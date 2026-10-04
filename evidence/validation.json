@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-05",
+  "source_sha256": {
+    "src/cached_lookup.rs": "08fb9db945d71c8b49d377c5974a72022df0ff3e60dea9d025cb4cca5a088227",
+    "src/feature.rs": "9ff16f96f7fe07434a8396b733183647c1a2295bb88eb4fc5b9955dfc4ffb878",
+    "src/furnace_cache_tests.rs": "f2eb6e8da39c4477cd1acd2e36c2bf7bbd5ef98652c0e9991c240305d8514eee",
+    "src/main.rs": "9ec3507eadbf7001c224840f8cca96bce863325cbe6e9954792bd22cde58b931",
+    "src/tree.rs": "7a21579fba7be4c37a11d89cc94279256802bf7556e706d8a4c847325c2ed13b",
+    "src/worldgen.rs": "27a99affe8f8ebd10c38aeddf6fcdfa133cbd8c0832f987adbcfbec1c49b8648"
+  },
+  "rustc": "1.98.1",
+  "cargo": "1.98.1",
+  "limits": {
+    "memory_bytes": 536870912,
+    "swap_bytes": 0,
+    "cpu_quota_percent": 50
+  },
+  "rustflags": "-C debuginfo=0 -C link-arg=-Wl,--threads=1",
+  "tests": {
+    "command": "cargo test --offline --locked -j 1 -- --test-threads=1",
+    "passed": 13,
+    "failed": 0
+  },
+  "build": {
+    "command": "cargo build --offline --locked -j 1",
+    "exit_code": 0
+  },
+  "negative_control": {
+    "change": "Ignore dependency key changes",
+    "expected": "Both cache dependency tests fail",
+    "result": "REJECTED",
+    "source": "evidence/stale-key-control.rs",
+    "sha256": "a14b4122de6699317cbe90501d20d49d831d050a978e35cddb40f28e01b0ccee",
+    "compile_command": "rustc --edition=2021 --test evidence/stale-key-control.rs -C link-arg=-Wl,--threads=1 -o target/stale-key-control",
+    "run_command": "target/stale-key-control"
+  },
+  "not_run": [
+    "live Minecraft client",
+    "save/reload integration",
+    "mc-spine CPU benchmark",
+    "Clippy",
+    "whole-source rustfmt"
+  ],
+  "review": {
+    "mode": "independent read-only static review",
+    "result": "no actionable regression found"
+  }
+}

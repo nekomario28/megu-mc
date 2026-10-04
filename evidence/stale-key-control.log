@@ -1,0 +1,28 @@
+
+running 2 tests
+test tests::every_dependency_change_recomputes_even_after_false ... FAILED
+test tests::repeated_miss_is_cached_and_changed_input_is_observed ... FAILED
+
+failures:
+
+---- tests::every_dependency_change_recomputes_even_after_false stdout ----
+
+thread 'tests::every_dependency_change_recomputes_even_after_false' (1653160) panicked at work/mc-spine-cache-stale-control.rs:54:13:
+assertion `left == right` failed
+  left: false
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::repeated_miss_is_cached_and_changed_input_is_observed stdout ----
+
+thread 'tests::repeated_miss_is_cached_and_changed_input_is_observed' (1653161) panicked at work/mc-spine-cache-stale-control.rs:45:9:
+assertion `left == right` failed
+  left: None
+ right: Some(42)
+
+
+failures:
+    tests::every_dependency_change_recomputes_even_after_false
+    tests::repeated_miss_is_cached_and_changed_input_is_observed
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

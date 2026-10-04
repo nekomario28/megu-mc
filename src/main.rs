@@ -8,6 +8,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+mod cached_lookup;
+use cached_lookup::CachedLookup;
 mod feature;
 mod tree;
 mod worldgen;
@@ -1989,11 +1991,11 @@ fn furnace_tick() {
     let mut dirty_pos: Vec<(i32,i32,i32)> = Vec::new();
     for (pos, f) in fs.iter_mut() {
         if !is_warm(pos.0, pos.2) { continue }
-        let out = smelt_out(f.input.0);
+        let out = smelt_out(f.input.0, |item| f.recipe_cache.get_or_compute(item, || smelt_result(item)));
         let can_smelt = f.input.1 > 0 && out.as_ref().map(|o|
             f.output.1 == 0 || (f.output.0 == o.0 && f.output.2 == o.2 && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))).unwrap_or(false);
         if f.burn_left <= 0 && can_smelt && f.fuel.1 > 0 {
-            let t = fuel_ticks(f.fuel.0);
+            let t = f.fuel_cache.get_or_compute(f.fuel.0, || fuel_ticks(f.fuel.0));
             if t > 0 {
                 f.burn_left = t;
                 f.fuel.1 -= 1;
@@ -2906,6 +2908,8 @@ fn world() -> &'static Mutex<HashMap<(i32, i32), HashMap<u32, u32>>> {
 struct Furnace {
     input: Stack, fuel: Stack, output: Stack,
     burn_left: i32, progress: i32, dirty: bool, xp: f32,
+    recipe_cache: CachedLookup<i64, Option<i64>>,
+    fuel_cache: CachedLookup<i64, i32>,
 }
 static FURNACES: OnceLock<Mutex<HashMap<(i32, i32, i32), Furnace>>> = OnceLock::new();
 static CROPS: OnceLock<Mutex<HashMap<(i32, i32, i32), u8>>> = OnceLock::new();
@@ -2928,11 +2932,12 @@ fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
         m
     }).unwrap_or_default()
 }
-fn smelt_out(item: i64) -> Option<Stack> {
+fn smelt_out(item: i64, builtin: impl FnOnce(i64) -> Option<i64>) -> Option<Stack> {
+    // Datapack recipes and ingredient tags are mutable: always resolve them first.
     for (ig, o, c, _) in json_smelts().lock().unwrap().iter() {
         if ingr_match(ig, item, 0) { return Some((*o, *c, Vec::new())) }
     }
-    smelt_result(item).map(|o| (o, 1, Vec::new()))
+    builtin(item).map(|o| (o, 1, Vec::new()))
 }
 fn smelt_result(item: i64) -> Option<i64> {
     for (a, b) in [("beef","cooked_beef"),("porkchop","cooked_porkchop"),("chicken","cooked_chicken"),
@@ -4277,7 +4282,7 @@ fn load_world() {
                 if p + 8 > b.len() { break }
                 let burn_left = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let progress = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                fs.insert((x, y, z), Furnace { input, fuel, output, burn_left, progress, dirty: false, xp: 0.0 });
+                fs.insert((x, y, z), Furnace { input, fuel, output, burn_left, progress, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
             }
             eprintln!("[spine] loaded {} furnaces", fs.len());
         }
@@ -9961,7 +9966,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         let key = (bx, by, bz);
                         if is_furnace_at(bx, by, bz) && slot <= 2 {
                             let mut fs = furnaces().lock().unwrap();
-                            let f = fs.entry(key).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0 });
+                            let f = fs.entry(key).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                             let cell = match slot { 0 => &mut f.input, 1 => &mut f.fuel, _ => &mut f.output };
                             *cell = (item, cnt, comps); f.dirty = true;
                         } else {
@@ -12171,7 +12176,7 @@ fn handle(mut s: TcpStream) {
                             let furnace_pos = *me.open_furnace.lock().unwrap();
                             if let Some(fp) = furnace_pos {
                                 let mut fs = furnaces().lock().unwrap();
-                                let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0 });
+                                let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                                 let mut inv = me.inv.lock().unwrap();
                                 let mut cur = me.cursor.lock().unwrap();
                                 if slot == -999 {
@@ -12501,7 +12506,7 @@ fn handle(mut s: TcpStream) {
                                             if hst.1 > 0 { inv.insert(g, hst.clone()); }
                                             resync_slot(&me, 2, slot, &hst);
                                         } else {
-                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0 });
+                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                                             if slot == 2 {
                                                 // output is take-only — push it to hotbar, don't swap in
                                                 if f.output.1 > 0 {
@@ -12682,7 +12687,7 @@ fn handle(mut s: TcpStream) {
                                         if slot >= 3 {
                                             if let Some(st) = map_take(&mut inv, slot + 6, if btn == 1 { 255 } else { 1 }) { throw!(st); }
                                         } else {
-                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0 });
+                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                                             let m = if slot == 0 { &mut f.input } else if slot == 1 { &mut f.fuel } else { &mut f.output };
                                             let n = if btn == 1 { m.1 } else { 1.min(m.1) };
                                             if n > 0 { let st = (m.0, n, m.2.clone()); m.1 -= n; if m.1 == 0 { *m = (0, 0, Vec::new()); } f.dirty = true;
@@ -12691,7 +12696,7 @@ fn handle(mut s: TcpStream) {
                                         }
                                     } else if slot == 2 {
                                         // shift-take output into inventory
-                                        let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0 });
+                                        let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                                         if f.output.1 > 0 {
                                             let st = std::mem::replace(&mut f.output, (0, 0, Vec::new()));
                                             f.dirty = true;
@@ -12702,7 +12707,7 @@ fn handle(mut s: TcpStream) {
                                         }
                                     } else if slot <= 1 {
                                         // shift input/fuel -> inv
-                                        let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0 });
+                                        let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                                         let m = if slot == 0 { &mut f.input } else { &mut f.fuel };
                                         if m.1 > 0 {
                                             let st = std::mem::replace(m, (0, 0, Vec::new()));
@@ -12713,8 +12718,8 @@ fn handle(mut s: TcpStream) {
                                     } else {
                                         // shift inv -> furnace input/fuel by type, else stays
                                         if let Some(st) = inv.get(&(slot + 6)).cloned() {
-                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0 });
-                                            let dst: i16 = if smelt_out(st.0).is_some() { 0 } else if fuel_ticks(st.0) > 0 { 1 } else { -1 };
+                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                                            let dst: i16 = if smelt_out(st.0, smelt_result).is_some() { 0 } else if fuel_ticks(st.0) > 0 { 1 } else { -1 };
                                             if dst >= 0 {
                                                 let m = if dst == 0 { &mut f.input } else { &mut f.fuel };
                                                 let fits = m.1 == 0 || (m.0 == st.0 && m.2 == st.2 && (m.1 as i64) < item_stack_max(m.0, &m.2));
@@ -13427,3 +13432,6 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod furnace_cache_tests;

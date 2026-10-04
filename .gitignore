@@ -1,0 +1,5 @@
+/target/
+*.log
+!/evidence/*.log
+/world_overlay.bin
+/world_overlay.bin.*

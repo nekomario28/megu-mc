@@ -1,0 +1,5 @@
+2026-10-05 independent read-only review
+Scope: mc-spine source diff and newly added Rust modules.
+Checked dependency keys, dynamic datapack/tag priority, all Furnace constructors, lock ownership, persistence and resolver callers.
+Result: no actionable regression found by static inspection.
+Reviewer did not run builds or tests; executable validation is recorded separately.
