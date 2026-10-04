@@ -1,0 +1,3 @@
+{"criteria":{"killed":{"trigger":"minecraft:player_killed_entity",
+   "conditions":{"entity":{"type":"minecraft:cow"}}}},
+ "display":{"title":{"text":"Cow Hunter"}}}

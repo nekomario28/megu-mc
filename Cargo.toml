@@ -1,0 +1,12 @@
+[package]
+name = "mc-spine"
+version = "0.0.0"
+edition = "2021"
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[dependencies]
+signal-hook = "0.4.4"
+ureq = { version = "3.4.2", features = ["rustls"] }
