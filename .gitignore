@@ -3,3 +3,5 @@
 !/evidence/*.log
 /world_overlay.bin
 /world_overlay.bin.*
+/compat/fabric-probe/.cache/
+/compat/fabric-probe/.build/

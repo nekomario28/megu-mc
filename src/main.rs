@@ -8,6 +8,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(feature = "fabric-probe")]
+mod fabric_probe;
 mod cached_lookup;
 use cached_lookup::CachedLookup;
 mod feature;
@@ -13148,6 +13150,22 @@ fn rcon_listener() {
     }
 }
 fn main() {
+    let probe_args: Vec<String> = std::env::args().skip(1).collect();
+    if probe_args.first().is_some_and(|arg| arg.starts_with("--fabric-probe")) {
+        #[cfg(feature = "fabric-probe")]
+        {
+            if let Err(error) = fabric_probe::run(&probe_args) {
+                eprintln!("[fabric-probe] {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "fabric-probe"))]
+        {
+            eprintln!("Rebuild with --features fabric-probe to run the diagnostic");
+            std::process::exit(1);
+        }
+    }
 
     // quick profile: MC_SPINE_WG_PROFILE=n generates n^2 chunks then exits
     if let Ok(n) = std::env::var("MC_SPINE_WG_PROFILE") {

@@ -28,3 +28,7 @@ MC_SPINE_PORT=25699 cargo run --locked
 他の処理へ適用する際は、計算が純粋であること、キーがすべての依存を含むこと、変更と同じ呼び出しで再計算されることを確認する。変更可能なテーブルの参照を含める場合は、そのスナップショットと整合するrevisionも必要になる。
 
 [復元と検証の記録](RESTORATION.md)を参照。
+
+## Java mod互換層
+
+[段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を追加した。世界の正本はRustに置き、実Fabric Loader・MixinからJNIで操作する。診断用modを使う基盤検証であり、既存Minecraft modやNeoForgeとの互換はまだ未検証。通常ビルドではJava実行機能を有効にしない。

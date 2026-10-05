@@ -1,0 +1,15 @@
+package net.mcspine.fixture.mixin;
+
+import net.mcspine.probe.ProbeGame;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+@Mixin(value = ProbeGame.class, remap = false)
+public abstract class InvalidGuard {
+    @Inject(method = "missingMethod", at = @At("HEAD"), cancellable = true, require = 1)
+    private void cancelReplace(int state, CallbackInfoReturnable<Boolean> result) {
+        result.setReturnValue(false);
+    }
+}

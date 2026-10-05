@@ -7,6 +7,10 @@ opt-level = 3
 lto = true
 strip = true
 
+[features]
+fabric-probe = ["dep:jni"]
+
 [dependencies]
+jni = { version = "0.21.1", features = ["invocation"], optional = true }
 signal-hook = "0.4.4"
 ureq = { version = "3.4.2", features = ["rustls"] }
