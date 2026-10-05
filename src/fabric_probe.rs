@@ -14,6 +14,9 @@ use std::{
 
 static TRAMPLE: OnceLock<bool> = OnceLock::new();
 static OWNER: OnceLock<ThreadId> = OnceLock::new();
+static SERVER: OnceLock<bool> = OnceLock::new();
+static COMMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE: std::sync::Mutex<Option<super::landing::Trample>> = std::sync::Mutex::new(None);
 fn on_owner(env: &mut JNIEnv) -> bool {
     if OWNER.get() == Some(&thread::current().id()) {
         return true;
@@ -43,6 +46,33 @@ extern "system" fn set_block(
     } else {
         (1..=2).contains(&state)
     };
+    if SERVER.get() == Some(&true) {
+        let active = *ACTIVE.lock().unwrap();
+        if let Some(active) = active {
+            if active.position == (x, y, z) && state == 10 {
+                return match catch_unwind(AssertUnwindSafe(|| {
+                    super::set_block_if(x, y, z, 10, Some(active.state))
+                })) {
+                    Ok(changed) => {
+                        COMMITTED.store(changed, super::Ordering::Relaxed);
+                        changed as u8
+                    }
+                    Err(_) => {
+                        let _ = env.throw_new(
+                            "java/lang/IllegalStateException",
+                            "Rust world mutation failed",
+                        );
+                        0
+                    }
+                };
+            }
+        }
+        let _ = env.throw_new(
+            "java/lang/IllegalStateException",
+            "No matching native landing operation",
+        );
+        return 0;
+    }
     if !valid_position(x, y, z) || !valid_state {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
@@ -65,7 +95,15 @@ extern "system" fn get_block(mut env: JNIEnv, _class: JClass, x: jint, y: jint, 
     if !on_owner(&mut env) {
         return -1;
     }
-    if !valid_position(x, y, z) {
+    let valid = if SERVER.get() == Some(&true) {
+        ACTIVE
+            .lock()
+            .unwrap()
+            .is_some_and(|active| active.position == (x, y, z))
+    } else {
+        valid_position(x, y, z)
+    };
+    if !valid {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
             "Position outside diagnostic ABI",
@@ -137,57 +175,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         super::set_block(8, 70, 8, 4286);
     }
     let classpath = std::fs::read_to_string(&args[1])?;
-    let game_jar = classpath.split(':').next().ok_or("Missing game JAR")?;
-    if !Path::new(game_jar).is_absolute() {
-        return Err("Classpath must contain absolute paths".into());
-    }
-    let cp_option = format!("-Djava.class.path={}", classpath.trim());
-    let init = InitArgsBuilder::new()
-        .version(JNIVersion::V8)
-        .option("-Xms16m")
-        .option("-Xmx128m")
-        .option("-Xcheck:jni")
-        .option("-Djava.awt.headless=true")
-        .option(&cp_option)
-        .build()?;
-    OWNER
-        .set(thread::current().id())
-        .map_err(|_| "Probe already initialized")?;
-    let jvm = JavaVM::new(init)?;
+    let jvm = create_jvm(&classpath)?;
     let mut env = jvm.attach_current_thread()?;
-    let directory = std::env::current_dir()?;
-    let result = (|| -> Result<bool, jni::errors::Error> {
-        let jar = JObject::from(env.new_string(game_jar)?);
-        let dir = JObject::from(env.new_string(directory.to_string_lossy())?);
-        let host = env
-            .call_static_method(
-                "net/mcspine/probe/Bootstrap",
-                "initialize",
-                "(Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/Class;",
-                &[
-                    JValue::Object(&jar),
-                    JValue::Object(&dir),
-                    JValue::Bool(trample as u8),
-                ],
-            )?
-            .l()?;
-        env.register_native_methods(
-            JClass::from(host),
-            &[
-                NativeMethod {
-                    name: "setBlock".into(),
-                    sig: "(IIII)Z".into(),
-                    fn_ptr: set_block as *mut c_void,
-                },
-                NativeMethod {
-                    name: "getBlock".into(),
-                    sig: "(III)I".into(),
-                    fn_ptr: get_block as *mut c_void,
-                },
-            ],
-        )?;
-        env.call_static_method("net/mcspine/probe/Bootstrap", "run", "()Z", &[])?
-            .z()
+    let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+        initialize(&mut env, &classpath, trample)?;
+        Ok(env
+            .call_static_method("net/mcspine/probe/Bootstrap", "run", "()Z", &[])?
+            .z()?)
     })();
     let changed = match result {
         Ok(value) => value,
@@ -211,4 +205,155 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{{\"stored_state\":{actual},\"changed\":{changed}}}");
     Ok(())
+}
+
+fn create_jvm(classpath: &str) -> Result<JavaVM, Box<dyn std::error::Error>> {
+    let game_jar = classpath
+        .trim()
+        .split(':')
+        .next()
+        .ok_or("Missing game JAR")?;
+    if !Path::new(game_jar).is_absolute() {
+        return Err("Classpath must contain absolute paths".into());
+    }
+    let cp_option = format!("-Djava.class.path={}", classpath.trim());
+    let init = InitArgsBuilder::new()
+        .version(JNIVersion::V8)
+        .option("-Xms16m")
+        .option("-Xmx128m")
+        .option("-Xcheck:jni")
+        .option("-Djava.awt.headless=true")
+        .option(&cp_option)
+        .build()?;
+    OWNER
+        .set(thread::current().id())
+        .map_err(|_| "JVM owner already initialized")?;
+    Ok(JavaVM::new(init)?)
+}
+fn initialize(
+    env: &mut JNIEnv,
+    classpath: &str,
+    trample: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let game_jar = classpath
+        .trim()
+        .split(':')
+        .next()
+        .ok_or("Missing game JAR")?;
+    let directory = std::env::current_dir()?;
+    let jar = JObject::from(env.new_string(game_jar)?);
+    let dir = JObject::from(env.new_string(directory.to_string_lossy())?);
+    let host = env
+        .call_static_method(
+            "net/mcspine/probe/Bootstrap",
+            "initialize",
+            "(Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/Class;",
+            &[
+                JValue::Object(&jar),
+                JValue::Object(&dir),
+                JValue::Bool(trample as u8),
+            ],
+        )?
+        .l()?;
+    env.register_native_methods(
+        JClass::from(host),
+        &[
+            NativeMethod {
+                name: "setBlock".into(),
+                sig: "(IIII)Z".into(),
+                fn_ptr: set_block as *mut c_void,
+            },
+            NativeMethod {
+                name: "getBlock".into(),
+                sig: "(III)I".into(),
+                fn_ptr: get_block as *mut c_void,
+            },
+        ],
+    )?;
+    Ok(())
+}
+pub fn serve(
+    classpath_file: &str,
+    receive: std::sync::mpsc::Receiver<super::landing::Request>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    let started = (|| -> Result<(), Box<dyn std::error::Error>> {
+        SERVER
+            .set(true)
+            .map_err(|_| "Fabric server already initialized")?;
+        TRAMPLE
+            .set(true)
+            .map_err(|_| "Fabric contract already initialized")?;
+        if super::name_to_state("farmland") != Some(4286)
+            || super::name_to_state("dirt") != Some(10)
+        {
+            return Err("Native state IDs differ from the pinned contract".into());
+        }
+        let classpath = std::fs::read_to_string(classpath_file)?;
+        let jvm = create_jvm(&classpath)?;
+        let mut env = jvm.attach_current_thread()?;
+        let setup = (|| -> Result<jni::objects::GlobalRef, Box<dyn std::error::Error>> {
+            initialize(&mut env, &classpath, true)?;
+            let hooks = env
+                .call_static_method(
+                    "net/mcspine/probe/Bootstrap",
+                    "initializeServer",
+                    "()Ljava/lang/Class;",
+                    &[],
+                )?
+                .l()?;
+            Ok(env.new_global_ref(hooks)?)
+        })();
+        let hooks = match setup {
+            Ok(hooks) => hooks,
+            Err(error) => {
+                if env.exception_check()? {
+                    env.exception_describe()?;
+                }
+                return Err(error);
+            }
+        };
+        ready.send(Ok(())).map_err(|_| "Server startup abandoned")?;
+        for request in receive {
+            let input = request.trample;
+            COMMITTED.store(false, super::Ordering::Relaxed);
+            *ACTIVE.lock().unwrap() = Some(input);
+            let (x, y, z) = input.position;
+            let outcome = env.with_local_frame(16, |env| {
+                env.call_static_method(
+                    <&JClass>::from(hooks.as_obj()),
+                    "land",
+                    "(IIIF)V",
+                    &[
+                        JValue::Int(x),
+                        JValue::Int(y),
+                        JValue::Int(z),
+                        JValue::Float(input.distance),
+                    ],
+                )?;
+                Ok::<(), jni::errors::Error>(())
+            });
+            *ACTIVE.lock().unwrap() = None;
+            let result = match outcome {
+                Ok(()) => Ok(COMMITTED.load(super::Ordering::Relaxed)),
+                Err(error) => {
+                    if env.exception_check()? {
+                        env.exception_describe()?;
+                        env.exception_clear()?;
+                    }
+                    Err(error.to_string())
+                }
+            };
+            let failed = result.is_err();
+            let _ = request.reply.send(result);
+            if failed {
+                return Err("Fabric callback failed; owner stopped".into());
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = started {
+        let _ = ready.send(Err(error.to_string()));
+        eprintln!("[mod-compatibility] {error}");
+    }
 }

@@ -14,7 +14,7 @@ Five narrowly scoped Java argument/facade classes are authored with Yarn named n
 
 In isolated `--fabric-trample` mode, Rust initializes farmland state 4286 at `(8,70,8)`. The already-eligible conversion branch calls the mapped Java method, which calls the mapped static dirt-conversion method and existing Rust set_block via JNI. The actual mod's required Redirect can replace that invocation. Java owns no block storage. State IDs are checked against native name_to_state before the scenario runs. Owner-thread and persistence protection from slice 01 remain active.
 
-Only this mode advertises Minecraft 1.21.1 to satisfy the selected mod's loader dependency. Scoped startup rejects Fabric system-property overrides, including alternate mod paths and development discovery. An absent mods directory is created for the no-mod baseline. Before loader resolution, every supplied mod file must match the selected original-JAR SHA-256; unknown mod hashes are rejected. This is a scoped dependency contract, not a claim that all Minecraft APIs exist. Ordinary foundation mode continues to reject missing Minecraft dependencies; normal server startup does not enable this provider.
+Only this mode advertises Minecraft 1.21.1 to satisfy the selected mod's loader dependency. Scoped startup rejects Fabric system-property overrides, including alternate mod paths and development discovery. An absent mods directory is created for the no-mod baseline. Before loader resolution, every supplied mod file must match the selected original-JAR SHA-256; unknown mod hashes are rejected. This is a scoped dependency contract, not a claim that all Minecraft APIs exist. Ordinary foundation mode continues to reject missing Minecraft dependencies; normal server startup enables this pinned provider only through explicit MC_SPINE_FABRIC_CLASSPATH configuration.
 
 ## Acceptance / evidence
 
@@ -26,17 +26,17 @@ Only this mode advertises Minecraft 1.21.1 to satisfy the selected mod's loader 
 - [x] Empty scratch directory starts; additional mod paths and development discovery are specifically rejected.
 - [x] Actual loaded mod JAR and original inputs retain their hashes.
 - [x] Existing slice 01 scenarios still pass.
-- [ ] Real Vanilla/Fabric reference run of the equivalent eligible landing.
-- [ ] Normal-server player/entity landing routed through this facade on the owning tick thread.
+- [x] Real Vanilla/Fabric reference run of the equivalent adult-cow landing; saved MCA block palettes confirm the result.
+- [x] Normal player movement packets and adult-cow tick landing routed synchronously through a dedicated JVM owner.
 - [ ] Full landing eligibility, mobGriefing, entity conditions, damage and crop behavior match the pinned reference.
 
 World, Entity and BlockState arguments are opaque shapes for this Redirect, not general Minecraft implementations. FarmlandBlock implements only the eligible dirt-conversion branch; it does not reproduce Vanilla fall eligibility or Block inheritance. Do not expose this operation as complete onLandedUpon compatibility. No real-client visual result is claimed.
 
 ## Next gate and NeoForge handoff
 
-First validate the eligible branch against a real isolated Vanilla/Fabric reference, then bind normal mc-spine landing behavior through the same Java/native commit boundary and compare cancellation and persisted state. The current host resource gate reports two heavy Minecraft occupants; only already-authorized bounded probes (512MiB, zero swap, half CPU) run here, not an additional full server.
+First validate the eligible branch against a real isolated Vanilla/Fabric reference, then bind normal mc-spine landing behavior through the same Java/native commit boundary and compare cancellation and persisted state. The current host resource gate reports two heavy Minecraft occupants; the user explicitly authorized sequential isolated reference servers capped at 1GiB, zero swap, half CPU and 180 seconds per run. The successful reference removes NoAI, forces the test chunk loaded and verifies both live state and saved MCA state. Earlier stationary NoAI attempts are excluded from passing evidence.
 
-The native player landing branch currently handles fall damage inside its connection thread (`src/main.rs`, position packet handling). No farmland trample operation was found there. Normal-server integration must introduce and validate the landing operation, and define its handoff to the JVM owner; it cannot claim that an already-existing farmland behavior has merely been intercepted.
+Normal startup now routes player movement (position, look and onGround-only packets) and adult-cow landing through src/landing.rs. Fabric callbacks run on a dedicated synchronous owner; native commits compare the initial state under the world mutex. Existing fall damage continues after cancellation. Passive mobs now descend while stationary, and farmland landing height uses 15/16 of a block. The native cow starts at 20 HP versus the reference 10 HP: both lose 3 HP in the measured fall, so absolute health parity is not claimed. Crop/loot, other entities and seed-identical physics remain open.
 
 NeoForge starts after those Fabric gates. A same-feature candidate exists: Modrinth Seed Protect `HetyfPep`, titled 1.0.1 but filename `seedprotect-1.0.0.jar`; the inspected TOML and VERSION field both say 1.0.0. Its constructor registers this on NeoForge.EVENT_BUS, and its subscribed FarmlandTrampleEvent handler calls setCanceled(true). See 03-neoforge.md; exact loader/bootstrap selection still requires source inspection. Keep the native operation owner. NeoForge execution is NOT RUN.
 

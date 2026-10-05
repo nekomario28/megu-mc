@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "fabric-probe")]
 mod fabric_probe;
+mod landing;
 mod cached_lookup;
 use cached_lookup::CachedLookup;
 mod feature;
@@ -1019,12 +1020,15 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
     // snap to ground surface; while buried only allow snaps within step height
     // so a fully enclosed mob cannot teleport out through solid blocks
-    let sy = surface_y(mp.0.round() as i32, mp.2.round() as i32);
+    let (land_x, land_z) = (mp.0.floor() as i32, mp.2.floor() as i32);
+    let mut sy = surface_y(land_x, land_z);
+    if (4286..=4293).contains(&block_at(land_x, sy as i32 - 1, land_z)) { sy -= 1.0 / 16.0; }
     if !mob_cell_solid(mp.0, mp.1, mp.2) || sy - mp.1 <= 1.2 {
         // refuse snaps that phase through solid blocks (e.g. sealed under a cap)
-        let (fx, fz) = (mp.0.round() as i32, mp.2.round() as i32);
+        let (fx, fz) = (land_x, land_z);
         let mut yy = mp.1.floor() as i32 + 1;
         while yy < sy.floor() as i32 { if !mob_passable(block_at(fx, yy, fz)) { return } yy += 1; }
+        let converted = landing::cow_land(m, (land_x, (sy - 0.2).floor() as i32, land_z), (mp.1 - sy) as f32);
         // fall damage on descent >3 blocks; chicken/cat/ocelot immune (vanilla)
         if mp.1 - sy > 3.0 && !matches!(m.etype, 19 | 15 | 72) {
             let mut hp = m.hp.lock().unwrap();
@@ -1032,6 +1036,7 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
             drop(hp);
             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
         }
+        if converted { sy += 1.0 / 16.0; }
         mp.1 = sy;
     }
 }
@@ -2717,6 +2722,7 @@ fn mob_tick() {
         }
         // passive mobs: slow wander + breeding (two loved animals -> baby)
         if matches!(m.etype, 22 | 77 | 87 | 19) {
+            mob_snap_y(m, &mut mp);
             let mut lov = m.love.lock().unwrap();
             if *lov > 0 {
                 *lov -= 1;
@@ -3468,9 +3474,13 @@ fn block_at(x: i32, y: i32, z: i32) -> u32 {
         .unwrap_or_else(|| base_state(x, y, z))
 }
 fn set_block(x: i32, y: i32, z: i32, st: u32) {
+    set_block_if(x, y, z, st, None);
+}
+fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
     let mut w = world().lock().unwrap();
     let c = w.entry((x >> 4, z >> 4)).or_default();
     let old = c.get(&local_idx(x, y, z)).copied().unwrap_or_else(|| base_state(x, y, z));
+    if expected.is_some_and(|value| old != value) { return false; }
     if st == base_state(x, y, z) { c.remove(&local_idx(x, y, z)); } else { c.insert(local_idx(x, y, z), st); }
     drop(w);
     if st != old {
@@ -3514,6 +3524,7 @@ fn set_block(x: i32, y: i32, z: i32, st: u32) {
     }
     refresh_hidden_neighbors(x, y, z);
     block_updated(x, y, z);
+    true
 }
 
 // ---------- neighbor-update engine (vanilla-ish: piston QC, tnt ignite, observer, dispenser, gravity) ----------
@@ -10971,36 +10982,7 @@ fn handle(mut s: TcpStream) {
                     {
                         let prev_gnd = { let p = me.pos.lock().unwrap(); p.5 };
                         *me.pos.lock().unwrap() = (px, py, pz, yaw, pitch, gnd);
-                        let mut ff = me.fall_from.lock().unwrap();
-                        if !gnd && py > *ff { *ff = py; }
-                        // vanilla resets fallDistance each tick while in water
-                        // or while gliding with elytra
-                        if !gnd {
-                            let wst = name_to_state("water").unwrap_or(u32::MAX);
-                            let bx = px.floor() as i32; let bz = pz.floor() as i32;
-                            if block_at(bx, py.floor() as i32, bz) == wst
-                                || block_at(bx, (py + 1.0).floor() as i32, bz) == wst
-                                || *me.fall_fly.lock().unwrap() {
-                                *ff = py;
-                            }
-                        }
-                        if gnd && !prev_gnd {
-                            let fall = *ff - py;
-                            *ff = py;
-                            let wst = name_to_state("water").unwrap_or(u32::MAX);
-                            let wet_land = block_at(px.floor() as i32, (py - 0.5).floor() as i32, pz.floor() as i32) == wst
-                                || block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == wst;
-                            if fall > 3.0 && !wet_land && *me.gm.lock().unwrap() != 1 {
-                                drop(ff);
-                                let mut h = me.hp.lock().unwrap();
-                                // vanilla: armor does not reduce fall damage; feather_falling epf does
-                                let fraw = (fall - 3.0).ceil() as f32;
-                                *h = (*h - fraw * (1.0 - 0.04 * enchant_epf(&me, 1) as f32)).max(0.0); if *h <= 0.0 { drop(h); totem_check(&me); h = me.hp.lock().unwrap(); }
-                                let hh = *h; drop(h);
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x24, hurt_anim(me.eid));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, &me));
-                            }
-                        }
+                        landing::player_move(&me, prev_gnd);
                     }
                     let (ccx, ccz) = ((px / 16.0).floor() as i32, (pz / 16.0).floor() as i32);
                     if (ccx, ccz) != player_chunk {
@@ -11022,9 +11004,11 @@ fn handle(mut s: TcpStream) {
                     let yaw = f32::from_be_bytes(b[..4].try_into().unwrap());
                     let pitch = f32::from_be_bytes(b[4..8].try_into().unwrap());
                     let mut p = me.pos.lock().unwrap();
+                    let prev_gnd = p.5;
                     p.3 = yaw; p.4 = pitch; p.5 = b[8] != 0;
                     let (px, py, pz, g) = (p.0, p.1, p.2, p.5);
                     drop(p);
+                    landing::player_move(&me, prev_gnd);
                     broadcast_seen(me.eid, |_c| (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, g)));
                     broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw)));
                 }
@@ -11061,7 +11045,9 @@ fn handle(mut s: TcpStream) {
             }
             0x1d => { // flying: onGround only
                 if !b.is_empty() {
-                    let mut p = me.pos.lock().unwrap(); p.5 = b[0] != 0;
+                    let mut p = me.pos.lock().unwrap(); let prev_gnd = p.5; p.5 = b[0] != 0;
+                    drop(p);
+                    landing::player_move(&me, prev_gnd);
                 }
             }
             0x24 => { // block_dig
@@ -13374,6 +13360,10 @@ fn main() {
     WORLD_SEED.store(wg_seed, Ordering::Relaxed);
 
     load_world();
+    if let Err(error) = landing::initialize() {
+        eprintln!("[mod-compatibility] {error}");
+        std::process::exit(1);
+    }
     std::thread::spawn(rcon_listener);
     http_server();
     load_datapacks();

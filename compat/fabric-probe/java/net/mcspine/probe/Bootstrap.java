@@ -21,6 +21,11 @@ public final class Bootstrap {
         target = knot.init(new String[0]);
         return target.loadClass("net.mcspine.probe.Host");
     }
+    public static Class<?> initializeServer() throws ReflectiveOperationException {
+        Class<?> hooks = target.loadClass("net.mcspine.probe.ServerHooks");
+        hooks.getMethod("initialize").invoke(null);
+        return hooks;
+    }
     public static boolean run() throws ReflectiveOperationException {
         var provider = net.fabricmc.loader.impl.FabricLoaderImpl.INSTANCE.getGameProvider();
         provider.launch(target);

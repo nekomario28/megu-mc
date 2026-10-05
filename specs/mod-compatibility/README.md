@@ -1,6 +1,6 @@
 # mc-spine Java mod compatibility
 
-Status: slice 01 passed; slice 02 pinned Redirect contract passed, full reference and normal-server integration pending; arbitrary Minecraft mod compatibility remains NOT RUN.
+Status: slice 01 passed; slice 02 pinned Redirect and normal player/adult-cow landing passed against a real reference; broader physics/crop coverage pending; arbitrary Minecraft mod compatibility remains NOT RUN.
 Target: Minecraft Java 1.21.1, Java 21, Fabric and NeoForge server mods. Client rendering mods are outside this server's execution boundary.
 
 ## Ownership and execution
@@ -13,11 +13,11 @@ Minecraft class names alone do not provide compatibility. A supported mod must r
 
 ## Production operation path
 
-When compatibility is enabled, route each supported Rust tick/player action through the corresponding interceptable Java game method, then invoke the native commit only after required callbacks and cancellation checks. A transformed method that normal gameplay never calls provides no compatibility. Java mod API calls must enter that same operation path. The foundation probe demonstrates this direction for one diagnostic method; normal-server integration is still future work.
+When compatibility is enabled, route each supported Rust tick/player action through the corresponding interceptable Java game method, then invoke the native commit only after required callbacks and cancellation checks. A transformed method that normal gameplay never calls provides no compatibility. Java mod API calls must enter that same operation path. The normal player movement and adult-cow tick now use this path. A dedicated JVM owner executes callbacks synchronously; Rust callers wait without holding the world mutex, and the native commit compares the initial farmland state under that mutex. Other entity landing and full crop behavior remain outside the validated contract.
 
 Java world/entity/block-entity facades hold Rust handles and resolve current values through the owner. Registry IDs and object identity must remain stable across callbacks and persistence. Adding custom blocks/items also requires network registry/palette and save-format identity support before registration can be accepted. Direct Java field mutations and arbitrary internal bytecode edits need an explicit synchronization/execution contract; they are deferred rather than treated as equivalent to method-based API calls.
 
-Fabric supplies its entrypoint/dependency/classloading lifecycle; the adapter adds actual Minecraft namespace/API behavior. NeoForge needs a separately pinned bootstrap plus its own mod/game event buses, listener ordering, registration phases and access transformations. It will reuse validated native world commits, not assume Fabric's lifecycle is identical. Exact NeoForge artifact/bootstrap selection is unresolved until slice 03 source inspection.
+Fabric supplies its entrypoint/dependency/classloading lifecycle; the adapter adds actual Minecraft namespace/API behavior. NeoForge needs a separately pinned bootstrap plus its own mod/game event buses, listener ordering, registration phases and access transformations. It will reuse validated native world commits, not assume Fabric's lifecycle is identical. The event adapter investigation pins NeoForge 21.1.172, FML 4.0.39 API classes and event bus 8.0.2. Full FML startup remains a separate gate.
 
 ## Verifiable slices
 
@@ -37,7 +37,9 @@ Three lenses were applied: smallest end-to-end proof (loader â†’ native state â†
 
 ## Next implementation
 
-Slice 02 selects Seed Protect version WAKX5fBR and implements a restricted, mapped Redirect facade. Complete the reference-run and normal-server integration gates before closing this slice. Compare a real Vanilla/Fabric reference run with the mc-spine run before calling it compatible. Resolve mappings and target bytecode before advertising `minecraft` as a provided dependency. For slice 03 inspect the pinned NeoForge bootstrap and lifecycle contracts; do not assume Fabric ordering applies.
+Normal Fabric player/adult-cow landing is verified with the original Seed Protect WAKX5fBR JAR, normal TCP/tick entry points, and saved Rust-world reload. Real Vanilla/Fabric reference servers confirm adult-cow dirt conversion versus cancellation and saved MCA state. 18 diagnostic regression arms and 15 native tests pass. Broader collision, crop/loot and all-entity parity are still open.
+
+Implement the bounded NeoForge event adapter next using actual upstream game-bus and FarmlandTrampleEvent classes. Preserve one native landing commit and one JVM owner; do not implement a second event engine. Distinguish actual event API execution from full FML discovery/bootstrap, which remains unproven.
 
 ## Sources
 
