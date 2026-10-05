@@ -16,10 +16,13 @@ def jar(path, entries):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--java-home', default=os.environ.get('JAVA_HOME'))
+    parser.add_argument('--seedprotect', action='store_true')
     args = parser.parse_args()
     javac = str(pathlib.Path(args.java_home) / 'bin/javac') if args.java_home else 'javac'
     cache, build = ROOT / '.cache', ROOT / '.build'
-    cache.mkdir(exist_ok=True); build.mkdir(exist_ok=True)
+    cache.mkdir(exist_ok=True)
+    if build.exists(): shutil.rmtree(build)
+    build.mkdir()
     libraries = []
     for lib in json.loads((ROOT / 'dependencies.json').read_text())['libraries']:
         path = cache / lib['url'].rsplit('/', 1)[1]
@@ -58,6 +61,14 @@ def main():
     fixture('invalid_guard', 'InvalidGuard', 'InvalidGuard')
     fixture('requires_minecraft', depends={'minecraft': '1.21.1'})
     (build / 'classpath.txt').write_text(os.pathsep.join(map(str, [build / 'game.jar', *libraries])))
+    if args.seedprotect:
+        from seedprotect_build import prepare
+        java = pathlib.Path(args.java_home) / 'bin/java' if args.java_home else pathlib.Path(shutil.which('java'))
+        entries, broken_entries, slf4j = prepare(ROOT, build, classes, libraries, java)
+        jar(build / 'game-seedprotect.jar', entries)
+        jar(build / 'game-seedprotect-missing-invoke.jar', broken_entries)
+        (build / 'classpath-seedprotect-missing-invoke.txt').write_text(os.pathsep.join(map(str, [build / 'game-seedprotect-missing-invoke.jar', *libraries, slf4j])))
+        (build / 'classpath-seedprotect.txt').write_text(os.pathsep.join(map(str, [build / 'game-seedprotect.jar', *libraries, slf4j])))
     (build / 'build-receipt.json').write_text(json.dumps({'java_home': args.java_home, 'sources': {str(p.relative_to(ROOT)): sha(p) for p in sources}, 'jars': {p.name: sha(p) for p in sorted(build.glob('*.jar'))}}, indent=2) + '\n')
     print(build / 'classpath.txt')
 

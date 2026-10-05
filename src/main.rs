@@ -13151,7 +13151,7 @@ fn rcon_listener() {
 }
 fn main() {
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
-    if probe_args.first().is_some_and(|arg| arg.starts_with("--fabric-probe")) {
+    if probe_args.first().is_some_and(|arg| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample")) {
         #[cfg(feature = "fabric-probe")]
         {
             if let Err(error) = fabric_probe::run(&probe_args) {

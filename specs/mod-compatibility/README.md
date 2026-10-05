@@ -1,6 +1,6 @@
 # mc-spine Java mod compatibility
 
-Status: slice 01 diagnostic acceptance passed; arbitrary Minecraft mod compatibility remains NOT RUN.
+Status: slice 01 passed; slice 02 pinned Redirect contract passed, full reference and normal-server integration pending; arbitrary Minecraft mod compatibility remains NOT RUN.
 Target: Minecraft Java 1.21.1, Java 21, Fabric and NeoForge server mods. Client rendering mods are outside this server's execution boundary.
 
 ## Ownership and execution
@@ -24,8 +24,8 @@ Fabric supplies its entrypoint/dependency/classloading lifecycle; the adapter ad
 | Slice | Deliverable | Acceptance |
 |---|---|---|
 | [01 foundation](slices/01-foundation.md) | Embedded JVM, actual Fabric Loader and Mixin, diagnostic mod | Rust mutation, cancellation, persistence across processes, dependency/invalid injection rejection |
-| 02 real Fabric mod | Pinned existing server mod JAR, named/intermediary mapping strategy, smallest real Minecraft API facade | Original JAR hash retained; expected game operation and saved state, with required transformations |
-| 03 real NeoForge mod | Pinned 1.21.1 loader bootstrap, lifecycle and registration adapter | Original JAR runs; registry/event behavior reaches the same Rust world |
+| [02 real Fabric mod](slices/02-seedprotect.md) | Pinned existing server mod JAR, named/intermediary mapping strategy, smallest real Minecraft API facade | Original JAR hash retained; expected game operation and saved state, with required transformations |
+| [03 real NeoForge mod](slices/03-neoforge.md) | Pinned 1.21.1 loader bootstrap, lifecycle and registration adapter | Original JAR runs; declared lifecycle/event behavior reaches the same Rust world |
 | 04 stateful behavior | Inventories/block entities/tick callbacks required by selected mods | Vanilla reference scenarios, save/reload and exact tick ordering; canceled operations produce no effects |
 | 05 compatibility expansion | Explicit per-version supported contract matrix | Each additional contract backed by a mod/scenario; missing contracts visibly rejected |
 
@@ -37,7 +37,7 @@ Three lenses were applied: smallest end-to-end proof (loader â†’ native state â†
 
 ## Next implementation
 
-Complete slice 01 evidence first. For slice 02 choose and pin one existing small server mod, inspect its actual bytecode/API calls, and build only the required facade. Compare a real Vanilla/Fabric reference run with the mc-spine run before calling it compatible. Resolve mappings and target bytecode before advertising `minecraft` as a provided dependency. For slice 03 inspect the pinned NeoForge bootstrap and lifecycle contracts; do not assume Fabric ordering applies.
+Slice 02 selects Seed Protect version WAKX5fBR and implements a restricted, mapped Redirect facade. Complete the reference-run and normal-server integration gates before closing this slice. Compare a real Vanilla/Fabric reference run with the mc-spine run before calling it compatible. Resolve mappings and target bytecode before advertising `minecraft` as a provided dependency. For slice 03 inspect the pinned NeoForge bootstrap and lifecycle contracts; do not assume Fabric ordering applies.
 
 ## Sources
 

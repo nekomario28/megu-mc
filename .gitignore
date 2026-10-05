@@ -5,3 +5,4 @@
 /world_overlay.bin.*
 /compat/fabric-probe/.cache/
 /compat/fabric-probe/.build/
+/compat/fabric-probe/__pycache__/

@@ -31,4 +31,4 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 ## Java mod互換層
 
-[段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を追加した。世界の正本はRustに置き、実Fabric Loader・MixinからJNIで操作する。診断用modを使う基盤検証であり、既存Minecraft modやNeoForgeとの互換はまだ未検証。通常ビルドではJava実行機能を有効にしない。
+[段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を追加した。世界の正本はRustに置き、実Fabric Loader・MixinからJNIで操作する。診断用modの基盤検証に加え、既存Seed Protect JARのRedirect契約と名前変換を検証した。通常サーバーへの統合、Vanilla参照との同等性、NeoForge実行は未検証。通常ビルドではJava実行機能を有効にしない。

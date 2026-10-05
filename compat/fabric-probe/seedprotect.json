@@ -1,0 +1,15 @@
+{
+  "mod": {
+    "url": "https://cdn.modrinth.com/data/szm2rZGy/versions/WAKX5fBR/seedprotect-1.21.1-fabric-1.0.0.jar",
+    "sha256": "ccd48d96239f485846ced57968e73c6040df4a66ca6ea02cb180a29a5cff7a3f",
+    "version_id": "WAKX5fBR"
+  },
+  "yarn": {
+    "url": "https://maven.fabricmc.net/net/fabricmc/yarn/1.21.1+build.3/yarn-1.21.1+build.3-v2.jar",
+    "sha256": "4ec570889585cb958b7d3c9dd94ce4064b16ab797dffec152bc8486c59a4010b"
+  },
+  "slf4j": {
+    "url": "https://repo.maven.apache.org/maven2/org/slf4j/slf4j-api/2.0.9/slf4j-api-2.0.9.jar",
+    "sha256": "0818930dc8d7debb403204611691da58e49d42c50b6ffcfdce02dadb7c3c2b6c"
+  }
+}

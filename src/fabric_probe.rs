@@ -12,6 +12,7 @@ use std::{
     thread::{self, ThreadId},
 };
 
+static TRAMPLE: OnceLock<bool> = OnceLock::new();
 static OWNER: OnceLock<ThreadId> = OnceLock::new();
 fn on_owner(env: &mut JNIEnv) -> bool {
     if OWNER.get() == Some(&thread::current().id()) {
@@ -37,10 +38,15 @@ extern "system" fn set_block(
     if !on_owner(&mut env) {
         return 0;
     }
-    if !valid_position(x, y, z) || !(1..=2).contains(&state) {
+    let valid_state = if TRAMPLE.get() == Some(&true) {
+        state == 10 || state == 4286
+    } else {
+        (1..=2).contains(&state)
+    };
+    if !valid_position(x, y, z) || !valid_state {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
-            "Diagnostic ABI accepts only (8,70,8), states 1 or 2",
+            "Position or state outside the scoped diagnostic ABI",
         );
         return 0;
     }
@@ -76,12 +82,20 @@ extern "system" fn get_block(mut env: JNIEnv, _class: JClass, x: jint, y: jint, 
 }
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if args[0] == "--fabric-probe-reload" {
+    let trample = args[0].starts_with("--fabric-trample");
+    let valid_expected = |state: u32| {
+        if trample {
+            state == 10 || state == 4286
+        } else {
+            (1..=2).contains(&state)
+        }
+    };
+    if args[0] == "--fabric-probe-reload" || args[0] == "--fabric-trample-reload" {
         if args.len() != 2 {
             return Err("usage: --fabric-probe-reload <expected-state>".into());
         }
         let expected: u32 = args[1].parse()?;
-        if !(1..=2).contains(&expected) || !Path::new(super::WORLD_FILE).is_file() {
+        if !valid_expected(expected) || !Path::new(super::WORLD_FILE).is_file() {
             return Err("Missing diagnostic world or invalid expected state".into());
         }
         super::load_world();
@@ -92,15 +106,15 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("{{\"reloaded_state\":{actual}}}");
         return Ok(());
     }
-    if args[0] != "--fabric-probe" {
+    if args[0] != "--fabric-probe" && args[0] != "--fabric-trample" {
         return Err("Unknown diagnostic command".into());
     }
     if args.len() != 3 {
         return Err("usage: --fabric-probe <classpath-file> <expected-state>".into());
     }
     let expected: u32 = args[2].parse()?;
-    if !(1..=2).contains(&expected) {
-        return Err("Expected state must be 1 or 2".into());
+    if !valid_expected(expected) {
+        return Err("Expected state outside the selected contract".into());
     }
     if Path::new(super::WORLD_FILE).symlink_metadata().is_ok() {
         return Err("Refusing to overwrite an existing world".into());
@@ -110,6 +124,17 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .is_ok()
     {
         return Err("Refusing to overwrite an existing temporary world".into());
+    }
+    TRAMPLE
+        .set(trample)
+        .map_err(|_| "Probe already initialized")?;
+    if trample {
+        if super::name_to_state("farmland") != Some(4286)
+            || super::name_to_state("dirt") != Some(10)
+        {
+            return Err("Native state IDs differ from the pinned contract".into());
+        }
+        super::set_block(8, 70, 8, 4286);
     }
     let classpath = std::fs::read_to_string(&args[1])?;
     let game_jar = classpath.split(':').next().ok_or("Missing game JAR")?;
@@ -138,8 +163,12 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .call_static_method(
                 "net/mcspine/probe/Bootstrap",
                 "initialize",
-                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;",
-                &[JValue::Object(&jar), JValue::Object(&dir)],
+                "(Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/Class;",
+                &[
+                    JValue::Object(&jar),
+                    JValue::Object(&dir),
+                    JValue::Bool(trample as u8),
+                ],
             )?
             .l()?;
         env.register_native_methods(
@@ -170,7 +199,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let actual = super::block_at(8, 70, 8);
-    if actual != expected || changed != (expected == 2) {
+    if actual != expected || changed != (expected == if trample { 10 } else { 2 }) {
         return Err(format!(
             "World/Mixin mismatch: state={actual}, changed={changed}, expected={expected}"
         )
