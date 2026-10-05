@@ -2,6 +2,8 @@
 
 Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバー。保存されていたv2.37のソース、datapack、プロトコル設定を復元した。Minecraft全体との互換性が完成した実装ではない。
 
+目標は、**小規模・低負荷の世界では計算量を大きく減らし、必要な既存Modも使えるサーバー**。処理を省略できる条件・状態の所有・Modの呼出しを一貫して扱う。[目的と設計原則](DESIGN.md)に方針、構造の方向、実装済みの範囲と評価条件を記載する。
+
 Cargoのpackage version `0.0.0` は保存時の値を維持している。`AUDIT_WIRE.md` と `SECURITY_NOTES.md` は当時の監査記録であり、現在の安全性や完成度を保証する資料ではない。
 
 ## ビルドと確認
@@ -31,7 +33,7 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 ## Java mod互換層
 
-[段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を追加した。世界の正本はRustに置き、実Fabric Loader・MixinからJNIで操作する。診断用modの基盤検証に加え、既存Seed Protect JARのRedirect契約と名前変換を検証した。通常サーバーへの統合、Vanilla参照との同等性、NeoForge実行は未検証。通常ビルドではJava実行機能を有効にしない。
+[段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を参照。世界の正本はRustに置き、Java互換層からJNIで操作する。通常ビルドではJava実行機能を有効にしない。現在対応する契約と未検証の境界は以下に記載する。
 
 ## Selected Java mod contract
 
