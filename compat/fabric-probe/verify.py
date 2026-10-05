@@ -131,7 +131,7 @@ def main():
     after = {str(path.relative_to(ROOT)): sha(path) for path in jars}
     assert before == after, 'Input JAR mutated'
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({'status': 'PASS', 'resource_scope': resource_scope, 'base_revision': revision, 'java_sources': sources, 'rust_source_sha256': sha(ROOT.parent.parent / 'src/fabric_probe.rs'), 'binary_sha256': sha(binary), 'java_home': os.environ.get('JAVA_HOME'), 'jars_before': before, 'jars_after': after, 'cases': records, 'boundary': 'Pinned Seed Protect Redirect contract tested' if args.seedprotect else 'Diagnostic fixtures only; Minecraft API and NeoForge NOT RUN'}, indent=2) + '\n')
+    args.output.write_text(json.dumps({'status': 'PASS', 'resource_scope': resource_scope, 'base_revision': revision, 'java_sources': sources, 'rust_source_sha256': sha(ROOT.parent.parent / 'src/java_compat.rs'), 'binary_sha256': sha(binary), 'java_home': os.environ.get('JAVA_HOME'), 'jars_before': before, 'jars_after': after, 'cases': records, 'boundary': 'Pinned Seed Protect Redirect contract tested' if args.seedprotect else 'Diagnostic fixtures only; Minecraft API and NeoForge NOT RUN'}, indent=2) + '\n')
     print('PASS: API, real Mixin cancellation, fresh-process persistence, required failure and refusal arms')
 
 if __name__ == '__main__':

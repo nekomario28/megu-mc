@@ -1,0 +1,46 @@
+{
+  "neoforge": {
+    "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.172/neoforge-21.1.172-universal.jar",
+    "sha256": "02d2bc5bc56a9a60405adbbdeb3b996ecdae82d38f0ff1cec5c9715117c0af47"
+  },
+  "neoforge_sources": {
+    "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.172/neoforge-21.1.172-sources.jar",
+    "sha256": "271a5a3064a01e73bf0f2bb95d37d856a6315d16c020c05b53250fac063618b4"
+  },
+  "bus": {
+    "url": "https://maven.neoforged.net/releases/net/neoforged/bus/8.0.2/bus-8.0.2.jar",
+    "sha256": "7ae71dcb9225f3593dca618a668add22b3a1b3f010fdcd746fcb31c3f6d57969"
+  },
+  "bus_sources": {
+    "url": "https://maven.neoforged.net/releases/net/neoforged/bus/8.0.2/bus-8.0.2-sources.jar",
+    "sha256": "78f10c0cfbb78807b9cfb264472f3805da23966bc5e81b311c961ac1613cb3ac"
+  },
+  "fml": {
+    "url": "https://maven.neoforged.net/releases/net/neoforged/fancymodloader/loader/4.0.39/loader-4.0.39.jar",
+    "sha256": "2c5b1386bba0e77c769e95d53eb2edb00773ef3bded5196a44277ade8f112534"
+  },
+  "distmarker": {
+    "url": "https://maven.neoforged.net/releases/net/neoforged/mergetool/2.0.0/mergetool-2.0.0-api.jar",
+    "sha256": "0260881294d8b218afe3d673f084d3745a55c28b35205d07d5e62d7f22202a00"
+  },
+  "log4j": {
+    "url": "https://repo.maven.apache.org/maven2/org/apache/logging/log4j/log4j-api/2.23.1/log4j-api-2.23.1.jar",
+    "sha256": "92ec1fd36ab3bc09de6198d2d7c0914685c0f7127ea931acc32fd2ecdd82ea89"
+  },
+  "annotations": {
+    "url": "https://repo.maven.apache.org/maven2/org/jetbrains/annotations/24.1.0/annotations-24.1.0.jar",
+    "sha256": "27a770dc7ce50500918bb8c3c0660c98290630ec796b5e3cf6b90f403b3033c6"
+  },
+  "typetools": {
+    "url": "https://repo.maven.apache.org/maven2/net/jodah/typetools/0.6.3/typetools-0.6.3.jar",
+    "sha256": "408300867804be05d1083cc0287dd3a21295a9e76090e288013ba5a4182dc96d"
+  },
+  "mod": {
+    "url": "https://cdn.modrinth.com/data/szm2rZGy/versions/HetyfPep/seedprotect-1.0.0.jar",
+    "sha256": "90d3318ce049d2e684b08d12ab6e35410a9d8e159afc43757102ab127c028acf"
+  },
+  "asm": {
+    "url": "https://maven.fabricmc.net/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar",
+    "sha256": "ed825d10ab1399c8c0cb669e688cf0c8c82629b4c8399b58352b68e92ca10fcb"
+  }
+}

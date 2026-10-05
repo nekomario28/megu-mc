@@ -73,10 +73,20 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--binary',required=True,type=pathlib.Path)
     parser.add_argument('--output',required=True,type=pathlib.Path)
+    parser.add_argument('--neoforge',action='store_true')
     args=parser.parse_args(); binary=args.binary.resolve(); build=ROOT/'.build'
     records=[]
+    inputs={binary:hashlib.sha256(binary.read_bytes()).hexdigest()}
+    for folder in ([ROOT] + ([ROOT.parent/'neoforge-events'] if args.neoforge else [])):
+        for path in (folder/'.cache').glob('*.jar'): inputs[path]=hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (folder/'.build').glob('*.jar'): inputs[path]=hashlib.sha256(path.read_bytes()).hexdigest()
+    assert hashlib.sha256((ROOT/'.cache/seedprotect-1.21.1-fabric-1.0.0.jar').read_bytes()).hexdigest()=='ccd48d96239f485846ced57968e73c6040df4a66ca6ea02cb180a29a5cff7a3f'
+    if args.neoforge:
+        assert hashlib.sha256((ROOT.parent/'neoforge-events/.cache/seedprotect-1.0.0.jar').read_bytes()).hexdigest()=='90d3318ce049d2e684b08d12ab6e35410a9d8e159afc43757102ab127c028acf'
     with tempfile.TemporaryDirectory(prefix='mc-spine-normal-') as scratch:
-        for index,mode in enumerate(['native','fabric_baseline','fabric_seedprotect']):
+        modes=['native','fabric_baseline','fabric_seedprotect']
+        if args.neoforge: modes += ['neoforge_baseline','neoforge_seedprotect']
+        for index,mode in enumerate(modes):
             cwd=pathlib.Path(scratch)/mode; cwd.mkdir()
             shutil.copyfile(ROOT.parent.parent/'config_packets.bin',cwd/'config_packets.bin')
             (cwd/'mods').mkdir()
@@ -84,7 +94,10 @@ def main():
             port=25650+index*2; rcon=port+1
             env={**os.environ,'JAVA_HOME':'/usr/lib/jvm/java-21-openjdk','MC_SPINE_WG':'old','MC_SPINE_PORT':str(port),'MC_SPINE_RCON_PORT':str(rcon),'MC_SPINE_RCON_PASS':'probe-only'}
             env.pop('MC_SPINE_FABRIC_CLASSPATH',None)
-            if mode!='native': env['MC_SPINE_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect.txt')
+            env.pop('MC_SPINE_NEOFORGE_CLASSPATH',None)
+            if mode.startswith('fabric_'): env['MC_SPINE_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect.txt')
+            if mode.startswith('neoforge_'): env['MC_SPINE_NEOFORGE_CLASSPATH']=str(ROOT.parent/'neoforge-events/.build/classpath.txt')
+            if mode=='neoforge_seedprotect': shutil.copyfile(ROOT.parent/'neoforge-events/.cache/seedprotect-1.0.0.jar',cwd/'mods/seedprotect.jar')
             log=cwd/'capture.log'
             with log.open('w') as output:
                 process=subprocess.Popen([str(binary)],cwd=cwd,env=env,stdout=output,stderr=subprocess.STDOUT)
@@ -115,7 +128,7 @@ def main():
                     time.sleep(.4)
                     block=command(rcon,'execute if block 8 70 8 dirt run say NORMAL_DIRT')
                     farmland=command(rcon,'execute if block 8 70 8 farmland run say NORMAL_FARMLAND')
-                    expected='farmland' if mode=='fabric_seedprotect' else 'dirt'
+                    expected='farmland' if mode.endswith('_seedprotect') else 'dirt'
                     assert (block == 'executed 1 command(s)') == (expected=='dirt'),(mode,block,farmland,log.read_text())
                     assert (farmland == 'executed 1 command(s)') == (expected=='farmland'),(mode,block,farmland)
                     assert health and health[-1] == 16.0,(mode,health)
@@ -147,7 +160,24 @@ def main():
             assert reload.returncode==0,(mode,reload.stderr)
             record.update({'reload':json.loads(reload.stdout.splitlines()[-1]),'world_sha256':hashlib.sha256(world.read_bytes()).hexdigest(),'log':log.read_text()})
             records.append(record)
-    receipt={'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'cases':records,'scope':'normal TCP player landing and adult cow tick; original pinned Fabric JAR; save and fresh-process reload'}
+        refusals=[('fabric_missing_invoke','fabric','Critical injection failure'),('fabric_unknown_mod','fabric','Unsupported mod hash'),('conflicting_adapters','both','Select only one Java loader adapter')]
+        if args.neoforge: refusals.append(('neoforge_unknown_mod','neoforge','Unsupported NeoForge mod hash'))
+        for index,(name,adapter,reason) in enumerate(refusals):
+            cwd=pathlib.Path(scratch)/name;cwd.mkdir();(cwd/'mods').mkdir()
+            env={**os.environ,'JAVA_HOME':'/usr/lib/jvm/java-21-openjdk','MC_SPINE_WG':'old','MC_SPINE_PORT':str(25670+index*2),'MC_SPINE_RCON_PORT':str(25671+index*2),'MC_SPINE_RCON_PASS':'probe-only'}
+            env.pop('MC_SPINE_FABRIC_CLASSPATH',None);env.pop('MC_SPINE_NEOFORGE_CLASSPATH',None)
+            if adapter in ['fabric','both']:env['MC_SPINE_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect.txt')
+            if adapter in ['neoforge','both']:env['MC_SPINE_NEOFORGE_CLASSPATH']=str(ROOT.parent/'neoforge-events/.build/classpath.txt')
+            if name=='fabric_missing_invoke':
+                env['MC_SPINE_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect-missing-invoke.txt')
+                shutil.copyfile(ROOT/'.cache/seedprotect-1.21.1-fabric-1.0.0.jar',cwd/'mods/seedprotect.jar')
+            if name.endswith('unknown_mod'):(cwd/'mods/unsupported.jar').write_bytes(b'not-a-supported-artifact')
+            result=subprocess.run([str(binary)],cwd=cwd,env=env,text=True,capture_output=True,timeout=15)
+            assert result.returncode!=0 and reason in result.stderr,(name,result.stderr)
+            assert 'listening :' not in result.stderr and not (cwd/'world_overlay.bin').exists(),(name,result.stderr)
+            records.append({'mode':name,'startup_rejection':reason,'stderr':result.stderr})
+    for path,value in inputs.items():assert hashlib.sha256(path.read_bytes()).hexdigest()==value,str(path)+': changed during verification'
+    receipt={'inputs_sha256':{str(path):value for path,value in inputs.items()},'rust_sources':{path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (ROOT.parent.parent/'src').glob('*.rs')},'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'cases':records,'scope':'normal TCP player landing and adult cow tick; original pinned Fabric and NeoForge artifacts; saved Rust-world reload; NeoForge full FML startup NOT RUN'}
     args.output.parent.mkdir(parents=True,exist_ok=True);args.output.write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps({'passed':len(records),'output':str(args.output)}))
 if __name__=='__main__':main()

@@ -32,3 +32,11 @@ MC_SPINE_PORT=25699 cargo run --locked
 ## Java mod互換層
 
 [段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を追加した。世界の正本はRustに置き、実Fabric Loader・MixinからJNIで操作する。診断用modの基盤検証に加え、既存Seed Protect JARのRedirect契約と名前変換を検証した。通常サーバーへの統合、Vanilla参照との同等性、NeoForge実行は未検証。通常ビルドではJava実行機能を有効にしない。
+
+## Selected Java mod contract
+
+Java compatibility is opt-in. The pinned Seed Protect Fabric artifact and its NeoForge event counterpart now reach the normal player/adult-cow farmland landing path. Rust keeps the only authoritative world; one synchronous JVM owner executes callbacks, and a native commit replaces farmland only if its original state still matches. Cancellation preserves farmland while existing fall damage continues.
+
+Build and validation instructions are in [Fabric contract](compat/fabric-probe/README.md) and [NeoForge event adapter](compat/neoforge-events/README.md). Set exactly one of `MC_SPINE_FABRIC_CLASSPATH` or `MC_SPINE_NEOFORGE_CLASSPATH` to its built absolute classpath-file path, and use the selected original JAR alone in that server working directory's `mods/`. Unknown mod bytes and required transformation failures reject startup before listeners open. Without those settings, the default Rust server loads no JVM.
+
+This supports one pinned feature contract, not arbitrary Minecraft mods. Full FML/NeoForge startup, all-entity collision physics, crop/loot behavior and general Minecraft API object identity remain outside the verified scope. See [compatibility specification](specs/mod-compatibility/README.md) for the open gates.

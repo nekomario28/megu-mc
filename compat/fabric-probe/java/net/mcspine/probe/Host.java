@@ -1,6 +1,6 @@
 package net.mcspine.probe;
 
-/** Probe ABI only. Rust owns the world; Java has no duplicate world model. */
+/** Scoped world ABI. Rust owns storage; normal callbacks may commit only their active landing. */
 public final class Host {
     private Host() { }
     public static native boolean setBlock(int x, int y, int z, int state);

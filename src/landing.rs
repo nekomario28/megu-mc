@@ -1,7 +1,13 @@
 //! Supported player landing operation. Java callbacks run synchronously on one owner.
 use super::*;
-#[cfg(feature = "fabric-probe")]
+#[cfg(feature = "java-compat")]
 use std::sync::mpsc::{self, SyncSender};
+
+#[derive(Clone, Copy, Debug)]
+pub enum Loader {
+    Fabric,
+    NeoForge,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trample {
@@ -9,24 +15,41 @@ pub struct Trample {
     pub state: u32,
     pub distance: f32,
 }
-#[cfg(feature = "fabric-probe")]
+#[cfg(feature = "java-compat")]
 pub struct Request {
     pub trample: Trample,
     pub reply: SyncSender<Result<bool, String>>,
 }
-#[cfg(feature = "fabric-probe")]
+#[cfg(feature = "java-compat")]
 static CALLBACKS: OnceLock<SyncSender<Request>> = OnceLock::new();
 
 pub fn initialize() -> Result<(), String> {
-    let Some(classpath) = std::env::var_os("MC_SPINE_FABRIC_CLASSPATH") else {
-        return Ok(());
+    let fabric = std::env::var_os("MC_SPINE_FABRIC_CLASSPATH");
+    let neoforge = std::env::var_os("MC_SPINE_NEOFORGE_CLASSPATH");
+    if fabric.is_some() && neoforge.is_some() {
+        return Err("Select only one Java loader adapter".into());
+    }
+    let (classpath, loader) = match (fabric, neoforge) {
+        (Some(path), None) => {
+            if !cfg!(feature = "fabric-probe") {
+                return Err("Fabric adapter requires --features fabric-probe".into());
+            }
+            (path, Loader::Fabric)
+        }
+        (None, Some(path)) => {
+            if !cfg!(feature = "neoforge-events") {
+                return Err("NeoForge adapter requires --features neoforge-events".into());
+            }
+            (path, Loader::NeoForge)
+        }
+        _ => return Ok(()),
     };
-    #[cfg(not(feature = "fabric-probe"))]
+    #[cfg(not(feature = "java-compat"))]
     {
-        let _ = classpath;
+        let _ = (classpath, loader);
         Err("MC_SPINE_FABRIC_CLASSPATH requires --features fabric-probe".into())
     }
-    #[cfg(feature = "fabric-probe")]
+    #[cfg(feature = "java-compat")]
     {
         let classpath = classpath
             .into_string()
@@ -34,17 +57,17 @@ pub fn initialize() -> Result<(), String> {
         let (send, receive) = mpsc::sync_channel(64);
         let (ready_send, ready_receive) = mpsc::channel();
         thread::Builder::new()
-            .name("fabric-game-owner".into())
+            .name("java-game-owner".into())
             .spawn(move || {
-                super::fabric_probe::serve(&classpath, receive, ready_send);
+                super::java_compat::serve(&classpath, loader, receive, ready_send);
             })
             .map_err(|e| e.to_string())?;
         ready_receive
             .recv()
-            .map_err(|_| "Fabric startup thread terminated")??;
+            .map_err(|_| "Java startup thread terminated")??;
         CALLBACKS
             .set(send)
-            .map_err(|_| "Fabric already initialized")?;
+            .map_err(|_| "Java owner already initialized")?;
         Ok(())
     }
 }
@@ -70,7 +93,7 @@ pub fn eligible(
 }
 
 fn commit(trample: Trample) -> Result<bool, String> {
-    #[cfg(feature = "fabric-probe")]
+    #[cfg(feature = "java-compat")]
     if let Some(callbacks) = CALLBACKS.get() {
         let (send, receive) = mpsc::sync_channel(0);
         callbacks
@@ -78,8 +101,8 @@ fn commit(trample: Trample) -> Result<bool, String> {
                 trample,
                 reply: send,
             })
-            .map_err(|_| "Fabric game owner terminated")?;
-        return receive.recv().map_err(|_| "Fabric callback terminated")?;
+            .map_err(|_| "Java game owner terminated")?;
+        return receive.recv().map_err(|_| "Java callback terminated")?;
     }
     Ok(super::set_block_if(
         trample.position.0,

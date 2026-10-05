@@ -8,7 +8,9 @@ lto = true
 strip = true
 
 [features]
-fabric-probe = ["dep:jni"]
+java-compat = ["dep:jni"]
+fabric-probe = ["java-compat"]
+neoforge-events = ["java-compat"]
 
 [dependencies]
 jni = { version = "0.21.1", features = ["invocation"], optional = true }

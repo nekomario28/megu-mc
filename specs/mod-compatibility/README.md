@@ -5,7 +5,7 @@ Target: Minecraft Java 1.21.1, Java 21, Fabric and NeoForge server mods. Client 
 
 ## Ownership and execution
 
-Rust owns world state, ticks, persistence, inventories and networking. Java objects expose operations on those owners through a narrow JNI boundary; they do not maintain a second authoritative world. Execute synchronous game callbacks on the owning game thread. Before exposing asynchronous APIs, define thread affinity, reentrancy and shutdown behavior explicitly.
+Rust owns world state, ticks, persistence, inventories and networking. Java objects expose operations on those owners through a narrow JNI boundary; they do not maintain a second authoritative world. Execute synchronous game callbacks on the dedicated owning operation thread. Before exposing asynchronous APIs, define thread affinity, reentrancy and shutdown behavior explicitly.
 
 Reuse actual loader and Mixin machinery where possible. Loader-specific lifecycle, registries, events, mappings and access transformations belong in separate adapters. Share concrete world operations once both consumers require them; do not invent a generic loader abstraction before its contracts are known.
 
@@ -39,7 +39,7 @@ Three lenses were applied: smallest end-to-end proof (loader â†’ native state â†
 
 Normal Fabric player/adult-cow landing is verified with the original Seed Protect WAKX5fBR JAR, normal TCP/tick entry points, and saved Rust-world reload. Real Vanilla/Fabric reference servers confirm adult-cow dirt conversion versus cancellation and saved MCA state. 18 diagnostic regression arms and 15 native tests pass. Broader collision, crop/loot and all-entity parity are still open.
 
-Implement the bounded NeoForge event adapter next using actual upstream game-bus and FarmlandTrampleEvent classes. Preserve one native landing commit and one JVM owner; do not implement a second event engine. Distinguish actual event API execution from full FML discovery/bootstrap, which remains unproven.
+The bounded NeoForge event adapter now uses actual upstream game-bus and FarmlandTrampleEvent classes with the original Seed Protect HetyfPep JAR. One guarded native commit and JVM owner serve both loaders. Five normal-server modes and four startup refusals pass, as do real event-bus contract checks. Full FML discovery/bootstrap and a full NeoForge reference remain NOT RUN. Next, close broader collision/crop coverage before expanding the supported artifact/API set.
 
 ## Sources
 

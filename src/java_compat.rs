@@ -1,4 +1,4 @@
-//! Explicit diagnostic mode: real Fabric/Mixin, existing Rust world, isolated storage.
+//! One JVM owner and guarded Rust world ABI for pinned Fabric and NeoForge operations.
 use jni::{
     objects::{JClass, JObject, JValue},
     sys::{jboolean, jint},
@@ -178,7 +178,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let jvm = create_jvm(&classpath)?;
     let mut env = jvm.attach_current_thread()?;
     let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
-        initialize(&mut env, &classpath, trample)?;
+        initialize_fabric(&mut env, &classpath, trample)?;
         Ok(env
             .call_static_method("net/mcspine/probe/Bootstrap", "run", "()Z", &[])?
             .z()?)
@@ -230,7 +230,7 @@ fn create_jvm(classpath: &str) -> Result<JavaVM, Box<dyn std::error::Error>> {
         .map_err(|_| "JVM owner already initialized")?;
     Ok(JavaVM::new(init)?)
 }
-fn initialize(
+fn initialize_fabric(
     env: &mut JNIEnv,
     classpath: &str,
     trample: bool,
@@ -255,25 +255,12 @@ fn initialize(
             ],
         )?
         .l()?;
-    env.register_native_methods(
-        JClass::from(host),
-        &[
-            NativeMethod {
-                name: "setBlock".into(),
-                sig: "(IIII)Z".into(),
-                fn_ptr: set_block as *mut c_void,
-            },
-            NativeMethod {
-                name: "getBlock".into(),
-                sig: "(III)I".into(),
-                fn_ptr: get_block as *mut c_void,
-            },
-        ],
-    )?;
+    register_host(env, host)?;
     Ok(())
 }
 pub fn serve(
     classpath_file: &str,
+    loader: super::landing::Loader,
     receive: std::sync::mpsc::Receiver<super::landing::Request>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
@@ -293,14 +280,28 @@ pub fn serve(
         let jvm = create_jvm(&classpath)?;
         let mut env = jvm.attach_current_thread()?;
         let setup = (|| -> Result<jni::objects::GlobalRef, Box<dyn std::error::Error>> {
-            initialize(&mut env, &classpath, true)?;
+            let bootstrap = match loader {
+                super::landing::Loader::Fabric => {
+                    initialize_fabric(&mut env, &classpath, true)?;
+                    "net/mcspine/probe/Bootstrap"
+                }
+                super::landing::Loader::NeoForge => {
+                    let directory =
+                        JObject::from(env.new_string(std::env::current_dir()?.to_string_lossy())?);
+                    let host = env
+                        .call_static_method(
+                            "net/mcspine/neoforge/Bootstrap",
+                            "initialize",
+                            "(Ljava/lang/String;)Ljava/lang/Class;",
+                            &[JValue::Object(&directory)],
+                        )?
+                        .l()?;
+                    register_host(&mut env, host)?;
+                    "net/mcspine/neoforge/Bootstrap"
+                }
+            };
             let hooks = env
-                .call_static_method(
-                    "net/mcspine/probe/Bootstrap",
-                    "initializeServer",
-                    "()Ljava/lang/Class;",
-                    &[],
-                )?
+                .call_static_method(bootstrap, "initializeServer", "()Ljava/lang/Class;", &[])?
                 .l()?;
             Ok(env.new_global_ref(hooks)?)
         })();
@@ -347,7 +348,7 @@ pub fn serve(
             let failed = result.is_err();
             let _ = request.reply.send(result);
             if failed {
-                return Err("Fabric callback failed; owner stopped".into());
+                return Err("Java callback failed; owner stopped".into());
             }
         }
         Ok(())
@@ -356,4 +357,23 @@ pub fn serve(
         let _ = ready.send(Err(error.to_string()));
         eprintln!("[mod-compatibility] {error}");
     }
+}
+
+fn register_host(env: &mut JNIEnv, host: JObject) -> Result<(), jni::errors::Error> {
+    env.register_native_methods(
+        JClass::from(host),
+        &[
+            NativeMethod {
+                name: "setBlock".into(),
+                sig: "(IIII)Z".into(),
+                fn_ptr: set_block as *mut c_void,
+            },
+            NativeMethod {
+                name: "getBlock".into(),
+                sig: "(III)I".into(),
+                fn_ptr: get_block as *mut c_void,
+            },
+        ],
+    )?;
+    Ok(())
 }

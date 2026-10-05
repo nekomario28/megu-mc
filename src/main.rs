@@ -8,8 +8,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-#[cfg(feature = "fabric-probe")]
-mod fabric_probe;
+#[cfg(feature = "java-compat")]
+mod java_compat;
 mod landing;
 mod cached_lookup;
 use cached_lookup::CachedLookup;
@@ -13140,7 +13140,7 @@ fn main() {
     if probe_args.first().is_some_and(|arg| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample")) {
         #[cfg(feature = "fabric-probe")]
         {
-            if let Err(error) = fabric_probe::run(&probe_args) {
+            if let Err(error) = java_compat::run(&probe_args) {
                 eprintln!("[fabric-probe] {error}");
                 std::process::exit(1);
             }
