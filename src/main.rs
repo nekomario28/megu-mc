@@ -54,22 +54,34 @@ fn read_pos(b: &[u8]) -> (i32, i32, i32) {
     ((x << 6) >> 6, (y << 20) >> 20, (z << 6) >> 6) // sign-extend, (x,y,z) order
 }
 
-fn read_packet(s: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
-    // single-shot read (login phase only; consume loop uses RxBuf)
-    let mut len = 0i64; let mut i = 0;
-    loop {
-        let mut b = [0u8; 1];
-        if s.read(&mut b).ok()? != 1 { return None }
-        len |= ((b[0] & 0x7f) as i64) << (7 * i); i += 1;
-        if b[0] & 0x80 == 0 { break }
-        if i > 5 { return None }
+// A single wall-clock deadline covers every byte of pre-play handshaking.
+// Socket read timeouts alone can be bypassed by sending one byte at a time.
+fn read_before(s: &mut TcpStream, mut out: &mut [u8], deadline: Instant) -> Option<()> {
+    while !out.is_empty() {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        s.set_read_timeout(Some(remaining)).ok()?;
+        let n = s.read(out).ok()?;
+        if n == 0 { return None; }
+        out = &mut out[n..];
     }
-    if len < 0 || len > (16 << 20) {
+    Some(())
+}
+fn read_packet(s: &mut TcpStream, deadline: Instant) -> Option<(i64, Vec<u8>)> {
+    let mut len = 0u64;
+    let mut done = false;
+    for i in 0..5 {
+        let mut b = [0u8; 1];
+        read_before(s, &mut b, deadline)?;
+        len |= ((b[0] & 0x7f) as u64) << (7 * i);
+        if b[0] & 0x80 == 0 { done = true; break; }
+    }
+    // Pre-play packets are small; reject large declared allocations.
+    if !done || len == 0 || len > 64 * 1024 {
         let _ = s.shutdown(std::net::Shutdown::Both);
-        return None
+        return None;
     }
     let mut body = vec![0u8; len as usize];
-    s.read_exact(&mut body).ok()?;
+    read_before(s, &mut body, deadline)?;
     let mut sl = &body[..];
     let id = read_varint(&mut sl)?;
     Some((id, sl.to_vec()))
@@ -11023,28 +11035,29 @@ fn handle(mut s: TcpStream) {
     // Applied before handshake/login: idle unauthenticated sockets must expire.
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
-    let (id, hs) = match read_packet(&mut s) { Some(x) => x, None => return };
+    let login_deadline = Instant::now() + Duration::from_secs(30);
+    let (id, hs) = match read_packet(&mut s, login_deadline) { Some(x) => x, None => return };
     if id != 0 { return }
     let Some(next) = handshake_next_state(&hs) else { return };
     if next == 1 {
-        if let Some((0, _)) = read_packet(&mut s) {
+        if let Some((0, _)) = read_packet(&mut s, login_deadline) {
             let json = "{\"version\":{\"name\":\"1.21.1\",\"protocol\":767},\"players\":{\"max\":20,\"online\":0},\"description\":{\"text\":\"mc-spine\"}}";
             let mut pl = Vec::new(); write_str(&mut pl, json);
             let _ = send_packet(&mut s, 0, pl);
         }
-        if let Some((1, ping)) = read_packet(&mut s) { let _ = send_packet(&mut s, 1, ping); }
+        if let Some((1, ping)) = read_packet(&mut s, login_deadline) { let _ = send_packet(&mut s, 1, ping); }
         return;
     }
     if next != 2 { return }
     // ---- login ----
-    let (lid, lbody) = match read_packet(&mut s) { Some(x) => x, None => return };
+    let (lid, lbody) = match read_packet(&mut s, login_deadline) { Some(x) => x, None => return };
     if lid != 0 { return }
     let Some((name, uuid)) = login_identity(&lbody) else { return };
     let mut ls = Vec::new();
     ls.extend_from_slice(&uuid); write_str(&mut ls, &name);
     write_varint(&mut ls, 0); ls.push(0);
     if send_packet(&mut s, 2, ls).is_err() { return }
-    match read_packet(&mut s) { Some((3, _)) => {}, _ => return }
+    match read_packet(&mut s, login_deadline) { Some((3, _)) => {}, _ => return }
     // ---- config ----
     let cfg = load_config_packets();
     let mut sent_selpacks = false;
@@ -11057,7 +11070,7 @@ fn handle(mut s: TcpStream) {
     let t0 = Instant::now();
     let mut got_selpacks = false;
     while Instant::now() - t0 < Duration::from_secs(15) {
-        match read_packet(&mut s) {
+        match read_packet(&mut s, login_deadline) {
             Some((0x07, _)) => { got_selpacks = true; break }
             Some(_) => continue,
             None => continue,
@@ -11072,7 +11085,7 @@ fn handle(mut s: TcpStream) {
     let t0 = Instant::now();
     loop {
         if Instant::now() - t0 > Duration::from_secs(15) { return }
-        match read_packet(&mut s) {
+        match read_packet(&mut s, login_deadline) {
             Some((0x03, _)) => break,
             Some(_) => continue,
             None => continue,
