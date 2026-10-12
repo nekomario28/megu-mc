@@ -3893,6 +3893,7 @@ fn read_comps(b: &[u8], p: &mut usize) -> Comps {
         if *p >= b.len() { break }
         let ty = rv_varint(b, p);
         if b.len().saturating_sub(*p) < 2 { break }
+        if b.len().saturating_sub(*p) < 2 { break }
         let l = u16::from_be_bytes(b[*p..*p + 2].try_into().unwrap()) as usize; *p += 2;
         if b.len().saturating_sub(*p) < l { break }
         c.push((ty, b[*p..*p + l].to_vec())); *p += l;
@@ -3909,8 +3910,37 @@ fn rv_varint(b: &[u8], p: &mut usize) -> i64 {
     }
     v
 }
+// Envelope protects new saves from silent partial-load and overwrite after a
+// truncated or torn write. Legacy MET2/MET3 files remain readable for migration.
+// SHA-1 detects accidental damage; it does not authenticate untrusted files.
+const SAVE_MAGIC: &[u8; 4] = b"SPN4";
+fn wrap_world_payload(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 32);
+    out.extend_from_slice(SAVE_MAGIC);
+    out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    out.extend_from_slice(&sha1(payload));
+    out.extend_from_slice(payload);
+    out
+}
+fn unwrap_world_payload(raw: Vec<u8>) -> Result<Vec<u8>, &'static str> {
+    if raw.starts_with(SAVE_MAGIC) {
+        if raw.len() < 32 { return Err("truncated save header"); }
+        let len = u64::from_be_bytes(raw[4..12].try_into().unwrap());
+        if len != (raw.len() - 32) as u64 { return Err("save length mismatch"); }
+        if sha1(&raw[32..]) != raw[12..32] { return Err("save checksum mismatch"); }
+        return Ok(raw[32..].to_vec());
+    }
+    if raw.starts_with(b"SPN") { return Err("unsupported or corrupted save format"); }
+    Ok(raw) // existing unwrapped v2.37 format
+}
+fn save_world() {
+    let mut f = Vec::new();
+    save_world_into(&mut f);
+    // The envelope lets load reject a torn or truncated write.
+    let _ = std::fs::write(WORLD_FILE, &wrap_world_payload(&f));
+}
 fn save_world_into(f: &mut Vec<u8>) {
-        let w = world().lock().unwrap();
+    let w = world().lock().unwrap();
     write_varint(&mut *f, w.len() as i64);
     for (&(cx, cz), c) in w.iter() {
         (*f).extend_from_slice(&cx.to_be_bytes());
@@ -4263,14 +4293,24 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
     }
     let tmp = format!("{}.tmp", WORLD_FILE);
-    if std::fs::write(&tmp, &f).is_ok() {
-        let _ = std::fs::rename(&tmp, WORLD_FILE);
+    let framed = wrap_world_payload(&f);
+    if std::fs::write(&tmp, &framed).is_ok() {
+        if std::path::Path::new(WORLD_FILE).exists() {
+            let _ = std::fs::copy(WORLD_FILE, format!("{}.bak", WORLD_FILE));
+        }
+        if let Err(error) = std::fs::rename(&tmp, WORLD_FILE) {
+            eprintln!("[spine] world save rename failed: {error}");
+        }
     }
 }
-fn save_world() {
-    let mut f = Vec::new();
-    save_world_into(&mut f);
-    let _ = std::fs::write(WORLD_FILE, &f);
+fn load_world() -> Result<(), &'static str> {
+    let raw = match std::fs::read(WORLD_FILE) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("failed to read world save"),
+    };
+    load_world_from(&unwrap_world_payload(raw)?);
+    Ok(())
 }
 
 fn load_world_from(payload: &[u8]) {
@@ -4704,10 +4744,6 @@ fn load_world_from(payload: &[u8]) {
 }
 
 // ---------- name -> id tables (generated from minecraft-data 1.21.1) ----------
-fn load_world() {
-    let Ok(b) = std::fs::read(WORLD_FILE) else { return };
-    load_world_from(&b);
-}
 
 fn state_from_arg(arg: &str) -> Option<u32> {
     let (name, props) = match arg.split_once('[') {
@@ -13814,5 +13850,27 @@ mod resource_pack_url_tests {
         assert!(resource_pack_url("0.0.0.0", None).is_none());
         assert_eq!(resource_pack_url("0.0.0.0", Some("https://example.org/pack.zip")).as_deref(), Some("https://example.org/pack.zip"));
         assert!(resource_pack_url("0.0.0.0", Some("javascript:alert(1)")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod save_integrity_tests {
+    use super::*;
+    #[test]
+    fn wrapped_world_roundtrip_and_legacy_acceptance() {
+        let legacy = vec![0u8, b'M', b'E', b'T', b'3', 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(unwrap_world_payload(legacy.clone()), Ok(legacy.clone()));
+        assert_eq!(unwrap_world_payload(wrap_world_payload(&legacy)), Ok(legacy));
+    }
+    #[test]
+    fn truncated_and_damaged_new_saves_are_rejected() {
+        let original = wrap_world_payload(b"world-data");
+        for n in 0..original.len() {
+            let short = original[..n].to_vec();
+            if n >= 3 { assert!(unwrap_world_payload(short).is_err(), "truncated to {n}"); }
+        }
+        let mut corrupt = original;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert_eq!(unwrap_world_payload(corrupt), Err("save checksum mismatch"));
     }
 }
