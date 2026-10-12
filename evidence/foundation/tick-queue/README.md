@@ -76,6 +76,28 @@ y=150 に上げて40tickでは地面に届かないようにした。
 
 並列実行で60 passed が5回連続で安定することを確認。
 
+## 水の移行（完了）
+
+`water_tick` を `due()` 主導にした。`waters()` の全件cloneと全件巡回は消えた。
+
+- 登録2箇所（`set_block_if` と chunk再構築）で `schedule(pos, 1)`
+- ループは `due()`。**5つの出口すべてで `requeue_water`** を呼ぶ
+  （cold/not-ready、2つのsched_result(true)、lvl>=7、末尾）
+- 登録から外す場合だけ re-queue しない（`due()` で既にキューから出ている）
+- 遅延値は**backoff map が権威**のまま。queue は「今dueのセル」だけを答える。
+  ラダー（`backoff_ticks`）の意味は変えていない
+
+**等価性はトレースゲートで確認**：移行後も
+`water_spread_trace_is_stable_across_the_scheduler_migration` が
+移行前と同一のトレースを返す。
+
+### 費用測定について
+
+このfixture（`entity_heavy` 等）は**水を含まない**ので、水の移行は
+fixtureでは測れない。したがって性能値は主張しない。
+移行の証拠は**トレースの一致**であって速度ではない。
+水セルを大量に含むfixtureを作るまで、費用は不明のまま。
+
 ## まだやっていないこと（重要）
 
 **システムへの接続は未実施。** `water_tick`/`lava_tick`/`hopper_tick` は

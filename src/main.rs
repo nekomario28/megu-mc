@@ -2365,13 +2365,14 @@ fn lava_tick() {
 }
 fn water_tick() {
     // vanilla-ish: source(80) spreads horizontally into air, level+1, max level 7
-    let cells: Vec<(i32, i32, i32)> = waters().lock().unwrap().iter().copied().collect();
-    // One region borrow for the loop: a per-cell is_warm acquired the mutex once
-    // per registered cell, every tick.
-    let region = (!cells.is_empty()).then(region_guard);
-    for (x, y, z) in cells {
-        let region = region.as_ref().unwrap();
-        if !region.is_warm(x, z) || !sched_ready(x, y, z) { continue }
+    // Only the cells that come due are visited, so a tick costs the cells that
+    // need work rather than every cell that exists. Every exit below re-queues the
+    // cell for its next visit, except removal from the registry, which drops it.
+    let due = { let mut q = water_queue().lock().unwrap(); q.due() };
+    if due.is_empty() { return }
+    let region = region_guard();
+    for (x, y, z) in due {
+        if !region.is_warm(x, z) || !sched_ready(x, y, z) { requeue_water(x, y, z); continue }
         let st = block_at(x, y, z);
         if !(80..=95).contains(&st) { waters().lock().unwrap().remove(&(x, y, z)); continue; }
         let lvl = st - 80;
@@ -2381,6 +2382,7 @@ fn water_tick() {
             set_block(x, y - 1, z, st);
             note_block_update(x, y - 1, z, st);
             sched_result(x, y, z, true);
+            requeue_water(x, y, z);
             continue;
         }
         if water_intoable(below) { // falls downward as level-8 falling water
@@ -2388,9 +2390,10 @@ fn water_tick() {
             set_block(x, y - 1, z, 88);
             note_block_update(x, y - 1, z, 88);
             sched_result(x, y, z, true);
+            requeue_water(x, y, z);
             continue;
         }
-        if lvl >= 7 { sched_result(x, y, z, false); continue }
+        if lvl >= 7 { sched_result(x, y, z, false); requeue_water(x, y, z); continue }
         let mut spread = false;
         for (dx, dz) in [(1,0),(-1,0),(0,1),(0,-1)] {
             let cst = block_at(x + dx, y, z + dz);
@@ -2411,6 +2414,7 @@ fn water_tick() {
             }
         }
         sched_result(x, y, z, spread);
+        requeue_water(x, y, z);
     }
 }
 static OBS_UNPOWER: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
@@ -3460,6 +3464,25 @@ fn sched_ready(x: i32, y: i32, z: i32) -> bool {
     let now = TICK_IDX.load(Ordering::Relaxed);
     backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)
 }
+/// Water cells waiting to be visited, indexed by delay. This replaces the
+/// per-tick sweep of every registered cell, which cost the number of registered
+/// cells rather than the number that come due and cloned them into a Vec each
+/// tick. The backoff map stays the source of the delay value; the queue only
+/// answers which cells are due now.
+static WATER_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
+fn water_queue() -> &'static Mutex<tick_queue::TickQueue> {
+    WATER_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
+}
+/// Delay to re-queue a cell for, read from the backoff map so the ladder is
+/// unchanged. A cell with no pending backoff is due next tick.
+fn requeue_water(x: i32, y: i32, z: i32) {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let delay = match backoff().lock().unwrap().get(&(x, y, z)) {
+        Some((due, _)) if *due > now => (*due - now) as usize,
+        _ => 1,
+    };
+    water_queue().lock().unwrap().schedule((x, y, z), delay);
+}
 /// call after evaluating a cell: did_work=true resets, false backs off.
 fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
     let now = TICK_IDX.load(Ordering::Relaxed);
@@ -3702,7 +3725,10 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     if (9225..=9234).contains(&st) { if hh.len() < HOPPER_CAP { hh.insert((x, y, z)); } } else { hh.remove(&(x, y, z)); }
     drop(hh);
     let mut wtr = waters().lock().unwrap();
-    if (80..=95).contains(&st) { wtr.insert((x, y, z)); } else { wtr.remove(&(x, y, z)); }
+    if (80..=95).contains(&st) {
+        wtr.insert((x, y, z));
+        water_queue().lock().unwrap().schedule((x, y, z), 1);
+    } else { wtr.remove(&(x, y, z)); }
     drop(wtr);
     let mut lv = lavas().lock().unwrap();
     if (96..=111).contains(&st) { lv.insert((x, y, z)); } else { lv.remove(&(x, y, z)); }
@@ -3920,7 +3946,10 @@ fn rebuild_derived_indexes() {
             let x = cx * 16 + (*idx & 15) as i32;
             let z = cz * 16 + ((*idx >> 4) & 15) as i32;
             let y = (*idx >> 8) as i32 + MIN_Y;
-            if (80..=95).contains(st) { wtr.insert((x, y, z)); }
+            if (80..=95).contains(st) {
+                wtr.insert((x, y, z));
+                water_queue().lock().unwrap().schedule((x, y, z), 1);
+            }
             if (96..=111).contains(st) { lavas().lock().unwrap().insert((x, y, z)); }
             if (9225..=9234).contains(st) { hh.insert((x, y, z)); }
             if (4278..=4285).contains(st) { cg.insert((x, y, z), (*st - 4278) as u8); }
