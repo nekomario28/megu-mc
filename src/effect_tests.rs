@@ -46,7 +46,7 @@ fn death_protection_updates_state_and_sends_effect_changes() {
 
     client.sock.lock().unwrap().shutdown(std::net::Shutdown::Write).unwrap();
     let mut changes = Vec::new();
-    while let Some((packet, body)) = read_packet(&mut receiver) {
+    while let Some((packet, body)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
         if packet == 0x43 || packet == 0x76 {
             let mut payload = &body[..];
             let entity = read_varint(&mut payload).unwrap();

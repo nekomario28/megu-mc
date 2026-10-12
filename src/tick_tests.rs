@@ -175,7 +175,7 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     // legitimately reach it here.
     for _ in 0..40 { game_tick(|_, tick| tick()); }
     let mut seen = Vec::new();
-    while let Some((packet, _)) = read_packet(&mut receiver) {
+    while let Some((packet, _)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
         if packet == 0x26 || packet == 0x64 { seen.push(packet); }
     }
     // Rewinding an anchor past its period must make the next tick fire it,
@@ -184,7 +184,7 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     *wall_anchor(&TIME_NOTIFY_AT).lock().unwrap() = Instant::now() - Duration::from_millis(TIME_NOTIFY_MS + 1);
     game_tick(|_, tick| tick());
     let mut fired = Vec::new();
-    while let Some((packet, _)) = read_packet(&mut receiver) {
+    while let Some((packet, _)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
         if packet == 0x26 || packet == 0x64 { fired.push(packet); }
     }
     // Restore before asserting so a failure cannot poison the shared fixture.
