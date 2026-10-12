@@ -10937,6 +10937,31 @@ fn json_component_nbt(json: &str) -> Vec<u8> {
 fn ack(seq: i64) -> Vec<u8> { let mut v = Vec::new(); write_varint(&mut v, seq); v }
 const FACE_OFF: [(i32, i32, i32); 6] = [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
 
+// Decode protocol-767 handshake without trusting unbounded client lengths.
+fn handshake_next_state(hs: &[u8]) -> Option<i64> {
+    let mut p = hs;
+    if read_varint(&mut p)? != 767 { return None; }
+    let address_len = usize::try_from(read_varint(&mut p)?).ok()?;
+    if address_len > 255 || p.len() < address_len.checked_add(2)? { return None; }
+    std::str::from_utf8(&p[..address_len]).ok()?;
+    p = &p[address_len + 2..]; // address + two-byte port
+    let next = read_varint(&mut p)?;
+    matches!(next, 1 | 2).then_some(next)
+}
+
+// This is an offline-mode prototype; client-provided identities are NOT
+// authenticated. Reject malformed and unbounded names and UUIDs.
+fn login_identity(body: &[u8]) -> Option<(String, [u8; 16])> {
+    let mut p = body;
+    let name_len = usize::try_from(read_varint(&mut p)?).ok()?;
+    if !(1..=16).contains(&name_len) || p.len() < name_len + 16 { return None; }
+    let name = std::str::from_utf8(&p[..name_len]).ok()?;
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return None; }
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&p[name_len..name_len + 16]);
+    Some((name.to_owned(), uuid))
+}
+
 fn handle(mut s: TcpStream) {
     s.set_nodelay(true).ok();
     // Applied before handshake/login: idle unauthenticated sockets must expire.
@@ -10944,11 +10969,7 @@ fn handle(mut s: TcpStream) {
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
     let (id, hs) = match read_packet(&mut s) { Some(x) => x, None => return };
     if id != 0 { return }
-    let mut p = &hs[..];
-    let _proto = read_varint(&mut p);
-    let alen = read_varint(&mut p).unwrap_or(0) as usize;
-    if p.len() < alen + 3 { return }
-    let next = p[alen + 2] as i64;
+    let Some(next) = handshake_next_state(&hs) else { return };
     if next == 1 {
         if let Some((0, _)) = read_packet(&mut s) {
             let json = "{\"version\":{\"name\":\"1.21.1\",\"protocol\":767},\"players\":{\"max\":20,\"online\":0},\"description\":{\"text\":\"mc-spine\"}}";
@@ -10962,13 +10983,9 @@ fn handle(mut s: TcpStream) {
     // ---- login ----
     let (lid, lbody) = match read_packet(&mut s) { Some(x) => x, None => return };
     if lid != 0 { return }
-    let mut lp = &lbody[..];
-    let nlen = read_varint(&mut lp).unwrap_or(0) as usize;
-    let name: String = String::from_utf8_lossy(&lp[..nlen.min(lp.len())]).chars().take(64).collect();
-    let uuid_off = nlen.min(lp.len());
-    let uuid = if lp.len() >= uuid_off + 16 { &lp[uuid_off..uuid_off + 16] } else { &[0u8; 16] };
+    let Some((name, uuid)) = login_identity(&lbody) else { return };
     let mut ls = Vec::new();
-    ls.extend_from_slice(uuid); write_str(&mut ls, &name);
+    ls.extend_from_slice(&uuid); write_str(&mut ls, &name);
     write_varint(&mut ls, 0); ls.push(0);
     if send_packet(&mut s, 2, ls).is_err() { return }
     match read_packet(&mut s) { Some((3, _)) => {}, _ => return }
@@ -11055,7 +11072,7 @@ fn handle(mut s: TcpStream) {
         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
         uuid: {
             let mut u = [0u8; 16];
-            let n = uuid.len().min(16); u[..n].copy_from_slice(&uuid[..n]); u
+            u.copy_from_slice(&uuid); u
         },
         name: name.clone(),
         pos: Mutex::new((sx, sy, sz, syaw, spitch, true)),
@@ -13650,8 +13667,12 @@ fn main() {
         });
     }
     let port: u16 = std::env::var("MC_SPINE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(25599);
-    let l = TcpListener::bind(("0.0.0.0", port)).unwrap();
-    eprintln!("mc-spine v0.6 listening :{}", port);
+    let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
+    eprintln!("mc-spine v0.6 listening {bind}:{port} (offline identities; no Mojang authentication)");
+    if bind != "127.0.0.1" && bind != "::1" {
+        eprintln!("[security] non-loopback bind: restrict access with a firewall/private network");
+    }
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
     for st in l.incoming() {
         if let Ok(s) = st {
@@ -13715,5 +13736,51 @@ mod connection_slot_tests {
         });
         assert!(result.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod handshake_security_tests {
+    use super::*;
+    #[test]
+    fn valid_handshake_and_login_identity() {
+        let mut h = Vec::new();
+        write_varint(&mut h, 767);
+        write_str(&mut h, "localhost");
+        h.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(&mut h, 2);
+        assert_eq!(handshake_next_state(&h), Some(2));
+        let mut login = Vec::new();
+        write_str(&mut login, "Test_Player");
+        login.extend_from_slice(&[7u8; 16]);
+        assert_eq!(login_identity(&login), Some(("Test_Player".into(), [7; 16])));
+    }
+    #[test]
+    fn malformed_handshake_is_rejected_without_panicking() {
+        let mut h = Vec::new();
+        write_varint(&mut h, 767);
+        write_varint(&mut h, i64::MAX);
+        assert_eq!(handshake_next_state(&h), None);
+        let mut truncated = Vec::new();
+        write_varint(&mut truncated, 767);
+        write_str(&mut truncated, "localhost");
+        truncated.extend_from_slice(&25565u16.to_be_bytes());
+        assert_eq!(handshake_next_state(&truncated), None);
+        let mut bad_proto = Vec::new();
+        write_varint(&mut bad_proto, 766);
+        write_str(&mut bad_proto, "localhost");
+        bad_proto.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(&mut bad_proto, 2);
+        assert_eq!(handshake_next_state(&bad_proto), None);
+    }
+    #[test]
+    fn malformed_login_does_not_assume_zero_uuid() {
+        let mut short = Vec::new();
+        write_str(&mut short, "Alice");
+        assert!(login_identity(&short).is_none());
+        let mut long_name = Vec::new();
+        write_str(&mut long_name, "APlayerWithAVeryLongUsername");
+        long_name.extend_from_slice(&[1u8;16]);
+        assert!(login_identity(&long_name).is_none());
     }
 }
