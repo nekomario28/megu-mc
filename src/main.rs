@@ -135,7 +135,7 @@ fn send_raw(s: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-struct Eff { id: i32, amp: i32, left: i32 } // left: server ticks (250ms)
+struct Eff { id: i32, amp: i32, left: i32 } // left: server ticks (TICK_MS)
 struct Client {
     eid: i32,
     uuid: [u8; 16],
@@ -1185,7 +1185,8 @@ fn totem_check(c: &Client) {
 // Both death-protection paths own the effect guard; do not acquire it here.
 fn totem_effects(ef: &mut Vec<Eff>) {
     ef.clear();
-    // Stored durations are still 250ms ticks: vanilla 900 / 100 / 800 game ticks.
+    // Stored durations are still server ticks: vanilla 900 / 100 / 800 game ticks.
+    // Wire values derive from GAME_TICKS_PER_TICK.
     for (name, amp, dur) in [("regeneration", 1, 180), ("absorption", 1, 20), ("fire_resistance", 0, 160)] {
         let id = name_to_effect(name).expect("totem effect must exist in the effect registry");
         ef.push(Eff { id, amp, left: dur });
@@ -1200,8 +1201,8 @@ fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
     totem_effects(ef);
     *c.absorb.lock().unwrap() = 8.0;
     for e in ef.iter() {
-        // The wire uses game ticks even while the simulation still stores 250ms ticks.
-        let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left * 5);
+        // The wire uses game ticks even while the simulation stores server ticks.
+        let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left * GAME_TICKS_PER_TICK as i32);
         if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x76, packet.clone()); }
         broadcast_seen(c.eid, |_| (0x76, packet.clone()));
     }
@@ -1291,6 +1292,14 @@ fn surface_y(x: i32, z: i32) -> f64 {
     while y > MIN_Y && block_at(x, y - 1, z) == 0 { y -= 1; }
     y as f64
 }
+// One owner for simulation cadence. Every per-tick increment, wire
+// conversion and wall-clock boundary composes from these values, so a coherent
+// cadence change is one edit instead of scattered multipliers.
+// The world clock must still advance 20 game ticks per real second, so the
+// per-tick advance is derived, not written as a literal 5.
+const TICK_MS: u64 = 250;
+const TICKS_PER_SECOND: u32 = 1000 / TICK_MS as u32;
+const GAME_TICKS_PER_TICK: u32 = 20 / TICKS_PER_SECOND;
 static TICK: AtomicU64 = AtomicU64::new(0);
 static WORLD_TIME: AtomicU64 = AtomicU64::new(1000); // morning
 static BOLTS: OnceLock<Mutex<Vec<(i32, i32)>>> = OnceLock::new(); // (eid, ticks-left) transient lightning visuals
@@ -1320,7 +1329,7 @@ fn keepalive_time_tick() {
     let t = TICK.fetch_add(1, Ordering::Relaxed);
     // world clock advances every tick (20 tps => +20/s)
     let wt = if GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) == 1 {
-        WORLD_TIME.fetch_add(5, Ordering::Relaxed) % 24000
+        WORLD_TIME.fetch_add(GAME_TICKS_PER_TICK as u64, Ordering::Relaxed) % 24000
     } else { WORLD_TIME.load(Ordering::Relaxed) % 24000 };
     if t % 4 == 0 {
         broadcast(0, |_c| {
@@ -1415,9 +1424,9 @@ fn keepalive_time_tick() {
                 *ex += d * if *c.sprinting.lock().unwrap() { 0.1 }
                     else if *c.sneaking.lock().unwrap() { 0.005 } else { 0.0 };
             }
-            // hunger effect (internal id 16): +0.005/lvl per tick
+            // hunger effect (internal id 16): +0.005/lvl per game tick
             if let Some(e) = c.effs.lock().unwrap().iter().find(|e| e.id == 16) {
-                *ex += 0.025 * (e.amp as f64 + 1.0); // vanilla 0.005/gametick = 0.025/250ms-tick
+                *ex += 0.005 * (e.amp as f64 + 1.0) * GAME_TICKS_PER_TICK as f64;
             }
             let food = *c.food.lock().unwrap();
             let mut h = c.hp.lock().unwrap();
@@ -1528,7 +1537,7 @@ fn keepalive_time_tick() {
         let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
         for c in cls.iter() { effects::tick_effects(c); }
     }
-    // crop growth: ~1 stage per 60s average (1/240 chance per 250ms tick)
+    // crop growth: ~1 stage per 60s average (1/240 chance per server tick)
     {
         let mut cg = crops().lock().unwrap();
         let mut ripe: Vec<(i32,i32,i32)> = Vec::new();
@@ -1935,7 +1944,7 @@ fn primed_tick() {
         let mut i = 0;
         while i < pl.len() {
             if !is_hot(pl[i].x as i32, pl[i].z as i32) {
-                pl[i].lit += Duration::from_millis(250); // fuse pauses while cold
+                pl[i].lit += Duration::from_millis(TICK_MS); // fuse pauses while cold
                 i += 1;
             } else if pl[i].lit.elapsed() > Duration::from_millis(4000) { boom.push(pl.remove(i)); }
             else { i += 1; }
@@ -2169,7 +2178,7 @@ fn solidify_on_contact(lx: i32, ly: i32, lz: i32, lava_lvl: u32) -> bool {
 
 fn lava_tick() {
     // vanilla: lava flows like water but ~6x slower and only 3 blocks
-    // horizontally in the overworld. Our tick=250ms ~5gt, so gating to
+    // horizontally in the overworld. Our tick=TICK_MS ~5gt, so gating to
     // every 6th tick lands near 30gt.
     let cells: Vec<(i32, i32, i32)> = lavas().lock().unwrap().iter().copied().collect();
     for (x, y, z) in cells {
@@ -9674,11 +9683,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                                     *f = (*f + amp + 1).min(20); drop(f);
                                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c)); } }
                                 _ => {
-                                    let ticks = secs * 4; // server ticks (250ms)
+                                    let ticks = secs * TICKS_PER_SECOND as i32; // server ticks
                                     { let mut ef = c.effs.lock().unwrap();
                                       ef.retain(|e| e.id != eid2);
                                       ef.push(Eff { id: eid2, amp, left: ticks }); }
-                                    fx.push(((*c).clone(), entity_effect_pkt(c.eid, eid2, amp, secs * 20)));
+                                    fx.push(((*c).clone(), entity_effect_pkt(c.eid, eid2, amp, ticks * GAME_TICKS_PER_TICK as i32)));
                                 }
                             }
                             touched += 1;
@@ -13020,7 +13029,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                                   ef.retain(|e| e.id != eid2);
                                   ef.push(Eff { id: eid2, amp, left: ticks }); }
                                 if eid2 == 21 { *me.absorb.lock().unwrap() = (amp + 1) as f32 * 4.0; }
-                                let pk = entity_effect_pkt(me.eid, eid2, amp, ticks * 5);
+                                let pk = entity_effect_pkt(me.eid, eid2, amp, ticks * GAME_TICKS_PER_TICK as i32);
                                 let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x76, pk.clone());
                                 broadcast_seen(me.eid, |_c| (0x76, pk.clone()));
                             }
@@ -13376,7 +13385,7 @@ fn main() {
         }
     }
     thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(TICK_MS));
         game_tick(|_, tick| tick());
     });
     // vanilla saves the world on SIGTERM/SIGINT (docker/systemd stop);

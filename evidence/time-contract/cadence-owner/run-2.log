@@ -1,0 +1,432 @@
+
+running 1 test
+test tick_tests::profile_game_tick ... [sz] t=20 VmRSS:	    4848 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=40 VmRSS:	    4852 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=60 VmRSS:	    4852 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=80 VmRSS:	    4852 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=100 VmRSS:	    4852 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=120 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=140 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=160 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=180 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=200 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=220 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=240 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=260 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=280 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=300 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=320 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=340 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=360 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=380 VmRSS:	    4860 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=400 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=420 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=440 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=460 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=480 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=500 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=520 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=540 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=560 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=580 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=600 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=620 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=640 VmRSS:	    4864 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=660 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=680 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=700 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=720 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=740 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=760 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=780 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=800 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=820 VmRSS:	    4868 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=840 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=860 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=880 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=900 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=920 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=940 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=960 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=980 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1000 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1020 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1040 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1060 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1080 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1100 VmRSS:	    4872 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+PROFILE	empty	tick	1000	1531976	1052	9217	9478
+PROFILE	empty	actors	1000	27102	60
+PROFILE	empty	arrows	1000	28946	50
+PROFILE	empty	block_updates	1000	28727	671
+PROFILE	empty	drops	1000	67820	81
+PROFILE	empty	environment	1000	611759	13435
+PROFILE	empty	furnaces	1000	28379	40
+PROFILE	empty	hoppers	1000	28949	40
+PROFILE	empty	hot_regions	1000	63418	71
+PROFILE	empty	interest	1000	30238	41
+PROFILE	empty	lava	167	4727	40
+PROFILE	empty	mobs	1000	31355	41
+PROFILE	empty	observers	1000	53744	61
+PROFILE	empty	plugins	1000	26394	31
+PROFILE	empty	tnt	1000	27971	50
+PROFILE	empty	water	1000	28883	40
+[sz] t=20 VmRSS:	    4876 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=40 VmRSS:	    4876 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=60 VmRSS:	    4876 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=80 VmRSS:	    4876 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=100 VmRSS:	    4876 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=120 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=140 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=160 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=180 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=200 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=220 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=240 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=260 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=280 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=300 VmRSS:	    4880 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=320 VmRSS:	    4884 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=340 VmRSS:	    4884 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=360 VmRSS:	    4884 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=380 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=400 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=420 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=440 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=460 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=480 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=500 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=520 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=540 VmRSS:	    4888 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=560 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=580 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=600 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=620 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=640 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=660 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=680 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=700 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=720 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=740 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=760 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=780 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=800 VmRSS:	    4892 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=820 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=840 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=860 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=880 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=900 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=920 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=940 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=960 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=980 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1000 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1020 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1040 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1060 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1080 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1100 VmRSS:	    4896 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+PROFILE	idle_actor	tick	1000	10534149	9959	18365	19507
+PROFILE	idle_actor	actors	1000	79209	271
+PROFILE	idle_actor	arrows	1000	29214	220
+PROFILE	idle_actor	block_updates	1000	28752	110
+PROFILE	idle_actor	drops	1000	68440	340
+PROFILE	idle_actor	environment	1000	646115	21100
+PROFILE	idle_actor	furnaces	1000	28025	100
+PROFILE	idle_actor	hoppers	1000	29347	111
+PROFILE	idle_actor	hot_regions	1000	8951668	21380
+PROFILE	idle_actor	interest	1000	31915	140
+PROFILE	idle_actor	lava	167	4954	100
+PROFILE	idle_actor	mobs	1000	31926	210
+PROFILE	idle_actor	observers	1000	54342	140
+PROFILE	idle_actor	plugins	1000	26334	50
+PROFILE	idle_actor	tnt	1000	27210	91
+PROFILE	idle_actor	water	1000	29392	60
+[sz] t=20 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=40 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=60 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=80 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=120 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=140 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=160 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=180 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=200 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=220 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=240 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=260 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=280 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=300 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=320 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=340 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=360 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=380 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=400 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=420 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=440 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=460 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=480 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=500 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=520 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=540 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=560 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=580 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=600 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=620 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=640 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=660 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=680 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=700 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=720 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=740 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=760 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=780 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=800 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=820 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=840 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=860 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=880 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=900 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=920 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=940 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=960 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=980 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1000 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1020 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1040 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1060 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1080 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+PROFILE	idle_furnaces	tick	1000	19877124	18885	27382	29095
+PROFILE	idle_furnaces	actors	1000	80494	190
+PROFILE	idle_furnaces	arrows	1000	29046	80
+PROFILE	idle_furnaces	block_updates	1000	28856	60
+PROFILE	idle_furnaces	drops	1000	68453	90
+PROFILE	idle_furnaces	environment	1000	691332	17703
+PROFILE	idle_furnaces	furnaces	1000	9279744	219245
+PROFILE	idle_furnaces	hoppers	1000	29180	90
+PROFILE	idle_furnaces	hot_regions	1000	9007479	127902
+PROFILE	idle_furnaces	interest	1000	30348	50
+PROFILE	idle_furnaces	lava	167	4917	50
+PROFILE	idle_furnaces	mobs	1000	31911	71
+PROFILE	idle_furnaces	observers	1000	54085	90
+PROFILE	idle_furnaces	plugins	1000	26576	90
+PROFILE	idle_furnaces	tnt	1000	27422	31
+PROFILE	idle_furnaces	water	1000	29306	50
+[sz] t=20 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=40 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=60 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=80 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=120 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=140 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=160 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=180 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=200 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=220 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=240 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=260 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=280 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=300 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=320 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=340 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=360 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=380 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=400 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=420 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=440 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=460 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=480 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=500 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=520 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=540 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=560 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=580 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=600 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=620 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=640 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=660 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=680 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=700 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=720 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=740 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=760 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=780 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=800 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=820 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=840 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=860 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=880 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=900 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=920 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=940 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=960 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=980 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1000 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1020 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1040 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1060 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1080 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+[sz] t=1100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=400 crops=0 world=0 inv=0 clients=0
+PROFILE	active_furnaces	tick	1000	22651375	19747	28283	117612
+PROFILE	active_furnaces	actors	1000	79074	101
+PROFILE	active_furnaces	arrows	1000	29066	31
+PROFILE	active_furnaces	block_updates	1000	28790	40
+PROFILE	active_furnaces	drops	1000	68218	80
+PROFILE	active_furnaces	environment	1000	718174	59062
+PROFILE	active_furnaces	furnaces	1000	12133080	115188
+PROFILE	active_furnaces	hoppers	1000	29407	31
+PROFILE	active_furnaces	hot_regions	1000	8905461	36098
+PROFILE	active_furnaces	interest	1000	31872	41
+PROFILE	active_furnaces	lava	167	4849	31
+PROFILE	active_furnaces	mobs	1000	31840	41
+PROFILE	active_furnaces	observers	1000	54276	61
+PROFILE	active_furnaces	plugins	1000	26514	31
+PROFILE	active_furnaces	tnt	1000	27065	31
+PROFILE	active_furnaces	water	1000	29370	31
+[sz] t=20 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=40 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=60 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=80 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=120 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=140 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=160 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=180 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=200 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=220 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=240 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=260 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=280 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=300 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=320 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=340 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=360 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=380 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=400 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=420 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=440 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=460 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=480 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=500 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=520 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=540 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=560 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=580 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=600 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=620 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=640 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=660 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=680 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=700 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=720 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=740 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=760 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=780 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=800 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=820 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=840 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=860 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=880 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=900 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=920 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=940 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=960 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=980 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1000 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1020 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1040 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1060 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1080 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+PROFILE	crowded_actors	tick	1000	17604609	16301	24747	25909
+PROFILE	crowded_actors	actors	1000	4906971	23104
+PROFILE	crowded_actors	arrows	1000	29290	90
+PROFILE	crowded_actors	block_updates	1000	28148	140
+PROFILE	crowded_actors	drops	1000	68407	150
+PROFILE	crowded_actors	environment	1000	815806	158790
+PROFILE	crowded_actors	furnaces	1000	28149	60
+PROFILE	crowded_actors	hoppers	1000	29065	60
+PROFILE	crowded_actors	hot_regions	1000	11019249	448929
+PROFILE	crowded_actors	interest	1000	30377	50
+PROFILE	crowded_actors	lava	167	4918	50
+PROFILE	crowded_actors	mobs	1000	31979	60
+PROFILE	crowded_actors	observers	1000	56077	2184
+PROFILE	crowded_actors	plugins	1000	26501	40
+PROFILE	crowded_actors	tnt	1000	27206	31
+PROFILE	crowded_actors	water	1000	29404	50
+[sz] t=20 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=40 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=60 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=80 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=120 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=140 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=160 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=180 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=200 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=220 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=240 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=260 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=280 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=300 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=320 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=340 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=360 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=380 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=400 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=420 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=440 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=460 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=480 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=500 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=520 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=540 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=560 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=580 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=600 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=620 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=640 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=660 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=680 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=700 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=720 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=740 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=760 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=780 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=800 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=820 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=840 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=860 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=880 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=900 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=920 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=940 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=960 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=980 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1000 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1020 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1040 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1060 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1080 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+[sz] t=1100 VmRSS:	    5136 kB | mobs=0 drops=0 xps=0 arrows=0 bob=0 pearl=0 primed=0 chests=0 furn=0 crops=0 world=0 inv=0 clients=0
+PROFILE	dense_actors	tick	1000	185942236	183878	193606	201231
+PROFILE	dense_actors	actors	1000	4887171	7044
+PROFILE	dense_actors	arrows	1000	29321	151
+PROFILE	dense_actors	block_updates	1000	28190	451
+PROFILE	dense_actors	drops	1000	68675	191
+PROFILE	dense_actors	environment	1000	757171	18375
+PROFILE	dense_actors	furnaces	1000	28195	70
+PROFILE	dense_actors	hoppers	1000	29581	80
+PROFILE	dense_actors	hot_regions	1000	179444564	490808
+PROFILE	dense_actors	interest	1000	31904	140
+PROFILE	dense_actors	lava	167	4888	71
+PROFILE	dense_actors	mobs	1000	32196	100
+PROFILE	dense_actors	observers	1000	54223	90
+PROFILE	dense_actors	plugins	1000	26590	40
+PROFILE	dense_actors	tnt	1000	27460	61
+PROFILE	dense_actors	water	1000	29538	80
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.29s
+

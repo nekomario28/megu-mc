@@ -121,6 +121,34 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
 }
 
 #[test]
+fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    // 20 game ticks per real second is the invariant the world clock must keep.
+    // A cadence change is only coherent if this product stays 20.
+    assert_eq!(TICKS_PER_SECOND * GAME_TICKS_PER_TICK, 20);
+    assert_eq!(TICKS_PER_SECOND as u64 * TICK_MS, 1000);
+    let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_hot = hot().lock().unwrap().clone();
+    let old_warm = warm().lock().unwrap().clone();
+    let advanced = {
+        game_tick(|_, tick| tick());
+        WORLD_TIME.load(Ordering::Relaxed) - 1000
+    };
+    *actors().lock().unwrap() = old_actors;
+    *forceloaded().lock().unwrap() = old_forced;
+    *hot().lock().unwrap() = old_hot;
+    *warm().lock().unwrap() = old_warm;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    WORLD_TIME.store(old_time, Ordering::Relaxed);
+    assert_eq!(advanced, GAME_TICKS_PER_TICK as u64);
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();

@@ -81,7 +81,7 @@ fn totem_replaces_existing_effects_with_vanilla_grant() {
     // The production clock is still 4TPS. Compare its stored durations in
     // vanilla game ticks; remove this conversion during the atomic 20TPS cutover.
     let snapshot = |effects: &[Eff]| {
-        let mut result: Vec<_> = effects.iter().map(|e| (e.id, e.amp, e.left * 5)).collect();
+        let mut result: Vec<_> = effects.iter().map(|e| (e.id, e.amp, e.left * GAME_TICKS_PER_TICK as i32)).collect();
         result.sort_unstable();
         result
     };

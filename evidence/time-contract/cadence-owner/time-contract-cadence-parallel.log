@@ -1,0 +1,43 @@
+warning: field `distance` is never read
+  --> src/landing.rs:16:9
+   |
+13 | pub struct Trample {
+   |            ------- field in this struct
+...
+16 |     pub distance: f32,
+   |         ^^^^^^^^
+   |
+   = note: `Trample` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-spine` (bin "mc-spine" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/main.rs (target/debug/deps/mc_spine-1f88f8b672a353a0)
+
+running 23 tests
+test cached_lookup::tests::repeated_miss_is_cached_and_changed_input_is_observed ... ok
+test cached_lookup::tests::every_dependency_change_recomputes_even_after_false ... ok
+test effect_tests::totem_replaces_existing_effects_with_vanilla_grant ... ok
+test furnace_cache_tests::fuel_miss_does_not_delay_valid_fuel ... ok
+test landing::tests::vanilla_eligibility_boundaries ... ok
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test effect_tests::absorption_expiry_removes_unspent_shield ... ok
+test worldgen::wg_tests::aqdist ... ok
+test effect_tests::wither_death_protection_stops_old_effects_and_keeps_new_grants ... ok
+test effect_tests::death_protection_updates_state_and_sends_effect_changes ... ok
+test landing::tests::stale_landing_does_not_replace_new_block ... ok
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::cadence_owner_keeps_world_clock_at_vanilla_rate ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test worldgen::wg_tests::perf_probe ... ok
+test worldgen::wg_tests::xoroshiro_parity ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+test worldgen::wg_tests::aquifer_vectors ... ok
+test worldgen::wg_tests::feat_determinism ... ok
+test worldgen::wg_tests::biome_vectors ... ok
+test worldgen::wg_tests::material_rules_real_ids ... ok
+test worldgen::wg_tests::feat_populate_perf ... ok
+test worldgen::wg_tests::material_rules_load ... ok
+
+test result: ok. 22 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 10.91s
+

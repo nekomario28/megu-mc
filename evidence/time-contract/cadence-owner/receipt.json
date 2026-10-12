@@ -1,0 +1,27 @@
+{
+  "claim": "single-owner cadence constants with identical values, ordering and durations; NOT 20TPS, NOT vanilla parity for unconnected boundaries",
+  "negative_controls": {
+    "world_clock_advance": "replaced GAME_TICKS_PER_TICK with literal 4: cadence test fails",
+    "effect_wire": "removed GAME_TICKS_PER_TICK from totem wire: TCP test reports 720/80/640 instead of 900/100/800"
+  },
+  "reviewer_finding_fixed": "hunger exhaustion was scaled by TICKS_PER_SECOND, silently changing 0.025 to 0.020 per server tick; now scales by GAME_TICKS_PER_TICK",
+  "tests": "22 passed, 0 failed, 1 explicitly ignored serial and at 8 threads; three shared-fixture tests re-run 20 times at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "final independent review found no actionable defect; reviewer did not run tests",
+  "measurement": "mean tick within 2 percent of previous slice, all-process CPU 0.2862s -> 0.2827s; regression detection only, not a performance claim",
+  "unconnected": "keepalive/timeouts, weather counters, suffocation air, projectile TTL, fishing, movement coefficients, MET4 persistence",
+  "files_sha256": {
+    "README.md": "875800eb95f0d0506b79a95f099f21daf19ae427f54326d89b9a985beaaac6e3",
+    "build.log": "faeb413027f6f0bf57c4e86199aaa184644bd92d1a016599156204423768e0e1",
+    "results.json": "43651df9b576149995d1b6f17f024c68dccfc7af2731b871e82d0d29670d458e",
+    "run-0.log": "ee605e4a802545be65c0cb468dd9bc5a7fa5f74cbdeac7a11dc08f32adff6140",
+    "run-1.log": "df63c7de9d042d86ffd7701cefe38f0fdf9bf77b5c729c50216e2f7d29c7ad34",
+    "run-2.log": "788f3cabed4f8aaf856d54c5ed457fee5c6a534de44d5788a57436bfcc3d029c",
+    "time-contract-cadence-clock-negative.log": "a8f96938bd7504610bf44e4dcbcaf4021cc43e7541e703c96a587e08a1117aa8",
+    "time-contract-cadence-features.log": "b6476168e3defde8fa371e3353d33d385edf30dacf0268b09d6b08a10208e65c",
+    "time-contract-cadence-parallel.log": "414d52e5dbf61472186c397071aaa25f1e98512be3e3ee75aa63270b83164dde",
+    "time-contract-cadence-review.log": "802ba398cd81b7fe98c33cf80a6292af4a256b9ff8efc1d410320b9f56b53851",
+    "time-contract-cadence-suite.log": "e6597a577697cec756d14cfe0f2a8d9d15548a0e54ae058a512212376c5c4332",
+    "time-contract-cadence-wire-negative.log": "5281844d9470b5af3e47bfd8342335e3cce907339c6c0c9a3832bec69d789667"
+  }
+}
