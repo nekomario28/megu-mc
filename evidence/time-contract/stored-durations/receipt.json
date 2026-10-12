@@ -1,0 +1,19 @@
+{
+  "claim": "furnace/fuel/air/weather/backoff durations derived from vanilla game-tick values with identical real time at 4TPS; thunder duration corrected from rain counter; NOT 20TPS",
+  "interval_property": "server_ticks(gt) * TICK_MS == gt * 50 for 10/20/40/80/100/200/300/1600/3600/12000/16000 game ticks",
+  "negative_control": "division replaced by multiplication: 10 game ticks spanned 12500ms and the test failed",
+  "regression_caught_during_implementation": "first version multiplied instead of dividing, making coal burn 1600 server ticks (400s); the existing furnace regression test caught it",
+  "behavior_fix": "thunder 2400 -> server_ticks(3600) = 720 server ticks (180s). The old code shared rain counter and gave 600s.",
+  "tests": "25 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN. codex review was interrupted by an external usage limit. This slice did not pass an independent review gate.",
+  "files_sha256": {
+    "README.md": "321bf83c87877a9831ecd7d2caebdd1d10da05987aabf4f8484a0126c521f7c9",
+    "results.json": "21df3c71ee08d89d6d42b39086d2f560c116a56ee7cb679215c0c3dda7d8a803",
+    "time-contract-stored-features.log": "11a984d15598045a9c98b88fd799ca600e22a988431f58564f7d292b3a16083a",
+    "time-contract-stored-negative.log": "680a4233fcce7ebcef37fb0d8d8be9d0bf3dd940ad01b23dbc8d746b6e1b294c",
+    "time-contract-stored-parallel.log": "f570b0fdded712d654e7c8131a5c3f4e76ea7618c8bb06cc5bf9e632c488ba46",
+    "time-contract-stored-review.log": "8d809fef9445a4aa709ab5ab020465a1d3a78a418a08a179fee3bcb0687b947c",
+    "time-contract-stored-suite.log": "e003ceb40d57b732913bb5881feea5427ea7f3fb5f35218ce379d4ae5041c35e"
+  }
+}

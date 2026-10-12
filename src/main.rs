@@ -1300,13 +1300,17 @@ fn surface_y(x: i32, z: i32) -> f64 {
 const TICK_MS: u64 = 250;
 const TICKS_PER_SECOND: u32 = 1000 / TICK_MS as u32;
 const GAME_TICKS_PER_TICK: u32 = 20 / TICKS_PER_SECOND;
-/// Vanilla states damage and healing intervals in game ticks. Deriving the
-/// server-tick period keeps the real-time interval identical across cadences.
-/// A period below one server tick collapses to every tick, never to zero.
-const fn server_tick_period(game_ticks: u64) -> u64 {
-    let period = game_ticks / GAME_TICKS_PER_TICK as u64;
-    if period == 0 { 1 } else { period }
+/// Vanilla states every timing quantity in game ticks. Dividing by the ticks
+/// per server tick converts one to the other, so a duration or interval keeps
+/// the same real time at any cadence. Anything below one server tick collapses
+/// to every tick rather than to zero, which would divide by zero in a modulo.
+const fn server_ticks(game_ticks: u64) -> u64 {
+    let ticks = game_ticks / GAME_TICKS_PER_TICK as u64;
+    if ticks == 0 { 1 } else { ticks }
 }
+/// The lazy-schedule ladder doubles the re-check interval up to 80 game ticks
+/// (4 s). Vanilla has no analogue; this is the lightweight schedule itself.
+const fn backoff_ticks(fails: u64) -> u64 { server_ticks(10 << fails.saturating_sub(1)) }
 // Wall-clock owners. Vanilla defines these in real time, not in game ticks, so
 // they anchor on Instants: changing the simulation cadence must not shift them.
 const KEEPALIVE_MS: u64 = 15_000;   // ServerCommonPacketListenerImpl
@@ -1391,10 +1395,10 @@ fn keepalive_time_tick() {
                 broadcast(-1, |_c| { let mut p = vec![8u8]; p.extend_from_slice(&0f32.to_be_bytes()); (0x22, p.clone()) });
             }
         } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1 && t.wrapping_mul(2654435761) % 6000 == 0 {
-            RAINING.store(2400, Ordering::Relaxed);
+            RAINING.store(server_ticks(12000), Ordering::Relaxed);
             broadcast(-1, |_c| (0x22, vec![1u8, 0, 0, 0, 0]));
             if rand_u64() % 8 == 0 { // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
-                THUNDERING.store(2400, Ordering::Relaxed);
+                THUNDERING.store(server_ticks(3600), Ordering::Relaxed);
                 broadcast(-1, |_c| { let mut p = vec![8u8]; p.extend_from_slice(&1f32.to_be_bytes()); (0x22, p.clone()) });
             }
         }
@@ -1423,7 +1427,7 @@ fn keepalive_time_tick() {
                     iv.get(&6i16).map(|v| v.0).unwrap_or(0) } == name_to_item("elytra").unwrap_or(-9);
                 let glide = !gnd && ely && py < ff - 0.1 && *c.hp.lock().unwrap() > 0.0;
                 // vanilla: elytra pays 1 durability per second of glide
-                if glide && t % server_tick_period(20) == 0 && damage_inv_slot(c, 6) {
+                if glide && t % server_ticks(20) == 0 && damage_inv_slot(c, 6) {
                     let st = c.inv.lock().unwrap().get(&6i16).cloned().unwrap_or((0, 0, Vec::new()));
                     resync_slot(c, 0, 6, &st);
                 }
@@ -1461,7 +1465,7 @@ fn keepalive_time_tick() {
             if GR_NATURAL_REGEN.load(Ordering::Relaxed) == 1 && food >= 18 && *h < mh && *h > 0.0 {
                 // vanilla: fast heal 1hp/10t while food==20&&sat>0, else 1hp/80t; +6 exh per hp
                 let fast = food >= 20 && *c.sat.lock().unwrap() > 0.0;
-                if t % server_tick_period(if fast { 10 } else { 80 }) == 0 { *h = (*h + 1.0).min(mh); dirty = true; *ex += 6.0; }
+                if t % server_ticks(if fast { 10 } else { 80 }) == 0 { *h = (*h + 1.0).min(mh); dirty = true; *ex += 6.0; }
             }
             if *ex >= 4.0 {
                 *ex -= 4.0; dirty = true;
@@ -1475,14 +1479,14 @@ fn keepalive_time_tick() {
                 let wst = name_to_state("water").unwrap_or(u32::MAX);
                 let submerged = block_at(px.floor() as i32, (py + 1.62).floor() as i32, pz.floor() as i32) == wst;
                 let mut air = c.air.lock().unwrap();
-                if !submerged { *air = 60; }
+                if !submerged { *air = server_ticks(300) as i32; }
                 else if *air > 0 {
                     // respiration: air drains (lvl+1)x slower
                     let resp: i64 = { let iv = c.inv.lock().unwrap();
                         enchant_level(&iv.get(&5i16).map(|v| v.2.clone()).unwrap_or_default(), 30) };
                     if resp == 0 || t % (resp + 1) as u64 == 0 { *air -= 1; }
                 }
-                else if t % server_tick_period(20) == 0 { *h = (*h - 2.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                else if t % server_ticks(20) == 0 { *h = (*h - 2.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
             }
             {   // lava: feet in lava -> 4hp/tick-ish (vanilla 4hp/0.5s; ours every 2 ticks)
                 let lst = name_to_state("lava").unwrap_or(u32::MAX);
@@ -1495,20 +1499,20 @@ fn keepalive_time_tick() {
                 // fire_protection epf applies, armor does not
                 let fst = name_to_state("fire").unwrap_or(u32::MAX);
                 let in_fire = !fire_immune && (block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
-                if in_fire && t % server_tick_period(20) == 0 { *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                if in_fire && t % server_ticks(20) == 0 { *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
                 // void: 4hp per 0.5s below y=-64, ignores armor (vanilla)
-                if py < -64.0 && t % server_tick_period(10) == 0 { *h = (*h - 4.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                if py < -64.0 && t % server_ticks(10) == 0 { *h = (*h - 4.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
                 // suffocation: solid block at head height, 1hp/0.5s (vanilla)
-                if t % server_tick_period(10) == 0 {
+                if t % server_ticks(10) == 0 {
                     let hb = block_at(px.floor() as i32, (py + 1.62).floor() as i32, pz.floor() as i32);
                     if hb != u32::MAX && !mob_passable(hb) { *h = (*h - 1.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
                 }
                 // contact damage: cactus adjacent (1hp/0.5s), magma underfoot
                 // (1hp/0.5s, sneaking safe, fire kind), berry bush inside
                 let (bx, bz) = (px.floor() as i32, pz.floor() as i32);
-                if t % server_tick_period(10) == 0 {
+                if t % server_ticks(10) == 0 {
                     let cst = name_to_state("cactus").unwrap_or(u32::MAX);
-                    let near_cactus = t % server_tick_period(20) == 0 && [[1,0],[-1,0],[0,1],[0,-1],[0,0]].iter().any(|&[dx,dz]|
+                    let near_cactus = t % server_ticks(20) == 0 && [[1,0],[-1,0],[0,1],[0,-1],[0,0]].iter().any(|&[dx,dz]|
                         block_at(bx+dx, py.floor() as i32, bz+dz) == cst);
                     if near_cactus { *h = (*h - 1.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
                     let mst = name_to_state("magma_block").unwrap_or(u32::MAX);
@@ -1516,7 +1520,7 @@ fn keepalive_time_tick() {
                         && block_at(bx, (py - 0.5).floor() as i32, bz) == mst;
                     if on_magma { *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
                     let bst = name_to_state("sweet_berry_bush").unwrap_or(u32::MAX);
-                    if t % server_tick_period(20) == 0 && block_at(bx, py.floor() as i32, bz) == bst { *h = (*h - 0.5).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                    if t % server_ticks(20) == 0 && block_at(bx, py.floor() as i32, bz) == bst { *h = (*h - 0.5).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
                 }
             }
             if dirty { if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*h, c)); } }
@@ -2003,7 +2007,7 @@ fn furnace_tick() {
         if f.burn_left > 0 && can_smelt {
             f.burn_left -= 1;
             f.progress += 1;
-            if f.progress >= 40 {
+            if f.progress >= server_ticks(200) as i32 {
                 f.progress = 0;
                 let r = out.clone().unwrap();
                 f.xp += smelt_xp(f.input.0);
@@ -2560,7 +2564,7 @@ fn mob_tick() {
         }
         if !is_hot(mp.0 as i32, mp.2 as i32) { continue }
         // suffocation: head cell buried in a solid block -> 1hp/0.5s (vanilla)
-        if TICK.load(Ordering::Relaxed) % server_tick_period(10) == 0 && mob_cell_solid(mp.0, mp.1 + 1.0, mp.2) {
+        if TICK.load(Ordering::Relaxed) % server_ticks(10) == 0 && mob_cell_solid(mp.0, mp.1 + 1.0, mp.2) {
             let mut hp = m.hp.lock().unwrap();
             *hp -= 1.0;
             let mdead = *hp <= 0.0; drop(hp);
@@ -2578,9 +2582,9 @@ fn mob_tick() {
             let wst = name_to_state("water").unwrap_or(u32::MAX);
             let submerged = block_at(mp.0.floor() as i32, (mp.1 + 1.0).floor() as i32, mp.2.floor() as i32) == wst;
             let mut air = m.air.lock().unwrap();
-            if !submerged { *air = 60; }
+            if !submerged { *air = server_ticks(300) as i32; }
             else if *air > 0 { *air -= 1; }
-            else if TICK.load(Ordering::Relaxed) % server_tick_period(20) == 0 {
+            else if TICK.load(Ordering::Relaxed) % server_ticks(20) == 0 {
                 drop(air);
                 let mut hp = m.hp.lock().unwrap();
                 *hp -= 2.0;
@@ -2968,8 +2972,8 @@ fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
     }
 }
 fn fuel_ticks(item: i64) -> i32 {
-    for (n, t) in [("coal",320),("charcoal",320),("oak_log",60),("oak_planks",60),("stick",20),("coal_block",3200)] {
-        if name_to_item(n) == Some(item) { return t }
+    for (n, t) in [("coal",1600),("charcoal",1600),("oak_log",300),("oak_planks",300),("stick",100),("coal_block",16000)] {
+        if name_to_item(n) == Some(item) { return server_ticks(t) as i32 }
     }
     0
 }
@@ -3281,7 +3285,7 @@ fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
     if did_work { b.remove(&(x, y, z)); }
     else {
         let fails = b.get(&(x, y, z)).map(|e| e.1).unwrap_or(0) + 1;
-        b.insert((x, y, z), (now + (1u64 << fails.min(4)), fails.min(4)));
+        b.insert((x, y, z), (now + backoff_ticks(u64::from(fails)), fails));
     }
 }
 /// any world mutation resets backoff for the cell and its 6 neighbors —

@@ -209,17 +209,39 @@ fn game_tick_periods_preserve_the_vanilla_real_time_interval() {
     // The property that must survive a cadence change: a vanilla interval of N
     // game ticks is N * 50ms, so period * TICK_MS must equal that exactly.
     for game_ticks in [10, 20, 40, 80, 100] {
-        assert_eq!(server_tick_period(game_ticks) * TICK_MS, game_ticks * 50,
+        assert_eq!(server_ticks(game_ticks) * TICK_MS, game_ticks * 50,
             "game-tick period {game_ticks} no longer spans {}ms", game_ticks * 50);
     }
     // At the current cadence these are exactly the counts that used to be literal.
-    assert_eq!(server_tick_period(10), 2); // lava, void, suffocation, contact
-    assert_eq!(server_tick_period(20), 4); // fire, drowning, elytra, cactus, berries
-    assert_eq!(server_tick_period(80), 16); // slow natural regeneration
+    assert_eq!(server_ticks(10), 2); // lava, void, suffocation, contact
+    assert_eq!(server_ticks(20), 4); // fire, drowning, elytra, cactus, berries
+    assert_eq!(server_ticks(80), 16); // slow natural regeneration
     // A period below one server tick must never collapse to zero, which would
     // make the modulo divide by zero at a faster cadence.
-    assert_eq!(server_tick_period(0), 1);
-    assert_eq!(server_tick_period(1), 1);
+    assert_eq!(server_ticks(0), 1);
+    assert_eq!(server_ticks(1), 1);
+}
+
+#[test]
+fn stored_tick_durations_match_the_vanilla_game_tick_values() {
+    // The real-time duration must survive a cadence change, so each stored
+    // threshold is the vanilla game-tick value divided down to server ticks.
+    for game_ticks in [10, 20, 40, 80, 100, 200, 300, 1600, 3600, 12000, 16000] {
+        assert_eq!(server_ticks(game_ticks) * TICK_MS, game_ticks * 50,
+            "game-tick duration {} no longer spans {}ms", game_ticks, game_ticks * 50);
+    }
+    // At the current cadence these are exactly the literals used before.
+    assert_eq!(server_ticks(200), 40);   // furnace total cook time
+    assert_eq!(fuel_ticks(name_to_item("coal").unwrap()), 320);
+    assert_eq!(fuel_ticks(name_to_item("coal_block").unwrap()), 3200);
+    assert_eq!(server_ticks(300), 60);   // air supply
+    assert_eq!(server_ticks(12000), 2400); // rain
+    // Thunder used to share rain's counter, which was 600s rather than the
+    // vanilla 180s minimum. Pinning the derived value keeps that fixed.
+    assert_eq!(server_ticks(3600), 720);
+    // The lazy-schedule ladder keeps its 0.5s..4s real-time steps.
+    assert_eq!((1..=4).map(backoff_ticks).collect::<Vec<_>>(), vec![2, 4, 8, 16]);
+    assert_eq!(backoff_ticks(4) * TICK_MS, 4000);
 }
 
 #[test]
