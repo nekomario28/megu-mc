@@ -13665,7 +13665,12 @@ fn main() {
     }
     WORLD_SEED.store(wg_seed, Ordering::Relaxed);
 
-    load_world();
+    // A corrupt protected save must stop startup rather than silently
+    // continuing with a world that failed validation.
+    if let Err(error) = load_world() {
+        eprintln!("[spine] refusing corrupt world save: {error} (original file preserved)");
+        std::process::exit(1);
+    }
     if let Err(error) = landing::initialize() {
         eprintln!("[mod-compatibility] {error}");
         std::process::exit(1);
