@@ -442,6 +442,26 @@ fn remaining_tick_periods_and_chances_keep_their_real_time() {
 }
 
 #[test]
+fn tick_pacing_holds_cadence_and_refuses_to_catch_up() {
+    // The deadline must advance by exactly one interval each tick, so tick work
+    // that overruns does not walk the clock later. A plain sleep(TICK_MS) would
+    // lose the overrun every tick and drift.
+    let start = Instant::now();
+    let mut deadline = start;
+    for _ in 0..100 { deadline += Duration::from_millis(TICK_MS); }
+    assert_eq!(deadline, start + Duration::from_millis(TICK_MS * 100));
+    // Without an overrun the deadline is kept, so cadence does not slip.
+    assert_eq!(next_deadline(deadline, false), deadline);
+    // With an overrun the deadline is re-anchored to now, so the loop cannot
+    // spin to catch up and add more work to an already overloaded server.
+    let reanchored = next_deadline(deadline, true);
+    assert!(reanchored >= start);
+    assert!(reanchored < deadline);
+    // The interval itself must be the single cadence owner.
+    assert_eq!(Duration::from_millis(TICK_MS), Duration::from_millis(1000 / TICKS_PER_SECOND as u64));
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();

@@ -1361,6 +1361,13 @@ const SIZE_LOG_MS: u64 = 5_000;     // container-count watch (diagnostic)
 static KEEPALIVE_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 static TIME_NOTIFY_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 static SIZE_LOG_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
+/// The tick loop's pacing rule, extracted so it can be held to a contract.
+/// Returns the next deadline given the current one and the work that just ran.
+/// `overrun` re-anchors instead of catching up, so an overloaded server cannot
+/// accumulate an unbounded backlog of deadlines.
+fn next_deadline(deadline: Instant, overrun: bool) -> Instant {
+    if overrun { Instant::now() } else { deadline }
+}
 fn wall_anchor(cell: &'static OnceLock<Mutex<Instant>>) -> &'static Mutex<Instant> {
     cell.get_or_init(|| Mutex::new(Instant::now()))
 }
@@ -13519,9 +13526,19 @@ fn main() {
             }));
         }
     }
-    thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_millis(TICK_MS));
-        game_tick(|_, tick| tick());
+    thread::spawn(|| {
+        // The deadline derives from the previous one, not from the sleep
+        // duration, so tick work that overruns does not walk the clock later.
+        // Under sustained overload the deadline is re-anchored instead of
+        // spinning to catch up, which would only add more work.
+        const TICK_INTERVAL: Duration = Duration::from_millis(TICK_MS);
+        let mut next_tick = Instant::now();
+        loop {
+            next_tick += TICK_INTERVAL;
+            std::thread::sleep(next_tick.saturating_duration_since(Instant::now()));
+            next_tick = next_deadline(next_tick, Instant::now() > next_tick + TICK_INTERVAL);
+            game_tick(|_, tick| tick());
+        }
     });
     // vanilla saves the world on SIGTERM/SIGINT (docker/systemd stop);
     // without a handler the autosave window (30s) is lost on kill.
