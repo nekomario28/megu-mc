@@ -33,7 +33,9 @@ fn reference_tick() {
         if f.burn_left > 0 && can_smelt {
             f.burn_left -= 1;
             f.progress += 1;
-            if f.progress >= 40 {
+            // The frozen reference kept the 4TPS literal; vanilla cooks in 200
+            // game ticks, which is 40 server ticks only at 4TPS.
+            if f.progress >= server_ticks(200) as i32 {
                 f.progress = 0;
                 let r = out.clone().unwrap();
                 f.xp += smelt_xp(f.input.0);
@@ -107,37 +109,38 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
     furnaces().lock().unwrap().clear();
     furnaces().lock().unwrap().insert(pos, new_furnace());
     let mut trace = Vec::new();
-    for time in 0..160 {
+    // 160 ticks was 40s at 4TPS; the same 40s is 800 ticks at 20TPS.
+    for time in 0..server_ticks(2000) as usize {
         {
             let mut fs = furnaces().lock().unwrap();
             let f = fs.get_mut(&pos).unwrap();
-            if time == 10 {
+            if time == server_ticks(50) as usize {
                 f.input = (if scenario == 2 { diamond } else { iron }, 3, Vec::new());
                 f.fuel = (coal, 1, Vec::new());
             }
             if scenario == 1 {
-                if time == 20 {
+                if time == server_ticks(100) as usize {
                     f.output = (ingot, 64, Vec::new());
                 }
-                if time == 35 {
+                if time == server_ticks(175) as usize {
                     f.output = (0, 0, Vec::new());
                 }
-                if time == 75 {
+                if time == server_ticks(375) as usize {
                     f.input = (diamond, 1, Vec::new());
                 }
-                if time == 90 {
+                if time == server_ticks(450) as usize {
                     f.input = (iron, 1, Vec::new());
                 }
             }
             if scenario == 2 {
-                if time == 20 {
+                if time == server_ticks(100) as usize {
                     // Cached builtin miss must not conceal a newly added datapack recipe.
                     json_smelts()
                         .lock()
                         .unwrap()
                         .push((Ingr::Item(diamond), gold, 2, 1.5));
                 }
-                if time == 65 {
+                if time == server_ticks(325) as usize {
                     json_smelts().lock().unwrap().clear();
                     json_smelts().lock().unwrap().push((
                         Ingr::Tag("test:smelt".into()),
@@ -146,16 +149,16 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                         1.5,
                     ));
                 }
-                if time == 70 {
+                if time == server_ticks(350) as usize {
                     item_tags()
                         .lock()
                         .unwrap()
                         .insert("test:smelt".into(), vec!["diamond".into()]);
                 }
-                if time == 85 {
+                if time == server_ticks(425) as usize {
                     item_tags().lock().unwrap().remove("test:smelt");
                 }
-                if time == 100 {
+                if time == server_ticks(500) as usize {
                     f.input = (iron, 1, Vec::new());
                     f.output = (0, 0, Vec::new());
                     f.fuel = (coal, 1, Vec::new());
@@ -190,7 +193,8 @@ fn cached_tick_matches_v237_with_input_output_recipe_and_tag_changes() {
             .filter_map(|(i, w)| (w[1].output.1 > w[0].output.1).then_some(i + 1))
             .collect();
         if scenario == 0 {
-            assert_eq!(produced, vec![49, 89, 129]);
+            // Consecutive smelts are one cook time apart: 200 game ticks.
+            assert_eq!(produced, vec![249, 449, 649]);
             let last = actual.last().unwrap();
             assert_eq!(
                 last.output,
@@ -201,11 +205,11 @@ fn cached_tick_matches_v237_with_input_output_recipe_and_tag_changes() {
         }
         if scenario == 2 {
             assert_eq!(
-                actual[59].output,
+                actual[299].output,
                 (name_to_item("gold_ingot").unwrap(), 2, Vec::new())
             );
             assert_eq!(
-                actual[139].output,
+                actual[699].output,
                 (name_to_item("iron_ingot").unwrap(), 1, Vec::new())
             );
         }
@@ -222,5 +226,5 @@ fn fuel_miss_does_not_delay_valid_fuel() {
     let diamond = name_to_item("diamond").unwrap();
     let coal = name_to_item("coal").unwrap();
     assert_eq!(cache.get_or_compute(diamond, || fuel_ticks(diamond)), 0);
-    assert_eq!(cache.get_or_compute(coal, || fuel_ticks(coal)), 320);
+    assert_eq!(cache.get_or_compute(coal, || fuel_ticks(coal)), server_ticks(1600) as i32);
 }

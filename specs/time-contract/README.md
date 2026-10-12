@@ -1,6 +1,6 @@
 # 忠実なゲーム時間と、結果不変の処理省略
 
-Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達。
+Status: 20TPS化 完了 — vanilla動的同等性・軽量化の実証・実クライアント検証は未達。
 
 ## Next Agent Prompt
 
@@ -21,7 +21,7 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 [導火線](slices/10-tnt-fuse.md)、[Drop/Xp寿命とpickup遅延](slices/11-entity-life.md)
 のgame tick化、[永続化のround-trip検証](slices/12-persistence.md) も
 同じ所有者から導出した。
-[20TPS切替](slices/13-cutover-20tps.md) は**実行計画のみ**。実装はしていない。
+[20TPS切替](slices/13-cutover-20tps.md) を実行した。[証拠と測定](../../evidence/time-contract/cutover-20tps/README.md)。
 雷の持続も雨と別の値に直した。溶岩ダメージの変換漏れも発見・修正した。
 [限定fixtureのA/Bと限界](../../evidence/time-contract/region-expansion/README.md) を読む。
 切替の前提は揃った。次は `TICK_MS = 50` の1コミット。
@@ -53,7 +53,7 @@ setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 
 ## 現在の検証
 
-トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも30 passed・1 ignored。clockはまだ250ms。
+トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも31 passed・1 ignored。clockは50ms。
 ignoredは専用runnerで前後各3プロセス実行したrelease計測用fixture。
 tickの炉stage欠落・ringの半径誤り・世界時刻の加算・効果wireの周期導出は
 それぞれ負の対照で検出した。keepaliveのtick除算とダメージ周期・保存値の換算方向の誤りも検出した。共有fixture競合も

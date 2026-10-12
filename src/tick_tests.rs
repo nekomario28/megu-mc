@@ -43,8 +43,8 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
     WORLD_TIME.store(old_time, Ordering::Relaxed);
     GR_DAYLIGHT_CYCLE.store(old_daylight, Ordering::Relaxed);
     // These are the current 4TPS contract, NOT vanilla 20TPS acceptance values.
-    assert_eq!(actual, (1, 319, 63, 0, 0, 64));
-    assert_eq!(clocks, (2, 1, 1005));
+    assert_eq!(actual, (1, 1599, 63, 0, 0, 64));
+    assert_eq!(clocks, (2, 1, 1001));
 }
 
 #[test]
@@ -213,9 +213,9 @@ fn game_tick_periods_preserve_the_vanilla_real_time_interval() {
             "game-tick period {game_ticks} no longer spans {}ms", game_ticks * 50);
     }
     // At the current cadence these are exactly the counts that used to be literal.
-    assert_eq!(server_ticks(10), 2); // lava, void, suffocation, contact
-    assert_eq!(server_ticks(20), 4); // fire, drowning, elytra, cactus, berries
-    assert_eq!(server_ticks(80), 16); // slow natural regeneration
+    assert_eq!(server_ticks(10), 10); // lava, void, suffocation, contact
+    assert_eq!(server_ticks(20), 20); // fire, drowning, elytra, cactus, berries
+    assert_eq!(server_ticks(80), 80); // slow natural regeneration
     // A period below one server tick must never collapse to zero, which would
     // make the modulo divide by zero at a faster cadence.
     assert_eq!(server_ticks(0), 1);
@@ -231,16 +231,16 @@ fn stored_tick_durations_match_the_vanilla_game_tick_values() {
             "game-tick duration {} no longer spans {}ms", game_ticks, game_ticks * 50);
     }
     // At the current cadence these are exactly the literals used before.
-    assert_eq!(server_ticks(200), 40);   // furnace total cook time
-    assert_eq!(fuel_ticks(name_to_item("coal").unwrap()), 320);
-    assert_eq!(fuel_ticks(name_to_item("coal_block").unwrap()), 3200);
-    assert_eq!(server_ticks(300), 60);   // air supply
-    assert_eq!(server_ticks(12000), 2400); // rain
+    assert_eq!(server_ticks(200), 200);   // furnace total cook time
+    assert_eq!(fuel_ticks(name_to_item("coal").unwrap()), 1600);
+    assert_eq!(fuel_ticks(name_to_item("coal_block").unwrap()), 16000);
+    assert_eq!(server_ticks(300), 300);   // air supply
+    assert_eq!(server_ticks(12000), 12000); // rain
     // Thunder used to share rain's counter, which was 600s rather than the
     // vanilla 180s minimum. Pinning the derived value keeps that fixed.
-    assert_eq!(server_ticks(3600), 720);
+    assert_eq!(server_ticks(3600), 3600);
     // The lazy-schedule ladder keeps its 0.5s..4s real-time steps.
-    assert_eq!((1..=4).map(backoff_ticks).collect::<Vec<_>>(), vec![2, 4, 8, 16]);
+    assert_eq!((1..=4).map(backoff_ticks).collect::<Vec<_>>(), vec![10, 20, 40, 80]);
     assert_eq!(backoff_ticks(4) * TICK_MS, 4000);
 }
 
@@ -249,21 +249,21 @@ fn per_tick_rates_keep_the_same_chance_per_real_second() {
     // A per-tick probability is not an interval: the denominator has to scale
     // WITH ticks per second so the chance per real second is unchanged.
     // Crop growth keeps its current 1/30 per second at any cadence.
-    assert_eq!(CROP_GROWTH_DENOMINATOR, 120); // the literal used before
+    assert_eq!(CROP_GROWTH_DENOMINATOR, 600); // 120 at 4TPS, 600 at 20TPS
     assert_eq!(CROP_GROWTH_DENOMINATOR * TICK_MS, 30 * 1000);
     assert_eq!(TICKS_PER_SECOND as u64 * 30, CROP_GROWTH_DENOMINATOR);
     // Every recurring schedule and one-shot life that used to be a tick literal
     // now names its vanilla game-tick value. Each must keep both its previous
     // server-tick literal and its real-time spacing.
     let schedules: [(&str, u64, u64, u64); 5] = [
-        ("autosave", AUTOSAVE_GT, 120, 30_000),
-        ("spawn cycle", SPAWN_CYCLE_GT, 40, 10_000),
-        ("creeper fuse", CREEPER_FUSE_GT, 20, 5_000),
-        ("bobber packet", BOBBER_PACKET_GT, 3, 750),
-        ("lightning life", BOLT_LIFE_GT, 2, 500),
+        ("autosave", AUTOSAVE_GT, 600, 30_000),
+        ("spawn cycle", SPAWN_CYCLE_GT, 200, 10_000),
+        ("creeper fuse", CREEPER_FUSE_GT, 100, 5_000),
+        ("bobber packet", BOBBER_PACKET_GT, 15, 750),
+        ("lightning life", BOLT_LIFE_GT, 10, 500),
     ];
-    for (name, game_ticks, previous_literal, millis) in schedules {
-        assert_eq!(server_ticks(game_ticks), previous_literal, "{name} no longer matches its previous literal");
+    for (name, game_ticks, expected_ticks, millis) in schedules {
+        assert_eq!(server_ticks(game_ticks), expected_ticks, "{name} no longer spans its game-tick count");
         assert_eq!(server_ticks(game_ticks) * TICK_MS, millis, "{name} no longer spans {millis}ms");
     }
 }
@@ -290,7 +290,7 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     forceloaded().lock().unwrap().insert((0, 0));
     primed().lock().unwrap().push(Primed { eid: 9001, x: 0.5, y: 70.0, z: 0.5, left: server_ticks(TNT_FUSE_GT) as i32 });
     let mut exploded_at = None;
-    for step in 1..=40 {
+    for step in 1..=200 {
         game_tick(|_, tick| tick());
         if primed().lock().unwrap().is_empty() { exploded_at = Some(step); break; }
     }
@@ -310,9 +310,10 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     TICK_IDX.store(old_index, Ordering::Relaxed);
     *hot().lock().unwrap() = old_hot;
     *warm().lock().unwrap() = old_warm;
-    assert_eq!(exploded_at, Some(16), "the 4s fuse must fire on its 16th hot tick");
+    assert_eq!(exploded_at, Some(80), "the 4s fuse must fire on its 80th hot tick");
     assert_eq!(cold_left, Some(3), "a cold fuse must not count down");
-    assert_eq!(chain_range, vec![2, 2, 6, 6, 6]);
+    // jitter 1 now survives the integer divide, which 4TPS quantised away.
+    assert_eq!(chain_range, vec![10, 11, 30, 30, 30]);
 }
 
 #[test]
@@ -349,7 +350,7 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     // drop: 9103 is deliberately outside the hot set and therefore never ages.
     drops().lock().unwrap().push(Drop { eid: 9104, x: 0.5, y: 70.0, z: 0.5, item: 1, cnt: 1, comps: Vec::new(), age: 0 });
     let mut pickup_ready_at = None;
-    for step in 1..=8 {
+    for step in 1..=20 {
         game_tick(|_, tick| tick());
         let d = drops().lock().unwrap().iter().find(|d| d.eid == 9104).map(|d| d.age).unwrap_or(0);
         if d >= server_ticks(PICKUP_DELAY_GT) as i32 { pickup_ready_at = Some(step); break; }
@@ -367,7 +368,7 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     assert_eq!(xp_age, Some(4), "a hot xp orb must age once per tick, one stage late");
     assert_eq!(cold_age, Some(0), "a cold drop must not age");
     assert!(expired, "a drop past its lifespan must be removed");
-    assert_eq!(pickup_ready_at, Some(2), "the 0.5s pickup delay is 2 server ticks");
+    assert_eq!(pickup_ready_at, Some(10), "the 0.5s pickup delay is 10 server ticks");
 }
 
 #[test]
@@ -419,10 +420,13 @@ fn profile_game_tick() {
             samples.push(start.elapsed().as_nanos());
         }
         if machines > 0 {
+            // Assert the machines actually ran, so a faster measurement cannot be
+            // a stage that silently stopped doing work. The counts themselves are
+            // cadence dependent, so bound them rather than pin them.
             let fs = furnaces().lock().unwrap();
             for f in fs.values() {
-                assert_eq!((f.output.1, f.progress, f.burn_left, f.fuel.1),
-                    if active { (27, 20, 180, 60) } else { (0, 0, 0, 64) });
+                assert_eq!((f.output.1 > 0, f.progress > 0, f.burn_left > 0, f.fuel.1 < 64),
+                    if active { (true, true, true, true) } else { (false, false, false, false) });
             }
         }
         samples.sort_unstable();

@@ -20,7 +20,7 @@ struct Loaded {
     mob_air: i32,
 }
 
-fn round_trip(with_air: bool, mob_air: i32) -> Loaded {
+fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loaded {
     let old_world = std::mem::take(&mut *world().lock().unwrap());
     let old_drops = std::mem::take(&mut *drops().lock().unwrap());
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
@@ -30,7 +30,7 @@ fn round_trip(with_air: bool, mob_air: i32) -> Loaded {
     world().lock().unwrap().entry((0, 0)).or_default().insert(0x0000_0004, 4);
     drops().lock().unwrap().push(Drop { eid: 777, x: 0.5, y: 70.0, z: 0.5,
         item: name_to_item("iron_ingot").unwrap(), cnt: 3,
-        comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())], age: 3 });
+        comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())], age: drop_age });
     mobs().lock().unwrap().push(Arc::new(Mob { eid: 778, uuid: [0u8; 16], etype: 124,
         pos: Mutex::new((1.5, 70.0, 2.5, 0.0, 0.0)), hp: Mutex::new(12.5),
         last_hit: Mutex::new(Instant::now()), hurt_at: Mutex::new(Instant::now()),
@@ -43,13 +43,15 @@ fn round_trip(with_air: bool, mob_air: i32) -> Loaded {
         *drops().lock().unwrap() = Vec::new();
         *mobs().lock().unwrap() = Vec::new();
         WORLD_TIME.store(0, Ordering::Relaxed);
-        if with_air {
-            // A MET2 file never carried the mob air field. Emulate that writer by
-            // dropping the four bytes the MET3 encoder appends after mob hp.
-            let magic = payload.windows(4).position(|w| w == b"MET3").expect("a MET3 tail");
-            // MET3 magic, mob count, etype, x, y, z, hp — no air field follows.
-            payload.truncate(magic + 4 + 1 + 1 + 8 + 8 + 8 + 4);
-            let _ = &mut payload;
+        if let Some(magic) = legacy_tail {
+            // Emulate an older writer: MET2 never carried the mob air field, and
+            // MET3 stored entity ages in milliseconds rather than server ticks.
+            let at = payload.windows(4).position(|w| w == b"MET4").expect("a MET4 tail");
+            payload[at..at + 4].copy_from_slice(magic);
+            if magic == b"MET2" {
+                // magic, mob count, etype, x, y, z, hp — no air field follows.
+                payload.truncate(at + 4 + 1 + 1 + 8 + 8 + 8 + 4);
+            }
         }
         load_world_from(&payload);
         let d = drops().lock().unwrap().first()
@@ -79,10 +81,10 @@ fn round_trip(with_air: bool, mob_air: i32) -> Loaded {
 }
 
 #[test]
-fn met3_round_trip_preserves_drop_components_age_and_mob_air() {
+fn met4_round_trip_preserves_drop_components_age_and_mob_air() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
     let full_air = server_ticks(300) as i32;
-    let loaded = round_trip(false, 150);
+    let loaded = round_trip(None, 150, 3);
     assert_eq!(loaded, Loaded {
         chunks: 1, forced: 1, world_time: 555, drops: 1, drop_age: 3,
         drop_item: name_to_item("iron_ingot").unwrap(), drop_count: 3,
@@ -100,7 +102,19 @@ fn met2_without_mob_air_falls_back_to_a_full_supply() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
     // MET2 never carried air. The loader must substitute the vanilla air supply
     // rather than a zero that would drown the mob on its first tick.
-    let loaded = round_trip(true, 0);
+    let loaded = round_trip(Some(b"MET2"), 0, 3);
     assert_eq!(loaded.mobs, 1, "the mob must still load from a MET2 tail");
     assert_eq!(loaded.mob_air, server_ticks(300) as i32);
+}
+
+#[test]
+fn legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    // The 20TPS cutover made one tick 50ms. A MET3 file that stored a drop age of
+    // 300000 ms read as ticks would sit at 300000 ticks against a 6000 tick life
+    // and despawn on the first tick, destroying every saved drop.
+    let loaded = round_trip(Some(b"MET3"), 150, 3000);
+    assert_eq!(loaded.drops, 1, "the drop must survive a legacy MET3 load");
+    assert_eq!(loaded.drop_age, 60, "3000 ms of legacy age is 60 ticks at 50 ms per tick");
+    assert!(loaded.drop_age < server_ticks(DROP_LIFE_GT) as i32);
 }

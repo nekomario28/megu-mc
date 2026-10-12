@@ -1,0 +1,35 @@
+{
+  "claim": "simulation cadence moved from 250ms to 50ms with vanilla game-tick values throughout; real-time durations and intervals are unchanged; projectile motion now matches the vanilla coefficients, which changes trajectories",
+  "cadence": "TICK_MS 250 -> 50. TICKS_PER_SECOND 4 -> 20. GAME_TICKS_PER_TICK 5 -> 1.",
+  "automatic": "every duration and interval derived in slices 05-12 became its vanilla game-tick value with no further constant changes",
+  "manual_additions": [
+    "effect stored durations set to vanilla game ticks (totem 900/100/800, foods 2400/100/400/6000/600/300/1200)",
+    "effect periods derived as server_ticks(50/25/40) >> amp; the old code used half the vanilla game-tick period",
+    "the effect wire conversion disappeared because GAME_TICKS_PER_TICK is 1",
+    "motion coefficients replaced with javap-verified vanilla values: arrow 0.99/-0.05, throwable 0.99/-0.03"
+  ],
+  "results_changed": [
+    "projectile and mob trajectories, because gravity-lite approximations became the vanilla coefficients"
+  ],
+  "results_preserved": "furnace cook, fuel burn, air supply, weather length, autosave, TNT fuse, drop and xp lifespan, pickup delay, environmental damage intervals, crop growth rate, keepalive, time notification",
+  "ttl_decision": "arrow 240, pearl 50, mob arrow 160 and bobber bite were kept at their current real time rather than removed. Vanilla has no flying TTL and 1200 is an in-ground despawn counter, so removal would change results and risk entity accumulation. Deferred to a separate slice.",
+  "reference_fix": "the frozen v2.37 reference in furnace_cache_tests hardcoded progress >= 40; it now uses server_ticks(200). Without this it compared against a stale 4TPS model.",
+  "measurement": "same fixtures, runner and release build, 3 processes each. Per-tick median 1.27->1.17us empty, 22.74->20.28us active furnaces, 183.11->182.35us dense actors. Whole-process CPU 0.2811s -> 0.2766s, peak RSS 14768-14860 -> 14764-14860 KiB.",
+  "measurement_limit": "per tick, not per second. 20TPS runs five times as often, so CPU per second at equal load is about five times higher. This is not a lightweight-performance win and must not be claimed as one.",
+  "tests": "30 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN. codex review blocked by an external usage limit for seven consecutive slices. This is a large change committed without independent review.",
+  "open_items": "legacy MET3 drop age is in milliseconds and now misread as ticks; TTLs deferred; hurt invulnerability still 500ms versus vanilla invulnerableTime 20; weather range still pinned to the lower bound; mob air not persisted; the vanilla 0.8f in-water drag branch is unimplemented",
+  "files_sha256": {
+    "README.md": "fbad2f0575efdd4a056159f26d3d15ff9c5c2de0d842e5eaac1401565b857668",
+    "build.log": "6bfa9e18ffdef821c711a542cfebd7db0982665615563e5a191285e489609c6f",
+    "cut-features.log": "21a292e1b73f6a144286d6362c6b1e5bf94440bf4a7b4460f490166f2ef5ac22",
+    "cut-parallel.log": "8822c1a6a880874190f0a916be5177f3a21d1f87c8acc774cae95776dc0b684d",
+    "cut-suite.log": "0c432ffa2d59bac5f249aa6b2427c6ae677190833ffa2192a8d5052edf67073b",
+    "results.json": "5a02c223c9c5810e785c065ea49d838998ad0e4e6cfc39fe8e768f938ad4d4a4",
+    "run-0.log": "484d7de9e47996321cbf0268c123ac345e86a57433918ede51e1387f86e60d71",
+    "run-1.log": "60e378c132ebd576461ac0350a55d6b560d72bb84af2a753d62b7d52151c57cf",
+    "run-2.log": "7b60704b0943f5e928f6e6fb00b39bfb6120f0d06af983843249fde87f4a5274"
+  },
+  "provenance_note": "results.json was captured on the cutover sources. These differ from the committed sources: ['src/furnace_cache_tests.rs', 'src/main.rs', 'src/persistence_tests.rs']. furnace_cache_tests.rs differs by a trailing-whitespace fix; main.rs and persistence_tests.rs differ because the MET4 marker fix shipped in the same commit. The per-tick measurement itself was taken on the cutover cadence and remains valid; those hashes are stale."
+}

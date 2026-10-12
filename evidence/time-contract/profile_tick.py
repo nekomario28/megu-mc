@@ -22,6 +22,8 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     command = ["cargo", "test", "--release", "--offline", "--locked", "-j", "2", "--no-run", "--message-format=json"]
+    cadence = subprocess.check_output(["git", "grep", "-h", "const TICK_MS: u64", "--", "src/main.rs"], cwd=ROOT, text=True).strip()
+    TICKS_PER_SECOND_LABEL = cadence.split("=")[-1].strip().rstrip(";") + "ms tick period"
     build = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=240)
     (output / "build.log").write_text(build.stderr)
     if build.returncode:
@@ -78,7 +80,9 @@ def main():
         "source_sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in source},
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
-        "build_command": command, "clock": "unchanged 4TPS semantics; executed without sleep",
+        "build_command": command,
+        "cadence": f"{TICKS_PER_SECOND_LABEL} semantics; ticks are executed back to back without sleep",
+        "per_tick_unit": "microseconds, total_ns over 1000 ticks divided by 1000 then by 1000",
         "scope": "flat headless fixture; 100 warmup + 1000 measured ticks per scenario; no clients, mobs, fluids, worldgen, Java mods",
         "cpu_rss_scope": "whole child: all six scenarios, fixture setup, warmup and output; Linux RSS in KiB",
         "results": results,

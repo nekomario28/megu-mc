@@ -1191,9 +1191,9 @@ fn totem_effects(ef: &mut Vec<Eff>) {
     ef.clear();
     // Stored durations are still server ticks: vanilla 900 / 100 / 800 game ticks.
     // Wire values derive from GAME_TICKS_PER_TICK.
-    for (name, amp, dur) in [("regeneration", 1, 180), ("absorption", 1, 20), ("fire_resistance", 0, 160)] {
+    for (name, amp, dur) in [("regeneration", 1, 900), ("absorption", 1, 100), ("fire_resistance", 0, 800)] {
         let id = name_to_effect(name).expect("totem effect must exist in the effect registry");
-        ef.push(Eff { id, amp, left: dur });
+        ef.push(Eff { id, amp, left: server_ticks(dur) as i32 });
     }
 }
 fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
@@ -1206,7 +1206,7 @@ fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
     *c.absorb.lock().unwrap() = 8.0;
     for e in ef.iter() {
         // The wire uses game ticks even while the simulation stores server ticks.
-        let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left * GAME_TICKS_PER_TICK as i32);
+        let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left);
         if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x76, packet.clone()); }
         broadcast_seen(c.eid, |_| (0x76, packet.clone()));
     }
@@ -1301,7 +1301,7 @@ fn surface_y(x: i32, z: i32) -> f64 {
 // cadence change is one edit instead of scattered multipliers.
 // The world clock must still advance 20 game ticks per real second, so the
 // per-tick advance is derived, not written as a literal 5.
-const TICK_MS: u64 = 250;
+const TICK_MS: u64 = 50;
 const TICKS_PER_SECOND: u32 = 1000 / TICK_MS as u32;
 const GAME_TICKS_PER_TICK: u32 = 20 / TICKS_PER_SECOND;
 /// Vanilla states every timing quantity in game ticks. Dividing by the ticks
@@ -1647,8 +1647,8 @@ fn keepalive_time_tick() {
             let wst = name_to_state("water").unwrap_or(u32::MAX);
             let in_water = block_at(b.x.floor() as i32, b.y.floor() as i32, b.z.floor() as i32) == wst;
             if !in_water && b.dy.abs() + b.dx.abs() + b.dz.abs() > 0.01 {
-                b.x += b.dx * 0.6; b.y += b.dy * 0.6; b.z += b.dz * 0.6;
-                b.dy -= 0.04;
+                b.x += b.dx * 0.99; b.y += b.dy * 0.99; b.z += b.dz * 0.99;
+                b.dy -= 0.03;
             } else {
                 b.dx = 0.0; b.dy = 0.0; b.dz = 0.0;
                 if !b.bit && b.age > 15 { b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6; }
@@ -1667,7 +1667,7 @@ fn keepalive_time_tick() {
             p0.ttl -= 1;
             let hit = block_at(p0.x.floor() as i32, p0.y.floor() as i32, p0.z.floor() as i32) != 0;
             if hit || p0.ttl <= 0 { done.push((p0.owner, p0.x, p0.y, p0.z)); }
-            else { p0.x += p0.dx * 0.7; p0.y += p0.dy * 0.7; p0.z += p0.dz * 0.7; p0.dy -= 0.05; }
+            else { p0.x += p0.dx * 0.99; p0.y += p0.dy * 0.99; p0.z += p0.dz * 0.99; p0.dy -= 0.03; }
             let (ax, ay, az, eid) = (p0.x, p0.y, p0.z, p0.eid);
             broadcast_seen(eid, |_c| (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true)));
         }
@@ -1818,9 +1818,9 @@ fn arrow_tick() {
                 }
                 continue;
             }
-            a.x += a.dx * 0.9; a.y += a.dy * 0.9; a.z += a.dz * 0.9;
-            // gravity-lite
-            a.dy -= 0.02;
+            a.x += a.dx * 0.99; a.y += a.dy * 0.99; a.z += a.dz * 0.99;
+            // vanilla AbstractArrow: scale(0.99) then -0.05 per game tick
+            a.dy -= 0.05;
             let (ax, ay, az) = (a.x, a.y, a.z);
             // block collision: arrows stick into solid blocks (vanilla)
             let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
@@ -3824,8 +3824,9 @@ fn save_world_into(f: &mut Vec<u8>) {
     }
     drop(w);
     // META section: mobs + world time + inventories (offline store + live).
-    // MET3 = stacks carry component blobs; MET2 (legacy) had id/count only.
-    (*f).extend_from_slice(b"MET3");
+    // MET4 = stacks carry component blobs and entity ages are server ticks.
+    // MET2/MET3 stored those ages in milliseconds, which the loader converts.
+    (*f).extend_from_slice(b"MET4");
     {
         let ms = mobs().lock().unwrap();
         write_varint(&mut *f, ms.len() as i64);
@@ -4187,8 +4188,13 @@ fn load_world_from(payload: &[u8]) {
     drop(w);
     rebuild_derived_indexes();
     // optional META tail
-    if p + 4 <= payload.len() && (&payload[p..p+4] == b"MET2" || &payload[p..p+4] == b"MET3") {
-        let has_comps = &payload[p..p+4] == b"MET3";
+    if p + 4 <= payload.len() && matches!(&payload[p..p+4], b"MET2" | b"MET3" | b"MET4") {
+        let magic = &payload[p..p+4];
+        let has_comps = magic != b"MET2";
+        // MET4 stores entity ages as server ticks. MET2 and MET3 stored them as
+        // milliseconds, and one millisecond is not one tick, so a legacy file
+        // read as ticks would despawn its drops immediately.
+        let legacy_ms_ages = magic != b"MET4";
         p += 4;
         let mn = rv(&payload, &mut p);
         let mut ms = mobs().lock().unwrap();
@@ -4381,7 +4387,8 @@ fn load_world_from(payload: &[u8]) {
                 let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let val = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
                 let ams = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                xs.push(Xp { eid, x, y, z, val, age: ams.min(server_ticks(XP_LIFE_GT) as u32) as i32 });
+                let age = if legacy_ms_ages { u64::from(ams) / TICK_MS } else { u64::from(ams) };
+                xs.push(Xp { eid, x, y, z, val, age: age.min(server_ticks(XP_LIFE_GT)) as i32 });
                 if eid > mx { mx = eid; }
             }
             if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
@@ -4392,7 +4399,8 @@ fn load_world_from(payload: &[u8]) {
             let mut ds = drops().lock().unwrap();
             for d in ds.iter_mut() {
                 if p + 4 > payload.len() { break }
-                let aticks = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                let raw = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                let aticks = if legacy_ms_ages { raw / TICK_MS as u32 } else { raw };
                 d.age = aticks.min(server_ticks(DROP_LIFE_GT) as u32) as i32;
             }
         }
@@ -8571,12 +8579,14 @@ fn health_pkt_c(hp: f32, c: &Client) -> Vec<u8> {
 // vanilla food side-effects: (chance%%, effect id, amplifier, ticks@4/s)
 fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
     let g = |n| name_to_item(n).unwrap_or(-1);
-    if item == g("golden_apple") { return &[(100, 21, 0, 480), (100, 9, 1, 20)] }
-    if item == g("enchanted_golden_apple") { return &[(100, 21, 3, 480), (100, 9, 1, 80), (100, 10, 0, 1200), (100, 11, 0, 1200)] }
-    if item == g("rotten_flesh") { return &[(80, 16, 0, 120)] }
-    if item == g("chicken") { return &[(30, 16, 0, 120)] }
-    if item == g("pufferfish") { return &[(100, 16, 2, 60), (100, 8, 0, 60), (100, 18, 2, 240)] }
-    if item == g("spider_eye") { return &[(100, 18, 0, 20)] }
+    // Durations are vanilla game ticks. One server tick is one game tick at
+    // 20TPS, so these literals are also the stored server-tick values.
+    if item == g("golden_apple") { return &[(100, 21, 0, 2400), (100, 9, 1, 100)] }
+    if item == g("enchanted_golden_apple") { return &[(100, 21, 3, 2400), (100, 9, 1, 400), (100, 10, 0, 6000), (100, 11, 0, 6000)] }
+    if item == g("rotten_flesh") { return &[(80, 16, 0, 600)] }
+    if item == g("chicken") { return &[(30, 16, 0, 600)] }
+    if item == g("pufferfish") { return &[(100, 16, 2, 300), (100, 8, 0, 300), (100, 18, 2, 1200)] }
+    if item == g("spider_eye") { return &[(100, 18, 0, 100)] }
     &[]
 }
 // damage absorbed by the absorption-effect pool before touching hp
@@ -9756,7 +9766,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                                     { let mut ef = c.effs.lock().unwrap();
                                       ef.retain(|e| e.id != eid2);
                                       ef.push(Eff { id: eid2, amp, left: ticks }); }
-                                    fx.push(((*c).clone(), entity_effect_pkt(c.eid, eid2, amp, ticks * GAME_TICKS_PER_TICK as i32)));
+                                    fx.push(((*c).clone(), entity_effect_pkt(c.eid, eid2, amp, ticks)));
                                 }
                             }
                             touched += 1;
@@ -13098,7 +13108,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                                   ef.retain(|e| e.id != eid2);
                                   ef.push(Eff { id: eid2, amp, left: ticks }); }
                                 if eid2 == 21 { *me.absorb.lock().unwrap() = (amp + 1) as f32 * 4.0; }
-                                let pk = entity_effect_pkt(me.eid, eid2, amp, ticks * GAME_TICKS_PER_TICK as i32);
+                                let pk = entity_effect_pkt(me.eid, eid2, amp, ticks);
                                 let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x76, pk.clone());
                                 broadcast_seen(me.eid, |_c| (0x76, pk.clone()));
                             }

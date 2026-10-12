@@ -78,10 +78,9 @@ fn totem_replaces_existing_effects_with_vanilla_grant() {
         Eff { id: 21, amp: 0, left: 40 },
         Eff { id: 21, amp: 0, left: 40 },
     ];
-    // The production clock is still 4TPS. Compare its stored durations in
-    // vanilla game ticks; remove this conversion during the atomic 20TPS cutover.
+    // Stored durations are vanilla game ticks, which equal server ticks at 20TPS.
     let snapshot = |effects: &[Eff]| {
-        let mut result: Vec<_> = effects.iter().map(|e| (e.id, e.amp, e.left * GAME_TICKS_PER_TICK as i32)).collect();
+        let mut result: Vec<_> = effects.iter().map(|e| (e.id, e.amp, e.left)).collect();
         result.sort_unstable();
         result
     };
@@ -109,7 +108,7 @@ fn wither_death_protection_stops_old_effects_and_keeps_new_grants() {
     assert_eq!(*client.absorb.lock().unwrap(), 8.0);
     let mut actual: Vec<_> = client.effs.lock().unwrap().iter().map(|e| (e.id, e.amp, e.left)).collect();
     actual.sort_unstable();
-    assert_eq!(actual, vec![(9, 1, 180), (11, 0, 160), (21, 1, 20)]);
+    assert_eq!(actual, vec![(9, 1, 900), (11, 0, 800), (21, 1, 100)]);
 }
 
 #[test]

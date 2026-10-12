@@ -12,9 +12,9 @@ pub(super) fn tick_effects(c: &Client) {
         if *c.gm.lock().unwrap() == 1 { if e.left <= 0 { expired.push(e.id); } continue }
         let mut h = c.hp.lock().unwrap();
         match e.id {
-            9 => { let iv = (10i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { let mh = max_hp_of(&c.name); *h = (*h + 1.0).min(mh); dirty2 = true; } }
-            18 => { let iv = (5i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { *h = (*h - 1.0).max(1.0); dirty2 = true; } }
-            19 => { let iv = (8i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { *h = (*h - 1.0).max(0.0); dirty2 = true; }
+            9 => { let iv = (server_ticks(50) as i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { let mh = max_hp_of(&c.name); *h = (*h + 1.0).min(mh); dirty2 = true; } }
+            18 => { let iv = (server_ticks(25) as i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { *h = (*h - 1.0).max(1.0); dirty2 = true; } }
+            19 => { let iv = (server_ticks(40) as i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { *h = (*h - 1.0).max(0.0); dirty2 = true; }
                 if *h <= 0.0 {
                     // The effect guard is held here; do not re-lock it through totem_check.
                     let mut inv2 = c.inv.lock().unwrap();
@@ -47,7 +47,7 @@ pub(super) fn tick_effects(c: &Client) {
                     }
                 } }
             16 => { drop(h); let mut f = c.food.lock().unwrap();
-                if e.left % 80 == 0 && *f > 0 { *f -= 1; dirty2 = true; }
+                if e.left % server_ticks(80) as i32 == 0 && *f > 0 { *f -= 1; dirty2 = true; }
                 h = c.hp.lock().unwrap(); }
             _ => {}
         }

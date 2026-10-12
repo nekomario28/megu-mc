@@ -1,0 +1,18 @@
+{
+  "claim": "legacy MET2/MET3 entity ages are read as milliseconds and converted, while MET4 stores server ticks, so a pre-20TPS save no longer despawns all its drops",
+  "regression_fixed": "the 20TPS cutover made one tick 50ms, so a legacy 300000 ms age read as 300000 ticks exceeded the 6000 tick life and removed every saved drop on the first tick. I introduced this in the cutover commit.",
+  "format": "magic MET3 -> MET4. MET4 ages are server ticks. MET2/MET3 ages are milliseconds divided by TICK_MS.",
+  "negative_controls": "all 3 detected: legacy ages read as ticks (the pre-fix bug), MET4 ages wrongly converted from ms, millisecond divisor using ticks per second",
+  "implementation_error": "expected value was written as 150, which is the 4TPS result of 3000/20; the correct value at 50 ms per tick is 60. The test caught it.",
+  "tests": "31 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force for eight consecutive slices",
+  "provenance_note": "the cutover-20tps results.json records a hash for src/furnace_cache_tests.rs that predates a trailing-whitespace fix made after that measurement. The committed file matches HEAD and HEAD~1. The difference is whitespace only, so the cutover measurement remains valid, but that receipt hash is stale.",
+  "files_sha256": {
+    "README.md": "e86fa1b5933fc371b2e257b214c1271c2f6173930eaee18692d78ae2c2a9f20b",
+    "features.log": "d292a7fad2fea884e268be7d920f73530fb37ec7b415297009464f44dd4c326b",
+    "met4-negative.log": "789efd696eb14232de88672c1176a1b43389ea130105623c2349144e7fcff8c1",
+    "parallel.log": "8dabdcb9adb49a0ad36a5cc2d2b12c4237e76258417cbba0964a3a0e79af551d",
+    "suite.log": "4c88e8d40329c5146e464cd10f5c411786ebaed3252a6f67b230ab4315222a24"
+  }
+}
