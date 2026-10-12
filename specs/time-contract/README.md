@@ -17,8 +17,9 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 [時間語の単一所有者](slices/05-cadence-owner.md) で `TICK_MS` から全境界を導出した。
 [実時間境界](slices/06-wall-clock.md) のkeepalive/通知と、[ゲーム時間周期](slices/07-game-tick-periods.md)
 のダメージ間隔、[保存tick語の値](slices/08-stored-durations.md) の炉/燃料/空気/天候、
-[1tickあたりの割合](slices/09-per-tick-rates.md) の作物成長と周期スケジュールも
-同じ所有者から導出した。雷の持続も雨と別の値に直した。
+[1tickあたりの割合](slices/09-per-tick-rates.md) の作物成長と周期スケジュール、
+[導火線](slices/10-tnt-fuse.md) をgame tick化も同じ所有者から導出した。
+雷の持続も雨と別の値に直した。溶岩ダメージの変換漏れも発見・修正した。
 [限定fixtureのA/Bと限界](../../evidence/time-contract/region-expansion/README.md) を読む。
 ここで性能最適化を広げず、次は実時間→game tick・MET4永続化を接続する。
 **移動係数の扱いはユーザーの判断が必要。** 現在は「gravity-lite」近似で、
@@ -48,7 +49,7 @@ setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 
 ## 現在の検証
 
-トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも26 passed・1 ignored。
+トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも27 passed・1 ignored。
 ignoredは専用runnerで前後各3プロセス実行したrelease計測用fixture。
 tickの炉stage欠落・ringの半径誤り・世界時刻の加算・効果wireの周期導出は
 それぞれ負の対照で検出した。keepaliveのtick除算とダメージ周期・保存値の換算方向の誤りも検出した。共有fixture競合も

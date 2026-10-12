@@ -269,6 +269,53 @@ fn per_tick_rates_keep_the_same_chance_per_real_second() {
 }
 
 #[test]
+fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_primed = std::mem::take(&mut *primed().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let old_hot = hot().lock().unwrap().clone();
+    let old_warm = warm().lock().unwrap().clone();
+    // Pin the vanilla game-tick values themselves. At 4TPS a one-game-tick drift
+    // quantises away, so the projection alone cannot catch it.
+    assert_eq!(TNT_FUSE_GT, 80);
+    assert_eq!(server_ticks(TNT_FUSE_GT) * TICK_MS, 4000);
+    // Chain-lit TNT keeps 0.5s..1.5s of fuse. Assert the production expression,
+    // because its 4TPS projection quantises a one-game-tick drift away.
+    assert_eq!(chain_fuse_left(0), server_ticks(10));
+    assert_eq!(chain_fuse_left(1023), server_ticks(30));
+    assert_eq!(chain_fuse_left(0) * TICK_MS, 500);
+    assert_eq!(chain_fuse_left(1023) * TICK_MS, 1500);
+    forceloaded().lock().unwrap().insert((0, 0));
+    primed().lock().unwrap().push(Primed { eid: 9001, x: 0.5, y: 70.0, z: 0.5, left: server_ticks(TNT_FUSE_GT) as i32 });
+    let mut exploded_at = None;
+    for step in 1..=40 {
+        game_tick(|_, tick| tick());
+        if primed().lock().unwrap().is_empty() { exploded_at = Some(step); break; }
+    }
+    // Far outside the hot set the fuse must not advance at all, so an unloaded
+    // TNT survives indefinitely instead of exploding on a wall-clock timer.
+    primed().lock().unwrap().push(Primed { eid: 9002, x: 30_000_000.0, y: 70.0, z: 30_000_000.0, left: 3 });
+    for _ in 0..20 { game_tick(|_, tick| tick()); }
+    let cold_left = primed().lock().unwrap().iter().find(|p| p.eid == 9002).map(|p| p.left);
+    // Chain-lit TNT keeps its 0.5s..1.5s remaining fuse in game ticks.
+    let mut chain_range = Vec::new();
+    for jitter in [0u64, 1, 20, 1000, 1023] {
+        chain_range.push(server_ticks(10 + jitter.min(20)) as i32);
+    }
+    *primed().lock().unwrap() = old_primed;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    *hot().lock().unwrap() = old_hot;
+    *warm().lock().unwrap() = old_warm;
+    assert_eq!(exploded_at, Some(16), "the 4s fuse must fire on its 16th hot tick");
+    assert_eq!(cold_left, Some(3), "a cold fuse must not count down");
+    assert_eq!(chain_range, vec![2, 2, 6, 6, 6]);
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();

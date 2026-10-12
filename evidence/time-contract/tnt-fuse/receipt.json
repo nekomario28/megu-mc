@@ -1,0 +1,18 @@
+{
+  "claim": "TNT fuse moved from wall clock to a server-tick counter with identical 4s and 0.5s..1.5s timings, and cold fuses no longer advance; NOT 20TPS",
+  "vanilla_values": "ordinary fuse 80 game ticks; chain fuse 10..30 game ticks from positional jitter",
+  "implementation_bugs_caught": "chain fuse expression went negative for jitter>100, producing a huge count; hot fuses never decremented so they never exploded",
+  "tests": "27 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "negative_controls": "all 5 detected: fuse 80->81, chain base 10->16, chain jitter bound 20->40, zero guard, cold decrements, hot never decrements",
+  "resolution_limit": "a 1-game-tick (50ms) drift in the chain fuse is undetectable at 4TPS because 10 and 11 game ticks both quantise to 2 server ticks. Drift of 250ms or more is detected. This becomes detectable at 20TPS.",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "files_sha256": {
+    "README.md": "59d339aa2058b295d06e053868d4d911e865af0606468dcf64304c5112d829c3",
+    "review-attempt.log": "48cc911efaf00473a0065aebc4e4a417011f7f79d8e83ae6af00f363c33194e5",
+    "time-contract-tnt-features.log": "e7cbd80d6302e2b71ffae3d767345e56846400068fdc8911bc1b8e9312c571c3",
+    "time-contract-tnt-negative.log": "f0359fde8d9c186ef5d123a1ba76861b29f6028dd5544fd5ddfb0d7cf9ea953d",
+    "time-contract-tnt-parallel.log": "93d2cc1240827d885869d5eddc700b200aa0bea327e9f8d9ea4a8a4d22490f75",
+    "time-contract-tnt-suite.log": "73d639cc76e6a6b548e0a25ee2308eaf331649dffc348cfd42abc20c1198f937"
+  }
+}

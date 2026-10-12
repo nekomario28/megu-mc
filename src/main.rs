@@ -413,7 +413,9 @@ fn broadcast_seen_ex<F: Fn(&Client) -> (i64, Vec<u8>)>(eid: i32, excl: i32, mk: 
 struct Arrow { eid: i32, owner: i32, x: f64, y: f64, z: f64, dx: f64, dy: f64, dz: f64, ttl: i32, dmg: f32, fire: i32, punch: i32, kind: u8, loy: i64, ret_item: i64, ret_comps: Comps, pierce: i32, last_hit: i32, stuck: bool }
 static ARROWS: OnceLock<Mutex<Vec<Arrow>>> = OnceLock::new();
 fn arrows() -> &'static Mutex<Vec<Arrow>> { ARROWS.get_or_init(|| Mutex::new(Vec::new())) }
-struct Primed { eid: i32, x: f64, y: f64, z: f64, lit: Instant }
+// left: server ticks of fuse remaining. Vanilla holds the fuse in game ticks
+// (80 for ordinary TNT), so a loaded world cannot shift it under tick lag.
+struct Primed { eid: i32, x: f64, y: f64, z: f64, left: i32 }
 static PRIMED: OnceLock<Mutex<Vec<Primed>>> = OnceLock::new();
 fn primed() -> &'static Mutex<Vec<Primed>> { PRIMED.get_or_init(|| Mutex::new(Vec::new())) }
 fn spawn_arrow_pkt(a: &Arrow) -> Vec<u8> {
@@ -1323,6 +1325,9 @@ const SPAWN_CYCLE_GT: u64 = 200;     // 10s
 const CREEPER_FUSE_GT: u64 = 100;    // 5s
 const BOBBER_PACKET_GT: u64 = 15;    // 0.75s
 const BOLT_LIFE_GT: u64 = 10;        // 0.5s visual
+const TNT_FUSE_GT: u64 = 80;         // 4s, TntBlock fuse
+/// chain
+const fn chain_fuse_left(jitter: u64) -> u64 { server_ticks(10 + if jitter > 20 { 20 } else { jitter }) }
 // Wall-clock owners. Vanilla defines these in real time, not in game ticks, so
 // they anchor on Instants: changing the simulation cadence must not shift them.
 const KEEPALIVE_MS: u64 = 15_000;   // ServerCommonPacketListenerImpl
@@ -1954,7 +1959,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
                 let jitter = ((tx.wrapping_mul(31) ^ tz.wrapping_mul(17) ^ ty) & 0x3ff) as u64;
                 primed().lock().unwrap().push(Primed {
                     eid, x: tx as f64 + 0.5, y: ty as f64, z: tz as f64 + 0.5,
-                    lit: Instant::now() - Duration::from_millis(4000 - 500 - jitter.min(1000)),
+                    left: chain_fuse_left(jitter) as i32,
                 });
             }
             offs.push((dx as i8, dy as i8, dz as i8));
@@ -1989,9 +1994,8 @@ fn primed_tick() {
         let mut i = 0;
         while i < pl.len() {
             if !is_hot(pl[i].x as i32, pl[i].z as i32) {
-                pl[i].lit += Duration::from_millis(TICK_MS); // fuse pauses while cold
-                i += 1;
-            } else if pl[i].lit.elapsed() > Duration::from_millis(4000) { boom.push(pl.remove(i)); }
+                i += 1; // fuse pauses while cold: no tick, no decrement
+            } else if { pl[i].left -= 1; pl[i].left <= 0 } { boom.push(pl.remove(i)); }
             else { i += 1; }
         }
     }
@@ -3691,7 +3695,7 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
             set_block(bx, by, bz, 0);
             note_block_update(bx, by, bz, 0);
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-            primed().lock().unwrap().push(Primed { eid, x: bx as f64 + 0.5, y: by as f64, z: bz as f64 + 0.5, lit: Instant::now() });
+            primed().lock().unwrap().push(Primed { eid, x: bx as f64 + 0.5, y: by as f64, z: bz as f64 + 0.5, left: server_ticks(TNT_FUSE_GT) as i32 });
             // interest_tick delivers the arrow spawn to trackers
         }
         // observer: watched cell changed -> pulse next tick
@@ -4042,7 +4046,7 @@ fn save_world() {
                 f.extend_from_slice(&a.x.to_be_bytes());
                 f.extend_from_slice(&a.y.to_be_bytes());
                 f.extend_from_slice(&a.z.to_be_bytes());
-                f.extend_from_slice(&(a.lit.elapsed().as_millis() as u32).to_be_bytes());
+                f.extend_from_slice(&a.left.to_be_bytes());
             }
         }
         // weather is world state in vanilla — rain budget survives restart
@@ -4422,8 +4426,8 @@ fn load_world() {
                 if p + 32 > b.len() { break }
                 let eid = ri4(&b, &mut p);
                 let (x, y, z) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
-                let lms = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                pr.push(Primed { eid, x, y, z, lit: Instant::now() - Duration::from_millis(lms.min(79000) as u64) });
+                let left = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                pr.push(Primed { eid, x, y, z, left });
                 bump(eid, &mut mx);
               } }
             if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
@@ -9824,7 +9828,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 let (x, y, z) = (coord(args[1], ctx.x), coord(args[2], ctx.y), coord(args[3], ctx.z));
                 if args[0] == "tnt" {
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    primed().lock().unwrap().push(Primed { eid, x, y, z, lit: Instant::now() });
+                    primed().lock().unwrap().push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
                     format!("Summoned tnt")
                 } else {
                     let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
@@ -11368,7 +11372,7 @@ fn handle(mut s: TcpStream) {
                     set_block(x, y, z, 0);
                     note_block_update(x, y, z, 0);
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    primed().lock().unwrap().push(Primed { eid, x: x as f64 + 0.5, y: y as f64 + 0.5, z: z as f64 + 0.5, lit: Instant::now() });
+                    primed().lock().unwrap().push(Primed { eid, x: x as f64 + 0.5, y: y as f64 + 0.5, z: z as f64 + 0.5, left: server_ticks(TNT_FUSE_GT) as i32 });
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
