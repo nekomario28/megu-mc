@@ -3810,96 +3810,95 @@ fn rv_varint(b: &[u8], p: &mut usize) -> i64 {
     }
     v
 }
-fn save_world() {
-    let w = world().lock().unwrap();
-    let mut f = Vec::new();
-    write_varint(&mut f, w.len() as i64);
+fn save_world_into(f: &mut Vec<u8>) {
+        let w = world().lock().unwrap();
+    write_varint(&mut *f, w.len() as i64);
     for (&(cx, cz), c) in w.iter() {
-        f.extend_from_slice(&cx.to_be_bytes());
-        f.extend_from_slice(&cz.to_be_bytes());
-        write_varint(&mut f, c.len() as i64);
+        (*f).extend_from_slice(&cx.to_be_bytes());
+        (*f).extend_from_slice(&cz.to_be_bytes());
+        write_varint(&mut *f, c.len() as i64);
         for (&idx, &st) in c.iter() {
-            f.extend_from_slice(&idx.to_be_bytes());
-            write_varint(&mut f, st as i64);
+            (*f).extend_from_slice(&idx.to_be_bytes());
+            write_varint(&mut *f, st as i64);
         }
     }
     drop(w);
     // META section: mobs + world time + inventories (offline store + live).
     // MET3 = stacks carry component blobs; MET2 (legacy) had id/count only.
-    f.extend_from_slice(b"MET3");
+    (*f).extend_from_slice(b"MET3");
     {
         let ms = mobs().lock().unwrap();
-        write_varint(&mut f, ms.len() as i64);
+        write_varint(&mut *f, ms.len() as i64);
         for m in ms.iter() {
             let (x, y, z, ..) = { let p = m.pos.lock().unwrap(); *p };
-            write_varint(&mut f, m.etype);
-            f.extend_from_slice(&x.to_be_bytes());
-            f.extend_from_slice(&y.to_be_bytes());
-            f.extend_from_slice(&z.to_be_bytes());
-            f.extend_from_slice(&{ let h = m.hp.lock().unwrap(); *h }.to_be_bytes());
+            write_varint(&mut *f, m.etype);
+            (*f).extend_from_slice(&x.to_be_bytes());
+            (*f).extend_from_slice(&y.to_be_bytes());
+            (*f).extend_from_slice(&z.to_be_bytes());
+            (*f).extend_from_slice(&{ let h = m.hp.lock().unwrap(); *h }.to_be_bytes());
         }
     }
-    f.extend_from_slice(&WORLD_TIME.load(Ordering::Relaxed).to_be_bytes());
+    (*f).extend_from_slice(&WORLD_TIME.load(Ordering::Relaxed).to_be_bytes());
     {
         let mut all: HashMap<String, HashMap<i16, Stack>> = inv_store().lock().unwrap().clone();
         for c in clients().lock().unwrap().iter() {
             all.insert(c.name.clone(), c.inv.lock().unwrap().clone());
         }
-        write_varint(&mut f, all.len() as i64);
+        write_varint(&mut *f, all.len() as i64);
         for (name, inv) in all.iter() {
-            f.extend_from_slice(&(name.len() as u16).to_be_bytes());
-            f.extend_from_slice(name.as_bytes());
-            write_varint(&mut f, inv.len() as i64);
+            (*f).extend_from_slice(&(name.len() as u16).to_be_bytes());
+            (*f).extend_from_slice(name.as_bytes());
+            write_varint(&mut *f, inv.len() as i64);
             for (&slot, (item, cnt, ic)) in inv.iter() {
-                f.extend_from_slice(&slot.to_be_bytes());
-                write_varint(&mut f, *item);
-                f.push(*cnt);
-                write_varint(&mut f, ic.len() as i64);
+                (*f).extend_from_slice(&slot.to_be_bytes());
+                write_varint(&mut *f, *item);
+                (*f).push(*cnt);
+                write_varint(&mut *f, ic.len() as i64);
                 for (ty, d) in ic {
-                    write_varint(&mut f, *ty);
-                    f.extend_from_slice(&(d.len() as u16).to_be_bytes());
-                    f.extend_from_slice(d);
+                    write_varint(&mut *f, *ty);
+                    (*f).extend_from_slice(&(d.len() as u16).to_be_bytes());
+                    (*f).extend_from_slice(d);
                 }
             }
         }
         let ch = chests().lock().unwrap();
-        write_varint(&mut f, ch.len() as i64);
+        write_varint(&mut *f, ch.len() as i64);
         for (&(x, y, z), slots) in ch.iter() {
-            f.extend_from_slice(&x.to_be_bytes());
-            f.extend_from_slice(&y.to_be_bytes());
-            f.extend_from_slice(&z.to_be_bytes());
-            write_varint(&mut f, slots.len() as i64);
+            (*f).extend_from_slice(&x.to_be_bytes());
+            (*f).extend_from_slice(&y.to_be_bytes());
+            (*f).extend_from_slice(&z.to_be_bytes());
+            write_varint(&mut *f, slots.len() as i64);
             for (&slot, (item, cnt, ic)) in slots.iter() {
-                f.extend_from_slice(&slot.to_be_bytes());
-                write_varint(&mut f, *item);
-                f.push(*cnt);
-                write_varint(&mut f, ic.len() as i64);
+                (*f).extend_from_slice(&slot.to_be_bytes());
+                write_varint(&mut *f, *item);
+                (*f).push(*cnt);
+                write_varint(&mut *f, ic.len() as i64);
                 for (ty, d) in ic {
-                    write_varint(&mut f, *ty);
-                    f.extend_from_slice(&(d.len() as u16).to_be_bytes());
-                    f.extend_from_slice(d);
+                    write_varint(&mut *f, *ty);
+                    (*f).extend_from_slice(&(d.len() as u16).to_be_bytes());
+                    (*f).extend_from_slice(d);
                 }
             }
         }
         let sg = signs().lock().unwrap();
-        write_varint(&mut f, sg.len() as i64);
+        write_varint(&mut *f, sg.len() as i64);
         for (&(x, y, z, front), lines) in sg.iter() {
-            f.extend_from_slice(&x.to_be_bytes());
-            f.extend_from_slice(&y.to_be_bytes());
-            f.extend_from_slice(&z.to_be_bytes());
-            f.push(front);
+            (*f).extend_from_slice(&x.to_be_bytes());
+            (*f).extend_from_slice(&y.to_be_bytes());
+            (*f).extend_from_slice(&z.to_be_bytes());
+            (*f).push(front);
             for l in lines {
-                f.extend_from_slice(&(l.len() as u16).to_be_bytes());
-                f.extend_from_slice(l.as_bytes());
+                (*f).extend_from_slice(&(l.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(l.as_bytes());
             }
         }
         // forceload tail — vanilla keeps forced chunks across restarts;
         // losing them would silently freeze fixture+machine regions.
         let fl = forceloaded().lock().unwrap();
-        write_varint(&mut f, fl.len() as i64);
+        write_varint(&mut *f, fl.len() as i64);
         for &(cx, cz) in fl.iter() {
-            f.extend_from_slice(&cx.to_be_bytes());
-            f.extend_from_slice(&cz.to_be_bytes());
+            (*f).extend_from_slice(&cx.to_be_bytes());
+            (*f).extend_from_slice(&cz.to_be_bytes());
         }
         // player positions — vanilla respawns you where you logged out
         let mut allp: HashMap<String, (f64, f64, f64, f32, f32)> =
@@ -3908,46 +3907,46 @@ fn save_world() {
             let p = *c.pos.lock().unwrap();
             allp.insert(c.name.clone(), (p.0, p.1, p.2, p.3, p.4));
         }
-        write_varint(&mut f, allp.len() as i64);
+        write_varint(&mut *f, allp.len() as i64);
         for (name, &(x, y, z, yaw, pitch)) in allp.iter() {
-            f.extend_from_slice(&(name.len() as u16).to_be_bytes());
-            f.extend_from_slice(name.as_bytes());
-            f.extend_from_slice(&x.to_be_bytes());
-            f.extend_from_slice(&y.to_be_bytes());
-            f.extend_from_slice(&z.to_be_bytes());
-            f.extend_from_slice(&yaw.to_be_bytes());
-            f.extend_from_slice(&pitch.to_be_bytes());
+            (*f).extend_from_slice(&(name.len() as u16).to_be_bytes());
+            (*f).extend_from_slice(name.as_bytes());
+            (*f).extend_from_slice(&x.to_be_bytes());
+            (*f).extend_from_slice(&y.to_be_bytes());
+            (*f).extend_from_slice(&z.to_be_bytes());
+            (*f).extend_from_slice(&yaw.to_be_bytes());
+            (*f).extend_from_slice(&pitch.to_be_bytes());
         }
         // dropped items are world entities in vanilla — they survive
         // restart inside their despawn budget
         let mut drop_ages: Vec<u32> = Vec::new();
         {
             let ds = drops().lock().unwrap();
-            write_varint(&mut f, ds.len() as i64);
+            write_varint(&mut *f, ds.len() as i64);
             for d in ds.iter() {
-                f.extend_from_slice(&d.eid.to_be_bytes());
-                f.extend_from_slice(&d.x.to_be_bytes());
-                f.extend_from_slice(&d.y.to_be_bytes());
-                f.extend_from_slice(&d.z.to_be_bytes());
-                write_varint(&mut f, d.item);
-                f.push(d.cnt);
-                write_comps(&mut f, &d.comps);
-                drop_ages.push(d.age as u32);
+                (*f).extend_from_slice(&d.eid.to_be_bytes());
+                (*f).extend_from_slice(&d.x.to_be_bytes());
+                (*f).extend_from_slice(&d.y.to_be_bytes());
+                (*f).extend_from_slice(&d.z.to_be_bytes());
+                write_varint(&mut *f, d.item);
+                (*f).push(d.cnt);
+                write_comps(&mut *f, &d.comps);
+                drop_ages.push(d.age as u32); // server ticks
             }
         }
         // furnaces are block entities — contents and smelting state are
         // durable in vanilla, not session-scoped
         let fs = furnaces().lock().unwrap();
-        write_varint(&mut f, fs.len() as i64);
+        write_varint(&mut *f, fs.len() as i64);
         for (&(x, y, z), fr) in fs.iter() {
-            f.extend_from_slice(&x.to_be_bytes());
-            f.extend_from_slice(&y.to_be_bytes());
-            f.extend_from_slice(&z.to_be_bytes());
-            write_varint(&mut f, fr.input.0); f.push(fr.input.1); write_comps(&mut f, &fr.input.2);
-            write_varint(&mut f, fr.fuel.0); f.push(fr.fuel.1); write_comps(&mut f, &fr.fuel.2);
-            write_varint(&mut f, fr.output.0); f.push(fr.output.1); write_comps(&mut f, &fr.output.2);
-            f.extend_from_slice(&fr.burn_left.to_be_bytes());
-            f.extend_from_slice(&fr.progress.to_be_bytes());
+            (*f).extend_from_slice(&x.to_be_bytes());
+            (*f).extend_from_slice(&y.to_be_bytes());
+            (*f).extend_from_slice(&z.to_be_bytes());
+            write_varint(&mut *f, fr.input.0); (*f).push(fr.input.1); write_comps(&mut *f, &fr.input.2);
+            write_varint(&mut *f, fr.fuel.0); (*f).push(fr.fuel.1); write_comps(&mut *f, &fr.fuel.2);
+            write_varint(&mut *f, fr.output.0); (*f).push(fr.output.1); write_comps(&mut *f, &fr.output.2);
+            (*f).extend_from_slice(&fr.burn_left.to_be_bytes());
+            (*f).extend_from_slice(&fr.progress.to_be_bytes());
         }
         // sheared-mob indices (eids are re-issued on load — persist by
         // mob order, not eid)
@@ -3956,39 +3955,39 @@ fn save_world() {
             let sh = sheared().lock().unwrap();
             let idx: Vec<i64> = ms.iter().enumerate()
                 .filter(|(_, m)| sh.contains(&m.eid)).map(|(i, _)| i as i64).collect();
-            write_varint(&mut f, idx.len() as i64);
-            for i in idx { write_varint(&mut f, i); }
+            write_varint(&mut *f, idx.len() as i64);
+            for i in idx { write_varint(&mut *f, i); }
         }
         // scoreboard — vanilla stores objectives under data storage
         {
             let sc = scores().lock().unwrap();
-            write_varint(&mut f, sc.len() as i64);
+            write_varint(&mut *f, sc.len() as i64);
             for (obj, entries) in sc.iter() {
-                f.extend_from_slice(&(obj.len() as u16).to_be_bytes());
-                f.extend_from_slice(obj.as_bytes());
-                write_varint(&mut f, entries.len() as i64);
+                (*f).extend_from_slice(&(obj.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(obj.as_bytes());
+                write_varint(&mut *f, entries.len() as i64);
                 for (entry, val) in entries.iter() {
-                    f.extend_from_slice(&(entry.len() as u16).to_be_bytes());
-                    f.extend_from_slice(entry.as_bytes());
-                    f.extend_from_slice(&val.to_be_bytes());
+                    (*f).extend_from_slice(&(entry.len() as u16).to_be_bytes());
+                    (*f).extend_from_slice(entry.as_bytes());
+                    (*f).extend_from_slice(&val.to_be_bytes());
                 }
             }
         }
         // XP orbs are world entities too — same persistence class as drops
         {
             let xs = xps().lock().unwrap();
-            write_varint(&mut f, xs.len() as i64);
+            write_varint(&mut *f, xs.len() as i64);
             for x in xs.iter() {
-                f.extend_from_slice(&x.eid.to_be_bytes());
-                f.extend_from_slice(&x.x.to_be_bytes());
-                f.extend_from_slice(&x.y.to_be_bytes());
-                f.extend_from_slice(&x.z.to_be_bytes());
-                f.extend_from_slice(&x.val.to_be_bytes());
-                f.extend_from_slice(&x.age.to_be_bytes());
+                (*f).extend_from_slice(&x.eid.to_be_bytes());
+                (*f).extend_from_slice(&x.x.to_be_bytes());
+                (*f).extend_from_slice(&x.y.to_be_bytes());
+                (*f).extend_from_slice(&x.z.to_be_bytes());
+                (*f).extend_from_slice(&x.val.to_be_bytes());
+                (*f).extend_from_slice(&x.age.to_be_bytes());
             }
         }
         // drop despawn-budget residue: elapsed ms per drop, by order
-        for a in drop_ages { f.extend_from_slice(&a.to_be_bytes()); }
+        for a in drop_ages { (*f).extend_from_slice(&a.to_be_bytes()); }
         // projectiles + primed tnt are world entities in vanilla —
         // they survive restart mid-flight
         {
@@ -4007,95 +4006,95 @@ fn save_world() {
             }
             let ar = arrows().lock().unwrap();
             // ARW2: stuck flag persists so saved arrows resume embedded
-            f.extend_from_slice(b"ARW2");
-            write_varint(&mut f, ar.len() as i64);
+            (*f).extend_from_slice(b"ARW2");
+            write_varint(&mut *f, ar.len() as i64);
             for a in ar.iter() {
-                f.extend_from_slice(&a.eid.to_be_bytes());
-                f.extend_from_slice(&a.owner.to_be_bytes());
-                f.extend_from_slice(&a.x.to_be_bytes());
-                f.extend_from_slice(&a.y.to_be_bytes());
-                f.extend_from_slice(&a.z.to_be_bytes());
-                f.extend_from_slice(&a.dx.to_be_bytes());
-                f.extend_from_slice(&a.dy.to_be_bytes());
-                f.extend_from_slice(&a.dz.to_be_bytes());
-                f.extend_from_slice(&a.ttl.to_be_bytes());
-                f.push(a.stuck as u8);
+                (*f).extend_from_slice(&a.eid.to_be_bytes());
+                (*f).extend_from_slice(&a.owner.to_be_bytes());
+                (*f).extend_from_slice(&a.x.to_be_bytes());
+                (*f).extend_from_slice(&a.y.to_be_bytes());
+                (*f).extend_from_slice(&a.z.to_be_bytes());
+                (*f).extend_from_slice(&a.dx.to_be_bytes());
+                (*f).extend_from_slice(&a.dy.to_be_bytes());
+                (*f).extend_from_slice(&a.dz.to_be_bytes());
+                (*f).extend_from_slice(&a.ttl.to_be_bytes());
+                (*f).push(a.stuck as u8);
             }
             let bo = bobbers().lock().unwrap();
-            write_varint(&mut f, bo.len() as i64);
+            write_varint(&mut *f, bo.len() as i64);
             for a in bo.iter() {
-                f.extend_from_slice(&a.eid.to_be_bytes());
-                f.extend_from_slice(&a.owner.to_be_bytes());
-                f.extend_from_slice(&a.x.to_be_bytes());
-                f.extend_from_slice(&a.y.to_be_bytes());
-                f.extend_from_slice(&a.z.to_be_bytes());
-                f.extend_from_slice(&a.dx.to_be_bytes());
-                f.extend_from_slice(&a.dy.to_be_bytes());
-                f.extend_from_slice(&a.dz.to_be_bytes());
-                f.extend_from_slice(&a.age.to_be_bytes());
-                f.push(a.bit as u8);
+                (*f).extend_from_slice(&a.eid.to_be_bytes());
+                (*f).extend_from_slice(&a.owner.to_be_bytes());
+                (*f).extend_from_slice(&a.x.to_be_bytes());
+                (*f).extend_from_slice(&a.y.to_be_bytes());
+                (*f).extend_from_slice(&a.z.to_be_bytes());
+                (*f).extend_from_slice(&a.dx.to_be_bytes());
+                (*f).extend_from_slice(&a.dy.to_be_bytes());
+                (*f).extend_from_slice(&a.dz.to_be_bytes());
+                (*f).extend_from_slice(&a.age.to_be_bytes());
+                (*f).push(a.bit as u8);
             }
             let pe = pearls().lock().unwrap();
-            write_varint(&mut f, pe.len() as i64);
+            write_varint(&mut *f, pe.len() as i64);
             for a in pe.iter() {
-                f.extend_from_slice(&a.eid.to_be_bytes());
-                f.extend_from_slice(&a.owner.to_be_bytes());
-                f.extend_from_slice(&a.x.to_be_bytes());
-                f.extend_from_slice(&a.y.to_be_bytes());
-                f.extend_from_slice(&a.z.to_be_bytes());
-                f.extend_from_slice(&a.dx.to_be_bytes());
-                f.extend_from_slice(&a.dy.to_be_bytes());
-                f.extend_from_slice(&a.dz.to_be_bytes());
-                f.extend_from_slice(&a.ttl.to_be_bytes());
+                (*f).extend_from_slice(&a.eid.to_be_bytes());
+                (*f).extend_from_slice(&a.owner.to_be_bytes());
+                (*f).extend_from_slice(&a.x.to_be_bytes());
+                (*f).extend_from_slice(&a.y.to_be_bytes());
+                (*f).extend_from_slice(&a.z.to_be_bytes());
+                (*f).extend_from_slice(&a.dx.to_be_bytes());
+                (*f).extend_from_slice(&a.dy.to_be_bytes());
+                (*f).extend_from_slice(&a.dz.to_be_bytes());
+                (*f).extend_from_slice(&a.ttl.to_be_bytes());
             }
             let pr = primed().lock().unwrap();
-            write_varint(&mut f, pr.len() as i64);
+            write_varint(&mut *f, pr.len() as i64);
             for a in pr.iter() {
-                f.extend_from_slice(&a.eid.to_be_bytes());
-                f.extend_from_slice(&a.x.to_be_bytes());
-                f.extend_from_slice(&a.y.to_be_bytes());
-                f.extend_from_slice(&a.z.to_be_bytes());
-                f.extend_from_slice(&a.left.to_be_bytes());
+                (*f).extend_from_slice(&a.eid.to_be_bytes());
+                (*f).extend_from_slice(&a.x.to_be_bytes());
+                (*f).extend_from_slice(&a.y.to_be_bytes());
+                (*f).extend_from_slice(&a.z.to_be_bytes());
+                (*f).extend_from_slice(&a.left.to_be_bytes());
             }
         }
         // weather is world state in vanilla — rain budget survives restart
-        f.extend_from_slice(&RAINING.load(Ordering::Relaxed).to_be_bytes());
-        f.extend_from_slice(&THUNDERING.load(Ordering::Relaxed).to_be_bytes());
+        (*f).extend_from_slice(&RAINING.load(Ordering::Relaxed).to_be_bytes());
+        (*f).extend_from_slice(&THUNDERING.load(Ordering::Relaxed).to_be_bytes());
         // gamerules are world state too (level.dat GameRules)
         for r in [&GR_KEEP_INVENTORY, &GR_DAYLIGHT_CYCLE, &GR_WEATHER_CYCLE, &GR_MOB_SPAWNING, &GR_MOB_GRIEFING, &GR_NATURAL_REGEN, &GR_MOB_LOOT] {
-            f.push(r.load(Ordering::Relaxed));
+            (*f).push(r.load(Ordering::Relaxed));
         }
         { let ws = WORLD_SPAWN.lock().unwrap();
-          f.extend_from_slice(&ws.0.to_be_bytes());
-          f.extend_from_slice(&ws.1.to_be_bytes());
-          f.extend_from_slice(&ws.2.to_be_bytes()); }
-        f.push(DIFFICULTY.load(Ordering::Relaxed));
+          (*f).extend_from_slice(&ws.0.to_be_bytes());
+          (*f).extend_from_slice(&ws.1.to_be_bytes());
+          (*f).extend_from_slice(&ws.2.to_be_bytes()); }
+        (*f).push(DIFFICULTY.load(Ordering::Relaxed));
         // entity tags: players by name, mobs by ordinal (eids re-issue)
         {
             let tm = tags().lock().unwrap();
             let players: Vec<(&String, &HashSet<String>)> = tm.iter()
                 .filter(|(k, _)| k.starts_with("p:")).collect();
-            write_varint(&mut f, players.len() as i64);
+            write_varint(&mut *f, players.len() as i64);
             for (k, st) in players {
                 let nm = &k[2..];
-                f.extend_from_slice(&(nm.len() as u16).to_be_bytes());
-                f.extend_from_slice(nm.as_bytes());
-                write_varint(&mut f, st.len() as i64);
+                (*f).extend_from_slice(&(nm.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(nm.as_bytes());
+                write_varint(&mut *f, st.len() as i64);
                 for t in st.iter() {
-                    f.extend_from_slice(&(t.len() as u16).to_be_bytes());
-                    f.extend_from_slice(t.as_bytes());
+                    (*f).extend_from_slice(&(t.len() as u16).to_be_bytes());
+                    (*f).extend_from_slice(t.as_bytes());
                 }
             }
             let ms = mobs().lock().unwrap();
             let mobe: Vec<(i64, &HashSet<String>)> = ms.iter().enumerate()
                 .filter_map(|(i, m)| tm.get(&format!("e:{}", m.eid)).map(|st| (i as i64, st))).collect();
-            write_varint(&mut f, mobe.len() as i64);
+            write_varint(&mut *f, mobe.len() as i64);
             for (i, st) in mobe {
-                write_varint(&mut f, i);
-                write_varint(&mut f, st.len() as i64);
+                write_varint(&mut *f, i);
+                write_varint(&mut *f, st.len() as i64);
                 for t in st.iter() {
-                    f.extend_from_slice(&(t.len() as u16).to_be_bytes());
-                    f.extend_from_slice(t.as_bytes());
+                    (*f).extend_from_slice(&(t.len() as u16).to_be_bytes());
+                    (*f).extend_from_slice(t.as_bytes());
                 }
             }
         }
@@ -4104,51 +4103,52 @@ fn save_world() {
         {
             let t_now = TICK.load(Ordering::Relaxed);
             let sf = sched_fns().lock().unwrap();
-            write_varint(&mut f, sf.len() as i64);
+            let n_sched = sf.len();
+            write_varint(&mut *f, n_sched as i64);
             for (f2, due) in sf.iter() {
-                f.extend_from_slice(&(f2.len() as u16).to_be_bytes());
-                f.extend_from_slice(f2.as_bytes());
-                f.extend_from_slice(&(due.saturating_sub(t_now)).to_be_bytes());
+                (*f).extend_from_slice(&(f2.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(f2.as_bytes());
+                (*f).extend_from_slice(&(due.saturating_sub(t_now)).to_be_bytes());
             }
             let ag = adv_done().lock().unwrap();
-            write_varint(&mut f, ag.len() as i64);
+            write_varint(&mut *f, ag.len() as i64);
             for (pn, ids) in ag.iter() {
-                f.extend_from_slice(&(pn.len() as u16).to_be_bytes());
-                f.extend_from_slice(pn.as_bytes());
-                write_varint(&mut f, ids.len() as i64);
+                (*f).extend_from_slice(&(pn.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(pn.as_bytes());
+                write_varint(&mut *f, ids.len() as i64);
                 for id in ids {
-                    f.extend_from_slice(&(id.len() as u16).to_be_bytes());
-                    f.extend_from_slice(id.as_bytes());
+                    (*f).extend_from_slice(&(id.len() as u16).to_be_bytes());
+                    (*f).extend_from_slice(id.as_bytes());
                 }
             }
             // player attributes (p: keys) — e: keys are transient by design
             let at = attrs().lock().unwrap();
             let pa: Vec<(&String, &HashMap<String, f64>)> =
                 at.iter().filter(|(k, _)| k.starts_with("p:")).collect();
-            write_varint(&mut f, pa.len() as i64);
+            write_varint(&mut *f, pa.len() as i64);
             for (k, m) in pa {
                 let nm = &k[2..];
-                f.extend_from_slice(&(nm.len() as u16).to_be_bytes());
-                f.extend_from_slice(nm.as_bytes());
-                write_varint(&mut f, m.len() as i64);
+                (*f).extend_from_slice(&(nm.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(nm.as_bytes());
+                write_varint(&mut *f, m.len() as i64);
                 for (an, v) in m.iter() {
-                    f.extend_from_slice(&(an.len() as u16).to_be_bytes());
-                    f.extend_from_slice(an.as_bytes());
-                    f.extend_from_slice(&v.to_be_bytes());
+                    (*f).extend_from_slice(&(an.len() as u16).to_be_bytes());
+                    (*f).extend_from_slice(an.as_bytes());
+                    (*f).extend_from_slice(&v.to_be_bytes());
                 }
             }
             // scoreboard objective types + sidebar selection
             let ot = obj_types().lock().unwrap();
-            write_varint(&mut f, ot.len() as i64);
+            write_varint(&mut *f, ot.len() as i64);
             for (o, t) in ot.iter() {
-                f.extend_from_slice(&(o.len() as u16).to_be_bytes());
-                f.extend_from_slice(o.as_bytes());
-                f.extend_from_slice(&(t.len() as u16).to_be_bytes());
-                f.extend_from_slice(t.as_bytes());
+                (*f).extend_from_slice(&(o.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(o.as_bytes());
+                (*f).extend_from_slice(&(t.len() as u16).to_be_bytes());
+                (*f).extend_from_slice(t.as_bytes());
             }
             let sb = sidebar_obj().lock().unwrap().clone().unwrap_or_default();
-            f.extend_from_slice(&(sb.len() as u16).to_be_bytes());
-            f.extend_from_slice(sb.as_bytes());
+            (*f).extend_from_slice(&(sb.len() as u16).to_be_bytes());
+            (*f).extend_from_slice(sb.as_bytes());
         }
     }
     let tmp = format!("{}.tmp", WORLD_FILE);
@@ -4156,24 +4156,30 @@ fn save_world() {
         let _ = std::fs::rename(&tmp, WORLD_FILE);
     }
 }
-fn load_world() {
-    let Ok(b) = std::fs::read(WORLD_FILE) else { return };
+fn save_world() {
+    let mut f = Vec::new();
+    save_world_into(&mut f);
+    let _ = std::fs::write(WORLD_FILE, &f);
+}
+
+fn load_world_from(payload: &[u8]) {
     let mut p = 0usize;
+    let b = payload;
     // bounds-safe varint read: truncated input stops the parse instead of
     // panicking; continuation bytes beyond i64's 70 bits are ignored.
     let rv = rv_varint;
-    let n = rv(&b, &mut p);
+    let n = rv(&payload, &mut p);
     let mut w = world().lock().unwrap();
     for _ in 0..n {
-        if p + 8 > b.len() { break }
+        if p + 8 > payload.len() { break }
         let cx = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
         let cz = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-        let m = rv(&b, &mut p);
+        let m = rv(&payload, &mut p);
         let c = w.entry((cx, cz)).or_default();
         for _ in 0..m {
-            if p + 4 > b.len() { break }
+            if p + 4 > payload.len() { break }
             let idx = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-            let st = rv(&b, &mut p) as u32;
+            let st = rv(&payload, &mut p) as u32;
             c.insert(idx, st);
         }
     }
@@ -4181,14 +4187,14 @@ fn load_world() {
     drop(w);
     rebuild_derived_indexes();
     // optional META tail
-    if p + 4 <= b.len() && (&b[p..p+4] == b"MET2" || &b[p..p+4] == b"MET3") {
-        let has_comps = &b[p..p+4] == b"MET3";
+    if p + 4 <= payload.len() && (&payload[p..p+4] == b"MET2" || &payload[p..p+4] == b"MET3") {
+        let has_comps = &payload[p..p+4] == b"MET3";
         p += 4;
-        let mn = rv(&b, &mut p);
+        let mn = rv(&payload, &mut p);
         let mut ms = mobs().lock().unwrap();
         for _ in 0..mn {
-            if p + 28 > b.len() { break }
-            let et = rv(&b, &mut p);
+            if p + 28 > payload.len() { break }
+            let et = rv(&payload, &mut p);
             let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
             let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
             let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
@@ -4196,93 +4202,93 @@ fn load_world() {
             ms.push(Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                 etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(hp),
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(60) }));
+                fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(300) as i32) }));
         }
         drop(ms);
-        if p + 8 <= b.len() {
+        if p + 8 <= payload.len() {
             WORLD_TIME.store(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), Ordering::Relaxed); p += 8;
         }
-        if p < b.len() {
-            let pn = rv(&b, &mut p);
+        if p < payload.len() {
+            let pn = rv(&payload, &mut p);
             let mut store = inv_store().lock().unwrap();
             for _ in 0..pn {
-                if p + 2 > b.len() { break }
+                if p + 2 > payload.len() { break }
                 let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl > b.len() { break }
-                let name = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
-                let en = rv(&b, &mut p);
+                if p + nl > payload.len() { break }
+                let name = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                let en = rv(&payload, &mut p);
                 let mut inv = HashMap::new();
                 for _ in 0..en {
-                    if p + 3 > b.len() { break }
+                    if p + 3 > payload.len() { break }
                     let slot = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
-                    let item = rv(&b, &mut p);
-                    if p >= b.len() { break }
+                    let item = rv(&payload, &mut p);
+                    if p >= payload.len() { break }
                     let cnt = b[p]; p += 1;
-                    let comps = if has_comps { read_comps(&b, &mut p) } else { Vec::new() };
+                    let comps = if has_comps { read_comps(&payload, &mut p) } else { Vec::new() };
                     inv.insert(slot, (item, cnt, comps));
                 }
                 store.insert(name, inv);
             }
         }
-        if p < b.len() {
-            let cn = rv(&b, &mut p);
+        if p < payload.len() {
+            let cn = rv(&payload, &mut p);
             let mut ch = chests().lock().unwrap();
             for _ in 0..cn {
-                if p + 12 > b.len() { break }
+                if p + 12 > payload.len() { break }
                 let x = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let y = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let z = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let en = rv(&b, &mut p);
+                let en = rv(&payload, &mut p);
                 let mut slots = HashMap::new();
                 for _ in 0..en {
-                    if p + 3 > b.len() { break }
+                    if p + 3 > payload.len() { break }
                     let slot = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
-                    let item = rv(&b, &mut p);
-                    if p >= b.len() { break }
+                    let item = rv(&payload, &mut p);
+                    if p >= payload.len() { break }
                     let cnt = b[p]; p += 1;
-                    let comps = if has_comps { read_comps(&b, &mut p) } else { Vec::new() };
+                    let comps = if has_comps { read_comps(&payload, &mut p) } else { Vec::new() };
                     slots.insert(slot, (item, cnt, comps));
                 }
                 ch.insert((x, y, z), slots);
             }
         }
-        if p < b.len() {
-            let sn = rv(&b, &mut p);
+        if p < payload.len() {
+            let sn = rv(&payload, &mut p);
             let mut sg = signs().lock().unwrap();
             for _ in 0..sn {
-                if p + 13 > b.len() { break }
+                if p + 13 > payload.len() { break }
                 let x = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let y = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let z = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let front = b[p]; p += 1;
                 let mut lines: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
                 for l in lines.iter_mut() {
-                    if p + 2 > b.len() { break }
+                    if p + 2 > payload.len() { break }
                     let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > b.len() { break }
-                    *l = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
+                    if p + nl > payload.len() { break }
+                    *l = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
                 }
                 sg.insert((x, y, z, front), lines);
             }
         }
-        if p < b.len() {
-            let fn_ = rv(&b, &mut p);
+        if p < payload.len() {
+            let fn_ = rv(&payload, &mut p);
             let mut fl = forceloaded().lock().unwrap();
             for _ in 0..fn_ {
-                if p + 8 > b.len() { break }
+                if p + 8 > payload.len() { break }
                 let cx = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let cz = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 fl.insert((cx, cz));
             }
         }
-        if p + 1 <= b.len() {
-            let pn = rv(&b, &mut p);
+        if p + 1 <= payload.len() {
+            let pn = rv(&payload, &mut p);
             let mut ps = pos_store().lock().unwrap();
             for _ in 0..pn {
-                if p + 2 > b.len() { break }
+                if p + 2 > payload.len() { break }
                 let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl + 28 > b.len() { break }
-                let name = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
+                if p + nl + 28 > payload.len() { break }
+                let name = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
                 let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
@@ -4291,283 +4297,283 @@ fn load_world() {
                 ps.insert(name, (x, y, z, yaw, pitch));
             }
         }
-        if p < b.len() {
-            let dn = rv(&b, &mut p);
+        if p < payload.len() {
+            let dn = rv(&payload, &mut p);
             let mut ds = drops().lock().unwrap();
             for _ in 0..dn {
-                if p + 30 > b.len() { break }
+                if p + 30 > payload.len() { break }
                 let eid = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let item = rv(&b, &mut p);
-                if p >= b.len() { break }
+                let item = rv(&payload, &mut p);
+                if p >= payload.len() { break }
                 let cnt = b[p]; p += 1;
-                let comps = if has_comps { read_comps(&b, &mut p) } else { Vec::new() };
+                let comps = if has_comps { read_comps(&payload, &mut p) } else { Vec::new() };
                 if eid >= NEXT_EID.load(Ordering::Relaxed) {
                     NEXT_EID.store(eid + 1, Ordering::SeqCst);
                 }
                 ds.push(Drop { eid, x, y, z, item, cnt, comps, age: 0 });
             }
         }
-        if p < b.len() {
-            let fn_ = rv(&b, &mut p);
+        if p < payload.len() {
+            let fn_ = rv(&payload, &mut p);
             let mut fs = furnaces().lock().unwrap();
             for _ in 0..fn_ {
-                if p + 12 > b.len() { break }
+                if p + 12 > payload.len() { break }
                 let x = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let y = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let z = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let rd = |b: &[u8], p: &mut usize| -> Stack {
-                    let it = rv(b, p); let c = if *p < b.len() { b[*p] } else { 0 }; *p += 1;
+                    let it = rv(b, p); let c = if *p < payload.len() { b[*p] } else { 0 }; *p += 1;
                     (it, c, if has_comps { read_comps(b, p) } else { Vec::new() })
                 };
-                let input = rd(&b, &mut p);
-                let fuel = rd(&b, &mut p);
-                let output = rd(&b, &mut p);
-                if p + 8 > b.len() { break }
+                let input = rd(&payload, &mut p);
+                let fuel = rd(&payload, &mut p);
+                let output = rd(&payload, &mut p);
+                if p + 8 > payload.len() { break }
                 let burn_left = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let progress = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 fs.insert((x, y, z), Furnace { input, fuel, output, burn_left, progress, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
             }
             eprintln!("[spine] loaded {} furnaces", fs.len());
         }
-        if p < b.len() {
+        if p < payload.len() {
             // sheared mob indices -> mark by load order (fresh eids)
-            let sn = rv(&b, &mut p);
+            let sn = rv(&payload, &mut p);
             let mut shidx: Vec<usize> = Vec::new();
-            for _ in 0..sn { shidx.push(rv(&b, &mut p) as usize); }
+            for _ in 0..sn { shidx.push(rv(&payload, &mut p) as usize); }
             let ms = mobs().lock().unwrap();
             let mut sh = sheared().lock().unwrap();
             for i in shidx { if let Some(m) = ms.get(i) { sh.insert(m.eid); } }
         }
-        if p < b.len() {
-            let on = rv(&b, &mut p);
+        if p < payload.len() {
+            let on = rv(&payload, &mut p);
             let mut sc = scores().lock().unwrap();
             for _ in 0..on {
-                if p + 2 > b.len() { break }
+                if p + 2 > payload.len() { break }
                 let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl > b.len() { break }
-                let obj = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
-                let en = rv(&b, &mut p);
+                if p + nl > payload.len() { break }
+                let obj = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                let en = rv(&payload, &mut p);
                 let mut entries = HashMap::new();
                 for _ in 0..en {
-                    if p + 2 > b.len() { break }
+                    if p + 2 > payload.len() { break }
                     let el = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + el + 8 > b.len() { break }
-                    let entry = String::from_utf8_lossy(&b[p..p+el]).to_string(); p += el;
+                    if p + el + 8 > payload.len() { break }
+                    let entry = String::from_utf8_lossy(&payload[p..p+el]).to_string(); p += el;
                     let val = i64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                     entries.insert(entry, val);
                 }
                 sc.insert(obj, entries);
             }
         }
-        if p + 1 < b.len() {
+        if p + 1 < payload.len() {
             // XP orbs (eid,x,y,z,val,age_ms)
-            let xn = rv(&b, &mut p);
+            let xn = rv(&payload, &mut p);
             let mut xs = xps().lock().unwrap();
             let mut mx: i32 = 0;
             for _ in 0..xn {
-                if p + 34 > b.len() { break }
+                if p + 34 > payload.len() { break }
                 let eid = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let val = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
                 let ams = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                xs.push(Xp { eid, x, y, z, val, age: (u64::from(ams) / u64::from(1000 / TICKS_PER_SECOND)).min(server_ticks(XP_LIFE_GT)) as i32 });
+                xs.push(Xp { eid, x, y, z, val, age: ams.min(server_ticks(XP_LIFE_GT) as u32) as i32 });
                 if eid > mx { mx = eid; }
             }
             if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
             if !xs.is_empty() { eprintln!("[spine] loaded {} xp orbs", xs.len()); }
         }
-        if p < b.len() {
+        if p < payload.len() {
             // drop ages by order — restore remaining despawn budget
             let mut ds = drops().lock().unwrap();
             for d in ds.iter_mut() {
-                if p + 4 > b.len() { break }
-                let ams = u32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64; p += 4;
-                d.age = (ams / u64::from(1000 / TICKS_PER_SECOND)).min(server_ticks(DROP_LIFE_GT)) as i32;
+                if p + 4 > payload.len() { break }
+                let aticks = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                d.age = aticks.min(server_ticks(DROP_LIFE_GT) as u32) as i32;
             }
         }
-        if p < b.len() {
+        if p < payload.len() {
             let rf3 = |b: &[u8], p: &mut usize| -> f64 { let v = f64::from_be_bytes(b[*p..*p+8].try_into().unwrap()); *p += 8; v };
             let ri4 = |b: &[u8], p: &mut usize| -> i32 { let v = i32::from_be_bytes(b[*p..*p+4].try_into().unwrap()); *p += 4; v };
             let mut mx = 0i32;
             let bump = |eid: i32, mx: &mut i32| { if eid > *mx { *mx = eid; } };
             let arw2 = b[p..].starts_with(b"ARW2");
             if arw2 { p += 4; }
-            let n = rv(&b, &mut p);
+            let n = rv(&payload, &mut p);
             { let mut ar = arrows().lock().unwrap();
               let rec = if arw2 { 61 } else { 60 };
               for _ in 0..n {
-                if p + rec > b.len() { break }
-                let eid = ri4(&b, &mut p); let owner = ri4(&b, &mut p);
-                let (x, y, z) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
-                let (dx, dy, dz) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
-                let ttl = ri4(&b, &mut p);
+                if p + rec > payload.len() { break }
+                let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
+                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
+                let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
+                let ttl = ri4(&payload, &mut p);
                 let stuck = if arw2 { let v = b[p] != 0; p += 1; v } else { false };
                 ar.push(Arrow { eid, owner, x, y, z, dx, dy, dz, ttl, dmg: 6.0, fire: 0, punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck }); bump(eid, &mut mx);
               } }
-            let n = rv(&b, &mut p);
+            let n = rv(&payload, &mut p);
             { let mut bo = bobbers().lock().unwrap();
               for _ in 0..n {
-                if p + 61 > b.len() { break }
-                let eid = ri4(&b, &mut p); let owner = ri4(&b, &mut p);
-                let (x, y, z) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
-                let (dx, dy, dz) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
-                let age = ri4(&b, &mut p); let bit = b[p] != 0; p += 1;
+                if p + 61 > payload.len() { break }
+                let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
+                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
+                let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
+                let age = ri4(&payload, &mut p); let bit = b[p] != 0; p += 1;
                 bo.push(Bobber { eid, owner, x, y, z, dx, dy, dz, age, bit }); bump(eid, &mut mx);
               } }
-            let n = rv(&b, &mut p);
+            let n = rv(&payload, &mut p);
             { let mut pe = pearls().lock().unwrap();
               for _ in 0..n {
-                if p + 60 > b.len() { break }
-                let eid = ri4(&b, &mut p); let owner = ri4(&b, &mut p);
-                let (x, y, z) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
-                let (dx, dy, dz) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
-                let ttl = ri4(&b, &mut p);
+                if p + 60 > payload.len() { break }
+                let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
+                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
+                let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
+                let ttl = ri4(&payload, &mut p);
                 pe.push(Pearl { eid, owner, x, y, z, dx, dy, dz, ttl }); bump(eid, &mut mx);
               } }
-            let n = rv(&b, &mut p);
+            let n = rv(&payload, &mut p);
             { let mut pr = primed().lock().unwrap();
               for _ in 0..n {
-                if p + 32 > b.len() { break }
-                let eid = ri4(&b, &mut p);
-                let (x, y, z) = (rf3(&b, &mut p), rf3(&b, &mut p), rf3(&b, &mut p));
+                if p + 32 > payload.len() { break }
+                let eid = ri4(&payload, &mut p);
+                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
                 let left = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 pr.push(Primed { eid, x, y, z, left });
                 bump(eid, &mut mx);
               } }
             if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
         }
-        if p + 8 <= b.len() {
+        if p + 8 <= payload.len() {
             RAINING.store(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), Ordering::Relaxed);
             p += 8;
         }
-        if p + 8 <= b.len() {
+        if p + 8 <= payload.len() {
             THUNDERING.store(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), Ordering::Relaxed);
             p += 8;
         }
-        if p + 4 <= b.len() {
+        if p + 4 <= payload.len() {
             for r in [&GR_KEEP_INVENTORY, &GR_DAYLIGHT_CYCLE, &GR_WEATHER_CYCLE, &GR_MOB_SPAWNING, &GR_MOB_GRIEFING, &GR_NATURAL_REGEN, &GR_MOB_LOOT] {
                 r.store(b[p], Ordering::Relaxed); p += 1;
             }
         }
-        if p + 25 <= b.len() {
+        if p + 25 <= payload.len() {
             let (x, y, z) = (f64::from_be_bytes(b[p..p+8].try_into().unwrap()),
                              f64::from_be_bytes(b[p+8..p+16].try_into().unwrap()),
                              f64::from_be_bytes(b[p+16..p+24].try_into().unwrap()));
             *WORLD_SPAWN.lock().unwrap() = (x, y, z); p += 24;
             DIFFICULTY.store(b[p], Ordering::Relaxed); p += 1;
         }
-        if p < b.len() {
+        if p < payload.len() {
             let mut tm = tags().lock().unwrap();
-            let pn = rv(&b, &mut p);
+            let pn = rv(&payload, &mut p);
             for _ in 0..pn {
-                if p + 2 > b.len() { break }
+                if p + 2 > payload.len() { break }
                 let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl > b.len() { break }
-                let nm = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
-                let tc = rv(&b, &mut p);
+                if p + nl > payload.len() { break }
+                let nm = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                let tc = rv(&payload, &mut p);
                 let mut st = HashSet::new();
                 for _ in 0..tc {
-                    if p + 2 > b.len() { break }
+                    if p + 2 > payload.len() { break }
                     let tl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + tl > b.len() { break }
-                    st.insert(String::from_utf8_lossy(&b[p..p+tl]).to_string()); p += tl;
+                    if p + tl > payload.len() { break }
+                    st.insert(String::from_utf8_lossy(&payload[p..p+tl]).to_string()); p += tl;
                 }
                 if !st.is_empty() { tm.insert(format!("p:{}", nm), st); }
             }
-            let mn2 = rv(&b, &mut p);
+            let mn2 = rv(&payload, &mut p);
             let mut mtag: Vec<(usize, HashSet<String>)> = Vec::new();
             for _ in 0..mn2 {
-                let i = rv(&b, &mut p) as usize;
-                let tc = rv(&b, &mut p);
+                let i = rv(&payload, &mut p) as usize;
+                let tc = rv(&payload, &mut p);
                 let mut st = HashSet::new();
                 for _ in 0..tc {
-                    if p + 2 > b.len() { break }
+                    if p + 2 > payload.len() { break }
                     let tl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + tl > b.len() { break }
-                    st.insert(String::from_utf8_lossy(&b[p..p+tl]).to_string()); p += tl;
+                    if p + tl > payload.len() { break }
+                    st.insert(String::from_utf8_lossy(&payload[p..p+tl]).to_string()); p += tl;
                 }
                 if !st.is_empty() { mtag.push((i, st)); }
             }
             let ms = mobs().lock().unwrap();
             for (i, st) in mtag { if let Some(m) = ms.get(i) { tm.insert(format!("e:{}", m.eid), st); } }
             drop(ms);
-            if p < b.len() {
-                let sn = rv(&b, &mut p);
+            if p < payload.len() {
+                let sn = rv(&payload, &mut p);
                 let mut sf = sched_fns().lock().unwrap();
                 let t_now = TICK.load(Ordering::Relaxed);
                 for _ in 0..sn {
-                    if p + 2 > b.len() { break }
+                    if p + 2 > payload.len() { break }
                     let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > b.len() { break }
-                    let f2 = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
-                    if p + 8 > b.len() { break }
+                    if p + nl > payload.len() { break }
+                    let f2 = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                    if p + 8 > payload.len() { break }
                     let rem = u64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                     sf.push((f2, t_now + rem));
                 }
             }
-            if p < b.len() {
-                let gn = rv(&b, &mut p);
+            if p < payload.len() {
+                let gn = rv(&payload, &mut p);
                 let mut ag = adv_done().lock().unwrap();
                 for _ in 0..gn {
-                    if p + 2 > b.len() { break }
+                    if p + 2 > payload.len() { break }
                     let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > b.len() { break }
-                    let pn = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
-                    let ic = rv(&b, &mut p);
+                    if p + nl > payload.len() { break }
+                    let pn = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                    let ic = rv(&payload, &mut p);
                     let mut ids = HashSet::new();
                     for _ in 0..ic {
-                        if p + 2 > b.len() { break }
+                        if p + 2 > payload.len() { break }
                         let il = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + il > b.len() { break }
-                        ids.insert(String::from_utf8_lossy(&b[p..p+il]).to_string()); p += il;
+                        if p + il > payload.len() { break }
+                        ids.insert(String::from_utf8_lossy(&payload[p..p+il]).to_string()); p += il;
                     }
                     if !ids.is_empty() { ag.insert(pn, ids); }
                 }
             }
             // player attributes
-            if p < b.len() {
-                let an = rv(&b, &mut p);
+            if p < payload.len() {
+                let an = rv(&payload, &mut p);
                 let mut at = attrs().lock().unwrap();
                 for _ in 0..an {
-                    if p + 2 > b.len() { break }
+                    if p + 2 > payload.len() { break }
                     let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > b.len() { break }
-                    let nm = String::from_utf8_lossy(&b[p..p+nl]).to_string(); p += nl;
-                    let cnt = rv(&b, &mut p);
+                    if p + nl > payload.len() { break }
+                    let nm = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                    let cnt = rv(&payload, &mut p);
                     let mut m = HashMap::new();
                     for _ in 0..cnt {
-                        if p + 2 > b.len() { break }
+                        if p + 2 > payload.len() { break }
                         let kl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + kl + 8 > b.len() { break }
-                        let kn = String::from_utf8_lossy(&b[p..p+kl]).to_string(); p += kl;
+                        if p + kl + 8 > payload.len() { break }
+                        let kn = String::from_utf8_lossy(&payload[p..p+kl]).to_string(); p += kl;
                         let v = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                         m.insert(kn, v);
                     }
                     if !m.is_empty() { at.insert(format!("p:{}", nm), m); }
                 }
                 // objective types + sidebar
-                if p < b.len() {
-                    let oc = rv(&b, &mut p);
+                if p < payload.len() {
+                    let oc = rv(&payload, &mut p);
                     let mut ot = obj_types().lock().unwrap();
                     for _ in 0..oc {
-                        if p + 2 > b.len() { break }
+                        if p + 2 > payload.len() { break }
                         let ol = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + ol + 2 > b.len() { break }
-                        let on = String::from_utf8_lossy(&b[p..p+ol]).to_string(); p += ol;
+                        if p + ol + 2 > payload.len() { break }
+                        let on = String::from_utf8_lossy(&payload[p..p+ol]).to_string(); p += ol;
                         let tl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + tl > b.len() { break }
-                        ot.insert(on, String::from_utf8_lossy(&b[p..p+tl]).to_string()); p += tl;
+                        if p + tl > payload.len() { break }
+                        ot.insert(on, String::from_utf8_lossy(&payload[p..p+tl]).to_string()); p += tl;
                     }
-                    if p + 2 <= b.len() {
+                    if p + 2 <= payload.len() {
                         let sl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + sl <= b.len() && sl > 0 {
+                        if p + sl <= payload.len() && sl > 0 {
                             *sidebar_obj().lock().unwrap() =
-                                Some(String::from_utf8_lossy(&b[p..p+sl]).to_string());
+                                Some(String::from_utf8_lossy(&payload[p..p+sl]).to_string());
                         }
                     }
                 }
@@ -4578,6 +4584,11 @@ fn load_world() {
 }
 
 // ---------- name -> id tables (generated from minecraft-data 1.21.1) ----------
+fn load_world() {
+    let Ok(b) = std::fs::read(WORLD_FILE) else { return };
+    load_world_from(&b);
+}
+
 fn state_from_arg(arg: &str) -> Option<u32> {
     let (name, props) = match arg.split_once('[') {
         Some((n, rest)) => (n.trim_start_matches("minecraft:").to_string(), rest.trim_end_matches(']').to_string()),
@@ -13488,3 +13499,5 @@ mod furnace_cache_tests;
 mod effect_tests;
 #[cfg(test)]
 mod tick_tests;
+#[cfg(test)]
+mod persistence_tests;

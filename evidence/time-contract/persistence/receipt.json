@@ -1,0 +1,21 @@
+{
+  "claim": "save/load round-trips the MET3 tail and MET2 tolerates the missing air field; a real save/load unit mismatch was found and fixed; NOT 20TPS",
+  "method": "synthetic round-trip through the production encoder, because no real saved world exists for this repository",
+  "bugs_found": [
+    "drop and xp age were written as server ticks but read back as milliseconds, so a 3-tick age returned as 0",
+    "the MET3 tail carries no mob air field at all, so reloaded mobs get a full supply; the earlier assumption that MET3 persisted air was wrong",
+    "the MET2 emulation truncated inside the z coordinate due to a wrong offset"
+  ],
+  "fidelity_gap": "vanilla persists mob air; this format does not",
+  "undecided": "legacy MET3 files store drop age in milliseconds. After the fix the loader reads that value as a tick count, which is wrong for old files. A MET4 marker with explicit versioning, or a magic change, is needed. No real data exists, so the blast radius is unknown.",
+  "tests": "30 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "files_sha256": {
+    "README.md": "f0ec2a63db5d01d00aa6b8dcb1061ebb4c0c75381edf89afec7a46c1ad9832ec",
+    "review-attempt.log": "48cc911efaf00473a0065aebc4e4a417011f7f79d8e83ae6af00f363c33194e5",
+    "time-contract-persist-features.log": "f9e1492a0efcf72f32c108a71e64edac77ba2e654cc20de3d819d4bb5d248a98",
+    "time-contract-persist-parallel.log": "3362c4ecf360c2a0f2cf328d4ac9efa34bd3ca9557ffe905ea028fad6884da88",
+    "time-contract-persist-suite.log": "22d34d2a92a07f86f409fc3c0a582bf5ffc2398e36d5098fe1b8956650301e20"
+  }
+}
