@@ -1438,6 +1438,9 @@ fn powered_plates() -> &'static Mutex<HashSet<(i32, i32, i32)>> { POWERED_PLATES
 fn plate_unpowered(st: u32) -> bool { st == 5651 || (5717..=5733).contains(&st) && st % 2 == 1 }
 fn plate_powered(st: u32) -> bool { st == 5650 || (5716..=5732).contains(&st) && st % 2 == 0 }
 fn keepalive_time_tick() {
+    // One region borrow for the stage. A static scan confirmed that nothing this
+    // stage calls re-enters the region lock.
+    let region = region_guard();
     let t = TICK.fetch_add(1, Ordering::Relaxed);
     // world clock advances every tick (20 tps => +20/s)
     let wt = if GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) == 1 {
@@ -1654,8 +1657,7 @@ fn keepalive_time_tick() {
     {
         let mut cg = crops().lock().unwrap();
         let mut ripe: Vec<(i32,i32,i32)> = Vec::new();
-        let keys: Vec<(i32,i32,i32)> = { let region = region_guard();
-            cg.keys().copied().filter(|p| region.is_warm(p.0, p.2)).collect() };
+        let keys: Vec<(i32,i32,i32)> = cg.keys().copied().filter(|p| region.is_warm(p.0, p.2)).collect();
         for p in keys {
             let age = cg.get(&p).cloned().unwrap_or(0);
             let hh = ((p.0 as i64).wrapping_mul(31) ^ (p.2 as i64).wrapping_mul(37) ^ (p.1 as i64) ^ t as i64) as u64;
@@ -1705,7 +1707,7 @@ fn keepalive_time_tick() {
     { // fishing bobbers: fly, land on water, bite after 3-7 s
         let mut fb = bobbers().lock().unwrap();
         for b in fb.iter_mut() {
-            if !is_hot(b.x as i32, b.z as i32) { continue }
+            if !region.is_hot(b.x as i32, b.z as i32) { continue }
             b.age += 1;
             let wst = name_to_state("water").unwrap_or(u32::MAX);
             let in_water = block_at(b.x.floor() as i32, b.y.floor() as i32, b.z.floor() as i32) == wst;
@@ -1729,7 +1731,7 @@ fn keepalive_time_tick() {
         let mut pl = pearls().lock().unwrap();
         let mut done: Vec<(i32, f64, f64, f64)> = vec![];
         for p0 in pl.iter_mut() {
-            if !is_hot(p0.x as i32, p0.z as i32) { continue }
+            if !region.is_hot(p0.x as i32, p0.z as i32) { continue }
             p0.ttl -= 1;
             let hit = block_at(p0.x.floor() as i32, p0.y.floor() as i32, p0.z.floor() as i32) != 0;
             if hit || p0.ttl <= 0 { done.push((p0.owner, p0.x, p0.y, p0.z)); }
@@ -1765,7 +1767,7 @@ fn keepalive_time_tick() {
         let mut sl2 = snowballs().lock().unwrap();
         let mut done: Vec<(i32, Option<i32>, f64, f64, bool, f64, f64, f64)> = vec![];
         for p0 in sl2.iter_mut() {
-            if !is_hot(p0.x as i32, p0.z as i32) { continue }
+            if !region.is_hot(p0.x as i32, p0.z as i32) { continue }
             p0.ttl -= 1;
             let mut hit_mob: Option<i32> = None;
             { let ms = mobs().lock().unwrap();
@@ -1817,9 +1819,8 @@ fn keepalive_time_tick() {
         // a farm can out-spawn the despawn window.
         let mut xl = xps().lock().unwrap();
         let life = server_ticks(XP_LIFE_GT) as i32;
-        { let region = region_guard();
-          for x in xl.iter_mut() { if region.is_hot(x.x as i32, x.z as i32) { x.age += 1; } } }
-        let exp: Vec<i32> = xl.iter().filter(|x| x.age >= life && is_hot(x.x as i32, x.z as i32)).map(|x| x.eid).collect();
+        for x in xl.iter_mut() { if region.is_hot(x.x as i32, x.z as i32) { x.age += 1; } }
+        let exp: Vec<i32> = xl.iter().filter(|x| x.age >= life && region.is_hot(x.x as i32, x.z as i32)).map(|x| x.eid).collect();
         for eid in &exp {
             xl.retain(|x| x.eid != *eid);
             broadcast_seen_destroy(*eid);
@@ -1862,11 +1863,12 @@ fn arrow_tick() {
     let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
     {
         let mut ar = arrows().lock().unwrap();
+        let region = region_guard();
         for a in ar.iter_mut() {
             a.ttl -= 1;
             let eid = a.eid;
             if a.ttl <= 0 { dead.push(eid); continue }
-            if !is_hot(a.x as i32, a.z as i32) { continue }
+            if !region.is_hot(a.x as i32, a.z as i32) { continue }
             let (ax, ay, az) = (a.x, a.y, a.z);
             // vanilla: a stuck arrow is picked up on contact (survival only)
             if a.stuck {
@@ -2078,9 +2080,10 @@ fn primed_tick() {
     let mut boom: Vec<Primed> = Vec::new();
     {
         let mut pl = primed().lock().unwrap();
+        let region = region_guard();
         let mut i = 0;
         while i < pl.len() {
-            if !is_hot(pl[i].x as i32, pl[i].z as i32) {
+            if !region.is_hot(pl[i].x as i32, pl[i].z as i32) {
                 i += 1; // fuse pauses while cold: no tick, no decrement
             } else if { pl[i].left -= 1; pl[i].left <= 0 } { boom.push(pl.remove(i)); }
             else { i += 1; }
@@ -2411,10 +2414,11 @@ fn water_tick() {
 static OBS_UNPOWER: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
 fn obs_unpower() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { OBS_UNPOWER.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
 fn observer_tick() {
+    let region = region_guard();
     // phase 1: unpower last tick's pulsers
     let ups: Vec<(i32, i32, i32)> = obs_unpower().lock().unwrap().drain().collect();
     for (bx, by, bz) in ups {
-        if !is_hot(bx, bz) { continue }
+        if !region.is_hot(bx, bz) { continue }
         let st = block_at(bx, by, bz);
         if (12550..=12561).contains(&st) && (st - 12550) / 6 == 1 {
             let nst = st - 6;
@@ -2425,7 +2429,7 @@ fn observer_tick() {
     // phase 2: this tick's detections -> power on (the powered state IS the output)
     let ps: Vec<(i32, i32, i32)> = obs_pulse().lock().unwrap().drain().collect();
     for (bx, by, bz) in ps {
-        if !is_hot(bx, bz) { continue }
+        if !region.is_hot(bx, bz) { continue }
         let st = block_at(bx, by, bz);
         if !(12550..=12561).contains(&st) || (st - 12550) / 6 == 1 { continue }
         let fi = (st - 12550) % 6;
@@ -2524,13 +2528,14 @@ fn hopper_tick() {
     }
 }
 fn drop_tick() {
+    let region = region_guard();
     // player within 1.3 blocks picks up the drop
     let mut taken: Vec<(i32, i32, Stack)> = vec![]; // (drop_eid, collector_eid, stack)
     {
         let ds: Vec<(i32,f64,f64,f64,Stack)> = drops().lock().unwrap().iter().map(|d| (d.eid,d.x,d.y,d.z,(d.item,d.cnt,d.comps.clone()))).collect();
         let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
         for (d_eid, dx, dy, dz, d_stk) in ds.iter() {
-            if !is_hot(*dx as i32, *dz as i32) { continue }
+            if !region.is_hot(*dx as i32, *dz as i32) { continue }
             for c in cls.iter() {
                 let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
                 if (px-dx).powi(2)+(py-dy).powi(2)+(pz-dz).powi(2) < 1.69 {
@@ -2630,8 +2635,7 @@ fn drop_tick() {
         // inside any one despawn window — oldest lose first.
         let mut dp = drops().lock().unwrap();
         let life = server_ticks(DROP_LIFE_GT) as i32;
-        { let region = region_guard();
-          for d in dp.iter_mut() { if region.is_hot(d.x as i32, d.z as i32) { d.age += 1; } } }
+        for d in dp.iter_mut() { if region.is_hot(d.x as i32, d.z as i32) { d.age += 1; } }
         let exp: Vec<i32> = dp.iter().filter(|d| d.age >= life).map(|d| d.eid).collect();
         for eid in &exp {
             dp.retain(|d| d.eid != *eid);
@@ -2699,6 +2703,7 @@ fn mob_tick() {
         }).map(|c| { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) }).collect();
     if cls.is_empty() { return }
     let mobs_snap: Vec<Arc<Mob>> = mobs().lock().unwrap().iter().cloned().collect();
+    let region = region_guard();
 
     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
     let day = wt < 13000 || wt > 23000;
@@ -2712,7 +2717,7 @@ fn mob_tick() {
             mob_env_die(m.eid, et, mx, my, mz, mburn);
             continue;
         }
-        if !is_hot(mp.0 as i32, mp.2 as i32) { continue }
+        if !region.is_hot(mp.0 as i32, mp.2 as i32) { continue }
         // suffocation: head cell buried in a solid block -> 1hp/0.5s (vanilla)
         if TICK.load(Ordering::Relaxed) % server_ticks(10) == 0 && mob_cell_solid(mp.0, mp.1 + 1.0, mp.2) {
             let mut hp = m.hp.lock().unwrap();
@@ -3576,12 +3581,13 @@ fn plugin_tick() {
     if nplug == 0 { return }
     let cells: Vec<PluginCell> = plugin_cells().lock().unwrap().values().flatten().cloned().collect();
     if cells.is_empty() { return }
+    let region = region_guard();
     let now = TICK_IDX.load(Ordering::Relaxed);
     for c in cells {
         let ck = (c.pi, c.x, c.y, c.z, c.key);
         let due = plugin_backoff().lock().unwrap().get(&ck).map(|(t, _)| *t <= now).unwrap_or(true);
         if !due { continue }
-        if !(is_hot(c.x, c.z) || (c.warm_ok && is_warm(c.x, c.z))) { continue }
+        if !(region.is_hot(c.x, c.z) || (c.warm_ok && region.is_warm(c.x, c.z))) { continue }
         let mut api = PluginApi { fuel: PLUGIN_FUEL, pi: c.pi };
         let res = {
             let mut pl = plugins().lock().unwrap();

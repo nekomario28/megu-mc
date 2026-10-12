@@ -45,9 +45,32 @@ CPU時間で19%変動した。**
 52テスト（serial／8thread）、wire smoke、Java adapter×2。
 `region_membership_matches_hot_plus_skirt_across_input_changes` を維持。
 
-## 残り
+## 残り18箇所の変換（追記）
 
-per-itemで `is_hot`/`is_warm` を呼ぶ箇所は**18残っている**
-（飛翔体4経路・オブザーバー・Mob・plugin cell・interest・作物の確率判定）。
-今回変換したのは炉（既にslice 18）・水・溶岩・ホッパー・作物・drop・xp。
-残りは同じ形なので順次移す。
+残っていた飛翔体・オブザーバー・Mob・plugin cell・interest・keepalive内の
+各ブロックを、**関数ごとに1回借りる**形に統一した。
+結果、素の `is_hot`/`is_warm` は**定義以外に0件**になった。
+
+### デッドロック検査
+
+guard保持中に `is_hot`/`is_warm`（およびそれを呼ぶ関数）を呼べば
+非再入mutexで停止する。2種類の静的検査を行い**0件**を確認した。
+
+1. 同一関数内で `region_guard()` の後に素の `is_hot(`/`is_warm(` が残るか
+2. guard保持中に、regionを使う別関数を呼ぶか
+
+### 測定（バックトゥバック、各3プロセス）
+
+| fixture | before | after | 比 |
+|---|---:|---:|---:|
+| entity_heavy | 333,194µs | 326,694µs | x1.020 |
+| empty | 1,187µs | 1,216µs | x0.976 |
+| 他 | — | — | x0.997–1.015 |
+
+CPU合計 1.0134–1.0112s -> 1.0034–1.0028s。
+
+**中立。** 変換したループ（飛翔体・Mob・plugin cell）はこのfixtureで
+**空**なので費用が出ない。これは性能向上ではなく**所有権の一本化**の変更で、
+slice 02 以降が前提にする「regionを1回借りる」APIを全域で成立させるもの。
+
+教訓：fixtureに無いループの最適化は測れない（slice 18で2回踏んだ）。
