@@ -21,9 +21,11 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 [導火線](slices/10-tnt-fuse.md)、[Drop/Xp寿命とpickup遅延](slices/11-entity-life.md)
 のgame tick化、[永続化のround-trip検証](slices/12-persistence.md) も
 同じ所有者から導出した。
+[20TPS切替](slices/13-cutover-20tps.md) は**実行計画のみ**。実装はしていない。
 雷の持続も雨と別の値に直した。溶岩ダメージの変換漏れも発見・修正した。
 [限定fixtureのA/Bと限界](../../evidence/time-contract/region-expansion/README.md) を読む。
-ここで性能最適化を広げず、次は実時間→game tick・MET4永続化を接続する。
+切替の前提は揃った。次は `TICK_MS = 50` の1コミット。
+移動係数・TTLをvanillaへ置き換えるため**結果が変わる**。予告済み。
 **移動係数の扱いはユーザーの判断が必要。** 現在は「gravity-lite」近似で、
 vanillaのper-game-tick係数と実時間あたり一致しない。近似を実時間で保存するか、
 vanilla係数に置き換えるかで結果が変わる。弓矢/パール/Mob弓矢のttlと
@@ -51,7 +53,7 @@ setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 
 ## 現在の検証
 
-トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも30 passed・1 ignored。
+トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも30 passed・1 ignored。clockはまだ250ms。
 ignoredは専用runnerで前後各3プロセス実行したrelease計測用fixture。
 tickの炉stage欠落・ringの半径誤り・世界時刻の加算・効果wireの周期導出は
 それぞれ負の対照で検出した。keepaliveのtick除算とダメージ周期・保存値の換算方向の誤りも検出した。共有fixture競合も
