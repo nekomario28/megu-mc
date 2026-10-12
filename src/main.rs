@@ -1328,6 +1328,7 @@ const CREEPER_FUSE_GT: u64 = 100;    // 5s
 const BOBBER_PACKET_GT: u64 = 15;    // 0.75s
 const BOLT_LIFE_GT: u64 = 10;        // 0.5s visual
 const TNT_FUSE_GT: u64 = 80;         // 4s, TntBlock fuse
+const AIR_SUPPLY_GT: u64 = 300;        // 15s, entity air supply
 const PICKUP_DELAY_GT: u64 = 10;     // 0.5s, ItemEntity pickupDelay
 const DROP_LIFE_GT: u64 = 6000;       // 300s, ItemEntity lifespan
 const XP_LIFE_GT: u64 = 6000;         // 300s, ExperienceOrb lifespan
@@ -1501,7 +1502,7 @@ fn keepalive_time_tick() {
                 let wst = name_to_state("water").unwrap_or(u32::MAX);
                 let submerged = block_at(px.floor() as i32, (py + 1.62).floor() as i32, pz.floor() as i32) == wst;
                 let mut air = c.air.lock().unwrap();
-                if !submerged { *air = server_ticks(300) as i32; }
+                if !submerged { *air = server_ticks(AIR_SUPPLY_GT) as i32; }
                 else if *air > 0 {
                     // respiration: air drains (lvl+1)x slower
                     let resp: i64 = { let iv = c.inv.lock().unwrap();
@@ -1633,7 +1634,7 @@ fn keepalive_time_tick() {
                 let et = match (t / 40) % 5 { 0 => 23, 1 => 91, 2 => 100, _ => 124 };
                 let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                     etype: et, pos: Mutex::new((nx, ny, nz, 0.0, 0.0)), hp: Mutex::new(20.0),
-                    last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)), fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(60) });
+                    last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)), fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
                 mobs().lock().unwrap().push(m);
                 drop(cls);
             } else { drop(cls); }
@@ -1719,7 +1720,7 @@ fn keepalive_time_tick() {
                     etype: 19, pos: Mutex::new((ix, iy, iz, 0.0, 0.0)), hp: Mutex::new(4.0),
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                    fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(60) });
+                    fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
                 mobs().lock().unwrap().push(m);
             }
             if let Some(meid) = hit {
@@ -2613,7 +2614,7 @@ fn mob_tick() {
             let wst = name_to_state("water").unwrap_or(u32::MAX);
             let submerged = block_at(mp.0.floor() as i32, (mp.1 + 1.0).floor() as i32, mp.2.floor() as i32) == wst;
             let mut air = m.air.lock().unwrap();
-            if !submerged { *air = server_ticks(300) as i32; }
+            if !submerged { *air = server_ticks(AIR_SUPPLY_GT) as i32; }
             else if *air > 0 { *air -= 1; }
             else if TICK.load(Ordering::Relaxed) % server_ticks(20) == 0 {
                 drop(air);
@@ -2763,7 +2764,7 @@ fn mob_tick() {
                     let baby = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                         etype: m.etype, pos: Mutex::new((bx, by, bz, 0.0, 0.0)), hp: Mutex::new(20.0),
                         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                        fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(60) });
+                        fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
                     if mobs().lock().unwrap().len() >= MOB_CAP { continue }
                     mobs().lock().unwrap().push(baby);
                     let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -4212,7 +4213,7 @@ fn load_world_from(payload: &[u8]) {
             ms.push(Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                 etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(hp),
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(300) as i32) }));
+                fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) }));
         }
         drop(ms);
         if p + 8 <= payload.len() {
@@ -9868,7 +9869,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                         etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(20.0),
                         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                        fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(60) });
+                        fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
                     if mobs().lock().unwrap().len() >= MOB_CAP { "mob cap reached".into() } else {
                     mobs().lock().unwrap().push(m);
                     format!("Summoned {}", args[0])
@@ -10954,7 +10955,7 @@ fn handle(mut s: TcpStream) {
         gm: Mutex::new(1),
         fall_from: Mutex::new(sy),
         food: Mutex::new(20),
-        air: Mutex::new(60),
+        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         armor_pts: Mutex::new(0),
         sat: Mutex::new(5.0),
         walk_acc: Mutex::new(0.0),
@@ -13463,7 +13464,7 @@ fn main() {
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
-                air: Mutex::new(60),
+                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
             }));
         }
     }

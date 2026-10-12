@@ -1,0 +1,19 @@
+{
+  "claim": "self-review of the unreviewed range found and fixed a real bug: the entity air supply was still a 4TPS literal at six construction sites, giving 3s instead of 15s",
+  "status": "self-review, not an independent review. codex review has been blocked for nine consecutive slices.",
+  "bug": "the server_ticks(300) conversion in slice 08 covered only the two reset paths. Six construction sites kept air: Mutex::new(60), which was 15s at 4TPS and 3s at 20TPS, so new players and spawned mobs started drowning immediately.",
+  "fix": "AIR_SUPPLY_GT = 300 named constant; all eight sites derive from it",
+  "second_instance": "second literal of this class. The first was the lava damage t % 2 in slice 09. Both are invisible to behavioural gates and findable only by search.",
+  "search_patterns_recorded": "air: Mutex::new(60), fuse.lock().unwrap() = 20;, push((be, 2)), t % N == 0, t % 120, progress >= 40, age.elapsed() > from_secs(300), from_millis(500), from_millis(4000). Excluded: plate_powered st % 2, a block-state bit test.",
+  "remaining_real_time": "hurt_at 500ms invulnerability (vanilla uses invulnerableTime 20 with a different model), shield_cd 5s (vanilla also 5s, so consistent), the last_hit long-ago sentinel, lightning lh.elapsed()",
+  "not_provable_statically": "vanilla dynamic tick comparison, real-client rendering, full damage-path numbers, tick overrun behaviour, movement and collision detail",
+  "tests": "32 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "negative_control": "AIR_SUPPLY_GT set back to 60: the new test fails with 60 vs 300",
+  "files_sha256": {
+    "README.md": "5d9884b6edce05f6235c54be06f126a8cd986dff66a5190434bd7e5cbd3b7f6f",
+    "air-features.log": "659d3fc71caeefca66d6dfbd72e75ca7210f8ff7611f5dae70f1b0aa75f7c88e",
+    "air-negative.log": "16d9316496536e12299cbb0cba5510e5c31d475296c71fc2d23a0a8c1a78cefb",
+    "air-parallel.log": "e06f03216bfb687ad55f0730eba2929b63c3f0c0056b1de6fa4b3600e0c8ace9",
+    "air-suite.log": "6bf46526ce4b363f9f9e8a98f0d98721f535bea4a0cdd92b64324037c05917f1"
+  }
+}

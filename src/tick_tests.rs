@@ -372,6 +372,36 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
 }
 
 #[test]
+fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
+    // The air supply is a duration, so it must come from the cadence owner. A
+    // leftover 4TPS literal would give 3s instead of the vanilla 15s, and only
+    // the reset paths had been converted, not the construction sites.
+    assert_eq!(AIR_SUPPLY_GT, 300);
+    assert_eq!(server_ticks(AIR_SUPPLY_GT) * TICK_MS, 15_000);
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let old_hot = hot().lock().unwrap().clone();
+    let old_warm = warm().lock().unwrap().clone();
+    let expected = server_ticks(AIR_SUPPLY_GT) as i32;
+    // Every construction path shares one helper, so exercising the spawn path
+    // covers the sites that build creatures directly.
+    forceloaded().lock().unwrap().insert((0, 0));
+    game_tick(|_, tick| tick());
+    let mut seen: Vec<i32> = mobs().lock().unwrap().iter().map(|m| *m.air.lock().unwrap()).collect();
+    *mobs().lock().unwrap() = old_mobs;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    *hot().lock().unwrap() = old_hot;
+    *warm().lock().unwrap() = old_warm;
+    seen.retain(|air| *air > 0);
+    assert!(seen.iter().all(|air| *air == expected), "air supply was {seen:?}, expected {expected}");
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
