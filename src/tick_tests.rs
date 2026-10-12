@@ -679,3 +679,50 @@ fn water_spread_trace_is_stable_across_the_scheduler_migration() {
     let extra: Vec<_> = actual.iter().filter(|c| !exp.contains(c)).collect();
     assert_eq!((missing, extra), (vec![], vec![]), "flooded set differs");
 }
+
+/// Pins hopper item movement tick by tick, for the same reason as the water
+/// trace: the scheduler migration replaces the sweep of every registered hopper,
+/// and a missed re-queue would silently stop a hopper moving items.
+#[test]
+fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_hoppers = std::mem::take(&mut *hoppers().lock().unwrap());
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let (old_hot, old_warm) = test_region();
+    forceloaded().lock().unwrap().insert((0, 0));
+    refresh_hot();
+    let hy = 120;
+    let hopper_st = 9225u32; // facing down
+    let chest_st = name_to_state("chest").unwrap_or(9225);
+    set_block(0, hy, 0, hopper_st);
+    set_block(0, hy - 1, 0, chest_st);
+    hoppers().lock().unwrap().insert((0, hy, 0));
+    let item = name_to_item("raw_iron").unwrap_or(1);
+    chests().lock().unwrap().entry((0, hy, 0)).or_default().insert(0, (item, 3, Vec::new()));
+    let mut trace: Vec<(u8, u8)> = Vec::new();
+    for _ in 0..24 {
+        game_tick(|_, tick| tick());
+        let own = chests().lock().unwrap().get(&(0, hy, 0))
+            .map(|m| m.values().map(|v| v.1).sum::<u8>()).unwrap_or(0);
+        let dst = chests().lock().unwrap().get(&(0, hy - 1, 0))
+            .map(|m| m.values().map(|v| v.1).sum::<u8>()).unwrap_or(0);
+        trace.push((own, dst));
+    }
+    // restore
+    set_block(0, hy, 0, 0);
+    set_block(0, hy - 1, 0, 0);
+    *hoppers().lock().unwrap() = old_hoppers;
+    *chests().lock().unwrap() = old_chests;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    set_test_region(old_hot, old_warm);
+    // One item per tick for three ticks, then nothing left to move.
+    let expected: Vec<(u8, u8)> = vec![(2, 1), (1, 2), (0, 3)]
+        .into_iter().chain(std::iter::repeat((0, 3)).take(21)).collect();
+    assert_eq!(trace, expected,
+        "the hopper scheduler changed what moves, or when");
+}

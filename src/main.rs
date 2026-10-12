@@ -2446,18 +2446,21 @@ fn observer_tick() {
     }
 }
 fn hopper_tick() {
-    let hs: Vec<(i32, i32, i32)> = hoppers().lock().unwrap().iter().copied().collect();
-    let region = (!hs.is_empty()).then(region_guard);
-    for (hx, hy, hz) in hs {
-        let region = region.as_ref().unwrap();
-        if !region.is_warm(hx, hz) || !sched_ready(hx, hy, hz) { continue }
+    // Only the hoppers that come due are visited, so a tick costs the hoppers
+    // that need work rather than every hopper that exists. Every exit re-queues
+    // except removal from the registry.
+    let due = { let mut q = hopper_queue().lock().unwrap(); q.due() };
+    if due.is_empty() { return }
+    let region = region_guard();
+    for (hx, hy, hz) in due {
+        if !region.is_warm(hx, hz) || !sched_ready(hx, hy, hz) { requeue_hopper(hx, hy, hz); continue }
         let st = block_at(hx, hy, hz);
         if !(9225..=9234).contains(&st) { hoppers().lock().unwrap().remove(&(hx, hy, hz)); continue; }
-        if st >= 9230 { sched_result(hx, hy, hz, false); continue; } // powered(disabled) hopper holds items
+        if st >= 9230 { sched_result(hx, hy, hz, false); requeue_hopper(hx, hy, hz); continue; } // powered(disabled) hopper holds items
         let facing = st - 9225; // 0 down,1 n,2 s,3 w,4 e
         let (dx, dy, dz) = match facing { 0 => (0, -1, 0), 1 => (0, 0, -1), 2 => (0, 0, 1), 3 => (-1, 0, 0), _ => (1, 0, 0) };
         let dst = (hx + dx, hy + dy, hz + dz);
-        if container_kind(block_at(dst.0, dst.1, dst.2)).is_none() { sched_result(hx, hy, hz, false); continue; }
+        if container_kind(block_at(dst.0, dst.1, dst.2)).is_none() { sched_result(hx, hy, hz, false); requeue_hopper(hx, hy, hz); continue; }
         let mut did = false;
         // push one item from the hopper's own inventory toward facing container
         {
@@ -2531,6 +2534,7 @@ fn hopper_tick() {
             }
         }
         sched_result(hx, hy, hz, did);
+        requeue_hopper(hx, hy, hz);
     }
 }
 fn drop_tick() {
@@ -3469,6 +3473,18 @@ fn sched_ready(x: i32, y: i32, z: i32) -> bool {
 /// cells rather than the number that come due and cloned them into a Vec each
 /// tick. The backoff map stays the source of the delay value; the queue only
 /// answers which cells are due now.
+static HOPPER_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
+fn hopper_queue() -> &'static Mutex<tick_queue::TickQueue> {
+    HOPPER_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
+}
+fn requeue_hopper(x: i32, y: i32, z: i32) {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let delay = match backoff().lock().unwrap().get(&(x, y, z)) {
+        Some((due, _)) if *due > now => (*due - now) as usize,
+        _ => 1,
+    };
+    hopper_queue().lock().unwrap().schedule((x, y, z), delay);
+}
 static WATER_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
 fn water_queue() -> &'static Mutex<tick_queue::TickQueue> {
     WATER_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
@@ -3722,7 +3738,10 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
         if !(4278..=4285).contains(&st) { crops().lock().unwrap().remove(&(x, y, z)); }
     }
     let mut hh = hoppers().lock().unwrap();
-    if (9225..=9234).contains(&st) { if hh.len() < HOPPER_CAP { hh.insert((x, y, z)); } } else { hh.remove(&(x, y, z)); }
+    if (9225..=9234).contains(&st) {
+        if hh.len() < HOPPER_CAP { hh.insert((x, y, z)); }
+        hopper_queue().lock().unwrap().schedule((x, y, z), 1);
+    } else { hh.remove(&(x, y, z)); }
     drop(hh);
     let mut wtr = waters().lock().unwrap();
     if (80..=95).contains(&st) {
@@ -3951,7 +3970,10 @@ fn rebuild_derived_indexes() {
                 water_queue().lock().unwrap().schedule((x, y, z), 1);
             }
             if (96..=111).contains(st) { lavas().lock().unwrap().insert((x, y, z)); }
-            if (9225..=9234).contains(st) { hh.insert((x, y, z)); }
+            if (9225..=9234).contains(st) {
+                hh.insert((x, y, z));
+                hopper_queue().lock().unwrap().schedule((x, y, z), 1);
+            }
             if (4278..=4285).contains(st) { cg.insert((x, y, z), (*st - 4278) as u8); }
             if lamp_on && *st == ST_GROWTH_LAMP {
                 cells.entry((*cx, *cz)).or_default()
