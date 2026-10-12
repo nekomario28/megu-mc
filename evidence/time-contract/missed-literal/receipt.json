@@ -1,0 +1,16 @@
+{
+  "claim": "one missed tick-modulo literal (lava damage) converted; the search now returns zero tick-modulo damage sites; behaviour unchanged at 4TPS",
+  "why_it_was_missed": "server_ticks(10) == 2 at 4TPS, so the literal and the derived form are exactly equivalent and every behavioural test passed",
+  "provenance": "git log -S shows the line was t % 2 since f9924b0; the slice 07 report of 12 conversions was accurate for the other 11 sites but this site was never converted",
+  "significance": "this is the realised instance of the limitation recorded in the per-tick-rates receipt, not a hypothetical warning",
+  "tests": "26 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "files_sha256": {
+    "README.md": "9fdecb063d05a7c2a26a47675b9f39966e9cd4c544d5acdd957e28c1d7fa411a",
+    "features.log": "6d77f64dfc8c5325b90fdbe05d8be367bdd578bcccec24f275c5ffee7d03dd6e",
+    "parallel.log": "0799c112e4575c44050ddb8bf3d50e675ff83a560e0c7fc23f00c9b524737c8e",
+    "suite.log": "4bbc861073ab0f5dfec065e21612fb7ec648cbe5b8bc57acb9ed0b674c3f0370",
+    "tick-modulo-search.log": "d31886ea1ae8a41c71bed7ba73f381b21a3a1b601d7a658b420b8d45896a0327"
+  }
+}

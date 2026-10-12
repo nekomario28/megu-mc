@@ -1506,7 +1506,7 @@ fn keepalive_time_tick() {
                 let in_lava = !fire_immune && block_at(px.floor() as i32, (py - 0.2).floor() as i32, pz.floor() as i32) == lst
                     || block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == lst
                     || block_at(px.floor() as i32, (py + 1.0).floor() as i32, pz.floor() as i32) == lst;
-                if in_lava && t % 2 == 0 { *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                if in_lava && t % server_ticks(10) == 0 { *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
                 // standing in fire: 1hp/s (vanilla), fire_resist immune,
                 // fire_protection epf applies, armor does not
                 let fst = name_to_state("fire").unwrap_or(u32::MAX);
