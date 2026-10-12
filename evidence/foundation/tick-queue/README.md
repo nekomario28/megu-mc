@@ -49,6 +49,33 @@ Pumpkinは **GPL-3.0** なのでコードは写していない
 （[negative-control.log](negative-control.log)）。実装直後にも
 この off-by-one で4テストが赤くなり、そこから直した。
 
+## 移行の等価性ゲート（用意した）
+
+`water_spread_trace_is_stable_across_the_scheduler_migration` が、
+現実装の水の広がりを**セル単位・tick単位**で固定する。
+
+- 空中 y=150 に水源を置き、40tick の水セル集合を毎tick記録する
+- assert: 各tickのセル数と最大レベル、最終的なセル集合
+
+`per_tick = (2,8),(3,8),...,(41,8)`、最終集合は y=110..149 がレベル8、
+水源 y=150 がレベル0。
+
+**地形非依存にする必要があった。** 最初は y=70 に置いたが、並行実行で
+水が8セルで止まった。**別のテストがworldgenの有効状態を変えるため**
+地形の高さが変わり、8ブロックで床に当たっていた。
+y=150 に上げて40tickでは地面に届かないようにした。
+
+これは**移行の等価性ゲートであってvanilla parityの主張ではない。**
+移行前の挙動を固定するもの。
+
+## 見つけた共有fixtureの競合（修正した）
+
+`src/landing.rs` の `stale_landing_does_not_replace_new_block` が
+**WORLD_TEST_LOCKを取らずに `set_block` を呼んでいた**。
+新しい水テストのassertが露見させた。ロックを取り、セルを元に戻すようにした。
+
+並列実行で60 passed が5回連続で安定することを確認。
+
 ## まだやっていないこと（重要）
 
 **システムへの接続は未実施。** `water_tick`/`lava_tick`/`hopper_tick` は

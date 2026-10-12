@@ -243,10 +243,18 @@ mod tests {
     }
     #[test]
     fn stale_landing_does_not_replace_new_block() {
+        // This is the only test here that writes to the shared world, so it must
+        // hold the world fixture lock or it corrupts another test's world mid-run.
+        // It also has to put the cell back afterwards.
+        let _world_guard = super::super::WORLD_TEST_LOCK.lock().unwrap();
         let p = (811, 71, 811);
+        let original = block_at(p.0, p.1, p.2);
         super::super::set_block(p.0, p.1, p.2, 4286);
         super::super::set_block(p.0, p.1, p.2, 1);
-        assert!(!super::super::set_block_if(p.0, p.1, p.2, 10, Some(4286)));
-        assert_eq!(block_at(p.0, p.1, p.2), 1);
+        let replaced = super::super::set_block_if(p.0, p.1, p.2, 10, Some(4286));
+        let landed = block_at(p.0, p.1, p.2);
+        super::super::set_block(p.0, p.1, p.2, original);
+        assert!(!replaced, "a stale landing must not replace the new block");
+        assert_eq!(landed, 1);
     }
 }

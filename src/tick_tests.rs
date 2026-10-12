@@ -597,3 +597,85 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
     }
     assert!(prev_v < 0.96, "velocity barely decayed: {prev_v}");
 }
+
+/// Pins how water spreads under the current implementation, cell by cell and tick
+/// by tick. The scheduled-tick migration must reproduce this trace exactly: it
+/// replaces the per-tick sweep of every registered cell with a delay queue, and a
+/// scheduling site that is missed would make a cell stop updating. A trace is the
+/// only way to see that, because the failure is silent.
+///
+/// This pins the pre-migration behaviour, not vanilla's. It is an equivalence
+/// gate for the migration, not a parity claim.
+#[test]
+fn water_spread_trace_is_stable_across_the_scheduler_migration() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_waters = std::mem::take(&mut *waters().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let (old_hot, old_warm) = test_region();
+    forceloaded().lock().unwrap().insert((0, 0));
+    refresh_hot();
+    // One source block at the surface of a flat warm area.
+    // In the air above the surface: this exercises the falling column, which
+    // schedules a new cell every tick and is the path the queue replaces. A
+    // surface source barely flows in the current implementation, so it would not
+    // exercise the scheduler at all.
+    // High enough that forty ticks of falling cannot reach the ground whatever
+    // the surface height is, so the trace does not depend on whether another test
+    // has left worldgen enabled.
+    let y = 150;
+    let src = name_to_state("water").unwrap_or(80);
+    // Snapshot the column so the test can put it back: leaving flooded cells in
+    // the shared world makes any later test that reads the world order-dependent.
+    // The trace is also restricted to this column, so unrelated world content
+    // cannot leak into it.
+    let original: Vec<(i32, u32)> = (105..=151).map(|y| (y, block_at(0, y, 0))).collect();
+    set_block(0, y, 0, src);
+    // Record the water cells and their levels after each tick.
+    let mut trace: Vec<Vec<(i32, i32, i32, u32)>> = Vec::new();
+    for _ in 0..40 {
+        game_tick(|_, tick| tick());
+        let mut cells: Vec<(i32, i32, i32, u32)> = {
+            let w = world().lock().unwrap();
+            let mut v = Vec::new();
+            for (&(cx, cz), c) in w.iter() {
+                for (idx, st) in c.iter() {
+                    let (wx, wy, wz) = (cx * 16 + (*idx & 15) as i32, (*idx >> 8) as i32 + MIN_Y,
+                                        cz * 16 + ((*idx >> 4) & 15) as i32);
+                    if (80..=95).contains(st) && wx == 0 && wz == 0 {
+                        v.push((wx, wy, wz, *st - 80));
+                    }
+                }
+            }
+            v
+        };
+        cells.sort_unstable();
+        trace.push(cells);
+    }
+    let flooded = trace.last().unwrap().len();
+    let max_level = trace.last().unwrap().iter().map(|c| c.3).max().unwrap_or(0);
+    for (y, st) in original { set_block(0, y, 0, st); }
+    *waters().lock().unwrap() = old_waters;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    set_test_region(old_hot, old_warm);
+    // The scenario must actually do something, or the trace proves nothing.
+    assert!(flooded > 3, "the source barely spread: {flooded} cells");
+    assert!(max_level >= 1, "no flowing level appeared");
+    let per_tick: Vec<(usize, u32)> = trace.iter()
+        .map(|c| (c.len(), c.iter().map(|x| x.3).max().unwrap_or(0))).collect();
+    let expected_per_tick: Vec<(usize, u32)> = (2..=41).map(|n| (n, 8u32)).collect();
+    // The source keeps level 0 and the falling column below it is level 8.
+    let mut expected_final: Vec<(i32, i32, i32, u32)> = (110..=149).map(|y| (0, y, 0, 8u32)).collect();
+    expected_final.push((0, 150, 0, 0));
+    assert_eq!(per_tick, expected_per_tick,
+        "the fluid scheduler changed how many cells run or when they run");
+    let mut actual = trace.last().unwrap().clone();
+    let mut exp = expected_final.clone();
+    actual.sort_unstable(); exp.sort_unstable();
+    let missing: Vec<_> = exp.iter().filter(|c| !actual.contains(c)).collect();
+    let extra: Vec<_> = actual.iter().filter(|c| !exp.contains(c)).collect();
+    assert_eq!((missing, extra), (vec![], vec![]), "flooded set differs");
+}
