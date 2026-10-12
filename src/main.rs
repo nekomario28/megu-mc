@@ -10939,6 +10939,9 @@ const FACE_OFF: [(i32, i32, i32); 6] = [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0
 
 fn handle(mut s: TcpStream) {
     s.set_nodelay(true).ok();
+    // Applied before handshake/login: idle unauthenticated sockets must expire.
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(10))).ok();
     let (id, hs) = match read_packet(&mut s) { Some(x) => x, None => return };
     if id != 0 { return }
     let mut p = &hs[..];
@@ -13278,7 +13281,10 @@ impl std::ops::Drop for ConnectionSlot<'_> {
 fn rcon_conn(mut s: TcpStream, pass: String) {
     use std::io::Write;
     s.set_nodelay(true).ok();
-    let mut authed = pass.is_empty();
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(10))).ok();
+    // Never treat an empty secret as successful RCON authentication.
+    let mut authed = false;
     loop {
         let mut lb = [0u8; 4];
         if s.read_exact(&mut lb).is_err() { return }
@@ -13315,10 +13321,30 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
 fn rcon_listener() {
     let Some(port) = std::env::var("MC_SPINE_RCON_PORT").ok().and_then(|p| p.parse::<u16>().ok()) else { return };
     let pass = std::env::var("MC_SPINE_RCON_PASS").unwrap_or_default();
-    let Ok(l) = TcpListener::bind(("0.0.0.0", port)) else { eprintln!("[rcon] bind fail :{}", port); return };
-    eprintln!("[rcon] listening :{}", port);
+    if pass.trim().is_empty() {
+        eprintln!("[rcon] refusing to start without a nonempty MC_SPINE_RCON_PASS");
+        return;
+    }
+    let bind = std::env::var("MC_SPINE_RCON_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    let Ok(l) = TcpListener::bind((bind.as_str(), port)) else {
+        eprintln!("[rcon] bind failed on {bind}:{port}");
+        return;
+    };
+    eprintln!("[rcon] listening {bind}:{port}");
+    static RCON_ACTIVE: AtomicUsize = AtomicUsize::new(0);
     for st in l.incoming() {
-        if let Ok(s) = st { let pass = pass.clone(); std::thread::spawn(move || rcon_conn(s, pass)); }
+        if let Ok(s) = st {
+            if RCON_ACTIVE.fetch_add(1, Ordering::SeqCst) >= 8 {
+                RCON_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                drop(s);
+                continue;
+            }
+            let pass = pass.clone();
+            std::thread::spawn(move || {
+                let _slot = ConnectionSlot(&RCON_ACTIVE);
+                rcon_conn(s, pass);
+            });
+        }
     }
 }
 // The caller may observe a stage, but must execute it exactly once and in order.
@@ -13636,8 +13662,8 @@ fn main() {
                 continue;
             }
             thread::spawn(move || {
+                let _slot = ConnectionSlot(&ACTIVE);
                 handle(s);
-                ACTIVE.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
@@ -13674,5 +13700,20 @@ mod security_command_tests {
         ] {
             assert!(!command_allowed_for_player(cmd, &args), "{cmd}");
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_slot_tests {
+    use super::*;
+    #[test]
+    fn panic_does_not_leak_connection_slot() {
+        let count = AtomicUsize::new(1);
+        let result = std::panic::catch_unwind(|| {
+            let _slot = ConnectionSlot(&count);
+            panic!("synthetic handler panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }
