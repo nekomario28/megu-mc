@@ -89,7 +89,7 @@ fn is_replaceable(reg: &BReg, cur: u32, tags: &[&str]) -> bool {
 空気はすべての placer で置換可能、石はどれでも不可、原木は
 `logs` を名乗る placer でのみ可、加えて3つのタグ集合すべてで
 定義（is_air ∨ in_tag）と一致。タグ引数を無視する変異で**exit=101**
-（[tree-negative.log](../evidence/foundation/fanout/tree-negative.log)）。
+（[tree-negative.log](../../../evidence/foundation/fanout/tree-negative.log)）。
 
 **注意**：`tree.rs` には元々テストが無かった。この統合は条件を逐語的に
 保存しているが、**placer 全体の挙動は依然としてテストされていない**。
