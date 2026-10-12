@@ -1,0 +1,180 @@
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.03s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.03s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+
+
+running 4 tests
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 18 filtered out; finished in 0.02s
+

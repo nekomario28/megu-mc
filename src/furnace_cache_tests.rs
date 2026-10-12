@@ -179,6 +179,7 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
 
 #[test]
 fn cached_tick_matches_v237_with_input_output_recipe_and_tag_changes() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
     for scenario in 0..3 {
         let expected = run(scenario, reference_tick);
         let actual = run(scenario, furnace_tick);

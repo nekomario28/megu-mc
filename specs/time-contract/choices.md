@@ -17,6 +17,30 @@
 CPU/RSSはその子プロセス全体、stageの時間は測定区間、と証拠の範囲を分ける。
 規模・反復数は実装者が選び、fixtureとreceiptに残す。clockはまだ変更しない。
 
+## ring最適化sliceの判断
+
+### キャッシュでなく、同じ集合を安く作る — confidence: high
+
+ringは所属条件を変えずに集合演算で同じ要素を作れる。元の中心を毎回読むので、
+長命のキャッシュ、invalidator、追加の世界状態を導入しない。同じchunkの中心は重複排除。
+密集すると直接拡張がかえって増えるため、等価な構築方法の挿入回数を比較して選ぶ。
+これは何をtickするかの変更ではない。HashSetのconsumerはcontainsのみで、iteration順が
+乱数や保存へ流れないこともsource検索で確認した。
+
+### 限定された改善として採用する — confidence: medium
+
+単一中心・炉・同一chunkに多数Actorではfixtureのtick費用が減った。
+密集する多数中心のfixtureでは約3.7%遅く、RSSも減っていない。
+全負荷の速度改善や全サーバーの軽量化とは呼ばない。ここで更にgeometry/cacheを増築せず、
+時間契約の監査へ戻る（CONVERGE）。実プレイヤー負荷でring費用が再び大きいと判明したら再開する。
+切替前に計測できる経路と結果不変の局所削減を得た、という範囲に留める。
+
+### 世界fixtureのsetup/restoreを一つのtest-only lockで守る — confidence: high
+
+新しいregionテストと既存炉テストの競合を独立レビューで指摘され、並行実行で再現した。
+個別のstate Mutexはfixture全体を隔離しない。関連する世界fixtureは一つのlockを保持する。
+本番ビルドにはこのlockを置かない。テストをserial固定するだけの対処は採用しない。
+
 ## sound（妥当）
 
 ### 時間周期の切替前に、トーテムの付与集合を直す — confidence: medium

@@ -11,6 +11,7 @@ fn furnace(input_count: u8) -> Furnace {
 
 #[test]
 fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
     let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_hot = hot().lock().unwrap().clone();
@@ -46,17 +47,94 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
 }
 
 #[test]
+fn region_membership_matches_hot_plus_skirt_across_input_changes() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    assert!(clients().lock().unwrap().is_empty());
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_hot = hot().lock().unwrap().clone();
+    let old_warm = warm().lock().unwrap().clone();
+    let mut observations = Vec::new();
+    refresh_hot();
+    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), HashSet::new(), HashSet::new()));
+    for name in ["moving", "stationary"] {
+        actors().lock().unwrap().insert(name.into(), Arc::new(Actor {
+            name: name.into(), eid: 4242, pos: Mutex::new((0.0, 70.0, 0.0)),
+            look: Mutex::new(None), action: Mutex::new(""), held: Mutex::new((0, 0, Vec::new())),
+            inv: Mutex::new(HashMap::new()),
+        }));
+    }
+    for (i, (x, z, cx, cz)) in [
+        (0.0, 0.0, 0, 0), (15.999, 15.999, 0, 0), (16.0, 16.0, 1, 1),
+        (-0.01, -0.01, -1, -1), (-16.0, -16.0, -1, -1), (-16.01, -16.01, -2, -2),
+        (160.0, -160.0, 10, -10), (30_000_000.0, -30_000_000.0, 1_875_000, -1_875_000),
+    ].into_iter().enumerate() {
+        *actors().lock().unwrap()["moving"].pos.lock().unwrap() = (x, 70.0, z);
+        forceloaded().lock().unwrap().clear();
+        let mut expected_hot = HashSet::new();
+        if i % 2 == 0 {
+            forceloaded().lock().unwrap().insert((200, -200));
+            expected_hot.insert((200, -200));
+        }
+        for (px, pz) in [(cx, cz), (0, 0)] {
+            for dx in -5..=5 { for dz in -5..=5 { expected_hot.insert((px + dx, pz + dz)); } }
+        }
+        // Independent oracle: the original hot-then-skirt algorithm.
+        let mut expected_warm = expected_hot.clone();
+        for &(px, pz) in &expected_hot {
+            for dx in -3..=3 { for dz in -3..=3 { expected_warm.insert((px + dx, pz + dz)); } }
+        }
+        refresh_hot();
+        observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+    }
+    actors().lock().unwrap().clear();
+    for x in 0..10 { for z in 0..10 {
+        let name = format!("dense-{x}-{z}");
+        actors().lock().unwrap().insert(name.clone(), Arc::new(Actor {
+            name, eid: 4242, pos: Mutex::new((16.0 * x as f64, 70.0, 16.0 * z as f64)),
+            look: Mutex::new(None), action: Mutex::new(""), held: Mutex::new((0, 0, Vec::new())),
+            inv: Mutex::new(HashMap::new()),
+        }));
+    } }
+    refresh_hot();
+    let expected_hot = (-5..=14).flat_map(|x| (-5..=14).map(move |z| (x, z))).collect();
+    let expected_warm = (-8..=17).flat_map(|x| (-8..=17).map(move |z| (x, z))).collect();
+    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+    actors().lock().unwrap().clear();
+    forceloaded().lock().unwrap().insert((-12, 9));
+    refresh_hot();
+    let expected_hot = HashSet::from([(-12, 9)]);
+    let mut expected_warm = HashSet::new();
+    for dx in -3..=3 { for dz in -3..=3 { expected_warm.insert((-12 + dx, 9 + dz)); } }
+    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+    forceloaded().lock().unwrap().clear();
+    refresh_hot();
+    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), HashSet::new(), HashSet::new()));
+    *actors().lock().unwrap() = old_actors;
+    *forceloaded().lock().unwrap() = old_forced;
+    *hot().lock().unwrap() = old_hot;
+    *warm().lock().unwrap() = old_warm;
+    for (actual_hot, actual_warm, expected_hot, expected_warm) in observations {
+        assert_eq!(actual_hot, expected_hot);
+        assert_eq!(actual_warm, expected_warm);
+    }
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
     let scratch = std::env::var("MC_SPINE_TICK_PROFILE_DIR").expect("use the isolated profiling runner");
     assert_eq!(std::env::current_dir().unwrap(), std::path::PathBuf::from(scratch));
     assert_ne!(std::env::current_dir().unwrap(), std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     assert!(!worldgen::enabled(), "this fixture measures the flat/headless tick only");
-    for (scenario, actor, machines, active) in [
-        ("empty", false, 0, false),
-        ("idle_actor", true, 0, false),
-        ("idle_furnaces", true, 400, false),
-        ("active_furnaces", true, 400, true),
+    for (scenario, actor_count, machines, active) in [
+        ("empty", 0, 0, false),
+        ("idle_actor", 1, 0, false),
+        ("idle_furnaces", 1, 400, false),
+        ("active_furnaces", 1, 400, true),
+        ("crowded_actors", 100, 0, false),
+        ("dense_actors", 100, 0, false),
     ] {
         actors().lock().unwrap().clear();
         furnaces().lock().unwrap().clear();
@@ -64,9 +142,11 @@ fn profile_game_tick() {
         TICK.store(1, Ordering::Relaxed);
         TICK_IDX.store(0, Ordering::Relaxed);
         WORLD_TIME.store(1000, Ordering::Relaxed);
-        if actor {
-            actors().lock().unwrap().insert("tick-profile".into(), Arc::new(Actor {
-                name: "tick-profile".into(), eid: 4242, pos: Mutex::new((0.0, 70.0, 0.0)),
+        for i in 0..actor_count {
+            let name = format!("tick-profile-{i}");
+            let pos = if scenario == "dense_actors" { (16.0 * (i % 10) as f64, 70.0, 16.0 * (i / 10) as f64) } else { (0.0, 70.0, 0.0) };
+            actors().lock().unwrap().insert(name.clone(), Arc::new(Actor {
+                name, eid: 4242 + i, pos: Mutex::new(pos),
                 look: Mutex::new(None), action: Mutex::new(""), held: Mutex::new((0, 0, Vec::new())),
                 inv: Mutex::new(HashMap::new()),
             }));

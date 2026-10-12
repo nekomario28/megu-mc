@@ -1,0 +1,22 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/Documents/Codex/2026-10-04/mc/outputs/mc-spine/native)
+warning: field `distance` is never read
+  --> src/landing.rs:16:9
+   |
+13 | pub struct Trample {
+   |            ------- field in this struct
+...
+16 |     pub distance: f32,
+   |         ^^^^^^^^
+   |
+   = note: `Trample` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mc-spine` (bin "mc-spine" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.70s
+     Running unittests src/main.rs (target/debug/deps/mc_spine-1f88f8b672a353a0)
+
+running 1 test
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.03s
+

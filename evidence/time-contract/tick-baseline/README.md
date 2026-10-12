@@ -26,7 +26,7 @@ Actor付きfixtureではhot/warm集合の再構築が約35.65µs/tick。
 
 ## 再実行と証拠
 
-Linuxで native rootから：
+Linuxで native rootから、現在の実装を同種のfixtureで再測定できる：
 
 ```sh
 python evidence/time-contract/profile_tick.py --runs 3 --output /tmp/mc-spine-tick-profile
@@ -42,4 +42,6 @@ Fabric/NeoForge付きcheck合格。[`review.log`](review.log) は独立レビュ
 （レビュー自体は実行検証していない）。既存の `Trample.distance` warningは残る。
 
 source/binary hashとbuild commandはresultsに収録。receiptはログ類のhashを保持する。
-README/specのみの追記は測定対象のコードを変えない。
+この測定のコードは `ceb79b2`。現在のrunnerには後続の多数Actorケースとring最適化も含まれる。
+歴史的なベースラインそのものを再現する場合はそのcommitのコードを使う。
+このREADMEのみの追記は測定対象のコードを変えない。

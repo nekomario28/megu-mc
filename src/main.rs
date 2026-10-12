@@ -3186,24 +3186,36 @@ static HOT: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
 fn hot() -> &'static Mutex<HashSet<(i32, i32)>> { HOT.get_or_init(|| Mutex::new(HashSet::new())) }
 static FORCELOADED: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
 fn forceloaded() -> &'static Mutex<HashSet<(i32, i32)>> { FORCELOADED.get_or_init(|| Mutex::new(HashSet::new())) }
+fn extend_chunk_square(chunks: &mut HashSet<(i32, i32)>, (cx, cz): (i32, i32), radius: i32) {
+    for dx in -radius..=radius { for dz in -radius..=radius { chunks.insert((cx + dx, cz + dz)); } }
+}
 fn refresh_hot() {
     // collect without holding the hot lock: is_hot callers may hold pos
     // locks, so hot must never block on pos underneath itself.
     let mut h = forceloaded().lock().unwrap().clone();
+    let forced: Vec<_> = h.iter().copied().collect();
+    let mut centers = HashSet::new();
     for c in clients().lock().unwrap().iter() {
         let p = *c.pos.lock().unwrap();
-        let (cx, cz) = ((p.0.floor() as i32).div_euclid(16), (p.2.floor() as i32).div_euclid(16));
-        for dx in -5..=5i32 { for dz in -5..=5i32 { h.insert((cx + dx, cz + dz)); } }
+        centers.insert(((p.0.floor() as i32).div_euclid(16), (p.2.floor() as i32).div_euclid(16)));
     }
     for a in actors().lock().unwrap().values() {
         let p = *a.pos.lock().unwrap();
-        let (cx, cz) = ((p.0.floor() as i32).div_euclid(16), (p.2.floor() as i32).div_euclid(16));
-        for dx in -5..=5 { for dz in -5..=5 { h.insert((cx + dx, cz + dz)); } }
+        centers.insert(((p.0.floor() as i32).div_euclid(16), (p.2.floor() as i32).div_euclid(16)));
     }
-    // warm ring: everything hot plus the 3-chunk skirt — block systems only
-    let mut w = h.clone();
-    for (cx, cz) in h.iter().collect::<Vec<_>>().iter().copied() {
-        for dx in -3..=3i32 { for dz in -3..=3i32 { w.insert((cx + dx, cz + dz)); } }
+    for &center in &centers { extend_chunk_square(&mut h, center, 5); }
+    // Square dilation distributes over union: radius 5 + skirt 3 = radius 8.
+    // Dense, overlapping centers can make direct expansion MORE work. Choose
+    // between equivalent unions by their number of insertion attempts (17²/7²).
+    let direct_cost = forced.len().saturating_mul(49).saturating_add(centers.len().saturating_mul(289));
+    let mut w;
+    if direct_cost < h.len().saturating_mul(49) {
+        w = HashSet::new();
+        for center in forced { extend_chunk_square(&mut w, center, 3); }
+        for center in centers { extend_chunk_square(&mut w, center, 8); }
+    } else {
+        w = h.clone();
+        for &center in &h { extend_chunk_square(&mut w, center, 3); }
     }
     *hot().lock().unwrap() = h;
     *warm().lock().unwrap() = w;
@@ -13400,6 +13412,9 @@ fn main() {
     }
 }
 
+// Hold across setup, tick execution and restoration of shared world fixtures.
+#[cfg(test)]
+static WORLD_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod furnace_cache_tests;
 #[cfg(test)]

@@ -1,0 +1,21 @@
+src/furnace_cache_tests.rs:106:    warm().lock().unwrap().insert((0, 0));
+src/furnace_cache_tests.rs:216:    warm().lock().unwrap().remove(&(0, 0));
+src/tick_tests.rs:17:    let old_hot = hot().lock().unwrap().clone();
+src/tick_tests.rs:18:    let old_warm = warm().lock().unwrap().clone();
+src/tick_tests.rs:38:    *hot().lock().unwrap() = old_hot;
+src/tick_tests.rs:39:    *warm().lock().unwrap() = old_warm;
+src/tick_tests.rs:55:    let old_hot = hot().lock().unwrap().clone();
+src/tick_tests.rs:56:    let old_warm = warm().lock().unwrap().clone();
+src/tick_tests.rs:59:    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), HashSet::new(), HashSet::new()));
+src/tick_tests.rs:88:        observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+src/tick_tests.rs:102:    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+src/tick_tests.rs:109:    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+src/tick_tests.rs:112:    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), HashSet::new(), HashSet::new()));
+src/tick_tests.rs:115:    *hot().lock().unwrap() = old_hot;
+src/tick_tests.rs:116:    *warm().lock().unwrap() = old_warm;
+src/main.rs:3186:fn hot() -> &'static Mutex<HashSet<(i32, i32)>> { HOT.get_or_init(|| Mutex::new(HashSet::new())) }
+src/main.rs:3220:    *hot().lock().unwrap() = h;
+src/main.rs:3221:    *warm().lock().unwrap() = w;
+src/main.rs:3223:fn is_hot(x: i32, z: i32) -> bool { hot().lock().unwrap().contains(&(x.div_euclid(16), z.div_euclid(16))) }
+src/main.rs:3227:fn warm() -> &'static Mutex<HashSet<(i32, i32)>> { WARM.get_or_init(|| Mutex::new(HashSet::new())) }
+src/main.rs:3228:fn is_warm(x: i32, z: i32) -> bool { warm().lock().unwrap().contains(&(x.div_euclid(16), z.div_euclid(16))) }

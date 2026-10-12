@@ -61,7 +61,7 @@ def main():
                 item["tick"] = dict(zip(("samples", "total_ns", "p50_ns", "p95_ns", "p99_ns"), values))
             else:
                 item.setdefault("stages", {})[stage] = dict(zip(("calls", "total_ns", "max_ns"), values))
-        assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces"}
+        assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces", "crowded_actors", "dense_actors"}
         for item in scenarios.values():
             assert item["tick"]["samples"] == 1000
             assert len(item["stages"]) == 15
@@ -80,7 +80,7 @@ def main():
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
         "build_command": command, "clock": "unchanged 4TPS semantics; executed without sleep",
         "scope": "flat headless fixture; 100 warmup + 1000 measured ticks per scenario; no clients, mobs, fluids, worldgen, Java mods",
-        "cpu_rss_scope": "whole child: all four scenarios, fixture setup, warmup and output; Linux RSS in KiB",
+        "cpu_rss_scope": "whole child: all six scenarios, fixture setup, warmup and output; Linux RSS in KiB",
         "results": results,
     }
     (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")

@@ -13,9 +13,13 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 [トーテム効果集合](slices/01-totem-grant.md) の付与関数修正と回帰テストは完了。
 [実際の発動・通知・吸収](slices/02-totem-activation.md) のRust/TCPゲートも通った。
 [本番tick計測](slices/03-tick-baseline.md) を追加し、[切替前の限定fixture測定](../../evidence/time-contract/tick-baseline/README.md) を実行した。
-直近の候補はhot/warm ringの重複挿入除去。中心からの等価拡張で同じ集合が得られることを
-検証してから適用する。恒常的なキャッシュや起床管理を足す必要はまだない。
-並行してゲームtick語と実時間語の所有者を棚卸しし、20TPS一括移行sliceを具体化する。
+[hot/warm集合構築](slices/04-region-expansion.md) の等価変形も適用・検証した。
+[限定fixtureのA/Bと限界](../../evidence/time-contract/region-expansion/README.md) を読む。
+ここで性能最適化を広げず、次はゲームtick語と実時間語の所有者を棚卸しし、
+20TPS一括移行sliceを具体化する。特にkeepalive/timeoutの実時間、Mob/投擲の移動係数・
+酸素・導火線、MET3/MET4の保存値を同じ契約へ接続する。
+独立レビューで共有fixtureの並行実行競合も修正した。世界fixtureを追加するテストは
+setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 移動/衝突、保存の単位、遅延時の方針を未決定のまま時計を変えてはいけない。
 終了時にこのpickupと検証結果を更新すること。
 
@@ -26,6 +30,7 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 - [ ] 20TPSへ一括移行（時刻・効果・精錬・機械・移動・導火線等の整合が先）。
 - [ ] 被ダメ・飛翔・天候・釣り等の状態条件を一次参照に合わせ、発生tickを比較。
 - [x] 切替前の本番tick経路を限定fixtureで測定（4TPS時間語・sleepなし。全サーバー性能ではない）。
+- [x] hot/warm集合を変えず重複挿入を削減。全負荷での速度改善は未証明。
 - [ ] 同条件20TPSでCPU/RSS/tick遅延を測り、費用の大きい箇所だけ最適化。
 
 後続項目はまだ実装可能なsliceに確定していない。着手前に状態の所有者・入力・
@@ -33,11 +38,12 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 
 ## 現在の検証
 
-トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストは20 passed・1 ignored。
-ignoredは専用runnerで3プロセス実行したrelease計測用fixture。tickの炉stageを欠落させる
-負の対照では、新しいproduction tick回帰テストが失敗した。
+トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも21 passed・1 ignored。
+ignoredは専用runnerで前後各3プロセス実行したrelease計測用fixture。
+tickの炉stage欠落・ringの半径誤りはそれぞれ負の対照で検出した。共有fixture競合も
+再現して修正し、対象テストの8thread実行を20回反復した。
 通常発動の吸収0、救命後の旧空腹効果の実行、期限切れ後に残る吸収をそれぞれ再現した。
-Fabric/NeoForge機能付きcargo checkも合格。両パスの独立Codexレビューは回帰指摘なし
+Fabric/NeoForge機能付きcargo checkも合格。各パスの最終独立Codexレビューは指摘なし
 （レビュー自体はテストを実行していない）。ログは
 [実装の証拠](../../evidence/time-contract/)に保存。
 clockは4TPSのまま。vanilla動的同等性・20TPS・全サーバーCPU/RSS・実クライアントは未検証。
