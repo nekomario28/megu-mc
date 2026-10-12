@@ -1,0 +1,20 @@
+{
+  "claim": "adding drops, xp, crops and mobs to the fixture exposed the dominant real cost: 667ms per tick, 72 percent in the drop stage, caused by an O(n^2) merge loop",
+  "why": "slice 18 rejected the remaining membership hoists because the fixture had no drops, xp, crops or mobs, so their cost was invisible",
+  "measurement": "same runner and release build, 3 processes, 100 warmup and 1000 measured ticks per scenario. entity_heavy: 600 drops, 600 xp, 600 crops, 600 mobs = 667ms per tick, drops 72 percent, environment 27 percent. entity_heavy_furnaces adds 400 active furnaces = 674ms.",
+  "significance": "667ms per tick would break a 20TPS server outright. This was completely invisible in every previous fixture.",
+  "cause": "drop_tick merges same-item nearby drops with a nested loop over all pairs, about 180000 pairs per tick at 600 drops. dp[i].comps == dp[j].comps is evaluated before the cheap distance test.",
+  "fix_plan": "bucket by integer cell and only compare the own cell plus its 26 neighbours, since a distance under 0.5 implies the floors differ by at most one on each axis. To stay equivalent, iterate i in original order, collect candidate j from the neighbourhood, filter to j > i, sort ascending, and merge on the first match.",
+  "not_equivalent": "sorting the drops and comparing neighbours changes which drop is absorbed, so that approach is rejected",
+  "status": "fixture added only. drop_tick is unchanged.",
+  "tests": "32 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "files_sha256": {
+    "README.md": "41a729e19df9b1064db5f753c024d11f835e6a10d20941681999ca839361800b",
+    "build.log": "7a925e095704603acea91a1eee7f273ceee89888194a1eec94a5382340e413bc",
+    "fixture-features.log": "5a40a3691af350a35735f370fd5f086be6ecde4c8af17a296b663bb2b8a89c99",
+    "fixture-parallel.log": "df7e57cc3f26be2bf08fa304260d4d6747450bfb5640d5f99957f2e1795a6456",
+    "results.json": "a898a4282dc03dd0459cb645fba05a6a5a8ae6151fbcaeb9fab7e5a098f76caa"
+  }
+}

@@ -416,10 +416,32 @@ fn profile_game_tick() {
         ("active_furnaces", 1, 400, true),
         ("crowded_actors", 100, 0, false),
         ("dense_actors", 100, 0, false),
+        // Without drops, xp, crops and mobs in the fixture the per-item membership
+        // locks never fire, so hoisting them cannot be measured.
+        ("entity_heavy", 1, 0, false),
+        ("entity_heavy_furnaces", 1, 400, true),
     ] {
         actors().lock().unwrap().clear();
         furnaces().lock().unwrap().clear();
         forceloaded().lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        xps().lock().unwrap().clear();
+        crops().lock().unwrap().clear();
+        mobs().lock().unwrap().clear();
+        if scenario.starts_with("entity_heavy") {
+            for i in 0..600 {
+                let (x, y, z) = (16.0 * (i % 20) as f64, 70.0, 16.0 * (i / 20) as f64);
+                drops().lock().unwrap().push(Drop { eid: 20_000 + i, x, y, z,
+                    item: 811, cnt: 1, comps: Vec::new(), age: (i % 400) as i32 });
+                xps().lock().unwrap().push(Xp { eid: 21_000 + i, x, y, z, val: 1, age: (i % 400) as i32 });
+                crops().lock().unwrap().insert((x as i32, y as i32, z as i32), (i % 7) as u8);
+                mobs().lock().unwrap().push(Arc::new(Mob { eid: 22_000 + i, uuid: [0u8; 16], etype: 124,
+                    pos: Mutex::new((x + 1.0, y, z, 0.0, 0.0)), hp: Mutex::new(20.0),
+                    last_hit: Mutex::new(Instant::now()), hurt_at: Mutex::new(Instant::now()),
+                    fuse: Mutex::new(0), love: Mutex::new(0),
+                    air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) }));
+            }
+        }
         TICK.store(1, Ordering::Relaxed);
         TICK_IDX.store(0, Ordering::Relaxed);
         WORLD_TIME.store(1000, Ordering::Relaxed);

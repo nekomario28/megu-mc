@@ -63,7 +63,7 @@ def main():
                 item["tick"] = dict(zip(("samples", "total_ns", "p50_ns", "p95_ns", "p99_ns"), values))
             else:
                 item.setdefault("stages", {})[stage] = dict(zip(("calls", "total_ns", "max_ns"), values))
-        assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces", "crowded_actors", "dense_actors"}
+        assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces", "crowded_actors", "dense_actors", "entity_heavy", "entity_heavy_furnaces"}
         for item in scenarios.values():
             assert item["tick"]["samples"] == 1000
             assert len(item["stages"]) == 15
@@ -84,7 +84,7 @@ def main():
         "cadence": f"{TICKS_PER_SECOND_LABEL} semantics; ticks are executed back to back without sleep",
         "per_tick_unit": "microseconds, total_ns over 1000 ticks divided by 1000 then by 1000",
         "scope": "flat headless fixture; 100 warmup + 1000 measured ticks per scenario; no clients, mobs, fluids, worldgen, Java mods",
-        "cpu_rss_scope": "whole child: all six scenarios, fixture setup, warmup and output; Linux RSS in KiB",
+        "cpu_rss_scope": "whole child: all eight scenarios, fixture setup, warmup and output; Linux RSS in KiB",
         "results": results,
     }
     (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
