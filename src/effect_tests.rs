@@ -1,5 +1,75 @@
 use super::*;
 
+fn client_pair() -> (Client, TcpStream) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let receiver = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let (sender, _) = listener.accept().unwrap();
+    let past = Instant::now() - Duration::from_secs(10);
+    let client = Client {
+        eid: 4242, uuid: [0; 16], name: "totem-test".into(),
+        pos: Mutex::new((0.0, 70.0, 0.0, 0.0, 0.0, true)), hp: Mutex::new(20.0),
+        sock: Mutex::new(sender), inv: Mutex::new(HashMap::new()),
+        cursor: Mutex::new((0, 0, Vec::new())), drag: Mutex::new((-1, Vec::new())),
+        open_chest: Mutex::new(None), open_furnace: Mutex::new(None),
+        craft: Mutex::new(HashMap::new()), craft9: Mutex::new(HashMap::new()),
+        open_table: Mutex::new(false), open_merchant: Mutex::new(false), trade_sel: Mutex::new(-1),
+        merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+        bow_draw: Mutex::new(None), dig: Mutex::new(None), eat_start: Mutex::new(None),
+        blocking: Mutex::new(false), sprinting: Mutex::new(false), sneaking: Mutex::new(false),
+        last_melee: Mutex::new(past), fall_fly: Mutex::new(false), hurt_at: Mutex::new(past),
+        shield_cd: Mutex::new(past), absorb: Mutex::new(0.0), pearl_cd: Mutex::new(past),
+        xp: Mutex::new(0), skin: Mutex::new(None), seen: Mutex::new(HashSet::new()),
+        chunks: Mutex::new(HashSet::new()), gm: Mutex::new(0), fall_from: Mutex::new(70.0),
+        food: Mutex::new(20), air: Mutex::new(60), armor_pts: Mutex::new(0), sat: Mutex::new(5.0),
+        walk_acc: Mutex::new(0.0), lastp: Mutex::new((0.0, 70.0, 0.0)),
+        spawn_pt: Mutex::new(None), held: Mutex::new(0), effs: Mutex::new(Vec::new()),
+    };
+    (client, receiver)
+}
+
+#[test]
+fn death_protection_updates_state_and_sends_effect_changes() {
+    let (client, mut receiver) = client_pair();
+    let totem = name_to_item("totem_of_undying").unwrap();
+    client.inv.lock().unwrap().insert(45, (totem, 2, Vec::new()));
+    *client.hp.lock().unwrap() = 0.0;
+    client.effs.lock().unwrap().push(Eff { id: 18, amp: 1, left: 80 });
+    totem_check(&client);
+    assert_eq!(*client.hp.lock().unwrap(), 1.0);
+    assert_eq!(client.inv.lock().unwrap().get(&45), Some(&(totem, 1, Vec::new())));
+    assert_eq!(*client.absorb.lock().unwrap(), 8.0);
+    assert_eq!(hurt_absorb(&client, 3.0), 0.0);
+    assert_eq!(*client.absorb.lock().unwrap(), 5.0);
+    assert_eq!(hurt_absorb(&client, 7.0), 2.0);
+    assert_eq!(*client.absorb.lock().unwrap(), 0.0);
+
+    client.sock.lock().unwrap().shutdown(std::net::Shutdown::Write).unwrap();
+    let mut changes = Vec::new();
+    while let Some((packet, body)) = read_packet(&mut receiver) {
+        if packet == 0x43 || packet == 0x76 {
+            let mut payload = &body[..];
+            let entity = read_varint(&mut payload).unwrap();
+            let effect = read_varint(&mut payload).unwrap();
+            if packet == 0x43 {
+                assert!(payload.is_empty());
+                changes.push((packet, entity, effect, None));
+            } else {
+                let amplifier = read_varint(&mut payload).unwrap();
+                let duration = read_varint(&mut payload).unwrap();
+                assert_eq!(payload, &[0x06]);
+                changes.push((packet, entity, effect, Some((amplifier, duration))));
+            }
+        }
+    }
+    assert_eq!(changes, vec![
+        (0x43, 4242, 18, None),
+        (0x76, 4242, 9, Some((1, 900))),
+        (0x76, 4242, 21, Some((1, 100))),
+        (0x76, 4242, 11, Some((0, 800))),
+    ]);
+}
+
 #[test]
 fn totem_replaces_existing_effects_with_vanilla_grant() {
     let mut effects = vec![
@@ -20,4 +90,37 @@ fn totem_replaces_existing_effects_with_vanilla_grant() {
     assert_eq!(snapshot(&effects), expected);
     totem_effects(&mut effects);
     assert_eq!(snapshot(&effects), expected, "repeated grants must not duplicate effects");
+}
+
+#[test]
+fn wither_death_protection_stops_old_effects_and_keeps_new_grants() {
+    let (client, _receiver) = client_pair();
+    client.inv.lock().unwrap().insert(45, (name_to_item("totem_of_undying").unwrap(), 1, Vec::new()));
+    *client.hp.lock().unwrap() = 1.0;
+    *client.effs.lock().unwrap() = vec![
+        Eff { id: 21, amp: 0, left: 1 }, // expires in the old set
+        Eff { id: 19, amp: 0, left: 1 }, // lethal wither
+        Eff { id: 16, amp: 0, left: 81 }, // must not run after death protection removes it
+    ];
+    effects::tick_effects(&client);
+    assert_eq!(*client.hp.lock().unwrap(), 1.0);
+    assert!(!client.inv.lock().unwrap().contains_key(&45));
+    assert_eq!(*client.food.lock().unwrap(), 20);
+    assert_eq!(*client.absorb.lock().unwrap(), 8.0);
+    let mut actual: Vec<_> = client.effs.lock().unwrap().iter().map(|e| (e.id, e.amp, e.left)).collect();
+    actual.sort_unstable();
+    assert_eq!(actual, vec![(9, 1, 180), (11, 0, 160), (21, 1, 20)]);
+}
+
+#[test]
+fn absorption_expiry_removes_unspent_shield() {
+    let (client, _receiver) = client_pair();
+    *client.absorb.lock().unwrap() = 8.0;
+    client.effs.lock().unwrap().push(Eff { id: 21, amp: 1, left: 2 });
+    effects::tick_effects(&client);
+    assert_eq!(*client.absorb.lock().unwrap(), 8.0, "still active before expiry");
+    effects::tick_effects(&client);
+    assert!(client.effs.lock().unwrap().is_empty());
+    assert_eq!(hurt_absorb(&client, 3.0), 3.0, "expired absorption must not intercept damage");
+    assert_eq!(*client.absorb.lock().unwrap(), 0.0);
 }

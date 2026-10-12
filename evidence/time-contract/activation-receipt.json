@@ -1,0 +1,20 @@
+{
+  "base_revision": "a6c00fa",
+  "source_sha256": {
+    "src/main.rs": "b5dfe719cfeddf33d8e5694b6cf159db8f3277e17337f14cdd18a3bf95a59015",
+    "src/effects.rs": "8d105166f3d8efceee92581970245bb48ecd40fdaf214d527bf058bcb97746d9",
+    "src/effect_tests.rs": "e4c8972d2cb75f9b672eceab341ffd06b4abbf74cf3cafeffdd888e942ec458d"
+  },
+  "checks": [
+    {"command": "cargo test --offline --locked -j 2 -- --test-threads=1", "result": "19 passed, 0 failed", "log": "activation-suite.log"},
+    {"command": "cargo check --offline --locked -j 2 --features fabric-probe,neoforge-events", "result": "PASS", "log": "activation-java.log"},
+    {"command": "codex review --uncommitted", "result": "No actionable regressions; static review only, tests not run by reviewer"}
+  ],
+  "negative_controls": {
+    "activation-red.log": "absorption pool 0 instead of 8",
+    "wither-red.log": "removed hunger ran after death protection: food 19 instead of 20",
+    "expiry-red.log": "expired absorption intercepted damage: 0 instead of 3"
+  },
+  "not_verified": ["20TPS cutover", "vanilla runtime comparison", "real client rendering", "all damage paths", "CPU/RSS performance"],
+  "clock": "unchanged: 250ms server tick"
+}

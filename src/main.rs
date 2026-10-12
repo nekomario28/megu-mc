@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "java-compat")]
 mod java_compat;
 mod landing;
+mod effects;
 mod cached_lookup;
 use cached_lookup::CachedLookup;
 mod feature;
@@ -1174,7 +1175,7 @@ fn totem_check(c: &Client) {
             let snd = sound_pkt_named("item.totem.use", px, py, pz);
             broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
             // Death protection replaces existing effects with the vanilla grant set.
-            totem_effects(&mut *c.effs.lock().unwrap());
+            grant_totem_effects(c, &mut c.effs.lock().unwrap());
             let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x5d, health_pkt_c(1.0, c));
             return
         }
@@ -1188,6 +1189,21 @@ fn totem_effects(ef: &mut Vec<Eff>) {
     for (name, amp, dur) in [("regeneration", 1, 180), ("absorption", 1, 20), ("fire_resistance", 0, 160)] {
         let id = name_to_effect(name).expect("totem effect must exist in the effect registry");
         ef.push(Eff { id, amp, left: dur });
+    }
+}
+fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
+    for e in ef.iter() {
+        let packet = remove_effect_pkt(c.eid, e.id);
+        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x43, packet.clone()); }
+        broadcast_seen(c.eid, |_| (0x43, packet.clone()));
+    }
+    totem_effects(ef);
+    *c.absorb.lock().unwrap() = 8.0;
+    for e in ef.iter() {
+        // The wire uses game ticks even while the simulation still stores 250ms ticks.
+        let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left * 5);
+        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x76, packet.clone()); }
+        broadcast_seen(c.eid, |_| (0x76, packet.clone()));
     }
 }
 fn armor_pts_of(inv: &HashMap<i16, Stack>) -> i32 {
@@ -1510,71 +1526,7 @@ fn keepalive_time_tick() {
     // still apply there; damage effects are client-irrelevant in creative)
     {
         let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
-        for c in cls.iter() {
-            adv_event(&c.name, "tick", None);
-            let mut ef = c.effs.lock().unwrap();
-            if ef.is_empty() { continue }
-            let mut dirty2 = false;
-            let mut expired: Vec<i32> = Vec::new();
-            let mut grant_totem = false;
-            for e in ef.iter_mut() {
-                e.left -= 1;
-                if *c.gm.lock().unwrap() == 1 { if e.left <= 0 { expired.push(e.id); } continue }
-                let mut h = c.hp.lock().unwrap();
-                match e.id {
-                    9 => { let iv = (10i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { let mh = max_hp_of(&c.name); *h = (*h + 1.0).min(mh); dirty2 = true; } }
-                    18 => { let iv = (5i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { *h = (*h - 1.0).max(1.0); dirty2 = true; } }
-                    19 => { let iv = (8i32 >> (e.amp.clamp(0, 6) as u32)).max(1); if e.left % iv == 0 { *h = (*h - 1.0).max(0.0); dirty2 = true; }
-                        if *h <= 0.0 {
-                            // ef guard is held here — inline the totem check
-                            // without re-locking effs
-                            let mut inv2 = c.inv.lock().unwrap();
-                            let hk = 36i16 + (*c.held.lock().unwrap()) as i16;
-                            let mut saved = false;
-                            let mut saved_k = -1i16;
-                            let mut saved_now = (0i64, 0u8, Vec::new());
-                            for k in [45i16, hk] {
-                                if inv2.get(&k).map(|v| v.0) == Some(1163) {
-                                    let st = inv2.get(&k).unwrap().clone();
-                                    if st.1 <= 1 { inv2.remove(&k); } else { inv2.insert(k, (st.0, st.1 - 1, st.2)); }
-                                    saved = true; saved_k = k;
-                                    saved_now = inv2.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
-                                    break
-                                }
-                            }
-                            drop(inv2);
-                            if saved {
-                                *h = 1.0;
-                                grant_totem = true;
-                                resync_slot(c, 0, saved_k, &saved_now);
-                                let mut st_pkt = Vec::new();
-                                st_pkt.extend_from_slice(&c.eid.to_be_bytes());
-                                st_pkt.push(35);
-                                let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
-                                broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
-                                let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
-                                let snd = sound_pkt_named("item.totem.use", px, py, pz);
-                                broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
-                            }
-                        } }
-                    16 => { drop(h); let mut f = c.food.lock().unwrap();
-                        if e.left % 80 == 0 && *f > 0 { *f -= 1; dirty2 = true; }
-                        h = c.hp.lock().unwrap(); }
-                    _ => {}
-                }
-                drop(h);
-                if e.left <= 0 { expired.push(e.id); }
-            }
-            if dirty2 { if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c)); } }
-            for id in &expired {
-                ef.retain(|e| e.id != *id);
-                let pk = remove_effect_pkt(c.eid, *id);
-                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x43, pk.clone()); }
-                broadcast_seen(c.eid, |_c| (0x43, pk.clone()));
-            }
-            // Expired effects belong to the old set, not to the death-protection grant.
-            if grant_totem { totem_effects(&mut ef); }
-        }
+        for c in cls.iter() { effects::tick_effects(c); }
     }
     // crop growth: ~1 stage per 60s average (1/240 chance per 250ms tick)
     {
