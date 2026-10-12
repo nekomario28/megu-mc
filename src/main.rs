@@ -2017,7 +2017,11 @@ fn furnace_tick() {
     let mut dirty_pos: Vec<(i32,i32,i32)> = Vec::new();
     for (pos, f) in fs.iter_mut() {
         if !is_warm(pos.0, pos.2) { continue }
-        let out = smelt_out(f.input.0, |item| f.recipe_cache.get_or_compute(item, || smelt_result(item)));
+        // The recipe result is only ever read behind `input.1 > 0`, so an empty
+        // input skips the lookup instead of hashing an item it cannot smelt.
+        let out = if f.input.1 > 0 {
+            smelt_out(f.input.0, |item| f.recipe_cache.get_or_compute(item, || smelt_result(item)))
+        } else { None };
         let can_smelt = f.input.1 > 0 && out.as_ref().map(|o|
             f.output.1 == 0 || (f.output.0 == o.0 && f.output.2 == o.2 && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))).unwrap_or(false);
         if f.burn_left <= 0 && can_smelt && f.fuel.1 > 0 {

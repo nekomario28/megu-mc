@@ -1,0 +1,16 @@
+{
+  "claim": "skipping the recipe lookup when the input stack is empty is result-identical and faster on every measured fixture",
+  "equivalence": "the recipe result is only read behind input.1 > 0, in can_smelt and in the smelt branch. With an empty input it is never read, so not computing it cannot change state, output, xp or rng consumption.",
+  "measurement": "HEAD baseline, same fixtures, runner and release build, 3 processes each. Idle 400 furnaces: tick x1.20, furnace stage x1.57. All other fixtures x0.99-1.04, no regression anywhere. Whole-process CPU 0.2760-0.2791s -> 0.2722-0.2733s.",
+  "measurement_limit": "this fixture only; not a whole-server or vanilla-comparison result",
+  "previous_mistake_corrected": "the first attempt compared against the rejected Vec candidate measurement instead of HEAD, which made unrelated fixtures swing by 0.81x-1.39x and was unreadable",
+  "tests": "31 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "next_candidate": "furnace fixed-point skipping. A furnace with burn_left <= 0, progress == 0 and an empty input cannot change without an external event, so the scan itself can be skipped. Every mutation path must wake it or furnaces stop smelting silently.",
+  "files_sha256": {
+    "README.md": "4cd1b1db4e412bc0e2e4819d4cafdb4caed3a330757626b29a3b43182968e1de",
+    "results-after.json": "89bb5bd3f0d2451db2725d119eacdbc831bccea5031b15555bef79e4a9b5d971",
+    "results-before.json": "ae552e95b00538fad29dbe1a46f667d9560a7a904e996d06000a84877f42fd52"
+  }
+}
