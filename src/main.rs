@@ -3409,8 +3409,9 @@ fn is_warm(x: i32, z: i32) -> bool { warm().lock().unwrap().contains(&(x.div_euc
 
 // generalized lazy-schedule primitive (the Create-generalization core):
 // a cell that produces no observable change doubles its re-check interval
-// up to 16 ticks (4 s); any neighbor block change invalidates it back to
-// full rate. Event-driven reset + exponential backoff, not polling.
+// up to 80 game ticks (4 s); any neighbor block change invalidates it back
+// to full rate. Event-driven reset + exponential backoff, not polling.
+// The tick counts live in backoff_ticks; only the 4 s ceiling belongs here.
 static BACKOFF: OnceLock<Mutex<HashMap<(i32, i32, i32), (u64, u32)>>> = OnceLock::new();
 fn backoff() -> &'static Mutex<HashMap<(i32, i32, i32), (u64, u32)>> { BACKOFF.get_or_init(|| Mutex::new(HashMap::new())) }
 static TICK_IDX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
