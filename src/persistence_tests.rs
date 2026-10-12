@@ -183,3 +183,34 @@ fn met4_round_trip_leaves_persisted_durations_untouched() {
     let loaded = round_trip(None, 150, 600);
     assert_eq!(loaded.drop_age, 600, "MET4 ages must pass through unconverted");
 }
+
+/// A truncated or corrupt save must not panic the loader. `read_comps` reads a
+/// variable-width type VarInt and then a 2-byte length, so the length has to be
+/// re-checked after the VarInt is consumed.
+#[test]
+fn truncated_component_blobs_do_not_panic_the_loader() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    // Every truncation of a valid component record must either parse or stop.
+    let mut full = Vec::new();
+    write_comps(&mut full, &vec![(2i64, b"{\"text\":\"x\"}".to_vec()), (9i64, vec![0u8; 8])]);
+    for cut in 0..=full.len() {
+        let mut p = 0usize;
+        let _ = read_comps(&full[..cut], &mut p);
+        assert!(p <= cut, "cursor ran past the buffer at cut {cut}");
+    }
+    // A VarInt that claims more component bytes than remain must stop, not index.
+    let mut liar = Vec::new();
+    write_varint(&mut liar, 1);          // one component
+    write_varint(&mut liar, 2);          // type
+    liar.extend_from_slice(&100u16.to_be_bytes()); // claims 100 bytes
+    liar.extend_from_slice(&[0u8; 3]);   // supplies 3
+    let mut p = 0usize;
+    let parsed = read_comps(&liar, &mut p);
+    assert!(parsed.is_empty(), "an over-long blob must be rejected, got {parsed:?}");
+    // The truncated length field itself.
+    for cut in 0..=liar.len() {
+        let mut p = 0usize;
+        let _ = read_comps(&liar[..cut], &mut p);
+        assert!(p <= cut, "cursor ran past the buffer at cut {cut}");
+    }
+}

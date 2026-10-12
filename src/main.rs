@@ -3876,10 +3876,14 @@ fn read_comps(b: &[u8], p: &mut usize) -> Comps {
     let n = rv_varint(b, p);
     let mut c = Vec::new();
     for _ in 0..n {
-        if *p + 2 > b.len() { break }
+        // The type is a variable-width VarInt, so the 2-byte length field can only
+        // be checked after it has been consumed. Checking first and then indexing
+        // panicked on a truncated record.
+        if *p >= b.len() { break }
         let ty = rv_varint(b, p);
+        if b.len().saturating_sub(*p) < 2 { break }
         let l = u16::from_be_bytes(b[*p..*p + 2].try_into().unwrap()) as usize; *p += 2;
-        if *p + l > b.len() { break }
+        if b.len().saturating_sub(*p) < l { break }
         c.push((ty, b[*p..*p + l].to_vec())); *p += l;
     }
     c
