@@ -1696,8 +1696,11 @@ fn keepalive_time_tick() {
             let wst = name_to_state("water").unwrap_or(u32::MAX);
             let in_water = block_at(b.x.floor() as i32, b.y.floor() as i32, b.z.floor() as i32) == wst;
             if !in_water && b.dy.abs() + b.dx.abs() + b.dz.abs() > 0.01 {
-                b.x += b.dx * 0.99; b.y += b.dy * 0.99; b.z += b.dz * 0.99;
+                // Drag belongs on the velocity, not on the displacement, or the
+                // horizontal velocity never decays. Values are unchanged here.
+                b.dx *= 0.99; b.dy *= 0.99; b.dz *= 0.99;
                 b.dy -= 0.03;
+                b.x += b.dx; b.y += b.dy; b.z += b.dz;
             } else {
                 b.dx = 0.0; b.dy = 0.0; b.dz = 0.0;
                 if !b.bit && b.age > server_ticks(BOBBER_BITE_GT) as i32 { b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6; }
@@ -1716,7 +1719,12 @@ fn keepalive_time_tick() {
             p0.ttl -= 1;
             let hit = block_at(p0.x.floor() as i32, p0.y.floor() as i32, p0.z.floor() as i32) != 0;
             if hit || p0.ttl <= 0 { done.push((p0.owner, p0.x, p0.y, p0.z)); }
-            else { p0.x += p0.dx * 0.99; p0.y += p0.dy * 0.99; p0.z += p0.dz * 0.99; p0.dy -= 0.03; }
+            else {
+                // vanilla ThrowableProjectile: scale 0.99, add -0.03, integrate.
+                p0.dx *= 0.99; p0.dy *= 0.99; p0.dz *= 0.99;
+                p0.dy -= 0.03;
+                p0.x += p0.dx; p0.y += p0.dy; p0.z += p0.dz;
+            }
             let (ax, ay, az, eid) = (p0.x, p0.y, p0.z, p0.eid);
             broadcast_seen(eid, |_c| (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true)));
         }
@@ -1867,9 +1875,12 @@ fn arrow_tick() {
                 }
                 continue;
             }
-            a.x += a.dx * 0.99; a.y += a.dy * 0.99; a.z += a.dz * 0.99;
-            // vanilla AbstractArrow: scale(0.99) then -0.05 per game tick
+            // vanilla AbstractArrow: scale the velocity by 0.99, add -0.05, then
+            // integrate position from that velocity. Applying drag to the
+            // displacement instead would leave the horizontal velocity undamped.
+            a.dx *= 0.99; a.dy *= 0.99; a.dz *= 0.99;
             a.dy -= 0.05;
+            a.x += a.dx; a.y += a.dy; a.z += a.dz;
             let (ax, ay, az) = (a.x, a.y, a.z);
             // block collision: arrows stick into solid blocks (vanilla)
             let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);

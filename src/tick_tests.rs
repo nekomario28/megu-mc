@@ -566,3 +566,50 @@ fn profile_game_tick() {
         }
     }
 }
+
+
+/// The velocity itself must decay, which only a test driving the production loop
+/// can observe. Checking the arithmetic alone passes even when arrow_tick still
+/// applies drag to the displacement.
+#[test]
+fn the_production_arrow_loop_decays_horizontal_velocity() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let old_hot = hot().lock().unwrap().clone();
+    let old_warm = warm().lock().unwrap().clone();
+    forceloaded().lock().unwrap().insert((0, 0));
+    arrows().lock().unwrap().push(Arrow { eid: 8001, owner: 1, x: 0.5, y: 120.0, z: 0.5,
+        dx: 1.0, dy: 0.0, dz: 0.0, ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 6.0, fire: 0,
+        punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: false });
+    let (mut prev_x, mut prev_v) = (0.5f64, 1.0f64);
+    let mut steps = Vec::new();
+    for _ in 0..5 {
+        game_tick(|_, tick| tick());
+        let a = arrows().lock().unwrap();
+        let Some(a) = a.iter().find(|a| a.eid == 8001) else { break };
+        let (x, v) = (a.x, a.dx);
+        drop(a);
+        steps.push((x - prev_x, v));
+        prev_x = x; prev_v = v;
+    }
+    *arrows().lock().unwrap() = old_arrows;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    *hot().lock().unwrap() = old_hot;
+    *warm().lock().unwrap() = old_warm;
+    assert_eq!(steps.len(), 5, "the arrow left the hot set: {steps:?}");
+    // Horizontal velocity must shrink by the drag factor every tick, and the step
+    // must equal the velocity rather than the velocity times the drag.
+    let mut expected = 1.0f64;
+    for (step, velocity) in &steps {
+        expected *= 0.99;
+        assert!((*velocity - expected).abs() < 1e-9, "velocity {velocity} != {expected}");
+        assert!((*step - *velocity).abs() < 1e-9, "step {step} != velocity {velocity}");
+        assert!(*step < 1.0, "the step must be the damped velocity, not the initial one: {step}");
+    }
+    assert!(prev_v < 0.96, "velocity barely decayed: {prev_v}");
+}
