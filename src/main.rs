@@ -1368,6 +1368,24 @@ static SIZE_LOG_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 fn next_deadline(deadline: Instant, overrun: bool) -> Instant {
     if overrun { Instant::now() } else { deadline }
 }
+/// MET4 stores durations in server ticks. MET2 and MET3 stored the same counters as
+/// 4TPS server ticks, which span five times the wall time, so a legacy value read
+/// directly at 20TPS expires five times early. Dividing by TICK_MS converts the
+/// legacy millisecond-equivalent budget, and TICK_MS went 250 to 50, so the factor
+/// is exactly the cadence ratio.
+fn legacy_ticks(raw: u64, legacy: bool) -> u64 { if legacy { raw / TICK_MS } else { raw } }
+/// The tick period MET2 and MET3 files were written at. It is a property of the
+/// file format, not of the running server, so it is a fixed historical value and
+/// must not be derived from TICK_MS.
+const LEGACY_TICK_MS: u64 = 250;
+/// Counters the legacy format stored as a number of 4TPS server ticks, not as
+/// milliseconds: arrow and pearl ttl, primed TNT left, furnace burn_left and
+/// progress, and the weather counters. A legacy tick spans 250ms, so it is five
+/// 20TPS ticks; dividing would shorten the budget fivefold, which is the very
+/// bug the legacy conversion exists to prevent.
+fn legacy_tick_count(raw: u64, legacy: bool) -> u64 {
+    if legacy { raw * (LEGACY_TICK_MS / TICK_MS) } else { raw }
+}
 fn wall_anchor(cell: &'static OnceLock<Mutex<Instant>>) -> &'static Mutex<Instant> {
     cell.get_or_init(|| Mutex::new(Instant::now()))
 }
@@ -4407,8 +4425,8 @@ fn load_world_from(payload: &[u8]) {
                 let fuel = rd(&payload, &mut p);
                 let output = rd(&payload, &mut p);
                 if p + 8 > payload.len() { break }
-                let burn_left = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let progress = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                let burn_left = legacy_tick_count(i32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64, legacy_ms_ages) as i32; p += 4;
+                let progress = legacy_tick_count(i32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64, legacy_ms_ages) as i32; p += 4;
                 fs.insert((x, y, z), Furnace { input, fuel, output, burn_left, progress, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
             }
             eprintln!("[spine] loaded {} furnaces", fs.len());
@@ -4456,7 +4474,7 @@ fn load_world_from(payload: &[u8]) {
                 let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let val = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
                 let ams = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let age = if legacy_ms_ages { u64::from(ams) / TICK_MS } else { u64::from(ams) };
+                let age = legacy_ticks(u64::from(ams), legacy_ms_ages);
                 xs.push(Xp { eid, x, y, z, val, age: age.min(server_ticks(XP_LIFE_GT)) as i32 });
                 if eid > mx { mx = eid; }
             }
@@ -4469,7 +4487,7 @@ fn load_world_from(payload: &[u8]) {
             for d in ds.iter_mut() {
                 if p + 4 > payload.len() { break }
                 let raw = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let aticks = if legacy_ms_ages { raw / TICK_MS as u32 } else { raw };
+                let aticks = legacy_ticks(u64::from(raw), legacy_ms_ages);
                 // Reinterpret as signed so a negative pickup-delay marker survives
                 // instead of wrapping to a value that clamps to a full lifespan.
                 d.age = aticks as i32;
@@ -4490,7 +4508,7 @@ fn load_world_from(payload: &[u8]) {
                 let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
                 let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
                 let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let ttl = ri4(&payload, &mut p);
+                let ttl = legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
                 let stuck = if arw2 { let v = b[p] != 0; p += 1; v } else { false };
                 ar.push(Arrow { eid, owner, x, y, z, dx, dy, dz, ttl, dmg: 6.0, fire: 0, punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck }); bump(eid, &mut mx);
               } }
@@ -4511,7 +4529,7 @@ fn load_world_from(payload: &[u8]) {
                 let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
                 let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
                 let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let ttl = ri4(&payload, &mut p);
+                let ttl = legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
                 pe.push(Pearl { eid, owner, x, y, z, dx, dy, dz, ttl }); bump(eid, &mut mx);
               } }
             let n = rv(&payload, &mut p);
@@ -4520,18 +4538,18 @@ fn load_world_from(payload: &[u8]) {
                 if p + 32 > payload.len() { break }
                 let eid = ri4(&payload, &mut p);
                 let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let left = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                let left = legacy_tick_count(i32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64, legacy_ms_ages) as i32; p += 4;
                 pr.push(Primed { eid, x, y, z, left });
                 bump(eid, &mut mx);
               } }
             if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
         }
         if p + 8 <= payload.len() {
-            RAINING.store(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), Ordering::Relaxed);
+            RAINING.store(legacy_tick_count(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), legacy_ms_ages), Ordering::Relaxed);
             p += 8;
         }
         if p + 8 <= payload.len() {
-            THUNDERING.store(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), Ordering::Relaxed);
+            THUNDERING.store(legacy_tick_count(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), legacy_ms_ages), Ordering::Relaxed);
             p += 8;
         }
         if p + 4 <= payload.len() {

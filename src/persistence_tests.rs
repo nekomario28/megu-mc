@@ -147,3 +147,39 @@ fn hostile_rotation_does_not_collapse_to_one_type() {
         assert_eq!((t / 40) % 5, 2, "the old divisor still pins the choice");
     }
 }
+
+/// Legacy MET2/MET3 stored every duration as a 4TPS server tick, which spans five
+/// times the wall time of a 20TPS tick. Reading one directly would expire it five
+/// times early, so each counter must be divided by the cadence ratio.
+#[test]
+fn legacy_persisted_durations_resume_with_their_original_wall_time() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    // The conversion factor itself, stated in the unit the file used.
+    assert_eq!(legacy_ticks(1000, true), 1000 / TICK_MS);
+    assert_eq!(legacy_ticks(1000, false), 1000, "MET4 values must pass through untouched");
+    // Millisecond fields: drop and xp age were written as elapsed milliseconds.
+    for millis in [1000u64, 2000, 50_000, 300_000] {
+        assert_eq!(legacy_ticks(millis, true) * TICK_MS, millis,
+            "legacy age {millis}ms no longer spans the same wall time");
+    }
+    // Count fields were written as a number of 4TPS ticks, so they scale the other
+    // way. A legacy tick spans 250ms, which is five 20TPS ticks.
+    for budget in [1u64, 40, 100, 240, 1600, 6000, 12000] {
+        assert_eq!(legacy_tick_count(budget, true) * TICK_MS, budget * 250,
+            "legacy budget {budget} no longer spans {}ms", budget * 250);
+    }
+    assert_eq!(legacy_tick_count(ARROW_TTL_GT, true) * TICK_MS, ARROW_TTL_GT * 250);
+    assert_eq!(legacy_tick_count(PEARL_TTL_GT, true) * TICK_MS, PEARL_TTL_GT * 250);
+    assert_eq!(legacy_tick_count(TNT_FUSE_GT, true) * TICK_MS, TNT_FUSE_GT * 250);
+    assert_eq!(legacy_tick_count(200, true) * TICK_MS, 200 * 250, "furnace cook time");
+    // The two directions must not be interchangeable.
+    assert_ne!(legacy_ticks(1000, true), legacy_tick_count(1000, true));
+}
+
+#[test]
+fn met4_round_trip_leaves_persisted_durations_untouched() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    // A MET4 save writes server ticks, so loading it must not rescale anything.
+    let loaded = round_trip(None, 150, 600);
+    assert_eq!(loaded.drop_age, 600, "MET4 ages must pass through unconverted");
+}
