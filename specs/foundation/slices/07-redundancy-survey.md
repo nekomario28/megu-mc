@@ -21,7 +21,7 @@ Status: 調査完了。検出した上位から統合済み（下記）。
 | **`client_snapshot` idiom ×35** | (同一式) | **統合済み** |
 | **`broadcast` / `broadcast_seen_ex` / `broadcast_chunk`** | 0.90 / 0.73 | **統合済み** |
 | **`requeue_water` / `requeue_hopper` (+`requeue_lava`)** | 1.00 | **統合済み** |
-| `set_if_can_replace` / `set_if_can_replace_or_log` | 0.91 | 未着手（下記） |
+| `set_if_can_replace` / `set_if_can_replace_or_log` / `is_air_or_leaves` | 0.91 | **統合済み** |
 | `name_to_state` / `name_to_item` / `name_to_etype` / `name_to_effect` | 1.00 | 未着手（slice 03 そのもの） |
 | `spawn_arrow_pkt` / `spawn_drop_pkt` | 1.00 | 未着手（slice 04） |
 | `spawn_player` / `spawn_mob` | 0.77 | 未着手（slice 04） |
@@ -68,11 +68,31 @@ fn broadcast_seen_ex(eid, ex, mk) { fanout(|c| c.eid != ex && c.seen.lock().unwr
 
 ## 未着手の上位候補と、そう判断した理由
 
-**`set_if_can_replace` / `set_if_can_replace_or_log`（J=0.91）** —
-違うのは `in_tag("minecraft:logs")` を余分に見るかどうかだけ。
-**2つの実装が「置換可能」の規則を別々に持っている**のは divergence の危険がある。
-ただし差がタグ1つなので、統合するなら「どのタグを見るか」を引数にして
-呼び出し側で明示する形になる。**挙動の差が意図的かどうかを先に確認する必要がある。**
+**統合済み3：`is_replaceable(reg, cur, tags)` — 述語3つ → 1つ**
+
+`set_if_can_replace` / `set_if_can_replace_or_log` / `is_air_or_leaves` は
+**同じ質問**（この位置に書いてよいか）を、タグだけ変えて別々に書いていた。
+
+```rust
+fn is_replaceable(reg: &BReg, cur: u32, tags: &[&str]) -> bool {
+    reg.is_air(cur) || tags.iter().any(|t| reg.in_tag(cur, t))
+}
+```
+
+タグが**引数になった**ので、どの placer が何を置換可能と見なすかが
+呼び出し側に現れる。以前は3箇所に散っていた。
+
+述語が `&mut FC` ではなく**現在状態**を受け取る形にしたので、
+**FC を構築せずにテストできる**。
+
+ゲート `the_replaceable_predicate_says_what_each_placer_used_to_say`：
+空気はすべての placer で置換可能、石はどれでも不可、原木は
+`logs` を名乗る placer でのみ可、加えて3つのタグ集合すべてで
+定義（is_air ∨ in_tag）と一致。タグ引数を無視する変異で**exit=101**
+（[tree-negative.log](../evidence/foundation/fanout/tree-negative.log)）。
+
+**注意**：`tree.rs` には元々テストが無かった。この統合は条件を逐語的に
+保存しているが、**placer 全体の挙動は依然としてテストされていない**。
 
 **`name_to_*` の4つ組（J=1.00）** — どれも「静的表を名前で引いて
 無ければNone」。slice 03 の registry そのもの。**表ごとに統合すると

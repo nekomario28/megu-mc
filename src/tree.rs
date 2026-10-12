@@ -2,11 +2,20 @@
 // feature-size clipping, decorators, mangrove root placer, and leaf-distance
 // propagation. Ported from pumpkin feature/features/tree semantics.
 
+use crate::feature::BReg;
 use crate::worldgen::{J, Xor};
 
 pub(crate) type P3 = (i32, i32, i32);
 
 // ---------- helpers ----------
+
+/// Vanilla placers all ask the same question - may this position be written? - and
+/// answer it as air-or-in-tag. Which tag differs per placer, so it is the argument
+/// rather than three copies of the test with a different tag baked into each. That
+/// is how a placer ends up overwriting something it should not.
+fn is_replaceable(reg: &BReg, cur: u32, tags: &[&str]) -> bool {
+    reg.is_air(cur) || tags.iter().any(|t| reg.in_tag(cur, t))
+}
 
 fn set_if_can_replace(ctx: &mut FC, p: P3, st: u32) -> bool {
     let reg = match breg() {
@@ -14,7 +23,7 @@ fn set_if_can_replace(ctx: &mut FC, p: P3, st: u32) -> bool {
         None => return false,
     };
     let cur = ctx.get(p.0, p.1, p.2);
-    if reg.is_air(cur) || reg.in_tag(cur, "minecraft:replaceable_by_trees") {
+    if is_replaceable(reg, cur, &["minecraft:replaceable_by_trees"]) {
         ctx.set(p.0, p.1, p.2, st);
         return true;
     }
@@ -26,22 +35,20 @@ fn set_if_can_replace_or_log(ctx: &mut FC, p: P3, st: u32) -> bool {
         None => return false,
     };
     let cur = ctx.get(p.0, p.1, p.2);
-    if reg.is_air(cur)
-        || reg.in_tag(cur, "minecraft:replaceable_by_trees")
-        || reg.in_tag(cur, "minecraft:logs")
-    {
+    if is_replaceable(reg, cur, &["minecraft:replaceable_by_trees", "minecraft:logs"]) {
         ctx.set(p.0, p.1, p.2, st);
         return true;
     }
     false
 }
 fn is_air_or_leaves(ctx: &mut FC, p: P3) -> bool {
-    let reg = match breg() {
-        Some(r) => r,
-        None => return false,
-    };
-    let cur = ctx.get(p.0, p.1, p.2);
-    reg.is_air(cur) || reg.in_tag(cur, "minecraft:leaves")
+    match breg() {
+        Some(reg) => {
+            let cur = ctx.get(p.0, p.1, p.2);
+            is_replaceable(reg, cur, &["minecraft:leaves"])
+        }
+        None => false,
+    }
 }
 fn set_dirt(ctx: &mut FC, rng: &mut Xor, p: P3, provider: &Option<Box<BSP>>) {
     if let Some(bsp) = provider {
@@ -1942,3 +1949,59 @@ use crate::feature::{
     breg, dir_off, is_water_st, jint_pub, jnum_pub, js_pub, jstr_pub, mkprops, p_bsp_pub,
     p_ip_pub, BSP, FC, IP,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(name: &str) -> u32 {
+        crate::name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"))
+    }
+
+    /// The three placers used to spell the same test out separately with a
+    /// different tag each. The tag list is now the argument, so what has to be
+    /// pinned is that each caller still asks for the tags it used to ask for and
+    /// that the predicate actually reads them.
+    #[test]
+    fn the_replaceable_predicate_says_what_each_placer_used_to_say() {
+        let reg = breg().expect("the block registry must load from assets/");
+        let stone = state("stone");
+        let log = state("oak_log");
+
+        // Air is replaceable for every placer; stone is replaceable for none.
+        for tags in [
+            &["minecraft:leaves"][..],
+            &["minecraft:replaceable_by_trees"][..],
+            &["minecraft:replaceable_by_trees", "minecraft:logs"][..],
+        ] {
+            assert!(is_replaceable(reg, 0, tags), "air must be replaceable: {tags:?}");
+            assert!(!is_replaceable(reg, stone, tags), "stone must not be replaceable: {tags:?}");
+        }
+
+        // The tag argument has to be read: a log is not replaceable by trees, and
+        // is only replaceable where the placer names the logs tag.
+        let by_trees = &["minecraft:replaceable_by_trees"][..];
+        let or_log = &["minecraft:replaceable_by_trees", "minecraft:logs"][..];
+        assert!(reg.in_tag(log, "minecraft:logs"), "the registry must know oak_log is a log");
+        assert!(
+            !is_replaceable(reg, log, by_trees),
+            "trees alone must not overwrite a log"
+        );
+        assert!(
+            is_replaceable(reg, log, or_log),
+            "a log must be replaceable when the placer names logs"
+        );
+
+        // The predicate is the disjunction it replaced, for every caller's tags.
+        for tags in [
+            &["minecraft:leaves"][..],
+            &["minecraft:replaceable_by_trees"][..],
+            &["minecraft:replaceable_by_trees", "minecraft:logs"][..],
+        ] {
+            for st in [0u32, stone, log, state("oak_leaves")] {
+                let expected = reg.is_air(st) || tags.iter().any(|t| reg.in_tag(st, t));
+                assert_eq!(is_replaceable(reg, st, tags), expected, "state {st} tags {tags:?}");
+            }
+        }
+    }
+}
