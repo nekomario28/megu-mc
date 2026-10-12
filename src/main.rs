@@ -3904,7 +3904,7 @@ fn read_comps(b: &[u8], p: &mut usize) -> Comps {
         // panicked on a truncated record.
         if *p >= b.len() { break }
         let ty = rv_varint(b, p);
-        if b.len().saturating_sub(*p) < 2 { break }
+        // The VarInt itself may consume all remaining bytes.
         if b.len().saturating_sub(*p) < 2 { break }
         let l = u16::from_be_bytes(b[*p..*p + 2].try_into().unwrap()) as usize; *p += 2;
         if b.len().saturating_sub(*p) < l { break }
@@ -3946,10 +3946,22 @@ fn unwrap_world_payload(raw: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     Ok(raw) // existing unwrapped v2.37 format
 }
 fn save_world() {
+    // save_world_into only builds the payload; the write happens here so the
+    // snapshot stays observational and there is exactly one disk path.
     let mut f = Vec::new();
     save_world_into(&mut f);
-    // The envelope lets load reject a torn or truncated write.
-    let _ = std::fs::write(WORLD_FILE, &wrap_world_payload(&f));
+    // The envelope lets load reject a torn or truncated write, and writing via a
+    // temporary file plus a retained backup means a failed write cannot destroy
+    // the previous save.
+    let framed = wrap_world_payload(&f);
+    let tmp = format!("{}.tmp", WORLD_FILE);
+    if std::fs::write(&tmp, &framed).is_err() { return }
+    if std::path::Path::new(WORLD_FILE).exists() {
+        let _ = std::fs::copy(WORLD_FILE, format!("{}.bak", WORLD_FILE));
+    }
+    if let Err(error) = std::fs::rename(&tmp, WORLD_FILE) {
+        eprintln!("[spine] world save rename failed: {error}");
+    }
 }
 fn save_world_into(f: &mut Vec<u8>) {
     let w = world().lock().unwrap();
@@ -4302,16 +4314,6 @@ fn save_world_into(f: &mut Vec<u8>) {
             let sb = sidebar_obj().lock().unwrap().clone().unwrap_or_default();
             (*f).extend_from_slice(&(sb.len() as u16).to_be_bytes());
             (*f).extend_from_slice(sb.as_bytes());
-        }
-    }
-    let tmp = format!("{}.tmp", WORLD_FILE);
-    let framed = wrap_world_payload(&f);
-    if std::fs::write(&tmp, &framed).is_ok() {
-        if std::path::Path::new(WORLD_FILE).exists() {
-            let _ = std::fs::copy(WORLD_FILE, format!("{}.bak", WORLD_FILE));
-        }
-        if let Err(error) = std::fs::rename(&tmp, WORLD_FILE) {
-            eprintln!("[spine] world save rename failed: {error}");
         }
     }
 }
