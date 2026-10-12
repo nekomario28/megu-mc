@@ -2015,9 +2015,14 @@ fn primed_tick() {
 
 fn furnace_tick() {
     let mut fs = furnaces().lock().unwrap();
+    if fs.is_empty() { return }
     let mut dirty_pos: Vec<(i32,i32,i32)> = Vec::new();
+    // One membership lock per tick, not one per furnace: is_warm re-locks the
+    // same mutex on every call, which dominated this stage.
+    let warm = warm().lock().unwrap();
+    let in_warm = |x: i32, z: i32| warm.contains(&(x.div_euclid(16), z.div_euclid(16)));
     for (pos, f) in fs.iter_mut() {
-        if !is_warm(pos.0, pos.2) { continue }
+        if !in_warm(pos.0, pos.2) { continue }
         // The recipe result is only ever read behind `input.1 > 0`, so an empty
         // input skips the lookup instead of hashing an item it cannot smelt.
         let out = if f.input.1 > 0 {
@@ -2051,6 +2056,7 @@ fn furnace_tick() {
         }
         if f.dirty { f.dirty = false; dirty_pos.push(*pos); }
     }
+    drop(warm);
     drop(fs);
     if dirty_pos.is_empty() { return }
     let cs: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };

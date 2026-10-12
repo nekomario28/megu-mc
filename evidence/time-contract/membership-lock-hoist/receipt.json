@@ -1,0 +1,22 @@
+{
+  "claim": "hoisting the warm membership lock out of the per-furnace loop is result-identical and faster on every measured fixture",
+  "cause": "is_warm locks a mutex on every call, so a loop over N furnaces took N locks per tick. Measured 5758us for 400 idle furnaces, about 14us each, which is lock cost rather than comparison cost.",
+  "equivalence": "the membership test is unchanged; only the number of lock acquisitions changes. Same div_euclid(16), same set.",
+  "measurement": "HEAD baseline, same fixtures, runner and release build, 3 processes each. Idle 400 furnaces: tick x1.16, furnace stage x1.60. Active furnaces: tick x1.17, stage x1.43. All other fixtures x0.99-1.03. Whole-process CPU 0.2722-0.2733s -> 0.2660-0.2696s.",
+  "regression_found_and_fixed": "without an early return the furnace-less fixtures regressed from 27us to 36us per tick (x0.78) because the lock was taken unconditionally. Measurement caught it.",
+  "near_miss": "a first attempt hoisted five loops at once and held the same mutex while still calling is_hot inside, which would deadlock on a non-reentrant mutex. Reverted and done one block at a time.",
+  "remaining": "20 call sites still lock per item, in crop growth, bobbers, pearls, xp, drops, arrows, primed tnt, mobs and plugin cells. Each needs the same treatment, one block at a time, verifying no re-entry.",
+  "measurement_limit": "this fixture only; not a whole-server or vanilla-comparison result",
+  "tests": "32 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "provenance_note": "results-before was measured before the air-supply commit, so it also differs in ['src/main.rs', 'src/tick_tests.rs']. Only src/main.rs differs between the two measurements, which is the change under test.",
+  "files_sha256": {
+    "README.md": "747dc1ad2952f6180f764aec48ce990444fe2502fb83da90719b53b59e98203c",
+    "build.log": "47cbc79fc033359e4e3a0a7dc136cdecc5690a78302d758ac30b59fd6635dac9",
+    "results-after.json": "7457afbeef8a1ffe0a47c601f2b5909b7bb87eb091442fad64ab37cc373daa25",
+    "results-before.json": "89bb5bd3f0d2451db2725d119eacdbc831bccea5031b15555bef79e4a9b5d971",
+    "warm-features.log": "1902a8eaa04fa6006191557a1a4d0bdf2c2ce34b2930079c86615e3338935107",
+    "warm-parallel.log": "a248980eeec8ce3d0bc8f50f73812ef5c8bfde609d0df8410734812362763383"
+  }
+}
