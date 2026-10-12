@@ -1,0 +1,21 @@
+{
+  "claim": "bucketing the drop merge by integer cell removes the O(n^2) pairwise scan while absorbing exactly the same drops",
+  "measurement": "same fixtures, runner and release build, 3 processes each. entity_heavy: tick 666976us -> 339037us (x1.97), drop stage 478372us -> 149337us (x3.20). entity_heavy_furnaces x1.94 and x3.19. The other six fixtures x0.99-1.00 tick and x0.96-1.00 drop stage. Whole-process CPU 1.7401-1.7457s -> 1.0227-1.0241s.",
+  "cause": "drop_tick merged same-item nearby drops with a nested loop over every pair, about 180000 pairs per tick at 600 drops",
+  "method": "bucket drops by integer cell. A pair within 0.5 blocks differs by at most one on each axis, so only the own cell and its 26 neighbours are candidates.",
+  "equivalence": "iterate i in original order, collect candidates from the 27-cell neighbourhood, filter to j > i, sort ascending, merge on the first match. Drops outside the neighbourhood would fail the distance test anyway, so the first match is unchanged.",
+  "rejected": "sorting the drops then comparing neighbours changes which drop is absorbed, so it is not equivalent",
+  "reordering": "the cheap item and distance tests now run before the component-blob Vec comparison. All conditions are conjunctions, so the result is unchanged.",
+  "real_bug_fixed": "cx + dx overflowed the i32 limit and panicked. floor() saturates on out-of-range coordinates, so a drop at the world edge could trigger this in production. Now checked_add; wrapping was rejected because it aliases cell keys and could merge unrelated drops.",
+  "tests": "34 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "equivalence_test": "a verbatim copy of the original pairwise scan is compared against production across 9 scenarios: coincident drops, x and y integer-boundary straddles, mixed items and components, stack cap rejection, age-based survivor selection, far-apart non-merge, chains, and deterministic scatter",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "remaining": "entity_heavy is still 339ms per tick with the drop stage at 149ms. The bucket is O(n x neighbourhood), so 600 drops concentrated in a small area still pay a large neighbourhood. This target is spatially spread load, not a pile.",
+  "files_sha256": {
+    "README.md": "d7890dce8fe0654bca81950490f98da8ad75976362dc3f124b61b1e4750f28be",
+    "build.log": "40298fd7d73e876d650026b1941b2c783e455914ac2a2354058a0f35805d4e18",
+    "results-after.json": "158081cd90a68d6d55202f3d38399c83421b5a391b335d26437bdf561f4f9568",
+    "results-before.json": "a898a4282dc03dd0459cb645fba05a6a5a8ae6151fbcaeb9fab7e5a098f76caa"
+  }
+}

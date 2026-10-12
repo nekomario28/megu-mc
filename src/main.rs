@@ -2557,12 +2557,37 @@ fn drop_tick() {
         // vanilla merges same-item drops within ~0.5 blocks into one
         // stack (fits <=64); the merged entity keeps the fresher age
         let mut merged: Vec<i32> = Vec::new();
+        // Bucket drops by integer cell. A pair within 0.5 blocks differs by at
+        // most one on each axis, so only the own cell and its 26 neighbours can
+        // satisfy the distance test. Iterating i in order and candidates in
+        // ascending index order keeps the first match identical to scanning
+        // every pair, so which drop is absorbed does not change.
+        let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        for (idx, d) in dp.iter().enumerate() {
+            cells.entry((d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32)).or_default().push(idx);
+        }
         for i in 0..dp.len() {
-            for j in (i + 1)..dp.len() {
+            let (cx, cy, cz) = (dp[i].x.floor() as i32, dp[i].y.floor() as i32, dp[i].z.floor() as i32);
+            let mut candidates: Vec<usize> = Vec::new();
+            // checked arithmetic: a drop whose cell is at the i32 limit has no
+            // neighbour there, and wrapping would invent a cell that aliases.
+            for dx in -1..=1i32 { for dy in -1..=1i32 { for dz in -1..=1i32 {
+                let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
+                if let (Some(kx), Some(ky), Some(kz)) = key {
+                    if let Some(bucket) = cells.get(&(kx, ky, kz)) {
+                        candidates.extend(bucket.iter().copied().filter(|j| *j > i));
+                    }
+                }
+            }}}
+            candidates.sort_unstable();
+            for j in candidates {
                 let (ax, ay, az, ait, acnt, aage) = { let a = &dp[i]; (a.x, a.y, a.z, a.item, a.cnt, a.age) };
                 let (bx, by, bz, bit, bcnt, bage) = { let b = &dp[j]; (b.x, b.y, b.z, b.item, b.cnt, b.age) };
-                if ait == bit && dp[i].comps == dp[j].comps
+                // Cheap integer and distance tests first; the component blobs
+                // are a Vec comparison, so they run only for a real candidate.
+                if ait == bit
                     && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
+                    && dp[i].comps == dp[j].comps
                     && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16 {
                     let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
                     dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
@@ -13520,5 +13545,7 @@ mod furnace_cache_tests;
 mod effect_tests;
 #[cfg(test)]
 mod tick_tests;
+#[cfg(test)]
+mod merge_tests;
 #[cfg(test)]
 mod persistence_tests;
