@@ -1381,6 +1381,7 @@ fn every_ms(cell: &'static OnceLock<Mutex<Instant>>, period: u64, body: impl FnO
     if fire { body(); }
 }
 static TICK: AtomicU64 = AtomicU64::new(0);
+static SPAWN_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 static WORLD_TIME: AtomicU64 = AtomicU64::new(1000); // morning
 static BOLTS: OnceLock<Mutex<Vec<(i32, i32)>>> = OnceLock::new(); // (eid, ticks-left) transient lightning visuals
 fn bolts() -> &'static Mutex<Vec<(i32, i32)>> { BOLTS.get_or_init(|| Mutex::new(Vec::new())) }
@@ -1651,13 +1652,16 @@ fn keepalive_time_tick() {
         let mcount = mobs().lock().unwrap().iter().filter(|m| matches!(m.etype, 124 | 23 | 91 | 100)).count();
         let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
         if mcount < 12 && !cls.is_empty() {
-            let idx = (t / 40) as usize;
-            if let Some(c) = cls.get(idx % cls.len()) {
+            // The spawn attempt count, not the world tick, drives the rotation.
+            // Deriving it from t made the cadence change collapse the choice to a
+            // single etype: at 20TPS every attempt lands on the same t/40 residue.
+            let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+            if let Some(c) = cls.get(attempt as usize % cls.len()) {
                 let (px, _py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
                 let ang = (t as f64) * 2.399;
                 let (nx, nz) = (px + ang.cos() * 14.0, pz + ang.sin() * 14.0);
                 let ny = surface_y(nx.round() as i32, nz.round() as i32);
-                let et = match (t / 40) % 5 { 0 => 23, 1 => 91, 2 => 100, _ => 124 };
+                let et = match attempt % 5 { 0 => 23, 1 => 91, 2 => 100, _ => 124 };
                 let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                     etype: et, pos: Mutex::new((nx, ny, nz, 0.0, 0.0)), hp: Mutex::new(20.0),
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)), fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
@@ -3994,7 +3998,10 @@ fn save_world_into(f: &mut Vec<u8>) {
                 write_varint(&mut *f, d.item);
                 (*f).push(d.cnt);
                 write_comps(&mut *f, &d.comps);
-                drop_ages.push(d.age as u32); // server ticks
+                // `as u32` is already a bit-preserving two's complement cast, so a
+                // negative pickup-delay marker round-trips; only the load-side
+                // clamp used to destroy it.
+                drop_ages.push(d.age as u32); // server ticks, signed
             }
         }
         // furnaces are block entities — contents and smelting state are
@@ -4463,7 +4470,9 @@ fn load_world_from(payload: &[u8]) {
                 if p + 4 > payload.len() { break }
                 let raw = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
                 let aticks = if legacy_ms_ages { raw / TICK_MS as u32 } else { raw };
-                d.age = aticks.min(server_ticks(DROP_LIFE_GT) as u32) as i32;
+                // Reinterpret as signed so a negative pickup-delay marker survives
+                // instead of wrapping to a value that clamps to a full lifespan.
+                d.age = aticks as i32;
             }
         }
         if p < payload.len() {

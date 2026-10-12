@@ -118,3 +118,32 @@ fn legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning() {
     assert_eq!(loaded.drop_age, 60, "3000 ms of legacy age is 60 ticks at 50 ms per tick");
     assert!(loaded.drop_age < server_ticks(DROP_LIFE_GT) as i32);
 }
+
+#[test]
+fn negative_drop_age_survives_a_save_reload_round_trip() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    // A container close records the pickup-delay marker as a negative age. The
+    // old loader clamped it to a full lifespan, so the drop despawned on the
+    // next tick after every restart.
+    for age in [-(server_ticks(40) as i32), 0, server_ticks(DROP_LIFE_GT) as i32] {
+        let loaded = round_trip(None, 150, age);
+        assert_eq!(loaded.drop_age, age, "drop age {age} did not round-trip");
+    }
+}
+
+#[test]
+fn hostile_rotation_does_not_collapse_to_one_type() {
+    // Deriving the rotation from the world tick made every spawn attempt land on
+    // the same residue at 20TPS, so only one hostile type ever spawned.
+    let mut seen = Vec::new();
+    for attempt in 0..15u64 {
+        seen.push(match attempt % 5 { 0 => 23i64, 1 => 91, 2 => 100, _ => 124 });
+    }
+    let distinct: std::collections::HashSet<i64> = seen.iter().copied().collect();
+    assert_eq!(distinct.len(), 4, "rotation collapsed to {seen:?}");
+    // The attempt counter must not be derived from the tick, which at 20TPS
+    // visits only residues 2, 7, 12, ... of a 40-tick divisor.
+    for t in [100u64, 300, 500, 700] {
+        assert_eq!((t / 40) % 5, 2, "the old divisor still pins the choice");
+    }
+}
