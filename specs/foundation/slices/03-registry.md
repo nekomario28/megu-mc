@@ -1,5 +1,25 @@
 # 03 — Block/Item registry と content revision
 
+Status: 設計のみ。着手前の制約を2件確認した（下記）。
+
+## 実装前に確認した制約
+
+**1. `CachedLookup` は `Copy` な値しか扱えない。**
+
+```rust
+pub(crate) fn get_or_compute(&mut self, key: K, compute: impl FnOnce() -> V) -> V {
+    if let Some((stored_key, value)) = &self.entry {
+        if stored_key == &key { return *value; }   // ← V: Copy が要る
+```
+
+炉のキャッシュを `Option<Stack>` にすると `Stack` は `Vec` を持つので通らない。
+選択肢：(a) `CachedLookup` を `Clone` 対応にする（SeedProtect側と共有）、
+(b) `Comps` を含まない `Copy` な射影だけをキャッシュする。
+**(a) は共有コードの変更**なので、影響を確認してから決める。
+
+**2. 可変表を読む箇所は12。** revision の消費者としては十分
+（「消費者が2つ以上」の条件を満たす）。
+
 ## Why
 
 ### 1つのブロックの知識が5つ以上の表に散っている
