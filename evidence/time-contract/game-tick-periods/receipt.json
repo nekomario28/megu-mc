@@ -1,0 +1,19 @@
+{
+  "claim": "damage/healing/elytra/contact intervals derived from the cadence owner with identical values and real-time intervals at 4TPS; NOT 20TPS",
+  "negative_control": "server_tick_period kept the game-tick number instead of dividing: interval property test fails (10 game ticks spanned 1000ms)",
+  "interval_property": "period * TICK_MS == game_ticks * 50 for 10/20/40/80/100 game ticks",
+  "zero_guard": "a period below one server tick collapses to 1, so the modulo cannot divide by zero at a faster cadence",
+  "sites_converted": "player elytra/regen/drowning/lava/fire/void/suffocation/cactus/magma/berries, mob suffocation and drowning",
+  "tests": "24 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "independent review found no actionable defect; reviewer did not run tests",
+  "measurement": "same profiler and fixtures as previous slices; regression detection only, not a performance claim",
+  "files_sha256": {
+    "results.json": "c4fc9213406a59a24b041ad6979524fca116a45e5af8bff4981672c9c89f3ccd",
+    "time-contract-periods-features.log": "11a984d15598045a9c98b88fd799ca600e22a988431f58564f7d292b3a16083a",
+    "time-contract-periods-negative.log": "01015a84236fce5efbbfef59822969b986f8f7ce03387ce9fe106abf7450cb93",
+    "time-contract-periods-parallel.log": "0951a7288e58a44faf813561e69a2e5ade1059fa9df87f360ea0a0ad82f61a9d",
+    "time-contract-periods-review.log": "970aa1e20fa032fd0c3389570d573153862d474c0deaf9718e9bed591913cadc",
+    "time-contract-periods-suite.log": "970824692640274c76c26ce1532ceaf55eced35c33d7f0998df9fadb16a3af57"
+  }
+}

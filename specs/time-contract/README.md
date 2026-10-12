@@ -15,9 +15,11 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 [本番tick計測](slices/03-tick-baseline.md) を追加し、[切替前の限定fixture測定](../../evidence/time-contract/tick-baseline/README.md) を実行した。
 [hot/warm集合構築](slices/04-region-expansion.md) の等価変形も適用・検証した。
 [時間語の単一所有者](slices/05-cadence-owner.md) で `TICK_MS` から全境界を導出した。
+[実時間境界](slices/06-wall-clock.md) のkeepalive/通知と、[ゲーム時間周期](slices/07-game-tick-periods.md)
+のダメージ間隔も同じ所有者から導出した。
 [限定fixtureのA/Bと限界](../../evidence/time-contract/region-expansion/README.md) を読む。
-ここで性能最適化を広げず、次は未接続の実時間境界・移動係数・MET4保存・遅延時方針を
-同じ所有者から導出し、整合した20TPS切替sliceを作る。
+ここで性能最適化を広げず、次は保存tick語・1tickあたり割合・実時間→game tick・
+MET4永続化を同じ契約へ接続し、20TPS切替を一つの不可分な変更にする。
 独立レビューで共有fixtureの並行実行競合も修正した。世界fixtureを追加するテストは
 setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 移動/衝突、保存の単位、遅延時の方針を未決定のまま時計を変えてはいけない。
@@ -32,6 +34,8 @@ setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 - [x] 切替前の本番tick経路を限定fixtureで測定（4TPS時間語・sleepなし。全サーバー性能ではない）。
 - [x] hot/warm集合を変えず重複挿入を削減。全負荷での速度改善は未証明。
 - [x] tick周期を `TICK_MS` の単一所有者にし、世界時刻・効果wire・秒変換を導出化。周期は不変。
+- [x] keepalive等の実時間境界を `every_ms` へ接続。keepaliveはvanillaの15000msに修正。
+- [x] 環境ダメージ/回復の周期を `server_tick_period` から導出。値と実時間間隔は不変。
 - [ ] 同条件20TPSでCPU/RSS/tick遅延を測り、費用の大きい箇所だけ最適化。
 
 後続項目はまだ実装可能なsliceに確定していない。着手前に状態の所有者・入力・
@@ -39,10 +43,10 @@ setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 
 ## 現在の検証
 
-トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも22 passed・1 ignored。
+トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも24 passed・1 ignored。
 ignoredは専用runnerで前後各3プロセス実行したrelease計測用fixture。
 tickの炉stage欠落・ringの半径誤り・世界時刻の加算・効果wireの周期導出は
-それぞれ負の対照で検出した。共有fixture競合も
+それぞれ負の対照で検出した。keepaliveのtick除算とダメージ周期の換算忘れも検出した。共有fixture競合も
 再現して修正し、対象テストの8thread実行を20回反復した。
 通常発動の吸収0、救命後の旧空腹効果の実行、期限切れ後に残る吸収をそれぞれ再現した。
 Fabric/NeoForge機能付きcargo checkも合格。各パスの最終独立Codexレビューは指摘なし

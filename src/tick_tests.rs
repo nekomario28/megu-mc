@@ -205,6 +205,24 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
 }
 
 #[test]
+fn game_tick_periods_preserve_the_vanilla_real_time_interval() {
+    // The property that must survive a cadence change: a vanilla interval of N
+    // game ticks is N * 50ms, so period * TICK_MS must equal that exactly.
+    for game_ticks in [10, 20, 40, 80, 100] {
+        assert_eq!(server_tick_period(game_ticks) * TICK_MS, game_ticks * 50,
+            "game-tick period {game_ticks} no longer spans {}ms", game_ticks * 50);
+    }
+    // At the current cadence these are exactly the counts that used to be literal.
+    assert_eq!(server_tick_period(10), 2); // lava, void, suffocation, contact
+    assert_eq!(server_tick_period(20), 4); // fire, drowning, elytra, cactus, berries
+    assert_eq!(server_tick_period(80), 16); // slow natural regeneration
+    // A period below one server tick must never collapse to zero, which would
+    // make the modulo divide by zero at a faster cadence.
+    assert_eq!(server_tick_period(0), 1);
+    assert_eq!(server_tick_period(1), 1);
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
