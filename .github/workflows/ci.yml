@@ -1,0 +1,31 @@
+name: Rust regression checks
+
+on:
+  push:
+    branches:
+      - main
+      - 'fix/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (locked)
+        run: cargo build --locked
+      - name: Unit and regression tests (locked, serialized)
+        run: cargo test --locked -- --test-threads=1
+      - name: Bounded localhost network smoke
+        run: python3 tests/wire_smoke.py target/debug/mc-spine
+      - name: Check Java adapter feature compilation
+        run: |
+          cargo check --locked --features fabric-probe
+          cargo check --locked --features neoforge-events
