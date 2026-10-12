@@ -316,6 +316,61 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
 }
 
 #[test]
+fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let old_xps = std::mem::take(&mut *xps().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let old_hot = hot().lock().unwrap().clone();
+    let old_warm = warm().lock().unwrap().clone();
+    // Pin the vanilla game-tick values, not just their 4TPS projection.
+    assert_eq!(PICKUP_DELAY_GT, 10);
+    assert_eq!(DROP_LIFE_GT, 6000);
+    assert_eq!(XP_LIFE_GT, 6000);
+    assert_eq!(server_ticks(PICKUP_DELAY_GT) * TICK_MS, 500);
+    assert_eq!(server_ticks(DROP_LIFE_GT) * TICK_MS, 300_000);
+    forceloaded().lock().unwrap().insert((0, 0));
+    drops().lock().unwrap().push(Drop { eid: 9101, x: 0.5, y: 70.0, z: 0.5, item: 1, cnt: 1, comps: Vec::new(), age: 0 });
+    xps().lock().unwrap().push(Xp { eid: 9102, x: 0.5, y: 70.0, z: 0.5, val: 1, age: 0 });
+    // A drop far outside the hot set must not age, so an unloaded world keeps it.
+    drops().lock().unwrap().push(Drop { eid: 9103, x: 30_000_000.0, y: 70.0, z: 30_000_000.0, item: 1, cnt: 1, comps: Vec::new(), age: 0 });
+    for _ in 0..5 { game_tick(|_, tick| tick()); }
+    let hot_age = drops().lock().unwrap().iter().find(|d| d.eid == 9101).map(|d| d.age);
+    let cold_age = drops().lock().unwrap().iter().find(|d| d.eid == 9103).map(|d| d.age);
+    let xp_age = xps().lock().unwrap().iter().find(|x| x.eid == 9102).map(|x| x.age);
+    // A drop past its lifespan must be removed by the despawn pass.
+    let life = server_ticks(DROP_LIFE_GT) as i32;
+    drops().lock().unwrap().iter_mut().find(|d| d.eid == 9101).unwrap().age = life;
+    for _ in 0..2 { game_tick(|_, tick| tick()); }
+    let expired = drops().lock().unwrap().iter().all(|d| d.eid != 9101);
+    // Pickup must stay blocked until the delay has elapsed in ticks. Use a hot
+    // drop: 9103 is deliberately outside the hot set and therefore never ages.
+    drops().lock().unwrap().push(Drop { eid: 9104, x: 0.5, y: 70.0, z: 0.5, item: 1, cnt: 1, comps: Vec::new(), age: 0 });
+    let mut pickup_ready_at = None;
+    for step in 1..=8 {
+        game_tick(|_, tick| tick());
+        let d = drops().lock().unwrap().iter().find(|d| d.eid == 9104).map(|d| d.age).unwrap_or(0);
+        if d >= server_ticks(PICKUP_DELAY_GT) as i32 { pickup_ready_at = Some(step); break; }
+    }
+    *drops().lock().unwrap() = old_drops;
+    *xps().lock().unwrap() = old_xps;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    *hot().lock().unwrap() = old_hot;
+    *warm().lock().unwrap() = old_warm;
+    assert_eq!(hot_age, Some(5), "a hot drop must age once per tick");
+    // XP aging runs in the environment stage, which precedes refresh_hot, so it
+    // observes the previous tick hot set and trails the drop pass by one tick.
+    assert_eq!(xp_age, Some(4), "a hot xp orb must age once per tick, one stage late");
+    assert_eq!(cold_age, Some(0), "a cold drop must not age");
+    assert!(expired, "a drop past its lifespan must be removed");
+    assert_eq!(pickup_ready_at, Some(2), "the 0.5s pickup delay is 2 server ticks");
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();

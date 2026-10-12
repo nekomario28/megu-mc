@@ -1,0 +1,19 @@
+{
+  "claim": "drop and xp orb age plus pickup delay moved from wall clock to server-tick counters with identical 0.5s and 300s timings; cold entities no longer age; NOT 20TPS",
+  "vanilla_values": "pickupDelay 10 game ticks; ItemEntity and ExperienceOrb lifespan 6000 game ticks (300s)",
+  "persistence": "stored as tick counts directly; legacy elapsed-milliseconds input is divided by ms-per-tick",
+  "negative_controls": "all 5 detected: pickup 10->15, drop life 6000->6100, cold drops age, drops never age, xp never age",
+  "pre_existing_asymmetry": "xp aging runs in the environment stage before refresh_hot while drop aging runs after it, so xp trails by one tick at region boundaries. Not introduced here; pinned by the test as Some(4).",
+  "tests": "28 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "remaining": "hurt invulnerability 500ms. Vanilla uses invulnerableTime 20 with a >10 residual rejection rule, which is a different model from the current flat cooldown that also gates environmental damage. Adopting it changes consecutive-damage, shield and effect outcomes.",
+  "files_sha256": {
+    "README.md": "6d513a30a3c93ddb1a09a90f57fc2c936a5dadd7dd1379cbc19bf623fcc44daa",
+    "review-attempt.log": "48cc911efaf00473a0065aebc4e4a417011f7f79d8e83ae6af00f363c33194e5",
+    "time-contract-life-features.log": "042e79d007da747628646b1970258ef62a2a0c3cfcffbbc662e89f3991e643ba",
+    "time-contract-life-negative.log": "9d624f37b68b70edeabd46992d3b840dd5e5f3ae8a671eef74c9f8fcfeac7f94",
+    "time-contract-life-parallel.log": "88861db33d307f154b0c0970f8540fdbbedbe82d50f5cbd90542370d3bce37c3",
+    "time-contract-life-suite.log": "e1f4c3f0e4d06ccfde76e73606276c61dc5583b45431698e2c73c8502a06ca14"
+  }
+}

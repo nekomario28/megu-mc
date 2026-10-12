@@ -310,7 +310,7 @@ fn interest_tick() {
     for d in drops().lock().unwrap().iter() {
         let (eid, x, y, z, item, cnt, comps) = (d.eid, d.x, d.y, d.z, d.item, d.cnt, d.comps.clone());
         ents.push((eid, x, y, z, Box::new(move || {
-            let d = Drop { eid, x, y, z, item, cnt, comps: comps.clone(), age: Instant::now() };
+            let d = Drop { eid, x, y, z, item, cnt, comps: comps.clone(), age: 0 };
             vec![(0x01, spawn_drop_pkt(&d)), (0x58, drop_meta_pkt(&d))]
         })));
     }
@@ -450,7 +450,9 @@ fn spawn_typed_pkt(eid: i32, etype: i64, x: f64, y: f64, z: f64) -> Vec<u8> {
 }
 
 // ---------- xp orbs ----------
-struct Xp { eid: i32, x: f64, y: f64, z: f64, val: i16, age: Instant }
+// age: server ticks since spawn. Vanilla counts entity age in game ticks, so a
+// despawn window cannot shift when a loaded world is ticked under lag.
+struct Xp { eid: i32, x: f64, y: f64, z: f64, val: i16, age: i32 }
 static XPS: OnceLock<Mutex<Vec<Xp>>> = OnceLock::new();
 fn xps() -> &'static Mutex<Vec<Xp>> { XPS.get_or_init(|| Mutex::new(Vec::new())) }
 
@@ -916,7 +918,7 @@ fn read_varint_at(b: &[u8], p: usize) -> (i64, usize) {
         i += 1;
     }
 }
-struct Drop { eid: i32, x: f64, y: f64, z: f64, item: i64, cnt: u8, comps: Comps, age: Instant }
+struct Drop { eid: i32, x: f64, y: f64, z: f64, item: i64, cnt: u8, comps: Comps, age: i32 }
 static DROPS: OnceLock<Mutex<Vec<Drop>>> = OnceLock::new();
 fn drops() -> &'static Mutex<Vec<Drop>> { DROPS.get_or_init(|| Mutex::new(Vec::new())) }
 
@@ -1013,11 +1015,11 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
     let was_sheared = sheared().lock().unwrap().remove(&deid);
     for (item, cnt, comps) in mob_loot(etype, burning).into_iter().filter(|st| !(was_sheared && st.0 == 202))
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: Instant::now() };
+        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 };
         drops().lock().unwrap().push(d);
     }
     let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    xps().lock().unwrap().push(Xp { eid: xeid, x: mx, y: my, z: mz, val: mob_xp(etype), age: Instant::now() });
+    xps().lock().unwrap().push(Xp { eid: xeid, x: mx, y: my, z: mz, val: mob_xp(etype), age: 0 });
     // spawn streams via interest_tick
 }
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
@@ -1050,7 +1052,7 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
     broadcast_seen_destroy(deid);
     sheared().lock().unwrap().remove(&deid);
     for (item, cnt, comps) in mob_loot(etype, burning).into_iter().filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-        drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: Instant::now() });
+        drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 });
     }
 }
 static LOOT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1326,6 +1328,9 @@ const CREEPER_FUSE_GT: u64 = 100;    // 5s
 const BOBBER_PACKET_GT: u64 = 15;    // 0.75s
 const BOLT_LIFE_GT: u64 = 10;        // 0.5s visual
 const TNT_FUSE_GT: u64 = 80;         // 4s, TntBlock fuse
+const PICKUP_DELAY_GT: u64 = 10;     // 0.5s, ItemEntity pickupDelay
+const DROP_LIFE_GT: u64 = 6000;       // 300s, ItemEntity lifespan
+const XP_LIFE_GT: u64 = 6000;         // 300s, ExperienceOrb lifespan
 /// chain
 const fn chain_fuse_left(jitter: u64) -> u64 { server_ticks(10 + if jitter > 20 { 20 } else { jitter }) }
 // Wall-clock owners. Vanilla defines these in real time, not in game ticks, so
@@ -1732,10 +1737,12 @@ fn keepalive_time_tick() {
             }
         }
     }
-    { // despawn xp orbs after 5 min — plus the same hard cap as drops:
+    { // despawn xp orbs after 300s — plus the same hard cap as drops:
         // a farm can out-spawn the despawn window.
         let mut xl = xps().lock().unwrap();
-        let exp: Vec<i32> = xl.iter().filter(|x| x.age.elapsed() > Duration::from_secs(300) && is_hot(x.x as i32, x.z as i32)).map(|x| x.eid).collect();
+        let life = server_ticks(XP_LIFE_GT) as i32;
+        for x in xl.iter_mut() { if is_hot(x.x as i32, x.z as i32) { x.age += 1; } }
+        let exp: Vec<i32> = xl.iter().filter(|x| x.age >= life && is_hot(x.x as i32, x.z as i32)).map(|x| x.eid).collect();
         for eid in &exp {
             xl.retain(|x| x.eid != *eid);
             broadcast_seen_destroy(*eid);
@@ -1912,7 +1919,7 @@ fn arrow_tick() {
                     .unwrap_or((lx, ly, lz))
             } else { (lx, ly, lz) };
             drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                x: tx, y: ty, z: tz, item: ri, cnt: 1, comps: rc, age: Instant::now() });
+                x: tx, y: ty, z: tz, item: ri, cnt: 1, comps: rc, age: 0 });
         }
     }
     for (deid, etype, mx, my, mz) in mob_dead { kill_mob(deid, etype, mx, my, mz); }
@@ -2137,7 +2144,7 @@ fn actor_tick() {
                     let st = block_at(tx, ty, tz);
                     if st != 0 {
                         if let Some(it) = state_to_item(st) {
-                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: tx as f64 + 0.5, y: ty as f64 + 0.4, z: tz as f64 + 0.5, item: it, cnt: 1, comps: Vec::new(), age: Instant::now() };
+                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: tx as f64 + 0.5, y: ty as f64 + 0.4, z: tz as f64 + 0.5, item: it, cnt: 1, comps: Vec::new(), age: 0 };
                                                         drops().lock().unwrap().push(d);
                             // spawn streams via interest_tick
                         }
@@ -2170,7 +2177,7 @@ fn actor_tick() {
             let mut shrunk: Vec<(i32, Vec<u8>)> = vec![];
             for d in ds.iter_mut() {
                 // vanilla: freshly spawned/thrown drops can't be picked up for ~10 ticks
-                if d.age.elapsed() < Duration::from_millis(500) { continue }
+                if d.age < server_ticks(PICKUP_DELAY_GT) as i32 { continue }
                 if (d.x - ax).powi(2) + (d.y - ay).powi(2) + (d.z - az).powi(2) < 2.25 {
                     // vanilla takes the whole stack; a mergeable slot is
                     // filled to 64 and the entity keeps the remainder
@@ -2205,7 +2212,7 @@ fn wash_away(x: i32, y: i32, z: i32) {
     if !water_washable(st) { return }
     if let Some(item) = state_to_item(st) {
         let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x: x as f64 + 0.5, y: y as f64 + 0.4, z: z as f64 + 0.5, item, cnt: 1, comps: Vec::new(), age: Instant::now() };
+            x: x as f64 + 0.5, y: y as f64 + 0.4, z: z as f64 + 0.5, item, cnt: 1, comps: Vec::new(), age: 0 };
         drops().lock().unwrap().push(d);
     }
 }
@@ -2522,10 +2529,12 @@ fn drop_tick() {
             }
         }
     }
-    { // despawn drops after 5 min (vanilla); a hard cap bounds the flood
+    { // despawn drops after 300s (vanilla); a hard cap bounds the flood
         // inside any one despawn window — oldest lose first.
         let mut dp = drops().lock().unwrap();
-        let exp: Vec<i32> = dp.iter().filter(|d| d.age.elapsed() > Duration::from_secs(300)).map(|d| d.eid).collect();
+        let life = server_ticks(DROP_LIFE_GT) as i32;
+        for d in dp.iter_mut() { if is_hot(d.x as i32, d.z as i32) { d.age += 1; } }
+        let exp: Vec<i32> = dp.iter().filter(|d| d.age >= life).map(|d| d.eid).collect();
         for eid in &exp {
             dp.retain(|d| d.eid != *eid);
             broadcast_seen_destroy(*eid);
@@ -2640,7 +2649,7 @@ fn mob_tick() {
                         mobs().lock().unwrap().retain(|x| x.eid != m.eid);
                         broadcast_seen_destroy(m.eid);
                         for (item, cnt, comps) in mob_loot(m.etype, true).into_iter().filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: Instant::now() };
+                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 };
                             drops().lock().unwrap().push(d);
                         }
                     }
@@ -2754,7 +2763,7 @@ fn mob_tick() {
                     if mobs().lock().unwrap().len() >= MOB_CAP { continue }
                     mobs().lock().unwrap().push(baby);
                     let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                        xps().lock().unwrap().push(Xp { eid: xeid, x: bx, y: by, z: bz, val: (1 + rand_u64() % 7) as i16, age: Instant::now() });
+                                        xps().lock().unwrap().push(Xp { eid: xeid, x: bx, y: by, z: bz, val: (1 + rand_u64() % 7) as i16, age: 0 });
                     // spawn streams via interest_tick
                     continue;
                 }
@@ -2874,7 +2883,7 @@ fn mob_tick() {
                                                 broadcast_seen_destroy(m.eid);
                                                 let mburn = *m.fuse.lock().unwrap() > 0;
                                                 for (item, cnt, comps) in mob_loot(m.etype, mburn).into_iter().filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-                                                    drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: Instant::now() });
+                                                    drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 });
                                                 }
                                             }
                                         }
@@ -2986,7 +2995,7 @@ fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
     f.xp = 0.0;
     if whole > 0 {
         xps().lock().unwrap().push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x: px, y: py + 1.0, z: pz, val: whole, age: Instant::now() });
+            x: px, y: py + 1.0, z: pz, val: whole, age: 0 });
     }
 }
 fn fuel_ticks(item: i64) -> i32 {
@@ -3526,7 +3535,7 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
             for (item, cnt, comps) in spill {
                 ds.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     x: x as f64 + 0.5, y: y as f64 + 0.5, z: z as f64 + 0.5,
-                    item, cnt, comps, age: Instant::now() });
+                    item, cnt, comps, age: 0 });
             }
         }
         disp_power().lock().unwrap().remove(&(x, y, z));
@@ -3923,7 +3932,7 @@ fn save_world() {
                 write_varint(&mut f, d.item);
                 f.push(d.cnt);
                 write_comps(&mut f, &d.comps);
-                drop_ages.push(d.age.elapsed().as_millis() as u32);
+                drop_ages.push(d.age as u32);
             }
         }
         // furnaces are block entities — contents and smelting state are
@@ -3975,7 +3984,7 @@ fn save_world() {
                 f.extend_from_slice(&x.y.to_be_bytes());
                 f.extend_from_slice(&x.z.to_be_bytes());
                 f.extend_from_slice(&x.val.to_be_bytes());
-                f.extend_from_slice(&(x.age.elapsed().as_millis() as u32).to_be_bytes());
+                f.extend_from_slice(&x.age.to_be_bytes());
             }
         }
         // drop despawn-budget residue: elapsed ms per drop, by order
@@ -3993,7 +4002,7 @@ fn save_world() {
                 let mut ds = drops().lock().unwrap();
                 for (x, y, z, ri, rc) in tri {
                     ds.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x, y, z, item: ri, cnt: 1, comps: rc, age: Instant::now() });
+                        x, y, z, item: ri, cnt: 1, comps: rc, age: 0 });
                 }
             }
             let ar = arrows().lock().unwrap();
@@ -4298,7 +4307,7 @@ fn load_world() {
                 if eid >= NEXT_EID.load(Ordering::Relaxed) {
                     NEXT_EID.store(eid + 1, Ordering::SeqCst);
                 }
-                ds.push(Drop { eid, x, y, z, item, cnt, comps, age: Instant::now() });
+                ds.push(Drop { eid, x, y, z, item, cnt, comps, age: 0 });
             }
         }
         if p < b.len() {
@@ -4366,7 +4375,7 @@ fn load_world() {
                 let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
                 let val = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
                 let ams = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                xs.push(Xp { eid, x, y, z, val, age: Instant::now() - Duration::from_millis(ams.min(59000) as u64) });
+                xs.push(Xp { eid, x, y, z, val, age: (u64::from(ams) / u64::from(1000 / TICKS_PER_SECOND)).min(server_ticks(XP_LIFE_GT)) as i32 });
                 if eid > mx { mx = eid; }
             }
             if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
@@ -4378,7 +4387,7 @@ fn load_world() {
             for d in ds.iter_mut() {
                 if p + 4 > b.len() { break }
                 let ams = u32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64; p += 4;
-                d.age = Instant::now() - Duration::from_millis(ams.min(59000) as u64);
+                d.age = (ams / u64::from(1000 / TICKS_PER_SECOND)).min(server_ticks(DROP_LIFE_GT)) as i32;
             }
         }
         if p < b.len() {
@@ -10091,7 +10100,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 let n = items.len();
                 for (item, cnt, ic) in items {
                     drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x: lx, y: ly, z: lz, item, cnt, comps: ic, age: Instant::now() });
+                        x: lx, y: ly, z: lz, item, cnt, comps: ic, age: 0 });
                 }
                 format!("Dropped {} item stack(s)", n)
             } else { "usage: /loot spawn x y z loot <table>|kill <entity>".into() }
@@ -11202,7 +11211,7 @@ fn handle(mut s: TcpStream) {
                         if let Some((item, cnt, comps)) = it {
                             let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
                             drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: px, y: py + 1.3, z: pz, item, cnt, comps, age: Instant::now() });
+                                x: px, y: py + 1.3, z: pz, item, cnt, comps, age: 0 });
                             {   let mut p = vec![0u8]; write_varint(&mut p, 0);
                                 p.extend_from_slice(&hs.to_be_bytes());
                                 let now = me.inv.lock().unwrap().get(&hs).cloned().unwrap_or((0,0,Vec::new()));
@@ -11291,12 +11300,12 @@ fn handle(mut s: TcpStream) {
                     crops().lock().unwrap().remove(&(x, y, z));
                     if old == 4285 { // ripe: extra wheat drop
                         let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                            x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item: 854, cnt: 1, comps: Vec::new(), age: Instant::now() };
+                            x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item: 854, cnt: 1, comps: Vec::new(), age: 0 };
                         drops().lock().unwrap().push(d);
                     }
                     if let Some(item) = if needs_pickaxe(old as i64) && harvest_level(&held) < harvest_level_required(old as i64) { None } else { drop_item } {
                         let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                            x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item, cnt: drop_cnt, comps: Vec::new(), age: Instant::now() };
+                            x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item, cnt: drop_cnt, comps: Vec::new(), age: 0 };
                         drops().lock().unwrap().push(d);
                     }
                     }
@@ -11650,7 +11659,7 @@ fn handle(mut s: TcpStream) {
                             let n = 1 + ((target as u64).wrapping_mul(2654435761) % 3) as u8;
                             for _ in 0..n {
                                 let deid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                let d = Drop { eid: deid, x: mx, y: my + 0.5, z: mz, item: 202, cnt: 1, comps: Vec::new(), age: Instant::now() };
+                                let d = Drop { eid: deid, x: mx, y: my + 0.5, z: mz, item: 202, cnt: 1, comps: Vec::new(), age: 0 };
                                 drops().lock().unwrap().push(d);
                             }
                             continue;
@@ -11912,11 +11921,11 @@ fn handle(mut s: TcpStream) {
                         for (item, cnt, comps) in mob_loot(etype, burn_kill).into_iter().filter(|st| !(was_sheared && st.0 == 202))
                             .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
                             let extra = if loot > 0 { (rand_u64() % (loot + 1)) as u8 } else { 0 };
-                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt: cnt + extra, comps, age: Instant::now() };
+                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt: cnt + extra, comps, age: 0 };
                             drops().lock().unwrap().push(d);
                         }
                         let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                                xps().lock().unwrap().push(Xp { eid: xeid, x: mx, y: my, z: mz, val: mob_xp(etype), age: Instant::now() });
+                                                xps().lock().unwrap().push(Xp { eid: xeid, x: mx, y: my, z: mz, val: mob_xp(etype), age: 0 });
                         // spawn streams via interest_tick
                     }
                 }
@@ -11944,7 +11953,7 @@ fn handle(mut s: TcpStream) {
                             let mut ds = drops().lock().unwrap();
                             for (item, cnt, comps) in spill.into_iter().filter(|s| s.1 > 0 && enchant_level(&s.2, 40) == 0) {
                                 ds.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                    x: dx, y: dy + 0.4, z: dz, item, cnt, comps, age: Instant::now() });
+                                    x: dx, y: dy + 0.4, z: dz, item, cnt, comps, age: 0 });
                             }
                         }
                         // player xp scatters as orbs (~7*level, cap 100)
@@ -11954,7 +11963,7 @@ fn handle(mut s: TcpStream) {
                         while rem > 0 {
                             let v = rem.min(10) as i16; rem -= v as i64;
                             xs.push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: dx, y: dy + 0.5, z: dz, val: v, age: Instant::now() });
+                                x: dx, y: dy + 0.5, z: dz, val: v, age: 0 });
                         }
                         drop(xs);
                     }
@@ -12090,7 +12099,7 @@ fn handle(mut s: TcpStream) {
                             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                             x: px, y: py + 1.3, z: pz,
                             item: cur.0, cnt: cur.1, comps: cur.2,
-                            age: Instant::now() - Duration::from_secs(2), // pickup delay
+                            age: -(server_ticks(40) as i32), // pickup delay: 2s already elapsed
                         });
                     }
                     let mut inv = me.inv.lock().unwrap();
@@ -12143,7 +12152,7 @@ fn handle(mut s: TcpStream) {
                                         let it = cur.clone();
                                         if n >= cur.1 { *cur = (0, 0, Vec::new()); } else { cur.1 -= n; }
                                         let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: Instant::now() };
+                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: 0 };
                                         drops().lock().unwrap().push(d);
                                     }
                                 } else if slot >= 0 && slot < rows + 36 {
@@ -12198,7 +12207,7 @@ fn handle(mut s: TcpStream) {
                                         let it = cur.clone();
                                         if n >= cur.1 { *cur = (0, 0, Vec::new()); } else { cur.1 -= n; }
                                         let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: Instant::now() };
+                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: 0 };
                                         drops().lock().unwrap().push(d);
                                     }
                                 } else if slot >= 0 && slot < 39 {
@@ -12280,7 +12289,7 @@ fn handle(mut s: TcpStream) {
                                         // vanilla: each completed trade grants 3-6 xp to the player
                                         let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
                                         xps().lock().unwrap().push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px, y: py + 1.0, z: pz, val: (3 + rand_u64() % 4) as i16, age: Instant::now() });
+                                            x: px, y: py + 1.0, z: pz, val: (3 + rand_u64() % 4) as i16, age: 0 });
                                         // auto-refill from inventory
                                         let mut inv = me.inv.lock().unwrap();
                                         if s0.1 == 0 && inv_consume(&mut inv, ai, ac as i64) {
@@ -12335,7 +12344,7 @@ fn handle(mut s: TcpStream) {
                                         let it = cur.clone();
                                         if n >= cur.1 { *cur = (0, 0, Vec::new()); } else { cur.1 -= n; }
                                         let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: Instant::now() };
+                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: 0 };
                                         drops().lock().unwrap().push(d);drop(cur); drop(grid); drop(inv);
                                         // spawn streams via interest_tick
                                         // drop meta streams via interest_tick
@@ -12386,7 +12395,7 @@ fn handle(mut s: TcpStream) {
                                     if n >= cur.1 { *me.cursor.lock().unwrap() = (0, 0, Vec::new()); }
                                     else { me.cursor.lock().unwrap().1 -= n; }
                                     let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                    let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: cur.0, cnt: n, comps: cur.2.clone(), age: Instant::now() };
+                                    let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: cur.0, cnt: n, comps: cur.2.clone(), age: 0 };
                                     drops().lock().unwrap().push(d);
                                 }
                             } else if slot == 0 {
@@ -12627,7 +12636,7 @@ fn handle(mut s: TcpStream) {
                                 let st: Stack = $st;
                                 if st.1 > 0 {
                                     drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                        x: px, y: py + 1.3, z: pz, item: st.0, cnt: st.1, comps: st.2, age: Instant::now() });
+                                        x: px, y: py + 1.3, z: pz, item: st.0, cnt: st.1, comps: st.2, age: 0 });
                                 }
                             } } }
                             if let Some((cp, cp2)) = chest_pos {
@@ -12865,7 +12874,7 @@ fn handle(mut s: TcpStream) {
                 let (px, py, pz, ..) = *me_cleanup.pos.lock().unwrap();
                 let mut drp = drops().lock().unwrap();
                 for st in to_drop {
-                    drp.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: st.0, cnt: st.1, comps: st.2, age: Instant::now() });
+                    drp.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: st.0, cnt: st.1, comps: st.2, age: 0 });
                 }
             }
             *me_cleanup.drag.lock().unwrap() = (-1, Vec::new());
