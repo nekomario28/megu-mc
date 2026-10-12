@@ -4008,10 +4008,17 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
         // dropped items are world entities in vanilla — they survive
         // restart inside their despawn budget
+        // A trident that came to rest is persisted as a ground drop. Saving must be
+        // observational: the conversion is written into the payload instead of
+        // being applied to the live world, where it also lost the new drop because
+        // the drop list had already been serialized.
+        let tridents: Vec<(f64, f64, f64, i64, Comps)> = arrows().lock().unwrap().iter()
+            .filter(|a| a.kind == 1 && a.ret_item > 0)
+            .map(|a| (a.x, a.y, a.z, a.ret_item, a.ret_comps.clone())).collect();
         let mut drop_ages: Vec<u32> = Vec::new();
         {
             let ds = drops().lock().unwrap();
-            write_varint(&mut *f, ds.len() as i64);
+            write_varint(&mut *f, (ds.len() + tridents.len()) as i64);
             for d in ds.iter() {
                 (*f).extend_from_slice(&d.eid.to_be_bytes());
                 (*f).extend_from_slice(&d.x.to_be_bytes());
@@ -4024,6 +4031,17 @@ fn save_world_into(f: &mut Vec<u8>) {
                 // negative pickup-delay marker round-trips; only the load-side
                 // clamp used to destroy it.
                 drop_ages.push(d.age as u32); // server ticks, signed
+            }
+            for (x, y, z, item, comps) in tridents.iter() {
+                // eid 0 is remapped on load and age 0 grants a full pickup delay.
+                (*f).extend_from_slice(&0i32.to_be_bytes());
+                (*f).extend_from_slice(&x.to_be_bytes());
+                (*f).extend_from_slice(&y.to_be_bytes());
+                (*f).extend_from_slice(&z.to_be_bytes());
+                write_varint(&mut *f, *item);
+                (*f).push(1);
+                write_comps(&mut *f, comps);
+                drop_ages.push(0);
             }
         }
         // furnaces are block entities — contents and smelting state are
@@ -4083,24 +4101,14 @@ fn save_world_into(f: &mut Vec<u8>) {
         // projectiles + primed tnt are world entities in vanilla —
         // they survive restart mid-flight
         {
-            // thrown tridents persist as ground drops (item-preserving)
-            {
-                let mut ar0 = arrows().lock().unwrap();
-                let tri: Vec<(f64, f64, f64, i64, Comps)> = ar0.iter()
-                    .filter(|a| a.kind == 1 && a.ret_item > 0)
-                    .map(|a| (a.x, a.y, a.z, a.ret_item, a.ret_comps.clone())).collect();
-                ar0.retain(|a| a.kind != 1);
-                let mut ds = drops().lock().unwrap();
-                for (x, y, z, ri, rc) in tri {
-                    ds.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x, y, z, item: ri, cnt: 1, comps: rc, age: 0 });
-                }
-            }
             let ar = arrows().lock().unwrap();
             // ARW2: stuck flag persists so saved arrows resume embedded
             (*f).extend_from_slice(b"ARW2");
-            write_varint(&mut *f, ar.len() as i64);
-            for a in ar.iter() {
+            // Tridents travel in the drop list above, so they are excluded here
+            // rather than removed from the live arrow list.
+            let persisted: Vec<&Arrow> = ar.iter().filter(|a| !(a.kind == 1 && a.ret_item > 0)).collect();
+            write_varint(&mut *f, persisted.len() as i64);
+            for a in persisted {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
                 (*f).extend_from_slice(&a.owner.to_be_bytes());
                 (*f).extend_from_slice(&a.x.to_be_bytes());

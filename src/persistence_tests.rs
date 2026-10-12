@@ -214,3 +214,43 @@ fn truncated_component_blobs_do_not_panic_the_loader() {
         assert!(p <= cut, "cursor ran past the buffer at cut {cut}");
     }
 }
+
+
+/// Saving must be observational. The trident-to-drop conversion used to run inside
+/// save_world_into: it removed the trident from the live arrow list, created a live
+/// drop, and — because the drop list had already been serialized — omitted that drop
+/// from the very save that produced it, so a resting trident was lost on restart.
+#[test]
+fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    arrows().lock().unwrap().push(Arrow { eid: 7001, owner: 1, x: 1.5, y: 70.0, z: 1.5,
+        dx: 0.0, dy: 0.0, dz: 0.0, ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 8.0, fire: 0,
+        punch: 0, kind: 1, loy: 3, ret_item: 811, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: true });
+    arrows().lock().unwrap().push(Arrow { eid: 7002, owner: 1, x: 2.5, y: 70.0, z: 2.5,
+        dx: 0.5, dy: 0.0, dz: 0.5, ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 6.0, fire: 0,
+        punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: false });
+    let live_arrows_before: Vec<i32> = arrows().lock().unwrap().iter().map(|a| a.eid).collect();
+    let live_drops_before = drops().lock().unwrap().len();
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let live_arrows_after: Vec<i32> = arrows().lock().unwrap().iter().map(|a| a.eid).collect();
+    let live_drops_after = drops().lock().unwrap().len();
+    // A second save of an unchanged world must produce identical bytes. A save that
+    // consumes the world is not idempotent and cannot be retried safely.
+    let mut payload2 = Vec::new();
+    save_world_into(&mut payload2);
+    *drops().lock().unwrap() = Vec::new();
+    *arrows().lock().unwrap() = Vec::new();
+    load_world_from(&payload);
+    let loaded_drops: Vec<(i64, u8)> = drops().lock().unwrap().iter().map(|d| (d.item, d.cnt)).collect();
+    let loaded_arrow_kinds: Vec<u8> = arrows().lock().unwrap().iter().map(|a| a.kind).collect();
+    *arrows().lock().unwrap() = old_arrows;
+    *drops().lock().unwrap() = old_drops;
+    assert_eq!(live_arrows_before, live_arrows_after, "saving removed a live projectile");
+    assert_eq!(live_drops_before, live_drops_after, "saving created a live drop");
+    assert_eq!(payload, payload2, "saving is not idempotent");
+    assert_eq!(loaded_drops, vec![(811, 1)], "the resting trident must persist exactly once");
+    assert_eq!(loaded_arrow_kinds, vec![0], "only the airborne arrow stays an arrow");
+}
