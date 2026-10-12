@@ -1,0 +1,19 @@
+{
+  "claim": "keepalive/time-notify/size-log gated on elapsed wall time with cadence-independent intervals; keepalive is now the vanilla 15000ms; NOT 20TPS, NOT full vanilla parity",
+  "negative_control": "keepalive reverted to t % 40: test reports immediate 0x26 firing",
+  "positive_control": "anchor rewound past its period makes the next tick fire exactly one keepalive and one time notify",
+  "reviewer_findings_fixed": "shared anchor inherited from other tests could legitimately fire the 1s boundary; restoration ran after assertion and could poison the shared fixture",
+  "tests": "23 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "final independent review found no actionable defect; reviewer did not run tests",
+  "behavior_change": "keepalive interval 10s -> 15s (vanilla). Time notify and size log keep 1s and 5s.",
+  "remaining_instant_boundaries": "hurt_at 500ms, shield 5s, pearl cooldown, xp/drop 300s, pickup 500ms, tnt fuse 4000ms. Vanilla holds TNT fuse, pickup delay, xp/drop despawn and invulnerability in game ticks; decide in the cutover slice.",
+  "files_sha256": {
+    "README.md": "4d8f718ea0849858526205f51bdb874a58462ae5b44c365cdc14f08a5efec150",
+    "time-contract-wallclock-features.log": "228d26a7460857485e87de8890a305a318aec4933758b31b39ed312b8b8054f7",
+    "time-contract-wallclock-negative.log": "0bd6bd5129fbb489f7075363803f4eb39a1019e23d9227990edb52136c018657",
+    "time-contract-wallclock-parallel.log": "aaaae3fe1d58364d84c029d2362f2e51eb492f1dfc4a6aaee941f38a9a6f3915",
+    "time-contract-wallclock-review.log": "9e5a707ef55a1a33d5c4a5e416f609b9301fed1494525e06ca7c480b77919118",
+    "time-contract-wallclock-suite.log": "8c055d1d2a2e93b02f073fd1c8a026e10417ae05a08a55d2212ca7e181271201"
+  }
+}

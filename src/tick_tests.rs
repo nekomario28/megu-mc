@@ -1,4 +1,5 @@
 use super::*;
+use effect_tests::client_pair;
 
 fn furnace(input_count: u8) -> Furnace {
     Furnace {
@@ -146,6 +147,61 @@ fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
     TICK_IDX.store(old_index, Ordering::Relaxed);
     WORLD_TIME.store(old_time, Ordering::Relaxed);
     assert_eq!(advanced, GAME_TICKS_PER_TICK as u64);
+}
+
+#[test]
+fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let (client, mut receiver) = client_pair();
+    let old_clients = std::mem::take(&mut *clients().lock().unwrap());
+    let old_tick = TICK.swap(0, Ordering::Relaxed);
+    let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_hot = hot().lock().unwrap().clone();
+    let old_warm = warm().lock().unwrap().clone();
+    let old_anchors: Vec<_> = [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT]
+        .iter().map(|cell| *wall_anchor(cell).lock().unwrap()).collect();
+    // Re-anchor every period so this test starts from a known wall clock and
+    // cannot inherit an anchor another test initialized long ago.
+    for cell in [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT] {
+        *wall_anchor(cell).lock().unwrap() = Instant::now();
+    }
+    clients().lock().unwrap().push(Arc::new(client));
+    // 40 is the old keepalive divisor and 4 the old time-notify divisor, so a
+    // tick-count implementation would have fired both within these 40 ticks.
+    // 40 ticks cost microseconds against a 1s period, so elapsed time cannot
+    // legitimately reach it here.
+    for _ in 0..40 { game_tick(|_, tick| tick()); }
+    let mut seen = Vec::new();
+    while let Some((packet, _)) = read_packet(&mut receiver) {
+        if packet == 0x26 || packet == 0x64 { seen.push(packet); }
+    }
+    // Rewinding an anchor past its period must make the next tick fire it,
+    // which is what proves the mechanism is a wall clock and not a counter.
+    *wall_anchor(&KEEPALIVE_AT).lock().unwrap() = Instant::now() - Duration::from_millis(KEEPALIVE_MS + 1);
+    *wall_anchor(&TIME_NOTIFY_AT).lock().unwrap() = Instant::now() - Duration::from_millis(TIME_NOTIFY_MS + 1);
+    game_tick(|_, tick| tick());
+    let mut fired = Vec::new();
+    while let Some((packet, _)) = read_packet(&mut receiver) {
+        if packet == 0x26 || packet == 0x64 { fired.push(packet); }
+    }
+    // Restore before asserting so a failure cannot poison the shared fixture.
+    *clients().lock().unwrap() = old_clients;
+    TICK.store(old_tick, Ordering::Relaxed);
+    WORLD_TIME.store(old_time, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    *actors().lock().unwrap() = old_actors;
+    *forceloaded().lock().unwrap() = old_forced;
+    *hot().lock().unwrap() = old_hot;
+    *warm().lock().unwrap() = old_warm;
+    for (cell, anchor) in [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT].iter().zip(old_anchors) {
+        *wall_anchor(cell).lock().unwrap() = anchor;
+    }
+    assert!(seen.is_empty(), "tick-count boundaries fired immediately: {seen:?}");
+    assert_eq!(fired.len(), 2, "expected exactly one keepalive and one time notify: {fired:?}");
+    assert_eq!(TICKS_PER_SECOND as u64 * TICK_MS, 1000);
 }
 
 #[test]

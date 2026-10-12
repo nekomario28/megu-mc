@@ -1,6 +1,6 @@
 use super::*;
 
-fn client_pair() -> (Client, TcpStream) {
+pub(super) fn client_pair() -> (Client, TcpStream) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let receiver = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();

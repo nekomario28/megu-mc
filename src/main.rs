@@ -1300,6 +1300,26 @@ fn surface_y(x: i32, z: i32) -> f64 {
 const TICK_MS: u64 = 250;
 const TICKS_PER_SECOND: u32 = 1000 / TICK_MS as u32;
 const GAME_TICKS_PER_TICK: u32 = 20 / TICKS_PER_SECOND;
+// Wall-clock owners. Vanilla defines these in real time, not in game ticks, so
+// they anchor on Instants: changing the simulation cadence must not shift them.
+const KEEPALIVE_MS: u64 = 15_000;   // ServerCommonPacketListenerImpl
+const TIME_NOTIFY_MS: u64 = 1_000;  // day/night display sync
+const SIZE_LOG_MS: u64 = 5_000;     // container-count watch (diagnostic)
+static KEEPALIVE_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
+static TIME_NOTIFY_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
+static SIZE_LOG_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
+fn wall_anchor(cell: &'static OnceLock<Mutex<Instant>>) -> &'static Mutex<Instant> {
+    cell.get_or_init(|| Mutex::new(Instant::now()))
+}
+/// Run `body` at most once per `period` of wall-clock time. The anchor is the
+/// previous firing, so neither cadence nor tick position can shift the interval.
+fn every_ms(cell: &'static OnceLock<Mutex<Instant>>, period: u64, body: impl FnOnce()) {
+    let fire = {
+        let mut last = wall_anchor(cell).lock().unwrap();
+        if last.elapsed() >= Duration::from_millis(period) { *last = Instant::now(); true } else { false }
+    };
+    if fire { body(); }
+}
 static TICK: AtomicU64 = AtomicU64::new(0);
 static WORLD_TIME: AtomicU64 = AtomicU64::new(1000); // morning
 static BOLTS: OnceLock<Mutex<Vec<(i32, i32)>>> = OnceLock::new(); // (eid, ticks-left) transient lightning visuals
@@ -1331,18 +1351,18 @@ fn keepalive_time_tick() {
     let wt = if GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) == 1 {
         WORLD_TIME.fetch_add(GAME_TICKS_PER_TICK as u64, Ordering::Relaxed) % 24000
     } else { WORLD_TIME.load(Ordering::Relaxed) % 24000 };
-    if t % 4 == 0 {
+    every_ms(&TIME_NOTIFY_AT, TIME_NOTIFY_MS, || {
         broadcast(0, |_c| {
             let mut p = Vec::new();
             p.extend_from_slice(&t.to_be_bytes());      // world age (i64)
             p.extend_from_slice(&(wt as i64).to_be_bytes());
             (0x64, p)
         });
-    }
-    if t % 40 == 0 {
-        broadcast(0, |_c| { (0x26, t.to_be_bytes().to_vec()) });
-    }
-    if t % 20 == 0 { // container size watch (leak hunt)
+    });
+    every_ms(&KEEPALIVE_AT, KEEPALIVE_MS, || {
+        broadcast(0, |_c| (0x26, t.to_be_bytes().to_vec()));
+    });
+    every_ms(&SIZE_LOG_AT, SIZE_LOG_MS, || {
         let rss = std::fs::read_to_string("/proc/self/status").unwrap_or_default()
             .lines().find(|l| l.starts_with("VmRSS")).map(|l| l.to_string()).unwrap_or_default();
         eprintln!("[sz] t={} {} | mobs={} drops={} xps={} arrows={} bob={} pearl={} primed={} chests={} furn={} crops={} world={} inv={} clients={}",
@@ -1352,7 +1372,7 @@ fn keepalive_time_tick() {
             primed().lock().unwrap().len(), chests().lock().unwrap().len(), furnaces().lock().unwrap().len(),
             crops().lock().unwrap().len(), world().lock().unwrap().len(), inv_store().lock().unwrap().len(),
             clients().lock().unwrap().len());
-    }
+    });
     // weather: occasional rain
     {
         let rt = RAINING.load(Ordering::Relaxed);
