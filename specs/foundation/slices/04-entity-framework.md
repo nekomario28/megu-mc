@@ -23,7 +23,7 @@
 - **物理が4経路に複製され、1つだけ直された。**
   レビューは Arrow と Pearl を指摘し、`Snowball` は
   **dragが皆無・重力も0.05**のまま残った
-  （[slice 26](../time-contract/slices/26-contradictions.md)）。
+  （[slice 26](../../time-contract/slices/26-contradictions.md)）。
 - **興味管理が種ごとに別実装。** `interest_tick` に
   「spawn streams via interest_tick」が種の数だけ並ぶ。
 - **protocol が種ごとに別関数。** `spawn_arrow_pkt` / `spawn_typed_pkt` /

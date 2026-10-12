@@ -10,7 +10,7 @@ Status: 実装済み。測定は [region-accessor](../../../evidence/time-contra
 
 炉で測った実害：休止炉400個で **1tickあたり約35.6µs** が所属判定。
 中身は `div_euclid(16)` とHashSet照合だけなので、費用の正体はlock。
-炉だけ集約して **炉stageがx1.60**（[slice 18](../time-contract/slices/18-membership-lock-hoist.md)）。
+炉だけ集約して **炉stageがx1.60**（[slice 18](../../time-contract/slices/18-membership-lock-hoist.md)）。
 
 他19箇所は同じ形のまま。個別に直すと：
 - 各ループにクロージャが増えて読みにくくなる
@@ -48,7 +48,7 @@ impl RegionSnapshot {
 - 新規: スナップショット経由の判定が、グローバルlock経由の判定と
   **全登録セルで一致**することを検証する。
 - 費用: fixture の前後比較。炉stageに加え、水・ホッパー・作物を含む
-  fixture（[entity-heavy](../time-contract/slices/19-entity-fixture.md) を拡張）で測る。
+  fixture（[entity-heavy](../../time-contract/slices/19-entity-fixture.md) を拡張）で測る。
   **x1.10未満は主張しない。**
 - 全テスト、CI 4step、wire smoke。
 

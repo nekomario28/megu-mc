@@ -21,7 +21,7 @@ for (cx, cz) in &news {
    tickが跳ねる。PR #6 が「avoid synchronous 9×9 bursts on player movement」
    として指摘している（issue #3 P1/P2）。
 2. **ビュー距離が ±4 固定**。クライアントの描画距離設定を受けず、
-   運営者も変えられない（[slice 28](../time-contract/slices/28-playability-gaps.md) A4）。
+   運営者も変えられない（[slice 28](../../time-contract/slices/28-playability-gaps.md) A4）。
    遠景が消え、描画距離MODも効かない。
 3. **backpressure が無い**。相手が読み遅いと送信が詰まる。
    PR #6 はプロトコル767のACK（`0x08` float）で gate する設計にしている。

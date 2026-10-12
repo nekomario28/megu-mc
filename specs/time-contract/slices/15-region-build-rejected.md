@@ -33,4 +33,4 @@ sortは候補数比例、hash dedupは集合サイズ比例。密集すると候
 - `region_membership` の独立oracleは候補のバグを即座に特定できた。
   このゲートは維持する。
 
-証拠は [region-build-rejected](../../evidence/time-contract/region-build-rejected/README.md)。
+証拠は [region-build-rejected](../../../evidence/time-contract/region-build-rejected/README.md)。
