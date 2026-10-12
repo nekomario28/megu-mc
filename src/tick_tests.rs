@@ -420,6 +420,9 @@ fn profile_game_tick() {
         // locks never fire, so hoisting them cannot be measured.
         ("entity_heavy", 1, 0, false),
         ("entity_heavy_furnaces", 1, 400, true),
+        // A pile: the bucket merge is O(n x neighbourhood), so concentrating
+        // drops in one area grows the neighbourhood back toward n.
+        ("drop_pile", 1, 0, false),
     ] {
         actors().lock().unwrap().clear();
         furnaces().lock().unwrap().clear();
@@ -428,6 +431,20 @@ fn profile_game_tick() {
         xps().lock().unwrap().clear();
         crops().lock().unwrap().clear();
         mobs().lock().unwrap().clear();
+        if scenario == "drop_pile" {
+            // 600 drops inside a 3x3 block area, all mergeable, plus 600 spread
+            // far apart that must not merge, to separate merge cost from scan cost.
+            for i in 0..600 {
+                let (x, y, z) = (0.5 + (i % 3) as f64 * 0.05, 70.0, 0.5 + (i / 3 % 3) as f64 * 0.05);
+                drops().lock().unwrap().push(Drop { eid: 30_000 + i, x, y, z,
+                    item: 811, cnt: 1, comps: Vec::new(), age: i as i32 });
+            }
+            for i in 0..600 {
+                let (x, y, z) = (400.0 + (i % 20) as f64 * 0.4, 70.0, 400.0 + (i / 20) as f64 * 0.4);
+                drops().lock().unwrap().push(Drop { eid: 31_000 + i, x, y, z,
+                    item: 812, cnt: 1, comps: Vec::new(), age: i as i32 });
+            }
+        }
         if scenario.starts_with("entity_heavy") {
             for i in 0..600 {
                 let (x, y, z) = (16.0 * (i % 20) as f64, 70.0, 16.0 * (i / 20) as f64);

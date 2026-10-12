@@ -1,0 +1,14 @@
+{
+  "claim": "concentrating 600 mergeable drops into a 3x3 block does not regress the bucketed merge, because the pile collapses to one stack on the first tick",
+  "measurement": "same runner and release build, 3 processes. drop_pile: 600 drops in a 3x3 block plus 600 spread over 12 blocks = 10272us per tick, drop stage 0.3ms (3 percent). entity_heavy for reference: 337607us, drop stage 148.3ms (44 percent).",
+  "why": "a concentrated pile merges into a single stack on the first tick, so the bucket holds one entry afterwards and the neighbourhood is one",
+  "unverified_bad_case": "the bucket degrades only with many drops that are close AND cannot merge, i.e. differing item, components or stack cap. No fixture exercises that yet.",
+  "open_question": "environment is 178.8ms (53 percent) of entity_heavy, about 298us per xp orb, which is far too high for a mutex lock. keepalive_time_tick also runs crop growth, which calls set_block with occlusion, batching and invalidation. Not isolated.",
+  "next": "split keepalive_time_tick into separate stages so the environment cost can be attributed",
+  "tests": "34 passed, 0 failed, 1 explicitly ignored",
+  "review": "NOT RUN, external usage limit still in force",
+  "files_sha256": {
+    "README.md": "1bda1c32978db558b5bc3fc7515073193e25a1eaf1b73a1396d5b332b34f3c78",
+    "results.json": "103feb6ab332722dcf31de74be89eb39eee86c7b5786ba1285f2ed00e2ecda93"
+  }
+}
