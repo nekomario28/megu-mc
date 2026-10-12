@@ -1173,7 +1173,7 @@ fn totem_check(c: &Client) {
             let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
             let snd = sound_pkt_named("item.totem.use", px, py, pz);
             broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
-            // vanilla grants absorption 2 (100s), regen 2 (45s), fire_resist (40s)
+            // Death protection replaces existing effects with the vanilla grant set.
             totem_effects(&mut *c.effs.lock().unwrap());
             let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x5d, health_pkt_c(1.0, c));
             return
@@ -1181,11 +1181,12 @@ fn totem_check(c: &Client) {
     }
     drop(inv);
 }
-// granted effects, factored so callers already holding effs can apply
-// them without re-locking (totem_check_e exists for that path)
+// Both death-protection paths own the effect guard; do not acquire it here.
 fn totem_effects(ef: &mut Vec<Eff>) {
-    for (id, amp, dur) in [(22i32, 1i32, 180), (10, 1, 20), (12, 0, 160)] {
-        ef.retain(|e| e.id != id);
+    ef.clear();
+    // Stored durations are still 250ms ticks: vanilla 900 / 100 / 800 game ticks.
+    for (name, amp, dur) in [("regeneration", 1, 180), ("absorption", 1, 20), ("fire_resistance", 0, 160)] {
+        let id = name_to_effect(name).expect("totem effect must exist in the effect registry");
         ef.push(Eff { id, amp, left: dur });
     }
 }
@@ -1564,7 +1565,6 @@ fn keepalive_time_tick() {
                 drop(h);
                 if e.left <= 0 { expired.push(e.id); }
             }
-            if grant_totem { totem_effects(&mut ef); }
             if dirty2 { if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c)); } }
             for id in &expired {
                 ef.retain(|e| e.id != *id);
@@ -1572,6 +1572,8 @@ fn keepalive_time_tick() {
                 if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x43, pk.clone()); }
                 broadcast_seen(c.eid, |_c| (0x43, pk.clone()));
             }
+            // Expired effects belong to the old set, not to the death-protection grant.
+            if grant_totem { totem_effects(&mut ef); }
         }
     }
     // crop growth: ~1 stage per 60s average (1/240 chance per 250ms tick)
@@ -13443,3 +13445,5 @@ fn main() {
 
 #[cfg(test)]
 mod furnace_cache_tests;
+#[cfg(test)]
+mod effect_tests;

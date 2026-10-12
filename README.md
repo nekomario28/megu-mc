@@ -31,6 +31,11 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 [復元と検証の記録](RESTORATION.md)を参照。
 
+## ゲーム時間と処理省略
+
+[時間契約の実装計画](specs/time-contract/README.md)に従い、vanillaの結果を保つ時間基準と、
+結果を変えない処理省略を分けて検証する。20TPS移行・全体互換・性能改善はまだ未完了。
+
 ## Java mod互換層
 
 [段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を参照。世界の正本はRustに置き、Java互換層からJNIで操作する。通常ビルドではJava実行機能を有効にしない。現在対応する契約と未検証の境界は以下に記載する。
