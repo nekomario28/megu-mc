@@ -42,6 +42,15 @@ drop・xp・作物・mobのループにも同じhoistを適用したが、全て
 **hoistは要素が実際に多いことを測定で確認してから適用する。**
 作物・drop・xp・mobを含むfixtureを作るまでは着手しない。
 
+## xpのhoistも不採用（fixture拡張後に再測定）
+
+fixture 19で600xp等を入れたあと測り直した。
+entity_heavy では environment stage が x1.024 と改善したが、
+xpが無いfixtureは x0.94 に後退。利得2.4%は管理コストに合わない。
+
+`return` で早期脱出すると `keepalive_time_tick` の天候・雷・サイズログを
+巻き添えにする。採用するなら `if !xl.is_empty() { ... }` で囲むこと。
+
 ## 同じ失敗を避けた経過
 
 最初に作物・bobber・パール・xp・dropのループも一括でhoistしたが、

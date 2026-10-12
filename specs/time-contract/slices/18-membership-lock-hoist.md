@@ -43,3 +43,27 @@ hoistすると「0回のlock」が「1回のlock」になり、要素数0では�
 **教訓：hoistは「要素が実際に多い」ことが測定で確認できてから適用する。**
 fixtureにその要素が無い最適化は、fixtureを先に拡張して測ること。
 作物・drop・xp・mobを含むfixtureを作るまでは着手しない。
+
+## xpのhoistも不採用（fixture拡張後に再測定）
+
+slice 19でfixtureに600xp・600ドロップ・600作物・600Mobを入れたあと、
+xpループのhoistを測り直した。
+
+| fixture | environment stage 比 |
+|---|---:|
+| entity_heavy | **x1.024** |
+| entity_heavy_furnaces | **x1.024** |
+| 空 | x0.994 |
+| idle Actor 1 | x0.950 |
+| 休止炉400 | x0.939 |
+| 稼働炉400 | x0.942 |
+
+xpが無いfixtureではlockを無駄に取るので x0.94 に後退。
+利得は entity_heavy でわずか2.4%しかない。
+
+**判断：不採用。** 2.4%の利得に後退の管理コストと
+早期returnの落とし穴（`keepalive_time_tick` の後続処理を飛ばす）を
+持ち込む価値がない。
+
+もし採用するなら `return` ではなく `if !xl.is_empty() { ... }` で囲むこと。
+`return` は天候・雷・サイズログを巻き添えにする。
