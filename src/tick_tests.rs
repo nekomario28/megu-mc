@@ -402,6 +402,24 @@ fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
 }
 
 #[test]
+fn projectile_lifetimes_keep_their_real_time_at_any_cadence() {
+    // These were bare tick counts written for 4TPS, so the 20TPS cutover silently
+    // shortened them fivefold: an arrow lived 12s instead of 60s. The cutover
+    // claimed TTLs kept their real time, which was wrong.
+    for (name, game_ticks, millis) in [
+        ("arrow", ARROW_TTL_GT, 60_000u64),
+        ("mob arrow", MOB_ARROW_TTL_GT, 40_000),
+        ("pearl", PEARL_TTL_GT, 12_500),
+        ("snowball", SNOWBALL_TTL_GT, 15_000u64),
+    ] {
+        assert_eq!(server_ticks(game_ticks) * TICK_MS, millis,
+            "{name} no longer spans {millis}ms");
+    }
+    // A bare tick count would fail this: at 20TPS, 240 ticks is 12s, not 60s.
+    assert!(server_ticks(ARROW_TTL_GT) != 240 || TICK_MS == 250);
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();

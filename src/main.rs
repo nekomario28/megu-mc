@@ -1330,6 +1330,13 @@ const BOLT_LIFE_GT: u64 = 10;        // 0.5s visual
 const TNT_FUSE_GT: u64 = 80;         // 4s, TntBlock fuse
 const AIR_SUPPLY_GT: u64 = 300;        // 15s, entity air supply
 const PICKUP_DELAY_GT: u64 = 10;     // 0.5s, ItemEntity pickupDelay
+// Projectile lifetimes. Vanilla has no flying TTL and counts 1200 game ticks of
+// being in the ground, so these are this server's own limits. They are stated as
+// the real time they had at 4TPS, not as bare tick counts.
+const ARROW_TTL_GT: u64 = 1200;      // 60s
+const MOB_ARROW_TTL_GT: u64 = 800;   // 40s
+const PEARL_TTL_GT: u64 = 250;       // 12.5s
+const SNOWBALL_TTL_GT: u64 = 300;    // 15s
 const DROP_LIFE_GT: u64 = 6000;       // 300s, ItemEntity lifespan
 const XP_LIFE_GT: u64 = 6000;         // 300s, ExperienceOrb lifespan
 /// chain
@@ -2865,7 +2872,7 @@ fn mob_tick() {
                     let vl = (vx*vx+vy*vy+vz*vz).sqrt().max(0.01);
                     vx /= vl; vy /= vl; vz /= vl;
                     let a = Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), owner: -1, x: sx, y: sy, z: sz,
-                        dx: vx, dy: vy, dz: vz, ttl: 160, dmg: diff_mob_dmg(3.0), fire: 0, punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: false };
+                        dx: vx, dy: vy, dz: vz, ttl: server_ticks(MOB_ARROW_TTL_GT) as i32, dmg: diff_mob_dmg(3.0), fire: 0, punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: false };
                                         arrows().lock().unwrap().push(a);
                     // spawn streams via interest_tick
                 }
@@ -11185,7 +11192,7 @@ fn handle(mut s: TcpStream) {
                             let pi = if hit == 1192 { enchant_level(&held_c, 24) } else { 0 };
                             let a = Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), owner: me.eid,
                                 x, y: y + 1.5, z,
-                                dx: -yr.sin() * pr.cos() * 2.5 * pow_f as f64, dy: -pr.sin() * 2.5 * pow_f as f64, dz: yr.cos() * pr.cos() * 2.5 * pow_f as f64, ttl: 240,
+                                dx: -yr.sin() * pr.cos() * 2.5 * pow_f as f64, dy: -pr.sin() * 2.5 * pow_f as f64, dz: yr.cos() * pr.cos() * 2.5 * pow_f as f64, ttl: server_ticks(ARROW_TTL_GT) as i32,
                                 dmg: 6.0 * pow_f * (1.0 + 0.25 * pw as f32), fire: (fl > 0) as i32 * 20, punch: pu as i32,
                                 kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: pi as i32, last_hit: -1, stuck: false };
                             let (admg, afire, apunch, apierce) = (a.dmg, a.fire, a.punch, a.pierce);
@@ -11197,7 +11204,7 @@ fn handle(mut s: TcpStream) {
                                     arrows().lock().unwrap().push(Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                         owner: me.eid, x, y: y + 1.5, z,
                                         dx: -yr2.sin() * pr.cos() * 2.5 * pow_f as f64, dy: -pr.sin() * 2.5 * pow_f as f64,
-                                        dz: yr2.cos() * pr.cos() * 2.5 * pow_f as f64, ttl: 240,
+                                        dz: yr2.cos() * pr.cos() * 2.5 * pow_f as f64, ttl: server_ticks(ARROW_TTL_GT) as i32,
                                         dmg: admg, fire: afire, punch: apunch, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(),
                                         pierce: apierce, last_hit: -1, stuck: false });
                                 }
@@ -11237,7 +11244,7 @@ fn handle(mut s: TcpStream) {
                             arrows().lock().unwrap().push(Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                 owner: me.eid, x, y: y + 1.5, z,
                                 dx: -yr.sin() * pr.cos() * 2.2, dy: -pr.sin() * 2.2, dz: yr.cos() * pr.cos() * 2.2,
-                                ttl: 240, dmg: 8.0 + imp, fire: 0, punch: chan as i32,
+                                ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 8.0 + imp, fire: 0, punch: chan as i32,
                                 kind: 1, loy, ret_item: held_st.0, ret_comps: held_st.2.clone(),
                                 pierce: 0, last_hit: -1, stuck: false });
                             held_slot_resync(&me);
@@ -13004,7 +13011,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     let yr = (yaw as f64).to_radians(); let pr = (pitch as f64).to_radians();
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                     let pe = Pearl { eid, owner: me.eid, x, y: y + 1.5, z,
-                        dx: -yr.sin() * pr.cos() * 2.0, dy: -pr.sin() * 2.0 + 0.3, dz: yr.cos() * pr.cos() * 2.0, ttl: 50 };
+                        dx: -yr.sin() * pr.cos() * 2.0, dy: -pr.sin() * 2.0 + 0.3, dz: yr.cos() * pr.cos() * 2.0, ttl: server_ticks(PEARL_TTL_GT) as i32 };
                                         pearls().lock().unwrap().push(pe);
                     // spawn streams via interest_tick
                     if *me.gm.lock().unwrap() != 1 {
@@ -13024,7 +13031,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     let yr = (yaw as f64).to_radians(); let pr = (pitch as f64).to_radians();
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                     let sb = Snowball { eid, owner: me.eid, x, y: y + 1.5, z,
-                        dx: -yr.sin() * pr.cos() * 1.5, dy: -pr.sin() * 1.5 + 0.25, dz: yr.cos() * pr.cos() * 1.5, ttl: 60,
+                        dx: -yr.sin() * pr.cos() * 1.5, dy: -pr.sin() * 1.5 + 0.25, dz: yr.cos() * pr.cos() * 1.5, ttl: server_ticks(SNOWBALL_TTL_GT) as i32,
                         egg: main == 927 };
                                         snowballs().lock().unwrap().push(sb);
                     // spawn streams via interest_tick

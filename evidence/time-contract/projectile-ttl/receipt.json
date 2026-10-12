@@ -1,0 +1,16 @@
+{
+  "claim": "projectile TTLs were left as bare 4TPS tick counts, so the 20TPS cutover shortened them fivefold; they now derive from vanilla game-tick values and keep their original real time",
+  "what_happened": "the cutover commit reported that TTLs kept their real time. They did not: ttl 240 was 60s at 250ms per tick and 12s at 50ms per tick. An arrow lived 12s instead of 60s, a pearl 2.5s instead of 12.5s.",
+  "fix": "arrow 1200 game ticks (60s), mob arrow 800 (40s), pearl 250 (12.5s), snowball 300 (15s), each converted with server_ticks. This restores pre-cutover behaviour; it is not a vanilla-faithful removal.",
+  "not_done": "vanilla has no flying TTL and 1200 counts ticks in the ground, so removing the TTL would change results and risk entity accumulation. Deferred to its own slice.",
+  "how_found": "the recorded search pattern ttl: [0-9]+ across src/main.rs. This is the third literal of this class, after lava t % 2 and air 60.",
+  "lesson": "a conversion declared as real-time preserving must be verified by search, not by declaration. Declaring it is not implementing it.",
+  "tests": "35 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "negative_control": "ARROW_TTL_GT set back to 240: the test fails with arrow no longer spans 60000ms, left 12000",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "files_sha256": {
+    "README.md": "d5ab73b9d6471511ce4e4b90cce6eb5c5f95111159e4e161e9f57a4eda29b061",
+    "negative-control.log": "1c1127cd0697a6237d8b8c4641b3c095be85784ad7b717ab2bae8b3e99c4c3bb"
+  }
+}
