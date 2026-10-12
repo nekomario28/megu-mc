@@ -13089,6 +13089,26 @@ fn rcon_listener() {
         if let Ok(s) = st { let pass = pass.clone(); std::thread::spawn(move || rcon_conn(s, pass)); }
     }
 }
+// The caller may observe a stage, but must execute it exactly once and in order.
+fn game_tick(mut step: impl FnMut(&'static str, fn())) {
+    step("environment", keepalive_time_tick);
+    TICK_IDX.fetch_add(1, Ordering::Relaxed);
+    step("hot_regions", refresh_hot);
+    step("interest", interest_tick);
+    step("drops", drop_tick);
+    step("arrows", arrow_tick);
+    step("tnt", primed_tick);
+    step("furnaces", furnace_tick);
+    step("hoppers", hopper_tick);
+    step("water", water_tick);
+    if TICK_IDX.load(Ordering::Relaxed) % 6 == 0 { step("lava", lava_tick); }
+    step("observers", observer_tick);
+    step("plugins", plugin_tick);
+    step("actors", actor_tick);
+    step("mobs", mob_tick);
+    step("block_updates", flush_block_updates);
+}
+
 fn main() {
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
     if probe_args.first().is_some_and(|arg| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample")) {
@@ -13345,22 +13365,7 @@ fn main() {
     }
     thread::spawn(|| loop {
         std::thread::sleep(Duration::from_millis(250));
-        keepalive_time_tick();
-        TICK_IDX.fetch_add(1, Ordering::Relaxed);
-        refresh_hot();
-        interest_tick();
-        drop_tick();
-        arrow_tick();
-        primed_tick();
-        furnace_tick();
-        hopper_tick();
-        water_tick();
-        if TICK_IDX.load(Ordering::Relaxed) % 6 == 0 { lava_tick(); }
-        observer_tick();
-        plugin_tick();
-        actor_tick();
-        mob_tick();
-        flush_block_updates();
+        game_tick(|_, tick| tick());
     });
     // vanilla saves the world on SIGTERM/SIGINT (docker/systemd stop);
     // without a handler the autosave window (30s) is lost on kill.
@@ -13399,3 +13404,5 @@ fn main() {
 mod furnace_cache_tests;
 #[cfg(test)]
 mod effect_tests;
+#[cfg(test)]
+mod tick_tests;

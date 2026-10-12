@@ -1,5 +1,22 @@
 # 代わりに選んだ判断
 
+## 計測sliceの判断
+
+### production tickのstage列を一つだけ所有する — confidence: high
+
+本番threadと計測fixtureは同じ `game_tick` を呼ぶ。既存の実行順とlava条件は維持。
+通常threadのcallbackは即実行だけで、計測の時計読み出しや集計を入れない。
+代案の計測用tick複製は、後続の20TPS変更と乖離してしまう。新しいschedulerや
+実行時の設定は不要。release fixtureだけをignoredテストとして明示実行する。
+
+### 実世界ではなく、範囲を限定したfixtureを先に測る — confidence: medium
+
+実プレイヤー負荷・vanilla比較の計測系はまだない。既存のActorでhot/warm ringを作り、
+休止/稼働炉を加えて本番stageごとの費用を得る。結果はheadless/flatの限られた経路であり、
+全サーバーの軽量性とは呼ばない。autosaveも実行するのでプロセスごとにtemporary cwdへ隔離。
+CPU/RSSはその子プロセス全体、stageの時間は測定区間、と証拠の範囲を分ける。
+規模・反復数は実装者が選び、fixtureとreceiptに残す。clockはまだ変更しない。
+
 ## sound（妥当）
 
 ### 時間周期の切替前に、トーテムの付与集合を直す — confidence: medium

@@ -1,0 +1,19 @@
+{
+  "claim": "unchanged production tick ordering/cadence, new behavioral guard and isolated baseline; NOT 20TPS parity or full-server performance",
+  "negative_control": "furnace stage deliberately omitted: focused behavioral test fails; mutation restored",
+  "suite": "20 passed, 0 failed, 1 explicitly ignored; ignored fixture separately executed in 3 fresh release processes",
+  "feature_check": "fabric-probe,neoforge-events passed",
+  "independent_review": "no actionable finding; reviewer did not run tests",
+  "files_sha256": {
+    "README.md": "985bb12bcebb9bcb863f1734d920a90478b13f28d28f9f53a67f823ecb67f2cf",
+    "build.log": "222a02ed477d249a21359df8cae975864a62d848f4739cadc5b00b6190a963c6",
+    "features.log": "8f4ee20742966ff7ad02a5fc63b3bce755f987d3540caee846712ef6ea80b14d",
+    "negative-control.log": "ea953ce63fac323c0158e7a8a56b966416bc9eee3117b78ddfa33a59798ba1a2",
+    "results.json": "96ae3ec9395b5eb3d5c05b87650206701a3f8e24aa9b1e66ff3fa68aff18c1bb",
+    "review.log": "eea6cd4cc9e32b1d5cf0e7315dc1fa950ae247bd3fd3223d80f0946769038dbb",
+    "run-0.log": "6aac0c2cc5f3e1770a322aab30abe9c3eee9bc545702f9b5833916e8a9ebaebd",
+    "run-1.log": "1b541341f38310fde860a2050a5895a12604e6e85c5731df90fc4e0286d7a447",
+    "run-2.log": "73d3d3676804a02463aab177c69311385ba77d5dfed262879dd9df2dcb3f62ec",
+    "suite.log": "3f0a24ddece65963b7fcb4b127c232dca99177dd10b39f3eb5619b2fd8eb0949"
+  }
+}
