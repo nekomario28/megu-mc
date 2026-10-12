@@ -1,6 +1,18 @@
 use super::*;
 
-// Frozen v2.37 tick body; only the explicit builtin resolver argument is adapted.
+// Frozen v2.37 tick body. The resolver no longer takes its builtin argument,
+// and the smelt result no longer carries components, so the reference resolves
+// uncached and tests the output stack for emptiness. Everything else is
+// unchanged, which is the point: the reference is the uncached path.
+
+/// Models a datapack reload. Production only changes these mutable tables through
+/// `load_datapacks`, which bumps the revision on its single exit. A test that
+/// writes them directly must say so too, or it would be asserting that a cache
+/// observes content it has no way to know changed.
+fn pack_changed() {
+    CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
 fn reference_tick() {
     let mut fs = furnaces().lock().unwrap();
     let mut dirty_pos: Vec<(i32, i32, i32)> = Vec::new();
@@ -8,14 +20,14 @@ fn reference_tick() {
         if !is_warm(pos.0, pos.2) {
             continue;
         }
-        let out = smelt_out(f.input.0, smelt_result);
+        let out = smelt_out(f.input.0);
         let can_smelt = f.input.1 > 0
             && out
                 .as_ref()
                 .map(|o| {
                     f.output.1 == 0
                         || (f.output.0 == o.0
-                            && f.output.2 == o.2
+                            && f.output.2.is_empty()
                             && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))
                 })
                 .unwrap_or(false);
@@ -139,6 +151,7 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                         .lock()
                         .unwrap()
                         .push((Ingr::Item(diamond), gold, 2, 1.5));
+                    pack_changed();
                 }
                 if time == server_ticks(325) as usize {
                     json_smelts().lock().unwrap().clear();
@@ -148,15 +161,18 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                         2,
                         1.5,
                     ));
+                    pack_changed();
                 }
                 if time == server_ticks(350) as usize {
                     item_tags()
                         .lock()
                         .unwrap()
                         .insert("test:smelt".into(), vec!["diamond".into()]);
+                    pack_changed();
                 }
                 if time == server_ticks(425) as usize {
                     item_tags().lock().unwrap().remove("test:smelt");
+                    pack_changed();
                 }
                 if time == server_ticks(500) as usize {
                     f.input = (iron, 1, Vec::new());
@@ -227,4 +243,94 @@ fn fuel_miss_does_not_delay_valid_fuel() {
     let coal = name_to_item("coal").unwrap();
     assert_eq!(cache.get_or_compute(diamond, || fuel_ticks(diamond)), 0);
     assert_eq!(cache.get_or_compute(coal, || fuel_ticks(coal)), server_ticks(1600) as i32);
+}
+
+/// The cache is keyed on the content revision, so a datapack reload must make it
+/// re-resolve. Without the revision in the key a reloaded recipe would keep
+/// returning the pre-reload answer forever, which is why the loader bumps it on
+/// its single exit.
+#[test]
+fn a_content_reload_invalidates_cached_smelting() {
+    let _guard = WORLD_TEST_LOCK.lock().unwrap();
+    // `Ingr` is not Clone, so the pack recipe is appended and then truncated off
+    // rather than saved and restored.
+    let len_before = json_smelts().lock().unwrap().len();
+    let item = name_to_item("oak_log").expect("oak_log must exist");
+    let mut cache: CachedLookup<(i64, u64), Option<(i64, u8)>> = CachedLookup::default();
+
+    let rev = content_revision();
+    let builtin = cache.get_or_compute((item, rev), || smelt_out(item));
+    assert_eq!(
+        builtin,
+        smelt_result(item).map(|o| (o, 1)),
+        "with no matching pack recipe the builtin answer must come through"
+    );
+
+    // A pack now overrides the recipe, but nothing has announced a reload yet.
+    json_smelts().lock().unwrap().push((Ingr::Item(item), 42, 3, 0.5));
+    assert_eq!(
+        cache.get_or_compute((item, rev), || smelt_out(item)),
+        builtin,
+        "the cache must not second-guess content that has not been reloaded"
+    );
+
+    // A reload is what bumps the revision, and that must invalidate the entry.
+    CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        cache.get_or_compute((item, content_revision()), || smelt_out(item)),
+        Some((42, 3)),
+        "a new revision must re-resolve the recipe"
+    );
+
+    json_smelts().lock().unwrap().truncate(len_before);
+    CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Pins the mechanism this change is for. The end-to-end fixtures define no
+/// datapack recipes, so they cannot show this cost; this measures it directly.
+/// Run with --nocapture to see the numbers. A one-entry cache measured x1.00 here,
+/// which is why the cache holds several entries now.
+#[test]
+fn cached_smelting_beats_rescanning_datapack_recipes() {
+    let _guard = WORLD_TEST_LOCK.lock().unwrap();
+    let len_before = json_smelts().lock().unwrap().len();
+    // Recipes that match nothing under test, so every scan runs to the end.
+    for i in 0..40i64 {
+        json_smelts().lock().unwrap().push((Ingr::Item(900_000 + i), 42, 1, 0.0));
+    }
+    let names = ["oak_log", "raw_iron", "sand", "cobblestone", "raw_gold"];
+    let items: Vec<i64> = (0..400i64).filter_map(|i| name_to_item(names[i as usize % 5])).collect();
+    let rev = content_revision();
+
+    let t0 = std::time::Instant::now();
+    let mut uncached_sum = 0i64;
+    for _ in 0..1000 {
+        for it in &items {
+            if let Some((o, _)) = smelt_out(*it) { uncached_sum += o }
+        }
+    }
+    let uncached = t0.elapsed();
+
+    let mut cache: CachedLookup<(i64, u64), Option<(i64, u8)>> = CachedLookup::default();
+    let t1 = std::time::Instant::now();
+    let mut cached_sum = 0i64;
+    for _ in 0..1000 {
+        for it in &items {
+            if let Some((o, _)) = cache.get_or_compute((*it, rev), || smelt_out(*it)) { cached_sum += o }
+        }
+    }
+    let cached = t1.elapsed();
+
+    json_smelts().lock().unwrap().truncate(len_before);
+    CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(uncached_sum, cached_sum, "the cache must not change the answer");
+    assert!(cached_sum > 0, "the measurement must do real work");
+    let ratio = uncached.as_secs_f64() / cached.as_secs_f64().max(1e-9);
+    println!(
+        "SMELT_COST uncached={uncached:?} cached={cached:?} speedup=x{ratio:.1}          ({} items x 40 pack recipes x 1000 rounds)",
+        items.len()
+    );
+    // The font bench refused x1.10 claims. This one is far larger than the noise
+    // floor, so a floor is asserted rather than the raw ratio.
+    assert!(ratio > 10.0, "the revision-keyed cache must avoid the rescan (x{ratio:.1})");
 }

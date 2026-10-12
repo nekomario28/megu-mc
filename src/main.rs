@@ -2109,10 +2109,16 @@ fn furnace_tick() {
         // The recipe result is only ever read behind `input.1 > 0`, so an empty
         // input skips the lookup instead of hashing an item it cannot smelt.
         let out = if f.input.1 > 0 {
-            smelt_out(f.input.0, |item| f.recipe_cache.get_or_compute(item, || smelt_result(item)))
+            // Keyed on the content revision as well as the item, so the answer is
+            // resolved once per revision instead of scanning every datapack recipe
+            // for every furnace on every tick.
+            let rev = content_revision();
+            f.recipe_cache.get_or_compute((f.input.0, rev), || smelt_out(f.input.0))
         } else { None };
+        // A smelt output never carries components, so an output stack holding any
+        // cannot be merged with one.
         let can_smelt = f.input.1 > 0 && out.as_ref().map(|o|
-            f.output.1 == 0 || (f.output.0 == o.0 && f.output.2 == o.2 && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))).unwrap_or(false);
+            f.output.1 == 0 || (f.output.0 == o.0 && f.output.2.is_empty() && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))).unwrap_or(false);
         if f.burn_left <= 0 && can_smelt && f.fuel.1 > 0 {
             let t = f.fuel_cache.get_or_compute(f.fuel.0, || fuel_ticks(f.fuel.0));
             if t > 0 {
@@ -3079,7 +3085,7 @@ fn world() -> &'static Mutex<HashMap<(i32, i32), HashMap<u32, u32>>> {
 struct Furnace {
     input: Stack, fuel: Stack, output: Stack,
     burn_left: i32, progress: i32, dirty: bool, xp: f32,
-    recipe_cache: CachedLookup<i64, Option<i64>>,
+    recipe_cache: CachedLookup<(i64, u64), Option<(i64, u8)>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
 static FURNACES: OnceLock<Mutex<HashMap<(i32, i32, i32), Furnace>>> = OnceLock::new();
@@ -3103,12 +3109,20 @@ fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
         m
     }).unwrap_or_default()
 }
-fn smelt_out(item: i64, builtin: impl FnOnce(i64) -> Option<i64>) -> Option<Stack> {
-    // Datapack recipes and ingredient tags are mutable: always resolve them first.
+/// Bumped by the datapack loader. Recipes and ingredient tags are mutable, so
+/// anything caching an answer derived from them must key on this.
+static CONTENT_REVISION: AtomicU64 = AtomicU64::new(0);
+fn content_revision() -> u64 { CONTENT_REVISION.load(Ordering::Relaxed) }
+
+/// The smelting result, independent of which furnace is asking. Datapack recipes
+/// and tags are mutable, so a caller that caches this must include
+/// `content_revision()` in the key. The result never carries components, which is
+/// why the cache can hold a plain pair rather than a whole stack.
+fn smelt_out(item: i64) -> Option<(i64, u8)> {
     for (ig, o, c, _) in json_smelts().lock().unwrap().iter() {
-        if ingr_match(ig, item, 0) { return Some((*o, *c, Vec::new())) }
+        if ingr_match(ig, item, 0) { return Some((*o, *c)) }
     }
-    builtin(item).map(|o| (o, 1, Vec::new()))
+    smelt_result(item).map(|o| (o, 1))
 }
 fn smelt_result(item: i64) -> Option<i64> {
     for (a, b) in [("beef","cooked_beef"),("porkchop","cooked_porkchop"),("chicken","cooked_chicken"),
@@ -8014,6 +8028,9 @@ fn load_datapacks() {
             packs().lock().unwrap().push(pk);
         }
     }
+    // Single exit, so the revision cannot be forgotten on one path: everything
+    // cached against the recipes and tags above is now stale.
+    CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
 }
 
 // tiny json helpers for datapack files (no serde — dep-free loader)
@@ -13122,7 +13139,7 @@ fn handle(mut s: TcpStream) {
                                         // shift inv -> furnace input/fuel by type, else stays
                                         if let Some(st) = inv.get(&(slot + 6)).cloned() {
                                             let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
-                                            let dst: i16 = if smelt_out(st.0, smelt_result).is_some() { 0 } else if fuel_ticks(st.0) > 0 { 1 } else { -1 };
+                                            let dst: i16 = if smelt_out(st.0).is_some() { 0 } else if fuel_ticks(st.0) > 0 { 1 } else { -1 };
                                             if dst >= 0 {
                                                 let m = if dst == 0 { &mut f.input } else { &mut f.fuel };
                                                 let fits = m.1 == 0 || (m.0 == st.0 && m.2 == st.2 && (m.1 as i64) < item_stack_max(m.0, &m.2));
