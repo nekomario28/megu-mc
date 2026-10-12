@@ -9599,12 +9599,25 @@ fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&mut TcpStrea
     };
     run_command_ctx(&ctx, msg, s);
 }
+// Client chat commands are not a trusted administrator channel.
+// RCON/console calls have no player context; the explicit unsafe override is
+// reserved for local compatibility testing, not public/LAN deployments.
+fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
+    matches!(cmd, "help" | "list")
+        || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
+}
+fn allow_unsafe_player_admin() -> bool {
+    std::env::var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS").ok().as_deref() == Some("1")
+}
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> String {
     let me = ctx.me.as_ref();
     let mut it = msg[1..].split_whitespace();
     let cmd = it.next().unwrap_or("");
 
     let args: Vec<&str> = it.collect();
+    if me.is_some() && !allow_unsafe_player_admin() && !command_allowed_for_player(cmd, &args) {
+        return "You do not have permission to run that command".into();
+    }
     let reply = match cmd {
         "execute" => run_execute(ctx, &args, s),
         "time" => {
@@ -13643,3 +13656,23 @@ mod tick_tests;
 mod merge_tests;
 #[cfg(test)]
 mod persistence_tests;
+#[cfg(test)]
+mod security_command_tests {
+    use super::command_allowed_for_player;
+    #[test]
+    fn clients_can_only_run_read_only_commands() {
+        for cmd in ["help", "list"] {
+            assert!(command_allowed_for_player(cmd, &[]), "{cmd}");
+        }
+        assert!(command_allowed_for_player("time", &["query", "daytime"]));
+        for (cmd, args) in [
+            ("stop", vec![]), ("give", vec!["Steve", "diamond"]),
+            ("gamemode", vec!["creative"]), ("setblock", vec!["0", "64", "0", "stone"]),
+            ("execute", vec!["run", "stop"]), ("function", vec!["spine:hello"]),
+            ("time", vec!["set", "night"]), ("scoreboard", vec!["players", "set"]),
+            ("seed", vec![]), ("", vec![]),
+        ] {
+            assert!(!command_allowed_for_player(cmd, &args), "{cmd}");
+        }
+    }
+}
