@@ -8,8 +8,7 @@ fn merge_outcome(items: Vec<Drop>) -> Vec<(i32, i64, u8)> {
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     forceloaded().lock().unwrap().insert((0, 0));
     *drops().lock().unwrap() = items;
     // One tick isolates the merge. More ticks would advance ages and merge again,
@@ -21,8 +20,7 @@ fn merge_outcome(items: Vec<Drop>) -> Vec<(i32, i64, u8)> {
     *forceloaded().lock().unwrap() = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     outcome.sort_unstable();
     outcome
 }

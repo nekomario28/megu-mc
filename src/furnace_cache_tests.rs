@@ -105,7 +105,7 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
     let diamond = name_to_item("diamond").unwrap();
     json_smelts().lock().unwrap().clear();
     item_tags().lock().unwrap().remove("test:smelt");
-    warm().lock().unwrap().insert((0, 0));
+    test_region_warm_insert((0, 0));
     furnaces().lock().unwrap().clear();
     furnaces().lock().unwrap().insert(pos, new_furnace());
     let mut trace = Vec::new();
@@ -217,7 +217,7 @@ fn cached_tick_matches_v237_with_input_output_recipe_and_tag_changes() {
     furnaces().lock().unwrap().clear();
     json_smelts().lock().unwrap().clear();
     item_tags().lock().unwrap().remove("test:smelt");
-    warm().lock().unwrap().remove(&(0, 0));
+    test_region_warm_remove(&(0, 0));
 }
 
 #[test]

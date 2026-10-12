@@ -1654,7 +1654,8 @@ fn keepalive_time_tick() {
     {
         let mut cg = crops().lock().unwrap();
         let mut ripe: Vec<(i32,i32,i32)> = Vec::new();
-        let keys: Vec<(i32,i32,i32)> = cg.keys().copied().filter(|p| is_warm(p.0, p.2)).collect();
+        let keys: Vec<(i32,i32,i32)> = { let region = region_guard();
+            cg.keys().copied().filter(|p| region.is_warm(p.0, p.2)).collect() };
         for p in keys {
             let age = cg.get(&p).cloned().unwrap_or(0);
             let hh = ((p.0 as i64).wrapping_mul(31) ^ (p.2 as i64).wrapping_mul(37) ^ (p.1 as i64) ^ t as i64) as u64;
@@ -1816,7 +1817,8 @@ fn keepalive_time_tick() {
         // a farm can out-spawn the despawn window.
         let mut xl = xps().lock().unwrap();
         let life = server_ticks(XP_LIFE_GT) as i32;
-        for x in xl.iter_mut() { if is_hot(x.x as i32, x.z as i32) { x.age += 1; } }
+        { let region = region_guard();
+          for x in xl.iter_mut() { if region.is_hot(x.x as i32, x.z as i32) { x.age += 1; } } }
         let exp: Vec<i32> = xl.iter().filter(|x| x.age >= life && is_hot(x.x as i32, x.z as i32)).map(|x| x.eid).collect();
         for eid in &exp {
             xl.retain(|x| x.eid != *eid);
@@ -2094,12 +2096,11 @@ fn furnace_tick() {
     let mut fs = furnaces().lock().unwrap();
     if fs.is_empty() { return }
     let mut dirty_pos: Vec<(i32,i32,i32)> = Vec::new();
-    // One membership lock per tick, not one per furnace: is_warm re-locks the
-    // same mutex on every call, which dominated this stage.
-    let warm = warm().lock().unwrap();
-    let in_warm = |x: i32, z: i32| warm.contains(&(x.div_euclid(16), z.div_euclid(16)));
+    // One region borrow for the whole loop. Acquiring the mutex per furnace was
+    // what dominated this stage, not the set lookup itself.
+    let region = region_guard();
     for (pos, f) in fs.iter_mut() {
-        if !in_warm(pos.0, pos.2) { continue }
+        if !region.is_warm(pos.0, pos.2) { continue }
         // The recipe result is only ever read behind `input.1 > 0`, so an empty
         // input skips the lookup instead of hashing an item it cannot smelt.
         let out = if f.input.1 > 0 {
@@ -2133,7 +2134,7 @@ fn furnace_tick() {
         }
         if f.dirty { f.dirty = false; dirty_pos.push(*pos); }
     }
-    drop(warm);
+    drop(region);
     drop(fs);
     if dirty_pos.is_empty() { return }
     let cs: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
@@ -2325,8 +2326,10 @@ fn lava_tick() {
     // horizontally in the overworld. Our tick=TICK_MS ~5gt, so gating to
     // every 6th tick lands near 30gt.
     let cells: Vec<(i32, i32, i32)> = lavas().lock().unwrap().iter().copied().collect();
+    let region = (!cells.is_empty()).then(region_guard);
     for (x, y, z) in cells {
-        if !is_warm(x, z) || !sched_ready(x, y, z) { continue }
+        let region = region.as_ref().unwrap();
+        if !region.is_warm(x, z) || !sched_ready(x, y, z) { continue }
         let st = block_at(x, y, z);
         if !(96..=111).contains(&st) { lavas().lock().unwrap().remove(&(x, y, z)); continue; }
         let lvl = st - 96;
@@ -2358,8 +2361,12 @@ fn lava_tick() {
 fn water_tick() {
     // vanilla-ish: source(80) spreads horizontally into air, level+1, max level 7
     let cells: Vec<(i32, i32, i32)> = waters().lock().unwrap().iter().copied().collect();
+    // One region borrow for the loop: a per-cell is_warm acquired the mutex once
+    // per registered cell, every tick.
+    let region = (!cells.is_empty()).then(region_guard);
     for (x, y, z) in cells {
-        if !is_warm(x, z) || !sched_ready(x, y, z) { continue }
+        let region = region.as_ref().unwrap();
+        if !region.is_warm(x, z) || !sched_ready(x, y, z) { continue }
         let st = block_at(x, y, z);
         if !(80..=95).contains(&st) { waters().lock().unwrap().remove(&(x, y, z)); continue; }
         let lvl = st - 80;
@@ -2430,8 +2437,10 @@ fn observer_tick() {
 }
 fn hopper_tick() {
     let hs: Vec<(i32, i32, i32)> = hoppers().lock().unwrap().iter().copied().collect();
+    let region = (!hs.is_empty()).then(region_guard);
     for (hx, hy, hz) in hs {
-        if !is_warm(hx, hz) || !sched_ready(hx, hy, hz) { continue }
+        let region = region.as_ref().unwrap();
+        if !region.is_warm(hx, hz) || !sched_ready(hx, hy, hz) { continue }
         let st = block_at(hx, hy, hz);
         if !(9225..=9234).contains(&st) { hoppers().lock().unwrap().remove(&(hx, hy, hz)); continue; }
         if st >= 9230 { sched_result(hx, hy, hz, false); continue; } // powered(disabled) hopper holds items
@@ -2621,7 +2630,8 @@ fn drop_tick() {
         // inside any one despawn window — oldest lose first.
         let mut dp = drops().lock().unwrap();
         let life = server_ticks(DROP_LIFE_GT) as i32;
-        for d in dp.iter_mut() { if is_hot(d.x as i32, d.z as i32) { d.age += 1; } }
+        { let region = region_guard();
+          for d in dp.iter_mut() { if region.is_hot(d.x as i32, d.z as i32) { d.age += 1; } } }
         let exp: Vec<i32> = dp.iter().filter(|d| d.age >= life).map(|d| d.eid).collect();
         for eid in &exp {
             dp.retain(|d| d.eid != *eid);
@@ -3362,8 +3372,33 @@ fn refresh_hidden_neighbors(x: i32, y: i32, z: i32) {
 // hot region: chunks ticked by observers (players + actors) plus forceloaded
 // chunks — everything outside sleeps, so idle CPU ~0 and mechanics outside
 // view distance don't burn cycles (lazy-tick generalization).
-static HOT: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
-fn hot() -> &'static Mutex<HashSet<(i32, i32)>> { HOT.get_or_init(|| Mutex::new(HashSet::new())) }
+/// The tick's view of which chunks are in scope, in one owner.
+///
+/// `refresh_hot` builds it once at the start of a tick and every system reads
+/// that same set. Two things follow. A membership test costs a set lookup with
+/// no lock, so a loop over N items acquires the mutex once instead of N times;
+/// measuring the furnace loop showed that acquisition, not the lookup, was the
+/// cost. And no caller can observe the region changing between two membership
+/// tests inside one tick, because only `refresh_hot` writes it and it runs
+/// first.
+#[derive(Default)]
+pub struct Region {
+    hot: HashSet<(i32, i32)>,
+    warm: HashSet<(i32, i32)>,
+}
+impl Region {
+    fn is_hot(&self, x: i32, z: i32) -> bool {
+        self.hot.contains(&(x.div_euclid(16), z.div_euclid(16)))
+    }
+    fn is_warm(&self, x: i32, z: i32) -> bool {
+        self.warm.contains(&(x.div_euclid(16), z.div_euclid(16)))
+    }
+}
+static REGION: OnceLock<Mutex<Region>> = OnceLock::new();
+fn region() -> &'static Mutex<Region> { REGION.get_or_init(|| Mutex::new(Region::default())) }
+/// Borrow the region for the duration of one loop. This is the shape a per-item
+/// membership test in a hot loop should use.
+fn region_guard() -> std::sync::MutexGuard<'static, Region> { region().lock().unwrap() }
 static FORCELOADED: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
 fn forceloaded() -> &'static Mutex<HashSet<(i32, i32)>> { FORCELOADED.get_or_init(|| Mutex::new(HashSet::new())) }
 fn extend_chunk_square(chunks: &mut HashSet<(i32, i32)>, (cx, cz): (i32, i32), radius: i32) {
@@ -3397,15 +3432,14 @@ fn refresh_hot() {
         w = h.clone();
         for &center in &h { extend_chunk_square(&mut w, center, 3); }
     }
-    *hot().lock().unwrap() = h;
-    *warm().lock().unwrap() = w;
+    let mut r = region().lock().unwrap();
+    r.hot = h;
+    r.warm = w;
 }
-fn is_hot(x: i32, z: i32) -> bool { hot().lock().unwrap().contains(&(x.div_euclid(16), z.div_euclid(16))) }
+fn is_hot(x: i32, z: i32) -> bool { region().lock().unwrap().is_hot(x, z) }
 // warm ring: block-level systems tick, entities/projectiles stay frozen —
 // the vanilla lazy-chunk analogue (blocks progress, entities don't).
-static WARM: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
-fn warm() -> &'static Mutex<HashSet<(i32, i32)>> { WARM.get_or_init(|| Mutex::new(HashSet::new())) }
-fn is_warm(x: i32, z: i32) -> bool { warm().lock().unwrap().contains(&(x.div_euclid(16), z.div_euclid(16))) }
+fn is_warm(x: i32, z: i32) -> bool { region().lock().unwrap().is_warm(x, z) }
 
 // generalized lazy-schedule primitive (the Create-generalization core):
 // a cell that produces no observable change doubles its re-check interval
@@ -13772,6 +13806,26 @@ fn main() {
         }
     }
 }
+
+/// Test-only access to the region snapshot. The production code reads it through
+/// `region_guard`; these exist so a fixture can save, force and restore it.
+#[cfg(test)]
+pub fn test_region() -> (HashSet<(i32, i32)>, HashSet<(i32, i32)>) {
+    let r = region().lock().unwrap();
+    (r.hot.clone(), r.warm.clone())
+}
+#[cfg(test)]
+pub fn set_test_region(hot: HashSet<(i32, i32)>, warm: HashSet<(i32, i32)>) {
+    let mut r = region().lock().unwrap();
+    r.hot = hot;
+    r.warm = warm;
+}
+#[cfg(test)]
+pub fn set_test_region_warm(warm: HashSet<(i32, i32)>) { region().lock().unwrap().warm = warm; }
+#[cfg(test)]
+pub fn test_region_warm_insert(c: (i32, i32)) { region().lock().unwrap().warm.insert(c); }
+#[cfg(test)]
+pub fn test_region_warm_remove(c: &(i32, i32)) { region().lock().unwrap().warm.remove(c); }
 
 // Hold across setup, tick execution and restoration of shared world fixtures.
 #[cfg(test)]

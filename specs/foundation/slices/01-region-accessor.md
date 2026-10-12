@@ -1,5 +1,8 @@
 # 01 — Region accessor（所属判定を1箇所に集める）
 
+Status: 実装済み。測定は [region-accessor](../../../evidence/time-contract/region-accessor/README.md)。
+残り18箇所のper-item呼び出しは同じ形で順次移す。
+
 ## Why
 
 `is_hot(x,z)` / `is_warm(x,z)` は呼ぶたびにmutexを取る。

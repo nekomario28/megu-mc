@@ -15,8 +15,7 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
     let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
@@ -36,8 +35,7 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
     let clocks = (TICK.load(Ordering::Relaxed), TICK_IDX.load(Ordering::Relaxed), WORLD_TIME.load(Ordering::Relaxed));
     *furnaces().lock().unwrap() = old_furnaces;
     *forceloaded().lock().unwrap() = old_forced;
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     WORLD_TIME.store(old_time, Ordering::Relaxed);
@@ -53,11 +51,10 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
     assert!(clients().lock().unwrap().is_empty());
     let old_actors = std::mem::take(&mut *actors().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     let mut observations = Vec::new();
     refresh_hot();
-    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), HashSet::new(), HashSet::new()));
+    observations.push((test_region().0, test_region().1, HashSet::new(), HashSet::new()));
     for name in ["moving", "stationary"] {
         actors().lock().unwrap().insert(name.into(), Arc::new(Actor {
             name: name.into(), eid: 4242, pos: Mutex::new((0.0, 70.0, 0.0)),
@@ -86,7 +83,7 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
             for dx in -3..=3 { for dz in -3..=3 { expected_warm.insert((px + dx, pz + dz)); } }
         }
         refresh_hot();
-        observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+        observations.push((test_region().0, test_region().1, expected_hot, expected_warm));
     }
     actors().lock().unwrap().clear();
     for x in 0..10 { for z in 0..10 {
@@ -100,21 +97,20 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
     refresh_hot();
     let expected_hot = (-5..=14).flat_map(|x| (-5..=14).map(move |z| (x, z))).collect();
     let expected_warm = (-8..=17).flat_map(|x| (-8..=17).map(move |z| (x, z))).collect();
-    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+    observations.push((test_region().0, test_region().1, expected_hot, expected_warm));
     actors().lock().unwrap().clear();
     forceloaded().lock().unwrap().insert((-12, 9));
     refresh_hot();
     let expected_hot = HashSet::from([(-12, 9)]);
     let mut expected_warm = HashSet::new();
     for dx in -3..=3 { for dz in -3..=3 { expected_warm.insert((-12 + dx, 9 + dz)); } }
-    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), expected_hot, expected_warm));
+    observations.push((test_region().0, test_region().1, expected_hot, expected_warm));
     forceloaded().lock().unwrap().clear();
     refresh_hot();
-    observations.push((hot().lock().unwrap().clone(), warm().lock().unwrap().clone(), HashSet::new(), HashSet::new()));
+    observations.push((test_region().0, test_region().1, HashSet::new(), HashSet::new()));
     *actors().lock().unwrap() = old_actors;
     *forceloaded().lock().unwrap() = old_forced;
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     for (actual_hot, actual_warm, expected_hot, expected_warm) in observations {
         assert_eq!(actual_hot, expected_hot);
         assert_eq!(actual_warm, expected_warm);
@@ -133,16 +129,14 @@ fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let old_actors = std::mem::take(&mut *actors().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     let advanced = {
         game_tick(|_, tick| tick());
         WORLD_TIME.load(Ordering::Relaxed) - 1000
     };
     *actors().lock().unwrap() = old_actors;
     *forceloaded().lock().unwrap() = old_forced;
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     WORLD_TIME.store(old_time, Ordering::Relaxed);
@@ -159,8 +153,7 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let old_actors = std::mem::take(&mut *actors().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     let old_anchors: Vec<_> = [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT]
         .iter().map(|cell| *wall_anchor(cell).lock().unwrap()).collect();
     // Re-anchor every period so this test starts from a known wall clock and
@@ -194,8 +187,7 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     TICK_IDX.store(old_index, Ordering::Relaxed);
     *actors().lock().unwrap() = old_actors;
     *forceloaded().lock().unwrap() = old_forced;
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     for (cell, anchor) in [&KEEPALIVE_AT, &TIME_NOTIFY_AT, &SIZE_LOG_AT].iter().zip(old_anchors) {
         *wall_anchor(cell).lock().unwrap() = anchor;
     }
@@ -275,8 +267,7 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     // Pin the vanilla game-tick values themselves. At 4TPS a one-game-tick drift
     // quantises away, so the projection alone cannot catch it.
     assert_eq!(TNT_FUSE_GT, 80);
@@ -308,8 +299,7 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
     *forceloaded().lock().unwrap() = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     assert_eq!(exploded_at, Some(80), "the 4s fuse must fire on its 80th hot tick");
     assert_eq!(cold_left, Some(3), "a cold fuse must not count down");
     // jitter 1 now survives the integer divide, which 4TPS quantised away.
@@ -324,8 +314,7 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     // Pin the vanilla game-tick values, not just their 4TPS projection.
     assert_eq!(PICKUP_DELAY_GT, 10);
     assert_eq!(DROP_LIFE_GT, 6000);
@@ -360,8 +349,7 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     *forceloaded().lock().unwrap() = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     assert_eq!(hot_age, Some(5), "a hot drop must age once per tick");
     // XP aging runs in the environment stage, which precedes refresh_hot, so it
     // observes the previous tick hot set and trails the drop pass by one tick.
@@ -383,8 +371,7 @@ fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     let expected = server_ticks(AIR_SUPPLY_GT) as i32;
     // Every construction path shares one helper, so exercising the spawn path
     // covers the sites that build creatures directly.
@@ -395,8 +382,7 @@ fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
     *forceloaded().lock().unwrap() = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     seen.retain(|air| *air > 0);
     assert!(seen.iter().all(|air| *air == expected), "air supply was {seen:?}, expected {expected}");
 }
@@ -578,8 +564,7 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
-    let old_hot = hot().lock().unwrap().clone();
-    let old_warm = warm().lock().unwrap().clone();
+    let (old_hot, old_warm) = test_region();
     forceloaded().lock().unwrap().insert((0, 0));
     arrows().lock().unwrap().push(Arrow { eid: 8001, owner: 1, x: 0.5, y: 120.0, z: 0.5,
         dx: 1.0, dy: 0.0, dz: 0.0, ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 6.0, fire: 0,
@@ -599,8 +584,7 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
     *forceloaded().lock().unwrap() = old_forced;
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
-    *hot().lock().unwrap() = old_hot;
-    *warm().lock().unwrap() = old_warm;
+    set_test_region(old_hot, old_warm);
     assert_eq!(steps.len(), 5, "the arrow left the hot set: {steps:?}");
     // Horizontal velocity must shrink by the drag factor every tick, and the step
     // must equal the velocity rather than the velocity times the drag.
