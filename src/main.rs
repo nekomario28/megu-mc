@@ -13255,6 +13255,13 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
 }
 
 // ---------- RCON (parity-fixture control plane) ----------
+// A panic in a connection handler must not leak a permanently reserved slot.
+struct ConnectionSlot<'a>(&'a AtomicUsize);
+impl std::ops::Drop for ConnectionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 fn rcon_conn(mut s: TcpStream, pass: String) {
     use std::io::Write;
     s.set_nodelay(true).ok();
