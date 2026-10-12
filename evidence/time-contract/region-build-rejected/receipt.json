@@ -1,0 +1,18 @@
+{
+  "claim": "a Vec+sort+dedup region build was measured and rejected, not shipped",
+  "why_measured": "hot_regions was the dominant measured cost at 20TPS (88-97 percent for actor fixtures, 44-47 percent for furnace fixtures)",
+  "result": "1.10-1.29x faster for sparse centers, 0.72x for densely clustered centers. Whole-process CPU 0.2766s -> 0.3469s.",
+  "decision": "reverted. Clustered centers are the realistic load because players gather at bases and spawns, so a 40 percent regression there outweighs the sparse-case win.",
+  "mechanism": "sorting costs O(candidates) while hash dedup costs O(distinct chunks). Dense centers make candidates far exceed the distinct set.",
+  "bug_found": "the candidate dropped forceloaded chunks from hot. The independent-oracle membership test caught the missing (200,-200).",
+  "provenance_note": "results.json was captured on the candidate sources. HEAD differs in: ['src/main.rs']. Reverted, so HEAD is the pre-candidate code.",
+  "next": "only attempt again with a strategy branch chosen by candidate-count versus set-size ratio, and only if it wins on every fixture shape.",
+  "files_sha256": {
+    "README.md": "65675205186f7d8eec54152d67c7a74410882c2fa834e0e7a76a368208ed9dea",
+    "build.log": "d1a29e4a16737ac6e34f150b5ac095e5b332e7df51d26e7a9ee0378bcfd675a1",
+    "results.json": "129d5d176265ac204816cbe527225f10d183073b84143ec1997bfe714b0cc208",
+    "run-0.log": "a65072cf46604be5c531dafe933941e41f392701850638d02fc135dd5b2cbc5b",
+    "run-1.log": "412f01167f3ceec8829ab3cb1aed615d01bb0642385b30b58e52fe8590406b78",
+    "run-2.log": "b24d57afbe600d8d0893021a0249ad1a2e43dd88d822cf079d4d419102fd2b32"
+  }
+}
