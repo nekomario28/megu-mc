@@ -1201,8 +1201,9 @@ fn totem_check(c: &Client) {
 // Both death-protection paths own the effect guard; do not acquire it here.
 fn totem_effects(ef: &mut Vec<Eff>) {
     ef.clear();
-    // Stored durations are still server ticks: vanilla 900 / 100 / 800 game ticks.
-    // Wire values derive from GAME_TICKS_PER_TICK.
+    // Vanilla grants 900 / 100 / 800 game ticks. At 20TPS a server tick is a game
+    // tick, so these are also the stored server-tick values and the wire takes
+    // them unchanged; there is no conversion left to apply.
     for (name, amp, dur) in [("regeneration", 1, 900), ("absorption", 1, 100), ("fire_resistance", 0, 800)] {
         let id = name_to_effect(name).expect("totem effect must exist in the effect registry");
         ef.push(Eff { id, amp, left: server_ticks(dur) as i32 });
@@ -1775,7 +1776,12 @@ fn keepalive_time_tick() {
             let blocked = block_at(p0.x.floor() as i32, p0.y.floor() as i32, p0.z.floor() as i32) != 0;
             if hit_mob.is_some() || blocked || p0.ttl <= 0 { done.push((p0.eid, hit_mob, p0.dx, p0.dz, p0.egg, p0.x, p0.y, p0.z)); }
             else {
-                p0.x += p0.dx; p0.y += p0.dy; p0.z += p0.dz; p0.dy -= 0.05;
+                // Snowballs and eggs are ThrowableProjectile, like the pearl, so
+                // they scale the velocity by 0.99 and use the 0.03 gravity. This
+                // path had no drag at all and the wrong gravity.
+                p0.dx *= 0.99; p0.dy *= 0.99; p0.dz *= 0.99;
+                p0.dy -= 0.03;
+                p0.x += p0.dx; p0.y += p0.dy; p0.z += p0.dz;
                 broadcast_seen(p0.eid, |_c| (0x70, entity_teleport(p0.eid, p0.x, p0.y, p0.z, 0.0, 0.0, true)));
             }
         }

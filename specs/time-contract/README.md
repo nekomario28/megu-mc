@@ -1,73 +1,72 @@
 # 忠実なゲーム時間と、結果不変の処理省略
 
-Status: 20TPS化 完了・CI green — vanilla動的同等性・軽量化の実証・実クライアント検証・独立レビューは未達。
+Status: 20TPS化 完了・CI green・独立レビュー1回受領（REQUEST CHANGES、P1は対応済み）。
+未達: vanilla動的同等性・実クライアント検証・負荷計測・統合headの再レビュー。
 
 ## Next Agent Prompt
 
-目的は「超軽量だがゲームの結果は変えない」。前提の参照値は
-[時間契約の一次証拠](../../../evidence/time-contract/README.md)、既存の影響表は
-[時間契約の設計](../../../TIME-CONTRACT-DESIGN.md)を読む。
-ユーザーは「忠実な20TPS＋必要な対象だけ実行」という推奨方針で進めることを承認した。
-意図的なゲーム結果の近似は採用しない。小差の具体的な許可リストはまだない。
+目的は「超軽量だがゲームの結果は変えない」。一次参照は
+[時間契約の一次証拠](../../../evidence/time-contract/README.md)、影響表は
+[時間契約の設計](../../../TIME-CONTRACT-DESIGN.md)。
+ユーザーは「忠実な20TPS＋必要な対象だけ実行」を承認し、移動係数はvanilla値（案B）を選んだ。
+
+branchは `fix/20tps-integrated`。20TPS時間契約とPR #2のhardeningを統合したheadで、
+これが正系。`fix/20tps-time-contract` は時間契約のみ、`fix/audit-1-on-20tps` は削除済み。
+
+**まず [矛盾の棚卸し](slices/26-contradictions.md) を読む。** 計画文書が実装から
+どれだけ乖離していたかと、その是正を記録してある。
 
 [トーテム効果集合](slices/01-totem-grant.md) の付与関数修正と回帰テストは完了。
 [実際の発動・通知・吸収](slices/02-totem-activation.md) のRust/TCPゲートも通った。
-[本番tick計測](slices/03-tick-baseline.md) を追加し、[切替前の限定fixture測定](../../evidence/time-contract/tick-baseline/README.md) を実行した。
-[hot/warm集合構築](slices/04-region-expansion.md) の等価変形も適用・検証した。
-[時間語の単一所有者](slices/05-cadence-owner.md) で `TICK_MS` から全境界を導出した。
-[実時間境界](slices/06-wall-clock.md) のkeepalive/通知と、[ゲーム時間周期](slices/07-game-tick-periods.md)
-のダメージ間隔、[保存tick語の値](slices/08-stored-durations.md) の炉/燃料/空気/天候、
-[1tickあたりの割合](slices/09-per-tick-rates.md) の作物成長と周期スケジュール、
-[導火線](slices/10-tnt-fuse.md)、[Drop/Xp寿命とpickup遅延](slices/11-entity-life.md)
-のgame tick化、[永続化のround-trip検証](slices/12-persistence.md)、
-[飛翔体TTLの実時間復元](slices/22-projectile-ttl.md)、
-[tick周期と確率の網羅監査](slices/23-tick-periods-audit.md)、
-[tick pacing のdrift補正](slices/24-tick-pacing.md) も
-同じ所有者から導出した。
-[20TPS切替](slices/13-cutover-20tps.md) を実行した。[証拠と測定](../../evidence/time-contract/cutover-20tps/README.md)。
-雷の持続も雨と別の値に直した。溶岩ダメージの変換漏れも発見・修正した。
-[限定fixtureのA/Bと限界](../../evidence/time-contract/region-expansion/README.md) を読む。
-切替の前提は揃った。次は `TICK_MS = 50` の1コミット。
-移動係数・TTLをvanillaへ置き換えるため**結果が変わる**。予告済み。
-**移動係数の扱いはユーザーの判断が必要。** 現在は「gravity-lite」近似で、
-vanillaのper-game-tick係数と実時間あたり一致しない。近似を実時間で保存するか、
-vanilla係数に置き換えるかで結果が変わる。弓矢/パール/Mob弓矢のttlと
-bobberの咬みもvanillaと大きく違う。この判断が出るまで20TPSは有効化しない。
-独立レビューで共有fixtureの並行実行競合も修正した。世界fixtureを追加するテストは
-setupからrestoreまでWORLD_TEST_LOCKを保持すること。
-移動/衝突、保存の単位、遅延時の方針を未決定のまま時計を変えてはいけない。
-終了時にこのpickupと検証結果を更新すること。
+[本番tick計測](slices/03-tick-baseline.md)、[hot/warm集合構築](slices/04-region-expansion.md)、
+[時間語の単一所有者](slices/05-cadence-owner.md)、[実時間境界](slices/06-wall-clock.md)、
+[ゲーム時間周期](slices/07-game-tick-periods.md)、[保存tick語の値](slices/08-stored-durations.md)、
+[1tickあたりの割合](slices/09-per-tick-rates.md)、[導火線](slices/10-tnt-fuse.md)、
+[Drop/Xp寿命とpickup遅延](slices/11-entity-life.md)、[永続化のround-trip検証](slices/12-persistence.md)、
+[20TPS切替](slices/13-cutover-20tps.md)、[MET4マーカー](slices/14-met4-marker.md)、
+[飛翔体TTLの実時間復元](slices/22-projectile-ttl.md)、[tick周期と確率の網羅監査](slices/23-tick-periods-audit.md)、
+[tick pacing のdrift補正](slices/24-tick-pacing.md) を適用した。
+
+軽量化は [炉の空input skip](slices/16-furnace-idle-skip.md)、
+[所属判定lockの集約](slices/18-membership-lock-hoist.md)、
+[dropマージのセルバケット化](slices/20-drop-merge-bucket.md) を採用。
+[region構築案](slices/15-region-build-rejected.md) は密集で後退したため不採用。
+
+[被ダメ無敵](slices/25-invulnerability.md) は仕様のみで未実装。
 
 - [x] トーテム効果のID・持続・既存効果除去を修正し、実際の付与関数で回帰検証。
 - [x] トーテムの通常被ダメ後/効果中の発動・TCP効果通知・吸収量の消費/期限切れをRust経路で検証。
 - [ ] 実クライアント/vanilla実サーバーでのトーテム比較（TCP検証は描画や全戦闘経路の証明ではない）。
-- [ ] ゲームtick語・実時間語を分離し、全ての生成/消費/保存/パケット境界を監査。
-- [ ] 20TPSへ一括移行（時刻・効果・精錬・機械・移動・導火線等の整合が先）。
+- [x] ゲームtick語・実時間語を分離し、生成/消費/保存/パケット境界を監査（slice 05–12, 23）。
+- [x] 20TPSへ一括移行（`bf2c595`。時刻・効果・精錬・機械・移動・導火線を同時に）。
 - [ ] 被ダメ・飛翔・天候・釣り等の状態条件を一次参照に合わせ、発生tickを比較。
-- [x] 切替前の本番tick経路を限定fixtureで測定（4TPS時間語・sleepなし。全サーバー性能ではない）。
-- [x] hot/warm集合を変えず重複挿入を削減。全負荷での速度改善は未証明。
-- [x] tick周期を `TICK_MS` の単一所有者にし、世界時刻・効果wire・秒変換を導出化。周期は不変。
-- [x] keepalive等の実時間境界を `every_ms` へ接続。keepaliveはvanillaの15000msに修正。
-- [x] 環境ダメージ/回復の周期を `server_tick_period` から導出。値と実時間間隔は不変。
-- [ ] 同条件20TPSでCPU/RSS/tick遅延を測り、費用の大きい箇所だけ最適化。
-
-後続項目はまだ実装可能なsliceに確定していない。着手前に状態の所有者・入力・
-動的ゲートを絞り、sliceとして具体化する。全体の終了をこの最初のパスと混同しない。
+      [被ダメ無敵](slices/25-invulnerability.md) は未実装。
+- [x] 切替前の本番tick経路を限定fixtureで測定。
+- [x] tick周期を `TICK_MS` の単一所有者にした。周期は50ms。
+- [x] keepalive等の実時間境界を `every_ms` へ接続。keepaliveはvanillaの15000ms。
+- [x] 環境ダメージ/回復の周期を `server_ticks` から導出。
+- [x] 同条件20TPSでfixtureのCPU/RSSを測り、費用の大きい箇所を最適化（slice 16/18/20）。
+- [ ] 実クライアント・vanilla動的比較・代表負荷での計測。
+- [ ] 統合headの独立再レビュー。
 
 ## 現在の検証
 
-トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも32 passed・1 ignored。clockは50ms。
-ignoredは専用runnerで前後各3プロセス実行したrelease計測用fixture。
-tickの炉stage欠落・ringの半径誤り・世界時刻の加算・効果wireの周期導出は
-それぞれ負の対照で検出した。keepaliveのtick除算とダメージ周期・保存値の換算方向の誤りも検出した。共有fixture競合も
-再現して修正し、対象テストの8thread実行を20回反復した。
-通常発動の吸収0、救命後の旧空腹効果の実行、期限切れ後に残る吸収をそれぞれ再現した。
-Fabric/NeoForge機能付きcargo checkも合格。**保存値と1tickあたり割合のsliceは独立レビューが
-未実行**（`codex review` が外部の利用制限で中断）。それ以外のパスは指摘なし
-（レビュー自体はテストを実行していない）。ログは
-[実装の証拠](../../evidence/time-contract/)に保存。
-clockは4TPSのまま。vanilla動的同等性・20TPS・全サーバーCPU/RSS・実クライアントは未検証。
+全テストはserial/parallelとも52 passed・1 ignored。clockは50ms。CI green
+（locked build・serialized tests・localhost wire smoke・Java adapter × 2）。
+ignoredは専用runnerで実行するrelease計測用fixture。
 
+独立レビューは [issue #7](https://github.com/nekomario28/mc-spine/issues/7) で1回受領し
+REQUEST CHANGES。P1は全て対応し、各修正に負の対照を付けた
+（spawn回転・負のdrop age・旧counter単位・save副作用・飛翔体drag）。
+P0は統合headで解消（[統合](slices/26-contradictions.md)）。
+[P2] `read_comps` も修正。残るは統合headの再レビュー。
+
+**自己レビューは代替にならない。** 統合の衝突解決10箇所で私が作った欠陥を2件、
+自己レビューで見つけた。計画と実装の乖離は [slice 26](slices/26-contradictions.md) を参照。
+
+Fabric/NeoForge機能付きcargo checkも合格。ログは
+[実装の証拠](../../evidence/time-contract/)に保存。
+vanilla動的同等性・全サーバーCPU/RSS・実クライアントは未検証。
 ## 守る契約
 
 - ゲーム時間・乱数・状態はRustに一つだけ置く。Java側に別の世界を進めない。
@@ -86,7 +85,7 @@ clockは4TPSのまま。vanilla動的同等性・20TPS・全サーバーCPU/RSS�
 付与・tick更新・パケットは既存のEff経路を修正する。新しい平行の効果状態を作らない。
 プレイヤー単位の効果更新は`effects::tick_effects`が所有し、主ループとテストが同じ関数を使う。
 時間移行のためだけの二重モードや汎用schedulerは増設しない。
-初期のトーテム修正では現行4TPSの保存語を維持し、その限界をsliceに明記する。
+トーテム修正を先に行った理由は、切替が不可分で他を巻き込むためだった。
 
 ## 検証境界
 
