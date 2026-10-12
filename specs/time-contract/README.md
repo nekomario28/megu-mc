@@ -5,34 +5,16 @@ Status: 20TPS化 完了・CI green・独立レビュー1回受領（REQUEST CHAN
 
 ## Next Agent Prompt
 
-目的は「超軽量だがゲームの結果は変えない」。一次参照は
+**現在の状態は [specs/README.md](../README.md)（集約文書）を見る。**
+この文書は時間契約の契約・検証境界・slice一覧を所有する。
+
+目的は「超軽量化だがゲームの結果は変えない」。一次参照は
 [時間契約の一次証拠](../../../evidence/time-contract/README.md)、影響表は
 [時間契約の設計](../../../TIME-CONTRACT-DESIGN.md)。
 ユーザーは「忠実な20TPS＋必要な対象だけ実行」を承認し、移動係数はvanilla値（案B）を選んだ。
 
-branchは `fix/20tps-integrated`。20TPS時間契約とPR #2のhardeningを統合したheadで、
-これが正系。`fix/20tps-time-contract` は時間契約のみ、`fix/audit-1-on-20tps` は削除済み。
-
-**まず [矛盾の棚卸し](slices/26-contradictions.md) を読む。** 計画文書が実装から
-どれだけ乖離していたかと、その是正を記録してある。
-
-[トーテム効果集合](slices/01-totem-grant.md) の付与関数修正と回帰テストは完了。
-[実際の発動・通知・吸収](slices/02-totem-activation.md) のRust/TCPゲートも通った。
-[本番tick計測](slices/03-tick-baseline.md)、[hot/warm集合構築](slices/04-region-expansion.md)、
-[時間語の単一所有者](slices/05-cadence-owner.md)、[実時間境界](slices/06-wall-clock.md)、
-[ゲーム時間周期](slices/07-game-tick-periods.md)、[保存tick語の値](slices/08-stored-durations.md)、
-[1tickあたりの割合](slices/09-per-tick-rates.md)、[導火線](slices/10-tnt-fuse.md)、
-[Drop/Xp寿命とpickup遅延](slices/11-entity-life.md)、[永続化のround-trip検証](slices/12-persistence.md)、
-[20TPS切替](slices/13-cutover-20tps.md)、[MET4マーカー](slices/14-met4-marker.md)、
-[飛翔体TTLの実時間復元](slices/22-projectile-ttl.md)、[tick周期と確率の網羅監査](slices/23-tick-periods-audit.md)、
-[tick pacing のdrift補正](slices/24-tick-pacing.md) を適用した。
-
-軽量化は [炉の空input skip](slices/16-furnace-idle-skip.md)、
-[所属判定lockの集約](slices/18-membership-lock-hoist.md)、
-[dropマージのセルバケット化](slices/20-drop-merge-bucket.md) を採用。
-[region構築案](slices/15-region-build-rejected.md) は密集で後退したため不採用。
-
-[被ダメ無敵](slices/25-invulnerability.md) は仕様のみで未実装。
+この時間契約は `fix/20tps-integrated` に取り込まれている。
+独立レビュー（issue #7）の P1 は対応済みで、各修正に負の対照がある。
 
 - [x] トーテム効果のID・持続・既存効果除去を修正し、実際の付与関数で回帰検証。
 - [x] トーテムの通常被ダメ後/効果中の発動・TCP効果通知・吸収量の消費/期限切れをRust経路で検証。
@@ -51,22 +33,12 @@ branchは `fix/20tps-integrated`。20TPS時間契約とPR #2のhardeningを統�
 
 ## 現在の検証
 
-全テストはserial/parallelとも52 passed・1 ignored。clockは50ms。CI green
-（locked build・serialized tests・localhost wire smoke・Java adapter × 2）。
-ignoredは専用runnerで実行するrelease計測用fixture。
+全テストは [specs/README.md](../README.md) を参照。clockは50ms、CI green。
+独立レビューは issue #7 で1回受領し REQUEST CHANGES、P1は全て対応。
+自己レビューは統合の衝突解決で私が作った欠陥2件を見つけた。
+**自己レビューは代替にならない。**
+計画と実装の乖離は [slice 26](slices/26-contradictions.md)。
 
-独立レビューは [issue #7](https://github.com/nekomario28/mc-spine/issues/7) で1回受領し
-REQUEST CHANGES。P1は全て対応し、各修正に負の対照を付けた
-（spawn回転・負のdrop age・旧counter単位・save副作用・飛翔体drag）。
-P0は統合headで解消（[統合](slices/26-contradictions.md)）。
-[P2] `read_comps` も修正。残るは統合headの再レビュー。
-
-**自己レビューは代替にならない。** 統合の衝突解決10箇所で私が作った欠陥を2件、
-自己レビューで見つけた。計画と実装の乖離は [slice 26](slices/26-contradictions.md) を参照。
-
-Fabric/NeoForge機能付きcargo checkも合格。ログは
-[実装の証拠](../../evidence/time-contract/)に保存。
-vanilla動的同等性・全サーバーCPU/RSS・実クライアントは未検証。
 ## 守る契約
 
 - ゲーム時間・乱数・状態はRustに一つだけ置く。Java側に別の世界を進めない。

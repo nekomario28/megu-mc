@@ -1,0 +1,124 @@
+# 現在状態の集約（次の判断の入口）
+
+この文書は**加速層**であり、権威ではない。権威は各spec・CI・証拠。
+下の各specへ降りて確認する。書いた時点の状態を1箇所にまとめ、
+次のセッションが再構成せずに判断できるようにする。
+
+## CURRENT OBJECTIVE
+
+**小規模・低負荷の世界で計算量を減らし、必要な既存Modも使えるサーバーを作る。**
+観測可能な挙動を保つことが前提（[DESIGN.md](../DESIGN.md)）。
+
+順序は「基盤を先に」。20TPS時間契約は完了し、いまは基盤の共通部品を作っている。
+「超軽量化の実証」は**まだ達成していない**。
+
+## CURRENT AUTHORITY / HEAD
+
+| | |
+|---|---|
+| branch | **`fix/20tps-integrated`** |
+| HEAD | `0902a57` |
+| 状態 | ツリーclean、リモートと一致、**CI green** |
+| `main` との差 | **64 commit**。`main` は `4e5f3e6`（未マージ） |
+| テスト | **64 passed**（serial／8thread×3回連続）、CI 4step通過 |
+
+`fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
+`fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
+`fix/audit-1-on-20tps` は削除済み。
+
+## PROVEN / ACCEPTED
+
+**時間契約（[time-contract](time-contract/README.md)）**
+- `TICK_MS = 50`。全境界（時刻・効果・精錬・機械・移動・導火線・TTL・周期・確率）を
+  `TICK_MS` から導出。独立レビュー（issue #7）の P1 は全て対応し、各修正に負の対照を付けた
+- 移動係数は javap 一次証拠から vanilla 値
+- 実バグを6件発見・修正（溶岩リテラル・save/load単位・air供給・TTL・座標OF・
+  旧counter単位・save副作用・飛翔体drag）
+
+**基盤（[foundation](foundation/README.md)）**
+- **slice 01 Region accessor 完了**：per-item lockを1箇所に。entity-heavy fixtureで
+  **x1.148 / x1.184**（測定）
+- **slice 02 Scheduled-tick queue 完了**：遅延リング＋重複排除。**水・溶岩・ホッパー
+  全てを移行**し、毎tick全セルclone＋巡回は**0件**。痕跡ゲート3本で等価性を確認
+
+**セキュリティ**：PR #2のhardeningを統合（権限・RCON・handshake・save envelope・
+起動時検証・pre-play deadline）
+
+## DISPROVEN / SUPERSEDED
+
+**再開しないこと（negative knowledge）**
+- **PR #2の素朴な20TPS（`56a6e79`）は取り込まない。** `TICK_MS` を50にするだけで
+  効果持続・炉・空気・TTL・移動係数を変換しておらず、取り込むと後退する。
+  pacing部分だけ移植済み
+- **region構築のVec+sort+dedupは不採用**。密集した中心で x0.72
+- **drop/xp/作物/mobのlock hoistは不採用**（fixtureにその要素が無く測れない）
+- **`save_world_into` の旧実装はデータ損失**。resting tridentがsaveから失われていた
+
+**測定方法の失敗（繰り返さない）**
+- before/afterを数分離して測ると**環境負荷を変更の効果と誤読**する。
+  同一コードの再測定で壁時計8.5%・CPU時間19%変動。**連続して測る**
+- **fixtureに無い要素の最適化は測れない**（slice 18で3回踏んだ）
+- `tc qdisc` 等でリソース制限すると、制限が全体にかかり測定環境を壊す
+
+## UNRESOLVED
+
+| 項目 | 場所 |
+|---|---|
+| **独立レビュー**：統合headの衝突解決10箇所は未確認 | issue #7 |
+| 基盤 slice 03〜06 | [foundation](foundation/README.md) |
+| 被ダメ無敵をvanilla `invulnerableTime` 20へ（未実装） | [slice 25](time-contract/slices/25-invulnerability.md) |
+| 実クライアント・vanilla動的比較・代表負荷計測 | 全て未実施 |
+| `sched_ready` が3ループに冗長に残る（掃除候補） | [tick-queue](../evidence/foundation/tick-queue/README.md) |
+
+## INVARIANTS / DO-NOT-CHANGE
+
+- ゲーム時間・乱数・状態はRustに一つだけ。Java側に別の世界を進めない
+- 省略は結果と発生tickが不変と証明した対象だけ。**定数の時間換算を状態再現と呼ばない**
+- scheduled tickの遅延値を全セルの永久巡回周期に読み替えない（slice 02で解消済み）
+- 休止には漏れない起床条件が要る。**起床条件漏れは不合格**
+- 時間語の変換は**周期は割る・確率は掛ける**。方向を間違えると5倍/8倍ずれる
+- 永続化の単位はMET4。旧MET2/MET3はミリ秒（age系）と4TPS tick（counter系）の2種類
+- 測定は **x1.10未満を主張しない**（ノイズが大きい）
+- `main` に直接入れない。段階ごとにbranchを切りCIを通す
+
+## CURRENT FIRST BLOCKER
+
+**独立レビューが一度も通っていない。** `codex review` は外部の利用制限で不通。
+統合headは衝突解決を10箇所で行い、**その正しさは未確認**。
+自己レビューで私が作った欠陥を2件見つけた（`read_comps` の重複、saveの二重書込）
+ので、他にも残っている可能性がある。
+
+## FINITE DECISION TREE
+
+1. **基盤 slice 03（Registry）を実装する** — 独立した測定可能な利得がある。
+   ただし制約2件の解決が先（`CachedLookup` は `Copy` のみ対応／可変表の読者は12箇所）
+2. **基盤 slice 04（Entity framework）を実装する** — 物理4重複の解消。大規模
+3. **slice 05/06 を進める** — 05は新状態を持つ部品ごと、06はPR #6の取り込み
+4. **実環境計測の手段を作る** — vanilla比較・実クライアント。軽量化の主張の前提
+5. **独立レビューを起こす** — 現在の最大の欠落
+
+## NEXT SMALLEST DISCRIMINATING ACTION
+
+**slice 03 の制約1を解決する。** `CachedLookup::get_or_compute` の `return *value` を
+`Clone` 対応にするか、`Comps` を含まない `Copy` な射影をキャッシュするか。
+**どちらが良いかを決める最小の判別**は、`smelt_out` の呼び出しで `Comps` が
+実際に必要かを確認すること（空Vecなら射影で足りる）。
+
+これは1ファイルで完結し、決定を1つ進める。**実装前に確認できる。**
+
+## EXPLICIT NON-NEXT WORK
+
+- **vanilla coeffやTTLの再変更**（レビュー済み・確定）
+- **PR #2の素朴な20TPSの取り込み**（却下済み）
+- **不採用にした最適化の再試行**（測定済み）
+- **fixtureに無い要素の最適化**（測れない）
+- `sched_ready` の削除（安全網。急がない）
+
+## EVIDENCE REFERENCES
+
+- 時間契約: [specs/time-contract](time-contract/README.md) / [evidence/time-contract](../evidence/time-contract/)
+- 基盤: [specs/foundation](foundation/README.md) / [evidence/foundation](../evidence/foundation/)
+- Mod互換: [specs/mod-compatibility](mod-compatibility/README.md)
+- 設計原則: [DESIGN.md](../DESIGN.md)
+- 独立レビュー: issue #7（REQUEST CHANGES、P1は対応済み）
+- Pumpkin採用の制約: issue #3（**GPL-3.0。コードは写さない**）
