@@ -777,3 +777,27 @@ fn lava_spread_trace_is_stable_across_the_scheduler_migration() {
         assert_eq!(*tick, 29 + 30 * (k as u64 - 1), "timing at change {k}");
     }
 }
+
+/// A neighbour change has to make a backed-off fluid cell due promptly. Clearing
+/// the backoff map alone did not: the delay queues carry their own deadline, so a
+/// waiting cell kept its old slot and was not visited until it came round, which
+/// is the opposite of being woken. This is the regression for that.
+#[test]
+fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let pos = (3, 70, 3);
+    // Park the cell far out in the queue, as a backed-off cell would be.
+    water_queue().lock().unwrap().schedule(pos, tick_queue::MAX_DELAY);
+    assert!(water_queue().lock().unwrap().len() > 0, "the cell must be waiting");
+    // A block change next to it must pull it forward.
+    sched_invalidate(pos.0 + 1, pos.1, pos.2);
+    // drain one tick's worth: the promoted cell must be in it
+    let mut found = false;
+    for _ in 0..2 {
+        let due = { let mut q = water_queue().lock().unwrap(); q.due() };
+        if due.contains(&pos) { found = true; break; }
+    }
+    // clean up whatever is left
+    water_queue().lock().unwrap().cancel(pos);
+    assert!(found, "a neighbour change must wake a waiting cell within two ticks");
+}

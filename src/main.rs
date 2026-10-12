@@ -3534,10 +3534,27 @@ fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
 /// any world mutation resets backoff for the cell and its 6 neighbors —
 /// the event-driven wake that makes lazy intervals safe.
 fn sched_invalidate(x: i32, y: i32, z: i32) {
-    let mut b = backoff().lock().unwrap();
-    b.remove(&(x, y, z));
-    for (dx, dy, dz) in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
-        b.remove(&(x + dx, y + dy, z + dz));
+    // The cell and its six neighbours are woken. Clearing the backoff alone is not
+    // enough: the delay queues hold their own deadline, so a cell that is already
+    // waiting would keep its old slot and not be visited until it came round,
+    // which is the opposite of waking it. Promote it to the next tick as well.
+    let cells: [(i32, i32, i32); 7] = [(x, y, z), (x+1, y, z), (x-1, y, z),
+                                      (x, y+1, z), (x, y-1, z), (x, y, z+1), (x, y, z-1)];
+    {
+        let mut b = backoff().lock().unwrap();
+        for c in cells { b.remove(&c); }
+    }
+    if !water_queue().lock().unwrap().is_empty() {
+        let mut q = water_queue().lock().unwrap();
+        for c in cells { q.promote(c); }
+    }
+    if !lava_queue().lock().unwrap().is_empty() {
+        let mut q = lava_queue().lock().unwrap();
+        for c in cells { q.promote(c); }
+    }
+    if !hopper_queue().lock().unwrap().is_empty() {
+        let mut q = hopper_queue().lock().unwrap();
+        for c in cells { q.promote(c); }
     }
 }
 

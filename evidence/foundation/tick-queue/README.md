@@ -156,13 +156,34 @@ delay = (*due - now + period - 1) / period     // period = server_ticks(FLUID_TI
 `waters()` / `lavas()` / `hoppers()` の
 `.lock().unwrap().iter().copied().collect()` は**0件**になった。
 
+### 掃除中に見つけた実バグ：起床条件が queue に届いていなかった
+
+`sched_ready` の冗長性を確認しようとして見つかった。
+
+`sched_invalidate` は **backoff map を消すだけ**で、**queue のエントリを
+移動していなかった**。delay queue は自前の締切を持つので、既に待っている
+セルは**古い枠のまま**残る。つまり隣のブロックが変わっても、
+そのセルは自分の順番が来るまで訪ねられない。**「起こす」の反対**。
+
+`sched_ready` はこれを隠していただけだった。移行で持ち込んだ潜在バグで、
+痕跡ゲートでは検出できなかった（「休止中のセルの隣が変わる」状況を
+シナリオが踏んでいなかった）。
+
+**修正**：`TickQueue::promote(pos)` を追加し、`sched_invalidate` が
+セルと6近傍を**3つのqueueすべてで** promote する。
+`promote` は既に待っているセルだけを動かす（挿入しない）。
+挿入すると、無関係なセルがqueueを汚す。
+
+**ゲート**：`a_neighbour_change_promotes_a_waiting_fluid_cell`。
+`promote` を `schedule(MAX_DELAY)` に変える負の対照で失敗
+（[promote-negative.log](promote-negative.log)）。
+
 ### 残る `sched_ready`
 
-3ループ内に `sched_ready` が残っている。queueのdue集合が既に
-「ready」を意味するので**冗長**だが、
-- 費用は**dueなセル数に比例**（全セルではない）ので目的は達成している
-- 安全網として残した
-将来の掃除候補として記録する。
+3ループ内の `sched_ready` は残した。今は本当に冗長だが、
+- 費用は**dueなセル数に比例**するので目的は達成している
+- 安全網として残す
+掃除候補として記録する。
 
 ## まだやっていないこと（重要）
 

@@ -72,6 +72,17 @@ impl TickQueue {
         self.waiting.insert(pos, b);
     }
 
+    /// Move `pos` to the next tick's bucket if it is already waiting, and report
+    /// whether it was. This is what a wake condition needs: a neighbour change
+    /// must make a backed-off cell due promptly. It deliberately does not insert,
+    /// because invalidation runs for every block change and would otherwise fill
+    /// the queue with cells that are not registered with this system at all.
+    pub(crate) fn promote(&mut self, pos: (i32, i32, i32)) -> bool {
+        if !self.waiting.contains_key(&pos) { return false }
+        self.reschedule(pos, 1);
+        true
+    }
+
     /// Drop `pos` from the queue if present.
     pub(crate) fn cancel(&mut self, pos: (i32, i32, i32)) {
         if let Some(previous) = self.waiting.remove(&pos) {
@@ -162,6 +173,19 @@ mod tests {
         let ticks = run(MAX_DELAY + 1, &mut q);
         let fired: usize = ticks.iter().map(|t| t.len()).sum();
         assert_eq!(fired, MAX_DELAY, "every entry must fire exactly once");
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn promote_pulls_a_waiting_cell_forward_and_ignores_a_stranger() {
+        // A neighbour change must make a backed-off cell due promptly, and must not
+        // enqueue a cell that belongs to some other system.
+        let mut q = TickQueue::new();
+        q.schedule((1, 1, 1), MAX_DELAY);
+        assert!(q.promote((1, 1, 1)), "a waiting cell must be promoted");
+        assert!(!q.promote((9, 9, 9)), "an unknown cell must not be inserted");
+        assert_eq!(q.len(), 1, "promote must not add entries");
+        assert_eq!(run(2, &mut q)[0], vec![(1, 1, 1)], "it must now be due next tick");
         assert!(q.is_empty());
     }
 
