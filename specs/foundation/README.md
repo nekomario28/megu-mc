@@ -72,6 +72,12 @@ for (x,y,z) in cells {
 | **永続化の section 登録** | 既存の全保存対象 | MET4で既に強制されている |
 | **Chunk送信 pipeline** | 既存の `stream_chunks` + ビュー距離の設定 | プレイヤー体験（別PR #6） |
 
+### 実害5：同じ式が35回書かれている（調査で発見）
+
+[slice 07](slices/07-redundancy-survey.md) のクローン検出より。`broadcast*` の
+呼び出しは94箇所あり、そのたびに `clients()` のスナップショット式が手で書かれていた。
+`fanout` と `client_snapshot()` に統合し、ロック順序の規則を関数にした。
+
 ## 順序
 
 依存が少なく効果が測れるものから。

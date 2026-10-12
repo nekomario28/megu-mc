@@ -282,13 +282,31 @@ fn head_rot(eid: i32, yaw: f32) -> Vec<u8> {
 // LOCK ORDER: acquires clients() internally — the caller must NOT
 // hold clients().lock() (self-deadlock). Per-client field locks are
 // fine: the client list is snapshotted before any field is touched.
-fn broadcast<F: Fn(&Client) -> (i64, Vec<u8>)>(me_eid: i32, mk: F) {
-    let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
-    for c in cls.iter() {
-        if c.eid == me_eid { continue }
+/// Snapshot the client list and release the lock before handing it back. Every
+/// caller must come through here, because sending while holding `clients()`
+/// self-deadlocks: the send paths acquire it themselves. That was hit twice
+/// before the rule was written down, so the rule is a function rather than a
+/// comment that the next caller has to find.
+fn client_snapshot() -> Vec<Arc<Client>> {
+    clients().lock().unwrap().iter().cloned().collect()
+}
+
+/// Send one packet to every client the predicate accepts. The snapshot is taken
+/// before any send, so the lock order above is structural rather than remembered.
+fn fanout<F, P>(interested: P, mk: F)
+where
+    F: Fn(&Client) -> (i64, Vec<u8>),
+    P: Fn(&Client) -> bool,
+{
+    for c in client_snapshot().iter() {
+        if !interested(c) { continue }
         let pl = mk(c);
         if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, pl.0, pl.1); }
     }
+}
+
+fn broadcast<F: Fn(&Client) -> (i64, Vec<u8>)>(me_eid: i32, mk: F) {
+    fanout(|c| c.eid != me_eid, mk)
 }
 // distance-gated broadcast: only clients within VIS_R2 of (x,y,z) get the
 // packet — "don't send what isn't visible" (bandwidth + anti-ESP)
@@ -309,7 +327,7 @@ const HOPPER_CAP: usize = 65536;
 // clients only know entities within VIS_R2 — spawn on approach,
 // destroy on leave, prune dead. Server never streams far entities.
 fn interest_tick() {
-    let cls: Vec<Arc<Client>> = clients().lock().unwrap().iter().cloned().collect();
+    let cls = client_snapshot();
     if cls.is_empty() { return }
     // spawn payloads are built lazily on the visible-transition only —
     // steady-state cost is one distance check per entity per client.
@@ -391,12 +409,7 @@ fn interest_tick() {
 // chunk-scoped broadcast: only clients currently holding the chunk —
 // block updates to an unloaded chunk would create phantom state.
 fn broadcast_chunk<F: Fn(&Client) -> (i64, Vec<u8>)>(cx: i32, cz: i32, mk: F) {
-    let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
-    for c in cls.iter() {
-        if !c.chunks.lock().unwrap().contains(&(cx, cz)) { continue }
-        let pl = mk(c);
-        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, pl.0, pl.1); }
-    }
+    fanout(|c| c.chunks.lock().unwrap().contains(&(cx, cz)), mk)
 }
 fn broadcast_seen_destroy(eid: i32) {
     let mut p = Vec::new(); write_varint(&mut p, 1); write_varint(&mut p, eid as i64);
@@ -410,13 +423,7 @@ fn broadcast_seen<F: Fn(&Client) -> (i64, Vec<u8>)>(eid: i32, mk: F) {
     broadcast_seen_ex(eid, 0, mk)
 }
 fn broadcast_seen_ex<F: Fn(&Client) -> (i64, Vec<u8>)>(eid: i32, excl: i32, mk: F) {
-    let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
-    for c in cls.iter() {
-        if c.eid == excl { continue }
-        if !c.seen.lock().unwrap().contains(&eid) { continue }
-        let pl = mk(c);
-        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, pl.0, pl.1); }
-    }
+    fanout(|c| c.eid != excl && c.seen.lock().unwrap().contains(&eid), mk)
 }
 
 // broadcast helpers return (packet_id, payload)
@@ -1501,7 +1508,7 @@ fn keepalive_time_tick() {
     }
     // hunger: drain by distance, regen at high food, starve at 0
     {
-        let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+        let cls: Vec<Arc<Client>> = client_snapshot();
         for c in cls.iter() {
             if *c.gm.lock().unwrap() == 1 { continue }
             let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
@@ -1651,7 +1658,7 @@ fn keepalive_time_tick() {
     // potion effects tick for ALL players (creative included — speed etc.
     // still apply there; damage effects are client-irrelevant in creative)
     {
-        let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+        let cls: Vec<Arc<Client>> = client_snapshot();
         for c in cls.iter() { effects::tick_effects(c); }
     }
     // crop growth: ~1/30 chance per real second (per-tick denominator scales
@@ -1686,7 +1693,7 @@ fn keepalive_time_tick() {
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1 && DIFFICULTY.load(Ordering::Relaxed) != 0
         && t % server_ticks(SPAWN_CYCLE_GT) == server_ticks(SPAWN_CYCLE_GT) / 2 && wt >= 13000 && wt <= 23000 {
         let mcount = mobs().lock().unwrap().iter().filter(|m| matches!(m.etype, 124 | 23 | 91 | 100)).count();
-        let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+        let cls: Vec<Arc<Client>> = client_snapshot();
         if mcount < 12 && !cls.is_empty() {
             // The spawn attempt count, not the world tick, drives the rotation.
             // Deriving it from t made the cadence change collapse the choice to a
@@ -1752,7 +1759,7 @@ fn keepalive_time_tick() {
             if let Some(peid) = dead_pearl {
                 broadcast_seen_destroy(peid);
             }
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == owner) {
                 { let mut p = c.pos.lock().unwrap(); *p = (tx, ty, tz, p.3, p.4, true); }
                 if let Ok(mut w) = c.sock.lock() {
@@ -1963,7 +1970,7 @@ fn arrow_tick() {
                 }
                 drop(ml);
                 if !dead.contains(&eid) {
-                    let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                    let cls: Vec<Arc<Client>> = client_snapshot();
                     'p2: for c in cls.iter() {
                         if c.eid == a.owner { continue }
                         let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
@@ -1981,7 +1988,7 @@ fn arrow_tick() {
                     }
                 }
             } else {
-                let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                let cls: Vec<Arc<Client>> = client_snapshot();
                 for c in cls.iter() {
                     let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
                     // player hitbox ~0.6 wide, 1.8 tall
@@ -2011,7 +2018,7 @@ fn arrow_tick() {
         broadcast_seen_destroy(*eid);
     }
     for (veid, admg) in hits {
-        let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+        let cls: Vec<Arc<Client>> = client_snapshot();
         if let Some(c) = cls.iter().find(|c| c.eid == veid) {
             if *c.gm.lock().unwrap() == 1 { continue }
             let mut h = c.hp.lock().unwrap();
@@ -2058,7 +2065,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
         }
     }}}
     broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
-    let cs: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+    let cs: Vec<Arc<Client>> = client_snapshot();
     for cl in cs {
         let (px,py,pz,..) = { let p = cl.pos.lock().unwrap(); *p };
         let dd = ((px-ex).powi(2)+(py-ey).powi(2)+(pz-ez).powi(2)).sqrt();
@@ -2148,7 +2155,7 @@ fn furnace_tick() {
     drop(region);
     drop(fs);
     if dirty_pos.is_empty() { return }
-    let cs: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+    let cs: Vec<Arc<Client>> = client_snapshot();
     for c in cs {
         let fp = *c.open_furnace.lock().unwrap();
         if let Some(fp) = fp {
@@ -2553,7 +2560,7 @@ fn drop_tick() {
     let mut taken: Vec<(i32, i32, Stack)> = vec![]; // (drop_eid, collector_eid, stack)
     {
         let ds: Vec<(i32,f64,f64,f64,Stack)> = drops().lock().unwrap().iter().map(|d| (d.eid,d.x,d.y,d.z,(d.item,d.cnt,d.comps.clone()))).collect();
-        let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+        let cls: Vec<Arc<Client>> = client_snapshot();
         for (d_eid, dx, dy, dz, d_stk) in ds.iter() {
             if !region.is_hot(*dx as i32, *dz as i32) { continue }
             for c in cls.iter() {
@@ -2570,7 +2577,7 @@ fn drop_tick() {
         let mut collected: Vec<(i32, i32, i16)> = vec![];
         {
             let xs = xps().lock().unwrap();
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             for x in xs.iter() {
                 for c in cls.iter() {
                     let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
@@ -2583,7 +2590,7 @@ fn drop_tick() {
         }
         for (xeid, ceid, val) in collected {
             xps().lock().unwrap().retain(|x| x.eid != xeid);
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == ceid) {
                 // mending: xp first repairs damaged mending gear (2 dur per xp)
                 let mut val = val as i64;
@@ -2621,7 +2628,7 @@ fn drop_tick() {
     }
     for (deid, ceid, stk) in taken {
         let (item, dcnt, dcomp) = (stk.0, stk.1, stk.2);
-        let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+        let cls: Vec<Arc<Client>> = client_snapshot();
         if let Some(c) = cls.iter().find(|c| c.eid == ceid) {
             // merge only into a same-item same-components slot (vanilla:
             // differing NBT never stacks), else a free slot
@@ -2714,7 +2721,7 @@ fn drop_tick() {
     }
 }
 fn mob_tick() {
-    let cls_snap: Vec<Arc<Client>> = clients().lock().unwrap().iter().cloned().collect();
+    let cls_snap = client_snapshot();
     let cls: Vec<(i32, f64, f64, f64)> = cls_snap.iter()
         .map(|c| { let p = c.pos.lock().unwrap(); (c.eid, p.0, p.1, p.2) }).collect();
     let wheat_holders: Vec<(f64, f64, f64)> = cls_snap.iter().filter(|c| {
@@ -3001,7 +3008,7 @@ fn mob_tick() {
                         // find which client is nearest & hurt them
                         let mut hurt_eid = None;
                         {
-                            let c: Vec<Arc<Client>> = clients().lock().unwrap().iter().cloned().collect();
+                            let c = client_snapshot();
                             for cl in c.iter() {
                                 let (cp0, _cp1, cp2) = { let cp = cl.pos.lock().unwrap(); (cp.0, cp.1, cp.2) };
                                 let (mx, _my, mz) = { let mp2 = m.pos.lock().unwrap(); (mp2.0, mp2.1, mp2.2) };
@@ -9081,7 +9088,7 @@ fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
             }
         };
     }
-    let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+    let cls: Vec<Arc<Client>> = client_snapshot();
     if sel == "@p" {
         if let Some(c) = ctx {
             let pp = *c.pos.lock().unwrap();
@@ -9309,7 +9316,7 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
                             let p = *p.pos.lock().unwrap(); cur.x = p.0; cur.y = p.1; cur.z = p.2;
                         }
                     } else if let Ok(eid) = t.parse::<i32>() {
-                        let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                        let cls: Vec<Arc<Client>> = client_snapshot();
                         if let Some(c) = cls.iter().find(|c| c.eid == eid) {
                             let p = *c.pos.lock().unwrap(); cur.x = p.0; cur.y = p.1; cur.z = p.2;
                         }
@@ -9419,7 +9426,7 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
         for t in &targets {
             if t.starts_with("m:") { continue } // mob-as-executor unsupported yet
             let eid: i32 = t.parse().unwrap_or(-1);
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == eid).cloned() {
                 let p = *c.pos.lock().unwrap();
                 let cc = CmdCtx { me: Some(c), x: p.0, y: p.1, z: p.2 };
@@ -9920,7 +9927,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 if let Some(nm) = &actor_tgt {
                     if let Some(a) = actors().lock().unwrap().get(nm) { *a.pos.lock().unwrap() = (x, y, z); n += 1; }
                 }
-                let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                let cls: Vec<Arc<Client>> = client_snapshot();
                 for t in &targets {
                     if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
                         { let mut p = c.pos.lock().unwrap(); *p = (x, y, z, p.3, p.4, true); }
@@ -9978,7 +9985,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     broadcast_seen_destroy(eid);
                     killed += 1;
                 } else if let Ok(eid) = t.parse::<i32>() {
-                    let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                    let cls: Vec<Arc<Client>> = client_snapshot();
                     if let Some(c) = cls.iter().find(|c| c.eid == eid) {
                         *c.hp.lock().unwrap() = 0.0;
                         if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(0.0, c)); }
@@ -10044,7 +10051,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 .and_then(|a| name_to_item(a));
             let max = args.iter().rev().find_map(|a| a.parse::<u8>().ok());
             let mut removed = 0i64;
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             for t in &targets {
                 if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
                     let mut inv = c.inv.lock().unwrap();
@@ -10082,7 +10089,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
             // hold a snapshot of client Arcs, not the clients() mutex —
             // broadcast_seen re-locks clients() internally.
-            let cls_snap: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls_snap: Vec<Arc<Client>> = client_snapshot();
             let mut touched = 0;
             let mut fx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, entity_effect pkt)
             let mut rx: Vec<(Arc<Client>, Vec<u8>)> = Vec::new(); // (target, remove_effect pkt)
@@ -10157,7 +10164,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
             let amount = args.get(2).and_then(|a| a.parse::<i64>().ok()).unwrap_or(0);
             let unit = args.get(3).copied().unwrap_or("points");
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             let mut touched = 0;
             for t in &targets {
                 if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
@@ -10236,7 +10243,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let comps = parse_item_comps(item_arg);
             let mut gave_names: Vec<String> = Vec::new();
             {
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             let mut gave = 0;
             for t in &targets {
                 if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
@@ -10287,7 +10294,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let mut resync: Vec<Arc<Client>> = Vec::new();
             let mut done = 0;
             {
-                let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                let cls: Vec<Arc<Client>> = client_snapshot();
                 for t in &targets {
                     let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
                     let slot = 36 + *c.held.lock().unwrap();
@@ -10350,7 +10357,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         };
                         let mut done = 0;
                         {
-                            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                            let cls: Vec<Arc<Client>> = client_snapshot();
                             for t in &tgts {
                                 let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
                                 let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap()) else { continue };
@@ -10399,7 +10406,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
                         let mut done = 0;
                         {
-                            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                            let cls: Vec<Arc<Client>> = client_snapshot();
                             for t in &tgts {
                                 let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) else { continue };
                                 let Some(slot) = slot_of(slot_sp, *c.held.lock().unwrap()) else { continue };
@@ -10484,7 +10491,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let targets = if args.len() > 2 { resolve_selector(args[2], me) }
                 else { me.map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
             let mut n = 0;
-            let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls: Vec<Arc<Client>> = client_snapshot();
             for t in &targets {
                 if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
                     let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
@@ -10590,7 +10597,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             for e in &eids {
                 // resolve key: player name (persistent) or mob eid (transient)
                 let key = {
-                    let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                    let cls: Vec<Arc<Client>> = client_snapshot();
                     cls.iter().find(|c| c.eid.to_string() == *e)
                         .map(|c| format!("p:{}", c.name))
                         .unwrap_or_else(|| format!("e:{}", e))
@@ -10930,7 +10937,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 else { clients().lock().unwrap().iter().find(|c| c.name == sel)
                     .map(|c| vec![c.eid.to_string()]).unwrap_or_default() };
             let mut n = 0;
-            let cls_snap: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+            let cls_snap: Vec<Arc<Client>> = client_snapshot();
             let mut mob_hits: Vec<(i32, f32)> = Vec::new();
             for t in &tgts {
                 if let Some(e) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
@@ -11064,7 +11071,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 let eids = resolve_selector(sel, me);
                 let mut out = String::new();
                 // players first
-                let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
+                let cls: Vec<Arc<Client>> = client_snapshot();
                 for e in &eids {
                     if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *e) {
                         let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
@@ -13941,6 +13948,8 @@ pub fn test_region_warm_remove(c: &(i32, i32)) { region().lock().unwrap().warm.r
 // Hold across setup, tick execution and restoration of shared world fixtures.
 #[cfg(test)]
 static WORLD_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+mod fanout_tests;
 #[cfg(test)]
 mod furnace_cache_tests;
 #[cfg(test)]
