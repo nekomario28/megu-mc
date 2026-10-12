@@ -245,6 +245,30 @@ fn stored_tick_durations_match_the_vanilla_game_tick_values() {
 }
 
 #[test]
+fn per_tick_rates_keep_the_same_chance_per_real_second() {
+    // A per-tick probability is not an interval: the denominator has to scale
+    // WITH ticks per second so the chance per real second is unchanged.
+    // Crop growth keeps its current 1/30 per second at any cadence.
+    assert_eq!(CROP_GROWTH_DENOMINATOR, 120); // the literal used before
+    assert_eq!(CROP_GROWTH_DENOMINATOR * TICK_MS, 30 * 1000);
+    assert_eq!(TICKS_PER_SECOND as u64 * 30, CROP_GROWTH_DENOMINATOR);
+    // Every recurring schedule and one-shot life that used to be a tick literal
+    // now names its vanilla game-tick value. Each must keep both its previous
+    // server-tick literal and its real-time spacing.
+    let schedules: [(&str, u64, u64, u64); 5] = [
+        ("autosave", AUTOSAVE_GT, 120, 30_000),
+        ("spawn cycle", SPAWN_CYCLE_GT, 40, 10_000),
+        ("creeper fuse", CREEPER_FUSE_GT, 20, 5_000),
+        ("bobber packet", BOBBER_PACKET_GT, 3, 750),
+        ("lightning life", BOLT_LIFE_GT, 2, 500),
+    ];
+    for (name, game_ticks, previous_literal, millis) in schedules {
+        assert_eq!(server_ticks(game_ticks), previous_literal, "{name} no longer matches its previous literal");
+        assert_eq!(server_ticks(game_ticks) * TICK_MS, millis, "{name} no longer spans {millis}ms");
+    }
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();

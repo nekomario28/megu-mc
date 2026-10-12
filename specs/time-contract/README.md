@@ -16,11 +16,15 @@ Status: IMPLEMENTING — 全体の20TPS化・vanilla互換・軽量化は未達�
 [hot/warm集合構築](slices/04-region-expansion.md) の等価変形も適用・検証した。
 [時間語の単一所有者](slices/05-cadence-owner.md) で `TICK_MS` から全境界を導出した。
 [実時間境界](slices/06-wall-clock.md) のkeepalive/通知と、[ゲーム時間周期](slices/07-game-tick-periods.md)
-のダメージ間隔、[保存tick語の値](slices/08-stored-durations.md) の炉/燃料/空気/天候も
+のダメージ間隔、[保存tick語の値](slices/08-stored-durations.md) の炉/燃料/空気/天候、
+[1tickあたりの割合](slices/09-per-tick-rates.md) の作物成長と周期スケジュールも
 同じ所有者から導出した。雷の持続も雨と別の値に直した。
 [限定fixtureのA/Bと限界](../../evidence/time-contract/region-expansion/README.md) を読む。
-ここで性能最適化を広げず、次は1tickあたりの割合・実時間→game tick・MET4永続化を
-接続し、20TPS切替を一つの不可分な変更にする。
+ここで性能最適化を広げず、次は実時間→game tick・MET4永続化を接続する。
+**移動係数の扱いはユーザーの判断が必要。** 現在は「gravity-lite」近似で、
+vanillaのper-game-tick係数と実時間あたり一致しない。近似を実時間で保存するか、
+vanilla係数に置き換えるかで結果が変わる。弓矢/パール/Mob弓矢のttlと
+bobberの咬みもvanillaと大きく違う。この判断が出るまで20TPSは有効化しない。
 独立レビューで共有fixtureの並行実行競合も修正した。世界fixtureを追加するテストは
 setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 移動/衝突、保存の単位、遅延時の方針を未決定のまま時計を変えてはいけない。
@@ -44,13 +48,13 @@ setupからrestoreまでWORLD_TEST_LOCKを保持すること。
 
 ## 現在の検証
 
-トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも25 passed・1 ignored。
+トーテムの4テストはそれぞれ対応する修正前に失敗。現在の全テストはserial/parallelとも26 passed・1 ignored。
 ignoredは専用runnerで前後各3プロセス実行したrelease計測用fixture。
 tickの炉stage欠落・ringの半径誤り・世界時刻の加算・効果wireの周期導出は
 それぞれ負の対照で検出した。keepaliveのtick除算とダメージ周期・保存値の換算方向の誤りも検出した。共有fixture競合も
 再現して修正し、対象テストの8thread実行を20回反復した。
 通常発動の吸収0、救命後の旧空腹効果の実行、期限切れ後に残る吸収をそれぞれ再現した。
-Fabric/NeoForge機能付きcargo checkも合格。**保存値のsliceだけは独立レビューが
+Fabric/NeoForge機能付きcargo checkも合格。**保存値と1tickあたり割合のsliceは独立レビューが
 未実行**（`codex review` が外部の利用制限で中断）。それ以外のパスは指摘なし
 （レビュー自体はテストを実行していない）。ログは
 [実装の証拠](../../evidence/time-contract/)に保存。

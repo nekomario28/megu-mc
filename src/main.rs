@@ -1311,6 +1311,18 @@ const fn server_ticks(game_ticks: u64) -> u64 {
 /// The lazy-schedule ladder doubles the re-check interval up to 80 game ticks
 /// (4 s). Vanilla has no analogue; this is the lightweight schedule itself.
 const fn backoff_ticks(fails: u64) -> u64 { server_ticks(10 << fails.saturating_sub(1)) }
+/// Crop growth is a per-tick chance, not an interval, so the denominator scales
+/// WITH ticks per second: the chance per real second stays 1/30 at any cadence.
+/// This is the opposite direction from server_ticks, which divides.
+const CROP_GROWTH_DENOMINATOR: u64 = 30 * TICKS_PER_SECOND as u64;
+// Recurring schedules and one-shot lives that were tick literals. Naming the
+// vanilla game-tick value lets the cutover derive the server-tick form from the
+// single cadence owner instead of hunting for scattered numbers.
+const AUTOSAVE_GT: u64 = 600;        // 30s
+const SPAWN_CYCLE_GT: u64 = 200;     // 10s
+const CREEPER_FUSE_GT: u64 = 100;    // 5s
+const BOBBER_PACKET_GT: u64 = 15;    // 0.75s
+const BOLT_LIFE_GT: u64 = 10;        // 0.5s visual
 // Wall-clock owners. Vanilla defines these in real time, not in game ticks, so
 // they anchor on Instants: changing the simulation cadence must not shift them.
 const KEEPALIVE_MS: u64 = 15_000;   // ServerCommonPacketListenerImpl
@@ -1568,7 +1580,8 @@ fn keepalive_time_tick() {
         let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
         for c in cls.iter() { effects::tick_effects(c); }
     }
-    // crop growth: ~1 stage per 60s average (1/240 chance per server tick)
+    // crop growth: ~1/30 chance per real second (per-tick denominator scales
+    // with ticks per second, so a cadence change keeps the same rate)
     {
         let mut cg = crops().lock().unwrap();
         let mut ripe: Vec<(i32,i32,i32)> = Vec::new();
@@ -1576,7 +1589,7 @@ fn keepalive_time_tick() {
         for p in keys {
             let age = cg.get(&p).cloned().unwrap_or(0);
             let hh = ((p.0 as i64).wrapping_mul(31) ^ (p.2 as i64).wrapping_mul(37) ^ (p.1 as i64) ^ t as i64) as u64;
-            if hh % 120 == 0 {
+            if hh % CROP_GROWTH_DENOMINATOR == 0 {
                 if age < 7 {
                     cg.insert(p, age + 1);
                     let st = 4278 + (age as u32) + 1;
@@ -1590,13 +1603,14 @@ fn keepalive_time_tick() {
             note_block_update(x, y, z, block_at(x, y, z));
         }
     }
-    if t % 120 == 119 { save_world(); gc_backoff(); }
+    let autosave = server_ticks(AUTOSAVE_GT);
+    if t % autosave == autosave - 1 { save_world(); gc_backoff(); }
     // night spawn cycle: dark hours -> hostiles near players (cap 12).
     // The count must cover every spawned hostile etype — counting only
     // zombies/creepers let skeletons and spiders accrete without bound
     // (hostiles never despawn here).
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1 && DIFFICULTY.load(Ordering::Relaxed) != 0
-        && t % 40 == 20 && wt >= 13000 && wt <= 23000 {
+        && t % server_ticks(SPAWN_CYCLE_GT) == server_ticks(SPAWN_CYCLE_GT) / 2 && wt >= 13000 && wt <= 23000 {
         let mcount = mobs().lock().unwrap().iter().filter(|m| matches!(m.etype, 124 | 23 | 91 | 100)).count();
         let cls: Vec<Arc<Client>> = { clients().lock().unwrap().iter().cloned().collect() };
         if mcount < 12 && !cls.is_empty() {
@@ -1629,7 +1643,7 @@ fn keepalive_time_tick() {
                 b.dx = 0.0; b.dy = 0.0; b.dz = 0.0;
                 if !b.bit && b.age > 15 { b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6; }
             }
-            if b.age % 3 == 0 {
+            if b.age % server_ticks(BOBBER_PACKET_GT) as i32 == 0 {
                 let (ax, ay, az, eid) = (b.x, b.y, b.z, b.eid);
                 broadcast_seen(eid, |_c| (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true)));
             }
@@ -1830,9 +1844,9 @@ fn arrow_tick() {
                             // (punch slot carries the level for kind==1)
                             if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0 {
                                 { let mut h2 = m.hp.lock().unwrap(); *h2 -= 5.0; }
-                                *m.fuse.lock().unwrap() = 20; // ignite ~5s
+                                *m.fuse.lock().unwrap() = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
                                 let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                bolts().lock().unwrap().push((be, 2));
+                                bolts().lock().unwrap().push((be, server_ticks(BOLT_LIFE_GT) as i32));
                                 broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
                                 let ts = sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
                                 broadcast(-1, |_c| (0x68, ts.clone()));

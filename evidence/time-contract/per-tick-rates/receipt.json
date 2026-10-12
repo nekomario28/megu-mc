@@ -1,0 +1,28 @@
+{
+  "claim": "per-tick probability scales with ticks per second while intervals divide; every converted schedule keeps its previous literal and real-time spacing at 4TPS; NOT 20TPS",
+  "two_directions": "stored values and intervals divide by GAME_TICKS_PER_TICK; per-tick probabilities multiply by TICKS_PER_SECOND. This is why a blanket 5x is invalid.",
+  "negative_controls_detected": [
+    "crop denominator divided instead of multiplied",
+    "crop denominator frozen at 30",
+    "autosave 600 -> 610 game ticks",
+    "lightning life 10 -> 15 game ticks",
+    "bobber packet 15 -> 10 game ticks",
+    "spawn cycle 200 -> 205 game ticks"
+  ],
+  "negative_control_limit": "reverting a call site to its previous literal is behaviourally identical at 4TPS, so no behavioural gate can detect it. Protection is the recorded zero-hit literal search (remaining-literals.log), not a test. This is a real gap and is stated rather than hidden.",
+  "schedules_converted": "autosave 600gt/30s, spawn cycle 200gt/10s, creeper fuse 100gt/5s, bobber packet 15gt/0.75s, lightning life 10gt/0.5s, crop growth 1/30 per second",
+  "tests": "26 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN. codex review blocked by an external usage limit for two consecutive slices. Attempt log retained.",
+  "decision_needed": "movement coefficients are gravity-lite approximations that do not match vanilla per-game-tick drag and gravity in real time. Vanilla-matched values would change results, so this was not chosen unilaterally. Arrow/pearl/mob-arrow TTLs and bobber bite timing also deviate from vanilla and need a decision.",
+  "files_sha256": {
+    "README.md": "0d5618321070dfa7a9b7571905f39a970a7143e817409dd6de50313c0a37b2f4",
+    "remaining-literals.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "results.json": "4d4d380b754b2f4f327be0021a6d0154d406a26174efc5664f4a8667941c3bf2",
+    "review-attempt.log": "48cc911efaf00473a0065aebc4e4a417011f7f79d8e83ae6af00f363c33194e5",
+    "time-contract-rates-features.log": "ae8dba511f22aed4441fd3620845ff459478f880fd191139f956d8186e6d83a9",
+    "time-contract-rates-negative.log": "7ecc8117a33f83d554a13e94f4be225c1070f249ddc8c058f2b8c47545830f52",
+    "time-contract-rates-parallel.log": "dd9b813e7ae776dc3d432236554211da45821e518c8db06403bd48fdd88d5fec",
+    "time-contract-rates-suite.log": "3050b058c7baf958b5adae7a2d4b33a3065d0e1cb7214ab646c66518f20144cb"
+  }
+}
