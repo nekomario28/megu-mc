@@ -19,7 +19,7 @@ cargo test --locked -- --test-threads=1
 MC_SPINE_PORT=25699 cargo run --locked
 ```
 
-ゲームlistenerは `0.0.0.0`、resource pack HTTPは固定ポート25598。起動前にポートの使用状況を確認する。`MC_SPINE_WG=old` で旧world generatorを選択できる。
+ゲームlistenerは安全のため既定で `127.0.0.1` にbindする。resource pack HTTPはポート25598を利用する。起動前にポートの使用状況を確認する。`MC_SPINE_WG=old` で旧world generatorを選択できる。
 
 ## 依存値が安定した処理の共通化
 
@@ -47,3 +47,17 @@ Java compatibility is opt-in. The pinned Seed Protect Fabric artifact and its Ne
 Build and validation instructions are in [Fabric contract](compat/fabric-probe/README.md) and [NeoForge event adapter](compat/neoforge-events/README.md). Set exactly one of `MC_SPINE_FABRIC_CLASSPATH` or `MC_SPINE_NEOFORGE_CLASSPATH` to its built absolute classpath-file path, and use the selected original JAR alone in that server working directory's `mods/`. Unknown mod bytes and required transformation failures reject startup before listeners open. Without those settings, the default Rust server loads no JVM.
 
 This supports one pinned feature contract, not arbitrary Minecraft mods. Full FML/NeoForge startup, all-entity collision physics, crop/loot behavior and general Minecraft API object identity remain outside the verified scope. See [compatibility specification](specs/mod-compatibility/README.md) for the open gates.
+
+## ネットワーク・権限・保存上の注意（Issue #1）
+
+この実装は**オフラインモードの開発用サーバー**であり、Mojang/Microsoftによるプレイヤー認証は**行っていない**。インターネットへ直接公開しない。LAN等でゲームポートを明示的に開く場合は、ファイアウォールと信頼できる接続元の制限を用意する。
+
+- `MC_SPINE_BIND_ADDR`（既定 `127.0.0.1`）: ゲーム接続の待受アドレス。LAN向けに `0.0.0.0` とする場合もオンライン認証が追加されるわけではない。
+- 一般プレイヤーがゲーム内で実行できるコマンドは `/help`、`/list`、`/time query`（または `get`）に限定。管理コマンドはゲーム内から許可しない。**ローカルの実験専用**に限り `MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS=1` で旧動作へ戻せる（公開・共有サーバーで使用しない）。
+- `MC_SPINE_RCON_PORT` を設定した場合、非空の `MC_SPINE_RCON_PASS` が必須。RCONのbind先は `MC_SPINE_RCON_BIND_ADDR`（既定 `127.0.0.1`）、同時8接続上限、読み書き各10秒のtimeout。RCONのコマンドは管理権限扱いであり、プロトコルは平文なので外部公開しない。
+- ログイン前の通信は接続開始から合計30秒で期限切れとし、pre-playフレームは64KiBに制限する。
+- `MC_SPINE_RESOURCE_PACK_URL` には、クライアントがアクセスできるHTTP(S) URLを指定できる。ゲームlistenerがloopback以外の場合、未設定ならリソースパックを案内しない。リソースパックHTTPのbind先は `MC_SPINE_RESOURCE_PACK_BIND_ADDR`、未設定なら `MC_SPINE_BIND_ADDR` を利用する。
+- ゲームロジックの呼び出し周期は50ms（**20TPS目標**）とし、ワールド時刻も1 tickに1進める。負荷時に20TPSを保証するものではない。Vanillaとの差分・負荷を実機で比較する必要がある。
+- 新規保存は `SPN4` 形式のサイズ・SHA-1チェック付き外側フレームを使用する。既存の `world_overlay.bin` は旧形式として読める。保存更新時に `world_overlay.bin.bak` へ旧ファイルをコピーする。新形式に破損が見つかったときはロードを拒否し、元ファイルを保持する。**旧形式の部分破損の検出とトランザクショナル復旧は未完成**。運用前に別途バックアップを取る。
+
+CIは `.github/workflows/ci.yml` にて `cargo build --locked`、`cargo test --locked -- --test-threads=1`、Java互換機能の`cargo check`を実行する。CI成功はVanillaとの互換性・ネットワーク負荷耐性・20TPS実測を保証しない。
