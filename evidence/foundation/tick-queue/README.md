@@ -178,6 +178,27 @@ delay = (*due - now + period - 1) / period     // period = server_ticks(FLUID_TI
 `promote` を `schedule(MAX_DELAY)` に変える負の対照で失敗
 （[promote-negative.log](promote-negative.log)）。
 
+### 重複していた起床プロトコルを統合（クローン検出で発見）
+
+関数本体のクローン検出器（正規化 + 4-gram Jaccard）を書けて回したところ、
+`requeue_water` と `requeue_hopper` が **J=1.00** で一致した。
+`requeue_lava` も同じ形（period の ceil だけが違う）。**3重化**していた。
+
+`requeue_fluid(queue, pos, period)` に統合した。period は
+「その系が何tickごとに呼ばれるか」= 水/ホッパーは1、溶岩は
+`server_ticks(FLUID_TICK_GT)`。
+
+**この統合で検証の穴が1つ見つかった。**
+溶岩トレースは `period` を無視する変異を通してしまった（exit=0）。
+理由：流れているセルは early return するので **backoff が無く**、
+`period` が効かない分岐しか通らない。
+
+`a_periodic_system_expresses_its_backoff_in_invocations` を追加し、
+変換そのものを固定した。`(due - now)` をそのまま使う変異で
+**exit=101** になる（[period-negative.log](period-negative.log)）。
+**痕跡ゲートは「その系がbackoffする」状況を踏んでいなかった** — slice 02 と
+同じ種類の限界である。
+
 ### 残る `sched_ready`
 
 3ループ内の `sched_ready` は残した。今は本当に冗長だが、

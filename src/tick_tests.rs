@@ -801,3 +801,40 @@ fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
     water_queue().lock().unwrap().cancel(pos);
     assert!(found, "a neighbour change must wake a waiting cell within two ticks");
 }
+
+/// The spread traces cannot cover this: a flowing cell returns before it is ever
+/// backed off, so its re-queue always takes the no-backoff branch where the period
+/// does not matter. Replacing the period with 1 left every trace green, which is
+/// the gap this closes. The conversion itself is what a periodic system gets wrong
+/// (lava was thirty times too slow before), so it is pinned directly.
+#[test]
+fn a_periodic_system_expresses_its_backoff_in_invocations() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let pos = (11, 70, 11);
+    let period = server_ticks(FLUID_TICK_GT);
+    // How many invocations pass before the cell comes due.
+    let invocations = |ahead: u64| -> usize {
+        backoff()
+            .lock()
+            .unwrap()
+            .insert(pos, (TICK_IDX.load(Ordering::Relaxed) + ahead, 1));
+        lava_queue().lock().unwrap().cancel(pos);
+        requeue_lava(pos.0, pos.1, pos.2);
+        for n in 1..=12 {
+            let due = { let mut q = lava_queue().lock().unwrap(); q.due() };
+            if due.contains(&pos) { return n }
+        }
+        panic!("the cell never came due");
+    };
+    // A backoff inside the next period still lands on the next invocation, because
+    // that is the earliest moment the system can visit it at all.
+    assert_eq!(invocations(1), invocations(period), "within one period");
+    assert_eq!(invocations(period + 1), invocations(2 * period), "one period later");
+    assert_eq!(invocations(2 * period + 1), invocations(3 * period), "two periods later");
+    assert!(
+        invocations(period + 1) > invocations(period),
+        "crossing a period boundary must cost an invocation"
+    );
+    lava_queue().lock().unwrap().cancel(pos);
+    backoff().lock().unwrap().remove(&pos);
+}

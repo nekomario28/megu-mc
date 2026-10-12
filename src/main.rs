@@ -3486,54 +3486,44 @@ fn sched_ready(x: i32, y: i32, z: i32) -> bool {
     let now = TICK_IDX.load(Ordering::Relaxed);
     backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)
 }
-/// Water cells waiting to be visited, indexed by delay. This replaces the
-/// per-tick sweep of every registered cell, which cost the number of registered
-/// cells rather than the number that come due and cloned them into a Vec each
-/// tick. The backoff map stays the source of the delay value; the queue only
-/// answers which cells are due now.
 static LAVA_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
 fn lava_queue() -> &'static Mutex<tick_queue::TickQueue> {
     LAVA_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
 }
-/// Re-queue a lava cell. Lava is visited once per `server_ticks(FLUID_TICK_GT)`
-/// while the queue advances one step per invocation, so the delay is expressed in
-/// invocations. A cell can only ever be visited on those boundaries, so "due at
-/// tick T" and "first visit at or after T" are the same thing and the rounding is
-/// exact rather than an approximation.
-fn requeue_lava(x: i32, y: i32, z: i32) {
+/// Re-queue a due cell for its next visit. The delay comes from the backoff map,
+/// so the ladder is unchanged, and a cell with no pending backoff is due next
+/// invocation.
+///
+/// `period` is the number of ticks between this system's invocations: 1 for water
+/// and hoppers, which run every tick, and `server_ticks(FLUID_TICK_GT)` for lava.
+/// A cell can only ever be visited on those boundaries, so "due at tick T" and
+/// "first visit at or after T" are the same statement and the rounding is exact
+/// rather than an approximation. Getting this wrong for lava once made its delays
+/// thirty times too long.
+fn requeue_fluid(queue: &Mutex<tick_queue::TickQueue>, pos: (i32, i32, i32), period: u64) {
     let now = TICK_IDX.load(Ordering::Relaxed);
-    let period = server_ticks(FLUID_TICK_GT);
-    let delay = match backoff().lock().unwrap().get(&(x, y, z)) {
+    let delay = match backoff().lock().unwrap().get(&pos) {
         Some((due, _)) if *due > now => ((*due - now + period - 1) / period) as usize,
         _ => 1,
     };
-    lava_queue().lock().unwrap().schedule((x, y, z), delay);
+    queue.lock().unwrap().schedule(pos, delay);
+}
+fn requeue_lava(x: i32, y: i32, z: i32) {
+    requeue_fluid(lava_queue(), (x, y, z), server_ticks(FLUID_TICK_GT))
 }
 static HOPPER_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
 fn hopper_queue() -> &'static Mutex<tick_queue::TickQueue> {
     HOPPER_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
 }
 fn requeue_hopper(x: i32, y: i32, z: i32) {
-    let now = TICK_IDX.load(Ordering::Relaxed);
-    let delay = match backoff().lock().unwrap().get(&(x, y, z)) {
-        Some((due, _)) if *due > now => (*due - now) as usize,
-        _ => 1,
-    };
-    hopper_queue().lock().unwrap().schedule((x, y, z), delay);
+    requeue_fluid(hopper_queue(), (x, y, z), 1)
 }
 static WATER_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
 fn water_queue() -> &'static Mutex<tick_queue::TickQueue> {
     WATER_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
 }
-/// Delay to re-queue a cell for, read from the backoff map so the ladder is
-/// unchanged. A cell with no pending backoff is due next tick.
 fn requeue_water(x: i32, y: i32, z: i32) {
-    let now = TICK_IDX.load(Ordering::Relaxed);
-    let delay = match backoff().lock().unwrap().get(&(x, y, z)) {
-        Some((due, _)) if *due > now => (*due - now) as usize,
-        _ => 1,
-    };
-    water_queue().lock().unwrap().schedule((x, y, z), delay);
+    requeue_fluid(water_queue(), (x, y, z), 1)
 }
 /// call after evaluating a cell: did_work=true resets, false backs off.
 fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
