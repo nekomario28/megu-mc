@@ -2330,11 +2330,13 @@ fn lava_tick() {
     // vanilla: lava flows like water but ~6x slower and only 3 blocks
     // horizontally in the overworld. Our tick=TICK_MS ~5gt, so gating to
     // every 6th tick lands near 30gt.
-    let cells: Vec<(i32, i32, i32)> = lavas().lock().unwrap().iter().copied().collect();
-    let region = (!cells.is_empty()).then(region_guard);
-    for (x, y, z) in cells {
-        let region = region.as_ref().unwrap();
-        if !region.is_warm(x, z) || !sched_ready(x, y, z) { continue }
+    // Only the cells that come due are visited; a backed-off cell costs nothing.
+    // Every exit re-queues except removal from the registry.
+    let due = { let mut q = lava_queue().lock().unwrap(); q.due() };
+    if due.is_empty() { return }
+    let region = region_guard();
+    for (x, y, z) in due {
+        if !region.is_warm(x, z) || !sched_ready(x, y, z) { requeue_lava(x, y, z); continue }
         let st = block_at(x, y, z);
         if !(96..=111).contains(&st) { lavas().lock().unwrap().remove(&(x, y, z)); continue; }
         let lvl = st - 96;
@@ -2345,9 +2347,10 @@ fn lava_tick() {
                 note_block_update(x, y - 1, z, 104);
             }
             sched_result(x, y, z, true);
+            requeue_lava(x, y, z);
             continue;
         }
-        if lvl >= 3 || (8..=15).contains(&lvl) { sched_result(x, y, z, false); continue }
+        if lvl >= 3 || (8..=15).contains(&lvl) { sched_result(x, y, z, false); requeue_lava(x, y, z); continue }
         let mut spread = false;
         for (dx, dz) in [(1,0),(-1,0),(0,1),(0,-1)] {
             if water_intoable(block_at(x + dx, y, z + dz)) && block_at(x + dx, y - 1, z + dz) != 0 {
@@ -2361,6 +2364,7 @@ fn lava_tick() {
             }
         }
         sched_result(x, y, z, spread);
+        requeue_lava(x, y, z);
     }
 }
 fn water_tick() {
@@ -3473,6 +3477,24 @@ fn sched_ready(x: i32, y: i32, z: i32) -> bool {
 /// cells rather than the number that come due and cloned them into a Vec each
 /// tick. The backoff map stays the source of the delay value; the queue only
 /// answers which cells are due now.
+static LAVA_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
+fn lava_queue() -> &'static Mutex<tick_queue::TickQueue> {
+    LAVA_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
+}
+/// Re-queue a lava cell. Lava is visited once per `server_ticks(FLUID_TICK_GT)`
+/// while the queue advances one step per invocation, so the delay is expressed in
+/// invocations. A cell can only ever be visited on those boundaries, so "due at
+/// tick T" and "first visit at or after T" are the same thing and the rounding is
+/// exact rather than an approximation.
+fn requeue_lava(x: i32, y: i32, z: i32) {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let period = server_ticks(FLUID_TICK_GT);
+    let delay = match backoff().lock().unwrap().get(&(x, y, z)) {
+        Some((due, _)) if *due > now => ((*due - now + period - 1) / period) as usize,
+        _ => 1,
+    };
+    lava_queue().lock().unwrap().schedule((x, y, z), delay);
+}
 static HOPPER_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
 fn hopper_queue() -> &'static Mutex<tick_queue::TickQueue> {
     HOPPER_QUEUE.get_or_init(|| Mutex::new(tick_queue::TickQueue::new()))
@@ -3750,7 +3772,10 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     } else { wtr.remove(&(x, y, z)); }
     drop(wtr);
     let mut lv = lavas().lock().unwrap();
-    if (96..=111).contains(&st) { lv.insert((x, y, z)); } else { lv.remove(&(x, y, z)); }
+    if (96..=111).contains(&st) {
+        lv.insert((x, y, z));
+        lava_queue().lock().unwrap().schedule((x, y, z), 1);
+    } else { lv.remove(&(x, y, z)); }
     drop(lv);
     plugin_sched_remove(x, y, z);
     if st == ST_GROWTH_LAMP {
@@ -3969,7 +3994,10 @@ fn rebuild_derived_indexes() {
                 wtr.insert((x, y, z));
                 water_queue().lock().unwrap().schedule((x, y, z), 1);
             }
-            if (96..=111).contains(st) { lavas().lock().unwrap().insert((x, y, z)); }
+            if (96..=111).contains(st) {
+                lavas().lock().unwrap().insert((x, y, z));
+                lava_queue().lock().unwrap().schedule((x, y, z), 1);
+            }
             if (9225..=9234).contains(st) {
                 hh.insert((x, y, z));
                 hopper_queue().lock().unwrap().schedule((x, y, z), 1);

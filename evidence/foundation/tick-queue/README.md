@@ -104,7 +104,7 @@ fixtureでは測れない。したがって性能値は主張しない。
 |---|---|---|
 | 水 | 毎tick | **移行完了** |
 | ホッパー | 毎tick（`step("hoppers")`） | **移行完了**。痕跡ゲートで等価確認 |
-| 溶岩 | `TICK_IDX % server_ticks(30) == 0` | 全件巡回のまま。**単位の落とし穴あり** |
+| 溶岩 | `TICK_IDX % server_ticks(30) == 0` | **移行完了**。痕跡ゲートで等価確認 |
 
 ### 溶岩の落とし穴
 
@@ -134,6 +134,35 @@ fixtureでは測れない。したがって性能値は主張しない。
 `(2,1),(1,2),(0,3),(0,3)...`。移行前後で一致。
 
 費用は測っていない（fixtureにホッパーが無い）。証拠はトレースの一致。
+
+## 溶岩の移行（完了）
+
+**単位の落とし穴を解決した。** 訪問は `server_ticks(30)` の倍数でしか起きないので、
+「tick T で due」と「T 以降の最初の訪問」は同じ意味になる。
+したがって `ceil((due - now) / period)` が**近似ではなく厳密**。
+
+```
+delay = (*due - now + period - 1) / period     // period = server_ticks(FLUID_TICK_GT)
+```
+
+出口4箇所（cold、固化/流下、lvl>=3、末尾）で `requeue_lava`。
+
+痕跡ゲート `lava_spread_trace_is_stable_across_the_scheduler_migration`：
+30tickごとに落下溶岩(104)が1つ増え、最後に水源(96)が残る。
+変化点だけ記録し、**形と時刻の両方**をassert（近似ではなく厳密であることの証拠）。
+
+## 全件巡回は全て消えた
+
+`waters()` / `lavas()` / `hoppers()` の
+`.lock().unwrap().iter().copied().collect()` は**0件**になった。
+
+### 残る `sched_ready`
+
+3ループ内に `sched_ready` が残っている。queueのdue集合が既に
+「ready」を意味するので**冗長**だが、
+- 費用は**dueなセル数に比例**（全セルではない）ので目的は達成している
+- 安全網として残した
+将来の掃除候補として記録する。
 
 ## まだやっていないこと（重要）
 

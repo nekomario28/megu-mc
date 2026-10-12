@@ -726,3 +726,54 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
     assert_eq!(trace, expected,
         "the hopper scheduler changed what moves, or when");
 }
+
+/// Pins lava flow for the same reason as water and hoppers. Lava's cadence is the
+/// complication: lava_tick runs once per server_ticks(FLUID_TICK_GT), while the
+/// queue advances one step per due() call, so the delay must be expressed in
+/// invocations. Because a cell can only ever be visited on those boundaries,
+/// "due at tick T" and "first visit at or after T" are the same thing, and the
+/// conversion is exact rather than an approximation.
+#[test]
+fn lava_spread_trace_is_stable_across_the_scheduler_migration() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_lavas = std::mem::take(&mut *lavas().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let (old_hot, old_warm) = test_region();
+    forceloaded().lock().unwrap().insert((0, 0));
+    refresh_hot();
+    // High enough that the test never reaches terrain whatever worldgen state
+    // another test leaves behind.
+    let top = 150;
+    let src = name_to_state("lava").unwrap_or(96);
+    let original: Vec<(i32, u32)> = (95..=151).map(|y| (y, block_at(0, y, 0))).collect();
+    set_block(0, top, 0, src);
+    let mut trace: Vec<(u64, Vec<u32>)> = Vec::new();
+    let mut last: Vec<u32> = Vec::new();
+    for tick in 0..400u64 {
+        game_tick(|_, t| t());
+        let mut col: Vec<u32> = (80..=152).map(|y| block_at(0, y, 0)).collect();
+        col.retain(|st| (96..=111).contains(st));
+        if col != last {
+            trace.push((tick, col.clone()));
+            last = col;
+        }
+    }
+    for (y, st) in original { set_block(0, y, 0, st); }
+    *lavas().lock().unwrap() = old_lavas;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    set_test_region(old_hot, old_warm);
+    assert!(trace.len() > 3, "lava never flowed: {trace:?}");
+    // One falling-lava cell (104) is added below the source (96) per invocation,
+    // and invocations land every server_ticks(FLUID_TICK_GT).
+    assert_eq!(trace[0], (0, vec![96u32]), "the source must start alone");
+    for (k, (tick, col)) in trace.iter().enumerate().skip(1) {
+        let mut expected = vec![104u32; k];
+        expected.push(96);
+        assert_eq!(col, &expected, "column shape at change {k}");
+        assert_eq!(*tick, 29 + 30 * (k as u64 - 1), "timing at change {k}");
+    }
+}
