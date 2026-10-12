@@ -17,10 +17,10 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `0902a57` |
+| HEAD | `95c916c` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
 | `main` との差 | **64 commit**。`main` は `4e5f3e6`（未マージ） |
-| テスト | **64 passed**（serial／8thread×3回連続）、CI 4step通過 |
+| テスト | **70 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
 `fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
@@ -41,6 +41,14 @@
 - **slice 02 Scheduled-tick queue 完了**：遅延リング＋重複排除。**水・溶岩・ホッパー
   全てを移行**し、毎tick全セルclone＋巡回は**0件**。痕跡ゲート3本で等価性を確認
 
+**重複の解消（[survey](foundation/slices/07-redundancy-survey.md)）**
+- `requeue_water`/`requeue_hopper`/`requeue_lava` の3重化 → `requeue_fluid(queue,pos,period)`
+- `clients()` スナップショット式 **35箇所** → `client_snapshot()`（ロック順序を関数にした）
+- 4つのbroadcast → `fanout(述語, mk)`（broadcast呼び出しは94箇所）
+- tree の置換可能述語3つ → `is_replaceable(reg, cur, tags)`
+- 各統合にゲートと**負の対照**を付けた。うち2件は**統合した瞬間に検証の穴を発見**
+  （溶岩のperiod変換、broadcastの述語）
+
 **セキュリティ**：PR #2のhardeningを統合（権限・RCON・handshake・save envelope・
 起動時検証・pre-play deadline）
 
@@ -54,6 +62,13 @@
 - **drop/xp/作物/mobのlock hoistは不採用**（fixtureにその要素が無く測れない）
 - **`save_world_into` の旧実装はデータ損失**。resting tridentがsaveから失われていた
 
+**重複の統合で実際に起きたこと（記録）**
+- 統合は**検証の穴を露出させる**。溶岩のperiod変換は痕跡ゲートをすり抜けていた
+  （流れるセルはbackoffせず、periodが効かない分岐しか通らない）。
+  broadcastの述語も同様。**「重複している」と「ゲートが覆っている」は別**
+- クローン検出の J は**候補を挙げるだけ**。`lerp2`/`lerp3` は J=1.00 だが
+  アリティが違うので統合しない
+
 **測定方法の失敗（繰り返さない）**
 - before/afterを数分離して測ると**環境負荷を変更の効果と誤読**する。
   同一コードの再測定で壁時計8.5%・CPU時間19%変動。**連続して測る**
@@ -65,6 +80,7 @@
 | 項目 | 場所 |
 |---|---|
 | **独立レビュー**：統合headの衝突解決10箇所は未確認 | issue #7 |
+| 重複の上位候補（表引き4つ組、`spawn_*_pkt`、`door_base`/`gate_base`） | [survey](foundation/slices/07-redundancy-survey.md) |
 | 基盤 slice 03〜06 | [foundation](foundation/README.md) |
 | 被ダメ無敵をvanilla `invulnerableTime` 20へ（未実装） | [slice 25](time-contract/slices/25-invulnerability.md) |
 | 実クライアント・vanilla動的比較・代表負荷計測 | 全て未実施 |
