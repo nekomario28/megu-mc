@@ -1,6 +1,6 @@
 # 忠実なゲーム時間と、結果不変の処理省略
 
-Status: 20TPS化 完了 — vanilla動的同等性・軽量化の実証・実クライアント検証は未達。
+Status: 20TPS化 完了・CI green — vanilla動的同等性・軽量化の実証・実クライアント検証・独立レビューは未達。
 
 ## Next Agent Prompt
 
@@ -19,7 +19,10 @@ Status: 20TPS化 完了 — vanilla動的同等性・軽量化の実証・実ク
 のダメージ間隔、[保存tick語の値](slices/08-stored-durations.md) の炉/燃料/空気/天候、
 [1tickあたりの割合](slices/09-per-tick-rates.md) の作物成長と周期スケジュール、
 [導火線](slices/10-tnt-fuse.md)、[Drop/Xp寿命とpickup遅延](slices/11-entity-life.md)
-のgame tick化、[永続化のround-trip検証](slices/12-persistence.md) も
+のgame tick化、[永続化のround-trip検証](slices/12-persistence.md)、
+[飛翔体TTLの実時間復元](slices/22-projectile-ttl.md)、
+[tick周期と確率の網羅監査](slices/23-tick-periods-audit.md)、
+[tick pacing のdrift補正](slices/24-tick-pacing.md) も
 同じ所有者から導出した。
 [20TPS切替](slices/13-cutover-20tps.md) を実行した。[証拠と測定](../../evidence/time-contract/cutover-20tps/README.md)。
 雷の持続も雨と別の値に直した。溶岩ダメージの変換漏れも発見・修正した。
