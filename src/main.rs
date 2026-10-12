@@ -7418,17 +7418,37 @@ fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
 
 static PACK_INFO: OnceLock<Option<(String, String)>> = OnceLock::new(); // (url, sha1hex)
 fn pack_info() -> &'static Option<(String, String)> { PACK_INFO.get_or_init(|| load_pack_info()) }
-fn load_pack_info() -> Option<(String, String)> {
-    let data = std::fs::read("resourcepack.zip").ok()?;
-    let h = hex(&sha1(&data));
-    Some((format!("http://{}:25598/pack.zip", local_ip()), h))
+fn resource_pack_url(bind: &str, configured: Option<&str>) -> Option<String> {
+    if let Some(url) = configured {
+        let url = url.trim();
+        return (url.starts_with("http://") || url.starts_with("https://"))
+            .then(|| url.to_owned());
+    }
+    // Never suggest 127.0.0.1 to a remote client: that is the client's host.
+    match bind {
+        "127.0.0.1" => Some("http://127.0.0.1:25598/pack.zip".into()),
+        "::1" => Some("http://[::1]:25598/pack.zip".into()),
+        _ => None,
+    }
 }
-fn local_ip() -> String { "127.0.0.1".into() } // override via env later if needed
+fn load_pack_info() -> Option<(String, String)> {
+    let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    let url = resource_pack_url(&bind, std::env::var("MC_SPINE_RESOURCE_PACK_URL").ok().as_deref())?;
+    let data = std::fs::read("resourcepack.zip").ok()?;
+    Some((url, hex(&sha1(&data))))
+}
 
 fn http_server() {
+    if pack_info().is_none() { return; }
     let Ok(data) = std::fs::read("resourcepack.zip") else { return };
-    let Ok(l) = TcpListener::bind("0.0.0.0:25598") else { return };
-    eprintln!("[spine] resource pack http :25598 ({} bytes)", data.len());
+    let bind = std::env::var("MC_SPINE_RESOURCE_PACK_BIND_ADDR")
+        .or_else(|_| std::env::var("MC_SPINE_BIND_ADDR"))
+        .unwrap_or_else(|_| "127.0.0.1".into());
+    let Ok(l) = TcpListener::bind((bind.as_str(), 25598)) else {
+        eprintln!("[spine] resource pack bind failed on {bind}:25598");
+        return;
+    };
+    eprintln!("[spine] resource pack http {bind}:25598 ({} bytes)", data.len());
     thread::spawn(move || {
         for st in l.incoming().flatten() {
             let mut st = st;
@@ -13782,5 +13802,17 @@ mod handshake_security_tests {
         write_str(&mut long_name, "APlayerWithAVeryLongUsername");
         long_name.extend_from_slice(&[1u8;16]);
         assert!(login_identity(&long_name).is_none());
+    }
+}
+
+#[cfg(test)]
+mod resource_pack_url_tests {
+    use super::resource_pack_url;
+    #[test]
+    fn loopback_only_by_default_and_explicit_external_url() {
+        assert_eq!(resource_pack_url("127.0.0.1", None).as_deref(), Some("http://127.0.0.1:25598/pack.zip"));
+        assert!(resource_pack_url("0.0.0.0", None).is_none());
+        assert_eq!(resource_pack_url("0.0.0.0", Some("https://example.org/pack.zip")).as_deref(), Some("https://example.org/pack.zip"));
+        assert!(resource_pack_url("0.0.0.0", Some("javascript:alert(1)")).is_none());
     }
 }
