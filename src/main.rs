@@ -1337,6 +1337,18 @@ const ARROW_TTL_GT: u64 = 1200;      // 60s
 const MOB_ARROW_TTL_GT: u64 = 800;   // 40s
 const PEARL_TTL_GT: u64 = 250;       // 12.5s
 const SNOWBALL_TTL_GT: u64 = 300;    // 15s
+// Mob counters that were bare tick counts at 4TPS, so the 20TPS cutover
+// shortened them fivefold. Stated as the real time they had before.
+const BOBBER_BITE_GT: u64 = 75;      // 3.75s, bobber settles before biting
+const MOB_BURN_TICK_GT: u64 = 40;    // 2s, burn damage interval
+const CREEPER_IGNITE_GT: u64 = 30;   // 1.5s, creeper fuse before igniting
+const STARVE_GT: u64 = 80;            // 4s, starvation damage interval
+const FLUID_TICK_GT: u64 = 30;        // 1.5s, scheduled lava/fluid tick
+// Per-tick probabilities, not intervals: the denominator scales WITH ticks per
+// second so the chance per real second is unchanged. This is the opposite
+// direction from server_ticks, which divides.
+const RAIN_CHANCE_DENOMINATOR: u64 = 6000 * TICKS_PER_SECOND as u64 / 4;
+const MOB_SPAWN_CHANCE_DENOMINATOR: u64 = 400 * TICKS_PER_SECOND as u64 / 4;
 const DROP_LIFE_GT: u64 = 6000;       // 300s, ItemEntity lifespan
 const XP_LIFE_GT: u64 = 6000;         // 300s, ExperienceOrb lifespan
 /// chain
@@ -1424,7 +1436,7 @@ fn keepalive_time_tick() {
                 broadcast(-1, |_c| (0x22, vec![2u8, 0, 0, 0, 0]));
                 broadcast(-1, |_c| { let mut p = vec![8u8]; p.extend_from_slice(&0f32.to_be_bytes()); (0x22, p.clone()) });
             }
-        } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1 && t.wrapping_mul(2654435761) % 6000 == 0 {
+        } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1 && t.wrapping_mul(2654435761) % RAIN_CHANCE_DENOMINATOR == 0 {
             RAINING.store(server_ticks(12000), Ordering::Relaxed);
             broadcast(-1, |_c| (0x22, vec![1u8, 0, 0, 0, 0]));
             if rand_u64() % 8 == 0 { // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
@@ -1504,7 +1516,7 @@ fn keepalive_time_tick() {
                 else { let mut f = c.food.lock().unwrap(); *f = (*f - 1).max(0); }
             }
             drop(ex);
-            if food <= 0 && *h > 1.0 && t % 16 == 8 { *h = (*h - 1.0).max(1.0); dirty = true; }
+            if food <= 0 && *h > 1.0 && t % server_ticks(STARVE_GT) == server_ticks(STARVE_GT) / 2 { *h = (*h - 1.0).max(1.0); dirty = true; }
             {   // drowning: head in water drains air, then 2hp/s
                 let wst = name_to_state("water").unwrap_or(u32::MAX);
                 let submerged = block_at(px.floor() as i32, (py + 1.62).floor() as i32, pz.floor() as i32) == wst;
@@ -1659,7 +1671,7 @@ fn keepalive_time_tick() {
                 b.dy -= 0.03;
             } else {
                 b.dx = 0.0; b.dy = 0.0; b.dz = 0.0;
-                if !b.bit && b.age > 15 { b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6; }
+                if !b.bit && b.age > server_ticks(BOBBER_BITE_GT) as i32 { b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6; }
             }
             if b.age % server_ticks(BOBBER_PACKET_GT) as i32 == 0 {
                 let (ax, ay, az, eid) = (b.x, b.y, b.z, b.eid);
@@ -2676,7 +2688,7 @@ fn mob_tick() {
             let mut burn = m.fuse.lock().unwrap();
             if exposed {
                 *burn += 1;
-                if *burn >= 8 {
+                if *burn >= server_ticks(MOB_BURN_TICK_GT) as i32 {
                     *burn = 0;
                     drop(burn); drop(mp);
                     // on-fire flag: entity flags byte idx0 bit0x01
@@ -2718,7 +2730,7 @@ fn mob_tick() {
                 let mut fuse = m.fuse.lock().unwrap();
                 if bd < 9.0 {
                     *fuse += 1;
-                    if *fuse >= 6 {
+                    if *fuse >= server_ticks(CREEPER_IGNITE_GT) as i32 {
                         // explode: crater radius 3 (skip bedrock), damage nearby players
                         let (cx, cy, cz) = (mp.0.round() as i32, mp.1.round() as i32, mp.2.round() as i32);
                         let mut recs: Vec<(i8,i8,i8)> = vec![];
@@ -2778,7 +2790,7 @@ fn mob_tick() {
         if m.etype == 87 && sheared().lock().unwrap().contains(&m.eid) {
             let (bx, by, bz) = (mp.0.round() as i32, mp.1.round() as i32, mp.2.round() as i32);
             if block_at(bx, by - 1, bz) == name_to_state("grass_block").unwrap_or(u32::MAX)
-                && ((m.eid as u64).wrapping_mul(1103515245) ^ TICK.load(Ordering::Relaxed)) % 400 == 0 {
+                && ((m.eid as u64).wrapping_mul(1103515245) ^ TICK.load(Ordering::Relaxed)) % MOB_SPAWN_CHANCE_DENOMINATOR == 0 {
                 set_block(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
                 sheared().lock().unwrap().remove(&m.eid);
                 note_block_update(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
@@ -2829,7 +2841,7 @@ fn mob_tick() {
                 let (x,y,z,yaw,pitch) = *mp;
                 drop(mp);
                 broadcast_seen(m.eid, |_c| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
-            } else if (m.eid as i64 + TICK.load(Ordering::Relaxed) as i64) % 32 == 0 {
+            } else if (m.eid as i64 + TICK.load(Ordering::Relaxed) as i64) % (MOB_SPAWN_CHANCE_DENOMINATOR / 12) as i64 == 0 {
                 let t = ((m.eid as u32).wrapping_mul(2654435761u32) ^ (TICK.load(Ordering::Relaxed) as u32)) as f64 / 4294967295.0 * std::f64::consts::TAU;
                 let (nx, nz) = (mp.0 + t.cos() * 2.0, mp.2 + t.sin() * 2.0);
                 let mid = !mob_move_blocked((mp.0 + nx) * 0.5, mp.1, (mp.2 + nz) * 0.5);
@@ -13244,7 +13256,8 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     step("furnaces", furnace_tick);
     step("hoppers", hopper_tick);
     step("water", water_tick);
-    if TICK_IDX.load(Ordering::Relaxed) % 6 == 0 { step("lava", lava_tick); }
+    let lava_period = server_ticks(FLUID_TICK_GT);
+    if TICK_IDX.load(Ordering::Relaxed) % lava_period == 0 { step("lava", lava_tick); }
     step("observers", observer_tick);
     step("plugins", plugin_tick);
     step("actors", actor_tick);

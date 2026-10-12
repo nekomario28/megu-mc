@@ -420,6 +420,28 @@ fn projectile_lifetimes_keep_their_real_time_at_any_cadence() {
 }
 
 #[test]
+fn remaining_tick_periods_and_chances_keep_their_real_time() {
+    // Same class as the projectile TTLs: recurring periods must divide by
+    // GAME_TICKS_PER_TICK, and per-tick probabilities must multiply by
+    // TICKS_PER_SECOND. Getting the direction wrong changes the rate 5x or 8x.
+    for (name, game_ticks, millis) in [
+        ("starvation", STARVE_GT, 4_000u64),
+        ("fluid tick", FLUID_TICK_GT, 1_500),
+    ] {
+        assert_eq!(server_ticks(game_ticks) * TICK_MS, millis, "{name} no longer spans {millis}ms");
+    }
+    // Per-tick probabilities keep the same chance per real second. The rate is
+    // ticks per second over the denominator, and it must equal the 4TPS rate.
+    for (name, denominator, old_denominator) in [
+        ("rain", RAIN_CHANCE_DENOMINATOR, 6000u64),
+        ("mob spawn", MOB_SPAWN_CHANCE_DENOMINATOR, 400u64),
+    ] {
+        assert_eq!(TICKS_PER_SECOND as u64 * old_denominator, 4 * denominator,
+            "{name} no longer fires at the same rate per second as at 4TPS");
+    }
+}
+
+#[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
     let _world_guard = WORLD_TEST_LOCK.lock().unwrap();

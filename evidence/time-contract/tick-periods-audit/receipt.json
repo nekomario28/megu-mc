@@ -1,0 +1,42 @@
+{
+  "claim": "a systematic audit found four more unconverted tick quantities, including two per-tick probabilities that would have fired eight times too often",
+  "found": [
+    [
+      "starvation damage interval",
+      "t % 16 == 8",
+      "period",
+      "4s at 4TPS, 0.8s at 20TPS"
+    ],
+    [
+      "fluid scheduled tick",
+      "TICK_IDX % 6",
+      "period",
+      "1.5s at 4TPS, 0.3s at 20TPS"
+    ],
+    [
+      "rain onset chance",
+      "% 6000 == 0",
+      "probability",
+      "1/24000 per second at 4TPS, 1/3000 at 20TPS, eight times too often"
+    ],
+    [
+      "mob spawn chance",
+      "% 400 and % 32",
+      "probability",
+      "1/2000 per second at 4TPS, 1/250 at 20TPS, eight times too often"
+    ]
+  ],
+  "direction_matters": "periods divide by GAME_TICKS_PER_TICK, probabilities multiply by TICKS_PER_SECOND. Choosing wrong shifts the rate by 5x for periods and 8x for probabilities.",
+  "fix": "periods via server_ticks(STARVE_GT=80) and server_ticks(FLUID_TICK_GT=30); probabilities via RAIN_CHANCE_DENOMINATOR = 6000 * TICKS_PER_SECOND / 4 and MOB_SPAWN_CHANCE_DENOMINATOR = 400 * TICKS_PER_SECOND / 4",
+  "implementation_error": "the test first asserted the wrong invariant for probabilities, comparing ticks per second times the old denominator against the new denominator. The correct relation is TICKS_PER_SECOND * old == 4 * new.",
+  "audit_method": "search for tick counters via -= 1 and += 1 on struct fields, then check their initialisers and thresholds; separately search % N == and classify each as period or probability",
+  "excluded": "plate_powered st % 2 is a block-state bit test; rand_u64() % N is not tick based; % 5, % 6, % 23, % 601, % 197, % 89 are state encodings and worldgen",
+  "fourth_instance": "fourth occurrence of the same class, after lava t % 2, air 60, and the projectile TTLs",
+  "remaining": "the combat invulnerabilityTime model is still unimplemented; hurt_at 500ms is real time and cadence independent; shield cooldown 5s matches vanilla",
+  "tests": "36 passed, 0 failed, 1 explicitly ignored, serial and at 8 threads",
+  "features": "fabric-probe,neoforge-events passed",
+  "review": "NOT RUN, external usage limit still in force",
+  "files_sha256": {
+    "README.md": "7e1b25ff0f28e288ff0f097f6d24d9053f265a6152e1e5becbcfe4a60d404fc4"
+  }
+}
