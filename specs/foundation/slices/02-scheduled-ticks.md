@@ -1,5 +1,9 @@
 # 02 — Scheduled-tick queue（巡回とアロケーションを消す）
 
+Status: **部品のみ実装済み**（`src/tick_queue.rs`、7テスト）。
+システムへの接続は未実施で、実害1はまだ残っている。
+証拠は [tick-queue](../../../evidence/foundation/tick-queue/README.md)。
+
 ## Why
 
 `water_tick` / `lava_tick` / `hopper_tick` は毎tick：

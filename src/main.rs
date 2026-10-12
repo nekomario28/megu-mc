@@ -1316,6 +1316,8 @@ fn surface_y(x: i32, z: i32) -> f64 {
 // per-tick advance is derived, not written as a literal 5.
 const TICK_MS: u64 = 50;
 const TICKS_PER_SECOND: u32 = 1000 / TICK_MS as u32;
+/// Four seconds in server ticks, derived so it stays four seconds.
+pub(crate) const MAX_DELAY_TICKS: usize = (4 * TICKS_PER_SECOND) as usize;
 const GAME_TICKS_PER_TICK: u32 = 20 / TICKS_PER_SECOND;
 /// Vanilla states every timing quantity in game ticks. Dividing by the ticks
 /// per server tick converts one to the other, so a duration or interval keeps
@@ -13842,6 +13844,7 @@ mod furnace_cache_tests;
 mod effect_tests;
 #[cfg(test)]
 mod tick_tests;
+mod tick_queue;
 #[cfg(test)]
 mod merge_tests;
 #[cfg(test)]
