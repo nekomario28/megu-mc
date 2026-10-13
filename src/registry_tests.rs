@@ -593,3 +593,93 @@ fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
         assert_eq!(reg.get_prop(back, "facing").as_deref(), Some("north"));
     }
 }
+
+/// Luminance and opacity are per-state fields in pblocks.json. That file is a different
+/// Minecraft version from blocks_1211.json - it has pale_oak_planks - so its state ids are
+/// its own numbering and cannot be used as the global state. The registry pairs the two by
+/// block name and state position, which is what this checks.
+#[test]
+fn light_values_come_from_the_asset_for_every_state() {
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let raw = std::fs::read("assets/pblocks.json").expect("pblocks must be readable");
+    let blocks = crate::feature::jparse_pub(&raw)
+        .expect("pblocks must parse")
+        .get("blocks")
+        .expect("pblocks has blocks")
+        .into_arr()
+        .expect("blocks is an array")
+        .clone();
+    use std::collections::HashMap;
+    let mut by_name: HashMap<String, &crate::worldgen::J> = HashMap::new();
+    for b in &blocks {
+        if let Some(n) = crate::feature::jstr_pub(b, "name") {
+            by_name.insert(n, b);
+        }
+    }
+
+    let raw_md = std::fs::read("assets/blocks_1211.json").expect("blocks_1211 must be readable");
+    let md = crate::feature::jparse_pub(&raw_md)
+        .expect("blocks_1211 must parse")
+        .into_arr()
+        .expect("blocks_1211 is an array")
+        .clone();
+    let mut checked = 0usize;
+    let mut emitters = 0usize;
+    let mut no_states = Vec::new();
+    for b in &md {
+        let name = crate::feature::jstr_pub(b, "name").unwrap_or_default();
+        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
+        let n = (hi - lo + 1) as usize;
+        let Some(pb) = by_name.get(&name) else { continue };
+        let Some(states) = pb.get("states").and_then(|s| s.into_arr()) else { continue };
+        if states.len() != n {
+            // Positional pairing is impossible for these; they are counted so the hole is
+            // visible rather than silent.
+            no_states.push(name);
+            continue;
+        }
+        for (i, s) in states.iter().enumerate() {
+            let st = lo + i as u32;
+            if (st as usize) >= reg.state_count() {
+                continue;
+            }
+            let lum = crate::feature::jnum_pub(s, "luminance").unwrap_or(0.0) as u8;
+            let op = crate::feature::jnum_pub(s, "opacity").unwrap_or(0.0) as u8;
+            assert_eq!(reg.luminance_of(st), lum, "luminance of {name} state {st}");
+            assert_eq!(reg.opacity_of(st), op, "opacity of {name} state {st}");
+            if lum > 0 {
+                emitters += 1;
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
+    assert!(emitters > 100, "the asset must have light sources, found {emitters}");
+    // The two assets are different versions, so a handful of blocks cannot be paired.
+    // If this grows, the pairing assumption has broken.
+    assert!(
+        no_states.len() <= 4,
+        "too many blocks cannot be paired by position: {no_states:?}"
+    );
+}
+
+/// Named light sources, and the two that must not emit.
+#[test]
+fn named_blocks_emit_the_light_vanilla_emits() {
+    for (name, lum) in [
+        ("torch", 14i64),
+        ("lantern", 15),
+        ("sea_lantern", 15),
+        ("glowstone", 15),
+        ("redstone_torch", 7),
+        ("furnace", 0),
+        ("stone", 0),
+    ] {
+        let Some(st) = name_to_state(name) else { panic!("{name} must exist") };
+        let got = breg().unwrap().luminance_of(st);
+        assert_eq!(i64::from(got), lum, "{name}");
+    }
+}

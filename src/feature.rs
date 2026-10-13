@@ -89,6 +89,8 @@ pub(crate) struct BReg {
     drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
     stack_size: Vec<i64>, // state id -> max stack of the item, from the asset
     behaviour: Vec<u8>, // block idx -> random-tick behaviour id
+    luminance: Vec<u8>, // state id -> light the state emits (0 = none)
+    opacity: Vec<u8>, // state id -> how much light it stops
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
@@ -127,6 +129,8 @@ impl BReg {
             drops: vec![-1; n_states_max + 1],
             stack_size: vec![64; n_states_max + 1],
             behaviour: vec![],
+            luminance: vec![0; n_states_max + 1],
+            opacity: vec![0; n_states_max + 1],
             tag: HashMap::new(),
         };
         for b in &md {
@@ -243,6 +247,10 @@ impl BReg {
                                     jnum(&sts[i], "state_flags").unwrap_or(0.0) as u16;
                                 reg.st_side[st] =
                                     jnum(&sts[i], "side_flags").unwrap_or(0.0) as u8;
+                                reg.luminance[st] =
+                                    jnum(&sts[i], "luminance").unwrap_or(0.0) as u8;
+                                reg.opacity[st] =
+                                    jnum(&sts[i], "opacity").unwrap_or(0.0) as u8;
                             }
                         }
                     }
@@ -366,6 +374,16 @@ impl BReg {
             Some(ht) if !ht.is_empty() => ht.contains(&item),
             _ => true,
         }
+    }
+
+    /// Light this state emits, 0..15.
+    pub(crate) fn luminance_of(&self, st: u32) -> u8 {
+        self.luminance.get(st as usize).copied().unwrap_or(0)
+    }
+
+    /// How much light this state stops. Zero is fully transparent.
+    pub(crate) fn opacity_of(&self, st: u32) -> u8 {
+        self.opacity.get(st as usize).copied().unwrap_or(0)
     }
 
     /// The random-tick behaviour of this block, or B_NONE.
