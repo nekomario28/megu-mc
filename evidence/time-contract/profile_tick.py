@@ -63,7 +63,7 @@ def main():
                 item["tick"] = dict(zip(("samples", "total_ns", "p50_ns", "p95_ns", "p99_ns"), values))
             else:
                 item.setdefault("stages", {})[stage] = dict(zip(("calls", "total_ns", "max_ns"), values))
-        assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces", "crowded_actors", "dense_actors", "entity_heavy", "entity_heavy_furnaces", "drop_pile"}
+        assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces", "crowded_actors", "dense_actors", "entity_heavy", "entity_heavy_furnaces", "active_furnaces_pack", "drop_pile"}
         for item in scenarios.values():
             assert item["tick"]["samples"] == 1000
             assert len(item["stages"]) == 15

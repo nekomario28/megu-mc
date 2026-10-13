@@ -466,6 +466,11 @@ fn profile_game_tick() {
         // locks never fire, so hoisting them cannot be measured.
         ("entity_heavy", 1, 0, false),
         ("entity_heavy_furnaces", 1, 400, true),
+        // The arm the other furnace scenarios cannot exercise. A fixture with no
+        // datapacks leaves the smelt list empty, so resolving a result costs nothing
+        // there and the recipe cache has nothing to save. This one loads 40 pack
+        // recipes that match nothing, so each furnace walks the whole list.
+        ("active_furnaces_pack", 1, 400, true),
         // A pile: the bucket merge is O(n x neighbourhood), so concentrating
         // drops in one area grows the neighbourhood back toward n.
         ("drop_pile", 1, 0, false),
@@ -477,6 +482,16 @@ fn profile_game_tick() {
         xps().lock().unwrap().clear();
         crops().lock().unwrap().clear();
         mobs().lock().unwrap().clear();
+        json_smelts().lock().unwrap().clear();
+        if scenario == "active_furnaces_pack" {
+            for i in 0..40i64 {
+                json_smelts()
+                    .lock()
+                    .unwrap()
+                    .push((Ingr::Item(900_000 + i), 42, 1, 0.0));
+            }
+            CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
         if scenario == "drop_pile" {
             // 600 drops inside a 3x3 block area, all mergeable, plus 600 spread
             // far apart that must not merge, to separate merge cost from scan cost.
