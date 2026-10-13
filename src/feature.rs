@@ -255,6 +255,12 @@ impl BReg {
             .map(|s| s.as_str())
             .unwrap_or("minecraft:air")
     }
+    /// Number of states the registry knows. Callers that walk the state space need
+    /// this rather than a literal, so the extent has one owner.
+    pub(crate) fn state_count(&self) -> usize {
+        self.st_blk.len()
+    }
+
     pub(crate) fn is_air(&self, st: u32) -> bool {
         st == 0
             || self.st_fl.get(st as usize).map(|f| f & FL_AIR != 0).unwrap_or(true)

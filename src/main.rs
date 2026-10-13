@@ -3345,12 +3345,19 @@ fn base_state(x: i32, y: i32, z: i32) -> u32 {
 // until a face is exposed to a transparent neighbor — cuts palette diversity
 // AND defeats x-ray, since buried ore never reaches the wire.
 static HIDDEN: OnceLock<HashSet<u32>> = OnceLock::new();
+/// Blocks hidden from clients until seen (anti-xray). Named here rather than inline
+/// so the list has one owner and a test can require every name to resolve: the
+/// names used to be resolved with `filter_map`, which drops a misspelling silently
+/// and leaves that ore visible to clients with nothing reported anywhere.
+const HIDDEN_BLOCK_NAMES: &[&str] = &[
+    "coal_ore", "iron_ore", "gold_ore", "diamond_ore", "lapis_ore", "redstone_ore",
+    "copper_ore", "emerald_ore", "deepslate_coal_ore", "deepslate_iron_ore",
+    "deepslate_diamond_ore", "deepslate_gold_ore", "deepslate_lapis_ore",
+    "deepslate_redstone_ore", "deepslate_copper_ore", "deepslate_emerald_ore",
+    "ancient_debris", "chest", "trapped_chest", "barrel", "ender_chest",
+];
 fn hidden_states() -> &'static HashSet<u32> {
-    HIDDEN.get_or_init(|| ["coal_ore","iron_ore","gold_ore","diamond_ore","lapis_ore","redstone_ore",
-        "copper_ore","emerald_ore","deepslate_coal_ore","deepslate_iron_ore","deepslate_diamond_ore",
-        "deepslate_gold_ore","deepslate_lapis_ore","deepslate_redstone_ore","deepslate_copper_ore",
-        "deepslate_emerald_ore","ancient_debris","chest","trapped_chest","barrel","ender_chest"]
-        .iter().filter_map(|n| name_to_state(n)).collect())
+    HIDDEN.get_or_init(|| HIDDEN_BLOCK_NAMES.iter().filter_map(|n| name_to_state(n)).collect())
 }
 static HIDDEN_EXTRA: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 fn hidden_extra() -> &'static Mutex<HashSet<u32>> {
@@ -13950,6 +13957,8 @@ pub fn test_region_warm_remove(c: &(i32, i32)) { region().lock().unwrap().warm.r
 static WORLD_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod fanout_tests;
+#[cfg(test)]
+mod registry_tests;
 #[cfg(test)]
 mod furnace_cache_tests;
 #[cfg(test)]

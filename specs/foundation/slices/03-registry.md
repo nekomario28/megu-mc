@@ -1,6 +1,54 @@
 # 03 — Block/Item registry と content revision
 
-Status: 設計のみ。着手前の制約を2件確認した（下記）。
+Status: **移行のgate実装済み**。表の中身は未移行。
+
+## 実装済み：gate（移行の前提であり、それ自体が検査道具）
+
+移行の前に、表どうしが**今**一致しているかを主張するテストを書いた。
+移行の等価性ゲートは、移行前の状態を固定していなければ意味がない。
+
+`src/registry_tests.rs` の3テスト：
+
+| テスト | 検査する不変条件 |
+|---|---|
+| `an_item_places_the_block_it_is_named_after` | `item_to_state(i) = st` なら `name_of(st)` が `i` に解決する |
+| `every_block_that_drops_something_is_a_block_the_registry_knows` | `state_to_item(st)` の落とすアイテムがID空間内 |
+| `every_hidden_block_name_resolves_to_the_block_it_names` | 隠す名前が全て解決し、かつ**同じ名前のブロック**に解決する |
+
+### 最初のテストは**間違っていた**（記録）
+
+`state_to_item` と `item_to_state` を**逆写像**と仮定して書いたら2件「失敗」した。
+**失敗したのはテストであって、表ではなかった。**
+
+- `state_to_item(1) = 35` ：石を掘ると**丸石が落ちる**
+- `item_to_state(1) = 1` ：石アイテムは**石を置く**
+
+**別々の正しい関係**である（「このブロックは何を落とすか」と
+「このアイテムは何を置くか」）。往復は要求できない。
+要求できるのは**配置方向の自己整合性**（置いたブロックがその名前のブロックであること）。
+
+これは `refactor-clean` の「例は問題を記録する」の実例である：
+仮説（逆写像）がデータに否定された。
+
+### 静かな穴を1つ塞いだ
+
+`hidden_states` は `filter_map` で解決しており、**解決できない名前を無言で捨てていた**。
+アンチXrayが黙って効かなくなる型。名前を `HIDDEN_BLOCK_NAMES` const に抽出し、
+「名前の数だけ状態がある」ことをテストで要求した（タイポがテストを落とす）。
+
+### 負の対照
+
+[table-gate-negative.log](../../../evidence/foundation/registry/table-gate-negative.log)：
+`item_to_state(1)` を2へ、`iron_ore` を `iron_oar` へ変異させると
+`places minecraft:granite, whose name is item 2` と
+`iron_oar did not resolve to any block` で失敗する。
+
+### このgateで分かったこと
+
+**3テストとも通る。** 表は正しい不変条件の下で**今は一致している**。
+つまり移行前のベースラインが存在し、移行後の等価性をこれで主張できる。
+
+## 着手前の制約は2つとも解けた（下記）
 
 ## 実装前に確認した制約
 
