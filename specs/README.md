@@ -17,7 +17,7 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `c9db329` |
+| HEAD | `0c52559` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
 | `main` との差 | **86 commit**。`main` は `4e5f3e6`（未マージ） |
 | テスト | **92 passed**（serial／8thread×3回連続）、CI 4step通過 |
@@ -165,6 +165,13 @@
   「読み込み済み chunk の一覧」が無い → 対象は既存の hot region + forceload で定義する。
   (b) **seed 付き world RNG が無い**（`rand_u64()` は SystemTime、18箇所）→
   ランダムtick は RNG を消費するので**これが最初の実装対象**
+- **slice 02 の手順1〜4 完了＋最適化**：tick は `idle_actor` で **x3.22**、
+  `active_furnaces_pack` で **x2.77**（連続前後測定）。
+  挙動ID（u8）で整数ディスパッチ、`breg()` をパスごとに1回。
+  **random_ticks 自身の比は主張しない**（どのシナリオでも約18µs一定で、
+  `ticked_chunks()` の費用を説明できていない）
+- **前の記録を訂正**：1サンプル1µsではなく32ns。費用の正体はサンプル数
+  （726/tick）。vanilla は 8,712/tick なので**我々は12倍少ない**
 - **slice 02 の手順1〜4 完了**：`world_rng()`（seed付き xorshift64*、zero seed の
   固定点をテスト）／`ticked_chunks()`（hot region + forceload。新概念を作らない）／
   サンプラ（section ごとに3個）／**サトウキビ成長**
