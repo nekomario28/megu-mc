@@ -144,3 +144,47 @@ tick p50 は 33µs。つまり**ランダムtick が tick の約7割**。）
 - **random_ticks の x1237 は原因不明として記録し、主張しない**
 - 次にやること：`ticked_chunks()` の費用を単独で測る。
   定数18µs が説明できれば、比が意味を持つ
+
+## fixture が機能を測っていなかった（最重要の欠陥）
+
+**ランナーは scratch directory で fixture を走らせるが、`assets/` を用意していなかった。**
+そのため fixture の中では `BReg::load` が失敗して **`breg()` が `None`** になり、
+**registry に依存する経路は全て黙って何もしない**。
+
+つまり：
+
+- `let Some(reg) = breg() else { return }` の**前後どちらの版も、実質何もしていなかった**
+- 私はそれを知らずに **x1237** という比を出しかけた
+- 「どのシナリオでも約18µs一定」という**まさにその異常**が唯一の手がかりだった
+  （それは**ハーネスの stage 計測オーバーヘッド**であって、機能の費用ではない）
+
+**修正**：`profile_tick.py` が scratch dir に `assets/` と `datapacks/` を symlink する。
+これはこの枝の原則そのもの — **「fixture は変更したコードに到達しなければならない」**
+（[audit-performance の測定規律](/home/yuu/.agents/skills/audit-performance/references/measurement-discipline.md) に
+同じ失敗を既に書いていた）。**書いてあるだけで、自分の fixture を確認していなかった。**
+
+### 修正後の実測（release、2run）
+
+| シナリオ | random_ticks | tick p50 | 占有 |
+|---|---|---|---|
+| empty | 36.6µs | 1,232ns | 3% |
+| idle_actor | **59,442.7µs** | 69,391ns | **86%** |
+| dense_actors | 198,229.0µs | 382,408ns | 52% |
+| entity_heavy | 77,066.1µs | 402,932ns | 19% |
+
+（1000 tick あたり。`idle_actor` で **59µs/tick**、726 サンプルなので **81ns/サンプル**）
+
+### この数字の読み方
+
+**tick の86%** ではあるが、**tick 自体が 69µs** であり、目標は **50ms = 50,000µs**。
+つまり **フレーム予算の 0.12%**。比率が高いのは**他がほぼ無料だから**であって、
+絶対値は小さい。**「tick の86%」だけを引用すると誤解を生む。**
+
+対して vanilla は同じ121 chunk で **8,712 サンプル/tick**（全区間）。
+81ns/サンプルなら換算 **約700µs/tick**、vanilla の 50ms 予算の 1.4%。
+
+### 前後の比について
+
+**`assets/` 欠落時の前後比較（x3.22 等）は、registry に依存する経路では無効である。**
+tick 全体は他の stage も含むので 0 ではないが、**ランダムtick の費用比较としては
+使えない**。有効な比較はこの修正の後に取り直す必要がある。

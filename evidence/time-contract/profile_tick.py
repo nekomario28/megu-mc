@@ -36,6 +36,15 @@ def main():
     for index in range(args.runs):
         log = output / f"run-{index}.log"
         with tempfile.TemporaryDirectory(prefix="mc-spine-tick-profile-") as scratch:
+            # The fixture runs in a scratch directory, so anything it reads by relative
+            # path is missing unless it is linked in. assets/ holds the block registry:
+            # without it breg() is None and every registry-dependent path - which is now
+            # most block behaviour - silently does nothing, and the profile reports a
+            # stage that never ran. datapacks/ is the worldgen and pack data.
+            for needed in ("assets", "datapacks"):
+                src = ROOT / needed
+                if src.exists():
+                    os.symlink(src, Path(scratch) / needed)
             pid = os.fork()
             if pid == 0:
                 try:
