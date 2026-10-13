@@ -72,3 +72,33 @@ mc-spine のアイドル RSS と CPU が vanilla より桁で小さい。
 - **機能あたりの費用ではない。** 実装済み部分（炉・水・ホッパー）は
   [recipe-cache](../time-contract/recipe-cache/README.md) の x2.52 のように
   前後比較でしか測っていない。
+
+## vanilha 側の worldgen 費用はこの方法では測れない（否定的結果）
+
+`spawn-chunk-radius` で生成チャンク数を制御し、「Preparing spawn area」出現から
+`Done` までの CPU を測った：
+
+| radius | チャンク数 | spawn生成 CPU | wall |
+|---|---|---|---|
+| 2 | 25 | **7.100 s** | 1.030 s |
+| 4 | 81 | **6.380 s** | 1.020 s |
+| 10 | 441 | **5.790 s** | 0.922 s |
+
+**CPU がチャンク数に比例しない。** チャンクが 25 → 441（17.6倍）でも
+CPU は 7.1 → 5.8 s と**減っている**。つまりこの窓の CPU は
+**JIT・クラス読込・ワーカープール起動という一回きりの費用**が支配しており、
+worldgen の費用ではない。wall も全て約1秒で、差が見えない。
+
+**この数値を「vanilla は441チャンクに6秒CPU」と報告してはいけない。**
+そう読むと、mc-spine の 9.3 ms/chunk（=4.09s/441）と桁で比較してしまい、
+**両方とも間違い**である。
+
+**必要な方法**：サーバーを**warming した後**に RCON で制御されたチャンク生成を
+行い、その窓だけを測る。起動直後の窓は使えない。
+
+## mc-spine 側の数値の但し書き
+
+`MC_SPINE_WG_PROFILE` の 9.3 ms/chunk は
+**地形の列のみ**（`chunk_cols` のコメントに "terrain layer only — no features"）。
+vanilla の full chunk は地形＋feature＋ライト＋スポーンを含む。
+**同じ仕事ではない。**
