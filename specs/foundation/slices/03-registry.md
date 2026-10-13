@@ -35,11 +35,56 @@ Status: **gate実装済み + hardness を資産由来に移行済み**。
 `dig_seconds` の式（`h * (canHarvest ? 1.5 : 5.0) / speed`）は vanilla のままで、
 hardness の出所だけが変わった。
 
+## 実装済み：canHarvest を資産から導出（実バグ修正）
+
+`canHarvest` は vanilla で**2つのことを決める**：
+- ブロックがドロップするか
+- 掘削の倍率（1.5 か 5.0 か）
+
+現状は `needs_pickaxe(b) && harvest_level(held) >= harvest_level_required(b)`
+という**別の質問**で再導出していた。資産の `harvestTools` は
+「無い → どのツールでも可」「有る → そのアイテムが要る」という集合である。
+
+**間違っていたのは道具が要らないブロック**（土・砂・草・原木・葉）。
+これらは「canHarvest=false」と判定され、倍率が 5.0 になっていた。
+**vanilla の 3.33倍遅い。**
+
+測定：ツール別に現状と vanilla の `canHarvest` を全状態で比較し、
+**92〜99% の状態で食い違い**（大半は「vanilla=true / 現状=false」方向）。
+
+変更：`can_harvest(st, item)` を registry が `harvestTools` から答える。
+`harvest_level_required` と `harvest_level`（約30行の手書き表）を削除。
+2箇所の呼び出し（速度倍率とドロップ）が**同じ質問を同じ関数に**尋ねるようになった。
+
+**gate**：
+- `can_harvest_is_the_assets_harvest_tools_set` — 資産を独立に読み、
+  10万通り以上を比較
+- `named_blocks_answer_can_harvest_the_vanilla_way` — 鉄鉱石は石のツルハシで可／
+  木のツルハシで不可、土は何でも可
+- 負の対照：常に true にすると `state 1 of stone` で失敗
+  （[canharvest-negative.log](../../../evidence/foundation/registry/canharvest-negative.log)）
+
+**変更の大きさ**：`feature.rs` +29、`main.rs` +14/−17、`tick_queue.rs` +8。
+挙動の変更は大きい（全ブロックの掘削速度とドロップ）が、行数はほぼ増えていない。
+
 ### 残っている同じ形の再導出（次の候補）
 
-資産は `drops` と `harvestTools` も持っている。つまり `state_to_item`（drops）と
-`harvest_level_required` / `needs_pickaxe`（harvestTools/material）も
-**同じ形の部分的な再導出**である。今回は hardness だけを移した。
+**1. `tool_dig_speed` の `right_tool`（速度側）** — まだ裸の数値範囲：
+
+```rust
+let right_tool = if needs_pickaxe(block) { kind == 2 }
+    else if (131..=235).contains(&block) || (15..=24)... { kind == 1 }
+    else if matches!(block, 9 | 10 | 112 | ...) { kind == 3 }
+    else { false };
+```
+
+資産の `material`（`mineable/pickaxe` / `mineable/axe` / `mineable/shovel` /
+`mineable/hoe`）が**まさにこの情報**を持つ。現状では土にシャベルを使っても
+速度が 1.0 のままなので、vanilla より遅い（鉄シャベルで6倍）。
+`canHarvest` を直したことで**倍率は正しくなったが、速度側は未着手**。
+
+**2. `state_to_item`（drops）** — 資産は `drops` を持つ。
+シルクタッチ/幸運の分岐が別にあるため、単純な置換ではない。要調査。
 
 
 ## 実装済み：gate（移行の前提であり、それ自体が検査道具）

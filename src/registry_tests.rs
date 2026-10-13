@@ -205,3 +205,75 @@ fn named_blocks_have_their_vanilla_mining_time() {
         assert_eq!(block_hardness(st as i64), expect, "{name}");
     }
 }
+
+/// `canHarvest` decides both whether a block drops and whether mining uses the fast
+/// multiplier, and it used to be re-derived as "needs a pickaxe AND a high enough
+/// tier". That asks the wrong question for the many blocks that need no tool at all:
+/// dirt was answered "cannot harvest", so it mined at the slow rate. The registry
+/// answers from the block's own harvestTools set, and this reads the asset to check.
+#[test]
+fn can_harvest_is_the_assets_harvest_tools_set() {
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
+    let md = crate::feature::jparse_pub(&raw)
+        .expect("the asset must parse")
+        .into_arr()
+        .expect("the asset is an array")
+        .clone();
+    let mut checked = 0usize;
+    let mut needs_tool = 0usize;
+    for b in &md {
+        // Every tool id in the asset, so both the accepted and rejected cases run.
+        let allowed: Vec<i64> = match b.get("harvestTools") {
+            Some(crate::worldgen::J::Obj(entries)) => {
+                entries.iter().filter_map(|(k, _)| k.parse::<i64>().ok()).collect()
+            }
+            _ => Vec::new(),
+        };
+        if !allowed.is_empty() {
+            needs_tool += 1;
+        }
+        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        for st in lo..=hi {
+            if (st as usize) >= reg.state_count() {
+                continue;
+            }
+            for item in [818i64, 819, 820, 825, 830, 835, 840, 845, 850] {
+                let expected = allowed.is_empty() || allowed.contains(&item);
+                assert_eq!(can_harvest(st as i64, item), expected, "state {st} of {name}, item {item}");
+                checked += 1;
+            }
+        }
+    }
+    assert!(needs_tool > 100, "the asset must have tool-requiring blocks");
+    assert!(checked > 100_000, "the check must cover the states, covered {checked}");
+}
+
+/// Named cases, because the interesting half is the blocks that need NO tool: those
+/// were the ones answered wrongly.
+#[test]
+fn named_blocks_answer_can_harvest_the_vanilla_way() {
+    let wood_pick = 820i64; // 818 + tier*5 + kind, kind 2 = pickaxe
+    let stone_pick = 825;
+    let shovel = 819;
+    for (name, item, expect) in [
+        ("dirt", shovel, true),
+        ("dirt", wood_pick, true),
+        ("sand", wood_pick, true),
+        ("grass_block", shovel, true),
+        ("oak_log", wood_pick, true),
+        ("stone", wood_pick, true),
+        ("stone", shovel, false),
+        ("cobblestone", wood_pick, true),
+        ("iron_ore", wood_pick, false),
+        ("iron_ore", stone_pick, true),
+        ("diamond_ore", stone_pick, false),
+    ] {
+        let st = name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"));
+        assert_eq!(can_harvest(st as i64, item), expect, "{name} with item {item}");
+    }
+}

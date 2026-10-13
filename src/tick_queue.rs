@@ -38,6 +38,9 @@ impl TickQueue {
     }
 
     pub(crate) fn is_empty(&self) -> bool { self.waiting.is_empty() }
+    /// Test-only: nothing in the tick path needs the count, only whether the queue
+    /// has anything to do.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize { self.waiting.len() }
 
     /// Deadline bucket for `delay` ticks from the current one. A delay of zero or
@@ -84,6 +87,11 @@ impl TickQueue {
     }
 
     /// Drop `pos` from the queue if present.
+    ///
+    /// Production never needs this: a cell whose block is gone is still visited once
+    /// and removes itself from the registry instead of re-queueing, so the entry
+    /// leaves the queue on its own.
+    #[cfg(test)]
     pub(crate) fn cancel(&mut self, pos: (i32, i32, i32)) {
         if let Some(previous) = self.waiting.remove(&pos) {
             if let Some(i) = self.buckets[previous].iter().position(|&p| p == pos) {

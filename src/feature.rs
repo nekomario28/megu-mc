@@ -17,6 +17,9 @@ fn js<'a>(j: &'a J, k: &str) -> Option<&'a J> {
     j.get(k)
 }
 pub(crate) fn jstr_pub(j: &J, k: &str) -> Option<String> { jstr(j,k) }
+/// Test-only: lets the registry checks read the asset themselves rather than
+/// trusting the registry's own answer.
+#[cfg(test)]
 pub(crate) fn jparse_pub(raw: &[u8]) -> Option<J> { jparse(raw) }
 fn jstr(j: &J, k: &str) -> Option<String> {
     js(j, k).map(|v| v.str().to_string())
@@ -76,6 +79,7 @@ pub(crate) struct BReg {
     st_fl: Vec<u16>,   // pumpkin state_flags
     st_side: Vec<u8>,  // pumpkin side_flags
     hardness: Vec<f32>, // state id -> vanilla destroy time (-1 unbreakable)
+    htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
@@ -109,6 +113,7 @@ impl BReg {
             st_fl: vec![0; n_states_max + 1],
             st_side: vec![0; n_states_max + 1],
             hardness: vec![0.6; n_states_max + 1],
+            htools: vec![],
             tag: HashMap::new(),
         };
         for b in &md {
@@ -141,6 +146,18 @@ impl BReg {
             // covered 356 of the 26684 states, which meant mining time was wrong for
             // almost every block in the world.
             let hardness = jnum(b, "hardness").unwrap_or(0.6) as f32;
+            // Vanilla answers "can this tool harvest this block?" from the block's
+            // harvestTools set: empty means any tool works, otherwise the held item
+            // must be in it. Re-deriving that as (needs a pickaxe) AND (tier high
+            // enough) got the multiplier wrong for every block that needs no tool.
+            let ht: Vec<i64> = match b.get("harvestTools") {
+                Some(J::Obj(entries)) => entries
+                    .iter()
+                    .filter_map(|(k, _)| k.parse::<i64>().ok())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            reg.htools.push(ht);
             let n = (hi - lo + 1) as usize;
             for i in 0..n {
                 let st = (lo + i as u32) as usize;
@@ -266,8 +283,20 @@ impl BReg {
     }
     /// Number of states the registry knows. Callers that walk the state space need
     /// this rather than a literal, so the extent has one owner.
+    #[cfg(test)]
     pub(crate) fn state_count(&self) -> usize {
         self.st_blk.len()
+    }
+
+    /// Vanilla `canHarvest`: whether this tool gets the block's drop, and whether
+    /// mining uses the fast multiplier. A block with no harvestTools entry can be
+    /// harvested by anything.
+    pub(crate) fn can_harvest(&self, st: u32, item: i64) -> bool {
+        let Some(&bi) = self.st_blk.get(st as usize) else { return true };
+        match self.htools.get(bi as usize) {
+            Some(ht) if !ht.is_empty() => ht.contains(&item),
+            _ => true,
+        }
     }
 
     /// Vanilla destroy time in seconds. Negative means unbreakable.

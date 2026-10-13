@@ -609,9 +609,10 @@ fn attack_cooldown(item: i64) -> f64 {
     }
 }
 
-// vanilla destroy time: damage/tick = speed/hardness/(canHarvest?30:100).
-// seconds = hardness*1.5/speed when harvestable, hardness*5.0 when not.
-// returns (seconds, harvest_level_required). hardness <0 => unbreakable.
+// Vanilla destroy time: damage/tick = speed/hardness/(canHarvest?30:100), so
+// seconds = hardness*1.5/speed when harvestable and hardness*5.0/speed when not.
+// hardness < 0 means unbreakable, 0 means instantaneous. `canHarvest` comes from
+// the registry's harvestTools data; the tool *speed* side is still a hand table.
 /// Vanilla destroy time, owned by the block registry, which reads it from the same
 /// asset it reads everything else from. The fallback only applies if the registry
 /// failed to load at all.
@@ -621,13 +622,13 @@ fn block_hardness(b: i64) -> f32 {
         None => 0.6,
     }
 }
-// minimum harvest tier (0 wood/gold,1 stone,2 iron,3 diamond,4 netherite)
-fn harvest_level_required(b: i64) -> i64 {
-    match b {
-        125 | 126 | 520 | 521 | 22942 | 22943 => 1,   // iron/lapis/copper ore
-        123 | 124 | 4274 | 4275 | 5735..=5737 | 7511 | 7512 => 2, // gold/diamond/redstone/emerald
-        2354 | 19448 => 3,                            // obsidian/ancient_debris
-        _ => 0,
+/// Whether this tool harvests this block, owned by the registry's `harvestTools`
+/// data. It decides both the drop and the fast/slow mining multiplier, so the two
+/// call sites must ask the same question.
+fn can_harvest(block: i64, held_item: i64) -> bool {
+    match crate::feature::breg() {
+        Some(reg) => reg.can_harvest(block as u32, held_item),
+        None => true,
     }
 }
 fn needs_pickaxe(b: i64) -> bool {
@@ -649,17 +650,13 @@ fn tool_dig_speed(held: &Stack, block: i64) -> f32 {
     if eff > 0 && speed > 1.0 { speed += (eff * eff + 1) as f32; }
     speed
 }
-fn harvest_level(held: &Stack) -> i64 {
-    if (818..=847).contains(&held.0) && (held.0 - 818) % 5 == 2 {
-        [0i64, 1, 0, 2, 3, 4][((held.0 - 818) / 5).clamp(0, 5) as usize]
-    } else { -1 }
-}
+
 fn dig_seconds(block: i64, held: &Stack) -> Option<f32> {
     let h = block_hardness(block);
     if h < 0.0 { return None; }
     if h == 0.0 { return Some(0.0); }
     let speed = tool_dig_speed(held, block);
-    let can = needs_pickaxe(block) && harvest_level(held) >= harvest_level_required(block);
+    let can = can_harvest(block, held.0);
     Some(h * if can { 1.5 } else { 5.0 } / speed)
 }
 
@@ -11676,7 +11673,7 @@ fn handle(mut s: TcpStream) {
                             x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item: 854, cnt: 1, comps: Vec::new(), age: 0 };
                         drops().lock().unwrap().push(d);
                     }
-                    if let Some(item) = if needs_pickaxe(old as i64) && harvest_level(&held) < harvest_level_required(old as i64) { None } else { drop_item } {
+                    if let Some(item) = if !can_harvest(old as i64, held.0) { None } else { drop_item } {
                         let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                             x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item, cnt: drop_cnt, comps: Vec::new(), age: 0 };
                         drops().lock().unwrap().push(d);
