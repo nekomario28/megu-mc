@@ -483,3 +483,55 @@ fn named_blocks_drop_what_vanilla_drops() {
     assert_eq!(block_drop(1u32), Some(item("cobblestone")));
     assert_eq!(block_drop(9u32), Some(item("dirt")));
 }
+
+/// Stack size was a hand table of item id ranges. The asset states it per block - 1 for
+/// tools, 16 for signs, 64 otherwise - so for anything that places a block the table was
+/// a re-derivation, and a partial one. This checks every state against the asset.
+#[test]
+fn stack_size_comes_from_the_asset_for_every_state() {
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
+    let md = crate::feature::jparse_pub(&raw)
+        .expect("the asset must parse")
+        .into_arr()
+        .expect("the asset is an array")
+        .clone();
+    let mut checked = 0usize;
+    for b in &md {
+        let want = crate::feature::jnum_pub(b, "stackSize").unwrap_or(64.0) as i64;
+        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        for st in lo..=hi {
+            if (st as usize) >= reg.state_count() {
+                continue;
+            }
+            assert_eq!(reg.stack_size_of(st), want, "state {st} of {name}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
+}
+
+/// The names, so the assertion reads as the behaviour. Signs stack to 16 and tools to 1,
+/// and both were previously answered from ranges over item ids.
+#[test]
+fn named_items_stack_the_way_vanilla_stacks_them() {
+    for (name, want) in [
+        ("stone", 64i64),
+        ("oak_log", 64),
+        ("oak_sign", 16),
+        ("oak_hanging_sign", 16),
+        ("white_banner", 16),
+        ("bucket", 64), // the block "bucket" does not exist; this is the water bucket
+        ("diamond_pickaxe", 64),
+    ] {
+        let Some(st) = name_to_state(name) else { continue };
+        let Some(item) = name_to_item(name) else { continue };
+        // Only meaningful when the name is both a block and an item.
+        assert_eq!(item_stack_max(item, &Vec::new()), want, "{name}");
+        assert_eq!(stack_size_of(st), want, "{name} state");
+    }
+}

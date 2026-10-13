@@ -492,6 +492,14 @@ const COMP_ENCHANTMENTS: i64 = 9;
 // (1.21.1 minecraft-data: unstackable ids and the 16-stack ids)
 fn item_stack_max(item: i64, comps: &Comps) -> i64 {
     if let Some(n) = comp_varint(comps, 1) { return n.clamp(1, 99) }
+    // A block's item stacks to what the asset says the block stacks to. The ranges
+    // below cover only items that place no block, so they are reached for tools,
+    // buckets, potions and the like.
+    if let Some(st) = item_to_state(item) {
+        if let Some(reg) = crate::feature::breg() {
+            return reg.stack_size_of(st);
+        }
+    }
     if matches!(item,
         522..=538 | 765..=791 | 794 | 797..=798 | 801 | 818..=847 | 849
         | 856..=879 | 909..=911 | 914..=920 | 930..=931 | 933 | 963..=979
@@ -625,6 +633,12 @@ fn block_hardness(b: i64) -> f32 {
 /// Whether this tool harvests this block, owned by the registry's `harvestTools`
 /// data. It decides both the drop and the fast/slow mining multiplier, so the two
 /// call sites must ask the same question.
+/// Test-only: production goes through item_stack_max, which resolves the item to its
+/// block first.
+#[cfg(test)]
+fn stack_size_of(st: u32) -> i64 {
+    crate::feature::breg().map(|reg| reg.stack_size_of(st)).unwrap_or(64)
+}
 fn tool_kind(block: i64) -> i8 {
     match crate::feature::breg() {
         Some(reg) => reg.tool_kind_of(block as u32),

@@ -82,6 +82,7 @@ pub(crate) struct BReg {
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
     tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
     drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
+    stack_size: Vec<i64>, // state id -> max stack of the item, from the asset
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
@@ -118,6 +119,7 @@ impl BReg {
             htools: vec![],
             tool_kind: vec![],
             drops: vec![-1; n_states_max + 1],
+            stack_size: vec![64; n_states_max + 1],
             tag: HashMap::new(),
         };
         for b in &md {
@@ -150,6 +152,10 @@ impl BReg {
             // covered 356 of the 26684 states, which meant mining time was wrong for
             // almost every block in the world.
             let hardness = jnum(b, "hardness").unwrap_or(0.6) as f32;
+            // Stack size is a block property in the asset (1 for tools and potions,
+            // 16 for signs and buckets, 64 otherwise) and is read here once per state
+            // rather than re-derived from item id ranges.
+            let stack_size = jnum(b, "stackSize").unwrap_or(64.0) as i64;
             // What the block drops. The asset lists the default drop, with no
             // enchantment and the correct tool assumed, which is the question this
             // answers; silk touch and fortune are handled where the block is broken.
@@ -213,6 +219,7 @@ impl BReg {
                 reg.st_blk[st] = bi;
                 reg.hardness[st] = hardness;
                 reg.drops[st] = drop0;
+                reg.stack_size[st] = stack_size;
                 if let Some(pbb) = pbr {
                     if let Some(sts) = jarr(pbb, "states") {
                         if sts.len() == n {
@@ -344,6 +351,11 @@ impl BReg {
             Some(ht) if !ht.is_empty() => ht.contains(&item),
             _ => true,
         }
+    }
+
+    /// How many of this item fit in one slot, as the asset states it.
+    pub(crate) fn stack_size_of(&self, st: u32) -> i64 {
+        self.stack_size.get(st as usize).copied().unwrap_or(64)
     }
 
     /// The item this block drops when broken with no enchantment, or None when it
