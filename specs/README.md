@@ -17,9 +17,9 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `b7fa0de` |
+| HEAD | `4d94065` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
-| `main` との差 | **85 commit**。`main` は `4e5f3e6`（未マージ） |
+| `main` との差 | **86 commit**。`main` は `4e5f3e6`（未マージ） |
 | テスト | **83 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
@@ -65,6 +65,16 @@
   黒曜石のように `material` が tier しか述べない場合は `harvestTools` の
   アイテムIDからツール種が決まる
 - 3件とも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
+
+**目標の測定（[receipt](../evidence/goal/idle-vanilla/README.md)）**
+- **初の別実装比較**：同seed・同ワールド種別・同視野/シミュレーション距離・
+  プレイヤー無しで、アイドル12秒の CPU と RSS を連続測定
+- vanilla 1.21.1（公式バンドラ、SHA-1照合済み）：**0.320s / 987 MiB / 62 threads**
+- mc-spine：**0.000s / 5.2 MiB / 3 threads**（桁で 1/140〜1/190）
+- 再現：`bash tools/idle_compare.sh 12 0`
+- **示さないもの**：同じ仕事をしている比較ではない（実装している機能が少ない）。
+  プレイヤー有りの比較ではない。worldgen の比較ではない
+  （mc-spine は datapack が無く flat。vanilla も flat に揃えた）
 
 **性能の end-to-end 測定（[receipt](../evidence/time-contract/recipe-cache/README.md)）**
 - この枝で**初めて**、最適化を fixture の tick で**連続前後測定**した
@@ -146,11 +156,12 @@
 2. **スカラー系のデータフィールドを一括で移行する**
    （`stackSize`, `blast_resistance`, `slipperiness` など）— 同形の作業を
    5コミットに分けない。
-3. **実環境計測の手段を作る** — datapack入りfixtureは**できた**（x2.52を測定）。
-   残りは **vanilla との比較**（同seed・同視界距離・同負荷で両方を走らせる）と
-   代表負荷。**これが無い限り「超軽量化」は主張できない。**
-   手順は `evidence/time-contract/profile_tick.py`（scenario集合を固定して
-   fixtureの無断変更を検知する）。
+3. **実環境計測の手段を仕上げる** — アイドル比較は**できた**（再現スクリプト付き）。
+   次は **同じ仕事をさせた比較**：プレイヤーを入れ、同じ構造を置き、
+   同じ tick 数だけ走らせる。これが無いと「機能あたりの費用が安い」とは言えず、
+   「実装が少ないから軽い」と区別できない。
+   あわせて mc-spine 側の **worldgen datapack 欠落**を直す
+   （現状 flat でしか走らず、地形を持つ比較ができない）。
 4. **`collision_shapes`（状態ごとの衝突形状）** — 残る**最大の挙動差**。
    新しい形状系と移動・設置の消費者が要るので独立した spec にする。
 5. **独立レビューを起こす** — 最大のプロセスリスク。
