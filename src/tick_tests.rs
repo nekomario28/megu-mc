@@ -950,6 +950,38 @@ fn measure_the_light_cost_per_chunk() {
 
     *forceloaded().lock().unwrap() = old_forced;
 
+    // Split the sky cost: the surface lookup and the walk down through block_at are the two
+    // candidates, and which one dominates decides what to fix.
+    let heights = time_it(&mut || {
+        for _ in 0..rounds {
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    std::hint::black_box(height_at(lx, lz));
+                }
+            }
+        }
+    });
+    let walks = time_it(&mut || {
+        for _ in 0..rounds {
+            let reg = crate::feature::breg().unwrap();
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    let mut y = height_at(lx, lz) - 1;
+                    let mut steps = 0;
+                    while steps < 16 {
+                        if reg.opacity_of(block_at(lx, y, lz)) > 0 {
+                            break;
+                        }
+                        y -= 1;
+                        steps += 1;
+                    }
+                }
+            }
+        }
+    });
+    println!(
+        "LIGHT_SPLIT per chunk over {rounds} rounds: surface_lookup={heights:?} surface_plus_walk={walks:?}"
+    );
     println!(
         "LIGHT_COST per chunk over {rounds} rounds: sky={sky:?} block_no_source={none:?} block_with_torch={lit:?}"
     );
