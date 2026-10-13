@@ -17,10 +17,10 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `010061c` |
+| HEAD | `8601f5e` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
 | `main` との差 | **86 commit**。`main` は `4e5f3e6`（未マージ） |
-| テスト | **83 passed**（serial／8thread×3回連続）、CI 4step通過 |
+| テスト | **85 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
 `fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
@@ -152,6 +152,15 @@
 統合headは衝突解決を10箇所で行い、**その正しさは未確認**。
 自己レビューで私が作った欠陥を2件見つけた（`read_comps` の重複、saveの二重書込）
 ので、他にも残っている可能性がある。
+
+**ゲーム要素の計画（[gameplay](gameplay/README.md)）**
+- 在庫を確定：tick システム15、コマンド約25。欠落は ディメンション / レッドストーン /
+  村人 / mob 5種のみ / 光 / 衝突形状 / 落下ブロック / 葉の枯れ / ポータル / ベッド / ボート
+- 支配的な教訓：**ブロックの知識はすでにデータである**（`pblocks.json` が状態ごとに
+  `collision_shapes` / `luminance` / `opacity` 等を持つ）。**挙動を書くのではなく
+  データを読み消費者を書く**
+- 12 slice を値÷費用で順序付け、各 slice に証拠を要求
+- slice 01 の1件目（`stackSize`）完了。**5つ目にして初めて既に正しかった表**
 
 ## FINITE DECISION TREE
 
