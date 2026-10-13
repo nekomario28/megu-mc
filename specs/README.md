@@ -17,10 +17,10 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `d086ee3` |
+| HEAD | `c9db329` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
 | `main` との差 | **86 commit**。`main` は `4e5f3e6`（未マージ） |
-| テスト | **85 passed**（serial／8thread×3回連続）、CI 4step通過 |
+| テスト | **92 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
 `fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
@@ -165,8 +165,14 @@
   「読み込み済み chunk の一覧」が無い → 対象は既存の hot region + forceload で定義する。
   (b) **seed 付き world RNG が無い**（`rand_u64()` は SystemTime、18箇所）→
   ランダムtick は RNG を消費するので**これが最初の実装対象**
-- **次の一手**：`world_rng()`（seed 付き・保存される状態）→ `ticked_chunks()` →
-  サンプラ → **サトウキビ成長**（vanilla は16回で1段＝決定的なので検証しやすい）
+- **slice 02 の手順1〜4 完了**：`world_rng()`（seed付き xorshift64*、zero seed の
+  固定点をテスト）／`ticked_chunks()`（hot region + forceload。新概念を作らない）／
+  サンプラ（section ごとに3個）／**サトウキビ成長**
+- **実バグ1件発見**：`with_prop` がプロパティを**下げる**とき状態範囲の外へ
+  出ていた（age 15→0 が **jukebox**）。**軸・向き・年齢・距離・レベル全てに影響**。
+  剰余で差分を出し、`digit*mult` を含む `off` に足していた
+- **未了**：RNG 状態を保存していない（vanilla は保存する。実ギャップ）／
+  `rand_u64()` 18箇所は未移行（分布が変わるため）／苗木・葉・草・雪は未着手
 
 ## FINITE DECISION TREE
 

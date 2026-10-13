@@ -1,6 +1,16 @@
 # 02 — ブロック挙動ディスパッチとランダムtick
 
-Status: 設計。実装は未着手。**slice 03〜05 の前提**。
+Status: **手順1〜4 完了**（world_rng / ticked_chunks / sampler / サトウキビ）。
+
+**この実装が実バグを1件見つけた**：`with_prop` がプロパティを
+**現在より低い値へ設定するとき**にブロックの状態範囲の外へ出ていた
+（age 15→0 が `minecraft:jukebox` = state 5815）。剰余で差分を出し、
+すでに `digit*mult` を含む `off` に足していたため、引くべきところで足していた。
+**軸・向き・年齢・距離・レベルを設定する全箇所に影響**。
+`setting_a_property_lower_than_its_current_value_stays_inside_the_block` が
+全16×16双方向＋階段3プロパティを網羅し、負の対照は
+`state 5815 is minecraft:jukebox` で失敗する
+（[negative](../../../evidence/foundation/registry/withprop-negative.log)）。
 
 ## 何が無いか
 
