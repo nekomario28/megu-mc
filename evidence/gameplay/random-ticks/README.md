@@ -59,3 +59,43 @@ gate：同じ seed で同じ列／違う seed で違う列／**zero seed が固�
 - 苗木・葉の枯れ・草・雪氷は未着手（葉は `distance` プロパティ、
   草は光＝slice 03 を待つ）。
 - 作物の既存タイマーは**そのまま**（測ってから決める）。
+
+## 費用の測定（重要 — 実装が高すぎる）
+
+`evidence/time-contract/profile_tick.py`（2 run、release）で stage 別に見ると：
+
+| シナリオ | tick p50 | `random_ticks` | 全stage合計 | 占有 |
+|---|---|---|---|---|
+| empty | 1,237ns | 39.3µs | 807.8µs | 5% |
+| idle_actor | 33,077ns | **22,996.3µs** | 32,782.2µs | **70%** |
+| dense_actors | 259,345ns | 76,504.6µs | 259,439.0µs | 30% |
+| entity_heavy | 372,509ns | 26,950.4µs | 373,705.2µs | 7% |
+
+（stage は 1000 tick あたりの ns。`idle_actor` で 23,000µs/1000tick = **23µs/tick**、
+tick p50 は 33µs。つまり**ランダムtick が tick の約7割**。）
+
+**これは「超軽量化」に反する。** このままでは入れられない。
+
+### 原因
+
+`ticked_chunks()` = hot region。1 chunk あたり `ticked_sections()` が
+**最低2区間**（surface 帯）を返すので **6回/tick/chunk** の `on_random_tick`。
+`on_random_tick` 1回が約1µs：
+
+1. **`block_at` が毎回 `world()` の Mutex を取る**
+2. **`reg.name_of(st) == "minecraft:sugar_cane"` という文字列比較**で分岐
+
+実測（1 chunk・編集0）: chunk 1、section 2、`on_random_tick` **6回/tick**。
+つまり**費用は chunk 数 × 区間数 × 3 に比例**し、1回あたりが重い。
+
+### 次の課題（測定済みなので順序が決まる）
+
+1. **ブロックごとの挙動ID を事前計算する**（u8）。`name_of` の文字列比較を
+   **整数比較**に置き換える。`BReg` に `behaviour: Vec<u8>` を足し、
+   `name_of` ではなくIDで分岐する
+2. **1回のパスで `world()` を1度だけ取る**。 `block_at` を内側で呼ばず、
+   ガードを保持したまま読む（`set_block` を呼ぶ経路は再入になるので分離が要る）
+3. そのうえで**連続前後測定**（`x1.10` 未満は主張しない）
+
+**3が済むまでこの機能は「入った」とは言えない** — 現在の費用は
+[tick の70%]であり、記録として残す。

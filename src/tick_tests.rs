@@ -912,3 +912,4 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     set_test_region(old_hot, old_warm);
 }
 
+
