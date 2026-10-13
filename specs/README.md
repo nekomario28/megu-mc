@@ -17,7 +17,7 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `8601f5e` |
+| HEAD | `d086ee3` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
 | `main` との差 | **86 commit**。`main` は `4e5f3e6`（未マージ） |
 | テスト | **85 passed**（serial／8thread×3回連続）、CI 4step通過 |
@@ -153,7 +153,7 @@
 自己レビューで私が作った欠陥を2件見つけた（`read_comps` の重複、saveの二重書込）
 ので、他にも残っている可能性がある。
 
-**ゲーム要素の計画（[gameplay](gameplay/README.md)）**
+**ゲーム要素の計画（[gameplay](gameplay/README.md)）** — 95 commit / 85テスト
 - 在庫を確定：tick システム15、コマンド約25。欠落は ディメンション / レッドストーン /
   村人 / mob 5種のみ / 光 / 衝突形状 / 落下ブロック / 葉の枯れ / ポータル / ベッド / ボート
 - 支配的な教訓：**ブロックの知識はすでにデータである**（`pblocks.json` が状態ごとに
@@ -161,6 +161,12 @@
   データを読み消費者を書く**
 - 12 slice を値÷費用で順序付け、各 slice に証拠を要求
 - slice 01 の1件目（`stackSize`）完了。**5つ目にして初めて既に正しかった表**
+- **slice 02 の設計で前提問題が判明**：(a) world は疎なオーバーレイで
+  「読み込み済み chunk の一覧」が無い → 対象は既存の hot region + forceload で定義する。
+  (b) **seed 付き world RNG が無い**（`rand_u64()` は SystemTime、18箇所）→
+  ランダムtick は RNG を消費するので**これが最初の実装対象**
+- **次の一手**：`world_rng()`（seed 付き・保存される状態）→ `ticked_chunks()` →
+  サンプラ → **サトウキビ成長**（vanilla は16回で1段＝決定的なので検証しやすい）
 
 ## FINITE DECISION TREE
 
