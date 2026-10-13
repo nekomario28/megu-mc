@@ -8275,6 +8275,77 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
     v
 }
 
+/// One 2048-byte sky light array per section, in the client's layout, from a per-column
+/// floor. A column's light is 15 above `floors[i]` and 0 at and below it.
+///
+/// Taking the floors as an argument rather than reading the world is deliberate: the first
+/// attempt at this computed them internally, came out inverted, and could not be reasoned
+/// about because the test depended on world state as well. With the input explicit the test
+/// can hand it floors it chose.
+///
+/// VERTICAL ONLY. Vanilla also spreads sky light sideways, so this lights the column that
+/// has sky directly above it and nothing else: a window or a cave mouth gives no light
+/// through the opening. That is a known limit, not parity.
+fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
+    let reg = crate::feature::breg();
+    let mut floors = [0i32; 256];
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+            // Walk down from the surface while the block lets light through, so water,
+            // glass and leaves near the top do not shade what is under them.
+            let mut y = height_at(x, z) - 1;
+            let mut steps = 0;
+            while steps < 16 {
+                let st = block_at(x, y, z);
+                if reg.map(|r| r.opacity_of(st)).unwrap_or(0) > 0 {
+                    break;
+                }
+                y -= 1;
+                steps += 1;
+            }
+            floors[(lz << 4) | lx] = y;
+        }
+    }
+    sky_light_sections_from(cx, cz, &floors)
+}
+
+fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 2048]> {
+    let _ = (cx, cz);
+    let (mut fmin, mut fmax) = (i32::MAX, i32::MIN);
+    for f in floors {
+        fmin = fmin.min(*f);
+        fmax = fmax.max(*f);
+    }
+    let mut out = Vec::with_capacity(26);
+    for sec in 0..26 {
+        let sy = sec * 16 + MIN_Y;
+        let mut arr = [0u8; 2048];
+        if fmax < sy {
+            // Every floor is below this section, so the whole section is above its own
+            // floor and open to the sky.
+            arr = [0xffu8; 2048];
+        } else if fmin >= sy + 15 {
+            // Every floor is at or above the section's top, so the whole section sits below
+            // the light and stays dark - which all-zero already is.
+        } else {
+            for y in 0..16usize {
+                let wy = sy + y as i32;
+                for lz in 0..16usize {
+                    for half in 0..8usize {
+                        let lx = half * 2;
+                        let lo = if wy > floors[(lz << 4) | lx] { 0x0f } else { 0x00 };
+                        let hi = if wy > floors[(lz << 4) | lx + 1] { 0xf0 } else { 0x00 };
+                        arr[y * 128 + lz * 8 + half] = lo | hi;
+                    }
+                }
+            }
+        }
+        out.push(arr);
+    }
+    out
+}
+
 fn chunk_data(cx: i32, cz: i32) -> Vec<u8> {
 
     let mut data = Vec::new();
@@ -8400,12 +8471,9 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
     write_varint(&mut p, 0); // emptySky
     write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // emptyBlock
     write_varint(&mut p, 26);
-    // PLACEHOLDER: sky light 15 everywhere and no block light, so the world reads as noon
-    // and a torch emits nothing. Replacing it with per-column sky light was attempted and
-    // reverted: the first version lit the world *below* the surface and darkened the sky
-    // above it, which is worse than the constant. A test caught it before the commit, and
-    // the next attempt starts from that test rather than from the same reasoning.
-    for _ in 0..26 { write_varint(&mut p, 2048); p.extend_from_slice(&[0xffu8; 2048]); }
+    // Sky light per column instead of the placeholder 0xff that read as noon everywhere.
+    // Block light is still absent, so a torch emits nothing yet; that is the remaining half.
+    for sec in sky_light_sections(cx, cz) { write_varint(&mut p, 2048); p.extend_from_slice(&sec); }
     write_varint(&mut p, 0);
     p
 }

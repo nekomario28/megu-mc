@@ -684,3 +684,63 @@ fn named_blocks_emit_the_light_vanilla_emits() {
     }
 }
 
+
+/// The nibble layout is part of the contract: a wrong index lights the wrong column, and
+/// nothing else would notice. The floors are supplied rather than read from the world so the
+/// expected values are the test's own.
+#[test]
+fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
+    let floor = 69i32;
+    let mut floors = [floor; 256];
+    floors[(7 << 4) | 5] = floor; // column x=5, z=7
+    let secs = sky_light_sections_from(0, 0, &floors);
+
+    let nibble = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - MIN_Y) / 16) as usize;
+        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+
+    assert_eq!(nibble(floor + 1, 5, 7), 15, "above the floor must be lit");
+    assert_eq!(nibble(floor, 5, 7), 0, "at the floor must be dark");
+    assert_eq!(nibble(floor - 1, 5, 7), 0, "below the floor must be dark");
+    assert_eq!(nibble(floor + 40, 5, 7), 15, "far above must stay lit");
+    assert_eq!(nibble(floor - 40, 5, 7), 0, "far below must stay dark");
+
+    // A different floor for one column must not leak into its neighbour.
+    let mut two = [floor; 256];
+    two[(7 << 4) | 5] = 79;
+    let secs2 = sky_light_sections_from(0, 0, &two);
+    let nib2 = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - MIN_Y) / 16) as usize;
+        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nib2(75, 5, 7), 0, "the raised column must be dark at 75");
+    assert_eq!(nib2(75, 6, 7), 15, "its neighbour must still be lit at 75");
+    assert_eq!(nib2(80, 5, 7), 15, "and lit above its own floor");
+}
+
+/// The same invariant against the world rather than against invented floors: standing on the
+/// surface the player reads lit, and the ground under it dark.
+#[test]
+fn sky_light_reads_lit_at_the_surface_and_dark_under_it() {
+    // No region or forceload setup: sky light reads the world through block_at and
+    // height_at, so it does not depend on the region. Touching the region here without
+    // restoring it polluted the fixture for every test that ran after this one.
+    let _g = WORLD_TEST_LOCK.lock().unwrap();
+    let surface = height_at(5, 7);
+    let secs = sky_light_sections(0, 0);
+    let nibble = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - MIN_Y) / 16) as usize;
+        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nibble(surface, 5, 7), 15, "the block above the surface must be lit");
+    assert_eq!(nibble(surface + 20, 5, 7), 15, "and stay lit upward");
+    assert!(nibble(surface - 1, 5, 7) == 0, "the surface block must be dark");
+    assert!(nibble(surface - 30, 5, 7) == 0, "and stay dark downward");
+}
