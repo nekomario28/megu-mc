@@ -744,3 +744,62 @@ fn sky_light_reads_lit_at_the_surface_and_dark_under_it() {
     assert!(nibble(surface - 1, 5, 7) == 0, "the surface block must be dark");
     assert!(nibble(surface - 30, 5, 7) == 0, "and stay dark downward");
 }
+
+/// Block light falls by one a step and stops at zero. The sources are supplied so the test
+/// owns the input, and so it can place a torch at the edge and check the neighbour chunk's
+/// side of the border - a spread confined to one chunk would leave a dark seam there.
+#[test]
+fn block_light_falls_by_one_a_step_from_its_source() {
+    let lamp = 15u8;
+    let sources = [((5, 70, 7), lamp)];
+    let secs = block_light_sections_from(0, 0, &sources, |_, _, _| 0);
+    let nib = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - MIN_Y) / 16) as usize;
+        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nib(70, 5, 7), 15, "the source is full");
+    assert_eq!(nib(70, 6, 7), 14, "one step away loses one");
+    assert_eq!(nib(70, 7, 7), 13, "two steps lose two");
+    assert_eq!(nib(70, 5, 8), 14, "and the fall is the same in z");
+    assert_eq!(nib(71, 5, 7), 14, "and upward");
+    // The far end of a chunk, with the source in the corner so the distance fits inside it.
+    let corner = [((0i32, 70, 0), lamp)];
+    let cs = block_light_sections_from(0, 0, &corner, |_, _, _| 0);
+    let cnib = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - MIN_Y) / 16) as usize;
+        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let b = cs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(cnib(70, 14, 0), 1, "fourteen steps away is one");
+    assert_eq!(cnib(70, 15, 0), 0, "fifteen steps away is dark");
+
+    // A source just outside the chunk must light the inside of it.
+    let across = [((-1i32, 70, 7), lamp)];
+    let secs2 = block_light_sections_from(0, 0, &across, |_, _, _| 0);
+    let nib2 = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - MIN_Y) / 16) as usize;
+        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nib2(70, 0, 7), 14, "light must cross the chunk border");
+    assert_eq!(nib2(70, 1, 7), 13, "and keep falling inside");
+
+    // Nothing placed means nothing lit.
+    let none = block_light_sections_from(0, 0, &[], |_, _, _| 0);
+    assert!(none.iter().all(|s| s.iter().all(|b| *b == 0)), "no source, no light");
+
+    // A block that stops light does not pass it on.
+    let blocked = block_light_sections_from(0, 0, &sources, |x, _, _| if x == 6 { 15 } else { 0 });
+    let nib3 = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - MIN_Y) / 16) as usize;
+        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let b = blocked[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nib3(70, 6, 7), 0, "an opaque neighbour gets no light");
+    assert_eq!(nib3(70, 7, 7), 0, "and passes none beyond it");
+}

@@ -8286,6 +8286,114 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
 /// VERTICAL ONLY. Vanilla also spreads sky light sideways, so this lights the column that
 /// has sky directly above it and nothing else: a window or a cave mouth gives no light
 /// through the opening. That is a known limit, not parity.
+/// Block light from the given sources, packed for the centre chunk.
+///
+/// The spread runs over the three-by-three chunk area around the centre, which is exact
+/// rather than generous: light falls by one a step, so nothing sixteen blocks away can
+/// reach the centre chunk at all. Sources within one chunk would leave a dark seam along
+/// every border.
+///
+/// With no sources the map stays empty, the spread does nothing, and the cost is the
+/// call itself. That is the common case and it is why this can go in without a measurement
+/// showing a regression.
+fn block_light_sections_from(
+    cx: i32,
+    cz: i32,
+    sources: &[((i32, i32, i32), u8)],
+    opacity: impl Fn(i32, i32, i32) -> u8,
+) -> Vec<[u8; 2048]> {
+    let mut light: HashMap<(i32, i32, i32), u8> = HashMap::new();
+    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> = std::collections::VecDeque::new();
+    for (p, l) in sources {
+        if *l == 0 {
+            continue;
+        }
+        if light.get(p).copied().unwrap_or(0) < *l {
+            light.insert(*p, *l);
+            queue.push_back((*p, *l));
+        }
+    }
+    let (x0, x1) = (cx * 16 - 15, cx * 16 + 30);
+    let (z0, z1) = (cz * 16 - 15, cz * 16 + 30);
+    while let Some((p, l)) = queue.pop_front() {
+        // A block that stops light does not pass it on. The source itself is exempt: a
+        // torch is opaque-looking and still lights its neighbours.
+        if l <= 1 {
+            continue;
+        }
+        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+            let q = (p.0 + dx, p.1 + dy, p.2 + dz);
+            if q.0 < x0 || q.0 > x1 || q.2 < z0 || q.2 > z1 {
+                continue;
+            }
+            if q.1 < MIN_Y || q.1 >= MIN_Y + 384 {
+                continue;
+            }
+            let step = opacity(q.0, q.1, q.2).max(1);
+            let nl = l.saturating_sub(step);
+            if nl == 0 || light.get(&q).copied().unwrap_or(0) >= nl {
+                continue;
+            }
+            light.insert(q, nl);
+            queue.push_back((q, nl));
+        }
+    }
+    let mut out = Vec::with_capacity(26);
+    for sec in 0..26 {
+        let sy = sec * 16 + MIN_Y;
+        let mut arr = [0u8; 2048];
+        for y in 0..16usize {
+            let wy = sy + y as i32;
+            for lz in 0..16usize {
+                for half in 0..8usize {
+                    let lx = half * 2;
+                    let bx = cx * 16 + lx as i32;
+                    let bz = cz * 16 + lz as i32;
+                    let lo = light.get(&(bx, wy, bz)).copied().unwrap_or(0) & 0x0f;
+                    let hi = light.get(&(bx + 1, wy, bz)).copied().unwrap_or(0) & 0x0f;
+                    arr[y * 128 + lz * 8 + half] = lo | (hi << 4);
+                }
+            }
+        }
+        out.push(arr);
+    }
+    out
+}
+
+/// The sources a chunk can see: blocks the world holds that emit light, plus the lava the
+/// server already tracks. Generated glowstone and similar are not found, because the only
+/// list of what the world contains is the overlay of edits; that limit is recorded rather
+/// than papered over by scanning every block.
+fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
+    let Some(reg) = crate::feature::breg() else {
+        return vec![[0u8; 2048]; 26];
+    };
+    let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
+    {
+        let w = world().lock().unwrap();
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let (ncx, ncz) = (cx + dx, cz + dz);
+                let Some(col) = w.get(&(ncx, ncz)) else { continue };
+                for (idx, st) in col {
+                    let lum = reg.luminance_of(*st);
+                    if lum == 0 {
+                        continue;
+                    }
+                    let x = ncx * 16 + (*idx & 15) as i32;
+                    let z = ncz * 16 + ((*idx >> 4) & 15) as i32;
+                    let y = (*idx >> 8) as i32 + MIN_Y;
+                    sources.push(((x, y, z), lum));
+                }
+            }
+        }
+    }
+    for (x, y, z) in lavas().lock().unwrap().iter() {
+        sources.push(((*x, *y, *z), 15));
+    }
+    block_light_sections_from(cx, cz, &sources, |x, y, z| reg.opacity_of(block_at(x, y, z)))
+}
+
 fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     let reg = crate::feature::breg();
     let mut floors = [0i32; 256];
@@ -8467,14 +8575,21 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
         p.extend_from_slice(&n);
     }
     write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask
-    write_varint(&mut p, 0); // blockLightMask
+    // Block light is sent for every section rather than masked per section: the mask would
+    // save 53 KB on a chunk with no light source and cost a pass to compute, and the simpler
+    // form is the one that can be shown correct.
+    write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // blockLightMask
     write_varint(&mut p, 0); // emptySky
-    write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // emptyBlock
-    write_varint(&mut p, 26);
-    // Sky light per column instead of the placeholder 0xff that read as noon everywhere.
-    // Block light is still absent, so a torch emits nothing yet; that is the remaining half.
-    for sec in sky_light_sections(cx, cz) { write_varint(&mut p, 2048); p.extend_from_slice(&sec); }
-    write_varint(&mut p, 0);
+    write_varint(&mut p, 0); // emptyBlock
+    // The arrays follow as two counted lists, each entry prefixed by its length.
+    // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
+    // then the block light a torch contributes. Two counted lists, sky first.
+    let sky = sky_light_sections(cx, cz);
+    write_varint(&mut p, sky.len() as i64);
+    for sec in sky { write_varint(&mut p, 2048); p.extend_from_slice(&sec); }
+    let block = block_light_sections(cx, cz);
+    write_varint(&mut p, block.len() as i64);
+    for sec in block { write_varint(&mut p, 2048); p.extend_from_slice(&sec); }
     p
 }
 
