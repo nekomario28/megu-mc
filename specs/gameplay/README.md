@@ -71,6 +71,13 @@ hot_regions / interest / lava / mobs / observers / plugins / tnt / water
 kill, gamemode, save-all, stop, clear, effect, xp, setblock, summon, give, enchant,
 item, weather, playsound, …
 
+**構造上の制約（設計を決める）**：
+- world は**疎なオーバーレイ**（`(cx,cz) -> {idx -> state}`、worldgen が fallback）。
+  **「読み込み済み chunk」の一覧が無い** → ランダムtick の対象は
+  **既存の hot region + forceload** で定義する（新概念を作らない）
+- **seed 付き world RNG が無い**（`rand_u64()` は SystemTime、18箇所）。
+  ランダムtick は RNG を消費するので、**これは実装の前提**
+
 **無いもの**：
 ディメンション（Nether/End）／レッドストーン（ワイヤ・リピータ・コンパレータ・
 ピストン）／村人・取引・襲撃／mob は5種のみ（chicken・creeper・skeleton・spider・zombie）／
@@ -82,7 +89,7 @@ item, weather, playsound, …
 | # | slice | 消費者 | 証拠 |
 |---|---|---|---|
 | **01** | **ブロック物性レイヤ**（pblocks の残りスカラーを BReg へ） | スタック・爆発・氷・ハチミツ | 資産との全状態一致 + 症状テスト |
-| **02** | **ブロック挙動ディスパッチ**（1箇所に集約） | 作物・苗木・葉・サトウキビ | 既存挙動の等価性 |
+| **02** | **[ブロック挙動ディスパッチとランダムtick](slices/02-block-behaviour.md)** | 作物・苗木・葉・サトウキビ | **前提：seed付きworld RNG**（現状は SystemTime ベースで再現不能） |
 | **03** | **光エンジン**（luminance + opacity） | 松明・ランタン・溶岩 | 光値の一致 |
 | **04** | **衝突形状** | 階段・ハーフ・フェンス・植物 | 形状の一致 |
 | **05** | 落下ブロック・葉の枯れ・草の伝播 | 砂・砂利・葉 | 挙動の一致 |
