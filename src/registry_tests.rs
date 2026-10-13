@@ -683,3 +683,4 @@ fn named_blocks_emit_the_light_vanilla_emits() {
         assert_eq!(i64::from(got), lum, "{name}");
     }
 }
+

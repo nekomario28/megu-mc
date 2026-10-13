@@ -8400,6 +8400,11 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
     write_varint(&mut p, 0); // emptySky
     write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // emptyBlock
     write_varint(&mut p, 26);
+    // PLACEHOLDER: sky light 15 everywhere and no block light, so the world reads as noon
+    // and a torch emits nothing. Replacing it with per-column sky light was attempted and
+    // reverted: the first version lit the world *below* the surface and darkened the sky
+    // above it, which is worse than the constant. A test caught it before the commit, and
+    // the next attempt starts from that test rather than from the same reasoning.
     for _ in 0..26 { write_varint(&mut p, 2048); p.extend_from_slice(&[0xffu8; 2048]); }
     write_varint(&mut p, 0);
     p
