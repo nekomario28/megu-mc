@@ -1,0 +1,32 @@
+{
+ "before": {
+  "idle_furnaces": {
+   "furnaces_ns": 3548051.5,
+   "tick_p50_ns": 13525.5
+  },
+  "active_furnaces": {
+   "furnaces_ns": 7219695.5,
+   "tick_p50_ns": 16721.5
+  },
+  "active_furnaces_pack": {
+   "furnaces_ns": 28640834.5,
+   "tick_p50_ns": 38037.0
+  }
+ },
+ "before revision": "375d17ee0c406ac833b1bde23ab98def38825bad",
+ "after": {
+  "idle_furnaces": {
+   "furnaces_ns": 3631633.0,
+   "tick_p50_ns": 13660.5
+  },
+  "active_furnaces": {
+   "furnaces_ns": 5467246.0,
+   "tick_p50_ns": 15069.0
+  },
+  "active_furnaces_pack": {
+   "furnaces_ns": 5607950.5,
+   "tick_p50_ns": 15098.5
+  }
+ },
+ "after revision": "375d17ee0c406ac833b1bde23ab98def38825bad"
+}
