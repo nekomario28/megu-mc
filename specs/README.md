@@ -66,7 +66,7 @@
   アイテムIDからツール種が決まる
 - 3件とも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
 
-**性能の end-to-end 測定（[receipt](evidence/time-contract/recipe-cache/README.md)）**
+**性能の end-to-end 測定（[receipt](../evidence/time-contract/recipe-cache/README.md)）**
 - この枝で**初めて**、最適化を fixture の tick で**連続前後測定**した
 - `active_furnaces_pack`（datapackレシピ40件）で **tick x2.52**、炉stage x5.11
 - datapack無しでも **tick x1.11**（空でも毎回扣っていた mutex が消える）
