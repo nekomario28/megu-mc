@@ -908,10 +908,13 @@ static DROPS: OnceLock<Mutex<Vec<Drop>>> = OnceLock::new();
 fn drops() -> &'static Mutex<Vec<Drop>> { DROPS.get_or_init(|| Mutex::new(Vec::new())) }
 
 // blockstate -> dropped item id (vanilla: stone->cobblestone, grass->dirt)
-fn state_to_item(st: u32) -> Option<i64> {
-    Some(match st { 1 => 35, 9 => 28, 10 => 28, 14 => 35, 15 => 36, 112 => 57,
-        79 => 56, 131 => 132, 519 => 188, 2092 => 88, 4276 => 91, 2354 => 290, 2355 => 291,
-        _ => return None })
+/// The item a block drops, owned by the block registry, which reads it from the same
+/// asset everything else comes from. The hand table this replaced listed 13 states out
+/// of the 23364 the asset gives a drop, so granite, the stairs and the slabs dropped
+/// nothing at all, and glass dropped itself where vanilla drops nothing without silk
+/// touch. The fallback only applies if the registry failed to load.
+fn block_drop(st: u32) -> Option<i64> {
+    crate::feature::breg().and_then(|reg| reg.block_drop(st))
 }
 fn spawn_drop_pkt(d: &Drop) -> Vec<u8> {
     let mut p = Vec::new();
@@ -2216,7 +2219,7 @@ fn actor_tick() {
                 "attack" => {
                     let st = block_at(tx, ty, tz);
                     if st != 0 {
-                        if let Some(it) = state_to_item(st) {
+                        if let Some(it) = block_drop(st) {
                             let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: tx as f64 + 0.5, y: ty as f64 + 0.4, z: tz as f64 + 0.5, item: it, cnt: 1, comps: Vec::new(), age: 0 };
                                                         drops().lock().unwrap().push(d);
                             // spawn streams via interest_tick
@@ -2283,7 +2286,7 @@ fn water_intoable(st: u32) -> bool { st == 0 || water_washable(st) }
 fn wash_away(x: i32, y: i32, z: i32) {
     let st = block_at(x, y, z);
     if !water_washable(st) { return }
-    if let Some(item) = state_to_item(st) {
+    if let Some(item) = block_drop(st) {
         let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             x: x as f64 + 0.5, y: y as f64 + 0.4, z: z as f64 + 0.5, item, cnt: 1, comps: Vec::new(), age: 0 };
         drops().lock().unwrap().push(d);
@@ -11661,7 +11664,7 @@ fn handle(mut s: TcpStream) {
                             22942..=22943 => Some(812),
                             7511 | 7512 => Some(806),
                             4278..=4285 => Some(853), // wheat -> seeds
-                            _ => state_to_item(old),
+                            _ => block_drop(old),
                         };
                         let n = if fort > 0 && ore.is_some() { 1 + (rand_u64() % (fort as u64 + 1)) as u8 } else { 1 };
                         (it, n)

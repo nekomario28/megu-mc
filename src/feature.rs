@@ -81,6 +81,7 @@ pub(crate) struct BReg {
     hardness: Vec<f32>, // state id -> vanilla destroy time (-1 unbreakable)
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
     tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
+    drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
@@ -116,6 +117,7 @@ impl BReg {
             hardness: vec![0.6; n_states_max + 1],
             htools: vec![],
             tool_kind: vec![],
+            drops: vec![-1; n_states_max + 1],
             tag: HashMap::new(),
         };
         for b in &md {
@@ -148,6 +150,15 @@ impl BReg {
             // covered 356 of the 26684 states, which meant mining time was wrong for
             // almost every block in the world.
             let hardness = jnum(b, "hardness").unwrap_or(0.6) as f32;
+            // What the block drops. The asset lists the default drop, with no
+            // enchantment and the correct tool assumed, which is the question this
+            // answers; silk touch and fortune are handled where the block is broken.
+            // 34 blocks list two drops (the potted plants drop the pot and the
+            // plant) and only the first is modelled here.
+            let drop0 = match b.get("drops").and_then(|d| d.into_arr()) {
+                Some(a) => a.first().map(|j| j.num() as i64).unwrap_or(-1),
+                None => -1,
+            };
             // Vanilla answers "can this tool harvest this block?" from the block's
             // harvestTools set: empty means any tool works, otherwise the held item
             // must be in it. Re-deriving that as (needs a pickaxe) AND (tier high
@@ -201,6 +212,7 @@ impl BReg {
                 }
                 reg.st_blk[st] = bi;
                 reg.hardness[st] = hardness;
+                reg.drops[st] = drop0;
                 if let Some(pbb) = pbr {
                     if let Some(sts) = jarr(pbb, "states") {
                         if sts.len() == n {
@@ -331,6 +343,16 @@ impl BReg {
         match self.htools.get(bi as usize) {
             Some(ht) if !ht.is_empty() => ht.contains(&item),
             _ => true,
+        }
+    }
+
+    /// The item this block drops when broken with no enchantment, or None when it
+    /// drops nothing (glass, ice, tall grass) - which is a real answer, not a missing
+    /// one, and the reason this cannot be inferred from the block's own item.
+    pub(crate) fn block_drop(&self, st: u32) -> Option<i64> {
+        match self.drops.get(st as usize).copied() {
+            Some(d) if d >= 0 => Some(d),
+            _ => None,
         }
     }
 

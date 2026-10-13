@@ -5,7 +5,7 @@ use crate::feature::breg;
 /// the gate the registry slice needs is also the tool that says whether they agree
 /// today.
 ///
-/// The first version of this test assumed `state_to_item` and `item_to_state` were
+/// The first version of this test assumed the drop and item-placement tables were
 /// inverse mappings. They are not, and the failures it reported were the test being
 /// wrong, not the tables: mining stone drops cobblestone while the stone item places
 /// stone. They answer two different questions - *what does this block drop* and
@@ -56,7 +56,7 @@ fn every_block_that_drops_something_is_a_block_the_registry_knows() {
     let mut problems = Vec::new();
     let mut with_drop = 0;
     for st in 0..reg.state_count() as u32 {
-        let Some(item) = state_to_item(st) else { continue };
+        let Some(item) = block_drop(st) else { continue };
         with_drop += 1;
         if !(0..4096).contains(&item) {
             problems.push(format!("state {st} drops item {item}, outside the item space"));
@@ -406,4 +406,80 @@ fn the_right_tool_is_faster_than_bare_hands() {
         tool_dig_speed(&diamond_pick, at("obsidian")) > 1.0,
         "obsidian's tool is the pickaxe, even though only its tier is stated"
     );
+}
+
+/// The drop table used to list 13 states. The asset gives a drop for 23364 of them, so
+/// granite, the stairs, the slabs and everything else dropped nothing at all, and glass
+/// and ice dropped themselves where vanilla drops nothing without silk touch. This
+/// reads the asset and requires the same answer for every state.
+#[test]
+fn the_drop_is_the_assets_drop_for_every_state() {
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
+    let md = crate::feature::jparse_pub(&raw)
+        .expect("the asset must parse")
+        .into_arr()
+        .expect("the asset is an array")
+        .clone();
+    let mut checked = 0usize;
+    let mut multi = 0usize;
+    for b in &md {
+        let drops: Vec<i64> = match b.get("drops").and_then(|d| d.into_arr()) {
+            Some(a) => a.iter().map(|j| j.num() as i64).collect(),
+            None => Vec::new(),
+        };
+        if drops.len() > 1 {
+            multi += 1;
+        }
+        let want = drops.first().copied();
+        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        for st in lo..=hi {
+            if (st as usize) >= reg.state_count() {
+                continue;
+            }
+            // Only the first drop is modelled; the 34 potted plants also drop their plant.
+            assert_eq!(reg.block_drop(st), want, "state {st} of {name}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
+    assert_eq!(
+        multi, 34,
+        "the asset now has {multi} blocks with more than one drop, and only the first is modelled"
+    );
+}
+
+/// Named cases, including the two the old table got backwards: a block whose drop is not
+/// itself, and a block that drops nothing.
+#[test]
+fn named_blocks_drop_what_vanilla_drops() {
+    let item = |n: &str| name_to_item(n).unwrap_or_else(|| panic!("{n} must be an item"));
+    for (name, expect) in [
+        ("stone", Some(35i64)),      // cobblestone
+        ("granite", Some(2)),
+        ("grass_block", Some(28)),   // dirt
+        ("dirt", Some(28)),
+        ("sand", Some(57)),
+        ("gravel", Some(61)),
+        ("oak_log", Some(132)),
+        ("coal_ore", Some(803)),
+        ("iron_ore", Some(810)),
+        ("diamond_ore", Some(805)),
+        ("redstone_ore", Some(657)),
+        ("glass", None),             // nothing without silk touch
+        ("ice", None),
+        ("bedrock", None),
+    ] {
+        let st = name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"));
+        assert_eq!(block_drop(st), expect, "{name}");
+    }
+    // And the ids above are the named items, not just numbers that happen to fit.
+    assert_eq!(name_to_state("cobblestone"), Some(14));
+    assert_eq!(block_drop(14u32), name_to_item("cobblestone"));
+    assert_eq!(block_drop(1u32), Some(item("cobblestone")));
+    assert_eq!(block_drop(9u32), Some(item("dirt")));
 }
