@@ -66,8 +66,15 @@ pub(crate) fn next_below(bound: u32) -> u32 {
 mod tests {
     use super::*;
 
+    // The stream is one global, so a test that reseeds it is mutating shared state and
+    // must hold the same lock the rest of the suite uses for the world.
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn the_same_seed_gives_the_same_sequence() {
+        let _g = guard();
         seed(12345);
         let a: Vec<u64> = (0..8).map(|_| next_u64()).collect();
         seed(12345);
@@ -77,6 +84,7 @@ mod tests {
 
     #[test]
     fn a_different_seed_gives_a_different_sequence() {
+        let _g = guard();
         seed(1);
         let a: Vec<u64> = (0..4).map(|_| next_u64()).collect();
         seed(2);
@@ -98,6 +106,7 @@ mod tests {
 
     #[test]
     fn next_below_stays_in_range_and_covers_it() {
+        let _g = guard();
         seed(7);
         let mut seen = [false; 16];
         for _ in 0..4000 {
@@ -111,6 +120,7 @@ mod tests {
 
     #[test]
     fn the_state_round_trips() {
+        let _g = guard();
         seed(99);
         let _ = next_u64();
         let saved = saved_state();
