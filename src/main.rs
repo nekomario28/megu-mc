@@ -3831,6 +3831,16 @@ fn block_at(x: i32, y: i32, z: i32) -> u32 {
         .and_then(|c| c.get(&local_idx(x, y, z)).copied())
         .unwrap_or_else(|| base_state(x, y, z))
 }
+/// `block_at` for a caller that already holds the world lock. A pass that reads thousands of
+/// cells takes and releases the mutex that many times otherwise, which is what dominates the
+/// block light spread. Safe to combine with `base_state`: it and its dependencies do not take
+/// the world lock, so there is no re-entry.
+fn block_at_held(w: &HashMap<(i32, i32), HashMap<u32, u32>>, x: i32, y: i32, z: i32) -> u32 {
+    w.get(&(x >> 4, z >> 4))
+        .and_then(|c| c.get(&local_idx(x, y, z)).copied())
+        .unwrap_or_else(|| base_state(x, y, z))
+}
+
 fn set_block(x: i32, y: i32, z: i32, st: u32) {
     set_block_if(x, y, z, st, None);
 }
@@ -8364,30 +8374,37 @@ fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     let Some(reg) = crate::feature::breg() else {
         return vec![[0u8; 2048]; 26];
     };
+    // The lava set is taken first and released before the world lock is acquired: every other
+    // path that needs both takes them in that order, and this pass must not be the one that
+    // reverses it.
+    let lava: Vec<(i32, i32, i32)> = lavas().lock().unwrap().iter().copied().collect();
+    // One guard for the whole pass. The spread reads a cell per neighbour per visited cell -
+    // tens of thousands of reads for a single torch - and each read taking the mutex was what
+    // made this the expensive half of the light work.
+    let w = world().lock().unwrap();
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
-    {
-        let w = world().lock().unwrap();
-        for dx in -1..=1 {
-            for dz in -1..=1 {
-                let (ncx, ncz) = (cx + dx, cz + dz);
-                let Some(col) = w.get(&(ncx, ncz)) else { continue };
-                for (idx, st) in col {
-                    let lum = reg.luminance_of(*st);
-                    if lum == 0 {
-                        continue;
-                    }
-                    let x = ncx * 16 + (*idx & 15) as i32;
-                    let z = ncz * 16 + ((*idx >> 4) & 15) as i32;
-                    let y = (*idx >> 8) as i32 + MIN_Y;
-                    sources.push(((x, y, z), lum));
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            let (ncx, ncz) = (cx + dx, cz + dz);
+            let Some(col) = w.get(&(ncx, ncz)) else { continue };
+            for (idx, st) in col {
+                let lum = reg.luminance_of(*st);
+                if lum == 0 {
+                    continue;
                 }
+                let x = ncx * 16 + (*idx & 15) as i32;
+                let z = ncz * 16 + ((*idx >> 4) & 15) as i32;
+                let y = (*idx >> 8) as i32 + MIN_Y;
+                sources.push(((x, y, z), lum));
             }
         }
     }
-    for (x, y, z) in lavas().lock().unwrap().iter() {
-        sources.push(((*x, *y, *z), 15));
+    for (x, y, z) in lava {
+        sources.push(((x, y, z), 15));
     }
-    block_light_sections_from(cx, cz, &sources, |x, y, z| reg.opacity_of(block_at(x, y, z)))
+    block_light_sections_from(cx, cz, &sources, |x, y, z| {
+        reg.opacity_of(block_at_held(&w, x, y, z))
+    })
 }
 
 fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
