@@ -52,13 +52,13 @@
 **ブロック知識の表を資産由来にする（[slice 03](foundation/slices/03-registry.md)）**
 - 手書きの表と資産を全状態で比較し、**移行前のgate**を作った（移行の等価性は
   移行前の状態を固定していなければ意味がない）
-- ** を削除し資産から導出**：手書き表は 26,684状態中**356状態（1.3%）**
+- **`block_hardness` を削除し資産から導出**：手書き表は 26,684状態中**356状態（1.3%）**
   しか覆っておらず、残りは既定0.6だった。**26,420状態の掘削時間が誤っていた**
-  （ は50ではなく0.6、金属ブロック・spawner・anvil・hopper・chest・deepslate）
-- ** を資産の  から導出**：旧判定は
+  （`crying_obsidian` は50ではなく0.6、金属ブロック・spawner・anvil・hopper・chest・deepslate）
+- **`canHarvest` を資産の `harvestTools` から導出**：旧判定は
   「ツルハシが要る かつ tierが足りる」という**別の質問**で、道具が要らないブロック
   （土・砂・草・原木・葉）を「不可」と判定し**3.33倍遅く**していた。
-   / （約30行）を削除
+  `harvest_level_required` / `harvest_level`（約30行）を削除
 - どちらも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
 
 **セキュリティ**：PR #2のhardeningを統合（権限・RCON・handshake・save envelope・
@@ -93,9 +93,9 @@
 |---|---|
 | **独立レビュー**：統合headの衝突解決10箇所は未確認 | issue #7 |
 | 重複の上位候補（表引き4つ組、`spawn_*_pkt`、`door_base`/`gate_base`） | [survey](foundation/slices/07-redundancy-survey.md) |
-| ** の速度側**が裸の数値範囲のまま（資産の `material` で置換可。土にシャベルで6倍遅い） | [slice 03](foundation/slices/03-registry.md) |
-| （drops）も資産の `drops` を再導出している（シルクタッチ/幸運の分岐があり単純置換不可） | [slice 03](foundation/slices/03-registry.md) |
-|  /  の薄いラッパが未使用のまま残る（警告2件） | [slice 01](foundation/slices/01-region-accessor.md) |
+| **`tool_dig_speed` の速度側**が裸の数値範囲のまま（資産の `material` で置換可。土にシャベルで6倍遅い） | [slice 03](foundation/slices/03-registry.md) |
+| `state_to_item`（drops）も資産の `drops` を再導出している（シルクタッチ/幸運の分岐があり単純置換不可） | [slice 03](foundation/slices/03-registry.md) |
+| `is_hot` / `is_warm` の薄いラッパが未使用のまま残る（警告2件） | [slice 01](foundation/slices/01-region-accessor.md) |
 | 基盤 slice 03〜06 | [foundation](foundation/README.md) |
 | 被ダメ無敵をvanilla `invulnerableTime` 20へ（未実装） | [slice 25](time-contract/slices/25-invulnerability.md) |
 | 実クライアント・vanilla動的比較・代表負荷計測 | 全て未実施 |
@@ -130,7 +130,7 @@
 
 ## NEXT SMALLEST DISCRIMINATING ACTION
 
-** の速度側を資産の `material` から導出する。**
+**`tool_dig_speed` の速度側を資産の `material` から導出する。**
 
 現状は裸の数値範囲（`131..=235`、`15..=24`、`9 | 10 | 112 | ...`）で
 「どのツール種が正しいか」を判定している。資産の `material` が
