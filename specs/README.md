@@ -17,7 +17,7 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `4d94065` |
+| HEAD | `010061c` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
 | `main` との差 | **86 commit**。`main` は `4e5f3e6`（未マージ） |
 | テスト | **83 passed**（serial／8thread×3回連続）、CI 4step通過 |
@@ -69,8 +69,16 @@
 **目標の測定（[receipt](../evidence/goal/idle-vanilla/README.md)）**
 - **初の別実装比較**：同seed・同ワールド種別・同視野/シミュレーション距離・
   プレイヤー無しで、アイドル12秒の CPU と RSS を連続測定
-- vanilla 1.21.1（公式バンドラ、SHA-1照合済み）：**0.320s / 987 MiB / 62 threads**
-- mc-spine：**0.000s / 5.2 MiB / 3 threads**（桁で 1/140〜1/190）
+- vanilla 1.21.1（公式バンドラ、SHA-1照合済み）：**2.690s / 1094 MiB / 63 threads**
+- mc-spine：**0.000s / 30.1 MiB / 3 threads**
+- **地形入り**（両方が vanilla の noise settings から同じ地形を生成）。
+  最初の版は flat で測っていた — mc-spine を一時ディレクトリから起動したため
+  `./datapacks` が見えず**黙って flat にフォールバック**していた。
+  **「条件を揃えた」は確認して初めて言える**
+- **worldgen の比較はまだできない**：vanilla 側は起動窓の CPU が
+  JIT・プール起動に支配され**チャンク数に比例しない**（25ch=7.1s、441ch=5.8s）。
+  サーバーを温めてから RCON で制御生成する方法が要る。mc-spine 側の
+  9.3 ms/chunk も**地形列のみ**で full chunk ではない
 - 再現：`bash tools/idle_compare.sh 12 0`
 - **示さないもの**：同じ仕事をしている比較ではない（実装している機能が少ない）。
   プレイヤー有りの比較ではない。worldgen の比較ではない
