@@ -3571,13 +3571,15 @@ const RANDOM_TICK_SPEED: u32 = 3;
 /// walking every block, so the cost follows the number of sections instead of the number
 /// of blocks, and a position that holds nothing costs one array lookup.
 fn random_tick_pass() {
+    // The registry is looked up once per pass, not once per sample.
+    let Some(reg) = crate::feature::breg() else { return };
     for (cx, cz) in ticked_chunks() {
         for sy in ticked_sections(cx, cz) {
             for _ in 0..RANDOM_TICK_SPEED {
                 let x = cx * 16 + world_rng::next_below(16) as i32;
                 let y = sy * 16 + world_rng::next_below(16) as i32;
                 let z = cz * 16 + world_rng::next_below(16) as i32;
-                on_random_tick(x, y, z);
+                on_random_tick(reg, x, y, z);
             }
         }
     }
@@ -3586,14 +3588,12 @@ fn random_tick_pass() {
 /// What a block does when a random tick lands on it. Vanilla calls the block's
 /// `randomTick`; here the block is identified by name from the registry rather than by a
 /// hand-written id range, so a block added from the asset needs no edit to this file.
-fn on_random_tick(x: i32, y: i32, z: i32) {
-    let Some(reg) = crate::feature::breg() else { return };
+fn on_random_tick(reg: &crate::feature::BReg, x: i32, y: i32, z: i32) {
     let st = block_at(x, y, z);
-    if reg.is_air(st) {
-        return;
-    }
-    match reg.name_of(st) {
-        "minecraft:sugar_cane" => sugar_cane_random_tick(reg, x, y, z, st),
+    // One compare against zero for the common case, rather than a string compare against
+    // the block's name on every sample.
+    match reg.behaviour_of(st) {
+        crate::feature::B_SUGAR_CANE => sugar_cane_random_tick(reg, x, y, z, st),
         _ => {}
     }
 }

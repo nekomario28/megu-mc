@@ -872,7 +872,7 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     set_block(0, top, 0, cane);
 
     let reg = crate::feature::breg().expect("the block registry must load from assets/");
-    let tick = || on_random_tick(0, top, 0);
+    let tick = || on_random_tick(crate::feature::breg().unwrap(), 0, top, 0);
     let age = |y: i32| reg.get_prop(block_at(0, y, 0), "age").and_then(|a| a.parse::<u32>().ok());
     let is_cane = |y: i32| reg.name_of(block_at(0, y, 0)) == "minecraft:sugar_cane";
 
@@ -895,13 +895,13 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     // Sixteen more make three, and a third round must not make four.
     for _ in 0..16 {
         tick();
-        on_random_tick(0, top + 1, 0);
+        on_random_tick(crate::feature::breg().unwrap(), 0, top + 1, 0);
     }
     assert!(is_cane(top + 2) && !is_cane(top + 3), "the column must stop at height 3");
     for _ in 0..40 {
         tick();
-        on_random_tick(0, top + 1, 0);
-        on_random_tick(0, top + 2, 0);
+        on_random_tick(crate::feature::breg().unwrap(), 0, top + 1, 0);
+        on_random_tick(crate::feature::breg().unwrap(), 0, top + 2, 0);
     }
     assert!(!is_cane(top + 3), "a column of three must not grow a fourth");
 

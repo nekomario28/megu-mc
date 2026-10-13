@@ -68,6 +68,11 @@ struct Prop {
     vals: Vec<String>,
 }
 
+/// What a block does when a random tick lands on it. Zero is the common case and the
+/// registry stores it for every block, so the dispatch is a compare against zero.
+pub(crate) const B_NONE: u8 = 0;
+pub(crate) const B_SUGAR_CANE: u8 = 1;
+
 pub(crate) struct BReg {
     bname: Vec<String>,
     idx: HashMap<String, u32>,
@@ -83,6 +88,7 @@ pub(crate) struct BReg {
     tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
     drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
     stack_size: Vec<i64>, // state id -> max stack of the item, from the asset
+    behaviour: Vec<u8>, // block idx -> random-tick behaviour id
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
@@ -120,6 +126,7 @@ impl BReg {
             tool_kind: vec![],
             drops: vec![-1; n_states_max + 1],
             stack_size: vec![64; n_states_max + 1],
+            behaviour: vec![],
             tag: HashMap::new(),
         };
         for b in &md {
@@ -208,6 +215,14 @@ impl BReg {
                 }
                 if disagree { None } else { k }
             };
+            // The asset has no behaviour field, so this is the one hand-written table in
+            // the registry. It lives here, next to the data it accompanies, rather than at
+            // the call site, so the dispatch is an integer compare and a behaviour is added
+            // by one line instead of a new branch in the tick.
+            reg.behaviour.push(match name.as_str() {
+                "minecraft:sugar_cane" => B_SUGAR_CANE,
+                _ => B_NONE,
+            });
             reg.tool_kind.push(from_material.or(from_tools).unwrap_or(-1));
             reg.htools.push(ht);
             let n = (hi - lo + 1) as usize;
@@ -351,6 +366,12 @@ impl BReg {
             Some(ht) if !ht.is_empty() => ht.contains(&item),
             _ => true,
         }
+    }
+
+    /// The random-tick behaviour of this block, or B_NONE.
+    pub(crate) fn behaviour_of(&self, st: u32) -> u8 {
+        let Some(&bi) = self.st_blk.get(st as usize) else { return B_NONE };
+        self.behaviour.get(bi as usize).copied().unwrap_or(B_NONE)
     }
 
     /// How many of this item fit in one slot, as the asset states it.
