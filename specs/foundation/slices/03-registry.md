@@ -1,6 +1,46 @@
 # 03 — Block/Item registry と content revision
 
-Status: **移行のgate実装済み**。表の中身は未移行。
+Status: **gate実装済み + hardness を資産由来に移行済み**。
+
+## 実装済み：hardness を資産から導出（実バグ修正）
+
+`block_hardness` は手書きの `match` だった。**資源はすでに資産にあった**：
+`assets/blocks_1211.json` が `hardness` を1060エントリ持っている
+（registry が既に読んでいるファイル）。
+
+全状態で比較した結果：
+
+| | |
+|---|---|
+| 資産が覆う状態 | **26,684** |
+| 手書き表が覆う状態 | **356**（1.3%） |
+| **食い違う状態** | **26,420** |
+
+手書き表があった356件は**資産と一致**していた。つまり表は「間違い」ではなく
+**圧倒的に不完全**で、残りは `_ => 0.6, // unmapped: soft default` に落ちていた。
+
+掘削時間が誤っていた例：`crying_obsidian`（50ではなく0.6）、`netherite_block`、
+`diamond_block`/`gold_block`/`emerald_block`、`spawner`、`anvil`、`hopper`、
+`chest`、`deepslate` ほか。
+
+**変更の大きさ**：`feature.rs` +14、`main.rs` +6/−36（純 −16行）で
+26,420状態が直った。規模対効果は良い方向。
+
+**gate**（資産を**独立に**読んで比較するので、registry経由の再導出ではない）：
+- `mining_time_is_the_asset_value_for_every_state` — 2万状態以上を網羅
+- `named_blocks_have_their_vanilla_mining_time` — 名前付きの値を直接主張
+- 負の対照：既定0.6に戻すと `state ...` と `stone` で失敗
+  （[hardness-negative.log](../../../evidence/foundation/registry/hardness-negative.log)）
+
+`dig_seconds` の式（`h * (canHarvest ? 1.5 : 5.0) / speed`）は vanilla のままで、
+hardness の出所だけが変わった。
+
+### 残っている同じ形の再導出（次の候補）
+
+資産は `drops` と `harvestTools` も持っている。つまり `state_to_item`（drops）と
+`harvest_level_required` / `needs_pickaxe`（harvestTools/material）も
+**同じ形の部分的な再導出**である。今回は hardness だけを移した。
+
 
 ## 実装済み：gate（移行の前提であり、それ自体が検査道具）
 

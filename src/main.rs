@@ -612,43 +612,13 @@ fn attack_cooldown(item: i64) -> f64 {
 // vanilla destroy time: damage/tick = speed/hardness/(canHarvest?30:100).
 // seconds = hardness*1.5/speed when harvestable, hardness*5.0 when not.
 // returns (seconds, harvest_level_required). hardness <0 => unbreakable.
+/// Vanilla destroy time, owned by the block registry, which reads it from the same
+/// asset it reads everything else from. The fallback only applies if the registry
+/// failed to load at all.
 fn block_hardness(b: i64) -> f32 {
-    match b {
-        79 => -1.0,                                   // bedrock
-        1 | 2 | 3 | 4 | 5 | 6 | 7 => 1.5,             // stone/granite/diorite/andesite
-        14 => 2.0,                                     // cobblestone
-        535..=552 => 0.8,                              // sandstone
-        6537..=6560 => 1.5,                            // stone_bricks
-        7415 => 3.0,                                   // end_stone
-        19460 => 1.5,                                  // blackstone
-        20285 => 1.5,                                  // gilded_blackstone
-        21081..=21099 => 3.0,                          // tuff
-        24905..=24960 => 3.0,                          // deepslate
-        5849 => 0.4,                                   // netherrack
-        2354 => 50.0,                                  // obsidian
-        19448 => 30.0,                                 // ancient_debris
-        2092 => 5.0,                                   // iron_block
-        123..=128 | 520..=521 | 4274..=4275 | 5735..=5737 | 7511..=7512 | 22942..=22943 => 3.0, // ores
-        21032 => 1.5,                                  // budding_amethyst
-        131..=235 => 2.0,                              // all logs/wood
-        15..=24 => 2.0,                                // planks
-        2955 => 2.5,                                   // chest
-        4277 => 2.5,                                   // crafting_table
-        4295..=4300 => 3.5,                            // furnace
-        9 => 0.6, 10 => 0.5,                           // grass_block/dirt
-        4286 => 0.6,                                   // farmland
-        112 => 0.5, 118 => 0.6,                        // sand/gravel
-        5798 => 0.6,                                   // clay
-        5850 | 5851 => 0.5,                            // soul_sand/soil
-        5772..=5781 => 0.2,                            // snow
-        519 => 0.3,                                    // glass
-        264..=294 => 0.2,                              // leaves
-        5782 => 0.4,                                   // cactus
-        12543 => 0.5,                                  // magma_block
-        2355 | 2005 | 2077 | 10756 | 18575 => 0.0,      // torch/grass/poppy/tall_grass/berry
-        25..=32 => 0.0,                                // saplings
-        4278..=4301 => 0.0,                            // crops
-        _ => 0.6,                                      // unmapped: soft default
+    match crate::feature::breg() {
+        Some(reg) => reg.hardness_of(b as u32),
+        None => 0.6,
     }
 }
 // minimum harvest tier (0 wood/gold,1 stone,2 iron,3 diamond,4 netherite)
