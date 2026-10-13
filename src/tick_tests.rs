@@ -1021,6 +1021,47 @@ fn measure_the_light_cost_per_chunk() {
             std::hint::black_box(sky_light_sections_from(0, 0, &real_floors));
         }
     });
+    // The halves did not sum to the whole, so the suspicion is that black_box on a Vec did not
+    // force the bytes to be produced - black_box sees the pointer, not the 53 kilobytes behind
+    // it. Reading every byte into a checksum removes that doubt: if the packing was being
+    // optimised away, this is where it shows up.
+    let checksum = |v: &Vec<[u8; 2048]>| -> u64 {
+        let mut acc = 0u64;
+        for s in v {
+            for b in s.iter() {
+                acc = acc.wrapping_add(*b as u64);
+            }
+        }
+        acc
+    };
+    let pack_read = time_it(&mut || {
+        for _ in 0..rounds {
+            std::hint::black_box(checksum(&sky_light_sections_from(0, 0, &real_floors)));
+        }
+    });
+    let sky_read = time_it(&mut || {
+        for _ in 0..rounds {
+            std::hint::black_box(checksum(&sky_light_sections(0, 0)));
+        }
+    });
+    // The same rig for block light, which is where the earlier numbers came from and where
+    // none of them were trustworthy. Reading the bytes is what makes this one comparable.
+    let block_read = time_it(&mut || {
+        for _ in 0..rounds {
+            std::hint::black_box(checksum(&block_light_sections(0, 0)));
+        }
+    });
+    set_block(tx, ty, tz, name_to_state("torch").expect("torch must exist"));
+    let block_read_lit = time_it(&mut || {
+        for _ in 0..rounds {
+            std::hint::black_box(checksum(&block_light_sections(0, 0)));
+        }
+    });
+    set_block(tx, ty, tz, old);
+
+    println!(
+        "LIGHT_READ per chunk over {rounds} rounds: pack_read={pack_read:?} sky_read={sky_read:?} block_read={block_read:?} block_read_lit={block_read_lit:?}"
+    );
     println!(
         "LIGHT_HALVES per chunk over {rounds} rounds: floors_only={floors_only:?} pack_only={pack_only:?}"
     );
