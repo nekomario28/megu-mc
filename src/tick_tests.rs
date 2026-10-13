@@ -979,6 +979,51 @@ fn measure_the_light_cost_per_chunk() {
             }
         }
     });
+    // The two halves of sky_light_sections, measured apart: building the floors, and packing
+    // them. The split so far did not add up, and guessing which half was missing has been
+    // wrong twice, so both are timed with the same inputs the real call uses.
+    let reg = crate::feature::breg().unwrap();
+    let mut real_floors = [0i32; 256];
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let mut y = height_at(lx as i32, lz as i32) - 1;
+            let mut steps = 0;
+            while steps < 16 {
+                if reg.opacity_of(block_at(lx as i32, y, lz as i32)) > 0 {
+                    break;
+                }
+                y -= 1;
+                steps += 1;
+            }
+            real_floors[(lz << 4) | lx] = y;
+        }
+    }
+    let floors_only = time_it(&mut || {
+        for _ in 0..rounds {
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let mut y = height_at(lx as i32, lz as i32) - 1;
+                    let mut steps = 0;
+                    while steps < 16 {
+                        if reg.opacity_of(block_at(lx as i32, y, lz as i32)) > 0 {
+                            break;
+                        }
+                        y -= 1;
+                        steps += 1;
+                    }
+                    std::hint::black_box(y);
+                }
+            }
+        }
+    });
+    let pack_only = time_it(&mut || {
+        for _ in 0..rounds {
+            std::hint::black_box(sky_light_sections_from(0, 0, &real_floors));
+        }
+    });
+    println!(
+        "LIGHT_HALVES per chunk over {rounds} rounds: floors_only={floors_only:?} pack_only={pack_only:?}"
+    );
     println!(
         "LIGHT_SPLIT per chunk over {rounds} rounds: surface_lookup={heights:?} surface_plus_walk={walks:?}"
     );
