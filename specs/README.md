@@ -17,10 +17,10 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `5b73cfd` |
+| HEAD | `2184339` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
 | `main` との差 | **78 commit**。`main` は `4e5f3e6`（未マージ） |
-| テスト | **81 passed**（serial／8thread×3回連続）、CI 4step通過 |
+| テスト | **83 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
 `fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
@@ -49,7 +49,7 @@
 - 各統合にゲートと**負の対照**を付けた。うち2件は**統合した瞬間に検証の穴を発見**
   （溶岩のperiod変換、broadcastの述語）
 
-**ブロック知識の表を資産由来にする（[slice 03](foundation/slices/03-registry.md)）**
+**ブロック知識の表を資産由来にする（[slice 03](foundation/slices/03-registry.md)、[一掃](foundation/slices/08-asset-sweep.md)）**
 - 手書きの表と資産を全状態で比較し、**移行前のgate**を作った（移行の等価性は
   移行前の状態を固定していなければ意味がない）
 - **`block_hardness` を削除し資産から導出**：手書き表は 26,684状態中**356状態（1.3%）**
@@ -98,6 +98,7 @@
 |---|---|
 | **独立レビュー**：統合headの衝突解決10箇所は未確認 | issue #7 |
 | 重複の上位候補（表引き4つ組、`spawn_*_pkt`、`door_base`/`gate_base`） | [survey](foundation/slices/07-redundancy-survey.md) |
+| **資産の残りフィールド**（`stackSize`, `resistance`, `luminance`, `blast_resistance`, `slipperiness`, **`collision_shapes`**） | [一掃](foundation/slices/08-asset-sweep.md) |
 | **`tier_speed` の表**（木2/石4/金12/鉄6/ダイヤ8/ネト9）が手書き（資産の `harvestTools` にツール速度は無いので出典が要る） | [slice 03](foundation/slices/03-registry.md) |
 | `state_to_item`（drops）も資産の `drops` を再導出している（シルクタッチ/幸運の分岐があり単純置換不可） | [slice 03](foundation/slices/03-registry.md) |
 | `is_hot` / `is_warm` の薄いラッパが未使用のまま残る（警告2件） | [slice 01](foundation/slices/01-region-accessor.md) |
@@ -126,28 +127,37 @@
 
 ## FINITE DECISION TREE
 
-1. **基盤 slice 03（Registry）を実装する** — 独立した測定可能な利得がある。
-   ただし制約2件の解決が先（`CachedLookup` は `Copy` のみ対応／可変表の読者は12箇所）
-2. **基盤 slice 04（Entity framework）を実装する** — 物理4重複の解消。大規模
-3. **slice 05/06 を進める** — 05は新状態を持つ部品ごと、06はPR #6の取り込み
-4. **実環境計測の手段を作る** — vanilla比較・実クライアント。軽量化の主張の前提
-5. **独立レビューを起こす** — 現在の最大の欠落
+**順序を入れ替えた。** 直近の作業は全て vanilla 忠実性であり、目標である
+「超軽量化」の証拠は1つも増えていない。[slice 08](foundation/slices/08-asset-sweep.md)
+の一掃で、忠実性の作業が**無限に続くこと**が分かった（残りは10フィールド以上）。
+
+1. **測定器を作る（`tools/asset_coverage.py` + `tests/verify.sh`）** —
+   同じ手順を4回手書きした。1コマンドにすれば、以降の全部が安くなる。
+2. **スカラー系のデータフィールドを一括で移行する**
+   （`stackSize`, `blast_resistance`, `slipperiness` など）— 同形の作業を
+   5コミットに分けない。
+3. **実環境計測の手段を作る** — vanilla比較・代表負荷・datapack入りfixture。
+   **これが無い限り「超軽量化」は主張できない。**
+4. **`collision_shapes`（状態ごとの衝突形状）** — 残る**最大の挙動差**。
+   新しい形状系と移動・設置の消費者が要るので独立した spec にする。
+5. **独立レビューを起こす** — 最大のプロセスリスク。
+   `codex review` は不通なので別の経路で。
+6. slice 04（Entity framework）/ 05 / 06 — 上を踏んだ後。
 
 ## NEXT SMALLEST DISCRIMINATING ACTION
 
-**`state_to_item`（drops）を資産の `drops` と突き合わせる。**
+**測定の手順を1つのスクリプトにする。**
 
-**これは前3件と違って単純な置換ではない。** 資産の `drops` は
-**デフォルトのドロップ**（シルクタッチ無し・幸運無し・正しいツール前提）であり、
-サーバー側にはシルクタッチ/幸運の分岐が**別に**ある。
-`state_to_item` がその分岐とどう噛み合っているかを先に読む必要がある。
+「手書き表と資産を全状態で比較し、食い違いを数え、例を出す」という
+**同じ手順を4回手書きした**（hardness / canHarvest / tool_kind / drops）。
 
-**最初の一手**：`state_to_item` の全状態と資産の `drops` を比較し、
-食い違いを**分類する**（デフォルトと一致する／シルクタッチ側で扱っている／
-どちらでもない＝実バグ）。**測ってから変える。**
+`tools/asset_coverage.py --field <name>` として置けば、
+残りのフィールド（`stackSize` / `resistance` / `luminance` / `blast_resistance` /
+`slipperiness` / `collision_shapes`）の**それぞれが1コマンドで測れる**。
 
-前3件で分かったこと：**手書き表は「間違い」ではなく「圧倒的に不完全」**だった。
-`drops` でも同じなら、シルクタッチの分岐を壊さずに移せる範囲が見える。
+これは1ファイルで完結し、**以降の全ての決定を安くする**。
+
+同時に `tests/verify.sh` を作る（serial → 8thread×3 → wire smoke → feature 2種）。
 
 ## EXPLICIT NON-NEXT WORK
 
