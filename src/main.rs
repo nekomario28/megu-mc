@@ -8439,6 +8439,28 @@ fn pack_light_section(
     arr
 }
 
+/// One section's sky light, written a column at a time. The generic packer reads the floor
+/// twice per byte, 4096 reads a section; a column has one floor per x and writes its sixteen
+/// bytes together, so the reads drop to 256 and there is no closure to call. This is where the
+/// cost was: the packing, not the block lookups.
+fn pack_sky_section(sy: i32, floors: &[i32; 256]) -> [u8; 2048] {
+    let mut arr = [0u8; 2048];
+    for lz in 0..16usize {
+        for half in 0..8usize {
+            let lx = half * 2;
+            let f0 = floors[(lz << 4) | lx];
+            let f1 = floors[(lz << 4) | lx + 1];
+            for y in 0..16usize {
+                let wy = sy + y as i32;
+                let lo = if wy > f0 { 0x0f } else { 0x00 };
+                let hi = if wy > f1 { 0xf0 } else { 0x00 };
+                arr[y * 128 + lz * 8 + half] = lo | hi;
+            }
+        }
+    }
+    arr
+}
+
 fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 2048]> {
     let _ = (cx, cz);
     let (mut fmin, mut fmax) = (i32::MAX, i32::MIN);
@@ -8457,10 +8479,19 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
         } else if fmin >= sy + 15 {
             // Every floor is at or above the section's top, so the whole section sits below
             // the light and stays dark - which all-zero already is.
+        } else if fmin == fmax {
+            // Every column shares this floor, so the section is a run of dark rows and then a
+            // run of lit ones. Relief makes this rare, so it is a branch for the flat case and
+            // not the expected path.
+            for y in 0..16usize {
+                if sy + y as i32 > fmin {
+                    for i in 0..128 {
+                        arr[y * 128 + i] = 0xff;
+                    }
+                }
+            }
         } else {
-            arr = pack_light_section(sy, cx, cz, |lx, wy, lz| {
-                if wy > floors[(lz << 4) | lx] { 15 } else { 0 }
-            });
+            arr = pack_sky_section(sy, floors);
         }
         out.push(arr);
     }
