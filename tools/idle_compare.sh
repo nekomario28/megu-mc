@@ -2,6 +2,11 @@
 # Compare an idle server against vanilla under the conditions the goal names: the same
 # seed, the same world type, the same view and simulation distance, and no players.
 #
+# Both generate real terrain from seeds 0. mc-spine reads its vanilla worldgen from
+# ./datapacks, so the pack directory is linked into its run directory; without it the
+# server silently falls back to a flat generator and the comparison would be measuring
+# two different things.
+#
 #   tools/idle_compare.sh [seconds] [seed]
 #
 # The goal is to be lightweight while behaving like vanilla, and the only way that
@@ -58,7 +63,6 @@ printf 'eula=true\n' > "$VANILLA_DIR/eula.txt"
 cat > "$VANILLA_DIR/server.properties" <<EOF
 level-seed=$SEED
 level-name=world
-level-type=minecraft:flat
 online-mode=false
 view-distance=4
 simulation-distance=4
@@ -78,6 +82,7 @@ wait "$VPID" 2>/dev/null || true
 echo "-- mc-spine, flat, seed $SEED, no players"
 cargo build --release --offline --locked -j 4 --manifest-path "$ROOT/Cargo.toml" >/dev/null
 rm -rf "$SPINE_DIR"; mkdir -p "$SPINE_DIR"
+ln -s "$ROOT/datapacks" "$SPINE_DIR/datapacks"
 ( cd "$SPINE_DIR" && MC_SPINE_PORT=25598 MC_SPINE_SEED="$SEED" \
     exec "$ROOT/target/release/mc-spine" ) > "$SPINE_DIR/spine.log" 2>&1 &
 SPID=$!
@@ -89,4 +94,5 @@ printf '\n%-14s %10s %10s %8s\n' "idle ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "
 printf '%-14s %10s %10s %8s\n' vanilla   $(echo "$VAN" | awk '{printf "%s %s %s", $1, $2, $3}')
 printf '%-14s %10s %10s %8s\n' mc-spine  $(echo "$SPI" | awk '{printf "%s %s %s", $1, $2, $3}')
 echo
-grep -h 'worldgen datapack' "$SPINE_DIR/spine.log" || true
+grep -hE '\[wg\]' "$SPINE_DIR/spine.log" || true
+grep -oE 'Done \([0-9.]+s\)' "$VANILLA_DIR/server.log" | tail -1
