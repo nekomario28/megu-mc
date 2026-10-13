@@ -67,23 +67,49 @@ hardness の出所だけが変わった。
 **変更の大きさ**：`feature.rs` +29、`main.rs` +14/−17、`tick_queue.rs` +8。
 挙動の変更は大きい（全ブロックの掘削速度とドロップ）が、行数はほぼ増えていない。
 
-### 残っている同じ形の再導出（次の候補）
+## 実装済み：正しいツール種を資産から導出（実バグ修正）
 
-**1. `tool_dig_speed` の `right_tool`（速度側）** — まだ裸の数値範囲：
+`tool_dig_speed` の `right_tool` は**裸の数値範囲**だった：
 
 ```rust
 let right_tool = if needs_pickaxe(block) { kind == 2 }
-    else if (131..=235).contains(&block) || (15..=24)... { kind == 1 }
-    else if matches!(block, 9 | 10 | 112 | ...) { kind == 3 }
+    else if (131..=235).contains(&block) || (15..=24)... { kind == 3 }
+    else if matches!(block, 9 | 10 | 112 | ...) { kind == 1 }
     else { false };
 ```
 
-資産の `material`（`mineable/pickaxe` / `mineable/axe` / `mineable/shovel` /
-`mineable/hoe`）が**まさにこの情報**を持つ。現状では土にシャベルを使っても
-速度が 1.0 のままなので、vanilla より遅い（鉄シャベルで6倍）。
-`canHarvest` を直したことで**倍率は正しくなったが、速度側は未着手**。
+`needs_pickaxe` は157状態、axe範囲119、shovel範囲19しか覆っていなかった。
+資産の `material`（`mineable/pickaxe` 等）が**まさにこの情報**である。
 
-**2. `state_to_item`（drops）** — 資産は `drops` を持つ。
+**測定**：全状態×全ツール種で比較すると **22,391 / 26,684 = 83.9%** が食い違い。
+例：土にシャベル（認識されず速度1.0）、板材に斧、苗木に斧、葉にクワ。
+
+**2つの形があった**：
+1. `material` が `mineable/<kind>` を名乗る（大半）
+2. `material` が `incorrect_for_wooden_tool` で、**tier でしか門番していない**
+   （黒曜石・古代の残骸・ネザライトブロック）。この場合は `harvestTools` の
+   アイテムIDからツール種が決まる（840/845 はどちらもkind 2 = ツルハシ）
+
+```
+kind = material の mineable/<kind>  →  無ければ harvestTools の共通kind  →  無ければ -1
+```
+
+`needs_pickaxe` を削除。`right_tool = kind == tool_kind(block)`。
+
+**gate**：
+- `the_correct_tool_kind_is_the_assets_material` — 資産を独立に読み全状態を比較
+- `named_blocks_name_their_tool` — 土=シャベル、原木=斧、葉=クワ、黒曜石=ツルハシ、
+  ガラス/松明=-1（正しいツール無し）
+- `the_right_tool_is_faster_than_bare_hands` — **症状そのもの**：
+  シャベルは土を速くし、ツルハシは土を速くしない
+- 負の対照：常に -1 にすると `dirt` と `state` で失敗
+  （[toolkind-negative.log](../../../evidence/foundation/registry/toolkind-negative.log)）
+
+**変更の大きさ**：`feature.rs` +42、`main.rs` +9/−10。
+
+## 残っている同じ形の再導出（次の候補）
+
+**1. `state_to_item`（drops）** — 資産は `drops` を持つ。
 シルクタッチ/幸運の分岐が別にあるため、単純な置換ではない。要調査。
 
 

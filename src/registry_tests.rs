@@ -277,3 +277,133 @@ fn named_blocks_answer_can_harvest_the_vanilla_way() {
         assert_eq!(can_harvest(st as i64, item), expect, "{name} with item {item}");
     }
 }
+
+/// Which tool mines a block at full speed used to come from bare id ranges in
+/// `tool_dig_speed`, which named the right tool for 16 percent of the states: a shovel
+/// was not recognised on dirt, an axe not on planks, and so on. The asset states it,
+/// either as a mineable/<kind> tag or - for blocks gated by tier, like obsidian -
+/// through the harvestTools set alone. This reads the asset and requires the same
+/// answer, for every state.
+#[test]
+fn the_correct_tool_kind_is_the_assets_material() {
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
+    let md = crate::feature::jparse_pub(&raw)
+        .expect("the asset must parse")
+        .into_arr()
+        .expect("the asset is an array")
+        .clone();
+    let mut checked = 0usize;
+    let mut with_kind = 0usize;
+    for b in &md {
+        let material = b.get("material").map(|m| m.str().to_string()).unwrap_or_default();
+        let from_material = material.split(';').find_map(|part| match part {
+            "mineable/shovel" => Some(1i8),
+            "mineable/pickaxe" => Some(2),
+            "mineable/axe" => Some(3),
+            "mineable/hoe" => Some(4),
+            "mineable/sword" => Some(0),
+            _ => None,
+        });
+        let from_tools = match b.get("harvestTools") {
+            Some(crate::worldgen::J::Obj(entries)) => {
+                let mut k: Option<i8> = None;
+                let mut disagree = false;
+                for (key, _) in entries {
+                    let t: i64 = match key.parse() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    if (818..=847).contains(&t) {
+                        let kd = ((t - 818) % 5) as i8;
+                        match k {
+                            None => k = Some(kd),
+                            Some(prev) if prev != kd => disagree = true,
+                            _ => {}
+                        }
+                    }
+                }
+                if disagree { None } else { k }
+            }
+            _ => None,
+        };
+        let want = from_material.or(from_tools).unwrap_or(-1);
+        if want >= 0 {
+            with_kind += 1;
+        }
+        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        for st in lo..=hi {
+            if (st as usize) >= reg.state_count() {
+                continue;
+            }
+            assert_eq!(reg.tool_kind_of(st), want, "state {st} of {name}");
+            checked += 1;
+        }
+    }
+    assert!(with_kind > 300, "the asset must name a tool for most blocks");
+    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
+}
+
+/// Named cases, including the two shapes that used to be missed: a block mined by a
+/// non-pickaxe, and a block whose tool is stated only through its tier-gated set.
+#[test]
+fn named_blocks_name_their_tool() {
+    for (name, kind) in [
+        ("dirt", 1i8),
+        ("sand", 1),
+        ("gravel", 1),
+        ("grass_block", 1),
+        ("stone", 2),
+        ("cobblestone", 2),
+        ("iron_ore", 2),
+        ("obsidian", 2),
+        ("ancient_debris", 2),
+        ("netherite_block", 2),
+        ("oak_planks", 3),
+        ("oak_log", 3),
+        ("oak_leaves", 4),
+        ("glass", -1),
+        ("torch", -1),
+    ] {
+        let st = name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"));
+        assert_eq!(tool_kind(st as i64), kind, "{name}");
+    }
+}
+
+/// The consequence the derivation is for: the right tool has to be faster than bare
+/// hands, and a tool of the wrong type must not be.
+#[test]
+fn the_right_tool_is_faster_than_bare_hands() {
+    let hands = (0i64, 0u8, Vec::new());
+    let iron_shovel = (818 + 3 * 5 + 1, 1u8, Vec::new());
+    let iron_pick = (818 + 3 * 5 + 2, 1u8, Vec::new());
+    let iron_axe = (818 + 3 * 5 + 3, 1u8, Vec::new());
+    let diamond_pick = (840i64, 1u8, Vec::new());
+    let at = |name: &str| name_to_state(name).unwrap() as i64;
+
+    assert!(
+        tool_dig_speed(&iron_shovel, at("dirt")) > tool_dig_speed(&hands, at("dirt")),
+        "a shovel must speed up dirt"
+    );
+    assert_eq!(
+        tool_dig_speed(&iron_pick, at("dirt")),
+        1.0,
+        "a pickaxe is not dirt's tool and must not speed it up"
+    );
+    assert!(
+        tool_dig_speed(&iron_axe, at("oak_planks")) > 1.0,
+        "an axe must speed up planks"
+    );
+    assert!(
+        tool_dig_speed(&iron_pick, at("stone")) > 1.0,
+        "a pickaxe must speed up stone"
+    );
+    assert!(
+        tool_dig_speed(&diamond_pick, at("obsidian")) > 1.0,
+        "obsidian's tool is the pickaxe, even though only its tier is stated"
+    );
+}

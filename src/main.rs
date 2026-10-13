@@ -625,26 +625,25 @@ fn block_hardness(b: i64) -> f32 {
 /// Whether this tool harvests this block, owned by the registry's `harvestTools`
 /// data. It decides both the drop and the fast/slow mining multiplier, so the two
 /// call sites must ask the same question.
+fn tool_kind(block: i64) -> i8 {
+    match crate::feature::breg() {
+        Some(reg) => reg.tool_kind_of(block as u32),
+        None => -1,
+    }
+}
 fn can_harvest(block: i64, held_item: i64) -> bool {
     match crate::feature::breg() {
         Some(reg) => reg.can_harvest(block as u32, held_item),
         None => true,
     }
 }
-fn needs_pickaxe(b: i64) -> bool {
-    matches!(b, 1..=7 | 14 | 123..=128 | 520..=521 | 535..=552 | 4274..=4275
-        | 4295..=4300 | 5735..=5737 | 6537..=6560 | 7415 | 7511..=7512
-        | 12543 | 19448 | 19460 | 20285 | 2092 | 21032 | 21081..=21099
-        | 22942..=22943 | 2354 | 24905..=24960 | 5849)
-}
 // tool dig speed; kind order in band: sword,shovel,pick,axe,hoe; tier: wood,stone,gold,iron,diamond,netherite
 fn tool_dig_speed(held: &Stack, block: i64) -> f32 {
     let (kind, band) = if (818..=847).contains(&held.0) { ((held.0 - 818) % 5, (held.0 - 818) / 5) } else { (-1, 0) };
     let tier_speed = [2.0f32, 4.0, 12.0, 6.0, 8.0, 9.0];
-    let right_tool = if needs_pickaxe(block) { kind == 2 }
-        else if (131..=235i64).contains(&block) || (15..=24).contains(&block) || block == 2955 || block == 4277 { kind == 3 }
-        else if matches!(block, 9 | 10 | 112 | 118 | 4286 | 5798 | 5850 | 5851 | 5772..=5781) { kind == 1 }
-        else { false };
+    // The correct tool type comes from the block asset, not from id ranges: the hand
+    // ranges answered for 16 percent of the states.
+    let right_tool = kind >= 0 && kind == i64::from(tool_kind(block));
     let mut speed = if right_tool { tier_speed[band.clamp(0, 5) as usize] } else { 1.0 };
     let eff = enchant_level(&held.2, 8);
     if eff > 0 && speed > 1.0 { speed += (eff * eff + 1) as f32; }

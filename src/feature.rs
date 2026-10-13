@@ -80,6 +80,7 @@ pub(crate) struct BReg {
     st_side: Vec<u8>,  // pumpkin side_flags
     hardness: Vec<f32>, // state id -> vanilla destroy time (-1 unbreakable)
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
+    tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
@@ -114,6 +115,7 @@ impl BReg {
             st_side: vec![0; n_states_max + 1],
             hardness: vec![0.6; n_states_max + 1],
             htools: vec![],
+            tool_kind: vec![],
             tag: HashMap::new(),
         };
         for b in &md {
@@ -157,6 +159,39 @@ impl BReg {
                     .collect(),
                 _ => Vec::new(),
             };
+            // Which tool type mines this block at full speed. The asset states it as a
+            // mineable/<kind> tag, or - for blocks gated by tier rather than by tool
+            // type, like obsidian - only through the harvestTools set. A hand table of
+            // bare id ranges answered this for 16% of the states.
+            let from_material = match b.get("material") {
+                Some(m) => m.str(),
+                None => "",
+            }
+            .split(';')
+            .find_map(|part| match part {
+                "mineable/shovel" => Some(1i8),
+                "mineable/pickaxe" => Some(2),
+                "mineable/axe" => Some(3),
+                "mineable/hoe" => Some(4),
+                "mineable/sword" => Some(0),
+                _ => None,
+            });
+            let from_tools = {
+                let mut k: Option<i8> = None;
+                let mut disagree = false;
+                for t in &ht {
+                    if (818..=847).contains(t) {
+                        let kd = ((t - 818) % 5) as i8;
+                        match k {
+                            None => k = Some(kd),
+                            Some(prev) if prev != kd => disagree = true,
+                            _ => {}
+                        }
+                    }
+                }
+                if disagree { None } else { k }
+            };
+            reg.tool_kind.push(from_material.or(from_tools).unwrap_or(-1));
             reg.htools.push(ht);
             let n = (hi - lo + 1) as usize;
             for i in 0..n {
@@ -297,6 +332,13 @@ impl BReg {
             Some(ht) if !ht.is_empty() => ht.contains(&item),
             _ => true,
         }
+    }
+
+    /// Which tool type (0 sword, 1 shovel, 2 pickaxe, 3 axe, 4 hoe) mines this block
+    /// at full speed, or -1 when no tool is faster than bare hands.
+    pub(crate) fn tool_kind_of(&self, st: u32) -> i8 {
+        let Some(&bi) = self.st_blk.get(st as usize) else { return -1 };
+        self.tool_kind.get(bi as usize).copied().unwrap_or(-1)
     }
 
     /// Vanilla destroy time in seconds. Negative means unbreakable.
