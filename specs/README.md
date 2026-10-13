@@ -19,8 +19,8 @@
 | branch | **`fix/20tps-integrated`** |
 | HEAD | `c70cde6` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
-| `main` との差 | **75 commit**。`main` は `4e5f3e6`（未マージ） |
-| テスト | **78 passed**（serial／8thread×3回連続）、CI 4step通過 |
+| `main` との差 | **78 commit**。`main` は `4e5f3e6`（未マージ） |
+| テスト | **81 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
 `fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
@@ -59,7 +59,12 @@
   「ツルハシが要る かつ tierが足りる」という**別の質問**で、道具が要らないブロック
   （土・砂・草・原木・葉）を「不可」と判定し**3.33倍遅く**していた。
   `harvest_level_required` / `harvest_level`（約30行）を削除
-- どちらも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
+- **`tool_dig_speed` の正しいツール種も資産から導出**：旧判定は裸の数値範囲で、
+  157状態+119+19しか覆っておらず **83.9% の状態で誤っていた**（土にシャベル、
+  原木に斧、苗木に斧、葉にクワ）。`needs_pickaxe` を削除。
+  黒曜石のように `material` が tier しか述べない場合は `harvestTools` の
+  アイテムIDからツール種が決まる
+- 3件とも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
 
 **セキュリティ**：PR #2のhardeningを統合（権限・RCON・handshake・save envelope・
 起動時検証・pre-play deadline）
@@ -93,7 +98,7 @@
 |---|---|
 | **独立レビュー**：統合headの衝突解決10箇所は未確認 | issue #7 |
 | 重複の上位候補（表引き4つ組、`spawn_*_pkt`、`door_base`/`gate_base`） | [survey](foundation/slices/07-redundancy-survey.md) |
-| **`tool_dig_speed` の速度側**が裸の数値範囲のまま（資産の `material` で置換可。土にシャベルで6倍遅い） | [slice 03](foundation/slices/03-registry.md) |
+| **`tier_speed` の表**（木2/石4/金12/鉄6/ダイヤ8/ネト9）が手書き（資産の `harvestTools` にツール速度は無いので出典が要る） | [slice 03](foundation/slices/03-registry.md) |
 | `state_to_item`（drops）も資産の `drops` を再導出している（シルクタッチ/幸運の分岐があり単純置換不可） | [slice 03](foundation/slices/03-registry.md) |
 | `is_hot` / `is_warm` の薄いラッパが未使用のまま残る（警告2件） | [slice 01](foundation/slices/01-region-accessor.md) |
 | 基盤 slice 03〜06 | [foundation](foundation/README.md) |
