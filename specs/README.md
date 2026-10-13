@@ -17,9 +17,9 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `2184339` |
+| HEAD | `b7fa0de` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
-| `main` との差 | **78 commit**。`main` は `4e5f3e6`（未マージ） |
+| `main` との差 | **85 commit**。`main` は `4e5f3e6`（未マージ） |
 | テスト | **83 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
@@ -65,6 +65,16 @@
   黒曜石のように `material` が tier しか述べない場合は `harvestTools` の
   アイテムIDからツール種が決まる
 - 3件とも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
+
+**性能の end-to-end 測定（[receipt](evidence/time-contract/recipe-cache/README.md)）**
+- この枝で**初めて**、最適化を fixture の tick で**連続前後測定**した
+- `active_furnaces_pack`（datapackレシピ40件）で **tick x2.52**、炉stage x5.11
+- datapack無しでも **tick x1.11**（空でも毎回扣っていた mutex が消える）
+- 対照 `idle_furnaces` は x0.98（=変化なし）
+- **before の作り方で一度間違えた**：`smelt_out` 全体を外すと不変側の memo まで
+  外れて 100倍になり、忠実でなかった。可変走査だけを外す形に直した
+- **示すもの**：等しい20TPS・等しい世界で前後が上表の比になる
+- **示さないもの**：vanilla との比較ではない。代表負荷ではない。実クライアント未使用
 
 **セキュリティ**：PR #2のhardeningを統合（権限・RCON・handshake・save envelope・
 起動時検証・pre-play deadline）
@@ -136,8 +146,11 @@
 2. **スカラー系のデータフィールドを一括で移行する**
    （`stackSize`, `blast_resistance`, `slipperiness` など）— 同形の作業を
    5コミットに分けない。
-3. **実環境計測の手段を作る** — vanilla比較・代表負荷・datapack入りfixture。
-   **これが無い限り「超軽量化」は主張できない。**
+3. **実環境計測の手段を作る** — datapack入りfixtureは**できた**（x2.52を測定）。
+   残りは **vanilla との比較**（同seed・同視界距離・同負荷で両方を走らせる）と
+   代表負荷。**これが無い限り「超軽量化」は主張できない。**
+   手順は `evidence/time-contract/profile_tick.py`（scenario集合を固定して
+   fixtureの無断変更を検知する）。
 4. **`collision_shapes`（状態ごとの衝突形状）** — 残る**最大の挙動差**。
    新しい形状系と移動・設置の消費者が要るので独立した spec にする。
 5. **独立レビューを起こす** — 最大のプロセスリスク。
