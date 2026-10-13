@@ -913,3 +913,49 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
 }
 
 
+
+/// The two light computations run per chunk send, which the tick fixture never reaches, so
+/// they are measured here directly. Run with --nocapture to see the numbers. The point of the
+/// pair is the difference: with no light source in the chunk the block light spread must do
+/// nothing, and that is what makes it safe to compute unconditionally.
+#[test]
+fn measure_the_light_cost_per_chunk() {
+    let _g = WORLD_TEST_LOCK.lock().unwrap();
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    forceloaded().lock().unwrap().insert((0, 0));
+    refresh_hot();
+
+    let time_it = |f: &mut dyn FnMut()| {
+        let t = std::time::Instant::now();
+        f();
+        t.elapsed()
+    };
+    let rounds = 200;
+
+    let sky = time_it(&mut || {
+        for _ in 0..rounds { std::hint::black_box(sky_light_sections(0, 0)); }
+    });
+    let none = time_it(&mut || {
+        for _ in 0..rounds { std::hint::black_box(block_light_sections(0, 0)); }
+    });
+
+    // With a torch placed, the block light spread has something to do.
+    let (tx, ty, tz) = (5, height_at(5, 7), 7);
+    let old = block_at(tx, ty, tz);
+    set_block(tx, ty, tz, name_to_state("torch").expect("torch must exist"));
+    let lit = time_it(&mut || {
+        for _ in 0..rounds { std::hint::black_box(block_light_sections(0, 0)); }
+    });
+    set_block(tx, ty, tz, old);
+
+    *forceloaded().lock().unwrap() = old_forced;
+
+    println!(
+        "LIGHT_COST per chunk over {rounds} rounds: sky={sky:?} block_no_source={none:?} block_with_torch={lit:?}"
+    );
+    // No source, no work: the spread must not be doing a scan per chunk.
+    assert!(
+        none.as_nanos() < lit.as_nanos(),
+        "a chunk with no source must be cheaper than one with a torch ({none:?} vs {lit:?})"
+    );
+}
