@@ -535,3 +535,61 @@ fn named_items_stack_the_way_vanilla_stacks_them() {
         assert_eq!(stack_size_of(st), want, "{name} state");
     }
 }
+
+/// `with_prop` moves one property's digit inside a block's state range. Doing that to a
+/// value lower than the current one used to wrap the wrong way and land outside the
+/// block: setting sugar cane's age back to 0 produced state 5815, which is a jukebox.
+/// Every value of a 16-valued property is walked in both directions here.
+#[test]
+fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let cane = name_to_state("sugar_cane").expect("sugar_cane must exist");
+    let values: Vec<String> = (0..16).map(|v| v.to_string()).collect();
+
+    // Downwards from each starting value, which is where the wrapping went wrong.
+    for from in &values {
+        let start = reg.with_prop(cane, "age", from);
+        assert_eq!(reg.name_of(start), "minecraft:sugar_cane", "age {from} left the block");
+        for to in &values {
+            let moved = reg.with_prop(start, "age", to);
+            assert_eq!(
+                reg.name_of(moved),
+                "minecraft:sugar_cane",
+                "age {from} -> {to} left the block (state {moved} is {})",
+                reg.name_of(moved)
+            );
+            assert_eq!(
+                reg.get_prop(moved, "age").as_deref(),
+                Some(to.as_str()),
+                "age {from} -> {to} did not take"
+            );
+        }
+    }
+
+    // And a block with more than one property, where the digit has a multiplier.
+    let Some(stairs) = name_to_state("oak_stairs") else { panic!("oak_stairs must exist") };
+    let facing = ["north", "south", "west", "east"];
+    for f in facing {
+        for half in ["top", "bottom"] {
+            for shape in ["straight", "inner_left", "inner_right", "outer_left", "outer_right"] {
+                let mut s = stairs;
+                s = reg.with_prop(s, "facing", f);
+                s = reg.with_prop(s, "half", half);
+                s = reg.with_prop(s, "shape", shape);
+                assert_eq!(reg.name_of(s), "minecraft:oak_stairs", "{f}/{half}/{shape}");
+                assert_eq!(reg.get_prop(s, "facing").as_deref(), Some(f));
+                assert_eq!(reg.get_prop(s, "half").as_deref(), Some(half));
+                assert_eq!(reg.get_prop(s, "shape").as_deref(), Some(shape));
+            }
+        }
+    }
+    // And back down again, which is the direction that used to escape the block.
+    for f in facing {
+        let s = reg.with_prop(stairs, "facing", f);
+        let back = reg.with_prop(s, "facing", "north");
+        assert_eq!(reg.name_of(back), "minecraft:oak_stairs", "{f} -> north");
+        assert_eq!(reg.get_prop(back, "facing").as_deref(), Some("north"));
+    }
+}

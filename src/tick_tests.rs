@@ -853,3 +853,62 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
     lava_queue().lock().unwrap().cancel(pos);
     backoff().lock().unwrap().remove(&pos);
 }
+
+/// Vanilla grows sugar cane one stage per random tick and adds a block on the tick that
+/// would pass age 15, so sixteen random ticks raise the column by one. That makes it the
+/// one behaviour a random tick can drive that can be pinned exactly, which is why it is
+/// the first consumer of the stream.
+#[test]
+fn sixteen_random_ticks_raise_sugar_cane_one_block() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (old_hot, old_warm) = test_region();
+    let top = 150;
+    let cane = name_to_state("sugar_cane").expect("sugar_cane must exist");
+    let original: Vec<(i32, u32)> = (top..=top + 4).map(|y| (y, block_at(0, y, 0))).collect();
+    for y in top..=top + 4 {
+        set_block(0, y, 0, 0);
+    }
+    set_block(0, top, 0, cane);
+
+    let reg = crate::feature::breg().expect("the block registry must load from assets/");
+    let tick = || on_random_tick(0, top, 0);
+    let age = |y: i32| reg.get_prop(block_at(0, y, 0), "age").and_then(|a| a.parse::<u32>().ok());
+    let is_cane = |y: i32| reg.name_of(block_at(0, y, 0)) == "minecraft:sugar_cane";
+
+    assert!(is_cane(top) && !is_cane(top + 1), "the test must start with one cane");
+    assert_eq!(age(top), Some(0), "a placed cane starts at age 0");
+
+    // Fifteen ticks walk the age up without adding a block.
+    for i in 0..15 {
+        tick();
+        assert!(!is_cane(top + 1), "no block may appear before the sixteenth tick (tick {i})");
+    }
+    assert_eq!(age(top), Some(15), "fifteen ticks must reach age 15");
+
+    // The sixteenth adds the block above and resets the age.
+    tick();
+    assert!(is_cane(top + 1), "the sixteenth tick must add a cane above");
+    assert_eq!(age(top), Some(0), "adding a block must reset the age");
+    assert_eq!(age(top + 1), Some(0), "the new cane starts at age 0");
+
+    // Sixteen more make three, and a third round must not make four.
+    for _ in 0..16 {
+        tick();
+        on_random_tick(0, top + 1, 0);
+    }
+    assert!(is_cane(top + 2) && !is_cane(top + 3), "the column must stop at height 3");
+    for _ in 0..40 {
+        tick();
+        on_random_tick(0, top + 1, 0);
+        on_random_tick(0, top + 2, 0);
+    }
+    assert!(!is_cane(top + 3), "a column of three must not grow a fourth");
+
+    for (y, st) in original {
+        set_block(0, y, 0, st);
+    }
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(old_hot, old_warm);
+}
+

@@ -16,6 +16,7 @@ mod cached_lookup;
 use cached_lookup::CachedLookup;
 mod feature;
 mod tree;
+mod world_rng;
 mod worldgen;
 
 // ---------- varint / wire ----------
@@ -3534,6 +3535,95 @@ fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
 }
 /// any world mutation resets backoff for the cell and its 6 neighbors —
 /// the event-driven wake that makes lazy intervals safe.
+/// The chunks a random tick may land in. The world is a sparse overlay of edits over
+/// generated terrain, so there is no list of loaded chunks to walk; the hot region is the
+/// existing definition of where the world is simulated, and forceload marks chunks
+/// explicitly. No third notion of "loaded" is introduced.
+fn ticked_chunks() -> Vec<(i32, i32)> {
+    let mut out: Vec<(i32, i32)> = { let r = region_guard(); r.hot.iter().copied().collect() };
+    out.extend(forceloaded().lock().unwrap().iter().copied());
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Sections a random tick may land in for this chunk: the ones it has edits in, plus the
+/// band around its surface, which is where placed blocks sit.
+fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::new();
+    if let Some(c) = world().lock().unwrap().get(&(cx, cz)) {
+        for idx in c.keys() {
+            out.push(((*idx >> 8) as i32 + MIN_Y) >> 4);
+        }
+    }
+    let surface = height_at(cx * 16 + 8, cz * 16 + 8);
+    out.push((surface - 16) >> 4);
+    out.push((surface + 4) >> 4);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Vanilla's random tick speed: this many positions per chunk section per tick.
+const RANDOM_TICK_SPEED: u32 = 3;
+
+/// One pass of vanilla's random block ticks. A position is drawn per section rather than
+/// walking every block, so the cost follows the number of sections instead of the number
+/// of blocks, and a position that holds nothing costs one array lookup.
+fn random_tick_pass() {
+    for (cx, cz) in ticked_chunks() {
+        for sy in ticked_sections(cx, cz) {
+            for _ in 0..RANDOM_TICK_SPEED {
+                let x = cx * 16 + world_rng::next_below(16) as i32;
+                let y = sy * 16 + world_rng::next_below(16) as i32;
+                let z = cz * 16 + world_rng::next_below(16) as i32;
+                on_random_tick(x, y, z);
+            }
+        }
+    }
+}
+
+/// What a block does when a random tick lands on it. Vanilla calls the block's
+/// `randomTick`; here the block is identified by name from the registry rather than by a
+/// hand-written id range, so a block added from the asset needs no edit to this file.
+fn on_random_tick(x: i32, y: i32, z: i32) {
+    let Some(reg) = crate::feature::breg() else { return };
+    let st = block_at(x, y, z);
+    if reg.is_air(st) {
+        return;
+    }
+    match reg.name_of(st) {
+        "minecraft:sugar_cane" => sugar_cane_random_tick(reg, x, y, z, st),
+        _ => {}
+    }
+}
+
+/// Vanilla grows sugar cane one stage per random tick, from age 0 to 15, and the tick
+/// that would take it past 15 places a new cane above and resets the age. Sixteen
+/// random ticks therefore add one block to the column, up to a height of three.
+fn sugar_cane_random_tick(reg: &crate::feature::BReg, x: i32, y: i32, z: i32, st: u32) {
+    if !reg.is_air(block_at(x, y + 1, z)) {
+        return;
+    }
+    let mut height = 1;
+    while reg.name_of(block_at(x, y - height, z)) == "minecraft:sugar_cane" {
+        height += 1;
+    }
+    if height >= 3 {
+        return;
+    }
+    let age: u32 = reg
+        .get_prop(st, "age")
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0);
+    if age >= 15 {
+        set_block(x, y + 1, z, reg.state_of("minecraft:sugar_cane", None));
+        set_block(x, y, z, reg.with_prop(st, "age", "0"));
+    } else {
+        set_block(x, y, z, reg.with_prop(st, "age", &(age + 1).to_string()));
+    }
+}
+
 fn sched_invalidate(x: i32, y: i32, z: i32) {
     // The cell and its six neighbours are woken. Clearing the backoff alone is not
     // enough: the delay queues hold their own deadline, so a cell that is already
@@ -13602,6 +13692,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     step("plugins", plugin_tick);
     step("actors", actor_tick);
     step("mobs", mob_tick);
+    step("random_ticks", random_tick_pass);
     step("block_updates", flush_block_updates);
 }
 
@@ -13828,6 +13919,7 @@ fn main() {
         }
     }
     WORLD_SEED.store(wg_seed, Ordering::Relaxed);
+    world_rng::seed(wg_seed);
 
     // A corrupt protected save must stop startup rather than silently
     // continuing with a world that failed validation.

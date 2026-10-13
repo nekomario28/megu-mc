@@ -423,7 +423,15 @@ impl BReg {
             let len = p.vals.len().max(1) as u64;
             let digit = if mult > 0 { (off as u64 / mult) % len } else { 0 };
             if let Some(nd) = p.vals.iter().position(|v| v == val) {
-                let o = off as u64 + (nd as u64 + len - digit) % len * mult;
+                // Move this property's digit to `nd` by the difference, NOT by
+                // (nd + len - digit) % len. The offset already carries digit*mult, so
+                // the wrapping form adds a positive delta where the answer needed a
+                // negative one: setting age 15 back to 0 landed one state past the end
+                // of the block and produced a jukebox.
+                let o = off as i64 + (nd as i64 - digit as i64) * mult as i64;
+                if o < 0 {
+                    return st;
+                }
                 return self.st_lo[bi as usize] + o as u32;
             }
             return st;
