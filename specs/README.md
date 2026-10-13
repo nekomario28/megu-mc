@@ -17,10 +17,10 @@
 | | |
 |---|---|
 | branch | **`fix/20tps-integrated`** |
-| HEAD | `95c916c` |
+| HEAD | `c70cde6` |
 | 状態 | ツリーclean、リモートと一致、**CI green** |
-| `main` との差 | **64 commit**。`main` は `4e5f3e6`（未マージ） |
-| テスト | **70 passed**（serial／8thread×3回連続）、CI 4step通過 |
+| `main` との差 | **75 commit**。`main` は `4e5f3e6`（未マージ） |
+| テスト | **78 passed**（serial／8thread×3回連続）、CI 4step通過 |
 
 `fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
 `fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
@@ -48,6 +48,18 @@
 - tree の置換可能述語3つ → `is_replaceable(reg, cur, tags)`
 - 各統合にゲートと**負の対照**を付けた。うち2件は**統合した瞬間に検証の穴を発見**
   （溶岩のperiod変換、broadcastの述語）
+
+**ブロック知識の表を資産由来にする（[slice 03](foundation/slices/03-registry.md)）**
+- 手書きの表と資産を全状態で比較し、**移行前のgate**を作った（移行の等価性は
+  移行前の状態を固定していなければ意味がない）
+- ** を削除し資産から導出**：手書き表は 26,684状態中**356状態（1.3%）**
+  しか覆っておらず、残りは既定0.6だった。**26,420状態の掘削時間が誤っていた**
+  （ は50ではなく0.6、金属ブロック・spawner・anvil・hopper・chest・deepslate）
+- ** を資産の  から導出**：旧判定は
+  「ツルハシが要る かつ tierが足りる」という**別の質問**で、道具が要らないブロック
+  （土・砂・草・原木・葉）を「不可」と判定し**3.33倍遅く**していた。
+   / （約30行）を削除
+- どちらも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
 
 **セキュリティ**：PR #2のhardeningを統合（権限・RCON・handshake・save envelope・
 起動時検証・pre-play deadline）
@@ -81,6 +93,9 @@
 |---|---|
 | **独立レビュー**：統合headの衝突解決10箇所は未確認 | issue #7 |
 | 重複の上位候補（表引き4つ組、`spawn_*_pkt`、`door_base`/`gate_base`） | [survey](foundation/slices/07-redundancy-survey.md) |
+| ** の速度側**が裸の数値範囲のまま（資産の `material` で置換可。土にシャベルで6倍遅い） | [slice 03](foundation/slices/03-registry.md) |
+| （drops）も資産の `drops` を再導出している（シルクタッチ/幸運の分岐があり単純置換不可） | [slice 03](foundation/slices/03-registry.md) |
+|  /  の薄いラッパが未使用のまま残る（警告2件） | [slice 01](foundation/slices/01-region-accessor.md) |
 | 基盤 slice 03〜06 | [foundation](foundation/README.md) |
 | 被ダメ無敵をvanilla `invulnerableTime` 20へ（未実装） | [slice 25](time-contract/slices/25-invulnerability.md) |
 | 実クライアント・vanilla動的比較・代表負荷計測 | 全て未実施 |
@@ -115,12 +130,18 @@
 
 ## NEXT SMALLEST DISCRIMINATING ACTION
 
-**slice 03 の制約1を解決する。** `CachedLookup::get_or_compute` の `return *value` を
-`Clone` 対応にするか、`Comps` を含まない `Copy` な射影をキャッシュするか。
-**どちらが良いかを決める最小の判別**は、`smelt_out` の呼び出しで `Comps` が
-実際に必要かを確認すること（空Vecなら射影で足りる）。
+** の速度側を資産の `material` から導出する。**
 
-これは1ファイルで完結し、決定を1つ進める。**実装前に確認できる。**
+現状は裸の数値範囲（`131..=235`、`15..=24`、`9 | 10 | 112 | ...`）で
+「どのツール種が正しいか」を判定している。資産の `material` が
+`mineable/pickaxe` / `mineable/axe` / `mineable/shovel` / `mineable/hoe` を
+持ち、**それがまさにこの情報**である。
+
+**既知の症状**：土にシャベルを使っても速度が1.0のままで、vanilla の鉄シャベルより6倍遅い。
+`canHarvest` を直したので**倍率は正しくなったが、速度側は未着手**。
+
+**最初の一手**：手書き範囲の状態と資産の `material` を全状態で比較し、
+食い違いを数える（前2件と同じ手順。測ってから変える）。
 
 ## EXPLICIT NON-NEXT WORK
 
