@@ -8341,21 +8341,17 @@ fn block_light_sections_from(
     let mut out = Vec::with_capacity(26);
     for sec in 0..26 {
         let sy = sec * 16 + MIN_Y;
-        let mut arr = [0u8; 2048];
-        for y in 0..16usize {
-            let wy = sy + y as i32;
-            for lz in 0..16usize {
-                for half in 0..8usize {
-                    let lx = half * 2;
-                    let bx = cx * 16 + lx as i32;
-                    let bz = cz * 16 + lz as i32;
-                    let lo = light.get(&(bx, wy, bz)).copied().unwrap_or(0) & 0x0f;
-                    let hi = light.get(&(bx + 1, wy, bz)).copied().unwrap_or(0) & 0x0f;
-                    arr[y * 128 + lz * 8 + half] = lo | (hi << 4);
-                }
-            }
+        // Nothing lit in this section: the packer would walk 2048 positions to write zeros.
+        if !light.keys().any(|(_, y, _)| *y >= sy && *y < sy + 16) {
+            out.push([0u8; 2048]);
+            continue;
         }
-        out.push(arr);
+        out.push(pack_light_section(sy, cx, cz, |lx, wy, lz| {
+            light
+                .get(&(cx * 16 + lx as i32, wy, cz * 16 + lz as i32))
+                .copied()
+                .unwrap_or(0)
+        }));
     }
     out
 }
@@ -8418,6 +8414,31 @@ fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     sky_light_sections_from(cx, cz, &floors)
 }
 
+/// One section's 2048 bytes from a level function, in the client's layout: for each y,
+/// each z, eight bytes carrying the sixteen x values as nibbles. Both light kinds need this
+/// and a wrong index lights the wrong column with nothing else to notice, so it has one
+/// owner.
+fn pack_light_section(
+    sy: i32,
+    cx: i32,
+    cz: i32,
+    level: impl Fn(usize, i32, usize) -> u8,
+) -> [u8; 2048] {
+    let mut arr = [0u8; 2048];
+    for y in 0..16usize {
+        let wy = sy + y as i32;
+        for lz in 0..16usize {
+            for half in 0..8usize {
+                let lx = half * 2;
+                let lo = level(lx, wy, lz) & 0x0f;
+                let hi = level(lx + 1, wy, lz) & 0x0f;
+                arr[y * 128 + lz * 8 + half] = lo | (hi << 4);
+            }
+        }
+    }
+    arr
+}
+
 fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 2048]> {
     let _ = (cx, cz);
     let (mut fmin, mut fmax) = (i32::MAX, i32::MIN);
@@ -8437,17 +8458,9 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
             // Every floor is at or above the section's top, so the whole section sits below
             // the light and stays dark - which all-zero already is.
         } else {
-            for y in 0..16usize {
-                let wy = sy + y as i32;
-                for lz in 0..16usize {
-                    for half in 0..8usize {
-                        let lx = half * 2;
-                        let lo = if wy > floors[(lz << 4) | lx] { 0x0f } else { 0x00 };
-                        let hi = if wy > floors[(lz << 4) | lx + 1] { 0xf0 } else { 0x00 };
-                        arr[y * 128 + lz * 8 + half] = lo | hi;
-                    }
-                }
-            }
+            arr = pack_light_section(sy, cx, cz, |lx, wy, lz| {
+                if wy > floors[(lz << 4) | lx] { 15 } else { 0 }
+            });
         }
         out.push(arr);
     }
