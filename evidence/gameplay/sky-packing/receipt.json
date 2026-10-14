@@ -1,0 +1,126 @@
+{
+  "scope": "CI bound repair by byte-equivalent sparse sky packing",
+  "baseline_commit": "5ed649b879cbe803695280f97aeddef45ade1189",
+  "failed_hosted_run": 38625751779,
+  "first_failure": "protocol767.ContractFailure: play-view-127",
+  "timeouts_or_assertions_weakened": false,
+  "source_sha256": {
+    "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
+    "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
+    "config_packets.bin": "9fb932886e1da038d42f20ec385ec04517c1c0286d71b9d9eea91e8f5decb49a",
+    "src/cached_lookup.rs": "a97db58064eed4f959dc28e55d8988795b5df50d6d56a8d2fc801f69ead3d57c",
+    "src/effect_tests.rs": "f011c7367431f2c8e2af8c6d30a52ad3d5733951e9b30b358558d6dda66e7d1f",
+    "src/effects.rs": "8a0517ca58b12cf6d254eca5b377add82e693f1b9e34753658dd57ead450a37b",
+    "src/fanout_tests.rs": "74bde3e27774084188cccc3d52f179b822d58b41802f65b1e2ac543f9179372d",
+    "src/feature.rs": "ffda2a6b48136acff6648485977302a01ca7f7cd02efc34c0ed4b5bb726ffcbb",
+    "src/furnace_cache_tests.rs": "63efbbb7595066b8f3395239078f7aa0e84febc8a6fa73890c77c05a62f8866f",
+    "src/java_compat.rs": "a5130e184331de35e09f91119f6ba8ac515593e6bdd96b38b3772517fc7886fa",
+    "src/landing.rs": "4b3b22e066bd74d000a95b82cef99dd4fb760115efa1ee3862726f237df45d2e",
+    "src/light_pack_tests.rs": "8e2394f0d1a8fb49ee9fbd2fd08ba8f161a5cf47c370c2dd4fbf4180e4b57329",
+    "src/main.rs": "ffbbe6921ba350bce7d2f8d36fca3cafb25c1b2b5d711deb527921cb24c1557c",
+    "src/merge_tests.rs": "e4a7810ff24a52d7e2a5a886e14e5aab2e5f99bee6c98a33589d5f6119c402bd",
+    "src/persistence_tests.rs": "5b7bfd14cd3dd0f753ed11fe8eb490e01b66f13baab2114ba5023c31583092a3",
+    "src/registry_tests.rs": "b520bc552605e1a54c550b7f3d498cefdb513233c48b807a14a16bd2378d405f",
+    "src/test_support.rs": "4b6fea4acb39732d91ef51dbd2750bede3467a839afbac80aa3b76b7003f1f6f",
+    "src/tick_queue.rs": "7ee53868580850f4375e83879e69b8d5f53bf72462804722a42f56749b1ca76c",
+    "src/tick_tests.rs": "bb4704114ec5645f30d9a9bd19ce0d6fa709948ee87a33ac0fbe9cf44b788575",
+    "src/tree.rs": "957f9554c134b4378210568dbb11a85e8808f4370ab850a8fc2954067f397a00",
+    "src/world_rng.rs": "49a023374735dd23b9806c4f08510793380441b7c8a1a0a3596d640f262210ba",
+    "src/worldgen.rs": "27a99affe8f8ebd10c38aeddf6fcdfa133cbd8c0832f987adbcfbec1c49b8648",
+    "tests/client_settings_wire.py": "8483d78dd3052317612725eac1e3ae3a716a9329c64976d9635798f9475992da",
+    "tests/protocol767.py": "27cacf1c63a76660caa6a8279142953ded580540531fabe5c2f742bff2a54b7d",
+    "tests/verify.sh": "dc5d2f2dba686c928e8d470a3f436b3a1bdb5d6f994ae4b29ca912e6152288bf",
+    "tools/mutation_check.sh": "227aedc4a7432430d70b8c2160a268cf62cd1631be3b0a401a2b836c623ea766"
+  },
+  "artifacts": {
+    "baseline": {
+      "selection": "Cargo compiler-artifact, non-test mc-spine bin",
+      "binary_sha256": "ffc7ef80d1b64c4806b5813c4a8b61f19770801913c4289b1e9a0cadca593954"
+    },
+    "candidate": {
+      "selection": "Cargo compiler-artifact, non-test mc-spine bin",
+      "binary_sha256": "0e9969c27b4da0c7bfb309742d54b743381cc0268e21c40ced47d0c0ab5fef03"
+    }
+  },
+  "diagnostic_only": {
+    "build": "debug",
+    "cpus": [
+      0,
+      1
+    ],
+    "actual_loaded_tps": "not measured; not a representative performance gate",
+    "back_to_back_pairs": [
+      {
+        "baseline": {
+          "mode": "full",
+          "contract": "play-view-127",
+          "wall": 7.60321622597985,
+          "client_cpu": 0.728759941,
+          "before": 25,
+          "after": 289
+        },
+        "candidate": {
+          "mode": "full",
+          "contract": "play-view-127",
+          "wall": 2.613093223015312,
+          "client_cpu": 0.723726242,
+          "before": 25,
+          "after": 289
+        }
+      },
+      {
+        "baseline": {
+          "mode": "full",
+          "contract": "play-view-127",
+          "wall": 7.615072751999833,
+          "client_cpu": 0.755648975,
+          "before": 25,
+          "after": 289
+        },
+        "candidate": {
+          "mode": "full",
+          "contract": "play-view-127",
+          "wall": 2.6414710709941573,
+          "client_cpu": 0.731100028,
+          "before": 25,
+          "after": 289
+        }
+      },
+      {
+        "baseline": {
+          "mode": "full",
+          "contract": "play-view-127",
+          "wall": 7.613456994993612,
+          "client_cpu": 0.725509743,
+          "before": 25,
+          "after": 289
+        },
+        "candidate": {
+          "mode": "full",
+          "contract": "play-view-127",
+          "wall": 2.6124587529920973,
+          "client_cpu": 0.732709707,
+          "before": 25,
+          "after": 289
+        }
+      }
+    ]
+  },
+  "verification": {
+    "full_verify_exit": 0,
+    "mandatory_mutants": 22,
+    "not_a_gate": 0,
+    "parked": 0,
+    "skipped": 0,
+    "rust_suite": "113 passed, 1 preexisting ignored",
+    "nibble_mutant": "green baseline; intended per-byte mismatch; hash-identical restored/rebuilt green"
+  },
+  "independent_review": "Static independent review found no defect; runtime execution by main agent",
+  "nonclaims": [
+    "vanilla light coordinate parity",
+    "generated emitter completeness",
+    "representative release performance",
+    "all H/T/F/N/Q complete"
+  ],
+  "target_hosted_ci": "pending"
+}

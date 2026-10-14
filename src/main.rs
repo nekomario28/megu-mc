@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "java-compat")]
 mod java_compat;
 mod landing;
+#[cfg(test)]
+mod light_pack_tests;
 mod effects;
 mod cached_lookup;
 use cached_lookup::CachedLookup;
@@ -8698,22 +8700,25 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
         }
     }
     let spill = sky_spill(cx, cz, &floors, |x, y, z| reg.opacity_of(block_at(x, y, z)));
-    if spill.is_empty() {
-        return sky_light_sections_from(cx, cz, &floors);
-    }
-    let mut out = Vec::with_capacity(26);
-    for sec in 0..26 {
-        let sy = sec * 16 + MIN_Y;
-        out.push(pack_light_section(sy, |lx, wy, lz| {
-            let f = floors[(lz << 4) | lx];
-            let base = if wy > f { 15 } else { 0 };
-            base.max(
-                spill
-                    .get(&(cx * 16 + lx as i32, wy, cz * 16 + lz as i32))
-                    .copied()
-                    .unwrap_or(0),
-            )
-        }));
+    sky_light_sections_with_spill(cx, cz, &floors, &spill)
+}
+
+fn sky_light_sections_with_spill(
+    cx: i32, cz: i32, floors: &[i32; 256],
+    spill: &HashMap<(i32, i32, i32), u8>,
+) -> Vec<[u8; 2048]> {
+    // Start with the column packer, then visit only the actual spill entries.
+    // A seed makes spill nonempty even when it raises no dark cell; probing the
+    // map at every voxel needlessly defeated the uniform-section fast paths.
+    let mut out = sky_light_sections_from(cx, cz, floors);
+    for (&(x, y, z), &level) in spill {
+        if x.div_euclid(16) != cx || z.div_euclid(16) != cz
+            || y < MIN_Y || y >= MIN_Y + 26 * 16 { continue; }
+        let (lx, lz, relative_y) = ((x & 15) as usize, (z & 15) as usize, (y - MIN_Y) as usize);
+        let byte = &mut out[relative_y / 16][(relative_y & 15) * 128 + lz * 8 + lx / 2];
+        let shift = (lx & 1) * 4;
+        let raised = ((*byte >> shift) & 15).max(level) & 15;
+        *byte = (*byte & !(15 << shift)) | (raised << shift);
     }
     out
 }
@@ -8880,7 +8885,6 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
 }
 
 fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
-
     let mut p = Vec::new();
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
