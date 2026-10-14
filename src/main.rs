@@ -4079,7 +4079,15 @@ fn falling_tick() {
         std::mem::take(&mut *f)
     };
     let mut again = Vec::new();
+    let region = region_guard();
     for (x, y, z) in queued {
+        // A block in flight is an entity in vanilla, so it does not move in a chunk nobody is
+        // near. Re-queued rather than dropped, the same way the fluid ticks treat a cold cell, so
+        // it carries on falling when the chunk warms up instead of hanging where it stopped.
+        if !region.is_warm(x, z) {
+            again.push((x, y, z));
+            continue;
+        }
         let st = block_at(x, y, z);
         let reg = match crate::feature::breg() {
             Some(r) => r,

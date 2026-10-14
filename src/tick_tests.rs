@@ -1101,6 +1101,11 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
+    // The chunk has to be warm or the tick re-queues instead of moving: a block in flight is an
+    // entity in vanilla and does not tick in a chunk nobody is near.
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     // A floor to land on, and sand three blocks above it.
@@ -1163,6 +1168,11 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
+    // The chunk has to be warm or the tick re-queues instead of moving: a block in flight is an
+    // entity in vanilla and does not tick in a chunk nobody is near.
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let original: Vec<(i32, u32)> = (base..=base + 5).map(|y| (y, block_at(5, y, 5))).collect();
@@ -1210,6 +1220,11 @@ fn every_falling_block_is_scheduled_and_moves_one_cell() {
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
+    // The chunk has to be warm or the tick re-queues instead of moving: a block in flight is an
+    // entity in vanilla and does not tick in a chunk nobody is near.
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
     let reg = crate::feature::breg().unwrap();
     let names: std::collections::BTreeSet<String> = (0..reg.state_count() as u32)
         .filter(|&st| reg.behaviour_of(st) == crate::feature::B_FALLING)
@@ -1239,4 +1254,40 @@ fn every_falling_block_is_scheduled_and_moves_one_cell() {
     *falling().lock().unwrap() = old_falling;
     *forceloaded().lock().unwrap() = old_forced;
     set_test_region(oh, ow);
+}
+
+/// A queued block in a chunk nobody is near must not move. Vanilla's falling block is an entity and
+/// entities do not tick where there is no player, so without this the queue would carry a block all
+/// the way down and land it in a chunk nobody had ever visited.
+#[test]
+fn a_falling_block_waits_in_a_cold_chunk() {
+    let _g = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (oh, ow) = test_region();
+    set_test_region(oh.clone(), std::collections::HashSet::new());
+    let reg = crate::feature::breg().unwrap();
+    let base = 150;
+    for y in base..=base + 4 {
+        set_block(11, y, 11, 0);
+    }
+    set_block(11, base, 11, name_to_state("stone").unwrap());
+    set_block(11, base + 3, 11, name_to_state("sand").unwrap());
+    assert!(!falling().lock().unwrap().is_empty(), "the placement queues it");
+
+    falling_tick();
+    assert_eq!(
+        reg.name_of(block_at(11, base + 3, 11)).trim_start_matches("minecraft:"),
+        "sand",
+        "a cold chunk must not move it"
+    );
+    assert_eq!(
+        falling().lock().unwrap().len(),
+        1,
+        "and it stays queued for when the chunk warms up, rather than being dropped"
+    );
+
+    set_test_region(oh, ow);
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
 }

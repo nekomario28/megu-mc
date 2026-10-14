@@ -191,6 +191,11 @@ check "a block that drops twice keeps its second drop" \
   '                reg.drops_second[st] = -1;' \
   a_potted_plant_drops_both_entries_the_asset_lists
 
+check "a falling block does not move in a cold chunk" \
+  src/main.rs '        if !region.is_warm(x, z) {' \
+  '        if false {' \
+  a_falling_block_waits_in_a_cold_chunk
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
