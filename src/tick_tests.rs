@@ -1291,3 +1291,44 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     *falling().lock().unwrap() = old_falling;
     *forceloaded().lock().unwrap() = old_forced;
 }
+
+/// Containers are stored by position, and the world is a sparse overlay that omits any cell equal to
+/// the generator's answer. So a stored chest whose block is gone is an orphan: it comes back after a
+/// load owned by nothing, impossible to open or break, its contents unreachable. A schema check
+/// cannot see this - the reference is well-formed whether or not the cell exists - which is why it is
+/// asserted here rather than checked there.
+#[test]
+fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
+    let _g = world_guard();
+    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
+    let old_world = world().lock().unwrap().clone();
+    let chest = name_to_state("chest").expect("chest must exist");
+    let (x, y, z) = (21, 150, 21);
+
+    set_block(x, y, z, chest);
+    chests().lock().unwrap().entry((x, y, z)).or_default().insert(0, (1, 5, Vec::new()));
+    assert!(chests().lock().unwrap().contains_key(&(x, y, z)), "the store holds the chest");
+
+    // Identity change: the slots must not survive the block that owned them.
+    set_block(x, y, z, 0);
+    assert!(
+        !chests().lock().unwrap().contains_key(&(x, y, z)),
+        "breaking a chest must drop its stored slots, or the position outlives its block"
+    );
+
+    // A round trip is where an interleaving would show, since the code cleans up on the break.
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    load_world_from(&payload);
+    let orphans: Vec<(i32, i32, i32)> = chests()
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .filter(|&(cx, cy, cz)| !is_chest_pairable(block_at(cx, cy, cz)))
+        .collect();
+    assert!(orphans.is_empty(), "a stored container must point at a container: {orphans:?}");
+
+    *chests().lock().unwrap() = old_chests;
+    *world().lock().unwrap() = old_world;
+}

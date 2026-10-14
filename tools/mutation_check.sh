@@ -196,6 +196,11 @@ check "a falling block does not move in a cold chunk" \
   '        if false {' \
   a_falling_block_waits_in_a_cold_chunk
 
+check "breaking a chest drops the slots it owned" \
+  src/main.rs '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z)) {' \
+  '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z + 1000)) {' \
+  a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
