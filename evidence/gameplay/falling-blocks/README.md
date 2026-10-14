@@ -88,9 +88,36 @@ TRACE after one tick, queue=[]
 しかし `note_falling_above` は同じ `breg()` を呼んで**キューに積めている**ので、
 `Some` だったはずである。**矛盾している。**
 
-**この矛盾を解くまで主張しない。** 次の一手：
-- `falling_tick` の中で `breg()` の結果を出力する（`FT enter` の隣で）
-- `reg` を取る前後で状態が変わっていないか確認する
+### 計測を検証した結果：矛盾はコード側にある
+
+`falling_tick` の**3つの終了経路すべてに出力**を入れて実行：
+
+```
+FT2 top len=1
+FT2 took 1
+FT2 exit behaviour=0 at (9, 153, 9)     ← behaviour が 0（B_NONE）
+EX after tick ["0:stone", "1:sand", ...]  ← 砂は base+1 にいる
+```
+
+**計測は機能している**（`breg()` は `Some`、ループには入っている）。
+そして**矛盾が確定した**：
+
+| 呼び出し | 同じ座標 (9,153,9) について |
+|---|---|
+| `note_falling_above`（キューに積む側） | **B_FALLING** と判定 ✓ |
+| `falling_tick`（数ms後） | **behaviour 0** と判定 |
+
+**同じ `block_at`、同じ座標、間に挟まるのはキューの push だけ。**
+そして砂は `base+1` にある — **誰かが動かした**。
+
+**したがって「動かしたのは `falling_tick` の移動分岐ではない」ことだけは確定した。**
+`falling_tick` は `behaviour 0` を見て抜けており、移動は**別の経路**が起こしている。
+
+次の一手：**`block_at(9,153,9)` を `note_falling_above` と `falling_tick` の両方で
+出力し、状態そのものを突き合わせる**（behaviour ではなく state id と name を出す）。
+そのうえで `set_block` の連鎖を1つずつ出力する。
+
+**説明できるまで落下の速度も移動量も主張しない。**
 
 ## 未着手
 
