@@ -294,3 +294,29 @@ HTTP リソースパックは 25598。`prismlauncher` は `--launch / --offline 
 **注意**：この環境では**外部ハーネスが mc-spine を port 25701 で常駐**させている
 （`timeout 120 env MC_SPINE_PORT=25701 ...`）。`pkill -f 'target/debug/mc-spine'` は
 **それにも一致する**ので使わないこと。自前の検証は `MC_SPINE_PORT` を明示して別ポートで行う。
+
+## 12. protogx による接続ライフサイクル検査（「prism より前」）
+
+`gxkit` の `protogx` で接続の状態機械を検査した → **0 problems（構造的に健全）**。
+証拠と、私のモデルが3回間違った記録は
+[evidence/gameplay/protocol-lifecycle](../../evidence/gameplay/protocol-lifecycle/README.md)。
+
+**結論**：**実クライアントが繋がらない原因は接続の状態機械ではない。**
+次に疑うのは**パケットのフィールド符号化・チャンクデータ・レジストリの中身**。
+
+### 新たに記録した挙動ギャップ（プロトコル破壊ではない）
+
+**`Client Information`（view distance / locale / skin parts）を無視している**
+（`src/main.rs:11823` 付近、`Some(_) => continue`）。
+vanilla は **view distance** を使ってチャンク送信距離を決めるので、
+**サーバー側の送信距離がクライアントの設定に従わない**。
+接続は壊れないため `wire_smoke.py` では見えない。
+
+### 次に gxkit を使う場所
+
+| ツール | 対象 | いつ |
+|---|---|---|
+| `protogx` | レッドストーン/ピストン/ディスペンサーの状態機械 | S4 の前 |
+| `flowgx` | tick の状態機械（`Machine(states, transitions)`） | 時間契約に触る前 |
+| `depsgx` | **`main.rs` 分割の層**（`ModuleGraph(depends, layers)`） | **S2.2 の前**（下位が上位を import していないかを機械的に検査できる） |
+| `schemagx` | 保存形式（節の依存） | 節を足すとき |
