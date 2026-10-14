@@ -4078,8 +4078,13 @@ fn note_falling_above(x: i32, y: i32, z: i32) {
 /// One block a tick, which is what a falling block entity does at its slowest. A block that has
 /// landed leaves the queue.
 fn falling_tick() {
-    let mut f = falling().lock().unwrap();
-    let queued = std::mem::take(&mut *f);
+    // The lock is held only to take the queue and to put the moved blocks back. set_block reaches
+    // note_falling_above, which takes this same lock, so holding it across the moves deadlocks as
+    // soon as two blocks are stacked - the block above the one that moves is itself falling.
+    let queued = {
+        let mut f = falling().lock().unwrap();
+        std::mem::take(&mut *f)
+    };
     let mut again = Vec::new();
     for (x, y, z) in queued {
         let st = block_at(x, y, z);
@@ -4099,7 +4104,7 @@ fn falling_tick() {
         note_block_update(x, y - 1, z, st);
         again.push((x, y - 1, z));
     }
-    f.extend(again);
+    falling().lock().unwrap().extend(again);
 }
 
 fn block_updated_inner(x: i32, y: i32, z: i32) {

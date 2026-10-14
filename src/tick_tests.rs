@@ -1138,3 +1138,45 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
     *forceloaded().lock().unwrap() = old_forced;
     set_test_region(oh, ow);
 }
+
+/// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
+/// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
+/// block it never showed, because the check returns before locking when there is nothing above.
+#[test]
+fn two_stacked_sand_blocks_fall_without_deadlocking() {
+    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (oh, ow) = test_region();
+    let sand = name_to_state("sand").expect("sand must exist");
+    let base = 150;
+    let original: Vec<(i32, u32)> = (base..=base + 5).map(|y| (y, block_at(5, y, 5))).collect();
+    for y in base..=base + 5 {
+        set_block(5, y, 5, 0);
+    }
+    set_block(5, base, 5, name_to_state("stone").expect("stone must exist"));
+    set_block(5, base + 3, 5, sand);
+    set_block(5, base + 4, 5, sand);
+    set_block(5, base + 2, 5, 0);
+    // Both are queued by the neighbour check that set_block already ran, and the order is whatever
+    // the moves produce: putting the lower one first is what the first version deadlocked on, and
+    // the test cannot force it from here.
+    assert_eq!(falling().lock().unwrap().len(), 2, "both stacked blocks are queued");
+
+    let name = |y: i32| crate::feature::breg().unwrap().name_of(block_at(5, y, 5)).to_string();
+    let mut ticks = 0;
+    while !falling().lock().unwrap().is_empty() && ticks < 20 {
+        falling_tick();
+        ticks += 1;
+    }
+    assert_eq!(name(base + 1), "minecraft:sand", "the lower one lands");
+    assert_eq!(name(base + 2), "minecraft:sand", "and the upper one rests on it");
+    assert_eq!(name(base + 3), "minecraft:air", "nothing is left in the air");
+
+    for (y, st) in original {
+        set_block(5, y, 5, st);
+    }
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
