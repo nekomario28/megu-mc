@@ -8306,61 +8306,81 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
 /// With no sources the map stays empty, the spread does nothing, and the cost is the
 /// call itself. That is the common case and it is why this can go in without a measurement
 /// showing a regression.
+/// The area a block light spread may use: the centre chunk with one chunk of margin, which is
+/// where light from a neighbouring source can reach.
+fn within_search(cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
+    x >= cx * 16 - 15 && x <= cx * 16 + 30 && z >= cz * 16 - 15 && z <= cz * 16 + 30 && y >= MIN_Y && y < MIN_Y + 384
+}
+
 fn block_light_sections_from(
     cx: i32,
     cz: i32,
     sources: &[((i32, i32, i32), u8)],
     opacity: impl Fn(i32, i32, i32) -> u8,
 ) -> Vec<[u8; 2048]> {
-    let mut light: HashMap<(i32, i32, i32), u8> = HashMap::new();
+    let live: Vec<((i32, i32, i32), u8)> = sources.iter().copied().filter(|(p, l)| *l > 0 && within_search(cx, cz, p.0, p.1, p.2)).collect();
+    if live.is_empty() {
+        return vec![[0u8; 2048]; 26];
+    }
+    // A dense box rather than a hash map. The spread visits every cell within fifteen of a
+    // source, so a hash of the position for each of tens of thousands of visits costs more than
+    // the arithmetic the map was there to save.
+    let (mut bx0, mut bx1) = (i32::MAX, i32::MIN);
+    let (mut by0, mut by1) = (i32::MAX, i32::MIN);
+    let (mut bz0, mut bz1) = (i32::MAX, i32::MIN);
+    for (p, _) in &live {
+        bx0 = bx0.min(p.0); bx1 = bx1.max(p.0);
+        by0 = by0.min(p.1); by1 = by1.max(p.1);
+        bz0 = bz0.min(p.2); bz1 = bz1.max(p.2);
+    }
+    // Fifteen in every direction is the reach of the brightest source, so nothing outside the
+    // expanded box can be lit. The search area clips it, as the map form did.
+    let x0 = (bx0 - 15).max(cx * 16 - 15);
+    let x1 = (bx1 + 15).min(cx * 16 + 30);
+    let z0 = (bz0 - 15).max(cz * 16 - 15);
+    let z1 = (bz1 + 15).min(cz * 16 + 30);
+    let y0 = (by0 - 15).max(MIN_Y);
+    let y1 = (by1 + 15).min(MIN_Y + 383);
+    let (w, d, h) = ((x1 - x0 + 1) as usize, (z1 - z0 + 1) as usize, (y1 - y0 + 1) as usize);
+    let mut light = vec![0u8; w * d * h];
+    let idx = |x: i32, y: i32, z: i32| ((y - y0) as usize * d + (z - z0) as usize) * w + (x - x0) as usize;
     let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> = std::collections::VecDeque::new();
-    for (p, l) in sources {
-        if *l == 0 {
-            continue;
-        }
-        if light.get(p).copied().unwrap_or(0) < *l {
-            light.insert(*p, *l);
+    for (p, l) in &live {
+        let i = idx(p.0, p.1, p.2);
+        if light[i] < *l {
+            light[i] = *l;
             queue.push_back((*p, *l));
         }
     }
-    let (x0, x1) = (cx * 16 - 15, cx * 16 + 30);
-    let (z0, z1) = (cz * 16 - 15, cz * 16 + 30);
-    while let Some((p, l)) = queue.pop_front() {
-        // A block that stops light does not pass it on. The source itself is exempt: a
-        // torch is opaque-looking and still lights its neighbours.
-        if l <= 1 {
+    while let Some((p, level)) = queue.pop_front() {
+        if level <= 1 {
             continue;
         }
         for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
-            let q = (p.0 + dx, p.1 + dy, p.2 + dz);
-            if q.0 < x0 || q.0 > x1 || q.2 < z0 || q.2 > z1 {
+            let (qx, qy, qz) = (p.0 + dx, p.1 + dy, p.2 + dz);
+            if qx < x0 || qx > x1 || qz < z0 || qz > z1 || qy < y0 || qy > y1 {
                 continue;
             }
-            if q.1 < MIN_Y || q.1 >= MIN_Y + 384 {
+            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));
+            if nl == 0 {
                 continue;
             }
-            let step = opacity(q.0, q.1, q.2).max(1);
-            let nl = l.saturating_sub(step);
-            if nl == 0 || light.get(&q).copied().unwrap_or(0) >= nl {
+            let i = idx(qx, qy, qz);
+            if light[i] >= nl {
                 continue;
             }
-            light.insert(q, nl);
-            queue.push_back((q, nl));
+            light[i] = nl;
+            queue.push_back(((qx, qy, qz), nl));
         }
     }
     let mut out = Vec::with_capacity(26);
     for sec in 0..26 {
         let sy = sec * 16 + MIN_Y;
-        // Nothing lit in this section: the packer would walk 2048 positions to write zeros.
-        if !light.keys().any(|(_, y, _)| *y >= sy && *y < sy + 16) {
-            out.push([0u8; 2048]);
-            continue;
-        }
         out.push(pack_light_section(sy, cx, cz, |lx, wy, lz| {
-            light
-                .get(&(cx * 16 + lx as i32, wy, cz * 16 + lz as i32))
-                .copied()
-                .unwrap_or(0)
+            if wy < y0 || wy > y1 {
+                return 0;
+            }
+            light[idx(cx * 16 + lx as i32, wy, cz * 16 + lz as i32)]
         }));
     }
     out
