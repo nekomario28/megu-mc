@@ -273,3 +273,24 @@ cargo に再ビルドさせる）。
   **抽出前に、参照している項目を列挙する**こと。
 - 抽出は**挙動を変えない**ので、**テストが緑のままであること**が唯一の証拠。
 - **1抽出 = 1コミット**。まとめて動かすと、どの移動が壊したか分からなくなる。
+
+### S1.1 の試行記録（2026-10、未達）
+
+**できたこと**：`./target/debug/mc-spine` を**リポジトリ根から**起動し、
+`mc-spine v0.6 listening 127.0.0.1:25599` を確認（ポートは **25599**、25565 ではない）。
+HTTP リソースパックは 25598。`prismlauncher` は `--launch / --offline <name> / --server <addr>` を持つ。
+
+**できなかったこと**：`prismlauncher --launch 1.21.1 --offline spineprobe --server 127.0.0.1:25599`
+を 90 秒走らせても**クライアントの java プロセスが現れなかった**。出力は Qt のログのみ。
+**接続は未確認。**
+
+**次の一手**：
+1. PrismLauncher に**オフラインアカウントが登録されているか**を確認する（無ければ `--offline` が失敗する）。
+2. `~/.local/share/PrismLauncher/instances/1.21.1/.minecraft/logs/latest.log` を直接見る
+   （ランチャの stdout は Qt のログで埋まり、クライアントの失敗はそこに出ない）。
+3. `--alive` は起動後に `live.check` を書くので、**起動したかどうかの判定に使える**。
+4. サーバー側は `/tmp/spine.log` に join 行が出るかを待つ。
+
+**注意**：この環境では**外部ハーネスが mc-spine を port 25701 で常駐**させている
+（`timeout 120 env MC_SPINE_PORT=25701 ...`）。`pkill -f 'target/debug/mc-spine'` は
+**それにも一致する**ので使わないこと。自前の検証は `MC_SPINE_PORT` を明示して別ポートで行う。
