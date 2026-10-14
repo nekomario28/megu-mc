@@ -358,7 +358,7 @@ error worldgen  layer-violation: worldgen (layer 4) depends on feature (layer 3)
 | **d** | 時計依存 RNG | **20**（定義含む） | 大 | **未着手**。ラチェットで凍結済み |
 | **e** | 鉢植えが2つ目のドロップを落とす | 34ブロック | 小 | **完了 `d64a2a7`**（`drops_second` を加算的に追加、変異チェックで落ちられることを証明） |
 | **f** | 資産間で対応しないブロック | **1**（`chain`。以前「2」と誤記） | 小 | **未着手** |
-| **g** | `sched_ready` の安全網 | **4箇所**（以前「3ループ」と誤記） | 小 | **未着手** |
+| **g** | `sched_ready` の安全網 | **4箇所** | 小 | **証明済み**：`flowgx` で 0 errors → **発火しない**。削除は独立コミット（[evidence](../../../evidence/foundation/scheduler-machine/README.md)） |
 | **h** | depsgx の層エラー | **3**（循環＋2層違反） | **大**（約1,300行） | **未着手**。目標は `deps_target.py` で証明済み |
 | **i** | `Client Information`（view distance）を無視 | — | 小 | **未着手** |
 | **j** | S1.1 実クライアント検証 | — | 中 | **未着手**（手順記録済み） |
@@ -380,3 +380,20 @@ error worldgen  layer-violation: worldgen (layer 4) depends on feature (layer 3)
 
 **各項目で要求するもの**：実装 → **テスト** → **変異チェックに登録し落ちられることを証明** →
 `verify.sh` 緑 → 記録。**数値を主張するときは測った値を書く。**
+
+## 15. gxkit の使い所（実績と予定）
+
+| ツール | 対象 | 結果 |
+|---|---|---|
+| `protogx` | 接続ライフサイクル | **0 problems**。`Client Information` 無視の挙動ギャップを発見 |
+| `depsgx`（現状） | モジュール層 | **3 errors**（循環＋2層違反）— 本物 |
+| `depsgx`（目標） | 意図する層 | **no problems** — **実装前に証明**、CI の門に |
+| `flowgx` | スケジューラのバックオフ | **0 errors** → `sched_ready` は**発火しない**（項目 g） |
+| **`authzgx`** | **コマンド権限** | **未実施** — 低権限が op 専用コマンドに到達しないか。セキュリティ検査 |
+| `schemagx` | 保存の節（MET4 / ARW2 / FAL1） | 未実施 — 節の依存に循環が無いか |
+| `chartgx` | 測定値の図（ブロックライト 709→148µs 等） | 未実施 — 証拠の図 |
+| `docgx` | PLAN / specs のページ | 未実施 — 版面はみ出し |
+
+**使い方の規律**：**赤はまず自分のモデルを疑う**（protogx で3回・depsgx で1回、すべてモデル側の誤り）。
+**ただしコードを読んで消えない赤は本物**（depsgx の3 errors、`boundaryBox` の否定）。
+**目標の状態を成果物として書けば、実装前の設計門になる**（`deps_target.py`、`machine.py`）。
