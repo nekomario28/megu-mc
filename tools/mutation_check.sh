@@ -38,6 +38,11 @@ skipped=0
 parked=0
 log=$(mktemp)
 
+# Content hash of the file as it was before the mutation. Restoring the bytes is the point;
+# restoring a timestamp is not, and neither is trusting that the restore worked. A mutation that
+# survives in the tree is worse than a failing check, so this is verified rather than assumed.
+hash_of() { sha256sum "$1" | cut -d' ' -f1; }
+
 restore() {
   if [ -n "${backup:-}" ] && [ -f "$backup" ]; then
     # Copy, then touch, rather than mv. `mv` gives the file back the backup's timestamp, which is
@@ -58,6 +63,8 @@ check() {
   local name="$1" mut_file_local="$2" from="$3" to="$4" test_filter="$5"
   mut_file="$mut_file_local"
   backup="$mut_file.mutation-backup"
+  local sha_before
+  sha_before=$(hash_of "$mut_file")
   cp "$mut_file" "$backup"
 
   if ! MUT_FILE="$mut_file" MUT_FROM="$from" MUT_TO="$to" python3 - <<'PY'
@@ -75,6 +82,7 @@ PY
     echo "      mutation no longer describes it. Update the entry rather than deleting it."
     skipped=$((skipped + 1))
     restore
+    verify_restored "$name" "$sha_before"
     return
   fi
 
@@ -115,6 +123,22 @@ PY
     failed=$((failed + 1))
   fi
   restore
+  verify_restored "$name" "$sha_before"
+}
+
+# A restore that did not put the bytes back leaves the tree mutated, and every later measurement is
+# of a source nobody chose. Checking the hash is the only way to know, because the failure mode is
+# silent: the file compiles, the suite runs, and the answer is about the mutation.
+verify_restored() {
+  local name="$1" want="$2" got
+  got=$(hash_of "$mut_file")
+  if [ "$want" != "$got" ]; then
+    echo "BROKEN $name"
+    echo "      $mut_file did not come back byte-identical after the mutation."
+    echo "      Restoring from git and stopping: a mutated tree must not be measured."
+    git checkout -- "$mut_file" 2>/dev/null || true
+    exit 3
+  fi
 }
 
 FALLING_SELF='    if y > MIN_Y
