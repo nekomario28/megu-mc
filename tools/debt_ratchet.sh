@@ -29,7 +29,12 @@ failed=0
 blind=0
 
 # count <pattern>; counts matching occurrences across the source.
-count() { rg -o "$1" src/*.rs 2>/dev/null | wc -l | tr -d ' '; }
+#
+# grep, not rg. ripgrep is not installed on the CI runner, and because a missing tool produces no
+# output rather than an error the count came back zero for every entry and the BLIND guard failed the
+# job. That guard was written for exactly this and it earned its place on its first CI run - the
+# alternative was a ratchet that reported "nothing left to fix" on every push.
+count() { grep -ohE "$1" src/*.rs 2>/dev/null | wc -l | tr -d ' '; }
 
 # ratchet <label> <pattern> <limit> <why>
 ratchet() {
