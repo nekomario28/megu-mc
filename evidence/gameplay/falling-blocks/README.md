@@ -59,8 +59,38 @@ FALL tick1 queue=0 ["0:stone", "1:sand", "2:air", "3:air", "4:air"]
 - `set_block` の連鎖がもう1回の移動を起こした
 - テストのループが1回で抜けた（キューが空だった）
 
-**次の一手はこの出力を1行ずつ追うこと**（各 `set_block` の後でキューを出力する）。
-**説明できるまで tick 数も、移動が1セルずつであることも主張しない。**
+**1行ずつ追った結果（絞り込み）**：
+
+```
+TRACE after clearing base+2, queue=[(9, 153, 9)]
+FT enter queued=[(9, 153, 9)]
+TRACE after one tick, queue=[]
+```
+
+- ループには**入っている**（`FT enter`）
+- **`FT move` が出ていない** → 移動の前に早期終了している
+- キューは空
+
+`falling_tick` の早期終了は3つ：
+
+| 終了 | キューが空になるか | ブロックが動くか |
+|---|---|---|
+| `behaviour_of != B_FALLING` → `continue` | なる | ならない |
+| `y <= MIN_Y \|\| !fallable` → `continue` | なる | ならない |
+| **`breg()` が `None` → `return`** | **なる** | **ならない** |
+
+**3つとも観測と一致する。** ただし個別に確認した範囲では：
+
+- `behaviour_of(sand)` = **2（B_FALLING）** ✓ 発火しない
+- `fallable(9, base+2, 9)` — base+2 は空気 ✓ 発火しない
+
+**したがって残るは `breg()` が `None` の経路のみ。**
+しかし `note_falling_above` は同じ `breg()` を呼んで**キューに積めている**ので、
+`Some` だったはずである。**矛盾している。**
+
+**この矛盾を解くまで主張しない。** 次の一手：
+- `falling_tick` の中で `breg()` の結果を出力する（`FT enter` の隣で）
+- `reg` を取る前後で状態が変わっていないか確認する
 
 ## 未着手
 

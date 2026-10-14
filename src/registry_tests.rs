@@ -842,3 +842,4 @@ fn sky_light_reaches_sideways_through_an_opening() {
     assert_eq!(at(10, 61, 9), 0, "and nothing arrives behind it");
     assert_eq!(at(6, 66, 7), 6, "the far corner keeps the fall of nine steps");
 }
+
