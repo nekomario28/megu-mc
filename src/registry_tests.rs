@@ -843,3 +843,34 @@ fn sky_light_reaches_sideways_through_an_opening() {
     assert_eq!(at(6, 66, 7), 6, "the far corner keeps the fall of nine steps");
 }
 
+/// The set of blocks that fall is decided by the asset through BReg.behaviour, not by a hand list.
+/// The hand list this replaced named sand, red_sand and gravel and silently omitted the sixteen
+/// concrete powders, so the count is pinned here: without it a block that ought to fall quietly
+/// stays in the air and nothing fails.
+#[test]
+fn the_falling_set_is_the_asset_set() {
+    let reg = breg().unwrap();
+    let mut falling: Vec<String> = (0..reg.state_count() as u32)
+        .filter(|&st| reg.behaviour_of(st) == crate::feature::B_FALLING)
+        .map(|st| reg.name_of(st).trim_start_matches("minecraft:").to_string())
+        .collect();
+    falling.sort();
+    falling.dedup();
+    assert_eq!(falling.len(), 19, "sand, red_sand, gravel and 16 concrete powders: {falling:?}");
+    for expect in [
+        "sand", "red_sand", "gravel",
+        "white_concrete_powder", "orange_concrete_powder", "magenta_concrete_powder",
+        "light_blue_concrete_powder", "yellow_concrete_powder", "lime_concrete_powder",
+        "pink_concrete_powder", "gray_concrete_powder", "light_gray_concrete_powder",
+        "cyan_concrete_powder", "purple_concrete_powder", "blue_concrete_powder",
+        "brown_concrete_powder", "green_concrete_powder", "red_concrete_powder",
+        "black_concrete_powder",
+    ] {
+        assert!(falling.iter().any(|n| n == expect), "{expect} must fall: {falling:?}");
+    }
+    // The converse, so the assertion cannot pass by marking everything as falling.
+    for not_falling in ["stone", "dirt", "oak_planks"] {
+        let st = name_to_state(not_falling).expect("must exist");
+        assert_ne!(reg.behaviour_of(st), crate::feature::B_FALLING, "{not_falling} must not fall");
+    }
+}

@@ -1113,23 +1113,27 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
 
     let name = |y: i32| crate::feature::breg().unwrap().name_of(block_at(3, y, 3)).to_string();
     assert_eq!(name(base + 3), "minecraft:sand", "the test starts with sand in the air");
-    // Removing the block beneath it schedules the fall.
+    // Removing the block beneath it schedules the fall. The sand must still be where it was: an
+    // earlier version dropped it to the floor inside this very call through a second gravity
+    // implementation, which made the count below read one and hid the duplicate.
     set_block(3, base + 2, 3, 0);
     note_falling_above(3, base + 2, 3);
     assert!(!falling().lock().unwrap().is_empty(), "the sand must be queued");
+    assert_eq!(name(base + 3), "minecraft:sand", "scheduling a fall must not move the block");
 
-    // One cell a tick, and it stops on the floor.
-    let mut ticks = 0;
-    while !falling().lock().unwrap().is_empty() && ticks < 10 {
-        falling_tick();
-        ticks += 1;
-    }
-    assert_eq!(name(base + 1), "minecraft:sand", "it must land on the floor");
-    assert_eq!(name(base + 2), "minecraft:air", "and leave nothing above");
-    assert_eq!(name(base + 3), "minecraft:air", "nor where it started");
-    // The tick count is not asserted: the loop above was observed to finish in one pass where two
-    // cells of fall were expected, and that is not explained yet. The landing itself is pinned.
-    assert!(ticks >= 1, "at least one tick must have run");
+    // One cell a tick, and it stops on the floor. The column is pinned after every tick: a count
+    // alone would also pass if the block moved two cells in one tick and then idled, which is what
+    // the duplicate gravity implementation used to do.
+    falling_tick();
+    assert_eq!(name(base + 2), "minecraft:sand", "one cell down after one tick");
+    assert_eq!(name(base + 3), "minecraft:air", "and nothing left where it was");
+    falling_tick();
+    assert_eq!(name(base + 1), "minecraft:sand", "landed on the floor after two ticks");
+    assert_eq!(name(base + 2), "minecraft:air", "with nothing above it");
+    // A landed block is looked at once more to take it out of the queue; that pass must not move it.
+    falling_tick();
+    assert_eq!(name(base + 1), "minecraft:sand", "a landed block must not move again");
+    assert!(falling().lock().unwrap().is_empty(), "and the queue drains");
 
     for (y, st) in original {
         set_block(3, y, 3, st);
@@ -1158,17 +1162,20 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     set_block(5, base + 3, 5, sand);
     set_block(5, base + 4, 5, sand);
     set_block(5, base + 2, 5, 0);
-    // Both are queued by the neighbour check that set_block already ran, and the order is whatever
-    // the moves produce: putting the lower one first is what the first version deadlocked on, and
-    // the test cannot force it from here.
-    assert_eq!(falling().lock().unwrap().len(), 2, "both stacked blocks are queued");
+    // The neighbour check schedules only the lower block; the upper one joins the queue when the
+    // lower moves out of the way. On a later tick both are held at once, and that is the
+    // arrangement the first version deadlocked on, so the maximum is asserted rather than assumed.
+    assert_eq!(falling().lock().unwrap().len(), 1, "the neighbour check schedules the lower block");
 
     let name = |y: i32| crate::feature::breg().unwrap().name_of(block_at(5, y, 5)).to_string();
     let mut ticks = 0;
+    let mut most_held = 1;
     while !falling().lock().unwrap().is_empty() && ticks < 20 {
+        most_held = most_held.max(falling().lock().unwrap().len());
         falling_tick();
         ticks += 1;
     }
+    assert_eq!(most_held, 2, "both blocks must be in flight at once, or the deadlock is not exercised");
     assert_eq!(name(base + 1), "minecraft:sand", "the lower one lands");
     assert_eq!(name(base + 2), "minecraft:sand", "and the upper one rests on it");
     assert_eq!(name(base + 3), "minecraft:air", "nothing is left in the air");
@@ -1180,6 +1187,8 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     *forceloaded().lock().unwrap() = old_forced;
     set_test_region(oh, ow);
 }
+
+
 
 
 

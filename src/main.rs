@@ -3974,22 +3974,6 @@ fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
         }
     }
 }
-fn is_gravity(st: u32) -> bool { matches!(st, 112 | 117 | 118) } // sand, red_sand, gravel
-fn settle_gravity(x: i32, y: i32, z: i32) {
-    // walk up: while a gravity block sits on air, drop it to the lowest free cell
-    let mut sy = y + 1;
-    while is_gravity(block_at(x, sy, z)) && sy < y + 8 {
-        if block_at(x, sy - 1, z) != 0 { break }
-        let mut ny = sy;
-        while ny > y - 8 && block_at(x, ny - 1, z) == 0 { ny -= 1; }
-        let st = block_at(x, sy, z);
-        set_block(x, ny, z, st);   // land first: nested settles see a consistent column
-        set_block(x, sy, z, 0);
-        note_block_update(x, sy, z, 0);
-        note_block_update(x, ny, z, st);
-        sy += 1;
-    }
-}
 fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
     let lo = if (523..=534).contains(&st) { 523u32 } else { 9345 };
     let fi = ((st - lo) / 2) % 6;
@@ -4102,9 +4086,19 @@ fn falling_tick() {
         set_block(x, y - 1, z, st);
         note_block_update(x, y, z, 0);
         note_block_update(x, y - 1, z, st);
-        again.push((x, y - 1, z));
+        // The two set_block calls above each reach note_falling_above, which may already have
+        // queued the cell this move just vacated. Pushing unconditionally let the queue grow past
+        // the number of blocks in flight, so every position is offered once.
+        if !again.contains(&(x, y - 1, z)) {
+            again.push((x, y - 1, z));
+        }
     }
-    falling().lock().unwrap().extend(again);
+    let mut f = falling().lock().unwrap();
+    for p in again {
+        if !f.contains(&p) {
+            f.push(p);
+        }
+    }
 }
 
 fn block_updated_inner(x: i32, y: i32, z: i32) {
@@ -4145,8 +4139,6 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
             else if !powered { dp.remove(&(bx, by, bz)); }
         }
     }
-    // gravity settle below/above the changed cell
-    settle_gravity(x, y, z);
 }
 
 
