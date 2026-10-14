@@ -227,7 +227,7 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
     for b in &md {
         // Every tool id in the asset, so both the accepted and rejected cases run.
         let allowed: Vec<i64> = match b.get("harvestTools") {
-            Some(crate::worldgen::J::Obj(entries)) => {
+            Some(crate::json::J::Obj(entries)) => {
                 entries.iter().filter_map(|(k, _)| k.parse::<i64>().ok()).collect()
             }
             _ => Vec::new(),
@@ -308,7 +308,7 @@ fn the_correct_tool_kind_is_the_assets_material() {
             _ => None,
         });
         let from_tools = match b.get("harvestTools") {
-            Some(crate::worldgen::J::Obj(entries)) => {
+            Some(crate::json::J::Obj(entries)) => {
                 let mut k: Option<i8> = None;
                 let mut disagree = false;
                 for (key, _) in entries {
@@ -612,7 +612,7 @@ fn light_values_come_from_the_asset_for_every_state() {
         .expect("blocks is an array")
         .clone();
     use std::collections::HashMap;
-    let mut by_name: HashMap<String, &crate::worldgen::J> = HashMap::new();
+    let mut by_name: HashMap<String, &crate::json::J> = HashMap::new();
     for b in &blocks {
         if let Some(n) = crate::feature::jstr_pub(b, "name") {
             by_name.insert(n, b);

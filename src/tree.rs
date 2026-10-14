@@ -3,7 +3,8 @@
 // propagation. Ported from pumpkin feature/features/tree semantics.
 
 use crate::feature::BReg;
-use crate::worldgen::{J, Xor};
+use crate::json::J;
+use crate::generation_math::Xor;
 
 pub(crate) type P3 = (i32, i32, i32);
 

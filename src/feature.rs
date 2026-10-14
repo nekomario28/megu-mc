@@ -5,6 +5,8 @@
 // into Gen::feat_c. State ids come from assets/blocks_1211.json (1.21.1 wire
 // ids); solidity/side flags come from assets/pblocks.json (pumpkin flags table).
 
+use crate::json::{J, jparse};
+use crate::generation_math::*;
 use crate::worldgen::*;
 use std::collections::{HashMap, HashSet};
 

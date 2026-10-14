@@ -5,17 +5,20 @@
     ["java_compat", "landing", "effects"],
     ["cached_lookup", "world_rng", "tick_queue", "landing_types"],
     ["feature"],
-    ["tree", "worldgen"]
+    ["tree", "worldgen"],
+    ["json", "generation_math"]
   ],
-  "explicit_generation_modules": ["feature", "tree", "worldgen"],
+  "explicit_generation_modules": ["feature", "tree", "worldgen", "json", "generation_math"],
   "forbidden": [["worldgen", "tree"]],
   "allowed_edges": [
     ["main", "java_compat"], ["main", "landing"], ["main", "effects"],
-    ["main", "cached_lookup"], ["main", "world_rng"], ["main", "tick_queue"], ["main", "landing_types"],
+    ["main", "cached_lookup"], ["main", "world_rng"], ["main", "tick_queue"], ["main", "landing_types"], ["main", "json"], ["main", "generation_math"],
     ["main", "feature"], ["main", "tree"], ["main", "worldgen"],
     ["feature", "tree"], ["feature", "worldgen"],
-    ["tree", "feature"], ["tree", "worldgen"], ["worldgen", "feature"],
-    ["java_compat", "landing_types"], ["landing", "java_compat"], ["landing", "landing_types"]
+    ["tree", "feature"], ["worldgen", "feature"],
+    ["java_compat", "landing_types"], ["landing", "java_compat"], ["landing", "landing_types"],
+    ["feature", "json"], ["tree", "json"], ["worldgen", "json"],
+    ["feature", "generation_math"], ["tree", "generation_math"], ["worldgen", "generation_math"]
   ],
   "accepted_errors": [
     ["cycle", "feature"],

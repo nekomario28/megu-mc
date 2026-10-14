@@ -20,6 +20,8 @@ use cached_lookup::CachedLookup;
 mod feature;
 mod tree;
 mod world_rng;
+mod json;
+mod generation_math;
 mod worldgen;
 
 // ---------- varint / wire ----------

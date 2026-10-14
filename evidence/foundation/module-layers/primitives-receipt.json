@@ -1,0 +1,71 @@
+{
+  "scope": "H shared JSON and seeded mathematics extraction; not completion of H",
+  "parent": "11fa91ba1bece0e7c1b3b26ab0473dcf57ffc4c2",
+  "source_sha256": {
+    "src/main.rs": "5df65e5f9170ffaf902e08a8ea11b6e93d83d4a2d465b8c92d40b906e1aa2636",
+    "src/worldgen.rs": "25f5f16005895e9f6b229bd88f4e443a8698468fecc8dcb763cf5700180d2517",
+    "src/feature.rs": "d9013fccb47523265ea18f7ecd02f9767d8d509a77c5931de10c34ab875f08a5",
+    "src/tree.rs": "73bfb5545c976e356a0ee6fc6946286de7364fe7b0b307bcb9d6a526474bb745",
+    "src/registry_tests.rs": "a4630d0f45e9ea2ae37128fc8f1606653a97e9071b5b8708b497aaccc2aa7cc0",
+    "src/json.rs": "31f178e44abd08e2d11abc8d3120b2ae3274a6d3c826110035a33a7ba382f2e1",
+    "src/generation_math.rs": "0fbd4cbeba8592fd26c60f7c513a40ddbc1e55247fc7f87f3f20ec676182d859",
+    "tests/layers_gate_test.py": "68cfaf7aee907aa03a59d2b40eed2a406618baf3e2fa0ea5bee3ea2e7ab0244c",
+    "evidence/foundation/module-layers/policy.json": "3e65e380165a7b5bb093dcdba37cd21786cfd536fe6bfceaf102c4f3ec24eb05",
+    "evidence/foundation/module-layers/deps_target.py": "594ebba9c2844247c5494bc5fecd6525fca989f1a0a0a35011eb9f67f4eaf910"
+  },
+  "implementation_comparison": {
+    "json": "byte-for-byte identical implementation",
+    "mathematics": "identical after removing pub(crate) visibility modifiers; only required internal visibility broadened",
+    "rng_vector_test": "byte-for-byte identical test moved to the type owner",
+    "new_world_or_rng_state": false
+  },
+  "checks": {
+    "cargo_check": "passed",
+    "registry_tests": {"passed": 26, "failed": 0},
+    "worldgen_tests": {"passed": 8, "failed": 0},
+    "rng_vector_test": {"passed": 1, "failed": 0},
+    "compiler_backed_controls": {
+      "methods": 14,
+      "passed": true,
+      "primitive_upward_imports": "each owner: green baseline, named layer-violation, restored green"
+    },
+    "source_projection": {
+      "modules": 13,
+      "edges": 25,
+      "remaining_findings": [["cycle", "feature"], ["layer-violation", "tree"], ["layer-violation", "worldgen"]]
+    },
+    "full_verify": {
+      "passed": true,
+      "rust_suite_runs": 4,
+      "passed_per_run": 113,
+      "preexisting_ignored_per_run": 1,
+      "mutants_proved": 22,
+      "not_a_gate": 0,
+      "parked": 0,
+      "skipped": 0,
+      "log_sha256": "06eb6db3fb686737e1fb655c4db8aa930215354962e81d7ab04927fd46d71361"
+    }
+  },
+  "independent_review": {
+    "tool": "codex review, read-only",
+    "confirmed_scoped_defects": 0,
+    "executed": "implementation comparisons, dependency model inspection, diff checks",
+    "not_run": "compilation, runtime and compiler-backed controls; main execution supplied these checks",
+    "log_sha256": "962ee4ef9be4771211e28ae1904a7ecce8121ce9cbb6f280bcb5fe6ffc8d8a28"
+  },
+  "parent_hosted_ci": {
+    "run_id": 38635803160,
+    "head": "11fa91ba1bece0e7c1b3b26ab0473dcf57ffc4c2",
+    "conclusion": "success",
+    "validates_this_change": false
+  },
+  "hosted_ci_for_this_change": "not yet run at receipt creation",
+  "limits": [
+    "The source projection is not complete Rust symbol/type resolution.",
+    "Generation configuration, context and population ownership remain to be split; three findings remain.",
+    "Clock-dependent RNG migration and persistence N remain open.",
+    "The preexisting ignored Rust test still blocks overall completion.",
+    "No whole-server vanilla parity, representative-load performance or full-branch review claim.",
+    "CLI-only acceptance; no GUI or KDE test requirement."
+  ]
+}

@@ -9,7 +9,7 @@ from pathlib import Path
 import depsgx as d
 
 modules = ["main", "featuredefs", "tree", "worldgen", "feature", "cached_lookup",
-           "world_rng", "tick_queue", "landing_types", "landing", "effects", "java_compat"]
+           "world_rng", "tick_queue", "landing_types", "landing", "effects", "java_compat", "json", "generation_math"]
 graph = d.ModuleGraph(
     modules=modules,
     depends=[("main", name) for name in modules if name != "main"] + [
@@ -22,13 +22,15 @@ graph = d.ModuleGraph(
         ("landing", "java_compat"),
         ("landing", "landing_types"),
         ("java_compat", "landing_types"),
+        ("feature", "json"), ("tree", "json"), ("worldgen", "json"),
+        ("feature", "generation_math"), ("tree", "generation_math"), ("worldgen", "generation_math"),
     ],
     roots=["main"],
     layers=[
         ["main"],
         ["java_compat", "landing", "effects"],
         ["cached_lookup", "world_rng", "tick_queue", "landing_types"],
-        ["featuredefs"], ["tree"], ["worldgen"], ["feature"],
+        ["featuredefs"], ["tree"], ["worldgen"], ["feature"], ["json", "generation_math"],
     ],
     forbidden=[("worldgen", "tree")],
 )
