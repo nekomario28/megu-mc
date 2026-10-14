@@ -135,11 +135,30 @@ FT3 read  (9,153,9)  st=0     name=air  beh=0      ← 同じ座標が空気
 (9,153,9) のオーバーレイ項目を消しているか、動かしている。**
 `falling_tick` の移動分岐ではないことは既に確定している。
 
-**次の一手**：テストで `set_block(9,152,9,0)` の**直後**に
-`block_at(9,153,9)` を出力する。それで消えた瞬間が `set_block` の中か外かが分かる。
-**そのうえで `set_block_if` → `block_updated` → `block_updated_inner` を1段ずつ出力する。**
+### 消えた瞬間を特定した
 
-**説明できるまで落下の速度も移動量も主張しない。**
+`set_block` の前後で同じ座標を出力：
+
+```
+WHEN placed sand: sand_at_153=112
+WHEN cleared base+2: sand_at_153=0      ← set_block(9,152,9,0) の後で消えている
+WHEN queue=[(9, 153, 9)]
+```
+
+**確定**：`set_block(9,152,9,0)` が
+**(9,153,9) のオーバーレイ項目を消している**（1つ上）。
+
+`set_block_if` の書き込みは `local_idx(x,y,z)` で**正しいキー**を使っており、
+対象位置以外を触っていない。したがって**原因はオーバーレイ書き込みの後の連鎖**にある。
+`set_block_if` の残りの処理は：`signs().retain` / `chests().remove` / `furnaces().remove` /
+spill のドロップ / `block_updated(x,y,z)` / `refresh_hidden_neighbors(x,y,z)` /
+`note_block_update(x,y,z,st)`。
+
+**次の一手**：この連鎖の各段の後で `block_at(9,153,9)` を出力し、
+どの呼び出しが消しているかを1つに絞る。
+
+**これは落下ブロックの問題ではなく、`set_block` の一般的な問題である可能性がある**
+（隣接ブロックを消す経路がある）。**説明できるまで落下の速度も移動量も主張しない。**
 
 ## 未着手
 
