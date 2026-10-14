@@ -390,7 +390,7 @@ error worldgen  layer-violation: worldgen (layer 4) depends on feature (layer 3)
 | `depsgx`（目標） | 意図する層 | **no problems** — **実装前に証明**、CI の門に |
 | `flowgx` | スケジューラのバックオフ | **0 errors** → `sched_ready` は**発火しない**（項目 g） |
 | `authzgx` | コマンド権限 | **実施**：出荷既定は **no problems**（allowlist＝既定拒否）。脱出口は**1 error を意図的に残す**（[evidence](../../../evidence/foundation/command-auth/README.md)） |
-| `schemagx` | 保存の節（MET4 / ARW2 / FAL1） | 未実施 — 節の依存に循環が無いか |
+| `schemagx` | 保存の節（MET4 / ARW2 / FAL1） | **実施**：**0 errors**（循環なし、根は `world_cell`）。**孤児のリスクは範囲外**と判明 → テストで押さえる（[evidence](../../../evidence/foundation/save-schema/README.md)） |
 | `chartgx` | 測定値の図（ブロックライト 709→148µs 等） | 未実施 — 証拠の図 |
 | `docgx` | PLAN / specs のページ | 未実施 — 版面はみ出し |
 
