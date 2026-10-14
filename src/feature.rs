@@ -89,6 +89,9 @@ pub(crate) struct BReg {
     hardness: Vec<f32>, // state id -> vanilla destroy time (-1 unbreakable)
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
     tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
+    /// Names in blocks_1211.json with no counterpart in pblocks.json, so their per-state values
+    /// are the defaults. Empty is the only acceptable value; a rename adds one.
+    pub(crate) unpaired: Vec<String>,
     drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
     /// A few blocks drop twice: the potted plants drop the pot and the plant. Kept beside
     /// `drops` rather than folded into it so the single-drop path stays as it was.
@@ -114,6 +117,17 @@ impl BReg {
         for b in pb_blocks {
             pb_by_name.insert(format!("minecraft:{}", jstr(b, "name")?), b);
         }
+        // The two assets are different Minecraft versions, so a block renamed between them has no
+        // entry under the 1.21.1 name and silently loses every per-state value - solidity, opacity,
+        // luminance, shapes. 1.21.1's chain became iron_chain when chains gained material variants.
+        // This table is the only place that mapping lives, and `unpaired` below makes a new one
+        // visible instead of quiet.
+        const PB_ALIAS: [(&str, &str); 1] = [("minecraft:chain", "minecraft:iron_chain")];
+        for (old, new) in PB_ALIAS {
+            if let Some(b) = pb_by_name.get(new).copied() {
+                pb_by_name.insert(old.to_string(), b);
+            }
+        }
         let n_states_max = md
             .iter()
             .filter_map(|b| jnum(b, "maxStateId"))
@@ -132,6 +146,7 @@ impl BReg {
             hardness: vec![0.6; n_states_max + 1],
             htools: vec![],
             tool_kind: vec![],
+            unpaired: Vec::new(),
             drops: vec![-1; n_states_max + 1],
             drops_second: vec![-1; n_states_max + 1],
             stack_size: vec![64; n_states_max + 1],
@@ -170,6 +185,9 @@ impl BReg {
             // covered 356 of the 26684 states, which meant mining time was wrong for
             // almost every block in the world.
             let hardness = jnum(b, "hardness").unwrap_or(0.6) as f32;
+            if !pb_by_name.contains_key(&name) {
+                reg.unpaired.push(name.clone());
+            }
             // Stack size is a block property in the asset (1 for tools and potions,
             // 16 for signs and buckets, 64 otherwise) and is read here once per state
             // rather than re-derived from item id ranges.

@@ -201,6 +201,11 @@ check "breaking a chest drops the slots it owned" \
   '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z + 1000)) {' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
+check "a renamed block is still paired between the two assets" \
+  src/feature.rs '("minecraft:chain", "minecraft:iron_chain")' \
+  '("minecraft:chain", "minecraft:not_a_block")' \
+  every_block_has_a_counterpart_in_the_other_asset
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

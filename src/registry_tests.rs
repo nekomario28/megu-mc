@@ -894,3 +894,17 @@ fn a_potted_plant_drops_both_entries_the_asset_lists() {
     assert!(reg.block_drop(stone).is_some(), "stone drops itself");
     assert!(reg.block_drop_second(stone).is_none(), "and only once");
 }
+
+/// Every block in the 1.21.1 asset has a counterpart in the newer one. Without one it silently keeps
+/// the defaults for solidity, opacity, luminance and shape, which is a behaviour difference with no
+/// error anywhere. One rename cost `chain` all of them: 1.21.1 calls it chain, the newer asset calls
+/// it iron_chain once chains gained material variants.
+#[test]
+fn every_block_has_a_counterpart_in_the_other_asset() {
+    let reg = breg().unwrap();
+    assert!(
+        reg.unpaired.is_empty(),
+        "these blocks have no counterpart in pblocks.json, so their per-state values are defaults: {:?}",
+        reg.unpaired
+    );
+}

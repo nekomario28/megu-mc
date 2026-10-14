@@ -357,7 +357,7 @@ error worldgen  layer-violation: worldgen (layer 4) depends on feature (layer 3)
 | **c** | 落下 tick が hot/warm を見ない | — | 小 | **完了**（冷えたチャンクでは再キュー、変異チェックで証明） |
 | **d** | 時計依存 RNG | **20**（定義含む） | 大 | **未着手**。ラチェットで凍結済み |
 | **e** | 鉢植えが2つ目のドロップを落とす | 34ブロック | 小 | **完了 `d64a2a7`**（`drops_second` を加算的に追加、変異チェックで落ちられることを証明） |
-| **f** | 資産間で対応しないブロック | **1**（`chain`。以前「2」と誤記） | 小 | **未着手** |
+| **f** | 資産間で対応しないブロック | — | 小 | **完了**：`chain` は**改名**（新資産では `iron_chain`）。別名表＋**未対応を数える門**（`unpaired` は空であること） |
 | **g** | `sched_ready` の安全網 | **4箇所** | 小 | **証明済み**：`flowgx` で 0 errors → **発火しない**。削除は独立コミット（[evidence](../../../evidence/foundation/scheduler-machine/README.md)） |
 | **h** | depsgx の層エラー | **3**（循環＋2層違反） | **大**（約1,300行） | **未着手**。目標は `deps_target.py` で証明済み |
 | **i** | `Client Information`（view distance）を無視 | — | 小 | **未着手** |
