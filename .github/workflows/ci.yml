@@ -23,6 +23,11 @@ jobs:
       # a number nothing checks drifts.
       - name: Debt is frozen at today's count, and must not grow
         run: bash tools/debt_ratchet.sh
+      # The intended module layering has to stay acyclic, and the current one must not get worse
+      # while main.rs is being split. Skips with a message when depsgx is absent rather than passing
+      # quietly - a gate that reports health while running nothing is the failure mode to avoid.
+      - name: The module layering must be reachable
+        run: bash tools/layers_check.sh
       - name: Build (locked)
         run: cargo build --locked
       - name: Unit and regression tests (locked, serialized)

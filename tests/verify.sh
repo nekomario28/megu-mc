@@ -4,6 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+echo "== module layering"
+bash tools/layers_check.sh || exit 1
+
 echo "== debt ratchet"
 bash tools/debt_ratchet.sh || exit 1
 
