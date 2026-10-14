@@ -1095,9 +1095,6 @@ fn measure_the_light_cost_per_chunk() {
 
 /// Sand over air falls until it lands. Vanilla schedules a tick from the neighbour update, so the
 /// queue is filled by a block change rather than by a scan, and the block moves one cell a tick.
-#[ignore = "flaky: fails in a filtered run and at eight threads, passes in the full serial \
-           suite, and the state prints correct when it does fail. Unexplained - specs/PLAN.md \
-           section 7. Not weakened silently: the case is parked by name."]
 #[test]
 fn sand_falls_one_block_a_tick_until_it_lands() {
     let _world_guard = world_guard();
@@ -1136,7 +1133,9 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
     // One cell a tick, and it stops on the floor. The column is pinned after every tick: a count
     // alone would also pass if the block moved two cells in one tick and then idled, which is what
     // the duplicate gravity implementation used to do.
+    eprintln!("D before tick queue={:?} col={:?}", falling().lock().unwrap(), (base..=base+4).map(name).collect::<Vec<_>>());
     falling_tick();
+    eprintln!("D after tick queue={:?} col={:?}", falling().lock().unwrap(), (base..=base+4).map(name).collect::<Vec<_>>());
     assert_eq!(name(base + 2), "minecraft:sand", "one cell down after one tick");
     assert_eq!(name(base + 3), "minecraft:air", "and nothing left where it was");
     falling_tick();
@@ -1158,9 +1157,6 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
 /// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
 /// block it never showed, because the check returns before locking when there is nothing above.
-#[ignore = "flaky: fails in a filtered run and at eight threads, passes in the full serial \
-           suite, and the state prints correct when it does fail. Unexplained - specs/PLAN.md \
-           section 7. Not weakened silently: the case is parked by name."]
 #[test]
 fn two_stacked_sand_blocks_fall_without_deadlocking() {
     let _world_guard = world_guard();
@@ -1208,9 +1204,6 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
 /// block name from the asset is walked here, because the registry test alone cannot tell whether a
 /// name that is classified as falling is also scheduled and moved - reverting the tick to a hand
 /// list of three states kept that test green.
-#[ignore = "flaky: fails in a filtered run and at eight threads, passes in the full serial \
-           suite, and the state prints correct when it does fail. Unexplained - specs/PLAN.md \
-           section 7. Not weakened silently: the case is parked by name."]
 #[test]
 fn every_falling_block_is_scheduled_and_moves_one_cell() {
     let _g = world_guard();
