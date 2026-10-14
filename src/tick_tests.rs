@@ -1059,8 +1059,23 @@ fn measure_the_light_cost_per_chunk() {
     });
     set_block(tx, ty, tz, old);
 
+    // Where the block light spread's time goes: the same sources with an opacity function that
+    // reads nothing, against the one that reads the world through block_at.
+    let free_op = time_it(&mut || {
+        for _ in 0..rounds {
+            for x in -16..32 {
+                for z in -16..32 {
+                    let _ = std::hint::black_box(block_light_sections_from(
+                        0, 0, &[((5, height_at(5, 7), 7), 15)], |_, _, _| 0));
+                    let _ = x; let _ = z;
+                    break;
+                }
+                break;
+            }
+        }
+    });
     println!(
-        "LIGHT_READ per chunk over {rounds} rounds: pack_read={pack_read:?} sky_read={sky_read:?} block_read={block_read:?} block_read_lit={block_read_lit:?}"
+        "LIGHT_READ per chunk over {rounds} rounds: pack_read={pack_read:?} sky_read={sky_read:?} block_read={block_read:?} block_read_lit={block_read_lit:?} free_op={free_op:?}"
     );
     println!(
         "LIGHT_HALVES per chunk over {rounds} rounds: floors_only={floors_only:?} pack_only={pack_only:?}"
