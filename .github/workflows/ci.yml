@@ -29,3 +29,15 @@ jobs:
         run: |
           cargo check --locked --features fabric-probe
           cargo check --locked --features neoforge-events
+
+  # Separate from the suite on purpose: a green suite is not evidence that a gate works. This job
+  # breaks each pinned implementation and requires the named test to go red, so a test that can no
+  # longer fail is a red build rather than a green one that checks nothing.
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Every pinned gate must fail when its implementation is broken
+        run: bash tools/mutation_check.sh

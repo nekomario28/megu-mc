@@ -20,4 +20,8 @@ echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe
 cargo check --offline --locked -j 2 --features neoforge-events
 
+# Last, because it is the slowest: prove the gates can still fail. A suite that is green over a gate
+# that cannot fail reports safety it does not have, and this is the only check that would notice.
+bash tools/mutation_check.sh --offline || exit 1
+
 echo "verify: PASS"

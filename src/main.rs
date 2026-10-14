@@ -4087,13 +4087,12 @@ fn falling_tick() {
         set_block(x, y - 1, z, st);
         note_block_update(x, y, z, 0);
         note_block_update(x, y - 1, z, st);
-        // The two set_block calls above each reach note_falling_above, which may already have
-        // queued the cell this move just vacated. Pushing unconditionally let the queue grow past
-        // the number of blocks in flight, so every position is offered once.
-        if !again.contains(&(x, y - 1, z)) {
-            again.push((x, y - 1, z));
-        }
+        again.push((x, y - 1, z));
     }
+    // The two set_block calls above each reach note_falling, which may already have queued the cell
+    // this move vacated, so the merge is the place that keeps one entry per position. A second
+    // check while building `again` is redundant: contains is applied here against the live queue,
+    // which already holds anything pushed a moment ago.
     let mut f = falling().lock().unwrap();
     for p in again {
         if !f.contains(&p) {

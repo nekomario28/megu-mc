@@ -1109,7 +1109,15 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
         set_block(3, y, 3, 0);
     }
     set_block(3, base, 3, name_to_state("stone").expect("stone must exist"));
+    // A support under the sand, so the sand is not scheduled merely by being placed. Without it the
+    // placement schedules the fall on its own, and the branch that notices a removed support is
+    // never exercised: a mutation deleting that branch leaves this test green.
+    set_block(3, base + 2, 3, name_to_state("dirt").expect("dirt must exist"));
     set_block(3, base + 3, 3, sand);
+    assert!(
+        falling().lock().unwrap().is_empty(),
+        "a block with support under it must not be scheduled"
+    );
 
     let name = |y: i32| crate::feature::breg().unwrap().name_of(block_at(3, y, 3)).to_string();
     assert_eq!(name(base + 3), "minecraft:sand", "the test starts with sand in the air");
