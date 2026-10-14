@@ -113,9 +113,31 @@ EX after tick ["0:stone", "1:sand", ...]  ← 砂は base+1 にいる
 **したがって「動かしたのは `falling_tick` の移動分岐ではない」ことだけは確定した。**
 `falling_tick` は `behaviour 0` を見て抜けており、移動は**別の経路**が起こしている。
 
-次の一手：**`block_at(9,153,9)` を `note_falling_above` と `falling_tick` の両方で
-出力し、状態そのものを突き合わせる**（behaviour ではなく state id と name を出す）。
-そのうえで `set_block` の連鎖を1つずつ出力する。
+### state id と名前を両方の読み出し点で出力した結果
+
+```
+EX placing sand=112 at 153
+EX read back = 112                                 ← 置いた直後は sand
+NFQ check (9,153,9) above=112 name=sand beh=2      ← キュー判定は sand を見ている
+NFQ check (9,154,9) above=0   name=air  beh=0
+FT3 read  (9,153,9)  st=0     name=air  beh=0      ← 同じ座標が空気
+```
+
+**確定したこと（すべて出力に基づく）**：
+
+1. `set_block(9,153,9,sand)` は効いている（read back = 112）
+2. キューに積む判定は**同じ座標で sand を見ている**
+3. `falling_tick` は**同じ座標で空気を読む**
+4. その間に挟まるのは**キューの push だけ**
+5. 砂は最終的に `base+1` にいる（**誰かが動かした**）
+
+**したがって、`set_block(9,152,9,0)` の呼び出し連鎖のどこかが
+(9,153,9) のオーバーレイ項目を消しているか、動かしている。**
+`falling_tick` の移動分岐ではないことは既に確定している。
+
+**次の一手**：テストで `set_block(9,152,9,0)` の**直後**に
+`block_at(9,153,9)` を出力する。それで消えた瞬間が `set_block` の中か外かが分かる。
+**そのうえで `set_block_if` → `block_updated` → `block_updated_inner` を1段ずつ出力する。**
 
 **説明できるまで落下の速度も移動量も主張しない。**
 
