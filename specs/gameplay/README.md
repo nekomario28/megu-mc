@@ -113,18 +113,20 @@ Status: 計画。slice 01 完了、slice 02 の手順1〜4 完了。
 | 03 | **[光エンジン](slices/03-light-engine.md)**（luminance + opacity） | **設計済み**。消費者は既存で、今は嘘の値を送っている | **大**（松明が光る） |
 | 04 | **衝突形状** | **未着手 — 次** | **最大**（階段・ハーフ・フェンス） |
 
-### slice 04 の第一歩が最初に否定されたこと（次に読む人へ）
+### slice 04 のデータ源（確認済み）
 
-「アセットに `boundingBox` があるのだから、hardness / drops / stackSize と同じ手順で読める」—
-**これは誤りだった。** `assets/blocks_1211.json` の `boundingBox` は
-**`"block"`（835件）と `"empty"`（225件）の2値だけ**で、
-階段・ハーフ・フェンスの形状を持たない。**`is_solid` の真偽値と同じ粒度**であり、
-**このアセットからは衝突形状を導出できない。**
+**正しい源は `assets/pblocks.json` であり、実形状が入っている。**
+状態ごとに `collision_shapes` / `outline_shapes`（**35,723 参照**）があり、
+参照先の `shapes` は **719 個の実 AABB**（`min` / `max`）。
+例：`oak_stairs` の既定状態は `[58, 59]` の2箱。
 
-`boundingBox` という名前を見て「形状が入っている」と結論したのが誤りである。
-**behavior のときと同じ教訓**：このアセットにあるのは、このアセットにあるものだけであり、
-プロパティ名は中身の保証ではない。**次はまず `pblocks.json`（別バージョン、list-of-list 構造）に
-実形状があるかを確認し、無ければ vanilla のデータ生成器が出す当たり判定を持ってくる。**
+**`assets/blocks_1211.json` の `boundingBox` は使えない** —
+`"block"`（835件）/ `"empty"`（225件）の**2値だけ**で形状を持たない。
+`is_solid` の真偽値と同じ粒度である。
+
+**教訓**：`boundingBox` という名前を見て「形状が入っている」と結論したのは誤りだった。
+**behavior のときと同じで、プロパティ名は中身の保証ではない。**
+**同じリポジトリの別ファイル（別バージョンの資産）を先に確認する。**
 | 05 | 落下ブロック | **完了**（1tick1セル、アセット由来の19種、独立レビュー済み）。**未修正のギャップ3件は [evidence/gameplay/falling-blocks](../../evidence/gameplay/falling-blocks/README.md)** | 中 |
 | 05b | 葉の枯れ・苗木 | 未着手 | 小 |
 | 06 | Entity framework（[slice 04](../foundation/slices/04-entity-framework.md)） | 未着手 | 土台 |
