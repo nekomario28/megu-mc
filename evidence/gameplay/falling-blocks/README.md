@@ -154,7 +154,49 @@ WHEN queue=[(9, 153, 9)]
 spill のドロップ / `block_updated(x,y,z)` / `refresh_hidden_neighbors(x,y,z)` /
 `note_block_update(x,y,z,st)`。
 
-### 連鎖の各段にプローブを入れた結果
+### 解決：落下を実装している機構が2つあった
+
+`set_block` の**入口**にプローブを置き、そこから `Backtrace::force_capture()` を取った：
+
+```
+ENT set=(9,151,9) st=112
+   0: mc_spine::set_block
+   1: mc_spine::settle_gravity          ← 実行者
+   2: mc_spine::block_updated_inner
+   3: mc_spine::block_updated
+   4: mc_spine::set_block_if
+```
+
+**`settle_gravity`** が `block_updated_inner` の末尾から呼ばれ、
+**重力ブロックを列ごと一気に最下段まで落としていた**。したがって
+`falling_tick` が見る頃にはブロックは既に床の上にあり、
+「キューに積んだ位置は空気」になっていた。
+
+同じ振る舞いの実装が**2つ**あった：
+
+| 実装 | 落下の集合 | 時間 |
+|---|---|---|
+| `settle_gravity`（先にあった） | **手書きの3状態**（sand, red_sand, gravel） | **即時**（時間が消える） |
+| `falling_tick`（後から追加） | **アセットの `B_FALLING`** | **1tick1セル** |
+
+- 16種のコンクリートパウダーは**アセットにはあるが手書きリストに無く、まったく落ちなかった**
+- 即時着地は**近似ではなく、経過時間の除去**である
+
+**`settle_gravity` と `is_gravity` を削除**し、アセット由来の `falling_tick` を唯一の所有者にした。
+
+**なぜ既存のテストがこれを見つけられなかったか**：テストは**着地だけ**を固定し、
+「2セル落ちるはずが1周で終わった、それは未説明」とコメントして **tick 数を主張していなかった**。
+`settle_gravity` が `set_block` の中で既に床まで落としていたためである。
+現在は**各 tick 後の列**を固定し、**スケジューリングがブロックを動かさないこと**も固定している。
+
+**副次的な修正**：`falling_tick` は重複を蓄積していた
+（両方の `set_block` が `note_falling_above` に達し、`again` が無条件に push していたため、
+2個のスタックでキューが3件になっていた）。位置ごとに1件に保つようにした。
+
+**集合は門で固定**：`registry_tests::the_falling_set_is_the_asset_set` が
+**19件**（砂・赤砂・砂利＋16種のコンクリートパウダー）を数え、名前を列挙する。
+
+### 連鎖の各段にプローブを入れた結果（経緯）
 
 `set_block_if` の各段の後で、**その呼び出しが設定する位置の1つ上**を出力：
 
