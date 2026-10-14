@@ -48,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Gate failures and missing checks must reject completion
+        run: python3 tests/gate_scripts.py
       - name: Every pinned gate must fail when its implementation is broken
         run: bash tools/mutation_check.sh
       # The check rewrites a source file to break it and puts it back. If it fails to put it back,

@@ -28,7 +28,7 @@ fi
 if ls src/*.mutation-backup >/dev/null 2>&1; then
   echo "refusing to run: a previous mutation was left applied:" >&2
   ls src/*.mutation-backup >&2
-  echo "restore with: for f in src/*.mutation-backup; do mv \"\$f\" \"\${f%.mutation-backup}\"; done" >&2
+  echo 'restore with: for f in src/*.mutation-backup; do cp "$f" "${f%.mutation-backup}" && touch "${f%.mutation-backup}" && rm "$f"; done' >&2
   exit 2
 fi
 
@@ -215,4 +215,5 @@ echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipp
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
 fi
-[ "$failed" -eq 0 ]
+# Every registered mutation is required; an unexecuted assertion is not success.
+[ "$failed" -eq 0 ] && [ "$parked" -eq 0 ] && [ "$skipped" -eq 0 ] && [ "$passed" -gt 0 ]

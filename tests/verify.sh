@@ -4,6 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+echo "== gate exit contracts"
+python3 tests/gate_scripts.py
+
 echo "== module layering"
 bash tools/layers_check.sh || exit 1
 

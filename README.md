@@ -13,6 +13,17 @@ cargo build --locked
 cargo test --locked -- --test-threads=1
 ```
 
+必須ゲートは `bash tests/verify.sh`。出力を整形しても、呼び出すシェルが失敗の終了値を保持する：
+
+```sh
+set -euo pipefail
+bash tests/verify.sh > verify.log 2>&1
+# この行以降へ進めるのは全必須ゲート成功時だけ。
+```
+
+`verify.sh | tail` を終了判定に使わない。スキップ・未実行の必須変異も検証失敗として扱う。
+[残る欠陥の完了契約](specs/close-defects/README.md)を参照。
+
 設定とdatapackは相対パスで読むため、リポジトリ直下から実行する。既存ワールドは復元ソースに含めていない。
 
 ```sh

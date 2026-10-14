@@ -1,6 +1,8 @@
 # 最終目標への計画
 
-Status: 計画。**数値はすべて実測**。測っていないものは「未測定」と明記する。
+Status: 実装中。残件・完了判定の正本は [未修正欠陥を閉じる](close-defects/README.md)。
+以下の完了表示・数値は過去のチェックポイントであり、直近監査で i と g および保存の証明を撤回した。
+実測とモデル検査を実装の効果へ読み替えない。
 
 個々の設計は [foundation](foundation/README.md) / [gameplay](gameplay/README.md) /
 [time-contract](time-contract/README.md) / [mod-compatibility](mod-compatibility/README.md) が持つ。
