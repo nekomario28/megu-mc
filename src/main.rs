@@ -4044,7 +4044,68 @@ fn block_updated(x: i32, y: i32, z: i32) {
     UPD_DEPTH.set(depth);
     r
 }
+static FALLING: OnceLock<Mutex<Vec<(i32, i32, i32)>>> = OnceLock::new();
+fn falling() -> &'static Mutex<Vec<(i32, i32, i32)>> {
+    FALLING.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Whether a block can be fallen into. Vanilla replaces air and fluids; the registry's opacity is
+/// the closest thing to hand, and a full block never is.
+fn fallable(x: i32, y: i32, z: i32) -> bool {
+    let Some(reg) = crate::feature::breg() else { return false };
+    let st = block_at(x, y, z);
+    reg.is_air(st) || reg.is_liquid(st)
+}
+
+/// Queue the block above a change if that change took its support away. Vanilla does this from
+/// the neighbour update; here it is the same place, so a falling block is scheduled exactly when
+/// something under it changes and never on a scan.
+fn note_falling_above(x: i32, y: i32, z: i32) {
+    let Some(reg) = crate::feature::breg() else { return };
+    if !fallable(x, y, z) {
+        return;
+    }
+    let above = block_at(x, y + 1, z);
+    if reg.behaviour_of(above) != crate::feature::B_FALLING {
+        return;
+    }
+    let mut f = falling().lock().unwrap();
+    if !f.contains(&(x, y + 1, z)) {
+        f.push((x, y + 1, z));
+    }
+}
+
+/// One block a tick, which is what a falling block entity does at its slowest. A block that has
+/// landed leaves the queue.
+fn falling_tick() {
+    let mut f = falling().lock().unwrap();
+    let queued = std::mem::take(&mut *f);
+    let mut again = Vec::new();
+    for (x, y, z) in queued {
+        let st = block_at(x, y, z);
+        let reg = match crate::feature::breg() {
+            Some(r) => r,
+            None => return,
+        };
+        if reg.behaviour_of(st) != crate::feature::B_FALLING {
+            continue; // something else is here now
+        }
+        if y <= MIN_Y || !fallable(x, y - 1, z) {
+            continue; // landed
+        }
+        set_block(x, y, z, 0);
+        set_block(x, y - 1, z, st);
+        note_block_update(x, y, z, 0);
+        note_block_update(x, y - 1, z, st);
+        again.push((x, y - 1, z));
+    }
+    f.extend(again);
+}
+
 fn block_updated_inner(x: i32, y: i32, z: i32) {
+    // A block losing its support falls. Checked here rather than by scanning, because this is
+    // called exactly when something under it changed.
+    note_falling_above(x, y, z);
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [(0,0,0),(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
         let (bx, by, bz) = (x + dx, y + dy, z + dz);
@@ -14114,6 +14175,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     step("plugins", plugin_tick);
     step("actors", actor_tick);
     step("mobs", mob_tick);
+    step("falling", falling_tick);
     step("random_ticks", random_tick_pass);
     step("block_updates", flush_block_updates);
 }

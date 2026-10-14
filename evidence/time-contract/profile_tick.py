@@ -75,7 +75,7 @@ def main():
         assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces", "crowded_actors", "dense_actors", "entity_heavy", "entity_heavy_furnaces", "active_furnaces_pack", "drop_pile"}
         for item in scenarios.values():
             assert item["tick"]["samples"] == 1000
-            assert len(item["stages"]) == 16
+            assert len(item["stages"]) == 17
             # Every stage must run, so the reading cannot be a stopped pipeline.
             # The lava stage is periodic, so its count follows the cadence rather
             # than a fixed number; assert it ran less often and let the report

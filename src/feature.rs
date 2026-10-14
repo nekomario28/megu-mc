@@ -72,6 +72,9 @@ struct Prop {
 /// registry stores it for every block, so the dispatch is a compare against zero.
 pub(crate) const B_NONE: u8 = 0;
 pub(crate) const B_SUGAR_CANE: u8 = 1;
+/// Falls when the block under it goes away. Vanilla schedules a tick and moves it as an entity;
+/// the behaviour is the same either way, and the id is what keeps the name out of the tick.
+pub(crate) const B_FALLING: u8 = 2;
 
 pub(crate) struct BReg {
     bname: Vec<String>,
@@ -225,6 +228,8 @@ impl BReg {
             // by one line instead of a new branch in the tick.
             reg.behaviour.push(match name.as_str() {
                 "minecraft:sugar_cane" => B_SUGAR_CANE,
+                "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel" => B_FALLING,
+                n if n.ends_with("_concrete_powder") => B_FALLING,
                 _ => B_NONE,
             });
             reg.tool_kind.push(from_material.or(from_tools).unwrap_or(-1));
