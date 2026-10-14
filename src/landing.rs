@@ -1,25 +1,10 @@
 //! Supported player landing operation. Java callbacks run synchronously on one owner.
 use super::*;
+use crate::landing_types::{Loader, Trample};
+#[cfg(feature = "java-compat")]
+use crate::landing_types::Request;
 #[cfg(feature = "java-compat")]
 use std::sync::mpsc::{self, SyncSender};
-
-#[derive(Clone, Copy, Debug)]
-pub enum Loader {
-    Fabric,
-    NeoForge,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Trample {
-    pub position: (i32, i32, i32),
-    pub state: u32,
-    pub distance: f32,
-}
-#[cfg(feature = "java-compat")]
-pub struct Request {
-    pub trample: Trample,
-    pub reply: SyncSender<Result<bool, String>>,
-}
 #[cfg(feature = "java-compat")]
 static CALLBACKS: OnceLock<SyncSender<Request>> = OnceLock::new();
 

@@ -1,53 +1,38 @@
-"""The layering S2.2 is aiming for, checked before any code moves.
+"""A design hypothesis, not evidence of the current implementation's layering.
 
-Today feature and tree form a cycle because feature.rs is two things at once: the block registry,
-which the generation layers legitimately depend on, and the feature/config system, which generates
-trees and therefore depends back on them. Splitting it in two points every edge downward.
-
-The proposed split, lowest layer first:
-
-    feature (registry: breg, name_to_state, is_solid, ...)
-      -> worldgen          (terrain; needs block ids)
-      -> tree              (tree shapes; needs terrain and block ids)
-      -> featuredefs       (the config language and placement; generates trees)
-      -> main
-
-depsgx is the check: if this file reports no errors, the target is acyclic and the extraction is
-worth starting. If it reports a violation, the split above is wrong and no code should move yet.
+Separating registry, config and placement is the intended direction. Actual JSON,
+RNG/context types and population calls must also acquire correct owners; moving
+one function does not prove these edges or eliminate current source cycles.
 """
-
+import json
+from pathlib import Path
 import depsgx as d
 
+modules = ["main", "featuredefs", "tree", "worldgen", "feature", "cached_lookup",
+           "world_rng", "tick_queue", "landing_types", "landing", "effects", "java_compat"]
 graph = d.ModuleGraph(
-    modules=["main", "featuredefs", "tree", "worldgen", "feature",
-             "cached_lookup", "world_rng", "tick_queue", "landing", "effects", "java_compat"],
-    depends=[
-        ("main", "featuredefs"),
-        ("main", "feature"),
-        ("main", "cached_lookup"),
-        ("main", "world_rng"),
-        ("main", "tick_queue"),
-        ("main", "landing"),
-        ("main", "effects"),
-        ("main", "java_compat"),
-        # The config language parses tree configs and asks the tree layer to place them.
+    modules=modules,
+    depends=[("main", name) for name in modules if name != "main"] + [
         ("featuredefs", "tree"),
         ("featuredefs", "worldgen"),
         ("featuredefs", "feature"),
-        # The generation layers only ever reach down to the registry.
         ("tree", "worldgen"),
         ("tree", "feature"),
         ("worldgen", "feature"),
+        ("landing", "java_compat"),
+        ("landing", "landing_types"),
+        ("java_compat", "landing_types"),
     ],
     roots=["main"],
     layers=[
         ["main"],
         ["java_compat", "landing", "effects"],
-        ["cached_lookup", "world_rng", "tick_queue"],
-        ["featuredefs"],
-        ["tree"],
-        ["worldgen"],
-        ["feature"],
+        ["cached_lookup", "world_rng", "tick_queue", "landing_types"],
+        ["featuredefs"], ["tree"], ["worldgen"], ["feature"],
     ],
-    forbidden=[],
+    forbidden=[("worldgen", "tree")],
 )
+policy = json.loads((Path(__file__).with_name("policy.json")).read_text())
+current = {name for layer in policy["layers"] for name in layer}
+if not current.issubset(modules):
+    raise ValueError(f"design omits classified source owners: {sorted(current - set(modules))}")

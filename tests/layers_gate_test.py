@@ -77,6 +77,14 @@ class LayerGateTests(unittest.TestCase):
             code, output = run(root)
             self.assertEqual(code, 0, output)
 
+    def test_java_backend_cannot_depend_on_its_dispatcher_again(self):
+        with fixture() as root:
+            p = root / "src/java_compat.rs"
+            p.write_text(p.read_text() + "\nuse crate::landing::eligible;\n")
+            code, output = run(root)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("deps.py: [cycle] java_compat", output)
+
     def test_macro_shadow_is_seen_at_the_expanded_call_site(self):
         with fixture() as root:
             p = root / "src/main.rs"

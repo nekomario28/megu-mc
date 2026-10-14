@@ -1,0 +1,67 @@
+{
+  "scope": "H-Interop only; generation debt remains open",
+  "parent": "4dcde4fea5d72b4d216a1b7607881d50f465812e",
+  "source_sha256": {
+    "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
+    "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
+    "evidence/foundation/module-layers/deps_target.py": "a269b5cf62a3c5d013714f91bde10d33406a4df19059f4aa4720e0caaa60f1ed",
+    "evidence/foundation/module-layers/policy.json": "5d06cf3495a93ed861610f3af83392485e5fa36a5e7c181169b7e6a8034a3215",
+    "src/cached_lookup.rs": "a97db58064eed4f959dc28e55d8988795b5df50d6d56a8d2fc801f69ead3d57c",
+    "src/effect_tests.rs": "f011c7367431f2c8e2af8c6d30a52ad3d5733951e9b30b358558d6dda66e7d1f",
+    "src/effects.rs": "8a0517ca58b12cf6d254eca5b377add82e693f1b9e34753658dd57ead450a37b",
+    "src/fanout_tests.rs": "74bde3e27774084188cccc3d52f179b822d58b41802f65b1e2ac543f9179372d",
+    "src/feature.rs": "ffda2a6b48136acff6648485977302a01ca7f7cd02efc34c0ed4b5bb726ffcbb",
+    "src/furnace_cache_tests.rs": "63efbbb7595066b8f3395239078f7aa0e84febc8a6fa73890c77c05a62f8866f",
+    "src/java_compat.rs": "2060cfd3a8a48e7d66415eb9324c41c409a7b47cf22e567cc9ba7a3b5b7aef3b",
+    "src/landing.rs": "72dc8d0f297d8a686dff1fb809763a6e4bd35d89dd5c2ed28bd04c21429b1020",
+    "src/landing_types.rs": "92bc97e031459851e9e1877eb7856f0bb83ca93d468771b19221637c742a4d93",
+    "src/light_pack_tests.rs": "8e2394f0d1a8fb49ee9fbd2fd08ba8f161a5cf47c370c2dd4fbf4180e4b57329",
+    "src/main.rs": "ebf78e6ef76cd900dd9011faa409dba39899896316b8154f1695ae56faaf7a5c",
+    "src/merge_tests.rs": "e4a7810ff24a52d7e2a5a886e14e5aab2e5f99bee6c98a33589d5f6119c402bd",
+    "src/persistence_tests.rs": "5b7bfd14cd3dd0f753ed11fe8eb490e01b66f13baab2114ba5023c31583092a3",
+    "src/registry_tests.rs": "b520bc552605e1a54c550b7f3d498cefdb513233c48b807a14a16bd2378d405f",
+    "src/test_support.rs": "4b6fea4acb39732d91ef51dbd2750bede3467a839afbac80aa3b76b7003f1f6f",
+    "src/tick_queue.rs": "7ee53868580850f4375e83879e69b8d5f53bf72462804722a42f56749b1ca76c",
+    "src/tick_tests.rs": "bb4704114ec5645f30d9a9bd19ce0d6fa709948ee87a33ac0fbe9cf44b788575",
+    "src/tree.rs": "957f9554c134b4378210568dbb11a85e8808f4370ab850a8fc2954067f397a00",
+    "src/world_rng.rs": "49a023374735dd23b9806c4f08510793380441b7c8a1a0a3596d640f262210ba",
+    "src/worldgen.rs": "27a99affe8f8ebd10c38aeddf6fcdfa133cbd8c0832f987adbcfbec1c49b8648",
+    "tests/layers_gate_test.py": "6beff2725da3affcee4f2767bcf6a9fc21a28d971bee21ab30c47d5f03045efb"
+  },
+  "ownership": "Shared message definitions only; no additional world/thread/callback state; no old definitions or reexports",
+  "source_graph": {
+    "modules": 11,
+    "edges": 18,
+    "remaining_errors": [
+      [
+        "cycle",
+        "feature"
+      ],
+      [
+        "layer-violation",
+        "tree"
+      ],
+      [
+        "layer-violation",
+        "worldgen"
+      ]
+    ]
+  },
+  "verification": {
+    "full_verify_exit": 0,
+    "source_control_methods": 13,
+    "live_landing_tests": 2,
+    "mandatory_mutants": 22,
+    "not_a_gate": 0,
+    "parked": 0,
+    "skipped": 0,
+    "rust_suite": "113 passed, 1 preexisting ignored"
+  },
+  "independent_review": "Operational landing/backend source identical after name normalization; no scoped defects found. Main execution supplied compilation and runtime controls.",
+  "nonclaims": [
+    "all H complete",
+    "live Java mod callback integration newly exercised",
+    "vanilla parity",
+    "representative performance"
+  ]
+}

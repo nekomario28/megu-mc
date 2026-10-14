@@ -81,3 +81,11 @@ private診断機能の使用は解析子プロセスとmc_spine crateに限定�
 全循環成分を報告するgxkit修正を独立レビューしてPR #4へ出し、CIは正確な公開commitに固定した。
 必須negative probeにも2つの循環を入れ、1つしか報告しない旧ツールを拒否する。
 新たに見えたjava_compat/landingの循環はHの対象へ加える。Lの緑をHの解決とは呼ばない。
+
+## メッセージ型を呼出元の実装へ依存させない（H-Interop、sound、high）
+
+dispatcherはJava backendを起動する一方、backendはdispatcher内のメッセージ型を使っていた。
+値の型だけを共有の下位所有者へ移す。世界・スレッド・callbackの状態や選択処理は移さない。
+元の型定義と旧パスの再exportは残さず、実際の両消費者を新所有者へ結ぶ。
+source graphから逆依存を消し、再追加した実ソースで循環を検出する回帰を置く。
+これはInteropの解消であり、生成系の残り3指摘を解消したとはしない。

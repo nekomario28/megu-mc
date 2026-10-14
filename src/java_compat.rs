@@ -1,4 +1,5 @@
 //! One JVM owner and guarded Rust world ABI for pinned Fabric and NeoForge operations.
+use crate::landing_types::{Loader, Request, Trample};
 use jni::{
     objects::{JClass, JObject, JValue},
     sys::{jboolean, jint},
@@ -16,7 +17,7 @@ static TRAMPLE: OnceLock<bool> = OnceLock::new();
 static OWNER: OnceLock<ThreadId> = OnceLock::new();
 static SERVER: OnceLock<bool> = OnceLock::new();
 static COMMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static ACTIVE: std::sync::Mutex<Option<super::landing::Trample>> = std::sync::Mutex::new(None);
+static ACTIVE: std::sync::Mutex<Option<Trample>> = std::sync::Mutex::new(None);
 fn on_owner(env: &mut JNIEnv) -> bool {
     if OWNER.get() == Some(&thread::current().id()) {
         return true;
@@ -260,8 +261,8 @@ fn initialize_fabric(
 }
 pub fn serve(
     classpath_file: &str,
-    loader: super::landing::Loader,
-    receive: std::sync::mpsc::Receiver<super::landing::Request>,
+    loader: Loader,
+    receive: std::sync::mpsc::Receiver<Request>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let started = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -281,11 +282,11 @@ pub fn serve(
         let mut env = jvm.attach_current_thread()?;
         let setup = (|| -> Result<jni::objects::GlobalRef, Box<dyn std::error::Error>> {
             let bootstrap = match loader {
-                super::landing::Loader::Fabric => {
+                Loader::Fabric => {
                     initialize_fabric(&mut env, &classpath, true)?;
                     "net/mcspine/probe/Bootstrap"
                 }
-                super::landing::Loader::NeoForge => {
+                Loader::NeoForge => {
                     let directory =
                         JObject::from(env.new_string(std::env::current_dir()?.to_string_lossy())?);
                     let host = env

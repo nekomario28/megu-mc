@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "java-compat")]
 mod java_compat;
+mod landing_types;
 mod landing;
 #[cfg(test)]
 mod light_pack_tests;
