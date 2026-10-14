@@ -10,8 +10,8 @@ Status: 調査。**設計のみ参照。コードは写さない。**
 | **Lithium** | `github.com/CaffeineMC/lithium`（branch `develop`） | **LGPL-3.0** | 同上 |
 | **FerriteCore** | `github.com/malte0811/FerriteCore` | README のみ取得 | 同上 |
 
-[issue #3](../../../../../../work/) の Pumpkin と同じ扱い。**高レベルの設計と
-「何が遅いか」の記述のみ**を参照し、実装は独立に書く。
+**issue #3**（Pumpkin、GPL-3.0）で定めた扱いと同じ。
+**高レベルの設計と「何が遅いか」の記述のみ**を参照し、実装は独立に書く。
 
 ## 最も重要な事実：vanilla 1.20+ は Starlight の方式を取り込んでいる
 
