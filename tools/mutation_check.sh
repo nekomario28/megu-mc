@@ -35,6 +35,7 @@ fi
 passed=0
 failed=0
 skipped=0
+parked=0
 log=$(mktemp)
 
 restore() {
@@ -86,6 +87,13 @@ PY
     echo "FAIL  $name"
     echo "      '$test_filter' matched no test, so nothing was checked."
     failed=$((failed + 1))
+  elif [ "$status" = green ] && grep -qE 'test result: ok\. 0 passed; 0 failed; [1-9][0-9]* ignored' "$log"; then
+    # The test ran nothing because it is parked with #[ignore]. That is neither a gate nor a silent
+    # pass: it is a named gap, and it has to be loud in the summary or parking becomes a way to make
+    # this job green. Check the count of parked gates, not just the fact that there are some.
+    echo "PARK  $name"
+    echo "      '$test_filter' is #[ignore]d, so the mutation had nothing to hit. See specs/PLAN.md."
+    parked=$((parked + 1))
   elif [ "$status" = green ]; then
     echo "FAIL  $name"
     echo "      '$test_filter' stayed green with the implementation broken. That test is not a gate."
@@ -141,5 +149,8 @@ check "a falling block does not move while it is only scheduled" \
   sand_falls_one_block_a_tick_until_it_lands
 
 echo
-echo "mutation check: $passed proved, $failed not a gate, $skipped skipped"
+echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
+if [ "$parked" -gt 0 ]; then
+  echo "  $parked gate(s) are parked and prove nothing until they run again."
+fi
 [ "$failed" -eq 0 ]
