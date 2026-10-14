@@ -12,7 +12,7 @@ fn furnace(input_count: u8) -> Furnace {
 
 #[test]
 fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (old_hot, old_warm) = test_region();
@@ -47,7 +47,7 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
 
 #[test]
 fn region_membership_matches_hot_plus_skirt_across_input_changes() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     assert!(clients().lock().unwrap().is_empty());
     let old_actors = std::mem::take(&mut *actors().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -119,7 +119,7 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
 
 #[test]
 fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     // 20 game ticks per real second is the invariant the world clock must keep.
     // A cadence change is only coherent if this product stays 20.
     assert_eq!(TICKS_PER_SECOND * GAME_TICKS_PER_TICK, 20);
@@ -145,7 +145,7 @@ fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
 
 #[test]
 fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let (client, mut receiver) = client_pair();
     let old_clients = std::mem::take(&mut *clients().lock().unwrap());
     let old_tick = TICK.swap(0, Ordering::Relaxed);
@@ -262,7 +262,7 @@ fn per_tick_rates_keep_the_same_chance_per_real_second() {
 
 #[test]
 fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_primed = std::mem::take(&mut *primed().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
@@ -308,7 +308,7 @@ fn tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold() {
 
 #[test]
 fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_drops = std::mem::take(&mut *drops().lock().unwrap());
     let old_xps = std::mem::take(&mut *xps().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -366,7 +366,7 @@ fn air_supply_is_derived_everywhere_a_creature_is_constructed() {
     // the reset paths had been converted, not the construction sites.
     assert_eq!(AIR_SUPPLY_GT, 300);
     assert_eq!(server_ticks(AIR_SUPPLY_GT) * TICK_MS, 15_000);
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
@@ -450,7 +450,7 @@ fn tick_pacing_holds_cadence_and_refuses_to_catch_up() {
 #[test]
 #[ignore = "explicit release-profile run from the isolated tick profiler"]
 fn profile_game_tick() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let scratch = std::env::var("MC_SPINE_TICK_PROFILE_DIR").expect("use the isolated profiling runner");
     assert_eq!(std::env::current_dir().unwrap(), std::path::PathBuf::from(scratch));
     assert_ne!(std::env::current_dir().unwrap(), std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
@@ -574,7 +574,7 @@ fn profile_game_tick() {
 /// applies drag to the displacement.
 #[test]
 fn the_production_arrow_loop_decays_horizontal_velocity() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
@@ -623,7 +623,7 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
 /// gate for the migration, not a parity claim.
 #[test]
 fn water_spread_trace_is_stable_across_the_scheduler_migration() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_waters = std::mem::take(&mut *waters().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
@@ -700,7 +700,7 @@ fn water_spread_trace_is_stable_across_the_scheduler_migration() {
 /// and a missed re-queue would silently stop a hopper moving items.
 #[test]
 fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_hoppers = std::mem::take(&mut *hoppers().lock().unwrap());
     let old_chests = std::mem::take(&mut *chests().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -750,7 +750,7 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
 /// conversion is exact rather than an approximation.
 #[test]
 fn lava_spread_trace_is_stable_across_the_scheduler_migration() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_lavas = std::mem::take(&mut *lavas().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);
@@ -799,7 +799,7 @@ fn lava_spread_trace_is_stable_across_the_scheduler_migration() {
 /// is the opposite of being woken. This is the regression for that.
 #[test]
 fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let pos = (3, 70, 3);
     // Park the cell far out in the queue, as a backed-off cell would be.
     water_queue().lock().unwrap().schedule(pos, tick_queue::MAX_DELAY);
@@ -824,7 +824,7 @@ fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
 /// (lava was thirty times too slow before), so it is pinned directly.
 #[test]
 fn a_periodic_system_expresses_its_backoff_in_invocations() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let pos = (11, 70, 11);
     let period = server_ticks(FLUID_TICK_GT);
     // How many invocations pass before the cell comes due.
@@ -860,7 +860,7 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
 /// the first consumer of the stream.
 #[test]
 fn sixteen_random_ticks_raise_sugar_cane_one_block() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (old_hot, old_warm) = test_region();
     let top = 150;
@@ -920,7 +920,7 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
 /// nothing, and that is what makes it safe to compute unconditionally.
 #[test]
 fn measure_the_light_cost_per_chunk() {
-    let _g = WORLD_TEST_LOCK.lock().unwrap();
+    let _g = world_guard();
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     forceloaded().lock().unwrap().insert((0, 0));
     refresh_hot();
@@ -1097,7 +1097,7 @@ fn measure_the_light_cost_per_chunk() {
 /// queue is filled by a block change rather than by a scan, and the block moves one cell a tick.
 #[test]
 fn sand_falls_one_block_a_tick_until_it_lands() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -1117,7 +1117,8 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
     // earlier version dropped it to the floor inside this very call through a second gravity
     // implementation, which made the count below read one and hid the duplicate.
     set_block(3, base + 2, 3, 0);
-    note_falling_above(3, base + 2, 3);
+    // Nothing schedules the queue here by hand: set_block has to reach it on its own. Calling the
+    // scheduler explicitly would keep this test green over a placement that never queues at all.
     assert!(!falling().lock().unwrap().is_empty(), "the sand must be queued");
     assert_eq!(name(base + 3), "minecraft:sand", "scheduling a fall must not move the block");
 
@@ -1148,7 +1149,7 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
 /// block it never showed, because the check returns before locking when there is nothing above.
 #[test]
 fn two_stacked_sand_blocks_fall_without_deadlocking() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
@@ -1188,10 +1189,44 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     set_test_region(oh, ow);
 }
 
-
-
-
-
-
-
-
+/// Placing a gravity block in mid-air changes that cell and leaves everything under it untouched,
+/// so a scheduler that only looked at the cell above would leave it hanging forever. Every falling
+/// block name from the asset is walked here, because the registry test alone cannot tell whether a
+/// name that is classified as falling is also scheduled and moved - reverting the tick to a hand
+/// list of three states kept that test green.
+#[test]
+fn every_falling_block_is_scheduled_and_moves_one_cell() {
+    let _g = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (oh, ow) = test_region();
+    let reg = crate::feature::breg().unwrap();
+    let names: std::collections::BTreeSet<String> = (0..reg.state_count() as u32)
+        .filter(|&st| reg.behaviour_of(st) == crate::feature::B_FALLING)
+        .map(|st| reg.name_of(st).trim_start_matches("minecraft:").to_string())
+        .collect();
+    assert_eq!(names.len(), 19, "the asset set changed: {names:?}");
+    let base = 150;
+    let mut x = 20;
+    for n in &names {
+        x += 2;
+        let st = name_to_state(n).unwrap_or_else(|| panic!("{n} must be a placeable block"));
+        for y in base..=base + 4 {
+            set_block(x, y, 9, 0);
+        }
+        set_block(x, base, 9, name_to_state("stone").unwrap());
+        *falling().lock().unwrap() = Vec::new();
+        set_block(x, base + 3, 9, st);
+        assert!(!falling().lock().unwrap().is_empty(), "{n} placed in mid-air must be scheduled");
+        falling_tick();
+        assert_eq!(
+            reg.name_of(block_at(x, base + 2, 9)).trim_start_matches("minecraft:"),
+            n.as_str(),
+            "{n} must fall one cell"
+        );
+        assert_eq!(block_at(x, base + 3, 9), 0, "{n} must leave nothing where it was");
+    }
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}

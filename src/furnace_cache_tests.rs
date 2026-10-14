@@ -198,7 +198,7 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
 
 #[test]
 fn cached_tick_matches_v237_with_input_output_recipe_and_tag_changes() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     for scenario in 0..3 {
         let expected = run(scenario, reference_tick);
         let actual = run(scenario, furnace_tick);
@@ -251,7 +251,7 @@ fn fuel_miss_does_not_delay_valid_fuel() {
 /// its single exit.
 #[test]
 fn a_content_reload_invalidates_cached_smelting() {
-    let _guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _guard = world_guard();
     // `Ingr` is not Clone, so the pack recipe is appended and then truncated off
     // rather than saved and restored.
     let len_before = json_smelts().lock().unwrap().len();
@@ -292,7 +292,7 @@ fn a_content_reload_invalidates_cached_smelting() {
 /// which is why the cache holds several entries now.
 #[test]
 fn cached_smelting_beats_rescanning_datapack_recipes() {
-    let _guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _guard = world_guard();
     let len_before = json_smelts().lock().unwrap().len();
     // Recipes that match nothing under test, so every scan runs to the end.
     for i in 0..40i64 {

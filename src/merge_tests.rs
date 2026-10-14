@@ -3,7 +3,7 @@ use super::*;
 // The production merge is exercised through drop_tick, so this drives the same
 // code path rather than a reimplementation of it.
 fn merge_outcome(items: Vec<Drop>) -> Vec<(i32, i64, u8)> {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_drops = std::mem::take(&mut *drops().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_tick = TICK.swap(1, Ordering::Relaxed);

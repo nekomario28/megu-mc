@@ -82,7 +82,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
 
 #[test]
 fn met4_round_trip_preserves_drop_components_age_and_mob_air() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let full_air = server_ticks(300) as i32;
     let loaded = round_trip(None, 150, 3);
     assert_eq!(loaded, Loaded {
@@ -99,7 +99,7 @@ fn met4_round_trip_preserves_drop_components_age_and_mob_air() {
 
 #[test]
 fn met2_without_mob_air_falls_back_to_a_full_supply() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     // MET2 never carried air. The loader must substitute the vanilla air supply
     // rather than a zero that would drown the mob on its first tick.
     let loaded = round_trip(Some(b"MET2"), 0, 3);
@@ -109,7 +109,7 @@ fn met2_without_mob_air_falls_back_to_a_full_supply() {
 
 #[test]
 fn legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     // The 20TPS cutover made one tick 50ms. A MET3 file that stored a drop age of
     // 300000 ms read as ticks would sit at 300000 ticks against a 6000 tick life
     // and despawn on the first tick, destroying every saved drop.
@@ -121,7 +121,7 @@ fn legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning() {
 
 #[test]
 fn negative_drop_age_survives_a_save_reload_round_trip() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     // A container close records the pickup-delay marker as a negative age. The
     // old loader clamped it to a full lifespan, so the drop despawned on the
     // next tick after every restart.
@@ -153,7 +153,7 @@ fn hostile_rotation_does_not_collapse_to_one_type() {
 /// times early, so each counter must be divided by the cadence ratio.
 #[test]
 fn legacy_persisted_durations_resume_with_their_original_wall_time() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     // The conversion factor itself, stated in the unit the file used.
     assert_eq!(legacy_ticks(1000, true), 1000 / TICK_MS);
     assert_eq!(legacy_ticks(1000, false), 1000, "MET4 values must pass through untouched");
@@ -178,7 +178,7 @@ fn legacy_persisted_durations_resume_with_their_original_wall_time() {
 
 #[test]
 fn met4_round_trip_leaves_persisted_durations_untouched() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     // A MET4 save writes server ticks, so loading it must not rescale anything.
     let loaded = round_trip(None, 150, 600);
     assert_eq!(loaded.drop_age, 600, "MET4 ages must pass through unconverted");
@@ -189,7 +189,7 @@ fn met4_round_trip_leaves_persisted_durations_untouched() {
 /// re-checked after the VarInt is consumed.
 #[test]
 fn truncated_component_blobs_do_not_panic_the_loader() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     // Every truncation of a valid component record must either parse or stop.
     let mut full = Vec::new();
     write_comps(&mut full, &vec![(2i64, b"{\"text\":\"x\"}".to_vec()), (9i64, vec![0u8; 8])]);
@@ -222,7 +222,7 @@ fn truncated_component_blobs_do_not_panic_the_loader() {
 /// from the very save that produced it, so a resting trident was lost on restart.
 #[test]
 fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
-    let _world_guard = WORLD_TEST_LOCK.lock().unwrap();
+    let _world_guard = world_guard();
     let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
     let old_drops = std::mem::take(&mut *drops().lock().unwrap());
     arrows().lock().unwrap().push(Arrow { eid: 7001, owner: 1, x: 1.5, y: 70.0, z: 1.5,

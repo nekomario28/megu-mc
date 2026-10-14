@@ -730,7 +730,7 @@ fn sky_light_reads_lit_at_the_surface_and_dark_under_it() {
     // No region or forceload setup: sky light reads the world through block_at and
     // height_at, so it does not depend on the region. Touching the region here without
     // restoring it polluted the fixture for every test that ran after this one.
-    let _g = WORLD_TEST_LOCK.lock().unwrap();
+    let _g = world_guard();
     let surface = height_at(5, 7);
     let secs = sky_light_sections(0, 0);
     let nibble = |y: i32, lx: usize, lz: usize| -> u8 {

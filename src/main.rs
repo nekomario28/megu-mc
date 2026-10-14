@@ -3843,10 +3843,6 @@ fn block_at(x: i32, y: i32, z: i32) -> u32 {
         .and_then(|c| c.get(&local_idx(x, y, z)).copied())
         .unwrap_or_else(|| base_state(x, y, z))
 }
-/// `block_at` for a caller that already holds the world lock. A pass that reads thousands of
-/// cells takes and releases the mutex that many times otherwise, which is what dominates the
-/// block light spread. Safe to combine with `base_state`: it and its dependencies do not take
-/// the world lock, so there is no re-entry.
 fn set_block(x: i32, y: i32, z: i32, st: u32) {
     set_block_if(x, y, z, st, None);
 }
@@ -4039,18 +4035,28 @@ fn fallable(x: i32, y: i32, z: i32) -> bool {
 /// Queue the block above a change if that change took its support away. Vanilla does this from
 /// the neighbour update; here it is the same place, so a falling block is scheduled exactly when
 /// something under it changes and never on a scan.
-fn note_falling_above(x: i32, y: i32, z: i32) {
+/// Schedules a fall for the cell above and for the cell itself, if either is a gravity block that
+/// has nothing under it. Called from every block change, so one place covers both directions.
+///
+/// The cell itself is not optional: placing a gravity block in mid-air, or pushing one there with a
+/// piston, changes that cell while leaving everything under it untouched, and a check that only
+/// looked upward left the block hanging.
+fn note_falling(x: i32, y: i32, z: i32) {
     let Some(reg) = crate::feature::breg() else { return };
-    if !fallable(x, y, z) {
-        return;
+    let mut schedule = |px: i32, py: i32, pz: i32| {
+        let mut f = falling().lock().unwrap();
+        if !f.contains(&(px, py, pz)) {
+            f.push((px, py, pz));
+        }
+    };
+    if y > MIN_Y
+        && reg.behaviour_of(block_at(x, y, z)) == crate::feature::B_FALLING
+        && fallable(x, y - 1, z)
+    {
+        schedule(x, y, z);
     }
-    let above = block_at(x, y + 1, z);
-    if reg.behaviour_of(above) != crate::feature::B_FALLING {
-        return;
-    }
-    let mut f = falling().lock().unwrap();
-    if !f.contains(&(x, y + 1, z)) {
-        f.push((x, y + 1, z));
+    if fallable(x, y, z) && reg.behaviour_of(block_at(x, y + 1, z)) == crate::feature::B_FALLING {
+        schedule(x, y + 1, z);
     }
 }
 
@@ -4099,7 +4105,7 @@ fn falling_tick() {
 fn block_updated_inner(x: i32, y: i32, z: i32) {
     // A block losing its support falls. Checked here rather than by scanning, because this is
     // called exactly when something under it changed.
-    note_falling_above(x, y, z);
+    note_falling(x, y, z);
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [(0,0,0),(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
         let (bx, by, bz) = (x + dx, y + dy, z + dz);
@@ -14505,6 +14511,15 @@ pub fn test_region_warm_remove(c: &(i32, i32)) { region().lock().unwrap().warm.r
 // Hold across setup, tick execution and restoration of shared world fixtures.
 #[cfg(test)]
 static WORLD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// The world lock, taken with any poison cleared. A test that fails while holding it would
+/// otherwise poison the mutex, and every later test would fail on its own unwrap - one real failure
+/// turned into thirty, which is what a red suite has to make impossible to misread. The lock exists
+/// to stop two tests touching the world at once, and a test that has finished cannot do that.
+#[cfg(test)]
+fn world_guard() -> std::sync::MutexGuard<'static, ()> {
+    WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 #[cfg(test)]
 mod fanout_tests;
 #[cfg(test)]
