@@ -43,3 +43,42 @@ inspect: 13 problems (3 errors)
 
 **教訓**：**ツールの info は「コードが悪い」ではなく「私のモデルが不完全」であることが多い。**
 今日、protogx でも同じ形を3回踏んだ（毎回コードの方が寛容だった）。
+
+---
+
+## 目標の層を**実装前に**証明した（`deps_target.py` → no problems）
+
+**循環の原因は、`feature.rs` が2つのものを兼ねていることである。**
+
+| 兼ねているもの | 本来の向き |
+|---|---|
+| **ブロック registry**（`breg` / `name_to_state` / `is_solid` / …） | **最下層**。生成の層が依存してよい |
+| **feature/config 系**（`Cf` の言語・配置） | 生成の層の**上**。木を生成するので `tree` に依存する |
+
+**`feature → tree` の実参照は4箇所だけ**である：
+
+| 行 | 内容 |
+|---|---|
+| 8 | `use crate::worldgen::*;`（実際に使うのは `Gen` / `default_state` / `surface` / `load` 程度） |
+| 1243 | `Tree(Box<crate::tree::TreeExtra>)` — config の変種 |
+| 1422 | `crate::tree::p_tree(j)?` — config の解釈 |
+| 2157 | `crate::tree::gen_tree(ctx, rng, pos, t)` — **木の生成** |
+
+`min_y` の22件は**ローカル引数**であり、モジュール参照ではない（数え間違い）。
+
+**提案（低い層から）**：
+
+```
+feature (registry)
+  → worldgen          (地形; ブロックIDが要る)
+  → tree              (木の形; 地形とブロックIDが要る)
+  → featuredefs       (config 言語と配置; 木を生成する)
+  → main
+```
+
+**`deps_target.py` を depsgx にかけると `inspect: no problems`。**
+**実装前に、目標の層が無循環であることが機械的に確認できた。**
+
+**次の一手**：`feature.rs` から config/config 解釈/配置（`Cf`、`p_*`、`gen_*`）を
+`featuredefs.rs` へ移す。**1 community = 1 コミット**、テストが緑のまま、
+**移すたびに `depsgx inspect deps.py` の error が減ることを確認する。**
