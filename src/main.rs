@@ -8354,6 +8354,10 @@ fn block_light_sections_from(
     let y1 = (by1 + 15).min(MIN_Y + 383);
     let (w, d, h) = ((x1 - x0 + 1) as usize, (z1 - z0 + 1) as usize, (y1 - y0 + 1) as usize);
     let mut light = vec![0u8; w * d * h];
+    // Opacity, read once per cell rather than once per neighbour. A visited cell is asked about
+    // by each of its six neighbours, so the spread was reading the world six times for values it
+    // had already seen. 0xff means "not looked up yet"; opacity is 0..15.
+    let mut op = vec![0xffu8; w * d * h];
     let idx = |x: i32, y: i32, z: i32| ((y - y0) as usize * d + (z - z0) as usize) * w + (x - x0) as usize;
     let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> = std::collections::VecDeque::new();
     for (p, l) in &live {
@@ -8372,11 +8376,18 @@ fn block_light_sections_from(
             if qx < x0 || qx > x1 || qz < z0 || qz > z1 || qy < y0 || qy > y1 {
                 continue;
             }
-            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));
+            let i = idx(qx, qy, qz);
+            let o = if op[i] == 0xff {
+                let v = opacity(qx, qy, qz);
+                op[i] = v;
+                v
+            } else {
+                op[i]
+            };
+            let nl = level.saturating_sub(o.max(1));
             if nl == 0 {
                 continue;
             }
-            let i = idx(qx, qy, qz);
             if light[i] >= nl {
                 continue;
             }
