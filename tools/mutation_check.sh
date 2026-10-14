@@ -40,7 +40,15 @@ log=$(mktemp)
 
 restore() {
   if [ -n "${backup:-}" ] && [ -f "$backup" ]; then
-    mv "$backup" "$mut_file"
+    # Copy, then touch, rather than mv. `mv` gives the file back the backup's timestamp, which is
+    # older than the test binary just built from the mutated source, so cargo decides it is up to
+    # date and keeps using that binary. Every test run after a mutation check then measures the
+    # mutation - which is exactly how three falling tests appeared to fail deterministically at
+    # eight threads, and why blaming "a leftover mutation" was right about the cause and wrong
+    # about the mechanism. The source is correct on disk; the binary was not rebuilt from it.
+    cp "$backup" "$mut_file"
+    rm -f "$backup"
+    touch "$mut_file"
   fi
 }
 trap 'restore; rm -f "$log"' EXIT
