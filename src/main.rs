@@ -30,6 +30,13 @@ fn read_varint(b: &mut &[u8]) -> Option<i64> {
         i += 1;
     }
 }
+/// Protocol VarInt is at most five bytes; the save reader also supports wider values.
+fn read_protocol_i32(b: &mut &[u8]) -> Option<i32> {
+    let before = b.len();
+    let value = read_varint(b)?;
+    if before - b.len() > 5 || value > u32::MAX as i64 { return None; }
+    Some(value as u32 as i32)
+}
 fn write_varint(out: &mut Vec<u8>, v: i64) {
     // i32-range negatives encode as VarInt (5-byte u32 LEB128); wider as VarLong.
     // (arithmetic `>>=` on a negative i64 loops forever -> unbounded Vec growth)
@@ -8928,16 +8935,25 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
     p
 }
 
-/// The view distance out of a Client Information packet: a length-prefixed locale string, then one
-/// byte. Ignoring this packet is why the server streamed a fixed window while Join Game advertised
-/// eight - the client believed it held chunks it had never been sent.
+const SERVER_VIEW_DISTANCE: i32 = 8;
+
+/// Decode protocol 767 Client Information; view distance is a signed Byte.
+/// The connection bounds the requested value, not the packet decoder.
 fn client_info_view_distance(body: &[u8]) -> Option<i32> {
-    let mut p = 0usize;
-    let len = rv_varint(body, &mut p);
-    if len < 0 { return None }
-    p += len as usize;
-    let v = *body.get(p)? as i32;
-    Some(v.clamp(0, 32))
+    let mut p = body;
+    let len = usize::try_from(read_protocol_i32(&mut p)?).ok()?;
+    if len > 64 || p.len() < len { return None; }
+    let locale = std::str::from_utf8(&p[..len]).ok()?;
+    if locale.encode_utf16().count() > 16 { return None; }
+    p = &p[len..];
+    let view = *p.first()? as i8 as i32;
+    p = &p[1..];
+    if !(0..=2).contains(&read_protocol_i32(&mut p)?) { return None; } // chat mode
+    if p.len() < 2 { return None; }
+    p = &p[2..]; // chat colours and skin parts
+    if !(0..=1).contains(&read_protocol_i32(&mut p)?) { return None; } // main hand
+    if p.len() != 2 { return None; } // filtering and server listings
+    Some(view)
 }
 
 fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i32)>, ccx: i32, ccz: i32, view: i32) {
@@ -8981,7 +8997,7 @@ fn join_game() -> Vec<u8> {
     p.push(0);
     write_varint(&mut p, 1); write_str(&mut p, "minecraft:overworld");
     write_varint(&mut p, 20);
-    write_varint(&mut p, 8);
+    write_varint(&mut p, SERVER_VIEW_DISTANCE as i64);
     write_varint(&mut p, 8);
     p.push(0); p.push(1); p.push(0);
     p.extend_from_slice(&spawn_info());
@@ -11849,10 +11865,10 @@ fn handle(mut s: TcpStream) {
     while Instant::now() - t0 < Duration::from_secs(15) {
         match read_packet(&mut s, login_deadline) {
             Some((0x00, b)) => {
-            if let Some(v) = client_info_view_distance(&b) { client_view = v; }
-            continue;
-        }
-        Some((0x07, _)) => { got_selpacks = true; break }
+                let Some(v) = client_info_view_distance(&b) else { return; };
+                client_view = v;
+            }
+            Some((0x07, _)) => { got_selpacks = true; break }
             Some(_) => continue,
             None => continue,
         }
@@ -11867,6 +11883,10 @@ fn handle(mut s: TcpStream) {
     loop {
         if Instant::now() - t0 > Duration::from_secs(15) { return }
         match read_packet(&mut s, login_deadline) {
+            Some((0x00, b)) => {
+                let Some(v) = client_info_view_distance(&b) else { return; };
+                client_view = v;
+            }
             Some((0x03, _)) => break,
             Some(_) => continue,
             None => continue,
@@ -11890,10 +11910,7 @@ fn handle(mut s: TcpStream) {
         }
     }
     let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-    // Join Game advertises a view distance of 8, so that is the server's own limit; a client asking
-    // for less is honoured down to 2.
-    let server_view: i32 = 8;
-    let view = client_view.min(server_view).max(2);
+    let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
     // vanilla: a returning player resumes where they logged out — the
     // chunk window, spawn teleport and authoritative pos all agree.
     let (sx, sy, sz, syaw, spitch) = pos_store().lock().unwrap().get(&name)
@@ -12019,6 +12036,17 @@ fn handle(mut s: TcpStream) {
         };
 
         match pid {
+            0x0a => {
+                let Some(requested) = client_info_view_distance(&b) else { break 'conn; };
+                let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);
+                if effective != view {
+                    view = effective;
+                    let (x, _, z, _, _, _) = *me.pos.lock().unwrap();
+                    let mut chunks = me.chunks.lock().unwrap();
+                    stream_chunks(&mut *me.sock.lock().unwrap(), &mut chunks,
+                        (x / 16.0).floor() as i32, (z / 16.0).floor() as i32, view);
+                }
+            }
             0x1a | 0x1b => { // position / position_look: f64 x,y,z first
                 if b.len() >= 24 {
                     let px = f64::from_be_bytes(b[..8].try_into().unwrap());

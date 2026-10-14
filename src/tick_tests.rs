@@ -1325,28 +1325,27 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
     assert_eq!((ground[0].item, ground[0].cnt, &ground[0].comps), (stack.0, stack.1, &stack.2));
 }
 
-/// The view distance sits after the locale string in a Client Information packet. Reading it is what
-/// lets the server stream as far as the client asked: the window used to be a fixed four chunks
-/// while Join Game advertised eight, so a client believed it held chunks it had never been sent.
 #[test]
 fn client_information_carries_the_view_distance_after_the_locale() {
-    let mut body = Vec::new();
-    write_varint(&mut body, 2); // locale length
-    body.extend_from_slice(b"en");
-    body.push(12); // view distance
-    body.extend_from_slice(&[0, 1, 0, 127, 1, 0, 1, 0]); // chat mode, colours, skin parts, ...
-    assert_eq!(client_info_view_distance(&body), Some(12), "the byte after the locale");
-
-    // Clamped, so a client cannot ask for a window the server will not build.
-    let mut big = Vec::new();
-    write_varint(&mut big, 2);
-    big.extend_from_slice(b"en");
-    big.push(200);
-    assert_eq!(client_info_view_distance(&big), Some(32), "clamped to the maximum");
-
-    // A body that ends before the field is a parse failure, not a guess.
-    let mut short = Vec::new();
-    write_varint(&mut short, 2);
-    short.extend_from_slice(b"en");
-    assert_eq!(client_info_view_distance(&short), None, "no view distance byte present");
+    let body = |locale: &str, view: i8| {
+        let mut b = Vec::new();
+        write_str(&mut b, locale);
+        b.push(view as u8);
+        b.extend_from_slice(&[0, 1, 127, 1, 0, 1]);
+        b
+    };
+    for view in [12, 127, -1, -128, 0] {
+        assert_eq!(client_info_view_distance(&body("en_us", view)), Some(view as i32));
+    }
+    let b = body("en_us", 2);
+    for end in 0..b.len() { assert_eq!(client_info_view_distance(&b[..end]), None); }
+    let mut oversized = vec![0x80; 5];
+    oversized.extend_from_slice(&body("", 2));
+    assert_eq!(client_info_view_distance(&oversized), None, "six-byte locale VarInt");
+    assert_eq!(client_info_view_distance(&body(&"a".repeat(17), 2)), None, "locale exceeds 16 UTF-16 units");
+    assert_eq!(client_info_view_distance(&body(&"😀".repeat(8), 2)), Some(2));
+    assert_eq!(client_info_view_distance(&body(&"😀".repeat(9), 2)), None);
+    let mut invalid_utf8 = b.clone();
+    invalid_utf8[1] = 0xff;
+    assert_eq!(client_info_view_distance(&invalid_utf8), None);
 }

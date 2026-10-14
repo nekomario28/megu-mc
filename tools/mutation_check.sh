@@ -37,6 +37,7 @@ failed=0
 skipped=0
 parked=0
 log=$(mktemp)
+artifacts=$(mktemp)
 
 # Content hash of the file as it was before the mutation. Restoring the bytes is the point;
 # restoring a timestamp is not, and neither is trusting that the restore worked. A mutation that
@@ -56,9 +57,9 @@ restore() {
     touch "$mut_file"
   fi
 }
-trap 'restore; rm -f "$log"' EXIT
+trap 'restore; rm -f "$log" "$artifacts"' EXIT
 
-# check <name> <file> <from> <to> <test-filter>
+# check <name> <file> <from> <to> <test-filter-or-wire-script>
 check() {
   local name="$1" mut_file_local="$2" from="$3" to="$4" test_filter="$5"
   mut_file="$mut_file_local"
@@ -86,8 +87,20 @@ PY
     return
   fi
 
-  local status
-  if cargo test ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"} "$test_filter" -- --test-threads=1 >"$log" 2>&1; then
+  local status compiled=yes
+  if [[ "$test_filter" == tests/*.py ]]; then
+    if cargo build ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"} --message-format=json-render-diagnostics >"$artifacts" 2>"$log"; then
+      local executable
+      if executable=$(python3 tools/cargo_executable.py <"$artifacts" 2>>"$log"); then
+        if python3 "$test_filter" "$executable" >>"$log" 2>&1; then status=green; else status=failed; fi
+      else
+        status=failed
+      fi
+    else
+      compiled=no
+      status=failed
+    fi
+  elif cargo test ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"} "$test_filter" -- --test-threads=1 >"$log" 2>&1; then
     status=green
   else
     status=failed
@@ -95,7 +108,7 @@ PY
 
   # cargo prints "error: test failed" for a failing test, so the exit code and the word error cannot
   # tell a compile failure from an assertion failure. The lines the harness itself prints can.
-  if grep -qE '^error\[' "$log"; then
+  if [ "$compiled" = no ] || grep -qE '^error\[' "$log"; then
     echo "FAIL  $name"
     echo "      the mutation did not compile, so no assertion ran. Narrow it."
     failed=$((failed + 1))
@@ -114,12 +127,13 @@ PY
     echo "FAIL  $name"
     echo "      '$test_filter' stayed green with the implementation broken. That test is not a gate."
     failed=$((failed + 1))
-  elif grep -qE 'test result: FAILED' "$log"; then
+  elif grep -qE 'test result: FAILED|^client settings wire: FAIL$' "$log"; then
     echo "ok    $name"
     passed=$((passed + 1))
   else
     echo "FAIL  $name"
-    echo "      the run neither compiled, matched, nor reported a failing test. Inspect $log."
+    echo "      the run neither compiled, matched, nor reported a failing test."
+    tail -15 "$log"
     failed=$((failed + 1))
   fi
   restore
@@ -207,8 +221,8 @@ check "a renamed block is still paired between the two assets" \
   every_wire_state_has_complete_metadata
 
 check "the client's view distance is read from its packet" \
-  src/main.rs '    p += len as usize;' \
-  '    p += len as usize + 1;' \
+  src/main.rs '    let view = *p.first()? as i8 as i32;' \
+  '    let view = *p.get(1)? as i8 as i32;' \
   client_information_carries_the_view_distance_after_the_locale
 
 check "containers must be decoded, not merely remain absent" \
@@ -235,6 +249,28 @@ check "property remapping cannot reuse positional state offsets" \
   src/feature.rs '        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;' \
   '        out = offset;' \
   property_names_and_values_determine_metadata_position
+
+check "configuration information before known packs reaches chunk streaming" \
+  src/main.rs '                client_view = v;
+            }
+            Some((0x07, _))' \
+  '                let _ = v;
+            }
+            Some((0x07, _))' \
+  tests/client_settings_wire.py
+
+check "configuration information after known packs reaches chunk streaming" \
+  src/main.rs '                client_view = v;
+            }
+            Some((0x03, _))' \
+  '                let _ = v;
+            }
+            Some((0x03, _))' \
+  tests/client_settings_wire.py
+
+check "play information reaches the live chunk window" \
+  src/main.rs '            0x0a => {' '            0x7f => {' \
+  tests/client_settings_wire.py
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

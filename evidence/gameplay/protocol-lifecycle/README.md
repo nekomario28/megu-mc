@@ -1,56 +1,24 @@
-# 接続ライフサイクルを protogx で検査した（prism より前）
+# 接続ライフサイクル：モデルと実通信を分ける
 
-`gxkit` の `protogx` はプロトコル/メッセージ状態機械を検査する
-（到達不能状態・未処理メッセージ・デッドロック・終端に到達できない状態）。
-**実クライアントを起動する前に、接続が進んで終われるかを証明できる。**
+`spine_proto.py` は `protogx inspect` で検査する手書きモデル。
+モデルが構造的に健全でも、実装のパケット符号化・タイムアウト・描画・
+vanillaとの一致は証明できない。以前の「接続できない原因は状態機械ではない」
+という結論は強すぎたため撤回する。
 
-## 結果：**0 problems**（構造的に健全）
+## 実装へ結びつける契約
 
-```
-protocol: 6 states, 15 transitions
-  14 messages, 0 requests
-```
-`inspect` は問題行を出さない（= 0 件）。
+protocol 767のClient Informationは、configurationでは `0x00`、playでは `0x0a`。
+configurationの両方の待機ループと、接続後のplayループがview distanceを消費する。
+localeは長さ制限付きUTF-8、長さは最大5バイトのVarInt、viewは**符号付きByte**。
+接続が保持する有効距離をサーバー上限と最小距離で制限し、変更時に同じ窓を
+送信にもアンロードにも使う。チャンク保持集合は既存の `Client.chunks` が唯一の所有者。
 
-**状態**：handshake / status / login / configuration / play / closed。
-`src/main.rs` の実装を読んで写した：
+`tests/client_settings_wire.py` は使い捨て世界で実サーバーへ接続し、
+両configuration段階からの設定、play中の拡大・縮小・符号付き入力・上限・
+移動後の更新に対して、実際に受信したチャンク座標を検査する。
+`mutation_check.sh` は各受信経路を無効化して、この試験が落ちることを要求する。
+Cargoの出力先が変更されても、Cargoが報告した実行ファイルを使う。
 
-| フェーズ | 実装 | 行 |
-|---|---|---|
-| handshake | `handshake_next_state()` が status(1) / login(2) を選ぶ | 11757 |
-| login | Login Start(0x00) → Login Success(0x02) → **Login Acknowledged(0x03)** | 11801–11808 |
-| configuration | `load_config_packets()` → **Select Known Packs(0x07) を15秒待つ** → Finish Configuration → **ack(0x03) を15秒待つ** | 11810–11841 |
-| play | `'conn` ループ | 11973– |
-
-**重要な事実**：configuration の2つのループは
-**`Some(_) => continue`** で**未知のパケットを無視する**（切断しない）。
-
-```rust
-Some((0x07, _)) => { got_selpacks = true; break }
-Some(_) => continue,
-```
-
-## 私のモデルは3回間違っており、毎回コードの方が寛容だった
-
-| 私が書いたこと | 実際 |
-|---|---|
-| `configuration` は **ack(0x03) 以外で切断する** | `Some(_) => continue` — **無視する** |
-| `Select Known Packs` は**未処理** | **専用の待ちループがある**（0x07 を15秒待つ） |
-| `status` が**デッドロック** | 私が遷移を書き忘れただけ |
-
-**この順序は重要である**：protogx の指摘は**まず自分のモデルの誤り**であり、
-**コードの欠陥と報告する前に、コードを読んで確かめる必要があった**。
-「ツールが赤を出した」は「コードが悪い」ではない。
-
-## 残る本当のギャップ（プロトコル破壊ではない）
-
-`Some(_) => continue` は**無視**であって処理ではない。したがって
-**`Client Information`（view distance・locale・skin parts）は捨てられている。**
-vanilla は view distance を使ってチャンク送信距離を決めるので、
-**これは挙動のギャップ**である（接続は壊れない）。PLAN に記録した。
-
-## これが「prism より前」である理由
-
-**実クライアントが繋がらない原因は、接続の状態機械ではない**と分かった。
-したがって次に疑うべきは**パケットのフィールド符号化・チャンクデータ・レジストリの中身**であり、
-クライアントを起動する前にサーバー側で潰せる候補が絞られた。
+この検査は合成クライアントによる通信の証拠であり、実ゲームクライアントの描画の
+証拠ではない。またview以外の設定値をすべてゲームへ反映する契約でもない。
+実クライアントの確認は `specs/close-defects/README.md` のCで別に追跡する。

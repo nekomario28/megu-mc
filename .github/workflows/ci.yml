@@ -29,11 +29,15 @@ jobs:
       - name: The module layering must be reachable
         run: bash tools/layers_check.sh
       - name: Build (locked)
-        run: cargo build --locked
+        run: |
+          cargo build --locked --message-format=json-render-diagnostics > build-artifacts.json
+          echo "MC_SPINE_TEST_BINARY=$(python3 tools/cargo_executable.py < build-artifacts.json)" >> "$GITHUB_ENV"
       - name: Unit and regression tests (locked, serialized)
         run: cargo test --locked -- --test-threads=1
       - name: Bounded localhost network smoke
-        run: python3 tests/wire_smoke.py target/debug/mc-spine
+        run: |
+          python3 tests/wire_smoke.py "$MC_SPINE_TEST_BINARY"
+          python3 tests/client_settings_wire.py "$MC_SPINE_TEST_BINARY"
       - name: Check Java adapter feature compilation
         run: |
           cargo check --locked --features fabric-probe

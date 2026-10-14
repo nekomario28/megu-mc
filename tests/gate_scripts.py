@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the mutation gate's exit contract without compiling mutant binaries."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -11,13 +12,30 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_case(cargo_output, cargo_status, *, missing_anchor=False, leftover=False):
+def run_case(cargo_output, cargo_status, *, missing_anchor=False, leftover=False, wire_error=False,
+             stale_artifact=False, empty_artifact=False):
     with tempfile.TemporaryDirectory(prefix="spine-gate-") as tmp:
         root = Path(tmp)
         (root / "tools").mkdir()
         (root / "src").mkdir()
         (root / "bin").mkdir()
-        shutil.copy2(ROOT / "tools/mutation_check.sh", root / "tools/mutation_check.sh")
+        (root / "tests").mkdir()
+        artifact = root / "alternate-target/debug/mc-spine"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("fake executable")
+        wire_output = "FileNotFoundError: broken harness" if wire_error else cargo_output
+        wire_status = 1 if wire_error else cargo_status
+        (root / "tests/client_settings_wire.py").write_text(
+            "import sys\nassert sys.argv[1] == " + repr(str(artifact)) + "\nprint(" + repr(wire_output)
+            + ")\nsys.exit(" + str(wire_status) + ")\n")
+        for name in ["mutation_check.sh", "cargo_executable.py"]:
+            shutil.copy2(ROOT / "tools" / name, root / "tools" / name)
+        if stale_artifact:
+            script = root / "tools/mutation_check.sh"
+            text = script.read_text()
+            anchor = 'python3 "$test_filter" "$executable"'
+            assert text.count(anchor) == 1
+            script.write_text(text.replace(anchor, 'python3 "$test_filter" target/debug/mc-spine'))
         for name in ("main.rs", "feature.rs"):
             shutil.copy2(ROOT / "src" / name, root / "src" / name)
         if missing_anchor:
@@ -31,7 +49,13 @@ def run_case(cargo_output, cargo_status, *, missing_anchor=False, leftover=False
             (root / "src/main.rs.mutation-backup").write_text("unrestored source")
         before = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in (root / "src").glob("*.rs")}
         cargo = root / "bin/cargo"
-        cargo.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(cargo_output) + "\nexit " + str(cargo_status) + "\n")
+        event = json.dumps({"reason": "compiler-artifact", "target": {"name": "mc-spine", "kind": ["bin"]},
+                            "executable": str(artifact)})
+        if empty_artifact:
+            event = json.dumps({"reason": "build-finished", "success": True})
+        build = "" if cargo_output.startswith("error[") else (
+            'if [ "$1" = build ]; then printf "%s\\n" ' + shlex.quote(event) + '; exit 0; fi\n')
+        cargo.write_text("#!/bin/sh\n" + build + "printf '%s\\n' " + shlex.quote(cargo_output) + "\nexit " + str(cargo_status) + "\n")
         cargo.chmod(0o755)
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
         result = subprocess.run(["bash", "tools/mutation_check.sh", "--offline"], cwd=root,
@@ -51,6 +75,9 @@ def main():
         ("mutant stays green", "running 1 test\ntest result: ok. 1 passed; 0 failed", 0, {}, False, "stayed green"),
         ("compile failure", "error[E0425]: missing function", 101, {}, False, "did not compile"),
         ("leftover mutation", failed, 101, {"leftover": True}, False, "refusing to run"),
+        ("wire harness error", failed, 101, {"wire_error": True}, False, "neither compiled"),
+        ("guessed executable instead of Cargo artifact", failed, 101, {"stale_artifact": True}, False, "neither compiled"),
+        ("missing Cargo artifact", failed, 101, {"empty_artifact": True}, False, "received 0"),
     ]
     for name, output, status, kwargs, success, marker in cases:
         rc, log = run_case(output, status, **kwargs)

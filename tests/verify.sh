@@ -32,8 +32,12 @@ for i in 1 2 3; do
 done
 
 echo "== wire smoke"
-cargo build --offline --locked -j 2
-timeout 180 python3 tests/wire_smoke.py target/debug/mc-spine
+build_manifest=$(mktemp)
+trap 'rm -f "$build_manifest"' EXIT
+cargo build --offline --locked -j 2 --message-format=json-render-diagnostics >"$build_manifest"
+binary=$(python3 tools/cargo_executable.py <"$build_manifest")
+timeout 180 python3 tests/wire_smoke.py "$binary"
+timeout 180 python3 tests/client_settings_wire.py "$binary"
 
 echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe
