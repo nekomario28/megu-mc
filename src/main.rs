@@ -4631,6 +4631,19 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(sb.as_bytes());
         }
     }
+
+    // FAL1: the falling block queue. Without this, a block in flight is written to the world
+    // mid-air and nothing ever drops it, because the tick only moves what is queued. Appended
+    // after the meta section: a save written before this existed simply has no queue to read.
+    let mut in_flight = falling().lock().unwrap().clone();
+    in_flight.sort_unstable();
+    (*f).extend_from_slice(b"FAL1");
+    write_varint(&mut *f, in_flight.len() as i64);
+    for (fx, fy, fz) in in_flight {
+        (*f).extend_from_slice(&fx.to_be_bytes());
+        (*f).extend_from_slice(&fy.to_be_bytes());
+        (*f).extend_from_slice(&fz.to_be_bytes());
+    }
 }
 fn load_world() -> Result<(), &'static str> {
     let raw = match std::fs::read(WORLD_FILE) {
@@ -5069,6 +5082,21 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         eprintln!("[spine] loaded meta: {} mobs, {} invs, {} chests", mn, inv_store().lock().unwrap().len(), chests().lock().unwrap().len());
+    }
+
+    // Falling queue, when the save carries one. Absent sections are the normal case for saves
+    // written before this existed, so a missing tag leaves the queue empty rather than failing.
+    if p + 4 <= payload.len() && &payload[p..p + 4] == b"FAL1" {
+        p += 4;
+        let n = rv(&payload, &mut p);
+        let mut q = falling().lock().unwrap();
+        for _ in 0..n {
+            if p + 12 > payload.len() { break }
+            let fx = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            if !q.contains(&(fx, fy, fz)) { q.push((fx, fy, fz)); }
+        }
     }
 }
 

@@ -254,3 +254,29 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
     assert_eq!(loaded_drops, vec![(811, 1)], "the resting trident must persist exactly once");
     assert_eq!(loaded_arrow_kinds, vec![0], "only the airborne arrow stays an arrow");
 }
+
+/// A block in flight has to survive a save and a load. Without the queue in the save, the world
+/// keeps the block where it was mid-air and nothing ever drops it, because the tick only moves what
+/// is queued - so after a restart the block hangs there permanently.
+#[test]
+fn the_falling_queue_survives_a_save_and_load_round_trip() {
+    let _g = world_guard();
+    let old_world = world().lock().unwrap().clone();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+
+    falling().lock().unwrap().extend([(1, 100, 2), (-3, 70, 4)]);
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+
+    // Clear it first: reading back a value that was never removed proves nothing.
+    falling().lock().unwrap().clear();
+    load_world_from(&payload);
+
+    let q = falling().lock().unwrap().clone();
+    assert_eq!(q.len(), 2, "both entries came back and nothing else: {q:?}");
+    assert!(q.contains(&(1, 100, 2)), "positive coordinates survive: {q:?}");
+    assert!(q.contains(&(-3, 70, 4)), "and negative ones, which are easy to mangle: {q:?}");
+
+    *world().lock().unwrap() = old_world;
+    *falling().lock().unwrap() = old_falling;
+}

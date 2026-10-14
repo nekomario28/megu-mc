@@ -181,6 +181,11 @@ check "a falling block does not move while it is only scheduled" \
   sand_falls_one_block_a_tick_until_it_lands
 
 echo
+check "the falling queue is written into the save" \
+  src/main.rs '(*f).extend_from_slice(b"FAL1");' \
+  '(*f).extend_from_slice(b"XXXX");' \
+  the_falling_queue_survives_a_save_and_load_round_trip
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
