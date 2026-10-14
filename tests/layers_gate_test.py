@@ -85,6 +85,20 @@ class LayerGateTests(unittest.TestCase):
             self.assertNotEqual(code, 0, output)
             self.assertIn("deps.py: [cycle] java_compat", output)
 
+    def test_terrain_cannot_depend_on_population_implementation_again(self):
+        with fixture() as root:
+            p = root / "src/worldgen.rs"
+            original = p.read_text()
+            code, output = run(root)
+            self.assertEqual(code, 0, output)
+            p.write_text(original + "\nuse crate::feature::populate;\n")
+            code, output = run(root)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("deps.py: [layer-violation] worldgen", output)
+            p.write_text(original)
+            code, output = run(root)
+            self.assertEqual(code, 0, output)
+
     def test_shared_primitives_cannot_depend_on_terrain_generation(self):
         for owner in ["json", "generation_math"]:
             with self.subTest(owner=owner), fixture() as root:

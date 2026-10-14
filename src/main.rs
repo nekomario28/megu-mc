@@ -3247,7 +3247,7 @@ fn column_state(x: i32, y: i32, z: i32, h: i32) -> u32 {
 // datapack worldgen (worldgen.rs): vanilla density pipeline
 fn wg2_block(x: i32, y: i32, z: i32) -> Option<u32> {
     // feature layer (trees/ores/vegetation/lakes...) overrides terrain
-    if let Some(st) = worldgen::feature_state(x, y, z) {
+    if let Some(st) = worldgen::feature_state(x, y, z, feature::populate) {
         return Some(st);
     }
     let cc = worldgen::chunk_cols(x >> 4, z >> 4)?;
@@ -14433,7 +14433,7 @@ fn main() {
                             let cc = worldgen::chunk_cols(cx, cz).unwrap();
                             let top = cc.wtop((x & 15) as usize, (z & 15) as usize);
                             for y in top - 2..top + 24 {
-                                if let Some(st) = worldgen::feature_state(x, y, z) {
+                                if let Some(st) = worldgen::feature_state(x, y, z, feature::populate) {
                                     *hist.entry(st).or_default() += 1;
                                     n += 1;
                                 }

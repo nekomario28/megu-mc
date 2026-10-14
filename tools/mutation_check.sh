@@ -181,6 +181,11 @@ verify_restored() {
   fi
 }
 
+check "lazy feature lookup applies its population input and retains cached overrides" \
+  src/worldgen.rs '                    populate(self, sx, sz);' \
+  '                    let _ = (&mut populate, sx, sz);' \
+  worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides
+
 FALLING_SELF='    if y > MIN_Y
         && reg.behaviour_of(block_at(x, y, z)) == crate::feature::B_FALLING
         && fallable(x, y - 1, z)

@@ -1544,13 +1544,16 @@ impl Gen {
     }
     /// feature-layer lookup: populates the 3x3 neighborhood on demand, then
     /// returns the override state for (x,y,z) if a feature wrote one.
-    pub(crate) fn feat_state(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
+    pub(crate) fn feat_state(
+        &mut self, x: i32, y: i32, z: i32,
+        mut populate: impl FnMut(&mut Gen, i32, i32),
+    ) -> Option<u32> {
         let (cx, cz) = (x >> 4, z >> 4);
         for sx in cx - 1..=cx + 1 {
             for sz in cz - 1..=cz + 1 {
                 if !self.pop_done.contains(&(sx, sz)) {
                     self.pop_done.insert((sx, sz));
-                    crate::feature::populate(self, sx, sz);
+                    populate(self, sx, sz);
                 }
             }
         }
@@ -2008,8 +2011,10 @@ pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
 }
 
 /// feature-layer override lookup (populates 3x3 chunks lazily on first touch)
-pub fn feature_state(x: i32, y: i32, z: i32) -> Option<u32> {
-    GEN.lock().unwrap().as_mut()?.feat_state(x, y, z)
+pub fn feature_state(
+    x: i32, y: i32, z: i32, populate: impl FnMut(&mut Gen, i32, i32),
+) -> Option<u32> {
+    GEN.lock().unwrap().as_mut()?.feat_state(x, y, z, populate)
 }
 
 impl Gen {
@@ -2524,12 +2529,12 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         init(seed, crate::name_to_state);
         let t = std::time::Instant::now();
         // one query triggers populate of the 3x3 neighborhood
-        feature_state(8, 64, 8);
+        feature_state(8, 64, 8, crate::feature::populate);
         eprintln!("PERF populate9: {:?}", t.elapsed());
         let t = std::time::Instant::now();
         for cx in -1..=1 {
             for cz in -1..=1 {
-                feature_state(cx * 16 + 8, 64, cz * 16 + 8);
+                feature_state(cx * 16 + 8, 64, cz * 16 + 8, crate::feature::populate);
             }
         }
         eprintln!("PERF +8 centers (cached): {:?}", t.elapsed());
@@ -2542,6 +2547,48 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
             }
         }
         eprintln!("PERF overrides/chunk-9x9: {}", n);
+    }
+
+    #[test]
+    fn lazy_population_keeps_neighborhood_order_and_cached_overrides() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut visited = Vec::new();
+        let mut populate = |g: &mut Gen, sx: i32, sz: i32| {
+            visited.push((sx, sz));
+            // Cross-chunk writes make invocation order and repeated population
+            // observable in returned values, not just in the call trace.
+            g.feat_write(sx * 16 + 16, 64, sz * 16, 100 + visited.len() as u32);
+        };
+        assert_eq!(g.feat_state(-16, 64, -16, &mut populate), Some(102));
+        assert_eq!(g.feat_state(-16, 64, -16, &mut populate), Some(102));
+        assert_eq!(g.feat_state(0, 64, 0, &mut populate), Some(106));
+        let mut expected: Vec<_> = (-2..=0).flat_map(|sx| (-2..=0).map(move |sz| (sx, sz))).collect();
+        expected.extend([(-1, 1), (0, 1), (1, -1), (1, 0), (1, 1)]);
+        assert_eq!(visited, expected);
+    }
+
+    #[test]
+    fn lazy_population_preserves_direct_feature_outputs() {
+        // Preserve population results through the lazy lookup, including writes
+        // outside the queried chunk. This is a refactor control, not a vanilla oracle.
+        for (x, z) in [(-1i32, -1i32), (16, 16)] {
+            let mut lazy = Gen::load(0, crate::name_to_state).expect("datapack");
+            let mut direct = Gen::load(0, crate::name_to_state).expect("datapack");
+            let first = lazy.feat_state(x, 64, z, crate::feature::populate);
+            let (cx, cz) = (x.div_euclid(16), z.div_euclid(16));
+            for sx in cx - 1..=cx + 1 {
+                for sz in cz - 1..=cz + 1 {
+                    crate::feature::populate(&mut direct, sx, sz);
+                }
+            }
+            let expected: usize = direct.feat_c.values().map(HashMap::len).sum();
+            assert!(expected > 0, "fixture must exercise real feature writes");
+            assert!(lazy.feat_c == direct.feat_c,
+                "feature values differ at center ({cx},{cz}): actual={} expected={expected}",
+                lazy.feat_c.values().map(HashMap::len).sum::<usize>());
+            assert_eq!(lazy.feat_state(x, 64, z, crate::feature::populate), first);
+            assert!(lazy.feat_c == direct.feat_c, "cached lookup changed feature values");
+        }
     }
 
     #[test]

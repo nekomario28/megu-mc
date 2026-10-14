@@ -1,0 +1,73 @@
+{
+  "scope": "H population-input dependency inversion; feature/tree split still open",
+  "parent": "108c3431b9346c6f1d7fc3f470425063e04c01af",
+  "source_sha256": {
+    "src/main.rs": "8918abcf737bd9d3d2eabd70b1db0f305c4b85afd13327bad003b486f1b93b26",
+    "src/worldgen.rs": "146da1a5e2c29f363653d1564f4f37c48b433ce52c4c5db0cbffd9f9a30c467f",
+    "tools/mutation_check.sh": "7c034e85d9cf6dc8acd6ef28b401377f149d59f33c4a0dbd6c055118929cc290",
+    "tests/gate_scripts.py": "467e3d99d3b5ec63a8edb9c6a4dce9a445e49a80e96c379d5219168c0300e18a",
+    "tests/layers_gate_test.py": "7495ec47db389e76cfcae3dbab4f2426015b0792773c3aabe8f5ef9909f1d71e",
+    "evidence/foundation/module-layers/policy.json": "fa4f7d3764f6c3581c35bcb8eba4d7a40db08275d136e9d797d15c27676be90d"
+  },
+  "implementation_comparison": {
+    "lookup_body": "identical except replacing the concrete population path with the supplied input",
+    "Gen_state_layout": "byte-for-byte unchanged",
+    "production_and_diagnostic_callers": "entire main.rs unchanged except supplying the same existing feature::populate at both calls",
+    "additional_world_or_rng_state": false,
+    "retained_callback_or_trait_object": false
+  },
+  "checks": {
+    "direct_real_population_equivalence": {
+      "green_before_api_change": true,
+      "green_after_api_change": true,
+      "compared": "all feature override values, cross-chunk writes and cached reread; positive and negative centers; seed 0",
+      "vanilla_oracle": false
+    },
+    "dispatch_and_cache": "cross-chunk returned values and invocation order; duplicate lookup does not repopulate; newly entered neighbors retain ordering",
+    "ignored_input_mutant": "green baseline, assertion failure, restored/rebuilt green via the shared mutation runner",
+    "compiler_backed_controls": {
+      "methods": 15,
+      "passed": true,
+      "implementation_import_readdition": "green baseline, named worldgen layer-violation, restored green"
+    },
+    "source_projection": {
+      "modules": 13,
+      "edges": 24,
+      "removed_edge": ["worldgen", "feature"],
+      "remaining_findings": [["cycle", "feature"], ["layer-violation", "tree"]]
+    },
+    "full_verify": {
+      "passed": true,
+      "rust_suite_runs": 4,
+      "passed_per_run": 115,
+      "preexisting_ignored_per_run": 1,
+      "mutants_proved": 23,
+      "not_a_gate": 0,
+      "parked": 0,
+      "skipped": 0,
+      "log_sha256": "671910063e7dc23c0155f2e68abf2e004f4d344c8da2d43ecf7752edceec2dc6"
+    }
+  },
+  "independent_review": {
+    "tool": "codex review, read-only",
+    "confirmed_scoped_defects": 0,
+    "executed": "static diff, source dependency and syntax inspection",
+    "not_run": "runtime tests, compiler-backed controls and mutations; main execution supplied these",
+    "setup_limit": "reviewer attempted an existing executable that was a server rather than a test harness; sandbox denied listener binding; this is not runtime verification or a product-defect finding",
+    "log_sha256": "0045a2e749ed52ff871f2f2f48c45c5c2381a13bad7d1ca67810c5582a682a46"
+  },
+  "parent_hosted_ci": {
+    "run_id": 38640951293,
+    "head": "108c3431b9346c6f1d7fc3f470425063e04c01af",
+    "conclusion": "success",
+    "validates_this_change": false
+  },
+  "hosted_ci_for_this_change": "not yet run at receipt creation",
+  "limits": [
+    "Explicit-path source projection is not complete Rust symbol/type resolution or runtime call-graph acyclicity.",
+    "Feature/tree type and generation-context ownership remain open.",
+    "The preexisting ignored Rust test and T/F/N/Q remain open.",
+    "No whole-server vanilla parity, representative-load performance or full-branch review claim.",
+    "CLI-only acceptance; no GUI or KDE test requirement."
+  ]
+}

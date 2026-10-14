@@ -49,8 +49,8 @@ sys.exit({cargo_status})
             anchor = 'python3 "$filter" "$executable"'
             assert text.count(anchor) == 1
             script.write_text(text.replace(anchor, 'python3 "$filter" target/debug/mc-spine'))
-        for name in ("main.rs", "feature.rs"):
-            shutil.copy2(ROOT / "src" / name, root / "src" / name)
+        for source in (ROOT / "src").glob("*.rs"):
+            shutil.copy2(source, root / "src" / source.name)
         if missing_anchor:
             path = root / "src/main.rs"
             text = path.read_text()

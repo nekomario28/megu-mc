@@ -15,14 +15,13 @@
     ["main", "cached_lookup"], ["main", "world_rng"], ["main", "tick_queue"], ["main", "landing_types"], ["main", "json"], ["main", "generation_math"],
     ["main", "feature"], ["main", "tree"], ["main", "worldgen"],
     ["feature", "tree"], ["feature", "worldgen"],
-    ["tree", "feature"], ["worldgen", "feature"],
+    ["tree", "feature"],
     ["java_compat", "landing_types"], ["landing", "java_compat"], ["landing", "landing_types"],
     ["feature", "json"], ["tree", "json"], ["worldgen", "json"],
     ["feature", "generation_math"], ["tree", "generation_math"], ["worldgen", "generation_math"]
   ],
   "accepted_errors": [
     ["cycle", "feature"],
-    ["layer-violation", "tree"],
-    ["layer-violation", "worldgen"]
+    ["layer-violation", "tree"]
   ]
 }
