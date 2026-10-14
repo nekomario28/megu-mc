@@ -1332,3 +1332,29 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
     *chests().lock().unwrap() = old_chests;
     *world().lock().unwrap() = old_world;
 }
+
+/// The view distance sits after the locale string in a Client Information packet. Reading it is what
+/// lets the server stream as far as the client asked: the window used to be a fixed four chunks
+/// while Join Game advertised eight, so a client believed it held chunks it had never been sent.
+#[test]
+fn client_information_carries_the_view_distance_after_the_locale() {
+    let mut body = Vec::new();
+    write_varint(&mut body, 2); // locale length
+    body.extend_from_slice(b"en");
+    body.push(12); // view distance
+    body.extend_from_slice(&[0, 1, 0, 127, 1, 0, 1, 0]); // chat mode, colours, skin parts, ...
+    assert_eq!(client_info_view_distance(&body), Some(12), "the byte after the locale");
+
+    // Clamped, so a client cannot ask for a window the server will not build.
+    let mut big = Vec::new();
+    write_varint(&mut big, 2);
+    big.extend_from_slice(b"en");
+    big.push(200);
+    assert_eq!(client_info_view_distance(&big), Some(32), "clamped to the maximum");
+
+    // A body that ends before the field is a parse failure, not a guess.
+    let mut short = Vec::new();
+    write_varint(&mut short, 2);
+    short.extend_from_slice(b"en");
+    assert_eq!(client_info_view_distance(&short), None, "no view distance byte present");
+}

@@ -8928,12 +8928,24 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
     p
 }
 
-fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i32)>, ccx: i32, ccz: i32) {
+/// The view distance out of a Client Information packet: a length-prefixed locale string, then one
+/// byte. Ignoring this packet is why the server streamed a fixed window while Join Game advertised
+/// eight - the client believed it held chunks it had never been sent.
+fn client_info_view_distance(body: &[u8]) -> Option<i32> {
+    let mut p = 0usize;
+    let len = rv_varint(body, &mut p);
+    if len < 0 { return None }
+    p += len as usize;
+    let v = *body.get(p)? as i32;
+    Some(v.clamp(0, 32))
+}
+
+fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i32)>, ccx: i32, ccz: i32, view: i32) {
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
     // client holds" (updates must only target holders).
     let gone: Vec<(i32, i32)> = sent.iter().copied()
-        .filter(|c| (c.0 - ccx).abs() > 4 || (c.1 - ccz).abs() > 4).collect();
+        .filter(|c| (c.0 - ccx).abs() > view || (c.1 - ccz).abs() > view).collect();
     for c in gone {
         let mut p = Vec::with_capacity(8);
         p.extend_from_slice(&c.1.to_be_bytes()); // wire order: chunkZ, chunkX
@@ -8944,7 +8956,7 @@ fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i
     let mut vp = Vec::new(); write_varint(&mut vp, ccx as i64); write_varint(&mut vp, ccz as i64);
     let _ = send_packet(s, 0x54, vp);
     let mut news = Vec::new();
-    for dx in -4..=4i32 { for dz in -4..=4i32 {
+    for dx in -view..=view { for dz in -view..=view {
         let c = (ccx + dx, ccz + dz);
         if !sent.contains(&c) { news.push(c); sent.insert(c); }
     }}
@@ -11823,6 +11835,7 @@ fn handle(mut s: TcpStream) {
     if send_packet(&mut s, 2, ls).is_err() { return }
     match read_packet(&mut s, login_deadline) { Some((3, _)) => {}, _ => return }
     // ---- config ----
+    let mut client_view: i32 = 8;
     let cfg = load_config_packets();
     let mut sent_selpacks = false;
     for (pid, pkt) in &cfg {
@@ -11835,7 +11848,11 @@ fn handle(mut s: TcpStream) {
     let mut got_selpacks = false;
     while Instant::now() - t0 < Duration::from_secs(15) {
         match read_packet(&mut s, login_deadline) {
-            Some((0x07, _)) => { got_selpacks = true; break }
+            Some((0x00, b)) => {
+            if let Some(v) = client_info_view_distance(&b) { client_view = v; }
+            continue;
+        }
+        Some((0x07, _)) => { got_selpacks = true; break }
             Some(_) => continue,
             None => continue,
         }
@@ -11873,11 +11890,15 @@ fn handle(mut s: TcpStream) {
         }
     }
     let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    // Join Game advertises a view distance of 8, so that is the server's own limit; a client asking
+    // for less is honoured down to 2.
+    let server_view: i32 = 8;
+    let view = client_view.min(server_view).max(2);
     // vanilla: a returning player resumes where they logged out — the
     // chunk window, spawn teleport and authoritative pos all agree.
     let (sx, sy, sz, syaw, spitch) = pos_store().lock().unwrap().get(&name)
         .copied().unwrap_or_else(|| { let w = *WORLD_SPAWN.lock().unwrap(); (w.0, w.1, w.2, 0.0, 0.0) });
-    stream_chunks(&mut s, &mut sent, (sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32);
+    stream_chunks(&mut s, &mut sent, (sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32, view);
     let mut tm = Vec::new(); tm.extend_from_slice(&0i64.to_be_bytes()); tm.extend_from_slice(&6000i64.to_be_bytes());
     let _ = send_packet(&mut s, 0x64, tm);
     let mut ps = Vec::new();
@@ -12022,7 +12043,7 @@ fn handle(mut s: TcpStream) {
 
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let mut ch = me.chunks.lock().unwrap();
-                            stream_chunks(&mut *me.sock.lock().unwrap(), &mut ch, ccx, ccz)
+                            stream_chunks(&mut *me.sock.lock().unwrap(), &mut ch, ccx, ccz, view)
                         })).is_ok();
 
                         let _ = ok;

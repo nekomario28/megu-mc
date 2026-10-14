@@ -206,6 +206,11 @@ check "a renamed block is still paired between the two assets" \
   '("minecraft:chain", "minecraft:not_a_block")' \
   every_block_has_a_counterpart_in_the_other_asset
 
+check "the client's view distance is read from its packet" \
+  src/main.rs '    p += len as usize;' \
+  '    p += len as usize + 1;' \
+  client_information_carries_the_view_distance_after_the_locale
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

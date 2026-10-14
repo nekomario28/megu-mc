@@ -405,7 +405,7 @@ error worldgen  layer-violation: worldgen (layer 4) depends on feature (layer 3)
 
 | # | 項目 | 実測（2026-10-14） | 実装手順 | 費用 |
 |---|---|---|---|---|
-| **i** | `Client Information` の view distance を無視 | `stream_chunks`（`main.rs:8931`）が **`(c.0 - ccx).abs() > 4` の固定 ±4**。呼び出しは **2箇所**（`11880` 初期送信、`12025` 移動時） | ① `Client Information`（configuration 0x00 / play 0x00）を `Some(_) => continue` から分岐し、locale の直後の **view distance (byte)** を読む ② 接続ローカルに保持 ③ **両方の呼び出しに渡し**、`±4` を `min(client, server_max)` に置換 ④ 既定値とクランプをテスト | 中 |
+| **i** | ~~`Client Information` の view distance を無視~~ | — | ① `Client Information`（configuration 0x00 / play 0x00）を `Some(_) => continue` から分岐し、locale の直後の **view distance (byte)** を読む ② 接続ローカルに保持 ③ **両方の呼び出しに渡し**、`±4` を `min(client, server_max)` に置換 ④ 既定値とクランプをテスト | **完了**：`Client Information`（configuration 0x00）の locale 直後の byte を読み、`min(client, 8)` を `stream_chunks` の両呼び出しへ。**Join Game は8を通知しているのに ±4 しか送っていなかった矛盾を解消**。変異チェックで証明 |
 | **j** | S1.1 実クライアント | PrismLauncher に **1.21.1 インスタンス**あり、`--offline`/`--server`/`--alive` 可。手順は 11節 | 11節の4手順 | 中 |
 | **b** | 落下が 1tick1セル（vanilla はエンティティの加速） | — | **j の後**。同一 seed・view distance で vanilla と比較（0.3 の枠組み）。近似のまま残すなら**近似として明記** | 中 |
 | **d** | 時計依存 RNG | **20**（`debt_ratchet.sh` が凍結、定義含む→呼び出し19） | 20 → `world_rng::next_below` へ。**分布が変わる**ので独立 slice。**移す前に「旧測定は無効」と書く** | 大 |
