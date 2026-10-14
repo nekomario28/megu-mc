@@ -20,12 +20,13 @@ import depsgx as d
 
 graph = d.ModuleGraph(
     modules=["main", "featuredefs", "tree", "worldgen", "feature",
-             "cached_lookup", "world_rng", "landing", "effects", "java_compat"],
+             "cached_lookup", "world_rng", "tick_queue", "landing", "effects", "java_compat"],
     depends=[
         ("main", "featuredefs"),
         ("main", "feature"),
         ("main", "cached_lookup"),
         ("main", "world_rng"),
+        ("main", "tick_queue"),
         ("main", "landing"),
         ("main", "effects"),
         ("main", "java_compat"),
@@ -42,7 +43,7 @@ graph = d.ModuleGraph(
     layers=[
         ["main"],
         ["java_compat", "landing", "effects"],
-        ["cached_lookup", "world_rng"],
+        ["cached_lookup", "world_rng", "tick_queue"],
         ["featuredefs"],
         ["tree"],
         ["worldgen"],

@@ -23,11 +23,24 @@ jobs:
       # a number nothing checks drifts.
       - name: Debt is frozen at today's count, and must not grow
         run: bash tools/debt_ratchet.sh
-      # The intended module layering has to stay acyclic, and the current one must not get worse
-      # while main.rs is being split. Skips with a message when depsgx is absent rather than passing
-      # quietly - a gate that reports health while running nothing is the failure mode to avoid.
-      - name: The module layering must be reachable
-        run: bash tools/layers_check.sh
+      - name: Install the required dependency inspector from an immutable revision
+        env:
+          GXKIT_REV: d6b9ad8db4774919c8b4fb032342e53b2548b660
+        run: |
+          git init "$RUNNER_TEMP/gxkit"
+          git -C "$RUNNER_TEMP/gxkit" remote add origin https://github.com/nekomario28/gxkit.git
+          git -C "$RUNNER_TEMP/gxkit" fetch --depth=1 origin "$GXKIT_REV"
+          git -C "$RUNNER_TEMP/gxkit" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/gxkit" rev-parse HEAD)" = "$GXKIT_REV"
+          python3 -m venv "$RUNNER_TEMP/gxkit-venv"
+          "$RUNNER_TEMP/gxkit-venv/bin/python" -m pip install "$RUNNER_TEMP/gxkit/packages/gxcore" "$RUNNER_TEMP/gxkit/packages/depsgx"
+          echo "$RUNNER_TEMP/gxkit-venv/bin" >> "$GITHUB_PATH"
+      - name: Fetch locked dependencies for the offline all-features compiler gate
+        run: cargo fetch --locked
+      - name: Source changes must drive the dependency gate
+        run: |
+          python3 tests/layers_gate_test.py
+          bash tools/layers_check.sh
       - name: Build (locked)
         run: |
           cargo build --locked --message-format=json-render-diagnostics > build-artifacts.json

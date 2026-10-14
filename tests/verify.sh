@@ -10,6 +10,7 @@ python3 tests/gate_scripts.py
 python3 tests/protocol767_test.py
 
 echo "== module layering"
+python3 tests/layers_gate_test.py
 bash tools/layers_check.sh || exit 1
 
 echo "== debt ratchet"

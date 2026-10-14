@@ -1,0 +1,26 @@
+{
+  "scope": "All-features, non-test rustc expansion, projected onto explicit module paths. This is not symbol resolution. Parent-facade bindings outside generation are not expanded; generation modules cannot use that escape.",
+  "layers": [
+    ["main"],
+    ["java_compat", "landing", "effects"],
+    ["cached_lookup", "world_rng", "tick_queue"],
+    ["feature"],
+    ["tree", "worldgen"]
+  ],
+  "explicit_generation_modules": ["feature", "tree", "worldgen"],
+  "forbidden": [["worldgen", "tree"]],
+  "allowed_edges": [
+    ["main", "java_compat"], ["main", "landing"], ["main", "effects"],
+    ["main", "cached_lookup"], ["main", "world_rng"], ["main", "tick_queue"],
+    ["main", "feature"], ["main", "tree"], ["main", "worldgen"],
+    ["feature", "tree"], ["feature", "worldgen"],
+    ["tree", "feature"], ["tree", "worldgen"], ["worldgen", "feature"],
+    ["java_compat", "landing"], ["landing", "java_compat"]
+  ],
+  "accepted_errors": [
+    ["cycle", "feature"],
+    ["cycle", "java_compat"],
+    ["layer-violation", "tree"],
+    ["layer-violation", "worldgen"]
+  ]
+}
