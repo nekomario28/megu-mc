@@ -19,6 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Fast and independent of the compiler: the plan states numbers about what is left to do, and
+      # a number nothing checks drifts.
+      - name: Debt is frozen at today's count, and must not grow
+        run: bash tools/debt_ratchet.sh
       - name: Build (locked)
         run: cargo build --locked
       - name: Unit and regression tests (locked, serialized)

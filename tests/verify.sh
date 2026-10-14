@@ -4,6 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+echo "== debt ratchet"
+bash tools/debt_ratchet.sh || exit 1
+
 echo "== tests, serial"
 cargo test --offline --locked -j 2 -- --test-threads=1
 

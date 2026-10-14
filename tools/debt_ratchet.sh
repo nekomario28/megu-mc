@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Debt that is frozen at today's count.
+#
+# Every entry names something the plan says should go away, pins how much of it exists now, and fails
+# if the count grows. The point is not to clean it up today: it is that a number in the plan is a
+# claim, and a claim with nothing checking it drifts. Reducing a count is a deliberate edit to this
+# file, which is the moment to say in the commit message that the old measurement of anything
+# touching it is void.
+#
+# Why these and not others: a ratchet is only worth having where the count means something. It is
+# not "unwraps" or "hard-coded ranges" - those numbers are large, move for innocent reasons, and
+# would train everyone to raise the limit. A ratchet that gets its limit raised is worse than none,
+# because it looks like a check.
+#
+# Run: bash tools/debt_ratchet.sh
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+# A ratchet that cannot see the source reports zero and passes. Running this from the wrong
+# directory, or looking for a pattern that no longer matches, must be an error rather than a
+# silent pass - the check exists to catch a number growing, and it cannot catch that by counting
+# nothing.
+if [ ! -d src ]; then
+  echo "cannot find src/ from $(pwd); run this from the repository root" >&2
+  exit 2
+fi
+
+failed=0
+blind=0
+
+# count <pattern>; counts matching occurrences across the source.
+count() { rg -o "$1" src/*.rs 2>/dev/null | wc -l | tr -d ' '; }
+
+# ratchet <label> <pattern> <limit> <why>
+ratchet() {
+  local label="$1" pattern="$2" limit="$3" why="$4" now
+  now=$(count "$pattern")
+  if [ "$now" -eq 0 ] && [ "$limit" -gt 0 ]; then
+    echo "BLIND $label: the pattern '$pattern' matches nothing, so this check proves nothing."
+    echo "      Either the thing it counts was removed - lower the limit to 0 and say so - or the"
+    echo "      pattern no longer describes it and the ratchet has been passing on nothing."
+    blind=$((blind + 1))
+  elif [ "$now" -gt "$limit" ]; then
+    echo "GREW  $label: $now, limit $limit"
+    echo "      $why"
+    echo "      Adding one is allowed only by editing this file, so that the decision is visible."
+    failed=$((failed + 1))
+  elif [ "$now" -lt "$limit" ]; then
+    echo "DOWN  $label: $now, limit $limit - lower the limit to lock the gain in."
+  else
+    echo "ok    $label: $now"
+  fi
+}
+
+# The clock cannot be saved, replayed or compared, so anything whose behaviour depends on it cannot
+# be tested against vanilla and cannot agree with a second run of the same seed. The world stream
+# exists for exactly this; these sites are the ones that have not moved yet. Moving them shifts the
+# distributions they drive, which is why it is a deliberate slice and not a sweep.
+ratchet "clock-based RNG sites (incl. the definition)" 'rand_u64\(\)' 20 \
+  "rand_u64() reads the clock: see PLAN.md 7.2d. New randomness must draw from world_rng."
+
+# A parked gate is a named gap. Parking one is sometimes right; parking one silently is how a suite
+# stops meaning anything. The mutation check counts them too, from the other side.
+ratchet "ignored tests (parked gates)" '#\[ignore' 1 \
+  "see PLAN.md section 7; a parked gate proves nothing, so the count must not creep up."
+
+echo
+if [ "$blind" -gt 0 ]; then
+  echo "debt ratchet: $blind check(s) blind - the count is not being measured"
+  exit 3
+fi
+echo "debt ratchet: $failed over limit"
+[ "$failed" -eq 0 ]
