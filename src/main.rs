@@ -3478,9 +3478,10 @@ fn refresh_hot() {
     r.hot = h;
     r.warm = w;
 }
-fn is_hot(x: i32, z: i32) -> bool { region().lock().unwrap().is_hot(x, z) }
 // warm ring: block-level systems tick, entities/projectiles stay frozen —
-// the vanilla lazy-chunk analogue (blocks progress, entities don't).
+// the vanilla lazy-chunk analogue (blocks progress, entities don't). The production paths call
+// region().is_warm directly; this wrapper exists for the tests that pin the cold-furnace rule.
+#[cfg(test)]
 fn is_warm(x: i32, z: i32) -> bool { region().lock().unwrap().is_warm(x, z) }
 
 // generalized lazy-schedule primitive (the Create-generalization core):
@@ -3846,12 +3847,6 @@ fn block_at(x: i32, y: i32, z: i32) -> u32 {
 /// cells takes and releases the mutex that many times otherwise, which is what dominates the
 /// block light spread. Safe to combine with `base_state`: it and its dependencies do not take
 /// the world lock, so there is no re-entry.
-fn block_at_held(w: &HashMap<(i32, i32), HashMap<u32, u32>>, x: i32, y: i32, z: i32) -> u32 {
-    w.get(&(x >> 4, z >> 4))
-        .and_then(|c| c.get(&local_idx(x, y, z)).copied())
-        .unwrap_or_else(|| base_state(x, y, z))
-}
-
 fn set_block(x: i32, y: i32, z: i32, st: u32) {
     set_block_if(x, y, z, st, None);
 }
@@ -8456,7 +8451,7 @@ fn block_light_sections_from(
     let mut out = Vec::with_capacity(26);
     for sec in 0..26 {
         let sy = sec * 16 + MIN_Y;
-        out.push(pack_light_section(sy, cx, cz, |lx, wy, lz| {
+        out.push(pack_light_section(sy, |lx, wy, lz| {
             if wy < y0 || wy > y1 {
                 return 0;
             }
@@ -8540,6 +8535,7 @@ fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     })
 }
 
+#[cfg(test)]
 fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     let reg = crate::feature::breg();
     let mut floors = [0i32; 256];
@@ -8652,7 +8648,7 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     let mut out = Vec::with_capacity(26);
     for sec in 0..26 {
         let sy = sec * 16 + MIN_Y;
-        out.push(pack_light_section(sy, cx, cz, |lx, wy, lz| {
+        out.push(pack_light_section(sy, |lx, wy, lz| {
             let f = floors[(lz << 4) | lx];
             let base = if wy > f { 15 } else { 0 };
             base.max(
@@ -8668,8 +8664,6 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
 
 fn pack_light_section(
     sy: i32,
-    cx: i32,
-    cz: i32,
     level: impl Fn(usize, i32, usize) -> u8,
 ) -> [u8; 2048] {
     let mut arr = [0u8; 2048];
