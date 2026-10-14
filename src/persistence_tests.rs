@@ -82,6 +82,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
 
 #[test]
 fn met4_round_trip_preserves_drop_components_age_and_mob_air() {
+    if test_support::isolated_world_test() { return; }
     let _world_guard = world_guard();
     let full_air = server_ticks(300) as i32;
     let loaded = round_trip(None, 150, 3);
@@ -99,6 +100,7 @@ fn met4_round_trip_preserves_drop_components_age_and_mob_air() {
 
 #[test]
 fn met2_without_mob_air_falls_back_to_a_full_supply() {
+    if test_support::isolated_world_test() { return; }
     let _world_guard = world_guard();
     // MET2 never carried air. The loader must substitute the vanilla air supply
     // rather than a zero that would drown the mob on its first tick.
@@ -109,6 +111,7 @@ fn met2_without_mob_air_falls_back_to_a_full_supply() {
 
 #[test]
 fn legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning() {
+    if test_support::isolated_world_test() { return; }
     let _world_guard = world_guard();
     // The 20TPS cutover made one tick 50ms. A MET3 file that stored a drop age of
     // 300000 ms read as ticks would sit at 300000 ticks against a 6000 tick life
@@ -121,6 +124,7 @@ fn legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning() {
 
 #[test]
 fn negative_drop_age_survives_a_save_reload_round_trip() {
+    if test_support::isolated_world_test() { return; }
     let _world_guard = world_guard();
     // A container close records the pickup-delay marker as a negative age. The
     // old loader clamped it to a full lifespan, so the drop despawned on the
@@ -178,6 +182,7 @@ fn legacy_persisted_durations_resume_with_their_original_wall_time() {
 
 #[test]
 fn met4_round_trip_leaves_persisted_durations_untouched() {
+    if test_support::isolated_world_test() { return; }
     let _world_guard = world_guard();
     // A MET4 save writes server ticks, so loading it must not rescale anything.
     let loaded = round_trip(None, 150, 600);
@@ -222,6 +227,7 @@ fn truncated_component_blobs_do_not_panic_the_loader() {
 /// from the very save that produced it, so a resting trident was lost on restart.
 #[test]
 fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
+    if test_support::isolated_world_test() { return; }
     let _world_guard = world_guard();
     let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
     let old_drops = std::mem::take(&mut *drops().lock().unwrap());
@@ -260,6 +266,7 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
 /// is queued - so after a restart the block hangs there permanently.
 #[test]
 fn the_falling_queue_survives_a_save_and_load_round_trip() {
+    if test_support::isolated_world_test() { return; }
     let _g = world_guard();
     let old_world = world().lock().unwrap().clone();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
@@ -279,4 +286,51 @@ fn the_falling_queue_survives_a_save_and_load_round_trip() {
 
     *world().lock().unwrap() = old_world;
     *falling().lock().unwrap() = old_falling;
+}
+
+#[test]
+fn furnace_and_sign_round_trip_keeps_only_live_owners() {
+    if test_support::isolated_world_test() { return; }
+    let broken_furnace = (30, 150, 30);
+    let live_furnace = (32, 150, 30);
+    let broken_sign = (34, 150, 30);
+    let live_sign = (36, 150, 30);
+    let input = (name_to_item("raw_iron").unwrap(), 3, Vec::new());
+    for pos in [broken_furnace, live_furnace] {
+        set_block(pos.0, pos.1, pos.2, name_to_state("furnace").unwrap());
+        furnaces().lock().unwrap().insert(pos, Furnace {
+            input: input.clone(), fuel: (0, 0, Vec::new()), output: (0, 0, Vec::new()),
+            burn_left: 43, progress: 17, dirty: false, xp: 0.0,
+            recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default(),
+        });
+    }
+    let lines = ["persist".into(), "both".into(), "sides".into(), "exactly".into()];
+    for pos in [broken_sign, live_sign] {
+        set_block(pos.0, pos.1, pos.2, name_to_state("oak_sign").unwrap());
+        for front in [0, 1] {
+            signs().lock().unwrap().insert((pos.0, pos.1, pos.2, front), lines.clone());
+        }
+    }
+    for pos in [broken_furnace, broken_sign] { set_block(pos.0, pos.1, pos.2, 0); }
+    assert!(!furnaces().lock().unwrap().contains_key(&broken_furnace));
+    assert!(!signs().lock().unwrap().keys().any(|&(x, y, z, _)| (x, y, z) == broken_sign));
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    world().lock().unwrap().clear();
+    furnaces().lock().unwrap().clear();
+    signs().lock().unwrap().clear();
+    drops().lock().unwrap().clear();
+    load_world_from(&payload);
+    let fs = furnaces().lock().unwrap();
+    assert_eq!(fs.len(), 1);
+    let loaded = fs.get(&live_furnace).expect("live furnace must be restored");
+    assert_eq!(loaded.input, input);
+    assert_eq!((loaded.burn_left, loaded.progress), (43, 17));
+    assert_eq!(block_at(live_furnace.0, live_furnace.1, live_furnace.2), name_to_state("furnace").unwrap());
+    let sg = signs().lock().unwrap();
+    assert_eq!(sg.len(), 2);
+    for front in [0, 1] {
+        assert_eq!(sg.get(&(live_sign.0, live_sign.1, live_sign.2, front)), Some(&lines));
+    }
+    assert_eq!(block_at(live_sign.0, live_sign.1, live_sign.2), name_to_state("oak_sign").unwrap());
 }

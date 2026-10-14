@@ -1292,45 +1292,37 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     *forceloaded().lock().unwrap() = old_forced;
 }
 
-/// Containers are stored by position, and the world is a sparse overlay that omits any cell equal to
-/// the generator's answer. So a stored chest whose block is gone is an orphan: it comes back after a
-/// load owned by nothing, impossible to open or break, its contents unreachable. A schema check
-/// cannot see this - the reference is well-formed whether or not the cell exists - which is why it is
-/// asserted here rather than checked there.
+/// A live container is the positive control: a no-op reader must fail this round trip.
 #[test]
 fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
-    let _g = world_guard();
-    let old_chests = std::mem::take(&mut *chests().lock().unwrap());
-    let old_world = world().lock().unwrap().clone();
-    let chest = name_to_state("chest").expect("chest must exist");
-    let (x, y, z) = (21, 150, 21);
-
-    set_block(x, y, z, chest);
-    chests().lock().unwrap().entry((x, y, z)).or_default().insert(0, (1, 5, Vec::new()));
-    assert!(chests().lock().unwrap().contains_key(&(x, y, z)), "the store holds the chest");
-
-    // Identity change: the slots must not survive the block that owned them.
-    set_block(x, y, z, 0);
-    assert!(
-        !chests().lock().unwrap().contains_key(&(x, y, z)),
-        "breaking a chest must drop its stored slots, or the position outlives its block"
-    );
-
-    // A round trip is where an interleaving would show, since the code cleans up on the break.
+    if test_support::isolated_world_test() { return; }
+    let broken = (21, 150, 21);
+    let live = (23, 150, 21);
+    let barrel = (25, 150, 21);
+    let stack = (name_to_item("iron_ingot").unwrap(), 5, vec![(2, vec![0])]);
+    for (pos, name) in [(broken, "chest"), (live, "chest"), (barrel, "barrel")] {
+        set_block(pos.0, pos.1, pos.2, name_to_state(name).unwrap());
+        chests().lock().unwrap().entry(pos).or_default().insert(0, stack.clone());
+    }
+    set_block(broken.0, broken.1, broken.2, 0);
+    assert!(!chests().lock().unwrap().contains_key(&broken), "cleanup on break");
     let mut payload = Vec::new();
     save_world_into(&mut payload);
+    world().lock().unwrap().clear();
+    chests().lock().unwrap().clear();
+    drops().lock().unwrap().clear();
     load_world_from(&payload);
-    let orphans: Vec<(i32, i32, i32)> = chests()
-        .lock()
-        .unwrap()
-        .keys()
-        .copied()
-        .filter(|&(cx, cy, cz)| !is_chest_pairable(block_at(cx, cy, cz)))
-        .collect();
-    assert!(orphans.is_empty(), "a stored container must point at a container: {orphans:?}");
-
-    *chests().lock().unwrap() = old_chests;
-    *world().lock().unwrap() = old_world;
+    assert_eq!(block_at(live.0, live.1, live.2), name_to_state("chest").unwrap());
+    let containers = chests().lock().unwrap().clone();
+    assert_eq!(containers.len(), 2);
+    assert!(!containers.contains_key(&broken), "broken contents must not resurrect");
+    for pos in [live, barrel] {
+        assert_eq!(containers.get(&pos).and_then(|slots| slots.get(&0)), Some(&stack));
+        assert!(container_kind(block_at(pos.0, pos.1, pos.2)).is_some());
+    }
+    let ground = drops().lock().unwrap();
+    assert_eq!(ground.len(), 1, "the spilled stack persists once, not twice");
+    assert_eq!((ground[0].item, ground[0].cnt, &ground[0].comps), (stack.0, stack.1, &stack.2));
 }
 
 /// The view distance sits after the locale string in a Client Information packet. Reading it is what

@@ -14600,6 +14600,8 @@ mod merge_tests;
 #[cfg(test)]
 mod persistence_tests;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod security_command_tests {
     use super::command_allowed_for_player;
     #[test]

@@ -211,6 +211,21 @@ check "the client's view distance is read from its packet" \
   '    p += len as usize + 1;' \
   client_information_carries_the_view_distance_after_the_locale
 
+check "containers must be decoded, not merely remain absent" \
+  src/main.rs 'fn load_world_from(payload: &[u8]) {' \
+  'fn load_world_from(payload: &[u8]) { return;' \
+  a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
+
+check "a broken furnace cannot retain its slots" \
+  src/main.rs '        if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z)) {' \
+  '        if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z + 1000)) {' \
+  furnace_and_sign_round_trip_keeps_only_live_owners
+
+check "broken sign text cannot survive its block" \
+  src/main.rs 'signs().lock().unwrap().retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
+  'signs().lock().unwrap().retain(|_, _| true);' \
+  furnace_and_sign_round_trip_keeps_only_live_owners
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
