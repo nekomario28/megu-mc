@@ -68,12 +68,57 @@ struct Prop {
     vals: Vec<String>,
 }
 
+fn metadata_properties(block: &J, definitions: &HashMap<i64, &J>) -> Option<Vec<Prop>> {
+    jarr(block, "properties")?.iter().map(|key| {
+        let definition = definitions.get(&(key.num() as i64))?;
+        let vals = match jstr(definition, "type")?.as_str() {
+            "boolean" => vec!["true".into(), "false".into()],
+            "enum" => jarr(definition, "values")?.iter().map(|v| v.str().to_string()).collect(),
+            "int" => (jnum(definition, "min")? as i32..=jnum(definition, "max")? as i32)
+                .map(|v| v.to_string()).collect(),
+            _ => return None,
+        };
+        Some(Prop { name: jstr(definition, "serialized_name")?, vals })
+    }).collect()
+}
+
+/// State arrays are mixed-radix products, but each asset may order or extend the
+/// property values differently. Translate names and values, never numeric state ids.
+fn metadata_offset(wire: &[Prop], offset: usize, metadata: &[Prop]) -> Option<usize> {
+    if wire.len() != metadata.len() { return None; }
+    let mut out = 0usize;
+    for prop in metadata {
+        let index = wire.iter().position(|p| p.name == prop.name)?;
+        let stride: usize = wire[index + 1..].iter().map(|p| p.vals.len()).product();
+        if stride == 0 || wire[index].vals.is_empty() { return None; }
+        let value = &wire[index].vals[(offset / stride) % wire[index].vals.len()];
+        let digit = prop.vals.iter().position(|v| v == value)?;
+        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod state_mapping_tests {
+    use super::*;
+    #[test]
+    fn property_names_and_values_determine_metadata_position() {
+        let prop = |name: &str, vals: &[&str]| Prop {
+            name: name.into(), vals: vals.iter().map(|v| v.to_string()).collect(),
+        };
+        let wire = [prop("axis", &["x", "y"]), prop("wet", &["true", "false"])];
+        let metadata = [prop("wet", &["false", "true"]), prop("axis", &["z", "y", "x"])];
+        for (offset, expected) in [5, 2, 4, 1].into_iter().enumerate() {
+            assert_eq!(metadata_offset(&wire, offset, &metadata), Some(expected));
+        }
+    }
+}
+
 /// What a block does when a random tick lands on it. Zero is the common case and the
 /// registry stores it for every block, so the dispatch is a compare against zero.
 pub(crate) const B_NONE: u8 = 0;
 pub(crate) const B_SUGAR_CANE: u8 = 1;
-/// Falls when the block under it goes away. Vanilla schedules a tick and moves it as an entity;
-/// the behaviour is the same either way, and the id is what keeps the name out of the tick.
+/// Blocks affected by gravity; scheduling and physics belong to the falling loop.
 pub(crate) const B_FALLING: u8 = 2;
 
 pub(crate) struct BReg {
@@ -89,8 +134,8 @@ pub(crate) struct BReg {
     hardness: Vec<f32>, // state id -> vanilla destroy time (-1 unbreakable)
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
     tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
-    /// Names in blocks_1211.json with no counterpart in pblocks.json, so their per-state values
-    /// are the defaults. Empty is the only acceptable value; a rename adds one.
+    /// Target-version states that could not obtain complete metadata by property value.
+    /// The registry gate requires this to be empty, not merely the block names to match.
     pub(crate) unpaired: Vec<String>,
     drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
     /// A few blocks drop twice: the potted plants drop the pot and the plant. Kept beside
@@ -113,6 +158,11 @@ impl BReg {
         let md = jparse(&std::fs::read("assets/blocks_1211.json").ok()?)?.into_arr()?.clone();
         let pb = jparse(&std::fs::read("assets/pblocks.json").ok()?)?;
         let pb_blocks = pb.get("blocks")?.into_arr()?;
+        let property_data = jparse(&std::fs::read("assets/properties.json").ok()?)?;
+        let mut property_definitions = HashMap::new();
+        for definition in property_data.into_arr()? {
+            property_definitions.insert(jnum(definition, "hash_key")? as i64, definition);
+        }
         let mut pb_by_name: HashMap<String, &J> = HashMap::new();
         for b in pb_blocks {
             pb_by_name.insert(format!("minecraft:{}", jstr(b, "name")?), b);
@@ -180,14 +230,12 @@ impl BReg {
             }
             reg.props.push(props.into_boxed_slice());
             let pbr = pb_by_name.get(&name);
+            let metadata_props = pbr.and_then(|block| metadata_properties(block, &property_definitions));
             // Destroy time is a property of the block, so it is read here once and
             // held per state rather than re-derived by a hand table. A hand table
             // covered 356 of the 26684 states, which meant mining time was wrong for
             // almost every block in the world.
             let hardness = jnum(b, "hardness").unwrap_or(0.6) as f32;
-            if !pb_by_name.contains_key(&name) {
-                reg.unpaired.push(name.clone());
-            }
             // Stack size is a block property in the asset (1 for tools and potions,
             // 16 for signs and buckets, 64 otherwise) and is read here once per state
             // rather than re-derived from item id ranges.
@@ -270,21 +318,23 @@ impl BReg {
                 reg.drops[st] = drop0;
                 reg.drops_second[st] = drop1;
                 reg.stack_size[st] = stack_size;
-                if let Some(pbb) = pbr {
-                    if let Some(sts) = jarr(pbb, "states") {
-                        if sts.len() == n {
-                            if let J::Obj(_) = &sts[i] {
-                                reg.st_fl[st] =
-                                    jnum(&sts[i], "state_flags").unwrap_or(0.0) as u16;
-                                reg.st_side[st] =
-                                    jnum(&sts[i], "side_flags").unwrap_or(0.0) as u8;
-                                reg.luminance[st] =
-                                    jnum(&sts[i], "luminance").unwrap_or(0.0) as u8;
-                                reg.opacity[st] =
-                                    jnum(&sts[i], "opacity").unwrap_or(0.0) as u8;
-                            }
-                        }
+                let values = metadata_props.as_deref()
+                    .and_then(|props| metadata_offset(&reg.props[bi as usize], i, props))
+                    .and_then(|index| pbr.and_then(|block| jarr(block, "states")?.get(index)))
+                    .and_then(|state| Some((
+                        jnum(state, "state_flags")? as u16,
+                        jnum(state, "side_flags")? as u8,
+                        jnum(state, "luminance")? as u8,
+                        jnum(state, "opacity")? as u8,
+                    )));
+                match values {
+                    Some((flags, sides, light, opacity)) => {
+                        reg.st_fl[st] = flags;
+                        reg.st_side[st] = sides;
+                        reg.luminance[st] = light;
+                        reg.opacity[st] = opacity;
                     }
+                    None => reg.unpaired.push(format!("{name} state {st}")),
                 }
             }
         }

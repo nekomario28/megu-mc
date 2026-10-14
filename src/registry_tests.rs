@@ -895,16 +895,29 @@ fn a_potted_plant_drops_both_entries_the_asset_lists() {
     assert!(reg.block_drop_second(stone).is_none(), "and only once");
 }
 
-/// Every block in the 1.21.1 asset has a counterpart in the newer one. Without one it silently keeps
-/// the defaults for solidity, opacity, luminance and shape, which is a behaviour difference with no
-/// error anywhere. One rename cost `chain` all of them: 1.21.1 calls it chain, the newer asset calls
-/// it iron_chain once chains gained material variants.
+/// Names alone are insufficient: every target state needs complete metadata.
 #[test]
-fn every_block_has_a_counterpart_in_the_other_asset() {
+fn every_wire_state_has_complete_metadata() {
     let reg = breg().unwrap();
     assert!(
         reg.unpaired.is_empty(),
-        "these blocks have no counterpart in pblocks.json, so their per-state values are defaults: {:?}",
+        "these target states have missing property-matched metadata: {:?}",
         reg.unpaired
     );
+}
+
+#[test]
+fn note_block_keeps_solid_and_light_values_for_every_instrument() {
+    let reg = breg().unwrap();
+    let raw = std::fs::read("assets/blocks_1211.json").unwrap();
+    let md = crate::feature::jparse_pub(&raw).unwrap();
+    let block = md.into_arr().unwrap().iter()
+        .find(|b| crate::feature::jstr_pub(b, "name").as_deref() == Some("note_block")).unwrap();
+    let lo = crate::feature::jnum_pub(block, "minStateId").unwrap() as u32;
+    let hi = crate::feature::jnum_pub(block, "maxStateId").unwrap() as u32;
+    for st in lo..=hi {
+        assert!(reg.is_solid(st), "note block state {st} is a full solid block");
+        assert_eq!(reg.opacity_of(st), 15, "note block state {st} must block skylight");
+        for side in 0..6 { assert!(reg.side_solid(st, side), "note block state {st} side {side}"); }
+    }
 }

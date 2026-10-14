@@ -204,7 +204,7 @@ check "breaking a chest drops the slots it owned" \
 check "a renamed block is still paired between the two assets" \
   src/feature.rs '("minecraft:chain", "minecraft:iron_chain")' \
   '("minecraft:chain", "minecraft:not_a_block")' \
-  every_block_has_a_counterpart_in_the_other_asset
+  every_wire_state_has_complete_metadata
 
 check "the client's view distance is read from its packet" \
   src/main.rs '    p += len as usize;' \
@@ -225,6 +225,16 @@ check "broken sign text cannot survive its block" \
   src/main.rs 'signs().lock().unwrap().retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
   'signs().lock().unwrap().retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
+
+check "solid metadata must reach every note block state" \
+  src/feature.rs '                        reg.st_fl[st] = flags;' \
+  '                        reg.st_fl[st] = 0;' \
+  note_block_keeps_solid_and_light_values_for_every_instrument
+
+check "property remapping cannot reuse positional state offsets" \
+  src/feature.rs '        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;' \
+  '        out = offset;' \
+  property_names_and_values_determine_metadata_position
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
