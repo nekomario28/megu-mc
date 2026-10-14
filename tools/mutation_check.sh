@@ -59,13 +59,50 @@ restore() {
 }
 trap 'restore; rm -f "$log" "$artifacts"' EXIT
 
-# check <name> <file> <from> <to> <test-filter-or-wire-script>
+# One execution owner for positive controls and mutants. Status is local to check().
+run_filter() {
+  local filter="$1" executable
+  compiled=yes
+  status=failed
+  if [[ "$filter" == tests/*.py ]]; then
+    if cargo build ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"} --message-format=json-render-diagnostics >"$artifacts" 2>"$log"; then
+      if executable=$(python3 tools/cargo_executable.py <"$artifacts" 2>>"$log"); then
+        if python3 "$filter" "$executable" >>"$log" 2>&1; then status=green; fi
+      fi
+    else
+      compiled=no
+    fi
+  elif cargo test ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"} "$filter" -- --test-threads=1 >"$log" 2>&1; then
+    status=green
+  fi
+}
+
+control() {
+  local name="$1" filter="$2" phase="$3" pattern
+  run_filter "$filter"
+  if [[ "$filter" == tests/*.py ]]; then
+    pattern='^(client settings|gameplay) wire: PASS$'
+  else
+    pattern='^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored'
+  fi
+  if [ "$status" = green ] && grep -qE "$pattern" "$log"; then return 0; fi
+  echo "FAIL  $name: $phase control did not pass the required test"
+  tail -15 "$log"
+  return 1
+}
+
+# check <name> <file> <from> <to> <test-filter-or-wire-script> [exact-wire-failure]
 check() {
-  local name="$1" mut_file_local="$2" from="$3" to="$4" test_filter="$5"
+  local name="$1" mut_file_local="$2" from="$3" to="$4" test_filter="$5" expected_failure="${6:-}"
+  local status compiled caught=no
   mut_file="$mut_file_local"
   backup="$mut_file.mutation-backup"
   local sha_before
   sha_before=$(hash_of "$mut_file")
+  if ! control "$name" "$test_filter" baseline; then
+    failed=$((failed + 1))
+    return
+  fi
   cp "$mut_file" "$backup"
 
   if ! MUT_FILE="$mut_file" MUT_FROM="$from" MUT_TO="$to" python3 - <<'PY'
@@ -87,24 +124,7 @@ PY
     return
   fi
 
-  local status compiled=yes
-  if [[ "$test_filter" == tests/*.py ]]; then
-    if cargo build ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"} --message-format=json-render-diagnostics >"$artifacts" 2>"$log"; then
-      local executable
-      if executable=$(python3 tools/cargo_executable.py <"$artifacts" 2>>"$log"); then
-        if python3 "$test_filter" "$executable" >>"$log" 2>&1; then status=green; else status=failed; fi
-      else
-        status=failed
-      fi
-    else
-      compiled=no
-      status=failed
-    fi
-  elif cargo test ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"} "$test_filter" -- --test-threads=1 >"$log" 2>&1; then
-    status=green
-  else
-    status=failed
-  fi
+  run_filter "$test_filter"
 
   # cargo prints "error: test failed" for a failing test, so the exit code and the word error cannot
   # tell a compile failure from an assertion failure. The lines the harness itself prints can.
@@ -127,9 +147,9 @@ PY
     echo "FAIL  $name"
     echo "      '$test_filter' stayed green with the implementation broken. That test is not a gate."
     failed=$((failed + 1))
-  elif grep -qE 'test result: FAILED|^client settings wire: FAIL$' "$log"; then
-    echo "ok    $name"
-    passed=$((passed + 1))
+  elif { [[ "$test_filter" == tests/*.py ]] && [ -n "$expected_failure" ] && grep -Fxq "$expected_failure" "$log"; } ||
+       { [[ "$test_filter" != tests/*.py ]] && grep -qE 'test result: FAILED' "$log"; }; then
+    caught=yes
   else
     echo "FAIL  $name"
     echo "      the run neither compiled, matched, nor reported a failing test."
@@ -138,6 +158,12 @@ PY
   fi
   restore
   verify_restored "$name" "$sha_before"
+  if ! control "$name" "$test_filter" restored; then
+    if [ "$caught" = yes ]; then failed=$((failed + 1)); fi
+  elif [ "$caught" = yes ]; then
+    echo "ok    $name"
+    passed=$((passed + 1))
+  fi
 }
 
 # A restore that did not put the bytes back leaves the tree mutated, and every later measurement is
@@ -257,7 +283,7 @@ check "configuration information before known packs reaches chunk streaming" \
   '                let _ = v;
             }
             Some((0x07, _))' \
-  tests/client_settings_wire.py
+  tests/client_settings_wire.py 'client settings wire: FAIL config-early-window'
 
 check "configuration information after known packs reaches chunk streaming" \
   src/main.rs '                client_view = v;
@@ -266,11 +292,28 @@ check "configuration information after known packs reaches chunk streaming" \
   '                let _ = v;
             }
             Some((0x03, _))' \
-  tests/client_settings_wire.py
+  tests/client_settings_wire.py 'client settings wire: FAIL config-late-window'
 
 check "play information reaches the live chunk window" \
   src/main.rs '            0x0a => {' '            0x7f => {' \
-  tests/client_settings_wire.py
+  tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
+
+check "breaking changes server state, not only the predicted wire update" \
+  src/main.rs '                    if break_now {
+                    set_block(x, y, z, 0);' \
+  '                    if break_now {
+                    let _ = old;' \
+  tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
+
+check "chat returns the actual sender and message" \
+  src/main.rs '                    let line = format!("<{}> {}", me.name, m);' \
+  '                    let line = format!("<{}> {}", me.name, "");' \
+  tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
+
+check "light arrays agree with their section masks" \
+  src/main.rs '    write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask' \
+  '    write_varint(&mut p, 1); p.extend_from_slice(&0x3fffffei64.to_be_bytes()); // skyLightMask' \
+  tests/gameplay_wire.py 'gameplay wire: FAIL light-mask-count'
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

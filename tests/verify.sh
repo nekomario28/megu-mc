@@ -3,9 +3,11 @@
 # each time, which is six chances to skip one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PYTHONDONTWRITEBYTECODE=1
 
 echo "== gate exit contracts"
 python3 tests/gate_scripts.py
+python3 tests/protocol767_test.py
 
 echo "== module layering"
 bash tools/layers_check.sh || exit 1
@@ -38,6 +40,7 @@ cargo build --offline --locked -j 2 --message-format=json-render-diagnostics >"$
 binary=$(python3 tools/cargo_executable.py <"$build_manifest")
 timeout 180 python3 tests/wire_smoke.py "$binary"
 timeout 180 python3 tests/client_settings_wire.py "$binary"
+timeout 180 python3 tests/gameplay_wire.py "$binary"
 
 echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe

@@ -3,6 +3,7 @@
 Status: 実装中。残件・完了判定の正本は [未修正欠陥を閉じる](close-defects/README.md)。
 以下の完了表示・数値は過去のチェックポイントであり、直近監査で i と g および保存の証明を撤回した。
 実測とモデル検査を実装の効果へ読み替えない。
+ユーザー指示により実画面・KDE経由の試験は不要。接続と操作はCLI経由で検証する。
 
 個々の設計は [foundation](foundation/README.md) / [gameplay](gameplay/README.md) /
 [time-contract](time-contract/README.md) / [mod-compatibility](mod-compatibility/README.md) が持つ。

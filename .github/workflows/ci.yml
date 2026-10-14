@@ -37,7 +37,9 @@ jobs:
       - name: Bounded localhost network smoke
         run: |
           python3 tests/wire_smoke.py "$MC_SPINE_TEST_BINARY"
+          python3 tests/protocol767_test.py
           python3 tests/client_settings_wire.py "$MC_SPINE_TEST_BINARY"
+          python3 tests/gameplay_wire.py "$MC_SPINE_TEST_BINARY"
       - name: Check Java adapter feature compilation
         run: |
           cargo check --locked --features fabric-probe

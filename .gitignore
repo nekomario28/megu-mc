@@ -1,4 +1,5 @@
 /target/
+__pycache__/
 *.log
 !/evidence/*.log
 /world_overlay.bin
