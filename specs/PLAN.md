@@ -320,3 +320,28 @@ vanilla は **view distance** を使ってチャンク送信距離を決める�
 | `flowgx` | tick の状態機械（`Machine(states, transitions)`） | 時間契約に触る前 |
 | `depsgx` | **`main.rs` 分割の層**（`ModuleGraph(depends, layers)`） | **S2.2 の前**（下位が上位を import していないかを機械的に検査できる） |
 | `schemagx` | 保存形式（節の依存） | 節を足すとき |
+
+## 13. depsgx による S2.2 の前提検査 → **循環が見つかった**
+
+`depsgx` で既存モジュールの層を検査 → **3 errors**：
+
+```
+error feature   cycle: feature → tree → feature
+error tree      layer-violation: tree (layer 4) depends on feature (layer 3)
+error worldgen  layer-violation: worldgen (layer 4) depends on feature (layer 3)
+```
+
+証拠：[evidence/foundation/module-layers](../../evidence/foundation/module-layers/README.md)
+
+**S2.2 の第一の仕事は「抽出」ではなく「循環を壊すこと」である。**
+光エンジンを新モジュールへ出しても、**そのモジュールは循環に加わるだけ**で層は良くならない。
+
+**順序（改訂）**：
+1. `feature.rs` が `tree::` / `worldgen::` を参照している箇所を列挙し、
+   **registry の責務か**を1つずつ判定する（そうなら呼び出し側へ押し出せる）
+2. 押し出せないものだけを下位層へ移す → **`depsgx` が 0 errors になるまで**
+3. **その後で**光エンジンの抽出（1抽出=1コミット、テストが緑のまま）
+
+**盲点**：`cached_lookup` / `effects` / `java_compat` / `landing` / `world_rng` が
+「到達不能」と出るのは、`main.rs` が裸の `landing::` で呼ぶため私の辺の抽出が拾えていないから。
+**dead code ではない。**
