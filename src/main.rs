@@ -931,6 +931,14 @@ fn drops() -> &'static Mutex<Vec<Drop>> { DROPS.get_or_init(|| Mutex::new(Vec::n
 fn block_drop(st: u32) -> Option<i64> {
     crate::feature::breg().and_then(|reg| reg.block_drop(st))
 }
+/// The second drop, for the blocks whose asset entry lists two. Nothing is lost when a block has
+/// only one: the list is filtered to the entries that exist.
+fn block_drops(st: u32) -> Vec<i64> {
+    let reg = crate::feature::breg();
+    let first = reg.and_then(|r| r.block_drop(st));
+    let second = reg.and_then(|r| r.block_drop_second(st));
+    [first, second].into_iter().flatten().collect()
+}
 fn spawn_drop_pkt(d: &Drop) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, d.eid as i64);
@@ -2234,7 +2242,7 @@ fn actor_tick() {
                 "attack" => {
                     let st = block_at(tx, ty, tz);
                     if st != 0 {
-                        if let Some(it) = block_drop(st) {
+                        for it in block_drops(st) {
                             let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: tx as f64 + 0.5, y: ty as f64 + 0.4, z: tz as f64 + 0.5, item: it, cnt: 1, comps: Vec::new(), age: 0 };
                                                         drops().lock().unwrap().push(d);
                             // spawn streams via interest_tick
@@ -2301,7 +2309,7 @@ fn water_intoable(st: u32) -> bool { st == 0 || water_washable(st) }
 fn wash_away(x: i32, y: i32, z: i32) {
     let st = block_at(x, y, z);
     if !water_washable(st) { return }
-    if let Some(item) = block_drop(st) {
+    for item in block_drops(st) {
         let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             x: x as f64 + 0.5, y: y as f64 + 0.4, z: z as f64 + 0.5, item, cnt: 1, comps: Vec::new(), age: 0 };
         drops().lock().unwrap().push(d);

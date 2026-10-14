@@ -90,6 +90,9 @@ pub(crate) struct BReg {
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
     tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
     drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
+    /// A few blocks drop twice: the potted plants drop the pot and the plant. Kept beside
+    /// `drops` rather than folded into it so the single-drop path stays as it was.
+    drops_second: Vec<i64>,
     stack_size: Vec<i64>, // state id -> max stack of the item, from the asset
     behaviour: Vec<u8>, // block idx -> random-tick behaviour id
     luminance: Vec<u8>, // state id -> light the state emits (0 = none)
@@ -130,6 +133,7 @@ impl BReg {
             htools: vec![],
             tool_kind: vec![],
             drops: vec![-1; n_states_max + 1],
+            drops_second: vec![-1; n_states_max + 1],
             stack_size: vec![64; n_states_max + 1],
             behaviour: vec![],
             luminance: vec![0; n_states_max + 1],
@@ -173,11 +177,14 @@ impl BReg {
             // What the block drops. The asset lists the default drop, with no
             // enchantment and the correct tool assumed, which is the question this
             // answers; silk touch and fortune are handled where the block is broken.
-            // 34 blocks list two drops (the potted plants drop the pot and the
-            // plant) and only the first is modelled here.
-            let drop0 = match b.get("drops").and_then(|d| d.into_arr()) {
-                Some(a) => a.first().map(|j| j.num() as i64).unwrap_or(-1),
-                None => -1,
+            // 34 blocks list two drops (the potted plants drop the pot and the plant). Both are
+            // read: modelling only the first lost one item per broken pot.
+            let (drop0, drop1) = match b.get("drops").and_then(|d| d.into_arr()) {
+                Some(a) => (
+                    a.first().map(|j| j.num() as i64).unwrap_or(-1),
+                    a.get(1).map(|j| j.num() as i64).unwrap_or(-1),
+                ),
+                None => (-1, -1),
             };
             // Vanilla answers "can this tool harvest this block?" from the block's
             // harvestTools set: empty means any tool works, otherwise the held item
@@ -243,6 +250,7 @@ impl BReg {
                 reg.st_blk[st] = bi;
                 reg.hardness[st] = hardness;
                 reg.drops[st] = drop0;
+                reg.drops_second[st] = drop1;
                 reg.stack_size[st] = stack_size;
                 if let Some(pbb) = pbr {
                     if let Some(sts) = jarr(pbb, "states") {
@@ -407,6 +415,14 @@ impl BReg {
     /// one, and the reason this cannot be inferred from the block's own item.
     pub(crate) fn block_drop(&self, st: u32) -> Option<i64> {
         match self.drops.get(st as usize).copied() {
+            Some(d) if d >= 0 => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The second item a block drops, when the asset lists one.
+    pub(crate) fn block_drop_second(&self, st: u32) -> Option<i64> {
+        match self.drops_second.get(st as usize).copied() {
             Some(d) if d >= 0 => Some(d),
             _ => None,
         }

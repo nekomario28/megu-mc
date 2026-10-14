@@ -874,3 +874,23 @@ fn the_falling_set_is_the_asset_set() {
         assert_ne!(reg.behaviour_of(st), crate::feature::B_FALLING, "{not_falling} must not fall");
     }
 }
+
+/// A potted plant drops the pot and the plant. The asset lists both; reading only the first lost one
+/// item per broken pot, and nothing said so, because a single drop is the normal case.
+#[test]
+fn a_potted_plant_drops_both_entries_the_asset_lists() {
+    let reg = breg().unwrap();
+    let two: Vec<&str> = ["potted_oak_sapling", "potted_fern", "potted_flowering_azalea_bush"]
+        .into_iter()
+        .filter(|n| {
+            let st = name_to_state(n).unwrap_or_else(|| panic!("{n} must exist"));
+            reg.block_drop(st).is_some() && reg.block_drop_second(st).is_some()
+        })
+        .collect();
+    assert_eq!(two.len(), 3, "each of these drops two items, got {two:?}");
+
+    // The single-drop case must stay single, or this would pass by marking everything two.
+    let stone = name_to_state("stone").expect("stone must exist");
+    assert!(reg.block_drop(stone).is_some(), "stone drops itself");
+    assert!(reg.block_drop_second(stone).is_none(), "and only once");
+}

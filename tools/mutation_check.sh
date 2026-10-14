@@ -186,6 +186,11 @@ check "the falling queue is written into the save" \
   '(*f).extend_from_slice(b"XXXX");' \
   the_falling_queue_survives_a_save_and_load_round_trip
 
+check "a block that drops twice keeps its second drop" \
+  src/feature.rs '                reg.drops_second[st] = drop1;' \
+  '                reg.drops_second[st] = -1;' \
+  a_potted_plant_drops_both_entries_the_asset_lists
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
