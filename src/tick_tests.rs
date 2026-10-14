@@ -1180,3 +1180,4 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     *forceloaded().lock().unwrap() = old_forced;
     set_test_region(oh, ow);
 }
+
