@@ -803,3 +803,42 @@ fn block_light_falls_by_one_a_step_from_its_source() {
     assert_eq!(nib3(70, 6, 7), 0, "an opaque neighbour gets no light");
     assert_eq!(nib3(70, 7, 7), 0, "and passes none beyond it");
 }
+
+/// The sideways spread against a scenario that models the ground as opaque.
+///
+/// The first version of this test made every column transparent except a wall, so light fell
+/// straight down from each column's own sky and a cell behind the wall came out at 6. The spread
+/// was never wrong: the ground was air. This one states the opacity it means and drives the real
+/// function rather than a copy of it.
+#[test]
+fn sky_light_reaches_sideways_through_an_opening() {
+    // Ground at y <= 69 except a cave at z=7, x 6..=12, y 61..=69, whose ceiling is solid except
+    // above the shaft at x=10. Only the shaft column therefore has its first opaque block at y=60;
+    // every other cave column's own sky is above its ceiling at 69.
+    let mut floors = [69i32; 256];
+    floors[(7 << 4) | 10] = 60;
+    let solid = |x: i32, y: i32, z: i32| -> u8 {
+        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+        if lz == 8 {
+            return 15; // the wall
+        }
+        let in_cave = lz == 7 && (6..=12).contains(&lx) && (61..=69).contains(&y);
+        let ceiling = y == 69 && lz == 7 && lx != 10;
+        if in_cave && !ceiling { 0 } else { 15 }
+    };
+    let spill = sky_spill(0, 0, &floors, solid);
+    let at = |x: i32, y: i32, z: i32| spill.get(&(x, y, z)).copied().unwrap_or(0);
+
+    assert_eq!(at(10, 61, 7), 15, "the shaft's own lit cell is the seed");
+    assert_eq!(at(9, 61, 7), 14, "one step into the cave loses one");
+    assert_eq!(at(8, 61, 7), 13, "two steps lose two");
+    assert_eq!(at(6, 61, 7), 11, "four steps lose four");
+    // The spill holds dark cells only, so the shaft's own column above the floor is not in it: the
+    // per-column rule already lights those to 15.
+    assert_eq!(at(10, 62, 7), 0, "the shaft's own column is the column rule's business");
+    assert_eq!(at(8, 69, 7), 0, "the ceiling stops what falls on it");
+    assert_eq!(at(9, 69, 7), 0, "nor beside the shaft's opening");
+    assert_eq!(at(10, 61, 8), 0, "the wall passes nothing");
+    assert_eq!(at(10, 61, 9), 0, "and nothing arrives behind it");
+    assert_eq!(at(6, 66, 7), 6, "the far corner keeps the fall of nine steps");
+}

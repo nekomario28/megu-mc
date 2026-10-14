@@ -8510,6 +8510,104 @@ fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
 /// each z, eight bytes carrying the sixteen x values as nibbles. Both light kinds need this
 /// and a wrong index lights the wrong column with nothing else to notice, so it has one
 /// owner.
+/// Sky light that arrives sideways, which the per-column rule cannot produce: a window or a cave
+/// mouth lights what is beside it and a column test lights only what is above it.
+///
+/// The seed is the lit cell just above an opening's floor. Only columns whose first opaque block
+/// is below their neighbours have one, so a cave with a solid ceiling seeds nothing - its own cell
+/// above the ceiling is its sky, and the light that reaches inside it arrives through the opening.
+/// The spread then runs through dark cells only, which keeps the work proportional to the cavity.
+fn sky_spill(
+    cx: i32,
+    cz: i32,
+    floors: &[i32; 256],
+    opacity: impl Fn(i32, i32, i32) -> u8,
+) -> HashMap<(i32, i32, i32), u8> {
+    let (x0, x1) = (cx * 16 - 15, cx * 16 + 30);
+    let (z0, z1) = (cz * 16 - 15, cz * 16 + 30);
+    let dark = |x: i32, y: i32, z: i32| -> bool {
+        let (lx, lz) = (x.rem_euclid(16) as usize, z.rem_euclid(16) as usize);
+        y <= floors[(lz << 4) | lx]
+    };
+    let mut lit: HashMap<(i32, i32, i32), u8> = HashMap::new();
+    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> = std::collections::VecDeque::new();
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+            let y = floors[(lz << 4) | lx] + 1;
+            if dark(x, y, z) {
+                continue;
+            }
+            lit.insert((x, y, z), 15);
+            queue.push_back(((x, y, z), 15));
+        }
+    }
+    while let Some((p, level)) = queue.pop_front() {
+        if level <= 1 {
+            continue;
+        }
+        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+            let (qx, qy, qz) = (p.0 + dx, p.1 + dy, p.2 + dz);
+            if qx < x0 || qx > x1 || qz < z0 || qz > z1 || qy < MIN_Y || qy >= MIN_Y + 384 {
+                continue;
+            }
+            if !dark(qx, qy, qz) {
+                continue;
+            }
+            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));
+            if nl == 0 || lit.get(&(qx, qy, qz)).copied().unwrap_or(0) >= nl {
+                continue;
+            }
+            lit.insert((qx, qy, qz), nl);
+            queue.push_back(((qx, qy, qz), nl));
+        }
+    }
+    lit
+}
+
+/// Sky light for a chunk, from the world: the per-column value, raised where light has arrived
+/// sideways.
+fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
+    let Some(reg) = crate::feature::breg() else {
+        return vec![[0u8; 2048]; 26];
+    };
+    let mut floors = [0i32; 256];
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+            let mut y = height_at(x, z) - 1;
+            let mut steps = 0;
+            while steps < 16 {
+                if reg.opacity_of(block_at(x, y, z)) > 0 {
+                    break;
+                }
+                y -= 1;
+                steps += 1;
+            }
+            floors[(lz << 4) | lx] = y;
+        }
+    }
+    let spill = sky_spill(cx, cz, &floors, |x, y, z| reg.opacity_of(block_at(x, y, z)));
+    if spill.is_empty() {
+        return sky_light_sections_from(cx, cz, &floors);
+    }
+    let mut out = Vec::with_capacity(26);
+    for sec in 0..26 {
+        let sy = sec * 16 + MIN_Y;
+        out.push(pack_light_section(sy, cx, cz, |lx, wy, lz| {
+            let f = floors[(lz << 4) | lx];
+            let base = if wy > f { 15 } else { 0 };
+            base.max(
+                spill
+                    .get(&(cx * 16 + lx as i32, wy, cz * 16 + lz as i32))
+                    .copied()
+                    .unwrap_or(0),
+            )
+        }));
+    }
+    out
+}
+
 fn pack_light_section(
     sy: i32,
     cx: i32,
@@ -8720,7 +8818,7 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
     // The arrays follow as two counted lists, each entry prefixed by its length.
     // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
     // then the block light a torch contributes. Two counted lists, sky first.
-    let sky = sky_light_sections(cx, cz);
+    let sky = sky_light_sections_world(cx, cz);
     write_varint(&mut p, sky.len() as i64);
     for sec in sky { write_varint(&mut p, 2048); p.extend_from_slice(&sec); }
     let block = block_light_sections(cx, cz);
