@@ -1,0 +1,42 @@
+{
+  "checkpoint": "N: no wall-clock randomness; the world stream is seeded, saved and reloaded",
+  "goal": "Remove every clock-dependent RNG site, draw from the seeded world stream instead, persist that stream in the save, and pin its consumption order and distribution.",
+  "changes": {
+    "removed": "fn rand_u64() (SystemTime::now() ^ subsec_nanos mixed) and all 20 occurrences",
+    "converted": "19 call sites draw from world_rng::next_u64() (main.rs 17, landing.rs 2); each site's arithmetic is unchanged",
+    "persistence": "save section RNG1 (8-byte state) after FAL1; the loader restores it when present and leaves the seed-derived start when absent",
+    "ratchet": "tools/debt_ratchet.sh now fails on any SystemTime|subsec_nanos read (0 limit)"
+  },
+  "evidence": {
+    "world_rng_tests": "pinned xorshift64* vector for seed 12345, reproducibility, distinct seeds, zero-seed non-fixed-point, next_below coverage, state round trip",
+    "persistence_test": "persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_round_trip (isolated child process; asserts RNG1 present and continuation)",
+    "mutation": "loader ignores the RNG1 state -> that test fails (tools/mutation_check.sh)",
+    "graph": "16 modules, 40 edges, 0 named errors; added downward edge landing -> world_rng",
+    "verify": {
+      "command": "bash tests/verify.sh",
+      "result": "PASS",
+      "rust": "121 passed / 1 pre-existing ignored in 3 thread runs and 1 serial run",
+      "source_controls": 17,
+      "mutants_proved": 28,
+      "not_a_gate": 0,
+      "parked": 0,
+      "skipped": 0,
+      "log_sha256": "7380218a3264075bfa6bb85849db25d9e0b99e026d1d83e0b3e1cc35d54f963b"
+    }
+  },
+  "source_hashes": {
+    "src/world_rng.rs": "bf67872ac138c24b53c34ab90f40d64ae42420e99945701227fa3250682dbc53",
+    "src/main.rs": "5a47c0876b459f66d44da12e28abb04dbd8dbf00a2d91aee4cdda6d0e0c956b7",
+    "src/landing.rs": "32c42776a7a57cfb5b7ecb2272dad88d93d78b0c59c59da2619b2282b7ed4502",
+    "src/persistence_tests.rs": "340ea0b4fc780eaf16f07c55d039999423e649df7f6e95a42b455e226a9cf208",
+    "tools/debt_ratchet.sh": "e0be09a9368ea97df249cb2775e4ff58b23d87b469361f66ce2acf2cfd18f7e4",
+    "tools/mutation_check.sh": "c3e684bff9fc7509cf919ef108cb4462ac5798fcf51061ab5d988fb4a5219296",
+    "evidence/foundation/module-layers/policy.json": "af8165e6cbe4a13c43ae0abeaae078ca94d535bb8da116b44e38a86f523c1e07"
+  },
+  "limits": [
+    "Distributions change: randomness now comes from one shared seeded stream, not the clock per call",
+    "Matching vanilla's per-consumer RandomSource draws is unverified and remains part of Q",
+    "RNG1 is backward compatible (old saves lack it); whether vanilla saves an equivalent state is unverified",
+    "F (vanilla falling) and Q (whole-change review) remain open"
+  ]
+}

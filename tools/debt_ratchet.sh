@@ -57,12 +57,11 @@ ratchet() {
   fi
 }
 
-# The clock cannot be saved, replayed or compared, so anything whose behaviour depends on it cannot
-# be tested against vanilla and cannot agree with a second run of the same seed. The world stream
-# exists for exactly this; these sites are the ones that have not moved yet. Moving them shifts the
-# distributions they drive, which is why it is a deliberate slice and not a sweep.
-ratchet "clock-based RNG sites (incl. the definition)" 'rand_u64\(\)' 20 \
-  "rand_u64() reads the clock: see PLAN.md 7.2d. New randomness must draw from world_rng."
+# The clock cannot be saved, replayed or compared. Every consumer now draws from the world
+# stream, which is seeded and saved. The pattern is kept at zero so re-introducing a clock read is
+# a deliberate edit rather than a silent regression.
+ratchet "wall-clock reads (clock RNG must not return)" 'SystemTime|subsec_nanos' 0 \
+  "Randomness must draw from world_rng. A new wall-clock read needs its own decision."
 
 # A parked gate is a named gap. Parking one is sometimes right; parking one silently is how a suite
 # stops meaning anything. The mutation check counts them too, from the other side.

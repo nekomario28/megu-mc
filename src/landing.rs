@@ -108,7 +108,7 @@ pub fn cow_land(mob: &Arc<Mob>, position: (i32, i32, i32), distance: f32) -> boo
     if !(4286..=4293).contains(&state) {
         return false;
     }
-    let random = (rand_u64() >> 40) as f32 / 16777216.0;
+    let random = (crate::world_rng::next_u64() >> 40) as f32 / 16777216.0;
     if !eligible(
         distance,
         random,
@@ -173,7 +173,7 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
         1.8
     };
     if (4286..=4293).contains(&state) && !wet && *me.hp.lock().unwrap() > 0.0 {
-        let random = (rand_u64() >> 40) as f32 / 16777216.0;
+        let random = (crate::world_rng::next_u64() >> 40) as f32 / 16777216.0;
         if eligible(distance as f32, random, true, true, true, 0.6, height) {
             match commit(Trample {
                 position,

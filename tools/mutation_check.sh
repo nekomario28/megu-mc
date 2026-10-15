@@ -301,6 +301,11 @@ check "the queue cap cannot visit a cell before its real backoff" \
   '    backoff().lock().unwrap().get(&(x, y, z)).map(|(_t, _)| true).unwrap_or(true)' \
   a_backoff_past_the_queue_cap_waits_for_its_real_deadline
 
+check "a reload continues the world random stream" \
+  src/main.rs '            world_rng::restore(u64::from_be_bytes(payload[p..p + 8].try_into().unwrap()));' \
+  '            let _ = &payload[p..p + 8];' \
+  persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_round_trip
+
 check "configuration information before known packs reaches chunk streaming" \
   src/main.rs '                client_view = v;
             }

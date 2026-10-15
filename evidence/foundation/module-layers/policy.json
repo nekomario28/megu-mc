@@ -25,6 +25,7 @@
     ["generation_context", "worldgen"], ["generation_context", "block_registry"],
     ["block_registry", "json"],
     ["java_compat", "landing_types"], ["landing", "java_compat"], ["landing", "landing_types"],
+    ["landing", "world_rng"],
     ["feature", "json"], ["tree", "json"], ["worldgen", "json"], ["generation_providers", "json"],
     ["feature", "generation_math"], ["tree", "generation_math"], ["worldgen", "generation_math"],
     ["generation_providers", "generation_math"]

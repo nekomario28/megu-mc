@@ -830,7 +830,7 @@ fn damage_held(me: &Arc<Client>) -> bool {
     let Some(maxd) = tool_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else { return false };
     if comp_get(&st.2, COMP_UNBREAKABLE).is_some() { return false }
     let unb = enchant_level(&st.2, 39); // unbreaking
-    if unb > 0 && (rand_u64() % (unb + 1) as u64) != 0 { return false }
+    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 { return false }
     let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
     if dmg >= maxd {
         inv.remove(&slot);
@@ -847,7 +847,7 @@ fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
         .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else { return false };
     if comp_get(&st.2, COMP_UNBREAKABLE).is_some() { return false }
     let unb = enchant_level(&st.2, 39);
-    if unb > 0 && (rand_u64() % (unb + 1) as u64) != 0 { return false }
+    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 { return false }
     let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
     if dmg >= maxd { inv.remove(&slot); return true }
     comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
@@ -865,7 +865,7 @@ fn damage_shield(me: &Arc<Client>, blocked: f32) {
         let unb = enchant_level(&st.2, 39);
         let maxd = comp_varint(&st.2, COMP_MAX_DAMAGE).unwrap_or(337);
         let mut add = 0i64;
-        for _ in 0..(blocked.floor() as i64 + 1) { if unb == 0 || (rand_u64() % (unb + 1) as u64) == 0 { add += 1 } }
+        for _ in 0..(blocked.floor() as i64 + 1) { if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 { add += 1 } }
         let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + add;
         if dmg >= maxd { inv.remove(&slot); } else { comp_set_varint(&mut st.2, COMP_DAMAGE, dmg); }
         return;
@@ -884,7 +884,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
             if comp_get(&st.2, COMP_UNBREAKABLE).is_some() { continue }
             let unb = enchant_level(&st.2, 39);
             let mut add = 0i64;
-            for _ in 0..per { if unb == 0 || (rand_u64() % (unb + 1) as u64) == 0 { add += 1 } }
+            for _ in 0..per { if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 { add += 1 } }
             let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + add;
             if dmg >= maxd { inv.remove(&slot); broke = true; }
             else { comp_set_varint(&mut st.2, COMP_DAMAGE, dmg); }
@@ -917,13 +917,6 @@ fn held_slot_resync(me: &Arc<Client>) {
     p.extend_from_slice(&slot.to_be_bytes());
     p.extend_from_slice(&slot_wire(&st));
     if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
-}
-fn rand_u64() -> u64 {
-    use std::time::SystemTime;
-    static S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9e3779b97f4a7c15);
-    let x = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().subsec_nanos() as u64
-        ^ S.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
-    x.wrapping_mul(0xd6e8feb86659fd93).rotate_left(31)
 }
 fn read_varint_at(b: &[u8], p: usize) -> (i64, usize) {
     let mut r: i64 = 0; let mut i = 0;
@@ -1028,7 +1021,7 @@ fn explosion_pkt(x: f64, y: f64, z: f64, records: &[(i8,i8,i8)]) -> Vec<u8> {
 }
 // vanilla xp on death: hostile mobs 5, animals 1-3
 fn mob_xp(etype: i64) -> i16 {
-    if [22i64, 19, 77, 87].contains(&etype) { (1 + rand_u64() % 3) as i16 } else { 5 }
+    if [22i64, 19, 77, 87].contains(&etype) { (1 + world_rng::next_u64() % 3) as i16 } else { 5 }
 }
 // vanilla /kill applies void damage — the same loot+xp+cleanup path as
 // combat death, not a silent retain
@@ -1497,7 +1490,7 @@ fn keepalive_time_tick() {
         } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1 && t.wrapping_mul(2654435761) % RAIN_CHANCE_DENOMINATOR == 0 {
             RAINING.store(server_ticks(12000), Ordering::Relaxed);
             broadcast(-1, |_c| (0x22, vec![1u8, 0, 0, 0, 0]));
-            if rand_u64() % 8 == 0 { // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
+            if world_rng::next_u64() % 8 == 0 { // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
                 THUNDERING.store(server_ticks(3600), Ordering::Relaxed);
                 broadcast(-1, |_c| { let mut p = vec![8u8]; p.extend_from_slice(&1f32.to_be_bytes()); (0x22, p.clone()) });
             }
@@ -1808,7 +1801,7 @@ fn keepalive_time_tick() {
             sl2.retain(|p0| p0.eid != seid);
             broadcast_seen_destroy(seid);
             // vanilla: an egg that lands has a 1/8 chance to hatch a chicken
-            if is_egg && rand_u64() % 8 == 0 {
+            if is_egg && world_rng::next_u64() % 8 == 0 {
                 let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                     etype: 19, pos: Mutex::new((ix, iy, iz, 0.0, 0.0)), hp: Mutex::new(4.0),
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
@@ -2925,7 +2918,7 @@ fn mob_tick() {
                     if mobs().lock().unwrap().len() >= MOB_CAP { continue }
                     mobs().lock().unwrap().push(baby);
                     let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                        xps().lock().unwrap().push(Xp { eid: xeid, x: bx, y: by, z: bz, val: (1 + rand_u64() % 7) as i16, age: 0 });
+                                        xps().lock().unwrap().push(Xp { eid: xeid, x: bx, y: by, z: bz, val: (1 + world_rng::next_u64() % 7) as i16, age: 0 });
                     // spawn streams via interest_tick
                     continue;
                 }
@@ -3034,8 +3027,8 @@ fn mob_tick() {
                                     {
                                         let th: i64 = { let iv = cl.inv.lock().unwrap();
                                             [5i16,6,7,8].iter().map(|s| enchant_level(&iv.get(s).map(|v| v.2.clone()).unwrap_or_default(), 38)).sum() };
-                                        if dmg > 0.0 && th > 0 && (rand_u64() % 100) < (th * 15) as u64 {
-                                            let refl = 1.0 + (rand_u64() % 4) as f32;
+                                        if dmg > 0.0 && th > 0 && (world_rng::next_u64() % 100) < (th * 15) as u64 {
+                                            let refl = 1.0 + (world_rng::next_u64() % 4) as f32;
                                             let mut mh = m.hp.lock().unwrap(); *mh -= refl;
                                             let mdead = *mh <= 0.0; drop(mh);
                                             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
@@ -3161,7 +3154,7 @@ fn smelt_xp(item: i64) -> f32 {
 // grant accumulated smelting xp: floor + fractional chance (vanilla), as orbs at (px,py,pz)
 fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
     if f.xp <= 0.0 { return }
-    let whole = f.xp.floor() as i16 + if (rand_u64() % 1024) as f32 / 1024.0 < f.xp.fract() { 1 } else { 0 };
+    let whole = f.xp.floor() as i16 + if (world_rng::next_u64() % 1024) as f32 / 1024.0 < f.xp.fract() { 1 } else { 0 };
     f.xp = 0.0;
     if whole > 0 {
         xps().lock().unwrap().push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -4675,6 +4668,11 @@ fn save_world_into(f: &mut Vec<u8>) {
         (*f).extend_from_slice(&fy.to_be_bytes());
         (*f).extend_from_slice(&fz.to_be_bytes());
     }
+
+    // RNG1: the world random stream's state. Without it a reload restarts the stream
+    // from the seed, so two runs of the same seed diverge after a restart.
+    (*f).extend_from_slice(b"RNG1");
+    (*f).extend_from_slice(&world_rng::saved_state().to_be_bytes());
 }
 fn load_world() -> Result<(), &'static str> {
     let raw = match std::fs::read(WORLD_FILE) {
@@ -5127,6 +5125,15 @@ fn load_world_from(payload: &[u8]) {
             let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             if !q.contains(&(fx, fy, fz)) { q.push((fx, fy, fz)); }
+        }
+    }
+
+    // World random state, when the save carries one. A save without it (written before
+    // this section existed) leaves the stream at the seed-derived start.
+    if p + 4 <= payload.len() && &payload[p..p + 4] == b"RNG1" {
+        p += 4;
+        if p + 8 <= payload.len() {
+            world_rng::restore(u64::from_be_bytes(payload[p..p + 8].try_into().unwrap()));
         }
     }
 }
@@ -12352,7 +12359,7 @@ fn handle(mut s: TcpStream) {
                             4278..=4285 => Some(853), // wheat -> seeds
                             _ => block_drop(old),
                         };
-                        let n = if fort > 0 && ore.is_some() { 1 + (rand_u64() % (fort as u64 + 1)) as u8 } else { 1 };
+                        let n = if fort > 0 && ore.is_some() { 1 + (world_rng::next_u64() % (fort as u64 + 1)) as u8 } else { 1 };
                         (it, n)
                     };
                     crops().lock().unwrap().remove(&(x, y, z));
@@ -12978,7 +12985,7 @@ fn handle(mut s: TcpStream) {
                         let loot = enchant_level(&held2.2, 18).clamp(0, 3) as u64;
                         for (item, cnt, comps) in mob_loot(etype, burn_kill).into_iter().filter(|st| !(was_sheared && st.0 == 202))
                             .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-                            let extra = if loot > 0 { (rand_u64() % (loot + 1)) as u8 } else { 0 };
+                            let extra = if loot > 0 { (world_rng::next_u64() % (loot + 1)) as u8 } else { 0 };
                             let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt: cnt + extra, comps, age: 0 };
                             drops().lock().unwrap().push(d);
                         }
@@ -13347,7 +13354,7 @@ fn handle(mut s: TcpStream) {
                                         // vanilla: each completed trade grants 3-6 xp to the player
                                         let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
                                         xps().lock().unwrap().push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px, y: py + 1.0, z: pz, val: (3 + rand_u64() % 4) as i16, age: 0 });
+                                            x: px, y: py + 1.0, z: pz, val: (3 + world_rng::next_u64() % 4) as i16, age: 0 });
                                         // auto-refill from inventory
                                         let mut inv = me.inv.lock().unwrap();
                                         if s0.1 == 0 && inv_consume(&mut inv, ai, ac as i64) {
@@ -14140,7 +14147,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, &me));
                         // vanilla food side-effects (golden apple, pufferfish, ...)
                         for &(ch, eid2, amp, ticks) in food_effects(it) {
-                            if (rand_u64() % 100) < ch {
+                            if (world_rng::next_u64() % 100) < ch {
                                 { let mut ef = me.effs.lock().unwrap();
                                   ef.retain(|e| e.id != eid2);
                                   ef.push(Eff { id: eid2, amp, left: ticks }); }
@@ -14165,8 +14172,8 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                         if it == name_to_item("chorus_fruit").unwrap_or(-9) {
                             let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
                             for _ in 0..16 {
-                                let nx = px + ((rand_u64() % 1600) as f64 / 100.0) - 8.0;
-                                let nz = pz + ((rand_u64() % 1600) as f64 / 100.0) - 8.0;
+                                let nx = px + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
+                                let nz = pz + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
                                 let ny = surface_y(nx.round() as i32, nz.round() as i32);
                                 if (ny - py).abs() < 8.0 {
                                     { let mut p = me.pos.lock().unwrap(); *p = (nx, ny, nz, p.3, p.4, true); }

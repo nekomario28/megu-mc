@@ -26,6 +26,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
     let old_time = WORLD_TIME.swap(555, Ordering::Relaxed);
     let old_forced_chunk = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_rng = world_rng::saved_state();
     forceloaded().lock().unwrap().insert((0, 0));
     world().lock().unwrap().entry((0, 0)).or_default().insert(0x0000_0004, 4);
     drops().lock().unwrap().push(Drop { eid: 777, x: 0.5, y: 70.0, z: 0.5,
@@ -77,6 +78,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
     *drops().lock().unwrap() = old_drops;
     *mobs().lock().unwrap() = old_mobs;
     WORLD_TIME.store(old_time, Ordering::Relaxed);
+    world_rng::restore(old_rng);
     loaded
 }
 
@@ -286,6 +288,33 @@ fn the_falling_queue_survives_a_save_and_load_round_trip() {
 
     *world().lock().unwrap() = old_world;
     *falling().lock().unwrap() = old_falling;
+}
+
+#[test]
+fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
+    if test_support::isolated_world_test() { return; }
+    let _g = world_guard();
+    let old_world = world().lock().unwrap().clone();
+    let old_rng = world_rng::saved_state();
+
+    world_rng::seed(4242);
+    for _ in 0..5 { let _ = world_rng::next_u64(); }
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    assert!(payload.windows(4).any(|w| w == b"RNG1"),
+        "the save must carry the world random stream state");
+    // The value the reloaded stream must produce next.
+    let expected = world_rng::next_u64();
+
+    // Move the live stream elsewhere first: reading back a value that was never
+    // replaced would prove nothing.
+    world_rng::seed(999);
+    load_world_from(&payload);
+    assert_eq!(world_rng::next_u64(), expected,
+        "the reloaded stream must continue from the saved state, not restart");
+
+    *world().lock().unwrap() = old_world;
+    world_rng::restore(old_rng);
 }
 
 #[test]

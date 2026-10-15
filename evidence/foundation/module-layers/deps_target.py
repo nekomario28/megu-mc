@@ -23,6 +23,7 @@ graph = d.ModuleGraph(
     modules=modules,
     depends=[("main", name) for name in modules if name != "main"] + [
         ("landing", "java_compat"), ("landing", "landing_types"),
+        ("landing", "world_rng"),
         ("java_compat", "landing_types"),
         ("feature", "tree"), ("feature", "worldgen"),
         ("feature", "block_registry"), ("feature", "generation_providers"),

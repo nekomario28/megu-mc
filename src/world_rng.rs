@@ -5,8 +5,9 @@
 //! gives neither — nothing can be tested against it, and there is no state to save — so
 //! anything whose behaviour depends on randomness has to draw from here instead.
 //!
-//! This is not yet the stream the drops use; those still read the clock, and moving them
-//! would shift the distributions they drive. New consumers start here.
+//! Every consumer that used to read the clock draws from here now: random ticks,
+//! durability rolls, loot and the other gameplay rolls. The state is written to the
+//! save, so a reload continues the same sequence instead of restarting it.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -29,16 +30,12 @@ pub(crate) fn seed(s: u64) {
     *st = if s == 0 { DEFAULT_SEED } else { s };
 }
 
-/// The current state, for saving. Nothing saves it yet: the level format has no section
-/// for it, so a restart today starts the stream over. That is a real gap against vanilla,
-/// which stores it with the level, and it is noted rather than papered over.
-#[cfg(test)]
+/// The current state, for saving.
 pub(crate) fn saved_state() -> u64 {
     *state().lock().unwrap()
 }
 
-/// Restore a saved state. Test-only for the same reason as `saved_state`.
-#[cfg(test)]
+/// Restore a saved state.
 pub(crate) fn restore(s: u64) {
     *state().lock().unwrap() = if s == 0 { DEFAULT_SEED } else { s };
 }
@@ -80,6 +77,21 @@ mod tests {
         seed(12345);
         let b: Vec<u64> = (0..8).map(|_| next_u64()).collect();
         assert_eq!(a, b, "a seeded stream must be reproducible");
+    }
+
+    /// A fixed vector pins the algorithm and the draw order, not only reproducibility:
+    /// two runs could agree while both used a different generator.
+    #[test]
+    fn the_stream_is_the_pinned_xorshift64star_vector() {
+        let _g = guard();
+        seed(12345);
+        let got: Vec<u64> = (0..4).map(|_| next_u64()).collect();
+        assert_eq!(got, vec![
+            10977518812293740004,
+            13893246733018840292,
+            1412386850724336324,
+            13578198927181985541,
+        ]);
     }
 
     #[test]
