@@ -27,7 +27,7 @@ fn sparse_sky_composition_matches_every_dense_nibble() {
                 let actual = sky_light_sections_with_spill(cx, cz, &floors, values);
                 assert_eq!(actual.len(), 26);
                 for (section, bytes) in actual.iter().enumerate() {
-                    let sy = MIN_Y + section as i32 * 16;
+                    let sy = LIGHT_MIN_Y + section as i32 * 16;
                     let expected = pack_light_section(sy, |lx, y, lz| {
                         let base: u8 = if y > floors[(lz << 4) | lx] { 15 } else { 0 };
                         base.max(values.get(&(cx * 16 + lx as i32, y, cz * 16 + lz as i32))
@@ -40,4 +40,26 @@ fn sparse_sky_composition_matches_every_dense_nibble() {
             }
         }
     }
+}
+
+/// The light array at index i must belong to light section `LIGHT_MIN_Y/16 + i`, where
+/// `LIGHT_MIN_Y` is one section below the world. Vanilla
+/// `LevelLightEngine.getMinLightSection()` is `getMinSection() - 1` and the packet sends
+/// `getSectionsCount() + 2` arrays from there; anchoring at `MIN_Y` shifts every array up one.
+#[test]
+fn light_sections_start_one_below_the_world() {
+    assert_eq!(LIGHT_MIN_Y, MIN_Y - 16, "the first light section is minSection - 1");
+    let mut floors = [MIN_Y + 5; 256];
+    let secs = sky_light_sections_from(0, 0, &floors);
+    assert_eq!(secs.len(), 26);
+    let nib = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
+        let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nib(MIN_Y + 5, 0, 0), 0, "at the floor is dark");
+    assert_eq!(nib(MIN_Y + 6, 0, 0), 15, "above the floor is lit");
+    assert_eq!(nib(MIN_Y - 1, 0, 0), 0, "the extra section below the world is dark");
+    assert_eq!(nib(LIGHT_MIN_Y, 0, 0), 0, "and its bottom is dark too");
 }

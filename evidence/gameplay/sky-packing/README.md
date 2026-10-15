@@ -42,3 +42,21 @@ mc-spine の `sky_light_sections_with_spill` は
 
 これは光値の基点だけである。**world y → light section の対応（26 section の採り方）と、
 生成地形の全発光源の網羅は未照合**であり、Qの残件として変わらない。
+
+## light section の基点を修正（Q）
+
+vanilla `LevelLightEngine`（obf `eot`）のバイトコード：
+
+- `getMinLightSection() = getMinSection() - 1`（`d()`）
+- `getLightSectionCount() = getSectionsCount() + 2`（`c()`、overworld で 26）
+
+つまり light の26配列は **`minSection-1`（= `MIN_Y - 16`、y=-80）から**始まる。
+従来の mc-spine は `sec*16 + MIN_Y` で **1セクション高く**配置しており、クライアントは
+index i を `-4+i` ではなく `-5+i` として読むため、全配列が1つずれていた。
+
+`LIGHT_MIN_Y = MIN_Y - 16` を導入し、`sky_light_sections_from`・`block_light_sections_from`・
+`sky_light_sections_with_spill` の基点とクリップを修正。`light_sections_start_one_below_the_world`
+が `LIGHT_MIN_Y == MIN_Y - 16` と `MIN_Y` セクションの独立性を固定し、
+`tools/mutation_check.sh` が `LIGHT_MIN_Y` を `MIN_Y` に戻す変異を赤にする。
+
+残りは**生成地形の全発光源の網羅**（現状は overlay の編集と溶岩のみを探索する）で、これは Q に残る。

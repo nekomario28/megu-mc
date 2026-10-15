@@ -196,6 +196,11 @@ check "a block above a removed support is scheduled" \
   '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
   sand_falls_under_vanilla_gravity_until_it_lands
 
+check "light sections start one below the world" \
+  src/main.rs 'const LIGHT_MIN_Y: i32 = MIN_Y - 16;' \
+  'const LIGHT_MIN_Y: i32 = MIN_Y;' \
+  light_sections_start_one_below_the_world
+
 check "a falling block passes through replaceable blocks" \
   src/main.rs '    reg.is_air(st) || reg.is_liquid(st) || reg.is_replaceable(st)' \
   '    reg.is_air(st) || reg.is_liquid(st)' \

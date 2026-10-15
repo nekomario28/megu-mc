@@ -8551,6 +8551,13 @@ fn within_search(cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
     x >= cx * 16 - 15 && x <= cx * 16 + 30 && z >= cz * 16 - 15 && z <= cz * 16 + 30 && y >= MIN_Y && y < MIN_Y + 384
 }
 
+/// The first light section, from vanilla `LevelLightEngine.getMinLightSection()`:
+/// `getMinSection() - 1`, one section below the world's lowest block section. The light packet
+/// sends `getLightSectionCount() = getSectionsCount() + 2` sections from here, so the array at
+/// index i belongs to light section `LIGHT_MIN_Y/16 + i`. Anchoring at `MIN_Y` instead would
+/// shift every array up one section.
+const LIGHT_MIN_Y: i32 = MIN_Y - 16;
+
 fn block_light_sections_from(
     cx: i32,
     cz: i32,
@@ -8625,7 +8632,7 @@ fn block_light_sections_from(
     }
     let mut out = Vec::with_capacity(26);
     for sec in 0..26 {
-        let sy = sec * 16 + MIN_Y;
+        let sy = sec * 16 + LIGHT_MIN_Y;
         out.push(pack_light_section(sy, |lx, wy, lz| {
             if wy < y0 || wy > y1 {
                 return 0;
@@ -8830,8 +8837,8 @@ fn sky_light_sections_with_spill(
     let mut out = sky_light_sections_from(cx, cz, floors);
     for (&(x, y, z), &level) in spill {
         if x.div_euclid(16) != cx || z.div_euclid(16) != cz
-            || y < MIN_Y || y >= MIN_Y + 26 * 16 { continue; }
-        let (lx, lz, relative_y) = ((x & 15) as usize, (z & 15) as usize, (y - MIN_Y) as usize);
+            || y < LIGHT_MIN_Y || y >= LIGHT_MIN_Y + 26 * 16 { continue; }
+        let (lx, lz, relative_y) = ((x & 15) as usize, (z & 15) as usize, (y - LIGHT_MIN_Y) as usize);
         let byte = &mut out[relative_y / 16][(relative_y & 15) * 128 + lz * 8 + lx / 2];
         let shift = (lx & 1) * 4;
         let raised = ((*byte >> shift) & 15).max(level) & 15;
@@ -8890,7 +8897,7 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
     }
     let mut out = Vec::with_capacity(26);
     for sec in 0..26 {
-        let sy = sec * 16 + MIN_Y;
+        let sy = sec * 16 + LIGHT_MIN_Y;
         let mut arr = [0u8; 2048];
         if fmax < sy {
             // Every floor is below this section, so the whole section is above its own

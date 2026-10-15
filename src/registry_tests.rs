@@ -696,8 +696,8 @@ fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
     let secs = sky_light_sections_from(0, 0, &floors);
 
     let nibble = |y: i32, lx: usize, lz: usize| -> u8 {
-        let sec = ((y - MIN_Y) / 16) as usize;
-        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
         if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
     };
@@ -713,8 +713,8 @@ fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
     two[(7 << 4) | 5] = 79;
     let secs2 = sky_light_sections_from(0, 0, &two);
     let nib2 = |y: i32, lx: usize, lz: usize| -> u8 {
-        let sec = ((y - MIN_Y) / 16) as usize;
-        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
         if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
     };
@@ -734,8 +734,8 @@ fn sky_light_reads_lit_at_the_surface_and_dark_under_it() {
     let surface = height_at(5, 7);
     let secs = sky_light_sections(0, 0);
     let nibble = |y: i32, lx: usize, lz: usize| -> u8 {
-        let sec = ((y - MIN_Y) / 16) as usize;
-        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
         if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
     };
@@ -754,8 +754,8 @@ fn block_light_falls_by_one_a_step_from_its_source() {
     let sources = [((5, 70, 7), lamp)];
     let secs = block_light_sections_from(0, 0, &sources, |_, _, _| 0);
     let nib = |y: i32, lx: usize, lz: usize| -> u8 {
-        let sec = ((y - MIN_Y) / 16) as usize;
-        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
         if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
     };
@@ -768,8 +768,8 @@ fn block_light_falls_by_one_a_step_from_its_source() {
     let corner = [((0i32, 70, 0), lamp)];
     let cs = block_light_sections_from(0, 0, &corner, |_, _, _| 0);
     let cnib = |y: i32, lx: usize, lz: usize| -> u8 {
-        let sec = ((y - MIN_Y) / 16) as usize;
-        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = cs[sec][sy * 128 + lz * 8 + (lx >> 1)];
         if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
     };
@@ -780,8 +780,8 @@ fn block_light_falls_by_one_a_step_from_its_source() {
     let across = [((-1i32, 70, 7), lamp)];
     let secs2 = block_light_sections_from(0, 0, &across, |_, _, _| 0);
     let nib2 = |y: i32, lx: usize, lz: usize| -> u8 {
-        let sec = ((y - MIN_Y) / 16) as usize;
-        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
         if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
     };
@@ -795,8 +795,8 @@ fn block_light_falls_by_one_a_step_from_its_source() {
     // A block that stops light does not pass it on.
     let blocked = block_light_sections_from(0, 0, &sources, |x, _, _| if x == 6 { 15 } else { 0 });
     let nib3 = |y: i32, lx: usize, lz: usize| -> u8 {
-        let sec = ((y - MIN_Y) / 16) as usize;
-        let sy = (y - MIN_Y - (sec as i32) * 16) as usize;
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = blocked[sec][sy * 128 + lz * 8 + (lx >> 1)];
         if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
     };
