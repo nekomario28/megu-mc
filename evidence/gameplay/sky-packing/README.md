@@ -60,3 +60,16 @@ index i を `-4+i` ではなく `-5+i` として読むため、全配列が1つ�
 `tools/mutation_check.sh` が `LIGHT_MIN_Y` を `MIN_Y` に戻す変異を赤にする。
 
 残りは**生成地形の全発光源の網羅**（現状は overlay の編集と溶岩のみを探索する）で、これは Q に残る。
+
+## 残る発光源の網羅（設計メモ）
+
+`block_light_sections` は overlay の編集と `lavas()` だけを光源として走査する。
+生成地形の glowstone/sea lantern/生成溶岩は `base_state`（`wg2_block` + `column_state`）に
+あるが overlay には無いため、光を出さない。
+
+素直な修正は `chunk_data` が既に全ブロック状態を持っているので、そこ（非fast-path分岐）で
+`luminance_of(st) > 0` を per-chunk キャッシュへ集め、`block_light_sections` が3×3近傍の
+キャッシュをマージする案。ただし **チャンク送信順** に依存する（隣接チャンク未生成なら
+その光源を落とす）ため、順序非依存にするには近傍の生成地形を走査するか、
+近傍が揃うまで光を送らない設計が要る。全走査は 48×48×384 ≈ 88万 state/chunk で高コスト。
+このトレードオフを決めるのが次のスライス。
