@@ -1,0 +1,78 @@
+{
+  "checkpoint": "H: shared generation contracts moved below feature and tree",
+  "parent_commit": "9c43051ffa203824ee53085abbdcc48b321d2139",
+  "branch": "fix/20tps-integrated",
+  "goal": "Remove the feature/tree dependency cycle and the tree upward dependency by moving the registry, provider/predicate and generation-context contracts to lower owners, without changing behavior, RNG consumption, ordering, state ownership, configuration or persistence.",
+  "observed_graph": {
+    "modules": 16,
+    "edges": 39,
+    "findings": 0,
+    "accepted_errors": [],
+    "command": "PATH=<pinned-venv>/bin bash tools/layers_check.sh",
+    "inspector": "depsgx pinned to gxkit d6b9ad8db4774919c8b4fb032342e53b2548b660"
+  },
+  "new_owners": {
+    "block_registry": "states, metadata/property mapping, tags, per-state values, block-state JSON helpers",
+    "generation_providers": "IP/HP/BSP providers, Pr/RT predicates, PM modifiers, placement survival rules",
+    "generation_context": "FC: one mutable Gen borrow plus write-through overrides and terrain/heightmap/biome caches",
+    "json": "generic JSON field accessors js/jstr/jnum/jint/jf32/jbool/jarr"
+  },
+  "source_hashes": {
+    "src/block_registry.rs": "db23cb33328a0dc019c0e7f0427ded1cffd4cf82e177efd30bee2ed7e1443b87",
+    "src/generation_context.rs": "708a36c02065c0780bea77a565121dc48bacba853f02020987e6e48d072e0cb5",
+    "src/generation_providers.rs": "c399216d98f050e2c921cfe91d921f6986fdbd11e2b77990b21b0f52e133b837",
+    "src/generation_contract_tests.rs": "7258227e495e9c504c2f53d918f07f98fa9eba8b17a24912f6cd327e4efb50ab",
+    "src/feature.rs": "d6a51709711d125ee43ed1b45baaa016349be59ae86c7f1b825dbf093f09f781",
+    "src/json.rs": "f938f5b3f29cba3a6e2b9a1c8e33bba60c2ad6ad7dd5ae9787c3ec1b674d4574",
+    "src/tree.rs": "a82a8c5f6d62c01f29737293e724ed56dce65b087e089438933cce17461f8621",
+    "src/worldgen.rs": "340da25809c9bbf284c694d36f8fe0c73e554a88ecbb3e8bad78a712ef3eb97e",
+    "evidence/foundation/module-layers/policy.json": "457362c7c7476ac4ede4cc83f0cb8340fccd764af0c34fe9ed37b55915c06274",
+    "evidence/foundation/module-layers/provider-baseline.bin": "70f3d70bbfac38232fe4be1d5f79f6e10f22684b09e36ad00382829531000e76"
+  },
+  "frozen_comparisons": {
+    "population_bytes": {
+      "sha256": "0ab88652a45f7d0917c21c8d09f6b610c856f7315c954a9eb81fcde689e3277c",
+      "how": "independent pre-refactor worktree, two fresh Cargo test processes over sorted overrides and completion sets; environment-relative caches are not assumed present"
+    },
+    "population_digest": {
+      "md5": "8afe1b4f2b9cebd5e86f2b5a56371ea9",
+      "test": "worldgen::wg_tests::feature_population_output_matches_the_pre_refactor_capture",
+      "how": "permanent test hashes the same sorted capture, so a shared change made on both sides cannot hide behind a lazy-vs-direct comparison"
+    },
+    "provider_context_fixture": {
+      "file": "evidence/foundation/module-layers/provider-baseline.bin",
+      "test": "feature::generation_contract_tests",
+      "how": "byte-exact values and the two following raw draws per provider call pin RNG-consumption count; context overrides/heightmaps/biomes/bounds are asserted"
+    }
+  },
+  "verification": {
+    "command": "bash tests/verify.sh",
+    "rust": "118 passed / 1 pre-existing ignored in each of 3 thread runs and 1 serial run",
+    "source_controls": 17,
+    "mutants_proved": 26,
+    "not_a_gate": 0,
+    "parked": 0,
+    "skipped": 0,
+    "result": "PASS",
+    "verify_log_sha256": "49cdbd1105976de492b86cca76bfdda49b1ebe776e5db0e37211381708679711"
+  },
+  "independent_review": {
+    "reviewer": "pi (separate read-only session)",
+    "verdict": "no confirmed defect",
+    "log_sha256": "ec5fdcb60da6dc5374eff41e1a2555082301e01f4638071ae0a7119439918c0d",
+    "addressed": [
+      "reduced pub(crate) visibility (p_ya/noise_state/noise_j/st_list/off_arr private; YA/HP remain pub(crate) only for HP's variant fields)",
+      "added a mutation that proves the population digest reacts to a shared provider change",
+      "added a multi-step Pr::Unobstructed assertion kept outside the frozen trace"
+    ],
+    "limitations": [
+      "reviewer could not compile, run tests, or read all 14.7k lines of main.rs; runtime results come from main execution",
+      "codex review was unavailable (usage limit); pi was used as the independent reviewer"
+    ]
+  },
+  "limits": [
+    "Static dependency separation only; it does not claim a runtime call graph, vanilla parity, or representative-load performance",
+    "T (scheduler/backoff invariants), F (vanilla falling), N (persistent RNG) and Q (whole-change/lighting parity) remain open",
+    "One pre-existing ignored Rust test remains; overall completion is not claimed"
+  ]
+}

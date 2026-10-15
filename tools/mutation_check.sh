@@ -187,7 +187,7 @@ check "lazy feature lookup applies its population input and retains cached overr
   worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides
 
 FALLING_SELF='    if y > MIN_Y
-        && reg.behaviour_of(block_at(x, y, z)) == crate::feature::B_FALLING
+        && reg.behaviour_of(block_at(x, y, z)) == crate::block_registry::B_FALLING
         && fallable(x, y - 1, z)
     {
         schedule(x, y, z);
@@ -198,14 +198,14 @@ check "a placed gravity block is scheduled by its own cell" \
   every_falling_block_is_scheduled_and_moves_one_cell
 
 check "the falling set comes from the asset, not a hand list" \
-  src/main.rs 'if reg.behaviour_of(st) != crate::feature::B_FALLING {
+  src/main.rs 'if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
             continue; // something else is here now' \
   'if !matches!(st, 112 | 117 | 118) {
             continue; // something else is here now' \
   every_falling_block_is_scheduled_and_moves_one_cell
 
 check "a landed block is still scheduled when the support is removed" \
-  src/main.rs '    if fallable(x, y, z) && reg.behaviour_of(block_at(x, y + 1, z)) == crate::feature::B_FALLING {' \
+  src/main.rs '    if fallable(x, y, z) && reg.behaviour_of(block_at(x, y + 1, z)) == crate::block_registry::B_FALLING {' \
   '    if false {' \
   sand_falls_one_block_a_tick_until_it_lands
 
@@ -232,7 +232,7 @@ check "the falling queue is written into the save" \
   the_falling_queue_survives_a_save_and_load_round_trip
 
 check "a block that drops twice keeps its second drop" \
-  src/feature.rs '                reg.drops_second[st] = drop1;' \
+  src/block_registry.rs '                reg.drops_second[st] = drop1;' \
   '                reg.drops_second[st] = -1;' \
   a_potted_plant_drops_both_entries_the_asset_lists
 
@@ -247,7 +247,7 @@ check "breaking a chest drops the slots it owned" \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a renamed block is still paired between the two assets" \
-  src/feature.rs '("minecraft:chain", "minecraft:iron_chain")' \
+  src/block_registry.rs '("minecraft:chain", "minecraft:iron_chain")' \
   '("minecraft:chain", "minecraft:not_a_block")' \
   every_wire_state_has_complete_metadata
 
@@ -272,14 +272,29 @@ check "broken sign text cannot survive its block" \
   furnace_and_sign_round_trip_keeps_only_live_owners
 
 check "solid metadata must reach every note block state" \
-  src/feature.rs '                        reg.st_fl[st] = flags;' \
+  src/block_registry.rs '                        reg.st_fl[st] = flags;' \
   '                        reg.st_fl[st] = 0;' \
   note_block_keeps_solid_and_light_values_for_every_instrument
 
 check "property remapping cannot reuse positional state offsets" \
-  src/feature.rs '        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;' \
+  src/block_registry.rs '        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;' \
   '        out = offset;' \
   property_names_and_values_determine_metadata_position
+
+check "a predicate reads solidity, not replaceability" \
+  src/generation_providers.rs '        Pr::Solid => reg.is_solid(ctx.get(x, y, z)),' \
+  '        Pr::Solid => reg.is_replaceable(ctx.get(x, y, z)),' \
+  provider_values_and_following_rng_match_pre_extraction
+
+check "a context override outranks the cached terrain read" \
+  src/generation_context.rs '        if let Some(&s) = self.wr.get(&(x, y, z)) {' \
+  '        if let Some(&s) = self.rc.get(&(x, y, z)) {' \
+  context_overrides_heights_bounds_and_biomes_keep_existing_results
+
+check "the frozen population digest notices shared provider changes" \
+  src/generation_providers.rs '            IP::Uniform(a, b) => r.next_inbetween(*a, *b),' \
+  '            IP::Uniform(a, b) => (*a + *b) / 2,' \
+  feature_population_output_matches_the_pre_refactor_capture
 
 check "configuration information before known packs reaches chunk streaming" \
   src/main.rs '                client_view = v;

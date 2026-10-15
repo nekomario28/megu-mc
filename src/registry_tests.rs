@@ -1,5 +1,5 @@
 use super::*;
-use crate::feature::breg;
+use crate::block_registry::breg;
 
 /// The block/item knowledge is spread across several hand-maintained tables, and
 /// the gate the registry slice needs is also the tool that says whether they agree
@@ -157,17 +157,17 @@ fn mining_time_is_the_asset_value_for_every_state() {
         panic!("the block registry must load from assets/");
     };
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::feature::jparse_pub(&raw)
+    let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
         .into_arr()
         .expect("the asset is an array")
         .clone();
     let mut checked = 0usize;
     for b in &md {
-        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
-        let h = crate::feature::jnum_pub(b, "hardness").unwrap_or(0.6) as f32;
-        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
+        let h = crate::json::jnum(b, "hardness").unwrap_or(0.6) as f32;
+        let name = crate::json::jstr(b, "name").unwrap_or_else(|| "?".into());
         for st in lo..=hi {
             if (st as usize) >= reg.state_count() {
                 continue;
@@ -217,7 +217,7 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
         panic!("the block registry must load from assets/");
     };
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::feature::jparse_pub(&raw)
+    let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
         .into_arr()
         .expect("the asset is an array")
@@ -235,9 +235,9 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
         if !allowed.is_empty() {
             needs_tool += 1;
         }
-        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
-        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::json::jstr(b, "name").unwrap_or_else(|| "?".into());
         for st in lo..=hi {
             if (st as usize) >= reg.state_count() {
                 continue;
@@ -290,7 +290,7 @@ fn the_correct_tool_kind_is_the_assets_material() {
         panic!("the block registry must load from assets/");
     };
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::feature::jparse_pub(&raw)
+    let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
         .into_arr()
         .expect("the asset is an array")
@@ -333,9 +333,9 @@ fn the_correct_tool_kind_is_the_assets_material() {
         if want >= 0 {
             with_kind += 1;
         }
-        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
-        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::json::jstr(b, "name").unwrap_or_else(|| "?".into());
         for st in lo..=hi {
             if (st as usize) >= reg.state_count() {
                 continue;
@@ -418,7 +418,7 @@ fn the_drop_is_the_assets_drop_for_every_state() {
         panic!("the block registry must load from assets/");
     };
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::feature::jparse_pub(&raw)
+    let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
         .into_arr()
         .expect("the asset is an array")
@@ -434,9 +434,9 @@ fn the_drop_is_the_assets_drop_for_every_state() {
             multi += 1;
         }
         let want = drops.first().copied();
-        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
-        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::json::jstr(b, "name").unwrap_or_else(|| "?".into());
         for st in lo..=hi {
             if (st as usize) >= reg.state_count() {
                 continue;
@@ -493,17 +493,17 @@ fn stack_size_comes_from_the_asset_for_every_state() {
         panic!("the block registry must load from assets/");
     };
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::feature::jparse_pub(&raw)
+    let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
         .into_arr()
         .expect("the asset is an array")
         .clone();
     let mut checked = 0usize;
     for b in &md {
-        let want = crate::feature::jnum_pub(b, "stackSize").unwrap_or(64.0) as i64;
-        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
-        let name = crate::feature::jstr_pub(b, "name").unwrap_or_else(|| "?".into());
+        let want = crate::json::jnum(b, "stackSize").unwrap_or(64.0) as i64;
+        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::json::jstr(b, "name").unwrap_or_else(|| "?".into());
         for st in lo..=hi {
             if (st as usize) >= reg.state_count() {
                 continue;
@@ -604,7 +604,7 @@ fn light_values_come_from_the_asset_for_every_state() {
         panic!("the block registry must load from assets/");
     };
     let raw = std::fs::read("assets/pblocks.json").expect("pblocks must be readable");
-    let blocks = crate::feature::jparse_pub(&raw)
+    let blocks = crate::json::jparse(&raw)
         .expect("pblocks must parse")
         .get("blocks")
         .expect("pblocks has blocks")
@@ -614,13 +614,13 @@ fn light_values_come_from_the_asset_for_every_state() {
     use std::collections::HashMap;
     let mut by_name: HashMap<String, &crate::json::J> = HashMap::new();
     for b in &blocks {
-        if let Some(n) = crate::feature::jstr_pub(b, "name") {
+        if let Some(n) = crate::json::jstr(b, "name") {
             by_name.insert(n, b);
         }
     }
 
     let raw_md = std::fs::read("assets/blocks_1211.json").expect("blocks_1211 must be readable");
-    let md = crate::feature::jparse_pub(&raw_md)
+    let md = crate::json::jparse(&raw_md)
         .expect("blocks_1211 must parse")
         .into_arr()
         .expect("blocks_1211 is an array")
@@ -629,9 +629,9 @@ fn light_values_come_from_the_asset_for_every_state() {
     let mut emitters = 0usize;
     let mut no_states = Vec::new();
     for b in &md {
-        let name = crate::feature::jstr_pub(b, "name").unwrap_or_default();
-        let lo = crate::feature::jnum_pub(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::feature::jnum_pub(b, "maxStateId").expect("maxStateId") as u32;
+        let name = crate::json::jstr(b, "name").unwrap_or_default();
+        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
+        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
         let n = (hi - lo + 1) as usize;
         let Some(pb) = by_name.get(&name) else { continue };
         let Some(states) = pb.get("states").and_then(|s| s.into_arr()) else { continue };
@@ -646,8 +646,8 @@ fn light_values_come_from_the_asset_for_every_state() {
             if (st as usize) >= reg.state_count() {
                 continue;
             }
-            let lum = crate::feature::jnum_pub(s, "luminance").unwrap_or(0.0) as u8;
-            let op = crate::feature::jnum_pub(s, "opacity").unwrap_or(0.0) as u8;
+            let lum = crate::json::jnum(s, "luminance").unwrap_or(0.0) as u8;
+            let op = crate::json::jnum(s, "opacity").unwrap_or(0.0) as u8;
             assert_eq!(reg.luminance_of(st), lum, "luminance of {name} state {st}");
             assert_eq!(reg.opacity_of(st), op, "opacity of {name} state {st}");
             if lum > 0 {
@@ -851,7 +851,7 @@ fn sky_light_reaches_sideways_through_an_opening() {
 fn the_falling_set_is_the_asset_set() {
     let reg = breg().unwrap();
     let mut falling: Vec<String> = (0..reg.state_count() as u32)
-        .filter(|&st| reg.behaviour_of(st) == crate::feature::B_FALLING)
+        .filter(|&st| reg.behaviour_of(st) == crate::block_registry::B_FALLING)
         .map(|st| reg.name_of(st).trim_start_matches("minecraft:").to_string())
         .collect();
     falling.sort();
@@ -871,7 +871,7 @@ fn the_falling_set_is_the_asset_set() {
     // The converse, so the assertion cannot pass by marking everything as falling.
     for not_falling in ["stone", "dirt", "oak_planks"] {
         let st = name_to_state(not_falling).expect("must exist");
-        assert_ne!(reg.behaviour_of(st), crate::feature::B_FALLING, "{not_falling} must not fall");
+        assert_ne!(reg.behaviour_of(st), crate::block_registry::B_FALLING, "{not_falling} must not fall");
     }
 }
 
@@ -910,11 +910,11 @@ fn every_wire_state_has_complete_metadata() {
 fn note_block_keeps_solid_and_light_values_for_every_instrument() {
     let reg = breg().unwrap();
     let raw = std::fs::read("assets/blocks_1211.json").unwrap();
-    let md = crate::feature::jparse_pub(&raw).unwrap();
+    let md = crate::json::jparse(&raw).unwrap();
     let block = md.into_arr().unwrap().iter()
-        .find(|b| crate::feature::jstr_pub(b, "name").as_deref() == Some("note_block")).unwrap();
-    let lo = crate::feature::jnum_pub(block, "minStateId").unwrap() as u32;
-    let hi = crate::feature::jnum_pub(block, "maxStateId").unwrap() as u32;
+        .find(|b| crate::json::jstr(b, "name").as_deref() == Some("note_block")).unwrap();
+    let lo = crate::json::jnum(block, "minStateId").unwrap() as u32;
+    let hi = crate::json::jnum(block, "maxStateId").unwrap() as u32;
     for st in lo..=hi {
         assert!(reg.is_solid(st), "note block state {st} is a full solid block");
         assert_eq!(reg.opacity_of(st), 15, "note block state {st} must block skylight");

@@ -115,3 +115,28 @@ PLANは目標と検証契約だけを持つ。古いGUI手順や重複した完�
 順序と再利用は境界を越える値に反映させ、入力を無視する変異を正常系・復元対照付きで拒否する。
 解消した辺と上向き指摘は方針から削除し、地形へ実装の参照を再追加した実ソースは失敗させる。
 これは静的依存の分離であり、残る型/文脈の分離やvanilla全体の証明を代行しない。
+
+## 配置と樹木が共有する契約を下位所有者へ移す（H、bounded、high）
+
+樹木が配置実装を参照していたのは、registry（状態・metadata・タグ）、JSON field accessor、
+provider/predicate、生成文脈を feature が所有していたためである。値を上位から再exportする案は、
+循環を見えなくするだけで所有者を1つにしないため採らない。
+`block_registry` が状態とmetadata、`generation_providers` が値/高さ/状態provider・predicate・
+placement modifier、`generation_context` が `FC`（Genの可変借用と上書き/heightmap/biomeキャッシュ）、
+汎用JSON accessorは既存の `json` が所有する。`tree` は feature を参照しない。
+
+移動は既存定義のコピーであり、式・分岐・反復順・RNG消費・保存形式を変えない。
+配置registry（`FReg`/`Cf`）と配置実行（`gen_pf`/`gen_cf`）は feature に残し、tree/feature registryの
+所有者も変えない。`FC` の `g`/`wr` だけをcrate内へ開き、`rc/ws_t/oc_t/bc` と単一コンストラクタ
+`FC::new` は context が持つ。不要な可視性の拡大は戻し、feature が実際に使う `can_place`/`is_dirtish`
+だけをcrate内に開く。
+
+変更前の独立worktreeで、返却値・全上書き値・完了領域をソートしたバイト列を2回取得して一致を確認し、
+provider/predicateの値と後続RNG消費を固定した fixture、実population出力のMD5対照を追加した。
+JSON accessor以外の式は移動前後でバイト同一、`main.rs` の変更はモジュール宣言と呼出先の付け替えだけ、
+保存形式・CLI・サーバー設定モード・Java callback・スケジューラは触らない。
+
+旧所有者の再exportや互換wrapperは残さず、`tree`→`feature` と下位→上位の再追加を
+正常系→層違反→復元正常系の実ソース負例で拒否する。registryの移動変異は新ファイルのanchorへ更新し、
+predicateとcontextの変異を追加した。現行グラフは16モジュール・39辺・指摘0でaccepted findingsは空。
+これは静的依存の分離であり、T/F/N/Q、既存ignoredテスト、代表負荷やvanilla全体の証明を代行しない。

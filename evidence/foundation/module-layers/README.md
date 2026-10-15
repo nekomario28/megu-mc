@@ -58,6 +58,12 @@ RNGインスタンスやキャッシュの所有者・消費順を増やさな�
 実配置と直接配置の全上書き値を比較し、負座標・重複照会・境界越えの順序と再利用も返却値で検査する。
 この静的依存の逆転を、実行時の呼出グラフが無循環であるという主張にはしない。
 
-生成側のfeature/tree循環とtreeの上向き依存は残る。**ゲートの緑は既知の負債の固定であり、層分割Hは未完了。**
-実際の型・生成文脈・配置起動の所有者を分け、ソース由来の指摘を0にしてからHを閉じる。
-型解決で見える依存を単に別ファイルへ隠す変更や、きれいな設計図を描くことはその代用にならない。
+feature/treeの循環とtreeの上向き依存も、配置と樹木が共有する契約を下位へ移して解消した。
+registry（状態・metadata・タグ）は `block_registry.rs`、値/高さ/状態providerとpredicateは
+`generation_providers.rs`、1本のGen借用と上書き・heightmap・biomeキャッシュは
+`generation_context.rs` が所有する。既存定義の移動であり、式・分岐・反復順・RNG消費・
+保存形式を変えず、旧feature側の再exportや互換wrapperは残さない。
+現行グラフは**16モジュール・39辺・指摘0**で、`policy.json` のaccepted findingsも空である。
+移動前後を独立プロセスで2回比較した全上書き値と、provider/predicateの値とRNG消費を固定した
+fixture、実population出力のMD5対照が保存を検査する。これはvanilla準拠や代表負荷の証明ではなく、
+T/F/N/Qと既存ignoredテストは別の未完了契約として残る。

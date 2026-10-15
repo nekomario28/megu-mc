@@ -163,3 +163,31 @@ impl<'a> JP<'a> {
 pub(crate) fn jparse(b: &[u8]) -> Option<J> {
     JP { b, i: 0 }.val()
 }
+
+// Typed field accessors shared by the registry, providers and feature parsing.
+// They move the existing lookup/defaulting contract; they do not change it.
+pub(crate) fn js<'a>(j: &'a J, k: &str) -> Option<&'a J> {
+    j.get(k)
+}
+pub(crate) fn jstr(j: &J, k: &str) -> Option<String> {
+    js(j, k).map(|v| v.str().to_string())
+}
+pub(crate) fn jnum(j: &J, k: &str) -> Option<f64> {
+    js(j, k).map(|v| v.num())
+}
+pub(crate) fn jint(j: &J, k: &str, d: i32) -> i32 {
+    jnum(j, k).unwrap_or(d as f64) as i32
+}
+pub(crate) fn jf32(j: &J, k: &str, d: f32) -> f32 {
+    jnum(j, k).unwrap_or(d as f64) as f32
+}
+pub(crate) fn jbool(j: &J, k: &str, d: bool) -> bool {
+    match js(j, k) {
+        Some(J::Num(n)) => *n != 0.0,
+        Some(J::Str(s)) => s == "true",
+        _ => d,
+    }
+}
+pub(crate) fn jarr<'a>(j: &'a J, k: &str) -> Option<&'a Vec<J>> {
+    js(j, k).and_then(|v| v.into_arr())
+}

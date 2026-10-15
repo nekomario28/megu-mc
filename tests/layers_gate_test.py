@@ -54,7 +54,7 @@ class LayerGateTests(unittest.TestCase):
 
     def test_forbidden_edge_is_read_from_rust(self):
         for imported in ["use crate::tree::TreeExtra;\n",
-                         "use crate::{tree::{TreeExtra}, feature::BReg};\n",
+                         "use crate::{tree::TreeExtra, block_registry::BReg};\n",
                          "use crate::{{tree as hidden}};\n"]:
             with self.subTest(imported=imported), fixture() as root:
                 p = root / "src/worldgen.rs"
@@ -95,6 +95,34 @@ class LayerGateTests(unittest.TestCase):
             code, output = run(root)
             self.assertNotEqual(code, 0, output)
             self.assertIn("deps.py: [layer-violation] worldgen", output)
+            p.write_text(original)
+            code, output = run(root)
+            self.assertEqual(code, 0, output)
+
+    def test_tree_cannot_depend_on_feature_again(self):
+        with fixture() as root:
+            p = root / "src/tree.rs"
+            original = p.read_text()
+            code, output = run(root)
+            self.assertEqual(code, 0, output)
+            p.write_text(original + "\nuse crate::feature::populate;\n")
+            code, output = run(root)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("deps.py: [layer-violation] tree", output)
+            p.write_text(original)
+            code, output = run(root)
+            self.assertEqual(code, 0, output)
+
+    def test_generation_context_cannot_depend_on_placement_implementations(self):
+        with fixture() as root:
+            p = root / "src/generation_context.rs"
+            original = p.read_text()
+            code, output = run(root)
+            self.assertEqual(code, 0, output)
+            p.write_text(original + "\nuse crate::tree::TreeExtra;\n")
+            code, output = run(root)
+            self.assertNotEqual(code, 0, output)
+            self.assertIn("deps.py: [layer-violation] generation_context", output)
             p.write_text(original)
             code, output = run(root)
             self.assertEqual(code, 0, output)

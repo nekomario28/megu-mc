@@ -5,23 +5,29 @@
     ["java_compat", "landing", "effects"],
     ["cached_lookup", "world_rng", "tick_queue", "landing_types"],
     ["feature"],
-    ["tree", "worldgen"],
+    ["tree"],
+    ["generation_providers"],
+    ["generation_context"],
+    ["worldgen", "block_registry"],
     ["json", "generation_math"]
   ],
-  "explicit_generation_modules": ["feature", "tree", "worldgen", "json", "generation_math"],
+  "explicit_generation_modules": ["feature", "tree", "generation_providers", "generation_context", "worldgen", "block_registry", "json", "generation_math"],
   "forbidden": [["worldgen", "tree"]],
   "allowed_edges": [
     ["main", "java_compat"], ["main", "landing"], ["main", "effects"],
-    ["main", "cached_lookup"], ["main", "world_rng"], ["main", "tick_queue"], ["main", "landing_types"], ["main", "json"], ["main", "generation_math"],
-    ["main", "feature"], ["main", "tree"], ["main", "worldgen"],
-    ["feature", "tree"], ["feature", "worldgen"],
-    ["tree", "feature"],
+    ["main", "cached_lookup"], ["main", "world_rng"], ["main", "tick_queue"], ["main", "landing_types"],
+    ["main", "block_registry"], ["main", "generation_context"], ["main", "generation_providers"],
+    ["main", "feature"], ["main", "tree"], ["main", "worldgen"], ["main", "json"], ["main", "generation_math"],
+    ["feature", "tree"], ["feature", "worldgen"], ["feature", "block_registry"],
+    ["feature", "generation_providers"], ["feature", "generation_context"],
+    ["tree", "block_registry"], ["tree", "generation_providers"], ["tree", "generation_context"],
+    ["generation_providers", "block_registry"], ["generation_providers", "generation_context"],
+    ["generation_context", "worldgen"], ["generation_context", "block_registry"],
+    ["block_registry", "json"],
     ["java_compat", "landing_types"], ["landing", "java_compat"], ["landing", "landing_types"],
-    ["feature", "json"], ["tree", "json"], ["worldgen", "json"],
-    ["feature", "generation_math"], ["tree", "generation_math"], ["worldgen", "generation_math"]
+    ["feature", "json"], ["tree", "json"], ["worldgen", "json"], ["generation_providers", "json"],
+    ["feature", "generation_math"], ["tree", "generation_math"], ["worldgen", "generation_math"],
+    ["generation_providers", "generation_math"]
   ],
-  "accepted_errors": [
-    ["cycle", "feature"],
-    ["layer-violation", "tree"]
-  ]
+  "accepted_errors": []
 }

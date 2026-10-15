@@ -17,6 +17,9 @@ mod light_pack_tests;
 mod effects;
 mod cached_lookup;
 use cached_lookup::CachedLookup;
+mod block_registry;
+mod generation_context;
+mod generation_providers;
 mod feature;
 mod tree;
 mod world_rng;
@@ -509,7 +512,7 @@ fn item_stack_max(item: i64, comps: &Comps) -> i64 {
     // below cover only items that place no block, so they are reached for tools,
     // buckets, potions and the like.
     if let Some(st) = item_to_state(item) {
-        if let Some(reg) = crate::feature::breg() {
+        if let Some(reg) = crate::block_registry::breg() {
             return reg.stack_size_of(st);
         }
     }
@@ -638,7 +641,7 @@ fn attack_cooldown(item: i64) -> f64 {
 /// asset it reads everything else from. The fallback only applies if the registry
 /// failed to load at all.
 fn block_hardness(b: i64) -> f32 {
-    match crate::feature::breg() {
+    match crate::block_registry::breg() {
         Some(reg) => reg.hardness_of(b as u32),
         None => 0.6,
     }
@@ -650,16 +653,16 @@ fn block_hardness(b: i64) -> f32 {
 /// block first.
 #[cfg(test)]
 fn stack_size_of(st: u32) -> i64 {
-    crate::feature::breg().map(|reg| reg.stack_size_of(st)).unwrap_or(64)
+    crate::block_registry::breg().map(|reg| reg.stack_size_of(st)).unwrap_or(64)
 }
 fn tool_kind(block: i64) -> i8 {
-    match crate::feature::breg() {
+    match crate::block_registry::breg() {
         Some(reg) => reg.tool_kind_of(block as u32),
         None => -1,
     }
 }
 fn can_harvest(block: i64, held_item: i64) -> bool {
-    match crate::feature::breg() {
+    match crate::block_registry::breg() {
         Some(reg) => reg.can_harvest(block as u32, held_item),
         None => true,
     }
@@ -941,12 +944,12 @@ fn drops() -> &'static Mutex<Vec<Drop>> { DROPS.get_or_init(|| Mutex::new(Vec::n
 /// nothing at all, and glass dropped itself where vanilla drops nothing without silk
 /// touch. The fallback only applies if the registry failed to load.
 fn block_drop(st: u32) -> Option<i64> {
-    crate::feature::breg().and_then(|reg| reg.block_drop(st))
+    crate::block_registry::breg().and_then(|reg| reg.block_drop(st))
 }
 /// The second drop, for the blocks whose asset entry lists two. Nothing is lost when a block has
 /// only one: the list is filtered to the entries that exist.
 fn block_drops(st: u32) -> Vec<i64> {
-    let reg = crate::feature::breg();
+    let reg = crate::block_registry::breg();
     let first = reg.and_then(|r| r.block_drop(st));
     let second = reg.and_then(|r| r.block_drop_second(st));
     [first, second].into_iter().flatten().collect()
@@ -3604,7 +3607,7 @@ const RANDOM_TICK_SPEED: u32 = 3;
 /// of blocks, and a position that holds nothing costs one array lookup.
 fn random_tick_pass() {
     // The registry is looked up once per pass, not once per sample.
-    let Some(reg) = crate::feature::breg() else { return };
+    let Some(reg) = crate::block_registry::breg() else { return };
     for (cx, cz) in ticked_chunks() {
         for sy in ticked_sections(cx, cz) {
             for _ in 0..RANDOM_TICK_SPEED {
@@ -3620,12 +3623,12 @@ fn random_tick_pass() {
 /// What a block does when a random tick lands on it. Vanilla calls the block's
 /// `randomTick`; here the block is identified by name from the registry rather than by a
 /// hand-written id range, so a block added from the asset needs no edit to this file.
-fn on_random_tick(reg: &crate::feature::BReg, x: i32, y: i32, z: i32) {
+fn on_random_tick(reg: &crate::block_registry::BReg, x: i32, y: i32, z: i32) {
     let st = block_at(x, y, z);
     // One compare against zero for the common case, rather than a string compare against
     // the block's name on every sample.
     match reg.behaviour_of(st) {
-        crate::feature::B_SUGAR_CANE => sugar_cane_random_tick(reg, x, y, z, st),
+        crate::block_registry::B_SUGAR_CANE => sugar_cane_random_tick(reg, x, y, z, st),
         _ => {}
     }
 }
@@ -3633,7 +3636,7 @@ fn on_random_tick(reg: &crate::feature::BReg, x: i32, y: i32, z: i32) {
 /// Vanilla grows sugar cane one stage per random tick, from age 0 to 15, and the tick
 /// that would take it past 15 places a new cane above and resets the age. Sixteen
 /// random ticks therefore add one block to the column, up to a height of three.
-fn sugar_cane_random_tick(reg: &crate::feature::BReg, x: i32, y: i32, z: i32, st: u32) {
+fn sugar_cane_random_tick(reg: &crate::block_registry::BReg, x: i32, y: i32, z: i32, st: u32) {
     if !reg.is_air(block_at(x, y + 1, z)) {
         return;
     }
@@ -4047,7 +4050,7 @@ fn falling() -> &'static Mutex<Vec<(i32, i32, i32)>> {
 /// Whether a block can be fallen into. Vanilla replaces air and fluids; the registry's opacity is
 /// the closest thing to hand, and a full block never is.
 fn fallable(x: i32, y: i32, z: i32) -> bool {
-    let Some(reg) = crate::feature::breg() else { return false };
+    let Some(reg) = crate::block_registry::breg() else { return false };
     let st = block_at(x, y, z);
     reg.is_air(st) || reg.is_liquid(st)
 }
@@ -4062,7 +4065,7 @@ fn fallable(x: i32, y: i32, z: i32) -> bool {
 /// piston, changes that cell while leaving everything under it untouched, and a check that only
 /// looked upward left the block hanging.
 fn note_falling(x: i32, y: i32, z: i32) {
-    let Some(reg) = crate::feature::breg() else { return };
+    let Some(reg) = crate::block_registry::breg() else { return };
     let mut schedule = |px: i32, py: i32, pz: i32| {
         let mut f = falling().lock().unwrap();
         if !f.contains(&(px, py, pz)) {
@@ -4070,12 +4073,12 @@ fn note_falling(x: i32, y: i32, z: i32) {
         }
     };
     if y > MIN_Y
-        && reg.behaviour_of(block_at(x, y, z)) == crate::feature::B_FALLING
+        && reg.behaviour_of(block_at(x, y, z)) == crate::block_registry::B_FALLING
         && fallable(x, y - 1, z)
     {
         schedule(x, y, z);
     }
-    if fallable(x, y, z) && reg.behaviour_of(block_at(x, y + 1, z)) == crate::feature::B_FALLING {
+    if fallable(x, y, z) && reg.behaviour_of(block_at(x, y + 1, z)) == crate::block_registry::B_FALLING {
         schedule(x, y + 1, z);
     }
 }
@@ -4101,11 +4104,11 @@ fn falling_tick() {
             continue;
         }
         let st = block_at(x, y, z);
-        let reg = match crate::feature::breg() {
+        let reg = match crate::block_registry::breg() {
             Some(r) => r,
             None => return,
         };
-        if reg.behaviour_of(st) != crate::feature::B_FALLING {
+        if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
             continue; // something else is here now
         }
         if y <= MIN_Y || !fallable(x, y - 1, z) {
@@ -8527,7 +8530,7 @@ fn block_light_sections_from(
 /// list of what the world contains is the overlay of edits; that limit is recorded rather
 /// than papered over by scanning every block.
 fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
-    let Some(reg) = crate::feature::breg() else {
+    let Some(reg) = crate::block_registry::breg() else {
         return vec![[0u8; 2048]; 26];
     };
     // The lava set is taken first and released before the world lock is acquired: every other
@@ -8598,7 +8601,7 @@ fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
 
 #[cfg(test)]
 fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
-    let reg = crate::feature::breg();
+    let reg = crate::block_registry::breg();
     let mut floors = [0i32; 256];
     for lz in 0..16usize {
         for lx in 0..16usize {
@@ -8683,7 +8686,7 @@ fn sky_spill(
 /// Sky light for a chunk, from the world: the per-column value, raised where light has arrived
 /// sideways.
 fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
-    let Some(reg) = crate::feature::breg() else {
+    let Some(reg) = crate::block_registry::breg() else {
         return vec![[0u8; 2048]; 26];
     };
     let mut floors = [0i32; 256];
@@ -14446,7 +14449,7 @@ fn main() {
             let mut top: Vec<(u32, usize)> = hist.into_iter().collect();
             top.sort_by_key(|e| std::cmp::Reverse(e.1));
             for (st, c) in top.iter().take(25) {
-                let nm = crate::feature::breg().map(|r| r.name_of(*st).to_string()).unwrap_or_default();
+                let nm = crate::block_registry::breg().map(|r| r.name_of(*st).to_string()).unwrap_or_default();
                 eprintln!("[feat]   {} x{} (id {})", nm, c, st);
             }
             // a surface column: find a log and print its column
@@ -14459,11 +14462,11 @@ fn main() {
                             let top = cc.wtop((x & 15) as usize, (z & 15) as usize);
                             for y in top..top + 20 {
                                 let st = wg2_block(x, y, z).unwrap_or(99999);
-                                let n = crate::feature::breg().map(|r| r.name_of(st).to_string()).unwrap_or_default();
+                                let n = crate::block_registry::breg().map(|r| r.name_of(st).to_string()).unwrap_or_default();
                                 if n.contains("log") {
                                     eprintln!("[feat] LOG @{},{} surf={}", x, z, top);
                                     for yy in top - 3..top + 10 {
-                                        let nm = crate::feature::breg().map(|r| r.name_of(wg2_block(x, yy, z).unwrap_or(99999)).to_string()).unwrap_or_default();
+                                        let nm = crate::block_registry::breg().map(|r| r.name_of(wg2_block(x, yy, z).unwrap_or(99999)).to_string()).unwrap_or_default();
                                         eprintln!("[feat]   y={} {}", yy, nm);
                                     }
                                     break 'outer;

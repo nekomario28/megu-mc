@@ -871,8 +871,8 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     }
     set_block(0, top, 0, cane);
 
-    let reg = crate::feature::breg().expect("the block registry must load from assets/");
-    let tick = || on_random_tick(crate::feature::breg().unwrap(), 0, top, 0);
+    let reg = crate::block_registry::breg().expect("the block registry must load from assets/");
+    let tick = || on_random_tick(crate::block_registry::breg().unwrap(), 0, top, 0);
     let age = |y: i32| reg.get_prop(block_at(0, y, 0), "age").and_then(|a| a.parse::<u32>().ok());
     let is_cane = |y: i32| reg.name_of(block_at(0, y, 0)) == "minecraft:sugar_cane";
 
@@ -895,13 +895,13 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     // Sixteen more make three, and a third round must not make four.
     for _ in 0..16 {
         tick();
-        on_random_tick(crate::feature::breg().unwrap(), 0, top + 1, 0);
+        on_random_tick(crate::block_registry::breg().unwrap(), 0, top + 1, 0);
     }
     assert!(is_cane(top + 2) && !is_cane(top + 3), "the column must stop at height 3");
     for _ in 0..40 {
         tick();
-        on_random_tick(crate::feature::breg().unwrap(), 0, top + 1, 0);
-        on_random_tick(crate::feature::breg().unwrap(), 0, top + 2, 0);
+        on_random_tick(crate::block_registry::breg().unwrap(), 0, top + 1, 0);
+        on_random_tick(crate::block_registry::breg().unwrap(), 0, top + 2, 0);
     }
     assert!(!is_cane(top + 3), "a column of three must not grow a fourth");
 
@@ -963,7 +963,7 @@ fn measure_the_light_cost_per_chunk() {
     });
     let walks = time_it(&mut || {
         for _ in 0..rounds {
-            let reg = crate::feature::breg().unwrap();
+            let reg = crate::block_registry::breg().unwrap();
             for lz in 0..16 {
                 for lx in 0..16 {
                     let mut y = height_at(lx, lz) - 1;
@@ -982,7 +982,7 @@ fn measure_the_light_cost_per_chunk() {
     // The two halves of sky_light_sections, measured apart: building the floors, and packing
     // them. The split so far did not add up, and guessing which half was missing has been
     // wrong twice, so both are timed with the same inputs the real call uses.
-    let reg = crate::feature::breg().unwrap();
+    let reg = crate::block_registry::breg().unwrap();
     let mut real_floors = [0i32; 256];
     for lz in 0..16usize {
         for lx in 0..16usize {
@@ -1124,7 +1124,7 @@ fn sand_falls_one_block_a_tick_until_it_lands() {
         "a block with support under it must not be scheduled"
     );
 
-    let name = |y: i32| crate::feature::breg().unwrap().name_of(block_at(3, y, 3)).to_string();
+    let name = |y: i32| crate::block_registry::breg().unwrap().name_of(block_at(3, y, 3)).to_string();
     assert_eq!(name(base + 3), "minecraft:sand", "the test starts with sand in the air");
     // Removing the block beneath it schedules the fall. The sand must still be where it was: an
     // earlier version dropped it to the floor inside this very call through a second gravity
@@ -1188,7 +1188,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     // arrangement the first version deadlocked on, so the maximum is asserted rather than assumed.
     assert_eq!(falling().lock().unwrap().len(), 1, "the neighbour check schedules the lower block");
 
-    let name = |y: i32| crate::feature::breg().unwrap().name_of(block_at(5, y, 5)).to_string();
+    let name = |y: i32| crate::block_registry::breg().unwrap().name_of(block_at(5, y, 5)).to_string();
     let mut ticks = 0;
     let mut most_held = 1;
     while !falling().lock().unwrap().is_empty() && ticks < 20 {
@@ -1225,9 +1225,9 @@ fn every_falling_block_is_scheduled_and_moves_one_cell() {
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
     set_test_region(oh.clone(), warm);
-    let reg = crate::feature::breg().unwrap();
+    let reg = crate::block_registry::breg().unwrap();
     let names: std::collections::BTreeSet<String> = (0..reg.state_count() as u32)
-        .filter(|&st| reg.behaviour_of(st) == crate::feature::B_FALLING)
+        .filter(|&st| reg.behaviour_of(st) == crate::block_registry::B_FALLING)
         .map(|st| reg.name_of(st).trim_start_matches("minecraft:").to_string())
         .collect();
     assert_eq!(names.len(), 19, "the asset set changed: {names:?}");
@@ -1266,7 +1266,7 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
     set_test_region(oh.clone(), std::collections::HashSet::new());
-    let reg = crate::feature::breg().unwrap();
+    let reg = crate::block_registry::breg().unwrap();
     let base = 150;
     for y in base..=base + 4 {
         set_block(11, y, 11, 0);

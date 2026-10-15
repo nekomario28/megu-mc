@@ -2,7 +2,7 @@
 // feature-size clipping, decorators, mangrove root placer, and leaf-distance
 // propagation. Ported from pumpkin feature/features/tree semantics.
 
-use crate::feature::BReg;
+use crate::block_registry::BReg;
 use crate::json::J;
 use crate::generation_math::Xor;
 
@@ -1725,14 +1725,14 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) {
 // ---------- JSON parsing ----------
 
 fn ip(j: &J) -> IP {
-    p_ip_pub(j).unwrap_or(IP::Const(0))
+    p_ip(j).unwrap_or(IP::Const(0))
 }
 fn p_tp(j: &J) -> Option<TrunkPl> {
-    let ty = jstr_pub(j, "type")?;
+    let ty = jstr(j, "type")?;
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
-    let base = jint_pub(j, "base_height", 0);
-    let a = jint_pub(j, "height_rand_a", 0);
-    let b = jint_pub(j, "height_rand_b", 0);
+    let base = jint(j, "base_height", 0);
+    let a = jint(j, "height_rand_a", 0);
+    let b = jint(j, "height_rand_b", 0);
     let tp = match ty {
         "straight_trunk_placer" => TP::Straight,
         "forking_trunk_placer" => TP::Forking,
@@ -1741,114 +1741,114 @@ fn p_tp(j: &J) -> Option<TrunkPl> {
         "dark_oak_trunk_placer" => TP::DarkOak,
         "fancy_trunk_placer" => TP::Fancy,
         "bending_trunk_placer" => TP::Bending {
-            min_height_for_leaves: jint_pub(j, "min_height_for_leaves", 1),
-            bend_length: ip(js_pub(j, "bend_length")?),
+            min_height_for_leaves: jint(j, "min_height_for_leaves", 1),
+            bend_length: ip(js(j, "bend_length")?),
         },
         "upwards_branching_trunk_placer" => TP::UpwardsBranching {
-            extra_steps: ip(js_pub(j, "extra_branch_steps")?),
-            branch_prob: jnum_pub(j, "place_branch_per_log_probability").unwrap_or(0.0) as f32,
-            extra_len: ip(js_pub(j, "extra_branch_length")?),
-            grow_through: match js_pub(j, "can_grow_through") {
+            extra_steps: ip(js(j, "extra_branch_steps")?),
+            branch_prob: jnum(j, "place_branch_per_log_probability").unwrap_or(0.0) as f32,
+            extra_len: ip(js(j, "extra_branch_length")?),
+            grow_through: match js(j, "can_grow_through") {
                 Some(J::Arr(v)) => v.iter().map(|x| x.str().to_string()).collect(),
                 Some(J::Str(s)) => vec![s.clone()],
                 _ => vec![],
             },
         },
         "cherry_trunk_placer" => TP::Cherry {
-            count: ip(js_pub(j, "branch_count")?),
-            horizontal: ip(js_pub(j, "branch_horizontal_length")?),
-            start_off: ip(js_pub(j, "branch_start_offset_from_top")?),
-            end_off: ip(js_pub(j, "branch_end_offset_from_top")?),
+            count: ip(js(j, "branch_count")?),
+            horizontal: ip(js(j, "branch_horizontal_length")?),
+            start_off: ip(js(j, "branch_start_offset_from_top")?),
+            end_off: ip(js(j, "branch_end_offset_from_top")?),
         },
         "poplar_trunk_placer" => TP::Poplar {
-            above_branches: ip(js_pub(j, "trunk_height_above_branches")?),
-            branch_amount: ip(js_pub(j, "branch_amount")?),
+            above_branches: ip(js(j, "trunk_height_above_branches")?),
+            branch_amount: ip(js(j, "branch_amount")?),
         },
         _ => return None,
     };
     Some(TrunkPl { base, a, b, ty: tp })
 }
 fn p_fp(j: &J) -> Option<(FP, IP, IP)> {
-    let ty = jstr_pub(j, "type")?;
+    let ty = jstr(j, "type")?;
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
-    let radius = ip(js_pub(j, "radius").unwrap_or(&J::Num(0.0)));
-    let offset = ip(js_pub(j, "offset").unwrap_or(&J::Num(0.0)));
+    let radius = ip(js(j, "radius").unwrap_or(&J::Num(0.0)));
+    let offset = ip(js(j, "offset").unwrap_or(&J::Num(0.0)));
     let fp = match ty {
-        "blob_foliage_placer" => FP::Blob { height: jint_pub(j, "height", 3) },
-        "spruce_foliage_placer" => FP::Spruce { trunk_h: ip(js_pub(j, "trunk_height")?) },
-        "pine_foliage_placer" => FP::Pine { height: ip(js_pub(j, "height")?) },
+        "blob_foliage_placer" => FP::Blob { height: jint(j, "height", 3) },
+        "spruce_foliage_placer" => FP::Spruce { trunk_h: ip(js(j, "trunk_height")?) },
+        "pine_foliage_placer" => FP::Pine { height: ip(js(j, "height")?) },
         "acacia_foliage_placer" => FP::Acacia,
-        "bush_foliage_placer" => FP::Bush { height: jint_pub(j, "height", 2) },
-        "fancy_foliage_placer" => FP::Fancy { height: jint_pub(j, "height", 4) },
-        "jungle_foliage_placer" => FP::Jungle { height: jint_pub(j, "height", 2) },
-        "mega_jungle_foliage_placer" => FP::MegaJungle { height: jint_pub(j, "height", 10) },
-        "mega_pine_foliage_placer" => FP::MegaPine { crown: ip(js_pub(j, "crown_height")?) },
+        "bush_foliage_placer" => FP::Bush { height: jint(j, "height", 2) },
+        "fancy_foliage_placer" => FP::Fancy { height: jint(j, "height", 4) },
+        "jungle_foliage_placer" => FP::Jungle { height: jint(j, "height", 2) },
+        "mega_jungle_foliage_placer" => FP::MegaJungle { height: jint(j, "height", 10) },
+        "mega_pine_foliage_placer" => FP::MegaPine { crown: ip(js(j, "crown_height")?) },
         "dark_oak_foliage_placer" => FP::DarkOak,
         "random_spread_foliage_placer" => FP::RandomSpread {
-            fh: ip(js_pub(j, "foliage_height")?),
-            attempts: jint_pub(j, "leaf_placement_attempts", 10),
+            fh: ip(js(j, "foliage_height")?),
+            attempts: jint(j, "leaf_placement_attempts", 10),
         },
         "cherry_foliage_placer" => FP::Cherry {
-            height: ip(js_pub(j, "height")?),
-            wide_hole: jnum_pub(j, "wide_bottom_layer_hole_chance").unwrap_or(0.0) as f32,
-            corner_hole: jnum_pub(j, "corner_hole_chance").unwrap_or(0.0) as f32,
-            hang: jnum_pub(j, "hanging_leaves_chance").unwrap_or(0.0) as f32,
-            hang_ext: jnum_pub(j, "hanging_leaves_extension_chance").unwrap_or(0.0) as f32,
+            height: ip(js(j, "height")?),
+            wide_hole: jnum(j, "wide_bottom_layer_hole_chance").unwrap_or(0.0) as f32,
+            corner_hole: jnum(j, "corner_hole_chance").unwrap_or(0.0) as f32,
+            hang: jnum(j, "hanging_leaves_chance").unwrap_or(0.0) as f32,
+            hang_ext: jnum(j, "hanging_leaves_extension_chance").unwrap_or(0.0) as f32,
         },
         "poplar_foliage_placer" => FP::Poplar {
-            height: ip(js_pub(j, "height")?),
-            side_hole: jnum_pub(j, "side_hole_chance").unwrap_or(0.0) as f32,
+            height: ip(js(j, "height")?),
+            side_hole: jnum(j, "side_hole_chance").unwrap_or(0.0) as f32,
         },
         _ => return None,
     };
     Some((fp, radius, offset))
 }
 fn p_fs(j: &J) -> Option<(FS, Option<i32>)> {
-    let ty = jstr_pub(j, "type")?;
+    let ty = jstr(j, "type")?;
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
-    let mch = jnum_pub(j, "min_clipped_height").map(|v| v as i32);
+    let mch = jnum(j, "min_clipped_height").map(|v| v as i32);
     Some((
         match ty {
             "three_layers_feature_size" => FS::Three {
-                limit: jint_pub(j, "limit", 0),
-                upper_limit: jint_pub(j, "upper_limit", 0),
-                lower: jint_pub(j, "lower_size", 0),
-                middle: jint_pub(j, "middle_size", 0),
-                upper: jint_pub(j, "upper_size", 0),
+                limit: jint(j, "limit", 0),
+                upper_limit: jint(j, "upper_limit", 0),
+                lower: jint(j, "lower_size", 0),
+                middle: jint(j, "middle_size", 0),
+                upper: jint(j, "upper_size", 0),
             },
             _ => FS::Two {
-                limit: jint_pub(j, "limit", 0),
-                lower: jint_pub(j, "lower_size", 0),
-                upper: jint_pub(j, "upper_size", 0),
+                limit: jint(j, "limit", 0),
+                lower: jint(j, "lower_size", 0),
+                upper: jint(j, "upper_size", 0),
             },
         },
         mch,
     ))
 }
 fn p_deco(j: &J) -> Option<Deco> {
-    let ty = jstr_pub(j, "type")?;
+    let ty = jstr(j, "type")?;
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
     Some(match ty {
         "trunk_vine" => Deco::TrunkVine,
-        "leave_vine" | "leaves_vine" => Deco::LeaveVine(jnum_pub(j, "probability").unwrap_or(0.25) as f32),
+        "leave_vine" | "leaves_vine" => Deco::LeaveVine(jnum(j, "probability").unwrap_or(0.25) as f32),
         "pale_moss" => Deco::PaleMoss {
-            leaves: jnum_pub(j, "leaves_probability").unwrap_or(0.0) as f32,
-            trunk: jnum_pub(j, "trunk_probability").unwrap_or(0.0) as f32,
-            ground: jnum_pub(j, "ground_probability").unwrap_or(0.0) as f32,
+            leaves: jnum(j, "leaves_probability").unwrap_or(0.0) as f32,
+            trunk: jnum(j, "trunk_probability").unwrap_or(0.0) as f32,
+            ground: jnum(j, "ground_probability").unwrap_or(0.0) as f32,
         },
-        "creaking_heart" => Deco::Creaking(jnum_pub(j, "probability").unwrap_or(0.0) as f32),
-        "cocoa" => Deco::Cocoa(jnum_pub(j, "probability").unwrap_or(0.0) as f32),
-        "beehive" => Deco::Beehive(jnum_pub(j, "probability").unwrap_or(0.0) as f32),
-        "alter_ground" => Deco::AlterGround(p_bsp_pub(js_pub(j, "provider")?)?),
+        "creaking_heart" => Deco::Creaking(jnum(j, "probability").unwrap_or(0.0) as f32),
+        "cocoa" => Deco::Cocoa(jnum(j, "probability").unwrap_or(0.0) as f32),
+        "beehive" => Deco::Beehive(jnum(j, "probability").unwrap_or(0.0) as f32),
+        "alter_ground" => Deco::AlterGround(p_bsp(js(j, "provider")?)?),
         "place_on_ground" => Deco::PlaceOnGround {
-            tries: jint_pub(j, "tries", 2),
-            radius: jint_pub(j, "radius", 2),
-            height: jint_pub(j, "height", 1),
-            bsp: p_bsp_pub(js_pub(j, "block_state_provider")?)?,
+            tries: jint(j, "tries", 2),
+            radius: jint(j, "radius", 2),
+            height: jint(j, "height", 1),
+            bsp: p_bsp(js(j, "block_state_provider")?)?,
         },
         "attached_to_leaves" => Deco::AttachedLeaves {
-            bsp: p_bsp_pub(js_pub(j, "block_provider")?)?,
-            dirs: match js_pub(j, "directions") {
+            bsp: p_bsp(js(j, "block_provider")?)?,
+            dirs: match js(j, "directions") {
                 Some(J::Arr(v)) => v
                     .iter()
                     .map(|x| match x.str() {
@@ -1862,15 +1862,15 @@ fn p_deco(j: &J) -> Option<Deco> {
                     .collect(),
                 _ => vec![0],
             },
-            excl_xz: jint_pub(j, "exclusion_radius_xz", 0),
-            excl_y: jint_pub(j, "exclusion_radius_y", 0),
-            prob: jnum_pub(j, "probability").unwrap_or(0.0) as f32,
-            req_empty: jint_pub(j, "required_empty_blocks", 0),
+            excl_xz: jint(j, "exclusion_radius_xz", 0),
+            excl_y: jint(j, "exclusion_radius_y", 0),
+            prob: jnum(j, "probability").unwrap_or(0.0) as f32,
+            req_empty: jint(j, "required_empty_blocks", 0),
         },
         "attached_to_logs" => Deco::AttachedLogs {
-            prob: jnum_pub(j, "probability").unwrap_or(0.0) as f32,
-            bsp: p_bsp_pub(js_pub(j, "block_provider")?)?,
-            dirs: match js_pub(j, "directions") {
+            prob: jnum(j, "probability").unwrap_or(0.0) as f32,
+            bsp: p_bsp(js(j, "block_provider")?)?,
+            dirs: match js(j, "directions") {
                 Some(J::Arr(v)) => v
                     .iter()
                     .map(|x| match x.str() {
@@ -1885,44 +1885,44 @@ fn p_deco(j: &J) -> Option<Deco> {
                 _ => vec![],
             },
         },
-        "shelf_mushroom" => Deco::ShelfMushroom(jnum_pub(j, "probability").unwrap_or(0.4) as f32),
+        "shelf_mushroom" => Deco::ShelfMushroom(jnum(j, "probability").unwrap_or(0.4) as f32),
         _ => return None,
     })
 }
 fn p_root(j: &J) -> Option<RootP> {
-    if !jstr_pub(j, "type")?.ends_with("mangrove_root_placer") {
+    if !jstr(j, "type")?.ends_with("mangrove_root_placer") {
         return None;
     }
-    let mr = js_pub(j, "mangrove_root_placement")?;
-    let above = js_pub(j, "above_root_placement");
+    let mr = js(j, "mangrove_root_placement")?;
+    let above = js(j, "above_root_placement");
     Some(RootP {
-        trunk_off_y: ip(js_pub(j, "trunk_offset_y")?),
-        root_bsp: p_bsp_pub(js_pub(j, "root_provider")?)?,
-        above_chance: above.and_then(|a| jnum_pub(a, "above_root_placement_chance")).map(|v| v as f32),
-        above_bsp: above.and_then(|a| js_pub(a, "above_root_provider")).and_then(p_bsp_pub),
-        grow_through: match js_pub(mr, "can_grow_through") {
+        trunk_off_y: ip(js(j, "trunk_offset_y")?),
+        root_bsp: p_bsp(js(j, "root_provider")?)?,
+        above_chance: above.and_then(|a| jnum(a, "above_root_placement_chance")).map(|v| v as f32),
+        above_bsp: above.and_then(|a| js(a, "above_root_provider")).and_then(p_bsp),
+        grow_through: match js(mr, "can_grow_through") {
             Some(J::Arr(v)) => v.iter().map(|x| x.str().to_string()).collect(),
             Some(J::Str(s)) => vec![s.clone()],
             _ => vec![],
         },
-        muddy_in: match js_pub(mr, "muddy_roots_in") {
+        muddy_in: match js(mr, "muddy_roots_in") {
             Some(J::Arr(v)) => v.iter().map(|x| x.str().to_string()).collect(),
             _ => vec![],
         },
-        muddy_bsp: p_bsp_pub(js_pub(mr, "muddy_roots_provider")?)?,
-        max_w: jint_pub(mr, "max_root_width", 8),
-        max_l: jint_pub(mr, "max_root_length", 15),
-        skew: jnum_pub(mr, "random_skew_chance").unwrap_or(0.0) as f32,
+        muddy_bsp: p_bsp(js(mr, "muddy_roots_provider")?)?,
+        max_w: jint(mr, "max_root_width", 8),
+        max_l: jint(mr, "max_root_length", 15),
+        skew: jnum(mr, "random_skew_chance").unwrap_or(0.0) as f32,
     })
 }
 
 pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
-    let trunk_placer = p_tp(js_pub(j, "trunk_placer")?)?;
+    let trunk_placer = p_tp(js(j, "trunk_placer")?)?;
     let (foliage_placer, foliage_radius, foliage_offset) =
-        p_fp(js_pub(j, "foliage_placer")?)?;
-    let (min_size, mch) = p_fs(js_pub(j, "minimum_size")?)?;
+        p_fp(js(j, "foliage_placer")?)?;
+    let (min_size, mch) = p_fs(js(j, "minimum_size")?)?;
     let mut decorators = vec![];
-    if let Some(ds) = js_pub(j, "decorators").and_then(|d| d.into_arr()) {
+    if let Some(ds) = js(j, "decorators").and_then(|d| d.into_arr()) {
         for d in ds {
             if let Some(x) = p_deco(d) {
                 decorators.push(x);
@@ -1931,14 +1931,14 @@ pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
     }
     Some(TreeExtra {
         min_clipped: mch,
-        below_trunk: js_pub(j, "below_trunk_provider").and_then(p_bsp_pub).map(Box::new),
-        ignore_vines: jnum_pub(j, "ignore_vines").unwrap_or(0.0) != 0.0
-            || matches!(js_pub(j, "ignore_vines"), Some(J::Str(s)) if s == "true"),
+        below_trunk: js(j, "below_trunk_provider").and_then(p_bsp).map(Box::new),
+        ignore_vines: jnum(j, "ignore_vines").unwrap_or(0.0) != 0.0
+            || matches!(js(j, "ignore_vines"), Some(J::Str(s)) if s == "true"),
         min_size,
         decorators,
-        root_placer: js_pub(j, "root_placer").and_then(p_root),
-        trunk_bsp: p_bsp_pub(js_pub(j, "trunk_provider")?)?,
-        foliage_bsp: p_bsp_pub(js_pub(j, "foliage_provider")?)?,
+        root_placer: js(j, "root_placer").and_then(p_root),
+        trunk_bsp: p_bsp(js(j, "trunk_provider")?)?,
+        foliage_bsp: p_bsp(js(j, "foliage_provider")?)?,
         foliage_placer,
         foliage_radius,
         foliage_offset,
@@ -1946,10 +1946,10 @@ pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
     })
 }
 
-use crate::feature::{
-    breg, dir_off, is_water_st, jint_pub, jnum_pub, js_pub, jstr_pub, mkprops, p_bsp_pub,
-    p_ip_pub, BSP, FC, IP,
-};
+use crate::block_registry::{breg, mkprops};
+use crate::generation_context::FC;
+use crate::generation_providers::{dir_off, is_water_st, p_bsp, p_ip, BSP, IP};
+use crate::json::{jint, jnum, js, jstr};
 
 #[cfg(test)]
 mod tests {

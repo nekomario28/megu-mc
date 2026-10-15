@@ -1,37 +1,42 @@
-"""A design hypothesis, not evidence of the current implementation's layering.
+"""Design hypothesis for shared generation contracts, not an observed source graph.
 
-Separating registry, config and placement is the intended direction. Actual JSON,
-RNG/context types and population calls must also acquire correct owners; moving
-one function does not prove these edges or eliminate current source cycles.
+Registry, provider and local-world-access contracts have independent owners now;
+this file states the intended layering so the observation can be checked against it.
 """
 import json
 from pathlib import Path
 import depsgx as d
 
-modules = ["main", "featuredefs", "tree", "worldgen", "feature", "cached_lookup",
-           "world_rng", "tick_queue", "landing_types", "landing", "effects", "java_compat", "json", "generation_math"]
+layers = [
+    ["main"],
+    ["java_compat", "landing", "effects"],
+    ["cached_lookup", "world_rng", "tick_queue", "landing_types"],
+    ["feature"],
+    ["tree"],
+    ["generation_providers"],
+    ["generation_context"],
+    ["worldgen", "block_registry"],
+    ["json", "generation_math"],
+]
+modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(
     modules=modules,
     depends=[("main", name) for name in modules if name != "main"] + [
-        ("featuredefs", "tree"),
-        ("featuredefs", "worldgen"),
-        ("featuredefs", "feature"),
-        ("tree", "worldgen"),
-        ("tree", "feature"),
-        ("worldgen", "feature"),
-        ("landing", "java_compat"),
-        ("landing", "landing_types"),
+        ("landing", "java_compat"), ("landing", "landing_types"),
         ("java_compat", "landing_types"),
-        ("feature", "json"), ("tree", "json"), ("worldgen", "json"),
-        ("feature", "generation_math"), ("tree", "generation_math"), ("worldgen", "generation_math"),
+        ("feature", "tree"), ("feature", "worldgen"),
+        ("feature", "block_registry"), ("feature", "generation_providers"),
+        ("feature", "generation_context"), ("feature", "json"), ("feature", "generation_math"),
+        ("tree", "block_registry"), ("tree", "generation_providers"),
+        ("tree", "generation_context"), ("tree", "json"), ("tree", "generation_math"),
+        ("generation_providers", "block_registry"), ("generation_providers", "generation_context"),
+        ("generation_providers", "json"), ("generation_providers", "generation_math"),
+        ("generation_context", "worldgen"), ("generation_context", "block_registry"),
+        ("block_registry", "json"),
+        ("worldgen", "json"), ("worldgen", "generation_math"),
     ],
     roots=["main"],
-    layers=[
-        ["main"],
-        ["java_compat", "landing", "effects"],
-        ["cached_lookup", "world_rng", "tick_queue", "landing_types"],
-        ["featuredefs"], ["tree"], ["worldgen"], ["feature"], ["json", "generation_math"],
-    ],
+    layers=layers,
     forbidden=[("worldgen", "tree")],
 )
 policy = json.loads((Path(__file__).with_name("policy.json")).read_text())
