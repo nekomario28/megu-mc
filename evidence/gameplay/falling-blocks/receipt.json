@@ -34,14 +34,14 @@
     "not_a_gate": 0,
     "parked": 0,
     "skipped": 0,
-    "log_sha256": "ff94b98e1f729db6b554306643dd379f4a796b79d0914691858584e13688dd32"
+    "log_sha256": "7ac935323226fc71b0252485c28f4039127d8a91eb65773976c3440313eddc83"
   },
   "source_hashes": {
-    "src/main.rs": "89150664c52f64258fa18acb5573559404deffa1e456d9dbad2d5afa9c222563",
-    "src/tick_tests.rs": "dfe37a300280b9d9871f417a6cdee1b3f4b811d847402fe54bd67cbf1eeffeec",
+    "src/main.rs": "4f04d4365b8040ca2229521e79b1c3c3d4befb952201e740f98a33a06d7e3f4c",
+    "src/tick_tests.rs": "594bed6ab1900976147490df8f470cd6bbdcc139c4ffcca7a2fb67b91db4fda3",
     "src/persistence_tests.rs": "2c4682b2bba33e6b1ed7667bdba3313982cab38caefc6ec0bbc2267ce61e34b9",
-    "tools/mutation_check.sh": "7ea8111a206bbfa960b01c103a2d7a8d4357263bb2f8028700ead719cac3d1cd",
-    "evidence/gameplay/falling-blocks/README.md": "104cd6cd2c2db7b581c70a4269f7e1a1e1a4cc2ae05ed40574531f4c26039354",
+    "tools/mutation_check.sh": "60d4d07ca91f702d47950e5671de684ec4113456a032fa0774c231d8ee0a1f98",
+    "evidence/gameplay/falling-blocks/README.md": "6f7aaeda71cda2776bd7ccd46603395463a1c03de94043881b993f42e3e3b642",
     "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
   },
   "limits": [
@@ -50,6 +50,10 @@
     "The entity is a point: no bounding box and no horizontal velocity.",
     "fallable is air||liquid, so replaceable blocks (flowers, torches) act as support instead of being passed through and replaced.",
     "Below-world despawn destroys the block without dropping it.",
-    "The landing cell is checked for replaceability only when the support search walked through it."
+    "The landing cell is checked for replaceability only when the support search walked through it.",
+    "Columns taller than the neighbour-update recursion depth (24) leave the blocks above the bound in place.",
+    "note_falling skips py <= MIN_Y, so a gravity block at the world floor is not converted.",
+    "A legacy FAL1 cell with no overlay entry would materialise the terrain base_state (records carry no state).",
+    "save_world is not serialised against the tick autosave and the signal handler writing the same temp file."
   ]
 }

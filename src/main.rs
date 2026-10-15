@@ -4094,8 +4094,9 @@ fn note_falling(x: i32, y: i32, z: i32) {
 
 /// Turn a gravity block that has lost its support into a falling-block entity, as vanilla
 /// does: the block leaves the world and the entity owns its state until it lands. Removing
-/// the block reaches `note_falling` again, so a whole unsupported column converts in one
-/// pass instead of one cell per tick.
+/// the block reaches `note_falling` again, so an unsupported column converts in one pass
+/// instead of one cell per tick, bounded by the neighbour-update recursion depth
+/// (`UPD_DEPTH`); a column taller than that leaves the blocks above the bound in place.
 fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
     // The block must still be there. Keying this on "an entity occupies the cell" was wrong: a
     // falling entity has already left its block cell, so a *new* gravity block placed into that
@@ -4117,7 +4118,8 @@ fn falling_tick() {
     let active = std::mem::take(&mut *falling().lock().unwrap());
     let mut keep: Vec<Fall> = Vec::with_capacity(active.len());
     let mut moves: Vec<(i32, f64, f64, f64)> = Vec::new();
-    let mut landings: Vec<(i32, i32, i32, u32)> = Vec::new();
+    // A landing keeps its entity: the target cell is re-checked at the moment of placement.
+    let mut landings: Vec<(Fall, i32, i32, i32)> = Vec::new();
     let mut despawn: Vec<i32> = Vec::new();
     {
         let region = region_guard();
@@ -4135,8 +4137,8 @@ fn falling_tick() {
             while support > MIN_Y && fallable(bx, support, bz) { support -= 1; }
             let top = support + 1;
             if new_y <= top as f64 {
-                landings.push((bx, top, bz, f.state));
-                despawn.push(f.eid);
+                // Defer the placement to the application pass below, which re-checks the cell.
+                landings.push((f, bx, top, bz));
             } else {
                 f.y = new_y;
                 moves.push((f.eid, f.x, f.y, f.z));
@@ -4151,9 +4153,24 @@ fn falling_tick() {
         let mut f = falling().lock().unwrap();
         f.extend(keep);
     }
-    for (bx, top, bz, st) in landings {
-        set_block(bx, top, bz, st);
-        note_block_update(bx, top, bz, st);
+    for (fa, bx, top, bz) in landings {
+        // The support scan used the pre-tick snapshot. Two entities can reach the same cell in
+        // one tick, and a connection thread can place a block there; placing without this check
+        // would overwrite it and destroy a block. If the cell is taken, keep falling and resolve
+        // again next tick.
+        if fallable(bx, top, bz) {
+            set_block(bx, top, bz, fa.state);
+            note_block_update(bx, top, bz, fa.state);
+            broadcast_seen_destroy(fa.eid);
+        } else {
+            // The target is taken: a sibling landed there in this same batch, or a block was
+            // placed concurrently. Rest the entity on top of the new block and land it next
+            // tick, so neither block is destroyed and the fall terminates.
+            let mut rest = fa;
+            rest.y = (top + 1) as f64;
+            rest.dy = 0.0;
+            falling().lock().unwrap().push(rest);
+        }
     }
     for (eid, x, y, z) in moves {
         broadcast_seen(eid, |_| (0x70, entity_teleport(eid, x, y, z, 0.0, 0.0, true)));

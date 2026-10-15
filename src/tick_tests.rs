@@ -1274,6 +1274,17 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     assert_eq!(falling().lock().unwrap().len(), 2,
         "a new block in the passing entity's cell must still fall");
     assert_eq!(block_at(x, base + 3, z), 0, "and must leave the world");
+    // Both entities are co-located and descend in lockstep. Landing both must keep both blocks:
+    // the batch must not overwrite one with the other.
+    let mut ticks = 0;
+    while !falling().lock().unwrap().is_empty() && ticks < 40 {
+        falling_tick();
+        ticks += 1;
+    }
+    assert!(falling().lock().unwrap().is_empty(), "both entities must land");
+    let name = |y: i32| crate::block_registry::breg().unwrap().name_of(block_at(x, y, z)).to_string();
+    assert_eq!(name(base + 1), "minecraft:sand", "the first lands on the floor");
+    assert_eq!(name(base + 2), "minecraft:sand", "the second must not be destroyed");
 
     *falling().lock().unwrap() = old_falling;
     *forceloaded().lock().unwrap() = old_forced;

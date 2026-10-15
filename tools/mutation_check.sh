@@ -212,8 +212,8 @@ check "gravity is 0.04 per tick, not doubled" \
   sand_falls_under_vanilla_gravity_until_it_lands
 
 check "a landed block is placed on the support's top face" \
-  src/main.rs '                landings.push((bx, top, bz, f.state));' \
-  '                landings.push((bx, top + 1, bz, f.state));' \
+  src/main.rs '                landings.push((f, bx, top, bz));' \
+  '                landings.push((f, bx, top + 1, bz));' \
   sand_falls_under_vanilla_gravity_until_it_lands
 
 echo
