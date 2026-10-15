@@ -1209,6 +1209,41 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     set_test_region(oh, ow);
 }
 
+/// A fall that moves more than one block per tick must still land on a one-block platform it
+/// crosses. The support scan starts at the old feet and sweeps down to the new feet, so it sees
+/// a platform whose cell is entirely above `floor(new_y)`.
+#[test]
+fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
+    let _world_guard = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    let start = 150;
+    let original: Vec<(i32, u32)> = (60..=start).map(|y| (y, block_at(3, y, 3))).collect();
+    for y in 60..=start { set_block(3, y, 3, 0); }
+    set_block(3, 60, 3, stone); // the world floor below the platform
+    set_block(3, 97, 3, stone); // one-block platform at 97 (top face 98)
+    set_block(3, start, 3, sand);
+
+    // Tick 50 leaves the feet at y=99 (above the platform); tick 51 moves to y=96.96, whose
+    // floor is below the platform. A scan starting at the new cell would pass through it.
+    for _ in 0..51 { falling_tick(); }
+    assert!(falling().lock().unwrap().is_empty(), "the entity must have landed");
+    let name = |y: i32| crate::block_registry::breg().unwrap().name_of(block_at(3, y, 3)).to_string();
+    assert_eq!(name(98), "minecraft:sand", "it lands on the platform's top face");
+    assert_eq!(name(97), "minecraft:stone", "the platform is untouched");
+
+    for (y, st) in original { set_block(3, y, 3, st); }
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
+
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
 /// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
 /// block it never showed, because the check returns before locking when there is nothing above.

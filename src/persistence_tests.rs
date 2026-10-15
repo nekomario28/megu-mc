@@ -327,6 +327,10 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
     load_world_from(&payload);
 
     assert_eq!(block_at(1, 100, 2), 0, "the legacy block must leave the world");
+    assert_eq!(
+        world().lock().unwrap().get(&(0, 0)).and_then(|c| c.get(&local_idx(1, 100, 2))).copied(),
+        Some(0),
+        "the migrated cell is an explicit air override, so a non-air generated base is not exposed");
     let q = falling().lock().unwrap().clone();
     assert_eq!(q.len(), 1, "the legacy cell becomes one entity: {q:?}");
     assert_eq!(q[0].state, sand, "with the state the block had");

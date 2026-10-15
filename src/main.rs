@@ -4138,6 +4138,19 @@ fn falling_tick() {
             let new_y = f.y + f.dy;
             let bx = f.x.floor() as i32;
             let bz = f.z.floor() as i32;
+            // The entity is a point, so a tick that moves more than one block must sweep the
+            // whole interval: a one-block platform between the old and new feet is a landing,
+            // not something to pass through. Scan from the old feet down to the new feet (or the
+            // world floor for a fall that leaves the world), before the below-world check.
+            let old_floor = f.y.floor() as i32;
+            let lowest = (new_y.floor() as i32).max(MIN_Y);
+            let mut support = old_floor;
+            while support >= lowest && fallable(bx, support, bz) { support -= 1; }
+            if support >= lowest {
+                // Defer the placement to the application pass below, which re-checks the cell.
+                landings.push((f, bx, support + 1, bz));
+                continue;
+            }
             if new_y < MIN_Y as f64 {
                 // Below the world vanilla cannot place the block, so it drops it rather than
                 // destroying the item that left the world when the fall started.
@@ -4150,17 +4163,9 @@ fn falling_tick() {
                 despawn.push(f.eid);
                 continue;
             }
-            let mut support = new_y.floor() as i32;
-            while support > MIN_Y && fallable(bx, support, bz) { support -= 1; }
-            let top = support + 1;
-            if new_y <= top as f64 {
-                // Defer the placement to the application pass below, which re-checks the cell.
-                landings.push((f, bx, top, bz));
-            } else {
-                f.y = new_y;
-                moves.push((f.eid, f.x, f.y, f.z));
-                keep.push(f);
-            }
+            f.y = new_y;
+            moves.push((f.eid, f.x, f.y, f.z));
+            keep.push(f);
         }
     }
     // Put the survivors back by appending, not assigning. A connection thread can reach
@@ -5222,9 +5227,12 @@ fn load_world_from(payload: &[u8]) {
             let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             let st = block_at(fx, fy, fz);
-            if let Some(c) = world().lock().unwrap().get_mut(&(fx >> 4, fz >> 4)) {
-                c.remove(&local_idx(fx, fy, fz));
-            }
+            if st == 0 { continue }
+            // An absent overlay entry falls back to generated terrain, so removing the entry
+            // would leave a generated block where the migrating block used to be. Record air
+            // explicitly: the block is now the entity, not whatever terrain is underneath it.
+            world().lock().unwrap().entry((fx >> 4, fz >> 4)).or_default()
+                .insert(local_idx(fx, fy, fz), 0);
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
             falling().lock().unwrap().push(Fall {
                 eid, x: fx as f64 + 0.5, y: fy as f64, z: fz as f64 + 0.5,

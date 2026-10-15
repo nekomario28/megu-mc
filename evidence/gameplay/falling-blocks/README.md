@@ -9,8 +9,9 @@
   になる。`note_falling` は changed cell とその上の2セルだけを見る（走査しない）。
 - 物理はバイトコード契約（[falling-vanilla](../falling-vanilla/README.md)）どおり：
   毎 tick `dy -= 0.04`、`y += dy`。位置は `y_n = y0 - 0.02 n(n+1)`、減衰なし。
-- 着地は `new_y` が支持ブロックの上面 `top` に達した時点。`top` のセルへブロックを設置し、
-  `note_block_update` を送ってエンティティを破棄する。
+- 着地は、**掃引**した支持の上面 `top` に達した時点。1 tick の移動が1ブロックを超えても、
+  旧位置から新位置までを走査するので、間に挟まった1ブロックの床を飛び越えない。
+  `top` のセルへブロックを設置し、`note_block_update` を送ってエンティティを破棄する。
 - エンティティは `interest_tick` が `minecraft:falling_block`（type 40、object data = block state）で
   spawn し、`falling_tick` が `0x70` で位置を配信、着地で `0x42` 破棄する。
 - **冷えたチャンクのエンティティは tick しない**（ブロックは既に世界から消え、エンティティが待つ）。
@@ -29,10 +30,13 @@
 - `persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip`：位置・速度・状態・age が
   保存・再読込される。
 - `persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities`：旧 `FAL1`（セル）は
-  エンティティへ変換され、世界のブロックは除去される。
+  エンティティへ変換され、世界のブロックは**明示的な空気**へ置き換わる（下の地形を露出しない）。
+- `a_fast_falling_block_lands_on_a_thin_platform_it_crosses`：落下速度が1ブロック/tick を
+  超えても、掃引が途中の1ブロックの床を捉えて着地する。
 
 `tools/mutation_check.sh` が対照を赤にする：セル自身/上のセルの検査除去、資産集合→手書き3状態、
-重力を `0.04→0.08`、着地面を1上げる、冷チャンク判定除去、`FAL2` タグ改変、通過中エンティティによる新ブロック抑制。
+重力を `0.04→0.08`、着地面を上げる、掃引の開始点を旧位置→新位置に戻す、`FAL1` の明示空気を
+非空気にする、冷チャンク判定除去、`FAL2` タグ改変、通過中エンティティによる新ブロック抑制。
 
 ## 保存形式
 
@@ -58,12 +62,15 @@
 - **着地セルの再検査**：バッチ着地は設置直前に `fallable` を再確認し、埋まっていれば上に乗せて次tickで着地する。
 - **下世界のドロップ**：`new_y < MIN_Y` では破棄せず `block_drop` を item 化。
 - **save の直列化**：`SAVE_LOCK` で tick autosave と signal ハンドラの同時書き込みを防ぐ。
+- **高速落下のすり抜け**：支持走査を新位置のセルからではなく旧位置の足元から始め、新位置まで
+  掃引する。1 tick で1ブロックを超えて動いても、途中の1ブロックの床を飛び越えない
+  （`a_fast_falling_block_lands_on_a_thin_platform_it_crosses` と変異で固定）。
+- **FAL1 変換の地形露出**：旧セルのオーバーレイを削除すると生成地形が露出して二重になるため、
+  明示的な空気を記録する（`a_legacy_fal1_save_converts_its_blocks_to_entities` と変異で固定）。
 
 ## なお残る限界
 
 - `note_falling` は `py <= MIN_Y` を skip する（世界底面の重力ブロックは変換しない）。
-- 旧 `FAL1` の変換は記録に状態が無いため `block_at` を読む。オーバーレイに無いセルなら
-  地形の `base_state` を持ち上げてしまう（実運用の落下セルはオーバーレイにあるため通常は起きない）。
 - `canSurvive` 補正、`levelEvent(2001,…)`、`cancelDrop`、落下ダメージは未実装。
   信頼性19種（sand/red_sand/gravel/concrete_powder）は `EntityBlock` でも
   hurting block でもないので `BlockEntity`/`setHurtsEntities`/`causeFallDamage` は N/A。

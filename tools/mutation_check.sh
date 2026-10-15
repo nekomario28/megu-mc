@@ -237,15 +237,25 @@ check "gravity is 0.04 per tick, not doubled" \
   sand_falls_under_vanilla_gravity_until_it_lands
 
 check "a landed block is placed on the support's top face" \
-  src/main.rs '                landings.push((f, bx, top, bz));' \
-  '                landings.push((f, bx, top + 1, bz));' \
+  src/main.rs '                landings.push((f, bx, support + 1, bz));' \
+  '                landings.push((f, bx, support + 2, bz));' \
   sand_falls_under_vanilla_gravity_until_it_lands
+
+check "a fast fall sweeps for a thin platform" \
+  src/main.rs '            let old_floor = f.y.floor() as i32;' \
+  '            let old_floor = new_y.floor() as i32;' \
+  a_fast_falling_block_lands_on_a_thin_platform_it_crosses
 
 echo
 check "the falling entities are written into the save" \
   src/main.rs '(*f).extend_from_slice(b"FAL2");' \
   '(*f).extend_from_slice(b"XXXX");' \
   the_falling_entities_survive_a_save_and_load_round_trip
+
+check "a migrated legacy cell is explicitly air" \
+  src/main.rs '                .insert(local_idx(fx, fy, fz), 0);' \
+  '                .insert(local_idx(fx, fy, fz), 1);' \
+  a_legacy_fal1_save_converts_its_blocks_to_entities
 
 check "a block that drops twice keeps its second drop" \
   src/block_registry.rs '                reg.drops_second[st] = drop1;' \

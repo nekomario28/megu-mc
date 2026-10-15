@@ -25,9 +25,10 @@
     "persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip",
     "persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities",
     "tick_tests::a_falling_block_passes_through_a_replaceable_block",
-    "tick_tests::a_long_unsupported_column_converts_in_one_pass"
+    "tick_tests::a_long_unsupported_column_converts_in_one_pass",
+    "tick_tests::a_fast_falling_block_lands_on_a_thin_platform_it_crosses"
   ],
-  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed",
+  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air",
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
@@ -48,7 +49,6 @@
   },
   "limits": [
     "note_falling skips py <= MIN_Y, so a gravity block at the world floor is not converted.",
-    "A legacy FAL1 cell with no overlay entry would materialise the terrain base_state (records carry no state).",
     "canSurvive correction, levelEvent(2001) and cancelDrop are not implemented; the 19 falling states are neither EntityBlock nor hurting blocks, so BlockEntity/setHurtsEntities/causeFallDamage are N/A.",
     "The entity is a point: no bounding box."
   ],
@@ -59,5 +59,9 @@
     "mc_spine": "sand lands at y=151 (final_column {150: stone, 151: sand})",
     "result": "same landing cell on both servers for the same input",
     "note": "The oracle observes the landing cell; the tick-by-tick position is pinned by the unit test against the bytecode formula."
-  }
+  },
+  "integration_review_fixes": [
+    "The support scan sweeps from the old feet to the new feet, so a one-block platform crossed in a sub-block step is a landing, not a tunnel. (Codex integration review P2)",
+    "A migrated legacy FAL1 cell records explicit air instead of removing its overlay entry, so a non-air generated base is not exposed under the new entity. (Codex integration review P2)"
+  ]
 }
