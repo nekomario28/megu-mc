@@ -62,6 +62,12 @@
 - **着地セルの再検査**：バッチ着地は設置直前に `fallable` を再確認し、埋まっていれば上に乗せて次tickで着地する。
 - **下世界のドロップ**：`new_y < MIN_Y` では破棄せず `block_drop` を item 化。
 - **save の直列化**：`SAVE_LOCK` で tick autosave と signal ハンドラの同時書き込みを防ぐ。
+- **エンティティ化の原子的確保**：`spawn_fall` は check-then-clear ではなく既存の
+  `set_block_if(..., Some(st))` で CAS し、実際に外したスレッドだけがエンティティを作る
+  （2つの接続が同じブロックを二重に落とさない）。
+- **配置後の通知は世界の現在状態**：`place_block` は `set_block` の後に `block_at` を通知する。
+  未支持の砂を置くとその場でエンティティ化するが、要求した砂を通知するとクライアントに
+  幽霊ブロックが残る（`placing_unsupported_sand_queues_air_not_a_ghost` と変異で固定）。
 - **世界↔エンティティの遷移と save**：`spawn_fall` と `falling_tick` の着地適用を再入可能な
   `with_save_guard`（`SAVE_LOCK`）で挟む。signal スレッドの save が「ブロックは消えたが
   エンティティは未登録」「着地ブロックは置いたがエンティティはまだキュー」という中間状態を

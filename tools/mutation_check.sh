@@ -191,6 +191,11 @@ check "a placed gravity block is scheduled by its own cell" \
   '    for (px, py, pz) in [(x, y + 1, z), (x, y + 1, z)] {' \
   every_falling_block_becomes_an_entity_and_lands
 
+check "placing unsupported sand queues air, not a ghost" \
+  src/main.rs '    note_block_update(wx, wy, wz, block_at(wx, wy, wz));' \
+  '    note_block_update(wx, wy, wz, st);' \
+  placing_unsupported_sand_queues_air_not_a_ghost
+
 check "a block above a removed support is scheduled" \
   src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {' \
   '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
@@ -227,8 +232,8 @@ check "a long unsupported column converts in one pass" \
   a_long_unsupported_column_converts_in_one_pass
 
 check "a passing entity must not suppress a new block in the same cell" \
-  src/main.rs '    if block_at(px, py, pz) != st { return; }' \
-  '    if falling().lock().unwrap().iter().any(|f| f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64) { return; }' \
+  src/main.rs '        if !set_block_if(px, py, pz, 0, Some(st)) { return; }' \
+  '        if falling().lock().unwrap().iter().any(|f| f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64) { return; } if !set_block_if(px, py, pz, 0, Some(st)) { return; }' \
   a_new_block_in_a_passing_entity_cell_still_falls
 
 check "the falling set comes from the asset, not a hand list" \

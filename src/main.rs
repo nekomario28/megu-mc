@@ -4118,12 +4118,13 @@ fn note_falling(x: i32, y: i32, z: i32) {
 /// instead of one cell per tick, bounded by the neighbour-update recursion depth
 /// (`UPD_DEPTH`); a column taller than that leaves the blocks above the bound in place.
 fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
-    // The block must still be there. Keying this on "an entity occupies the cell" was wrong: a
-    // falling entity has already left its block cell, so a *new* gravity block placed into that
-    // cell matched the passing entity, was never spawned, and hung in the air forever.
-    if block_at(px, py, pz) != st { return; }
+    // Claim the block with a compare-and-set instead of a check then a clear: two threads can
+    // both see the unsupported gravity block, and only the one that actually removes it may
+    // create the entity, or one block would fall twice. Keying this on "an entity occupies the
+    // cell" was wrong: a falling entity has already left its block cell, so a *new* gravity block
+    // placed into that cell matched the passing entity and hung in the air forever.
     with_save_guard(|| {
-        set_block(px, py, pz, 0);
+        if !set_block_if(px, py, pz, 0, Some(st)) { return; }
         note_block_update(px, py, pz, 0);
         let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         falling().lock().unwrap().push(Fall {
@@ -4133,6 +4134,13 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
     });
 }
 
+/// Place a block and queue the update for whatever the world now holds. Placing an unsupported
+/// gravity block converts it to an entity in the same call, so notifying the requested state
+/// instead of the post-conversion state would leave a ghost block on the client.
+fn place_block(wx: i32, wy: i32, wz: i32, st: u32) {
+    set_block(wx, wy, wz, st);
+    note_block_update(wx, wy, wz, block_at(wx, wy, wz));
+}
 /// Advance each falling entity by vanilla's gravity and land it on the first solid block
 /// below. The physics is the bytecode-derived contract in evidence/gameplay/falling-vanilla:
 /// `dy -= 0.04` per tick, no drag, land when the feet reach the support's top face.
@@ -12789,8 +12797,7 @@ fn handle(mut s: TcpStream) {
                     let replaceable = matches!(block_at(tx, ty, tz), 0 | 2005 | 2006 | 2007 | 2075 | 2077 | 10756 | 5772..=5779);
                     if (item == 909 || item == 910) && replaceable {
                         let st = if item == 909 { 80 } else { 96 };
-                        set_block(tx, ty, tz, st);
-                        note_block_update(tx, ty, tz, st);
+                        place_block(tx, ty, tz, st);
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
                             inv.insert(36 + held_slot, (908, 1, Vec::new()));
@@ -12919,16 +12926,14 @@ fn handle(mut s: TcpStream) {
                         let yaw = { let p = me.pos.lock().unwrap(); p.3 } as f64;
                         let rot = (((180.0 + yaw) * 16.0 / 360.0 + 0.5) as i64 & 15) as u32;
                         let st = sb + rot * 2 + 1;
-                        set_block(tx, ty, tz, st);
-                        note_block_update(tx, ty, tz, st);
+                        place_block(tx, ty, tz, st);
                         let mut op = Vec::new(); write_pos(&mut op, tx, ty, tz); op.push(1);
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x34, op);
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                     if let Some(st) = item_to_state(item) {
-                        set_block(tx, ty, tz, st);
-                        note_block_update(tx, ty, tz, st);
+                        place_block(tx, ty, tz, st);
                     }
                 }
                 let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));

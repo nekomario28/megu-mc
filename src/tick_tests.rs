@@ -1422,6 +1422,38 @@ fn a_long_unsupported_column_converts_in_one_pass() {
     set_test_region(oh, ow);
 }
 
+/// Placing unsupported sand must queue the air the world now holds, not the sand that was
+/// requested: the block converts to an entity in the same call, and notifying the requested state
+/// would leave a ghost block on the client.
+#[test]
+fn placing_unsupported_sand_queues_air_not_a_ghost() {
+    let _g = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_world = world().lock().unwrap().clone();
+    pending_blocks().lock().unwrap().clear();
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
+    let sand = name_to_state("sand").unwrap();
+    let (x, y, z) = (3, 150, 3);
+    let original: Vec<(i32, u32)> = (y - 1..=y + 1).map(|yy| (yy, block_at(x, yy, z))).collect();
+    set_block(x, y - 1, z, 0);
+    set_block(x, y, z, 0);
+    place_block(x, y, z, sand);
+    assert_eq!(block_at(x, y, z), 0, "unsupported sand leaves the world");
+    let idx = ((x & 15) as u16) << 8 | ((z & 15) as u16) << 4 | (y & 15) as u16;
+    let queued = pending_blocks().lock().unwrap().get(&(x >> 4, y >> 4, z >> 4))
+        .and_then(|m| m.get(&idx)).copied();
+    assert_eq!(queued, Some(0), "the queued update is the air the world holds, not a ghost sand");
+    for (yy, st) in original { set_block(x, yy, z, st); }
+    *world().lock().unwrap() = old_world;
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
+
 /// Placing a gravity block in mid-air changes that cell and leaves everything under it untouched,
 /// so a scheduler that only looked at the cell above would leave it hanging forever. Every falling
 /// block name from the asset is walked here, because the registry test alone cannot tell whether a
