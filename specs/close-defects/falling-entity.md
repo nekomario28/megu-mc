@@ -1,6 +1,6 @@
 # F: 落下を vanilla の FallingBlockEntity に合わせる
 
-Status: 未実装。vanilla バイトコードの契約は
+Status: 実装済み（エンティティモデル）。同一入力のvanilla実行照合だけがQに残る。vanilla バイトコードの契約は
 [evidence/gameplay/falling-vanilla/README.md](../../evidence/gameplay/falling-vanilla/README.md) に固定した。
 現行 mc-spine は落下ブロックを「1 tick に 1 セル動かすブロックのキュー」で近似しており、
 vanilla の速度・加速・着地・ドロップ・保存とは一致しない。

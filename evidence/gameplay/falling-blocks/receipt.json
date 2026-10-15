@@ -1,0 +1,52 @@
+{
+  "checkpoint": "F: falling blocks are vanilla FallingBlockEntity, not a one-cell-per-tick block move",
+  "goal": "Match vanilla's position, acceleration, landing and save for falling blocks instead of keeping the block in the world and moving it one cell a tick.",
+  "contract": {
+    "source": "evidence/gameplay/falling-vanilla/FallingBlockEntity.javap.txt",
+    "gravity": "getDefaultGravity() = 0.04; applyGravity adds -gravity to dy each tick",
+    "drag": "none (the post-move Entity.bP is portal handling)",
+    "position": "y_n = y0 - 0.02 n(n+1)",
+    "landing": "when the feet reach the top face of the first solid block below; the block is placed there and the entity discarded",
+    "entity_type": 40,
+    "spawn_object_data": "block state id"
+  },
+  "changes": {
+    "model": "Fall { eid, x, y, z, dy, state, time }; the block leaves the world on spawn_fall",
+    "physics": "falling_tick integrates dy -= 0.04 and lands on the support top",
+    "wire": "interest_tick spawns type 40 with object data = state; falling_tick broadcasts 0x70 position and 0x42 destroy",
+    "save": "FAL2 records id/position/velocity/state/age; FAL1 (legacy cells) converts on load and removes the block",
+    "cold": "an entity in a cold chunk is kept, not ticked"
+  },
+  "tests": [
+    "tick_tests::sand_falls_under_vanilla_gravity_until_it_lands",
+    "tick_tests::two_stacked_sand_blocks_fall_without_deadlocking",
+    "tick_tests::every_falling_block_becomes_an_entity_and_lands",
+    "tick_tests::a_falling_block_waits_in_a_cold_chunk",
+    "persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip",
+    "persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities"
+  ],
+  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed",
+  "verify": {
+    "command": "bash tests/verify.sh",
+    "result": "PASS",
+    "rust": "122 passed / 1 pre-existing ignored in 3 thread runs and 1 serial run",
+    "mutants_proved": 28,
+    "not_a_gate": 0,
+    "parked": 0,
+    "skipped": 0,
+    "log_sha256": "7a2b55217167df21959479e5a7745f95ab907f68b087362861a18060e833e385"
+  },
+  "source_hashes": {
+    "src/main.rs": "ee134a7f91b731982ae6b2e4365b1483ba0288403a252e05edd5d7ffe143cf26",
+    "src/tick_tests.rs": "de96fe5fff3eb5bb08a8105bca1008dd8510d007d8ac8ec98cbdcfdfe34d7871",
+    "src/persistence_tests.rs": "abe8332dc6d31415205d90794490b58387b85df28f7e96ba6eba09bace622fd4",
+    "tools/mutation_check.sh": "30c25a868c9559e90985e62bc6297ee8dbcdfdfa8b57d3db56eb37e427c841e3",
+    "evidence/gameplay/falling-blocks/README.md": "112c6c46342c6e5feeefdd4c2564c3a262f54fa49b31b0a36526df30a036bd05",
+    "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
+  },
+  "limits": [
+    "No same-input vanilla runtime comparison yet: the physics is derived from bytecode, not observed from a running vanilla server (Q).",
+    "move collision snap, canSurvive=false alternatives/drops, lava/water, cancelDrop and fall damage are not implemented.",
+    "The entity is a point: no bounding box and no horizontal velocity."
+  ]
+}

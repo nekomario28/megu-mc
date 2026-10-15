@@ -267,13 +267,16 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
 /// keeps the block where it was mid-air and nothing ever drops it, because the tick only moves what
 /// is queued - so after a restart the block hangs there permanently.
 #[test]
-fn the_falling_queue_survives_a_save_and_load_round_trip() {
+fn the_falling_entities_survive_a_save_and_load_round_trip() {
     if test_support::isolated_world_test() { return; }
     let _g = world_guard();
     let old_world = world().lock().unwrap().clone();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
 
-    falling().lock().unwrap().extend([(1, 100, 2), (-3, 70, 4)]);
+    falling().lock().unwrap().extend([
+        Fall { eid: 7001, x: 1.5, y: 100.25, z: 2.5, dy: -0.12, state: 112, time: 3 },
+        Fall { eid: 7002, x: -2.5, y: 70.0, z: 4.5, dy: 0.0, state: 117, time: 0 },
+    ]);
     let mut payload = Vec::new();
     save_world_into(&mut payload);
 
@@ -282,9 +285,50 @@ fn the_falling_queue_survives_a_save_and_load_round_trip() {
     load_world_from(&payload);
 
     let q = falling().lock().unwrap().clone();
-    assert_eq!(q.len(), 2, "both entries came back and nothing else: {q:?}");
-    assert!(q.contains(&(1, 100, 2)), "positive coordinates survive: {q:?}");
-    assert!(q.contains(&(-3, 70, 4)), "and negative ones, which are easy to mangle: {q:?}");
+    assert_eq!(q.len(), 2, "both entities came back and nothing else: {q:?}");
+    assert!(q.iter().any(|f| f.eid == 7001 && (f.x - 1.5).abs() < 1e-9
+        && (f.y - 100.25).abs() < 1e-9 && (f.z - 2.5).abs() < 1e-9
+        && (f.dy + 0.12).abs() < 1e-9 && f.state == 112 && f.time == 3),
+        "position, velocity, state and age survive: {q:?}");
+    assert!(q.iter().any(|f| f.eid == 7002 && (f.x + 2.5).abs() < 1e-9 && f.state == 117),
+        "and negative coordinates are easy to mangle: {q:?}");
+
+    *world().lock().unwrap() = old_world;
+    *falling().lock().unwrap() = old_falling;
+}
+
+/// A save written by the old cell-moving model carries FAL1. Loading it must convert each cell
+/// to an entity and remove the block, or the block would remain behind and duplicate.
+#[test]
+fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
+    if test_support::isolated_world_test() { return; }
+    let _g = world_guard();
+    let old_world = world().lock().unwrap().clone();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+
+    let sand = name_to_state("sand").unwrap();
+    let mut payload = Vec::new();
+    write_varint(&mut payload, 1);
+    payload.extend_from_slice(&0i32.to_be_bytes());
+    payload.extend_from_slice(&0i32.to_be_bytes());
+    write_varint(&mut payload, 1);
+    payload.extend_from_slice(&local_idx(1, 100, 2).to_be_bytes());
+    write_varint(&mut payload, sand as i64);
+    payload.extend_from_slice(b"FAL1");
+    write_varint(&mut payload, 1);
+    payload.extend_from_slice(&1i32.to_be_bytes());
+    payload.extend_from_slice(&100i32.to_be_bytes());
+    payload.extend_from_slice(&2i32.to_be_bytes());
+
+    world().lock().unwrap().clear();
+    falling().lock().unwrap().clear();
+    load_world_from(&payload);
+
+    assert_eq!(block_at(1, 100, 2), 0, "the legacy block must leave the world");
+    let q = falling().lock().unwrap().clone();
+    assert_eq!(q.len(), 1, "the legacy cell becomes one entity: {q:?}");
+    assert_eq!(q[0].state, sand, "with the state the block had");
+    assert!((q[0].x - 1.5).abs() < 1e-9 && (q[0].y - 100.0).abs() < 1e-9, "at the cell center");
 
     *world().lock().unwrap() = old_world;
     *falling().lock().unwrap() = old_falling;

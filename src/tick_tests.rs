@@ -1154,67 +1154,54 @@ fn measure_the_light_cost_per_chunk() {
     );
 }
 
-/// Sand over air falls until it lands. Vanilla schedules a tick from the neighbour update, so the
-/// queue is filled by a block change rather than by a scan, and the block moves one cell a tick.
+/// Sand over air falls as a vanilla falling-block entity: the block leaves the world, the
+/// entity integrates `dy -= 0.04` per tick (`y_n = y0 - 0.02 n(n+1)`), and it lands on the
+/// first solid block below. The bytecode contract is evidence/gameplay/falling-vanilla.
 #[test]
-fn sand_falls_one_block_a_tick_until_it_lands() {
+fn sand_falls_under_vanilla_gravity_until_it_lands() {
     let _world_guard = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
-    // The chunk has to be warm or the tick re-queues instead of moving: a block in flight is an
-    // entity in vanilla and does not tick in a chunk nobody is near.
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
     set_test_region(oh.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
-    // A floor to land on, and sand three blocks above it.
     let original: Vec<(i32, u32)> = (base..=base + 4).map(|y| (y, block_at(3, y, 3))).collect();
-    for y in base..=base + 4 {
-        set_block(3, y, 3, 0);
-    }
+    for y in base..=base + 4 { set_block(3, y, 3, 0); }
     set_block(3, base, 3, name_to_state("stone").expect("stone must exist"));
-    // A support under the sand, so the sand is not scheduled merely by being placed. Without it the
-    // placement schedules the fall on its own, and the branch that notices a removed support is
-    // never exercised: a mutation deleting that branch leaves this test green.
     set_block(3, base + 2, 3, name_to_state("dirt").expect("dirt must exist"));
     set_block(3, base + 3, 3, sand);
-    assert!(
-        falling().lock().unwrap().is_empty(),
-        "a block with support under it must not be scheduled"
-    );
+    assert!(falling().lock().unwrap().is_empty(), "supported sand must not fall");
 
     let name = |y: i32| crate::block_registry::breg().unwrap().name_of(block_at(3, y, 3)).to_string();
-    assert_eq!(name(base + 3), "minecraft:sand", "the test starts with sand in the air");
-    // Removing the block beneath it schedules the fall. The sand must still be where it was: an
-    // earlier version dropped it to the floor inside this very call through a second gravity
-    // implementation, which made the count below read one and hid the duplicate.
+    // Removing the support converts the block into an entity in the same call; the block does
+    // not stay in the world while it falls.
     set_block(3, base + 2, 3, 0);
-    // Nothing schedules the queue here by hand: set_block has to reach it on its own. Calling the
-    // scheduler explicitly would keep this test green over a placement that never queues at all.
-    assert!(!falling().lock().unwrap().is_empty(), "the sand must be queued");
-    assert_eq!(name(base + 3), "minecraft:sand", "scheduling a fall must not move the block");
+    assert_eq!(block_at(3, base + 3, 3), 0, "the block must leave the world");
+    let entity = falling().lock().unwrap().clone();
+    assert_eq!(entity.len(), 1, "exactly one falling entity");
+    assert_eq!(entity[0].state, sand, "the entity carries the block state");
+    assert!((entity[0].y - (base + 3) as f64).abs() < 1e-9, "it starts at the block cell");
 
-    // One cell a tick, and it stops on the floor. The column is pinned after every tick: a count
-    // alone would also pass if the block moved two cells in one tick and then idled, which is what
-    // the duplicate gravity implementation used to do.
-    eprintln!("D before tick queue={:?} col={:?}", falling().lock().unwrap(), (base..=base+4).map(name).collect::<Vec<_>>());
-    falling_tick();
-    eprintln!("D after tick queue={:?} col={:?}", falling().lock().unwrap(), (base..=base+4).map(name).collect::<Vec<_>>());
-    assert_eq!(name(base + 2), "minecraft:sand", "one cell down after one tick");
-    assert_eq!(name(base + 3), "minecraft:air", "and nothing left where it was");
-    falling_tick();
-    assert_eq!(name(base + 1), "minecraft:sand", "landed on the floor after two ticks");
-    assert_eq!(name(base + 2), "minecraft:air", "with nothing above it");
-    // A landed block is looked at once more to take it out of the queue; that pass must not move it.
-    falling_tick();
-    assert_eq!(name(base + 1), "minecraft:sand", "a landed block must not move again");
-    assert!(falling().lock().unwrap().is_empty(), "and the queue drains");
-
-    for (y, st) in original {
-        set_block(3, y, 3, st);
+    // The exact gravity trace, tick by tick, for the nine airborne ticks.
+    let mut expected = (base + 3) as f64;
+    for n in 1..=9 {
+        falling_tick();
+        expected -= 0.04 * n as f64;
+        let cur = falling().lock().unwrap().clone();
+        assert_eq!(cur.len(), 1, "still in flight at tick {n}");
+        assert!((cur[0].y - expected).abs() < 1e-9,
+            "tick {n}: y={} but vanilla gravity gives {expected}", cur[0].y);
     }
+    // Tick ten reaches the floor's top face and places the block there.
+    falling_tick();
+    assert!(falling().lock().unwrap().is_empty(), "the entity landed and despawned");
+    assert_eq!(name(base + 1), "minecraft:sand", "the block is placed on the floor");
+    assert_eq!(name(base + 2), "minecraft:air", "nothing is left above it");
+
+    for (y, st) in original { set_block(3, y, 3, st); }
     *falling().lock().unwrap() = old_falling;
     *forceloaded().lock().unwrap() = old_forced;
     set_test_region(oh, ow);
@@ -1229,42 +1216,35 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
-    // The chunk has to be warm or the tick re-queues instead of moving: a block in flight is an
-    // entity in vanilla and does not tick in a chunk nobody is near.
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
     set_test_region(oh.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let original: Vec<(i32, u32)> = (base..=base + 5).map(|y| (y, block_at(5, y, 5))).collect();
-    for y in base..=base + 5 {
-        set_block(5, y, 5, 0);
-    }
+    for y in base..=base + 5 { set_block(5, y, 5, 0); }
     set_block(5, base, 5, name_to_state("stone").expect("stone must exist"));
+    set_block(5, base + 2, 5, name_to_state("dirt").expect("dirt must exist"));
     set_block(5, base + 3, 5, sand);
     set_block(5, base + 4, 5, sand);
+    // Removing the support converts the lower block, whose removal makes the upper one
+    // unsupported, so both become entities in the same call.
     set_block(5, base + 2, 5, 0);
-    // The neighbour check schedules only the lower block; the upper one joins the queue when the
-    // lower moves out of the way. On a later tick both are held at once, and that is the
-    // arrangement the first version deadlocked on, so the maximum is asserted rather than assumed.
-    assert_eq!(falling().lock().unwrap().len(), 1, "the neighbour check schedules the lower block");
+    assert_eq!(falling().lock().unwrap().len(), 2, "both blocks must become entities");
 
     let name = |y: i32| crate::block_registry::breg().unwrap().name_of(block_at(5, y, 5)).to_string();
     let mut ticks = 0;
-    let mut most_held = 1;
-    while !falling().lock().unwrap().is_empty() && ticks < 20 {
-        most_held = most_held.max(falling().lock().unwrap().len());
+    while !falling().lock().unwrap().is_empty() && ticks < 30 {
         falling_tick();
         ticks += 1;
     }
-    assert_eq!(most_held, 2, "both blocks must be in flight at once, or the deadlock is not exercised");
+    assert!(ticks < 30, "both entities must land");
+    assert!(falling().lock().unwrap().is_empty(), "nothing left in flight");
     assert_eq!(name(base + 1), "minecraft:sand", "the lower one lands");
     assert_eq!(name(base + 2), "minecraft:sand", "and the upper one rests on it");
     assert_eq!(name(base + 3), "minecraft:air", "nothing is left in the air");
 
-    for (y, st) in original {
-        set_block(5, y, 5, st);
-    }
+    for (y, st) in original { set_block(5, y, 5, st); }
     *falling().lock().unwrap() = old_falling;
     *forceloaded().lock().unwrap() = old_forced;
     set_test_region(oh, ow);
@@ -1276,13 +1256,11 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
 /// name that is classified as falling is also scheduled and moved - reverting the tick to a hand
 /// list of three states kept that test green.
 #[test]
-fn every_falling_block_is_scheduled_and_moves_one_cell() {
+fn every_falling_block_becomes_an_entity_and_lands() {
     let _g = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
-    // The chunk has to be warm or the tick re-queues instead of moving: a block in flight is an
-    // entity in vanilla and does not tick in a chunk nobody is near.
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
     set_test_region(oh.clone(), warm);
@@ -1297,20 +1275,24 @@ fn every_falling_block_is_scheduled_and_moves_one_cell() {
     for n in &names {
         x += 2;
         let st = name_to_state(n).unwrap_or_else(|| panic!("{n} must be a placeable block"));
-        for y in base..=base + 4 {
-            set_block(x, y, 9, 0);
-        }
+        for y in base..=base + 4 { set_block(x, y, 9, 0); }
         set_block(x, base, 9, name_to_state("stone").unwrap());
         *falling().lock().unwrap() = Vec::new();
         set_block(x, base + 3, 9, st);
-        assert!(!falling().lock().unwrap().is_empty(), "{n} placed in mid-air must be scheduled");
-        falling_tick();
+        assert_eq!(block_at(x, base + 3, 9), 0, "{n} must leave the world when it falls");
+        assert_eq!(falling().lock().unwrap().len(), 1, "{n} must become one entity");
+        assert_eq!(falling().lock().unwrap()[0].state, st, "{n} must keep its state");
+        let mut ticks = 0;
+        while !falling().lock().unwrap().is_empty() && ticks < 30 {
+            falling_tick();
+            ticks += 1;
+        }
+        assert!(ticks < 30, "{n} must land");
         assert_eq!(
-            reg.name_of(block_at(x, base + 2, 9)).trim_start_matches("minecraft:"),
+            reg.name_of(block_at(x, base + 1, 9)).trim_start_matches("minecraft:"),
             n.as_str(),
-            "{n} must fall one cell"
+            "{n} must land on the floor's top face"
         );
-        assert_eq!(block_at(x, base + 3, 9), 0, "{n} must leave nothing where it was");
     }
     *falling().lock().unwrap() = old_falling;
     *forceloaded().lock().unwrap() = old_forced;
@@ -1327,26 +1309,19 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
     set_test_region(oh.clone(), std::collections::HashSet::new());
-    let reg = crate::block_registry::breg().unwrap();
     let base = 150;
-    for y in base..=base + 4 {
-        set_block(11, y, 11, 0);
-    }
+    for y in base..=base + 4 { set_block(11, y, 11, 0); }
     set_block(11, base, 11, name_to_state("stone").unwrap());
     set_block(11, base + 3, 11, name_to_state("sand").unwrap());
-    assert!(!falling().lock().unwrap().is_empty(), "the placement queues it");
+    // The block still leaves the world and becomes an entity even in a cold chunk; only the
+    // entity's tick is deferred.
+    assert_eq!(block_at(11, base + 3, 11), 0, "the block leaves the world");
+    let y0 = { let q = falling().lock().unwrap(); assert_eq!(q.len(), 1); q[0].y };
 
     falling_tick();
-    assert_eq!(
-        reg.name_of(block_at(11, base + 3, 11)).trim_start_matches("minecraft:"),
-        "sand",
-        "a cold chunk must not move it"
-    );
-    assert_eq!(
-        falling().lock().unwrap().len(),
-        1,
-        "and it stays queued for when the chunk warms up, rather than being dropped"
-    );
+    let q = falling().lock().unwrap().clone();
+    assert_eq!(q.len(), 1, "a cold chunk must not land or drop the entity");
+    assert_eq!(q[0].y, y0, "and must not move it");
 
     set_test_region(oh, ow);
     *falling().lock().unwrap() = old_falling;

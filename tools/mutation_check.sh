@@ -186,50 +186,36 @@ check "lazy feature lookup applies its population input and retains cached overr
   '                    let _ = (&mut populate, sx, sz);' \
   worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides
 
-FALLING_SELF='    if y > MIN_Y
-        && reg.behaviour_of(block_at(x, y, z)) == crate::block_registry::B_FALLING
-        && fallable(x, y - 1, z)
-    {
-        schedule(x, y, z);
-    }
-'
 check "a placed gravity block is scheduled by its own cell" \
-  src/main.rs "$FALLING_SELF" "" \
-  every_falling_block_is_scheduled_and_moves_one_cell
+  src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {' \
+  '    for (px, py, pz) in [(x, y + 1, z), (x, y + 1, z)] {' \
+  every_falling_block_becomes_an_entity_and_lands
+
+check "a block above a removed support is scheduled" \
+  src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {' \
+  '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
+  sand_falls_under_vanilla_gravity_until_it_lands
 
 check "the falling set comes from the asset, not a hand list" \
-  src/main.rs 'if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
-            continue; // something else is here now' \
-  'if !matches!(st, 112 | 117 | 118) {
-            continue; // something else is here now' \
-  every_falling_block_is_scheduled_and_moves_one_cell
+  src/main.rs '        if reg.behaviour_of(st) != crate::block_registry::B_FALLING { continue }' \
+  '        if !matches!(st, 112 | 117 | 118) { continue }' \
+  every_falling_block_becomes_an_entity_and_lands
 
-check "a landed block is still scheduled when the support is removed" \
-  src/main.rs '    if fallable(x, y, z) && reg.behaviour_of(block_at(x, y + 1, z)) == crate::block_registry::B_FALLING {' \
-  '    if false {' \
-  sand_falls_one_block_a_tick_until_it_lands
+check "gravity is 0.04 per tick, not doubled" \
+  src/main.rs '            f.dy -= 0.04;' \
+  '            f.dy -= 0.08;' \
+  sand_falls_under_vanilla_gravity_until_it_lands
 
-check "the merge keeps one entry per position" \
-  src/main.rs '    for p in again {
-        if !f.contains(&p) {
-            f.push(p);
-        }
-    }' \
-  '    f.extend(again);' \
-  two_stacked_sand_blocks_fall_without_deadlocking
-
-check "a falling block does not move while it is only scheduled" \
-  src/main.rs '        set_block(x, y - 1, z, st);
-        note_block_update(x, y, z, 0);' \
-  '        set_block(x, y, z, 0);
-        note_block_update(x, y, z, 0);' \
-  sand_falls_one_block_a_tick_until_it_lands
+check "a landed block is placed on the support's top face" \
+  src/main.rs '                landings.push((bx, top, bz, f.state));' \
+  '                landings.push((bx, top + 1, bz, f.state));' \
+  sand_falls_under_vanilla_gravity_until_it_lands
 
 echo
-check "the falling queue is written into the save" \
-  src/main.rs '(*f).extend_from_slice(b"FAL1");' \
+check "the falling entities are written into the save" \
+  src/main.rs '(*f).extend_from_slice(b"FAL2");' \
   '(*f).extend_from_slice(b"XXXX");' \
-  the_falling_queue_survives_a_save_and_load_round_trip
+  the_falling_entities_survive_a_save_and_load_round_trip
 
 check "a block that drops twice keeps its second drop" \
   src/block_registry.rs '                reg.drops_second[st] = drop1;' \
@@ -237,8 +223,8 @@ check "a block that drops twice keeps its second drop" \
   a_potted_plant_drops_both_entries_the_asset_lists
 
 check "a falling block does not move in a cold chunk" \
-  src/main.rs '        if !region.is_warm(x, z) {' \
-  '        if false {' \
+  src/main.rs '            if !region.is_warm(f.x as i32, f.z as i32) { keep.push(f); continue; }' \
+  '            if false { keep.push(f); continue; }' \
   a_falling_block_waits_in_a_cold_chunk
 
 check "breaking a chest drops the slots it owned" \

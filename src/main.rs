@@ -380,6 +380,10 @@ fn interest_tick() {
         let (eid, x, y, z) = (t.eid, t.x, t.y, t.z);
         ents.push((eid, x, y, z, Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0))])));
     }
+    for f in falling().lock().unwrap().iter() {
+        let (eid, x, y, z, state) = (f.eid, f.x, f.y, f.z, f.state);
+        ents.push((eid, x, y, z, Box::new(move || vec![(0x01, spawn_falling_pkt(eid, state, x, y, z))])));
+    }
     for o in xps().lock().unwrap().iter() {
         let (eid, x, y, z, val) = (o.eid, o.x, o.y, o.z, o.val);
         ents.push((eid, x, y, z, Box::new(move || vec![(0x02, xp_orb_pkt(eid, x, y, z, val))])));
@@ -1302,6 +1306,21 @@ fn spawn_entity_pkt(eid: i32, etype: u32, x: f64, y: f64, z: f64, yaw: f32, pitc
     p.extend_from_slice(&z.to_be_bytes());
     p.push(angle(pitch) as u8); p.push(angle(yaw) as u8); p.push(angle(yaw) as u8);
     write_varint(&mut p, 0);
+    p.extend_from_slice(&[0u8; 6]);
+    p
+}
+/// `minecraft:falling_block` (entity type 40) carries its block state as the spawn packet's
+/// object data, so the client renders the right block while it falls.
+fn spawn_falling_pkt(eid: i32, state: u32, x: f64, y: f64, z: f64) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, eid as i64);
+    p.extend_from_slice(&[0u8; 16]);
+    write_varint(&mut p, 40);
+    p.extend_from_slice(&x.to_be_bytes());
+    p.extend_from_slice(&y.to_be_bytes());
+    p.extend_from_slice(&z.to_be_bytes());
+    p.extend_from_slice(&[0u8; 3]);
+    write_varint(&mut p, state as i64);
     p.extend_from_slice(&[0u8; 6]);
     p
 }
@@ -4035,8 +4054,13 @@ fn block_updated(x: i32, y: i32, z: i32) {
     UPD_DEPTH.set(depth);
     r
 }
-static FALLING: OnceLock<Mutex<Vec<(i32, i32, i32)>>> = OnceLock::new();
-fn falling() -> &'static Mutex<Vec<(i32, i32, i32)>> {
+/// A falling block in flight, as vanilla's `FallingBlockEntity`: the block has left the
+/// world, and this owns its state until it lands. `dy` is the vertical velocity and is
+/// integrated with vanilla's 0.04-per-tick gravity (`y_n = y0 - 0.02 n(n+1)`).
+#[derive(Clone, Debug)]
+struct Fall { eid: i32, x: f64, y: f64, z: f64, dy: f64, state: u32, time: i32 }
+static FALLING: OnceLock<Mutex<Vec<Fall>>> = OnceLock::new();
+fn falling() -> &'static Mutex<Vec<Fall>> {
     FALLING.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -4059,70 +4083,79 @@ fn fallable(x: i32, y: i32, z: i32) -> bool {
 /// looked upward left the block hanging.
 fn note_falling(x: i32, y: i32, z: i32) {
     let Some(reg) = crate::block_registry::breg() else { return };
-    let mut schedule = |px: i32, py: i32, pz: i32| {
-        let mut f = falling().lock().unwrap();
-        if !f.contains(&(px, py, pz)) {
-            f.push((px, py, pz));
-        }
-    };
-    if y > MIN_Y
-        && reg.behaviour_of(block_at(x, y, z)) == crate::block_registry::B_FALLING
-        && fallable(x, y - 1, z)
-    {
-        schedule(x, y, z);
-    }
-    if fallable(x, y, z) && reg.behaviour_of(block_at(x, y + 1, z)) == crate::block_registry::B_FALLING {
-        schedule(x, y + 1, z);
+    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {
+        if py <= MIN_Y { continue }
+        let st = block_at(px, py, pz);
+        if reg.behaviour_of(st) != crate::block_registry::B_FALLING { continue }
+        if !fallable(px, py - 1, pz) { continue }
+        spawn_fall(px, py, pz, st);
     }
 }
 
-/// One block a tick, which is what a falling block entity does at its slowest. A block that has
-/// landed leaves the queue.
+/// Turn a gravity block that has lost its support into a falling-block entity, as vanilla
+/// does: the block leaves the world and the entity owns its state until it lands. Removing
+/// the block reaches `note_falling` again, so a whole unsupported column converts in one
+/// pass instead of one cell per tick.
+fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
+    if falling().lock().unwrap().iter().any(|f| {
+        f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64
+    }) {
+        return;
+    }
+    set_block(px, py, pz, 0);
+    note_block_update(px, py, pz, 0);
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    falling().lock().unwrap().push(Fall {
+        eid, x: px as f64 + 0.5, y: py as f64, z: pz as f64 + 0.5,
+        dy: 0.0, state: st, time: 0,
+    });
+}
+
+/// Advance each falling entity by vanilla's gravity and land it on the first solid block
+/// below. The physics is the bytecode-derived contract in evidence/gameplay/falling-vanilla:
+/// `dy -= 0.04` per tick, no drag, land when the feet reach the support's top face.
 fn falling_tick() {
-    // The lock is held only to take the queue and to put the moved blocks back. set_block reaches
-    // note_falling_above, which takes this same lock, so holding it across the moves deadlocks as
-    // soon as two blocks are stacked - the block above the one that moves is itself falling.
-    let queued = {
-        let mut f = falling().lock().unwrap();
-        std::mem::take(&mut *f)
-    };
-    let mut again = Vec::new();
-    let region = region_guard();
-    for (x, y, z) in queued {
-        // A block in flight is an entity in vanilla, so it does not move in a chunk nobody is
-        // near. Re-queued rather than dropped, the same way the fluid ticks treat a cold cell, so
-        // it carries on falling when the chunk warms up instead of hanging where it stopped.
-        if !region.is_warm(x, z) {
-            again.push((x, y, z));
-            continue;
-        }
-        let st = block_at(x, y, z);
-        let reg = match crate::block_registry::breg() {
-            Some(r) => r,
-            None => return,
-        };
-        if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
-            continue; // something else is here now
-        }
-        if y <= MIN_Y || !fallable(x, y - 1, z) {
-            continue; // landed
-        }
-        set_block(x, y, z, 0);
-        set_block(x, y - 1, z, st);
-        note_block_update(x, y, z, 0);
-        note_block_update(x, y - 1, z, st);
-        again.push((x, y - 1, z));
-    }
-    // The two set_block calls above each reach note_falling, which may already have queued the cell
-    // this move vacated, so the merge is the place that keeps one entry per position. A second
-    // check while building `again` is redundant: contains is applied here against the live queue,
-    // which already holds anything pushed a moment ago.
-    let mut f = falling().lock().unwrap();
-    for p in again {
-        if !f.contains(&p) {
-            f.push(p);
+    let active = std::mem::take(&mut *falling().lock().unwrap());
+    let mut keep: Vec<Fall> = Vec::with_capacity(active.len());
+    let mut moves: Vec<(i32, f64, f64, f64)> = Vec::new();
+    let mut landings: Vec<(i32, i32, i32, u32)> = Vec::new();
+    let mut despawn: Vec<i32> = Vec::new();
+    {
+        let region = region_guard();
+        for mut f in active {
+            // A block in flight is an entity in vanilla, so it does not tick in a chunk nobody
+            // is near; it stays in flight until the chunk warms up.
+            if !region.is_warm(f.x as i32, f.z as i32) { keep.push(f); continue; }
+            f.time += 1;
+            f.dy -= 0.04;
+            let new_y = f.y + f.dy;
+            let bx = f.x.floor() as i32;
+            let bz = f.z.floor() as i32;
+            if new_y < MIN_Y as f64 { despawn.push(f.eid); continue; }
+            let mut support = new_y.floor() as i32;
+            while support > MIN_Y && fallable(bx, support, bz) { support -= 1; }
+            let top = support + 1;
+            if new_y <= top as f64 {
+                landings.push((bx, top, bz, f.state));
+                despawn.push(f.eid);
+            } else {
+                f.y = new_y;
+                moves.push((f.eid, f.x, f.y, f.z));
+                keep.push(f);
+            }
         }
     }
+    // Restore the survivors before the landing writes: set_block reaches note_falling, which
+    // appends to this same list, and overwriting it after the writes would drop those entities.
+    *falling().lock().unwrap() = keep;
+    for (bx, top, bz, st) in landings {
+        set_block(bx, top, bz, st);
+        note_block_update(bx, top, bz, st);
+    }
+    for (eid, x, y, z) in moves {
+        broadcast_seen(eid, |_| (0x70, entity_teleport(eid, x, y, z, 0.0, 0.0, true)));
+    }
+    for eid in despawn { broadcast_seen_destroy(eid); }
 }
 
 fn block_updated_inner(x: i32, y: i32, z: i32) {
@@ -4656,17 +4689,23 @@ fn save_world_into(f: &mut Vec<u8>) {
         }
     }
 
-    // FAL1: the falling block queue. Without this, a block in flight is written to the world
-    // mid-air and nothing ever drops it, because the tick only moves what is queued. Appended
-    // after the meta section: a save written before this existed simply has no queue to read.
+    // FAL2: falling-block entities (id, position, velocity, block state, age). FAL1 stored a
+    // cell the old cell-moving model held; a save carrying it is converted on load.
     let mut in_flight = falling().lock().unwrap().clone();
-    in_flight.sort_unstable();
-    (*f).extend_from_slice(b"FAL1");
+    in_flight.sort_by(|a, b| {
+        (a.x.to_bits(), a.y.to_bits(), a.z.to_bits(), a.eid)
+            .cmp(&(b.x.to_bits(), b.y.to_bits(), b.z.to_bits(), b.eid))
+    });
+    (*f).extend_from_slice(b"FAL2");
     write_varint(&mut *f, in_flight.len() as i64);
-    for (fx, fy, fz) in in_flight {
-        (*f).extend_from_slice(&fx.to_be_bytes());
-        (*f).extend_from_slice(&fy.to_be_bytes());
-        (*f).extend_from_slice(&fz.to_be_bytes());
+    for fa in in_flight {
+        (*f).extend_from_slice(&fa.eid.to_be_bytes());
+        (*f).extend_from_slice(&fa.x.to_be_bytes());
+        (*f).extend_from_slice(&fa.y.to_be_bytes());
+        (*f).extend_from_slice(&fa.z.to_be_bytes());
+        (*f).extend_from_slice(&fa.dy.to_be_bytes());
+        (*f).extend_from_slice(&fa.state.to_be_bytes());
+        (*f).extend_from_slice(&fa.time.to_be_bytes());
     }
 
     // RNG1: the world random stream's state. Without it a reload restarts the stream
@@ -5115,16 +5154,40 @@ fn load_world_from(payload: &[u8]) {
 
     // Falling queue, when the save carries one. Absent sections are the normal case for saves
     // written before this existed, so a missing tag leaves the queue empty rather than failing.
-    if p + 4 <= payload.len() && &payload[p..p + 4] == b"FAL1" {
+    if p + 4 <= payload.len() && &payload[p..p + 4] == b"FAL2" {
         p += 4;
         let n = rv(&payload, &mut p);
-        let mut q = falling().lock().unwrap();
+        for _ in 0..n {
+            if p + 44 > payload.len() { break }
+            let eid = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            let x = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
+            let y = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
+            let z = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
+            let dy = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
+            let state = u32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            let time = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            NEXT_EID.fetch_max(eid + 1, Ordering::SeqCst);
+            falling().lock().unwrap().push(Fall { eid, x, y, z, dy, state, time });
+        }
+    } else if p + 4 <= payload.len() && &payload[p..p + 4] == b"FAL1" {
+        // The old cell-moving model kept the block in the world and stored its cell. Convert to
+        // an entity and remove the block, so it does not remain after the entity lands.
+        p += 4;
+        let n = rv(&payload, &mut p);
         for _ in 0..n {
             if p + 12 > payload.len() { break }
             let fx = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
             let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
-            if !q.contains(&(fx, fy, fz)) { q.push((fx, fy, fz)); }
+            let st = block_at(fx, fy, fz);
+            if let Some(c) = world().lock().unwrap().get_mut(&(fx >> 4, fz >> 4)) {
+                c.remove(&local_idx(fx, fy, fz));
+            }
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            falling().lock().unwrap().push(Fall {
+                eid, x: fx as f64 + 0.5, y: fy as f64, z: fz as f64 + 0.5,
+                dy: 0.0, state: st, time: 0,
+            });
         }
     }
 

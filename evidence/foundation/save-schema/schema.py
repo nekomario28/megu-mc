@@ -4,7 +4,9 @@ Read from src/main.rs:
   - the world is a sparse overlay: per chunk (cx,cz), cells keyed by local_idx(x,y,z). A cell whose
     state equals base_state is REMOVED rather than stored, so silence means "the generator's answer".
   - MET4 holds mobs, the offline and live inventories, chests, furnaces and the scoreboard.
-  - ARW2 holds projectiles. FAL1 holds the falling queue (positions).
+  - ARW2 holds projectiles. FAL2 holds falling-block entities (position, velocity, block state,
+    age); the block itself has left the world, so a falling entity does NOT point at a world cell.
+    FAL1 (the old cell list) is still readable and is converted on load.
   - chests, furnaces, signs and hoppers are keyed by WORLD POSITION, not by a cell id. hoppers are
     derived again on load from the block at the position; chests/furnaces/signs are stored.
 
@@ -24,7 +26,7 @@ schema = s.Schema(
         "chest": {"x": "int", "y": "int", "z": "int", "slots": "blob"},
         "furnace": {"x": "int", "y": "int", "z": "int", "input": "blob", "fuel": "blob", "output": "blob"},
         "sign": {"x": "int", "y": "int", "z": "int", "front": "bool", "lines": "text"},
-        "falling": {"x": "int", "y": "int", "z": "int"},
+        "falling": {"eid": "int", "x": "float", "y": "float", "z": "float", "dy": "float", "state": "int", "time": "int"},
         "arrow": {"eid": "int", "owner": "int", "x": "float", "y": "float", "z": "float"},
     },
     primary_keys={
@@ -35,14 +37,14 @@ schema = s.Schema(
         "chest": "x",
         "furnace": "x",
         "sign": "x",
-        "falling": "x",
+        "falling": "eid",
     },
     foreign_keys=[
         # The position-keyed stores point at the cell that owns them.
         ("chest.x", "world_cell.local_idx"),
         ("furnace.x", "world_cell.local_idx"),
         ("sign.x", "world_cell.local_idx"),
-        ("falling.x", "world_cell.local_idx"),
+        # A falling entity's block has left the world, so it has no owning cell to point at.
     ],
     # The world is what everything else hangs off; nothing points back at it.
     roots=["world_cell"],
