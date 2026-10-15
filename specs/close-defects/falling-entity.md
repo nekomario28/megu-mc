@@ -1,0 +1,41 @@
+# F: 落下を vanilla の FallingBlockEntity に合わせる
+
+Status: 未実装。vanilla バイトコードの契約は
+[evidence/gameplay/falling-vanilla/README.md](../../evidence/gameplay/falling-vanilla/README.md) に固定した。
+現行 mc-spine は落下ブロックを「1 tick に 1 セル動かすブロックのキュー」で近似しており、
+vanilla の速度・加速・着地・ドロップ・保存とは一致しない。
+完了の正本は [README](README.md) のF。Qの要求として**同一入力の実行照合**が必須。
+
+## 現状と差分
+
+- 現行 `falling()` は `Vec<(i32,i32,i32)>` のセル列。ブロックは世界に残ったまま 1 tick で 1 セル下へ移動する。
+- vanilla は**エンティティ**で、`dy += -0.04` を毎 tick 加算し、`move` で移動する。
+  `y_n = y0 - 0.02·n(n+1)`、1 セルに約 7 tick、2 セルに約 10 tick。
+- 現行の `FAL1` はセル座標 3×i32。vanilla は位置(double)・速度(double)・BlockState・
+  BlockEntity データ・`DropItem`/`CancelDrop`/`HurtEntities` を保存する。
+
+## スライス（各々が独立に検証可能）
+
+1. **速度モデルと時間**：`FallingBlock` を世界から外し、`{x,y,z,dy,state}` の落下エンティティを
+   キューへ。`GameTick` ごとに `dy -= 0.04; y += dy`。バイトコード由来の式で
+   「n tick 後の y」を固定値テスト。落下ダメージ用の `fallDistance` は後続。
+   検証：式の固定ベクトル、着地までの tick 数。保存形式はまだ変えない（メモリのみ）。
+2. **着地位置とブロック設置**：`move` の衝突と同じ最終 y を求め、そのセルの床へ
+   `blockState.canSurvive` を満たす向きで設置し、`levelEvent(2001,…)` 相当を送る。
+   検証：同一入力で設置セルと最終 y が式と一致。設置不能時の次スライス。
+3. **ドロップと消滅**：`dropItem && !cancelDrop` のときだけ item 化。`disableDrop`/`cancelDrop` の
+   設定経路（構造物からの落下など）を実消費者と共に実装。溶岩・水・`canSurvive` 偽の扱い。
+   検証：設置 vs ドロップの分岐を実ブロックで。
+4. **保存/再読込**：`FAL1` を後方互換で拡張（旧セーブはセル列として読む）か、新セクションで
+   位置/速度/state/NBT を保存。再読込後に同じ入力列が続くことを子プロセスで検査。
+5. **vanilla 実行対照**：`/tmp/idle-compare` の 1.21.1 サーバーを所有ワールドで起動し、
+   同一座標に砂を置いて tick ごとの位置を観測して固定列にする。これが Q の要求する
+   「同一入力の実行照合」で、バイトコードの静的読みはその代用にならない。
+
+## 制約
+
+- 落下の結果（着地位置・ドロップ・保存）を変える変更なので、既存の
+  `water_spread_trace`/落下トレーステストは vanilla 準拠の新しい期待値へ書き換える。
+  旧挙動の equivalence テストを残したまま両立させない。
+- 新しい世界状態・第2の落下表現を並存させない。エンティティ所有者を1つにする。
+- 代表負荷性能と Q の他の項目（光座標・発光源探索）はこのパスの外。
