@@ -292,6 +292,8 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
         "position, velocity, state and age survive: {q:?}");
     assert!(q.iter().any(|f| f.eid == 7002 && (f.x + 2.5).abs() < 1e-9 && f.state == 117),
         "and negative coordinates are easy to mangle: {q:?}");
+    // New entities must not reuse a loaded id.
+    assert!(NEXT_EID.load(Ordering::SeqCst) > 7002, "NEXT_EID must clear the loaded ids");
 
     *world().lock().unwrap() = old_world;
     *falling().lock().unwrap() = old_falling;

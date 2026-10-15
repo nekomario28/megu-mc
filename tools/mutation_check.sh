@@ -196,6 +196,11 @@ check "a block above a removed support is scheduled" \
   '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
   sand_falls_under_vanilla_gravity_until_it_lands
 
+check "a passing entity must not suppress a new block in the same cell" \
+  src/main.rs '    if block_at(px, py, pz) != st { return; }' \
+  '    if falling().lock().unwrap().iter().any(|f| f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64) { return; }' \
+  a_new_block_in_a_passing_entity_cell_still_falls
+
 check "the falling set comes from the asset, not a hand list" \
   src/main.rs '        if reg.behaviour_of(st) != crate::block_registry::B_FALLING { continue }' \
   '        if !matches!(st, 112 | 117 | 118) { continue }' \

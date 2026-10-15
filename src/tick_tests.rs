@@ -1250,6 +1250,36 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     set_test_region(oh, ow);
 }
 
+/// A falling entity has already left its block cell, so a *new* gravity block placed into that
+/// same cell must still fall. Keying the spawn guard on "an entity occupies this cell" suppressed
+/// it and left the block hanging in the air forever.
+#[test]
+fn a_new_block_in_a_passing_entity_cell_still_falls() {
+    let _g = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let base = 150;
+    let (x, z) = (7, 7);
+    for y in base..=base + 4 { set_block(x, y, z, 0); }
+    set_block(x, base, z, name_to_state("stone").unwrap());
+    set_block(x, base + 3, z, sand);
+    assert_eq!(falling().lock().unwrap().len(), 1, "the first block becomes an entity");
+    // The entity is still at y = base+3, so its cell is exactly the cell we now refill.
+    set_block(x, base + 3, z, sand);
+    assert_eq!(falling().lock().unwrap().len(), 2,
+        "a new block in the passing entity's cell must still fall");
+    assert_eq!(block_at(x, base + 3, z), 0, "and must leave the world");
+
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
+
 /// Placing a gravity block in mid-air changes that cell and leaves everything under it untouched,
 /// so a scheduler that only looked at the cell above would leave it hanging forever. Every falling
 /// block name from the asset is walked here, because the registry test alone cannot tell whether a
@@ -1322,6 +1352,13 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     let q = falling().lock().unwrap().clone();
     assert_eq!(q.len(), 1, "a cold chunk must not land or drop the entity");
     assert_eq!(q[0].y, y0, "and must not move it");
+    // Warming the chunk must let it resume, not leave it frozen.
+    let mut warm = ow.clone();
+    warm.extend([(0, 0)]);
+    set_test_region(oh.clone(), warm);
+    falling_tick();
+    let q = falling().lock().unwrap().clone();
+    assert!(q.len() == 1 && q[0].y < y0, "a warmed chunk must resume the fall: {q:?}");
 
     set_test_region(oh, ow);
     *falling().lock().unwrap() = old_falling;

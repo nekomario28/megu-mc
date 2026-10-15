@@ -32,7 +32,7 @@
   エンティティへ変換され、世界のブロックは除去される。
 
 `tools/mutation_check.sh` が対照を赤にする：セル自身/上のセルの検査除去、資産集合→手書き3状態、
-重力を `0.04→0.08`、着地面を1上げる、冷チャンク判定除去、`FAL2` タグ改変。
+重力を `0.04→0.08`、着地面を1上げる、冷チャンク判定除去、`FAL2` タグ改変、通過中エンティティによる新ブロック抑制。
 
 ## 保存形式
 
@@ -48,3 +48,13 @@
   落下ダメージ（`fallDistance`/`hurtEntities`）は未実装。着地できない位置への落下は
   現状そのまま設置する（vanilla は条件により item 化）。
 - エンティティの bounding box は無い（点として扱う）。横方向の速度も無い（vanilla も 0）。
+
+## 独立レビューで残った乖離（記録）
+
+- `fallable = is_air || is_liquid`。vanilla の衝突はブロックの collision shape を使うため、
+  **花・松明・レール等の置換可能ブロックを通過して着地時に置き換える**。現状はそれらを支持として止まる。
+  `BReg::is_replaceable` という近似の predicate は存在するが、collision shape そのものではない。
+- `MIN_Y` を割ったエンティティは item 化せず破棄する（vanilla は条件により drop）。
+- 着地セルは支持探索がそこを通過した場合だけ fallable を確認する。`floor(new_y)` 自体が
+  非fallable の場合は未確認のまま `set_block` する（通常は衝突で先に止まるため狭い）。
+- `canSurvive` 補正、`levelEvent(2001,…)`、`cancelDrop`、落下ダメージは未実装。

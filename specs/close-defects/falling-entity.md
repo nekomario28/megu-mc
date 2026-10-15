@@ -1,18 +1,20 @@
 # F: 落下を vanilla の FallingBlockEntity に合わせる
 
-Status: 実装済み（エンティティモデル）。同一入力のvanilla実行照合だけがQに残る。vanilla バイトコードの契約は
+Status: 実装中。vanilla バイトコードの契約は
 [evidence/gameplay/falling-vanilla/README.md](../../evidence/gameplay/falling-vanilla/README.md) に固定した。
 現行 mc-spine は落下ブロックを「1 tick に 1 セル動かすブロックのキュー」で近似しており、
 vanilla の速度・加速・着地・ドロップ・保存とは一致しない。
 完了の正本は [README](README.md) のF。Qの要求として**同一入力の実行照合**が必須。
 
-## 現状と差分
+## 現状と差分（実装後）
 
-- 現行 `falling()` は `Vec<(i32,i32,i32)>` のセル列。ブロックは世界に残ったまま 1 tick で 1 セル下へ移動する。
-- vanilla は**エンティティ**で、`dy += -0.04` を毎 tick 加算し、`move` で移動する。
-  `y_n = y0 - 0.02·n(n+1)`、1 セルに約 7 tick、2 セルに約 10 tick。
-- 現行の `FAL1` はセル座標 3×i32。vanilla は位置(double)・速度(double)・BlockState・
-  BlockEntity データ・`DropItem`/`CancelDrop`/`HurtEntities` を保存する。
+- **実装済み**: `falling()` は `Vec<Fall>`。支持を失ったブロックは世界から外れてエンティティになり、
+  `dy -= 0.04` を毎 tick 加算して `y_n = y0 - 0.02·n(n+1)` で落ちる。着地は支持ブロックの上面。
+  `FAL2` が位置/速度/state/age を保存し、旧 `FAL1` は変換して読む。冷チャンクのエンティティは待つ。
+- **残り**: `dropItem && !cancelDrop` の item 化（slice 3）、`canSurvive` 偽の代替、
+  `levelEvent(2001,…)`、`BlockEntity`/`setHurtsEntities`（信頼性19種は対象外なので N/A としてよい）、
+  溶岩/水、置換可能ブロックの通過（現状は `fallable = air|liquid` なので花などの上で止まる）、
+  同一入力のvanilla実行照合。
 
 ## スライス（各々が独立に検証可能）
 

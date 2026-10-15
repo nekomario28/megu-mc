@@ -4097,11 +4097,10 @@ fn note_falling(x: i32, y: i32, z: i32) {
 /// the block reaches `note_falling` again, so a whole unsupported column converts in one
 /// pass instead of one cell per tick.
 fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
-    if falling().lock().unwrap().iter().any(|f| {
-        f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64
-    }) {
-        return;
-    }
+    // The block must still be there. Keying this on "an entity occupies the cell" was wrong: a
+    // falling entity has already left its block cell, so a *new* gravity block placed into that
+    // cell matched the passing entity, was never spawned, and hung in the air forever.
+    if block_at(px, py, pz) != st { return; }
     set_block(px, py, pz, 0);
     note_block_update(px, py, pz, 0);
     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -4145,9 +4144,13 @@ fn falling_tick() {
             }
         }
     }
-    // Restore the survivors before the landing writes: set_block reaches note_falling, which
-    // appends to this same list, and overwriting it after the writes would drop those entities.
-    *falling().lock().unwrap() = keep;
+    // Put the survivors back by appending, not assigning. A connection thread can reach
+    // note_falling while the physics runs and push a new entity; assigning would overwrite those
+    // pushes after their block had already been removed from the world, losing them silently.
+    {
+        let mut f = falling().lock().unwrap();
+        f.extend(keep);
+    }
     for (bx, top, bz, st) in landings {
         set_block(bx, top, bz, st);
         note_block_update(bx, top, bz, st);
