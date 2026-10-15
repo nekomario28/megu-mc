@@ -76,7 +76,9 @@
 
 - **mc-spine**: `MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS=1` で `/setblock` をチャット経由で実行。
   `(x,z)=(0,0)`、床 stone@150、砂@153 → 最終列 `150=stone, 151=sand`（床の1つ上に着地）。
-- **vanilla**: コンソール経由の `/setblock`+`/execute if block` を試したが、
-  「Test passed」が砂の元位置で返り、チャンクの tick とコマンド実行の確認が取れず**未確定**。
-  クライアントチャット経由も vanilla 1.21.1 の署名付きチャット形式に合わず未確定。
-  **同一入力の vanilla 実行照合は未完了**で、Q の残件として明示する。
+- **vanilla**: コンソール（FIFO stdin）経由で同じ入力列。**空サーバは tick しない**ため
+  （`pause-when-empty-seconds` 既定やチャンク tick にプレイヤーが必要）、CLI クライアントを
+  スポーンに接続してから実行した。`/setblock 0 150 0 stone`、`/setblock 0 153 0 sand`、10秒後：
+  **150=stone, 151=sand**、149/152/153 は空、falling_block エンティティ無し。
+- **mc-spine の結果と一致**：同じ入力で砂は床の1つ上（y=151）に着地する。
+  `tools/falling_oracle.py` の mc-spine 出力は `final_column {150:stone, 151:sand}`。

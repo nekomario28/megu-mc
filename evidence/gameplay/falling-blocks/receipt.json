@@ -47,10 +47,17 @@
     "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
   },
   "limits": [
-    "No same-input vanilla runtime comparison yet: the physics is derived from bytecode, not observed from a running vanilla server (Q).",
     "note_falling skips py <= MIN_Y, so a gravity block at the world floor is not converted.",
     "A legacy FAL1 cell with no overlay entry would materialise the terrain base_state (records carry no state).",
     "canSurvive correction, levelEvent(2001) and cancelDrop are not implemented; the 19 falling states are neither EntityBlock nor hurting blocks, so BlockEntity/setHurtsEntities/causeFallDamage are N/A.",
     "The entity is a point: no bounding box."
-  ]
+  ],
+  "oracle": {
+    "tool": "tools/falling_oracle.py",
+    "input": "stone floor at y=150, sand placed at y=153, chunk kept ticking by a connected CLI client",
+    "vanilla": "sand lands at y=151 (only 150 and 151 non-air, no falling_block entity left)",
+    "mc_spine": "sand lands at y=151 (final_column {150: stone, 151: sand})",
+    "result": "same landing cell on both servers for the same input",
+    "note": "The oracle observes the landing cell; the tick-by-tick position is pinned by the unit test against the bytecode formula."
+  }
 }
