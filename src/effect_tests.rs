@@ -20,7 +20,7 @@ pub(super) fn client_pair() -> (Client, TcpStream) {
         last_melee: Mutex::new(past), fall_fly: Mutex::new(false), hurt_at: Mutex::new(past),
         shield_cd: Mutex::new(past), absorb: Mutex::new(0.0), pearl_cd: Mutex::new(past),
         xp: Mutex::new(0), skin: Mutex::new(None), seen: Mutex::new(HashSet::new()),
-        chunks: Mutex::new(HashSet::new()), gm: Mutex::new(0), fall_from: Mutex::new(70.0),
+        chunks: Mutex::new(HashSet::new()), gen_sources: Mutex::new(HashMap::new()), gm: Mutex::new(0), fall_from: Mutex::new(70.0),
         food: Mutex::new(20), air: Mutex::new(60), armor_pts: Mutex::new(0), sat: Mutex::new(5.0),
         walk_acc: Mutex::new(0.0), lastp: Mutex::new((0.0, 70.0, 0.0)),
         spawn_pt: Mutex::new(None), held: Mutex::new(0), effs: Mutex::new(Vec::new()),

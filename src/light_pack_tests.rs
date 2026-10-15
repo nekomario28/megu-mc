@@ -69,9 +69,9 @@ fn light_sections_start_one_below_the_world() {
 #[test]
 fn block_light_uses_generated_sources() {
     let _g = world_guard();
-    gen_sources().lock().unwrap().insert((0, 0), vec![((5, 70, 7), 15)]);
-    let secs = block_light_sections(0, 0);
-    gen_sources().lock().unwrap().remove(&(0, 0));
+    let mut gen = GenSources::new();
+    gen.insert((0, 0), vec![((5, 70, 7), 15)]);
+    let secs = block_light_sections(0, 0, &gen);
     let nib = |y: i32, lx: usize, lz: usize| -> u8 {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
@@ -80,4 +80,66 @@ fn block_light_uses_generated_sources() {
     };
     assert_eq!(nib(70, 5, 7), 15, "a generated emitter must light");
     assert_eq!(nib(70, 6, 7), 14, "and spread by one");
+}
+
+/// A generated emitter in the next chunk must light this one across the border: the light pass
+/// may not assume every source is inside the chunk being lit.
+#[test]
+fn block_light_sees_a_neighbours_generated_source() {
+    let _g = world_guard();
+    let mut gen = GenSources::new();
+    gen.insert((1, 0), vec![((20, 70, 7), 15)]); // next chunk, five blocks past the border
+    let secs = block_light_sections(0, 0, &gen);
+    let nib = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
+        let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nib(70, 15, 7), 10, "a neighbour's emitter lights this chunk's edge");
+    assert_eq!(nib(70, 14, 7), 9, "and falls off with distance");
+}
+
+/// A newly generated chunk names an already-generated neighbour for a light update, and a chunk
+/// with no emitters names none; a neighbour not generated yet is left to its own call.
+#[test]
+fn a_source_marks_an_already_generated_neighbour_for_a_light_update() {
+    let mut gen = GenSources::new();
+    gen.insert((0, 0), vec![((15, 70, 7), 15)]);
+    gen.insert((1, 0), vec![]);
+    let dirty = light_dirty_for(&gen, 0, 0);
+    assert!(dirty.contains(&(1, 0)), "an emitter at the border reaches the next chunk");
+    assert!(!dirty.contains(&(0, 1)), "a neighbour not generated yet is not updated now");
+    assert!(light_dirty_for(&gen, 1, 0).is_empty(), "a chunk with no emitters changes no light");
+}
+
+/// A light update carries only block light: no sky mask, no sky arrays, and every zero block
+/// section goes in the empty mask. The client leaves sky unchanged for an unmasked section, so
+/// omitting it is what keeps the update small without dimming the world.
+#[test]
+fn update_light_packet_sends_block_light_only() {
+    let _g = world_guard();
+    let mut gen = GenSources::new();
+    gen.insert((0, 0), vec![((5, 70, 7), 15)]);
+    let bytes = update_light_packet(0, 0, &gen);
+    let mut r = &bytes[..];
+    assert_eq!(read_varint(&mut r), Some(0), "chunk x");
+    assert_eq!(read_varint(&mut r), Some(0), "chunk z");
+    assert_eq!(read_varint(&mut r), Some(0), "no sky mask");
+    assert_eq!(read_varint(&mut r), Some(1), "block mask is one long");
+    let block_mask = u64::from_be_bytes(r[..8].try_into().unwrap()); r = &r[8..];
+    assert_ne!(block_mask, 0, "the chunk has lit sections");
+    assert_eq!(read_varint(&mut r), Some(0), "no empty sky mask");
+    assert_eq!(read_varint(&mut r), Some(1), "empty block mask is one long");
+    let empty_mask = u64::from_be_bytes(r[..8].try_into().unwrap()); r = &r[8..];
+    assert_eq!(block_mask & empty_mask, 0, "a section is lit or empty, never both");
+    assert_eq!(block_mask | empty_mask, (1 << 26) - 1, "all 26 sections are accounted for");
+    assert_eq!(read_varint(&mut r), Some(0), "no sky arrays");
+    let count = read_varint(&mut r).unwrap() as usize;
+    assert_eq!(count, block_mask.count_ones() as usize, "one array per lit section");
+    for _ in 0..count {
+        assert_eq!(read_varint(&mut r), Some(2048));
+        r = &r[2048..];
+    }
+    assert!(r.is_empty(), "packet fully consumed");
 }

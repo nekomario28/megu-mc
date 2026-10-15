@@ -996,8 +996,9 @@ fn measure_the_light_cost_per_chunk() {
     let sky = time_it(&mut || {
         for _ in 0..rounds { std::hint::black_box(sky_light_sections(0, 0)); }
     });
+    let gen = GenSources::new();
     let none = time_it(&mut || {
-        for _ in 0..rounds { std::hint::black_box(block_light_sections(0, 0)); }
+        for _ in 0..rounds { std::hint::black_box(block_light_sections(0, 0, &gen)); }
     });
 
     // With a torch placed, the block light spread has something to do.
@@ -1005,7 +1006,7 @@ fn measure_the_light_cost_per_chunk() {
     let old = block_at(tx, ty, tz);
     set_block(tx, ty, tz, name_to_state("torch").expect("torch must exist"));
     let lit = time_it(&mut || {
-        for _ in 0..rounds { std::hint::black_box(block_light_sections(0, 0)); }
+        for _ in 0..rounds { std::hint::black_box(block_light_sections(0, 0, &gen)); }
     });
     set_block(tx, ty, tz, old);
 
@@ -1107,15 +1108,16 @@ fn measure_the_light_cost_per_chunk() {
     });
     // The same rig for block light, which is where the earlier numbers came from and where
     // none of them were trustworthy. Reading the bytes is what makes this one comparable.
+    let gen = GenSources::new();
     let block_read = time_it(&mut || {
         for _ in 0..rounds {
-            std::hint::black_box(checksum(&block_light_sections(0, 0)));
+            std::hint::black_box(checksum(&block_light_sections(0, 0, &gen)));
         }
     });
     set_block(tx, ty, tz, name_to_state("torch").expect("torch must exist"));
     let block_read_lit = time_it(&mut || {
         for _ in 0..rounds {
-            std::hint::black_box(checksum(&block_light_sections(0, 0)));
+            std::hint::black_box(checksum(&block_light_sections(0, 0, &gen)));
         }
     });
     set_block(tx, ty, tz, old);

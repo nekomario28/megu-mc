@@ -218,6 +218,7 @@ class Client:
         self.socket = socket.create_connection(("127.0.0.1", game), timeout=10)
         self.game, self.name = game, name
         self.chunks, self.messages, self.updates = {}, [], []
+        self.light_updates = []
         self.pos, self.contract_started = None, False
         self.phase, self.registry_counts = "login", {}
 
@@ -271,6 +272,24 @@ class Client:
                            sz * 16 + ((record >> 4) & 15))
                 self._block_update(x, y, z, record >> 12)
             assert reader.pos == len(body)
+        elif pid == 0x2a:
+            reader = Reader(body)
+            cx = signed(reader.varint(), 32)
+            cz = signed(reader.varint(), 32)
+            masks = []
+            for _ in range(4):
+                length = reader.varint()
+                assert length <= 1, "light-update mask outside 26 sections"
+                masks.append(reader.number(">Q") if length else 0)
+            assert not masks[0] & masks[2] and not masks[1] & masks[3], "overlapping light-update masks"
+            for mask in masks[:2]:
+                length = reader.varint()
+                require(length == mask.bit_count(), "light-update-mask-count")
+                for _ in range(length):
+                    assert reader.varint() == 2048, "light-update array nibble count"
+                    reader.take(2048)
+            assert reader.pos == len(body), "unparsed light update packet"
+            self.light_updates.append((cx, cz))
         elif pid == 0x40:
             reader = Reader(body)
             coords = [reader.number(">d") for _ in range(3)]

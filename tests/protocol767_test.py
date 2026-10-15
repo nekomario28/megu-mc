@@ -67,6 +67,25 @@ class DecoderTests(unittest.TestCase):
             self.assertEqual(client.read(1)[0], 0x49)
             self.assertEqual(client.updates, [((-19, -14, 55), 123)])
             self.assertEqual(client.block(-19, -14, 55), 123)
+    def test_light_update_known_answer_and_bad_mask_count(self):
+        a, b = socket.socketpair()
+        with a, b:
+            client = Client.__new__(Client)
+            client.socket, client.phase = a, "play"
+            client.light_updates = []
+            mask = b"\1" + struct.pack(">Q", (1 << 26) - 1)
+            zero = b"\0"
+            arrays = vint(26) + (vint(2048) + bytes(2048)) * 26
+            # sky mask 0, block mask all-26, empty sky 0, empty block 0, no sky arrays, block arrays
+            body = vint(9) + vint((-4) & 0xffffffff) + zero + mask + zero + zero + zero + arrays
+            b.sendall(frame(0x2a, body))
+            self.assertEqual(client.read(1)[0], 0x2a)
+            self.assertEqual(client.light_updates, [(9, -4)])
+            # The block mask has 26 bits set, so a count of 25 must be rejected.
+            bad = vint(0) + vint(0) + zero + mask + zero + zero + zero + vint(25) + (vint(2048) + bytes(2048)) * 25
+            b.sendall(frame(0x2a, bad))
+            with self.assertRaises(AssertionError):
+                client.read(1)
 
 
 if __name__ == "__main__":

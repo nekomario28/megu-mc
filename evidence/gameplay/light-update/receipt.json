@@ -1,0 +1,69 @@
+{
+  "checkpoint": "Q: generated emitters light across a chunk border, order-independently",
+  "goal": "A generated light source (lava, glowstone) in one chunk must light a neighbour, and a chunk streamed before its neighbour must be corrected when that neighbour is generated, without depending on send order.",
+  "changes": {
+    "owner": "GenSources lives in the connection's chunk window (Client.gen_sources), one entry per held chunk, removed on unload",
+    "merge": "block_light_sections reads the chunk and its eight neighbours' recorded generated emitters",
+    "record": "chunk_data records emitters that come from generated terrain (not the overlay) so a broken torch is not cached",
+    "update": "a new chunk marks an already-generated neighbour dirty when a source lies in the neighbour's search area; stream_chunks sends ClientboundLightUpdatePacket (0x2a) for held dirty chunks",
+    "packet": "sky omitted (it does not depend on emitters and the client leaves an unmasked section unchanged); zero block sections go in the empty mask with no array"
+  },
+  "contract": {
+    "packet_id": "0x2a",
+    "source": "evidence/gameplay/light-update/ClientboundLightUpdatePacket.javap.txt",
+    "data": "evidence/gameplay/light-update/ClientboundLightUpdatePacketData.javap.txt",
+    "client_apply": "evidence/gameplay/light-update/ClientPacketListener-applyLightData.javap.txt",
+    "mappings": "evidence/gameplay/light-update/mappings.txt",
+    "section_basis": "adk builds section getMinLightSection()+i, matching LIGHT_MIN_Y/16+i",
+    "unmasked_unchanged": "ClientPacketListener.applyLightData only writes a section when its mask or empty mask bit is set"
+  },
+  "tests": [
+    "light_pack_tests::block_light_sees_a_neighbours_generated_source",
+    "light_pack_tests::a_source_marks_an_already_generated_neighbour_for_a_light_update",
+    "light_pack_tests::block_light_uses_generated_sources",
+    "protocol767_test::test_light_update_known_answer_and_bad_mask_count"
+  ],
+  "mutations": "tools/mutation_check.sh: neighbour lookup -> self only (neighbour test red); generated source ignored (self test red)",
+  "runtime": {
+    "tool": "tools/light_update_probe.py (release binary)",
+    "datapack_view_2_move_one_chunk": "29 update-light packets, chunks (-2,-2)..(3,1); client decoded them",
+    "flat_wg_old": "0 update-light packets (no generated emitters)",
+    "probe_output_sha256": "3e3218fa3e5ea162be803fe510adf295fb25db4ccad8fff6e8a3ad3931874f65"
+  },
+  "source_hashes": {
+    "src/main.rs": "49b4c29de8937bdf4d2af479b248b1fe79493ce8112aeb8fccab22973a42e921",
+    "src/light_pack_tests.rs": "64917fef7ed704b28e271eac47cafeec529f4490b68040eca92c5cad0e074482",
+    "src/tick_tests.rs": "09234f96a266cb1ce94fbc9adfca53c90bf9c07df59bae2c7883df1c13de7952",
+    "src/effect_tests.rs": "9da53fca7f5ba0a641e8700172a65803df3db6572758a2aff09b6cc7df183353",
+    "tests/protocol767.py": "8567e015644c0be3fdbc52687c55a48070b08349d676a3cb53e5083863cfe3da",
+    "tests/protocol767_test.py": "aa32f244d8ad89880f6e1972a1e54c8a26a05c29a639b80262bd723d3f386ce1",
+    "tools/mutation_check.sh": "ecdc26dd08d7af54f3c37f7eaf2fa66305d6911d5314bca22e2b6b3537076b6d",
+    "tools/light_update_probe.py": "1057744c09a14b67f504067410b41b3fad6acf0a2b48f9bd572ee8c14f3c429a",
+    "evidence/gameplay/light-update/README.md": "11133af1c084db4651f19238f34e0c6cdb1ec717afded02b1d8a2510e53319a6",
+    "evidence/gameplay/light-update/ClientboundLightUpdatePacket.javap.txt": "23f5f310df96dc1d1edb2763d30d85c7537955c8a8d4671eba779ba1c00279aa",
+    "evidence/gameplay/light-update/ClientboundLightUpdatePacketData.javap.txt": "ddbd7312bbd62e2c3ef8cf02bbdb7e83bce5dc9deaa57c411ae2da9bed71877c",
+    "evidence/gameplay/light-update/ClientPacketListener-applyLightData.javap.txt": "9acab4eeafd89edbb7ea67d9134457861d0c04d8def17076fe10b011981f2d28",
+    "evidence/gameplay/light-update/mappings.txt": "52277a2edf6f08f02386d9739c8624d6aa7364119ba325d08ca65132467a74d9"
+  },
+  "limits": [
+    "The client probe is the repository's CLI decoder, not the vanilla client renderer; on-screen light parity remains for the excluded GUI path.",
+    "light_dirty_for over-approximates reach by x/z search area, so it may send an unnecessary update but never omits a needed one.",
+    "The packet carries full recomputed block light for the chunk, not vanilla's minimal changed-section set."
+  ],
+  "nonclaims": [
+    "vanilla on-screen light parity",
+    "representative release performance of the update path",
+    "all Q complete"
+  ],
+  "verify": {
+    "command": "bash tests/verify.sh",
+    "result": "PASS",
+    "rust": "130 passed / 1 pre-existing ignored (serial)",
+    "mutants_proved": 35,
+    "not_a_gate": 0,
+    "parked": 0,
+    "skipped": 0,
+    "layer_gate": "16 modules, 40 edges, 0 named errors",
+    "log_sha256": "fd3fe0160bc7a62ad8f601a699ed2c691a61660394979d58908c119ca71b8c89"
+  }
+}

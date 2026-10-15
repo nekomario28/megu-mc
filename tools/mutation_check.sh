@@ -197,9 +197,14 @@ check "a block above a removed support is scheduled" \
   sand_falls_under_vanilla_gravity_until_it_lands
 
 check "block light uses generated sources, not only the overlay" \
-  src/main.rs '        sources.extend(gen.iter().copied());' \
-  '        let _ = gen;' \
+  src/main.rs 'sources.extend(g.iter().copied());' \
+  'let _ = g;' \
   block_light_uses_generated_sources
+
+check "block light sees a neighbour's generated source" \
+  src/main.rs 'gen.get(&(cx + dx, cz + dz))' \
+  'gen.get(&(cx, cz))' \
+  block_light_sees_a_neighbours_generated_source
 
 check "light sections start one below the world" \
   src/main.rs 'const LIGHT_MIN_Y: i32 = MIN_Y - 16;' \
@@ -352,9 +357,14 @@ check "chat returns the actual sender and message" \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
 check "light arrays agree with their section masks" \
-  src/main.rs '    write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask' \
-  '    write_varint(&mut p, 1); p.extend_from_slice(&0x3fffffei64.to_be_bytes()); // skyLightMask' \
+  src/main.rs 'write_varint(p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask' \
+  'write_varint(p, 1); p.extend_from_slice(&0x3fffffei64.to_be_bytes()); // skyLightMask' \
   tests/gameplay_wire.py 'gameplay wire: FAIL light-mask-count'
+
+check "an update packet sends block light only" \
+  src/main.rs '    write_varint(&mut p, 0); // skyLightMask: sky is unchanged' \
+  '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
+  update_light_packet_sends_block_light_only
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

@@ -61,15 +61,17 @@ index i を `-4+i` ではなく `-5+i` として読むため、全配列が1つ�
 
 残りは**生成地形の全発光源の網羅**（現状は overlay の編集と溶岩のみを探索する）で、これは Q に残る。
 
-## 生成地形の光源（実装済み＋残る境界）
+## 生成地形の光源（実装済み、境界も対応）
 
 `chunk_data` は各チャンクの全ブロック状態を計算するので、その非fast-path分岐で
-`luminance_of(st) > 0` を `GEN_SOURCES[(cx,cz)]` に記録する。`block_light_sections` は
-**そのチャンク自身**の生成光源を overlay/溶岩の光源へマージする。これで生成された溶岩湖や
-glowstone が（そのチャンク内で）光る。`block_light_uses_generated_sources` と変異で固定。
+生成地形由来の `luminance_of(st) > 0` を接続のチャンク窓（`Client.gen_sources`）へ記録する。
+overlay の編集光源は記録せず、`block_light_sections` の overlay 走査に任せる（壊した松明を
+再点灯しない）。`block_light_sections` は**自チャンクと隣接8チャンク**の記録をまとめて
+overlay/溶岩の光源へマージする。これで生成された溶岩湖や glowstone が（境界をまたいでも）
+光る。
 
-**残る境界**：隣接チャンクの生成光源は、そのチャンクがまだ生成・キャッシュされていないと
-使えない。チャンク送信順に依存するのを避けるため、現状は自チャンク分だけを使う
-（決定論的だが、境界をまたぐ生成光源は隣チャンクの光に寄与しない）。
-順序非依存にするには近傍の生成地形を走査する（48×48×384 ≈ 88万 state/chunk、高コスト）か、
-近傍が揃うまで光を送らない設計が要る。このトレードオフが次のスライス。
+境界の順序依存は、vanilla と同じ **Update Light パケット（0x2a）** で解消した。
+あるチャンクの生成光源が既存の隣の探索範囲に入るとき、その隣の光を再計算して送る。
+クライアントの `applyLightData` が「どちらの mask にも無い section は不変」と扱うことを
+bytecode で確認し、sky を送らず空 block section を empty mask に置く。詳細と証拠は
+[境界生成光源](../../../evidence/gameplay/light-update/README.md)。

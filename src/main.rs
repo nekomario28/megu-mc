@@ -186,6 +186,7 @@ struct Client {
     skin: Mutex<Option<(String, String)>>, // textures (value, signature) resolved from Mojang
     seen: Mutex<HashSet<i32>>, // entity ids currently spawned for this client
     chunks: Mutex<HashSet<(i32, i32)>>, // chunks the client currently holds
+    gen_sources: Mutex<GenSources>, // generated light emitters per held chunk, for the light pass
     gm: Mutex<u8>,          // 0=survival 1=creative 3=spectator
     fall_from: Mutex<f64>,
     food: Mutex<i32>,
@@ -8551,15 +8552,15 @@ fn within_search(cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
     x >= cx * 16 - 15 && x <= cx * 16 + 30 && z >= cz * 16 - 15 && z <= cz * 16 + 30 && y >= MIN_Y && y < MIN_Y + 384
 }
 
-/// Light-emitting blocks the **generator** placed in each chunk, recorded by `chunk_data` as it
+/// Light-emitting blocks the **generator** placed in a chunk, recorded by `chunk_data` as it
 /// computes every state. They are not in the overlay, so the block-light spread cannot find them
-/// by scanning edits; without this a generated lava lake or sea lantern emits no light. Only the
-/// chunk being lit is used (a neighbour's cache may not exist yet), so a generated emitter just
-/// across a chunk border is not seen until that chunk is itself streamed.
-static GEN_SOURCES: OnceLock<Mutex<HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>>> = OnceLock::new();
-fn gen_sources() -> &'static Mutex<HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>> {
-    GEN_SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// by scanning edits; without this a generated lava lake or sea lantern emits no light.
+///
+/// Owned by the connection's chunk window: the light pass only ever needs the sources of a chunk
+/// and its eight neighbours, all of which that client holds, so this is one entry per held chunk
+/// and is dropped when a chunk unloads. That keeps it bounded and, together with the light
+/// update sent when a later neighbour is generated, order-independent.
+pub(crate) type GenSources = HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>;
 
 /// The first light section, from vanilla `LevelLightEngine.getMinLightSection()`:
 /// `getMinSection() - 1`, one section below the world's lowest block section. The light packet
@@ -8644,10 +8645,14 @@ fn block_light_sections_from(
     for sec in 0..26 {
         let sy = sec * 16 + LIGHT_MIN_Y;
         out.push(pack_light_section(sy, |lx, wy, lz| {
-            if wy < y0 || wy > y1 {
+            let (wx, wz) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+            // The box only covers the sources' fifteen-block reach, so a chunk column the box
+            // does not span (all sources on the far side) is dark; without this the index
+            // arithmetic underflows on the columns outside the box.
+            if wx < x0 || wx > x1 || wz < z0 || wz > z1 || wy < y0 || wy > y1 {
                 return 0;
             }
-            light[idx(cx * 16 + lx as i32, wy, cz * 16 + lz as i32)]
+            light[idx(wx, wy, wz)]
         }));
     }
     out
@@ -8657,7 +8662,7 @@ fn block_light_sections_from(
 /// server already tracks. Generated glowstone and similar are not found, because the only
 /// list of what the world contains is the overlay of edits; that limit is recorded rather
 /// than papered over by scanning every block.
-fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
+fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     let Some(reg) = crate::block_registry::breg() else {
         return vec![[0u8; 2048]; 26];
     };
@@ -8670,9 +8675,15 @@ fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     // made this the expensive half of the light work.
     let w = world().lock().unwrap();
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
-    // Generated light sources for this chunk (recorded by `chunk_data`).
-    if let Some(gen) = gen_sources().lock().unwrap().get(&(cx, cz)) {
-        sources.extend(gen.iter().copied());
+    // Generated light sources for this chunk and the eight neighbours (recorded by `chunk_data`
+    // as each was streamed). `block_light_sections_from` clips them to the search area, so an
+    // emitter across a border lights this chunk exactly as if it were inside it.
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if let Some(g) = gen.get(&(cx + dx, cz + dz)) {
+                sources.extend(g.iter().copied());
+            }
+        }
     }
     for dx in -1..=1 {
         for dz in -1..=1 {
@@ -8939,7 +8950,7 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
     out
 }
 
-fn chunk_data(cx: i32, cz: i32) -> Vec<u8> {
+fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
 
     let mut data = Vec::new();
     let reg = crate::block_registry::breg();
@@ -8978,16 +8989,18 @@ fn chunk_data(cx: i32, cz: i32) -> Vec<u8> {
                     for lz in 0..16 {
                         for lx in 0..16 {
                             let wx = cx * 16 + lx as i32; let wz = cz * 16 + lz as i32; let wy = sy + ly as i32;
-                            let st = if overlay_empty {
-                                base_state(wx, wy, wz)
-                            } else {
-                                read(wx, wy, wz)
+                            let ov = if overlay_empty { None } else {
+                                w.get(&(wx >> 4, wz >> 4)).and_then(|c| c.get(&local_idx(wx, wy, wz))).copied()
                             };
-                            // The true state is here already, so record generated emitters for the
-                            // block-light pass without a second read.
-                            if let Some(reg) = reg {
-                                let lum = reg.luminance_of(st);
-                                if lum > 0 { gen_sources_here.push(((wx, wy, wz), lum)); }
+                            let st = ov.unwrap_or_else(|| base_state(wx, wy, wz));
+                            // Record emitters that come from generated terrain, not from the
+                            // overlay: player-placed and edited emitters are found live by the
+                            // overlay scan, and caching them here would re-light a broken torch.
+                            if ov.is_none() {
+                                if let Some(reg) = reg {
+                                    let lum = reg.luminance_of(st);
+                                    if lum > 0 { gen_sources_here.push(((wx, wy, wz), lum)); }
+                                }
                             }
                             // anti-xray + palette compression: buried hidden blocks sent as stone
                             let vis = if is_hidden(st) && ![(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter()
@@ -9002,13 +9015,7 @@ fn chunk_data(cx: i32, cz: i32) -> Vec<u8> {
             data.extend_from_slice(&section_encode(&arr, &biomes));
         }
     }
-    {
-        let mut gen = gen_sources().lock().unwrap();
-        if gen.len() > 2048 {
-            gen.clear();
-        }
-        gen.insert((cx, cz), gen_sources_here);
-    }
+    gen.insert((cx, cz), gen_sources_here);
     data
 }
 
@@ -9037,7 +9044,7 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     v
 }
 
-fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
+fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
@@ -9046,7 +9053,7 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
         tops[lz * 16 + lx] = surface_y(cx * 16 + lx as i32, cz * 16 + lz as i32) as i32;
     }}
     p.extend_from_slice(&heightmaps_nbt(&tops));
-    let data = chunk_data(cx, cz);
+    let data = chunk_data(cx, cz, gen);
     write_varint(&mut p, data.len() as i64);
     p.extend_from_slice(&data);
     // block entities ride inside the chunk packet in vanilla — signs
@@ -9073,23 +9080,78 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
         write_varint(&mut p, ty);
         p.extend_from_slice(&n);
     }
-    write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask
-    // Block light is sent for every section rather than masked per section: the mask would
-    // save 53 KB on a chunk with no light source and cost a pass to compute, and the simpler
-    // form is the one that can be shown correct.
-    write_varint(&mut p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // blockLightMask
-    write_varint(&mut p, 0); // emptySky
-    write_varint(&mut p, 0); // emptyBlock
+    write_light_arrays(&mut p, cx, cz, gen);
+    p
+}
+
+/// The light half of a chunk packet, shared with `update_light_packet`: four section masks, then
+/// sky and block light as two counted lists of 2048-byte arrays. Both light kinds are sent for
+/// every section rather than masked per section - the mask would save 53 KB on a chunk with no
+/// light source and cost a pass to compute, and the simpler form is the one that can be shown
+/// correct.
+fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, gen: &GenSources) {
+    write_varint(p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask
+    write_varint(p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // blockLightMask
+    write_varint(p, 0); // emptySky
+    write_varint(p, 0); // emptyBlock
     // The arrays follow as two counted lists, each entry prefixed by its length.
     // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
     // then the block light a torch contributes. Two counted lists, sky first.
     let sky = sky_light_sections_world(cx, cz);
-    write_varint(&mut p, sky.len() as i64);
-    for sec in sky { write_varint(&mut p, 2048); p.extend_from_slice(&sec); }
-    let block = block_light_sections(cx, cz);
-    write_varint(&mut p, block.len() as i64);
-    for sec in block { write_varint(&mut p, 2048); p.extend_from_slice(&sec); }
+    write_varint(p, sky.len() as i64);
+    for sec in sky { write_varint(p, 2048); p.extend_from_slice(&sec); }
+    let block = block_light_sections(cx, cz, gen);
+    write_varint(p, block.len() as i64);
+    for sec in block { write_varint(p, 2048); p.extend_from_slice(&sec); }
+}
+
+/// A client already holding a chunk receives this when a later neighbour is generated: the held
+/// chunk's block data is unchanged, only its light is recomputed with the new emitters. Vanilla's
+/// `ClientboundLightUpdatePacket` (protocol 767 id 0x2a) carries light after a varint chunk
+/// position. Sky light is omitted: it depends on the chunk's own terrain, not on a neighbour's
+/// emitters, and the client leaves a section out of both masks unchanged (verified against
+/// `ClientPacketListener.applyLightData`). Sections whose block light is zero go in the empty
+/// mask with no array, which is vanilla's own encoding for them.
+fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, cx as i64);
+    write_varint(&mut p, cz as i64);
+    let block = block_light_sections(cx, cz, gen);
+    let (mut mask, mut empty) = (0u64, 0u64);
+    for (i, sec) in block.iter().enumerate() {
+        if sec.iter().all(|b| *b == 0) { empty |= 1 << i; } else { mask |= 1 << i; }
+    }
+    write_varint(&mut p, 0); // skyLightMask: sky is unchanged
+    write_varint(&mut p, 1); p.extend_from_slice(&mask.to_be_bytes());
+    write_varint(&mut p, 0); // emptySkyLightMask
+    write_varint(&mut p, 1); p.extend_from_slice(&empty.to_be_bytes());
+    write_varint(&mut p, 0); // no sky updates
+    let lit: Vec<&[u8; 2048]> = block.iter().filter(|s| s.iter().any(|b| *b != 0)).collect();
+    write_varint(&mut p, lit.len() as i64);
+    for sec in lit { write_varint(&mut p, 2048); p.extend_from_slice(sec); }
     p
+}
+
+/// Chunks already generated whose light the chunk at `(cx, cz)` can change. A neighbour is
+/// affected exactly when one of this chunk's emitters lies inside the neighbour's light search
+/// area; the light the client already holds for it predates these sources, so it is recomputed
+/// and re-sent. Neighbours generated later name this chunk in their own call, so every ordered
+/// pair is covered once.
+fn light_dirty_for(gen: &GenSources, cx: i32, cz: i32) -> Vec<(i32, i32)> {
+    let Some(sources) = gen.get(&(cx, cz)) else { return Vec::new() };
+    if sources.is_empty() { return Vec::new() }
+    let mut out = Vec::new();
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if dx == 0 && dz == 0 { continue }
+            let (nx, nz) = (cx + dx, cz + dz);
+            if !gen.contains_key(&(nx, nz)) { continue }
+            if sources.iter().any(|(p, _)| within_search(nx, nz, p.0, p.1, p.2)) {
+                out.push((nx, nz));
+            }
+        }
+    }
+    out
 }
 
 const SERVER_VIEW_DISTANCE: i32 = 8;
@@ -9113,7 +9175,7 @@ fn client_info_view_distance(body: &[u8]) -> Option<i32> {
     Some(view)
 }
 
-fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i32)>, ccx: i32, ccz: i32, view: i32) {
+fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i32)>, gen: &mut GenSources, ccx: i32, ccz: i32, view: i32) {
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
     // client holds" (updates must only target holders).
@@ -9125,6 +9187,7 @@ fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i
         p.extend_from_slice(&c.0.to_be_bytes());
         if send_packet(s, 0x21, p).is_err() { return }
         sent.remove(&c);
+        gen.remove(&c);
     }
     let mut vp = Vec::new(); write_varint(&mut vp, ccx as i64); write_varint(&mut vp, ccz as i64);
     let _ = send_packet(s, 0x54, vp);
@@ -9135,14 +9198,23 @@ fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i
     }}
     if news.is_empty() { return }
     let _ = send_packet(s, 0x0d, vec![]);
+    let mut dirty: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     for (cx, cz) in &news {
-        if send_packet(s, 0x27, map_chunk(*cx, *cz)).is_err() { return }
+        if send_packet(s, 0x27, map_chunk(*cx, *cz, gen)).is_err() { return }
+        for n in light_dirty_for(gen, *cx, *cz) { dirty.insert(n); }
         let snap: Vec<((i32,i32,i32,u8), [String;4])> = signs().lock().unwrap().iter()
             .filter(|((sx,_,sz,_),_)| sx.div_euclid(16) == *cx && sz.div_euclid(16) == *cz)
             .map(|(k,v)| (*k, v.clone())).collect();
         for ((sx,sy,sz,front), lines) in snap {
             let _ = send_packet(s, 0x07, sign_entity_pkt(sx,sy,sz,front,&lines));
         }
+    }
+    // A neighbour lit before this batch could not see the emitters generated now, so its light is
+    // recomputed and re-sent. `light_dirty_for` limits this to held chunks a new emitter can
+    // actually reach, and the set deduplicates the chunks several new neighbours all touch.
+    for (cx, cz) in dirty {
+        if !sent.contains(&(cx, cz)) { continue }
+        if send_packet(s, 0x2a, update_light_packet(cx, cz, gen)).is_err() { return }
     }
     let mut bf = Vec::new(); write_varint(&mut bf, news.len() as i64);
     let _ = send_packet(s, 0x0c, bf);
@@ -12067,12 +12139,13 @@ fn handle(mut s: TcpStream) {
         }
     }
     let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    let mut gen: GenSources = GenSources::new();
     let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
     // vanilla: a returning player resumes where they logged out — the
     // chunk window, spawn teleport and authoritative pos all agree.
     let (sx, sy, sz, syaw, spitch) = pos_store().lock().unwrap().get(&name)
         .copied().unwrap_or_else(|| { let w = *WORLD_SPAWN.lock().unwrap(); (w.0, w.1, w.2, 0.0, 0.0) });
-    stream_chunks(&mut s, &mut sent, (sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32, view);
+    stream_chunks(&mut s, &mut sent, &mut gen, (sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32, view);
     let mut tm = Vec::new(); tm.extend_from_slice(&0i64.to_be_bytes()); tm.extend_from_slice(&6000i64.to_be_bytes());
     let _ = send_packet(&mut s, 0x64, tm);
     let mut ps = Vec::new();
@@ -12119,6 +12192,7 @@ fn handle(mut s: TcpStream) {
         merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]), bow_draw: Mutex::new(None), dig: Mutex::new(None), eat_start: Mutex::new(None), blocking: Mutex::new(false), sprinting: Mutex::new(false), sneaking: Mutex::new(false), last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)), fall_fly: Mutex::new(false), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)), shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)), absorb: Mutex::new(0.0), pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
         seen: Mutex::new(HashSet::new()),
         chunks: Mutex::new(HashSet::new()),
+        gen_sources: Mutex::new(gen),
         xp: Mutex::new(0),
         gm: Mutex::new(1),
         fall_from: Mutex::new(sy),
@@ -12200,7 +12274,8 @@ fn handle(mut s: TcpStream) {
                     view = effective;
                     let (x, _, z, _, _, _) = *me.pos.lock().unwrap();
                     let mut chunks = me.chunks.lock().unwrap();
-                    stream_chunks(&mut *me.sock.lock().unwrap(), &mut chunks,
+                    let mut gen = me.gen_sources.lock().unwrap();
+                    stream_chunks(&mut *me.sock.lock().unwrap(), &mut chunks, &mut gen,
                         (x / 16.0).floor() as i32, (z / 16.0).floor() as i32, view);
                 }
             }
@@ -12228,7 +12303,8 @@ fn handle(mut s: TcpStream) {
 
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let mut ch = me.chunks.lock().unwrap();
-                            stream_chunks(&mut *me.sock.lock().unwrap(), &mut ch, ccx, ccz, view)
+                            let mut gen = me.gen_sources.lock().unwrap();
+                            stream_chunks(&mut *me.sock.lock().unwrap(), &mut ch, &mut gen, ccx, ccz, view)
                         })).is_ok();
 
                         let _ = ok;
