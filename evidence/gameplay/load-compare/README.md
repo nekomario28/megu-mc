@@ -56,3 +56,18 @@ view distance・移動スクリプト**で動かし、同じ 20 秒窓の CPU/RS
 **37.90s / 4096 chunk = 9.3 ms/chunk**。負荷時の 21.47s CPU はこの生成器が支配している。
 次の作業はこの 9.3ms/chunk の中身（密度/気候ノイズ、表層、aquifer、feature）を
 段階計測し、vanilla 同等以下へ下げること。`perf`/`valgrind` は環境に無い。
+
+## 生成の内訳（M3 の真のホットスポット）
+
+`WGPERF=1` の worldgen プローブ（release）：
+
+| 段階 | コスト |
+|---|---|
+| `chunk_cols`（密度/気候/表層/aquifer） | **8.79 ms/chunk** |
+| `deep_state` | 0.0016 ms/call |
+| `feature_state`（1回＝3×3=9チャンクを populate） | **448 ms → 約50 ms/chunk** |
+| 9×9 の feature 上書き数 | 60,189（≈743/chunk） |
+
+`MC_SPINE_WG_PROFILE` の 9.3ms/chunk は **地形だけ**。負荷時の 21.47s CPU は
+**feature population（約50ms/chunk）** が支配している（地形8.8 + populate50 ≒ 59ms × 数百チャンク）。
+**M3 の最適化対象は feature population** であり、地形密度ではない。

@@ -72,5 +72,13 @@
     "vanilla_cpu_s": 16.18,
     "finding": "Datapack worldgen accounts for almost all of mc-spine's CPU under load (21.47s -> 0.34s with a flat generator); the tick/streaming/IO core is far cheaper than vanilla. The M3 gap is in the terrain generator.",
     "caveat": "flat terrain is not the same work as vanilla normal terrain; this is a cause-isolation diagnostic, not a like-for-like comparison."
+  },
+  "worldgen_breakdown": {
+    "chunk_cols_ms_per_chunk": 8.79,
+    "deep_state_ms_per_call": 0.0016,
+    "feature_populate_ms_per_9_chunks": 448.0,
+    "feature_populate_ms_per_chunk": 50.0,
+    "overrides_per_chunk_9x9": 60189,
+    "finding": "Feature population (~50 ms/chunk) dominates the load CPU, not terrain density (8.8 ms/chunk). M3 optimization should target the feature pipeline."
   }
 }
