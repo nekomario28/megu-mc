@@ -143,3 +143,26 @@ fn update_light_packet_sends_block_light_only() {
     }
     assert!(r.is_empty(), "packet fully consumed");
 }
+
+/// A generated emitter the player has since removed must stop lighting. The cached generated
+/// source is skipped when the overlay now holds that cell, so the live overlay decides emission.
+#[test]
+fn a_removed_generated_emitter_stops_lighting() {
+    let _g = world_guard();
+    let old_world = world().lock().unwrap().clone();
+    let mut gen = GenSources::new();
+    gen.insert((0, 0), vec![((5, 70, 7), 15)]);
+    let nib = |secs: &[[u8; 2048]], y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
+        let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    let lit = block_light_sections(0, 0, &gen);
+    assert_eq!(nib(&lit, 70, 5, 7), 15, "the generated emitter lights");
+    // The player breaks it: an explicit air override at the cell, as set_block records.
+    world().lock().unwrap().entry((0, 0)).or_default().insert(local_idx(5, 70, 7), 0);
+    let dark = block_light_sections(0, 0, &gen);
+    assert_eq!(nib(&dark, 70, 5, 7), 0, "a removed generated emitter must not light again");
+    *world().lock().unwrap() = old_world;
+}

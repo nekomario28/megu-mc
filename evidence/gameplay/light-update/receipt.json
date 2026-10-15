@@ -6,7 +6,8 @@
     "merge": "block_light_sections reads the chunk and its eight neighbours' recorded generated emitters",
     "record": "chunk_data records emitters that come from generated terrain (not the overlay) so a broken torch is not cached",
     "update": "a new chunk marks an already-generated neighbour dirty when a source lies in the neighbour's search area; stream_chunks sends ClientboundLightUpdatePacket (0x2a) for held dirty chunks",
-    "packet": "sky omitted (it does not depend on emitters and the client leaves an unmasked section unchanged); zero block sections go in the empty mask with no array"
+    "packet": "sky omitted (it does not depend on emitters and the client leaves an unmasked section unchanged); zero block sections go in the empty mask with no array",
+    "overlay_filter": "a cached generated emitter is skipped once the overlay holds that cell, so a removed/replaced emitter stops lighting"
   },
   "contract": {
     "packet_id": "0x2a",
@@ -21,9 +22,10 @@
     "light_pack_tests::block_light_sees_a_neighbours_generated_source",
     "light_pack_tests::a_source_marks_an_already_generated_neighbour_for_a_light_update",
     "light_pack_tests::block_light_uses_generated_sources",
-    "protocol767_test::test_light_update_known_answer_and_bad_mask_count"
+    "protocol767_test::test_light_update_known_answer_and_bad_mask_count",
+    "light_pack_tests::a_removed_generated_emitter_stops_lighting"
   ],
-  "mutations": "tools/mutation_check.sh: neighbour lookup -> self only (neighbour test red); generated source ignored (self test red)",
+  "mutations": "tools/mutation_check.sh: neighbour lookup -> self only (neighbour test red); generated source ignored (self test red); overlay filter disabled -> removed-emitter test red",
   "runtime": {
     "tool": "tools/light_update_probe.py (release binary)",
     "datapack_view_2_move_one_chunk": "29 update-light packets, chunks (-2,-2)..(3,1); client decoded them",
@@ -58,12 +60,15 @@
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
-    "rust": "130 passed / 1 pre-existing ignored (serial)",
-    "mutants_proved": 35,
+    "rust": "133 passed / 1 pre-existing ignored (serial)",
+    "mutants_proved": 40,
     "not_a_gate": 0,
     "parked": 0,
     "skipped": 0,
     "layer_gate": "16 modules, 40 edges, 0 named errors",
-    "log_sha256": "fd3fe0160bc7a62ad8f601a699ed2c691a61660394979d58908c119ca71b8c89"
-  }
+    "log_sha256": "11b06e7ca617eda202de564306647e00181b7b51f4d9a6782b1a8a2efd79e90b"
+  },
+  "integration_review_fixes": [
+    "Skip a cached generated emitter whose cell now has an overlay entry (Codex integration review P2)."
+  ]
 }

@@ -4120,8 +4120,25 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
 /// Advance each falling entity by vanilla's gravity and land it on the first solid block
 /// below. The physics is the bytecode-derived contract in evidence/gameplay/falling-vanilla:
 /// `dy -= 0.04` per tick, no drag, land when the feet reach the support's top face.
+/// The entities to advance this tick. The queue is cloned, not drained, so a save on another
+/// thread always sees the complete in-flight set; draining showed it an empty queue and lost
+/// blocks that had already left the world.
+fn begin_falling_tick() -> (Vec<Fall>, std::collections::HashSet<i32>) {
+    let active: Vec<Fall> = falling().lock().unwrap().clone();
+    let processed = active.iter().map(|f| f.eid).collect();
+    (active, processed)
+}
+
+/// Retire the ids this tick handled and re-add the survivors. `retain` keeps any entity a
+/// connection thread pushed during the pass, which is why the queue is not simply assigned.
+fn end_falling_tick(processed: &std::collections::HashSet<i32>, keep: Vec<Fall>) {
+    let mut f = falling().lock().unwrap();
+    f.retain(|e| !processed.contains(&e.eid));
+    f.extend(keep);
+}
+
 fn falling_tick() {
-    let active = std::mem::take(&mut *falling().lock().unwrap());
+    let (active, processed) = begin_falling_tick();
     let mut keep: Vec<Fall> = Vec::with_capacity(active.len());
     let mut moves: Vec<(i32, f64, f64, f64)> = Vec::new();
     // A landing keeps its entity: the target cell is re-checked at the moment of placement.
@@ -4168,13 +4185,7 @@ fn falling_tick() {
             keep.push(f);
         }
     }
-    // Put the survivors back by appending, not assigning. A connection thread can reach
-    // note_falling while the physics runs and push a new entity; assigning would overwrite those
-    // pushes after their block had already been removed from the world, losing them silently.
-    {
-        let mut f = falling().lock().unwrap();
-        f.extend(keep);
-    }
+    end_falling_tick(&processed, keep);
     for (fa, bx, top, bz) in landings {
         // The support scan used the pre-tick snapshot. Two entities can reach the same cell in
         // one tick, and a connection thread can place a block there; placing without this check
@@ -8685,11 +8696,17 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
     // Generated light sources for this chunk and the eight neighbours (recorded by `chunk_data`
     // as each was streamed). `block_light_sections_from` clips them to the search area, so an
-    // emitter across a border lights this chunk exactly as if it were inside it.
+    // emitter across a border lights this chunk exactly as if it were inside it. A cell the
+    // overlay now holds is skipped: the overlay scan below decides its live emission, so a
+    // generated lava the player has since removed does not light again.
     for dx in -1..=1 {
         for dz in -1..=1 {
-            if let Some(g) = gen.get(&(cx + dx, cz + dz)) {
-                sources.extend(g.iter().copied());
+            let Some(g) = gen.get(&(cx + dx, cz + dz)) else { continue };
+            for (p, lum) in g {
+                if w.get(&(p.0 >> 4, p.2 >> 4)).and_then(|c| c.get(&local_idx(p.0, p.1, p.2))).is_some() {
+                    continue;
+                }
+                sources.push((*p, *lum));
             }
         }
     }

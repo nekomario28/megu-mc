@@ -1244,6 +1244,23 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     set_test_region(oh, ow);
 }
 
+/// A tick must not drain the falling queue: a save on another thread clones the queue during
+/// the pass, and an empty queue would drop blocks that are already out of the world.
+#[test]
+fn beginning_a_falling_tick_leaves_the_queue_visible() {
+    let _world_guard = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    falling().lock().unwrap().push(Fall {
+        eid: 7, x: 0.5, y: 80.0, z: 0.5, dy: 0.0, state: 1, time: 0,
+    });
+    let (active, processed) = begin_falling_tick();
+    assert_eq!(active.len(), 1, "the tick advances the in-flight entity");
+    assert_eq!(processed.len(), 1);
+    assert_eq!(falling().lock().unwrap().len(), 1,
+        "a concurrent save must still see the in-flight entity");
+    *falling().lock().unwrap() = old_falling;
+}
+
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
 /// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
 /// block it never showed, because the check returns before locking when there is nothing above.

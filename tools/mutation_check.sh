@@ -197,14 +197,19 @@ check "a block above a removed support is scheduled" \
   sand_falls_under_vanilla_gravity_until_it_lands
 
 check "block light uses generated sources, not only the overlay" \
-  src/main.rs 'sources.extend(g.iter().copied());' \
-  'let _ = g;' \
+  src/main.rs '                sources.push((*p, *lum));' \
+  '                let _ = (p, lum);' \
   block_light_uses_generated_sources
 
 check "block light sees a neighbour's generated source" \
   src/main.rs 'gen.get(&(cx + dx, cz + dz))' \
   'gen.get(&(cx, cz))' \
   block_light_sees_a_neighbours_generated_source
+
+check "a removed generated emitter stops lighting" \
+  src/main.rs 'if w.get(&(p.0 >> 4, p.2 >> 4)).and_then(|c| c.get(&local_idx(p.0, p.1, p.2))).is_some() {' \
+  'if false {' \
+  a_removed_generated_emitter_stops_lighting
 
 check "light sections start one below the world" \
   src/main.rs 'const LIGHT_MIN_Y: i32 = MIN_Y - 16;' \
@@ -245,6 +250,11 @@ check "a fast fall sweeps for a thin platform" \
   src/main.rs '            let old_floor = f.y.floor() as i32;' \
   '            let old_floor = new_y.floor() as i32;' \
   a_fast_falling_block_lands_on_a_thin_platform_it_crosses
+
+check "a falling tick leaves the queue visible to a save" \
+  src/main.rs '    let active: Vec<Fall> = falling().lock().unwrap().clone();' \
+  '    let active: Vec<Fall> = std::mem::take(&mut *falling().lock().unwrap());' \
+  beginning_a_falling_tick_leaves_the_queue_visible
 
 echo
 check "the falling entities are written into the save" \

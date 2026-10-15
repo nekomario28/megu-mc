@@ -26,18 +26,19 @@
     "persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities",
     "tick_tests::a_falling_block_passes_through_a_replaceable_block",
     "tick_tests::a_long_unsupported_column_converts_in_one_pass",
-    "tick_tests::a_fast_falling_block_lands_on_a_thin_platform_it_crosses"
+    "tick_tests::a_fast_falling_block_lands_on_a_thin_platform_it_crosses",
+    "tick_tests::beginning_a_falling_tick_leaves_the_queue_visible"
   ],
-  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air",
+  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air; falling-tick clone -> mem::take",
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
-    "rust": "125 passed / 1 pre-existing ignored in 3 thread runs and 1 serial run",
-    "mutants_proved": 31,
+    "rust": "133 passed / 1 pre-existing ignored (serial)",
+    "mutants_proved": 40,
     "not_a_gate": 0,
     "parked": 0,
     "skipped": 0,
-    "log_sha256": "6dba60f9889ba4665bc0ebaddf4c9e123f325fb656f6ebc2866964d0e577f0a7"
+    "log_sha256": "11b06e7ca617eda202de564306647e00181b7b51f4d9a6782b1a8a2efd79e90b"
   },
   "source_hashes": {
     "src/main.rs": "c4675d387dde01ba7e6d60eaa143543b2ba5fa76035ca23aab51f1df81235602",
@@ -62,6 +63,7 @@
   },
   "integration_review_fixes": [
     "The support scan sweeps from the old feet to the new feet, so a one-block platform crossed in a sub-block step is a landing, not a tunnel. (Codex integration review P2)",
-    "A migrated legacy FAL1 cell records explicit air instead of removing its overlay entry, so a non-air generated base is not exposed under the new entity. (Codex integration review P2)"
+    "A migrated legacy FAL1 cell records explicit air instead of removing its overlay entry, so a non-air generated base is not exposed under the new entity. (Codex integration review P2)",
+    "falling_tick snapshots the queue instead of draining it, so a SIGTERM/save-all save during the pass sees every in-flight entity (Codex integration review P1)."
   ]
 }
