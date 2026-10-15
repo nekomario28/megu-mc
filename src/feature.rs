@@ -1602,6 +1602,30 @@ fn pop_seed(seed: u64, bx: i32, bz: i32) -> u64 {
 
 /// populate chunk (sx,sz): evaluate the vanilla feature pipeline and merge
 /// block-state overrides into Gen::feat_c.
+/// Env-gated per-placed-feature timing, so the feature-population hotspot can be attributed to a
+/// named feature instead of guessed. No behaviour change; the map is only written when
+/// `FEAT_PROFILE` is set.
+pub(crate) static FEAT_PROF: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u128, u64)>>> =
+    std::sync::OnceLock::new();
+pub(crate) fn feat_prof_record(name: &str, ns: u128) {
+    let m = FEAT_PROF.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap();
+    let e = g.entry(name.to_string()).or_insert((0, 0));
+    e.0 += ns;
+    e.1 += 1;
+}
+pub(crate) fn feat_prof_dump() {
+    let Some(m) = FEAT_PROF.get() else { return };
+    let m = m.lock().unwrap();
+    let mut v: Vec<(String, u128, u64)> = m.iter().map(|(k, (t, c))| (k.clone(), *t, *c)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u128 = v.iter().map(|x| x.1).sum();
+    eprintln!("FEATPROF total={:.1}ms", total as f64 / 1e6);
+    for (name, ns, cnt) in v.iter().take(25) {
+        eprintln!("FEATPROF {:8.2}ms n={cnt:5}  {name}", *ns as f64 / 1e6);
+    }
+}
+
 pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     let fr = freg();
     if fr.steps == 0 || breg().is_none() {
@@ -1622,6 +1646,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     let pop = pop_seed(g.wseed(), sx * 16, sz * 16);
     let mut ctx = FC::new(g);
     let trace = std::env::var("FEAT_TRACE").is_ok();
+    let profile = std::env::var("FEAT_PROFILE").is_ok();
     for step in 0..fr.steps {
         for (gi, name) in &fr.order[step] {
             let present = biomes.iter().any(|b| {
@@ -1640,7 +1665,11 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));
             let mut rng = Xor::seed(deco);
             let before = ctx.wr.len();
+            let t0 = if profile { Some(std::time::Instant::now()) } else { None };
             gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
+            if let Some(t0) = t0 {
+                feat_prof_record(name, t0.elapsed().as_nanos());
+            }
             if trace {
                 let mut h: u64 = 0;
                 for (k, v) in ctx.wr.iter() {

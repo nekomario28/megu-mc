@@ -71,3 +71,22 @@ view distance・移動スクリプト**で動かし、同じ 20 秒窓の CPU/RS
 `MC_SPINE_WG_PROFILE` の 9.3ms/chunk は **地形だけ**。負荷時の 21.47s CPU は
 **feature population（約50ms/chunk）** が支配している（地形8.8 + populate50 ≒ 59ms × 数百チャンク）。
 **M3 の最適化対象は feature population** であり、地形密度ではない。
+
+## feature 単位の内訳（`FEAT_PROFILE=1`、release）
+
+`feature::populate` の `gen_pf` を名前ごとに集計（env ゲート、挙動不変）：
+
+| feature | 時間 | 呼出 | 1回あたり |
+|---|---|---|---|
+| `ore_dirt` | 236 ms | 25 | **9.4 ms** |
+| `monster_room_deep` | 161 ms | 25 | 6.4 ms |
+| `ore_gravel` | 85 ms | 25 | 3.4 ms |
+| `monster_room` | 84 ms | 25 | 3.4 ms |
+| `ore_tuff` | 63 ms | 25 | 2.5 ms |
+| `ore_diorite/granite/andesite_lower` | 各 ~48 ms | 25 | 各 ~1.9 ms |
+| `underwater_magma` | 42 ms | 25 | 1.7 ms |
+
+`ore_dirt` は size 33 で、`gen_vein` が約2100セル/vein を `FC.wr`（HashMap）へ書き込む。
+**コストは feature 評価そのものより、セル書込み（`ctx.set` の HashMap 挿入）と
+`gen_vein` の楕円走査**にある。次の M3 最適化は `FC.wr` のデータ構造（per-chunk 配列など）で、
+影響範囲が広いため独立スライスにする。

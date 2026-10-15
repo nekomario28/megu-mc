@@ -80,5 +80,36 @@
     "feature_populate_ms_per_chunk": 50.0,
     "overrides_per_chunk_9x9": 60189,
     "finding": "Feature population (~50 ms/chunk) dominates the load CPU, not terrain density (8.8 ms/chunk). M3 optimization should target the feature pipeline."
+  },
+  "feature_profile": {
+    "tool": "FEAT_PROFILE=1 in feature::populate (env-gated, no behaviour change)",
+    "top": [
+      {
+        "name": "minecraft:ore_dirt",
+        "ms_total": 236.35,
+        "calls": 25
+      },
+      {
+        "name": "minecraft:monster_room_deep",
+        "ms_total": 160.52,
+        "calls": 25
+      },
+      {
+        "name": "minecraft:ore_gravel",
+        "ms_total": 84.97,
+        "calls": 25
+      },
+      {
+        "name": "minecraft:monster_room",
+        "ms_total": 83.93,
+        "calls": 25
+      },
+      {
+        "name": "minecraft:ore_tuff",
+        "ms_total": 62.89,
+        "calls": 25
+      }
+    ],
+    "finding": "ore_dirt is 9.4 ms/call: a size-33 vein writes ~2100 cells into FC.wr (a HashMap). The next M3 slice is the FC.wr data structure, which has broad impact."
   }
 }

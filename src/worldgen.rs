@@ -2547,6 +2547,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
             }
         }
         eprintln!("PERF overrides/chunk-9x9: {}", n);
+        crate::feature::feat_prof_dump();
     }
 
     #[test]
