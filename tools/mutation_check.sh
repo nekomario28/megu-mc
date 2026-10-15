@@ -196,6 +196,11 @@ check "a block above a removed support is scheduled" \
   '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
   sand_falls_under_vanilla_gravity_until_it_lands
 
+check "block light uses generated sources, not only the overlay" \
+  src/main.rs '        sources.extend(gen.iter().copied());' \
+  '        let _ = gen;' \
+  block_light_uses_generated_sources
+
 check "light sections start one below the world" \
   src/main.rs 'const LIGHT_MIN_Y: i32 = MIN_Y - 16;' \
   'const LIGHT_MIN_Y: i32 = MIN_Y;' \

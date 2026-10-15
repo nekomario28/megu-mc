@@ -8551,6 +8551,16 @@ fn within_search(cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
     x >= cx * 16 - 15 && x <= cx * 16 + 30 && z >= cz * 16 - 15 && z <= cz * 16 + 30 && y >= MIN_Y && y < MIN_Y + 384
 }
 
+/// Light-emitting blocks the **generator** placed in each chunk, recorded by `chunk_data` as it
+/// computes every state. They are not in the overlay, so the block-light spread cannot find them
+/// by scanning edits; without this a generated lava lake or sea lantern emits no light. Only the
+/// chunk being lit is used (a neighbour's cache may not exist yet), so a generated emitter just
+/// across a chunk border is not seen until that chunk is itself streamed.
+static GEN_SOURCES: OnceLock<Mutex<HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>>> = OnceLock::new();
+fn gen_sources() -> &'static Mutex<HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>> {
+    GEN_SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// The first light section, from vanilla `LevelLightEngine.getMinLightSection()`:
 /// `getMinSection() - 1`, one section below the world's lowest block section. The light packet
 /// sends `getLightSectionCount() = getSectionsCount() + 2` sections from here, so the array at
@@ -8660,6 +8670,10 @@ fn block_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     // made this the expensive half of the light work.
     let w = world().lock().unwrap();
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
+    // Generated light sources for this chunk (recorded by `chunk_data`).
+    if let Some(gen) = gen_sources().lock().unwrap().get(&(cx, cz)) {
+        sources.extend(gen.iter().copied());
+    }
     for dx in -1..=1 {
         for dz in -1..=1 {
             let (ncx, ncz) = (cx + dx, cz + dz);
@@ -8928,6 +8942,8 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
 fn chunk_data(cx: i32, cz: i32) -> Vec<u8> {
 
     let mut data = Vec::new();
+    let reg = crate::block_registry::breg();
+    let mut gen_sources_here: Vec<((i32, i32, i32), u8)> = Vec::new();
     let overlay_empty = {
         let w = world().lock().unwrap();
         w.get(&(cx, cz)).map_or(true, |c| c.is_empty())
@@ -8967,6 +8983,12 @@ fn chunk_data(cx: i32, cz: i32) -> Vec<u8> {
                             } else {
                                 read(wx, wy, wz)
                             };
+                            // The true state is here already, so record generated emitters for the
+                            // block-light pass without a second read.
+                            if let Some(reg) = reg {
+                                let lum = reg.luminance_of(st);
+                                if lum > 0 { gen_sources_here.push(((wx, wy, wz), lum)); }
+                            }
                             // anti-xray + palette compression: buried hidden blocks sent as stone
                             let vis = if is_hidden(st) && ![(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter()
                                 .any(|(dx,dy,dz)| exposes(read(wx+dx, wy+dy, wz+dz))) {
@@ -8979,6 +9001,13 @@ fn chunk_data(cx: i32, cz: i32) -> Vec<u8> {
             }
             data.extend_from_slice(&section_encode(&arr, &biomes));
         }
+    }
+    {
+        let mut gen = gen_sources().lock().unwrap();
+        if gen.len() > 2048 {
+            gen.clear();
+        }
+        gen.insert((cx, cz), gen_sources_here);
     }
     data
 }

@@ -63,3 +63,21 @@ fn light_sections_start_one_below_the_world() {
     assert_eq!(nib(MIN_Y - 1, 0, 0), 0, "the extra section below the world is dark");
     assert_eq!(nib(LIGHT_MIN_Y, 0, 0), 0, "and its bottom is dark too");
 }
+
+/// A generated light source (lava, glowstone) is not in the overlay, so the block-light pass
+/// must take it from the chunk's recorded generated sources.
+#[test]
+fn block_light_uses_generated_sources() {
+    let _g = world_guard();
+    gen_sources().lock().unwrap().insert((0, 0), vec![((5, 70, 7), 15)]);
+    let secs = block_light_sections(0, 0);
+    gen_sources().lock().unwrap().remove(&(0, 0));
+    let nib = |y: i32, lx: usize, lz: usize| -> u8 {
+        let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
+        let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
+        let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
+        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+    };
+    assert_eq!(nib(70, 5, 7), 15, "a generated emitter must light");
+    assert_eq!(nib(70, 6, 7), 14, "and spread by one");
+}
