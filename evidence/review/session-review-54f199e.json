@@ -1,0 +1,23 @@
+{
+  "scope": "fix/20tps-integrated 9c43051..54f199e (H, T, N and the F evidence)",
+  "reviewer": "pi (separate read-only session, static review only)",
+  "verdict": "no confirmed defect",
+  "confirmed": [
+    "H moved definitions are textually identical; the old *_pub wrappers are gone and unreferenced; the generation Xor stream is untouched, so generation order is unchanged",
+    "T's sched_ready is load-bearing because MAX_DELAY caps the queue at 80 ticks while backoff_ticks is unbounded; the new test drives the real game_tick path and the always-true mutation makes it red",
+    "N's RNG1 section is appended after FAL1 and read only when present, so pre-RNG1 saves still load; world_rng::seed runs before load_world, so a reload continues the saved stream; the SystemTime|subsec_nanos ratchet is at zero",
+    "F evidence states it is not yet vanilla-compliant and names the unverified landing position and the required runtime comparison",
+    "policy.json and deps_target.py both carry the downward landing -> world_rng edge with accepted_errors empty"
+  ],
+  "not_verified_by_reviewer": [
+    "the full compiler-expanded 40-edge graph (only the H/N-central modules were read)",
+    "the exact pinned xorshift64* vector values and the frozen byte artifacts (cannot execute)",
+    "verify.sh and the hosted CI results (relied on the mutation guards that were read)"
+  ],
+  "observations": [
+    "src/tree.rs keeps its main import block at the end of the file (legal, pre-existing shape)",
+    "backoff_ticks shift overflow is physically unreachable"
+  ],
+  "log": "/home/yuu/.cache/mc-spine-audit/Q-review.log",
+  "log_sha256": "a477116b9615913a937d1271c59753686038d7138cb7579628014a9796f317bf"
+}
