@@ -8,10 +8,16 @@ Read from src/main.rs:
                        keeping its old slot
   - requeue_fluid()    re-schedules with the delay taken from the same backoff map
 
-The question this answers is item g in PLAN.md: the fluid ticks carry a `sched_ready` test
-alongside `is_warm`, and if the ladder always reaches a due state on its own then that test is a
-safety net that cannot fire. A state from which no accepting state is reachable would mean the
-opposite - a cell that stops being visited and is never removed, which is a soft-lock.
+The question this answers is liveness: can a cell get stuck in a state from which no accepting
+state is reachable, i.e. is it ever visited but neither removed nor allowed to become due again?
+0 errors means no such soft-lock.
+
+It does NOT answer whether the `sched_ready` test alongside `is_warm` can fire. Reachability
+only says the ladder eventually reaches a due deadline; it says nothing about the delay queue,
+which clamps its wait at MAX_DELAY (4 s). Because `backoff_ticks` keeps doubling past 80 ticks,
+a cell at `fails >= 5` has a real deadline beyond the queue's cap and the queue would return it
+early, so `sched_ready` is false and the guard is load-bearing. See README.md and
+tick_tests::a_backoff_past_the_queue_cap_waits_for_its_real_deadline.
 """
 
 import flowgx as f

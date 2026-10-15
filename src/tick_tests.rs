@@ -854,6 +854,67 @@ fn a_periodic_system_expresses_its_backoff_in_invocations() {
     backoff().lock().unwrap().remove(&pos);
 }
 
+/// The delay queue caps a wait at four seconds, but the backoff ladder does not:
+/// after four consecutive no-op visits `backoff_ticks` returns more than
+/// `MAX_DELAY`, so the queue on its own would visit the cell early. The
+/// `sched_ready` guard is what holds the cell to its real deadline, which makes it
+/// load-bearing rather than the "cannot fire" net a reachability model suggested.
+/// This drives the real `game_tick`/`water_tick` path and reads the visit times
+/// off the backoff map's fail counter, because the guard re-queues without
+/// touching that counter.
+#[test]
+fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
+    let _world_guard = world_guard();
+    let old_waters = std::mem::take(&mut *waters().lock().unwrap());
+    let old_queue = std::mem::replace(&mut *water_queue().lock().unwrap(), tick_queue::TickQueue::new());
+    let old_backoff = std::mem::take(&mut *backoff().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let (old_hot, old_warm) = test_region();
+    forceloaded().lock().unwrap().insert((0, 0));
+    refresh_hot();
+
+    assert!(backoff_ticks(5) > tick_queue::MAX_DELAY as u64,
+        "this test is vacuous unless the ladder exceeds the queue cap");
+    let pos = (0, 150, 0);
+    let stone = name_to_state("stone").unwrap();
+    let water = name_to_state("water").unwrap();
+    let cells = [(0, 150, 0), (0, 149, 0), (1, 150, 0), (-1, 150, 0), (0, 150, 1), (0, 150, -1)];
+    let original: Vec<(i32, i32, i32, u32)> =
+        cells.iter().map(|&(x, y, z)| (x, y, z, block_at(x, y, z))).collect();
+    for &(x, y, z) in &cells[1..] { set_block(x, y, z, stone); }
+    // Placing the water registers and schedules it. Walled in on every side it has
+    // no work to do, so each visit is a no-op and the ladder climbs past the cap.
+    set_block(pos.0, pos.1, pos.2, water);
+
+    let mut visits: Vec<u64> = Vec::new();
+    let mut fails = 0u32;
+    for t in 0..=700u64 {
+        game_tick(|_, tick| tick());
+        if let Some((_, f)) = backoff().lock().unwrap().get(&pos).copied() {
+            if f != fails {
+                fails = f;
+                visits.push(t);
+            }
+        }
+    }
+    for (x, y, z, st) in original { set_block(x, y, z, st); }
+    *waters().lock().unwrap() = old_waters;
+    *water_queue().lock().unwrap() = old_queue;
+    *backoff().lock().unwrap() = old_backoff;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    set_test_region(old_hot, old_warm);
+
+    let deltas: Vec<u64> = visits.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(deltas.len() >= 6, "the ladder must climb past the cap: {visits:?}");
+    let expected: Vec<u64> = (1..=deltas.len() as u64).map(backoff_ticks).collect();
+    assert_eq!(deltas, expected,
+        "the guard must hold each visit to the real backoff, not the queue's 4s cap: {visits:?}");
+}
+
 /// Vanilla grows sugar cane one stage per random tick and adds a block on the tick that
 /// would pass age 15, so sixteen random ticks raise the column by one. That makes it the
 /// one behaviour a random tick can drive that can be pinned exactly, which is why it is

@@ -1,0 +1,36 @@
+{
+  "checkpoint": "T: the sched_ready guard is load-bearing, not a redundant safety net",
+  "goal": "Establish the real relationship between the delay-queue deadline and the BACKOFF ladder on the production tick path, instead of inferring redundancy from state reachability.",
+  "finding": {
+    "queue_cap": "TickQueue clamps every wait to MAX_DELAY = 4 s (80 ticks at 20 TPS)",
+    "ladder": "backoff_ticks is unbounded (10, 20, 40, 80, 160, 320, ...); only the queue caps it",
+    "consequence": "From fails >= 5 the real deadline exceeds the queue cap, so the queue returns the cell early, sched_ready is false, and the !sched_ready guard holds the cell. Removing the guard visits every 80 ticks instead of the ladder's interval.",
+    "decision": "Keep the guard. The flowgx reachability result is a liveness statement (no soft-lock), not a redundancy proof."
+  },
+  "evidence": {
+    "test": "tick_tests::a_backoff_past_the_queue_cap_waits_for_its_real_deadline",
+    "how": "drives the real game_tick/water_tick path on a walled-in no-op water cell and reads visit times from the backoff fail counter, requiring deltas 10,20,40,80,160,320",
+    "mutation": "tools/mutation_check.sh: sched_ready's deadline comparison replaced by always-true; the test then observes 80,80,... and fails",
+    "verify": {
+      "command": "bash tests/verify.sh",
+      "result": "PASS",
+      "rust": "119 passed / 1 pre-existing ignored in each of 3 thread runs and 1 serial run",
+      "mutants_proved": 27,
+      "not_a_gate": 0,
+      "parked": 0,
+      "skipped": 0,
+      "log_sha256": "4136951204413b579dad57354f800cae525a633f757c291ea82ac6cb25db15af"
+    }
+  },
+  "source_hashes": {
+    "src/tick_tests.rs": "44ff6046df15e3422e6f9b52cba850cbccb522e07b37548b6d1ea83ce177b587",
+    "evidence/foundation/scheduler-machine/README.md": "00326e835e432f197397cf62a3ac779bfd90ff7cbeb630b39101db4fec1fc286",
+    "evidence/foundation/scheduler-machine/machine.py": "4177f007ec84d44df4bda2a06c1dbf35bf94da1fa11b2e4ca1a4e681e7bd8173",
+    "tools/mutation_check.sh": "1315833e9f26c3a3c5539ab6e410cf5509627eac475390d1dfd573fe99702466"
+  },
+  "limits": [
+    "Static/behavioral only for the scheduler; no vanilla equivalent exists for the lightweight backoff ladder",
+    "The guard stays; this checkpoint does not delete scheduler checks",
+    "F (vanilla falling), N (persistent RNG) and Q (whole-change review) remain open"
+  ]
+}

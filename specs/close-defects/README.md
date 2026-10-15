@@ -14,7 +14,7 @@
 | P | Client Information（監査1/3、i） | 正しい符号化。configuration全受信段階とplay更新を実際の接続へ入力し、送信・アンロード座標が一致 | 検証済み（実ソケット・3受信経路の変異・出力先変更・独立レビュー） |
 | R | 状態データ対応（監査2） | 対象版の全状態が意味の同じプロパティで対応。音符ブロックが固体で光を遮る。未対応はゲートが非0 | 検証済み（全対象状態の対応・音符ブロック・順序変更変異・独立列挙） |
 | L | ソースの依存ゲート（監査6） | ソース由来のグラフで禁止依存追加が赤。CIに必須ツールを固定導入。設計モデルは別に検査 | 検証済み（compiler展開・実ソース負例・固定ツール・自己試験・全verify・独立レビュー。対象CIはQで再確認） |
-| T | スケジューラ（監査6、g） | 実経路でキュー時刻とBACKOFFの関係を検査し、不要なガードの削除前後で結果一致 | 未着手 |
+| T | スケジューラ（監査6、g） | 実経路でキュー時刻とBACKOFFの関係を検査。ガードが load-bearing であることを変異で示す | 検証済み（`game_tick`実経路で訪問間隔がラダー `10,20,40,80,160,320` と一致。ガード除去相当の変異で `80,80,…` に変わる。到達可能性は liveness のみで冗長性の証明ではない） |
 | H | 層分割（h） | 現行ソースの循環と層違反が0、既存結果が不変。生成系に加えjava_compat/landingの型所有循環を解消 | 完了（16モジュール・39辺・指摘0。`block_registry`/`generation_providers`/`generation_context` を追加し、旧結果は凍結対照一致） |
 | C | CLIクライアント（j、ユーザー指示で画面検証を除外） | protocol 767で接続・チャンク復号・移動・破壊・チャット・再取得。CLIの入出力とassertに証拠 | 検証済み（CLI、復号負例、独立した再取得、狙った変異と復元対照、独立レビュー） |
 | F | 落下（b） | エンティティの位置・加速・着地・ドロップ・保存をvanillaと同一入力で照合 | 未着手 |
@@ -36,7 +36,7 @@ C/F/Nは実験を最小にし、参照の静的解析と実行時の一致を別
 
 ## 次の担当者への入口
 
-Hは完了。地形は配置実装を直接参照せず、呼出境界から受け取る。feature/treeの循環とtreeの上向き依存は、共有契約の所有者を `block_registry`/`generation_providers`/`generation_context` へ移して解消した。実装は [共有契約の切替](generation-sharing.md)。次はT（本番スケジューラ/backoffの不変条件）とF（vanilla落下準拠）。CはCLIのみで検証済み。実画面・KDE経由の試験はユーザー指示で行わない。
+HとTは完了。地形は配置実装を直接参照せず、呼出境界から受け取る。feature/treeの循環とtreeの上向き依存は、共有契約の所有者を `block_registry`/`generation_providers`/`generation_context` へ移して解消した（[共有契約の切替](generation-sharing.md)）。スケジューラの `sched_ready` はキュー4秒上限と無上限ラダーの差を埋める load-bearing なガードで、到達可能性モデルからの冗長扱いを実経路の対照と変異で否定した（[スケジューラ](../../evidence/foundation/scheduler-machine/README.md)）。次はF（vanilla落下準拠）とN（RNG）。CはCLIのみで検証済み。実画面・KDE経由の試験はユーザー指示で行わない。
 通信のゲートは `tests/client_settings_wire.py`。
 Sの保存試験は、子プロセスに世界を所有させ親の状態を変更しない。
 Vのゲートは `tests/gate_scripts.py`、通常の全ゲートは `tests/verify.sh`。

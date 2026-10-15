@@ -296,6 +296,11 @@ check "the frozen population digest notices shared provider changes" \
   '            IP::Uniform(a, b) => (*a + *b) / 2,' \
   feature_population_output_matches_the_pre_refactor_capture
 
+check "the queue cap cannot visit a cell before its real backoff" \
+  src/main.rs '    backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)' \
+  '    backoff().lock().unwrap().get(&(x, y, z)).map(|(_t, _)| true).unwrap_or(true)' \
+  a_backoff_past_the_queue_cap_waits_for_its_real_deadline
+
 check "configuration information before known packs reaches chunk streaming" \
   src/main.rs '                client_view = v;
             }
