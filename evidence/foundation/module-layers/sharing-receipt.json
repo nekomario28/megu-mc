@@ -56,6 +56,11 @@
     "result": "PASS",
     "verify_log_sha256": "49cdbd1105976de492b86cca76bfdda49b1ebe776e5db0e37211381708679711"
   },
+  "hosted_ci": {
+    "run": 38680194413,
+    "head": "e821bc9d5be49356f7a37a36fa456a0dc0d3b337",
+    "result": "success (rust + mutation)"
+  },
   "independent_review": {
     "reviewer": "pi (separate read-only session)",
     "verdict": "no confirmed defect",

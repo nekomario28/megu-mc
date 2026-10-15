@@ -96,4 +96,5 @@ Hを閉じてもT/F/N/Q、既存ignoredテスト、代表負荷や全vanilla準�
   変異 **26 proved / 0 skipped**。
 - 独立レビュー（pi、read-only、静的）: 修正対象の欠陥なし。P3の指摘は可視性の戻し・
   不要な `pub(crate)` の縮小・population digestの変異追加・`Unobstructed` の複数歩検査に反映済み。
+- 対象head `e821bc9` のhosted CI（run 38680194413、rust+mutation）は成功。
 - 未確認として残すもの: vanilla全体の準拠、代表負荷性能、並行保存、T/F/N/Q。
