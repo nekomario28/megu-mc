@@ -63,5 +63,14 @@
   "source_hashes": {
     "tools/load_compare.sh": "be54e728954a396efcf2e0bc6278c2fadb796c211780b87d3ee7b0727ae1d293",
     "tools/load_client.py": "d79746c847873912686dd1adcffdc85bcc60b7d07fd1e1b91796535de4262c3b"
+  },
+  "diagnostic": {
+    "question": "where does mc-spine's extra CPU go under load?",
+    "flat_spine_cpu_s": 0.34,
+    "flat_spine_rss_mib": 73.1,
+    "datapack_spine_cpu_s": 21.47,
+    "vanilla_cpu_s": 16.18,
+    "finding": "Datapack worldgen accounts for almost all of mc-spine's CPU under load (21.47s -> 0.34s with a flat generator); the tick/streaming/IO core is far cheaper than vanilla. The M3 gap is in the terrain generator.",
+    "caveat": "flat terrain is not the same work as vanilla normal terrain; this is a cause-isolation diagnostic, not a like-for-like comparison."
   }
 }

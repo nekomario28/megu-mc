@@ -68,3 +68,15 @@
   信頼性19種（sand/red_sand/gravel/concrete_powder）は `EntityBlock` でも
   hurting block でもないので `BlockEntity`/`setHurtsEntities`/`causeFallDamage` は N/A。
 - **同一入力の vanilla 実行照合は未実施**（バイトコード導出のみ）。
+
+## 同一入力オラクルの道具（途中）
+
+`tools/falling_oracle.py` は `/setblock` で床と砂を置き、サーバが送るブロック更新
+（`0x49` セクション更新）を列ごとに集めて、最終列を JSON で出す。チャンク本体は復号しない。
+
+- **mc-spine**: `MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS=1` で `/setblock` をチャット経由で実行。
+  `(x,z)=(0,0)`、床 stone@150、砂@153 → 最終列 `150=stone, 151=sand`（床の1つ上に着地）。
+- **vanilla**: コンソール経由の `/setblock`+`/execute if block` を試したが、
+  「Test passed」が砂の元位置で返り、チャンクの tick とコマンド実行の確認が取れず**未確定**。
+  クライアントチャット経由も vanilla 1.21.1 の署名付きチャット形式に合わず未確定。
+  **同一入力の vanilla 実行照合は未完了**で、Q の残件として明示する。

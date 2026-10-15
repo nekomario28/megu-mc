@@ -23,6 +23,8 @@ Minecraft Java 1.21.1（protocol 767）の超軽量サーバーを作り、観�
 代表負荷の初回測定（`tools/load_compare.sh`、20秒窓×3、同一ホスト・同一移動列・圧縮なし）は
 **CPUが mc-spine 21.47s 対 vanilla 16.18s（約x1.33）**、RSSは mc-spine 122 MiB 対 vanilla 1168 MiB だった。
 **M3の「CPUも小さい」は未達**であり、idle の小さいCPU値を軽量の一般則に使わない。
+追試で `MC_SPINE_WG=old`（フラット）は **0.34s** だった。データパック地形生成が mc-spine の CPU の
+ほぼ全てで、tick・チャンク配信・I/O のコアは vanilla より遥かに軽い。**M3 の律速は地形生成器**である。
 証拠と限界は [代表負荷比較](../evidence/gameplay/load-compare/README.md) にある。
 
 ## 合格条件
