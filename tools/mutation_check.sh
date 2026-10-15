@@ -222,8 +222,8 @@ check "a falling block passes through replaceable blocks" \
   a_falling_block_passes_through_a_replaceable_block
 
 check "a long unsupported column converts in one pass" \
-  src/main.rs '    if depth >= 64 { return }' \
-  '    if depth >= 24 { return }' \
+  src/main.rs '        UPD_DEFER.with(|d| d.borrow_mut().push((x, y, z)));' \
+  '        let _ = (x, y, z);' \
   a_long_unsupported_column_converts_in_one_pass
 
 check "a passing entity must not suppress a new block in the same cell" \

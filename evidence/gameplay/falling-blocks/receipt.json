@@ -29,7 +29,7 @@
     "tick_tests::a_fast_falling_block_lands_on_a_thin_platform_it_crosses",
     "tick_tests::beginning_a_falling_tick_leaves_the_queue_visible"
   ],
-  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air; falling-tick clone -> mem::take",
+  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air; falling-tick clone -> mem::take; UPD_DEFER push -> discard",
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
@@ -41,11 +41,11 @@
     "log_sha256": "11b06e7ca617eda202de564306647e00181b7b51f4d9a6782b1a8a2efd79e90b"
   },
   "source_hashes": {
-    "src/main.rs": "c4675d387dde01ba7e6d60eaa143543b2ba5fa76035ca23aab51f1df81235602",
-    "src/tick_tests.rs": "25e304f7b7e56ecce0254cd69ea84323edb5798d90cbccd6d982ea07ac767f4e",
-    "src/persistence_tests.rs": "2c4682b2bba33e6b1ed7667bdba3313982cab38caefc6ec0bbc2267ce61e34b9",
-    "tools/mutation_check.sh": "ce25b61e27f4979f0d9186a82ed9e3840b44840ac6a997c3eeee05631d9e9cf5",
-    "evidence/gameplay/falling-blocks/README.md": "f9632ba853ae64b0e9bde8ec5e5b99084da229ca521fad44dfc7c2c7c38b7f4b",
+    "src/main.rs": "4cd2c95ffe612c11c131a23d0fcc714c8593957bbcaff060181c230ecbb02695",
+    "src/tick_tests.rs": "a6f6079f696a03cec75413697bb3d8215c0a7b59cf5ac318ef764005c204350a",
+    "src/persistence_tests.rs": "620bed4fb5d89750139e6fe82d40faaf19ea9fc517880508579a84d1d2921bb3",
+    "tools/mutation_check.sh": "ea23803396c094aed49558b7df36fe02a7a21fccd80225dcdd52d8751fe58f92",
+    "evidence/gameplay/falling-blocks/README.md": "09c160db59b6045dbaffa0f441430154b58d74fbed5ac1af60c6dab18d9dbfab",
     "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
   },
   "limits": [
@@ -64,6 +64,8 @@
   "integration_review_fixes": [
     "The support scan sweeps from the old feet to the new feet, so a one-block platform crossed in a sub-block step is a landing, not a tunnel. (Codex integration review P2)",
     "A migrated legacy FAL1 cell records explicit air instead of removing its overlay entry, so a non-air generated base is not exposed under the new entity. (Codex integration review P2)",
-    "falling_tick snapshots the queue instead of draining it, so a SIGTERM/save-all save during the pass sees every in-flight entity (Codex integration review P1)."
+    "falling_tick snapshots the queue instead of draining it, so a SIGTERM/save-all save during the pass sees every in-flight entity (Codex integration review P1).",
+    "block_updated queues a neighbour update past the recursion cap and drains it iteratively, so a gravity column taller than 64 still converts (Codex integration review P2).",
+    "spawn_fall and falling_tick's landing placement run under a re-entrant SAVE_LOCK guard, so a signal-thread save cannot observe the block/entity transition midway (Codex integration review P2)."
   ]
 }

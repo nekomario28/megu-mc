@@ -62,6 +62,13 @@
 - **着地セルの再検査**：バッチ着地は設置直前に `fallable` を再確認し、埋まっていれば上に乗せて次tickで着地する。
 - **下世界のドロップ**：`new_y < MIN_Y` では破棄せず `block_drop` を item 化。
 - **save の直列化**：`SAVE_LOCK` で tick autosave と signal ハンドラの同時書き込みを防ぐ。
+- **世界↔エンティティの遷移と save**：`spawn_fall` と `falling_tick` の着地適用を再入可能な
+  `with_save_guard`（`SAVE_LOCK`）で挟む。signal スレッドの save が「ブロックは消えたが
+  エンティティは未登録」「着地ブロックは置いたがエンティティはまだキュー」という中間状態を
+  見ない（`spawn_fall` は再帰するので最外殻だけがロックする）。
+- **再帰上限を超える柱**：`block_updated` の深さ上限で破棄せず、更新をキューに積んで最外殻から
+  反復処理する。64 を超える支持除去柱も1回で全段エンティティ化する
+  （`a_long_unsupported_column_converts_in_one_pass` を高さ70にし、変異で固定）。
 - **並行 save の可視性**：`falling_tick` はキューを `mem::take` せず clone し、処理後に処理済み id
   だけ除いて生存者を戻す。SIGTERM/`save-all` が tick 中に走っても、飛行中エンティティが空の
   キューとして保存されない（`beginning_a_falling_tick_leaves_the_queue_visible` と変異で固定）。

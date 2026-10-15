@@ -1403,7 +1403,9 @@ fn a_long_unsupported_column_converts_in_one_pass() {
     let stone = name_to_state("stone").unwrap();
     let base = 150;
     let (x, z) = (13, 9);
-    let height = 30;
+    // Taller than the neighbour-update recursion cap (64), so the cap must defer the rest rather
+    // than discard it: every block still has to leave the world in one pass.
+    let height = 70;
     let original: Vec<(i32, u32)> =
         (base..=base + height + 2).map(|y| (y, block_at(x, y, z))).collect();
     for y in base..=base + height + 2 { set_block(x, y, z, 0); }

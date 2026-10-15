@@ -4045,16 +4045,30 @@ static LAVAS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = Once
 fn lavas() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { LAVAS.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
 
 thread_local! { static UPD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) } }
+thread_local! { static UPD_DEFER: std::cell::RefCell<Vec<(i32, i32, i32)>> = const { std::cell::RefCell::new(Vec::new()) } }
 fn block_updated(x: i32, y: i32, z: i32) {
     sched_invalidate(x, y, z);
     plugin_invalidate(x, y, z);
     let depth = UPD_DEPTH.get();
-    // Vanilla has no depth cap on neighbour updates; this bounds recursion while still letting a
-    // long unsupported falling column convert in one pass.
-    if depth >= 64 { return }
+    // Vanilla has no depth cap on neighbour updates. This bounds the recursion so a very tall
+    // column cannot overflow the stack, but instead of discarding the update at the cap it is
+    // queued and drained iteratively from the outermost call: a column taller than the cap still
+    // converts, instead of leaving its upper blocks suspended forever.
+    if depth >= 64 {
+        UPD_DEFER.with(|d| d.borrow_mut().push((x, y, z)));
+        return;
+    }
     UPD_DEPTH.set(depth + 1);
     let r = block_updated_inner(x, y, z);
     UPD_DEPTH.set(depth);
+    if depth == 0 {
+        loop {
+            let Some((dx, dy, dz)) = UPD_DEFER.with(|d| d.borrow_mut().pop()) else { break };
+            UPD_DEPTH.set(1);
+            block_updated_inner(dx, dy, dz);
+            UPD_DEPTH.set(0);
+        }
+    }
     r
 }
 /// A falling block in flight, as vanilla's `FallingBlockEntity`: the block has left the
@@ -4108,12 +4122,14 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
     // falling entity has already left its block cell, so a *new* gravity block placed into that
     // cell matched the passing entity, was never spawned, and hung in the air forever.
     if block_at(px, py, pz) != st { return; }
-    set_block(px, py, pz, 0);
-    note_block_update(px, py, pz, 0);
-    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    falling().lock().unwrap().push(Fall {
-        eid, x: px as f64 + 0.5, y: py as f64, z: pz as f64 + 0.5,
-        dy: 0.0, state: st, time: 0,
+    with_save_guard(|| {
+        set_block(px, py, pz, 0);
+        note_block_update(px, py, pz, 0);
+        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+        falling().lock().unwrap().push(Fall {
+            eid, x: px as f64 + 0.5, y: py as f64, z: pz as f64 + 0.5,
+            dy: 0.0, state: st, time: 0,
+        });
     });
 }
 
@@ -4185,26 +4201,28 @@ fn falling_tick() {
             keep.push(f);
         }
     }
-    end_falling_tick(&processed, keep);
-    for (fa, bx, top, bz) in landings {
-        // The support scan used the pre-tick snapshot. Two entities can reach the same cell in
-        // one tick, and a connection thread can place a block there; placing without this check
-        // would overwrite it and destroy a block. If the cell is taken, keep falling and resolve
-        // again next tick.
-        if fallable(bx, top, bz) {
-            set_block(bx, top, bz, fa.state);
-            note_block_update(bx, top, bz, fa.state);
-            broadcast_seen_destroy(fa.eid);
-        } else {
-            // The target is taken: a sibling landed there in this same batch, or a block was
-            // placed concurrently. Rest the entity on top of the new block and land it next
-            // tick, so neither block is destroyed and the fall terminates.
-            let mut rest = fa;
-            rest.y = (top + 1) as f64;
-            rest.dy = 0.0;
-            falling().lock().unwrap().push(rest);
+    with_save_guard(|| {
+        end_falling_tick(&processed, keep);
+        for (fa, bx, top, bz) in landings {
+            // The support scan used the pre-tick snapshot. Two entities can reach the same cell in
+            // one tick, and a connection thread can place a block there; placing without this check
+            // would overwrite it and destroy a block. If the cell is taken, keep falling and resolve
+            // again next tick.
+            if fallable(bx, top, bz) {
+                set_block(bx, top, bz, fa.state);
+                note_block_update(bx, top, bz, fa.state);
+                broadcast_seen_destroy(fa.eid);
+            } else {
+                // The target is taken: a sibling landed there in this same batch, or a block was
+                // placed concurrently. Rest the entity on top of the new block and land it next
+                // tick, so neither block is destroyed and the fall terminates.
+                let mut rest = fa;
+                rest.y = (top + 1) as f64;
+                rest.dy = 0.0;
+                falling().lock().unwrap().push(rest);
+            }
         }
-    }
+    });
     for (eid, x, y, z) in moves {
         broadcast_seen(eid, |_| (0x70, entity_teleport(eid, x, y, z, 0.0, 0.0, true)));
     }
@@ -4374,6 +4392,22 @@ fn unwrap_world_payload(raw: Vec<u8>) -> Result<Vec<u8>, &'static str> {
 /// and they share one temporary path; two writers would interleave in it and the envelope would
 /// reject the result.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
+thread_local! { static SAVE_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) } }
+/// Run a world/entity ownership transition under `SAVE_LOCK`, so the signal-thread save cannot
+/// observe the block removed but the entity not yet added, or a landing placed but its entity
+/// still queued. Re-entrant per thread: `spawn_fall` is reached from `falling_tick`'s placement
+/// and from another `spawn_fall`, and only the outermost call locks.
+fn with_save_guard<R>(f: impl FnOnce() -> R) -> R {
+    if SAVE_GUARD.with(|g| g.get()) { return f(); }
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    SAVE_GUARD.with(|g| g.set(true));
+    struct Reset;
+    impl std::ops::Drop for Reset {
+        fn drop(&mut self) { SAVE_GUARD.with(|g| g.set(false)); }
+    }
+    let _reset = Reset;
+    f()
+}
 fn save_world() {
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // save_world_into only builds the payload; the write happens here so the
