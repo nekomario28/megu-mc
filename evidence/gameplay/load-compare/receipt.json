@@ -111,5 +111,47 @@
       }
     ],
     "finding": "ore_dirt is 9.4 ms/call: a size-33 vein writes ~2100 cells into FC.wr (a HashMap). The next M3 slice is the FC.wr data structure, which has broad impact."
+  },
+  "deep_state_memo": {
+    "change": "the material rule below the surface window (deep_state_i) is memoized on Gen and shared by the feature pass (ctx.get) and the chunk send pass (wg2_block)",
+    "bound": "500000 entries, evicted in insertion order; reset with the Gen",
+    "generation_output": "unchanged: the frozen population digest and the generation contract tests still pass; a mutation returning a constant on a hit turns the digest red",
+    "mc_spine_only_ab": {
+      "harness": "tools/load_client.py, view 4, 10 s window, base and memo alternating",
+      "pairs": [
+        {
+          "base_cpu_s": 15.93,
+          "memo_cpu_s": 14.3,
+          "ratio": 1.114,
+          "base_rss_mib": 119.4,
+          "memo_rss_mib": 137.1
+        },
+        {
+          "base_cpu_s": 15.77,
+          "memo_cpu_s": 14.39,
+          "ratio": 1.096,
+          "base_rss_mib": 119.8,
+          "memo_rss_mib": 136.9
+        },
+        {
+          "base_cpu_s": 15.73,
+          "memo_cpu_s": 14.78,
+          "ratio": 1.064,
+          "base_rss_mib": 119.7,
+          "memo_rss_mib": 136.8
+        }
+      ],
+      "mean_base_cpu_s": 15.81,
+      "mean_memo_cpu_s": 14.49,
+      "ratio": 1.09,
+      "verdict": "real (above the 4% floor, same direction in every pair) but below x1.10, so it is not claimed as an M3 step"
+    },
+    "same_settings_vs_vanilla_15s": {
+      "vanilla_cpu_s": 16.74,
+      "spine_cpu_s": 18.72,
+      "ratio": 1.12,
+      "verdict": "M3 still unmet"
+    },
+    "next_bottleneck": "deep_state_i evaluated once per unique cell by the feature pass itself (about 190k calls per 9 chunks), because mc-spine recomputes per-cell states instead of reading generated chunk state"
   }
 }
