@@ -61,6 +61,11 @@
     "head": "e821bc9d5be49356f7a37a36fa456a0dc0d3b337",
     "result": "success (rust + mutation)"
   },
+  "carried_forward_ci": {
+    "run": 38681021382,
+    "head": "262d034080f3a1c93e144a889f6b3ca15388889f",
+    "result": "success (documentation only)"
+  },
   "independent_review": {
     "reviewer": "pi (separate read-only session)",
     "verdict": "no confirmed defect",

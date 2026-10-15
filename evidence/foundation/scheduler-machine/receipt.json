@@ -20,6 +20,11 @@
       "parked": 0,
       "skipped": 0,
       "log_sha256": "4136951204413b579dad57354f800cae525a633f757c291ea82ac6cb25db15af"
+    },
+    "hosted_ci": {
+      "run": 38682023128,
+      "head": "65e3fbb3e1dd5f575d33cb14eb111772b967120a",
+      "result": "success (rust + mutation)"
     }
   },
   "source_hashes": {
