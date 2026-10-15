@@ -26,3 +26,19 @@ releaseの代表負荷性能やvanillaとの軽量性比較には使わない。
 
 この変更は従来のsection座標と光値を保存する。vanillaのlight-section座標や
 生成地形の全発光源の正しさを証明するものではない。それらの照合は全体完了条件に残る。
+
+## nibble/byte の基点を vanilla バイトコードで確認（Qの一部）
+
+vanilla `DataLayer`（obf `dvd`）の `javap`（`DataLayer.javap.txt`）から：
+
+- `getIndex(x,y,z) = (y << 8) | (z << 4) | x`
+- バイト位置 = `index >> 1`、nibble shift = `4 * (index & 1)`
+- `get` は `data[index >> 1] >> (4*(index&1)) & 15`
+
+mc-spine の `sky_light_sections_with_spill` は
+`index = (relative_y&15)*128 + lz*8 + lx/2`、`shift = (lx&1)*4` で、
+`(relative_y&15)*128 + lz*8 + lx/2 == ((y<<8)|(z<<4)|x) >> 1`（y=relative_y）。
+**nibble/byte の基点は vanilla と一致する**（静的導出）。
+
+これは光値の基点だけである。**world y → light section の対応（26 section の採り方）と、
+生成地形の全発光源の網羅は未照合**であり、Qの残件として変わらない。
