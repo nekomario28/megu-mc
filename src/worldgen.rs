@@ -252,6 +252,8 @@ pub struct Gen {
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
     feat_c: HashMap<(i32, i32), HashMap<u32, u32>>,
     feat_ord: Vec<(i32, i32)>,
+    deep_c: HashMap<(i32, i32, i32), u32>,
+    deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pop_done: HashSet<(i32, i32)>,
     world_seed: u64,
 }
@@ -356,6 +358,8 @@ impl Gen {
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
             feat_ord: Vec::new(),
+            deep_c: HashMap::new(),
+            deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
             world_seed: seed,
         };
@@ -1516,11 +1520,11 @@ impl Gen {
             if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
                 return if st == u32::MAX { self.def_st } else { st };
             }
-            return self.deep_state_i(x, y, z, &cc);
+            return self.deep_state_cached(x, y, z, &cc);
         }
         match self.aq_state(x, y, z, d) {
             Some(st) => st,
-            None => self.deep_state_i(x, y, z, &cc),
+            None => self.deep_state_cached(x, y, z, &cc),
         }
     }
     /// WORLD_SURFACE_WG-style height (first non-air + 1) at a column.
@@ -1668,13 +1672,26 @@ pub fn default_state() -> u32 {
 pub fn deep_state(x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
     let mut gg = GEN.lock().unwrap();
     match gg.as_mut() {
-        Some(g) => g.deep_state_i(x, y, z, cc),
+        Some(g) => g.deep_state_cached(x, y, z, cc),
         None => 1,
     }
 }
 impl Gen {
     /// in-lock deep rule evaluation (feature layer / tests use this; the free
     /// `deep_state` wrapper locks GEN).
+    /// The material rule below the surface window. Running the rule is the most expensive
+    /// terrain work the feature pass does, and the same cell is read again by the send pass
+    /// (`wg2_block`) immediately after, so the result is memoized here rather than recomputed.
+    pub(crate) fn deep_state_cached(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
+        if let Some(&v) = self.deep_c.get(&(x, y, z)) { return v; }
+        let v = self.deep_state_i(x, y, z, cc);
+        self.deep_c.insert((x, y, z), v);
+        self.deep_ord.push_back((x, y, z));
+        while self.deep_ord.len() > 500_000 {
+            if let Some(old) = self.deep_ord.pop_front() { self.deep_c.remove(&old); }
+        }
+        v
+    }
     pub(crate) fn deep_state_i(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
         let root = match self.surface_rule {
             Some(r) => r,

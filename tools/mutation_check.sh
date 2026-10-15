@@ -312,6 +312,11 @@ check "the frozen population digest notices shared provider changes" \
   '            IP::Uniform(a, b) => (*a + *b) / 2,' \
   feature_population_output_matches_the_pre_refactor_capture
 
+check "the deep-state memo returns the value it computed" \
+  src/worldgen.rs 'if let Some(&v) = self.deep_c.get(&(x, y, z)) { return v; }' \
+  'if self.deep_c.contains_key(&(x, y, z)) { return 0; }' \
+  feature_population_output_matches_the_pre_refactor_capture
+
 check "the queue cap cannot visit a cell before its real backoff" \
   src/main.rs '    backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)' \
   '    backoff().lock().unwrap().get(&(x, y, z)).map(|(_t, _)| true).unwrap_or(true)' \

@@ -26,6 +26,8 @@ Minecraft Java 1.21.1（protocol 767）の超軽量サーバーを作り、観�
 追試で `MC_SPINE_WG=old`（フラット）は **0.34s** だった。データパック地形生成が mc-spine の CPU の
 ほぼ全てで、tick・チャンク配信・I/O のコアは vanilla より遥かに軽い。**M3 の律速は地形生成器**である。
 証拠と限界は [代表負荷比較](../evidence/gameplay/load-compare/README.md) にある。
+feature パスと送信パスが同じ深部 state を再計算していた分を有界メモで共有し、
+同等設定で mc-spine 21s→18.72s（15秒窓）まで縮めたが **x1.12 でまだ遅く、M3 は未達**。
 
 ## 合格条件
 

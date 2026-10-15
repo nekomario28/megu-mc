@@ -101,3 +101,28 @@ view distance・移動スクリプト**で動かし、同じ 20 秒窓の CPU/RS
 **x1.10 未満でノイズ床4%程度**のため、規律（主張しない）に従い**変更を撤回**した。
 `ore_dirt` のコストは楕円体走査の浮動小数演算（vanilla 同等のアルゴリズム）側が支配的で、
 ハッシュの入れ替えでは動かない。M3 の次の対象は楕円体充填のアルゴリズムそのもの。
+
+## feature 後の送信パスが同じ深部 state を再計算していた（実装・M3 は未達のまま）
+
+`deep_state_i`（surface window より下の material rule）は、feature パス（`ctx.get`）と
+送信パス（`wg2_block`）の両方から呼ばれる。同じセルを feature 直後に送信パスがもう一度
+評価していた。結果を `Gen` の有界メモ（50万エントリ、超過は挿入順に破棄）に持ち、
+両パスで共有する。生成結果は不変（凍結 population digest と contract テストが固定、
+変異でメモが定数を返すと digest が赤）。
+
+mc-spine のみの代表負荷（view 4、10秒、`tools/load_client.py`、各組 base→memo 交互）:
+
+| 組 | base CPU(s) | memo CPU(s) | 比 |
+|---|---|---|---|
+| 1 | 15.93 | 14.30 | 1.114 |
+| 2 | 15.77 | 14.39 | 1.096 |
+| 3 | 15.73 | 14.78 | 1.064 |
+
+平均 base 15.81 / memo 14.49 → **約 x1.09**。ノイズ床（4%）は超えるが **x1.10 には届かず、
+M3 の達成としては主張しない**。RSS は +17 MiB（119→137 MiB、vanilla の 1168 MiB より遥かに小）。
+
+同等設定の `tools/load_compare.sh`（15秒窓、view 4）では vanilla 16.74s に対し mc-spine 18.72s
+（**x1.12 でまだ遅い**）。memo 前は約 21s だったので差は縮まったが、**M3 は未達**。
+次の律速は feature パス自体の `deep_state_i`（9チャンクあたり約19万回）で、これは一意な
+セルごとに material rule を評価する。vanilla は生成済み chunk の state を配列で読むため、
+ここを閉じるには生成 state の per-chunk cache（大きな独立スライス）が要る。
