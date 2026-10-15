@@ -1265,6 +1265,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let (x, z) = (7, 7);
+    let original: Vec<(i32, u32)> = (base..=base + 4).map(|y| (y, block_at(x, y, z))).collect();
     for y in base..=base + 4 { set_block(x, y, z, 0); }
     set_block(x, base, z, name_to_state("stone").unwrap());
     set_block(x, base + 3, z, sand);
@@ -1285,6 +1286,80 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     let name = |y: i32| crate::block_registry::breg().unwrap().name_of(block_at(x, y, z)).to_string();
     assert_eq!(name(base + 1), "minecraft:sand", "the first lands on the floor");
     assert_eq!(name(base + 2), "minecraft:sand", "the second must not be destroyed");
+    for (y, st) in original { set_block(x, y, z, st); }
+
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
+
+/// Vanilla's collision uses the block shape, so a falling block passes through a replaceable
+/// block (a flower) and replaces it, rather than resting on top of it.
+#[test]
+fn a_falling_block_passes_through_a_replaceable_block() {
+    let _g = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
+    let reg = crate::block_registry::breg().unwrap();
+    let flower = name_to_state("short_grass")
+        .or_else(|| name_to_state("dandelion"))
+        .expect("a replaceable plant must exist in the asset");
+    assert!(reg.is_replaceable(flower), "the fixture plant must be replaceable");
+    let sand = name_to_state("sand").unwrap();
+    let base = 150;
+    let (x, z) = (9, 9);
+    let original: Vec<(i32, u32)> = (base..=base + 4).map(|y| (y, block_at(x, y, z))).collect();
+    for y in base..=base + 4 { set_block(x, y, z, 0); }
+    set_block(x, base, z, name_to_state("stone").unwrap());
+    set_block(x, base + 1, z, flower);
+    set_block(x, base + 3, z, sand);
+    set_block(x, base + 2, z, 0);
+    assert_eq!(falling().lock().unwrap().len(), 1, "the sand must fall, not rest on the plant");
+    let mut ticks = 0;
+    while !falling().lock().unwrap().is_empty() && ticks < 40 {
+        falling_tick();
+        ticks += 1;
+    }
+    let name = |y: i32| reg.name_of(block_at(x, y, z)).to_string();
+    assert_eq!(name(base + 1), "minecraft:sand", "the sand replaces the plant on the floor");
+    assert!(!reg.in_tag(block_at(x, base + 1, z), "minecraft:replaceable"), "the plant is gone");
+    for (y, st) in original { set_block(x, y, z, st); }
+
+    *falling().lock().unwrap() = old_falling;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
+
+/// A long unsupported column must convert entirely in one pass, not stop at the neighbour-update
+/// recursion bound.
+#[test]
+fn a_long_unsupported_column_converts_in_one_pass() {
+    let _g = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
+    let sand = name_to_state("sand").unwrap();
+    let stone = name_to_state("stone").unwrap();
+    let base = 150;
+    let (x, z) = (13, 9);
+    let height = 30;
+    let original: Vec<(i32, u32)> =
+        (base..=base + height + 2).map(|y| (y, block_at(x, y, z))).collect();
+    for y in base..=base + height + 2 { set_block(x, y, z, 0); }
+    set_block(x, base, z, stone);
+    for i in 1..=height { set_block(x, base + i, z, sand); }
+    assert!(falling().lock().unwrap().is_empty(), "a supported column must not fall yet");
+    set_block(x, base, z, 0);
+    assert_eq!(falling().lock().unwrap().len(), height as usize,
+        "the whole column must become entities in one pass");
+    for (y, st) in original { set_block(x, y, z, st); }
 
     *falling().lock().unwrap() = old_falling;
     *forceloaded().lock().unwrap() = old_forced;

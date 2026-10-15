@@ -4048,7 +4048,9 @@ fn block_updated(x: i32, y: i32, z: i32) {
     sched_invalidate(x, y, z);
     plugin_invalidate(x, y, z);
     let depth = UPD_DEPTH.get();
-    if depth >= 24 { return }
+    // Vanilla has no depth cap on neighbour updates; this bounds recursion while still letting a
+    // long unsupported falling column convert in one pass.
+    if depth >= 64 { return }
     UPD_DEPTH.set(depth + 1);
     let r = block_updated_inner(x, y, z);
     UPD_DEPTH.set(depth);
@@ -4069,7 +4071,10 @@ fn falling() -> &'static Mutex<Vec<Fall>> {
 fn fallable(x: i32, y: i32, z: i32) -> bool {
     let Some(reg) = crate::block_registry::breg() else { return false };
     let st = block_at(x, y, z);
-    reg.is_air(st) || reg.is_liquid(st)
+    // Vanilla's collision uses the block's shape, so air, fluids and blocks a player can replace
+    // (grass, flowers, torches, rails) have no collision shape: a falling block passes through
+    // them and replaces them on landing. `is_replaceable` is the registry's closest predicate.
+    reg.is_air(st) || reg.is_liquid(st) || reg.is_replaceable(st)
 }
 
 /// Queue the block above a change if that change took its support away. Vanilla does this from
@@ -4132,7 +4137,18 @@ fn falling_tick() {
             let new_y = f.y + f.dy;
             let bx = f.x.floor() as i32;
             let bz = f.z.floor() as i32;
-            if new_y < MIN_Y as f64 { despawn.push(f.eid); continue; }
+            if new_y < MIN_Y as f64 {
+                // Below the world vanilla cannot place the block, so it drops it rather than
+                // destroying the item that left the world when the fall started.
+                if let Some(item) = block_drop(f.state) {
+                    drops().lock().unwrap().push(Drop {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        x: f.x, y: f.y, z: f.z, item, cnt: 1, comps: Vec::new(), age: 0,
+                    });
+                }
+                despawn.push(f.eid);
+                continue;
+            }
             let mut support = new_y.floor() as i32;
             while support > MIN_Y && fallable(bx, support, bz) { support -= 1; }
             let top = support + 1;
@@ -4337,7 +4353,12 @@ fn unwrap_world_payload(raw: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     if raw.starts_with(b"SPN") { return Err("unsupported or corrupted save format"); }
     Ok(raw) // existing unwrapped v2.37 format
 }
+/// Serialises saves. The tick autosave and the SIGTERM/SIGINT handler both call `save_world`,
+/// and they share one temporary path; two writers would interleave in it and the envelope would
+/// reject the result.
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 fn save_world() {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // save_world_into only builds the payload; the write happens here so the
     // snapshot stays observational and there is exactly one disk path.
     let mut f = Vec::new();

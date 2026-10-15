@@ -49,20 +49,22 @@
   現状そのまま設置する（vanilla は条件により item 化）。
 - エンティティの bounding box は無い（点として扱う）。横方向の速度も無い（vanilla も 0）。
 
-## 独立レビューで残った乖離（記録）
+## 解決した乖離（独立レビューの指摘）
 
-- `fallable = is_air || is_liquid`。vanilla の衝突はブロックの collision shape を使うため、
-  **花・松明・レール等の置換可能ブロックを通過して着地時に置き換える**。現状はそれらを支持として止まる。
-  `BReg::is_replaceable` という近似の predicate は存在するが、collision shape そのものではない。
-- `MIN_Y` を割ったエンティティは item 化せず破棄する（vanilla は条件により drop）。
-- 着地セルは支持探索がそこを通過した場合だけ fallable を確認する。`floor(new_y)` 自体が
-  非fallable の場合は未確認のまま `set_block` する（通常は衝突で先に止まるため狭い）。
-- `canSurvive` 補正、`levelEvent(2001,…)`、`cancelDrop`、落下ダメージは未実装。
+- **置換可能ブロックの通過**：`fallable = is_air || is_liquid || is_replaceable` にした。
+  花などの置換可能ブロックを通過し、着地時に置き換える。`a_falling_block_passes_through_a_replaceable_block`
+  と変異で固定。
+- **長い柱**：`UPD_DEPTH` を 64 に上げ、30段の支持除去が1回で全段エンティティ化することをテスト。
+- **着地セルの再検査**：バッチ着地は設置直前に `fallable` を再確認し、埋まっていれば上に乗せて次tickで着地する。
+- **下世界のドロップ**：`new_y < MIN_Y` では破棄せず `block_drop` を item 化。
+- **save の直列化**：`SAVE_LOCK` で tick autosave と signal ハンドラの同時書き込みを防ぐ。
 
-- 支持を失った列の変換は近傍更新の再帰深さ `UPD_DEPTH`(24) に律速される。**24段を超える柱**では
-  上限より上のブロックが変換されず宙に残る。上限を上げる変更は落下以外の近傍更新にも及ぶため、
-  vanilla実行オラクル無しでは行わない。
+## なお残る限界
+
 - `note_falling` は `py <= MIN_Y` を skip する（世界底面の重力ブロックは変換しない）。
 - 旧 `FAL1` の変換は記録に状態が無いため `block_at` を読む。オーバーレイに無いセルなら
   地形の `base_state` を持ち上げてしまう（実運用の落下セルはオーバーレイにあるため通常は起きない）。
-- `save_world` 自体の直列化は未検証（tick の autosave と signal ハンドラが同じ tmp へ書ける）。
+- `canSurvive` 補正、`levelEvent(2001,…)`、`cancelDrop`、落下ダメージは未実装。
+  信頼性19種（sand/red_sand/gravel/concrete_powder）は `EntityBlock` でも
+  hurting block でもないので `BlockEntity`/`setHurtsEntities`/`causeFallDamage` は N/A。
+- **同一入力の vanilla 実行照合は未実施**（バイトコード導出のみ）。

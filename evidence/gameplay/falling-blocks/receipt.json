@@ -23,37 +23,34 @@
     "tick_tests::every_falling_block_becomes_an_entity_and_lands",
     "tick_tests::a_falling_block_waits_in_a_cold_chunk",
     "persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip",
-    "persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities"
+    "persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities",
+    "tick_tests::a_falling_block_passes_through_a_replaceable_block",
+    "tick_tests::a_long_unsupported_column_converts_in_one_pass"
   ],
   "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed",
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
-    "rust": "123 passed / 1 pre-existing ignored in 3 thread runs and 1 serial run",
-    "mutants_proved": 29,
+    "rust": "125 passed / 1 pre-existing ignored in 3 thread runs and 1 serial run",
+    "mutants_proved": 31,
     "not_a_gate": 0,
     "parked": 0,
     "skipped": 0,
-    "log_sha256": "7ac935323226fc71b0252485c28f4039127d8a91eb65773976c3440313eddc83"
+    "log_sha256": "6dba60f9889ba4665bc0ebaddf4c9e123f325fb656f6ebc2866964d0e577f0a7"
   },
   "source_hashes": {
-    "src/main.rs": "4f04d4365b8040ca2229521e79b1c3c3d4befb952201e740f98a33a06d7e3f4c",
-    "src/tick_tests.rs": "594bed6ab1900976147490df8f470cd6bbdcc139c4ffcca7a2fb67b91db4fda3",
+    "src/main.rs": "c4675d387dde01ba7e6d60eaa143543b2ba5fa76035ca23aab51f1df81235602",
+    "src/tick_tests.rs": "25e304f7b7e56ecce0254cd69ea84323edb5798d90cbccd6d982ea07ac767f4e",
     "src/persistence_tests.rs": "2c4682b2bba33e6b1ed7667bdba3313982cab38caefc6ec0bbc2267ce61e34b9",
-    "tools/mutation_check.sh": "60d4d07ca91f702d47950e5671de684ec4113456a032fa0774c231d8ee0a1f98",
-    "evidence/gameplay/falling-blocks/README.md": "6f7aaeda71cda2776bd7ccd46603395463a1c03de94043881b993f42e3e3b642",
+    "tools/mutation_check.sh": "ce25b61e27f4979f0d9186a82ed9e3840b44840ac6a997c3eeee05631d9e9cf5",
+    "evidence/gameplay/falling-blocks/README.md": "f9632ba853ae64b0e9bde8ec5e5b99084da229ca521fad44dfc7c2c7c38b7f4b",
     "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
   },
   "limits": [
     "No same-input vanilla runtime comparison yet: the physics is derived from bytecode, not observed from a running vanilla server (Q).",
-    "move collision snap, canSurvive=false alternatives/drops, lava/water, cancelDrop and fall damage are not implemented.",
-    "The entity is a point: no bounding box and no horizontal velocity.",
-    "fallable is air||liquid, so replaceable blocks (flowers, torches) act as support instead of being passed through and replaced.",
-    "Below-world despawn destroys the block without dropping it.",
-    "The landing cell is checked for replaceability only when the support search walked through it.",
-    "Columns taller than the neighbour-update recursion depth (24) leave the blocks above the bound in place.",
     "note_falling skips py <= MIN_Y, so a gravity block at the world floor is not converted.",
     "A legacy FAL1 cell with no overlay entry would materialise the terrain base_state (records carry no state).",
-    "save_world is not serialised against the tick autosave and the signal handler writing the same temp file."
+    "canSurvive correction, levelEvent(2001) and cancelDrop are not implemented; the 19 falling states are neither EntityBlock nor hurting blocks, so BlockEntity/setHurtsEntities/causeFallDamage are N/A.",
+    "The entity is a point: no bounding box."
   ]
 }

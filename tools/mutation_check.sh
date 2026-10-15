@@ -196,6 +196,16 @@ check "a block above a removed support is scheduled" \
   '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
   sand_falls_under_vanilla_gravity_until_it_lands
 
+check "a falling block passes through replaceable blocks" \
+  src/main.rs '    reg.is_air(st) || reg.is_liquid(st) || reg.is_replaceable(st)' \
+  '    reg.is_air(st) || reg.is_liquid(st)' \
+  a_falling_block_passes_through_a_replaceable_block
+
+check "a long unsupported column converts in one pass" \
+  src/main.rs '    if depth >= 64 { return }' \
+  '    if depth >= 24 { return }' \
+  a_long_unsupported_column_converts_in_one_pass
+
 check "a passing entity must not suppress a new block in the same cell" \
   src/main.rs '    if block_at(px, py, pz) != st { return; }' \
   '    if falling().lock().unwrap().iter().any(|f| f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64) { return; }' \
