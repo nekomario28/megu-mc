@@ -20,6 +20,11 @@ Minecraft Java 1.21.1（protocol 767）の超軽量サーバーを作り、観�
 相違を列挙することは調査には必要だが、近似を文書化するだけではvanilla維持の要求を閉じない。
 現状をM1達成や全機能準拠とは扱わない。
 
+代表負荷の初回測定（`tools/load_compare.sh`、20秒窓×3、同一ホスト・同一移動列・圧縮なし）は
+**CPUが mc-spine 21.47s 対 vanilla 16.18s（約x1.33）**、RSSは mc-spine 122 MiB 対 vanilla 1168 MiB だった。
+**M3の「CPUも小さい」は未達**であり、idle の小さいCPU値を軽量の一般則に使わない。
+証拠と限界は [代表負荷比較](../evidence/gameplay/load-compare/README.md) にある。
+
 ## 合格条件
 
 | 条件 | 必要な証拠 |

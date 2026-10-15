@@ -1,0 +1,67 @@
+{
+  "checkpoint": "Q representative-load comparison (first measurement)",
+  "goal": "Measure both servers under a moving viewer with the same seed, world type, view distance and movement script, instead of inferring lightness from an idle run.",
+  "harness": {
+    "script": "tools/load_compare.sh",
+    "driver": "tools/load_client.py",
+    "protocol": "767, compression disabled on both sides",
+    "window_seconds": 20,
+    "runs": 3,
+    "host": "same machine, back-to-back",
+    "views": "vanilla view-distance=4 simulation-distance=5; mc-spine clamps the client's view=4; MC_SPINE_RESOURCE_PACK_URL empty"
+  },
+  "measurements": [
+    {
+      "run": 1,
+      "vanilla_cpu_s": 16.25,
+      "spine_cpu_s": 21.42,
+      "vanilla_rss_mib": 1173.4,
+      "spine_rss_mib": 121.9,
+      "vanilla_threads": 64,
+      "spine_threads": 3,
+      "vanilla_packets": 3768,
+      "spine_packets": 501
+    },
+    {
+      "run": 2,
+      "vanilla_cpu_s": 15.79,
+      "spine_cpu_s": 21.56,
+      "vanilla_rss_mib": 1168.3,
+      "spine_rss_mib": 122.4,
+      "vanilla_threads": 65,
+      "spine_threads": 3,
+      "vanilla_packets": 1213,
+      "spine_packets": 494
+    },
+    {
+      "run": 3,
+      "vanilla_cpu_s": 16.49,
+      "spine_cpu_s": 21.42,
+      "vanilla_rss_mib": 1163.4,
+      "spine_rss_mib": 122.1,
+      "vanilla_threads": 63,
+      "spine_threads": 3,
+      "vanilla_packets": 2533,
+      "spine_packets": 500
+    }
+  ],
+  "means": {
+    "vanilla_cpu_s": 16.18,
+    "spine_cpu_s": 21.47,
+    "cpu_ratio": 1.33,
+    "vanilla_rss_mib": 1168.4,
+    "spine_rss_mib": 122.1,
+    "rss_ratio": 0.104
+  },
+  "finding": "Under a moving viewer mc-spine uses MORE CPU than vanilla (x1.33, above the 4% noise floor and the x1.10 claim threshold) while using about 9.6x less RSS and 21x fewer threads. M3's 'CPU also smaller' is NOT met; the idle CPU number must not be generalized.",
+  "limits": [
+    "not a feature-equal comparison; mc-spine implements less",
+    "movement is teleport-style position updates, not walking physics; packet counts differ, so 'same work' is approximate",
+    "one host, one build, 20 s window, 3 runs; JIT warm-up/GC not controlled",
+    "first representative-load measurement, not the final G1-G4/M1 value and not yet a regression gate"
+  ],
+  "source_hashes": {
+    "tools/load_compare.sh": "be54e728954a396efcf2e0bc6278c2fadb796c211780b87d3ee7b0727ae1d293",
+    "tools/load_client.py": "d79746c847873912686dd1adcffdc85bcc60b7d07fd1e1b91796535de4262c3b"
+  }
+}
