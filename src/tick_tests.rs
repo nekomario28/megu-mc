@@ -315,6 +315,10 @@ fn entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold() {
     let old_tick = TICK.swap(1, Ordering::Relaxed);
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
+    // The first tick's environment stage reads whatever hot set a previous test left behind; pin
+    // it empty so the xp orb is not already hot when this test starts (it is made hot by
+    // refresh_hot on the first tick instead).
+    set_test_region(HashSet::new(), old_warm.clone());
     // Pin the vanilla game-tick values, not just their 4TPS projection.
     assert_eq!(PICKUP_DELAY_GT, 10);
     assert_eq!(DROP_LIFE_GT, 6000);
@@ -1363,7 +1367,9 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0)]);
-    set_test_region(oh.clone(), warm);
+    // Falling does not depend on the hot set, so start from an empty one rather than whatever a
+    // previous test left, and restore the ambient region at the end.
+    set_test_region(HashSet::new(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     // Clear a column down to the world floor, then perch one sand on a support.
@@ -1405,6 +1411,14 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     assert_eq!(live, 1, "the below-world block becomes exactly one item");
     assert!(falling().lock().unwrap().is_empty(), "nothing is left in flight");
 
+    // A snapshot may predate the fall (the block is still on its support), be mid-fall (an entity),
+    // or be after it (the item). Conservation holds in every case: blocks + items == 1.
+    let sand_blocks = || {
+        (MIN_Y..=MIN_Y + 6)
+            .filter(|&y| crate::block_registry::breg().unwrap().name_of(block_at(1, y, 1)).to_string() == "minecraft:sand")
+            .count() as u32
+    };
+    assert_eq!(sand_blocks() + live, 1, "live: block + item is conserved");
     let saved = snapshots_store.lock().unwrap().clone();
     assert!(!saved.is_empty(), "the saver stored a snapshot");
     for (i, snap) in saved.iter().enumerate() {
@@ -1415,7 +1429,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
         let mut t = 0;
         while !falling().lock().unwrap().is_empty() && t < 400 { falling_tick(); t += 1; }
         let n: u32 = drops().lock().unwrap().iter().map(|d| d.cnt as u32).sum();
-        assert_eq!(n, 1, "snapshot {i} loses or duplicates the below-world drop");
+        assert_eq!(sand_blocks() + n, 1, "snapshot {i} loses or duplicates the below-world block");
     }
 
     *world().lock().unwrap() = old_world;

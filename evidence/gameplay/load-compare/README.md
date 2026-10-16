@@ -180,3 +180,22 @@ vanilla 14.39s 対 mc-spine 17.94s（この回は x1.25）で、実行環境の�
 実装するなら「vanilla 準拠方向への出力変更＋再基準化」として独立スライスで行い、
 同一 seed・同一設定で vanilla と地形を照合する。ここでは**測定と記録まで**とし、
 現在の parity-preserving な2段（深部メモ x1.09、ノイズ値キャッシュ x1.056）で止める。
+
+### 実装して測定した結果（撤回）：`interpolated` は M3 の解ではない
+
+bytecode（`NoiseChunk$NoiseInterpolator.compute`、`NoiseSettings.getCellWidth/Height`、`Mth.lerp3`）から
+補間式を確定し、`DF::Interpolated`（セル 4×8×4、8 隅の三線形）を実装して測定した。
+
+- **パリティ**：vanilla の `interpolated` を再現するので、出力は vanilla に近づく。
+  ただし **mc-spine の現在の出力が変わる**（ore vein が変わる：`copper_density` の
+  `present` が 716→777、hash も変化）。「結果を変えない」制約の外。
+- **速度**：feature パスの `populate9` は **399ms → 495–499ms（約 +23%、x0.80）** と遅くなる。
+  理由は mc-spine の評価モデル。vanilla はチャンクをセル単位でストリーム充填するので
+  1 セルの 8 隅を 128 ブロックで共有できる（8/128）。mc-spine の feature パスは
+  `deep_state_i` を**ブロック単位で散発的に**呼ぶため、1 セルあたり約 2.3 ブロックしか
+  問い合わせず、8 隅を **8/2.3 ≈ 3.5 倍**計算してしまう（直接マップ 1<<17 でヒット率 57%）。
+- 純関数ノイズのセル内キャッシュ（x1.056）と合わせても、この追加コストは回収できない。
+
+したがって `interpolated` は **「パリティを保った高速化」ではない**（出力が変わる上に遅い）ので撤回した。
+M3 を閉じるには **セル順の material-rule 評価**（チャンクをセル単位で充填して 8 隅を共有）か
+**worldgen の並列化**という、局所最適化ではない構造変更が必要で、これは独立スライスである。
