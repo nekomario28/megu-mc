@@ -164,5 +164,9 @@ fn a_removed_generated_emitter_stops_lighting() {
     world().lock().unwrap().entry((0, 0)).or_default().insert(local_idx(5, 70, 7), 0);
     let dark = block_light_sections(0, 0, &gen);
     assert_eq!(nib(&dark, 70, 5, 7), 0, "a removed generated emitter must not light again");
+    // Removing the edit re-exposes the cached generated emitter, which must light again.
+    world().lock().unwrap().entry((0, 0)).or_default().remove(&local_idx(5, 70, 7));
+    let back = block_light_sections(0, 0, &gen);
+    assert_eq!(nib(&back, 70, 5, 7), 15, "removing the overlay re-exposes the generated emitter");
     *world().lock().unwrap() = old_world;
 }

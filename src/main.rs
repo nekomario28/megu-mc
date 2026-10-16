@@ -4083,13 +4083,15 @@ fn falling() -> &'static Mutex<Vec<Fall>> {
 
 /// Whether a block can be fallen into. Vanilla replaces air and fluids; the registry's opacity is
 /// the closest thing to hand, and a full block never is.
-fn fallable(x: i32, y: i32, z: i32) -> bool {
+fn fallable_state(st: u32) -> bool {
     let Some(reg) = crate::block_registry::breg() else { return false };
-    let st = block_at(x, y, z);
     // Vanilla's collision uses the block's shape, so air, fluids and blocks a player can replace
     // (grass, flowers, torches, rails) have no collision shape: a falling block passes through
     // them and replaces them on landing. `is_replaceable` is the registry's closest predicate.
     reg.is_air(st) || reg.is_liquid(st) || reg.is_replaceable(st)
+}
+fn fallable(x: i32, y: i32, z: i32) -> bool {
+    fallable_state(block_at(x, y, z))
 }
 
 /// Queue the block above a change if that change took its support away. Vanilla does this from
@@ -4212,12 +4214,11 @@ fn falling_tick() {
     with_save_guard(|| {
         end_falling_tick(&processed, keep);
         for (fa, bx, top, bz) in landings {
-            // The support scan used the pre-tick snapshot. Two entities can reach the same cell in
-            // one tick, and a connection thread can place a block there; placing without this check
-            // would overwrite it and destroy a block. If the cell is taken, keep falling and resolve
-            // again next tick.
-            if fallable(bx, top, bz) {
-                set_block(bx, top, bz, fa.state);
+            // Revalidate and replace the landing cell atomically: a connection thread can
+            // place a block after the check, and `set_block` would overwrite it. The
+            // compare-and-set fails if the cell changed, and the entity rests on top instead.
+            let current = block_at(bx, top, bz);
+            if fallable_state(current) && set_block_if(bx, top, bz, fa.state, Some(current)) {
                 note_block_update(bx, top, bz, fa.state);
                 broadcast_seen_destroy(fa.eid);
             } else {
@@ -9060,14 +9061,13 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                                 w.get(&(wx >> 4, wz >> 4)).and_then(|c| c.get(&local_idx(wx, wy, wz))).copied()
                             };
                             let st = ov.unwrap_or_else(|| base_state(wx, wy, wz));
-                            // Record emitters that come from generated terrain, not from the
-                            // overlay: player-placed and edited emitters are found live by the
-                            // overlay scan, and caching them here would re-light a broken torch.
-                            if ov.is_none() {
-                                if let Some(reg) = reg {
-                                    let lum = reg.luminance_of(st);
-                                    if lum > 0 { gen_sources_here.push(((wx, wy, wz), lum)); }
-                                }
+                            // Record the generated emitter even when an overlay edit covers it:
+                            // removing that edit re-exposes it, and the live-overlay filter in
+                            // `block_light_sections` suppresses it while the edit remains.
+                            if let Some(reg) = reg {
+                                let gen = if ov.is_some() { base_state(wx, wy, wz) } else { st };
+                                let lum = reg.luminance_of(gen);
+                                if lum > 0 { gen_sources_here.push(((wx, wy, wz), lum)); }
                             }
                             // anti-xray + palette compression: buried hidden blocks sent as stone
                             let vis = if is_hidden(st) && ![(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter()

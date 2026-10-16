@@ -62,6 +62,9 @@
 - **着地セルの再検査**：バッチ着地は設置直前に `fallable` を再確認し、埋まっていれば上に乗せて次tickで着地する。
 - **下世界のドロップ**：`new_y < MIN_Y` では破棄せず `block_drop` を item 化。
 - **save の直列化**：`SAVE_LOCK` で tick autosave と signal ハンドラの同時書き込みを防ぐ。
+- **着地セルの原子的確保**：着地は `fallable_state(current) && set_block_if(..., Some(current))` で
+  再検査と書込みを世界ロック下で CAS する。飛行中に接続スレッドが着地セルへ置いたブロックを
+  上書きしない（失敗時は上に乗せて次tickで着地）。
 - **エンティティ化の原子的確保**：`spawn_fall` は check-then-clear ではなく既存の
   `set_block_if(..., Some(st))` で CAS し、実際に外したスレッドだけがエンティティを作る
   （2つの接続が同じブロックを二重に落とさない）。
