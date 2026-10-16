@@ -126,3 +126,15 @@ M3 の達成としては主張しない**。RSS は +17 MiB（119→137 MiB、va
 次の律速は feature パス自体の `deep_state_i`（9チャンクあたり約19万回）で、これは一意な
 セルごとに material rule を評価する。vanilla は生成済み chunk の state を配列で読むため、
 ここを閉じるには生成 state の per-chunk cache（大きな独立スライス）が要る。
+
+## 撤回した最適化：全列の material-rule 事前計算
+
+「深い state も `ChunkCols` 構築時に全列走査して配列に持ち、feature/送信は配列を読む」を試した：
+
+- `chunk_cols` は 9.3→**28.9 ms/chunk**（全列走査は約9.8万 `eval_rule`/chunk）。
+- `feat_populate_perf` の populate9 は 445→**767 ms**（feature パスが `cols` 構築の
+  コストを払うため逆に悪化）。
+
+事前計算は問い合わせ数（feature 深部＋送信で約5万/chunk）の約2倍を常に評価するので、
+lazy な per-cell（現在の `deep_c` メモ）の方が安い。**この案は撤回**。M3 を閉じるには
+「問い合わせたセルだけを dense 配列に lazy cache する」等、別の設計が要る。
