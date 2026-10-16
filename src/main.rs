@@ -3980,10 +3980,8 @@ fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
             || (9225..=9234).contains(&front)                          // hopper
             || signs().lock().unwrap().keys().any(|&(sx, sy, sz, _)| sx == px && sy == py && sz == pz);
         if front != 0 && !immovable && block_at(qx, qy, qz) == 0 {
-            set_block(qx, qy, qz, front);
-            set_block(px, py, pz, head);
-            note_block_update(qx, qy, qz, front);
-            note_block_update(px, py, pz, head);
+            place_block(qx, qy, qz, front);
+            place_block(px, py, pz, head);
         } else if front == 0 {
             set_block(px, py, pz, head);
             note_block_update(px, py, pz, head);

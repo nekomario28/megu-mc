@@ -413,15 +413,39 @@ pub(crate) struct Octave {
     f: f64,
     a: f64,
 }
+/// A direct-mapped, thread-local cache of `Normal::get` values. The material rule reaches the
+/// same noise at the same coordinate several times while evaluating one cell, and the function is
+/// pure, so caching the value is exact. A fixed array (not a hash map) keeps the hit path to a
+/// hash, an index, and one comparison.
+const NCACHE_N: usize = 8192;
+type NKey = (usize, u64, u64, u64);
+thread_local! {
+    static NCACHE: std::cell::RefCell<Vec<(NKey, f64)>> =
+        std::cell::RefCell::new(vec![((0usize, 0, 0, 0), 0.0); NCACHE_N]);
+}
+#[inline]
+fn nhash(k: NKey) -> usize {
+    let mut h = k.0 as u64;
+    h = (h ^ k.1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h = (h ^ k.2).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h = (h ^ k.3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> 32) as usize & (NCACHE_N - 1)
+}
 pub(crate) struct Normal {
     layers: Vec<Octave>,
 }
 impl Normal {
     pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
+        let key = (self as *const Normal as usize, x.to_bits(), y.to_bits(), z.to_bits());
+        let idx = nhash(key);
+        if let Some(v) = NCACHE.with(|c| { let slot = c.borrow()[idx]; if slot.0 == key { Some(slot.1) } else { None } }) {
+            return v;
+        }
         let mut v = 0.0;
         for o in &self.layers {
             v += o.a * o.n.get(x * o.f, y * o.f, z * o.f);
         }
+        NCACHE.with(|c| { c.borrow_mut()[idx] = (key, v); });
         v
     }
 }

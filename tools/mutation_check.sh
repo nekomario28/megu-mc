@@ -347,6 +347,11 @@ check "the deep-state memo returns the value it computed" \
   'if self.deep_c.contains_key(&(x, y, z)) { return 0; }' \
   feature_population_output_matches_the_pre_refactor_capture
 
+check "the noise-value cache returns the value it computed" \
+  src/generation_math.rs 'if slot.0 == key { Some(slot.1) } else { None }' \
+  'if slot.0 == key { Some(slot.1 + 1.0) } else { None }' \
+  feature_population_output_matches_the_pre_refactor_capture
+
 check "the queue cap cannot visit a cell before its real backoff" \
   src/main.rs '    backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)' \
   '    backoff().lock().unwrap().get(&(x, y, z)).map(|(_t, _)| true).unwrap_or(true)' \
