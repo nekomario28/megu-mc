@@ -68,13 +68,15 @@
 - **エンティティ化の原子的確保**：`spawn_fall` は check-then-clear ではなく既存の
   `set_block_if(..., Some(st))` で CAS し、実際に外したスレッドだけがエンティティを作る
   （2つの接続が同じブロックを二重に落とさない）。
-- **配置後の通知は世界の現在状態**：`place_block` は `set_block` の後に `block_at` を通知する。
-  未支持の砂を置くとその場でエンティティ化するが、要求した砂を通知するとクライアントに
-  幽霊ブロックが残る（`placing_unsupported_sand_queues_air_not_a_ghost` と変異で固定）。
-- **世界↔エンティティの遷移と save**：`spawn_fall` と `falling_tick` の着地適用を再入可能な
-  `with_save_guard`（`SAVE_LOCK`）で挟む。signal スレッドの save が「ブロックは消えたが
-  エンティティは未登録」「着地ブロックは置いたがエンティティはまだキュー」という中間状態を
-  見ない（`spawn_fall` は再帰するので最外殻だけがロックする）。
+- **配置後の通知は世界の現在状態**：アイテム配置だけでなく `/setblock`・`/fill`・piston の
+  配置も `place_block` を通し、`set_block` の後に `block_at` を通知する。未支持の砂を置くと
+  その場でエンティティ化するが、要求した砂を通知するとクライアントに幽霊ブロックが残る
+  （`placing_unsupported_sand_queues_air_not_a_ghost` と変異で固定）。
+- **世界↔エンティティの遷移と save**：`spawn_fall` と `falling_tick` の着地適用、および
+  下世界で item 化するドロップの生成を再入可能な `with_save_guard`（`SAVE_LOCK`）で挟む。
+  signal スレッドの save が「ブロックは消えたがエンティティは未登録」「着地ブロックは置いたが
+  エンティティはまだキュー」「ドロップは作ったが飛行中エンティティがまだキュー」という
+  中間状態を見ない（`spawn_fall` は再帰するので最外殻だけがロックする）。
 - **再帰上限を超える柱**：`block_updated` の深さ上限で破棄せず、更新をキューに積んで最外殻から
   反復処理する。64 を超える支持除去柱も1回で全段エンティティ化する
   （`a_long_unsupported_column_converts_in_one_pass` を高さ70にし、変異で固定）。

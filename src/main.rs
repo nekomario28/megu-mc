@@ -2220,10 +2220,8 @@ fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
                 let dest = block_at(qx, qy, qz);
                 let head = 2023 + facing as u32 * 4; // piston_head, normal type
                 if front != 0 && dest == 0 {
-                    set_block(qx, qy, qz, front);
-                    set_block(px, py, pz, head);
-                    note_block_update(qx, qy, qz, front);
-                    note_block_update(px, py, pz, head);
+                    place_block(qx, qy, qz, front);
+                    place_block(px, py, pz, head);
                 } else if front == 0 {
                     set_block(px, py, pz, head);
                     note_block_update(px, py, pz, head);
@@ -4170,6 +4168,9 @@ fn falling_tick() {
     // A landing keeps its entity: the target cell is re-checked at the moment of placement.
     let mut landings: Vec<(Fall, i32, i32, i32)> = Vec::new();
     let mut despawn: Vec<i32> = Vec::new();
+    // Items for entities that fell out of the world: created under the same save guard that
+    // retires the entity, so a snapshot cannot see both and duplicate the drop.
+    let mut below: Vec<Drop> = Vec::new();
     {
         let region = region_guard();
         for mut f in active {
@@ -4198,7 +4199,7 @@ fn falling_tick() {
                 // Below the world vanilla cannot place the block, so it drops it rather than
                 // destroying the item that left the world when the fall started.
                 if let Some(item) = block_drop(f.state) {
-                    drops().lock().unwrap().push(Drop {
+                    below.push(Drop {
                         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                         x: f.x, y: f.y, z: f.z, item, cnt: 1, comps: Vec::new(), age: 0,
                     });
@@ -4212,6 +4213,7 @@ fn falling_tick() {
         }
     }
     with_save_guard(|| {
+        if !below.is_empty() { drops().lock().unwrap().extend(below); }
         end_falling_tick(&processed, keep);
         for (fa, bx, top, bz) in landings {
             // Revalidate and replace the landing cell atomically: a connection thread can
@@ -11128,8 +11130,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             if args.len() >= 4 {
                 let (x, y, z) = (coord(args[0], ctx.x) as i32, coord(args[1], ctx.y) as i32, coord(args[2], ctx.z) as i32);
                 let st = state_from_arg(args[3]).unwrap_or(0);
-                set_block(x, y, z, st);
-                note_block_update(x, y, z, st);
+                place_block(x, y, z, st);
                 format!("Set block at {} {} {}", x, y, z)
             } else { "usage: /setblock x y z <block>".into() }
         }
@@ -11761,8 +11762,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 if total > 32768 { "fill too large".into() } else {
                     let mut n = 0;
                     for x in xa..=xb { for y in ya..=yb { for z in za..=zb {
-                        set_block(x, y, z, st); n += 1;
-                        note_block_update(x, y, z, st);
+                        place_block(x, y, z, st); n += 1;
                     }}}
                     format!("Filled {} blocks", n)
                 }
