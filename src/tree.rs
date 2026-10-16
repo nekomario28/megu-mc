@@ -43,7 +43,7 @@ fn is_air_or_leaves(ctx: &mut FC, p: P3) -> bool {
     let cur = ctx.get(p.0, p.1, p.2);
     reg.is_air(cur) || reg.in_tag(cur, "minecraft:leaves")
 }
-fn set_dirt(ctx: &mut FC, rng: &mut Xor, p: P3, provider: &Option<Box<BSP>>) {
+fn set_dirt(ctx: &mut FC, rng: &mut Xor, p: P3, provider: &Option<Box<Bsp>>) {
     if let Some(bsp) = provider {
         let st = bsp.get(ctx, rng, p.0, p.1, p.2);
         ctx.set(p.0, p.1, p.2, st);
@@ -121,13 +121,14 @@ impl TrunkPl {
     pub fn height(&self, rng: &mut Xor) -> i32 {
         self.base + rng.next_bound(self.a + 1) + rng.next_bound(self.b + 1)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         ctx: &mut FC,
         rng: &mut Xor,
         height: i32,
         start: P3,
-        below_trunk: &Option<Box<BSP>>,
+        below_trunk: &Option<Box<Bsp>>,
         trunk_st: u32,
         extra: &TreeExtra,
     ) -> (Vec<TreeNode>, Vec<P3>) {
@@ -756,6 +757,7 @@ fn leave_pos_invalid(f: &FP, rng: &mut Xor, dx: i32, y: i32, dz: i32, r: i32, gi
     };
     f.invalid(rng, x, y, z, r, giant)
 }
+#[allow(clippy::too_many_arguments)]
 fn gen_square(
     fp: &FP,
     out: &mut Vec<P3>,
@@ -1356,15 +1358,15 @@ pub(crate) enum Deco {
     Creaking(f32),
     Cocoa(f32),
     Beehive(f32),
-    AlterGround(BSP),
+    AlterGround(Bsp),
     PlaceOnGround {
         tries: i32,
         radius: i32,
         height: i32,
-        bsp: BSP,
+        bsp: Bsp,
     },
     AttachedLeaves {
-        bsp: BSP,
+        bsp: Bsp,
         dirs: Vec<u8>,
         excl_xz: i32,
         excl_y: i32,
@@ -1373,7 +1375,7 @@ pub(crate) enum Deco {
     },
     AttachedLogs {
         prob: f32,
-        bsp: BSP,
+        bsp: Bsp,
         dirs: Vec<u8>,
     },
     ShelfMushroom(f32),
@@ -1717,7 +1719,7 @@ impl Deco {
         }
     }
 }
-fn self_circle(ctx: &mut FC, rng: &mut Xor, bsp: &BSP, p: P3) {
+fn self_circle(ctx: &mut FC, rng: &mut Xor, bsp: &Bsp, p: P3) {
     for xx in -2..=2i32 {
         for zz in -2..=2i32 {
             if xx.abs() != 2 || zz.abs() != 2 {
@@ -1726,7 +1728,7 @@ fn self_circle(ctx: &mut FC, rng: &mut Xor, bsp: &BSP, p: P3) {
         }
     }
 }
-fn place_block_at(ctx: &mut FC, rng: &mut Xor, bsp: &BSP, p: P3) {
+fn place_block_at(ctx: &mut FC, rng: &mut Xor, bsp: &Bsp, p: P3) {
     for dy in (-3..=2).rev() {
         let c = (p.0, p.1 + dy, p.2);
         let cur = ctx.get(c.0, c.1, c.2);
@@ -1747,12 +1749,12 @@ fn place_block_at(ctx: &mut FC, rng: &mut Xor, bsp: &BSP, p: P3) {
 
 pub(crate) struct RootP {
     pub trunk_off_y: IP,
-    pub root_bsp: BSP,
+    pub root_bsp: Bsp,
     pub above_chance: Option<f32>,
-    pub above_bsp: Option<BSP>,
+    pub above_bsp: Option<Bsp>,
     pub grow_through: Vec<String>, // #tag or names
     pub muddy_in: Vec<String>,
-    pub muddy_bsp: BSP,
+    pub muddy_bsp: Bsp,
     pub max_w: i32,
     pub max_l: i32,
     pub skew: f32,
@@ -1771,6 +1773,7 @@ impl RootP {
                 }
             })
     }
+    #[allow(clippy::too_many_arguments)]
     fn can_grow(
         &self,
         ctx: &mut FC,
@@ -1879,13 +1882,13 @@ impl RootP {
 
 pub(crate) struct TreeExtra {
     pub min_clipped: Option<i32>,
-    pub below_trunk: Option<Box<BSP>>,
+    pub below_trunk: Option<Box<Bsp>>,
     pub ignore_vines: bool,
     pub min_size: FS,
     pub decorators: Vec<Deco>,
     pub root_placer: Option<RootP>,
-    pub trunk_bsp: BSP,
-    pub foliage_bsp: BSP,
+    pub trunk_bsp: Bsp,
+    pub foliage_bsp: Bsp,
     pub foliage_placer: FP,
     pub foliage_radius: IP,
     pub foliage_offset: IP,
@@ -2315,7 +2318,7 @@ pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
     let (foliage_placer, foliage_radius, foliage_offset) = p_fp(js_pub(j, "foliage_placer")?)?;
     let (min_size, mch) = p_fs(js_pub(j, "minimum_size")?)?;
     let mut decorators = vec![];
-    if let Some(ds) = js_pub(j, "decorators").and_then(|d| d.into_arr()) {
+    if let Some(ds) = js_pub(j, "decorators").and_then(|d| d.as_arr()) {
         for d in ds {
             if let Some(x) = p_deco(d) {
                 decorators.push(x);
@@ -2343,5 +2346,5 @@ pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
 
 use crate::feature::{
     breg, dir_off, is_water_st, jint_pub, jnum_pub, js_pub, jstr_pub, mkprops, p_bsp_pub, p_ip_pub,
-    BSP, FC, IP,
+    Bsp, FC, IP,
 };

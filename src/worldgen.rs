@@ -31,7 +31,7 @@ impl J {
             _ => "",
         }
     }
-    pub(crate) fn into_arr(&self) -> Option<&Vec<J>> {
+    pub(crate) fn as_arr(&self) -> Option<&Vec<J>> {
         match self {
             J::Arr(a) => Some(a),
             _ => None,
@@ -391,11 +391,11 @@ pub(crate) struct Lcg {
 impl Lcg {
     pub(crate) fn new(seed: u64) -> Self {
         Lcg {
-            seed: (seed ^ 0x5DEECE66D) & 0xFF_FFFF_FFFF_FF,
+            seed: (seed ^ 0x5_DEEC_E66D) & 0xFFFF_FFFF_FFFF,
         }
     }
     fn nx(&mut self, bits: u32) -> u64 {
-        self.seed = self.seed.wrapping_mul(0x5DEECE66D).wrapping_add(11) & 0xFF_FFFF_FFFF_FF;
+        self.seed = self.seed.wrapping_mul(0x5_DEEC_E66D).wrapping_add(11) & 0xFFFF_FFFF_FFFF;
         self.seed >> (48 - bits)
     }
     pub(crate) fn next_i32(&mut self) -> i32 {
@@ -482,6 +482,7 @@ fn wrap(x: f64) -> f64 {
 fn smooth(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
+#[allow(clippy::too_many_arguments)]
 fn lerp3(
     a: f64,
     b: f64,
@@ -1246,7 +1247,7 @@ pub struct Gen {
     pub def_st: u32,
     pub def_fl: u32,
     // aquifer (vanilla NoiseBasedAquifer): DF ids + fluid states + caches
-    aq: Option<AQD>,
+    aq: Option<Aqd>,
     aq_lv: HashMap<(i32, i32, i32), (i32, u8)>,
     aq_lvo: Vec<(i32, i32, i32)>,
     aq_near: HashMap<(i32, i32, i32), (i32, i32, i32)>,
@@ -1265,7 +1266,7 @@ pub struct Gen {
     pop_done: HashSet<(i32, i32)>,
     world_seed: u64,
 }
-struct AQD {
+struct Aqd {
     barrier: usize,
     flood: usize,
     spread: usize,
@@ -1491,7 +1492,7 @@ impl Gen {
             if let (Some(barrier), Some(flood), Some(spread), Some(lava), Some(excl)) =
                 (b, f, s, l, e)
             {
-                g.aq = Some(AQD {
+                g.aq = Some(Aqd {
                     barrier,
                     flood,
                     spread,
@@ -1560,7 +1561,7 @@ impl Gen {
         Some(match ty.as_str() {
             "sequence" => Rule::Seq(
                 j.get("sequence")?
-                    .into_arr()?
+                    .as_arr()?
                     .iter()
                     .filter_map(|c| self.rule_node(c, files, rf, cf, res))
                     .collect(),
@@ -1759,7 +1760,7 @@ impl Gen {
     fn parse_spline(&mut self, j: &J, files: &HashMap<String, Vec<u8>>) -> Option<Spl> {
         let coord = self.node(j.get("coordinate")?, files)?;
         let mut pts = Vec::new();
-        for p in j.get("points")?.into_arr()? {
+        for p in j.get("points")?.as_arr()? {
             let loc = p.get("location")?.num();
             let der = p.get("derivative").map(J::num).unwrap_or(0.0);
             let val = match p.get("value")? {
@@ -1843,10 +1844,10 @@ impl Gen {
             "interval_select" => {
                 let mut th = vec![];
                 let mut fns = vec![];
-                for f in j.get("functions")?.into_arr()? {
+                for f in j.get("functions")?.as_arr()? {
                     fns.push(self.node(f, files)?);
                 }
-                for t in j.get("thresholds")?.into_arr()? {
+                for t in j.get("thresholds")?.as_arr()? {
                     th.push(t.num());
                 }
                 DF::IntervalSelect {
@@ -3268,7 +3269,7 @@ enum BT {
 
 fn bt_params(j: &J) -> [[i32; 2]; 7] {
     let mut p = [[0i32; 2]; 7];
-    if let Some(a) = j.get("parameters").and_then(J::into_arr) {
+    if let Some(a) = j.get("parameters").and_then(J::as_arr) {
         for (i, e) in a.iter().take(7).enumerate() {
             p[i][0] = e.get("min").map(J::num).unwrap_or(0.0) as i32;
             p[i][1] = e.get("max").map(J::num).unwrap_or(0.0) as i32;
@@ -3302,7 +3303,7 @@ fn bt_parse(
         Some("branch") => {
             let ch = j
                 .get("subTree")
-                .and_then(J::into_arr)?
+                .and_then(J::as_arr)?
                 .iter()
                 .filter_map(|c| bt_parse(c, names, ids, leaf_ps))
                 .collect();
@@ -4091,7 +4092,8 @@ mod wg_tests {
         ((100, 100, 50), 1),
         ((100, 100, 100), 1),
     ];
-    const AQ_FL: &[((i32, i32, i32), (i32, u8))] = &[
+    type AqFluidCase = ((i32, i32, i32), (i32, u8));
+    const AQ_FL: &[AqFluidCase] = &[
         ((-100, -100, -100), (-32512, 2)),
         ((-100, -100, -50), (-32512, 2)),
         ((-100, -100, 0), (-32512, 2)),
@@ -4218,7 +4220,8 @@ mod wg_tests {
         ((100, 100, 50), (63, 1)),
         ((100, 100, 100), (63, 1)),
     ];
-    const AQ_CD: &[((i32, i32, i32, i32, i32), f64)] = &[
+    type AqCdCase = ((i32, i32, i32, i32, i32), f64);
+    const AQ_CD: &[AqCdCase] = &[
         ((-100, -100, -100, 0, 0), 0.0),
         ((-100, -100, -50, 50, 0), -19.3),
         ((-100, -100, 0, 0, 0), 0.0),
@@ -4345,7 +4348,8 @@ mod wg_tests {
         ((100, 100, 50, 50, 0), -40.4),
         ((100, 100, 100, 0, 0), 0.0),
     ];
-    const AQ_AP: &[((i32, i32, i32, f64), &str)] = &[
+    type AqApCase = ((i32, i32, i32, f64), &'static str);
+    const AQ_AP: &[AqApCase] = &[
         ((112, -100, 64, 0.037482421875), "none"),
         ((112, -100, 66, 0.037482421875), "none"),
         ((112, -100, 68, 0.037482421875), "none"),
@@ -4883,7 +4887,6 @@ mod wg_tests {
             }
             for (tbl, my) in [(AQ_FYT, true), (AQ_FYF, false)] {
                 for &((x, y, z), want) in tbl {
-                    let want = want;
                     let got = g.aq_fluid_y(x, y, z, (0, 1), 80, my);
                     if got != want {
                         miss += 1;
@@ -4899,7 +4902,6 @@ mod wg_tests {
                 }
             }
             for &((x, y, z), (wy, wk)) in AQ_FL {
-                let wy = wy;
                 let got = g.aq_fluid_level_at(x, y, z);
                 if got != (wy, wk) {
                     miss += 1;

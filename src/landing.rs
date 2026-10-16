@@ -13,6 +13,7 @@ pub enum Loader {
 pub struct Trample {
     pub position: (i32, i32, i32),
     pub state: u32,
+    #[cfg_attr(not(feature = "java-compat"), allow(dead_code))]
     pub distance: f32,
 }
 #[cfg(feature = "java-compat")]

@@ -17,6 +17,27 @@ mod feature;
 mod tree;
 mod worldgen;
 
+// Type aliases for the recurring composite shapes (clippy::type_complexity).
+type ChestSession = ((i32, i32, i32), Option<(i32, i32, i32)>);
+type SkinMap = HashMap<String, Option<(String, String)>>;
+type SpawnFn = Box<dyn Fn() -> Vec<(i64, Vec<u8>)> + Send>;
+type EntSnapshot = (i32, f64, f64, f64, SpawnFn);
+type ProjOutcome = (i32, Option<i32>, f64, f64, bool, f64, f64, f64);
+type WorldEdits = HashMap<(i32, i32), HashMap<u32, u32>>;
+type FurnaceMap = HashMap<(i32, i32, i32), Furnace>;
+type ChestMap = HashMap<(i32, i32, i32), HashMap<i16, Stack>>;
+type PosStore = HashMap<String, (f64, f64, f64, f32, f32)>;
+type BackoffMap = HashMap<(i32, i32, i32), (u64, u32)>;
+type PluginCellMap = HashMap<(i32, i32), Vec<PluginCell>>;
+type PendingBlockMap = HashMap<(i32, i32, i32), HashMap<u16, u32>>;
+type BlockEntitySnap = ((i32, i32, i32), i64, Vec<u8>);
+type SignSnap = ((i32, i32, i32, u8), [String; 4]);
+type TradeSpec = (i64, u8, Option<(i64, u8)>, i64, u8);
+type CropMap = HashMap<(i32, i32, i32), u8>;
+type SignMap = HashMap<(i32, i32, i32, u8), [String; 4]>;
+type SmeltList = Vec<(Ingr, i64, u8, f32)>;
+type TagIndex = HashMap<String, HashMap<String, HashSet<String>>>;
+
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
     let mut v = 0i64;
@@ -215,7 +236,7 @@ struct Client {
     inv: Mutex<HashMap<i16, Stack>>,
     cursor: Mutex<Stack>,
     drag: Mutex<(i32, Vec<i16>)>, // (button, painted window slots) for click-mode 5
-    open_chest: Mutex<Option<((i32, i32, i32), Option<(i32, i32, i32)>)>>, // (key/pos, double-chest partner)
+    open_chest: Mutex<Option<ChestSession>>, // (key/pos, double-chest partner)
     open_furnace: Mutex<Option<(i32, i32, i32)>>,
     craft: Mutex<HashMap<i16, Stack>>,
     craft9: Mutex<HashMap<i16, Stack>>,
@@ -260,8 +281,8 @@ fn angle(deg: f32) -> i8 {
     (deg / 360.0 * 256.0) as i8
 }
 
-static SKIN_CACHE: OnceLock<Mutex<HashMap<String, Option<(String, String)>>>> = OnceLock::new();
-fn skin_cache() -> &'static Mutex<HashMap<String, Option<(String, String)>>> {
+static SKIN_CACHE: OnceLock<Mutex<SkinMap>> = OnceLock::new();
+fn skin_cache() -> &'static Mutex<SkinMap> {
     SKIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn fetch_skin(name: &str) -> Option<(String, String)> {
@@ -422,13 +443,7 @@ fn interest_tick() {
     }
     // spawn payloads are built lazily on the visible-transition only —
     // steady-state cost is one distance check per entity per client.
-    let mut ents: Vec<(
-        i32,
-        f64,
-        f64,
-        f64,
-        Box<dyn Fn() -> Vec<(i64, Vec<u8>)> + Send>,
-    )> = Vec::new();
+    let mut ents: Vec<EntSnapshot> = Vec::new();
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
         let m = m.clone();
@@ -2762,7 +2777,7 @@ fn keepalive_time_tick() {
     {
         // snowballs: fly, hit mob -> hurt flash
         let mut sl2 = snowballs().lock().unwrap();
-        let mut done: Vec<(i32, Option<i32>, f64, f64, bool, f64, f64, f64)> = vec![];
+        let mut done: Vec<ProjOutcome> = vec![];
         for p0 in sl2.iter_mut() {
             if !is_hot(p0.x as i32, p0.z as i32) {
                 continue;
@@ -4775,8 +4790,8 @@ fn mob_tick() {
 
 // ---------- world ----------
 // overlay edits: (cx,cz) -> { packed_local_idx -> blockstate }
-static WORLD: OnceLock<Mutex<HashMap<(i32, i32), HashMap<u32, u32>>>> = OnceLock::new();
-fn world() -> &'static Mutex<HashMap<(i32, i32), HashMap<u32, u32>>> {
+static WORLD: OnceLock<Mutex<WorldEdits>> = OnceLock::new();
+fn world() -> &'static Mutex<WorldEdits> {
     WORLD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 struct Furnace {
@@ -4790,12 +4805,12 @@ struct Furnace {
     recipe_cache: CachedLookup<i64, Option<i64>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
-static FURNACES: OnceLock<Mutex<HashMap<(i32, i32, i32), Furnace>>> = OnceLock::new();
-static CROPS: OnceLock<Mutex<HashMap<(i32, i32, i32), u8>>> = OnceLock::new();
-fn crops() -> &'static Mutex<HashMap<(i32, i32, i32), u8>> {
+static FURNACES: OnceLock<Mutex<FurnaceMap>> = OnceLock::new();
+static CROPS: OnceLock<Mutex<CropMap>> = OnceLock::new();
+fn crops() -> &'static Mutex<CropMap> {
     CROPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn furnaces() -> &'static Mutex<HashMap<(i32, i32, i32), Furnace>> {
+fn furnaces() -> &'static Mutex<FurnaceMap> {
     FURNACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // furnace block states 4295..=4302 (facing x lit); one store for
@@ -4921,8 +4936,8 @@ fn fuel_ticks(item: i64) -> i32 {
     }
     0
 }
-static CHESTS: OnceLock<Mutex<HashMap<(i32, i32, i32), HashMap<i16, Stack>>>> = OnceLock::new();
-fn chests() -> &'static Mutex<HashMap<(i32, i32, i32), HashMap<i16, Stack>>> {
+static CHESTS: OnceLock<Mutex<ChestMap>> = OnceLock::new();
+fn chests() -> &'static Mutex<ChestMap> {
     CHESTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 static INV_STORE: OnceLock<Mutex<HashMap<String, HashMap<i16, Stack>>>> = OnceLock::new();
@@ -4930,8 +4945,8 @@ fn inv_store() -> &'static Mutex<HashMap<String, HashMap<i16, Stack>>> {
     INV_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // name -> (x,y,z,yaw,pitch): vanilla respawns a player where they left
-static POS_STORE: OnceLock<Mutex<HashMap<String, (f64, f64, f64, f32, f32)>>> = OnceLock::new();
-fn pos_store() -> &'static Mutex<HashMap<String, (f64, f64, f64, f32, f32)>> {
+static POS_STORE: OnceLock<Mutex<PosStore>> = OnceLock::new();
+fn pos_store() -> &'static Mutex<PosStore> {
     POS_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 const MIN_Y: i32 = -64;
@@ -5395,8 +5410,8 @@ fn is_warm(x: i32, z: i32) -> bool {
 // a cell that produces no observable change doubles its re-check interval
 // up to 16 ticks (4 s); any neighbor block change invalidates it back to
 // full rate. Event-driven reset + exponential backoff, not polling.
-static BACKOFF: OnceLock<Mutex<HashMap<(i32, i32, i32), (u64, u32)>>> = OnceLock::new();
-fn backoff() -> &'static Mutex<HashMap<(i32, i32, i32), (u64, u32)>> {
+static BACKOFF: OnceLock<Mutex<BackoffMap>> = OnceLock::new();
+fn backoff() -> &'static Mutex<BackoffMap> {
     BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
 }
 static TICK_IDX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5528,10 +5543,10 @@ struct PluginCell {
     warm_ok: bool,
 }
 type CellKey = (usize, i32, i32, i32, u32);
-static PLUGIN_CELLS: OnceLock<Mutex<HashMap<(i32, i32), Vec<PluginCell>>>> = OnceLock::new();
+static PLUGIN_CELLS: OnceLock<Mutex<PluginCellMap>> = OnceLock::new();
 static PLUGIN_BACKOFF: OnceLock<Mutex<HashMap<CellKey, (u64, u8)>>> = OnceLock::new();
 static PLUGINS: OnceLock<Mutex<Vec<Box<dyn Plugin>>>> = OnceLock::new();
-fn plugin_cells() -> &'static Mutex<HashMap<(i32, i32), Vec<PluginCell>>> {
+fn plugin_cells() -> &'static Mutex<PluginCellMap> {
     PLUGIN_CELLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn plugin_backoff() -> &'static Mutex<HashMap<CellKey, (u64, u8)>> {
@@ -5676,9 +5691,8 @@ impl Plugin for GrowthLamp {
 
 // per-tick block-change batching (vanilla multi_block_change, 0x49):
 // N individual block_change packets -> 1 packet per touched section.
-static PENDING_BLOCKS: OnceLock<Mutex<HashMap<(i32, i32, i32), HashMap<u16, u32>>>> =
-    OnceLock::new();
-fn pending_blocks() -> &'static Mutex<HashMap<(i32, i32, i32), HashMap<u16, u32>>> {
+static PENDING_BLOCKS: OnceLock<Mutex<PendingBlockMap>> = OnceLock::new();
+fn pending_blocks() -> &'static Mutex<PendingBlockMap> {
     PENDING_BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
@@ -10213,6 +10227,9 @@ fn name_to_etype(n: &str) -> Option<i64> {
 }
 
 // ---------- resource pack (embedded http + sha1) ----------
+// Message-schedule reads four earlier lanes (i-3, i-8, i-14, i-16), so an
+// index loop is the honest shape here.
+#[allow(clippy::needless_range_loop)]
 fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
     let ml = (data.len() as u64) * 8;
@@ -11127,10 +11144,10 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
         let nlongs = 4096 / per + if 4096 % per != 0 { 1 } else { 0 };
         write_varint(&mut v, nlongs as i64);
         let mut longs = vec![0u64; nlongs];
-        for i in 0..4096 {
+        for (i, &id) in idx.iter().enumerate().take(4096) {
             let li = i / per;
             let off = (i % per) * bpe;
-            longs[li] |= (idx[i] as u64) << off;
+            longs[li] |= (id as u64) << off;
         }
         for l in longs {
             v.extend_from_slice(&l.to_be_bytes());
@@ -11282,10 +11299,10 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     v.extend_from_slice(&37i32.to_be_bytes());
     let per = 64 / 9;
     let mut longs = vec![0u64; 37];
-    for i in 0..256usize {
+    for (i, &top) in tops.iter().enumerate().take(256) {
         let li = i / per;
         let off = (i % per) * 9;
-        let val = (tops[i] - MIN_Y).max(0) as u64; // tops already = top y+1; stored relative to min_y
+        let val = (top - MIN_Y).max(0) as u64; // tops already = top y+1; stored relative to min_y
         if li < 37 {
             longs[li] |= (val & 0x1ff) << off;
         }
@@ -11313,7 +11330,7 @@ fn map_chunk(cx: i32, cz: i32) -> Vec<u8> {
     p.extend_from_slice(&data);
     // block entities ride inside the chunk packet in vanilla — signs
     // would otherwise render blank until edited after each chunk load
-    let be: Vec<((i32, i32, i32), i64, Vec<u8>)> = {
+    let be: Vec<BlockEntitySnap> = {
         let sg = signs().lock().unwrap();
         sg.iter()
             .filter(|(&(x, _, z, _), _)| x >> 4 == cx && z >> 4 == cz)
@@ -11401,7 +11418,7 @@ fn stream_chunks(
         if send_packet(s, 0x27, map_chunk(*cx, *cz)).is_err() {
             return;
         }
-        let snap: Vec<((i32, i32, i32, u8), [String; 4])> = signs()
+        let snap: Vec<SignSnap> = signs()
             .lock()
             .unwrap()
             .iter()
@@ -11474,7 +11491,7 @@ fn slot_wire(s: &Stack) -> Vec<u8> {
     p
 }
 // villager trades: (input item name, count, optional second input, output name, count)
-fn trades() -> Vec<(i64, u8, Option<(i64, u8)>, i64, u8)> {
+fn trades() -> Vec<TradeSpec> {
     let mut v = Vec::new();
     for (a, ac, b, c, cc) in [
         ("wheat", 20u8, None, "emerald", 1u8),
@@ -11877,44 +11894,51 @@ fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) 
     // merge only when components match too (vanilla: stacks with different NBT never merge)
     let mergeable = |a: &Stack, b: &Stack| a.0 == b.0 && a.2 == b.2;
     if btn == 0 {
-        if cv.1 == 0 && sv.is_some() {
-            *cur = sv.unwrap();
-            m.remove(&slot);
-        } else if cv.1 > 0 && sv.is_none() {
-            m.insert(slot, cv);
-            *cur = empty;
-        } else if cv.1 > 0 && sv.is_some() {
-            let svv = sv.unwrap();
-            let room = stack_max_of(&svv) - svv.1 as i64;
-            if mergeable(&svv, &cv) && room >= cv.1 as i64 {
-                m.insert(slot, (svv.0, svv.1 + cv.1, svv.2));
-                *cur = empty;
-            } else {
-                m.insert(slot, cv);
+        match sv {
+            Some(svv) if cv.1 == 0 => {
                 *cur = svv;
-            }
-        }
-    } else if btn == 1 {
-        if cv.1 == 0 && sv.is_some() {
-            let (si, sc, cps) = sv.unwrap();
-            let take = sc - sc / 2;
-            *cur = (si, take, cps.clone());
-            if sc - take == 0 {
                 m.remove(&slot);
-            } else {
-                m.insert(slot, (si, sc - take, cps));
             }
-        } else if cv.1 > 0 {
-            if sv.is_none() {
-                m.insert(slot, (cv.0, 1, cv.2.clone()));
-                *cur = (cv.0, cv.1 - 1, cv.2);
-            } else {
-                let svv = sv.unwrap();
-                if mergeable(&svv, &cv) && svv.1 < stack_max_of(&svv) as u8 {
-                    m.insert(slot, (svv.0, svv.1 + 1, svv.2));
-                    *cur = (cv.0, cv.1 - 1, cv.2);
+            None if cv.1 > 0 => {
+                m.insert(slot, cv);
+                *cur = empty;
+            }
+            Some(svv) if cv.1 > 0 => {
+                let room = stack_max_of(&svv) - svv.1 as i64;
+                if mergeable(&svv, &cv) && room >= cv.1 as i64 {
+                    m.insert(slot, (svv.0, svv.1 + cv.1, svv.2));
+                    *cur = empty;
+                } else {
+                    m.insert(slot, cv);
+                    *cur = svv;
                 }
             }
+            _ => {}
+        }
+    } else if btn == 1 {
+        match sv {
+            Some((si, sc, cps)) if cv.1 == 0 => {
+                let take = sc - sc / 2;
+                *cur = (si, take, cps.clone());
+                if sc - take == 0 {
+                    m.remove(&slot);
+                } else {
+                    m.insert(slot, (si, sc - take, cps));
+                }
+            }
+            sv if cv.1 > 0 => match sv {
+                None => {
+                    m.insert(slot, (cv.0, 1, cv.2.clone()));
+                    *cur = (cv.0, cv.1 - 1, cv.2);
+                }
+                Some(svv) => {
+                    if mergeable(&svv, &cv) && svv.1 < stack_max_of(&svv) as u8 {
+                        m.insert(slot, (svv.0, svv.1 + 1, svv.2));
+                        *cur = (cv.0, cv.1 - 1, cv.2);
+                    }
+                }
+            },
+            _ => {}
         }
     }
 }
@@ -12072,7 +12096,7 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
         if pw > dim || ph > dim {
             continue;
         }
-        'off: for oy in 0..=(dim - ph) {
+        for oy in 0..=(dim - ph) {
             for ox in 0..=(dim - pw) {
                 let mut ok = true;
                 for gy in 0..dim {
@@ -12116,7 +12140,6 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
                 if ok {
                     return Some((r.out, r.out_cnt, Vec::new()));
                 }
-                continue 'off;
             }
         }
     }
@@ -12447,8 +12470,8 @@ fn food_value(item: i64) -> i32 {
     0
 }
 
-static SIGNS: OnceLock<Mutex<HashMap<(i32, i32, i32, u8), [String; 4]>>> = OnceLock::new();
-fn signs() -> &'static Mutex<HashMap<(i32, i32, i32, u8), [String; 4]>> {
+static SIGNS: OnceLock<Mutex<SignMap>> = OnceLock::new();
+fn signs() -> &'static Mutex<SignMap> {
     SIGNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn nbt_named_str(v: &mut Vec<u8>, name: &str, val: &str) {
@@ -13494,13 +13517,15 @@ fn json_recipes() -> &'static Mutex<Vec<JsonRecipe>> {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 // datapack furnace recipes: smelting/blasting/smoking/campfire_cooking
-fn json_smelts() -> &'static Mutex<Vec<(Ingr, i64, u8, f32)>> {
-    static R: OnceLock<Mutex<Vec<(Ingr, i64, u8, f32)>>> = OnceLock::new();
+fn json_smelts() -> &'static Mutex<SmeltList> {
+    static R: OnceLock<Mutex<SmeltList>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 // datapack entity loot tables: data/<ns>/loot_table[s]/entities/<mob>.json
 // loot functions / item modifiers: the bounded subset with a real
 // consumer here. set_count folds into min/max at parse time.
+// Variants mirror the vanilla loot-function names (set_name, set_lore, ...).
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone)]
 enum LootFunc {
     SetName(String),
@@ -13816,8 +13841,8 @@ fn send_attrs(c: &Arc<Client>) {
         let _ = send_packet(&mut w, 0x75, p);
     }
 }
-fn adv_prog() -> &'static Mutex<HashMap<String, HashMap<String, HashSet<String>>>> {
-    static R: OnceLock<Mutex<HashMap<String, HashMap<String, HashSet<String>>>>> = OnceLock::new();
+fn adv_prog() -> &'static Mutex<TagIndex> {
+    static R: OnceLock<Mutex<TagIndex>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // event -> mark matching criteria, grant when ALL criteria done, announce
@@ -14666,7 +14691,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 p.extend_from_slice(&a.to_be_bytes()); p.extend_from_slice(&b.to_be_bytes()); p.extend_from_slice(&c.to_be_bytes());
                 let mut n = 0;
                 for e in &targets {
-                    if let Some(c2) = { clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned() } {
+                    let c2_opt = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                                        if let Some(c2) = c2_opt {
                         if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, 0x66, p.clone()); n += 1; }
                     }
                 }
@@ -14679,7 +14705,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let payload = chat_nbt(&txt);
             let mut n = 0;
             for e in &targets {
-                if let Some(c2) = { clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned() } {
+                let c2_opt = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                                        if let Some(c2) = c2_opt {
                     if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, pkt_id, payload.clone()); n += 1; }
                 }
             }
@@ -14770,7 +14797,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let payload = json_component_nbt(&args[1..].join(" "));
             let mut n = 0;
             for e in &targets {
-                if let Some(c) = { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned() } {
+                let c_opt = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                                        if let Some(c) = c_opt {
                     let mut p = payload.clone(); p.push(0);
                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6c, p); n += 1; }
                 }
@@ -14783,7 +14811,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let snd = args.get(2).copied().unwrap_or("");
             let mut n = 0;
             for e in &targets {
-                if let Some(c) = { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned() } {
+                let c_opt = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                                        if let Some(c) = c_opt {
                     let mut p = Vec::new();
                     if snd.is_empty() { p.push(0u8); }
                     else { p.push(2u8);
@@ -15757,8 +15786,7 @@ fn handle(mut s: TcpStream) {
                             enchant_level(&i2.get(&(36 + held_slot)).map(|v| v.2.clone()).unwrap_or_default(), 29) };
                         let can_fire = if hit == 801 { charge_t >= 0.1 }
                             else { draw_t >= 1.25 - 0.25 * (qc as f32).min(5.0) };
-                        if (hit == 801 || hit == 1192) && arrow_slot.is_some() && can_fire {
-                            let asl = arrow_slot.unwrap();
+                        if let Some(asl) = arrow_slot.filter(|_| (hit == 801 || hit == 1192) && can_fire) {
                             let pow_f = (charge_t * charge_t + 2.0 * charge_t) / 3.0;
                             let inf = { let i2 = me.inv.lock().unwrap();
                                 enchant_level(&i2.get(&(36 + held_slot)).map(|v| v.2.clone()).unwrap_or_default(), 16) > 0 };
@@ -15927,8 +15955,8 @@ fn handle(mut s: TcpStream) {
                         7511 | 7512 => Some((806, 72)), // emerald -> emerald_ore
                         _ => None,
                     };
-                    let (drop_item, drop_cnt) = if silk && ore.is_some() {
-                        (Some(ore.unwrap().1), 1)
+                    let (drop_item, drop_cnt) = if let Some(o) = ore.filter(|_| silk) {
+                        (Some(o.1), 1)
                     } else {
                         let it = match old {
                             127 | 128 => Some(803),
@@ -16813,23 +16841,28 @@ fn handle(mut s: TcpStream) {
                                     let sv = gmap.get(&gslot).cloned();
                                     let cv = cur.clone();
                                     if btn == 0 {
-                                        if cv.1 == 0 && sv.is_some() { *cur = sv.unwrap(); gmap.remove(&gslot); }
-                                        else if cv.1 > 0 && sv.is_none() { gmap.insert(gslot, cv); *cur = (0, 0, Vec::new()); }
-                                        else if cv.1 > 0 && sv.is_some() {
-                                            let (si, sc, _cc) = sv.unwrap();
-                                            if si == cv.0 && _cc == cv.2 && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc) { gmap.insert(gslot, (si, sc + cv.1, _cc)); *cur = (0, 0, Vec::new()); }
-                                            else { gmap.insert(gslot, cv); *cur = (si, sc, _cc); }
+                                        match sv {
+                                            Some(svv) if cv.1 == 0 => { *cur = svv; gmap.remove(&gslot); }
+                                            None if cv.1 > 0 => { gmap.insert(gslot, cv); *cur = (0, 0, Vec::new()); }
+                                            Some((si, sc, _cc)) if cv.1 > 0 => {
+                                                if si == cv.0 && _cc == cv.2 && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc) { gmap.insert(gslot, (si, sc + cv.1, _cc)); *cur = (0, 0, Vec::new()); }
+                                                else { gmap.insert(gslot, cv); *cur = (si, sc, _cc); }
+                                            }
+                                            _ => {}
                                         }
                                     } else if btn == 1 {
-                                        if cv.1 == 0 && sv.is_some() {
-                                            let (si, sc, _cc) = sv.unwrap();
-                                            let take = sc - sc / 2;
-                                            *cur = (si, take, _cc.clone());
-                                            if sc - take == 0 { gmap.remove(&gslot); } else { gmap.insert(gslot, (si, sc - take, _cc)); }
-                                        } else if cv.1 > 0 {
-                                            if sv.is_none() { gmap.insert(gslot, (cv.0, 1, cv.2.clone())); *cur = (cv.0, cv.1 - 1, cv.2); }
-                                            else { let (si, sc, _cc) = sv.unwrap();
-                                                if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 { gmap.insert(gslot, (si, sc + 1, _cc)); *cur = (cv.0, cv.1 - 1, cv.2); } }
+                                        match sv {
+                                            Some((si, sc, _cc)) if cv.1 == 0 => {
+                                                let take = sc - sc / 2;
+                                                *cur = (si, take, _cc.clone());
+                                                if sc - take == 0 { gmap.remove(&gslot); } else { gmap.insert(gslot, (si, sc - take, _cc)); }
+                                            }
+                                            sv if cv.1 > 0 => match sv {
+                                                None => { gmap.insert(gslot, (cv.0, 1, cv.2.clone())); *cur = (cv.0, cv.1 - 1, cv.2); }
+                                                Some((si, sc, _cc)) => {
+                                                    if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 { gmap.insert(gslot, (si, sc + 1, _cc)); *cur = (cv.0, cv.1 - 1, cv.2); } }
+                                            },
+                                            _ => {}
                                         }
                                     }
                                     let (it, c2, _cc) = gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
@@ -16872,23 +16905,28 @@ fn handle(mut s: TcpStream) {
                                         let sv = if m.1 == 0 { None } else { Some(m.clone()) };
                                         let cv = cur.clone();
                                         if btn == 0 {
-                                            if cv.1 == 0 && sv.is_some() { *cur = sv.unwrap(); *m = (0, 0, Vec::new()); }
-                                            else if cv.1 > 0 && sv.is_none() { *m = cv; *cur = (0, 0, Vec::new()); }
-                                            else if cv.1 > 0 && sv.is_some() {
-                                                let (si, sc, _cc) = sv.unwrap();
-                                                if si == cv.0 && _cc == cv.2 && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc) { *m = (si, sc + cv.1, _cc); *cur = (0, 0, Vec::new()); }
-                                                else { *m = cv; *cur = (si, sc, _cc); }
+                                            match sv {
+                                                Some(svv) if cv.1 == 0 => { *cur = svv; *m = (0, 0, Vec::new()); }
+                                                None if cv.1 > 0 => { *m = cv; *cur = (0, 0, Vec::new()); }
+                                                Some((si, sc, _cc)) if cv.1 > 0 => {
+                                                    if si == cv.0 && _cc == cv.2 && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc) { *m = (si, sc + cv.1, _cc); *cur = (0, 0, Vec::new()); }
+                                                    else { *m = cv; *cur = (si, sc, _cc); }
+                                                }
+                                                _ => {}
                                             }
                                         } else if btn == 1 {
-                                            if cv.1 == 0 && sv.is_some() {
-                                                let (si, sc, _cc) = sv.unwrap();
-                                                let take = sc - sc / 2;
-                                                *cur = (si, take, _cc.clone());
-                                                if sc - take == 0 { *m = (0, 0, Vec::new()); } else { *m = (si, sc - take, _cc); }
-                                            } else if cv.1 > 0 {
-                                                if sv.is_none() { *m = (cv.0, 1, cv.2.clone()); *cur = (cv.0, cv.1 - 1, cv.2); }
-                                                else { let (si, sc, _cc) = sv.unwrap();
-                                                    if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 { *m = (si, sc + 1, _cc); *cur = (cv.0, cv.1 - 1, cv.2); } }
+                                            match sv {
+                                                Some((si, sc, _cc)) if cv.1 == 0 => {
+                                                    let take = sc - sc / 2;
+                                                    *cur = (si, take, _cc.clone());
+                                                    if sc - take == 0 { *m = (0, 0, Vec::new()); } else { *m = (si, sc - take, _cc); }
+                                                }
+                                                sv if cv.1 > 0 => match sv {
+                                                    None => { *m = (cv.0, 1, cv.2.clone()); *cur = (cv.0, cv.1 - 1, cv.2); }
+                                                    Some((si, sc, _cc)) => {
+                                                        if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 { *m = (si, sc + 1, _cc); *cur = (cv.0, cv.1 - 1, cv.2); } }
+                                                },
+                                                _ => {}
                                             }
                                         }
                                         f.dirty = true;
@@ -18440,19 +18478,17 @@ fn main() {
     let l = TcpListener::bind(("0.0.0.0", port)).unwrap();
     eprintln!("mc-spine v0.6 listening :{}", port);
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    for st in l.incoming() {
-        if let Ok(s) = st {
-            // connection cap: refuse above 64 live handler threads
-            if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 64 {
-                ACTIVE.fetch_sub(1, Ordering::SeqCst);
-                drop(s);
-                continue;
-            }
-            thread::spawn(move || {
-                handle(s);
-                ACTIVE.fetch_sub(1, Ordering::SeqCst);
-            });
+    for s in l.incoming().flatten() {
+        // connection cap: refuse above 64 live handler threads
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 64 {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            drop(s);
+            continue;
         }
+        thread::spawn(move || {
+            handle(s);
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 

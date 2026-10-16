@@ -45,7 +45,7 @@ fn jbool(j: &J, k: &str, d: bool) -> bool {
     }
 }
 fn jarr<'a>(j: &'a J, k: &str) -> Option<&'a Vec<J>> {
-    js(j, k).and_then(|v| v.into_arr())
+    js(j, k).and_then(|v| v.as_arr())
 }
 fn ns_name(s: &str) -> String {
     if s.contains(':') {
@@ -91,10 +91,10 @@ const FL_SOLID: u16 = 1 << 6;
 impl BReg {
     fn load() -> Option<BReg> {
         let md = jparse(&std::fs::read("assets/blocks_1211.json").ok()?)?
-            .into_arr()?
+            .as_arr()?
             .clone();
         let pb = jparse(&std::fs::read("assets/pblocks.json").ok()?)?;
-        let pb_blocks = pb.get("blocks")?.into_arr()?;
+        let pb_blocks = pb.get("blocks")?.as_arr()?;
         let mut pb_by_name: HashMap<String, &J> = HashMap::new();
         for b in pb_blocks {
             pb_by_name.insert(format!("minecraft:{}", jstr(b, "name")?), b);
@@ -313,11 +313,7 @@ impl BReg {
                 .map(|q| q.vals.len().max(1) as u64)
                 .product();
             let len = p.vals.len().max(1) as u64;
-            let digit = if mult > 0 {
-                (off as u64 / mult) % len
-            } else {
-                0
-            };
+            let digit = (off as u64).checked_div(mult).map_or(0, |d| d % len);
             if let Some(nd) = p.vals.iter().position(|v| v == val) {
                 let o = off as u64 + (nd as u64 + len - digit) % len * mult;
                 return self.st_lo[bi as usize] + o as u32;
@@ -339,11 +335,7 @@ impl BReg {
                 .map(|q| q.vals.len().max(1) as u64)
                 .product();
             let len = p.vals.len().max(1) as u64;
-            let d = if mult > 0 {
-                (off as u64 / mult) % len
-            } else {
-                0
-            };
+            let d = (off as u64).checked_div(mult).map_or(0, |q| q % len);
             return p.vals.get(d as usize).cloned();
         }
         None
@@ -614,7 +606,7 @@ fn p_hp(j: &J) -> Option<HP> {
 
 // ---------- block state providers ----------
 
-pub(crate) enum BSP {
+pub(crate) enum Bsp {
     Simple(u32),
     Rotated {
         base: u32,
@@ -622,7 +614,7 @@ pub(crate) enum BSP {
     },
     Weighted(Vec<(i32, u32)>),
     RandomInt {
-        src: Box<BSP>,
+        src: Box<Bsp>,
         prop: String,
         vals: Vec<i32>,
     },
@@ -649,8 +641,8 @@ pub(crate) enum BSP {
         states: Vec<u32>,
     },
     RuleBased {
-        fb: Option<Box<BSP>>,
-        rules: Vec<(Pr, BSP)>,
+        fb: Option<Box<Bsp>>,
+        rules: Vec<(Pr, Bsp)>,
     },
 }
 fn noise_state(states: &[u32], v: f64) -> u32 {
@@ -658,11 +650,11 @@ fn noise_state(states: &[u32], v: f64) -> u32 {
     let val = ((1.0 + v) / 2.0).clamp(0.0, 0.9999);
     states[(val * states.len() as f64) as usize]
 }
-impl BSP {
+impl Bsp {
     pub(crate) fn get(&self, ctx: &mut FC, r: &mut Xor, x: i32, y: i32, z: i32) -> u32 {
         match self {
-            BSP::Simple(s) => *s,
-            BSP::Rotated { base, axis } => {
+            Bsp::Simple(s) => *s,
+            Bsp::Rotated { base, axis } => {
                 if !*axis {
                     *base
                 } else {
@@ -676,7 +668,7 @@ impl BSP {
                         .unwrap_or(*base)
                 }
             }
-            BSP::Weighted(list) => {
+            Bsp::Weighted(list) => {
                 let total: i32 = list.iter().map(|(w, _)| (*w).max(0)).sum();
                 if total <= 0 {
                     return list.first().map(|e| e.1).unwrap_or(0);
@@ -690,7 +682,7 @@ impl BSP {
                 }
                 list.last().unwrap().1
             }
-            BSP::RandomInt { src, prop, vals } => {
+            Bsp::RandomInt { src, prop, vals } => {
                 let st = src.get(ctx, r, x, y, z);
                 if !vals.is_empty() {
                     let i = r.next_bound(vals.len() as i32) as usize;
@@ -700,14 +692,14 @@ impl BSP {
                 }
                 st
             }
-            BSP::Noise { n, scale, states } => {
+            Bsp::Noise { n, scale, states } => {
                 if states.is_empty() {
                     return 0;
                 }
                 let v = n.get(x as f64 * scale, y as f64 * scale, z as f64 * scale);
                 noise_state(states, v)
             }
-            BSP::NoiseThr {
+            Bsp::NoiseThr {
                 n,
                 scale,
                 thr,
@@ -728,7 +720,7 @@ impl BSP {
                 }
                 *def
             }
-            BSP::Dual {
+            Bsp::Dual {
                 n,
                 scale,
                 variety,
@@ -757,7 +749,7 @@ impl BSP {
                 let v = n.get(x as f64 * scale, y as f64 * scale, z as f64 * scale);
                 noise_state(sub, v)
             }
-            BSP::RuleBased { fb, rules } => {
+            Bsp::RuleBased { fb, rules } => {
                 if let Some(reg) = breg() {
                     for (cond, prov) in rules {
                         if test_pred(cond, reg, ctx, x, y, z) {
@@ -795,13 +787,13 @@ fn st_list(j: &J, k: &str) -> Vec<u32> {
     }
     out
 }
-pub(crate) fn p_bsp_pub(j: &J) -> Option<BSP> {
+pub(crate) fn p_bsp_pub(j: &J) -> Option<Bsp> {
     p_bsp(j)
 }
-fn p_bsp(j: &J) -> Option<BSP> {
+fn p_bsp(j: &J) -> Option<Bsp> {
     if let Some((n, p)) = bs_parts(j) {
         if js(j, "type").is_none() || js(j, "id").is_some() && jstr(j, "type").is_none() {
-            return Some(BSP::Simple(breg()?.state_of(&n, p)));
+            return Some(Bsp::Simple(breg()?.state_of(&n, p)));
         }
     }
     let ty = jstr(j, "type")?;
@@ -811,7 +803,7 @@ fn p_bsp(j: &J) -> Option<BSP> {
         "rotated_block_provider" => {
             // vanilla RotatedBlockProvider randomizes the axis
             let (n, p) = bs_parts(js(j, "state")?)?;
-            BSP::Rotated {
+            Bsp::Rotated {
                 base: breg()?.state_of(&n, p),
                 axis: reg_props_axis(&n).is_some(),
             }
@@ -823,7 +815,7 @@ fn p_bsp(j: &J) -> Option<BSP> {
                 let (n, p) = bs_parts(js(e, "data")?)?;
                 v.push((w, breg()?.state_of(&n, p)));
             }
-            BSP::Weighted(v)
+            Bsp::Weighted(v)
         }
         "randomized_int_state_provider" => {
             let mut vals = vec![];
@@ -832,20 +824,20 @@ fn p_bsp(j: &J) -> Option<BSP> {
                     vals.push(v.num() as i32);
                 }
             }
-            BSP::RandomInt {
+            Bsp::RandomInt {
                 src: Box::new(p_bsp(js(j, "source")?)?),
                 prop: jstr(j, "property")?,
                 vals,
             }
         }
-        "noise_provider" => BSP::Noise {
+        "noise_provider" => Bsp::Noise {
             n: noise_j(j)?,
             scale: jnum(j, "scale").unwrap_or(1.0),
             states: st_list(j, "states"),
         },
         "noise_threshold_provider" => {
             let (dn, dp) = bs_parts(js(j, "default_state")?)?;
-            BSP::NoiseThr {
+            Bsp::NoiseThr {
                 n: noise_j(j)?,
                 scale: jnum(j, "scale").unwrap_or(1.0),
                 thr: jf32(j, "threshold", 0.0),
@@ -869,7 +861,7 @@ fn p_bsp(j: &J) -> Option<BSP> {
                     _ => (1, 1),
                 }
             };
-            BSP::Dual {
+            Bsp::Dual {
                 n: noise_j(j)?,
                 scale: jnum(j, "scale").unwrap_or(1.0),
                 variety: pr("variety"),
@@ -889,7 +881,7 @@ fn p_bsp(j: &J) -> Option<BSP> {
                     }
                 }
             }
-            BSP::RuleBased {
+            Bsp::RuleBased {
                 fb: js(j, "fallback").and_then(p_bsp).map(Box::new),
                 rules,
             }
@@ -1111,11 +1103,11 @@ enum Cf {
     Disk {
         half: i32,
         radius: IP,
-        bsp: BSP,
+        bsp: Bsp,
         target: Pr,
     },
     SimpleBlock {
-        to: BSP,
+        to: Bsp,
         on: Vec<String>,
         in_: Vec<String>,
         under: Vec<String>,
@@ -1137,7 +1129,7 @@ enum Cf {
         extra_bottom: f32,
         extra_edge: f32,
         replaceable: String,
-        ground: BSP,
+        ground: Bsp,
         floor: bool,
         chance: f32,
         vfeat: Box<Pf>,
@@ -1146,15 +1138,15 @@ enum Cf {
         waterlog: bool,
     },
     BlockColumn {
-        layers: Vec<(IP, BSP)>,
+        layers: Vec<(IP, Bsp)>,
         down: bool,
         allowed: Option<Pr>,
         prio: bool,
     },
-    BlockPile(BSP),
+    BlockPile(Bsp),
     Lake {
-        fluid: BSP,
-        barrier: BSP,
+        fluid: Bsp,
+        barrier: Bsp,
     },
     BlueIce,
     BlockBlob {
@@ -1178,7 +1170,7 @@ enum Cf {
     Vines,
     MonsterRoom,
     Fallen {
-        trunk: BSP,
+        trunk: Bsp,
     },
     Tree(Box<crate::tree::TreeExtra>),
     Unknown(#[expect(dead_code)] String),
@@ -1488,7 +1480,7 @@ fn load_freg() -> FReg {
             if let Some(fs) = jarr(&j, "features") {
                 for s in fs {
                     let mut step = vec![];
-                    if let Some(arr) = s.into_arr() {
+                    if let Some(arr) = s.as_arr() {
                         for v in arr {
                             step.push(ns_name(v.str()));
                         }
@@ -1503,7 +1495,7 @@ fn load_freg() -> FReg {
         }
     }
     let mut order: Vec<Vec<(u32, String)>> = vec![vec![]; max_steps];
-    for step in 0..max_steps {
+    for (step, slot) in order.iter_mut().enumerate() {
         let mut nodes: Vec<String> = vec![];
         let mut idx_of: HashMap<String, usize> = HashMap::new();
         let mut edges: Vec<(usize, usize)> = vec![];
@@ -1556,7 +1548,7 @@ fn load_freg() -> FReg {
                 }
             }
         }
-        order[step] = out
+        *slot = out
             .iter()
             .enumerate()
             .map(|(gi, &ni)| (gi as u32, nodes[ni].clone()))
