@@ -153,5 +153,42 @@
       "verdict": "M3 still unmet"
     },
     "next_bottleneck": "deep_state_i evaluated once per unique cell by the feature pass itself (about 190k calls per 9 chunks), because mc-spine recomputes per-cell states instead of reading generated chunk state"
+  },
+  "noise_value_cache": {
+    "change": "a direct-mapped, thread-local cache of Normal::get values (pure function), 8192 slots",
+    "feature_pass": "populate9 445 ms -> about 399-421 ms",
+    "mc_spine_only_ab": {
+      "harness": "10 s window, base and cache alternating",
+      "pairs": [
+        {
+          "base_cpu_s": 14.03,
+          "cache_cpu_s": 13.22
+        },
+        {
+          "base_cpu_s": 13.92,
+          "cache_cpu_s": 13.26
+        },
+        {
+          "base_cpu_s": 13.95,
+          "cache_cpu_s": 13.2
+        }
+      ],
+      "mean_base_cpu_s": 13.97,
+      "mean_cache_cpu_s": 13.23,
+      "ratio": 1.056
+    },
+    "generation_output": "unchanged (frozen population digest; a mutation adding 1.0 to a hit turns it red)",
+    "rss": "unchanged (~137 MiB)",
+    "verdict": "real and parity-preserving, but below x1.10, so not claimed as an M3 step; M3 remains unmet"
+  },
+  "verify": {
+    "command": "bash tests/verify.sh",
+    "result": "PASS",
+    "rust": "135 passed / 1 pre-existing ignored (serial)",
+    "mutants_proved": 43,
+    "not_a_gate": 0,
+    "parked": 0,
+    "skipped": 0,
+    "log_sha256": "6cfa5fff200c0752360f019fd869070efdc83c22013df079b002c363ac7f1700"
   }
 }
