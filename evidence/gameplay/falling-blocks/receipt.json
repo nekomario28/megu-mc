@@ -30,7 +30,7 @@
     "tick_tests::beginning_a_falling_tick_leaves_the_queue_visible",
     "tick_tests::placing_unsupported_sand_queues_air_not_a_ghost"
   ],
-  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air; falling-tick clone -> mem::take; UPD_DEFER push -> discard; place_block notifies requested state -> ghost update",
+  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air; falling-tick clone -> mem::take; UPD_DEFER push -> discard; place_block notifies requested state -> ghost update; place_block routes /setblock, /fill and piston",
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
@@ -39,14 +39,14 @@
     "not_a_gate": 0,
     "parked": 0,
     "skipped": 0,
-    "log_sha256": "8d06ecf89cad7dc03186035cce43e0c05e4ed3063627937fe2c61db43451e5f2"
+    "log_sha256": "b003ea6eb613edbf15d6c1ab6f9c561244f9a8a5d6cb7fc25dc5157be746f2df"
   },
   "source_hashes": {
-    "src/main.rs": "868515c78233388473521e7d1f588f406b1dd43303134db3287f35efaffd091e",
+    "src/main.rs": "f906dd7f7b3146384a37d8f5d38fa177dbd044771ff50e21cd28950e55c7fcfd",
     "src/tick_tests.rs": "9daeff8b6ab31323ebf1facfc3196f0ed3b0cdf01e3d12f4f1da7c6ef7e57dcf",
     "src/persistence_tests.rs": "620bed4fb5d89750139e6fe82d40faaf19ea9fc517880508579a84d1d2921bb3",
     "tools/mutation_check.sh": "5361b1e122b19fa472f0a954cba5099aecb041788604bded0e662795d4b7e56f",
-    "evidence/gameplay/falling-blocks/README.md": "e942502f4fa7174c486820e319fe89c42c199609211da2f7490acb2b4f540ffd",
+    "evidence/gameplay/falling-blocks/README.md": "de584cf58d4248a0d5669e138439661099d28bea049e0d9b716075fbaf920471",
     "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
   },
   "limits": [
@@ -70,6 +70,8 @@
     "spawn_fall and falling_tick's landing placement run under a re-entrant SAVE_LOCK guard, so a signal-thread save cannot observe the block/entity transition midway (Codex integration review P2).",
     "spawn_fall claims the block with set_block_if(..., Some(st)) so two threads cannot both create an entity for one block (Codex integration review P2).",
     "place_block queues the post-conversion world state, so placing unsupported sand does not leave a ghost block update (Codex integration review P2).",
-    "The landing path revalidates and claims the landing cell atomically with set_block_if, so a concurrently placed block is not overwritten (Codex integration review P2)."
+    "The landing path revalidates and claims the landing cell atomically with set_block_if, so a concurrently placed block is not overwritten (Codex integration review P2).",
+    "/setblock, /fill and piston place blocks through place_block, so an unsupported gravity block converts without a stale requested-state update (Codex integration review P2).",
+    "The below-world item and the entity it replaces are created and retired under the same save guard, so a snapshot cannot capture both and duplicate the drop (Codex integration review P2)."
   ]
 }
