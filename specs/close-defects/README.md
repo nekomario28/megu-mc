@@ -19,7 +19,7 @@
 | C | CLIクライアント（j、ユーザー指示で画面検証を除外） | protocol 767で接続・チャンク復号・移動・破壊・チャット・再取得。CLIの入出力とassertに証拠 | 検証済み（CLI、復号負例、独立した再取得、狙った変異と復元対照、独立レビュー） |
 | F | 落下（b） | エンティティの位置・加速・着地・ドロップ・保存をvanillaと同一入力で照合 | 検証済み（エンティティ化・重力・着地再検査・置換通過・長柱・下世界ドロップ・`FAL2`保存。19種/2段/冷/legacy/通過をテスト、**同一入力でvanilla実機と着地セル一致（床150・砂153→151）**。時間方向は単位テストで固定。統合レビューで**高速落下のすり抜け**と**legacy変換の地形露出**を修正し回帰テスト・変異で固定） |
 | N | RNG（d） | 時計依存呼び出しなし。状態保存と再読込後の列一致。消費順序・分布を検証 | 検証済み（`rand_u64`全廃・19サイトを`world_rng`へ。`RNG1`保存/復元と子プロセス対照、固定ベクトルで消費順序、変異でローダを赤。分布は変わる。vanillaの各乱数消費との一致はQに残す） |
-| Q | 最終レビュー | 全変更への独立レビュー、全必須ゲートとCIを対象revisionで再検証、未修正一覧が空 | 実装中（H/T/N/Fを独立レビュー済み・各headのhosted CI緑。代表負荷比較で**CPU x1.33（M3未達、原因は地形生成器）**。light の nibble/byte 基点と**section 基点（`minSection-1`）をvanillaと一致させ修正**。**生成光源を接続のチャンク窓が所有し、自チャンク＋隣接8をまとめて読む**。**後から生成された隣は Update Light（0x2a）で再点灯し、送信順に依存しない**（client `applyLightData` をbytecodeで確認、release probeで29件）。深部 material-rule を feature/送信パスで共有し代表負荷を約x1.09（**x1.10未満なので M3 としては主張しない**）。残: **M3（feature パス自身の `deep_state_i`）**、統合レビューの残り（`d266fb2..HEAD` の静的レビューを5回実施し、落下のすり抜け・FAL1地形露出・並行saveの不可視・生成光源の残存・再帰上限超えの柱・遷移とsaveの中間状態・配置の幽霊更新・エンティティ化の二重生成・着地セルの上書き・覆われた生成光源の消失の10件を修正。このレビューは網羅を証明せず、落下の並行/順序まわりは専用スライス（並行テスト含む）の候補として残る）、最終対象CI。**落下のvanilla実行同一入力照合は完了**） |
+| Q | 最終レビュー | 全変更への独立レビュー、全必須ゲートとCIを対象revisionで再検証、未修正一覧が空 | 実装中（H/T/N/Fを独立レビュー済み・各headのhosted CI緑。代表負荷比較で**CPU x1.33（M3未達、原因は地形生成器）**。light の nibble/byte 基点と**section 基点（`minSection-1`）をvanillaと一致させ修正**。**生成光源を接続のチャンク窓が所有し、自チャンク＋隣接8をまとめて読む**。**後から生成された隣は Update Light（0x2a）で再点灯し、送信順に依存しない**（client `applyLightData` をbytecodeで確認、release probeで29件）。深部 material-rule を feature/送信パスで共有し代表負荷を約x1.09（**x1.10未満なので M3 としては主張しない**）。残: **M3（feature パス自身の `deep_state_i`）**、統合レビューの残り（`d266fb2..HEAD` の静的レビューを6回実施し、落下のすり抜け・FAL1地形露出・並行saveの不可視・生成光源の残存・再帰上限超えの柱・遷移とsaveの中間状態・配置の幽霊更新・エンティティ化の二重生成・着地セルの上書き・覆われた生成光源の消失・複数の配置経路の幽霊更新・下世界ドロップのsave二重化の12件を修正。**このレビューは網羅の証明ではなく、落下の並行/順序まわりを専用スライス（並行テスト含む）として残す**。同じレビューを繰り返しても新規の端ケースが出続けるため、これ以上の逐次修正は収束しないと判断した）、最終対象CI。**落下のvanilla実行同一入力照合は完了**） |
 
 Qではlight-sectionの座標基点と、生成地形の発光源探索もvanillaに照合する。
 境界光源は chunk 窓が所有する記録と、後から生成された隣への Update Light で順序非依存にした（[境界生成光源](../../evidence/gameplay/light-update/README.md)）。
@@ -37,7 +37,7 @@ C/F/Nは実験を最小にし、参照の静的解析と実行時の一致を別
 
 ## 次の担当者への入口
 
-H・T・Nは完了。feature/treeの循環とtreeの上向き依存は共有契約を `block_registry`/`generation_providers`/`generation_context` へ移して解消（[共有契約の切替](generation-sharing.md)）。スケジューラの `sched_ready` はキュー4秒上限と無上限ラダーの差を埋める load-bearing なガードで、到達可能性モデルからの冗長扱いを実経路の対照と変異で否定した（[スケジューラ](../../evidence/foundation/scheduler-machine/README.md)）。時計依存RNGは全廃し、`world_rng` を `RNG1` として保存・復元する（[世界乱数](../../evidence/foundation/world-rng/README.md)）。残る主作業はF（[vanilla落下準拠](falling-entity.md)）とQ（全体レビュー・光座標・発光源探索・代表負荷）。CはCLIのみで検証済み。実画面・KDE経由の試験はユーザー指示で行わない。
+H・T・Nは完了。feature/treeの循環とtreeの上向き依存は共有契約を `block_registry`/`generation_providers`/`generation_context` へ移して解消（[共有契約の切替](generation-sharing.md)）。スケジューラの `sched_ready` はキュー4秒上限と無上限ラダーの差を埋める load-bearing なガードで、到達可能性モデルからの冗長扱いを実経路の対照と変異で否定した（[スケジューラ](../../evidence/foundation/scheduler-machine/README.md)）。時計依存RNGは全廃し、`world_rng` を `RNG1` として保存・復元する（[世界乱数](../../evidence/foundation/world-rng/README.md)）。Fはvanilla準拠で検証済み（統合レビューの12件の修正を含む）だが、**落下の並行/順序まわり（ブロック↔エンティティの所有権、配置経路、save との相互作用）は逐次修正では収束しないため、並行テスト付きの専用ハードニングスライスを次に切る**。Q の残りは **M3**（全列事前計算は撤回済み、次の設計は lazy な dense キャッシュ）、光の実機照合、全体/最終CI。CはCLIのみで検証済み。実画面・KDE経由の試験はユーザー指示で行わない。
 通信のゲートは `tests/client_settings_wire.py`。
 Sの保存試験は、子プロセスに世界を所有させ親の状態を変更しない。
 Vのゲートは `tests/gate_scripts.py`、通常の全ゲートは `tests/verify.sh`。
