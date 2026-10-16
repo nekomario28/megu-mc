@@ -34,19 +34,19 @@
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
-    "rust": "133 passed / 1 pre-existing ignored (serial)",
-    "mutants_proved": 40,
+    "rust": "134 passed / 1 pre-existing ignored (serial)",
+    "mutants_proved": 41,
     "not_a_gate": 0,
     "parked": 0,
     "skipped": 0,
-    "log_sha256": "11b06e7ca617eda202de564306647e00181b7b51f4d9a6782b1a8a2efd79e90b"
+    "log_sha256": "8d06ecf89cad7dc03186035cce43e0c05e4ed3063627937fe2c61db43451e5f2"
   },
   "source_hashes": {
-    "src/main.rs": "4cd2c95ffe612c11c131a23d0fcc714c8593957bbcaff060181c230ecbb02695",
-    "src/tick_tests.rs": "a6f6079f696a03cec75413697bb3d8215c0a7b59cf5ac318ef764005c204350a",
+    "src/main.rs": "868515c78233388473521e7d1f588f406b1dd43303134db3287f35efaffd091e",
+    "src/tick_tests.rs": "9daeff8b6ab31323ebf1facfc3196f0ed3b0cdf01e3d12f4f1da7c6ef7e57dcf",
     "src/persistence_tests.rs": "620bed4fb5d89750139e6fe82d40faaf19ea9fc517880508579a84d1d2921bb3",
-    "tools/mutation_check.sh": "ea23803396c094aed49558b7df36fe02a7a21fccd80225dcdd52d8751fe58f92",
-    "evidence/gameplay/falling-blocks/README.md": "09c160db59b6045dbaffa0f441430154b58d74fbed5ac1af60c6dab18d9dbfab",
+    "tools/mutation_check.sh": "5361b1e122b19fa472f0a954cba5099aecb041788604bded0e662795d4b7e56f",
+    "evidence/gameplay/falling-blocks/README.md": "e942502f4fa7174c486820e319fe89c42c199609211da2f7490acb2b4f540ffd",
     "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
   },
   "limits": [
@@ -69,6 +69,7 @@
     "block_updated queues a neighbour update past the recursion cap and drains it iteratively, so a gravity column taller than 64 still converts (Codex integration review P2).",
     "spawn_fall and falling_tick's landing placement run under a re-entrant SAVE_LOCK guard, so a signal-thread save cannot observe the block/entity transition midway (Codex integration review P2).",
     "spawn_fall claims the block with set_block_if(..., Some(st)) so two threads cannot both create an entity for one block (Codex integration review P2).",
-    "place_block queues the post-conversion world state, so placing unsupported sand does not leave a ghost block update (Codex integration review P2)."
+    "place_block queues the post-conversion world state, so placing unsupported sand does not leave a ghost block update (Codex integration review P2).",
+    "The landing path revalidates and claims the landing cell atomically with set_block_if, so a concurrently placed block is not overwritten (Codex integration review P2)."
   ]
 }
