@@ -28,25 +28,26 @@
     "tick_tests::a_long_unsupported_column_converts_in_one_pass",
     "tick_tests::a_fast_falling_block_lands_on_a_thin_platform_it_crosses",
     "tick_tests::beginning_a_falling_tick_leaves_the_queue_visible",
-    "tick_tests::placing_unsupported_sand_queues_air_not_a_ghost"
+    "tick_tests::placing_unsupported_sand_queues_air_not_a_ghost",
+    "tick_tests::a_save_concurrent_with_falling_conserves_every_block"
   ],
-  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air; falling-tick clone -> mem::take; UPD_DEFER push -> discard; place_block notifies requested state -> ghost update; place_block routes /setblock, /fill and piston",
+  "mutations": "tools/mutation_check.sh pairs each gate with a change: self/above-cell check removed, a passing entity suppressing a new block, asset set -> hand list of 3, gravity 0.04 -> 0.08, landing cell +1, cold-chunk check removed, FAL2 tag changed; fast-fall sweep start old->new; FAL1 explicit air -> non-air; falling-tick clone -> mem::take; UPD_DEFER push -> discard; place_block notifies requested state -> ghost update; place_block routes /setblock, /fill and piston; with_save_guard lock removed",
   "verify": {
     "command": "bash tests/verify.sh",
     "result": "PASS",
-    "rust": "134 passed / 1 pre-existing ignored (serial)",
-    "mutants_proved": 41,
+    "rust": "135 passed / 1 pre-existing ignored (serial)",
+    "mutants_proved": 42,
     "not_a_gate": 0,
     "parked": 0,
     "skipped": 0,
-    "log_sha256": "b003ea6eb613edbf15d6c1ab6f9c561244f9a8a5d6cb7fc25dc5157be746f2df"
+    "log_sha256": "28a35b33a78c0893dc5dbfdf69a9bfc9bd111007552d1817b8ab7f682971329c"
   },
   "source_hashes": {
-    "src/main.rs": "f906dd7f7b3146384a37d8f5d38fa177dbd044771ff50e21cd28950e55c7fcfd",
-    "src/tick_tests.rs": "9daeff8b6ab31323ebf1facfc3196f0ed3b0cdf01e3d12f4f1da7c6ef7e57dcf",
+    "src/main.rs": "0e9849399b2dbd518a87e298f8869fb2dbf5a2fc958154362fb415820f53b869",
+    "src/tick_tests.rs": "46058adc3f2be2e6f092a506692ac88c2b19363606d83a2cffc5b690bccfd1c2",
     "src/persistence_tests.rs": "620bed4fb5d89750139e6fe82d40faaf19ea9fc517880508579a84d1d2921bb3",
-    "tools/mutation_check.sh": "5361b1e122b19fa472f0a954cba5099aecb041788604bded0e662795d4b7e56f",
-    "evidence/gameplay/falling-blocks/README.md": "de584cf58d4248a0d5669e138439661099d28bea049e0d9b716075fbaf920471",
+    "tools/mutation_check.sh": "67ea68b495cafae428aa5c07cfbe0b05a4a01b24c0a20a127e74ea1fca395b53",
+    "evidence/gameplay/falling-blocks/README.md": "97a6c77ca9bf96bfb8f3930401243b47097989d62c10066596d8942e7fd91991",
     "evidence/foundation/save-schema/schema.py": "ffa31f56ddba287bb3f85a7c1a705f8fda628b9711e6b1c09320dc0019b1f9d6"
   },
   "limits": [
