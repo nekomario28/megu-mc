@@ -261,6 +261,11 @@ check "a falling tick leaves the queue visible to a save" \
   '    let active: Vec<Fall> = std::mem::take(&mut *falling().lock().unwrap());' \
   beginning_a_falling_tick_leaves_the_queue_visible
 
+check "a save is serialized with the falling transition" \
+  src/main.rs '    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());' \
+  '    let _save = ();' \
+  a_save_concurrent_with_falling_conserves_every_block
+
 echo
 check "the falling entities are written into the save" \
   src/main.rs '(*f).extend_from_slice(b"FAL2");' \

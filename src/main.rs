@@ -4410,7 +4410,7 @@ thread_local! { static SAVE_GUARD: std::cell::Cell<bool> = const { std::cell::Ce
 /// and from another `spawn_fall`, and only the outermost call locks.
 fn with_save_guard<R>(f: impl FnOnce() -> R) -> R {
     if SAVE_GUARD.with(|g| g.get()) { return f(); }
-    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     SAVE_GUARD.with(|g| g.set(true));
     struct Reset;
     impl std::ops::Drop for Reset {

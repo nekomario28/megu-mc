@@ -1261,6 +1261,96 @@ fn beginning_a_falling_tick_leaves_the_queue_visible() {
     *falling().lock().unwrap() = old_falling;
 }
 
+/// A save that runs while blocks are falling must not lose or duplicate them. A saver thread
+/// snapshots under `SAVE_LOCK` throughout the fall, and a snapshot taken mid-fall is reloaded and
+/// ticked to completion: every starting block must reappear exactly once.
+#[test]
+fn a_save_concurrent_with_falling_conserves_every_block() {
+    let _world_guard = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_world = world().lock().unwrap().clone();
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+    set_test_region(oh.clone(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    let base = 150;
+    let height = 4;
+    let columns = [(1, 1), (2, 1), (3, 1), (1, 2), (2, 2)];
+    let expected = columns.len() * height as usize;
+    for &(x, z) in &columns {
+        for y in base..=base + height + 2 { set_block(x, y, z, 0); }
+        set_block(x, base, z, stone);
+        set_block(x, base + 1, z, name_to_state("dirt").unwrap());
+        for i in 1..=height { set_block(x, base + 1 + i, z, sand); }
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let snapshots_store = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let saver = {
+        let stop = stop.clone();
+        let snapshots_store = snapshots_store.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                let _lock = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let mut buf = Vec::new();
+                save_world_into(&mut buf);
+                let mut store = snapshots_store.lock().unwrap();
+                if store.len() < 16 { store.push(buf); }
+                drop(store);
+                n += 1;
+            }
+            n
+        })
+    };
+
+    // Knock out every support: all blocks become entities.
+    for &(x, z) in &columns { set_block(x, base + 1, z, 0); }
+    assert_eq!(falling().lock().unwrap().len(), expected, "every block becomes an entity");
+    let mut ticks = 0;
+    while !falling().lock().unwrap().is_empty() && ticks < 200 { falling_tick(); ticks += 1; }
+    assert!(ticks < 200, "every entity must land");
+    stop.store(true, Ordering::Relaxed);
+    let saves = saver.join().expect("saver thread");
+    assert!(saves > 0, "a save must have run during the fall");
+
+    let name = |x: i32, y: i32, z: i32| crate::block_registry::breg().unwrap().name_of(block_at(x, y, z)).to_string();
+    let placed = |columns: &[(i32, i32)]| -> usize {
+        let mut n = 0;
+        for &(x, z) in columns {
+            for y in base..=base + height + height { if name(x, y, z) == "minecraft:sand" { n += 1; } }
+        }
+        n
+    };
+    assert_eq!(placed(&columns), expected, "live: no block is lost or duplicated");
+    assert!(falling().lock().unwrap().is_empty(), "nothing is left in flight");
+    assert!(drops().lock().unwrap().is_empty(), "landed blocks do not drop");
+
+    // Reload every concurrent snapshot into a clean state and land it: each must conserve its
+    // blocks. A snapshot taken mid-transition would drop or duplicate one.
+    let saved = snapshots_store.lock().unwrap().clone();
+    assert!(!saved.is_empty(), "the saver stored a snapshot");
+    for (i, snap) in saved.iter().enumerate() {
+        world().lock().unwrap().clear();
+        falling().lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        load_world_from(snap);
+        let mut t = 0;
+        while !falling().lock().unwrap().is_empty() && t < 200 { falling_tick(); t += 1; }
+        assert_eq!(placed(&columns), expected, "snapshot {i} loses or duplicates a block");
+    }
+
+    *world().lock().unwrap() = old_world;
+    *falling().lock().unwrap() = old_falling;
+    *drops().lock().unwrap() = old_drops;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
+
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
 /// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
 /// block it never showed, because the check returns before locking when there is nothing above.
