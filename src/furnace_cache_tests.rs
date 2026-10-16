@@ -63,7 +63,7 @@ fn reference_tick() {
             if dirty_pos.contains(&fp) {
                 let inv = c.inv.lock().unwrap().clone();
                 if let Ok(mut w) = c.sock.lock() {
-                    furnace_push_items(&mut *w, fp, &inv);
+                    furnace_push_items(&mut w, fp, &inv);
                 }
             }
         }
