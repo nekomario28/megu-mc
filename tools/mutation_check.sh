@@ -264,7 +264,7 @@ check "a falling tick leaves the queue visible to a save" \
 check "a save is serialized with the falling transition" \
   src/main.rs '    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());' \
   '    let _save = ();' \
-  a_save_concurrent_with_falling_conserves_every_block
+  a_save
 
 echo
 check "the falling entities are written into the save" \

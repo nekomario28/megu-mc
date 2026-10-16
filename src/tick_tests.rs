@@ -1351,6 +1351,80 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     set_test_region(oh, ow);
 }
 
+/// A block that falls out of the world becomes exactly one item; a save racing that
+/// transition must neither duplicate nor lose the item when its snapshot is reloaded.
+#[test]
+fn a_saved_below_world_drop_is_not_duplicated() {
+    let _world_guard = world_guard();
+    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_world = world().lock().unwrap().clone();
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0)]);
+    set_test_region(oh.clone(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    // Clear a column down to the world floor, then perch one sand on a support.
+    for y in MIN_Y..=(MIN_Y + 6) { set_block(1, y, 1, 0); }
+    set_block(1, MIN_Y + 3, 1, stone);
+    set_block(1, MIN_Y + 4, 1, sand);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let snapshots_store = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let saver = {
+        let stop = stop.clone();
+        let snapshots_store = snapshots_store.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                let _lock = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let mut buf = Vec::new();
+                save_world_into(&mut buf);
+                let mut store = snapshots_store.lock().unwrap();
+                if store.len() < 16 { store.push(buf); }
+                drop(store);
+                n += 1;
+            }
+            n
+        })
+    };
+
+    // Knock out the support so the block falls out of the world.
+    set_block(1, MIN_Y + 3, 1, 0);
+    assert_eq!(falling().lock().unwrap().len(), 1, "the block becomes an entity");
+    let mut ticks = 0;
+    while !falling().lock().unwrap().is_empty() && ticks < 400 { falling_tick(); ticks += 1; }
+    assert!(ticks < 400, "the entity must leave the world");
+    stop.store(true, Ordering::Relaxed);
+    let saves = saver.join().expect("saver thread");
+    assert!(saves > 0, "a save must have run during the fall");
+
+    let live: u32 = drops().lock().unwrap().iter().map(|d| d.cnt as u32).sum();
+    assert_eq!(live, 1, "the below-world block becomes exactly one item");
+    assert!(falling().lock().unwrap().is_empty(), "nothing is left in flight");
+
+    let saved = snapshots_store.lock().unwrap().clone();
+    assert!(!saved.is_empty(), "the saver stored a snapshot");
+    for (i, snap) in saved.iter().enumerate() {
+        world().lock().unwrap().clear();
+        falling().lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        load_world_from(snap);
+        let mut t = 0;
+        while !falling().lock().unwrap().is_empty() && t < 400 { falling_tick(); t += 1; }
+        let n: u32 = drops().lock().unwrap().iter().map(|d| d.cnt as u32).sum();
+        assert_eq!(n, 1, "snapshot {i} loses or duplicates the below-world drop");
+    }
+
+    *world().lock().unwrap() = old_world;
+    *falling().lock().unwrap() = old_falling;
+    *drops().lock().unwrap() = old_drops;
+    *forceloaded().lock().unwrap() = old_forced;
+    set_test_region(oh, ow);
+}
+
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
 /// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
 /// block it never showed, because the check returns before locking when there is nothing above.

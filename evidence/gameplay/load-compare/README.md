@@ -160,3 +160,23 @@ lazy な per-cell（現在の `deep_c` メモ）の方が安い。**この案は
 **x1.10 未満なので M3 の達成としては主張しない**。同等設定の `tools/load_compare.sh`（15秒窓）は
 vanilla 14.39s 対 mc-spine 17.94s（この回は x1.25）で、実行環境の負荷で絶対値は大きく動くが、
 **M3 は未達のまま**。次の律速は依然 feature パス内の material-rule 評価である。
+
+## M3 の根本原因（実装前の判断待ち）：`interpolated` を `cache` として扱っている
+
+`src/worldgen.rs:805` は `interpolated` / `flat_cache` / `cache_2d` / `cache_once` /
+`cache_all_in_cell` をすべて `DF::Cache` に落としている。つまり **vanilla がセル解像度
+（ore vein は 4×8×4）でノイズを評価して三線形補間する `interpolated` を、mc-spine は
+ブロックごとに厳密評価している**。
+
+- 影響：`minecraft:overworld/ore_vein/mask`・`toggle`（どちらも `interpolated`）が
+  `deep_state_i` のたびにブロック単位でノイズを引き、feature パスの約65%を占める。
+  vanilla の約32倍のサンプル数。
+- これは **M3 の律速**であると同時に **vanilla パリティの欠落**（ore vein の形が vanilla と違う）。
+- `interpolated` を正しく実装すると **両方が同時に直る**（セル角ノイズを一度だけ評価し、
+  補間で全ブロックに配る）。ただし **世界生成の出力が変わる**ため、凍結 population digest の
+  再基準化と、vanilla の `NoiseChunk` 補間式（`cell_size` と補間順序）の照合が要る。
+
+**「パリティを保った高速化」という制約下では実装できない**（補間は値が変わる）。
+実装するなら「vanilla 準拠方向への出力変更＋再基準化」として独立スライスで行い、
+同一 seed・同一設定で vanilla と地形を照合する。ここでは**測定と記録まで**とし、
+現在の parity-preserving な2段（深部メモ x1.09、ノイズ値キャッシュ x1.056）で止める。
