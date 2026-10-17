@@ -94,7 +94,10 @@ VAN=$(sample_load "$VPID" "$VAN_PORT" "$WORK/van-load.txt")
 kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
 
 echo "-- mc-spine, datapack worldgen, seed $SEED, moving viewer ${SECONDS_WINDOW}s"
-cargo build --release --offline --locked -j 4 --manifest-path "$ROOT/Cargo.toml" >/dev/null
+# Build into the directory this script runs from. With CARGO_TARGET_DIR exported (the project's
+# own workflow sets it) a bare `cargo build` writes elsewhere and the run below executes a stale
+# `$ROOT/target/release/mc-spine`, silently measuring a binary nobody just built.
+cargo build --release --offline --locked -j 4 --target-dir "$ROOT/target" --manifest-path "$ROOT/Cargo.toml" >/dev/null
 rm -rf "$SPINE_DIR"; mkdir -p "$SPINE_DIR"
 ln -s "$ROOT/datapacks" "$SPINE_DIR/datapacks"
 # The registry is read from assets/ and the configuration handshake needs it;
