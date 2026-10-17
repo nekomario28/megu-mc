@@ -25,10 +25,10 @@ from protocol767 import Client, port, status  # noqa: E402
 def lenient_chunk(body, _biome_count):
     """Parse only the coordinate: the probe reads light packets, not chunk contents."""
     reader = protocol767.Reader(body)
-    return (reader.number(">i"), reader.number(">i")), []
+    return (reader.number(">i"), reader.number(">i")), [], [0, 0, 0, 0], [], []
 
 
-protocol767.decode_chunk = lenient_chunk
+protocol767.decode_chunk_light = lenient_chunk
 
 
 def run(binary, wg):
