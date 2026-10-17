@@ -199,3 +199,25 @@ bytecode（`NoiseChunk$NoiseInterpolator.compute`、`NoiseSettings.getCellWidth/
 したがって `interpolated` は **「パリティを保った高速化」ではない**（出力が変わる上に遅い）ので撤回した。
 M3 を閉じるには **セル順の material-rule 評価**（チャンクをセル単位で充填して 8 隅を共有）か
 **worldgen の並列化**という、局所最適化ではない構造変更が必要で、これは独立スライスである。
+
+### 代表負荷のプロファイル（一時計測、撤回した変更の根拠）
+
+15 秒・移動ビュー・view 4 の負荷で、server 内に一時的な段別/スレッド別計測を入れて測った
+（計測コードは撤回済み。数値はその実行からの記録）。
+
+- `game_tick` の段別は `environment` が支配（例 5.67s / 全 5.71s、約 16.9ms/tick）。他は
+  `random_ticks` が約 50ms、残りは 1ms 未満。`environment` は tick スレッドが **region ロックを
+  待つ**時間で、worldgen は送信スレッド側で走っている。
+- 送信 `map_chunk` は約 9.2s / 81 チャンク（内訳 `chunk_data` 約 8.3s、light 約 1.0s）。
+- worldgen 入口 `wg2_block` は **570 万回/15 秒で 11.8s**、うち `feature_state`（`GEN` ロック＋
+  3×3 pop 走査）が 6.95s。`chunk_data` がブロックごとに `base_state`→`wg2_block` を呼ぶため。
+- スレッド別 CPU は 1 スレッド 13.4s・もう 1 スレッド 2.8s（計 16.2s）で、**実質単一スレッド**。
+  mc-spine は 3 スレッドでも region/GEN ロックで直列化される。
+- 総 CPU は mc-spine 16.5s 対 vanilla 16.0s（**x1.03、ノイズ内**）。つまり M3 の差は「ロック」ではなく
+  **worldgen＋送信の実仕事量**。
+- 参考として `feature_map` をチャンク単位にまとめて `wg2_block` を 570万→46万回にしても、
+  end-to-end CPU は 17.29s→17.17s（**0.7%、ノイズ内**）で変わらなかった。加えて worldgen 層が
+  placement 層に依存する層違反を招き、`wg2_block` の地形則を複製するため、**撤回**した。
+
+**結論**：パリティを保ったまま世界生成の実仕事を数 %削る局所最適化は見つからなかった。M3 を閉じるには
+`interpolated`（出力を変える）か、**セル順の material-rule 評価**／**worldgen の並列化**という構造変更が要る。
