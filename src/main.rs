@@ -8842,10 +8842,9 @@ fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
 /// Sky light that arrives sideways, which the per-column rule cannot produce: a window or a cave
 /// mouth lights what is beside it and a column test lights only what is above it.
 ///
-/// The seed is the lit cell just above an opening's floor. Only columns whose first opaque block
-/// is below their neighbours have one, so a cave with a solid ceiling seeds nothing - its own cell
-/// above the ceiling is its sky, and the light that reaches inside it arrives through the opening.
-/// The spread then runs through dark cells only, which keeps the work proportional to the cavity.
+/// The seed is the lit cell just above each column's floor (the cell the per-column rule lights).
+/// A cave with a solid ceiling seeds from the cell above the ceiling, which is its own sky; the
+/// light that reaches inside it arrives through the opening, and the BFS only enters dark cells.
 fn sky_spill(
     cx: i32,
     cz: i32,
@@ -8864,9 +8863,9 @@ fn sky_spill(
         for lx in 0..16usize {
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
             let y = floors[(lz << 4) | lx] + 1;
-            if dark(x, y, z) {
-                continue;
-            }
+            // Every column seeds: the floor+1 cell is never dark by the `y <= floor` test, so the
+            // old `if dark(..) { continue }` guard was dead. The per-column rule already lights
+            // this cell to 15; the seed exists so the BFS has a source to spread sideways from.
             lit.insert((x, y, z), 15);
             queue.push_back(((x, y, z), 15));
         }

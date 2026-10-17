@@ -97,3 +97,19 @@ Starlight の文書にある原則がそのまま vanilla の原則になって�
 - `TECHNICAL_DETAILS.md`（Starlight）: 伝播アルゴリズムの比較、光データ管理、
   chunk lighting、ベンチマーク
 - 取得元 URL は上表。**ライセンスが許容的でないため、文章・コードの転載はしない。**
+
+## 独立レビュー（flash）で確認したこと
+
+`sky_spill` と `sky_light_sections_from` を `opencode-go/deepseek-v4.1-flash` でレビュー：
+
+- **BFS は値を上げるだけ**（`lit` は既存 < 新値のときだけ insert、合成は `max`）。
+  減衰 `level - max(1, opacity)` はブロックライトの BFS と同一。
+- **`sky_light_sections_from` の3つの fast path は `pack_sky_section` と一致**（境界 `floor==sy`,
+  `floor==sy+15` 含む）。インデックスにも問題なし。
+- **seed の `dark()` ガードは死んだコード**（`y = floor+1` は `y <= floor` を満たさない）で、
+  コメントも実装と食い違っていた。ガードを除去しコメントを修正。
+- **マージンの floor は近似**：`dark()` は `x.rem_euclid(16)` で中央チャンクの `floors` を引くため、
+  BFS が隣チャンクの margin に入るときその列の floor を正しく使えない。最終的に送るのは中央
+  チャンクのセルだけなので raise/lower の違反にはならないが、margin 経由で中央セルが
+  過大に上がり得る。正しくするには 3×3 の floors が要るが、floors 計算（height_at＋不透明度走査）が
+  **9 倍**になるため見送り、既知の近似として記録する。

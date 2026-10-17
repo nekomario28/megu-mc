@@ -216,6 +216,11 @@ check "a removed generated emitter stops lighting" \
   'if false {' \
   a_removed_generated_emitter_stops_lighting
 
+check "sky spill loses one level per step" \
+  src/main.rs '            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));' \
+  '            let nl = level;' \
+  sky_light_reaches_sideways_through_an_opening
+
 check "light sections start one below the world" \
   src/main.rs 'const LIGHT_MIN_Y: i32 = MIN_Y - 16;' \
   'const LIGHT_MIN_Y: i32 = MIN_Y;' \
