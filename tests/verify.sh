@@ -24,14 +24,14 @@ echo "== tests, eight threads, three times"
 # made this stage unable to fail the script: grep succeeded, the pipeline reported success, and a red
 # parallel run printed "test result: FAILED" and then let verify.sh continue to PASS.
 for i in 1 2 3; do
-  out=$(cargo test --offline --locked -j 2 -- --test-threads=8 2>&1)
-  rc=$?
-  echo "$out" | tail -2 | grep -E 'test result'
-  if [ $rc -ne 0 ]; then
-    echo "parallel suite failed on run $i (exit $rc)"
-    echo "$out" | grep -A6 '^failures:' | head -20
+  # Read the status inside an `if` so `set -e` does not exit before the failure is printed: a bare
+  # `out=$(...)` aborts the script and the log ends with no failing test named.
+  if ! out=$(cargo test --offline --locked -j 2 -- --test-threads=8 2>&1); then
+    echo "parallel suite failed on run $i"
+    echo "$out" | grep -A14 '^failures:' | head -40
     exit 1
   fi
+  echo "$out" | tail -2 | grep -E 'test result'
 done
 
 echo "== wire smoke"

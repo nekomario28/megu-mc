@@ -250,8 +250,8 @@ pub struct Gen {
     clim_c: HashMap<(i32, i32), ([i64; 5], f64)>,
     clim_ord: Vec<(i32, i32)>,
     // quart -> biome leaf, shared across SCs (the deep material rule asks per block)
-    bioq: HashMap<u64, u16>,
-    bioq_ord: std::collections::VecDeque<u64>,
+    bioq: HashMap<(i32, i32, i32), u16>,
+    bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     col_ord: Vec<(i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
@@ -1133,10 +1133,11 @@ impl Gen {
 
     fn leaf_at(&mut self, c: &mut SC) -> u16 {
         let (qx, qy, qz) = (c.x >> 2, c.y >> 2, c.z >> 2);
-        let key = (((qx as i64) << 40) ^ ((qy as i64) << 20) ^ (qz as i64)) as u64;
+        let key = (qx, qy, qz);
         // The biome is a pure function of the quart when the search is unseeded, and the material
         // rule asks for the same quart once per block (64 blocks per quart). A per-Gen cache turns
-        // millions of B-tree searches into one per quart.
+        // millions of B-tree searches into one per quart. The key is the tuple, not a packed u64:
+        // the old per-block packed key was collision-free by luck only.
         if let Some(&l) = self.bioq.get(&key) {
             return l;
         }
