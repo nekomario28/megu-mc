@@ -221,6 +221,15 @@ check "sky spill loses one level per step" \
   '            let nl = level;' \
   sky_light_reaches_sideways_through_an_opening
 
+check "a knocked-out gravity block becomes an entity" \
+  src/main.rs '        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+        falling().lock().unwrap().push(Fall {
+            eid, x: px as f64 + 0.5, y: py as f64, z: pz as f64 + 0.5,
+            dy: 0.0, state: st, time: 0,
+        });' \
+  '        let _eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);' \
+  concurrent_knockout_and_falling_conserve_blocks
+
 check "light sections start one below the world" \
   src/main.rs 'const LIGHT_MIN_Y: i32 = MIN_Y - 16;' \
   'const LIGHT_MIN_Y: i32 = MIN_Y;' \

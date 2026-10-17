@@ -1468,6 +1468,76 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     }
 }
 
+/// The connection thread drops a gravity block's support while the tick thread advances the fall.
+/// Neither takes the test's world guard, which is the point: `set_block` from a non-tick thread
+/// runs against `falling_tick`, and every block must still land exactly once.
+#[test]
+fn concurrent_knockout_and_falling_conserve_blocks() {
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (_, ow) = test_region();
+    let mut warm = ow.clone();
+    for x in 0..6 {
+        for z in 0..6 {
+            warm.insert((x, z));
+        }
+    }
+    set_test_region(HashSet::new(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    let base = 120;
+    let height = 3;
+    let cols: Vec<(i32, i32)> = (1..5).flat_map(|x| (1..5).map(move |z| (x, z))).collect();
+    let expected = cols.len() * height as usize;
+    for &(x, z) in &cols {
+        set_block(x, base - 1, z, stone);
+        set_block(x, base, z, stone);
+        for i in 1..=height {
+            set_block(x, base + i, z, sand);
+        }
+    }
+
+    let knocker = {
+        let cols = cols.clone();
+        std::thread::spawn(move || {
+            for &(x, z) in &cols {
+                // Remove the support only while it is the support, so the knock-out never deletes a
+                // block that has already landed in the cell.
+                if block_at(x, base, z) == stone {
+                    set_block(x, base, z, 0);
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    let mut ticks = 0;
+    while ticks < 800 {
+        falling_tick();
+        ticks += 1;
+        if knocker.is_finished() && falling().lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    knocker.join().expect("knocker thread");
+    while !falling().lock().unwrap().is_empty() && ticks < 1600 {
+        falling_tick();
+        ticks += 1;
+    }
+    assert!(ticks < 1600, "the fall must settle");
+
+    let mut placed = 0;
+    for &(x, z) in &cols {
+        for y in (base - 1)..=(base + height + 4) {
+            if block_at(x, y, z) == sand {
+                placed += 1;
+            }
+        }
+    }
+    assert_eq!(placed, expected, "a concurrent knock-out duplicated or lost a block");
+    assert!(falling().lock().unwrap().is_empty(), "nothing is left in flight");
+    assert!(drops().lock().unwrap().is_empty(), "landed blocks do not drop");
+}
+
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
 /// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
 /// block it never showed, because the check returns before locking when there is nothing above.
