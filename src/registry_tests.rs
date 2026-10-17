@@ -826,7 +826,12 @@ fn sky_light_reaches_sideways_through_an_opening() {
         let ceiling = y == 69 && lz == 7 && lx != 10;
         if in_cave && !ceiling { 0 } else { 15 }
     };
-    let spill = sky_spill(0, 0, &floors, solid);
+    let spill = sky_spill(
+        0,
+        0,
+        |x, z| floors[((z.rem_euclid(16) as usize) << 4) | (x.rem_euclid(16) as usize)],
+        solid,
+    );
     let at = |x: i32, y: i32, z: i32| spill.get(&(x, y, z)).copied().unwrap_or(0);
 
     assert_eq!(at(10, 61, 7), 15, "the shaft's own lit cell is the seed");

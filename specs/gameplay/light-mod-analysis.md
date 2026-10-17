@@ -108,8 +108,8 @@ Starlight の文書にある原則がそのまま vanilla の原則になって�
   `floor==sy+15` 含む）。インデックスにも問題なし。
 - **seed の `dark()` ガードは死んだコード**（`y = floor+1` は `y <= floor` を満たさない）で、
   コメントも実装と食い違っていた。ガードを除去しコメントを修正。
-- **マージンの floor は近似**：`dark()` は `x.rem_euclid(16)` で中央チャンクの `floors` を引くため、
-  BFS が隣チャンクの margin に入るときその列の floor を正しく使えない。最終的に送るのは中央
-  チャンクのセルだけなので raise/lower の違反にはならないが、margin 経由で中央セルが
-  過大に上がり得る。正しくするには 3×3 の floors が要るが、floors 計算（height_at＋不透明度走査）が
-  **9 倍**になるため見送り、既知の近似として記録する。
+- **マージンの floor を 3×3 化して修正**：当初 `dark()` は `x.rem_euclid(16)` で中央チャンクの
+  `floors` を流用していたため、BFS が隣チャンクの margin に入るとその列の floor を正しく
+  使えなかった。`sky_light_sections_world` が 3×3 の floors を計算して `floor_of` として渡す
+  ようにし、各セルが自分の列の floor で判定されるようにした（3×3 は固定配列なので `dark()` の
+  追加コストは小さい。floors の計算は 9 倍になるが、`height_at` はキャッシュ済み）。

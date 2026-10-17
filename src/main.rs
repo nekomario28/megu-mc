@@ -8848,21 +8848,18 @@ fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
 fn sky_spill(
     cx: i32,
     cz: i32,
-    floors: &[i32; 256],
+    floor_of: impl Fn(i32, i32) -> i32,
     opacity: impl Fn(i32, i32, i32) -> u8,
 ) -> HashMap<(i32, i32, i32), u8> {
     let (x0, x1) = (cx * 16 - 15, cx * 16 + 30);
     let (z0, z1) = (cz * 16 - 15, cz * 16 + 30);
-    let dark = |x: i32, y: i32, z: i32| -> bool {
-        let (lx, lz) = (x.rem_euclid(16) as usize, z.rem_euclid(16) as usize);
-        y <= floors[(lz << 4) | lx]
-    };
+    let dark = |x: i32, y: i32, z: i32| -> bool { y <= floor_of(x, z) };
     let mut lit: HashMap<(i32, i32, i32), u8> = HashMap::new();
     let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> = std::collections::VecDeque::new();
     for lz in 0..16usize {
         for lx in 0..16usize {
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-            let y = floors[(lz << 4) | lx] + 1;
+            let y = floor_of(x, z) + 1;
             // Every column seeds: the floor+1 cell is never dark by the `y <= floor` test, so the
             // old `if dark(..) { continue }` guard was dead. The per-column rule already lights
             // this cell to 15; the seed exists so the BFS has a source to spread sideways from.
@@ -8893,12 +8890,8 @@ fn sky_spill(
     lit
 }
 
-/// Sky light for a chunk, from the world: the per-column value, raised where light has arrived
-/// sideways.
-fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
-    let Some(reg) = crate::block_registry::breg() else {
-        return vec![[0u8; 2048]; 26];
-    };
+/// The first opaque block y in each column, scanning down from the surface (the sky floor).
+fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
     let mut floors = [0i32; 256];
     for lz in 0..16usize {
         for lx in 0..16usize {
@@ -8906,7 +8899,7 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
             let mut y = height_at(x, z) - 1;
             let mut steps = 0;
             while steps < 16 {
-                if reg.opacity_of(block_at(x, y, z)) > 0 {
+                if opacity(x, y, z) > 0 {
                     break;
                 }
                 y -= 1;
@@ -8915,7 +8908,34 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
             floors[(lz << 4) | lx] = y;
         }
     }
-    let spill = sky_spill(cx, cz, &floors, |x, y, z| reg.opacity_of(block_at(x, y, z)));
+    floors
+}
+
+/// Sky light for a chunk, from the world: the per-column value, raised where light has arrived
+/// sideways.
+fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
+    let Some(reg) = crate::block_registry::breg() else {
+        return vec![[0u8; 2048]; 26];
+    };
+    let op = |x: i32, y: i32, z: i32| reg.opacity_of(block_at(x, y, z));
+    let floors = sky_floors(cx, cz, &op);
+    // Floors for the 3x3 window: a margin cell (a neighbour chunk) must be tested against its own
+    // column, not wrapped onto the centre chunk's, or the BFS routes through cells that are not dark.
+    let mut f9 = [[0i32; 256]; 9];
+    for dx in -1..=1i32 {
+        for dz in -1..=1i32 {
+            f9[((dx + 1) * 3 + (dz + 1)) as usize] = sky_floors(cx + dx, cz + dz, &op);
+        }
+    }
+    let floor_of = |x: i32, z: i32| -> i32 {
+        let dx = (x >> 4) - cx + 1;
+        let dz = (z >> 4) - cz + 1;
+        if !(0..=2).contains(&dx) || !(0..=2).contains(&dz) {
+            return i32::MIN;
+        }
+        f9[(dx * 3 + dz) as usize][(((z & 15) as usize) << 4) | (x & 15) as usize]
+    };
+    let spill = sky_spill(cx, cz, floor_of, &op);
     sky_light_sections_with_spill(cx, cz, &floors, &spill)
 }
 
