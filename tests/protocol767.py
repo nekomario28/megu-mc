@@ -117,7 +117,10 @@ def palette(reader, count, indirect_max, minimum_bits, registry_count):
     return indices
 
 
-def decode_chunk(body, biome_count):
+STRICT = True
+
+
+def decode_chunk_light(body, biome_count):
     reader = Reader(body)
     coord = (reader.number(">i"), reader.number(">i"))
     heightmaps = reader.nbt()
@@ -128,7 +131,8 @@ def decode_chunk(body, biome_count):
         non_air = data.number(">h")
         assert 0 <= non_air <= 4096
         states = palette(data, 4096, 8, 4, STATE_COUNT)
-        assert non_air == sum(st not in AIR_STATES for st in states), "non-air section count"
+        if STRICT:
+            assert non_air == sum(st not in AIR_STATES for st in states), "non-air section count"
         sections.append(states)
         palette(data, 64, 3, 1, biome_count)
     assert data.pos == len(data.data), "unparsed chunk section bytes"
@@ -144,13 +148,21 @@ def decode_chunk(body, biome_count):
         assert mask < 1 << 26
         masks.append(mask)
     assert not masks[0] & masks[2] and not masks[1] & masks[3], "overlapping light masks"
+    arrays = []
     for mask in masks[:2]:
         length = reader.varint()
         require(length == mask.bit_count(), "light-mask-count")
+        rows = []
         for _ in range(length):
             assert reader.varint() == 2048, "light array nibble count"
-            reader.take(2048)
+            rows.append(reader.take(2048))
+        arrays.append(rows)
     assert reader.pos == len(body), "unparsed chunk packet bytes"
+    return coord, sections, masks, arrays[0], arrays[1]
+
+
+def decode_chunk(body, biome_count):
+    coord, sections, _, _, _ = decode_chunk_light(body, biome_count)
     return coord, sections
 
 
@@ -219,6 +231,7 @@ class Client:
         self.game, self.name = game, name
         self.chunks, self.messages, self.updates = {}, [], []
         self.light_updates = []
+        self.chunk_light = {}
         self.pos, self.contract_started = None, False
         self.phase, self.registry_counts = "login", {}
 
@@ -249,9 +262,11 @@ class Client:
                 assert reader.pos == len(body), "unparsed registry data"
             return pid, body
         if pid == 0x27:
-            coord, sections = decode_chunk(body, self.registry_counts["minecraft:worldgen/biome"])
+            coord, sections, masks, sky, block = decode_chunk_light(
+                body, self.registry_counts["minecraft:worldgen/biome"])
             assert coord not in self.chunks, f"duplicate chunk {coord}"
             self.chunks[coord] = sections
+            self.chunk_light[coord] = (masks, sky, block)
         elif pid == 0x21:
             z, x = struct.unpack(">ii", body)
             assert (x, z) in self.chunks, f"unload of unknown chunk {(x, z)}"

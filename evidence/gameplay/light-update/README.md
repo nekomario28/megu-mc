@@ -58,3 +58,19 @@ mask と配列数の一致を assert）、`(-2,-2)..(3,1)` の 29 チャンク�
 - 記録はチャンクの全 state から取り、隣接の記録が揃う前に送ったチャンクは更新で直す。
   これは vanilla の chunk load ごとの light propagation と同じ役割だが、vanilla の
   `ThreadedLevelLightEngine` の伝播そのものを写したものではない。
+
+## 光値の vanilla 照合を試行（ツール欠陥を記録）
+
+`tools/light_parity_probe.py`（新）はサーバーが送る 0x27 の sky/block light 配列を正準化して
+出力する（`tests/protocol767.py` の `decode_chunk_light`、`STRICT=False` で実行）。mc-spine に
+対しては動作し、chunk (0,0) で sky/block mask と各セクションの digest を取得できた。
+
+vanilla に対しては、リポジトリの chunk デコーダが vanilla の chunk 形式で desync する
+（biome palette を読んだ後、次のセクションの `non_air` が範囲外になる）。厳密デコーダはこれまで
+fixture と mc-spine でしか検証されておらず、vanilla では未検証だった。光値の wire 一致を取るには
+まずデコーダを vanilla の形式へ対応させる必要がある（独立したツールスライス）。
+
+さらに mc-spine の光エンジンは vanilla `ThreadedLevelLightEngine` の移植ではなく独自伝播
+（上記「証拠の境界」）なので、値の一致にはエンジンの移植が要る。したがって **座標基点と生成光源探索は
+照合済み**（前者は bytecode、後者は構造）だが、**光値そのものの vanilla 一致は未確立**であり、
+GUI を除外した本作業の範囲外として記録する。
