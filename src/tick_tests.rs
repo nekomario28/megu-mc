@@ -25,11 +25,23 @@ impl WorldSnapshot {
 }
 impl std::ops::Drop for WorldSnapshot {
     fn drop(&mut self) {
-        *world().lock().unwrap() = std::mem::take(&mut self.world);
-        *falling().lock().unwrap() = std::mem::take(&mut self.falling);
-        *drops().lock().unwrap() = std::mem::take(&mut self.drops);
-        *forceloaded().lock().unwrap() = std::mem::take(&mut self.forced);
+        // Poison-tolerant: an assertion that fails while holding one of these mutexes poisons it, and
+        // `unwrap()` here would panic inside a destructor -- a double panic aborts the whole test
+        // binary and skips the restore, the opposite of what this guard is for.
+        *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+        *falling().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.falling);
+        *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+        *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.forced);
         set_test_region(self.region.0.clone(), self.region.1.clone());
+    }
+}
+
+/// Sets a test's saver-thread stop flag when dropped, so a panic does not leave the thread taking
+/// `SAVE_LOCK` for the rest of the test binary.
+struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl std::ops::Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1322,6 +1334,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     }
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(stop.clone());
     let snapshots_store = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
     let saver = {
         let stop = stop.clone();
@@ -1399,6 +1412,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     set_block(1, MIN_Y + 4, 1, sand);
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(stop.clone());
     let snapshots_store = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
     let saver = {
         let stop = stop.clone();

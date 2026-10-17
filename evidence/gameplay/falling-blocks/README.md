@@ -129,3 +129,11 @@
   restore するようにし、両落下テストで使う。
 
 save-guard 変異は依然として両テストを赤にし、verify は緑（137 passed / 44 proved）。
+
+### レビュー修正への再レビュー（flash）でもう1件
+
+`c5ec1e8` を再レビュー。**RAII ガードの `.lock().unwrap()` は、アサーション失敗でミューテックスが
+poison されるとデストラクタ内で panic し、二重 panic でテストバイナリ全体を abort** させる
+（＝単一の赤がバイナリ全体の異常終了になり、restore も走らない）。poison 耐性
+（`unwrap_or_else(|e| e.into_inner())`）に修正。saver スレッドも `StopOnDrop` で panic 時に停止する。
+save-guard 変異を与えても **abort せず 2 failed** になることを確認（`verify` は 137 passed / 44 proved）。
