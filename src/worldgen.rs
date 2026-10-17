@@ -190,7 +190,6 @@ struct SC {
     fluid: i32,
     est_min: i32,
     nt: HashMap<usize, bool>,             // per-column memo for 2d noise_threshold
-    leafq: HashMap<u64, u16>,             // quart -> leaf id
     memo: HashMap<(usize, i32, i32, i32), f64>,
 }
 impl SC {
@@ -198,10 +197,13 @@ impl SC {
         SC {
             x: 0, y: 0, z: 0, run_depth: 0, sec: 0.0, sec_ok: false,
             steep: None, sda: 0, sdb: 0, fluid: i32::MIN, est_min: i32::MAX,
-            nt: HashMap::new(), leafq: HashMap::new(), memo: HashMap::new(),
+            nt: HashMap::new(), memo: HashMap::new(),
         }
     }
 }
+
+// bound on the shared quart -> biome cache
+const BIO_CAP: usize = 1 << 18;
 
 pub struct Gen {
     dfs: Vec<DF>,
@@ -247,6 +249,9 @@ pub struct Gen {
     prelim_ord: Vec<(i32, i32)>,
     clim_c: HashMap<(i32, i32), ([i64; 5], f64)>,
     clim_ord: Vec<(i32, i32)>,
+    // quart -> biome leaf, shared across SCs (the deep material rule asks per block)
+    bioq: HashMap<u64, u16>,
+    bioq_ord: std::collections::VecDeque<u64>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     col_ord: Vec<(i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
@@ -354,6 +359,8 @@ impl Gen {
             prelim_ord: Vec::new(),
             clim_c: HashMap::new(),
             clim_ord: Vec::new(),
+            bioq: HashMap::new(),
+            bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
@@ -1126,15 +1133,24 @@ impl Gen {
 
     fn leaf_at(&mut self, c: &mut SC) -> u16 {
         let (qx, qy, qz) = (c.x >> 2, c.y >> 2, c.z >> 2);
-        let key = ((qx as i64) << 40) ^ ((qy as i64) << 20) ^ (qz as i64);
-        if let Some(&l) = c.leafq.get(&(key as u64)) {
+        let key = (((qx as i64) << 40) ^ ((qy as i64) << 20) ^ (qz as i64)) as u64;
+        // The biome is a pure function of the quart when the search is unseeded, and the material
+        // rule asks for the same quart once per block (64 blocks per quart). A per-Gen cache turns
+        // millions of B-tree searches into one per quart.
+        if let Some(&l) = self.bioq.get(&key) {
             return l;
         }
         let l = self
             .biome_quart(qx, qy, qz, None)
             .map(|(_, l)| l)
             .unwrap_or(u16::MAX);
-        c.leafq.insert(key as u64, l);
+        self.bioq.insert(key, l);
+        self.bioq_ord.push_back(key);
+        if self.bioq_ord.len() > BIO_CAP {
+            if let Some(old) = self.bioq_ord.pop_front() {
+                self.bioq.remove(&old);
+            }
+        }
         l
     }
 
@@ -1406,7 +1422,6 @@ impl Gen {
                 c.sec_ok = false;
                 c.steep = None;
                 c.nt.clear();
-                c.leafq.clear();
                 rd[lz * 16 + lx] = c.run_depth as i16;
                 let est = lerp2(
                     lx as f64 / 16.0,
@@ -2655,6 +2670,28 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
             .collect();
         assert_eq!(digest, "8afe1b4f2b9cebd5e86f2b5a56371ea9",
             "feature population output changed from the pre-refactor capture");
+    }
+
+    #[test]
+    fn the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart() {
+        // The deep material rule asks for the biome once per block; the answer only depends on the
+        // quart, so one shared cache replaced millions of B-tree searches. Pin that a repeat query
+        // returns what the first one computed and what a direct lookup gives.
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut c = SC::new();
+        for (qx, qy, qz) in [(0i32, 24, 0), (1, 25, 2), (-3, -8, 5), (7, 60, -8)] {
+            c.x = qx << 2;
+            c.y = qy << 2;
+            c.z = qz << 2;
+            let first = g.leaf_at(&mut c);
+            let second = g.leaf_at(&mut c);
+            assert_eq!(first, second, "the shared cache changed the leaf for {qx},{qy},{qz}");
+            let direct = g
+                .biome_quart(qx, qy, qz, None)
+                .map(|(_, l)| l)
+                .unwrap_or(u16::MAX);
+            assert_eq!(second, direct, "the shared cache disagrees with a direct lookup at {qx},{qy},{qz}");
+        }
     }
 
     #[test]

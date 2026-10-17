@@ -232,3 +232,21 @@ M3 を閉じるには **セル順の material-rule 評価**（チャンクをセ
 この修正後（= 現在の HEAD のバイナリ）の代表負荷は **mc-spine 16.5s vs vanilla 16.0s（x1.03、ノイズ内）**。
 `CARGO_TARGET_DIR` を設定した環境で以前に取った比（例 x1.33）は**古いバイナリを測っていた可能性がある**。
 したがって M3 は「明確な未達」ではなく「ノイズ内で区別できない」であり、断定には同一バイナリでの再測が要る。
+
+### M3 達成（パリティを保ったまま）：生態系（biome）葉の共有キャッシュ
+
+上のプロファイルで「CPU は worldgen＋送信の実仕事」と分かったので、その中身を数えた。材料ルールは
+**ブロックごとに生態系**を引いていた（`SC::leaf_at` → `Gen::biome_quart` の B木探索）。`deep_state_i` は
+毎回 `SC` を作り直すため `leafq` がブロックをまたがらず、**421万回の探索**（作業集合の quart は約12万個、
+同じ quart を 34 回）になっていた。
+
+`Gen` に quart→葉の共有キャッシュ（`bioq`、上限 2^18）を追加。（`last=None` の `biome_quart` は quart の
+純関数なので）探索結果は前と同一で、**出力は不変**。
+
+- `biome_quart` 呼び出し **421万 → 32万回（約13×削減）**。
+- 代表負荷（15s、seed 0、view 4、同一クライアント、修正済み `load_compare.sh`）：
+  vanilla **16.09s / 1134MiB / 64thr** 対 mc-spine **10.16s / 140MiB / 3thr** → **x0.63（1.58倍高速）**。
+- 137 passed（凍結 population digest 含む）、変異 44 proved。詳細:
+  [biome-cache](../biome-cache/README.md)。
+
+**M3（パリティを保った高速化）は達成**。`interpolated` の出力変更は不要だった。

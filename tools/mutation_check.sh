@@ -352,6 +352,11 @@ check "the noise-value cache returns the value it computed" \
   'if slot.0 == key { Some(slot.1 + 1.0) } else { None }' \
   feature_population_output_matches_the_pre_refactor_capture
 
+check "the shared biome cache returns the value it computed" \
+  src/worldgen.rs '        self.bioq.insert(key, l);' \
+  '        self.bioq.insert(key, l.wrapping_add(1));' \
+  the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart
+
 check "the queue cap cannot visit a cell before its real backoff" \
   src/main.rs '    backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)' \
   '    backoff().lock().unwrap().get(&(x, y, z)).map(|(_t, _)| true).unwrap_or(true)' \
