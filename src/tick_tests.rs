@@ -1,6 +1,38 @@
 use super::*;
 use effect_tests::client_pair;
 
+/// Captures the globals a world test mutates and restores them when dropped, so a failing assertion
+/// cannot leak them into a later test. A leaked hot set was the eight-thread flake: the pins made it
+/// deterministic for one test, but a panic on the straight-line restore left it polluted for the
+/// next one. Dropping this guard runs the restore on every unwind path.
+struct WorldSnapshot {
+    world: HashMap<(i32, i32), HashMap<u32, u32>>,
+    falling: Vec<Fall>,
+    drops: Vec<Drop>,
+    forced: HashSet<(i32, i32)>,
+    region: (HashSet<(i32, i32)>, HashSet<(i32, i32)>),
+}
+impl WorldSnapshot {
+    fn take() -> WorldSnapshot {
+        WorldSnapshot {
+            world: std::mem::take(&mut *world().lock().unwrap()),
+            falling: std::mem::take(&mut *falling().lock().unwrap()),
+            drops: std::mem::take(&mut *drops().lock().unwrap()),
+            forced: std::mem::take(&mut *forceloaded().lock().unwrap()),
+            region: test_region(),
+        }
+    }
+}
+impl std::ops::Drop for WorldSnapshot {
+    fn drop(&mut self) {
+        *world().lock().unwrap() = std::mem::take(&mut self.world);
+        *falling().lock().unwrap() = std::mem::take(&mut self.falling);
+        *drops().lock().unwrap() = std::mem::take(&mut self.drops);
+        *forceloaded().lock().unwrap() = std::mem::take(&mut self.forced);
+        set_test_region(self.region.0.clone(), self.region.1.clone());
+    }
+}
+
 fn furnace(input_count: u8) -> Furnace {
     Furnace {
         input: (name_to_item("raw_iron").unwrap(), input_count, Vec::new()),
@@ -1271,10 +1303,7 @@ fn beginning_a_falling_tick_leaves_the_queue_visible() {
 #[test]
 fn a_save_concurrent_with_falling_conserves_every_block() {
     let _world_guard = world_guard();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    let old_world = world().lock().unwrap().clone();
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let _snap = WorldSnapshot::take();
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
@@ -1347,12 +1376,6 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         while !falling().lock().unwrap().is_empty() && t < 200 { falling_tick(); t += 1; }
         assert_eq!(placed(&columns), expected, "snapshot {i} loses or duplicates a block");
     }
-
-    *world().lock().unwrap() = old_world;
-    *falling().lock().unwrap() = old_falling;
-    *drops().lock().unwrap() = old_drops;
-    *forceloaded().lock().unwrap() = old_forced;
-    set_test_region(oh, ow);
 }
 
 /// A block that falls out of the world becomes exactly one item; a save racing that
@@ -1360,17 +1383,15 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
 #[test]
 fn a_saved_below_world_drop_is_not_duplicated() {
     let _world_guard = world_guard();
-    let old_falling = std::mem::take(&mut *falling().lock().unwrap());
-    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
-    let old_world = world().lock().unwrap().clone();
-    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    let (oh, ow) = test_region();
+    let _snap = WorldSnapshot::take();
+    let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0)]);
     // Falling does not depend on the hot set, so start from an empty one rather than whatever a
     // previous test left, and restore the ambient region at the end.
     set_test_region(HashSet::new(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
+    let sand_item = name_to_item("sand").expect("sand item must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     // Clear a column down to the world floor, then perch one sand on a support.
     for y in MIN_Y..=(MIN_Y + 6) { set_block(1, y, 1, 0); }
@@ -1407,7 +1428,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     let saves = saver.join().expect("saver thread");
     assert!(saves > 0, "a save must have run during the fall");
 
-    let live: u32 = drops().lock().unwrap().iter().map(|d| d.cnt as u32).sum();
+    let live: u32 = drops().lock().unwrap().iter().filter(|d| d.item == sand_item).map(|d| d.cnt as u32).sum();
     assert_eq!(live, 1, "the below-world block becomes exactly one item");
     assert!(falling().lock().unwrap().is_empty(), "nothing is left in flight");
 
@@ -1428,15 +1449,9 @@ fn a_saved_below_world_drop_is_not_duplicated() {
         load_world_from(snap);
         let mut t = 0;
         while !falling().lock().unwrap().is_empty() && t < 400 { falling_tick(); t += 1; }
-        let n: u32 = drops().lock().unwrap().iter().map(|d| d.cnt as u32).sum();
+        let n: u32 = drops().lock().unwrap().iter().filter(|d| d.item == sand_item).map(|d| d.cnt as u32).sum();
         assert_eq!(sand_blocks() + n, 1, "snapshot {i} loses or duplicates the below-world block");
     }
-
-    *world().lock().unwrap() = old_world;
-    *falling().lock().unwrap() = old_falling;
-    *drops().lock().unwrap() = old_drops;
-    *forceloaded().lock().unwrap() = old_forced;
-    set_test_region(oh, ow);
 }
 
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
