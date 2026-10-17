@@ -28,7 +28,12 @@ for i in 1 2 3; do
   # `out=$(...)` aborts the script and the log ends with no failing test named.
   if ! out=$(cargo test --offline --locked -j 2 -- --test-threads=8 2>&1); then
     echo "parallel suite failed on run $i"
-    echo "$out" | grep -A14 '^failures:' | head -40
+    if echo "$out" | grep -qE '^failures:'; then
+      echo "$out" | grep -A14 '^failures:' | head -40
+    else
+      # A build failure has no `failures:` block; print the compiler output instead of nothing.
+      echo "$out" | tail -30
+    fi
     exit 1
   fi
   echo "$out" | tail -2 | grep -E 'test result'

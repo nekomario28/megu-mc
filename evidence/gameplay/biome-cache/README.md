@@ -53,3 +53,22 @@ suite went from about 109 s to about 44 s for three eight-thread runs.
 - The load is a CLI protocol client, not a rendered client; on-screen parity is the excluded GUI path.
 - The quart cache is bounded at 262144 entries (about 15 MiB); a session that streams far more
   unique quarts evicts in FIFO order, which only costs a recomputed search, never a wrong leaf.
+
+## Independent review
+
+Codex and the pi OpenAI route were both at their account usage limit, so the review ran through
+`pi --print --model opencode-go/deepseek-v4.1-flash` on the diff `97b9daf..HEAD` with a bounded
+question. Verdict: the cache is a sound memo of a pure function; no correctness regression.
+
+Findings and disposition:
+
+- **The old packed key collided (latent bug).** `(0,0,0)` and `(0,1,1<<20)` both packed to `0x0`
+  with `((qx<<40)^(qy<<20)^qz)`; `qz = 1<<20` is about 4.2 M blocks, inside the world. The tuple key
+  removes this. This is a fix, not only a style change, and it is why the identity claim is
+  "identical to the intended uncached result", not "identical to the old buggy cache".
+- Purity, the removed `SC::leafq`, FIFO eviction and the `Mutex<Gen>` guard were each checked and
+  found sound.
+- **`tests/verify.sh` build-failure gap (fixed).** On a build failure there is no `failures:` line,
+  so `grep` found nothing and `set -e -o pipefail` ended the script before printing the compiler
+  output. The failure branch now prints the `failures:` block when present and the compiler tail
+  otherwise.
