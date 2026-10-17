@@ -114,3 +114,18 @@
   **150=stone, 151=sand**、149/152/153 は空、falling_block エンティティ無し。
 - **mc-spine の結果と一致**：同じ入力で砂は床の1つ上（y=151）に着地する。
   `tools/falling_oracle.py` の mc-spine 出力は `final_column {150:stone, 151:sand}`。
+
+## 独立レビュー（flash）の指摘と対応
+
+`97b9daf`（下世界ドロップの並行 save テスト）を `opencode-go/deepseek-v4.1-flash` で
+レビュー。2件の指摘を修正した（`c5ec1e8`）：
+
+- **保存則がアイテム同一性を見ていなかった**：全ての drop を合計していたため、sand を失って
+  別アイテムだけ残ったスナップショットでも 1 になってしまう。**sand アイテムだけ数える**
+  ようにした。
+- **restore がパニック安全でない**：restore はアサーションの後ろの直線コードなので、
+  途中で panic すると world/falling/drops/forceloaded/region を次のテストへ漏らす
+  （hot set の pin はこれを隠していただけ）。**`WorldSnapshot` ガード**にして全 unwind 経路で
+  restore するようにし、両落下テストで使う。
+
+save-guard 変異は依然として両テストを赤にし、verify は緑（137 passed / 44 proved）。
