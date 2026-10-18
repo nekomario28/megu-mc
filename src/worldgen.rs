@@ -3485,8 +3485,17 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    // These tests mutate the shared `GEN` static, so they must not run in
+    // parallel: one lock per test serializes the whole module.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap()
+    }
     #[test]
     fn xoroshiro_parity() {
+        let _guard = lock_gen();
         // pumpkin xoroshiro128.rs test vectors
         let mut x = Xor::seed(0);
         eprintln!("DBG seed0 lo={:#x} hi={:#x}", x.lo, x.hi);
@@ -3513,6 +3522,7 @@ mod wg_tests {
 
     #[test]
     fn biome_vectors() {
+        let _guard = lock_gen();
         // pumpkin multi_noise_sampler tests: seed, quart pos, params
         fn stub(_: &str) -> Option<u32> {
             Some(1)
@@ -3529,6 +3539,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_load() {
+        let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
             Some(1)
         }
@@ -3565,6 +3576,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_real_ids() {
+        let _guard = lock_gen();
         assert!(init(0, crate::name_to_state));
         let cc = chunk_cols(0, 0).unwrap();
         let mut kinds: HashMap<u32, u32> = HashMap::new();
@@ -4874,6 +4886,7 @@ mod wg_tests {
 
     #[test]
     fn aquifer_vectors() {
+        let _guard = lock_gen();
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
         let mut miss = 0u32;
         {
@@ -4938,6 +4951,7 @@ mod wg_tests {
 
     #[test]
     fn aqdist() {
+        let _guard = lock_gen();
         if std::env::var("WGAQ").is_err() {
             return;
         }
@@ -4970,6 +4984,7 @@ mod wg_tests {
 
     #[test]
     fn perf_probe() {
+        let _guard = lock_gen();
         if std::env::var("WGPERF").is_err() {
             return;
         }
@@ -5008,6 +5023,7 @@ mod wg_tests {
 
     #[test]
     fn feat_populate_perf() {
+        let _guard = lock_gen();
         let seed = 0u64;
         init(seed, crate::name_to_state);
         let t = std::time::Instant::now();
@@ -5034,6 +5050,7 @@ mod wg_tests {
 
     #[test]
     fn feat_determinism() {
+        let _guard = lock_gen();
         // same seed -> identical override maps; and feature writes must cross
         // chunk boundaries (e.g. a tree rooted in a neighbor must appear here)
         let g1 = Gen::load(0, crate::name_to_state).expect("datapack");
