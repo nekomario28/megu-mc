@@ -2761,3 +2761,43 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         assert!(m1.len() + neigh > 0, "no features generated at all");
     }
 }
+
+#[cfg(test)]
+mod bedrock_bench {
+    /// Diagnostic (ignored): is a flat bedrock layer worth its parity cost?
+    /// The bedrock band is ~7us per chunk against ~5.7ms for the terrain layer
+    /// (about 0.12%), so flattening it does not make the generator materially
+    /// lighter and the per-cell vanilla pattern is kept. Run with
+    /// `cargo test --release -- --ignored time_deep_state_band --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_deep_state_band() {
+        let mut g = super::Gen::load(0, crate::name_to_state).expect("datapack");
+        let cc = g.cols(0, 0).expect("cols");
+        let start = std::time::Instant::now();
+        let mut n = 0u64;
+        let mut acc = 0u64;
+        for _ in 0..20 {
+            for y in -63..=-60i32 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        acc = acc.wrapping_add(super::deep_state(x, y, z, &cc) as u64);
+                        n += 1;
+                    }
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        eprintln!("BEDROCK_BENCH cells={n} elapsed={elapsed:?} per_cell={:?} acc={acc}", elapsed / n as u32);
+        // Whole-chunk context: how much is the bedrock band against full generation?
+        let mut cg = super::Gen::load(0, crate::name_to_state).expect("datapack");
+        let t = std::time::Instant::now();
+        let mut chunks = 0u32;
+        for cx in 0..8i32 {
+            for cz in 0..8i32 {
+                if cg.cols(cx, cz).is_some() { chunks += 1; }
+            }
+        }
+        eprintln!("CHUNK_BENCH chunks={chunks} elapsed={:?} per_chunk={:?}", t.elapsed(), t.elapsed() / chunks);
+    }
+}
