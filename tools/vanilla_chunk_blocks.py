@@ -79,7 +79,16 @@ def main():
             client.login(view=2)
         except AssertionError:
             pass  # a re-sent chunk trips the fixture's duplicate check; capture already ran
-        client.move(cx * 16 + px, 80, cz * 16 + pz)
+        # Vanilla ignores a teleport larger than its movement threshold ("moved too quickly"),
+        # so walk to the target in small steps and let it stream the chunks on the way.
+        tx, tz = cx * 16 + px, cz * 16 + pz
+        steps = int(max(abs(tx), abs(tz)) // 8) + 1
+        for i in range(1, steps + 1):
+            client.move(tx * i / steps, 80, tz * i / steps)
+            try:
+                client.read(0.05)
+            except TimeoutError:
+                pass
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and (cx, cz) not in captured:
             try:

@@ -64,7 +64,17 @@ def fetch(port, cx, cz):
             client.login(view=2)
         except AssertionError:
             pass
-        client.move(cx * 16 + 8, 80, cz * 16 + 8)
+        # Vanilla ignores a teleport larger than its movement threshold ("moved too quickly"),
+        # so walk to the target in small steps and let it stream the chunks on the way.
+        tx, tz = cx * 16 + 8, cz * 16 + 8
+        sx, sz = 0.0, 0.0
+        steps = int(max(abs(tx - sx), abs(tz - sz)) // 8) + 1
+        for i in range(1, steps + 1):
+            client.move(sx + (tx - sx) * i / steps, 80, sz + (tz - sz) * i / steps)
+            try:
+                client.read(0.05)
+            except TimeoutError:
+                pass
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and (cx, cz) not in captured:
             try:
