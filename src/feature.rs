@@ -1651,6 +1651,11 @@ pub(crate) fn feat_prof_dump() {
 }
 
 pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
+    // Diagnostic: MC_SPINE_NOFEAT=1 skips the whole feature layer so a block diff can
+    // attribute the remainder to terrain or to features.
+    if std::env::var("MC_SPINE_NOFEAT").is_ok() {
+        return;
+    }
     let fr = freg();
     if fr.steps == 0 || breg().is_none() {
         return;
