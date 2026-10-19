@@ -138,3 +138,32 @@ grass_block を置くべき列で dirt を置いている**のが根。tree の 
 次の一手は `src/worldgen.rs` の surface rule（`mat`/`eval_rule`）で、
 `grass_block` を置く条件（上に空気、biome、`stone_depth_above` 等）を
 vanilla と突き合わせること。
+
+## worldgen パリティの現状（2026-10 追記）
+
+`tools/chunk_block_diff.py` と `MC_SPINE_NOFEAT=1` で測った残差:
+
+```
+chunk (0,0), seed 0: feature あり 11856/98304 (12.1%)
+                      feature なし  7727/98304 ( 7.9%)
+```
+
+- **ノイズスタックは vanilla と一致**（bytecode で確認）: `XoroshiroRandomSource` seed、
+  `fromHashOf(x,y,z)` = `RandomSource(getSeed ^ lo, hi)`、`fromHashOf(name)` = md5
+  `Longs.fromBytes` ^ lo/hi、`ImprovedNoise` コンストラクタ（offset/perm/`nextInt(256-i)`
+  シャッフル）とノイズ関数（8勾配・`lerp3`・`smooth`）、`NormalNoise` シード
+  （旧 `splitter()` が最良で、`forkPositional`/`state()` や `valueFactor` 単純置換は悪化）、
+  `vertical_gradient` = `Mth.map(y,b,e,1,0)` + `fromHashOf`。
+- **密度 DF 演算も一致**: `squeeze`/`min`/`mul`/`gradient`/`lerp`/`range_choice`。
+- **`interpolated` は二重補間になるため不要**: mc-spine は既に `cols()` で `final_density` を
+  セル隅評価し `density()` で三線形補間している。`DF::Interp` を足しても diff は不変。
+- **`beardifier` が `DF::Zero` 固定、構造物未実装**（`structure_set` もない）。vanilla の
+  `final_density` は `right: beardifier` を加算するため、構造物（村・廃坑等）の周辺で
+  密度がずれる。これが地形残差の主因。
+
+### 探針の既知制約
+
+vanilla は移動しきい値を超えるテレポートを無視する（`moved too quickly`）ため、任意の
+チャンクを wire で取得できない。`(0,0)`（ログイン位置付近）のみ安定して取れる。
+`tools/chunk_block_diff.py` / `tools/vanilla_chunk_blocks.py` は 8 ブロック刻みで歩くが、
+vanilla の任意座標取得にはログイン位置自体を対象チャンクにする必要がある。
