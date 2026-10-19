@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Diff one chunk's blocks between two live servers, state id by state id.
+"""Diff one chunk's blocks between two live servers, layer by layer.
 
   tools/chunk_block_diff.py <port_a> <port_b> <cx> <cz> [limit]
 
 Both servers are assumed to speak protocol 767 and share the block-state id
 order (true for vanilla 1.21.1 and mc-spine's assets/blocks_1211.json), so the
-decoded ids are directly comparable. Prints the number of differing cells, a
-per-y histogram, and up to `limit` sample positions with both ids.
+decoded ids are directly comparable.
 
-The sections are read without the fixture's registry-bound assertion: that
-assertion compares against one server's air state ids and rejects the other
-before the blocks are read. See tools/vanilla_chunk_blocks.py.
+Each differing cell is classified into the layer a worldgen fix would live in:
+
+  bedrock  y <= min_y + 4           — the per-cell floor pattern
+  feature  above the column's top   — air vs a placed block (tree, ore surface)
+  surface  the top few solid blocks — the material rule (grass/dirt/deepslate)
+  deep     the rest                 — density / ore / deepslate gradient
+
+and the block-state pairs are counted, so "which fix buys the most" is a number,
+not a guess.
 """
 import os
 import sys
@@ -24,6 +29,7 @@ from protocol767 import Client, Reader  # noqa: E402
 protocol767.STRICT = False
 MIN_Y = protocol767.MIN_Y
 HEIGHT = 384
+SURFACE_BAND = 4
 
 
 def palette(reader, count, indirect_max):
@@ -82,27 +88,62 @@ def fetch(port, cx, cz):
     return sections
 
 
+def top_solid(sections, cx, cz):
+    """Highest non-air y per column, from the reference side."""
+    tops = {}
+    for section in range(HEIGHT // 16 - 1, -1, -1):
+        for index in range(4096):
+            if sections[section][index] != 0:
+                y = MIN_Y + section * 16 + (index >> 8)
+                wx = cx * 16 + (index & 15)
+                wz = cz * 16 + ((index >> 4) & 15)
+                if (wx, wz) not in tops:
+                    tops[(wx, wz)] = y
+    return tops
+
+
 def main():
     if len(sys.argv) < 5:
         print(__doc__)
         return 2
     pa, pb, cx, cz = (int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
-    limit = int(sys.argv[5]) if len(sys.argv) > 5 else 20
+    limit = int(sys.argv[5]) if len(sys.argv) > 5 else 12
     a, b = fetch(pa, cx, cz), fetch(pb, cx, cz)
+    tops = top_solid(a, cx, cz)
 
-    diffs = []
+    layers = Counter()
+    pairs = Counter()
+    samples = []
     for section in range(HEIGHT // 16):
         for index in range(4096):
-            if a[section][index] != b[section][index]:
-                y = MIN_Y + section * 16 + (index >> 8)
-                x = (cx * 16 + (index & 15), cz * 16 + ((index >> 4) & 15))
-                diffs.append((y, x, a[section][index], b[section][index]))
-    print(f"chunk {(cx, cz)}: {len(diffs)} differing cells of {HEIGHT * 256}")
-    hist = Counter(y for y, _, _, _ in diffs)
-    for y in sorted(hist):
-        print(f"  y={y}: {hist[y]}")
-    for y, (wx, wz), va, vb in sorted(diffs)[:limit]:
-        print(f"  ({wx},{y},{wz}) a={va} b={vb}")
+            va, vb = a[section][index], b[section][index]
+            if va == vb:
+                continue
+            y = MIN_Y + section * 16 + (index >> 8)
+            wx = cx * 16 + (index & 15)
+            wz = cz * 16 + ((index >> 4) & 15)
+            top = tops.get((wx, wz), MIN_Y)
+            if y <= MIN_Y + 4:
+                layer = "bedrock"
+            elif y > top:
+                layer = "feature"
+            elif y >= top - SURFACE_BAND:
+                layer = "surface"
+            else:
+                layer = "deep"
+            layers[layer] += 1
+            pairs[(va, vb)] += 1
+            if len(samples) < limit:
+                samples.append((layer, wx, y, wz, va, vb))
+    total = sum(layers.values())
+    print(f"chunk {(cx, cz)}: {total} differing cells of {HEIGHT * 256}")
+    for layer, count in layers.most_common():
+        print(f"  {layer:8s} {count:6d}  {100.0 * count / max(total, 1):5.1f}%")
+    print("  top state pairs (a != b):")
+    for (va, vb), count in pairs.most_common(10):
+        print(f"    {va} -> {vb}: {count}")
+    for layer, wx, y, wz, va, vb in samples:
+        print(f"  [{layer}] ({wx},{y},{wz}) a={va} b={vb}")
     return 0
 
 
