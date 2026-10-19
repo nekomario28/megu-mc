@@ -93,3 +93,25 @@ vanilla に無い木を置いている**ことにある（worldgen の feature �
   は特定していない。
 - 探針は client の復号（protocol 767）で読んだ wire 値であり、クライアントの画面表示ではない。
 - heightmap の展開は末尾 long 付近で値域外（>384）を出すため、列の packed long の一致でのみ使った。
+
+## feature 順序の vanilla アルゴリズム（逆コンパイル確定）
+
+残差の正体は feature の step 内順序。vanilla の `FeatureSorter.buildFeaturesPerStep`
+（obf `deg.a`、`java.util.List,Function,boolean`）を `javap` で確定した:
+
+1. `featureIndex` = `Object2IntOpenHashMap` + `MutableInt.getAndIncrement`。
+   バイオームを **step 順に flatten した初出順**で feature にグローバル index を割り当てる。
+2. 各バイオームについて全 step を flatten した `nodeList` を作り、**隣接要素間にエッジ**
+   （step 境界をまたぐ）。
+3. `Comparator.comparingInt(deg$a::step).thenComparingInt(deg$a::featureIndex)` の
+   `TreeSet` を用いた **DFS の post-order を `Collections.reverse`** した順が topological order。
+   （`deg.a(java.util.Map,java.util.Set,java.util.Set,java.util.function.Consumer,Object)`
+   = `ayd.a` の DFS。）
+4. step ごとにグルーピングし、`deg$b(features, Util.createIndexIdentityLookup(features))`。
+   `indexMapping` は **その step リスト内の位置**（`Util.h` = `list::indexOf` 相当）。
+
+つまり `gi` は step リスト内位置で mc-spine と同じだが、**順序を作るアルゴリズムが違う**：
+vanilla は DFS post-order reversed + cross-step エッジ + `step→featureIndex` 比較子、
+mc-spine は Kahn FIFO。これが「vanilla に無い木」の原因。
+
+比較子・エッジ・DFS は obf から確定済み（`deg.javap.txt`, `ad.javap.txt`）。
