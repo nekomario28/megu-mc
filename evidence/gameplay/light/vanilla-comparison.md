@@ -155,11 +155,23 @@ chunk (0,0), seed 0: feature あり 11856/98304 (12.1%)
   （旧 `splitter()` が最良で、`forkPositional`/`state()` や `valueFactor` 単純置換は悪化）、
   `vertical_gradient` = `Mth.map(y,b,e,1,0)` + `fromHashOf`。
 - **密度 DF 演算も一致**: `squeeze`/`min`/`mul`/`gradient`/`lerp`/`range_choice`。
-- **`interpolated` は二重補間になるため不要**: mc-spine は既に `cols()` で `final_density` を
-  セル隅評価し `density()` で三線形補間している。`DF::Interp` を足しても diff は不変。
-- **`beardifier` が `DF::Zero` 固定、構造物未実装**（`structure_set` もない）。vanilla の
-  `final_density` は `right: beardifier` を加算するため、構造物（村・廃坑等）の周辺で
-  密度がずれる。これが地形残差の主因。
+- **残差の主因（2026-10 追記、逆コンパイルで確定）**: vanilla の `overworld/final_density` は
+  ```
+  add( min( squeeze( interpolated( mul(blend_density(...), sloped_cheese) ) ),
+            overworld/caves/noodle ),
+       beardifier )
+  ```
+  で、`interpolated` は **`mul(...)` の部分だけ**を包む。外側の `squeeze`/`min`/`add` は
+  非線形（`squeeze` は三次）なので、`squeeze(lerp(X))` と `lerp(squeeze(X))` は一致しない。
+  mc-spine は `cols()` で `final_density` **全体**をセル隅評価してから `density()` で三線形
+  補間するため、`lerp(squeeze(X))` になっている。**これが地形 7.9% 残差の有力原因**。
+  正しい順序は「`interpolated` の入力だけを隅評価→三線形→その外側をブロック毎に評価」。
+- **`interpolated` を `Cache`（恒等）に落としているのは誤り**（上記）。以前の
+  「`DF::Interp` を足しても diff 不変」という測定は、`cols()` が依然として全体を隅評価して
+  いたため二重補間になっただけで、順序の誤りを直していなかった。
+- **`beardifier` は `DF::Zero` 固定だが、地形残差の原因ではない**: 新しい vanilla ワールドを
+  `generate-structures=false` で生成しても chunk (0,0) の diff は 7727 のまま不変（実験で否定）。
+  構造物の有無で vanilla のチャンク digest は変わるが、地形セルの比較には影響しない。
 
 ### 探針の既知制約
 
