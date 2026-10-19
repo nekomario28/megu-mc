@@ -2626,8 +2626,10 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
     }
 
     /// The full, sorted feature population output for a fixed seed and query
-    /// sequence, as raw bytes. The digest below was taken from the pre-refactor
-    /// source; shared provider/predicate/context edits must reproduce it exactly.
+    /// sequence, as raw bytes. The digest below was taken after switching the
+    /// feature order to vanilla's decompiled `FeatureSorter` algorithm (DFS
+    /// post-order reversed, cross-step edges); later shared provider/predicate/
+    /// context edits must reproduce it exactly.
     fn feature_population_capture(g: &mut Gen) -> Vec<u8> {
         let mut bytes = b"GEN-OUTPUT-1\0".to_vec();
         for (x, y, z) in [(-1, 64, -1), (0, 64, 0), (-17, 64, -1), (0, 80, 0)] {
@@ -2669,8 +2671,8 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert_eq!(digest, "8afe1b4f2b9cebd5e86f2b5a56371ea9",
-            "feature population output changed from the pre-refactor capture");
+        assert_eq!(digest, "1da71fe648e08d8530f3fbb9be5db301",
+            "feature population output changed from the vanilla-order capture");
     }
 
     #[test]

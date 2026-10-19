@@ -300,6 +300,31 @@ const OW_BIOMES: &[&str] = &[
     "minecraft:crimson_forest", "minecraft:warped_forest", "minecraft:basalt_deltas",
 ];
 
+/// Vanilla's DFS (obf `ayd.a`): post-order visit over the feature edges, neighbours in
+/// (step, featureIndex) order. A cycle is a data error, so it stops rather than recursing forever.
+fn dfs_step(
+    v: (usize, u32),
+    edges: &HashMap<(usize, u32), Vec<(usize, u32)>>,
+    visited: &mut std::collections::HashSet<(usize, u32)>,
+    in_progress: &mut std::collections::HashSet<(usize, u32)>,
+    order: &mut Vec<(usize, u32)>,
+) {
+    if visited.contains(&v) || in_progress.contains(&v) {
+        return;
+    }
+    in_progress.insert(v);
+    if let Some(neigh) = edges.get(&v) {
+        let mut sorted = neigh.clone();
+        sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        for m in sorted {
+            dfs_step(m, edges, visited, in_progress, order);
+        }
+    }
+    in_progress.remove(&v);
+    visited.insert(v);
+    order.push(v);
+}
+
 fn load_freg() -> FReg {
     let mut reg = FReg {
         cfg: HashMap::new(),
@@ -349,63 +374,62 @@ fn load_freg() -> FReg {
             reg.bsteps.insert(name, steps);
         }
     }
-    let mut order: Vec<Vec<(u32, String)>> = vec![vec![]; max_steps];
-    for step in 0..max_steps {
-        let mut nodes: Vec<String> = vec![];
-        let mut idx_of: HashMap<String, usize> = HashMap::new();
-        let mut edges: Vec<(usize, usize)> = vec![];
-        for b in OW_BIOMES {
-            let Some(steps) = reg.bsteps.get(*b) else { continue };
-            let Some(list) = steps.get(step) else { continue };
-            let mut enc: HashMap<String, usize> = HashMap::new();
-            let mut ordered: Vec<&String> = vec![];
+    // Vanilla FeatureSorter.buildFeaturesPerStep (obf `deg.a`): a global first-seen index per
+    // feature, cross-step edges over each biome's flattened feature list, a DFS post-order
+    // reversed under a step-then-index comparator, then grouped by step. The old Kahn FIFO
+    // order differed, which moved every placed feature's RNG offset (one extra tree at
+    // chunk (0,0)) and every sky-spill column it touched.
+    let mut fidx: HashMap<String, u32> = HashMap::new();
+    let mut counter = 0u32;
+    for b in OW_BIOMES {
+        let Some(steps) = reg.bsteps.get(*b) else { continue };
+        for list in steps {
             for f in list {
-                if !enc.contains_key(f) {
-                    enc.insert(f.clone(), ordered.len());
-                    ordered.push(f);
-                    if !idx_of.contains_key(f) {
-                        idx_of.insert(f.clone(), nodes.len());
-                        nodes.push(f.clone());
-                    }
-                }
-            }
-            for w in ordered.windows(2) {
-                edges.push((idx_of[w[0]], idx_of[w[1]]));
-            }
-        }
-        let n = nodes.len();
-        let mut indeg = vec![0usize; n];
-        let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
-        for (a, b) in edges {
-            adj[a].push(b);
-            indeg[b] += 1;
-        }
-        let mut queue: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
-        let mut out = vec![];
-        while let Some(i) = queue.first().copied() {
-            queue.remove(0);
-            out.push(i);
-            for &m in &adj[i] {
-                indeg[m] -= 1;
-                if indeg[m] == 0 {
-                    queue.push(m);
+                if !fidx.contains_key(f) {
+                    fidx.insert(f.clone(), counter);
+                    counter += 1;
                 }
             }
         }
-        if out.len() < n {
-            for i in 0..n {
-                if !out.contains(&i) {
-                    out.push(i);
-                }
-            }
-        }
-        order[step] = out
-            .iter()
-            .enumerate()
-            .map(|(gi, &ni)| (gi as u32, nodes[ni].clone()))
-            .collect();
     }
-    reg.order = order;
+    // A node is (step, featureIndex); the name is kept alongside for the output.
+    let mut name_of: HashMap<(usize, u32), String> = HashMap::new();
+    let mut edges: HashMap<(usize, u32), Vec<(usize, u32)>> = HashMap::new();
+    for b in OW_BIOMES {
+        let Some(steps) = reg.bsteps.get(*b) else { continue };
+        let mut flat: Vec<(usize, u32)> = vec![];
+        for (i, list) in steps.iter().enumerate() {
+            for f in list {
+                if let Some(&fi) = fidx.get(f) {
+                    name_of.entry((i, fi)).or_insert_with(|| f.clone());
+                    flat.push((i, fi));
+                }
+            }
+        }
+        for w in flat.windows(2) {
+            if w[0] != w[1] {
+                edges.entry(w[0]).or_default().push(w[1]);
+            }
+        }
+    }
+    let mut order: Vec<(usize, u32)> = vec![];
+    let mut visited: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+    let mut in_progress: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+    let mut keys: Vec<(usize, u32)> = edges.keys().copied().collect();
+    keys.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    for k in keys {
+        dfs_step(k, &edges, &mut visited, &mut in_progress, &mut order);
+    }
+    order.reverse();
+    let mut by_step: Vec<Vec<(u32, String)>> = vec![vec![]; max_steps];
+    for step in 0..max_steps {
+        for (gi, k) in order.iter().filter(|k| k.0 == step).enumerate() {
+            if let Some(name) = name_of.get(k) {
+                by_step[step].push((gi as u32, name.clone()));
+            }
+        }
+    }
+    reg.order = by_step;
     reg.steps = max_steps;
     reg
 }
