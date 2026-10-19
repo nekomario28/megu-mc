@@ -115,3 +115,26 @@ vanilla は DFS post-order reversed + cross-step エッジ + `step→featureInde
 mc-spine は Kahn FIFO。これが「vanilla に無い木」の原因。
 
 比較子・エッジ・DFS は obf から確定済み（`deg.javap.txt`, `ad.javap.txt`）。
+
+## vanilla のブロックを列単位で読めるようにした（突破口）
+
+`decode_chunk_light` の strict 失敗は区間長の desync ではなく、
+`non_air != sum(st not in AIR_STATES)` の**fixture の air state id 不一致**だけだった。
+区間の palette を registry 上限なしで読むと vanilla のブロックが読める。
+
+chunk (0,0) の x=2..4, z=12 を比較:
+
+```
+mc-spine:  y=62 dirt,  y=65-66 oak_leaves
+vanilla :  y=62 grass_block,  上は空気
+```
+
+残差の「vanilla に無い木」の下は、mc-spine が `dirt`、vanilla が `grass_block`。
+つまり light でも tree RNG でもなく、**地表材質ルール（surface rule）が
+grass_block を置くべき列で dirt を置いている**のが根。tree の RNG 照合は
+高さ・trunk・selector・foliage 高さ/半径・skip 判定・座標ループすべて一致済み
+（`be25cbd` を含む）。
+
+次の一手は `src/worldgen.rs` の surface rule（`mat`/`eval_rule`）で、
+`grass_block` を置く条件（上に空気、biome、`stone_depth_above` 等）を
+vanilla と突き合わせること。
