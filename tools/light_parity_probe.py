@@ -40,6 +40,16 @@ def main():
             return 1
         masks, sky, block = c.chunk_light[(cx, cz)]
         print(f"chunk {cx},{cz} sky_mask={masks[0]:#x} block_mask={masks[1]:#x}")
+        # The MOTION_BLOCKING heightmap is terrain, independent of the light engine: two servers
+        # with the same heightmap for a chunk have the same terrain under its light.
+        r = protocol767.Reader(c.raw_chunk[(cx, cz)])
+        r.number(">i")
+        r.number(">i")
+        hm = r.nbt().get("MOTION_BLOCKING")
+        if isinstance(hm, list):
+            print("heightmap", hashlib.sha256(b"".join(
+                int(v).to_bytes(8, "big") for v in hm)).hexdigest()[:16])
+            print("heights", ",".join(str(v) for v in hm))
         for kind, arrs in (("sky", sky), ("block", block)):
             for i, a in enumerate(arrs):
                 print(f"{kind}[{i}] {hashlib.sha256(a).hexdigest()[:16]}")

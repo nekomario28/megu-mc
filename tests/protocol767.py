@@ -127,15 +127,20 @@ def decode_chunk_light(body, biome_count):
     assert isinstance(heightmaps, dict) and "MOTION_BLOCKING" in heightmaps
     data = Reader(reader.take(reader.varint()))
     sections = []
-    for _ in range(24):
-        non_air = data.number(">h")
-        assert 0 <= non_air <= 4096
-        states = palette(data, 4096, 8, 4, STATE_COUNT)
-        if STRICT:
-            assert non_air == sum(st not in AIR_STATES for st in states), "non-air section count"
-        sections.append(states)
-        palette(data, 64, 3, 1, biome_count)
-    assert data.pos == len(data.data), "unparsed chunk section bytes"
+    if STRICT:
+        for _ in range(24):
+            non_air = data.number(">h")
+            assert 0 <= non_air <= 4096
+            states = palette(data, 4096, 8, 4, STATE_COUNT)
+            if STRICT:
+                assert non_air == sum(st not in AIR_STATES for st in states), "non-air section count"
+            sections.append(states)
+            palette(data, 64, 3, 1, biome_count)
+        assert data.pos == len(data.data), "unparsed chunk section bytes"
+    else:
+        # A live server's palette ids need not match the fixture's, and a probe reads the light
+        # below, so the section contents are skipped rather than asserted.
+        sections = None
     for _ in range(reader.varint()):
         reader.take(3)  # packed local x/z and signed y
         reader.varint()  # block entity type
@@ -232,6 +237,7 @@ class Client:
         self.chunks, self.messages, self.updates = {}, [], []
         self.light_updates = []
         self.chunk_light = {}
+        self.raw_chunk = {}
         self.pos, self.contract_started = None, False
         self.phase, self.registry_counts = "login", {}
 
@@ -266,6 +272,7 @@ class Client:
                 body, self.registry_counts["minecraft:worldgen/biome"])
             assert coord not in self.chunks, f"duplicate chunk {coord}"
             self.chunks[coord] = sections
+            self.raw_chunk[coord] = body
             self.chunk_light[coord] = (masks, sky, block)
         elif pid == 0x21:
             z, x = struct.unpack(">ii", body)
