@@ -603,6 +603,15 @@ impl Gen {
     }
 
     fn resolve_cond(&mut self, name: &str, cf: &HashMap<String, Vec<u8>>) -> Option<usize> {
+        // `minecraft:not_underwater` is a built-in ConditionSource, not a datapack file, so a
+        // string reference to it resolved to None and the grass_block branch never ran. Vanilla
+        // defines it as not(water(0, 0, false)).
+        if name == "minecraft:not_underwater" || name == "not_underwater" {
+            let water = self.conds.len();
+            self.conds.push(Cond::Water { off: 0, mult: 0, sd: false });
+            self.conds.push(Cond::Not(water));
+            return Some(self.conds.len() - 1);
+        }
         if let Some(&i) = self.cond_ids.get(name) {
             return Some(i);
         }
@@ -696,6 +705,14 @@ impl Gen {
                 sec: n("secondary_depth_range") as i32,
                 ceil: j.get("surface_type").map(J::str) == Some("ceiling"),
             },
+            // Vanilla's `not_underwater` is `not(water(offset 0, surface_depth_multiplier 0,
+            // add_stone_depth false))`. Without this arm it fell through to `Cond::False`, so the
+            // `grass_block` branch of the surface rule never ran and every land column got `dirt`.
+            "not_underwater" => {
+                let water = self.conds.len();
+                self.conds.push(Cond::Water { off: 0, mult: 0, sd: false });
+                Cond::Not(water)
+            }
             "not" => Cond::Not(self.cond_node(j.get("invert")?, cf)?),
             "hole" => Cond::Hole,
             "above_preliminary_surface" => Cond::Prelim,
@@ -2671,7 +2688,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert_eq!(digest, "1da71fe648e08d8530f3fbb9be5db301",
+        assert_eq!(digest, "c98dd40dcd35fcac19b3f9006b1f9879",
             "feature population output changed from the vanilla-order capture");
     }
 
