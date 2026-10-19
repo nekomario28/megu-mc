@@ -61,14 +61,14 @@ def fetch(port, cx, cz):
     protocol767.decode_chunk_light = capture
     with Client(port, "Diff") as client:
         try:
-            client.login(view=2)
+            client.login(view=8)
         except AssertionError:
             pass
-        # Vanilla ignores a teleport larger than its movement threshold ("moved too quickly"),
-        # so walk to the target in small steps and let it stream the chunks on the way.
-        tx, tz = cx * 16 + 8, cz * 16 + 8
+        # Vanilla rejects a move that exceeds its per-tick threshold ("moved too quickly"),
+        # so step one block at a time and give the server a tick between moves.
+        tx, tz = (cx * 16 + 8, cz * 16 + 8) if True else (0, 0)
         sx, sz = 0.0, 0.0
-        steps = int(max(abs(tx - sx), abs(tz - sz)) // 8) + 1
+        steps = int(max(abs(tx - sx), abs(tz - sz))) + 1
         for i in range(1, steps + 1):
             client.move(sx + (tx - sx) * i / steps, 80, sz + (tz - sz) * i / steps)
             try:
