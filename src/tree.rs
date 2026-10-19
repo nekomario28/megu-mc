@@ -1534,6 +1534,13 @@ pub(crate) struct TreeExtra {
 
 pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> bool {
     let height = t.trunk_placer.height(rng);
+    // Vanilla TreeFeature.place draws the foliage height and radius immediately after the
+    // trunk height, before the root placer and the trunk: foliageHeight(random, height),
+    // then foliageRadius(random, height - foliageHeight). Drawing them after the trunk
+    // (as this used to) shifted every later random value, which moved the placed tree.
+    let foliage_h = t.foliage_placer.rand_height(rng, height);
+    let base_h = height - foliage_h;
+    let frad = t.foliage_placer.rand_radius(&t.foliage_radius, rng, base_h);
     let trunk_start = t
         .root_placer
         .as_ref()
@@ -1581,9 +1588,6 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
     let trunk_st = t.trunk_bsp.get(ctx, rng, pos.0, pos.1, pos.2);
     let (nodes, logs) =
         t.trunk_placer.generate(ctx, rng, top.max(0), trunk_start, &t.below_trunk, trunk_st, t);
-    let foliage_h = t.foliage_placer.rand_height(rng, height);
-    let base_h = height - foliage_h;
-    let frad = t.foliage_placer.rand_radius(&t.foliage_radius, rng, base_h);
     let foliage_st = t.foliage_bsp.get(ctx, rng, pos.0, pos.1, pos.2);
     let mut foliage = vec![];
     for node in &nodes {
