@@ -8896,9 +8896,12 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
     for lz in 0..16usize {
         for lx in 0..16usize {
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-            let mut y = height_at(x, z) - 1;
+            // Vanilla's floor is the first light-blocking block from the top. Scan down from above
+            // the water/leaf top so a leaf is seen before the ground, but start from a bounded
+            // height: scanning from the world top costs 384 lookups a column and stalls large views.
+            let mut y = height_at(x, z) + 17;
             let mut steps = 0;
-            while steps < 16 {
+            while steps < 24 {
                 if opacity(x, y, z) > 0 {
                     break;
                 }
