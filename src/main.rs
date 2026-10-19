@@ -9135,9 +9135,12 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
     let mut tops = [0i32; 256];
-    for lz in 0..16usize { for lx in 0..16usize {
-        tops[lz * 16 + lx] = surface_y(cx * 16 + lx as i32, cz * 16 + lz as i32) as i32;
-    }}
+    if let Some(c) = worldgen::chunk_cols(cx, cz) {
+        for lz in 0..16usize { for lx in 0..16usize {
+            // MOTION_BLOCKING is the top of the fluid-inclusive surface, not the density top.
+            tops[lz * 16 + lx] = c.wtop(lx, lz) + 1;
+        }}
+    }
     p.extend_from_slice(&heightmaps_nbt(&tops));
     let data = chunk_data(cx, cz, gen);
     write_varint(&mut p, data.len() as i64);
