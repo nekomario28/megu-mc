@@ -64,10 +64,11 @@ feature 層の残差（chunk (0,0) で 10939 セル）は同梱 worldgen デー�
 [光の比較](../../evidence/gameplay/light/vanilla-comparison.md)。
 
 **M3 の訂正**: Q に記録した x0.63（mc-spine 10.16s 対 vanilla 16.09s）は、地形が
-一致していない状態の値であり、現在の代表値として使わない。地形一致後の再測は
-**mc-spine 19.87s 対 vanilla 17.53s（x1.13）で M3 は未達**（RSS 144.7 対
-1159.7 MiB、threads 3 対 63）。証拠は
-[代表負荷比較](../../evidence/gameplay/load-compare/README.md)。
-次のスライスは生成器の費用削減で、地形パリティを崩さずに `block_density` の
-再評価を減らす（1 チャンクあたり fill・surface 走査・material 窓で同じセルを
-2〜3 回評価している）。
+一致していない状態の値であり、現在の代表値として使わない。地形一致後、8 回の
+移動視点比較の中央値は **mc-spine 17.96s 対 vanilla 16.33s（x1.10）で M3 は未達**
+（RSS 142 対 ~1160 MiB、threads 3 対 62-64）。spawn burst を除いた `WARM=1` の
+3 回は **x1.65-2.85（中央値 x1.79）**で、残差は移動中のチャンク生成（feature の
+単一スレッド実行）にある。証拠:
+[生成器の費用](../../evidence/gameplay/worldgen-cost/README.md)。
+次のスライスは生成の並列化（owner: region/chunk pipeline）で、それまでは
+`ore_dirt` / `monster_room` のループを削る。

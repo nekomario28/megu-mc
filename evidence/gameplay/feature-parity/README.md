@@ -71,3 +71,38 @@ height_range / biome フィルタ）と ore 本体の RNG 消費・target 判定
 
 - 10939/10874 は 1 seed・1 chunk の wire 値。feature 全体の一致ではない。
 - `FEAT_PROFILE` の時間は診断用で、絶対値の主張には使わない。
+
+## 石系 ore の位置ずれ（2026-10-20 の調査、未解決）
+
+「biome リストか feature index が違う」という仮説を、次の順で確かめた。
+
+1. **RNG の基本演算は一致**: `XoroshiroRandomSource(60007)` の
+   nextLong / nextInt(16) / nextFloat / nextDouble を、vanilla の server jar の
+   `dzz` を Java から直接呼んだ列と mc-spine の `Xor` で比較し、**8 個の組が
+   完全一致**した（seed 60007 = step 6 の gi 7 + 10000*6）。`nextInt(bound)` は
+   Lemire の乗算高位 + 棄却で、`RandomSupport` の実装と一致する。
+2. **step 6 の並び**: mc-spine の `order[6]` は
+   `0:ore_dirt 1:ore_gravel 2:ore_granite_upper 3:ore_granite_lower
+   4:ore_diorite_upper 5:ore_diorite_lower 6:ore_andesite_upper
+   7:ore_andesite_lower 8:ore_tuff ...`（34 個）。
+3. **gi の総当たり**: `ore_andesite_lower` の gi を 0..23 で振り、chunk (0,0) の
+   andesite セルを vanilla の 1908 セルと比較。最大の一致は gi=8 の 472（25%）。
+   次に step 6 全体を -12..+12 シフトして測ると、+1 が最良で 412（22%）。
+   どれも一致しない。
+4. **biome の iteration 順**: vanilla の `OverworldBiomeBuilder` の
+   parameter list 順（deep_frozen_ocean 始まり、53 biome）を bytecode から
+   取り出して `OW_BIOMES` に使うと、chunk (0,0) の feature あり diff は
+   10874 → 11070 と**悪化**した（gi は並びに鈍感で、DFS の結果が変わらない）。
+   採用せず。
+
+**結論**: 種（decoration seed / feature seed / RNG 演算）は一致している。
+残差は ore の**実行**（modifier の適用順・biome フィルタ・vein のループ）にあり、
+gi のずれでは説明できない。次の一手は、vanilla の `OreFeature.place` と
+`PlacedFeature.placeWithContext` の stream 意味論（どの位置でどの順に RNG を
+引くか）を、mc-spine の `gen_pf` と 1 対 1 で突き合わせること。mc-spine 側の
+`FEAT_POS` のような位置ダンプと、vanilla 側の Java からの同種の呼び出しで
+最初の 1 vein のセル集合を比較するのが最も速い。
+
+この調査で使った一時的な計測（`FEAT_GI`、`FEAT_GI_SHIFT`、`FEAT_POS`、
+step リストのダンプ）は、結論を出して**撤回**した（hot path に env 参照を
+残さないため）。再現手順はこの節のとおり。

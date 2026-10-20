@@ -72,8 +72,9 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 
 ### R3 M3「軽量の証明」（地形一致後の再測で未達、削減が次のスライス）
 
-- 地形一致後に測り直した: **CPU x1.13**（mc-spine 19.87s / 144.7MiB / 3thr 対
-  vanilla 17.53s / 1159.7MiB / 63thr、20 秒窓）。以前の x0.63 は地形不一致時の値。
+- 地形一致後に測り直した: 8 回の 20 秒窓で中央値 **x1.10**（mc-spine 17.96s /
+  142MiB / 3thr 対 vanilla 16.33s / ~1160MiB）。spawn burst を除く `WARM=1` は
+  **x1.65-2.85（中央値 x1.79）**。以前の x0.63 は地形不一致時の値。
 - 内訳（release）: `chunk_cols` 11.5 ms/chunk、feature の populate 約 60 ms/chunk。
   **生成時間の約 84% は feature**で、上位は `ore_dirt` 13 ms/chunk、
   `monster_room(_deep)` 9.7 ms、`ore_gravel` 3.9 ms など。populate の 45% は
@@ -81,10 +82,10 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
   [生成器の費用](../../evidence/gameplay/worldgen-cost/README.md)。
 - チャンク単位の地形配列は試して撤回（構築 20.7 ms/chunk、移動視点で悪化）。
   feature 側の列取得をチャンク単位にキャッシュして読みを 1797 → 295 ns/call、
-  `populate9` を 667 → 411 ms にした。移動視点 4 回の中央値は **x1.08**で、
-  M3 はまだ未達（単発の x0.83 は主張しない）。次のスライスは feature ロジック
-  本体（`ore_dirt`、`monster_room`）と、ログイン burst を除く測定。並列化は
-  所有者（region/chunk pipeline）を決めてから。
+  `populate9` を 667 → 411 ms にした。それでも M3 は未達。残差は feature の
+  単一スレッド実行なので、次のスライスは **チャンク生成の並列化**
+  （owner: region/chunk pipeline）。並列化までは `ore_dirt`/`monster_room` の
+  ループ削減。測定は `WARM=1` を標準にする。
 - 出口: 同一 seed・同一負荷で CPU を再測定し、x1.10 未満の差は主張しない。
 
 ### R4 統合・公開

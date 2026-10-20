@@ -6,16 +6,17 @@
 
 ## 進行中
 
-- [ ] **R3 feature ロジック本体の削減**（M3 は中央値 x1.08 でまだ未達）
+- [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）
   - 現在: `populate9` 60 → 37 ms/chunk（地形読み 1797 → 295 ns/call、FC の列
-    キャッシュを採用）。移動視点 4 回の中央値は vanilla 16.68 対 mc-spine 17.94
-    （x1.08、RSS は 145 対 1114-1183 MiB）。単発の x0.83 は主張しない。
+    キャッシュを採用）。burst 込み 8 回の中央値 x1.10（RSS 142 対 ~1160 MiB）、
+    burst を除く 3 回は x1.65-2.85。単発の x0.83 は主張しない。
   - チャンク単位の地形配列は**撤回**（構築 20.7 ms/chunk、移動視点で悪化）。
-  - 次: `ore_dirt`（読みを除いても 11.7 ms/chunk）と `monster_room(_deep)`
-    （計 8.9 ms）を 1 つ選び、候補セル数・書き込み数・ループ内の計算量を測る。
-    ログイン burst を窓から除外する測定も用意する。並列化は所有者を決めてから。
-  - 判定: `FEAT_PROFILE` の該当 feature と `load_compare.sh` の中央値。x1.10 未満は
-    主張しない。
+  - 残差は feature の単一スレッド実行（vanilla は 62-64 スレッド）。次は
+    region/chunk pipeline の所有者を決め、読み取り専用の base terrain と
+    チャンク単位で閉じた feature 書き込みを worker に渡して決定的にマージする。
+  - 並列化までの間は `ore_dirt`（11.7 ms/chunk）と `monster_room(_deep)`
+    （計 8.9 ms）のループ削減。測定は `WARM=1` を標準にする。
+  - 判定: `load_compare.sh` の `WARM=1` 中央値。x1.10 未満は主張しない。
 
 ## 次
 
@@ -58,6 +59,12 @@
       vanilla と一致（mask の送り方だけ差）。
 - [x] R1a スライス1: biome の feature リストを 1.21.1 の jar から差し替え
       （feature あり 10939 → 10874）。ore 定義は jar と同一と確認。
+- [x] 石系 ore のずれを調査: RNG 演算は vanilla と完全一致、gi の総当たり
+      （0..23）と全体シフト（-12..+12）でも vanilla の andesite に一致しない。
+      biome の iteration 順の変更は悪化。残差は ore の実行側（未解決）。
+- [x] M3: 8 回の burst 込み中央値 x1.10、`WARM=1` で x1.79。定常の feature 実行が
+      律速と特定（`tools/load_compare.sh` の `WARM=1` を追加）。
+- [x] LICENSE（MIT）と第三者データの境界を明記（#11 のソース側）。
 - [x] ローカル `depsgx` を固定 revision の venv に置き換え（同一バージョン表記の古い
       ビルドが cycle を 1 件しか報告しなかった）。
 

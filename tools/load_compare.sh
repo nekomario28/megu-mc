@@ -57,6 +57,13 @@ wait_for_line() { # logfile pid marker timeout_s
 
 sample_load() { # pid port loadout
   local pid=$1 port=$2 out=$3 hz c0 c1 rss thr load
+  # WARM=1 spends one window driving first, so the measured window does not
+  # contain the spawn/ login burst. The sweep is deterministic, so the warm pass
+  # covers the first half of the path and the measured pass the second.
+  if [ "${WARM:-0}" = 1 ]; then
+    ( cd "$ROOT" && timeout $((SECONDS_WINDOW + 30)) \
+        python3 tools/load_client.py "$port" "$SECONDS_WINDOW" LoadWarm ) >/dev/null 2>&1 || true
+  fi
   hz=$(getconf CLK_TCK)
   c0=$(awk '{print $14+$15}' "/proc/$pid/stat")
   # Let the viewer settle, then measure the same window of movement.
