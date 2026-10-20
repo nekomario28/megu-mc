@@ -312,3 +312,29 @@ z が 5 ずれる）。
 `duy` → `dvj`）を差し替えて**、実際に書かれたセルと `placeWithContext` の
 位置ストリームを vanilla から直接取ること。現状のプローブは
 `level.hasChunkAt` が false を返すため書き込み経路に入らない（draw 数は取れる）。
+
+## 2026-10-20（続き7）: vein の幾何は完全一致（harness で 666/666）
+
+Java プローブ（`tools/vanilla-probe/OreCells.java`）で vanilla の
+`OreFeature.place` を偽 level 上で走らせ、書き込みセルを取った。level は
+`dcx.a(int,int)` → `duy` → `LevelChunkSection` を差し替え（`Unsafe` で確保）、
+`RandomSource` は呼び出しを数える Proxy。
+
+seed 60007・位置 (7,49,13)・size 64 で:
+
+| | セル数 | 一致 |
+|---|---|---|
+| vanilla `OreFeature.place` | 666 | — |
+| `tools/ore_oracle.py` | 666 | **666/666（完全一致）** |
+
+これで **vein の幾何は確定**: `Mth.sin` の表による半径、`Math.sin` の中心、
+double の `Mth.lerp`、collapse、r=1 の楕円体判定、x→y→z の走査はすべて正しい。
+残差は**位置だけ**に絞られた。
+
+位置については、チェーン（count 0 draw / in_square 2 / height 1 / feature 67）を
+bytecode どおりに再現すると位置2 = (5,6,2) になるが、隔離した count=2 の
+vanilla 世界にはその vein が無い（in-box 497 セルのうち 1 セルだけ一致）。
+位置1 (7,49,13) は一致する（in-box 474 のうち 262、残りは洞窟の空気）。
+したがって「位置1の vein の後、位置2の in_square までに draw が入る」以外に
+説明がなく、次はプローブで `ejb`（CountPlacement）と `eis`（InSquarePlacement）の
+`getPositions` を直接呼び、draw 数と位置を vanilla から取る。
