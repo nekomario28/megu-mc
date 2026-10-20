@@ -42,6 +42,14 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 [復元と検証の記録](RESTORATION.md)を参照。
 
+## ライセンスと第三者データ
+
+このリポジトリのコードは MIT（[LICENSE](LICENSE)）。ただし `datapacks/vanilla/` の
+worldgen データ、`assets/` と `resourcepack.zip` の Mojang 由来資産、
+`config_packets.bin` は MIT の対象ではない。1.21.1 の互換検証に使う派生物であり、
+再配布・利用条件は Mojang の EULA と同データの出所に従う。Pumpkin など他実装の
+GPL コードは取り込んでいない（[#3 の由来メモ](https://github.com/nekomario28/mc-spine/issues/3)）。
+
 ## ゲーム時間と処理省略
 
 [時間契約の実装計画](specs/time-contract/README.md)に従い、vanillaの結果を保つ時間基準と、
