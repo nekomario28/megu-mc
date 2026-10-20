@@ -14607,6 +14607,37 @@ fn main() {
             let _ = c.surface(0, 0);
         }}
         eprintln!("[wgprof] {}x{} chunks in {:?} ({:.1} ms/chunk)", n, n, t0.elapsed(), t0.elapsed().as_secs_f64()*1000.0/(n*n) as f64);
+        if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP") {
+            // Offline block dump for parity diffs: `MC_SPINE_WG_DUMP_N` chunks per
+            // side from (0,0), each section in the send layout `(ly<<8)|(lz<<4)|lx`.
+            // `tools/carver_diff.py` reads it against a vanilla region file.
+            let n: i32 = std::env::var("MC_SPINE_WG_DUMP_N")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+            let ox: i32 = std::env::var("MC_SPINE_WG_DUMP_X")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let oz: i32 = std::env::var("MC_SPINE_WG_DUMP_Z")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let (lo, hi) = (worldgen::min_y(), worldgen::max_y());
+            let mut out: Vec<u8> = Vec::new();
+            let t1 = Instant::now();
+            for dz in 0..n {
+                for dx in 0..n {
+                    let (cx, cz) = (ox + dx, oz + dz);
+                    let mut sy = lo;
+                    while sy <= hi {
+                        let arr = worldgen::terrain_section(cx, sy, cz, crate::feature::populate)
+                            .unwrap_or_else(|| Box::new([0u32; 4096]));
+                        for v in arr.iter() {
+                            out.extend_from_slice(&v.to_le_bytes());
+                        }
+                        sy += 16;
+                    }
+                }
+            }
+            std::fs::write(&path, &out).unwrap();
+            eprintln!("[wgdump] {} chunks -> {} ({} bytes) in {:?}",
+                n * n, path, out.len(), t1.elapsed());
+        }
         if std::env::var("WGDIFF").is_ok() {
             // vanilla reference values at (0,0,0) seed 0 from pumpkin test data
             for (name, want) in [

@@ -1666,6 +1666,730 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
     }
 }
 
+// ---------- carvers (GenerationStep.Carving.AIR) ----------
+//
+// Vanilla `NoiseBasedChunkGenerator.applyCarvers` walks the -8..8 chunk
+// neighbourhood, asks each neighbour's biome (sampled at that chunk's minimum
+// corner, y=0) for its carver list, reseeds a `LegacyRandomSource` per carver
+// index and lets every carver that "starts" carve tunnels into THIS chunk
+// through the chunk's shared `CarvingMask`. The port keeps that shape: one pass
+// per target chunk, run before its features, writing into the same override map
+// the feature layer uses so everything downstream sees the caves.
+//
+// Every constant below is from the 1.21.1 bytecode (`ebb` CaveWorldCarver,
+// `ebe` WorldCarver, `eaw` CanyonWorldCarver, `dux` CarvingMask,
+// `dzb.a(arb,long,...)` applyCarvers), not from a decompiler's guess.
+
+/// `2 * getRange() - 1` as a block distance: WorldCarver.getRange() is 8 and the
+/// cave tunnel count is `112 - nextInt(112 / 4)` steps; the canyon multiplies the
+/// same 112 by its `distance_factor`.
+const CARVE_STEPS: i32 = 112;
+
+/// `2 * PI` as the 1.21.1 bytecode spells it (`ldc 6.2831855f`).
+const TAU: f32 = 6.283_185_5;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CKind {
+    Cave,
+    Canyon,
+}
+
+/// A `VerticalAnchor`: absolute, above the bottom of the world, or below its top.
+#[derive(Clone, Copy)]
+enum Anchor {
+    Abs(i32),
+    AboveBottom(i32),
+    BelowTop(i32),
+}
+
+impl Anchor {
+    fn resolve(self, min_y: i32, height: i32) -> i32 {
+        match self {
+            Anchor::Abs(v) => v,
+            Anchor::AboveBottom(v) => min_y + v,
+            Anchor::BelowTop(v) => min_y + height - v,
+        }
+    }
+}
+
+/// A `FloatProvider` sample. `uniform` is min-inclusive/max-exclusive; the
+/// `trapezoid` form draws twice and lands in the middle more often.
+#[derive(Clone, Copy)]
+enum FProv {
+    Const(f32),
+    Uniform(f32, f32),
+    Trapezoid(f32, f32, f32),
+}
+
+impl FProv {
+    fn sample(self, r: &mut Lcg) -> f32 {
+        match self {
+            FProv::Const(v) => v,
+            FProv::Uniform(lo, hi) => r.next_f32() * (hi - lo) + lo,
+            FProv::Trapezoid(lo, hi, plateau) => {
+                let range = hi - lo;
+                let half = (range - plateau) / 2.0;
+                let flat = range - half;
+                lo + r.next_f32() * flat + r.next_f32() * half
+            }
+        }
+    }
+}
+
+/// A `HeightProvider`. The uniform form draws twice (`UniformHeight` in the
+/// bytecode: `nextInt(range)` then `nextInt(k + 1) + min`), so the draw count is
+/// part of the contract.
+#[derive(Clone, Copy)]
+enum HProv {
+    Const(Anchor),
+    Uniform(Anchor, Anchor),
+}
+
+impl HProv {
+    fn sample(self, r: &mut Lcg, min_y: i32, height: i32) -> i32 {
+        match self {
+            HProv::Const(a) => a.resolve(min_y, height),
+            HProv::Uniform(a, b) => {
+                let lo = a.resolve(min_y, height);
+                let hi = b.resolve(min_y, height);
+                let n = hi - lo;
+                if n <= 0 {
+                    return lo;
+                }
+                let k = r.next_bound(n);
+                r.next_bound(k + 1) + lo
+            }
+        }
+    }
+}
+
+struct CarverDef {
+    kind: CKind,
+    probability: f32,
+    y: HProv,
+    y_scale: FProv,
+    lava: Anchor,
+    replaceable: String,
+    // CaveCarverConfiguration
+    floor: FProv,
+    horiz: FProv,
+    vert: FProv,
+    // CanyonCarverConfiguration
+    rotation: FProv,
+    canyon: Option<CanyonShape>,
+}
+
+/// `CanyonShapeConfiguration`, flattened. Field order matches its codec:
+/// distance_factor, thickness, width_smoothness, horizontal_radius_factor,
+/// vertical_radius_default_factor, vertical_radius_center_factor.
+#[derive(Clone, Copy)]
+struct CanyonShape {
+    distance: FProv,
+    thickness: FProv,
+    width_smoothness: i32,
+    horizontal_radius: FProv,
+    vertical_default: f32,
+    vertical_center: f32,
+}
+
+struct CarverReg {
+    cfg: HashMap<String, CarverDef>,
+    /// biome -> carver ids, in the order the biome lists them (the index is the
+    /// seed offset, so the order is load-bearing)
+    biome: HashMap<String, Vec<String>>,
+}
+
+pub(crate) fn creg() -> &'static CarverReg {
+    static R: std::sync::OnceLock<CarverReg> = std::sync::OnceLock::new();
+    R.get_or_init(load_creg)
+}
+
+fn load_creg() -> CarverReg {
+    let mut reg = CarverReg { cfg: HashMap::new(), biome: HashMap::new() };
+    for (name, b) in Gen::dp_files("configured_carver") {
+        if let Some(j) = jparse(&b) {
+            match p_carver(&j) {
+                Some(d) => {
+                    reg.cfg.insert(name, d);
+                }
+                // A carver type this port does not implement must not silently
+                // become a different algorithm: it stays out of the registry and
+                // the miss is reported once.
+                None => eprintln!("[carver] unsupported configured_carver {name}"),
+            }
+        }
+    }
+    for (name, b) in Gen::dp_files("biome") {
+        if let Some(j) = jparse(&b) {
+            if let Some(list) = jarr(&j, "carvers") {
+                reg.biome
+                    .insert(name, list.iter().map(|v| ns_name(v.str())).collect());
+            }
+        }
+    }
+    reg
+}
+
+fn p_anchor(j: &J) -> Option<Anchor> {
+    if let Some(v) = jnum(j, "absolute") {
+        return Some(Anchor::Abs(v as i32));
+    }
+    if let Some(v) = jnum(j, "above_bottom") {
+        return Some(Anchor::AboveBottom(v as i32));
+    }
+    if let Some(v) = jnum(j, "below_top") {
+        return Some(Anchor::BelowTop(v as i32));
+    }
+    None
+}
+
+fn p_fprov(j: &J) -> FProv {
+    // the codec is `either(float, FloatProvider)`: a bare number is a constant
+    if let J::Num(v) = j {
+        return FProv::Const(*v as f32);
+    }
+    let ty = jstr(j, "type").unwrap_or_default();
+    match ty.rsplit(':').next().unwrap_or(&ty) {
+        "constant" => FProv::Const(jf32(j, "value", 0.0)),
+        "trapezoid" => {
+            FProv::Trapezoid(jf32(j, "min", 0.0), jf32(j, "max", 0.0), jf32(j, "plateau", 0.0))
+        }
+        _ => {
+            let lo = jf32(j, "min_inclusive", jf32(j, "min_exclusive", 0.0));
+            let hi = jf32(j, "max_exclusive", jf32(j, "max_inclusive", 0.0));
+            FProv::Uniform(lo, hi)
+        }
+    }
+}
+
+fn fprov(j: &J, key: &str) -> FProv {
+    js(j, key).map(p_fprov).unwrap_or(FProv::Const(0.0))
+}
+
+fn p_hprov(j: &J) -> Option<HProv> {
+    let ty = jstr(j, "type")?;
+    match ty.rsplit(':').next().unwrap_or(&ty) {
+        "constant" => Some(HProv::Const(p_anchor(js(j, "value")?)?)),
+        "uniform" => Some(HProv::Uniform(
+            p_anchor(js(j, "min_inclusive")?)?,
+            p_anchor(js(j, "max_inclusive")?)?,
+        )),
+        _ => None,
+    }
+}
+
+fn p_carver(j: &J) -> Option<CarverDef> {
+    let ty = jstr(j, "type")?;
+    let kind = match ty.rsplit(':').next().unwrap_or(&ty) {
+        "cave" => CKind::Cave,
+        "canyon" => CKind::Canyon,
+        _ => return None,
+    };
+    let cfg = js(j, "config")?;
+    let canyon = js(cfg, "shape").map(|s| CanyonShape {
+        distance: fprov(s, "distance_factor"),
+        thickness: fprov(s, "thickness"),
+        width_smoothness: jint(s, "width_smoothness", 3),
+        horizontal_radius: fprov(s, "horizontal_radius_factor"),
+        vertical_default: jf32(s, "vertical_radius_default_factor", 1.0),
+        vertical_center: jf32(s, "vertical_radius_center_factor", 0.0),
+    });
+    if kind == CKind::Canyon && canyon.is_none() {
+        return None;
+    }
+    Some(CarverDef {
+        kind,
+        probability: jf32(cfg, "probability", 0.0),
+        y: p_hprov(js(cfg, "y")?)?,
+        y_scale: p_fprov(js(cfg, "yScale")?),
+        lava: p_anchor(js(cfg, "lava_level")?)?,
+        // the JSON keeps the `#` tag marker; `in_tag` is keyed without it
+        replaceable: ns_name(jstr(cfg, "replaceable")?.trim_start_matches('#')),
+        floor: fprov(cfg, "floor_level"),
+        horiz: fprov(cfg, "horizontal_radius_multiplier"),
+        vert: fprov(cfg, "vertical_radius_multiplier"),
+        canyon,
+        rotation: fprov(cfg, "vertical_rotation"),
+    })
+}
+
+/// `WorldgenRandom.setLargeFeatureSeed`: two raw longs and a XOR, no `|1` — the
+/// population seed used by the feature layer is a different function.
+fn set_large_feature_seed(r: &mut Lcg, seed: u64, cx: i32, cz: i32) {
+    let mut s = Lcg::new(seed);
+    let l = s.next_i64();
+    let m = s.next_i64();
+    *r = Lcg::new(((cx as i64).wrapping_mul(l) ^ (cz as i64).wrapping_mul(m) ^ seed as i64) as u64);
+}
+
+/// `CaveWorldCarver.getYScale`: two floats plus an occasional 1-in-10 room bulge.
+fn cave_rng_y_scale(r: &mut Lcg) -> f32 {
+    let mut f = r.next_f32() * 2.0 + r.next_f32();
+    if r.next_bound(10) == 0 {
+        f *= r.next_f32() * r.next_f32() * 3.0 + 1.0;
+    }
+    f
+}
+
+/// `CanyonWorldCarver.getWidths`: one squared width per block of world height,
+/// re-drawn every `width_smoothness` blocks. The height index is absolute world
+/// height, so the array is `getGenDepth()` long from the bottom.
+fn canyon_widths(depth: usize, smoothness: i32, r: &mut Lcg) -> Vec<f32> {
+    let mut out = vec![0.0f32; depth];
+    let mut f = 1.0f32;
+    for (i, slot) in out.iter_mut().enumerate() {
+        // `i == 0 ||` short-circuits, so the first entry never draws nextInt
+        if i == 0 || r.next_bound(smoothness) == 0 {
+            f = 1.0 + r.next_f32() * r.next_f32();
+        }
+        *slot = f * f;
+    }
+    out
+}
+
+/// `CanyonWorldCarver.getY`: a triangular vertical-radius window over the
+/// branch index, times `yScale`, times a 0.75..1.0 jitter.
+fn canyon_y(shape: CanyonShape, r: &mut Lcg, y_scale: f64, branch_count: f32, i: f32) -> f64 {
+    let w = 1.0 - ((0.5 - i / branch_count).abs() * 2.0);
+    let f = shape.vertical_default + shape.vertical_center * w;
+    f as f64 * y_scale * (r.next_f32() * 0.25 + 0.75) as f64
+}
+
+/// One target chunk's carving state: the shared mask, the cells written so far,
+/// and the `CarvingContext` facts the carve reads (world bounds, floor level).
+struct CarveRun {
+    tx: i32,
+    tz: i32,
+    min_y: i32,
+    height: i32,
+    /// `floor_level` of the carver being applied: `skip` rejects cells at or
+    /// below it, and vanilla builds that predicate once per carve call.
+    floor: f64,
+    mask: Vec<u64>,
+    out: HashMap<(u8, i32, u8), u32>,
+    /// Probe mode: pretend every cell is stone and every aquifer sample is cave
+    /// air, and print the writes. That is the world `CarverProbe.java` gives
+    /// vanilla, so the two cell sets can be compared without a worldgen behind
+    /// either side.
+    probe: bool,
+    probe_air: u32,
+    probe_lava: u32,
+}
+
+impl CarveRun {
+    #[inline]
+    fn idx(&self, lx: i32, y: i32, lz: i32) -> usize {
+        (((y - self.min_y) << 8) | ((lz & 15) << 4) | (lx & 15)) as usize
+    }
+    #[inline]
+    fn mask_get(&self, lx: i32, y: i32, lz: i32) -> bool {
+        let i = self.idx(lx, y, lz);
+        self.mask[i >> 6] >> (i & 63) & 1 != 0
+    }
+    #[inline]
+    fn mask_set(&mut self, lx: i32, y: i32, lz: i32) {
+        let i = self.idx(lx, y, lz);
+        self.mask[i >> 6] |= 1 << (i & 63);
+    }
+    /// The chunk's block state as the carver sees it: cells carved earlier in
+    /// this pass, else the surface-rule terrain.
+    fn read(&self, g: &mut Gen, cc: &ChunkCols, x: i32, y: i32, z: i32) -> u32 {
+        if self.probe {
+            return breg().map_or(1, |b| b.state_of("minecraft:stone", None));
+        }
+        match self.out.get(&((x & 15) as u8, y, (z & 15) as u8)) {
+            Some(&st) => st,
+            None => g.terrain_cell(cc, x, y, z),
+        }
+    }
+}
+
+/// `NoiseBasedChunkGenerator.applyCarvers` for one target chunk.
+///
+/// Diagnostics are env-gated and deliberately small, because each one is a way to
+/// compare against vanilla without a second implementation standing in for it:
+///
+/// * `MC_SPINE_NOCARVE` — skip carvers (the "no carvers" world fixture).
+/// * `CARVE_TRACE` — one line per chunk: configs loaded, starts, cells written.
+/// * `CARVE_PROBE=<tx,tz>|all` — carve an all-stone world (every ellipsoid cell is
+///   replaceable and the aquifer answers cave_air) and print the writes. That is
+///   the world `tools/vanilla-probe/CarverProbe.java` gives vanilla, so the two
+///   cell sets compare directly.
+/// * `CARVE_ONLY=<carver id>` — run a single carver (cave / canyon / …).
+/// * `CARVE_DUMP_WRITES=<tx,tz>` — print the real (terrain-filtered) writes.
+pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
+    if std::env::var("MC_SPINE_NOCARVE").is_ok() {
+        return;
+    }
+    let reg = creg();
+    if reg.cfg.is_empty() || reg.biome.is_empty() || breg().is_none() {
+        return;
+    }
+    let Some(cc) = g.cols(tx, tz) else { return };
+    let trace = std::env::var("CARVE_TRACE").is_ok();
+    let here = format!("{tx},{tz}");
+    let probe_env = std::env::var("CARVE_PROBE").ok();
+    let probe_here = probe_env.as_deref() == Some("all") || probe_env.as_deref() == Some(&here);
+    let dump_here = std::env::var("CARVE_DUMP_WRITES").ok().as_deref() == Some(&here);
+    let only = std::env::var("CARVE_ONLY").ok();
+    let (min_y, height, wseed) = (g.min_y, g.height, g.wseed());
+    let mut run = CarveRun {
+        tx,
+        tz,
+        min_y,
+        height,
+        floor: 0.0,
+        mask: vec![0u64; (height as usize * 256).div_ceil(64)],
+        out: HashMap::new(),
+        probe: probe_here,
+        probe_air: breg().map_or(12959, |b| b.state_of("minecraft:cave_air", None)),
+        probe_lava: breg().map_or(96, |b| b.state_of("minecraft:lava", None)),
+    };
+    let mut starts = 0u32;
+    for ox in tx - 8..=tx + 8 {
+        for oz in tz - 8..=tz + 8 {
+            // the carver list comes from the biome at the neighbour chunk's
+            // minimum corner at y=0, not from its centre
+            let Some(biome) = g.biome_name_at(ox * 16, 0, oz * 16) else { continue };
+            let Some(list) = reg.biome.get(&biome) else { continue };
+            for (k, name) in list.iter().enumerate() {
+                if only.as_deref().is_some_and(|only| only != name) {
+                    continue;
+                }
+                let Some(c) = reg.cfg.get(name) else { continue };
+                let mut r = Lcg::new(0);
+                set_large_feature_seed(&mut r, wseed.wrapping_add(k as u64), ox, oz);
+                if r.next_f32() > c.probability {
+                    continue;
+                }
+                starts += 1;
+                match c.kind {
+                    CKind::Cave => run.cave(g, &cc, c, &mut r, ox, oz),
+                    CKind::Canyon => run.canyon(g, &cc, c, &mut r, ox, oz),
+                }
+            }
+        }
+    }
+    if trace {
+        eprintln!(
+            "[carve] chunk {tx},{tz}: {} starts, {} mask bits, {} cells written",
+            starts,
+            run.mask.iter().map(|w| w.count_ones() as u64).sum::<u64>(),
+            run.out.len()
+        );
+    }
+    if probe_here || dump_here {
+        let tag = if probe_here { "CELL" } else { "WCELL" };
+        let mut cells: Vec<((u8, i32, u8), u32)> = run.out.iter().map(|(k, v)| (*k, *v)).collect();
+        cells.sort();
+        for ((lx, y, lz), st) in cells {
+            eprintln!(
+                "{tag} {} {} {} {}",
+                tx * 16 + lx as i32,
+                y,
+                tz * 16 + lz as i32,
+                st
+            );
+        }
+        eprintln!("PROBE {} cells={}", if probe_here { "stone" } else { "world" }, run.out.len());
+    }
+    for ((lx, y, lz), st) in std::mem::take(&mut run.out) {
+        g.feat_write(tx * 16 + lx as i32, y, tz * 16 + lz as i32, st);
+    }
+}
+
+impl CarveRun {
+    /// `CaveWorldCarver.carve`.
+    fn cave(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, r: &mut Lcg, ox: i32, oz: i32) {
+        // nextInt(nextInt(nextInt(getRange()) + 1) + 1); getRange() is 15 here
+        let inner = r.next_bound(15);
+        let mid = r.next_bound(inner + 1);
+        let tunnels = r.next_bound(mid + 1);
+        for _ in 0..tunnels {
+            let x = (ox * 16 + r.next_bound(16)) as f64;
+            let y = c.y.sample(r, self.min_y, self.height) as f64;
+            let z = (oz * 16 + r.next_bound(16)) as f64;
+            let hrm = c.horiz.sample(r) as f64;
+            let vrm = c.vert.sample(r) as f64;
+            self.floor = c.floor.sample(r) as f64;
+            let mut branches = 1i32;
+            if r.next_bound(4) == 0 {
+                let room_scale = c.y_scale.sample(r) as f64;
+                let thick = 1.0f32 + r.next_f32() * 6.0;
+                // carveRoom: an ellipsoid 1.5 blocks fatter than the tunnel,
+                // squashed vertically by yScale, centred one block +x
+                let hr = 1.5 + (mth_sin(std::f32::consts::FRAC_PI_2) * thick) as f64;
+                self.ellipsoid(g, cc, c, x + 1.0, y, z, hr, hr * room_scale);
+                branches += r.next_bound(4);
+            }
+            for _ in 0..branches {
+                let yaw = r.next_f32() * TAU;
+                let pitch = (r.next_f32() - 0.5) / 4.0;
+                let y_scale = cave_rng_y_scale(r);
+                // a tunnel is up to CARVE_STEPS long, minus up to a quarter
+                let count = CARVE_STEPS - r.next_bound(CARVE_STEPS / 4);
+                let seed = r.next_i64() as u64;
+                self.tunnel(
+                    g, cc, c, seed, x, y, z, hrm, vrm, y_scale, yaw, pitch, 0, count, 1.0,
+                );
+            }
+        }
+    }
+
+    /// `CanyonWorldCarver.carve`.
+    fn canyon(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, r: &mut Lcg, ox: i32, oz: i32) {
+        // `p_carver` refuses a canyon config without a shape, so this cannot be
+        // reached with one; the guard keeps the borrow honest.
+        let Some(shape) = c.canyon else { return };
+        let x = (ox * 16 + r.next_bound(16)) as f64;
+        let y = c.y.sample(r, self.min_y, self.height) as f64;
+        let z = (oz * 16 + r.next_bound(16)) as f64;
+        let yaw = r.next_f32() * TAU;
+        let rotation = c.rotation.sample(r);
+        let y_scale = c.y_scale.sample(r) as f64;
+        let thickness = shape.thickness.sample(r);
+        let count = (CARVE_STEPS as f32 * shape.distance.sample(r)) as i32;
+        let seed = r.next_i64() as u64;
+        self.canyon_tunnel(
+            g, cc, c, seed, x, y, z, thickness, yaw, rotation, 0, count, y_scale,
+        );
+    }
+
+    /// `CanyonWorldCarver.carveTunnel`: the cave walk with a per-height vertical
+    /// width profile (`getWidths`) instead of an ellipsoid, and its own `skip`.
+    #[expect(clippy::too_many_arguments)]
+    fn canyon_tunnel(
+        &mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, seed: u64,
+        mut x: f64, mut y: f64, mut z: f64, thickness: f32, mut yaw: f32, mut pitch: f32,
+        branch_index: i32, branch_count: i32, y_scale: f64,
+    ) {
+        let Some(shape) = c.canyon else { return };
+        let mut r = Lcg::new(seed);
+        let widths = canyon_widths(self.height as usize, shape.width_smoothness, &mut r);
+        let mut yaw_drift = 0.0f32;
+        let mut pitch_drift = 0.0f32;
+        for i in branch_index..branch_count {
+            let mut d0 = 1.5 + (mth_sin(std::f32::consts::PI * i as f32 / branch_count as f32)
+                * thickness) as f64;
+            let d1 = d0 * y_scale;
+            d0 *= shape.horizontal_radius.sample(&mut r) as f64;
+            let d1 = canyon_y(shape, &mut r, d1, branch_count as f32, i as f32);
+            let cp = mth_cos(pitch);
+            let sp = mth_sin(pitch);
+            x += (mth_cos(yaw) * cp) as f64;
+            y += sp as f64;
+            z += (mth_sin(yaw) * cp) as f64;
+            pitch *= 0.7;
+            pitch += pitch_drift * 0.05;
+            yaw += yaw_drift * 0.05;
+            pitch_drift *= 0.8;
+            yaw_drift *= 0.5;
+            pitch_drift += (r.next_f32() - r.next_f32()) * r.next_f32() * 2.0;
+            yaw_drift += (r.next_f32() - r.next_f32()) * r.next_f32() * 4.0;
+            if r.next_bound(4) == 0 {
+                continue;
+            }
+            if !can_reach(self.tx, self.tz, x, z, i, branch_count, thickness) {
+                return;
+            }
+            self.canyon_ellipsoid(g, cc, c, x, y, z, d0, d1, &widths);
+        }
+    }
+
+    /// `CanyonWorldCarver.carveEllipsoid`: the canyon profile is a vertical
+    /// stack of widths, so the `skip` test is `(x^2 + z^2) * width + y^2 / 6`.
+    #[expect(clippy::too_many_arguments)]
+    fn canyon_ellipsoid(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
+                        x: f64, y: f64, z: f64, hr: f64, vr: f64, widths: &[f32]) -> bool {
+        let mid_x = (self.tx * 16 + 8) as f64;
+        let mid_z = (self.tz * 16 + 8) as f64;
+        let reach = 16.0 + hr * 2.0;
+        if (x - mid_x).abs() > reach || (z - mid_z).abs() > reach {
+            return false;
+        }
+        let (min_x, min_z) = (self.tx * 16, self.tz * 16);
+        let x0 = ((x - hr).floor() as i32 - min_x - 1).max(0);
+        let x1 = ((x + hr).floor() as i32 - min_x + 15).min(15);
+        let y0 = ((y - vr).floor() as i32 - 1).max(self.min_y + 1);
+        let y1 = ((y + vr).floor() as i32 + 1).min(self.min_y + self.height - 1 - 7);
+        let z0 = ((z - hr).floor() as i32 - min_z - 1).max(0);
+        let z1 = ((z + hr).floor() as i32 - min_z + 15).min(15);
+        let mut carved = false;
+        for lx in x0..=x1 {
+            let bx = min_x + lx;
+            let nx = (bx as f64 + 0.5 - x) / hr;
+            for lz in z0..=z1 {
+                let bz = min_z + lz;
+                let nz = (bz as f64 + 0.5 - z) / hr;
+                if nx * nx + nz * nz >= 1.0 {
+                    continue;
+                }
+                let mut yy = y1;
+                while yy > y0 {
+                    // vanilla normalizes the y cell centre with `- 0.5`, not the
+                    // `+ 0.5` the x and z coordinates use (carveEllipsoid's
+                    // `i2d; ldc 0.5; dsub`). Using +0.5 lifts every ellipsoid by
+                    // one cell at its top edge.
+                    let ny = (yy as f64 - 0.5 - y) / vr;
+                    let w = widths
+                        .get((yy - self.min_y - 1) as usize)
+                        .copied()
+                        .unwrap_or(1.0) as f64;
+                    if (nx * nx + nz * nz) * w + ny * ny / 6.0 < 1.0
+                        && !self.mask_get(lx, yy, lz)
+                    {
+                        self.mask_set(lx, yy, lz);
+                        carved |= self.carve_block(g, cc, c, bx, yy, bz);
+                    }
+                    yy -= 1;
+                }
+            }
+        }
+        carved
+    }
+
+    /// `CaveWorldCarver.carveTunnel`: a walk along (yaw, pitch) that lays an
+    /// ellipsoid every step it does not reject, and forks once when `yScale` is
+    /// large. The RNG is `RandomSource.create(seed)` — a `LegacyRandomSource`.
+    #[expect(clippy::too_many_arguments)]
+    fn tunnel(
+        &mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, seed: u64,
+        mut x: f64, mut y: f64, mut z: f64, hrm: f64, vrm: f64, y_scale: f32,
+        mut yaw: f32, mut pitch: f32, branch_index: i32, branch_count: i32, ratio: f64,
+    ) {
+        let mut r = Lcg::new(seed);
+        let split = r.next_bound(branch_count / 2) + branch_count / 4;
+        let flat = r.next_bound(6) == 0;
+        let mut pitch_drift = 0.0f32;
+        let mut yaw_drift = 0.0f32;
+        for i in branch_index..branch_count {
+            let d0 = 1.5 + (mth_sin(std::f32::consts::PI * i as f32 / branch_count as f32) * y_scale) as f64;
+            let d1 = d0 * ratio;
+            let cp = mth_cos(pitch);
+            x += (mth_cos(yaw) * cp) as f64;
+            y += mth_sin(pitch) as f64;
+            z += (mth_sin(yaw) * cp) as f64;
+            pitch *= if flat { 0.92 } else { 0.7 };
+            pitch += pitch_drift * 0.1;
+            yaw += yaw_drift * 0.1;
+            pitch_drift *= 0.9;
+            yaw_drift *= 0.75;
+            pitch_drift += (r.next_f32() - r.next_f32()) * r.next_f32() * 2.0;
+            yaw_drift += (r.next_f32() - r.next_f32()) * r.next_f32() * 4.0;
+            if i == split && y_scale > 1.0 {
+                let s1 = r.next_i64() as u64;
+                let sc1 = r.next_f32() * 0.5 + 0.5;
+                self.tunnel(g, cc, c, s1, x, y, z, hrm, vrm, sc1,
+                    yaw - std::f32::consts::FRAC_PI_2, pitch / 3.0, i, branch_count, 1.0);
+                let s2 = r.next_i64() as u64;
+                let sc2 = r.next_f32() * 0.5 + 0.5;
+                self.tunnel(g, cc, c, s2, x, y, z, hrm, vrm, sc2,
+                    yaw + std::f32::consts::FRAC_PI_2, pitch / 3.0, i, branch_count, 1.0);
+                return;
+            } else if r.next_bound(4) != 0 {
+                if !can_reach(self.tx, self.tz, x, z, i, branch_count, y_scale) {
+                    return;
+                }
+                self.ellipsoid(g, cc, c, x, y, z, d0 * hrm, d1 * vrm);
+            }
+        }
+    }
+
+    /// `WorldCarver.carveEllipsoid`: clips the ellipsoid to this chunk and carves
+    /// every cell inside it that the mask has not claimed and `skip` accepts.
+    fn ellipsoid(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
+                 x: f64, y: f64, z: f64, hr: f64, vr: f64) -> bool {
+        let mid_x = (self.tx * 16 + 8) as f64;
+        let mid_z = (self.tz * 16 + 8) as f64;
+        let reach = 16.0 + hr * 2.0;
+        if (x - mid_x).abs() > reach || (z - mid_z).abs() > reach {
+            return false;
+        }
+        let (min_x, min_z) = (self.tx * 16, self.tz * 16);
+        let x0 = ((x - hr).floor() as i32 - min_x - 1).max(0);
+        let x1 = ((x + hr).floor() as i32 - min_x + 15).min(15);
+        let y0 = ((y - vr).floor() as i32 - 1).max(self.min_y + 1);
+        // fresh worlds have no below-zero retrogen, so the top stops 7 short
+        let y1 = ((y + vr).floor() as i32 + 1).min(self.min_y + self.height - 1 - 7);
+        let z0 = ((z - hr).floor() as i32 - min_z - 1).max(0);
+        let z1 = ((z + hr).floor() as i32 - min_z + 15).min(15);
+        let mut carved = false;
+        for lx in x0..=x1 {
+            let bx = min_x + lx;
+            let nx = (bx as f64 + 0.5 - x) / hr;
+            for lz in z0..=z1 {
+                let bz = min_z + lz;
+                let nz = (bz as f64 + 0.5 - z) / hr;
+                if nx * nx + nz * nz >= 1.0 {
+                    continue;
+                }
+                let mut yy = y1;
+                while yy > y0 {
+                    // vanilla normalizes the y cell centre with `- 0.5`, not the
+                    // `+ 0.5` the x and z coordinates use (carveEllipsoid's
+                    // `i2d; ldc 0.5; dsub`). Using +0.5 lifts every ellipsoid by
+                    // one cell at its top edge.
+                    let ny = (yy as f64 - 0.5 - y) / vr;
+                    // `skip`: at or below the floor level, or outside the sphere
+                    if ny > self.floor && nx * nx + ny * ny + nz * nz < 1.0
+                        && !self.mask_get(lx, yy, lz)
+                    {
+                        self.mask_set(lx, yy, lz);
+                        carved |= self.carve_block(g, cc, c, bx, yy, bz);
+                    }
+                    yy -= 1;
+                }
+            }
+        }
+        carved
+    }
+
+    /// `WorldCarver.carveBlock`: replace a `#overworld_carver_replaceables` cell
+    /// with the aquifer's substance (lava below the lava level), and restore the
+    /// top material under a cave mouth that was opened through the surface.
+    fn carve_block(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
+                   x: i32, y: i32, z: i32) -> bool {
+        let cur = self.read(g, cc, x, y, z);
+        let br = match breg() {
+            Some(br) => br,
+            None => return false,
+        };
+        let reached_surface = cur == br.state_of("minecraft:grass_block", None)
+            || cur == br.state_of("minecraft:podzol", None);
+        if !br.in_tag(cur, &c.replaceable) {
+            return false;
+        }
+        let lava_level = c.lava.resolve(self.min_y, self.height);
+        let probed = if self.probe {
+            let lava = self.probe_lava;
+            Some(if y <= lava_level { lava } else { self.probe_air })
+        } else {
+            g.carve_state(x, y, z, lava_level)
+        };
+        let Some(st) = probed else {
+            return false;
+        };
+        self.out.insert(((x & 15) as u8, y, (z & 15) as u8), st);
+        if reached_surface && self.read(g, cc, x, y - 1, z) == br.state_of("minecraft:dirt", None) {
+            let fluid = g.is_fluid_state(st);
+            if let Some(top) = g.top_material_at(x, y - 1, z, fluid) {
+                self.out.insert(((x & 15) as u8, y - 1, (z & 15) as u8), top);
+            }
+        }
+        true
+    }
+}
+
+/// `WorldCarver.canReach`: stop walking a tunnel once it is so far from the
+/// chunk and so late in its run that it cannot come back.
+fn can_reach(tx: i32, tz: i32, x: f64, z: f64, branch_index: i32, branch_count: i32, y_scale: f32) -> bool {
+    let dx = x - (tx * 16 + 8) as f64;
+    let dz = z - (tz * 16 + 8) as f64;
+    let left = (branch_count - branch_index) as f64;
+    let reach = y_scale as f64 + 2.0 + 16.0;
+    dx * dx + dz * dz - left * left <= reach * reach
+}
+
 // ---------- entry point ----------
 
 fn pop_seed(seed: u64, bx: i32, bz: i32) -> u64 {
@@ -1711,6 +2435,11 @@ pub(crate) fn feat_prof_dump() {
 }
 
 pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
+    // Vanilla's chunk status order is CARVERS then FEATURES, and both write into
+    // the chunk's block state, so the carver pass runs here — before the feature
+    // gate, because "no features" is a comparison fixture, not a carver switch
+    // (`MC_SPINE_NOCARVE` is).
+    apply_carvers(g, sx, sz);
     // Diagnostic: MC_SPINE_NOFEAT=1 skips the whole feature layer so a block diff can
     // attribute the remainder to terrain or to features.
     if std::env::var("MC_SPINE_NOFEAT").is_ok() {

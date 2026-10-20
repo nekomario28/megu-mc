@@ -6,14 +6,21 @@
 
 ## 進行中
 
-- [ ] **R1e carver（洞窟・峡谷）の実装**（未実装・未比較だった最大の穴）
-  - 基準値: `tools/vanilla_nofeat_pack.py --keep-carvers` の世界で 36 chunk の
-    y<60 空気 = **3361 セル**（carvers 無効だと 143）→ **洞窟の 96% は carver 由来**。
-    mc-spine は 0。記録: [carvers](evidence/gameplay/carvers/README.md)。
-  - 必要なもの: `configured_carver` の読み込み、`CarvingContext`、`CaveWorldCarver`
-    （tunnel/branch/room、carve_ellipsoid）、`CanyonWorldCarver`、`cave_air` と
-    溶岩/水の充填、feature より前の実行順。
-  - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル。
+- [ ] **R1e carver（洞窟・峡谷）の実装**（実装済み・world 水準で残差）
+  - 実装: `src/feature.rs` の carvers 節（`apply_carvers` / `carve_block` /
+    `cave`+`room`+`tunnel`+`ellipsoid` / `canyon` / `CarvingMask`）と
+    `worldgen.rs` の `carve_state` / `top_material_at` / `prelim_min`。
+    feature より前に走る。記録: [carvers](evidence/gameplay/carvers/README.md) §5。
+  - 検証: vanilla のクラスを直接呼ぶ probe（`tools/vanilla-probe/CarverProbe.java`）
+    とセル単位で一致 — cave 1400、cave_extra 3042、canyon 342。制御 config の
+    world 比較は 4 chunk で 1 セル差。
+  - 残差（新しい固定具、49 chunk = (-5..1,-3..3)、seed 0、feature 無し）:
+    vanilla の carver 由来 53601 セルに対し、一致 5289 / 掘り漏れ 48312 /
+    掘りすぎ 41923。地形そのものは同じ固定具で 49 セル（R1a の ore vein）。
+  - 次の一手: `aq_state(x,y,z,0.0)` の経路（地形比較では踏まれない）を
+    `NoiseBasedAquifer.computeSubstance` と直接突き合わせる。aquifer 用の probe を
+    `tools/vanilla-probe/` に足すのが最短。
+  - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル（R1a の 49 セルを除く）。
 
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）
   - 設計: [chunk-parallelism](specs/chunk-parallelism/README.md)（GenData/Gen の分離

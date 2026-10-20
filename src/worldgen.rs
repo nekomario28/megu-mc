@@ -1321,6 +1321,28 @@ impl Gen {
         v
     }
 
+    /// Vanilla's preliminary surface level for one column: the bilinear
+    /// interpolation of the four corner heights, plus the surface noise, minus
+    /// the 8 block window (`SurfaceRules.Context`'s preliminary surface level).
+    /// `above_preliminary_surface` is `y >= this`.
+    pub(crate) fn prelim_min(&mut self, x: i32, z: i32) -> i32 {
+        let (cx, cz) = (x >> 4, z >> 4);
+        let h00 = self.prelim_est(cx * 16, cz * 16);
+        let h10 = self.prelim_est(cx * 16 + 16, cz * 16);
+        let h01 = self.prelim_est(cx * 16, cz * 16 + 16);
+        let h11 = self.prelim_est(cx * 16 + 16, cz * 16 + 16);
+        let est = lerp2(
+            (x & 15) as f64 / 16.0,
+            (z & 15) as f64 / 16.0,
+            h00 as f64,
+            h10 as f64,
+            h01 as f64,
+            h11 as f64,
+        )
+        .floor() as i32;
+        est.saturating_add(self.run_depth(x, z)) - 8
+    }
+
     fn test_cond(&mut self, cid: usize, c: &mut SC, surf: &[i16; 256]) -> bool {
         let cd = self.conds[cid];
         match cd {
@@ -1586,10 +1608,6 @@ impl Gen {
     let mut mats: Vec<Option<SurfMat>> = (0..256).map(|_| None).collect();
     let mut rd = [0i16; 256];
     if let Some(root) = g.surface_rule {
-        let h00 = g.prelim_est(cx * 16, cz * 16);
-        let h10 = g.prelim_est(cx * 16 + 16, cz * 16);
-        let h01 = g.prelim_est(cx * 16, cz * 16 + 16);
-        let h11 = g.prelim_est(cx * 16 + 16, cz * 16 + 16);
         let mut c = SC::new();
         for lz in 0..16usize {
             for lx in 0..16usize {
@@ -1613,16 +1631,7 @@ impl Gen {
                 c.steep = None;
                 c.nt.clear();
                 rd[lz * 16 + lx] = c.run_depth as i16;
-                let est = lerp2(
-                    lx as f64 / 16.0,
-                    lz as f64 / 16.0,
-                    h00 as f64,
-                    h10 as f64,
-                    h01 as f64,
-                    h11 as f64,
-                )
-                .floor() as i32;
-                let est_min = est.saturating_add(c.run_depth) - 8;
+                let est_min = g.prelim_min(x, z);
                 c.est_min = est_min;
                 if scan_top < est_min {
                     continue;
@@ -1943,11 +1952,43 @@ impl Gen {
         v
     }
     /// Water or lava, as the aquifer decided it for this cell.
-    fn is_fluid_state(&self, st: u32) -> bool {
+    pub(crate) fn is_fluid_state(&self, st: u32) -> bool {
         if st == self.def_fl {
             return true;
         }
         self.aq.as_ref().is_some_and(|a| st == a.lava_st)
+    }
+
+    /// Vanilla `WorldCarver.getCarveState`: at or below the lava level the cell
+    /// becomes lava, otherwise the aquifer's substance at density 0. `None` is
+    /// the aquifer's barrier (the material rule keeps the cell solid) and means
+    /// "do not carve here".
+    pub(crate) fn carve_state(&mut self, x: i32, y: i32, z: i32, lava_level: i32) -> Option<u32> {
+        if y <= lava_level {
+            return Some(self.aq.as_ref().map(|a| a.lava_st).unwrap_or(0));
+        }
+        self.aq_state(x, y, z, 0.0)
+    }
+
+    /// Vanilla `CarvingContext.topMaterial` / `SurfaceSystem.buildSurface` for a
+    /// single position: the surface rule evaluated with one block of stone above
+    /// and below, and the fluid height the carved state implies. A carver calls
+    /// this to restore the top material under a cave mouth it opened.
+    pub(crate) fn top_material_at(
+        &mut self, x: i32, y: i32, z: i32, is_fluid: bool,
+    ) -> Option<u32> {
+        let root = self.surface_rule?;
+        let cc = self.cols(x >> 4, z >> 4)?;
+        let mut c = SC::new();
+        c.x = x;
+        c.z = z;
+        c.y = y;
+        c.run_depth = self.run_depth(x, z);
+        c.est_min = self.prelim_min(x, z);
+        c.sda = 1;
+        c.sdb = 1;
+        c.fluid = if is_fluid { y + 1 } else { i32::MIN };
+        self.eval_rule(root, &mut c, &cc.surf)
     }
 
     pub(crate) fn deep_state_i(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
@@ -3018,7 +3059,14 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // used to place at y=15 and y=18, vanilla's order gives y=49 and y=18.
         // Full-chunk block diff for (0,0) against the replayed vanilla world:
         // 11017 -> 10302 cells (11.21% -> 10.48%).
-        assert_eq!(digest, "5b1313fedc84de907db7e40a3907b520",
+        // 2026-10-21: `Lcg::next_i64` now sign-extends its low word like Java's
+        // `nextLong` (see `world_rng`'s pinned vector), which is what every
+        // population / large-feature seed is built from. Half of all draws were
+        // 2^32 off. Measured cost in this layer: the 2x2-chunk feature-on diff
+        // against a fresh 1.21.1 world went 44187 -> 45226 cells, so the feature
+        // layer still has a compensating defect (R1a); the carver seeds need the
+        // correct value, and two wrong seeds are not a calibration to preserve.
+        assert_eq!(digest, "d919a4194b02c6131249f905a07ed3d8",
             "feature population output changed from the vanilla-order capture");
     }
 

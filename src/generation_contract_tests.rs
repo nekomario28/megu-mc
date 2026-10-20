@@ -313,3 +313,48 @@ fn context_overrides_heights_bounds_and_biomes_keep_existing_results() {
     assert!(!ctx.out_of_h(ctx.g.min_y + ctx.g.height - 1));
     assert!(ctx.out_of_h(ctx.g.min_y + ctx.g.height));
 }
+
+/// The carver configs are read with the 1.21.1 field shapes, and two of them are
+/// easy to get subtly wrong: `yScale` is a bare number in `canyon.json` (the codec
+/// is `either(float, FloatProvider)`), and `replaceable` carries the `#` tag
+/// marker in the file but is looked up without it.
+#[test]
+fn carver_configs_parse_the_1_21_1_field_shapes() {
+    use crate::generation_math::Lcg;
+
+    let reg = super::creg();
+    let cave = reg.cfg.get("minecraft:cave").expect("cave config");
+    assert_eq!(cave.probability, 0.15);
+    assert_eq!(cave.replaceable, "minecraft:overworld_carver_replaceables");
+    assert_eq!(
+        cave.kind,
+        super::CKind::Cave,
+        "the cave type must not become another algorithm"
+    );
+    // y is uniform(above_bottom 8 .. absolute 180) and the world's min y is -64
+    let mut r = Lcg::new(7);
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for _ in 0..2000 {
+        let v = cave.y.sample(&mut r, -64, 384);
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    assert!(lo >= -56, "y never below the above_bottom anchor: {lo}");
+    assert!(hi <= 180, "y never above the absolute anchor: {hi}");
+    assert!(lo < 0 && hi > 100, "the range is exercised: {lo}..{hi}");
+
+    // canyon.json's yScale is a plain number, not a provider object
+    let canyon = reg.cfg.get("minecraft:canyon").expect("canyon config");
+    assert_eq!(canyon.y_scale.sample(&mut Lcg::new(0)), 3.0);
+    assert!(canyon.canyon.is_some(), "the canyon shape must parse");
+    // and the biome list order is what the carver seed index counts
+    let forest = reg.biome.get("minecraft:forest").expect("forest carvers");
+    assert_eq!(
+        forest,
+        &vec![
+            "minecraft:cave".to_string(),
+            "minecraft:cave_extra_underground".to_string(),
+            "minecraft:canyon".to_string()
+        ]
+    );
+}

@@ -97,6 +97,12 @@ pub(crate) fn mth_sin(v: f32) -> f32 {
     sin_table()[(v * SIN_STEPS) as i32 as usize & 65535]
 }
 
+/// `Mth.cos` is the same table read a quarter turn ahead, not libm. The
+/// quarter-turn is added in `f32` *before* the truncation, as in the bytecode.
+pub(crate) fn mth_cos(v: f32) -> f32 {
+    sin_table()[(v * SIN_STEPS + 16384.0) as i32 as usize & 65535]
+}
+
 pub(crate) struct Xor {
     lo: u64,
     hi: u64,
@@ -246,7 +252,15 @@ impl Lcg {
         self.nx(32) as u32 as i32
     }
     pub(crate) fn next_i64(&mut self) -> i64 {
-        ((self.nx(32) as i64) << 32).wrapping_add(self.nx(32) as i64)
+        // `RandomSource`'s default `nextLong` is `(long)next(32) << 32 + next(32)`
+        // where `next(32)` is an **int**: both halves sign-extend. Treating them as
+        // unsigned shifts the result by 2^32 whenever bit 31 of the low word is
+        // set, which is half the draws - so every seed derived from this stream
+        // (population seed, large-feature seed, carver seeds) came out wrong half
+        // the time.
+        let hi = self.nx(32) as u32 as i32 as i64;
+        let lo = self.nx(32) as u32 as i32 as i64;
+        (hi << 32).wrapping_add(lo)
     }
     // java nextInt(bound): power-of-2 fast path + rejection otherwise
     pub(crate) fn next_bound(&mut self, bound: i32) -> i32 {
@@ -851,4 +865,31 @@ mod tests {
         assert_eq!(ng.next_i32(), 435917842);
     }
 
+    /// `RandomSource`'s default `nextLong` is `(long)next(32) << 32 + next(32)`
+    /// with **signed** halves, so the low word sign-extends. Reading both halves
+    /// as unsigned is off by 2^32 whenever bit 31 of the low word is set, which is
+    /// half the draws — every seed derived from the stream (population seed,
+    /// large-feature seed, carver seeds) came out wrong half the time.
+    ///
+    /// Expected values are `new java.util.Random(0).nextLong()` and the second
+    /// draw of the same stream.
+    #[test]
+    fn legacy_next_long_sign_extends_like_javas() {
+        let mut r = Lcg::new(0);
+        assert_eq!(r.next_i64(), -4962768465676381896, "seed 0, first nextLong");
+        assert_eq!(r.next_i64(), 4437113781045784766, "seed 0, second nextLong");
+        // 0xbb20b45fd4d95138: the low word 0xd4d95138 has bit 31 set, so the
+        // unsigned concatenation (0xbb20b460d4d95138) is the wrong answer.
+        assert_ne!(r.seed, 0);
+    }
+
+    /// `Mth.cos` is the sine table a quarter turn ahead, not libm.
+    #[test]
+    fn mth_cos_is_the_sine_table_shifted() {
+        assert_eq!(mth_sin(0.0), 0.0);
+        assert_eq!(mth_cos(0.0), 1.0);
+        let v = 1.570_796_4_f32; // pi/2 as the carver spells it
+        assert_eq!(mth_sin(v), 1.0);
+        assert!((mth_cos(v)).abs() < 1e-6);
+    }
 }
