@@ -3006,14 +3006,12 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // Vanilla block diff with features and carvers disabled on both sides
         // went 1221 -> 194 cells at seed 0 chunk (0,0); the deepslate and
         // bedrock bands match, so this capture records the corrected input.
-        // 2026-10-20: the terrain now matches vanilla exactly, so feature inputs
-        // changed twice. `interpolated` is sampled over its input and the
-        // enclosing squeeze/min are per block (see
-        // surface_density_follows_vanillas_interpolated_order); with features and
-        // carvers disabled the block diff is 0 cells in (0,0), (0,1), (-1,-1)
-        // and (-2,0), where the earlier whole-expression interpolation left a
-        // one-block surface step on a few columns.
-        assert_eq!(digest, "559586a58b0f108635e493f10ec5481d",
+        // 2026-10-20: the terrain now matches vanilla exactly, and the biome
+        // feature lists were replaced with the 1.21.1 server jar's (the bundled
+        // data had 1.21.5-ish lists: 48/64 biomes differed). With features and
+        // carvers disabled the block diff is 0 in (0,0), (0,1), (-1,-1), (-2,0);
+        // with features on it is 10939 -> 10874 after the list swap.
+        assert_eq!(digest, "d1847cd981c73740ca39422c62ad5506",
             "feature population output changed from the vanilla-order capture");
     }
 

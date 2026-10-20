@@ -16,7 +16,7 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 | hosted CI | GitHub の支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替し、復旧後に同一 SHA で再取得する |
 | M3（軽量） | **未達**: 地形一致後の代表負荷で CPU x1.13（mc-spine 19.87s / 144.7MiB 対 vanilla 17.53s / 1159.7MiB）。以前の x0.63 は地形不一致時の値で、現在の代表値にしない |
 | 地形（feature/carver なし） | vanilla と **0 セル**（chunk (0,0)、(0,1)、(-1,-1)、(-2,0)）。density・surface rule・bedrock が一致 |
-| feature 層 | feature ありの比較は 10939 / 98304（11.1%）。地形一致後もこの数はほぼ変わらない。同梱 worldgen データが 1.21.1 ではないため、版差を含む |
+| feature 層 | feature ありの比較は 10874 / 98304（11.1%）。地形一致後もこの数はほぼ変わらない。同梱 worldgen データの biome リストは 1.21.1 に差し替え済みで、残りは石系 ore の配置実行 |
 
 ## 順序
 
@@ -40,12 +40,15 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 
 ### R1 worldgen の 1.21.1 一致（最優先）
 
-- **R1a データ版の固定**: 同梱 `datapacks/vanilla` の biome/feature/noise_settings を
-  1.21.1 の server jar から取り直して固定する。同梱 biome は 1.21.2+ 形式で、
-  1.21.1 と feature リストが 48/64 不一致、feature type が 16 個欠け・9 個余る。
-  データ差のまま feature 順序や `setFeatureSeed` の index を論じても意味がない。
-  出口: 版を名乗る根拠（jar の SHA-256 と抽出元 path）と、取り直し前後で
-  feature あり block diff を測った数字。
+- **R1a データ版の固定（biome リスト完了 2026-10-20）**: 同梱 `datapacks/vanilla`
+  の biome は 1.21.2+ 形式で、1.21.1 と feature リストが 48/64 不一致。64 biome の
+  `features` を 1.21.1 の server jar から取り直し、feature あり block diff は
+  10939 → **10874**（-0.6%）。トップの状態組は変わらず、残差は石系 ore の位置 =
+  feature の**実行**側。configured/placed feature の ore 定義は jar と同一。
+  証拠: [feature パリティ](../../evidence/gameplay/feature-parity/README.md)。
+  残り: 石系 ore の modifier RNG / height provider / target 判定を vanilla の
+  bytecode と突き合わせる。全 type を 1.21.1 に揃えるのは mc-spine が新しい型
+  （`vegetation_patch` 等）で書かれているため、型の実装追加が前提。
 - **R1b surface rule の残差（完了 2026-10-20）**: `not_underwater` の二重否定と
   waterHeight の近似を直し、(0,0) 194→5、(0,1) 243→36、(-1,-1) 228→0。
   残りは 1 ブロックの表面段差で density の境界。
@@ -55,8 +58,9 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 - **R1c feature 層の切り分け**: 1.21.1 データで feature ありの diff を step 単位に
   分解し、どの step（ore / vegetal / tree / top_layer …）がずれるかを数で示す。
   出口: step 別の差分表と、最初に直す 1 step の特定。
-- **R1d 光**: 地形が一致した後で `light_parity_probe.py` の digest を再測する。
-  出口: 区間別 digest の一致／不一致と、残差の層（地形・光源・伝播）の特定。
+- **R1d 光（完了 2026-10-20）**: 地形一致後に `light_parity_probe.py` を 3 chunk で
+  実行。heightmap と非一様区間の sky digest が vanilla と一致した。差は区間マスクの
+  送り方（全 26 区間 vs 一様区間の省略）だけで、値ではない。
 
 ### R2 M2「遊べる」の一致
 

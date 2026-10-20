@@ -19,14 +19,18 @@
 
 ## 次
 
-- [ ] **R1a worldgen データを 1.21.1 に固定**
-  - 1.21.1 server jar（SHA-256 を記録）から biome / configured_feature /
-    placed_feature / noise_settings を取り、`datapacks/vanilla` の該当部分を置き換える。
-    密度関数のファイル分割と `material_rule` は mc-spine 側の持ち物として残す。
-  - 同梱 biome は 1.21.2+ 形式（`attributes` あり、`spawners` なし）。
-    1.21.1 と feature リストが 48/64 不一致、type が 16 欠け・9 余る。
-  - 判定: feature あり block diff（seed 0, chunk (0,0)）の前後。データ差の分が
-    減ったことを確認し、減らなければ理由を特定する。
+- [ ] **R1d の残り（任意）**: 区間マスクを vanilla と同じにする（1 chunk あたり
+      約 94 KiB の節約）。GUI でクライアントの「マスクに無い区間」の扱いを
+      確認しない方針のため、wire の値が一致した今は保留。
+- [ ] **R1a 残り: 石系 ore の配置実行**
+  - biome の feature リストは 1.21.1 に差し替え済み（10939 → 10874）。
+    ore の configured/placed 定義は jar と同一。残差は andesite/diorite/granite/
+    tuff/deepslate の**位置**で、modifier の RNG 消費・height provider・target 判定。
+  - 次: `ore_andesite_lower` を 1 つ取り、vanilla の `OreFeature.place` と
+    `HeightRangePlacement`/`CountPlacement` の bytecode を読み、RNG 順と分布を
+    mc-spine と突き合わせる。予測した vein 中心を両サーバの andesite セルから
+    逆算して照合する。
+  - 判定: 1 seed・1 chunk で andesite のセル集合が一致するか。
 - [ ] **R1c feature step 別の差分表**（R1a の後）
   - `chunk_block_diff.py` に step 別の集計を足すか、populate の書き込みを step で
     タグ付けして数える。最初に直す 1 step を決める。
@@ -50,6 +54,10 @@
       1 回計算に整理（代表負荷はノイズ内、パリティ 0 セル）。
 - [x] feature の地形読みを 1797 → 295 ns/call（`FC` がチャンク列を保持）。
       `populate9` 667 → 411 ms、FEATPROF 1088 → 736 ms。capture digest 不変。
+- [x] R1d: 地形一致後の光を 3 chunk で再測。heightmap と非一様 sky digest が
+      vanilla と一致（mask の送り方だけ差）。
+- [x] R1a スライス1: biome の feature リストを 1.21.1 の jar から差し替え
+      （feature あり 10939 → 10874）。ore 定義は jar と同一と確認。
 - [x] ローカル `depsgx` を固定 revision の venv に置き換え（同一バージョン表記の古い
       ビルドが cycle を 1 件しか報告しなかった）。
 
