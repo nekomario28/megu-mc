@@ -301,6 +301,31 @@ check "a falling block does not move in a cold chunk" \
   '            if false { keep.push(f); continue; }' \
   a_falling_block_waits_in_a_cold_chunk
 
+check "a save carries the falling entities it reloads" \
+  src/main.rs '    write_varint(&mut *f, in_flight.len() as i64);' \
+  '    write_varint(&mut *f, 0i64);' \
+  a_support_placed_under_a_falling_entity_is_landed_on
+
+check "a knockout and a save in one tick conserve the column" \
+  src/main.rs '        end_falling_tick(&processed, keep);' \
+  '        end_falling_tick(&processed, Vec::new());' \
+  a_knockout_and_a_save_in_the_same_tick_conserve_the_block
+
+check "adjacent knockouts conserve every block" \
+  src/main.rs '            if fallable_state(current) && set_block_if(bx, top, bz, fa.state, Some(current)) {' \
+  '            if false {' \
+  two_knockouts_of_adjacent_supports_conserve_every_block
+
+check "a conversion does not leave a second drop behind" \
+  src/main.rs '                despawn.push(f.eid);' \
+  '                despawn.push(f.eid); keep.push(f.clone());' \
+  a_save_during_entity_conversion_has_no_duplicate_drop
+
+check "a block in a cold chunk keeps its position across ticks" \
+  src/main.rs '            if !region.is_warm(f.x as i32, f.z as i32) { keep.push(f); continue; }' \
+  '            if !region.is_warm(f.x as i32, f.z as i32) { }' \
+  region_change_mid_fall_keeps_the_entity
+
 check "breaking a chest drops the slots it owned" \
   src/main.rs '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z)) {' \
   '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z + 1000)) {' \

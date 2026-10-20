@@ -1,6 +1,7 @@
 # 落下と並行操作のハードニング（close-defects から繰り越し）
 
-Status: 設計。実装前。逐次修正で収束しないと判断された範囲を、性質テストとして固定する。
+Status: 実装済み（2026-10-20）。`src/tick_tests.rs` の 5 テストと
+`tools/mutation_check.sh` の対応変異で固定した。
 
 ## なぜ
 
@@ -25,7 +26,7 @@ F の統合レビューで 12 件の並行/順序の欠陥を逐次修正した�
 4. **ホットセット非依存**: 落下は region のホットセットに依存しない。変更が
    途中で入っても、次のティックで正しいセルが処理される。
 
-## テスト案（`src/tick_tests.rs` に追加）
+## テスト（`src/tick_tests.rs`、2026-10-20 実装）
 
 - `a_support_placed_under_a_falling_entity_is_landed_on`: 落下中に支持ブロックを
   置き、着地位置が新しい支持の上面になる。保存/再読込でも同じ。
@@ -39,11 +40,22 @@ F の統合レビューで 12 件の並行/順序の欠陥を逐次修正した�
   ホットセットを変えても、次のティックで着地する。
 
 各テストは `world_guard` と `WorldSnapshot` で世界を復元し、反復回数を固定する
-（時間・スレッド数に依存する assert を置かない）。変異（`with_save_guard` の
-ロック除去など）で赤になることを `tools/mutation_check.sh` に登録する。
+（時間・スレッド数に依存する assert を置かない）。
+
+実装時の注意:
+
+- 「支持を壊す」ためのセル消去は**上から順に**行うか、消去後に `falling()` を
+  空にする。下のセルを先に消すと、その上のブロックが entity 化し、前の scenariof
+  の entity がスナップショットへ混入する（テスト側の取り違えで 1 件実際に踏んだ）。
+- ドロップの個数は block state ではなく **item id** で数える
+  （`name_to_item("sand")`）。`Drop.item` は item id で、block state と一致しない。
+- 着地のたびに支持の上面を assert し、同じテストで保存/再読込の前後を比べる。
+  再読込後に「ブロック数が 1」であることが、entity の cell を ghost として
+  書き戻す実装を落とす。
 
 ## 完了条件
 
-- 追加した性質テストが緑で、対応する変異で赤になる（gate の load-bearing 証明）。
-- `tests/verify.sh` が緑（142 passed 以上、mutation 46 proved 以上）。
-- 新しいフレークがないこと: 同一 binary で 3 回連続実行して緑。
+- [x] 追加した性質テストが緑（5 件、`cargo test` 147 passed / 1 ignored）。
+- [x] 対応する変異を `tools/mutation_check.sh` に登録（5 件追加）。
+- [x] `tests/verify.sh` が緑（2026-10-20、`fix/20tps-integrated`）。
+- [ ] 新しいフレークがないこと: 同一 binary で 3 回連続実行して緑（下記の実行記録）。

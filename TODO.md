@@ -72,7 +72,11 @@
 
 ## 検証・公開
 
-- [x] `tests/verify.sh` PASS（142 passed / 1 ignored、mutation 46 proved）。
+- [x] 落下と並行操作のハードニング（[falling-concurrency](specs/falling-concurrency/README.md)）:
+      性質テスト 5 件（保存中/破壊中/隣接破壊/変換中の保存/ホットセット変更）を
+      `src/tick_tests.rs` に追加し、対応する変異 5 件で赤になることを確認。
+      `cargo test` 147 passed / mutation 51 proved（2026-10-20）。
+- [x] `tests/verify.sh` PASS（147 passed / 1 ignored、mutation 51 proved）。
       固定 revision の `depsgx` を `PATH` に置いて実行、ログは
       `~/.cache/mc-spine-work/verify-2026-10-20.log`。
 - [x] `fix/20tps-integrated` を push（`568f40f` まで成功）。hosted CI は run
@@ -85,8 +89,6 @@
       arrow collision の 0.9）。実行した証拠ごと close する。
 - [ ] 草案 PR #2 / #4 / #6 を統合ブランチの内容と照合して閉じる。
 - [ ] LICENSE を決めて追加（#11）。worldgen データの出自と再配布条件を明記。
-- [ ] 落下の並行/順序ハードニング: [falling-concurrency](specs/falling-concurrency/README.md)
-      の性質テスト（守恒・順序・無デッドロック・ホットセット非依存）を実装し、変異で固定する。
 
 ## 保留・監視
 

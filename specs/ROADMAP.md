@@ -11,11 +11,12 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 
 | 項目 | 実測・状態 |
 |---|---|
-| ビルド・テスト | `cargo build --locked` 成功。`cargo test` 140 passed / 1 ignored（2026-10-20 の verify） |
-| 必須ゲート | `tests/verify.sh` PASS（140 passed / 1 ignored、mutation 46 proved、local、2026-10-20） |
+| ビルド・テスト | `cargo build --locked` 成功。`cargo test` 147 passed / 1 ignored（2026-10-20） |
+| 必須ゲート | `tests/verify.sh` PASS（147 passed / 1 ignored、mutation 51 proved、local、2026-10-20） |
 | hosted CI | GitHub の支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替し、復旧後に同一 SHA で再取得する |
 | M3（軽量） | **未達**: 地形一致後の代表負荷で CPU x1.13（mc-spine 19.87s / 144.7MiB 対 vanilla 17.53s / 1159.7MiB）。以前の x0.63 は地形不一致時の値で、現在の代表値にしない |
 | 地形（feature/carver なし） | vanilla と **0 セル**（chunk (0,0)、(0,1)、(-1,-1)、(-2,0)）。density・surface rule・bedrock が一致 |
+| 落下と並行操作 | 性質テスト 5 件・変異 5 件を追加（2026-10-20）。保存・破壊・設置・ホットセット変更が同じティック列で交差してもブロックを落とさない（[falling-concurrency](falling-concurrency/README.md)） |
 | feature 層 | feature ありの比較は 10874 / 98304（11.1%）。地形一致後もこの数はほぼ変わらない。同梱 worldgen データの biome リストは 1.21.1 に差し替え済みで、残りは石系 ore の配置実行 |
 
 ## 順序

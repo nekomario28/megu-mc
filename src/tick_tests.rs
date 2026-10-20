@@ -1885,3 +1885,349 @@ fn client_information_carries_the_view_distance_after_the_locale() {
     invalid_utf8[1] = 0xff;
     assert_eq!(client_info_view_distance(&invalid_utf8), None);
 }
+
+// ---------- falling and concurrent operations (specs/falling-concurrency) ----------
+
+fn sand_count(x: i32, z: i32, lo: i32, hi: i32) -> usize {
+    let sand = name_to_state("sand").expect("sand must exist");
+    (lo..=hi).filter(|&y| block_at(x, y, z) == sand).count()
+}
+
+fn drop_count(item: i64) -> usize {
+    drops()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|d| d.item == item)
+        .map(|d| d.cnt as usize)
+        .sum()
+}
+
+/// A support placed while the block is in flight lands the entity on its top face, and a save
+/// taken at that moment reloads to the same landing. This is the ownership case: the entity has
+/// already left its block cell, so the support is placed into an empty cell and the landing is
+/// deferred to the next tick's re-check.
+#[test]
+fn a_support_placed_under_a_falling_entity_is_landed_on() {
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (_, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.insert((0, 0));
+    set_test_region(HashSet::new(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    let (x, z, base) = (3, 3, 150);
+    for y in base..=base + 8 {
+        set_block(x, y, z, 0);
+    }
+    set_block(x, base, z, stone);
+    set_block(x, base + 4, z, sand);
+    assert_eq!(
+        falling().lock().unwrap().len(),
+        1,
+        "the block becomes an entity"
+    );
+    falling_tick();
+    // Place the support one block under the in-flight entity.
+    set_block(x, base + 2, z, stone);
+    let mut ticks = 0;
+    while !falling().lock().unwrap().is_empty() && ticks < 200 {
+        falling_tick();
+        ticks += 1;
+    }
+    assert!(ticks < 200, "the entity must land");
+    assert_eq!(
+        block_at(x, base + 3, z),
+        sand,
+        "it lands on the new support's top face"
+    );
+    assert_eq!(block_at(x, base + 2, z), stone, "the support is untouched");
+    assert!(
+        drops().lock().unwrap().is_empty(),
+        "a landed block does not drop"
+    );
+
+    // The same state survives a save/reload: the support and the in-flight entity are written,
+    // and the reloaded world lands the entity on the same cell.
+    falling().lock().unwrap().clear();
+    drops().lock().unwrap().clear();
+    for y in base..=base + 8 {
+        set_block(x, y, z, 0);
+    }
+    // Clearing a lower cell can spawn a fall for the block above it; those entities belong to the
+    // previous scenario, not to the snapshot.
+    falling().lock().unwrap().clear();
+    drops().lock().unwrap().clear();
+    set_block(x, base, z, stone);
+    set_block(x, base + 4, z, sand);
+    falling_tick();
+    set_block(x, base + 2, z, stone);
+    let mut buf = Vec::new();
+    {
+        let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        save_world_into(&mut buf);
+    }
+    world().lock().unwrap().clear();
+    falling().lock().unwrap().clear();
+    drops().lock().unwrap().clear();
+    load_world_from(&buf);
+    let mut t = 0;
+    while !falling().lock().unwrap().is_empty() && t < 200 {
+        falling_tick();
+        t += 1;
+    }
+    assert!(t < 200, "the reloaded entity must land");
+    assert_eq!(
+        block_at(x, base + 3, z),
+        sand,
+        "reload lands on the same support"
+    );
+    assert_eq!(
+        sand_count(x, z, base, base + 8),
+        1,
+        "exactly one block, not a ghost"
+    );
+}
+
+/// A support removal and a save in the same tick: the snapshot is taken at the transition, so it
+/// must conserve the column (world + falling + drops) both live and after a reload.
+#[test]
+fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (_, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.insert((0, 0));
+    set_test_region(HashSet::new(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let sand_item = name_to_item("sand").expect("sand item must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    let (x, z, base, height) = (5, 5, 150, 3);
+    for _ in 0..4 {
+        world().lock().unwrap().clear();
+        falling().lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        for y in base - 1..=base + height + 4 {
+            set_block(x, y, z, 0);
+        }
+        set_block(x, base - 1, z, stone); // the floor the column lands on
+        set_block(x, base, z, stone); // the support that is knocked out
+        for i in 1..=height {
+            set_block(x, base + i, z, sand);
+        }
+        set_block(x, base, z, 0); // the column becomes entities in this call
+        let live = sand_count(x, z, base, base + height + 4)
+            + falling().lock().unwrap().len()
+            + drop_count(sand_item);
+        assert_eq!(
+            live, height as usize,
+            "live: block + entity + drop is conserved"
+        );
+        let mut buf = Vec::new();
+        {
+            let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            save_world_into(&mut buf);
+        }
+        world().lock().unwrap().clear();
+        falling().lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        load_world_from(&buf);
+        let mut t = 0;
+        while !falling().lock().unwrap().is_empty() && t < 400 {
+            falling_tick();
+            t += 1;
+        }
+        assert!(t < 400, "the snapshot's entities must settle");
+        let after = sand_count(x, z, base, base + height + 4) + drop_count(sand_item);
+        assert_eq!(
+            after, height as usize,
+            "reload: no block is lost or duplicated"
+        );
+    }
+}
+
+/// Two threads removing adjacent supports while the tick thread runs: every block ends up either
+/// placed or dropped, and no block falls twice.
+#[test]
+fn two_knockouts_of_adjacent_supports_conserve_every_block() {
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (_, ow) = test_region();
+    let mut warm = ow.clone();
+    for x in 0..3 {
+        for z in 0..3 {
+            warm.insert((x, z));
+        }
+    }
+    set_test_region(HashSet::new(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let sand_item = name_to_item("sand").expect("sand item must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    let base = 120;
+    let cols: Vec<(i32, i32)> = [(1, 1), (2, 1), (1, 2), (2, 2)].to_vec();
+    let height = 2;
+    for &(x, z) in &cols {
+        for y in base - 2..=base + height + 2 {
+            set_block(x, y, z, 0);
+        }
+        set_block(x, base - 1, z, stone);
+        set_block(x, base, z, stone);
+        for i in 1..=height {
+            set_block(x, base + i, z, sand);
+        }
+    }
+    let expected = cols.len() * height as usize;
+    let knock = |part: Vec<(i32, i32)>| {
+        std::thread::spawn(move || {
+            for (x, z) in part {
+                // Only remove the support while it still is the support.
+                if block_at(x, base, z) == name_to_state("stone").unwrap() {
+                    set_block(x, base, z, 0);
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    let a = knock(vec![(1, 1), (2, 1)]);
+    let b = knock(vec![(1, 2), (2, 2)]);
+    let mut ticks = 0;
+    while ticks < 800 {
+        falling_tick();
+        ticks += 1;
+        if a.is_finished() && b.is_finished() && falling().lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    a.join().expect("knocker a");
+    b.join().expect("knocker b");
+    while !falling().lock().unwrap().is_empty() && ticks < 1600 {
+        falling_tick();
+        ticks += 1;
+    }
+    assert!(ticks < 1600, "the fall must settle");
+    let mut placed = 0;
+    for &(x, z) in &cols {
+        placed += sand_count(x, z, base - 1, base + height + 4);
+        assert_eq!(sand_count(x, z, base, base + height - 1), height as usize,
+            "column ({x},{z}) fell one block onto the floor");
+        assert_eq!(sand_count(x, z, base + height, base + height + 4), 0,
+            "column ({x},{z}) left its top cell empty");
+    }
+    let dropped = drop_count(sand_item);
+    assert_eq!(placed + dropped, expected, "no block is lost or duplicated");
+    assert!(
+        falling().lock().unwrap().is_empty(),
+        "nothing is left in flight"
+    );
+}
+
+/// Conversion to a drop at the world floor is one item whether the snapshot is taken in flight or
+/// after conversion.
+#[test]
+fn a_save_during_entity_conversion_has_no_duplicate_drop() {
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (_, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.insert((0, 0));
+    set_test_region(HashSet::new(), warm);
+    let sand = name_to_state("sand").expect("sand must exist");
+    let sand_item = name_to_item("sand").expect("sand item must exist");
+    let (x, z) = (7, 7);
+    for y in MIN_Y..=MIN_Y + 4 {
+        set_block(x, y, z, 0);
+    }
+    set_block(x, MIN_Y + 1, z, sand);
+    assert_eq!(
+        falling().lock().unwrap().len(),
+        1,
+        "the block becomes an entity"
+    );
+
+    // Snapshot in flight, before the world floor.
+    let mut mid = Vec::new();
+    {
+        let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        save_world_into(&mut mid);
+    }
+    // Let it convert, then snapshot again.
+    let mut t = 0;
+    while !falling().lock().unwrap().is_empty() && t < 200 {
+        falling_tick();
+        t += 1;
+    }
+    assert!(t < 200, "the entity must leave the world");
+    assert_eq!(drop_count(sand_item), 1, "one drop in the live world");
+    let mut after = Vec::new();
+    {
+        let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        save_world_into(&mut after);
+    }
+    for (name, snap) in [("mid-flight", &mid), ("after conversion", &after)] {
+        world().lock().unwrap().clear();
+        falling().lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        load_world_from(snap);
+        let mut t = 0;
+        while !falling().lock().unwrap().is_empty() && t < 200 {
+            falling_tick();
+            t += 1;
+        }
+        assert_eq!(
+            drop_count(sand_item),
+            1,
+            "{name}: exactly one drop, not duplicated"
+        );
+        assert_eq!(
+            sand_count(x, z, MIN_Y, MIN_Y + 4),
+            0,
+            "{name}: no block is left behind"
+        );
+    }
+}
+
+/// A block in a chunk that leaves the warm set stays in flight without moving, and lands once the
+/// chunk is warm again.
+#[test]
+fn region_change_mid_fall_keeps_the_entity() {
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (_, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.insert((0, 0));
+    set_test_region(HashSet::new(), warm.clone());
+    let sand = name_to_state("sand").expect("sand must exist");
+    let stone = name_to_state("stone").expect("stone must exist");
+    let (x, z, base) = (9, 9, 140);
+    for y in base..=base + 6 {
+        set_block(x, y, z, 0);
+    }
+    set_block(x, base, z, stone);
+    set_block(x, base + 4, z, sand);
+    falling_tick();
+    let before = falling().lock().unwrap()[0].y;
+    // Cold: the entity must be kept and not advanced.
+    set_test_region(HashSet::new(), HashSet::new());
+    for _ in 0..20 {
+        falling_tick();
+    }
+    let held = falling().lock().unwrap();
+    assert_eq!(held.len(), 1, "a cold chunk keeps the entity");
+    assert_eq!(held[0].y, before, "a cold chunk does not advance it");
+    drop(held);
+    // Warm again: it lands on the support.
+    set_test_region(HashSet::new(), warm);
+    let mut ticks = 0;
+    while !falling().lock().unwrap().is_empty() && ticks < 200 {
+        falling_tick();
+        ticks += 1;
+    }
+    assert!(ticks < 200, "the entity must land once the chunk is warm");
+    assert_eq!(
+        sand_count(x, z, base + 1, base + 5),
+        1,
+        "exactly one block lands"
+    );
+    assert_eq!(block_at(x, base + 1, z), sand, "it lands on the support");
+}
