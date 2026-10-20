@@ -77,7 +77,7 @@ class Xor:
         m = l * bound
         n = m & 0xFFFFFFFF
         if n < bound:
-            i = ((~bound + 1) & 0xFFFFFFFF) % bound
+            i = ((1 << 64) - bound) % bound
             while n < i:
                 l = self.next_i32() & 0xFFFFFFFF
                 m = l * bound
