@@ -106,3 +106,70 @@ gi のずれでは説明できない。次の一手は、vanilla の `OreFeature
 この調査で使った一時的な計測（`FEAT_GI`、`FEAT_GI_SHIFT`、`FEAT_POS`、
 step リストのダンプ）は、結論を出して**撤回**した（hot path に env 参照を
 残さないため）。再現手順はこの節のとおり。
+
+## 2026-10-20（続き）: modifier の適用順と block tag の版ずれ
+
+### 見つけた欠陥1: placement modifier を「全位置に1つずつ」適用していた
+
+vanilla の `PlacedFeature.placeWithContext` は
+
+```java
+Stream<BlockPos> stream = Stream.of(origin);
+for (PlacementModifier m : placement) stream = stream.flatMap(pos -> m.getPositions(ctx, random, pos));
+stream.forEach(feature::place)   // 位置が pull されるたびに feature を実行
+```
+
+なので `count: 2` の feature は `x1,z1,y1,<feature の draw>,x2,z2,y2,<feature>` の順に
+同じ RandomSource を引く。mc-spine は「1つの modifier を全位置へ適用してから次へ」だったため
+`x1,z1,x2,z2,y1,y2` を引き、**同じ seed・同じ gi でも vein の原点が変わる**。
+
+chunk (0,0) の `ore_andesite_lower` で確認した:
+
+| | vein 原点 |
+|---|---|
+| mc-spine（旧） | (7,15,13), (12,18,3) |
+| vanilla の stream 順 | (7,49,13), (3,18,4) |
+
+`tools/ore_oracle.py`（bytecode から書き起こした独立実装）で、旧順序を再現すると
+mc-spine の原点と完全一致し、stream 順にすると上表のとおりになる。つまり RNG と seed は
+一致していて、差は**引く順序**だけだった。gi の総当たりで一致しなかったのは、位置そのものが
+ずれていたため。
+
+修正後、同一条件（seed 0、chunk (0,0)、offline の full-chunk 比較、
+`tools/vanilla_region_blocks.py` で復元した vanilla の region と比較）:
+
+| | 差分セル | 割合 |
+|---|---|---|
+| 修正前 | 11017 | 11.21% |
+| 修正後 | 10302 | 10.48% |
+
+上位の状態組は変わらず石系 ore。残差はまだ大きく、別の原因が残っている。
+
+### 見つけた欠陥2: 同梱 block tag が 1.21.1 のデータではなかった
+
+`datapacks/vanilla` の biome は 1.21.1 に差し替え済みだったが、block tag は新しい版のまま
+だった。1.21.1 の server jar と比べると 48 個が不一致、16 個が欠落:
+
+- `deepslate_ore_replaceables`: jar = `[deepslate, tuff]`、同梱 = `[deepslate]`。
+  tuff に deepslate 系 ore が置けない。
+- `dirt`: jar は grass_block / podzol / mycelium / moss_block / mud 等も含む。
+- `azalea_grows_on` / `azalea_root_replaceable` は `substrate_overworld`（新しい版の tag）を
+  参照していた。
+
+`tools/vanilla_tags_sync.py` で jar の block tag を書き戻した（16 追加 / 48 置換 / 120 は同一）。
+chunk (0,0) の feature 出力はこの変更だけでは変わらなかった（ore の target は
+`base_stone_overworld` で、差のある tag は地表側のため）。データの版ずれとしては直す。
+
+### 追加した道具
+
+- `tools/vanilla_region_blocks.py`: region file から直接 block 名を数える/セルを出す。
+  vanilla を起動せずに比較できる。
+- `tools/ore_oracle.py`: `OreFeature.place` と placement modifier を bytecode から
+  書き起こした独立実装。gi を振って vanilla のセルと照合できる。
+- `tools/vanilla_tags_sync.py`: 1.21.1 jar の block tag を同梱データへ同期。
+
+### 次
+
+残差 10302 セルは石系 ore の位置のまま。次は `tools/ore_oracle.py` で vein 単位の
+一致率を上げ、（a）`ctx.get` が前の feature の書き込みを見ているか、（b）高さ provider の
+分布、（c）biome フィルタの範囲（chunk 内 vs 3x3）を 1 つずつ潰す。

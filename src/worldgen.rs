@@ -3011,7 +3011,14 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // data had 1.21.5-ish lists: 48/64 biomes differed). With features and
         // carvers disabled the block diff is 0 in (0,0), (0,1), (-1,-1), (-2,0);
         // with features on it is 10939 -> 10874 after the list swap.
-        assert_eq!(digest, "d1847cd981c73740ca39422c62ad5506",
+        // 2026-10-20: placement modifiers now run as vanilla's stream
+        // (`flatMap` per position, feature placed before the next position is
+        // pulled) instead of one modifier over all positions. Same seed, same
+        // step index, different draw order: `ore_andesite_lower` in chunk (0,0)
+        // used to place at y=15 and y=18, vanilla's order gives y=49 and y=18.
+        // Full-chunk block diff for (0,0) against the replayed vanilla world:
+        // 11017 -> 10302 cells (11.21% -> 10.48%).
+        assert_eq!(digest, "5b1313fedc84de907db7e40a3907b520",
             "feature population output changed from the vanilla-order capture");
     }
 

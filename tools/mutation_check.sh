@@ -376,6 +376,14 @@ check "a context override outranks the cached terrain read" \
   '        if let Some(&s) = self.rc.get(&(x, y, z)) {' \
   context_overrides_heights_bounds_and_biomes_keep_existing_results
 
+check "placement modifiers advance positions in vanilla's draw order" \
+  src/feature.rs '        PM::InSquare => {
+            out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + rng.next_bound(16)));' \
+  '        PM::InSquare => {
+            let z = rng.next_bound(16);
+            out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + z));' \
+  feature_population_output_matches_the_pre_refactor_capture
+
 check "the frozen population digest notices shared provider changes" \
   src/generation_providers.rs '            IP::Uniform(a, b) => r.next_inbetween(*a, *b),' \
   '            IP::Uniform(a, b) => (*a + *b) / 2,' \

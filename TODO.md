@@ -25,7 +25,7 @@
 - [ ] **R1d の残り（任意）**: 区間マスクを vanilla と同じにする（1 chunk あたり
       約 94 KiB の節約）。GUI でクライアントの「マスクに無い区間」の扱いを
       確認しない方針のため、wire の値が一致した今は保留。
-- [ ] **R1a 残り: 石系 ore の配置実行**
+- [ ] **R1a 残り: 石系 ore の配置実行**（2026-10-20 に modifier 順を修正、11017 → 10302）
   - biome の feature リストは 1.21.1 に差し替え済み（10939 → 10874）。
     ore の configured/placed 定義は jar と同一。残差は andesite/diorite/granite/
     tuff/deepslate の**位置**で、modifier の RNG 消費・height provider・target 判定。
@@ -76,8 +76,8 @@
       性質テスト 5 件（保存中/破壊中/隣接破壊/変換中の保存/ホットセット変更）を
       `src/tick_tests.rs` に追加し、対応する変異 5 件で赤になることを確認。
       `cargo test` 147 passed / mutation 51 proved（2026-10-20）。
-- [x] `tests/verify.sh` PASS（`a18623b`、147 passed / 1 ignored、mutation 51 proved、
-      8 threads × 3 回、log: `~/.cache/mc-spine-work/verify-2026-10-20-falling.log`）。
+- [x] `tests/verify.sh` PASS（147 passed / 1 ignored、mutation 52 proved、8 threads × 3 回、
+      log: `~/.cache/mc-spine-work/verify-2026-10-20-modifier-order.log`）。
       固定 revision の `depsgx` を `PATH` に置いて実行、ログは
       `~/.cache/mc-spine-work/verify-2026-10-20.log`。
 - [x] `fix/20tps-integrated` を push（`568f40f` まで成功）。hosted CI は run

@@ -73,6 +73,30 @@ fn stafford13(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+// ---------- Mth.sin / Mth.cos (vanilla's lookup table) ----------
+//
+// `Mth.sin(float)` is not libm: it indexes a 65536-entry float table built from
+// `(float)Math.sin(i * PI * 2.0 / 65536.0)`. Feature geometry mixes the two
+// precisions - `OreFeature` places its centre with `Math.sin((double)f)` and its
+// radii with `Mth.sin` - so a port that calls `f32::sin` everywhere is off by an
+// ulp exactly where a cell boundary is decided.
+const SIN_STEPS: f32 = 10430.378;
+
+fn sin_table() -> &'static [f32; 65536] {
+    static T: std::sync::OnceLock<Box<[f32; 65536]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = Box::new([0.0f32; 65536]);
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = (i as f64 * std::f64::consts::PI * 2.0 / 65536.0).sin() as f32;
+        }
+        t
+    })
+}
+
+pub(crate) fn mth_sin(v: f32) -> f32 {
+    sin_table()[(v * SIN_STEPS) as i32 as usize & 65535]
+}
+
 pub(crate) struct Xor {
     lo: u64,
     hi: u64,

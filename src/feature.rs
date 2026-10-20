@@ -448,19 +448,36 @@ fn foliage_noise() -> &'static OSimp {
 // ---------- placed feature execution ----------
 
 fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
-    let mut cur: Vec<(i32, i32, i32)> = vec![pos];
-    for m in &pf.mods {
-        let mut next = Vec::new();
-        for p in &cur {
-            mod_positions(m, fr, ctx, rng, *p, pf, &mut next);
-        }
-        cur = next;
-        if cur.is_empty() {
-            return;
-        }
-    }
-    for p in cur {
-        gen_cf_ref(&pf.feat, fr, ctx, rng, p);
+    // Modifiers are streams of positions, not passes over a list. Vanilla builds
+    // `Stream.of(origin).flatMap(modifier::getPositions)` for each modifier in turn, and the
+    // terminal operation places the feature as each position is pulled. So a position produced by
+    // `count` goes through `in_square`, `height_range` and the feature before the next position is
+    // produced, and every draw lands in that order on the shared RandomSource.
+    //
+    // Applying one modifier to all positions before the next modifier is not equivalent: with
+    // `count: 2` this server drew x1,z1,x2,z2,y1,y2 while vanilla draws x1,z1,y1,x2,z2,y2. The
+    // vein origins then differ for every multi-position feature - `ore_andesite_lower` in chunk
+    // (0,0) put its veins at y=15 and y=18 instead of y=49 and y=18 - which is why no step index
+    // reproduced vanilla's ore cells.
+    apply_modifiers(pf.mods.as_slice(), pf, fr, ctx, rng, pos);
+}
+
+fn apply_modifiers(
+    mods: &[PM],
+    pf: &Pf,
+    fr: &'static FReg,
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+) {
+    let Some((m, rest)) = mods.split_first() else {
+        gen_cf_ref(&pf.feat, fr, ctx, rng, pos);
+        return;
+    };
+    let mut out = Vec::new();
+    mod_positions(m, fr, ctx, rng, pos, pf, &mut out);
+    for p in out {
+        apply_modifiers(rest, pf, fr, ctx, rng, p);
     }
 }
 
@@ -675,9 +692,11 @@ fn gen_vein(
         ds[k as usize * 4] = sx + (ex - sx) * f as f64;
         ds[k as usize * 4 + 1] = sy + (ey - sy) * f as f64;
         ds[k as usize * 4 + 2] = sz + (ez - sz) * f as f64;
+        // The radius is the one place vanilla uses the table: `Mth.sin(float)` over
+        // the f32 fraction, then double arithmetic around it.
         let hh = rng.next_f64() * j as f64 / 16.0;
-        ds[k as usize * 4 + 3] =
-            (((std::f32::consts::PI * f).sin() + 1.0) * hh as f32 + 1.0) as f64 / 2.0;
+        let s1 = crate::generation_math::mth_sin(std::f32::consts::PI * f) + 1.0f32;
+        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;
     }
     for k in 0..(j - 1) {
         if ds[k as usize * 4 + 3] <= 0.0 {
@@ -785,10 +804,14 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let f = rng.next_f32() * std::f32::consts::PI;
             let g = *size as f32 / 8.0;
             let i = ((*size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
-            let d = pos.0 as f64 + f.sin() as f64 * g as f64;
-            let e = pos.0 as f64 - f.sin() as f64 * g as f64;
-            let h = pos.2 as f64 + f.cos() as f64 * g as f64;
-            let j = pos.2 as f64 - f.cos() as f64 * g as f64;
+            // The centre uses `Math.sin((double)f)`, not the table: vanilla widens the
+            // float angle and calls double-precision sin/cos here.
+            let sin_f = (f as f64).sin();
+            let cos_f = (f as f64).cos();
+            let d = pos.0 as f64 + sin_f * g as f64;
+            let e = pos.0 as f64 - sin_f * g as f64;
+            let h = pos.2 as f64 + cos_f * g as f64;
+            let j = pos.2 as f64 - cos_f * g as f64;
             let l = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
             let mm = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
             let n = pos.0 - g.ceil() as i32 - i;
