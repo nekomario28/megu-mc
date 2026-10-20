@@ -12,6 +12,7 @@ Cargoのpackage version `0.0.0` は保存時の値を維持している。`AUDIT
 
 | 項目 | 状態 |
 |---|---|
+| 洞窟（carver） | **未実装**。36 chunk の y<60 空気は vanilla 3361 セル、mc-spine 0。洞窟の 96% は carver 由来（density 由来は 143 セル） |
 | 地形（feature/carver なし） | vanilla と **0 セル差**（seed 0、chunk (0,0)、(0,1)、(-1,-1)、(-2,0)）。density・surface rule・bedrock・光の非一様区間 digest が一致 |
 | feature 層 | 10302 / 98304 セル差（10.48%、chunk (0,0) の offline 比較）。placement modifier を vanilla の stream 順に直して 11017 → 10302。biome リストと block tag は 1.21.1 の jar に一致済み。残差は石系 ore の実行側 |
 | 軽量性（M3） | **未達**。代表負荷で CPU x1.10（8 回中央値、RSS は約 1/8）、spawn burst を除くと x1.79 |

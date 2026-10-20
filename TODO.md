@@ -6,6 +6,15 @@
 
 ## 進行中
 
+- [ ] **R1e carver（洞窟・峡谷）の実装**（未実装・未比較だった最大の穴）
+  - 基準値: `tools/vanilla_nofeat_pack.py --keep-carvers` の世界で 36 chunk の
+    y<60 空気 = **3361 セル**（carvers 無効だと 143）→ **洞窟の 96% は carver 由来**。
+    mc-spine は 0。記録: [carvers](evidence/gameplay/carvers/README.md)。
+  - 必要なもの: `configured_carver` の読み込み、`CarvingContext`、`CaveWorldCarver`
+    （tunnel/branch/room、carve_ellipsoid）、`CanyonWorldCarver`、`cave_air` と
+    溶岩/水の充填、feature より前の実行順。
+  - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル。
+
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）
   - 設計: [chunk-parallelism](specs/chunk-parallelism/README.md)（GenData/Gen の分離
     → ジョブ化 → worker >1、決定性テスト、`WARM=1` の前後測定）。

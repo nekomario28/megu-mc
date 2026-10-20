@@ -9,7 +9,10 @@ read from the jar itself, never from `datapacks/vanilla`: the repository's copy
 is not 1.21.1 data (it carries 1.21.2+ biome fields and newer feature lists),
 which would make a "terrain only" comparison compare two different games.
 
-The pack overrides every biome with `"features": []` and `"carvers": {}`. Load it
+The pack overrides every biome with `"features": []` and, unless
+`--keep-carvers` is passed, `"carvers": {}`. With `--keep-carvers` the world
+holds exactly the caves and canyons that the carvers produce - the fixture for
+cave parity, which a features-and-carvers-off world cannot say anything about. Load it
 in a **fresh** world (`level-name=<new dir>`), because generated chunks are not
 regenerated. Then run mc-spine with `MC_SPINE_NOFEAT=1` and diff the two chunks:
 what remains is density, the surface material rule and the aquifer.
@@ -32,16 +35,18 @@ def open_server_jar(path):
 
 
 def main():
-    if len(sys.argv) != 3:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(args) != 2:
         print(__doc__)
         return 2
-    jar, world = sys.argv[1], sys.argv[2]
+    jar, world = args[0], args[1]
+    keep_carvers = "--keep-carvers" in sys.argv
     src = f"{world}/datapacks/nofeat"
     data = f"{src}/data/minecraft/worldgen/biome"
     os.makedirs(data, exist_ok=True)
     with open(f"{src}/pack.mcmeta", "w") as f:
         json.dump({"pack": {"pack_format": PACK_FORMAT,
-                            "description": "no features or carvers"}}, f)
+                            "description": "no features" + ("" if keep_carvers else " or carvers")}}, f)
 
     z = open_server_jar(jar)
     names = [n for n in z.namelist()
@@ -57,11 +62,13 @@ def main():
             return 1
         removed += sum(len(step) for step in biome["features"])
         biome["features"] = [[] for _ in biome["features"]]
-        biome["carvers"] = {}
+        if not keep_carvers:
+            biome["carvers"] = {}
         with open(os.path.join(data, os.path.basename(name)), "w") as f:
             json.dump(biome, f)
     print(f"wrote {len(names)} biomes to {src} "
-          f"(dropped {removed} placed-feature references)")
+          f"(dropped {removed} placed-feature references"
+          f"{', kept carvers' if keep_carvers else ', dropped carvers'})")
     print(f"set level-name to {os.path.basename(world.rstrip('/'))} in server.properties")
     return 0
 
