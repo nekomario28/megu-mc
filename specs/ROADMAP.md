@@ -1,0 +1,98 @@
+# ロードマップ
+
+Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main` より 259 コミット先、
+`main` 側の clippy 3 コミットだけ未取り込み）。直近の実測値と却下した仮説は
+[evidence/gameplay/terrain-parity](../evidence/gameplay/terrain-parity/README.md)、
+目的と合格条件は [PLAN](PLAN.md)、欠陥の状態の正本は
+[close-defects](close-defects/README.md) が持つ。この文書は**順序と出口条件**だけを持ち、
+状態表を複製しない。
+
+## 現在地
+
+| 項目 | 実測・状態 |
+|---|---|
+| ビルド・テスト | `cargo build --locked` 成功。`cargo test` 140 passed / 1 ignored（2026-10-20 の verify） |
+| 必須ゲート | `tests/verify.sh` PASS（140 passed / 1 ignored、mutation 46 proved、local、2026-10-20） |
+| hosted CI | GitHub の支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替し、復旧後に同一 SHA で再取得する |
+| M3（軽量） | 代表負荷で CPU x0.63（mc-spine 10.16s / 140MiB 対 vanilla 16.09s / 1134MiB）。地形の一致を取る前の値 |
+| 地形（feature/carver なし） | vanilla と **194 / 98304 セル**（0.20%）不一致。deepslate・bedrock 帯は一致 |
+| feature 層 | feature ありの比較は 11034 / 98304（11.2%）。同梱 worldgen データが 1.21.1 ではないため、いまの数字は版差を含む |
+
+## 順序
+
+各段階は「測れる出口条件」を持つ。前段の出口条件が未達なら次段へ進まない。
+チェックポイントは検証済みコミットで切り、`main` へは統合ブランチをそのまま入れない。
+
+### R0 復元と基準（2026-10-20）
+
+- 作業ツリーを `fix/20tps-integrated` に戻し、ビルド・テスト・verify のローカル基準を取る。
+- 復元時に HEAD が必須ゲートで赤だった箇所を直した（いずれもこの日の変更ではない）:
+  - `src/worldgen.rs` の生成系から `crate::name_to_state("bedrock")` を呼んでいた
+    （a02cbf5 で混入）。層ゲートが root binding 越しの生成依存として拒否するため、
+    `Gen` が load 時に bedrock state を解決して保持する形にした。
+  - `#[ignore]` の診断ベンチが 2 件になり debt ratchet（上限 1）が赤だった。
+    ベンチは `WGBEDROCK=1` の env ゲートへ移し、parked gate の数を 1 に戻した。
+- ローカルの `depsgx` が同一バージョン表記（0.1.0）の古いビルドで、cycle を 1 件しか
+  報告せず層ゲートの自己試験が落ちた。CI が固定する revision
+  `d6b9ad8db4774919c8b4fb032342e53b2548b660` を venv に入れて `PATH` の先頭に置いた
+  （`~/.cache/mc-spine-work/gxkit-venv`）。バージョン文字列ではなく revision で固定する。
+- 出口: `tests/verify.sh` が PASS。ホスト CI の代替であることを記録する。
+
+### R1 worldgen の 1.21.1 一致（最優先）
+
+- **R1a データ版の固定**: 同梱 `datapacks/vanilla` の biome/feature/noise_settings を
+  1.21.1 の server jar から取り直して固定する。同梱 biome は 1.21.2+ 形式で、
+  1.21.1 と feature リストが 48/64 不一致、feature type が 16 個欠け・9 個余る。
+  データ差のまま feature 順序や `setFeatureSeed` の index を論じても意味がない。
+  出口: 版を名乗る根拠（jar の SHA-256 と抽出元 path）と、取り直し前後で
+  feature あり block diff を測った数字。
+- **R1b surface rule の残差**: feature/carver なしで残る 194 セル（y=54-55 の
+  dirt↔grass）を閉じる。条件式は vanilla の `dzp$z$a` と一致しているので、
+  `Context.updateY` に渡る waterHeight の与え方を vanilla の
+  `SurfaceSystem`（`dzq`）から確定する。出口: 194 → 0 付近、回帰テスト。
+- **R1c feature 層の切り分け**: 1.21.1 データで feature ありの diff を step 単位に
+  分解し、どの step（ore / vegetal / tree / top_layer …）がずれるかを数で示す。
+  出口: step 別の差分表と、最初に直す 1 step の特定。
+- **R1d 光**: 地形が一致した後で `light_parity_probe.py` の digest を再測する。
+  出口: 区間別 digest の一致／不一致と、残差の層（地形・光源・伝播）の特定。
+
+### R2 M2「遊べる」の一致
+
+- CLI（`load_client.py` / `gameplay_wire.py`）で、移動・破壊設置・所持品・クラフト・
+  精錬・収納・明暗・昼夜・天候・戦闘・死亡/リスポーン・基本 mob のセッションを
+  同一入力で vanilla と比べる。実画面は使わない（ユーザー指示）。
+- 出口: 各項目に wire の assert と vanilla 対照。未実装機能は「未実装」と明記し、
+  近似を一致として数えない。
+
+### R3 M3「軽量の証明」の再測
+
+- R1 で地形が一致した後の生成器コストを測り直す。現在の M3 は**地形が違う状態**の
+  数字なので、パリティ確立後に同じ代表負荷で再測する。生成器の並列化は
+  所有者（region/chunk pipeline）を決めてから。
+- 出口: 同一 seed・同一負荷・20TPS で CPU/RSS を再測定。x1.10 未満の差は主張しない。
+
+### R4 統合・公開
+
+- `fix/20tps-integrated` をレビュー済みのスライスに分けて `main` へ入れる。
+  草案 PR #2/#4/#6 は統合ブランチに含まれるので、統合の事実を確認して閉じる。
+- issue #7（time-contract レビュー）の各項目を統合 head に対して再判定し、
+  実行した証拠とともに閉じる。issue #1/#3 の残項目も同じ。
+- LICENSE を決めて追加（#11）。worldgen データの出自（Mojang 資産）と
+  再配布条件を README/SECURITY_NOTES に明記する。
+- 出口: `main` の CI が緑（支払い復旧後）、未修正項目が空、独立レビュー済み SHA。
+
+### R5 Mod 互換の拡張
+
+- [mod-compatibility](mod-compatibility/README.md) のスライス 04/05。
+  状態を持つ block entity・inventory・tick callback を 1 mod ずつ契約化する。
+- 出口: 対象 mod の実 JAR で、通常経路と保存/再読込の一致。
+
+## 横断的な規律
+
+- 欠陥の状態は close-defects に集約し、この文書へ複製しない。完了は
+  「実装・実行した検証・独立レビュー・未実行ゲートなし」が揃ったときだけ。
+- 計測は同一ビルド・同一条件で前後を取る。別条件の数字を比較しない
+  （`chunk_cols` を 9.3ms と比べて 7 倍と誤認しかけた。同一 `WGPERF` では
+  50.9 → 64.4ms だった）。
+- 効果のない変更は撤回し、撤回した事実と数字を evidence に残す。
+- 未実行のゲートは成功ではない。`tests/verify.sh` の終了値で停止する。
