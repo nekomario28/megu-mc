@@ -15,7 +15,7 @@ Cargoのpackage version `0.0.0` は保存時の値を維持している。`AUDIT
 | 地形（feature/carver なし） | vanilla と **0 セル差**（seed 0、chunk (0,0)、(0,1)、(-1,-1)、(-2,0)）。density・surface rule・bedrock・光の非一様区間 digest が一致 |
 | feature 層 | 10302 / 98304 セル差（10.48%、chunk (0,0) の offline 比較）。placement modifier を vanilla の stream 順に直して 11017 → 10302。biome リストと block tag は 1.21.1 の jar に一致済み。残差は石系 ore の実行側 |
 | 軽量性（M3） | **未達**。代表負荷で CPU x1.10（8 回中央値、RSS は約 1/8）、spawn burst を除くと x1.79 |
-| 必須ゲート | `tests/verify.sh` がローカルで PASS（147 passed / 1 ignored、mutation 51 proved） |
+| 必須ゲート | `tests/verify.sh` がローカルで PASS（148 passed / 1 ignored、mutation 53 proved） |
 | hosted CI | 支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替中 |
 
 順序と出口条件は [ロードマップ](specs/ROADMAP.md)、欠陥の状態は

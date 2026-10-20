@@ -88,8 +88,8 @@
       性質テスト 5 件（保存中/破壊中/隣接破壊/変換中の保存/ホットセット変更）を
       `src/tick_tests.rs` に追加し、対応する変異 5 件で赤になることを確認。
       `cargo test` 147 passed / mutation 51 proved（2026-10-20）。
-- [x] `tests/verify.sh` PASS（147 passed / 1 ignored、mutation 52 proved、8 threads × 3 回、
-      log: `~/.cache/mc-spine-work/verify-2026-10-20-modifier-order.log`）。
+- [x] `tests/verify.sh` PASS（148 passed / 1 ignored、mutation 53 proved、8 threads × 3 回、
+      log: `~/.cache/mc-spine-work/verify-2026-10-20-vein-golden.log`）。
       固定 revision の `depsgx` を `PATH` に置いて実行、ログは
       `~/.cache/mc-spine-work/verify-2026-10-20.log`。
 - [x] `fix/20tps-integrated` を push（`568f40f` まで成功）。hosted CI は run
