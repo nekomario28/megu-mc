@@ -211,3 +211,25 @@ vanilla の `PlacedFeature` の位置ストリーム（`placeWithContext`）の 
   その証拠。
 - したがって残差は「位置ストリームの draw 数」か「位置ごとの feature 実行の
   タイミング」のどちらか。
+
+## 2026-10-20（続き3）: biome フィルタの範囲は差を生まなかった（撤回）
+
+vanilla は chunk 自身の 4x4x4 biome セルから `biomesInChunk` を作る。mc-spine は
+3x3 neighborhood の chunk 中心（y=0）の biome をサンプルしていたので、
+chunk ローカル（全 section の quart セル）へ変えて測った。
+
+- chunk (0,0) の full-chunk 差分: **10302 → 10302（変化なし）**。状態組の内訳も同一。
+- 費用: `feat_populate_perf` の `populate9` が **2.494s → 2.818s（+13%）**。
+  biome 参照が 9 回から 1536 回/chunk に増えるため。
+
+この chunk では cave biome が無く、差が出ない。効果が無く費用だけ増えるので撤回した
+（`src/feature.rs` は元の 3x3 サンプルへ戻した）。cave biome を持つ chunk で差が出る
+可能性は残るが、測っていない変更は入れない。
+
+## 次の一手（未実行）
+
+vanilla 側の draw を直接取る。`OreFeature.place` は `dds`（WorldGenLevel）を要求するが、
+必要なのは `getHeight` / `getBlockState` / `setBlock` だけなので、Java の
+`java.lang.reflect.Proxy` で `dds` を差し替え、`ecz.a(dds, ayw, eeq, ...)` を
+直接呼べば「2 本目の位置」を vanilla の実装から取り出せる。そこから
+`ayw`（RandomSource）の `nextLong` を数えれば、1 本目が何 draw 使うかが確定する。

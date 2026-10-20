@@ -33,7 +33,9 @@
     位置ストリームの per-position draw 数を確定する。1 本目の vein は完全一致
     （原点 (7,49,13)、vanilla の 582 セル成分）だが 2 本目が (5,6,2) で一致しない。
     1 本目の後に 4 draw 余分とすると (1,20,8) になり vanilla の 263 セル成分と
-    x/z が一致する（chunk (1,0)/(0,1) では再現しないので未確定）。
+    x/z が一致するが、chunk (1,0)/(0,1)/(2,0) では再現しないので単純な draw 差ではない。
+    次の一手は Java の `Proxy` で `dds` を差し替えて `ecz.a(...)` を直接呼び、
+    2 本目の位置と `nextLong` の回数を vanilla 実装から取ること（推測で埋めない）。
   - 判定: 1 seed・1 chunk で andesite のセル集合が一致するか。
 - [ ] **R1c feature step 別の差分表**（R1a の後）
   - `chunk_block_diff.py` に step 別の集計を足すか、populate の書き込みを step で
