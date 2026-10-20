@@ -42,3 +42,36 @@ biome の `carvers` リスト（1.21.1 の jar と同内容）はデータとし
    （tunnel・branch・room、`carve_ellipsoid`）を bytecode から移植。
 3. feature より**前**に走らせる（vanilla の順序）。
 4. `--keep-carvers` の世界と block diff を取り、0 セルを出口条件にする。
+
+## 1. configured_carver を同梱（2026-10-20 実施）
+
+jar の `data/minecraft/worldgen/configured_carver/*.json` を
+`datapacks/vanilla/.../configured_carver/` へそのまま置いた（4 個）:
+
+| file | type | probability | y | yScale | lava |
+|---|---|---|---|---|---|
+| cave | cave | 0.15 | uniform(above_bottom 8 .. absolute 180) | uniform(0.1 .. 0.9 exclusive) | above_bottom 8 |
+| cave_extra_underground | cave | 0.07 | uniform(above_bottom 8 .. absolute 47) | uniform(0.1 .. 0.9) | above_bottom 8 |
+| canyon | canyon | 0.01 | uniform(absolute 10 .. 67) | 3.0 | above_bottom 8 |
+| nether_cave | nether_cave | 0.2 | uniform(absolute 0 .. below_top 1) | 0.5 | above_bottom 10 |
+
+`replaceable` はいずれも `#minecraft:overworld_carver_replaceables` / `#nether_carver_replaceables`。
+読み込みが正しいことは `bundled_carver_configs_are_the_1_21_1_shapes` で固定（type と
+`probability`/`y`/`yScale`/`lava_level`/`replaceable` の存在）。
+
+## 2. 移植先の obf 名（`server_mappings.txt` から）
+
+| named | obf |
+|---|---|
+| CaveWorldCarver | `ebb` |
+| CanyonWorldCarver | `eaw` |
+| WorldCarver (base: carveBlock / canReplaceBlock / isStartChunk) | `ebe` |
+| CarvingContext | `eaz` |
+| CarverConfiguration | `eax` |
+| CaveCarverConfiguration | `eba` |
+
+`CarvingMask` は名前一致で見つからないので、`CarvingMask` の内部型（`$Mask`）を
+`javap` で探すところから。移植の順序: `WorldCarver.carveBlock`（replaceable 判定・
+`cave_air`/溶岩/水の充填）→ `CaveWorldCarver.carve`（tunnel/branch/room、
+`carveEllipsoid`、`CarvingMask`）→ `CarvingContext`（surface height と aquifer）→
+chunk 生成の feature 前に呼ぶ。

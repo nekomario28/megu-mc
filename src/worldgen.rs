@@ -3023,6 +3023,30 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
     }
 
     #[test]
+    fn bundled_carver_configs_are_the_1_21_1_shapes() {
+        // The four configured carvers the overworld's biomes reference. They were missing
+        // entirely, so no cave could ever be carved; this keeps them present and shaped like
+        // the 1.21.1 jar's files now that the carving code is the next piece.
+        for (name, ty) in [
+            ("cave", "minecraft:cave"),
+            ("cave_extra_underground", "minecraft:cave"),
+            ("canyon", "minecraft:canyon"),
+            ("nether_cave", "minecraft:nether_cave"),
+        ] {
+            let raw = std::fs::read(format!(
+                "datapacks/vanilla/data/minecraft/worldgen/configured_carver/{name}.json"
+            ))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let j = crate::json::jparse(&raw).unwrap_or_else(|| panic!("{name}: not JSON"));
+            assert_eq!(crate::json::jstr(&j, "type").as_deref(), Some(ty), "{name}: type");
+            let cfg = crate::json::js(&j, "config").unwrap_or_else(|| panic!("{name}: no config"));
+            for key in ["probability", "y", "yScale", "lava_level", "replaceable"] {
+                assert!(crate::json::js(cfg, key).is_some(), "{name}: config lacks {key}");
+            }
+        }
+    }
+
+    #[test]
     fn the_ore_vein_geometry_matches_vanillas_own_output() {
         // Vanilla's OreFeature.place (called through tools/vanilla-probe) writes these 666
         // cells for seed 60007, position (7,49,13) and size 64. Pinning them means the Rust
