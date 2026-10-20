@@ -3023,6 +3023,26 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
     }
 
     #[test]
+    fn the_ore_vein_geometry_matches_vanillas_own_output() {
+        // Vanilla's OreFeature.place (called through tools/vanilla-probe) writes these 666
+        // cells for seed 60007, position (7,49,13) and size 64. Pinning them means the Rust
+        // generator is compared against the game's own output, not only against the Python
+        // port in tools/ore_oracle.py.
+        let text = include_str!("../evidence/gameplay/feature-parity/ore_andesite_666.txt");
+        let mut want: Vec<(i32, i32, i32)> = text
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            })
+            .collect();
+        want.sort();
+        let got = crate::feature::ore_cells_for_test(60007, (7, 49, 13), 64);
+        assert_eq!(got.len(), want.len(), "cell count differs from vanilla's 666");
+        assert_eq!(got, want, "vein geometry differs from vanilla's own output");
+    }
+
+    #[test]
     fn the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart() {
         // The deep material rule asks for the biome once per block; the answer only depends on the
         // quart, so one shared cache replaced millions of B-tree searches. Pin that a repeat query

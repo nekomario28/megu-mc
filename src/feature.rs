@@ -772,14 +772,16 @@ fn gen_vein(
 }
 
 
-fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
-    match cf {
-        Cf::Unknown(_) => {}
-        Cf::Tree(t) => {
-            crate::tree::gen_tree(ctx, rng, pos, t);
-        }
-        Cf::Ore { size, discard, targets, scattered } => {
-            if *scattered {
+fn gen_ore(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    size: i32,
+    discard: f32,
+    targets: &[(RT, u32)],
+    scattered: bool,
+) {
+            if scattered {
                 let count = rng.next_bound(size + 1);
                 for i in 0..count {
                     let md = i.min(7);
@@ -793,7 +795,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         continue;
                     }
                     for (rt, st) in targets {
-                        if ore_should_place(*discard, ctx, rt, tp, rng) {
+                        if ore_should_place(discard, ctx, rt, tp, rng) {
                             ctx.set(tp.0, tp.1, tp.2, *st);
                             break;
                         }
@@ -802,8 +804,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 return;
             }
             let f = rng.next_f32() * std::f32::consts::PI;
-            let g = *size as f32 / 8.0;
-            let i = ((*size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
+            let g = size as f32 / 8.0;
+            let i = ((size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
             // The centre uses `Math.sin((double)f)`, not the table: vanilla widens the
             // float angle and calls double-precision sin/cos here.
             let sin_f = (f as f64).sin();
@@ -822,11 +824,37 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             for xp in n..=(n + q) {
                 for zp in p..=(p + q) {
                     if o <= ctx.hm_oc(xp, zp) {
-                        gen_vein(ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, *size, *discard, targets);
+                        gen_vein(ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets);
                         return;
                     }
                 }
             }
+}
+
+
+/// Test helper: the cells one vein writes for a seed and position, with a rule test that
+/// always matches, so the geometry can be compared cell for cell with vanilla's own output
+/// (see evidence/gameplay/feature-parity/ore_andesite_666.txt).
+#[cfg(test)]
+pub(crate) fn ore_cells_for_test(seed: u64, pos: (i32, i32, i32), size: i32) -> Vec<(i32, i32, i32)> {
+    let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = FC::new(&mut g);
+    let mut rng = Xor::seed(seed);
+    let targets = [(RT::True, 0u32)];
+    gen_ore(&mut ctx, &mut rng, pos, size, 0.0, &targets, false);
+    let mut v: Vec<(i32, i32, i32)> = ctx.wr.keys().copied().collect();
+    v.sort();
+    v
+}
+
+fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    match cf {
+        Cf::Unknown(_) => {}
+        Cf::Tree(t) => {
+            crate::tree::gen_tree(ctx, rng, pos, t);
+        }
+        Cf::Ore { size, discard, targets, scattered } => {
+            gen_ore(ctx, rng, pos, *size, *discard, targets, *scattered);
         }
         Cf::Disk { half, radius, bsp, target } => {
             let Some(reg) = breg() else { return };

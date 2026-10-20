@@ -384,6 +384,11 @@ check "placement modifiers advance positions in vanilla's draw order" \
             out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + z));' \
   feature_population_output_matches_the_pre_refactor_capture
 
+check "the ore vein radius matches vanilla's own output" \
+  src/feature.rs '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \
+  '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0 + 0.01;' \
+  the_ore_vein_geometry_matches_vanillas_own_output
+
 check "the frozen population digest notices shared provider changes" \
   src/generation_providers.rs '            IP::Uniform(a, b) => r.next_inbetween(*a, *b),' \
   '            IP::Uniform(a, b) => (*a + *b) / 2,' \
