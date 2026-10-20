@@ -86,12 +86,46 @@ feature が読む地形をチャンク単位の配列（16×16×height、no feat
 - 判断: **撤回**。地形の読みを作り直す方向では M3 に届かない。次の候補は
   feature ロジック本体（40 ms/chunk）の削減か、生成の並列化（所有者を決めてから）。
 
+## 試したこと3: feature 側のチャンク列キャッシュ（採用）
+
+読み 1 回の内訳を疑い、`FC::get` がセルごとに `Gen::cols()`（HashMap 参照 +
+`Arc` clone）を呼んでいたのを、チャンクが変わったときだけ取得するようにした。
+`Gen::terrain_cell(&ChunkCols, …)` は `terrain_state` と同じ計算を、取得済みの
+列に対して行う。
+
+|| 前 | 後 |
+|---|---|---|
+| 地形読み | 1797 ns/call | **295 ns/call** |
+| 地形読み合計（25 chunk） | 492 ms | **81 ms** |
+| FEATPROF total | 1088 ms | **736 ms** |
+| `populate9` | 667 ms | **411 ms** |
+
+計算内容は同じ（同じ列・同じ密度・同じ material rule）で、feature capture
+digest も変わらない。`Populate9` は 60 → 37 ms/chunk。
+
+## 移動視点の再測定（4 回、20 秒窓）
+
+| run | vanilla CPU | mc-spine CPU | 比 |
+|---|---|---|---|
+| 1 | 17.19 | 14.30 | 0.83 |
+| 2 | 17.24 | 18.31 | 1.06 |
+| 3 | 15.36 | 18.27 | 1.19 |
+| 4 | 16.12 | 17.61 | 1.09 |
+
+中央値は vanilla 16.68 対 mc-spine 17.94 で **x1.08**（RSS は 145 対 1114-1183 MiB）。
+1 回だけ x0.83 が出たが、同じ binary の他 3 回は x1.06-1.19 なので **M3 はまだ
+主張しない**。ログイン時の spawn 生成（約 121 チャンク）が 20 秒窓の大半を占め、
+窓ごとのばらつきも大きい。feature ロジック側の改善（`populate9` -38%）は
+限定的にしか end-to-end に出ていない。
+
 ## 次の一手（R3）
 
-feature ロジック本体の 40 ms/chunk を対象にする。最初に `FEAT_PROFILE` の
-上位（`ore_dirt` 13 ms、`monster_room(_deep)` 9.7 ms）を 1 つずつ測り、
-候補セル数・書き込み数・地形読み以外のコストを分ける。並列化は所有者
-（region/chunk pipeline）を決めてから。
+feature ロジック本体（読みを除いて約 40 ms/chunk）が残る。`ore_dirt` は
+読みを安くしても 11.7 ms/chunk で、コストは vein の楕円体ループ
+（候補セル数 × 距離計算）にある。`monster_room(_deep)` も同様。
+次はこの 2 つを 1 つずつ、候補セル数と書き込み数、ループ内の計算量に分けて測る。
+並列化（vanilla は 62-64 スレッド、mc-spine は 3）は所有者
+（region/chunk pipeline）を決めてから。ログイン burst を窓から除外する測定も要る。
 
 ## 主張しないこと
 
@@ -101,3 +135,5 @@ feature ロジック本体の 40 ms/chunk を対象にする。最初に `FEAT_P
 - 機能集合は等しくない（mc-spine の方が少ない）。同じ仕事の比較ではない。
 - `FEAT_PROFILE` は `Instant` を feature ごとに取る診断で、その分の overhead を
   含む。順位付けに使い、絶対値の主張には使わない。
+- end-to-end の 4 回は同一 binary だが、ホストの他プロセスと窓の内容で
+  14.3-18.3s とばらつく。中央値だけを比較に使い、単発の最良値は主張しない。

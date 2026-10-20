@@ -1727,23 +1727,30 @@ impl Gen {
     /// Terrain-layer block state at a world position (no feature layer).
     /// Mirrors wg2_block: material window -> deep rules -> aquifer.
     pub(crate) fn terrain_state(&mut self, x: i32, y: i32, z: i32) -> u32 {
-        if y < self.min_y || y >= self.min_y + self.height {
-            return 0;
-        }
         let cc = match self.cols(x >> 4, z >> 4) {
             Some(c) => c,
             None => return 0,
         };
-        let d = self.block_density(&cc, x, y, z);
+        self.terrain_cell(&cc, x, y, z)
+    }
+
+    /// `terrain_state` with the chunk columns already fetched. Feature placement
+    /// reads thousands of cells from one chunk; fetching `cols()` (a HashMap
+    /// lookup plus an Arc clone) per cell was ~1.2 us of the 1.8 us read.
+    pub(crate) fn terrain_cell(&mut self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> u32 {
+        if y < self.min_y || y >= self.min_y + self.height {
+            return 0;
+        }
+        let d = self.block_density(cc, x, y, z);
         if d > 0.0 {
             if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
                 return if st == u32::MAX { self.def_st } else { st };
             }
-            return self.deep_state_cached(x, y, z, &cc);
+            return self.deep_state_cached(x, y, z, cc);
         }
         match self.aq_state(x, y, z, d) {
             Some(st) => st,
-            None => self.deep_state_cached(x, y, z, &cc),
+            None => self.deep_state_cached(x, y, z, cc),
         }
     }
     /// WORLD_SURFACE_WG-style height (first non-air + 1) at a column.

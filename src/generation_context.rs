@@ -20,6 +20,7 @@ pub(crate) struct FC<'a> {
     ws_t: HashMap<(i32, i32), i32>,
     oc_t: HashMap<(i32, i32), i32>,
     bc: HashMap<(i32, i32, i32), Option<String>>, // biome cache per quart
+    cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
     prof: bool,
 }
 impl<'a> FC<'a> {
@@ -31,6 +32,7 @@ impl<'a> FC<'a> {
             ws_t: HashMap::new(),
             oc_t: HashMap::new(),
             bc: HashMap::new(),
+            cc: None,
             prof: std::env::var("FEAT_PROFILE").is_ok(),
         }
     }
@@ -41,12 +43,22 @@ impl<'a> FC<'a> {
         if let Some(&s) = self.rc.get(&(x, y, z)) {
             return s;
         }
+        let (cx, cz) = (x >> 4, z >> 4);
+        if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
+            match self.g.cols(cx, cz) {
+                Some(c) => self.cc = Some((cx, cz, c)),
+                None => return 0,
+            }
+        }
         let t0 = if self.prof {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        let st = self.g.terrain_state(x, y, z);
+        let st = match &self.cc {
+            Some((_, _, c)) => self.g.terrain_cell(c, x, y, z),
+            None => 0,
+        };
         if let Some(t0) = t0 {
             READ_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             READ_N.fetch_add(1, Ordering::Relaxed);

@@ -6,16 +6,15 @@
 
 ## 進行中
 
-- [ ] **R3 feature ロジック本体の削減**（M3 は x1.13 で未達）
-  - 再測値: mc-spine 19.79s / 145.2MiB / 3thr 対 vanilla 17.59s / 1204.7MiB / 62thr。
-    内訳: `chunk_cols` 11.5 ms/chunk、feature 約 60 ms/chunk（生成の 84%）。
-    うち地形読みが 45%（1.8 µs/call、274k 回/25 chunk）、残りが feature ロジック。
-  - チャンク単位の地形配列は試して**撤回**（構築 20.7 ms/chunk、移動視点で
-    22.56s 対 19.79s に悪化）。地形の読みを作り直す方向では届かない。
-  - 次: `FEAT_PROFILE` の上位（`ore_dirt` 13 ms、`monster_room(_deep)` 9.7 ms）を
-    1 つ選び、候補セル数・書き込み数・地形読み以外の内訳を測って削る。
-    並列化は所有者（region/chunk pipeline）を決めてから。
-  - 判定: `FEAT_PROFILE` の該当 feature と `load_compare.sh` の CPU。x1.10 未満は
+- [ ] **R3 feature ロジック本体の削減**（M3 は中央値 x1.08 でまだ未達）
+  - 現在: `populate9` 60 → 37 ms/chunk（地形読み 1797 → 295 ns/call、FC の列
+    キャッシュを採用）。移動視点 4 回の中央値は vanilla 16.68 対 mc-spine 17.94
+    （x1.08、RSS は 145 対 1114-1183 MiB）。単発の x0.83 は主張しない。
+  - チャンク単位の地形配列は**撤回**（構築 20.7 ms/chunk、移動視点で悪化）。
+  - 次: `ore_dirt`（読みを除いても 11.7 ms/chunk）と `monster_room(_deep)`
+    （計 8.9 ms）を 1 つ選び、候補セル数・書き込み数・ループ内の計算量を測る。
+    ログイン burst を窓から除外する測定も用意する。並列化は所有者を決めてから。
+  - 判定: `FEAT_PROFILE` の該当 feature と `load_compare.sh` の中央値。x1.10 未満は
     主張しない。
 
 ## 次
@@ -49,6 +48,8 @@
       以前の x0.63 を現在の代表値として使わないことを close-defects に記録。
 - [x] 生成費用の内訳を診断（feature 84%、ore_dirt 13 ms/chunk）。fill を 1 ロック・
       1 回計算に整理（代表負荷はノイズ内、パリティ 0 セル）。
+- [x] feature の地形読みを 1797 → 295 ns/call（`FC` がチャンク列を保持）。
+      `populate9` 667 → 411 ms、FEATPROF 1088 → 736 ms。capture digest 不変。
 - [x] ローカル `depsgx` を固定 revision の venv に置き換え（同一バージョン表記の古い
       ビルドが cycle を 1 件しか報告しなかった）。
 
