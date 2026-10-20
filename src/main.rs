@@ -3260,28 +3260,9 @@ fn column_state(x: i32, y: i32, z: i32, h: i32) -> u32 {
 }
 // datapack worldgen (worldgen.rs): vanilla density pipeline
 fn wg2_block(x: i32, y: i32, z: i32) -> Option<u32> {
-    // feature layer (trees/ores/vegetation/lakes...) overrides terrain
-    if let Some(st) = worldgen::feature_state(x, y, z, feature::populate) {
-        return Some(st);
-    }
-    let cc = worldgen::chunk_cols(x >> 4, z >> 4)?;
-    let d = worldgen::density_in(&cc, x, y, z);
-    let solid = d > 0.0;
-    if solid {
-        // surface-window material rules first; below the window -> deep rules
-        if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
-            return Some(if st == u32::MAX { worldgen::default_state() } else { st });
-        }
-        return Some(worldgen::deep_state(x, y, z, &cc));
-    }
-    // vanilla aquifer: fluid-level grid + barrier noise decide air/water/lava
-    // (or solid when a barrier pushes the cell back over density>0).
-    match worldgen::aquifer_state(x, y, z, d) {
-        Some(0) => {}
-        Some(st) => return Some(st),
-        None => return Some(worldgen::deep_state(x, y, z, &cc)),
-    }
-    Some(0)
+    // One lock for the whole decision (feature layer -> material window ->
+    // aquifer -> deep rules); the five free accessors each took the lock again.
+    worldgen::block_state(x, y, z, feature::populate)
 }
 
 fn door_base(st: u32) -> Option<u32> {
@@ -9069,6 +9050,11 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             data.extend_from_slice(&section_encode(&arr, &biomes));
         } else {
             let mut arr = [0u32; 4096];
+            // One terrain pass for the section: the previous shape took the worldgen
+            // lock up to five times per block (feature lookup, columns, density,
+            // aquifer, deep rules) and could compute the generated state twice when
+            // an overlay edit covered the cell.
+            let base = worldgen::terrain_section(cx, sy, cz, feature::populate);
             {
                 let w = world().lock().unwrap();
                 let read = |wx: i32, wy: i32, wz: i32| -> u32 {
@@ -9082,12 +9068,15 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                             let ov = if overlay_empty { None } else {
                                 w.get(&(wx >> 4, wz >> 4)).and_then(|c| c.get(&local_idx(wx, wy, wz))).copied()
                             };
-                            let st = ov.unwrap_or_else(|| base_state(wx, wy, wz));
+                            let gen = match &base {
+                                Some(a) => a[((ly << 8) | (lz << 4) | lx) as usize],
+                                None => base_state(wx, wy, wz),
+                            };
+                            let st = ov.unwrap_or(gen);
                             // Record the generated emitter even when an overlay edit covers it:
                             // removing that edit re-exposes it, and the live-overlay filter in
                             // `block_light_sections` suppresses it while the edit remains.
                             if let Some(reg) = reg {
-                                let gen = if ov.is_some() { base_state(wx, wy, wz) } else { st };
                                 let lum = reg.luminance_of(gen);
                                 if lum > 0 { gen_sources_here.push(((wx, wy, wz), lum)); }
                             }

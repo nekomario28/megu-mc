@@ -70,11 +70,15 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 
 - 地形一致後に測り直した: **CPU x1.13**（mc-spine 19.87s / 144.7MiB / 3thr 対
   vanilla 17.53s / 1159.7MiB / 63thr、20 秒窓）。以前の x0.63 は地形不一致時の値。
-- 同じセルを fill・surface 走査・material 窓で 2〜3 回密度評価している。
-  `block_density` の再評価を減らす（チャンク内の値を一度だけ作って参照する、
-  interp の格子参照をインライン化する等）を、地形 0 セルを保ったまま行う。
+- 内訳（release）: `chunk_cols` 11.5 ms/chunk、feature の populate 約 60 ms/chunk。
+  **生成時間の約 84% は feature**で、上位は `ore_dirt` 13 ms/chunk、
+  `monster_room(_deep)` 9.7 ms、`ore_gravel` 3.9 ms など。原因は候補セルごとの
+  `terrain_state`（µs 台）で、vanilla のブロック配列読み（ns 台）との差。
+  証拠: [生成器の費用](../../evidence/gameplay/worldgen-cost/README.md)。
+- 次のスライス: feature が読む地形をチャンク単位の配列として一度だけ作り、
+  populate と fill で共有する（9〜16 チャンクの LRU、3.5〜6 MiB）。地形は feature の
+  書き込みに依存しないので順序に依存しない。並列化は所有者を決めてから。
 - 出口: 同一 seed・同一負荷で CPU を再測定し、x1.10 未満の差は主張しない。
-  並列化は所有者（region/chunk pipeline）を決めてから。
 
 ### R4 統合・公開
 

@@ -6,15 +6,15 @@
 
 ## 進行中
 
-- [ ] **R3 生成器の費用削減**（地形一致後、M3 は x1.13 で未達）
-  - 再測値: mc-spine 19.87s / 144.7MiB / 3thr 対 vanilla 17.53s / 1159.7MiB / 63thr
-    （`tools/load_compare.sh 20 0`）。以前の x0.63 は地形不一致時の値。
-  - 同じセルを fill・surface 走査・material 窓で 2〜3 回密度評価している。
-    まず `cols()` 内で 1 チャンク分の final density を一度だけ作り、
-    `block_density` の再評価をなくす（メモリと引き換えの案を含めて測る）。
-    interp の格子参照のインライン化も同じスライス。
-  - 判定: feature/carver なしの block diff が 0 のまま、`WGPERF` と
-    `load_compare.sh` の CPU が改善するか。x1.10 未満の差は主張しない。
+- [ ] **R3 feature が読む地形の共有配列**（M3 は x1.13 で未達）
+  - 再測値: mc-spine 19.79s / 145.2MiB / 3thr 対 vanilla 17.59s / 1204.7MiB / 62thr。
+    内訳: `chunk_cols` 11.5 ms/chunk、feature 約 60 ms/chunk（生成の 84%）。
+    `FEAT_PROFILE` 上位は `ore_dirt` 13 ms/chunk、`monster_room(_deep)` 9.7 ms。
+  - feature の候補セルごとの `terrain_state` をやめ、チャンク単位の地形配列を
+    一度だけ作って populate と fill で共有する（9〜16 チャンクの LRU、3.5〜6 MiB）。
+    地形は feature の書き込みに依存しないので順序に依存しない。
+  - 判定: feature/carver なしの block diff が 0 のまま、`FEAT_PROFILE` の
+    populate と `load_compare.sh` の CPU が改善するか。x1.10 未満は主張しない。
 
 ## 次
 
@@ -45,6 +45,8 @@
       （feature/carver なしの block diff が 4 chunk で 0）。回帰テスト追加。
 - [x] 地形一致後の代表負荷を再測定（CPU x1.13 で M3 未達、RSS x8 軽い）。
       以前の x0.63 を現在の代表値として使わないことを close-defects に記録。
+- [x] 生成費用の内訳を診断（feature 84%、ore_dirt 13 ms/chunk）。fill を 1 ロック・
+      1 回計算に整理（代表負荷はノイズ内、パリティ 0 セル）。
 - [x] ローカル `depsgx` を固定 revision の venv に置き換え（同一バージョン表記の古い
       ビルドが cycle を 1 件しか報告しなかった）。
 

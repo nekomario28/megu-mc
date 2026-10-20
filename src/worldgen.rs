@@ -1697,6 +1697,33 @@ impl Gen {
 }
 
 impl Gen {
+    /// Full block decision (feature layer, material window, aquifer, deep rules)
+    /// without taking the GEN lock. `terrain_section` and the free `block_state`
+    /// use it so a chunk fill takes one lock instead of five per block.
+    pub(crate) fn block_state_at(
+        &mut self, x: i32, y: i32, z: i32, populate: impl FnMut(&mut Gen, i32, i32),
+    ) -> u32 {
+        if let Some(st) = self.feat_state(x, y, z, populate) {
+            return st;
+        }
+        let cc = match self.cols(x >> 4, z >> 4) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let d = self.block_density(&cc, x, y, z);
+        if d > 0.0 {
+            if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
+                return if st == u32::MAX { self.def_st } else { st };
+            }
+            return self.deep_state_cached(x, y, z, &cc);
+        }
+        match self.aq_state(x, y, z, d) {
+            Some(0) => 0,
+            Some(st) => st,
+            None => self.deep_state_cached(x, y, z, &cc),
+        }
+    }
+
     /// Terrain-layer block state at a world position (no feature layer).
     /// Mirrors wg2_block: material window -> deep rules -> aquifer.
     pub(crate) fn terrain_state(&mut self, x: i32, y: i32, z: i32) -> u32 {
@@ -2253,6 +2280,35 @@ impl Gen {
 /// Some(state) = air/water/lava; None = barrier pushed it solid (material rules).
 pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
     GEN.lock().unwrap().as_mut()?.aq_state(x, y, z, density)
+}
+
+/// The block state at a world position, taking the GEN lock once.
+pub fn block_state(x: i32, y: i32, z: i32, populate: impl FnMut(&mut Gen, i32, i32)) -> Option<u32> {
+    GEN.lock()
+        .unwrap()
+        .as_mut()
+        .map(|g| g.block_state_at(x, y, z, populate))
+}
+
+/// Base terrain states for one 16x16x16 section, in the send layout
+/// `(ly << 8) | (lz << 4) | lx`, with one GEN lock for the whole section.
+pub fn terrain_section(
+    cx: i32, sy: i32, cz: i32, mut populate: impl FnMut(&mut Gen, i32, i32),
+) -> Option<Box<[u32; 4096]>> {
+    let mut gg = GEN.lock().unwrap();
+    let g = gg.as_mut()?;
+    let mut arr = Box::new([0u32; 4096]);
+    for ly in 0..16i32 {
+        let y = sy + ly;
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
+                let x = cx * 16 + lx;
+                let z = cz * 16 + lz;
+                arr[((ly << 8) | (lz << 4) | lx) as usize] = g.block_state_at(x, y, z, &mut populate);
+            }
+        }
+    }
+    Some(arr)
 }
 
 /// feature-layer override lookup (populates 3x3 chunks lazily on first touch)
