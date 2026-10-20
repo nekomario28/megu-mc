@@ -4,6 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONDONTWRITEBYTECODE=1
+# The wire tests generate spawn chunks before the play phase. On a shared host the
+# 10s default can expire under load without a code failure (observed: the mutation
+# check's baseline control failed twice in one run and passed when re-run alone).
+# Keep a bound, but give the server load headroom.
+export MC_PROBE_DEADLINE="${MC_PROBE_DEADLINE:-30}"
 
 echo "== gate exit contracts"
 python3 tests/gate_scripts.py

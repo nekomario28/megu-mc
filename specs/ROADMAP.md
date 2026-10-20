@@ -15,8 +15,8 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 | 必須ゲート | `tests/verify.sh` PASS（140 passed / 1 ignored、mutation 46 proved、local、2026-10-20） |
 | hosted CI | GitHub の支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替し、復旧後に同一 SHA で再取得する |
 | M3（軽量） | 代表負荷で CPU x0.63（mc-spine 10.16s / 140MiB 対 vanilla 16.09s / 1134MiB）。地形の一致を取る前の値 |
-| 地形（feature/carver なし） | vanilla と **194 / 98304 セル**（0.20%）不一致。deepslate・bedrock 帯は一致 |
-| feature 層 | feature ありの比較は 11034 / 98304（11.2%）。同梱 worldgen データが 1.21.1 ではないため、いまの数字は版差を含む |
+| 地形（feature/carver なし） | vanilla と **5 / 98304 セル**（chunk (0,0)。(0,1) は 36、(-1,-1)/(-2,0) は 0）。deepslate・bedrock 帯は一致 |
+| feature 層 | feature ありの比較は 10947 / 98304（11.1%）。同梱 worldgen データが 1.21.1 ではないため、いまの数字は版差を含む |
 
 ## 順序
 
@@ -46,10 +46,9 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
   データ差のまま feature 順序や `setFeatureSeed` の index を論じても意味がない。
   出口: 版を名乗る根拠（jar の SHA-256 と抽出元 path）と、取り直し前後で
   feature あり block diff を測った数字。
-- **R1b surface rule の残差**: feature/carver なしで残る 194 セル（y=54-55 の
-  dirt↔grass）を閉じる。条件式は vanilla の `dzp$z$a` と一致しているので、
-  `Context.updateY` に渡る waterHeight の与え方を vanilla の
-  `SurfaceSystem`（`dzq`）から確定する。出口: 194 → 0 付近、回帰テスト。
+- **R1b surface rule の残差（完了 2026-10-20）**: `not_underwater` の二重否定と
+  waterHeight の近似を直し、(0,0) 194→5、(0,1) 243→36、(-1,-1) 228→0。
+  残りは 1 ブロックの表面段差で density の境界。
 - **R1c feature 層の切り分け**: 1.21.1 データで feature ありの diff を step 単位に
   分解し、どの step（ore / vegetal / tree / top_layer …）がずれるかを数で示す。
   出口: step 別の差分表と、最初に直す 1 step の特定。

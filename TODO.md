@@ -6,12 +6,14 @@
 
 ## 進行中
 
-- [ ] **R1b surface rule の 194 セル**（y=54-55 の dirt↔grass）
-  - vanilla `SurfaceSystem`（obf `dzq`）の `Context.updateY(..., waterHeight, ...)` へ
-    渡る値を確定する。条件式 `dzp$z$a` は `waterHeight == MIN` → true、
-    それ以外は `y + stoneDepthAbove >= waterHeight + offset + runDepth * mult` で一致済み。
-  - 判定: feature/carver なしの `chunk_block_diff` が 194 → 0 付近。
-    減らない／増える変更は撤回して数字を残す。
+- [ ] **density の補間順序を再評価する**（残差 5/36 セルの候補）
+  - 残差は表面が 1 ブロック低い列に集中している（vanilla y=63 grass / mc-spine
+    y=62 grass）。surface rule ではなく density の符号が境界で反転している形。
+  - `interpolated` の入力だけをセル隅評価し、`squeeze`/`min` の外側をブロック毎に
+    評価する変更を再適用して測る（前回は feature なし 7727→7723 で撤回、+27%。
+    今回は surface rule 修正後の 5/36 が対象）。
+  - 判定: feature/carver なしの (0,0)/(0,1) が 0 に近づくか。費用（`WGPERF` の
+    ms/chunk）も同じ条件で前後を取る。改善しなければ撤回して数字を残す。
 
 ## 次
 
@@ -36,6 +38,8 @@
       `tools/vanilla_nofeat_pack.py`、`evidence/gameplay/terrain-parity/README.md`。
 - [x] 層ゲートの赤（生成系からの `crate::name_to_state`）と debt ratchet の赤
       （2 件目の ignored test）を解消。
+- [x] surface rule の `not_underwater` 二重否定と waterHeight 近似を修正
+      （(0,0) 194→5、(0,1) 243→36、(-1,-1) 228→0）。回帰テスト追加。
 - [x] ローカル `depsgx` を固定 revision の venv に置き換え（同一バージョン表記の古い
       ビルドが cycle を 1 件しか報告しなかった）。
 

@@ -607,13 +607,16 @@ impl Gen {
     }
 
     fn resolve_cond(&mut self, name: &str, cf: &HashMap<String, Vec<u8>>) -> Option<usize> {
-        // `minecraft:not_underwater` is a built-in ConditionSource, not a datapack file, so a
-        // string reference to it resolved to None and the grass_block branch never ran. Vanilla
-        // defines it as not(water(0, 0, false)).
+        // `minecraft:not_underwater` is a built-in ConditionSource, not a datapack
+        // file. Its condition (`SurfaceRules$WaterConditionSource$1WaterCondition`)
+        // is already "not underwater": waterHeight == MIN, or blockY + stoneDepth
+        // above the water surface. Negating it put grass on submerged floors.
         if name == "minecraft:not_underwater" || name == "not_underwater" {
-            let water = self.conds.len();
-            self.conds.push(Cond::Water { off: 0, mult: 0, sd: false });
-            self.conds.push(Cond::Not(water));
+            self.conds.push(Cond::Water {
+                off: 0,
+                mult: 0,
+                sd: false,
+            });
             return Some(self.conds.len() - 1);
         }
         if let Some(&i) = self.cond_ids.get(name) {
@@ -711,14 +714,12 @@ impl Gen {
                 sec: n("secondary_depth_range") as i32,
                 ceil: j.get("surface_type").map(J::str) == Some("ceiling"),
             },
-            // Vanilla's `not_underwater` is `not(water(offset 0, surface_depth_multiplier 0,
-            // add_stone_depth false))`. Without this arm it fell through to `Cond::False`, so the
-            // `grass_block` branch of the surface rule never ran and every land column got `dirt`.
-            "not_underwater" => {
-                let water = self.conds.len();
-                self.conds.push(Cond::Water { off: 0, mult: 0, sd: false });
-                Cond::Not(water)
-            }
+            // The condition is already "not underwater" (see resolve_cond).
+            "not_underwater" => Cond::Water {
+                off: 0,
+                mult: 0,
+                sd: false,
+            },
             "not" => Cond::Not(self.cond_node(j.get("invert")?, cf)?),
             "hole" => Cond::Hole,
             "above_preliminary_surface" => Cond::Prelim,
@@ -1423,6 +1424,30 @@ impl Gen {
             cc.surf[zi * 16 + xi] = sy as i16;
         }
     }
+
+    // heightmap basis: topmost solid-or-fluid per column. Columns whose
+    // solid top sits below sea level probe the aquifer for water so
+    // OCEAN_FLOOR/WORLD_SURFACE_WG land on the water surface.
+    let water_st = g.def_fl;
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let sy = cc.surf[lz * 16 + lx] as i32;
+            let mut wt = sy;
+            if sy < g.sea {
+                let wx = cx * 16 + lx as i32;
+                let wz = cz * 16 + lz as i32;
+                let mut yy = g.sea;
+                while yy > sy {
+                    if g.aq_state(wx, yy, wz, -1.0) == Some(water_st) {
+                        wt = yy;
+                        break;
+                    }
+                    yy -= 1;
+                }
+            }
+            cc.wtop[lz * 16 + lx] = wt as i16;
+        }
+    }
     // vanilla surface material rules: per-column top-down scan over the
     // surface window [est_min .. max(surf, sea)] tracking vanilla's
     // stone_depth_above/below and fluid_height.
@@ -1439,6 +1464,15 @@ impl Gen {
                 let x = cx * 16 + lx as i32;
                 let z = cz * 16 + lz as i32;
                 let surf_y = cc.surf[lz * 16 + lx] as i32;
+                // vanilla's SurfaceSystem scan sets waterHeight to the topmost
+                // fluid cell it has seen since the last air cell. For the window
+                // the fluid above the terrain is the open water column, whose
+                // top the heightmap probe already found.
+                let water_surface = if (cc.wtop[lz * 16 + lx] as i32) > surf_y {
+                    cc.wtop[lz * 16 + lx] as i32
+                } else {
+                    i32::MIN
+                };
                 let scan_top = surf_y.max(g.sea);
                 c.x = x;
                 c.z = z;
@@ -1467,8 +1501,18 @@ impl Gen {
                 let mut fluid = i32::MIN;
                 let mut y = scan_top;
                 while y >= est_min {
-                    if cc.density(x, y, z) <= 0.0 {
-                        if y <= g.sea {
+                    let d = cc.density(x, y, z);
+                    if d <= 0.0 {
+                        // A fluid cell sets waterHeight once; air resets it, as
+                        // vanilla's buildSurface scan does. Above the terrain the
+                        // open column is water up to the probed surface; below it
+                        // only an aquifer water/lava cell counts.
+                        let fluid_cell = if y > surf_y {
+                            y <= water_surface
+                        } else {
+                            g.aq_state(x, y, z, d).is_some_and(|st| g.is_fluid_state(st))
+                        };
+                        if fluid_cell {
                             if fluid == i32::MIN {
                                 fluid = y + 1;
                             }
@@ -1509,29 +1553,6 @@ impl Gen {
     }
     cc.mats = mats;
     cc.rd = rd;
-    // heightmap basis: topmost solid-or-fluid per column. Columns whose
-    // solid top sits below sea level probe the aquifer for water so
-    // OCEAN_FLOOR/WORLD_SURFACE_WG land on the water surface.
-    let water_st = g.def_fl;
-    for lz in 0..16usize {
-        for lx in 0..16usize {
-            let sy = cc.surf[lz * 16 + lx] as i32;
-            let mut wt = sy;
-            if sy < g.sea {
-                let wx = cx * 16 + lx as i32;
-                let wz = cz * 16 + lz as i32;
-                let mut yy = g.sea;
-                while yy > sy {
-                    if g.aq_state(wx, yy, wz, -1.0) == Some(water_st) {
-                        wt = yy;
-                        break;
-                    }
-                    yy -= 1;
-                }
-            }
-            cc.wtop[lz * 16 + lx] = wt as i16;
-        }
-    }
     let arc = std::sync::Arc::new(cc);
     g.col_ord.push((cx, cz));
     if g.col_ord.len() > 128 {
@@ -1740,6 +1761,14 @@ impl Gen {
         }
         v
     }
+    /// Water or lava, as the aquifer decided it for this cell.
+    fn is_fluid_state(&self, st: u32) -> bool {
+        if st == self.def_fl {
+            return true;
+        }
+        self.aq.as_ref().is_some_and(|a| st == a.lava_st)
+    }
+
     pub(crate) fn deep_state_i(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
         // Opt-in flat floor: the vanilla bedrock band is y in [min_y, min_y+4].
         if flat_bedrock() && y >= self.min_y && y < self.min_y + 5 {
@@ -2721,6 +2750,25 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
     }
 
     #[test]
+    fn not_underwater_is_grass_only_above_the_water_surface() {
+        // vanilla's WaterCondition (SurfaceRules$WaterConditionSource$1WaterCondition)
+        // is already "not underwater": waterHeight == MIN (no fluid), or
+        // blockY + stoneDepthAbove >= the water surface. The grass rule uses it
+        // directly. Negating it put grass on the submerged floors of the spawn
+        // ocean and dirt on dry ground.
+        assert!(init(0, crate::name_to_state));
+        let grass = crate::name_to_state("minecraft:grass_block").unwrap();
+        let dirt = crate::name_to_state("minecraft:dirt").unwrap();
+        let wet = chunk_cols(0, 0).unwrap();
+        assert_eq!(wet.surface(2, 0), 54, "top solid of the spawn ocean column");
+        assert_eq!(wet.wtop(2, 0), 62, "its water surface");
+        assert_eq!(wet.mat(2, 0, 54), Some(dirt), "a submerged floor is dirt");
+        let dry = chunk_cols(0, 2).unwrap();
+        assert_eq!(dry.surface(4, 0), 63, "top solid of a dry column");
+        assert_eq!(dry.mat(4, 0, 63), Some(grass), "a dry surface is grass");
+    }
+
+    #[test]
     fn feature_population_output_matches_the_pre_refactor_capture() {
         // Unlike the lazy-vs-direct comparison, this pins the values against a
         // digest recorded before the shared contracts moved, so a change made on
@@ -2737,7 +2785,12 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // Vanilla block diff with features and carvers disabled on both sides
         // went 1221 -> 194 cells at seed 0 chunk (0,0); the deepslate and
         // bedrock bands match, so this capture records the corrected input.
-        assert_eq!(digest, "51d6e2fbb958f1ae42a998bc39a15f74",
+        // 2026-10-20: not_underwater is the water condition itself, not its
+        // negation, and the water surface comes from the probed fluid column.
+        // Vanilla block diff with features and carvers disabled went 194 -> 5
+        // cells at seed 0 chunk (0,0) and 36 -> 36 at (0,1) (a density edge),
+        // so feature inputs changed and the capture records the corrected one.
+        assert_eq!(digest, "54760c8c6c3a0161cc163f58b38763f1",
             "feature population output changed from the vanilla-order capture");
     }
 

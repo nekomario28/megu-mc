@@ -19,20 +19,26 @@ density・surface material rule・aquifer だけになる。
 
 ## 結果（seed 0、chunk (0,0)、feature/carver なし）
 
-| | 差分セル | 内訳 |
-|---|---|---|
-| 修正前 | 1221 / 98304 (1.24%) | deep 722、bedrock 310、feature 188、surface 1 |
-| 修正後 | **194 / 98304 (0.20%)** | feature 193、surface 1 |
+world overlay（以前のセッションが残したブロック編集）を外した状態で測り直した。
+overlay があると mc-spine 側だけに数セルの差が乗る。
 
-- 差分のトップ組は `dirt(10) -> grass_block(9)` 179 と `9 -> 10` 11。
-  位置は y=54-55 の洞窟床で、vanilla は dirt、mc-spine は grass_block。
-- 修正後は deepslate（`stone(1) <-> deepslate(24905)`）と bedrock の帯が一致する。
-- feature を止めない比較（同 chunk、seed 0）は **11856 → 11034**
-  （修正前の 11856 は直前の作業記録 b53dbbe の値、11034 は修正後の実測）。
-  残差のトップ組は `deepslate <-> tuff`、`andesite/diorite/granite <-> stone` で、
-  feature 層（同梱データの版差を含む）に残っている。地形密度ではない。
+| chunk | 2 修正前 | 2 修正後 | 残差の内訳 |
+|---|---|---|---|
+| (0,0) | 194 / 98304 | **5 / 98304 (0.005%)** | 2 列の 1 ブロック段差と water/dirt 1 |
+| (0,1) | 243 / 98304 | **36 / 98304** | 12 列 × 3 セルの 1 ブロック段差 |
+| (-1,-1) | 228 / 98304 | **0** | — |
+| (-2,0) | — | **0** | — |
 
-## 修正: vertical_gradient の random_name ハッシュは big-endian
+- 2 修正前の (0,0) は 1221（VERT 修正前）→ 194（VERT 修正後）。
+- 残差は terrain の表面が 1 ブロック低い列に集中している（vanilla は y=63 に
+  grass、mc-spine は y=62）。surface rule ではなく density の境界（`interpolated` の
+  順序）の候補で、feature を止めない比較の差もそこへ乗る。
+- feature を止めない比較（同 chunk、seed 0）は **11856 → 10947**
+  （11856 は VERT 修正前の作業記録 b53dbbe の値）。残差のトップ組は
+  `deepslate <-> tuff`、`andesite/diorite/granite <-> stone` で、feature 層
+  （同梱データの版差を含む）にある。地形密度ではない。
+
+## 修正1: vertical_gradient の random_name ハッシュは big-endian
 
 `SurfaceRules$VerticalGradientConditionSource`（obf `dzp$y`）の条件
 （`dzp$y$a.a()`）を `javap` で確定した:
@@ -55,6 +61,30 @@ mc-spine は同じ連鎖を持っていたが、md5 の読み出しだけ `from_
 が固定する。feature 入力が変わるため feature capture digest も更新した
 （`51d6e2fbb958f1ae42a998bc39a15f74`）。
 
+## 修正2: `not_underwater` は条件そのもの、waterHeight は実流体の面
+
+`SurfaceRules$WaterConditionSource$1WaterCondition`（obf `dzp$z$a`）は
+
+1. `waterHeight == Integer.MIN_VALUE` → true
+2. それ以外は `blockY + stoneDepthAbove >= waterHeight + offset + surfaceDepth * multiplier`
+
+で、名前のとおり**すでに「not underwater」**である。grass_block の分岐はこれを
+そのまま使う。mc-spine は `not(water(...))` と二重否定にしており、さらに `fluid` を
+「海面以下の density<=0 の最初のセル + 1」で近似していたため、**水中の海底が
+grass、乾いた地面が dirt** になっていた（(0,0) の 194 セルは水中の海底）。
+
+修正:
+
+- `not_underwater` を `Cond::Water { off: 0, mult: 0, sd: false }` そのものにする。
+- 列の水面を、既存の heightmap 用 aquifer probe（`wtop`）から先に求める。
+- 表面窓のスキャンで vanilla の `buildSurface` と同じ流体追跡をする:
+  流体セルは `waterHeight` を一度だけ設定し、空気セルは MIN に戻す。
+  地形より上は probe した水面までが水、地形より下は aquifer が water/lava を
+  返したセルだけを流体として扱う。
+
+回帰は `worldgen::wg_tests::not_underwater_is_grass_only_above_the_water_surface`
+（水中の海底 = dirt、乾いた表面 = grass）。feature capture digest も更新した。
+
 ## 却下: `squeeze` の外側をブロック毎に評価する変更
 
 vanilla の `final_density` は `min(squeeze(interpolated(...)), noodle)` で、
@@ -69,7 +99,8 @@ vanilla の `final_density` は `min(squeeze(interpolated(...)), noodle)` で、
   密度値そのものを比較する検証を入れるときに再適用する。
 
 この測定で「7.9% 残差の主因」という以前の記述は否定された。残差の大半は
-feature 層（後述のデータ版差を含む）である。
+feature 層（後述のデータ版差を含む）である。なお 2 修正後、残差 5/36 セルは
+この順序の差（density の符号が境界で反転する）に一致する形をしている。
 
 ## 残差の次: 同梱 datapack が 1.21.1 ではない
 
@@ -95,7 +126,7 @@ feature 層（後述のデータ版差を含む）である。
 
 - 1 seed・1 chunk・wire の復号値。クライアント画面やGUIは見ていない。
 - feature/carver を止めた比較であり、通常のゲーム挙動の一致ではない。
-- 194 セルの dirt/grass 差の原因（`WaterCondition` の waterHeight の与え方）は
-  未確定。vanilla の条件式自体は `dzp$z$a` と一致している（`waterHeight == MIN`
-  なら true、それ以外は `y + stoneDepthAbove >= waterHeight + offset +
-  runDepth * mult`）。違うのは `Context.updateY(..., waterHeight, ...)` に渡る値。
+- 残差 5（(0,0)）と 36（(0,1)）は 1 ブロックの表面段差。density の補間順序の
+  候補であり、原因は未確定（「却下」節の変更を再適用して測る価値がある）。
+- 水面の probe は sea level から下向きにしか探さない（既存の `wtop` と同じ）。
+  sea より上の湖・池の底面はまだ「水なし」として扱う。
