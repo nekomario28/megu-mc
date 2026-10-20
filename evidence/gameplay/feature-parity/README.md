@@ -233,3 +233,15 @@ vanilla 側の draw を直接取る。`OreFeature.place` は `dds`（WorldGenLev
 `java.lang.reflect.Proxy` で `dds` を差し替え、`ecz.a(dds, ayw, eeq, ...)` を
 直接呼べば「2 本目の位置」を vanilla の実装から取り出せる。そこから
 `ayw`（RandomSource）の `nextLong` を数えれば、1 本目が何 draw 使うかが確定する。
+
+## 2026-10-20（続き4）: 隣 chunk の書き込みを見せても改善しない（撤回）
+
+vanilla の `level.getBlockState` は、既に decorate 済みの隣 chunk が書いた block も
+返す。mc-spine の `FC::get` は自 chunk の `wr` と地形しか見ていなかったので、
+`feat_c`（保存済みの上書き）も参照するよう変えて測った。
+
+- chunk (0,0) の full-chunk 差分: **10302 → 10336（+34 セル、悪化）**。
+- 状態組の上位はほぼ同じ。隣 chunk の可視性は population の順序にも依存するので、
+  順序が vanilla と違えば「見える集合」も変わり、単純な改善にはならない。
+
+測って悪化したので撤回（`src/generation_context.rs` は元に戻した）。
