@@ -29,6 +29,7 @@ def main():
         print(__doc__)
         return 2
     jar, world, keep = sys.argv[1], sys.argv[2], sys.argv[3]
+    keep = keep.replace("minecraft:", "")
     z = open_server_jar(jar)
     out = os.path.join(world, "datapacks", PACK)
     biome_dir = os.path.join(out, "data/minecraft/worldgen/biome")
