@@ -40,8 +40,11 @@
     （`nextFloat` 1 + `nextInt(3)` 2 + `nextDouble`×64）。modifier も bytecode で確認
     （in_square は `nextInt(16)` ×2、count 定数は 0、height uniform は 1）。
     それでも 2 本目 (5,6,2) は隔離 vanilla 世界に存在しない。
-    次の一手はプローブに chunk 供給（`dcx.a(int,int)` → `duy` → `dvj`）を足し、
-    位置ストリームと書き込みセルを vanilla から直接取ること。
+    プローブに chunk 供給を足して書き込みセルを取得済み: seed 60007・(7,49,13)・
+    size 64 で vanilla 666 セル = `ore_oracle.py` 666 セル（**完全一致**）。
+    vein の幾何は確定。残りは位置だけで、次は `ejb`(CountPlacement) と
+    `eis`(InSquarePlacement) の `getPositions` をプローブから直接呼び、
+    位置2の位置と draw 数を vanilla から取ること。
   - 判定: 1 seed・1 chunk で andesite のセル集合が一致するか。
 - [ ] **R1c feature step 別の差分表**（R1a の後）
   - `chunk_block_diff.py` に step 別の集計を足すか、populate の書き込みを step で
