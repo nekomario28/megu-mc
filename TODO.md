@@ -41,9 +41,11 @@
 
 ## 検証・公開
 
-- [ ] `tests/verify.sh` を 2026-10-20 の変更で完走させ、ログを残す
-      （hosted CI は支払いブロックのためローカルで代替）。
-- [ ] `fix/20tps-integrated` を push し、hosted CI が復旧したら同一 SHA で再実行。
+- [x] `tests/verify.sh` PASS（140 passed / 1 ignored、mutation 46 proved）。
+      固定 revision の `depsgx` を `PATH` に置いて実行、ログは
+      `~/.cache/mc-spine-work/verify-2026-10-20.log`。
+- [x] `fix/20tps-integrated` を push（`2a11df1`）。hosted CI は run 39351452776 で
+      **job が起動せず**（支払い/上限ブロック）。復旧後に同一 SHA で再実行する。
 - [ ] issue #7 の各項目を統合 head で再判定（spawn 周期、projectile drag、
       legacy counter 変換、負の drop age、save の副作用、malformed save、
       arrow collision の 0.9）。実行した証拠ごと close する。
