@@ -37,7 +37,7 @@ C/F/Nは実験を最小にし、参照の静的解析と実行時の一致を別
 
 ## 次の担当者への入口
 
-H・T・Nは完了。feature/treeの循環とtreeの上向き依存は共有契約を `block_registry`/`generation_providers`/`generation_context` へ移して解消（[共有契約の切替](generation-sharing.md)）。スケジューラの `sched_ready` はキュー4秒上限と無上限ラダーの差を埋める load-bearing なガードで、到達可能性モデルからの冗長扱いを実経路の対照と変異で否定した（[スケジューラ](../../evidence/foundation/scheduler-machine/README.md)）。時計依存RNGは全廃し、`world_rng` を `RNG1` として保存・復元する（[世界乱数](../../evidence/foundation/world-rng/README.md)）。Fはvanilla準拠で検証済み（統合レビューの12件の修正を含む）だが、**落下の並行/順序まわり（ブロック↔エンティティの所有権、配置経路、save との相互作用）は逐次修正では収束しないため、並行テスト付きの専用ハードニングスライスを次に切る**。Q は完了（**M3 は生態系葉の共有キャッシュで達成、x0.63**、独立レビュー（flash）、ローカルCI緑。`interpolated` の出力変更は不要だった）。光値そのものの vanilla 一致のみ未確立（探針は vanilla の chunk からも光を読めるようになったが、同一 seed でも heightmap が一致せず、地形パリティの説明が先）で、GUI 除外の範囲外。CはCLIのみで検証済み。実画面・KDE経由の試験はユーザー指示で行わない。
+H・T・Nは完了。feature/treeの循環とtreeの上向き依存は共有契約を `block_registry`/`generation_providers`/`generation_context` へ移して解消（[共有契約の切替](generation-sharing.md)）。スケジューラの `sched_ready` はキュー4秒上限と無上限ラダーの差を埋める load-bearing なガードで、到達可能性モデルからの冗長扱いを実経路の対照と変異で否定した（[スケジューラ](../../evidence/foundation/scheduler-machine/README.md)）。時計依存RNGは全廃し、`world_rng` を `RNG1` として保存・復元する（[世界乱数](../../evidence/foundation/world-rng/README.md)）。Fはvanilla準拠で検証済み（統合レビューの12件の修正を含む）だが、**落下の並行/順序まわり（ブロック↔エンティティの所有権、配置経路、save との相互作用）は逐次修正では収束しないため、性質テスト付きの専用スライスに切り出す**（設計: [falling-concurrency](../falling-concurrency/README.md)）。Q は完了（**M3 は生態系葉の共有キャッシュで達成、x0.63**、独立レビュー（flash）、ローカルCI緑。`interpolated` の出力変更は不要だった）。光値そのものの vanilla 一致のみ未確立（探針は vanilla の chunk からも光を読めるようになったが、同一 seed でも heightmap が一致せず、地形パリティの説明が先）で、GUI 除外の範囲外。CはCLIのみで検証済み。実画面・KDE経由の試験はユーザー指示で行わない。
 通信のゲートは `tests/client_settings_wire.py`。
 Sの保存試験は、子プロセスに世界を所有させ親の状態を変更しない。
 Vのゲートは `tests/gate_scripts.py`、通常の全ゲートは `tests/verify.sh`。

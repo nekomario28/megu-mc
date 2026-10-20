@@ -7,6 +7,8 @@
 ## 進行中
 
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）
+  - 設計: [chunk-parallelism](specs/chunk-parallelism/README.md)（GenData/Gen の分離
+    → ジョブ化 → worker >1、決定性テスト、`WARM=1` の前後測定）。
   - 現在: `populate9` 60 → 37 ms/chunk（地形読み 1797 → 295 ns/call、FC の列
     キャッシュを採用）。burst 込み 8 回の中央値 x1.10（RSS 142 対 ~1160 MiB）、
     burst を除く 3 回は x1.65-2.85。単発の x0.83 は主張しない。
@@ -83,11 +85,13 @@
       arrow collision の 0.9）。実行した証拠ごと close する。
 - [ ] 草案 PR #2 / #4 / #6 を統合ブランチの内容と照合して閉じる。
 - [ ] LICENSE を決めて追加（#11）。worldgen データの出自と再配布条件を明記。
-- [ ] 落下の並行/順序ハードニング（close-defects から繰り越し）を専用スライスにする。
+- [ ] 落下の並行/順序ハードニング: [falling-concurrency](specs/falling-concurrency/README.md)
+      の性質テスト（守恒・順序・無デッドロック・ホットセット非依存）を実装し、変異で固定する。
 
 ## 保留・監視
 
 - [ ] 密度値そのものの vanilla 比較（`interpolated` の順序を正しくした実装の再適用は
       そのとき）。現状は観測できる差が 4 セルで費用 +27% のため撤回済み。
-- [ ] 生成器の並列化。所有者（region/chunk pipeline）を決めるまで着手しない。
+- [ ] 生成器の並列化: [chunk-parallelism](specs/chunk-parallelism/README.md) の
+      owner 決定（GenData 分離とマージ順）が前提。
 - [ ] 代表負荷の再測定は R1 完了後。いまの x0.63 は地形が違う状態の値。
