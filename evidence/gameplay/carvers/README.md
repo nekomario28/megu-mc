@@ -75,3 +75,40 @@ jar の `data/minecraft/worldgen/configured_carver/*.json` を
 `cave_air`/溶岩/水の充填）→ `CaveWorldCarver.carve`（tunnel/branch/room、
 `carveEllipsoid`、`CarvingMask`）→ `CarvingContext`（surface height と aquifer）→
 chunk 生成の feature 前に呼ぶ。
+
+## 3. 移植の足がかり（obf シグネチャ、2026-10-20 時点）
+
+`javap -p` で確認した入口:
+
+```
+ebb (CaveWorldCarver) extends ebe<eba>
+  public boolean a(eba config, ayw random)                      // isStartChunk: random.nextFloat() <= probability
+  public boolean a(eaz ctx, eba cfg, duy chunk, Function<jd,jm<ddw>> biomes,
+                   ayw random, dyk chunkPos, dcd region, dux mask)   // carve(...)  ← dux = CarvingMask
+  protected int   a()                                            // getRange()
+  protected float a(ayw r)                                       // config.yScale のサンプル？
+  protected double b()                                           // 定数（tunnel の太さ係数）
+  protected void  a(ctx, cfg, chunk, biomes, dyk pos, double x, double y, double z,
+                    float a, double b, dux mask, ebe$a skip)      // carveTunnel
+  protected void  a(ctx, cfg, chunk, biomes, long seed, dyk pos, double x, double y, double z,
+                    double a, double b, float c, float d, float e, int f, int g, double h,
+                    dux mask, ebe$a skip)                         // carveTunnelBranch
+  private static boolean a(double,double,double,double)           // 交差判定
+ebe (WorldCarver) extends ... <C extends eax>
+  // ebe に carveBlock / canReplaceBlock / carveEllipsoid がある。eax = CarverConfiguration
+```
+
+次に bytecode から読むべきは `ebb.a(eaz, eba, duy, Function, ayw, dyk, dcd, dux)`（carve 本体）で、
+**draw の順序**（`config.y.sample` → `nextFloat()*PI` → `yScale.sample` → tunnel/branch の分岐 →
+`random.nextInt` の入れ子）を確定させる。`isStartChunk` が `nextFloat() <= probability` なので、
+チャンクごとに 1 回この判定が走る（`cave` 0.15 / `cave_extra_underground` 0.07 / `canyon` 0.01）。
+
+移植は次の順で、各段で `--keep-carvers` の世界（36 chunk、3361 セル）に対して
+block diff を取る:
+
+1. `CarvingMask`（chunk 内 16×384×16 のビット列。`dux`）
+2. `WorldCarver.carveBlock`: `#overworld_carver_replaceables` 判定 → `lava_level` 以下は溶岩、
+   それ以外は `cave_air`、aquifer があれば水
+3. `CaveWorldCarver.carve` + `carveEllipsoid`（r=1 の楕円体、`skip` 判定）
+4. `CarvingContext`（surface height は `chunk_cols` の `surface()`、aquifer は既存の `aq_state`）
+5. `applyCarvers`: biome の `carvers` を step 順に、**feature より前**に実行
