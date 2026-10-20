@@ -72,12 +72,12 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
   vanilla 17.53s / 1159.7MiB / 63thr、20 秒窓）。以前の x0.63 は地形不一致時の値。
 - 内訳（release）: `chunk_cols` 11.5 ms/chunk、feature の populate 約 60 ms/chunk。
   **生成時間の約 84% は feature**で、上位は `ore_dirt` 13 ms/chunk、
-  `monster_room(_deep)` 9.7 ms、`ore_gravel` 3.9 ms など。原因は候補セルごとの
-  `terrain_state`（µs 台）で、vanilla のブロック配列読み（ns 台）との差。
-  証拠: [生成器の費用](../../evidence/gameplay/worldgen-cost/README.md)。
-- 次のスライス: feature が読む地形をチャンク単位の配列として一度だけ作り、
-  populate と fill で共有する（9〜16 チャンクの LRU、3.5〜6 MiB）。地形は feature の
-  書き込みに依存しないので順序に依存しない。並列化は所有者を決めてから。
+  `monster_room(_deep)` 9.7 ms、`ore_gravel` 3.9 ms など。populate の 45% は
+  地形読み（1.8 µs/call）、残りは feature ロジック。証拠:
+  [生成器の費用](../../evidence/gameplay/worldgen-cost/README.md)。
+- チャンク単位の地形配列は試して撤回（構築 20.7 ms/chunk、移動視点で 22.56s 対
+  19.79s に悪化）。次のスライスは feature ロジック本体の削減。並列化は所有者
+  （region/chunk pipeline）を決めてから。
 - 出口: 同一 seed・同一負荷で CPU を再測定し、x1.10 未満の差は主張しない。
 
 ### R4 統合・公開

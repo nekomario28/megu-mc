@@ -5,6 +5,11 @@
 use crate::block_registry::breg;
 use crate::worldgen::Gen;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// FEAT_PROFILE diagnostic: time spent in feature-side terrain reads.
+pub(crate) static READ_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static READ_N: AtomicU64 = AtomicU64::new(0);
 
 // ---------- generation context ----------
 
@@ -15,6 +20,7 @@ pub(crate) struct FC<'a> {
     ws_t: HashMap<(i32, i32), i32>,
     oc_t: HashMap<(i32, i32), i32>,
     bc: HashMap<(i32, i32, i32), Option<String>>, // biome cache per quart
+    prof: bool,
 }
 impl<'a> FC<'a> {
     pub(crate) fn new(g: &'a mut Gen) -> Self {
@@ -25,6 +31,7 @@ impl<'a> FC<'a> {
             ws_t: HashMap::new(),
             oc_t: HashMap::new(),
             bc: HashMap::new(),
+            prof: std::env::var("FEAT_PROFILE").is_ok(),
         }
     }
     pub(crate) fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {
@@ -34,7 +41,16 @@ impl<'a> FC<'a> {
         if let Some(&s) = self.rc.get(&(x, y, z)) {
             return s;
         }
+        let t0 = if self.prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let st = self.g.terrain_state(x, y, z);
+        if let Some(t0) = t0 {
+            READ_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            READ_N.fetch_add(1, Ordering::Relaxed);
+        }
         self.rc.insert((x, y, z), st);
         st
     }

@@ -6,15 +6,17 @@
 
 ## 進行中
 
-- [ ] **R3 feature が読む地形の共有配列**（M3 は x1.13 で未達）
+- [ ] **R3 feature ロジック本体の削減**（M3 は x1.13 で未達）
   - 再測値: mc-spine 19.79s / 145.2MiB / 3thr 対 vanilla 17.59s / 1204.7MiB / 62thr。
     内訳: `chunk_cols` 11.5 ms/chunk、feature 約 60 ms/chunk（生成の 84%）。
-    `FEAT_PROFILE` 上位は `ore_dirt` 13 ms/chunk、`monster_room(_deep)` 9.7 ms。
-  - feature の候補セルごとの `terrain_state` をやめ、チャンク単位の地形配列を
-    一度だけ作って populate と fill で共有する（9〜16 チャンクの LRU、3.5〜6 MiB）。
-    地形は feature の書き込みに依存しないので順序に依存しない。
-  - 判定: feature/carver なしの block diff が 0 のまま、`FEAT_PROFILE` の
-    populate と `load_compare.sh` の CPU が改善するか。x1.10 未満は主張しない。
+    うち地形読みが 45%（1.8 µs/call、274k 回/25 chunk）、残りが feature ロジック。
+  - チャンク単位の地形配列は試して**撤回**（構築 20.7 ms/chunk、移動視点で
+    22.56s 対 19.79s に悪化）。地形の読みを作り直す方向では届かない。
+  - 次: `FEAT_PROFILE` の上位（`ore_dirt` 13 ms、`monster_room(_deep)` 9.7 ms）を
+    1 つ選び、候補セル数・書き込み数・地形読み以外の内訳を測って削る。
+    並列化は所有者（region/chunk pipeline）を決めてから。
+  - 判定: `FEAT_PROFILE` の該当 feature と `load_compare.sh` の CPU。x1.10 未満は
+    主張しない。
 
 ## 次
 

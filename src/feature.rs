@@ -1645,6 +1645,15 @@ pub(crate) fn feat_prof_dump() {
     v.sort_by(|a, b| b.1.cmp(&a.1));
     let total: u128 = v.iter().map(|x| x.1).sum();
     eprintln!("FEATPROF total={:.1}ms", total as f64 / 1e6);
+    eprintln!(
+        "FEATPROF terrain reads={:.1}ms n={} ({:.0} ns/call)",
+        crate::generation_context::READ_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        crate::generation_context::READ_N.load(std::sync::atomic::Ordering::Relaxed),
+        crate::generation_context::READ_NS.load(std::sync::atomic::Ordering::Relaxed) as f64
+            / crate::generation_context::READ_N
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1) as f64
+    );
     for (name, ns, cnt) in v.iter().take(25) {
         eprintln!("FEATPROF {:8.2}ms n={cnt:5}  {name}", *ns as f64 / 1e6);
     }
