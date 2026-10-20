@@ -76,7 +76,7 @@ def main():
     protocol767.decode_chunk_light = capture
     with Client(port, "Blocks") as client:
         try:
-            client.login(view=8)
+            client.login(view=int(os.environ.get("MC_PROBE_VIEW", "8")))
         except AssertionError:
             pass  # a re-sent chunk trips the fixture's duplicate check; capture already ran
         # Vanilla rejects a move that exceeds its per-tick threshold ("moved too quickly"),

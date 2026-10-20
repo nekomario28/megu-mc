@@ -337,7 +337,8 @@ class Client:
             chunk[(y - MIN_Y) // 16][((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] = state
 
     def until(self, predicate, contract=None):
-        deadline = time.monotonic() + 10
+        # Probes over slower worldgen can raise the bound; tests keep 10s.
+        deadline = time.monotonic() + float(os.environ.get("MC_PROBE_DEADLINE", "10"))
         try:
             for _ in range(2048):
                 remaining = deadline - time.monotonic()
