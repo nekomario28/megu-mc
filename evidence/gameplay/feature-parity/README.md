@@ -327,6 +327,8 @@ seed 60007・位置 (7,49,13)・size 64 で:
 | vanilla `OreFeature.place` | 666 | — |
 | `tools/ore_oracle.py` | 666 | **666/666（完全一致）** |
 
+セル一覧は `ore_andesite_666.txt`（seed 60007、(7,49,13)、size 64）。
+
 これで **vein の幾何は確定**: `Mth.sin` の表による半径、`Math.sin` の中心、
 double の `Mth.lerp`、collapse、r=1 の楕円体判定、x→y→z の走査はすべて正しい。
 残差は**位置だけ**に絞られた。
