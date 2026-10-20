@@ -72,7 +72,7 @@
 
 ## 検証・公開
 
-- [x] `tests/verify.sh` PASS（140 passed / 1 ignored、mutation 46 proved）。
+- [x] `tests/verify.sh` PASS（142 passed / 1 ignored、mutation 46 proved）。
       固定 revision の `depsgx` を `PATH` に置いて実行、ログは
       `~/.cache/mc-spine-work/verify-2026-10-20.log`。
 - [x] `fix/20tps-integrated` を push（`568f40f` まで成功）。hosted CI は run
