@@ -1432,6 +1432,18 @@ fn a_saved_below_world_drop_is_not_duplicated() {
         })
     };
 
+    // The saver's first snapshot can be slower than the whole fall (the world may be
+    // larger than when this test runs alone), and a test that asserted "a save ran"
+    // without waiting for one would fail on scheduling and world size rather than on
+    // the race it is about. Wait for the thread to prove itself, then start the fall.
+    let wait = std::time::Instant::now();
+    while snapshots_store.lock().unwrap().is_empty() {
+        assert!(
+            wait.elapsed().as_secs() < 10,
+            "the saver never stored a snapshot"
+        );
+        std::thread::yield_now();
+    }
     // Knock out the support so the block falls out of the world.
     set_block(1, MIN_Y + 3, 1, 0);
     assert_eq!(falling().lock().unwrap().len(), 1, "the block becomes an entity");
