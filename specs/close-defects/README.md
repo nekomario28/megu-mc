@@ -43,3 +43,17 @@ Sの保存試験は、子プロセスに世界を所有させ親の状態を変�
 Vのゲートは `tests/gate_scripts.py`、通常の全ゲートは `tests/verify.sh`。
 監査の再現ログは `/home/yuu/.cache/mc-spine-audit/REPORT.md`。
 ここを残件の正本とし、PLANの重複した完了表示はこの表へ集約する。
+
+## 2026-10-20 地形パリティの更新
+
+feature と carver を両側で止めた比較で、地形（density・surface rule・bedrock）は
+seed 0 の chunk (0,0)、(0,1)、(-1,-1)、(-2,0) で **0 セル**一致した。修正は 3 つ:
+vertical_gradient の random_name ハッシュの big-endian 読み出し、`not_underwater` を
+条件そのものにすること + 実流体面の waterHeight、`interpolated` の入力だけを
+セル隅で補間して `squeeze`/`min` をブロック毎に評価すること。
+証拠と数値は [地形パリティ](../../evidence/gameplay/terrain-parity/README.md)。
+
+Q に残っていた「光値そのものの vanilla 一致」は、heightmap の面の説明待ちではなく
+なった（MOTION_BLOCKING も同じ比較で一致する）。次は光の再測（R1d）。
+feature 層の残差（chunk (0,0) で 10939 セル）は同梱 worldgen データが 1.21.1 でない
+ことが主因で、R1a で 1.21.1 の jar から取り直す。

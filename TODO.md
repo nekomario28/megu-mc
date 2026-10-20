@@ -6,14 +6,12 @@
 
 ## 進行中
 
-- [ ] **density の補間順序を再評価する**（残差 5/36 セルの候補）
-  - 残差は表面が 1 ブロック低い列に集中している（vanilla y=63 grass / mc-spine
-    y=62 grass）。surface rule ではなく density の符号が境界で反転している形。
-  - `interpolated` の入力だけをセル隅評価し、`squeeze`/`min` の外側をブロック毎に
-    評価する変更を再適用して測る（前回は feature なし 7727→7723 で撤回、+27%。
-    今回は surface rule 修正後の 5/36 が対象）。
-  - 判定: feature/carver なしの (0,0)/(0,1) が 0 に近づくか。費用（`WGPERF` の
-    ms/chunk）も同じ条件で前後を取る。改善しなければ撤回して数字を残す。
+- [ ] **R3 代表負荷の再測定**（地形一致後）
+  - `tools/load_compare.sh` を同一 seed・同一移動列で再実行し、CPU/RSS/threads を
+    取る。`chunk_cols` は 48.8 → 70.8 ms/chunk（+45%）なので、M3 の x0.63 が
+    維持されるかを確認する。x1.10 未満の差は主張しない。
+  - 判定: 同一条件の前後比較。悪化していれば生成器の最適化（interp の格子参照を
+    インライン化する等）を次のスライスにする。
 
 ## 次
 
@@ -40,6 +38,9 @@
       （2 件目の ignored test）を解消。
 - [x] surface rule の `not_underwater` 二重否定と waterHeight 近似を修正
       （(0,0) 194→5、(0,1) 243→36、(-1,-1) 228→0）。回帰テスト追加。
+- [x] `interpolated` の入力をセル隅で補間し外側をブロック毎に評価
+      （feature/carver なしの block diff が 4 chunk で 0）。回帰テスト追加。
+      費用 +45% のため M3 の再測定を進行中へ。
 - [x] ローカル `depsgx` を固定 revision の venv に置き換え（同一バージョン表記の古い
       ビルドが cycle を 1 件しか報告しなかった）。
 

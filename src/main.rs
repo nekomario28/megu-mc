@@ -3265,7 +3265,7 @@ fn wg2_block(x: i32, y: i32, z: i32) -> Option<u32> {
         return Some(st);
     }
     let cc = worldgen::chunk_cols(x >> 4, z >> 4)?;
-    let d = cc.density(x, y, z);
+    let d = worldgen::density_in(&cc, x, y, z);
     let solid = d > 0.0;
     if solid {
         // surface-window material rules first; below the window -> deep rules
@@ -14643,8 +14643,8 @@ fn main() {
         }
         if std::env::var("WGD3").is_ok() {
             for y in (-60..=80i32).step_by(8) {
-                let c = worldgen::chunk_cols(0, 0).unwrap();
-                eprintln!("y={} d={:.4}", y, c.density(0, y, 0));
+                let d = worldgen::density_at(0, y, 0).unwrap_or(0.0);
+                eprintln!("y={} d={:.4}", y, d);
             }
         }
         if std::env::var("WGSURF").is_ok() {
@@ -14660,7 +14660,9 @@ fn main() {
                 let c = worldgen::chunk_cols(x >> 4, 0).unwrap();
                 eprintln!("x={} surf={} d@y60={:.4} d@y70={:.4} d@y0={:.4}",
                     x, c.surface((x & 15) as usize, 0),
-                    c.density(x, 60, 0), c.density(x, 70, 0), c.density(x, 0, 0));
+                    worldgen::density_in(&c, x, 60, 0),
+                    worldgen::density_in(&c, x, 70, 0),
+                    worldgen::density_in(&c, x, 0, 0));
             }
         }
         if std::env::var("WGBPROF").is_ok() {

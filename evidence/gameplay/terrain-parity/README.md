@@ -22,21 +22,20 @@ density・surface material rule・aquifer だけになる。
 world overlay（以前のセッションが残したブロック編集）を外した状態で測り直した。
 overlay があると mc-spine 側だけに数セルの差が乗る。
 
-| chunk | 2 修正前 | 2 修正後 | 残差の内訳 |
-|---|---|---|---|
-| (0,0) | 194 / 98304 | **5 / 98304 (0.005%)** | 2 列の 1 ブロック段差と water/dirt 1 |
-| (0,1) | 243 / 98304 | **36 / 98304** | 12 列 × 3 セルの 1 ブロック段差 |
-| (-1,-1) | 228 / 98304 | **0** | — |
-| (-2,0) | — | **0** | — |
+| chunk | 3 修正前（2 修正後） | 3 修正後 |
+|---|---|---|
+| (0,0) | 5 / 98304 | **0** |
+| (0,1) | 36 / 98304 | **0** |
+| (-1,-1) | 0 | **0** |
+| (-2,0) | 0 | **0** |
 
-- 2 修正前の (0,0) は 1221（VERT 修正前）→ 194（VERT 修正後）。
-- 残差は terrain の表面が 1 ブロック低い列に集中している（vanilla は y=63 に
-  grass、mc-spine は y=62）。surface rule ではなく density の境界（`interpolated` の
-  順序）の候補で、feature を止めない比較の差もそこへ乗る。
-- feature を止めない比較（同 chunk、seed 0）は **11856 → 10947**
-  （11856 は VERT 修正前の作業記録 b53dbbe の値）。残差のトップ組は
-  `deepslate <-> tuff`、`andesite/diorite/granite <-> stone` で、feature 層
-  （同梱データの版差を含む）にある。地形密度ではない。
+- (0,0) の履歴: 1221（3 修正前）→ 194（vertical_gradient 修正後）→
+  5（surface rule 修正後）→ 0（interpolated 順序修正後）。
+- feature を止めない比較（同 chunk、seed 0）は **11856 → 10939**
+  （11856 は VERT 修正前の作業記録 b53dbbe の値）。地形が一致してもこの数は
+  ほとんど減らない。残差のトップ組は `deepslate <-> tuff`、
+  `andesite/diorite/granite <-> stone` で、feature 層（同梱データの版差を含む）
+  にある。地形密度ではない。
 
 ## 修正1: vertical_gradient の random_name ハッシュは big-endian
 
@@ -85,22 +84,39 @@ grass、乾いた地面が dirt** になっていた（(0,0) の 194 セルは�
 回帰は `worldgen::wg_tests::not_underwater_is_grass_only_above_the_water_surface`
 （水中の海底 = dirt、乾いた表面 = grass）。feature capture digest も更新した。
 
-## 却下: `squeeze` の外側をブロック毎に評価する変更
+## 修正3: `interpolated` の入力だけを補間し、外側はブロック毎に評価する
 
-vanilla の `final_density` は `min(squeeze(interpolated(...)), noodle)` で、
-`interpolated` は `mul(...)` の内側だけを包む。mc-spine は `final_density` 全体を
-セル隅で評価してから三線形補間しており、`lerp(squeeze(X))` になっていた。
-`interpolated` を専用ノードにし、入力だけをセル隅評価して外側をブロック毎に
-評価する実装を試した（当時の差分は `~/.cache/mc-spine-work/interp-order-attempt.diff`）。
+vanilla の `final_density` は `min(squeeze(interpolated(X)), noodle)` で、
+`interpolated` は `X` だけを包む。mc-spine は `final_density` 全体をセル隅で
+評価してから三線形補間しており、`lerp(squeeze(X))` になっていた。
 
-- 結果: feature なし 7727 → 7723、feature あり 11856 → 11857（**4 セル**）
-- 費用: `chunk_cols` 50.9 → 64.4 ms/chunk（同一ビルド・同一 `WGPERF` 条件、+27%）
-- 判断: vanilla の順序ではあるが、観測できる差が 4 セルで費用が大きいため**撤回**。
-  密度値そのものを比較する検証を入れるときに再適用する。
+一度は撤回している。surface rule がまだ間違っていた時点で試すと、残差
+7727 → 7723（feature なし）と 4 セルしか動かず、`chunk_cols` は
+50.9 → 64.4 ms/chunk（+27%）だったため。surface rule 修正後の残差 5/36 が
+ちょうど「1 ブロックの表面段差」だったので、同じ変更を再適用した。
 
-この測定で「7.9% 残差の主因」という以前の記述は否定された。残差の大半は
-feature 層（後述のデータ版差を含む）である。なお 2 修正後、残差 5/36 セルは
-この順序の差（density の符号が境界で反転する）に一致する形をしている。
+実装:
+
+- `DF::Interp` を追加し、`interpolated` を `Cache` と区別する。
+- 評価器に `cc: Option<&ChunkCols>` を通す。`cc` があるとき `DF::Interp` は
+  チャンクの格子から三線形補間した値を返し、無いとき（格子を作る隅の評価）は
+  入力の評価と同じ。
+- `cols()` は `final_density` から到達できる `DF::Interp` ごとに 5×5×ny の
+  格子を作る（`Gen::interp_ids` の到達性探索）。`ChunkCols::density` の代わりに
+  `Gen::block_density` が外側の演算をブロック毎に評価する。
+
+結果（feature/carver なし）:
+
+| chunk | 3 修正前 | 3 修正後 |
+|---|---|---|
+| (0,0) | 5 | **0** |
+| (0,1) | 36 | **0** |
+| (-1,-1) | 0 | **0** |
+| (-2,0) | 0 | **0** |
+
+費用: `chunk_cols` 48.8 → 70.8 ms/chunk（同一 `WGPERF`、+45%）。
+**M3 の x0.63 は地形が違う状態の値**なので、R3 で代表負荷を測り直す。
+地形パリティを優先して採用し、費用は別に扱う。
 
 ## 残差の次: 同梱 datapack が 1.21.1 ではない
 
@@ -126,7 +142,6 @@ feature 層（後述のデータ版差を含む）である。なお 2 修正後
 
 - 1 seed・1 chunk・wire の復号値。クライアント画面やGUIは見ていない。
 - feature/carver を止めた比較であり、通常のゲーム挙動の一致ではない。
-- 残差 5（(0,0)）と 36（(0,1)）は 1 ブロックの表面段差。density の補間順序の
-  候補であり、原因は未確定（「却下」節の変更を再適用して測る価値がある）。
 - 水面の probe は sea level から下向きにしか探さない（既存の `wtop` と同じ）。
   sea より上の湖・池の底面はまだ「水なし」として扱う。
+- 費用の +45% は、地形が一致した状態での M3 の再測定（R3）で扱う。

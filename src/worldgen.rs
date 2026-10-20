@@ -54,6 +54,9 @@ enum DF {
         tv: f64,
     }, // axis always y here
     Cache(usize),
+    // vanilla `interpolated`: sampled at 4x8x4 cell corners, trilinearly
+    // interpolated at the query position (a per-chunk grid, see ChunkCols).
+    Interp(usize),
     Noise {
         ni: usize,
         sx: usize,
@@ -833,8 +836,10 @@ impl Gen {
                 tc: n("to_coordinate"),
                 tv: n("to_value"),
             },
-            "cache" | "interpolated" | "flat_cache" | "cache_2d" | "cache_once"
-            | "cache_all_in_cell" => DF::Cache(sub(self, "input")?),
+            "interpolated" => DF::Interp(sub(self, "input")?),
+            "cache" | "flat_cache" | "cache_2d" | "cache_once" | "cache_all_in_cell" => {
+                DF::Cache(sub(self, "input")?)
+            }
             "noise" => {
                 let zero = {
                     self.dfs.push(DF::C(0.0));
@@ -918,20 +923,133 @@ impl Gen {
     }
 
     pub(crate) fn eval(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut HashMap<(usize, i32, i32, i32), f64>) -> f64 {
+        self.eval_c(id, x, y, z, memo, None)
+    }
+
+    /// Evaluate a density function. `cc` supplies the per-chunk interpolation
+    /// grids: with it, an `interpolated` node returns the trilinear value of its
+    /// grid instead of evaluating its input at block resolution (vanilla
+    /// NoiseChunk). While the grids are being filled `cc` is None, which is a
+    /// corner sample.
+    fn eval_c(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut HashMap<(usize, i32, i32, i32), f64>, cc: Option<&ChunkCols>) -> f64 {
+        if let Some(cc) = cc {
+            if let DF::Interp(inner) = self.dfs[id] {
+                if let Some(v) = cc.interp(id, x, y, z) {
+                    return v;
+                }
+                return self.eval_c(inner, x, y, z, memo, Some(cc));
+            }
+        }
         if let DF::Cache(_) = self.dfs[id] {
             if let Some(&v) = memo.get(&(id, x, y, z)) {
                 return v;
             }
         }
-        let v = self.eval0(id, x, y, z, memo);
+        let v = self.eval0_c(id, x, y, z, memo, cc);
         if let DF::Cache(_) = self.dfs[id] {
             memo.insert((id, x, y, z), v);
         }
         v
     }
 
-    fn eval_spline(&self, s: &Spl, x: i32, y: i32, z: i32, memo: &mut HashMap<(usize, i32, i32, i32), f64>) -> f64 {
-        let loc = self.eval(s.coord, x, y, z, memo);
+    /// Terrain density at a block position, with `interpolated` resolved from the
+    /// chunk's corner grids.
+    pub(crate) fn block_density(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> f64 {
+        let mut memo = HashMap::new();
+        self.eval_c(self.final_density, x, y, z, &mut memo, Some(cc))
+    }
+
+    /// Density-function ids a node reads, for the grid reachability walk.
+    fn push_kids(&self, id: usize, out: &mut Vec<usize>) {
+        fn spl_kids(s: &Spl, out: &mut Vec<usize>) {
+            out.push(s.coord);
+            for (_, v, _) in &s.pts {
+                if let SV::S(inner) = v {
+                    spl_kids(inner, out);
+                }
+            }
+        }
+        match &self.dfs[id] {
+            DF::C(_)
+            | DF::Zero
+            | DF::Grad { .. }
+            | DF::ShiftA(_)
+            | DF::ShiftB(_)
+            | DF::OldBlended { .. } => {}
+            DF::Add(a, b)
+            | DF::Sub(a, b)
+            | DF::Mul(a, b)
+            | DF::Min(a, b)
+            | DF::Max(a, b)
+            | DF::Div(a, b) => {
+                out.push(*a);
+                out.push(*b);
+            }
+            DF::Neg(a)
+            | DF::Abs(a)
+            | DF::Sq(a)
+            | DF::Cube(a)
+            | DF::HNeg(a)
+            | DF::QNeg(a)
+            | DF::Squeeze(a)
+            | DF::Cache(a)
+            | DF::Interp(a)
+            | DF::BlendD(a) => out.push(*a),
+            DF::Clamp { i, .. } => out.push(*i),
+            DF::Lerp { a, f, s } => {
+                out.push(*a);
+                out.push(*f);
+                out.push(*s);
+            }
+            DF::Noise { sx, sy, sz, .. } => {
+                out.push(*sx);
+                out.push(*sy);
+                out.push(*sz);
+            }
+            DF::RangeChoice { i, wr, wo, .. } => {
+                out.push(*i);
+                out.push(*wr);
+                out.push(*wo);
+            }
+            DF::IntervalSelect { i, fns, .. } => {
+                out.push(*i);
+                out.extend(fns.iter().copied());
+            }
+            DF::Spline(s) => spl_kids(s, out),
+            DF::FindTopSurface { density, upper, .. } => {
+                out.push(*density);
+                out.push(*upper);
+            }
+        }
+    }
+
+    /// `interpolated` nodes reachable from final_density.
+    fn interp_ids(&self) -> Vec<usize> {
+        let mut seen = vec![false; self.dfs.len()];
+        let mut out = Vec::new();
+        let mut kids = Vec::new();
+        let mut stack = vec![self.final_density];
+        while let Some(id) = stack.pop() {
+            if seen[id] {
+                continue;
+            }
+            seen[id] = true;
+            if matches!(self.dfs[id], DF::Interp(_)) {
+                out.push(id);
+            }
+            kids.clear();
+            self.push_kids(id, &mut kids);
+            for &k in &kids {
+                if !seen[k] {
+                    stack.push(k);
+                }
+            }
+        }
+        out
+    }
+
+    fn eval_spline_c(&self, s: &Spl, x: i32, y: i32, z: i32, memo: &mut HashMap<(usize, i32, i32, i32), f64>, cc: Option<&ChunkCols>) -> f64 {
+        let loc = self.eval_c(s.coord, x, y, z, memo, cc);
         let n = s.pts.len();
         if n == 0 {
             return 0.0;
@@ -939,7 +1057,7 @@ impl Gen {
         let mut sv = |sv: &SV| -> f64 {
             match sv {
                 SV::V(v) => *v,
-                SV::S(sp) => self.eval_spline(sp, x, y, z, memo),
+                SV::S(sp) => self.eval_spline_c(sp, x, y, z, memo, cc),
             }
         };
         let idx = s.pts.partition_point(|p| loc >= p.0);
@@ -961,35 +1079,35 @@ impl Gen {
         h00 * v0 + h10 * d0 * (x1 - x0) + h01 * v1 + h11 * d1 * (x1 - x0)
     }
 
-    fn eval0(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut HashMap<(usize, i32, i32, i32), f64>) -> f64 {
+    fn eval0_c(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut HashMap<(usize, i32, i32, i32), f64>, cc: Option<&ChunkCols>) -> f64 {
         match &self.dfs[id] {
             DF::C(v) => *v,
             DF::Zero => 0.0,
-            DF::Add(a, b) => self.eval(*a, x, y, z, memo) + self.eval(*b, x, y, z, memo),
-            DF::Sub(a, b) => self.eval(*a, x, y, z, memo) - self.eval(*b, x, y, z, memo),
-            DF::Mul(a, b) => self.eval(*a, x, y, z, memo) * self.eval(*b, x, y, z, memo),
-            DF::Min(a, b) => self.eval(*a, x, y, z, memo).min(self.eval(*b, x, y, z, memo)),
-            DF::Max(a, b) => self.eval(*a, x, y, z, memo).max(self.eval(*b, x, y, z, memo)),
+            DF::Add(a, b) => self.eval_c(*a, x, y, z, memo, cc) + self.eval_c(*b, x, y, z, memo, cc),
+            DF::Sub(a, b) => self.eval_c(*a, x, y, z, memo, cc) - self.eval_c(*b, x, y, z, memo, cc),
+            DF::Mul(a, b) => self.eval_c(*a, x, y, z, memo, cc) * self.eval_c(*b, x, y, z, memo, cc),
+            DF::Min(a, b) => self.eval_c(*a, x, y, z, memo, cc).min(self.eval_c(*b, x, y, z, memo, cc)),
+            DF::Max(a, b) => self.eval_c(*a, x, y, z, memo, cc).max(self.eval_c(*b, x, y, z, memo, cc)),
             DF::Div(a, b) => {
-                let d = self.eval(*b, x, y, z, memo);
+                let d = self.eval_c(*b, x, y, z, memo, cc);
                 if d == 0.0 {
                     0.0
                 } else {
-                    self.eval(*a, x, y, z, memo) / d
+                    self.eval_c(*a, x, y, z, memo, cc) / d
                 }
             }
-            DF::Neg(a) => -self.eval(*a, x, y, z, memo),
-            DF::Abs(a) => self.eval(*a, x, y, z, memo).abs(),
+            DF::Neg(a) => -self.eval_c(*a, x, y, z, memo, cc),
+            DF::Abs(a) => self.eval_c(*a, x, y, z, memo, cc).abs(),
             DF::Sq(a) => {
-                let v = self.eval(*a, x, y, z, memo);
+                let v = self.eval_c(*a, x, y, z, memo, cc);
                 v * v
             }
             DF::Cube(a) => {
-                let v = self.eval(*a, x, y, z, memo);
+                let v = self.eval_c(*a, x, y, z, memo, cc);
                 v * v * v
             }
             DF::HNeg(a) => {
-                let v = self.eval(*a, x, y, z, memo);
+                let v = self.eval_c(*a, x, y, z, memo, cc);
                 if v > 0.0 {
                     v
                 } else {
@@ -997,7 +1115,7 @@ impl Gen {
                 }
             }
             DF::QNeg(a) => {
-                let v = self.eval(*a, x, y, z, memo);
+                let v = self.eval_c(*a, x, y, z, memo, cc);
                 if v > 0.0 {
                     v
                 } else {
@@ -1005,25 +1123,26 @@ impl Gen {
                 }
             }
             DF::Squeeze(a) => {
-                let v = self.eval(*a, x, y, z, memo).clamp(-1.0, 1.0);
+                let v = self.eval_c(*a, x, y, z, memo, cc).clamp(-1.0, 1.0);
                 v / 2.0 - v * v * v / 24.0
             }
-            DF::Clamp { i, lo, hi } => self.eval(*i, x, y, z, memo).clamp(*lo, *hi),
+            DF::Clamp { i, lo, hi } => self.eval_c(*i, x, y, z, memo, cc).clamp(*lo, *hi),
             DF::Lerp { a, f, s } => {
-                let alpha = self.eval(*a, x, y, z, memo);
-                let fv = self.eval(*f, x, y, z, memo);
-                let sv = self.eval(*s, x, y, z, memo);
+                let alpha = self.eval_c(*a, x, y, z, memo, cc);
+                let fv = self.eval_c(*f, x, y, z, memo, cc);
+                let sv = self.eval_c(*s, x, y, z, memo, cc);
                 fv + alpha * (sv - fv)
             }
             DF::Grad { fc, fv, tc, tv } => {
                 let t = ((y as f64) - fc) / (tc - fc);
                 fv + t.clamp(0.0, 1.0) * (tv - fv)
             }
-            DF::Cache(a) => self.eval(*a, x, y, z, memo),
+            DF::Cache(a) => self.eval_c(*a, x, y, z, memo, cc),
+            DF::Interp(a) => self.eval_c(*a, x, y, z, memo, cc),
             DF::Noise { ni, sx, sy, sz, xzs, ys } => {
-                let xs = self.eval(*sx, x, y, z, memo);
-                let ysv = self.eval(*sy, x, y, z, memo);
-                let zs = self.eval(*sz, x, y, z, memo);
+                let xs = self.eval_c(*sx, x, y, z, memo, cc);
+                let ysv = self.eval_c(*sy, x, y, z, memo, cc);
+                let zs = self.eval_c(*sz, x, y, z, memo, cc);
                 self.noises[*ni].get(
                     x as f64 * xzs + xs,
                     y as f64 * ys + ysv,
@@ -1033,11 +1152,11 @@ impl Gen {
             DF::ShiftA(ni) => self.noises[*ni].get(x as f64 * 0.25, 0.0, z as f64 * 0.25) * 4.0,
             DF::ShiftB(ni) => self.noises[*ni].get(z as f64 * 0.25, x as f64 * 0.25, 0.0) * 4.0,
             DF::RangeChoice { i, mi, ma, wr, wo } => {
-                let v = self.eval(*i, x, y, z, memo);
-                self.eval(if v >= *mi && v < *ma { *wr } else { *wo }, x, y, z, memo)
+                let v = self.eval_c(*i, x, y, z, memo, cc);
+                self.eval_c(if v >= *mi && v < *ma { *wr } else { *wo }, x, y, z, memo, cc)
             }
             DF::IntervalSelect { i, th, fns } => {
-                let v = self.eval(*i, x, y, z, memo);
+                let v = self.eval_c(*i, x, y, z, memo, cc);
                 let mut pick = fns.len() - 1;
                 for (k, t) in th.iter().enumerate() {
                     if v < *t {
@@ -1045,9 +1164,9 @@ impl Gen {
                         break;
                     }
                 }
-                self.eval(fns[pick.min(fns.len() - 1)], x, y, z, memo)
+                self.eval_c(fns[pick.min(fns.len() - 1)], x, y, z, memo, cc)
             }
-            DF::Spline(s) => self.eval_spline(s, x, y, z, memo),
+            DF::Spline(s) => self.eval_spline_c(s, x, y, z, memo, cc),
             DF::OldBlended { min, max, main, xzm, ym, mxm, mym } => {
                 let xv = x as f64;
                 let yv = y as f64;
@@ -1063,12 +1182,12 @@ impl Gen {
                     a + alpha * (b - a)
                 }
             }
-            DF::BlendD(a) => self.eval(*a, x, y, z, memo),
+            DF::BlendD(a) => self.eval_c(*a, x, y, z, memo, cc),
             DF::FindTopSurface { density, lower, upper, cell_h } => {
-                let ub = self.eval(*upper, x, 0, z, memo) as i32;
+                let ub = self.eval_c(*upper, x, 0, z, memo, cc) as i32;
                 let mut yy = ub.div_euclid(*cell_h) * *cell_h;
                 while yy >= *lower {
-                    if self.eval(*density, x, yy, z, memo) > 0.0 {
+                    if self.eval_c(*density, x, yy, z, memo, cc) > 0.0 {
                         return yy as f64;
                     }
                     yy -= cell_h;
@@ -1348,8 +1467,10 @@ impl Gen {
 // ---------- chunk column generation ----------
 
 pub(crate) struct ChunkCols {
-    // surface y per local column (world y), and trilerp density grid
-    cells: Vec<f64>,       // 5*5*(ny+1)
+    // 5 x 5 x ny corner grid per `interpolated` node reachable from
+    // final_density, indexed by density-function id. Vanilla interpolates only
+    // the input of `interpolated`; squeeze/min/add stay per block.
+    grids: Vec<Option<Box<[f64]>>>,
     surf: [i16; 256],
     ny: usize, // cell count y (48)
     min_y: i32,
@@ -1385,21 +1506,32 @@ impl Gen {
     }
     let g = self;
     let ny = ((g.height / 8) + 1) as usize;
-    let mut cells = vec![0.0f64; 5 * 5 * ny];
     let mut memo = HashMap::new();
-    for zi in 0..5usize {
-        for xi in 0..5usize {
-            for yi in 0..ny {
-                let bx = cx * 16 + (xi as i32) * 4;
-                let by = g.min_y + (yi as i32) * 8;
-                let bz = cz * 16 + (zi as i32) * 4;
-                let v = g.eval(g.final_density, bx, by, bz, &mut memo);
-                cells[(zi * 5 + xi) * ny + yi] = v;
+    // One corner grid per `interpolated` node on the final_density path. The
+    // grid holds the node's input; the enclosing operators are evaluated per
+    // block in block_density(). Interpolating final_density itself would
+    // interpolate squeeze(), which is cubic and not vanilla.
+    let mut grids: Vec<Option<Box<[f64]>>> = (0..g.dfs.len()).map(|_| None).collect();
+    for iid in g.interp_ids() {
+        let inner = match g.dfs[iid] {
+            DF::Interp(i) => i,
+            _ => continue,
+        };
+        let mut cells = vec![0.0f64; 5 * 5 * ny];
+        for zi in 0..5usize {
+            for xi in 0..5usize {
+                for yi in 0..ny {
+                    let bx = cx * 16 + (xi as i32) * 4;
+                    let by = g.min_y + (yi as i32) * 8;
+                    let bz = cz * 16 + (zi as i32) * 4;
+                    cells[(zi * 5 + xi) * ny + yi] = g.eval(inner, bx, by, bz, &mut memo);
+                }
             }
         }
+        grids[iid] = Some(cells.into_boxed_slice());
     }
     let mut cc = ChunkCols {
-        cells,
+        grids,
         surf: [0i16; 256],
         ny,
         min_y: g.min_y,
@@ -1415,7 +1547,7 @@ impl Gen {
             let mut sy = g.min_y - 1;
             let mut yy = top;
             while yy >= g.min_y {
-                if cc.density(wx, yy, wz) > 0.0 {
+                if g.block_density(&cc, wx, yy, wz) > 0.0 {
                     sy = yy;
                     break;
                 }
@@ -1501,7 +1633,7 @@ impl Gen {
                 let mut fluid = i32::MIN;
                 let mut y = scan_top;
                 while y >= est_min {
-                    let d = cc.density(x, y, z);
+                    let d = g.block_density(&cc, x, y, z);
                     if d <= 0.0 {
                         // A fluid cell sets waterHeight once; air resets it, as
                         // vanilla's buildSurface scan does. Above the terrain the
@@ -1527,7 +1659,7 @@ impl Gen {
                         min = g.min_y;
                         let mut sy = y - 1;
                         while sy >= g.min_y {
-                            if cc.density(x, sy, z) <= 0.0 {
+                            if g.block_density(&cc, x, sy, z) <= 0.0 {
                                 min = sy + 1;
                                 break;
                             }
@@ -1575,7 +1707,7 @@ impl Gen {
             Some(c) => c,
             None => return 0,
         };
-        let d = cc.density(x, y, z);
+        let d = self.block_density(&cc, x, y, z);
         if d > 0.0 {
             if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
                 return if st == u32::MAX { self.def_st } else { st };
@@ -1671,29 +1803,36 @@ impl ChunkCols {
         let v = m.vals[i as usize];
         Some(if v == u16::MAX { u32::MAX } else { v as u32 })
     }
+    /// Trilinear value of this chunk's grid for `interpolated` node `id`, or
+    /// `None` when that node has no grid (not reachable from final_density).
     #[inline]
-    pub fn density(&self, x: i32, y: i32, z: i32) -> f64 {
-        // trilinear interpolation of cell densities
-        let lx = (x & 15) as f64;
-        let lz = (z & 15) as f64;
-        let ly = (y - self.min_y) as f64;
-        let xi = (lx / 4.0).floor().min(3.0) as usize;
-        let zi = (lz / 4.0).floor().min(3.0) as usize;
-        let yi = (ly / 8.0).floor().min((self.ny - 2) as f64) as usize;
-        let fx = lx / 4.0 - xi as f64;
-        let fz = lz / 4.0 - zi as f64;
-        let fy = ly / 8.0 - yi as f64;
-        let g = |xi: usize, yi: usize, zi: usize| self.cells[(zi * 5 + xi) * self.ny + yi];
-        let c000 = g(xi, yi, zi);
-        let c100 = g(xi + 1, yi, zi);
-        let c010 = g(xi, yi + 1, zi);
-        let c110 = g(xi + 1, yi + 1, zi);
-        let c001 = g(xi, yi, zi + 1);
-        let c101 = g(xi + 1, yi, zi + 1);
-        let c011 = g(xi, yi + 1, zi + 1);
-        let c111 = g(xi + 1, yi + 1, zi + 1);
-        lerp3(fx, fy, fz, c000, c100, c010, c110, c001, c101, c011, c111)
+    fn interp(&self, id: usize, x: i32, y: i32, z: i32) -> Option<f64> {
+        let cells = self.grids.get(id)?.as_deref()?;
+        Some(trilinear(cells, self.ny, self.min_y, x, y, z))
     }
+}
+
+#[inline]
+fn trilinear(cells: &[f64], ny: usize, min_y: i32, x: i32, y: i32, z: i32) -> f64 {
+    let lx = (x & 15) as f64;
+    let lz = (z & 15) as f64;
+    let ly = (y - min_y) as f64;
+    let xi = (lx / 4.0).floor().min(3.0) as usize;
+    let zi = (lz / 4.0).floor().min(3.0) as usize;
+    let yi = (ly / 8.0).floor().min((ny - 2) as f64) as usize;
+    let fx = lx / 4.0 - xi as f64;
+    let fz = lz / 4.0 - zi as f64;
+    let fy = ly / 8.0 - yi as f64;
+    let g = |xi: usize, yi: usize, zi: usize| cells[(zi * 5 + xi) * ny + yi];
+    let c000 = g(xi, yi, zi);
+    let c100 = g(xi + 1, yi, zi);
+    let c010 = g(xi, yi + 1, zi);
+    let c110 = g(xi + 1, yi + 1, zi);
+    let c001 = g(xi, yi, zi + 1);
+    let c101 = g(xi + 1, yi, zi + 1);
+    let c011 = g(xi, yi + 1, zi + 1);
+    let c111 = g(xi + 1, yi + 1, zi + 1);
+    lerp3(fx, fy, fz, c000, c100, c010, c110, c001, c101, c011, c111)
 }
 
 // public API -------------------------------------------------------------
@@ -1701,7 +1840,15 @@ impl ChunkCols {
 /// Density at a block position (trilerped from the per-chunk cell grid).
 pub fn density_at(x: i32, y: i32, z: i32) -> Option<f64> {
     let cc = chunk_cols(x >> 4, z >> 4)?;
-    Some(cc.density(x, y, z))
+    Some(density_in(&cc, x, y, z))
+}
+
+/// Block density for a column already fetched with `chunk_cols`.
+pub fn density_in(cc: &ChunkCols, x: i32, y: i32, z: i32) -> f64 {
+    match GEN.lock().unwrap().as_ref() {
+        Some(g) => g.block_density(cc, x, y, z),
+        None => 0.0,
+    }
 }
 
 pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
@@ -2579,7 +2726,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
             let cc = chunk_cols(cx, cz).unwrap();
             for lx in 0..16 { for lz in 0..16 {
                 for y in (-60..60).step_by(2) {
-                    let d = cc.density(cx*16+lx, y, cz*16+lz);
+                    let d = density_at(cx*16+lx, y, cz*16+lz).unwrap_or(0.0);
                     if d <= 0.0 {
                         cave += 1;
                         match aquifer_state(cx*16+lx, y, cz*16+lz, d) {
@@ -2769,6 +2916,17 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
     }
 
     #[test]
+    fn surface_density_follows_vanillas_interpolated_order() {
+        // vanilla samples `interpolated` over its input at 4x8x4 cell corners and
+        // interpolates that, then applies squeeze/min/add per block. Interpolating
+        // final_density as a whole is lerp(squeeze(X)); squeeze is cubic, so the
+        // surface of this column sat one block low (y=62 instead of 63).
+        assert!(init(0, crate::name_to_state));
+        let cc = chunk_cols(0, 1).unwrap();
+        assert_eq!(cc.surface(4, 0), 63, "surface of the check column");
+    }
+
+    #[test]
     fn feature_population_output_matches_the_pre_refactor_capture() {
         // Unlike the lazy-vs-direct comparison, this pins the values against a
         // digest recorded before the shared contracts moved, so a change made on
@@ -2785,12 +2943,14 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // Vanilla block diff with features and carvers disabled on both sides
         // went 1221 -> 194 cells at seed 0 chunk (0,0); the deepslate and
         // bedrock bands match, so this capture records the corrected input.
-        // 2026-10-20: not_underwater is the water condition itself, not its
-        // negation, and the water surface comes from the probed fluid column.
-        // Vanilla block diff with features and carvers disabled went 194 -> 5
-        // cells at seed 0 chunk (0,0) and 36 -> 36 at (0,1) (a density edge),
-        // so feature inputs changed and the capture records the corrected one.
-        assert_eq!(digest, "54760c8c6c3a0161cc163f58b38763f1",
+        // 2026-10-20: the terrain now matches vanilla exactly, so feature inputs
+        // changed twice. `interpolated` is sampled over its input and the
+        // enclosing squeeze/min are per block (see
+        // surface_density_follows_vanillas_interpolated_order); with features and
+        // carvers disabled the block diff is 0 cells in (0,0), (0,1), (-1,-1)
+        // and (-2,0), where the earlier whole-expression interpolation left a
+        // one-block surface step on a few columns.
+        assert_eq!(digest, "559586a58b0f108635e493f10ec5481d",
             "feature population output changed from the vanilla-order capture");
     }
 
