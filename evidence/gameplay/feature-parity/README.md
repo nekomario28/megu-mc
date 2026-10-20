@@ -173,3 +173,41 @@ chunk (0,0) の feature 出力はこの変更だけでは変わらなかった�
 残差 10302 セルは石系 ore の位置のまま。次は `tools/ore_oracle.py` で vein 単位の
 一致率を上げ、（a）`ctx.get` が前の feature の書き込みを見ているか、（b）高さ provider の
 分布、（c）biome フィルタの範囲（chunk 内 vs 3x3）を 1 つずつ潰す。
+
+## 2026-10-20（続き2）: 2本目の vein が合わない = 位置ストリームの draw 数
+
+修正後、chunk (0,0) の `ore_andesite_lower` の原点は
+`(7,49,13)` と `(5,6,2)`。`tools/ore_oracle.py`（bytecode からの独立実装、
+`next_bound` の棄却しきい値を 64bit に直した後）も同じ 2 点を出すので、
+Rust 側の実装は bytecode の意味論と一致している。
+
+vanilla の世界では:
+
+- `(7,49,13)` の vein は**存在する**（andesite の最大連結成分 582 セル、
+  centroid (5.4, 48.8, 7.7)）。x/z/y が一致し、セルの 88% が andesite。
+- `(5,6,2)` の vein は**存在しない**。そこの block は stone
+  （biome は `minecraft:river`、y=3..9 は stone/deepslate が主）。
+
+つまり 1 本目は完全一致、2 本目だけずれる。1 本目の vein が消費する draw は
+`nextFloat` 1 + `nextInt(3)` 2 + `nextDouble` × size 64 = 67。2 本目の位置を
+「1 本目の後に k 個余分に draw する」として k を振ると:
+
+| 余分な draw | 2 本目の原点 | vanilla の andesite との一致 |
+|---|---|---|
+| 0（現状） | (5,6,2) | 263 / 1419 |
+| 4 | **(1,20,8)** | **510 / 1418** |
+
+k=4 のとき 2 本目は (1,20,8) になり、vanilla には centroid (1.2, 17.5, 8.0) の
+263 セル成分がある（x/z が一致）。ただし chunk (1,0) と (0,1) では k を振っても
+一致率が上がらない（最大 0.11 / 0.12）ので、k=4 がそのまま正しいとは限らない。
+vanilla の `PlacedFeature` の位置ストリーム（`placeWithContext`）の bytecode を
+読み、per-position の draw 数を確定させるのが次の一手。
+
+確認済みの切り分け:
+
+- seed（decoration seed / feature seed / step / gi）と RNG 演算は一致。
+- `OreFeature.place` の幾何（中心は `Math.sin(double)`、半径は `Mth.sin` の表、
+  点は double lerp、collapse 条件、走査順 x→y→z）も一致。1 本目の vein が
+  その証拠。
+- したがって残差は「位置ストリームの draw 数」か「位置ごとの feature 実行の
+  タイミング」のどちらか。

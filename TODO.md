@@ -29,10 +29,11 @@
   - biome の feature リストは 1.21.1 に差し替え済み（10939 → 10874）。
     ore の configured/placed 定義は jar と同一。残差は andesite/diorite/granite/
     tuff/deepslate の**位置**で、modifier の RNG 消費・height provider・target 判定。
-  - 次: `ore_andesite_lower` を 1 つ取り、vanilla の `OreFeature.place` と
-    `HeightRangePlacement`/`CountPlacement` の bytecode を読み、RNG 順と分布を
-    mc-spine と突き合わせる。予測した vein 中心を両サーバの andesite セルから
-    逆算して照合する。
+  - 次: vanilla の `PlacedFeature.placeWithContext` の bytecode を読み、
+    位置ストリームの per-position draw 数を確定する。1 本目の vein は完全一致
+    （原点 (7,49,13)、vanilla の 582 セル成分）だが 2 本目が (5,6,2) で一致しない。
+    1 本目の後に 4 draw 余分とすると (1,20,8) になり vanilla の 263 セル成分と
+    x/z が一致する（chunk (1,0)/(0,1) では再現しないので未確定）。
   - 判定: 1 seed・1 chunk で andesite のセル集合が一致するか。
 - [ ] **R1c feature step 別の差分表**（R1a の後）
   - `chunk_block_diff.py` に step 別の集計を足すか、populate の書き込みを step で
