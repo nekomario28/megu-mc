@@ -245,3 +245,35 @@ vanilla の `level.getBlockState` は、既に decorate 済みの隣 chunk が�
   順序が vanilla と違えば「見える集合」も変わり、単純な改善にはならない。
 
 測って悪化したので撤回（`src/generation_context.rs` は元に戻した）。
+
+## 2026-10-20（続き5）: 単一 ore だけの vanilla 世界で vein を直接読む
+
+推測を減らすため、**`ore_andesite_lower` 以外の ore をすべて `count: 0` にした
+datapack**（`tools/vanilla_ore_isolate.py`）で vanilla 1.21.1 の新しい世界を作り、
+chunk (0,0) の andesite をそのまま読んだ（`tools/vanilla_region_blocks.py`）。
+
+- biome ファイルは jar のままコピーするので step リストの長さと順序は変わらず、
+  `ore_andesite_lower` の index は 7 のまま。これを崩すと（リストから抜くなど）
+  後続 feature の seed が全部ずれるので、mute は `count: 0` で行う。
+- 生成された chunk (0,0) の andesite は **1961 セル、8 連結成分**
+  （621 / 264 / 239 / 234 / 216 / 182 / 152 / 53 セル）。他の ore が無いので、
+  このセルは全部この feature の出力。
+
+予測（`tools/ore_oracle.py`、gi=7）との比較:
+
+| 予測した原点 | in-box セル | そのうち vanilla で andesite | 比 |
+|---|---|---|---|
+| (7,49,13) | 474 | 262 | **0.55** |
+| (5,6,2) | 497 | 1 | **0.00** |
+
+1 本目は空気セルを除けば一致（0.55 は洞窟の空気ぶん）。2 本目は**存在しない**。
+2 本目の位置を「1 本目の vein の後に k draw 余分」として総当たりすると、
+k=4 で (1,20,8) になり、vanilla の 264 セル成分（centroid (1.2, 17.5, 8.0)）と
+x/z が一致する（比 0.556）。ただし k を大きくすれば他の成分にも当たるので、
+k=4 が正しいという証明にはならない。
+
+**確定したこと**: seed・RNG・`OreFeature.place` の幾何は 1 本目で裏が取れている。
+**残り**: 1 本目の vein が消費する draw が 67（`nextFloat` 1 + `nextInt(3)` 2 +
+`nextDouble` × 64）で足りず、2 本目の位置がずれる。vanilla 側で draw 数と
+2 本目の位置を直接取るのが次の一手（`dds` を `Proxy` で差し替えて
+`ecz.a(...)` を呼ぶ）。
