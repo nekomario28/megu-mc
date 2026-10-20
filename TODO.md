@@ -36,8 +36,12 @@
     x/z が一致するが、chunk (1,0)/(0,1)/(2,0) では再現しないので単純な draw 差ではない。
     単一 ore だけの vanilla 世界（`tools/vanilla_ore_isolate.py`）では 1 本目が
     一致（原点 (7,49,13)、in-box 比 0.55）し、2 本目 (5,6,2) は 0.00 で存在しない。
-    次の一手は Java の `Proxy` で `dds` を差し替えて `ecz.a(...)` を直接呼び、
-    2 本目の位置と `nextLong` の回数を vanilla 実装から取ること（推測で埋めない）。
+    Java プローブで `OreFeature.place`（size 64）の draw が **67** と確定
+    （`nextFloat` 1 + `nextInt(3)` 2 + `nextDouble`×64）。modifier も bytecode で確認
+    （in_square は `nextInt(16)` ×2、count 定数は 0、height uniform は 1）。
+    それでも 2 本目 (5,6,2) は隔離 vanilla 世界に存在しない。
+    次の一手はプローブに chunk 供給（`dcx.a(int,int)` → `duy` → `dvj`）を足し、
+    位置ストリームと書き込みセルを vanilla から直接取ること。
   - 判定: 1 seed・1 chunk で andesite のセル集合が一致するか。
 - [ ] **R1c feature step 別の差分表**（R1a の後）
   - `chunk_block_diff.py` に step 別の集計を足すか、populate の書き込みを step で

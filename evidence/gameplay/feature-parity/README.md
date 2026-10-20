@@ -277,3 +277,38 @@ k=4 が正しいという証明にはならない。
 `nextDouble` × 64）で足りず、2 本目の位置がずれる。vanilla 側で draw 数と
 2 本目の位置を直接取るのが次の一手（`dds` を `Proxy` で差し替えて
 `ecz.a(...)` を呼ぶ）。
+
+## 2026-10-20（続き6）: vanilla 自身のコードで draw 数を測る
+
+推測を止めるため、1.21.1 の server jar のクラスを直接呼ぶ Java プローブを書いた
+（`Bootstrap` → `OreConfiguration` → `OreFeature.place`、`RandomSource` は
+呼び出しを数える Proxy、level は `java.lang.reflect.Proxy`）。
+
+結果:
+
+- **`OreFeature.place`（size 64）が消費する draw は 67**
+  （`nextFloat` 1 + `nextInt(3)` 2 + `nextDouble` × 64）。`tools/ore_oracle.py` と
+  `src/feature.rs` の前提と一致する。feature 側の draw 数は正しい。
+- modifier も bytecode で確認: `InSquarePlacement`（obf `eis`）は
+  `nextInt(16)` を x, z の順に 2 回だけ引く。`CountPlacement` は定数なら引かない。
+  `HeightRangePlacement`（uniform）は 1 回。`BiomePlacementModifier` は引かない。
+- つまり位置 1 = (7,49,13)（3 draw）、その vein が 67 draw、位置 2 = 次の 3 draw で
+  (5,6,2) になる。**この導出は vanilla のコードと一致している。**
+
+ところが隔離した vanilla 世界（`ore_andesite_lower` のみ）には
+**(5,6,2) の vein が存在しない**（y=4..8 に andesite が 1 セルも無い）。
+count=1 の世界では位置 1 の vein が一致し（in-box 比 0.55、残りは洞窟の空気）、
+count=2 の世界で増える 789 セルも、こちらの予測する 2 本目の位置
+（3x3 の各 chunk）とはほぼ重ならない（一致は 20 セル）。
+
+**未解決**: 位置 2 の 3 draw がどこで消費されるか。候補は
+(a) `BiomePlacementModifier` が位置 2 を落としている（biome は river で
+`ore_andesite_lower` を持つので説明にならない）、
+(b) `place` の中で更に draw がある（プローブでは 67 で確定）、
+(c) 位置 1 の vein が実際は (7,49,13) ではない（成分 centroid は (5.6,49,7.8) で
+z が 5 ずれる）。
+
+次の一手はプローブを完成させ、**level の chunk 供給（`dcx.a(int,int)` →
+`duy` → `dvj`）を差し替えて**、実際に書かれたセルと `placeWithContext` の
+位置ストリームを vanilla から直接取ること。現状のプローブは
+`level.hasChunkAt` が false を返すため書き込み経路に入らない（draw 数は取れる）。
