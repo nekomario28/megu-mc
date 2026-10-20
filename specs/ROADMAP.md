@@ -14,7 +14,7 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 | ビルド・テスト | `cargo build --locked` 成功。`cargo test` 140 passed / 1 ignored（2026-10-20 の verify） |
 | 必須ゲート | `tests/verify.sh` PASS（140 passed / 1 ignored、mutation 46 proved、local、2026-10-20） |
 | hosted CI | GitHub の支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替し、復旧後に同一 SHA で再取得する |
-| M3（軽量） | 代表負荷で CPU x0.63（mc-spine 10.16s / 140MiB 対 vanilla 16.09s / 1134MiB）。地形の一致を取る前の値 |
+| M3（軽量） | **未達**: 地形一致後の代表負荷で CPU x1.13（mc-spine 19.87s / 144.7MiB 対 vanilla 17.53s / 1159.7MiB）。以前の x0.63 は地形不一致時の値で、現在の代表値にしない |
 | 地形（feature/carver なし） | vanilla と **0 セル**（chunk (0,0)、(0,1)、(-1,-1)、(-2,0)）。density・surface rule・bedrock が一致 |
 | feature 層 | feature ありの比較は 10939 / 98304（11.1%）。地形一致後もこの数はほぼ変わらない。同梱 worldgen データが 1.21.1 ではないため、版差を含む |
 
@@ -66,12 +66,15 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 - 出口: 各項目に wire の assert と vanilla 対照。未実装機能は「未実装」と明記し、
   近似を一致として数えない。
 
-### R3 M3「軽量の証明」の再測
+### R3 M3「軽量の証明」（地形一致後の再測で未達、削減が次のスライス）
 
-- R1 で地形が一致した後の生成器コストを測り直す。現在の M3 は**地形が違う状態**の
-  数字なので、パリティ確立後に同じ代表負荷で再測する。生成器の並列化は
-  所有者（region/chunk pipeline）を決めてから。
-- 出口: 同一 seed・同一負荷・20TPS で CPU/RSS を再測定。x1.10 未満の差は主張しない。
+- 地形一致後に測り直した: **CPU x1.13**（mc-spine 19.87s / 144.7MiB / 3thr 対
+  vanilla 17.53s / 1159.7MiB / 63thr、20 秒窓）。以前の x0.63 は地形不一致時の値。
+- 同じセルを fill・surface 走査・material 窓で 2〜3 回密度評価している。
+  `block_density` の再評価を減らす（チャンク内の値を一度だけ作って参照する、
+  interp の格子参照をインライン化する等）を、地形 0 セルを保ったまま行う。
+- 出口: 同一 seed・同一負荷で CPU を再測定し、x1.10 未満の差は主張しない。
+  並列化は所有者（region/chunk pipeline）を決めてから。
 
 ### R4 統合・公開
 

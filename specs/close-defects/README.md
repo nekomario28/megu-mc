@@ -57,3 +57,12 @@ Q に残っていた「光値そのものの vanilla 一致」は、heightmap �
 なった（MOTION_BLOCKING も同じ比較で一致する）。次は光の再測（R1d）。
 feature 層の残差（chunk (0,0) で 10939 セル）は同梱 worldgen データが 1.21.1 でない
 ことが主因で、R1a で 1.21.1 の jar から取り直す。
+
+**M3 の訂正**: Q に記録した x0.63（mc-spine 10.16s 対 vanilla 16.09s）は、地形が
+一致していない状態の値であり、現在の代表値として使わない。地形一致後の再測は
+**mc-spine 19.87s 対 vanilla 17.53s（x1.13）で M3 は未達**（RSS 144.7 対
+1159.7 MiB、threads 3 対 63）。証拠は
+[代表負荷比較](../../evidence/gameplay/load-compare/README.md)。
+次のスライスは生成器の費用削減で、地形パリティを崩さずに `block_density` の
+再評価を減らす（1 チャンクあたり fill・surface 走査・material 窓で同じセルを
+2〜3 回評価している）。

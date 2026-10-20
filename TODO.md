@@ -6,12 +6,15 @@
 
 ## 進行中
 
-- [ ] **R3 代表負荷の再測定**（地形一致後）
-  - `tools/load_compare.sh` を同一 seed・同一移動列で再実行し、CPU/RSS/threads を
-    取る。`chunk_cols` は 48.8 → 70.8 ms/chunk（+45%）なので、M3 の x0.63 が
-    維持されるかを確認する。x1.10 未満の差は主張しない。
-  - 判定: 同一条件の前後比較。悪化していれば生成器の最適化（interp の格子参照を
-    インライン化する等）を次のスライスにする。
+- [ ] **R3 生成器の費用削減**（地形一致後、M3 は x1.13 で未達）
+  - 再測値: mc-spine 19.87s / 144.7MiB / 3thr 対 vanilla 17.53s / 1159.7MiB / 63thr
+    （`tools/load_compare.sh 20 0`）。以前の x0.63 は地形不一致時の値。
+  - 同じセルを fill・surface 走査・material 窓で 2〜3 回密度評価している。
+    まず `cols()` 内で 1 チャンク分の final density を一度だけ作り、
+    `block_density` の再評価をなくす（メモリと引き換えの案を含めて測る）。
+    interp の格子参照のインライン化も同じスライス。
+  - 判定: feature/carver なしの block diff が 0 のまま、`WGPERF` と
+    `load_compare.sh` の CPU が改善するか。x1.10 未満の差は主張しない。
 
 ## 次
 
@@ -40,7 +43,8 @@
       （(0,0) 194→5、(0,1) 243→36、(-1,-1) 228→0）。回帰テスト追加。
 - [x] `interpolated` の入力をセル隅で補間し外側をブロック毎に評価
       （feature/carver なしの block diff が 4 chunk で 0）。回帰テスト追加。
-      費用 +45% のため M3 の再測定を進行中へ。
+- [x] 地形一致後の代表負荷を再測定（CPU x1.13 で M3 未達、RSS x8 軽い）。
+      以前の x0.63 を現在の代表値として使わないことを close-defects に記録。
 - [x] ローカル `depsgx` を固定 revision の venv に置き換え（同一バージョン表記の古い
       ビルドが cycle を 1 件しか報告しなかった）。
 
