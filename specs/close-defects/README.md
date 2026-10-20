@@ -58,6 +58,11 @@ Q に残っていた「光値そのものの vanilla 一致」は、heightmap �
 feature 層の残差（chunk (0,0) で 10939 セル）は同梱 worldgen データが 1.21.1 でない
 ことが主因で、R1a で 1.21.1 の jar から取り直す。
 
+**光の再測定（2026-10-20）**: 地形一致後に `light_parity_probe.py` を 3 chunk で
+実行し、heightmap と非一様区間の sky digest が vanilla と一致した。差は区間マスクの
+送り方（mc-spine は全 26 区間、vanilla は一様区間を省略）だけで、値ではない。
+[光の比較](../../evidence/gameplay/light/vanilla-comparison.md)。
+
 **M3 の訂正**: Q に記録した x0.63（mc-spine 10.16s 対 vanilla 16.09s）は、地形が
 一致していない状態の値であり、現在の代表値として使わない。地形一致後の再測は
 **mc-spine 19.87s 対 vanilla 17.53s（x1.13）で M3 は未達**（RSS 144.7 対
