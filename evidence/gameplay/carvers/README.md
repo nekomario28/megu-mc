@@ -532,3 +532,45 @@ probe がそのまま「本物の aquifer 抜きの oracle」として使える�
 その oracle と我々の出力を比べれば、残差が幾何（トンネル）か aquifer かを
 1 回で切り分けられる。dense 設定（cave probability 1.0）では既に 32023 セル差が
 出ており、信号としては十分。
+
+## 15. aquifer を切った固定具は level.dat を作り直さないと効かない
+
+`aquifers_enabled: false` の `noise_settings/overworld.json` を ctl datapack に
+入れても、**既存 world には反映されない**。`WorldGenSettings`（generator
+settings 込み）は `level.dat` に**インラインで保存**されるため、datapack の
+上書きは world 作成時にしか効かない。実測でも no-aquifer を期待した実行が
+通常時とほぼ同じ差分（4025 セル）になった。
+
+→ no-aquifer 固定具を作るには `level.dat` を消して `level-seed=0` で作り直す
+必要がある（`server.properties` の `level-seed` を使う）。今回は未実施。
+
+実装側は `aquifers_enabled` を読むようにした（`MC_SPINE_NOAQ` でも強制可）。
+1.21.1 の `dyk$1`（aquifer 無効時の実装）と同じ
+`density > 0 ? null : picker.at(y)` 経路に入る。
+
+## 16. 未解決の核心: world の carve がモデルから再現できない
+
+cave だけ有効にした固定具（4 chunk）で、world が掘ったセルは
+(0,0)=20, (0,1)=8, (1,0)=49, (1,1)=**0**。一方
+
+- 我々の port: 4 chunk で 540 セル
+- vanilla のクラスを直接呼ぶ probe: (1,1) で 401 セル、(0,0) では **0** セル
+
+つまり **world は「probe が 0 と言う chunk で 20 セル掘り、401 と言う chunk で
+0 セルしか掘っていない」**。seed 0（level.dat で確認）・jar の carver config
+（フィールド単位で一致確認）・±8 chunk 走査・`k = biome の carver list index`
+というモデルからは再現できない。
+
+候補は 3 つに絞られた:
+1. **aquifer** が carve 経路でだけ我々と違う（ただし位置・similarity・level は
+   検証済みで、`computeSubstance` が null を返す条件と矛盾するケースがある）。
+2. **world の生成条件**がモデルと違う（spawn 生成・dimension の再生成・
+   `level.dat` の generator settings など）。§15 の level.dat インライン化は
+   その傍証。
+3. **probe が忠実でない**（fake chunk が全 stone、biome 関数が null、ctx を
+   Unsafe で確保）。ただし probe と port が 401 セル集合一致なので、少なくとも
+   幾何に関しては両者が同じ実装を見ている。
+
+次の一手は候補 2 の排除: 固定具を「level.dat を作り直す」手順に変え、
+`level-seed=0` を明示したうえで同じ 4 chunk を測る。それで数字が変わらなければ
+候補 1/3 に戻る。

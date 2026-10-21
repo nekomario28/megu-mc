@@ -44,6 +44,11 @@
     chunk (1,1) cave 401 セル中、一致 250 / こちらが余分 151 / vanilla だけが
     water 116（この 116 は我々のどの carver セットにも無い別トンネル）。
     固定具の生成条件を疑う段階。
+  - §15: datapack の `noise_settings` 上書きは既存 world に効かない
+    （generator settings は level.dat にインライン）。no-aquifer 固定具は
+    level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §16: world の carve はモデルから再現できない（probe が 0 の chunk で 20 セル、
+    probe が 401 の chunk で 0 セル）。次は level.dat 再作成で候補 2 を排除。
   - §14: 固定具を高速化（9 秒/サイクル、原点指定・region 削除・EXIT 復元）。
     **carver 全部 zero で地形は 0 セル差 = bit-exact**。carver 別では
     canyon 0 / cave 617 / extra 341。aquifer の 12 サンプル位置も Java 側の

@@ -48,6 +48,10 @@ install_cfg() {  # $1 = carver name, $2 = path|zero|-
     *) cp "$src" "$out" ;;
   esac
 }
+# extra ctl datapack files (e.g. a noise_settings override)
+if [ -n "${CARVER_FIXTURE_EXTRA:-}" ]; then
+  cp -r "$CARVER_FIXTURE_EXTRA"/. "$DIR/world/datapacks/ctl/"
+fi
 install_cfg cave "$CAVE"
 install_cfg cave_extra_underground "$EXTRA"
 install_cfg canyon "$CANYON"

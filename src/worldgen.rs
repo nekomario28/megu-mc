@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::json::{J, jparse};
+use crate::json::{J, jbool, jparse};
 
 use crate::generation_math::*;
 
@@ -510,7 +510,8 @@ impl Gen {
             }
         }
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
-        if let Some(aq) = ns.get("aquifers") {
+        let noaq = std::env::var("MC_SPINE_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
+        if let Some(aq) = ns.get("aquifers").filter(|_| !noaq) {
             let get = |g: &mut Gen, k: &str| aq.get(k).and_then(|j| g.node(j, &files));
             let (b, f, s, l, e) = (
                 get(&mut g, "barrier"),
