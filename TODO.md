@@ -47,6 +47,12 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §18: **§17 の結論を訂正**。cave p=1.0 の固定具で world 2353 セル /
+    probe 5486 セル / 共通 212（9%）。seed 0..3 を振っても一致しない
+    （最良 seed 1 で 27%）。p=1.0 では start の確率差が消えるので、
+    **carve 段の呼び出しモデル自体が world と違う**。per-cell aquifer 比較は
+    その修正後に行う。次はサーバー側 Mixin/javaagent で applyCarvers の
+    seed/sourcePos/carverIndex/isStartChunk を実測する。
   - §17: probe に実地形を食わせると 401=401 で集合差 0 → 幾何・置換判定は完全一致。
     chunk (1,1) の差は「我々が余分に掘る」2 家族のみ（water/stone 152,
     air/stone 151）で、vanilla だけが掘るセルは 0。折り畳みガードも無実。

@@ -2478,6 +2478,9 @@ impl Gen {
     let def = g.aq_pick(y);
     let def_blk = Gen::lvl_block(def.0, def.1, y);
     if y > g.aq_skip_above(x >> 4, z >> 4) {
+        if aq_trace_at(x, z) {
+            eprintln!("AQD {x} {y} {z} d={density} skip {def_blk}");
+        }
         return Some(match def_blk {
             1 => water,
             2 => lava,
@@ -2485,6 +2488,9 @@ impl Gen {
         });
     }
     if def_blk == 2 {
+        if aq_trace_at(x, z) {
+            eprintln!("AQD {x} {y} {z} d={density} lava");
+        }
         return Some(lava);
     }
     g.aq_pos_trace(x, y, z);
@@ -2504,6 +2510,9 @@ impl Gen {
         );
     }
     if sim12 <= 0.0 {
+        if aq_trace_at(x, z) {
+            eprintln!("AQD {x} {y} {z} d={density} sim {blk} sim12={sim12:.4} l0={l2:?}");
+        }
         return Some(match blk {
             1 => water,
             2 => lava,
@@ -2513,6 +2522,9 @@ impl Gen {
     // water directly above a lava level stays water (vanilla schedules a tick)
     let pb = g.aq_pick(y - 1);
     if blk == 1 && Gen::lvl_block(pb.0, pb.1, y - 1) == 2 {
+        if aq_trace_at(x, z) {
+            eprintln!("AQD {x} {y} {z} d={density} lavaunder {blk} sim12={sim12:.4} l0={l2:?}");
+        }
         return Some(water);
     }
     let mut barrier = None;

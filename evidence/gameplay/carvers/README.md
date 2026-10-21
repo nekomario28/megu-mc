@@ -612,3 +612,43 @@ mc-spine CARVE_PROBE (実地形) : 401
 sim12・サンプル位置・PSL・DF 評価は検証済み。次は AQD ダンプに
 `sim12<=0` 早期 return と `skip_above` 早期 return も含めて全分岐を記録し、
 world の結果と 1 セルずつ突き合わせる。
+
+## 18. §17 の結論を訂正: world の carve は p=1.0 でも再現できない
+
+cave probability 1.0（他は 0）の固定具と、同じ config で vanilla のクラスを
+直接呼ぶ probe を chunk (1,1) で比較した:
+
+```
+world が掘ったセル : 2353
+probe が掘ったセル : 5486
+共通               :  212  (world の 9%)
+```
+
+p=1.0 では `isStartChunk` の確率判定が常に真なので、start の有無・乱数消費の
+差は原理的に消える。それでも 9% しか重ならないということは、
+**carve 段の呼び出し（seed / 走査範囲 / 順序）そのものがモデルと違う**。
+
+seed を 0..3 で振ってみた（`setLargeFeatureSeed(seed+k, cx, cz)`）:
+
+| seed | probe セル | world との共通 |
+|---|---|---|
+| 0 | 5486 | 212 |
+| 1 | 6366 | 647 |
+| 2 | 6769 | 313 |
+| 3 | 3331 | 110 |
+
+どの seed でも一致しない（seed 1 が最も近いが 27%）。つまり
+「world seed 0 + `seed+k`」というモデルでは world の carve を再現できない。
+
+したがって §17 の「残差は aquifer だけ」は**言い過ぎ**だった。正しくは:
+
+- 幾何（probe と port）は一致する ✓
+- 置換判定・マスクも一致する ✓
+- しかし **world の carve 自体がモデルから再現できない**（p=1.0 で 9%）
+- よって per-cell の aquifer 比較（§17 の 216/98/87）は、まず carve 段の
+  呼び出しモデルを直さないと意味を持たない
+
+次の一手は carve 段の呼び出しの実測: サーバー側に Mixin / javaagent を入れて
+`NoiseBasedChunkGenerator.applyCarvers` の `seed`, `sourcePos`, `carverIndex`,
+`carver`, `isStartChunk` の結果を記録する。それが取れれば上の表のどこが
+違うのかが即座に分かる。
