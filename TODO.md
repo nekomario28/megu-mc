@@ -47,6 +47,10 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §17: probe に実地形を食わせると 401=401 で集合差 0 → 幾何・置換判定は完全一致。
+    chunk (1,1) の差は「我々が余分に掘る」2 家族のみ（water/stone 152,
+    air/stone 151）で、vanilla だけが掘るセルは 0。折り畳みガードも無実。
+    残るのは carve 経路の aquifer 判定のみ。
   - §16: world の carve はモデルから再現できない（probe が 0 の chunk で 20 セル、
     probe が 401 の chunk で 0 セル）。次は level.dat 再作成で候補 2 を排除。
   - §14: 固定具を高速化（9 秒/サイクル、原点指定・region 削除・EXIT 復元）。

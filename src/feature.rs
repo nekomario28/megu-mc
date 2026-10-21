@@ -2378,6 +2378,15 @@ impl CarveRun {
         let Some(st) = probed else {
             return false;
         };
+        // `applyCarvers` gives `carveBlock` the *target* chunk and the mask is
+        // that chunk's. A tunnel walked from a source chunk up to 8 chunks away
+        // could in principle put an ellipsoid cell outside the target, and the
+        // `x & 15` fold below would then paint a neighbour's cave into this
+        // chunk. Measured: the guard never fires (vanilla's walk stays inside
+        // the target too), so this is belt-and-braces, not a behaviour change.
+        if (x >> 4) != self.tx || (z >> 4) != self.tz {
+            return false;
+        }
         self.out.insert(((x & 15) as u8, y, (z & 15) as u8), st);
         if reached_surface && self.read(g, cc, x, y - 1, z) == br.state_of("minecraft:dirt", None) {
             let fluid = g.is_fluid_state(st);

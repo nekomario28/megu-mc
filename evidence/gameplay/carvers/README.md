@@ -574,3 +574,41 @@ cave だけ有効にした固定具（4 chunk）で、world が掘ったセル�
 次の一手は候補 2 の排除: 固定具を「level.dat を作り直す」手順に変え、
 `level-seed=0` を明示したうえで同じ 4 chunk を測る。それで数字が変わらなければ
 候補 1/3 に戻る。
+
+## 17. probe に実地形を食わせたら完全一致 → 残るのは aquifer だけ
+
+`CarverProbe` に `-Dterrain=<file> -Dterrainchunk=<tx>,<tz>` を足した。
+`MC_SPINE_NOCARVE=1` のダンプ（98304 u32/chunk、section 順）を読み、
+`FakeChunk.getBlockState` がその state を返し、`setBlockState` が配列も更新する
+（`dfy.q.a(id)` で id→BlockState）。これで `canReplaceBlock` まで実 world と同じ。
+
+結果（chunk (1,1), cave, 実地形）:
+
+```
+probe(vanilla のクラス, 実地形): cells=401
+mc-spine CARVE_PROBE (実地形) : 401
+集合差                       : 0
+```
+
+**幾何・置換判定・マスク・seed/k は完全一致**。probe が忠実でないという疑い
+（§16 の候補3）はこれで消えた。
+
+同じ chunk の world との差は 2 家族だけ:
+
+| 我々 | world | ベース | セル |
+|---|---|---|---|
+| water | stone | stone | 152 |
+| air | stone | stone | 151 |
+
+**vanilla だけが掘るセルは 0**（この chunk では）。つまり我々が余分に掘っており、
+その余分は carve 経路の aquifer 判定（`computeSubstance` が null を返すはずの
+ところで air/water を返している）に由来する。
+
+`carve_block` の `x & 15` 折り畳みで隣 chunk のトンネルを混入させている疑いも
+検証した: ターゲット chunk 外を弾くガードを入れても差分は 617 のまま（ガードは
+一度も発火しない）。よって折り畳みは無実。ガードは保険として残した。
+
+残る焦点は `compute_fluid`（サンプル位置の level/kind）と `calc` の値で、
+sim12・サンプル位置・PSL・DF 評価は検証済み。次は AQD ダンプに
+`sim12<=0` 早期 return と `skip_above` 早期 return も含めて全分岐を記録し、
+world の結果と 1 セルずつ突き合わせる。

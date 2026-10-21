@@ -2517,24 +2517,40 @@ impl Gen {
     }
     let mut barrier = None;
     let l3 = g.aq_water_level(near[1].0, near[1].1, near[1].2);
-    if density + sim12 * g.aq_calc_density(x, y, z, l2, l3, &mut barrier) > 0.0 {
+    let c12 = g.aq_calc_density(x, y, z, l2, l3, &mut barrier);
+    let (mut c13, mut c23) = (0.0f64, 0.0f64);
+    if density + sim12 * c12 > 0.0 {
+        if aq_trace_at(x, z) {
+            eprintln!("AQD {x} {y} {z} d={density} null 12 sim={sim12:.4} c12={c12:.4} c13=0 c23=0 l0={:?} l1={:?} l2={:?}", l2, l3, (0, 0));
+        }
         return None;
     }
     let l4 = g.aq_water_level(near[2].0, near[2].1, near[2].2);
     let d2 = d(near[2]);
     let sim13 = 1.0 - (d2 - d0).abs() as f64 / 25.0;
     if sim13 > 0.0 {
-        let b13 = sim12 * sim13 * g.aq_calc_density(x, y, z, l2, l4, &mut barrier);
+        c13 = g.aq_calc_density(x, y, z, l2, l4, &mut barrier);
+        let b13 = sim12 * sim13 * c13;
         if density + b13 > 0.0 {
+            if aq_trace_at(x, z) {
+                eprintln!("AQD {x} {y} {z} d={density} null 13 sim={sim12:.4} c12={c12:.4} s13={sim13:.4} c13={c13:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
+            }
             return None;
         }
     }
     let sim23 = 1.0 - (d2 - d1).abs() as f64 / 25.0;
     if sim23 > 0.0 {
-        let b23 = sim12 * sim23 * g.aq_calc_density(x, y, z, l3, l4, &mut barrier);
+        c23 = g.aq_calc_density(x, y, z, l3, l4, &mut barrier);
+        let b23 = sim12 * sim23 * c23;
         if density + b23 > 0.0 {
+            if aq_trace_at(x, z) {
+                eprintln!("AQD {x} {y} {z} d={density} null 23 sim={sim12:.4} s23={sim23:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
+            }
             return None;
         }
+    }
+    if aq_trace_at(x, z) {
+        eprintln!("AQD {x} {y} {z} d={density} state {blk} sim={sim12:.4} c12={c12:.4} c13={c13:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
     }
     Some(match blk {
         1 => water,
