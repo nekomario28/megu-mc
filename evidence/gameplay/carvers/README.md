@@ -652,3 +652,27 @@ seed を 0..3 で振ってみた（`setLargeFeatureSeed(seed+k, cx, cz)`）:
 `NoiseBasedChunkGenerator.applyCarvers` の `seed`, `sourcePos`, `carverIndex`,
 `carver`, `isStartChunk` の結果を記録する。それが取れれば上の表のどこが
 違うのかが即座に分かる。
+
+## 19. サーバー内計測（javaagent）: 世界は chunk (1,1) を 1 セルも掘っていない
+
+`tools/carve-agent/` に javaagent を追加した。`applyCarvers` の
+(source chunk, carver index, isStartChunk) と、`WorldCarver.getCarveState` の
+戻り値（null か state id か）をサーバー内で直接記録する。fixture の出力は
+エージェント有無で不変（617 セルのまま）なので、計測は生成を乱さない。
+
+実測（cave のみ、2x2 chunk）:
+
+- `applyCarvers` 呼び出し 104907 行、`isStartChunk=true` 4800。
+- **target (1,1) の start は 36、すべて k=0**（cave）。我々のモデルと一致。
+- ところが **chunk (1,1) 内の `getCarveState` 呼び出しは 0 件**。
+  `ASTATE` は 76 chunk をカバーするが (1,1) は含まれない。
+
+つまり world では cave の 36 start が **chunk (1,1) に 1 セルも届いていない**。
+こちらの port（と probe）は同じ 36 start から 401 セルを (1,1) に掘る。
+
+start は一致しているので、**ずれは `carve` の中（乱数消費かパラメータ）**。
+aquifer ではない。§17/§18 の「aquifer だけ」も、この意味で修正が必要。
+
+次の一手: `ebb.carve` の入口で source chunk と最初の数ドロー
+（y / yaw / pitch / thickness）を記録し、こちらの `CARVE_RNG` トレースと
+並べる。最初に食い違うドローがそのままバグの位置になる。

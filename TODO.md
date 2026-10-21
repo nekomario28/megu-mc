@@ -47,6 +47,10 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §19: javaagent (`tools/carve-agent/`) で `applyCarvers` と `getCarveState` を
+    サーバー内計測。target (1,1) の start 36 は我々と一致するが、**chunk (1,1)
+    内の getCarveState 呼び出しは 0 件**。world は (1,1) を 1 セルも掘っていない。
+    ずれは `carve` 内部（乱数消費/パラメータ）で、aquifer ではない。
   - §18: **§17 の結論を訂正**。cave p=1.0 の固定具で world 2353 セル /
     probe 5486 セル / 共通 212（9%）。seed 0..3 を振っても一致しない
     （最良 seed 1 で 27%）。p=1.0 では start の確率差が消えるので、
