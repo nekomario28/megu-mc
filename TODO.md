@@ -145,3 +145,20 @@
 - [ ] 生成器の並列化: [chunk-parallelism](specs/chunk-parallelism/README.md) の
       owner 決定（GenData 分離とマージ順）が前提。
 - [ ] 代表負荷の再測定は R1 完了後。いまの x0.63 は地形が違う状態の値。
+
+## OSS survey (2026-10-21)
+
+`evidence/foundation/oss-survey/README.md` に、ライセンス的に取り込める OSS の
+一覧と判定をまとめた。要点:
+
+- **Soju06/hyperchunk** (MIT, C11): 26.2 の overworld 全工程（noise/DF/SIMD,
+  surface, carvers, aquifer, features, structures, lighting, spawn, NBT/region）を
+  bit-exact 実装。`openspec/` が bytecode 再構成ノート。**aquifer.c は我々の
+  `aq_state` と分岐単位で一致**（similarity/13 offsets/12 cell scan/calc/3 tests/
+  skip formula/PSL memo/lava floor）。二つの独立実装が一致 → 残差は aquifer の
+  外側（plumbing か fixture）。
+- **MCHPRS** (MIT, Rust): redstone/tick。**cubiomes** (MIT): biome/structure。
+  **chorus** (Apache-2.0): bedrock worldgen + lighting。**mc-datapack-map** (MIT):
+  datapack の DF 評価の突き合わせ。**valence/azalea/PicoLimbo** (MIT): protocol。
+- 使えない: Pumpkin (GPL-3.0), SteelMC (AGPL-3.0), Amidst (GPL-3.0),
+  fluffy-parakeet (ライセンス無し)。
