@@ -22,8 +22,15 @@
     レベル決定・kind 決定・センチネル・calc_density・barrier 3 テスト）は bytecode と
     一致を確認済み。**残る唯一の候補**は `a(IIILdyk$b;IZ)I` 冒頭の
     `dem.a(u, v, pos)` で、mc-spine は `excl` 1 本で代用している。
-  - 次の一手: `dyk$c` の ctor で `u`/`v` が noise router のどのキーか、
-    `dem.a(DF,DF,ctx)` の本体を読み、`aq_fluid_y` の `deep` を置き換える。
+  - `dem.a` は erosion<-0.225 && depth>0.9 で、datapack の `aquifers.exclusion`
+    (`min(-0.225-erosion, depth-0.9)`) と同値 → 一致を確認済み（§6）。
+  - 形状は完全一致（chunk (1,1) の cave probe 401 = 401、セル集合も一致）。
+    残差 1450 セルの内訳と我々の判断は §7。`AQ_TRACE` で見ると
+    sim12<0 経路は最近 2 セルの level がセンチネル、sim12>0 経路は level が
+    両方 63（= `|Δ|=0` で calc 0）。よって残るのはセル流体の level そのもの。
+  - 最後の未検証入力は `prelim_est`（aquifer 専用）: chunk (1,1) で値が
+    {40,48,56} の 3 種のみ、実地表より平均 -12 低い。`chunk_surface_level` を
+    vanilla の DF codec で評価する probe を作り、256 列で数値比較するのが次の一手。
   - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル（R1a の 49 セルを除く）。
 
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）

@@ -282,3 +282,92 @@ mc-spine の `excl > 0.0` は等価（`min(a,b) > 0 ⟺ a>0 ∧ b>0`）。よっ
 （probe 側は `n[0] < 60` 件、こちらは 400 件で止まる）。`tools/vanilla-probe/` に aquifer 用の probe（NoiseChunk を
 Unsafe で確保し `computeSubstance` を直接叩く）を足せれば、セル単位で
 `aq_state` を突き合わせて即座に白黒つく。
+
+## 7. 残差は aquifer の「セル流体」だけ（2026-10-21 続き）
+
+### 形状は完全一致（もう疑わなくてよい）
+
+chunk (1,1) で `CARVE_PROBE`（all-stone）と Java probe を突き合わせた:
+
+```
+mc-spine (CARVE_ONLY=minecraft:cave): 401 cells
+CarverProbe 0 1 1                 : cells=401 writes=401
+```
+
+セル集合も一致。**トンネルの形・開始点・マスクは一致している。**
+したがって差分は `carveBlock` の中で `getCarveState` が返す値だけ。
+
+### 差分の内訳（49-chunk 固定具の chunk (1,1)、1450 セル）
+
+| 我々 | vanilla | セル数 | y 範囲 |
+|---|---|---|---|
+| air | deepslate | 788 | -54..-10 |
+| lava | deepslate | 243 | -62..-55 |
+| water | stone | 152 | 39..49 |
+| air | stone | 151 | 30..41 |
+| stone | water | 116 | 39..44 |
+
+vanilla 側が「何も書かない」= `getCarveState` が **null**（barrier）。
+我々は 1334 セルで書き、116 セルで書かない。両方向・狭い y 帯 = 値のずれ。
+
+### 我々の判断（`AQ_TRACE="1,1"` の実測）
+
+- air-vs-deepslate の 788 セル: `sim12 = -1.24 .. -1.72`（負）で
+  **早期 return 経路**。最近 2 セルの level はどちらも `-32512`（センチネル）
+  → `lvl_block` が 0 → air。
+- water-vs-stone の 152 セル: `sim12 = 0.80 .. 0.96`（正）で barrier 経路。
+  最近 2 セルの level がどちらも `63` → `|Δ| = 0` → `calc = 0` → barrier 不成立 → water。
+
+vanilla が null を返すには `sim12 > 0` かつ `calc > 0` が必要。`sim12` は
+**同じ 12 セル・同じ乱数位置**から出るので一致するはず。よって残るのは
+**セル流体（level, kind）の値そのもの**。それは
+`b(px,py,pz)`（13 列スキャン）だけで決まる。
+
+### `b(int,int,int)`（13 列スキャン）の bytecode（転記）
+
+```
+def = t.computeFluid(x, y, z);   minEst = MAX;  j = y+12;  k = y-12;  foundWater = false;
+for (off : C) {                                  // C = 13 個の (dx,dz)
+    xx = x + (off[0] << 4);  zz = z + (off[1] << 4);
+    n  = l.a(xx, zz);                            // 予備地表レベル
+    o  = n + 8;
+    center = off[0]==0 && off[1]==0;
+    if (center && k > o) return def;
+    b18 = j > o;
+    if (b18 || center) {
+        fs = t.computeFluid(xx, o, zz);
+        if (!fs.at(o).isAir()) { if (center) foundWater = true; if (b18) return fs; }
+    }
+    minEst = min(minEst, n);
+}
+level = a(x,y,z,def,minEst,foundWater);          // §6 で一致確認済み
+kind  = a(x,y,z,def,level);                      // §6 で一致確認済み
+```
+mc-spine の `aq_fluid_level_at` はこの形と一致（`aq_pick(o)` = `t.computeFluid` の
+y のみ版、`prelim_est` = `l.a`）。
+
+### 最後に残った検証点: `prelim_est`
+
+`prelim_est` は **aquifer 専用**（地形比較では踏まれない）。実測すると
+chunk (1,1) の 256 列で
+
+- 値は `{40, 48, 56}` の 3 種類だけ（8 ブロック量子化）
+- 実際の地表（carvers 無効 world の最上位固体）との差は
+  **平均 -11.97 / 中央 -14 / 範囲 -22..-7**（系統的に下）
+
+datapack の定義は
+
+```
+chunk_surface_level     = interpolated(cell_size_xz=16, cell_size_y=1, preliminary_surface_level)
+preliminary_surface_level = find_top_surface(cell_height=8, density=add(...))
+```
+
+量子化 8 は `find_top_surface.cell_height` と整合。系統的に下に出るのは
+`find_top_surface` の探索範囲/終了条件か、`interpolated` の扱いのどちらか。
+`minEst` は `f = clamp(minEst + 8 - y, 0, 64)` に入るので、14 の下振れは
+`aq_fluid_y` の 2 つの比較（`-0.3/0.8`, `-0.8/0.4`）を確実に跨ぐ。
+
+**次の一手**: `chunk_surface_level` を vanilla の DF codec で評価する小さな
+probe（`dyr.b` CODEC + `JsonOps` + resource lookup）を書き、同じ 256 列で
+`prelim_est` と数値比較する。ここが合えば aquifer 連鎖は全て vanilla と
+同じ入力を持つことになり、残差は 0 になるはず。

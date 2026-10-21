@@ -279,6 +279,19 @@ struct AQD {
     lava_st: u32,
 }
 
+/// `AQ_TRACE="<cx>,<cz>"` prints the aquifer's decision terms for that chunk.
+fn aq_trace_at(x: i32, z: i32) -> bool {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<(i32, i32)>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var("AQ_TRACE").ok().and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+    });
+    matches!(spec, Some((cx, cz)) if *cx == x >> 4 && *cz == z >> 4)
+}
+
 impl Gen {
     fn df_files() -> HashMap<String, Vec<u8>> {
         Self::dp_files("density_function")
@@ -1300,6 +1313,23 @@ impl Gen {
 
     // find_top_surface of the preliminary_surface_level DF, cached per quart column
     pub(crate) fn prelim_est(&mut self, x: i32, z: i32) -> i32 {
+        if let Ok(spec) = std::env::var("PRELIM_DUMP") {
+            static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            let v = self.prelim_est_raw(x, z);
+            if DONE.get().is_none() && spec == format!("{x},{z}") {
+                let _ = DONE.set(());
+                for dz in 0..16 {
+                    for dx in 0..16 {
+                        let n = self.prelim_est_raw(x + dx, z + dz);
+                        eprintln!("PRELIM {} {} {}", x + dx, z + dz, n);
+                    }
+                }
+            }
+            return v;
+        }
+        self.prelim_est_raw(x, z)
+    }
+    fn prelim_est_raw(&mut self, x: i32, z: i32) -> i32 {
         let k = (x >> 2, z >> 2);
         if let Some(&v) = self.prelim_c.get(&k) {
             return v;
@@ -2167,7 +2197,13 @@ impl Gen {
     // position — arbitrary positions must use aq_fluid_level_at to avoid
     // polluting the per-cell cache (pumpkin's get_fluid_level is uncached).
     fn aq_water_level(&mut self, rx: i32, ry: i32, rz: i32) -> (i32, u8) {
-        let key = (lxz(rx), ly12(ry), lxz(rz));
+        // Cache key = the cell the sample position belongs to: vanilla's
+        // `NoiseBasedAquifer.a(long)` keys on `floorDiv(px,16)`, `floorDiv(py,12)`,
+        // `floorDiv(pz,16)` - **without** the `-5/+1` offsets the neighbour
+        // selection uses. Those offsets are not a bijection on positions: a
+        // position with r>=5 in cell c and one with r<5 in cell c+1 land on the
+        // same key, so the two cells would share one level.
+        let key = (rx.div_euclid(16), ry.div_euclid(12), rz.div_euclid(16));
         if let Some(&v) = self.aq_lv.get(&key) {
             return v;
         }
@@ -2406,6 +2442,12 @@ impl Gen {
     let l2 = g.aq_water_level(near[0].0, near[0].1, near[0].2);
     let blk = Gen::lvl_block(l2.0, l2.1, y);
     let sim12 = 1.0 - (d1 - d0).abs() as f64 / 25.0;
+    if aq_trace_at(x, z) {
+        eprintln!(
+            "AQ x={x} y={y} z={z} sim12={sim12:.4} near0={:?} lvl0={:?} near1={:?} lvl1={:?} d0={d0} d1={d1}",
+            near[0], l2, near[1], g.aq_water_level(near[1].0, near[1].1, near[1].2)
+        );
+    }
     if sim12 <= 0.0 {
         return Some(match blk {
             1 => water,
