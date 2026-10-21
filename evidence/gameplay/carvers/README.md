@@ -447,3 +447,47 @@ sim12<0 の早期 return で空気を返すため、ほぼ全部掘ってしま�
 と、carve 経路（ブロック座標）での `r[]`/`s[]` キャッシュの共有状態。
 probe では `dyk$c` を直接 new できない（`dzc` が要る）ため、
 `NoiseChunk` を組み立てる小さな harness が必要。
+
+## 11. 独立実装との突き合わせ（hyperchunk, MIT）
+
+`Soju06/hyperchunk`（MIT, C11, 26.2 の bit-exact 主張、`openspec/` に bytecode
+再構成ノート）の `core/src/aquifer.c` は、我々の `aq_state` と**分岐単位で一致**
+した（similarity・13 offsets・12 セル走査・サンプル位置・早期 return・
+water-over-lava・圧力 3 テスト・calc の短絡・level/kind・PSL メモ・
+skipSamplingAboveY・carve 時の lava floor）。二つの独立実装が一致したので、
+aquifer の論理そのものを疑うのは打ち切り。詳細は
+`evidence/foundation/oss-survey/README.md`。
+
+## 12. 今回直した 2 件（数値は不変、bytecode 一致のため）
+
+1. **PSL の探索開始 y**: 1.21.1 は *コード*で `minY + height`（=320）から 8 刻みで
+   下ろす。リポジトリの datapack（1.21.2+ 形式）の `find_top_surface` には
+   `upper_bound` DF があり、この世界では **47** に評価される。そこから探すと
+   予備地表が最大 270 ブロック低く出る。`prelim_est` を 1.21.1 の形
+   （`minY + height` から開始、失敗時 `i32::MAX`）に変更。
+   ただし実測では真の PSL が 47 より下（{40,48,56}）なので数値は変わらず。
+2. **nearest-4 の同点規則**: bytecode は `dx 0..1 / dy -1..1 / dz 0..1` の順で
+   比較はすべて `>=`（同点なら後着が前に挿入）。我々は `>` で順序も別だった。
+   スロット 2/3 が圧力テストのペアを決めるので同点規則は観測可能。bytecode
+   どおりに書き換え（この chunk では同点がなく数値不変）。
+
+## 13. 残差の内訳（chunk (1,1), cave のみ 401 セル）
+
+| | セル数 |
+|---|---|
+| 我々も vanilla も拒否（一致） | 250 |
+| 我々が air にし、vanilla は stone のまま | 151 |
+| 我々は stone のまま、vanilla が water にしたセル（**我々の 401 とは別のトンネル**） | 116 |
+
+- 401 セルの**集合は vanilla のクラスを直接呼んだ結果と完全一致**（`DUMPCELLS`
+  を足した probe で diff 0）。
+- 116 セルは我々の cave/extra/canyon のどのセットにも含まれない（y 39..44 の
+  水トンネル）。つまり固定具の world には、seed 0・jar の config・±8 chunk の
+  走査から出るはずのないトンネルが 1 本ある。ここは固定具の生成条件そのものを
+  疑う必要がある（`level.dat` は seed 0 / DataVersion 3955 / DataPacks
+  vanilla+file/nofeat を確認済み）。
+- 残差は「1 chunk あたり ±150 セルの局所的な不一致」で、系統的な全面不一致ではない。
+
+**次の一手**: 実物の `NoiseChunk`(`dzc`) を組み立てて `dyk$c` を作る probe。
+または固定具を作り直して（world を作る工程を 1 から記録しながら）116 セルの
+トンネルの出所を特定する。

@@ -1347,7 +1347,30 @@ impl Gen {
             Some(id) => {
                 let ax = (x >> 2) << 2;
                 let az = (z >> 2) << 2;
-                self.eval(id, ax, 0, az, &mut HashMap::new()) as i32
+                // 1.21.1 computes the preliminary surface in *code*, not from the
+                // datapack's `find_top_surface` node: `ChunkNoiseSampler.a(long)`
+                // starts at `minY + height` and steps down by 8 until
+                // `initial_density_without_jaggedness` exceeds 0.390625. The
+                // newer-format JSON carries its own `upper_bound` density
+                // function, which here evaluates to ~47 - starting there returns
+                // a surface up to 270 blocks too low, and only the aquifer reads
+                // it, so terrain parity never noticed.
+                match self.dfs.get(id) {
+                    Some(DF::FindTopSurface { density, cell_h, .. }) => {
+                        let (density, step) = (*density, (*cell_h).max(1));
+                        let mut y = ((self.min_y + self.height) / step) * step;
+                        let mut found = i32::MAX;
+                        while y >= self.min_y {
+                            if self.eval(density, ax, y, az, &mut HashMap::new()) > 0.0 {
+                                found = y;
+                                break;
+                            }
+                            y -= step;
+                        }
+                        found
+                    }
+                    _ => self.eval(id, ax, 0, az, &mut HashMap::new()) as i32,
+                }
             }
             None => self.min_y,
         };
@@ -2159,43 +2182,40 @@ impl Gen {
     }
     // 12 neighbor-cell random positions -> 4 nearest positions to (x,y,z)
     // (vanilla sorts per query point — result depends on (x,y,z), not just cell)
+    /// `NoiseBasedAquifer.computeSubstance` nearest-four selection.
+    ///
+    /// Bytecode order is x outer, y middle, z inner (`dx 0..1`, `dy -1..1`,
+    /// `dz 0..1`) and every comparison is `>=`, i.e. on a tie the *later*
+    /// cell is inserted in front and the earlier one shifts down. Symmetric
+    /// cells tie often, and which cells land in slots 2/3 picks the pairs the
+    /// three pressure tests use, so the tie rule is observable.
     fn aq_near4(&mut self, x: i32, y: i32, z: i32) -> [(i32, i32, i32); 4] {
         let sx = lxz(x - 5);
         let sy = ly12(y + 1);
         let sz = lxz(z - 5);
-        // pumpkin order: i11/i10/i01/i00 at y+1, y, y-1 (insertion ties kept)
-        let cells = [
-            (sx + 1, sy + 1, sz + 1),
-            (sx + 1, sy + 1, sz),
-            (sx, sy + 1, sz + 1),
-            (sx, sy + 1, sz),
-            (sx + 1, sy, sz + 1),
-            (sx + 1, sy, sz),
-            (sx, sy, sz + 1),
-            (sx, sy, sz),
-            (sx + 1, sy - 1, sz + 1),
-            (sx + 1, sy - 1, sz),
-            (sx, sy - 1, sz + 1),
-            (sx, sy - 1, sz),
-        ];
         let mut near = [((0, 0, 0), i64::MAX); 4];
-        for c in cells {
-            let (px, py, pz) = self.aq_rpos_c(c.0, c.1, c.2);
-            let (dx, dy, dz) = (px - x, py - y, pz - z);
-            let h = dx as i64 * dx as i64 + dy as i64 * dy as i64 + dz as i64 * dz as i64;
-            if near[3].1 > h {
-                near[3] = ((px, py, pz), h);
-                if near[2].1 > h {
-                    near[3] = near[2];
-                    near[2] = ((px, py, pz), h);
-                }
-                if near[1].1 > h {
-                    near[2] = near[1];
-                    near[1] = ((px, py, pz), h);
-                }
-                if near[0].1 > h {
-                    near[1] = near[0];
-                    near[0] = ((px, py, pz), h);
+        for dx in 0..=1 {
+            for dy in -1..=1 {
+                for dz in 0..=1 {
+                    let (px, py, pz) = self.aq_rpos_c(sx + dx, sy + dy, sz + dz);
+                    let (ex, ey, ez) = (px - x, py - y, pz - z);
+                    let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
+                    let p = ((px, py, pz), h);
+                    if near[0].1 >= h {
+                        near[3] = near[2];
+                        near[2] = near[1];
+                        near[1] = near[0];
+                        near[0] = p;
+                    } else if near[1].1 >= h {
+                        near[3] = near[2];
+                        near[2] = near[1];
+                        near[1] = p;
+                    } else if near[2].1 >= h {
+                        near[3] = near[2];
+                        near[2] = p;
+                    } else if near[3].1 >= h {
+                        near[3] = p;
+                    }
                 }
             }
         }

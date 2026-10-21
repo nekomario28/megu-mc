@@ -39,6 +39,11 @@
     `computeSubstance` をセル単位で比較する（carve 経路はブロック座標、
     terrain 経路は 4x8x4 格子座標で呼ばれる点と、`r[]`/`s[]` の共有状態が焦点）。
   - 併せて: `datapacks/vanilla` を 1.21.1 の jar から再生成する（現状は 1.21.2+ 形式）。
+  - §11-13: hyperchunk (MIT) の `aquifer.c` と分岐単位で一致。PSL の開始 y と
+    nearest-4 の同点規則を bytecode どおりに修正（数値は不変）。残差は
+    chunk (1,1) cave 401 セル中、一致 250 / こちらが余分 151 / vanilla だけが
+    water 116（この 116 は我々のどの carver セットにも無い別トンネル）。
+    固定具の生成条件を疑う段階。
   - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル（R1a の 49 セルを除く）。
 
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）
