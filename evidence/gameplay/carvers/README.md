@@ -199,3 +199,70 @@ R1a（ore vein）の既存残差。
 density=0.0 経路 — barrier 判定 `density + sim12*calc > 0` と 3 近傍の重み。
 `tools/vanilla-probe/` に aquifer 用の probe を足して、同じセル集合で
 `aq_state` を直接突き合わせるのが最短。
+
+## 6. 残差の切り分け（2026-10-21 後半）
+
+§5.3 の残差を「tunnel の位置」ではなく「carveBlock の入力」に絞った記録。
+
+### 決定的だった 1 chunk の比較
+
+固定具 `/tmp/carverfix-caveonly`（`tools/carver_fixture.sh caveonly cave.json zero zero 2`、
+cave だけ probability 0.15、extra/canyon は probability 0.0 を両側に入れた world）の
+chunk (1,1):
+
+| | セル数 |
+|---|---|
+| vanilla のクラスを直接呼ぶ probe（all-stone、cave） | **401** |
+| mc-spine の同じ probe | 303（probe も同条件で 303） |
+| vanilla の**実 world** が掘ったセル | **0** |
+
+start 集合も一致していた（36 origins、Java probe と完全一致）。つまり
+**同じ tunnel が、vanilla の実 world では 1 セルも掘られていない**。
+`carveBlock` は `canReplaceBlock` か `getCarveState` で全部 false を返した、という意味。
+
+- `#overworld_carver_replaceables` の tag ファイルは jar と**バイト一致**（入れ子の
+  `base_stone_overworld` / `dirt` / `sand` / `terracotta` / `iron_ores` / `copper_ores` も）。
+  我々の側の `cur` も全て stone（tag 内）。
+- したがって残るのは `getCarveState` → `aq_state(x,y,z,0.0)` の**barrier 判定**だけ。
+
+### bytecode と突き合わせて一致を確認した部分
+
+`dyk$c`（NoiseBasedAquifer）を 1 メソッドずつ読んだ。以下は mc-spine と**一致**:
+
+- `a(int,int)`（近接度）= `1.0 - |d1-d0|/25.0`
+- `dyk$c` の static `C`（13 個の 2D オフセット表）= `AQ_OFF` と同内容・同順
+- 12 セル（i∈{0,1}, j∈{-1,0,1}, k∈{0,1}）から近い 3 つを選ぶ挿入
+- セル fluid の走査（center 特例、`minSurface`、`+8`、`computeFluid`）
+- レベル決定 `a(IIILdyk$b;IZ)I`: `clampedMap(top,0,64,1,0)`、`map(f,1,0,-0.3,0.8)`、
+  `map(f,1,0,-0.8,0.4)`、`floor(s/3)*3 + cellY*40 + 20`、`min(...)`
+- kind 決定 `a(IIILdyk$b;I)Ldtc`: `level <= -10 && level != センチネル && state != LAVA`
+  → lava ノイズ `|v| > 0.3` で溶岩
+- センチネル `dwy.g`: `(65 - h - i) << 4`（h=i=1+2^25）= **-1073740816**。
+  mc-spine の `AQ_MIN = -32512` と**挙動は同じ**（どの y よりも下なので「流体なし」）
+- `calc_density`: 溶岩/水ペアで 2.0、`|Δlevel|==0` で 0、`o = hd - |sc|`、
+  `sc>0 ? (o>0?o/1.5:o/2.5) : (p=3+o; p>0?p/3:p/10)`、`q∈[-2,2]` の外は 0、
+  `2*(r+q)`。**完全一致**
+- barrier の 3 テストの組み合わせと重み（`sim12*calc(p14,p16)`,
+  `sim12*sim13*calc(p14,p18)`, `sim12*sim23*calc(p16,p18)`）、`MutableDouble` の共有
+
+### 残る唯一の候補
+
+`a(IIILdyk$b;IZ)I` の**最初の分岐**だけ形が違う:
+
+```
+0: new dyr$e(x, y, z)
+12: getfield u:Ldyr;  16: getfield v:Ldyr;  22: invokestatic dem.a:(Ldyr;Ldyr;Ldyr$b;)Z
+25: ifeq 41                      // false なら通常計算
+28: d0 = -1.0; d1 = -1.0         // true なら「深い」= 両方 -1
+```
+
+mc-spine は `excl`（noise settings の `aquifers.exclusion`）1 本を `> 0.0` で見ている。
+vanilla は **2 本の DF（`u`, `v`）と `dem.a(DF,DF,ctx)`** という別の述語。
+ここが `deep` を決め、`deep` が true だとレベルが両方 -1 になって
+`calc_density` の溶岩/水分岐と barrier の符号が変わる。
+
+**次の一手**: `dyk$c` のコンストラクタで `u`/`v` にどの DF が入るか（noise router の
+どのキーか）と `dem.a(DF,DF,ctx)` の本体を読み、`aq_fluid_y` の `deep` を
+それに置き換える。`tools/vanilla-probe/` に aquifer 用の probe（NoiseChunk を
+Unsafe で確保し `computeSubstance` を直接叩く）を足せれば、セル単位で
+`aq_state` を突き合わせて即座に白黒つく。

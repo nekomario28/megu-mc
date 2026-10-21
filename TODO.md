@@ -17,9 +17,13 @@
   - 残差（新しい固定具、49 chunk = (-5..1,-3..3)、seed 0、feature 無し）:
     vanilla の carver 由来 53601 セルに対し、一致 5289 / 掘り漏れ 48312 /
     掘りすぎ 41923。地形そのものは同じ固定具で 49 セル（R1a の ore vein）。
-  - 次の一手: `aq_state(x,y,z,0.0)` の経路（地形比較では踏まれない）を
-    `NoiseBasedAquifer.computeSubstance` と直接突き合わせる。aquifer 用の probe を
-    `tools/vanilla-probe/` に足すのが最短。
+  - 切り分け済み（§6）: 残差は tunnel ではなく `carveBlock` の入力で、tag は jar と
+    バイト一致。aquifer 連鎖（近接度・13 オフセット表・近い 3 つ・セル fluid 走査・
+    レベル決定・kind 決定・センチネル・calc_density・barrier 3 テスト）は bytecode と
+    一致を確認済み。**残る唯一の候補**は `a(IIILdyk$b;IZ)I` 冒頭の
+    `dem.a(u, v, pos)` で、mc-spine は `excl` 1 本で代用している。
+  - 次の一手: `dyk$c` の ctor で `u`/`v` が noise router のどのキーか、
+    `dem.a(DF,DF,ctx)` の本体を読み、`aq_fluid_y` の `deep` を置き換える。
   - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル（R1a の 49 セルを除く）。
 
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）

@@ -2063,6 +2063,9 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                     continue;
                 }
                 starts += 1;
+                if std::env::var("CARVE_TRACE").is_ok() {
+                    eprintln!("START target={tx},{tz} origin={ox},{oz} k={k} {name} ({biome})");
+                }
                 match c.kind {
                     CKind::Cave => run.cave(g, &cc, c, &mut r, ox, oz),
                     CKind::Canyon => run.canyon(g, &cc, c, &mut r, ox, oz),
