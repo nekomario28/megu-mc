@@ -490,8 +490,17 @@ impl Gen {
                 .and_then(|b| res(b.str()))
                 .unwrap_or(0);
             g.bands = create_bands(&mut g.factory.of_str("minecraft:clay_bands"), res);
-            if let Some(aq) = router
-                .and_then(|r| r.get("chunk_surface_level"))
+            // The aquifer's `minEst` column comes from `aquifers.surface_level`
+            // (`minecraft:overworld/preliminary_surface_level`, the raw
+            // find_top_surface with cell_height 8). The noise router also carries
+            // a `chunk_surface_level`, but that is `interpolated(cell_size_xz=16)`
+            // wrapped around the same function - a different number, and not what
+            // NoiseBasedAquifer reads. Prefer the aquifers entry; keep the router
+            // key as a fallback for datapacks that only publish that one.
+            if let Some(aq) = ns
+                .get("aquifers")
+                .and_then(|a| a.get("surface_level"))
+                .or_else(|| router.and_then(|r| r.get("chunk_surface_level")))
                 .map(|v| v.str().to_string())
             {
                 g.prelim_df = g.resolve_ref(&files, &aq);

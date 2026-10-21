@@ -367,7 +367,19 @@ preliminary_surface_level = find_top_surface(cell_height=8, density=add(...))
 `minEst` は `f = clamp(minEst + 8 - y, 0, 64)` に入るので、14 の下振れは
 `aq_fluid_y` の 2 つの比較（`-0.3/0.8`, `-0.8/0.4`）を確実に跨ぐ。
 
-**次の一手**: `chunk_surface_level` を vanilla の DF codec で評価する小さな
-probe（`dyr.b` CODEC + `JsonOps` + resource lookup）を書き、同じ 256 列で
-`prelim_est` と数値比較する。ここが合えば aquifer 連鎖は全て vanilla と
-同じ入力を持つことになり、残差は 0 になるはず。
+補足（同日、bytecode で確認）:
+
+- aquifer が読むのは noise router の `chunk_surface_level` ではなく
+  **`aquifers.surface_level`**（= `preliminary_surface_level`、生の
+  `find_top_surface(cell_height=8)`）。前者は `interpolated(cell_size_xz=16)`
+  で包んだ別の値。mc-spine は router 側を読んでいたので
+  `aquifers.surface_level` 優先に直した（`eval` は `interpolated` を点評価する
+  ので今回の datapack では数値は不変 = md5 一致。意味の修正）。
+- 既定流体 picker（`dzb.a(dzd)` + `dzb.a(dyk$b,int,dyk$b,dyk$b,int,int,int)`）は
+  `y < min(-54, seaLevel) ? (-54, lava) : (seaLevel, water)`。
+  mc-spine の `aq_pick` と**一致**。`-54` はハードコードで正しい。
+
+**次の一手**: `prelim_est` を vanilla の DF codec で評価して 256 列を数値比較する
+（`JsonOps` + resource lookup が要るので小さな probe を 1 本書く）。ここが合えば
+aquifer 連鎖の入力は全て vanilla と同一になり、残りは vanilla 側の
+セルキャッシュ `r[]`/`s[]`（`a(III)` のスロット衝突）だけになる。
