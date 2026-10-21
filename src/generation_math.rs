@@ -236,6 +236,20 @@ pub(crate) fn java_hash(s: &str) -> i32 {
 
 // ---------- legacy java.util.Random LCG (population seeds, legacy noise) ----------
 
+/// Gameplay debugging aid: while this is non-zero, every `Lcg` draw is
+/// printed as `RNG <method> <value>` and the counter is decremented. Used to
+/// diff a carver's draw sequence against the vanilla probe's `DRAW` lines.
+pub(crate) static RNG_TRACE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn rtrace(name: &str, v: String) {
+    if RNG_TRACE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    RNG_TRACE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("RNG {name} {v}");
+}
+
 pub(crate) struct Lcg {
     seed: u64,
 }
@@ -249,7 +263,9 @@ impl Lcg {
         self.seed >> (48 - bits)
     }
     pub(crate) fn next_i32(&mut self) -> i32 {
-        self.nx(32) as u32 as i32
+        let v = self.nx(32) as u32 as i32;
+        rtrace("nextInt", v.to_string());
+        v
     }
     pub(crate) fn next_i64(&mut self) -> i64 {
         // `RandomSource`'s default `nextLong` is `(long)next(32) << 32 + next(32)`
@@ -260,10 +276,17 @@ impl Lcg {
         // the time.
         let hi = self.nx(32) as u32 as i32 as i64;
         let lo = self.nx(32) as u32 as i32 as i64;
-        (hi << 32).wrapping_add(lo)
+        let v = (hi << 32).wrapping_add(lo);
+        rtrace("nextLong", v.to_string());
+        v
     }
     // java nextInt(bound): power-of-2 fast path + rejection otherwise
     pub(crate) fn next_bound(&mut self, bound: i32) -> i32 {
+        let v = self.next_bound_raw(bound);
+        rtrace("nextInt", format!("{v} (bound {bound})"));
+        v
+    }
+    fn next_bound_raw(&mut self, bound: i32) -> i32 {
         if bound <= 0 {
             return 0;
         }
@@ -279,13 +302,20 @@ impl Lcg {
         }
     }
     pub(crate) fn next_f32(&mut self) -> f32 {
-        self.nx(24) as f32 * 5.960_464_5E-8
+        let v = self.nx(24) as f32 * 5.960_464_5E-8;
+        rtrace("nextFloat", format!("{v}"));
+        v
     }
     pub(crate) fn next_f64(&mut self) -> f64 {
-        ((self.nx(26) << 27).wrapping_add(self.nx(27)) as f64) * f64::from_bits(0x3CA0000000000000)
+        let v = ((self.nx(26) << 27).wrapping_add(self.nx(27)) as f64)
+            * f64::from_bits(0x3CA0000000000000);
+        rtrace("nextDouble", format!("{v}"));
+        v
     }
     pub(crate) fn next_bool(&mut self) -> bool {
-        self.nx(1) != 0
+        let v = self.nx(1) != 0;
+        rtrace("nextBoolean", v.to_string());
+        v
     }
     pub(crate) fn skip(&mut self, n: i32) {
         for _ in 0..n {

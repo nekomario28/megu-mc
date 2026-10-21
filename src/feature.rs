@@ -2063,6 +2063,12 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                     continue;
                 }
                 starts += 1;
+                if let Ok(spec) = std::env::var("CARVE_RNG") {
+                    if spec == format!("{ox},{oz}") || spec == "all" {
+                        crate::generation_math::RNG_TRACE
+                            .store(400, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 if std::env::var("CARVE_TRACE").is_ok() {
                     eprintln!("START target={tx},{tz} origin={ox},{oz} k={k} {name} ({biome})");
                 }

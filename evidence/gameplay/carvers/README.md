@@ -213,8 +213,14 @@ chunk (1,1):
 | | セル数 |
 |---|---|
 | vanilla のクラスを直接呼ぶ probe（all-stone、cave） | **401** |
-| mc-spine の同じ probe | 303（probe も同条件で 303） |
+| mc-spine の同じ probe | 303 |
 | vanilla の**実 world** が掘ったセル | **0** |
+
+注意: この probe は `dyk`（aquifer）を **proxy で渡している**（`CarverProbe.java`
+167 行、全メソッド null 返し = 「aquifer なし」）。したがって probe の 401 は
+**地形形状だけ**の値で、実世界の 0 は「vanilla の本物の aquifer が全て拒否した」
+ことしか言っていない。ただし同じ 2x2 の他のチャンクは 20/49/8 セル掘られており、
+(1,1) だけ 0 は設定（cave probability 0.15）依存の局所的なもの。
 
 start 集合も一致していた（36 origins、Java probe と完全一致）。つまり
 **同じ tunnel が、vanilla の実 world では 1 セルも掘られていない**。
@@ -261,8 +267,18 @@ vanilla は **2 本の DF（`u`, `v`）と `dem.a(DF,DF,ctx)`** という別の�
 ここが `deep` を決め、`deep` が true だとレベルが両方 -1 になって
 `calc_density` の溶岩/水分岐と barrier の符号が変わる。
 
-**次の一手**: `dyk$c` のコンストラクタで `u`/`v` にどの DF が入るか（noise router の
-どのキーか）と `dem.a(DF,DF,ctx)` の本体を読み、`aq_fluid_y` の `deep` を
-それに置き換える。`tools/vanilla-probe/` に aquifer 用の probe（NoiseChunk を
+※ `dem.a(DF,DF,ctx)` は `dze`（noise router）の `h()`/`i()` = **erosion / depth** を
+`< -0.225 && > 0.9` で見る述語だった。datapack の
+`noise_settings/overworld.json` の `aquifers.exclusion` は
+`min(-0.225 - erosion, depth - 0.9)` として**同じ述語を DF で表現**しており、
+mc-spine の `excl > 0.0` は等価（`min(a,b) > 0 ⟺ a>0 ∧ b>0`）。よってここも一致。
+
+**次の一手**: 残った候補は (a) aquifer の各 DF id の解決（barrier/flood/spread/lava/excl
+が意図した DF を指しているか。terrain は通るので大半は正しいはず）、(b)
+`aq_cell_fluid` に渡す座標が vanilla のセル原点（16/40/16 の倍数）と一致しているか、
+(c) `split`（セルごとの乱数位置）の導出。切り分けには draw 列の比較が使える:
+`CARVE_RNG="<ox>,<oz>"` で `Lcg` の全 draw を `RNG <method> <value>` として出し、
+`java -Dleg=1 -Donly=<ox>,<oz> -cp ... CarverProbe 0 <tx> <tz>` の `DRAW` 行と並べる
+（probe 側は `n[0] < 60` 件、こちらは 400 件で止まる）。`tools/vanilla-probe/` に aquifer 用の probe（NoiseChunk を
 Unsafe で確保し `computeSubstance` を直接叩く）を足せれば、セル単位で
 `aq_state` を突き合わせて即座に白黒つく。
