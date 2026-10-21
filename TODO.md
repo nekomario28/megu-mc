@@ -28,9 +28,17 @@
     残差 1450 セルの内訳と我々の判断は §7。`AQ_TRACE` で見ると
     sim12<0 経路は最近 2 セルの level がセンチネル、sim12>0 経路は level が
     両方 63（= `|Δ|=0` で calc 0）。よって残るのはセル流体の level そのもの。
-  - 最後の未検証入力は `prelim_est`（aquifer 専用）: chunk (1,1) で値が
-    {40,48,56} の 3 種のみ、実地表より平均 -12 低い。`chunk_surface_level` を
-    vanilla の DF codec で評価する probe を作り、256 列で数値比較するのが次の一手。
+  - `prelim_est` は §8 で**一致を確認済み**（1.21.1 は `dzc.a(long)` が
+    `initial_density_without_jaggedness > 0.390625` を 8 刻みで探す。datapack 側は
+    同じ式 + (-0.390625) で同値）。§9 のとおり datapack 自体は 1.21.2+ の
+    スキーマだが、依存値は同値。
+  - §10: 固定具の chunk (1,1) では vanilla の実 world が cave 由来 0 セル
+    （chunk 全体で 116）しか掘っておらず、probe の 401 セルは全て solid。
+    同じ固定具の (-3,0) は 2870 セル。**拒否率が chunk 依存**で、これが残差の実体。
+  - 次の一手: `NoiseChunk`(dzc) を組み立てて実物の `dyk$c` を作る probe を書き、
+    `computeSubstance` をセル単位で比較する（carve 経路はブロック座標、
+    terrain 経路は 4x8x4 格子座標で呼ばれる点と、`r[]`/`s[]` の共有状態が焦点）。
+  - 併せて: `datapacks/vanilla` を 1.21.1 の jar から再生成する（現状は 1.21.2+ 形式）。
   - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル（R1a の 49 セルを除く）。
 
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）

@@ -383,3 +383,67 @@ preliminary_surface_level = find_top_surface(cell_height=8, density=add(...))
 （`JsonOps` + resource lookup が要るので小さな probe を 1 本書く）。ここが合えば
 aquifer 連鎖の入力は全て vanilla と同一になり、残りは vanilla 側の
 セルキャッシュ `r[]`/`s[]`（`a(III)` のスロット衝突）だけになる。
+
+## 8. `prelim_est` は正しい（§7 の宿題を回収）
+
+1.21.1 の aquifer が読む地表は **コード**で計算される（データではない）。
+`dzc.a(long)`（= `getPreliminarySurfaceLevel`）の bytecode:
+
+```
+x,z = 4 ブロックに丸めた列;   y = minY + height;
+while (y >= minY) {
+    if (router.k().compute(ctx(x,y,z)) > 0.390625) return y;   // k() = initial_density_without_jaggedness
+    y -= 8;
+}
+return Integer.MAX_VALUE;
+```
+
+リポジトリの datapack（後述のとおり 1.21.1 のものではない）は同じものを
+DF で表現している:
+
+```
+preliminary_surface_level = find_top_surface(cell_height=8,
+    density = <1.21.1 の initial_density_without_jaggedness> + (-0.390625))
+```
+
+両者を式レベルで突き合わせた: 1.21.1 の
+`mul(depth, cache_2d(factor))` は、datapack 側の
+`mul(add(gradient(1.5@-64,-1.5@320), offset), factor)` と同値
+（`depth` の定義が `gradient + offset`、`cache_2d` は値を通すだけ）。
+したがって `prelim_est` の数値は vanilla と一致する。§7 の「14 低い」は
+`find_top_surface` が平滑化されることによるもので、ずれではない。
+
+## 9. リポジトリの vanilla datapack は 1.21.1 のものではない
+
+`datapacks/vanilla/.../noise_settings/overworld.json` は `aquifers: {...}` と
+`material_rule` を持ち、`noise_router` は 8 キー。一方 1.21.1 の jar の同じ
+ファイルは `aquifers_enabled`/`surface_rule` を持ち、router は 15 キー
+（`initial_density_without_jaggedness`, `barrier`, `lava`, ... を含む）。
+つまり**後方のバージョン（1.21.2+）のスキーマ**のデータが入っている。
+
+- 依存している値は同値であることを確認済み（§8 の地表、§6 の exclusion、
+  carver 3 種の JSON も 1.21.1 の既定と一致）。
+- ただし「1.21.1 の bytecode に合わせる」対象としては由来が違うので、
+  どこかの時点で 1.21.1 の jar から再生成するのが望ましい（TODO 化）。
+
+## 10. 残差の見え方が変わった: vanilla はこの chunk でほぼ何も掘っていない
+
+固定具（49 chunk）の実測:
+
+| chunk | cave probe（vanilla のクラスを直接呼ぶ） | vanilla の実 world が掘ったセル |
+|---|---|---|
+| (1,1) | 401 | **0**（cave 由来。chunk 全体でも 116） |
+| (-3,0) | — | 2870 |
+
+(1,1) の 401 セルは**全て solid**（air も fluid も 0）。つまり vanilla の
+本物の aquifer はこの chunk の cave セルを**全拒否**している。こちらの port は
+sim12<0 の早期 return で空気を返すため、ほぼ全部掘ってしまう。
+
+同じ 49 chunk の中で (-3,0) は 2870 セル掘れており、拒否率は chunk 依存。
+この「拒否率の差」が残差の実体で、次に必要なのは
+**実物の `NoiseChunk`（`dzc`）を持つ aquifer probe**。bytecode 上の鎖は
+§6〜§8 で全部一致を確認済みなので、残る違いは
+`dzc` のセル格子座標（aquifer が terrain 経路で 4x8x4 格子の座標で呼ばれる）
+と、carve 経路（ブロック座標）での `r[]`/`s[]` キャッシュの共有状態。
+probe では `dyk$c` を直接 new できない（`dzc` が要る）ため、
+`NoiseChunk` を組み立てる小さな harness が必要。
