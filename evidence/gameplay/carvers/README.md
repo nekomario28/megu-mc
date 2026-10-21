@@ -491,3 +491,44 @@ aquifer の論理そのものを疑うのは打ち切り。詳細は
 **次の一手**: 実物の `NoiseChunk`(`dzc`) を組み立てて `dyk$c` を作る probe。
 または固定具を作り直して（world を作る工程を 1 から記録しながら）116 セルの
 トンネルの出所を特定する。
+
+## 14. 高速固定具と、地形は bit-exact という新しい事実
+
+`tools/carver_fixture.sh` を改良した（1 サイクル **9 秒**）:
+
+- `CARVER_FIXTURE_X0/Z0` で chunk 原点を指定（spawn chunk を避けられる）。
+- `CARVER_FIXTURE_FRESH=1` で world の region/entities/poi を消してから生成
+  （`vanilla_nofeat_pack.py` が world 作成時に 1 回サーバを起動するため、
+  spawn 周辺が ctl pack より前に生成されるのを防ぐ）。
+- `trap ... EXIT` で repo の carver JSON を必ず復元（`| head` で殺されると
+  作業ツリーが汚れたままになっていた）。
+
+**新しい事実: 地形は bit-exact。** 3 carver すべてを `zero` にした固定具で
+`differing cells: 0`（4 chunk = 393216 セル）。つまり terrain + surface rule +
+aquifer の地形側の寄与は完全一致。残差は carve 段だけ。
+
+carver 別（既定 probability, 2x2 chunk）:
+
+| carver | 差分セル |
+|---|---|
+| canyon | **0** |
+| cave | 617 |
+| cave_extra_underground | 341 |
+
+aquifer のサンプル位置（12 セル）は Java 側で
+`RandomSource.fromSeed(0).nextPositionalRandomFactory().fromHashOf("aquifer")
+.nextPositionalRandomFactory()` から直接計算した値と**完全一致**
+（`tools/vanilla-probe/AquiferPos.java` と `AQ_POS="x,y,z"`）。
+`legacy_random_source: false` なので Xoroshiro。
+
+注意: 既存の `CarverProbe` は fake chunk を**全 stone**で埋めている。
+`#overworld_carver_replaceables` に air/water は入らないので、実際の chunk では
+空気/水のセルは `canReplaceBlock` が false になり掘れない。したがって
+「probe の 401 セル」は上限であって、world の実測とは一致しない。
+
+**次の一手**: `CarverProbe` の fake chunk を**実地形**（no-carve dump）で埋めて
+から carve させる。そうすると `canReplaceBlock` の挙動まで world と同じになり、
+probe がそのまま「本物の aquifer 抜きの oracle」として使える。
+その oracle と我々の出力を比べれば、残差が幾何（トンネル）か aquifer かを
+1 回で切り分けられる。dense 設定（cave probability 1.0）では既に 32023 セル差が
+出ており、信号としては十分。

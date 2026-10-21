@@ -2131,6 +2131,30 @@ impl Gen {
         }
     }
     // per-cell random sample position (16x12x16 grid, minecraft:aquifer deriver)
+    /// `AQ_POS="x,y,z"` prints the 12 sample positions for that query block,
+    /// for diffing against `tools/vanilla-probe/AquiferPos.java`.
+    fn aq_pos_trace(&mut self, x: i32, y: i32, z: i32) {
+        use std::sync::OnceLock;
+        static SPEC: OnceLock<Option<String>> = OnceLock::new();
+        let Some(spec) = SPEC.get_or_init(|| std::env::var("AQ_POS").ok()) else {
+            return;
+        };
+        if *spec != format!("{x},{y},{z}") {
+            return;
+        }
+        let (sx, sy, sz) = (lxz(x - 5), ly12(y + 1), lxz(z - 5));
+        for dx in 0..=1 {
+            for dy in -1..=1 {
+                for dz in 0..=1 {
+                    let (px, py, pz) = self.aq_rpos_c(sx + dx, sy + dy, sz + dz);
+                    eprintln!(
+                        "APOS {} {} {} {} {} {}",
+                        sx + dx, sy + dy, sz + dz, px, py, pz
+                    );
+                }
+            }
+        }
+    }
     fn aq_rpos(&self, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
         let mut r = self.aq.as_ref().unwrap().split.pos(gx, gy, gz);
         (
@@ -2462,6 +2486,7 @@ impl Gen {
     if def_blk == 2 {
         return Some(lava);
     }
+    g.aq_pos_trace(x, y, z);
     let near = g.aq_near4(x, y, z);
     let d = |p: (i32, i32, i32)| -> i64 {
         let (dx, dy, dz) = (p.0 - x, p.1 - y, p.2 - z);

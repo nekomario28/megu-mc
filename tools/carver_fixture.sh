@@ -10,6 +10,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="$1"; CAVE="$2"; EXTRA="$3"; CANYON="$4"; N="${5:-2}"
+# chunk origin (default 0,0). Use a region far from spawn to keep the world's
+# spawn-chunk generation (which runs before any ctl pack is installed) from
+# contaminating the fixture.
+X0="${CARVER_FIXTURE_X0:-0}"; Z0="${CARVER_FIXTURE_Z0:-0}"
 DIR="/tmp/carverfix-$TAG"
 REPO_CFG="$ROOT/datapacks/vanilla/data/minecraft/worldgen/configured_carver"
 
@@ -48,6 +52,11 @@ install_cfg cave "$CAVE"
 install_cfg cave_extra_underground "$EXTRA"
 install_cfg canyon "$CANYON"
 
+# Always put the repo's carver JSONs back: piping this script into `head` used to
+# kill it before the restore line and leave the working tree dirty.
+restore_repo() { cp /tmp/carver_backup/*.json "$REPO_CFG"/ 2>/dev/null || true; }
+trap restore_repo EXIT
+
 # the repo (mc-spine's data) must read the same files
 for pair in "cave:$CAVE" "cave_extra_underground:$EXTRA" "canyon:$CANYON"; do
   name="${pair%%:*}"; src="${pair#*:}"
@@ -60,14 +69,20 @@ done
 
 # force-load the chunk area and stop (run from the server dir: it reads its
 # properties, eula and world relative to the working directory)
-lo=$((-N*16)); hi=$((N*16-1))
-( cd "$DIR" && printf 'forceload add %d %d %d %d\nsave-all flush\nstop\n' "$lo" "$lo" "$hi" "$hi" \
+# `vanilla_nofeat_pack.py` starts the server once to create the world, so the
+# spawn area is generated *before* the ctl pack (and before any --keep-carvers
+# decision reaches the biomes) exists. Wipe those chunks so every chunk in the
+# fixture is generated with the final pack set.
+if [ -n "${CARVER_FIXTURE_FRESH:-}" ]; then
+  rm -rf "$DIR/world/region" "$DIR/world/entities" "$DIR/world/poi"
+fi
+lox=$((X0*16)); loz=$((Z0*16)); hix=$(((X0+N)*16-1)); hiz=$(((Z0+N)*16-1))
+( cd "$DIR" && printf 'forceload add %d %d %d %d\nsave-all flush\nstop\n' "$lox" "$loz" "$hix" "$hiz" \
   | timeout 240 systemd-run --scope --user -p MemoryMax=3G --unit="cf-$TAG-$$" \
       java -Xmx2G -Xms512M -jar server.jar nogui > run.log 2>&1 || true )
 
 cd "$ROOT"
 MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$DIR/dump.bin" MC_SPINE_WG_DUMP_N="$N" \
-  MC_SPINE_WG_DUMP_X=0 MC_SPINE_WG_DUMP_Z=0 MC_SPINE_NOFEAT=1 \
+  MC_SPINE_WG_DUMP_X="$X0" MC_SPINE_WG_DUMP_Z="$Z0" MC_SPINE_NOFEAT=1 \
   ./target/release/mc-spine >/dev/null 2>&1
-python3 tools/carver_diff.py "$DIR/dump.bin" "$DIR/world" --n "$N" --x0 0 --z0 0
-cp /tmp/carver_backup/*.json "$REPO_CFG"/
+python3 tools/carver_diff.py "$DIR/dump.bin" "$DIR/world" --n "$N" --x0 "$X0" --z0 "$Z0"

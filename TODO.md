@@ -44,6 +44,11 @@
     chunk (1,1) cave 401 セル中、一致 250 / こちらが余分 151 / vanilla だけが
     water 116（この 116 は我々のどの carver セットにも無い別トンネル）。
     固定具の生成条件を疑う段階。
+  - §14: 固定具を高速化（9 秒/サイクル、原点指定・region 削除・EXIT 復元）。
+    **carver 全部 zero で地形は 0 セル差 = bit-exact**。carver 別では
+    canyon 0 / cave 617 / extra 341。aquifer の 12 サンプル位置も Java 側の
+    直接計算と完全一致。次は `CarverProbe` の fake chunk を実地形で埋めて
+    「本物の aquifer 抜き oracle」にし、幾何か aquifer かを切り分ける。
   - 出口: `--keep-carvers` の vanilla 世界と block diff 0 セル（R1a の 49 セルを除く）。
 
 - [ ] **R3 チャンク生成の並列化**（M3 は 8 回中央値 x1.10、WARM=1 は x1.79 で未達）
