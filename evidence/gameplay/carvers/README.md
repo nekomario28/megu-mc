@@ -1109,3 +1109,42 @@ vanilla: toggle=0.4000649451503646 ridged=-0.02908584499032882 gap=-0.2872244962
 - port 側 `MC_SPINE_DFDUMP=x,y,z` → `DFDUMP ... final=.. vein=Some((t,r,g))`。
 - `~/.cache/mc-spine-work/mc121/` に server.txt と vineflower を置き、
   `java -jar vineflower-1.11.1.jar cls out` で任意クラスを読めるようにした。
+
+## 31. feature 配置の乱数は「legacy」だった（`WorldgenRandom` の 2 つの顔）
+
+地形と carver が 0 になったので feature 層（40975 / 4 chunk ≒ 10.4%/chunk）に着手。
+公式 mappings で `OreFeature` (`ecz`) と `OreConfiguration` (`eeq`) を逆コンパイルすると、
+配置ロジックはこちらの実装と一致していた（`size/8`、`ceil((size/16*2+1)/2)`、
+`nextDouble()*size/16`、`(sin+1)*d+1)/2`、さらに `BitSet` の cell 訪問）。
+
+ずれは**乱数**だった。`WorldgenRandom` (`dzx`) は Xoroshiro を包むが、
+`dyn`（RandomSource）の **legacy な draw** を実装している:
+
+```java
+public int c(int bits) { count++; return d instanceof dyz l ? l.c(bits) : (int)(d.g() >>> 64 - bits); }
+// dyn の default: nextInt(bound) = (bound * next(31)) >> 31 / rejection, nextInt() = next(32),
+//                nextDouble() = ((next(26)<<27)+next(27))*2^-53, nextBoolean() = next(1)
+```
+
+こちらは `Xor` に modern `RandomGenerator` の形（low word の Lemire）を実装していたため、
+**ore の origin が 242/242 すべて違っていた**（個数と size 分布は完全一致）。
+
+計測は 3 つで足りた:
+
+- エージェント: `WorldgenRandom.setDecorationSeed`/`setFeatureSeed` をフックして
+  `FSEED <decoSeed> <i> <step>`、`OreFeature.place` で `ORE x y z size`、
+  `XoroshiroRandomSource` の生 draw は `XDRAW`（`c(int)` が無いので `a(I)I`/`f()I`）
+- port: `FSEED_TRACE` / `ORE_TRACE` / `FSEED_ARM=cx,cz,i,step` で同じ値を出力
+- `FSEED` の列は step 6（underground_ores）で**完全一致** → seed は正しい、と切り分けられた
+
+`Xor` に `seed_worldgen()`（legacy フラグ）を足して feature 配置だけ legacy に切り替えると:
+
+| | 前 | 後 |
+|---|---|---|
+| ore origin 一致 | 0 / 242 | 37 / 242（最初の 3 つは完全一致） |
+| feature あり 2×2 diff | 40975 | **34679** |
+| chunk (0,0) 単体 | 10177 | **4908** |
+
+残りは feature ごとの差（`FSEED`→`ORE` の対応付けは「配置 0 個の feature」で
+ずれるので、次は ORE ログに feature id を付けて比較する）。biome の feature リストも
+step 2/9/10 で差が出ている（1.21.2+ データの残り）。

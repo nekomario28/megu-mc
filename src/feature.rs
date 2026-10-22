@@ -781,6 +781,13 @@ fn gen_ore(
     targets: &[(RT, u32)],
     scattered: bool,
 ) {
+    if let Ok(spec) = std::env::var("ORE_TRACE") {
+        if let Some((a, b)) = spec.split_once(',') {
+            if a.parse::<i32>() == Ok(pos.0 >> 4) && b.parse::<i32>() == Ok(pos.2 >> 4) {
+                eprintln!("ORE {} {} {} size={} scattered={}", pos.0, pos.1, pos.2, size, scattered);
+            }
+        }
+    }
             if scattered {
                 let count = rng.next_bound(size + 1);
                 for i in 0..count {
@@ -2548,7 +2555,21 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             let deco = pop
                 .wrapping_add(*gi as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));
-            let mut rng = Xor::seed(deco);
+            // feature placement sees a `WorldgenRandom` (legacy draw semantics)
+            let mut rng = Xor::seed_worldgen(deco);
+            if let Ok(spec) = std::env::var("FSEED_ARM") {
+                if spec == format!("{sx},{sz},{gi},{step}") {
+                    crate::generation_math::XTRACE
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if let Ok(spec) = std::env::var("FSEED_TRACE") {
+                if let Some((a, b)) = spec.split_once(',') {
+                    if a.parse::<i32>() == Ok(sx) && b.parse::<i32>() == Ok(sz) {
+                        eprintln!("FSEED {pop} {gi} {step}");
+                    }
+                }
+            }
             let before = ctx.wr.len();
             let t0 = if profile { Some(std::time::Instant::now()) } else { None };
             gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));

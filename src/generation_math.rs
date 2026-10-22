@@ -103,10 +103,28 @@ pub(crate) fn mth_cos(v: f32) -> f32 {
     sin_table()[(v * SIN_STEPS + 16384.0) as i32 as usize & 65535]
 }
 
+/// Env-gated draw trace for feature placement (`FSEED_ARM=i,step`).
+pub(crate) static XTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn xtrace(kind: &str, arg: i64, val: i64) {
+    let n = XTRACE.load(std::sync::atomic::Ordering::Relaxed);
+    if n < 0 {
+        return;
+    }
+    eprintln!("XDRAW {n} bound={arg} -> {val} ({kind})");
+    XTRACE.store(if n + 1 >= 16 { -1 } else { n + 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) struct Xor {
     lo: u64,
     hi: u64,
     g: Option<f64>,
+    /// `WorldgenRandom` wraps a source but implements `dyn`'s *legacy* draws:
+    /// `nextInt()` is `next(32)` (top bits), `nextInt(bound)` is the
+    /// multiply-shift on `next(31)`, `nextLong()` is two `next(32)` calls.
+    /// The raw Xoroshiro source (aquifer/vein sampling) uses the modern
+    /// `RandomGenerator` forms instead, so both flavours are needed.
+    legacy: bool,
 }
 impl Xor {
     pub(crate) fn seed(seed: u64) -> Self {
@@ -114,13 +132,18 @@ impl Xor {
         let m = l.wrapping_add(0x9E3779B97F4A7C15);
         Self::raw(stafford13(l), stafford13(m))
     }
+    pub(crate) fn seed_worldgen(seed: u64) -> Self {
+        let mut x = Self::seed(seed);
+        x.legacy = true;
+        x
+    }
     pub(crate) const fn raw(lo: u64, hi: u64) -> Self {
         let (lo, hi) = if (lo | hi) == 0 {
             (0x9E3779B97F4A7C15, 0x6A09E667F3BCC909)
         } else {
             (lo, hi)
         };
-        Xor { lo, hi, g: None }
+        Xor { lo, hi, g: None, legacy: false }
     }
     pub(crate) fn next_long(&mut self) -> u64 {
         let l = self.lo;
@@ -134,10 +157,40 @@ impl Xor {
     pub(crate) fn next(&mut self, bits: u32) -> u64 {
         self.next_long() >> (64 - bits)
     }
+    /// `WorldgenRandom`-style `nextLong()`: two `next(32)` calls, sign-extended.
+    pub(crate) fn next_i64_legacy(&mut self) -> i64 {
+        let hi = self.next(32) as u32 as i32 as i64;
+        let lo = self.next(32) as u32 as i32 as i64;
+        (hi << 32).wrapping_add(lo)
+    }
     pub(crate) fn next_i32(&mut self) -> i32 {
-        self.next_long() as i32
+        if self.legacy {
+            // `dyn`'s default `nextInt()` is `next(32)`, i.e. the top word.
+            self.next(32) as i32
+        } else {
+            self.next_long() as i32
+        }
     }
     pub(crate) fn next_bound(&mut self, bound: i32) -> i32 {
+        let v = self.next_bound_raw(bound);
+        xtrace("nextInt", bound as i64, v as i64);
+        v
+    }
+    fn next_bound_raw(&mut self, bound: i32) -> i32 {
+        if self.legacy {
+            // `dyn.a(int)` (the default WorldgenRandom inherits):
+            // power-of-two -> (bound * next(31)) >> 31, else rejection on next(31).
+            if bound > 0 && (bound & (bound - 1)) == 0 {
+                return ((bound as i64).wrapping_mul(self.next(31) as i64) >> 31) as i32;
+            }
+            loop {
+                let bits = self.next(31) as i32;
+                let val = bits % bound;
+                if bits.wrapping_sub(val).wrapping_add(bound - 1) >= 0 {
+                    return val;
+                }
+            }
+        }
         // RandomGenerator.nextInt(bound): Lemire multiply-high + rejection
         let mut l = (self.next_i32() as u64) & 0xFFFF_FFFF;
         let mut m = l.wrapping_mul(bound as u64);
@@ -153,13 +206,25 @@ impl Xor {
         (m >> 32) as i32
     }
     pub(crate) fn next_f64(&mut self) -> f64 {
-        (self.next_long() >> 11) as f64 * f64::from_bits(0x3CA0000000000000) // 2^-53
+        if self.legacy {
+            // `dyn`'s default: ((next(26) << 27) + next(27)) * 2^-53
+            let hi = self.next(26) as i64;
+            let lo = self.next(27) as i64;
+            ((hi << 27).wrapping_add(lo)) as f64 * f64::from_bits(0x3CA0000000000000)
+        } else {
+            (self.next_long() >> 11) as f64 * f64::from_bits(0x3CA0000000000000) // 2^-53
+        }
     }
     pub(crate) fn next_f32(&mut self) -> f32 {
         self.next(24) as f32 * 5.960_464_5E-8
     }
     pub(crate) fn next_bool(&mut self) -> bool {
-        (self.next_long() & 1) != 0
+        if self.legacy {
+            // `dyn`'s default `nextBoolean()` is `next(1) != 0`, i.e. the top bit.
+            self.next(1) != 0
+        } else {
+            (self.next_long() & 1) != 0
+        }
     }
     // nextInbetween inclusive: next_bounded(max-min+1)+min
     pub(crate) fn next_inbetween(&mut self, min: i32, max: i32) -> i32 {

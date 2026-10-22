@@ -3427,7 +3427,14 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // Cave-only and all-carver 2x2 fixtures at (0,0) went 617 / 617+341 ->
         // 0 differing cells against vanilla, so this capture records the
         // corrected (vanilla-matching) carving output.
-        assert_eq!(digest, "48efe93ece4bf9e4652dd93931362151",
+        // 2026-10-22: feature placement now draws from a `WorldgenRandom`, which
+        // wraps the Xoroshiro source but implements `dyn`'s *legacy* draws
+        // (`nextInt(bound)` = multiply-shift on `next(31)`, `nextInt()` = the top
+        // word, `nextDouble()` = two draws). The modern `RandomGenerator` forms
+        // put every ore blob somewhere else: 242/242 origins differed. With the
+        // legacy flavour the first origins match vanilla exactly and the 2x2
+        // feature-on diff at (0,0) drops 40975 -> 34679.
+        assert_eq!(digest, "44a455d03763afcc6bfb58ac02a0ffe1",
             "feature population output changed from the vanilla-order capture");
     }
 

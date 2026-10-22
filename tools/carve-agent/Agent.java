@@ -232,6 +232,119 @@ public class Agent {
         }
     }
 
+    /** XoroshiroRandomSource: the typed draws (it has no `c(int)` funnel). */
+    static byte[] instrumentXorDraws(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (mn.equals("a") && md.equals("(I)I")) return drawLog(mv, 4, true);
+                    if (mn.equals("f") && md.equals("()I")) return drawLog(mv, 0, false);
+                    return mv;
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT xor draws failed: " + t);
+            return null;
+        }
+    }
+
+    /** Wrap IRETURN: log (bound, value) then return it. */
+    static MethodVisitor drawLog(MethodVisitor mv, int argSlot, boolean hasArg) {
+        return new MethodVisitor(Opcodes.ASM9, mv) {
+            @Override public void visitInsn(int op) {
+                if (op != Opcodes.IRETURN) { super.visitInsn(op); return; }
+                super.visitVarInsn(Opcodes.ISTORE, 40);
+                if (hasArg) super.visitVarInsn(Opcodes.ILOAD, argSlot);
+                else super.visitInsn(Opcodes.ICONST_0);
+                super.visitInsn(Opcodes.I2L);
+                super.visitVarInsn(Opcodes.ILOAD, 40);
+                super.visitInsn(Opcodes.I2L);
+                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdraw2", "(JJ)V", false);
+                super.visitVarInsn(Opcodes.ILOAD, 40);
+                super.visitInsn(op);
+            }
+        };
+    }
+
+    /** setDecorationSeed / setFeatureSeed: log the per-feature seeding of a chunk. */
+    static byte[] instrumentSeeds(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (mn.equals("a") && md.equals("(JII)J")) {
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.ILOAD, 3);
+                                super.visitVarInsn(Opcodes.ILOAD, 4);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "deco", "(II)V", false);
+                            }
+                        };
+                    }
+                    if (mn.equals("b") && md.equals("(JII)V")) {
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.LLOAD, 1);
+                                super.visitVarInsn(Opcodes.ILOAD, 3);
+                                super.visitVarInsn(Opcodes.ILOAD, 4);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "fseed", "(JII)V", false);
+                            }
+                        };
+                    }
+                    return mv;
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT seeds failed: " + t);
+            return null;
+        }
+    }
+
+    /** OreFeature.place: log the origin and size of every blob in a chunk. */
+    static byte[] instrumentOre(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals("(Lecg;)Z")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            for (String g : new String[] {"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 1);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ecg", "e", "()Ljd;", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                            }
+                            super.visitVarInsn(Opcodes.ALOAD, 1);
+                            super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ecg", "f", "()Leei;", false);
+                            super.visitTypeInsn(Opcodes.CHECKCAST, "eeq");
+                            super.visitFieldInsn(Opcodes.GETFIELD, "eeq", "c", "I");
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "ore", "(IIII)V", false);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT ore failed: " + t);
+            return null;
+        }
+    }
+
     /**
      * OreVeinifier: log the three density-function values the sampler reads.
      * The synthetic lambda is `a(dyr toggle, dtc terrain, dzl factory,
@@ -335,8 +448,13 @@ public class Agent {
             if ("ebe".equals(name) && buf != null && hasTunnel(buf)) return instrumentTunnel(buf);
             if ("ebe".equals(name)) return instrumentCarveState(buf);
             if ("dzi".equals(name)) return instrumentVein(buf);
-            if ("dzx".equals(name)) return instrumentRSeed(buf);
+            if ("ecz".equals(name)) return instrumentOre(buf);
+            if ("dzx".equals(name)) {
+                byte[] b = instrumentSeeds(buf);
+                return instrumentRSeed(b != null ? b : buf);
+            }
             if ("dyz".equals(name)) return instrumentBits(buf);
+            if ("dzz".equals(name)) return instrumentXorDraws(buf);
             if (!"dzb".equals(name)) return null;
             try {
                 ClassReader cr = new ClassReader(buf);

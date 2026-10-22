@@ -32,10 +32,56 @@ public class CarveLog {
         RD.get()[1] = 0;
     }
 
+    static final ThreadLocal<int[]> CHUNK = new ThreadLocal<int[]>() {
+        @Override protected int[] initialValue() { return new int[] { Integer.MIN_VALUE, 0 }; }
+    };
+
+    /** setDecorationSeed(seed, x, z): remember which chunk is being decorated. */
+    public static void deco(int x, int z) {
+        CHUNK.get()[0] = x >> 4;
+        CHUNK.get()[1] = z >> 4;
+    }
+
+    /** setFeatureSeed(seed, i, step): log the (i, step) pair for the target chunk. */
+    public static void fseed(long seed, int i, int step) {
+        String p = System.getProperty("fseedchunk");
+        if (p == null) return;
+        String[] a = p.split(",");
+        if (a.length != 2) return;
+        int[] c = CHUNK.get();
+        if (c[0] != Integer.parseInt(a[0]) || c[1] != Integer.parseInt(a[1])) return;
+        System.out.println("FSEED " + seed + " " + i + " " + step);
+        String arm = System.getProperty("fseedarm");
+        if (arm != null && arm.equals(i + "," + step)) {
+            RD.get()[0] = 1;
+            RD.get()[1] = 0;
+        }
+    }
+
+    /** OreFeature origins: `-Dorechunk=cx,cz` limits the log to one chunk. */
+    public static void ore(int x, int y, int z, int size) {
+        String p = System.getProperty("orechunk");
+        if (p == null) return;
+        String[] a = p.split(",");
+        if (a.length != 2) return;
+        if ((x >> 4) == Integer.parseInt(a[0]) && (z >> 4) == Integer.parseInt(a[1])) {
+            System.out.println("ORE " + x + " " + y + " " + z + " size=" + size);
+        }
+    }
+
     /** Gate for -Dveindump=x,y,z: which cells the vein sampler should report. */
     public static boolean vwant(int x, int y, int z) {
         String p = System.getProperty("veindump");
         return p != null && p.equals(x + "," + y + "," + z);
+    }
+
+    /** Bound (0 = nextInt()) and value of one Xoroshiro draw. */
+    public static void rdraw2(long bound, long val) {
+        int[] st = RD.get();
+        if (st[0] != 1) return;
+        int i = st[1]++;
+        if (i >= 16) { st[0] = -1; return; }
+        System.out.println("XDRAW " + i + " bound=" + bound + " -> " + val);
     }
 
     /** The three density functions OreVeinifier samples for one cell. */
