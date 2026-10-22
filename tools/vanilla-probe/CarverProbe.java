@@ -116,10 +116,13 @@ public class CarverProbe {
         boolean canyon = System.getProperty("canyon") != null;
         boolean extra = System.getProperty("extra") != null;
         String yc = System.getProperty("yconst");
+        // `minecraft:uniform` is `eia` in 1.21.1: one nextInt(max - min + 1)
+        // through Mth.randomBetweenInclusive. `ehv` is the *trapezoid* provider
+        // and draws twice; using it here shifts every later carver draw.
         ehx yp = yc == null
-                ? (canyon ? ehv.a(dzs.a(10), dzs.a(67), 1)
-                          : (extra ? ehv.a(dzs.b(8), dzs.a(47), 1)
-                                   : ehv.a(dzs.b(8), dzs.a(180), 1)))
+                ? (canyon ? eia.a(dzs.a(10), dzs.a(67))
+                          : (extra ? eia.a(dzs.b(8), dzs.a(47))
+                                   : eia.a(dzs.b(8), dzs.a(180))))
                 : ehw.a(dzs.a(Integer.parseInt(yc)));
         eax cfg;
         if (canyon) {

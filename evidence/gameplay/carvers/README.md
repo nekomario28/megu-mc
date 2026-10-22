@@ -887,3 +887,28 @@ draw が 1 つずれると yaw/pitch/yScale/count/seed が全部ずれ、トン�
 carver の出力（air を掘る）ではなく state 1↔2 の入れ替わりなので別件として追う。
 
 probe (`CarverProbe`) は今も `ehv` で組んでいるので `eia`/`ayo.b` に直す必要がある（TODO）。
+
+### 25.1 他の carver と probe の修正
+
+probe を `eia.a(...)` に直したところ、サーバーの生ストリームと完全一致した:
+
+```
+a(15)  -> 7      a(8) -> 7      a(8) -> 3
+a(16)  -> 4      // x = 20
+a(237) -> 90     // y = 90 - 56 = 34   ← ATUN と一致
+a(16)  -> 7      // z = -48 + 7 = -41  ← ATUN と一致
+i()    -> 0.13620782   i() -> 0.07097554
+```
+
+固定具の結果（すべて 2×2 at (0,0)、band y=-64..319）:
+
+| 固定具 | 結果 |
+|---|---|
+| cave only | **0** |
+| cave_extra only | **0** |
+| canyon（jar の probability 0.01） | 0（この 4 chunk では start が無く、空の比較） |
+| canyon probability 1.0（強制 start） | **1** セル（`deep`、got air / want `stripped_mangrove_wood`） |
+| 全 carver | **0** |
+
+canyon の JSON は `debug_settings`（air_state = warped_button）を持っており、
+port はそれを含めて一致している（4 chunk を canyon で埋めて 1 セルだけ違う）。
