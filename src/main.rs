@@ -14607,6 +14607,12 @@ fn main() {
             let _ = c.surface(0, 0);
         }}
         eprintln!("[wgprof] {}x{} chunks in {:?} ({:.1} ms/chunk)", n, n, t0.elapsed(), t0.elapsed().as_secs_f64()*1000.0/(n*n) as f64);
+        {
+            let c = worldgen::EVAL_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if c > 0 {
+                eprintln!("[wgprof] eval_c calls: {} ({:.0} per chunk)", c, c as f64 / (n * n) as f64);
+            }
+        }
         if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP") {
             // Offline block dump for parity diffs: `MC_SPINE_WG_DUMP_N` chunks per
             // side from (0,0), each section in the send layout `(ly<<8)|(lz<<4)|lx`.

@@ -292,6 +292,11 @@ fn aq_trace_at(x: i32, z: i32) -> bool {
     matches!(spec, Some((cx, cz)) if *cx == x >> 4 && *cz == z >> 4)
 }
 
+/// Diagnostics: `WG_COUNT=1` prints how many density-function nodes one chunk
+/// walks. Measured 2026-10-22: ~1.6M calls per chunk, which is where the
+/// per-chunk time goes (see evidence/foundation/performance/README.md).
+pub(crate) static EVAL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Gen {
     fn df_files() -> HashMap<String, Vec<u8>> {
         Self::dp_files("density_function")
@@ -955,6 +960,12 @@ impl Gen {
     /// NoiseChunk). While the grids are being filled `cc` is None, which is a
     /// corner sample.
     fn eval_c(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut HashMap<(usize, i32, i32, i32), f64>, cc: Option<&ChunkCols>) -> f64 {
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var_os("WG_COUNT").is_some()) {
+                EVAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if let Some(cc) = cc {
             if let DF::Interp(inner) = self.dfs[id] {
                 if let Some(v) = cc.interp(id, x, y, z) {
