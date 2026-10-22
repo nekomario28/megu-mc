@@ -1221,3 +1221,24 @@ BlockPos.betweenClosed(base.offset(-r,-r,-r), base.offset(r,r,r))
 
 で、**箱の全セルで nextFloat を引いてから** 包囲判定。修正後は陸地で 0 セルになり、
 feature あり 2×2 の diff は 3472 → **2188**（1 chunk あたり ~550 = 0.56%）。
+
+## 34. 木が 1 本も生えない理由: placed_feature の版ずれ
+
+feature ありの残差から木（leaves/log 約 750 セル）を調べると、chunk (0,0) の
+step 9 で `trees_birch_and_oak` が **+0 writes** だった。biome の feature リストは
+1.21.1 の jar から取り直してある（`forest` の step 9 に `trees_birch_and_oak`）が、
+
+- 同梱の `placed_feature/` は 1.21.2+ の名前で、`trees_birch_and_oak.json` が無く
+  `trees_birch_and_oak_leaf_litter.json` だけがあった
+- したがって `fr.placed.get("minecraft:trees_birch_and_oak")` が None になり、
+  **黙ってスキップ**されていた
+
+`placed_feature/` を 1.21.1 の jar から上書き（234 ファイル）すると木が走り出す。
+feature あり 2×2 の diff は 2188 → **2062**。
+
+**ただし** `feature/`（configured feature）は 1.21.2+ の形のままで、1.21.1 の
+`{"type":"minecraft:tree","config":{...}}` とは構造が違う（こちらは `config` 無しで
+`foliage_provider` が `{"id":...}`）。1.21.1 の configured_feature をそのまま
+上書きすると逆に 24063 まで悪化する（ore の `targets.state` が `{"Name":...}` 形式に
+なるため）。木・disk を仕上げるには **configured_feature の 1.21.1 化 + パーサの
+両対応**が必要で、これは次の作業単位。

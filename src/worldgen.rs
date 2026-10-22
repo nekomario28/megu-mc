@@ -3450,7 +3450,12 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // Column.scan (the origin must be water) and enclosure test, so a land
         // chunk no longer receives magma at all. 2x2 feature-on diff: 3472 ->
         // 2188 cells.
-        assert_eq!(digest, "3b65881fc05eea084a0474d3d934d5c0",
+        // 2026-10-22: the placed-feature definitions are now the 1.21.1 jar's
+        // (the bundled set was 1.21.2+ and, for example, referenced
+        // `trees_birch_and_oak_leaf_litter` while the 1.21.1 biomes reference
+        // `trees_birch_and_oak`, so every forest tree was silently skipped).
+        // 2x2 feature-on diff: 2188 -> 2062.
+        assert_eq!(digest, "c1859cd281c1f5056b5b97243953637d",
             "feature population output changed from the vanilla-order capture");
     }
 
