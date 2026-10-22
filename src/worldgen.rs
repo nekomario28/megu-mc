@@ -453,13 +453,7 @@ impl Gen {
         g.final_density = idx;
         // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
         // from three router functions; 1.21.2+ moved them into a material rule.
-        // The sampler reproduces `OreVeinSampler`'s control flow but still
-        // disagrees with vanilla on which cells survive its gates (34 granite
-        // against 44 for chunk (-3,3), versus 48 for the 1.21.2 material rule),
-        // so it stays opt-in until that is resolved.
-        if jbool(&ns, "ore_veins_enabled", false)
-            && matches!(std::env::var("MC_SPINE_OREVEIN").as_deref(), Ok("sampler"))
-        {
+        if jbool(&ns, "ore_veins_enabled", false) {
             let get = |k: &str| router.and_then(|r| r.get(k)).cloned();
             if let (Some(a), Some(b), Some(c)) =
                 (get("vein_toggle"), get("vein_ridged"), get("vein_gap"))
@@ -1668,6 +1662,16 @@ pub fn init(seed: u64, res: fn(&str) -> Option<u32>) -> bool {
         None => false,
     }
 }
+/// `MC_SPINE_DFDUMP=x,y,z` diagnostic: print the vein-sampler inputs.
+pub fn dfdump(spec: &str) {
+    let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
+    if p.len() != 3 {
+        return;
+    }
+    if let Some(g) = GEN.lock().unwrap().as_mut() {
+        g.dump_dfs(p[0], p[1], p[2]);
+    }
+}
 pub fn enabled() -> bool {
     GEN.lock().unwrap().is_some()
 }
@@ -1891,6 +1895,24 @@ impl Gen {
         }
     }
 
+    /// `MC_SPINE_DFDUMP=x,y,z`: print the four density functions the vein
+    /// sampler's caller passes, for comparison with the live server.
+    pub(crate) fn dump_dfs(&mut self, x: i32, y: i32, z: i32) {
+        let mut memo = std::mem::take(&mut self.memo);
+        let cc = self.cols(x >> 4, z >> 4);
+        let ccr = cc.as_deref();
+        let fd = self.eval_c(self.final_density, x, y, z, &mut memo, ccr);
+        let v = self.vein.map(|v| {
+            (
+                self.eval_c(v.toggle, x, y, z, &mut memo, ccr),
+                self.eval_c(v.ridged, x, y, z, &mut memo, ccr),
+                self.eval_c(v.gap, x, y, z, &mut memo, ccr),
+            )
+        });
+        self.memo = memo;
+        eprintln!("DFDUMP {x} {y} {z} final={fd:.6} vein={v:?}");
+    }
+
     /// 1.21.1 `OreVeinSampler` (`dzi` in the obfuscated jar). The terrain state
     /// is overridden where a vein is present:
     ///
@@ -1966,10 +1988,13 @@ impl Gen {
             if at + roundoff < 0.4 {
                 None
             } else {
-                // `RandomState.at(x,y,z)` derives from the seed source's
-                // `forkPositional()`, which is the Xoroshiro factory here (the
-                // aquifer's own sample positions were verified against it).
-                let mut r = self.factory.pos(x, y, z);
+                // `RandomState` builds `this.g = this.a.fromHashOf("ore")
+                // .forkPositional()` and hands *that* to OreVeinifier, not the
+                // base factory (decompiled dzm: `this.g = this.a.a(akr.b("ore")).e()`).
+                let mut r = match self.ore_split.as_ref() {
+                    Some(f) => f.pos(x, y, z),
+                    None => self.factory.pos(x, y, z),
+                };
                 let r1 = r.next_f32();
                 if dbg {
                     eprintln!("VEIN   up={up} down={down} at={at:.4} round={roundoff:.4} r1={r1:.4}");

@@ -14613,6 +14613,9 @@ fn main() {
                 eprintln!("[wgprof] eval_c calls: {} ({:.0} per chunk)", c, c as f64 / (n * n) as f64);
             }
         }
+        if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {
+            worldgen::dfdump(&spec);
+        }
         if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP") {
             // Offline block dump for parity diffs: `MC_SPINE_WG_DUMP_N` chunks per
             // side from (0,0), each section in the send layout `(ly<<8)|(lz<<4)|lx`.
@@ -14835,6 +14838,9 @@ fn main() {
         if worldgen::init(wg_seed, name_to_state) {
             *WORLD_SPAWN.lock().unwrap() = (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5);
             eprintln!("[wg] vanilla datapack worldgen active (seed {})", wg_seed);
+            if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {
+                worldgen::dfdump(&spec);
+            }
         } else {
             eprintln!("[wg] worldgen datapack missing — flat generator");
         }

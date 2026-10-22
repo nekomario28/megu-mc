@@ -1056,3 +1056,56 @@ material rule（差 10 セル）で、sampler は opt-in のまま。
 固定具を 1 回流しただけで消える**（今回それで `ore_veins_enabled` が消え、
 sampler が `vein=None` になって既定と同じ 48 を出した）。データ変更は
 コミットしてから測る。
+
+## 30. 解決: 公式 mappings + 逆コンパイルで最後の 1 点 = "ore" positional factory
+
+Mojang は 1.21.1 の server mappings を公開している
+（`piston-data.mojang.com/v1/objects/03f898.../server.txt`、7.4 MB）。
+これを Vineflower 1.11.1 で当てて `dzi` を逆コンパイルすると `OreVeinifier` で、
+**bytecode から読んだ擬似コードと行単位で一致**した（定数 0.4 / 20 / −0.2 / 0.7 /
+0.1 / 0.3 / 0.6 / 0.02 / −0.3 も一致）。mappings で `dzi = OreVeinifier`、
+`dzi$a = VeinType`、`dze = NoiseRouter`（`veinToggle = n` / `veinRidged = o` /
+`veinGap = p`）も確定。
+
+残りの不一致は **乱数**だった。`RandomState` (`dzm`) の逆コンパイル:
+
+```java
+this.a = settings.getRandomSource().newInstance(seed).forkPositional();
+this.f = this.a.fromHashOf(ResourceLocation("aquifer")).forkPositional();  // d()
+this.g = this.a.fromHashOf(ResourceLocation("ore")).forkPositional();      // e()
+```
+
+`NoiseChunk` は `OreVeinifier.create(toggle, ridged, gap, randomState.e())` と、
+**"ore" から派生した positional factory** を渡す。こちらは base factory を使っていた。
+
+決め手はエージェントで `OreVeinifier` の lambda をフックして 3 つの DF 値を実測した
+こと（`-Dveindump=x,y,z`）。(-36,27,62) で
+
+```
+vanilla: toggle=0.4000649451503646 ridged=-0.02908584499032882 gap=-0.2872244962433405
+こちら:  toggle=0.4000649451503646 ridged=-0.029085844990328805 gap=-0.2872244962433405
+```
+
+と**入力は完全一致**（ridge は 1 ULP 差）→ 疑うべきは乱数だけ、と絞れた。
+
+`self.factory.of_str("minecraft:ore").splitter().pos(x, y, z)` に直した結果:
+
+| 固定具 | 修正前 | 修正後 |
+|---|---|---|
+| chunk (-3,3) 単体 | 10 | **0** |
+| (-3,3) 2×2 | 48 | **0** |
+| 8×8 spawn 周辺（比較 42 chunk） | 52 | **4**（すべて §27 の tick する水） |
+| cave only 2×2 (0,0) | 0 | **0** |
+
+これで **world 比較の残差は「サーバーが tick した水」だけ**。1.21.2 の
+`material_rule/overworld/copper_ore_vein.json` 側は、sampler が有効なとき
+`Rule::OreVein` を解決しないことで無効化している。
+
+### 追加した計測器
+
+- `tools/carve-agent`: `dzi` の lambda をフックし `-Dveindump=x,y,z` で
+  toggle/ridged/gap を出力（`VDUMP`）。クラッシュ時の `VerifyError` は
+  `vdump(IIIDDD)` の引数順（double を先に積んでいた）が原因だった。
+- port 側 `MC_SPINE_DFDUMP=x,y,z` → `DFDUMP ... final=.. vein=Some((t,r,g))`。
+- `~/.cache/mc-spine-work/mc121/` に server.txt と vineflower を置き、
+  `java -jar vineflower-1.11.1.jar cls out` で任意クラスを読めるようにした。

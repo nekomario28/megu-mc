@@ -32,6 +32,17 @@ public class CarveLog {
         RD.get()[1] = 0;
     }
 
+    /** Gate for -Dveindump=x,y,z: which cells the vein sampler should report. */
+    public static boolean vwant(int x, int y, int z) {
+        String p = System.getProperty("veindump");
+        return p != null && p.equals(x + "," + y + "," + z);
+    }
+
+    /** The three density functions OreVeinifier samples for one cell. */
+    public static void vdump(int x, int y, int z, double t, double r, double g) {
+        System.out.println("VDUMP " + x + " " + y + " " + z + " toggle=" + t + " ridged=" + r + " gap=" + g);
+    }
+
     /** dyz.c(int) is the single funnel every dyn draw goes through. */
     public static void rbits(long bits, long val) {
         int[] st = RD.get();

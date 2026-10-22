@@ -232,6 +232,62 @@ public class Agent {
         }
     }
 
+    /**
+     * OreVeinifier: log the three density-function values the sampler reads.
+     * The synthetic lambda is `a(dyr toggle, dtc terrain, dzl factory,
+     * dyr ridged, dyr gap, dyr$b ctx)`.
+     */
+    static byte[] instrumentVein(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals("(Ldyr;Ldtc;Ldzl;Ldyr;Ldyr;Ldyr$b;)Ldtc;")) {
+                        return mv;
+                    }
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            Label skip = new Label();
+                            // ctx.a() / b() / c() are blockX / blockY / blockZ
+                            super.visitVarInsn(Opcodes.ALOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dyr$b", "a", "()I", true);
+                            super.visitVarInsn(Opcodes.ALOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dyr$b", "b", "()I", true);
+                            super.visitVarInsn(Opcodes.ALOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dyr$b", "c", "()I", true);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "vwant", "(III)Z", false);
+                            super.visitJumpInsn(Opcodes.IFEQ, skip);
+                            // vdump(IIIDDD): x,y,z then toggle,ridged,gap
+                            super.visitVarInsn(Opcodes.ALOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dyr$b", "a", "()I", true);
+                            super.visitVarInsn(Opcodes.ALOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dyr$b", "b", "()I", true);
+                            super.visitVarInsn(Opcodes.ALOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dyr$b", "c", "()I", true);
+                            for (int slot : new int[] {0, 3, 4}) {
+                                super.visitVarInsn(Opcodes.ALOAD, slot);
+                                super.visitVarInsn(Opcodes.ALOAD, 5);
+                                super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dyr", "a",
+                                                      "(Ldyr$b;)D", true);
+                            }
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "vdump",
+                                                  "(IIIDDD)V", false);
+                            super.visitLabel(skip);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT vein failed: " + t);
+            return null;
+        }
+    }
+
     /** Logs the first draws after a reseed, so the server's stream is readable. */
     static MethodVisitor drawHook(MethodVisitor mv, String mn, String md) {
         final boolean isInt = mn.equals("f") && md.equals("()I");
@@ -278,6 +334,7 @@ public class Agent {
             }
             if ("ebe".equals(name) && buf != null && hasTunnel(buf)) return instrumentTunnel(buf);
             if ("ebe".equals(name)) return instrumentCarveState(buf);
+            if ("dzi".equals(name)) return instrumentVein(buf);
             if ("dzx".equals(name)) return instrumentRSeed(buf);
             if ("dyz".equals(name)) return instrumentBits(buf);
             if (!"dzb".equals(name)) return null;

@@ -6,6 +6,15 @@
 
 ## 進行中
 
+- [x] **R1a 地形の ore vein 残差: 0 セル達成（2026-10-22）**
+  - 1.21.1 の `OreVeinifier`（`dzi`）を公式 mappings + Vineflower で逆コンパイルして
+    bytecode 読みを検証し、`Gen::vein_override` として実装（§29 の擬似コード）。
+  - 最後の 1 点は乱数で、vanilla は `RandomState` の
+    `fromHashOf("minecraft:ore").forkPositional()` を渡す（`randomState.e()`）。
+    base factory を使っていたため 48/29/34 セルとぶれていた。
+    `factory.of_str("minecraft:ore").splitter()` に直して **0 セル**。
+  - 結果: (-3,3) 2×2 = **0**、8×8 spawn 周辺 = **4**（すべて tick する水）、
+    cave only = **0**。
 - [x] **R1e carver（洞窟・峡谷）: world 水準で 0 セル達成（2026-10-22）**
   - 原因は `minecraft:uniform` height provider の draw 数だった（§25）。
     1.21.1 は `eia` = `nextInt(max-min+1)` の 1 回。port は trapezoid `ehv`
