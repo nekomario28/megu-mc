@@ -17,8 +17,10 @@
     全 carver 617+341→**0**、canyon は jar の probability では start 無しで 0、
     probability 1.0 で **1 セル**。
   - 残り（§26 で分解済み）:
-    - 8×8 の 52 セルのうち **48 は地形**（granite/stone/copper の位置ずれ =
-      R1a の ore vein。NOFEAT でも NOCARVE でも 48 のまま、vanilla 側も 44 持つ）
+    - 8×8 の 52 セルのうち **48 は地形**（R1a の ore vein。§28 で正体判明:
+      1.21.1 は `ore_veins_enabled` + router の vein 3 関数で**地形段階**に生成、
+      リポジトリの 1.21.2+ データは `material_rule/copper_ore_vein.json`。
+      chunk (‑3,3) で 48 vs 44、共通 42、bbox 一致 → 実装の境界差）
     - 4 セルは **worldgen ではなく水の流れ**（§27）。こちらの dump は隣に
       level 0 の水を持ち、vanilla の palette には level 1（流動）が居る。
       spawn 周辺は forceload で tick するため、サーバー稼働中に流体が広がる。

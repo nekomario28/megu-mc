@@ -957,3 +957,45 @@ canyon を probability 1.0 にしたときの 1 セルも同じ `air` vs water�
 教訓: 保存済み world は純粋な worldgen の産物ではない。spawn/forceload された
 chunk は tick するので、`air` vs `water[level>0]` や `water[level=0]` の隣接は
 worldgen の差ではなく流体伝播として除外して読む（`--cells` で座標と名前を見る）。
+
+## 28. R1a（granite/copper の 48 セル）の正体: 1.21.1 の ore vein は地形段階
+
+chunk (‑3,3) の granite を集合で比べた:
+
+| | セル数 |
+|---|---|
+| こちら（`MC_SPINE_NOFEAT=1`） | 48 |
+| vanilla（features 空） | 44 |
+| 共通 | **42** |
+| こちらだけ | 6 |
+| vanilla だけ | 2 |
+
+bbox は完全一致（x‑39..‑33 / y26..32 / z61..63）。つまり**同じ鉱脈をほぼ同じ形で
+作っていて、境界の数セルだけ違う**。
+
+なぜ features を切っても両側に granite が残るのか:
+
+- 1.21.1 の `noise_settings/overworld.json` には **`ore_veins_enabled: true`** と
+  router の **`vein_toggle` / `vein_ridged` / `vein_gap`** があり、鉱脈は
+  **地形（NoiseChunk）段階**で生成される。`material_rule` ディレクトリは存在しない
+  （jar 内 0 件）
+- リポジトリの `datapacks/vanilla` は 1.21.2+ で、鉱脈は
+  `material_rule/overworld/copper_ore_vein.json`（`type: minecraft:ore_vein`,
+  `density`/`richness`/`filler_gap` を名前付き density function で参照）にある
+- こちらは後者を `Rule::OreVein` として実装しているので、**features を切っても
+  地形段階で鉱脈が出る**（両側とも出る）✓
+
+残る 6/2 セルの差は実装の境界条件。port の評価は
+
+```rust
+if d <= 0.0 { return None; }
+let mut r = sp.pos(x, y, z);
+if r.next_f32() > d as f32 { return None; }   // ← density を確率として使っている
+```
+
+と、density を**確率ゲート**に使っている。1.21.1 の sampler は toggle/ridged/gap の
+しきい値で決める決定的な判定なので、ここが「ほぼ同じだが数セル違う」形の原因と
+みられる（1.21.2 の `ore_vein` ルールの正しい意味も要確認）。
+
+**したがって R1a の恒久修正は「データを 1.21.1 jar から再生成 + 1.21.1 の
+OreVeinSampler を実装」**であり、`Rule::OreVein` の微修正では終わらない。
