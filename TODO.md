@@ -6,7 +6,20 @@
 
 ## 進行中
 
-- [ ] **R1e carver（洞窟・峡谷）の実装**（実装済み・world 水準で残差）
+- [x] **R1e carver（洞窟・峡谷）: world 水準で 0 セル達成（2026-10-22）**
+  - 原因は `minecraft:uniform` height provider の draw 数だった（§25）。
+    1.21.1 は `eia` = `nextInt(max-min+1)` の 1 回。port は trapezoid `ehv`
+    (plateau 1) の 2 回で組んでいたため、tunnel の yaw/pitch/yScale/count/seed が
+    すべて 1 draw ずれていた。
+  - サーバーの生ドロー（`dzx.c(JII)` の reseed + `dyz.c(I)` = `next(bits)`）と
+    port の `CARVE_RAW` を突き合わせて特定。probe も `eia` に修正して一致。
+  - 結果（2×2 at (0,0), y=-64..319）: cave 617→**0**、cave_extra 341→**0**、
+    全 carver 617+341→**0**、canyon は jar の probability では start 無しで 0、
+    probability 1.0 で **1 セル**。
+  - 残り: canyon p=1 の 1 セル（`deep`、want `stripped_mangrove_wood`）、
+    8×8 spawn 周辺の 52 セル（state 1↔2 = granite/stone、carver ではなく
+    feature 層 = R1a の残差とみられる）。
+- [ ] **R1e-old carver（洞窟・峡谷）の実装**（実装済み・world 水準で残差）
   - 実装: `src/feature.rs` の carvers 節（`apply_carvers` / `carve_block` /
     `cave`+`room`+`tunnel`+`ellipsoid` / `canyon` / `CarvingMask`）と
     `worldgen.rs` の `carve_state` / `top_material_at` / `prelim_min`。
