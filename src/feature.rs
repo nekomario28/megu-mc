@@ -1974,6 +1974,9 @@ struct CarveRun {
     probe: bool,
     probe_air: u32,
     probe_lava: u32,
+    /// First cell the current source chunk wrote, for the `SRC` trace that is
+    /// compared against the real server's carve agent.
+    mark: Option<(i32, i32, i32)>,
 }
 
 impl CarveRun {
@@ -2044,6 +2047,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
         probe: probe_here,
         probe_air: breg().map_or(12959, |b| b.state_of("minecraft:cave_air", None)),
         probe_lava: breg().map_or(96, |b| b.state_of("minecraft:lava", None)),
+        mark: None,
     };
     let mut starts = 0u32;
     for ox in tx - 8..=tx + 8 {
@@ -2072,9 +2076,17 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                 if std::env::var("CARVE_TRACE").is_ok() {
                     eprintln!("START target={tx},{tz} origin={ox},{oz} k={k} {name} ({biome})");
                 }
+                run.mark = None;
                 match c.kind {
                     CKind::Cave => run.cave(g, &cc, c, &mut r, ox, oz),
                     CKind::Canyon => run.canyon(g, &cc, c, &mut r, ox, oz),
+                }
+                if let Ok(spec) = std::env::var("CARVE_SRC") {
+                    if spec == "all" || spec == format!("{tx},{tz}") {
+                        if let Some((x, y, z)) = run.mark {
+                            eprintln!("SRC ox={ox} oz={oz} k={k} first={x},{y},{z}");
+                        }
+                    }
                 }
             }
         }
@@ -2114,6 +2126,9 @@ impl CarveRun {
         let inner = r.next_bound(15);
         let mid = r.next_bound(inner + 1);
         let tunnels = r.next_bound(mid + 1);
+        if std::env::var("CV_TRACE").is_ok() {
+            eprintln!("CVSTART ox={ox} oz={oz} inner={inner} mid={mid} tunnels={tunnels}");
+        }
         for _ in 0..tunnels {
             let x = (ox * 16 + r.next_bound(16)) as f64;
             let y = c.y.sample(r, self.min_y, self.height) as f64;
@@ -2130,6 +2145,9 @@ impl CarveRun {
                 let hr = 1.5 + (mth_sin(std::f32::consts::FRAC_PI_2) * thick) as f64;
                 self.ellipsoid(g, cc, c, x + 1.0, y, z, hr, hr * room_scale);
                 branches += r.next_bound(4);
+            }
+            if std::env::var("CV_TRACE").is_ok() {
+                eprintln!("CVTUN ox={ox} oz={oz} x={x} y={y} z={z} hrm={hrm} vrm={vrm} floor={} branches={branches}", self.floor);
             }
             for _ in 0..branches {
                 let yaw = r.next_f32() * TAU;
@@ -2378,14 +2396,15 @@ impl CarveRun {
         let Some(st) = probed else {
             return false;
         };
-        // `applyCarvers` gives `carveBlock` the *target* chunk and the mask is
-        // that chunk's. A tunnel walked from a source chunk up to 8 chunks away
-        // could in principle put an ellipsoid cell outside the target, and the
-        // `x & 15` fold below would then paint a neighbour's cave into this
-        // chunk. Measured: the guard never fires (vanilla's walk stays inside
-        // the target too), so this is belt-and-braces, not a behaviour change.
-        if (x >> 4) != self.tx || (z >> 4) != self.tz {
+        // vanilla writes with the *target* chunk and lets the position fold
+        // (`x & 15`), so a tunnel from a source chunk up to 8 chunks away paints
+        // its cells into the target chunk at folded coordinates. Keep that as
+        // the default; MC_SPINE_NOFOLD=1 clips instead, for experiments.
+        if std::env::var("MC_SPINE_NOFOLD").is_ok() && ((x >> 4) != self.tx || (z >> 4) != self.tz) {
             return false;
+        }
+        if self.mark.is_none() {
+            self.mark = Some((x, y, z));
         }
         self.out.insert(((x & 15) as u8, y, (z & 15) as u8), st);
         if reached_surface && self.read(g, cc, x, y - 1, z) == br.state_of("minecraft:dirt", None) {

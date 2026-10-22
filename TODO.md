@@ -47,6 +47,12 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §20: エージェントに target を記録させると、target (0,0) で
+    getCarveState を呼ぶ source は (1,-3) の 1 個だけ、書いたセルは 20。
+    こちらの port は同じ start から 0 セル。原因は `carve_block` の `read` が
+    `terrain_cell(cc, x, y, z)` を **x&15 で折り畳んで**評価するため、ターゲット外
+    セルの地形判定が vanilla（隣 protochunk を読む）と違うこと。
+    次の一手は「隣 chunk の ChunkCols で terrain_cell を評価する」＋書きは折り畳み。
   - §19: javaagent (`tools/carve-agent/`) で `applyCarvers` と `getCarveState` を
     サーバー内計測。target (1,1) の start 36 は我々と一致するが、**chunk (1,1)
     内の getCarveState 呼び出しは 0 件**。world は (1,1) を 1 セルも掘っていない。

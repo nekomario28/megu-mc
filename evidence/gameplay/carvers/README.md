@@ -676,3 +676,46 @@ aquifer ではない。§17/§18 の「aquifer だけ」も、この意味で修
 次の一手: `ebb.carve` の入口で source chunk と最初の数ドロー
 （y / yaw / pitch / thickness）を記録し、こちらの `CARVE_RNG` トレースと
 並べる。最初に食い違うドローがそのままバグの位置になる。
+
+## 20. javaagent でターゲット付き計測 → ずれの正体は「ターゲット外セルの地形読み」
+
+エージェントに target chunk を記録させ（`applyCarvers` 入口で thread-local に
+設定）、`ASTATE t=<target> s=<source> x y z <id>` の形で出るようにした。
+
+cave のみ・target (0,0) の実測:
+
+```
+target (0,0) で getCarveState を呼んだ source     : 1 個だけ (1,-3)
+その source が (0,0) に書いた非 null セル         : 20（先頭 (0,34,0)）
+```
+
+こちらの port は target (0,0) に対して **0 セル**しか書かない（同じ 33 start、
+同じ seed で）。`CV_TRACE` で我々の source (1,-3) のトンネル開始位置を見ると
+(20,84,-46) / (20,122,-36) / (23,33,-36) で、3 本目が vanilla の書いた
+y≈34 と整合する。つまり **start は同じで、そこから先の書き込みが起きていない**。
+
+原因は `carve_block` の読み:
+
+```rust
+fn read(&self, g, cc, x, y, z) -> u32 {
+    match self.out.get(&((x & 15), y, (z & 15))) {
+        Some(&st) => st,
+        None => g.terrain_cell(cc, x, y, z),   // cc = *target* の ChunkCols
+    }
+}
+```
+
+`terrain_cell` は `block_density(cc, x, y, z)` を **`x & 15` で折り畳んで**
+評価するので、ターゲット chunk の外にあるセルは「隣 chunk の地形」ではなく
+「ターゲット chunk の同じローカル座標の地形」で判定される。vanilla は
+`chunk.getBlockState(pos)` で**隣 protochunk の実際の地形**を読み、書き込みだけを
+`x & 15` で折り畳む。この差で、遠い source chunk からのトンネルは
+`canReplaceBlock` の判定が食い違い、書くセル集合が変わる。
+
+§16〜§18 で「aquifer だけ」「world の carve が再現できない」と見えていたものの
+主因はこれで、aquifer は二次的。`MC_SPINE_NOFOLD=1` で折り畳みを切る実験口も
+入れたが、この読みの問題があるため差は変わらない（617 のまま）。
+
+**次の一手**: `read` を「隣 chunk の ChunkCols で terrain_cell を評価する」形に
+する（`g.cols(x >> 4, z >> 4)` で列を取得）。性能は carve ループ内なので、
+隣 chunk の列キャッシュが要る。

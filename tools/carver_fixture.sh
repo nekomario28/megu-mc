@@ -19,10 +19,11 @@ REPO_CFG="$ROOT/datapacks/vanilla/data/minecraft/worldgen/configured_carver"
 
 rm -rf "$DIR"
 mkdir -p "$DIR/world/datapacks/ctl/data/minecraft/worldgen/configured_carver"
-cp /tmp/carverfresh/server.jar "$DIR/"
-cp -r /tmp/carverfresh/libraries /tmp/carverfresh/versions "$DIR/"
+BASE="${CARVER_FIXTURE_BASE:-/tmp/carverfresh}"
+cp "$BASE/server.jar" "$DIR/"
+cp -r "$BASE/libraries" "$BASE/versions" "$DIR/"
 echo "eula=true" > "$DIR/eula.txt"
-sed 's/^level-name=.*/level-name=world/' /tmp/carverfresh/server.properties > "$DIR/server.properties"
+sed 's/^level-name=.*/level-name=world/' "$BASE/server.properties" > "$DIR/server.properties"
 python3 "$ROOT/tools/vanilla_nofeat_pack.py" "$DIR/server.jar" "$DIR/world" --keep-carvers >/dev/null
 echo "{\"pack\": {\"pack_format\": 48, \"description\": \"$TAG\"}}" \
   > "$DIR/world/datapacks/ctl/pack.mcmeta"
@@ -58,7 +59,13 @@ install_cfg canyon "$CANYON"
 
 # Always put the repo's carver JSONs back: piping this script into `head` used to
 # kill it before the restore line and leave the working tree dirty.
-restore_repo() { cp /tmp/carver_backup/*.json "$REPO_CFG"/ 2>/dev/null || true; }
+restore_repo() {
+  if ls /tmp/carver_backup/*.json >/dev/null 2>&1; then
+    cp /tmp/carver_backup/*.json "$REPO_CFG"/
+  else
+    ( cd "$ROOT" && git checkout -- datapacks/ ) 2>/dev/null || true
+  fi
+}
 trap restore_repo EXIT
 
 # the repo (mc-spine's data) must read the same files
@@ -81,9 +88,11 @@ if [ -n "${CARVER_FIXTURE_FRESH:-}" ]; then
   rm -rf "$DIR/world/region" "$DIR/world/entities" "$DIR/world/poi"
 fi
 lox=$((X0*16)); loz=$((Z0*16)); hix=$(((X0+N)*16-1)); hiz=$(((Z0+N)*16-1))
+AGENT=""
+[ -n "${CARVE_AGENT:-}" ] && AGENT="-javaagent:$CARVE_AGENT"
 ( cd "$DIR" && printf 'forceload add %d %d %d %d\nsave-all flush\nstop\n' "$lox" "$loz" "$hix" "$hiz" \
   | timeout 240 systemd-run --scope --user -p MemoryMax=3G --unit="cf-$TAG-$$" \
-      java -Xmx2G -Xms512M -jar server.jar nogui > run.log 2>&1 || true )
+      java -Xmx2G -Xms512M $AGENT -jar server.jar nogui > run.log 2>&1 || true )
 
 cd "$ROOT"
 MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$DIR/dump.bin" MC_SPINE_WG_DUMP_N="$N" \

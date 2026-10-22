@@ -1,5 +1,14 @@
 /** Bootstrap-visible logger for the instrumented carver hooks (no game types). */
 public class CarveLog {
+    static final ThreadLocal<int[]> TGT = new ThreadLocal<int[]>() {
+        @Override protected int[] initialValue() { return new int[]{Integer.MIN_VALUE, Integer.MIN_VALUE}; }
+    };
+    public static void target(int tx, int tz) { TGT.set(new int[]{tx, tz}); }
+    static final ThreadLocal<int[]> SRC = new ThreadLocal<int[]>() {
+        @Override protected int[] initialValue() { return new int[]{Integer.MIN_VALUE, Integer.MIN_VALUE}; }
+    };
+    public static void enter(int sx, int sz) { SRC.set(new int[]{sx, sz}); }
+    public static void exit() { SRC.set(new int[]{Integer.MIN_VALUE, Integer.MIN_VALUE}); }
     public static void pre(int tx, int tz, int sx, int sz, int k, long seed) {
         System.out.println("APRE t=" + tx + "," + tz + " s=" + sx + "," + sz + " k=" + k + " seed=" + seed);
     }
@@ -7,6 +16,9 @@ public class CarveLog {
         System.out.println("APOST t=" + tx + "," + tz + " s=" + sx + "," + sz + " k=" + k + " start=" + start);
     }
     public static void state(int x, int y, int z, int id) {
-        System.out.println("ASTATE " + x + " " + y + " " + z + " " + id);
+        int[] s = SRC.get();
+        int[] t = TGT.get();
+        System.out.println("ASTATE t=" + t[0] + "," + t[1] + " s=" + s[0] + "," + s[1]
+            + " " + x + " " + y + " " + z + " " + id);
     }
 }

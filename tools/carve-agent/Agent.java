@@ -28,6 +28,42 @@ public class Agent {
         inst.addTransformer(new Transformer());
     }
 
+    /** `CaveWorldCarver.carve(...)`: track which source chunk the writes belong to. */
+    static byte[] instrumentCarve(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals(
+                            "(Leaz;Leba;Lduy;Ljava/util/function/Function;Layw;Ldyk;Ldcd;Ldux;)Z")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            super.visitVarInsn(Opcodes.ALOAD, 7);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "e", "I");
+                            super.visitVarInsn(Opcodes.ALOAD, 7);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "f", "I");
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "enter", "(II)V", false);
+                        }
+                        @Override public void visitInsn(int op) {
+                            if (op == Opcodes.ARETURN) {
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "exit", "()V", false);
+                            }
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT carve transform failed: " + t);
+            return null;
+        }
+    }
+
     /** `WorldCarver.getCarveState(ctx, cfg, pos, aquifer)` -> log pos + state id. */
     static byte[] instrumentCarveState(byte[] buf) {
         try {
@@ -80,6 +116,7 @@ public class Agent {
     static class Transformer implements ClassFileTransformer {
         @Override public byte[] transform(ClassLoader l, String name, Class<?> c,
                                           ProtectionDomain pd, byte[] buf) {
+            if ("ebb".equals(name)) return instrumentCarve(buf);
             if ("ebe".equals(name)) return instrumentCarveState(buf);
             if (!"dzb".equals(name)) return null;
             try {
@@ -91,6 +128,17 @@ public class Agent {
                         MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
                         if (!mn.equals("a") || !md.startsWith("(Larb;JLdzm;")) return mv;
                         return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                // local 12 is set later; the target ChunkPos is arg 6 (local 7)
+                                super.visitVarInsn(Opcodes.ALOAD, 7);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "duy", "f", "()Ldcd;", false);
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "e", "I");
+                                super.visitInsn(Opcodes.SWAP);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "f", "I");
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "target", "(II)V", false);
+                            }
                             @Override public void visitMethodInsn(int op, String owner, String n,
                                                                  String d, boolean itf) {
                                 if (owner.equals("ebc") && n.equals("a") && d.equals("(Layw;)Z")) {
