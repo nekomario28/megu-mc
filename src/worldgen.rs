@@ -3446,7 +3446,11 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // unaffected, because its seed is `0 ^ 0 ^ seed`. With the fix the ore
         // origins of neighbour chunks match too and the 2x2 feature-on diff
         // drops 33853 -> 15820.
-        assert_eq!(digest, "8ef7b02a5394956cd7ba8faff59cc522",
+        // 2026-10-22: `underwater_magma` now runs `UnderwaterMagmaFeature`'s
+        // Column.scan (the origin must be water) and enclosure test, so a land
+        // chunk no longer receives magma at all. 2x2 feature-on diff: 3472 ->
+        // 2188 cells.
+        assert_eq!(digest, "3b65881fc05eea084a0474d3d934d5c0",
             "feature population output changed from the vanilla-order capture");
     }
 

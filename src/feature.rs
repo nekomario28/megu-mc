@@ -1342,45 +1342,59 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
         }
         Cf::UnderMagma { floor, prob, radius } => {
+            // `UnderwaterMagmaFeature` (eds): Column.scan requires the origin to be
+            // water, walks down while it stays water, and only then places magma
+            // around the floor. Every cell in the cube draws `nextFloat()` first
+            // and is kept when the draw is below the probability *and* the cell is
+            // fully enclosed (itself, the cell above, and all six neighbours are
+            // neither water nor air).
             let Some(reg) = breg() else { return };
             let magma = reg.state_of("minecraft:magma_block", None);
-            let mut p = pos;
+            if !is_water_st(reg, ctx.get(pos.0, pos.1, pos.2)) {
+                return;
+            }
+            let mut y = pos.1;
             let mut found = false;
-            for _ in 0..*floor {
-                let cur = ctx.get(p.0, p.1 - 1, p.2);
-                if !is_water_st(reg, cur) && !reg.is_air(cur) {
+            for _ in 1..*floor {
+                if !is_water_st(reg, ctx.get(pos.0, y, pos.2)) {
                     found = true;
                     break;
                 }
-                p.1 -= 1;
+                y -= 1;
             }
             if !found {
                 return;
             }
             let r = *radius;
+            let wet_air = |ctx: &mut FC, reg: &crate::block_registry::BReg, p: (i32, i32, i32)| {
+                let st = ctx.get(p.0, p.1, p.2);
+                reg.is_air(st) || is_water_st(reg, st)
+            };
+            let enclosed = |ctx: &mut FC, reg: &crate::block_registry::BReg, p: (i32, i32, i32)| {
+                if wet_air(ctx, reg, p) || wet_air(ctx, reg, (p.0, p.1 + 1, p.2)) {
+                    return false;
+                }
+                for (dx, dy, dz) in [
+                    (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
+                ] {
+                    if wet_air(ctx, reg, (p.0 + dx, p.1 + dy, p.2 + dz)) {
+                        return false;
+                    }
+                }
+                true
+            };
             for dx in -r..=r {
-                for dz in -r..=r {
-                    for dy in -1..=r + 2 {
-                        let bp = (p.0 + dx, p.1 + dy - 1, p.2 + dz);
-                        let cur = ctx.get(bp.0, bp.1, bp.2);
-                        let n = reg.name_of(cur);
-                        let target = matches!(
-                            n,
-                            "minecraft:netherrack" | "minecraft:dirt" | "minecraft:gravel"
-                                | "minecraft:sand" | "minecraft:clay" | "minecraft:stone"
-                                | "minecraft:deepslate"
-                        ) || n.contains("stone");
-                        if !target {
+                for dy in -r..=r {
+                    for dz in -r..=r {
+                        let bp = (pos.0 + dx, y + dy, pos.2 + dz);
+                        let draw = rng.next_f32();
+                        if draw >= *prob {
                             continue;
                         }
-                        if is_water_st(reg, ctx.get(bp.0, bp.1 + 1, bp.2))
-                            || is_water_st(reg, ctx.get(bp.0, bp.1 + 2, bp.2))
-                        {
+                        if !enclosed(ctx, reg, bp) {
                             continue;
                         }
-                        if rng.next_f32() < *prob {
-                            ctx.set(bp.0, bp.1, bp.2, magma);
-                        }
+                        ctx.set(bp.0, bp.1, bp.2, magma);
                     }
                 }
             }

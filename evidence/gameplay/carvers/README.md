@@ -1196,3 +1196,28 @@ feature あり 2×2 の diff は 15820 → **3472**（1 chunk あたり ~870 = 0
 残差 3472 の内訳: `magma_block`（1236、vanilla は 0 = `underwater_magma` を
 置きすぎ）、木（leaves/log 747、置き漏れ）、`dirt != sand/gravel`（579、disk 系）、
 `diorite != water` など。
+
+## 33. `underwater_magma` は「水面下」でしか置かない
+
+残差 3472 のうち最大の 1236 セルが `magma_block`（vanilla は 0）。
+`UnderwaterMagmaFeature`（`eds`）を逆コンパイルすると:
+
+```java
+OptionalInt floor = Column.scan(level, origin, cfg.floorSearchRange,
+                                s -> s.is(WATER), s -> !s.is(WATER)).map(Column::getFloor);
+```
+
+つまり **origin のセルが水であること**が前提で、水を下に辿って最初の非水セルが床。
+こちらの実装はこの前提を持たず、陸地でも「下が水/空気でなくなるまで降りて」置いていた。
+
+さらに配置は
+
+```java
+BlockPos.betweenClosed(base.offset(-r,-r,-r), base.offset(r,r,r))
+    .filter(p -> random.nextFloat() < cfg.placementProbability)
+    .filter(p -> isWaterSatisfied(level, p))     // 自身/上/6近傍が水でも空気でもない
+    .forEach(p -> setBlock(p, MAGMA));
+```
+
+で、**箱の全セルで nextFloat を引いてから** 包囲判定。修正後は陸地で 0 セルになり、
+feature あり 2×2 の diff は 3472 → **2188**（1 chunk あたり ~550 = 0.56%）。
