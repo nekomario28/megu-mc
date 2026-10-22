@@ -937,3 +937,23 @@ canyon を probability 1.0 にしたときの 1 セルも同じ `air` vs `water`
 （§25.1 で `stripped_mangrove_wood` と書いたのは誤り — `assets/blocks_1211.json`
 をリストの添字で引いていた。state id → 名前は `minStateId..maxStateId` の範囲で
 引く必要があり、`carver_diff.py --cells` はそうしている。id 81 は water）。
+
+## 27. 残り 4 セルは worldgen ではなく水の流れだった
+
+§26 の 4 セル（`air` vs `water`、y=55）を掘った結果:
+
+- こちらの dump は (-37,55,13) に **level 0 の水**、(-38,55,13..15) は air
+- vanilla の chunk palette には water **level 0 が 2 個**、**level 1 が 1 個**
+- chunk には structure の start が無い（`structures.starts` が空）ので構造物ではない
+
+つまり vanilla 側だけ、湧き水の隣接セルへ **水が流れた**（level 1 = 流動）。
+spawn 周辺は forceload されて tick するので、サーバーが動いている間に流体が広がる。
+こちらの port は tick しないので air のまま。**worldgen の差ではない。**
+
+canyon を probability 1.0 にしたときの 1 セルも同じ `air` vs water（level 付き）で、
+同じく流動。したがって carver の world 比較は、地形層の ore vein 残差（R1a）を
+除いて **0 セル**。
+
+教訓: 保存済み world は純粋な worldgen の産物ではない。spawn/forceload された
+chunk は tick するので、`air` vs `water[level>0]` や `water[level=0]` の隣接は
+worldgen の差ではなく流体伝播として除外して読む（`--cells` で座標と名前を見る）。

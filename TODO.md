@@ -19,9 +19,10 @@
   - 残り（§26 で分解済み）:
     - 8×8 の 52 セルのうち **48 は地形**（granite/stone/copper の位置ずれ =
       R1a の ore vein。NOFEAT でも NOCARVE でも 48 のまま、vanilla 側も 44 持つ）
-    - **4 セルが aquifer**（chunk (-3,0)、y=55、`air` vs `water`、z=15/16 の
-      境界をまたぐ）。canyon p=1 の 1 セルも同じ `air` vs `water`。
-      次は `AQ_TRACE=-3,0` と実地形を食わせた `CARVE_PROBE` で 4 セルを見る。
+    - 4 セルは **worldgen ではなく水の流れ**（§27）。こちらの dump は隣に
+      level 0 の水を持ち、vanilla の palette には level 1（流動）が居る。
+      spawn 周辺は forceload で tick するため、サーバー稼働中に流体が広がる。
+      canyon p=1 の 1 セルも同じ流動。**carver の world 比較は R1a を除いて 0**。
 - [ ] **R1e-old carver（洞窟・峡谷）の実装**（実装済み・world 水準で残差）
   - 実装: `src/feature.rs` の carvers 節（`apply_carvers` / `carve_block` /
     `cave`+`room`+`tunnel`+`ellipsoid` / `canyon` / `CarvingMask`）と
