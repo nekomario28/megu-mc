@@ -835,10 +835,20 @@ fn gen_ore(
             let p = pos.2 - g.ceil() as i32 - i;
             let q = 2 * (g.ceil() as i32 + i);
             let r2 = 2 * (2 + i);
+            let before = ctx.wr.len();
             for xp in n..=(n + q) {
                 for zp in p..=(p + q) {
                     if o <= ctx.hm_oc(xp, zp) {
                         gen_vein(ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets);
+                        if let Ok(spec) = std::env::var("ORE_CELL_TRACE") {
+                            if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
+                                eprintln!(
+                                    "ORECELL origin={pos:?} size={size} wrote={} radius={:?}",
+                                    ctx.wr.len() - before,
+                                    (d, e, h, j, l, mm)
+                                );
+                            }
+                        }
                         return;
                     }
                 }
@@ -2474,10 +2484,15 @@ fn can_reach(tx: i32, tz: i32, x: f64, z: f64, branch_index: i32, branch_count: 
 // ---------- entry point ----------
 
 fn pop_seed(seed: u64, bx: i32, bz: i32) -> u64 {
-    let mut r = Lcg::new(seed);
-    let l = r.next_i64() | 1;
-    let m = r.next_i64() | 1;
-    ((bx as i64).wrapping_mul(l).wrapping_add((bz as i64).wrapping_mul(m)) as u64) ^ seed
+    // `WorldgenRandom.setDecorationSeed` (dzx.a(JII)J) runs on the *Xoroshiro*
+    // source that `applyBiomeDecoration` wraps, not on an LCG, and combines the
+    // two products with XOR:
+    //   setSeed(seed); l = nextLong() | 1; m = nextLong() | 1;
+    //   n = (x * l) ^ (z * m) ^ seed;
+    let mut r = Xor::seed_worldgen(seed);
+    let l = r.next_i64_legacy() | 1;
+    let m = r.next_i64_legacy() | 1;
+    ((bx as i64).wrapping_mul(l) ^ (bz as i64).wrapping_mul(m) ^ seed as i64) as u64
 }
 
 /// populate chunk (sx,sz): evaluate the vanilla feature pipeline and merge

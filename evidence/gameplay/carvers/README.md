@@ -1148,3 +1148,28 @@ public int c(int bits) { count++; return d instanceof dyz l ? l.c(bits) : (int)(
 残りは feature ごとの差（`FSEED`→`ORE` の対応付けは「配置 0 個の feature」で
 ずれるので、次は ORE ログに feature id を付けて比較する）。biome の feature リストも
 step 2/9/10 で差が出ている（1.21.2+ データの残り）。
+
+## 32. feature の decoration seed は Xoroshiro + XOR だった
+
+ore の配置が chunk (0,0) で完全一致したのに、隣の chunk (-1,0) では 242/242 ずれた。
+`applyBiomeDecoration` を逆コンパイルすると:
+
+```java
+dzx rand = new dzx(new dzz(dzn.a()));            // WorldgenRandom wrapping Xoroshiro
+long decoSeed = rand.a(level.getSeed(), origin.getX(), origin.getZ());  // setDecorationSeed
+```
+
+`setDecorationSeed`（`dzx.a(JII)J`）の bytecode は
+
+```
+setSeed(seed); l = nextLong() | 1; m = nextLong() | 1;
+n = (x * l) ^ (z * m) ^ seed;      // ← lxor（加算ではない）
+```
+
+で、`l`/`m` は **Xoroshiro** の nextLong（`WorldgenRandom` 経由なので legacy 形）。
+こちらは `Lcg` と `+` で計算していた。chunk (0,0) だけは `0*l ^ 0*m ^ seed = seed`
+なので偶然一致していた（＝ 4 chunk 中 3 chunk の feature が全部ずれていた）。
+
+修正後: 隣 chunk (-1,0) の decoration seed が vanilla と一致
+（`6716476193438028432`）、ore feature 21/22 が一致、feature あり 2×2 の diff は
+**33853 → 15820**（chunk (0,0) 単体 3992 → 1218）。

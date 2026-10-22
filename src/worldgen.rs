@@ -3440,7 +3440,13 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // With those fixed every one of the 22 ore placed features in chunk (0,0)
         // has an identical origin list to the live server, and the 2x2 feature-on
         // diff drops 33853 cells.
-        assert_eq!(digest, "6c7ef1f3420e1e08e238c29bd0c97c14",
+        // 2026-10-22: the decoration seed is now computed the way vanilla does it
+        // (`WorldgenRandom.setDecorationSeed` on the Xoroshiro source, with XOR
+        // instead of the LCG and addition the port had). Only chunk (0,0) was
+        // unaffected, because its seed is `0 ^ 0 ^ seed`. With the fix the ore
+        // origins of neighbour chunks match too and the 2x2 feature-on diff
+        // drops 33853 -> 15820.
+        assert_eq!(digest, "8ef7b02a5394956cd7ba8faff59cc522",
             "feature population output changed from the vanilla-order capture");
     }
 
