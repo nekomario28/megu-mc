@@ -37,13 +37,17 @@ public class CarveLog {
     };
 
     static final ThreadLocal<int[]> CHUNK = new ThreadLocal<int[]>() {
-        @Override protected int[] initialValue() { return new int[] { Integer.MIN_VALUE, 0 }; }
+        @Override protected int[] initialValue() { return new int[] { Integer.MIN_VALUE, 0, 0 }; }
     };
 
-    /** setDecorationSeed(seed, x, z): remember which chunk is being decorated. */
-    public static void deco(int x, int z) {
+    /** setDecorationSeed(seed, x, z): remember the chunk and the level seed. */
+    public static void deco(long seed, int x, int z) {
         CHUNK.get()[0] = x >> 4;
         CHUNK.get()[1] = z >> 4;
+        // the nether/end decorate with their own seed; -Ddecoseed=0 keeps the
+        // overworld only
+        String want = System.getProperty("decoseed");
+        CHUNK.get()[2] = (want == null || want.equals(Long.toString(seed))) ? 1 : 0;
     }
 
     /** setFeatureSeed(seed, i, step): log the (i, step) pair for the target chunk. */
@@ -54,6 +58,7 @@ public class CarveLog {
         if (a.length != 2) return;
         int[] c = CHUNK.get();
         if (c[0] != Integer.parseInt(a[0]) || c[1] != Integer.parseInt(a[1])) return;
+        if (c[2] != 1) return;
         FEAT.get()[0] = i;
         FEAT.get()[1] = step;
         System.out.println("FSEED " + seed + " " + i + " " + step);

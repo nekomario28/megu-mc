@@ -284,9 +284,10 @@ public class Agent {
                         return new MethodVisitor(Opcodes.ASM9, mv) {
                             @Override public void visitCode() {
                                 super.visitCode();
+                                super.visitVarInsn(Opcodes.LLOAD, 1);
                                 super.visitVarInsn(Opcodes.ILOAD, 3);
                                 super.visitVarInsn(Opcodes.ILOAD, 4);
-                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "deco", "(II)V", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "deco", "(JII)V", false);
                             }
                         };
                     }
