@@ -454,7 +454,7 @@ public class Agent {
                 return instrumentRSeed(b != null ? b : buf);
             }
             if ("dyz".equals(name)) return instrumentBits(buf);
-            if ("dzz".equals(name)) return instrumentXorDraws(buf);
+
             if (!"dzb".equals(name)) return null;
             try {
                 ClassReader cr = new ClassReader(buf);

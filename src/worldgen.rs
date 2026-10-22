@@ -3434,7 +3434,13 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // put every ore blob somewhere else: 242/242 origins differed. With the
         // legacy flavour the first origins match vanilla exactly and the 2x2
         // feature-on diff at (0,0) drops 40975 -> 34679.
-        assert_eq!(digest, "44a455d03763afcc6bfb58ac02a0ffe1",
+        // 2026-10-22: the feature height providers now match vanilla's classes
+        // (uniform `eia` one draw, trapezoid `ehz` plateau 0, biased `ehv`,
+        // very-biased `eib`) and `below_top` resolves to minY + height - 1 - value.
+        // With those fixed every one of the 22 ore placed features in chunk (0,0)
+        // has an identical origin list to the live server, and the 2x2 feature-on
+        // diff drops 33853 cells.
+        assert_eq!(digest, "6c7ef1f3420e1e08e238c29bd0c97c14",
             "feature population output changed from the vanilla-order capture");
     }
 

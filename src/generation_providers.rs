@@ -132,7 +132,12 @@ impl YA {
         match self {
             YA::Abs(y) => *y,
             YA::AboveBottom(o) => min_y.saturating_add(*o),
-            YA::BelowTop(o) => min_y.saturating_add(height).saturating_sub(*o),
+            // `VerticalAnchor.BELOW_TOP` resolves to minY + height - 1 - value:
+            // the top *block* is at minY + height - 1.
+            YA::BelowTop(o) => min_y
+                .saturating_add(height)
+                .saturating_sub(1)
+                .saturating_sub(*o),
         }
     }
 }
@@ -152,35 +157,55 @@ fn p_ya(j: &J) -> Option<YA> {
     }
 }
 pub(crate) enum HP {
+    /// `minecraft:uniform` = `eia`: one `nextInt(max - min + 1)`.
     Uniform(YA, YA),
-    Trap(YA, YA),
-    VeryBias(YA, YA),
+    /// `minecraft:biased_to_bottom` = `ehv` (inner defaults to 1): two draws.
+    Biased(YA, YA, i32),
+    /// `minecraft:very_biased_to_bottom` = `eib` (inner defaults to 1): three draws.
+    VeryBias(YA, YA, i32),
+    /// `minecraft:trapezoid` = `ehz` (plateau defaults to 0): two draws.
+    Trap(YA, YA, i32),
 }
 impl HP {
     pub(crate) fn get(&self, r: &mut Xor, min_y: i32, height: i32) -> i32 {
         match self {
             HP::Uniform(a, b) => r.next_inbetween(a.get(min_y, height), b.get(min_y, height)),
-            HP::Trap(a, b) => {
+            HP::Biased(a, b, inner) => {
+                // ehv: k = nextInt(hi - lo - inner + 1); return nextInt(k + inner) + lo
                 let lo = a.get(min_y, height);
                 let hi = b.get(min_y, height);
-                if lo >= hi {
+                if hi - lo - inner + 1 <= 0 {
                     return lo;
                 }
-                // vanilla TrapezoidHeightProvider: triangular via midpoint of two rolls
-                let u1 = r.next_inbetween(lo, hi);
-                let u2 = r.next_inbetween(lo, hi);
-                (u1 + u2) / 2
+                let k = r.next_bound(hi - lo - inner + 1);
+                r.next_bound(k + inner) + lo
             }
-            HP::VeryBias(a, b) => {
+            HP::Trap(a, b, plateau) => {
+                // ehz: if plateau >= range -> uniform; else lo + rbi(0, other) + rbi(0, half)
                 let lo = a.get(min_y, height);
                 let hi = b.get(min_y, height);
-                if lo >= hi {
+                if lo > hi {
                     return lo;
                 }
-                let u1 = r.next_inbetween(lo, hi);
-                let u2 = r.next_inbetween(lo, hi);
-                let u3 = r.next_inbetween(lo, hi);
-                u1.min(u2).min(u3)
+                let range = hi - lo;
+                if *plateau >= range {
+                    return r.next_inbetween(lo, hi);
+                }
+                let half = (range - plateau) / 2;
+                let other = range - half;
+                lo + r.next_inbetween(0, other) + r.next_inbetween(0, half)
+            }
+            HP::VeryBias(a, b, inner) => {
+                // eib: k = rbi(lo + inner, hi); m = rbi(lo, k - 1);
+                //      return rbi(lo, m - 1 + inner)
+                let lo = a.get(min_y, height);
+                let hi = b.get(min_y, height);
+                if hi - lo - inner + 1 <= 0 {
+                    return lo;
+                }
+                let k = r.next_inbetween(lo + inner, hi);
+                let m = r.next_inbetween(lo, k - 1);
+                r.next_inbetween(lo, m - 1 + inner)
             }
         }
     }
@@ -196,10 +221,15 @@ pub(crate) fn p_hp(j: &J) -> Option<HP> {
     }
     let lo = p_ya(js(j, "min_inclusive")?)?;
     let hi = p_ya(js(j, "max_inclusive")?)?;
+    // `inner` defaults to 1 (biased_to_bottom / very_biased_to_bottom);
+    // `plateau` defaults to 0 (trapezoid).
+    let inner = jnum(j, "inner").map(|v| v as i32).unwrap_or(1);
+    let plateau = jnum(j, "plateau").map(|v| v as i32).unwrap_or(0);
     Some(match ty {
         "uniform" => HP::Uniform(lo, hi),
-        "trapezoid" => HP::Trap(lo, hi),
-        "very_biased_to_bottom" | "biased_to_bottom" => HP::VeryBias(lo, hi),
+        "trapezoid" => HP::Trap(lo, hi, plateau),
+        "biased_to_bottom" => HP::Biased(lo, hi, inner),
+        "very_biased_to_bottom" => HP::VeryBias(lo, hi, inner),
         _ => return None,
     })
 }

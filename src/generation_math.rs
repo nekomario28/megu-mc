@@ -228,7 +228,10 @@ impl Xor {
     }
     // nextInbetween inclusive: next_bounded(max-min+1)+min
     pub(crate) fn next_inbetween(&mut self, min: i32, max: i32) -> i32 {
-        if min >= max {
+        // `Mth.randomBetweenInclusive` = `nextInt(max - min + 1) + min`: it
+        // draws even when min == max (`nextInt(1)`), and skipping that draw
+        // shifts every later value in the stream.
+        if max < min {
             return min;
         }
         self.next_bound(max - min + 1) + min

@@ -772,6 +772,9 @@ fn gen_vein(
 }
 
 
+/// (feature index << 32) | step of the placed feature currently being generated.
+pub(crate) static CUR_FEAT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
 fn gen_ore(
     ctx: &mut FC,
     rng: &mut Xor,
@@ -784,7 +787,11 @@ fn gen_ore(
     if let Ok(spec) = std::env::var("ORE_TRACE") {
         if let Some((a, b)) = spec.split_once(',') {
             if a.parse::<i32>() == Ok(pos.0 >> 4) && b.parse::<i32>() == Ok(pos.2 >> 4) {
-                eprintln!("ORE {} {} {} size={} scattered={}", pos.0, pos.1, pos.2, size, scattered);
+                let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "ORE {} {} {} size={} feature={},{}",
+                    pos.0, pos.1, pos.2, size, cf >> 32, cf & 0xFFFF
+                );
             }
         }
     }
@@ -2535,6 +2542,16 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             }
         }
     }
+    if let Ok(spec) = std::env::var("FEAT_LIST") {
+        if let Ok(st) = spec.parse::<usize>() {
+            if let Some(l) = fr.order.get(st) {
+                for (gi, name) in l.iter() {
+                    eprintln!("FEATLIST {st} {gi} {name}");
+                }
+            }
+            return;
+        }
+    }
     let pop = pop_seed(g.wseed(), sx * 16, sz * 16);
     let mut ctx = FC::new(g);
     let trace = std::env::var("FEAT_TRACE").is_ok();
@@ -2555,6 +2572,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             let deco = pop
                 .wrapping_add(*gi as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));
+            CUR_FEAT.store(((*gi as i64) << 32) | step as i64, std::sync::atomic::Ordering::Relaxed);
             // feature placement sees a `WorldgenRandom` (legacy draw semantics)
             let mut rng = Xor::seed_worldgen(deco);
             if let Ok(spec) = std::env::var("FSEED_ARM") {

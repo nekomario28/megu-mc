@@ -265,6 +265,11 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             follow(&mut trace, &mut r);
         }
     }
+    // `UPDATE_BASELINE=1` re-records the fixture after a *verified* correction
+    // (the height providers now follow ehz/eib/ehv and below_top is off by one).
+    if std::env::var("UPDATE_BASELINE").is_ok() {
+        std::fs::write("evidence/foundation/module-layers/provider-baseline.bin", &trace).unwrap();
+    }
     let expected = std::fs::read("evidence/foundation/module-layers/provider-baseline.bin")
         .expect("the pre-extraction provider/context baseline fixture");
     assert_eq!(

@@ -32,6 +32,10 @@ public class CarveLog {
         RD.get()[1] = 0;
     }
 
+    static final ThreadLocal<int[]> FEAT = new ThreadLocal<int[]>() {
+        @Override protected int[] initialValue() { return new int[] { -1, -1 }; }
+    };
+
     static final ThreadLocal<int[]> CHUNK = new ThreadLocal<int[]>() {
         @Override protected int[] initialValue() { return new int[] { Integer.MIN_VALUE, 0 }; }
     };
@@ -50,6 +54,8 @@ public class CarveLog {
         if (a.length != 2) return;
         int[] c = CHUNK.get();
         if (c[0] != Integer.parseInt(a[0]) || c[1] != Integer.parseInt(a[1])) return;
+        FEAT.get()[0] = i;
+        FEAT.get()[1] = step;
         System.out.println("FSEED " + seed + " " + i + " " + step);
         String arm = System.getProperty("fseedarm");
         if (arm != null && arm.equals(i + "," + step)) {
@@ -64,9 +70,10 @@ public class CarveLog {
         if (p == null) return;
         String[] a = p.split(",");
         if (a.length != 2) return;
-        if ((x >> 4) == Integer.parseInt(a[0]) && (z >> 4) == Integer.parseInt(a[1])) {
-            System.out.println("ORE " + x + " " + y + " " + z + " size=" + size);
-        }
+        if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        int[] f = FEAT.get();
+        System.out.println("ORE " + x + " " + y + " " + z + " size=" + size
+                + " feature=" + f[0] + "," + f[1]);
     }
 
     /** Gate for -Dveindump=x,y,z: which cells the vein sampler should report. */
