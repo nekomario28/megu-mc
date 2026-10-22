@@ -11,3 +11,4 @@ __pycache__/
 /compat/neoforge-events/.cache/
 /compat/neoforge-events/.build/
 /compat/neoforge-events/__pycache__/
+logs/
