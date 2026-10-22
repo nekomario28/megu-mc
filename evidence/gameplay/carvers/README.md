@@ -774,3 +774,35 @@ y=28..45 は 3 本目（y≈33）のトンネルの分。
 次の一手: `ebb.carve` の 3 本目のトンネルで、yaw/pitch/count/seed を
 エージェントから記録し、こちらの `CARVE_RNG`（`RNG <method> <value>`）と
 先頭から並べる。最初に食い違う値がそのままバグの位置になる。
+
+## 23. トンネル単位の実測: seed と y/z が違う
+
+エージェントに `ebb`（CaveWorldCarver）の `carveTunnel` フックを足した。
+descriptor は `(Leaz;Leba;Lduy;Ljava/util/function/Function;JLdyk;DDDDDFFFIIDLdux;Lebe$a;)V`
+（ジェネリクス `C` の消去が `ebe` では `eax`、`ebb` では `eba` になる点に注意）。
+ローカルは seed=5-6, x/y/z=8..17, yScale/yaw/pitch=18/19/20, branchIndex/Count=21/22。
+
+4 chunk の固定具で **10,475 回**の carveTunnel 呼び出しを記録。source (1,-3) の
+最初のトンネルを比べると:
+
+```
+実サーバー: seed=1754441436904522573  x=20 y=34  z=-41 yaw=2.4176 pitch=0.0605 count=86
+こちらの port: seed=138348582335151166  x=20 y=84  z=-46 yaw=4.6633 pitch=-0.0023 count=92
+```
+
+**x だけ一致し、y・z・seed・yaw・count がすべて違う。** トンネル開始前のドローは
+「tunnels の nextInt 連鎖3回 + x の nextInt(16)」だけなので、`x` が同じで `y` が
+違うのは、**y のサンプル（`nextInt` 2回）でストリームがずれている**ことを意味する。
+`UniformHeight` の `inner` 既定は 1（codec の `optionalFieldOf("inner", 1)`）で
+bound は `hi - lo - inner + 1 = 236`、こちらも同じ 236 を使っているので、bound の
+差ではなく**直前のストリーム**が違う。
+
+未解決の観測: 同じ `s=1,-3` でも target が違うと ATUN の y/z が変わる
+（(20,34,-41) と (16,101,-40) が混在）。seed は `(worldSeed, k, sourceX, sourceZ)`
+だけで決まるので target 非依存のはずで、`s=` の attribution（thread-local の
+設定/解除）を疑う必要がある。ここを確定してから「seed が違う」と結論する。
+
+次の一手: プローブの DRAW ログ（`-Donly=1,-3 -Dleg=1`）と本 port の
+`CARVE_RNG=1,-3` トレースを先頭 10 ドローで並べる。プローブの DRAW ゲートは
+`-Donly` 指定時にも出るよう修正済み（この commit）。ただしプローブ実行は
+まだ bootstrap で落ちており（`starts=` まで到達しない）、そこを直す必要がある。

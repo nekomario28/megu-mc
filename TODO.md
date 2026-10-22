@@ -47,6 +47,11 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §23: `ebb.carveTunnel` を計測（10,475 回）。source (1,-3) の最初のトンネルは
+    実サーバー (20,34,-41) seed=1754441436904522573 / こちら (20,84,-46)
+    seed=138348582335151166。**x だけ一致、y/z/seed/yaw が違う** → y サンプルで
+    ストリームがずれている。bound は両者 236 で同じ。次は DRAW ログと
+    `CARVE_RNG` を先頭 10 ドローで比較（プローブの bootstrap 修正が先）。
   - §22: `ehv`(UniformHeight) の inner 既定は 1 で、こちらの y サンプルと一致。
     §21 の「y が違う」は錯覚（y=84/122 のトンネルは空を掘るので ASTATE に出ない）。
     残る差は 3 本目 (start (23,33,-36)) が target (0,0) に届くか。yaw/pitch/count を

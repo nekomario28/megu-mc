@@ -28,6 +28,54 @@ public class Agent {
         inst.addTransformer(new Transformer());
     }
 
+    static boolean hasTunnel(byte[] buf) {
+        for (String d : CARVE_TUNNEL_DESCS) {
+            if (new String(buf, java.nio.charset.StandardCharsets.ISO_8859_1).contains(d)) return true;
+        }
+        return false;
+    }
+
+    static final String[] CARVE_TUNNEL_DESCS = {
+        // C is a generic parameter: erased as `eax` on WorldCarver, `eba` on
+        // CaveWorldCarver. The tunnel lives on the subclass.
+        "(Leaz;Leba;Lduy;Ljava/util/function/Function;JLdyk;DDDDDFFFIIDLdux;Lebe$a;)V",
+        "(Leaz;Leax;Lduy;Ljava/util/function/Function;JLdyk;DDDDDFFFIIDLdux;Lebe$a;)V",
+    };
+
+    /** `WorldCarver.carveTunnel`: log seed, start, yaw/pitch and length. */
+    static byte[] instrumentTunnel(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !java.util.Arrays.asList(CARVE_TUNNEL_DESCS).contains(md)) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            // seed=5-6, x/y/z=8..17, yaw/pitch=18/19, count=22
+                            super.visitVarInsn(Opcodes.LLOAD, 5);
+                            super.visitVarInsn(Opcodes.DLOAD, 8);
+                            super.visitVarInsn(Opcodes.DLOAD, 10);
+                            super.visitVarInsn(Opcodes.DLOAD, 12);
+                            super.visitVarInsn(Opcodes.FLOAD, 19);   // yaw
+                            super.visitVarInsn(Opcodes.FLOAD, 20);   // pitch
+                            super.visitVarInsn(Opcodes.ILOAD, 22);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "tunnel",
+                                "(JDDDFFI)V", false);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT tunnel transform failed: " + t);
+            return null;
+        }
+    }
+
     /** `CaveWorldCarver.carve(...)`: track which source chunk the writes belong to. */
     static byte[] instrumentCarve(byte[] buf) {
         try {
@@ -116,7 +164,11 @@ public class Agent {
     static class Transformer implements ClassFileTransformer {
         @Override public byte[] transform(ClassLoader l, String name, Class<?> c,
                                           ProtectionDomain pd, byte[] buf) {
-            if ("ebb".equals(name)) return instrumentCarve(buf);
+            if ("ebb".equals(name)) {
+                byte[] b = instrumentCarve(buf);
+                return instrumentTunnel(b != null ? b : buf);
+            }
+            if ("ebe".equals(name) && buf != null && hasTunnel(buf)) return instrumentTunnel(buf);
             if ("ebe".equals(name)) return instrumentCarveState(buf);
             if (!"dzb".equals(name)) return null;
             try {

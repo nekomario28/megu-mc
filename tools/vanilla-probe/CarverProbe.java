@@ -216,7 +216,7 @@ public class CarverProbe {
                             Object r;
                             try { r = m.invoke(real, a); }
                             catch (InvocationTargetException e) { throw e.getCause(); }
-                            if (LEG && firstOrigin[0] == cxo * 1000 + czo && n[0] < 60) {
+                            if (LEG && (only != null || firstOrigin[0] == cxo * 1000 + czo) && n[0] < 60) {
                                 StringBuilder sb = new StringBuilder("DRAW o=" + cxo + "," + czo + " " + m.getName() + "(");
                                 if (a != null) for (Object o : a) sb.append(o).append(",");
                                 System.out.println(sb + ") -> " + r);

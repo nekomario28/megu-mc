@@ -2161,6 +2161,16 @@ impl CarveRun {
                 // a tunnel is up to CARVE_STEPS long, minus up to a quarter
                 let count = CARVE_STEPS - r.next_bound(CARVE_STEPS / 4);
                 let seed = r.next_i64() as u64;
+                if let Ok(spec) = std::env::var("CV_TUN") {
+                    if spec == "all" || spec == format!("{ox},{oz}") {
+                        eprintln!(
+                            "TUN ox={ox} oz={oz} seed={seed} x={} y={} z={} yaw={yaw} pitch={pitch} count={count}",
+                            x.floor(),
+                            y.floor(),
+                            z.floor()
+                        );
+                    }
+                }
                 self.tunnel(
                     g, cc, c, seed, x, y, z, hrm, vrm, y_scale, yaw, pitch, 0, count, 1.0,
                 );
