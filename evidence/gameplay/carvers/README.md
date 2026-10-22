@@ -806,3 +806,37 @@ bound は `hi - lo - inner + 1 = 236`、こちらも同じ 236 を使ってい�
 `CARVE_RNG=1,-3` トレースを先頭 10 ドローで並べる。プローブの DRAW ゲートは
 `-Donly` 指定時にも出るよう修正済み（この commit）。ただしプローブ実行は
 まだ bootstrap で落ちており（`starts=` まで到達しない）、そこを直す必要がある。
+
+## 24. probe と実サーバーが同じ seed で違う → ドロー列をサーバー側で取るしかない
+
+probe（vanilla のクラスを直接呼ぶ）に `-Donly=1,-3 -Dleg=1` を付けて、source
+(1,-3) の最初のトンネルのドロー列を取った（`tools/vanilla-probe/CarverProbe.java`
+の DRAW ゲートを `-Donly` 指定時にも出るよう修正）:
+
+```
+i()      -> 0.12260747      // isStartChunk: 0.1226 < 0.15 → start
+a(15)    -> 7               // inner
+a(8)     -> 7               // mid
+a(8)     -> 3               // tunnels = 3
+a(16)    -> 4               // x = 16 + 4 = 20      ← 実サーバーと一致
+a(236)   -> 156             // y 1回目 (hi-lo-inner+1 = 236)
+a(157)   -> 140             // y 2回目 → y = 140 - 56 = 84
+a(16)    -> 2               // z = -48 + 2 = -46
+```
+
+つまり probe（＝こちらの port）は **(20, 84, -46)**。実サーバーの ATUN は
+**(20, 34, -41)** で、`y=34` は `nextInt(91)=90` 相当、`z=-41` は
+`nextInt(16)=9` 相当。初期 seed を 0/12345/999 に振っても probe の値は不変
+（`setLargeFeatureSeed` が完全に再 seed するため）なので、**同じ
+`setLargeFeatureSeed(0, 1, -3)` から出発しているのに 2 回目の y ドローで
+食い違う**。
+
+probe と実サーバーは同じ `dzx.c(JII)`（`WorldgenRandom` の継承メソッド）を
+呼んでいるはずで、そこが食い違うなら**推測をやめてサーバー内で生ドローを取る**
+しかない。次の一手は `ayw` をエージェントでプロキシし、`applyCarvers` が
+作る `WorldgenRandom` の `nextInt/nextLong/nextFloat` を先頭 10 回ぶん記録して、
+probe の DRAW 列と直接 diff すること。
+
+（なお実サーバーの ATUN は source あたり 5 種類のトンネルが各 121 回出る。
+5 = 1 start の tunnels(3) + room 分岐(2)、121 = その source が start になる
+target の数、で説明がつくので attribution 自体は正しい。）

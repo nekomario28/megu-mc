@@ -47,6 +47,11 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §24: probe の DRAW 列を取得（`-Donly` 対応に修正）。source (1,-3) は
+    x=4→20, y 156/140→84, z 2→-46。実サーバーは y=34, z=-41 なので
+    **同じ setLargeFeatureSeed(0,1,-3) から2回目の y ドローで食い違う**。
+    初期 seed を振っても probe は不変。次は `ayw` をサーバー側でプロキシして
+    生ドローを記録し、probe と diff する（推測をやめる）。
   - §23: `ebb.carveTunnel` を計測（10,475 回）。source (1,-3) の最初のトンネルは
     実サーバー (20,34,-41) seed=1754441436904522573 / こちら (20,84,-46)
     seed=138348582335151166。**x だけ一致、y/z/seed/yaw が違う** → y サンプルで

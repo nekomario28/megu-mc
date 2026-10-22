@@ -207,7 +207,7 @@ public class CarverProbe {
                 int cxo = tx + dx, czo = tz + dz;
                 String only = System.getProperty("only");
                 if (only != null && !only.equals(cxo + "," + czo)) continue;
-                dzx real = new dzx(new dyz(0L));
+                dzx real = new dzx(new dyz(Long.getLong("iseed", 0L)));
                 real.c(seed + Integer.getInteger("k", 0), cxo, czo);
                 final int[] n = {0};
                 final int[] firstOrigin = {-1};
