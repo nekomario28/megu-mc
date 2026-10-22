@@ -1736,9 +1736,10 @@ impl FProv {
     }
 }
 
-/// A `HeightProvider`. The uniform form draws twice (`UniformHeight` in the
-/// bytecode: `nextInt(range)` then `nextInt(k + 1) + min`), so the draw count is
-/// part of the contract.
+/// A `HeightProvider`. `minecraft:uniform` is `eia` in 1.21.1, which resolves
+/// both anchors and calls `Mth.randomBetweenInclusive` - a *single*
+/// `nextInt(max - min + 1)`. `ehv` (trapezoid, `nextInt` twice) is a different
+/// provider; copying its shape shifts every later draw in the tunnel.
 #[derive(Clone, Copy)]
 enum HProv {
     Const(Anchor),
@@ -1752,12 +1753,11 @@ impl HProv {
             HProv::Uniform(a, b) => {
                 let lo = a.resolve(min_y, height);
                 let hi = b.resolve(min_y, height);
-                let n = hi - lo;
-                if n <= 0 {
+                if lo > hi {
+                    // `eia` warns once and returns the minimum.
                     return lo;
                 }
-                let k = r.next_bound(n);
-                r.next_bound(k + 1) + lo
+                r.next_bound(hi - lo + 1) + lo
             }
         }
     }
@@ -1916,6 +1916,13 @@ fn p_carver(j: &J) -> Option<CarverDef> {
 /// `WorldgenRandom.setLargeFeatureSeed`: two raw longs and a XOR, no `|1` — the
 /// population seed used by the feature layer is a different function.
 fn set_large_feature_seed(r: &mut Lcg, seed: u64, cx: i32, cz: i32) {
+    if let Ok(spec) = std::env::var("CARVE_RAW") {
+        if let Some((a, b)) = spec.split_once(',') {
+            if a.parse::<i32>() == Ok(cx) && b.parse::<i32>() == Ok(cz) {
+                crate::generation_math::RAW_ARM.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     let mut s = Lcg::new(seed);
     let l = s.next_i64();
     let m = s.next_i64();

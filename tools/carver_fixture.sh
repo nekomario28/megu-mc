@@ -89,7 +89,7 @@ if [ -n "${CARVER_FIXTURE_FRESH:-}" ]; then
 fi
 lox=$((X0*16)); loz=$((Z0*16)); hix=$(((X0+N)*16-1)); hiz=$(((Z0+N)*16-1))
 AGENT=""
-[ -n "${CARVE_AGENT:-}" ] && AGENT="-javaagent:$CARVE_AGENT"
+[ -n "${CARVE_AGENT:-}" ] && AGENT="-javaagent:$CARVE_AGENT $CARVE_AGENT_OPTS"
 ( cd "$DIR" && printf 'forceload add %d %d %d %d\nsave-all flush\nstop\n' "$lox" "$loz" "$hix" "$hiz" \
   | timeout 240 systemd-run --scope --user -p MemoryMax=3G --unit="cf-$TAG-$$" \
       java -Xmx2G -Xms512M $AGENT -jar server.jar nogui > run.log 2>&1 || true )

@@ -47,6 +47,11 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §25（解決）: `minecraft:uniform` height provider は 1.21.1 では `eia` で
+    `nextInt(max-min+1)` の**1 ドロー**。port は `ehv`(trapezoid) の 2 ドローで
+    組んでいたため draw が 1 つずれ、全トンネルが別物になっていた。
+    修正後: cave only 2×2 = **0**、全 carver 2×2 = **0**。8×8 spawn 周辺に
+    state 1↔2 の 52 セル残差（carver とは別件）。
   - §24: probe の DRAW 列を取得（`-Donly` 対応に修正）。source (1,-3) は
     x=4→20, y 156/140→84, z 2→-46。実サーバーは y=34, z=-41 なので
     **同じ setLargeFeatureSeed(0,1,-3) から2回目の y ドローで食い違う**。

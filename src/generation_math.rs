@@ -250,6 +250,9 @@ fn rtrace(name: &str, v: String) {
     eprintln!("RNG {name} {v}");
 }
 
+/// -1 = disarmed; otherwise the number of draws already traced.
+pub(crate) static RAW_ARM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 pub(crate) struct Lcg {
     seed: u64,
 }
@@ -260,7 +263,15 @@ impl Lcg {
     }
     fn nx(&mut self, bits: u32) -> u64 {
         self.seed = self.seed.wrapping_mul(0x5DEECE66D).wrapping_add(11) & 0xFF_FFFF_FFFF_FF;
-        self.seed >> (48 - bits)
+        let v = self.seed >> (48 - bits);
+        // CARVE_RAW=<cx>,<cz>: dump the first 16 raw next(bits) values after that
+        // chunk's carver reseed, to diff against the server's RBITS trace.
+        let n = RAW_ARM.load(std::sync::atomic::Ordering::Relaxed);
+        if n >= 0 {
+            eprintln!("RBITS {n} bits={bits} -> {v}");
+            RAW_ARM.store(if n + 1 >= 16 { -1 } else { n + 1 }, std::sync::atomic::Ordering::Relaxed);
+        }
+        v
     }
     pub(crate) fn next_i32(&mut self) -> i32 {
         let v = self.nx(32) as u32 as i32;

@@ -161,6 +161,114 @@ public class Agent {
         }
     }
 
+    /** Logs the LCG state that c(JII) (setLargeFeatureSeed) leaves behind. */
+    static byte[] instrumentRSeed(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("c") || !md.equals("(JII)V")) return drawHook(mv, mn, md);
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            super.visitVarInsn(Opcodes.ILOAD, 3);
+                            super.visitVarInsn(Opcodes.ILOAD, 4);
+                            super.visitVarInsn(Opcodes.LLOAD, 1);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rseedIn", "(IIJ)V", false);
+                        }
+                        @Override public void visitInsn(int op) {
+                            if (op == Opcodes.RETURN) {
+                                super.visitVarInsn(Opcodes.ILOAD, 3);
+                                super.visitVarInsn(Opcodes.ILOAD, 4);
+                                super.visitVarInsn(Opcodes.ALOAD, 0);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rseedOut",
+                                                      "(IILjava/lang/Object;)V", false);
+                            }
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT rseed failed: " + t);
+            return null;
+        }
+    }
+
+    /** dyz.c(int) is next(bits), the single funnel behind every dyn draw. */
+    static byte[] instrumentBits(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("c") || !md.equals("(I)I")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            if (op != Opcodes.IRETURN) { super.visitInsn(op); return; }
+                            super.visitVarInsn(Opcodes.ISTORE, 40);
+                            super.visitVarInsn(Opcodes.ILOAD, 1);
+                            super.visitInsn(Opcodes.I2L);
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
+                            super.visitInsn(Opcodes.I2L);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rbits",
+                                                  "(JJ)V", false);
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT bits failed: " + t);
+            return null;
+        }
+    }
+
+    /** Logs the first draws after a reseed, so the server's stream is readable. */
+    static MethodVisitor drawHook(MethodVisitor mv, String mn, String md) {
+        final boolean isInt = mn.equals("f") && md.equals("()I");
+        final boolean isFloat = mn.equals("i") && md.equals("()F");
+        final boolean isLong = mn.equals("g") && md.equals("()J");
+        final boolean isBound = mn.equals("a") && md.equals("(I)I");
+        if (!isInt && !isFloat && !isLong && !isBound) return mv;
+        final int slot = 40;
+        final String label = isInt ? "nextInt" : isFloat ? "nextFloat" : isLong ? "nextLong" : "nextInt(b)";
+        return new MethodVisitor(Opcodes.ASM9, mv) {
+            @Override public void visitInsn(int op) {
+                boolean isReturn = (isInt || isBound) ? op == Opcodes.IRETURN
+                    : isFloat ? op == Opcodes.FRETURN : op == Opcodes.LRETURN;
+                if (!isReturn) { super.visitInsn(op); return; }
+                if (isInt || isBound) {
+                    super.visitVarInsn(Opcodes.ISTORE, slot);
+                } else if (isFloat) {
+                    super.visitVarInsn(Opcodes.FSTORE, slot);
+                } else {
+                    super.visitVarInsn(Opcodes.LSTORE, slot);
+                }
+                super.visitLdcInsn(label);
+                if (isBound) { super.visitVarInsn(Opcodes.ILOAD, 1); super.visitInsn(Opcodes.I2L); }
+                else { super.visitLdcInsn(Long.valueOf(-1L)); }
+                if (isInt || isBound) { super.visitVarInsn(Opcodes.ILOAD, slot); super.visitInsn(Opcodes.I2L); }
+                else if (isFloat) { super.visitVarInsn(Opcodes.FLOAD, slot); super.visitInsn(Opcodes.F2L); }
+                else { super.visitVarInsn(Opcodes.LLOAD, slot); }
+                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdraw",
+                                      "(Ljava/lang/String;JJ)V", false);
+                if (isLong) super.visitVarInsn(Opcodes.LLOAD, slot);
+                else if (isFloat) super.visitVarInsn(Opcodes.FLOAD, slot);
+                else super.visitVarInsn(Opcodes.ILOAD, slot);
+                super.visitInsn(op);
+            }
+        };
+    }
+
     static class Transformer implements ClassFileTransformer {
         @Override public byte[] transform(ClassLoader l, String name, Class<?> c,
                                           ProtectionDomain pd, byte[] buf) {
@@ -170,6 +278,8 @@ public class Agent {
             }
             if ("ebe".equals(name) && buf != null && hasTunnel(buf)) return instrumentTunnel(buf);
             if ("ebe".equals(name)) return instrumentCarveState(buf);
+            if ("dzx".equals(name)) return instrumentRSeed(buf);
+            if ("dyz".equals(name)) return instrumentBits(buf);
             if (!"dzb".equals(name)) return null;
             try {
                 ClassReader cr = new ClassReader(buf);

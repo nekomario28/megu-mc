@@ -840,3 +840,50 @@ probe の DRAW 列と直接 diff すること。
 （なお実サーバーの ATUN は source あたり 5 種類のトンネルが各 121 回出る。
 5 = 1 start の tunnels(3) + room 分岐(2)、121 = その source が start になる
 target の数、で説明がつくので attribution 自体は正しい。）
+
+## 25. 原因: `minecraft:uniform` の height provider は 1 回しか引かない
+
+サーバーの生ドローを取るため、エージェントに
+
+- `dzx.c(JII)` (`setLargeFeatureSeed`) の reseed を記録
+- `dyz.c(I)` = `dyn` の `next(bits)` — **全ドローの唯一の関所** — の戻り値を 16 回ぶん記録
+
+を足し、port 側にも `CARVE_RAW=<cx>,<cz>`（reseed 後の `nx(bits)` を 16 回）を入れて
+同じ生値を出した。source (1,-3), k=0, seed=0:
+
+```
+server: 0:24->2057012 1:31->297986332 2:31->1934649034 3:31->896980054
+        4:31->545566709 5:31->436620924 6:31->1021188899 7:24->2285188 ...
+port  : 4:24->2057012 5:31->297986332 ...   (先頭4つは seed 混合の nextLong)
+```
+
+7 ドロー目まで完全一致。その次に server は **float**、port は int (z) を引く。
+
+`ebb.a(...)` の bytecode の順序は
+`x=nextInt(16) → y=cfg.e.a(random,ctx) → z=nextInt(16) → hrm → vrm → floor → nextInt(4)`
+で port の順序は正しい。ずれは **y のドロー数**だった:
+
+- `ehv`（3 フィールド = trapezoid）は `nextInt(range-plateau+1)` と `nextInt(k+plateau)` の 2 回
+- 1.21.1 の `minecraft:uniform` は **`eia`** で、`Mth.randomBetweenInclusive`
+  （`ayo.b`）= `nextInt(max-min+1)` の **1 回**。`i > j` なら warn して min を返す
+
+server の 5 番目 `436620924 % 237 = 90` → `y = 90 - 56 = 34` ✓ ATUN の y=34、
+6 番目 `1021188899` → `nextInt(16) = 7` → `z = -41` ✓ ATUN の z=-41。**ATUN は正しかった。**
+
+port は probe が `ehv`（trapezoid, plateau=1）で組んでいたのに引きずられ、2 回引いていた。
+draw が 1 つずれると yaw/pitch/yScale/count/seed が全部ずれ、トンネルが別物になる。
+
+### 修正と結果
+
+`HProv::Uniform` を `lo + next_bound(hi - lo + 1)` の 1 ドローに修正:
+
+| 固定具 | 修正前 | 修正後 |
+|---|---|---|
+| cave only 2×2 (0,0) | 617 | **0** |
+| 全 carver 2×2 (0,0) | 617+341 | **0** |
+| 8×8 spawn 周辺（比較 42 chunk） | — | 52（3 chunk、`deep` 層、state 1↔2） |
+
+8×8 の残差は spawn 準備の partially generated chunk 22 個を除いた領域に出ており、
+carver の出力（air を掘る）ではなく state 1↔2 の入れ替わりなので別件として追う。
+
+probe (`CarverProbe`) は今も `ehv` で組んでいるので `eia`/`ayo.b` に直す必要がある（TODO）。
