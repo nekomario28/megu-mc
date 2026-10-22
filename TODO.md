@@ -47,6 +47,10 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §22: `ehv`(UniformHeight) の inner 既定は 1 で、こちらの y サンプルと一致。
+    §21 の「y が違う」は錯覚（y=84/122 のトンネルは空を掘るので ASTATE に出ない）。
+    残る差は 3 本目 (start (23,33,-36)) が target (0,0) に届くか。yaw/pitch/count を
+    エージェントで記録し CARVE_RNG と並べるのが次。
   - §21: §20 を訂正。no-fold / 隣 chunk read / ellipsoid bail-out 削除はいずれも
     617 のまま（効かない）。決定的なのは y の分布: 実サーバーの source (1,-3) は
     y=28..45 にしか彫っておらず（y>70 は 0）、こちらのトンネル開始は

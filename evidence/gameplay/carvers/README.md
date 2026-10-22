@@ -747,3 +747,30 @@ provider のサンプル方法（nextInt の回数/範囲）が疑わしい。�
 `ehx`/`ehv` の `sample` を計測し、`above_bottom`/`absolute` の解決値と
 `nextInt` の引数を実測する）。こちらの `c.y.sample` の実装
 （`p_anchor` → `c.y.resolve(min_y, height)`）と突き合わせる。
+
+## 22. §21 の訂正: y サンプルは一致していた
+
+`ehv`（UniformHeight）の bytecode を読み直した:
+
+```java
+int lo = min.resolveY(ctx), hi = max.resolveY(ctx);   // -56, 180
+if (hi - lo - inner + 1 <= 0) return lo;              // inner default = 1
+int k = random.nextInt(hi - lo - inner + 1);          // nextInt(236)
+return random.nextInt(k + inner) + lo;                // nextInt(k+1) + lo
+```
+
+`inner` の既定値は codec の `optionalFieldOf("inner", 1)` で **1**。こちらの
+`HProv::Uniform`（`next_bound(hi-lo)` → `next_bound(k+1) + lo`）と**一致**する。
+
+§21 の「y が違う」に見えたのは錯覚で、**y=84/122 のトンネルは空を掘るので
+`canReplaceBlock` が false になり ASTATE に出ない**だけだった。実サーバーの
+y=28..45 は 3 本目（y≈33）のトンネルの分。
+
+よって残る差は 3 本目（source (1,-3), start (23,33,-36)）が **target (0,0) に
+届くかどうか**。vanilla は (0,34,0) を彫るが、こちらは同じ source から
+1 セルも書かない。候補は yaw/pitch の以後のドロー、`count`（トンネル長）、
+`can_reach` の打ち切り位置、ellipsoid のクリップ。
+
+次の一手: `ebb.carve` の 3 本目のトンネルで、yaw/pitch/count/seed を
+エージェントから記録し、こちらの `CARVE_RNG`（`RNG <method> <value>`）と
+先頭から並べる。最初に食い違う値がそのままバグの位置になる。
