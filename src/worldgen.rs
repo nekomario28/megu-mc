@@ -208,6 +208,31 @@ impl SC {
 // bound on the shared quart -> biome cache
 const BIO_CAP: usize = 1 << 18;
 
+/// One router entry: either a resource name or an inline density-function object.
+fn router_df(g: &mut Gen, files: &HashMap<String, Vec<u8>>, j: &J) -> Option<usize> {
+    let name = j.str();
+    if !name.is_empty() {
+        if let Some(i) = g.resolve_ref(files, name) {
+            return Some(i);
+        }
+    }
+    g.node(j, files)
+}
+
+/// The three vein functions plus the six block states `OreVeinSampler` uses.
+#[derive(Clone, Copy)]
+struct VeinCfg {
+    toggle: usize,
+    ridged: usize,
+    gap: usize,
+    copper_ore: u32,
+    copper_raw: u32,
+    copper_fill: u32,
+    iron_ore: u32,
+    iron_raw: u32,
+    iron_fill: u32,
+}
+
 pub struct Gen {
     dfs: Vec<DF>,
     names: HashMap<String, usize>,
@@ -220,6 +245,10 @@ pub struct Gen {
     climate: Option<[usize; 6]>,
     // vanilla depth = grad(y) + offset(x,z) — (fc,fv,tc,tv, offset_df)
     depth_split: Option<(f64, f64, f64, f64, usize)>,
+    // 1.21.1 ore veins: `ore_veins_enabled` plus the router's vein functions
+    vein: Option<VeinCfg>,
+    // scratch memo for the vein sampler's density evaluations
+    memo: HashMap<(usize, i32, i32, i32), f64>,
     btree: Option<BT>,
     leaf_ps: Vec<[[i32; 2]; 7]>,
     biome_names: Vec<String>,
@@ -393,6 +422,8 @@ impl Gen {
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            vein: None,
+            memo: HashMap::new(),
             world_seed: seed,
         };
         // noise settings (sea level, bounds, router names)
@@ -420,6 +451,44 @@ impl Gen {
             .map(|j| j.str().to_string())?;
         let idx = g.resolve_ref(&files, &fd)?;
         g.final_density = idx;
+        // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
+        // from three router functions; 1.21.2+ moved them into a material rule.
+        // The sampler reproduces `OreVeinSampler`'s control flow but still
+        // disagrees with vanilla on which cells survive its gates (34 granite
+        // against 44 for chunk (-3,3), versus 48 for the 1.21.2 material rule),
+        // so it stays opt-in until that is resolved.
+        if jbool(&ns, "ore_veins_enabled", false)
+            && matches!(std::env::var("MC_SPINE_OREVEIN").as_deref(), Ok("sampler"))
+        {
+            let get = |k: &str| router.and_then(|r| r.get(k)).cloned();
+            if let (Some(a), Some(b), Some(c)) =
+                (get("vein_toggle"), get("vein_ridged"), get("vein_gap"))
+            {
+                // the vein functions are *inline* objects in 1.21.1, not names
+                let (ta, tb, tc) = (
+                    router_df(&mut g, &files, &a),
+                    router_df(&mut g, &files, &b),
+                    router_df(&mut g, &files, &c),
+                );
+                if std::env::var("MC_SPINE_VEINDBG").is_ok() {
+                    eprintln!("VEINCFG refs a={:?} b={:?} c={:?}", ta, tb, tc);
+                }
+                if let (Some(ta), Some(tb), Some(tc)) = (ta, tb, tc) {
+                    let st = |n: &str| crate::name_to_state(n).unwrap_or(0);
+                    g.vein = Some(VeinCfg {
+                        toggle: ta,
+                        ridged: tb,
+                        gap: tc,
+                        copper_ore: st("minecraft:copper_ore"),
+                        copper_raw: st("minecraft:raw_copper_block"),
+                        copper_fill: st("minecraft:granite"),
+                        iron_ore: st("minecraft:deepslate_iron_ore"),
+                        iron_raw: st("minecraft:raw_iron_block"),
+                        iron_fill: st("minecraft:tuff"),
+                    });
+                }
+            }
+        }
         // climate router ids for biome multi-noise sampling
         {
             let keys = [
@@ -609,6 +678,12 @@ impl Gen {
             "block" => Rule::Block(res(j.get("result_state")?.str()).unwrap_or(self.def_st)),
             "bandlands" => Rule::Bandlands,
             "ore_vein" => {
+                // 1.21.1 has no `material_rule`; when the 1.21.1 sampler is
+                // active (ore_veins_enabled), the 1.21.2+ rule would place a
+                // second vein on top of it.
+                if self.vein.is_some() {
+                    return None;
+                }
                 let density = self.node(j.get("density")?, files)?;
                 // bounds check fast-path: density root is range_choice on minecraft:y
                 let (mut ymin, mut ymax) = (i32::MIN, i32::MAX);
@@ -1062,7 +1137,11 @@ impl Gen {
         let mut seen = vec![false; self.dfs.len()];
         let mut out = Vec::new();
         let mut kids = Vec::new();
-        let mut stack = vec![self.final_density];
+        let mut roots = vec![self.final_density];
+        if let Some(v) = self.vein {
+            roots.extend([v.toggle, v.ridged, v.gap]);
+        }
+        let mut stack = roots;
         while let Some(id) = stack.pop() {
             if seen[id] {
                 continue;
@@ -1545,7 +1624,10 @@ impl Gen {
                 }
                 let sp = self.ore_split.as_ref()?;
                 let mut r = sp.pos(c.x, c.y, c.z);
-                if r.next_f32() > d as f32 {
+                // `OreVeinSampler` (dzi in 1.21.1) keeps a cell with probability
+                // VEIN_SOLIDNESS = 0.7; the density value is *not* the probability
+                // (it decides the edge roundoff and the richness band instead).
+                if r.next_f32() > 0.7 {
                     return None;
                 }
                 let richness = self.eval(rich, c.x, c.y, c.z, &mut c.memo) as f32;
@@ -1796,15 +1878,125 @@ impl Gen {
         let d = self.block_density(&cc, x, y, z);
         if d > 0.0 {
             if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
-                return if st == u32::MAX { self.def_st } else { st };
+                let st = if st == u32::MAX { self.def_st } else { st };
+                return self.vein_override(&cc, x, y, z, st);
             }
-            return self.deep_state_cached(x, y, z, &cc);
+            let st = self.deep_state_cached(x, y, z, &cc);
+            return self.vein_override(&cc, x, y, z, st);
         }
         match self.aq_state(x, y, z, d) {
             Some(0) => 0,
             Some(st) => st,
             None => self.deep_state_cached(x, y, z, &cc),
         }
+    }
+
+    /// 1.21.1 `OreVeinSampler` (`dzi` in the obfuscated jar). The terrain state
+    /// is overridden where a vein is present:
+    ///
+    /// ```text
+    /// t = vein_toggle(ctx);  type = t > 0 ? COPPER : IRON
+    /// if y outside [min, max) of the type                     -> no vein
+    /// if |t| + map(min(up, down), 0, 20, -0.2, 0) < 0.4       -> no vein
+    /// r = random at (x,y,z); if r.nextFloat() > 0.7           -> no vein
+    /// if vein_ridged(ctx) >= 0                                -> no vein
+    /// richness = map(|t|, 0.4, 0.6, 0.1, 0.3)
+    /// if r.nextFloat() < richness && vein_gap(ctx) > -0.3
+    ///     -> r.nextFloat() < 0.02 ? raw ore : ore
+    /// else -> filler
+    /// ```
+    ///
+    /// COPPER is y 0..50 with copper_ore / raw_copper_block / granite, IRON is
+    /// y -60..-8 with deepslate_iron_ore / raw_iron_block / tuff.
+    fn vein_override(&mut self, cc: &ChunkCols, x: i32, y: i32, z: i32, st: u32) -> u32 {
+        let v = match self.vein {
+            Some(v) => v,
+            None => {
+                static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+                if std::env::var("MC_SPINE_VEINDBG").is_ok()
+                    && ONCE.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    eprintln!("VEINCFG sampler active but vein=None");
+                }
+                return st;
+            }
+        };
+        if st == 0 {
+            return st;
+        }
+        let map = |v: f64, lo: f64, hi: f64, from: f64, to: f64| {
+            if v <= lo {
+                from
+            } else if v >= hi {
+                to
+            } else {
+                (v - lo) / (hi - lo) * (to - from) + from
+            }
+        };
+        let mut memo = std::mem::take(&mut self.memo);
+        let t = self.eval_c(v.toggle, x, y, z, &mut memo, Some(cc));
+        let (min_y, max_y, ore, raw, fill) = if t > 0.0 {
+            (0i32, 50i32, v.copper_ore, v.copper_raw, v.copper_fill)
+        } else {
+            (-60i32, -8i32, v.iron_ore, v.iron_raw, v.iron_fill)
+        };
+        let dbg = std::env::var("MC_SPINE_VEINTRACE").ok()
+            .and_then(|v| {
+                let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
+                if p.len() == 3 && p[0] == x && p[1] == y && p[2] == z { Some(()) } else { None }
+            })
+            .is_some();
+        if dbg {
+            let inner = match self.dfs[v.toggle] {
+                DF::Interp(i) => i,
+                _ => v.toggle,
+            };
+            let direct = self.eval_c(inner, x, y, z, &mut memo, None);
+            let nodirect = self.eval_c(v.toggle, x, y, z, &mut memo, None);
+            eprintln!(
+                "VEIN {x} {y} {z} t={t:.4} direct={direct:.4} interp_no_cc={nodirect:.4} st={st}"
+            );
+        }
+        let (up, down) = (max_y - y, y - min_y);
+        let out = if up < 0 || down < 0 {
+            None
+        } else {
+            let at = t.abs();
+            let roundoff = map(up.min(down) as f64, 0.0, 20.0, -0.2, 0.0);
+            if at + roundoff < 0.4 {
+                None
+            } else {
+                // `RandomState.at(x,y,z)` derives from the seed source's
+                // `forkPositional()`, which is the Xoroshiro factory here (the
+                // aquifer's own sample positions were verified against it).
+                let mut r = self.factory.pos(x, y, z);
+                let r1 = r.next_f32();
+                if dbg {
+                    eprintln!("VEIN   up={up} down={down} at={at:.4} round={roundoff:.4} r1={r1:.4}");
+                }
+                if r1 > 0.7 {
+                    None
+                } else if self.eval_c(v.ridged, x, y, z, &mut memo, Some(cc)) >= 0.0 {
+                    if dbg { eprintln!("VEIN   ridged reject"); }
+                    None
+                } else {
+                    let richness = map(at, 0.4, 0.6, 0.1, 0.3);
+                    let r2 = r.next_f32();
+                    let gv = self.eval_c(v.gap, x, y, z, &mut memo, Some(cc));
+                    let r3 = r.next_f32();
+                    if dbg {
+                        eprintln!("VEIN   rich={richness:.4} r2={r2:.4} gap={gv:.4} r3={r3:.4}");
+                    }
+                    if (r2 as f64) < richness && gv > -0.3 {
+                        Some(if r3 < 0.02 { raw } else { ore })
+                    } else {
+                        Some(fill)
+                    }
+                }
+            }
+        };
+        self.memo = memo;
+        out.unwrap_or(st)
     }
 
     /// Terrain-layer block state at a world position (no feature layer).
@@ -1827,9 +2019,11 @@ impl Gen {
         let d = self.block_density(cc, x, y, z);
         if d > 0.0 {
             if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
-                return if st == u32::MAX { self.def_st } else { st };
+                let st = if st == u32::MAX { self.def_st } else { st };
+                return self.vein_override(cc, x, y, z, st);
             }
-            return self.deep_state_cached(x, y, z, cc);
+            let st = self.deep_state_cached(x, y, z, cc);
+            return self.vein_override(cc, x, y, z, st);
         }
         match self.aq_state(x, y, z, d) {
             Some(st) => st,

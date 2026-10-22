@@ -999,3 +999,60 @@ if r.next_f32() > d as f32 { return None; }   // ← density を確率として�
 
 **したがって R1a の恒久修正は「データを 1.21.1 jar から再生成 + 1.21.1 の
 OreVeinSampler を実装」**であり、`Rule::OreVein` の微修正では終わらない。
+
+## 29. 1.21.1 の `OreVeinSampler` を特定して実装した（既定では未使用）
+
+`NoiseChunk` (`dzc`) のコンストラクタが
+
+```java
+if (settings.oreVeinsEnabled())
+    list.add(OreVeinSampler.create(router.m(), router.n(), router.o(), randomState.e()));
+```
+
+と `dzi.a(Ldyr;Ldyr;Ldyr;Ldzl;)` を呼ぶ。`dzi` が 1.21.1 の **OreVeinSampler** で、
+bytecode から読んだ本体は:
+
+```
+t = vein_toggle(ctx);  type = t > 0 ? COPPER : IRON
+y が type の帯の外                          -> なし
+|t| + map(min(up,down), 0, 20, -0.2, 0) < 0.4 -> なし
+r = RandomState.at(x,y,z); r.nextFloat() > 0.7 -> なし
+vein_ridged(ctx) >= 0                        -> なし
+richness = map(|t|, 0.4, 0.6, 0.1, 0.3)
+r.nextFloat() < richness && vein_gap(ctx) > -0.3
+    ? (r.nextFloat() < 0.02 ? raw_ore : ore) : filler
+```
+
+`dzi$a` の enum 定数は **COPPER: y 0..50, copper_ore / raw_copper_block / granite**、
+**IRON: y -60..-8, deepslate_iron_ore / raw_iron_block / tuff**（`dga` の static init
+から名前を解決）。ランダムは `RandomState.at` = seed source の `forkPositional()`
+（aquifer のサンプル位置で検証済みの Xoroshiro）。`eie`（MaterialRule のリスト）は
+**最初の非 null** を返すので、鉱脈は地形より前に評価される = 地形を上書きする。
+
+実装は `Gen::vein_override`（`MC_SPINE_OREVEIN=sampler` のときだけ有効）。データは
+1.21.1 の router 3 関数 + `ore_veins_enabled` を
+`datapacks/vanilla/.../noise_settings/overworld.json` に追加した（port のパーサは
+1.21.2 の綴り `input` / `left` / `right` を期待するので、`argument` /
+`argument1` / `argument2` を正規化して入れた）。
+
+### 実測（chunk (‑3,3)、features off）
+
+| 実装 | granite | vanilla と共通 | こちらだけ | vanilla だけ | chunk の全差 |
+|---|---|---|---|---|---|
+| 1.21.2 material rule（既定） | 48 | 42 | 6 | 2 | **10** |
+| sampler（Xoroshiro pos） | 29 | 22 | 7 | 22 | 30 |
+| sampler（LCG pos = `dyz$a`） | 34 | 26 | 8 | 18 | 28 |
+
+補間は効いている: (‑36,27,62) で `t=0.4001`（グリッド補間）vs `0.3997`（直接評価）。
+鉱脈は **0.4 のしきい値**の上に乗っているので、補間が 1e-4 違うだけでセルが反転する。
+
+sampler の制御フローは bytecode と一致しているのに配置が少ないので、次は
+`t` / `ridged` / `gap` の**値そのもの**を vanilla 側で測る（javaagent で
+`dyr.a(dyr$b)` を評価して座標指定で出力する）必要がある。既定は依然
+material rule（差 10 セル）で、sampler は opt-in のまま。
+
+**ハーネスの罠**: `tools/carver_fixture.sh` の `trap restore_repo EXIT` は
+`git checkout -- datapacks/` を実行するので、**未コミットの datapack 変更は
+固定具を 1 回流しただけで消える**（今回それで `ore_veins_enabled` が消え、
+sampler が `vein=None` になって既定と同じ 48 を出した）。データ変更は
+コミットしてから測る。
