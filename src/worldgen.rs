@@ -3202,7 +3202,13 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // against a fresh 1.21.1 world went 44187 -> 45226 cells, so the feature
         // layer still has a compensating defect (R1a); the carver seeds need the
         // correct value, and two wrong seeds are not a calibration to preserve.
-        assert_eq!(digest, "d919a4194b02c6131249f905a07ed3d8",
+        // 2026-10-22: `minecraft:uniform` height providers draw once (`eia` ->
+        // `Mth.randomBetweenInclusive`), not twice like the trapezoid `ehv` the
+        // port had copied. Every cave tunnel start was shifted by one draw.
+        // Cave-only and all-carver 2x2 fixtures at (0,0) went 617 / 617+341 ->
+        // 0 differing cells against vanilla, so this capture records the
+        // corrected (vanilla-matching) carving output.
+        assert_eq!(digest, "48efe93ece4bf9e4652dd93931362151",
             "feature population output changed from the vanilla-order capture");
     }
 
