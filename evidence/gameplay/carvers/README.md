@@ -912,3 +912,28 @@ i()    -> 0.13620782   i() -> 0.07097554
 
 canyon の JSON は `debug_settings`（air_state = warped_button）を持っており、
 port はそれを含めて一致している（4 chunk を canyon で埋めて 1 セルだけ違う）。
+
+## 26. 広い領域の残差を分解した
+
+2×2 の固定具は 0 になったが、8×8（spawn 周辺、比較 42 chunk）では 52 セル残る。
+`tools/carver_diff.py --cells N` を足して座標とブロック名を出すと、2 種類に分かれた:
+
+| セル | 中身 | 層 |
+|---|---|---|
+| 48 | granite / stone / copper_ore の入れ替わり（(‑36,27..32,61..63) 付近） | 地形（R1a の ore vein） |
+| 4 | `air` vs `water`、y=55、(‑38..‑37, 13..16) | carver/aquifer |
+
+48 セルの方は carver ではない。`MC_SPINE_NOFEAT=1` でも `MC_SPINE_NOCARVE=1` でも
+chunk (‑3,3) の granite は 48 セルのまま（features on だと 1510）で、vanilla 側も
+features を空にした world で 44 セル持っている。つまり両者とも地形段階で同じ
+大きさの granite 塊を作っており、位置が数十セルずれる = TODO の R1a（ore vein）。
+
+4 セルは chunk (‑3,0) を単独で固定具にしても **4 セルで再現**する（t16）。すべて
+`got air / want water`、y=55 の水平なパッチで z=15/16 の chunk 境界をまたぐ形。
+aquifer の fluid level 判定が境界で 1 違う類なので、次は `AQ_TRACE=-3,0` と
+`CARVE_PROBE=-3,0`（実地形 dump を `-Dterrain=` で食わせる）で 4 セルを見る。
+
+canyon を probability 1.0 にしたときの 1 セルも同じ `air` vs `water` だった
+（§25.1 で `stripped_mangrove_wood` と書いたのは誤り — `assets/blocks_1211.json`
+をリストの添字で引いていた。state id → 名前は `minStateId..maxStateId` の範囲で
+引く必要があり、`carver_diff.py --cells` はそうしている。id 81 は water）。

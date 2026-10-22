@@ -16,9 +16,12 @@
   - 結果（2×2 at (0,0), y=-64..319）: cave 617→**0**、cave_extra 341→**0**、
     全 carver 617+341→**0**、canyon は jar の probability では start 無しで 0、
     probability 1.0 で **1 セル**。
-  - 残り: canyon p=1 の 1 セル（`deep`、want `stripped_mangrove_wood`）、
-    8×8 spawn 周辺の 52 セル（state 1↔2 = granite/stone、carver ではなく
-    feature 層 = R1a の残差とみられる）。
+  - 残り（§26 で分解済み）:
+    - 8×8 の 52 セルのうち **48 は地形**（granite/stone/copper の位置ずれ =
+      R1a の ore vein。NOFEAT でも NOCARVE でも 48 のまま、vanilla 側も 44 持つ）
+    - **4 セルが aquifer**（chunk (-3,0)、y=55、`air` vs `water`、z=15/16 の
+      境界をまたぐ）。canyon p=1 の 1 セルも同じ `air` vs `water`。
+      次は `AQ_TRACE=-3,0` と実地形を食わせた `CARVE_PROBE` で 4 セルを見る。
 - [ ] **R1e-old carver（洞窟・峡谷）の実装**（実装済み・world 水準で残差）
   - 実装: `src/feature.rs` の carvers 節（`apply_carvers` / `carve_block` /
     `cave`+`room`+`tunnel`+`ellipsoid` / `canyon` / `CarvingMask`）と

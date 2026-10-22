@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Diff mc-spine's offline chunk dump against a vanilla (Anvil) world.
 
-  tools/carver_diff.py <dump.bin> <world_dir> [--n 6] [--y 0:60]
+  tools/carver_diff.py <dump.bin> <world_dir> [--n 6] [--y 0:60] [--cells N]
 
 The dump comes from `MC_SPINE_WG_DUMP=<file> MC_SPINE_WG_DUMP_N=<n>` (see
 `main.rs`): `n*n` chunks from (0,0) in chunk-major order, each 24 sections of
@@ -37,6 +37,15 @@ MIN_Y = -64
 HEIGHT = 384
 SECTIONS = HEIGHT // 16
 CELLS = SECTIONS * 4096
+
+
+def load_names():
+    """block state id -> block name, for reading a `--cells` report."""
+    names = {}
+    for block in json.loads((ROOT / "assets" / "blocks_1211.json").read_text()):
+        for state in range(block["minStateId"], block["maxStateId"] + 1):
+            names[state] = block["name"]
+    return names
 
 
 def load_states():
@@ -104,6 +113,12 @@ def main():
     if "--z0" in sys.argv:
         z0 = int(sys.argv[sys.argv.index("--z0") + 1])
     band = (MIN_Y, MIN_Y + HEIGHT)
+    detail = []
+    if "--cells" in sys.argv:
+        want_n = int(sys.argv[sys.argv.index("--cells") + 1])
+    else:
+        want_n = 0
+    names = load_names() if want_n else {}
     if "--y" in sys.argv:
         lo, hi = sys.argv[sys.argv.index("--y") + 1].split(":")
         band = (int(lo), int(hi))
@@ -138,6 +153,10 @@ def main():
                         continue
                     diff += 1
                     pairs[(g, w)] += 1
+                    if len(detail) < want_n:
+                        y = y0 + (i >> 8)
+                        detail.append((cx * 16 + (i & 15), y, cz * 16 + ((i >> 4) & 15),
+                                       names.get(g, str(g)), names.get(w, str(w))))
                     if (g in airlike) != (w in airlike):
                         layers["carver"] += 1
                     elif sec >= 20:
@@ -151,6 +170,8 @@ def main():
     if skipped:
         print(f"skipped {len(skipped)} partially generated chunks: {skipped}")
     print("layers:", dict(layers))
+    for x, y, z, gn, wn in detail:
+        print(f"  cell {x},{y},{z}: got {gn} want {wn}")
     if pairs:
         print("top pairs (got, want) x count:")
         for (g, w), c in pairs.most_common(15):
