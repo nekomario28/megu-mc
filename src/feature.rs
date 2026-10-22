@@ -2000,6 +2000,11 @@ impl CarveRun {
         if self.probe {
             return breg().map_or(1, |b| b.state_of("minecraft:stone", None));
         }
+        // Vanilla hands `carveBlock` the *target* chunk and both the read and the
+        // write go through `pos` folded with `& 15`, so out-of-chunk candidates
+        // are judged against this chunk's block at the folded position. Reading
+        // the neighbour's terrain instead (tried 2026-10-22) changes nothing and
+        // is not what the bytecode does.
         match self.out.get(&((x & 15) as u8, y, (z & 15) as u8)) {
             Some(&st) => st,
             None => g.terrain_cell(cc, x, y, z),
@@ -2228,6 +2233,10 @@ impl CarveRun {
     #[expect(clippy::too_many_arguments)]
     fn canyon_ellipsoid(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
                         x: f64, y: f64, z: f64, hr: f64, vr: f64, widths: &[f32]) -> bool {
+        // The iteration range below is clipped to this chunk, so an ellipsoid
+        // centred far away contributes nothing; the distance test is only a
+        // cheap way to skip those. (Removing it changes no cell: measured
+        // 2026-10-22.)
         let mid_x = (self.tx * 16 + 8) as f64;
         let mid_z = (self.tz * 16 + 8) as f64;
         let reach = 16.0 + hr * 2.0;
@@ -2326,6 +2335,10 @@ impl CarveRun {
     /// every cell inside it that the mask has not claimed and `skip` accepts.
     fn ellipsoid(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
                  x: f64, y: f64, z: f64, hr: f64, vr: f64) -> bool {
+        // The iteration range below is clipped to this chunk, so an ellipsoid
+        // centred far away contributes nothing; the distance test is only a
+        // cheap way to skip those. (Removing it changes no cell: measured
+        // 2026-10-22.)
         let mid_x = (self.tx * 16 + 8) as f64;
         let mid_z = (self.tz * 16 + 8) as f64;
         let reach = 16.0 + hr * 2.0;

@@ -47,6 +47,12 @@
   - §15: datapack の `noise_settings` 上書きは既存 world に効かない
     （generator settings は level.dat にインライン）。no-aquifer 固定具は
     level.dat 再作成が必要。`aquifers_enabled` の読み取りは実装済み。
+  - §21: §20 を訂正。no-fold / 隣 chunk read / ellipsoid bail-out 削除はいずれも
+    617 のまま（効かない）。決定的なのは y の分布: 実サーバーの source (1,-3) は
+    y=28..45 にしか彫っておらず（y>70 は 0）、こちらのトンネル開始は
+    (20,84,-46)/(20,122,-36)/(23,33,-36)。**`cfg.y.sample` の結果が違う**。
+    次は `above_bottom 8` の解決と uniform height provider の
+    nextInt 引数/回数をサーバー内で実測する。
   - §20: エージェントに target を記録させると、target (0,0) で
     getCarveState を呼ぶ source は (1,-3) の 1 個だけ、書いたセルは 20。
     こちらの port は同じ start から 0 セル。原因は `carve_block` の `read` が

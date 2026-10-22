@@ -719,3 +719,31 @@ fn read(&self, g, cc, x, y, z) -> u32 {
 **次の一手**: `read` を「隣 chunk の ChunkCols で terrain_cell を評価する」形に
 する（`g.cols(x >> 4, z >> 4)` で列を取得）。性能は carve ループ内なので、
 隣 chunk の列キャッシュが要る。
+
+## 21. §20 の訂正: ずれは「y のサンプル」にある
+
+§20 で「ターゲット外セルの地形読み」を原因と書いたが、次の 3 つを実測した結果
+いずれも差分は **617 のまま**だった:
+
+1. `MC_SPINE_NOFOLD=1`（書きの折り畳みを切る）
+2. `read` を隣 chunk の ChunkCols で評価（vanilla は折り畳んで読むので、これは
+   そもそも bytecodeと違う。撤回済み）
+3. `ellipsoid` の距離 bail-out を削除
+
+決定的だったのは y の分布。エージェントの `ASTATE t=... s=1,-3 ...` を集計すると、
+**source (1,-3) が実際に彫ったセルは y=28..45 に集中し、y>70 は 0 個**。
+
+一方こちらの `CV_TRACE` は source (1,-3) のトンネル開始を
+(20,84,-46) / (20,122,-36) / (23,33,-36) と出している。3 本のうち 2 本が
+y=84/122 で、vanilla の分布と合わない。
+
+→ **`cfg.y.sample(random, ctx)` の結果が vanilla と違う**（同じ seed・同じ
+config JSON なのに）。`above_bottom 8` の解決（-56 のはず）か、uniform height
+provider のサンプル方法（nextInt の回数/範囲）が疑わしい。ここが直れば
+トンネルの向き・到達 chunk が変わり、§16〜§20 で見えていた残差の大半が
+説明できる可能性が高い。
+
+次の一手: エージェントで `ebb.carve` の y ドロー直後の値を記録する（または
+`ehx`/`ehv` の `sample` を計測し、`above_bottom`/`absolute` の解決値と
+`nextInt` の引数を実測する）。こちらの `c.y.sample` の実装
+（`p_anchor` → `c.y.resolve(min_y, height)`）と突き合わせる。
