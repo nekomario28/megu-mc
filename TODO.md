@@ -250,3 +250,20 @@
   datapack の DF 評価の突き合わせ。**valence/azalea/PicoLimbo** (MIT): protocol。
 - 使えない: Pumpkin (GPL-3.0), SteelMC (AGPL-3.0), Amidst (GPL-3.0),
   fluffy-parakeet (ライセンス無し)。
+
+## feature 層の到達点（2026-10-22 追記）
+
+feature あり 2×2 の diff は **40975 → 2062**（1 chunk あたり ~520 = 0.53%）。
+効いた修正（いずれも公式 1.21.1 mappings + Vineflower で確認）:
+
+1. `WorldgenRandom` は `dyn` の legacy draw（modern 形では ore origin が 242/242 ずれ）
+2. height provider 4 種（`eia` uniform / `ehz` trapezoid plateau 0 / `ehv` biased /
+   `eib` very_biased）と `below_top` の −1、`next_inbetween` の draw 抜け
+3. `setDecorationSeed` = Xoroshiro の nextLong を **加算**合成（`(x*l + z*m) ^ seed`）。
+   chunk (0,0) だけは 0 なので今まで露見しなかった
+4. `underwater_magma` の前提（origin が水）と包囲判定
+5. `placed_feature/` を 1.21.1 jar から取得（`trees_birch_and_oak` 欠落で木が全部スキップ）
+
+残り: 木・disk は `feature/`（configured feature）が 1.21.2+ 形状のままで、
+1.21.1 の値と噛み合わない。**configured_feature の 1.21.1 化 + パーサ両対応**が次の単位。
+そのあと carver 層 1040 セル、構造物（未実装）、性能（R3）。
