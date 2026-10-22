@@ -1173,3 +1173,26 @@ n = (x * l) ^ (z * m) ^ seed;      // ← lxor（加算ではない）
 修正後: 隣 chunk (-1,0) の decoration seed が vanilla と一致
 （`6716476193438028432`）、ore feature 21/22 が一致、feature あり 2×2 の diff は
 **33853 → 15820**（chunk (0,0) 単体 3992 → 1218）。
+
+### 32.1 続き: 掛け算は「加算」で合成する（XOR ではない）
+
+`setDecorationSeed` の decompiled は
+
+```java
+long $$5 = $$1 * $$3 + $$2 * $$4 ^ $$0;    // (x*l) + (z*m) してから seed と XOR
+```
+
+で、`+` と `^` の順序が肝。chunk (-1,0) は z=0 なので `(x*l + 0) ^ 0 = x*l` と
+XOR 形式でも同じ値になり、**両者を区別できない**。chunk (1,1)（x=z=16）で初めて差が出る:
+
+| 式 | 値 |
+|---|---|
+| `(16*l) ^ (16*m)` | 11973949894776616928 |
+| `(16*l) + (16*m)` | **12083320522243344384** = vanilla |
+
+修正後: 全 4 chunk で decoration seed が一致、ore feature は 22/22（chunk (1,1)）、
+feature あり 2×2 の diff は 15820 → **3472**（1 chunk あたり ~870 = 0.9%）。
+
+残差 3472 の内訳: `magma_block`（1236、vanilla は 0 = `underwater_magma` を
+置きすぎ）、木（leaves/log 747、置き漏れ）、`dirt != sand/gravel`（579、disk 系）、
+`diorite != water` など。
