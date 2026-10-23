@@ -47,6 +47,13 @@ enum Cf {
     SimpleBlock { to: BSP, on: Vec<String>, in_: Vec<String>, under: Vec<String> },
     Spring { fluid: u32, req_below: bool, rock: i32, hole: i32, valid: HashSet<String> },
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
+    /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
+    /// `nextInt(xz+1) - nextInt(xz+1)` per horizontal axis and the same with
+    /// `y_spread + 1` vertically, then run the nested *placed* feature there (its own
+    /// modifiers, on this RNG). Skipping the type left every grass/flower/mushroom
+    /// patch unplaced (measured: 34 of the pack's 60 configured-feature types had no
+    /// arm, and `short_grass` was 0 cells against vanilla's 102).
+    RandomPatch { feature: Box<Pf>, tries: i32, xz: i32, y: i32 },
     SimpleRand(Vec<Pf>),
     WeightedSel(Vec<(Pf, i32)>),
     BoolSel(Pf, Pf),
@@ -194,6 +201,12 @@ fn p_cf(j: &J) -> Option<Cf> {
             rock: jint(j, "rock_count", 4),
             hole: jint(j, "hole_count", 1),
             valid: name_list(j, "valid_blocks").into_iter().collect(),
+        },
+        "random_patch" => Cf::RandomPatch {
+            feature: Box::new(pf_any(js(j, "feature")?)?),
+            tries: jint(j, "tries", 0),
+            xz: jint(j, "xz_spread", 0),
+            y: jint(j, "y_spread", 0),
         },
         "random_selector" => {
             let mut v = vec![];
@@ -1067,6 +1080,17 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             if rocks == *rock && air == *hole {
                 ctx.set(pos.0, pos.1, pos.2, *fluid);
+            }
+        }
+        Cf::RandomPatch { feature, tries, xz, y } => {
+            let (xs, ys) = (xz + 1, y + 1);
+            for _ in 0..*tries {
+                // the arguments are evaluated left to right, so the draws go
+                // xz, xz, y, y, xz, xz - a different grouping shifts every position
+                let dx = rng.next_bound(xs) - rng.next_bound(xs);
+                let dy = rng.next_bound(ys) - rng.next_bound(ys);
+                let dz = rng.next_bound(xs) - rng.next_bound(xs);
+                gen_pf(feature, fr, ctx, rng, (pos.0 + dx, pos.1 + dy, pos.2 + dz));
             }
         }
         Cf::RandSel(list, default) => {

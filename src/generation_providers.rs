@@ -517,9 +517,16 @@ pub(crate) fn p_pred(j: &J) -> Option<Pr> {
             let mut v = vec![];
             if let Some(bs) = jarr(j, "blocks") {
                 for b in bs {
-                    v.push(ns_name(b.str()));
+                    // entries may be plain names or block-state objects
+                    v.push(if let Some((n, _)) = bs_parts(b) { n } else { ns_name(b.str()) });
                 }
-            } else if let Some(b) = jstr(j, "block").or_else(|| jstr(j, "id")) {
+            } else if let Some(b) = jstr(j, "blocks")
+                .or_else(|| jstr(j, "block"))
+                .or_else(|| jstr(j, "id"))
+            {
+                // `"blocks": "minecraft:air"` is a single value, not a list - the
+                // nested `patch_grass` predicate is written this way, and an empty
+                // match set made every grass patch unplaceable
                 v.push(ns_name(&b));
             }
             Pr::Blocks(v)

@@ -2063,3 +2063,58 @@ per chunk: 0 22 0 0 0 0 0 0
 残差の内訳（4×4 隔離、床を引いた後に追うべき順）:
 葉の在否 438 / gravle blob 225 / 植生（short_grass・seagrass・dirt↔grass）173 /
 その他 ≈100。葉の `distance` 1469 は tick 由来で除外。
+
+## 58. 未実装の configured-feature **型**が 34 件あった（`random_patch` を実装）
+
+`short_grass` が ours 0 / vanilla 102、`seagrass` が 0 / 28 ＝ **丸ごと置けていない**。
+逃げ道（`CF_MISSING` / `PF_UNKNOWN` / `FEAT_TRACE`）では何も出ず、feature は走っているが
+`+0 writes` だった。原因は **configured feature の型の未実装**:
+
+- `p_cf` が扱う型は 26 件、パックの `feature/*.json` の型は **60 件**（未実装 34 件）。
+  内訳の上位: `random_patch` 18、`nether_forest_vegetation` 6、`flower` 6、
+  `huge_fungus` 4、`seagrass` 4、`end_podium` 2 …（overworld の植生の大半が
+  `random_patch` ✓）。
+- `patch_grass_forest` の configured feature は `minecraft:patch_grass`
+  （**type: `minecraft:random_patch`**）で、私たちは型を持っていなかった。
+
+`RandomPatchFeature`（`edc`）を bytecode から実装:
+
+```java
+int xz = cfg.xzSpread() + 1, y = cfg.ySpread() + 1;
+for (int i = 0; i < cfg.tries(); i++) {
+   pos.setWithOffset(origin,
+       rand.nextInt(xz) - rand.nextInt(xz),
+       rand.nextInt(y)  - rand.nextInt(y),
+       rand.nextInt(xz) - rand.nextInt(xz));
+   if (cfg.feature().value().place(level, generator, rand, pos)) placed++;   // 入れ子は *placed* feature
+}
+```
+
+＝ 1 try あたり 6 ドロー、順序は `xz, xz, y, y, xz, xz`（引数の左→右評価）。
+入れ子は `FRef::Placed`（既存）で自分の modifier を同じ RNG で走らせる。
+
+### さらに: `"blocks": "minecraft:air"` は**スカラー**
+
+`patch_grass` の入れ子 placed feature は
+`block_predicate_filter(matching_blocks {"blocks": "minecraft:air"})` を持つが、
+こちらの `p_pred` は `blocks` を**リスト**としてしか読んでおらず、スカラーだと
+`Pr::Blocks([])` ＝ 永久に不一致 → **入れ子が一切走らない**（`"fluids"` のスカラーと
+同じ型のバグ）。修正した。
+
+### 結果: 残差は 938 → **42939**（＝むしろ正しい方向）
+
+| ブロック | 修正前 | 修正後 | vanilla |
+|---|---|---|---|
+| `short_grass` | 0 | 362 | 102 |
+| `seagrass` | 0 | 0 | 28 |
+| 4×4 の diff | 938 | **42939** | — |
+
+これまで「動いていなかった」多数の feature が動き出すので、**diff は増える**
+（＝ 0 セルという出口条件にはまだ遠いが、状態としてはより正しい）。
+次にやること:
+
+1. **過剰配置**（`short_grass` 362 vs 102 ＝ 3.5 倍）の原因究明
+   （`random_patch` の tries/ドローか、入れ子 `simple_block` の条件か）
+2. 残る型の実装（`seagrass`・`flower`・`kelp`・`sea_pickle`・`large_dripstone`・
+   `geode` など overworld に効くもの）
+3. その後で残差を**再基準化**して、順序非依存の塊（葉の在否・gravel blob・植生）を追う
