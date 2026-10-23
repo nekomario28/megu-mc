@@ -77,10 +77,15 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   `BiomeManager.getBiome(BlockPos)`（8 近傍を zoom seed の重み付き距離で選ぶ blend）。
   `LevelReader.getBiome` は後者で、`BiomeFilter` はそれを使う。前者を読んでいたため
   river/forest 境界で候補を誤って受理していた（実装後 1035 → **940**、木 45 → 42）。
+  14. **feature を走らせる条件**: vanilla は装飾対象 chunk の **3×3 の section palette を
+  union** して feature を選ぶ。こちらは 3×3 の 9 マスを y=0 でサンプルしていたため
+  **cave biome を読み地表 biome（river）を落とし**、chunk (-2,1) で `trees_water` ほか
+  3 件を実行していなかった（step 9 が 9 件 vs vanilla 12 件 → 修正で一致）。
   残りの出口: **B 分類**（vanilla にあってこちらに無い gravel/dirt/water =
-  `ore_dirt`/`ore_gravel` の欠け + spring の水）、**樹冠の幾何**（木 39 vs 38。chunk 別に
-  (-1,-1) 3 vs 2、(-1,1) 8 vs 7、(0,-1) 6 vs 7）。生ドローの最初の食い違いは
-  (feature 20, step 9, chunk (0,1)) の draw 139 で、vanilla は別の feature の連鎖に入る。
+  `ore_dirt`/`ore_gravel` の欠け + spring の水）、**樹冠の幾何**（木 39 vs 38）。加えて
+  **装飾順の差**: seed も添字も一致するのに chunk (-2,1) の木が一致しないのは、
+  feature 実行時に「どこまで装飾済みか」が違うため（vanilla は先に装飾した chunk の
+  書き込みを全部見る／こちらは 3×3 をオンデマンドに populate するので順序が別）。
 - **R1d 光（完了 2026-10-20）**: 地形一致後に `light_parity_probe.py` を 3 chunk で
   実行。heightmap と非一様区間の sky digest が vanilla と一致した。差は区間マスクの
   送り方（全 26 区間 vs 一様区間の省略）だけで、値ではない。
