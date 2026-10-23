@@ -3770,7 +3770,11 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // longer places its block on any air cell in the box (short_grass 362 -> 44
         // against vanilla's 102, with the draw streams identical - the next item is the
         // attempt/acceptance count, not the placement).
-        assert_eq!(digest, "115d0f466e9459fd43af43dbea4c91a3",
+        // 2026-10-23: `seagrass` is implemented (`edk` + `SeagrassBlock.mayPlaceOn`), which
+        // places 27 cells against vanilla's 28 in the isolated fixture - the capture
+        // moves with it, and that feature's residue is now the size of the reference's
+        // own noise floor.
+        assert_eq!(digest, "d3a81caa99551dd6d53284d1e5e29116",
             "feature population output changed from the vanilla-order capture");
     }
 
