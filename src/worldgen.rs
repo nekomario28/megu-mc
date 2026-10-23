@@ -2113,8 +2113,14 @@ impl Gen {
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) -> Option<u32> {
         let (cx, cz) = (x >> 4, z >> 4);
-        for sx in cx - 1..=cx + 1 {
-            for sz in cz - 1..=cz + 1 {
+        // MC_SPINE_FEAT_NBR=0 decorates only the queried chunk, which is what a
+        // chunk generated on its own (a forceload far from the spawn area) sees:
+        // its neighbours are generated to the carver status, not decorated.
+        let nbr = std::env::var("MC_SPINE_FEAT_NBR").map(|v| v != "0").unwrap_or(true);
+        let (x0, x1) = if nbr { (cx - 1, cx + 1) } else { (cx, cx) };
+        let (z0, z1) = if nbr { (cz - 1, cz + 1) } else { (cz, cz) };
+        for sx in x0..=x1 {
+            for sz in z0..=z1 {
                 if !self.pop_done.contains(&(sx, sz)) {
                     self.pop_done.insert((sx, sz));
                     populate(self, sx, sz);

@@ -1934,3 +1934,18 @@ forceload されるので、dump 対象 chunk にとっては「隣が先」が�
 (1) 固定具を **単一 chunk の forceload**にして、隣が未装飾であることが保証される条件で比べる、
 (2) サーバーの装飾順を実測して再現する、
 (3) 順序依存のセル（隣 chunk の樹冠が届く範囲）を比較から除外する。
+
+### 52.1 順序に依存しない固定具への道（今回の試行と結果）
+
+「隣が未装飾であることが保証される chunk」を作るための試行:
+
+| 試行 | 結果 |
+|---|---|
+| spawn から 112 block 離れた chunk を `forceload add` | コマンドが失敗（`An unexpected error occurred`、スタックトレース無し）。spawn 近傍では成功する |
+| `setworldspawn 112 64 -144` + 再起動 + 100 秒待ってから save/stop | spawn 準備は `Preparing spawn area: 0%` のまま進まず、遠方 chunk は `structure_starts` のまま（`prepareLevels` は**ワールド作成時**の spawn 周りだけを準備するため） |
+| 上記の chunk を無理に比較 | 参照が `structure_starts` なので**比較自体が空振り**（両側「skip」で 0 セルと表示される）——固定具は「参照側が full か」を必ず確認する |
+
+残る道: (a) 我々の protocol client（`tools/load_client.py`）で bot を遠方へ歩かせて
+サーバーに自然な順序で生成させる（画面は使わない方針に合致）、
+(b) `level.dat` を直接書いて spawn を先に移してから新規ワールドを作る、
+(c) spawn 準備の spiral 順序を再現する、(d) 順序依存セルを比較から除外する。
