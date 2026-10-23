@@ -1353,3 +1353,48 @@ TreeFeature の `updateLeaves`（葉の distance 伝播）が未実装なのが�
 - `CF_MISSING=1`: 名前で参照された configured feature が見つからないとき表示
   （今回の disk はこれで見つかった）
 - `DISK_TRACE=1`: disk の判定を列単位で表示（追加したが、今回は不要だった）
+
+## 38. 葉の `distance` は worldgen の値ではない（tick が上書きする）
+
+残差の内訳に `oak_leaves != oak_leaves` 190（同じ葉で `distance` だけ違う）があった。
+調べると **こちらの値は常に vanilla より 1 小さい**。原因はアルゴリズムではなく
+**段階**だった。
+
+`LeavesBlock`（`dki`）の逆コンパイル:
+
+```java
+protected BlockState updateShape(state, dir, neighbour, level, pos, neighbourPos) {
+   if (state.getValue(PERSISTENT)) level.scheduleTick(pos, WATER, ...);
+   int i = getDistanceAt(neighbour) + 1;
+   if (i != 1 || state.getValue(DISTANCE) != i) level.scheduleTick(pos, this, 1);
+   return state;                    // ← state は変えない
+}
+protected void tick(state, level, pos, random) {
+   level.setBlock(pos, updateDistance(state, level, pos), 3);   // ← ここで初めて distance を書く
+}
+```
+
+`Block.updateFromNeighbourShapes`（`TreeFeature.place` の最後）は上の `updateShape` を
+境界面ごとに呼ぶだけで、**返り値を代入するのは「変わったとき」だが `updateShape` は
+state を変えない**（＝実質 `scheduleTick` だけ）。したがって保存済み world の
+`distance` は **スケジュールされたブロック tick が連鎖して書いた値**であり、
+worldgen の出力ではない。TreeFeature 内の BFS（`updateLeaves`）が書くのは
+初期値にすぎず、tick が上書きする。
+
+実測でも裏が取れる: 保存済み world の oak_leaves 590 セルのうち **166 (28%) が
+「distance == min(近傍)+1」を満たさない**（＝まだ収束していない）。
+
+さらに `randomTick` は `!persistent && distance == 7` の葉を**消す**ので、
+forceload された chunk では樹冠が欠ける（水の流れと同じ種類の tick 由来の差）。
+
+したがって:
+- `oak_leaves != oak_leaves`（distance のみの差）は **worldgen の残差ではない**ので
+  除外して数える（水の `air vs water[level>0]` と同じ扱い）。
+- ただし「こちらに葉があり vanilla が air」の 578 セルの距離分布は 1〜3 が大半
+  （d=1:135 / d=2:237 / d=3:168 / d=4:36 / d=7:2）で、距離 7 の落葉では説明できない。
+  これは**樹冠の形（幾何）の差**なので残差として追う価値がある。
+
+**教訓**: 保存済み world は worldgen の出力ではない。tick を持つブロック
+（水・葉・作物・流体）は「worldgen 段階の値」と「tick 後の値」が別物で、
+固定具の world は後者を保持している。差を数える前に「これはどちらの段階か」を
+確かめる（葉は `updateShape` が state を返さないことが根拠になる）。

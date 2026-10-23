@@ -293,3 +293,12 @@ feature あり 2×2 の diff: **40975 → 1856**（chunk (0,0) 単体 10177 → 
 port 側: `FSEED_TRACE` / `FSEED_ARM`（`NDRAW`/`FDRAW`/`XDRAW`）/ `ORE_TRACE` /
 `TREE_TRACE` / `BIOMEF_TRACE` / `FEAT_TRACE` / `FEAT_LIST` / `PF_UNKNOWN` /
 `CF_MISSING` / `MC_SPINE_BIOME_DUMP` / `MC_SPINE_HM_DUMP`。
+
+## 葉の distance と樹冠（2026-10-22 追記）
+
+- `LeavesBlock.updateShape` は state を変えず `scheduleTick` するだけ。保存済み world の
+  `distance` は tick 連鎖が書いた値で、worldgen の出力ではない。実測: 保存済みの
+  oak_leaves 590 のうち 166 (28%) が局所規則を満たさない（未収束）。
+- `randomTick` は `!persistent && distance==7` の葉を消すので、forceload chunk は樹冠が欠ける。
+- → `oak_leaves != oak_leaves`（distance のみ）は除外。ただし「こちらに葉・vanilla は air」
+  の 578 は距離 1〜3 が大半で、幾何の差として残差に数える（次はここ）。
