@@ -48,6 +48,10 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 **draw 列は一致しました**（chunk (81,0) の `kelp_warm`、先頭20ドローが port/参照で完全一致。port は `FSEED_ARM=81,0,91,9`、参照は `-Dfseedarm=91,9`。`gi` は両側とも全体通し番号で 91）。
 
-次は**候補ごとの y（`OCEAN_FLOOR_WG` の読み）と水判定**の突き合わせです。高さ予算が同じで茎長が違うので、原因は floor の y のずれ（他 feature の書き込みを heightmap 経由で読む順序クラス）か、途中セルの水判定（seagrass 等の書き込み順）のどちらかです。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
+**列ごとの帰属まで進みました**（[carvers §62.1](../evidence/gameplay/carvers/README.md)）: 参照484列のうち **390 は茎まで一致**、**31 は「vanilla が同 step の seagrass の書き込みを見て棄却した列」**、**53 は「両側の `getHeight(OCEAN_FLOOR)` が違う列」**。`KelpFeature.place` の逆コンパイルで**実装差1件**（位置を毎回上げる）も見つけて修正しました（§62.2、負の対照つきテストで経路の実行を証明）。
+
+次は 53 列の y の差（`hm_oc` の読み vs vanilla の `getHeight`）を同じ列で両側ダンプして比べることです。装飾順を固定具に寄せる実験は**負の結果**でした（§62.3）。
+
+**型カバレッジ**は計測できるようにしました（`tools/feature_type_coverage.py`）: pack の 60 型中 31 型に `p_cf` の腕が無く、**overworld の biome から到達されるのは 11 型**（`fossil` `iceberg` `root_system` `sculk_patch` `geode` `desert_well` `dripstone_cluster` `ice_spike` `large_dripstone` `sea_pickle` `speleothem_cluster`）。`geode` は **56 biome** から到達され最優先です（旧記載の「13型」は人手の数え上げで、機械計測では 11）。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
 
 以後の順序は[ロードマップ](ROADMAP.md)に従います。比較規律は[DESIGN.mdの約束](../DESIGN.md#比較の約束)を参照してください。

@@ -54,18 +54,30 @@ if grep -q "Unexpected error occurred" "$DIR/run.log"; then
   exit 2
 fi
 
-# the gate: a reference without kelp cannot say anything about kelp
+# Two gates, because a fixture can be empty in two ways: a chunk that was never
+# generated (the comparison silently drops it) and a region with no kelp at all
+# (the comparison compares nothing).
 total=0
+missing=0
 for (( dx=0; dx<N; dx++ )); do
   for (( dz=0; dz<N; dz++ )); do
-    # a chunk the server did not write makes the reader exit non-zero; that is a
-    # chunk to skip, not a reason to abort the fixture
-    c=$(python3 "$ROOT/tools/vanilla_region_blocks.py" "$DIR/world" $((CX+dx)) $((CZ+dz)) 2>/dev/null \
-        | grep -E "minecraft:kelp(_plant)?$" | awk '{s+=$1} END{print s+0}') || c=0
+    chunk=$((CX+dx)),$((CZ+dz))
+    if ! counts=$(python3 "$ROOT/tools/vanilla_region_blocks.py" "$DIR/world" $((CX+dx)) $((CZ+dz)) 2>/dev/null); then
+      echo "kelp fixture: chunk ($chunk) is not in the reference world" >&2
+      missing=$((missing + 1))
+      continue
+    fi
+    # a chunk with no kelp makes grep exit non-zero; that is zero cells, not a
+    # reason to abort under `set -e`/`pipefail`
+    c=$(printf '%s\n' "$counts" | grep -E "minecraft:kelp(_plant)?$" | awk '{s+=$1} END{print s+0}') || c=0
     total=$((total + c))
   done
 done
-echo "kelp fixture: reference kelp cells in the region: $total"
+if [ "$missing" -gt 0 ]; then
+  echo "kelp fixture: FAIL - $missing of $((N*N)) chunks were not generated; the reference is not complete" >&2
+  exit 2
+fi
+echo "kelp fixture: reference chunks all present ($((N*N))), kelp cells in the region: $total"
 if [ "$total" -eq 0 ]; then
   echo "kelp fixture: FAIL - the reference region holds no kelp; the comparison would be empty" >&2
   exit 2

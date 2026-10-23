@@ -8,6 +8,7 @@
 | 道具 | 何をするか |
 |---|---|
 | `bytecode_probe.sh <class> [pattern]` | 固定した1.21.1 jar から1クラスの `javap -p -c` を出す。公式mappingsで難読名に引き、入れ子jarから取り出す。証拠ページの javap 引用はこれで再現する |
+| `feature_type_coverage.py [--unimplemented] [--overworld]` | pack の configured-feature 型 × `p_cf` の腕 × placed feature の入れ子 × それを参照する biome を静的に数える。**到達されていない型を先に実装しない**ための計測 |
 | `kelp_fixture.sh <cx> <cz> [n] [seed]` | 海洋 biome を spawn から離れた場所で forceload し、**正の kelp セルをゲートで要求**してから port と block 単位で diff（0 なら失敗）。forceload は起動後に送る |
 | `fixture_base.sh [dir]` | 固定具の基点（`CARVER_FIXTURE_BASE`、既定 `/tmp/carverfresh`）を組む。jar を sha1 で固定し、worldgen に効く設定をここで明示する。基点が無いと固定具は空振りする |
 | `carver_fixture.sh <tag> <cave> <extra> <canyon> [n]` | carver だけを残した world を作り、port と block 単位で diff。`ctl` pack で carver を差し替え |
