@@ -1,108 +1,41 @@
 # mc-spine
 
-Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバー。保存されていたv2.37のソース、datapack、プロトコル設定を復元した。Minecraft全体との互換性が完成した実装ではない。
+Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバーです。小規模・低負荷の世界で、観測できる挙動を保ちながら計算量を減らし、必要な既存Modとの接続を試しています。**Minecraft全体との互換性や、vanillaより軽いことが確認済みの製品ではありません。**
 
-目標は、**小規模・低負荷の世界では計算量を大きく減らし、必要な既存Modも使えるサーバー**。処理を省略できる条件・状態の所有・Modの呼出しを一貫して扱う。[目的と設計原則](DESIGN.md)に方針、構造の方向、実装済みの範囲と評価条件を記載する。
-
-Cargoのpackage version `0.0.0` は保存時の値を維持している。`AUDIT_WIRE.md` と `SECURITY_NOTES.md` は当時の監査記録であり、現在の安全性や完成度を保証する資料ではない。
-
-## 現在地（2026-10-22）
-
-目標は vanilla と同一の world 生成。到達点は測った範囲だけを書く。
-
-| 項目 | 状態 |
-|---|---|
-| 地形（feature/carver なし） | vanilla と **0 セル差**（seed 0、(0,0) の 2×2）。density・surface rule・bedrock・鉱脈（ore vein）が一致。地形だけの高さマップは 256/256 列一致 |
-| 洞窟・峡谷（carver） | **0 セル差**（(0,0) の 2×2、cave / cave_extra / canyon、y=−64..319）。vanilla の生ドローと1 draw 単位で一致。証拠は [carvers](evidence/gameplay/carvers/README.md) |
-| feature 層 | **704 / 393216 セル差（0.18%、(0,0) の 2×2、全 feature）**。葉の `distance` は tick 由来で、除外すると **285**（計測: 2026-10-22）。後続の4×4隔離ダンプは 8 chunk 比較で 42654 差だが、比較器は deep 41394 / carver 1260 と分類し、8 chunk を skip しているため feature 残差としては未確定。configured-feature の型カバレッジと比較条件は [証跡](evidence/gameplay/carvers/README.md) を参照。 |
-| 構造物 | **未実装**（jigsaw / template pool / NBT とも無し） |
-| 軽量性（M3） | **未達**。代表負荷で CPU x1.10（8 回中央値、RSS は約 1/8）、spawn burst を除くと x1.79 |
-| 必須ゲート | `tests/verify.sh` がローカルで PASS（152 passed / 1 ignored） |
-| hosted CI | 支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替中 |
-
-順序と出口条件は [ロードマップ](specs/ROADMAP.md)、欠陥の状態は
-[close-defects](specs/close-defects/README.md) が持つ。数値の根拠は
-[地形](evidence/gameplay/terrain-parity/README.md)・
-[洞窟/峡谷](evidence/gameplay/carvers/README.md)・
-[feature](evidence/gameplay/feature-parity/README.md)・
-[費用](evidence/gameplay/worldgen-cost/README.md) の記録にある。
-
-vanilla と比べる手順そのものは
-[開発と評価の方針](DESIGN.md#開発と評価の方針)の「比較の約束」に書いてある
-（どの段階の成果物かを確かめる・黙って落ちる宣言を名前で出す・
-数値が動かない変更は未実行を疑う）。
-
-## ビルドと確認
+## 試す
 
 ```sh
 cargo build --locked
 cargo test --locked -- --test-threads=1
-```
-
-必須ゲートは `bash tests/verify.sh`。出力を整形しても、呼び出すシェルが失敗の終了値を保持する：
-
-```sh
-set -euo pipefail
-bash tests/verify.sh > verify.log 2>&1
-# この行以降へ進めるのは全必須ゲート成功時だけ。
-```
-
-`verify.sh | tail` を終了判定に使わない。スキップ・未実行の必須変異も検証失敗として扱う。
-[残る欠陥の完了契約](specs/close-defects/README.md)を参照。
-
-設定とdatapackは相対パスで読むため、リポジトリ直下から実行する。既存ワールドは復元ソースに含めていない。
-
-```sh
 MC_SPINE_PORT=25699 cargo run --locked
 ```
 
-ゲームlistenerは安全のため既定で `127.0.0.1` にbindする。resource pack HTTPはポート25598を利用する。起動前にポートの使用状況を確認する。`MC_SPINE_WG=old` で旧world generatorを選択できる。
+設定とdatapackはリポジトリ直下から読みます。通常のゲームlistenerは `127.0.0.1` にbindします。外部ネットワークに公開しないでください。認証・権限・保存の注意は [SECURITY_NOTES.md](SECURITY_NOTES.md) を参照してください。
 
-## 依存値が安定した処理の共通化
+現在の検証範囲と未解決事項は [プロジェクト状態](specs/README.md) にあります。テスト成功は、vanillaとの全機能一致や性能優位を意味しません。
 
-`CachedLookup<K, V>` は直近の完全な依存キーと純粋な結果を一組だけ保持する。検索失敗も保持し、キーが変わればその呼び出しで再計算する。同期は呼び出し側が担う。
+## 確認できている範囲
 
-かまどの固定精錬結果と燃料時間に適用した。datapackレシピとingredient tagは変更可能なので、精錬候補の判定時に引き続き確認する。tick、燃焼時間、進捗、インベントリ更新は既存の処理で実行する。キャッシュは保存せず、ワールド読込時に空で作成する。
+| 領域 | 確認範囲 |
+|---|---|
+| worldgen | 地形とcarverは限定した固定具で照合済み。feature層と構造物は未完了 |
+| ゲーム操作 | CLI経由の通信・操作を検査。全ゲーム要素の一致は未完了 |
+| Java Mod | 特定のSeed Protect契約をFabric/NeoForgeで検査。任意Mod対応ではない |
+| 軽量性 | 目標未達。比較条件と最新結果は[費用の証拠](evidence/gameplay/worldgen-cost/README.md)を参照 |
 
-他の処理へ適用する際は、計算が純粋であること、キーがすべての依存を含むこと、変更と同じ呼び出しで再計算されることを確認する。変更可能なテーブルの参照を含める場合は、そのスナップショットと整合するrevisionも必要になる。
+例として、feature parity の作業では `cargo test --release` の結果に加え、vanilla側のブロックセル集合と参照chunkの生成状態を比較します。最新の実行結果と、その比較で証明できていない点は[状態ページ](specs/README.md)に記録します。
 
-[復元と検証の記録](RESTORATION.md)を参照。
+## 開発と設計
+
+- [目的と設計原則](DESIGN.md)
+- [目標・検証契約](specs/PLAN.md)
+- [実装順と出口条件](specs/ROADMAP.md)
+- [診断・固定具の道具](tools/README.md)
+- [worldgenの証跡](evidence/gameplay/)
+- [Fabric契約](compat/fabric-probe/README.md) / [NeoForgeイベント契約](compat/neoforge-events/README.md)
+
+Cargoのpackage version `0.0.0` は復元時の値です。`AUDIT_WIRE.md` と `SECURITY_NOTES.md` は監査記録であり、現在の安全性や完成度を保証しません。
 
 ## ライセンスと第三者データ
 
-このリポジトリのコードは MIT（[LICENSE](LICENSE)）。ただし `datapacks/vanilla/` の
-worldgen データ、`assets/` と `resourcepack.zip` の Mojang 由来資産、
-`config_packets.bin` は MIT の対象ではない。1.21.1 の互換検証に使う派生物であり、
-再配布・利用条件は Mojang の EULA と同データの出所に従う。Pumpkin など他実装の
-GPL コードは取り込んでいない（[#3 の由来メモ](https://github.com/nekomario28/mc-spine/issues/3)）。
-
-## ゲーム時間と処理省略
-
-[時間契約の実装計画](specs/time-contract/README.md)に従い、vanillaの結果を保つ時間基準と、
-結果を変えない処理省略を分けて検証する。20TPS移行・全体互換・性能改善はまだ未完了。
-
-## Java mod互換層
-
-[段階設計](specs/mod-compatibility/README.md)と[Fabric接続の診断](compat/fabric-probe/README.md)を参照。世界の正本はRustに置き、Java互換層からJNIで操作する。通常ビルドではJava実行機能を有効にしない。現在対応する契約と未検証の境界は以下に記載する。
-
-## Selected Java mod contract
-
-Java compatibility is opt-in. The pinned Seed Protect Fabric artifact and its NeoForge event counterpart now reach the normal player/adult-cow farmland landing path. Rust keeps the only authoritative world; one synchronous JVM owner executes callbacks, and a native commit replaces farmland only if its original state still matches. Cancellation preserves farmland while existing fall damage continues.
-
-Build and validation instructions are in [Fabric contract](compat/fabric-probe/README.md) and [NeoForge event adapter](compat/neoforge-events/README.md). Set exactly one of `MC_SPINE_FABRIC_CLASSPATH` or `MC_SPINE_NEOFORGE_CLASSPATH` to its built absolute classpath-file path, and use the selected original JAR alone in that server working directory's `mods/`. Unknown mod bytes and required transformation failures reject startup before listeners open. Without those settings, the default Rust server loads no JVM.
-
-This supports one pinned feature contract, not arbitrary Minecraft mods. Full FML/NeoForge startup, all-entity collision physics, crop/loot behavior and general Minecraft API object identity remain outside the verified scope. See [compatibility specification](specs/mod-compatibility/README.md) for the open gates.
-
-## ネットワーク・権限・保存上の注意（Issue #1）
-
-この実装は**オフラインモードの開発用サーバー**であり、Mojang/Microsoftによるプレイヤー認証は**行っていない**。インターネットへ直接公開しない。LAN等でゲームポートを明示的に開く場合は、ファイアウォールと信頼できる接続元の制限を用意する。
-
-- `MC_SPINE_BIND_ADDR`（既定 `127.0.0.1`）: ゲーム接続の待受アドレス。LAN向けに `0.0.0.0` とする場合もオンライン認証が追加されるわけではない。
-- 一般プレイヤーがゲーム内で実行できるコマンドは `/help`、`/list`、`/time query`（または `get`）に限定。管理コマンドはゲーム内から許可しない。**ローカルの実験専用**に限り `MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS=1` で旧動作へ戻せる（公開・共有サーバーで使用しない）。
-- `MC_SPINE_RCON_PORT` を設定した場合、非空の `MC_SPINE_RCON_PASS` が必須。RCONのbind先は `MC_SPINE_RCON_BIND_ADDR`（既定 `127.0.0.1`）、同時8接続上限、読み書き各10秒のtimeout。RCONのコマンドは管理権限扱いであり、プロトコルは平文なので外部公開しない。
-- ログイン前の通信は接続開始から合計30秒で期限切れとし、pre-playフレームは64KiBに制限する。
-- `MC_SPINE_RESOURCE_PACK_URL` には、クライアントがアクセスできるHTTP(S) URLを指定できる。ゲームlistenerがloopback以外の場合、未設定ならリソースパックを案内しない。リソースパックHTTPのbind先は `MC_SPINE_RESOURCE_PACK_BIND_ADDR`、未設定なら `MC_SPINE_BIND_ADDR` を利用する。
-- ゲームロジックの呼び出し周期は50ms（**20TPS目標**）とし、ワールド時刻も1 tickに1進める。負荷時に20TPSを保証するものではない。Vanillaとの差分・負荷を実機で比較する必要がある。
-- 新規保存は `SPN4` 形式のサイズ・SHA-1チェック付き外側フレームを使用する。既存の `world_overlay.bin` は旧形式として読める。保存更新時に `world_overlay.bin.bak` へ旧ファイルをコピーする。新形式に破損が見つかったときはロードを拒否し、元ファイルを保持する。**旧形式の部分破損の検出とトランザクショナル復旧は未完成**。運用前に別途バックアップを取る。
-
-CIは `.github/workflows/ci.yml` にて `cargo build --locked`、`cargo test --locked -- --test-threads=1`、Java互換機能の`cargo check`を実行する。CI成功はVanillaとの互換性・ネットワーク負荷耐性・20TPS実測を保証しない。
+コードはMIT（[LICENSE](LICENSE)）。`datapacks/vanilla/`、`assets/`、`resourcepack.zip`、`config_packets.bin` はMojang由来のデータ・資産であり、MITライセンスの対象外です。詳細は[復元と検証の記録](RESTORATION.md)と[第三者データの注意](SECURITY_NOTES.md)を参照してください。GPL/AGPLの実装コードは取り込んでいません。

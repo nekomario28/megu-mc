@@ -1,239 +1,32 @@
-# 現在状態の集約（次の判断の入口）
+# 現在状態
 
-この文書は**加速層**であり、権威ではない。権威は各spec・CI・証拠。
-下の各specへ降りて確認する。書いた時点の状態を1箇所にまとめ、
-次のセッションが再構成せずに判断できるようにする。
+このページは、現在の作業状態と次の判断の入口です。ブランチ名・HEAD・コミット数のように短期間で変わる値は記録しません。測定値と再現条件の詳細は各証拠ページを正本とし、ここでは結論と限界だけを要約します。
 
-**全体の順序と合格条件は [PLAN.md](PLAN.md) が持つ。** 以下の文書は各領域の設計を持つ。
+## 文書の役割
 
-## CURRENT OBJECTIVE
-
-**小規模・低負荷の世界で計算量を減らし、必要な既存Modも使えるサーバーを作る。**
-観測可能な挙動を保つことが前提（[DESIGN.md](../DESIGN.md)）。
-
-順序は「基盤を先に」。20TPS時間契約は完了し、いまは基盤の共通部品を作っている。
-「超軽量化の実証」は**まだ達成していない**。
-
-## CURRENT AUTHORITY / HEAD
-
-| | |
+| 質問 | 正本 |
 |---|---|
-| branch | **`fix/20tps-integrated`** |
-| HEAD | `0c52559` |
-| 状態 | ツリーclean、リモートと一致、**CI green** |
-| `main` との差 | **86 commit**。`main` は `4e5f3e6`（未マージ） |
-| テスト | **92 passed**（serial／8thread×3回連続）、CI 4step通過 |
+| いま何ができ、何が未確認か | このページ |
+| 目標・合格条件 | [PLAN.md](PLAN.md) |
+| 次に進む順序と各段階の出口条件 | [ROADMAP.md](ROADMAP.md) |
+| なぜその設計を選んだか | [choices](close-defects/choices.md) と各spec |
+| 数値・fixture・再現条件 | 該当する [`evidence/`](../evidence/) ページ |
+| 過去の個別監査項目 | [close-defects](close-defects/README.md)（現在の全体完了判定ではない） |
 
-`fix/20tps-integrated` = 20TPS時間契約 + PR #2のhardening の統合head。
-`fix/20tps-time-contract` は時間契約のみ（`58dac5e`、統合に包含）。
-`fix/audit-1-on-20tps` は削除済み。
+READMEや他の計画文書に状態表を複製しません。更新時はこのページと根拠となる証拠を一緒に直します。
 
-## PROVEN / ACCEPTED
+## 状態
 
-**時間契約（[time-contract](time-contract/README.md)）**
-- `TICK_MS = 50`。全境界（時刻・効果・精錬・機械・移動・導火線・TTL・周期・確率）を
-  `TICK_MS` から導出。独立レビュー（issue #7）の P1 は全て対応し、各修正に負の対照を付けた
-- 移動係数は javap 一次証拠から vanilla 値
-- 実バグを6件発見・修正（溶岩リテラル・save/load単位・air供給・TTL・座標OF・
-  旧counter単位・save副作用・飛翔体drag）
+- **全体目標は未達。** M2（同じ入力で遊べる範囲のvanilla一致）とM3（同じ仕事での軽量性）は達成していません。完了条件は[PLAN](PLAN.md)を参照。
+- **worldgenは進行中。** terrain-only比較と cave / cave-extra / canyon carver は限定した2×2固定具で0セル差を確認しています。これは全seed・全chunk・featureを含む一致を示しません。
+- **feature層は未確定。** 以前の差分値の一部は、生成stage・参照chunkの完成度・skip数が揃っていないため、現行feature残差として扱いません。保存world全体の差をfeature差と呼ばないこと。
+- **kelpは実装済みだがvanilla parityは未検証。** 合成回帰テストはありますが、既存のvanilla fixtureでは両側ともkelpが0個で、挙動を通った証拠になりません。正の参照セルを持つ完全生成chunkが必要です。
+- **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。
+- **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
+- **コード検証:** `cargo test --release` は `b3e1c62` のコードで157 passed / 1 ignored。今回の変更は文書のみです。この記録は `tests/verify.sh` やhosted CIの成功を意味しません。`cargo fmt -- --check` は既存の広範な差分を報告しており、一括整形はしていません。
 
-**基盤（[foundation](foundation/README.md)）**
-- **slice 01 Region accessor 完了**：per-item lockを1箇所に。entity-heavy fixtureで
-  **x1.148 / x1.184**（測定）
-- **slice 02 Scheduled-tick queue 完了**：遅延リング＋重複排除。**水・溶岩・ホッパー
-  全てを移行**し、毎tick全セルclone＋巡回は**0件**。痕跡ゲート3本で等価性を確認
+## 次の判別作業
 
-**重複の解消（[survey](foundation/slices/07-redundancy-survey.md)）**
-- `requeue_water`/`requeue_hopper`/`requeue_lava` の3重化 → `requeue_fluid(queue,pos,period)`
-- `clients()` スナップショット式 **35箇所** → `client_snapshot()`（ロック順序を関数にした）
-- 4つのbroadcast → `fanout(述語, mk)`（broadcast呼び出しは94箇所）
-- tree の置換可能述語3つ → `is_replaceable(reg, cur, tags)`
-- 各統合にゲートと**負の対照**を付けた。うち2件は**統合した瞬間に検証の穴を発見**
-  （溶岩のperiod変換、broadcastの述語）
+feature parity を進める前に、**正のkelp参照を含むvanilla fixture**を作ります。選択されたplaced feature、全生成済み参照chunk、kelp/kelp-plantの正の個数をゲートで確認し、その後にfeature実行・乱数消費・セル集合を比較します。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
 
-**ブロック知識の表を資産由来にする（[slice 03](foundation/slices/03-registry.md)、[一掃](foundation/slices/08-asset-sweep.md)）**
-- 手書きの表と資産を全状態で比較し、**移行前のgate**を作った（移行の等価性は
-  移行前の状態を固定していなければ意味がない）
-- **`block_hardness` を削除し資産から導出**：手書き表は 26,684状態中**356状態（1.3%）**
-  しか覆っておらず、残りは既定0.6だった。**26,420状態の掘削時間が誤っていた**
-  （`crying_obsidian` は50ではなく0.6、金属ブロック・spawner・anvil・hopper・chest・deepslate）
-- **`canHarvest` を資産の `harvestTools` から導出**：旧判定は
-  「ツルハシが要る かつ tierが足りる」という**別の質問**で、道具が要らないブロック
-  （土・砂・草・原木・葉）を「不可」と判定し**3.33倍遅く**していた。
-  `harvest_level_required` / `harvest_level`（約30行）を削除
-- **`tool_dig_speed` の正しいツール種も資産から導出**：旧判定は裸の数値範囲で、
-  157状態+119+19しか覆っておらず **83.9% の状態で誤っていた**（土にシャベル、
-  原木に斧、苗木に斧、葉にクワ）。`needs_pickaxe` を削除。
-  黒曜石のように `material` が tier しか述べない場合は `harvestTools` の
-  アイテムIDからツール種が決まる
-- 3件とも**資産を独立に読む**gateを持ち、負の対照で失敗を確認
-
-**目標の測定（[receipt](../evidence/goal/idle-vanilla/README.md)）**
-- **初の別実装比較**：同seed・同ワールド種別・同視野/シミュレーション距離・
-  プレイヤー無しで、アイドル12秒の CPU と RSS を連続測定
-- vanilla 1.21.1（公式バンドラ、SHA-1照合済み）：**2.690s / 1094 MiB / 63 threads**
-- mc-spine：**0.000s / 30.1 MiB / 3 threads**
-- **地形入り**（両方が vanilla の noise settings から同じ地形を生成）。
-  最初の版は flat で測っていた — mc-spine を一時ディレクトリから起動したため
-  `./datapacks` が見えず**黙って flat にフォールバック**していた。
-  **「条件を揃えた」は確認して初めて言える**
-- **worldgen の比較はまだできない**：vanilla 側は起動窓の CPU が
-  JIT・プール起動に支配され**チャンク数に比例しない**（25ch=7.1s、441ch=5.8s）。
-  サーバーを温めてから RCON で制御生成する方法が要る。mc-spine 側の
-  9.3 ms/chunk も**地形列のみ**で full chunk ではない
-- 再現：`bash tools/idle_compare.sh 12 0`
-- **示さないもの**：同じ仕事をしている比較ではない（実装している機能が少ない）。
-  プレイヤー有りの比較ではない。worldgen の比較ではない
-  （mc-spine は datapack が無く flat。vanilla も flat に揃えた）
-
-**性能の end-to-end 測定（[receipt](../evidence/time-contract/recipe-cache/README.md)）**
-- この枝で**初めて**、最適化を fixture の tick で**連続前後測定**した
-- `active_furnaces_pack`（datapackレシピ40件）で **tick x2.52**、炉stage x5.11
-- datapack無しでも **tick x1.11**（空でも毎回扣っていた mutex が消える）
-- 対照 `idle_furnaces` は x0.98（=変化なし）
-- **before の作り方で一度間違えた**：`smelt_out` 全体を外すと不変側の memo まで
-  外れて 100倍になり、忠実でなかった。可変走査だけを外す形に直した
-- **示すもの**：等しい20TPS・等しい世界で前後が上表の比になる
-- **示さないもの**：vanilla との比較ではない。代表負荷ではない。実クライアント未使用
-
-**セキュリティ**：PR #2のhardeningを統合（権限・RCON・handshake・save envelope・
-起動時検証・pre-play deadline）
-
-## DISPROVEN / SUPERSEDED
-
-**再開しないこと（negative knowledge）**
-- **PR #2の素朴な20TPS（`56a6e79`）は取り込まない。** `TICK_MS` を50にするだけで
-  効果持続・炉・空気・TTL・移動係数を変換しておらず、取り込むと後退する。
-  pacing部分だけ移植済み
-- **region構築のVec+sort+dedupは不採用**。密集した中心で x0.72
-- **drop/xp/作物/mobのlock hoistは不採用**（fixtureにその要素が無く測れない）
-- **`save_world_into` の旧実装はデータ損失**。resting tridentがsaveから失われていた
-
-**重複の統合で実際に起きたこと（記録）**
-- 統合は**検証の穴を露出させる**。溶岩のperiod変換は痕跡ゲートをすり抜けていた
-  （流れるセルはbackoffせず、periodが効かない分岐しか通らない）。
-  broadcastの述語も同様。**「重複している」と「ゲートが覆っている」は別**
-- クローン検出の J は**候補を挙げるだけ**。`lerp2`/`lerp3` は J=1.00 だが
-  アリティが違うので統合しない
-
-**測定方法の失敗（繰り返さない）**
-- before/afterを数分離して測ると**環境負荷を変更の効果と誤読**する。
-  同一コードの再測定で壁時計8.5%・CPU時間19%変動。**連続して測る**
-- **fixtureに無い要素の最適化は測れない**（slice 18で3回踏んだ）
-- `tc qdisc` 等でリソース制限すると、制限が全体にかかり測定環境を壊す
-
-## UNRESOLVED
-
-| 項目 | 場所 |
-|---|---|
-| **独立レビュー**：統合headの衝突解決10箇所は未確認 | issue #7 |
-| 重複の上位候補（表引き4つ組、`spawn_*_pkt`、`door_base`/`gate_base`） | [survey](foundation/slices/07-redundancy-survey.md) |
-| **資産の残りフィールド**（`stackSize`, `resistance`, `luminance`, `blast_resistance`, `slipperiness`, **`collision_shapes`**） | [一掃](foundation/slices/08-asset-sweep.md) |
-| **`tier_speed` の表**（木2/石4/金12/鉄6/ダイヤ8/ネト9）が手書き（資産の `harvestTools` にツール速度は無いので出典が要る） | [slice 03](foundation/slices/03-registry.md) |
-| `state_to_item`（drops）も資産の `drops` を再導出している（シルクタッチ/幸運の分岐があり単純置換不可） | [slice 03](foundation/slices/03-registry.md) |
-| `is_hot` / `is_warm` の薄いラッパが未使用のまま残る（警告2件） | [slice 01](foundation/slices/01-region-accessor.md) |
-| 基盤 slice 03〜06 | [foundation](foundation/README.md) |
-| 被ダメ無敵をvanilla `invulnerableTime` 20へ（未実装） | [slice 25](time-contract/slices/25-invulnerability.md) |
-| 実クライアント・vanilla動的比較・代表負荷計測 | 全て未実施 |
-| `sched_ready` が3ループに冗長に残る（掃除候補） | [tick-queue](../evidence/foundation/tick-queue/README.md) |
-
-## INVARIANTS / DO-NOT-CHANGE
-
-- ゲーム時間・乱数・状態はRustに一つだけ。Java側に別の世界を進めない
-- 省略は結果と発生tickが不変と証明した対象だけ。**定数の時間換算を状態再現と呼ばない**
-- scheduled tickの遅延値を全セルの永久巡回周期に読み替えない（slice 02で解消済み）
-- 休止には漏れない起床条件が要る。**起床条件漏れは不合格**
-- 時間語の変換は**周期は割る・確率は掛ける**。方向を間違えると5倍/8倍ずれる
-- 永続化の単位はMET4。旧MET2/MET3はミリ秒（age系）と4TPS tick（counter系）の2種類
-- 測定は **x1.10未満を主張しない**（ノイズが大きい）
-- `main` に直接入れない。段階ごとにbranchを切りCIを通す
-
-## CURRENT FIRST BLOCKER
-
-**独立レビューが一度も通っていない。** `codex review` は外部の利用制限で不通。
-統合headは衝突解決を10箇所で行い、**その正しさは未確認**。
-自己レビューで私が作った欠陥を2件見つけた（`read_comps` の重複、saveの二重書込）
-ので、他にも残っている可能性がある。
-
-**ゲーム要素の計画（[gameplay](gameplay/README.md)）** — 95 commit / 85テスト
-- 在庫を確定：tick システム15、コマンド約25。欠落は ディメンション / レッドストーン /
-  村人 / mob 5種のみ / 光 / 衝突形状 / 落下ブロック / 葉の枯れ / ポータル / ベッド / ボート
-- 支配的な教訓：**ブロックの知識はすでにデータである**（`pblocks.json` が状態ごとに
-  `collision_shapes` / `luminance` / `opacity` 等を持つ）。**挙動を書くのではなく
-  データを読み消費者を書く**
-- 12 slice を値÷費用で順序付け、各 slice に証拠を要求
-- slice 01 の1件目（`stackSize`）完了。**5つ目にして初めて既に正しかった表**
-- **slice 02 の設計で前提問題が判明**：(a) world は疎なオーバーレイで
-  「読み込み済み chunk の一覧」が無い → 対象は既存の hot region + forceload で定義する。
-  (b) **seed 付き world RNG が無い**（`rand_u64()` は SystemTime、18箇所）→
-  ランダムtick は RNG を消費するので**これが最初の実装対象**
-- **slice 02 の手順1〜4 完了＋最適化**：tick は `idle_actor` で **x3.22**、
-  `active_furnaces_pack` で **x2.77**（連続前後測定）。
-  挙動ID（u8）で整数ディスパッチ、`breg()` をパスごとに1回。
-  **random_ticks 自身の比は主張しない**（どのシナリオでも約18µs一定で、
-  `ticked_chunks()` の費用を説明できていない）
-- **前の記録を訂正**：1サンプル1µsではなく32ns。費用の正体はサンプル数
-  （726/tick）。vanilla は 8,712/tick なので**我々は12倍少ない**
-- **slice 02 の手順1〜4 完了**：`world_rng()`（seed付き xorshift64*、zero seed の
-  固定点をテスト）／`ticked_chunks()`（hot region + forceload。新概念を作らない）／
-  サンプラ（section ごとに3個）／**サトウキビ成長**
-- **実バグ1件発見**：`with_prop` がプロパティを**下げる**とき状態範囲の外へ
-  出ていた（age 15→0 が **jukebox**）。**軸・向き・年齢・距離・レベル全てに影響**。
-  剰余で差分を出し、`digit*mult` を含む `off` に足していた
-- **未了**：RNG 状態を保存していない（vanilla は保存する。実ギャップ）／
-  `rand_u64()` 18箇所は未移行（分布が変わるため）／苗木・葉・草・雪は未着手
-
-## FINITE DECISION TREE
-
-**順序を入れ替えた。** 直近の作業は全て vanilla 忠実性であり、目標である
-「超軽量化」の証拠は1つも増えていない。[slice 08](foundation/slices/08-asset-sweep.md)
-の一掃で、忠実性の作業が**無限に続くこと**が分かった（残りは10フィールド以上）。
-
-1. **測定器を作る（`tools/asset_coverage.py` + `tests/verify.sh`）** —
-   同じ手順を4回手書きした。1コマンドにすれば、以降の全部が安くなる。
-2. **スカラー系のデータフィールドを一括で移行する**
-   （`stackSize`, `blast_resistance`, `slipperiness` など）— 同形の作業を
-   5コミットに分けない。
-3. **実環境計測の手段を仕上げる** — アイドル比較は**できた**（再現スクリプト付き）。
-   次は **同じ仕事をさせた比較**：プレイヤーを入れ、同じ構造を置き、
-   同じ tick 数だけ走らせる。これが無いと「機能あたりの費用が安い」とは言えず、
-   「実装が少ないから軽い」と区別できない。
-   あわせて mc-spine 側の **worldgen datapack 欠落**を直す
-   （現状 flat でしか走らず、地形を持つ比較ができない）。
-4. **`collision_shapes`（状態ごとの衝突形状）** — 残る**最大の挙動差**。
-   新しい形状系と移動・設置の消費者が要るので独立した spec にする。
-5. **独立レビューを起こす** — 最大のプロセスリスク。
-   `codex review` は不通なので別の経路で。
-6. slice 04（Entity framework）/ 05 / 06 — 上を踏んだ後。
-
-## NEXT SMALLEST DISCRIMINATING ACTION
-
-**測定の手順を1つのスクリプトにする。**
-
-「手書き表と資産を全状態で比較し、食い違いを数え、例を出す」という
-**同じ手順を4回手書きした**（hardness / canHarvest / tool_kind / drops）。
-
-`tools/asset_coverage.py --field <name>` として置けば、
-残りのフィールド（`stackSize` / `resistance` / `luminance` / `blast_resistance` /
-`slipperiness` / `collision_shapes`）の**それぞれが1コマンドで測れる**。
-
-これは1ファイルで完結し、**以降の全ての決定を安くする**。
-
-同時に `tests/verify.sh` を作る（serial → 8thread×3 → wire smoke → feature 2種）。
-
-## EXPLICIT NON-NEXT WORK
-
-- **vanilla coeffやTTLの再変更**（レビュー済み・確定）
-- **PR #2の素朴な20TPSの取り込み**（却下済み）
-- **不採用にした最適化の再試行**（測定済み）
-- **fixtureに無い要素の最適化**（測れない）
-- `sched_ready` の削除（安全網。急がない）
-
-## EVIDENCE REFERENCES
-
-- 時間契約: [specs/time-contract](time-contract/README.md) / [evidence/time-contract](../evidence/time-contract/)
-- 基盤: [specs/foundation](foundation/README.md) / [evidence/foundation](../evidence/foundation/)
-- Mod互換: [specs/mod-compatibility](mod-compatibility/README.md)
-- 設計原則: [DESIGN.md](../DESIGN.md)
-- 独立レビュー: issue #7（REQUEST CHANGES、P1は対応済み）
-- Pumpkin採用の制約: issue #3（**GPL-3.0。コードは写さない**）
+以後の順序は[ロードマップ](ROADMAP.md)に従います。比較規律は[DESIGN.mdの約束](../DESIGN.md#比較の約束)を参照してください。
