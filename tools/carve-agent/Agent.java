@@ -403,6 +403,41 @@ public class Agent {
         }
     }
 
+    /** WorldGenRegion.getNoiseBiome(int,int,int): the quart biome actually read. */
+    static byte[] instrumentNoiseBiome(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals("(III)Ljm;")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            if (op != Opcodes.ARETURN) { super.visitInsn(op); return; }
+                            // holder is the return value: stash it, push (qx,qy,qz),
+                            // then reload it as the 4th argument
+                            super.visitVarInsn(Opcodes.ASTORE, 40);
+                            super.visitVarInsn(Opcodes.ILOAD, 1);
+                            super.visitVarInsn(Opcodes.ILOAD, 2);
+                            super.visitVarInsn(Opcodes.ILOAD, 3);
+                            super.visitVarInsn(Opcodes.ALOAD, 40);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "qbiome",
+                                                  "(IIILjava/lang/Object;)V", false);
+                            super.visitVarInsn(Opcodes.ALOAD, 40);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT noisebiome failed: " + t);
+            return null;
+        }
+    }
+
     /** BiomeFilter: log every candidate position and whether the biome accepts it. */
     static byte[] instrumentBiomeFilter(byte[] buf) {
         try {
@@ -676,6 +711,7 @@ public class Agent {
             if ("duz".equals(name)) return instrumentDimension(buf);
             if ("deg".equals(name)) return instrumentBiomes(buf);
             if ("eii".equals(name)) return instrumentBiomeFilter(buf);
+            if ("arb".equals(name)) return instrumentNoiseBiome(buf);
             if ("eis".equals(name)) return instrumentInSquare(buf);
             if ("dyn".equals(name)) return instrumentDynDraws(buf);
             if ("dzx".equals(name)) {

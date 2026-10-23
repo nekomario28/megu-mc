@@ -148,6 +148,29 @@ public class CarveLog {
         return o.getClass();
     }
 
+    static final ThreadLocal<int[]> QB = new ThreadLocal<int[]>() {
+        @Override protected int[] initialValue() { return new int[] { 0 }; }
+    };
+
+    /** `WorldGenRegion.getNoiseBiome(qx, qy, qz)` for one quart cell. */
+    public static void qbiome(int qx, int qy, int qz, Object holder) {
+        String p = System.getProperty("qbiome");
+        if (p == null) return;
+        String[] a = p.split(",");
+        if (a.length == 1 && a[0].equals("all")) {
+            if (QB.get()[0]++ < 24) {
+                System.out.println("QBIOME " + qx + " " + qy + " " + qz + " -> " + holder);
+            }
+            return;
+        }
+        if (a.length != 3) return;
+        if (qx != Integer.parseInt(a[0]) || qy != Integer.parseInt(a[1])
+                || qz != Integer.parseInt(a[2])) {
+            return;
+        }
+        System.out.println("QBIOME " + qx + " " + qy + " " + qz + " -> " + holder);
+    }
+
     public static void biomef(int x, int y, int z, boolean ok) {
         String p = System.getProperty("biomefchunk");
         if (p == null) return;
