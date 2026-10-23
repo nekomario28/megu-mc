@@ -173,9 +173,22 @@ fn p_cf(j: &J) -> Option<Cf> {
             under: name_list(j, "can_place_under"),
         },
         "spring_feature" => Cf::Spring {
+            // the config holds a *fluid* state and vanilla places its legacy block
+            // (`createLegacyBlock`): falling water is level 8, a source is level 0
             fluid: {
-                let (n, p) = js(j, "state").and_then(bs_parts)?;
-                breg()?.state_of(&n, p)
+                let st = js(j, "state")?;
+                let (n, p) = bs_parts(st)?;
+                // the config holds a *fluid* state; vanilla places its legacy block
+                // (`createLegacyBlock`): falling water is level 8, a source level 0
+                let falling = J::Obj(vec![("level".to_string(), J::Str(
+                    if jbool(st, "falling", false) { "8" } else { "0" }.to_string(),
+                ))]);
+                let props = if n.ends_with("water") || n.ends_with("lava") {
+                    Some(&falling)
+                } else {
+                    p
+                };
+                breg()?.state_of(&n, props)
             },
             req_below: jbool(j, "requires_block_below", true),
             rock: jint(j, "rock_count", 4),
@@ -1000,11 +1013,15 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             ctx.set(pos.0, pos.1, pos.2, st);
         }
         Cf::Spring { fluid, req_below, rock, hole, valid } => {
+            // `SpringFeature` (edp): the block *below* must be valid, and with
+            // `requires_block_below` the one below that too. This used to test the
+            // block above, which is the opposite geometry (a spring hanging from a
+            // ceiling instead of emerging from a rock floor).
             let Some(reg) = breg() else { return };
-            if !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 + 1, pos.2))) {
+            if !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2))) {
                 return;
             }
-            if *req_below && !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2))) {
+            if *req_below && !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 - 2, pos.2))) {
                 return;
             }
             let at = ctx.get(pos.0, pos.1, pos.2);
@@ -1013,7 +1030,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             let mut rocks = 0;
             let mut air = 0;
-            for d in [4u8, 5, 2, 3, 0] {
+            // vanilla scans west, east, north, south and *above*
+            for d in [4u8, 5, 2, 3, 1] {
                 let (dx, dy, dz) = dir_off(d);
                 let s = ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz);
                 if valid.contains(reg.name_of(s)) {
@@ -1021,6 +1039,19 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
                 if reg.is_air(s) {
                     air += 1;
+                }
+            }
+            if std::env::var("SPRING_TRACE").is_ok() {
+                static SHOWN: std::sync::atomic::AtomicI32 =
+                    std::sync::atomic::AtomicI32::new(0);
+                if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "SPRING {} {} {} at={} below={} below2={} rocks={rocks} holes={air} want={rock},{hole}",
+                        pos.0, pos.1, pos.2,
+                        reg.name_of(at),
+                        reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
+                        reg.name_of(ctx.get(pos.0, pos.1 - 2, pos.2)),
+                    );
                 }
             }
             if rocks == *rock && air == *hole {
