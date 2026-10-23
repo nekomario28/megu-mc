@@ -2217,3 +2217,17 @@ if (level.getBlockState(p).is(WATER)) {            // ← 水判定が nextDoubl
 固定具**（spawn から離れた chunk を自力生成）が必要で、その道は
 自前 protocol client で bot を歩かせること（`forceload` は遠方で失敗、`setworldspawn` は
 再準備しない）。
+
+## 60. `flower` は `random_patch` と同じ config 形（型名だけ違う）
+
+`feature/flower_default.json` 等の `type` は `minecraft:flower` だが、config は
+`{feature, tries, xz_spread, y_spread}` ＝ **`RandomPatchConfiguration` と同じ形**。
+`KelpFeature`（`ecs`）は別物（`1 + nextInt(10)` の高さ、`age` を
+`nextInt(4)+20`、`kelp`/`kelp_plant`）なので独立に実装する。
+`p_cf` に `"flower" | "random_patch"` の別名を足しただけで花が置けるようになった
+（4×4 隔離固定具で dandelion 2/1・poppy 1/2 ＝ 参照とほぼ一致）。
+
+この固定具の総 diff は 42654 でほぼ動かない: 支配しているのは
+**順序/可視性クラス**（葉の在否・gravel blob・`short_grass` の y）で、型の実装は
+機械的だがこの領域では小さい。型を埋め切ったうえで残る数字が、そのまま
+「この固定具では再現できない部分」の大きさになる（§59 の期待値）。

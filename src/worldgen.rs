@@ -3774,7 +3774,9 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // places 27 cells against vanilla's 28 in the isolated fixture - the capture
         // moves with it, and that feature's residue is now the size of the reference's
         // own noise floor.
-        assert_eq!(digest, "d3a81caa99551dd6d53284d1e5e29116",
+        // 2026-10-23: `minecraft:flower` (the same patch config shape as random_patch, a
+        // different type name) is implemented, so the flower patches in the pack place.
+        assert_eq!(digest, "549920689f0e8bc55538ad9aada6bc45",
             "feature population output changed from the vanilla-order capture");
     }
 

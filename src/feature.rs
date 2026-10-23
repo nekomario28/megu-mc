@@ -208,7 +208,10 @@ fn p_cf(j: &J) -> Option<Cf> {
             valid: name_list(j, "valid_blocks").into_iter().collect(),
         },
         "seagrass" => Cf::Seagrass { prob: jnum(j, "probability").unwrap_or(0.0) },
-        "random_patch" => Cf::RandomPatch {
+        // `minecraft:flower` is the same config shape (a patch of simple blocks), just a
+        // different type name - it was one of the 34 types with no arm, so every flower
+        // patch in the pack did nothing.
+        "flower" | "random_patch" => Cf::RandomPatch {
             feature: Box::new(pf_any(js(j, "feature")?)?),
             tries: jint(j, "tries", 0),
             xz: jint(j, "xz_spread", 0),
