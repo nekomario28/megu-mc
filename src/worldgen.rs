@@ -521,7 +521,9 @@ impl Gen {
                     eprintln!("VEINCFG refs a={:?} b={:?} c={:?}", ta, tb, tc);
                 }
                 if let (Some(ta), Some(tb), Some(tc)) = (ta, tb, tc) {
-                    let st = |n: &str| crate::name_to_state(n).unwrap_or(0);
+                    // the resolver `Gen::load` was handed, not the root binding: a
+                    // generation module may not reach `crate::` for names.
+                    let st = |n: &str| res(n).unwrap_or(0);
                     g.vein = Some(VeinCfg {
                         toggle: ta,
                         ridged: tb,
@@ -2289,10 +2291,10 @@ impl Gen {
     /// counts canopy leaves, and a later candidate then fails `would_survive` on the
     /// leaf above it. Keeping the tally inside one chunk's placement pass loses that
     /// (measured: vanilla's candidate (0,70,17) against this port's (0,64,17)).
-    pub(crate) fn note_feature_write(&mut self, x: i32, y: i32, z: i32, st: u32) {
-        let reg = crate::block_registry::breg();
-        let solid = reg.map(|r| r.is_solid(st)).unwrap_or(false);
-        let air = reg.map(|r| r.is_air(st)).unwrap_or(st == 0);
+    ///
+    /// The caller classifies the state: the block knowledge lives below this layer
+    /// and a generation module may not reach for it (see module-layers/policy.json).
+    pub(crate) fn note_feature_write(&mut self, x: i32, y: i32, z: i32, solid: bool, air: bool) {
         let e = self.feat_hm.entry((x, z)).or_insert((i32::MIN, i32::MIN));
         if !air {
             e.0 = e.0.max(y + 1);
@@ -2342,12 +2344,19 @@ impl Gen {
     }
 
     /// Populate the 3x3 around a chunk if it has not been populated yet, so a
-    /// diagnostic reads the same feature-layer state a generation loop would.
-    pub(crate) fn ensure_populated(&mut self, cx: i32, cz: i32) {
+    /// diagnostic reads the same feature-layer state a generation loop would. The
+    /// driver is passed in, as at every other call site here: the choice of
+    /// placement implementation belongs to the caller's boundary, not to worldgen.
+    pub(crate) fn ensure_populated(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        mut populate: impl FnMut(&mut Gen, i32, i32),
+    ) {
         for dx in -1..=1 {
             for dz in -1..=1 {
                 if !self.pop_done.contains(&(cx + dx, cz + dz)) {
-                    crate::feature::populate(self, cx + dx, cz + dz);
+                    populate(self, cx + dx, cz + dz);
                 }
             }
         }
@@ -3447,7 +3456,7 @@ pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
 /// 4x4x4 biome ids for one chunk section, quart-space index (y<<4|z<<2|x).
 /// `MC_SPINE_HM_DUMP=cx,cz`: print the OCEAN_FLOOR and WORLD_SURFACE height of
 /// every column, to compare against a saved vanilla chunk's Heightmaps.
-pub fn hm_dump(spec: &str) {
+pub fn hm_dump(spec: &str, populate: fn(&mut Gen, i32, i32)) {
     let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
     if p.len() != 2 {
         return;
@@ -3458,7 +3467,7 @@ pub fn hm_dump(spec: &str) {
     // the feature layer's height a *running* world would hold only exists once the
     // chunks around the column have been populated; reading the tally before that
     // returns terrain heights and silently "proves" a difference
-    g.ensure_populated(cx, cz);
+    g.ensure_populated(cx, cz, populate);
     let Some(c) = g.cols(cx, cz) else { return };
     for lz in 0..16usize {
         for lx in 0..16usize {

@@ -21167,7 +21167,7 @@ fn main() {
             worldgen::biome_dump(&spec);
         }
         if let Ok(spec) = std::env::var("MC_SPINE_HM_DUMP") {
-            worldgen::hm_dump(&spec);
+            worldgen::hm_dump(&spec, feature::populate);
         }
         if let Ok(spec) = std::env::var("MC_SPINE_BIOME_AT") {
             worldgen::biome_at_dump(&spec);

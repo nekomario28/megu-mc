@@ -67,8 +67,12 @@ impl<'a> FC<'a> {
         self.wr.insert((x, y, z), st);
         // the heightmap lives on `Gen` so that a write for this chunk is visible to
         // the next chunk's placements too (vanilla updates the owning chunk's
-        // heightmap on every setBlock)
-        self.g.note_feature_write(x, y, z, st);
+        // heightmap on every setBlock). This layer classifies the state, because
+        // the block knowledge sits below worldgen and worldgen may not reach for it.
+        let reg = breg();
+        let solid = reg.map(|r| r.is_solid(st)).unwrap_or(false);
+        let air = reg.map(|r| r.is_air(st)).unwrap_or(st == 0);
+        self.g.note_feature_write(x, y, z, solid, air);
     }
     pub(crate) fn is_air(&mut self, x: i32, y: i32, z: i32) -> bool {
         let st = self.get(x, y, z);
