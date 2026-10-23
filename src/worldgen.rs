@@ -3766,7 +3766,11 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // moves with it; the fixture to read next is `tools/ore_fixture.sh`
         // (938 -> 42939 cells over 8 chunks, short_grass 0 -> 362 against vanilla's 102,
         // i.e. an over-placement to explain).
-        assert_eq!(digest, "90c0986409c4e0495a9a04e3ecb96d95",
+        // 2026-10-23: `SimpleBlockFeature`'s `canSurvive` gate is applied, so a patch no
+        // longer places its block on any air cell in the box (short_grass 362 -> 44
+        // against vanilla's 102, with the draw streams identical - the next item is the
+        // attempt/acceptance count, not the placement).
+        assert_eq!(digest, "115d0f466e9459fd43af43dbea4c91a3",
             "feature population output changed from the vanilla-order capture");
     }
 

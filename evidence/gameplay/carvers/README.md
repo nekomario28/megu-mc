@@ -2118,3 +2118,36 @@ for (int i = 0; i < cfg.tries(); i++) {
 2. 残る型の実装（`seagrass`・`flower`・`kelp`・`sea_pickle`・`large_dripstone`・
    `geode` など overworld に効くもの）
 3. その後で残差を**再基準化**して、順序非依存の塊（葉の在否・gravel blob・植生）を追う
+
+### 58.1 `simple_block` の `canSurvive` を実装（過剰配置 → 過少配置へ）
+
+`RandomPatchFeature` のドロー列は vanilla と **14/14 完全一致**（`f=51,9`：
+`nextInt(16)=9,4`（in_square）→ `nextInt(8)=3,0` / `nextInt(4)=0,2` / `nextInt(8)=1,0`（patch の
+x/y/z ずれ、6 ドロー））＝ 外側の配置も patch の広がりも正しい。
+
+残るのは入れ子の `simple_block`。vanilla の `SimpleBlockFeature`（`edl`）は
+
+```java
+dtc st = cfg.toPlace().getState(level, random);
+if (st.a(level, pos)) {          // canSurvive
+   level.setBlock(pos, st, 2);
+   return true;
+}
+return false;                     // ← これが無かった
+```
+
+＝ `canSurvive` を要求する。`short_grass` は `TallGrassBlock`（`doe`）→ `BushBlock`（`dgh`）で、
+`mayPlaceOn` は「下が DIRT タグ or FARMLAND」。実装した（`would_survive` と同じ `can_place` を再利用）。
+
+| | 修正前 | 修正後 | vanilla |
+|---|---|---|---|
+| `short_grass` | 362（3.5倍） | **44** | 102 |
+| 共通 | 41 | 40 | — |
+
+過剰配置は消えたが、今度は**過少**（44 vs 102、vanilla だけ 62）。ドローは一致しているので、
+試行数（`tries` 32×patch 16 = 512）か受理率のどちらかが違う。`SIMPLE_TRACE=1` で
+1 試行ごとの `below`/verdict を出せるようにしたので、次は
+「試行数・受理数」を数えて切り分ける（例: 我々の patch 位置が **y で 1 ずれ**ていて
+「地面の中」を叩いている、なら大幅に過少になる）。
+
+4×4 の総 diff は 42706（型の未実装が支配的なので、この数字は型を埋めるまで意味を持たない）。

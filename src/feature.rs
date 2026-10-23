@@ -1034,6 +1034,30 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
             }
             let st = to.get(ctx, rng, pos.0, pos.1, pos.2);
+            // `SimpleBlockFeature` (edl) places only where the state `canSurvive`
+            // (`edl.a`: `if ($$4.a($$2, $$3)) ... else return false`). Without it a
+            // patch places its block on any air cell inside the box - measured:
+            // short_grass 362 cells against vanilla's 102, with the draw streams
+            // matching exactly, so the outer placement and the patch spreads were
+            // already right and only this check was missing.
+            if let Some(reg) = breg() {
+                let ok = can_place(reg, ctx, reg.name_of(st), pos.0, pos.1, pos.2);
+                if std::env::var("SIMPLE_TRACE").is_ok() {
+                    static N: std::sync::atomic::AtomicI32 =
+                        std::sync::atomic::AtomicI32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                        eprintln!(
+                            "SIMPLE {} {} {} state={} below={} at={} ok={ok}",
+                            pos.0, pos.1, pos.2, reg.name_of(st),
+                            reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
+                            reg.name_of(ctx.get(pos.0, pos.1, pos.2))
+                        );
+                    }
+                }
+                if !ok {
+                    return;
+                }
+            }
             ctx.set(pos.0, pos.1, pos.2, st);
         }
         Cf::Spring { fluid, req_below, rock, hole, valid } => {
