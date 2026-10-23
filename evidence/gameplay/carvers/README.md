@@ -1325,3 +1325,31 @@ disk 系 feature（sand/clay/gravel）の実装**で、それが直れば木の�
 **注意**: `LevelHeightAccessor.getMinBuildHeight` の obf は `I_()`（`dcy`）。
 nether/end は同じ chunk 座標・同じ level seed で装飾するので、
 dimension で切らないと FSEED/BIOMEF のログが混ざる（今回それで 1 往復無駄にした）。
+
+## 37. disk 系が「黙って 0 書き込み」だった 2 つの理由
+
+`disk_sand` / `disk_gravel` / `disk_grass` が 1 セルも置いていなかった。原因は
+**どちらも「解析に失敗したものが黙って落ちる」**型で、ログには `+0 writes` としか
+出ない（＝「置くものが無かった」と見分けがつかない）。
+
+1. **1.21.1 の rule-based state provider には `type` が無い**。形は
+   `{"fallback": {...}, "rules": [...]}` で、こちらは `jstr(j,"type")?` で
+   即 `None` → **feature 全体が登録されない**（`CF_MISSING=1` を足すまで見えなかった）。
+   1.21.2+ は `"type": "minecraft:rule_based_state_provider"` を書くので気付きにくい。
+2. **`"fluids": "minecraft:water"` は単一値**。こちらのパーサは
+   `jarr(j,"fluids")` か `jstr(j,"fluid")` しか見ておらず、`fluids` が文字列だと
+   `Pr::Fluids(vec![])` になり **全候補が棄却**（`disk_sand` の placement は
+   `count 3 → in_square → heightmap(OCEAN_FLOOR_WG) → block_predicate_filter(matching_fluids water)`）。
+
+修正後: feature あり 2×2 の diff は 2510 → **1856**、chunk (0,0) 単体は 540 → **140**。
+
+残差の内訳は `oak_leaves != air` 541 / `air != oak_leaves` 303 /
+**`oak_leaves != oak_leaves` 190**（＝同じ葉だが `distance` プロパティが違う）=
+TreeFeature の `updateLeaves`（葉の distance 伝播）が未実装なのが次。
+
+### 計測器（追加）
+
+- `PF_UNKNOWN=1`: 解析できず落ちた placement modifier を表示（`fixed_placement` を発見）
+- `CF_MISSING=1`: 名前で参照された configured feature が見つからないとき表示
+  （今回の disk はこれで見つかった）
+- `DISK_TRACE=1`: disk の判定を列単位で表示（追加したが、今回は不要だった）

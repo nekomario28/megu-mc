@@ -377,7 +377,16 @@ pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
             return Some(BSP::Simple(breg()?.state_of(&n, p)));
         }
     }
-    let ty = jstr(j, "type")?;
+    // 1.21.1 writes the rule-based provider as `{"fallback": ..., "rules": [...]}`
+    // with no `type` field; 1.21.2+ names it `minecraft:rule_based_state_provider`.
+    // Without this the whole *feature* fails to parse and is dropped silently.
+    let ty = match jstr(j, "type") {
+        Some(t) => t,
+        None if js(j, "fallback").is_some() || js(j, "rules").is_some() => {
+            "rule_based".to_string()
+        }
+        None => return None,
+    };
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
     Some(match ty {
         "simple_state_provider" => p_bsp(js(j, "state")?)?,
@@ -520,9 +529,12 @@ pub(crate) fn p_pred(j: &J) -> Option<Pr> {
             let mut v = vec![];
             if let Some(fs) = jarr(j, "fluids") {
                 for f in fs {
-                    v.push(ns_name(f.str()));
+                    // the 1.21.1 data writes plain names here, the 1.21.2 one
+                    // block-state-shaped objects
+                    v.push(if let Some((n, _)) = bs_parts(f) { n } else { ns_name(f.str()) });
                 }
-            } else if let Some(f) = jstr(j, "fluid") {
+            } else if let Some(f) = jstr(j, "fluids").or_else(|| jstr(j, "fluid")) {
+                // `"fluids": "minecraft:water"` is a single value, not a list
                 v.push(ns_name(&f));
             }
             Pr::Fluids(v)

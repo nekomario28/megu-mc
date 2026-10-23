@@ -495,8 +495,16 @@ fn apply_modifiers(
 fn gen_cf_ref(fref: &FRef, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match fref {
         FRef::Name(n) => {
-            if let Some(cf) = fr.cfg.get(n) {
-                gen_cf(cf, fr, ctx, rng, pos);
+            match fr.cfg.get(n) {
+                Some(cf) => gen_cf(cf, fr, ctx, rng, pos),
+                None => {
+                    // A configured feature that failed to parse is skipped
+                    // silently, which looks exactly like "the feature chose not
+                    // to place anything".
+                    if std::env::var("CF_MISSING").is_ok() {
+                        eprintln!("CFMISSING {n}");
+                    }
+                }
             }
         }
         FRef::Inline(cf) => gen_cf(cf, fr, ctx, rng, pos),
@@ -934,6 +942,15 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     let (x, z) = (pos.0 + cx, pos.2 + cz);
                     let mut y = top;
                     while y > bottom {
+                        if std::env::var("DISK_TRACE").is_ok() && cx == 0 && cz == 0 {
+                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "DISK {x} {y} {z} block={} target={} feature={},{}",
+                                reg.name_of(ctx.get(x, y, z)),
+                                test_pred(target, reg, ctx, x, y, z),
+                                cf >> 32, cf & 0xFFFF
+                            );
+                        }
                         if !ctx.out_of_h(y) && test_pred(target, reg, ctx, x, y, z) {
                             let st = bsp.get(ctx, rng, x, y, z);
                             ctx.set(x, y, z, st);

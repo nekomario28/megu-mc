@@ -3031,6 +3031,27 @@ pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
 }
 
 /// 4x4x4 biome ids for one chunk section, quart-space index (y<<4|z<<2|x).
+/// `MC_SPINE_HM_DUMP=cx,cz`: print the OCEAN_FLOOR and WORLD_SURFACE height of
+/// every column, to compare against a saved vanilla chunk's Heightmaps.
+pub fn hm_dump(spec: &str) {
+    let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
+    if p.len() != 2 {
+        return;
+    }
+    let mut gg = GEN.lock().unwrap();
+    let Some(g) = gg.as_mut() else { return };
+    let (cx, cz) = (p[0], p[1]);
+    let Some(c) = g.cols(cx, cz) else { return };
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+            let of = g.top_oc(x, z);
+            let ws = g.top_ws(x, z);
+            eprintln!("HM {} {} {} {}", lx, lz, of, ws);
+        }
+    }
+}
+
 /// `MC_SPINE_BIOME_DUMP=cx,sy,cz`: print the quart-sampled biome name for every
 /// 4x4x4 cell of one section, to compare against a saved vanilla chunk.
 pub fn biome_dump(spec: &str) {
@@ -3494,7 +3515,11 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // per-feature index - and therefore the RNG offset - of every step whose
         // biome lists differ, so trees and vegetation landed in the wrong places
         // while the ore step (identical lists in every biome) was unaffected.
-        assert_eq!(digest, "5b8655ca01002e0da4f69ab4d08069d7",
+        // 2026-10-22: the disk features now place. Their 1.21.1 state provider has
+        // no "type" field and their fluid predicate names a single fluid, so both
+        // parsed to nothing and the feature silently did no work.
+        // 2x2 feature-on diff: 2510 -> 1856 (chunk (0,0): 540 -> 140).
+        assert_eq!(digest, "d71b0fa09e1ec756f945a8940cd3f46d",
             "feature population output changed from the vanilla-order capture");
     }
 
