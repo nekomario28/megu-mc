@@ -1456,14 +1456,33 @@ return ctx.f().a(biome).a(feature);             // biome の feature 集合が f
 で、`forest` の step 9 には `trees_birch_and_oak` が入っている（step 9 の添字集合は
 一致済み）。したがって「保存済み biome = forest なのに false」は説明がついていない。
 
-次に試すべき計測（1 回で足りるはず）:
+### ここまでに確定したこと（追加計測）
 
-- `eii.a` のフック内で `ctx.d().t(pos)` の**戻り値（biome holder）を文字列化**して
-  ログする（`LevelReader.getBiome(BlockPos)` の obf は `dcz.t(Ljd;)Ljm;`）。
-  今回 `eiw.d()Ldds;` → `dcz.t` の連鎖で VerifyError を出したので、
-  正しい所有者インターフェースを確認してから挿す。
-- `ctx.e()`（topFeature）の `toString` も同時に出す（child の `oak_bees_0002` に
-  なっていないか）。
+`eii.a` の中で `ctx.e()`（topFeature）を文字列化したところ:
+
+```
+BIOMEF3 20 66 3 false biome=err top=Optional[Placed Reference{ResourceKey[
+  minecraft:worldgen/configured_feature / minecraft:trees_birch_and_oak]=Configured: ...}]
+```
+
+- **topFeature は `trees_birch_and_oak`**（child の `oak_bees_0002` ではない）。
+- 同じ chunk (1,0) の biome フィルタ呼び出しは **31098 true / 1646 false**。
+  つまり biome 参照は一般的には働いており、この 1 点だけが false。
+- `BiomeFilter` の bytecode は
+  `eiw.e()`（feature）→ `((dds) eiw.d()).t(pos)` → `duz.a(biome)` → `.a(feature)`。
+  `arb`（WorldGenRegion）は `getBiome` を**実装していない**（`a(III)Ljm;` =
+  `getNoiseBiome` だけ実装）ので、`t(pos)` は `LevelReader` の default で
+  `getNoiseBiome(QuartPos.fromBlock(x), fromBlock(y), fromBlock(z))`
+  = この位置では `(5, 16, 0)` に落ちる。
+
+### 次の計測（これで決まるはず）
+
+`arb.a(III)Ljm;`（= `WorldGenRegion.getNoiseBiome`）をフックし、`(5,16,0)` で
+**返る biome holder を文字列化**する。プリミティブ引数＋toString だけなので、
+このリポジトリで実績のある計装パターン（引数をスタックに積んで `CarveLog` を呼ぶ）
+がそのまま使える。`dcz.t` / `eiw.d` の連鎖をリフレクションで辿る方法は
+（`CarveLog.biomef3`、`-Dbiomefwhy`）NPE になり使えなかった — 実装クラス側を
+フックするほうが確実。
 
 候補の (x,z) が一致している以上、ここの解決で木は 45→38 に揃う見込み。
 

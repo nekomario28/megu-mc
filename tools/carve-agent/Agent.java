@@ -422,6 +422,11 @@ public class Agent {
                                 super.visitVarInsn(Opcodes.ALOAD, 3);
                                 super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
                             }
+                            super.visitVarInsn(Opcodes.ALOAD, 1);
+                            super.visitVarInsn(Opcodes.ALOAD, 3);
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "biomef3",
+                                                  "(Ljava/lang/Object;Ljava/lang/Object;Z)V", false);
                             super.visitVarInsn(Opcodes.ILOAD, 40);
                             super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "biomef",
                                                   "(IIIZ)V", false);

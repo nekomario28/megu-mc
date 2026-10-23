@@ -45,6 +45,109 @@ public class CarveLog {
     }
 
     /** BiomeFilter verdicts: `-Dbiomefchunk=cx,cz` limits the log to one chunk. */
+    /**
+     * What the biome filter actually saw, via reflection so no game type has to
+     * be named at the instrumentation site (a hand-rolled interface chain through
+     * the obfuscated hierarchy is easy to get wrong and fails verification).
+     * `ctx.d().t(pos)` is `level.getBiome(pos)`; `ctx.e()` is the top feature.
+     */
+    public static void biomef3(Object ctx, Object pos, boolean ok) {
+        if (System.getProperty("biomefwhy") == null) return;
+        int x = 0, y = 0, z = 0;
+        try {
+            x = (Integer) call(pos, "u");
+            y = (Integer) call(pos, "v");
+            z = (Integer) call(pos, "w");
+        } catch (Throwable t) {
+            // positions are always available; a miss just leaves the coords at 0
+        }
+        String biome = "?", top = "?";
+        try {
+            Object level = callIn(ctx, new String[] {"dds", "dcz"}, "d", new Object[0]);
+            // `dds.t(jd)` is `WorldGenLevel.getBiome(BlockPos)`; several unrelated
+            // one-letter methods exist on the hierarchy, so the declaring class is
+            // pinned by name (obfuscated, hence the string).
+            Object holder = callIn(level, new String[] {"dds", "dcz"}, "t", new Object[] {pos});
+            biome = String.valueOf(holder);
+        } catch (Throwable t) {
+            biome = "err:" + t;
+        }
+        try {
+            top = String.valueOf(call(ctx, "e"));
+        } catch (Throwable t) {
+            top = "err:" + t;
+        }
+        System.out.println("BIOMEF3 " + x + " " + y + " " + z + " " + ok
+                + " biome=" + biome + " top=" + top);
+    }
+
+    /** Invoke the first no-arg (or single-arg) method with that name, whatever its arity. */
+    /** Like `call`, but only accepts a method declared by one of `owners`. */
+    static Object callIn(Object o, String[] owners, String name, Object[] args) throws Exception {
+        java.util.ArrayDeque<Class<?>> q = new java.util.ArrayDeque<>();
+        java.util.HashSet<Class<?>> seen = new java.util.HashSet<>();
+        q.add(o.getClass());
+        while (!q.isEmpty()) {
+            Class<?> c = q.poll();
+            if (c == null || !seen.add(c)) continue;
+            boolean owner = false;
+            for (String w : owners) {
+                if (c.getName().equals(w) || c.getName().endsWith("." + w)) owner = true;
+            }
+            if (owner) {
+                for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                    if (!m.getName().equals(name) || m.getParameterCount() != args.length) continue;
+                    if (args.length == 1 && args[0] != null
+                            && !m.getParameterTypes()[0].isInstance(args[0])) continue;
+                    m.setAccessible(true);
+                    return m.invoke(o, args);
+                }
+            }
+            q.add(c.getSuperclass());
+            for (Class<?> i : c.getInterfaces()) q.add(i);
+        }
+        throw new NoSuchMethodException(name + " on " + java.util.Arrays.toString(owners));
+    }
+
+    static Object call(Object o, String name, Class<?>[] sig, Object... args) throws Exception {
+        // the method may be declared on an interface several levels up, so walk
+        // both the superclass chain and every interface it implements
+        java.util.ArrayDeque<Class<?>> q = new java.util.ArrayDeque<>();
+        java.util.HashSet<Class<?>> seen = new java.util.HashSet<>();
+        q.add(o.getClass());
+        while (!q.isEmpty()) {
+            Class<?> c = q.poll();
+            if (c == null || !seen.add(c)) continue;
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                if (!m.getName().equals(name) || m.getParameterCount() != args.length) continue;
+                // several obfuscated classes reuse one-letter names; the first
+                // candidate that accepts the argument is the one we want, and the
+                // parameter type is checked here rather than guessed at the call site
+                if (args.length == 1 && !m.getParameterTypes()[0].isInstance(args[0])) continue;
+                m.setAccessible(true);
+                try {
+                    return m.invoke(o, args);
+                } catch (java.lang.reflect.InvocationTargetException ite) {
+                    if (ite.getCause() instanceof NullPointerException) continue;
+                    throw ite;
+                } catch (Throwable t) {
+                    throw (Exception) (t instanceof Exception ? t : new Exception(t));
+                }
+            }
+            q.add(c.getSuperclass());
+            for (Class<?> i : c.getInterfaces()) q.add(i);
+        }
+        throw new NoSuchMethodException(name);
+    }
+
+    static Object call(Object o, String name) throws Exception {
+        return call(o, name, new Class<?>[0]);
+    }
+
+    static Class<?> typeOf(Object o) {
+        return o.getClass();
+    }
+
     public static void biomef(int x, int y, int z, boolean ok) {
         String p = System.getProperty("biomefchunk");
         if (p == null) return;
