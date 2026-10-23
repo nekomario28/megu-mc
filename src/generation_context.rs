@@ -17,8 +17,7 @@ pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
     rc: HashMap<(i32, i32, i32), u32>,   // terrain read-through cache
-    ws_t: HashMap<(i32, i32), i32>,
-    oc_t: HashMap<(i32, i32), i32>,
+
     bc: HashMap<(i32, i32, i32), Option<String>>, // biome cache per quart
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
     prof: bool,
@@ -29,8 +28,6 @@ impl<'a> FC<'a> {
             g,
             wr: HashMap::new(),
             rc: HashMap::new(),
-            ws_t: HashMap::new(),
-            oc_t: HashMap::new(),
             bc: HashMap::new(),
             cc: None,
             prof: std::env::var("FEAT_PROFILE").is_ok(),
@@ -68,16 +65,10 @@ impl<'a> FC<'a> {
     }
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
         self.wr.insert((x, y, z), st);
-        if let Some(reg) = breg() {
-            if !reg.is_air(st) {
-                *self.ws_t.entry((x, z)).or_insert(i32::MIN) =
-                    (*self.ws_t.entry((x, z)).or_insert(i32::MIN)).max(y + 1);
-                if reg.is_solid(st) {
-                    *self.oc_t.entry((x, z)).or_insert(i32::MIN) =
-                        (*self.oc_t.entry((x, z)).or_insert(i32::MIN)).max(y + 1);
-                }
-            }
-        }
+        // the heightmap lives on `Gen` so that a write for this chunk is visible to
+        // the next chunk's placements too (vanilla updates the owning chunk's
+        // heightmap on every setBlock)
+        self.g.note_feature_write(x, y, z, st);
     }
     pub(crate) fn is_air(&mut self, x: i32, y: i32, z: i32) -> bool {
         let st = self.get(x, y, z);
@@ -85,11 +76,11 @@ impl<'a> FC<'a> {
     }
     pub(crate) fn hm_ws(&mut self, x: i32, z: i32) -> i32 {
         let base = self.g.top_ws(x, z);
-        self.ws_t.get(&(x, z)).copied().unwrap_or(i32::MIN).max(base)
+        self.g.feature_height(x, z, 0).max(base)
     }
     pub(crate) fn hm_oc(&mut self, x: i32, z: i32) -> i32 {
         let base = self.g.top_oc(x, z);
-        self.oc_t.get(&(x, z)).copied().unwrap_or(i32::MIN).max(base)
+        self.g.feature_height(x, z, 1).max(base)
     }
     /// `LevelReader.getBiome(BlockPos)`, i.e. `BiomeManager.getBiome` — the
     /// *blended* biome, and the one vanilla's `BiomeFilter` reads. It is not the

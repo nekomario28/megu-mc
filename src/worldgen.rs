@@ -295,6 +295,8 @@ pub struct Gen {
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pop_done: HashSet<(i32, i32)>,
+    // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
+    feat_hm: HashMap<(i32, i32), (i32, i32)>,
     world_seed: u64,
 }
 struct AQD {
@@ -424,6 +426,7 @@ impl Gen {
             pop_done: HashSet::new(),
             vein: None,
             memo: HashMap::new(),
+            feat_hm: HashMap::new(),
             world_seed: seed,
         };
         // noise settings (sea level, bounds, router names)
@@ -2101,6 +2104,34 @@ impl Gen {
         let k = ((y - self.min_y) as u32) << 8 | (((z & 15) as u32) << 4) | (x & 15) as u32;
         self.feat_c.get(&(cx, cz))?.get(&k).copied()
     }
+    /// The feature layer's heightmap: for each column, the highest non-air and the
+    /// highest solid block a *feature* has written. Vanilla keeps this per chunk and
+    /// updates it on every `setBlock`, so a tree placed for one chunk raises the
+    /// heightmap a neighbouring chunk's placements read - `heightmap(OCEAN_FLOOR)`
+    /// counts canopy leaves, and a later candidate then fails `would_survive` on the
+    /// leaf above it. Keeping the tally inside one chunk's placement pass loses that
+    /// (measured: vanilla's candidate (0,70,17) against this port's (0,64,17)).
+    pub(crate) fn note_feature_write(&mut self, x: i32, y: i32, z: i32, st: u32) {
+        let reg = crate::block_registry::breg();
+        let solid = reg.map(|r| r.is_solid(st)).unwrap_or(false);
+        let air = reg.map(|r| r.is_air(st)).unwrap_or(st == 0);
+        let e = self.feat_hm.entry((x, z)).or_insert((i32::MIN, i32::MIN));
+        if !air {
+            e.0 = e.0.max(y + 1);
+        }
+        if solid {
+            e.1 = e.1.max(y + 1);
+        }
+    }
+
+    /// Highest non-air (`0`) / solid (`1`) feature-written block + 1 in a column.
+    pub(crate) fn feature_height(&self, x: i32, z: i32, solid: usize) -> i32 {
+        match self.feat_hm.get(&(x, z)) {
+            Some(e) => if solid == 0 { e.0 } else { e.1 },
+            None => i32::MIN,
+        }
+    }
+
     pub(crate) fn feat_write(&mut self, x: i32, y: i32, z: i32, st: u32) {
         if y < self.min_y || y >= self.min_y + self.height {
             return;
@@ -3602,7 +3633,14 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // returns) instead of the chunk's quart container. BiomeFilter uses it, so
         // the container path accepted candidates vanilla rejects at a biome
         // boundary. 2x2 feature-on diff: 1035 -> 940; trees 45 -> 42 (vanilla 38).
-        assert_eq!(digest, "56bbcedc708a1eae55dd5601583a51a5",
+        // 2026-10-22: the feature-layer heightmap is now owned by `Gen` and updated
+        // on every write, so a tree placed for one chunk raises the height a
+        // neighbouring chunk's candidates read (vanilla updates the *owning* chunk's
+        // heightmap on setBlock, and OCEAN_FLOOR counts canopy leaves). Keeping the
+        // tally inside one placement pass made candidate (0,17) read y=64 instead of
+        // vanilla's 70 and grow a tree vanilla rejects on the leaf above it.
+        // 2x2 feature-on diff: 940 -> 704; trees 42 -> 39 (vanilla 38).
+        assert_eq!(digest, "514a3361fecddfdeb8aaba3cb40703ac",
             "feature population output changed from the vanilla-order capture");
     }
 
