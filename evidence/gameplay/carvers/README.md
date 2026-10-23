@@ -1792,3 +1792,43 @@ deco seed も feature 添字集合も一致しているので、違いは **feat
 2×2 の固定具（(0,0)〜(1,1)）が 704 セルで動かないのは、影響する chunk (-2,1)/(-1,1) が
 固定具の外だから。順序依存の差を消すには「隣が全部装飾済みの chunk を装飾する」順序で
 回す（＝3×3 を先に埋める）か、サーバーが装飾した順序を再現する必要がある。
+
+## 49. 残差 704 の内訳と、次の一単位（ore_dirt / ore_gravel の blob が部分集合）
+
+2×2 の残差（tick 由来の葉 419 を除いた 704）をブロック別に取ると:
+
+| 組 | セル |
+|---|---|
+| diorite / andesite != water | 142 |
+| diorite != gravel | 87 |
+| andesite != dirt | 80 |
+| oak_leaves != air / air != short_grass / seagrass 系 | ~137 |
+| deepslate != deepslate_lapis_ore | 35 |
+| deepslate != deepslate_diamond_ore | 27 |
+| その他 | ~150 |
+
+**vanilla にあってこちらに無い** ore/gravel/dirt 系のセルは 319 で、そのうち
+**air に隣接するのはわずか 2 セル** → `discard_chance_on_air_exposure` の経路ではない。
+タグの疑い（`base_stone_overworld` が gravel/dirt を含む）も
+**単体テストで否定**（`base_stone_overworld_excludes_gravel_and_dirt`、gravel/dirt/grass/
+sand/clay/slab は一致しない）。
+
+セルを見ると:
+
+```
+(15,-16,11) こちら tuff     vanilla gravel（下は deepslate）
+(24,10,12)  こちら andesite vanilla dirt
+(6,-32,12)  こちら deepslate vanilla deepslate_lapis_ore
+```
+
+つまり **先に走る `ore_dirt`(index 0) / `ore_gravel`(1) の blob がセルを落としており**、
+そのあと stone 系 ore（andesite/tuff/diorite…）がそこを埋めるので
+「石系 ore は上位集合・gravel/dirt は部分集合」という非対称が出る。
+lapis/diamond も同様に部分集合。exposure 経路と tag は否定済みなので、残る候補は
+**blob のセル走査そのもの**（origin は一致している）。
+
+次の一単位（隔離実験）: `placed_feature/ore_*.json` の `count` を 0 にして
+**1 つの ore だけ動かした vanilla world** を作り、こちらの同じ構成の dump と
+セル単位で比べる（skill の「count: 0 で 1 feature を隔離する」パターン）。
+`tools/carver_fixture.sh` の `CARVER_FIXTURE_EXTRA` が ctl datapack を差し込めるので、
+その仕組みを feature 用に流用する。

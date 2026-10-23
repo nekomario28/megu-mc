@@ -622,3 +622,26 @@ pub(crate) fn breg() -> Option<&'static BReg> {
 pub(crate) fn mkprops(pairs: &[(&str, &str)]) -> J {
     J::Obj(pairs.iter().map(|(k, v)| (k.to_string(), J::Str(v.to_string()))).collect())
 }
+
+#[cfg(test)]
+mod tag_tests {
+    /// `ore_*` features target `#minecraft:base_stone_overworld`; if the tag lookup
+    /// also matched `gravel`/`dirt`, a later ore would overwrite the gravel and dirt
+    /// an earlier one placed (measured: this port's gravel set was a strict subset of
+    /// vanilla's, 121 cells missing, while its stone-variant sets were supersets).
+    #[test]
+    fn base_stone_overworld_excludes_gravel_and_dirt() {
+        let reg = super::breg().expect("registry");
+        for name in ["stone", "granite", "diorite", "andesite", "tuff", "deepslate"] {
+            let st = reg.state_of(name, None);
+            assert!(reg.in_tag(st, "minecraft:base_stone_overworld"), "{name} should match");
+        }
+        for name in ["gravel", "dirt", "grass_block", "sand", "clay", "andesite_slab"] {
+            let st = reg.state_of(name, None);
+            assert!(
+                !reg.in_tag(st, "minecraft:base_stone_overworld"),
+                "{name} must not match base_stone_overworld"
+            );
+        }
+    }
+}
