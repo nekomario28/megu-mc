@@ -83,12 +83,13 @@ feature 層の残差（chunk (0,0) で 10939 セル）は同梱 worldgen デー�
   `CARVE_RAW` を先頭から突き合わせて特定（証拠は §25）。
 - ore vein（地形段階）: **0 セル**。1.21.1 は router の vein 3 関数 + `ore_veins_enabled`
   で地形段階に生成し、乱数は `fromHashOf("minecraft:ore")` の派生 positional factory。
-- feature 層: 2×2 で **1035 / 393216（0.26%）**。葉の `distance` 380 は tick 由来で、
-  除外すると **655**。原因 12 件（いずれも「宣言的なものが黙って落ちる」型）は
+- feature 層: 2×2 で **940 / 393216（0.24%）**。葉の `distance` 394 は tick 由来で、
+  除外すると **546**。原因 13 件（「宣言的なものが黙って落ちる」型 12 件と、
+  biome の 2 定義を取り違えていた 1 件）は
   [feature パリティ](../../evidence/gameplay/feature-parity/README.md) と
   [carvers §25〜§42](../../evidence/gameplay/carvers/README.md) に記録。
 
-未解決は 2 件: (1) chunk (1,0) の候補 (20,66,3) で vanilla の `BiomeFilter` が false を
-返す（保存済み biome は forest）— 木 45 vs 38 の主因、(2) `ore_dirt`/`ore_gravel` の
-blob が vanilla の部分集合（121 + 96 セル）。構造物（jigsaw / template pool / NBT）は
-未実装のまま。
+未解決は 2 件: (1) chunk (0,1) などで木が 42 vs 38。deco seed も候補列の先頭 2 つも
+一致するのに 3 つ目でずれる（＝候補間の消費ドロー数の差）ので、生ドロー列の diff が次の計測、
+(2) `ore_dirt`/`ore_gravel` の blob が vanilla の部分集合（121 + 96 セル）。
+構造物（jigsaw / template pool / NBT）は未実装のまま。

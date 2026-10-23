@@ -14,7 +14,7 @@ Cargoのpackage version `0.0.0` は保存時の値を維持している。`AUDIT
 |---|---|
 | 地形（feature/carver なし） | vanilla と **0 セル差**（seed 0、(0,0) の 2×2）。density・surface rule・bedrock・鉱脈（ore vein）が一致。地形だけの高さマップは 256/256 列一致 |
 | 洞窟・峡谷（carver） | **0 セル差**（(0,0) の 2×2、cave / cave_extra / canyon、y=−64..319）。vanilla の生ドローと1 draw 単位で一致。証拠は [carvers](evidence/gameplay/carvers/README.md) |
-| feature 層 | **1035 / 393216 セル差（0.26%、(0,0) の 2×2）**。うち葉の `distance` 380 は tick 由来で、除外すると **655**。起点は 40975（10.4%/chunk） |
+| feature 層 | **940 / 393216 セル差（0.24%、(0,0) の 2×2）**。うち葉の `distance` 394 は tick 由来で、除外すると **546**。起点は 40975（10.4%/chunk）。木は 42 本（vanilla 38） |
 | 構造物 | **未実装**（jigsaw / template pool / NBT とも無し） |
 | 軽量性（M3） | **未達**。代表負荷で CPU x1.10（8 回中央値、RSS は約 1/8）、spawn burst を除くと x1.79 |
 | 必須ゲート | `tests/verify.sh` がローカルで PASS（152 passed / 1 ignored） |
