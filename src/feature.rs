@@ -600,7 +600,18 @@ fn mod_positions(
             }
         }
         PM::InSquare => {
-            out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + rng.next_bound(16)));
+            let (x, z) = (pos.0 + rng.next_bound(16), pos.2 + rng.next_bound(16));
+            if let Ok(spec) = std::env::var("INSQ_TRACE") {
+                if let Some((a, c)) = spec.split_once(',') {
+                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
+                        if (x >> 4) == cx && (z >> 4) == cz {
+                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("INSQ {x} {z} feature={},{}", cf >> 32, cf & 0xFFFF);
+                        }
+                    }
+                }
+            }
+            out.push((x, pos.1, z));
         }
         PM::Offset(xz, ysp) => {
             out.push((pos.0 + xz.get(rng), pos.1 + ysp.get(rng), pos.2 + xz.get(rng)));
