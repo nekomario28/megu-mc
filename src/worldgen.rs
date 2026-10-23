@@ -337,12 +337,30 @@ impl Gen {
         Self::dp_files("density_function")
     }
     // datapacks/*/data/<ns>/worldgen/<subdir>/**.json -> "ns:relpath" (no .json)
+    /// The packs under `datapacks/` in *precedence* order: `vanilla` first (the
+    /// lowest priority, like the built-in data a datapack overrides), then the rest by
+    /// name so the order is deterministic. Iterating `read_dir` instead made
+    /// precedence arbitrary - a control pack meant to isolate one feature could be
+    /// silently ignored (measured: a ctl pack that zeroed every ore except
+    /// `ore_gravel` was ignored, and the port still ran 241 ore placements where the
+    /// server ran 126).
+    pub(crate) fn packs() -> Vec<std::path::PathBuf> {
+        let base = std::path::Path::new("datapacks");
+        let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(base)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        dirs.sort_by_key(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            (name != "vanilla", name)
+        });
+        dirs
+    }
+
     pub(crate) fn dp_files(subdir: &str) -> HashMap<String, Vec<u8>> {
         let mut m = HashMap::new();
-        let base = std::path::Path::new("datapacks");
-        if let Ok(packs) = std::fs::read_dir(base) {
-            for p in packs.flatten() {
-                let root = p.path().join("data");
+        {
+            for p in Gen::packs() {
+                let root = p.join("data");
                 if let Ok(nss) = std::fs::read_dir(&root) {
                     for ns in nss.flatten() {
                         let dfr = ns.path().join(format!("worldgen/{}", subdir));
@@ -361,7 +379,12 @@ impl Gen {
                                                 rel.with_extension("").to_string_lossy()
                                             );
                                             if let Ok(b) = std::fs::read(&p) {
-                                                m.entry(key).or_insert(b);
+                                                // later packs override earlier ones, and
+                                                // `packs()` puts `vanilla` first (lowest
+                                                // priority). `or_insert` made the first
+                                                // pack win, so a control pack could never
+                                                // override the bundled data.
+                                                m.insert(key, b);
                                             }
                                         }
                                     }
@@ -437,14 +460,11 @@ impl Gen {
         };
         // noise settings (sea level, bounds, router names)
         let mut ns_json: Option<J> = None;
-        let packs = std::fs::read_dir("datapacks").ok()?;
-        'outer: for p in packs.flatten() {
-            let f = p
-                .path()
-                .join("data/minecraft/worldgen/noise_settings/overworld.json");
+        'outer: for p in Gen::packs() {
+            let f = p.join("data/minecraft/worldgen/noise_settings/overworld.json");
             if let Ok(b) = std::fs::read(&f) {
                 ns_json = jparse(&b);
-                g.base = p.path().to_string_lossy().to_string();
+                g.base = p.to_string_lossy().to_string();
                 break 'outer;
             }
         }

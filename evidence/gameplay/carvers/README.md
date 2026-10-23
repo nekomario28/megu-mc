@@ -1832,3 +1832,33 @@ lapis/diamond も同様に部分集合。exposure 経路と tag は否定済み�
 セル単位で比べる（skill の「count: 0 で 1 feature を隔離する」パターン）。
 `tools/carver_fixture.sh` の `CARVER_FIXTURE_EXTRA` が ctl datapack を差し込めるので、
 その仕組みを feature 用に流用する。
+
+## 50. 隔離実験の道具・pack 優先順位の欠陥・blob の形
+
+`ore_gravel` だけを動かす隔離固定具（`tools/ore_fixture.sh` + `tools/ore_diff.py`）を
+足した。他の `ore_*`/`disk_*` の placement を `count: 0` にした ctl pack を
+**vanilla world と repo の両方**に置き、その 1 feature のセルだけを比べる。
+
+その過程で 2 つの**道具側の欠陥**が出た:
+
+1. **pack の優先順位が未定義だった**。`dp_files` は `read_dir` の順に
+   `entry().or_insert()` していたので「先に見つけた pack が勝つ」= 上書きが効かない
+   ことがあった（ctl pack を無視して全 ore が走り、241 起源 vs server 126 起源）。
+   `Gen::packs()`（`vanilla` を最下位に固定し、残りは名前順）＋ `insert`（後勝ち）に
+   修正。**datapack の上書きはこれで決定的**になった。
+2. **agent の `ore` フックが chunk ゲートを失っていた**（以前の編集で
+   `-Dorechunk` の判定を dimension 判定に置き換えてしまっていた）。そのためログが
+   3×3 の 9 chunk 全部を拾い、「126 vs 14」という**存在しない配置差**に見えていた。
+   両方のゲートを戻した。
+
+修正後の隔離比較（chunk (0,0)、`ore_gravel` のみ）:
+
+| | |
+|---|---|
+| 起源（origin） | **こちら 14 / vanilla 14 で完全一致**（こちら 14 は vanilla の部分集合で同数） |
+| セル | ours 1361 / vanilla 1334、共通 **1173**、ours-only **188**、vanilla-only **161** |
+
+**起源が一致してセルが 8% 違う** = blob の**形**（半径・丸め・セル走査）の差。
+次は 1 起源を選び、両側でその blob のセルを flood fill して並べる
+（`ORE_CELL_TRACE` はこちらの書き込み数を出す。vanilla 側は world から起源周辺を
+取り出せばよい）。

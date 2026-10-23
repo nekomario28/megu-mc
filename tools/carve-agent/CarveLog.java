@@ -38,6 +38,10 @@ public class CarveLog {
         if (p == null) return;
         String[] a = p.split(",");
         if (a.length != 2) return;
+        // BOTH gates: the chunk named by -Dorechunk *and* the overworld. An earlier
+        // edit replaced the chunk check with the dimension check, so the log quietly
+        // covered all nine chunks of the 3x3 (126 origins where the chunk had 14) and
+        // looked like a placement difference.
         if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
         if (!overworld()) return;
         int[] f = FEAT.get();
@@ -176,6 +180,10 @@ public class CarveLog {
         if (p == null) return;
         String[] a = p.split(",");
         if (a.length != 2) return;
+        // BOTH gates: the chunk named by -Dorechunk *and* the overworld. An earlier
+        // edit replaced the chunk check with the dimension check, so the log quietly
+        // covered all nine chunks of the 3x3 (126 origins where the chunk had 14) and
+        // looked like a placement difference.
         if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
         if (!overworld()) return;
         int[] f = FEAT.get();
