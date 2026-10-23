@@ -1,6 +1,6 @@
 # ロードマップ
 
-Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main` より 259 コミット先、
+Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main` より 259 コミット先、
 `main` 側の clippy 3 コミットだけ未取り込み）。直近の実測値と却下した仮説は
 [evidence/gameplay/terrain-parity](../evidence/gameplay/terrain-parity/README.md)、
 目的と合格条件は [PLAN](PLAN.md)、欠陥の状態の正本は
@@ -11,13 +11,15 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 
 | 項目 | 実測・状態 |
 |---|---|
-| ビルド・テスト | `cargo build --locked` 成功。`cargo test` 147 passed / 1 ignored（2026-10-20） |
-| 必須ゲート | `tests/verify.sh` PASS（147 passed / 1 ignored、mutation 51 proved、local、2026-10-20） |
+| ビルド・テスト | `cargo build --locked` 成功。`cargo test` 152 passed / 1 ignored（2026-10-22） |
+| 必須ゲート | `tests/verify.sh` PASS（152 passed / 1 ignored、local、2026-10-22） |
 | hosted CI | GitHub の支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替し、復旧後に同一 SHA で再取得する |
 | M3（軽量） | **未達**: 地形一致後の代表負荷で CPU x1.13（mc-spine 19.87s / 144.7MiB 対 vanilla 17.53s / 1159.7MiB）。以前の x0.63 は地形不一致時の値で、現在の代表値にしない |
-| 地形（feature/carver なし） | vanilla と **0 セル**（chunk (0,0)、(0,1)、(-1,-1)、(-2,0)）。density・surface rule・bedrock が一致 |
+| 地形（feature/carver なし） | vanilla と **0 セル**（(0,0) の 2×2）。density・surface rule・bedrock・**ore vein** が一致。高さマップも 256/256 列一致 |
+| 洞窟・峡谷（carver） | vanilla と **0 セル**（(0,0) の 2×2、cave / cave_extra / canyon）。生ドローの一致まで確認（[carvers](../evidence/gameplay/carvers/README.md)） |
 | 落下と並行操作 | 性質テスト 5 件・変異 5 件を追加（2026-10-20）。保存・破壊・設置・ホットセット変更が同じティック列で交差してもブロックを落とさない（[falling-concurrency](falling-concurrency/README.md)） |
-| feature 層 | feature ありの比較は chunk (0,0) で 10302 / 98304（10.48%、offline 比較）。placement modifier を vanilla の stream 順に直して 11017 → 10302。block tag も 1.21.1 の jar へ同期。残りは石系 ore の配置実行 |
+| feature 層 | 2×2 で **1035 / 393216（0.26%）**。葉の `distance` 380 は tick 由来で、除外すると **655**。起点は 40975（10.4%/chunk、2026-10-22 朝） |
+| 構造物 | **未実装**（jigsaw / template pool / structure_set / NBT のいずれも無い） |
 
 ## 順序
 
@@ -56,9 +58,20 @@ Status: 2026-10-20 再開。作業ブランチは `fix/20tps-integrated`（`main
 - **R1b2 density の補間順序（完了 2026-10-20）**: `interpolated` の入力をセル隅で
   補間し、外側をブロック毎に評価。feature/carver なしの block diff は 4 chunk で 0。
   `chunk_cols` は 48.8 → 70.8 ms/chunk なので、R3 で代表負荷を測り直す。
-- **R1c feature 層の切り分け**: 1.21.1 データで feature ありの diff を step 単位に
-  分解し、どの step（ore / vegetal / tree / top_layer …）がずれるかを数で示す。
-  出口: step 別の差分表と、最初に直す 1 step の特定。
+- **R1c feature 層の切り分け（大枠は完了 2026-10-22）**: feature あり 2×2 の diff は
+  40975 → **1035**（除外規則込みで 655）。step 別の寄与と原因は
+  [carvers §25〜§42](../evidence/gameplay/carvers/README.md) に記録した。判明した原因は
+  いずれも「宣言的なものが黙って落ちる」型:
+  `minecraft:uniform` の draw 数（1 vs 2）、`WorldgenRandom` の legacy draw、
+  height provider 4 種と `below_top`、`setDecorationSeed` の合成（Xoroshiro + 加算）、
+  feature 順序の入力 biome 集合（**53 件**であって 64 件ではない）、
+  placement modifier の落下（`fixed_placement`）、
+  rule-based state provider の `type` 欠落と `"fluids"` の単一値、
+  入れ子 placed feature 参照の modifier 落ち。
+  残りの出口: **B 分類**（vanilla にあってこちらに無い gravel/dirt/water ~379 =
+  `ore_dirt`/`ore_gravel` の欠け + spring の水）、**樹冠の幾何** ~470（木 45 vs 38）。
+  未解決: chunk (1,0) の候補 (20,66,3) で vanilla の `BiomeFilter` が false を返す
+  （保存済み biome は forest）— `ctx.d().t(pos)` の戻り値と `ctx.e()` を実測する。
 - **R1d 光（完了 2026-10-20）**: 地形一致後に `light_parity_probe.py` を 3 chunk で
   実行。heightmap と非一様区間の sky digest が vanilla と一致した。差は区間マスクの
   送り方（全 26 区間 vs 一様区間の省略）だけで、値ではない。

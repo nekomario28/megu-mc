@@ -340,3 +340,49 @@ vanilla 世界にはその vein が無い（in-box 497 セルのうち 1 セル�
 したがって「位置1の vein の後、位置2の in_square までに draw が入る」以外に
 説明がなく、次はプローブで `ejb`（CountPlacement）と `eis`（InSquarePlacement）の
 `getPositions` を直接呼び、draw 数と位置を vanilla から取る。
+
+## 2026-10-22: 残差 40975 → 1035（この節が現在地、詳細は carvers）
+
+この日、feature 層を 40975 セル（2×2、10.4%/chunk）から **1035 セル**まで減らした。
+step 単位の分解・生ドローの突き合わせ・bytecode の読みは
+[carvers §25〜§42](../../gameplay/carvers/README.md) が持つ（同じ fixture と agent を使うため）。
+ここには**原因の一覧**と**次にどこを見るか**だけ置く。
+
+### 原因（すべて「宣言的なものが黙って落ちる」型）
+
+| # | 原因 | 見つけ方 | 効果 |
+|---|---|---|---|
+| 1 | `minecraft:uniform` の height provider は 1 draw（`eia`）。trapezoid `ehv` と取り違えて 2 draw 引いていた | サーバーの生ドロー（`dzx.c(JII)` + `dyz.c(I)`）と port の `CARVE_RAW` を先頭から比較 | cave 617 → 0 |
+| 2 | 地形段階の ore vein（`ore_veins_enabled` + router の vein 3 関数）を 1.21.2 の material rule で実装していた | 公式 mappings + Vineflower で `OreVeinifier` | 48 → 0 |
+| 3 | vein の乱数が `factory` ではなく `fromHashOf("minecraft:ore")` の派生 | サーバー内で toggle/ridged/gap を実測 | 10 → 0 |
+| 4 | `WorldgenRandom` は `dyn` の legacy draw（modern 形では ore origin が 242/242 ずれ） | 生ドロー列 | 40975 → 34679 |
+| 5 | height provider 4 種と `below_top` の −1、`next_inbetween` の draw 抜け | 公式 mappings + 逆コンパイル | 34679 → 33853 |
+| 6 | `setDecorationSeed` は Xoroshiro + **加算**（`(x*l + z*m) ^ seed`）。chunk (0,0) だけは 0 なので露見しない | サーバーの `setFeatureSeed` ログと port の index 集合を step ごとに比較 | 33853 → 3472 |
+| 7 | feature の並び順が依存する biome 集合は biome source の **53 件**（64 件の registry 順ではない） | `deg.a` の第 1 引数を文字列で出力 | 3472 → 2510 |
+| 8 | `underwater_magma` は origin が水であること + 包囲判定 | 逆コンパイル | 1236 → 0 |
+| 9 | `placed_feature/` の版ずれ（`trees_birch_and_oak` が無く木が全部スキップ） | 1.21.1 jar と名前を突き合わせ | — |
+| 10 | rule-based state provider の `type` 欠落、`"fluids"` の単一値（disk 系が 0 書き込み） | `CF_MISSING=1` / `PF_UNKNOWN=1` | 2510 → 1856 |
+| 11 | 入れ子の **placed feature 参照**が modifier を落としていた（`would_survive` が走らず全候補で木が生える） | 木の本数 53 vs 38 → 生ドローの形 | 1856 → 1035 |
+| 12 | spring の上下が逆（below を見るべきところ above、走査は down でなく up） | 逆コンパイル | 木の位置の理解（水は tick で広がる） |
+
+### 残差 1035 の読み方
+
+ブロックごとの集合比較（`vanilla-only` / `ours-only`）が次の一単位を決める:
+
+| ブロック | ours-only | vanilla-only | 読み |
+|---|---|---|---|
+| diorite / andesite / granite / tuff | 419 | **0** | ore は vanilla を包含（上位集合）。差は後続の置換 |
+| gravel / dirt / water | ~0 | **379** | `ore_dirt` / `ore_gravel` のセル欠け + spring の水 |
+
+- 葉の `distance` 380 は **tick 由来**（`LeavesBlock.updateShape` は tick を予約するだけ）。
+  `tools/carver_diff.py` は既定で除外する。
+- 樹冠の幾何 ~470 は木の本数差（45 vs 38）。未解決の `BiomeFilter` の false を先に割る。
+
+### 次の一単位
+
+1. chunk (1,0) の候補 (20,66,3) で vanilla の `BiomeFilter` が false（保存済み biome は
+   forest）。`eii.a` の中で `ctx.d().t(pos)`（`dcz.t(Ljd;)Ljm;`）と `ctx.e()`（topFeature）を
+   文字列で出す。→ 木 45 → 38 の見込み。
+2. `ore_dirt` / `ore_gravel` の blob が vanilla の**部分集合**（121 + 96 セル）。同じ
+   ore 機構で他の 4 種は一致しているので、この 2 つ固有の条件（run 順が先頭、
+   `size:33`）を突き合わせる。
