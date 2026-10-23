@@ -1490,3 +1490,49 @@ step 8 の `spring_water` が diorite を水に置き換え、こちらは置き
 
 （なお `juxtapose` の注意: この比較は feature ありの world なので、carver/aquifer 層は
 別途 0 セルであることを確認済み — `tools/carver_fixture.sh tcur - - - 2` が 0。）
+
+## 42. 残差の内訳（最終）と spring の向き
+
+ブロック別の集合比較（2×2、feature あり）:
+
+| ブロック | ours | vanilla | ours-only | vanilla-only |
+|---|---|---|---|---|
+| diorite | 4251 | 4032 | 219 | **0** |
+| andesite | 5232 | 5112 | 120 | **0** |
+| granite | 4007 | 3960 | 47 | **0** |
+| tuff | 5568 | 5535 | 33 | **0** |
+| gravel | 1341 | 1462 | **0** | 121 |
+| dirt | 3547 | 3642 | 1 | 96 |
+| water | 1867 | 1971 | 58 | 162 |
+| sand | 439 | 433 | 6 | 0 |
+
+つまり「vanilla にあってこちらに無い gravel/dirt/water」のセルが、こちらでは
+**後続の ore が stone-family で埋めている**（ore 側が上位集合なのはそのため）。
+石系 ore の位置・形そのものは一致していて、欠けているのは step 6 の先頭 2 つ
+（`ore_dirt` / `ore_gravel`）と step 8 の spring が置くセル。
+
+**spring の向きのバグを修正**（`SpringFeature` = `edp`）:
+
+```java
+if (!level.getBlockState(pos.below()).is(cfg.validBlocks)) return false;   // below を見る
+if (cfg.requiresBlockBelow && !level.getBlockState(pos.below(2)).is(...)) return false;
+// 走査は west, east, north, south, **above**
+```
+こちらは *above* を見て、走査に *down* を使っていた（＝天井から生える spring）。
+さらに流体は `createLegacyBlock()` で置くので falling な水は **level 8**。
+
+修正後も 2×2 の diff は 1035 のまま（spring が置く水は tick で広がるため、
+稼働後の world と比べると別物）。`SPRING_TRACE=1` で候補 229 件中 4 件が
+rock 4 / hole 1 の条件を満たすことを確認。
+
+### 1035 セルの分解（現時点の理解）
+
+| 種類 | セル | 性質 |
+|---|---|---|
+| 葉の `distance`（`oak_leaves != oak_leaves`） | 380 | **tick 由来**（`LeavesBlock.updateShape` は tick を予約するだけ）。既定で除外 |
+| vanilla の gravel/dirt/water vs こちらの ore | ~379 | 欠けている ore_dirt/ore_gravel と spring（水は tick で広がる） |
+| 樹冠の幾何（葉 vs 空気） | ~470 | 木の位置/形（45 vs 38 本） |
+| その他 | 残り | — |
+
+carver / aquifer 層は現行コードでも 2×2 で **0 セル**
+（`tools/carver_fixture.sh tcur - - - 2`）。

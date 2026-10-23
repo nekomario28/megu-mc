@@ -317,3 +317,11 @@ forest に `trees_birch_and_oak` がある以上 false は説明できない。
 石系 ore のセル集合を vanilla と比較すると **vanilla-only 0 / ours-only 419** の
 「上位集合」。差は step 8 の `spring_water`（等）が後から diorite を水に置き換える
 分だけ。次の単位は spring 系（`SpringFeature` の rock_count/hole_count/valid_blocks）。
+
+## 最終残差の分解（2026-10-22）
+
+2×2 で 1035（既定の除外を入れると 655）。内訳:
+- 葉の distance 380（tick 由来、既定で除外）
+- vanilla の gravel/dirt/water vs こちらの ore ~379（ore_dirt/ore_gravel の欠け + spring）
+- 樹冠の幾何 ~470（木 45 vs 38）
+- carver/aquifer は現行コードで 0 セル（`carver_fixture.sh tcur - - - 2`）
