@@ -848,14 +848,12 @@ fn hanging_square(
             if is_leaf_set(ctx, above) {
                 let dist =
                     (p.0 - log_pos.0).abs() + (p.1 - log_pos.1).abs() + (p.2 - log_pos.2).abs();
-                if dist < 7 && rng.next_f32() <= hang {
-                    if set_if_can_replace(ctx, p, fst) {
-                        out.push(p);
-                        let dn = (p.0, p.1 - 1, p.2);
-                        let dist2 = dist + 1;
-                        if dist2 < 7 && rng.next_f32() <= ext && set_if_can_replace(ctx, dn, fst) {
-                            out.push(dn);
-                        }
+                if dist < 7 && rng.next_f32() <= hang && set_if_can_replace(ctx, p, fst) {
+                    out.push(p);
+                    let dn = (p.0, p.1 - 1, p.2);
+                    let dist2 = dist + 1;
+                    if dist2 < 7 && rng.next_f32() <= ext && set_if_can_replace(ctx, dn, fst) {
+                        out.push(dn);
                     }
                 }
             }

@@ -473,7 +473,7 @@ fn dfs_step(
     in_progress.insert(v);
     if let Some(neigh) = edges.get(&v) {
         let mut sorted = neigh.clone();
-        sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        sorted.sort_by_key(|a| (a.0, a.1));
         for m in sorted {
             dfs_step(m, edges, visited, in_progress, order);
         }
@@ -578,7 +578,7 @@ fn load_freg() -> FReg {
     let mut visited: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
     let mut in_progress: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
     let mut keys: Vec<(usize, u32)> = edges.keys().copied().collect();
-    keys.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    keys.sort_by_key(|a| (a.0, a.1));
     for k in keys {
         dfs_step(k, &edges, &mut visited, &mut in_progress, &mut order);
     }
@@ -1537,9 +1537,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     gen_pf(vfeat, fr, ctx, rng, pp);
                     if *waterlog {
                         let placed = ctx.get(pp.0, pp.1, pp.2);
-                        if !reg.is_air(placed)
-                            && is_water_st(reg, ctx.get(pp.0, pp.1, pp.2)) == false
-                        {
+                        if !reg.is_air(placed) && !is_water_st(reg, ctx.get(pp.0, pp.1, pp.2)) {
                             // waterlog the placed vegetation
                             let wst = reg.with_prop(placed, "waterlogged", "true");
                             if wst != placed {

@@ -29,7 +29,7 @@ pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
     msg.extend_from_slice(&bitlen.to_le_bytes());
     let (mut a0, mut b0, mut c0, mut d0) =
         (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for i in 0..16 {
             m[i] = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
@@ -1187,7 +1187,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -1319,7 +1319,6 @@ mod deco_seed_tests {
             (bx as i64)
                 .wrapping_mul(l)
                 .wrapping_add((bz as i64).wrapping_mul(m))
-                ^ 0
         };
         assert_eq!(f(-16, 0), 6716476193438028432);
         assert_eq!(f(-32, 16), -4660739044861673552);

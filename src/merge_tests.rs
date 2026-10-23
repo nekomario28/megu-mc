@@ -149,7 +149,7 @@ fn scenario(index: usize) -> Vec<Drop> {
                     (h % 17) as f64 + (h >> 8) as f64 / 256.0,
                     70.0 + (h >> 16) as f64 % 3.0,
                     900.0 + (h >> 24) as f64 % 40.0,
-                    if h % 3 == 0 { 811 } else { 812 },
+                    if h.is_multiple_of(3) { 811 } else { 812 },
                     (h % 5) as u8 + 1,
                     (h % 11) as i32,
                 )

@@ -73,14 +73,14 @@ fn light_sections_start_one_below_the_world() {
         MIN_Y - 16,
         "the first light section is minSection - 1"
     );
-    let mut floors = [MIN_Y + 5; 256];
+    let floors = [MIN_Y + 5; 256];
     let secs = sky_light_sections_from(0, 0, &floors);
     assert_eq!(secs.len(), 26);
     let nib = |y: i32, lx: usize, lz: usize| -> u8 {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -108,7 +108,7 @@ fn block_light_uses_generated_sources() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -130,7 +130,7 @@ fn block_light_sees_a_neighbours_generated_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -223,7 +223,7 @@ fn a_removed_generated_emitter_stops_lighting() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - sec as i32 * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4

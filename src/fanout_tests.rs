@@ -33,7 +33,7 @@ fn drained(r: &mut TcpStream) -> usize {
 #[test]
 fn the_broadcast_helpers_still_select_the_same_clients() {
     let _world_guard = world_guard();
-    let saved = std::mem::replace(&mut *clients().lock().unwrap(), Vec::new());
+    let saved = std::mem::take(&mut *clients().lock().unwrap());
     let (me, mut r_me) = client_with(1);
     let (peer, mut r_peer) = client_with(2);
     let (far, mut r_far) = client_with(3);

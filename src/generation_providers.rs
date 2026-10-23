@@ -174,7 +174,7 @@ impl HP {
                 // ehv: k = nextInt(hi - lo - inner + 1); return nextInt(k + inner) + lo
                 let lo = a.get(min_y, height);
                 let hi = b.get(min_y, height);
-                if hi - lo - inner + 1 <= 0 {
+                if hi - lo - inner < 0 {
                     return lo;
                 }
                 let k = r.next_bound(hi - lo - inner + 1);
@@ -200,7 +200,7 @@ impl HP {
                 //      return rbi(lo, m - 1 + inner)
                 let lo = a.get(min_y, height);
                 let hi = b.get(min_y, height);
-                if hi - lo - inner + 1 <= 0 {
+                if hi - lo - inner < 0 {
                     return lo;
                 }
                 let k = r.next_inbetween(lo + inner, hi);
@@ -345,10 +345,8 @@ impl BSP {
                     }
                     return low[r.next_bound(low.len() as i32) as usize];
                 }
-                if r.next_f32() < *hchance {
-                    if !high.is_empty() {
-                        return high[r.next_bound(high.len() as i32) as usize];
-                    }
+                if r.next_f32() < *hchance && !high.is_empty() {
+                    return high[r.next_bound(high.len() as i32) as usize];
                 }
                 *def
             }

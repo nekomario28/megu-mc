@@ -69,8 +69,7 @@ pub fn eligible(
     height: f32,
 ) -> bool {
     distance.is_finite()
-        && random >= 0.0
-        && random < 1.0
+        && (0.0..1.0).contains(&random)
         && random < distance - 0.5
         && living
         && (player || mob_griefing)
@@ -203,9 +202,9 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
         }
         let current = *hp;
         drop(hp);
-        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x24, hurt_anim(me.eid));
+        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x24, hurt_anim(me.eid));
         let _ = send_packet(
-            &mut *me.sock.lock().unwrap(),
+            &mut me.sock.lock().unwrap(),
             0x5d,
             health_pkt_c(current, me),
         );

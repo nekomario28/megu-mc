@@ -817,7 +817,7 @@ fn profile_game_tick() {
                     item: 811,
                     cnt: 1,
                     comps: Vec::new(),
-                    age: i as i32,
+                    age: i,
                 });
             }
             for i in 0..600 {
@@ -834,7 +834,7 @@ fn profile_game_tick() {
                     item: 812,
                     cnt: 1,
                     comps: Vec::new(),
-                    age: i as i32,
+                    age: i,
                 });
             }
         }
@@ -849,7 +849,7 @@ fn profile_game_tick() {
                     item: 811,
                     cnt: 1,
                     comps: Vec::new(),
-                    age: (i % 400) as i32,
+                    age: (i % 400),
                 });
                 xps().lock().unwrap().push(Xp {
                     eid: 21_000 + i,
@@ -857,7 +857,7 @@ fn profile_game_tick() {
                     y,
                     z,
                     val: 1,
-                    age: (i % 400) as i32,
+                    age: (i % 400),
                 });
                 crops()
                     .lock()
@@ -1184,7 +1184,7 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
     // One item per tick for three ticks, then nothing left to move.
     let expected: Vec<(u8, u8)> = vec![(2, 1), (1, 2), (0, 3)]
         .into_iter()
-        .chain(std::iter::repeat((0, 3)).take(21))
+        .chain(std::iter::repeat_n((0, 3), 21))
         .collect();
     assert_eq!(
         trace, expected,
@@ -1259,7 +1259,7 @@ fn a_neighbour_change_promotes_a_waiting_fluid_cell() {
         .unwrap()
         .schedule(pos, tick_queue::MAX_DELAY);
     assert!(
-        water_queue().lock().unwrap().len() > 0,
+        !water_queue().lock().unwrap().is_empty(),
         "the cell must be waiting"
     );
     // A block change next to it must pull it forward.
@@ -2077,7 +2077,6 @@ fn a_saved_below_world_drop_is_not_duplicated() {
                 crate::block_registry::breg()
                     .unwrap()
                     .name_of(block_at(1, y, 1))
-                    .to_string()
                     == "minecraft:sand"
             })
             .count() as u32

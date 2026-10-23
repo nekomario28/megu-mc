@@ -49,7 +49,7 @@ fn reference_tick() {
             // game ticks, which is 40 server ticks only at 4TPS.
             if f.progress >= server_ticks(200) as i32 {
                 f.progress = 0;
-                let r = out.clone().unwrap();
+                let r = out.unwrap();
                 f.xp += smelt_xp(f.input.0);
                 f.output = (r.0, f.output.1 + r.1, f.output.2.clone());
                 f.input.1 -= 1;
@@ -77,7 +77,7 @@ fn reference_tick() {
             if dirty_pos.contains(&fp) {
                 let inv = c.inv.lock().unwrap().clone();
                 if let Ok(mut w) = c.sock.lock() {
-                    furnace_push_items(&mut *w, fp, &inv);
+                    furnace_push_items(&mut w, fp, &inv);
                 }
             }
         }

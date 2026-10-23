@@ -783,7 +783,7 @@ fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -804,7 +804,7 @@ fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -829,7 +829,7 @@ fn sky_light_reads_lit_at_the_surface_and_dark_under_it() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -860,7 +860,7 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -878,7 +878,7 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = cs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -894,7 +894,7 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4
@@ -916,7 +916,7 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = blocked[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 {
+        if lx.is_multiple_of(2) {
             b & 0x0f
         } else {
             b >> 4

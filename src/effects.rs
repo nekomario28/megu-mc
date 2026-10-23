@@ -43,7 +43,7 @@ pub(super) fn tick_effects(c: &Client) {
                 if *h <= 0.0 {
                     // The effect guard is held here; do not re-lock it through totem_check.
                     let mut inv2 = c.inv.lock().unwrap();
-                    let hk = 36i16 + (*c.held.lock().unwrap()) as i16;
+                    let hk = 36i16 + (*c.held.lock().unwrap());
                     let mut saved = false;
                     let mut saved_k = -1i16;
                     let mut saved_now = (0i64, 0u8, Vec::new());
@@ -69,7 +69,7 @@ pub(super) fn tick_effects(c: &Client) {
                         let mut st_pkt = Vec::new();
                         st_pkt.extend_from_slice(&c.eid.to_be_bytes());
                         st_pkt.push(35);
-                        let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
+                        let _ = send_packet(&mut c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
                         broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
                         let (px, py, pz, ..) = {
                             let p = c.pos.lock().unwrap();
@@ -102,7 +102,7 @@ pub(super) fn tick_effects(c: &Client) {
     }
     if dirty2 {
         if let Ok(mut w) = c.sock.lock() {
-            let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c));
+            let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c));
         }
     }
     for id in &expired {
@@ -112,7 +112,7 @@ pub(super) fn tick_effects(c: &Client) {
         }
         let pk = remove_effect_pkt(c.eid, *id);
         if let Ok(mut w) = c.sock.lock() {
-            let _ = send_packet(&mut *w, 0x43, pk.clone());
+            let _ = send_packet(&mut w, 0x43, pk.clone());
         }
         broadcast_seen(c.eid, |_c| (0x43, pk.clone()));
     }

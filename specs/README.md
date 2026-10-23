@@ -24,7 +24,12 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。
 - **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
 - **コード検証:** `tests/verify.sh` が**通りました**（159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit）。`main` はこの統合ブランチと同じツリーを指しています（以前の main は tag `checkpoint/pre-consolidation-main`）。
-- **clippyの残件:** 457 warnings（`never_loop` 4件は修正済み。これは主張ではなく消化待ちの一覧です）。
+- **clippyの残件:** 457 → **83**。機械的に等価な変換（`&*`/`&mut *` の冗長、`x % n == 0` → `is_multiple_of`、
+  不要な `as`、`sort_by` → `sort_by_key`、`chunks_exact` → `as_chunks` など）を当て、171テスト・
+  mutation 53/53・wire smoke で確認しました。残る83件は判断が要るクラスです:
+  `type_complexity` 30（型エイリアスの設計を伴う）、`unnecessary_unwrap` 12、`blocks_in_conditions` 4、
+  `too_many_arguments` 5、死んだ関数/フィールド7（撤回した変更の残骸を含む）。掃引で数値を主張せず、
+  残りは名前付きの一覧としてここに置きます。
 
 ## 保留・外部依存（値ではなく事実だけ）
 

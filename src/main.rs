@@ -352,7 +352,7 @@ fn kick_skin(name: String, target: &Arc<Client>) {
             }
             let pi = player_info_add(&t);
             for c in cs.iter() {
-                let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x3e, pi.clone());
+                let _ = send_packet(&mut c.sock.lock().unwrap(), 0x3e, pi.clone());
             }
         }
     });
@@ -443,7 +443,7 @@ where
         }
         let pl = mk(c);
         if let Ok(mut w) = c.sock.lock() {
-            let _ = send_packet(&mut *w, pl.0, pl.1);
+            let _ = send_packet(&mut w, pl.0, pl.1);
         }
     }
 }
@@ -640,7 +640,7 @@ fn interest_tick() {
                 write_varint(&mut p, *e as i64);
             }
             if let Ok(mut w) = c.sock.lock() {
-                let _ = send_packet(&mut *w, 0x42, p);
+                let _ = send_packet(&mut w, 0x42, p);
             }
             for e in gone {
                 seen.remove(&e);
@@ -655,7 +655,7 @@ fn interest_tick() {
                 if seen.insert(*eid) {
                     if let Ok(mut w) = c.sock.lock() {
                         for (pid, pkt) in mkpkts() {
-                            let _ = send_packet(&mut *w, pid, pkt);
+                            let _ = send_packet(&mut w, pid, pkt);
                         }
                     }
                 }
@@ -664,7 +664,7 @@ fn interest_tick() {
                 write_varint(&mut p, 1);
                 write_varint(&mut p, *eid as i64);
                 if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut *w, 0x42, p);
+                    let _ = send_packet(&mut w, 0x42, p);
                 }
             }
         }
@@ -878,7 +878,7 @@ fn item_stack_max(item: i64, comps: &Comps) -> i64 {
 fn stack_max_of(st: &Stack) -> i64 {
     item_stack_max(st.0, &st.2)
 }
-fn comp_get<'a>(c: &'a Comps, ty: i64) -> Option<&'a [u8]> {
+fn comp_get(c: &Comps, ty: i64) -> Option<&[u8]> {
     c.iter().find(|(t, _)| *t == ty).map(|(_, d)| d.as_slice())
 }
 fn comp_set(c: &mut Comps, ty: i64, data: Vec<u8>) {
@@ -1326,7 +1326,7 @@ fn damage_held(me: &Arc<Client>) -> bool {
         return false;
     }
     let unb = enchant_level(&st.2, 39); // unbreaking
-    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 {
+    if unb > 0 && !world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
         return false;
     }
     let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
@@ -1353,7 +1353,7 @@ fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
         return false;
     }
     let unb = enchant_level(&st.2, 39);
-    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 {
+    if unb > 0 && !world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
         return false;
     }
     let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
@@ -1367,7 +1367,7 @@ fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
 // vanilla: blocking with a shield pays floor(blocked)+1 durability
 fn damage_shield(me: &Arc<Client>, blocked: f32) {
     let sh = name_to_item("shield").unwrap_or(-9);
-    let slots = [45i16, 36 + (*me.held.lock().unwrap() as i16)];
+    let slots = [45i16, 36 + *me.held.lock().unwrap()];
     let mut inv = me.inv.lock().unwrap();
     for slot in slots {
         let Some(st) = inv.get_mut(&slot) else {
@@ -1383,7 +1383,7 @@ fn damage_shield(me: &Arc<Client>, blocked: f32) {
         let maxd = comp_varint(&st.2, COMP_MAX_DAMAGE).unwrap_or(337);
         let mut add = 0i64;
         for _ in 0..(blocked.floor() as i64 + 1) {
-            if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 {
+            if unb == 0 || world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
                 add += 1
             }
         }
@@ -1417,7 +1417,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
             let unb = enchant_level(&st.2, 39);
             let mut add = 0i64;
             for _ in 0..per {
-                if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 {
+                if unb == 0 || world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
                     add += 1
                 }
             }
@@ -1453,7 +1453,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
         p.extend_from_slice(&slot.to_be_bytes());
         p.extend_from_slice(&slot_wire(&st));
         if let Ok(mut w) = me.sock.lock() {
-            let _ = send_packet(&mut *w, 0x15, p);
+            let _ = send_packet(&mut w, 0x15, p);
         }
     }
 }
@@ -1474,7 +1474,7 @@ fn held_slot_resync(me: &Arc<Client>) {
     p.extend_from_slice(&slot.to_be_bytes());
     p.extend_from_slice(&slot_wire(&st));
     if let Ok(mut w) = me.sock.lock() {
-        let _ = send_packet(&mut *w, 0x15, p);
+        let _ = send_packet(&mut w, 0x15, p);
     }
 }
 fn read_varint_at(b: &[u8], p: usize) -> (i64, usize) {
@@ -1872,7 +1872,7 @@ fn totem_check(c: &Client) {
         return;
     }
     let mut inv = c.inv.lock().unwrap();
-    let held_k = 36i16 + (*c.held.lock().unwrap()) as i16;
+    let held_k = 36i16 + (*c.held.lock().unwrap());
     for k in [45i16, held_k] {
         if inv.get(&k).map(|v| v.0) == Some(1163) {
             let st = inv.get(&k).unwrap().clone();
@@ -1889,7 +1889,7 @@ fn totem_check(c: &Client) {
             let mut st_pkt = Vec::new();
             st_pkt.extend_from_slice(&c.eid.to_be_bytes());
             st_pkt.push(35);
-            let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
+            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
             broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
             let (px, py, pz, ..) = {
                 let p = c.pos.lock().unwrap();
@@ -1899,7 +1899,7 @@ fn totem_check(c: &Client) {
             broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
             // Death protection replaces existing effects with the vanilla grant set.
             grant_totem_effects(c, &mut c.effs.lock().unwrap());
-            let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x5d, health_pkt_c(1.0, c));
+            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x5d, health_pkt_c(1.0, c));
             return;
         }
     }
@@ -2263,7 +2263,7 @@ fn plate_unpowered(st: u32) -> bool {
     st == 5651 || (5717..=5733).contains(&st) && st % 2 == 1
 }
 fn plate_powered(st: u32) -> bool {
-    st == 5650 || (5716..=5732).contains(&st) && st % 2 == 0
+    st == 5650 || (5716..=5732).contains(&st) && st.is_multiple_of(2)
 }
 fn keepalive_time_tick() {
     // One region borrow for the stage. A static scan confirmed that nothing this
@@ -2307,7 +2307,7 @@ fn keepalive_time_tick() {
         let rt = RAINING.load(Ordering::Relaxed);
         if rt > 0 {
             THUNDERING
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
                 })
                 .ok();
@@ -2323,11 +2323,12 @@ fn keepalive_time_tick() {
                 });
             }
         } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1
-            && t.wrapping_mul(2654435761) % RAIN_CHANCE_DENOMINATOR == 0
+            && t.wrapping_mul(2654435761)
+                .is_multiple_of(RAIN_CHANCE_DENOMINATOR)
         {
             RAINING.store(server_ticks(12000), Ordering::Relaxed);
             broadcast(-1, |_c| (0x22, vec![1u8, 0, 0, 0, 0]));
-            if world_rng::next_u64() % 8 == 0 {
+            if world_rng::next_u64().is_multiple_of(8) {
                 // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
                 THUNDERING.store(server_ticks(3600), Ordering::Relaxed);
                 broadcast(-1, |_c| {
@@ -2376,7 +2377,7 @@ fn keepalive_time_tick() {
                 } == name_to_item("elytra").unwrap_or(-9);
                 let glide = !gnd && ely && py < ff - 0.1 && *c.hp.lock().unwrap() > 0.0;
                 // vanilla: elytra pays 1 durability per second of glide
-                if glide && t % server_ticks(20) == 0 && damage_inv_slot(c, 6) {
+                if glide && t.is_multiple_of(server_ticks(20)) && damage_inv_slot(c, 6) {
                     let st =
                         c.inv
                             .lock()
@@ -2396,7 +2397,7 @@ fn keepalive_time_tick() {
                     write_varint(&mut p, c.eid as i64);
                     p.push(0);
                     p.push(0);
-                    p.push((sneak as u8) * 2 | (sprint as u8) * 8 | (glide as u8) * 0x80);
+                    p.push(((sneak as u8) * 2) | ((sprint as u8) * 8) | ((glide as u8) * 0x80));
                     p.push(6);
                     write_varint(&mut p, 21);
                     write_varint(
@@ -2437,7 +2438,7 @@ fn keepalive_time_tick() {
             if GR_NATURAL_REGEN.load(Ordering::Relaxed) == 1 && food >= 18 && *h < mh && *h > 0.0 {
                 // vanilla: fast heal 1hp/10t while food==20&&sat>0, else 1hp/80t; +6 exh per hp
                 let fast = food >= 20 && *c.sat.lock().unwrap() > 0.0;
-                if t % server_ticks(if fast { 10 } else { 80 }) == 0 {
+                if t.is_multiple_of(server_ticks(if fast { 10 } else { 80 })) {
                     *h = (*h + 1.0).min(mh);
                     dirty = true;
                     *ex += 6.0;
@@ -2476,10 +2477,10 @@ fn keepalive_time_tick() {
                         let iv = c.inv.lock().unwrap();
                         enchant_level(&iv.get(&5i16).map(|v| v.2.clone()).unwrap_or_default(), 30)
                     };
-                    if resp == 0 || t % (resp + 1) as u64 == 0 {
+                    if resp == 0 || t.is_multiple_of((resp + 1) as u64) {
                         *air -= 1;
                     }
-                } else if t % server_ticks(20) == 0 {
+                } else if t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 2.0).max(0.0);
                     dirty = true;
                     *c.hurt_at.lock().unwrap() = Instant::now();
@@ -2506,7 +2507,7 @@ fn keepalive_time_tick() {
                         (py + 1.0).floor() as i32,
                         pz.floor() as i32,
                     ) == lst;
-                if in_lava && t % server_ticks(10) == 0 {
+                if in_lava && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
                     *c.hurt_at.lock().unwrap() = Instant::now();
@@ -2521,7 +2522,7 @@ fn keepalive_time_tick() {
                 let fst = name_to_state("fire").unwrap_or(u32::MAX);
                 let in_fire = !fire_immune
                     && (block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
-                if in_fire && t % server_ticks(20) == 0 {
+                if in_fire && t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
                     *c.hurt_at.lock().unwrap() = Instant::now();
@@ -2532,7 +2533,7 @@ fn keepalive_time_tick() {
                     }
                 }
                 // void: 4hp per 0.5s below y=-64, ignores armor (vanilla)
-                if py < -64.0 && t % server_ticks(10) == 0 {
+                if py < -64.0 && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0).max(0.0);
                     dirty = true;
                     *c.hurt_at.lock().unwrap() = Instant::now();
@@ -2543,7 +2544,7 @@ fn keepalive_time_tick() {
                     }
                 }
                 // suffocation: solid block at head height, 1hp/0.5s (vanilla)
-                if t % server_ticks(10) == 0 {
+                if t.is_multiple_of(server_ticks(10)) {
                     let hb = block_at(
                         px.floor() as i32,
                         (py + 1.62).floor() as i32,
@@ -2563,9 +2564,9 @@ fn keepalive_time_tick() {
                 // contact damage: cactus adjacent (1hp/0.5s), magma underfoot
                 // (1hp/0.5s, sneaking safe, fire kind), berry bush inside
                 let (bx, bz) = (px.floor() as i32, pz.floor() as i32);
-                if t % server_ticks(10) == 0 {
+                if t.is_multiple_of(server_ticks(10)) {
                     let cst = name_to_state("cactus").unwrap_or(u32::MAX);
-                    let near_cactus = t % server_ticks(20) == 0
+                    let near_cactus = t.is_multiple_of(server_ticks(20))
                         && [[1, 0], [-1, 0], [0, 1], [0, -1], [0, 0]]
                             .iter()
                             .any(|&[dx, dz]| block_at(bx + dx, py.floor() as i32, bz + dz) == cst);
@@ -2594,7 +2595,9 @@ fn keepalive_time_tick() {
                         }
                     }
                     let bst = name_to_state("sweet_berry_bush").unwrap_or(u32::MAX);
-                    if t % server_ticks(20) == 0 && block_at(bx, py.floor() as i32, bz) == bst {
+                    if t.is_multiple_of(server_ticks(20))
+                        && block_at(bx, py.floor() as i32, bz) == bst
+                    {
                         *h = (*h - 0.5).max(0.0);
                         dirty = true;
                         *c.hurt_at.lock().unwrap() = Instant::now();
@@ -2608,7 +2611,7 @@ fn keepalive_time_tick() {
             }
             if dirty {
                 if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*h, c));
+                    let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c));
                 }
             }
         }
@@ -2681,13 +2684,11 @@ fn keepalive_time_tick() {
                 ^ (p.2 as i64).wrapping_mul(37)
                 ^ (p.1 as i64)
                 ^ t as i64) as u64;
-            if hh % CROP_GROWTH_DENOMINATOR == 0 {
-                if age < 7 {
-                    cg.insert(p, age + 1);
-                    let st = 4278 + (age as u32) + 1;
-                    set_block(p.0, p.1, p.2, st);
-                    ripe.push(p);
-                }
+            if hh.is_multiple_of(CROP_GROWTH_DENOMINATOR) && age < 7 {
+                cg.insert(p, age + 1);
+                let st = 4278 + (age as u32) + 1;
+                set_block(p.0, p.1, p.2, st);
+                ripe.push(p);
             }
         }
         drop(cg);
@@ -2707,8 +2708,7 @@ fn keepalive_time_tick() {
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1
         && DIFFICULTY.load(Ordering::Relaxed) != 0
         && t % server_ticks(SPAWN_CYCLE_GT) == server_ticks(SPAWN_CYCLE_GT) / 2
-        && wt >= 13000
-        && wt <= 23000
+        && (13000..=23000).contains(&wt)
     {
         let mcount = mobs()
             .lock()
@@ -2838,9 +2838,9 @@ fn keepalive_time_tick() {
                     *p = (tx, ty, tz, p.3, p.4, true);
                 }
                 if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut *w, 0x40, teleport_pkt(tx, ty, tz, 0.0, 0.0, 100));
+                    let _ = send_packet(&mut w, 0x40, teleport_pkt(tx, ty, tz, 0.0, 0.0, 100));
                     let mut h = c.hp.lock().unwrap();
-                    *h = (*h - dmg_after(&*c, 5.0, 0)).max(0.0);
+                    *h = (*h - dmg_after(c, 5.0, 0)).max(0.0);
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -2848,7 +2848,7 @@ fn keepalive_time_tick() {
                     }
                     let hh = *h;
                     drop(h);
-                    let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, c));
+                    let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
                 }
             }
         }
@@ -2907,7 +2907,7 @@ fn keepalive_time_tick() {
             sl2.retain(|p0| p0.eid != seid);
             broadcast_seen_destroy(seid);
             // vanilla: an egg that lands has a 1/8 chance to hatch a chicken
-            if is_egg && world_rng::next_u64() % 8 == 0 {
+            if is_egg && world_rng::next_u64().is_multiple_of(8) {
                 let m = Arc::new(Mob {
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     uuid: [0u8; 16],
@@ -3086,7 +3086,7 @@ fn arrow_tick() {
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
                     if let Ok(mut w) = c.sock.lock() {
-                        let _ = send_packet(&mut *w, 0x15, p);
+                        let _ = send_packet(&mut w, 0x15, p);
                     }
                     dead.push(eid);
                 }
@@ -3150,7 +3150,7 @@ fn arrow_tick() {
                                 *m.fuse.lock().unwrap() = a.fire;
                             }
                             if a.punch > 0 && a.kind == 0 {
-                                let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01) as f64;
+                                let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01);
                                 let kb = 0.3 * a.punch as f64;
                                 let mut p = m.pos.lock().unwrap();
                                 p.0 += a.dx / vl * kb;
@@ -3356,8 +3356,8 @@ fn arrow_tick() {
                 damage_armor(c, ad);
             }
             if let Ok(mut w) = c.sock.lock() {
-                let _ = send_packet(&mut *w, 0x24, hurt_anim(veid));
-                let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, c));
+                let _ = send_packet(&mut w, 0x24, hurt_anim(veid));
+                let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
             }
             let vname = c.name.clone();
             drop(cls);
@@ -3376,7 +3376,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
         for dy in -1..=2 {
             for dz in -2..=2 {
                 if dx * dx + dy * dy + dz * dz <= 5 {
-                    let (tx, ty, tz) = (bx + dx as i32, by + dy as i32, bz + dz as i32);
+                    let (tx, ty, tz) = (bx + dx, by + dy, bz + dz);
                     // vanilla: TNT destroyed by an explosion primes itself —
                     // short fuse (0.5-1.5s), this is what makes chains work
                     if (2094..=2095).contains(&block_at(tx, ty, tz)) {
@@ -3412,18 +3412,18 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
             *cl.hurt_at.lock().unwrap() = Instant::now();
             let mut h = cl.hp.lock().unwrap();
             let raw = ((power * 1.5 - dd) * 3.0) as f32;
-            *h = (*h - hurt_absorb(&*cl, dmg_after(&*cl, raw, 2))).max(0.0);
+            *h = (*h - hurt_absorb(&cl, dmg_after(&cl, raw, 2))).max(0.0);
             if *h <= 0.0 {
                 drop(h);
-                totem_check(&*cl);
+                totem_check(&cl);
                 h = cl.hp.lock().unwrap();
             }
             let hh = *h;
             drop(h);
             damage_armor(&cl, raw);
             if let Ok(mut w) = cl.sock.lock() {
-                let _ = send_packet(&mut *w, 0x24, hurt_anim(cl.eid));
-                let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, &cl));
+                let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
+                let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, &cl));
             }
         }
     }
@@ -3438,13 +3438,13 @@ fn primed_tick() {
         while i < pl.len() {
             if !region.is_hot(pl[i].x as i32, pl[i].z as i32) {
                 i += 1; // fuse pauses while cold: no tick, no decrement
-            } else if {
-                pl[i].left -= 1;
-                pl[i].left <= 0
-            } {
-                boom.push(pl.remove(i));
             } else {
-                i += 1;
+                pl[i].left -= 1;
+                if pl[i].left <= 0 {
+                    boom.push(pl.remove(i));
+                } else {
+                    i += 1;
+                }
             }
         }
     }
@@ -3509,7 +3509,7 @@ fn furnace_tick() {
             f.progress += 1;
             if f.progress >= server_ticks(200) as i32 {
                 f.progress = 0;
-                let r = out.clone().unwrap();
+                let r = out.unwrap();
                 f.xp += smelt_xp(f.input.0);
                 f.output = (r.0, f.output.1 + r.1, f.output.2.clone());
                 f.input.1 -= 1;
@@ -3538,7 +3538,7 @@ fn furnace_tick() {
             if dirty_pos.contains(&fp) {
                 let inv = c.inv.lock().unwrap().clone();
                 if let Ok(mut w) = c.sock.lock() {
-                    furnace_push_items(&mut *w, fp, &inv);
+                    furnace_push_items(&mut w, fp, &inv);
                 }
             }
         }
@@ -4210,7 +4210,7 @@ fn drop_tick() {
                 write_varint(&mut p, lvl as i64);
                 write_varint(&mut p, total);
                 if let Ok(mut w) = c.sock.lock() {
-                    let _ = send_packet(&mut *w, 0x5c, p);
+                    let _ = send_packet(&mut w, 0x5c, p);
                 }
                 drop(cls);
                 broadcast_seen_destroy(xeid);
@@ -4244,7 +4244,7 @@ fn drop_tick() {
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(&(item, cnt, dcomp)));
             if let Ok(mut w) = c.sock.lock() {
-                let _ = send_packet(&mut *w, 0x15, p);
+                let _ = send_packet(&mut w, 0x15, p);
             }
             drop(inv);
             drop(cls);
@@ -4374,7 +4374,7 @@ fn mob_tick() {
     let region = region_guard();
 
     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
-    let day = wt < 13000 || wt > 23000;
+    let day = !(13000..=23000).contains(&wt);
     for m in mobs_snap.iter() {
         let mut mp = m.pos.lock().unwrap();
         // died from last tick's fall/environmental damage
@@ -4389,7 +4389,9 @@ fn mob_tick() {
             continue;
         }
         // suffocation: head cell buried in a solid block -> 1hp/0.5s (vanilla)
-        if TICK.load(Ordering::Relaxed) % server_ticks(10) == 0
+        if TICK
+            .load(Ordering::Relaxed)
+            .is_multiple_of(server_ticks(10))
             && mob_cell_solid(mp.0, mp.1 + 1.0, mp.2)
         {
             let mut hp = m.hp.lock().unwrap();
@@ -4418,7 +4420,10 @@ fn mob_tick() {
                 *air = server_ticks(AIR_SUPPLY_GT) as i32;
             } else if *air > 0 {
                 *air -= 1;
-            } else if TICK.load(Ordering::Relaxed) % server_ticks(20) == 0 {
+            } else if TICK
+                .load(Ordering::Relaxed)
+                .is_multiple_of(server_ticks(20))
+            {
                 drop(air);
                 let mut hp = m.hp.lock().unwrap();
                 *hp -= 2.0;
@@ -4568,18 +4573,18 @@ fn mob_tick() {
                                     let raw = ((1.0 - dd / 6.5).max(0.0)
                                         * diff_expl_dmg(43.0) as f64)
                                         as f32;
-                                    *h = (*h - hurt_absorb(&*cl, dmg_after(&*cl, raw, 2))).max(0.0);
+                                    *h = (*h - hurt_absorb(cl, dmg_after(cl, raw, 2))).max(0.0);
                                     if *h <= 0.0 {
                                         drop(h);
-                                        totem_check(&*cl);
+                                        totem_check(cl);
                                         h = cl.hp.lock().unwrap();
                                     }
                                     let hh = *h;
                                     drop(h);
                                     damage_armor(cl, raw);
                                     if let Ok(mut w) = cl.sock.lock() {
-                                        let _ = send_packet(&mut *w, 0x24, hurt_anim(cl.eid));
-                                        let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, cl));
+                                        let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
+                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, cl));
                                     }
                                 }
                             }
@@ -4628,8 +4633,7 @@ fn mob_tick() {
             );
             if block_at(bx, by - 1, bz) == name_to_state("grass_block").unwrap_or(u32::MAX)
                 && ((m.eid as u64).wrapping_mul(1103515245) ^ TICK.load(Ordering::Relaxed))
-                    % MOB_SPAWN_CHANCE_DENOMINATOR
-                    == 0
+                    .is_multiple_of(MOB_SPAWN_CHANCE_DENOMINATOR)
             {
                 set_block(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
                 sheared().lock().unwrap().remove(&m.eid);
@@ -4863,12 +4867,12 @@ fn mob_tick() {
                                         && cl.shield_cd.lock().unwrap().elapsed()
                                             > Duration::from_secs(5);
                                     if bl {
-                                        damage_shield(&*cl, 2.0);
+                                        damage_shield(cl, 2.0);
                                     }
                                     let dmg = if bl {
                                         0.0
                                     } else {
-                                        dmg_after(&*cl, diff_mob_dmg(3.0), 0)
+                                        dmg_after(cl, diff_mob_dmg(3.0), 0)
                                     };
                                     *h = (*h - hurt_absorb(cl, dmg)).max(0.0);
                                     if dmg > 0.0 {
@@ -4932,14 +4936,14 @@ fn mob_tick() {
                                     }
                                     if *h <= 0.0 {
                                         drop(h);
-                                        totem_check(&*cl);
+                                        totem_check(cl);
                                         h = cl.hp.lock().unwrap();
                                     }
                                     let hh = *h;
                                     drop(h);
                                     if let Ok(mut w) = cl.sock.lock() {
-                                        let _ = send_packet(&mut *w, 0x24, hurt_anim(cl.eid));
-                                        let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, cl));
+                                        let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
+                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, cl));
                                     }
                                     hurt_eid = Some((cl.eid, cl.name.clone(), hh));
                                     break;
@@ -5351,14 +5355,14 @@ fn ore_state(x: i32, y: i32, z: i32) -> u32 {
         ^ (z as i64).wrapping_mul(0x85EBCA77)
         ^ (y as i64).wrapping_mul(0xC2B2AE3D)) as u64;
     let oh = oh.wrapping_mul(0x27D4EB2F) ^ (oh >> 15);
-    if y <= -52 && y >= -60 && oh % 23 == 0 {
+    if (-60..=-52).contains(&y) && oh.is_multiple_of(23) {
         return name_to_state("lava").unwrap_or(1);
     }
-    if y <= -32 && oh % 601 == 0 {
+    if y <= -32 && oh.is_multiple_of(601) {
         name_to_state("diamond_ore").unwrap_or(1)
-    } else if y <= 4 && oh % 197 == 0 {
+    } else if y <= 4 && oh.is_multiple_of(197) {
         name_to_state("iron_ore").unwrap_or(1)
-    } else if oh % 89 == 0 {
+    } else if oh.is_multiple_of(89) {
         name_to_state("coal_ore").unwrap_or(1)
     } else {
         name_to_state("stone").unwrap_or(1)
@@ -5678,7 +5682,7 @@ fn lava_queue() -> &'static Mutex<tick_queue::TickQueue> {
 fn requeue_fluid(queue: &Mutex<tick_queue::TickQueue>, pos: (i32, i32, i32), period: u64) {
     let now = TICK_IDX.load(Ordering::Relaxed);
     let delay = match backoff().lock().unwrap().get(&pos) {
-        Some((due, _)) if *due > now => ((*due - now + period - 1) / period) as usize,
+        Some((due, _)) if *due > now => (*due - now).div_ceil(period) as usize,
         _ => 1,
     };
     queue.lock().unwrap().schedule(pos, delay);
@@ -5775,9 +5779,8 @@ fn on_random_tick(reg: &crate::block_registry::BReg, x: i32, y: i32, z: i32) {
     let st = block_at(x, y, z);
     // One compare against zero for the common case, rather than a string compare against
     // the block's name on every sample.
-    match reg.behaviour_of(st) {
-        crate::block_registry::B_SUGAR_CANE => sugar_cane_random_tick(reg, x, y, z, st),
-        _ => {}
+    if reg.behaviour_of(st) == crate::block_registry::B_SUGAR_CANE {
+        sugar_cane_random_tick(reg, x, y, z, st)
     }
 }
 
@@ -6066,10 +6069,11 @@ impl Plugin for GrowthLamp {
                 for dz in -2..=2 {
                     let (bx, by, bz) = (x + dx, y + dy, z + dz);
                     match api.block_get(bx, by, bz) {
-                        Ok(st) if (4278..4285).contains(&st) => {
-                            if api.block_set(bx, by, bz, st + 1).is_ok() {
-                                did = true;
-                            }
+                        Ok(st)
+                            if (4278..4285).contains(&st)
+                                && api.block_set(bx, by, bz, st + 1).is_ok() =>
+                        {
+                            did = true;
                         }
                         _ => {}
                     }
@@ -6164,8 +6168,8 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
             spill.extend(
                 slots
                     .values()
-                    .cloned()
-                    .filter(|(it, cn, _)| *it > 0 && *cn > 0),
+                    .filter(|&(it, cn, _)| *it > 0 && *cn > 0)
+                    .cloned(),
             );
         }
         if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z)) {
@@ -6414,7 +6418,7 @@ fn block_updated(x: i32, y: i32, z: i32) {
         return;
     }
     UPD_DEPTH.set(depth + 1);
-    let r = block_updated_inner(x, y, z);
+    block_updated_inner(x, y, z);
     UPD_DEPTH.set(depth);
     if depth == 0 {
         loop {
@@ -6426,7 +6430,6 @@ fn block_updated(x: i32, y: i32, z: i32) {
             UPD_DEPTH.set(0);
         }
     }
-    r
 }
 /// A falling block in flight, as vanilla's `FallingBlockEntity`: the block has left the
 /// world, and this owns its state until it lands. `dy` is the vertical velocity and is
@@ -7374,7 +7377,7 @@ fn load_world_from(payload: &[u8]) {
     // bounds-safe varint read: truncated input stops the parse instead of
     // panicking; continuation bytes beyond i64's 70 bits are ignored.
     let rv = rv_varint;
-    let n = rv(&payload, &mut p);
+    let n = rv(payload, &mut p);
     let mut w = world().lock().unwrap();
     for _ in 0..n {
         if p + 8 > payload.len() {
@@ -7384,7 +7387,7 @@ fn load_world_from(payload: &[u8]) {
         p += 4;
         let cz = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
         p += 4;
-        let m = rv(&payload, &mut p);
+        let m = rv(payload, &mut p);
         let c = w.entry((cx, cz)).or_default();
         for _ in 0..m {
             if p + 4 > payload.len() {
@@ -7392,7 +7395,7 @@ fn load_world_from(payload: &[u8]) {
             }
             let idx = u32::from_be_bytes(b[p..p + 4].try_into().unwrap());
             p += 4;
-            let st = rv(&payload, &mut p) as u32;
+            let st = rv(payload, &mut p) as u32;
             c.insert(idx, st);
         }
     }
@@ -7408,13 +7411,13 @@ fn load_world_from(payload: &[u8]) {
         // read as ticks would despawn its drops immediately.
         let legacy_ms_ages = magic != b"MET4";
         p += 4;
-        let mn = rv(&payload, &mut p);
+        let mn = rv(payload, &mut p);
         let mut ms = mobs().lock().unwrap();
         for _ in 0..mn {
             if p + 28 > payload.len() {
                 break;
             }
-            let et = rv(&payload, &mut p);
+            let et = rv(payload, &mut p);
             let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
             p += 8;
             let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
@@ -7445,7 +7448,7 @@ fn load_world_from(payload: &[u8]) {
             p += 8;
         }
         if p < payload.len() {
-            let pn = rv(&payload, &mut p);
+            let pn = rv(payload, &mut p);
             let mut store = inv_store().lock().unwrap();
             for _ in 0..pn {
                 if p + 2 > payload.len() {
@@ -7458,7 +7461,7 @@ fn load_world_from(payload: &[u8]) {
                 }
                 let name = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
                 p += nl;
-                let en = rv(&payload, &mut p);
+                let en = rv(payload, &mut p);
                 let mut inv = HashMap::new();
                 for _ in 0..en {
                     if p + 3 > payload.len() {
@@ -7466,14 +7469,14 @@ fn load_world_from(payload: &[u8]) {
                     }
                     let slot = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
                     p += 2;
-                    let item = rv(&payload, &mut p);
+                    let item = rv(payload, &mut p);
                     if p >= payload.len() {
                         break;
                     }
                     let cnt = b[p];
                     p += 1;
                     let comps = if has_comps {
-                        read_comps(&payload, &mut p)
+                        read_comps(payload, &mut p)
                     } else {
                         Vec::new()
                     };
@@ -7483,7 +7486,7 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         if p < payload.len() {
-            let cn = rv(&payload, &mut p);
+            let cn = rv(payload, &mut p);
             let mut ch = chests().lock().unwrap();
             for _ in 0..cn {
                 if p + 12 > payload.len() {
@@ -7495,7 +7498,7 @@ fn load_world_from(payload: &[u8]) {
                 p += 4;
                 let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
                 p += 4;
-                let en = rv(&payload, &mut p);
+                let en = rv(payload, &mut p);
                 let mut slots = HashMap::new();
                 for _ in 0..en {
                     if p + 3 > payload.len() {
@@ -7503,14 +7506,14 @@ fn load_world_from(payload: &[u8]) {
                     }
                     let slot = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
                     p += 2;
-                    let item = rv(&payload, &mut p);
+                    let item = rv(payload, &mut p);
                     if p >= payload.len() {
                         break;
                     }
                     let cnt = b[p];
                     p += 1;
                     let comps = if has_comps {
-                        read_comps(&payload, &mut p)
+                        read_comps(payload, &mut p)
                     } else {
                         Vec::new()
                     };
@@ -7520,7 +7523,7 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         if p < payload.len() {
-            let sn = rv(&payload, &mut p);
+            let sn = rv(payload, &mut p);
             let mut sg = signs().lock().unwrap();
             for _ in 0..sn {
                 if p + 13 > payload.len() {
@@ -7552,7 +7555,7 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         if p < payload.len() {
-            let fn_ = rv(&payload, &mut p);
+            let fn_ = rv(payload, &mut p);
             let mut fl = forceloaded().lock().unwrap();
             for _ in 0..fn_ {
                 if p + 8 > payload.len() {
@@ -7565,8 +7568,8 @@ fn load_world_from(payload: &[u8]) {
                 fl.insert((cx, cz));
             }
         }
-        if p + 1 <= payload.len() {
-            let pn = rv(&payload, &mut p);
+        if p < payload.len() {
+            let pn = rv(payload, &mut p);
             let mut ps = pos_store().lock().unwrap();
             for _ in 0..pn {
                 if p + 2 > payload.len() {
@@ -7593,7 +7596,7 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         if p < payload.len() {
-            let dn = rv(&payload, &mut p);
+            let dn = rv(payload, &mut p);
             let mut ds = drops().lock().unwrap();
             for _ in 0..dn {
                 if p + 30 > payload.len() {
@@ -7607,14 +7610,14 @@ fn load_world_from(payload: &[u8]) {
                 p += 8;
                 let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
                 p += 8;
-                let item = rv(&payload, &mut p);
+                let item = rv(payload, &mut p);
                 if p >= payload.len() {
                     break;
                 }
                 let cnt = b[p];
                 p += 1;
                 let comps = if has_comps {
-                    read_comps(&payload, &mut p)
+                    read_comps(payload, &mut p)
                 } else {
                     Vec::new()
                 };
@@ -7634,7 +7637,7 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         if p < payload.len() {
-            let fn_ = rv(&payload, &mut p);
+            let fn_ = rv(payload, &mut p);
             let mut fs = furnaces().lock().unwrap();
             for _ in 0..fn_ {
                 if p + 12 > payload.len() {
@@ -7660,9 +7663,9 @@ fn load_world_from(payload: &[u8]) {
                         },
                     )
                 };
-                let input = rd(&payload, &mut p);
-                let fuel = rd(&payload, &mut p);
-                let output = rd(&payload, &mut p);
+                let input = rd(payload, &mut p);
+                let fuel = rd(payload, &mut p);
+                let output = rd(payload, &mut p);
                 if p + 8 > payload.len() {
                     break;
                 }
@@ -7695,10 +7698,10 @@ fn load_world_from(payload: &[u8]) {
         }
         if p < payload.len() {
             // sheared mob indices -> mark by load order (fresh eids)
-            let sn = rv(&payload, &mut p);
+            let sn = rv(payload, &mut p);
             let mut shidx: Vec<usize> = Vec::new();
             for _ in 0..sn {
-                shidx.push(rv(&payload, &mut p) as usize);
+                shidx.push(rv(payload, &mut p) as usize);
             }
             let ms = mobs().lock().unwrap();
             let mut sh = sheared().lock().unwrap();
@@ -7709,7 +7712,7 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         if p < payload.len() {
-            let on = rv(&payload, &mut p);
+            let on = rv(payload, &mut p);
             let mut sc = scores().lock().unwrap();
             for _ in 0..on {
                 if p + 2 > payload.len() {
@@ -7722,7 +7725,7 @@ fn load_world_from(payload: &[u8]) {
                 }
                 let obj = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
                 p += nl;
-                let en = rv(&payload, &mut p);
+                let en = rv(payload, &mut p);
                 let mut entries = HashMap::new();
                 for _ in 0..en {
                     if p + 2 > payload.len() {
@@ -7744,7 +7747,7 @@ fn load_world_from(payload: &[u8]) {
         }
         if p + 1 < payload.len() {
             // XP orbs (eid,x,y,z,val,age_ms)
-            let xn = rv(&payload, &mut p);
+            let xn = rv(payload, &mut p);
             let mut xs = xps().lock().unwrap();
             let mut mx: i32 = 0;
             for _ in 0..xn {
@@ -7819,7 +7822,7 @@ fn load_world_from(payload: &[u8]) {
             if arw2 {
                 p += 4;
             }
-            let n = rv(&payload, &mut p);
+            let n = rv(payload, &mut p);
             {
                 let mut ar = arrows().lock().unwrap();
                 let rec = if arw2 { 61 } else { 60 };
@@ -7827,20 +7830,19 @@ fn load_world_from(payload: &[u8]) {
                     if p + rec > payload.len() {
                         break;
                     }
-                    let eid = ri4(&payload, &mut p);
-                    let owner = ri4(&payload, &mut p);
+                    let eid = ri4(payload, &mut p);
+                    let owner = ri4(payload, &mut p);
                     let (x, y, z) = (
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
                     );
                     let (dx, dy, dz) = (
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
                     );
-                    let ttl =
-                        legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
+                    let ttl = legacy_tick_count(ri4(payload, &mut p) as u64, legacy_ms_ages) as i32;
                     let stuck = if arw2 {
                         let v = b[p] != 0;
                         p += 1;
@@ -7872,26 +7874,26 @@ fn load_world_from(payload: &[u8]) {
                     bump(eid, &mut mx);
                 }
             }
-            let n = rv(&payload, &mut p);
+            let n = rv(payload, &mut p);
             {
                 let mut bo = bobbers().lock().unwrap();
                 for _ in 0..n {
                     if p + 61 > payload.len() {
                         break;
                     }
-                    let eid = ri4(&payload, &mut p);
-                    let owner = ri4(&payload, &mut p);
+                    let eid = ri4(payload, &mut p);
+                    let owner = ri4(payload, &mut p);
                     let (x, y, z) = (
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
                     );
                     let (dx, dy, dz) = (
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
                     );
-                    let age = ri4(&payload, &mut p);
+                    let age = ri4(payload, &mut p);
                     let bit = b[p] != 0;
                     p += 1;
                     bo.push(Bobber {
@@ -7909,27 +7911,26 @@ fn load_world_from(payload: &[u8]) {
                     bump(eid, &mut mx);
                 }
             }
-            let n = rv(&payload, &mut p);
+            let n = rv(payload, &mut p);
             {
                 let mut pe = pearls().lock().unwrap();
                 for _ in 0..n {
                     if p + 60 > payload.len() {
                         break;
                     }
-                    let eid = ri4(&payload, &mut p);
-                    let owner = ri4(&payload, &mut p);
+                    let eid = ri4(payload, &mut p);
+                    let owner = ri4(payload, &mut p);
                     let (x, y, z) = (
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
                     );
                     let (dx, dy, dz) = (
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
                     );
-                    let ttl =
-                        legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
+                    let ttl = legacy_tick_count(ri4(payload, &mut p) as u64, legacy_ms_ages) as i32;
                     pe.push(Pearl {
                         eid,
                         owner,
@@ -7944,18 +7945,18 @@ fn load_world_from(payload: &[u8]) {
                     bump(eid, &mut mx);
                 }
             }
-            let n = rv(&payload, &mut p);
+            let n = rv(payload, &mut p);
             {
                 let mut pr = primed().lock().unwrap();
                 for _ in 0..n {
                     if p + 32 > payload.len() {
                         break;
                     }
-                    let eid = ri4(&payload, &mut p);
+                    let eid = ri4(payload, &mut p);
                     let (x, y, z) = (
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
-                        rf3(&payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
+                        rf3(payload, &mut p),
                     );
                     let left = legacy_tick_count(
                         i32::from_be_bytes(b[p..p + 4].try_into().unwrap()) as u64,
@@ -8017,7 +8018,7 @@ fn load_world_from(payload: &[u8]) {
         }
         if p < payload.len() {
             let mut tm = tags().lock().unwrap();
-            let pn = rv(&payload, &mut p);
+            let pn = rv(payload, &mut p);
             for _ in 0..pn {
                 if p + 2 > payload.len() {
                     break;
@@ -8029,7 +8030,7 @@ fn load_world_from(payload: &[u8]) {
                 }
                 let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
                 p += nl;
-                let tc = rv(&payload, &mut p);
+                let tc = rv(payload, &mut p);
                 let mut st = HashSet::new();
                 for _ in 0..tc {
                     if p + 2 > payload.len() {
@@ -8047,11 +8048,11 @@ fn load_world_from(payload: &[u8]) {
                     tm.insert(format!("p:{}", nm), st);
                 }
             }
-            let mn2 = rv(&payload, &mut p);
+            let mn2 = rv(payload, &mut p);
             let mut mtag: Vec<(usize, HashSet<String>)> = Vec::new();
             for _ in 0..mn2 {
-                let i = rv(&payload, &mut p) as usize;
-                let tc = rv(&payload, &mut p);
+                let i = rv(payload, &mut p) as usize;
+                let tc = rv(payload, &mut p);
                 let mut st = HashSet::new();
                 for _ in 0..tc {
                     if p + 2 > payload.len() {
@@ -8077,7 +8078,7 @@ fn load_world_from(payload: &[u8]) {
             }
             drop(ms);
             if p < payload.len() {
-                let sn = rv(&payload, &mut p);
+                let sn = rv(payload, &mut p);
                 let mut sf = sched_fns().lock().unwrap();
                 let t_now = TICK.load(Ordering::Relaxed);
                 for _ in 0..sn {
@@ -8100,7 +8101,7 @@ fn load_world_from(payload: &[u8]) {
                 }
             }
             if p < payload.len() {
-                let gn = rv(&payload, &mut p);
+                let gn = rv(payload, &mut p);
                 let mut ag = adv_done().lock().unwrap();
                 for _ in 0..gn {
                     if p + 2 > payload.len() {
@@ -8113,7 +8114,7 @@ fn load_world_from(payload: &[u8]) {
                     }
                     let pn = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
                     p += nl;
-                    let ic = rv(&payload, &mut p);
+                    let ic = rv(payload, &mut p);
                     let mut ids = HashSet::new();
                     for _ in 0..ic {
                         if p + 2 > payload.len() {
@@ -8134,7 +8135,7 @@ fn load_world_from(payload: &[u8]) {
             }
             // player attributes
             if p < payload.len() {
-                let an = rv(&payload, &mut p);
+                let an = rv(payload, &mut p);
                 let mut at = attrs().lock().unwrap();
                 for _ in 0..an {
                     if p + 2 > payload.len() {
@@ -8147,7 +8148,7 @@ fn load_world_from(payload: &[u8]) {
                     }
                     let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
                     p += nl;
-                    let cnt = rv(&payload, &mut p);
+                    let cnt = rv(payload, &mut p);
                     let mut m = HashMap::new();
                     for _ in 0..cnt {
                         if p + 2 > payload.len() {
@@ -8170,7 +8171,7 @@ fn load_world_from(payload: &[u8]) {
                 }
                 // objective types + sidebar
                 if p < payload.len() {
-                    let oc = rv(&payload, &mut p);
+                    let oc = rv(payload, &mut p);
                     let mut ot = obj_types().lock().unwrap();
                     for _ in 0..oc {
                         if p + 2 > payload.len() {
@@ -8214,7 +8215,7 @@ fn load_world_from(payload: &[u8]) {
     // written before this existed, so a missing tag leaves the queue empty rather than failing.
     if p + 4 <= payload.len() && &payload[p..p + 4] == b"FAL2" {
         p += 4;
-        let n = rv(&payload, &mut p);
+        let n = rv(payload, &mut p);
         for _ in 0..n {
             if p + 44 > payload.len() {
                 break;
@@ -8248,7 +8249,7 @@ fn load_world_from(payload: &[u8]) {
         // The old cell-moving model kept the block in the world and stored its cell. Convert to
         // an entity and remove the block, so it does not remain after the entity lands.
         p += 4;
-        let n = rv(&payload, &mut p);
+        let n = rv(payload, &mut p);
         for _ in 0..n {
             if p + 12 > payload.len() {
                 break;
@@ -11148,7 +11149,7 @@ fn hex(b: &[u8]) -> String {
 
 static PACK_INFO: OnceLock<Option<(String, String)>> = OnceLock::new(); // (url, sha1hex)
 fn pack_info() -> &'static Option<(String, String)> {
-    PACK_INFO.get_or_init(|| load_pack_info())
+    PACK_INFO.get_or_init(load_pack_info)
 }
 fn resource_pack_url(bind: &str, configured: Option<&str>) -> Option<String> {
     if let Some(url) = configured {
@@ -11267,7 +11268,7 @@ fn load_datapacks() {
                                 }
                                 if p.extension().map(|x| x == "mcfunction").unwrap_or(false) {
                                     let rel = p
-                                        .strip_prefix(&ns.path().join(tag))
+                                        .strip_prefix(ns.path().join(tag))
                                         .unwrap()
                                         .to_string_lossy()
                                         .replace('\\', "/");
@@ -11383,7 +11384,7 @@ fn load_datapacks() {
                                 } else if let Some(n) = jstr(spec, "item") {
                                     name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item)
                                 } else {
-                                    jstr(spec, "").and_then(|_| None)
+                                    jstr(spec, "").and(None)
                                 } // object-less spec unsupported
                             };
                             let (out_id, out_cnt) = {
@@ -11474,9 +11475,8 @@ fn load_datapacks() {
                                 .any(|k| body.contains(k))
                             {
                                 // "ingredient": {"item"|"tag":...} or bare "minecraft:x"
-                                let ig = jblock(&body, "ingredient")
-                                    .and_then(|b| mk_ingr(b))
-                                    .or_else(|| {
+                                let ig =
+                                    jblock(&body, "ingredient").and_then(mk_ingr).or_else(|| {
                                         jstr(&body, "ingredient").and_then(|n| {
                                             name_to_item(n.trim_start_matches("minecraft:"))
                                                 .map(Ingr::Item)
@@ -11592,7 +11592,7 @@ fn load_datapacks() {
                                         }
                                     }
                                     let pfuncs: Vec<LootFunc> = jarray(pb, "functions")
-                                        .map(|fa| parse_loot_funcs(fa))
+                                        .map(parse_loot_funcs)
                                         .unwrap_or_default();
                                     if !entries.is_empty() {
                                         pools.push(LootPool {
@@ -11611,7 +11611,7 @@ fn load_datapacks() {
                                     if let Some(mob) = p
                                         .file_stem()
                                         .and_then(|s| s.to_str())
-                                        .and_then(|n| name_to_etype(n))
+                                        .and_then(name_to_etype)
                                     {
                                         if let Some(pl) = loot_tables()
                                             .lock()
@@ -11852,11 +11852,7 @@ fn jstr<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     if let Some(q) = rest.strip_prefix('"') {
         return Some(&q[..q.find('"')?]);
     }
-    Some(
-        rest.split(|c: char| c == ',' || c == '}' || c == ']')
-            .next()?
-            .trim(),
-    )
+    Some(rest.split([',', '}', ']']).next()?.trim())
 }
 fn jnum(body: &str, key: &str) -> Option<i64> {
     jstr(body, key)?.parse().ok()
@@ -11881,7 +11877,7 @@ fn jblock<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 // yields each top-level {...} object inside an array body
-fn jobjects<'a>(arr: &'a str) -> Vec<&'a str> {
+fn jobjects(arr: &str) -> Vec<&str> {
     let mut v = Vec::new();
     let mut d = 0i32;
     let mut st = 0usize;
@@ -12126,8 +12122,7 @@ fn within_search(cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
         && x <= cx * 16 + 30
         && z >= cz * 16 - 15
         && z <= cz * 16 + 30
-        && y >= MIN_Y
-        && y < MIN_Y + 384
+        && (MIN_Y..MIN_Y + 384).contains(&y)
 }
 
 /// Light-emitting blocks the **generator** placed in a chunk, recorded by `chunk_data` as it
@@ -12425,7 +12420,7 @@ fn sky_spill(
             (0, 0, -1),
         ] {
             let (qx, qy, qz) = (p.0 + dx, p.1 + dy, p.2 + dz);
-            if qx < x0 || qx > x1 || qz < z0 || qz > z1 || qy < MIN_Y || qy >= MIN_Y + 384 {
+            if qx < x0 || qx > x1 || qz < z0 || qz > z1 || !(MIN_Y..MIN_Y + 384).contains(&qy) {
                 continue;
             }
             if !dark(qx, qy, qz) {
@@ -12490,7 +12485,7 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
         }
         f9[(dx * 3 + dz) as usize][(((z & 15) as usize) << 4) | (x & 15) as usize]
     };
-    let spill = sky_spill(cx, cz, floor_of, &op);
+    let spill = sky_spill(cx, cz, floor_of, op);
     sky_light_sections_with_spill(cx, cz, &floors, &spill)
 }
 
@@ -12507,8 +12502,7 @@ fn sky_light_sections_with_spill(
     for (&(x, y, z), &level) in spill {
         if x.div_euclid(16) != cx
             || z.div_euclid(16) != cz
-            || y < LIGHT_MIN_Y
-            || y >= LIGHT_MIN_Y + 26 * 16
+            || !(LIGHT_MIN_Y..LIGHT_MIN_Y + 26 * 16).contains(&y)
         {
             continue;
         }
@@ -12551,7 +12545,7 @@ fn pack_sky_section(sy: i32, floors: &[i32; 256]) -> [u8; 2048] {
         for half in 0..8usize {
             let lx = half * 2;
             let f0 = floors[(lz << 4) | lx];
-            let f1 = floors[(lz << 4) | lx + 1];
+            let f1 = floors[(lz << 4) | (lx + 1)];
             for y in 0..16usize {
                 let wy = sy + y as i32;
                 let lo = if wy > f0 { 0x0f } else { 0x00 };
@@ -12606,7 +12600,7 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     let mut gen_sources_here: Vec<((i32, i32, i32), u8)> = Vec::new();
     let overlay_empty = {
         let w = world().lock().unwrap();
-        w.get(&(cx, cz)).map_or(true, |c| c.is_empty())
+        w.get(&(cx, cz)).is_none_or(|c| c.is_empty())
     };
     let mut hs = [0i32; 256];
     let (mut hmin, mut hmax) = (i32::MAX, i32::MIN);
@@ -12659,7 +12653,7 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                                     .copied()
                             };
                             let gen = match &base {
-                                Some(a) => a[((ly << 8) | (lz << 4) | lx) as usize],
+                                Some(a) => a[(ly << 8) | (lz << 4) | lx],
                                 None => base_state(wx, wy, wz),
                             };
                             let st = ov.unwrap_or(gen);
@@ -12685,7 +12679,7 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                                 .iter()
                                 .any(|(dx, dy, dz)| exposes(read(wx + dx, wy + dy, wz + dz)))
                             {
-                                hidden_filler_with(&read, wx, wy, wz, hs[((lz << 4) | lx) as usize])
+                                hidden_filler_with(&read, wx, wy, wz, hs[(lz << 4) | lx])
                             } else {
                                 st
                             };
@@ -13121,7 +13115,7 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
         let ty = rv_varint(b, &mut p);
         let start = p;
         match ty {
-            1 | 2 | 3 => {
+            1..=3 => {
                 rv_varint(b, &mut p);
             } // varint payload
             4 => {
@@ -13363,7 +13357,7 @@ fn map_add_range(map: &mut HashMap<i16, Stack>, lo: i16, hi: i16, st: Stack) -> 
         }
         if let Some(cur) = map.get_mut(&k) {
             if cur.0 == rem.0 && cur.2 == rem.2 {
-                let room = (item_stack_max(cur.0, &cur.2) as i64 - cur.1 as i64).max(0) as u8;
+                let room = (item_stack_max(cur.0, &cur.2) - cur.1 as i64).max(0) as u8;
                 let t = room.min(rem.1);
                 cur.1 += t;
                 rem.1 -= t;
@@ -13372,8 +13366,8 @@ fn map_add_range(map: &mut HashMap<i16, Stack>, lo: i16, hi: i16, st: Stack) -> 
     }
     if rem.1 > 0 {
         for k in lo..=hi {
-            if !map.contains_key(&k) {
-                map.insert(k, rem.clone());
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(k) {
+                e.insert(rem.clone());
                 rem.1 = 0;
                 break;
             }
@@ -13474,7 +13468,7 @@ fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
     p.extend_from_slice(&wslot.to_be_bytes());
     p.extend_from_slice(&slot_wire(st));
     if let Ok(mut w) = me.sock.lock() {
-        let _ = send_packet(&mut *w, 0x15, p);
+        let _ = send_packet(&mut w, 0x15, p);
     }
 }
 fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) {
@@ -13922,7 +13916,7 @@ fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
     let g2: HashMap<i16, Stack> = g.clone();
     // single log -> its own planks (vanilla #minecraft:logs, type-preserving)
     if (1..=9).filter(|&i| !air(i)).count() == 1 {
-        if let Some(it) = (1..=9).find(|&i| !air(i)).map(|i| at(i)) {
+        if let Some(it) = (1..=9).find(|&i| !air(i)).map(at) {
             if let Some(p) = planks_for_log(it) {
                 return Some((p, 4, Vec::new()));
             }
@@ -14415,10 +14409,10 @@ fn sidebar_push(c: &Arc<Client>) {
         .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default();
     if let Ok(mut w) = c.sock.lock() {
-        let _ = send_packet(&mut *w, 0x5e, oc);
-        let _ = send_packet(&mut *w, 0x57, dp);
+        let _ = send_packet(&mut w, 0x5e, oc);
+        let _ = send_packet(&mut w, 0x57, dp);
         for (n, v) in scores_list {
-            let _ = send_packet(&mut *w, 0x61, score_pkt(&n, &obj, v));
+            let _ = send_packet(&mut w, 0x61, score_pkt(&n, &obj, v));
         }
     }
 }
@@ -14466,8 +14460,8 @@ fn pred_eval(body: &str, ctx: &CmdCtx, depth: usize) -> bool {
                 .map(|n| n as f64 / 100.0)
                 .or_else(|| jstr(b, "chance").and_then(|x| x.parse::<f64>().ok()))
                 .unwrap_or(0.0);
-            let h = (ctx.x.to_bits() as u64).wrapping_mul(2862933555777941757)
-                ^ (ctx.z.to_bits() as u64).wrapping_mul(3202034522624059733)
+            let h = ctx.x.to_bits().wrapping_mul(2862933555777941757)
+                ^ ctx.z.to_bits().wrapping_mul(3202034522624059733)
                 ^ TICK.load(Ordering::Relaxed);
             (h % 10000) as f64 / 10000.0 < c
         }
@@ -15424,7 +15418,7 @@ fn send_attrs(c: &Arc<Client>) {
     }
     let p = attrs_pkt(c.eid, &m);
     if let Ok(mut w) = c.sock.lock() {
-        let _ = send_packet(&mut *w, 0x75, p);
+        let _ = send_packet(&mut w, 0x75, p);
     }
 }
 fn adv_prog() -> &'static Mutex<HashMap<String, HashMap<String, HashSet<String>>>> {
@@ -15700,7 +15694,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 for t in &targets {
                     if let Some(c) = cls.iter().find(|c| c.eid.to_string() == *t) {
                         { let mut p = c.pos.lock().unwrap(); *p = (x, y, z, p.3, p.4, true); }
-                        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x40, teleport_pkt(x, y, z, 0.0, 0.0, 100)); }
+                        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x40, teleport_pkt(x, y, z, 0.0, 0.0, 100)); }
                         n += 1;
                     }
                 }
@@ -15757,7 +15751,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     let cls: Vec<Arc<Client>> = client_snapshot();
                     if let Some(c) = cls.iter().find(|c| c.eid == eid) {
                         *c.hp.lock().unwrap() = 0.0;
-                        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(0.0, c)); }
+                        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(0.0, c)); }
                         killed += 1;
                     }
                 }
@@ -15786,8 +15780,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     let mut g = vec![3u8]; g.extend_from_slice(&v.to_be_bytes());
                     let mut ab = vec![flags]; ab.extend_from_slice(&0.05f32.to_be_bytes()); ab.extend_from_slice(&0.1f32.to_be_bytes());
                     if let Ok(mut w) = c.sock.lock() {
-                        let _ = send_packet(&mut *w, 0x22, g);
-                        let _ = send_packet(&mut *w, 0x38, ab);
+                        let _ = send_packet(&mut w, 0x22, g);
+                        let _ = send_packet(&mut w, 0x38, ab);
                     }
                     format!("Set {}'s gamemode to {}", c.name, gm)
                 }
@@ -15843,7 +15837,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         q.extend_from_slice(&slot_wire(&(it2, c2, _cc)));
                     }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x13, q); }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x13, q); }
                 }
             }
             format!("Cleared {} item(s)", removed)
@@ -15876,14 +15870,14 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                                 // instant effects apply once, not stored
                                 5 => { let mut h = c.hp.lock().unwrap();
                                     *h = (*h + 4.0 * (amp + 1) as f32).min(20.0);
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*h, c)); } }
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
                                 6 => { let mut h = c.hp.lock().unwrap();
                                     *h = (*h - 6.0 * (amp + 1) as f32).max(0.0);
                                     if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); }
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*h, c)); } }
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*h, c)); } }
                                 22 => { let mut f = c.food.lock().unwrap();
                                     *f = (*f + amp + 1).min(20); drop(f);
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c)); } }
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(*c.hp.lock().unwrap(), c)); } }
                                 _ => {
                                     let ticks = secs * TICKS_PER_SECOND as i32; // server ticks
                                     { let mut ef = c.effs.lock().unwrap();
@@ -15915,10 +15909,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             };
             // send outside any clients() lock
             for (c, pk) in &fx {
-                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x76, pk.clone()); }
+                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x76, pk.clone()); }
             }
             for (c, pk) in &rx {
-                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x43, pk.clone()); }
+                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x43, pk.clone()); }
             }
             for (_c, pk) in &fx { broadcast_seen(_c.eid, |_o| (0x76, pk.clone())); }
             for (_c, pk) in &rx { broadcast_seen(_c.eid, |_o| (0x43, pk.clone())); }
@@ -15960,7 +15954,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     p.extend_from_slice(&bar.to_be_bytes());
                     write_varint(&mut p, lvl as i64);
                     write_varint(&mut p, total);
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5c, p); }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5c, p); }
                     touched += 1;
                 }
             }
@@ -15981,7 +15975,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 if args[0] == "tnt" {
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                     primed().lock().unwrap().push(Primed { eid, x, y, z, left: server_ticks(TNT_FUSE_GT) as i32 });
-                    format!("Summoned tnt")
+                    "Summoned tnt".to_string()
                 } else {
                     let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
                         etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(20.0),
@@ -16031,7 +16025,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     let mut p = vec![0u8]; write_varint(&mut p, 0);
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); }
                     gave += 1;
                 }
                 }
@@ -16092,9 +16086,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     "armor.head" => 5, "armor.chest" => 6,
                     "armor.legs" => 7, "armor.feet" => 8,
                     _ => {
-                        if let Some(n) = sp.strip_prefix("hotbar.").or_else(|| sp.strip_prefix("inventory.")).or_else(|| sp.strip_prefix("container.")) {
+                        {
+                            let n = sp.strip_prefix("hotbar.").or_else(|| sp.strip_prefix("inventory.")).or_else(|| sp.strip_prefix("container."))?;
                             n.parse::<i16>().ok().map(|x| 9 + x)?
-                        } else { return None }
+                        }
                     }
                 })
             };
@@ -16138,7 +16133,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                                     let mut p = vec![0u8]; write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&(item, cnt, comps.clone())));
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); }
                                 }
                                 done += 1;
                             }
@@ -16185,7 +16180,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                                 {   let mut p = vec![0u8]; write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&ns));
-                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); } }
+                                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x15, p); } }
                             }
                         }
                         format!("Modified item on {} target(s)", done)
@@ -16198,7 +16193,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         let mut ch = chests().lock().unwrap();
                         let ok = ch.get_mut(&(bx, by, bz)).and_then(|m| m.get_mut(&cslot))
                             .map(|st| { apply_loot_funcs(st, &fns); }).is_some();
-                        format!("{}", if ok { "Modified item".to_string() } else { "No item in slot".to_string() })
+                        (if ok { "Modified item".to_string() } else { "No item in slot".to_string() }).to_string()
                     } else { "usage: /item modify entity|block ... <modifier>".into() }
                 }
                 _ => "usage: /item modify|replace ...".into(),
@@ -16272,7 +16267,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     p2.extend_from_slice(&1.0f32.to_be_bytes());
                     p2.extend_from_slice(&1.0f32.to_be_bytes());
                     p2.extend_from_slice(&0i64.to_be_bytes()); // seed
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x68, p2); n += 1; }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x68, p2); n += 1; }
                 }
             }
             format!("Played sound to {} player(s)", n)
@@ -16292,7 +16287,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 let mut n = 0;
                 for e in &targets {
                     if let Some(c2) = { clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned() } {
-                        if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut *w, 0x66, p.clone()); n += 1; }
+                        if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, 0x66, p.clone()); n += 1; }
                     }
                 }
                 return format!("Set title times for {} player(s)", n);
@@ -16305,7 +16300,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let mut n = 0;
             for e in &targets {
                 if let Some(c2) = { clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned() } {
-                    if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut *w, pkt_id, payload.clone()); n += 1; }
+                    if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, pkt_id, payload.clone()); n += 1; }
                 }
             }
             format!("Title {} to {} player(s)", mode, n)
@@ -16336,7 +16331,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
         "trigger" => {
             // /trigger <obj> [set <v>|add <v>] — requires trigger-type + enabled
             let obj = args.first().copied().unwrap_or("");
-            let Some(pname) = (if let Some(c) = me { Some(c.name.clone()) } else { None }) else {
+            let Some(pname) = me.map(|c| c.name.clone()) else {
                 return "trigger: player only".into() };
             let is_trig = obj_types().lock().unwrap().get(obj).map(|t| t == "trigger").unwrap_or(false);
             if !is_trig { return format!("Cannot trigger '{}'", obj) }
@@ -16397,7 +16392,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             for e in &targets {
                 if let Some(c) = { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned() } {
                     let mut p = payload.clone(); p.push(0);
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x6c, p); n += 1; }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6c, p); n += 1; }
                 }
             }
             format!("Sent to {} player(s)", n)
@@ -16414,7 +16409,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     else { p.push(2u8);
                         let sn = if snd.contains(':') { snd.to_string() } else { format!("minecraft:{}", snd) };
                         write_str(&mut p, &sn); }
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x6a, p); n += 1; }
+                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6a, p); n += 1; }
                 }
             }
             format!("Stopped sound for {} player(s)", n)
@@ -16724,8 +16719,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     let hh = *h; drop(h);
                     damage_armor(c, amt);
                     if let Ok(mut w) = c.sock.lock() {
-                        let _ = send_packet(&mut *w, 0x24, hurt_anim(c.eid));
-                        let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, c));
+                        let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
+                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
                     }
                     n += 1;
                 }
@@ -16751,7 +16746,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
         }
         "schedule" => {
             // schedule function <fn> <time>[t|s|d] — t=game ticks(20/s), s=seconds
-            if args.get(0).copied() == Some("function") && args.len() >= 3 {
+            if args.first().copied() == Some("function") && args.len() >= 3 {
                 let f = args[1];
                 let (num, mult) = args[2].strip_suffix('t').map(|n| (n, 1.0f64))
                     .or_else(|| args[2].strip_suffix('s').map(|n| (n, 4.0)))
@@ -16759,8 +16754,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     .unwrap_or((args[2], 4.0));
                 let off = (num.parse::<f64>().unwrap_or(1.0) * mult) as u64;
                 let t2 = TICK.load(Ordering::Relaxed);
-                sched_fns().lock().unwrap().push((f.to_string(), t2 + off.max(1) as u64));
-                format!("Scheduled function '{}' in {} ticks", f, off.max(1) as u64)
+                sched_fns().lock().unwrap().push((f.to_string(), t2 + off.max(1)));
+                format!("Scheduled function '{}' in {} ticks", f, { off.max(1) })
             } else { "usage: /schedule function <fn> <time>[t|s|d]".into() }
         }
         "counts" => {
@@ -16776,7 +16771,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
         }
                 "player" => {
             // carpet-actor subset: spawn / look at / attack|use continuous / stop / kill
-            let name = args.get(0).copied().unwrap_or("").to_string();
+            let name = args.first().copied().unwrap_or("").to_string();
             let sub = args.get(1).copied().unwrap_or("");
             match sub {
                 "spawn" => {
@@ -17267,10 +17262,10 @@ fn handle(mut s: TcpStream) {
             // tab-list info is global (vanilla keeps it world-wide);
             // the ENTITY spawn is interest-gated — the sweep sends it
             // only once the other player enters visible range.
-            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x3e, player_info_add(c));
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x3e, player_info_add(c));
             let pi = player_info_add(&me);
             if let Ok(mut w) = c.sock.lock() {
-                let _ = send_packet(&mut *w, 0x3e, pi.clone());
+                let _ = send_packet(&mut w, 0x3e, pi.clone());
             }
         }
         cls.push(me.clone());
@@ -17291,7 +17286,7 @@ fn handle(mut s: TcpStream) {
             write_varint(&mut p, 0);
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(st));
-            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
         }
     }
     {
@@ -17313,7 +17308,7 @@ fn handle(mut s: TcpStream) {
         if last_ka.elapsed() > Duration::from_secs(8) {
             let mut ka = Vec::new();
             ka.extend_from_slice(&1i64.to_be_bytes());
-            if send_packet(&mut *me.sock.lock().unwrap(), 0x26, ka).is_err() {
+            if send_packet(&mut me.sock.lock().unwrap(), 0x26, ka).is_err() {
                 break 'conn;
             }
             last_ka = Instant::now();
@@ -17361,7 +17356,7 @@ fn handle(mut s: TcpStream) {
                 let mut gen = me.gen_sources.lock().unwrap();
                 // the pump: no centre announcement, this is the same window
                 stream_chunks(
-                    &mut *me.sock.lock().unwrap(),
+                    &mut me.sock.lock().unwrap(),
                     &mut ch,
                     &mut gen,
                     &mut ack,
@@ -17384,7 +17379,7 @@ fn handle(mut s: TcpStream) {
                     let mut chunks = me.chunks.lock().unwrap();
                     let mut gen = me.gen_sources.lock().unwrap();
                     stream_chunks(
-                        &mut *me.sock.lock().unwrap(),
+                        &mut me.sock.lock().unwrap(),
                         &mut chunks,
                         &mut gen,
                         &mut ack,
@@ -17429,7 +17424,7 @@ fn handle(mut s: TcpStream) {
                             let mut ch = me.chunks.lock().unwrap();
                             let mut gen = me.gen_sources.lock().unwrap();
                             stream_chunks(
-                                &mut *me.sock.lock().unwrap(),
+                                &mut me.sock.lock().unwrap(),
                                 &mut ch,
                                 &mut gen,
                                 &mut ack,
@@ -17491,7 +17486,7 @@ fn handle(mut s: TcpStream) {
                         write_varint(&mut p, me.eid as i64);
                         p.push(0);
                         p.push(0);
-                        p.push((sneak as u8) * 2 | (sprint as u8) * 8 | (glide as u8) * 0x80);
+                        p.push(((sneak as u8) * 2) | ((sprint as u8) * 8) | ((glide as u8) * 0x80));
                         p.push(6);
                         write_varint(&mut p, 21);
                         write_varint(
@@ -17685,7 +17680,7 @@ fn handle(mut s: TcpStream) {
                                 let inv = me.inv.lock().unwrap().get(&asl).cloned();
                                 let mut p = vec![4u8];
                                 write_varint(&mut p, 0);
-                                p.extend_from_slice(&(36i16 + held_slot as i16).to_be_bytes());
+                                p.extend_from_slice(&(36i16 + held_slot).to_be_bytes());
                                 let held_now = {
                                     let i2 = me.inv.lock().unwrap();
                                     i2.get(&(36 + held_slot))
@@ -17693,13 +17688,13 @@ fn handle(mut s: TcpStream) {
                                         .unwrap_or((0, 0, Vec::new()))
                                 };
                                 p.extend_from_slice(&slot_wire(&held_now));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                 let mut p2 = vec![4u8];
                                 write_varint(&mut p2, 0);
                                 p2.extend_from_slice(&asl.to_be_bytes());
                                 let iv = inv.unwrap_or((0, 0, Vec::new()));
                                 p2.extend_from_slice(&slot_wire(&iv));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p2);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p2);
                             }
                         }
                         if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= 0.1 {
@@ -17816,7 +17811,7 @@ fn handle(mut s: TcpStream) {
                                 ));
                                 p.extend_from_slice(&slot_wire(&now));
                                 if let Ok(mut w) = me.sock.lock() {
-                                    let _ = send_packet(&mut *w, 0x15, p);
+                                    let _ = send_packet(&mut w, 0x15, p);
                                 }
                             }
                         }
@@ -17972,7 +17967,7 @@ fn handle(mut s: TcpStream) {
                         }
                     }
                 }
-                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
             }
             0x38 => {
                 // block_place
@@ -18014,7 +18009,7 @@ fn handle(mut s: TcpStream) {
                         z as f64 + 0.5 - pz,
                     );
                     if rx * rx + ry * ry + rz * rz > reach * reach {
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                 }
@@ -18027,8 +18022,8 @@ fn handle(mut s: TcpStream) {
                     let mut op = Vec::new();
                     write_pos(&mut op, x, y, z);
                     op.push(1);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x34, op);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x34, op);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // chest: open container instead of placing
@@ -18049,8 +18044,8 @@ fn handle(mut s: TcpStream) {
                     };
                     *me.open_chest.lock().unwrap() = Some((a, b));
                     let inv = me.inv.lock().unwrap().clone();
-                    open_chest_window(&mut *me.sock.lock().unwrap(), a, b, &inv, kind);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    open_chest_window(&mut me.sock.lock().unwrap(), a, b, &inv, kind);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // ender chest: per-player shared storage (synthetic key, not world pos)
@@ -18059,13 +18054,13 @@ fn handle(mut s: TcpStream) {
                     *me.open_chest.lock().unwrap() = Some((key, None));
                     let inv = me.inv.lock().unwrap().clone();
                     open_chest_window(
-                        &mut *me.sock.lock().unwrap(),
+                        &mut me.sock.lock().unwrap(),
                         key,
                         None,
                         &inv,
                         "Ender Chest",
                     );
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // flint & steel on TNT -> ignite
@@ -18089,7 +18084,7 @@ fn handle(mut s: TcpStream) {
                         z: z as f64 + 0.5,
                         left: server_ticks(TNT_FUSE_GT) as i32,
                     });
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 if block_at(x, y, z) == name_to_state("crafting_table").unwrap_or(u32::MAX) {
@@ -18098,7 +18093,7 @@ fn handle(mut s: TcpStream) {
                     write_varint(&mut p, 3); // windowId 3
                     write_varint(&mut p, 12); // crafting menu
                     p.extend_from_slice(&chat_nbt("Crafting"));
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x33, p);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x33, p);
                     let mut q = vec![3u8];
                     write_varint(&mut q, 0);
                     write_varint(&mut q, 46);
@@ -18106,7 +18101,7 @@ fn handle(mut s: TcpStream) {
                         q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
                     }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x13, q);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, q);
                     // now fill: grid empty, inv slots
                     let inv = me.inv.lock().unwrap().clone();
                     let mut r = vec![3u8];
@@ -18121,15 +18116,15 @@ fn handle(mut s: TcpStream) {
                         r.extend_from_slice(&slot_wire(&(it, c, _cc)));
                     }
                     r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x13, r);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, r);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 if block_at(x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
                     *me.open_furnace.lock().unwrap() = Some((x, y, z));
                     let inv = me.inv.lock().unwrap().clone();
-                    open_furnace_window(&mut *me.sock.lock().unwrap(), (x, y, z), &inv);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    open_furnace_window(&mut me.sock.lock().unwrap(), (x, y, z), &inv);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // buckets: empty fills from source; filled places liquid
@@ -18160,8 +18155,8 @@ fn handle(mut s: TcpStream) {
                         write_varint(&mut p, 0);
                         p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                         p.extend_from_slice(&slot_wire(&(i2, c2, _cc)));
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                     let replaceable = matches!(
@@ -18179,27 +18174,27 @@ fn handle(mut s: TcpStream) {
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(908, 1, Vec::new())));
-                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                         }
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                 }
                 // bed: right-click at night skips to morning
                 if (1688..=1943).contains(&block_at(x, y, z)) {
                     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
-                    if wt >= 13000 && wt <= 23500 {
+                    if (13000..=23500).contains(&wt) {
                         WORLD_TIME.store(0, Ordering::Relaxed);
                         *me.spawn_pt.lock().unwrap() =
                             Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5));
                         let mut sp = Vec::new();
                         write_pos(&mut sp, x, y, z);
                         sp.extend_from_slice(&0.0f32.to_be_bytes());
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x56, sp);
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x56, sp);
                         let line = system_chat(&format!("{} slept through the night", me.name));
                         broadcast(-1, |_c| (0x6c, line.clone()));
                     }
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // door toggle: flip open bit on both halves
@@ -18211,7 +18206,7 @@ fn handle(mut s: TcpStream) {
                             note_block_update(x, y + dy, z, st ^ 2);
                         }
                     }
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // lever toggle: flip powered bit, then update neighbors
@@ -18222,7 +18217,7 @@ fn handle(mut s: TcpStream) {
                     note_block_update(x, y, z, nst);
                     let powered = (nst - 5626) & 1 == 0;
                     redstone_update(x, y, z, powered);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // fence gate toggle (open bit = stride 2)
@@ -18230,7 +18225,7 @@ fn handle(mut s: TcpStream) {
                     let st = block_at(x, y, z);
                     set_block(x, y, z, st ^ 2);
                     note_block_update(x, y, z, st ^ 2);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // hotbar slots are window slots 36..=44
@@ -18266,9 +18261,9 @@ fn handle(mut s: TcpStream) {
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                         }
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                 }
@@ -18280,7 +18275,7 @@ fn handle(mut s: TcpStream) {
                         let fm = name_to_state("farmland").unwrap_or(0);
                         set_block(x, y, z, fm);
                         note_block_update(x, y, z, fm);
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                     // wheat seeds on farmland -> wheat age0 + consume seed
@@ -18308,9 +18303,9 @@ fn handle(mut s: TcpStream) {
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                         }
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                 }
@@ -18326,15 +18321,15 @@ fn handle(mut s: TcpStream) {
                         let mut op = Vec::new();
                         write_pos(&mut op, tx, ty, tz);
                         op.push(1);
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x34, op);
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x34, op);
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
                     if let Some(st) = item_to_state(item) {
                         place_block(tx, ty, tz, st);
                     }
                 }
-                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
             }
             0x36 => {
                 // arm_animation: relay swing to others
@@ -18376,7 +18371,7 @@ fn handle(mut s: TcpStream) {
                     }
                     let line = format!("<{}> {}", me.name, m);
                     let pl = system_chat(&line);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x6c, pl.clone());
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x6c, pl.clone());
                     broadcast(me.eid, |_c| (0x6c, pl.clone()));
                 }
             }
@@ -18398,9 +18393,9 @@ fn handle(mut s: TcpStream) {
                             .cloned()
                     };
                     let tp = vt
-                        .and_then(|v| {
+                        .map(|v| {
                             let p = *v.pos.lock().unwrap();
-                            Some((p.0, p.1, p.2))
+                            (p.0, p.1, p.2)
                         })
                         .or_else(|| {
                             let ms = mobs().lock().unwrap();
@@ -18498,7 +18493,7 @@ fn handle(mut s: TcpStream) {
                             write_varint(&mut p, 0);
                             p.extend_from_slice(&k.to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it2, c2, _c2)));
-                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                             continue;
                         }
                     }
@@ -18533,7 +18528,7 @@ fn handle(mut s: TcpStream) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&k.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                             }
                             continue;
                         }
@@ -18545,8 +18540,8 @@ fn handle(mut s: TcpStream) {
                         write_varint(&mut p, 4); // windowId 4
                         write_varint(&mut p, 19); // merchant menu
                         p.extend_from_slice(&chat_nbt("Villager"));
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x33, p);
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x2d, trade_list_pkt(4));
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x33, p);
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x2d, trade_list_pkt(4));
                         // window items: 3 trade slots + inv (wslot 3..39 -> inv 9..44)
                         let inv = me.inv.lock().unwrap().clone();
                         let mut q = vec![4u8];
@@ -18561,7 +18556,7 @@ fn handle(mut s: TcpStream) {
                             q.extend_from_slice(&slot_wire(&(it, c, _cc)));
                         }
                         q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x13, q);
+                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, q);
                         continue;
                     }
                 }
@@ -18707,8 +18702,8 @@ fn handle(mut s: TcpStream) {
                                     }
                                     held_slot_resync(&me);
                                     if let Ok(mut w) = v.sock.lock() {
-                                        let _ = send_packet(&mut *w, 0x24, hurt_anim(v.eid));
-                                        let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, v));
+                                        let _ = send_packet(&mut w, 0x24, hurt_anim(v.eid));
+                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, v));
                                     }
                                     let (pp, vp) = (
                                         {
@@ -18731,7 +18726,7 @@ fn handle(mut s: TcpStream) {
                                         (kz * 3000.0) as i16,
                                     );
                                     if let Ok(mut w) = v.sock.lock() {
-                                        let _ = send_packet(&mut *w, 0x5a, vel.clone());
+                                        let _ = send_packet(&mut w, 0x5a, vel.clone());
                                     }
                                     found = Some((v.eid, v.name.clone(), hh));
                                 }
@@ -18839,7 +18834,7 @@ fn handle(mut s: TcpStream) {
                                 if sw > 0 && charge >= 0.9 {
                                     let (mx0, my0, mz0, ..) = *m.pos.lock().unwrap();
                                     let others: Vec<Arc<Mob>> =
-                                        ms.iter().cloned().filter(|o| o.eid != m.eid).collect();
+                                        ms.iter().filter(|&o| o.eid != m.eid).cloned().collect();
                                     for o in others {
                                         let (ox, oy, oz, ..) = {
                                             let p = o.pos.lock().unwrap();
@@ -18880,7 +18875,7 @@ fn handle(mut s: TcpStream) {
                                 }
                                 let ha = hurt_anim(m.eid);
                                 let _ =
-                                    send_packet(&mut *me.sock.lock().unwrap(), 0x24, ha.clone());
+                                    send_packet(&mut me.sock.lock().unwrap(), 0x24, ha.clone());
                                 broadcast_seen_ex(me.eid, me.eid, |_c| (0x24, ha.clone()));
                                 // knockback away from attacker
                                 let (pp, mp) = (
@@ -19072,7 +19067,7 @@ fn handle(mut s: TcpStream) {
                     }
                     let mut rp = spawn_info();
                     rp.push(0);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x47, rp);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x47, rp);
                     let (rx, ry, rz) = me
                         .spawn_pt
                         .lock()
@@ -19092,7 +19087,7 @@ fn handle(mut s: TcpStream) {
                     ps.extend_from_slice(&0f32.to_be_bytes());
                     ps.push(0);
                     write_varint(&mut ps, 2);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x40, ps);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x40, ps);
                     *me.food.lock().unwrap() = 20;
                     *me.sat.lock().unwrap() = 5.0;
                     {
@@ -19100,7 +19095,7 @@ fn handle(mut s: TcpStream) {
                         *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
                     }
                     let _ = send_packet(
-                        &mut *me.sock.lock().unwrap(),
+                        &mut me.sock.lock().unwrap(),
                         0x5d,
                         health_pkt_c(max_hp_of(&me.name), &me),
                     );
@@ -19118,7 +19113,7 @@ fn handle(mut s: TcpStream) {
                         }
                     }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x13, q);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x13, q);
                 }
             }
             0x2b => {
@@ -19167,7 +19162,7 @@ fn handle(mut s: TcpStream) {
                     write_varint(&mut p, 0);
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                 }
             }
             0x2d => {
@@ -19205,7 +19200,7 @@ fn handle(mut s: TcpStream) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&wsl.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&(it, c, _sc)));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                             }
                             for (wsl, it, c) in [
                                 (0i16, ai, ac),
@@ -19220,7 +19215,7 @@ fn handle(mut s: TcpStream) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&wsl.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&(it, c, Vec::new())));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                             }
                         } else {
                             drop(inv);
@@ -19230,7 +19225,7 @@ fn handle(mut s: TcpStream) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&wsl.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                             }
                         }
                     }
@@ -19249,7 +19244,7 @@ fn handle(mut s: TcpStream) {
                     // vanilla containerMenu.removed: the carried stack is
                     // thrown into the world, crafting grid goes back to inv
                     let cur =
-                        std::mem::replace(&mut *me.cursor.lock().unwrap(), (0, 0, Vec::new()));
+                        std::mem::take(&mut *me.cursor.lock().unwrap());
                     if cur.1 > 0 {
                         let (px, py, pz, ..) = *me.pos.lock().unwrap();
                         drops().lock().unwrap().push(Drop {
@@ -19290,9 +19285,9 @@ fn handle(mut s: TcpStream) {
                 *me.open_merchant.lock().unwrap() = false;
                 *me.trade_sel.lock().unwrap() = -1;
             }
-            0x0e => {
+            0x0e
                 // window_click: window u8, stateId varint, slot i16, button i8, mode varint, ...
-                if b.len() >= 6 {
+                if b.len() >= 6 => {
                     let mut sl = &b[..];
                     let _wid = sl[0];
                     sl = &sl[1..];
@@ -19400,7 +19395,7 @@ fn handle(mut s: TcpStream) {
                                     write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&(it, c2, _cc)));
-                                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                 }
                                 continue;
                             }
@@ -19446,7 +19441,7 @@ fn handle(mut s: TcpStream) {
                                         };
                                         drops().lock().unwrap().push(d);
                                     }
-                                } else if slot >= 0 && slot < 39 {
+                                } else if (0..39).contains(&slot) {
                                     if slot == 2 {
                                         // output: take only, merge onto cursor
                                         if f.output.1 > 0
@@ -19532,7 +19527,7 @@ fn handle(mut s: TcpStream) {
                                         write_varint(&mut p, 0);
                                         p.extend_from_slice(&wsl.to_be_bytes());
                                         p.extend_from_slice(&slot_wire(&st));
-                                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                     }
                                     if slot >= 3 {
                                         let (it, c, _cc) = inv
@@ -19543,7 +19538,7 @@ fn handle(mut s: TcpStream) {
                                         write_varint(&mut p, 0);
                                         p.extend_from_slice(&slot.to_be_bytes());
                                         p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                        let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                     }
                                 }
                                 continue;
@@ -19626,7 +19621,7 @@ fn handle(mut s: TcpStream) {
                                             p.extend_from_slice(&wsl.to_be_bytes());
                                             p.extend_from_slice(&slot_wire(&(it, c, _sc)));
                                             let _ =
-                                                send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                                send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                         }
                                         let out2 = if mi2[0].0 == ai && mi2[0].1 >= ac && can2 {
                                             (cc, ci)
@@ -19650,10 +19645,10 @@ fn handle(mut s: TcpStream) {
                                             p.extend_from_slice(&wsl.to_be_bytes());
                                             p.extend_from_slice(&slot_wire(&stx));
                                             let _ =
-                                                send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                                send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                         }
                                     }
-                                } else if slot >= 3 && slot <= 38 {
+                                } else if (3..=38).contains(&slot) {
                                     let mut inv = me.inv.lock().unwrap();
                                     let mut cur = me.cursor.lock().unwrap();
                                     click_slot(&mut inv, &mut cur, slot + 6, btn as i8);
@@ -19665,7 +19660,7 @@ fn handle(mut s: TcpStream) {
                                     write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                 }
                                 continue;
                             }
@@ -19725,7 +19720,7 @@ fn handle(mut s: TcpStream) {
                                     }
                                 } else if (1..=9).contains(&slot) {
                                     click_slot(&mut grid, &mut cur, slot, btn as i8);
-                                } else if slot >= 10 && slot <= 45 {
+                                } else if (10..=45).contains(&slot) {
                                     click_slot(&mut inv, &mut cur, slot - 1, btn as i8);
                                     *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
                                 }
@@ -19748,13 +19743,13 @@ fn handle(mut s: TcpStream) {
                                     write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&(it, c, _ce)));
-                                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                 }
                                 let mut p0 = vec![3u8];
                                 write_varint(&mut p0, 0);
                                 p0.extend_from_slice(&0i16.to_be_bytes());
                                 p0.extend_from_slice(&slot_wire(&(out.0, out.1, Vec::new())));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p0);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p0);
                                 continue;
                             }
                             if slot == -999 {
@@ -19816,7 +19811,7 @@ fn handle(mut s: TcpStream) {
                                             p.extend_from_slice(&i.to_be_bytes());
                                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
                                             let _ =
-                                                send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                                send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                         }
                                     }
                                 }
@@ -19832,12 +19827,12 @@ fn handle(mut s: TcpStream) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&slot.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&ns.unwrap_or((0, 0, Vec::new()))));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                 let mut p0 = vec![0u8];
                                 write_varint(&mut p0, 0);
                                 p0.extend_from_slice(&0i16.to_be_bytes());
                                 p0.extend_from_slice(&slot_wire(&(out.0, out.1, Vec::new())));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p0);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p0);
                             } else if (5..=8).contains(&slot) || slot == 45 {
                                 // armor + offhand: vanilla restricts armor
                                 // slots to their matching piece type
@@ -19898,13 +19893,13 @@ fn handle(mut s: TcpStream) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&slot.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&ns.unwrap_or((0, 0, Vec::new()))));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                                 let mut pc = vec![0u8];
                                 write_varint(&mut pc, 0);
                                 pc.extend_from_slice(&(-1i16).to_be_bytes());
                                 pc.extend_from_slice(&slot_wire(&cp));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, pc);
-                            } else if slot >= 9 && slot <= 44 {
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, pc);
+                            } else if (9..=44).contains(&slot) {
                                 let mut inv = me.inv.lock().unwrap();
                                 let mut cur = me.cursor.lock().unwrap();
                                 click_slot(&mut inv, &mut cur, slot, btn as i8);
@@ -19916,7 +19911,7 @@ fn handle(mut s: TcpStream) {
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&slot.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&ns.unwrap_or((0, 0, Vec::new()))));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                             }
                         } else if mode == 2 {
                             // number-key swap: hovered slot <-> hotbar slot btn (0-8)
@@ -19990,7 +19985,7 @@ fn handle(mut s: TcpStream) {
                                     }
                                 } else if let Some(fp) = furnace_pos {
                                     let mut fs = furnaces().lock().unwrap();
-                                    if slot >= 0 && slot < 39 {
+                                    if (0..39).contains(&slot) {
                                         let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
                                         if slot >= 3 {
                                             let g = slot + 6;
@@ -20017,10 +20012,7 @@ fn handle(mut s: TcpStream) {
                                             if slot == 2 {
                                                 // output is take-only — push it to hotbar, don't swap in
                                                 if f.output.1 > 0 {
-                                                    let st = std::mem::replace(
-                                                        &mut f.output,
-                                                        (0, 0, Vec::new()),
-                                                    );
+                                                    let st = std::mem::take(&mut f.output);
                                                     f.dirty = true;
                                                     let (px, py, pz, ..) = {
                                                         let p = me.pos.lock().unwrap();
@@ -20038,7 +20030,7 @@ fn handle(mut s: TcpStream) {
                                                 } else {
                                                     &mut f.fuel
                                                 };
-                                                let sst = std::mem::replace(m, (0, 0, Vec::new()));
+                                                let sst = std::mem::take(m);
                                                 if hst.1 > 0 {
                                                     *m = hst.clone();
                                                 }
@@ -20132,7 +20124,7 @@ fn handle(mut s: TcpStream) {
                             pc.extend_from_slice(&(-1i16).to_be_bytes());
                             pc.extend_from_slice(&slot_wire(&cp2));
                             if let Ok(mut w) = me.sock.lock() {
-                                let _ = send_packet(&mut *w, 0x15, pc);
+                                let _ = send_packet(&mut w, 0x15, pc);
                             }
                         } else if mode == 5 {
                             // drag-paint: btn 0/4 start (left/right), 1/5 add slot, 2/6 end
@@ -20148,8 +20140,8 @@ fn handle(mut s: TcpStream) {
                                         dr.1.push(slot);
                                     }
                                 }
-                                2 | 6 => {
-                                    if dr.0 >= 0 && dr.0 + 2 == bt {
+                                2 | 6
+                                    if dr.0 >= 0 && dr.0 + 2 == bt => {
                                         let slots_taken = std::mem::take(&mut dr.1);
                                         dr.0 = -1;
                                         drop(dr);
@@ -20165,7 +20157,6 @@ fn handle(mut s: TcpStream) {
                                             }
                                         }
                                     }
-                                }
                                 _ => {}
                             }
                         } else if mode == 4 || mode == 1 {
@@ -20248,7 +20239,6 @@ fn handle(mut s: TcpStream) {
                                                     if let Some(c2) = m.get_mut(&i) {
                                                         if c2.0 == rem.0 && c2.2 == rem.2 {
                                                             let room = (item_stack_max(c2.0, &c2.2)
-                                                                as i64
                                                                 - c2.1 as i64)
                                                                 .max(0)
                                                                 as u8;
@@ -20265,8 +20255,8 @@ fn handle(mut s: TcpStream) {
                                                 }
                                                 let m = all.entry(pos).or_default();
                                                 for i in 0..27i16 {
-                                                    if !m.contains_key(&i) {
-                                                        m.insert(i, rem.clone());
+                                                    if let std::collections::hash_map::Entry::Vacant(e) = m.entry(i) {
+                                                        e.insert(rem.clone());
                                                         rem.1 = 0;
                                                         break;
                                                     }
@@ -20303,7 +20293,7 @@ fn handle(mut s: TcpStream) {
                                 // window: 0 input,1 fuel,2 output | 3..38 inv(key=slot+6)
                                 let mut fs = furnaces().lock().unwrap();
                                 let mut inv = me.inv.lock().unwrap();
-                                if slot >= 0 && slot < 39 {
+                                if (0..39).contains(&slot) {
                                     if mode == 4 {
                                         if slot >= 3 {
                                             if let Some(st) = map_take(
@@ -20364,10 +20354,7 @@ fn handle(mut s: TcpStream) {
                                             fuel_cache: CachedLookup::default(),
                                         });
                                         if f.output.1 > 0 {
-                                            let st = std::mem::replace(
-                                                &mut f.output,
-                                                (0, 0, Vec::new()),
-                                            );
+                                            let st = std::mem::take(&mut f.output);
                                             f.dirty = true;
                                             let (px, py, pz, ..) = {
                                                 let p = me.pos.lock().unwrap();
@@ -20394,7 +20381,7 @@ fn handle(mut s: TcpStream) {
                                         });
                                         let m = if slot == 0 { &mut f.input } else { &mut f.fuel };
                                         if m.1 > 0 {
-                                            let st = std::mem::replace(m, (0, 0, Vec::new()));
+                                            let st = std::mem::take(m);
                                             f.dirty = true;
                                             let rem = map_add_range(&mut inv, 9, 44, st);
                                             if rem.1 > 0 {
@@ -20440,7 +20427,7 @@ fn handle(mut s: TcpStream) {
                                                             < item_stack_max(m.0, &m.2));
                                                 if fits {
                                                     inv.remove(&(slot + 6));
-                                                    let room = (item_stack_max(st.0, &st.2) as i64)
+                                                    let room = item_stack_max(st.0, &st.2)
                                                         .min(255)
                                                         as u8;
                                                     let t = if m.1 == 0 {
@@ -20572,7 +20559,6 @@ fn handle(mut s: TcpStream) {
                         }
                     }
                 }
-            }
             _ => {}
         }
         flush_block_updates();
@@ -20604,8 +20590,7 @@ fn handle(mut s: TcpStream) {
             // merchant inputs are placed back into the inventory (the
             // overflow falls on the ground as item entities)
             let mut back: Vec<Stack> = Vec::new();
-            let cur =
-                std::mem::replace(&mut *me_cleanup.cursor.lock().unwrap(), (0, 0, Vec::new()));
+            let cur = std::mem::take(&mut *me_cleanup.cursor.lock().unwrap());
             if cur.1 > 0 {
                 back.push(cur);
             }
@@ -20626,8 +20611,8 @@ fn handle(mut s: TcpStream) {
             for st in back {
                 // merge into matching stacks first, then first empty slot
                 let mut left = st.1 as i64;
-                let cap = item_stack_max(st.0, &st.2) as i64;
-                for (_, v) in inv.iter_mut() {
+                let cap = item_stack_max(st.0, &st.2);
+                for v in inv.values_mut() {
                     if left <= 0 {
                         break;
                     }
@@ -20698,7 +20683,7 @@ fn handle(mut s: TcpStream) {
 // usable item is activated in the air (bow draw, crossbow load, throws,
 // food, shield). seq is acked here; callers must not ack again.
 fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat_release: bool) {
-    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
+    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
     {
         let inv = me.inv.lock().unwrap();
         let main = inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0);
@@ -20738,7 +20723,11 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     let (fish, fcnt, fcomps) = table
                         .and_then(|p| roll_loot(&p).into_iter().next())
                         .unwrap_or((
-                            if (b.age as u64) % 5 == 0 { 936 } else { 935 },
+                            if (b.age as u64).is_multiple_of(5) {
+                                936
+                            } else {
+                                935
+                            },
                             1,
                             Vec::new(),
                         ));
@@ -20749,7 +20738,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     write_varint(&mut p, 0);
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&(fish, fcnt, fcomps)));
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
                 }
             } else {
                 let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
@@ -20784,7 +20773,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 write_varint(&mut cp, 993); // itemID
                 write_varint(&mut cp, 20); // cooldownTicks
                 if let Ok(mut w) = me.sock.lock() {
-                    let _ = send_packet(&mut *w, 0x17, cp);
+                    let _ = send_packet(&mut w, 0x17, cp);
                 }
             }
             drop(inv);
@@ -20818,7 +20807,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     }
                 }
                 drop(inv);
-                held_slot_resync(&me);
+                held_slot_resync(me);
             }
             return;
         }
@@ -20856,7 +20845,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     }
                 }
                 drop(inv2);
-                held_slot_resync(&me);
+                held_slot_resync(me);
             }
             return;
         }
@@ -20903,7 +20892,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 p.extend_from_slice(&asl.to_be_bytes());
                 p.extend_from_slice(&slot_wire(&st));
                 if let Ok(mut w) = me.sock.lock() {
-                    let _ = send_packet(&mut *w, 0x15, p);
+                    let _ = send_packet(&mut w, 0x15, p);
                 }
             }
             return;
@@ -20924,7 +20913,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             };
             for id in &gone {
                 let pk = remove_effect_pkt(me.eid, *id);
-                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x43, pk.clone());
+                let _ = send_packet(&mut me.sock.lock().unwrap(), 0x43, pk.clone());
                 broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
             }
             if *me.gm.lock().unwrap() != 1 {
@@ -20991,9 +20980,9 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 write_varint(&mut p, 0);
                 write_varint(&mut p, 0);
             }
-            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x15, p);
             let hh = *me.hp.lock().unwrap();
-            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, &me));
+            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, me));
             // vanilla food side-effects (golden apple, pufferfish, ...)
             for &(ch, eid2, amp, ticks) in food_effects(it) {
                 if (world_rng::next_u64() % 100) < ch {
@@ -21010,7 +20999,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                         *me.absorb.lock().unwrap() = (amp + 1) as f32 * 4.0;
                     }
                     let pk = entity_effect_pkt(me.eid, eid2, amp, ticks);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x76, pk.clone());
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x76, pk.clone());
                     broadcast_seen(me.eid, |_c| (0x76, pk.clone()));
                 }
             }
@@ -21024,7 +21013,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 };
                 if had {
                     let pk = remove_effect_pkt(me.eid, 18);
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x43, pk.clone());
+                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x43, pk.clone());
                     broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
                 }
             }
@@ -21044,7 +21033,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                             *p = (nx, ny, nz, p.3, p.4, true);
                         }
                         let _ = send_packet(
-                            &mut *me.sock.lock().unwrap(),
+                            &mut me.sock.lock().unwrap(),
                             0x40,
                             teleport_pkt(nx, ny, nz, 0.0, 0.0, 100),
                         );
@@ -21158,19 +21147,17 @@ fn rcon_listener() {
     };
     eprintln!("[rcon] listening {bind}:{port}");
     static RCON_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    for st in l.incoming() {
-        if let Ok(s) = st {
-            if RCON_ACTIVE.fetch_add(1, Ordering::SeqCst) >= 8 {
-                RCON_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-                drop(s);
-                continue;
-            }
-            let pass = pass.clone();
-            std::thread::spawn(move || {
-                let _slot = ConnectionSlot(&RCON_ACTIVE);
-                rcon_conn(s, pass);
-            });
+    for s in l.incoming().flatten() {
+        if RCON_ACTIVE.fetch_add(1, Ordering::SeqCst) >= 8 {
+            RCON_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            drop(s);
+            continue;
         }
+        let pass = pass.clone();
+        std::thread::spawn(move || {
+            let _slot = ConnectionSlot(&RCON_ACTIVE);
+            rcon_conn(s, pass);
+        });
     }
 }
 // The caller may observe a stage, but must execute it exactly once and in order.
@@ -21186,7 +21173,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     step("hoppers", hopper_tick);
     step("water", water_tick);
     let lava_period = server_ticks(FLUID_TICK_GT);
-    if TICK_IDX.load(Ordering::Relaxed) % lava_period == 0 {
+    if TICK_IDX.load(Ordering::Relaxed).is_multiple_of(lava_period) {
         step("lava", lava_tick);
     }
     step("observers", observer_tick);

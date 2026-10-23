@@ -1712,13 +1712,11 @@ impl Gen {
                         Rule::Seq(v) => v.get(i).copied(),
                         _ => None,
                     };
-                    match next {
-                        None => return None,
-                        Some(sub) => {
-                            i += 1;
-                            if let Some(st) = self.eval_rule(sub, c, surf) {
-                                return Some(st);
-                            }
+                    {
+                        let sub = next?;
+                        i += 1;
+                        if let Some(st) = self.eval_rule(sub, c, surf) {
+                            return Some(st);
                         }
                     }
                 }
@@ -3468,7 +3466,7 @@ pub fn hm_dump(spec: &str, populate: fn(&mut Gen, i32, i32)) {
     // chunks around the column have been populated; reading the tally before that
     // returns terrain heights and silently "proves" a difference
     g.ensure_populated(cx, cz, populate);
-    let Some(c) = g.cols(cx, cz) else { return };
+    let Some(_c) = g.cols(cx, cz) else { return };
     for lz in 0..16usize {
         for lx in 0..16usize {
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
@@ -5013,7 +5011,7 @@ mod wg_tests {
         let (mut air, mut wat, mut lav, mut sol, mut cave) = (0, 0, 0, 0, 0);
         for cx in 0..4 {
             for cz in 0..4 {
-                let cc = chunk_cols(cx, cz).unwrap();
+                let _cc = chunk_cols(cx, cz).unwrap();
                 for lx in 0..16 {
                     for lz in 0..16 {
                         for y in (-60..60).step_by(2) {
