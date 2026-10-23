@@ -19,7 +19,13 @@ pub(crate) fn ns_name(s: &str) -> String {
 pub(crate) fn bs_parts(j: &J) -> Option<(String, Option<&J>)> {
     match j {
         J::Str(s) => Some((ns_name(s), None)),
-        J::Obj(_) => Some((ns_name(&jstr(j, "id")?), js(j, "properties"))),
+        // 1.21.1 writes a serialised block state as {"Name": ..., "Properties": ...};
+        // 1.21.2+ (and this repository's copy of the data) as {"id": ...,
+        // "properties": ...}. Both appear in the bundled data, so read either.
+        J::Obj(_) => Some((
+            ns_name(&jstr(j, "id").or_else(|| jstr(j, "Name"))?),
+            js(j, "properties").or_else(|| js(j, "Properties")),
+        )),
         _ => None,
     }
 }
