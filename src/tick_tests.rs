@@ -1658,20 +1658,15 @@ fn measure_the_light_cost_per_chunk() {
     // reads nothing, against the one that reads the world through block_at.
     let free_op = time_it(&mut || {
         for _ in 0..rounds {
-            for x in -16..32 {
-                for z in -16..32 {
-                    let _ = std::hint::black_box(block_light_sections_from(
-                        0,
-                        0,
-                        &[((5, height_at(5, 7), 7), 15)],
-                        |_, _, _| 0,
-                    ));
-                    let _ = x;
-                    let _ = z;
-                    break;
-                }
-                break;
-            }
+            // one sample per round: this used to be a degenerate
+            // `for x in -16..32 { for z in -16..32 { ..; break } break }`,
+            // which clippy reads as a loop that never loops.
+            let _ = std::hint::black_box(block_light_sections_from(
+                0,
+                0,
+                &[((5, height_at(5, 7), 7), 15)],
+                |_, _, _| 0,
+            ));
         }
     });
     println!(
