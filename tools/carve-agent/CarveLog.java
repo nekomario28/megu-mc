@@ -156,6 +156,12 @@ public class CarveLog {
         @Override protected int[] initialValue() { return new int[] { 0 }; }
     };
 
+    /** Decoration order: chunk coordinates as applyBiomeDecoration is entered. */
+    public static void decoOrder(int x, int z) {
+        if (System.getProperty("decoorder") == null) return;
+        System.out.println("DECO " + x + " " + z);
+    }
+
     /** `WorldGenRegion.getNoiseBiome(qx, qy, qz)` for one quart cell. */
     public static void qbiome(int qx, int qy, int qz, Object holder) {
         String p = System.getProperty("qbiome");

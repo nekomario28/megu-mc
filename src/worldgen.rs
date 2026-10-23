@@ -299,6 +299,8 @@ pub struct Gen {
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pop_done: HashSet<(i32, i32)>,
+    /// Decoration region whose lexicographic scan order to follow (`MC_SPINE_POP_REGION`).
+    pop_region: Option<(i32, i32, i32, i32)>,
     // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
     world_seed: u64,
@@ -453,6 +455,14 @@ impl Gen {
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
+                let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
+                if p.len() == 4 {
+                    Some((p[0], p[1], p[2], p[3]))
+                } else {
+                    None
+                }
+            }),
             vein: None,
             memo: HashMap::new(),
             feat_hm: HashMap::new(),
@@ -2113,17 +2123,38 @@ impl Gen {
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) -> Option<u32> {
         let (cx, cz) = (x >> 4, z >> 4);
-        // MC_SPINE_FEAT_NBR=0 decorates only the queried chunk, which is what a
-        // chunk generated on its own (a forceload far from the spawn area) sees:
-        // its neighbours are generated to the carver status, not decorated.
-        let nbr = std::env::var("MC_SPINE_FEAT_NBR").map(|v| v != "0").unwrap_or(true);
-        let (x0, x1) = if nbr { (cx - 1, cx + 1) } else { (cx, cx) };
-        let (z0, z1) = if nbr { (cz - 1, cz + 1) } else { (cz, cz) };
-        for sx in x0..=x1 {
-            for sz in z0..=z1 {
-                if !self.pop_done.contains(&(sx, sz)) {
-                    self.pop_done.insert((sx, sz));
-                    populate(self, sx, sz);
+        // Decoration order. Vanilla decorates a chunk when the ticket order reaches
+        // it; for a world's spawn area that is a lexicographic scan of a square around
+        // the spawn, so a chunk sees the canopies of everything *earlier* in that scan
+        // and nothing else. `MC_SPINE_POP_REGION=x0,z0,x1,z1` reproduces that order
+        // (which the fixture compares against); the default decorates this chunk's 3x3
+        // relatively, which is what a single-chunk read does.
+        if let Some((px0, pz0, px1, pz1)) = self.pop_region {
+            for sx in px0..=px1 {
+                for sz in pz0..=pz1 {
+                    if (sx, sz) > (cx, cz) {
+                        break;
+                    }
+                    if !self.pop_done.contains(&(sx, sz)) {
+                        self.pop_done.insert((sx, sz));
+                        populate(self, sx, sz);
+                    }
+                }
+            }
+            if !self.pop_done.contains(&(cx, cz)) {
+                self.pop_done.insert((cx, cz));
+                populate(self, cx, cz);
+            }
+        } else {
+            let nbr = std::env::var("MC_SPINE_FEAT_NBR").map(|v| v != "0").unwrap_or(true);
+            let (x0, x1) = if nbr { (cx - 1, cx + 1) } else { (cx, cx) };
+            let (z0, z1) = if nbr { (cz - 1, cz + 1) } else { (cz, cz) };
+            for sx in x0..=x1 {
+                for sz in z0..=z1 {
+                    if !self.pop_done.contains(&(sx, sz)) {
+                        self.pop_done.insert((sx, sz));
+                        populate(self, sx, sz);
+                    }
                 }
             }
         }

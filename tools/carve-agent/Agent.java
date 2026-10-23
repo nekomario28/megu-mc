@@ -544,6 +544,18 @@ public class Agent {
                             super.visitVarInsn(Opcodes.ALOAD, 1);
                             super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dcy", "I_", "()I", true);
                             super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "dim", "(I)V", false);
+                            // decoration order: the chunk being decorated is arg 2
+                            super.visitVarInsn(Opcodes.ALOAD, 2);
+                            // ChunkAccess (`duy`) is an abstract class, not an
+                            // interface: INVOKEINTERFACE here throws
+                            // IncompatibleClassChangeError inside chunk generation.
+                            super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "duy", "f", "()Ldcd;", false);
+                            super.visitInsn(Opcodes.DUP);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "e", "I");
+                            super.visitInsn(Opcodes.SWAP);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "f", "I");
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "decoOrder",
+                                                  "(II)V", false);
                         }
                     };
                 }
