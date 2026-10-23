@@ -46,6 +46,8 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 **正の kelp 参照を含む fixture はできました**（`tools/kelp_fixture.sh`。seed 0 の lukewarm ocean を spawn から離れた場所で forceload し、正セル数をゲートに要求）。初回測定は `kelp` 494/484（shared 398）、`kelp_plant` 2761/2689（shared 2292）で、差は **同じ植物の高さ・head の位置**に集中しています（[carvers §62](../evidence/gameplay/carvers/README.md)）。
 
-次は **draw 列の突き合わせ**です（port の `FSEED_ARM`、参照の `tools/carve-agent` RDRAW）。`KelpFeature` の `1 + nextInt(10)` と head の `nextInt(4) + 20` の消費順・回数を両側で比べ、高さのずれを実装差か順序クラスかへ帰属させます。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
+**draw 列は一致しました**（chunk (81,0) の `kelp_warm`、先頭20ドローが port/参照で完全一致。port は `FSEED_ARM=81,0,91,9`、参照は `-Dfseedarm=91,9`。`gi` は両側とも全体通し番号で 91）。
+
+次は**候補ごとの y（`OCEAN_FLOOR_WG` の読み）と水判定**の突き合わせです。高さ予算が同じで茎長が違うので、原因は floor の y のずれ（他 feature の書き込みを heightmap 経由で読む順序クラス）か、途中セルの水判定（seagrass 等の書き込み順）のどちらかです。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
 
 以後の順序は[ロードマップ](ROADMAP.md)に従います。比較規律は[DESIGN.mdの約束](../DESIGN.md#比較の約束)を参照してください。

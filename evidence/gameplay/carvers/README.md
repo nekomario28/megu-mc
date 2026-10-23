@@ -2284,9 +2284,25 @@ head を置くときだけ
 
 共有率は `kelp` 80% / `kelp_plant` 85%。クラスタサイズ（＝植物の本数と分布）はほぼ同じで、
 `vanilla-only` が **y=45..60 に集中**している。つまり**別の植物ではなく、同じ植物の高さ・
-head の位置**が違う。`KelpFeature` は `1 + nextInt(10)` の高さと、head を置くときの
-`nextInt(4) + 20` を消費するので、次は **draw 列**を突き合わせる
-（port: `FSEED_ARM=cx,cz,i,step` の DRAW、参照: `tools/carve-agent` の RDRAW）。
+head の位置**が違う。
+
+### draw 列は一致した（20/20）— 残差は kelp 自身の乱数ではない
+
+chunk (81,0) の `kelp_warm` を両側で計装した:
+
+- port: `FSEED_ARM=81,0,91,9`（port の `gi` は**全体通し番号**で 91。`FEAT_LIST=9` で確認できる）
+- 参照: `-javaagent:carveagent.jar -Ddim=-64 -Dfseedchunk=81,0 -Dfseedarm=91,9`
+  （agent の `FSEED <pop> <i> <step>` も同じ通し番号を出す。step 9 の index 集合は
+  `0 48 49 60 63 64 71 72 83 85 90 91` で、port の gi と一致）
+
+先頭 **20 ドローが完全一致**（`nextInt(16)`×2 の in_square → `nextInt(10)` の高さ →
+`nextInt(4)` の age を候補ごとに繰り返す）。つまり候補位置・高さ予算・age は同じで、
+**セルの残差は kelp の draw ではない**。
+
+次は候補ごとの **y（`heightmap(OCEAN_FLOOR_WG)` の読み）と水判定**を両側で比べる。
+高さ予算が同じで茎の長さが違うなら、原因は (a) floor の y が違う（他 feature の書き込みを
+heightmap 経由で読む順序クラス）、(b) 途中のセルが水でない（seagrass 等の書き込み順）の
+どちらかで、これは §51/§54/§58 と同じクラス。
 
 ### 主張しないこと
 
