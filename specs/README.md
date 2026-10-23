@@ -44,6 +44,8 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 ## 次の判別作業
 
-feature parity を進める前に、**正のkelp参照を含むvanilla fixture**を作ります。選択されたplaced feature、全生成済み参照chunk、kelp/kelp-plantの正の個数をゲートで確認し、その後にfeature実行・乱数消費・セル集合を比較します。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
+**正の kelp 参照を含む fixture はできました**（`tools/kelp_fixture.sh`。seed 0 の lukewarm ocean を spawn から離れた場所で forceload し、正セル数をゲートに要求）。初回測定は `kelp` 494/484（shared 398）、`kelp_plant` 2761/2689（shared 2292）で、差は **同じ植物の高さ・head の位置**に集中しています（[carvers §62](../evidence/gameplay/carvers/README.md)）。
+
+次は **draw 列の突き合わせ**です（port の `FSEED_ARM`、参照の `tools/carve-agent` RDRAW）。`KelpFeature` の `1 + nextInt(10)` と head の `nextInt(4) + 20` の消費順・回数を両側で比べ、高さのずれを実装差か順序クラスかへ帰属させます。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
 
 以後の順序は[ロードマップ](ROADMAP.md)に従います。比較規律は[DESIGN.mdの約束](../DESIGN.md#比較の約束)を参照してください。

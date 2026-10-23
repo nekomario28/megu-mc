@@ -2253,3 +2253,44 @@ head を置くときだけ
 全体 test は通るが、vanilla と draw/cell parity を比較した証拠はない。kelp のある海洋 biome
 と完全生成 reference chunk を持つ隔離 fixture を作るまで、この型は「実装済み・参照未検証」
 と扱う。
+
+## 62. kelp の parity を初めて測った（正の参照セル、spawn から離れた領域）
+
+`tools/kelp_fixture.sh` を追加した。seed 0 の lukewarm ocean（chunk (79,-1) から 6×6）を
+**spawn から離れた場所で forceload して**参照を作り、正の kelp セルをゲートで要求する
+（両側 0 個・全 skip は合格にしない）。
+
+### 発見: `forceload` は起動後に送れば効く
+
+§52.1 は「spawn から 112 block 離れた chunk の forceload が失敗した」と記録していたが、
+これは距離の問題ではなく**送信タイミング**だった。同じコマンドを起動前にパイプで流すと
+（`save-all flush` と `stop` は効くのに）chunk が1つも生成されず、**8秒後に送ると生成された**。
+測定: 即時送信では領域ファイルが spawn 準備の4つだけ、8秒後では要求した 6×6 の領域が保存された。
+
+→ **順序に依存しない固定具が作れる**。spawn 準備の並列装飾に汚れていない chunk を
+参照にできるので、R1.5 の前提（bot で歩かせる等）が変わる。ただし本節の比較は
+「spawn から離れた」条件であって、その固定具での順序の帰属まで確かめたわけではない。
+
+### 測定（同一領域、両側とも同じデータ・seed 0）
+
+参照の kelp 系セルは 3099（`kelp_plant` 2689 / `kelp` 484）。
+
+| ブロック | ours | vanilla | shared | ours-only | vanilla-only |
+|---|---|---|---|---|---|
+| `kelp` | 494 | 484 | 398 | 96 | 86 |
+| `kelp_plant` | 2761 | 2689 | 2292 | 469 | 397 |
+
+### 読み
+
+共有率は `kelp` 80% / `kelp_plant` 85%。クラスタサイズ（＝植物の本数と分布）はほぼ同じで、
+`vanilla-only` が **y=45..60 に集中**している。つまり**別の植物ではなく、同じ植物の高さ・
+head の位置**が違う。`KelpFeature` は `1 + nextInt(10)` の高さと、head を置くときの
+`nextInt(4) + 20` を消費するので、次は **draw 列**を突き合わせる
+（port: `FSEED_ARM=cx,cz,i,step` の DRAW、参照: `tools/carve-agent` の RDRAW）。
+
+### 主張しないこと
+
+- この領域でも、他の feature（`seagrass` 等）の書き込みが水や `OCEAN_FLOOR_WG` を
+  変える順序クラスの寄与は分離していない。共有率の残り 15% をすべて kelp 実装の差と
+  呼ぶ根拠はまだ無い。
+- 1 seed・1 領域の測定であり、海洋 biome 全体の一致ではない。
