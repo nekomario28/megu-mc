@@ -23,7 +23,15 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **kelpは実装済みだがvanilla parityは未検証。** 合成回帰テストはありますが、既存のvanilla fixtureでは両側ともkelpが0個で、挙動を通った証拠になりません。正の参照セルを持つ完全生成chunkが必要です。
 - **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。
 - **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
-- **コード検証:** `cargo test --release` は `b3e1c62` のコードで157 passed / 1 ignored。今回の変更は文書のみです。この記録は `tests/verify.sh` やhosted CIの成功を意味しません。`cargo fmt -- --check` は既存の広範な差分を報告しており、一括整形はしていません。
+- **コード検証:** `tests/verify.sh` が**通りました**（159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit）。`main` はこの統合ブランチと同じツリーを指しています（以前の main は tag `checkpoint/pre-consolidation-main`）。
+- **clippyの残件:** 457 warnings（`never_loop` 4件は修正済み。これは主張ではなく消化待ちの一覧です）。
+
+## 保留・外部依存（値ではなく事実だけ）
+
+- **hosted CIはジョブが起動しません。** GitHub の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。**コード失敗ではない**ので、緑の判定は当面ローカルの `tests/verify.sh` が持ちます。復旧後に同一SHAで再取得します。
+- **比較の前提（固定具の基点）がリポジトリの外にある:** `tools/carver_fixture.sh` / `ore_fixture.sh` は `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を前提にしていますが、それを用意するスクリプトがリポジトリにありません。基点が無いまま固定具を回すと比較は空振りします。
+- **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MC_SPINE_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
+- **開放中の項目:** LICENSE 未追加、独立レビュー（issue #7）、draft PR #2/#4/#6。統合の事実確認後に閉じる対象です。
 
 ## 次の判別作業
 
