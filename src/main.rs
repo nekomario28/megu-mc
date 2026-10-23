@@ -438,7 +438,21 @@ where
     F: Fn(&Client) -> (i64, Vec<u8>),
     P: Fn(&Client) -> bool,
 {
-    for c in client_snapshot().iter() {
+    fanout_in(&client_snapshot(), interested, mk)
+}
+
+/// The audience is a parameter, not a global read: the four broadcast helpers
+/// are pinned by a test that hands them its own three clients, and that test
+/// asserts that the *other* clients receive nothing. While the audience came
+/// from `clients()`, any test running beside it that broadcast to the global
+/// list wrote into those sockets and broke the negative assertions - measured
+/// once in four eight-thread runs (`fanout_tests`, 68 bytes on the sender).
+fn fanout_in<F, P>(audience: &[Arc<Client>], interested: P, mk: F)
+where
+    F: Fn(&Client) -> (i64, Vec<u8>),
+    P: Fn(&Client) -> bool,
+{
+    for c in audience.iter() {
         if !interested(c) {
             continue;
         }
@@ -450,7 +464,10 @@ where
 }
 
 fn broadcast<F: Fn(&Client) -> (i64, Vec<u8>)>(me_eid: i32, mk: F) {
-    fanout(|c| c.eid != me_eid, mk)
+    broadcast_in(&client_snapshot(), me_eid, mk)
+}
+fn broadcast_in<F: Fn(&Client) -> (i64, Vec<u8>)>(audience: &[Arc<Client>], me_eid: i32, mk: F) {
+    fanout_in(audience, |c| c.eid != me_eid, mk)
 }
 // distance-gated broadcast: only clients within VIS_R2 of (x,y,z) get the
 // packet — "don't send what isn't visible" (bandwidth + anti-ESP)
@@ -677,7 +694,19 @@ fn interest_tick() {
 // chunk-scoped broadcast: only clients currently holding the chunk —
 // block updates to an unloaded chunk would create phantom state.
 fn broadcast_chunk<F: Fn(&Client) -> (i64, Vec<u8>)>(cx: i32, cz: i32, mk: F) {
-    fanout(|c| c.chunks.lock().unwrap().contains(&(cx, cz)), mk)
+    broadcast_chunk_in(&client_snapshot(), cx, cz, mk)
+}
+fn broadcast_chunk_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
+    audience: &[Arc<Client>],
+    cx: i32,
+    cz: i32,
+    mk: F,
+) {
+    fanout_in(
+        audience,
+        |c| c.chunks.lock().unwrap().contains(&(cx, cz)),
+        mk,
+    )
 }
 fn broadcast_seen_destroy(eid: i32) {
     let mut p = Vec::new();
@@ -693,7 +722,16 @@ fn broadcast_seen<F: Fn(&Client) -> (i64, Vec<u8>)>(eid: i32, mk: F) {
     broadcast_seen_ex(eid, 0, mk)
 }
 fn broadcast_seen_ex<F: Fn(&Client) -> (i64, Vec<u8>)>(eid: i32, excl: i32, mk: F) {
-    fanout(
+    broadcast_seen_ex_in(&client_snapshot(), eid, excl, mk)
+}
+fn broadcast_seen_ex_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
+    audience: &[Arc<Client>],
+    eid: i32,
+    excl: i32,
+    mk: F,
+) {
+    fanout_in(
+        audience,
         |c| c.eid != excl && c.seen.lock().unwrap().contains(&eid),
         mk,
     )

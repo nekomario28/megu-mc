@@ -6,7 +6,8 @@ use std::time::Duration;
 /// The four broadcast helpers used to be four copies of the same loop, each with
 /// its own filter and its own copy of the snapshot. They now differ only in the
 /// predicate, so what has to be pinned is that the predicates still select exactly
-/// the clients they used to.
+/// the clients they used to - and they take their audience as an argument, so the
+/// test can pin that without publishing its clients to the rest of the suite.
 fn client_with(eid: i32) -> (Arc<Client>, TcpStream) {
     let (mut c, r) = crate::effect_tests::client_pair();
     c.eid = eid;
@@ -32,8 +33,6 @@ fn drained(r: &mut TcpStream) -> usize {
 
 #[test]
 fn the_broadcast_helpers_still_select_the_same_clients() {
-    let _world_guard = world_guard();
-    let saved = std::mem::take(&mut *clients().lock().unwrap());
     let (me, mut r_me) = client_with(1);
     let (peer, mut r_peer) = client_with(2);
     let (far, mut r_far) = client_with(3);
@@ -41,15 +40,16 @@ fn the_broadcast_helpers_still_select_the_same_clients() {
     peer.seen.lock().unwrap().insert(77);
     far.seen.lock().unwrap().insert(77);
     peer.chunks.lock().unwrap().insert((4, 5));
-    clients()
-        .lock()
-        .unwrap()
-        .extend([me.clone(), peer.clone(), far.clone()]);
+    // The audience is handed to the helpers explicitly, so no other test can
+    // write into these sockets: the "nobody else may receive it" assertions used
+    // to depend on every concurrent broadcast holding the world guard, which the
+    // eight-thread stage does not guarantee (one red run in four).
+    let audience = [me.clone(), peer.clone(), far.clone()];
 
     let payload = |_c: &Client| (0x42i64, vec![1u8, 2, 3]);
 
     // broadcast: everyone except the named sender.
-    broadcast(1, payload);
+    broadcast_in(&audience, 1, payload);
     assert_eq!(drained(&mut r_me), 0, "the sender must not receive it");
     assert!(
         drained(&mut r_peer) > 0,
@@ -62,7 +62,7 @@ fn the_broadcast_helpers_still_select_the_same_clients() {
 
     // broadcast_seen_ex: only clients that have seen the entity, minus the excluded
     // one. `me` never saw it and `peer` is excluded, so only `far` is left.
-    broadcast_seen_ex(77, 2, payload);
+    broadcast_seen_ex_in(&audience, 77, 2, payload);
     assert_eq!(
         drained(&mut r_peer),
         0,
@@ -79,7 +79,7 @@ fn the_broadcast_helpers_still_select_the_same_clients() {
     );
 
     // broadcast_chunk: only clients streaming that chunk.
-    broadcast_chunk(4, 5, payload);
+    broadcast_chunk_in(&audience, 4, 5, payload);
     assert!(
         drained(&mut r_peer) > 0,
         "a client holding the chunk must receive it"
@@ -90,8 +90,6 @@ fn the_broadcast_helpers_still_select_the_same_clients() {
         "a client without the chunk must not receive it"
     );
 
-    broadcast_chunk(9, 9, payload);
+    broadcast_chunk_in(&audience, 9, 9, payload);
     assert_eq!(drained(&mut r_peer), 0, "nobody holds chunk (9,9)");
-
-    *clients().lock().unwrap() = saved;
 }
