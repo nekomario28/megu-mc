@@ -1475,14 +1475,40 @@ BIOMEF3 20 66 3 false biome=err top=Optional[Placed Reference{ResourceKey[
   `getNoiseBiome(QuartPos.fromBlock(x), fromBlock(y), fromBlock(z))`
   = この位置では `(5, 16, 0)` に落ちる。
 
-### 次の計測（これで決まるはず）
+### 解決: vanilla の `getBiome(BlockPos)` は chunk の container ではない
 
-`arb.a(III)Ljm;`（= `WorldGenRegion.getNoiseBiome`）をフックし、`(5,16,0)` で
-**返る biome holder を文字列化**する。プリミティブ引数＋toString だけなので、
-このリポジトリで実績のある計装パターン（引数をスタックに積んで `CarveLog` を呼ぶ）
-がそのまま使える。`dcz.t` / `eiw.d` の連鎖をリフレクションで辿る方法は
-（`CarveLog.biomef3`、`-Dbiomefwhy`）NPE になり使えなかった — 実装クラス側を
-フックするほうが確実。
+`arb.a(III)Ljm;`（= `WorldGenRegion.getNoiseBiome`）をフックしても **1 行も出なかった**
+（`-Dqbiome=all` で 0 件）。つまり decoration 中に `getNoiseBiome` は呼ばれていない。
+`dcz`（LevelReader）の default を読むと:
+
+```java
+public default Holder<Biome> t(BlockPos pos) {     // getBiome(BlockPos)
+   return this.F_().a(pos);                        // getBiomeManager().getBiome(pos)
+}
+```
+
+`F_()` は `ddy`（`BiomeManager`）。つまり vanilla には **biome が 2 種類**ある:
+
+1. **chunk の container**: quart セルごとに `fillBiomesFromNoise` が
+   `biomeSource.getNoiseBiome(qx,qy,qz,sampler)` を直接書いたもの。保存された world に残り、
+   こちらの `biome_quart` / `MC_SPINE_BIOME_DUMP` はこれを再現している（64/64 セル一致）。
+2. **`BiomeManager.getBiome(BlockPos)`**: `pos − 2` の quart セルと小数部から
+   **8 近傍の noise サンプルを `getFiddledDistance`（zoom seed を使う重み付き距離）で
+   選ぶ**、いわゆる biome blend。`LevelReader.getBiome(BlockPos)` はこちら。
+
+`BiomeFilter` は `ctx.getLevel().getBiome(pos)` = **2** を使う。こちらの `PM::Biome` は
+**1** を使っている。境界（river/forest）では両者が食い違うので、chunk (1,0) の
+(20,66,3) が「保存データは forest、フィルタは false」になったのは当然の結果だった。
+木の不足（45 vs 38）はこの 1 点に集約される。
+
+### 次の一単位（これで木が揃う見込み）
+
+`BiomeManager.getBiome(BlockPos)` 相当を port に実装する:
+
+- `ddy.a(Ljd;)Ljm;` と `getFiddledDistance` の bytecode（zoom seed・8 近傍・重み付き距離）を読む。
+- `Gen` に `biome_at_blended(x,y,z)` を足し、`PM::Biome`（と `getBiome(BlockPos)` を使う
+  他の消費者）をそちらへ向ける。chunk container を使う経路（保存・送信）はそのまま。
+- 出口: chunk (1,0) の候補 (20,66,3) で判定が false になり、木が 45 → 38 に揃う。
 
 候補の (x,z) が一致している以上、ここの解決で木は 45→38 に揃う見込み。
 
