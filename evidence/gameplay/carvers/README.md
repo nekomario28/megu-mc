@@ -1441,7 +1441,7 @@ feature (20,9) = `trees_birch_and_oak` の木の本数は 45 vs 38 まで詰ま�
   - vanilla の `BiomeFilter`（`eii.a` をフック）: **false**
   - こちらの `PM::Biome`: **true**（biome=forest）
   - 保存済み world の quart (20,64,0) = **minecraft:forest**
-    （`featworld` / `treeworld` の両方で同じ、palette は river 36 / forest 28）
+    （当時の作業 world は `~/.cache/mc-spine-work/tmp` の使い捨てで既に残っていない。数字は記録、world は `tools/fixture_base.sh` から作り直せる。palette は river 36 / forest 28）
 - vanilla の `InSquarePlacement` 候補（chunk (1,0)、feature (20,9)）は 10 個、
   そのうち `BiomeFilter` が true を返したものは **0 個**。
 
