@@ -344,21 +344,33 @@ public class Agent {
                     boolean plain = mn.equals("f") && md.equals("()I");
                     boolean flt = mn.equals("i") && md.equals("()F");
                     if (!bound && !plain && !flt) return mv;
-                    final int n = bound ? 2 : 1; // args pushed before the value
                     return new MethodVisitor(Opcodes.ASM9, mv) {
                         @Override public void visitInsn(int op) {
                             boolean ret = bound || plain ? op == Opcodes.IRETURN : op == Opcodes.FRETURN;
                             if (!ret) { super.visitInsn(op); return; }
-                            super.visitVarInsn(plain || bound ? Opcodes.ISTORE : Opcodes.FSTORE, 40);
-                            super.visitLdcInsn(bound ? "nextInt" : (plain ? "nextInt()" : "nextFloat"));
-                            if (bound) { super.visitVarInsn(Opcodes.ILOAD, 1); super.visitInsn(Opcodes.I2L); }
-                            else super.visitLdcInsn(Long.valueOf(0L));
-                            super.visitVarInsn(plain || bound ? Opcodes.ILOAD : Opcodes.FLOAD, 40);
-                            if (flt) super.visitInsn(Opcodes.F2L);
-                            else if (plain || bound) super.visitInsn(Opcodes.I2L);
-                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdraw",
-                                                  "(Ljava/lang/String;JJ)V", false);
-                            super.visitVarInsn(plain || bound ? Opcodes.ILOAD : Opcodes.FLOAD, 40);
+                            if (flt) {
+                                super.visitVarInsn(Opcodes.FSTORE, 40);
+                                super.visitLdcInsn("nextFloat");
+                                super.visitVarInsn(Opcodes.FLOAD, 40);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdrawF",
+                                                      "(Ljava/lang/String;F)V", false);
+                                super.visitVarInsn(Opcodes.FLOAD, 40);
+                                super.visitInsn(op);
+                                return;
+                            }
+                            super.visitVarInsn(Opcodes.ISTORE, 40);
+                            // label carries the bound: nextInt(16) / nextInt()
+                            if (bound) {
+                                super.visitVarInsn(Opcodes.ILOAD, 1);
+                                super.visitVarInsn(Opcodes.ILOAD, 40);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdrawI",
+                                                      "(II)V", false);
+                            } else {
+                                super.visitVarInsn(Opcodes.ILOAD, 40);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdrawN",
+                                                      "(I)V", false);
+                            }
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
                             super.visitInsn(op);
                         }
                     };

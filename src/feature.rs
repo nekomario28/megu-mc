@@ -2730,6 +2730,8 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     crate::generation_math::FTRACE
                         .store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::generation_math::DTRACE
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             if let Ok(spec) = std::env::var("FSEED_TRACE") {

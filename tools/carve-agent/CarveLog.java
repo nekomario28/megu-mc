@@ -292,6 +292,34 @@ public class CarveLog {
         System.out.println("RBOUND " + i + " bound=" + bound + " -> " + val);
     }
 
+    /** `nextInt()` (no bound). */
+    public static void rdrawN(int value) {
+        int[] st = RD.get();
+        if (st[0] != 1) return;
+        int i = st[1]++;
+        if (i >= 200) { st[0] = -1; return; }
+        System.out.println("RDRAW " + i + " nextInt()=" + value);
+    }
+
+    /** `nextInt(bound)` with the bound in the label, as the port prints it. */
+    public static void rdrawI(int bound, int value) {
+        int[] st = RD.get();
+        if (st[0] != 1) return;
+        int i = st[1]++;
+        if (i >= 200) { st[0] = -1; return; }
+        System.out.println("RDRAW " + i + " nextInt(" + bound + ")=" + value);
+    }
+
+    /** A typed `nextFloat` draw (a float parameter keeps the value intact; the
+     *  long-typed logger flattens small floats to 0). */
+    public static void rdrawF(String label, float value) {
+        int[] st = RD.get();
+        if (st[0] != 1) return;
+        int i = st[1]++;
+        if (i >= 200) { st[0] = -1; return; }
+        System.out.println("RDRAW " + i + " " + label + "=" + value);
+    }
+
     /** Bound (0 = nextInt()) and value of one Xoroshiro draw. */
     public static void rdraw2(long bound, long val) {
         int[] st = RD.get();

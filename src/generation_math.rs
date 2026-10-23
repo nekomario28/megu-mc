@@ -134,6 +134,23 @@ pub(crate) fn fdraw(v: f32) {
 
 pub(crate) static FTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// One chronological trace of the *typed* draws, mirroring the agent's hook on
+/// `RandomSource`'s default methods, so the two sequences can be diffed directly
+/// (the raw `next(bits)` traces cannot be interleaved with each other).
+pub(crate) fn dtrace(kind: &str, value: f64) {
+    let n = DTRACE.load(std::sync::atomic::Ordering::Relaxed);
+    if n < 0 {
+        return;
+    }
+    eprintln!("DRAW {n} {kind}={value}");
+    DTRACE.store(
+        if n + 1 >= 200 { -1 } else { n + 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) static DTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 /// Env-gated draw trace for feature placement (`FSEED_ARM=i,step`).
 pub(crate) static XTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -207,6 +224,7 @@ impl Xor {
     pub(crate) fn next_bound(&mut self, bound: i32) -> i32 {
         let v = self.next_bound_raw(bound);
         xtrace("nextInt", bound as i64, v as i64);
+        dtrace(&format!("nextInt({bound})"), v as f64);
         v
     }
     fn next_bound_raw(&mut self, bound: i32) -> i32 {
@@ -251,6 +269,7 @@ impl Xor {
     pub(crate) fn next_f32(&mut self) -> f32 {
         let v = self.next(24) as f32 * 5.960_464_5E-8;
         fdraw(v);
+        dtrace("nextFloat", v as f64);
         v
     }
     pub(crate) fn next_bool(&mut self) -> bool {
