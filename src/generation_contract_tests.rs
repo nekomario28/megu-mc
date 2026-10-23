@@ -101,6 +101,43 @@ fn kelp_stops_at_the_water_surface_and_replaces_the_last_plant_with_a_head() {
 }
 
 #[test]
+fn kelp_places_its_head_when_the_column_is_one_water_cell_deep() {
+    // `KelpFeature.place` moves the position up on *every* iteration - `pos.move(UP)`
+    // sits outside its if/else - so a base cell that is water with air above it
+    // rejects at i=0, then rejects again at i=1 as the head branch, and the head
+    // lands on the base cell itself. A loop that only advances on a placement
+    // examines the base cell twice and writes the head one cell lower, into the
+    // floor, where `canSurvive` refuses it and nothing is placed at all.
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (1280, 0);
+    let base = ctx.hm_oc(x, z);
+    ctx.set(x, base - 1, z, reg.state_of("minecraft:sand", None));
+    ctx.set(x, base, z, reg.state_of("minecraft:water", None));
+    ctx.set(x, base + 1, z, 0);
+
+    let mut rng = Xor::seed(0);
+    gen_cf(&Cf::Kelp, freg(), &mut ctx, &mut rng, (x, 0, z));
+
+    let written: Vec<_> = ctx
+        .wr
+        .iter()
+        .filter(|(&(px, _, pz), &st)| {
+            px == x
+                && pz == z
+                && matches!(reg.name_of(st), "minecraft:kelp" | "minecraft:kelp_plant")
+        })
+        .map(|(&(_, y, _), &st)| (y, reg.name_of(st).to_string()))
+        .collect();
+    assert_eq!(
+        written,
+        vec![(base, "minecraft:kelp".to_string())],
+        "one head on the base cell: no stem above it, nothing written into the floor"
+    );
+}
+
+#[test]
 fn provider_values_and_following_rng_match_pre_extraction() {
     let mut trace = Vec::new();
     let ints = [

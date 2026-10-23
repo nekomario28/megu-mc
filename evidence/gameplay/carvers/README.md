@@ -2310,3 +2310,43 @@ heightmap 経由で読む順序クラス）、(b) 途中のセルが水でない
   変える順序クラスの寄与は分離していない。共有率の残り 15% をすべて kelp 実装の差と
   呼ぶ根拠はまだ無い。
 - 1 seed・1 領域の測定であり、海洋 biome 全体の一致ではない。
+
+### 62.1 残差の帰属（列ごと）と、実装差1件
+
+6×6 領域（参照 484 列）で、port の候補を列ごとに分類した（`KELP_TRACE=1` の診断を追加）:
+
+| 分類 | 列 | 読み |
+|---|---|---|
+| 両側にあり茎も一致 | **390** | kelp 自身はほぼ正しい |
+| 両側にあり茎だけ違う | 21 | 停止条件（水/生存）の差 |
+| port が置き vanilla が棄却（参照セルは `seagrass`/`tall_seagrass`） | **31** | vanilla は**同 step の先行 feature（seagrass）の書き込み**を見て棄却。port は水を見ている＝seagrass 側の差が kelp に波及 |
+| port が置き vanilla が棄却（参照セルは `water`） | **53** | 両側の `getHeight(OCEAN_FLOOR)` が違う（y の読みの差） |
+| vanilla が置き port は水を見ていない | 12 | 上の鏡像 |
+| vanilla が置き port に候補が無い | 61 | この pass では未説明 |
+
+また chunk (80,2)/(83,1) の draw 列は**受理判定までは完全一致**（in_square・高さ・age の順と値が同じ）で、
+食い違いは「候補セルを水と見るか」の一点だった。つまり kelp の draw と位置は正しく、残差は
+**候補セルの世界状態**（先行 feature の書き込み、または y の読み）に帰属する。
+
+### 62.2 vanilla の `KelpFeature.place` を逆コンパイルして見つけた実装差（修正）
+
+`vineflower-1.11.1.jar`（`~/.cache/mc-spine-work/mc121/`）で `ecs`（= `KelpFeature`）を逆コンパイル:
+
+```java
+for (int i = 0; i <= height; i++) {
+    if (waterHere && waterAbove && plant.canSurvive(level, p)) { ... }
+    else if (i > 0) { ... head at p.below() ...; break; }
+    p = p.above();          // ← if/else の外。毎回無条件で上がる
+}
+```
+
+port は「置けたときだけ」`p.1 += 1` していたため、**基準セルが水・その上が水でない**場合
+（1セル深い水柱）に、i=0 で棄却 → i=1 で同じセルを再評価 → head を `p.1-1`
+＝**床の中**に書いていた。vanilla は基準セルに head を置く。
+
+修正: `p.1 += 1` を if/else の外へ（vanilla と同じ位置）。負の対照つきテスト
+`kelp_places_its_head_when_the_column_is_one_water_cell_deep` を追加し、
+旧ループでは `left: [(24, "minecraft:kelp")]`（床の中）で**落ちる**ことを確認した。
+
+注: この経路は今回の fixture 領域では踏まれず、領域のセル数（`kelp` 494/484、`kelp_plant` 2761/2689）は
+修正前後で**同じ**だった。数値が動かない変更を「効果なし」と読まず、単体テストで経路の実行を証明している。

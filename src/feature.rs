@@ -1324,7 +1324,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let Some(reg) = breg() else { return };
             let base_y = ctx.hm_oc(pos.0, pos.2);
             let mut p = (pos.0, base_y, pos.2);
+            let trace = std::env::var("KELP_TRACE").is_ok();
             if !is_water_st(reg, ctx.get(p.0, p.1, p.2)) {
+                if trace {
+                    eprintln!("KELP x={} z={} y0={base_y} no-water-at-base", pos.0, pos.2);
+                }
                 return;
             }
             let max_height = 1 + rng.next_bound(10);
@@ -1344,8 +1348,21 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     } else {
                         ctx.set(p.0, p.1, p.2, reg.state_of("minecraft:kelp_plant", None));
                     }
-                    p.1 += 1;
+                    if trace && i == max_height {
+                        eprintln!(
+                            "KELP x={} z={} y0={base_y} maxh={max_height} stem={max_height} full-height head_y={}",
+                            p.0,
+                            p.2,
+                            base_y + max_height as i32
+                        );
+                    }
                 } else if i > 0 {
+                    if trace {
+                        eprintln!(
+                            "KELP x={} z={} y0={base_y} maxh={max_height} stem={i} stopped_at={} here_water={here_water} above_water={above_water} survives={plant_survives}",
+                            p.0, p.2, p.1
+                        );
+                    }
                     let base = (p.0, p.1 - 1, p.2);
                     let below_is_head =
                         reg.name_of(ctx.get(base.0, base.1 - 1, base.2)) == "minecraft:kelp";
@@ -1362,6 +1379,10 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     }
                     break;
                 }
+                // `KelpFeature.place` moves up unconditionally: `pos.move(UP)` is
+                // outside its if/else. Advancing only on a placement makes the
+                // rejected-at-i=0 case write its head one cell lower than vanilla.
+                p.1 += 1;
             }
         }
         Cf::RandomPatch {
