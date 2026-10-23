@@ -2124,6 +2124,18 @@ impl Gen {
         }
     }
 
+    /// Populate the 3x3 around a chunk if it has not been populated yet, so a
+    /// diagnostic reads the same feature-layer state a generation loop would.
+    pub(crate) fn ensure_populated(&mut self, cx: i32, cz: i32) {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if !self.pop_done.contains(&(cx + dx, cz + dz)) {
+                    crate::feature::populate(self, cx + dx, cz + dz);
+                }
+            }
+        }
+    }
+
     /// Highest non-air (`0`) / solid (`1`) feature-written block + 1 in a column.
     pub(crate) fn feature_height(&self, x: i32, z: i32, solid: usize) -> i32 {
         match self.feat_hm.get(&(x, z)) {
@@ -3119,12 +3131,19 @@ pub fn hm_dump(spec: &str) {
     let mut gg = GEN.lock().unwrap();
     let Some(g) = gg.as_mut() else { return };
     let (cx, cz) = (p[0], p[1]);
+    // the feature layer's height a *running* world would hold only exists once the
+    // chunks around the column have been populated; reading the tally before that
+    // returns terrain heights and silently "proves" a difference
+    g.ensure_populated(cx, cz);
     let Some(c) = g.cols(cx, cz) else { return };
     for lz in 0..16usize {
         for lx in 0..16usize {
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-            let of = g.top_oc(x, z);
-            let ws = g.top_ws(x, z);
+            // include the feature layer: this dump exists to compare against a saved
+            // chunk's heightmaps, which a running server has already had raised by
+            // the canopy its own placements grew
+            let of = g.top_oc(x, z).max(g.feature_height(x, z, 1));
+            let ws = g.top_ws(x, z).max(g.feature_height(x, z, 0));
             eprintln!("HM {} {} {} {}", lx, lz, of, ws);
         }
     }
