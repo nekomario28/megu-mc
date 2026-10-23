@@ -506,6 +506,16 @@ check "an update packet sends block light only" \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
   update_light_packet_sends_block_light_only
 
+check "the projectile sweep spans the whole tick, not a fraction of it" \
+  src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
+  '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
+  the_projectile_sweep_covers_the_whole_tick
+
+check "an arrow hits the target it crosses on its first tick" \
+  src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
+  '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
+  the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

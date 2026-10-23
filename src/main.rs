@@ -433,14 +433,6 @@ fn client_snapshot() -> Vec<Arc<Client>> {
 
 /// Send one packet to every client the predicate accepts. The snapshot is taken
 /// before any send, so the lock order above is structural rather than remembered.
-fn fanout<F, P>(interested: P, mk: F)
-where
-    F: Fn(&Client) -> (i64, Vec<u8>),
-    P: Fn(&Client) -> bool,
-{
-    fanout_in(&client_snapshot(), interested, mk)
-}
-
 /// The audience is a parameter, not a global read: the four broadcast helpers
 /// are pinned by a test that hands them its own three clients, and that test
 /// asserts that the *other* clients receive nothing. While the audience came
@@ -3099,6 +3091,47 @@ fn keepalive_time_tick() {
         run_function(&f, None, &mut None);
     }
 }
+/// The substeps a projectile samples in one tick. Vanilla intersects the whole
+/// segment a projectile travelled (`ProjectileUtil.getEntityHitResult`); the port
+/// samples that segment, and the samples have to span all of it or a projectile
+/// walks past a target the segment still crosses.
+const PROJECTILE_SWEEP_STEPS: usize = 4;
+
+/// The positions one tick's motion is sampled at: from where the projectile was
+/// (`pos - d`, `d` being the displacement this tick's integrator applied) to where
+/// it is now, `PROJECTILE_SWEEP_STEPS` intervals later.
+fn projectile_sweep(
+    pos: (f64, f64, f64),
+    d: (f64, f64, f64),
+) -> [(f64, f64, f64); PROJECTILE_SWEEP_STEPS + 1] {
+    let mut out = [(0.0, 0.0, 0.0); PROJECTILE_SWEEP_STEPS + 1];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;
+        *slot = (pos.0 - d.0 * back, pos.1 - d.1 * back, pos.2 - d.2 * back);
+    }
+    out
+}
+
+/// The crude box both projectile hit tests put around a target's feet position:
+/// `rx` to either side, `y_lo` below and `y_hi` above. Generous on purpose - a
+/// block-accurate test would intersect the swept segment with the target's real
+/// AABB, which the port has not needed: at the speeds a vanilla arrow reaches, the
+/// samples below are closer together than the box is wide, so the box decides
+/// rather than the sampling. `the_projectile_sweep_covers_the_whole_tick` measures
+/// where that stops being true.
+fn projectile_reaches(
+    sample: (f64, f64, f64),
+    target: (f64, f64, f64),
+    rx: f64,
+    y_lo: f64,
+    y_hi: f64,
+) -> bool {
+    (target.0 - sample.0).abs() < rx
+        && (target.2 - sample.2).abs() < rx
+        && sample.1 > target.1 - y_lo
+        && sample.1 < target.1 + y_hi
+}
+
 fn arrow_tick() {
     let mut dead: Vec<i32> = vec![];
     let mut hits: Vec<(i32, f32)> = vec![]; // (victim eid, arrow dmg)
@@ -3175,6 +3208,12 @@ fn arrow_tick() {
             a.y += a.dy;
             a.z += a.dz;
             let (ax, ay, az) = (a.x, a.y, a.z);
+            // The whole tick's motion, not a fraction of it: the samples used to
+            // start `0.675 * step` behind the arrow because a drag constant was
+            // standing in for a geometric span, which leaves the first third of the
+            // tick - where an arrow shot at point-blank range crosses its target -
+            // unsampled.
+            let sweep = projectile_sweep((ax, ay, az), (a.dx, a.dy, a.dz));
             // block collision: arrows stick into solid blocks (vanilla)
             let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
             if bst != 0 && !mob_passable(bst) {
@@ -3202,18 +3241,8 @@ fn arrow_tick() {
                         continue;
                     }
                     let (mx, my, mz, ..) = *m.pos.lock().unwrap();
-                    for st in 1..=4 {
-                        let t = st as f64 / 4.0;
-                        let (sx, sy, sz) = (
-                            ax - a.dx * 0.9 * (1.0 - t),
-                            ay - a.dy * 0.9 * (1.0 - t),
-                            az - a.dz * 0.9 * (1.0 - t),
-                        );
-                        if (mx - sx).abs() < 1.2
-                            && (mz - sz).abs() < 1.2
-                            && sy > my - 0.4
-                            && sy < my + 2.1
-                        {
+                    for s in sweep {
+                        if projectile_reaches(s, (mx, my, mz), 1.2, 0.4, 2.1) {
                             let mut h = m.hp.lock().unwrap();
                             *h -= a.dmg;
                             let dh = *h;
@@ -3296,21 +3325,11 @@ fn arrow_tick() {
                             let p = c.pos.lock().unwrap();
                             *p
                         };
-                        for st in 1..=4 {
-                            let t = st as f64 / 4.0;
-                            let (sx, sy, sz) = (
-                                ax - a.dx * 0.9 * (1.0 - t),
-                                ay - a.dy * 0.9 * (1.0 - t),
-                                az - a.dz * 0.9 * (1.0 - t),
-                            );
+                        for s in sweep {
                             if c.eid == a.last_hit {
                                 continue;
                             }
-                            if (px - sx).abs() < 0.7
-                                && (pz - sz).abs() < 0.7
-                                && sy > py - 0.3
-                                && sy < py + 2.0
-                            {
+                            if projectile_reaches(s, (px, py, pz), 0.7, 0.3, 2.0) {
                                 hits.push((c.eid, a.dmg));
                                 if a.pierce > 0 {
                                     a.pierce -= 1;
