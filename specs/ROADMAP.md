@@ -18,7 +18,7 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
 | 地形（feature/carver なし） | vanilla と **0 セル**（(0,0) の 2×2）。density・surface rule・bedrock・**ore vein** が一致。高さマップも 256/256 列一致 |
 | 洞窟・峡谷（carver） | vanilla と **0 セル**（(0,0) の 2×2、cave / cave_extra / canyon）。生ドローの一致まで確認（[carvers](../evidence/gameplay/carvers/README.md)） |
 | 落下と並行操作 | 性質テスト 5 件・変異 5 件を追加（2026-10-20）。保存・破壊・設置・ホットセット変更が同じティック列で交差してもブロックを落とさない（[falling-concurrency](falling-concurrency/README.md)） |
-| feature 層 | 2×2 で **940 / 393216（0.24%）**。葉の `distance` 394 は tick 由来で、除外すると **546**。起点は 40975（10.4%/chunk、2026-10-22 朝） |
+| feature 層 | 2×2 で **704 / 393216（0.18%）**。葉の `distance` は tick 由来で、除外すると **285**。木は 39 本（vanilla 38）。起点は 40975（10.4%/chunk、2026-10-22 朝） |
 | 構造物 | **未実装**（jigsaw / template pool / structure_set / NBT のいずれも無い） |
 
 ## 順序
@@ -68,13 +68,19 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   placement modifier の落下（`fixed_placement`）、
   rule-based state provider の `type` 欠落と `"fluids"` の単一値、
   入れ子 placed feature 参照の modifier 落ち。
-  13. **biome は 2 種類ある**: chunk container（quart セル、保存 world の中身）と
+  13. **feature 層のハイトマップの所有者は chunk**: 書き込まれた位置を所有する chunk の
+  ハイトマップを `setBlock` ごとに更新する（`OCEAN_FLOOR` は樹冠の葉も数える）ので、
+  隣の chunk の木がこちらの候補の y を上げる。1 回の populate 内で数えていたため
+  候補 (0,17) が y=64 になり、vanilla が棄却する木を 1 本余分に作って以降のドローが
+  全部ずれていた（940 → **704**、木 42 → 39）。
+  14. **biome は 2 種類ある**: chunk container（quart セル、保存 world の中身）と
   `BiomeManager.getBiome(BlockPos)`（8 近傍を zoom seed の重み付き距離で選ぶ blend）。
   `LevelReader.getBiome` は後者で、`BiomeFilter` はそれを使う。前者を読んでいたため
   river/forest 境界で候補を誤って受理していた（実装後 1035 → **940**、木 45 → 42）。
-  残りの出口: **B 分類**（vanilla にあってこちらに無い gravel/dirt/water ~379 =
-  `ore_dirt`/`ore_gravel` の欠け + spring の水）、**樹冠の幾何** ~400（木 42 vs 38。chunk 別に
-  (0,-1) 6 vs 7、(0,1) 8 vs 5、(-1,-1) 3 vs 2、(-1,1) 8 vs 7）。
+  残りの出口: **B 分類**（vanilla にあってこちらに無い gravel/dirt/water =
+  `ore_dirt`/`ore_gravel` の欠け + spring の水）、**樹冠の幾何**（木 39 vs 38。chunk 別に
+  (-1,-1) 3 vs 2、(-1,1) 8 vs 7、(0,-1) 6 vs 7）。生ドローの最初の食い違いは
+  (feature 20, step 9, chunk (0,1)) の draw 139 で、vanilla は別の feature の連鎖に入る。
 - **R1d 光（完了 2026-10-20）**: 地形一致後に `light_parity_probe.py` を 3 chunk で
   実行。heightmap と非一様区間の sky digest が vanilla と一致した。差は区間マスクの
   送り方（全 26 区間 vs 一様区間の省略）だけで、値ではない。
