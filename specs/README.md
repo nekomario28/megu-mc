@@ -29,9 +29,10 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 ## 保留・外部依存（値ではなく事実だけ）
 
 - **hosted CIはジョブが起動しません。** GitHub の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。**コード失敗ではない**ので、緑の判定は当面ローカルの `tests/verify.sh` が持ちます。復旧後に同一SHAで再取得します。
-- **比較の前提（固定具の基点）がリポジトリの外にある:** `tools/carver_fixture.sh` / `ore_fixture.sh` は `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を前提にしていますが、それを用意するスクリプトがリポジトリにありません。基点が無いまま固定具を回すと比較は空振りします。
+- **比較の前提（固定具の基点）は再構成できます:** `tools/fixture_base.sh` が `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を組みます。jar は sha1 で固定（`59353fb4…`、既存の1.21.1導入ディレクトリを donor に使う）。基点が無いまま固定具を回すと比較は空振りします。
 - **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MC_SPINE_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
-- **開放中の項目:** LICENSE 未追加、独立レビュー（issue #7）、draft PR #2/#4/#6。統合の事実確認後に閉じる対象です。
+- **開放中の項目:** LICENSE 未追加（#11）、独立レビュー（#7）。draft PR #2/#4/#6 の head ブランチには
+  `main` に同一patchが無いコミットが残っています（9 / 16 / 34件）ので、**閉じる前に内容を移すか捨てるかを決めます**。
 
 ## 次の判別作業
 

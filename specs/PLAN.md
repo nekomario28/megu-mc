@@ -74,7 +74,8 @@ Nether/End、プレイヤー/世界機構・コマンドへ進む。どれも同
 - Cargoが出したartifactを検査する。推測した`target/debug`の古い実行ファイルを使わない。
   検証の終了値をログ整形や外側のパイプで消さない。
 - 独立レビューは実質的な変更ごとに範囲を固定する。静的推論と実行した結果を分ける。
-  `main`へこの統合ブランチをそのままマージしない。
+  統合線は一度 `main` に入れた（2026-10-23、fast-forward）。以後の変更も
+  同じ線で検証してから `main` を進める（旧 main は tag `checkpoint/pre-consolidation-main`）。
 - Pumpkin/Starlight/Lithium/FerriteCoreは設計・挙動の参照であり、コードや文面を写さない。
   静的`javap`、手書きモデル、コンテナへの`black_box`を実行時の証明へ読み替えない。
 
