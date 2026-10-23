@@ -15,10 +15,23 @@ def session(binary, late):
             client.login(late=late)
             require(set(client.chunks) == square(2), f"config-{'late' if late else 'early'}-window")
             if not late:
-                for requested, radius, barrier in [(3, 3, 0x0c), (2, 2, 0x54),
-                                                    (127, 8, 0x0c), (-1, 2, 0x54)]:
+                # a request that grows the window is answered by chunks, paced by
+                # this client's acknowledgements; a request that shrinks it is
+                # answered by the centre update alone
+                for requested, radius, barrier in [(3, 3, None), (2, 2, 0x54),
+                                                   (127, 8, None), (-1, 2, 0x54)]:
                     client.send(0x0a, settings(requested))
-                    client.until_id(barrier, f"play-view-{requested}")
+                    if barrier is None:
+                        before = len(client.chunk_batches)
+                        client.until_chunks(square(radius), f"play-view-{requested}")
+                        # the requested rate (30 chunks/tick) cannot carry the 17x17
+                        # window in one batch, so the acknowledgement gated at least
+                        # one more: that is the pacing this asserts
+                        if requested == 127:
+                            require(len(client.chunk_batches) - before >= 2,
+                                    "chunk-batch-ack-pacing")
+                    else:
+                        client.until_id(barrier, f"play-view-{requested}")
                     require(set(client.chunks) == square(radius), f"play-window-{requested}")
                 client.move(-24.0, 16.0, 24.0)
                 client.until_id(0x0c)

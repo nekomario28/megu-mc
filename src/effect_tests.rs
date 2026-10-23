@@ -19,6 +19,7 @@ pub(super) fn client_pair() -> (Client, TcpStream) {
         cursor: Mutex::new((0, 0, Vec::new())),
         drag: Mutex::new((-1, Vec::new())),
         open_chest: Mutex::new(None),
+        chunk_ack: Mutex::new(ChunkFeedback::new(1)),
         open_furnace: Mutex::new(None),
         craft: Mutex::new(HashMap::new()),
         craft9: Mutex::new(HashMap::new()),

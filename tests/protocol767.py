@@ -235,6 +235,9 @@ class Client:
         self.socket = socket.create_connection(("127.0.0.1", game), timeout=10)
         self.game, self.name = game, name
         self.chunks, self.messages, self.updates = {}, [], []
+        # how many Chunk Batch Finished frames arrived, and the batch sizes they
+        # declared: the delivery is paced by this client's acknowledgements
+        self.chunk_batches = []
         self.light_updates = []
         self.chunk_light = {}
         self.raw_chunk = {}
@@ -323,6 +326,7 @@ class Client:
         elif pid == 0x26:
             self.send(0x18, body)
         elif pid == 0x0c:
+            self.chunk_batches.append(Reader(body).varint())
             self.send(0x08, struct.pack(">f", 30.0))
         elif pid == 0x6c:
             text = Reader(body).nbt()
@@ -355,6 +359,18 @@ class Client:
 
     def until_id(self, pid, contract=None):
         return self.until(lambda actual, _: actual == pid, contract)
+
+    def until_chunks(self, expected, contract=None):
+        """Read until the decoded chunk set is exactly `expected`.
+
+        Delivery is paced: the reader above answers every Chunk Batch Finished
+        with the client's requested chunks/tick, and the server sends the next
+        batch on that answer. "The whole window is here" is therefore a state to
+        reach, not a single packet to wait for.
+        """
+        expected = set(expected)
+        self.until(lambda *_: set(self.chunks) == expected, contract)
+        return set(self.chunks)
 
     def login(self, view=2, late=False):
         self.send(0, vint(767) + string("localhost") + struct.pack(">H", self.game) + vint(2))

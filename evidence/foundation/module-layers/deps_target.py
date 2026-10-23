@@ -17,6 +17,9 @@ layers = [
     ["generation_context"],
     ["worldgen", "block_registry"],
     ["json", "generation_math"],
+    # leaf utilities the root uses: the wire-boundary frame limit and the tick
+    # measurements. They own no game state and depend on nothing.
+    ["ingress_guard", "tick_stats", "chunk_ack"],
 ]
 modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(

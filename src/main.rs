@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 mod cached_lookup;
+mod chunk_ack;
 mod effects;
 #[cfg(feature = "java-compat")]
 mod java_compat;
@@ -17,12 +18,15 @@ mod landing_types;
 #[cfg(test)]
 mod light_pack_tests;
 use cached_lookup::CachedLookup;
+use chunk_ack::ChunkFeedback;
 mod block_registry;
 mod feature;
 mod generation_context;
 mod generation_math;
 mod generation_providers;
+mod ingress_guard;
 mod json;
+mod tick_stats;
 mod tree;
 mod world_rng;
 mod worldgen;
@@ -161,7 +165,9 @@ impl RxBuf {
                 return None;
             }
         }
-        if len < 0 || len > (16 << 20) {
+        // vanilla's Varint21FrameDecoder bound: a three-byte length prefix cannot
+        // describe more, so a larger frame is not something a 1.21.1 client sends.
+        if len < 0 || len as usize > ingress_guard::MAX_PLAY_FRAME {
             return None;
         }
         let total = i + len as usize;
@@ -267,6 +273,7 @@ struct Client {
     skin: Mutex<Option<(String, String)>>, // textures (value, signature) resolved from Mojang
     seen: Mutex<HashSet<i32>>,             // entity ids currently spawned for this client
     chunks: Mutex<HashSet<(i32, i32)>>,    // chunks the client currently holds
+    chunk_ack: Mutex<ChunkFeedback>,       // chunk batch pacing: the client's requested rate
     gen_sources: Mutex<GenSources>, // generated light emitters per held chunk, for the light pass
     gm: Mutex<u8>,                  // 0=survival 1=creative 3=spectator
     fall_from: Mutex<f64>,
@@ -12909,13 +12916,25 @@ fn client_info_view_distance(body: &[u8]) -> Option<i32> {
     Some(view)
 }
 
+/// The chunks in a view window: the ceiling on one batch, and the pace the
+/// client starts with before it has asked for anything.
+fn window_batch(view: i32) -> usize {
+    let side = (2 * view + 1).max(1) as usize;
+    side * side
+}
+
 fn stream_chunks(
     s: &mut TcpStream,
     sent: &mut std::collections::HashSet<(i32, i32)>,
     gen: &mut GenSources,
+    ack: &mut ChunkFeedback,
     ccx: i32,
     ccz: i32,
     view: i32,
+    // the centre is announced when the window moves (spawn, view request,
+    // player crossing a chunk) - not on every batch, or a client pacing its own
+    // batches would see the centre move while nothing did
+    announce_center: bool,
 ) {
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
@@ -12935,22 +12954,38 @@ fn stream_chunks(
         sent.remove(&c);
         gen.remove(&c);
     }
-    let mut vp = Vec::new();
-    write_varint(&mut vp, ccx as i64);
-    write_varint(&mut vp, ccz as i64);
-    let _ = send_packet(s, 0x54, vp);
+    // The centre update is not part of a batch, but it is the answer a view
+    // request waits for even when nothing new is to be sent.
+    if announce_center {
+        let mut vp = Vec::new();
+        write_varint(&mut vp, ccx as i64);
+        write_varint(&mut vp, ccz as i64);
+        let _ = send_packet(s, 0x54, vp);
+    }
+    // A batch is already in flight: vanilla waits for the client's Chunk Batch
+    // Received before starting the next one, and so does this. The chunks that
+    // did not fit are simply not marked as held, so the pump that runs on the
+    // acknowledgement sends them.
+    if ack.awaiting() {
+        return;
+    }
     let mut news = Vec::new();
     for dx in -view..=view {
         for dz in -view..=view {
             let c = (ccx + dx, ccz + dz);
             if !sent.contains(&c) {
                 news.push(c);
-                sent.insert(c);
             }
         }
     }
+    // the client's requested chunks/tick bounds this batch
+    news.truncate(ack.batch_size());
     if news.is_empty() {
         return;
+    }
+    let batch = news.len();
+    for c in &news {
+        sent.insert(*c);
     }
     let _ = send_packet(s, 0x0d, vec![]);
     let mut dirty: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
@@ -12984,8 +13019,9 @@ fn stream_chunks(
         }
     }
     let mut bf = Vec::new();
-    write_varint(&mut bf, news.len() as i64);
+    write_varint(&mut bf, batch as i64);
     let _ = send_packet(s, 0x0c, bf);
+    ack.sent_batch(Instant::now(), batch);
 }
 
 fn join_game() -> Vec<u8> {
@@ -17113,6 +17149,8 @@ fn handle(mut s: TcpStream) {
     let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let mut gen: GenSources = GenSources::new();
     let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
+    // the window is the ceiling; the client's first acknowledgement lowers the pace
+    let mut chunk_ack = ChunkFeedback::new(window_batch(view));
     // vanilla: a returning player resumes where they logged out — the
     // chunk window, spawn teleport and authoritative pos all agree.
     let (sx, sy, sz, syaw, spitch) = pos_store()
@@ -17128,9 +17166,11 @@ fn handle(mut s: TcpStream) {
         &mut s,
         &mut sent,
         &mut gen,
+        &mut chunk_ack,
         (sx / 16.0).floor() as i32,
         (sz / 16.0).floor() as i32,
         view,
+        true,
     );
     let mut tm = Vec::new();
     tm.extend_from_slice(&0i64.to_be_bytes());
@@ -17203,6 +17243,7 @@ fn handle(mut s: TcpStream) {
         pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
         seen: Mutex::new(HashSet::new()),
         chunks: Mutex::new(HashSet::new()),
+        chunk_ack: Mutex::new(chunk_ack),
         gen_sources: Mutex::new(gen),
         xp: Mutex::new(0),
         gm: Mutex::new(1),
@@ -17283,7 +17324,53 @@ fn handle(mut s: TcpStream) {
             RxOut::Frame(pid, b) => (pid, b),
         };
 
+        // a client that stopped answering chunk batches is gone, not slow
+        if me.chunk_ack.lock().unwrap().timed_out(Instant::now()) {
+            eprintln!(
+                "[spine] {} disconnected: chunk batch acknowledgement timeout",
+                me.name
+            );
+            break 'conn;
+        }
+        // vanilla refuses a movement update whose position is not finite or is
+        // outside the world; letting it through carries the value into worldgen,
+        // visibility and every float-to-int conversion behind them.
+        if !ingress_guard::valid_movement_frame(pid, &b) {
+            eprintln!("[spine] {} disconnected: malformed movement frame", me.name);
+            break 'conn;
+        }
+
         match pid {
+            0x08 => {
+                // Java 1.21.1 Chunk Batch Received: desired chunks per tick, four
+                // big-endian f32 bytes. Answering it opens the next batch.
+                let acked = {
+                    let mut ack = me.chunk_ack.lock().unwrap();
+                    ack.acknowledge(&b)
+                };
+                if let Err(why) = acked {
+                    eprintln!("[spine] {} disconnected: {why}", me.name);
+                    break 'conn;
+                }
+                // nothing else pumps the queue when the player stands still, so
+                // the next batch goes out from here
+                let (px, _, pz, _, _, _) = *me.pos.lock().unwrap();
+                let (ccx, ccz) = ((px / 16.0).floor() as i32, (pz / 16.0).floor() as i32);
+                let mut ack = me.chunk_ack.lock().unwrap();
+                let mut ch = me.chunks.lock().unwrap();
+                let mut gen = me.gen_sources.lock().unwrap();
+                // the pump: no centre announcement, this is the same window
+                stream_chunks(
+                    &mut *me.sock.lock().unwrap(),
+                    &mut ch,
+                    &mut gen,
+                    &mut ack,
+                    ccx,
+                    ccz,
+                    view,
+                    false,
+                );
+            }
             0x0a => {
                 let Some(requested) = client_info_view_distance(&b) else {
                     break 'conn;
@@ -17292,15 +17379,19 @@ fn handle(mut s: TcpStream) {
                 if effective != view {
                     view = effective;
                     let (x, _, z, _, _, _) = *me.pos.lock().unwrap();
+                    let mut ack = me.chunk_ack.lock().unwrap();
+                    ack.set_window(window_batch(view));
                     let mut chunks = me.chunks.lock().unwrap();
                     let mut gen = me.gen_sources.lock().unwrap();
                     stream_chunks(
                         &mut *me.sock.lock().unwrap(),
                         &mut chunks,
                         &mut gen,
+                        &mut ack,
                         (x / 16.0).floor() as i32,
                         (z / 16.0).floor() as i32,
                         view,
+                        true,
                     );
                 }
             }
@@ -17334,15 +17425,18 @@ fn handle(mut s: TcpStream) {
                         player_chunk = (ccx, ccz);
 
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut ack = me.chunk_ack.lock().unwrap();
                             let mut ch = me.chunks.lock().unwrap();
                             let mut gen = me.gen_sources.lock().unwrap();
                             stream_chunks(
                                 &mut *me.sock.lock().unwrap(),
                                 &mut ch,
                                 &mut gen,
+                                &mut ack,
                                 ccx,
                                 ccz,
                                 view,
+                                true,
                             )
                         }))
                         .is_ok();
@@ -21540,11 +21634,21 @@ fn main() {
         // spinning to catch up, which would only add more work.
         const TICK_INTERVAL: Duration = Duration::from_millis(TICK_MS);
         let mut next_tick = Instant::now();
+        let mut stats = tick_stats::TickStats::new(next_tick, TICK_INTERVAL);
         loop {
             next_tick += TICK_INTERVAL;
             std::thread::sleep(next_tick.saturating_duration_since(Instant::now()));
             next_tick = next_deadline(next_tick, Instant::now() > next_tick + TICK_INTERVAL);
+            let started = Instant::now();
             game_tick(|_, tick| tick());
+            // the working server's own record of G3: the tick body's cost against
+            // the 50ms budget, once per 100 ticks
+            if let Some(r) = stats.record(Instant::now(), started.elapsed()) {
+                eprintln!(
+                    "[tick] observed_tps={:.2} avg_work_ms={:.2} max_work_ms={:.2} over_budget={}/{}",
+                    r.observed_tps, r.mean_work_ms, r.max_work_ms, r.overruns, tick_stats::SAMPLE_TICKS
+                );
+            }
         }
     });
     // vanilla saves the world on SIGTERM/SIGINT (docker/systemd stop);
