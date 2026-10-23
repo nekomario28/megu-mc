@@ -154,6 +154,7 @@ def main():
     tickish = False
     if "--tick" in sys.argv:
         tickish = True
+    compared = 0
     detail = []
     if "--cells" in sys.argv:
         want_n = int(sys.argv[sys.argv.index("--cells") + 1])
@@ -182,6 +183,7 @@ def main():
             if want is None:
                 skipped.append((cx, cz))
                 continue
+            compared += 1
             diff = 0
             for sec in range(SECTIONS):
                 y0 = MIN_Y + sec * 16
@@ -227,6 +229,13 @@ def main():
         print("top pairs (got, want) x count:")
         for (g, w), c in pairs.most_common(15):
             print(f"  {g:6d} != {w:6d}  x{c}")
+    # A comparison that compared nothing is not a clean result: every chunk was
+    # skipped (a partially generated reference, a wrong region path), and the report
+    # would read as "0 differing cells". Fail instead, so a green 0 always means the
+    # cells were actually compared.
+    if compared == 0:
+        print(f"NOTHING COMPARED: all {len(skipped)} requested chunks were skipped", file=sys.stderr)
+        return 2
     return 1 if total else 0
 
 

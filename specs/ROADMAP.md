@@ -81,6 +81,13 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   union** して feature を選ぶ。こちらは 3×3 の 9 マスを y=0 でサンプルしていたため
   **cave biome を読み地表 biome（river）を落とし**、chunk (-2,1) で `trees_water` ほか
   3 件を実行していなかった（step 9 が 9 件 vs vanilla 12 件 → 修正で一致）。
+  15. **装飾順は chunk ごとに違う**: 現行の「3×3 を先に decorate」は固定具の world
+  （spawn 準備で周辺が先に装飾される）と整合する。一律に「自分の chunk だけ」へ変えると
+  マテリアルルール（feature ハイトマップを読む）まで動き、704 → **6709** に悪化する。
+  順序に依存しない固定具（spawn から離れた chunk を自力生成）は未達で、
+  `forceload` は spawn 近傍以外で失敗し `setworldspawn` は再準備しない。
+  道は (a) 自前 protocol client で遠方を歩かせて順序を作る、(b) level.dat に spawn を
+  書いてから新規作成、(c) spawn 準備の spiral 順を再現、(d) 順序依存セルを除外。
   残りの出口: **B 分類**（vanilla にあってこちらに無い gravel/dirt/water =
   `ore_dirt`/`ore_gravel` の欠け + spring の水）、**樹冠の幾何**（木 39 vs 38）。加えて
   **装飾順の差**: seed も添字も一致するのに chunk (-2,1) の木が一致しないのは、
