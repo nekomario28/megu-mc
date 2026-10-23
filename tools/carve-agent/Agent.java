@@ -343,18 +343,22 @@ public class Agent {
                     boolean bound = mn.equals("a") && md.equals("(I)I");
                     boolean plain = mn.equals("f") && md.equals("()I");
                     boolean flt = mn.equals("i") && md.equals("()F");
-                    if (!bound && !plain && !flt) return mv;
+                    boolean dbl = mn.equals("j") && md.equals("()D");
+                    if (!bound && !plain && !flt && !dbl) return mv;
                     return new MethodVisitor(Opcodes.ASM9, mv) {
                         @Override public void visitInsn(int op) {
-                            boolean ret = bound || plain ? op == Opcodes.IRETURN : op == Opcodes.FRETURN;
+                            boolean ret = (bound || plain) ? op == Opcodes.IRETURN
+                                : (flt ? op == Opcodes.FRETURN : op == Opcodes.DRETURN);
                             if (!ret) { super.visitInsn(op); return; }
-                            if (flt) {
-                                super.visitVarInsn(Opcodes.FSTORE, 40);
-                                super.visitLdcInsn("nextFloat");
-                                super.visitVarInsn(Opcodes.FLOAD, 40);
-                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdrawF",
-                                                      "(Ljava/lang/String;F)V", false);
-                                super.visitVarInsn(Opcodes.FLOAD, 40);
+                            if (flt || dbl) {
+                                super.visitVarInsn(dbl ? Opcodes.DSTORE : Opcodes.FSTORE, 40);
+                                super.visitLdcInsn(dbl ? "nextDouble" : "nextFloat");
+                                super.visitVarInsn(dbl ? Opcodes.DLOAD : Opcodes.FLOAD, 40);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog",
+                                                      dbl ? "rdrawD" : "rdrawF",
+                                                      dbl ? "(Ljava/lang/String;D)V"
+                                                          : "(Ljava/lang/String;F)V", false);
+                                super.visitVarInsn(dbl ? Opcodes.DLOAD : Opcodes.FLOAD, 40);
                                 super.visitInsn(op);
                                 return;
                             }
