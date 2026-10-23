@@ -182,10 +182,19 @@ verify_restored() {
 }
 
 check "lazy feature lookup applies its population input and retains cached overrides" \
-  src/worldgen.rs '                    populate(self, sx, sz);' \
-  '                    let _ = (&mut populate, sx, sz);' \
+  src/worldgen.rs '            for sx in x0..=x1 {
+                for sz in z0..=z1 {
+                    if !self.pop_done.contains(&(sx, sz)) {
+                        self.pop_done.insert((sx, sz));
+                        populate(self, sx, sz);
+                    }' \
+  '            for sx in x0..=x1 {
+                for sz in z0..=z1 {
+                    if !self.pop_done.contains(&(sx, sz)) {
+                        self.pop_done.insert((sx, sz));
+                        let _ = (&mut populate, sx, sz);
+                    }' \
   worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides
-
 check "a placed gravity block is scheduled by its own cell" \
   src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {' \
   '    for (px, py, pz) in [(x, y + 1, z), (x, y + 1, z)] {' \
@@ -212,10 +221,12 @@ check "block light sees a neighbour's generated source" \
   block_light_sees_a_neighbours_generated_source
 
 check "a removed generated emitter stops lighting" \
-  src/main.rs 'if w.get(&(p.0 >> 4, p.2 >> 4)).and_then(|c| c.get(&local_idx(p.0, p.1, p.2))).is_some() {' \
-  'if false {' \
+  src/main.rs '                if w.get(&(p.0 >> 4, p.2 >> 4))
+                    .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
+                    .is_some()
+                {' \
+  '                if false {' \
   a_removed_generated_emitter_stops_lighting
-
 check "sky spill loses one level per step" \
   src/main.rs '            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));' \
   '            let nl = level;' \
@@ -224,12 +235,16 @@ check "sky spill loses one level per step" \
 check "a knocked-out gravity block becomes an entity" \
   src/main.rs '        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         falling().lock().unwrap().push(Fall {
-            eid, x: px as f64 + 0.5, y: py as f64, z: pz as f64 + 0.5,
-            dy: 0.0, state: st, time: 0,
+            eid,
+            x: px as f64 + 0.5,
+            y: py as f64,
+            z: pz as f64 + 0.5,
+            dy: 0.0,
+            state: st,
+            time: 0,
         });' \
   '        let _eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);' \
   concurrent_knockout_and_falling_conserve_blocks
-
 check "light sections start one below the world" \
   src/main.rs 'const LIGHT_MIN_Y: i32 = MIN_Y - 16;' \
   'const LIGHT_MIN_Y: i32 = MIN_Y;' \
@@ -246,15 +261,21 @@ check "a long unsupported column converts in one pass" \
   a_long_unsupported_column_converts_in_one_pass
 
 check "a passing entity must not suppress a new block in the same cell" \
-  src/main.rs '        if !set_block_if(px, py, pz, 0, Some(st)) { return; }' \
-  '        if falling().lock().unwrap().iter().any(|f| f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64) { return; } if !set_block_if(px, py, pz, 0, Some(st)) { return; }' \
+  src/main.rs '        if !set_block_if(px, py, pz, 0, Some(st)) {
+            return;
+        }' \
+  '        if falling().lock().unwrap().iter().any(|f| f.x.floor() == px as f64 && f.y.floor() == py as f64 && f.z.floor() == pz as f64) { return; } if !set_block_if(px, py, pz, 0, Some(st)) {
+            return;
+        }' \
   a_new_block_in_a_passing_entity_cell_still_falls
-
 check "the falling set comes from the asset, not a hand list" \
-  src/main.rs '        if reg.behaviour_of(st) != crate::block_registry::B_FALLING { continue }' \
-  '        if !matches!(st, 112 | 117 | 118) { continue }' \
+  src/main.rs '        if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
+            continue;
+        }' \
+  '        if !matches!(st, 112 | 117 | 118) {
+            continue;
+        }' \
   every_falling_block_becomes_an_entity_and_lands
-
 check "gravity is 0.04 per tick, not doubled" \
   src/main.rs '            f.dy -= 0.04;' \
   '            f.dy -= 0.08;' \
@@ -297,10 +318,15 @@ check "a block that drops twice keeps its second drop" \
   a_potted_plant_drops_both_entries_the_asset_lists
 
 check "a falling block does not move in a cold chunk" \
-  src/main.rs '            if !region.is_warm(f.x as i32, f.z as i32) { keep.push(f); continue; }' \
-  '            if false { keep.push(f); continue; }' \
+  src/main.rs '            if !region.is_warm(f.x as i32, f.z as i32) {
+                keep.push(f);
+                continue;
+            }' \
+  '            if false {
+                keep.push(f);
+                continue;
+            }' \
   a_falling_block_waits_in_a_cold_chunk
-
 check "a save carries the falling entities it reloads" \
   src/main.rs '    write_varint(&mut *f, in_flight.len() as i64);' \
   '    write_varint(&mut *f, 0i64);' \
@@ -322,10 +348,13 @@ check "a conversion does not leave a second drop behind" \
   a_save_during_entity_conversion_has_no_duplicate_drop
 
 check "a block in a cold chunk keeps its position across ticks" \
-  src/main.rs '            if !region.is_warm(f.x as i32, f.z as i32) { keep.push(f); continue; }' \
-  '            if !region.is_warm(f.x as i32, f.z as i32) { }' \
+  src/main.rs '            if !region.is_warm(f.x as i32, f.z as i32) {
+                keep.push(f);
+                continue;
+            }' \
+  '            if !region.is_warm(f.x as i32, f.z as i32) {
+            }' \
   region_change_mid_fall_keeps_the_entity
-
 check "breaking a chest drops the slots it owned" \
   src/main.rs '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z)) {' \
   '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z + 1000)) {' \
@@ -352,10 +381,12 @@ check "a broken furnace cannot retain its slots" \
   furnace_and_sign_round_trip_keeps_only_live_owners
 
 check "broken sign text cannot survive its block" \
-  src/main.rs 'signs().lock().unwrap().retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
-  'signs().lock().unwrap().retain(|_, _| true);' \
+  src/main.rs '        signs()
+            .lock()
+            .unwrap()
+            .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
+  '        signs().lock().unwrap().retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
-
 check "solid metadata must reach every note block state" \
   src/block_registry.rs '                        reg.st_fl[st] = flags;' \
   '                        reg.st_fl[st] = 0;' \
@@ -377,13 +408,10 @@ check "a context override outranks the cached terrain read" \
   context_overrides_heights_bounds_and_biomes_keep_existing_results
 
 check "placement modifiers advance positions in vanilla's draw order" \
-  src/feature.rs '        PM::InSquare => {
-            out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + rng.next_bound(16)));' \
-  '        PM::InSquare => {
-            let z = rng.next_bound(16);
-            out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + z));' \
+  src/feature.rs '            let (x, z) = (pos.0 + rng.next_bound(16), pos.2 + rng.next_bound(16));' \
+  '            let z = pos.2 + rng.next_bound(16);
+            let x = pos.0 + rng.next_bound(16);' \
   feature_population_output_matches_the_pre_refactor_capture
-
 check "the ore vein radius matches vanilla's own output" \
   src/feature.rs '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \
   '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0 + 0.01;' \
@@ -395,25 +423,40 @@ check "the frozen population digest notices shared provider changes" \
   feature_population_output_matches_the_pre_refactor_capture
 
 check "the deep-state memo returns the value it computed" \
-  src/worldgen.rs 'if let Some(&v) = self.deep_c.get(&(x, y, z)) { return v; }' \
-  'if self.deep_c.contains_key(&(x, y, z)) { return 0; }' \
+  src/worldgen.rs '        if let Some(&v) = self.deep_c.get(&(x, y, z)) {
+            return v;
+        }' \
+  '        if self.deep_c.contains_key(&(x, y, z)) {
+            return 0;
+        }' \
   feature_population_output_matches_the_pre_refactor_capture
-
 check "the noise-value cache returns the value it computed" \
-  src/generation_math.rs 'if slot.0 == key { Some(slot.1) } else { None }' \
-  'if slot.0 == key { Some(slot.1 + 1.0) } else { None }' \
+  src/generation_math.rs '            if slot.0 == key {
+                Some(slot.1)
+            } else {' \
+  '            if slot.0 == key {
+                Some(slot.1 + 1.0)
+            } else {' \
   feature_population_output_matches_the_pre_refactor_capture
-
 check "the shared biome cache returns the value it computed" \
   src/worldgen.rs '        self.bioq.insert(key, l);' \
   '        self.bioq.insert(key, l.wrapping_add(1));' \
   the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart
 
 check "the queue cap cannot visit a cell before its real backoff" \
-  src/main.rs '    backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)' \
-  '    backoff().lock().unwrap().get(&(x, y, z)).map(|(_t, _)| true).unwrap_or(true)' \
+  src/main.rs '    backoff()
+        .lock()
+        .unwrap()
+        .get(&(x, y, z))
+        .map(|(t, _)| *t <= now)
+        .unwrap_or(true)' \
+  '    backoff()
+        .lock()
+        .unwrap()
+        .get(&(x, y, z))
+        .map(|(_t, _)| true)
+        .unwrap_or(true)' \
   a_backoff_past_the_queue_cap_waits_for_its_real_deadline
-
 check "a reload continues the world random stream" \
   src/main.rs '            world_rng::restore(u64::from_be_bytes(payload[p..p + 8].try_into().unwrap()));' \
   '            let _ = &payload[p..p + 8];' \
@@ -438,26 +481,26 @@ check "configuration information after known packs reaches chunk streaming" \
   tests/client_settings_wire.py 'client settings wire: FAIL config-late-window'
 
 check "play information reaches the live chunk window" \
-  src/main.rs '            0x0a => {' '            0x7f => {' \
+  src/main.rs '                let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);' \
+  '                let effective = view;' \
   tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
-
 check "breaking changes server state, not only the predicted wire update" \
   src/main.rs '                    if break_now {
-                    set_block(x, y, z, 0);' \
+                        set_block(x, y, z, 0);' \
   '                    if break_now {
-                    let _ = old;' \
+                        let _ = old;' \
   tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
-
 check "chat returns the actual sender and message" \
   src/main.rs '                    let line = format!("<{}> {}", me.name, m);' \
   '                    let line = format!("<{}> {}", me.name, "");' \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
 check "light arrays agree with their section masks" \
-  src/main.rs 'write_varint(p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask' \
-  'write_varint(p, 1); p.extend_from_slice(&0x3fffffei64.to_be_bytes()); // skyLightMask' \
+  src/main.rs '    write_varint(p, 1);
+    p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask' \
+  '    write_varint(p, 1);
+    p.extend_from_slice(&0x3fffffei64.to_be_bytes()); // skyLightMask' \
   tests/gameplay_wire.py 'gameplay wire: FAIL light-mask-count'
-
 check "an update packet sends block light only" \
   src/main.rs '    write_varint(&mut p, 0); // skyLightMask: sky is unchanged' \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
