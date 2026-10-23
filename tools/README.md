@@ -24,7 +24,8 @@
 
 | 変数 | 何が出るか |
 |---|---|
-| `MC_SPINE_WG_DUMP/_N/_X/_Z` | block state の offline dump（比較の入力） |
+| `MC_SPINE_WG_PROFILE=n` | `n×n` chunk を処理する**offline診断モード**。診断用envだけを付けて通常起動すると、サーバーがlistenし続けるので、先にこのモードを指定し、終了ログを確認する |
+| `MC_SPINE_WG_DUMP/_N/_X/_Z` | offline mode 内で block state dump（比較の入力） |
 | `MC_SPINE_NOFEAT` / `_NOCARVE` / `_NOAQ` | 層を止めて帰属を分ける |
 | `MC_SPINE_FEAT_NBR=0` | 隣 chunk を decorate しない（順序の実験用） |
 | `MC_SPINE_POP_REGION=x0,z0,x1,z1` | その領域を辞書順で decorate（順序の実験用） |
