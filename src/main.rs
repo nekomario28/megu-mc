@@ -13643,7 +13643,7 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
         if pw > dim || ph > dim {
             continue;
         }
-        'off: for oy in 0..=(dim - ph) {
+        for oy in 0..=(dim - ph) {
             for ox in 0..=(dim - pw) {
                 let mut ok = true;
                 for gy in 0..dim {
@@ -13687,7 +13687,10 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
                 if ok {
                     return Some((r.out, r.out_cnt, Vec::new()));
                 }
-                continue 'off;
+                // this offset failed: try the next one. The label used to point
+                // at the outer loop, so only ox = 0 was ever tried and a pattern
+                // that needed a horizontal shift never matched.
+                continue;
             }
         }
     }
@@ -16644,15 +16647,23 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                     format!("{}ed {} target(s)", if sub=="add" {"tagg"} else {"untagg"}, n)
                 }
                 "list" => {
+                    // one report per matched target: a `return` inside the loop
+                    // answered only for the first one and named the selector
+                    // (`@a`) instead of the target it was reporting.
+                    let mut lines: Vec<String> = Vec::new();
                     for t in &tgts {
                         let key = if let Some(e) = t.strip_prefix("m:") { format!("e:{}", e) }
                             else { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *t)
                                 .map(|c| format!("p:{}", c.name)).unwrap_or_default() };
+                        if key.is_empty() { continue }
+                        let who = key.strip_prefix("p:").unwrap_or(t).to_string();
                         let st = tm.get(&key);
-                        return format!("{} has {} tag(s): {}", sel, st.map(|s| s.len()).unwrap_or(0),
-                            st.map(|s| s.iter().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default())
+                        let mut tags: Vec<String> = st.map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                        tags.sort();
+                        lines.push(format!("{} has {} tag(s): {}", who,
+                            tags.len(), tags.join(", ")));
                     }
-                    "no targets".into()
+                    if lines.is_empty() { "no targets".into() } else { lines.join(", ") }
                 }
                 _ => "usage: /tag <target> add|remove|list [tag]".into(),
             }
@@ -21618,6 +21629,10 @@ static WORLD_TEST_LOCK: Mutex<()> = Mutex::new(());
 fn world_guard() -> std::sync::MutexGuard<'static, ()> {
     WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
+#[cfg(test)]
+mod command_tests;
+#[cfg(test)]
+mod craft_tests;
 #[cfg(test)]
 mod effect_tests;
 #[cfg(test)]
