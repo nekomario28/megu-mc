@@ -104,8 +104,10 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   16. **configured-feature の型カバレッジ**: datapack 内60種、`p_cf` は受理名を実装する
   （alias を含むため単純な割り算はしない）。未対応型は `Unknown` として空振りしうる。
   `kelp` の bytecode 準拠実装を追加したが、現fixtureの両側とも0セルで parity 未検証。
-  次は kelp が実在する海洋 biome の完全生成 reference fixture を作り、typed draw と
-  cell sets を比較する。その後に次の未対応型へ進む。
+  次のfixtureは (a) kelp を含む海洋 biome で placed feature が選択される、(b) reference
+  chunk が完全生成済み、(c) reference に正の kelp/kelp_plant 数がある、(d) draw trace と
+  block cell sets を比較する、を満たすこと。0/0 なら parity gate は失敗させる。
+  その後に次の未対応型へ進む。
   **出口条件への含意は仮説**: chunk 装飾の順序/可視性が残差に影響する証拠はあるが、現在の
   4×4出力は deep/carver に分類され、feature残差の根拠にならない。現固定具で block diff 0
   が原理的に不可能とも、protocol client が唯一の方法ともまだ言えない。fixture の段階と
