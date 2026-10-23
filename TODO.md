@@ -267,3 +267,29 @@ feature あり 2×2 の diff は **40975 → 2062**（1 chunk あたり ~520 = 0
 残り: 木・disk は `feature/`（configured feature）が 1.21.2+ 形状のままで、
 1.21.1 の値と噛み合わない。**configured_feature の 1.21.1 化 + パーサ両対応**が次の単位。
 そのあと carver 層 1040 セル、構造物（未実装）、性能（R3）。
+
+## R1a feature 層（2026-10-22 続き、現在 1856 セル）
+
+feature あり 2×2 の diff: **40975 → 1856**（chunk (0,0) 単体 10177 → **140**）。
+追加で直したもの:
+
+6. **feature の並び順が依存する入力 biome 集合**: `FeatureSorter.buildFeaturesPerStep`
+   は biome source の possibleBiomes（overworld **53 件**）を受け取る。64 件の registry 順
+   （nether/end/the_void 込み）だと step 2/9/10 の添字がずれる。step 6（ore）が
+   正しく見えていたのは「どの biome でも並びが同一」で tie-break に依存しないため。
+   `trees_birch_and_oak` は 31 → **20**。
+7. **placement modifier の落下**: `fixed_placement` 未対応で modifier が黙って落ちていた
+   → `PF_UNKNOWN=1` を追加して実装。
+8. **`would_survive` は設定された state を評価**する（現在のブロックではない）。
+9. **disk 系が 0 書き込み**: 1.21.1 の rule-based state provider は `type` が無く、
+   `"fluids": "minecraft:water"` は単一値 → どちらも解析失敗で feature ごと消えていた
+   （`CF_MISSING=1` を追加して発見）。
+
+残り: 葉の `distance` プロパティ（`oak_leaves != oak_leaves` 190）= TreeFeature の
+`updateLeaves` 未実装、葉の位置 844、`diorite != water/gravel` 200、carver 層 1219。
+
+計測器（すべてサーバー内 javaagent）: `FSEED` / `ORE` / `TREE` / `BIOMEF` / `INSQ` /
+`RDRAW`（`dyn` の default draw）/ `BIOMELIST` / dimension ゲート（`I_()` = −64）。
+port 側: `FSEED_TRACE` / `FSEED_ARM`（`NDRAW`/`FDRAW`/`XDRAW`）/ `ORE_TRACE` /
+`TREE_TRACE` / `BIOMEF_TRACE` / `FEAT_TRACE` / `FEAT_LIST` / `PF_UNKNOWN` /
+`CF_MISSING` / `MC_SPINE_BIOME_DUMP` / `MC_SPINE_HM_DUMP`。
