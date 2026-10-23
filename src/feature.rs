@@ -121,6 +121,9 @@ fn p_pf(j: &J) -> Option<Pf> {
 
 fn p_cf(j: &J) -> Option<Cf> {
     let ty = jstr(j, "type")?;
+    // 1.21.1 wraps a configured feature's parameters in a "config" object;
+    // 1.21.2+ (and this repository's older copy) inlines them beside "type".
+    let j = js(j, "config").unwrap_or(j);
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
     Some(match ty {
         "ore" | "scattered_ore" => {
@@ -273,31 +276,28 @@ pub(crate) struct FReg {
     steps: usize,
 }
 
-// vanilla overworld biome order for feature-ordering ties (registry order)
+// The biome list `FeatureSorter.buildFeaturesPerStep` receives for the overworld: the
+// noise biome source's possible biomes. It is *not* the 64-entry registry - the nether,
+// the end and `the_void` are absent - and the order matters: it seeds the per-feature
+// index that every placed feature's RNG offset is derived from. Steps whose lists differ
+// between biomes (2, 9, 10) are sensitive to it; the ore step (6) is not, because every
+// biome lists the same ores in the same order. Measured from a 1.21.1 server by logging
+// `deg.a`'s first argument (see tools/carve-agent).
 const OW_BIOMES: &[&str] = &[
-    "minecraft:plains", "minecraft:sunflower_plains", "minecraft:snowy_plains",
-    "minecraft:ice_spikes", "minecraft:desert", "minecraft:swamp",
-    "minecraft:mangrove_swamp", "minecraft:forest", "minecraft:flower_forest",
-    "minecraft:birch_forest", "minecraft:dark_forest",
-    "minecraft:old_growth_birch_forest", "minecraft:old_growth_pine_taiga",
-    "minecraft:old_growth_spruce_taiga", "minecraft:taiga", "minecraft:snowy_taiga",
-    "minecraft:savanna", "minecraft:savanna_plateau", "minecraft:windswept_hills",
-    "minecraft:windswept_gravelly_hills", "minecraft:windswept_forest",
-    "minecraft:windswept_savanna", "minecraft:jungle", "minecraft:sparse_jungle",
-    "minecraft:bamboo_jungle", "minecraft:badlands", "minecraft:eroded_badlands",
-    "minecraft:wooded_badlands", "minecraft:meadow", "minecraft:cherry_grove",
-    "minecraft:grove", "minecraft:snowy_slopes", "minecraft:frozen_peaks",
-    "minecraft:jagged_peaks", "minecraft:stony_peaks", "minecraft:river",
-    "minecraft:frozen_river", "minecraft:beach", "minecraft:snowy_beach",
-    "minecraft:stony_shore", "minecraft:warm_ocean", "minecraft:lukewarm_ocean",
-    "minecraft:deep_lukewarm_ocean", "minecraft:ocean", "minecraft:deep_ocean",
-    "minecraft:cold_ocean", "minecraft:deep_cold_ocean", "minecraft:frozen_ocean",
-    "minecraft:deep_frozen_ocean", "minecraft:mushroom_fields",
-    "minecraft:dripstone_caves", "minecraft:lush_caves", "minecraft:deep_dark",
-    "minecraft:the_void", "minecraft:small_end_islands", "minecraft:end_midlands",
-    "minecraft:end_highlands", "minecraft:end_barrens", "minecraft:the_end",
-    "minecraft:nether_wastes", "minecraft:soul_sand_valley",
-    "minecraft:crimson_forest", "minecraft:warped_forest", "minecraft:basalt_deltas",
+    "minecraft:mushroom_fields", "minecraft:deep_frozen_ocean", "minecraft:frozen_ocean", "minecraft:deep_cold_ocean",
+    "minecraft:cold_ocean", "minecraft:deep_ocean", "minecraft:ocean", "minecraft:deep_lukewarm_ocean",
+    "minecraft:lukewarm_ocean", "minecraft:warm_ocean", "minecraft:stony_shore", "minecraft:swamp",
+    "minecraft:mangrove_swamp", "minecraft:snowy_slopes", "minecraft:snowy_plains", "minecraft:snowy_beach",
+    "minecraft:windswept_gravelly_hills", "minecraft:grove", "minecraft:windswept_hills", "minecraft:snowy_taiga",
+    "minecraft:windswept_forest", "minecraft:taiga", "minecraft:plains", "minecraft:meadow",
+    "minecraft:beach", "minecraft:forest", "minecraft:old_growth_spruce_taiga", "minecraft:flower_forest",
+    "minecraft:birch_forest", "minecraft:dark_forest", "minecraft:savanna_plateau", "minecraft:savanna",
+    "minecraft:jungle", "minecraft:badlands", "minecraft:desert", "minecraft:wooded_badlands",
+    "minecraft:jagged_peaks", "minecraft:stony_peaks", "minecraft:frozen_river", "minecraft:river",
+    "minecraft:ice_spikes", "minecraft:old_growth_pine_taiga", "minecraft:sunflower_plains", "minecraft:old_growth_birch_forest",
+    "minecraft:sparse_jungle", "minecraft:bamboo_jungle", "minecraft:eroded_badlands", "minecraft:windswept_savanna",
+    "minecraft:cherry_grove", "minecraft:frozen_peaks", "minecraft:dripstone_caves", "minecraft:lush_caves",
+    "minecraft:deep_dark",
 ];
 
 /// Vanilla's DFS (obf `ayd.a`): post-order visit over the feature edges, neighbours in
@@ -875,6 +875,21 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
     match cf {
         Cf::Unknown(_) => {}
         Cf::Tree(t) => {
+            if let Ok(spec) = std::env::var("TREE_TRACE") {
+                // same one-chunk radius as the agent's -Dtreechunk
+                if let Some((a, b)) = spec.split_once(',') {
+                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), b.parse::<i32>()) {
+                        let (dx, dz) = (pos.0 >> 4, pos.2 >> 4);
+                        if (cx - dx).abs() <= 1 && (cz - dz).abs() <= 1 {
+                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "TREE {} {} {} feature={},{}",
+                                pos.0, pos.1, pos.2, cf >> 32, cf & 0xFFFF
+                            );
+                        }
+                    }
+                }
+            }
             crate::tree::gen_tree(ctx, rng, pos, t);
         }
         Cf::Ore { size, discard, targets, scattered } => {

@@ -32,6 +32,28 @@ public class CarveLog {
         RD.get()[1] = 0;
     }
 
+    /** `FeatureSorter.buildFeaturesPerStep`'s biome list, in iteration order. */
+    public static void biomes(Object list) {
+        if (System.getProperty("biomelist") == null) return;
+        System.out.println("BIOMELIST " + list);
+    }
+
+    /** Set by ChunkGenerator.applyBiomeDecoration's min build height. */
+    static final ThreadLocal<int[]> DIM = new ThreadLocal<int[]>() {
+        @Override protected int[] initialValue() { return new int[] { Integer.MIN_VALUE }; }
+    };
+
+    /** -64 marks the overworld; every per-chunk log is gated on it. */
+    static boolean overworld() {
+        String p = System.getProperty("dim");
+        if (p == null) return true;
+        return DIM.get()[0] == Integer.parseInt(p);
+    }
+
+    public static void dim(int minY) {
+        DIM.get()[0] = minY;
+    }
+
     static final ThreadLocal<int[]> FEAT = new ThreadLocal<int[]>() {
         @Override protected int[] initialValue() { return new int[] { -1, -1 }; }
     };
@@ -58,7 +80,7 @@ public class CarveLog {
         if (a.length != 2) return;
         int[] c = CHUNK.get();
         if (c[0] != Integer.parseInt(a[0]) || c[1] != Integer.parseInt(a[1])) return;
-        if (c[2] != 1) return;
+        if (c[2] != 1 || !overworld()) return;
         FEAT.get()[0] = i;
         FEAT.get()[1] = step;
         System.out.println("FSEED " + seed + " " + i + " " + step);
@@ -75,10 +97,31 @@ public class CarveLog {
         if (p == null) return;
         String[] a = p.split(",");
         if (a.length != 2) return;
-        if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        // the trunk may sit in a neighbour while its canopy spills into the
+        // chunk of interest, so accept a one-chunk radius
+        int dx = (x >> 4) - Integer.parseInt(a[0]);
+        int dz = (z >> 4) - Integer.parseInt(a[1]);
+        if (dx < -1 || dx > 1 || dz < -1 || dz > 1) return;
+        if (!overworld()) return;
         int[] f = FEAT.get();
         System.out.println("ORE " + x + " " + y + " " + z + " size=" + size
                 + " feature=" + f[0] + "," + f[1]);
+    }
+
+    /** TreeFeature.place origins: `-Dtreechunk=cx,cz` limits the log to one chunk. */
+    public static void tree(int x, int y, int z) {
+        String p = System.getProperty("treechunk");
+        if (p == null) return;
+        String[] a = p.split(",");
+        if (a.length != 2) return;
+        // the trunk may sit in a neighbour while its canopy spills into the
+        // chunk of interest, so accept a one-chunk radius
+        int dx = (x >> 4) - Integer.parseInt(a[0]);
+        int dz = (z >> 4) - Integer.parseInt(a[1]);
+        if (dx < -1 || dx > 1 || dz < -1 || dz > 1) return;
+        if (!overworld()) return;
+        int[] f = FEAT.get();
+        System.out.println("TREE " + x + " " + y + " " + z + " feature=" + f[0] + "," + f[1]);
     }
 
     /** Gate for -Dveindump=x,y,z: which cells the vein sampler should report. */

@@ -3031,6 +3031,38 @@ pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
 }
 
 /// 4x4x4 biome ids for one chunk section, quart-space index (y<<4|z<<2|x).
+/// `MC_SPINE_BIOME_DUMP=cx,sy,cz`: print the quart-sampled biome name for every
+/// 4x4x4 cell of one section, to compare against a saved vanilla chunk.
+pub fn biome_dump(spec: &str) {
+    let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
+    if p.len() != 3 {
+        return;
+    }
+    let mut gg = GEN.lock().unwrap();
+    let Some(g) = gg.as_mut() else { return };
+    let (cx, sy, cz) = (p[0], p[1], p[2]);
+    let (qx0, qy0, qz0) = (cx * 4, sy >> 2, cz * 4);
+    let mut last: Option<u16> = None;
+    for ly in 0..4 {
+        for lz in 0..4 {
+            for lx in 0..4 {
+                if let Some((_, lid)) = g.biome_quart(qx0 + lx, qy0 + ly, qz0 + lz, last) {
+                    last = Some(lid);
+                    let name = g
+                        .biome_names
+                        .get(lid as usize)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{lid}"));
+                    eprintln!(
+                        "BDUMP {} {} {} {}",
+                        (qx0 + lx) * 4, (qy0 + ly) * 4, (qz0 + lz) * 4, name
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
     let mut gg = GEN.lock().unwrap();
     let g = gg.as_mut()?;
@@ -3455,7 +3487,14 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // `trees_birch_and_oak_leaf_litter` while the 1.21.1 biomes reference
         // `trees_birch_and_oak`, so every forest tree was silently skipped).
         // 2x2 feature-on diff: 2188 -> 2062.
-        assert_eq!(digest, "c1859cd281c1f5056b5b97243953637d",
+        // 2026-10-22: the feature-order tie-break list is now the biome list
+        // `FeatureSorter.buildFeaturesPerStep` actually receives (53 overworld
+        // biomes, measured from a live server) instead of a 64-entry registry
+        // order that also contained the nether and the end. That shifted the
+        // per-feature index - and therefore the RNG offset - of every step whose
+        // biome lists differ, so trees and vegetation landed in the wrong places
+        // while the ore step (identical lists in every biome) was unaffected.
+        assert_eq!(digest, "5b8655ca01002e0da4f69ab4d08069d7",
             "feature population output changed from the vanilla-order capture");
     }
 

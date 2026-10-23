@@ -1242,3 +1242,43 @@ feature あり 2×2 の diff は 2188 → **2062**。
 上書きすると逆に 24063 まで悪化する（ore の `targets.state` が `{"Name":...}` 形式に
 なるため）。木・disk を仕上げるには **configured_feature の 1.21.1 化 + パーサの
 両対応**が必要で、これは次の作業単位。
+
+## 35. feature の順序表が 53 biome だった（木が全部ずれていた真因）
+
+木の trunk 位置を実サーバーから取り（`edq` = TreeFeature を実行時にフック、
+`-Dtreechunk=cx,cz` は ±1 chunk を許容）、こちらの `TREE_TRACE` と比べると
+38 本中 1 本しか一致しなかった。y は概ね合うのに (x,z) が違う。
+
+決め手は **feature ごとの deco seed**。vanilla の `setFeatureSeed(seed, i, step)` は
+`seed + i + 10000*step` なので、chunk (0,0)（deco seed 0）では *i そのもの*が出る。
+両者を並べると:
+
+| step | vanilla の i | こちら |
+|---|---|---|
+| 1, 3, 6, 8 | 一致 | 一致 |
+| 2 | [2] | [3] |
+| 9 | [0,17,20,48,49,51,60,63,64,71,72,73] | [2,4,28,31,36,41,49,68,69,80,81,93] |
+| 10 | [0] | [1] |
+
+step 6（ore）だけ一致するのは、**どの biome でも step 6 の並びが同一**なので
+トポロジカルソートの結果が tie-break 順に依存しないため。step 2/9/10 は
+biome ごとに並びが違うので、`FeatureSorter` の first-seen index（biome を
+**どの順で**走査するか）に依存する。
+
+こちらの `OW_BIOMES` は 64 件で nether / end / the_void を含んでいた。vanilla の
+`FeatureSorter.buildFeaturesPerStep` が受け取るのは **biome source の
+possibleBiomes（53 件、overworld のみ）**。`deg.a`（= buildFeaturesPerStep）の
+第 1 引数をエージェントで出力して実測すると:
+
+```
+[Reference{.../minecraft:mushroom_fields}, .../deep_frozen_ocean, ...,
+ .../jungle, .../badlands, .../desert]
+```
+
+この 53 件順で `OW_BIOMES` を置き換えると **全 step の i 集合が vanilla と一致**
+（`trees_birch_and_oak` は 31 → **20**）。tree の origin 一致は 1/38 → 14/38 に増えた。
+step 6 の不変性のおかげで ore は今まで正しく見えていた、という関係。
+
+**教訓**: feature の RNG オフセットは「step 内の添字」で決まる。添字は
+全 biome の並びから作るトポロジカルソートなので、**入力の biome 集合と順序**が
+正しくないと、並びが同一の step（ore など）だけが正しく見える。

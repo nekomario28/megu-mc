@@ -312,6 +312,97 @@ public class Agent {
         }
     }
 
+    /** FeatureSorter.buildFeaturesPerStep: log the biome iteration order. */
+    static byte[] instrumentBiomes(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.startsWith("(Ljava/util/List;Ljava/util/function/Function;Z)")) {
+                        return mv;
+                    }
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            super.visitVarInsn(Opcodes.ALOAD, 0);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "biomes",
+                                                  "(Ljava/lang/Object;)V", false);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT biomes failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * ChunkGenerator.applyBiomeDecoration: remember which dimension is decorating.
+     * The nether and the end decorate the same chunk coordinates with the same
+     * level seed, so every per-chunk log needs this discriminator
+     * (LevelHeightAccessor.getMinBuildHeight is -64 only in the overworld).
+     */
+    static byte[] instrumentDimension(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.startsWith("(Ldds;Lduy;")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            super.visitVarInsn(Opcodes.ALOAD, 1);
+                            super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dcy", "I_", "()I", true);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "dim", "(I)V", false);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT dimension failed: " + t);
+            return null;
+        }
+    }
+
+    /** TreeFeature.place: log the trunk origin of every tree in a chunk. */
+    static byte[] instrumentTree(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals("(Lecg;)Z")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            for (String g : new String[] {"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 1);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ecg", "e", "()Ljd;", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                            }
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "tree", "(III)V", false);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT tree failed: " + t);
+            return null;
+        }
+    }
+
     /** OreFeature.place: log the origin and size of every blob in a chunk. */
     static byte[] instrumentOre(byte[] buf) {
         try {
@@ -450,6 +541,9 @@ public class Agent {
             if ("ebe".equals(name)) return instrumentCarveState(buf);
             if ("dzi".equals(name)) return instrumentVein(buf);
             if ("ecz".equals(name)) return instrumentOre(buf);
+            if ("edq".equals(name)) return instrumentTree(buf);
+            if ("duz".equals(name)) return instrumentDimension(buf);
+            if ("deg".equals(name)) return instrumentBiomes(buf);
             if ("dzx".equals(name)) {
                 byte[] b = instrumentSeeds(buf);
                 return instrumentRSeed(b != null ? b : buf);
