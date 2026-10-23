@@ -12,7 +12,10 @@ slice 05–12で導出した保存値は**全て自動的にvanilla game tick値
 - **wire変換が消えた**。`e.left * GAME_TICKS_PER_TICK` が `* 1` なので `e.left` を直接送る。
   二重単位が解消された
 - 移動係数を一次証拠のvanilla値へ。弓矢 `0.99`/`-0.05`、投擲 `0.99`/`-0.03`
-  （`AbstractArrow.javap.txt:747,665`、`ThrowableProjectile.javap.txt:163,aZ()`）
+  （`tools/bytecode_probe.sh net.minecraft.world.entity.projectile.AbstractArrow '0\.99f|0\.05d'`
+  が `747: ldc_w … float 0.99f` と `665: ldc2_w … double 0.05d`、
+  `… ThrowableProjectile '0\.99f|0\.03d'` が `163: ldc … float 0.99f` と `double 0.03d` を出す。
+  jar sha1 `59353fb4…` / sha256 `e3bc5569…`、公式mappings `03f89854…`）
 
 TTLは**現在の実時間を保つ**側を選んだ。vanilla忠実な撤去はエンティティ蓄納の
 リスクがあり結果も変わるため、別sliceとして分離する。

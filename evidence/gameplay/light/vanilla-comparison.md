@@ -114,7 +114,7 @@ vanilla に無い木を置いている**ことにある（worldgen の feature �
 vanilla は DFS post-order reversed + cross-step エッジ + `step→featureIndex` 比較子、
 mc-spine は Kahn FIFO。これが「vanilla に無い木」の原因。
 
-比較子・エッジ・DFS は obf から確定済み（`deg.javap.txt`, `ad.javap.txt`）。
+比較子・エッジ・DFS は obf から確定済み（`tools/bytecode_probe.sh <class>` で取り直せる。当時の出力ファイルはリポジトリに無い）。
 
 ## vanilla のブロックを列単位で読めるようにした（突破口）
 

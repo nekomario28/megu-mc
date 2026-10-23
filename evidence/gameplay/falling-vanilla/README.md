@@ -5,7 +5,7 @@
 現行 mc-spine は落下を「1 tick に 1 セル動くブロックのキュー」で近似しており、
 vanilla の速度・加速・着地位置とは一致しない。
 
-- `FallingBlockEntity.javap.txt`：`javap -p -c` の生出力（978行）
+- `tools/bytecode_probe.sh net.minecraft.world.entity.item.FallingBlockEntity`：`javap -p -c` の出力（当時の生出力は978行）
 - `FallingBlockEntity.mapping.txt`：同名の難読化解説（40行）
 
 ## 読み取った事項

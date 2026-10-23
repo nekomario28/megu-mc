@@ -36,9 +36,9 @@ dirty として送る。生成順の全順序対（先・後）はどちらか�
 - `FriendlyByteBuf.writeBitSet` は `BitSet.toLongArray()` を長さ付き long 配列として書く。
 
 `vlmkit`/`gxkit` の座標系ではなく、上記は 1.21.1 の Mojang 公式 mapping と
-client/server jar の `javap` から読み取った。生ログは同ディレクトリの
-`*.javap.txt` と `mappings.txt`。mapping の取得元は
-`https://piston-meta.mojang.com/v1/packages/499680d659b7a0ccb2fa9a809c345c5baf2ace7d/1.21.1.json`。
+client/server jar の `javap` から読み取った。当時の生ログはリポジトリに無いので、
+`tools/bytecode_probe.sh`（jarをsha1で固定）と公式mappingsで取り直せる
+（mappingsの取得元: `https://piston-meta.mojang.com/v1/packages/499680d659b7a0ccb2fa9a809c345c5baf2ace7d/1.21.1.json`）。
 
 ## 実行時の確認
 

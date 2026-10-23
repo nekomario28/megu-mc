@@ -29,7 +29,7 @@ releaseの代表負荷性能やvanillaとの軽量性比較には使わない。
 
 ## nibble/byte の基点を vanilla バイトコードで確認（Qの一部）
 
-vanilla `DataLayer`（obf `dvd`）の `javap`（`DataLayer.javap.txt`）から：
+vanilla `DataLayer`（obf `dvd`）の `javap`（`tools/bytecode_probe.sh net.minecraft.world.level.chunk.DataLayer`）から：
 
 - `getIndex(x,y,z) = (y << 8) | (z << 4) | x`
 - バイト位置 = `index >> 1`、nibble shift = `4 * (index & 1)`

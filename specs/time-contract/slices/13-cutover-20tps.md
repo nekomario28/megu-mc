@@ -41,8 +41,9 @@ vanillaは `50 >> amp`（再生）・`25 >> amp`（毒）・`40 >> amp`（ウィ
 
 ### 4. 移動係数をvanillaへ（**結果が変わる**）
 
-一次証拠（`AbstractArrow.javap.txt:747` が `0.99f`、`:665` が `0.05d`、
-`ThrowableProjectile.javap.txt:163` が `0.99f`、`aZ()` が `0.03d`）から確定。
+一次証拠（`tools/bytecode_probe.sh` で再現できる。`AbstractArrow` の `747` が `float 0.99f`、
+`665` が `double 0.05d`、`ThrowableProjectile` の `163` が `float 0.99f`、`aZ()` が `double 0.03d`。
+jarはsha1 `59353fb4…` で固定）から確定。
 
 | 対象 | 現在（4TPS, gravity-lite） | vanilla（per game tick） |
 |---|---|---|
@@ -52,7 +53,7 @@ vanillaは `50 >> amp`（再生）・`25 >> amp`（毒）・`40 >> amp`（ウィ
 | 投擲 重力 | `dy -= 0.05` | `-= 0.03` |
 | 釣針 | `dx * 0.6`, `dy -= 0.04` | 一次参照で確定が必要 |
 
-vanillaは水中で抗力 `0.8f`（`ThrowableProjectile.javap.txt:156`）。
+vanillaは水中で抗力 `0.8f`（`ThrowableProjectile` の `156`。`tools/bytecode_probe.sh` で再現）。
 現在の実装は水中分岐を持たない。これも同時に必要。
 
 **これは近似からの脱却であり近似化ではない。しかし弓矢・パール・Mobの軌道が変わる。**
