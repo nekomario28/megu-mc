@@ -91,14 +91,15 @@ impl<'a> FC<'a> {
         let base = self.g.top_oc(x, z);
         self.oc_t.get(&(x, z)).copied().unwrap_or(i32::MIN).max(base)
     }
+    /// `LevelReader.getBiome(BlockPos)`, i.e. `BiomeManager.getBiome` — the
+    /// *blended* biome, and the one vanilla's `BiomeFilter` reads. It is not the
+    /// chunk's container (`biome_name_at`), and the two disagree at boundaries:
+    /// a filter that checks the container rejects or accepts the wrong cells.
     pub(crate) fn biome(&mut self, x: i32, y: i32, z: i32) -> Option<String> {
-        let q = (x >> 2, y >> 2, z >> 2);
-        if let Some(b) = self.bc.get(&q) {
-            return b.clone();
+        match self.g.biome_blended(x, y, z) {
+            Some((_, leaf)) => self.g.biome_name_of_leaf(leaf),
+            None => self.g.biome_name_at(x, y, z),
         }
-        let b = self.g.biome_name_at(x, y, z);
-        self.bc.insert(q, b.clone());
-        b
     }
     pub(crate) fn out_of_h(&self, y: i32) -> bool {
         y < self.g.min_y || y >= self.g.min_y + self.g.height

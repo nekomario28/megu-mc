@@ -2072,6 +2072,9 @@ impl Gen {
     /// biome registry name at a block position (quart-sampled).
     pub(crate) fn biome_name_at(&mut self, x: i32, y: i32, z: i32) -> Option<String> {
         let (_, leaf) = self.biome_quart(x >> 2, y >> 2, z >> 2, None)?;
+        self.biome_name_of_leaf(leaf)
+    }
+    pub(crate) fn biome_name_of_leaf(&self, leaf: u16) -> Option<String> {
         self.biome_names.get(leaf as usize).cloned()
     }
     /// feature-layer lookup: populates the 3x3 neighborhood on demand, then
@@ -2993,6 +2996,50 @@ impl Gen {
         Some([c5[0], c5[1], c5[2], c5[3], dq, c5[4], 0])
     }
 
+    /// `BiomeManager.getBiome(BlockPos)` — the *blended* biome vanilla's
+    /// `LevelReader.getBiome` returns, which is what `BiomeFilter` (and anything
+    /// else reading the level at a position) sees. It is not the chunk's biome
+    /// container: the eight neighbouring noise samples are ranked by
+    /// `getFiddledDistance`, so at a biome boundary the two disagree.
+    pub(crate) fn biome_blended(&mut self, x: i32, y: i32, z: i32) -> Option<(i64, u16)> {
+        let zoom = crate::generation_math::biome_zoom_seed(self.world_seed);
+        let (x, y, z) = (x - 2, y - 2, z - 2);
+        let (bx, by, bz) = (x >> 2, y >> 2, z >> 2);
+        let (fx, fy, fz) = (
+            (x & 3) as f64 / 4.0,
+            (y & 3) as f64 / 4.0,
+            (z & 3) as f64 / 4.0,
+        );
+        let mut best = (0usize, f64::INFINITY);
+        for i in 0..8usize {
+            let (px, py, pz) = ((i & 4) == 0, (i & 2) == 0, (i & 1) == 0);
+            let (qx, qy, qz) = (
+                if px { bx } else { bx + 1 },
+                if py { by } else { by + 1 },
+                if pz { bz } else { bz + 1 },
+            );
+            let (ox, oy, oz) = (
+                if px { fx } else { fx - 1.0 },
+                if py { fy } else { fy - 1.0 },
+                if pz { fz } else { fz - 1.0 },
+            );
+            let d = crate::generation_math::fiddled_distance(zoom, qx, qy, qz, ox, oy, oz);
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        let i = best.0;
+        let (px, py, pz) = ((i & 4) == 0, (i & 2) == 0, (i & 1) == 0);
+        // the winner is looked up in the noise source at its own quart corner,
+        // which is exactly what this port's biome tree answers
+        self.biome_quart(
+            if px { bx } else { bx + 1 },
+            if py { by } else { by + 1 },
+            if pz { bz } else { bz + 1 },
+            None,
+        )
+    }
+
     pub(crate) fn biome_quart(
         &mut self,
         qx: i32,
@@ -3524,7 +3571,12 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // Holder<PlacedFeature>). Dropping them hid
         // block_predicate_filter(would_survive) on the random_selector children, so
         // every tree candidate grew a tree. 2x2 feature-on diff: 1856 -> 1035.
-        assert_eq!(digest, "b43cb2458e47bf29ea759aef021db763",
+        // 2026-10-22: the biome the placement chain reads is now
+        // `BiomeManager.getBiome` (the blended lookup that `LevelReader.getBiome`
+        // returns) instead of the chunk's quart container. BiomeFilter uses it, so
+        // the container path accepted candidates vanilla rejects at a biome
+        // boundary. 2x2 feature-on diff: 1035 -> 940; trees 45 -> 42 (vanilla 38).
+        assert_eq!(digest, "56bbcedc708a1eae55dd5601583a51a5",
             "feature population output changed from the vanilla-order capture");
     }
 

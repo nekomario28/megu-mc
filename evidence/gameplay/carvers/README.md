@@ -1581,3 +1581,40 @@ rock 4 / hole 1 の条件を満たすことを確認。
 
 carver / aquifer 層は現行コードでも 2×2 で **0 セル**
 （`tools/carver_fixture.sh tcur - - - 2`）。
+
+## 43. `BiomeManager.getBiome` を実装して木が 45 → 42、diff 1035 → 940
+
+§42 で「vanilla には biome が 2 種類ある」と判明したので、**2 番目**
+（`BiomeManager.getBiome(BlockPos)` = biome blend）を port に実装した。
+
+- `BiomeManager.a(JIIIDDD)D`（`getFiddledDistance`）: quart 座標 3 つと zoom seed を
+  `Mth.hash` に 6 回かけて `s` を作り、`(floorMod(s>>24, 1024)/1024 - 0.5) * 0.9` を
+  x/y/z それぞれに 1 つずつ得て、`(fz+f)² + (fy+e)² + (fx+d)²` を返す。
+- `BiomeManager.a(Ljd;)Ljm;`: `pos − 2` を取り、その quart セルと小数部から
+  **8 近傍**（各軸 `i&4`/`i&2`/`i&1` で ±1、小数部は `f` か `f−1`）を上の距離で順位付けし、
+  最小の角の biome を返す。
+- zoom seed は `Hashing.sha256().hashLong(seed).asLong()`（Guava の `putLong` は
+  little-endian、`asLong` も先頭 8 バイト little-endian）。この値は
+  **`sha256` を自前実装**して一致を検証した（seed 0 → 8794265229978523055、
+  既知ベクタ `sha256("abc")`）。
+- port 側: `generation_math::biome_zoom_seed` / `mth_hash` / `fiddled_distance`、
+  `worldgen::Gen::biome_blended`、`FC::biome` をそちらへ（`PM::Biome` のほか、
+  `ctx.biome` を使う vegetal 系も同じ経路に乗る）。chunk container を使う経路
+  （保存・送信・`MC_SPINE_BIOME_DUMP`）はそのまま。
+
+結果:
+
+| | 前 | 後 |
+|---|---|---|
+| 2×2 feature あり diff | 1035 | **940** |
+| うち tick 由来（葉の distance）を除く | 655 | **546** |
+| 木（chunk (0,0) 周辺 3×3） | 45 | **42**（vanilla 38） |
+| chunk (1,0) の木 | 2 | **0**（vanilla 0）✓ |
+| chunk (1,1) の diff | 208 | **176** |
+
+`BIOMEF_TRACE` の (20,66,3) は **false / biome=river** になり、vanilla の
+`BIOMEF 20 66 3 false` と一致した（この 1 点が 4 つの木と 100 セルを動かしていた）。
+
+残り: chunk 別の木は (0,-1) 6 vs 7、(0,1) 8 vs 5、(-1,-1) 3 vs 2、(-1,1) 8 vs 7。
+次の一単位は同じ手法（`InSquarePlacement` の生候補 + `BiomeFilter` の可否 +
+`would_survive`）を chunk (0,1) に当てる。
