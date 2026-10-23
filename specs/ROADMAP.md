@@ -107,6 +107,11 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   ① `short_grass` の過少（44 vs 102、ドローは一致 → 試行数/受理率）
   ② 残る型の実装（overworld に効く順）
   ③ 残差の再基準化（順序非依存の塊＝葉の在否・gravel blob・植生）
+  **出口条件への含意**: 現在の固定具（spawn 準備が先に周辺を装飾した world）では、
+  順序/可視性依存クラス（ore 探索箱ゲート・patch の y・隣 origin の blob）が残るため
+  **block diff 0 には原理的に届かない**。0 を出口にするなら「隣が未装飾と保証される
+  固定具」＝ spawn から離れた chunk を自前 protocol client で生成する必要がある
+  （`forceload` は遠方で失敗し、`setworldspawn` は再準備しないことを実測済み）。
   16. **装飾順は chunk ごとに違う**: 現行の「3×3 を先に decorate」は固定具の world
   （spawn 準備で周辺が先に装飾される）と整合する。一律に「自分の chunk だけ」へ変えると
   マテリアルルール（feature ハイトマップを読む）まで動き、704 → **6709** に悪化する。
