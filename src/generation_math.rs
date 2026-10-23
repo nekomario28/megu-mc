@@ -27,7 +27,8 @@ pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
         msg.push(0);
     }
     msg.extend_from_slice(&bitlen.to_le_bytes());
-    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    let (mut a0, mut b0, mut c0, mut d0) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
     for chunk in msg.chunks_exact(64) {
         let mut m = [0u32; 16];
         for i in 0..16 {
@@ -154,8 +155,7 @@ pub(crate) static DTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::Atom
 
 /// Which placed feature the trace is currently inside, so a draw can be attributed
 /// without guessing from the sequence shape.
-pub(crate) static XTRACE_FEAT: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(-1);
+pub(crate) static XTRACE_FEAT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
 /// Env-gated draw trace for feature placement (`FSEED_ARM=i,step`).
 pub(crate) static XTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -166,7 +166,10 @@ fn xtrace(kind: &str, arg: i64, val: i64) {
         return;
     }
     eprintln!("XDRAW {n} bound={arg} -> {val} ({kind})");
-    XTRACE.store(if n + 1 >= 16 { -1 } else { n + 1 }, std::sync::atomic::Ordering::Relaxed);
+    XTRACE.store(
+        if n + 1 >= 16 { -1 } else { n + 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 pub(crate) struct Xor {
@@ -197,7 +200,12 @@ impl Xor {
         } else {
             (lo, hi)
         };
-        Xor { lo, hi, g: None, legacy: false }
+        Xor {
+            lo,
+            hi,
+            g: None,
+            legacy: false,
+        }
     }
     pub(crate) fn next_long(&mut self) -> u64 {
         let l = self.lo;
@@ -274,7 +282,8 @@ impl Xor {
             let lo = self.next(27) as i64;
             ((hi << 27).wrapping_add(lo)) as f64 * f64::from_bits(0x3CA0000000000000)
         } else {
-            (self.next_long() >> 11) as f64 * f64::from_bits(0x3CA0000000000000) // 2^-53
+            (self.next_long() >> 11) as f64 * f64::from_bits(0x3CA0000000000000)
+            // 2^-53
         }
     }
     pub(crate) fn next_f32(&mut self) -> f32 {
@@ -392,7 +401,9 @@ pub(crate) struct Lcg {
 #[allow(dead_code)]
 impl Lcg {
     pub(crate) fn new(seed: u64) -> Self {
-        Lcg { seed: (seed ^ 0x5DEECE66D) & 0xFF_FFFF_FFFF_FF }
+        Lcg {
+            seed: (seed ^ 0x5DEECE66D) & 0xFF_FFFF_FFFF_FF,
+        }
     }
     fn nx(&mut self, bits: u32) -> u64 {
         self.seed = self.seed.wrapping_mul(0x5DEECE66D).wrapping_add(11) & 0xFF_FFFF_FFFF_FF;
@@ -402,7 +413,10 @@ impl Lcg {
         let n = RAW_ARM.load(std::sync::atomic::Ordering::Relaxed);
         if n >= 0 {
             eprintln!("RBITS {n} bits={bits} -> {v}");
-            RAW_ARM.store(if n + 1 >= 16 { -1 } else { n + 1 }, std::sync::atomic::Ordering::Relaxed);
+            RAW_ARM.store(
+                if n + 1 >= 16 { -1 } else { n + 1 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         v
     }
@@ -514,7 +528,19 @@ fn wrap(x: f64) -> f64 {
 fn smooth(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
-pub(crate) fn lerp3(a: f64, b: f64, c: f64, v0: f64, v1: f64, v2: f64, v3: f64, v4: f64, v5: f64, v6: f64, v7: f64) -> f64 {
+pub(crate) fn lerp3(
+    a: f64,
+    b: f64,
+    c: f64,
+    v0: f64,
+    v1: f64,
+    v2: f64,
+    v3: f64,
+    v4: f64,
+    v5: f64,
+    v6: f64,
+    v7: f64,
+) -> f64 {
     let l0 = v0 + a * (v1 - v0);
     let l1 = v2 + a * (v3 - v2);
     let l2 = v4 + a * (v5 - v4);
@@ -583,7 +609,19 @@ impl Perlin {
         let d101 = Self::grad_dot(self.perm(xy10 + z + 1), rx - 1.0, ry, rz - 1.0);
         let d011 = Self::grad_dot(self.perm(xy01 + z + 1), rx, ry - 1.0, rz - 1.0);
         let d111 = Self::grad_dot(self.perm(xy11 + z + 1), rx - 1.0, ry - 1.0, rz - 1.0);
-        lerp3(smooth(rx), smooth(ory), smooth(rz), d000, d100, d010, d110, d001, d101, d011, d111)
+        lerp3(
+            smooth(rx),
+            smooth(ory),
+            smooth(rz),
+            d000,
+            d100,
+            d010,
+            d110,
+            d001,
+            d101,
+            d011,
+            d111,
+        )
     }
     fn get(&self, x: f64, y: f64, z: f64) -> f64 {
         let x = wrap(x) + self.xo;
@@ -648,23 +686,43 @@ pub(crate) struct Normal {
 }
 impl Normal {
     pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
-        let key = (self as *const Normal as usize, x.to_bits(), y.to_bits(), z.to_bits());
+        let key = (
+            self as *const Normal as usize,
+            x.to_bits(),
+            y.to_bits(),
+            z.to_bits(),
+        );
         let idx = nhash(key);
-        if let Some(v) = NCACHE.with(|c| { let slot = c.borrow()[idx]; if slot.0 == key { Some(slot.1) } else { None } }) {
+        if let Some(v) = NCACHE.with(|c| {
+            let slot = c.borrow()[idx];
+            if slot.0 == key {
+                Some(slot.1)
+            } else {
+                None
+            }
+        }) {
             return v;
         }
         let mut v = 0.0;
         for o in &self.layers {
             v += o.a * o.n.get(x * o.f, y * o.f, z * o.f);
         }
-        NCACHE.with(|c| { c.borrow_mut()[idx] = (key, v); });
+        NCACHE.with(|c| {
+            c.borrow_mut()[idx] = (key, v);
+        });
         v
     }
 }
 
-fn build_octaves(base_octave: i32, base_amplitude: f64, count: usize, mods: &[f64]) -> Vec<(i32, f64, f64)> {
+fn build_octaves(
+    base_octave: i32,
+    base_amplitude: f64,
+    count: usize,
+    mods: &[f64],
+) -> Vec<(i32, f64, f64)> {
     let mut f = LACUNARITY.powi(base_octave);
-    let mut a = base_amplitude * (PERSISTENCE.powi(-(count as i32 - 1)) / (PERSISTENCE.powi(-(count as i32)) - 1.0));
+    let mut a = base_amplitude
+        * (PERSISTENCE.powi(-(count as i32 - 1)) / (PERSISTENCE.powi(-(count as i32)) - 1.0));
     let mut out = Vec::new();
     for i in 0..count {
         let m = if i < mods.len() { mods[i] } else { 1.0 };
@@ -694,7 +752,12 @@ fn norm_factor(target: f64, octaves: &[(i32, f64, f64)]) -> f64 {
 }
 
 // modern (non-legacy) NormalNoise: JSON carries precomputed base_amplitude
-pub(crate) fn normal_new(r: &mut Xor, base_octave: i32, base_amplitude: f64, mods: &[f64]) -> Normal {
+pub(crate) fn normal_new(
+    r: &mut Xor,
+    base_octave: i32,
+    base_amplitude: f64,
+    mods: &[f64],
+) -> Normal {
     let octaves = build_octaves(base_octave, base_amplitude, mods.len(), mods);
     let target: f64 = octaves.iter().map(|o| o.2.abs()).sum();
     let nf = norm_factor(target, &octaves);
@@ -735,8 +798,7 @@ fn legacy_fbm(r: &mut Lcg, first_octave: i32, amps: &[f64]) -> Vec<(Perlin, f64,
         }
     }
     let mut factor = LACUNARITY.powi(-zi);
-    let mut value_factor =
-        LACUNARITY.powi(octaves - 1) / (LACUNARITY.powi(octaves) - 1.0);
+    let mut value_factor = LACUNARITY.powi(octaves - 1) / (LACUNARITY.powi(octaves) - 1.0);
     let mut out = Vec::with_capacity(amps.len());
     for (i, n) in levels.into_iter().enumerate() {
         if let Some(n) = n {
@@ -782,7 +844,11 @@ pub(crate) fn normal_new_l(seed: u64, first_octave: i32, amps: &[f64]) -> Normal
         layers.push(Octave { n, f, a: a * nf });
     }
     for (n, f, a) in second {
-        layers.push(Octave { n, f: f * INPUT_FACTOR, a: a * nf });
+        layers.push(Octave {
+            n,
+            f: f * INPUT_FACTOR,
+            a: a * nf,
+        });
     }
     Normal { layers }
 }
@@ -870,16 +936,28 @@ impl Simp {
         let ak = k & 0xFF;
         let al = self.map(ai.wrapping_add(self.map(aj.wrapping_add(self.map(ak))))) % 12;
         let am = self.map(
-            ai.wrapping_add(q)
-                .wrapping_add(self.map(aj.wrapping_add(r).wrapping_add(self.map(ak.wrapping_add(s))))),
+            ai.wrapping_add(q).wrapping_add(
+                self.map(
+                    aj.wrapping_add(r)
+                        .wrapping_add(self.map(ak.wrapping_add(s))),
+                ),
+            ),
         ) % 12;
         let an = self.map(
-            ai.wrapping_add(t)
-                .wrapping_add(self.map(aj.wrapping_add(u).wrapping_add(self.map(ak.wrapping_add(v))))),
+            ai.wrapping_add(t).wrapping_add(
+                self.map(
+                    aj.wrapping_add(u)
+                        .wrapping_add(self.map(ak.wrapping_add(v))),
+                ),
+            ),
         ) % 12;
         let ao = self.map(
-            ai.wrapping_add(1)
-                .wrapping_add(self.map(aj.wrapping_add(1).wrapping_add(self.map(ak.wrapping_add(1))))),
+            ai.wrapping_add(1).wrapping_add(
+                self.map(
+                    aj.wrapping_add(1)
+                        .wrapping_add(self.map(ak.wrapping_add(1))),
+                ),
+            ),
         ) % 12;
         32.0 * (Self::grad3(al as usize, n, o, p)
             + Self::grad3(am as usize, w, aa, ab)
@@ -905,10 +983,8 @@ impl Simp {
         let r = i & 0xFF;
         let s = j & 0xFF;
         let t = self.map(r.wrapping_add(self.map(s)));
-        let u = self
-            .map(r.wrapping_add(l).wrapping_add(self.map(s.wrapping_add(m))));
-        let v = self
-            .map(r.wrapping_add(1).wrapping_add(self.map(s.wrapping_add(1))));
+        let u = self.map(r.wrapping_add(l).wrapping_add(self.map(s.wrapping_add(m))));
+        let v = self.map(r.wrapping_add(1).wrapping_add(self.map(s.wrapping_add(1))));
         let w = Self::grad(t as usize, h, k);
         let z = Self::grad(u as usize, n, o);
         let aa = Self::grad(v as usize, p, q);
@@ -928,7 +1004,12 @@ impl OSimp {
         oc.dedup();
         let (first, last) = match (oc.first(), oc.last()) {
             (Some(&a), Some(&b)) => (a, b),
-            _ => return OSimp { layers: Vec::new(), k: 0 },
+            _ => {
+                return OSimp {
+                    layers: Vec::new(),
+                    k: 0,
+                }
+            }
         };
         let j = last;
         let k = (-first).wrapping_add(j).wrapping_add(1);
@@ -997,7 +1078,12 @@ impl SmearStack {
         v
     }
 }
-pub(crate) fn smear_fbm(r: &mut Xor, first_octave: i32, smear_y: f64, value_factor: f64) -> SmearStack {
+pub(crate) fn smear_fbm(
+    r: &mut Xor,
+    first_octave: i32,
+    smear_y: f64,
+    value_factor: f64,
+) -> SmearStack {
     let octaves = -first_octave + 1;
     let mut f = 1.0f64;
     let mut vf = value_factor / (2f64.powi(octaves) - 1.0);
@@ -1007,7 +1093,10 @@ pub(crate) fn smear_fbm(r: &mut Xor, first_octave: i32, smear_y: f64, value_fact
         f /= 2.0;
         vf *= 2.0;
     }
-    SmearStack { layers, fudge_y: smear_y }
+    SmearStack {
+        layers,
+        fudge_y: smear_y,
+    }
 }
 
 #[cfg(test)]
@@ -1101,7 +1190,12 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     for chunk in msg.chunks_exact(64) {
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -1183,7 +1277,13 @@ fn fiddle_raw(s: i64) -> f64 {
 /// position and one quart corner, jittered by the seed.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn fiddled_distance(
-    zoom: i64, bx: i32, by: i32, bz: i32, fx: f64, fy: f64, fz: f64,
+    zoom: i64,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    fx: f64,
+    fy: f64,
+    fz: f64,
 ) -> f64 {
     let mut s = zoom;
     for v in [bx, by, bz, bx, by, bz] {
@@ -1216,7 +1316,10 @@ mod deco_seed_tests {
             let mut r = super::Xor::seed_worldgen(0);
             let l = r.next_i64_legacy() | 1;
             let m = r.next_i64_legacy() | 1;
-            (bx as i64).wrapping_mul(l).wrapping_add((bz as i64).wrapping_mul(m)) ^ 0
+            (bx as i64)
+                .wrapping_mul(l)
+                .wrapping_add((bz as i64).wrapping_mul(m))
+                ^ 0
         };
         assert_eq!(f(-16, 0), 6716476193438028432);
         assert_eq!(f(-32, 16), -4660739044861673552);

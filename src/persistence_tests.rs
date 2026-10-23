@@ -28,14 +28,34 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
     let old_forced_chunk = std::mem::take(&mut *forceloaded().lock().unwrap());
     let old_rng = world_rng::saved_state();
     forceloaded().lock().unwrap().insert((0, 0));
-    world().lock().unwrap().entry((0, 0)).or_default().insert(0x0000_0004, 4);
-    drops().lock().unwrap().push(Drop { eid: 777, x: 0.5, y: 70.0, z: 0.5,
-        item: name_to_item("iron_ingot").unwrap(), cnt: 3,
-        comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())], age: drop_age });
-    mobs().lock().unwrap().push(Arc::new(Mob { eid: 778, uuid: [0u8; 16], etype: 124,
-        pos: Mutex::new((1.5, 70.0, 2.5, 0.0, 0.0)), hp: Mutex::new(12.5),
-        last_hit: Mutex::new(Instant::now()), hurt_at: Mutex::new(Instant::now()),
-        fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(mob_air) }));
+    world()
+        .lock()
+        .unwrap()
+        .entry((0, 0))
+        .or_default()
+        .insert(0x0000_0004, 4);
+    drops().lock().unwrap().push(Drop {
+        eid: 777,
+        x: 0.5,
+        y: 70.0,
+        z: 0.5,
+        item: name_to_item("iron_ingot").unwrap(),
+        cnt: 3,
+        comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())],
+        age: drop_age,
+    });
+    mobs().lock().unwrap().push(Arc::new(Mob {
+        eid: 778,
+        uuid: [0u8; 16],
+        etype: 124,
+        pos: Mutex::new((1.5, 70.0, 2.5, 0.0, 0.0)),
+        hp: Mutex::new(12.5),
+        last_hit: Mutex::new(Instant::now()),
+        hurt_at: Mutex::new(Instant::now()),
+        fuse: Mutex::new(0),
+        love: Mutex::new(0),
+        air: Mutex::new(mob_air),
+    }));
     let mut payload = Vec::new();
     save_world_into(&mut payload);
     let loaded = {
@@ -47,7 +67,10 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
         if let Some(magic) = legacy_tail {
             // Emulate an older writer: MET2 never carried the mob air field, and
             // MET3 stored entity ages in milliseconds rather than server ticks.
-            let at = payload.windows(4).position(|w| w == b"MET4").expect("a MET4 tail");
+            let at = payload
+                .windows(4)
+                .position(|w| w == b"MET4")
+                .expect("a MET4 tail");
             payload[at..at + 4].copy_from_slice(magic);
             if magic == b"MET2" {
                 // magic, mob count, etype, x, y, z, hp — no air field follows.
@@ -55,7 +78,10 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
             }
         }
         load_world_from(&payload);
-        let d = drops().lock().unwrap().first()
+        let d = drops()
+            .lock()
+            .unwrap()
+            .first()
             .map(|d| (d.age, d.item, d.cnt, d.comps.clone()));
         let m = mobs().lock().unwrap().first().cloned();
         Loaded {
@@ -84,25 +110,39 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
 
 #[test]
 fn met4_round_trip_preserves_drop_components_age_and_mob_air() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _world_guard = world_guard();
     let full_air = server_ticks(300) as i32;
     let loaded = round_trip(None, 150, 3);
-    assert_eq!(loaded, Loaded {
-        chunks: 1, forced: 1, world_time: 555, drops: 1, drop_age: 3,
-        drop_item: name_to_item("iron_ingot").unwrap(), drop_count: 3,
-        drop_comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())],
-        mobs: 1, mob_etype: 124, mob_hp: 12.5,
-        // The MET3 tail has no air field, so a reloaded mob gets a full supply.
-        mob_air: full_air,
-    });
+    assert_eq!(
+        loaded,
+        Loaded {
+            chunks: 1,
+            forced: 1,
+            world_time: 555,
+            drops: 1,
+            drop_age: 3,
+            drop_item: name_to_item("iron_ingot").unwrap(),
+            drop_count: 3,
+            drop_comps: vec![(2i64, br#"{"text":"legacy"}"#.to_vec())],
+            mobs: 1,
+            mob_etype: 124,
+            mob_hp: 12.5,
+            // The MET3 tail has no air field, so a reloaded mob gets a full supply.
+            mob_air: full_air,
+        }
+    );
     // The default air supply is the vanilla 300 game ticks, not a bare literal.
     assert_eq!(u64::from(full_air as u32) * TICK_MS, 15_000);
 }
 
 #[test]
 fn met2_without_mob_air_falls_back_to_a_full_supply() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _world_guard = world_guard();
     // MET2 never carried air. The loader must substitute the vanilla air supply
     // rather than a zero that would drown the mob on its first tick.
@@ -113,25 +153,36 @@ fn met2_without_mob_air_falls_back_to_a_full_supply() {
 
 #[test]
 fn legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _world_guard = world_guard();
     // The 20TPS cutover made one tick 50ms. A MET3 file that stored a drop age of
     // 300000 ms read as ticks would sit at 300000 ticks against a 6000 tick life
     // and despawn on the first tick, destroying every saved drop.
     let loaded = round_trip(Some(b"MET3"), 150, 3000);
     assert_eq!(loaded.drops, 1, "the drop must survive a legacy MET3 load");
-    assert_eq!(loaded.drop_age, 60, "3000 ms of legacy age is 60 ticks at 50 ms per tick");
+    assert_eq!(
+        loaded.drop_age, 60,
+        "3000 ms of legacy age is 60 ticks at 50 ms per tick"
+    );
     assert!(loaded.drop_age < server_ticks(DROP_LIFE_GT) as i32);
 }
 
 #[test]
 fn negative_drop_age_survives_a_save_reload_round_trip() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _world_guard = world_guard();
     // A container close records the pickup-delay marker as a negative age. The
     // old loader clamped it to a full lifespan, so the drop despawned on the
     // next tick after every restart.
-    for age in [-(server_ticks(40) as i32), 0, server_ticks(DROP_LIFE_GT) as i32] {
+    for age in [
+        -(server_ticks(40) as i32),
+        0,
+        server_ticks(DROP_LIFE_GT) as i32,
+    ] {
         let loaded = round_trip(None, 150, age);
         assert_eq!(loaded.drop_age, age, "drop age {age} did not round-trip");
     }
@@ -143,7 +194,12 @@ fn hostile_rotation_does_not_collapse_to_one_type() {
     // the same residue at 20TPS, so only one hostile type ever spawned.
     let mut seen = Vec::new();
     for attempt in 0..15u64 {
-        seen.push(match attempt % 5 { 0 => 23i64, 1 => 91, 2 => 100, _ => 124 });
+        seen.push(match attempt % 5 {
+            0 => 23i64,
+            1 => 91,
+            2 => 100,
+            _ => 124,
+        });
     }
     let distinct: std::collections::HashSet<i64> = seen.iter().copied().collect();
     assert_eq!(distinct.len(), 4, "rotation collapsed to {seen:?}");
@@ -162,33 +218,62 @@ fn legacy_persisted_durations_resume_with_their_original_wall_time() {
     let _world_guard = world_guard();
     // The conversion factor itself, stated in the unit the file used.
     assert_eq!(legacy_ticks(1000, true), 1000 / TICK_MS);
-    assert_eq!(legacy_ticks(1000, false), 1000, "MET4 values must pass through untouched");
+    assert_eq!(
+        legacy_ticks(1000, false),
+        1000,
+        "MET4 values must pass through untouched"
+    );
     // Millisecond fields: drop and xp age were written as elapsed milliseconds.
     for millis in [1000u64, 2000, 50_000, 300_000] {
-        assert_eq!(legacy_ticks(millis, true) * TICK_MS, millis,
-            "legacy age {millis}ms no longer spans the same wall time");
+        assert_eq!(
+            legacy_ticks(millis, true) * TICK_MS,
+            millis,
+            "legacy age {millis}ms no longer spans the same wall time"
+        );
     }
     // Count fields were written as a number of 4TPS ticks, so they scale the other
     // way. A legacy tick spans 250ms, which is five 20TPS ticks.
     for budget in [1u64, 40, 100, 240, 1600, 6000, 12000] {
-        assert_eq!(legacy_tick_count(budget, true) * TICK_MS, budget * 250,
-            "legacy budget {budget} no longer spans {}ms", budget * 250);
+        assert_eq!(
+            legacy_tick_count(budget, true) * TICK_MS,
+            budget * 250,
+            "legacy budget {budget} no longer spans {}ms",
+            budget * 250
+        );
     }
-    assert_eq!(legacy_tick_count(ARROW_TTL_GT, true) * TICK_MS, ARROW_TTL_GT * 250);
-    assert_eq!(legacy_tick_count(PEARL_TTL_GT, true) * TICK_MS, PEARL_TTL_GT * 250);
-    assert_eq!(legacy_tick_count(TNT_FUSE_GT, true) * TICK_MS, TNT_FUSE_GT * 250);
-    assert_eq!(legacy_tick_count(200, true) * TICK_MS, 200 * 250, "furnace cook time");
+    assert_eq!(
+        legacy_tick_count(ARROW_TTL_GT, true) * TICK_MS,
+        ARROW_TTL_GT * 250
+    );
+    assert_eq!(
+        legacy_tick_count(PEARL_TTL_GT, true) * TICK_MS,
+        PEARL_TTL_GT * 250
+    );
+    assert_eq!(
+        legacy_tick_count(TNT_FUSE_GT, true) * TICK_MS,
+        TNT_FUSE_GT * 250
+    );
+    assert_eq!(
+        legacy_tick_count(200, true) * TICK_MS,
+        200 * 250,
+        "furnace cook time"
+    );
     // The two directions must not be interchangeable.
     assert_ne!(legacy_ticks(1000, true), legacy_tick_count(1000, true));
 }
 
 #[test]
 fn met4_round_trip_leaves_persisted_durations_untouched() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _world_guard = world_guard();
     // A MET4 save writes server ticks, so loading it must not rescale anything.
     let loaded = round_trip(None, 150, 600);
-    assert_eq!(loaded.drop_age, 600, "MET4 ages must pass through unconverted");
+    assert_eq!(
+        loaded.drop_age, 600,
+        "MET4 ages must pass through unconverted"
+    );
 }
 
 /// A truncated or corrupt save must not panic the loader. `read_comps` reads a
@@ -199,7 +284,10 @@ fn truncated_component_blobs_do_not_panic_the_loader() {
     let _world_guard = world_guard();
     // Every truncation of a valid component record must either parse or stop.
     let mut full = Vec::new();
-    write_comps(&mut full, &vec![(2i64, b"{\"text\":\"x\"}".to_vec()), (9i64, vec![0u8; 8])]);
+    write_comps(
+        &mut full,
+        &vec![(2i64, b"{\"text\":\"x\"}".to_vec()), (9i64, vec![0u8; 8])],
+    );
     for cut in 0..=full.len() {
         let mut p = 0usize;
         let _ = read_comps(&full[..cut], &mut p);
@@ -207,13 +295,16 @@ fn truncated_component_blobs_do_not_panic_the_loader() {
     }
     // A VarInt that claims more component bytes than remain must stop, not index.
     let mut liar = Vec::new();
-    write_varint(&mut liar, 1);          // one component
-    write_varint(&mut liar, 2);          // type
+    write_varint(&mut liar, 1); // one component
+    write_varint(&mut liar, 2); // type
     liar.extend_from_slice(&100u16.to_be_bytes()); // claims 100 bytes
-    liar.extend_from_slice(&[0u8; 3]);   // supplies 3
+    liar.extend_from_slice(&[0u8; 3]); // supplies 3
     let mut p = 0usize;
     let parsed = read_comps(&liar, &mut p);
-    assert!(parsed.is_empty(), "an over-long blob must be rejected, got {parsed:?}");
+    assert!(
+        parsed.is_empty(),
+        "an over-long blob must be rejected, got {parsed:?}"
+    );
     // The truncated length field itself.
     for cut in 0..=liar.len() {
         let mut p = 0usize;
@@ -222,23 +313,60 @@ fn truncated_component_blobs_do_not_panic_the_loader() {
     }
 }
 
-
 /// Saving must be observational. The trident-to-drop conversion used to run inside
 /// save_world_into: it removed the trident from the live arrow list, created a live
 /// drop, and — because the drop list had already been serialized — omitted that drop
 /// from the very save that produced it, so a resting trident was lost on restart.
 #[test]
 fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _world_guard = world_guard();
     let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
     let old_drops = std::mem::take(&mut *drops().lock().unwrap());
-    arrows().lock().unwrap().push(Arrow { eid: 7001, owner: 1, x: 1.5, y: 70.0, z: 1.5,
-        dx: 0.0, dy: 0.0, dz: 0.0, ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 8.0, fire: 0,
-        punch: 0, kind: 1, loy: 3, ret_item: 811, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: true });
-    arrows().lock().unwrap().push(Arrow { eid: 7002, owner: 1, x: 2.5, y: 70.0, z: 2.5,
-        dx: 0.5, dy: 0.0, dz: 0.5, ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 6.0, fire: 0,
-        punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: false });
+    arrows().lock().unwrap().push(Arrow {
+        eid: 7001,
+        owner: 1,
+        x: 1.5,
+        y: 70.0,
+        z: 1.5,
+        dx: 0.0,
+        dy: 0.0,
+        dz: 0.0,
+        ttl: server_ticks(ARROW_TTL_GT) as i32,
+        dmg: 8.0,
+        fire: 0,
+        punch: 0,
+        kind: 1,
+        loy: 3,
+        ret_item: 811,
+        ret_comps: Vec::new(),
+        pierce: 0,
+        last_hit: -1,
+        stuck: true,
+    });
+    arrows().lock().unwrap().push(Arrow {
+        eid: 7002,
+        owner: 1,
+        x: 2.5,
+        y: 70.0,
+        z: 2.5,
+        dx: 0.5,
+        dy: 0.0,
+        dz: 0.5,
+        ttl: server_ticks(ARROW_TTL_GT) as i32,
+        dmg: 6.0,
+        fire: 0,
+        punch: 0,
+        kind: 0,
+        loy: 0,
+        ret_item: 0,
+        ret_comps: Vec::new(),
+        pierce: 0,
+        last_hit: -1,
+        stuck: false,
+    });
     let live_arrows_before: Vec<i32> = arrows().lock().unwrap().iter().map(|a| a.eid).collect();
     let live_drops_before = drops().lock().unwrap().len();
     let mut payload = Vec::new();
@@ -252,15 +380,34 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
     *drops().lock().unwrap() = Vec::new();
     *arrows().lock().unwrap() = Vec::new();
     load_world_from(&payload);
-    let loaded_drops: Vec<(i64, u8)> = drops().lock().unwrap().iter().map(|d| (d.item, d.cnt)).collect();
+    let loaded_drops: Vec<(i64, u8)> = drops()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| (d.item, d.cnt))
+        .collect();
     let loaded_arrow_kinds: Vec<u8> = arrows().lock().unwrap().iter().map(|a| a.kind).collect();
     *arrows().lock().unwrap() = old_arrows;
     *drops().lock().unwrap() = old_drops;
-    assert_eq!(live_arrows_before, live_arrows_after, "saving removed a live projectile");
-    assert_eq!(live_drops_before, live_drops_after, "saving created a live drop");
+    assert_eq!(
+        live_arrows_before, live_arrows_after,
+        "saving removed a live projectile"
+    );
+    assert_eq!(
+        live_drops_before, live_drops_after,
+        "saving created a live drop"
+    );
     assert_eq!(payload, payload2, "saving is not idempotent");
-    assert_eq!(loaded_drops, vec![(811, 1)], "the resting trident must persist exactly once");
-    assert_eq!(loaded_arrow_kinds, vec![0], "only the airborne arrow stays an arrow");
+    assert_eq!(
+        loaded_drops,
+        vec![(811, 1)],
+        "the resting trident must persist exactly once"
+    );
+    assert_eq!(
+        loaded_arrow_kinds,
+        vec![0],
+        "only the airborne arrow stays an arrow"
+    );
 }
 
 /// A block in flight has to survive a save and a load. Without the queue in the save, the world
@@ -268,14 +415,32 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
 /// is queued - so after a restart the block hangs there permanently.
 #[test]
 fn the_falling_entities_survive_a_save_and_load_round_trip() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _g = world_guard();
     let old_world = world().lock().unwrap().clone();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
 
     falling().lock().unwrap().extend([
-        Fall { eid: 7001, x: 1.5, y: 100.25, z: 2.5, dy: -0.12, state: 112, time: 3 },
-        Fall { eid: 7002, x: -2.5, y: 70.0, z: 4.5, dy: 0.0, state: 117, time: 0 },
+        Fall {
+            eid: 7001,
+            x: 1.5,
+            y: 100.25,
+            z: 2.5,
+            dy: -0.12,
+            state: 112,
+            time: 3,
+        },
+        Fall {
+            eid: 7002,
+            x: -2.5,
+            y: 70.0,
+            z: 4.5,
+            dy: 0.0,
+            state: 117,
+            time: 0,
+        },
     ]);
     let mut payload = Vec::new();
     save_world_into(&mut payload);
@@ -285,15 +450,31 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
     load_world_from(&payload);
 
     let q = falling().lock().unwrap().clone();
-    assert_eq!(q.len(), 2, "both entities came back and nothing else: {q:?}");
-    assert!(q.iter().any(|f| f.eid == 7001 && (f.x - 1.5).abs() < 1e-9
-        && (f.y - 100.25).abs() < 1e-9 && (f.z - 2.5).abs() < 1e-9
-        && (f.dy + 0.12).abs() < 1e-9 && f.state == 112 && f.time == 3),
-        "position, velocity, state and age survive: {q:?}");
-    assert!(q.iter().any(|f| f.eid == 7002 && (f.x + 2.5).abs() < 1e-9 && f.state == 117),
-        "and negative coordinates are easy to mangle: {q:?}");
+    assert_eq!(
+        q.len(),
+        2,
+        "both entities came back and nothing else: {q:?}"
+    );
+    assert!(
+        q.iter().any(|f| f.eid == 7001
+            && (f.x - 1.5).abs() < 1e-9
+            && (f.y - 100.25).abs() < 1e-9
+            && (f.z - 2.5).abs() < 1e-9
+            && (f.dy + 0.12).abs() < 1e-9
+            && f.state == 112
+            && f.time == 3),
+        "position, velocity, state and age survive: {q:?}"
+    );
+    assert!(
+        q.iter()
+            .any(|f| f.eid == 7002 && (f.x + 2.5).abs() < 1e-9 && f.state == 117),
+        "and negative coordinates are easy to mangle: {q:?}"
+    );
     // New entities must not reuse a loaded id.
-    assert!(NEXT_EID.load(Ordering::SeqCst) > 7002, "NEXT_EID must clear the loaded ids");
+    assert!(
+        NEXT_EID.load(Ordering::SeqCst) > 7002,
+        "NEXT_EID must clear the loaded ids"
+    );
 
     *world().lock().unwrap() = old_world;
     *falling().lock().unwrap() = old_falling;
@@ -303,7 +484,9 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
 /// to an entity and remove the block, or the block would remain behind and duplicate.
 #[test]
 fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _g = world_guard();
     let old_world = world().lock().unwrap().clone();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
@@ -326,15 +509,28 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
     falling().lock().unwrap().clear();
     load_world_from(&payload);
 
-    assert_eq!(block_at(1, 100, 2), 0, "the legacy block must leave the world");
     assert_eq!(
-        world().lock().unwrap().get(&(0, 0)).and_then(|c| c.get(&local_idx(1, 100, 2))).copied(),
+        block_at(1, 100, 2),
+        0,
+        "the legacy block must leave the world"
+    );
+    assert_eq!(
+        world()
+            .lock()
+            .unwrap()
+            .get(&(0, 0))
+            .and_then(|c| c.get(&local_idx(1, 100, 2)))
+            .copied(),
         Some(0),
-        "the migrated cell is an explicit air override, so a non-air generated base is not exposed");
+        "the migrated cell is an explicit air override, so a non-air generated base is not exposed"
+    );
     let q = falling().lock().unwrap().clone();
     assert_eq!(q.len(), 1, "the legacy cell becomes one entity: {q:?}");
     assert_eq!(q[0].state, sand, "with the state the block had");
-    assert!((q[0].x - 1.5).abs() < 1e-9 && (q[0].y - 100.0).abs() < 1e-9, "at the cell center");
+    assert!(
+        (q[0].x - 1.5).abs() < 1e-9 && (q[0].y - 100.0).abs() < 1e-9,
+        "at the cell center"
+    );
 
     *world().lock().unwrap() = old_world;
     *falling().lock().unwrap() = old_falling;
@@ -342,17 +538,23 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
 
 #[test]
 fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let _g = world_guard();
     let old_world = world().lock().unwrap().clone();
     let old_rng = world_rng::saved_state();
 
     world_rng::seed(4242);
-    for _ in 0..5 { let _ = world_rng::next_u64(); }
+    for _ in 0..5 {
+        let _ = world_rng::next_u64();
+    }
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    assert!(payload.windows(4).any(|w| w == b"RNG1"),
-        "the save must carry the world random stream state");
+    assert!(
+        payload.windows(4).any(|w| w == b"RNG1"),
+        "the save must carry the world random stream state"
+    );
     // The value the reloaded stream must produce next.
     let expected = world_rng::next_u64();
 
@@ -360,8 +562,11 @@ fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
     // replaced would prove nothing.
     world_rng::seed(999);
     load_world_from(&payload);
-    assert_eq!(world_rng::next_u64(), expected,
-        "the reloaded stream must continue from the saved state, not restart");
+    assert_eq!(
+        world_rng::next_u64(),
+        expected,
+        "the reloaded stream must continue from the saved state, not restart"
+    );
 
     *world().lock().unwrap() = old_world;
     world_rng::restore(old_rng);
@@ -369,7 +574,9 @@ fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
 
 #[test]
 fn furnace_and_sign_round_trip_keeps_only_live_owners() {
-    if test_support::isolated_world_test() { return; }
+    if test_support::isolated_world_test() {
+        return;
+    }
     let broken_furnace = (30, 150, 30);
     let live_furnace = (32, 150, 30);
     let broken_sign = (34, 150, 30);
@@ -377,22 +584,45 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     let input = (name_to_item("raw_iron").unwrap(), 3, Vec::new());
     for pos in [broken_furnace, live_furnace] {
         set_block(pos.0, pos.1, pos.2, name_to_state("furnace").unwrap());
-        furnaces().lock().unwrap().insert(pos, Furnace {
-            input: input.clone(), fuel: (0, 0, Vec::new()), output: (0, 0, Vec::new()),
-            burn_left: 43, progress: 17, dirty: false, xp: 0.0,
-            recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default(),
-        });
+        furnaces().lock().unwrap().insert(
+            pos,
+            Furnace {
+                input: input.clone(),
+                fuel: (0, 0, Vec::new()),
+                output: (0, 0, Vec::new()),
+                burn_left: 43,
+                progress: 17,
+                dirty: false,
+                xp: 0.0,
+                recipe_cache: CachedLookup::default(),
+                fuel_cache: CachedLookup::default(),
+            },
+        );
     }
-    let lines = ["persist".into(), "both".into(), "sides".into(), "exactly".into()];
+    let lines = [
+        "persist".into(),
+        "both".into(),
+        "sides".into(),
+        "exactly".into(),
+    ];
     for pos in [broken_sign, live_sign] {
         set_block(pos.0, pos.1, pos.2, name_to_state("oak_sign").unwrap());
         for front in [0, 1] {
-            signs().lock().unwrap().insert((pos.0, pos.1, pos.2, front), lines.clone());
+            signs()
+                .lock()
+                .unwrap()
+                .insert((pos.0, pos.1, pos.2, front), lines.clone());
         }
     }
-    for pos in [broken_furnace, broken_sign] { set_block(pos.0, pos.1, pos.2, 0); }
+    for pos in [broken_furnace, broken_sign] {
+        set_block(pos.0, pos.1, pos.2, 0);
+    }
     assert!(!furnaces().lock().unwrap().contains_key(&broken_furnace));
-    assert!(!signs().lock().unwrap().keys().any(|&(x, y, z, _)| (x, y, z) == broken_sign));
+    assert!(!signs()
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|&(x, y, z, _)| (x, y, z) == broken_sign));
     let mut payload = Vec::new();
     save_world_into(&mut payload);
     world().lock().unwrap().clear();
@@ -402,14 +632,25 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     load_world_from(&payload);
     let fs = furnaces().lock().unwrap();
     assert_eq!(fs.len(), 1);
-    let loaded = fs.get(&live_furnace).expect("live furnace must be restored");
+    let loaded = fs
+        .get(&live_furnace)
+        .expect("live furnace must be restored");
     assert_eq!(loaded.input, input);
     assert_eq!((loaded.burn_left, loaded.progress), (43, 17));
-    assert_eq!(block_at(live_furnace.0, live_furnace.1, live_furnace.2), name_to_state("furnace").unwrap());
+    assert_eq!(
+        block_at(live_furnace.0, live_furnace.1, live_furnace.2),
+        name_to_state("furnace").unwrap()
+    );
     let sg = signs().lock().unwrap();
     assert_eq!(sg.len(), 2);
     for front in [0, 1] {
-        assert_eq!(sg.get(&(live_sign.0, live_sign.1, live_sign.2, front)), Some(&lines));
+        assert_eq!(
+            sg.get(&(live_sign.0, live_sign.1, live_sign.2, front)),
+            Some(&lines)
+        );
     }
-    assert_eq!(block_at(live_sign.0, live_sign.1, live_sign.2), name_to_state("oak_sign").unwrap());
+    assert_eq!(
+        block_at(live_sign.0, live_sign.1, live_sign.2),
+        name_to_state("oak_sign").unwrap()
+    );
 }

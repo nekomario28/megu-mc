@@ -12,7 +12,7 @@ use crate::block_registry::*;
 use crate::generation_context::FC;
 use crate::generation_math::*;
 use crate::generation_providers::*;
-use crate::json::{jarr, jbool, jf32, jint, jnum, jstr, js, jparse, J};
+use crate::json::{jarr, jbool, jf32, jint, jnum, jparse, js, jstr, J};
 use crate::worldgen::*;
 use std::collections::{HashMap, HashSet};
 
@@ -42,10 +42,31 @@ struct Pf {
 }
 
 enum Cf {
-    Ore { size: i32, discard: f32, targets: Vec<(RT, u32)>, scattered: bool },
-    Disk { half: i32, radius: IP, bsp: BSP, target: Pr },
-    SimpleBlock { to: BSP, on: Vec<String>, in_: Vec<String>, under: Vec<String> },
-    Spring { fluid: u32, req_below: bool, rock: i32, hole: i32, valid: HashSet<String> },
+    Ore {
+        size: i32,
+        discard: f32,
+        targets: Vec<(RT, u32)>,
+        scattered: bool,
+    },
+    Disk {
+        half: i32,
+        radius: IP,
+        bsp: BSP,
+        target: Pr,
+    },
+    SimpleBlock {
+        to: BSP,
+        on: Vec<String>,
+        in_: Vec<String>,
+        under: Vec<String>,
+    },
+    Spring {
+        fluid: u32,
+        req_below: bool,
+        rock: i32,
+        hole: i32,
+        valid: HashSet<String>,
+    },
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
     /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
     /// `nextInt(xz+1) - nextInt(xz+1)` per horizontal axis and the same with
@@ -53,12 +74,19 @@ enum Cf {
     /// modifiers, on this RNG). Skipping the type left every grass/flower/mushroom
     /// patch unplaced (measured: 34 of the pack's 60 configured-feature types had no
     /// arm, and `short_grass` was 0 cells against vanilla's 102).
-    RandomPatch { feature: Box<Pf>, tries: i32, xz: i32, y: i32 },
+    RandomPatch {
+        feature: Box<Pf>,
+        tries: i32,
+        xz: i32,
+        y: i32,
+    },
     /// `minecraft:seagrass` (`edk`): draw dx/dz in ±8, take the OCEAN_FLOOR height
     /// there, and if that cell is water draw `nextDouble() < probability` to choose
     /// tall or short seagrass. The block's own survival rule (`SeagrassBlock`, `dmx`)
     /// is "the block below has a sturdy top face and is not magma" - not the dirt rule.
-    Seagrass { prob: f64 },
+    Seagrass {
+        prob: f64,
+    },
     /// Kelp grows upward from OCEAN_FLOOR (`BlockPos.above`, obfuscated `d`), with one
     /// height draw and an age draw only when placing the head (`KelpFeature`, `ecs`).
     Kelp,
@@ -79,12 +107,26 @@ enum Cf {
         vrange: i32,
         waterlog: bool,
     },
-    BlockColumn { layers: Vec<(IP, BSP)>, down: bool, allowed: Option<Pr>, prio: bool },
+    BlockColumn {
+        layers: Vec<(IP, BSP)>,
+        down: bool,
+        allowed: Option<Pr>,
+        prio: bool,
+    },
     BlockPile(BSP),
-    Lake { fluid: BSP, barrier: BSP },
+    Lake {
+        fluid: BSP,
+        barrier: BSP,
+    },
     BlueIce,
-    BlockBlob { state: u32 },
-    UnderMagma { floor: i32, prob: f32, radius: i32 },
+    BlockBlob {
+        state: u32,
+    },
+    UnderMagma {
+        floor: i32,
+        prob: f32,
+        radius: i32,
+    },
     FreezeTop,
     Multiface {
         name: String,
@@ -97,7 +139,9 @@ enum Cf {
     Bamboo(f32),
     Vines,
     MonsterRoom,
-    Fallen { trunk: BSP },
+    Fallen {
+        trunk: BSP,
+    },
     Tree(Box<crate::tree::TreeExtra>),
     Unknown(#[expect(dead_code)] String),
 }
@@ -151,7 +195,11 @@ fn p_pf(j: &J) -> Option<Pf> {
             }
         }
     }
-    Some(Pf { feat: fref, mods, name: String::new() })
+    Some(Pf {
+        feat: fref,
+        mods,
+        name: String::new(),
+    })
 }
 
 fn p_cf(j: &J) -> Option<Cf> {
@@ -195,9 +243,17 @@ fn p_cf(j: &J) -> Option<Cf> {
                 let (n, p) = bs_parts(st)?;
                 // the config holds a *fluid* state; vanilla places its legacy block
                 // (`createLegacyBlock`): falling water is level 8, a source level 0
-                let falling = J::Obj(vec![("level".to_string(), J::Str(
-                    if jbool(st, "falling", false) { "8" } else { "0" }.to_string(),
-                ))]);
+                let falling = J::Obj(vec![(
+                    "level".to_string(),
+                    J::Str(
+                        if jbool(st, "falling", false) {
+                            "8"
+                        } else {
+                            "0"
+                        }
+                        .to_string(),
+                    ),
+                )]);
                 let props = if n.ends_with("water") || n.ends_with("lava") {
                     Some(&falling)
                 } else {
@@ -210,7 +266,9 @@ fn p_cf(j: &J) -> Option<Cf> {
             hole: jint(j, "hole_count", 1),
             valid: name_list(j, "valid_blocks").into_iter().collect(),
         },
-        "seagrass" => Cf::Seagrass { prob: jnum(j, "probability").unwrap_or(0.0) },
+        "seagrass" => Cf::Seagrass {
+            prob: jnum(j, "probability").unwrap_or(0.0),
+        },
         "kelp" => Cf::Kelp,
         // `minecraft:flower` is the same config shape (a patch of simple blocks), just a
         // different type name - it was one of the 34 types with no arm, so every flower
@@ -296,7 +354,9 @@ fn p_cf(j: &J) -> Option<Cf> {
         "blue_ice" => Cf::BlueIce,
         "block_blob" | "forest_rock" => {
             let (n, p) = js(j, "state").and_then(bs_parts)?;
-            Cf::BlockBlob { state: breg()?.state_of(&n, p) }
+            Cf::BlockBlob {
+                state: breg()?.state_of(&n, p),
+            }
         }
         "underwater_magma" => Cf::UnderMagma {
             floor: jint(j, "floor_search_range", 5),
@@ -343,19 +403,58 @@ pub(crate) struct FReg {
 // biome lists the same ores in the same order. Measured from a 1.21.1 server by logging
 // `deg.a`'s first argument (see tools/carve-agent).
 const OW_BIOMES: &[&str] = &[
-    "minecraft:mushroom_fields", "minecraft:deep_frozen_ocean", "minecraft:frozen_ocean", "minecraft:deep_cold_ocean",
-    "minecraft:cold_ocean", "minecraft:deep_ocean", "minecraft:ocean", "minecraft:deep_lukewarm_ocean",
-    "minecraft:lukewarm_ocean", "minecraft:warm_ocean", "minecraft:stony_shore", "minecraft:swamp",
-    "minecraft:mangrove_swamp", "minecraft:snowy_slopes", "minecraft:snowy_plains", "minecraft:snowy_beach",
-    "minecraft:windswept_gravelly_hills", "minecraft:grove", "minecraft:windswept_hills", "minecraft:snowy_taiga",
-    "minecraft:windswept_forest", "minecraft:taiga", "minecraft:plains", "minecraft:meadow",
-    "minecraft:beach", "minecraft:forest", "minecraft:old_growth_spruce_taiga", "minecraft:flower_forest",
-    "minecraft:birch_forest", "minecraft:dark_forest", "minecraft:savanna_plateau", "minecraft:savanna",
-    "minecraft:jungle", "minecraft:badlands", "minecraft:desert", "minecraft:wooded_badlands",
-    "minecraft:jagged_peaks", "minecraft:stony_peaks", "minecraft:frozen_river", "minecraft:river",
-    "minecraft:ice_spikes", "minecraft:old_growth_pine_taiga", "minecraft:sunflower_plains", "minecraft:old_growth_birch_forest",
-    "minecraft:sparse_jungle", "minecraft:bamboo_jungle", "minecraft:eroded_badlands", "minecraft:windswept_savanna",
-    "minecraft:cherry_grove", "minecraft:frozen_peaks", "minecraft:dripstone_caves", "minecraft:lush_caves",
+    "minecraft:mushroom_fields",
+    "minecraft:deep_frozen_ocean",
+    "minecraft:frozen_ocean",
+    "minecraft:deep_cold_ocean",
+    "minecraft:cold_ocean",
+    "minecraft:deep_ocean",
+    "minecraft:ocean",
+    "minecraft:deep_lukewarm_ocean",
+    "minecraft:lukewarm_ocean",
+    "minecraft:warm_ocean",
+    "minecraft:stony_shore",
+    "minecraft:swamp",
+    "minecraft:mangrove_swamp",
+    "minecraft:snowy_slopes",
+    "minecraft:snowy_plains",
+    "minecraft:snowy_beach",
+    "minecraft:windswept_gravelly_hills",
+    "minecraft:grove",
+    "minecraft:windswept_hills",
+    "minecraft:snowy_taiga",
+    "minecraft:windswept_forest",
+    "minecraft:taiga",
+    "minecraft:plains",
+    "minecraft:meadow",
+    "minecraft:beach",
+    "minecraft:forest",
+    "minecraft:old_growth_spruce_taiga",
+    "minecraft:flower_forest",
+    "minecraft:birch_forest",
+    "minecraft:dark_forest",
+    "minecraft:savanna_plateau",
+    "minecraft:savanna",
+    "minecraft:jungle",
+    "minecraft:badlands",
+    "minecraft:desert",
+    "minecraft:wooded_badlands",
+    "minecraft:jagged_peaks",
+    "minecraft:stony_peaks",
+    "minecraft:frozen_river",
+    "minecraft:river",
+    "minecraft:ice_spikes",
+    "minecraft:old_growth_pine_taiga",
+    "minecraft:sunflower_plains",
+    "minecraft:old_growth_birch_forest",
+    "minecraft:sparse_jungle",
+    "minecraft:bamboo_jungle",
+    "minecraft:eroded_badlands",
+    "minecraft:windswept_savanna",
+    "minecraft:cherry_grove",
+    "minecraft:frozen_peaks",
+    "minecraft:dripstone_caves",
+    "minecraft:lush_caves",
     "minecraft:deep_dark",
 ];
 
@@ -441,7 +540,9 @@ fn load_freg() -> FReg {
     let mut fidx: HashMap<String, u32> = HashMap::new();
     let mut counter = 0u32;
     for b in OW_BIOMES {
-        let Some(steps) = reg.bsteps.get(*b) else { continue };
+        let Some(steps) = reg.bsteps.get(*b) else {
+            continue;
+        };
         for list in steps {
             for f in list {
                 if !fidx.contains_key(f) {
@@ -455,7 +556,9 @@ fn load_freg() -> FReg {
     let mut name_of: HashMap<(usize, u32), String> = HashMap::new();
     let mut edges: HashMap<(usize, u32), Vec<(usize, u32)>> = HashMap::new();
     for b in OW_BIOMES {
-        let Some(steps) = reg.bsteps.get(*b) else { continue };
+        let Some(steps) = reg.bsteps.get(*b) else {
+            continue;
+        };
         let mut flat: Vec<(usize, u32)> = vec![];
         for (i, list) in steps.iter().enumerate() {
             for f in list {
@@ -497,7 +600,6 @@ static FREG: std::sync::OnceLock<FReg> = std::sync::OnceLock::new();
 fn freg() -> &'static FReg {
     FREG.get_or_init(load_freg)
 }
-
 
 fn foliage_noise() -> &'static OSimp {
     static N: std::sync::OnceLock<OSimp> = std::sync::OnceLock::new();
@@ -640,7 +742,11 @@ fn mod_positions(
             out.push((x, pos.1, z));
         }
         PM::Offset(xz, ysp) => {
-            out.push((pos.0 + xz.get(rng), pos.1 + ysp.get(rng), pos.2 + xz.get(rng)));
+            out.push((
+                pos.0 + xz.get(rng),
+                pos.1 + ysp.get(rng),
+                pos.2 + xz.get(rng),
+            ));
         }
         PM::HeightRange(hp) => {
             out.push((pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2));
@@ -658,7 +764,11 @@ fn mod_positions(
         PM::Fixed => out.push(pos),
         PM::Biome => {
             if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
-                let ok = fr.ball.get(&b).map(|s| s.contains(&pf.name)).unwrap_or(false);
+                let ok = fr
+                    .ball
+                    .get(&b)
+                    .map(|s| s.contains(&pf.name))
+                    .unwrap_or(false);
                 if let Ok(spec) = std::env::var("BIOMEF_TRACE") {
                     if let Some((a, c)) = spec.split_once(',') {
                         if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
@@ -666,7 +776,13 @@ fn mod_positions(
                                 let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
                                 eprintln!(
                                     "BIOMEF {} {} {} {} biome={} feature={},{}",
-                                    pos.0, pos.1, pos.2, ok, b, cf >> 32, cf & 0xFFFF
+                                    pos.0,
+                                    pos.1,
+                                    pos.2,
+                                    ok,
+                                    b,
+                                    cf >> 32,
+                                    cf & 0xFFFF
                                 );
                             }
                         }
@@ -755,7 +871,13 @@ fn mod_positions(
 
 // ---------- configured feature generation ----------
 
-fn ore_should_place(discard: f32, ctx: &mut FC, rt: &RT, pos: (i32, i32, i32), r: &mut Xor) -> bool {
+fn ore_should_place(
+    discard: f32,
+    ctx: &mut FC,
+    rt: &RT,
+    pos: (i32, i32, i32),
+    r: &mut Xor,
+) -> bool {
     let st = ctx.get(pos.0, pos.1, pos.2);
     let Some(reg) = breg() else { return false };
     if !test_rt(rt, reg, st, pos.1, r) {
@@ -783,9 +905,20 @@ fn ore_should_place(discard: f32, ctx: &mut FC, rt: &RT, pos: (i32, i32, i32), r
 fn gen_vein(
     ctx: &mut FC,
     rng: &mut Xor,
-    sx: f64, ex: f64, sz: f64, ez: f64, sy: f64, ey: f64,
-    xb: i32, yb: i32, zb: i32, hs: i32, vs: i32,
-    size: i32, discard: f32, targets: &[(RT, u32)],
+    sx: f64,
+    ex: f64,
+    sz: f64,
+    ez: f64,
+    sy: f64,
+    ey: f64,
+    xb: i32,
+    yb: i32,
+    zb: i32,
+    hs: i32,
+    vs: i32,
+    size: i32,
+    discard: f32,
+    targets: &[(RT, u32)],
 ) {
     let j = size.max(1);
     let mut ds = vec![0.0; (j * 4) as usize];
@@ -873,7 +1006,6 @@ fn gen_vein(
     }
 }
 
-
 /// (feature index << 32) | step of the placed feature currently being generated.
 pub(crate) static CUR_FEAT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
@@ -892,77 +1024,87 @@ fn gen_ore(
                 let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
                     "ORE {} {} {} size={} feature={},{}",
-                    pos.0, pos.1, pos.2, size, cf >> 32, cf & 0xFFFF
+                    pos.0,
+                    pos.1,
+                    pos.2,
+                    size,
+                    cf >> 32,
+                    cf & 0xFFFF
                 );
             }
         }
     }
-            if scattered {
-                let count = rng.next_bound(size + 1);
-                for i in 0..count {
-                    let md = i.min(7);
-                    let off = |rng: &mut Xor| {
-                        let f1 = rng.next_f32();
-                        let f2 = rng.next_f32();
-                        ((f1 - f2) * md as f32).round() as i32
-                    };
-                    let tp = (pos.0 + off(rng), pos.1 + off(rng), pos.2 + off(rng));
-                    if ctx.out_of_h(tp.1) {
-                        continue;
-                    }
-                    for (rt, st) in targets {
-                        if ore_should_place(discard, ctx, rt, tp, rng) {
-                            ctx.set(tp.0, tp.1, tp.2, *st);
-                            break;
-                        }
+    if scattered {
+        let count = rng.next_bound(size + 1);
+        for i in 0..count {
+            let md = i.min(7);
+            let off = |rng: &mut Xor| {
+                let f1 = rng.next_f32();
+                let f2 = rng.next_f32();
+                ((f1 - f2) * md as f32).round() as i32
+            };
+            let tp = (pos.0 + off(rng), pos.1 + off(rng), pos.2 + off(rng));
+            if ctx.out_of_h(tp.1) {
+                continue;
+            }
+            for (rt, st) in targets {
+                if ore_should_place(discard, ctx, rt, tp, rng) {
+                    ctx.set(tp.0, tp.1, tp.2, *st);
+                    break;
+                }
+            }
+        }
+        return;
+    }
+    let f = rng.next_f32() * std::f32::consts::PI;
+    let g = size as f32 / 8.0;
+    let i = ((size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
+    // The centre uses `Math.sin((double)f)`, not the table: vanilla widens the
+    // float angle and calls double-precision sin/cos here.
+    let sin_f = (f as f64).sin();
+    let cos_f = (f as f64).cos();
+    let d = pos.0 as f64 + sin_f * g as f64;
+    let e = pos.0 as f64 - sin_f * g as f64;
+    let h = pos.2 as f64 + cos_f * g as f64;
+    let j = pos.2 as f64 - cos_f * g as f64;
+    let l = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
+    let mm = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
+    let n = pos.0 - g.ceil() as i32 - i;
+    let o = pos.1 - 2 - i;
+    let p = pos.2 - g.ceil() as i32 - i;
+    let q = 2 * (g.ceil() as i32 + i);
+    let r2 = 2 * (2 + i);
+    let before = ctx.wr.len();
+    for xp in n..=(n + q) {
+        for zp in p..=(p + q) {
+            if o <= ctx.hm_oc(xp, zp) {
+                gen_vein(
+                    ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets,
+                );
+                if let Ok(spec) = std::env::var("ORE_CELL_TRACE") {
+                    if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
+                        eprintln!(
+                            "ORECELL origin={pos:?} size={size} wrote={} radius={:?}",
+                            ctx.wr.len() - before,
+                            (d, e, h, j, l, mm)
+                        );
                     }
                 }
                 return;
             }
-            let f = rng.next_f32() * std::f32::consts::PI;
-            let g = size as f32 / 8.0;
-            let i = ((size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
-            // The centre uses `Math.sin((double)f)`, not the table: vanilla widens the
-            // float angle and calls double-precision sin/cos here.
-            let sin_f = (f as f64).sin();
-            let cos_f = (f as f64).cos();
-            let d = pos.0 as f64 + sin_f * g as f64;
-            let e = pos.0 as f64 - sin_f * g as f64;
-            let h = pos.2 as f64 + cos_f * g as f64;
-            let j = pos.2 as f64 - cos_f * g as f64;
-            let l = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
-            let mm = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
-            let n = pos.0 - g.ceil() as i32 - i;
-            let o = pos.1 - 2 - i;
-            let p = pos.2 - g.ceil() as i32 - i;
-            let q = 2 * (g.ceil() as i32 + i);
-            let r2 = 2 * (2 + i);
-            let before = ctx.wr.len();
-            for xp in n..=(n + q) {
-                for zp in p..=(p + q) {
-                    if o <= ctx.hm_oc(xp, zp) {
-                        gen_vein(ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets);
-                        if let Ok(spec) = std::env::var("ORE_CELL_TRACE") {
-                            if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
-                                eprintln!(
-                                    "ORECELL origin={pos:?} size={size} wrote={} radius={:?}",
-                                    ctx.wr.len() - before,
-                                    (d, e, h, j, l, mm)
-                                );
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
+        }
+    }
 }
-
 
 /// Test helper: the cells one vein writes for a seed and position, with a rule test that
 /// always matches, so the geometry can be compared cell for cell with vanilla's own output
 /// (see evidence/gameplay/feature-parity/ore_andesite_666.txt).
 #[cfg(test)]
-pub(crate) fn ore_cells_for_test(seed: u64, pos: (i32, i32, i32), size: i32) -> Vec<(i32, i32, i32)> {
+pub(crate) fn ore_cells_for_test(
+    seed: u64,
+    pos: (i32, i32, i32),
+    size: i32,
+) -> Vec<(i32, i32, i32)> {
     let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("datapack");
     let mut ctx = FC::new(&mut g);
     let mut rng = Xor::seed(seed);
@@ -986,7 +1128,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
                             eprintln!(
                                 "TREE {} {} {} feature={},{}",
-                                pos.0, pos.1, pos.2, cf >> 32, cf & 0xFFFF
+                                pos.0,
+                                pos.1,
+                                pos.2,
+                                cf >> 32,
+                                cf & 0xFFFF
                             );
                         }
                     }
@@ -994,10 +1140,20 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             crate::tree::gen_tree(ctx, rng, pos, t);
         }
-        Cf::Ore { size, discard, targets, scattered } => {
+        Cf::Ore {
+            size,
+            discard,
+            targets,
+            scattered,
+        } => {
             gen_ore(ctx, rng, pos, *size, *discard, targets, *scattered);
         }
-        Cf::Disk { half, radius, bsp, target } => {
+        Cf::Disk {
+            half,
+            radius,
+            bsp,
+            target,
+        } => {
             let Some(reg) = breg() else { return };
             let top = pos.1 + half;
             let bottom = pos.1 - half - 1;
@@ -1016,7 +1172,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                                 "DISK {x} {y} {z} block={} target={} feature={},{}",
                                 reg.name_of(ctx.get(x, y, z)),
                                 test_pred(target, reg, ctx, x, y, z),
-                                cf >> 32, cf & 0xFFFF
+                                cf >> 32,
+                                cf & 0xFFFF
                             );
                         }
                         if !ctx.out_of_h(y) && test_pred(target, reg, ctx, x, y, z) {
@@ -1031,17 +1188,23 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::SimpleBlock { to, on, in_, under } => {
             if let Some(reg) = breg() {
                 if !on.is_empty()
-                    && !on.iter().any(|t| *t == reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)))
+                    && !on
+                        .iter()
+                        .any(|t| *t == reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)))
                 {
                     return;
                 }
                 if !in_.is_empty()
-                    && !in_.iter().any(|t| *t == reg.name_of(ctx.get(pos.0, pos.1, pos.2)))
+                    && !in_
+                        .iter()
+                        .any(|t| *t == reg.name_of(ctx.get(pos.0, pos.1, pos.2)))
                 {
                     return;
                 }
                 if !under.is_empty()
-                    && !under.iter().any(|t| *t == reg.name_of(ctx.get(pos.0, pos.1 + 1, pos.2)))
+                    && !under
+                        .iter()
+                        .any(|t| *t == reg.name_of(ctx.get(pos.0, pos.1 + 1, pos.2)))
                 {
                     return;
                 }
@@ -1056,12 +1219,14 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             if let Some(reg) = breg() {
                 let ok = can_place(reg, ctx, reg.name_of(st), pos.0, pos.1, pos.2);
                 if std::env::var("SIMPLE_TRACE").is_ok() {
-                    static N: std::sync::atomic::AtomicI32 =
-                        std::sync::atomic::AtomicI32::new(0);
+                    static N: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100_000 {
                         eprintln!(
                             "SIMPLE {} {} {} state={} below={} at={} ok={ok}",
-                            pos.0, pos.1, pos.2, reg.name_of(st),
+                            pos.0,
+                            pos.1,
+                            pos.2,
+                            reg.name_of(st),
                             reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
                             reg.name_of(ctx.get(pos.0, pos.1, pos.2))
                         );
@@ -1073,7 +1238,13 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             ctx.set(pos.0, pos.1, pos.2, st);
         }
-        Cf::Spring { fluid, req_below, rock, hole, valid } => {
+        Cf::Spring {
+            fluid,
+            req_below,
+            rock,
+            hole,
+            valid,
+        } => {
             // `SpringFeature` (edp): the block *below* must be valid, and with
             // `requires_block_below` the one below that too. This used to test the
             // block above, which is the opposite geometry (a spring hanging from a
@@ -1103,8 +1274,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
             }
             if std::env::var("SPRING_TRACE").is_ok() {
-                static SHOWN: std::sync::atomic::AtomicI32 =
-                    std::sync::atomic::AtomicI32::new(0);
+                static SHOWN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
                 if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     eprintln!(
                         "SPRING {} {} {} at={} below={} below2={} rocks={rocks} holes={air} want={rock},{hole}",
@@ -1137,16 +1307,12 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             if !reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block" {
                 return;
             }
-            let half = |v: &str| {
-                J::Obj(vec![("half".to_string(), J::Str(v.to_string()))])
-            };
+            let half = |v: &str| J::Obj(vec![("half".to_string(), J::Str(v.to_string()))]);
             if tall {
                 if reg.name_of(ctx.get(x, y + 1, z)) != "minecraft:water" {
                     return;
                 }
-                let lo = reg
-                    .state_of("minecraft:tall_seagrass", Some(&half("lower")))
-                    ;
+                let lo = reg.state_of("minecraft:tall_seagrass", Some(&half("lower")));
                 let hi = reg.state_of("minecraft:tall_seagrass", Some(&half("upper")));
                 ctx.set(x, y, z, lo);
                 ctx.set(x, y + 1, z, hi);
@@ -1169,7 +1335,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 if here_water && above_water && plant_survives {
                     if i == max_height {
                         let age = rng.next_bound(4) + 20;
-                        let head = reg.with_prop(reg.state_of("minecraft:kelp", None), "age", &age.to_string());
+                        let head = reg.with_prop(
+                            reg.state_of("minecraft:kelp", None),
+                            "age",
+                            &age.to_string(),
+                        );
                         ctx.set(p.0, p.1, p.2, head);
                     } else {
                         ctx.set(p.0, p.1, p.2, reg.state_of("minecraft:kelp_plant", None));
@@ -1177,17 +1347,29 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     p.1 += 1;
                 } else if i > 0 {
                     let base = (p.0, p.1 - 1, p.2);
-                    let below_is_head = reg.name_of(ctx.get(base.0, base.1 - 1, base.2)) == "minecraft:kelp";
-                    if can_place(reg, ctx, "minecraft:kelp", base.0, base.1, base.2) && !below_is_head {
+                    let below_is_head =
+                        reg.name_of(ctx.get(base.0, base.1 - 1, base.2)) == "minecraft:kelp";
+                    if can_place(reg, ctx, "minecraft:kelp", base.0, base.1, base.2)
+                        && !below_is_head
+                    {
                         let age = rng.next_bound(4) + 20;
-                        let head = reg.with_prop(reg.state_of("minecraft:kelp", None), "age", &age.to_string());
+                        let head = reg.with_prop(
+                            reg.state_of("minecraft:kelp", None),
+                            "age",
+                            &age.to_string(),
+                        );
                         ctx.set(base.0, base.1, base.2, head);
                     }
                     break;
                 }
             }
         }
-        Cf::RandomPatch { feature, tries, xz, y } => {
+        Cf::RandomPatch {
+            feature,
+            tries,
+            xz,
+            y,
+        } => {
             let (xs, ys) = (xz + 1, y + 1);
             for _ in 0..*tries {
                 // the arguments are evaluated left to right, so the draws go
@@ -1242,7 +1424,19 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 gen_pf(pf, fr, ctx, rng, pos);
             }
         }
-        Cf::VegPatch { depth, extra_bottom, extra_edge, replaceable, ground, floor, chance, vfeat, xz, vrange, waterlog } => {
+        Cf::VegPatch {
+            depth,
+            extra_bottom,
+            extra_edge,
+            replaceable,
+            ground,
+            floor,
+            chance,
+            vfeat,
+            xz,
+            vrange,
+            waterlog,
+        } => {
             let Some(reg) = breg() else { return };
             let xr = xz.get(rng) + 1;
             let zr = xz.get(rng) + 1;
@@ -1335,11 +1529,17 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     ctx.set(sp.0, sp.1, sp.2, water_st);
                 }
                 if *chance > 0.0 && rng.next_f32() < *chance {
-                    let pp = if *waterlog { sp } else { (sp.0, sp.1 - inward, sp.2) };
+                    let pp = if *waterlog {
+                        sp
+                    } else {
+                        (sp.0, sp.1 - inward, sp.2)
+                    };
                     gen_pf(vfeat, fr, ctx, rng, pp);
                     if *waterlog {
                         let placed = ctx.get(pp.0, pp.1, pp.2);
-                        if !reg.is_air(placed) && is_water_st(reg, ctx.get(pp.0, pp.1, pp.2)) == false {
+                        if !reg.is_air(placed)
+                            && is_water_st(reg, ctx.get(pp.0, pp.1, pp.2)) == false
+                        {
                             // waterlog the placed vegetation
                             let wst = reg.with_prop(placed, "waterlogged", "true");
                             if wst != placed {
@@ -1350,7 +1550,12 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
             }
         }
-        Cf::BlockColumn { layers, down, allowed, prio } => {
+        Cf::BlockColumn {
+            layers,
+            down,
+            allowed,
+            prio,
+        } => {
             let Some(reg) = breg() else { return };
             let n = layers.len();
             let mut heights: Vec<i32> = layers.iter().map(|(h, _)| h.get(rng)).collect();
@@ -1366,8 +1571,10 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 while allowed_len < total {
                     let ok = match allowed {
                         Some(pr) => test_pred(pr, reg, ctx, mp.0, mp.1, mp.2),
-                        None => ctx.is_air(mp.0, mp.1, mp.2)
-                            || reg.name_of(ctx.get(mp.0, mp.1, mp.2)) == "minecraft:water",
+                        None => {
+                            ctx.is_air(mp.0, mp.1, mp.2)
+                                || reg.name_of(ctx.get(mp.0, mp.1, mp.2)) == "minecraft:water"
+                        }
                     };
                     if !ok {
                         // vanilla adjust_layer_heights: trim layers from tip (prio)
@@ -1451,7 +1658,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         if !shell(x, z, y) {
                             continue;
                         }
-                        let bp = (pos.0 + x as i32 - 8, pos.1 + y as i32 - 4, pos.2 + z as i32 - 8);
+                        let bp = (
+                            pos.0 + x as i32 - 8,
+                            pos.1 + y as i32 - 4,
+                            pos.2 + z as i32 - 8,
+                        );
                         let cur = ctx.get(bp.0, bp.1, bp.2);
                         if y >= 4 && reg.is_liquid(cur) {
                             return;
@@ -1466,7 +1677,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 for z in 0..16usize {
                     for y in 0..8usize {
                         if grid[gidx(x, z, y)] {
-                            let bp = (pos.0 + x as i32 - 8, pos.1 + y as i32 - 4, pos.2 + z as i32 - 8);
+                            let bp = (
+                                pos.0 + x as i32 - 8,
+                                pos.1 + y as i32 - 4,
+                                pos.2 + z as i32 - 8,
+                            );
                             let cur = ctx.get(bp.0, bp.1, bp.2);
                             if !reg.in_tag(cur, "minecraft:features_cannot_replace") {
                                 ctx.set(bp.0, bp.1, bp.2, if y >= 4 { air_st } else { fluid_st });
@@ -1480,7 +1695,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     for z in 0..16usize {
                         for y in 0..8usize {
                             if shell(x, z, y) && (y < 4 || rng.next_bound(2) != 0) {
-                                let bp = (pos.0 + x as i32 - 8, pos.1 + y as i32 - 4, pos.2 + z as i32 - 8);
+                                let bp = (
+                                    pos.0 + x as i32 - 8,
+                                    pos.1 + y as i32 - 4,
+                                    pos.2 + z as i32 - 8,
+                                );
                                 let cur = ctx.get(bp.0, bp.1, bp.2);
                                 if reg.is_solid(cur)
                                     && !reg.in_tag(cur, "minecraft:lava_pool_stone_cannot_replace")
@@ -1542,7 +1761,10 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         let bp = (p.0 + dx, p.1 + dy, p.2 + dz);
                         let cur = ctx.get(bp.0, bp.1, bp.2);
                         let n = reg.name_of(cur);
-                        if n == "minecraft:water" || n == "minecraft:ice" || n == "minecraft:packed_ice" {
+                        if n == "minecraft:water"
+                            || n == "minecraft:ice"
+                            || n == "minecraft:packed_ice"
+                        {
                             let st = if rng.next_bound(6) == 0 { ice } else { packed };
                             ctx.set(bp.0, bp.1, bp.2, st);
                         }
@@ -1581,14 +1803,22 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             continue;
                         }
                         let cur = ctx.get(bp.0, bp.1, bp.2);
-                        if reg.is_air(cur) || reg.is_replaceable(cur) || reg.name_of(cur).contains("grass") || reg.name_of(cur).contains("snow") {
+                        if reg.is_air(cur)
+                            || reg.is_replaceable(cur)
+                            || reg.name_of(cur).contains("grass")
+                            || reg.name_of(cur).contains("snow")
+                        {
                             ctx.set(bp.0, bp.1, bp.2, *state);
                         }
                     }
                 }
             }
         }
-        Cf::UnderMagma { floor, prob, radius } => {
+        Cf::UnderMagma {
+            floor,
+            prob,
+            radius,
+        } => {
             // `UnderwaterMagmaFeature` (eds): Column.scan requires the origin to be
             // water, walks down while it stays water, and only then places magma
             // around the floor. Every cell in the cube draws `nextFloat()` first
@@ -1622,7 +1852,12 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     return false;
                 }
                 for (dx, dy, dz) in [
-                    (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
+                    (1, 0, 0),
+                    (-1, 0, 0),
+                    (0, 1, 0),
+                    (0, -1, 0),
+                    (0, 0, 1),
+                    (0, 0, -1),
                 ] {
                     if wet_air(ctx, reg, (p.0 + dx, p.1 + dy, p.2 + dz)) {
                         return false;
@@ -1659,7 +1894,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     if top <= ctx.g.min_y + 1 {
                         continue;
                     }
-                    let Some(b) = ctx.biome(x, top, z) else { continue };
+                    let Some(b) = ctx.biome(x, top, z) else {
+                        continue;
+                    };
                     let temp = fr.btemp.get(&b).copied().unwrap_or(0.8);
                     if temp >= 0.15 {
                         continue;
@@ -1676,7 +1913,14 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
             }
         }
-        Cf::Multiface { name, on, ceiling, wall, floor, search } => {
+        Cf::Multiface {
+            name,
+            on,
+            ceiling,
+            wall,
+            floor,
+            search,
+        } => {
             let Some(reg) = breg() else { return };
             // valid placement directions (face the lichen occupies)
             let mut dirs: Vec<u8> = vec![];
@@ -1692,47 +1936,48 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             if dirs.is_empty() {
                 return;
             }
-            let place_on_faces = |ctx: &mut FC,
-                                  rng: &mut Xor,
-                                  p: (i32, i32, i32),
-                                  exclude: Option<u8>|
-             -> bool {
-                // shuffled direction order
-                let mut dd: Vec<u8> = dirs.iter().copied().filter(|d| Some(*d) != exclude).collect();
-                for i in (1..dd.len()).rev() {
-                    let j = rng.next_bound(i as i32 + 1) as usize;
-                    dd.swap(i, j);
-                }
-                for &d in &dd {
-                    let (dx, dy, dz) = dir_off(d);
-                    let nb = (p.0 + dx, p.1 + dy, p.2 + dz);
-                    let nb_st = ctx.get(nb.0, nb.1, nb.2);
-                    if !on.contains(reg.name_of(nb_st)) {
-                        continue;
+            let place_on_faces =
+                |ctx: &mut FC, rng: &mut Xor, p: (i32, i32, i32), exclude: Option<u8>| -> bool {
+                    // shuffled direction order
+                    let mut dd: Vec<u8> = dirs
+                        .iter()
+                        .copied()
+                        .filter(|d| Some(*d) != exclude)
+                        .collect();
+                    for i in (1..dd.len()).rev() {
+                        let j = rng.next_bound(i as i32 + 1) as usize;
+                        dd.swap(i, j);
                     }
-                    let face_prop = match d {
-                        0 => "down",
-                        1 => "up",
-                        2 => "north",
-                        3 => "south",
-                        4 => "west",
-                        _ => "east",
-                    };
-                    let cur = ctx.get(p.0, p.1, p.2);
-                    let base = if reg.name_of(cur) == name.as_str() {
-                        cur
-                    } else {
-                        reg.state_of(name, None)
-                    };
-                    let mut st = reg.with_prop(base, face_prop, "true");
-                    if is_water_st(reg, cur) {
-                        st = reg.with_prop(st, "waterlogged", "true");
+                    for &d in &dd {
+                        let (dx, dy, dz) = dir_off(d);
+                        let nb = (p.0 + dx, p.1 + dy, p.2 + dz);
+                        let nb_st = ctx.get(nb.0, nb.1, nb.2);
+                        if !on.contains(reg.name_of(nb_st)) {
+                            continue;
+                        }
+                        let face_prop = match d {
+                            0 => "down",
+                            1 => "up",
+                            2 => "north",
+                            3 => "south",
+                            4 => "west",
+                            _ => "east",
+                        };
+                        let cur = ctx.get(p.0, p.1, p.2);
+                        let base = if reg.name_of(cur) == name.as_str() {
+                            cur
+                        } else {
+                            reg.state_of(name, None)
+                        };
+                        let mut st = reg.with_prop(base, face_prop, "true");
+                        if is_water_st(reg, cur) {
+                            st = reg.with_prop(st, "waterlogged", "true");
+                        }
+                        ctx.set(p.0, p.1, p.2, st);
+                        return true;
                     }
-                    ctx.set(p.0, p.1, p.2, st);
-                    return true;
-                }
-                false
-            };
+                    false
+                };
             let cur = ctx.get(pos.0, pos.1, pos.2);
             if !(reg.is_air(cur) || is_water_st(reg, cur)) {
                 return;
@@ -1750,7 +1995,19 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     if !(reg.is_air(c) || is_water_st(reg, c)) && reg.name_of(c) != name.as_str() {
                         break;
                     }
-                    if place_on_faces(ctx, rng, p, Some(match d { 0 => 1, 1 => 0, 2 => 3, 3 => 2, 4 => 5, _ => 4 })) {
+                    if place_on_faces(
+                        ctx,
+                        rng,
+                        p,
+                        Some(match d {
+                            0 => 1,
+                            1 => 0,
+                            2 => 3,
+                            3 => 2,
+                            4 => 5,
+                            _ => 4,
+                        }),
+                    ) {
                         return;
                     }
                 }
@@ -1786,7 +2043,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let mk = |leaves: &str, stage: &str| {
                 reg.state_of(
                     "minecraft:bamboo",
-                    Some(&mkprops(&[("age", "1"), ("leaves", leaves), ("stage", stage)])),
+                    Some(&mkprops(&[
+                        ("age", "1"),
+                        ("leaves", leaves),
+                        ("stage", stage),
+                    ])),
                 )
             };
             let trunk = mk("none", "0");
@@ -1814,10 +2075,23 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             for d in [2u8, 3, 4, 5] {
                 let (dx, _dy, dz) = dir_off(d);
                 let s = ctx.get(pos.0 + dx, pos.1, pos.2 + dz);
-                if !reg.side_solid(s, match d { 2 => 3, 3 => 2, 4 => 5, _ => 4 }) {
+                if !reg.side_solid(
+                    s,
+                    match d {
+                        2 => 3,
+                        3 => 2,
+                        4 => 5,
+                        _ => 4,
+                    },
+                ) {
                     continue;
                 }
-                let face = match d { 2 => "south", 3 => "north", 4 => "east", _ => "west" };
+                let face = match d {
+                    2 => "south",
+                    3 => "north",
+                    4 => "east",
+                    _ => "west",
+                };
                 let mut y = pos.1;
                 while ctx.is_air(pos.0, y, pos.2) && y > pos.1 - 4 {
                     let st = reg.with_prop(base, face, "true");
@@ -1863,21 +2137,27 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 for dy in (-1..=3i32).rev() {
                     for dz in min_z..=max_z {
                         let wp = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
-                        let boundary = dx == min_x || dy == -1 || dz == min_z
-                            || dx == max_x || dy == 4 || dz == max_z;
+                        let boundary = dx == min_x
+                            || dy == -1
+                            || dz == min_z
+                            || dx == max_x
+                            || dy == 4
+                            || dz == max_z;
                         let cur = ctx.get(wp.0, wp.1, wp.2);
                         if boundary {
                             let below = ctx.get(wp.0, wp.1 - 1, wp.2);
                             if wp.1 >= ctx.g.min_y && !reg.is_solid(below) {
                                 ctx.set(wp.0, wp.1, wp.2, cave_air);
-                            } else if reg.is_solid(cur)
-                                && reg.name_of(cur) != "minecraft:chest"
-                            {
+                            } else if reg.is_solid(cur) && reg.name_of(cur) != "minecraft:chest" {
                                 ctx.set(
                                     wp.0,
                                     wp.1,
                                     wp.2,
-                                    if dy == -1 && rng.next_bound(4) != 0 { mossy } else { cobble },
+                                    if dy == -1 && rng.next_bound(4) != 0 {
+                                        mossy
+                                    } else {
+                                        cobble
+                                    },
                                 );
                             }
                         } else {
@@ -1935,7 +2215,11 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
             }
             for i in 0..len {
-                let (x, z) = if horiz { (p.0 + i, p.2) } else { (p.0, p.2 + i) };
+                let (x, z) = if horiz {
+                    (p.0 + i, p.2)
+                } else {
+                    (p.0, p.2 + i)
+                };
                 let below = ctx.get(x, p.1 - 1, z);
                 if !(is_dirtish(reg, below) || reg.is_solid(below)) {
                     break;
@@ -2090,7 +2374,10 @@ pub(crate) fn creg() -> &'static CarverReg {
 }
 
 fn load_creg() -> CarverReg {
-    let mut reg = CarverReg { cfg: HashMap::new(), biome: HashMap::new() };
+    let mut reg = CarverReg {
+        cfg: HashMap::new(),
+        biome: HashMap::new(),
+    };
     for (name, b) in Gen::dp_files("configured_carver") {
         if let Some(j) = jparse(&b) {
             match p_carver(&j) {
@@ -2136,9 +2423,11 @@ fn p_fprov(j: &J) -> FProv {
     let ty = jstr(j, "type").unwrap_or_default();
     match ty.rsplit(':').next().unwrap_or(&ty) {
         "constant" => FProv::Const(jf32(j, "value", 0.0)),
-        "trapezoid" => {
-            FProv::Trapezoid(jf32(j, "min", 0.0), jf32(j, "max", 0.0), jf32(j, "plateau", 0.0))
-        }
+        "trapezoid" => FProv::Trapezoid(
+            jf32(j, "min", 0.0),
+            jf32(j, "max", 0.0),
+            jf32(j, "plateau", 0.0),
+        ),
         _ => {
             let lo = jf32(j, "min_inclusive", jf32(j, "min_exclusive", 0.0));
             let hi = jf32(j, "max_exclusive", jf32(j, "max_inclusive", 0.0));
@@ -2351,8 +2640,12 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
         for oz in tz - 8..=tz + 8 {
             // the carver list comes from the biome at the neighbour chunk's
             // minimum corner at y=0, not from its centre
-            let Some(biome) = g.biome_name_at(ox * 16, 0, oz * 16) else { continue };
-            let Some(list) = reg.biome.get(&biome) else { continue };
+            let Some(biome) = g.biome_name_at(ox * 16, 0, oz * 16) else {
+                continue;
+            };
+            let Some(list) = reg.biome.get(&biome) else {
+                continue;
+            };
             for (k, name) in list.iter().enumerate() {
                 if only.as_deref().is_some_and(|only| only != name) {
                     continue;
@@ -2409,7 +2702,11 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                 st
             );
         }
-        eprintln!("PROBE {} cells={}", if probe_here { "stone" } else { "world" }, run.out.len());
+        eprintln!(
+            "PROBE {} cells={}",
+            if probe_here { "stone" } else { "world" },
+            run.out.len()
+        );
     }
     for ((lx, y, lz), st) in std::mem::take(&mut run.out) {
         g.feat_write(tx * 16 + lx as i32, y, tz * 16 + lz as i32, st);
@@ -2471,7 +2768,15 @@ impl CarveRun {
     }
 
     /// `CanyonWorldCarver.carve`.
-    fn canyon(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, r: &mut Lcg, ox: i32, oz: i32) {
+    fn canyon(
+        &mut self,
+        g: &mut Gen,
+        cc: &ChunkCols,
+        c: &CarverDef,
+        r: &mut Lcg,
+        ox: i32,
+        oz: i32,
+    ) {
         // `p_carver` refuses a canyon config without a shape, so this cannot be
         // reached with one; the guard keeps the borrow honest.
         let Some(shape) = c.canyon else { return };
@@ -2493,9 +2798,20 @@ impl CarveRun {
     /// width profile (`getWidths`) instead of an ellipsoid, and its own `skip`.
     #[expect(clippy::too_many_arguments)]
     fn canyon_tunnel(
-        &mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, seed: u64,
-        mut x: f64, mut y: f64, mut z: f64, thickness: f32, mut yaw: f32, mut pitch: f32,
-        branch_index: i32, branch_count: i32, y_scale: f64,
+        &mut self,
+        g: &mut Gen,
+        cc: &ChunkCols,
+        c: &CarverDef,
+        seed: u64,
+        mut x: f64,
+        mut y: f64,
+        mut z: f64,
+        thickness: f32,
+        mut yaw: f32,
+        mut pitch: f32,
+        branch_index: i32,
+        branch_count: i32,
+        y_scale: f64,
     ) {
         let Some(shape) = c.canyon else { return };
         let mut r = Lcg::new(seed);
@@ -2503,8 +2819,9 @@ impl CarveRun {
         let mut yaw_drift = 0.0f32;
         let mut pitch_drift = 0.0f32;
         for i in branch_index..branch_count {
-            let mut d0 = 1.5 + (mth_sin(std::f32::consts::PI * i as f32 / branch_count as f32)
-                * thickness) as f64;
+            let mut d0 = 1.5
+                + (mth_sin(std::f32::consts::PI * i as f32 / branch_count as f32) * thickness)
+                    as f64;
             let d1 = d0 * y_scale;
             d0 *= shape.horizontal_radius.sample(&mut r) as f64;
             let d1 = canyon_y(shape, &mut r, d1, branch_count as f32, i as f32);
@@ -2533,8 +2850,18 @@ impl CarveRun {
     /// `CanyonWorldCarver.carveEllipsoid`: the canyon profile is a vertical
     /// stack of widths, so the `skip` test is `(x^2 + z^2) * width + y^2 / 6`.
     #[expect(clippy::too_many_arguments)]
-    fn canyon_ellipsoid(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
-                        x: f64, y: f64, z: f64, hr: f64, vr: f64, widths: &[f32]) -> bool {
+    fn canyon_ellipsoid(
+        &mut self,
+        g: &mut Gen,
+        cc: &ChunkCols,
+        c: &CarverDef,
+        x: f64,
+        y: f64,
+        z: f64,
+        hr: f64,
+        vr: f64,
+        widths: &[f32],
+    ) -> bool {
         // The iteration range below is clipped to this chunk, so an ellipsoid
         // centred far away contributes nothing; the distance test is only a
         // cheap way to skip those. (Removing it changes no cell: measured
@@ -2573,9 +2900,7 @@ impl CarveRun {
                         .get((yy - self.min_y - 1) as usize)
                         .copied()
                         .unwrap_or(1.0) as f64;
-                    if (nx * nx + nz * nz) * w + ny * ny / 6.0 < 1.0
-                        && !self.mask_get(lx, yy, lz)
-                    {
+                    if (nx * nx + nz * nz) * w + ny * ny / 6.0 < 1.0 && !self.mask_get(lx, yy, lz) {
                         self.mask_set(lx, yy, lz);
                         carved |= self.carve_block(g, cc, c, bx, yy, bz);
                     }
@@ -2591,9 +2916,22 @@ impl CarveRun {
     /// large. The RNG is `RandomSource.create(seed)` — a `LegacyRandomSource`.
     #[expect(clippy::too_many_arguments)]
     fn tunnel(
-        &mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, seed: u64,
-        mut x: f64, mut y: f64, mut z: f64, hrm: f64, vrm: f64, y_scale: f32,
-        mut yaw: f32, mut pitch: f32, branch_index: i32, branch_count: i32, ratio: f64,
+        &mut self,
+        g: &mut Gen,
+        cc: &ChunkCols,
+        c: &CarverDef,
+        seed: u64,
+        mut x: f64,
+        mut y: f64,
+        mut z: f64,
+        hrm: f64,
+        vrm: f64,
+        y_scale: f32,
+        mut yaw: f32,
+        mut pitch: f32,
+        branch_index: i32,
+        branch_count: i32,
+        ratio: f64,
     ) {
         let mut r = Lcg::new(seed);
         let split = r.next_bound(branch_count / 2) + branch_count / 4;
@@ -2601,7 +2939,8 @@ impl CarveRun {
         let mut pitch_drift = 0.0f32;
         let mut yaw_drift = 0.0f32;
         for i in branch_index..branch_count {
-            let d0 = 1.5 + (mth_sin(std::f32::consts::PI * i as f32 / branch_count as f32) * y_scale) as f64;
+            let d0 = 1.5
+                + (mth_sin(std::f32::consts::PI * i as f32 / branch_count as f32) * y_scale) as f64;
             let d1 = d0 * ratio;
             let cp = mth_cos(pitch);
             x += (mth_cos(yaw) * cp) as f64;
@@ -2617,12 +2956,42 @@ impl CarveRun {
             if i == split && y_scale > 1.0 {
                 let s1 = r.next_i64() as u64;
                 let sc1 = r.next_f32() * 0.5 + 0.5;
-                self.tunnel(g, cc, c, s1, x, y, z, hrm, vrm, sc1,
-                    yaw - std::f32::consts::FRAC_PI_2, pitch / 3.0, i, branch_count, 1.0);
+                self.tunnel(
+                    g,
+                    cc,
+                    c,
+                    s1,
+                    x,
+                    y,
+                    z,
+                    hrm,
+                    vrm,
+                    sc1,
+                    yaw - std::f32::consts::FRAC_PI_2,
+                    pitch / 3.0,
+                    i,
+                    branch_count,
+                    1.0,
+                );
                 let s2 = r.next_i64() as u64;
                 let sc2 = r.next_f32() * 0.5 + 0.5;
-                self.tunnel(g, cc, c, s2, x, y, z, hrm, vrm, sc2,
-                    yaw + std::f32::consts::FRAC_PI_2, pitch / 3.0, i, branch_count, 1.0);
+                self.tunnel(
+                    g,
+                    cc,
+                    c,
+                    s2,
+                    x,
+                    y,
+                    z,
+                    hrm,
+                    vrm,
+                    sc2,
+                    yaw + std::f32::consts::FRAC_PI_2,
+                    pitch / 3.0,
+                    i,
+                    branch_count,
+                    1.0,
+                );
                 return;
             } else if r.next_bound(4) != 0 {
                 if !can_reach(self.tx, self.tz, x, z, i, branch_count, y_scale) {
@@ -2635,8 +3004,17 @@ impl CarveRun {
 
     /// `WorldCarver.carveEllipsoid`: clips the ellipsoid to this chunk and carves
     /// every cell inside it that the mask has not claimed and `skip` accepts.
-    fn ellipsoid(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
-                 x: f64, y: f64, z: f64, hr: f64, vr: f64) -> bool {
+    fn ellipsoid(
+        &mut self,
+        g: &mut Gen,
+        cc: &ChunkCols,
+        c: &CarverDef,
+        x: f64,
+        y: f64,
+        z: f64,
+        hr: f64,
+        vr: f64,
+    ) -> bool {
         // The iteration range below is clipped to this chunk, so an ellipsoid
         // centred far away contributes nothing; the distance test is only a
         // cheap way to skip those. (Removing it changes no cell: measured
@@ -2673,7 +3051,8 @@ impl CarveRun {
                     // one cell at its top edge.
                     let ny = (yy as f64 - 0.5 - y) / vr;
                     // `skip`: at or below the floor level, or outside the sphere
-                    if ny > self.floor && nx * nx + ny * ny + nz * nz < 1.0
+                    if ny > self.floor
+                        && nx * nx + ny * ny + nz * nz < 1.0
                         && !self.mask_get(lx, yy, lz)
                     {
                         self.mask_set(lx, yy, lz);
@@ -2689,8 +3068,15 @@ impl CarveRun {
     /// `WorldCarver.carveBlock`: replace a `#overworld_carver_replaceables` cell
     /// with the aquifer's substance (lava below the lava level), and restore the
     /// top material under a cave mouth that was opened through the surface.
-    fn carve_block(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef,
-                   x: i32, y: i32, z: i32) -> bool {
+    fn carve_block(
+        &mut self,
+        g: &mut Gen,
+        cc: &ChunkCols,
+        c: &CarverDef,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> bool {
         let cur = self.read(g, cc, x, y, z);
         let br = match breg() {
             Some(br) => br,
@@ -2704,7 +3090,11 @@ impl CarveRun {
         let lava_level = c.lava.resolve(self.min_y, self.height);
         let probed = if self.probe {
             let lava = self.probe_lava;
-            Some(if y <= lava_level { lava } else { self.probe_air })
+            Some(if y <= lava_level {
+                lava
+            } else {
+                self.probe_air
+            })
         } else {
             g.carve_state(x, y, z, lava_level)
         };
@@ -2715,7 +3105,8 @@ impl CarveRun {
         // (`x & 15`), so a tunnel from a source chunk up to 8 chunks away paints
         // its cells into the target chunk at folded coordinates. Keep that as
         // the default; MC_SPINE_NOFOLD=1 clips instead, for experiments.
-        if std::env::var("MC_SPINE_NOFOLD").is_ok() && ((x >> 4) != self.tx || (z >> 4) != self.tz) {
+        if std::env::var("MC_SPINE_NOFOLD").is_ok() && ((x >> 4) != self.tx || (z >> 4) != self.tz)
+        {
             return false;
         }
         if self.mark.is_none() {
@@ -2725,7 +3116,8 @@ impl CarveRun {
         if reached_surface && self.read(g, cc, x, y - 1, z) == br.state_of("minecraft:dirt", None) {
             let fluid = g.is_fluid_state(st);
             if let Some(top) = g.top_material_at(x, y - 1, z, fluid) {
-                self.out.insert(((x & 15) as u8, y - 1, (z & 15) as u8), top);
+                self.out
+                    .insert(((x & 15) as u8, y - 1, (z & 15) as u8), top);
             }
         }
         true
@@ -2734,7 +3126,15 @@ impl CarveRun {
 
 /// `WorldCarver.canReach`: stop walking a tunnel once it is so far from the
 /// chunk and so late in its run that it cannot come back.
-fn can_reach(tx: i32, tz: i32, x: f64, z: f64, branch_index: i32, branch_count: i32, y_scale: f32) -> bool {
+fn can_reach(
+    tx: i32,
+    tz: i32,
+    x: f64,
+    z: f64,
+    branch_index: i32,
+    branch_count: i32,
+    y_scale: f32,
+) -> bool {
     let dx = x - (tx * 16 + 8) as f64;
     let dz = z - (tz * 16 + 8) as f64;
     let left = (branch_count - branch_index) as f64;
@@ -2753,7 +3153,10 @@ fn pop_seed(seed: u64, bx: i32, bz: i32) -> u64 {
     let mut r = Xor::seed_worldgen(seed);
     let l = r.next_i64_legacy() | 1;
     let m = r.next_i64_legacy() | 1;
-    let n = ((bx as i64).wrapping_mul(l).wrapping_add((bz as i64).wrapping_mul(m)) ^ seed as i64) as u64;
+    let n = ((bx as i64)
+        .wrapping_mul(l)
+        .wrapping_add((bz as i64).wrapping_mul(m))
+        ^ seed as i64) as u64;
     if std::env::var("POP_DBG").is_ok() {
         eprintln!("POPDBG seed={seed} bx={bx} bz={bz} l={l} m={m} -> {n}");
     }
@@ -2857,25 +3260,28 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             if !present {
                 continue;
             }
-            let Some(pf) = fr.placed.get(name) else { continue };
+            let Some(pf) = fr.placed.get(name) else {
+                continue;
+            };
             let deco = pop
                 .wrapping_add(*gi as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));
-            CUR_FEAT.store(((*gi as i64) << 32) | step as i64, std::sync::atomic::Ordering::Relaxed);
-            crate::generation_math::XTRACE_FEAT
-                .store(((*gi as i64) << 32) | step as i64, std::sync::atomic::Ordering::Relaxed);
+            CUR_FEAT.store(
+                ((*gi as i64) << 32) | step as i64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            crate::generation_math::XTRACE_FEAT.store(
+                ((*gi as i64) << 32) | step as i64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             // feature placement sees a `WorldgenRandom` (legacy draw semantics)
             let mut rng = Xor::seed_worldgen(deco);
             if let Ok(spec) = std::env::var("FSEED_ARM") {
                 if spec == format!("{sx},{sz},{gi},{step}") {
-                    crate::generation_math::XTRACE
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    crate::generation_math::NTRACE
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    crate::generation_math::FTRACE
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    crate::generation_math::DTRACE
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::generation_math::XTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::generation_math::NTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::generation_math::FTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::generation_math::DTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             if let Ok(spec) = std::env::var("FSEED_TRACE") {
@@ -2886,7 +3292,11 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
                 }
             }
             let before = ctx.wr.len();
-            let t0 = if profile { Some(std::time::Instant::now()) } else { None };
+            let t0 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
             if let Some(t0) = t0 {
                 feat_prof_record(name, t0.elapsed().as_nanos());
@@ -2894,10 +3304,20 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             if trace {
                 let mut h: u64 = 0;
                 for (k, v) in ctx.wr.iter() {
-                    h ^= (k.0 as u64).wrapping_mul(31).wrapping_add(k.1 as u64).rotate_left(7)
-                        ^ (k.2 as u64) ^ (*v as u64).wrapping_mul(131);
+                    h ^= (k.0 as u64)
+                        .wrapping_mul(31)
+                        .wrapping_add(k.1 as u64)
+                        .rotate_left(7)
+                        ^ (k.2 as u64)
+                        ^ (*v as u64).wrapping_mul(131);
                 }
-                eprintln!("TRACE step={} feat={} +{} writes h={:016x}", step, name, ctx.wr.len() - before, h);
+                eprintln!(
+                    "TRACE step={} feat={} +{} writes h={:016x}",
+                    step,
+                    name,
+                    ctx.wr.len() - before,
+                    h
+                );
             }
         }
     }

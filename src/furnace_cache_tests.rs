@@ -242,7 +242,10 @@ fn fuel_miss_does_not_delay_valid_fuel() {
     let diamond = name_to_item("diamond").unwrap();
     let coal = name_to_item("coal").unwrap();
     assert_eq!(cache.get_or_compute(diamond, || fuel_ticks(diamond)), 0);
-    assert_eq!(cache.get_or_compute(coal, || fuel_ticks(coal)), server_ticks(1600) as i32);
+    assert_eq!(
+        cache.get_or_compute(coal, || fuel_ticks(coal)),
+        server_ticks(1600) as i32
+    );
 }
 
 /// The cache is keyed on the content revision, so a datapack reload must make it
@@ -267,7 +270,10 @@ fn a_content_reload_invalidates_cached_smelting() {
     );
 
     // A pack now overrides the recipe, but nothing has announced a reload yet.
-    json_smelts().lock().unwrap().push((Ingr::Item(item), 42, 3, 0.5));
+    json_smelts()
+        .lock()
+        .unwrap()
+        .push((Ingr::Item(item), 42, 3, 0.5));
     assert_eq!(
         cache.get_or_compute((item, rev), || smelt_out(item)),
         builtin,
@@ -296,17 +302,24 @@ fn cached_smelting_beats_rescanning_datapack_recipes() {
     let len_before = json_smelts().lock().unwrap().len();
     // Recipes that match nothing under test, so every scan runs to the end.
     for i in 0..40i64 {
-        json_smelts().lock().unwrap().push((Ingr::Item(900_000 + i), 42, 1, 0.0));
+        json_smelts()
+            .lock()
+            .unwrap()
+            .push((Ingr::Item(900_000 + i), 42, 1, 0.0));
     }
     let names = ["oak_log", "raw_iron", "sand", "cobblestone", "raw_gold"];
-    let items: Vec<i64> = (0..400i64).filter_map(|i| name_to_item(names[i as usize % 5])).collect();
+    let items: Vec<i64> = (0..400i64)
+        .filter_map(|i| name_to_item(names[i as usize % 5]))
+        .collect();
     let rev = content_revision();
 
     let t0 = std::time::Instant::now();
     let mut uncached_sum = 0i64;
     for _ in 0..1000 {
         for it in &items {
-            if let Some((o, _)) = smelt_out(*it) { uncached_sum += o }
+            if let Some((o, _)) = smelt_out(*it) {
+                uncached_sum += o
+            }
         }
     }
     let uncached = t0.elapsed();
@@ -316,14 +329,19 @@ fn cached_smelting_beats_rescanning_datapack_recipes() {
     let mut cached_sum = 0i64;
     for _ in 0..1000 {
         for it in &items {
-            if let Some((o, _)) = cache.get_or_compute((*it, rev), || smelt_out(*it)) { cached_sum += o }
+            if let Some((o, _)) = cache.get_or_compute((*it, rev), || smelt_out(*it)) {
+                cached_sum += o
+            }
         }
     }
     let cached = t1.elapsed();
 
     json_smelts().lock().unwrap().truncate(len_before);
     CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
-    assert_eq!(uncached_sum, cached_sum, "the cache must not change the answer");
+    assert_eq!(
+        uncached_sum, cached_sum,
+        "the cache must not change the answer"
+    );
     assert!(cached_sum > 0, "the measurement must do real work");
     let ratio = uncached.as_secs_f64() / cached.as_secs_f64().max(1e-9);
     println!(
@@ -332,5 +350,8 @@ fn cached_smelting_beats_rescanning_datapack_recipes() {
     );
     // The font bench refused x1.10 claims. This one is far larger than the noise
     // floor, so a floor is asserted rather than the raw ratio.
-    assert!(ratio > 10.0, "the revision-keyed cache must avoid the rescan (x{ratio:.1})");
+    assert!(
+        ratio > 10.0,
+        "the revision-keyed cache must avoid the rescan (x{ratio:.1})"
+    );
 }

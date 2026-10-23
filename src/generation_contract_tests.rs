@@ -1,10 +1,10 @@
+use super::{freg, gen_cf, Cf};
 use crate::block_registry::breg;
 use crate::generation_context::FC;
 use crate::generation_math::{normal_new_l, Xor};
 use crate::generation_providers::{p_hp, p_ip, test_pred, test_rt, Pr, BSP, RT};
 use crate::json::jparse;
 use crate::worldgen::Gen;
-use super::{freg, gen_cf, Cf};
 
 fn context(g: &mut Gen) -> FC<'_> {
     FC::new(g)
@@ -38,19 +38,39 @@ fn kelp_feature_grows_up_from_the_ocean_floor_and_places_one_head() {
     gen_cf(&Cf::Kelp, freg(), &mut ctx, &mut rng, (x, 0, z));
 
     let plant = reg.state_of("minecraft:kelp_plant", None);
-    let placed_heads: Vec<_> = ctx.wr.iter()
+    let placed_heads: Vec<_> = ctx
+        .wr
+        .iter()
         .filter_map(|(&(px, y, pz), &st)| {
             (px == x && pz == z && reg.name_of(st) == "minecraft:kelp").then_some((y, st))
         })
         .collect();
-    assert_eq!(placed_heads.len(), 1, "KelpFeature must place exactly one terminal head");
+    assert_eq!(
+        placed_heads.len(),
+        1,
+        "KelpFeature must place exactly one terminal head"
+    );
     let (top, head_state) = placed_heads[0];
-    let age = reg.get_prop(head_state, "age").unwrap().parse::<u8>().unwrap();
-    assert!((20..=23).contains(&age), "head age must come from nextInt(4)+20");
+    let age = reg
+        .get_prop(head_state, "age")
+        .unwrap()
+        .parse::<u8>()
+        .unwrap();
+    assert!(
+        (20..=23).contains(&age),
+        "head age must come from nextInt(4)+20"
+    );
     assert_eq!(reg.name_of(ctx.get(x, top, z)), "minecraft:kelp");
-    assert!(top > base, "the kelp head must be above its OCEAN_FLOOR origin");
+    assert!(
+        top > base,
+        "the kelp head must be above its OCEAN_FLOOR origin"
+    );
     for y in base..top {
-        assert_eq!(ctx.get(x, y, z), plant, "kelp stem must be continuous at y={y}");
+        assert_eq!(
+            ctx.get(x, y, z),
+            plant,
+            "kelp stem must be continuous at y={y}"
+        );
     }
 }
 
@@ -72,7 +92,11 @@ fn kelp_stops_at_the_water_surface_and_replaces_the_last_plant_with_a_head() {
 
     assert_eq!(reg.name_of(ctx.get(x, base, z)), "minecraft:kelp");
     assert_eq!(reg.name_of(ctx.get(x, base + 1, z)), "minecraft:water");
-    let age = reg.get_prop(ctx.get(x, base, z), "age").unwrap().parse::<u8>().unwrap();
+    let age = reg
+        .get_prop(ctx.get(x, base, z), "age")
+        .unwrap()
+        .parse::<u8>()
+        .unwrap();
     assert!((20..=23).contains(&age));
 }
 
@@ -325,7 +349,11 @@ fn provider_values_and_following_rng_match_pre_extraction() {
     // `UPDATE_BASELINE=1` re-records the fixture after a *verified* correction
     // (the height providers now follow ehz/eib/ehv and below_top is off by one).
     if std::env::var("UPDATE_BASELINE").is_ok() {
-        std::fs::write("evidence/foundation/module-layers/provider-baseline.bin", &trace).unwrap();
+        std::fs::write(
+            "evidence/foundation/module-layers/provider-baseline.bin",
+            &trace,
+        )
+        .unwrap();
     }
     let expected = std::fs::read("evidence/foundation/module-layers/provider-baseline.bin")
         .expect("the pre-extraction provider/context baseline fixture");

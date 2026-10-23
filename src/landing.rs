@@ -1,8 +1,8 @@
 //! Supported player landing operation. Java callbacks run synchronously on one owner.
 use super::*;
-use crate::landing_types::{Loader, Trample};
 #[cfg(feature = "java-compat")]
 use crate::landing_types::Request;
+use crate::landing_types::{Loader, Trample};
 #[cfg(feature = "java-compat")]
 use std::sync::mpsc::{self, SyncSender};
 #[cfg(feature = "java-compat")]

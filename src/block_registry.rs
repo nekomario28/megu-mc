@@ -3,7 +3,7 @@
 // and assets/pblocks.json. Terrain and feature generation read it; it knows
 // nothing about terrain, placement or features.
 
-use crate::json::{jarr, jnum, jstr, js, jparse, J};
+use crate::json::{jarr, jnum, jparse, js, jstr, J};
 use std::collections::{HashMap, HashSet};
 
 // ---------- block-state JSON helpers ----------
@@ -38,28 +38,42 @@ struct Prop {
 }
 
 fn metadata_properties(block: &J, definitions: &HashMap<i64, &J>) -> Option<Vec<Prop>> {
-    jarr(block, "properties")?.iter().map(|key| {
-        let definition = definitions.get(&(key.num() as i64))?;
-        let vals = match jstr(definition, "type")?.as_str() {
-            "boolean" => vec!["true".into(), "false".into()],
-            "enum" => jarr(definition, "values")?.iter().map(|v| v.str().to_string()).collect(),
-            "int" => (jnum(definition, "min")? as i32..=jnum(definition, "max")? as i32)
-                .map(|v| v.to_string()).collect(),
-            _ => return None,
-        };
-        Some(Prop { name: jstr(definition, "serialized_name")?, vals })
-    }).collect()
+    jarr(block, "properties")?
+        .iter()
+        .map(|key| {
+            let definition = definitions.get(&(key.num() as i64))?;
+            let vals = match jstr(definition, "type")?.as_str() {
+                "boolean" => vec!["true".into(), "false".into()],
+                "enum" => jarr(definition, "values")?
+                    .iter()
+                    .map(|v| v.str().to_string())
+                    .collect(),
+                "int" => (jnum(definition, "min")? as i32..=jnum(definition, "max")? as i32)
+                    .map(|v| v.to_string())
+                    .collect(),
+                _ => return None,
+            };
+            Some(Prop {
+                name: jstr(definition, "serialized_name")?,
+                vals,
+            })
+        })
+        .collect()
 }
 
 /// State arrays are mixed-radix products, but each asset may order or extend the
 /// property values differently. Translate names and values, never numeric state ids.
 fn metadata_offset(wire: &[Prop], offset: usize, metadata: &[Prop]) -> Option<usize> {
-    if wire.len() != metadata.len() { return None; }
+    if wire.len() != metadata.len() {
+        return None;
+    }
     let mut out = 0usize;
     for prop in metadata {
         let index = wire.iter().position(|p| p.name == prop.name)?;
         let stride: usize = wire[index + 1..].iter().map(|p| p.vals.len()).product();
-        if stride == 0 || wire[index].vals.is_empty() { return None; }
+        if stride == 0 || wire[index].vals.is_empty() {
+            return None;
+        }
         let value = &wire[index].vals[(offset / stride) % wire[index].vals.len()];
         let digit = prop.vals.iter().position(|v| v == value)?;
         out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;
@@ -73,10 +87,14 @@ mod state_mapping_tests {
     #[test]
     fn property_names_and_values_determine_metadata_position() {
         let prop = |name: &str, vals: &[&str]| Prop {
-            name: name.into(), vals: vals.iter().map(|v| v.to_string()).collect(),
+            name: name.into(),
+            vals: vals.iter().map(|v| v.to_string()).collect(),
         };
         let wire = [prop("axis", &["x", "y"]), prop("wet", &["true", "false"])];
-        let metadata = [prop("wet", &["false", "true"]), prop("axis", &["z", "y", "x"])];
+        let metadata = [
+            prop("wet", &["false", "true"]),
+            prop("axis", &["z", "y", "x"]),
+        ];
         for (offset, expected) in [5, 2, 4, 1].into_iter().enumerate() {
             assert_eq!(metadata_offset(&wire, offset, &metadata), Some(expected));
         }
@@ -97,12 +115,12 @@ pub(crate) struct BReg {
     dfl: Vec<u32>,
     st_lo: Vec<u32>,
     n_states: Vec<u32>,
-    st_blk: Vec<u32>,  // state id -> block idx
-    st_fl: Vec<u16>,   // pumpkin state_flags
-    st_side: Vec<u8>,  // pumpkin side_flags
-    hardness: Vec<f32>, // state id -> vanilla destroy time (-1 unbreakable)
+    st_blk: Vec<u32>,      // state id -> block idx
+    st_fl: Vec<u16>,       // pumpkin state_flags
+    st_side: Vec<u8>,      // pumpkin side_flags
+    hardness: Vec<f32>,    // state id -> vanilla destroy time (-1 unbreakable)
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
-    tool_kind: Vec<i8>, // block idx -> tool kind mined at full speed (-1 = none)
+    tool_kind: Vec<i8>,    // block idx -> tool kind mined at full speed (-1 = none)
     /// Target-version states that could not obtain complete metadata by property value.
     /// The registry gate requires this to be empty, not merely the block names to match.
     pub(crate) unpaired: Vec<String>,
@@ -111,9 +129,9 @@ pub(crate) struct BReg {
     /// `drops` rather than folded into it so the single-drop path stays as it was.
     drops_second: Vec<i64>,
     stack_size: Vec<i64>, // state id -> max stack of the item, from the asset
-    behaviour: Vec<u8>, // block idx -> random-tick behaviour id
-    luminance: Vec<u8>, // state id -> light the state emits (0 = none)
-    opacity: Vec<u8>, // state id -> how much light it stops
+    behaviour: Vec<u8>,   // block idx -> random-tick behaviour id
+    luminance: Vec<u8>,   // state id -> light the state emits (0 = none)
+    opacity: Vec<u8>,     // state id -> how much light it stops
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
@@ -124,7 +142,9 @@ const FL_SOLID: u16 = 1 << 6;
 
 impl BReg {
     fn load() -> Option<BReg> {
-        let md = jparse(&std::fs::read("assets/blocks_1211.json").ok()?)?.into_arr()?.clone();
+        let md = jparse(&std::fs::read("assets/blocks_1211.json").ok()?)?
+            .into_arr()?
+            .clone();
         let pb = jparse(&std::fs::read("assets/pblocks.json").ok()?)?;
         let pb_blocks = pb.get("blocks")?.into_arr()?;
         let property_data = jparse(&std::fs::read("assets/properties.json").ok()?)?;
@@ -182,7 +202,8 @@ impl BReg {
             let lo = jnum(b, "minStateId")? as u32;
             let hi = jnum(b, "maxStateId")? as u32;
             reg.st_lo.push(lo);
-            reg.dfl.push(jnum(b, "defaultState").unwrap_or(lo as f64) as u32);
+            reg.dfl
+                .push(jnum(b, "defaultState").unwrap_or(lo as f64) as u32);
             reg.n_states.push(hi - lo + 1);
             let mut props = Vec::new();
             if let Some(ps) = jarr(b, "states") {
@@ -199,7 +220,8 @@ impl BReg {
             }
             reg.props.push(props.into_boxed_slice());
             let pbr = pb_by_name.get(&name);
-            let metadata_props = pbr.and_then(|block| metadata_properties(block, &property_definitions));
+            let metadata_props =
+                pbr.and_then(|block| metadata_properties(block, &property_definitions));
             // Destroy time is a property of the block, so it is read here once and
             // held per state rather than re-derived by a hand table. A hand table
             // covered 356 of the 26684 states, which meant mining time was wrong for
@@ -262,7 +284,11 @@ impl BReg {
                         }
                     }
                 }
-                if disagree { None } else { k }
+                if disagree {
+                    None
+                } else {
+                    k
+                }
             };
             // The asset has no behaviour field, so this is the one hand-written table in
             // the registry. It lives here, next to the data it accompanies, rather than at
@@ -274,7 +300,8 @@ impl BReg {
                 n if n.ends_with("_concrete_powder") => B_FALLING,
                 _ => B_NONE,
             });
-            reg.tool_kind.push(from_material.or(from_tools).unwrap_or(-1));
+            reg.tool_kind
+                .push(from_material.or(from_tools).unwrap_or(-1));
             reg.htools.push(ht);
             let n = (hi - lo + 1) as usize;
             for i in 0..n {
@@ -287,15 +314,18 @@ impl BReg {
                 reg.drops[st] = drop0;
                 reg.drops_second[st] = drop1;
                 reg.stack_size[st] = stack_size;
-                let values = metadata_props.as_deref()
+                let values = metadata_props
+                    .as_deref()
                     .and_then(|props| metadata_offset(&reg.props[bi as usize], i, props))
                     .and_then(|index| pbr.and_then(|block| jarr(block, "states")?.get(index)))
-                    .and_then(|state| Some((
-                        jnum(state, "state_flags")? as u16,
-                        jnum(state, "side_flags")? as u8,
-                        jnum(state, "luminance")? as u8,
-                        jnum(state, "opacity")? as u8,
-                    )));
+                    .and_then(|state| {
+                        Some((
+                            jnum(state, "state_flags")? as u16,
+                            jnum(state, "side_flags")? as u8,
+                            jnum(state, "luminance")? as u8,
+                            jnum(state, "opacity")? as u8,
+                        ))
+                    });
                 match values {
                     Some((flags, sides, light, opacity)) => {
                         reg.st_fl[st] = flags;
@@ -419,7 +449,9 @@ impl BReg {
     /// mining uses the fast multiplier. A block with no harvestTools entry can be
     /// harvested by anything.
     pub(crate) fn can_harvest(&self, st: u32, item: i64) -> bool {
-        let Some(&bi) = self.st_blk.get(st as usize) else { return true };
+        let Some(&bi) = self.st_blk.get(st as usize) else {
+            return true;
+        };
         match self.htools.get(bi as usize) {
             Some(ht) if !ht.is_empty() => ht.contains(&item),
             _ => true,
@@ -438,7 +470,9 @@ impl BReg {
 
     /// The random-tick behaviour of this block, or B_NONE.
     pub(crate) fn behaviour_of(&self, st: u32) -> u8 {
-        let Some(&bi) = self.st_blk.get(st as usize) else { return B_NONE };
+        let Some(&bi) = self.st_blk.get(st as usize) else {
+            return B_NONE;
+        };
         self.behaviour.get(bi as usize).copied().unwrap_or(B_NONE)
     }
 
@@ -468,7 +502,9 @@ impl BReg {
     /// Which tool type (0 sword, 1 shovel, 2 pickaxe, 3 axe, 4 hoe) mines this block
     /// at full speed, or -1 when no tool is faster than bare hands.
     pub(crate) fn tool_kind_of(&self, st: u32) -> i8 {
-        let Some(&bi) = self.st_blk.get(st as usize) else { return -1 };
+        let Some(&bi) = self.st_blk.get(st as usize) else {
+            return -1;
+        };
         self.tool_kind.get(bi as usize).copied().unwrap_or(-1)
     }
 
@@ -479,13 +515,23 @@ impl BReg {
 
     pub(crate) fn is_air(&self, st: u32) -> bool {
         st == 0
-            || self.st_fl.get(st as usize).map(|f| f & FL_AIR != 0).unwrap_or(true)
+            || self
+                .st_fl
+                .get(st as usize)
+                .map(|f| f & FL_AIR != 0)
+                .unwrap_or(true)
     }
     pub(crate) fn is_solid(&self, st: u32) -> bool {
-        self.st_fl.get(st as usize).map(|f| f & FL_SOLID != 0).unwrap_or(false)
+        self.st_fl
+            .get(st as usize)
+            .map(|f| f & FL_SOLID != 0)
+            .unwrap_or(false)
     }
     pub(crate) fn is_liquid(&self, st: u32) -> bool {
-        self.st_fl.get(st as usize).map(|f| f & FL_LIQUID != 0).unwrap_or(false)
+        self.st_fl
+            .get(st as usize)
+            .map(|f| f & FL_LIQUID != 0)
+            .unwrap_or(false)
     }
     pub(crate) fn is_replaceable(&self, st: u32) -> bool {
         self.is_air(st)
@@ -518,7 +564,11 @@ impl BReg {
                 .map(|q| q.vals.len().max(1) as u64)
                 .product();
             let len = p.vals.len().max(1) as u64;
-            let digit = if mult > 0 { (off as u64 / mult) % len } else { 0 };
+            let digit = if mult > 0 {
+                (off as u64 / mult) % len
+            } else {
+                0
+            };
             if let Some(nd) = p.vals.iter().position(|v| v == val) {
                 // Move this property's digit to `nd` by the difference, NOT by
                 // (nd + len - digit) % len. The offset already carries digit*mult, so
@@ -548,7 +598,11 @@ impl BReg {
                 .map(|q| q.vals.len().max(1) as u64)
                 .product();
             let len = p.vals.len().max(1) as u64;
-            let d = if mult > 0 { (off as u64 / mult) % len } else { 0 };
+            let d = if mult > 0 {
+                (off as u64 / mult) % len
+            } else {
+                0
+            };
             return p.vals.get(d as usize).cloned();
         }
         None
@@ -564,7 +618,10 @@ impl BReg {
             Some(&b) => b,
             None => return false,
         };
-        self.tag.get(&ns_name(tag)).map(|s| s.contains(&bi)).unwrap_or(false)
+        self.tag
+            .get(&ns_name(tag))
+            .map(|s| s.contains(&bi))
+            .unwrap_or(false)
     }
 }
 
@@ -584,11 +641,7 @@ fn dp_tag_files(sub: &str) -> HashMap<String, Vec<u8>> {
                                 let p = e.path();
                                 if p.is_dir() {
                                     stack.push(p);
-                                } else if p
-                                    .extension()
-                                    .map(|x| x == "json")
-                                    .unwrap_or(false)
-                                {
+                                } else if p.extension().map(|x| x == "json").unwrap_or(false) {
                                     if let Ok(rel) = p.strip_prefix(&dir) {
                                         let key = format!(
                                             "{}:{}",
@@ -620,7 +673,12 @@ pub(crate) fn breg() -> Option<&'static BReg> {
 }
 
 pub(crate) fn mkprops(pairs: &[(&str, &str)]) -> J {
-    J::Obj(pairs.iter().map(|(k, v)| (k.to_string(), J::Str(v.to_string()))).collect())
+    J::Obj(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), J::Str(v.to_string())))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -632,11 +690,28 @@ mod tag_tests {
     #[test]
     fn base_stone_overworld_excludes_gravel_and_dirt() {
         let reg = super::breg().expect("registry");
-        for name in ["stone", "granite", "diorite", "andesite", "tuff", "deepslate"] {
+        for name in [
+            "stone",
+            "granite",
+            "diorite",
+            "andesite",
+            "tuff",
+            "deepslate",
+        ] {
             let st = reg.state_of(name, None);
-            assert!(reg.in_tag(st, "minecraft:base_stone_overworld"), "{name} should match");
+            assert!(
+                reg.in_tag(st, "minecraft:base_stone_overworld"),
+                "{name} should match"
+            );
         }
-        for name in ["gravel", "dirt", "grass_block", "sand", "clay", "andesite_slab"] {
+        for name in [
+            "gravel",
+            "dirt",
+            "grass_block",
+            "sand",
+            "clay",
+            "andesite_slab",
+        ] {
             let st = reg.state_of(name, None);
             assert!(
                 !reg.in_tag(st, "minecraft:base_stone_overworld"),

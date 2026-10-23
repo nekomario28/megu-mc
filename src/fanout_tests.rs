@@ -10,7 +10,8 @@ use std::time::Duration;
 fn client_with(eid: i32) -> (Arc<Client>, TcpStream) {
     let (mut c, r) = crate::effect_tests::client_pair();
     c.eid = eid;
-    r.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    r.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     (Arc::new(c), r)
 }
 
@@ -40,27 +41,54 @@ fn the_broadcast_helpers_still_select_the_same_clients() {
     peer.seen.lock().unwrap().insert(77);
     far.seen.lock().unwrap().insert(77);
     peer.chunks.lock().unwrap().insert((4, 5));
-    clients().lock().unwrap().extend([me.clone(), peer.clone(), far.clone()]);
+    clients()
+        .lock()
+        .unwrap()
+        .extend([me.clone(), peer.clone(), far.clone()]);
 
     let payload = |_c: &Client| (0x42i64, vec![1u8, 2, 3]);
 
     // broadcast: everyone except the named sender.
     broadcast(1, payload);
     assert_eq!(drained(&mut r_me), 0, "the sender must not receive it");
-    assert!(drained(&mut r_peer) > 0, "an unrelated client must receive it");
-    assert!(drained(&mut r_far) > 0, "an unrelated client must receive it");
+    assert!(
+        drained(&mut r_peer) > 0,
+        "an unrelated client must receive it"
+    );
+    assert!(
+        drained(&mut r_far) > 0,
+        "an unrelated client must receive it"
+    );
 
     // broadcast_seen_ex: only clients that have seen the entity, minus the excluded
     // one. `me` never saw it and `peer` is excluded, so only `far` is left.
     broadcast_seen_ex(77, 2, payload);
-    assert_eq!(drained(&mut r_peer), 0, "the excluded client must not receive it");
-    assert_eq!(drained(&mut r_me), 0, "a client that has not seen it must not receive it");
-    assert!(drained(&mut r_far) > 0, "a client that has seen it must receive it");
+    assert_eq!(
+        drained(&mut r_peer),
+        0,
+        "the excluded client must not receive it"
+    );
+    assert_eq!(
+        drained(&mut r_me),
+        0,
+        "a client that has not seen it must not receive it"
+    );
+    assert!(
+        drained(&mut r_far) > 0,
+        "a client that has seen it must receive it"
+    );
 
     // broadcast_chunk: only clients streaming that chunk.
     broadcast_chunk(4, 5, payload);
-    assert!(drained(&mut r_peer) > 0, "a client holding the chunk must receive it");
-    assert_eq!(drained(&mut r_far), 0, "a client without the chunk must not receive it");
+    assert!(
+        drained(&mut r_peer) > 0,
+        "a client holding the chunk must receive it"
+    );
+    assert_eq!(
+        drained(&mut r_far),
+        0,
+        "a client without the chunk must not receive it"
+    );
 
     broadcast_chunk(9, 9, payload);
     assert_eq!(drained(&mut r_peer), 0, "nobody holds chunk (9,9)");

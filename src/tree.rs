@@ -10,8 +10,8 @@
 // `evidence/foundation/provenance/`).
 
 use crate::block_registry::BReg;
-use crate::json::J;
 use crate::generation_math::Xor;
+use crate::json::J;
 
 pub(crate) type P3 = (i32, i32, i32);
 
@@ -43,7 +43,11 @@ fn set_if_can_replace_or_log(ctx: &mut FC, p: P3, st: u32) -> bool {
         None => return false,
     };
     let cur = ctx.get(p.0, p.1, p.2);
-    if is_replaceable(reg, cur, &["minecraft:replaceable_by_trees", "minecraft:logs"]) {
+    if is_replaceable(
+        reg,
+        cur,
+        &["minecraft:replaceable_by_trees", "minecraft:logs"],
+    ) {
         ctx.set(p.0, p.1, p.2, st);
         return true;
     }
@@ -105,10 +109,26 @@ pub(crate) enum TP {
     MegaJungle,
     DarkOak,
     Fancy,
-    Bending { min_height_for_leaves: i32, bend_length: IP },
-    UpwardsBranching { extra_steps: IP, branch_prob: f32, extra_len: IP, grow_through: Vec<String> },
-    Cherry { count: IP, horizontal: IP, start_off: IP, end_off: IP },
-    Poplar { above_branches: IP, branch_amount: IP },
+    Bending {
+        min_height_for_leaves: i32,
+        bend_length: IP,
+    },
+    UpwardsBranching {
+        extra_steps: IP,
+        branch_prob: f32,
+        extra_len: IP,
+        grow_through: Vec<String>,
+    },
+    Cherry {
+        count: IP,
+        horizontal: IP,
+        start_off: IP,
+        end_off: IP,
+    },
+    Poplar {
+        above_branches: IP,
+        branch_amount: IP,
+    },
 }
 pub(crate) struct TrunkPl {
     pub base: i32,
@@ -149,7 +169,12 @@ impl TrunkPl {
             }
             TP::Giant | TP::MegaJungle => {
                 let below = (start.0, start.1 - 1, start.2);
-                for dp in [below, (below.0 + 1, below.1, below.2), (below.0, below.1, below.2 + 1), (below.0 + 1, below.1, below.2 + 1)] {
+                for dp in [
+                    below,
+                    (below.0 + 1, below.1, below.2),
+                    (below.0, below.1, below.2 + 1),
+                    (below.0 + 1, below.1, below.2 + 1),
+                ] {
                     set_dirt(ctx, rng, dp, below_trunk);
                 }
                 for y in 0..height {
@@ -192,7 +217,12 @@ impl TrunkPl {
             }
             TP::DarkOak => {
                 let below = (start.0, start.1 - 1, start.2);
-                for dp in [below, (below.0 + 1, below.1, below.2), (below.0, below.1, below.2 + 1), (below.0 + 1, below.1, below.2 + 1)] {
+                for dp in [
+                    below,
+                    (below.0 + 1, below.1, below.2),
+                    (below.0, below.1, below.2 + 1),
+                    (below.0 + 1, below.1, below.2 + 1),
+                ] {
                     set_dirt(ctx, rng, dp, below_trunk);
                 }
                 let lean_dir = rand_horizontal(rng);
@@ -217,7 +247,11 @@ impl TrunkPl {
                         }
                     }
                 }
-                nodes.push(TreeNode { center: (tx, ey, tz), foliage_radius: 0, giant: true });
+                nodes.push(TreeNode {
+                    center: (tx, ey, tz),
+                    foliage_radius: 0,
+                    giant: true,
+                });
                 for ox in -1..=2 {
                     for oz in -1..=2 {
                         if (!(0..=1).contains(&ox) || !(0..=1).contains(&oz))
@@ -261,7 +295,11 @@ impl TrunkPl {
                     }
                 }
                 if let Some(ey) = last_y {
-                    nodes.push(TreeNode { center: (tx, ey, tz), foliage_radius: 1, giant: false });
+                    nodes.push(TreeNode {
+                        center: (tx, ey, tz),
+                        foliage_radius: 1,
+                        giant: false,
+                    });
                 }
                 let (mut bx, mut bz) = (start.0, start.2);
                 let branch_dir = rand_horizontal(rng);
@@ -286,7 +324,11 @@ impl TrunkPl {
                         branch_steps -= 1;
                     }
                     if let Some(ey) = branch_last_y {
-                        nodes.push(TreeNode { center: (bx, ey, bz), foliage_radius: 0, giant: false });
+                        nodes.push(TreeNode {
+                            center: (bx, ey, bz),
+                            foliage_radius: 0,
+                            giant: false,
+                        });
                     }
                 }
             }
@@ -321,8 +363,7 @@ impl TrunkPl {
                         }
                         let r = start.0 - bp.0;
                         let s = start.2 - bp.2;
-                        let t =
-                            bp.1 as f64 - ((r * r + s * s) as f64).sqrt() * 0.381;
+                        let t = bp.1 as f64 - ((r * r + s * s) as f64).sqrt() * 0.381;
                         let u = if t > m as f64 { m } else { t as i32 };
                         let bp3 = (start.0, u, start.2);
                         let (ok, nl) = fancy_branch(ctx, bp3, bp, trunk_st, false);
@@ -333,7 +374,8 @@ impl TrunkPl {
                         list.push((bp, u));
                     }
                 }
-                let (_, nl) = fancy_branch(ctx, start, (start.0, start.1 + k, start.2), trunk_st, true);
+                let (_, nl) =
+                    fancy_branch(ctx, start, (start.0, start.1 + k, start.2), trunk_st, true);
                 logs.extend(nl);
                 for (node_p, end_y) in &list {
                     let i = *end_y;
@@ -346,11 +388,18 @@ impl TrunkPl {
                 }
                 for (node_p, end_y) in list {
                     if fancy_high(j, end_y - start.1) {
-                        nodes.push(TreeNode { center: node_p, foliage_radius: 0, giant: false });
+                        nodes.push(TreeNode {
+                            center: node_p,
+                            foliage_radius: 0,
+                            giant: false,
+                        });
                     }
                 }
             }
-            TP::Bending { min_height_for_leaves, bend_length } => {
+            TP::Bending {
+                min_height_for_leaves,
+                bend_length,
+            } => {
                 let dir = rand_horizontal(rng);
                 let log_h = height - 1;
                 let mut pos = start;
@@ -364,7 +413,11 @@ impl TrunkPl {
                         logs.push(pos);
                     }
                     if i >= *min_height_for_leaves {
-                        nodes.push(TreeNode { center: pos, foliage_radius: 0, giant: false });
+                        nodes.push(TreeNode {
+                            center: pos,
+                            foliage_radius: 0,
+                            giant: false,
+                        });
                     }
                     pos = (pos.0, pos.1 + 1, pos.2);
                 }
@@ -372,12 +425,21 @@ impl TrunkPl {
                     if set_if_can_replace(ctx, pos, trunk_st) {
                         logs.push(pos);
                     }
-                    nodes.push(TreeNode { center: pos, foliage_radius: 0, giant: false });
+                    nodes.push(TreeNode {
+                        center: pos,
+                        foliage_radius: 0,
+                        giant: false,
+                    });
                     let (ox, oz) = hoff(dir);
                     pos = (pos.0 + ox, pos.1, pos.2 + oz);
                 }
             }
-            TP::UpwardsBranching { extra_steps, branch_prob, extra_len, grow_through } => {
+            TP::UpwardsBranching {
+                extra_steps,
+                branch_prob,
+                extra_len,
+                grow_through,
+            } => {
                 for hp in 0..height {
                     let cp = (start.0, start.1 + hp, start.2);
                     let place_ok = {
@@ -387,15 +449,15 @@ impl TrunkPl {
                             r.is_air(cur)
                                 || r.in_tag(cur, "minecraft:replaceable_by_trees")
                                 || grow_through.iter().any(|g| *g == r.name_of(cur))
-                        }).unwrap_or(false)
+                        })
+                        .unwrap_or(false)
                     };
                     if place_ok {
                         ctx.set(cp.0, cp.1, cp.2, trunk_st);
                         logs.push(cp);
                         if hp < height - 1 && rng.next_f32() < *branch_prob {
                             let bdir = rand_horizontal(rng);
-                            let branch_pos =
-                                (extra_len.get(rng) - extra_len.get(rng) - 1).max(0);
+                            let branch_pos = (extra_len.get(rng) - extra_len.get(rng) - 1).max(0);
                             let mut branch_steps = extra_steps.get(rng);
                             let mut height_along = cp.1 + branch_pos;
                             let (mut lx, mut lz) = (cp.0, cp.2);
@@ -415,21 +477,30 @@ impl TrunkPl {
                                             r.is_air(cur)
                                                 || r.in_tag(cur, "minecraft:replaceable_by_trees")
                                                 || grow_through.iter().any(|g| *g == r.name_of(cur))
-                                        }).unwrap_or(false)
+                                        })
+                                        .unwrap_or(false)
                                     };
                                     if ok2 {
                                         ctx.set(p.0, p.1, p.2, trunk_st);
                                         logs.push(p);
                                         height_along = ph + 1;
                                     }
-                                    nodes.push(TreeNode { center: p, foliage_radius: 0, giant: false });
+                                    nodes.push(TreeNode {
+                                        center: p,
+                                        foliage_radius: 0,
+                                        giant: false,
+                                    });
                                 }
                                 bpi += 1;
                                 branch_steps -= 1;
                             }
                             if height_along - cp.1 > 1 {
                                 let fp = (lx, height_along, lz);
-                                nodes.push(TreeNode { center: fp, foliage_radius: 0, giant: false });
+                                nodes.push(TreeNode {
+                                    center: fp,
+                                    foliage_radius: 0,
+                                    giant: false,
+                                });
                                 nodes.push(TreeNode {
                                     center: (fp.0, fp.1 - 2, fp.2),
                                     foliage_radius: 0,
@@ -447,7 +518,12 @@ impl TrunkPl {
                     }
                 }
             }
-            TP::Cherry { count, horizontal, start_off, end_off } => {
+            TP::Cherry {
+                count,
+                horizontal,
+                start_off,
+                end_off,
+            } => {
                 set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
                 let first_off = (height - 1 + start_off.get(rng)).max(0);
                 let mut second_off = (height - 1 + {
@@ -486,15 +562,42 @@ impl TrunkPl {
                 }
                 let dirs = [(0i32, -1i32), (0, 1), (-1, 0), (1, 0)];
                 let bd = dirs[rng.next_bound(4) as usize];
-                cherry_branch(ctx, rng, height, start, trunk_st, bd, first_off,
-                    first_off < trunk_h - 1, horizontal, end_off, &mut nodes, &mut logs);
+                cherry_branch(
+                    ctx,
+                    rng,
+                    height,
+                    start,
+                    trunk_st,
+                    bd,
+                    first_off,
+                    first_off < trunk_h - 1,
+                    horizontal,
+                    end_off,
+                    &mut nodes,
+                    &mut logs,
+                );
                 if both {
                     let bd2 = (-bd.0, -bd.1);
-                    cherry_branch(ctx, rng, height, start, trunk_st, bd2, second_off,
-                        second_off < trunk_h - 1, horizontal, end_off, &mut nodes, &mut logs);
+                    cherry_branch(
+                        ctx,
+                        rng,
+                        height,
+                        start,
+                        trunk_st,
+                        bd2,
+                        second_off,
+                        second_off < trunk_h - 1,
+                        horizontal,
+                        end_off,
+                        &mut nodes,
+                        &mut logs,
+                    );
                 }
             }
-            TP::Poplar { above_branches, branch_amount } => {
+            TP::Poplar {
+                above_branches,
+                branch_amount,
+            } => {
                 set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
                 let branch_h = height - above_branches.get(rng);
                 for y in 0..height {
@@ -623,7 +726,11 @@ fn cherry_branch(
     let bend_off = height - 1 + end_off.get(rng);
     let extend = middle_up || bend_off < off_from_origin;
     let dist = horizontal.get(rng) + extend as i32;
-    let bend = (origin.0 + bdir.0 * dist, origin.1 + bend_off, origin.2 + bdir.1 * dist);
+    let bend = (
+        origin.0 + bdir.0 * dist,
+        origin.1 + bend_off,
+        origin.2 + bdir.1 * dist,
+    );
     let steps_h = if extend { 2 } else { 1 };
     let axis = if bdir.0 != 0 { "x" } else { "z" };
     for _ in 0..steps_h {
@@ -726,7 +833,11 @@ fn hanging_square(
         };
         let (ex, ez) = hoff(to_edge);
         let (ax, az) = hoff(along);
-        let off_e = if matches!(to_edge, 3 | 5) { radius + i } else { radius };
+        let off_e = if matches!(to_edge, 3 | 5) {
+            radius + i
+        } else {
+            radius
+        };
         let mut p = (
             center.0 + ex * off_e - ax * radius,
             center.1 + y - 1,
@@ -735,7 +846,8 @@ fn hanging_square(
         for _ in -radius..(radius + i) {
             let above = (p.0, p.1 + 1, p.2);
             if is_leaf_set(ctx, above) {
-                let dist = (p.0 - log_pos.0).abs() + (p.1 - log_pos.1).abs() + (p.2 - log_pos.2).abs();
+                let dist =
+                    (p.0 - log_pos.0).abs() + (p.1 - log_pos.1).abs() + (p.2 - log_pos.2).abs();
                 if dist < 7 && rng.next_f32() <= hang {
                     if set_if_can_replace(ctx, p, fst) {
                         out.push(p);
@@ -753,19 +865,47 @@ fn hanging_square(
 }
 
 pub(crate) enum FP {
-    Blob { height: i32 },
-    Spruce { trunk_h: IP },
-    Pine { height: IP },
+    Blob {
+        height: i32,
+    },
+    Spruce {
+        trunk_h: IP,
+    },
+    Pine {
+        height: IP,
+    },
     Acacia,
-    Bush { height: i32 },
-    Fancy { height: i32 },
-    Jungle { height: i32 },
-    MegaPine { crown: IP },
+    Bush {
+        height: i32,
+    },
+    Fancy {
+        height: i32,
+    },
+    Jungle {
+        height: i32,
+    },
+    MegaPine {
+        crown: IP,
+    },
     DarkOak,
-    RandomSpread { fh: IP, attempts: i32 },
-    Cherry { height: IP, wide_hole: f32, corner_hole: f32, hang: f32, hang_ext: f32 },
-    Poplar { height: IP, side_hole: f32 },
-    MegaJungle { height: i32 }, // vanilla mega_jungle ≈ jungle with giant flag
+    RandomSpread {
+        fh: IP,
+        attempts: i32,
+    },
+    Cherry {
+        height: IP,
+        wide_hole: f32,
+        corner_hole: f32,
+        hang: f32,
+        hang_ext: f32,
+    },
+    Poplar {
+        height: IP,
+        side_hole: f32,
+    },
+    MegaJungle {
+        height: i32,
+    }, // vanilla mega_jungle ≈ jungle with giant flag
 }
 impl FP {
     pub fn invalid(&self, rng: &mut Xor, dx: i32, y: i32, dz: i32, r: i32, giant: bool) -> bool {
@@ -800,7 +940,11 @@ impl FP {
                 }
                 false
             }
-            FP::Cherry { wide_hole, corner_hole, .. } => {
+            FP::Cherry {
+                wide_hole,
+                corner_hole,
+                ..
+            } => {
                 if y == -1 && (dx == r || dz == r) && rng.next_f32() < *wide_hole {
                     return true;
                 }
@@ -817,8 +961,11 @@ impl FP {
     /// vanilla FoliagePlacer::get_random_height(random, trunk_height)
     pub fn rand_height(&self, rng: &mut Xor, trunk_h: i32) -> i32 {
         match self {
-            FP::Blob { height } | FP::Bush { height } | FP::Fancy { height }
-            | FP::Jungle { height } | FP::MegaJungle { height } => *height,
+            FP::Blob { height }
+            | FP::Bush { height }
+            | FP::Fancy { height }
+            | FP::Jungle { height }
+            | FP::MegaJungle { height } => *height,
             FP::DarkOak => 4,
             FP::Acacia => 0,
             FP::Spruce { trunk_h: t } => (trunk_h - t.get(rng)).max(4),
@@ -831,9 +978,7 @@ impl FP {
     }
     pub fn rand_radius(&self, placer_radius: &IP, rng: &mut Xor, base_h: i32) -> i32 {
         match self {
-            FP::Pine { .. } => {
-                placer_radius.get(rng) + rng.next_bound((base_h + 1).max(1))
-            }
+            FP::Pine { .. } => placer_radius.get(rng) + rng.next_bound((base_h + 1).max(1)),
             _ => placer_radius.get(rng),
         }
     }
@@ -884,9 +1029,39 @@ impl FP {
                 }
             }
             FP::Acacia => {
-                gen_square(self, &mut out, ctx, rng, node.center, radius + node.foliage_radius, -1, node.giant, fst);
-                gen_square(self, &mut out, ctx, rng, node.center, radius - 1, -fh, node.giant, fst);
-                gen_square(self, &mut out, ctx, rng, node.center, radius + node.foliage_radius - 1, 0, node.giant, fst);
+                gen_square(
+                    self,
+                    &mut out,
+                    ctx,
+                    rng,
+                    node.center,
+                    radius + node.foliage_radius,
+                    -1,
+                    node.giant,
+                    fst,
+                );
+                gen_square(
+                    self,
+                    &mut out,
+                    ctx,
+                    rng,
+                    node.center,
+                    radius - 1,
+                    -fh,
+                    node.giant,
+                    fst,
+                );
+                gen_square(
+                    self,
+                    &mut out,
+                    ctx,
+                    rng,
+                    node.center,
+                    radius + node.foliage_radius - 1,
+                    0,
+                    node.giant,
+                    fst,
+                );
             }
             FP::Bush { .. } => {
                 for y in (offset - fh..=offset).rev() {
@@ -901,7 +1076,11 @@ impl FP {
                 }
             }
             FP::Jungle { .. } | FP::MegaJungle { .. } => {
-                let h = if node.giant { fh } else { 1 + rng.next_bound(2) };
+                let h = if node.giant {
+                    fh
+                } else {
+                    1 + rng.next_bound(2)
+                };
                 for y in (offset - h..=offset).rev() {
                     let r = radius + node.foliage_radius + 1 - y;
                     gen_square(self, &mut out, ctx, rng, node.center, r, y, node.giant, fst);
@@ -915,22 +1094,76 @@ impl FP {
                     let cr = radius
                         + node.foliage_radius
                         + ((delta as f32 / fh as f32) * 3.5).floor() as i32;
-                    let r = if delta > 0 && cr == cur_r && (y & 1) == 0 { cr + 1 } else { cr };
-                    gen_square(self, &mut out, ctx, rng, (pos.0, y, pos.2), r, 0, node.giant, fst);
+                    let r = if delta > 0 && cr == cur_r && (y & 1) == 0 {
+                        cr + 1
+                    } else {
+                        cr
+                    };
+                    gen_square(
+                        self,
+                        &mut out,
+                        ctx,
+                        rng,
+                        (pos.0, y, pos.2),
+                        r,
+                        0,
+                        node.giant,
+                        fst,
+                    );
                     cur_r = cr;
                 }
             }
             FP::DarkOak => {
                 let pos = (node.center.0, node.center.1 + offset, node.center.2);
-                gen_square(self, &mut out, ctx, rng, pos, radius + 2, -1, node.giant, fst);
+                gen_square(
+                    self,
+                    &mut out,
+                    ctx,
+                    rng,
+                    pos,
+                    radius + 2,
+                    -1,
+                    node.giant,
+                    fst,
+                );
                 if node.giant {
-                    gen_square(self, &mut out, ctx, rng, pos, radius + 3, 0, node.giant, fst);
-                    gen_square(self, &mut out, ctx, rng, pos, radius + 2, 1, node.giant, fst);
+                    gen_square(
+                        self,
+                        &mut out,
+                        ctx,
+                        rng,
+                        pos,
+                        radius + 3,
+                        0,
+                        node.giant,
+                        fst,
+                    );
+                    gen_square(
+                        self,
+                        &mut out,
+                        ctx,
+                        rng,
+                        pos,
+                        radius + 2,
+                        1,
+                        node.giant,
+                        fst,
+                    );
                     if rng.next_bool() {
                         gen_square(self, &mut out, ctx, rng, pos, radius, 2, node.giant, fst);
                     }
                 } else {
-                    gen_square(self, &mut out, ctx, rng, pos, radius + 1, 0, node.giant, fst);
+                    gen_square(
+                        self,
+                        &mut out,
+                        ctx,
+                        rng,
+                        pos,
+                        radius + 1,
+                        0,
+                        node.giant,
+                        fst,
+                    );
                 }
             }
             FP::RandomSpread { attempts, .. } => {
@@ -948,30 +1181,88 @@ impl FP {
             FP::Cherry { hang, hang_ext, .. } => {
                 let pos = (node.center.0, node.center.1 + offset, node.center.2);
                 let cr = radius + node.foliage_radius - 1;
-                gen_square(self, &mut out, ctx, rng, pos, cr - 2, fh - 3, node.giant, fst);
-                gen_square(self, &mut out, ctx, rng, pos, cr - 1, fh - 4, node.giant, fst);
+                gen_square(
+                    self,
+                    &mut out,
+                    ctx,
+                    rng,
+                    pos,
+                    cr - 2,
+                    fh - 3,
+                    node.giant,
+                    fst,
+                );
+                gen_square(
+                    self,
+                    &mut out,
+                    ctx,
+                    rng,
+                    pos,
+                    cr - 1,
+                    fh - 4,
+                    node.giant,
+                    fst,
+                );
                 for y in (0..=fh - 5).rev() {
                     gen_square(self, &mut out, ctx, rng, pos, cr, y, node.giant, fst);
                 }
-                hanging_square(self, &mut out, ctx, rng, pos, cr, -1, node.giant, fst, *hang, *hang_ext);
-                hanging_square(self, &mut out, ctx, rng, pos, cr - 1, -2, node.giant, fst, *hang, *hang_ext);
+                hanging_square(
+                    self, &mut out, ctx, rng, pos, cr, -1, node.giant, fst, *hang, *hang_ext,
+                );
+                hanging_square(
+                    self,
+                    &mut out,
+                    ctx,
+                    rng,
+                    pos,
+                    cr - 1,
+                    -2,
+                    node.giant,
+                    fst,
+                    *hang,
+                    *hang_ext,
+                );
             }
             FP::Poplar { side_hole, .. } => {
                 let pos = (node.center.0, node.center.1 + offset, node.center.2);
                 let cr = radius + node.foliage_radius - 1;
                 let flipped = rng.next_bool();
-                for (r, y) in [
-                    (cr - 2, fh - 1),
-                    (cr - 1, fh - 2),
-                    (cr - 1, fh - 3),
-                ] {
-                    poplar_rhombus(&mut out, ctx, rng, pos, r, y, node.giant, fst, fh, flipped, *side_hole);
+                for (r, y) in [(cr - 2, fh - 1), (cr - 1, fh - 2), (cr - 1, fh - 3)] {
+                    poplar_rhombus(
+                        &mut out, ctx, rng, pos, r, y, node.giant, fst, fh, flipped, *side_hole,
+                    );
                 }
                 for y in (1..=fh - 4).rev() {
-                    poplar_rhombus(&mut out, ctx, rng, pos, cr, y, node.giant, fst, fh, flipped, *side_hole);
+                    poplar_rhombus(
+                        &mut out, ctx, rng, pos, cr, y, node.giant, fst, fh, flipped, *side_hole,
+                    );
                 }
-                poplar_rhombus(&mut out, ctx, rng, pos, cr - 1, 0, node.giant, fst, fh, flipped, *side_hole);
-                poplar_rhombus(&mut out, ctx, rng, pos, (cr - 2).clamp(1, 2), -1, node.giant, fst, fh, flipped, *side_hole);
+                poplar_rhombus(
+                    &mut out,
+                    ctx,
+                    rng,
+                    pos,
+                    cr - 1,
+                    0,
+                    node.giant,
+                    fst,
+                    fh,
+                    flipped,
+                    *side_hole,
+                );
+                poplar_rhombus(
+                    &mut out,
+                    ctx,
+                    rng,
+                    pos,
+                    (cr - 2).clamp(1, 2),
+                    -1,
+                    node.giant,
+                    fst,
+                    fh,
+                    flipped,
+                    *side_hole,
+                );
             }
         }
         out
@@ -979,8 +1270,17 @@ impl FP {
 }
 #[expect(clippy::too_many_arguments)]
 fn poplar_rhombus(
-    out: &mut Vec<P3>, ctx: &mut FC, rng: &mut Xor, center: P3, r: i32, y: i32,
-    giant: bool, fst: u32, fh: i32, flipped: bool, side_hole: f32,
+    out: &mut Vec<P3>,
+    ctx: &mut FC,
+    rng: &mut Xor,
+    center: P3,
+    r: i32,
+    y: i32,
+    giant: bool,
+    fst: u32,
+    fh: i32,
+    flipped: bool,
+    side_hole: f32,
 ) {
     let i = giant as i32;
     for x in -r..=(r + i) {
@@ -990,8 +1290,18 @@ fn poplar_rhombus(
             if partial && (adx == r || adz == r) {
                 continue;
             }
-            let small_corner = if flipped { x > 0 && z > 0 || z < 0 && x < 0 } else { x > 0 && z < 0 || z > 0 && x < 0 };
-            let corner = if small_corner { r - 1 } else if partial { r + 1 } else { r };
+            let small_corner = if flipped {
+                x > 0 && z > 0 || z < 0 && x < 0
+            } else {
+                x > 0 && z < 0 || z > 0 && x < 0
+            };
+            let corner = if small_corner {
+                r - 1
+            } else if partial {
+                r + 1
+            } else {
+                r
+            };
             let side = i32::from(rng.next_f32() <= side_hole);
             if adx + adz > r * 2 - (corner + side) {
                 continue;
@@ -1007,16 +1317,40 @@ fn poplar_rhombus(
 // ---------- feature size ----------
 
 pub(crate) enum FS {
-    Two { limit: i32, lower: i32, upper: i32 },
-    Three { limit: i32, upper_limit: i32, lower: i32, middle: i32, upper: i32 },
+    Two {
+        limit: i32,
+        lower: i32,
+        upper: i32,
+    },
+    Three {
+        limit: i32,
+        upper_limit: i32,
+        lower: i32,
+        middle: i32,
+        upper: i32,
+    },
 }
 impl FS {
     fn radius(&self, height: i32, y: i32) -> i32 {
         match self {
-            FS::Two { limit, lower, upper } => {
-                if y < *limit { *lower } else { *upper }
+            FS::Two {
+                limit,
+                lower,
+                upper,
+            } => {
+                if y < *limit {
+                    *lower
+                } else {
+                    *upper
+                }
             }
-            FS::Three { limit, upper_limit, lower, middle, upper } => {
+            FS::Three {
+                limit,
+                upper_limit,
+                lower,
+                middle,
+                upper,
+            } => {
                 if y < *limit {
                     *lower
                 } else if y >= height - *upper_limit {
@@ -1034,14 +1368,35 @@ impl FS {
 pub(crate) enum Deco {
     TrunkVine,
     LeaveVine(f32),
-    PaleMoss { leaves: f32, trunk: f32, #[expect(dead_code)] ground: f32 },
+    PaleMoss {
+        leaves: f32,
+        trunk: f32,
+        #[expect(dead_code)]
+        ground: f32,
+    },
     Creaking(f32),
     Cocoa(f32),
     Beehive(f32),
     AlterGround(BSP),
-    PlaceOnGround { tries: i32, radius: i32, height: i32, bsp: BSP },
-    AttachedLeaves { bsp: BSP, dirs: Vec<u8>, excl_xz: i32, excl_y: i32, prob: f32, req_empty: i32 },
-    AttachedLogs { prob: f32, bsp: BSP, dirs: Vec<u8> },
+    PlaceOnGround {
+        tries: i32,
+        radius: i32,
+        height: i32,
+        bsp: BSP,
+    },
+    AttachedLeaves {
+        bsp: BSP,
+        dirs: Vec<u8>,
+        excl_xz: i32,
+        excl_y: i32,
+        prob: f32,
+        req_empty: i32,
+    },
+    AttachedLogs {
+        prob: f32,
+        bsp: BSP,
+        dirs: Vec<u8>,
+    },
     ShelfMushroom(f32),
 }
 
@@ -1119,10 +1474,8 @@ impl Deco {
                     let j = rng.next_bound(i as i32 + 1) as usize;
                     places.swap(i, j);
                 }
-                let nest = reg.state_of(
-                    "minecraft:bee_nest",
-                    Some(&mkprops(&[("facing", "south")])),
-                );
+                let nest =
+                    reg.state_of("minecraft:bee_nest", Some(&mkprops(&[("facing", "south")])));
                 for p in places {
                     let front = (p.0, p.1, p.2 + 1); // south
                     if ctx.is_air(p.0, p.1, p.2) && ctx.is_air(front.0, front.1, front.2) {
@@ -1184,7 +1537,12 @@ impl Deco {
                     }
                 }
             }
-            Deco::PlaceOnGround { tries, radius, height, bsp } => {
+            Deco::PlaceOnGround {
+                tries,
+                radius,
+                height,
+                bsp,
+            } => {
                 let list = litter_positions(roots, logs);
                 let Some(first) = list.first() else { return };
                 let y0 = first.1;
@@ -1220,7 +1578,14 @@ impl Deco {
                     }
                 }
             }
-            Deco::AttachedLeaves { bsp, dirs, excl_xz, excl_y, prob, req_empty } => {
+            Deco::AttachedLeaves {
+                bsp,
+                dirs,
+                excl_xz,
+                excl_y,
+                prob,
+                req_empty,
+            } => {
                 if dirs.is_empty() || foliage.is_empty() {
                     return;
                 }
@@ -1427,7 +1792,16 @@ impl RootP {
                 }
             })
     }
-    fn can_grow(&self, ctx: &mut FC, rng: &mut Xor, p: P3, dir: u8, origin: P3, off: &mut Vec<P3>, len: i32) -> bool {
+    fn can_grow(
+        &self,
+        ctx: &mut FC,
+        rng: &mut Xor,
+        p: P3,
+        dir: u8,
+        origin: P3,
+        off: &mut Vec<P3>,
+        len: i32,
+    ) -> bool {
         let max = self.max_l;
         if len == max || off.len() > max as usize {
             return false;
@@ -1593,14 +1967,28 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         None => vec![],
     };
     let trunk_st = t.trunk_bsp.get(ctx, rng, pos.0, pos.1, pos.2);
-    let (nodes, logs) =
-        t.trunk_placer.generate(ctx, rng, top.max(0), trunk_start, &t.below_trunk, trunk_st, t);
+    let (nodes, logs) = t.trunk_placer.generate(
+        ctx,
+        rng,
+        top.max(0),
+        trunk_start,
+        &t.below_trunk,
+        trunk_st,
+        t,
+    );
     let foliage_st = t.foliage_bsp.get(ctx, rng, pos.0, pos.1, pos.2);
     let mut foliage = vec![];
     for node in &nodes {
         let off = t.foliage_offset.get(rng);
         foliage.extend(t.foliage_placer.generate(
-            off, &t.foliage_radius, ctx, rng, node, foliage_h, frad, foliage_st,
+            off,
+            &t.foliage_radius,
+            ctx,
+            rng,
+            node,
+            foliage_h,
+            frad,
+            foliage_st,
         ));
     }
     if logs.is_empty() && foliage.is_empty() {
@@ -1640,9 +2028,7 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) {
         if p.0 < min.0 || p.0 > max.0 || p.1 < min.1 || p.1 > max.1 || p.2 < min.2 || p.2 > max.2 {
             return None;
         }
-        Some(
-            ((p.0 - min.0) as usize * ys + (p.1 - min.1) as usize) * zs + (p.2 - min.2) as usize,
-        )
+        Some(((p.0 - min.0) as usize * ys + (p.1 - min.1) as usize) * zs + (p.2 - min.2) as usize)
     };
     // Deterministic multi-source shortest-path propagation (label correcting):
     // logs/roots seed 0; leaves seed their stored `distance` (fresh=7, foreign
@@ -1785,15 +2171,31 @@ fn p_fp(j: &J) -> Option<(FP, IP, IP)> {
     let radius = ip(js(j, "radius").unwrap_or(&J::Num(0.0)));
     let offset = ip(js(j, "offset").unwrap_or(&J::Num(0.0)));
     let fp = match ty {
-        "blob_foliage_placer" => FP::Blob { height: jint(j, "height", 3) },
-        "spruce_foliage_placer" => FP::Spruce { trunk_h: ip(js(j, "trunk_height")?) },
-        "pine_foliage_placer" => FP::Pine { height: ip(js(j, "height")?) },
+        "blob_foliage_placer" => FP::Blob {
+            height: jint(j, "height", 3),
+        },
+        "spruce_foliage_placer" => FP::Spruce {
+            trunk_h: ip(js(j, "trunk_height")?),
+        },
+        "pine_foliage_placer" => FP::Pine {
+            height: ip(js(j, "height")?),
+        },
         "acacia_foliage_placer" => FP::Acacia,
-        "bush_foliage_placer" => FP::Bush { height: jint(j, "height", 2) },
-        "fancy_foliage_placer" => FP::Fancy { height: jint(j, "height", 4) },
-        "jungle_foliage_placer" => FP::Jungle { height: jint(j, "height", 2) },
-        "mega_jungle_foliage_placer" => FP::MegaJungle { height: jint(j, "height", 10) },
-        "mega_pine_foliage_placer" => FP::MegaPine { crown: ip(js(j, "crown_height")?) },
+        "bush_foliage_placer" => FP::Bush {
+            height: jint(j, "height", 2),
+        },
+        "fancy_foliage_placer" => FP::Fancy {
+            height: jint(j, "height", 4),
+        },
+        "jungle_foliage_placer" => FP::Jungle {
+            height: jint(j, "height", 2),
+        },
+        "mega_jungle_foliage_placer" => FP::MegaJungle {
+            height: jint(j, "height", 10),
+        },
+        "mega_pine_foliage_placer" => FP::MegaPine {
+            crown: ip(js(j, "crown_height")?),
+        },
         "dark_oak_foliage_placer" => FP::DarkOak,
         "random_spread_foliage_placer" => FP::RandomSpread {
             fh: ip(js(j, "foliage_height")?),
@@ -1841,7 +2243,9 @@ fn p_deco(j: &J) -> Option<Deco> {
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
     Some(match ty {
         "trunk_vine" => Deco::TrunkVine,
-        "leave_vine" | "leaves_vine" => Deco::LeaveVine(jnum(j, "probability").unwrap_or(0.25) as f32),
+        "leave_vine" | "leaves_vine" => {
+            Deco::LeaveVine(jnum(j, "probability").unwrap_or(0.25) as f32)
+        }
         "pale_moss" => Deco::PaleMoss {
             leaves: jnum(j, "leaves_probability").unwrap_or(0.0) as f32,
             trunk: jnum(j, "trunk_probability").unwrap_or(0.0) as f32,
@@ -1909,8 +2313,12 @@ fn p_root(j: &J) -> Option<RootP> {
     Some(RootP {
         trunk_off_y: ip(js(j, "trunk_offset_y")?),
         root_bsp: p_bsp(js(j, "root_provider")?)?,
-        above_chance: above.and_then(|a| jnum(a, "above_root_placement_chance")).map(|v| v as f32),
-        above_bsp: above.and_then(|a| js(a, "above_root_provider")).and_then(p_bsp),
+        above_chance: above
+            .and_then(|a| jnum(a, "above_root_placement_chance"))
+            .map(|v| v as f32),
+        above_bsp: above
+            .and_then(|a| js(a, "above_root_provider"))
+            .and_then(p_bsp),
         grow_through: match js(mr, "can_grow_through") {
             Some(J::Arr(v)) => v.iter().map(|x| x.str().to_string()).collect(),
             Some(J::Str(s)) => vec![s.clone()],
@@ -1929,8 +2337,7 @@ fn p_root(j: &J) -> Option<RootP> {
 
 pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
     let trunk_placer = p_tp(js(j, "trunk_placer")?)?;
-    let (foliage_placer, foliage_radius, foliage_offset) =
-        p_fp(js(j, "foliage_placer")?)?;
+    let (foliage_placer, foliage_radius, foliage_offset) = p_fp(js(j, "foliage_placer")?)?;
     let (min_size, mch) = p_fs(js(j, "minimum_size")?)?;
     let mut decorators = vec![];
     if let Some(ds) = js(j, "decorators").and_then(|d| d.into_arr()) {
@@ -1986,15 +2393,24 @@ mod tests {
             &["minecraft:replaceable_by_trees"][..],
             &["minecraft:replaceable_by_trees", "minecraft:logs"][..],
         ] {
-            assert!(is_replaceable(reg, 0, tags), "air must be replaceable: {tags:?}");
-            assert!(!is_replaceable(reg, stone, tags), "stone must not be replaceable: {tags:?}");
+            assert!(
+                is_replaceable(reg, 0, tags),
+                "air must be replaceable: {tags:?}"
+            );
+            assert!(
+                !is_replaceable(reg, stone, tags),
+                "stone must not be replaceable: {tags:?}"
+            );
         }
 
         // The tag argument has to be read: a log is not replaceable by trees, and
         // is only replaceable where the placer names the logs tag.
         let by_trees = &["minecraft:replaceable_by_trees"][..];
         let or_log = &["minecraft:replaceable_by_trees", "minecraft:logs"][..];
-        assert!(reg.in_tag(log, "minecraft:logs"), "the registry must know oak_log is a log");
+        assert!(
+            reg.in_tag(log, "minecraft:logs"),
+            "the registry must know oak_log is a log"
+        );
         assert!(
             !is_replaceable(reg, log, by_trees),
             "trees alone must not overwrite a log"
@@ -2012,7 +2428,11 @@ mod tests {
         ] {
             for st in [0u32, stone, log, state("oak_leaves")] {
                 let expected = reg.is_air(st) || tags.iter().any(|t| reg.in_tag(st, t));
-                assert_eq!(is_replaceable(reg, st, tags), expected, "state {st} tags {tags:?}");
+                assert_eq!(
+                    is_replaceable(reg, st, tags),
+                    expected,
+                    "state {st} tags {tags:?}"
+                );
             }
         }
     }

@@ -15,7 +15,10 @@ pub(crate) fn isolated_world_test() -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         if let Some(status) = child.try_wait().expect("wait for isolated fixture") {
-            assert!(status.success(), "isolated world fixture {name} failed: {status}");
+            assert!(
+                status.success(),
+                "isolated world fixture {name} failed: {status}"
+            );
             return true;
         }
         if std::time::Instant::now() >= deadline {

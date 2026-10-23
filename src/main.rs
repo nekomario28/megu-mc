@@ -8,33 +8,39 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+mod cached_lookup;
+mod effects;
 #[cfg(feature = "java-compat")]
 mod java_compat;
-mod landing_types;
 mod landing;
+mod landing_types;
 #[cfg(test)]
 mod light_pack_tests;
-mod effects;
-mod cached_lookup;
 use cached_lookup::CachedLookup;
 mod block_registry;
-mod generation_context;
-mod generation_providers;
 mod feature;
+mod generation_context;
+mod generation_math;
+mod generation_providers;
+mod json;
 mod tree;
 mod world_rng;
-mod json;
-mod generation_math;
 mod worldgen;
 
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
-    let mut v = 0i64; let mut i = 0;
+    let mut v = 0i64;
+    let mut i = 0;
     loop {
-        if b.is_empty() || i > 9 { return None }
-        let byte = b[0]; *b = &b[1..];
+        if b.is_empty() || i > 9 {
+            return None;
+        }
+        let byte = b[0];
+        *b = &b[1..];
         v |= ((byte & 0x7f) as i64) << (7 * i);
-        if byte & 0x80 == 0 { return Some(v) }
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
         i += 1;
     }
 }
@@ -42,21 +48,34 @@ fn read_varint(b: &mut &[u8]) -> Option<i64> {
 fn read_protocol_i32(b: &mut &[u8]) -> Option<i32> {
     let before = b.len();
     let value = read_varint(b)?;
-    if before - b.len() > 5 || value > u32::MAX as i64 { return None; }
+    if before - b.len() > 5 || value > u32::MAX as i64 {
+        return None;
+    }
     Some(value as u32 as i32)
 }
 fn write_varint(out: &mut Vec<u8>, v: i64) {
     // i32-range negatives encode as VarInt (5-byte u32 LEB128); wider as VarLong.
     // (arithmetic `>>=` on a negative i64 loops forever -> unbounded Vec growth)
-    let mut v = if v < 0 && v >= i32::MIN as i64 { v as u32 as u64 } else { v as u64 };
+    let mut v = if v < 0 && v >= i32::MIN as i64 {
+        v as u32 as u64
+    } else {
+        v as u64
+    };
     loop {
-        let mut b = (v & 0x7f) as u8; v >>= 7;
-        if v != 0 { b |= 0x80 } out.push(b);
-        if v == 0 { break }
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80
+        }
+        out.push(b);
+        if v == 0 {
+            break;
+        }
     }
 }
 fn write_str(out: &mut Vec<u8>, s: &str) {
-    write_varint(out, s.len() as i64); out.extend_from_slice(s.as_bytes());
+    write_varint(out, s.len() as i64);
+    out.extend_from_slice(s.as_bytes());
 }
 fn write_pos(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
     let v = ((x as i64 & 0x3ffffff) << 38) | ((z as i64 & 0x3ffffff) << 12) | (y as i64 & 0xfff);
@@ -77,7 +96,9 @@ fn read_before(s: &mut TcpStream, mut out: &mut [u8], deadline: Instant) -> Opti
         let remaining = deadline.checked_duration_since(Instant::now())?;
         s.set_read_timeout(Some(remaining)).ok()?;
         let n = s.read(out).ok()?;
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         out = &mut out[n..];
     }
     Some(())
@@ -89,7 +110,10 @@ fn read_packet(s: &mut TcpStream, deadline: Instant) -> Option<(i64, Vec<u8>)> {
         let mut b = [0u8; 1];
         read_before(s, &mut b, deadline)?;
         len |= ((b[0] & 0x7f) as u64) << (7 * i);
-        if b[0] & 0x80 == 0 { done = true; break; }
+        if b[0] & 0x80 == 0 {
+            done = true;
+            break;
+        }
     }
     // Pre-play packets are small; reject large declared allocations.
     if !done || len == 0 || len > 64 * 1024 {
@@ -105,24 +129,52 @@ fn read_packet(s: &mut TcpStream, deadline: Instant) -> Option<(i64, Vec<u8>)> {
 // Buffered frame reader for the consume loop: a mid-frame timeout must NOT
 // drop already-read bytes. Dropped length bytes desync the stream -> garbage
 // length fields -> repeated <=16MiB allocs -> allocator arena churn -> the OOM.
-struct RxBuf { buf: std::collections::VecDeque<u8> }
-enum RxOut { Closed, Idle, Frame(i64, Vec<u8>) }
+struct RxBuf {
+    buf: std::collections::VecDeque<u8>,
+}
+enum RxOut {
+    Closed,
+    Idle,
+    Frame(i64, Vec<u8>),
+}
 impl RxBuf {
-    fn new() -> Self { RxBuf { buf: std::collections::VecDeque::new() } }
+    fn new() -> Self {
+        RxBuf {
+            buf: std::collections::VecDeque::new(),
+        }
+    }
     fn try_frame(&mut self) -> Option<Option<RxOut>> {
         let n = self.buf.len();
-        let mut len = 0i64; let mut i = 0usize;
+        let mut len = 0i64;
+        let mut i = 0usize;
         loop {
-            if i >= n { return Some(None) }
+            if i >= n {
+                return Some(None);
+            }
             let b = self.buf[i];
-            len |= ((b & 0x7f) as i64) << (7 * i); i += 1;
-            if b & 0x80 == 0 { break }
-            if i > 5 { return None }
+            len |= ((b & 0x7f) as i64) << (7 * i);
+            i += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+            if i > 5 {
+                return None;
+            }
         }
-        if len < 0 || len > (16 << 20) { return None }
+        if len < 0 || len > (16 << 20) {
+            return None;
+        }
         let total = i + len as usize;
-        if n < total { return Some(None) }
-        let body: Vec<u8> = self.buf.iter().skip(i).take(len as usize).copied().collect();
+        if n < total {
+            return Some(None);
+        }
+        let body: Vec<u8> = self
+            .buf
+            .iter()
+            .skip(i)
+            .take(len as usize)
+            .copied()
+            .collect();
         self.buf.drain(..total);
         let mut sl = &body[..];
         match read_varint(&mut sl) {
@@ -132,38 +184,55 @@ impl RxBuf {
     }
     fn next(&mut self, s: &mut TcpStream) -> RxOut {
         match self.try_frame() {
-            None => { let _ = s.shutdown(std::net::Shutdown::Both); return RxOut::Closed }
+            None => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                return RxOut::Closed;
+            }
             Some(Some(f)) => return f,
             Some(None) => {}
         }
         let mut tmp = [0u8; 8192];
         match s.read(&mut tmp) {
             Ok(0) => RxOut::Closed,
-            Ok(n) => { self.buf.extend(&tmp[..n]); RxOut::Idle }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => RxOut::Idle,
+            Ok(n) => {
+                self.buf.extend(&tmp[..n]);
+                RxOut::Idle
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                RxOut::Idle
+            }
             Err(_) => RxOut::Closed,
         }
     }
 }
 fn send_packet(s: &mut TcpStream, id: i64, payload: Vec<u8>) -> std::io::Result<()> {
     let mut body = Vec::new();
-    write_varint(&mut body, id); body.extend_from_slice(&payload);
+    write_varint(&mut body, id);
+    body.extend_from_slice(&payload);
     let mut out = Vec::new();
-    write_varint(&mut out, body.len() as i64); out.extend_from_slice(&body);
+    write_varint(&mut out, body.len() as i64);
+    out.extend_from_slice(&body);
     s.write_all(&out)
 }
 fn send_raw(s: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
     let mut out = Vec::new();
-    write_varint(&mut out, body.len() as i64); out.extend_from_slice(body);
+    write_varint(&mut out, body.len() as i64);
+    out.extend_from_slice(body);
     s.write_all(&out)
 }
 
 // ---------- clients (multiplayer visibility) ----------
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-struct Eff { id: i32, amp: i32, left: i32 } // left: server ticks (TICK_MS)
+struct Eff {
+    id: i32,
+    amp: i32,
+    left: i32,
+} // left: server ticks (TICK_MS)
 struct Client {
     eid: i32,
     uuid: [u8; 16],
@@ -181,13 +250,25 @@ struct Client {
     open_table: Mutex<bool>,
     open_merchant: Mutex<bool>,
     trade_sel: Mutex<i32>,
-    merchant_in: Mutex<[Stack; 2]>, bow_draw: Mutex<Option<Instant>>, dig: Mutex<Option<(i32, i32, i32, Instant)>>, eat_start: Mutex<Option<Instant>>, blocking: Mutex<bool>, sprinting: Mutex<bool>, sneaking: Mutex<bool>, last_melee: Mutex<Instant>, fall_fly: Mutex<bool>, hurt_at: Mutex<Instant>, shield_cd: Mutex<Instant>, absorb: Mutex<f32>, pearl_cd: Mutex<Instant>,
+    merchant_in: Mutex<[Stack; 2]>,
+    bow_draw: Mutex<Option<Instant>>,
+    dig: Mutex<Option<(i32, i32, i32, Instant)>>,
+    eat_start: Mutex<Option<Instant>>,
+    blocking: Mutex<bool>,
+    sprinting: Mutex<bool>,
+    sneaking: Mutex<bool>,
+    last_melee: Mutex<Instant>,
+    fall_fly: Mutex<bool>,
+    hurt_at: Mutex<Instant>,
+    shield_cd: Mutex<Instant>,
+    absorb: Mutex<f32>,
+    pearl_cd: Mutex<Instant>,
     xp: Mutex<i64>,
     skin: Mutex<Option<(String, String)>>, // textures (value, signature) resolved from Mojang
-    seen: Mutex<HashSet<i32>>, // entity ids currently spawned for this client
-    chunks: Mutex<HashSet<(i32, i32)>>, // chunks the client currently holds
+    seen: Mutex<HashSet<i32>>,             // entity ids currently spawned for this client
+    chunks: Mutex<HashSet<(i32, i32)>>,    // chunks the client currently holds
     gen_sources: Mutex<GenSources>, // generated light emitters per held chunk, for the light pass
-    gm: Mutex<u8>,          // 0=survival 1=creative 3=spectator
+    gm: Mutex<u8>,                  // 0=survival 1=creative 3=spectator
     fall_from: Mutex<f64>,
     food: Mutex<i32>,
     air: Mutex<i32>,
@@ -204,7 +285,9 @@ static NEXT_EID: AtomicI32 = AtomicI32::new(1000);
 fn clients() -> &'static Mutex<Vec<Arc<Client>>> {
     CLIENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
-fn angle(deg: f32) -> i8 { (deg / 360.0 * 256.0) as i8 }
+fn angle(deg: f32) -> i8 {
+    (deg / 360.0 * 256.0) as i8
+}
 
 static SKIN_CACHE: OnceLock<Mutex<HashMap<String, Option<(String, String)>>>> = OnceLock::new();
 fn skin_cache() -> &'static Mutex<HashMap<String, Option<(String, String)>>> {
@@ -214,12 +297,29 @@ fn fetch_skin(name: &str) -> Option<(String, String)> {
     // offline-mode skin resolution: name -> uuid -> session profile textures
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(6)))
-        .build().into();
-    let prof = agent.get(format!("https://api.mojang.com/users/profiles/minecraft/{}", name))
-        .call().ok()?.body_mut().read_to_string().ok()?;
+        .build()
+        .into();
+    let prof = agent
+        .get(format!(
+            "https://api.mojang.com/users/profiles/minecraft/{}",
+            name
+        ))
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
     let id = jstr(&prof, "id")?.to_string();
-    let full = agent.get(format!("https://sessionserver.mojang.com/session/minecraft/profile/{}?unsigned=false", id))
-        .call().ok()?.body_mut().read_to_string().ok()?;
+    let full = agent
+        .get(format!(
+            "https://sessionserver.mojang.com/session/minecraft/profile/{}?unsigned=false",
+            id
+        ))
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
     let value = jstr(&full, "value")?.to_string();
     let signature = jstr(&full, "signature")?.to_string();
     Some((value, signature))
@@ -228,16 +328,21 @@ fn kick_skin(name: String, target: &Arc<Client>) {
     let t = target.clone();
     thread::spawn(move || {
         let hit = skin_cache().lock().unwrap().get(&name).cloned();
-        let res = match hit { Some(r) => r, None => {
-            let r = fetch_skin(&name);
-            skin_cache().lock().unwrap().insert(name, r.clone());
-            r
-        }};
+        let res = match hit {
+            Some(r) => r,
+            None => {
+                let r = fetch_skin(&name);
+                skin_cache().lock().unwrap().insert(name, r.clone());
+                r
+            }
+        };
         if let Some((v, sig)) = res {
             *t.skin.lock().unwrap() = Some((v.clone(), sig.clone()));
             // re-add player info so already-connected viewers pick up the skin
             let cs = clients().lock().unwrap();
-            if !cs.iter().any(|c| Arc::ptr_eq(c, &t)) { return; }
+            if !cs.iter().any(|c| Arc::ptr_eq(c, &t)) {
+                return;
+            }
             let pi = player_info_add(&t);
             for c in cs.iter() {
                 let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x3e, pi.clone());
@@ -275,26 +380,36 @@ fn spawn_player(c: &Client) -> Vec<u8> {
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(pitch) as u8); p.push(angle(yaw) as u8); p.push(angle(yaw) as u8);
+    p.push(angle(pitch) as u8);
+    p.push(angle(yaw) as u8);
+    p.push(angle(yaw) as u8);
     write_varint(&mut p, 0);
     p.extend_from_slice(&[0u8; 6]); // velocity
     p
 }
 #[allow(dead_code)]
-fn arrow_meta(eid: i32) -> Vec<u8> { let mut p = Vec::new(); write_varint(&mut p, eid as i64); p.push(0xff); p }
+fn arrow_meta(eid: i32) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, eid as i64);
+    p.push(0xff);
+    p
+}
 fn entity_teleport(eid: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32, g: bool) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, eid as i64);
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(yaw) as u8); p.push(angle(pitch) as u8);
+    p.push(angle(yaw) as u8);
+    p.push(angle(pitch) as u8);
     p.push(g as u8);
     p
 }
 fn head_rot(eid: i32, yaw: f32) -> Vec<u8> {
     let mut p = Vec::new();
-    write_varint(&mut p, eid as i64); p.push(angle(yaw) as u8); p
+    write_varint(&mut p, eid as i64);
+    p.push(angle(yaw) as u8);
+    p
 }
 // LOCK ORDER: acquires clients() internally — the caller must NOT
 // hold clients().lock() (self-deadlock). Per-client field locks are
@@ -316,9 +431,13 @@ where
     P: Fn(&Client) -> bool,
 {
     for c in client_snapshot().iter() {
-        if !interested(c) { continue }
+        if !interested(c) {
+            continue;
+        }
         let pl = mk(c);
-        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, pl.0, pl.1); }
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut *w, pl.0, pl.1);
+        }
     }
 }
 
@@ -345,81 +464,201 @@ const HOPPER_CAP: usize = 65536;
 // destroy on leave, prune dead. Server never streams far entities.
 fn interest_tick() {
     let cls = client_snapshot();
-    if cls.is_empty() { return }
+    if cls.is_empty() {
+        return;
+    }
     // spawn payloads are built lazily on the visible-transition only —
     // steady-state cost is one distance check per entity per client.
-    let mut ents: Vec<(i32, f64, f64, f64, Box<dyn Fn() -> Vec<(i64, Vec<u8>)> + Send>)> = Vec::new();
+    let mut ents: Vec<(
+        i32,
+        f64,
+        f64,
+        f64,
+        Box<dyn Fn() -> Vec<(i64, Vec<u8>)> + Send>,
+    )> = Vec::new();
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
         let m = m.clone();
-        ents.push((m.eid, p.0, p.1, p.2, Box::new(move || vec![(0x01, spawn_mob(&m))])));
+        ents.push((
+            m.eid,
+            p.0,
+            p.1,
+            p.2,
+            Box::new(move || vec![(0x01, spawn_mob(&m))]),
+        ));
     }
     for d in drops().lock().unwrap().iter() {
-        let (eid, x, y, z, item, cnt, comps) = (d.eid, d.x, d.y, d.z, d.item, d.cnt, d.comps.clone());
-        ents.push((eid, x, y, z, Box::new(move || {
-            let d = Drop { eid, x, y, z, item, cnt, comps: comps.clone(), age: 0 };
-            vec![(0x01, spawn_drop_pkt(&d)), (0x58, drop_meta_pkt(&d))]
-        })));
+        let (eid, x, y, z, item, cnt, comps) =
+            (d.eid, d.x, d.y, d.z, d.item, d.cnt, d.comps.clone());
+        ents.push((
+            eid,
+            x,
+            y,
+            z,
+            Box::new(move || {
+                let d = Drop {
+                    eid,
+                    x,
+                    y,
+                    z,
+                    item,
+                    cnt,
+                    comps: comps.clone(),
+                    age: 0,
+                };
+                vec![(0x01, spawn_drop_pkt(&d)), (0x58, drop_meta_pkt(&d))]
+            }),
+        ));
     }
     for a in arrows().lock().unwrap().iter() {
-        let a2 = Arrow { eid: a.eid, owner: a.owner, x: a.x, y: a.y, z: a.z, dx: a.dx, dy: a.dy, dz: a.dz, ttl: a.ttl, dmg: a.dmg, fire: a.fire, punch: a.punch, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: false };
-        ents.push((a.eid, a.x, a.y, a.z, Box::new(move || vec![(0x01, spawn_arrow_pkt(&a2))])));
+        let a2 = Arrow {
+            eid: a.eid,
+            owner: a.owner,
+            x: a.x,
+            y: a.y,
+            z: a.z,
+            dx: a.dx,
+            dy: a.dy,
+            dz: a.dz,
+            ttl: a.ttl,
+            dmg: a.dmg,
+            fire: a.fire,
+            punch: a.punch,
+            kind: 0,
+            loy: 0,
+            ret_item: 0,
+            ret_comps: Vec::new(),
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        };
+        ents.push((
+            a.eid,
+            a.x,
+            a.y,
+            a.z,
+            Box::new(move || vec![(0x01, spawn_arrow_pkt(&a2))]),
+        ));
     }
     for b in bobbers().lock().unwrap().iter() {
         let (eid, x, y, z) = (b.eid, b.x, b.y, b.z);
-        ents.push((eid, x, y, z, Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 129, x, y, z))])));
+        ents.push((
+            eid,
+            x,
+            y,
+            z,
+            Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 129, x, y, z))]),
+        ));
     }
     for p in pearls().lock().unwrap().iter() {
         let (eid, x, y, z) = (p.eid, p.x, p.y, p.z);
-        ents.push((eid, x, y, z, Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 32, x, y, z))])));
+        ents.push((
+            eid,
+            x,
+            y,
+            z,
+            Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 32, x, y, z))]),
+        ));
     }
     for sb in snowballs().lock().unwrap().iter() {
         let (eid, x, y, z) = (sb.eid, sb.x, sb.y, sb.z);
-        ents.push((eid, x, y, z, Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 97, x, y, z))])));
+        ents.push((
+            eid,
+            x,
+            y,
+            z,
+            Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 97, x, y, z))]),
+        ));
     }
     for t in primed().lock().unwrap().iter() {
         let (eid, x, y, z) = (t.eid, t.x, t.y, t.z);
-        ents.push((eid, x, y, z, Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0))])));
+        ents.push((
+            eid,
+            x,
+            y,
+            z,
+            Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0))]),
+        ));
     }
     for f in falling().lock().unwrap().iter() {
         let (eid, x, y, z, state) = (f.eid, f.x, f.y, f.z, f.state);
-        ents.push((eid, x, y, z, Box::new(move || vec![(0x01, spawn_falling_pkt(eid, state, x, y, z))])));
+        ents.push((
+            eid,
+            x,
+            y,
+            z,
+            Box::new(move || vec![(0x01, spawn_falling_pkt(eid, state, x, y, z))]),
+        ));
     }
     for o in xps().lock().unwrap().iter() {
         let (eid, x, y, z, val) = (o.eid, o.x, o.y, o.z, o.val);
-        ents.push((eid, x, y, z, Box::new(move || vec![(0x02, xp_orb_pkt(eid, x, y, z, val))])));
+        ents.push((
+            eid,
+            x,
+            y,
+            z,
+            Box::new(move || vec![(0x02, xp_orb_pkt(eid, x, y, z, val))]),
+        ));
     }
     for o in cls.iter() {
-        let p = { let p = o.pos.lock().unwrap(); *p };
+        let p = {
+            let p = o.pos.lock().unwrap();
+            *p
+        };
         let o2 = o.clone();
-        ents.push((o.eid, p.0, p.1, p.2, Box::new(move || vec![(0x01, spawn_player(&o2))])));
+        ents.push((
+            o.eid,
+            p.0,
+            p.1,
+            p.2,
+            Box::new(move || vec![(0x01, spawn_player(&o2))]),
+        ));
     }
     let alive: HashSet<i32> = ents.iter().map(|e| e.0).collect();
     for c in cls.iter() {
-        let (px, py, pz) = { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) };
+        let (px, py, pz) = {
+            let p = c.pos.lock().unwrap();
+            (p.0, p.1, p.2)
+        };
         let mut seen = c.seen.lock().unwrap();
-        let gone: Vec<i32> = seen.iter().copied().filter(|e| !alive.contains(e)).collect();
+        let gone: Vec<i32> = seen
+            .iter()
+            .copied()
+            .filter(|e| !alive.contains(e))
+            .collect();
         if !gone.is_empty() {
             let mut p = Vec::new();
             write_varint(&mut p, gone.len() as i64);
-            for e in &gone { write_varint(&mut p, *e as i64); }
-            if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x42, p); }
-            for e in gone { seen.remove(&e); }
+            for e in &gone {
+                write_varint(&mut p, *e as i64);
+            }
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut *w, 0x42, p);
+            }
+            for e in gone {
+                seen.remove(&e);
+            }
         }
         for (eid, x, y, z, mkpkts) in ents.iter() {
-            if *eid == c.eid { continue }
+            if *eid == c.eid {
+                continue;
+            }
             let d2 = (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2);
             if d2 <= VIS_R2 {
                 if seen.insert(*eid) {
                     if let Ok(mut w) = c.sock.lock() {
-                        for (pid, pkt) in mkpkts() { let _ = send_packet(&mut *w, pid, pkt); }
+                        for (pid, pkt) in mkpkts() {
+                            let _ = send_packet(&mut *w, pid, pkt);
+                        }
                     }
                 }
             } else if seen.remove(eid) {
                 let mut p = Vec::new();
                 write_varint(&mut p, 1);
                 write_varint(&mut p, *eid as i64);
-                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x42, p); }
+                if let Ok(mut w) = c.sock.lock() {
+                    let _ = send_packet(&mut *w, 0x42, p);
+                }
             }
         }
     }
@@ -433,7 +672,9 @@ fn broadcast_chunk<F: Fn(&Client) -> (i64, Vec<u8>)>(cx: i32, cz: i32, mk: F) {
     fanout(|c| c.chunks.lock().unwrap().contains(&(cx, cz)), mk)
 }
 fn broadcast_seen_destroy(eid: i32) {
-    let mut p = Vec::new(); write_varint(&mut p, 1); write_varint(&mut p, eid as i64);
+    let mut p = Vec::new();
+    write_varint(&mut p, 1);
+    write_varint(&mut p, eid as i64);
     broadcast_seen(eid, |_c| (0x42, p.clone()));
 }
 // LOCK ORDER: these helpers acquire clients() internally — never call
@@ -444,20 +685,53 @@ fn broadcast_seen<F: Fn(&Client) -> (i64, Vec<u8>)>(eid: i32, mk: F) {
     broadcast_seen_ex(eid, 0, mk)
 }
 fn broadcast_seen_ex<F: Fn(&Client) -> (i64, Vec<u8>)>(eid: i32, excl: i32, mk: F) {
-    fanout(|c| c.eid != excl && c.seen.lock().unwrap().contains(&eid), mk)
+    fanout(
+        |c| c.eid != excl && c.seen.lock().unwrap().contains(&eid),
+        mk,
+    )
 }
 
 // broadcast helpers return (packet_id, payload)
 
 // ---------- arrows ----------
-struct Arrow { eid: i32, owner: i32, x: f64, y: f64, z: f64, dx: f64, dy: f64, dz: f64, ttl: i32, dmg: f32, fire: i32, punch: i32, kind: u8, loy: i64, ret_item: i64, ret_comps: Comps, pierce: i32, last_hit: i32, stuck: bool }
+struct Arrow {
+    eid: i32,
+    owner: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    ttl: i32,
+    dmg: f32,
+    fire: i32,
+    punch: i32,
+    kind: u8,
+    loy: i64,
+    ret_item: i64,
+    ret_comps: Comps,
+    pierce: i32,
+    last_hit: i32,
+    stuck: bool,
+}
 static ARROWS: OnceLock<Mutex<Vec<Arrow>>> = OnceLock::new();
-fn arrows() -> &'static Mutex<Vec<Arrow>> { ARROWS.get_or_init(|| Mutex::new(Vec::new())) }
+fn arrows() -> &'static Mutex<Vec<Arrow>> {
+    ARROWS.get_or_init(|| Mutex::new(Vec::new()))
+}
 // left: server ticks of fuse remaining. Vanilla holds the fuse in game ticks
 // (80 for ordinary TNT), so a loaded world cannot shift it under tick lag.
-struct Primed { eid: i32, x: f64, y: f64, z: f64, left: i32 }
+struct Primed {
+    eid: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    left: i32,
+}
 static PRIMED: OnceLock<Mutex<Vec<Primed>>> = OnceLock::new();
-fn primed() -> &'static Mutex<Vec<Primed>> { PRIMED.get_or_init(|| Mutex::new(Vec::new())) }
+fn primed() -> &'static Mutex<Vec<Primed>> {
+    PRIMED.get_or_init(|| Mutex::new(Vec::new()))
+}
 fn spawn_arrow_pkt(a: &Arrow) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, a.eid as i64);
@@ -472,29 +746,83 @@ fn spawn_arrow_pkt(a: &Arrow) -> Vec<u8> {
     p
 }
 
-struct Bobber { eid: i32, owner: i32, x: f64, y: f64, z: f64, dx: f64, dy: f64, dz: f64, age: i32, bit: bool }
+struct Bobber {
+    eid: i32,
+    owner: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    age: i32,
+    bit: bool,
+}
 static BOBBERS: OnceLock<Mutex<Vec<Bobber>>> = OnceLock::new();
-fn bobbers() -> &'static Mutex<Vec<Bobber>> { BOBBERS.get_or_init(|| Mutex::new(Vec::new())) }
-struct Pearl { eid: i32, owner: i32, x: f64, y: f64, z: f64, dx: f64, dy: f64, dz: f64, ttl: i32 }
+fn bobbers() -> &'static Mutex<Vec<Bobber>> {
+    BOBBERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+struct Pearl {
+    eid: i32,
+    owner: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    ttl: i32,
+}
 static PEARLS: OnceLock<Mutex<Vec<Pearl>>> = OnceLock::new();
-fn pearls() -> &'static Mutex<Vec<Pearl>> { PEARLS.get_or_init(|| Mutex::new(Vec::new())) }
-struct Snowball { eid: i32, #[allow(dead_code)] owner: i32, x: f64, y: f64, z: f64, dx: f64, dy: f64, dz: f64, ttl: i32, egg: bool }
+fn pearls() -> &'static Mutex<Vec<Pearl>> {
+    PEARLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+struct Snowball {
+    eid: i32,
+    #[allow(dead_code)]
+    owner: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    ttl: i32,
+    egg: bool,
+}
 static SNOWBALLS: OnceLock<Mutex<Vec<Snowball>>> = OnceLock::new();
-fn snowballs() -> &'static Mutex<Vec<Snowball>> { SNOWBALLS.get_or_init(|| Mutex::new(Vec::new())) }
+fn snowballs() -> &'static Mutex<Vec<Snowball>> {
+    SNOWBALLS.get_or_init(|| Mutex::new(Vec::new()))
+}
 fn spawn_typed_pkt(eid: i32, etype: i64, x: f64, y: f64, z: f64) -> Vec<u8> {
     let mut p = Vec::new();
-    write_varint(&mut p, eid as i64); p.extend_from_slice(&[0u8; 16]);
+    write_varint(&mut p, eid as i64);
+    p.extend_from_slice(&[0u8; 16]);
     write_varint(&mut p, etype);
-    p.extend_from_slice(&x.to_be_bytes()); p.extend_from_slice(&y.to_be_bytes()); p.extend_from_slice(&z.to_be_bytes());
-    p.extend_from_slice(&[0u8; 3]); write_varint(&mut p, 0); p.extend_from_slice(&[0u8; 6]); p
+    p.extend_from_slice(&x.to_be_bytes());
+    p.extend_from_slice(&y.to_be_bytes());
+    p.extend_from_slice(&z.to_be_bytes());
+    p.extend_from_slice(&[0u8; 3]);
+    write_varint(&mut p, 0);
+    p.extend_from_slice(&[0u8; 6]);
+    p
 }
 
 // ---------- xp orbs ----------
 // age: server ticks since spawn. Vanilla counts entity age in game ticks, so a
 // despawn window cannot shift when a loaded world is ticked under lag.
-struct Xp { eid: i32, x: f64, y: f64, z: f64, val: i16, age: i32 }
+struct Xp {
+    eid: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    val: i16,
+    age: i32,
+}
 static XPS: OnceLock<Mutex<Vec<Xp>>> = OnceLock::new();
-fn xps() -> &'static Mutex<Vec<Xp>> { XPS.get_or_init(|| Mutex::new(Vec::new())) }
+fn xps() -> &'static Mutex<Vec<Xp>> {
+    XPS.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 // ---------- item drops ----------
 // item stack components: (type_id, serialized_data) — vanilla 1.21.1
@@ -502,7 +830,8 @@ fn xps() -> &'static Mutex<Vec<Xp>> { XPS.get_or_init(|| Mutex::new(Vec::new()))
 type Comps = Vec<(i64, Vec<u8>)>;
 type Stack = (i64, u8, Comps);
 // component type ids (SlotComponentType mapper)
-#[allow(dead_code)] const COMP_CUSTOM_DATA: i64 = 0;
+#[allow(dead_code)]
+const COMP_CUSTOM_DATA: i64 = 0;
 const COMP_MAX_DAMAGE: i64 = 2;
 const COMP_DAMAGE: i64 = 3;
 const COMP_UNBREAKABLE: i64 = 4;
@@ -512,7 +841,9 @@ const COMP_ENCHANTMENTS: i64 = 9;
 // max stack size: explicit component wins, else vanilla defaults
 // (1.21.1 minecraft-data: unstackable ids and the 16-stack ids)
 fn item_stack_max(item: i64, comps: &Comps) -> i64 {
-    if let Some(n) = comp_varint(comps, 1) { return n.clamp(1, 99) }
+    if let Some(n) = comp_varint(comps, 1) {
+        return n.clamp(1, 99);
+    }
     // A block's item stacks to what the asset says the block stacks to. The ranges
     // below cover only items that place no block, so they are reached for tools,
     // buckets, potions and the like.
@@ -526,41 +857,72 @@ fn item_stack_max(item: i64, comps: &Comps) -> i64 {
         | 856..=879 | 909..=911 | 914..=920 | 930..=931 | 933 | 963..=979
         | 983 | 998 | 1091 | 1093 | 1114 | 1120 | 1124..=1127 | 1130
         | 1156 | 1158 | 1161..=1163 | 1166..=1186 | 1188 | 1192..=1193
-        | 1195..=1203 | 1268) { 1 }
-    else if matches!(item,
-        886..=908 | 912 | 927 | 993 | 1092 | 1123 | 1133..=1148 | 1224) { 16 }
-    else { 64 }
+        | 1195..=1203 | 1268)
+    {
+        1
+    } else if matches!(item,
+        886..=908 | 912 | 927 | 993 | 1092 | 1123 | 1133..=1148 | 1224)
+    {
+        16
+    } else {
+        64
+    }
 }
-fn stack_max_of(st: &Stack) -> i64 { item_stack_max(st.0, &st.2) }
+fn stack_max_of(st: &Stack) -> i64 {
+    item_stack_max(st.0, &st.2)
+}
 fn comp_get<'a>(c: &'a Comps, ty: i64) -> Option<&'a [u8]> {
     c.iter().find(|(t, _)| *t == ty).map(|(_, d)| d.as_slice())
 }
 fn comp_set(c: &mut Comps, ty: i64, data: Vec<u8>) {
-    if let Some(e) = c.iter_mut().find(|(t, _)| *t == ty) { e.1 = data; }
-    else { c.push((ty, data)); }
+    if let Some(e) = c.iter_mut().find(|(t, _)| *t == ty) {
+        e.1 = data;
+    } else {
+        c.push((ty, data));
+    }
 }
 fn comp_varint(c: &Comps, ty: i64) -> Option<i64> {
     comp_get(c, ty).map(|d| read_varint_at(d, 0).0)
 }
 fn comp_set_varint(c: &mut Comps, ty: i64, v: i64) {
-    let mut d = Vec::new(); write_varint(&mut d, v); comp_set(c, ty, d);
+    let mut d = Vec::new();
+    write_varint(&mut d, v);
+    comp_set(c, ty, d);
 }
 // vanilla armor durability per piece slot (5=helmet..8=boots)
 fn armor_max_damage(item: i64) -> Option<i64> {
     let pairs: &[(&str, i64)] = &[
-        ("leather_helmet",55),("golden_helmet",77),("chainmail_helmet",165),
-        ("iron_helmet",165),("diamond_helmet",363),("netherite_helmet",407),
-        ("turtle_helmet",275),
-        ("leather_chestplate",80),("golden_chestplate",112),
-        ("chainmail_chestplate",240),("iron_chestplate",240),
-        ("diamond_chestplate",528),("netherite_chestplate",592),
-        ("elytra",432),
-        ("leather_leggings",75),("golden_leggings",105),
-        ("chainmail_leggings",225),("iron_leggings",225),
-        ("diamond_leggings",495),("netherite_leggings",555),
-        ("leather_boots",65),("golden_boots",91),("chainmail_boots",195),
-        ("iron_boots",195),("diamond_boots",429),("netherite_boots",481)];
-    pairs.iter().find(|(n,_)| name_to_item(n) == Some(item)).map(|(_,m)| *m)
+        ("leather_helmet", 55),
+        ("golden_helmet", 77),
+        ("chainmail_helmet", 165),
+        ("iron_helmet", 165),
+        ("diamond_helmet", 363),
+        ("netherite_helmet", 407),
+        ("turtle_helmet", 275),
+        ("leather_chestplate", 80),
+        ("golden_chestplate", 112),
+        ("chainmail_chestplate", 240),
+        ("iron_chestplate", 240),
+        ("diamond_chestplate", 528),
+        ("netherite_chestplate", 592),
+        ("elytra", 432),
+        ("leather_leggings", 75),
+        ("golden_leggings", 105),
+        ("chainmail_leggings", 225),
+        ("iron_leggings", 225),
+        ("diamond_leggings", 495),
+        ("netherite_leggings", 555),
+        ("leather_boots", 65),
+        ("golden_boots", 91),
+        ("chainmail_boots", 195),
+        ("iron_boots", 195),
+        ("diamond_boots", 429),
+        ("netherite_boots", 481),
+    ];
+    pairs
+        .iter()
+        .find(|(n, _)| name_to_item(n) == Some(item))
+        .map(|(_, m)| *m)
 }
 // vanilla max_damage by item id (tools/weapons/some utilities; armor omitted)
 fn tool_max_damage(item: i64) -> Option<i64> {
@@ -588,19 +950,47 @@ fn tool_max_damage(item: i64) -> Option<i64> {
 }
 fn enchant_id(name: &str) -> Option<i64> {
     Some(match name.trim_start_matches("minecraft:") {
-        "aqua_affinity" => 0, "bane_of_arthropods" => 1, "binding_curse" => 2,
-        "blast_protection" => 3, "breach" => 4, "channeling" => 5, "density" => 6,
-        "depth_strider" => 7, "efficiency" => 8, "feather_falling" => 9,
-        "fire_aspect" => 10, "fire_protection" => 11, "flame" => 12,
-        "fortune" => 13, "frost_walker" => 14, "impaling" => 15, "infinity" => 16,
-        "knockback" => 17, "looting" => 18, "loyalty" => 19,
-        "luck_of_the_sea" => 20, "lure" => 21, "mending" => 22,
-        "multishot" => 23, "piercing" => 24, "power" => 25,
-        "projectile_protection" => 26, "protection" => 27, "punch" => 28,
-        "quick_charge" => 29, "respiration" => 30, "riptide" => 31,
-        "sharpness" => 32, "silk_touch" => 33, "smite" => 34,
-        "soul_speed" => 35, "sweeping_edge" => 36, "swift_sneak" => 37,
-        "thorns" => 38, "unbreaking" => 39, "vanishing_curse" => 40,
+        "aqua_affinity" => 0,
+        "bane_of_arthropods" => 1,
+        "binding_curse" => 2,
+        "blast_protection" => 3,
+        "breach" => 4,
+        "channeling" => 5,
+        "density" => 6,
+        "depth_strider" => 7,
+        "efficiency" => 8,
+        "feather_falling" => 9,
+        "fire_aspect" => 10,
+        "fire_protection" => 11,
+        "flame" => 12,
+        "fortune" => 13,
+        "frost_walker" => 14,
+        "impaling" => 15,
+        "infinity" => 16,
+        "knockback" => 17,
+        "looting" => 18,
+        "loyalty" => 19,
+        "luck_of_the_sea" => 20,
+        "lure" => 21,
+        "mending" => 22,
+        "multishot" => 23,
+        "piercing" => 24,
+        "power" => 25,
+        "projectile_protection" => 26,
+        "protection" => 27,
+        "punch" => 28,
+        "quick_charge" => 29,
+        "respiration" => 30,
+        "riptide" => 31,
+        "sharpness" => 32,
+        "silk_touch" => 33,
+        "smite" => 34,
+        "soul_speed" => 35,
+        "sweeping_edge" => 36,
+        "swift_sneak" => 37,
+        "thorns" => 38,
+        "unbreaking" => 39,
+        "vanishing_curse" => 40,
         "wind_burst" => 41,
         _ => return None,
     })
@@ -609,7 +999,10 @@ fn enchant_id(name: &str) -> Option<i64> {
 fn enchantments_data(list: &[(i64, i64)], show_tip: bool) -> Vec<u8> {
     let mut d = Vec::new();
     write_varint(&mut d, list.len() as i64);
-    for (id, lv) in list { write_varint(&mut d, *id); write_varint(&mut d, *lv); }
+    for (id, lv) in list {
+        write_varint(&mut d, *id);
+        write_varint(&mut d, *lv);
+    }
     d.push(show_tip as u8);
     d
 }
@@ -618,8 +1011,12 @@ fn enchantments_get(c: &Comps) -> Vec<(i64, i64)> {
     if let Some(d) = comp_get(c, COMP_ENCHANTMENTS) {
         let (n, mut p) = read_varint_at(d, 0);
         for _ in 0..n.min(64) {
-            if p + 2 > d.len() { break }
-            let (id, p2) = read_varint_at(d, p); let (lv, p3) = read_varint_at(d, p2); p = p3;
+            if p + 2 > d.len() {
+                break;
+            }
+            let (id, p2) = read_varint_at(d, p);
+            let (lv, p3) = read_varint_at(d, p2);
+            p = p3;
             out.push((id, lv));
         }
     }
@@ -628,7 +1025,9 @@ fn enchantments_get(c: &Comps) -> Vec<(i64, i64)> {
 // vanilla 1.9+ attack cooldown: seconds per full charge by tool kind.
 // sword 1.6 (0.625s); axe ~1.0s avg across tiers; hoe 1.5s; fist 0.25s.
 fn attack_cooldown(item: i64) -> f64 {
-    if !(818..=847).contains(&item) { return 0.25 }
+    if !(818..=847).contains(&item) {
+        return 0.25;
+    }
     match (item - 818) % 5 {
         0 => 0.625, // sword
         1 => 1.0,   // shovel
@@ -658,7 +1057,9 @@ fn block_hardness(b: i64) -> f32 {
 /// block first.
 #[cfg(test)]
 fn stack_size_of(st: u32) -> i64 {
-    crate::block_registry::breg().map(|reg| reg.stack_size_of(st)).unwrap_or(64)
+    crate::block_registry::breg()
+        .map(|reg| reg.stack_size_of(st))
+        .unwrap_or(64)
 }
 fn tool_kind(block: i64) -> i8 {
     match crate::block_registry::breg() {
@@ -674,21 +1075,35 @@ fn can_harvest(block: i64, held_item: i64) -> bool {
 }
 // tool dig speed; kind order in band: sword,shovel,pick,axe,hoe; tier: wood,stone,gold,iron,diamond,netherite
 fn tool_dig_speed(held: &Stack, block: i64) -> f32 {
-    let (kind, band) = if (818..=847).contains(&held.0) { ((held.0 - 818) % 5, (held.0 - 818) / 5) } else { (-1, 0) };
+    let (kind, band) = if (818..=847).contains(&held.0) {
+        ((held.0 - 818) % 5, (held.0 - 818) / 5)
+    } else {
+        (-1, 0)
+    };
     let tier_speed = [2.0f32, 4.0, 12.0, 6.0, 8.0, 9.0];
     // The correct tool type comes from the block asset, not from id ranges: the hand
     // ranges answered for 16 percent of the states.
     let right_tool = kind >= 0 && kind == i64::from(tool_kind(block));
-    let mut speed = if right_tool { tier_speed[band.clamp(0, 5) as usize] } else { 1.0 };
+    let mut speed = if right_tool {
+        tier_speed[band.clamp(0, 5) as usize]
+    } else {
+        1.0
+    };
     let eff = enchant_level(&held.2, 8);
-    if eff > 0 && speed > 1.0 { speed += (eff * eff + 1) as f32; }
+    if eff > 0 && speed > 1.0 {
+        speed += (eff * eff + 1) as f32;
+    }
     speed
 }
 
 fn dig_seconds(block: i64, held: &Stack) -> Option<f32> {
     let h = block_hardness(block);
-    if h < 0.0 { return None; }
-    if h == 0.0 { return Some(0.0); }
+    if h < 0.0 {
+        return None;
+    }
+    if h == 0.0 {
+        return Some(0.0);
+    }
     let speed = tool_dig_speed(held, block);
     let can = can_harvest(block, held.0);
     Some(h * if can { 1.5 } else { 5.0 } / speed)
@@ -702,27 +1117,31 @@ fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
     c
 }
 fn enchant_level(c: &Comps, id: i64) -> i64 {
-    enchantments_get(c).iter().find(|(e, _)| *e == id).map(|(_, l)| *l).unwrap_or(0)
+    enchantments_get(c)
+        .iter()
+        .find(|(e, _)| *e == id)
+        .map(|(_, l)| *l)
+        .unwrap_or(0)
 }
 fn enchant_max_level(id: i64) -> i64 {
     match id {
-        0 | 2 | 12 | 16 | 22 | 23 | 33 | 40 => 1,  // aqua..infinity,mending,multishot,silk,vanishing
-        14 | 17 | 10 | 28 => 2,                    // frost, knockback, fire_aspect, punch
+        0 | 2 | 12 | 16 | 22 | 23 | 33 | 40 => 1, // aqua..infinity,mending,multishot,silk,vanishing
+        14 | 17 | 10 | 28 => 2,                   // frost, knockback, fire_aspect, punch
         7 | 13 | 18 | 19 | 20 | 21 | 29 | 30 | 31 | 35 | 36 | 37 | 38 | 39 | 41 => 3,
-        3 | 4 | 9 | 11 | 24 | 26 | 27 => 4,        // protection family, feather, breach, piercing
-        _ => 5,                                    // damage/efficiency/power/impaling/density
+        3 | 4 | 9 | 11 | 24 | 26 | 27 => 4, // protection family, feather, breach, piercing
+        _ => 5,                             // damage/efficiency/power/impaling/density
     }
 }
 // vanilla mutually-exclusive groups; some/any overlap forbids
 fn enchant_conflicts(a: i64, b: i64) -> bool {
     const GROUPS: &[&[i64]] = &[
-        &[27, 3, 11, 26],        // protection family
-        &[32, 34, 1, 6, 4],      // sharpness/smite/bane/density/breach
-        &[33, 13],               // silk_touch vs fortune
-        &[16, 22],               // infinity vs mending
-        &[31, 19, 5],            // riptide vs loyalty/channeling
-        &[7, 14],                // depth_strider vs frost_walker
-        &[23, 24],               // multishot vs piercing
+        &[27, 3, 11, 26],   // protection family
+        &[32, 34, 1, 6, 4], // sharpness/smite/bane/density/breach
+        &[33, 13],          // silk_touch vs fortune
+        &[16, 22],          // infinity vs mending
+        &[31, 19, 5],       // riptide vs loyalty/channeling
+        &[7, 14],           // depth_strider vs frost_walker
+        &[23, 24],          // multishot vs piercing
     ];
     a != b && GROUPS.iter().any(|g| g.contains(&a) && g.contains(&b))
 }
@@ -738,30 +1157,60 @@ fn nbt_string(text: &str) -> Vec<u8> {
 // lore, max_stack_size, repair_cost. Unknown/unsupported keys are ignored
 // (bounded: no silent half-support claims).
 fn parse_item_comps(arg: &str) -> Comps {
-    let Some(lb) = arg.find('[') else { return Vec::new() };
-    let Some(rb) = arg.rfind(']') else { return Vec::new() };
-    if rb <= lb { return Vec::new() }
+    let Some(lb) = arg.find('[') else {
+        return Vec::new();
+    };
+    let Some(rb) = arg.rfind(']') else {
+        return Vec::new();
+    };
+    if rb <= lb {
+        return Vec::new();
+    }
     let mut out: Comps = Vec::new();
     // split on top-level commas only — {}, [], '' nesting must not break
     let body = &arg[lb + 1..rb];
     let mut kvs: Vec<String> = Vec::new();
     {
-        let mut depth = 0i32; let mut q = '\0'; let mut cur = String::new();
+        let mut depth = 0i32;
+        let mut q = '\0';
+        let mut cur = String::new();
         for ch in body.chars() {
-            if q != '\0' { cur.push(ch); if ch == q { q = '\0'; } continue }
+            if q != '\0' {
+                cur.push(ch);
+                if ch == q {
+                    q = '\0';
+                }
+                continue;
+            }
             match ch {
-                '\'' | '"' => { q = ch; cur.push(ch) }
-                '{' | '[' | '(' => { depth += 1; cur.push(ch) }
-                '}' | ']' | ')' => { depth -= 1; cur.push(ch) }
-                ',' if depth == 0 => { kvs.push(std::mem::take(&mut cur)); }
+                '\'' | '"' => {
+                    q = ch;
+                    cur.push(ch)
+                }
+                '{' | '[' | '(' => {
+                    depth += 1;
+                    cur.push(ch)
+                }
+                '}' | ']' | ')' => {
+                    depth -= 1;
+                    cur.push(ch)
+                }
+                ',' if depth == 0 => {
+                    kvs.push(std::mem::take(&mut cur));
+                }
                 _ => cur.push(ch),
             }
         }
-        if !cur.is_empty() { kvs.push(cur); }
+        if !cur.is_empty() {
+            kvs.push(cur);
+        }
     }
     for kv in &kvs {
         let kv = kv.trim();
-        let (k, v) = match kv.split_once('=') { Some(t) => t, None => (kv, "") };
+        let (k, v) = match kv.split_once('=') {
+            Some(t) => t,
+            None => (kv, ""),
+        };
         let kn = k.trim().trim_start_matches("minecraft:");
         match kn {
             "enchantments" => {
@@ -772,16 +1221,33 @@ fn parse_item_comps(arg: &str) -> Comps {
                     if let Some((en, lv)) = e.rsplit_once(':') {
                         let en = en.trim().trim_matches('"').trim_matches('\'');
                         if let (Some(id), Ok(l)) = (enchant_id(en), lv.trim().parse::<i64>()) {
-                            list.retain(|(x, _)| *x != id); list.push((id, l.max(1)));
+                            list.retain(|(x, _)| *x != id);
+                            list.push((id, l.max(1)));
                         }
                     }
                 }
                 comp_set(&mut out, COMP_ENCHANTMENTS, enchantments_data(&list, true));
             }
-            "damage" => { if let Ok(n) = v.parse() { comp_set_varint(&mut out, COMP_DAMAGE, n) } }
-            "max_damage" => { if let Ok(n) = v.parse() { comp_set_varint(&mut out, COMP_MAX_DAMAGE, n) } }
-            "max_stack_size" => { if let Ok(n) = v.parse() { comp_set_varint(&mut out, 1, n) } }
-            "repair_cost" => { if let Ok(n) = v.parse() { comp_set_varint(&mut out, 16, n) } }
+            "damage" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, COMP_DAMAGE, n)
+                }
+            }
+            "max_damage" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, COMP_MAX_DAMAGE, n)
+                }
+            }
+            "max_stack_size" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, 1, n)
+                }
+            }
+            "repair_cost" => {
+                if let Ok(n) = v.parse() {
+                    comp_set_varint(&mut out, 16, n)
+                }
+            }
             "unbreakable" => comp_set(&mut out, COMP_UNBREAKABLE, vec![1u8]),
             "custom_name" => {
                 let t = v.trim().trim_matches('\'').trim_matches('"');
@@ -791,9 +1257,15 @@ fn parse_item_comps(arg: &str) -> Comps {
                 // ['a','b',...] — list of anonymous-NBT string elements
                 let inner = v.trim().trim_start_matches('[').trim_end_matches(']');
                 let mut d = Vec::new();
-                let parts: Vec<String> = inner.split(',').map(|x| x.trim().trim_matches('\'').trim_matches('"').to_string()).filter(|x| !x.is_empty()).collect();
+                let parts: Vec<String> = inner
+                    .split(',')
+                    .map(|x| x.trim().trim_matches('\'').trim_matches('"').to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
                 write_varint(&mut d, parts.len() as i64);
-                for t in parts { d.extend_from_slice(&nbt_string(&t)); }
+                for t in parts {
+                    d.extend_from_slice(&nbt_string(&t));
+                }
                 comp_set(&mut out, COMP_LORE, d);
             }
             _ => {}
@@ -804,7 +1276,11 @@ fn parse_item_comps(arg: &str) -> Comps {
 // vanilla enchantability, approximated: damageable items accept
 // unbreaking/mending always; weapons/tools/armor accept their usual sets.
 fn enchant_applicable(item: i64, eid: i64) -> bool {
-    let band = if (818..=847).contains(&item) { Some(((item - 818) / 5, (item - 818) % 5)) } else { None };
+    let band = if (818..=847).contains(&item) {
+        Some(((item - 818) / 5, (item - 818) % 5))
+    } else {
+        None
+    };
     let bow = item == name_to_item("bow").unwrap_or(-1);
     let xbow = item == name_to_item("crossbow").unwrap_or(-2);
     let trident = item == name_to_item("trident").unwrap_or(-3);
@@ -813,14 +1289,16 @@ fn enchant_applicable(item: i64, eid: i64) -> bool {
     let armor = (1064..=1115).contains(&item); // leather..netherite armor band
     match eid {
         39 | 22 => tool_max_damage(item).is_some() || band.is_some() || armor, // unbreaking/mending
-        32 | 34 | 1 | 17 | 10 | 18 | 36 => band.map(|(_, k)| k == 0 || k == 3).unwrap_or(false) || mace, // melee
+        32 | 34 | 1 | 17 | 10 | 18 | 36 => {
+            band.map(|(_, k)| k == 0 || k == 3).unwrap_or(false) || mace
+        } // melee
         8 | 13 | 33 => band.map(|(_, k)| (1..=4).contains(&k)).unwrap_or(false), // efficiency/fortune/silk
-        25 | 28 | 12 | 16 => bow,                   // power/punch/flame/infinity
-        29 | 23 | 24 => xbow,                       // quick_charge/multishot/piercing
-        19 | 31 | 5 | 15 => trident,                // loyalty/riptide/channeling/impaling
-        20 | 21 => rod,                             // luck_of_the_sea/lure
+        25 | 28 | 12 | 16 => bow,    // power/punch/flame/infinity
+        29 | 23 | 24 => xbow,        // quick_charge/multishot/piercing
+        19 | 31 | 5 | 15 => trident, // loyalty/riptide/channeling/impaling
+        20 | 21 => rod,              // luck_of_the_sea/lure
         27 | 3 | 11 | 26 | 38 | 0 | 7 | 9 | 14 | 30 | 35 | 37 | 2 | 40 => armor, // armor enchants+curses
-        6 | 4 | 41 => mace,                          // density/breach/wind_burst
+        6 | 4 | 41 => mace, // density/breach/wind_burst
         _ => true,
     }
 }
@@ -831,11 +1309,19 @@ fn damage_held(me: &Arc<Client>) -> bool {
     let hs = *me.held.lock().unwrap();
     let mut inv = me.inv.lock().unwrap();
     let slot = 36 + hs;
-    let Some(st) = inv.get_mut(&slot) else { return false };
-    let Some(maxd) = tool_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else { return false };
-    if comp_get(&st.2, COMP_UNBREAKABLE).is_some() { return false }
+    let Some(st) = inv.get_mut(&slot) else {
+        return false;
+    };
+    let Some(maxd) = tool_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else {
+        return false;
+    };
+    if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
+        return false;
+    }
     let unb = enchant_level(&st.2, 39); // unbreaking
-    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 { return false }
+    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 {
+        return false;
+    }
     let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
     if dmg >= maxd {
         inv.remove(&slot);
@@ -847,14 +1333,27 @@ fn damage_held(me: &Arc<Client>) -> bool {
 // same durability tick on an arbitrary inventory slot (elytra wear, etc)
 fn damage_inv_slot(me: &Arc<Client>, slot: i16) -> bool {
     let mut inv = me.inv.lock().unwrap();
-    let Some(st) = inv.get_mut(&slot) else { return false };
-    let Some(maxd) = tool_max_damage(st.0).or_else(|| armor_max_damage(st.0))
-        .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else { return false };
-    if comp_get(&st.2, COMP_UNBREAKABLE).is_some() { return false }
+    let Some(st) = inv.get_mut(&slot) else {
+        return false;
+    };
+    let Some(maxd) = tool_max_damage(st.0)
+        .or_else(|| armor_max_damage(st.0))
+        .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE))
+    else {
+        return false;
+    };
+    if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
+        return false;
+    }
     let unb = enchant_level(&st.2, 39);
-    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 { return false }
+    if unb > 0 && (world_rng::next_u64() % (unb + 1) as u64) != 0 {
+        return false;
+    }
     let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + 1;
-    if dmg >= maxd { inv.remove(&slot); return true }
+    if dmg >= maxd {
+        inv.remove(&slot);
+        return true;
+    }
     comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
     false
 }
@@ -864,15 +1363,29 @@ fn damage_shield(me: &Arc<Client>, blocked: f32) {
     let slots = [45i16, 36 + (*me.held.lock().unwrap() as i16)];
     let mut inv = me.inv.lock().unwrap();
     for slot in slots {
-        let Some(st) = inv.get_mut(&slot) else { continue };
-        if st.0 != sh { continue }
-        if comp_get(&st.2, COMP_UNBREAKABLE).is_some() { return }
+        let Some(st) = inv.get_mut(&slot) else {
+            continue;
+        };
+        if st.0 != sh {
+            continue;
+        }
+        if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
+            return;
+        }
         let unb = enchant_level(&st.2, 39);
         let maxd = comp_varint(&st.2, COMP_MAX_DAMAGE).unwrap_or(337);
         let mut add = 0i64;
-        for _ in 0..(blocked.floor() as i64 + 1) { if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 { add += 1 } }
+        for _ in 0..(blocked.floor() as i64 + 1) {
+            if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 {
+                add += 1
+            }
+        }
         let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + add;
-        if dmg >= maxd { inv.remove(&slot); } else { comp_set_varint(&mut st.2, COMP_DAMAGE, dmg); }
+        if dmg >= maxd {
+            inv.remove(&slot);
+        } else {
+            comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
+        }
         return;
     }
 }
@@ -884,31 +1397,57 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
     {
         let mut inv = me.inv.lock().unwrap();
         for slot in [5i16, 6, 7, 8] {
-            let Some(st) = inv.get_mut(&slot) else { continue };
-            let Some(maxd) = armor_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) else { continue };
-            if comp_get(&st.2, COMP_UNBREAKABLE).is_some() { continue }
+            let Some(st) = inv.get_mut(&slot) else {
+                continue;
+            };
+            let Some(maxd) = armor_max_damage(st.0).or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE))
+            else {
+                continue;
+            };
+            if comp_get(&st.2, COMP_UNBREAKABLE).is_some() {
+                continue;
+            }
             let unb = enchant_level(&st.2, 39);
             let mut add = 0i64;
-            for _ in 0..per { if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 { add += 1 } }
+            for _ in 0..per {
+                if unb == 0 || (world_rng::next_u64() % (unb + 1) as u64) == 0 {
+                    add += 1
+                }
+            }
             let dmg = comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) + add;
-            if dmg >= maxd { inv.remove(&slot); broke = true; }
-            else { comp_set_varint(&mut st.2, COMP_DAMAGE, dmg); }
+            if dmg >= maxd {
+                inv.remove(&slot);
+                broke = true;
+            } else {
+                comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
+            }
         }
         *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
     }
     if broke {
-        let (x, y, z, ..) = { let p = me.pos.lock().unwrap(); *p };
+        let (x, y, z, ..) = {
+            let p = me.pos.lock().unwrap();
+            *p
+        };
         let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
         broadcast(-1, |_c| (0x68, snd.clone()));
     }
     // resync the four armor slots (cheap: keeps client honest)
     for slot in [5i16, 6, 7, 8] {
-        let st = me.inv.lock().unwrap().get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+        let st = me
+            .inv
+            .lock()
+            .unwrap()
+            .get(&slot)
+            .cloned()
+            .unwrap_or((0, 0, Vec::new()));
         let mut p = vec![0u8];
         write_varint(&mut p, 0);
         p.extend_from_slice(&slot.to_be_bytes());
         p.extend_from_slice(&slot_wire(&st));
-        if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
+        if let Ok(mut w) = me.sock.lock() {
+            let _ = send_packet(&mut *w, 0x15, p);
+        }
     }
 }
 // resend the held slot to the owner after damage/break so the client
@@ -916,24 +1455,47 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
 fn held_slot_resync(me: &Arc<Client>) {
     let hs = *me.held.lock().unwrap();
     let slot = 36 + hs;
-    let st = me.inv.lock().unwrap().get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+    let st = me
+        .inv
+        .lock()
+        .unwrap()
+        .get(&slot)
+        .cloned()
+        .unwrap_or((0, 0, Vec::new()));
     let mut p = vec![0u8];
     write_varint(&mut p, 0);
     p.extend_from_slice(&slot.to_be_bytes());
     p.extend_from_slice(&slot_wire(&st));
-    if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
+    if let Ok(mut w) = me.sock.lock() {
+        let _ = send_packet(&mut *w, 0x15, p);
+    }
 }
 fn read_varint_at(b: &[u8], p: usize) -> (i64, usize) {
-    let mut r: i64 = 0; let mut i = 0;
+    let mut r: i64 = 0;
+    let mut i = 0;
     loop {
-        let byte = b[p + i]; r |= ((byte & 0x7f) as i64) << (7 * i);
-        if byte & 0x80 == 0 { return (r, p + i + 1) }
+        let byte = b[p + i];
+        r |= ((byte & 0x7f) as i64) << (7 * i);
+        if byte & 0x80 == 0 {
+            return (r, p + i + 1);
+        }
         i += 1;
     }
 }
-struct Drop { eid: i32, x: f64, y: f64, z: f64, item: i64, cnt: u8, comps: Comps, age: i32 }
+struct Drop {
+    eid: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    item: i64,
+    cnt: u8,
+    comps: Comps,
+    age: i32,
+}
 static DROPS: OnceLock<Mutex<Vec<Drop>>> = OnceLock::new();
-fn drops() -> &'static Mutex<Vec<Drop>> { DROPS.get_or_init(|| Mutex::new(Vec::new())) }
+fn drops() -> &'static Mutex<Vec<Drop>> {
+    DROPS.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 // blockstate -> dropped item id (vanilla: stone->cobblestone, grass->dirt)
 /// The item a block drops, owned by the block registry, which reads it from the same
@@ -968,12 +1530,16 @@ fn spawn_drop_pkt(d: &Drop) -> Vec<u8> {
 fn drop_meta_pkt(d: &Drop) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, d.eid as i64);
-    p.push(8);                    // metadata key 8 = item
-    write_varint(&mut p, 7);      // type 7 = item_stack
-    write_varint(&mut p, d.cnt as i64);  // slot: count
-    write_varint(&mut p, d.item);     // item id
-    write_varint(&mut p, d.comps.len() as i64); write_varint(&mut p, 0);
-    for (ty, data) in &d.comps { write_varint(&mut p, *ty); p.extend_from_slice(data); }
+    p.push(8); // metadata key 8 = item
+    write_varint(&mut p, 7); // type 7 = item_stack
+    write_varint(&mut p, d.cnt as i64); // slot: count
+    write_varint(&mut p, d.item); // item id
+    write_varint(&mut p, d.comps.len() as i64);
+    write_varint(&mut p, 0);
+    for (ty, data) in &d.comps {
+        write_varint(&mut p, *ty);
+        p.extend_from_slice(data);
+    }
     p.push(0xff);
     p
 }
@@ -985,10 +1551,19 @@ fn collect_pkt(drop_eid: i32, collector: i32, count: u8) -> Vec<u8> {
     p
 }
 fn xp_level(total: i64) -> (i32, f32) {
-    let mut l = 0i32; let mut acc = 0i64; let mut next = 7i64;
+    let mut l = 0i32;
+    let mut acc = 0i64;
+    let mut next = 7i64;
     while total >= acc + next {
-        acc += next; l += 1;
-        next = if l < 16 { 2 * l as i64 + 7 } else if l < 31 { 5 * l as i64 - 38 } else { 9 * l as i64 - 158 };
+        acc += next;
+        l += 1;
+        next = if l < 16 {
+            2 * l as i64 + 7
+        } else if l < 31 {
+            5 * l as i64 - 38
+        } else {
+            9 * l as i64 - 158
+        };
     }
     (l, ((total - acc) as f32 / next as f32).clamp(0.0, 1.0))
 }
@@ -1009,41 +1584,73 @@ fn velocity_pkt(eid: i32, vx: i16, vy: i16, vz: i16) -> Vec<u8> {
     p.extend_from_slice(&vz.to_be_bytes());
     p
 }
-fn explosion_pkt(x: f64, y: f64, z: f64, records: &[(i8,i8,i8)]) -> Vec<u8> {
+fn explosion_pkt(x: f64, y: f64, z: f64, records: &[(i8, i8, i8)]) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
     p.extend_from_slice(&3.0f32.to_be_bytes());
     write_varint(&mut p, records.len() as i64);
-    for &(ox, oy, oz) in records { p.push(ox as u8); p.push(oy as u8); p.push(oz as u8); }
+    for &(ox, oy, oz) in records {
+        p.push(ox as u8);
+        p.push(oy as u8);
+        p.push(oz as u8);
+    }
     p.extend_from_slice(&[0u8; 12]); // player motion xyz f32
-    write_varint(&mut p, 0);          // block_interaction = destroy
-    write_varint(&mut p, 53);         // small particle: poof
-    write_varint(&mut p, 22);         // large particle: explosion
-    write_varint(&mut p, 577);        // sound: entity.generic.explode
+    write_varint(&mut p, 0); // block_interaction = destroy
+    write_varint(&mut p, 53); // small particle: poof
+    write_varint(&mut p, 22); // large particle: explosion
+    write_varint(&mut p, 577); // sound: entity.generic.explode
     p
 }
 // vanilla xp on death: hostile mobs 5, animals 1-3
 fn mob_xp(etype: i64) -> i16 {
-    if [22i64, 19, 77, 87].contains(&etype) { (1 + world_rng::next_u64() % 3) as i16 } else { 5 }
+    if [22i64, 19, 77, 87].contains(&etype) {
+        (1 + world_rng::next_u64() % 3) as i16
+    } else {
+        5
+    }
 }
 // vanilla /kill applies void damage — the same loot+xp+cleanup path as
 // combat death, not a silent retain
 fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
     // vanilla: a mob that dies while burning drops the cooked variant
-    let burning = mobs().lock().unwrap().iter().find(|m| m.eid == deid)
-        .map(|m| *m.fuse.lock().unwrap() > 0).unwrap_or(false);
+    let burning = mobs()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|m| m.eid == deid)
+        .map(|m| *m.fuse.lock().unwrap() > 0)
+        .unwrap_or(false);
     mobs().lock().unwrap().retain(|m| m.eid != deid);
     broadcast_seen_destroy(deid);
     let was_sheared = sheared().lock().unwrap().remove(&deid);
-    for (item, cnt, comps) in mob_loot(etype, burning).into_iter().filter(|st| !(was_sheared && st.0 == 202))
-        .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 };
+    for (item, cnt, comps) in mob_loot(etype, burning)
+        .into_iter()
+        .filter(|st| !(was_sheared && st.0 == 202))
+        .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
+    {
+        let d = Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: mx,
+            y: my,
+            z: mz,
+            item,
+            cnt,
+            comps,
+            age: 0,
+        };
         drops().lock().unwrap().push(d);
     }
     let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    xps().lock().unwrap().push(Xp { eid: xeid, x: mx, y: my, z: mz, val: mob_xp(etype), age: 0 });
+    xps().lock().unwrap().push(Xp {
+        eid: xeid,
+        x: mx,
+        y: my,
+        z: mz,
+        val: mob_xp(etype),
+        age: 0,
+    });
     // spawn streams via interest_tick
 }
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
@@ -1051,13 +1658,24 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
     // so a fully enclosed mob cannot teleport out through solid blocks
     let (land_x, land_z) = (mp.0.floor() as i32, mp.2.floor() as i32);
     let mut sy = surface_y(land_x, land_z);
-    if (4286..=4293).contains(&block_at(land_x, sy as i32 - 1, land_z)) { sy -= 1.0 / 16.0; }
+    if (4286..=4293).contains(&block_at(land_x, sy as i32 - 1, land_z)) {
+        sy -= 1.0 / 16.0;
+    }
     if !mob_cell_solid(mp.0, mp.1, mp.2) || sy - mp.1 <= 1.2 {
         // refuse snaps that phase through solid blocks (e.g. sealed under a cap)
         let (fx, fz) = (land_x, land_z);
         let mut yy = mp.1.floor() as i32 + 1;
-        while yy < sy.floor() as i32 { if !mob_passable(block_at(fx, yy, fz)) { return } yy += 1; }
-        let converted = landing::cow_land(m, (land_x, (sy - 0.2).floor() as i32, land_z), (mp.1 - sy) as f32);
+        while yy < sy.floor() as i32 {
+            if !mob_passable(block_at(fx, yy, fz)) {
+                return;
+            }
+            yy += 1;
+        }
+        let converted = landing::cow_land(
+            m,
+            (land_x, (sy - 0.2).floor() as i32, land_z),
+            (mp.1 - sy) as f32,
+        );
         // fall damage on descent >3 blocks; chicken/cat/ocelot immune (vanilla)
         if mp.1 - sy > 3.0 && !matches!(m.etype, 19 | 15 | 72) {
             let mut hp = m.hp.lock().unwrap();
@@ -1065,7 +1683,9 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
             drop(hp);
             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
         }
-        if converted { sy += 1.0 / 16.0; }
+        if converted {
+            sy += 1.0 / 16.0;
+        }
         mp.1 = sy;
     }
 }
@@ -1075,17 +1695,33 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
     mobs().lock().unwrap().retain(|m| m.eid != deid);
     broadcast_seen_destroy(deid);
     sheared().lock().unwrap().remove(&deid);
-    for (item, cnt, comps) in mob_loot(etype, burning).into_iter().filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-        drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 });
+    for (item, cnt, comps) in mob_loot(etype, burning)
+        .into_iter()
+        .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
+    {
+        drops().lock().unwrap().push(Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: mx,
+            y: my,
+            z: mz,
+            item,
+            cnt,
+            comps,
+            age: 0,
+        });
     }
 }
 static LOOT_SEQ: AtomicU64 = AtomicU64::new(0);
 fn roll_loot(pools: &[LootPool]) -> Vec<Stack> {
     let mut out: Vec<Stack> = Vec::new();
     for pl in pools {
-        let h = LOOT_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_mul(6364136223846793005)
+        let h = LOOT_SEQ
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(6364136223846793005)
             ^ TICK.load(Ordering::Relaxed);
-        if pl.chance < 1.0 && (h % 1000) as f32 / 1000.0 > pl.chance { continue }
+        if pl.chance < 1.0 && (h % 1000) as f32 / 1000.0 > pl.chance {
+            continue;
+        }
         for r in 0..pl.rolls {
             let e = &pl.entries[((h >> (r * 8 + 3)) as usize) % pl.entries.len()];
             let span = (e.max - e.min + 1) as u64;
@@ -1101,20 +1737,53 @@ fn roll_loot(pools: &[LootPool]) -> Vec<Stack> {
     out
 }
 fn cooked_drop(item: i64) -> Option<i64> {
-    for (r, c) in [("beef","cooked_beef"), ("chicken","cooked_chicken"), ("porkchop","cooked_porkchop"),
-                   ("mutton","cooked_mutton"), ("rabbit","cooked_rabbit"), ("cod","cooked_cod"),
-                   ("salmon","cooked_salmon"), ("potato","baked_potato")] {
-        if name_to_item(r) == Some(item) { return name_to_item(c) }
+    for (r, c) in [
+        ("beef", "cooked_beef"),
+        ("chicken", "cooked_chicken"),
+        ("porkchop", "cooked_porkchop"),
+        ("mutton", "cooked_mutton"),
+        ("rabbit", "cooked_rabbit"),
+        ("cod", "cooked_cod"),
+        ("salmon", "cooked_salmon"),
+        ("potato", "baked_potato"),
+    ] {
+        if name_to_item(r) == Some(item) {
+            return name_to_item(c);
+        }
     }
     None
 }
 fn mob_loot(etype: i64, burning: bool) -> Vec<Stack> {
     if let Some(pools) = mob_loot_tables().lock().unwrap().get(&etype).map(|p| {
-        p.iter().map(|pl| LootPool { rolls: pl.rolls, chance: pl.chance, funcs: pl.funcs.clone(),
-            entries: pl.entries.iter().map(|e| LootEntry { item: e.item, min: e.min, max: e.max, funcs: e.funcs.clone() }).collect() }).collect::<Vec<_>>()
+        p.iter()
+            .map(|pl| LootPool {
+                rolls: pl.rolls,
+                chance: pl.chance,
+                funcs: pl.funcs.clone(),
+                entries: pl
+                    .entries
+                    .iter()
+                    .map(|e| LootEntry {
+                        item: e.item,
+                        min: e.min,
+                        max: e.max,
+                        funcs: e.funcs.clone(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>()
     }) {
-        return roll_loot(&pools).into_iter()
-            .map(|mut st| { if burning { if let Some(c) = cooked_drop(st.0) { st.0 = c; } } st }).collect();
+        return roll_loot(&pools)
+            .into_iter()
+            .map(|mut st| {
+                if burning {
+                    if let Some(c) = cooked_drop(st.0) {
+                        st.0 = c;
+                    }
+                }
+                st
+            })
+            .collect();
     }
     let names: &[&str] = match etype {
         124 => &["rotten_flesh"],
@@ -1126,8 +1795,18 @@ fn mob_loot(etype: i64, burning: bool) -> Vec<Stack> {
         87 => &["mutton", "white_wool"],
         _ => &[],
     };
-    names.iter().filter_map(|n| name_to_item(n).map(|i| (i, 1u8, Vec::new())))
-        .map(|mut st| { if burning { if let Some(c) = cooked_drop(st.0) { st.0 = c; } } st }).collect()
+    names
+        .iter()
+        .filter_map(|n| name_to_item(n).map(|i| (i, 1u8, Vec::new())))
+        .map(|mut st| {
+            if burning {
+                if let Some(c) = cooked_drop(st.0) {
+                    st.0 = c;
+                }
+            }
+            st
+        })
+        .collect()
 }
 
 // vanilla mob damage scales with difficulty: easy min(d/2+1,d),
@@ -1162,12 +1841,12 @@ fn enchant_epf(c: &Client, kind: u8) -> i64 {
     let mut epf = 0i64;
     for slot in [5i16, 6, 7, 8] {
         if let Some((_, _, comps)) = inv.get(&slot) {
-            epf += enchant_level(comps, 27);                       // protection
+            epf += enchant_level(comps, 27); // protection
             match kind {
-                1 => epf += 3 * enchant_level(comps, 9),           // feather_falling
-                2 => epf += 2 * enchant_level(comps, 3),           // blast_protection
-                3 => epf += 2 * enchant_level(comps, 26),          // projectile_protection
-                4 => epf += 2 * enchant_level(comps, 11),          // fire_protection
+                1 => epf += 3 * enchant_level(comps, 9),  // feather_falling
+                2 => epf += 2 * enchant_level(comps, 3),  // blast_protection
+                3 => epf += 2 * enchant_level(comps, 26), // projectile_protection
+                4 => epf += 2 * enchant_level(comps, 11), // fire_protection
                 _ => {}
             }
         }
@@ -1182,13 +1861,19 @@ fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
 // offhand), consume it — vanilla sets hp to 1, fires entity_status 35,
 // plays the totem animation+sound, grants absorption/regen/fire_resist
 fn totem_check(c: &Client) {
-    if *c.hp.lock().unwrap() > 0.0 || *c.gm.lock().unwrap() == 1 { return }
+    if *c.hp.lock().unwrap() > 0.0 || *c.gm.lock().unwrap() == 1 {
+        return;
+    }
     let mut inv = c.inv.lock().unwrap();
     let held_k = 36i16 + (*c.held.lock().unwrap()) as i16;
     for k in [45i16, held_k] {
         if inv.get(&k).map(|v| v.0) == Some(1163) {
             let st = inv.get(&k).unwrap().clone();
-            if st.1 <= 1 { inv.remove(&k); } else { inv.insert(k, (st.0, st.1 - 1, st.2)); }
+            if st.1 <= 1 {
+                inv.remove(&k);
+            } else {
+                inv.insert(k, (st.0, st.1 - 1, st.2));
+            }
             let now = inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
             drop(inv);
             *c.hp.lock().unwrap() = 1.0;
@@ -1199,13 +1884,16 @@ fn totem_check(c: &Client) {
             st_pkt.push(35);
             let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x1f, st_pkt.clone());
             broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
-            let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
+            let (px, py, pz, ..) = {
+                let p = c.pos.lock().unwrap();
+                *p
+            };
             let snd = sound_pkt_named("item.totem.use", px, py, pz);
             broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
             // Death protection replaces existing effects with the vanilla grant set.
             grant_totem_effects(c, &mut c.effs.lock().unwrap());
             let _ = send_packet(&mut *c.sock.lock().unwrap(), 0x5d, health_pkt_c(1.0, c));
-            return
+            return;
         }
     }
     drop(inv);
@@ -1216,15 +1904,25 @@ fn totem_effects(ef: &mut Vec<Eff>) {
     // Vanilla grants 900 / 100 / 800 game ticks. At 20TPS a server tick is a game
     // tick, so these are also the stored server-tick values and the wire takes
     // them unchanged; there is no conversion left to apply.
-    for (name, amp, dur) in [("regeneration", 1, 900), ("absorption", 1, 100), ("fire_resistance", 0, 800)] {
+    for (name, amp, dur) in [
+        ("regeneration", 1, 900),
+        ("absorption", 1, 100),
+        ("fire_resistance", 0, 800),
+    ] {
         let id = name_to_effect(name).expect("totem effect must exist in the effect registry");
-        ef.push(Eff { id, amp, left: server_ticks(dur) as i32 });
+        ef.push(Eff {
+            id,
+            amp,
+            left: server_ticks(dur) as i32,
+        });
     }
 }
 fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
     for e in ef.iter() {
         let packet = remove_effect_pkt(c.eid, e.id);
-        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x43, packet.clone()); }
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x43, packet.clone());
+        }
         broadcast_seen(c.eid, |_| (0x43, packet.clone()));
     }
     totem_effects(ef);
@@ -1232,20 +1930,69 @@ fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
     for e in ef.iter() {
         // The wire uses game ticks even while the simulation stores server ticks.
         let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left);
-        if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x76, packet.clone()); }
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x76, packet.clone());
+        }
         broadcast_seen(c.eid, |_| (0x76, packet.clone()));
     }
 }
 fn armor_pts_of(inv: &HashMap<i16, Stack>) -> i32 {
     let mut pts = 0i32;
     let slots: [(i16, &[(&str, i32)]); 4] = [
-        (5, &[("leather_helmet",1),("golden_helmet",2),("chainmail_helmet",2),("iron_helmet",2),("diamond_helmet",3),("netherite_helmet",3),("turtle_helmet",2)]),
-        (6, &[("leather_chestplate",3),("golden_chestplate",5),("chainmail_chestplate",5),("iron_chestplate",6),("diamond_chestplate",8),("netherite_chestplate",8),("elytra",0)]),
-        (7, &[("leather_leggings",2),("golden_leggings",3),("chainmail_leggings",4),("iron_leggings",5),("diamond_leggings",6),("netherite_leggings",6)]),
-        (8, &[("leather_boots",1),("golden_boots",1),("chainmail_boots",1),("iron_boots",2),("diamond_boots",3),("netherite_boots",3)])];
+        (
+            5,
+            &[
+                ("leather_helmet", 1),
+                ("golden_helmet", 2),
+                ("chainmail_helmet", 2),
+                ("iron_helmet", 2),
+                ("diamond_helmet", 3),
+                ("netherite_helmet", 3),
+                ("turtle_helmet", 2),
+            ],
+        ),
+        (
+            6,
+            &[
+                ("leather_chestplate", 3),
+                ("golden_chestplate", 5),
+                ("chainmail_chestplate", 5),
+                ("iron_chestplate", 6),
+                ("diamond_chestplate", 8),
+                ("netherite_chestplate", 8),
+                ("elytra", 0),
+            ],
+        ),
+        (
+            7,
+            &[
+                ("leather_leggings", 2),
+                ("golden_leggings", 3),
+                ("chainmail_leggings", 4),
+                ("iron_leggings", 5),
+                ("diamond_leggings", 6),
+                ("netherite_leggings", 6),
+            ],
+        ),
+        (
+            8,
+            &[
+                ("leather_boots", 1),
+                ("golden_boots", 1),
+                ("chainmail_boots", 1),
+                ("iron_boots", 2),
+                ("diamond_boots", 3),
+                ("netherite_boots", 3),
+            ],
+        ),
+    ];
     for (slot, mats) in slots {
         if let Some((item, _, _)) = inv.get(&slot) {
-            for (n, p) in mats { if name_to_item(n) == Some(*item) { pts += p } }
+            for (n, p) in mats {
+                if name_to_item(n) == Some(*item) {
+                    pts += p
+                }
+            }
         }
     }
     pts
@@ -1269,7 +2016,9 @@ fn mobs() -> &'static Mutex<Vec<Arc<Mob>>> {
     MOBS.get_or_init(|| Mutex::new(Vec::new()))
 }
 static SHEARED: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
-fn sheared() -> &'static Mutex<std::collections::HashSet<i32>> { SHEARED.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
+fn sheared() -> &'static Mutex<std::collections::HashSet<i32>> {
+    SHEARED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 // /schedule: pending (function, due server-tick) — vanilla keeps
 // scheduled functions in world data; persisted in the meta tail.
 fn sched_fns() -> &'static Mutex<Vec<(String, u64)>> {
@@ -1292,7 +2041,9 @@ fn spawn_mob(m: &Mob) -> Vec<u8> {
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(pitch) as u8); p.push(angle(yaw) as u8); p.push(angle(yaw) as u8);
+    p.push(angle(pitch) as u8);
+    p.push(angle(yaw) as u8);
+    p.push(angle(yaw) as u8);
     write_varint(&mut p, 0);
     p.extend_from_slice(&[0u8; 6]);
     p
@@ -1305,7 +2056,9 @@ fn spawn_entity_pkt(eid: i32, etype: u32, x: f64, y: f64, z: f64, yaw: f32, pitc
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(pitch) as u8); p.push(angle(yaw) as u8); p.push(angle(yaw) as u8);
+    p.push(angle(pitch) as u8);
+    p.push(angle(yaw) as u8);
+    p.push(angle(yaw) as u8);
     write_varint(&mut p, 0);
     p.extend_from_slice(&[0u8; 6]);
     p
@@ -1333,7 +2086,9 @@ fn surface_y(x: i32, z: i32) -> f64 {
             .unwrap_or(16.0);
     }
     let mut y = 100i32;
-    while y > MIN_Y && block_at(x, y - 1, z) == 0 { y -= 1; }
+    while y > MIN_Y && block_at(x, y - 1, z) == 0 {
+        y -= 1;
+    }
     y as f64
 }
 // One owner for simulation cadence. Every per-tick increment, wire
@@ -1352,11 +2107,17 @@ const GAME_TICKS_PER_TICK: u32 = 20 / TICKS_PER_SECOND;
 /// to every tick rather than to zero, which would divide by zero in a modulo.
 const fn server_ticks(game_ticks: u64) -> u64 {
     let ticks = game_ticks / GAME_TICKS_PER_TICK as u64;
-    if ticks == 0 { 1 } else { ticks }
+    if ticks == 0 {
+        1
+    } else {
+        ticks
+    }
 }
 /// The lazy-schedule ladder doubles the re-check interval up to 80 game ticks
 /// (4 s). Vanilla has no analogue; this is the lightweight schedule itself.
-const fn backoff_ticks(fails: u64) -> u64 { server_ticks(10 << fails.saturating_sub(1)) }
+const fn backoff_ticks(fails: u64) -> u64 {
+    server_ticks(10 << fails.saturating_sub(1))
+}
 /// Crop growth is a per-tick chance, not an interval, so the denominator scales
 /// WITH ticks per second: the chance per real second stays 1/30 at any cadence.
 /// This is the opposite direction from server_ticks, which divides.
@@ -1364,42 +2125,44 @@ const CROP_GROWTH_DENOMINATOR: u64 = 30 * TICKS_PER_SECOND as u64;
 // Recurring schedules and one-shot lives that were tick literals. Naming the
 // vanilla game-tick value lets the cutover derive the server-tick form from the
 // single cadence owner instead of hunting for scattered numbers.
-const AUTOSAVE_GT: u64 = 600;        // 30s
-const SPAWN_CYCLE_GT: u64 = 200;     // 10s
-const CREEPER_FUSE_GT: u64 = 100;    // 5s
-const BOBBER_PACKET_GT: u64 = 15;    // 0.75s
-const BOLT_LIFE_GT: u64 = 10;        // 0.5s visual
-const TNT_FUSE_GT: u64 = 80;         // 4s, TntBlock fuse
-const AIR_SUPPLY_GT: u64 = 300;        // 15s, entity air supply
-const PICKUP_DELAY_GT: u64 = 10;     // 0.5s, ItemEntity pickupDelay
-// Projectile lifetimes. Vanilla has no flying TTL and counts 1200 game ticks of
-// being in the ground, so these are this server's own limits. They are stated as
-// the real time they had at 4TPS, not as bare tick counts.
-const ARROW_TTL_GT: u64 = 1200;      // 60s
-const MOB_ARROW_TTL_GT: u64 = 800;   // 40s
-const PEARL_TTL_GT: u64 = 250;       // 12.5s
-const SNOWBALL_TTL_GT: u64 = 300;    // 15s
-// Mob counters that were bare tick counts at 4TPS, so the 20TPS cutover
-// shortened them fivefold. Stated as the real time they had before.
-const BOBBER_BITE_GT: u64 = 75;      // 3.75s, bobber settles before biting
-const MOB_BURN_TICK_GT: u64 = 40;    // 2s, burn damage interval
-const CREEPER_IGNITE_GT: u64 = 30;   // 1.5s, creeper fuse before igniting
-const STARVE_GT: u64 = 80;            // 4s, starvation damage interval
-const FLUID_TICK_GT: u64 = 30;        // 1.5s, scheduled lava/fluid tick
-// Per-tick probabilities, not intervals: the denominator scales WITH ticks per
-// second so the chance per real second is unchanged. This is the opposite
-// direction from server_ticks, which divides.
+const AUTOSAVE_GT: u64 = 600; // 30s
+const SPAWN_CYCLE_GT: u64 = 200; // 10s
+const CREEPER_FUSE_GT: u64 = 100; // 5s
+const BOBBER_PACKET_GT: u64 = 15; // 0.75s
+const BOLT_LIFE_GT: u64 = 10; // 0.5s visual
+const TNT_FUSE_GT: u64 = 80; // 4s, TntBlock fuse
+const AIR_SUPPLY_GT: u64 = 300; // 15s, entity air supply
+const PICKUP_DELAY_GT: u64 = 10; // 0.5s, ItemEntity pickupDelay
+                                 // Projectile lifetimes. Vanilla has no flying TTL and counts 1200 game ticks of
+                                 // being in the ground, so these are this server's own limits. They are stated as
+                                 // the real time they had at 4TPS, not as bare tick counts.
+const ARROW_TTL_GT: u64 = 1200; // 60s
+const MOB_ARROW_TTL_GT: u64 = 800; // 40s
+const PEARL_TTL_GT: u64 = 250; // 12.5s
+const SNOWBALL_TTL_GT: u64 = 300; // 15s
+                                  // Mob counters that were bare tick counts at 4TPS, so the 20TPS cutover
+                                  // shortened them fivefold. Stated as the real time they had before.
+const BOBBER_BITE_GT: u64 = 75; // 3.75s, bobber settles before biting
+const MOB_BURN_TICK_GT: u64 = 40; // 2s, burn damage interval
+const CREEPER_IGNITE_GT: u64 = 30; // 1.5s, creeper fuse before igniting
+const STARVE_GT: u64 = 80; // 4s, starvation damage interval
+const FLUID_TICK_GT: u64 = 30; // 1.5s, scheduled lava/fluid tick
+                               // Per-tick probabilities, not intervals: the denominator scales WITH ticks per
+                               // second so the chance per real second is unchanged. This is the opposite
+                               // direction from server_ticks, which divides.
 const RAIN_CHANCE_DENOMINATOR: u64 = 6000 * TICKS_PER_SECOND as u64 / 4;
 const MOB_SPAWN_CHANCE_DENOMINATOR: u64 = 400 * TICKS_PER_SECOND as u64 / 4;
-const DROP_LIFE_GT: u64 = 6000;       // 300s, ItemEntity lifespan
-const XP_LIFE_GT: u64 = 6000;         // 300s, ExperienceOrb lifespan
+const DROP_LIFE_GT: u64 = 6000; // 300s, ItemEntity lifespan
+const XP_LIFE_GT: u64 = 6000; // 300s, ExperienceOrb lifespan
 /// chain
-const fn chain_fuse_left(jitter: u64) -> u64 { server_ticks(10 + if jitter > 20 { 20 } else { jitter }) }
+const fn chain_fuse_left(jitter: u64) -> u64 {
+    server_ticks(10 + if jitter > 20 { 20 } else { jitter })
+}
 // Wall-clock owners. Vanilla defines these in real time, not in game ticks, so
 // they anchor on Instants: changing the simulation cadence must not shift them.
-const KEEPALIVE_MS: u64 = 15_000;   // ServerCommonPacketListenerImpl
-const TIME_NOTIFY_MS: u64 = 1_000;  // day/night display sync
-const SIZE_LOG_MS: u64 = 5_000;     // container-count watch (diagnostic)
+const KEEPALIVE_MS: u64 = 15_000; // ServerCommonPacketListenerImpl
+const TIME_NOTIFY_MS: u64 = 1_000; // day/night display sync
+const SIZE_LOG_MS: u64 = 5_000; // container-count watch (diagnostic)
 static KEEPALIVE_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 static TIME_NOTIFY_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 static SIZE_LOG_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
@@ -1408,14 +2171,24 @@ static SIZE_LOG_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 /// `overrun` re-anchors instead of catching up, so an overloaded server cannot
 /// accumulate an unbounded backlog of deadlines.
 fn next_deadline(deadline: Instant, overrun: bool) -> Instant {
-    if overrun { Instant::now() } else { deadline }
+    if overrun {
+        Instant::now()
+    } else {
+        deadline
+    }
 }
 /// MET4 stores durations in server ticks. MET2 and MET3 stored the same counters as
 /// 4TPS server ticks, which span five times the wall time, so a legacy value read
 /// directly at 20TPS expires five times early. Dividing by TICK_MS converts the
 /// legacy millisecond-equivalent budget, and TICK_MS went 250 to 50, so the factor
 /// is exactly the cadence ratio.
-fn legacy_ticks(raw: u64, legacy: bool) -> u64 { if legacy { raw / TICK_MS } else { raw } }
+fn legacy_ticks(raw: u64, legacy: bool) -> u64 {
+    if legacy {
+        raw / TICK_MS
+    } else {
+        raw
+    }
+}
 /// The tick period MET2 and MET3 files were written at. It is a property of the
 /// file format, not of the running server, so it is a fixed historical value and
 /// must not be derived from TICK_MS.
@@ -1426,7 +2199,11 @@ const LEGACY_TICK_MS: u64 = 250;
 /// 20TPS ticks; dividing would shorten the budget fivefold, which is the very
 /// bug the legacy conversion exists to prevent.
 fn legacy_tick_count(raw: u64, legacy: bool) -> u64 {
-    if legacy { raw * (LEGACY_TICK_MS / TICK_MS) } else { raw }
+    if legacy {
+        raw * (LEGACY_TICK_MS / TICK_MS)
+    } else {
+        raw
+    }
 }
 fn wall_anchor(cell: &'static OnceLock<Mutex<Instant>>) -> &'static Mutex<Instant> {
     cell.get_or_init(|| Mutex::new(Instant::now()))
@@ -1436,19 +2213,28 @@ fn wall_anchor(cell: &'static OnceLock<Mutex<Instant>>) -> &'static Mutex<Instan
 fn every_ms(cell: &'static OnceLock<Mutex<Instant>>, period: u64, body: impl FnOnce()) {
     let fire = {
         let mut last = wall_anchor(cell).lock().unwrap();
-        if last.elapsed() >= Duration::from_millis(period) { *last = Instant::now(); true } else { false }
+        if last.elapsed() >= Duration::from_millis(period) {
+            *last = Instant::now();
+            true
+        } else {
+            false
+        }
     };
-    if fire { body(); }
+    if fire {
+        body();
+    }
 }
 static TICK: AtomicU64 = AtomicU64::new(0);
 static SPAWN_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 static WORLD_TIME: AtomicU64 = AtomicU64::new(1000); // morning
 static BOLTS: OnceLock<Mutex<Vec<(i32, i32)>>> = OnceLock::new(); // (eid, ticks-left) transient lightning visuals
-fn bolts() -> &'static Mutex<Vec<(i32, i32)>> { BOLTS.get_or_init(|| Mutex::new(Vec::new())) }
+fn bolts() -> &'static Mutex<Vec<(i32, i32)>> {
+    BOLTS.get_or_init(|| Mutex::new(Vec::new()))
+}
 static RAINING: AtomicU64 = AtomicU64::new(0); // ticks of rain remaining
 static THUNDERING: AtomicU64 = AtomicU64::new(0); // ticks of thunder (subset of rain)
-// vanilla gamerules wired to systems that exist (0=false, 1=true);
-// persisted in the meta tail — they are world state, not session.
+                                                  // vanilla gamerules wired to systems that exist (0=false, 1=true);
+                                                  // persisted in the meta tail — they are world state, not session.
 static GR_KEEP_INVENTORY: AtomicU8 = AtomicU8::new(0);
 static GR_DAYLIGHT_CYCLE: AtomicU8 = AtomicU8::new(1);
 static GR_WEATHER_CYCLE: AtomicU8 = AtomicU8::new(1);
@@ -1462,10 +2248,16 @@ static WORLD_SEED: AtomicU64 = AtomicU64::new(0);
 // 0=peaceful 1=easy 2=normal 3=hard; gates hostile night spawns
 static DIFFICULTY: AtomicU8 = AtomicU8::new(2);
 static POWERED_PLATES: OnceLock<Mutex<HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn powered_plates() -> &'static Mutex<HashSet<(i32, i32, i32)>> { POWERED_PLATES.get_or_init(|| Mutex::new(HashSet::new())) }
+fn powered_plates() -> &'static Mutex<HashSet<(i32, i32, i32)>> {
+    POWERED_PLATES.get_or_init(|| Mutex::new(HashSet::new()))
+}
 // plate states: unpowered id is odd, powered = id-1 (vanilla bool order true,false)
-fn plate_unpowered(st: u32) -> bool { st == 5651 || (5717..=5733).contains(&st) && st % 2 == 1 }
-fn plate_powered(st: u32) -> bool { st == 5650 || (5716..=5732).contains(&st) && st % 2 == 0 }
+fn plate_unpowered(st: u32) -> bool {
+    st == 5651 || (5717..=5733).contains(&st) && st % 2 == 1
+}
+fn plate_powered(st: u32) -> bool {
+    st == 5650 || (5716..=5732).contains(&st) && st % 2 == 0
+}
 fn keepalive_time_tick() {
     // One region borrow for the stage. A static scan confirmed that nothing this
     // stage calls re-enters the region lock.
@@ -1474,11 +2266,13 @@ fn keepalive_time_tick() {
     // world clock advances every tick (20 tps => +20/s)
     let wt = if GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) == 1 {
         WORLD_TIME.fetch_add(GAME_TICKS_PER_TICK as u64, Ordering::Relaxed) % 24000
-    } else { WORLD_TIME.load(Ordering::Relaxed) % 24000 };
+    } else {
+        WORLD_TIME.load(Ordering::Relaxed) % 24000
+    };
     every_ms(&TIME_NOTIFY_AT, TIME_NOTIFY_MS, || {
         broadcast(0, |_c| {
             let mut p = Vec::new();
-            p.extend_from_slice(&t.to_be_bytes());      // world age (i64)
+            p.extend_from_slice(&t.to_be_bytes()); // world age (i64)
             p.extend_from_slice(&(wt as i64).to_be_bytes());
             (0x64, p)
         });
@@ -1487,8 +2281,12 @@ fn keepalive_time_tick() {
         broadcast(0, |_c| (0x26, t.to_be_bytes().to_vec()));
     });
     every_ms(&SIZE_LOG_AT, SIZE_LOG_MS, || {
-        let rss = std::fs::read_to_string("/proc/self/status").unwrap_or_default()
-            .lines().find(|l| l.starts_with("VmRSS")).map(|l| l.to_string()).unwrap_or_default();
+        let rss = std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("VmRSS"))
+            .map(|l| l.to_string())
+            .unwrap_or_default();
         eprintln!("[sz] t={} {} | mobs={} drops={} xps={} arrows={} bob={} pearl={} primed={} chests={} furn={} crops={} world={} inv={} clients={}",
             t, rss.trim(),
             mobs().lock().unwrap().len(), drops().lock().unwrap().len(), xps().lock().unwrap().len(),
@@ -1501,18 +2299,35 @@ fn keepalive_time_tick() {
     {
         let rt = RAINING.load(Ordering::Relaxed);
         if rt > 0 {
-            THUNDERING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1))).ok();
-            if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1 && RAINING.fetch_sub(1, Ordering::Relaxed) == 1 {
+            THUNDERING
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+            if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1
+                && RAINING.fetch_sub(1, Ordering::Relaxed) == 1
+            {
                 THUNDERING.store(0, Ordering::Relaxed);
                 broadcast(-1, |_c| (0x22, vec![2u8, 0, 0, 0, 0]));
-                broadcast(-1, |_c| { let mut p = vec![8u8]; p.extend_from_slice(&0f32.to_be_bytes()); (0x22, p.clone()) });
+                broadcast(-1, |_c| {
+                    let mut p = vec![8u8];
+                    p.extend_from_slice(&0f32.to_be_bytes());
+                    (0x22, p.clone())
+                });
             }
-        } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1 && t.wrapping_mul(2654435761) % RAIN_CHANCE_DENOMINATOR == 0 {
+        } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1
+            && t.wrapping_mul(2654435761) % RAIN_CHANCE_DENOMINATOR == 0
+        {
             RAINING.store(server_ticks(12000), Ordering::Relaxed);
             broadcast(-1, |_c| (0x22, vec![1u8, 0, 0, 0, 0]));
-            if world_rng::next_u64() % 8 == 0 { // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
+            if world_rng::next_u64() % 8 == 0 {
+                // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
                 THUNDERING.store(server_ticks(3600), Ordering::Relaxed);
-                broadcast(-1, |_c| { let mut p = vec![8u8]; p.extend_from_slice(&1f32.to_be_bytes()); (0x22, p.clone()) });
+                broadcast(-1, |_c| {
+                    let mut p = vec![8u8];
+                    p.extend_from_slice(&1f32.to_be_bytes());
+                    (0x22, p.clone())
+                });
             }
         }
     }
@@ -1522,39 +2337,71 @@ fn keepalive_time_tick() {
         let mut i = 0;
         while i < bs.len() {
             bs[i].1 -= 1;
-            if bs[i].1 <= 0 { let (be, _) = bs.remove(i); broadcast_seen_destroy(be); }
-            else { i += 1; }
+            if bs[i].1 <= 0 {
+                let (be, _) = bs.remove(i);
+                broadcast_seen_destroy(be);
+            } else {
+                i += 1;
+            }
         }
     }
     // hunger: drain by distance, regen at high food, starve at 0
     {
         let cls: Vec<Arc<Client>> = client_snapshot();
         for c in cls.iter() {
-            if *c.gm.lock().unwrap() == 1 { continue }
-            let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
+            if *c.gm.lock().unwrap() == 1 {
+                continue;
+            }
+            let (px, py, pz, ..) = {
+                let p = c.pos.lock().unwrap();
+                *p
+            };
             // elytra fall-flying: airborne + descending + elytra chestplate
             {
-                let (_x,_y,_z,_p,_q, gnd) = { let p = c.pos.lock().unwrap(); *p };
+                let (_x, _y, _z, _p, _q, gnd) = {
+                    let p = c.pos.lock().unwrap();
+                    *p
+                };
                 let ff = *c.fall_from.lock().unwrap();
-                let ely = { let iv = c.inv.lock().unwrap();
-                    iv.get(&6i16).map(|v| v.0).unwrap_or(0) } == name_to_item("elytra").unwrap_or(-9);
+                let ely = {
+                    let iv = c.inv.lock().unwrap();
+                    iv.get(&6i16).map(|v| v.0).unwrap_or(0)
+                } == name_to_item("elytra").unwrap_or(-9);
                 let glide = !gnd && ely && py < ff - 0.1 && *c.hp.lock().unwrap() > 0.0;
                 // vanilla: elytra pays 1 durability per second of glide
                 if glide && t % server_ticks(20) == 0 && damage_inv_slot(c, 6) {
-                    let st = c.inv.lock().unwrap().get(&6i16).cloned().unwrap_or((0, 0, Vec::new()));
+                    let st =
+                        c.inv
+                            .lock()
+                            .unwrap()
+                            .get(&6i16)
+                            .cloned()
+                            .unwrap_or((0, 0, Vec::new()));
                     resync_slot(c, 0, 6, &st);
                 }
                 let mut fl = c.fall_fly.lock().unwrap();
                 if *fl != glide {
-                    *fl = glide; drop(fl);
+                    *fl = glide;
+                    drop(fl);
                     let sneak = *c.sneaking.lock().unwrap();
                     let sprint = *c.sprinting.lock().unwrap();
                     let mut p = Vec::new();
                     write_varint(&mut p, c.eid as i64);
-                    p.push(0); p.push(0);
+                    p.push(0);
+                    p.push(0);
                     p.push((sneak as u8) * 2 | (sprint as u8) * 8 | (glide as u8) * 0x80);
-                    p.push(6); write_varint(&mut p, 21);
-                    write_varint(&mut p, if glide { 1 } else if sneak { 5 } else { 0 });
+                    p.push(6);
+                    write_varint(&mut p, 21);
+                    write_varint(
+                        &mut p,
+                        if glide {
+                            1
+                        } else if sneak {
+                            5
+                        } else {
+                            0
+                        },
+                    );
                     p.push(0xff);
                     broadcast_seen(c.eid, |_c| (0x58, p.clone()));
                 }
@@ -1565,8 +2412,13 @@ fn keepalive_time_tick() {
             let mut dirty = false;
             let mut ex = c.walk_acc.lock().unwrap(); // vanilla exhaustion accumulator
             if d < 10.0 {
-                *ex += d * if *c.sprinting.lock().unwrap() { 0.1 }
-                    else if *c.sneaking.lock().unwrap() { 0.005 } else { 0.0 };
+                *ex += d * if *c.sprinting.lock().unwrap() {
+                    0.1
+                } else if *c.sneaking.lock().unwrap() {
+                    0.005
+                } else {
+                    0.0
+                };
             }
             // hunger effect (internal id 16): +0.005/lvl per game tick
             if let Some(e) = c.effs.lock().unwrap().iter().find(|e| e.id == 16) {
@@ -1578,65 +2430,180 @@ fn keepalive_time_tick() {
             if GR_NATURAL_REGEN.load(Ordering::Relaxed) == 1 && food >= 18 && *h < mh && *h > 0.0 {
                 // vanilla: fast heal 1hp/10t while food==20&&sat>0, else 1hp/80t; +6 exh per hp
                 let fast = food >= 20 && *c.sat.lock().unwrap() > 0.0;
-                if t % server_ticks(if fast { 10 } else { 80 }) == 0 { *h = (*h + 1.0).min(mh); dirty = true; *ex += 6.0; }
+                if t % server_ticks(if fast { 10 } else { 80 }) == 0 {
+                    *h = (*h + 1.0).min(mh);
+                    dirty = true;
+                    *ex += 6.0;
+                }
             }
             if *ex >= 4.0 {
-                *ex -= 4.0; dirty = true;
+                *ex -= 4.0;
+                dirty = true;
                 let mut st = c.sat.lock().unwrap();
-                if *st > 0.0 { *st = (*st - 1.0).max(0.0); }
-                else { let mut f = c.food.lock().unwrap(); *f = (*f - 1).max(0); }
+                if *st > 0.0 {
+                    *st = (*st - 1.0).max(0.0);
+                } else {
+                    let mut f = c.food.lock().unwrap();
+                    *f = (*f - 1).max(0);
+                }
             }
             drop(ex);
-            if food <= 0 && *h > 1.0 && t % server_ticks(STARVE_GT) == server_ticks(STARVE_GT) / 2 { *h = (*h - 1.0).max(1.0); dirty = true; }
-            {   // drowning: head in water drains air, then 2hp/s
-                let wst = name_to_state("water").unwrap_or(u32::MAX);
-                let submerged = block_at(px.floor() as i32, (py + 1.62).floor() as i32, pz.floor() as i32) == wst;
-                let mut air = c.air.lock().unwrap();
-                if !submerged { *air = server_ticks(AIR_SUPPLY_GT) as i32; }
-                else if *air > 0 {
-                    // respiration: air drains (lvl+1)x slower
-                    let resp: i64 = { let iv = c.inv.lock().unwrap();
-                        enchant_level(&iv.get(&5i16).map(|v| v.2.clone()).unwrap_or_default(), 30) };
-                    if resp == 0 || t % (resp + 1) as u64 == 0 { *air -= 1; }
-                }
-                else if t % server_ticks(20) == 0 { *h = (*h - 2.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+            if food <= 0 && *h > 1.0 && t % server_ticks(STARVE_GT) == server_ticks(STARVE_GT) / 2 {
+                *h = (*h - 1.0).max(1.0);
+                dirty = true;
             }
-            {   // lava: feet in lava -> 4hp/tick-ish (vanilla 4hp/0.5s; ours every 2 ticks)
+            {
+                // drowning: head in water drains air, then 2hp/s
+                let wst = name_to_state("water").unwrap_or(u32::MAX);
+                let submerged = block_at(
+                    px.floor() as i32,
+                    (py + 1.62).floor() as i32,
+                    pz.floor() as i32,
+                ) == wst;
+                let mut air = c.air.lock().unwrap();
+                if !submerged {
+                    *air = server_ticks(AIR_SUPPLY_GT) as i32;
+                } else if *air > 0 {
+                    // respiration: air drains (lvl+1)x slower
+                    let resp: i64 = {
+                        let iv = c.inv.lock().unwrap();
+                        enchant_level(&iv.get(&5i16).map(|v| v.2.clone()).unwrap_or_default(), 30)
+                    };
+                    if resp == 0 || t % (resp + 1) as u64 == 0 {
+                        *air -= 1;
+                    }
+                } else if t % server_ticks(20) == 0 {
+                    *h = (*h - 2.0).max(0.0);
+                    dirty = true;
+                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    if *h <= 0.0 {
+                        drop(h);
+                        totem_check(c);
+                        h = c.hp.lock().unwrap();
+                    }
+                }
+            }
+            {
+                // lava: feet in lava -> 4hp/tick-ish (vanilla 4hp/0.5s; ours every 2 ticks)
                 let lst = name_to_state("lava").unwrap_or(u32::MAX);
                 let fire_immune = c.effs.lock().unwrap().iter().any(|e| e.id == 11);
-                let in_lava = !fire_immune && block_at(px.floor() as i32, (py - 0.2).floor() as i32, pz.floor() as i32) == lst
+                let in_lava = !fire_immune
+                    && block_at(
+                        px.floor() as i32,
+                        (py - 0.2).floor() as i32,
+                        pz.floor() as i32,
+                    ) == lst
                     || block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == lst
-                    || block_at(px.floor() as i32, (py + 1.0).floor() as i32, pz.floor() as i32) == lst;
-                if in_lava && t % server_ticks(10) == 0 { *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                    || block_at(
+                        px.floor() as i32,
+                        (py + 1.0).floor() as i32,
+                        pz.floor() as i32,
+                    ) == lst;
+                if in_lava && t % server_ticks(10) == 0 {
+                    *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
+                    dirty = true;
+                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    if *h <= 0.0 {
+                        drop(h);
+                        totem_check(c);
+                        h = c.hp.lock().unwrap();
+                    }
+                }
                 // standing in fire: 1hp/s (vanilla), fire_resist immune,
                 // fire_protection epf applies, armor does not
                 let fst = name_to_state("fire").unwrap_or(u32::MAX);
-                let in_fire = !fire_immune && (block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
-                if in_fire && t % server_ticks(20) == 0 { *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                let in_fire = !fire_immune
+                    && (block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
+                if in_fire && t % server_ticks(20) == 0 {
+                    *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
+                    dirty = true;
+                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    if *h <= 0.0 {
+                        drop(h);
+                        totem_check(c);
+                        h = c.hp.lock().unwrap();
+                    }
+                }
                 // void: 4hp per 0.5s below y=-64, ignores armor (vanilla)
-                if py < -64.0 && t % server_ticks(10) == 0 { *h = (*h - 4.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                if py < -64.0 && t % server_ticks(10) == 0 {
+                    *h = (*h - 4.0).max(0.0);
+                    dirty = true;
+                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    if *h <= 0.0 {
+                        drop(h);
+                        totem_check(c);
+                        h = c.hp.lock().unwrap();
+                    }
+                }
                 // suffocation: solid block at head height, 1hp/0.5s (vanilla)
                 if t % server_ticks(10) == 0 {
-                    let hb = block_at(px.floor() as i32, (py + 1.62).floor() as i32, pz.floor() as i32);
-                    if hb != u32::MAX && !mob_passable(hb) { *h = (*h - 1.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                    let hb = block_at(
+                        px.floor() as i32,
+                        (py + 1.62).floor() as i32,
+                        pz.floor() as i32,
+                    );
+                    if hb != u32::MAX && !mob_passable(hb) {
+                        *h = (*h - 1.0).max(0.0);
+                        dirty = true;
+                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        if *h <= 0.0 {
+                            drop(h);
+                            totem_check(c);
+                            h = c.hp.lock().unwrap();
+                        }
+                    }
                 }
                 // contact damage: cactus adjacent (1hp/0.5s), magma underfoot
                 // (1hp/0.5s, sneaking safe, fire kind), berry bush inside
                 let (bx, bz) = (px.floor() as i32, pz.floor() as i32);
                 if t % server_ticks(10) == 0 {
                     let cst = name_to_state("cactus").unwrap_or(u32::MAX);
-                    let near_cactus = t % server_ticks(20) == 0 && [[1,0],[-1,0],[0,1],[0,-1],[0,0]].iter().any(|&[dx,dz]|
-                        block_at(bx+dx, py.floor() as i32, bz+dz) == cst);
-                    if near_cactus { *h = (*h - 1.0).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                    let near_cactus = t % server_ticks(20) == 0
+                        && [[1, 0], [-1, 0], [0, 1], [0, -1], [0, 0]]
+                            .iter()
+                            .any(|&[dx, dz]| block_at(bx + dx, py.floor() as i32, bz + dz) == cst);
+                    if near_cactus {
+                        *h = (*h - 1.0).max(0.0);
+                        dirty = true;
+                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        if *h <= 0.0 {
+                            drop(h);
+                            totem_check(c);
+                            h = c.hp.lock().unwrap();
+                        }
+                    }
                     let mst = name_to_state("magma_block").unwrap_or(u32::MAX);
-                    let on_magma = !fire_immune && !*c.sneaking.lock().unwrap()
+                    let on_magma = !fire_immune
+                        && !*c.sneaking.lock().unwrap()
                         && block_at(bx, (py - 0.5).floor() as i32, bz) == mst;
-                    if on_magma { *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                    if on_magma {
+                        *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
+                        dirty = true;
+                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        if *h <= 0.0 {
+                            drop(h);
+                            totem_check(c);
+                            h = c.hp.lock().unwrap();
+                        }
+                    }
                     let bst = name_to_state("sweet_berry_bush").unwrap_or(u32::MAX);
-                    if t % server_ticks(20) == 0 && block_at(bx, py.floor() as i32, bz) == bst { *h = (*h - 0.5).max(0.0); dirty = true; *c.hurt_at.lock().unwrap() = Instant::now(); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); } }
+                    if t % server_ticks(20) == 0 && block_at(bx, py.floor() as i32, bz) == bst {
+                        *h = (*h - 0.5).max(0.0);
+                        dirty = true;
+                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        if *h <= 0.0 {
+                            drop(h);
+                            totem_check(c);
+                            h = c.hp.lock().unwrap();
+                        }
+                    }
                 }
             }
-            if dirty { if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*h, c)); } }
+            if dirty {
+                if let Ok(mut w) = c.sock.lock() {
+                    let _ = send_packet(&mut *w, 0x5d, health_pkt_c(*h, c));
+                }
+            }
         }
     }
     // pressure plates: an entity standing on one powers it; the plate
@@ -1644,14 +2611,18 @@ fn keepalive_time_tick() {
     // powered at the even id, unpowered odd
     {
         let mut spots: Vec<(i32, i32, i32)> = Vec::new();
-        { for c in clients().lock().unwrap().iter() {
-            let p = c.pos.lock().unwrap();
-            spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
-        } }
-        { for m in mobs().lock().unwrap().iter() {
-            let p = m.pos.lock().unwrap();
-            spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
-        } }
+        {
+            for c in clients().lock().unwrap().iter() {
+                let p = c.pos.lock().unwrap();
+                spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
+            }
+        }
+        {
+            for m in mobs().lock().unwrap().iter() {
+                let p = m.pos.lock().unwrap();
+                spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
+            }
+        }
         let mut pw = powered_plates().lock().unwrap();
         for (x, y, z) in spots.iter().copied() {
             let st = block_at(x, y, z);
@@ -1660,11 +2631,15 @@ fn keepalive_time_tick() {
                 note_block_update(x, y, z, st - 1);
                 redstone_update(x, y - 1, z, true); // plate powers the block below
                 pw.insert((x, y, z));
+            } else if plate_powered(st) {
+                pw.insert((x, y, z));
             }
-            else if plate_powered(st) { pw.insert((x, y, z)); }
         }
-        let off: Vec<(i32, i32, i32)> = pw.iter()
-            .filter(|&&(x, y, z)| !spots.contains(&(x, y, z))).copied().collect();
+        let off: Vec<(i32, i32, i32)> = pw
+            .iter()
+            .filter(|&&(x, y, z)| !spots.contains(&(x, y, z)))
+            .copied()
+            .collect();
         for (x, y, z) in off {
             let st = block_at(x, y, z);
             if plate_powered(st) {
@@ -1679,17 +2654,26 @@ fn keepalive_time_tick() {
     // still apply there; damage effects are client-irrelevant in creative)
     {
         let cls: Vec<Arc<Client>> = client_snapshot();
-        for c in cls.iter() { effects::tick_effects(c); }
+        for c in cls.iter() {
+            effects::tick_effects(c);
+        }
     }
     // crop growth: ~1/30 chance per real second (per-tick denominator scales
     // with ticks per second, so a cadence change keeps the same rate)
     {
         let mut cg = crops().lock().unwrap();
-        let mut ripe: Vec<(i32,i32,i32)> = Vec::new();
-        let keys: Vec<(i32,i32,i32)> = cg.keys().copied().filter(|p| region.is_warm(p.0, p.2)).collect();
+        let mut ripe: Vec<(i32, i32, i32)> = Vec::new();
+        let keys: Vec<(i32, i32, i32)> = cg
+            .keys()
+            .copied()
+            .filter(|p| region.is_warm(p.0, p.2))
+            .collect();
         for p in keys {
             let age = cg.get(&p).cloned().unwrap_or(0);
-            let hh = ((p.0 as i64).wrapping_mul(31) ^ (p.2 as i64).wrapping_mul(37) ^ (p.1 as i64) ^ t as i64) as u64;
+            let hh = ((p.0 as i64).wrapping_mul(31)
+                ^ (p.2 as i64).wrapping_mul(37)
+                ^ (p.1 as i64)
+                ^ t as i64) as u64;
             if hh % CROP_GROWTH_DENOMINATOR == 0 {
                 if age < 7 {
                     cg.insert(p, age + 1);
@@ -1705,14 +2689,26 @@ fn keepalive_time_tick() {
         }
     }
     let autosave = server_ticks(AUTOSAVE_GT);
-    if t % autosave == autosave - 1 { save_world(); gc_backoff(); }
+    if t % autosave == autosave - 1 {
+        save_world();
+        gc_backoff();
+    }
     // night spawn cycle: dark hours -> hostiles near players (cap 12).
     // The count must cover every spawned hostile etype — counting only
     // zombies/creepers let skeletons and spiders accrete without bound
     // (hostiles never despawn here).
-    if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1 && DIFFICULTY.load(Ordering::Relaxed) != 0
-        && t % server_ticks(SPAWN_CYCLE_GT) == server_ticks(SPAWN_CYCLE_GT) / 2 && wt >= 13000 && wt <= 23000 {
-        let mcount = mobs().lock().unwrap().iter().filter(|m| matches!(m.etype, 124 | 23 | 91 | 100)).count();
+    if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1
+        && DIFFICULTY.load(Ordering::Relaxed) != 0
+        && t % server_ticks(SPAWN_CYCLE_GT) == server_ticks(SPAWN_CYCLE_GT) / 2
+        && wt >= 13000
+        && wt <= 23000
+    {
+        let mcount = mobs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m.etype, 124 | 23 | 91 | 100))
+            .count();
         let cls: Vec<Arc<Client>> = client_snapshot();
         if mcount < 12 && !cls.is_empty() {
             // The spawn attempt count, not the world tick, drives the rotation.
@@ -1720,58 +2716,107 @@ fn keepalive_time_tick() {
             // single etype: at 20TPS every attempt lands on the same t/40 residue.
             let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
             if let Some(c) = cls.get(attempt as usize % cls.len()) {
-                let (px, _py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
+                let (px, _py, pz, ..) = {
+                    let p = c.pos.lock().unwrap();
+                    *p
+                };
                 let ang = (t as f64) * 2.399;
                 let (nx, nz) = (px + ang.cos() * 14.0, pz + ang.sin() * 14.0);
                 let ny = surface_y(nx.round() as i32, nz.round() as i32);
-                let et = match attempt % 5 { 0 => 23, 1 => 91, 2 => 100, _ => 124 };
-                let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
-                    etype: et, pos: Mutex::new((nx, ny, nz, 0.0, 0.0)), hp: Mutex::new(20.0),
-                    last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)), fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
+                let et = match attempt % 5 {
+                    0 => 23,
+                    1 => 91,
+                    2 => 100,
+                    _ => 124,
+                };
+                let m = Arc::new(Mob {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    uuid: [0u8; 16],
+                    etype: et,
+                    pos: Mutex::new((nx, ny, nz, 0.0, 0.0)),
+                    hp: Mutex::new(20.0),
+                    last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                    hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                    fuse: Mutex::new(0),
+                    love: Mutex::new(0),
+                    air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+                });
                 mobs().lock().unwrap().push(m);
                 drop(cls);
-            } else { drop(cls); }
-        } else { drop(cls); }
+            } else {
+                drop(cls);
+            }
+        } else {
+            drop(cls);
+        }
     }
-    { // fishing bobbers: fly, land on water, bite after 3-7 s
+    {
+        // fishing bobbers: fly, land on water, bite after 3-7 s
         let mut fb = bobbers().lock().unwrap();
         for b in fb.iter_mut() {
-            if !region.is_hot(b.x as i32, b.z as i32) { continue }
+            if !region.is_hot(b.x as i32, b.z as i32) {
+                continue;
+            }
             b.age += 1;
             let wst = name_to_state("water").unwrap_or(u32::MAX);
-            let in_water = block_at(b.x.floor() as i32, b.y.floor() as i32, b.z.floor() as i32) == wst;
+            let in_water =
+                block_at(b.x.floor() as i32, b.y.floor() as i32, b.z.floor() as i32) == wst;
             if !in_water && b.dy.abs() + b.dx.abs() + b.dz.abs() > 0.01 {
                 // Drag belongs on the velocity, not on the displacement, or the
                 // horizontal velocity never decays. Values are unchanged here.
-                b.dx *= 0.99; b.dy *= 0.99; b.dz *= 0.99;
+                b.dx *= 0.99;
+                b.dy *= 0.99;
+                b.dz *= 0.99;
                 b.dy -= 0.03;
-                b.x += b.dx; b.y += b.dy; b.z += b.dz;
+                b.x += b.dx;
+                b.y += b.dy;
+                b.z += b.dz;
             } else {
-                b.dx = 0.0; b.dy = 0.0; b.dz = 0.0;
-                if !b.bit && b.age > server_ticks(BOBBER_BITE_GT) as i32 { b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6; }
+                b.dx = 0.0;
+                b.dy = 0.0;
+                b.dz = 0.0;
+                if !b.bit && b.age > server_ticks(BOBBER_BITE_GT) as i32 {
+                    b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6;
+                }
             }
             if b.age % server_ticks(BOBBER_PACKET_GT) as i32 == 0 {
                 let (ax, ay, az, eid) = (b.x, b.y, b.z, b.eid);
-                broadcast_seen(eid, |_c| (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true)));
+                broadcast_seen(eid, |_c| {
+                    (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+                });
             }
         }
     }
-    { // thrown pearls: fly, on expiry teleport owner
+    {
+        // thrown pearls: fly, on expiry teleport owner
         let mut pl = pearls().lock().unwrap();
         let mut done: Vec<(i32, f64, f64, f64)> = vec![];
         for p0 in pl.iter_mut() {
-            if !region.is_hot(p0.x as i32, p0.z as i32) { continue }
+            if !region.is_hot(p0.x as i32, p0.z as i32) {
+                continue;
+            }
             p0.ttl -= 1;
-            let hit = block_at(p0.x.floor() as i32, p0.y.floor() as i32, p0.z.floor() as i32) != 0;
-            if hit || p0.ttl <= 0 { done.push((p0.owner, p0.x, p0.y, p0.z)); }
-            else {
+            let hit = block_at(
+                p0.x.floor() as i32,
+                p0.y.floor() as i32,
+                p0.z.floor() as i32,
+            ) != 0;
+            if hit || p0.ttl <= 0 {
+                done.push((p0.owner, p0.x, p0.y, p0.z));
+            } else {
                 // vanilla ThrowableProjectile: scale 0.99, add -0.03, integrate.
-                p0.dx *= 0.99; p0.dy *= 0.99; p0.dz *= 0.99;
+                p0.dx *= 0.99;
+                p0.dy *= 0.99;
+                p0.dz *= 0.99;
                 p0.dy -= 0.03;
-                p0.x += p0.dx; p0.y += p0.dy; p0.z += p0.dz;
+                p0.x += p0.dx;
+                p0.y += p0.dy;
+                p0.z += p0.dz;
             }
             let (ax, ay, az, eid) = (p0.x, p0.y, p0.z, p0.eid);
-            broadcast_seen(eid, |_c| (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true)));
+            broadcast_seen(eid, |_c| {
+                (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+            });
         }
         for (owner, tx, ty, tz) in done {
             let dead_pearl = pl.iter().find(|p0| p0.owner == owner).map(|p0| p0.eid);
@@ -1781,40 +2826,74 @@ fn keepalive_time_tick() {
             }
             let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == owner) {
-                { let mut p = c.pos.lock().unwrap(); *p = (tx, ty, tz, p.3, p.4, true); }
+                {
+                    let mut p = c.pos.lock().unwrap();
+                    *p = (tx, ty, tz, p.3, p.4, true);
+                }
                 if let Ok(mut w) = c.sock.lock() {
                     let _ = send_packet(&mut *w, 0x40, teleport_pkt(tx, ty, tz, 0.0, 0.0, 100));
                     let mut h = c.hp.lock().unwrap();
-                    *h = (*h - dmg_after(&*c, 5.0, 0)).max(0.0); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); }
-                    let hh = *h; drop(h);
+                    *h = (*h - dmg_after(&*c, 5.0, 0)).max(0.0);
+                    if *h <= 0.0 {
+                        drop(h);
+                        totem_check(c);
+                        h = c.hp.lock().unwrap();
+                    }
+                    let hh = *h;
+                    drop(h);
                     let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, c));
                 }
             }
         }
     }
-    { // snowballs: fly, hit mob -> hurt flash
+    {
+        // snowballs: fly, hit mob -> hurt flash
         let mut sl2 = snowballs().lock().unwrap();
         let mut done: Vec<(i32, Option<i32>, f64, f64, bool, f64, f64, f64)> = vec![];
         for p0 in sl2.iter_mut() {
-            if !region.is_hot(p0.x as i32, p0.z as i32) { continue }
+            if !region.is_hot(p0.x as i32, p0.z as i32) {
+                continue;
+            }
             p0.ttl -= 1;
             let mut hit_mob: Option<i32> = None;
-            { let ms = mobs().lock().unwrap();
+            {
+                let ms = mobs().lock().unwrap();
                 for m in ms.iter() {
                     let mp = m.pos.lock().unwrap();
-                    if (mp.0 - p0.x).abs() < 0.6 && (mp.2 - p0.z).abs() < 0.6 && p0.y > mp.1 - 0.3 && p0.y < mp.1 + 2.0 { hit_mob = Some(m.eid); break; }
+                    if (mp.0 - p0.x).abs() < 0.6
+                        && (mp.2 - p0.z).abs() < 0.6
+                        && p0.y > mp.1 - 0.3
+                        && p0.y < mp.1 + 2.0
+                    {
+                        hit_mob = Some(m.eid);
+                        break;
+                    }
                 }
             }
-            let blocked = block_at(p0.x.floor() as i32, p0.y.floor() as i32, p0.z.floor() as i32) != 0;
-            if hit_mob.is_some() || blocked || p0.ttl <= 0 { done.push((p0.eid, hit_mob, p0.dx, p0.dz, p0.egg, p0.x, p0.y, p0.z)); }
-            else {
+            let blocked = block_at(
+                p0.x.floor() as i32,
+                p0.y.floor() as i32,
+                p0.z.floor() as i32,
+            ) != 0;
+            if hit_mob.is_some() || blocked || p0.ttl <= 0 {
+                done.push((p0.eid, hit_mob, p0.dx, p0.dz, p0.egg, p0.x, p0.y, p0.z));
+            } else {
                 // Snowballs and eggs are ThrowableProjectile, like the pearl, so
                 // they scale the velocity by 0.99 and use the 0.03 gravity. This
                 // path had no drag at all and the wrong gravity.
-                p0.dx *= 0.99; p0.dy *= 0.99; p0.dz *= 0.99;
+                p0.dx *= 0.99;
+                p0.dy *= 0.99;
+                p0.dz *= 0.99;
                 p0.dy -= 0.03;
-                p0.x += p0.dx; p0.y += p0.dy; p0.z += p0.dz;
-                broadcast_seen(p0.eid, |_c| (0x70, entity_teleport(p0.eid, p0.x, p0.y, p0.z, 0.0, 0.0, true)));
+                p0.x += p0.dx;
+                p0.y += p0.dy;
+                p0.z += p0.dz;
+                broadcast_seen(p0.eid, |_c| {
+                    (
+                        0x70,
+                        entity_teleport(p0.eid, p0.x, p0.y, p0.z, 0.0, 0.0, true),
+                    )
+                });
             }
         }
         for (seid, hit, pdx, pdz, is_egg, ix, iy, iz) in done {
@@ -1822,11 +2901,18 @@ fn keepalive_time_tick() {
             broadcast_seen_destroy(seid);
             // vanilla: an egg that lands has a 1/8 chance to hatch a chicken
             if is_egg && world_rng::next_u64() % 8 == 0 {
-                let m = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
-                    etype: 19, pos: Mutex::new((ix, iy, iz, 0.0, 0.0)), hp: Mutex::new(4.0),
+                let m = Arc::new(Mob {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    uuid: [0u8; 16],
+                    etype: 19,
+                    pos: Mutex::new((ix, iy, iz, 0.0, 0.0)),
+                    hp: Mutex::new(4.0),
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                    fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
+                    fuse: Mutex::new(0),
+                    love: Mutex::new(0),
+                    air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+                });
                 mobs().lock().unwrap().push(m);
             }
             if let Some(meid) = hit {
@@ -1835,21 +2921,47 @@ fn keepalive_time_tick() {
                 // along the throw direction (~0.5 blocks + velocity)
                 let kl = (pdx * pdx + pdz * pdz).sqrt().max(0.01);
                 let (kx, kz) = (pdx / kl * 0.5, pdz / kl * 0.5);
-                if let Some(m) = mobs().lock().unwrap().iter().find(|m| m.eid == meid).cloned() {
-                    let (nx, ny, nz, yaw, pitch) = { let mut p = m.pos.lock().unwrap();
-                        p.0 += kx; p.2 += kz; *p };
-                    broadcast_seen(meid, |_c| (0x5a, velocity_pkt(meid, (kx * 6400.0) as i16, 1600, (kz * 6400.0) as i16)));
-                    broadcast_seen(meid, |_c| (0x70, entity_teleport(meid, nx, ny, nz, yaw, pitch, true)));
+                if let Some(m) = mobs()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m.eid == meid)
+                    .cloned()
+                {
+                    let (nx, ny, nz, yaw, pitch) = {
+                        let mut p = m.pos.lock().unwrap();
+                        p.0 += kx;
+                        p.2 += kz;
+                        *p
+                    };
+                    broadcast_seen(meid, |_c| {
+                        (
+                            0x5a,
+                            velocity_pkt(meid, (kx * 6400.0) as i16, 1600, (kz * 6400.0) as i16),
+                        )
+                    });
+                    broadcast_seen(meid, |_c| {
+                        (0x70, entity_teleport(meid, nx, ny, nz, yaw, pitch, true))
+                    });
                 }
             }
         }
     }
-    { // despawn xp orbs after 300s — plus the same hard cap as drops:
+    {
+        // despawn xp orbs after 300s — plus the same hard cap as drops:
         // a farm can out-spawn the despawn window.
         let mut xl = xps().lock().unwrap();
         let life = server_ticks(XP_LIFE_GT) as i32;
-        for x in xl.iter_mut() { if region.is_hot(x.x as i32, x.z as i32) { x.age += 1; } }
-        let exp: Vec<i32> = xl.iter().filter(|x| x.age >= life && region.is_hot(x.x as i32, x.z as i32)).map(|x| x.eid).collect();
+        for x in xl.iter_mut() {
+            if region.is_hot(x.x as i32, x.z as i32) {
+                x.age += 1;
+            }
+        }
+        let exp: Vec<i32> = xl
+            .iter()
+            .filter(|x| x.age >= life && region.is_hot(x.x as i32, x.z as i32))
+            .map(|x| x.eid)
+            .collect();
         for eid in &exp {
             xl.retain(|x| x.eid != *eid);
             broadcast_seen_destroy(*eid);
@@ -1862,8 +2974,14 @@ fn keepalive_time_tick() {
         let mut merged: Vec<i32> = Vec::new();
         for i in 0..xl.len() {
             for j in (i + 1)..xl.len() {
-                let (ax, ay, az, aage) = { let a = &xl[i]; (a.x, a.y, a.z, a.age) };
-                let (bx, by, bz, bage) = { let b = &xl[j]; (b.x, b.y, b.z, b.age) };
+                let (ax, ay, az, aage) = {
+                    let a = &xl[i];
+                    (a.x, a.y, a.z, a.age)
+                };
+                let (bx, by, bz, bage) = {
+                    let b = &xl[j];
+                    (b.x, b.y, b.z, b.age)
+                };
                 if (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 1.0 {
                     let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
                     xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);
@@ -1878,13 +2996,29 @@ fn keepalive_time_tick() {
         }
     }
     // #minecraft:tick functions (approx rate: our tick = 250ms, vanilla = 50ms)
-    let ticks: Vec<String> = packs().lock().unwrap().iter().flat_map(|p| p.tick.clone()).collect();
-    for f in ticks { run_function(&f, None, &mut None); }
+    let ticks: Vec<String> = packs()
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|p| p.tick.clone())
+        .collect();
+    for f in ticks {
+        run_function(&f, None, &mut None);
+    }
     // /schedule due functions
-    let due: Vec<String> = { let mut sf = sched_fns().lock().unwrap();
-        let d: Vec<String> = sf.iter().filter(|(_, dt)| *dt <= t).map(|(f, _)| f.clone()).collect();
-        sf.retain(|(_, dt)| *dt > t); d };
-    for f in due { run_function(&f, None, &mut None); }
+    let due: Vec<String> = {
+        let mut sf = sched_fns().lock().unwrap();
+        let d: Vec<String> = sf
+            .iter()
+            .filter(|(_, dt)| *dt <= t)
+            .map(|(f, _)| f.clone())
+            .collect();
+        sf.retain(|(_, dt)| *dt > t);
+        d
+    };
+    for f in due {
+        run_function(&f, None, &mut None);
+    }
 }
 fn arrow_tick() {
     let mut dead: Vec<i32> = vec![];
@@ -1896,32 +3030,57 @@ fn arrow_tick() {
         for a in ar.iter_mut() {
             a.ttl -= 1;
             let eid = a.eid;
-            if a.ttl <= 0 { dead.push(eid); continue }
-            if !region.is_hot(a.x as i32, a.z as i32) { continue }
+            if a.ttl <= 0 {
+                dead.push(eid);
+                continue;
+            }
+            if !region.is_hot(a.x as i32, a.z as i32) {
+                continue;
+            }
             let (ax, ay, az) = (a.x, a.y, a.z);
             // vanilla: a stuck arrow is picked up on contact (survival only)
             if a.stuck {
-                let grab = { clients().lock().unwrap().iter()
-                    .filter(|c| *c.gm.lock().unwrap() != 1)
-                    .find(|c| { let p = c.pos.lock().unwrap();
-                        let (dx, dy, dz) = (p.0 - ax, (p.1 + 0.9) - ay, p.2 - az);
-                        dx * dx + dy * dy + dz * dz < 1.3 })
-                    .cloned() };
+                let grab = {
+                    clients()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| *c.gm.lock().unwrap() != 1)
+                        .find(|c| {
+                            let p = c.pos.lock().unwrap();
+                            let (dx, dy, dz) = (p.0 - ax, (p.1 + 0.9) - ay, p.2 - az);
+                            dx * dx + dy * dy + dz * dz < 1.3
+                        })
+                        .cloned()
+                };
                 if let Some(c) = grab {
                     let mut inv = c.inv.lock().unwrap();
                     let slot: i16 = (9..=44i16)
-                        .find(|sl| inv.get(sl).map(|(i, c2, _)| *i == 802 && *c2 < 64).unwrap_or(false))
+                        .find(|sl| {
+                            inv.get(sl)
+                                .map(|(i, c2, _)| *i == 802 && *c2 < 64)
+                                .unwrap_or(false)
+                        })
                         .or_else(|| (9..=44).find(|sl| !inv.contains_key(sl)))
                         .unwrap_or(9);
                     let mut st = inv.get(&slot).cloned().unwrap_or((802, 0, Vec::new()));
-                    st.1 += 1; inv.insert(slot, st);
+                    st.1 += 1;
+                    inv.insert(slot, st);
                     drop(inv);
-                    let st = c.inv.lock().unwrap().get(&slot).cloned().unwrap_or((802, 1, Vec::new()));
+                    let st =
+                        c.inv
+                            .lock()
+                            .unwrap()
+                            .get(&slot)
+                            .cloned()
+                            .unwrap_or((802, 1, Vec::new()));
                     let mut p = vec![0u8];
                     write_varint(&mut p, 0);
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
-                    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
+                    if let Ok(mut w) = c.sock.lock() {
+                        let _ = send_packet(&mut *w, 0x15, p);
+                    }
                     dead.push(eid);
                 }
                 continue;
@@ -1929,61 +3088,120 @@ fn arrow_tick() {
             // vanilla AbstractArrow: scale the velocity by 0.99, add -0.05, then
             // integrate position from that velocity. Applying drag to the
             // displacement instead would leave the horizontal velocity undamped.
-            a.dx *= 0.99; a.dy *= 0.99; a.dz *= 0.99;
+            a.dx *= 0.99;
+            a.dy *= 0.99;
+            a.dz *= 0.99;
             a.dy -= 0.05;
-            a.x += a.dx; a.y += a.dy; a.z += a.dz;
+            a.x += a.dx;
+            a.y += a.dy;
+            a.z += a.dz;
             let (ax, ay, az) = (a.x, a.y, a.z);
             // block collision: arrows stick into solid blocks (vanilla)
             let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
             if bst != 0 && !mob_passable(bst) {
                 // tridents stick like arrows in vanilla too, but our trident
                 // return path handles its own landing — only plain arrows stick
-                if a.kind == 1 { dead.push(eid); } else { a.stuck = true; a.dx = 0.0; a.dy = 0.0; a.dz = 0.0; }
+                if a.kind == 1 {
+                    dead.push(eid);
+                } else {
+                    a.stuck = true;
+                    a.dx = 0.0;
+                    a.dy = 0.0;
+                    a.dz = 0.0;
+                }
                 continue;
             }
-            broadcast_seen(eid, |_c| (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true)));
+            broadcast_seen(eid, |_c| {
+                (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+            });
             if a.owner >= 0 {
                 // player-shot arrow: hit mobs (sub-step to avoid tunneling)
                 // and other players (vanilla PvP) — the owner is skipped
                 let ml = mobs().lock().unwrap();
                 'outer: for m in ml.iter() {
-                    if m.eid == a.last_hit { continue }
+                    if m.eid == a.last_hit {
+                        continue;
+                    }
                     let (mx, my, mz, ..) = *m.pos.lock().unwrap();
                     for st in 1..=4 {
                         let t = st as f64 / 4.0;
-                        let (sx, sy, sz) = (ax - a.dx*0.9*(1.0-t), ay - a.dy*0.9*(1.0-t), az - a.dz*0.9*(1.0-t));
-                        if (mx-sx).abs() < 1.2 && (mz-sz).abs() < 1.2 && sy > my - 0.4 && sy < my + 2.1 {
-                            let mut h = m.hp.lock().unwrap(); *h -= a.dmg;
-                            let dh = *h; drop(h);
-                            if a.fire > 0 { *m.fuse.lock().unwrap() = a.fire; }
+                        let (sx, sy, sz) = (
+                            ax - a.dx * 0.9 * (1.0 - t),
+                            ay - a.dy * 0.9 * (1.0 - t),
+                            az - a.dz * 0.9 * (1.0 - t),
+                        );
+                        if (mx - sx).abs() < 1.2
+                            && (mz - sz).abs() < 1.2
+                            && sy > my - 0.4
+                            && sy < my + 2.1
+                        {
+                            let mut h = m.hp.lock().unwrap();
+                            *h -= a.dmg;
+                            let dh = *h;
+                            drop(h);
+                            if a.fire > 0 {
+                                *m.fuse.lock().unwrap() = a.fire;
+                            }
                             if a.punch > 0 && a.kind == 0 {
-                                let vl = (a.dx*a.dx + a.dz*a.dz).sqrt().max(0.01) as f64;
+                                let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01) as f64;
                                 let kb = 0.3 * a.punch as f64;
-                                let mut p = m.pos.lock().unwrap(); p.0 += a.dx/vl*kb; p.2 += a.dz/vl*kb; drop(p);
-                                broadcast_seen(m.eid, |_c| (0x70, entity_teleport(m.eid, m.pos.lock().unwrap().0, m.pos.lock().unwrap().1, m.pos.lock().unwrap().2, m.pos.lock().unwrap().3, m.pos.lock().unwrap().4, true)));
+                                let mut p = m.pos.lock().unwrap();
+                                p.0 += a.dx / vl * kb;
+                                p.2 += a.dz / vl * kb;
+                                drop(p);
+                                broadcast_seen(m.eid, |_c| {
+                                    (
+                                        0x70,
+                                        entity_teleport(
+                                            m.eid,
+                                            m.pos.lock().unwrap().0,
+                                            m.pos.lock().unwrap().1,
+                                            m.pos.lock().unwrap().2,
+                                            m.pos.lock().unwrap().3,
+                                            m.pos.lock().unwrap().4,
+                                            true,
+                                        ),
+                                    )
+                                });
                             }
                             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
                             // channeling: trident hit in thunder calls lightning
                             // (punch slot carries the level for kind==1)
-                            if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0 {
-                                { let mut h2 = m.hp.lock().unwrap(); *h2 -= 5.0; }
+                            if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0
+                            {
+                                {
+                                    let mut h2 = m.hp.lock().unwrap();
+                                    *h2 -= 5.0;
+                                }
                                 *m.fuse.lock().unwrap() = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
                                 let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                bolts().lock().unwrap().push((be, server_ticks(BOLT_LIFE_GT) as i32));
+                                bolts()
+                                    .lock()
+                                    .unwrap()
+                                    .push((be, server_ticks(BOLT_LIFE_GT) as i32));
                                 broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
-                                let ts = sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
+                                let ts =
+                                    sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
                                 broadcast(-1, |_c| (0x68, ts.clone()));
                             }
                             if dh <= 0.0 {
                                 mob_dead.push((m.eid, m.etype, mx, my, mz));
-                                let on = clients().lock().unwrap().iter()
-                                    .find(|c| c.eid == a.owner).map(|c| c.name.clone());
+                                let on = clients()
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|c| c.eid == a.owner)
+                                    .map(|c| c.name.clone());
                                 if let Some(on) = on {
                                     adv_event(&on, "player_killed_entity", Some(m.etype));
                                 }
                             }
-                            if a.pierce > 0 { a.pierce -= 1; a.last_hit = m.eid; }
-                            else { dead.push(eid); }
+                            if a.pierce > 0 {
+                                a.pierce -= 1;
+                                a.last_hit = m.eid;
+                            } else {
+                                dead.push(eid);
+                            }
                             break 'outer;
                         }
                     }
@@ -1992,16 +3210,35 @@ fn arrow_tick() {
                 if !dead.contains(&eid) {
                     let cls: Vec<Arc<Client>> = client_snapshot();
                     'p2: for c in cls.iter() {
-                        if c.eid == a.owner { continue }
-                        let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
+                        if c.eid == a.owner {
+                            continue;
+                        }
+                        let (px, py, pz, ..) = {
+                            let p = c.pos.lock().unwrap();
+                            *p
+                        };
                         for st in 1..=4 {
                             let t = st as f64 / 4.0;
-                            let (sx, sy, sz) = (ax - a.dx*0.9*(1.0-t), ay - a.dy*0.9*(1.0-t), az - a.dz*0.9*(1.0-t));
-                            if c.eid == a.last_hit { continue }
-                            if (px-sx).abs() < 0.7 && (pz-sz).abs() < 0.7 && sy > py - 0.3 && sy < py + 2.0 {
+                            let (sx, sy, sz) = (
+                                ax - a.dx * 0.9 * (1.0 - t),
+                                ay - a.dy * 0.9 * (1.0 - t),
+                                az - a.dz * 0.9 * (1.0 - t),
+                            );
+                            if c.eid == a.last_hit {
+                                continue;
+                            }
+                            if (px - sx).abs() < 0.7
+                                && (pz - sz).abs() < 0.7
+                                && sy > py - 0.3
+                                && sy < py + 2.0
+                            {
                                 hits.push((c.eid, a.dmg));
-                                if a.pierce > 0 { a.pierce -= 1; a.last_hit = c.eid; }
-                                else { dead.push(eid); }
+                                if a.pierce > 0 {
+                                    a.pierce -= 1;
+                                    a.last_hit = c.eid;
+                                } else {
+                                    dead.push(eid);
+                                }
                                 break 'p2;
                             }
                         }
@@ -2010,46 +3247,107 @@ fn arrow_tick() {
             } else {
                 let cls: Vec<Arc<Client>> = client_snapshot();
                 for c in cls.iter() {
-                    let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
+                    let (px, py, pz, ..) = {
+                        let p = c.pos.lock().unwrap();
+                        *p
+                    };
                     // player hitbox ~0.6 wide, 1.8 tall
-                    if (px-ax).abs() < 0.7 && (pz-az).abs() < 0.7 && ay > py - 0.3 && ay < py + 2.0 {
-                        hits.push((c.eid, a.dmg)); dead.push(eid); break;
+                    if (px - ax).abs() < 0.7
+                        && (pz - az).abs() < 0.7
+                        && ay > py - 0.3
+                        && ay < py + 2.0
+                    {
+                        hits.push((c.eid, a.dmg));
+                        dead.push(eid);
+                        break;
                     }
                 }
             }
         }
         // thrown tridents land as pickupable drops; loyalty returns at owner's feet
-        let landed: Vec<(i32, f64, f64, f64, i64, i64, Comps)> = ar.iter()
+        let landed: Vec<(i32, f64, f64, f64, i64, i64, Comps)> = ar
+            .iter()
             .filter(|a| dead.contains(&a.eid) && a.ret_item > 0)
-            .map(|a| (a.owner, a.x, a.y, a.z, a.loy, a.ret_item, a.ret_comps.clone())).collect();
+            .map(|a| {
+                (
+                    a.owner,
+                    a.x,
+                    a.y,
+                    a.z,
+                    a.loy,
+                    a.ret_item,
+                    a.ret_comps.clone(),
+                )
+            })
+            .collect();
         ar.retain(|a| !dead.contains(&a.eid));
         for (ow, lx, ly, lz, loy, ri, rc) in landed {
             let (tx, ty, tz) = if loy > 0 {
-                clients().lock().unwrap().iter().find(|c| c.eid == ow)
-                    .map(|c| { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) })
+                clients()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c.eid == ow)
+                    .map(|c| {
+                        let p = c.pos.lock().unwrap();
+                        (p.0, p.1, p.2)
+                    })
                     .unwrap_or((lx, ly, lz))
-            } else { (lx, ly, lz) };
-            drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                x: tx, y: ty, z: tz, item: ri, cnt: 1, comps: rc, age: 0 });
+            } else {
+                (lx, ly, lz)
+            };
+            drops().lock().unwrap().push(Drop {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                x: tx,
+                y: ty,
+                z: tz,
+                item: ri,
+                cnt: 1,
+                comps: rc,
+                age: 0,
+            });
         }
     }
-    for (deid, etype, mx, my, mz) in mob_dead { kill_mob(deid, etype, mx, my, mz); }
+    for (deid, etype, mx, my, mz) in mob_dead {
+        kill_mob(deid, etype, mx, my, mz);
+    }
     for eid in &dead {
         broadcast_seen_destroy(*eid);
     }
     for (veid, admg) in hits {
         let cls: Vec<Arc<Client>> = client_snapshot();
         if let Some(c) = cls.iter().find(|c| c.eid == veid) {
-            if *c.gm.lock().unwrap() == 1 { continue }
+            if *c.gm.lock().unwrap() == 1 {
+                continue;
+            }
             let mut h = c.hp.lock().unwrap();
-            if c.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) { continue }
+            if c.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) {
+                continue;
+            }
             *c.hurt_at.lock().unwrap() = Instant::now();
-            let blocked_ar = *c.blocking.lock().unwrap() && c.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5);
-            if blocked_ar { damage_shield(c, admg); }
+            let blocked_ar = *c.blocking.lock().unwrap()
+                && c.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5);
+            if blocked_ar {
+                damage_shield(c, admg);
+            }
             let ad = if blocked_ar { 0.0 } else { admg };
-            *h = (*h - if ad > 0.0 { hurt_absorb(c, dmg_after(c, ad, 0)) } else { 0.0 }).max(0.0); if *h <= 0.0 { drop(h); totem_check(c); h = c.hp.lock().unwrap(); }
-            let hh = *h; drop(h);
-            if ad > 0.0 { damage_armor(c, ad); }
+            *h = (*h
+                - if ad > 0.0 {
+                    hurt_absorb(c, dmg_after(c, ad, 0))
+                } else {
+                    0.0
+                })
+            .max(0.0);
+            if *h <= 0.0 {
+                drop(h);
+                totem_check(c);
+                h = c.hp.lock().unwrap();
+            }
+            let hh = *h;
+            drop(h);
+            if ad > 0.0 {
+                damage_armor(c, ad);
+            }
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut *w, 0x24, hurt_anim(veid));
                 let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, c));
@@ -2066,36 +3364,55 @@ fn arrow_tick() {
 }
 fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
     let (bx, by, bz) = (ex.floor() as i32, ey.floor() as i32, ez.floor() as i32);
-    let mut offs: Vec<(i8,i8,i8)> = Vec::new();
-    for dx in -2..=2 { for dy in -1..=2 { for dz in -2..=2 {
-        if dx*dx+dy*dy+dz*dz <= 5 {
-            let (tx, ty, tz) = (bx+dx as i32, by+dy as i32, bz+dz as i32);
-            // vanilla: TNT destroyed by an explosion primes itself —
-            // short fuse (0.5-1.5s), this is what makes chains work
-            if (2094..=2095).contains(&block_at(tx, ty, tz)) {
-                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                let jitter = ((tx.wrapping_mul(31) ^ tz.wrapping_mul(17) ^ ty) & 0x3ff) as u64;
-                primed().lock().unwrap().push(Primed {
-                    eid, x: tx as f64 + 0.5, y: ty as f64, z: tz as f64 + 0.5,
-                    left: chain_fuse_left(jitter) as i32,
-                });
+    let mut offs: Vec<(i8, i8, i8)> = Vec::new();
+    for dx in -2..=2 {
+        for dy in -1..=2 {
+            for dz in -2..=2 {
+                if dx * dx + dy * dy + dz * dz <= 5 {
+                    let (tx, ty, tz) = (bx + dx as i32, by + dy as i32, bz + dz as i32);
+                    // vanilla: TNT destroyed by an explosion primes itself —
+                    // short fuse (0.5-1.5s), this is what makes chains work
+                    if (2094..=2095).contains(&block_at(tx, ty, tz)) {
+                        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                        let jitter =
+                            ((tx.wrapping_mul(31) ^ tz.wrapping_mul(17) ^ ty) & 0x3ff) as u64;
+                        primed().lock().unwrap().push(Primed {
+                            eid,
+                            x: tx as f64 + 0.5,
+                            y: ty as f64,
+                            z: tz as f64 + 0.5,
+                            left: chain_fuse_left(jitter) as i32,
+                        });
+                    }
+                    offs.push((dx as i8, dy as i8, dz as i8));
+                    set_block(tx, ty, tz, 0);
+                }
             }
-            offs.push((dx as i8, dy as i8, dz as i8));
-            set_block(tx, ty, tz, 0);
         }
-    }}}
+    }
     broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
     let cs: Vec<Arc<Client>> = client_snapshot();
     for cl in cs {
-        let (px,py,pz,..) = { let p = cl.pos.lock().unwrap(); *p };
-        let dd = ((px-ex).powi(2)+(py-ey).powi(2)+(pz-ez).powi(2)).sqrt();
-        if dd < power*1.5 && *cl.gm.lock().unwrap() != 1 {
-            if cl.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) { continue }
+        let (px, py, pz, ..) = {
+            let p = cl.pos.lock().unwrap();
+            *p
+        };
+        let dd = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
+        if dd < power * 1.5 && *cl.gm.lock().unwrap() != 1 {
+            if cl.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) {
+                continue;
+            }
             *cl.hurt_at.lock().unwrap() = Instant::now();
             let mut h = cl.hp.lock().unwrap();
-            let raw = ((power*1.5-dd)*3.0) as f32;
-            *h = (*h - hurt_absorb(&*cl, dmg_after(&*cl, raw, 2))).max(0.0); if *h <= 0.0 { drop(h); totem_check(&*cl); h = cl.hp.lock().unwrap(); }
-            let hh = *h; drop(h);
+            let raw = ((power * 1.5 - dd) * 3.0) as f32;
+            *h = (*h - hurt_absorb(&*cl, dmg_after(&*cl, raw, 2))).max(0.0);
+            if *h <= 0.0 {
+                drop(h);
+                totem_check(&*cl);
+                h = cl.hp.lock().unwrap();
+            }
+            let hh = *h;
+            drop(h);
             damage_armor(&cl, raw);
             if let Ok(mut w) = cl.sock.lock() {
                 let _ = send_packet(&mut *w, 0x24, hurt_anim(cl.eid));
@@ -2114,8 +3431,14 @@ fn primed_tick() {
         while i < pl.len() {
             if !region.is_hot(pl[i].x as i32, pl[i].z as i32) {
                 i += 1; // fuse pauses while cold: no tick, no decrement
-            } else if { pl[i].left -= 1; pl[i].left <= 0 } { boom.push(pl.remove(i)); }
-            else { i += 1; }
+            } else if {
+                pl[i].left -= 1;
+                pl[i].left <= 0
+            } {
+                boom.push(pl.remove(i));
+            } else {
+                i += 1;
+            }
         }
     }
     for p in boom {
@@ -2126,13 +3449,17 @@ fn primed_tick() {
 
 fn furnace_tick() {
     let mut fs = furnaces().lock().unwrap();
-    if fs.is_empty() { return }
-    let mut dirty_pos: Vec<(i32,i32,i32)> = Vec::new();
+    if fs.is_empty() {
+        return;
+    }
+    let mut dirty_pos: Vec<(i32, i32, i32)> = Vec::new();
     // One region borrow for the whole loop. Acquiring the mutex per furnace was
     // what dominated this stage, not the set lookup itself.
     let region = region_guard();
     for (pos, f) in fs.iter_mut() {
-        if !region.is_warm(pos.0, pos.2) { continue }
+        if !region.is_warm(pos.0, pos.2) {
+            continue;
+        }
         // The recipe result is only ever read behind `input.1 > 0`, so an empty
         // input skips the lookup instead of hashing an item it cannot smelt.
         let out = if f.input.1 > 0 {
@@ -2140,18 +3467,33 @@ fn furnace_tick() {
             // resolved once per revision instead of scanning every datapack recipe
             // for every furnace on every tick.
             let rev = content_revision();
-            f.recipe_cache.get_or_compute((f.input.0, rev), || smelt_out(f.input.0))
-        } else { None };
+            f.recipe_cache
+                .get_or_compute((f.input.0, rev), || smelt_out(f.input.0))
+        } else {
+            None
+        };
         // A smelt output never carries components, so an output stack holding any
         // cannot be merged with one.
-        let can_smelt = f.input.1 > 0 && out.as_ref().map(|o|
-            f.output.1 == 0 || (f.output.0 == o.0 && f.output.2.is_empty() && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))).unwrap_or(false);
+        let can_smelt = f.input.1 > 0
+            && out
+                .as_ref()
+                .map(|o| {
+                    f.output.1 == 0
+                        || (f.output.0 == o.0
+                            && f.output.2.is_empty()
+                            && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))
+                })
+                .unwrap_or(false);
         if f.burn_left <= 0 && can_smelt && f.fuel.1 > 0 {
-            let t = f.fuel_cache.get_or_compute(f.fuel.0, || fuel_ticks(f.fuel.0));
+            let t = f
+                .fuel_cache
+                .get_or_compute(f.fuel.0, || fuel_ticks(f.fuel.0));
             if t > 0 {
                 f.burn_left = t;
                 f.fuel.1 -= 1;
-                if f.fuel.1 == 0 { f.fuel = (0, 0, Vec::new()); }
+                if f.fuel.1 == 0 {
+                    f.fuel = (0, 0, Vec::new());
+                }
                 f.dirty = true;
             }
         }
@@ -2164,24 +3506,33 @@ fn furnace_tick() {
                 f.xp += smelt_xp(f.input.0);
                 f.output = (r.0, f.output.1 + r.1, f.output.2.clone());
                 f.input.1 -= 1;
-                if f.input.1 == 0 { f.input = (0, 0, Vec::new()); }
+                if f.input.1 == 0 {
+                    f.input = (0, 0, Vec::new());
+                }
                 f.dirty = true;
             }
         } else if f.progress > 0 {
             f.progress -= 1;
         }
-        if f.dirty { f.dirty = false; dirty_pos.push(*pos); }
+        if f.dirty {
+            f.dirty = false;
+            dirty_pos.push(*pos);
+        }
     }
     drop(region);
     drop(fs);
-    if dirty_pos.is_empty() { return }
+    if dirty_pos.is_empty() {
+        return;
+    }
     let cs: Vec<Arc<Client>> = client_snapshot();
     for c in cs {
         let fp = *c.open_furnace.lock().unwrap();
         if let Some(fp) = fp {
             if dirty_pos.contains(&fp) {
                 let inv = c.inv.lock().unwrap().clone();
-                if let Ok(mut w) = c.sock.lock() { furnace_push_items(&mut *w, fp, &inv); }
+                if let Ok(mut w) = c.sock.lock() {
+                    furnace_push_items(&mut *w, fp, &inv);
+                }
             }
         }
     }
@@ -2189,13 +3540,23 @@ fn furnace_tick() {
 
 // minimal redstone: lever powers 6 adjacent cells -> iron door opens/closes, piston pushes one block
 fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
-    for (dx, dy, dz) in [(1i32,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
+    for (dx, dy, dz) in [
+        (1i32, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
         let (bx, by, bz) = (x + dx, y + dy, z + dz);
         let st = block_at(bx, by, bz);
-        if (5652..=5715).contains(&st) { // iron door: open while powered (both halves)
+        if (5652..=5715).contains(&st) {
+            // iron door: open while powered (both halves)
             for oy in [-1i32, 0, 1] {
                 let hst = block_at(bx, by + oy, bz);
-                if !(5652..=5715).contains(&hst) { continue }
+                if !(5652..=5715).contains(&hst) {
+                    continue;
+                }
                 let open_now = (hst - 5652) & 2 == 0;
                 if open_now != powered {
                     let nst = if powered { hst & !2 } else { hst | 2 };
@@ -2205,11 +3566,19 @@ fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
             }
             continue;
         }
-        if (2011..=2022).contains(&st) { // piston
+        if (2011..=2022).contains(&st) {
+            // piston
             let off = st - 2011; // 0-5=extended, 6-11=retracted
             let facing = (off % 6) as i32; // 0 n,1 e,2 s,3 w,4 up,5 down
             let extended = off < 6;
-            let (fx, fy, fz) = match facing { 0 => (0,0,-1), 1 => (1,0,0), 2 => (0,0,1), 3 => (-1,0,0), 4 => (0,1,0), _ => (0,-1,0) };
+            let (fx, fy, fz) = match facing {
+                0 => (0, 0, -1),
+                1 => (1, 0, 0),
+                2 => (0, 0, 1),
+                3 => (-1, 0, 0),
+                4 => (0, 1, 0),
+                _ => (0, -1, 0),
+            };
             let (px, py, pz) = (bx + fx, by + fy, bz + fz);
             if powered && !extended {
                 let nst = st - 6;
@@ -2240,15 +3609,22 @@ fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
     }
 }
 static HOPPERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn hoppers() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { HOPPERS.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
+fn hoppers() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
+    HOPPERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 fn ender_key(uuid: &[u8; 16]) -> (i32, i32, i32) {
-    (20000000 + (u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]) & 0xfffff) as i32, 310,
-     (u32::from_be_bytes([uuid[4], uuid[5], uuid[6], uuid[7]]) & 0xfffff) as i32)
+    (
+        20000000 + (u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]) & 0xfffff) as i32,
+        310,
+        (u32::from_be_bytes([uuid[4], uuid[5], uuid[6], uuid[7]]) & 0xfffff) as i32,
+    )
 }
 // ---------- fake players (carpet-actor equivalent for parity fixtures) ----------
 struct Actor {
-    #[allow(dead_code)] name: String,
-    #[allow(dead_code)] eid: i32,
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    eid: i32,
     pos: Mutex<(f64, f64, f64)>,
     look: Mutex<Option<(i32, i32, i32)>>,
     action: Mutex<&'static str>, // "" | "attack" | "use"
@@ -2256,7 +3632,9 @@ struct Actor {
     inv: Mutex<HashMap<i16, Stack>>,
 }
 static ACTORS: OnceLock<Mutex<HashMap<String, Arc<Actor>>>> = OnceLock::new();
-fn actors() -> &'static Mutex<HashMap<String, Arc<Actor>>> { ACTORS.get_or_init(|| Mutex::new(HashMap::new())) }
+fn actors() -> &'static Mutex<HashMap<String, Arc<Actor>>> {
+    ACTORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 fn actor_tick() {
     let acts: Vec<Arc<Actor>> = actors().lock().unwrap().values().cloned().collect();
     for a in acts {
@@ -2269,8 +3647,17 @@ fn actor_tick() {
                     let st = block_at(tx, ty, tz);
                     if st != 0 {
                         for it in block_drops(st) {
-                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: tx as f64 + 0.5, y: ty as f64 + 0.4, z: tz as f64 + 0.5, item: it, cnt: 1, comps: Vec::new(), age: 0 };
-                                                        drops().lock().unwrap().push(d);
+                            let d = Drop {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: tx as f64 + 0.5,
+                                y: ty as f64 + 0.4,
+                                z: tz as f64 + 0.5,
+                                item: it,
+                                cnt: 1,
+                                comps: Vec::new(),
+                                age: 0,
+                            };
+                            drops().lock().unwrap().push(d);
                             // spawn streams via interest_tick
                         }
                         set_block(tx, ty, tz, 0);
@@ -2280,14 +3667,22 @@ fn actor_tick() {
                 "use" => {
                     // place held block on the target face toward the actor (dominant horizontal axis)
                     let (hx, hz) = (ax - tx as f64, az - tz as f64);
-                    let (ox, oz) = if hx.abs() >= hz.abs() { (hx.signum() as i32, 0) } else { (0, hz.signum() as i32) };
+                    let (ox, oz) = if hx.abs() >= hz.abs() {
+                        (hx.signum() as i32, 0)
+                    } else {
+                        (0, hz.signum() as i32)
+                    };
                     let (px, py, pz) = (tx + ox, ty, tz + oz);
                     let (item, cnt, _hc) = a.held.lock().unwrap().clone();
                     if item != 0 && cnt > 0 && block_at(px, py, pz) == 0 {
                         if let Some(st) = item_to_state(item) {
                             set_block(px, py, pz, st);
                             note_block_update(px, py, pz, st);
-                            let mut h = a.held.lock().unwrap(); h.1 = h.1.saturating_sub(1); if h.1 == 0 { h.0 = 0; }
+                            let mut h = a.held.lock().unwrap();
+                            h.1 = h.1.saturating_sub(1);
+                            if h.1 == 0 {
+                                h.0 = 0;
+                            }
                         }
                     }
                 }
@@ -2302,25 +3697,38 @@ fn actor_tick() {
             let mut shrunk: Vec<(i32, Vec<u8>)> = vec![];
             for d in ds.iter_mut() {
                 // vanilla: freshly spawned/thrown drops can't be picked up for ~10 ticks
-                if d.age < server_ticks(PICKUP_DELAY_GT) as i32 { continue }
+                if d.age < server_ticks(PICKUP_DELAY_GT) as i32 {
+                    continue;
+                }
                 if (d.x - ax).powi(2) + (d.y - ay).powi(2) + (d.z - az).powi(2) < 2.25 {
                     // vanilla takes the whole stack; a mergeable slot is
                     // filled to 64 and the entity keeps the remainder
                     let smax = item_stack_max(d.item, &d.comps) as u8;
-                    let slot = inv.iter().find(|(_, v)| v.0 == d.item && v.1 < smax && v.2 == d.comps).map(|(k, _)| *k)
+                    let slot = inv
+                        .iter()
+                        .find(|(_, v)| v.0 == d.item && v.1 < smax && v.2 == d.comps)
+                        .map(|(k, _)| *k)
                         .or_else(|| (0..36i16).find(|sl| !inv.contains_key(sl)));
                     let Some(slot) = slot else { continue }; // full inv -> item stays
                     let cur = inv.get(&slot).map(|v| v.1).unwrap_or(0);
                     let room = (smax - cur).min(d.cnt);
                     inv.insert(slot, (d.item, cur + room, d.comps.clone()));
                     d.cnt -= room;
-                    if d.cnt == 0 { gone.push(d.eid); }
-                    else { shrunk.push((d.eid, drop_meta_pkt(d))); }
+                    if d.cnt == 0 {
+                        gone.push(d.eid);
+                    } else {
+                        shrunk.push((d.eid, drop_meta_pkt(d)));
+                    }
                 }
             }
             drop(inv);
-            for e in gone { ds.retain(|d| d.eid != e); broadcast_seen_destroy(e); }
-            for (eid, pkt) in shrunk { broadcast_seen(eid, move |_c| (0x58, pkt.clone())); }
+            for e in gone {
+                ds.retain(|d| d.eid != e);
+                broadcast_seen_destroy(e);
+            }
+            for (eid, pkt) in shrunk {
+                broadcast_seen(eid, move |_c| (0x58, pkt.clone()));
+            }
         }
     }
 }
@@ -2330,14 +3738,26 @@ fn actor_tick() {
 fn water_washable(st: u32) -> bool {
     matches!(st, 2005..=2016 | 2075..=2090 | 2355..=2359 | 4278..=4285 | 5772..=5779 | 5799..=5814)
 }
-fn water_intoable(st: u32) -> bool { st == 0 || water_washable(st) }
+fn water_intoable(st: u32) -> bool {
+    st == 0 || water_washable(st)
+}
 
 fn wash_away(x: i32, y: i32, z: i32) {
     let st = block_at(x, y, z);
-    if !water_washable(st) { return }
+    if !water_washable(st) {
+        return;
+    }
     for item in block_drops(st) {
-        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x: x as f64 + 0.5, y: y as f64 + 0.4, z: z as f64 + 0.5, item, cnt: 1, comps: Vec::new(), age: 0 };
+        let d = Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: x as f64 + 0.5,
+            y: y as f64 + 0.4,
+            z: z as f64 + 0.5,
+            item,
+            cnt: 1,
+            comps: Vec::new(),
+            age: 0,
+        };
         drops().lock().unwrap().push(d);
     }
 }
@@ -2347,10 +3767,22 @@ fn wash_away(x: i32, y: i32, z: i32) {
 // into flowing lava makes cobblestone.
 fn solidify_on_contact(lx: i32, ly: i32, lz: i32, lava_lvl: u32) -> bool {
     let mut hit = false;
-    for (dx, dy, dz) in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
-        if (80..=95).contains(&block_at(lx + dx, ly + dy, lz + dz)) { hit = true; break }
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        if (80..=95).contains(&block_at(lx + dx, ly + dy, lz + dz)) {
+            hit = true;
+            break;
+        }
     }
-    if !hit { return false }
+    if !hit {
+        return false;
+    }
     let st = if lava_lvl == 0 { 2354 } else { 14 }; // obsidian / cobblestone
     set_block(lx, ly, lz, st);
     note_block_update(lx, ly, lz, st);
@@ -2363,13 +3795,24 @@ fn lava_tick() {
     // every 6th tick lands near 30gt.
     // Only the cells that come due are visited; a backed-off cell costs nothing.
     // Every exit re-queues except removal from the registry.
-    let due = { let mut q = lava_queue().lock().unwrap(); q.due() };
-    if due.is_empty() { return }
+    let due = {
+        let mut q = lava_queue().lock().unwrap();
+        q.due()
+    };
+    if due.is_empty() {
+        return;
+    }
     let region = region_guard();
     for (x, y, z) in due {
-        if !region.is_warm(x, z) || !sched_ready(x, y, z) { requeue_lava(x, y, z); continue }
+        if !region.is_warm(x, z) || !sched_ready(x, y, z) {
+            requeue_lava(x, y, z);
+            continue;
+        }
         let st = block_at(x, y, z);
-        if !(96..=111).contains(&st) { lavas().lock().unwrap().remove(&(x, y, z)); continue; }
+        if !(96..=111).contains(&st) {
+            lavas().lock().unwrap().remove(&(x, y, z));
+            continue;
+        }
         let lvl = st - 96;
         if water_intoable(block_at(x, y - 1, z)) {
             if !solidify_on_contact(x, y - 1, z, 8) {
@@ -2381,9 +3824,13 @@ fn lava_tick() {
             requeue_lava(x, y, z);
             continue;
         }
-        if lvl >= 3 || (8..=15).contains(&lvl) { sched_result(x, y, z, false); requeue_lava(x, y, z); continue }
+        if lvl >= 3 || (8..=15).contains(&lvl) {
+            sched_result(x, y, z, false);
+            requeue_lava(x, y, z);
+            continue;
+        }
         let mut spread = false;
-        for (dx, dz) in [(1,0),(-1,0),(0,1),(0,-1)] {
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             if water_intoable(block_at(x + dx, y, z + dz)) && block_at(x + dx, y - 1, z + dz) != 0 {
                 if !solidify_on_contact(x + dx, y, z + dz, lvl + 1) {
                     wash_away(x + dx, y, z + dz);
@@ -2403,13 +3850,24 @@ fn water_tick() {
     // Only the cells that come due are visited, so a tick costs the cells that
     // need work rather than every cell that exists. Every exit below re-queues the
     // cell for its next visit, except removal from the registry, which drops it.
-    let due = { let mut q = water_queue().lock().unwrap(); q.due() };
-    if due.is_empty() { return }
+    let due = {
+        let mut q = water_queue().lock().unwrap();
+        q.due()
+    };
+    if due.is_empty() {
+        return;
+    }
     let region = region_guard();
     for (x, y, z) in due {
-        if !region.is_warm(x, z) || !sched_ready(x, y, z) { requeue_water(x, y, z); continue }
+        if !region.is_warm(x, z) || !sched_ready(x, y, z) {
+            requeue_water(x, y, z);
+            continue;
+        }
         let st = block_at(x, y, z);
-        if !(80..=95).contains(&st) { waters().lock().unwrap().remove(&(x, y, z)); continue; }
+        if !(80..=95).contains(&st) {
+            waters().lock().unwrap().remove(&(x, y, z));
+            continue;
+        }
         let lvl = st - 80;
         let below = block_at(x, y - 1, z);
         if (96..=111).contains(&below) {
@@ -2420,7 +3878,8 @@ fn water_tick() {
             requeue_water(x, y, z);
             continue;
         }
-        if water_intoable(below) { // falls downward as level-8 falling water
+        if water_intoable(below) {
+            // falls downward as level-8 falling water
             wash_away(x, y - 1, z);
             set_block(x, y - 1, z, 88);
             note_block_update(x, y - 1, z, 88);
@@ -2428,9 +3887,13 @@ fn water_tick() {
             requeue_water(x, y, z);
             continue;
         }
-        if lvl >= 7 { sched_result(x, y, z, false); requeue_water(x, y, z); continue }
+        if lvl >= 7 {
+            sched_result(x, y, z, false);
+            requeue_water(x, y, z);
+            continue;
+        }
         let mut spread = false;
-        for (dx, dz) in [(1,0),(-1,0),(0,1),(0,-1)] {
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             let cst = block_at(x + dx, y, z + dz);
             if (96..=111).contains(&cst) {
                 // water flowing into lava: source -> obsidian, flowing -> cobble
@@ -2453,13 +3916,17 @@ fn water_tick() {
     }
 }
 static OBS_UNPOWER: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn obs_unpower() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { OBS_UNPOWER.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
+fn obs_unpower() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
+    OBS_UNPOWER.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 fn observer_tick() {
     let region = region_guard();
     // phase 1: unpower last tick's pulsers
     let ups: Vec<(i32, i32, i32)> = obs_unpower().lock().unwrap().drain().collect();
     for (bx, by, bz) in ups {
-        if !region.is_hot(bx, bz) { continue }
+        if !region.is_hot(bx, bz) {
+            continue;
+        }
         let st = block_at(bx, by, bz);
         if (12550..=12561).contains(&st) && (st - 12550) / 6 == 1 {
             let nst = st - 6;
@@ -2470,9 +3937,13 @@ fn observer_tick() {
     // phase 2: this tick's detections -> power on (the powered state IS the output)
     let ps: Vec<(i32, i32, i32)> = obs_pulse().lock().unwrap().drain().collect();
     for (bx, by, bz) in ps {
-        if !region.is_hot(bx, bz) { continue }
+        if !region.is_hot(bx, bz) {
+            continue;
+        }
         let st = block_at(bx, by, bz);
-        if !(12550..=12561).contains(&st) || (st - 12550) / 6 == 1 { continue }
+        if !(12550..=12561).contains(&st) || (st - 12550) / 6 == 1 {
+            continue;
+        }
         let fi = (st - 12550) % 6;
         let nst = 12550 + 6 + fi;
         set_block(bx, by, bz, nst);
@@ -2484,23 +3955,52 @@ fn hopper_tick() {
     // Only the hoppers that come due are visited, so a tick costs the hoppers
     // that need work rather than every hopper that exists. Every exit re-queues
     // except removal from the registry.
-    let due = { let mut q = hopper_queue().lock().unwrap(); q.due() };
-    if due.is_empty() { return }
+    let due = {
+        let mut q = hopper_queue().lock().unwrap();
+        q.due()
+    };
+    if due.is_empty() {
+        return;
+    }
     let region = region_guard();
     for (hx, hy, hz) in due {
-        if !region.is_warm(hx, hz) || !sched_ready(hx, hy, hz) { requeue_hopper(hx, hy, hz); continue }
+        if !region.is_warm(hx, hz) || !sched_ready(hx, hy, hz) {
+            requeue_hopper(hx, hy, hz);
+            continue;
+        }
         let st = block_at(hx, hy, hz);
-        if !(9225..=9234).contains(&st) { hoppers().lock().unwrap().remove(&(hx, hy, hz)); continue; }
-        if st >= 9230 { sched_result(hx, hy, hz, false); requeue_hopper(hx, hy, hz); continue; } // powered(disabled) hopper holds items
+        if !(9225..=9234).contains(&st) {
+            hoppers().lock().unwrap().remove(&(hx, hy, hz));
+            continue;
+        }
+        if st >= 9230 {
+            sched_result(hx, hy, hz, false);
+            requeue_hopper(hx, hy, hz);
+            continue;
+        } // powered(disabled) hopper holds items
         let facing = st - 9225; // 0 down,1 n,2 s,3 w,4 e
-        let (dx, dy, dz) = match facing { 0 => (0, -1, 0), 1 => (0, 0, -1), 2 => (0, 0, 1), 3 => (-1, 0, 0), _ => (1, 0, 0) };
+        let (dx, dy, dz) = match facing {
+            0 => (0, -1, 0),
+            1 => (0, 0, -1),
+            2 => (0, 0, 1),
+            3 => (-1, 0, 0),
+            _ => (1, 0, 0),
+        };
         let dst = (hx + dx, hy + dy, hz + dz);
-        if container_kind(block_at(dst.0, dst.1, dst.2)).is_none() { sched_result(hx, hy, hz, false); requeue_hopper(hx, hy, hz); continue; }
+        if container_kind(block_at(dst.0, dst.1, dst.2)).is_none() {
+            sched_result(hx, hy, hz, false);
+            requeue_hopper(hx, hy, hz);
+            continue;
+        }
         let mut did = false;
         // push one item from the hopper's own inventory toward facing container
         {
             let mut all = chests().lock().unwrap();
-            let own = all.get(&(hx, hy, hz)).and_then(|m| m.iter().find(|(_, v)| v.1 > 0).map(|(k, v)| (*k, v.clone())));
+            let own = all.get(&(hx, hy, hz)).and_then(|m| {
+                m.iter()
+                    .find(|(_, v)| v.1 > 0)
+                    .map(|(k, v)| (*k, v.clone()))
+            });
             if let Some((k, (it, _, _cc))) = own {
                 let smax = item_stack_max(it, &_cc) as u8;
                 // vanilla merges double chests — push spills to the
@@ -2508,13 +4008,21 @@ fn hopper_tick() {
                 let dsts = [dst, chest_partner(dst.0, dst.1, dst.2).unwrap_or(dst)];
                 for dp in dsts {
                     let dstm = all.entry(dp).or_default();
-                    let slot = dstm.iter().find(|(_, v)| v.0 == it && v.2 == _cc && v.1 < smax).map(|(s2, _)| *s2)
+                    let slot = dstm
+                        .iter()
+                        .find(|(_, v)| v.0 == it && v.2 == _cc && v.1 < smax)
+                        .map(|(s2, _)| *s2)
                         .or_else(|| (0..27i16).find(|sl| !dstm.contains_key(sl)));
                     let Some(slot) = slot else { continue }; // full -> try partner
                     let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
                     dstm.insert(slot, (it, cur + 1, _cc.clone()));
                     if let Some(sm) = all.get_mut(&(hx, hy, hz)) {
-                        if let Some(v) = sm.get_mut(&k) { v.1 -= 1; if v.1 == 0 { sm.remove(&k); } }
+                        if let Some(v) = sm.get_mut(&k) {
+                            v.1 -= 1;
+                            if v.1 == 0 {
+                                sm.remove(&k);
+                            }
+                        }
                     }
                     did = true;
                     break;
@@ -2528,20 +4036,38 @@ fn hopper_tick() {
                 let mut all = chests().lock().unwrap();
                 // vanilla merges double chests into one container — a
                 // hopper under either half can pull from both
-                let srcs: [(i32, i32, i32); 2] = [src, chest_partner(src.0, src.1, src.2).unwrap_or(src)];
-                let item = srcs.iter().filter_map(|sp| all.get(sp)
-                    .and_then(|ch| ch.iter().find(|(_, v)| v.1 > 0).map(|(k, v)| (*k, v.clone())).map(|kv| (*sp, kv))))
+                let srcs: [(i32, i32, i32); 2] =
+                    [src, chest_partner(src.0, src.1, src.2).unwrap_or(src)];
+                let item = srcs
+                    .iter()
+                    .filter_map(|sp| {
+                        all.get(sp).and_then(|ch| {
+                            ch.iter()
+                                .find(|(_, v)| v.1 > 0)
+                                .map(|(k, v)| (*k, v.clone()))
+                                .map(|kv| (*sp, kv))
+                        })
+                    })
                     .next();
                 if let Some((srcp, (k, (it, c, _xc)))) = item {
                     let smax = item_stack_max(it, &_xc) as u8;
                     let dstm = all.entry(dst).or_default();
-                    let slot = dstm.iter().find(|(_, v)| v.0 == it && v.2 == _xc && v.1 < smax).map(|(s, _)| *s)
-                        .unwrap_or_else(|| (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0));
+                    let slot = dstm
+                        .iter()
+                        .find(|(_, v)| v.0 == it && v.2 == _xc && v.1 < smax)
+                        .map(|(s, _)| *s)
+                        .unwrap_or_else(|| {
+                            (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0)
+                        });
                     let nc = dstm.get(&slot).map(|v| v.1).unwrap_or(0) + 1;
                     if nc <= smax {
                         dstm.insert(slot, (it, nc, _xc.clone()));
                         if let Some(srcm) = all.get_mut(&srcp) {
-                            if c <= 1 { srcm.remove(&k); } else { srcm.insert(k, (it, c - 1, _xc.clone())); }
+                            if c <= 1 {
+                                srcm.remove(&k);
+                            } else {
+                                srcm.insert(k, (it, c - 1, _xc.clone()));
+                            }
                         }
                         did = true;
                     }
@@ -2550,20 +4076,39 @@ fn hopper_tick() {
             // absorb drop entities resting on the hopper into the destination chest
             let absorbed: Vec<(i32, i64, Comps)> = {
                 let dl = drops().lock().unwrap();
-                dl.iter().filter(|d| (d.x - (hx as f64 + 0.5)).abs() < 0.7 && d.y > hy as f64 + 0.4 && d.y < hy as f64 + 1.6 && (d.z - (hz as f64 + 0.5)).abs() < 0.7)
-                    .map(|d| (d.eid, d.item, d.comps.clone())).collect()
+                dl.iter()
+                    .filter(|d| {
+                        (d.x - (hx as f64 + 0.5)).abs() < 0.7
+                            && d.y > hy as f64 + 0.4
+                            && d.y < hy as f64 + 1.6
+                            && (d.z - (hz as f64 + 0.5)).abs() < 0.7
+                    })
+                    .map(|d| (d.eid, d.item, d.comps.clone()))
+                    .collect()
             };
             for (deid, item, dcp) in absorbed {
-                { let mut all = chests().lock().unwrap();
+                {
+                    let mut all = chests().lock().unwrap();
                     let smax = item_stack_max(item, &dcp) as u8;
                     let dstm = all.entry(dst).or_default();
-                    let slot = dstm.iter().find(|(_, v)| v.0 == item && v.2 == dcp && v.1 < smax).map(|(s, _)| *s)
-                        .unwrap_or_else(|| (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0));
+                    let slot = dstm
+                        .iter()
+                        .find(|(_, v)| v.0 == item && v.2 == dcp && v.1 < smax)
+                        .map(|(s, _)| *s)
+                        .unwrap_or_else(|| {
+                            (0..27i16).find(|sl| !dstm.contains_key(sl)).unwrap_or(0)
+                        });
                     let nc = dstm.get(&slot).map(|v| v.1).unwrap_or(0) + 1;
-                    if nc <= smax { dstm.insert(slot, (item, nc, dcp)); } else { continue; }
+                    if nc <= smax {
+                        dstm.insert(slot, (item, nc, dcp));
+                    } else {
+                        continue;
+                    }
                 }
                 drops().lock().unwrap().retain(|d| d.eid != deid);
-                let mut p = Vec::new(); write_varint(&mut p, 1); write_varint(&mut p, deid as i64);
+                let mut p = Vec::new();
+                write_varint(&mut p, 1);
+                write_varint(&mut p, deid as i64);
                 broadcast_seen(deid, |_c| (0x42, p.clone()));
                 did = true;
             }
@@ -2577,13 +4122,23 @@ fn drop_tick() {
     // player within 1.3 blocks picks up the drop
     let mut taken: Vec<(i32, i32, Stack)> = vec![]; // (drop_eid, collector_eid, stack)
     {
-        let ds: Vec<(i32,f64,f64,f64,Stack)> = drops().lock().unwrap().iter().map(|d| (d.eid,d.x,d.y,d.z,(d.item,d.cnt,d.comps.clone()))).collect();
+        let ds: Vec<(i32, f64, f64, f64, Stack)> = drops()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| (d.eid, d.x, d.y, d.z, (d.item, d.cnt, d.comps.clone())))
+            .collect();
         let cls: Vec<Arc<Client>> = client_snapshot();
         for (d_eid, dx, dy, dz, d_stk) in ds.iter() {
-            if !region.is_hot(*dx as i32, *dz as i32) { continue }
+            if !region.is_hot(*dx as i32, *dz as i32) {
+                continue;
+            }
             for c in cls.iter() {
-                let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
-                if (px-dx).powi(2)+(py-dy).powi(2)+(pz-dz).powi(2) < 1.69 {
+                let (px, py, pz, ..) = {
+                    let p = c.pos.lock().unwrap();
+                    *p
+                };
+                if (px - dx).powi(2) + (py - dy).powi(2) + (pz - dz).powi(2) < 1.69 {
                     taken.push((*d_eid, c.eid, d_stk.clone()));
                     break;
                 }
@@ -2598,8 +4153,11 @@ fn drop_tick() {
             let cls: Vec<Arc<Client>> = client_snapshot();
             for x in xs.iter() {
                 for c in cls.iter() {
-                    let (px, py, pz, ..) = { let p = c.pos.lock().unwrap(); *p };
-                    if (px-x.x).powi(2)+(py-x.y).powi(2)+(pz-x.z).powi(2) < 2.56 {
+                    let (px, py, pz, ..) = {
+                        let p = c.pos.lock().unwrap();
+                        *p
+                    };
+                    if (px - x.x).powi(2) + (py - x.y).powi(2) + (pz - x.z).powi(2) < 2.56 {
                         collected.push((x.eid, c.eid, x.val));
                         break;
                     }
@@ -2614,13 +4172,19 @@ fn drop_tick() {
                 let mut val = val as i64;
                 {
                     let mut inv = c.inv.lock().unwrap();
-                    let cands: Vec<i16> = inv.iter()
-                        .filter(|(_, (it, _, cc))| *it > 0
-                            && enchant_level(cc, 22) > 0
-                            && comp_varint(cc, COMP_DAMAGE).unwrap_or(0) > 0)
-                        .map(|(&k, _)| k).collect();
+                    let cands: Vec<i16> = inv
+                        .iter()
+                        .filter(|(_, (it, _, cc))| {
+                            *it > 0
+                                && enchant_level(cc, 22) > 0
+                                && comp_varint(cc, COMP_DAMAGE).unwrap_or(0) > 0
+                        })
+                        .map(|(&k, _)| k)
+                        .collect();
                     for k in cands {
-                        if val <= 0 { break }
+                        if val <= 0 {
+                            break;
+                        }
                         let (it, cnt, mut cc) = inv.remove(&k).unwrap();
                         let cur = comp_varint(&cc, COMP_DAMAGE).unwrap_or(0);
                         let heal = (val * 2).min(cur);
@@ -2638,7 +4202,9 @@ fn drop_tick() {
                 p.extend_from_slice(&bar.to_be_bytes());
                 write_varint(&mut p, lvl as i64);
                 write_varint(&mut p, total);
-                if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x5c, p); }
+                if let Ok(mut w) = c.sock.lock() {
+                    let _ = send_packet(&mut *w, 0x5c, p);
+                }
                 drop(cls);
                 broadcast_seen_destroy(xeid);
             }
@@ -2652,10 +4218,16 @@ fn drop_tick() {
             // differing NBT never stacks), else a free slot
             let mut inv = c.inv.lock().unwrap();
             let smax = item_stack_max(item, &dcomp) as u8;
-            let slot = inv.iter().find(|(_, (it, cnt, cc))| *it == item && *cc == dcomp && *cnt < smax)
+            let slot = inv
+                .iter()
+                .find(|(_, (it, cnt, cc))| *it == item && *cc == dcomp && *cnt < smax)
                 .map(|(&sl, _)| sl)
                 .or_else(|| (9..=44).find(|sl| !inv.contains_key(sl)));
-            let Some(slot) = slot else { drop(inv); drop(cls); continue };
+            let Some(slot) = slot else {
+                drop(inv);
+                drop(cls);
+                continue;
+            };
             let cur = inv.get(&slot).map(|e| e.1).unwrap_or(0);
             let room = (smax - cur).min(dcnt);
             let cnt = cur + room;
@@ -2664,23 +4236,35 @@ fn drop_tick() {
             write_varint(&mut p, 0);
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(&(item, cnt, dcomp)));
-            if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut *w, 0x15, p);
+            }
             drop(inv);
             drop(cls);
             broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, ceid, room)));
             let mut ds = drops().lock().unwrap();
             if let Some(d) = ds.iter_mut().find(|d| d.eid == deid) {
                 d.cnt -= room;
-                if d.cnt == 0 { ds.retain(|x| x.eid != deid); broadcast_seen_destroy(deid); }
-                else { let pkt = drop_meta_pkt(d); broadcast_seen(deid, move |_c| (0x58, pkt.clone())); }
+                if d.cnt == 0 {
+                    ds.retain(|x| x.eid != deid);
+                    broadcast_seen_destroy(deid);
+                } else {
+                    let pkt = drop_meta_pkt(d);
+                    broadcast_seen(deid, move |_c| (0x58, pkt.clone()));
+                }
             }
         }
     }
-    { // despawn drops after 300s (vanilla); a hard cap bounds the flood
+    {
+        // despawn drops after 300s (vanilla); a hard cap bounds the flood
         // inside any one despawn window — oldest lose first.
         let mut dp = drops().lock().unwrap();
         let life = server_ticks(DROP_LIFE_GT) as i32;
-        for d in dp.iter_mut() { if region.is_hot(d.x as i32, d.z as i32) { d.age += 1; } }
+        for d in dp.iter_mut() {
+            if region.is_hot(d.x as i32, d.z as i32) {
+                d.age += 1;
+            }
+        }
         let exp: Vec<i32> = dp.iter().filter(|d| d.age >= life).map(|d| d.eid).collect();
         for eid in &exp {
             dp.retain(|d| d.eid != *eid);
@@ -2700,31 +4284,49 @@ fn drop_tick() {
         // every pair, so which drop is absorbed does not change.
         let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
         for (idx, d) in dp.iter().enumerate() {
-            cells.entry((d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32)).or_default().push(idx);
+            cells
+                .entry((d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32))
+                .or_default()
+                .push(idx);
         }
         for i in 0..dp.len() {
-            let (cx, cy, cz) = (dp[i].x.floor() as i32, dp[i].y.floor() as i32, dp[i].z.floor() as i32);
+            let (cx, cy, cz) = (
+                dp[i].x.floor() as i32,
+                dp[i].y.floor() as i32,
+                dp[i].z.floor() as i32,
+            );
             let mut candidates: Vec<usize> = Vec::new();
             // checked arithmetic: a drop whose cell is at the i32 limit has no
             // neighbour there, and wrapping would invent a cell that aliases.
-            for dx in -1..=1i32 { for dy in -1..=1i32 { for dz in -1..=1i32 {
-                let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
-                if let (Some(kx), Some(ky), Some(kz)) = key {
-                    if let Some(bucket) = cells.get(&(kx, ky, kz)) {
-                        candidates.extend(bucket.iter().copied().filter(|j| *j > i));
+            for dx in -1..=1i32 {
+                for dy in -1..=1i32 {
+                    for dz in -1..=1i32 {
+                        let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
+                        if let (Some(kx), Some(ky), Some(kz)) = key {
+                            if let Some(bucket) = cells.get(&(kx, ky, kz)) {
+                                candidates.extend(bucket.iter().copied().filter(|j| *j > i));
+                            }
+                        }
                     }
                 }
-            }}}
+            }
             candidates.sort_unstable();
             for j in candidates {
-                let (ax, ay, az, ait, acnt, aage) = { let a = &dp[i]; (a.x, a.y, a.z, a.item, a.cnt, a.age) };
-                let (bx, by, bz, bit, bcnt, bage) = { let b = &dp[j]; (b.x, b.y, b.z, b.item, b.cnt, b.age) };
+                let (ax, ay, az, ait, acnt, aage) = {
+                    let a = &dp[i];
+                    (a.x, a.y, a.z, a.item, a.cnt, a.age)
+                };
+                let (bx, by, bz, bit, bcnt, bage) = {
+                    let b = &dp[j];
+                    (b.x, b.y, b.z, b.item, b.cnt, b.age)
+                };
                 // Cheap integer and distance tests first; the component blobs
                 // are a Vec comparison, so they run only for a real candidate.
                 if ait == bit
                     && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
                     && dp[i].comps == dp[j].comps
-                    && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16 {
+                    && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
+                {
                     let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
                     dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
                     merged.push(dp[eat].eid);
@@ -2740,13 +4342,27 @@ fn drop_tick() {
 }
 fn mob_tick() {
     let cls_snap = client_snapshot();
-    let cls: Vec<(i32, f64, f64, f64)> = cls_snap.iter()
-        .map(|c| { let p = c.pos.lock().unwrap(); (c.eid, p.0, p.1, p.2) }).collect();
-    let wheat_holders: Vec<(f64, f64, f64)> = cls_snap.iter().filter(|c| {
+    let cls: Vec<(i32, f64, f64, f64)> = cls_snap
+        .iter()
+        .map(|c| {
+            let p = c.pos.lock().unwrap();
+            (c.eid, p.0, p.1, p.2)
+        })
+        .collect();
+    let wheat_holders: Vec<(f64, f64, f64)> = cls_snap
+        .iter()
+        .filter(|c| {
             let hs = 36 + *c.held.lock().unwrap();
             c.inv.lock().unwrap().get(&hs).map(|v| v.0).unwrap_or(0) == 854
-        }).map(|c| { let p = c.pos.lock().unwrap(); (p.0, p.1, p.2) }).collect();
-    if cls.is_empty() { return }
+        })
+        .map(|c| {
+            let p = c.pos.lock().unwrap();
+            (p.0, p.1, p.2)
+        })
+        .collect();
+    if cls.is_empty() {
+        return;
+    }
     let mobs_snap: Vec<Arc<Mob>> = mobs().lock().unwrap().iter().cloned().collect();
     let region = region_guard();
 
@@ -2762,12 +4378,17 @@ fn mob_tick() {
             mob_env_die(m.eid, et, mx, my, mz, mburn);
             continue;
         }
-        if !region.is_hot(mp.0 as i32, mp.2 as i32) { continue }
+        if !region.is_hot(mp.0 as i32, mp.2 as i32) {
+            continue;
+        }
         // suffocation: head cell buried in a solid block -> 1hp/0.5s (vanilla)
-        if TICK.load(Ordering::Relaxed) % server_ticks(10) == 0 && mob_cell_solid(mp.0, mp.1 + 1.0, mp.2) {
+        if TICK.load(Ordering::Relaxed) % server_ticks(10) == 0
+            && mob_cell_solid(mp.0, mp.1 + 1.0, mp.2)
+        {
             let mut hp = m.hp.lock().unwrap();
             *hp -= 1.0;
-            let mdead = *hp <= 0.0; drop(hp);
+            let mdead = *hp <= 0.0;
+            drop(hp);
             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
             if mdead {
                 let (mx, my, mz) = (mp.0, mp.1, mp.2);
@@ -2780,15 +4401,22 @@ fn mob_tick() {
         // drowning: head cell in water drains air (15s), then 2hp/s; undead don't drown
         if !matches!(m.etype, 124 | 91) {
             let wst = name_to_state("water").unwrap_or(u32::MAX);
-            let submerged = block_at(mp.0.floor() as i32, (mp.1 + 1.0).floor() as i32, mp.2.floor() as i32) == wst;
+            let submerged = block_at(
+                mp.0.floor() as i32,
+                (mp.1 + 1.0).floor() as i32,
+                mp.2.floor() as i32,
+            ) == wst;
             let mut air = m.air.lock().unwrap();
-            if !submerged { *air = server_ticks(AIR_SUPPLY_GT) as i32; }
-            else if *air > 0 { *air -= 1; }
-            else if TICK.load(Ordering::Relaxed) % server_ticks(20) == 0 {
+            if !submerged {
+                *air = server_ticks(AIR_SUPPLY_GT) as i32;
+            } else if *air > 0 {
+                *air -= 1;
+            } else if TICK.load(Ordering::Relaxed) % server_ticks(20) == 0 {
                 drop(air);
                 let mut hp = m.hp.lock().unwrap();
                 *hp -= 2.0;
-                let dead = *hp <= 0.0; drop(hp);
+                let dead = *hp <= 0.0;
+                drop(hp);
                 broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
                 if dead {
                     let (mx, my, mz) = (mp.0, mp.1, mp.2);
@@ -2801,28 +4429,55 @@ fn mob_tick() {
         }
         // undead burn in daylight with clear sky
         if day && matches!(m.etype, 124 | 91) {
-            let (bx, by, bz) = (mp.0.round() as i32, mp.1.round() as i32, mp.2.round() as i32);
-            let exposed = RAINING.load(Ordering::Relaxed) == 0 && by + 1 >= height_at(bx, bz) && block_at(bx, by + 2, bz) == 0;
+            let (bx, by, bz) = (
+                mp.0.round() as i32,
+                mp.1.round() as i32,
+                mp.2.round() as i32,
+            );
+            let exposed = RAINING.load(Ordering::Relaxed) == 0
+                && by + 1 >= height_at(bx, bz)
+                && block_at(bx, by + 2, bz) == 0;
             let mut burn = m.fuse.lock().unwrap();
             if exposed {
                 *burn += 1;
                 if *burn >= server_ticks(MOB_BURN_TICK_GT) as i32 {
                     *burn = 0;
-                    drop(burn); drop(mp);
+                    drop(burn);
+                    drop(mp);
                     // on-fire flag: entity flags byte idx0 bit0x01
-                    let mut md = Vec::new(); write_varint(&mut md, m.eid as i64);
-                    md.push(0); md.push(0); md.push(1); md.push(0xff);
+                    let mut md = Vec::new();
+                    write_varint(&mut md, m.eid as i64);
+                    md.push(0);
+                    md.push(0);
+                    md.push(1);
+                    md.push(0xff);
                     // drop meta streams via interest_tick
                     let mut hp = m.hp.lock().unwrap();
                     *hp -= 1.0;
-                    let dead = *hp <= 0.0; drop(hp);
+                    let dead = *hp <= 0.0;
+                    drop(hp);
                     broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
                     if dead {
-                        let (mx, my, mz) = { let p = m.pos.lock().unwrap(); (p.0, p.1, p.2) };
+                        let (mx, my, mz) = {
+                            let p = m.pos.lock().unwrap();
+                            (p.0, p.1, p.2)
+                        };
                         mobs().lock().unwrap().retain(|x| x.eid != m.eid);
                         broadcast_seen_destroy(m.eid);
-                        for (item, cnt, comps) in mob_loot(m.etype, true).into_iter().filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 };
+                        for (item, cnt, comps) in mob_loot(m.etype, true)
+                            .into_iter()
+                            .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
+                        {
+                            let d = Drop {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: mx,
+                                y: my,
+                                z: mz,
+                                item,
+                                cnt,
+                                comps,
+                                age: 0,
+                            };
                             drops().lock().unwrap().push(d);
                         }
                     }
@@ -2830,50 +4485,90 @@ fn mob_tick() {
                 }
             } else if *burn != 0 {
                 *burn = 0;
-                drop(burn); drop(mp);
-                let mut md = Vec::new(); write_varint(&mut md, m.eid as i64);
-                md.push(0); md.push(0); md.push(0); md.push(0xff);
+                drop(burn);
+                drop(mp);
+                let mut md = Vec::new();
+                write_varint(&mut md, m.eid as i64);
+                md.push(0);
+                md.push(0);
+                md.push(0);
+                md.push(0xff);
                 // drop meta streams via interest_tick
                 continue;
             }
         }
         // creeper: approach then fuse+explode
         if m.etype == 23 {
-            let mut best: Option<(f64,f64,f64)> = None; let mut bd = f64::MAX;
+            let mut best: Option<(f64, f64, f64)> = None;
+            let mut bd = f64::MAX;
             for &(_eid, px, py, pz) in &cls {
-                let d = (px-mp.0).powi(2)+(pz-mp.2).powi(2);
-                if d < bd { bd = d; best = Some((px,py,pz)); }
+                let d = (px - mp.0).powi(2) + (pz - mp.2).powi(2);
+                if d < bd {
+                    bd = d;
+                    best = Some((px, py, pz));
+                }
             }
-            if let Some((px,_py,pz)) = best {
+            if let Some((px, _py, pz)) = best {
                 let mut fuse = m.fuse.lock().unwrap();
                 if bd < 9.0 {
                     *fuse += 1;
                     if *fuse >= server_ticks(CREEPER_IGNITE_GT) as i32 {
                         // explode: crater radius 3 (skip bedrock), damage nearby players
-                        let (cx, cy, cz) = (mp.0.round() as i32, mp.1.round() as i32, mp.2.round() as i32);
-                        let mut recs: Vec<(i8,i8,i8)> = vec![];
-                        for dx in -3i32..=3 { for dy in -3i32..=3 { for dz in -3i32..=3 {
-                            if dx*dx+dy*dy+dz*dz > 9 { continue }
-                            let (bx, by, bz) = (cx+dx, cy+dy, cz+dz);
-                            let st = block_at(bx, by, bz);
-                            if st == 0 || st == 79 || GR_MOB_GRIEFING.load(Ordering::Relaxed) == 0 { continue }
-                            set_block(bx, by, bz, 0);
-                            recs.push((dx as i8, dy as i8, dz as i8));
-                            note_block_update(bx, by, bz, 0);
-                        }}}
+                        let (cx, cy, cz) = (
+                            mp.0.round() as i32,
+                            mp.1.round() as i32,
+                            mp.2.round() as i32,
+                        );
+                        let mut recs: Vec<(i8, i8, i8)> = vec![];
+                        for dx in -3i32..=3 {
+                            for dy in -3i32..=3 {
+                                for dz in -3i32..=3 {
+                                    if dx * dx + dy * dy + dz * dz > 9 {
+                                        continue;
+                                    }
+                                    let (bx, by, bz) = (cx + dx, cy + dy, cz + dz);
+                                    let st = block_at(bx, by, bz);
+                                    if st == 0
+                                        || st == 79
+                                        || GR_MOB_GRIEFING.load(Ordering::Relaxed) == 0
+                                    {
+                                        continue;
+                                    }
+                                    set_block(bx, by, bz, 0);
+                                    recs.push((dx as i8, dy as i8, dz as i8));
+                                    note_block_update(bx, by, bz, 0);
+                                }
+                            }
+                        }
                         broadcast(-1, |_c| (0x20, explosion_pkt(mp.0, mp.1, mp.2, &recs)));
                         for &(_eid, px, py, pz) in &cls {
-                            let dd = ((px-mp.0).powi(2)+(py-mp.1).powi(2)+(pz-mp.2).powi(2)).sqrt();
+                            let dd =
+                                ((px - mp.0).powi(2) + (py - mp.1).powi(2) + (pz - mp.2).powi(2))
+                                    .sqrt();
                             if dd < 5.0 {
                                 let c = clients().lock().unwrap();
                                 if let Some(cl) = c.iter().find(|c| c.eid == _eid) {
-                                    if *cl.gm.lock().unwrap() == 1 { continue }
-                                    if cl.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) { continue }
+                                    if *cl.gm.lock().unwrap() == 1 {
+                                        continue;
+                                    }
+                                    if cl.hurt_at.lock().unwrap().elapsed()
+                                        < Duration::from_millis(500)
+                                    {
+                                        continue;
+                                    }
                                     *cl.hurt_at.lock().unwrap() = Instant::now();
                                     let mut h = cl.hp.lock().unwrap();
-                                    let raw = ((1.0 - dd / 6.5).max(0.0) * diff_expl_dmg(43.0) as f64) as f32;
-                                    *h = (*h - hurt_absorb(&*cl, dmg_after(&*cl, raw, 2))).max(0.0); if *h <= 0.0 { drop(h); totem_check(&*cl); h = cl.hp.lock().unwrap(); }
-                                    let hh = *h; drop(h);
+                                    let raw = ((1.0 - dd / 6.5).max(0.0)
+                                        * diff_expl_dmg(43.0) as f64)
+                                        as f32;
+                                    *h = (*h - hurt_absorb(&*cl, dmg_after(&*cl, raw, 2))).max(0.0);
+                                    if *h <= 0.0 {
+                                        drop(h);
+                                        totem_check(&*cl);
+                                        h = cl.hp.lock().unwrap();
+                                    }
+                                    let hh = *h;
+                                    drop(h);
                                     damage_armor(cl, raw);
                                     if let Ok(mut w) = cl.sock.lock() {
                                         let _ = send_packet(&mut *w, 0x24, hurt_anim(cl.eid));
@@ -2882,33 +4577,53 @@ fn mob_tick() {
                                 }
                             }
                         }
-                        drop(fuse); drop(mp);
+                        drop(fuse);
+                        drop(mp);
                         let deid = m.eid;
                         mobs().lock().unwrap().retain(|m| m.eid != deid);
                         broadcast_seen_destroy(deid);
                         return;
                     }
-                } else if bd < 24.0*24.0 {
+                } else if bd < 24.0 * 24.0 {
                     *fuse = 0;
                     drop(fuse);
-                    let dx = px-mp.0; let dz = pz-mp.2; let len = (dx*dx+dz*dz).sqrt();
+                    let dx = px - mp.0;
+                    let dz = pz - mp.2;
+                    let len = (dx * dx + dz * dz).sqrt();
                     let (nx, nz) = (mp.0 + dx / len * 0.25, mp.2 + dz / len * 0.25);
-                    if !mob_move_blocked(nx, mp.1, nz) || (mob_cell_solid(mp.0, mp.1, mp.2) && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2) { mp.0 = nx; mp.2 = nz; }
+                    if !mob_move_blocked(nx, mp.1, nz)
+                        || (mob_cell_solid(mp.0, mp.1, mp.2)
+                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
+                    {
+                        mp.0 = nx;
+                        mp.2 = nz;
+                    }
                     mob_snap_y(m, &mut mp);
                     mp.3 = (dx.atan2(dz) * 180.0 / std::f64::consts::PI) as f32 - 180.0;
                     drop(mp);
-                    let (x,y,z,yaw,pitch) = *m.pos.lock().unwrap();
-                    broadcast_seen(m.eid, |_c| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
+                    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
+                    broadcast_seen(m.eid, |_c| {
+                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
+                    });
                     broadcast_seen(m.eid, |_c| (0x48, head_rot(m.eid, yaw)));
-                } else { drop(fuse); }
+                } else {
+                    drop(fuse);
+                }
             }
             continue;
         }
         // sheared sheep regrow wool by eating grass
         if m.etype == 87 && sheared().lock().unwrap().contains(&m.eid) {
-            let (bx, by, bz) = (mp.0.round() as i32, mp.1.round() as i32, mp.2.round() as i32);
+            let (bx, by, bz) = (
+                mp.0.round() as i32,
+                mp.1.round() as i32,
+                mp.2.round() as i32,
+            );
             if block_at(bx, by - 1, bz) == name_to_state("grass_block").unwrap_or(u32::MAX)
-                && ((m.eid as u64).wrapping_mul(1103515245) ^ TICK.load(Ordering::Relaxed)) % MOB_SPAWN_CHANCE_DENOMINATOR == 0 {
+                && ((m.eid as u64).wrapping_mul(1103515245) ^ TICK.load(Ordering::Relaxed))
+                    % MOB_SPAWN_CHANCE_DENOMINATOR
+                    == 0
+            {
                 set_block(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
                 sheared().lock().unwrap().remove(&m.eid);
                 note_block_update(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
@@ -2920,75 +4635,141 @@ fn mob_tick() {
             let mut lov = m.love.lock().unwrap();
             if *lov > 0 {
                 *lov -= 1;
-                let partner = mobs_snap.iter().find(|p| p.eid != m.eid && p.etype == m.etype
-                    && *p.love.lock().unwrap() > 0
-                    && { let q = p.pos.lock().unwrap(); (q.0-mp.0).powi(2)+(q.2-mp.2).powi(2) < 16.0 });
+                let partner = mobs_snap.iter().find(|p| {
+                    p.eid != m.eid && p.etype == m.etype && *p.love.lock().unwrap() > 0 && {
+                        let q = p.pos.lock().unwrap();
+                        (q.0 - mp.0).powi(2) + (q.2 - mp.2).powi(2) < 16.0
+                    }
+                });
                 if let Some(p) = partner {
-                    *lov = 0; *p.love.lock().unwrap() = 0;
+                    *lov = 0;
+                    *p.love.lock().unwrap() = 0;
                     let q = *p.pos.lock().unwrap();
-                    let (bx, bz) = ((mp.0+q.0)/2.0, (mp.2+q.2)/2.0);
+                    let (bx, bz) = ((mp.0 + q.0) / 2.0, (mp.2 + q.2) / 2.0);
                     let by = surface_y(bx.round() as i32, bz.round() as i32);
-                    drop(lov); drop(mp);
-                    let baby = Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
-                        etype: m.etype, pos: Mutex::new((bx, by, bz, 0.0, 0.0)), hp: Mutex::new(20.0),
-                        last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                        fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
-                    if mobs().lock().unwrap().len() >= MOB_CAP { continue }
+                    drop(lov);
+                    drop(mp);
+                    let baby = Arc::new(Mob {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        uuid: [0u8; 16],
+                        etype: m.etype,
+                        pos: Mutex::new((bx, by, bz, 0.0, 0.0)),
+                        hp: Mutex::new(20.0),
+                        last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                        hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                        fuse: Mutex::new(0),
+                        love: Mutex::new(0),
+                        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+                    });
+                    if mobs().lock().unwrap().len() >= MOB_CAP {
+                        continue;
+                    }
                     mobs().lock().unwrap().push(baby);
                     let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                        xps().lock().unwrap().push(Xp { eid: xeid, x: bx, y: by, z: bz, val: (1 + world_rng::next_u64() % 7) as i16, age: 0 });
+                    xps().lock().unwrap().push(Xp {
+                        eid: xeid,
+                        x: bx,
+                        y: by,
+                        z: bz,
+                        val: (1 + world_rng::next_u64() % 7) as i16,
+                        age: 0,
+                    });
                     // spawn streams via interest_tick
                     continue;
                 }
             }
             drop(lov);
             // follow nearest player holding wheat within 9 blocks
-            let mut tgt: Option<(f64, f64)> = None; let mut bd = f64::MAX;
+            let mut tgt: Option<(f64, f64)> = None;
+            let mut bd = f64::MAX;
             for &(hx, _hy, hz) in &wheat_holders {
                 let d = (hx - mp.0).powi(2) + (hz - mp.2).powi(2);
-                if d < 81.0 && d < bd { bd = d; tgt = Some((hx, hz)); }
+                if d < 81.0 && d < bd {
+                    bd = d;
+                    tgt = Some((hx, hz));
+                }
             }
             if let Some((tx, tz)) = tgt {
                 if bd > 2.0 {
-                    let dx = tx - mp.0; let dz = tz - mp.2; let len = (dx*dx + dz*dz).sqrt().max(0.01);
+                    let dx = tx - mp.0;
+                    let dz = tz - mp.2;
+                    let len = (dx * dx + dz * dz).sqrt().max(0.01);
                     let (nx, nz) = (mp.0 + dx / len * 0.28, mp.2 + dz / len * 0.28);
-                    if !mob_move_blocked(nx, mp.1, nz) || (mob_cell_solid(mp.0, mp.1, mp.2) && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2) { mp.0 = nx; mp.2 = nz; }
+                    if !mob_move_blocked(nx, mp.1, nz)
+                        || (mob_cell_solid(mp.0, mp.1, mp.2)
+                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
+                    {
+                        mp.0 = nx;
+                        mp.2 = nz;
+                    }
                     mob_snap_y(m, &mut mp);
                 }
                 mp.3 = ((-((tx - mp.0).atan2(tz - mp.2))) as f32).to_degrees();
-                let (x,y,z,yaw,pitch) = *mp;
+                let (x, y, z, yaw, pitch) = *mp;
                 drop(mp);
-                broadcast_seen(m.eid, |_c| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
-            } else if (m.eid as i64 + TICK.load(Ordering::Relaxed) as i64) % (MOB_SPAWN_CHANCE_DENOMINATOR / 12) as i64 == 0 {
-                let t = ((m.eid as u32).wrapping_mul(2654435761u32) ^ (TICK.load(Ordering::Relaxed) as u32)) as f64 / 4294967295.0 * std::f64::consts::TAU;
+                broadcast_seen(m.eid, |_c| {
+                    (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
+                });
+            } else if (m.eid as i64 + TICK.load(Ordering::Relaxed) as i64)
+                % (MOB_SPAWN_CHANCE_DENOMINATOR / 12) as i64
+                == 0
+            {
+                let t = ((m.eid as u32).wrapping_mul(2654435761u32)
+                    ^ (TICK.load(Ordering::Relaxed) as u32)) as f64
+                    / 4294967295.0
+                    * std::f64::consts::TAU;
                 let (nx, nz) = (mp.0 + t.cos() * 2.0, mp.2 + t.sin() * 2.0);
                 let mid = !mob_move_blocked((mp.0 + nx) * 0.5, mp.1, (mp.2 + nz) * 0.5);
-                if (mid && !mob_move_blocked(nx, mp.1, nz)) || (mob_cell_solid(mp.0, mp.1, mp.2) && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2) { mp.0 = nx; mp.2 = nz; }
+                if (mid && !mob_move_blocked(nx, mp.1, nz))
+                    || (mob_cell_solid(mp.0, mp.1, mp.2)
+                        && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
+                {
+                    mp.0 = nx;
+                    mp.2 = nz;
+                }
                 mob_snap_y(m, &mut mp);
                 drop(mp);
-                let (x,y,z,yaw,pitch) = *m.pos.lock().unwrap();
-                broadcast_seen(m.eid, |_c| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
-            } else { drop(mp); }
+                let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
+                broadcast_seen(m.eid, |_c| {
+                    (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
+                });
+            } else {
+                drop(mp);
+            }
             continue;
         }
         // skeleton: hold 6-12 b range, shoot arrows every ~3 s
         if m.etype == 91 {
-            let mut best: Option<(f64,f64,f64)> = None; let mut bd = f64::MAX;
+            let mut best: Option<(f64, f64, f64)> = None;
+            let mut bd = f64::MAX;
             for &(_eid, px, py, pz) in &cls {
-                let d = (px-mp.0).powi(2)+(pz-mp.2).powi(2);
-                if d < bd { bd = d; best = Some((px,py,pz)); }
+                let d = (px - mp.0).powi(2) + (pz - mp.2).powi(2);
+                if d < bd {
+                    bd = d;
+                    best = Some((px, py, pz));
+                }
             }
-            if let Some((px,py,pz)) = best {
+            if let Some((px, py, pz)) = best {
                 let dist = bd.sqrt();
                 // reposition: back off if <5, approach if >12
                 if dist > 12.0 || dist < 5.0 {
                     let dir = if dist > 12.0 { 1.0 } else { -1.0 };
-                    let dx = px-mp.0; let dz = pz-mp.2; let len = (dx*dx+dz*dz).sqrt().max(0.01);
+                    let dx = px - mp.0;
+                    let dz = pz - mp.2;
+                    let len = (dx * dx + dz * dz).sqrt().max(0.01);
                     let (nx, nz) = (mp.0 + dx / len * 0.22 * dir, mp.2 + dz / len * 0.22 * dir);
-                    if !mob_move_blocked(nx, mp.1, nz) || (mob_cell_solid(mp.0, mp.1, mp.2) && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2) { mp.0 = nx; mp.2 = nz; }
+                    if !mob_move_blocked(nx, mp.1, nz)
+                        || (mob_cell_solid(mp.0, mp.1, mp.2)
+                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
+                    {
+                        mp.0 = nx;
+                        mp.2 = nz;
+                    }
                     mob_snap_y(m, &mut mp);
-                    let (x,y,z,yaw,pitch) = *mp;
-                    broadcast_seen(m.eid, |_c| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
+                    let (x, y, z, yaw, pitch) = *mp;
+                    broadcast_seen(m.eid, |_c| {
+                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
+                    });
                 }
                 // fire every ~3 s when in range
                 let mut lh = m.last_hit.lock().unwrap();
@@ -2998,12 +4779,33 @@ fn mob_tick() {
                     let (sx, sy, sz) = (mp.0, mp.1 + 1.6, mp.2);
                     drop(mp);
                     let (tx, ty, tz) = (px, py + 1.2, pz);
-                    let (mut vx, mut vy, mut vz) = (tx-sx, ty-sy, tz-sz);
-                    let vl = (vx*vx+vy*vy+vz*vz).sqrt().max(0.01);
-                    vx /= vl; vy /= vl; vz /= vl;
-                    let a = Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), owner: -1, x: sx, y: sy, z: sz,
-                        dx: vx, dy: vy, dz: vz, ttl: server_ticks(MOB_ARROW_TTL_GT) as i32, dmg: diff_mob_dmg(3.0), fire: 0, punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck: false };
-                                        arrows().lock().unwrap().push(a);
+                    let (mut vx, mut vy, mut vz) = (tx - sx, ty - sy, tz - sz);
+                    let vl = (vx * vx + vy * vy + vz * vz).sqrt().max(0.01);
+                    vx /= vl;
+                    vy /= vl;
+                    vz /= vl;
+                    let a = Arrow {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        owner: -1,
+                        x: sx,
+                        y: sy,
+                        z: sz,
+                        dx: vx,
+                        dy: vy,
+                        dz: vz,
+                        ttl: server_ticks(MOB_ARROW_TTL_GT) as i32,
+                        dmg: diff_mob_dmg(3.0),
+                        fire: 0,
+                        punch: 0,
+                        kind: 0,
+                        loy: 0,
+                        ret_item: 0,
+                        ret_comps: Vec::new(),
+                        pierce: 0,
+                        last_hit: -1,
+                        stuck: false,
+                    };
+                    arrows().lock().unwrap().push(a);
                     // spawn streams via interest_tick
                 }
             }
@@ -3011,57 +4813,121 @@ fn mob_tick() {
         }
         // chase nearest player within 24 blocks (zombie=124 only)
         if m.etype == 124 {
-            let mut best: Option<(f64,f64,f64)> = None; let mut bd = f64::MAX;
+            let mut best: Option<(f64, f64, f64)> = None;
+            let mut bd = f64::MAX;
             for &(_eid, px, py, pz) in &cls {
-                let d = (px-mp.0).powi(2)+(pz-mp.2).powi(2);
-                if d < bd { bd = d; best = Some((px,py,pz)); }
+                let d = (px - mp.0).powi(2) + (pz - mp.2).powi(2);
+                if d < bd {
+                    bd = d;
+                    best = Some((px, py, pz));
+                }
             }
-            if let Some((px,_py,pz)) = best {
+            if let Some((px, _py, pz)) = best {
                 // melee: within 2.5 blocks, 1s cooldown -> damage that player
-                if bd < 2.5*2.5 {
+                if bd < 2.5 * 2.5 {
                     let mut lh = m.last_hit.lock().unwrap();
                     if lh.elapsed() > Duration::from_millis(1000) {
                         *lh = Instant::now();
-                        drop(lh); drop(mp);
+                        drop(lh);
+                        drop(mp);
                         // find which client is nearest & hurt them
                         let mut hurt_eid = None;
                         {
                             let c = client_snapshot();
                             for cl in c.iter() {
-                                let (cp0, _cp1, cp2) = { let cp = cl.pos.lock().unwrap(); (cp.0, cp.1, cp.2) };
-                                let (mx, _my, mz) = { let mp2 = m.pos.lock().unwrap(); (mp2.0, mp2.1, mp2.2) };
-                                let dd = (cp0-mx).powi(2)+(cp2-mz).powi(2);
+                                let (cp0, _cp1, cp2) = {
+                                    let cp = cl.pos.lock().unwrap();
+                                    (cp.0, cp.1, cp.2)
+                                };
+                                let (mx, _my, mz) = {
+                                    let mp2 = m.pos.lock().unwrap();
+                                    (mp2.0, mp2.1, mp2.2)
+                                };
+                                let dd = (cp0 - mx).powi(2) + (cp2 - mz).powi(2);
                                 if dd < 6.0 && *cl.gm.lock().unwrap() != 1 {
-                                    if cl.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) { continue }
+                                    if cl.hurt_at.lock().unwrap().elapsed()
+                                        < Duration::from_millis(500)
+                                    {
+                                        continue;
+                                    }
                                     *cl.hurt_at.lock().unwrap() = Instant::now();
                                     let mut h = cl.hp.lock().unwrap();
-                                    let bl = *cl.blocking.lock().unwrap() && cl.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5);
-                                    if bl { damage_shield(&*cl, 2.0); }
-                                    let dmg = if bl { 0.0 } else { dmg_after(&*cl, diff_mob_dmg(3.0), 0) };
+                                    let bl = *cl.blocking.lock().unwrap()
+                                        && cl.shield_cd.lock().unwrap().elapsed()
+                                            > Duration::from_secs(5);
+                                    if bl {
+                                        damage_shield(&*cl, 2.0);
+                                    }
+                                    let dmg = if bl {
+                                        0.0
+                                    } else {
+                                        dmg_after(&*cl, diff_mob_dmg(3.0), 0)
+                                    };
                                     *h = (*h - hurt_absorb(cl, dmg)).max(0.0);
-                                    if dmg > 0.0 { damage_armor(cl, 2.0); }
+                                    if dmg > 0.0 {
+                                        damage_armor(cl, 2.0);
+                                    }
                                     // thorns: lvl*15% chance to reflect 1-4 dmg to the attacker
                                     // (vanilla only triggers when the hit lands, not when blocked)
                                     {
-                                        let th: i64 = { let iv = cl.inv.lock().unwrap();
-                                            [5i16,6,7,8].iter().map(|s| enchant_level(&iv.get(s).map(|v| v.2.clone()).unwrap_or_default(), 38)).sum() };
-                                        if dmg > 0.0 && th > 0 && (world_rng::next_u64() % 100) < (th * 15) as u64 {
+                                        let th: i64 = {
+                                            let iv = cl.inv.lock().unwrap();
+                                            [5i16, 6, 7, 8]
+                                                .iter()
+                                                .map(|s| {
+                                                    enchant_level(
+                                                        &iv.get(s)
+                                                            .map(|v| v.2.clone())
+                                                            .unwrap_or_default(),
+                                                        38,
+                                                    )
+                                                })
+                                                .sum()
+                                        };
+                                        if dmg > 0.0
+                                            && th > 0
+                                            && (world_rng::next_u64() % 100) < (th * 15) as u64
+                                        {
                                             let refl = 1.0 + (world_rng::next_u64() % 4) as f32;
-                                            let mut mh = m.hp.lock().unwrap(); *mh -= refl;
-                                            let mdead = *mh <= 0.0; drop(mh);
+                                            let mut mh = m.hp.lock().unwrap();
+                                            *mh -= refl;
+                                            let mdead = *mh <= 0.0;
+                                            drop(mh);
                                             broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
                                             if mdead {
-                                                let (mx, my, mz, ..) = { let mp2 = m.pos.lock().unwrap(); (mp2.0, mp2.1, mp2.2) };
+                                                let (mx, my, mz, ..) = {
+                                                    let mp2 = m.pos.lock().unwrap();
+                                                    (mp2.0, mp2.1, mp2.2)
+                                                };
                                                 mobs().lock().unwrap().retain(|x| x.eid != m.eid);
                                                 broadcast_seen_destroy(m.eid);
                                                 let mburn = *m.fuse.lock().unwrap() > 0;
-                                                for (item, cnt, comps) in mob_loot(m.etype, mburn).into_iter().filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-                                                    drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt, comps, age: 0 });
+                                                for (item, cnt, comps) in mob_loot(m.etype, mburn)
+                                                    .into_iter()
+                                                    .filter(|_| {
+                                                        GR_MOB_LOOT.load(Ordering::Relaxed) == 1
+                                                    })
+                                                {
+                                                    drops().lock().unwrap().push(Drop {
+                                                        eid: NEXT_EID
+                                                            .fetch_add(1, Ordering::SeqCst),
+                                                        x: mx,
+                                                        y: my,
+                                                        z: mz,
+                                                        item,
+                                                        cnt,
+                                                        comps,
+                                                        age: 0,
+                                                    });
                                                 }
                                             }
                                         }
                                     }
-                                    if *h <= 0.0 { drop(h); totem_check(&*cl); h = cl.hp.lock().unwrap(); }
+                                    if *h <= 0.0 {
+                                        drop(h);
+                                        totem_check(&*cl);
+                                        h = cl.hp.lock().unwrap();
+                                    }
                                     let hh = *h;
                                     drop(h);
                                     if let Ok(mut w) = cl.sock.lock() {
@@ -3076,7 +4942,12 @@ fn mob_tick() {
                         if let Some((eid, vname, hh)) = hurt_eid {
                             broadcast_seen_ex(eid, eid, |_c| (0x24, hurt_anim(eid)));
                             if hh <= 0.0 {
-                                let mn = match m.etype { 124 => "Zombie", 91 => "Skeleton", 23 => "Creeper", _ => "mob" };
+                                let mn = match m.etype {
+                                    124 => "Zombie",
+                                    91 => "Skeleton",
+                                    23 => "Creeper",
+                                    _ => "mob",
+                                };
                                 let line = system_chat(&format!("{} was slain by {}", vname, mn));
                                 broadcast(-1, |_c| (0x6c, line.clone()));
                             }
@@ -3084,15 +4955,25 @@ fn mob_tick() {
                         continue;
                     }
                 }
-                if bd < 24.0*24.0 && bd > 1.0 {
-                    let dx = px-mp.0; let dz = pz-mp.2; let len = (dx*dx+dz*dz).sqrt();
+                if bd < 24.0 * 24.0 && bd > 1.0 {
+                    let dx = px - mp.0;
+                    let dz = pz - mp.2;
+                    let len = (dx * dx + dz * dz).sqrt();
                     let (nx, nz) = (mp.0 + dx / len * 0.25, mp.2 + dz / len * 0.25);
-                    if !mob_move_blocked(nx, mp.1, nz) || (mob_cell_solid(mp.0, mp.1, mp.2) && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2) { mp.0 = nx; mp.2 = nz; }
+                    if !mob_move_blocked(nx, mp.1, nz)
+                        || (mob_cell_solid(mp.0, mp.1, mp.2)
+                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
+                    {
+                        mp.0 = nx;
+                        mp.2 = nz;
+                    }
                     mob_snap_y(m, &mut mp);
                     mp.3 = (dx.atan2(dz) * 180.0 / std::f64::consts::PI) as f32 - 180.0;
                     drop(mp);
-                    let (x,y,z,yaw,pitch) = *m.pos.lock().unwrap();
-                    broadcast_seen(m.eid, |_c| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
+                    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
+                    broadcast_seen(m.eid, |_c| {
+                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
+                    });
                     broadcast_seen(m.eid, |_c| (0x48, head_rot(m.eid, yaw)));
                     continue;
                 }
@@ -3108,14 +4989,21 @@ fn world() -> &'static Mutex<HashMap<(i32, i32), HashMap<u32, u32>>> {
     WORLD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 struct Furnace {
-    input: Stack, fuel: Stack, output: Stack,
-    burn_left: i32, progress: i32, dirty: bool, xp: f32,
+    input: Stack,
+    fuel: Stack,
+    output: Stack,
+    burn_left: i32,
+    progress: i32,
+    dirty: bool,
+    xp: f32,
     recipe_cache: CachedLookup<(i64, u64), Option<(i64, u8)>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
 static FURNACES: OnceLock<Mutex<HashMap<(i32, i32, i32), Furnace>>> = OnceLock::new();
 static CROPS: OnceLock<Mutex<HashMap<(i32, i32, i32), u8>>> = OnceLock::new();
-fn crops() -> &'static Mutex<HashMap<(i32, i32, i32), u8>> { CROPS.get_or_init(|| Mutex::new(HashMap::new())) }
+fn crops() -> &'static Mutex<HashMap<(i32, i32, i32), u8>> {
+    CROPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 fn furnaces() -> &'static Mutex<HashMap<(i32, i32, i32), Furnace>> {
     FURNACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -3126,18 +5014,28 @@ fn is_furnace_at(x: i32, y: i32, z: i32) -> bool {
 }
 fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
     let fs = furnaces().lock().unwrap();
-    fs.get(&pos).map(|f| {
-        let mut m = HashMap::new();
-        if f.input.1 > 0 { m.insert(0i16, f.input.clone()); }
-        if f.fuel.1 > 0 { m.insert(1i16, f.fuel.clone()); }
-        if f.output.1 > 0 { m.insert(2i16, f.output.clone()); }
-        m
-    }).unwrap_or_default()
+    fs.get(&pos)
+        .map(|f| {
+            let mut m = HashMap::new();
+            if f.input.1 > 0 {
+                m.insert(0i16, f.input.clone());
+            }
+            if f.fuel.1 > 0 {
+                m.insert(1i16, f.fuel.clone());
+            }
+            if f.output.1 > 0 {
+                m.insert(2i16, f.output.clone());
+            }
+            m
+        })
+        .unwrap_or_default()
 }
 /// Bumped by the datapack loader. Recipes and ingredient tags are mutable, so
 /// anything caching an answer derived from them must key on this.
 static CONTENT_REVISION: AtomicU64 = AtomicU64::new(0);
-fn content_revision() -> u64 { CONTENT_REVISION.load(Ordering::Relaxed) }
+fn content_revision() -> u64 {
+    CONTENT_REVISION.load(Ordering::Relaxed)
+}
 
 /// The smelting result, independent of which furnace is asking. Datapack recipes
 /// and tags are mutable, so a caller that caches this must include
@@ -3145,43 +5043,100 @@ fn content_revision() -> u64 { CONTENT_REVISION.load(Ordering::Relaxed) }
 /// why the cache can hold a plain pair rather than a whole stack.
 fn smelt_out(item: i64) -> Option<(i64, u8)> {
     for (ig, o, c, _) in json_smelts().lock().unwrap().iter() {
-        if ingr_match(ig, item, 0) { return Some((*o, *c)) }
+        if ingr_match(ig, item, 0) {
+            return Some((*o, *c));
+        }
     }
     smelt_result(item).map(|o| (o, 1))
 }
 fn smelt_result(item: i64) -> Option<i64> {
-    for (a, b) in [("beef","cooked_beef"),("porkchop","cooked_porkchop"),("chicken","cooked_chicken"),
-                   ("mutton","cooked_mutton"),("sand","glass"),("cobblestone","stone"),
-                   ("potato","baked_potato"),("oak_log","charcoal"),("raw_iron","iron_ingot"),("raw_copper","copper_ingot"),("raw_gold","gold_ingot"),("rabbit","cooked_rabbit"),("cod","cooked_cod")] {
-        if name_to_item(a) == Some(item) { return name_to_item(b) }
+    for (a, b) in [
+        ("beef", "cooked_beef"),
+        ("porkchop", "cooked_porkchop"),
+        ("chicken", "cooked_chicken"),
+        ("mutton", "cooked_mutton"),
+        ("sand", "glass"),
+        ("cobblestone", "stone"),
+        ("potato", "baked_potato"),
+        ("oak_log", "charcoal"),
+        ("raw_iron", "iron_ingot"),
+        ("raw_copper", "copper_ingot"),
+        ("raw_gold", "gold_ingot"),
+        ("rabbit", "cooked_rabbit"),
+        ("cod", "cooked_cod"),
+    ] {
+        if name_to_item(a) == Some(item) {
+            return name_to_item(b);
+        }
     }
     None
 }
 fn smelt_xp(item: i64) -> f32 {
     for (ig, _, _, xp) in json_smelts().lock().unwrap().iter() {
-        if ingr_match(ig, item, 0) { return *xp }
+        if ingr_match(ig, item, 0) {
+            return *xp;
+        }
     }
-    for (n, x) in [("raw_gold",1.0f32),("raw_iron",0.7),("raw_copper",0.7),
-                   ("beef",0.35),("porkchop",0.35),("chicken",0.35),("mutton",0.35),
-                   ("rabbit",0.35),("cod",0.35),("salmon",0.35),("potato",0.35),("kelp",0.35),
-                   ("oak_log",0.15)] {
-        if name_to_item(n) == Some(item) { return x }
+    for (n, x) in [
+        ("raw_gold", 1.0f32),
+        ("raw_iron", 0.7),
+        ("raw_copper", 0.7),
+        ("beef", 0.35),
+        ("porkchop", 0.35),
+        ("chicken", 0.35),
+        ("mutton", 0.35),
+        ("rabbit", 0.35),
+        ("cod", 0.35),
+        ("salmon", 0.35),
+        ("potato", 0.35),
+        ("kelp", 0.35),
+        ("oak_log", 0.15),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return x;
+        }
     }
-    if smelt_result(item).is_some() { 0.1 } else { 0.0 }
+    if smelt_result(item).is_some() {
+        0.1
+    } else {
+        0.0
+    }
 }
 // grant accumulated smelting xp: floor + fractional chance (vanilla), as orbs at (px,py,pz)
 fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
-    if f.xp <= 0.0 { return }
-    let whole = f.xp.floor() as i16 + if (world_rng::next_u64() % 1024) as f32 / 1024.0 < f.xp.fract() { 1 } else { 0 };
+    if f.xp <= 0.0 {
+        return;
+    }
+    let whole = f.xp.floor() as i16
+        + if (world_rng::next_u64() % 1024) as f32 / 1024.0 < f.xp.fract() {
+            1
+        } else {
+            0
+        };
     f.xp = 0.0;
     if whole > 0 {
-        xps().lock().unwrap().push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x: px, y: py + 1.0, z: pz, val: whole, age: 0 });
+        xps().lock().unwrap().push(Xp {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: px,
+            y: py + 1.0,
+            z: pz,
+            val: whole,
+            age: 0,
+        });
     }
 }
 fn fuel_ticks(item: i64) -> i32 {
-    for (n, t) in [("coal",1600),("charcoal",1600),("oak_log",300),("oak_planks",300),("stick",100),("coal_block",16000)] {
-        if name_to_item(n) == Some(item) { return server_ticks(t) as i32 }
+    for (n, t) in [
+        ("coal", 1600),
+        ("charcoal", 1600),
+        ("oak_log", 300),
+        ("oak_planks", 300),
+        ("stick", 100),
+        ("coal_block", 16000),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return server_ticks(t) as i32;
+        }
     }
     0
 }
@@ -3206,14 +5161,18 @@ fn hash01(x: i32, z: i32) -> f64 {
     h = (h ^ (h >> 13)).wrapping_mul(1274126177);
     ((h ^ (h >> 16)) & 0xffff) as f64 / 65535.0
 }
-fn smooth(t: f64) -> f64 { t * t * (3.0 - 2.0 * t) }
+fn smooth(t: f64) -> f64 {
+    t * t * (3.0 - 2.0 * t)
+}
 fn vnoise(x: f64, z: f64, cell: i32) -> f64 {
     let gx = (x / cell as f64).floor() as i32;
     let gz = (z / cell as f64).floor() as i32;
     let fx = smooth(x / cell as f64 - gx as f64);
     let fz = smooth(z / cell as f64 - gz as f64);
-    let a = hash01(gx, gz); let b = hash01(gx + 1, gz);
-    let c = hash01(gx, gz + 1); let d = hash01(gx + 1, gz + 1);
+    let a = hash01(gx, gz);
+    let b = hash01(gx + 1, gz);
+    let c = hash01(gx, gz + 1);
+    let d = hash01(gx + 1, gz + 1);
     a + (b - a) * fx + (c - a) * fz + (a - b - c + d) * fx * fz
 }
 // surface height: gentle hills, roughly 8..=22
@@ -3239,24 +5198,37 @@ fn column_state(x: i32, y: i32, z: i32, h: i32) -> u32 {
             return name_to_state("water").unwrap_or(98);
         }
         if y <= h + 6 {
-            for dx in -2i32..=2 { for dz in -2i32..=2 {
-                if dx == 0 && dz == 0 { continue }
-                let (tx, tz) = (x + dx, z + dz);
-                if tree_at(tx, tz) {
-                    let th = height_at(tx, tz);
-                    if y >= th + 3 && y <= th + 5 {
-                        return name_to_state("oak_leaves").unwrap_or(98);
+            for dx in -2i32..=2 {
+                for dz in -2i32..=2 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let (tx, tz) = (x + dx, z + dz);
+                    if tree_at(tx, tz) {
+                        let th = height_at(tx, tz);
+                        if y >= th + 3 && y <= th + 5 {
+                            return name_to_state("oak_leaves").unwrap_or(98);
+                        }
                     }
                 }
-            }}
+            }
         }
         return 0;
     }
-    if h <= 11 { // shore floors under/near waterline
-        if y < h - 2 { ore_state(x, y, z) } else { name_to_state("sand").unwrap_or(10) }
-    } else if y < h - 4 { ore_state(x, y, z) }
-    else if y < h - 1 { name_to_state("dirt").unwrap_or(10) }
-    else { name_to_state("grass_block").unwrap_or(9) }
+    if h <= 11 {
+        // shore floors under/near waterline
+        if y < h - 2 {
+            ore_state(x, y, z)
+        } else {
+            name_to_state("sand").unwrap_or(10)
+        }
+    } else if y < h - 4 {
+        ore_state(x, y, z)
+    } else if y < h - 1 {
+        name_to_state("dirt").unwrap_or(10)
+    } else {
+        name_to_state("grass_block").unwrap_or(9)
+    }
 }
 // datapack worldgen (worldgen.rs): vanilla density pipeline
 fn wg2_block(x: i32, y: i32, z: i32) -> Option<u32> {
@@ -3266,42 +5238,74 @@ fn wg2_block(x: i32, y: i32, z: i32) -> Option<u32> {
 }
 
 fn door_base(st: u32) -> Option<u32> {
-    for base in [4590u32, 11822, 11886, 11950, 12014, 12078, 12142, 12206, 12270,
-                 19148, 19212, 23652, 23716, 23780, 23844, 23908, 23972, 24036, 24100] {
-        if (base..base + 64).contains(&st) { return Some(base) }
+    for base in [
+        4590u32, 11822, 11886, 11950, 12014, 12078, 12142, 12206, 12270, 19148, 19212, 23652,
+        23716, 23780, 23844, 23908, 23972, 24036, 24100,
+    ] {
+        if (base..base + 64).contains(&st) {
+            return Some(base);
+        }
     }
     None
 }
 fn gate_base(st: u32) -> Option<u32> {
-    for base in [6997u32, 11310, 11342, 11374, 11406, 11438, 11470, 11502, 11534, 18876, 18908] {
-        if (base..base + 32).contains(&st) { return Some(base) }
+    for base in [
+        6997u32, 11310, 11342, 11374, 11406, 11438, 11470, 11502, 11534, 18876, 18908,
+    ] {
+        if (base..base + 32).contains(&st) {
+            return Some(base);
+        }
     }
     None
 }
-fn container_kind(st: u32) -> Option<&'static str> { // 27-slot generic container blocks
-    if (2954..=2977).contains(&st) { return Some("Chest"); }
-    if (9119..=9142).contains(&st) { return Some("Chest"); }       // trapped_chest
-    if (18408..=18419).contains(&st) { return Some("Barrel"); }
-    if (12562..=12663).contains(&st) { return Some("Shulker Box"); }
+fn container_kind(st: u32) -> Option<&'static str> {
+    // 27-slot generic container blocks
+    if (2954..=2977).contains(&st) {
+        return Some("Chest");
+    }
+    if (9119..=9142).contains(&st) {
+        return Some("Chest");
+    } // trapped_chest
+    if (18408..=18419).contains(&st) {
+        return Some("Barrel");
+    }
+    if (12562..=12663).contains(&st) {
+        return Some("Shulker Box");
+    }
     None
 }
-fn is_chest_pairable(st: u32) -> bool { (2954..=2977).contains(&st) || (9119..=9142).contains(&st) }
+fn is_chest_pairable(st: u32) -> bool {
+    (2954..=2977).contains(&st) || (9119..=9142).contains(&st)
+}
 fn chest_partner(x: i32, y: i32, z: i32) -> Option<(i32, i32, i32)> {
-    if !is_chest_pairable(block_at(x, y, z)) { return None }
+    if !is_chest_pairable(block_at(x, y, z)) {
+        return None;
+    }
     [(x - 1, y, z), (x + 1, y, z), (x, y, z - 1), (x, y, z + 1)]
-        .iter().copied().find(|&(nx, ny, nz)| is_chest_pairable(block_at(nx, ny, nz)))
+        .iter()
+        .copied()
+        .find(|&(nx, ny, nz)| is_chest_pairable(block_at(nx, ny, nz)))
 }
 fn is_fence_or_wall(st: u32) -> bool {
     matches!(st,
           5817..=5848 | 7273..=7304 | 11566..=11821 | 18684..=18747        // fences
         | 7919..=8566 | 14160..=18371 | 19541..=22314 | 24994..=26550)   // walls
-        || (gate_base(st).is_some() && st & 2 != 0)                      // closed fence gate (1.5-high)
+        || (gate_base(st).is_some() && st & 2 != 0) // closed fence gate (1.5-high)
 }
-fn mob_passable(st: u32) -> bool { // a block a mob body can occupy
-    if st == 0 || st == 12958 || st == 12959 { return true; }            // air / void / cave
-    if (80..=111).contains(&st) { return true; }                         // water / lava
-    if is_fence_or_wall(st) { return false; }
-    if gate_base(st).is_some() || door_base(st).is_some() { return st & 2 == 0; } // open gate/door
+fn mob_passable(st: u32) -> bool {
+    // a block a mob body can occupy
+    if st == 0 || st == 12958 || st == 12959 {
+        return true;
+    } // air / void / cave
+    if (80..=111).contains(&st) {
+        return true;
+    } // water / lava
+    if is_fence_or_wall(st) {
+        return false;
+    }
+    if gate_base(st).is_some() || door_base(st).is_some() {
+        return st & 2 == 0;
+    } // open gate/door
     matches!(st,
           25..=78 | 2004..=2010 | 2075..=2090 | 2355..=2871
         | 2978..=4273 | 4278..=4285 | 4302..=4589 | 4654..=4681
@@ -3313,25 +5317,45 @@ fn mob_passable(st: u32) -> bool { // a block a mob body can occupy
         | 18594..=18665 | 19100..=19147 | 20374..=20397 | 22318
         | 22800..=22927 | 24748..=24901 | 26572..=26572)
 }
-fn mob_cell_solid(x: f64, y: f64, z: f64) -> bool { // feet cell solid?
-    !mob_passable(block_at(x.floor() as i32, y.floor() as i32, z.floor() as i32))
+fn mob_cell_solid(x: f64, y: f64, z: f64) -> bool {
+    // feet cell solid?
+    !mob_passable(block_at(
+        x.floor() as i32,
+        y.floor() as i32,
+        z.floor() as i32,
+    ))
 }
-fn mob_move_blocked(nx: f64, fy: f64, nz: f64) -> bool { // destination unreachable?
-    let xi = nx.floor() as i32; let zi = nz.floor() as i32;
+fn mob_move_blocked(nx: f64, fy: f64, nz: f64) -> bool {
+    // destination unreachable?
+    let xi = nx.floor() as i32;
+    let zi = nz.floor() as i32;
     let ty = surface_y(xi, zi);
-    if ty - fy > 1.2 { return true; }                                    // >1-block wall
+    if ty - fy > 1.2 {
+        return true;
+    } // >1-block wall
     let fi = ty.floor() as i32;
-    if is_fence_or_wall(block_at(xi, fi - 1, zi)) { return true; }       // never step onto a fence/wall top
+    if is_fence_or_wall(block_at(xi, fi - 1, zi)) {
+        return true;
+    } // never step onto a fence/wall top
     !mob_passable(block_at(xi, fi, zi)) || !mob_passable(block_at(xi, fi + 1, zi))
 }
 fn ore_state(x: i32, y: i32, z: i32) -> u32 {
-    let oh = ((x as i64).wrapping_mul(0x9E3779B1) ^ (z as i64).wrapping_mul(0x85EBCA77) ^ (y as i64).wrapping_mul(0xC2B2AE3D)) as u64;
+    let oh = ((x as i64).wrapping_mul(0x9E3779B1)
+        ^ (z as i64).wrapping_mul(0x85EBCA77)
+        ^ (y as i64).wrapping_mul(0xC2B2AE3D)) as u64;
     let oh = oh.wrapping_mul(0x27D4EB2F) ^ (oh >> 15);
-    if y <= -52 && y >= -60 && oh % 23 == 0 { return name_to_state("lava").unwrap_or(1) }
-    if y <= -32 && oh % 601 == 0 { name_to_state("diamond_ore").unwrap_or(1) }
-    else if y <= 4 && oh % 197 == 0 { name_to_state("iron_ore").unwrap_or(1) }
-    else if oh % 89 == 0 { name_to_state("coal_ore").unwrap_or(1) }
-    else { name_to_state("stone").unwrap_or(1) }
+    if y <= -52 && y >= -60 && oh % 23 == 0 {
+        return name_to_state("lava").unwrap_or(1);
+    }
+    if y <= -32 && oh % 601 == 0 {
+        name_to_state("diamond_ore").unwrap_or(1)
+    } else if y <= 4 && oh % 197 == 0 {
+        name_to_state("iron_ore").unwrap_or(1)
+    } else if oh % 89 == 0 {
+        name_to_state("coal_ore").unwrap_or(1)
+    } else {
+        name_to_state("stone").unwrap_or(1)
+    }
 }
 fn base_state(x: i32, y: i32, z: i32) -> u32 {
     if let Some(st) = wg2_block(x, y, z) {
@@ -3360,26 +5384,61 @@ static HIDDEN: OnceLock<HashSet<u32>> = OnceLock::new();
 /// names used to be resolved with `filter_map`, which drops a misspelling silently
 /// and leaves that ore visible to clients with nothing reported anywhere.
 const HIDDEN_BLOCK_NAMES: &[&str] = &[
-    "coal_ore", "iron_ore", "gold_ore", "diamond_ore", "lapis_ore", "redstone_ore",
-    "copper_ore", "emerald_ore", "deepslate_coal_ore", "deepslate_iron_ore",
-    "deepslate_diamond_ore", "deepslate_gold_ore", "deepslate_lapis_ore",
-    "deepslate_redstone_ore", "deepslate_copper_ore", "deepslate_emerald_ore",
-    "ancient_debris", "chest", "trapped_chest", "barrel", "ender_chest",
+    "coal_ore",
+    "iron_ore",
+    "gold_ore",
+    "diamond_ore",
+    "lapis_ore",
+    "redstone_ore",
+    "copper_ore",
+    "emerald_ore",
+    "deepslate_coal_ore",
+    "deepslate_iron_ore",
+    "deepslate_diamond_ore",
+    "deepslate_gold_ore",
+    "deepslate_lapis_ore",
+    "deepslate_redstone_ore",
+    "deepslate_copper_ore",
+    "deepslate_emerald_ore",
+    "ancient_debris",
+    "chest",
+    "trapped_chest",
+    "barrel",
+    "ender_chest",
 ];
 fn hidden_states() -> &'static HashSet<u32> {
-    HIDDEN.get_or_init(|| HIDDEN_BLOCK_NAMES.iter().filter_map(|n| name_to_state(n)).collect())
+    HIDDEN.get_or_init(|| {
+        HIDDEN_BLOCK_NAMES
+            .iter()
+            .filter_map(|n| name_to_state(n))
+            .collect()
+    })
 }
 static HIDDEN_EXTRA: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 fn hidden_extra() -> &'static Mutex<HashSet<u32>> {
-    HIDDEN_EXTRA.get_or_init(|| Mutex::new(
-        std::env::var("MC_SPINE_HIDDEN_EXTRA").unwrap_or_default()
-            .split(',').filter_map(|t| t.trim().parse::<u32>().ok()).collect()))
+    HIDDEN_EXTRA.get_or_init(|| {
+        Mutex::new(
+            std::env::var("MC_SPINE_HIDDEN_EXTRA")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|t| t.trim().parse::<u32>().ok())
+                .collect(),
+        )
+    })
 }
-fn is_hidden(st: u32) -> bool { hidden_states().contains(&st) || hidden_extra().lock().unwrap().contains(&st) }
+fn is_hidden(st: u32) -> bool {
+    hidden_states().contains(&st) || hidden_extra().lock().unwrap().contains(&st)
+}
 // neighbors that expose a face (non-occluding): air, liquids, leaves, glass, ice, torches, signs
 fn exposes(st: u32) -> bool {
-    st == 0 || (80..=112).contains(&st) || (264..=291).contains(&st) || (519..=526).contains(&st)
-        || st == 5780 || (2354..=2355).contains(&st) || (4302..=4589).contains(&st) || (19276..=19339).contains(&st)
+    st == 0
+        || (80..=112).contains(&st)
+        || (264..=291).contains(&st)
+        || (519..=526).contains(&st)
+        || st == 5780
+        || (2354..=2355).contains(&st)
+        || (4302..=4589).contains(&st)
+        || (19276..=19339).contains(&st)
 }
 // context-matched filler: majority vote over the six neighbors' WIRE
 // states — what the client already sees around the cell. Matches natural
@@ -3394,34 +5453,82 @@ fn hidden_filler(x: i32, y: i32, z: i32, h: i32) -> u32 {
 // its own reader; taking the lock here would self-deadlock.
 fn hidden_filler_with<F: Fn(i32, i32, i32) -> u32>(rd: &F, x: i32, y: i32, z: i32, h: i32) -> u32 {
     let mut counts: HashMap<u32, u32> = HashMap::new();
-    for (dx, dy, dz) in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
         let (nx, ny, nz) = (x + dx, y + dy, z + dz);
         let ns = rd(nx, ny, nz);
         // a hidden neighbor contributes its own wire state, not the truth —
         // otherwise a buried cluster would betray itself through the mask
-        let w = if is_hidden(ns) && ![(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter()
-            .any(|(ddx,ddy,ddz)| exposes(rd(nx+ddx, ny+ddy, nz+ddz))) {
+        let w = if is_hidden(ns)
+            && ![
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ]
+            .iter()
+            .any(|(ddx, ddy, ddz)| exposes(rd(nx + ddx, ny + ddy, nz + ddz)))
+        {
             base_state(nx, ny, nz)
-        } else { ns };
-        if !exposes(w) { *counts.entry(w).or_insert(0) += 1; }
+        } else {
+            ns
+        };
+        if !exposes(w) {
+            *counts.entry(w).or_insert(0) += 1;
+        }
     }
-    counts.iter().max_by_key(|(_, n)| *n).map(|(st, _)| *st).unwrap_or_else(|| {
-        let st = column_state(x, y, z, h);
-        if is_hidden(st) || exposes(st) { name_to_state("stone").unwrap_or(1) } else { st }
-    })
+    counts
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(st, _)| *st)
+        .unwrap_or_else(|| {
+            let st = column_state(x, y, z, h);
+            if is_hidden(st) || exposes(st) {
+                name_to_state("stone").unwrap_or(1)
+            } else {
+                st
+            }
+        })
 }
 fn block_exposed(x: i32, y: i32, z: i32) -> bool {
-    [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter()
-        .any(|(dx,dy,dz)| exposes(block_at(x+dx, y+dy, z+dz)))
+    [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ]
+    .iter()
+    .any(|(dx, dy, dz)| exposes(block_at(x + dx, y + dy, z + dz)))
 }
 // re-resolve every hidden neighbor's wire state after ANY mutation:
 // exposed -> true state, still-buried -> context filler (re-hide).
 fn refresh_hidden_neighbors(x: i32, y: i32, z: i32) {
-    for (dx,dy,dz) in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
-        let (nx,ny,nz) = (x+dx, y+dy, z+dz);
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        let (nx, ny, nz) = (x + dx, y + dy, z + dz);
         let ns = block_at(nx, ny, nz);
         if is_hidden(ns) {
-            let out = if block_exposed(nx, ny, nz) { ns } else { hidden_filler(nx, ny, nz, height_at(nx, nz)) };
+            let out = if block_exposed(nx, ny, nz) {
+                ns
+            } else {
+                hidden_filler(nx, ny, nz, height_at(nx, nz))
+            };
             note_block_update(nx, ny, nz, out);
         }
     }
@@ -3452,14 +5559,24 @@ impl Region {
     }
 }
 static REGION: OnceLock<Mutex<Region>> = OnceLock::new();
-fn region() -> &'static Mutex<Region> { REGION.get_or_init(|| Mutex::new(Region::default())) }
+fn region() -> &'static Mutex<Region> {
+    REGION.get_or_init(|| Mutex::new(Region::default()))
+}
 /// Borrow the region for the duration of one loop. This is the shape a per-item
 /// membership test in a hot loop should use.
-fn region_guard() -> std::sync::MutexGuard<'static, Region> { region().lock().unwrap() }
+fn region_guard() -> std::sync::MutexGuard<'static, Region> {
+    region().lock().unwrap()
+}
 static FORCELOADED: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
-fn forceloaded() -> &'static Mutex<HashSet<(i32, i32)>> { FORCELOADED.get_or_init(|| Mutex::new(HashSet::new())) }
+fn forceloaded() -> &'static Mutex<HashSet<(i32, i32)>> {
+    FORCELOADED.get_or_init(|| Mutex::new(HashSet::new()))
+}
 fn extend_chunk_square(chunks: &mut HashSet<(i32, i32)>, (cx, cz): (i32, i32), radius: i32) {
-    for dx in -radius..=radius { for dz in -radius..=radius { chunks.insert((cx + dx, cz + dz)); } }
+    for dx in -radius..=radius {
+        for dz in -radius..=radius {
+            chunks.insert((cx + dx, cz + dz));
+        }
+    }
 }
 fn refresh_hot() {
     // collect without holding the hot lock: is_hot callers may hold pos
@@ -3469,25 +5586,42 @@ fn refresh_hot() {
     let mut centers = HashSet::new();
     for c in clients().lock().unwrap().iter() {
         let p = *c.pos.lock().unwrap();
-        centers.insert(((p.0.floor() as i32).div_euclid(16), (p.2.floor() as i32).div_euclid(16)));
+        centers.insert((
+            (p.0.floor() as i32).div_euclid(16),
+            (p.2.floor() as i32).div_euclid(16),
+        ));
     }
     for a in actors().lock().unwrap().values() {
         let p = *a.pos.lock().unwrap();
-        centers.insert(((p.0.floor() as i32).div_euclid(16), (p.2.floor() as i32).div_euclid(16)));
+        centers.insert((
+            (p.0.floor() as i32).div_euclid(16),
+            (p.2.floor() as i32).div_euclid(16),
+        ));
     }
-    for &center in &centers { extend_chunk_square(&mut h, center, 5); }
+    for &center in &centers {
+        extend_chunk_square(&mut h, center, 5);
+    }
     // Square dilation distributes over union: radius 5 + skirt 3 = radius 8.
     // Dense, overlapping centers can make direct expansion MORE work. Choose
     // between equivalent unions by their number of insertion attempts (17²/7²).
-    let direct_cost = forced.len().saturating_mul(49).saturating_add(centers.len().saturating_mul(289));
+    let direct_cost = forced
+        .len()
+        .saturating_mul(49)
+        .saturating_add(centers.len().saturating_mul(289));
     let mut w;
     if direct_cost < h.len().saturating_mul(49) {
         w = HashSet::new();
-        for center in forced { extend_chunk_square(&mut w, center, 3); }
-        for center in centers { extend_chunk_square(&mut w, center, 8); }
+        for center in forced {
+            extend_chunk_square(&mut w, center, 3);
+        }
+        for center in centers {
+            extend_chunk_square(&mut w, center, 8);
+        }
     } else {
         w = h.clone();
-        for &center in &h { extend_chunk_square(&mut w, center, 3); }
+        for &center in &h {
+            extend_chunk_square(&mut w, center, 3);
+        }
     }
     let mut r = region().lock().unwrap();
     r.hot = h;
@@ -3497,7 +5631,9 @@ fn refresh_hot() {
 // the vanilla lazy-chunk analogue (blocks progress, entities don't). The production paths call
 // region().is_warm directly; this wrapper exists for the tests that pin the cold-furnace rule.
 #[cfg(test)]
-fn is_warm(x: i32, z: i32) -> bool { region().lock().unwrap().is_warm(x, z) }
+fn is_warm(x: i32, z: i32) -> bool {
+    region().lock().unwrap().is_warm(x, z)
+}
 
 // generalized lazy-schedule primitive (the Create-generalization core):
 // a cell that produces no observable change doubles its re-check interval
@@ -3505,11 +5641,18 @@ fn is_warm(x: i32, z: i32) -> bool { region().lock().unwrap().is_warm(x, z) }
 // to full rate. Event-driven reset + exponential backoff, not polling.
 // The tick counts live in backoff_ticks; only the 4 s ceiling belongs here.
 static BACKOFF: OnceLock<Mutex<HashMap<(i32, i32, i32), (u64, u32)>>> = OnceLock::new();
-fn backoff() -> &'static Mutex<HashMap<(i32, i32, i32), (u64, u32)>> { BACKOFF.get_or_init(|| Mutex::new(HashMap::new())) }
+fn backoff() -> &'static Mutex<HashMap<(i32, i32, i32), (u64, u32)>> {
+    BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
+}
 static TICK_IDX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn sched_ready(x: i32, y: i32, z: i32) -> bool {
     let now = TICK_IDX.load(Ordering::Relaxed);
-    backoff().lock().unwrap().get(&(x, y, z)).map(|(t, _)| *t <= now).unwrap_or(true)
+    backoff()
+        .lock()
+        .unwrap()
+        .get(&(x, y, z))
+        .map(|(t, _)| *t <= now)
+        .unwrap_or(true)
 }
 static LAVA_QUEUE: OnceLock<Mutex<tick_queue::TickQueue>> = OnceLock::new();
 fn lava_queue() -> &'static Mutex<tick_queue::TickQueue> {
@@ -3554,8 +5697,9 @@ fn requeue_water(x: i32, y: i32, z: i32) {
 fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
     let now = TICK_IDX.load(Ordering::Relaxed);
     let mut b = backoff().lock().unwrap();
-    if did_work { b.remove(&(x, y, z)); }
-    else {
+    if did_work {
+        b.remove(&(x, y, z));
+    } else {
         let fails = b.get(&(x, y, z)).map(|e| e.1).unwrap_or(0) + 1;
         b.insert((x, y, z), (now + backoff_ticks(u64::from(fails)), fails));
     }
@@ -3567,7 +5711,10 @@ fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
 /// existing definition of where the world is simulated, and forceload marks chunks
 /// explicitly. No third notion of "loaded" is introduced.
 fn ticked_chunks() -> Vec<(i32, i32)> {
-    let mut out: Vec<(i32, i32)> = { let r = region_guard(); r.hot.iter().copied().collect() };
+    let mut out: Vec<(i32, i32)> = {
+        let r = region_guard();
+        r.hot.iter().copied().collect()
+    };
     out.extend(forceloaded().lock().unwrap().iter().copied());
     out.sort_unstable();
     out.dedup();
@@ -3599,7 +5746,9 @@ const RANDOM_TICK_SPEED: u32 = 3;
 /// of blocks, and a position that holds nothing costs one array lookup.
 fn random_tick_pass() {
     // The registry is looked up once per pass, not once per sample.
-    let Some(reg) = crate::block_registry::breg() else { return };
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
     for (cx, cz) in ticked_chunks() {
         for sy in ticked_sections(cx, cz) {
             for _ in 0..RANDOM_TICK_SPEED {
@@ -3656,26 +5805,40 @@ fn sched_invalidate(x: i32, y: i32, z: i32) {
     // enough: the delay queues hold their own deadline, so a cell that is already
     // waiting would keep its old slot and not be visited until it came round,
     // which is the opposite of waking it. Promote it to the next tick as well.
-    let cells: [(i32, i32, i32); 7] = [(x, y, z), (x+1, y, z), (x-1, y, z),
-                                      (x, y+1, z), (x, y-1, z), (x, y, z+1), (x, y, z-1)];
+    let cells: [(i32, i32, i32); 7] = [
+        (x, y, z),
+        (x + 1, y, z),
+        (x - 1, y, z),
+        (x, y + 1, z),
+        (x, y - 1, z),
+        (x, y, z + 1),
+        (x, y, z - 1),
+    ];
     {
         let mut b = backoff().lock().unwrap();
-        for c in cells { b.remove(&c); }
+        for c in cells {
+            b.remove(&c);
+        }
     }
     if !water_queue().lock().unwrap().is_empty() {
         let mut q = water_queue().lock().unwrap();
-        for c in cells { q.promote(c); }
+        for c in cells {
+            q.promote(c);
+        }
     }
     if !lava_queue().lock().unwrap().is_empty() {
         let mut q = lava_queue().lock().unwrap();
-        for c in cells { q.promote(c); }
+        for c in cells {
+            q.promote(c);
+        }
     }
     if !hopper_queue().lock().unwrap().is_empty() {
         let mut q = hopper_queue().lock().unwrap();
-        for c in cells { q.promote(c); }
+        for c in cells {
+            q.promote(c);
+        }
     }
 }
-
 
 // ---------- native plugin trampoline (contract v0) ----------
 // Plugins never get a raw tick callback. The only execution path is
@@ -3685,22 +5848,34 @@ fn sched_invalidate(x: i32, y: i32, z: i32) {
 // and every block_write flows through set_block (occlusion + batch +
 // invalidation) exactly like internal systems.
 #[derive(Clone, Copy, PartialEq)]
-enum WorkResult { Work, NoOp }
+enum WorkResult {
+    Work,
+    NoOp,
+}
 
-const PLUGIN_FUEL: i32 = 256;              // host calls per tick_cell
-const PLUGIN_MAX_CELLS: usize = 4096;      // per-plugin scheduled volume cap
+const PLUGIN_FUEL: i32 = 256; // host calls per tick_cell
+const PLUGIN_MAX_CELLS: usize = 4096; // per-plugin scheduled volume cap
 
-pub struct PluginApi { fuel: i32, pi: usize }
+pub struct PluginApi {
+    fuel: i32,
+    pi: usize,
+}
 impl PluginApi {
     fn spend(&mut self) -> Result<(), &'static str> {
-        if self.fuel <= 0 { return Err("fuel"); }
-        self.fuel -= 1; Ok(())
+        if self.fuel <= 0 {
+            return Err("fuel");
+        }
+        self.fuel -= 1;
+        Ok(())
     }
     pub fn block_get(&mut self, x: i32, y: i32, z: i32) -> Result<u32, &'static str> {
-        self.spend()?; Ok(block_at(x, y, z))
+        self.spend()?;
+        Ok(block_at(x, y, z))
     }
     pub fn block_set(&mut self, x: i32, y: i32, z: i32, st: u32) -> Result<(), &'static str> {
-        self.spend()?; set_block(x, y, z, st); Ok(())
+        self.spend()?;
+        set_block(x, y, z, st);
+        Ok(())
     }
     /// Declare a state id hidden (ore/vault/etc): occlusion masking and
     /// reveal-on-expose apply to it exactly like the built-in set.
@@ -3709,13 +5884,32 @@ impl PluginApi {
         hidden_extra().lock().unwrap().insert(st);
         Ok(())
     }
-    pub fn schedule_cell(&mut self, x: i32, y: i32, z: i32, key: u32, warm_ok: bool) -> Result<(), &'static str> {
+    pub fn schedule_cell(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        key: u32,
+        warm_ok: bool,
+    ) -> Result<(), &'static str> {
         self.spend()?;
         let mut cells = plugin_cells().lock().unwrap();
-        if cells.values().flatten().filter(|c| c.pi == self.pi).count() >= PLUGIN_MAX_CELLS { return Err("cell cap"); }
+        if cells.values().flatten().filter(|c| c.pi == self.pi).count() >= PLUGIN_MAX_CELLS {
+            return Err("cell cap");
+        }
         let bucket = cells.entry((x >> 4, z >> 4)).or_default();
-        if !bucket.iter().any(|c| c.pi == self.pi && c.x == x && c.y == y && c.z == z && c.key == key) {
-            bucket.push(PluginCell { pi: self.pi, x, y, z, key, warm_ok });
+        if !bucket
+            .iter()
+            .any(|c| c.pi == self.pi && c.x == x && c.y == y && c.z == z && c.key == key)
+        {
+            bucket.push(PluginCell {
+                pi: self.pi,
+                x,
+                y,
+                z,
+                key,
+                warm_ok,
+            });
         }
         Ok(())
     }
@@ -3728,19 +5922,37 @@ trait Plugin: Send {
 }
 
 #[derive(Clone)]
-struct PluginCell { pi: usize, x: i32, y: i32, z: i32, key: u32, warm_ok: bool }
+struct PluginCell {
+    pi: usize,
+    x: i32,
+    y: i32,
+    z: i32,
+    key: u32,
+    warm_ok: bool,
+}
 type CellKey = (usize, i32, i32, i32, u32);
 static PLUGIN_CELLS: OnceLock<Mutex<HashMap<(i32, i32), Vec<PluginCell>>>> = OnceLock::new();
 static PLUGIN_BACKOFF: OnceLock<Mutex<HashMap<CellKey, (u64, u8)>>> = OnceLock::new();
 static PLUGINS: OnceLock<Mutex<Vec<Box<dyn Plugin>>>> = OnceLock::new();
-fn plugin_cells() -> &'static Mutex<HashMap<(i32, i32), Vec<PluginCell>>> { PLUGIN_CELLS.get_or_init(|| Mutex::new(HashMap::new())) }
-fn plugin_backoff() -> &'static Mutex<HashMap<CellKey, (u64, u8)>> { PLUGIN_BACKOFF.get_or_init(|| Mutex::new(HashMap::new())) }
+fn plugin_cells() -> &'static Mutex<HashMap<(i32, i32), Vec<PluginCell>>> {
+    PLUGIN_CELLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn plugin_backoff() -> &'static Mutex<HashMap<CellKey, (u64, u8)>> {
+    PLUGIN_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
+}
 fn plugins() -> &'static Mutex<Vec<Box<dyn Plugin>>> {
     PLUGINS.get_or_init(|| {
         let mut v: Vec<Box<dyn Plugin>> = Vec::new();
         let want = std::env::var("MC_SPINE_PLUGINS").unwrap_or_default();
-        if want.split(',').any(|w| w.trim() == "growthlamp") { v.push(Box::new(GrowthLamp)); }
-        if !v.is_empty() { eprintln!("[plugins] loaded: {}", v.iter().map(|p| p.id()).collect::<Vec<_>>().join(",")); }
+        if want.split(',').any(|w| w.trim() == "growthlamp") {
+            v.push(Box::new(GrowthLamp));
+        }
+        if !v.is_empty() {
+            eprintln!(
+                "[plugins] loaded: {}",
+                v.iter().map(|p| p.id()).collect::<Vec<_>>().join(",")
+            );
+        }
         Mutex::new(v)
     })
 }
@@ -3750,7 +5962,9 @@ fn plugin_sched_remove(x: i32, y: i32, z: i32) {
     let ck = (x >> 4, z >> 4);
     if let Some(b) = cells.get_mut(&ck) {
         b.retain(|c| !(c.x == x && c.y == y && c.z == z));
-        if b.is_empty() { cells.remove(&ck); }
+        if b.is_empty() {
+            cells.remove(&ck);
+        }
     }
 }
 
@@ -3758,11 +5972,13 @@ fn plugin_sched_remove(x: i32, y: i32, z: i32) {
 // neighbor-update reach) — invalidation is NOT depth-gated.
 fn plugin_invalidate(x: i32, y: i32, z: i32) {
     let cells = plugin_cells().lock().unwrap();
-    if cells.is_empty() { return }
+    if cells.is_empty() {
+        return;
+    }
     // a cell within Chebyshev-1 lives in one of the 3x3 surrounding chunks
     let mut b = plugin_backoff().lock().unwrap();
-    for cx in (x >> 4) - 1..= (x >> 4) + 1 {
-        for cz in (z >> 4) - 1..= (z >> 4) + 1 {
+    for cx in (x >> 4) - 1..=(x >> 4) + 1 {
+        for cz in (z >> 4) - 1..=(z >> 4) + 1 {
             if let Some(bucket) = cells.get(&(cx, cz)) {
                 for c in bucket {
                     if (c.x - x).abs() <= 1 && (c.y - y).abs() <= 1 && (c.z - z).abs() <= 1 {
@@ -3776,24 +5992,50 @@ fn plugin_invalidate(x: i32, y: i32, z: i32) {
 
 fn plugin_tick() {
     let nplug = { plugins().lock().unwrap().len() };
-    if nplug == 0 { return }
-    let cells: Vec<PluginCell> = plugin_cells().lock().unwrap().values().flatten().cloned().collect();
-    if cells.is_empty() { return }
+    if nplug == 0 {
+        return;
+    }
+    let cells: Vec<PluginCell> = plugin_cells()
+        .lock()
+        .unwrap()
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+    if cells.is_empty() {
+        return;
+    }
     let region = region_guard();
     let now = TICK_IDX.load(Ordering::Relaxed);
     for c in cells {
         let ck = (c.pi, c.x, c.y, c.z, c.key);
-        let due = plugin_backoff().lock().unwrap().get(&ck).map(|(t, _)| *t <= now).unwrap_or(true);
-        if !due { continue }
-        if !(region.is_hot(c.x, c.z) || (c.warm_ok && region.is_warm(c.x, c.z))) { continue }
-        let mut api = PluginApi { fuel: PLUGIN_FUEL, pi: c.pi };
+        let due = plugin_backoff()
+            .lock()
+            .unwrap()
+            .get(&ck)
+            .map(|(t, _)| *t <= now)
+            .unwrap_or(true);
+        if !due {
+            continue;
+        }
+        if !(region.is_hot(c.x, c.z) || (c.warm_ok && region.is_warm(c.x, c.z))) {
+            continue;
+        }
+        let mut api = PluginApi {
+            fuel: PLUGIN_FUEL,
+            pi: c.pi,
+        };
         let res = {
             let mut pl = plugins().lock().unwrap();
-            match pl.get_mut(c.pi) { Some(p) => p.tick_cell(&mut api, c.x, c.y, c.z, c.key), None => continue }
+            match pl.get_mut(c.pi) {
+                Some(p) => p.tick_cell(&mut api, c.x, c.y, c.z, c.key),
+                None => continue,
+            }
         };
         let mut b = plugin_backoff().lock().unwrap();
-        if res == WorkResult::Work { b.remove(&ck); }
-        else {
+        if res == WorkResult::Work {
+            b.remove(&ck);
+        } else {
             let f = b.get(&ck).map(|e| e.1).unwrap_or(0) + 1;
             b.insert(ck, (now + (1u64 << f.min(4)), f.min(4)));
         }
@@ -3807,22 +6049,38 @@ fn plugin_tick() {
 const ST_GROWTH_LAMP: u32 = 9900;
 struct GrowthLamp;
 impl Plugin for GrowthLamp {
-    fn id(&self) -> &'static str { "growthlamp" }
+    fn id(&self) -> &'static str {
+        "growthlamp"
+    }
     fn tick_cell(&mut self, api: &mut PluginApi, x: i32, y: i32, z: i32, _key: u32) -> WorkResult {
         let mut did = false;
-        for dx in -2..=2 { for dy in -2..=2 { for dz in -2..=2 {
-            let (bx, by, bz) = (x + dx, y + dy, z + dz);
-            match api.block_get(bx, by, bz) { Ok(st) if (4278..4285).contains(&st) => {
-                if api.block_set(bx, by, bz, st + 1).is_ok() { did = true; }
-            } _ => {} }
-        } } }
-        if did { WorkResult::Work } else { WorkResult::NoOp }
+        for dx in -2..=2 {
+            for dy in -2..=2 {
+                for dz in -2..=2 {
+                    let (bx, by, bz) = (x + dx, y + dy, z + dz);
+                    match api.block_get(bx, by, bz) {
+                        Ok(st) if (4278..4285).contains(&st) => {
+                            if api.block_set(bx, by, bz, st + 1).is_ok() {
+                                did = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if did {
+            WorkResult::Work
+        } else {
+            WorkResult::NoOp
+        }
     }
 }
 
 // per-tick block-change batching (vanilla multi_block_change, 0x49):
 // N individual block_change packets -> 1 packet per touched section.
-static PENDING_BLOCKS: OnceLock<Mutex<HashMap<(i32, i32, i32), HashMap<u16, u32>>>> = OnceLock::new();
+static PENDING_BLOCKS: OnceLock<Mutex<HashMap<(i32, i32, i32), HashMap<u16, u32>>>> =
+    OnceLock::new();
 fn pending_blocks() -> &'static Mutex<HashMap<(i32, i32, i32), HashMap<u16, u32>>> {
     PENDING_BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -3831,8 +6089,12 @@ fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
     // reach the wire as its true id, on ANY path — chunk send AND deltas.
     let out = if is_hidden(st) && !block_exposed(x, y, z) {
         hidden_filler(x, y, z, height_at(x, z))
-    } else { st };
-    pending_blocks().lock().unwrap()
+    } else {
+        st
+    };
+    pending_blocks()
+        .lock()
+        .unwrap()
         .entry((x.div_euclid(16), y.div_euclid(16), z.div_euclid(16)))
         .or_default()
         .insert((((x & 15) << 8) | ((z & 15) << 4) | (y & 15)) as u16, out);
@@ -3841,10 +6103,13 @@ fn flush_block_updates() {
     let map = std::mem::take(&mut *pending_blocks().lock().unwrap());
     for ((sx, sy, sz), recs) in map {
         let mut p = Vec::with_capacity(9 + recs.len() * 5);
-        let key = ((sx as i64 & 0x3fffff) << 42) | ((sz as i64 & 0x3fffff) << 20) | (sy as i64 & 0xfffff);
+        let key =
+            ((sx as i64 & 0x3fffff) << 42) | ((sz as i64 & 0x3fffff) << 20) | (sy as i64 & 0xfffff);
         p.extend_from_slice(&key.to_be_bytes());
         write_varint(&mut p, recs.len() as i64);
-        for (idx, st) in &recs { write_varint(&mut p, ((*st as i64) << 12) | *idx as i64); }
+        for (idx, st) in &recs {
+            write_varint(&mut p, ((*st as i64) << 12) | *idx as i64);
+        }
         broadcast_chunk(sx, sz, |_c| (0x49, p.clone()));
     }
 }
@@ -3864,57 +6129,107 @@ fn set_block(x: i32, y: i32, z: i32, st: u32) {
 fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
     let mut w = world().lock().unwrap();
     let c = w.entry((x >> 4, z >> 4)).or_default();
-    let old = c.get(&local_idx(x, y, z)).copied().unwrap_or_else(|| base_state(x, y, z));
-    if expected.is_some_and(|value| old != value) { return false; }
-    if st == base_state(x, y, z) { c.remove(&local_idx(x, y, z)); } else { c.insert(local_idx(x, y, z), st); }
+    let old = c
+        .get(&local_idx(x, y, z))
+        .copied()
+        .unwrap_or_else(|| base_state(x, y, z));
+    if expected.is_some_and(|value| old != value) {
+        return false;
+    }
+    if st == base_state(x, y, z) {
+        c.remove(&local_idx(x, y, z));
+    } else {
+        c.insert(local_idx(x, y, z), st);
+    }
     drop(w);
     if st != old {
         // identity change: per-position metadata cannot survive the
         // block that owned it (a new chest at a broken chest's spot
         // must NOT resurrect the old contents — that is an item-dupe).
-        signs().lock().unwrap().retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));
+        signs()
+            .lock()
+            .unwrap()
+            .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));
         // broken containers throw their contents (vanilla): one drop
         // entity per stack, not per item.
         let mut spill: Vec<Stack> = Vec::new();
         if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z)) {
-            spill.extend(slots.values().cloned().filter(|(it, cn, _)| *it > 0 && *cn > 0));
+            spill.extend(
+                slots
+                    .values()
+                    .cloned()
+                    .filter(|(it, cn, _)| *it > 0 && *cn > 0),
+            );
         }
         if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z)) {
-            spill.extend([f.input.clone(), f.fuel.clone(), f.output.clone()].into_iter().filter(|(it, cn, _)| *it > 0 && *cn > 0));
+            spill.extend(
+                [f.input.clone(), f.fuel.clone(), f.output.clone()]
+                    .into_iter()
+                    .filter(|(it, cn, _)| *it > 0 && *cn > 0),
+            );
         }
         if !spill.is_empty() {
             let mut ds = drops().lock().unwrap();
             for (item, cnt, comps) in spill {
-                ds.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    x: x as f64 + 0.5, y: y as f64 + 0.5, z: z as f64 + 0.5,
-                    item, cnt, comps, age: 0 });
+                ds.push(Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.5,
+                    z: z as f64 + 0.5,
+                    item,
+                    cnt,
+                    comps,
+                    age: 0,
+                });
             }
         }
         disp_power().lock().unwrap().remove(&(x, y, z));
         obs_unpower().lock().unwrap().remove(&(x, y, z));
-        if !(4278..=4285).contains(&st) { crops().lock().unwrap().remove(&(x, y, z)); }
+        if !(4278..=4285).contains(&st) {
+            crops().lock().unwrap().remove(&(x, y, z));
+        }
     }
     let mut hh = hoppers().lock().unwrap();
     if (9225..=9234).contains(&st) {
-        if hh.len() < HOPPER_CAP { hh.insert((x, y, z)); }
+        if hh.len() < HOPPER_CAP {
+            hh.insert((x, y, z));
+        }
         hopper_queue().lock().unwrap().schedule((x, y, z), 1);
-    } else { hh.remove(&(x, y, z)); }
+    } else {
+        hh.remove(&(x, y, z));
+    }
     drop(hh);
     let mut wtr = waters().lock().unwrap();
     if (80..=95).contains(&st) {
         wtr.insert((x, y, z));
         water_queue().lock().unwrap().schedule((x, y, z), 1);
-    } else { wtr.remove(&(x, y, z)); }
+    } else {
+        wtr.remove(&(x, y, z));
+    }
     drop(wtr);
     let mut lv = lavas().lock().unwrap();
     if (96..=111).contains(&st) {
         lv.insert((x, y, z));
         lava_queue().lock().unwrap().schedule((x, y, z), 1);
-    } else { lv.remove(&(x, y, z)); }
+    } else {
+        lv.remove(&(x, y, z));
+    }
     drop(lv);
     plugin_sched_remove(x, y, z);
     if st == ST_GROWTH_LAMP {
-        plugin_cells().lock().unwrap().entry((x >> 4, z >> 4)).or_default().push(PluginCell { pi: 0, x, y, z, key: 0, warm_ok: true });
+        plugin_cells()
+            .lock()
+            .unwrap()
+            .entry((x >> 4, z >> 4))
+            .or_default()
+            .push(PluginCell {
+                pi: 0,
+                x,
+                y,
+                z,
+                key: 0,
+                warm_ok: true,
+            });
     }
     refresh_hidden_neighbors(x, y, z);
     block_updated(x, y, z);
@@ -3930,21 +6245,46 @@ fn is_power_source(x: i32, y: i32, z: i32) -> bool {
         || plate_powered(st)
 }
 fn piston_powered(px: i32, py: i32, pz: i32) -> bool {
-    for (dx, dy, dz) in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
-        if is_power_source(px + dx, py + dy, pz + dz) { return true }
-        if is_power_source(px + dx, py + 1 + dy, pz + dz) { return true } // QC: cell above's neighbors
-        if plate_powered(block_at(px + dx, py + dy + 1, pz + dz)) { return true } // plate on the cell
-
+    for (dx, dy, dz) in [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        if is_power_source(px + dx, py + dy, pz + dz) {
+            return true;
+        }
+        if is_power_source(px + dx, py + 1 + dy, pz + dz) {
+            return true;
+        } // QC: cell above's neighbors
+        if plate_powered(block_at(px + dx, py + dy + 1, pz + dz)) {
+            return true;
+        } // plate on the cell
     }
     false
 }
 fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
-    let lo = if (2011..=2022).contains(&st) { 2011u32 } else { 1992 };
+    let lo = if (2011..=2022).contains(&st) {
+        2011u32
+    } else {
+        1992
+    };
     let off = st - lo;
     let is_ext = off < 6;
-    if is_ext == extended { return }
+    if is_ext == extended {
+        return;
+    }
     let facing = (off % 6) as i32;
-    let (fx, fy, fz) = match facing { 0 => (0,0,-1), 1 => (1,0,0), 2 => (0,0,1), 3 => (-1,0,0), 4 => (0,1,0), _ => (0,-1,0) };
+    let (fx, fy, fz) = match facing {
+        0 => (0, 0, -1),
+        1 => (1, 0, 0),
+        2 => (0, 0, 1),
+        3 => (-1, 0, 0),
+        4 => (0, 1, 0),
+        _ => (0, -1, 0),
+    };
     let (px, py, pz) = (bx + fx, by + fy, bz + fz);
     if extended {
         set_block(bx, by, bz, st - 6);
@@ -3979,21 +6319,39 @@ fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
     }
 }
 fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
-    let lo = if (523..=534).contains(&st) { 523u32 } else { 9345 };
+    let lo = if (523..=534).contains(&st) {
+        523u32
+    } else {
+        9345
+    };
     let fi = ((st - lo) / 2) % 6;
-    let (fx, fy, fz) = match fi { 0 => (0,0,-1), 1 => (1,0,0), 2 => (0,0,1), 3 => (-1,0,0), 4 => (0,1,0), _ => (0,-1,0) };
+    let (fx, fy, fz) = match fi {
+        0 => (0, 0, -1),
+        1 => (1, 0, 0),
+        2 => (0, 0, 1),
+        3 => (-1, 0, 0),
+        4 => (0, 1, 0),
+        _ => (0, -1, 0),
+    };
     let (tx, ty, tz) = (dx + fx, dy + fy, dz + fz);
-    let first = chests().lock().unwrap().get(&(dx, dy, dz))
-        .and_then(|m| m.iter().find(|(_, v)| v.1 > 0).map(|(k, v)| (*k, v.clone())));
-    let Some((slot, (item, _cnt, _fc))) = first else { return };
+    let first = chests().lock().unwrap().get(&(dx, dy, dz)).and_then(|m| {
+        m.iter()
+            .find(|(_, v)| v.1 > 0)
+            .map(|(k, v)| (*k, v.clone()))
+    });
+    let Some((slot, (item, _cnt, _fc))) = first else {
+        return;
+    };
     match item {
-        909 => { // water_bucket -> place source
+        909 => {
+            // water_bucket -> place source
             if block_at(tx, ty, tz) == 0 {
                 set_block(tx, ty, tz, 80);
                 note_block_update(tx, ty, tz, 80);
             }
         }
-        960 => { // bone_meal -> grow crop at target
+        960 => {
+            // bone_meal -> grow crop at target
             let cst = block_at(tx, ty, tz);
             if (4278..=4285).contains(&cst) {
                 let nst = (cst + 3).min(4285);
@@ -4006,20 +6364,33 @@ fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
             }
             let mut ch = chests().lock().unwrap();
             if let Some(m) = ch.get_mut(&(dx, dy, dz)) {
-                if let Some(v) = m.get_mut(&slot) { v.1 = v.1.saturating_sub(1); if v.1 == 0 { m.remove(&slot); } }
+                if let Some(v) = m.get_mut(&slot) {
+                    v.1 = v.1.saturating_sub(1);
+                    if v.1 == 0 {
+                        m.remove(&slot);
+                    }
+                }
             }
         }
         _ => {}
     }
 }
 static OBS_PULSE: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn obs_pulse() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { OBS_PULSE.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
+fn obs_pulse() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
+    OBS_PULSE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 static DISP_POWER: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn disp_power() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { DISP_POWER.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
+fn disp_power() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
+    DISP_POWER.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 static WATERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn waters() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { WATERS.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
+fn waters() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
+    WATERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 static LAVAS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn lavas() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> { LAVAS.get_or_init(|| Mutex::new(std::collections::HashSet::new())) }
+fn lavas() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
+    LAVAS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 
 thread_local! { static UPD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) } }
 thread_local! { static UPD_DEFER: std::cell::RefCell<Vec<(i32, i32, i32)>> = const { std::cell::RefCell::new(Vec::new()) } }
@@ -4040,7 +6411,9 @@ fn block_updated(x: i32, y: i32, z: i32) {
     UPD_DEPTH.set(depth);
     if depth == 0 {
         loop {
-            let Some((dx, dy, dz)) = UPD_DEFER.with(|d| d.borrow_mut().pop()) else { break };
+            let Some((dx, dy, dz)) = UPD_DEFER.with(|d| d.borrow_mut().pop()) else {
+                break;
+            };
             UPD_DEPTH.set(1);
             block_updated_inner(dx, dy, dz);
             UPD_DEPTH.set(0);
@@ -4052,7 +6425,15 @@ fn block_updated(x: i32, y: i32, z: i32) {
 /// world, and this owns its state until it lands. `dy` is the vertical velocity and is
 /// integrated with vanilla's 0.04-per-tick gravity (`y_n = y0 - 0.02 n(n+1)`).
 #[derive(Clone, Debug)]
-struct Fall { eid: i32, x: f64, y: f64, z: f64, dy: f64, state: u32, time: i32 }
+struct Fall {
+    eid: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    dy: f64,
+    state: u32,
+    time: i32,
+}
 static FALLING: OnceLock<Mutex<Vec<Fall>>> = OnceLock::new();
 fn falling() -> &'static Mutex<Vec<Fall>> {
     FALLING.get_or_init(|| Mutex::new(Vec::new()))
@@ -4061,7 +6442,9 @@ fn falling() -> &'static Mutex<Vec<Fall>> {
 /// Whether a block can be fallen into. Vanilla replaces air and fluids; the registry's opacity is
 /// the closest thing to hand, and a full block never is.
 fn fallable_state(st: u32) -> bool {
-    let Some(reg) = crate::block_registry::breg() else { return false };
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
     // Vanilla's collision uses the block's shape, so air, fluids and blocks a player can replace
     // (grass, flowers, torches, rails) have no collision shape: a falling block passes through
     // them and replaces them on landing. `is_replaceable` is the registry's closest predicate.
@@ -4081,12 +6464,20 @@ fn fallable(x: i32, y: i32, z: i32) -> bool {
 /// piston, changes that cell while leaving everything under it untouched, and a check that only
 /// looked upward left the block hanging.
 fn note_falling(x: i32, y: i32, z: i32) {
-    let Some(reg) = crate::block_registry::breg() else { return };
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
     for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {
-        if py <= MIN_Y { continue }
+        if py <= MIN_Y {
+            continue;
+        }
         let st = block_at(px, py, pz);
-        if reg.behaviour_of(st) != crate::block_registry::B_FALLING { continue }
-        if !fallable(px, py - 1, pz) { continue }
+        if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
+            continue;
+        }
+        if !fallable(px, py - 1, pz) {
+            continue;
+        }
         spawn_fall(px, py, pz, st);
     }
 }
@@ -4103,12 +6494,19 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
     // cell" was wrong: a falling entity has already left its block cell, so a *new* gravity block
     // placed into that cell matched the passing entity and hung in the air forever.
     with_save_guard(|| {
-        if !set_block_if(px, py, pz, 0, Some(st)) { return; }
+        if !set_block_if(px, py, pz, 0, Some(st)) {
+            return;
+        }
         note_block_update(px, py, pz, 0);
         let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         falling().lock().unwrap().push(Fall {
-            eid, x: px as f64 + 0.5, y: py as f64, z: pz as f64 + 0.5,
-            dy: 0.0, state: st, time: 0,
+            eid,
+            x: px as f64 + 0.5,
+            y: py as f64,
+            z: pz as f64 + 0.5,
+            dy: 0.0,
+            state: st,
+            time: 0,
         });
     });
 }
@@ -4155,7 +6553,10 @@ fn falling_tick() {
         for mut f in active {
             // A block in flight is an entity in vanilla, so it does not tick in a chunk nobody
             // is near; it stays in flight until the chunk warms up.
-            if !region.is_warm(f.x as i32, f.z as i32) { keep.push(f); continue; }
+            if !region.is_warm(f.x as i32, f.z as i32) {
+                keep.push(f);
+                continue;
+            }
             f.time += 1;
             f.dy -= 0.04;
             let new_y = f.y + f.dy;
@@ -4168,7 +6569,9 @@ fn falling_tick() {
             let old_floor = f.y.floor() as i32;
             let lowest = (new_y.floor() as i32).max(MIN_Y);
             let mut support = old_floor;
-            while support >= lowest && fallable(bx, support, bz) { support -= 1; }
+            while support >= lowest && fallable(bx, support, bz) {
+                support -= 1;
+            }
             if support >= lowest {
                 // Defer the placement to the application pass below, which re-checks the cell.
                 landings.push((f, bx, support + 1, bz));
@@ -4180,7 +6583,13 @@ fn falling_tick() {
                 if let Some(item) = block_drop(f.state) {
                     below.push(Drop {
                         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                        x: f.x, y: f.y, z: f.z, item, cnt: 1, comps: Vec::new(), age: 0,
+                        x: f.x,
+                        y: f.y,
+                        z: f.z,
+                        item,
+                        cnt: 1,
+                        comps: Vec::new(),
+                        age: 0,
                     });
                 }
                 despawn.push(f.eid);
@@ -4192,7 +6601,9 @@ fn falling_tick() {
         }
     }
     with_save_guard(|| {
-        if !below.is_empty() { drops().lock().unwrap().extend(below); }
+        if !below.is_empty() {
+            drops().lock().unwrap().extend(below);
+        }
         end_falling_tick(&processed, keep);
         for (fa, bx, top, bz) in landings {
             // Revalidate and replace the landing cell atomically: a connection thread can
@@ -4214,9 +6625,13 @@ fn falling_tick() {
         }
     });
     for (eid, x, y, z) in moves {
-        broadcast_seen(eid, |_| (0x70, entity_teleport(eid, x, y, z, 0.0, 0.0, true)));
+        broadcast_seen(eid, |_| {
+            (0x70, entity_teleport(eid, x, y, z, 0.0, 0.0, true))
+        });
     }
-    for eid in despawn { broadcast_seen_destroy(eid); }
+    for eid in despawn {
+        broadcast_seen_destroy(eid);
+    }
 }
 
 fn block_updated_inner(x: i32, y: i32, z: i32) {
@@ -4224,7 +6639,15 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
     // called exactly when something under it changed.
     note_falling(x, y, z);
     // piston eval: changed cell + its 6 neighbors
-    for (dx, dy, dz) in [(0,0,0),(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
+    for (dx, dy, dz) in [
+        (0, 0, 0),
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
         let (bx, by, bz) = (x + dx, y + dy, z + dz);
         let st = block_at(bx, by, bz);
         if (2011..=2022).contains(&st) || (1992..=2003).contains(&st) {
@@ -4233,34 +6656,67 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
         }
         // tnt ignite: tnt next to a power source (direct adjacency — vanilla TNT has no QC)
         if (2094..=2095).contains(&st)
-            && [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter().any(|(ddx, ddy, ddz)| is_power_source(bx + ddx, by + ddy, bz + ddz)) {
+            && [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ]
+            .iter()
+            .any(|(ddx, ddy, ddz)| is_power_source(bx + ddx, by + ddy, bz + ddz))
+        {
             set_block(bx, by, bz, 0);
             note_block_update(bx, by, bz, 0);
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-            primed().lock().unwrap().push(Primed { eid, x: bx as f64 + 0.5, y: by as f64, z: bz as f64 + 0.5, left: server_ticks(TNT_FUSE_GT) as i32 });
+            primed().lock().unwrap().push(Primed {
+                eid,
+                x: bx as f64 + 0.5,
+                y: by as f64,
+                z: bz as f64 + 0.5,
+                left: server_ticks(TNT_FUSE_GT) as i32,
+            });
             // interest_tick delivers the arrow spawn to trackers
         }
         // observer: watched cell changed -> pulse next tick
         if (12550..=12561).contains(&st) {
             let fi = ((st - 12550) % 6) as i32;
-            let (fx, fy, fz) = match fi { 0 => (0,0,-1), 1 => (1,0,0), 2 => (0,0,1), 3 => (-1,0,0), 4 => (0,1,0), _ => (0,-1,0) };
+            let (fx, fy, fz) = match fi {
+                0 => (0, 0, -1),
+                1 => (1, 0, 0),
+                2 => (0, 0, 1),
+                3 => (-1, 0, 0),
+                4 => (0, 1, 0),
+                _ => (0, -1, 0),
+            };
             if (bx + fx, by + fy, bz + fz) == (x, y, z) && (st - 12550) / 6 == 0 {
                 obs_pulse().lock().unwrap().insert((bx, by, bz));
             }
         }
         // dispenser/dropper edge: fire on power rising
         if (523..=534).contains(&st) || (9345..=9356).contains(&st) {
-            let powered = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter()
-                .any(|(ddx, ddy, ddz)| is_power_source(bx + ddx, by + ddy, bz + ddz));
+            let powered = [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ]
+            .iter()
+            .any(|(ddx, ddy, ddz)| is_power_source(bx + ddx, by + ddy, bz + ddz));
             let mut dp = disp_power().lock().unwrap();
-            if powered && !dp.contains(&(bx, by, bz)) { dp.insert((bx, by, bz)); drop(dp); fire_dispenser(bx, by, bz, st); }
-            else if !powered { dp.remove(&(bx, by, bz)); }
+            if powered && !dp.contains(&(bx, by, bz)) {
+                dp.insert((bx, by, bz));
+                drop(dp);
+                fire_dispenser(bx, by, bz, st);
+            } else if !powered {
+                dp.remove(&(bx, by, bz));
+            }
         }
     }
 }
-
-
-
 
 fn gc_backoff() {
     // Backoff entries outlive their owners (a dried-up water cell, a
@@ -4270,12 +6726,20 @@ fn gc_backoff() {
     let wtr = waters().lock().unwrap();
     let hh = hoppers().lock().unwrap();
     let cells = plugin_cells().lock().unwrap();
-    backoff().lock().unwrap().retain(|k, _|
-        wtr.contains(k) || hh.contains(k)
-            || cells.values().flatten().any(|c| c.x == k.0 && c.y == k.1 && c.z == k.2));
+    backoff().lock().unwrap().retain(|k, _| {
+        wtr.contains(k)
+            || hh.contains(k)
+            || cells
+                .values()
+                .flatten()
+                .any(|c| c.x == k.0 && c.y == k.1 && c.z == k.2)
+    });
     let mut pb = plugin_backoff().lock().unwrap();
-    let live: std::collections::HashSet<CellKey> =
-        cells.values().flatten().map(|c| (c.pi, c.x, c.y, c.z, c.key)).collect();
+    let live: std::collections::HashSet<CellKey> = cells
+        .values()
+        .flatten()
+        .map(|c| (c.pi, c.x, c.y, c.z, c.key))
+        .collect();
     pb.retain(|k, _| live.contains(k));
 }
 
@@ -4307,15 +6771,28 @@ fn rebuild_derived_indexes() {
                 hh.insert((x, y, z));
                 hopper_queue().lock().unwrap().schedule((x, y, z), 1);
             }
-            if (4278..=4285).contains(st) { cg.insert((x, y, z), (*st - 4278) as u8); }
+            if (4278..=4285).contains(st) {
+                cg.insert((x, y, z), (*st - 4278) as u8);
+            }
             if lamp_on && *st == ST_GROWTH_LAMP {
-                cells.entry((*cx, *cz)).or_default()
-                    .push(PluginCell { pi: 0, x, y, z, key: 0, warm_ok: true });
+                cells.entry((*cx, *cz)).or_default().push(PluginCell {
+                    pi: 0,
+                    x,
+                    y,
+                    z,
+                    key: 0,
+                    warm_ok: true,
+                });
             }
         }
     }
-    eprintln!("[spine] rebuilt indexes: {} water, {} hoppers, {} crops, {} cells",
-        wtr.len(), hh.len(), cg.len(), cells.len());
+    eprintln!(
+        "[spine] rebuilt indexes: {} water, {} hoppers, {} crops, {} cells",
+        wtr.len(),
+        hh.len(),
+        cg.len(),
+        cells.len()
+    );
 }
 
 // ---------- persistence (overlay only, no pregen) ----------
@@ -4335,23 +6812,41 @@ fn read_comps(b: &[u8], p: &mut usize) -> Comps {
         // The type is a variable-width VarInt, so the 2-byte length field can only
         // be checked after it has been consumed. Checking first and then indexing
         // panicked on a truncated record.
-        if *p >= b.len() { break }
+        if *p >= b.len() {
+            break;
+        }
         let ty = rv_varint(b, p);
         // The VarInt itself may consume all remaining bytes.
-        if b.len().saturating_sub(*p) < 2 { break }
-        let l = u16::from_be_bytes(b[*p..*p + 2].try_into().unwrap()) as usize; *p += 2;
-        if b.len().saturating_sub(*p) < l { break }
-        c.push((ty, b[*p..*p + l].to_vec())); *p += l;
+        if b.len().saturating_sub(*p) < 2 {
+            break;
+        }
+        let l = u16::from_be_bytes(b[*p..*p + 2].try_into().unwrap()) as usize;
+        *p += 2;
+        if b.len().saturating_sub(*p) < l {
+            break;
+        }
+        c.push((ty, b[*p..*p + l].to_vec()));
+        *p += l;
     }
     c
 }
 fn rv_varint(b: &[u8], p: &mut usize) -> i64 {
-    let mut v = 0i64; let mut sh = 0;
+    let mut v = 0i64;
+    let mut sh = 0;
     loop {
-        if *p >= b.len() { break }
-        let x = b[*p]; *p += 1; v |= ((x & 0x7f) as i64) << sh; if x & 0x80 == 0 { break }
+        if *p >= b.len() {
+            break;
+        }
+        let x = b[*p];
+        *p += 1;
+        v |= ((x & 0x7f) as i64) << sh;
+        if x & 0x80 == 0 {
+            break;
+        }
         sh += 7;
-        if sh > 63 { break }
+        if sh > 63 {
+            break;
+        }
     }
     v
 }
@@ -4369,13 +6864,21 @@ fn wrap_world_payload(payload: &[u8]) -> Vec<u8> {
 }
 fn unwrap_world_payload(raw: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     if raw.starts_with(SAVE_MAGIC) {
-        if raw.len() < 32 { return Err("truncated save header"); }
+        if raw.len() < 32 {
+            return Err("truncated save header");
+        }
         let len = u64::from_be_bytes(raw[4..12].try_into().unwrap());
-        if len != (raw.len() - 32) as u64 { return Err("save length mismatch"); }
-        if sha1(&raw[32..]) != raw[12..32] { return Err("save checksum mismatch"); }
+        if len != (raw.len() - 32) as u64 {
+            return Err("save length mismatch");
+        }
+        if sha1(&raw[32..]) != raw[12..32] {
+            return Err("save checksum mismatch");
+        }
         return Ok(raw[32..].to_vec());
     }
-    if raw.starts_with(b"SPN") { return Err("unsupported or corrupted save format"); }
+    if raw.starts_with(b"SPN") {
+        return Err("unsupported or corrupted save format");
+    }
     Ok(raw) // existing unwrapped v2.37 format
 }
 /// Serialises saves. The tick autosave and the SIGTERM/SIGINT handler both call `save_world`,
@@ -4388,12 +6891,16 @@ thread_local! { static SAVE_GUARD: std::cell::Cell<bool> = const { std::cell::Ce
 /// still queued. Re-entrant per thread: `spawn_fall` is reached from `falling_tick`'s placement
 /// and from another `spawn_fall`, and only the outermost call locks.
 fn with_save_guard<R>(f: impl FnOnce() -> R) -> R {
-    if SAVE_GUARD.with(|g| g.get()) { return f(); }
+    if SAVE_GUARD.with(|g| g.get()) {
+        return f();
+    }
     let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     SAVE_GUARD.with(|g| g.set(true));
     struct Reset;
     impl std::ops::Drop for Reset {
-        fn drop(&mut self) { SAVE_GUARD.with(|g| g.set(false)); }
+        fn drop(&mut self) {
+            SAVE_GUARD.with(|g| g.set(false));
+        }
     }
     let _reset = Reset;
     f()
@@ -4409,7 +6916,9 @@ fn save_world() {
     // the previous save.
     let framed = wrap_world_payload(&f);
     let tmp = format!("{}.tmp", WORLD_FILE);
-    if std::fs::write(&tmp, &framed).is_err() { return }
+    if std::fs::write(&tmp, &framed).is_err() {
+        return;
+    }
     if std::path::Path::new(WORLD_FILE).exists() {
         let _ = std::fs::copy(WORLD_FILE, format!("{}.bak", WORLD_FILE));
     }
@@ -4438,12 +6947,21 @@ fn save_world_into(f: &mut Vec<u8>) {
         let ms = mobs().lock().unwrap();
         write_varint(&mut *f, ms.len() as i64);
         for m in ms.iter() {
-            let (x, y, z, ..) = { let p = m.pos.lock().unwrap(); *p };
+            let (x, y, z, ..) = {
+                let p = m.pos.lock().unwrap();
+                *p
+            };
             write_varint(&mut *f, m.etype);
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
             (*f).extend_from_slice(&z.to_be_bytes());
-            (*f).extend_from_slice(&{ let h = m.hp.lock().unwrap(); *h }.to_be_bytes());
+            (*f).extend_from_slice(
+                &{
+                    let h = m.hp.lock().unwrap();
+                    *h
+                }
+                .to_be_bytes(),
+            );
         }
     }
     (*f).extend_from_slice(&WORLD_TIME.load(Ordering::Relaxed).to_be_bytes());
@@ -4531,9 +7049,13 @@ fn save_world_into(f: &mut Vec<u8>) {
         // observational: the conversion is written into the payload instead of
         // being applied to the live world, where it also lost the new drop because
         // the drop list had already been serialized.
-        let tridents: Vec<(f64, f64, f64, i64, Comps)> = arrows().lock().unwrap().iter()
+        let tridents: Vec<(f64, f64, f64, i64, Comps)> = arrows()
+            .lock()
+            .unwrap()
+            .iter()
             .filter(|a| a.kind == 1 && a.ret_item > 0)
-            .map(|a| (a.x, a.y, a.z, a.ret_item, a.ret_comps.clone())).collect();
+            .map(|a| (a.x, a.y, a.z, a.ret_item, a.ret_comps.clone()))
+            .collect();
         let mut drop_ages: Vec<u32> = Vec::new();
         {
             let ds = drops().lock().unwrap();
@@ -4571,9 +7093,15 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
             (*f).extend_from_slice(&z.to_be_bytes());
-            write_varint(&mut *f, fr.input.0); (*f).push(fr.input.1); write_comps(&mut *f, &fr.input.2);
-            write_varint(&mut *f, fr.fuel.0); (*f).push(fr.fuel.1); write_comps(&mut *f, &fr.fuel.2);
-            write_varint(&mut *f, fr.output.0); (*f).push(fr.output.1); write_comps(&mut *f, &fr.output.2);
+            write_varint(&mut *f, fr.input.0);
+            (*f).push(fr.input.1);
+            write_comps(&mut *f, &fr.input.2);
+            write_varint(&mut *f, fr.fuel.0);
+            (*f).push(fr.fuel.1);
+            write_comps(&mut *f, &fr.fuel.2);
+            write_varint(&mut *f, fr.output.0);
+            (*f).push(fr.output.1);
+            write_comps(&mut *f, &fr.output.2);
             (*f).extend_from_slice(&fr.burn_left.to_be_bytes());
             (*f).extend_from_slice(&fr.progress.to_be_bytes());
         }
@@ -4582,10 +7110,16 @@ fn save_world_into(f: &mut Vec<u8>) {
         {
             let ms = mobs().lock().unwrap();
             let sh = sheared().lock().unwrap();
-            let idx: Vec<i64> = ms.iter().enumerate()
-                .filter(|(_, m)| sh.contains(&m.eid)).map(|(i, _)| i as i64).collect();
+            let idx: Vec<i64> = ms
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| sh.contains(&m.eid))
+                .map(|(i, _)| i as i64)
+                .collect();
             write_varint(&mut *f, idx.len() as i64);
-            for i in idx { write_varint(&mut *f, i); }
+            for i in idx {
+                write_varint(&mut *f, i);
+            }
         }
         // scoreboard — vanilla stores objectives under data storage
         {
@@ -4616,7 +7150,9 @@ fn save_world_into(f: &mut Vec<u8>) {
             }
         }
         // drop despawn-budget residue: elapsed ms per drop, by order
-        for a in drop_ages { (*f).extend_from_slice(&a.to_be_bytes()); }
+        for a in drop_ages {
+            (*f).extend_from_slice(&a.to_be_bytes());
+        }
         // projectiles + primed tnt are world entities in vanilla —
         // they survive restart mid-flight
         {
@@ -4625,7 +7161,10 @@ fn save_world_into(f: &mut Vec<u8>) {
             (*f).extend_from_slice(b"ARW2");
             // Tridents travel in the drop list above, so they are excluded here
             // rather than removed from the live arrow list.
-            let persisted: Vec<&Arrow> = ar.iter().filter(|a| !(a.kind == 1 && a.ret_item > 0)).collect();
+            let persisted: Vec<&Arrow> = ar
+                .iter()
+                .filter(|a| !(a.kind == 1 && a.ret_item > 0))
+                .collect();
             write_varint(&mut *f, persisted.len() as i64);
             for a in persisted {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
@@ -4680,19 +7219,29 @@ fn save_world_into(f: &mut Vec<u8>) {
         (*f).extend_from_slice(&RAINING.load(Ordering::Relaxed).to_be_bytes());
         (*f).extend_from_slice(&THUNDERING.load(Ordering::Relaxed).to_be_bytes());
         // gamerules are world state too (level.dat GameRules)
-        for r in [&GR_KEEP_INVENTORY, &GR_DAYLIGHT_CYCLE, &GR_WEATHER_CYCLE, &GR_MOB_SPAWNING, &GR_MOB_GRIEFING, &GR_NATURAL_REGEN, &GR_MOB_LOOT] {
+        for r in [
+            &GR_KEEP_INVENTORY,
+            &GR_DAYLIGHT_CYCLE,
+            &GR_WEATHER_CYCLE,
+            &GR_MOB_SPAWNING,
+            &GR_MOB_GRIEFING,
+            &GR_NATURAL_REGEN,
+            &GR_MOB_LOOT,
+        ] {
             (*f).push(r.load(Ordering::Relaxed));
         }
-        { let ws = WORLD_SPAWN.lock().unwrap();
-          (*f).extend_from_slice(&ws.0.to_be_bytes());
-          (*f).extend_from_slice(&ws.1.to_be_bytes());
-          (*f).extend_from_slice(&ws.2.to_be_bytes()); }
+        {
+            let ws = WORLD_SPAWN.lock().unwrap();
+            (*f).extend_from_slice(&ws.0.to_be_bytes());
+            (*f).extend_from_slice(&ws.1.to_be_bytes());
+            (*f).extend_from_slice(&ws.2.to_be_bytes());
+        }
         (*f).push(DIFFICULTY.load(Ordering::Relaxed));
         // entity tags: players by name, mobs by ordinal (eids re-issue)
         {
             let tm = tags().lock().unwrap();
-            let players: Vec<(&String, &HashSet<String>)> = tm.iter()
-                .filter(|(k, _)| k.starts_with("p:")).collect();
+            let players: Vec<(&String, &HashSet<String>)> =
+                tm.iter().filter(|(k, _)| k.starts_with("p:")).collect();
             write_varint(&mut *f, players.len() as i64);
             for (k, st) in players {
                 let nm = &k[2..];
@@ -4705,8 +7254,11 @@ fn save_world_into(f: &mut Vec<u8>) {
                 }
             }
             let ms = mobs().lock().unwrap();
-            let mobe: Vec<(i64, &HashSet<String>)> = ms.iter().enumerate()
-                .filter_map(|(i, m)| tm.get(&format!("e:{}", m.eid)).map(|st| (i as i64, st))).collect();
+            let mobe: Vec<(i64, &HashSet<String>)> = ms
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| tm.get(&format!("e:{}", m.eid)).map(|st| (i as i64, st)))
+                .collect();
             write_varint(&mut *f, mobe.len() as i64);
             for (i, st) in mobe {
                 write_varint(&mut *f, i);
@@ -4775,8 +7327,12 @@ fn save_world_into(f: &mut Vec<u8>) {
     // cell the old cell-moving model held; a save carrying it is converted on load.
     let mut in_flight = falling().lock().unwrap().clone();
     in_flight.sort_by(|a, b| {
-        (a.x.to_bits(), a.y.to_bits(), a.z.to_bits(), a.eid)
-            .cmp(&(b.x.to_bits(), b.y.to_bits(), b.z.to_bits(), b.eid))
+        (a.x.to_bits(), a.y.to_bits(), a.z.to_bits(), a.eid).cmp(&(
+            b.x.to_bits(),
+            b.y.to_bits(),
+            b.z.to_bits(),
+            b.eid,
+        ))
     });
     (*f).extend_from_slice(b"FAL2");
     write_varint(&mut *f, in_flight.len() as i64);
@@ -4814,14 +7370,21 @@ fn load_world_from(payload: &[u8]) {
     let n = rv(&payload, &mut p);
     let mut w = world().lock().unwrap();
     for _ in 0..n {
-        if p + 8 > payload.len() { break }
-        let cx = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-        let cz = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+        if p + 8 > payload.len() {
+            break;
+        }
+        let cx = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+        p += 4;
+        let cz = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+        p += 4;
         let m = rv(&payload, &mut p);
         let c = w.entry((cx, cz)).or_default();
         for _ in 0..m {
-            if p + 4 > payload.len() { break }
-            let idx = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+            if p + 4 > payload.len() {
+                break;
+            }
+            let idx = u32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+            p += 4;
             let st = rv(&payload, &mut p) as u32;
             c.insert(idx, st);
         }
@@ -4830,8 +7393,8 @@ fn load_world_from(payload: &[u8]) {
     drop(w);
     rebuild_derived_indexes();
     // optional META tail
-    if p + 4 <= payload.len() && matches!(&payload[p..p+4], b"MET2" | b"MET3" | b"MET4") {
-        let magic = &payload[p..p+4];
+    if p + 4 <= payload.len() && matches!(&payload[p..p + 4], b"MET2" | b"MET3" | b"MET4") {
+        let magic = &payload[p..p + 4];
         let has_comps = magic != b"MET2";
         // MET4 stores entity ages as server ticks. MET2 and MET3 stored them as
         // milliseconds, and one millisecond is not one tick, so a legacy file
@@ -4841,38 +7404,72 @@ fn load_world_from(payload: &[u8]) {
         let mn = rv(&payload, &mut p);
         let mut ms = mobs().lock().unwrap();
         for _ in 0..mn {
-            if p + 28 > payload.len() { break }
+            if p + 28 > payload.len() {
+                break;
+            }
             let et = rv(&payload, &mut p);
-            let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-            let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-            let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-            let hp = f32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-            ms.push(Arc::new(Mob { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), uuid: [0u8;16],
-                etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(hp),
-                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
-                fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) }));
+            let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+            p += 8;
+            let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+            p += 8;
+            let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+            p += 8;
+            let hp = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+            p += 4;
+            ms.push(Arc::new(Mob {
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                uuid: [0u8; 16],
+                etype: et,
+                pos: Mutex::new((x, y, z, 0.0, 0.0)),
+                hp: Mutex::new(hp),
+                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                fuse: Mutex::new(0),
+                love: Mutex::new(0),
+                air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            }));
         }
         drop(ms);
         if p + 8 <= payload.len() {
-            WORLD_TIME.store(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), Ordering::Relaxed); p += 8;
+            WORLD_TIME.store(
+                u64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
+                Ordering::Relaxed,
+            );
+            p += 8;
         }
         if p < payload.len() {
             let pn = rv(&payload, &mut p);
             let mut store = inv_store().lock().unwrap();
             for _ in 0..pn {
-                if p + 2 > payload.len() { break }
-                let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl > payload.len() { break }
-                let name = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                if p + 2 > payload.len() {
+                    break;
+                }
+                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                p += 2;
+                if p + nl > payload.len() {
+                    break;
+                }
+                let name = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                p += nl;
                 let en = rv(&payload, &mut p);
                 let mut inv = HashMap::new();
                 for _ in 0..en {
-                    if p + 3 > payload.len() { break }
-                    let slot = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
+                    if p + 3 > payload.len() {
+                        break;
+                    }
+                    let slot = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
+                    p += 2;
                     let item = rv(&payload, &mut p);
-                    if p >= payload.len() { break }
-                    let cnt = b[p]; p += 1;
-                    let comps = if has_comps { read_comps(&payload, &mut p) } else { Vec::new() };
+                    if p >= payload.len() {
+                        break;
+                    }
+                    let cnt = b[p];
+                    p += 1;
+                    let comps = if has_comps {
+                        read_comps(&payload, &mut p)
+                    } else {
+                        Vec::new()
+                    };
                     inv.insert(slot, (item, cnt, comps));
                 }
                 store.insert(name, inv);
@@ -4882,19 +7479,34 @@ fn load_world_from(payload: &[u8]) {
             let cn = rv(&payload, &mut p);
             let mut ch = chests().lock().unwrap();
             for _ in 0..cn {
-                if p + 12 > payload.len() { break }
-                let x = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let y = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let z = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                if p + 12 > payload.len() {
+                    break;
+                }
+                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
                 let en = rv(&payload, &mut p);
                 let mut slots = HashMap::new();
                 for _ in 0..en {
-                    if p + 3 > payload.len() { break }
-                    let slot = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
+                    if p + 3 > payload.len() {
+                        break;
+                    }
+                    let slot = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
+                    p += 2;
                     let item = rv(&payload, &mut p);
-                    if p >= payload.len() { break }
-                    let cnt = b[p]; p += 1;
-                    let comps = if has_comps { read_comps(&payload, &mut p) } else { Vec::new() };
+                    if p >= payload.len() {
+                        break;
+                    }
+                    let cnt = b[p];
+                    p += 1;
+                    let comps = if has_comps {
+                        read_comps(&payload, &mut p)
+                    } else {
+                        Vec::new()
+                    };
                     slots.insert(slot, (item, cnt, comps));
                 }
                 ch.insert((x, y, z), slots);
@@ -4904,17 +7516,30 @@ fn load_world_from(payload: &[u8]) {
             let sn = rv(&payload, &mut p);
             let mut sg = signs().lock().unwrap();
             for _ in 0..sn {
-                if p + 13 > payload.len() { break }
-                let x = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let y = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let z = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let front = b[p]; p += 1;
-                let mut lines: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+                if p + 13 > payload.len() {
+                    break;
+                }
+                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let front = b[p];
+                p += 1;
+                let mut lines: [String; 4] =
+                    [String::new(), String::new(), String::new(), String::new()];
                 for l in lines.iter_mut() {
-                    if p + 2 > payload.len() { break }
-                    let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > payload.len() { break }
-                    *l = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                    if p + 2 > payload.len() {
+                        break;
+                    }
+                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    p += 2;
+                    if p + nl > payload.len() {
+                        break;
+                    }
+                    *l = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                    p += nl;
                 }
                 sg.insert((x, y, z, front), lines);
             }
@@ -4923,9 +7548,13 @@ fn load_world_from(payload: &[u8]) {
             let fn_ = rv(&payload, &mut p);
             let mut fl = forceloaded().lock().unwrap();
             for _ in 0..fn_ {
-                if p + 8 > payload.len() { break }
-                let cx = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let cz = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                if p + 8 > payload.len() {
+                    break;
+                }
+                let cx = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let cz = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
                 fl.insert((cx, cz));
             }
         }
@@ -4933,15 +7562,26 @@ fn load_world_from(payload: &[u8]) {
             let pn = rv(&payload, &mut p);
             let mut ps = pos_store().lock().unwrap();
             for _ in 0..pn {
-                if p + 2 > payload.len() { break }
-                let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl + 28 > payload.len() { break }
-                let name = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
-                let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let yaw = f32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let pitch = f32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                if p + 2 > payload.len() {
+                    break;
+                }
+                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                p += 2;
+                if p + nl + 28 > payload.len() {
+                    break;
+                }
+                let name = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                p += nl;
+                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let yaw = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let pitch = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
                 ps.insert(name, (x, y, z, yaw, pitch));
             }
         }
@@ -4949,40 +7589,100 @@ fn load_world_from(payload: &[u8]) {
             let dn = rv(&payload, &mut p);
             let mut ds = drops().lock().unwrap();
             for _ in 0..dn {
-                if p + 30 > payload.len() { break }
-                let eid = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
+                if p + 30 > payload.len() {
+                    break;
+                }
+                let eid = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
                 let item = rv(&payload, &mut p);
-                if p >= payload.len() { break }
-                let cnt = b[p]; p += 1;
-                let comps = if has_comps { read_comps(&payload, &mut p) } else { Vec::new() };
+                if p >= payload.len() {
+                    break;
+                }
+                let cnt = b[p];
+                p += 1;
+                let comps = if has_comps {
+                    read_comps(&payload, &mut p)
+                } else {
+                    Vec::new()
+                };
                 if eid >= NEXT_EID.load(Ordering::Relaxed) {
                     NEXT_EID.store(eid + 1, Ordering::SeqCst);
                 }
-                ds.push(Drop { eid, x, y, z, item, cnt, comps, age: 0 });
+                ds.push(Drop {
+                    eid,
+                    x,
+                    y,
+                    z,
+                    item,
+                    cnt,
+                    comps,
+                    age: 0,
+                });
             }
         }
         if p < payload.len() {
             let fn_ = rv(&payload, &mut p);
             let mut fs = furnaces().lock().unwrap();
             for _ in 0..fn_ {
-                if p + 12 > payload.len() { break }
-                let x = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let y = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let z = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                if p + 12 > payload.len() {
+                    break;
+                }
+                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
                 let rd = |b: &[u8], p: &mut usize| -> Stack {
-                    let it = rv(b, p); let c = if *p < payload.len() { b[*p] } else { 0 }; *p += 1;
-                    (it, c, if has_comps { read_comps(b, p) } else { Vec::new() })
+                    let it = rv(b, p);
+                    let c = if *p < payload.len() { b[*p] } else { 0 };
+                    *p += 1;
+                    (
+                        it,
+                        c,
+                        if has_comps {
+                            read_comps(b, p)
+                        } else {
+                            Vec::new()
+                        },
+                    )
                 };
                 let input = rd(&payload, &mut p);
                 let fuel = rd(&payload, &mut p);
                 let output = rd(&payload, &mut p);
-                if p + 8 > payload.len() { break }
-                let burn_left = legacy_tick_count(i32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64, legacy_ms_ages) as i32; p += 4;
-                let progress = legacy_tick_count(i32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64, legacy_ms_ages) as i32; p += 4;
-                fs.insert((x, y, z), Furnace { input, fuel, output, burn_left, progress, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                if p + 8 > payload.len() {
+                    break;
+                }
+                let burn_left = legacy_tick_count(
+                    i32::from_be_bytes(b[p..p + 4].try_into().unwrap()) as u64,
+                    legacy_ms_ages,
+                ) as i32;
+                p += 4;
+                let progress = legacy_tick_count(
+                    i32::from_be_bytes(b[p..p + 4].try_into().unwrap()) as u64,
+                    legacy_ms_ages,
+                ) as i32;
+                p += 4;
+                fs.insert(
+                    (x, y, z),
+                    Furnace {
+                        input,
+                        fuel,
+                        output,
+                        burn_left,
+                        progress,
+                        dirty: false,
+                        xp: 0.0,
+                        recipe_cache: CachedLookup::default(),
+                        fuel_cache: CachedLookup::default(),
+                    },
+                );
             }
             eprintln!("[spine] loaded {} furnaces", fs.len());
         }
@@ -4990,27 +7690,46 @@ fn load_world_from(payload: &[u8]) {
             // sheared mob indices -> mark by load order (fresh eids)
             let sn = rv(&payload, &mut p);
             let mut shidx: Vec<usize> = Vec::new();
-            for _ in 0..sn { shidx.push(rv(&payload, &mut p) as usize); }
+            for _ in 0..sn {
+                shidx.push(rv(&payload, &mut p) as usize);
+            }
             let ms = mobs().lock().unwrap();
             let mut sh = sheared().lock().unwrap();
-            for i in shidx { if let Some(m) = ms.get(i) { sh.insert(m.eid); } }
+            for i in shidx {
+                if let Some(m) = ms.get(i) {
+                    sh.insert(m.eid);
+                }
+            }
         }
         if p < payload.len() {
             let on = rv(&payload, &mut p);
             let mut sc = scores().lock().unwrap();
             for _ in 0..on {
-                if p + 2 > payload.len() { break }
-                let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl > payload.len() { break }
-                let obj = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                if p + 2 > payload.len() {
+                    break;
+                }
+                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                p += 2;
+                if p + nl > payload.len() {
+                    break;
+                }
+                let obj = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                p += nl;
                 let en = rv(&payload, &mut p);
                 let mut entries = HashMap::new();
                 for _ in 0..en {
-                    if p + 2 > payload.len() { break }
-                    let el = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + el + 8 > payload.len() { break }
-                    let entry = String::from_utf8_lossy(&payload[p..p+el]).to_string(); p += el;
-                    let val = i64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
+                    if p + 2 > payload.len() {
+                        break;
+                    }
+                    let el = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    p += 2;
+                    if p + el + 8 > payload.len() {
+                        break;
+                    }
+                    let entry = String::from_utf8_lossy(&payload[p..p + el]).to_string();
+                    p += el;
+                    let val = i64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                    p += 8;
                     entries.insert(entry, val);
                 }
                 sc.insert(obj, entries);
@@ -5022,26 +7741,50 @@ fn load_world_from(payload: &[u8]) {
             let mut xs = xps().lock().unwrap();
             let mut mx: i32 = 0;
             for _ in 0..xn {
-                if p + 34 > payload.len() { break }
-                let eid = i32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
-                let x = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let y = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let z = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
-                let val = i16::from_be_bytes(b[p..p+2].try_into().unwrap()); p += 2;
-                let ams = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                if p + 34 > payload.len() {
+                    break;
+                }
+                let eid = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
+                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                p += 8;
+                let val = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
+                p += 2;
+                let ams = u32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
                 let age = legacy_ticks(u64::from(ams), legacy_ms_ages);
-                xs.push(Xp { eid, x, y, z, val, age: age.min(server_ticks(XP_LIFE_GT)) as i32 });
-                if eid > mx { mx = eid; }
+                xs.push(Xp {
+                    eid,
+                    x,
+                    y,
+                    z,
+                    val,
+                    age: age.min(server_ticks(XP_LIFE_GT)) as i32,
+                });
+                if eid > mx {
+                    mx = eid;
+                }
             }
-            if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
-            if !xs.is_empty() { eprintln!("[spine] loaded {} xp orbs", xs.len()); }
+            if mx > 0 {
+                NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst);
+            }
+            if !xs.is_empty() {
+                eprintln!("[spine] loaded {} xp orbs", xs.len());
+            }
         }
         if p < payload.len() {
             // drop ages by order — restore remaining despawn budget
             let mut ds = drops().lock().unwrap();
             for d in ds.iter_mut() {
-                if p + 4 > payload.len() { break }
-                let raw = u32::from_be_bytes(b[p..p+4].try_into().unwrap()); p += 4;
+                if p + 4 > payload.len() {
+                    break;
+                }
+                let raw = u32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                p += 4;
                 let aticks = legacy_ticks(u64::from(raw), legacy_ms_ages);
                 // Reinterpret as signed so a negative pickup-delay marker survives
                 // instead of wrapping to a value that clamps to a full lifespan.
@@ -5049,93 +7792,253 @@ fn load_world_from(payload: &[u8]) {
             }
         }
         if p < payload.len() {
-            let rf3 = |b: &[u8], p: &mut usize| -> f64 { let v = f64::from_be_bytes(b[*p..*p+8].try_into().unwrap()); *p += 8; v };
-            let ri4 = |b: &[u8], p: &mut usize| -> i32 { let v = i32::from_be_bytes(b[*p..*p+4].try_into().unwrap()); *p += 4; v };
+            let rf3 = |b: &[u8], p: &mut usize| -> f64 {
+                let v = f64::from_be_bytes(b[*p..*p + 8].try_into().unwrap());
+                *p += 8;
+                v
+            };
+            let ri4 = |b: &[u8], p: &mut usize| -> i32 {
+                let v = i32::from_be_bytes(b[*p..*p + 4].try_into().unwrap());
+                *p += 4;
+                v
+            };
             let mut mx = 0i32;
-            let bump = |eid: i32, mx: &mut i32| { if eid > *mx { *mx = eid; } };
+            let bump = |eid: i32, mx: &mut i32| {
+                if eid > *mx {
+                    *mx = eid;
+                }
+            };
             let arw2 = b[p..].starts_with(b"ARW2");
-            if arw2 { p += 4; }
+            if arw2 {
+                p += 4;
+            }
             let n = rv(&payload, &mut p);
-            { let mut ar = arrows().lock().unwrap();
-              let rec = if arw2 { 61 } else { 60 };
-              for _ in 0..n {
-                if p + rec > payload.len() { break }
-                let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
-                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let ttl = legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
-                let stuck = if arw2 { let v = b[p] != 0; p += 1; v } else { false };
-                ar.push(Arrow { eid, owner, x, y, z, dx, dy, dz, ttl, dmg: 6.0, fire: 0, punch: 0, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: 0, last_hit: -1, stuck }); bump(eid, &mut mx);
-              } }
+            {
+                let mut ar = arrows().lock().unwrap();
+                let rec = if arw2 { 61 } else { 60 };
+                for _ in 0..n {
+                    if p + rec > payload.len() {
+                        break;
+                    }
+                    let eid = ri4(&payload, &mut p);
+                    let owner = ri4(&payload, &mut p);
+                    let (x, y, z) = (
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                    );
+                    let (dx, dy, dz) = (
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                    );
+                    let ttl =
+                        legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
+                    let stuck = if arw2 {
+                        let v = b[p] != 0;
+                        p += 1;
+                        v
+                    } else {
+                        false
+                    };
+                    ar.push(Arrow {
+                        eid,
+                        owner,
+                        x,
+                        y,
+                        z,
+                        dx,
+                        dy,
+                        dz,
+                        ttl,
+                        dmg: 6.0,
+                        fire: 0,
+                        punch: 0,
+                        kind: 0,
+                        loy: 0,
+                        ret_item: 0,
+                        ret_comps: Vec::new(),
+                        pierce: 0,
+                        last_hit: -1,
+                        stuck,
+                    });
+                    bump(eid, &mut mx);
+                }
+            }
             let n = rv(&payload, &mut p);
-            { let mut bo = bobbers().lock().unwrap();
-              for _ in 0..n {
-                if p + 61 > payload.len() { break }
-                let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
-                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let age = ri4(&payload, &mut p); let bit = b[p] != 0; p += 1;
-                bo.push(Bobber { eid, owner, x, y, z, dx, dy, dz, age, bit }); bump(eid, &mut mx);
-              } }
+            {
+                let mut bo = bobbers().lock().unwrap();
+                for _ in 0..n {
+                    if p + 61 > payload.len() {
+                        break;
+                    }
+                    let eid = ri4(&payload, &mut p);
+                    let owner = ri4(&payload, &mut p);
+                    let (x, y, z) = (
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                    );
+                    let (dx, dy, dz) = (
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                    );
+                    let age = ri4(&payload, &mut p);
+                    let bit = b[p] != 0;
+                    p += 1;
+                    bo.push(Bobber {
+                        eid,
+                        owner,
+                        x,
+                        y,
+                        z,
+                        dx,
+                        dy,
+                        dz,
+                        age,
+                        bit,
+                    });
+                    bump(eid, &mut mx);
+                }
+            }
             let n = rv(&payload, &mut p);
-            { let mut pe = pearls().lock().unwrap();
-              for _ in 0..n {
-                if p + 60 > payload.len() { break }
-                let eid = ri4(&payload, &mut p); let owner = ri4(&payload, &mut p);
-                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let (dx, dy, dz) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let ttl = legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
-                pe.push(Pearl { eid, owner, x, y, z, dx, dy, dz, ttl }); bump(eid, &mut mx);
-              } }
+            {
+                let mut pe = pearls().lock().unwrap();
+                for _ in 0..n {
+                    if p + 60 > payload.len() {
+                        break;
+                    }
+                    let eid = ri4(&payload, &mut p);
+                    let owner = ri4(&payload, &mut p);
+                    let (x, y, z) = (
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                    );
+                    let (dx, dy, dz) = (
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                    );
+                    let ttl =
+                        legacy_tick_count(ri4(&payload, &mut p) as u64, legacy_ms_ages) as i32;
+                    pe.push(Pearl {
+                        eid,
+                        owner,
+                        x,
+                        y,
+                        z,
+                        dx,
+                        dy,
+                        dz,
+                        ttl,
+                    });
+                    bump(eid, &mut mx);
+                }
+            }
             let n = rv(&payload, &mut p);
-            { let mut pr = primed().lock().unwrap();
-              for _ in 0..n {
-                if p + 32 > payload.len() { break }
-                let eid = ri4(&payload, &mut p);
-                let (x, y, z) = (rf3(&payload, &mut p), rf3(&payload, &mut p), rf3(&payload, &mut p));
-                let left = legacy_tick_count(i32::from_be_bytes(b[p..p+4].try_into().unwrap()) as u64, legacy_ms_ages) as i32; p += 4;
-                pr.push(Primed { eid, x, y, z, left });
-                bump(eid, &mut mx);
-              } }
-            if mx > 0 { NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst); }
+            {
+                let mut pr = primed().lock().unwrap();
+                for _ in 0..n {
+                    if p + 32 > payload.len() {
+                        break;
+                    }
+                    let eid = ri4(&payload, &mut p);
+                    let (x, y, z) = (
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                        rf3(&payload, &mut p),
+                    );
+                    let left = legacy_tick_count(
+                        i32::from_be_bytes(b[p..p + 4].try_into().unwrap()) as u64,
+                        legacy_ms_ages,
+                    ) as i32;
+                    p += 4;
+                    pr.push(Primed { eid, x, y, z, left });
+                    bump(eid, &mut mx);
+                }
+            }
+            if mx > 0 {
+                NEXT_EID.fetch_max(mx + 1, Ordering::SeqCst);
+            }
         }
         if p + 8 <= payload.len() {
-            RAINING.store(legacy_tick_count(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), legacy_ms_ages), Ordering::Relaxed);
+            RAINING.store(
+                legacy_tick_count(
+                    u64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
+                    legacy_ms_ages,
+                ),
+                Ordering::Relaxed,
+            );
             p += 8;
         }
         if p + 8 <= payload.len() {
-            THUNDERING.store(legacy_tick_count(u64::from_be_bytes(b[p..p+8].try_into().unwrap()), legacy_ms_ages), Ordering::Relaxed);
+            THUNDERING.store(
+                legacy_tick_count(
+                    u64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
+                    legacy_ms_ages,
+                ),
+                Ordering::Relaxed,
+            );
             p += 8;
         }
         if p + 4 <= payload.len() {
-            for r in [&GR_KEEP_INVENTORY, &GR_DAYLIGHT_CYCLE, &GR_WEATHER_CYCLE, &GR_MOB_SPAWNING, &GR_MOB_GRIEFING, &GR_NATURAL_REGEN, &GR_MOB_LOOT] {
-                r.store(b[p], Ordering::Relaxed); p += 1;
+            for r in [
+                &GR_KEEP_INVENTORY,
+                &GR_DAYLIGHT_CYCLE,
+                &GR_WEATHER_CYCLE,
+                &GR_MOB_SPAWNING,
+                &GR_MOB_GRIEFING,
+                &GR_NATURAL_REGEN,
+                &GR_MOB_LOOT,
+            ] {
+                r.store(b[p], Ordering::Relaxed);
+                p += 1;
             }
         }
         if p + 25 <= payload.len() {
-            let (x, y, z) = (f64::from_be_bytes(b[p..p+8].try_into().unwrap()),
-                             f64::from_be_bytes(b[p+8..p+16].try_into().unwrap()),
-                             f64::from_be_bytes(b[p+16..p+24].try_into().unwrap()));
-            *WORLD_SPAWN.lock().unwrap() = (x, y, z); p += 24;
-            DIFFICULTY.store(b[p], Ordering::Relaxed); p += 1;
+            let (x, y, z) = (
+                f64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
+                f64::from_be_bytes(b[p + 8..p + 16].try_into().unwrap()),
+                f64::from_be_bytes(b[p + 16..p + 24].try_into().unwrap()),
+            );
+            *WORLD_SPAWN.lock().unwrap() = (x, y, z);
+            p += 24;
+            DIFFICULTY.store(b[p], Ordering::Relaxed);
+            p += 1;
         }
         if p < payload.len() {
             let mut tm = tags().lock().unwrap();
             let pn = rv(&payload, &mut p);
             for _ in 0..pn {
-                if p + 2 > payload.len() { break }
-                let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                if p + nl > payload.len() { break }
-                let nm = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                if p + 2 > payload.len() {
+                    break;
+                }
+                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                p += 2;
+                if p + nl > payload.len() {
+                    break;
+                }
+                let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                p += nl;
                 let tc = rv(&payload, &mut p);
                 let mut st = HashSet::new();
                 for _ in 0..tc {
-                    if p + 2 > payload.len() { break }
-                    let tl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + tl > payload.len() { break }
-                    st.insert(String::from_utf8_lossy(&payload[p..p+tl]).to_string()); p += tl;
+                    if p + 2 > payload.len() {
+                        break;
+                    }
+                    let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    p += 2;
+                    if p + tl > payload.len() {
+                        break;
+                    }
+                    st.insert(String::from_utf8_lossy(&payload[p..p + tl]).to_string());
+                    p += tl;
                 }
-                if !st.is_empty() { tm.insert(format!("p:{}", nm), st); }
+                if !st.is_empty() {
+                    tm.insert(format!("p:{}", nm), st);
+                }
             }
             let mn2 = rv(&payload, &mut p);
             let mut mtag: Vec<(usize, HashSet<String>)> = Vec::new();
@@ -5144,27 +8047,48 @@ fn load_world_from(payload: &[u8]) {
                 let tc = rv(&payload, &mut p);
                 let mut st = HashSet::new();
                 for _ in 0..tc {
-                    if p + 2 > payload.len() { break }
-                    let tl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + tl > payload.len() { break }
-                    st.insert(String::from_utf8_lossy(&payload[p..p+tl]).to_string()); p += tl;
+                    if p + 2 > payload.len() {
+                        break;
+                    }
+                    let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    p += 2;
+                    if p + tl > payload.len() {
+                        break;
+                    }
+                    st.insert(String::from_utf8_lossy(&payload[p..p + tl]).to_string());
+                    p += tl;
                 }
-                if !st.is_empty() { mtag.push((i, st)); }
+                if !st.is_empty() {
+                    mtag.push((i, st));
+                }
             }
             let ms = mobs().lock().unwrap();
-            for (i, st) in mtag { if let Some(m) = ms.get(i) { tm.insert(format!("e:{}", m.eid), st); } }
+            for (i, st) in mtag {
+                if let Some(m) = ms.get(i) {
+                    tm.insert(format!("e:{}", m.eid), st);
+                }
+            }
             drop(ms);
             if p < payload.len() {
                 let sn = rv(&payload, &mut p);
                 let mut sf = sched_fns().lock().unwrap();
                 let t_now = TICK.load(Ordering::Relaxed);
                 for _ in 0..sn {
-                    if p + 2 > payload.len() { break }
-                    let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > payload.len() { break }
-                    let f2 = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
-                    if p + 8 > payload.len() { break }
-                    let rem = u64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
+                    if p + 2 > payload.len() {
+                        break;
+                    }
+                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    p += 2;
+                    if p + nl > payload.len() {
+                        break;
+                    }
+                    let f2 = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                    p += nl;
+                    if p + 8 > payload.len() {
+                        break;
+                    }
+                    let rem = u64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                    p += 8;
                     sf.push((f2, t_now + rem));
                 }
             }
@@ -5172,19 +8096,33 @@ fn load_world_from(payload: &[u8]) {
                 let gn = rv(&payload, &mut p);
                 let mut ag = adv_done().lock().unwrap();
                 for _ in 0..gn {
-                    if p + 2 > payload.len() { break }
-                    let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > payload.len() { break }
-                    let pn = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                    if p + 2 > payload.len() {
+                        break;
+                    }
+                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    p += 2;
+                    if p + nl > payload.len() {
+                        break;
+                    }
+                    let pn = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                    p += nl;
                     let ic = rv(&payload, &mut p);
                     let mut ids = HashSet::new();
                     for _ in 0..ic {
-                        if p + 2 > payload.len() { break }
-                        let il = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + il > payload.len() { break }
-                        ids.insert(String::from_utf8_lossy(&payload[p..p+il]).to_string()); p += il;
+                        if p + 2 > payload.len() {
+                            break;
+                        }
+                        let il = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        p += 2;
+                        if p + il > payload.len() {
+                            break;
+                        }
+                        ids.insert(String::from_utf8_lossy(&payload[p..p + il]).to_string());
+                        p += il;
                     }
-                    if !ids.is_empty() { ag.insert(pn, ids); }
+                    if !ids.is_empty() {
+                        ag.insert(pn, ids);
+                    }
                 }
             }
             // player attributes
@@ -5192,46 +8130,77 @@ fn load_world_from(payload: &[u8]) {
                 let an = rv(&payload, &mut p);
                 let mut at = attrs().lock().unwrap();
                 for _ in 0..an {
-                    if p + 2 > payload.len() { break }
-                    let nl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                    if p + nl > payload.len() { break }
-                    let nm = String::from_utf8_lossy(&payload[p..p+nl]).to_string(); p += nl;
+                    if p + 2 > payload.len() {
+                        break;
+                    }
+                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    p += 2;
+                    if p + nl > payload.len() {
+                        break;
+                    }
+                    let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+                    p += nl;
                     let cnt = rv(&payload, &mut p);
                     let mut m = HashMap::new();
                     for _ in 0..cnt {
-                        if p + 2 > payload.len() { break }
-                        let kl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + kl + 8 > payload.len() { break }
-                        let kn = String::from_utf8_lossy(&payload[p..p+kl]).to_string(); p += kl;
-                        let v = f64::from_be_bytes(b[p..p+8].try_into().unwrap()); p += 8;
+                        if p + 2 > payload.len() {
+                            break;
+                        }
+                        let kl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        p += 2;
+                        if p + kl + 8 > payload.len() {
+                            break;
+                        }
+                        let kn = String::from_utf8_lossy(&payload[p..p + kl]).to_string();
+                        p += kl;
+                        let v = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                        p += 8;
                         m.insert(kn, v);
                     }
-                    if !m.is_empty() { at.insert(format!("p:{}", nm), m); }
+                    if !m.is_empty() {
+                        at.insert(format!("p:{}", nm), m);
+                    }
                 }
                 // objective types + sidebar
                 if p < payload.len() {
                     let oc = rv(&payload, &mut p);
                     let mut ot = obj_types().lock().unwrap();
                     for _ in 0..oc {
-                        if p + 2 > payload.len() { break }
-                        let ol = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + ol + 2 > payload.len() { break }
-                        let on = String::from_utf8_lossy(&payload[p..p+ol]).to_string(); p += ol;
-                        let tl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
-                        if p + tl > payload.len() { break }
-                        ot.insert(on, String::from_utf8_lossy(&payload[p..p+tl]).to_string()); p += tl;
+                        if p + 2 > payload.len() {
+                            break;
+                        }
+                        let ol = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        p += 2;
+                        if p + ol + 2 > payload.len() {
+                            break;
+                        }
+                        let on = String::from_utf8_lossy(&payload[p..p + ol]).to_string();
+                        p += ol;
+                        let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        p += 2;
+                        if p + tl > payload.len() {
+                            break;
+                        }
+                        ot.insert(on, String::from_utf8_lossy(&payload[p..p + tl]).to_string());
+                        p += tl;
                     }
                     if p + 2 <= payload.len() {
-                        let sl = u16::from_be_bytes(b[p..p+2].try_into().unwrap()) as usize; p += 2;
+                        let sl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        p += 2;
                         if p + sl <= payload.len() && sl > 0 {
                             *sidebar_obj().lock().unwrap() =
-                                Some(String::from_utf8_lossy(&payload[p..p+sl]).to_string());
+                                Some(String::from_utf8_lossy(&payload[p..p + sl]).to_string());
                         }
                     }
                 }
             }
         }
-        eprintln!("[spine] loaded meta: {} mobs, {} invs, {} chests", mn, inv_store().lock().unwrap().len(), chests().lock().unwrap().len());
+        eprintln!(
+            "[spine] loaded meta: {} mobs, {} invs, {} chests",
+            mn,
+            inv_store().lock().unwrap().len(),
+            chests().lock().unwrap().len()
+        );
     }
 
     // Falling queue, when the save carries one. Absent sections are the normal case for saves
@@ -5240,16 +8209,33 @@ fn load_world_from(payload: &[u8]) {
         p += 4;
         let n = rv(&payload, &mut p);
         for _ in 0..n {
-            if p + 44 > payload.len() { break }
-            let eid = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
-            let x = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let y = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let z = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let dy = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let state = u32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
-            let time = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            if p + 44 > payload.len() {
+                break;
+            }
+            let eid = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            p += 4;
+            let x = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            p += 8;
+            let y = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            p += 8;
+            let z = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            p += 8;
+            let dy = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            p += 8;
+            let state = u32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            p += 4;
+            let time = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            p += 4;
             NEXT_EID.fetch_max(eid + 1, Ordering::SeqCst);
-            falling().lock().unwrap().push(Fall { eid, x, y, z, dy, state, time });
+            falling().lock().unwrap().push(Fall {
+                eid,
+                x,
+                y,
+                z,
+                dy,
+                state,
+                time,
+            });
         }
     } else if p + 4 <= payload.len() && &payload[p..p + 4] == b"FAL1" {
         // The old cell-moving model kept the block in the world and stored its cell. Convert to
@@ -5257,21 +8243,37 @@ fn load_world_from(payload: &[u8]) {
         p += 4;
         let n = rv(&payload, &mut p);
         for _ in 0..n {
-            if p + 12 > payload.len() { break }
-            let fx = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
-            let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
-            let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
+            if p + 12 > payload.len() {
+                break;
+            }
+            let fx = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            p += 4;
+            let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            p += 4;
+            let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            p += 4;
             let st = block_at(fx, fy, fz);
-            if st == 0 { continue }
+            if st == 0 {
+                continue;
+            }
             // An absent overlay entry falls back to generated terrain, so removing the entry
             // would leave a generated block where the migrating block used to be. Record air
             // explicitly: the block is now the entity, not whatever terrain is underneath it.
-            world().lock().unwrap().entry((fx >> 4, fz >> 4)).or_default()
+            world()
+                .lock()
+                .unwrap()
+                .entry((fx >> 4, fz >> 4))
+                .or_default()
                 .insert(local_idx(fx, fy, fz), 0);
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
             falling().lock().unwrap().push(Fall {
-                eid, x: fx as f64 + 0.5, y: fy as f64, z: fz as f64 + 0.5,
-                dy: 0.0, state: st, time: 0,
+                eid,
+                x: fx as f64 + 0.5,
+                y: fy as f64,
+                z: fz as f64 + 0.5,
+                dy: 0.0,
+                state: st,
+                time: 0,
             });
         }
     }
@@ -5290,54 +8292,106 @@ fn load_world_from(payload: &[u8]) {
 
 fn state_from_arg(arg: &str) -> Option<u32> {
     let (name, props) = match arg.split_once('[') {
-        Some((n, rest)) => (n.trim_start_matches("minecraft:").to_string(), rest.trim_end_matches(']').to_string()),
+        Some((n, rest)) => (
+            n.trim_start_matches("minecraft:").to_string(),
+            rest.trim_end_matches(']').to_string(),
+        ),
         None => return name_to_state(arg),
     };
     let name: &str = &name;
     let base = name_to_state(name)?;
     let get = |k: &str| -> Option<String> {
-        props.split(',').find_map(|kv| kv.trim().strip_prefix(k).and_then(|v| v.strip_prefix('=').map(|s| s.to_string())))
+        props.split(',').find_map(|kv| {
+            kv.trim()
+                .strip_prefix(k)
+                .and_then(|v| v.strip_prefix('=').map(|s| s.to_string()))
+        })
     };
     if name == "piston" || name == "sticky_piston" {
         let lo = if name == "piston" { 2011u32 } else { 1992u32 };
         let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(0);
-        let ext = match get("extended").as_deref() { Some("true") => 0, _ => 6 };
+        let ext = match get("extended").as_deref() {
+            Some("true") => 0,
+            _ => 6,
+        };
         return Some(lo + ext + fi);
     }
     if name == "piston_head" {
         let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(0);
-        let ty = match get("type").as_deref() { Some("sticky") => 1, _ => 0 };
+        let ty = match get("type").as_deref() {
+            Some("sticky") => 1,
+            _ => 0,
+        };
         return Some(2023 + fi * 4 + ty * 2);
     }
-    if name == "wheat" { return Some(4278 + get("age").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).min(7)); }
+    if name == "wheat" {
+        return Some(
+            4278 + get("age")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(7),
+        );
+    }
     if name == "observer" {
         let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(5);
-        let pw = match get("powered").as_deref() { Some("true") => 1, _ => 0 };
+        let pw = match get("powered").as_deref() {
+            Some("true") => 1,
+            _ => 0,
+        };
         return Some(12550 + pw * 6 + fi);
     }
     if name == "dispenser" || name == "dropper" {
         let lo = if name == "dispenser" { 523u32 } else { 9345 };
         let fi = get("facing").map(|f| facing_idx(&f)).unwrap_or(0);
-        let tr = match get("triggered").as_deref() { Some("true") => 1, _ => 0 };
+        let tr = match get("triggered").as_deref() {
+            Some("true") => 1,
+            _ => 0,
+        };
         return Some(lo + fi * 2 + tr);
     }
     if name == "lever" {
-        let mut face = 1u32; let mut face_i = 0u32; let mut pow = 1u32; // defaults: wall,north,unpowered
-        if let Some(v) = get("face") { face_i = ["floor","wall","ceiling"].iter().position(|&x| x == v).unwrap_or(1) as u32; }
-        if let Some(v) = get("facing") { face = ["north","south","west","east"].iter().position(|&x| x == v).unwrap_or(0) as u32; }
-        if let Some(v) = get("powered") { pow = if v == "true" { 0 } else { 1 }; }
+        let mut face = 1u32;
+        let mut face_i = 0u32;
+        let mut pow = 1u32; // defaults: wall,north,unpowered
+        if let Some(v) = get("face") {
+            face_i = ["floor", "wall", "ceiling"]
+                .iter()
+                .position(|&x| x == v)
+                .unwrap_or(1) as u32;
+        }
+        if let Some(v) = get("facing") {
+            face = ["north", "south", "west", "east"]
+                .iter()
+                .position(|&x| x == v)
+                .unwrap_or(0) as u32;
+        }
+        if let Some(v) = get("powered") {
+            pow = if v == "true" { 0 } else { 1 };
+        }
         return Some(5626 + face_i * 8 + face * 2 + pow);
     }
     if name == "hopper" {
-        let mut fi = 0u32; let mut en = 0u32; // defaults: down, enabled
-        if let Some(v) = get("facing") { fi = ["down","north","south","west","east"].iter().position(|&x| x == v).unwrap_or(0) as u32; }
-        if let Some(v) = get("enabled") { en = if v == "false" { 1 } else { 0 }; }
+        let mut fi = 0u32;
+        let mut en = 0u32; // defaults: down, enabled
+        if let Some(v) = get("facing") {
+            fi = ["down", "north", "south", "west", "east"]
+                .iter()
+                .position(|&x| x == v)
+                .unwrap_or(0) as u32;
+        }
+        if let Some(v) = get("enabled") {
+            en = if v == "false" { 1 } else { 0 };
+        }
         return Some(9225 + en * 5 + fi);
     }
     if door_base(base).is_some() {
         let mut st = base;
-        if let Some(v) = get("open") { st = if v == "true" { st & !2 } else { st | 2 }; }
-        if let Some(v) = get("half") { st = if v == "upper" { st | 8 } else { st & !8 }; }
+        if let Some(v) = get("open") {
+            st = if v == "true" { st & !2 } else { st | 2 };
+        }
+        if let Some(v) = get("half") {
+            st = if v == "upper" { st | 8 } else { st & !8 };
+        }
         return Some(st);
     }
     Some(base)
@@ -7753,28 +10807,55 @@ fn name_to_item(n: &str) -> Option<i64> {
 fn name_to_effect(n: &str) -> Option<i32> {
     let n = n.trim_start_matches("minecraft:");
     Some(match n {
-        "speed" => 0, "slowness" => 1, "haste" => 2, "mining_fatigue" => 3,
-        "strength" => 4, "instant_health" => 5, "instant_damage" => 6,
-        "jump_boost" => 7, "nausea" => 8, "regeneration" => 9, "resistance" => 10,
-        "fire_resistance" => 11, "water_breathing" => 12, "invisibility" => 13,
-        "blindness" => 14, "night_vision" => 15, "hunger" => 16, "weakness" => 17,
-        "poison" => 18, "wither" => 19, "health_boost" => 20, "absorption" => 21,
-        "saturation" => 22, "glowing" => 23, "levitation" => 24, "luck" => 25,
-        "unluck" => 26, "slow_falling" => 27, "conduit_power" => 28,
-        "dolphins_grace" => 29, "bad_omen" => 30, "hero_of_the_village" => 31,
-        "darkness" => 32, _ => return None,
+        "speed" => 0,
+        "slowness" => 1,
+        "haste" => 2,
+        "mining_fatigue" => 3,
+        "strength" => 4,
+        "instant_health" => 5,
+        "instant_damage" => 6,
+        "jump_boost" => 7,
+        "nausea" => 8,
+        "regeneration" => 9,
+        "resistance" => 10,
+        "fire_resistance" => 11,
+        "water_breathing" => 12,
+        "invisibility" => 13,
+        "blindness" => 14,
+        "night_vision" => 15,
+        "hunger" => 16,
+        "weakness" => 17,
+        "poison" => 18,
+        "wither" => 19,
+        "health_boost" => 20,
+        "absorption" => 21,
+        "saturation" => 22,
+        "glowing" => 23,
+        "levitation" => 24,
+        "luck" => 25,
+        "unluck" => 26,
+        "slow_falling" => 27,
+        "conduit_power" => 28,
+        "dolphins_grace" => 29,
+        "bad_omen" => 30,
+        "hero_of_the_village" => 31,
+        "darkness" => 32,
+        _ => return None,
     })
 }
 fn entity_effect_pkt(eid: i32, id: i32, amp: i32, ticks: i32) -> Vec<u8> {
     let mut p = Vec::new();
-    write_varint(&mut p, eid as i64); write_varint(&mut p, id as i64);
-    write_varint(&mut p, amp as i64); write_varint(&mut p, ticks as i64);
+    write_varint(&mut p, eid as i64);
+    write_varint(&mut p, id as i64);
+    write_varint(&mut p, amp as i64);
+    write_varint(&mut p, ticks as i64);
     p.push(0x06); // particles+icon
     p
 }
 fn remove_effect_pkt(eid: i32, id: i32) -> Vec<u8> {
     let mut p = Vec::new();
-    write_varint(&mut p, eid as i64); write_varint(&mut p, id as i64);
+    write_varint(&mut p, eid as i64);
+    write_varint(&mut p, id as i64);
     p
 }
 // sound/particle id subsets (minecraft-data 1.21.1 registries, unnamespaced)
@@ -7793,36 +10874,77 @@ fn sound_pkt_named(name: &str, x: f64, y: f64, z: f64) -> Vec<u8> {
 }
 fn sound_id(n: &str) -> Option<i32> {
     for (k, v) in [
-        ("entity.player.levelup",1115),("entity.experience_orb.pickup",502),
-        ("ui.toast.challenge_complete",1434),("entity.generic.explode",577),
-        ("entity.lightning_bolt.thunder",783),("block.chest.open",303),
-        ("entity.item.pickup",763),("entity.arrow.hit_player",84),
-        ("block.anvil.land",51),("block.note_block.pling",995),
-        ("block.note_block.bell",989),("ambient.cave",8),
-        ("entity.zombie.ambient",1586),("entity.villager.yes",1461),
-        ("entity.enderman.teleport",483),("entity.player.hurt",1110),
-        ("entity.zombie.death",1591),("entity.skeleton.ambient",1256),
-        ("entity.creeper.primed",375),("entity.spider.ambient",1344),
-        ("block.grass.break",629),("block.stone.break",1362),
-        ("entity.firework_rocket.launch",510),("entity.wither.spawn",1548),
-        ("entity.ender_dragon.death",470),("entity.egg.throw",456),
-        ("entity.firework_rocket.blast",506),("block.portal.travel",1133),
-        ("entity.item_frame.place",759),("block.note_block.harp",993)] {
-        if k == n { return Some(v) }
+        ("entity.player.levelup", 1115),
+        ("entity.experience_orb.pickup", 502),
+        ("ui.toast.challenge_complete", 1434),
+        ("entity.generic.explode", 577),
+        ("entity.lightning_bolt.thunder", 783),
+        ("block.chest.open", 303),
+        ("entity.item.pickup", 763),
+        ("entity.arrow.hit_player", 84),
+        ("block.anvil.land", 51),
+        ("block.note_block.pling", 995),
+        ("block.note_block.bell", 989),
+        ("ambient.cave", 8),
+        ("entity.zombie.ambient", 1586),
+        ("entity.villager.yes", 1461),
+        ("entity.enderman.teleport", 483),
+        ("entity.player.hurt", 1110),
+        ("entity.zombie.death", 1591),
+        ("entity.skeleton.ambient", 1256),
+        ("entity.creeper.primed", 375),
+        ("entity.spider.ambient", 1344),
+        ("block.grass.break", 629),
+        ("block.stone.break", 1362),
+        ("entity.firework_rocket.launch", 510),
+        ("entity.wither.spawn", 1548),
+        ("entity.ender_dragon.death", 470),
+        ("entity.egg.throw", 456),
+        ("entity.firework_rocket.blast", 506),
+        ("block.portal.travel", 1133),
+        ("entity.item_frame.place", 759),
+        ("block.note_block.harp", 993),
+    ] {
+        if k == n {
+            return Some(v);
+        }
     }
     None
 }
 fn particle_id(n: &str) -> Option<i32> {
     for (k, v) in [
-        ("flame",31),("heart",42),("crit",5),("happy_villager",40),
-        ("explosion",22),("smoke",56),("end_rod",19),("totem_of_undying",62),
-        ("portal",54),("dragon_breath",7),("angry_villager",0),("note",52),
-        ("snowflake",88),("soul",38),("campfire_cosy_smoke",71),
-        ("enchanted_hit",17),("large_smoke",49),("cloud",4),("splash",64),
-        ("rain",55),("composter",41),("firework",29),("flash",39),
-        ("glow",94),("sculk_soul",34),("sonic_boom",27),("cherry_leaves",33),
-        ("poof",53)] {
-        if k == n { return Some(v) }
+        ("flame", 31),
+        ("heart", 42),
+        ("crit", 5),
+        ("happy_villager", 40),
+        ("explosion", 22),
+        ("smoke", 56),
+        ("end_rod", 19),
+        ("totem_of_undying", 62),
+        ("portal", 54),
+        ("dragon_breath", 7),
+        ("angry_villager", 0),
+        ("note", 52),
+        ("snowflake", 88),
+        ("soul", 38),
+        ("campfire_cosy_smoke", 71),
+        ("enchanted_hit", 17),
+        ("large_smoke", 49),
+        ("cloud", 4),
+        ("splash", 64),
+        ("rain", 55),
+        ("composter", 41),
+        ("firework", 29),
+        ("flash", 39),
+        ("glow", 94),
+        ("sculk_soul", 34),
+        ("sonic_boom", 27),
+        ("cherry_leaves", 33),
+        ("poof", 53),
+    ] {
+        if k == n {
+            return Some(v);
+        }
     }
     None
 }
@@ -7969,12 +11091,18 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     let ml = (data.len() as u64) * 8;
     let mut msg = data.to_vec();
     msg.push(0x80);
-    while msg.len() % 64 != 56 { msg.push(0); }
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
     msg.extend_from_slice(&ml.to_be_bytes());
     for chunk in msg.chunks(64) {
         let mut w = [0u32; 80];
-        for i in 0..16 { w[i] = u32::from_be_bytes(chunk[i*4..i*4+4].try_into().unwrap()); }
-        for i in 16..80 { w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1); }
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
         let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
         for i in 0..80 {
             let (f, k) = match i {
@@ -7983,25 +11111,42 @@ fn sha1(data: &[u8]) -> [u8; 20] {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
                 _ => (b ^ c ^ d, 0xCA62C1D6),
             };
-            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
-            e = d; d = c; c = b.rotate_left(30); b = a; a = t;
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
         }
-        h[0]=h[0].wrapping_add(a); h[1]=h[1].wrapping_add(b); h[2]=h[2].wrapping_add(c);
-        h[3]=h[3].wrapping_add(d); h[4]=h[4].wrapping_add(e);
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
     }
     let mut out = [0u8; 20];
-    for i in 0..5 { out[i*4..i*4+4].copy_from_slice(&h[i].to_be_bytes()); }
+    for i in 0..5 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
     out
 }
-fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
 
 static PACK_INFO: OnceLock<Option<(String, String)>> = OnceLock::new(); // (url, sha1hex)
-fn pack_info() -> &'static Option<(String, String)> { PACK_INFO.get_or_init(|| load_pack_info()) }
+fn pack_info() -> &'static Option<(String, String)> {
+    PACK_INFO.get_or_init(|| load_pack_info())
+}
 fn resource_pack_url(bind: &str, configured: Option<&str>) -> Option<String> {
     if let Some(url) = configured {
         let url = url.trim();
-        return (url.starts_with("http://") || url.starts_with("https://"))
-            .then(|| url.to_owned());
+        return (url.starts_with("http://") || url.starts_with("https://")).then(|| url.to_owned());
     }
     // Never suggest 127.0.0.1 to a remote client: that is the client's host.
     match bind {
@@ -8012,14 +11157,21 @@ fn resource_pack_url(bind: &str, configured: Option<&str>) -> Option<String> {
 }
 fn load_pack_info() -> Option<(String, String)> {
     let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-    let url = resource_pack_url(&bind, std::env::var("MC_SPINE_RESOURCE_PACK_URL").ok().as_deref())?;
+    let url = resource_pack_url(
+        &bind,
+        std::env::var("MC_SPINE_RESOURCE_PACK_URL").ok().as_deref(),
+    )?;
     let data = std::fs::read("resourcepack.zip").ok()?;
     Some((url, hex(&sha1(&data))))
 }
 
 fn http_server() {
-    if pack_info().is_none() { return; }
-    let Ok(data) = std::fs::read("resourcepack.zip") else { return };
+    if pack_info().is_none() {
+        return;
+    }
+    let Ok(data) = std::fs::read("resourcepack.zip") else {
+        return;
+    };
     let bind = std::env::var("MC_SPINE_RESOURCE_PACK_BIND_ADDR")
         .or_else(|_| std::env::var("MC_SPINE_BIND_ADDR"))
         .unwrap_or_else(|_| "127.0.0.1".into());
@@ -8027,7 +11179,10 @@ fn http_server() {
         eprintln!("[spine] resource pack bind failed on {bind}:25598");
         return;
     };
-    eprintln!("[spine] resource pack http {bind}:25598 ({} bytes)", data.len());
+    eprintln!(
+        "[spine] resource pack http {bind}:25598 ({} bytes)",
+        data.len()
+    );
     thread::spawn(move || {
         for st in l.incoming().flatten() {
             let mut st = st;
@@ -8035,12 +11190,15 @@ fn http_server() {
             st.set_write_timeout(Some(Duration::from_secs(10))).ok();
             let mut buf = [0u8; 1024];
             let _ = st.read(&mut buf);
-            let head = format!("HTTP/1.1 200 OK
+            let head = format!(
+                "HTTP/1.1 200 OK
 Content-Type: application/zip
 Content-Length: {}
 Connection: close
 
-", data.len());
+",
+                data.len()
+            );
             let _ = st.write_all(head.as_bytes());
             let _ = st.write_all(&data);
         }
@@ -8058,17 +11216,33 @@ fn resource_pack_pkt() -> Option<Vec<u8>> {
 }
 
 // ---------- datapacks (folder packs under datapacks/) ----------
-struct Datapack { name: String, functions: HashMap<String, Vec<String>>, load: Vec<String>, tick: Vec<String> }
+struct Datapack {
+    name: String,
+    functions: HashMap<String, Vec<String>>,
+    load: Vec<String>,
+    tick: Vec<String>,
+}
 static PACKS: OnceLock<Mutex<Vec<Datapack>>> = OnceLock::new();
-fn packs() -> &'static Mutex<Vec<Datapack>> { PACKS.get_or_init(|| Mutex::new(Vec::new())) }
+fn packs() -> &'static Mutex<Vec<Datapack>> {
+    PACKS.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 fn load_datapacks() {
     let base = std::path::Path::new("datapacks");
-    let Ok(rd) = std::fs::read_dir(base) else { return };
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return;
+    };
     for e in rd.flatten() {
         let dir = e.path();
-        if !dir.is_dir() { continue }
-        let mut pk = Datapack { name: e.file_name().to_string_lossy().into(), functions: HashMap::new(), load: vec![], tick: vec![] };
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut pk = Datapack {
+            name: e.file_name().to_string_lossy().into(),
+            functions: HashMap::new(),
+            load: vec![],
+            tick: vec![],
+        };
         // functions: data/<ns>/function/**/*.mcfunction (1.21 layout: 'function' singular)
         if let Ok(data) = std::fs::read_dir(dir.join("data")) {
             for ns in data.flatten() {
@@ -8080,12 +11254,26 @@ fn load_datapacks() {
                         if let Ok(rr) = std::fs::read_dir(&d) {
                             for f in rr.flatten() {
                                 let p = f.path();
-                                if p.is_dir() { stack.push(p); continue }
+                                if p.is_dir() {
+                                    stack.push(p);
+                                    continue;
+                                }
                                 if p.extension().map(|x| x == "mcfunction").unwrap_or(false) {
-                                    let rel = p.strip_prefix(&ns.path().join(tag)).unwrap().to_string_lossy().replace('\\', "/");
-                                    let key = format!("{}:{}", nsn, rel.trim_end_matches(".mcfunction"));
+                                    let rel = p
+                                        .strip_prefix(&ns.path().join(tag))
+                                        .unwrap()
+                                        .to_string_lossy()
+                                        .replace('\\', "/");
+                                    let key =
+                                        format!("{}:{}", nsn, rel.trim_end_matches(".mcfunction"));
                                     if let Ok(body) = std::fs::read_to_string(&p) {
-                                        pk.functions.insert(key, body.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect());
+                                        pk.functions.insert(
+                                            key,
+                                            body.lines()
+                                                .map(|l| l.trim().to_string())
+                                                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                                                .collect(),
+                                        );
                                     }
                                 }
                             }
@@ -8095,29 +11283,58 @@ fn load_datapacks() {
                 // block/item tag members: data/<ns>/tags/{block,blocks,item,items}/**.json
                 for kind in ["block", "blocks", "item", "items"] {
                     let tdir = ns.path().join("tags").join(kind);
-                    if !tdir.exists() { continue }
+                    if !tdir.exists() {
+                        continue;
+                    }
                     let mut stack = vec![tdir.clone()];
                     while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                        let Ok(rd) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
                         for e in rd.flatten() {
                             let p = e.path();
-                            if p.is_dir() { stack.push(p); continue }
+                            if p.is_dir() {
+                                stack.push(p);
+                                continue;
+                            }
                             if p.extension().map(|x| x == "json").unwrap_or(false) {
-                                let rel = p.strip_prefix(&tdir).unwrap().to_string_lossy().replace('\\', "/");
+                                let rel = p
+                                    .strip_prefix(&tdir)
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .replace('\\', "/");
                                 let key = format!("{}:{}", nsn, rel.trim_end_matches(".json"));
                                 if let Ok(body) = std::fs::read_to_string(&p) {
                                     if let Some(va) = body.split("\"values\"").nth(1) {
                                         let mut vals: Vec<String> = Vec::new();
                                         for m in va.split('"').skip(1).step_by(2) {
                                             let m = m.trim();
-                                            if m.is_empty() || m.starts_with(']') || m.starts_with('{') { continue }
-                                            vals.push(if m.contains(':') || m.starts_with('#') { m.to_string() }
-                                                else { format!("minecraft:{}", m) });
+                                            if m.is_empty()
+                                                || m.starts_with(']')
+                                                || m.starts_with('{')
+                                            {
+                                                continue;
+                                            }
+                                            vals.push(if m.contains(':') || m.starts_with('#') {
+                                                m.to_string()
+                                            } else {
+                                                format!("minecraft:{}", m)
+                                            });
                                         }
                                         if kind.starts_with('b') {
-                                            block_tags().lock().unwrap().entry(key).or_default().extend(vals);
+                                            block_tags()
+                                                .lock()
+                                                .unwrap()
+                                                .entry(key)
+                                                .or_default()
+                                                .extend(vals);
                                         } else {
-                                            item_tags().lock().unwrap().entry(key).or_default().extend(vals);
+                                            item_tags()
+                                                .lock()
+                                                .unwrap()
+                                                .entry(key)
+                                                .or_default()
+                                                .extend(vals);
                                         }
                                     }
                                 }
@@ -8128,37 +11345,65 @@ fn load_datapacks() {
                 // crafting recipes: data/<ns>/recipe/**.json (shaped+shapeless)
                 for kind in ["recipe", "recipes"] {
                     let rdir = ns.path().join(kind);
-                    if !rdir.exists() { continue }
+                    if !rdir.exists() {
+                        continue;
+                    }
                     let mut stack = vec![rdir.clone()];
                     while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                        let Ok(rd) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
                         for e in rd.flatten() {
                             let p = e.path();
-                            if p.is_dir() { stack.push(p); continue }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) { continue }
-                            let Ok(body) = std::fs::read_to_string(&p) else { continue };
+                            if p.is_dir() {
+                                stack.push(p);
+                                continue;
+                            }
+                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
+                                continue;
+                            }
+                            let Ok(body) = std::fs::read_to_string(&p) else {
+                                continue;
+                            };
                             let mk_ingr = |spec: &str| -> Option<Ingr> {
                                 if let Some(t) = jstr(spec, "tag") {
                                     let t = t.trim_start_matches('#');
-                                    Some(Ingr::Tag(if t.contains(':') { t.to_string() } else { format!("minecraft:{}", t) }))
+                                    Some(Ingr::Tag(if t.contains(':') {
+                                        t.to_string()
+                                    } else {
+                                        format!("minecraft:{}", t)
+                                    }))
                                 } else if let Some(n) = jstr(spec, "item") {
                                     name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item)
-                                } else { jstr(spec, "").and_then(|_| None) } // object-less spec unsupported
+                                } else {
+                                    jstr(spec, "").and_then(|_| None)
+                                } // object-less spec unsupported
                             };
                             let (out_id, out_cnt) = {
                                 let rblk = jblock(&body, "result");
-                                let id = rblk.and_then(|b| jstr(b, "id"))
+                                let id = rblk
+                                    .and_then(|b| jstr(b, "id"))
                                     .or_else(|| jstr(&body, "result"));
-                                let cnt = rblk.and_then(|b| jnum(b, "count"))
-                                    .or_else(|| jnum(&body, "count")).unwrap_or(1).clamp(1, 64) as u8;
-                                (id.and_then(|i| name_to_item(i.trim_start_matches("minecraft:"))), cnt)
+                                let cnt = rblk
+                                    .and_then(|b| jnum(b, "count"))
+                                    .or_else(|| jnum(&body, "count"))
+                                    .unwrap_or(1)
+                                    .clamp(1, 64) as u8;
+                                (
+                                    id.and_then(|i| {
+                                        name_to_item(i.trim_start_matches("minecraft:"))
+                                    }),
+                                    cnt,
+                                )
                             };
                             let Some(out) = out_id else { continue };
                             if body.contains("crafting_shaped") {
                                 let mut rows: Vec<String> = Vec::new();
                                 if let Some(pa) = jarray(&body, "pattern") {
                                     for m in pa.split('"').skip(1).step_by(2) {
-                                        if !m.is_empty() { rows.push(m.to_string()) }
+                                        if !m.is_empty() {
+                                            rows.push(m.to_string())
+                                        }
                                     }
                                 }
                                 let mut key: HashMap<char, Ingr> = HashMap::new();
@@ -8166,25 +11411,42 @@ fn load_datapacks() {
                                     let inner = &kb[1..kb.len() - 1];
                                     for entry in inner.split(',') {
                                         let Some(col) = entry.find(':') else { continue };
-                                        let ch = entry[..col].trim().trim_matches('"').chars().next().unwrap_or(' ');
+                                        let ch = entry[..col]
+                                            .trim()
+                                            .trim_matches('"')
+                                            .chars()
+                                            .next()
+                                            .unwrap_or(' ');
                                         let spec = entry[col..].trim();
-                                        if let Some(ig) = mk_ingr(spec) { key.insert(ch, ig); }
+                                        if let Some(ig) = mk_ingr(spec) {
+                                            key.insert(ch, ig);
+                                        }
                                     }
                                 }
                                 if !rows.is_empty() {
                                     json_recipes().lock().unwrap().push(JsonRecipe {
-                                        shaped: true, rows, key, ing: Vec::new(), out, out_cnt });
+                                        shaped: true,
+                                        rows,
+                                        key,
+                                        ing: Vec::new(),
+                                        out,
+                                        out_cnt,
+                                    });
                                 }
                             } else if body.contains("crafting_shapeless") {
                                 let mut ing: Vec<Ingr> = Vec::new();
                                 if let Some(ia) = jarray(&body, "ingredients") {
                                     for spec in ia.split('{').skip(1) {
-                                        if let Some(ig) = mk_ingr(spec) { ing.push(ig) }
+                                        if let Some(ig) = mk_ingr(spec) {
+                                            ing.push(ig)
+                                        }
                                     }
                                     if ing.is_empty() {
                                         // bare form: ["minecraft:x","minecraft:y"]
                                         for m in ia.split('"').skip(1).step_by(2) {
-                                            if let Some(i) = name_to_item(m.trim_start_matches("minecraft:")) {
+                                            if let Some(i) =
+                                                name_to_item(m.trim_start_matches("minecraft:"))
+                                            {
                                                 ing.push(Ingr::Item(i));
                                             }
                                         }
@@ -8192,16 +11454,31 @@ fn load_datapacks() {
                                 }
                                 if !ing.is_empty() {
                                     json_recipes().lock().unwrap().push(JsonRecipe {
-                                        shaped: false, rows: Vec::new(), key: HashMap::new(), ing, out, out_cnt });
+                                        shaped: false,
+                                        rows: Vec::new(),
+                                        key: HashMap::new(),
+                                        ing,
+                                        out,
+                                        out_cnt,
+                                    });
                                 }
                             } else if ["smelting", "blasting", "smoking", "campfire_cooking"]
-                                .iter().any(|k| body.contains(k)) {
+                                .iter()
+                                .any(|k| body.contains(k))
+                            {
                                 // "ingredient": {"item"|"tag":...} or bare "minecraft:x"
-                                let ig = jblock(&body, "ingredient").and_then(|b| mk_ingr(b))
-                                    .or_else(|| jstr(&body, "ingredient")
-                                        .and_then(|n| name_to_item(n.trim_start_matches("minecraft:")).map(Ingr::Item)));
+                                let ig = jblock(&body, "ingredient")
+                                    .and_then(|b| mk_ingr(b))
+                                    .or_else(|| {
+                                        jstr(&body, "ingredient").and_then(|n| {
+                                            name_to_item(n.trim_start_matches("minecraft:"))
+                                                .map(Ingr::Item)
+                                        })
+                                    });
                                 if let Some(ig) = ig {
-                                    let xp = jstr(&body, "experience").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                                    let xp = jstr(&body, "experience")
+                                        .and_then(|v| v.parse::<f32>().ok())
+                                        .unwrap_or(0.0);
                                     json_smelts().lock().unwrap().push((ig, out, out_cnt, xp));
                                 }
                             }
@@ -8211,72 +11488,147 @@ fn load_datapacks() {
                 // loot tables: data/<ns>/loot_table[s]/**.json (entities/* also key by mob)
                 for kind in ["loot_table", "loot_tables"] {
                     let ldir = ns.path().join(kind);
-                    if !ldir.exists() { continue }
+                    if !ldir.exists() {
+                        continue;
+                    }
                     let lbase = ldir.clone();
                     let mut stack = vec![ldir.clone()];
                     while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                        let Ok(rd) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
                         for e in rd.flatten() {
                             let p = e.path();
-                            if p.is_dir() { stack.push(p); continue }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) { continue }
-                            let Ok(body) = std::fs::read_to_string(&p) else { continue };
-                            let relp = p.strip_prefix(&lbase).unwrap().to_string_lossy()
-                                .replace('\\', "/").trim_end_matches(".json").to_string();
+                            if p.is_dir() {
+                                stack.push(p);
+                                continue;
+                            }
+                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
+                                continue;
+                            }
+                            let Ok(body) = std::fs::read_to_string(&p) else {
+                                continue;
+                            };
+                            let relp = p
+                                .strip_prefix(&lbase)
+                                .unwrap()
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                                .trim_end_matches(".json")
+                                .to_string();
                             let lkey = format!("{}:{}", nsn, relp);
                             let mut pools: Vec<LootPool> = Vec::new();
                             if let Some(pa) = jarray(&body, "pools") {
                                 for pb in jobjects(pa) {
                                     let rolls = jnum(pb, "rolls")
-                                        .or_else(|| jblock(pb, "rolls").and_then(|b| jnum(b, "max")))
-                                        .unwrap_or(1).clamp(1, 64) as u8;
+                                        .or_else(|| {
+                                            jblock(pb, "rolls").and_then(|b| jnum(b, "max"))
+                                        })
+                                        .unwrap_or(1)
+                                        .clamp(1, 64)
+                                        as u8;
                                     let mut chance = 1.0f32;
                                     if let Some(ca) = jarray(pb, "conditions") {
                                         for cb in jobjects(ca) {
                                             if cb.contains("random_chance") {
-                                                if let Some(c) = jnum(cb, "chance") { chance *= c as f32 / 100.0; }
-                                                else if let Some(c) = jstr(cb, "chance").and_then(|x| x.parse::<f32>().ok()) { chance *= c; }
+                                                if let Some(c) = jnum(cb, "chance") {
+                                                    chance *= c as f32 / 100.0;
+                                                } else if let Some(c) = jstr(cb, "chance")
+                                                    .and_then(|x| x.parse::<f32>().ok())
+                                                {
+                                                    chance *= c;
+                                                }
                                             }
                                         }
                                     }
                                     let mut entries: Vec<LootEntry> = Vec::new();
                                     if let Some(ea) = jarray(pb, "entries") {
                                         for eb in jobjects(ea) {
-                                            if !eb.contains("\"item\"") && !eb.contains("item") { continue }
+                                            if !eb.contains("\"item\"") && !eb.contains("item") {
+                                                continue;
+                                            }
                                             let Some(n) = jstr(eb, "name") else { continue };
-                                            let Some(item) = name_to_item(n.trim_start_matches("minecraft:")) else { continue };
+                                            let Some(item) =
+                                                name_to_item(n.trim_start_matches("minecraft:"))
+                                            else {
+                                                continue;
+                                            };
                                             let (mut lo, mut hi) = (1u8, 1u8);
                                             let mut efuncs: Vec<LootFunc> = Vec::new();
                                             if let Some(fa) = jarray(eb, "functions") {
                                                 for fb in jobjects(fa) {
                                                     if fb.contains("set_count") {
                                                         if let Some(cb) = jblock(fb, "count") {
-                                                            lo = jnum(cb, "min").unwrap_or(1).clamp(0, 64) as u8;
-                                                            hi = jnum(cb, "max").unwrap_or(lo as i64).clamp(0, 64) as u8;
+                                                            lo = jnum(cb, "min")
+                                                                .unwrap_or(1)
+                                                                .clamp(0, 64)
+                                                                as u8;
+                                                            hi = jnum(cb, "max")
+                                                                .unwrap_or(lo as i64)
+                                                                .clamp(0, 64)
+                                                                as u8;
                                                         } else if let Some(c) = jnum(fb, "count") {
-                                                            lo = c.clamp(0, 64) as u8; hi = lo;
+                                                            lo = c.clamp(0, 64) as u8;
+                                                            hi = lo;
                                                         }
                                                     } else {
                                                         efuncs.extend(parse_loot_funcs(fb));
                                                     }
                                                 }
                                             }
-                                            entries.push(LootEntry { item, min: lo, max: hi.max(lo), funcs: efuncs });
+                                            entries.push(LootEntry {
+                                                item,
+                                                min: lo,
+                                                max: hi.max(lo),
+                                                funcs: efuncs,
+                                            });
                                         }
                                     }
-                                    let pfuncs: Vec<LootFunc> = jarray(pb, "functions").map(|fa| parse_loot_funcs(fa)).unwrap_or_default();
-                                    if !entries.is_empty() { pools.push(LootPool { rolls, chance, entries, funcs: pfuncs }); }
+                                    let pfuncs: Vec<LootFunc> = jarray(pb, "functions")
+                                        .map(|fa| parse_loot_funcs(fa))
+                                        .unwrap_or_default();
+                                    if !entries.is_empty() {
+                                        pools.push(LootPool {
+                                            rolls,
+                                            chance,
+                                            entries,
+                                            funcs: pfuncs,
+                                        });
+                                    }
                                 }
                             }
                             if !pools.is_empty() {
                                 // later packs override the same table (vanilla pack order)
                                 loot_tables().lock().unwrap().insert(lkey, pools);
                                 if relp.starts_with("entities/") {
-                                    if let Some(mob) = p.file_stem().and_then(|s| s.to_str())
-                                        .and_then(|n| name_to_etype(n)) {
-                                        if let Some(pl) = loot_tables().lock().unwrap().get(&format!("{}:{}", nsn, relp)) {
-                                            let cloned: Vec<LootPool> = pl.iter().map(|p| LootPool { rolls: p.rolls, chance: p.chance, funcs: p.funcs.clone(),
-                                                entries: p.entries.iter().map(|e| LootEntry { item: e.item, min: e.min, max: e.max, funcs: e.funcs.clone() }).collect() }).collect();
+                                    if let Some(mob) = p
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .and_then(|n| name_to_etype(n))
+                                    {
+                                        if let Some(pl) = loot_tables()
+                                            .lock()
+                                            .unwrap()
+                                            .get(&format!("{}:{}", nsn, relp))
+                                        {
+                                            let cloned: Vec<LootPool> = pl
+                                                .iter()
+                                                .map(|p| LootPool {
+                                                    rolls: p.rolls,
+                                                    chance: p.chance,
+                                                    funcs: p.funcs.clone(),
+                                                    entries: p
+                                                        .entries
+                                                        .iter()
+                                                        .map(|e| LootEntry {
+                                                            item: e.item,
+                                                            min: e.min,
+                                                            max: e.max,
+                                                            funcs: e.funcs.clone(),
+                                                        })
+                                                        .collect(),
+                                                })
+                                                .collect();
                                             mob_loot_tables().lock().unwrap().insert(mob, cloned);
                                         }
                                     }
@@ -8288,21 +11640,40 @@ fn load_datapacks() {
                 // item modifiers: data/<ns>/item_modifier/*.json
                 for kind in ["item_modifier", "item_modifiers"] {
                     let idir = ns.path().join(kind);
-                    if !idir.exists() { continue }
+                    if !idir.exists() {
+                        continue;
+                    }
                     let ibase = idir.clone();
                     let mut stack = vec![idir.clone()];
                     while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                        let Ok(rd) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
                         for e in rd.flatten() {
                             let p = e.path();
-                            if p.is_dir() { stack.push(p); continue }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) { continue }
-                            let Ok(body) = std::fs::read_to_string(&p) else { continue };
-                            let relp = p.strip_prefix(&ibase).unwrap().to_string_lossy()
-                                .replace('\\', "/").trim_end_matches(".json").to_string();
+                            if p.is_dir() {
+                                stack.push(p);
+                                continue;
+                            }
+                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
+                                continue;
+                            }
+                            let Ok(body) = std::fs::read_to_string(&p) else {
+                                continue;
+                            };
+                            let relp = p
+                                .strip_prefix(&ibase)
+                                .unwrap()
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                                .trim_end_matches(".json")
+                                .to_string();
                             let fns = parse_loot_funcs(&body);
                             if !fns.is_empty() {
-                                item_mods().lock().unwrap().insert(format!("{}:{}", nsn, relp), fns);
+                                item_mods()
+                                    .lock()
+                                    .unwrap()
+                                    .insert(format!("{}:{}", nsn, relp), fns);
                             }
                         }
                     }
@@ -8310,41 +11681,72 @@ fn load_datapacks() {
                 // advancements: data/<ns>/advancement/**.json -> id ns:relpath
                 for kind in ["advancement", "advancements"] {
                     let adir = ns.path().join(kind);
-                    if !adir.exists() { continue }
+                    if !adir.exists() {
+                        continue;
+                    }
                     let abase = adir.clone();
                     let mut stack = vec![adir.clone()];
                     while let Some(dir) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                        let Ok(rd) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
                         for e in rd.flatten() {
                             let p = e.path();
-                            if p.is_dir() { stack.push(p); continue }
-                            if !p.extension().map(|x| x == "json").unwrap_or(false) { continue }
-                            let Ok(body) = std::fs::read_to_string(&p) else { continue };
-                            let rel = p.strip_prefix(&abase).unwrap().to_string_lossy()
-                                .replace('\\', "/").trim_end_matches(".json").to_string();
-                            let Some(cb) = jblock(&body, "criteria") else { continue };
+                            if p.is_dir() {
+                                stack.push(p);
+                                continue;
+                            }
+                            if !p.extension().map(|x| x == "json").unwrap_or(false) {
+                                continue;
+                            }
+                            let Ok(body) = std::fs::read_to_string(&p) else {
+                                continue;
+                            };
+                            let rel = p
+                                .strip_prefix(&abase)
+                                .unwrap()
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                                .trim_end_matches(".json")
+                                .to_string();
+                            let Some(cb) = jblock(&body, "criteria") else {
+                                continue;
+                            };
                             let inner = &cb[1..cb.len() - 1];
                             let mut criteria: Vec<(String, String, Option<i64>)> = Vec::new();
                             for co in jobjects(inner) {
                                 // criterion key precedes the object: find its name backwards
                                 let Some(cpos) = inner.find(co) else { continue };
                                 let pre = &inner[..cpos];
-                                let cn = pre.rfind('"').and_then(|e2| pre[..e2].rfind('"')
-                                    .map(|s2| &pre[s2 + 1..e2])).unwrap_or("").to_string();
-                                let tr = jstr(co, "trigger").unwrap_or("").trim_start_matches("minecraft:").to_string();
+                                let cn = pre
+                                    .rfind('"')
+                                    .and_then(|e2| pre[..e2].rfind('"').map(|s2| &pre[s2 + 1..e2]))
+                                    .unwrap_or("")
+                                    .to_string();
+                                let tr = jstr(co, "trigger")
+                                    .unwrap_or("")
+                                    .trim_start_matches("minecraft:")
+                                    .to_string();
                                 let want = jblock(co, "conditions")
                                     .and_then(|cd| jblock(cd, "entity"))
                                     .and_then(|en| jstr(en, "type"))
-                                    .and_then(|t| name_to_etype(t.trim_start_matches("minecraft:")));
+                                    .and_then(|t| {
+                                        name_to_etype(t.trim_start_matches("minecraft:"))
+                                    });
                                 criteria.push((cn, tr, want));
                             }
                             let title = jblock(&body, "display")
-                                .and_then(|d| jblock(d, "title").and_then(|t| jstr(t, "text").map(|x| x.to_string()))
-                                    .or_else(|| jstr(d, "title").map(|x| x.to_string())))
+                                .and_then(|d| {
+                                    jblock(d, "title")
+                                        .and_then(|t| jstr(t, "text").map(|x| x.to_string()))
+                                        .or_else(|| jstr(d, "title").map(|x| x.to_string()))
+                                })
                                 .unwrap_or_else(|| rel.clone());
                             if !criteria.is_empty() {
-                                advancements().lock().unwrap()
-                                    .insert(format!("{}:{}", nsn, rel), Advancement { title, criteria });
+                                advancements().lock().unwrap().insert(
+                                    format!("{}:{}", nsn, rel),
+                                    Advancement { title, criteria },
+                                );
                             }
                         }
                     }
@@ -8352,22 +11754,40 @@ fn load_datapacks() {
                 // predicates: data/<ns>/predicate/**.json -> id ns:relpath
                 for kind in ["predicate", "predicates"] {
                     let pdir = ns.path().join(kind);
-                    if !pdir.exists() { continue }
+                    if !pdir.exists() {
+                        continue;
+                    }
                     let mut stack = vec![(pdir.clone(), String::new())];
                     while let Some((dir, rel)) = stack.pop() {
-                        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                        let Ok(rd) = std::fs::read_dir(&dir) else {
+                            continue;
+                        };
                         for e in rd.flatten() {
                             let p = e.path();
                             let name = e.file_name().to_string_lossy().to_string();
                             if p.is_dir() {
-                                stack.push((p, if rel.is_empty() { name } else { format!("{}/{}", rel, name) }));
+                                stack.push((
+                                    p,
+                                    if rel.is_empty() {
+                                        name
+                                    } else {
+                                        format!("{}/{}", rel, name)
+                                    },
+                                ));
                                 continue;
                             }
-                            if !name.ends_with(".json") { continue }
+                            if !name.ends_with(".json") {
+                                continue;
+                            }
                             if let Ok(body) = std::fs::read_to_string(&p) {
-                                let rel = if rel.is_empty() { name.trim_end_matches(".json").to_string() }
-                                    else { format!("{}/{}", rel, name.trim_end_matches(".json")) };
-                                predicates().lock().unwrap()
+                                let rel = if rel.is_empty() {
+                                    name.trim_end_matches(".json").to_string()
+                                } else {
+                                    format!("{}/{}", rel, name.trim_end_matches(".json"))
+                                };
+                                predicates()
+                                    .lock()
+                                    .unwrap()
                                     .insert(format!("{}:{}", nsn, rel), body);
                             }
                         }
@@ -8376,14 +11796,22 @@ fn load_datapacks() {
                 // tags: data/<ns>/tags/function/{load,tick}.json
                 for tag in ["function", "functions"] {
                     for (jf, dst) in [("load", &mut pk.load), ("tick", &mut pk.tick)] {
-                        let jp = ns.path().join("tags").join(tag).join(format!("{}.json", jf));
+                        let jp = ns
+                            .path()
+                            .join("tags")
+                            .join(tag)
+                            .join(format!("{}.json", jf));
                         if let Ok(body) = std::fs::read_to_string(&jp) {
                             // tiny json: grab quoted strings inside "values" array
                             if let Some(va) = body.split("\"values\"").nth(1) {
                                 for m in va.split('"').skip(1).step_by(2) {
                                     if m.starts_with('#') || m.contains(':') {
                                         let m = m.trim_start_matches('#');
-                                        let m = if m.contains(':') { m.to_string() } else { format!("minecraft:{}", m) };
+                                        let m = if m.contains(':') {
+                                            m.to_string()
+                                        } else {
+                                            format!("minecraft:{}", m)
+                                        };
                                         dst.push(m);
                                     }
                                 }
@@ -8394,7 +11822,13 @@ fn load_datapacks() {
             }
         }
         if !pk.functions.is_empty() || !pk.load.is_empty() {
-            eprintln!("[spine] datapack {}: {} fn, load={:?}, tick={:?}", pk.name, pk.functions.len(), pk.load, pk.tick);
+            eprintln!(
+                "[spine] datapack {}: {} fn, load={:?}, tick={:?}",
+                pk.name,
+                pk.functions.len(),
+                pk.load,
+                pk.tick
+            );
             packs().lock().unwrap().push(pk);
         }
     }
@@ -8408,8 +11842,14 @@ fn jstr<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     // value of "key": "..." or bare token
     let rest = body.split(&format!("\"{}\"", key)).nth(1)?;
     let rest = rest.trim_start().strip_prefix(':')?.trim_start();
-    if let Some(q) = rest.strip_prefix('"') { return Some(&q[..q.find('"')?]) }
-    Some(rest.split(|c: char| c == ',' || c == '}' || c == ']').next()?.trim())
+    if let Some(q) = rest.strip_prefix('"') {
+        return Some(&q[..q.find('"')?]);
+    }
+    Some(
+        rest.split(|c: char| c == ',' || c == '}' || c == ']')
+            .next()?
+            .trim(),
+    )
 }
 fn jnum(body: &str, key: &str) -> Option<i64> {
     jstr(body, key)?.parse().ok()
@@ -8420,18 +11860,38 @@ fn jblock<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let start = rest.find('{')?;
     let mut d = 0i32;
     for (i, ch) in rest[start..].char_indices() {
-        match ch { '{' => d += 1, '}' => { d -= 1; if d == 0 { return Some(&rest[start..start + i + 1]) } }, _ => {} }
+        match ch {
+            '{' => d += 1,
+            '}' => {
+                d -= 1;
+                if d == 0 {
+                    return Some(&rest[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
     }
     None
 }
 // yields each top-level {...} object inside an array body
 fn jobjects<'a>(arr: &'a str) -> Vec<&'a str> {
     let mut v = Vec::new();
-    let mut d = 0i32; let mut st = 0usize;
+    let mut d = 0i32;
+    let mut st = 0usize;
     for (i, ch) in arr.char_indices() {
         match ch {
-            '{' => { if d == 0 { st = i } d += 1 }
-            '}' => { d -= 1; if d == 0 { v.push(&arr[st..i + 1]) } }
+            '{' => {
+                if d == 0 {
+                    st = i
+                }
+                d += 1
+            }
+            '}' => {
+                d -= 1;
+                if d == 0 {
+                    v.push(&arr[st..i + 1])
+                }
+            }
             _ => {}
         }
     }
@@ -8442,20 +11902,46 @@ fn jarray<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let start = rest.find('[')?;
     let mut d = 0i32;
     for (i, ch) in rest[start..].char_indices() {
-        match ch { '[' => d += 1, ']' => { d -= 1; if d == 0 { return Some(&rest[start + 1..start + i]) } }, _ => {} }
+        match ch {
+            '[' => d += 1,
+            ']' => {
+                d -= 1;
+                if d == 0 {
+                    return Some(&rest[start + 1..start + i]);
+                }
+            }
+            _ => {}
+        }
     }
     None
 }
 fn lookup_function(name: &str) -> Option<Vec<String>> {
-    let name = if name.contains(':') { name.to_string() } else { format!("minecraft:{}", name) };
-    packs().lock().unwrap().iter().find_map(|p| p.functions.get(&name).cloned())
+    let name = if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{}", name)
+    };
+    packs()
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|p| p.functions.get(&name).cloned())
 }
 fn run_function(name: &str, me: Option<Arc<Client>>, s: &mut Option<&mut TcpStream>) -> usize {
     run_function_depth(name, me, s, 0)
 }
-fn run_function_depth(name: &str, me: Option<Arc<Client>>, s: &mut Option<&mut TcpStream>, depth: usize) -> usize {
-    if depth > 16 { return 0 }
-    let Some(lines) = lookup_function(name) else { return 0 };
+fn run_function_depth(
+    name: &str,
+    me: Option<Arc<Client>>,
+    s: &mut Option<&mut TcpStream>,
+    depth: usize,
+) -> usize {
+    if depth > 16 {
+        return 0;
+    }
+    let Some(lines) = lookup_function(name) else {
+        return 0;
+    };
     let mut n = 0;
     for line in lines {
         if let Some(rest) = line.strip_prefix("function ") {
@@ -8471,21 +11957,40 @@ fn run_function_depth(name: &str, me: Option<Arc<Client>>, s: &mut Option<&mut T
 // ---------- item -> blockstate (1.21.1 ids) ----------
 fn item_to_state(item: i64) -> Option<u32> {
     Some(match item {
-        1 => 1, 27 => 9, 28 => 10, 35 => 14, 36 => 15, 57 => 112,
-        88 => 2092, 91 => 4276, 132 => 131, 188 => 519, 290 => 2354, 291 => 2355,
+        1 => 1,
+        27 => 9,
+        28 => 10,
+        35 => 14,
+        36 => 15,
+        57 => 112,
+        88 => 2092,
+        91 => 4276,
+        132 => 131,
+        188 => 519,
+        290 => 2354,
+        291 => 2355,
         _ => return None,
     })
 }
 
 // ---------- config blob replay ----------
 fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
-    let data = match std::fs::read("config_packets.bin") { Ok(d) => d, Err(_) => return vec![] };
+    let data = match std::fs::read("config_packets.bin") {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
     let mut out = Vec::new();
     let mut sl = &data[..];
     while !sl.is_empty() {
-        let len = match read_varint(&mut sl) { Some(l) => l as usize, None => break };
-        if sl.len() < len { break }
-        let pkt = sl[..len].to_vec(); sl = &sl[len..];
+        let len = match read_varint(&mut sl) {
+            Some(l) => l as usize,
+            None => break,
+        };
+        if sl.len() < len {
+            break;
+        }
+        let pkt = sl[..len].to_vec();
+        sl = &sl[len..];
         let mut p2 = &pkt[..];
         let id = read_varint(&mut p2).unwrap_or(-1);
         out.push((id, pkt));
@@ -8502,28 +12007,38 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
     for (i, &s) in states.iter().enumerate() {
         match pal.iter().position(|&p| p == s) {
             Some(p) => idx[i] = p as u16,
-            None => { idx[i] = pal.len() as u16; pal.push(s); }
+            None => {
+                idx[i] = pal.len() as u16;
+                pal.push(s);
+            }
         }
     }
     let bc = states.iter().filter(|&&s| s != 0).count() as i16;
     v.extend_from_slice(&bc.to_be_bytes());
     if pal.len() == 1 {
-        v.push(0); write_varint(&mut v, pal[0] as i64); write_varint(&mut v, 0);
+        v.push(0);
+        write_varint(&mut v, pal[0] as i64);
+        write_varint(&mut v, 0);
     } else {
         let bits = 64 - (pal.len() as u64 - 1).leading_zeros();
         let bpe = bits.max(4) as usize;
         v.push(bpe as u8);
         write_varint(&mut v, pal.len() as i64);
-        for &p in &pal { write_varint(&mut v, p as i64); }
+        for &p in &pal {
+            write_varint(&mut v, p as i64);
+        }
         let per = 64 / bpe;
         let nlongs = 4096 / per + if 4096 % per != 0 { 1 } else { 0 };
         write_varint(&mut v, nlongs as i64);
         let mut longs = vec![0u64; nlongs];
         for i in 0..4096 {
-            let li = i / per; let off = (i % per) * bpe;
+            let li = i / per;
+            let off = (i % per) * bpe;
             longs[li] |= (idx[i] as u64) << off;
         }
-        for l in longs { v.extend_from_slice(&l.to_be_bytes()); }
+        for l in longs {
+            v.extend_from_slice(&l.to_be_bytes());
+        }
     }
     // biome palette: 4x4x4 quart cells, index (y<<4|z<<2|x)
     let mut bpal: Vec<i64> = Vec::new();
@@ -8544,7 +12059,11 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
     } else {
         // vanilla biome container: indirect palette up to 3 bpe, else 6-bit direct
         let bits = (64 - (bpal.len() as u64 - 1).leading_zeros()).max(1) as usize;
-        let (bpe, direct) = if bits > 3 { (6usize, true) } else { (bits, false) };
+        let (bpe, direct) = if bits > 3 {
+            (6usize, true)
+        } else {
+            (bits, false)
+        };
         v.push(bpe as u8);
         if !direct {
             write_varint(&mut v, bpal.len() as i64);
@@ -8557,7 +12076,11 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
         write_varint(&mut v, nlongs as i64);
         let mut longs = vec![0u64; nlongs];
         for i in 0..64 {
-            let val = if direct { biomes[i] as u64 } else { bidx[i] as u64 };
+            let val = if direct {
+                biomes[i] as u64
+            } else {
+                bidx[i] as u64
+            };
             let li = i / per;
             longs[li] |= val << ((i % per) * bpe);
         }
@@ -8592,7 +12115,12 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
 /// The area a block light spread may use: the centre chunk with one chunk of margin, which is
 /// where light from a neighbouring source can reach.
 fn within_search(cx: i32, cz: i32, x: i32, y: i32, z: i32) -> bool {
-    x >= cx * 16 - 15 && x <= cx * 16 + 30 && z >= cz * 16 - 15 && z <= cz * 16 + 30 && y >= MIN_Y && y < MIN_Y + 384
+    x >= cx * 16 - 15
+        && x <= cx * 16 + 30
+        && z >= cz * 16 - 15
+        && z <= cz * 16 + 30
+        && y >= MIN_Y
+        && y < MIN_Y + 384
 }
 
 /// Light-emitting blocks the **generator** placed in a chunk, recorded by `chunk_data` as it
@@ -8618,7 +12146,11 @@ fn block_light_sections_from(
     sources: &[((i32, i32, i32), u8)],
     opacity: impl Fn(i32, i32, i32) -> u8,
 ) -> Vec<[u8; 2048]> {
-    let live: Vec<((i32, i32, i32), u8)> = sources.iter().copied().filter(|(p, l)| *l > 0 && within_search(cx, cz, p.0, p.1, p.2)).collect();
+    let live: Vec<((i32, i32, i32), u8)> = sources
+        .iter()
+        .copied()
+        .filter(|(p, l)| *l > 0 && within_search(cx, cz, p.0, p.1, p.2))
+        .collect();
     if live.is_empty() {
         return vec![[0u8; 2048]; 26];
     }
@@ -8629,9 +12161,12 @@ fn block_light_sections_from(
     let (mut by0, mut by1) = (i32::MAX, i32::MIN);
     let (mut bz0, mut bz1) = (i32::MAX, i32::MIN);
     for (p, _) in &live {
-        bx0 = bx0.min(p.0); bx1 = bx1.max(p.0);
-        by0 = by0.min(p.1); by1 = by1.max(p.1);
-        bz0 = bz0.min(p.2); bz1 = bz1.max(p.2);
+        bx0 = bx0.min(p.0);
+        bx1 = bx1.max(p.0);
+        by0 = by0.min(p.1);
+        by1 = by1.max(p.1);
+        bz0 = bz0.min(p.2);
+        bz1 = bz1.max(p.2);
     }
     // Fifteen in every direction is the reach of the brightest source, so nothing outside the
     // expanded box can be lit. The search area clips it, as the map form did.
@@ -8641,14 +12176,21 @@ fn block_light_sections_from(
     let z1 = (bz1 + 15).min(cz * 16 + 30);
     let y0 = (by0 - 15).max(MIN_Y);
     let y1 = (by1 + 15).min(MIN_Y + 383);
-    let (w, d, h) = ((x1 - x0 + 1) as usize, (z1 - z0 + 1) as usize, (y1 - y0 + 1) as usize);
+    let (w, d, h) = (
+        (x1 - x0 + 1) as usize,
+        (z1 - z0 + 1) as usize,
+        (y1 - y0 + 1) as usize,
+    );
     let mut light = vec![0u8; w * d * h];
     // Opacity, read once per cell rather than once per neighbour. A visited cell is asked about
     // by each of its six neighbours, so the spread was reading the world six times for values it
     // had already seen. 0xff means "not looked up yet"; opacity is 0..15.
     let mut op = vec![0xffu8; w * d * h];
-    let idx = |x: i32, y: i32, z: i32| ((y - y0) as usize * d + (z - z0) as usize) * w + (x - x0) as usize;
-    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> = std::collections::VecDeque::new();
+    let idx = |x: i32, y: i32, z: i32| {
+        ((y - y0) as usize * d + (z - z0) as usize) * w + (x - x0) as usize
+    };
+    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> =
+        std::collections::VecDeque::new();
     for (p, l) in &live {
         let i = idx(p.0, p.1, p.2);
         if light[i] < *l {
@@ -8660,7 +12202,14 @@ fn block_light_sections_from(
         if level <= 1 {
             continue;
         }
-        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
             let (qx, qy, qz) = (p.0 + dx, p.1 + dy, p.2 + dz);
             if qx < x0 || qx > x1 || qz < z0 || qz > z1 || qy < y0 || qy > y1 {
                 continue;
@@ -8725,9 +12274,14 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     // generated lava the player has since removed does not light again.
     for dx in -1..=1 {
         for dz in -1..=1 {
-            let Some(g) = gen.get(&(cx + dx, cz + dz)) else { continue };
+            let Some(g) = gen.get(&(cx + dx, cz + dz)) else {
+                continue;
+            };
             for (p, lum) in g {
-                if w.get(&(p.0 >> 4, p.2 >> 4)).and_then(|c| c.get(&local_idx(p.0, p.1, p.2))).is_some() {
+                if w.get(&(p.0 >> 4, p.2 >> 4))
+                    .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
+                    .is_some()
+                {
                     continue;
                 }
                 sources.push((*p, *lum));
@@ -8737,7 +12291,9 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     for dx in -1..=1 {
         for dz in -1..=1 {
             let (ncx, ncz) = (cx + dx, cz + dz);
-            let Some(col) = w.get(&(ncx, ncz)) else { continue };
+            let Some(col) = w.get(&(ncx, ncz)) else {
+                continue;
+            };
             for (idx, st) in col {
                 let lum = reg.luminance_of(*st);
                 if lum == 0 {
@@ -8836,7 +12392,8 @@ fn sky_spill(
     let (z0, z1) = (cz * 16 - 15, cz * 16 + 30);
     let dark = |x: i32, y: i32, z: i32| -> bool { y <= floor_of(x, z) };
     let mut lit: HashMap<(i32, i32, i32), u8> = HashMap::new();
-    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> = std::collections::VecDeque::new();
+    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> =
+        std::collections::VecDeque::new();
     for lz in 0..16usize {
         for lx in 0..16usize {
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
@@ -8852,7 +12409,14 @@ fn sky_spill(
         if level <= 1 {
             continue;
         }
-        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
             let (qx, qy, qz) = (p.0 + dx, p.1 + dy, p.2 + dz);
             if qx < x0 || qx > x1 || qz < z0 || qz > z1 || qy < MIN_Y || qy >= MIN_Y + 384 {
                 continue;
@@ -8924,7 +12488,9 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
 }
 
 fn sky_light_sections_with_spill(
-    cx: i32, cz: i32, floors: &[i32; 256],
+    cx: i32,
+    cz: i32,
+    floors: &[i32; 256],
     spill: &HashMap<(i32, i32, i32), u8>,
 ) -> Vec<[u8; 2048]> {
     // Start with the column packer, then visit only the actual spill entries.
@@ -8932,9 +12498,18 @@ fn sky_light_sections_with_spill(
     // map at every voxel needlessly defeated the uniform-section fast paths.
     let mut out = sky_light_sections_from(cx, cz, floors);
     for (&(x, y, z), &level) in spill {
-        if x.div_euclid(16) != cx || z.div_euclid(16) != cz
-            || y < LIGHT_MIN_Y || y >= LIGHT_MIN_Y + 26 * 16 { continue; }
-        let (lx, lz, relative_y) = ((x & 15) as usize, (z & 15) as usize, (y - LIGHT_MIN_Y) as usize);
+        if x.div_euclid(16) != cx
+            || z.div_euclid(16) != cz
+            || y < LIGHT_MIN_Y
+            || y >= LIGHT_MIN_Y + 26 * 16
+        {
+            continue;
+        }
+        let (lx, lz, relative_y) = (
+            (x & 15) as usize,
+            (z & 15) as usize,
+            (y - LIGHT_MIN_Y) as usize,
+        );
         let byte = &mut out[relative_y / 16][(relative_y & 15) * 128 + lz * 8 + lx / 2];
         let shift = (lx & 1) * 4;
         let raised = ((*byte >> shift) & 15).max(level) & 15;
@@ -8943,10 +12518,7 @@ fn sky_light_sections_with_spill(
     out
 }
 
-fn pack_light_section(
-    sy: i32,
-    level: impl Fn(usize, i32, usize) -> u8,
-) -> [u8; 2048] {
+fn pack_light_section(sy: i32, level: impl Fn(usize, i32, usize) -> u8) -> [u8; 2048] {
     let mut arr = [0u8; 2048];
     for y in 0..16usize {
         let wy = sy + y as i32;
@@ -9022,7 +12594,6 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
 }
 
 fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
-
     let mut data = Vec::new();
     let reg = crate::block_registry::breg();
     let mut gen_sources_here: Vec<((i32, i32, i32), u8)> = Vec::new();
@@ -9032,21 +12603,25 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     };
     let mut hs = [0i32; 256];
     let (mut hmin, mut hmax) = (i32::MAX, i32::MIN);
-    for lz in 0..16 { for lx in 0..16 {
-        let h = height_at(cx * 16 + lx, cz * 16 + lz);
-        hs[((lz << 4) | lx) as usize] = h;
-        hmin = hmin.min(h); hmax = hmax.max(h);
-    }}
+    for lz in 0..16 {
+        for lx in 0..16 {
+            let h = height_at(cx * 16 + lx, cz * 16 + lz);
+            hs[((lz << 4) | lx) as usize] = h;
+            hmin = hmin.min(h);
+            hmax = hmax.max(h);
+        }
+    }
     for sec in 0..24 {
         let sy = sec * 16 + MIN_Y;
-        let biomes = worldgen::biome_section(cx, sy, cz)
-            .unwrap_or_else(|| Box::new([39i64; 64])); // plains
-        // uniform fast path only when overlay empty AND terrain can't reach the section
+        let biomes = worldgen::biome_section(cx, sy, cz).unwrap_or_else(|| Box::new([39i64; 64])); // plains
+                                                                                                   // uniform fast path only when overlay empty AND terrain can't reach the section
         let wg = worldgen::enabled();
         if overlay_empty && ((!wg && sy + 15 < hmin - 4) || sy > hmax + 8) {
             let st = if sy + 15 < hmin - 4 { 1 } else { 0 };
             let mut arr = [0u32; 4096];
-            if st != 0 { arr = [st; 4096]; }
+            if st != 0 {
+                arr = [st; 4096];
+            }
             data.extend_from_slice(&section_encode(&arr, &biomes));
         } else {
             let mut arr = [0u32; 4096];
@@ -9058,15 +12633,23 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             {
                 let w = world().lock().unwrap();
                 let read = |wx: i32, wy: i32, wz: i32| -> u32 {
-                    w.get(&(wx >> 4, wz >> 4)).and_then(|c| c.get(&local_idx(wx, wy, wz))).copied()
+                    w.get(&(wx >> 4, wz >> 4))
+                        .and_then(|c| c.get(&local_idx(wx, wy, wz)))
+                        .copied()
                         .unwrap_or_else(|| base_state(wx, wy, wz))
                 };
                 for ly in 0..16 {
                     for lz in 0..16 {
                         for lx in 0..16 {
-                            let wx = cx * 16 + lx as i32; let wz = cz * 16 + lz as i32; let wy = sy + ly as i32;
-                            let ov = if overlay_empty { None } else {
-                                w.get(&(wx >> 4, wz >> 4)).and_then(|c| c.get(&local_idx(wx, wy, wz))).copied()
+                            let wx = cx * 16 + lx as i32;
+                            let wz = cz * 16 + lz as i32;
+                            let wy = sy + ly as i32;
+                            let ov = if overlay_empty {
+                                None
+                            } else {
+                                w.get(&(wx >> 4, wz >> 4))
+                                    .and_then(|c| c.get(&local_idx(wx, wy, wz)))
+                                    .copied()
                             };
                             let gen = match &base {
                                 Some(a) => a[((ly << 8) | (lz << 4) | lx) as usize],
@@ -9078,13 +12661,27 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                             // `block_light_sections` suppresses it while the edit remains.
                             if let Some(reg) = reg {
                                 let lum = reg.luminance_of(gen);
-                                if lum > 0 { gen_sources_here.push(((wx, wy, wz), lum)); }
+                                if lum > 0 {
+                                    gen_sources_here.push(((wx, wy, wz), lum));
+                                }
                             }
                             // anti-xray + palette compression: buried hidden blocks sent as stone
-                            let vis = if is_hidden(st) && ![(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)].iter()
-                                .any(|(dx,dy,dz)| exposes(read(wx+dx, wy+dy, wz+dz))) {
+                            let vis = if is_hidden(st)
+                                && ![
+                                    (1, 0, 0),
+                                    (-1, 0, 0),
+                                    (0, 1, 0),
+                                    (0, -1, 0),
+                                    (0, 0, 1),
+                                    (0, 0, -1),
+                                ]
+                                .iter()
+                                .any(|(dx, dy, dz)| exposes(read(wx + dx, wy + dy, wz + dz)))
+                            {
                                 hidden_filler_with(&read, wx, wy, wz, hs[((lz << 4) | lx) as usize])
-                            } else { st };
+                            } else {
+                                st
+                            };
                             arr[(ly << 8) | (lz << 4) | lx] = vis;
                         }
                     }
@@ -9101,8 +12698,11 @@ fn nbt_str(v: &mut Vec<u8>, s: &str) {
     // NBT string length is u16 — clamp to a char boundary or oversized
     // strings wrap the length field and desync every client that reads it.
     let mut n = s.len().min(u16::MAX as usize);
-    while !s.is_char_boundary(n) { n -= 1 }
-    v.extend_from_slice(&(n as u16).to_be_bytes()); v.extend_from_slice(&s.as_bytes()[..n]);
+    while !s.is_char_boundary(n) {
+        n -= 1
+    }
+    v.extend_from_slice(&(n as u16).to_be_bytes());
+    v.extend_from_slice(&s.as_bytes()[..n]);
 }
 fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     let mut v = Vec::new();
@@ -9113,11 +12713,16 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     let per = 64 / 9;
     let mut longs = vec![0u64; 37];
     for i in 0..256usize {
-        let li = i / per; let off = (i % per) * 9;
+        let li = i / per;
+        let off = (i % per) * 9;
         let val = (tops[i] - MIN_Y).max(0) as u64; // tops already = top y+1; stored relative to min_y
-        if li < 37 { longs[li] |= (val & 0x1ff) << off; }
+        if li < 37 {
+            longs[li] |= (val & 0x1ff) << off;
+        }
     }
-    for l in longs { v.extend_from_slice(&l.to_be_bytes()); }
+    for l in longs {
+        v.extend_from_slice(&l.to_be_bytes());
+    }
     v.push(0);
     v
 }
@@ -9128,10 +12733,12 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     p.extend_from_slice(&cz.to_be_bytes());
     let mut tops = [0i32; 256];
     if let Some(c) = worldgen::chunk_cols(cx, cz) {
-        for lz in 0..16usize { for lx in 0..16usize {
-            // MOTION_BLOCKING is the top of the fluid-inclusive surface, not the density top.
-            tops[lz * 16 + lx] = c.wtop(lx, lz) + 1;
-        }}
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                // MOTION_BLOCKING is the top of the fluid-inclusive surface, not the density top.
+                tops[lz * 16 + lx] = c.wtop(lx, lz) + 1;
+            }
+        }
     }
     p.extend_from_slice(&heightmaps_nbt(&tops));
     let data = chunk_data(cx, cz, gen);
@@ -9141,10 +12748,15 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     // would otherwise render blank until edited after each chunk load
     let be: Vec<((i32, i32, i32), i64, Vec<u8>)> = {
         let sg = signs().lock().unwrap();
-        sg.iter().filter(|(&(x, _, z, _), _)| x >> 4 == cx && z >> 4 == cz)
+        sg.iter()
+            .filter(|(&(x, _, z, _), _)| x >> 4 == cx && z >> 4 == cz)
             .map(|(&(x, y, z, front), lines)| {
                 let empty: [String; 4] = Default::default();
-                let (fl, bl) = if front != 0 { (lines, &empty) } else { (&empty, lines) };
+                let (fl, bl) = if front != 0 {
+                    (lines, &empty)
+                } else {
+                    (&empty, lines)
+                };
                 let mut n = Vec::new();
                 n.push(10);
                 sign_side_nbt(&mut n, "front_text", fl);
@@ -9152,7 +12764,8 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                 nbt_named_byte(&mut n, "is_waxed", 0);
                 n.push(0);
                 ((x, y, z), 7i64, n)
-            }).collect()
+            })
+            .collect()
     };
     write_varint(&mut p, be.len() as i64);
     for ((x, y, z), ty, n) in be {
@@ -9171,19 +12784,27 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
 /// light source and cost a pass to compute, and the simpler form is the one that can be shown
 /// correct.
 fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, gen: &GenSources) {
-    write_varint(p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask
-    write_varint(p, 1); p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // blockLightMask
+    write_varint(p, 1);
+    p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask
+    write_varint(p, 1);
+    p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // blockLightMask
     write_varint(p, 0); // emptySky
     write_varint(p, 0); // emptyBlock
-    // The arrays follow as two counted lists, each entry prefixed by its length.
-    // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
-    // then the block light a torch contributes. Two counted lists, sky first.
+                        // The arrays follow as two counted lists, each entry prefixed by its length.
+                        // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
+                        // then the block light a torch contributes. Two counted lists, sky first.
     let sky = sky_light_sections_world(cx, cz);
     write_varint(p, sky.len() as i64);
-    for sec in sky { write_varint(p, 2048); p.extend_from_slice(&sec); }
+    for sec in sky {
+        write_varint(p, 2048);
+        p.extend_from_slice(&sec);
+    }
     let block = block_light_sections(cx, cz, gen);
     write_varint(p, block.len() as i64);
-    for sec in block { write_varint(p, 2048); p.extend_from_slice(&sec); }
+    for sec in block {
+        write_varint(p, 2048);
+        p.extend_from_slice(&sec);
+    }
 }
 
 /// A client already holding a chunk receives this when a later neighbour is generated: the held
@@ -9200,16 +12821,25 @@ fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     let block = block_light_sections(cx, cz, gen);
     let (mut mask, mut empty) = (0u64, 0u64);
     for (i, sec) in block.iter().enumerate() {
-        if sec.iter().all(|b| *b == 0) { empty |= 1 << i; } else { mask |= 1 << i; }
+        if sec.iter().all(|b| *b == 0) {
+            empty |= 1 << i;
+        } else {
+            mask |= 1 << i;
+        }
     }
     write_varint(&mut p, 0); // skyLightMask: sky is unchanged
-    write_varint(&mut p, 1); p.extend_from_slice(&mask.to_be_bytes());
+    write_varint(&mut p, 1);
+    p.extend_from_slice(&mask.to_be_bytes());
     write_varint(&mut p, 0); // emptySkyLightMask
-    write_varint(&mut p, 1); p.extend_from_slice(&empty.to_be_bytes());
+    write_varint(&mut p, 1);
+    p.extend_from_slice(&empty.to_be_bytes());
     write_varint(&mut p, 0); // no sky updates
     let lit: Vec<&[u8; 2048]> = block.iter().filter(|s| s.iter().any(|b| *b != 0)).collect();
     write_varint(&mut p, lit.len() as i64);
-    for sec in lit { write_varint(&mut p, 2048); p.extend_from_slice(sec); }
+    for sec in lit {
+        write_varint(&mut p, 2048);
+        p.extend_from_slice(sec);
+    }
     p
 }
 
@@ -9219,15 +12849,26 @@ fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
 /// and re-sent. Neighbours generated later name this chunk in their own call, so every ordered
 /// pair is covered once.
 fn light_dirty_for(gen: &GenSources, cx: i32, cz: i32) -> Vec<(i32, i32)> {
-    let Some(sources) = gen.get(&(cx, cz)) else { return Vec::new() };
-    if sources.is_empty() { return Vec::new() }
+    let Some(sources) = gen.get(&(cx, cz)) else {
+        return Vec::new();
+    };
+    if sources.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for dx in -1..=1 {
         for dz in -1..=1 {
-            if dx == 0 && dz == 0 { continue }
+            if dx == 0 && dz == 0 {
+                continue;
+            }
             let (nx, nz) = (cx + dx, cz + dz);
-            if !gen.contains_key(&(nx, nz)) { continue }
-            if sources.iter().any(|(p, _)| within_search(nx, nz, p.0, p.1, p.2)) {
+            if !gen.contains_key(&(nx, nz)) {
+                continue;
+            }
+            if sources
+                .iter()
+                .any(|(p, _)| within_search(nx, nz, p.0, p.1, p.2))
+            {
                 out.push((nx, nz));
             }
         }
@@ -9242,62 +12883,108 @@ const SERVER_VIEW_DISTANCE: i32 = 8;
 fn client_info_view_distance(body: &[u8]) -> Option<i32> {
     let mut p = body;
     let len = usize::try_from(read_protocol_i32(&mut p)?).ok()?;
-    if len > 64 || p.len() < len { return None; }
+    if len > 64 || p.len() < len {
+        return None;
+    }
     let locale = std::str::from_utf8(&p[..len]).ok()?;
-    if locale.encode_utf16().count() > 16 { return None; }
+    if locale.encode_utf16().count() > 16 {
+        return None;
+    }
     p = &p[len..];
     let view = *p.first()? as i8 as i32;
     p = &p[1..];
-    if !(0..=2).contains(&read_protocol_i32(&mut p)?) { return None; } // chat mode
-    if p.len() < 2 { return None; }
+    if !(0..=2).contains(&read_protocol_i32(&mut p)?) {
+        return None;
+    } // chat mode
+    if p.len() < 2 {
+        return None;
+    }
     p = &p[2..]; // chat colours and skin parts
-    if !(0..=1).contains(&read_protocol_i32(&mut p)?) { return None; } // main hand
-    if p.len() != 2 { return None; } // filtering and server listings
+    if !(0..=1).contains(&read_protocol_i32(&mut p)?) {
+        return None;
+    } // main hand
+    if p.len() != 2 {
+        return None;
+    } // filtering and server listings
     Some(view)
 }
 
-fn stream_chunks(s: &mut TcpStream, sent: &mut std::collections::HashSet<(i32, i32)>, gen: &mut GenSources, ccx: i32, ccz: i32, view: i32) {
+fn stream_chunks(
+    s: &mut TcpStream,
+    sent: &mut std::collections::HashSet<(i32, i32)>,
+    gen: &mut GenSources,
+    ccx: i32,
+    ccz: i32,
+    view: i32,
+) {
     // chunks leaving the window get an explicit unload — vanilla keeps
     // client memory bounded and the set now means exactly "chunks the
     // client holds" (updates must only target holders).
-    let gone: Vec<(i32, i32)> = sent.iter().copied()
-        .filter(|c| (c.0 - ccx).abs() > view || (c.1 - ccz).abs() > view).collect();
+    let gone: Vec<(i32, i32)> = sent
+        .iter()
+        .copied()
+        .filter(|c| (c.0 - ccx).abs() > view || (c.1 - ccz).abs() > view)
+        .collect();
     for c in gone {
         let mut p = Vec::with_capacity(8);
         p.extend_from_slice(&c.1.to_be_bytes()); // wire order: chunkZ, chunkX
         p.extend_from_slice(&c.0.to_be_bytes());
-        if send_packet(s, 0x21, p).is_err() { return }
+        if send_packet(s, 0x21, p).is_err() {
+            return;
+        }
         sent.remove(&c);
         gen.remove(&c);
     }
-    let mut vp = Vec::new(); write_varint(&mut vp, ccx as i64); write_varint(&mut vp, ccz as i64);
+    let mut vp = Vec::new();
+    write_varint(&mut vp, ccx as i64);
+    write_varint(&mut vp, ccz as i64);
     let _ = send_packet(s, 0x54, vp);
     let mut news = Vec::new();
-    for dx in -view..=view { for dz in -view..=view {
-        let c = (ccx + dx, ccz + dz);
-        if !sent.contains(&c) { news.push(c); sent.insert(c); }
-    }}
-    if news.is_empty() { return }
+    for dx in -view..=view {
+        for dz in -view..=view {
+            let c = (ccx + dx, ccz + dz);
+            if !sent.contains(&c) {
+                news.push(c);
+                sent.insert(c);
+            }
+        }
+    }
+    if news.is_empty() {
+        return;
+    }
     let _ = send_packet(s, 0x0d, vec![]);
     let mut dirty: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     for (cx, cz) in &news {
-        if send_packet(s, 0x27, map_chunk(*cx, *cz, gen)).is_err() { return }
-        for n in light_dirty_for(gen, *cx, *cz) { dirty.insert(n); }
-        let snap: Vec<((i32,i32,i32,u8), [String;4])> = signs().lock().unwrap().iter()
-            .filter(|((sx,_,sz,_),_)| sx.div_euclid(16) == *cx && sz.div_euclid(16) == *cz)
-            .map(|(k,v)| (*k, v.clone())).collect();
-        for ((sx,sy,sz,front), lines) in snap {
-            let _ = send_packet(s, 0x07, sign_entity_pkt(sx,sy,sz,front,&lines));
+        if send_packet(s, 0x27, map_chunk(*cx, *cz, gen)).is_err() {
+            return;
+        }
+        for n in light_dirty_for(gen, *cx, *cz) {
+            dirty.insert(n);
+        }
+        let snap: Vec<((i32, i32, i32, u8), [String; 4])> = signs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((sx, _, sz, _), _)| sx.div_euclid(16) == *cx && sz.div_euclid(16) == *cz)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for ((sx, sy, sz, front), lines) in snap {
+            let _ = send_packet(s, 0x07, sign_entity_pkt(sx, sy, sz, front, &lines));
         }
     }
     // A neighbour lit before this batch could not see the emitters generated now, so its light is
     // recomputed and re-sent. `light_dirty_for` limits this to held chunks a new emitter can
     // actually reach, and the set deduplicates the chunks several new neighbours all touch.
     for (cx, cz) in dirty {
-        if !sent.contains(&(cx, cz)) { continue }
-        if send_packet(s, 0x2a, update_light_packet(cx, cz, gen)).is_err() { return }
+        if !sent.contains(&(cx, cz)) {
+            continue;
+        }
+        if send_packet(s, 0x2a, update_light_packet(cx, cz, gen)).is_err() {
+            return;
+        }
     }
-    let mut bf = Vec::new(); write_varint(&mut bf, news.len() as i64);
+    let mut bf = Vec::new();
+    write_varint(&mut bf, news.len() as i64);
     let _ = send_packet(s, 0x0c, bf);
 }
 
@@ -9305,13 +12992,16 @@ fn join_game() -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&1i32.to_be_bytes());
     p.push(0);
-    write_varint(&mut p, 1); write_str(&mut p, "minecraft:overworld");
+    write_varint(&mut p, 1);
+    write_str(&mut p, "minecraft:overworld");
     write_varint(&mut p, 20);
     write_varint(&mut p, SERVER_VIEW_DISTANCE as i64);
     write_varint(&mut p, 8);
-    p.push(0); p.push(1); p.push(0);
+    p.push(0);
+    p.push(1);
+    p.push(0);
     p.extend_from_slice(&spawn_info());
-    p.push(0);   // secure chat off
+    p.push(0); // secure chat off
     p
 }
 fn spawn_info() -> Vec<u8> {
@@ -9319,18 +13009,26 @@ fn spawn_info() -> Vec<u8> {
     write_varint(&mut p, 0);
     write_str(&mut p, "minecraft:overworld");
     p.extend_from_slice(&0i64.to_be_bytes());
-    p.push(1);   // creative
+    p.push(1); // creative
     p.push(255); // prev -1
-    p.push(0); p.push(1); // isDebug=false, isFlat=true
-    p.push(0);   // no death loc
+    p.push(0);
+    p.push(1); // isDebug=false, isFlat=true
+    p.push(0); // no death loc
     write_varint(&mut p, 0);
     p
 }
 fn hurt_anim(eid: i32) -> Vec<u8> {
-    let mut p = Vec::new(); write_varint(&mut p, eid as i64); p.extend_from_slice(&0f32.to_be_bytes()); p
+    let mut p = Vec::new();
+    write_varint(&mut p, eid as i64);
+    p.extend_from_slice(&0f32.to_be_bytes());
+    p
 }
 fn health_pkt(hp: f32, food: i32, sat: f32) -> Vec<u8> {
-    let mut p = Vec::new(); p.extend_from_slice(&hp.to_be_bytes()); write_varint(&mut p, food as i64); p.extend_from_slice(&sat.to_be_bytes()); p
+    let mut p = Vec::new();
+    p.extend_from_slice(&hp.to_be_bytes());
+    write_varint(&mut p, food as i64);
+    p.extend_from_slice(&sat.to_be_bytes());
+    p
 }
 fn slot_wire(s: &Stack) -> Vec<u8> {
     let mut p = Vec::new();
@@ -9339,7 +13037,10 @@ fn slot_wire(s: &Stack) -> Vec<u8> {
         write_varint(&mut p, s.0);
         write_varint(&mut p, s.2.len() as i64);
         write_varint(&mut p, 0);
-        for (ty, data) in &s.2 { write_varint(&mut p, *ty); p.extend_from_slice(data); }
+        for (ty, data) in &s.2 {
+            write_varint(&mut p, *ty);
+            p.extend_from_slice(data);
+        }
     }
     p
 }
@@ -9367,11 +13068,15 @@ fn trades() -> Vec<(i64, u8, Option<(i64, u8)>, i64, u8)> {
 // ids abort the component loop — safe because slot data always ends a
 // packet here, so no framing desync.
 fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
-    if b.len() < 2 { return None }
+    if b.len() < 2 {
+        return None;
+    }
     let slot = i16::from_be_bytes(b[..2].try_into().unwrap());
     let mut p = 2usize;
     let cnt = rv_varint(b, &mut p);
-    if cnt <= 0 { return Some((slot, (0, 0, Vec::new()))) }
+    if cnt <= 0 {
+        return Some((slot, (0, 0, Vec::new())));
+    }
     let item = rv_varint(b, &mut p);
     let nadd = rv_varint(b, &mut p);
     let nrem = rv_varint(b, &mut p);
@@ -9380,46 +13085,98 @@ fn slot_read_wire(b: &[u8]) -> Option<(i16, Stack)> {
         let ty = rv_varint(b, &mut p);
         let start = p;
         match ty {
-            1 | 2 | 3 => { rv_varint(b, &mut p); }                        // varint payload
-            4 => { if p < b.len() { p += 1; } }                           // unbreakable: bool
-            5 => { if p + 3 <= b.len() && b[p] == 8 {                     // nbt_string
-                       let l = u16::from_be_bytes(b[p+1..p+3].try_into().unwrap()) as usize;
-                       p += 3 + l.min(b.len().saturating_sub(p + 3));
-                   } else { break } }
-            7 => { let n = rv_varint(b, &mut p);                          // lore: n strings
-                   for _ in 0..n.min(128) {
-                       if p + 3 <= b.len() && b[p] == 8 {
-                           let l = u16::from_be_bytes(b[p+1..p+3].try_into().unwrap()) as usize;
-                           p += 3 + l.min(b.len().saturating_sub(p + 3));
-                       } else { p = b.len(); break }
-                   } if p > b.len() { p = b.len() } }
-            9 => { let n = rv_varint(b, &mut p);                          // enchantments
-                   for _ in 0..n.min(256) { rv_varint(b, &mut p); rv_varint(b, &mut p); }
-                   if p < b.len() { p += 1; } }
-            _ => break,                                                 // unknown: keep prefix
+            1 | 2 | 3 => {
+                rv_varint(b, &mut p);
+            } // varint payload
+            4 => {
+                if p < b.len() {
+                    p += 1;
+                }
+            } // unbreakable: bool
+            5 => {
+                if p + 3 <= b.len() && b[p] == 8 {
+                    // nbt_string
+                    let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+                    p += 3 + l.min(b.len().saturating_sub(p + 3));
+                } else {
+                    break;
+                }
+            }
+            7 => {
+                let n = rv_varint(b, &mut p); // lore: n strings
+                for _ in 0..n.min(128) {
+                    if p + 3 <= b.len() && b[p] == 8 {
+                        let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+                        p += 3 + l.min(b.len().saturating_sub(p + 3));
+                    } else {
+                        p = b.len();
+                        break;
+                    }
+                }
+                if p > b.len() {
+                    p = b.len()
+                }
+            }
+            9 => {
+                let n = rv_varint(b, &mut p); // enchantments
+                for _ in 0..n.min(256) {
+                    rv_varint(b, &mut p);
+                    rv_varint(b, &mut p);
+                }
+                if p < b.len() {
+                    p += 1;
+                }
+            }
+            _ => break, // unknown: keep prefix
         }
-        if p <= b.len() && p > start { comps.push((ty, b[start..p].to_vec())); } else { break }
+        if p <= b.len() && p > start {
+            comps.push((ty, b[start..p].to_vec()));
+        } else {
+            break;
+        }
     }
     // removed components: varint ids — our stacks never carry them, skip
-    for _ in 0..nrem.min(128) { rv_varint(b, &mut p); }
+    for _ in 0..nrem.min(128) {
+        rv_varint(b, &mut p);
+    }
     Some((slot, (item, cnt as u8, comps)))
 }
 fn reduced_slot(p: &mut Vec<u8>, item: i64, cnt: u8) {
-    write_varint(p, item); write_varint(p, cnt as i64); write_varint(p, 0);
+    write_varint(p, item);
+    write_varint(p, cnt as i64);
+    write_varint(p, 0);
 }
 fn inv_consume(inv: &mut HashMap<i16, Stack>, item: i64, need: i64) -> bool {
     // vanilla trade costs have an empty component predicate — any stack of
     // that item type is spendable (enchanted/renamed accepted); prefer
     // plain stacks first to preserve valuable components
-    let have: i64 = inv.values().filter(|(it, _, _)| *it == item).map(|(_, c, _)| *c as i64).sum();
-    if have < need { return false }
+    let have: i64 = inv
+        .values()
+        .filter(|(it, _, _)| *it == item)
+        .map(|(_, c, _)| *c as i64)
+        .sum();
+    if have < need {
+        return false;
+    }
     let mut left = need;
-    let mut keys: Vec<i16> = inv.iter().filter(|(_, (it, _, _))| *it == item).map(|(&k, _)| k).collect();
+    let mut keys: Vec<i16> = inv
+        .iter()
+        .filter(|(_, (it, _, _))| *it == item)
+        .map(|(&k, _)| k)
+        .collect();
     keys.sort_by_key(|k| if inv[k].2.is_empty() { 0 } else { 1 });
-    for k in keys { if left <= 0 { break }
+    for k in keys {
+        if left <= 0 {
+            break;
+        }
         let (it, c, _cc) = inv[&k].clone();
-        let take = (c as i64).min(left); left -= take;
-        if take >= c as i64 { inv.remove(&k); } else { inv.insert(k, (it, c - take as u8, _cc)); }
+        let take = (c as i64).min(left);
+        left -= take;
+        if take >= c as i64 {
+            inv.remove(&k);
+        } else {
+            inv.insert(k, (it, c - take as u8, _cc));
+        }
     }
     true
 }
@@ -9430,26 +13187,39 @@ fn trade_list_pkt(wid: u8) -> Vec<u8> {
     for (a, ac, b, c, cc) in ts {
         reduced_slot(&mut p, a, ac);
         p.extend_from_slice(&slot_wire(&(c, cc, Vec::new())));
-        match b { Some((bi, bc)) => { p.push(1); reduced_slot(&mut p, bi, bc); } None => p.push(0) }
-        p.push(0);                                  // tradeDisabled
-        p.extend_from_slice(&0i32.to_be_bytes());   // uses
-        p.extend_from_slice(&12i32.to_be_bytes());  // max uses
-        p.extend_from_slice(&1i32.to_be_bytes());   // xp
-        p.extend_from_slice(&0i32.to_be_bytes());   // specialPrice
+        match b {
+            Some((bi, bc)) => {
+                p.push(1);
+                reduced_slot(&mut p, bi, bc);
+            }
+            None => p.push(0),
+        }
+        p.push(0); // tradeDisabled
+        p.extend_from_slice(&0i32.to_be_bytes()); // uses
+        p.extend_from_slice(&12i32.to_be_bytes()); // max uses
+        p.extend_from_slice(&1i32.to_be_bytes()); // xp
+        p.extend_from_slice(&0i32.to_be_bytes()); // specialPrice
         p.extend_from_slice(&0.0f32.to_be_bytes()); // priceMultiplier
-        p.extend_from_slice(&0i32.to_be_bytes());   // demand
+        p.extend_from_slice(&0i32.to_be_bytes()); // demand
     }
     write_varint(&mut p, 1); // villagerLevel
     write_varint(&mut p, 0); // experience
-    p.push(1); p.push(1);    // regular + canRestock
+    p.push(1);
+    p.push(1); // regular + canRestock
     p
 }
-fn open_chest_window(s: &mut TcpStream, pos: (i32,i32,i32), other: Option<(i32,i32,i32)>, inv: &HashMap<i16,Stack>, title: &str) {
+fn open_chest_window(
+    s: &mut TcpStream,
+    pos: (i32, i32, i32),
+    other: Option<(i32, i32, i32)>,
+    inv: &HashMap<i16, Stack>,
+    title: &str,
+) {
     let wide = other.is_some();
     let rows = if wide { 54i16 } else { 27i16 };
     let mut p = Vec::new();
-    write_varint(&mut p, 1);                       // windowId
-    write_varint(&mut p, if wide { 5 } else { 2 });// generic_9x6 / generic_9x3
+    write_varint(&mut p, 1); // windowId
+    write_varint(&mut p, if wide { 5 } else { 2 }); // generic_9x6 / generic_9x3
     p.extend_from_slice(&chat_nbt(if wide { "Large Chest" } else { title }));
     let _ = send_packet(s, 0x33, p);
     let mut q = vec![1u8];
@@ -9460,11 +13230,17 @@ fn open_chest_window(s: &mut TcpStream, pos: (i32,i32,i32), other: Option<(i32,i
     let ch2 = other.and_then(|k| all.get(&k).cloned()).unwrap_or_default();
     drop(all);
     for i in 0..rows {
-        let (it, c, _cc) = if i < 27 { ch.get(&i) } else { ch2.get(&(i - 27)) }.cloned().unwrap_or((0, 0, Vec::new()));
+        let (it, c, _cc) = if i < 27 {
+            ch.get(&i)
+        } else {
+            ch2.get(&(i - 27))
+        }
+        .cloned()
+        .unwrap_or((0, 0, Vec::new()));
         q.extend_from_slice(&slot_wire(&(it, c, _cc)));
     }
     for wsl in rows..(rows + 36) {
-        let islot = wsl - rows + 9;               // window inv section -> inv slots 9..44
+        let islot = wsl - rows + 9; // window inv section -> inv slots 9..44
         let (it, c, _cc) = inv.get(&islot).cloned().unwrap_or((0, 0, Vec::new()));
         q.extend_from_slice(&slot_wire(&(it, c, _cc)));
     }
@@ -9474,19 +13250,71 @@ fn open_chest_window(s: &mut TcpStream, pos: (i32,i32,i32), other: Option<(i32,i
 // which armor slot (5=helm..8=boots) an item equips into, or -1
 fn armor_slot_for(it: i64) -> i16 {
     let n = |x: &str| name_to_item(x).unwrap_or(-1);
-    if [n("leather_helmet"),n("golden_helmet"),n("chainmail_helmet"),n("iron_helmet"),n("diamond_helmet"),n("netherite_helmet"),n("turtle_helmet")].contains(&it) { return 5 }
-    if [n("leather_chestplate"),n("golden_chestplate"),n("chainmail_chestplate"),n("iron_chestplate"),n("diamond_chestplate"),n("netherite_chestplate"),n("elytra")].contains(&it) { return 6 }
-    if [n("leather_leggings"),n("golden_leggings"),n("chainmail_leggings"),n("iron_leggings"),n("diamond_leggings"),n("netherite_leggings")].contains(&it) { return 7 }
-    if [n("leather_boots"),n("golden_boots"),n("chainmail_boots"),n("iron_boots"),n("diamond_boots"),n("netherite_boots")].contains(&it) { return 8 }
+    if [
+        n("leather_helmet"),
+        n("golden_helmet"),
+        n("chainmail_helmet"),
+        n("iron_helmet"),
+        n("diamond_helmet"),
+        n("netherite_helmet"),
+        n("turtle_helmet"),
+    ]
+    .contains(&it)
+    {
+        return 5;
+    }
+    if [
+        n("leather_chestplate"),
+        n("golden_chestplate"),
+        n("chainmail_chestplate"),
+        n("iron_chestplate"),
+        n("diamond_chestplate"),
+        n("netherite_chestplate"),
+        n("elytra"),
+    ]
+    .contains(&it)
+    {
+        return 6;
+    }
+    if [
+        n("leather_leggings"),
+        n("golden_leggings"),
+        n("chainmail_leggings"),
+        n("iron_leggings"),
+        n("diamond_leggings"),
+        n("netherite_leggings"),
+    ]
+    .contains(&it)
+    {
+        return 7;
+    }
+    if [
+        n("leather_boots"),
+        n("golden_boots"),
+        n("chainmail_boots"),
+        n("iron_boots"),
+        n("diamond_boots"),
+        n("netherite_boots"),
+    ]
+    .contains(&it)
+    {
+        return 8;
+    }
     -1
 }
 // remove up to n items of the stack at k (n>=stack size takes all);
 // returns what was removed
 fn map_take(map: &mut HashMap<i16, Stack>, k: i16, n: u8) -> Option<Stack> {
     let st = map.get(&k).cloned()?;
-    if st.1 == 0 { return None }
+    if st.1 == 0 {
+        return None;
+    }
     let take = n.min(st.1);
-    if take >= st.1 { map.remove(&k); } else { map.get_mut(&k).unwrap().1 -= take; }
+    if take >= st.1 {
+        map.remove(&k);
+    } else {
+        map.get_mut(&k).unwrap().1 -= take;
+    }
     Some((st.0, take, st.2))
 }
 // insert st into map across keys lo..=hi: merge into matching stacks
@@ -9494,17 +13322,25 @@ fn map_take(map: &mut HashMap<i16, Stack>, k: i16, n: u8) -> Option<Stack> {
 fn map_add_range(map: &mut HashMap<i16, Stack>, lo: i16, hi: i16, st: Stack) -> Stack {
     let mut rem = st;
     for k in lo..=hi {
-        if rem.1 == 0 { break }
+        if rem.1 == 0 {
+            break;
+        }
         if let Some(cur) = map.get_mut(&k) {
             if cur.0 == rem.0 && cur.2 == rem.2 {
                 let room = (item_stack_max(cur.0, &cur.2) as i64 - cur.1 as i64).max(0) as u8;
-                let t = room.min(rem.1); cur.1 += t; rem.1 -= t;
+                let t = room.min(rem.1);
+                cur.1 += t;
+                rem.1 -= t;
             }
         }
     }
     if rem.1 > 0 {
         for k in lo..=hi {
-            if !map.contains_key(&k) { map.insert(k, rem.clone()); rem.1 = 0; break }
+            if !map.contains_key(&k) {
+                map.insert(k, rem.clone());
+                rem.1 = 0;
+                break;
+            }
         }
     }
     rem
@@ -9518,14 +13354,25 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
         let rows = if cp2.is_some() { 54i16 } else { 27i16 };
         let mut all = chests().lock().unwrap();
         let mut inv = me.inv.lock().unwrap();
-        if wsl < 0 || wsl >= rows + 36 { return }
-        let (m, gslot) = if wsl < 27 { (all.entry(cp).or_default(), wsl) }
-            else if wsl < rows { (all.entry(cp2.unwrap()).or_default(), wsl - 27) }
-            else { (&mut *inv, wsl - rows + 9) };
+        if wsl < 0 || wsl >= rows + 36 {
+            return;
+        }
+        let (m, gslot) = if wsl < 27 {
+            (all.entry(cp).or_default(), wsl)
+        } else if wsl < rows {
+            (all.entry(cp2.unwrap()).or_default(), wsl - 27)
+        } else {
+            (&mut *inv, wsl - rows + 9)
+        };
         let st = m.entry(gslot).or_insert((0, 0, Vec::new()));
         if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-            && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2) {
-            if st.1 == 0 { *st = (cur.0, per, cur.2.clone()); } else { st.1 += per; }
+            && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+        {
+            if st.1 == 0 {
+                *st = (cur.0, per, cur.2.clone());
+            } else {
+                st.1 += per;
+            }
             cur.1 -= per;
             resync_slot(me, 1, wsl, st);
         }
@@ -9537,8 +13384,13 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
             let k = wsl + 6;
             let st = inv.entry(k).or_insert((0, 0, Vec::new()));
             if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2) {
-                if st.1 == 0 { *st = (cur.0, per, cur.2.clone()); } else { st.1 += per; }
+                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+            {
+                if st.1 == 0 {
+                    *st = (cur.0, per, cur.2.clone());
+                } else {
+                    st.1 += per;
+                }
                 cur.1 -= per;
                 resync_slot(me, 2, wsl, st);
             }
@@ -9549,8 +13401,13 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
             let mut inv = me.inv.lock().unwrap();
             let st = inv.entry(wsl).or_insert((0, 0, Vec::new()));
             if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2) {
-                if st.1 == 0 { *st = (cur.0, per, cur.2.clone()); } else { st.1 += per; }
+                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+            {
+                if st.1 == 0 {
+                    *st = (cur.0, per, cur.2.clone());
+                } else {
+                    st.1 += per;
+                }
                 cur.1 -= per;
                 resync_slot(me, 0, wsl, st);
             }
@@ -9558,21 +13415,31 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
             let mut grid = me.craft.lock().unwrap();
             let st = grid.entry(wsl).or_insert((0, 0, Vec::new()));
             if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2) {
-                if st.1 == 0 { *st = (cur.0, per, cur.2.clone()); } else { st.1 += per; }
+                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
+            {
+                if st.1 == 0 {
+                    *st = (cur.0, per, cur.2.clone());
+                } else {
+                    st.1 += per;
+                }
                 cur.1 -= per;
                 resync_slot(me, 0, wsl, st);
             }
         }
     }
 }
-fn dr_btn_right(btn: i32) -> bool { btn >= 4 }
+fn dr_btn_right(btn: i32) -> bool {
+    btn >= 4
+}
 // re-send one window slot so the client can't drift
 fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
-    let mut p = vec![wid]; write_varint(&mut p, 0);
+    let mut p = vec![wid];
+    write_varint(&mut p, 0);
     p.extend_from_slice(&wslot.to_be_bytes());
     p.extend_from_slice(&slot_wire(st));
-    if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
+    if let Ok(mut w) = me.sock.lock() {
+        let _ = send_packet(&mut *w, 0x15, p);
+    }
 }
 fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) {
     let sv = m.get(&slot).cloned();
@@ -9581,69 +13448,114 @@ fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) 
     // merge only when components match too (vanilla: stacks with different NBT never merge)
     let mergeable = |a: &Stack, b: &Stack| a.0 == b.0 && a.2 == b.2;
     if btn == 0 {
-        if cv.1 == 0 && sv.is_some() { *cur = sv.unwrap(); m.remove(&slot); }
-        else if cv.1 > 0 && sv.is_none() { m.insert(slot, cv); *cur = empty; }
-        else if cv.1 > 0 && sv.is_some() {
+        if cv.1 == 0 && sv.is_some() {
+            *cur = sv.unwrap();
+            m.remove(&slot);
+        } else if cv.1 > 0 && sv.is_none() {
+            m.insert(slot, cv);
+            *cur = empty;
+        } else if cv.1 > 0 && sv.is_some() {
             let svv = sv.unwrap();
             let room = stack_max_of(&svv) - svv.1 as i64;
             if mergeable(&svv, &cv) && room >= cv.1 as i64 {
-                m.insert(slot, (svv.0, svv.1 + cv.1, svv.2)); *cur = empty;
-            } else { m.insert(slot, cv); *cur = svv; }
+                m.insert(slot, (svv.0, svv.1 + cv.1, svv.2));
+                *cur = empty;
+            } else {
+                m.insert(slot, cv);
+                *cur = svv;
+            }
         }
     } else if btn == 1 {
         if cv.1 == 0 && sv.is_some() {
             let (si, sc, cps) = sv.unwrap();
             let take = sc - sc / 2;
             *cur = (si, take, cps.clone());
-            if sc - take == 0 { m.remove(&slot); } else { m.insert(slot, (si, sc - take, cps)); }
+            if sc - take == 0 {
+                m.remove(&slot);
+            } else {
+                m.insert(slot, (si, sc - take, cps));
+            }
         } else if cv.1 > 0 {
-            if sv.is_none() { m.insert(slot, (cv.0, 1, cv.2.clone())); *cur = (cv.0, cv.1 - 1, cv.2); }
-            else { let svv = sv.unwrap();
-                if mergeable(&svv, &cv) && svv.1 < stack_max_of(&svv) as u8 { m.insert(slot, (svv.0, svv.1 + 1, svv.2)); *cur = (cv.0, cv.1 - 1, cv.2); } }
+            if sv.is_none() {
+                m.insert(slot, (cv.0, 1, cv.2.clone()));
+                *cur = (cv.0, cv.1 - 1, cv.2);
+            } else {
+                let svv = sv.unwrap();
+                if mergeable(&svv, &cv) && svv.1 < stack_max_of(&svv) as u8 {
+                    m.insert(slot, (svv.0, svv.1 + 1, svv.2));
+                    *cur = (cv.0, cv.1 - 1, cv.2);
+                }
+            }
         }
     }
 }
 // vanilla item tags used by recipes
-fn tag_planks(it: i64) -> bool { (15..=23).contains(&it) || (45..=46).contains(&it) }
+fn tag_planks(it: i64) -> bool {
+    (15..=23).contains(&it) || (45..=46).contains(&it)
+}
 // log id -> its own plank item (vanilla: oak_log->oak_planks, not oak for all)
 fn planks_for_log(it: i64) -> Option<i64> {
     Some(match it {
-        132 => 15, 133 => 16, 134 => 17, 135 => 18, 136 => 19, 137 => 20,
-        138 => 21, 139 => 22, 144 => 23,            // logs + bamboo_block
-        142 => 45, 143 => 46,                       // crimson/warped stems
+        132 => 15,
+        133 => 16,
+        134 => 17,
+        135 => 18,
+        136 => 19,
+        137 => 20,
+        138 => 21,
+        139 => 22,
+        144 => 23, // logs + bamboo_block
+        142 => 45,
+        143 => 46, // crimson/warped stems
         _ => return None,
     })
 }
 fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
-    if let Some(r) = json_craft_match(grid, 2) { return Some(r) }
+    if let Some(r) = json_craft_match(grid, 2) {
+        return Some(r);
+    }
     let stick = name_to_item("stick")?;
     let table = name_to_item("crafting_table")?;
-    let vals: Vec<(i16, i64)> = (1..=4).filter_map(|i| grid.get(&i).map(|(it, _, _)| (i, *it))).collect();
-    if vals.len() == 1 { if let Some(p) = planks_for_log(vals[0].1) { return Some((p, 4, Vec::new())) } }
-    if vals.len() == 4 && vals.iter().all(|v| tag_planks(v.1)) { return Some((table, 1, Vec::new())) }
+    let vals: Vec<(i16, i64)> = (1..=4)
+        .filter_map(|i| grid.get(&i).map(|(it, _, _)| (i, *it)))
+        .collect();
+    if vals.len() == 1 {
+        if let Some(p) = planks_for_log(vals[0].1) {
+            return Some((p, 4, Vec::new()));
+        }
+    }
+    if vals.len() == 4 && vals.iter().all(|v| tag_planks(v.1)) {
+        return Some((table, 1, Vec::new()));
+    }
     // sticks: two planks vertical (1&3 or 2&4)
-    if vals.len() == 2 && vals.iter().all(|v| tag_planks(v.1))
-        && ((vals[0].0 == 1 && vals[1].0 == 3) || (vals[0].0 == 2 && vals[1].0 == 4)) {
-        return Some((stick, 4, Vec::new()))
+    if vals.len() == 2
+        && vals.iter().all(|v| tag_planks(v.1))
+        && ((vals[0].0 == 1 && vals[1].0 == 3) || (vals[0].0 == 2 && vals[1].0 == 4))
+    {
+        return Some((stick, 4, Vec::new()));
     }
     None
 }
-fn open_furnace_window(s: &mut TcpStream, pos: (i32,i32,i32), inv: &HashMap<i16,Stack>) {
+fn open_furnace_window(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
     let mut p = Vec::new();
-    write_varint(&mut p, 2);        // windowId 2 (chest uses 1)
-    write_varint(&mut p, 14);       // furnace menu
+    write_varint(&mut p, 2); // windowId 2 (chest uses 1)
+    write_varint(&mut p, 14); // furnace menu
     p.extend_from_slice(&chat_nbt("Furnace"));
     let _ = send_packet(s, 0x33, p);
     furnace_push_items(s, pos, inv);
 }
-fn furnace_push_items(s: &mut TcpStream, pos: (i32,i32,i32), inv: &HashMap<i16,Stack>) {
+fn furnace_push_items(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
     let mut q = vec![2u8];
     write_varint(&mut q, 0);
     write_varint(&mut q, 39);
     let (fi, fu, fo) = {
         let fs = furnaces().lock().unwrap();
         let f = fs.get(&pos);
-        (f.map(|f| f.input.clone()).unwrap_or((0, 0, Vec::new())), f.map(|f| f.fuel.clone()).unwrap_or((0, 0, Vec::new())), f.map(|f| f.output.clone()).unwrap_or((0, 0, Vec::new())))
+        (
+            f.map(|f| f.input.clone()).unwrap_or((0, 0, Vec::new())),
+            f.map(|f| f.fuel.clone()).unwrap_or((0, 0, Vec::new())),
+            f.map(|f| f.output.clone()).unwrap_or((0, 0, Vec::new())),
+        )
     };
     q.extend_from_slice(&slot_wire(&fi));
     q.extend_from_slice(&slot_wire(&fu));
@@ -9659,12 +13571,21 @@ fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
     match ig {
         Ingr::Item(i) => *i == item,
         Ingr::Tag(t) => {
-            if depth > 8 { return false }
-            let members = item_tags().lock().unwrap().get(t).cloned().unwrap_or_default();
+            if depth > 8 {
+                return false;
+            }
+            let members = item_tags()
+                .lock()
+                .unwrap()
+                .get(t)
+                .cloned()
+                .unwrap_or_default();
             members.iter().any(|m| {
                 if let Some(inner) = m.strip_prefix('#') {
                     ingr_match(&Ingr::Tag(inner.to_string()), item, depth + 1)
-                } else { name_to_item(m).map(|i| i == item).unwrap_or(false) }
+                } else {
+                    name_to_item(m).map(|i| i == item).unwrap_or(false)
+                }
             })
         }
     }
@@ -9676,17 +13597,31 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
     for r in json_recipes().lock().unwrap().iter() {
         if !r.shaped {
             // shapeless: multiset of ingredients == multiset of grid items
-            let mut items: Vec<i64> = (1..=(dim * dim)).filter_map(|i| {
-                let v = g.get(&i).map(|e| e.0).unwrap_or(0);
-                if v > 0 && g.get(&i).map(|e| e.1).unwrap_or(0) > 0 { Some(v) } else { None }
-            }).collect();
-            if items.len() != r.ing.len() { continue }
+            let mut items: Vec<i64> = (1..=(dim * dim))
+                .filter_map(|i| {
+                    let v = g.get(&i).map(|e| e.0).unwrap_or(0);
+                    if v > 0 && g.get(&i).map(|e| e.1).unwrap_or(0) > 0 {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if items.len() != r.ing.len() {
+                continue;
+            }
             let mut ok = true;
             for ig in &r.ing {
-                if let Some(p) = items.iter().position(|i| ingr_match(ig, *i, 0)) { items.remove(p); }
-                else { ok = false; break }
+                if let Some(p) = items.iter().position(|i| ingr_match(ig, *i, 0)) {
+                    items.remove(p);
+                } else {
+                    ok = false;
+                    break;
+                }
             }
-            if ok { return Some((r.out, r.out_cnt, Vec::new())) }
+            if ok {
+                return Some((r.out, r.out_cnt, Vec::new()));
+            }
             continue;
         }
         // bounding box of non-space cells
@@ -9694,36 +13629,64 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
         for (ry, row) in r.rows.iter().enumerate() {
             for (rx, ch) in row.chars().enumerate() {
                 if ch != ' ' {
-                    x0 = x0.min(rx as i16); x1 = x1.max(rx as i16);
-                    y0 = y0.min(ry as i16); y1 = y1.max(ry as i16);
+                    x0 = x0.min(rx as i16);
+                    x1 = x1.max(rx as i16);
+                    y0 = y0.min(ry as i16);
+                    y1 = y1.max(ry as i16);
                 }
             }
         }
-        if x1 < 0 { continue }
+        if x1 < 0 {
+            continue;
+        }
         let (pw, ph) = (x1 - x0 + 1, y1 - y0 + 1);
-        if pw > dim || ph > dim { continue }
+        if pw > dim || ph > dim {
+            continue;
+        }
         'off: for oy in 0..=(dim - ph) {
             for ox in 0..=(dim - pw) {
                 let mut ok = true;
                 for gy in 0..dim {
                     for gx in 0..dim {
-                        let need: Option<char> = if gx >= ox && gx < ox + pw && gy >= oy && gy < oy + ph {
-                            r.rows[(y0 + gy - oy) as usize].chars().nth((x0 + gx - ox) as usize)
-                        } else { Some(' ') };
+                        let need: Option<char> =
+                            if gx >= ox && gx < ox + pw && gy >= oy && gy < oy + ph {
+                                r.rows[(y0 + gy - oy) as usize]
+                                    .chars()
+                                    .nth((x0 + gx - ox) as usize)
+                            } else {
+                                Some(' ')
+                            };
                         let cell = at(gx, gy);
                         match need {
-                            Some(' ') | None => { if cell != 0 { ok = false; break } }
-                            Some(ch) => {
-                                match r.key.get(&ch) {
-                                    Some(ig) => { if !ingr_match(ig, cell, 0) { ok = false; break } }
-                                    None => { if cell != 0 { ok = false; break } }
+                            Some(' ') | None => {
+                                if cell != 0 {
+                                    ok = false;
+                                    break;
                                 }
                             }
+                            Some(ch) => match r.key.get(&ch) {
+                                Some(ig) => {
+                                    if !ingr_match(ig, cell, 0) {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    if cell != 0 {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            },
                         }
                     }
-                    if !ok { break }
+                    if !ok {
+                        break;
+                    }
                 }
-                if ok { return Some((r.out, r.out_cnt, Vec::new())) }
+                if ok {
+                    return Some((r.out, r.out_cnt, Vec::new()));
+                }
                 continue 'off;
             }
         }
@@ -9731,7 +13694,9 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
     None
 }
 fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
-    if let Some(r) = json_craft_match(g, 3) { return Some(r) }
+    if let Some(r) = json_craft_match(g, 3) {
+        return Some(r);
+    }
     let at = |i: i16| g.get(&i).map(|e| e.0).unwrap_or(0);
     let is = |i: i16, n: &str| name_to_item(n) == Some(at(i));
     let planks = |i: i16| tag_planks(at(i)); // #minecraft:planks — any wood
@@ -9739,116 +13704,196 @@ fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
     // chest / furnace: full ring around empty center
     for (mat, res) in [("oak_planks", "chest"), ("cobblestone", "furnace")] {
         let ok = if mat == "oak_planks" {
-            [1,2,3,4,6,7,8,9].iter().all(|&i| planks(i)) && air(5)
+            [1, 2, 3, 4, 6, 7, 8, 9].iter().all(|&i| planks(i)) && air(5)
         } else {
-            [1,2,3,4,6,7,8,9].iter().all(|&i| is(i, mat)) && air(5)
+            [1, 2, 3, 4, 6, 7, 8, 9].iter().all(|&i| is(i, mat)) && air(5)
         };
-        if ok { return name_to_item(res).map(|r| (r, 1, Vec::new())) }
+        if ok {
+            return name_to_item(res).map(|r| (r, 1, Vec::new()));
+        }
     }
     // torch: coal directly above stick
-    for (c, st) in [(1,4),(2,5),(3,6),(4,7),(5,8),(6,9)] {
+    for (c, st) in [(1, 4), (2, 5), (3, 6), (4, 7), (5, 8), (6, 9)] {
         if is(c, "coal") && is(st, "stick") && (1..=9).filter(|&i| !air(i)).count() == 2 {
-            return name_to_item("torch").map(|r| (r, 4, Vec::new()))
+            return name_to_item("torch").map(|r| (r, 4, Vec::new()));
         }
     }
     // bread: 3 wheat in a row
-    for (a, b, c) in [(1i16,2,3),(4,5,6),(7,8,9)] {
-        if is(a,"wheat") && is(b,"wheat") && is(c,"wheat")
-            && (1..=9).filter(|&i| !air(i)).count() == 3 {
-            return name_to_item("bread").map(|r| (r, 1, Vec::new()))
+    for (a, b, c) in [(1i16, 2, 3), (4, 5, 6), (7, 8, 9)] {
+        if is(a, "wheat")
+            && is(b, "wheat")
+            && is(c, "wheat")
+            && (1..=9).filter(|&i| !air(i)).count() == 3
+        {
+            return name_to_item("bread").map(|r| (r, 1, Vec::new()));
         }
     }
     // generic tool/armor recipes per material
-    for (mat, prefix) in [("oak_planks","wooden"),("cobblestone","stone"),("iron_ingot","iron"),("gold_ingot","golden"),("diamond","diamond")] {
+    for (mat, prefix) in [
+        ("oak_planks", "wooden"),
+        ("cobblestone", "stone"),
+        ("iron_ingot", "iron"),
+        ("gold_ingot", "golden"),
+        ("diamond", "diamond"),
+    ] {
         let stick = |i: i16| is(i, "stick");
-        let m = |i: i16| if mat == "oak_planks" { planks(i) } else { is(i, mat) };
+        let m = |i: i16| {
+            if mat == "oak_planks" {
+                planks(i)
+            } else {
+                is(i, mat)
+            }
+        };
         // pickaxe: mat mat mat / _ stick _ / _ stick _
-        if m(1)&&m(2)&&m(3)&&stick(5)&&stick(8)&&air(4)&&air(6)&&air(7)&&air(9) {
-            return name_to_item(&format!("{}_pickaxe", prefix)).map(|r| (r, 1, Vec::new()))
+        if m(1) && m(2) && m(3) && stick(5) && stick(8) && air(4) && air(6) && air(7) && air(9) {
+            return name_to_item(&format!("{}_pickaxe", prefix)).map(|r| (r, 1, Vec::new()));
         }
         // axe: mat mat / mat stick / _ stick (either column)
-        if (m(1)&&m(2)&&m(4)&&stick(5)&&stick(8)&&air(3)&&air(6)&&air(7)&&air(9))
-         || (m(2)&&m(3)&&m(6)&&stick(5)&&stick(8)&&air(1)&&air(4)&&air(7)&&air(9)) {
-            return name_to_item(&format!("{}_axe", prefix)).map(|r| (r, 1, Vec::new()))
+        if (m(1) && m(2) && m(4) && stick(5) && stick(8) && air(3) && air(6) && air(7) && air(9))
+            || (m(2)
+                && m(3)
+                && m(6)
+                && stick(5)
+                && stick(8)
+                && air(1)
+                && air(4)
+                && air(7)
+                && air(9))
+        {
+            return name_to_item(&format!("{}_axe", prefix)).map(|r| (r, 1, Vec::new()));
         }
         // shovel: mat / stick / stick, any column
-        for col in [0i16,1,2] {
-            if m(1+col)&&stick(4+col)&&stick(7+col)
-                && (1..=9).filter(|&i| !air(i)).count() == 3 {
-                return name_to_item(&format!("{}_shovel", prefix)).map(|r| (r, 1, Vec::new()))
+        for col in [0i16, 1, 2] {
+            if m(1 + col)
+                && stick(4 + col)
+                && stick(7 + col)
+                && (1..=9).filter(|&i| !air(i)).count() == 3
+            {
+                return name_to_item(&format!("{}_shovel", prefix)).map(|r| (r, 1, Vec::new()));
             }
         }
         // sword: mat / mat / stick, any column
-        for col in [0i16,1,2] {
-            if m(1+col)&&m(4+col)&&stick(7+col)
-                && (1..=9).filter(|&i| !air(i)).count() == 3 {
-                return name_to_item(&format!("{}_sword", prefix)).map(|r| (r, 1, Vec::new()))
+        for col in [0i16, 1, 2] {
+            if m(1 + col)
+                && m(4 + col)
+                && stick(7 + col)
+                && (1..=9).filter(|&i| !air(i)).count() == 3
+            {
+                return name_to_item(&format!("{}_sword", prefix)).map(|r| (r, 1, Vec::new()));
             }
         }
         // hoe: mat mat / _ stick / _ stick (or mirrored)
-        if (m(1)&&m(2)&&stick(5)&&stick(8)&&air(3)&&air(4)&&air(6)&&air(7)&&air(9))
-         || (m(2)&&m(3)&&stick(5)&&stick(8)&&air(1)&&air(4)&&air(6)&&air(7)&&air(9)) {
-            return name_to_item(&format!("{}_hoe", prefix)).map(|r| (r, 1, Vec::new()))
+        if (m(1) && m(2) && stick(5) && stick(8) && air(3) && air(4) && air(6) && air(7) && air(9))
+            || (m(2)
+                && m(3)
+                && stick(5)
+                && stick(8)
+                && air(1)
+                && air(4)
+                && air(6)
+                && air(7)
+                && air(9))
+        {
+            return name_to_item(&format!("{}_hoe", prefix)).map(|r| (r, 1, Vec::new()));
         }
         // armor: helmet=5, chest=8, leggings=7, boots=4
         if mat != "cobblestone" {
-            if m(1)&&m(2)&&m(3)&&m(4)&&m(6)&&air(5)&&air(7)&&air(8)&&air(9) {
-                return name_to_item(&format!("{}_helmet", prefix)).map(|r| (r, 1, Vec::new()))
+            if m(1) && m(2) && m(3) && m(4) && m(6) && air(5) && air(7) && air(8) && air(9) {
+                return name_to_item(&format!("{}_helmet", prefix)).map(|r| (r, 1, Vec::new()));
             }
-            if m(1)&&m(3)&&m(4)&&m(5)&&m(6)&&m(7)&&m(8)&&m(9)&&air(2) {
-                return name_to_item(&format!("{}_chestplate", prefix)).map(|r| (r, 1, Vec::new()))
+            if m(1) && m(3) && m(4) && m(5) && m(6) && m(7) && m(8) && m(9) && air(2) {
+                return name_to_item(&format!("{}_chestplate", prefix)).map(|r| (r, 1, Vec::new()));
             }
-            if m(1)&&m(2)&&m(3)&&m(4)&&m(6)&&m(7)&&m(9)&&air(5)&&air(8) {
-                return name_to_item(&format!("{}_leggings", prefix)).map(|r| (r, 1, Vec::new()))
+            if m(1) && m(2) && m(3) && m(4) && m(6) && m(7) && m(9) && air(5) && air(8) {
+                return name_to_item(&format!("{}_leggings", prefix)).map(|r| (r, 1, Vec::new()));
             }
-            if m(4)&&m(6)&&m(7)&&m(9)&&(1..=9).filter(|&i| !air(i)).count()==4 {
-                return name_to_item(&format!("{}_boots", prefix)).map(|r| (r, 1, Vec::new()))
+            if m(4) && m(6) && m(7) && m(9) && (1..=9).filter(|&i| !air(i)).count() == 4 {
+                return name_to_item(&format!("{}_boots", prefix)).map(|r| (r, 1, Vec::new()));
             }
         }
     }
     // leather armor pieces on their own
     {
         let l = |i: i16| is(i, "leather");
-        if l(1)&&l(2)&&l(3)&&l(4)&&l(6)&&air(5)&&air(7)&&air(8)&&air(9) { return name_to_item("leather_helmet").map(|r| (r, 1, Vec::new())) }
-        if l(1)&&l(3)&&l(4)&&l(5)&&l(6)&&l(7)&&l(8)&&l(9)&&air(2) { return name_to_item("leather_chestplate").map(|r| (r, 1, Vec::new())) }
-        if l(1)&&l(2)&&l(3)&&l(4)&&l(6)&&l(7)&&l(9)&&air(5)&&air(8) { return name_to_item("leather_leggings").map(|r| (r, 1, Vec::new())) }
-        if l(4)&&l(6)&&l(7)&&l(9)&&(1..=9).filter(|&i| !air(i)).count()==4 { return name_to_item("leather_boots").map(|r| (r, 1, Vec::new())) }
+        if l(1) && l(2) && l(3) && l(4) && l(6) && air(5) && air(7) && air(8) && air(9) {
+            return name_to_item("leather_helmet").map(|r| (r, 1, Vec::new()));
+        }
+        if l(1) && l(3) && l(4) && l(5) && l(6) && l(7) && l(8) && l(9) && air(2) {
+            return name_to_item("leather_chestplate").map(|r| (r, 1, Vec::new()));
+        }
+        if l(1) && l(2) && l(3) && l(4) && l(6) && l(7) && l(9) && air(5) && air(8) {
+            return name_to_item("leather_leggings").map(|r| (r, 1, Vec::new()));
+        }
+        if l(4) && l(6) && l(7) && l(9) && (1..=9).filter(|&i| !air(i)).count() == 4 {
+            return name_to_item("leather_boots").map(|r| (r, 1, Vec::new()));
+        }
     }
     // bucket: iron V-shape
-    if is(4,"iron_ingot")&&is(6,"iron_ingot")&&is(8,"iron_ingot")&&(1..=9).filter(|&i| !air(i)).count()==3 {
-        return name_to_item("bucket").map(|r| (r, 1, Vec::new()))
+    if is(4, "iron_ingot")
+        && is(6, "iron_ingot")
+        && is(8, "iron_ingot")
+        && (1..=9).filter(|&i| !air(i)).count() == 3
+    {
+        return name_to_item("bucket").map(|r| (r, 1, Vec::new()));
     }
     // shears: 2 iron diagonal-ish
-    if ((is(5,"iron_ingot")&&is(8,"iron_ingot"))||(is(5,"iron_ingot")&&is(9,"iron_ingot")))
-        && (1..=9).filter(|&i| !air(i)).count()==2 {
-        return name_to_item("shears").map(|r| (r, 1, Vec::new()))
+    if ((is(5, "iron_ingot") && is(8, "iron_ingot"))
+        || (is(5, "iron_ingot") && is(9, "iron_ingot")))
+        && (1..=9).filter(|&i| !air(i)).count() == 2
+    {
+        return name_to_item("shears").map(|r| (r, 1, Vec::new()));
     }
     // shield: planks across + iron center-top
-    if planks(1)&&is(2,"iron_ingot")&&planks(3)&&planks(4)&&planks(5)&&planks(6)&&planks(8)&&air(7)&&air(9) {
-        return name_to_item("shield").map(|r| (r, 1, Vec::new()))
+    if planks(1)
+        && is(2, "iron_ingot")
+        && planks(3)
+        && planks(4)
+        && planks(5)
+        && planks(6)
+        && planks(8)
+        && air(7)
+        && air(9)
+    {
+        return name_to_item("shield").map(|r| (r, 1, Vec::new()));
     }
     // fishing rod: 3 sticks diagonal + 2 string
-    if is(3,"stick")&&is(5,"stick")&&is(7,"stick")&&is(6,"string")&&is(9,"string")
-        && (1..=9).filter(|&i| !air(i)).count()==5 {
-        return name_to_item("fishing_rod").map(|r| (r, 1, Vec::new()))
+    if is(3, "stick")
+        && is(5, "stick")
+        && is(7, "stick")
+        && is(6, "string")
+        && is(9, "string")
+        && (1..=9).filter(|&i| !air(i)).count() == 5
+    {
+        return name_to_item("fishing_rod").map(|r| (r, 1, Vec::new()));
     }
     // bow: sticks + strings
-    if is(2,"stick")&&is(4,"stick")&&is(8,"stick")&&is(3,"string")&&is(6,"string")&&is(9,"string")&&air(1)&&air(5)&&air(7) {
-        return name_to_item("bow").map(|r| (r, 1, Vec::new()))
+    if is(2, "stick")
+        && is(4, "stick")
+        && is(8, "stick")
+        && is(3, "string")
+        && is(6, "string")
+        && is(9, "string")
+        && air(1)
+        && air(5)
+        && air(7)
+    {
+        return name_to_item("bow").map(|r| (r, 1, Vec::new()));
     }
     // also accept 2x2-style recipes in the big grid
-    let g2: HashMap<i16,Stack> = g.clone();
+    let g2: HashMap<i16, Stack> = g.clone();
     // single log -> its own planks (vanilla #minecraft:logs, type-preserving)
     if (1..=9).filter(|&i| !air(i)).count() == 1 {
         if let Some(it) = (1..=9).find(|&i| !air(i)).map(|i| at(i)) {
-            if let Some(p) = planks_for_log(it) { return Some((p, 4, Vec::new())) }
+            if let Some(p) = planks_for_log(it) {
+                return Some((p, 4, Vec::new()));
+            }
         }
     }
     if (1..=9).filter(|&i| !air(i)).count() == 4 {
         // any 2x2 block of planks -> crafting_table
-        for (a,b,c,d) in [(1i16,2,4,5),(2,3,5,6),(4,5,7,8),(5,6,8,9)] {
-            if planks(a)&&planks(b)&&planks(c)&&planks(d) {
-                return name_to_item("crafting_table").map(|r| (r, 1, Vec::new()))
+        for (a, b, c, d) in [(1i16, 2, 4, 5), (2, 3, 5, 6), (4, 5, 7, 8), (5, 6, 8, 9)] {
+            if planks(a) && planks(b) && planks(c) && planks(d) {
+                return name_to_item("crafting_table").map(|r| (r, 1, Vec::new()));
             }
         }
     }
@@ -9863,76 +13908,172 @@ fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
     let g = |n| name_to_item(n).unwrap_or(-1);
     // Durations are vanilla game ticks. One server tick is one game tick at
     // 20TPS, so these literals are also the stored server-tick values.
-    if item == g("golden_apple") { return &[(100, 21, 0, 2400), (100, 9, 1, 100)] }
-    if item == g("enchanted_golden_apple") { return &[(100, 21, 3, 2400), (100, 9, 1, 400), (100, 10, 0, 6000), (100, 11, 0, 6000)] }
-    if item == g("rotten_flesh") { return &[(80, 16, 0, 600)] }
-    if item == g("chicken") { return &[(30, 16, 0, 600)] }
-    if item == g("pufferfish") { return &[(100, 16, 2, 300), (100, 8, 0, 300), (100, 18, 2, 1200)] }
-    if item == g("spider_eye") { return &[(100, 18, 0, 100)] }
+    if item == g("golden_apple") {
+        return &[(100, 21, 0, 2400), (100, 9, 1, 100)];
+    }
+    if item == g("enchanted_golden_apple") {
+        return &[
+            (100, 21, 3, 2400),
+            (100, 9, 1, 400),
+            (100, 10, 0, 6000),
+            (100, 11, 0, 6000),
+        ];
+    }
+    if item == g("rotten_flesh") {
+        return &[(80, 16, 0, 600)];
+    }
+    if item == g("chicken") {
+        return &[(30, 16, 0, 600)];
+    }
+    if item == g("pufferfish") {
+        return &[(100, 16, 2, 300), (100, 8, 0, 300), (100, 18, 2, 1200)];
+    }
+    if item == g("spider_eye") {
+        return &[(100, 18, 0, 100)];
+    }
     &[]
 }
 // damage absorbed by the absorption-effect pool before touching hp
 fn hurt_absorb(c: &Client, dmg: f32) -> f32 {
     let mut a = c.absorb.lock().unwrap();
-    if *a <= 0.0 { return dmg }
+    if *a <= 0.0 {
+        return dmg;
+    }
     let r = (dmg - *a).max(0.0);
     *a = (*a - dmg).max(0.0);
     r
 }
 fn always_edible(item: i64) -> bool {
-    [name_to_item("golden_apple"), name_to_item("enchanted_golden_apple"),
-     name_to_item("chorus_fruit"), name_to_item("honey_bottle")].contains(&Some(item))
+    [
+        name_to_item("golden_apple"),
+        name_to_item("enchanted_golden_apple"),
+        name_to_item("chorus_fruit"),
+        name_to_item("honey_bottle"),
+    ]
+    .contains(&Some(item))
 }
 fn sat_value(item: i64) -> f32 {
-    for (n, v) in [("cooked_beef",12.8f32),("cooked_porkchop",12.8),("cooked_mutton",9.6),
-                   ("cooked_rabbit",10.0),("cooked_chicken",7.2),("golden_apple",9.6),
-                   ("enchanted_golden_apple",9.6),("bread",6.0),("baked_potato",6.0),
-                   ("carrot",3.6),("apple",2.4),("chorus_fruit",2.4),("honey_bottle",1.2),
-                   ("melon_slice",1.2),("beef",1.8),("porkchop",1.8),("mutton",1.2),
-                   ("rabbit",1.8),("chicken",1.2),("potato",0.6),("beetroot",1.2),
-                   ("rotten_flesh",0.8),("cookie",0.4),("dried_kelp",0.2)] {
-        if name_to_item(n) == Some(item) { return v }
+    for (n, v) in [
+        ("cooked_beef", 12.8f32),
+        ("cooked_porkchop", 12.8),
+        ("cooked_mutton", 9.6),
+        ("cooked_rabbit", 10.0),
+        ("cooked_chicken", 7.2),
+        ("golden_apple", 9.6),
+        ("enchanted_golden_apple", 9.6),
+        ("bread", 6.0),
+        ("baked_potato", 6.0),
+        ("carrot", 3.6),
+        ("apple", 2.4),
+        ("chorus_fruit", 2.4),
+        ("honey_bottle", 1.2),
+        ("melon_slice", 1.2),
+        ("beef", 1.8),
+        ("porkchop", 1.8),
+        ("mutton", 1.2),
+        ("rabbit", 1.8),
+        ("chicken", 1.2),
+        ("potato", 0.6),
+        ("beetroot", 1.2),
+        ("rotten_flesh", 0.8),
+        ("cookie", 0.4),
+        ("dried_kelp", 0.2),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return v;
+        }
     }
     0.0
 }
 
 fn food_value(item: i64) -> i32 {
-    for (n, v) in [("cooked_beef",8),("cooked_porkchop",8),("cooked_chicken",6),("cooked_mutton",6),
-                   ("bread",5),("baked_potato",5),("cooked_rabbit",5),("apple",4),("rotten_flesh",4),
-                   ("carrot",3),("beef",3),("porkchop",3),("rabbit",3),("mutton",2),("melon_slice",2),
-                   ("cookie",2),("chicken",1),("potato",1),("beetroot",1),("dried_kelp",1),("honey_bottle",6),("chorus_fruit",4),("golden_apple",4),("enchanted_golden_apple",4)] {
-        if name_to_item(n) == Some(item) { return v }
+    for (n, v) in [
+        ("cooked_beef", 8),
+        ("cooked_porkchop", 8),
+        ("cooked_chicken", 6),
+        ("cooked_mutton", 6),
+        ("bread", 5),
+        ("baked_potato", 5),
+        ("cooked_rabbit", 5),
+        ("apple", 4),
+        ("rotten_flesh", 4),
+        ("carrot", 3),
+        ("beef", 3),
+        ("porkchop", 3),
+        ("rabbit", 3),
+        ("mutton", 2),
+        ("melon_slice", 2),
+        ("cookie", 2),
+        ("chicken", 1),
+        ("potato", 1),
+        ("beetroot", 1),
+        ("dried_kelp", 1),
+        ("honey_bottle", 6),
+        ("chorus_fruit", 4),
+        ("golden_apple", 4),
+        ("enchanted_golden_apple", 4),
+    ] {
+        if name_to_item(n) == Some(item) {
+            return v;
+        }
     }
     0
 }
 
 static SIGNS: OnceLock<Mutex<HashMap<(i32, i32, i32, u8), [String; 4]>>> = OnceLock::new();
-fn signs() -> &'static Mutex<HashMap<(i32, i32, i32, u8), [String; 4]>> { SIGNS.get_or_init(|| Mutex::new(HashMap::new())) }
-fn nbt_named_str(v: &mut Vec<u8>, name: &str, val: &str) { v.push(8); nbt_str(v, name); nbt_str(v, val); }
-fn nbt_named_byte(v: &mut Vec<u8>, name: &str, b: u8) { v.push(1); nbt_str(v, name); v.push(b); }
-fn json_text(s: &str) -> String { // {"text":"..."} with escaping
+fn signs() -> &'static Mutex<HashMap<(i32, i32, i32, u8), [String; 4]>> {
+    SIGNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn nbt_named_str(v: &mut Vec<u8>, name: &str, val: &str) {
+    v.push(8);
+    nbt_str(v, name);
+    nbt_str(v, val);
+}
+fn nbt_named_byte(v: &mut Vec<u8>, name: &str, b: u8) {
+    v.push(1);
+    nbt_str(v, name);
+    v.push(b);
+}
+fn json_text(s: &str) -> String {
+    // {"text":"..."} with escaping
     let mut o = String::from("{\"text\":\"");
     for c in s.chars() {
-        match c { '"' => o.push_str("\\\""), '\\' => o.push_str("\\\\"), c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)), c => o.push(c) }
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
     }
-    o.push_str("\"}"); o
+    o.push_str("\"}");
+    o
 }
 fn sign_side_nbt(v: &mut Vec<u8>, name: &str, lines: &[String; 4]) {
-    v.push(10); nbt_str(v, name);                     // TAG_Compound <name>
+    v.push(10);
+    nbt_str(v, name); // TAG_Compound <name>
     nbt_named_str(v, "color", "black");
     nbt_named_byte(v, "has_glowing_text", 0);
-    v.push(9); nbt_str(v, "messages");               // TAG_List<String>
-    v.push(8); v.extend_from_slice(&4i32.to_be_bytes());
-    for l in lines { nbt_str(v, &json_text(l)); }
+    v.push(9);
+    nbt_str(v, "messages"); // TAG_List<String>
+    v.push(8);
+    v.extend_from_slice(&4i32.to_be_bytes());
+    for l in lines {
+        nbt_str(v, &json_text(l));
+    }
     v.push(0);
 }
-fn sign_entity_pkt(x: i32, y: i32, z: i32, front: u8, lines: &[String; 4]) -> Vec<u8> { // 0x07 tile_entity_data
+fn sign_entity_pkt(x: i32, y: i32, z: i32, front: u8, lines: &[String; 4]) -> Vec<u8> {
+    // 0x07 tile_entity_data
     let empty: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
-    let (fl, bl) = if front != 0 { (lines, &empty) } else { (&empty, lines) };
+    let (fl, bl) = if front != 0 {
+        (lines, &empty)
+    } else {
+        (&empty, lines)
+    };
     let mut p = Vec::new();
     write_pos(&mut p, x, y, z);
-    write_varint(&mut p, 7);                          // block entity type: sign
-    p.push(10);                                       // root compound (anonymousNbt)
+    write_varint(&mut p, 7); // block entity type: sign
+    p.push(10); // root compound (anonymousNbt)
     sign_side_nbt(&mut p, "front_text", fl);
     sign_side_nbt(&mut p, "back_text", bl);
     nbt_named_byte(&mut p, "is_waxed", 0);
@@ -9941,8 +14082,17 @@ fn sign_entity_pkt(x: i32, y: i32, z: i32, front: u8, lines: &[String; 4]) -> Ve
 }
 fn sign_base_for_item(item: i64) -> Option<u32> {
     Some(match item {
-        886 => 4302, 887 => 4334, 888 => 4366, 889 => 4462, 890 => 4398,
-        891 => 4430, 892 => 4494, 893 => 4526, 894 => 4558, 895 => 19276, 896 => 19308,
+        886 => 4302,
+        887 => 4334,
+        888 => 4366,
+        889 => 4462,
+        890 => 4398,
+        891 => 4430,
+        892 => 4494,
+        893 => 4526,
+        894 => 4558,
+        895 => 19276,
+        896 => 19308,
         _ => return None,
     })
 }
@@ -9971,7 +14121,11 @@ fn teleport_pkt(x: f64, y: f64, z: f64, yaw: f32, pitch: f32, tid: i64) -> Vec<u
 fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
     if let Some(inner) = sel.strip_prefix("@e[").and_then(|x| x.strip_suffix(']')) {
         let mut typ: Option<String> = None;
-        let (mut cx, mut cy, mut cz) = ctx.map(|c| { let p = *c.pos.lock().unwrap(); (p.0, p.1, p.2) })
+        let (mut cx, mut cy, mut cz) = ctx
+            .map(|c| {
+                let p = *c.pos.lock().unwrap();
+                (p.0, p.1, p.2)
+            })
             .unwrap_or((0.5, 16.0, 0.5));
         let mut dist: Option<f64> = None;
         let mut item_filter: Option<i64> = None;
@@ -9979,18 +14133,36 @@ fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
         for kv in inner.split(',') {
             if let Some((k, v)) = kv.trim().split_once('=') {
                 match k.trim() {
-                    "type" => typ = Some(v.trim_start_matches("minecraft:").trim_start_matches('!').to_string()),
+                    "type" => {
+                        typ = Some(
+                            v.trim_start_matches("minecraft:")
+                                .trim_start_matches('!')
+                                .to_string(),
+                        )
+                    }
                     "x" => cx = v.parse().unwrap_or(cx),
                     "y" => cy = v.parse().unwrap_or(cy),
                     "z" => cz = v.parse().unwrap_or(cz),
                     "nbt" => {
-                        item_filter = v.split("id:\"").nth(1).and_then(|r| r.split('\"').next())
+                        item_filter = v
+                            .split("id:\"")
+                            .nth(1)
+                            .and_then(|r| r.split('\"').next())
                             .and_then(|id| name_to_item(id.trim_start_matches("minecraft:")));
                     }
-                    "tag" => tag_filt = Some((v.trim().trim_start_matches('!').to_string(), v.trim().starts_with('!'))),
+                    "tag" => {
+                        tag_filt = Some((
+                            v.trim().trim_start_matches('!').to_string(),
+                            v.trim().starts_with('!'),
+                        ))
+                    }
                     "distance" => {
                         let v = v.trim();
-                        dist = Some(if let Some(hi) = v.strip_prefix("..") { hi.parse().unwrap_or(f64::MAX) } else { v.parse().unwrap_or(0.0) });
+                        dist = Some(if let Some(hi) = v.strip_prefix("..") {
+                            hi.parse().unwrap_or(f64::MAX)
+                        } else {
+                            v.parse().unwrap_or(0.0)
+                        });
                     }
                     _ => {}
                 }
@@ -10001,31 +14173,100 @@ fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
             dist.map(|dd| d <= dd + 1e-6).unwrap_or(true)
         };
         return match typ.as_deref() {
-            Some("player") => { let tm = tags().lock().unwrap();
-                clients().lock().unwrap().iter()
-                .filter(|c| { let p = *c.pos.lock().unwrap(); near(p.0, p.1, p.2) })
-                .filter(|c| tag_filt.as_ref().map(|(tg, neg)| *neg != tm.get(&format!("p:{}", c.name)).map(|st| st.contains(tg)).unwrap_or(false)).unwrap_or(true))
-                .map(|c| c.eid.to_string()).collect() },
-            Some("item") => drops().lock().unwrap().iter()
+            Some("player") => {
+                let tm = tags().lock().unwrap();
+                clients()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| {
+                        let p = *c.pos.lock().unwrap();
+                        near(p.0, p.1, p.2)
+                    })
+                    .filter(|c| {
+                        tag_filt
+                            .as_ref()
+                            .map(|(tg, neg)| {
+                                *neg != tm
+                                    .get(&format!("p:{}", c.name))
+                                    .map(|st| st.contains(tg))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(true)
+                    })
+                    .map(|c| c.eid.to_string())
+                    .collect()
+            }
+            Some("item") => drops()
+                .lock()
+                .unwrap()
+                .iter()
                 .filter(|d| near(d.x, d.y, d.z) && item_filter.map(|f| d.item == f).unwrap_or(true))
-                .map(|d| format!("d:{}", d.eid)).collect(),
-            Some("tnt") => primed().lock().unwrap().iter()
-                .filter(|t| near(t.x, t.y, t.z)).map(|t| format!("t:{}", t.eid)).collect(),
-            Some("arrow") => arrows().lock().unwrap().iter()
-                .filter(|a| near(a.x, a.y, a.z)).map(|a| format!("a:{}", a.eid)).collect(),
-            Some("ender_pearl") => pearls().lock().unwrap().iter()
-                .filter(|a| near(a.x, a.y, a.z)).map(|a| format!("p:{}", a.eid)).collect(),
-            Some("fishing_bobber") => bobbers().lock().unwrap().iter()
-                .filter(|a| near(a.x, a.y, a.z)).map(|a| format!("b:{}", a.eid)).collect(),
-            Some("experience_orb") => xps().lock().unwrap().iter()
-                .filter(|a| near(a.x, a.y, a.z)).map(|a| format!("x:{}", a.eid)).collect(),
+                .map(|d| format!("d:{}", d.eid))
+                .collect(),
+            Some("tnt") => primed()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| near(t.x, t.y, t.z))
+                .map(|t| format!("t:{}", t.eid))
+                .collect(),
+            Some("arrow") => arrows()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("a:{}", a.eid))
+                .collect(),
+            Some("ender_pearl") => pearls()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("p:{}", a.eid))
+                .collect(),
+            Some("fishing_bobber") => bobbers()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("b:{}", a.eid))
+                .collect(),
+            Some("experience_orb") => xps()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| near(a.x, a.y, a.z))
+                .map(|a| format!("x:{}", a.eid))
+                .collect(),
             t => {
                 let et = t.and_then(name_to_etype).unwrap_or(-1);
-                { let tm = tags().lock().unwrap();
-                mobs().lock().unwrap().iter()
-                    .filter(|m| (t.is_none() || m.etype == et) && { let p = *m.pos.lock().unwrap(); near(p.0, p.1, p.2) })
-                    .filter(|m| tag_filt.as_ref().map(|(tg, neg)| *neg != tm.get(&format!("e:{}", m.eid)).map(|st| st.contains(tg)).unwrap_or(false)).unwrap_or(true))
-                    .map(|m| format!("m:{}", m.eid)).collect() }
+                {
+                    let tm = tags().lock().unwrap();
+                    mobs()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|m| {
+                            (t.is_none() || m.etype == et) && {
+                                let p = *m.pos.lock().unwrap();
+                                near(p.0, p.1, p.2)
+                            }
+                        })
+                        .filter(|m| {
+                            tag_filt
+                                .as_ref()
+                                .map(|(tg, neg)| {
+                                    *neg != tm
+                                        .get(&format!("e:{}", m.eid))
+                                        .map(|st| st.contains(tg))
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(true)
+                        })
+                        .map(|m| format!("m:{}", m.eid))
+                        .collect()
+                }
             }
         };
     }
@@ -10036,12 +14277,19 @@ fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
             let mut best: Option<(f64, i32)> = None;
             for cl in cls.iter() {
                 let cp = *cl.pos.lock().unwrap();
-                let d = (cp.0-pp.0).powi(2) + (cp.2-pp.2).powi(2);
-                if best.map(|b| d < b.0).unwrap_or(true) { best = Some((d, cl.eid)); }
+                let d = (cp.0 - pp.0).powi(2) + (cp.2 - pp.2).powi(2);
+                if best.map(|b| d < b.0).unwrap_or(true) {
+                    best = Some((d, cl.eid));
+                }
             }
-            if let Some((_, e)) = best { return vec![e.to_string()] }
+            if let Some((_, e)) = best {
+                return vec![e.to_string()];
+            }
         }
-        return cls.first().map(|c| vec![c.eid.to_string()]).unwrap_or_default();
+        return cls
+            .first()
+            .map(|c| vec![c.eid.to_string()])
+            .unwrap_or_default();
     }
     if sel == "@a" || sel == "@e" {
         return cls.iter().map(|c| c.eid.to_string()).collect();
@@ -10051,17 +14299,27 @@ fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
     }
     // bare player name resolves to that player (vanilla target syntax)
     if !sel.starts_with('@') {
-        if let Some(c) = cls.iter().find(|c| c.name == sel) { return vec![c.eid.to_string()] }
+        if let Some(c) = cls.iter().find(|c| c.name == sel) {
+            return vec![c.eid.to_string()];
+        }
     }
     vec![]
 }
 
 // execution context: who + where (for ~ coords)
 #[derive(Clone)]
-struct CmdCtx { me: Option<Arc<Client>>, x: f64, y: f64, z: f64 }
+struct CmdCtx {
+    me: Option<Arc<Client>>,
+    x: f64,
+    y: f64,
+    z: f64,
+}
 fn coord(tok: &str, base: f64) -> f64 {
-    if let Some(off) = tok.strip_prefix('~') { base + off.parse::<f64>().unwrap_or(0.0) }
-    else { tok.parse::<f64>().unwrap_or(0.0) }
+    if let Some(off) = tok.strip_prefix('~') {
+        base + off.parse::<f64>().unwrap_or(0.0)
+    } else {
+        tok.parse::<f64>().unwrap_or(0.0)
+    }
 }
 
 // ---------- scoreboard ----------
@@ -10074,45 +14332,64 @@ fn sidebar_obj() -> &'static Mutex<Option<String>> {
     static R: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(None))
 }
-fn trig_enabled() -> &'static Mutex<HashSet<(String, String)>> { // (player, objective)
+fn trig_enabled() -> &'static Mutex<HashSet<(String, String)>> {
+    // (player, objective)
     static R: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashSet::new()))
 }
 // wire: create/update objective (action 0), place at sidebar (pos 1)
 fn obj_create_pkt(obj: &str) -> Vec<u8> {
     let mut p = Vec::new();
-    write_str(&mut p, obj); p.push(0u8); // create
+    write_str(&mut p, obj);
+    p.push(0u8); // create
     p.extend_from_slice(&chat_nbt(obj));
     write_varint(&mut p, 0); // integer criterion
     p.push(0); // number_format absent
     p
 }
 fn display_pkt(slot: i64, obj: &str) -> Vec<u8> {
-    let mut p = Vec::new(); write_varint(&mut p, slot); write_str(&mut p, obj); p
+    let mut p = Vec::new();
+    write_varint(&mut p, slot);
+    write_str(&mut p, obj);
+    p
 }
 fn score_pkt(name: &str, obj: &str, v: i64) -> Vec<u8> {
     let mut p = Vec::new();
-    write_str(&mut p, name); write_str(&mut p, obj); write_varint(&mut p, v);
-    p.push(0); p.push(0); // no display_name, no number_format
+    write_str(&mut p, name);
+    write_str(&mut p, obj);
+    write_varint(&mut p, v);
+    p.push(0);
+    p.push(0); // no display_name, no number_format
     p
 }
 // push the displayed objective's current scores to one client (join / setdisplay)
 fn sidebar_push(c: &Arc<Client>) {
-    let Some(obj) = sidebar_obj().lock().unwrap().clone() else { return };
+    let Some(obj) = sidebar_obj().lock().unwrap().clone() else {
+        return;
+    };
     let oc = obj_create_pkt(&obj);
     let dp = display_pkt(1, &obj);
-    let scores_list: Vec<(String, i64)> = scores().lock().unwrap().get(&obj)
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
+    let scores_list: Vec<(String, i64)> = scores()
+        .lock()
+        .unwrap()
+        .get(&obj)
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     if let Ok(mut w) = c.sock.lock() {
         let _ = send_packet(&mut *w, 0x5e, oc);
         let _ = send_packet(&mut *w, 0x57, dp);
-        for (n, v) in scores_list { let _ = send_packet(&mut *w, 0x61, score_pkt(&n, &obj, v)); }
+        for (n, v) in scores_list {
+            let _ = send_packet(&mut *w, 0x61, score_pkt(&n, &obj, v));
+        }
     }
 }
 // broadcast a score change iff the objective is on the sidebar
 fn score_broadcast(obj: &str, name: &str, v: i64) {
     let shown = sidebar_obj().lock().unwrap().as_deref() == Some(obj);
-    if shown { let pk = score_pkt(name, obj, v); broadcast(-1, |_c| (0x61, pk.clone())); }
+    if shown {
+        let pk = score_pkt(name, obj, v);
+        broadcast(-1, |_c| (0x61, pk.clone()));
+    }
 }
 fn scores() -> &'static Mutex<HashMap<String, HashMap<String, i64>>> {
     SCORES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -10122,7 +14399,9 @@ fn scores() -> &'static Mutex<HashMap<String, HashMap<String, i64>>> {
 // (alternative), time_check, weather_check, entity_properties(type only),
 // location_check(block only); top-level array = all_of. Unknown -> false.
 fn pred_eval(body: &str, ctx: &CmdCtx, depth: usize) -> bool {
-    if depth > 8 { return false }
+    if depth > 8 {
+        return false;
+    }
     let b = body.trim();
     if b.starts_with('[') {
         if let Some(inner) = b.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
@@ -10130,15 +14409,22 @@ fn pred_eval(body: &str, ctx: &CmdCtx, depth: usize) -> bool {
         }
         return false;
     }
-    let cond = jstr(b, "condition").unwrap_or("").trim_start_matches("minecraft:");
+    let cond = jstr(b, "condition")
+        .unwrap_or("")
+        .trim_start_matches("minecraft:");
     match cond {
-        "inverted" => jblock(b, "term").map(|t| !pred_eval(t, ctx, depth + 1)).unwrap_or(false),
+        "inverted" => jblock(b, "term")
+            .map(|t| !pred_eval(t, ctx, depth + 1))
+            .unwrap_or(false),
         "any_of" | "alternative" => jarray(b, "terms")
-            .map(|a| jobjects(a).iter().any(|o| pred_eval(o, ctx, depth + 1))).unwrap_or(false),
+            .map(|a| jobjects(a).iter().any(|o| pred_eval(o, ctx, depth + 1)))
+            .unwrap_or(false),
         "all_of" => jarray(b, "terms")
-            .map(|a| jobjects(a).iter().all(|o| pred_eval(o, ctx, depth + 1))).unwrap_or(false),
+            .map(|a| jobjects(a).iter().all(|o| pred_eval(o, ctx, depth + 1)))
+            .unwrap_or(false),
         "random_chance" => {
-            let c = jnum(b, "chance").map(|n| n as f64 / 100.0)
+            let c = jnum(b, "chance")
+                .map(|n| n as f64 / 100.0)
                 .or_else(|| jstr(b, "chance").and_then(|x| x.parse::<f64>().ok()))
                 .unwrap_or(0.0);
             let h = (ctx.x.to_bits() as u64).wrapping_mul(2862933555777941757)
@@ -10160,7 +14446,9 @@ fn pred_eval(body: &str, ctx: &CmdCtx, depth: usize) -> bool {
         }
         "weather_check" => {
             let want_rain = jstr(b, "raining").map(|v| v == "true");
-            want_rain.map(|w| (RAINING.load(Ordering::Relaxed) > 0) == w).unwrap_or(true)
+            want_rain
+                .map(|w| (RAINING.load(Ordering::Relaxed) > 0) == w)
+                .unwrap_or(true)
         }
         "entity_properties" => {
             // only "this" + type check; context entity is a player when present
@@ -10171,20 +14459,28 @@ fn pred_eval(body: &str, ctx: &CmdCtx, depth: usize) -> bool {
         }
         "location_check" => {
             let st = block_at(ctx.x as i32, ctx.y as i32 - 1, ctx.z as i32);
-            jblock(b, "predicate").and_then(|p| jblock(p, "block"))
+            jblock(b, "predicate")
+                .and_then(|p| jblock(p, "block"))
                 .map(|bb| {
                     if let Some(arr) = jarray(bb, "blocks") {
                         jstr_all(arr).iter().any(|n| block_pred_match(st, n))
                     } else {
-                        jstr(bb, "blocks").map(|n| block_pred_match(st, n)).unwrap_or(false)
+                        jstr(bb, "blocks")
+                            .map(|n| block_pred_match(st, n))
+                            .unwrap_or(false)
                     }
-                }).unwrap_or(false)
+                })
+                .unwrap_or(false)
         }
         _ => false,
     }
 }
 fn jstr_all(arr: &str) -> Vec<String> {
-    arr.split('"').skip(1).step_by(2).map(|x| x.to_string()).collect()
+    arr.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(|x| x.to_string())
+        .collect()
 }
 // execute subset: as/at/positioned/if|unless block|entity|score ... run <cmd>
 fn exec_result(ctx: &CmdCtx, cmd: &str) -> i64 {
@@ -10194,20 +14490,26 @@ fn exec_result(ctx: &CmdCtx, cmd: &str) -> i64 {
     let mut last = 0i64;
     while i < a.len() {
         match a[i] {
-            "if" => {
-                match a.get(i+1).copied().unwrap_or("") {
-                    "entity" => { last = resolve_selector(a.get(i+2).copied().unwrap_or(""), ctx.me.as_ref()).len() as i64; i += 3; continue }
-                    "block" => {
-                        let (x, y, z) = (coord(a.get(i+2).copied().unwrap_or("~"), ctx.x) as i32,
-                                         coord(a.get(i+3).copied().unwrap_or("~"), ctx.y) as i32,
-                                         coord(a.get(i+4).copied().unwrap_or("~"), ctx.z) as i32);
-                        let want = a.get(i+5).copied().unwrap_or("");
-                        last = block_pred_match(block_at(x, y, z), want) as i64;
-                        i += 6; continue
-                    }
-                    _ => {}
+            "if" => match a.get(i + 1).copied().unwrap_or("") {
+                "entity" => {
+                    last = resolve_selector(a.get(i + 2).copied().unwrap_or(""), ctx.me.as_ref())
+                        .len() as i64;
+                    i += 3;
+                    continue;
                 }
-            }
+                "block" => {
+                    let (x, y, z) = (
+                        coord(a.get(i + 2).copied().unwrap_or("~"), ctx.x) as i32,
+                        coord(a.get(i + 3).copied().unwrap_or("~"), ctx.y) as i32,
+                        coord(a.get(i + 4).copied().unwrap_or("~"), ctx.z) as i32,
+                    );
+                    let want = a.get(i + 5).copied().unwrap_or("");
+                    last = block_pred_match(block_at(x, y, z), want) as i64;
+                    i += 6;
+                    continue;
+                }
+                _ => {}
+            },
             "run" => break,
             _ => {}
         }
@@ -10221,7 +14523,9 @@ fn exec_result(ctx: &CmdCtx, cmd: &str) -> i64 {
 thread_local! { static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) } }
 fn run_execute(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>) -> String {
     let depth = EXEC_DEPTH.get();
-    if depth >= 16 { return "execute depth limit".into() }
+    if depth >= 16 {
+        return "execute depth limit".into();
+    }
     EXEC_DEPTH.set(depth + 1);
     let r = run_execute_inner(ctx, args, s);
     EXEC_DEPTH.set(depth);
@@ -10238,9 +14542,13 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
             "run" => break,
             "store" => {
                 // store result score <entry> <objective>
-                if args.get(i+1).copied() == Some("result") && args.get(i+2).copied() == Some("score") {
-                    store_score = Some((args.get(i+3).copied().unwrap_or("").to_string(),
-                                        args.get(i+4).copied().unwrap_or("").to_string()));
+                if args.get(i + 1).copied() == Some("result")
+                    && args.get(i + 2).copied() == Some("score")
+                {
+                    store_score = Some((
+                        args.get(i + 3).copied().unwrap_or("").to_string(),
+                        args.get(i + 4).copied().unwrap_or("").to_string(),
+                    ));
                     i += 4;
                 }
             }
@@ -10254,20 +14562,26 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
                 if let Some(t) = ts.first() {
                     if let Some(eid) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
                         if let Some(p) = mobs().lock().unwrap().iter().find(|m| m.eid == eid) {
-                            let p = *p.pos.lock().unwrap(); cur.x = p.0; cur.y = p.1; cur.z = p.2;
+                            let p = *p.pos.lock().unwrap();
+                            cur.x = p.0;
+                            cur.y = p.1;
+                            cur.z = p.2;
                         }
                     } else if let Ok(eid) = t.parse::<i32>() {
                         let cls: Vec<Arc<Client>> = client_snapshot();
                         if let Some(c) = cls.iter().find(|c| c.eid == eid) {
-                            let p = *c.pos.lock().unwrap(); cur.x = p.0; cur.y = p.1; cur.z = p.2;
+                            let p = *c.pos.lock().unwrap();
+                            cur.x = p.0;
+                            cur.y = p.1;
+                            cur.z = p.2;
                         }
                     }
                 }
             }
             "positioned" => {
-                cur.x = coord(args.get(i+1).copied().unwrap_or("0"), cur.x);
-                cur.y = coord(args.get(i+2).copied().unwrap_or("0"), cur.y);
-                cur.z = coord(args.get(i+3).copied().unwrap_or("0"), cur.z);
+                cur.x = coord(args.get(i + 1).copied().unwrap_or("0"), cur.x);
+                cur.y = coord(args.get(i + 2).copied().unwrap_or("0"), cur.y);
+                cur.z = coord(args.get(i + 3).copied().unwrap_or("0"), cur.z);
                 i += 3;
             }
             "if" | "unless" => {
@@ -10275,89 +14589,167 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
                 i += 1;
                 let ok = match args.get(i).copied().unwrap_or("") {
                     "block" => {
-                        let (x, y, z) = (coord(args.get(i+1).copied().unwrap_or("~"), cur.x) as i32,
-                                         coord(args.get(i+2).copied().unwrap_or("~"), cur.y) as i32,
-                                         coord(args.get(i+3).copied().unwrap_or("~"), cur.z) as i32);
+                        let (x, y, z) = (
+                            coord(args.get(i + 1).copied().unwrap_or("~"), cur.x) as i32,
+                            coord(args.get(i + 2).copied().unwrap_or("~"), cur.y) as i32,
+                            coord(args.get(i + 3).copied().unwrap_or("~"), cur.z) as i32,
+                        );
                         i += 3;
-                        let want = args.get(i+1).copied().unwrap_or("");
+                        let want = args.get(i + 1).copied().unwrap_or("");
                         let st = block_at(x, y, z);
                         block_pred_match(st, want)
                     }
                     "entity" => {
                         i += 1;
-                        !resolve_selector(args.get(i).copied().unwrap_or(""), cur.me.as_ref()).is_empty()
+                        !resolve_selector(args.get(i).copied().unwrap_or(""), cur.me.as_ref())
+                            .is_empty()
                     }
-                    "data" if args.get(i+1).copied() == Some("entity") => {
+                    "data" if args.get(i + 1).copied() == Some("entity") => {
                         // if data entity <name> <path>
-                        let nm = args.get(i+2).copied().unwrap_or("");
-                        let path = args.get(i+3).copied().unwrap_or("");
+                        let nm = args.get(i + 2).copied().unwrap_or("");
+                        let path = args.get(i + 3).copied().unwrap_or("");
                         i += 3;
                         if path.starts_with("Inventory[{") {
-                            let idm = path.split("id:\"").nth(1).and_then(|r| r.split('\"').next()).unwrap_or("");
+                            let idm = path
+                                .split("id:\"")
+                                .nth(1)
+                                .and_then(|r| r.split('\"').next())
+                                .unwrap_or("");
                             let item = name_to_item(idm.trim_start_matches("minecraft:"));
-                            actors().lock().unwrap().get(nm)
-                                .map(|a| a.inv.lock().unwrap().values().any(|(it, _, _)| Some(*it) == item))
+                            actors()
+                                .lock()
+                                .unwrap()
+                                .get(nm)
+                                .map(|a| {
+                                    a.inv
+                                        .lock()
+                                        .unwrap()
+                                        .values()
+                                        .any(|(it, _, _)| Some(*it) == item)
+                                })
                                 .unwrap_or(false)
-                        } else { false }
+                        } else {
+                            false
+                        }
                     }
                     "data" => {
                         // if data block x y z <path>
-                        let bx = coord(args.get(i+2).copied().unwrap_or("~"), cur.x) as i32;
-                        let by = coord(args.get(i+3).copied().unwrap_or("~"), cur.y) as i32;
-                        let bz = coord(args.get(i+4).copied().unwrap_or("~"), cur.z) as i32;
-                        let path = args.get(i+5).copied().unwrap_or("");
+                        let bx = coord(args.get(i + 2).copied().unwrap_or("~"), cur.x) as i32;
+                        let by = coord(args.get(i + 3).copied().unwrap_or("~"), cur.y) as i32;
+                        let bz = coord(args.get(i + 4).copied().unwrap_or("~"), cur.z) as i32;
+                        let path = args.get(i + 5).copied().unwrap_or("");
                         i += 5;
-                        let slots = if is_furnace_at(bx, by, bz) { furnace_slots((bx, by, bz)) }
-                            else { chests().lock().unwrap().get(&(bx, by, bz)).cloned().unwrap_or_default() };
+                        let slots = if is_furnace_at(bx, by, bz) {
+                            furnace_slots((bx, by, bz))
+                        } else {
+                            chests()
+                                .lock()
+                                .unwrap()
+                                .get(&(bx, by, bz))
+                                .cloned()
+                                .unwrap_or_default()
+                        };
                         match path {
                             "Items" => !slots.is_empty(),
                             "Items[0]" => slots.contains_key(&0i16),
                             p if p.starts_with("Items[{") => {
-                                let idm = p.split("id:\"").nth(1).and_then(|r| r.split('\"').next()).unwrap_or("");
-                                let ctm = p.split("count:").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).and_then(|r| r.parse::<i64>().ok());
+                                let idm = p
+                                    .split("id:\"")
+                                    .nth(1)
+                                    .and_then(|r| r.split('\"').next())
+                                    .unwrap_or("");
+                                let ctm = p
+                                    .split("count:")
+                                    .nth(1)
+                                    .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+                                    .and_then(|r| r.parse::<i64>().ok());
                                 let item = name_to_item(idm.trim_start_matches("minecraft:"));
-                                let have: i64 = slots.values().filter(|(it, _, _)| Some(*it) == item).map(|(_, c, _)| *c as i64).sum();
-                                match ctm { Some(c) => have == c, None => have > 0 }
+                                let have: i64 = slots
+                                    .values()
+                                    .filter(|(it, _, _)| Some(*it) == item)
+                                    .map(|(_, c, _)| *c as i64)
+                                    .sum();
+                                match ctm {
+                                    Some(c) => have == c,
+                                    None => have > 0,
+                                }
                             }
                             _ => false,
                         }
                     }
                     "predicate" => {
-                        let id = args.get(i+1).copied().unwrap_or("");
+                        let id = args.get(i + 1).copied().unwrap_or("");
                         i += 1;
-                        let id = if id.contains(':') { id.to_string() } else { format!("minecraft:{}", id) };
-                        predicates().lock().unwrap().get(&id)
-                            .map(|b| pred_eval(b, &cur, 0)).unwrap_or(false)
+                        let id = if id.contains(':') {
+                            id.to_string()
+                        } else {
+                            format!("minecraft:{}", id)
+                        };
+                        predicates()
+                            .lock()
+                            .unwrap()
+                            .get(&id)
+                            .map(|b| pred_eval(b, &cur, 0))
+                            .unwrap_or(false)
                     }
                     "score" => {
                         // if score <target> <obj> matches <range>
-                        let t = args.get(i+1).copied().unwrap_or("");
-                        let obj = args.get(i+2).copied().unwrap_or("");
+                        let t = args.get(i + 1).copied().unwrap_or("");
+                        let obj = args.get(i + 2).copied().unwrap_or("");
                         i += 2;
-                        if args.get(i+1).copied() == Some("matches") {
+                        if args.get(i + 1).copied() == Some("matches") {
                             i += 1;
-                            let range = args.get(i+1).copied().unwrap_or("0");
-                            let entry = match t { "@s" => cur.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(), n => n.to_string() };
-                            let v = scores().lock().unwrap().get(obj).and_then(|m| m.get(&entry)).copied().unwrap_or(0);
+                            let range = args.get(i + 1).copied().unwrap_or("0");
+                            let entry = match t {
+                                "@s" => cur.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(),
+                                n => n.to_string(),
+                            };
+                            let v = scores()
+                                .lock()
+                                .unwrap()
+                                .get(obj)
+                                .and_then(|m| m.get(&entry))
+                                .copied()
+                                .unwrap_or(0);
                             in_range(v, range)
-                        } else { false }
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };
-                if ok == neg { passed = false; }
+                if ok == neg {
+                    passed = false;
+                }
             }
             _ => {}
         }
         i += 1;
     }
-    if i >= args.len() { return if passed { "Test passed".into() } else { "Test failed".into() } }
-    let cmd = args[i+1..].join(" ");
-    if !passed { return "Test failed".into() }
+    if i >= args.len() {
+        return if passed {
+            "Test passed".into()
+        } else {
+            "Test failed".into()
+        };
+    }
+    let cmd = args[i + 1..].join(" ");
+    if !passed {
+        return "Test failed".into();
+    }
     if let Some((en, ob)) = &store_score {
         let r = exec_result(&cur, &cmd);
-        let entry = match en.as_str() { "@s" => cur.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(), n => n.to_string() };
-        scores().lock().unwrap().entry(ob.clone()).or_default().insert(entry.clone(), r);
-        return format!("Stored {} in {} for {}", r, ob, entry)
+        let entry = match en.as_str() {
+            "@s" => cur.me.as_ref().map(|c| c.name.clone()).unwrap_or_default(),
+            n => n.to_string(),
+        };
+        scores()
+            .lock()
+            .unwrap()
+            .entry(ob.clone())
+            .or_default()
+            .insert(entry.clone(), r);
+        return format!("Stored {} in {} for {}", r, ob, entry);
     }
     let mut n = 0;
     if targets.is_empty() {
@@ -10365,12 +14757,19 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
         n += 1;
     } else {
         for t in &targets {
-            if t.starts_with("m:") { continue } // mob-as-executor unsupported yet
+            if t.starts_with("m:") {
+                continue;
+            } // mob-as-executor unsupported yet
             let eid: i32 = t.parse().unwrap_or(-1);
             let cls: Vec<Arc<Client>> = client_snapshot();
             if let Some(c) = cls.iter().find(|c| c.eid == eid).cloned() {
                 let p = *c.pos.lock().unwrap();
-                let cc = CmdCtx { me: Some(c), x: p.0, y: p.1, z: p.2 };
+                let cc = CmdCtx {
+                    me: Some(c),
+                    x: p.0,
+                    y: p.1,
+                    z: p.2,
+                };
                 let _ = run_command_ctx(&cc, &format!("/{}", cmd), s);
                 n += 1;
             }
@@ -10379,31 +14778,76 @@ fn run_execute_inner(ctx: &CmdCtx, args: &[&str], s: &mut Option<&mut TcpStream>
     format!("executed {} command(s)", n)
 }
 fn facing_idx(v: &str) -> u32 {
-    ["north","east","south","west","up","down"].iter().position(|&x| x == v).unwrap_or(0) as u32
+    ["north", "east", "south", "west", "up", "down"]
+        .iter()
+        .position(|&x| x == v)
+        .unwrap_or(0) as u32
 }
 fn block_family_range(name: &str) -> Option<(u32, u32)> {
     Some(match name {
-        "water" => (80, 95), "lava" => (96, 111),
-        "wheat" => (4278, 4285), "farmland" => (4286, 4293), "carrots" => (4294, 4301),
-        "piston" => (2011, 2022), "sticky_piston" => (1992, 2003), "piston_head" => (2023, 2046),
+        "water" => (80, 95),
+        "lava" => (96, 111),
+        "wheat" => (4278, 4285),
+        "farmland" => (4286, 4293),
+        "carrots" => (4294, 4301),
+        "piston" => (2011, 2022),
+        "sticky_piston" => (1992, 2003),
+        "piston_head" => (2023, 2046),
         "tnt" => (2094, 2095),
-        "lever" => (5626, 5649), "observer" => (12550, 12561), "dispenser" => (523, 534),
-        "hopper" => (9225, 9234), "redstone_block" => (9223, 9223),
-        "redstone_wire" => (2978, 4273), "iron_door" => (5652, 5715),
-        "oak_sign" => (4302, 4333), "chest" => (2954, 2977), "barrel" => (18408, 18419),
+        "lever" => (5626, 5649),
+        "observer" => (12550, 12561),
+        "dispenser" => (523, 534),
+        "hopper" => (9225, 9234),
+        "redstone_block" => (9223, 9223),
+        "redstone_wire" => (2978, 4273),
+        "iron_door" => (5652, 5715),
+        "oak_sign" => (4302, 4333),
+        "chest" => (2954, 2977),
+        "barrel" => (18408, 18419),
         _ => return None,
     })
 }
 fn prop_match(name: &str, st: u32, k: &str, v: &str) -> bool {
     match name {
         _ if matches!(name, "wheat" | "carrots") => true, // age handled inline by caller
-        "piston" => match k { "extended" => ((st - 2011) < 6) == (v == "true"), "facing" => (st - 2011) % 6 == facing_idx(v), _ => true },
-        "sticky_piston" => match k { "extended" => ((st - 1992) < 6) == (v == "true"), "facing" => (st - 1992) % 6 == facing_idx(v), _ => true },
-        "piston_head" => match k { "facing" => (st - 2023) / 4 == facing_idx(v), _ => true },
-        "water" => match k { "level" => (st - 80) == v.parse().unwrap_or(99), _ => true },
-        "lever" => match k { "powered" => ((st - 5626) & 1 == 0) == (v == "true"), _ => true },
-        "observer" => match k { "facing" => (st - 12550) % 6 == facing_idx(v), "powered" => ((st - 12550) / 6) == (v == "true") as u32, _ => true },
-        "hopper" => match k { "enabled" => (st < 9230) == (v == "true"), "facing" => (st - 9225) % 5 == ["down","north","south","west","east"].iter().position(|&x| x == v).unwrap_or(0) as u32, _ => true },
+        "piston" => match k {
+            "extended" => ((st - 2011) < 6) == (v == "true"),
+            "facing" => (st - 2011) % 6 == facing_idx(v),
+            _ => true,
+        },
+        "sticky_piston" => match k {
+            "extended" => ((st - 1992) < 6) == (v == "true"),
+            "facing" => (st - 1992) % 6 == facing_idx(v),
+            _ => true,
+        },
+        "piston_head" => match k {
+            "facing" => (st - 2023) / 4 == facing_idx(v),
+            _ => true,
+        },
+        "water" => match k {
+            "level" => (st - 80) == v.parse().unwrap_or(99),
+            _ => true,
+        },
+        "lever" => match k {
+            "powered" => ((st - 5626) & 1 == 0) == (v == "true"),
+            _ => true,
+        },
+        "observer" => match k {
+            "facing" => (st - 12550) % 6 == facing_idx(v),
+            "powered" => ((st - 12550) / 6) == (v == "true") as u32,
+            _ => true,
+        },
+        "hopper" => match k {
+            "enabled" => (st < 9230) == (v == "true"),
+            "facing" => {
+                (st - 9225) % 5
+                    == ["down", "north", "south", "west", "east"]
+                        .iter()
+                        .position(|&x| x == v)
+                        .unwrap_or(0) as u32
+            }
+            _ => true,
+        },
         _ => true,
     }
 }
@@ -10412,48 +14856,210 @@ fn prop_match(name: &str, st: u32, k: &str, v: &str) -> bool {
 // semantics default to merging for non-vanilla namespaces)
 fn block_tags() -> &'static Mutex<HashMap<String, Vec<String>>> {
     static T: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new([
-        ("logs", &["oak_log","spruce_log","birch_log","jungle_log","acacia_log",
-                   "dark_oak_log","mangrove_log","cherry_log","crimson_stem","warped_stem",
-                   "oak_wood","spruce_wood","birch_wood","jungle_wood","acacia_wood",
-                   "dark_oak_wood","mangrove_wood","cherry_wood","crimson_hyphae","warped_hyphae"][..]),
-        ("planks", &["oak_planks","spruce_planks","birch_planks","jungle_planks","acacia_planks",
-                     "dark_oak_planks","mangrove_planks","cherry_planks","crimson_planks","warped_planks"][..]),
-        ("leaves", &["oak_leaves","spruce_leaves","birch_leaves","jungle_leaves","acacia_leaves",
-                     "dark_oak_leaves","mangrove_leaves","cherry_leaves","azalea_leaves"][..]),
-        ("wool", &["white_wool","orange_wool","magenta_wool","light_blue_wool","yellow_wool",
-                   "lime_wool","pink_wool","gray_wool","light_gray_wool","cyan_wool",
-                   "purple_wool","blue_wool","brown_wool","green_wool","red_wool","black_wool"][..]),
-        ("sand", &["sand","red_sand"][..]),
-        ("dirt", &["dirt","grass_block","podzol","mycelium","coarse_dirt","rooted_dirt",
-                   "dirt_path","farmland","mud","muddy_mangrove_roots"][..]),
-        ("flowers", &["dandelion","poppy","allium","cornflower","torchflower",
-                      "sunflower","lilac","peony","red_tulip","orange_tulip","white_tulip","pink_tulip"][..]),
-        ("crops", &["wheat","carrots","potatoes","beetroots"][..]),
-    ].iter().map(|(k, v)| (format!("minecraft:{}", k), v.iter().map(|s| s.to_string()).collect()))
-     .collect()))
+    T.get_or_init(|| {
+        Mutex::new(
+            [
+                (
+                    "logs",
+                    &[
+                        "oak_log",
+                        "spruce_log",
+                        "birch_log",
+                        "jungle_log",
+                        "acacia_log",
+                        "dark_oak_log",
+                        "mangrove_log",
+                        "cherry_log",
+                        "crimson_stem",
+                        "warped_stem",
+                        "oak_wood",
+                        "spruce_wood",
+                        "birch_wood",
+                        "jungle_wood",
+                        "acacia_wood",
+                        "dark_oak_wood",
+                        "mangrove_wood",
+                        "cherry_wood",
+                        "crimson_hyphae",
+                        "warped_hyphae",
+                    ][..],
+                ),
+                (
+                    "planks",
+                    &[
+                        "oak_planks",
+                        "spruce_planks",
+                        "birch_planks",
+                        "jungle_planks",
+                        "acacia_planks",
+                        "dark_oak_planks",
+                        "mangrove_planks",
+                        "cherry_planks",
+                        "crimson_planks",
+                        "warped_planks",
+                    ][..],
+                ),
+                (
+                    "leaves",
+                    &[
+                        "oak_leaves",
+                        "spruce_leaves",
+                        "birch_leaves",
+                        "jungle_leaves",
+                        "acacia_leaves",
+                        "dark_oak_leaves",
+                        "mangrove_leaves",
+                        "cherry_leaves",
+                        "azalea_leaves",
+                    ][..],
+                ),
+                (
+                    "wool",
+                    &[
+                        "white_wool",
+                        "orange_wool",
+                        "magenta_wool",
+                        "light_blue_wool",
+                        "yellow_wool",
+                        "lime_wool",
+                        "pink_wool",
+                        "gray_wool",
+                        "light_gray_wool",
+                        "cyan_wool",
+                        "purple_wool",
+                        "blue_wool",
+                        "brown_wool",
+                        "green_wool",
+                        "red_wool",
+                        "black_wool",
+                    ][..],
+                ),
+                ("sand", &["sand", "red_sand"][..]),
+                (
+                    "dirt",
+                    &[
+                        "dirt",
+                        "grass_block",
+                        "podzol",
+                        "mycelium",
+                        "coarse_dirt",
+                        "rooted_dirt",
+                        "dirt_path",
+                        "farmland",
+                        "mud",
+                        "muddy_mangrove_roots",
+                    ][..],
+                ),
+                (
+                    "flowers",
+                    &[
+                        "dandelion",
+                        "poppy",
+                        "allium",
+                        "cornflower",
+                        "torchflower",
+                        "sunflower",
+                        "lilac",
+                        "peony",
+                        "red_tulip",
+                        "orange_tulip",
+                        "white_tulip",
+                        "pink_tulip",
+                    ][..],
+                ),
+                ("crops", &["wheat", "carrots", "potatoes", "beetroots"][..]),
+            ]
+            .iter()
+            .map(|(k, v)| {
+                (
+                    format!("minecraft:{}", k),
+                    v.iter().map(|s| s.to_string()).collect(),
+                )
+            })
+            .collect(),
+        )
+    })
 }
 fn item_tags() -> &'static Mutex<HashMap<String, Vec<String>>> {
     static T: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new([
-        ("planks", &["oak_planks","spruce_planks","birch_planks","jungle_planks","acacia_planks",
-                     "dark_oak_planks","mangrove_planks","cherry_planks","crimson_planks","warped_planks"][..]),
-        ("logs", &["oak_log","spruce_log","birch_log","jungle_log","acacia_log",
-                   "dark_oak_log","mangrove_log","cherry_log","crimson_stem","warped_stem"][..]),
-        ("wool", &["white_wool","orange_wool","magenta_wool","light_blue_wool","yellow_wool",
-                   "lime_wool","pink_wool","gray_wool","light_gray_wool","cyan_wool",
-                   "purple_wool","blue_wool","brown_wool","green_wool","red_wool","black_wool"][..]),
-    ].iter().map(|(k, v)| (format!("minecraft:{}", k), v.iter().map(|s| s.to_string()).collect()))
-     .collect()))
+    T.get_or_init(|| {
+        Mutex::new(
+            [
+                (
+                    "planks",
+                    &[
+                        "oak_planks",
+                        "spruce_planks",
+                        "birch_planks",
+                        "jungle_planks",
+                        "acacia_planks",
+                        "dark_oak_planks",
+                        "mangrove_planks",
+                        "cherry_planks",
+                        "crimson_planks",
+                        "warped_planks",
+                    ][..],
+                ),
+                (
+                    "logs",
+                    &[
+                        "oak_log",
+                        "spruce_log",
+                        "birch_log",
+                        "jungle_log",
+                        "acacia_log",
+                        "dark_oak_log",
+                        "mangrove_log",
+                        "cherry_log",
+                        "crimson_stem",
+                        "warped_stem",
+                    ][..],
+                ),
+                (
+                    "wool",
+                    &[
+                        "white_wool",
+                        "orange_wool",
+                        "magenta_wool",
+                        "light_blue_wool",
+                        "yellow_wool",
+                        "lime_wool",
+                        "pink_wool",
+                        "gray_wool",
+                        "light_gray_wool",
+                        "cyan_wool",
+                        "purple_wool",
+                        "blue_wool",
+                        "brown_wool",
+                        "green_wool",
+                        "red_wool",
+                        "black_wool",
+                    ][..],
+                ),
+            ]
+            .iter()
+            .map(|(k, v)| {
+                (
+                    format!("minecraft:{}", k),
+                    v.iter().map(|s| s.to_string()).collect(),
+                )
+            })
+            .collect(),
+        )
+    })
 }
 // datapack crafting recipes (data/<ns>/recipe/**.json)
-enum Ingr { Item(i64), Tag(String) }
+enum Ingr {
+    Item(i64),
+    Tag(String),
+}
 struct JsonRecipe {
     shaped: bool,
-    rows: Vec<String>,              // shaped pattern rows (' '=air)
-    key: HashMap<char, Ingr>,       // shaped ingredient map
-    ing: Vec<Ingr>,                 // shapeless ingredients
-    out: i64, out_cnt: u8,
+    rows: Vec<String>,        // shaped pattern rows (' '=air)
+    key: HashMap<char, Ingr>, // shaped ingredient map
+    ing: Vec<Ingr>,           // shapeless ingredients
+    out: i64,
+    out_cnt: u8,
 }
 fn json_recipes() -> &'static Mutex<Vec<JsonRecipe>> {
     static R: OnceLock<Mutex<Vec<JsonRecipe>>> = OnceLock::new();
@@ -10470,32 +15076,58 @@ fn json_smelts() -> &'static Mutex<Vec<(Ingr, i64, u8, f32)>> {
 #[derive(Clone)]
 enum LootFunc {
     SetName(String),
-    SetLore(Vec<String>, bool),       // replace | append
-    SetEnchant(Vec<(i64, i64)>, bool),// entries, add?
-    SetDamage(f32),                   // fraction of max damage
+    SetLore(Vec<String>, bool),        // replace | append
+    SetEnchant(Vec<(i64, i64)>, bool), // entries, add?
+    SetDamage(f32),                    // fraction of max damage
 }
-struct LootEntry { item: i64, min: u8, max: u8, funcs: Vec<LootFunc> }
-struct LootPool { rolls: u8, chance: f32, entries: Vec<LootEntry>, funcs: Vec<LootFunc> }
+struct LootEntry {
+    item: i64,
+    min: u8,
+    max: u8,
+    funcs: Vec<LootFunc>,
+}
+struct LootPool {
+    rolls: u8,
+    chance: f32,
+    entries: Vec<LootEntry>,
+    funcs: Vec<LootFunc>,
+}
 fn parse_loot_funcs(json: &str) -> Vec<LootFunc> {
     // accepts an object {"function":...} or an array of them
     let t = json.trim();
-    let objs: Vec<&str> = if t.starts_with('[') { jobjects(t) } else { vec![t] };
+    let objs: Vec<&str> = if t.starts_with('[') {
+        jobjects(t)
+    } else {
+        vec![t]
+    };
     let mut out = Vec::new();
     for o in objs {
-        let Some(f) = jstr(o, "function") else { continue };
+        let Some(f) = jstr(o, "function") else {
+            continue;
+        };
         match f.trim_start_matches("minecraft:") {
             "set_name" => {
-                let n = jblock(o, "name").and_then(|b| jstr(b, "text"))
-                    .or_else(|| jstr(o, "name")).unwrap_or_default();
-                if !n.is_empty() { out.push(LootFunc::SetName(n.to_string())) }
+                let n = jblock(o, "name")
+                    .and_then(|b| jstr(b, "text"))
+                    .or_else(|| jstr(o, "name"))
+                    .unwrap_or_default();
+                if !n.is_empty() {
+                    out.push(LootFunc::SetName(n.to_string()))
+                }
             }
             "set_lore" => {
-                let append = jstr(o, "mode").map(|m| m.contains("append")).unwrap_or(false);
+                let append = jstr(o, "mode")
+                    .map(|m| m.contains("append"))
+                    .unwrap_or(false);
                 let mut ls = Vec::new();
                 if let Some(la) = jarray(o, "lore") {
                     for lb2 in jobjects(la) {
-                        let t = jstr(lb2, "text").map(|x| x.to_string()).unwrap_or_else(|| lb2.trim_matches('"').to_string());
-                        if !t.is_empty() { ls.push(t) }
+                        let t = jstr(lb2, "text")
+                            .map(|x| x.to_string())
+                            .unwrap_or_else(|| lb2.trim_matches('"').to_string());
+                        if !t.is_empty() {
+                            ls.push(t)
+                        }
                     }
                 }
                 out.push(LootFunc::SetLore(ls, append));
@@ -10522,11 +15154,16 @@ fn parse_loot_funcs(json: &str) -> Vec<LootFunc> {
                 if val.is_none() {
                     if let Some(ki) = o.find("\"damage\":") {
                         let tail = &o[ki + 9..];
-                        let num: String = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+                        let num: String = tail
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                            .collect();
                         val = num.parse::<f32>().ok();
                     }
                 }
-                if let Some(d) = val { out.push(LootFunc::SetDamage(d)) }
+                if let Some(d) = val {
+                    out.push(LootFunc::SetDamage(d))
+                }
             }
             _ => {}
         }
@@ -10543,29 +15180,45 @@ fn apply_loot_funcs(st: &mut Stack, funcs: &[LootFunc]) {
                     if let Some(d) = comp_get(&st.2, COMP_LORE) {
                         let (n, mut p) = read_varint_at(d, 0);
                         for _ in 0..n.min(64) {
-                            if p + 3 > d.len() { break }
+                            if p + 3 > d.len() {
+                                break;
+                            }
                             p += 1; // tag byte
-                            let ln = u16::from_be_bytes([d[p], d[p + 1]]) as usize; p += 2;
-                            if p + ln > d.len() { break }
-                            elems.push(String::from_utf8_lossy(&d[p..p + ln]).to_string()); p += ln;
+                            let ln = u16::from_be_bytes([d[p], d[p + 1]]) as usize;
+                            p += 2;
+                            if p + ln > d.len() {
+                                break;
+                            }
+                            elems.push(String::from_utf8_lossy(&d[p..p + ln]).to_string());
+                            p += ln;
                         }
                     }
                 }
                 elems.extend(ls.iter().cloned());
                 let mut d = Vec::new();
                 write_varint(&mut d, elems.len() as i64);
-                for t in &elems { d.extend_from_slice(&nbt_string(t)); }
+                for t in &elems {
+                    d.extend_from_slice(&nbt_string(t));
+                }
                 comp_set(&mut st.2, COMP_LORE, d);
             }
             LootFunc::SetEnchant(ls, add) => {
-                let mut cur = if *add { enchantments_get(&st.2) } else { Vec::new() };
-                for (id, lv) in ls { cur.retain(|(x, _)| x != id); cur.push((*id, *lv)); }
+                let mut cur = if *add {
+                    enchantments_get(&st.2)
+                } else {
+                    Vec::new()
+                };
+                for (id, lv) in ls {
+                    cur.retain(|(x, _)| x != id);
+                    cur.push((*id, *lv));
+                }
                 comp_set(&mut st.2, COMP_ENCHANTMENTS, enchantments_data(&cur, true));
             }
             LootFunc::SetDamage(frac) => {
                 if let Some(maxd) = tool_max_damage(st.0)
                     .or_else(|| armor_max_damage(st.0))
-                    .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE)) {
+                    .or_else(|| comp_varint(&st.2, COMP_MAX_DAMAGE))
+                {
                     comp_set_varint(&mut st.2, COMP_DAMAGE, (frac * maxd as f32) as i64);
                 }
             }
@@ -10592,7 +15245,10 @@ fn predicates() -> &'static Mutex<HashMap<String, String>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // datapack advancements: id -> criteria set (name -> trigger[, entity type])
-struct Advancement { title: String, criteria: Vec<(String, String, Option<i64>)> }
+struct Advancement {
+    title: String,
+    criteria: Vec<(String, String, Option<i64>)>,
+}
 fn advancements() -> &'static Mutex<HashMap<String, Advancement>> {
     static R: OnceLock<Mutex<HashMap<String, Advancement>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
@@ -10602,17 +15258,29 @@ fn adv_done() -> &'static Mutex<HashMap<String, HashSet<String>>> {
     static R: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
-struct Bossbar { name: String, color: u8, style: u8, val: f32, max: f32, visible: bool }
+struct Bossbar {
+    name: String,
+    color: u8,
+    style: u8,
+    val: f32,
+    max: f32,
+    visible: bool,
+}
 fn bossbars() -> &'static Mutex<HashMap<String, Bossbar>> {
     static R: OnceLock<Mutex<HashMap<String, Bossbar>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn bossbar_uuid(id: &str) -> [u8; 16] {
     // stable uuid: double FNV-ish hash of the id string
-    let mut a: u64 = 0xcbf29ce484222325; let mut b: u64 = 0x9e3779b97f4a7c15;
-    for ch in id.bytes() { a = (a ^ ch as u64).wrapping_mul(0x100000001b3); b = (b ^ ch as u64).wrapping_mul(0xc6a4a7935bd1e995); }
+    let mut a: u64 = 0xcbf29ce484222325;
+    let mut b: u64 = 0x9e3779b97f4a7c15;
+    for ch in id.bytes() {
+        a = (a ^ ch as u64).wrapping_mul(0x100000001b3);
+        b = (b ^ ch as u64).wrapping_mul(0xc6a4a7935bd1e995);
+    }
     let mut u = [0u8; 16];
-    u[..8].copy_from_slice(&a.to_be_bytes()); u[8..].copy_from_slice(&b.to_be_bytes());
+    u[..8].copy_from_slice(&a.to_be_bytes());
+    u[8..].copy_from_slice(&b.to_be_bytes());
     u
 }
 fn bossbar_pkt(id: &str, action: u8, bar: Option<&Bossbar>) -> Vec<u8> {
@@ -10620,15 +15288,20 @@ fn bossbar_pkt(id: &str, action: u8, bar: Option<&Bossbar>) -> Vec<u8> {
     p.extend_from_slice(&bossbar_uuid(id));
     write_varint(&mut p, action as i64);
     match (action, bar) {
-        (0, Some(b)) => { // add: title, health, color, dividers, flags
+        (0, Some(b)) => {
+            // add: title, health, color, dividers, flags
             p.extend_from_slice(&chat_nbt(&b.name));
             p.extend_from_slice(&b.val.to_be_bytes());
-            write_varint(&mut p, b.color as i64); write_varint(&mut p, b.style as i64);
+            write_varint(&mut p, b.color as i64);
+            write_varint(&mut p, b.style as i64);
             p.push(0);
         }
         (2, Some(b)) => p.extend_from_slice(&b.val.to_be_bytes()),
         (3, Some(b)) => p.extend_from_slice(&chat_nbt(&b.name)),
-        (4, Some(b)) => { write_varint(&mut p, b.color as i64); write_varint(&mut p, b.style as i64); }
+        (4, Some(b)) => {
+            write_varint(&mut p, b.color as i64);
+            write_varint(&mut p, b.style as i64);
+        }
         _ => {}
     }
     p
@@ -10641,15 +15314,28 @@ fn attrs() -> &'static Mutex<HashMap<String, HashMap<String, f64>>> {
 fn attr_key_id(name: &str) -> Option<i64> {
     let n = name.trim_start_matches("minecraft:");
     Some(match n {
-        "generic.armor" => 0, "generic.armor_toughness" => 1, "generic.attack_damage" => 2,
-        "generic.attack_knockback" => 3, "generic.attack_speed" => 4,
-        "player.block_break_speed" => 5, "player.block_interaction_range" => 6,
-        "player.entity_interaction_range" => 7, "generic.fall_damage_multiplier" => 8,
-        "generic.flying_speed" => 9, "generic.follow_range" => 10, "generic.gravity" => 11,
-        "generic.jump_strength" => 12, "generic.knockback_resistance" => 13, "generic.luck" => 14,
-        "generic.max_absorption" => 15, "generic.max_health" => 16, "generic.movement_speed" => 17,
-        "generic.safe_fall_distance" => 18, "generic.scale" => 19,
-        "zombie.spawn_reinforcements" => 20, "generic.step_height" => 21,
+        "generic.armor" => 0,
+        "generic.armor_toughness" => 1,
+        "generic.attack_damage" => 2,
+        "generic.attack_knockback" => 3,
+        "generic.attack_speed" => 4,
+        "player.block_break_speed" => 5,
+        "player.block_interaction_range" => 6,
+        "player.entity_interaction_range" => 7,
+        "generic.fall_damage_multiplier" => 8,
+        "generic.flying_speed" => 9,
+        "generic.follow_range" => 10,
+        "generic.gravity" => 11,
+        "generic.jump_strength" => 12,
+        "generic.knockback_resistance" => 13,
+        "generic.luck" => 14,
+        "generic.max_absorption" => 15,
+        "generic.max_health" => 16,
+        "generic.movement_speed" => 17,
+        "generic.safe_fall_distance" => 18,
+        "generic.scale" => 19,
+        "zombie.spawn_reinforcements" => 20,
+        "generic.step_height" => 21,
         _ => return None,
     })
 }
@@ -10662,10 +15348,17 @@ fn attr_default(name: &str) -> f64 {
     }
 }
 fn attr_of(key: &str, name: &str) -> f64 {
-    attrs().lock().unwrap().get(key).and_then(|m| m.get(name)).copied()
+    attrs()
+        .lock()
+        .unwrap()
+        .get(key)
+        .and_then(|m| m.get(name))
+        .copied()
         .unwrap_or_else(|| attr_default(name))
 }
-fn max_hp_of(pname: &str) -> f32 { attr_of(&format!("p:{}", pname), "generic.max_health") as f32 }
+fn max_hp_of(pname: &str) -> f32 {
+    attr_of(&format!("p:{}", pname), "generic.max_health") as f32
+}
 fn attrs_pkt(eid: i32, m: &HashMap<String, f64>) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, eid as i64);
@@ -10681,10 +15374,19 @@ fn attrs_pkt(eid: i32, m: &HashMap<String, f64>) -> Vec<u8> {
 }
 // send a client's full attribute set to themselves (join/set paths)
 fn send_attrs(c: &Arc<Client>) {
-    let m = attrs().lock().unwrap().get(&format!("p:{}", c.name)).cloned().unwrap_or_default();
-    if m.is_empty() { return }
+    let m = attrs()
+        .lock()
+        .unwrap()
+        .get(&format!("p:{}", c.name))
+        .cloned()
+        .unwrap_or_default();
+    if m.is_empty() {
+        return;
+    }
     let p = attrs_pkt(c.eid, &m);
-    if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut *w, 0x75, p); }
+    if let Ok(mut w) = c.sock.lock() {
+        let _ = send_packet(&mut *w, 0x75, p);
+    }
 }
 fn adv_prog() -> &'static Mutex<HashMap<String, HashMap<String, HashSet<String>>>> {
     static R: OnceLock<Mutex<HashMap<String, HashMap<String, HashSet<String>>>>> = OnceLock::new();
@@ -10692,18 +15394,38 @@ fn adv_prog() -> &'static Mutex<HashMap<String, HashMap<String, HashSet<String>>
 }
 // event -> mark matching criteria, grant when ALL criteria done, announce
 fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
-    if advancements().lock().unwrap().is_empty() { return }
+    if advancements().lock().unwrap().is_empty() {
+        return;
+    }
     let mut grants: Vec<String> = Vec::new();
     {
         let advs = advancements().lock().unwrap();
-        if adv_done().lock().unwrap().get(pname).map(|g| g.len() >= advs.len()).unwrap_or(false) { return }
+        if adv_done()
+            .lock()
+            .unwrap()
+            .get(pname)
+            .map(|g| g.len() >= advs.len())
+            .unwrap_or(false)
+        {
+            return;
+        }
         let mut prog = adv_prog().lock().unwrap();
         let pp = prog.entry(pname.to_string()).or_default();
         for (id, a) in advs.iter() {
-            if adv_done().lock().unwrap().get(pname).map(|g| g.contains(id)).unwrap_or(false) { continue }
+            if adv_done()
+                .lock()
+                .unwrap()
+                .get(pname)
+                .map(|g| g.contains(id))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let p = pp.entry(id.clone()).or_default();
             for (cn, tr, want) in &a.criteria {
-                if tr == event && (want.is_none() || *want == etype) { p.insert(cn.clone()); }
+                if tr == event && (want.is_none() || *want == etype) {
+                    p.insert(cn.clone());
+                }
             }
             if !a.criteria.is_empty() && a.criteria.iter().all(|(cn, _, _)| p.contains(cn)) {
                 grants.push(id.clone());
@@ -10711,41 +15433,90 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         }
     }
     for id in grants {
-        adv_done().lock().unwrap().entry(pname.to_string()).or_default().insert(id.clone());
-        let t = advancements().lock().unwrap().get(&id).map(|a| a.title.clone()).unwrap_or(id.clone());
+        adv_done()
+            .lock()
+            .unwrap()
+            .entry(pname.to_string())
+            .or_default()
+            .insert(id.clone());
+        let t = advancements()
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|a| a.title.clone())
+            .unwrap_or(id.clone());
         let line = system_chat(&format!("{} has made the advancement [{}]", pname, t));
         broadcast(-1, |_c| (0x6c, line.clone()));
     }
 }
 fn block_tag_has(tag: &str, st: u32, depth: usize) -> bool {
-    if depth > 8 { return false }
-    let members = block_tags().lock().unwrap().get(tag).cloned().unwrap_or_default();
+    if depth > 8 {
+        return false;
+    }
+    let members = block_tags()
+        .lock()
+        .unwrap()
+        .get(tag)
+        .cloned()
+        .unwrap_or_default();
     for m in members {
         if let Some(inner) = m.strip_prefix('#') {
-            if block_tag_has(inner, st, depth + 1) { return true }
+            if block_tag_has(inner, st, depth + 1) {
+                return true;
+            }
         } else if let Some((lo, hi)) = block_family_range(&m) {
-            if (lo..=hi).contains(&st) { return true }
-        } else if name_to_state(&m).map(|w| w == st).unwrap_or(false) { return true }
+            if (lo..=hi).contains(&st) {
+                return true;
+            }
+        } else if name_to_state(&m).map(|w| w == st).unwrap_or(false) {
+            return true;
+        }
     }
     false
 }
 fn block_pred_match(st: u32, pred: &str) -> bool {
     if let Some(tag) = pred.strip_prefix('#') {
-        let tag = if tag.contains(':') { tag.to_string() } else { format!("minecraft:{}", tag) };
+        let tag = if tag.contains(':') {
+            tag.to_string()
+        } else {
+            format!("minecraft:{}", tag)
+        };
         return block_tag_has(&tag, st, 0);
     }
-    let (name, props) = match pred.split_once('[') { Some((n, r)) => (n, r.trim_end_matches(']')), None => (pred, "") };
+    let (name, props) = match pred.split_once('[') {
+        Some((n, r)) => (n, r.trim_end_matches(']')),
+        None => (pred, ""),
+    };
     let name = name.trim_start_matches("minecraft:");
     match block_family_range(name) {
         Some((lo, hi)) => {
-            if !(lo..=hi).contains(&st) { return false }
+            if !(lo..=hi).contains(&st) {
+                return false;
+            }
             for kv in props.split(',').filter(|x| !x.is_empty()) {
                 if let Some((k, v)) = kv.split_once('=') {
                     // single-prop families like wheat[age=N]: age == offset
-                    if name == "wheat" && k.trim() == "age" { if st - 4278 != v.trim().parse().unwrap_or(99) { return false } continue }
-                    if name == "carrots" && k.trim() == "age" { if st - 4294 != v.trim().parse().unwrap_or(99) { return false } continue }
-                    if name == "water" && k.trim() == "level" { if st - 80 != v.trim().parse().unwrap_or(99) { return false } continue }
-                    if !prop_match(name, st, k.trim(), v.trim()) { return false }
+                    if name == "wheat" && k.trim() == "age" {
+                        if st - 4278 != v.trim().parse().unwrap_or(99) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if name == "carrots" && k.trim() == "age" {
+                        if st - 4294 != v.trim().parse().unwrap_or(99) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if name == "water" && k.trim() == "level" {
+                        if st - 80 != v.trim().parse().unwrap_or(99) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if !prop_match(name, st, k.trim(), v.trim()) {
+                        return false;
+                    }
                 }
             }
             true
@@ -10758,14 +15529,29 @@ fn in_range(v: i64, r: &str) -> bool {
         let lo = a.parse::<i64>().unwrap_or(i64::MIN);
         let hi = b.parse::<i64>().unwrap_or(i64::MAX);
         v >= lo && v <= hi
-    } else { v == r.parse().unwrap_or(i64::MIN + 1) }
+    } else {
+        v == r.parse().unwrap_or(i64::MIN + 1)
+    }
 }
 
 // minimal brigadier seed: /time /tp /say /kill /gamemode /list /seed
 fn run_command(me: Option<&Arc<Client>>, msg: &str, s: &mut Option<&mut TcpStream>) {
     let ctx = match me {
-        Some(c) => { let p = *c.pos.lock().unwrap(); CmdCtx { me: Some(c.clone()), x: p.0, y: p.1, z: p.2 } }
-        None => CmdCtx { me: None, x: 0.5, y: 16.0, z: 0.5 },
+        Some(c) => {
+            let p = *c.pos.lock().unwrap();
+            CmdCtx {
+                me: Some(c.clone()),
+                x: p.0,
+                y: p.1,
+                z: p.2,
+            }
+        }
+        None => CmdCtx {
+            me: None,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        },
     };
     run_command_ctx(&ctx, msg, s);
 }
@@ -10777,7 +15563,10 @@ fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
         || (cmd == "time" && matches!(args.first().copied(), Some("query" | "get")))
 }
 fn allow_unsafe_player_admin() -> bool {
-    std::env::var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS").ok().as_deref() == Some("1")
+    std::env::var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> String {
     let me = ctx.me.as_ref();
@@ -12081,36 +16870,69 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
 }
 
 fn system_chat(text: &str) -> Vec<u8> {
-    let mut p = chat_nbt(text); p.push(0); p
+    let mut p = chat_nbt(text);
+    p.push(0);
+    p
 }
 // tellraw: build anonymousNbt compound from a flat json component
 // (scalar fields only — nested arrays/components documented gap)
 fn json_component_nbt(json: &str) -> Vec<u8> {
     let mut v = vec![10u8];
-    for (k, is_bool) in [("text", false), ("color", false), ("font", false), ("insertion", false),
-                         ("bold", true), ("italic", true), ("underlined", true),
-                         ("strikethrough", true), ("obfuscated", true)] {
+    for (k, is_bool) in [
+        ("text", false),
+        ("color", false),
+        ("font", false),
+        ("insertion", false),
+        ("bold", true),
+        ("italic", true),
+        ("underlined", true),
+        ("strikethrough", true),
+        ("obfuscated", true),
+    ] {
         if let Some(val) = jstr(json, k) {
             if is_bool {
-                v.push(1); nbt_str(&mut v, k); v.push(if val == "true" { 1 } else { 0 });
+                v.push(1);
+                nbt_str(&mut v, k);
+                v.push(if val == "true" { 1 } else { 0 });
             } else {
-                v.push(8); nbt_str(&mut v, k); nbt_str(&mut v, val);
+                v.push(8);
+                nbt_str(&mut v, k);
+                nbt_str(&mut v, val);
             }
         }
     }
-    if v.len() == 1 { v.push(8); nbt_str(&mut v, "text"); nbt_str(&mut v, json); }
+    if v.len() == 1 {
+        v.push(8);
+        nbt_str(&mut v, "text");
+        nbt_str(&mut v, json);
+    }
     v.push(0);
     v
 }
-fn ack(seq: i64) -> Vec<u8> { let mut v = Vec::new(); write_varint(&mut v, seq); v }
-const FACE_OFF: [(i32, i32, i32); 6] = [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
+fn ack(seq: i64) -> Vec<u8> {
+    let mut v = Vec::new();
+    write_varint(&mut v, seq);
+    v
+}
+const FACE_OFF: [(i32, i32, i32); 6] = [
+    (0, -1, 0),
+    (0, 1, 0),
+    (0, 0, -1),
+    (0, 0, 1),
+    (-1, 0, 0),
+    (1, 0, 0),
+];
 
 // Decode protocol-767 handshake without trusting unbounded client lengths.
 fn handshake_next_state(hs: &[u8]) -> Option<i64> {
     let mut p = hs;
-    if read_varint(&mut p)? != 767 { return None; }
+    if read_varint(&mut p)? != 767 {
+        return None;
+    }
     let address_len = usize::try_from(read_varint(&mut p)?).ok()?;
-    if address_len > 255 || p.len() < address_len.checked_add(2)? { return None; }
+    if address_len > 255 || p.len() < address_len.checked_add(2)? {
+        return None;
+    }
     std::str::from_utf8(&p[..address_len]).ok()?;
     p = &p[address_len + 2..]; // address + two-byte port
     let next = read_varint(&mut p)?;
@@ -12122,9 +16944,13 @@ fn handshake_next_state(hs: &[u8]) -> Option<i64> {
 fn login_identity(body: &[u8]) -> Option<(String, [u8; 16])> {
     let mut p = body;
     let name_len = usize::try_from(read_varint(&mut p)?).ok()?;
-    if !(1..=16).contains(&name_len) || p.len() < name_len + 16 { return None; }
+    if !(1..=16).contains(&name_len) || p.len() < name_len + 16 {
+        return None;
+    }
     let name = std::str::from_utf8(&p[..name_len]).ok()?;
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return None; }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&p[name_len..name_len + 16]);
     Some((name.to_owned(), uuid))
@@ -12136,63 +16962,110 @@ fn handle(mut s: TcpStream) {
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
     let login_deadline = Instant::now() + Duration::from_secs(30);
-    let (id, hs) = match read_packet(&mut s, login_deadline) { Some(x) => x, None => return };
-    if id != 0 { return }
-    let Some(next) = handshake_next_state(&hs) else { return };
+    let (id, hs) = match read_packet(&mut s, login_deadline) {
+        Some(x) => x,
+        None => return,
+    };
+    if id != 0 {
+        return;
+    }
+    let Some(next) = handshake_next_state(&hs) else {
+        return;
+    };
     if next == 1 {
         if let Some((0, _)) = read_packet(&mut s, login_deadline) {
             let json = "{\"version\":{\"name\":\"1.21.1\",\"protocol\":767},\"players\":{\"max\":20,\"online\":0},\"description\":{\"text\":\"mc-spine\"}}";
-            let mut pl = Vec::new(); write_str(&mut pl, json);
+            let mut pl = Vec::new();
+            write_str(&mut pl, json);
             let _ = send_packet(&mut s, 0, pl);
         }
-        if let Some((1, ping)) = read_packet(&mut s, login_deadline) { let _ = send_packet(&mut s, 1, ping); }
+        if let Some((1, ping)) = read_packet(&mut s, login_deadline) {
+            let _ = send_packet(&mut s, 1, ping);
+        }
         return;
     }
-    if next != 2 { return }
+    if next != 2 {
+        return;
+    }
     // ---- login ----
-    let (lid, lbody) = match read_packet(&mut s, login_deadline) { Some(x) => x, None => return };
-    if lid != 0 { return }
-    let Some((name, uuid)) = login_identity(&lbody) else { return };
+    let (lid, lbody) = match read_packet(&mut s, login_deadline) {
+        Some(x) => x,
+        None => return,
+    };
+    if lid != 0 {
+        return;
+    }
+    let Some((name, uuid)) = login_identity(&lbody) else {
+        return;
+    };
     let mut ls = Vec::new();
-    ls.extend_from_slice(&uuid); write_str(&mut ls, &name);
-    write_varint(&mut ls, 0); ls.push(0);
-    if send_packet(&mut s, 2, ls).is_err() { return }
-    match read_packet(&mut s, login_deadline) { Some((3, _)) => {}, _ => return }
+    ls.extend_from_slice(&uuid);
+    write_str(&mut ls, &name);
+    write_varint(&mut ls, 0);
+    ls.push(0);
+    if send_packet(&mut s, 2, ls).is_err() {
+        return;
+    }
+    match read_packet(&mut s, login_deadline) {
+        Some((3, _)) => {}
+        _ => return,
+    }
     // ---- config ----
     let mut client_view: i32 = 8;
     let cfg = load_config_packets();
     let mut sent_selpacks = false;
     for (pid, pkt) in &cfg {
-        if *pid == 0x0e { let _ = send_raw(&mut s, pkt); sent_selpacks = true; break; }
+        if *pid == 0x0e {
+            let _ = send_raw(&mut s, pkt);
+            sent_selpacks = true;
+            break;
+        }
         let _ = send_raw(&mut s, pkt);
     }
-    if !sent_selpacks { return }
+    if !sent_selpacks {
+        return;
+    }
     s.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let t0 = Instant::now();
     let mut got_selpacks = false;
     while Instant::now() - t0 < Duration::from_secs(15) {
         match read_packet(&mut s, login_deadline) {
             Some((0x00, b)) => {
-                let Some(v) = client_info_view_distance(&b) else { return; };
+                let Some(v) = client_info_view_distance(&b) else {
+                    return;
+                };
                 client_view = v;
             }
-            Some((0x07, _)) => { got_selpacks = true; break }
+            Some((0x07, _)) => {
+                got_selpacks = true;
+                break;
+            }
             Some(_) => continue,
             None => continue,
         }
     }
-    if !got_selpacks { return }
+    if !got_selpacks {
+        return;
+    }
     for (pid, pkt) in &cfg {
-        if matches!(*pid, 0x01 | 0x0c | 0x0e | 0x03) { continue }
+        if matches!(*pid, 0x01 | 0x0c | 0x0e | 0x03) {
+            continue;
+        }
         let _ = send_raw(&mut s, pkt);
     }
-    if send_packet(&mut s, 0x03, vec![]).is_err() { return }
+    if send_packet(&mut s, 0x03, vec![]).is_err() {
+        return;
+    }
     let t0 = Instant::now();
     loop {
-        if Instant::now() - t0 > Duration::from_secs(15) { return }
+        if Instant::now() - t0 > Duration::from_secs(15) {
+            return;
+        }
         match read_packet(&mut s, login_deadline) {
             Some((0x00, b)) => {
-                let Some(v) = client_info_view_distance(&b) else { return; };
+                let Some(v) = client_info_view_distance(&b) else {
+                    return;
+                };
                 client_view = v;
             }
             Some((0x03, _)) => break,
@@ -12201,19 +17074,28 @@ fn handle(mut s: TcpStream) {
         }
     }
     // ---- play ----
-    if send_packet(&mut s, 0x2b, join_game()).is_err() { return }
+    if send_packet(&mut s, 0x2b, join_game()).is_err() {
+        return;
+    }
     let _ = send_packet(&mut s, 0x53, vec![0]); // held slot 0
-    let mut vp = Vec::new(); write_varint(&mut vp, 0); write_varint(&mut vp, 0);
+    let mut vp = Vec::new();
+    write_varint(&mut vp, 0);
+    write_varint(&mut vp, 0);
     let _ = send_packet(&mut s, 0x54, vp);
-    let mut sp = Vec::new(); write_pos(&mut sp, 0, 16, 0); sp.extend_from_slice(&0f32.to_be_bytes());
+    let mut sp = Vec::new();
+    write_pos(&mut sp, 0, 16, 0);
+    sp.extend_from_slice(&0f32.to_be_bytes());
     let _ = send_packet(&mut s, 0x56, sp);
-    let mut gs = vec![13u8]; gs.extend_from_slice(&0f32.to_be_bytes());
+    let mut gs = vec![13u8];
+    gs.extend_from_slice(&0f32.to_be_bytes());
     let _ = send_packet(&mut s, 0x22, gs);
     if RAINING.load(Ordering::Relaxed) > 0 {
-        let mut rp = vec![1u8]; rp.extend_from_slice(&0f32.to_be_bytes());
+        let mut rp = vec![1u8];
+        rp.extend_from_slice(&0f32.to_be_bytes());
         let _ = send_packet(&mut s, 0x22, rp);
         if THUNDERING.load(Ordering::Relaxed) > 0 {
-            let mut tp = vec![8u8]; tp.extend_from_slice(&1f32.to_be_bytes());
+            let mut tp = vec![8u8];
+            tp.extend_from_slice(&1f32.to_be_bytes());
             let _ = send_packet(&mut s, 0x22, tp);
         }
     }
@@ -12222,10 +17104,26 @@ fn handle(mut s: TcpStream) {
     let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
     // vanilla: a returning player resumes where they logged out — the
     // chunk window, spawn teleport and authoritative pos all agree.
-    let (sx, sy, sz, syaw, spitch) = pos_store().lock().unwrap().get(&name)
-        .copied().unwrap_or_else(|| { let w = *WORLD_SPAWN.lock().unwrap(); (w.0, w.1, w.2, 0.0, 0.0) });
-    stream_chunks(&mut s, &mut sent, &mut gen, (sx / 16.0).floor() as i32, (sz / 16.0).floor() as i32, view);
-    let mut tm = Vec::new(); tm.extend_from_slice(&0i64.to_be_bytes()); tm.extend_from_slice(&6000i64.to_be_bytes());
+    let (sx, sy, sz, syaw, spitch) = pos_store()
+        .lock()
+        .unwrap()
+        .get(&name)
+        .copied()
+        .unwrap_or_else(|| {
+            let w = *WORLD_SPAWN.lock().unwrap();
+            (w.0, w.1, w.2, 0.0, 0.0)
+        });
+    stream_chunks(
+        &mut s,
+        &mut sent,
+        &mut gen,
+        (sx / 16.0).floor() as i32,
+        (sz / 16.0).floor() as i32,
+        view,
+    );
+    let mut tm = Vec::new();
+    tm.extend_from_slice(&0i64.to_be_bytes());
+    tm.extend_from_slice(&6000i64.to_be_bytes());
     let _ = send_packet(&mut s, 0x64, tm);
     let mut ps = Vec::new();
     ps.extend_from_slice(&sx.to_be_bytes());
@@ -12236,14 +17134,24 @@ fn handle(mut s: TcpStream) {
     ps.push(0);
     write_varint(&mut ps, 1);
     let _ = send_packet(&mut s, 0x40, ps);
-    let mut ab = vec![0x0du8]; ab.extend_from_slice(&0.05f32.to_be_bytes()); ab.extend_from_slice(&0.1f32.to_be_bytes());
+    let mut ab = vec![0x0du8];
+    ab.extend_from_slice(&0.05f32.to_be_bytes());
+    ab.extend_from_slice(&0.1f32.to_be_bytes());
     let _ = send_packet(&mut s, 0x38, ab);
     let _ = send_packet(&mut s, 0x0b, vec![1u8, 0u8]);
-    let mut xp = Vec::new(); xp.extend_from_slice(&0f32.to_be_bytes()); write_varint(&mut xp, 0); write_varint(&mut xp, 0);
+    let mut xp = Vec::new();
+    xp.extend_from_slice(&0f32.to_be_bytes());
+    write_varint(&mut xp, 0);
+    write_varint(&mut xp, 0);
     let _ = send_packet(&mut s, 0x5c, xp);
-    let mut hp = Vec::new(); hp.extend_from_slice(&max_hp_of(&name).to_be_bytes()); write_varint(&mut hp, 20); hp.extend_from_slice(&5f32.to_be_bytes());
+    let mut hp = Vec::new();
+    hp.extend_from_slice(&max_hp_of(&name).to_be_bytes());
+    write_varint(&mut hp, 20);
+    hp.extend_from_slice(&5f32.to_be_bytes());
     let _ = send_packet(&mut s, 0x5d, hp);
-    if let Some(rp) = resource_pack_pkt() { let _ = send_packet(&mut s, 0x46, rp); }
+    if let Some(rp) = resource_pack_pkt() {
+        let _ = send_packet(&mut s, 0x46, rp);
+    }
     // restore saved inventory for this name
     let saved_inv = inv_store().lock().unwrap().get(&name).cloned();
     eprintln!("[spine] {} joined", name);
@@ -12252,7 +17160,8 @@ fn handle(mut s: TcpStream) {
         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
         uuid: {
             let mut u = [0u8; 16];
-            u.copy_from_slice(&uuid); u
+            u.copy_from_slice(&uuid);
+            u
         },
         name: name.clone(),
         pos: Mutex::new((sx, sy, sz, syaw, spitch, true)),
@@ -12268,7 +17177,19 @@ fn handle(mut s: TcpStream) {
         open_table: Mutex::new(false),
         open_merchant: Mutex::new(false),
         trade_sel: Mutex::new(-1),
-        merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]), bow_draw: Mutex::new(None), dig: Mutex::new(None), eat_start: Mutex::new(None), blocking: Mutex::new(false), sprinting: Mutex::new(false), sneaking: Mutex::new(false), last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)), fall_fly: Mutex::new(false), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)), shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)), absorb: Mutex::new(0.0), pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+        bow_draw: Mutex::new(None),
+        dig: Mutex::new(None),
+        eat_start: Mutex::new(None),
+        blocking: Mutex::new(false),
+        sprinting: Mutex::new(false),
+        sneaking: Mutex::new(false),
+        last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        fall_fly: Mutex::new(false),
+        hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        absorb: Mutex::new(0.0),
+        pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
         seen: Mutex::new(HashSet::new()),
         chunks: Mutex::new(HashSet::new()),
         gen_sources: Mutex::new(gen),
@@ -12283,8 +17204,8 @@ fn handle(mut s: TcpStream) {
         lastp: Mutex::new((0.0, 0.0, 0.0)),
         spawn_pt: Mutex::new(None),
         skin: Mutex::new(None),
-    held: Mutex::new(0),
-    effs: Mutex::new(Vec::new()),
+        held: Mutex::new(0),
+        effs: Mutex::new(Vec::new()),
     });
     {
         let mut cls = clients().lock().unwrap();
@@ -12304,7 +17225,10 @@ fn handle(mut s: TcpStream) {
     }
     kick_skin(name.clone(), &me);
     // refresh armor points from restored inventory
-    { let iv = me.inv.lock().unwrap(); *me.armor_pts.lock().unwrap() = armor_pts_of(&iv); }
+    {
+        let iv = me.inv.lock().unwrap();
+        *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
+    }
     send_attrs(&me);
     sidebar_push(&me);
     // echo restored inventory slots so the client sees them
@@ -12335,8 +17259,11 @@ fn handle(mut s: TcpStream) {
     let mut rx = RxBuf::new();
     'conn: loop {
         if last_ka.elapsed() > Duration::from_secs(8) {
-            let mut ka = Vec::new(); ka.extend_from_slice(&1i64.to_be_bytes());
-            if send_packet(&mut *me.sock.lock().unwrap(), 0x26, ka).is_err() { break 'conn }
+            let mut ka = Vec::new();
+            ka.extend_from_slice(&1i64.to_be_bytes());
+            if send_packet(&mut *me.sock.lock().unwrap(), 0x26, ka).is_err() {
+                break 'conn;
+            }
             last_ka = Instant::now();
         }
         let (pid, b) = match rx.next(&mut s) {
@@ -12347,23 +17274,35 @@ fn handle(mut s: TcpStream) {
 
         match pid {
             0x0a => {
-                let Some(requested) = client_info_view_distance(&b) else { break 'conn; };
+                let Some(requested) = client_info_view_distance(&b) else {
+                    break 'conn;
+                };
                 let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);
                 if effective != view {
                     view = effective;
                     let (x, _, z, _, _, _) = *me.pos.lock().unwrap();
                     let mut chunks = me.chunks.lock().unwrap();
                     let mut gen = me.gen_sources.lock().unwrap();
-                    stream_chunks(&mut *me.sock.lock().unwrap(), &mut chunks, &mut gen,
-                        (x / 16.0).floor() as i32, (z / 16.0).floor() as i32, view);
+                    stream_chunks(
+                        &mut *me.sock.lock().unwrap(),
+                        &mut chunks,
+                        &mut gen,
+                        (x / 16.0).floor() as i32,
+                        (z / 16.0).floor() as i32,
+                        view,
+                    );
                 }
             }
-            0x1a | 0x1b => { // position / position_look: f64 x,y,z first
+            0x1a | 0x1b => {
+                // position / position_look: f64 x,y,z first
                 if b.len() >= 24 {
                     let px = f64::from_be_bytes(b[..8].try_into().unwrap());
                     let py = f64::from_be_bytes(b[8..16].try_into().unwrap());
                     let pz = f64::from_be_bytes(b[16..24].try_into().unwrap());
-                    let (mut yaw, mut pitch, mut gnd) = { let p = me.pos.lock().unwrap(); (p.3, p.4, p.5) };
+                    let (mut yaw, mut pitch, mut gnd) = {
+                        let p = me.pos.lock().unwrap();
+                        (p.3, p.4, p.5)
+                    };
                     if pid == 0x1b && b.len() >= 33 {
                         yaw = f32::from_be_bytes(b[24..28].try_into().unwrap());
                         pitch = f32::from_be_bytes(b[28..32].try_into().unwrap());
@@ -12372,7 +17311,10 @@ fn handle(mut s: TcpStream) {
                         gnd = b[24] != 0;
                     }
                     {
-                        let prev_gnd = { let p = me.pos.lock().unwrap(); p.5 };
+                        let prev_gnd = {
+                            let p = me.pos.lock().unwrap();
+                            p.5
+                        };
                         *me.pos.lock().unwrap() = (px, py, pz, yaw, pitch, gnd);
                         landing::player_move(&me, prev_gnd);
                     }
@@ -12383,30 +17325,48 @@ fn handle(mut s: TcpStream) {
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let mut ch = me.chunks.lock().unwrap();
                             let mut gen = me.gen_sources.lock().unwrap();
-                            stream_chunks(&mut *me.sock.lock().unwrap(), &mut ch, &mut gen, ccx, ccz, view)
-                        })).is_ok();
+                            stream_chunks(
+                                &mut *me.sock.lock().unwrap(),
+                                &mut ch,
+                                &mut gen,
+                                ccx,
+                                ccz,
+                                view,
+                            )
+                        }))
+                        .is_ok();
 
                         let _ = ok;
                     }
-                    broadcast_seen(me.eid, |_c| (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, gnd)));
-                    if pid == 0x1b { broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw))); }
+                    broadcast_seen(me.eid, |_c| {
+                        (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, gnd))
+                    });
+                    if pid == 0x1b {
+                        broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw)));
+                    }
                 }
             }
-            0x1c => { // look: yaw,pitch only
+            0x1c => {
+                // look: yaw,pitch only
                 if b.len() >= 9 {
                     let yaw = f32::from_be_bytes(b[..4].try_into().unwrap());
                     let pitch = f32::from_be_bytes(b[4..8].try_into().unwrap());
                     let mut p = me.pos.lock().unwrap();
                     let prev_gnd = p.5;
-                    p.3 = yaw; p.4 = pitch; p.5 = b[8] != 0;
+                    p.3 = yaw;
+                    p.4 = pitch;
+                    p.5 = b[8] != 0;
                     let (px, py, pz, g) = (p.0, p.1, p.2, p.5);
                     drop(p);
                     landing::player_move(&me, prev_gnd);
-                    broadcast_seen(me.eid, |_c| (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, g)));
+                    broadcast_seen(me.eid, |_c| {
+                        (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, g))
+                    });
                     broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw)));
                 }
             }
-            0x25 => { // entity_action: sneak/sprint start/stop -> entity flags+pose
+            0x25 => {
+                // entity_action: sneak/sprint start/stop -> entity flags+pose
                 let mut sl = &b[..];
                 let _eid = read_varint(&mut sl);
                 if let Some(act) = read_varint(&mut sl) {
@@ -12424,31 +17384,60 @@ fn handle(mut s: TcpStream) {
                         // flags: sneak=0x02 sprint=0x08 fall_flying=0x80 ; pose: sneak=5 fall_fly=1 else standing=0
                         let mut p = Vec::new();
                         write_varint(&mut p, me.eid as i64);
-                        p.push(0); p.push(0);
+                        p.push(0);
+                        p.push(0);
                         p.push((sneak as u8) * 2 | (sprint as u8) * 8 | (glide as u8) * 0x80);
-                        p.push(6); write_varint(&mut p, 21);
-                        write_varint(&mut p, if glide { 1 } else if sneak { 5 } else { 0 });
+                        p.push(6);
+                        write_varint(&mut p, 21);
+                        write_varint(
+                            &mut p,
+                            if glide {
+                                1
+                            } else if sneak {
+                                5
+                            } else {
+                                0
+                            },
+                        );
                         p.push(0xff);
                         broadcast_seen(me.eid, |_c| (0x58, p.clone()));
                     }
                 }
             }
-            0x2f => { // held_item_slot: i16
-                if b.len() >= 2 { held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8); *me.held.lock().unwrap() = held_slot; }
+            0x2f => {
+                // held_item_slot: i16
+                if b.len() >= 2 {
+                    held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8);
+                    *me.held.lock().unwrap() = held_slot;
+                }
             }
-            0x1d => { // flying: onGround only
+            0x1d => {
+                // flying: onGround only
                 if !b.is_empty() {
-                    let mut p = me.pos.lock().unwrap(); let prev_gnd = p.5; p.5 = b[0] != 0;
+                    let mut p = me.pos.lock().unwrap();
+                    let prev_gnd = p.5;
+                    p.5 = b[0] != 0;
                     drop(p);
                     landing::player_move(&me, prev_gnd);
                 }
             }
-            0x24 => { // block_dig
+            0x24 => {
+                // block_dig
                 let mut sl = &b[..];
                 let status = read_varint(&mut sl).unwrap_or(-1);
-                let (x, y, z) = if sl.len() >= 8 { read_pos(&sl[..8]) } else { (0, 0, 0) };
-                let seq = if sl.len() >= 9 { let mut s2 = &sl[9..]; read_varint(&mut s2).unwrap_or(0) } else { 0 };
-                if status == 5 { // finish using item (bow release / lower shield)
+                let (x, y, z) = if sl.len() >= 8 {
+                    read_pos(&sl[..8])
+                } else {
+                    (0, 0, 0)
+                };
+                let seq = if sl.len() >= 9 {
+                    let mut s2 = &sl[9..];
+                    read_varint(&mut s2).unwrap_or(0)
+                } else {
+                    0
+                };
+                if status == 5 {
+                    // finish using item (bow release / lower shield)
                     *me.blocking.lock().unwrap() = false;
                     let eat0 = me.eat_start.lock().unwrap().take();
                     if let Some(t0) = eat0 {
@@ -12458,51 +17447,127 @@ fn handle(mut s: TcpStream) {
                             continue;
                         }
                     }
-                    let draw_t = me.bow_draw.lock().unwrap().take().map(|st| st.elapsed().as_secs_f32()).unwrap_or(0.0);
+                    let draw_t = me
+                        .bow_draw
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .map(|st| st.elapsed().as_secs_f32())
+                        .unwrap_or(0.0);
                     if draw_t > 0.0 {
-                        let arrow_slot = me.inv.lock().unwrap().iter()
-                            .find(|(_, (i, c, _))| *i == 802 && *c > 0).map(|(&sl, _)| sl);
-                        let (hit, _) = { let inv = me.inv.lock().unwrap();
-                            (inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0), 0) };
+                        let arrow_slot = me
+                            .inv
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|(_, (i, c, _))| *i == 802 && *c > 0)
+                            .map(|(&sl, _)| sl);
+                        let (hit, _) = {
+                            let inv = me.inv.lock().unwrap();
+                            (inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0), 0)
+                        };
                         let charge_t = (draw_t / 1.19).min(1.0);
-                        let qc = { let i2 = me.inv.lock().unwrap();
-                            enchant_level(&i2.get(&(36 + held_slot)).map(|v| v.2.clone()).unwrap_or_default(), 29) };
-                        let can_fire = if hit == 801 { charge_t >= 0.1 }
-                            else { draw_t >= 1.25 - 0.25 * (qc as f32).min(5.0) };
+                        let qc = {
+                            let i2 = me.inv.lock().unwrap();
+                            enchant_level(
+                                &i2.get(&(36 + held_slot))
+                                    .map(|v| v.2.clone())
+                                    .unwrap_or_default(),
+                                29,
+                            )
+                        };
+                        let can_fire = if hit == 801 {
+                            charge_t >= 0.1
+                        } else {
+                            draw_t >= 1.25 - 0.25 * (qc as f32).min(5.0)
+                        };
                         if (hit == 801 || hit == 1192) && arrow_slot.is_some() && can_fire {
                             let asl = arrow_slot.unwrap();
                             let pow_f = (charge_t * charge_t + 2.0 * charge_t) / 3.0;
-                            let inf = { let i2 = me.inv.lock().unwrap();
-                                enchant_level(&i2.get(&(36 + held_slot)).map(|v| v.2.clone()).unwrap_or_default(), 16) > 0 };
-                            if !inf { let mut inv = me.inv.lock().unwrap();
-                              let n = inv[&asl].1 - 1;
-                              if n == 0 { inv.remove(&asl); } else { inv.get_mut(&asl).unwrap().1 = n; } }
+                            let inf = {
+                                let i2 = me.inv.lock().unwrap();
+                                enchant_level(
+                                    &i2.get(&(36 + held_slot))
+                                        .map(|v| v.2.clone())
+                                        .unwrap_or_default(),
+                                    16,
+                                ) > 0
+                            };
+                            if !inf {
+                                let mut inv = me.inv.lock().unwrap();
+                                let n = inv[&asl].1 - 1;
+                                if n == 0 {
+                                    inv.remove(&asl);
+                                } else {
+                                    inv.get_mut(&asl).unwrap().1 = n;
+                                }
+                            }
                             let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
-                            let yr = (yaw as f64).to_radians(); let pr = (pitch as f64).to_radians();
+                            let yr = (yaw as f64).to_radians();
+                            let pr = (pitch as f64).to_radians();
                             // bow enchants: power scales arrow dmg, flame ignites, punch knocks
-                            let held_c = { let i2 = me.inv.lock().unwrap();
-                                i2.get(&(36 + held_slot)).map(|v| v.2.clone()).unwrap_or_default() };
+                            let held_c = {
+                                let i2 = me.inv.lock().unwrap();
+                                i2.get(&(36 + held_slot))
+                                    .map(|v| v.2.clone())
+                                    .unwrap_or_default()
+                            };
                             let pw = enchant_level(&held_c, 25);
                             let fl = enchant_level(&held_c, 12);
                             let pu = enchant_level(&held_c, 28);
-                            let pi = if hit == 1192 { enchant_level(&held_c, 24) } else { 0 };
-                            let a = Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), owner: me.eid,
-                                x, y: y + 1.5, z,
-                                dx: -yr.sin() * pr.cos() * 2.5 * pow_f as f64, dy: -pr.sin() * 2.5 * pow_f as f64, dz: yr.cos() * pr.cos() * 2.5 * pow_f as f64, ttl: server_ticks(ARROW_TTL_GT) as i32,
-                                dmg: 6.0 * pow_f * (1.0 + 0.25 * pw as f32), fire: (fl > 0) as i32 * 20, punch: pu as i32,
-                                kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(), pierce: pi as i32, last_hit: -1, stuck: false };
+                            let pi = if hit == 1192 {
+                                enchant_level(&held_c, 24)
+                            } else {
+                                0
+                            };
+                            let a = Arrow {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                owner: me.eid,
+                                x,
+                                y: y + 1.5,
+                                z,
+                                dx: -yr.sin() * pr.cos() * 2.5 * pow_f as f64,
+                                dy: -pr.sin() * 2.5 * pow_f as f64,
+                                dz: yr.cos() * pr.cos() * 2.5 * pow_f as f64,
+                                ttl: server_ticks(ARROW_TTL_GT) as i32,
+                                dmg: 6.0 * pow_f * (1.0 + 0.25 * pw as f32),
+                                fire: (fl > 0) as i32 * 20,
+                                punch: pu as i32,
+                                kind: 0,
+                                loy: 0,
+                                ret_item: 0,
+                                ret_comps: Vec::new(),
+                                pierce: pi as i32,
+                                last_hit: -1,
+                                stuck: false,
+                            };
                             let (admg, afire, apunch, apierce) = (a.dmg, a.fire, a.punch, a.pierce);
-                                                        arrows().lock().unwrap().push(a);
+                            arrows().lock().unwrap().push(a);
                             // multishot (crossbow): +2 arrows spread +-10deg
                             if hit == 1192 && enchant_level(&held_c, 23) > 0 {
                                 for off in [-0.1745f64, 0.1745] {
                                     let yr2 = yr + off;
-                                    arrows().lock().unwrap().push(Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                        owner: me.eid, x, y: y + 1.5, z,
-                                        dx: -yr2.sin() * pr.cos() * 2.5 * pow_f as f64, dy: -pr.sin() * 2.5 * pow_f as f64,
-                                        dz: yr2.cos() * pr.cos() * 2.5 * pow_f as f64, ttl: server_ticks(ARROW_TTL_GT) as i32,
-                                        dmg: admg, fire: afire, punch: apunch, kind: 0, loy: 0, ret_item: 0, ret_comps: Vec::new(),
-                                        pierce: apierce, last_hit: -1, stuck: false });
+                                    arrows().lock().unwrap().push(Arrow {
+                                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                        owner: me.eid,
+                                        x,
+                                        y: y + 1.5,
+                                        z,
+                                        dx: -yr2.sin() * pr.cos() * 2.5 * pow_f as f64,
+                                        dy: -pr.sin() * 2.5 * pow_f as f64,
+                                        dz: yr2.cos() * pr.cos() * 2.5 * pow_f as f64,
+                                        ttl: server_ticks(ARROW_TTL_GT) as i32,
+                                        dmg: admg,
+                                        fire: afire,
+                                        punch: apunch,
+                                        kind: 0,
+                                        loy: 0,
+                                        ret_item: 0,
+                                        ret_comps: Vec::new(),
+                                        pierce: apierce,
+                                        last_hit: -1,
+                                        stuck: false,
+                                    });
                                 }
                             }
                             // spawn streams via interest_tick
@@ -12511,176 +17576,317 @@ fn handle(mut s: TcpStream) {
                                 let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
                                 broadcast(-1, |_c| (0x68, snd.clone()));
                             }
-                            { let inv = me.inv.lock().unwrap().get(&asl).cloned();
-                              let mut p = vec![4u8]; write_varint(&mut p, 0);
-                              p.extend_from_slice(&(36i16 + held_slot as i16).to_be_bytes());
-                              let held_now = { let i2 = me.inv.lock().unwrap(); i2.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new())) };
-                              p.extend_from_slice(&slot_wire(&held_now));
-                              let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
-                              let mut p2 = vec![4u8]; write_varint(&mut p2, 0);
-                              p2.extend_from_slice(&asl.to_be_bytes());
-                              let iv = inv.unwrap_or((0, 0, Vec::new()));
-                              p2.extend_from_slice(&slot_wire(&iv));
-                              let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p2); }
+                            {
+                                let inv = me.inv.lock().unwrap().get(&asl).cloned();
+                                let mut p = vec![4u8];
+                                write_varint(&mut p, 0);
+                                p.extend_from_slice(&(36i16 + held_slot as i16).to_be_bytes());
+                                let held_now = {
+                                    let i2 = me.inv.lock().unwrap();
+                                    i2.get(&(36 + held_slot))
+                                        .cloned()
+                                        .unwrap_or((0, 0, Vec::new()))
+                                };
+                                p.extend_from_slice(&slot_wire(&held_now));
+                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                let mut p2 = vec![4u8];
+                                write_varint(&mut p2, 0);
+                                p2.extend_from_slice(&asl.to_be_bytes());
+                                let iv = inv.unwrap_or((0, 0, Vec::new()));
+                                p2.extend_from_slice(&slot_wire(&iv));
+                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p2);
+                            }
                         }
-                        if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= 0.1 { // trident throw
-                            let held_st = { let i2 = me.inv.lock().unwrap();
-                                i2.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new())) };
+                        if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= 0.1 {
+                            // trident throw
+                            let held_st = {
+                                let i2 = me.inv.lock().unwrap();
+                                i2.get(&(36 + held_slot))
+                                    .cloned()
+                                    .unwrap_or((0, 0, Vec::new()))
+                            };
                             let loy = enchant_level(&held_st.2, 19);
                             let imp = enchant_level(&held_st.2, 15) as f32 * 2.5;
                             let chan = enchant_level(&held_st.2, 5);
                             // survival consumes the thrown trident; it lands as a
                             // pickupable drop (or returns at owner's feet w/ loyalty)
-                            if *me.gm.lock().unwrap() != 1 { let mut inv = me.inv.lock().unwrap();
+                            if *me.gm.lock().unwrap() != 1 {
+                                let mut inv = me.inv.lock().unwrap();
                                 let hs = 36 + held_slot;
                                 if let Some(st) = inv.get_mut(&hs) {
-                                    if st.1 <= 1 { inv.remove(&hs); } else { st.1 -= 1; } } }
+                                    if st.1 <= 1 {
+                                        inv.remove(&hs);
+                                    } else {
+                                        st.1 -= 1;
+                                    }
+                                }
+                            }
                             let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
-                            let yr = (yaw as f64).to_radians(); let pr = (pitch as f64).to_radians();
-                            arrows().lock().unwrap().push(Arrow { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                owner: me.eid, x, y: y + 1.5, z,
-                                dx: -yr.sin() * pr.cos() * 2.2, dy: -pr.sin() * 2.2, dz: yr.cos() * pr.cos() * 2.2,
-                                ttl: server_ticks(ARROW_TTL_GT) as i32, dmg: 8.0 + imp, fire: 0, punch: chan as i32,
-                                kind: 1, loy, ret_item: held_st.0, ret_comps: held_st.2.clone(),
-                                pierce: 0, last_hit: -1, stuck: false });
+                            let yr = (yaw as f64).to_radians();
+                            let pr = (pitch as f64).to_radians();
+                            arrows().lock().unwrap().push(Arrow {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                owner: me.eid,
+                                x,
+                                y: y + 1.5,
+                                z,
+                                dx: -yr.sin() * pr.cos() * 2.2,
+                                dy: -pr.sin() * 2.2,
+                                dz: yr.cos() * pr.cos() * 2.2,
+                                ttl: server_ticks(ARROW_TTL_GT) as i32,
+                                dmg: 8.0 + imp,
+                                fire: 0,
+                                punch: chan as i32,
+                                kind: 1,
+                                loy,
+                                ret_item: held_st.0,
+                                ret_comps: held_st.2.clone(),
+                                pierce: 0,
+                                last_hit: -1,
+                                stuck: false,
+                            });
                             held_slot_resync(&me);
                         }
                     }
                 }
-                if status == 6 { // swap_item_in_hand: held <-> offhand (F key)
+                if status == 6 {
+                    // swap_item_in_hand: held <-> offhand (F key)
                     let hs = 36 + held_slot;
                     let mut inv = me.inv.lock().unwrap();
                     let a = inv.remove(&hs).unwrap_or((0, 0, Vec::new()));
                     let b = inv.remove(&45i16).unwrap_or((0, 0, Vec::new()));
-                    if b.1 > 0 { inv.insert(hs, b.clone()); }
-                    if a.1 > 0 { inv.insert(45, a.clone()); }
+                    if b.1 > 0 {
+                        inv.insert(hs, b.clone());
+                    }
+                    if a.1 > 0 {
+                        inv.insert(45, a.clone());
+                    }
                     drop(inv);
                     resync_slot(&me, 0, hs, &b);
                     resync_slot(&me, 0, 45, &a);
                 }
-                if status == 3 || status == 4 { // DROP_ALL_ITEMS (ctrl+Q) / DROP_ITEM (Q)
-                    {   // vanilla: Q-drop works in creative too
+                if status == 3 || status == 4 {
+                    // DROP_ALL_ITEMS (ctrl+Q) / DROP_ITEM (Q)
+                    {
+                        // vanilla: Q-drop works in creative too
                         let hs = 36 + held_slot;
-                        let it = { let mut inv = me.inv.lock().unwrap();
+                        let it = {
+                            let mut inv = me.inv.lock().unwrap();
                             let take = inv.get(&hs).map(|st| if status == 3 { st.1 } else { 1 });
-                            take.and_then(|t| inv.get(&hs).map(|st| (st.0, t, st.1 <= t, st.2.clone())))
-                                .map(|(item, t, clear, comps)| {
-                                    if clear { inv.remove(&hs); } else { inv.get_mut(&hs).unwrap().1 -= t; }
-                                    (item, t, comps)
-                                }) };
+                            take.and_then(|t| {
+                                inv.get(&hs).map(|st| (st.0, t, st.1 <= t, st.2.clone()))
+                            })
+                            .map(|(item, t, clear, comps)| {
+                                if clear {
+                                    inv.remove(&hs);
+                                } else {
+                                    inv.get_mut(&hs).unwrap().1 -= t;
+                                }
+                                (item, t, comps)
+                            })
+                        };
                         if let Some((item, cnt, comps)) = it {
-                            let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                            drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: px, y: py + 1.3, z: pz, item, cnt, comps, age: 0 });
-                            {   let mut p = vec![0u8]; write_varint(&mut p, 0);
+                            let (px, py, pz, ..) = {
+                                let p = me.pos.lock().unwrap();
+                                *p
+                            };
+                            drops().lock().unwrap().push(Drop {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: px,
+                                y: py + 1.3,
+                                z: pz,
+                                item,
+                                cnt,
+                                comps,
+                                age: 0,
+                            });
+                            {
+                                let mut p = vec![0u8];
+                                write_varint(&mut p, 0);
                                 p.extend_from_slice(&hs.to_be_bytes());
-                                let now = me.inv.lock().unwrap().get(&hs).cloned().unwrap_or((0,0,Vec::new()));
+                                let now = me.inv.lock().unwrap().get(&hs).cloned().unwrap_or((
+                                    0,
+                                    0,
+                                    Vec::new(),
+                                ));
                                 p.extend_from_slice(&slot_wire(&now));
-                                if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); } }
+                                if let Ok(mut w) = me.sock.lock() {
+                                    let _ = send_packet(&mut *w, 0x15, p);
+                                }
+                            }
                         }
                     }
                 }
-                if status == 1 { *me.dig.lock().unwrap() = None; } // aborted dig
+                if status == 1 {
+                    *me.dig.lock().unwrap() = None;
+                } // aborted dig
                 if status == 0 || status == 2 {
                     // vanilla block_interaction_range: 4.5 survival / 5.0 creative
                     let (px, py, pz, ..) = *me.pos.lock().unwrap();
                     let gm_creative = *me.gm.lock().unwrap() == 1;
                     let reach = if gm_creative { 5.6f64 } else { 4.9 };
-                    let (ddx, ddy, ddz) = (x as f64 + 0.5 - px, y as f64 + 0.5 - (py + 1.62), z as f64 + 0.5 - pz);
+                    let (ddx, ddy, ddz) = (
+                        x as f64 + 0.5 - px,
+                        y as f64 + 0.5 - (py + 1.62),
+                        z as f64 + 0.5 - pz,
+                    );
                     let in_range = ddx * ddx + ddy * ddy + ddz * ddz <= reach * reach;
                     let old = block_at(x, y, z);
-                    let held = { let inv = me.inv.lock().unwrap(); inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new())) };
-                    let req = if in_range { dig_seconds(old as i64, &held) } else { None };
+                    let held = {
+                        let inv = me.inv.lock().unwrap();
+                        inv.get(&(36 + held_slot))
+                            .cloned()
+                            .unwrap_or((0, 0, Vec::new()))
+                    };
+                    let req = if in_range {
+                        dig_seconds(old as i64, &held)
+                    } else {
+                        None
+                    };
                     // vanilla dig timing: survival needs the destroy duration for
                     // the block+tool; finish packets arriving early are rejected.
                     let mut break_now = false;
                     if in_range && old != 0 {
-                        if (gm_creative && status == 0) || req == Some(0.0) { break_now = true; }
-                        else if let Some(t) = req {
+                        if (gm_creative && status == 0) || req == Some(0.0) {
+                            break_now = true;
+                        } else if let Some(t) = req {
                             if status == 0 {
                                 *me.dig.lock().unwrap() = Some((x, y, z, Instant::now()));
                             } else {
-                                let t0 = me.dig.lock().unwrap()
-                                    .and_then(|d| if (d.0, d.1, d.2) == (x, y, z) { Some(d.3) } else { None });
-                                if t0.map(|t0| t0.elapsed().as_secs_f32() >= t * 0.7).unwrap_or(false) { break_now = true; }
+                                let t0 = me.dig.lock().unwrap().and_then(|d| {
+                                    if (d.0, d.1, d.2) == (x, y, z) {
+                                        Some(d.3)
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if t0
+                                    .map(|t0| t0.elapsed().as_secs_f32() >= t * 0.7)
+                                    .unwrap_or(false)
+                                {
+                                    break_now = true;
+                                }
                             }
                         }
                     }
-                    if break_now { *me.dig.lock().unwrap() = None; }
+                    if break_now {
+                        *me.dig.lock().unwrap() = None;
+                    }
                     if !break_now && status == 2 && old != 0 {
                         note_block_update(x, y, z, old); // rejected: resync truth
                     }
                     if break_now {
-                    set_block(x, y, z, 0);
-                    note_block_update(x, y, z, 0);
-                    if *me.gm.lock().unwrap() != 1 {
-                    *me.walk_acc.lock().unwrap() += 0.005; // block-break exhaustion
-                    // vanilla: breaking a block damages the held tool
-                    if tool_max_damage(held.0).is_some() || comp_get(&held.2, COMP_MAX_DAMAGE).is_some() {
-                        if damage_held(&me) {
-                            let (pxx, pyy, pzz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                            let snd = sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
-                            broadcast(-1, |_c| (0x68, snd.clone()));
+                        set_block(x, y, z, 0);
+                        note_block_update(x, y, z, 0);
+                        if *me.gm.lock().unwrap() != 1 {
+                            *me.walk_acc.lock().unwrap() += 0.005; // block-break exhaustion
+                                                                   // vanilla: breaking a block damages the held tool
+                            if tool_max_damage(held.0).is_some()
+                                || comp_get(&held.2, COMP_MAX_DAMAGE).is_some()
+                            {
+                                if damage_held(&me) {
+                                    let (pxx, pyy, pzz, ..) = {
+                                        let p = me.pos.lock().unwrap();
+                                        *p
+                                    };
+                                    let snd =
+                                        sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
+                                    broadcast(-1, |_c| (0x68, snd.clone()));
+                                }
+                                held_slot_resync(&me);
+                            }
+                            let silk = enchant_level(&held.2, 33) > 0;
+                            let fort = enchant_level(&held.2, 13).clamp(0, 3) as u8;
+                            // ore loot: (material drop, silk-touch drops the ore block
+                            // item instead, fortune multiplies the material count)
+                            let ore: Option<(i64, i64)> = match old {
+                                127 | 128 => Some((803, 62)),     // coal -> coal_ore
+                                125 | 126 => Some((810, 64)),     // raw_iron -> iron_ore
+                                123 | 124 => Some((814, 68)),     // raw_gold -> gold_ore
+                                4274 | 4275 => Some((805, 76)),   // diamond -> diamond_ore
+                                520 | 521 => Some((807, 74)),     // lapis -> lapis_ore
+                                5735..=5737 => Some((657, 70)),   // redstone -> redstone_ore
+                                22942..=22943 => Some((812, 66)), // raw_copper -> copper_ore
+                                7511 | 7512 => Some((806, 72)),   // emerald -> emerald_ore
+                                _ => None,
+                            };
+                            let (drop_item, drop_cnt) = if silk && ore.is_some() {
+                                (Some(ore.unwrap().1), 1)
+                            } else {
+                                let it = match old {
+                                    127 | 128 => Some(803),
+                                    125 | 126 => Some(810),
+                                    123 | 124 => Some(814),
+                                    4274 | 4275 => Some(805),
+                                    520 | 521 => Some(807),
+                                    5735..=5737 => Some(657),
+                                    22942..=22943 => Some(812),
+                                    7511 | 7512 => Some(806),
+                                    4278..=4285 => Some(853), // wheat -> seeds
+                                    _ => block_drop(old),
+                                };
+                                let n = if fort > 0 && ore.is_some() {
+                                    1 + (world_rng::next_u64() % (fort as u64 + 1)) as u8
+                                } else {
+                                    1
+                                };
+                                (it, n)
+                            };
+                            crops().lock().unwrap().remove(&(x, y, z));
+                            if old == 4285 {
+                                // ripe: extra wheat drop
+                                let d = Drop {
+                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                    x: x as f64 + 0.5,
+                                    y: y as f64 + 0.25,
+                                    z: z as f64 + 0.5,
+                                    item: 854,
+                                    cnt: 1,
+                                    comps: Vec::new(),
+                                    age: 0,
+                                };
+                                drops().lock().unwrap().push(d);
+                            }
+                            if let Some(item) = if !can_harvest(old as i64, held.0) {
+                                None
+                            } else {
+                                drop_item
+                            } {
+                                let d = Drop {
+                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                    x: x as f64 + 0.5,
+                                    y: y as f64 + 0.25,
+                                    z: z as f64 + 0.5,
+                                    item,
+                                    cnt: drop_cnt,
+                                    comps: Vec::new(),
+                                    age: 0,
+                                };
+                                drops().lock().unwrap().push(d);
+                            }
                         }
-                        held_slot_resync(&me);
-                    }
-                    let silk = enchant_level(&held.2, 33) > 0;
-                    let fort = enchant_level(&held.2, 13).clamp(0, 3) as u8;
-                    // ore loot: (material drop, silk-touch drops the ore block
-                    // item instead, fortune multiplies the material count)
-                    let ore: Option<(i64, i64)> = match old {
-                        127 | 128 => Some((803, 62)),   // coal -> coal_ore
-                        125 | 126 => Some((810, 64)),   // raw_iron -> iron_ore
-                        123 | 124 => Some((814, 68)),   // raw_gold -> gold_ore
-                        4274 | 4275 => Some((805, 76)), // diamond -> diamond_ore
-                        520 | 521 => Some((807, 74)),   // lapis -> lapis_ore
-                        5735..=5737 => Some((657, 70)), // redstone -> redstone_ore
-                        22942..=22943 => Some((812, 66)),// raw_copper -> copper_ore
-                        7511 | 7512 => Some((806, 72)), // emerald -> emerald_ore
-                        _ => None,
-                    };
-                    let (drop_item, drop_cnt) = if silk && ore.is_some() {
-                        (Some(ore.unwrap().1), 1)
-                    } else {
-                        let it = match old {
-                            127 | 128 => Some(803),
-                            125 | 126 => Some(810),
-                            123 | 124 => Some(814),
-                            4274 | 4275 => Some(805),
-                            520 | 521 => Some(807),
-                            5735..=5737 => Some(657),
-                            22942..=22943 => Some(812),
-                            7511 | 7512 => Some(806),
-                            4278..=4285 => Some(853), // wheat -> seeds
-                            _ => block_drop(old),
-                        };
-                        let n = if fort > 0 && ore.is_some() { 1 + (world_rng::next_u64() % (fort as u64 + 1)) as u8 } else { 1 };
-                        (it, n)
-                    };
-                    crops().lock().unwrap().remove(&(x, y, z));
-                    if old == 4285 { // ripe: extra wheat drop
-                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                            x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item: 854, cnt: 1, comps: Vec::new(), age: 0 };
-                        drops().lock().unwrap().push(d);
-                    }
-                    if let Some(item) = if !can_harvest(old as i64, held.0) { None } else { drop_item } {
-                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                            x: x as f64 + 0.5, y: y as f64 + 0.25, z: z as f64 + 0.5, item, cnt: drop_cnt, comps: Vec::new(), age: 0 };
-                        drops().lock().unwrap().push(d);
-                    }
-                    }
                     }
                 }
                 let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
             }
-            0x38 => { // block_place
+            0x38 => {
+                // block_place
                 let mut sl = &b[..];
                 let _hand = read_varint(&mut sl);
-                let (x, y, z) = if sl.len() >= 8 { read_pos(&sl[..8]) } else { (0, 0, 0) };
+                let (x, y, z) = if sl.len() >= 8 {
+                    read_pos(&sl[..8])
+                } else {
+                    (0, 0, 0)
+                };
                 let mut s2 = &sl[8.min(sl.len())..];
                 let face = read_varint(&mut s2).unwrap_or(1);
                 let _ = &s2[..13.min(s2.len())]; // cursor+inside
-                let seq = if s2.len() >= 13 { let mut s3 = &s2[13..]; read_varint(&mut s3).unwrap_or(0) } else { 0 };
+                let seq = if s2.len() >= 13 {
+                    let mut s3 = &s2[13..];
+                    read_varint(&mut s3).unwrap_or(0)
+                } else {
+                    0
+                };
                 // air-use form (1.21+): use_item arrives as block_place
                 // {-1,255,-1}, face -1 — dispatch to the shared item-use path
                 if x == -1 && y == 255 && z == -1 && face == -1 {
@@ -12692,8 +17898,16 @@ fn handle(mut s: TcpStream) {
                 // block interactions (containers/signs/buckets all below).
                 {
                     let (px, py, pz, ..) = *me.pos.lock().unwrap();
-                    let reach = if *me.gm.lock().unwrap() == 1 { 5.6f64 } else { 4.9 };
-                    let (rx, ry, rz) = (x as f64 + 0.5 - px, y as f64 + 0.5 - (py + 1.62), z as f64 + 0.5 - pz);
+                    let reach = if *me.gm.lock().unwrap() == 1 {
+                        5.6f64
+                    } else {
+                        4.9
+                    };
+                    let (rx, ry, rz) = (
+                        x as f64 + 0.5 - px,
+                        y as f64 + 0.5 - (py + 1.62),
+                        z as f64 + 0.5 - pz,
+                    );
                     if rx * rx + ry * ry + rz * rz > reach * reach {
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
@@ -12702,8 +17916,12 @@ fn handle(mut s: TcpStream) {
                 let (dx, dy, dz) = FACE_OFF[(face.clamp(0, 5)) as usize];
                 let (tx, ty, tz) = (x + dx, y + dy, z + dz);
                 // existing sign: right-click reopens the editor (front text)
-                if (4302..=4589).contains(&block_at(x, y, z)) || (19276..=19339).contains(&block_at(x, y, z)) {
-                    let mut op = Vec::new(); write_pos(&mut op, x, y, z); op.push(1);
+                if (4302..=4589).contains(&block_at(x, y, z))
+                    || (19276..=19339).contains(&block_at(x, y, z))
+                {
+                    let mut op = Vec::new();
+                    write_pos(&mut op, x, y, z);
+                    op.push(1);
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x34, op);
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
@@ -12713,8 +17931,12 @@ fn handle(mut s: TcpStream) {
                     // adjacent chest -> vanilla double chest (54 slots); deterministic order: north(-z)/west(-x) first
                     let nb = if is_chest_pairable(block_at(x, y, z)) {
                         [(x - 1, y, z), (x + 1, y, z), (x, y, z - 1), (x, y, z + 1)]
-                            .iter().copied().find(|&(nx, ny, nz)| is_chest_pairable(block_at(nx, ny, nz)))
-                    } else { None };
+                            .iter()
+                            .copied()
+                            .find(|&(nx, ny, nz)| is_chest_pairable(block_at(nx, ny, nz)))
+                    } else {
+                        None
+                    };
                     let (a, b) = match nb {
                         Some(n2) if (n2.2, n2.0) < (z, x) => (n2, Some((x, y, z))),
                         Some(n2) => ((x, y, z), Some(n2)),
@@ -12731,31 +17953,53 @@ fn handle(mut s: TcpStream) {
                     let key = ender_key(&me.uuid);
                     *me.open_chest.lock().unwrap() = Some((key, None));
                     let inv = me.inv.lock().unwrap().clone();
-                    open_chest_window(&mut *me.sock.lock().unwrap(), key, None, &inv, "Ender Chest");
+                    open_chest_window(
+                        &mut *me.sock.lock().unwrap(),
+                        key,
+                        None,
+                        &inv,
+                        "Ender Chest",
+                    );
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 // flint & steel on TNT -> ignite
                 if (2094..=2095).contains(&block_at(x, y, z))
-                    && me.inv.lock().unwrap().get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0) == 798 {
+                    && me
+                        .inv
+                        .lock()
+                        .unwrap()
+                        .get(&(36 + held_slot))
+                        .map(|v| v.0)
+                        .unwrap_or(0)
+                        == 798
+                {
                     set_block(x, y, z, 0);
                     note_block_update(x, y, z, 0);
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    primed().lock().unwrap().push(Primed { eid, x: x as f64 + 0.5, y: y as f64 + 0.5, z: z as f64 + 0.5, left: server_ticks(TNT_FUSE_GT) as i32 });
+                    primed().lock().unwrap().push(Primed {
+                        eid,
+                        x: x as f64 + 0.5,
+                        y: y as f64 + 0.5,
+                        z: z as f64 + 0.5,
+                        left: server_ticks(TNT_FUSE_GT) as i32,
+                    });
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
                 if block_at(x, y, z) == name_to_state("crafting_table").unwrap_or(u32::MAX) {
                     *me.open_table.lock().unwrap() = true;
                     let mut p = Vec::new();
-                    write_varint(&mut p, 3);        // windowId 3
-                    write_varint(&mut p, 12);       // crafting menu
+                    write_varint(&mut p, 3); // windowId 3
+                    write_varint(&mut p, 12); // crafting menu
                     p.extend_from_slice(&chat_nbt("Crafting"));
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x33, p);
                     let mut q = vec![3u8];
                     write_varint(&mut q, 0);
                     write_varint(&mut q, 46);
-                    for _ in 0..46 { q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); }
+                    for _ in 0..46 {
+                        q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                    }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x13, q);
                     // now fill: grid empty, inv slots
@@ -12763,9 +18007,12 @@ fn handle(mut s: TcpStream) {
                     let mut r = vec![3u8];
                     write_varint(&mut r, 0);
                     write_varint(&mut r, 46);
-                    for _ in 0..10 { r.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); }
+                    for _ in 0..10 {
+                        r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                    }
                     for wsl in 10..46i16 {
-                        let (it, c, _cc) = inv.get(&(wsl - 1)).cloned().unwrap_or((0, 0, Vec::new()));
+                        let (it, c, _cc) =
+                            inv.get(&(wsl - 1)).cloned().unwrap_or((0, 0, Vec::new()));
                         r.extend_from_slice(&slot_wire(&(it, c, _cc)));
                     }
                     r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
@@ -12781,7 +18028,10 @@ fn handle(mut s: TcpStream) {
                     continue;
                 }
                 // buckets: empty fills from source; filled places liquid
-                let held_b = { let inv = me.inv.lock().unwrap(); inv.get(&(36 + held_slot)).cloned() };
+                let held_b = {
+                    let inv = me.inv.lock().unwrap();
+                    inv.get(&(36 + held_slot)).cloned()
+                };
                 if let Some((item, cnt, _hc)) = held_b {
                     let src = block_at(x, y, z);
                     if item == 908 && (src == 80 || src == 96) {
@@ -12796,7 +18046,10 @@ fn handle(mut s: TcpStream) {
                         } else {
                             inv.insert(36 + held_slot, (fi, 1, Vec::new()));
                         }
-                        let (i2, c2, _cc) = inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new()));
+                        let (i2, c2, _cc) =
+                            inv.get(&(36 + held_slot))
+                                .cloned()
+                                .unwrap_or((0, 0, Vec::new()));
                         drop(inv);
                         let mut p = vec![0u8];
                         write_varint(&mut p, 0);
@@ -12806,7 +18059,10 @@ fn handle(mut s: TcpStream) {
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
                     }
-                    let replaceable = matches!(block_at(tx, ty, tz), 0 | 2005 | 2006 | 2007 | 2075 | 2077 | 10756 | 5772..=5779);
+                    let replaceable = matches!(
+                        block_at(tx, ty, tz),
+                        0 | 2005 | 2006 | 2007 | 2075 | 2077 | 10756 | 5772..=5779
+                    );
                     if (item == 909 || item == 910) && replaceable {
                         let st = if item == 909 { 80 } else { 96 };
                         place_block(tx, ty, tz, st);
@@ -12829,7 +18085,8 @@ fn handle(mut s: TcpStream) {
                     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
                     if wt >= 13000 && wt <= 23500 {
                         WORLD_TIME.store(0, Ordering::Relaxed);
-                        *me.spawn_pt.lock().unwrap() = Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5));
+                        *me.spawn_pt.lock().unwrap() =
+                            Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5));
                         let mut sp = Vec::new();
                         write_pos(&mut sp, x, y, z);
                         sp.extend_from_slice(&0.0f32.to_be_bytes());
@@ -12872,7 +18129,10 @@ fn handle(mut s: TcpStream) {
                     continue;
                 }
                 // hotbar slots are window slots 36..=44
-                let held = { let inv = me.inv.lock().unwrap(); inv.get(&(36 + held_slot)).cloned() };
+                let held = {
+                    let inv = me.inv.lock().unwrap();
+                    inv.get(&(36 + held_slot)).cloned()
+                };
                 // bone meal on crops: +2..4 stages, consume 1
                 if let Some((960, _, _)) = held {
                     let cst = block_at(x, y, z);
@@ -12886,9 +18146,16 @@ fn handle(mut s: TcpStream) {
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
                             if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
-                                if c <= 1 { inv.remove(&(36 + held_slot)); } else { inv.insert(36 + held_slot, (it, c - 1, _cc)); }
+                                if c <= 1 {
+                                    inv.remove(&(36 + held_slot));
+                                } else {
+                                    inv.insert(36 + held_slot, (it, c - 1, _cc));
+                                }
                             }
-                            let (it, c, _cc) = inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new()));
+                            let (it, c, _cc) =
+                                inv.get(&(36 + held_slot))
+                                    .cloned()
+                                    .unwrap_or((0, 0, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
                             write_varint(&mut p, 0);
@@ -12912,16 +18179,25 @@ fn handle(mut s: TcpStream) {
                         continue;
                     }
                     // wheat seeds on farmland -> wheat age0 + consume seed
-                    if item == 853 && block_at(x, y, z) == name_to_state("farmland").unwrap_or(u32::MAX) {
+                    if item == 853
+                        && block_at(x, y, z) == name_to_state("farmland").unwrap_or(u32::MAX)
+                    {
                         set_block(tx, ty, tz, 4278);
                         crops().lock().unwrap().insert((tx, ty, tz), 0);
                         note_block_update(tx, ty, tz, 4278);
                         if *me.gm.lock().unwrap() != 1 {
                             let mut inv = me.inv.lock().unwrap();
                             if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
-                                if c <= 1 { inv.remove(&(36 + held_slot)); } else { inv.insert(36 + held_slot, (it, c - 1, _cc)); }
+                                if c <= 1 {
+                                    inv.remove(&(36 + held_slot));
+                                } else {
+                                    inv.insert(36 + held_slot, (it, c - 1, _cc));
+                                }
                             }
-                            let (it, c, _cc) = inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new()));
+                            let (it, c, _cc) =
+                                inv.get(&(36 + held_slot))
+                                    .cloned()
+                                    .unwrap_or((0, 0, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
                             write_varint(&mut p, 0);
@@ -12935,11 +18211,16 @@ fn handle(mut s: TcpStream) {
                 }
                 if let Some((item, _cnt, _)) = held {
                     if let Some(sb) = sign_base_for_item(item) {
-                        let yaw = { let p = me.pos.lock().unwrap(); p.3 } as f64;
+                        let yaw = {
+                            let p = me.pos.lock().unwrap();
+                            p.3
+                        } as f64;
                         let rot = (((180.0 + yaw) * 16.0 / 360.0 + 0.5) as i64 & 15) as u32;
                         let st = sb + rot * 2 + 1;
                         place_block(tx, ty, tz, st);
-                        let mut op = Vec::new(); write_pos(&mut op, tx, ty, tz); op.push(1);
+                        let mut op = Vec::new();
+                        write_pos(&mut op, tx, ty, tz);
+                        op.push(1);
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x34, op);
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
                         continue;
@@ -12950,40 +18231,52 @@ fn handle(mut s: TcpStream) {
                 }
                 let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
             }
-            0x36 => { // arm_animation: relay swing to others
-                broadcast_seen(me.eid, |_c| (0x03, {
-                    let mut p = Vec::new();
-                    write_varint(&mut p, me.eid as i64);
-                    p.push(0);
-                    p
-                }));
+            0x36 => {
+                // arm_animation: relay swing to others
+                broadcast_seen(me.eid, |_c| {
+                    (0x03, {
+                        let mut p = Vec::new();
+                        write_varint(&mut p, me.eid as i64);
+                        p.push(0);
+                        p
+                    })
+                });
             }
-            0x39 => { // use_item: ack + eat + bow draw
+            0x39 => {
+                // use_item: ack + eat + bow draw
                 let mut sl = &b[..];
                 let _h = read_varint(&mut sl);
                 let seq = read_varint(&mut sl).unwrap_or(0);
                 air_use_item(&me, held_slot, seq, _h, false);
             }
-            0x04 | 0x05 => { // chat_command(+signed): command string (no leading /)
+            0x04 | 0x05 => {
+                // chat_command(+signed): command string (no leading /)
                 let mut sl = &b[..];
                 if let Some(mlen) = read_varint(&mut sl) {
-                    let m = String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
+                    let m =
+                        String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
 
                     run_command(Some(&me), &format!("/{}", m), &mut Some(&mut s));
                 }
             }
-            0x06 => { // chat_message: first field = message string
+            0x06 => {
+                // chat_message: first field = message string
                 let mut sl = &b[..];
                 if let Some(mlen) = read_varint(&mut sl) {
-                    let m = String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
-                    if m.starts_with('/') { run_command(Some(&me), &m, &mut Some(&mut s)); continue; }
+                    let m =
+                        String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
+                    if m.starts_with('/') {
+                        run_command(Some(&me), &m, &mut Some(&mut s));
+                        continue;
+                    }
                     let line = format!("<{}> {}", me.name, m);
                     let pl = system_chat(&line);
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x6c, pl.clone());
                     broadcast(me.eid, |_c| (0x6c, pl.clone()));
                 }
             }
-            0x16 => { // use_entity: attack mobs
+            0x16 => {
+                // use_entity: attack mobs
                 let mut sl = &b[..];
                 let target = read_varint(&mut sl).unwrap_or(-1) as i32;
                 let mouse = read_varint(&mut sl).unwrap_or(-1);
@@ -12991,63 +18284,130 @@ fn handle(mut s: TcpStream) {
                 // uses so distant entities can't be hit/sheared/bred cross-map.
                 {
                     let (px, py, pz, ..) = *me.pos.lock().unwrap();
-                    let vt: Option<Arc<Client>> = { clients().lock().unwrap().iter().find(|c| c.eid == target).cloned() };
-                    let tp = vt.and_then(|v| { let p = *v.pos.lock().unwrap(); Some((p.0, p.1, p.2)) })
-                        .or_else(|| { let ms = mobs().lock().unwrap();
-                            ms.iter().find(|m| m.eid == target)
-                                .map(|m| { let p = *m.pos.lock().unwrap(); (p.0, p.1, p.2) }) });
-                    let ok = tp.map(|(tx, ty, tz)| {
-                        let (dx, dy, dz) = (tx - px, (ty + 0.9) - (py + 1.62), tz - pz);
-                        dx * dx + dy * dy + dz * dz <= 3.2 * 3.2
-                    }).unwrap_or(false);
-                    if !ok { continue; }
+                    let vt: Option<Arc<Client>> = {
+                        clients()
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|c| c.eid == target)
+                            .cloned()
+                    };
+                    let tp = vt
+                        .and_then(|v| {
+                            let p = *v.pos.lock().unwrap();
+                            Some((p.0, p.1, p.2))
+                        })
+                        .or_else(|| {
+                            let ms = mobs().lock().unwrap();
+                            ms.iter().find(|m| m.eid == target).map(|m| {
+                                let p = *m.pos.lock().unwrap();
+                                (p.0, p.1, p.2)
+                            })
+                        });
+                    let ok = tp
+                        .map(|(tx, ty, tz)| {
+                            let (dx, dy, dz) = (tx - px, (ty + 0.9) - (py + 1.62), tz - pz);
+                            dx * dx + dy * dy + dz * dz <= 3.2 * 3.2
+                        })
+                        .unwrap_or(false);
+                    if !ok {
+                        continue;
+                    }
                 }
-                if mouse == 0 || mouse == 2 { // interact: villagers open trade UI; wheat breeds animals
-                    let is_villager = { let ms = mobs().lock().unwrap();
-                        ms.iter().any(|m| m.eid == target && m.etype == 113) };
-                    let held_it = me.inv.lock().unwrap().get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new())).0;
-                    if held_it == 983 && !is_villager { // shears on sheep -> wool
-                        let is_sheep = { let ms = mobs().lock().unwrap();
-                            ms.iter().any(|m| m.eid == target && m.etype == 87) };
+                if mouse == 0 || mouse == 2 {
+                    // interact: villagers open trade UI; wheat breeds animals
+                    let is_villager = {
+                        let ms = mobs().lock().unwrap();
+                        ms.iter().any(|m| m.eid == target && m.etype == 113)
+                    };
+                    let held_it = me
+                        .inv
+                        .lock()
+                        .unwrap()
+                        .get(&(36 + held_slot))
+                        .cloned()
+                        .unwrap_or((0, 0, Vec::new()))
+                        .0;
+                    if held_it == 983 && !is_villager {
+                        // shears on sheep -> wool
+                        let is_sheep = {
+                            let ms = mobs().lock().unwrap();
+                            ms.iter().any(|m| m.eid == target && m.etype == 87)
+                        };
                         if is_sheep && !sheared().lock().unwrap().contains(&target) {
                             sheared().lock().unwrap().insert(target);
-                            let (mx, my, mz) = { let ms = mobs().lock().unwrap();
-                                ms.iter().find(|m| m.eid == target).map(|m| *m.pos.lock().unwrap()).map(|p| (p.0, p.1, p.2)).unwrap_or((0.0,0.0,0.0)) };
+                            let (mx, my, mz) = {
+                                let ms = mobs().lock().unwrap();
+                                ms.iter()
+                                    .find(|m| m.eid == target)
+                                    .map(|m| *m.pos.lock().unwrap())
+                                    .map(|p| (p.0, p.1, p.2))
+                                    .unwrap_or((0.0, 0.0, 0.0))
+                            };
                             let n = 1 + ((target as u64).wrapping_mul(2654435761) % 3) as u8;
                             for _ in 0..n {
                                 let deid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                let d = Drop { eid: deid, x: mx, y: my + 0.5, z: mz, item: 202, cnt: 1, comps: Vec::new(), age: 0 };
+                                let d = Drop {
+                                    eid: deid,
+                                    x: mx,
+                                    y: my + 0.5,
+                                    z: mz,
+                                    item: 202,
+                                    cnt: 1,
+                                    comps: Vec::new(),
+                                    age: 0,
+                                };
                                 drops().lock().unwrap().push(d);
                             }
                             continue;
                         }
                     }
-                    if held_it == 908 && !is_villager { // bucket on cow/sheep -> milk
-                        let milkable = { let ms = mobs().lock().unwrap();
-                            ms.iter().any(|m| m.eid == target && [22i64, 77].contains(&m.etype)) };
+                    if held_it == 908 && !is_villager {
+                        // bucket on cow/sheep -> milk
+                        let milkable = {
+                            let ms = mobs().lock().unwrap();
+                            ms.iter()
+                                .any(|m| m.eid == target && [22i64, 77].contains(&m.etype))
+                        };
                         if milkable {
                             let k = 36 + held_slot;
-                            { let mut inv = me.inv.lock().unwrap();
+                            {
+                                let mut inv = me.inv.lock().unwrap();
                                 let c = inv.get(&k).map(|v| v.1).unwrap_or(0);
-                                if c <= 1 { inv.insert(k, (914, 1, Vec::new())); }
-                                else { inv.insert(k, (908, c - 1, Vec::new()));
-                                    let fs = (9..=44i16).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
+                                if c <= 1 {
+                                    inv.insert(k, (914, 1, Vec::new()));
+                                } else {
+                                    inv.insert(k, (908, c - 1, Vec::new()));
+                                    let fs =
+                                        (9..=44i16).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
                                     inv.insert(fs, (914, 1, Vec::new()));
                                 }
                             }
-                            let (it2, c2, _c2) = me.inv.lock().unwrap().get(&k).cloned().unwrap_or((0, 0, Vec::new()));
-                            let mut p = vec![0u8]; write_varint(&mut p, 0);
+                            let (it2, c2, _c2) =
+                                me.inv.lock().unwrap().get(&k).cloned().unwrap_or((
+                                    0,
+                                    0,
+                                    Vec::new(),
+                                ));
+                            let mut p = vec![0u8];
+                            write_varint(&mut p, 0);
                             p.extend_from_slice(&k.to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it2, c2, _c2)));
                             let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
                             continue;
                         }
                     }
-                    if held_it == 854 && !is_villager { // wheat -> love mode on farm animals
+                    if held_it == 854 && !is_villager {
+                        // wheat -> love mode on farm animals
                         let mut loved = false;
-                        { let ms = mobs().lock().unwrap();
-                            if let Some(m) = ms.iter().find(|m| m.eid == target && [19i64, 22, 77, 87].contains(&m.etype)) {
-                                *m.love.lock().unwrap() = 80; loved = true;
+                        {
+                            let ms = mobs().lock().unwrap();
+                            if let Some(m) = ms
+                                .iter()
+                                .find(|m| m.eid == target && [19i64, 22, 77, 87].contains(&m.etype))
+                            {
+                                *m.love.lock().unwrap() = 80;
+                                loved = true;
                             }
                         }
                         if loved {
@@ -13055,9 +18415,14 @@ fn handle(mut s: TcpStream) {
                                 let mut inv = me.inv.lock().unwrap();
                                 let k = 36 + held_slot;
                                 if let Some((it, c, _kc)) = inv.get(&k).cloned() {
-                                    if c > 1 { inv.insert(k, (it, c - 1, _kc)); } else { inv.remove(&k); }
+                                    if c > 1 {
+                                        inv.insert(k, (it, c - 1, _kc));
+                                    } else {
+                                        inv.remove(&k);
+                                    }
                                 }
-                                let (it, c, _cc) = inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
+                                let (it, c, _cc) =
+                                    inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
                                 drop(inv);
                                 let mut p = vec![0u8];
                                 write_varint(&mut p, 0);
@@ -13072,8 +18437,8 @@ fn handle(mut s: TcpStream) {
                         *me.open_merchant.lock().unwrap() = true;
                         *me.trade_sel.lock().unwrap() = 0;
                         let mut p = Vec::new();
-                        write_varint(&mut p, 4);        // windowId 4
-                        write_varint(&mut p, 19);       // merchant menu
+                        write_varint(&mut p, 4); // windowId 4
+                        write_varint(&mut p, 19); // merchant menu
                         p.extend_from_slice(&chat_nbt("Villager"));
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x33, p);
                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x2d, trade_list_pkt(4));
@@ -13082,9 +18447,12 @@ fn handle(mut s: TcpStream) {
                         let mut q = vec![4u8];
                         write_varint(&mut q, 0);
                         write_varint(&mut q, 39);
-                        for _ in 0..3 { q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); }
+                        for _ in 0..3 {
+                            q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                        }
                         for wsl in 3..39i16 {
-                            let (it, c, _cc) = inv.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
+                            let (it, c, _cc) =
+                                inv.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
                             q.extend_from_slice(&slot_wire(&(it, c, _cc)));
                         }
                         q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
@@ -13092,7 +18460,8 @@ fn handle(mut s: TcpStream) {
                         continue;
                     }
                 }
-                if mouse == 1 { // attack
+                if mouse == 1 {
+                    // attack
                     // PvP: target may be another player
                     if target != me.eid {
                         let mut found: Option<(i32, String, f32)> = None;
@@ -13100,73 +18469,174 @@ fn handle(mut s: TcpStream) {
                             // LOCK ORDER: snapshot, never hold clients() while
                             // broadcasting or touching per-client locks
                             // (self-deadlock: broadcast re-locks clients()).
-                            let vic: Option<Arc<Client>> = { clients().lock().unwrap().iter()
-                                .find(|c| c.eid == target).cloned() };
+                            let vic: Option<Arc<Client>> = {
+                                clients()
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|c| c.eid == target)
+                                    .cloned()
+                            };
                             if let Some(v) = vic.as_ref() {
-                                if *v.gm.lock().unwrap() == 1 { }
-                                else {
-                                // vanilla: attack_damage attribute (fist=1) + held item bonus + sharpness
-                                let held = { let i2 = me.inv.lock().unwrap(); i2.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new())) };
-                                let band = if (818..=847).contains(&held.0) { ((held.0 - 818) / 5) as i64 } else { -1 };
-                                let kind = if (818..=847).contains(&held.0) { (held.0 - 818) % 5 } else { -1 };
-                                // vanilla tool attack damages by kind (sword,shovel,pick,axe,hoe)
-                            // bands: wood,stone,gold,iron,diamond,netherite
-                            let wep = match kind {
-                                0 => [4.0,5.0,4.0,6.0,7.0,8.0],   // swords
-                                1 => [2.5,3.5,2.5,4.5,5.5,6.5], // shovels
-                                2 => [2.0,3.0,2.0,4.0,5.0,6.0], // pickaxes
-                                3 => [7.0,9.0,7.0,9.0,9.0,10.0],// axes
-                                4 => [1.0,1.0,1.0,1.0,1.0,1.0], // hoes
-                                _ => [1.0; 6],
-                            }[band.clamp(0, 5) as usize];
-                                let wep = if held.0 == 1188 { 9.0 } else if held.0 == 1093 { 5.0 } else { wep };
-                                let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
-                                // attr default 1 = fist; an attribute-set value adds on top
-                                let chg = melee_charge(&me, held.0);
-                                let crt = { let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap();
-                                    let ff = *me.fall_from.lock().unwrap(); !g && py < ff - 0.1 };
-                                let (strb, wkb) = { let ef = me.effs.lock().unwrap();
-                                    (ef.iter().find(|e| e.id == 4).map(|e| e.amp + 1).unwrap_or(0) as f32 * 3.0,
-                                     ef.iter().find(|e| e.id == 17).map(|e| e.amp + 1).unwrap_or(0) as f32 * -4.0) };
-                                let dmg = ((attr_of(&format!("p:{}", me.name), "generic.attack_damage") as f32 - 1.0).max(0.0) + wep + sharp + strb + wkb).max(0.0) * (0.2 + 0.8 * chg * chg) * if crt { 1.5 } else { 1.0 };
-                                if v.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) { continue }
-                                *v.hurt_at.lock().unwrap() = Instant::now();
-                                *me.walk_acc.lock().unwrap() += 0.1;
-                                // vanilla: an axe hit disables a raised shield for 5s
-                                if kind == 3 && *v.blocking.lock().unwrap() {
-                                    *v.blocking.lock().unwrap() = false;
-                                    *v.shield_cd.lock().unwrap() = Instant::now();
-                                }
-                                let vb = kind != 3 && *v.blocking.lock().unwrap() && v.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5);
-                                if vb { damage_shield(v, dmg); }
-                                let mut h = v.hp.lock().unwrap();
-                                *h = (*h - if vb { 0.0 } else { hurt_absorb(v, dmg_after(v, dmg, 0)) }).max(0.0); if *h <= 0.0 { drop(h); totem_check(v); h = v.hp.lock().unwrap(); }
-                                let hh = *h; drop(h);
-                                if !vb { damage_armor(v, dmg); }
-                                if damage_held(&me) {
-                                    let (pxx, pyy, pzz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                    let snd = sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                    broadcast(-1, |_c| (0x68, snd.clone()));
-                                }
-                                held_slot_resync(&me);
-                                if let Ok(mut w) = v.sock.lock() {
-                                    let _ = send_packet(&mut *w, 0x24, hurt_anim(v.eid));
-                                    let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, v));
-                                }
-                                let (pp, vp) = ({ let p = me.pos.lock().unwrap(); *p }, { let p = v.pos.lock().unwrap(); *p });
-                                let (mut kx, mut kz) = (vp.0 - pp.0, vp.2 - pp.2);
-                                let kl = (kx*kx + kz*kz).sqrt().max(0.01);
-                                kx /= kl; kz /= kl;
-                                let vel = velocity_pkt(v.eid, (kx*3000.0) as i16, 2500, (kz*3000.0) as i16);
-                                if let Ok(mut w) = v.sock.lock() { let _ = send_packet(&mut *w, 0x5a, vel.clone()); }
-                                found = Some((v.eid, v.name.clone(), hh));
+                                if *v.gm.lock().unwrap() == 1 {
+                                } else {
+                                    // vanilla: attack_damage attribute (fist=1) + held item bonus + sharpness
+                                    let held = {
+                                        let i2 = me.inv.lock().unwrap();
+                                        i2.get(&(36 + held_slot)).cloned().unwrap_or((
+                                            0,
+                                            0,
+                                            Vec::new(),
+                                        ))
+                                    };
+                                    let band = if (818..=847).contains(&held.0) {
+                                        ((held.0 - 818) / 5) as i64
+                                    } else {
+                                        -1
+                                    };
+                                    let kind = if (818..=847).contains(&held.0) {
+                                        (held.0 - 818) % 5
+                                    } else {
+                                        -1
+                                    };
+                                    // vanilla tool attack damages by kind (sword,shovel,pick,axe,hoe)
+                                    // bands: wood,stone,gold,iron,diamond,netherite
+                                    let wep = match kind {
+                                        0 => [4.0, 5.0, 4.0, 6.0, 7.0, 8.0],  // swords
+                                        1 => [2.5, 3.5, 2.5, 4.5, 5.5, 6.5],  // shovels
+                                        2 => [2.0, 3.0, 2.0, 4.0, 5.0, 6.0],  // pickaxes
+                                        3 => [7.0, 9.0, 7.0, 9.0, 9.0, 10.0], // axes
+                                        4 => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],  // hoes
+                                        _ => [1.0; 6],
+                                    }[band.clamp(0, 5) as usize];
+                                    let wep = if held.0 == 1188 {
+                                        9.0
+                                    } else if held.0 == 1093 {
+                                        5.0
+                                    } else {
+                                        wep
+                                    };
+                                    let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
+                                    // attr default 1 = fist; an attribute-set value adds on top
+                                    let chg = melee_charge(&me, held.0);
+                                    let crt = {
+                                        let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap();
+                                        let ff = *me.fall_from.lock().unwrap();
+                                        !g && py < ff - 0.1
+                                    };
+                                    let (strb, wkb) = {
+                                        let ef = me.effs.lock().unwrap();
+                                        (
+                                            ef.iter()
+                                                .find(|e| e.id == 4)
+                                                .map(|e| e.amp + 1)
+                                                .unwrap_or(0)
+                                                as f32
+                                                * 3.0,
+                                            ef.iter()
+                                                .find(|e| e.id == 17)
+                                                .map(|e| e.amp + 1)
+                                                .unwrap_or(0)
+                                                as f32
+                                                * -4.0,
+                                        )
+                                    };
+                                    let dmg = ((attr_of(
+                                        &format!("p:{}", me.name),
+                                        "generic.attack_damage",
+                                    ) as f32
+                                        - 1.0)
+                                        .max(0.0)
+                                        + wep
+                                        + sharp
+                                        + strb
+                                        + wkb)
+                                        .max(0.0)
+                                        * (0.2 + 0.8 * chg * chg)
+                                        * if crt { 1.5 } else { 1.0 };
+                                    if v.hurt_at.lock().unwrap().elapsed()
+                                        < Duration::from_millis(500)
+                                    {
+                                        continue;
+                                    }
+                                    *v.hurt_at.lock().unwrap() = Instant::now();
+                                    *me.walk_acc.lock().unwrap() += 0.1;
+                                    // vanilla: an axe hit disables a raised shield for 5s
+                                    if kind == 3 && *v.blocking.lock().unwrap() {
+                                        *v.blocking.lock().unwrap() = false;
+                                        *v.shield_cd.lock().unwrap() = Instant::now();
+                                    }
+                                    let vb = kind != 3
+                                        && *v.blocking.lock().unwrap()
+                                        && v.shield_cd.lock().unwrap().elapsed()
+                                            > Duration::from_secs(5);
+                                    if vb {
+                                        damage_shield(v, dmg);
+                                    }
+                                    let mut h = v.hp.lock().unwrap();
+                                    *h = (*h
+                                        - if vb {
+                                            0.0
+                                        } else {
+                                            hurt_absorb(v, dmg_after(v, dmg, 0))
+                                        })
+                                    .max(0.0);
+                                    if *h <= 0.0 {
+                                        drop(h);
+                                        totem_check(v);
+                                        h = v.hp.lock().unwrap();
+                                    }
+                                    let hh = *h;
+                                    drop(h);
+                                    if !vb {
+                                        damage_armor(v, dmg);
+                                    }
+                                    if damage_held(&me) {
+                                        let (pxx, pyy, pzz, ..) = {
+                                            let p = me.pos.lock().unwrap();
+                                            *p
+                                        };
+                                        let snd =
+                                            sound_pkt_named("entity.item.break", pxx, pyy, pzz);
+                                        broadcast(-1, |_c| (0x68, snd.clone()));
+                                    }
+                                    held_slot_resync(&me);
+                                    if let Ok(mut w) = v.sock.lock() {
+                                        let _ = send_packet(&mut *w, 0x24, hurt_anim(v.eid));
+                                        let _ = send_packet(&mut *w, 0x5d, health_pkt_c(hh, v));
+                                    }
+                                    let (pp, vp) = (
+                                        {
+                                            let p = me.pos.lock().unwrap();
+                                            *p
+                                        },
+                                        {
+                                            let p = v.pos.lock().unwrap();
+                                            *p
+                                        },
+                                    );
+                                    let (mut kx, mut kz) = (vp.0 - pp.0, vp.2 - pp.2);
+                                    let kl = (kx * kx + kz * kz).sqrt().max(0.01);
+                                    kx /= kl;
+                                    kz /= kl;
+                                    let vel = velocity_pkt(
+                                        v.eid,
+                                        (kx * 3000.0) as i16,
+                                        2500,
+                                        (kz * 3000.0) as i16,
+                                    );
+                                    if let Ok(mut w) = v.sock.lock() {
+                                        let _ = send_packet(&mut *w, 0x5a, vel.clone());
+                                    }
+                                    found = Some((v.eid, v.name.clone(), hh));
                                 }
                             }
                         }
                         if let Some((veid, vname, hh)) = found {
                             broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_anim(veid)));
                             if hh <= 0.0 {
-                                let line = system_chat(&format!("{} was slain by {}", vname, me.name));
+                                let line =
+                                    system_chat(&format!("{} was slain by {}", vname, me.name));
                                 broadcast(-1, |_c| (0x6c, line.clone()));
                             }
                             continue;
@@ -13177,209 +18647,416 @@ fn handle(mut s: TcpStream) {
                         let ms = mobs().lock().unwrap();
                         if let Some(m) = ms.iter().find(|m| m.eid == target) {
                             // vanilla hurtTime: 0.5s of invulnerability after a hit
-                            let fresh = m.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500);
-                            if fresh { *m.hurt_at.lock().unwrap() = Instant::now(); }
+                            let fresh =
+                                m.hurt_at.lock().unwrap().elapsed() >= Duration::from_millis(500);
                             if fresh {
-                            *me.walk_acc.lock().unwrap() += 0.1;
-                            let held = { let i2 = me.inv.lock().unwrap(); i2.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new())) };
-                            // vanilla melee: weapon total by tool kind; sharpness adds 0.5*lvl
-                            let band = if (818..=847).contains(&held.0) { ((held.0 - 818) / 5) as i64 } else { -1 };
-                            let kind = if (818..=847).contains(&held.0) { (held.0 - 818) % 5 } else { -1 };
-                            let wep = match kind {
-                                0 => [4.0,5.0,4.0,6.0,7.0,8.0],
-                                1 => [2.5,3.5,2.5,4.5,5.5,6.5],
-                                2 => [2.0,3.0,2.0,4.0,5.0,6.0],
-                                3 => [7.0,9.0,7.0,9.0,9.0,10.0],
-                                4 => [1.0,1.0,1.0,1.0,1.0,1.0],
-                                _ => [1.0; 6],
-                            }[band.clamp(0, 5) as usize];
-                            let wep = if held.0 == 1188 { 9.0 } else if held.0 == 1093 { 5.0 } else { wep };
-                            let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
-                            // smite (+2.5/lvl vs undead) / bane (+2.5/lvl vs arthropods)
-                            let undead = [124i64, 91].contains(&m.etype);
-                            let arthro = [100i64].contains(&m.etype);
-                            let spec = if undead { enchant_level(&held.2, 34) } else if arthro { enchant_level(&held.2, 1) } else { 0 } as f32 * 2.5;
-                            // vanilla attack cooldown: charge<1 scales damage 0.2..1.0
-                            let charge = melee_charge(&me, held.0);
-                            let scale = 0.2 + 0.8 * charge * charge;
-                            // critical hit: airborne + descending deals +50%
-                            let crit = { let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap();
-                                let ff = *me.fall_from.lock().unwrap();
-                                !g && py < ff - 0.1 };
-                            let (strb, wkb) = { let ef = me.effs.lock().unwrap();
-                                (ef.iter().find(|e| e.id == 4).map(|e| e.amp + 1).unwrap_or(0) as f32 * 3.0,
-                                 ef.iter().find(|e| e.id == 17).map(|e| e.amp + 1).unwrap_or(0) as f32 * -4.0) };
-                            let mut h = m.hp.lock().unwrap();
-                            *h -= ((wep + sharp + spec + strb + wkb).max(0.0)) * scale * if crit { 1.5 } else { 1.0 };
-                            drop(h);
-                            // sweeping_edge: lvl dmg to other mobs within 1.5 blocks (needs ~full charge)
-                            let sw = enchant_level(&held.2, 36);
-                            if sw > 0 && charge >= 0.9 {
-                                let (mx0, my0, mz0, ..) = *m.pos.lock().unwrap();
-                                let others: Vec<Arc<Mob>> = ms.iter().cloned()
-                                    .filter(|o| o.eid != m.eid).collect();
-                                for o in others {
-                                    let (ox, oy, oz, ..) = { let p = o.pos.lock().unwrap(); *p };
-                                    if (ox-mx0).abs() < 1.5 && (oy-my0).abs() < 1.5 && (oz-mz0).abs() < 1.5 {
-                                        let mut oh = o.hp.lock().unwrap(); *oh -= wep * (sw as f32) / (sw as f32 + 1.0); drop(oh);
-                                        broadcast_seen(o.eid, |_c| (0x24, hurt_anim(o.eid)));
+                                *m.hurt_at.lock().unwrap() = Instant::now();
+                            }
+                            if fresh {
+                                *me.walk_acc.lock().unwrap() += 0.1;
+                                let held = {
+                                    let i2 = me.inv.lock().unwrap();
+                                    i2.get(&(36 + held_slot))
+                                        .cloned()
+                                        .unwrap_or((0, 0, Vec::new()))
+                                };
+                                // vanilla melee: weapon total by tool kind; sharpness adds 0.5*lvl
+                                let band = if (818..=847).contains(&held.0) {
+                                    ((held.0 - 818) / 5) as i64
+                                } else {
+                                    -1
+                                };
+                                let kind = if (818..=847).contains(&held.0) {
+                                    (held.0 - 818) % 5
+                                } else {
+                                    -1
+                                };
+                                let wep = match kind {
+                                    0 => [4.0, 5.0, 4.0, 6.0, 7.0, 8.0],
+                                    1 => [2.5, 3.5, 2.5, 4.5, 5.5, 6.5],
+                                    2 => [2.0, 3.0, 2.0, 4.0, 5.0, 6.0],
+                                    3 => [7.0, 9.0, 7.0, 9.0, 9.0, 10.0],
+                                    4 => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                                    _ => [1.0; 6],
+                                }[band.clamp(0, 5) as usize];
+                                let wep = if held.0 == 1188 {
+                                    9.0
+                                } else if held.0 == 1093 {
+                                    5.0
+                                } else {
+                                    wep
+                                };
+                                let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
+                                // smite (+2.5/lvl vs undead) / bane (+2.5/lvl vs arthropods)
+                                let undead = [124i64, 91].contains(&m.etype);
+                                let arthro = [100i64].contains(&m.etype);
+                                let spec = if undead {
+                                    enchant_level(&held.2, 34)
+                                } else if arthro {
+                                    enchant_level(&held.2, 1)
+                                } else {
+                                    0
+                                } as f32
+                                    * 2.5;
+                                // vanilla attack cooldown: charge<1 scales damage 0.2..1.0
+                                let charge = melee_charge(&me, held.0);
+                                let scale = 0.2 + 0.8 * charge * charge;
+                                // critical hit: airborne + descending deals +50%
+                                let crit = {
+                                    let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap();
+                                    let ff = *me.fall_from.lock().unwrap();
+                                    !g && py < ff - 0.1
+                                };
+                                let (strb, wkb) = {
+                                    let ef = me.effs.lock().unwrap();
+                                    (
+                                        ef.iter()
+                                            .find(|e| e.id == 4)
+                                            .map(|e| e.amp + 1)
+                                            .unwrap_or(0)
+                                            as f32
+                                            * 3.0,
+                                        ef.iter()
+                                            .find(|e| e.id == 17)
+                                            .map(|e| e.amp + 1)
+                                            .unwrap_or(0)
+                                            as f32
+                                            * -4.0,
+                                    )
+                                };
+                                let mut h = m.hp.lock().unwrap();
+                                *h -= ((wep + sharp + spec + strb + wkb).max(0.0))
+                                    * scale
+                                    * if crit { 1.5 } else { 1.0 };
+                                drop(h);
+                                // sweeping_edge: lvl dmg to other mobs within 1.5 blocks (needs ~full charge)
+                                let sw = enchant_level(&held.2, 36);
+                                if sw > 0 && charge >= 0.9 {
+                                    let (mx0, my0, mz0, ..) = *m.pos.lock().unwrap();
+                                    let others: Vec<Arc<Mob>> =
+                                        ms.iter().cloned().filter(|o| o.eid != m.eid).collect();
+                                    for o in others {
+                                        let (ox, oy, oz, ..) = {
+                                            let p = o.pos.lock().unwrap();
+                                            *p
+                                        };
+                                        if (ox - mx0).abs() < 1.5
+                                            && (oy - my0).abs() < 1.5
+                                            && (oz - mz0).abs() < 1.5
+                                        {
+                                            let mut oh = o.hp.lock().unwrap();
+                                            *oh -= wep * (sw as f32) / (sw as f32 + 1.0);
+                                            drop(oh);
+                                            broadcast_seen(o.eid, |_c| (0x24, hurt_anim(o.eid)));
+                                        }
                                     }
                                 }
-                            }
-                            // fire_aspect: ignite target 4s per level (16 server ticks)
-                            let fa = enchant_level(&held.2, 10);
-                            if fa > 0 { *m.fuse.lock().unwrap() = 16 * fa as i32; }
-                            if damage_held(&me) {
-                                let (pxx, pyy, pzz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                let snd = sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                broadcast(-1, |_c| (0x68, snd.clone()));
-                            }
-                            held_slot_resync(&me);
-                            let h = m.hp.lock().unwrap();
-                            if *h <= 0.0 {
-                                let (mx, my, mz, ..) = { let p = m.pos.lock().unwrap(); *p };
-                                dead = Some((m.eid, m.etype, mx, my, mz));
-                            }
-                            let ha = hurt_anim(m.eid);
-                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x24, ha.clone());
-                            broadcast_seen_ex(me.eid, me.eid, |_c| (0x24, ha.clone()));
-                            // knockback away from attacker
-                            let (pp, mp) = ({ let p = me.pos.lock().unwrap(); *p }, { let p = m.pos.lock().unwrap(); *p });
-                            let (mut kx, mut kz) = (mp.0 - pp.0, mp.2 - pp.2);
-                            let kl = (kx*kx + kz*kz).sqrt().max(0.01);
-                            kx /= kl; kz /= kl;
-                            let vp = velocity_pkt(m.eid, (kx*3200.0) as i16, 2800, (kz*3200.0) as i16);
-                            broadcast_seen(m.eid, |_c| (0x5a, vp.clone()));
-                            // vanilla: sprint attacks add knockback and reset the sprint
-                            let sprint_hit = *me.sprinting.lock().unwrap();
-                            if sprint_hit { *me.sprinting.lock().unwrap() = false; }
-                            let kbs = 0.6 + 0.6 * enchant_level(&held.2, 17) as f64
-                                + if sprint_hit { 0.5 } else { 0.0 };
-                            let (nx, nz) = (mp.0 + kx*kbs, mp.2 + kz*kbs);
-                            { let mut p = m.pos.lock().unwrap(); p.0 = nx; p.2 = nz; }
-                            let tp = entity_teleport(m.eid, nx, mp.1, nz, mp.3, mp.4, true);
-                            broadcast_seen(m.eid, |_c| (0x70, tp.clone()));
+                                // fire_aspect: ignite target 4s per level (16 server ticks)
+                                let fa = enchant_level(&held.2, 10);
+                                if fa > 0 {
+                                    *m.fuse.lock().unwrap() = 16 * fa as i32;
+                                }
+                                if damage_held(&me) {
+                                    let (pxx, pyy, pzz, ..) = {
+                                        let p = me.pos.lock().unwrap();
+                                        *p
+                                    };
+                                    let snd = sound_pkt_named("entity.item.break", pxx, pyy, pzz);
+                                    broadcast(-1, |_c| (0x68, snd.clone()));
+                                }
+                                held_slot_resync(&me);
+                                let h = m.hp.lock().unwrap();
+                                if *h <= 0.0 {
+                                    let (mx, my, mz, ..) = {
+                                        let p = m.pos.lock().unwrap();
+                                        *p
+                                    };
+                                    dead = Some((m.eid, m.etype, mx, my, mz));
+                                }
+                                let ha = hurt_anim(m.eid);
+                                let _ =
+                                    send_packet(&mut *me.sock.lock().unwrap(), 0x24, ha.clone());
+                                broadcast_seen_ex(me.eid, me.eid, |_c| (0x24, ha.clone()));
+                                // knockback away from attacker
+                                let (pp, mp) = (
+                                    {
+                                        let p = me.pos.lock().unwrap();
+                                        *p
+                                    },
+                                    {
+                                        let p = m.pos.lock().unwrap();
+                                        *p
+                                    },
+                                );
+                                let (mut kx, mut kz) = (mp.0 - pp.0, mp.2 - pp.2);
+                                let kl = (kx * kx + kz * kz).sqrt().max(0.01);
+                                kx /= kl;
+                                kz /= kl;
+                                let vp = velocity_pkt(
+                                    m.eid,
+                                    (kx * 3200.0) as i16,
+                                    2800,
+                                    (kz * 3200.0) as i16,
+                                );
+                                broadcast_seen(m.eid, |_c| (0x5a, vp.clone()));
+                                // vanilla: sprint attacks add knockback and reset the sprint
+                                let sprint_hit = *me.sprinting.lock().unwrap();
+                                if sprint_hit {
+                                    *me.sprinting.lock().unwrap() = false;
+                                }
+                                let kbs = 0.6
+                                    + 0.6 * enchant_level(&held.2, 17) as f64
+                                    + if sprint_hit { 0.5 } else { 0.0 };
+                                let (nx, nz) = (mp.0 + kx * kbs, mp.2 + kz * kbs);
+                                {
+                                    let mut p = m.pos.lock().unwrap();
+                                    p.0 = nx;
+                                    p.2 = nz;
+                                }
+                                let tp = entity_teleport(m.eid, nx, mp.1, nz, mp.3, mp.4, true);
+                                broadcast_seen(m.eid, |_c| (0x70, tp.clone()));
                             }
                         }
                     }
                     if let Some((deid, etype, mx, my, mz)) = dead {
                         adv_event(&me.name, "player_killed_entity", Some(etype));
-                        let mn = match etype { 124 => "Zombie", 22 => "Cow", 23 => "Creeper", 91 => "Skeleton", 19=>"Chicken", 77=>"Pig", 87=>"Sheep", 100=>"Spider", _ => "mob" };
+                        let mn = match etype {
+                            124 => "Zombie",
+                            22 => "Cow",
+                            23 => "Creeper",
+                            91 => "Skeleton",
+                            19 => "Chicken",
+                            77 => "Pig",
+                            87 => "Sheep",
+                            100 => "Spider",
+                            _ => "mob",
+                        };
                         let line = system_chat(&format!("{} was slain by {}", mn, me.name));
                         broadcast(-1, |_c| (0x6c, line.clone()));
-                        let burn_kill = mobs().lock().unwrap().iter().find(|m| m.eid == deid)
-                            .map(|m| *m.fuse.lock().unwrap() > 0).unwrap_or(false);
+                        let burn_kill = mobs()
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|m| m.eid == deid)
+                            .map(|m| *m.fuse.lock().unwrap() > 0)
+                            .unwrap_or(false);
                         mobs().lock().unwrap().retain(|m| m.eid != deid);
                         broadcast_seen_destroy(deid);
                         let was_sheared = sheared().lock().unwrap().remove(&deid);
                         // looting: +0..level extra count per drop
-                        let held2 = { let i2 = me.inv.lock().unwrap(); i2.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new())) };
+                        let held2 = {
+                            let i2 = me.inv.lock().unwrap();
+                            i2.get(&(36 + held_slot))
+                                .cloned()
+                                .unwrap_or((0, 0, Vec::new()))
+                        };
                         let loot = enchant_level(&held2.2, 18).clamp(0, 3) as u64;
-                        for (item, cnt, comps) in mob_loot(etype, burn_kill).into_iter().filter(|st| !(was_sheared && st.0 == 202))
-                            .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1) {
-                            let extra = if loot > 0 { (world_rng::next_u64() % (loot + 1)) as u8 } else { 0 };
-                            let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: mx, y: my, z: mz, item, cnt: cnt + extra, comps, age: 0 };
+                        for (item, cnt, comps) in mob_loot(etype, burn_kill)
+                            .into_iter()
+                            .filter(|st| !(was_sheared && st.0 == 202))
+                            .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
+                        {
+                            let extra = if loot > 0 {
+                                (world_rng::next_u64() % (loot + 1)) as u8
+                            } else {
+                                0
+                            };
+                            let d = Drop {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: mx,
+                                y: my,
+                                z: mz,
+                                item,
+                                cnt: cnt + extra,
+                                comps,
+                                age: 0,
+                            };
                             drops().lock().unwrap().push(d);
                         }
                         let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                                xps().lock().unwrap().push(Xp { eid: xeid, x: mx, y: my, z: mz, val: mob_xp(etype), age: 0 });
+                        xps().lock().unwrap().push(Xp {
+                            eid: xeid,
+                            x: mx,
+                            y: my,
+                            z: mz,
+                            val: mob_xp(etype),
+                            age: 0,
+                        });
                         // spawn streams via interest_tick
                     }
                 }
             }
-            0x09 => { // client_command: perform_respawn
+            0x09 => {
+                // client_command: perform_respawn
                 let mut sl = &b[..];
                 if read_varint(&mut sl) == Some(0) {
                     *me.hp.lock().unwrap() = max_hp_of(&me.name);
                     // vanilla death drops the inventory at the death
                     // location (keepInventory=false) — the player's pos
                     // is still the death site at this point
-                    if *me.gm.lock().unwrap() == 0 && GR_KEEP_INVENTORY.load(Ordering::Relaxed) == 0 {
-                        let (dx, dy, dz) = { let p = me.pos.lock().unwrap(); (p.0, p.1, p.2) };
+                    if *me.gm.lock().unwrap() == 0 && GR_KEEP_INVENTORY.load(Ordering::Relaxed) == 0
+                    {
+                        let (dx, dy, dz) = {
+                            let p = me.pos.lock().unwrap();
+                            (p.0, p.1, p.2)
+                        };
                         let mut spill: Vec<Stack> = Vec::new();
-                        { let mut iv = me.inv.lock().unwrap();
-                          spill.extend(iv.values().cloned()); iv.clear();
-                          *me.armor_pts.lock().unwrap() = 0; }
-                        { let mut cur = me.cursor.lock().unwrap();
-                          if cur.1 > 0 { spill.push(cur.clone()); } *cur = (0, 0, Vec::new()); }
-                        { let mut cr = me.craft.lock().unwrap();
-                          spill.extend(cr.values().cloned()); cr.clear(); }
-                        { let mut cr = me.craft9.lock().unwrap();
-                          spill.extend(cr.values().cloned()); cr.clear(); }
+                        {
+                            let mut iv = me.inv.lock().unwrap();
+                            spill.extend(iv.values().cloned());
+                            iv.clear();
+                            *me.armor_pts.lock().unwrap() = 0;
+                        }
+                        {
+                            let mut cur = me.cursor.lock().unwrap();
+                            if cur.1 > 0 {
+                                spill.push(cur.clone());
+                            }
+                            *cur = (0, 0, Vec::new());
+                        }
+                        {
+                            let mut cr = me.craft.lock().unwrap();
+                            spill.extend(cr.values().cloned());
+                            cr.clear();
+                        }
+                        {
+                            let mut cr = me.craft9.lock().unwrap();
+                            spill.extend(cr.values().cloned());
+                            cr.clear();
+                        }
                         {
                             let mut ds = drops().lock().unwrap();
-                            for (item, cnt, comps) in spill.into_iter().filter(|s| s.1 > 0 && enchant_level(&s.2, 40) == 0) {
-                                ds.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                    x: dx, y: dy + 0.4, z: dz, item, cnt, comps, age: 0 });
+                            for (item, cnt, comps) in spill
+                                .into_iter()
+                                .filter(|s| s.1 > 0 && enchant_level(&s.2, 40) == 0)
+                            {
+                                ds.push(Drop {
+                                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                    x: dx,
+                                    y: dy + 0.4,
+                                    z: dz,
+                                    item,
+                                    cnt,
+                                    comps,
+                                    age: 0,
+                                });
                             }
                         }
                         // player xp scatters as orbs (~7*level, cap 100)
-                        let tot = { let mut x = me.xp.lock().unwrap(); let v = *x; *x = 0; v };
+                        let tot = {
+                            let mut x = me.xp.lock().unwrap();
+                            let v = *x;
+                            *x = 0;
+                            v
+                        };
                         let mut xs = xps().lock().unwrap();
                         let mut rem = tot.clamp(0, 100);
                         while rem > 0 {
-                            let v = rem.min(10) as i16; rem -= v as i64;
-                            xs.push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: dx, y: dy + 0.5, z: dz, val: v, age: 0 });
+                            let v = rem.min(10) as i16;
+                            rem -= v as i64;
+                            xs.push(Xp {
+                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                x: dx,
+                                y: dy + 0.5,
+                                z: dz,
+                                val: v,
+                                age: 0,
+                            });
                         }
                         drop(xs);
                     }
-                    let mut rp = spawn_info(); rp.push(0);
+                    let mut rp = spawn_info();
+                    rp.push(0);
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x47, rp);
-                    let (rx, ry, rz) = me.spawn_pt.lock().unwrap().unwrap_or(*WORLD_SPAWN.lock().unwrap());
-                    { let mut p = me.pos.lock().unwrap(); p.0 = rx; p.1 = ry; p.2 = rz; }
+                    let (rx, ry, rz) = me
+                        .spawn_pt
+                        .lock()
+                        .unwrap()
+                        .unwrap_or(*WORLD_SPAWN.lock().unwrap());
+                    {
+                        let mut p = me.pos.lock().unwrap();
+                        p.0 = rx;
+                        p.1 = ry;
+                        p.2 = rz;
+                    }
                     let mut ps = Vec::new();
                     ps.extend_from_slice(&rx.to_be_bytes());
                     ps.extend_from_slice(&ry.to_be_bytes());
                     ps.extend_from_slice(&rz.to_be_bytes());
                     ps.extend_from_slice(&0f32.to_be_bytes());
                     ps.extend_from_slice(&0f32.to_be_bytes());
-                    ps.push(0); write_varint(&mut ps, 2);
+                    ps.push(0);
+                    write_varint(&mut ps, 2);
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x40, ps);
-                    *me.food.lock().unwrap() = 20; *me.sat.lock().unwrap() = 5.0;
-                    { let iv = me.inv.lock().unwrap(); *me.armor_pts.lock().unwrap() = armor_pts_of(&iv); }
-                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x5d, health_pkt_c(max_hp_of(&me.name), &me));
+                    *me.food.lock().unwrap() = 20;
+                    *me.sat.lock().unwrap() = 5.0;
+                    {
+                        let iv = me.inv.lock().unwrap();
+                        *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
+                    }
+                    let _ = send_packet(
+                        &mut *me.sock.lock().unwrap(),
+                        0x5d,
+                        health_pkt_c(max_hp_of(&me.name), &me),
+                    );
                     send_attrs(&me);
                     // vanilla resyncs window 0 after respawn — without it
                     // the client keeps showing the pre-death inventory
                     let mut q = vec![0u8]; // window 0 = player inventory
                     write_varint(&mut q, 0);
                     write_varint(&mut q, 46);
-                    { let iv = me.inv.lock().unwrap();
-                      for i in 0..46i16 {
-                          let (it, c, _cc) = iv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
-                          q.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                      } }
+                    {
+                        let iv = me.inv.lock().unwrap();
+                        for i in 0..46i16 {
+                            let (it, c, _cc) = iv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
+                            q.extend_from_slice(&slot_wire(&(it, c, _cc)));
+                        }
+                    }
                     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x13, q);
                 }
             }
-            0x2b => { // resource_pack_receive: status varint
+            0x2b => {
+                // resource_pack_receive: status varint
                 let mut sl = &b[..];
                 eprintln!("[spine] resource_pack status {:?}", read_varint(&mut sl));
             }
-            0x35 => { // update_sign: pos i64, front bool, 4 strings
+            0x35 => {
+                // update_sign: pos i64, front bool, 4 strings
                 if b.len() >= 10 {
                     let (sx, sy, sz) = read_pos(&b[..8]);
                     let front = if b[8] != 0 { 1u8 } else { 0u8 };
                     let mut sl = &b[9..];
-                    let mut lines: [String; 4] = [String::new(), String::new(), String::new(), String::new()];
+                    let mut lines: [String; 4] =
+                        [String::new(), String::new(), String::new(), String::new()];
                     for l in lines.iter_mut() {
                         let n = read_varint(&mut sl).unwrap_or(0).clamp(0, 256) as usize;
                         let m = n.min(sl.len());
                         *l = String::from_utf8_lossy(&sl[..m]).into_owned();
                         sl = &sl[m..];
                     }
-                    signs().lock().unwrap().insert((sx, sy, sz, front), lines.clone());
-                    broadcast_chunk(sx.div_euclid(16), sz.div_euclid(16), |_c| (0x07, sign_entity_pkt(sx, sy, sz, front, &lines)));
+                    signs()
+                        .lock()
+                        .unwrap()
+                        .insert((sx, sy, sz, front), lines.clone());
+                    broadcast_chunk(sx.div_euclid(16), sz.div_euclid(16), |_c| {
+                        (0x07, sign_entity_pkt(sx, sy, sz, front, &lines))
+                    });
                 }
             }
-            0x32 => { // set_creative_slot: slot i16 + slot data (creative only)
+            0x32 => {
+                // set_creative_slot: slot i16 + slot data (creative only)
                 if b.len() >= 3 && *me.gm.lock().unwrap() == 1 {
                     let (slot, st) = slot_read_wire(&b).unwrap_or((0, (0, 0, Vec::new())));
-                    if st.1 > 0 { me.inv.lock().unwrap().insert(slot, st.clone()); }
-                    else { me.inv.lock().unwrap().remove(&slot); }
-                    { let iv = me.inv.lock().unwrap(); *me.armor_pts.lock().unwrap() = armor_pts_of(&iv); }
+                    if st.1 > 0 {
+                        me.inv.lock().unwrap().insert(slot, st.clone());
+                    } else {
+                        me.inv.lock().unwrap().remove(&slot);
+                    }
+                    {
+                        let iv = me.inv.lock().unwrap();
+                        *me.armor_pts.lock().unwrap() = armor_pts_of(&iv);
+                    }
                     // echo container set_slot (0x15): window 0, stateId 0
                     let mut p = vec![0u8];
                     write_varint(&mut p, 0);
@@ -13388,7 +19065,8 @@ fn handle(mut s: TcpStream) {
                     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
                 }
             }
-            0x2d => { // select_trade: echo input/output into merchant slots 0/1/2
+            0x2d => {
+                // select_trade: echo input/output into merchant slots 0/1/2
                 let mut sl = &b[..];
                 let sel = read_varint(&mut sl).unwrap_or(0) as i32;
 
@@ -13401,23 +19079,38 @@ fn handle(mut s: TcpStream) {
                         // move inputs from inventory into trade slots 0/1
                         let mut inv = me.inv.lock().unwrap();
                         let mut ok = inv_consume(&mut inv, ai, ac as i64);
-                        if ok { if let Some((bi, bc)) = bin { ok = inv_consume(&mut inv, *bi, *bc as i64); } }
+                        if ok {
+                            if let Some((bi, bc)) = bin {
+                                ok = inv_consume(&mut inv, *bi, *bc as i64);
+                            }
+                        }
                         if ok {
                             let mut mi = me.merchant_in.lock().unwrap();
                             mi[0] = (ai, ac, Vec::new());
-                            mi[1] = bin.map(|(b, c)| (b, c, Vec::new())).unwrap_or((0, 0, Vec::new()));
+                            mi[1] =
+                                bin.map(|(b, c)| (b, c, Vec::new()))
+                                    .unwrap_or((0, 0, Vec::new()));
                             drop(mi);
                             let snap = inv.clone();
                             drop(inv);
                             for wsl in 3..39i16 {
-                                let (it, c, _sc) = snap.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
+                                let (it, c, _sc) =
+                                    snap.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
                                 let mut p = vec![4u8];
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&wsl.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&(it, c, _sc)));
                                 let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
                             }
-                            for (wsl, it, c) in [(0i16, ai, ac), (1, bin.map(|b| b.0).unwrap_or(0), bin.map(|b| b.1).unwrap_or(0)), (2, ci, cc)] {
+                            for (wsl, it, c) in [
+                                (0i16, ai, ac),
+                                (
+                                    1,
+                                    bin.map(|b| b.0).unwrap_or(0),
+                                    bin.map(|b| b.1).unwrap_or(0),
+                                ),
+                                (2, ci, cc),
+                            ] {
                                 let mut p = vec![4u8];
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&wsl.to_be_bytes());
@@ -13438,7 +19131,8 @@ fn handle(mut s: TcpStream) {
                     }
                 }
             }
-            0x0f => { // close_window
+            0x0f => {
+                // close_window
                 let had_container = me.open_chest.lock().unwrap().is_some()
                     || me.open_furnace.lock().unwrap().is_some()
                     || *me.open_table.lock().unwrap()
@@ -13449,13 +19143,18 @@ fn handle(mut s: TcpStream) {
                 if had_container {
                     // vanilla containerMenu.removed: the carried stack is
                     // thrown into the world, crafting grid goes back to inv
-                    let cur = std::mem::replace(&mut *me.cursor.lock().unwrap(), (0, 0, Vec::new()));
+                    let cur =
+                        std::mem::replace(&mut *me.cursor.lock().unwrap(), (0, 0, Vec::new()));
                     if cur.1 > 0 {
                         let (px, py, pz, ..) = *me.pos.lock().unwrap();
                         drops().lock().unwrap().push(Drop {
                             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                            x: px, y: py + 1.3, z: pz,
-                            item: cur.0, cnt: cur.1, comps: cur.2,
+                            x: px,
+                            y: py + 1.3,
+                            z: pz,
+                            item: cur.0,
+                            cnt: cur.1,
+                            comps: cur.2,
                             age: -(server_ticks(40) as i32), // pickup delay: 2s already elapsed
                         });
                     }
@@ -13474,20 +19173,24 @@ fn handle(mut s: TcpStream) {
                 if *me.open_merchant.lock().unwrap() {
                     let mi = me.merchant_in.lock().unwrap().clone();
                     let mut inv = me.inv.lock().unwrap();
-                    for (it, c, _mc) in mi.iter().cloned() { if c > 0 {
-                        let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
-                        inv.insert(slot, (it, c, _mc));
-                    } }
+                    for (it, c, _mc) in mi.iter().cloned() {
+                        if c > 0 {
+                            let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
+                            inv.insert(slot, (it, c, _mc));
+                        }
+                    }
                     *me.merchant_in.lock().unwrap() = [(0, 0, Vec::new()), (0, 0, Vec::new())];
                     drop(inv);
                 }
                 *me.open_merchant.lock().unwrap() = false;
                 *me.trade_sel.lock().unwrap() = -1;
             }
-            0x0e => { // window_click: window u8, stateId varint, slot i16, button i8, mode varint, ...
+            0x0e => {
+                // window_click: window u8, stateId varint, slot i16, button i8, mode varint, ...
                 if b.len() >= 6 {
                     let mut sl = &b[..];
-                    let _wid = sl[0]; sl = &sl[1..];
+                    let _wid = sl[0];
+                    sl = &sl[1..];
                     let _st = read_varint(&mut sl);
                     if sl.len() >= 4 {
                         let slot = i16::from_be_bytes(sl[..2].try_into().unwrap());
@@ -13507,42 +19210,87 @@ fn handle(mut s: TcpStream) {
                                         // vanilla: left-click outside = throw whole stack, right-click = one
                                         let n = if btn == 1 { 1 } else { cur.1 };
                                         let it = cur.clone();
-                                        if n >= cur.1 { *cur = (0, 0, Vec::new()); } else { cur.1 -= n; }
-                                        let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: 0 };
+                                        if n >= cur.1 {
+                                            *cur = (0, 0, Vec::new());
+                                        } else {
+                                            cur.1 -= n;
+                                        }
+                                        let (px, py, pz, ..) = {
+                                            let p = me.pos.lock().unwrap();
+                                            *p
+                                        };
+                                        let d = Drop {
+                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                            x: px,
+                                            y: py + 1.3,
+                                            z: pz,
+                                            item: it.0,
+                                            cnt: n,
+                                            comps: it.2.clone(),
+                                            age: 0,
+                                        };
                                         drops().lock().unwrap().push(d);
                                     }
                                 } else if slot >= 0 && slot < rows + 36 {
-                                    let (gslot, gmap): (i16, &mut HashMap<i16,Stack>) = if slot < 27 {
-                                        (slot, all.entry(cp).or_default())
-                                    } else if slot < rows {
-                                        (slot - 27, all.entry(cp2.unwrap()).or_default())
-                                    } else {
-                                        (slot - rows + 9, &mut inv)
-                                    };
+                                    let (gslot, gmap): (i16, &mut HashMap<i16, Stack>) =
+                                        if slot < 27 {
+                                            (slot, all.entry(cp).or_default())
+                                        } else if slot < rows {
+                                            (slot - 27, all.entry(cp2.unwrap()).or_default())
+                                        } else {
+                                            (slot - rows + 9, &mut inv)
+                                        };
                                     let sv = gmap.get(&gslot).cloned();
                                     let cv = cur.clone();
                                     if btn == 0 {
-                                        if cv.1 == 0 && sv.is_some() { *cur = sv.unwrap(); gmap.remove(&gslot); }
-                                        else if cv.1 > 0 && sv.is_none() { gmap.insert(gslot, cv); *cur = (0, 0, Vec::new()); }
-                                        else if cv.1 > 0 && sv.is_some() {
+                                        if cv.1 == 0 && sv.is_some() {
+                                            *cur = sv.unwrap();
+                                            gmap.remove(&gslot);
+                                        } else if cv.1 > 0 && sv.is_none() {
+                                            gmap.insert(gslot, cv);
+                                            *cur = (0, 0, Vec::new());
+                                        } else if cv.1 > 0 && sv.is_some() {
                                             let (si, sc, _cc) = sv.unwrap();
-                                            if si == cv.0 && _cc == cv.2 && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc) { gmap.insert(gslot, (si, sc + cv.1, _cc)); *cur = (0, 0, Vec::new()); }
-                                            else { gmap.insert(gslot, cv); *cur = (si, sc, _cc); }
+                                            if si == cv.0
+                                                && _cc == cv.2
+                                                && sc as i64 + cv.1 as i64
+                                                    <= item_stack_max(si, &_cc)
+                                            {
+                                                gmap.insert(gslot, (si, sc + cv.1, _cc));
+                                                *cur = (0, 0, Vec::new());
+                                            } else {
+                                                gmap.insert(gslot, cv);
+                                                *cur = (si, sc, _cc);
+                                            }
                                         }
                                     } else if btn == 1 {
                                         if cv.1 == 0 && sv.is_some() {
                                             let (si, sc, _cc) = sv.unwrap();
                                             let take = sc - sc / 2;
                                             *cur = (si, take, _cc.clone());
-                                            if sc - take == 0 { gmap.remove(&gslot); } else { gmap.insert(gslot, (si, sc - take, _cc)); }
+                                            if sc - take == 0 {
+                                                gmap.remove(&gslot);
+                                            } else {
+                                                gmap.insert(gslot, (si, sc - take, _cc));
+                                            }
                                         } else if cv.1 > 0 {
-                                            if sv.is_none() { gmap.insert(gslot, (cv.0, 1, cv.2.clone())); *cur = (cv.0, cv.1 - 1, cv.2); }
-                                            else { let (si, sc, _cc) = sv.unwrap();
-                                                if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 { gmap.insert(gslot, (si, sc + 1, _cc)); *cur = (cv.0, cv.1 - 1, cv.2); } }
+                                            if sv.is_none() {
+                                                gmap.insert(gslot, (cv.0, 1, cv.2.clone()));
+                                                *cur = (cv.0, cv.1 - 1, cv.2);
+                                            } else {
+                                                let (si, sc, _cc) = sv.unwrap();
+                                                if si == cv.0
+                                                    && _cc == cv.2
+                                                    && sc < item_stack_max(si, &_cc) as u8
+                                                {
+                                                    gmap.insert(gslot, (si, sc + 1, _cc));
+                                                    *cur = (cv.0, cv.1 - 1, cv.2);
+                                                }
+                                            }
                                         }
                                     }
-                                    let (it, c2, _cc) = gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
+                                    let (it, c2, _cc) =
+                                        gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
                                     let mut p = vec![1u8];
                                     write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
@@ -13554,7 +19302,17 @@ fn handle(mut s: TcpStream) {
                             let furnace_pos = *me.open_furnace.lock().unwrap();
                             if let Some(fp) = furnace_pos {
                                 let mut fs = furnaces().lock().unwrap();
-                                let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                                let f = fs.entry(fp).or_insert(Furnace {
+                                    input: (0, 0, Vec::new()),
+                                    fuel: (0, 0, Vec::new()),
+                                    output: (0, 0, Vec::new()),
+                                    burn_left: 0,
+                                    progress: 0,
+                                    dirty: false,
+                                    xp: 0.0,
+                                    recipe_cache: CachedLookup::default(),
+                                    fuel_cache: CachedLookup::default(),
+                                });
                                 let mut inv = me.inv.lock().unwrap();
                                 let mut cur = me.cursor.lock().unwrap();
                                 if slot == -999 {
@@ -13562,19 +19320,46 @@ fn handle(mut s: TcpStream) {
                                         // vanilla: left-click outside = throw whole stack, right-click = one
                                         let n = if btn == 1 { 1 } else { cur.1 };
                                         let it = cur.clone();
-                                        if n >= cur.1 { *cur = (0, 0, Vec::new()); } else { cur.1 -= n; }
-                                        let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: 0 };
+                                        if n >= cur.1 {
+                                            *cur = (0, 0, Vec::new());
+                                        } else {
+                                            cur.1 -= n;
+                                        }
+                                        let (px, py, pz, ..) = {
+                                            let p = me.pos.lock().unwrap();
+                                            *p
+                                        };
+                                        let d = Drop {
+                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                            x: px,
+                                            y: py + 1.3,
+                                            z: pz,
+                                            item: it.0,
+                                            cnt: n,
+                                            comps: it.2.clone(),
+                                            age: 0,
+                                        };
                                         drops().lock().unwrap().push(d);
                                     }
                                 } else if slot >= 0 && slot < 39 {
                                     if slot == 2 {
                                         // output: take only, merge onto cursor
-                                        if f.output.1 > 0 && (cur.1 == 0 || (cur.0 == f.output.0 && cur.2 == f.output.2 && cur.1 + f.output.1 <= item_stack_max(f.output.0, &f.output.2) as u8)) {
+                                        if f.output.1 > 0
+                                            && (cur.1 == 0
+                                                || (cur.0 == f.output.0
+                                                    && cur.2 == f.output.2
+                                                    && cur.1 + f.output.1
+                                                        <= item_stack_max(f.output.0, &f.output.2)
+                                                            as u8))
+                                        {
                                             let got = f.output.1;
                                             *cur = (f.output.0, cur.1 + got, f.output.2.clone());
-                                            f.output = (0, 0, Vec::new()); f.dirty = true;
-                                            let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
+                                            f.output = (0, 0, Vec::new());
+                                            f.dirty = true;
+                                            let (px, py, pz, ..) = {
+                                                let p = me.pos.lock().unwrap();
+                                                *p
+                                            };
                                             furnace_xp_pop(f, px, py, pz);
                                         }
                                     } else if slot == 0 || slot == 1 {
@@ -13582,23 +19367,50 @@ fn handle(mut s: TcpStream) {
                                         let sv = if m.1 == 0 { None } else { Some(m.clone()) };
                                         let cv = cur.clone();
                                         if btn == 0 {
-                                            if cv.1 == 0 && sv.is_some() { *cur = sv.unwrap(); *m = (0, 0, Vec::new()); }
-                                            else if cv.1 > 0 && sv.is_none() { *m = cv; *cur = (0, 0, Vec::new()); }
-                                            else if cv.1 > 0 && sv.is_some() {
+                                            if cv.1 == 0 && sv.is_some() {
+                                                *cur = sv.unwrap();
+                                                *m = (0, 0, Vec::new());
+                                            } else if cv.1 > 0 && sv.is_none() {
+                                                *m = cv;
+                                                *cur = (0, 0, Vec::new());
+                                            } else if cv.1 > 0 && sv.is_some() {
                                                 let (si, sc, _cc) = sv.unwrap();
-                                                if si == cv.0 && _cc == cv.2 && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc) { *m = (si, sc + cv.1, _cc); *cur = (0, 0, Vec::new()); }
-                                                else { *m = cv; *cur = (si, sc, _cc); }
+                                                if si == cv.0
+                                                    && _cc == cv.2
+                                                    && sc as i64 + cv.1 as i64
+                                                        <= item_stack_max(si, &_cc)
+                                                {
+                                                    *m = (si, sc + cv.1, _cc);
+                                                    *cur = (0, 0, Vec::new());
+                                                } else {
+                                                    *m = cv;
+                                                    *cur = (si, sc, _cc);
+                                                }
                                             }
                                         } else if btn == 1 {
                                             if cv.1 == 0 && sv.is_some() {
                                                 let (si, sc, _cc) = sv.unwrap();
                                                 let take = sc - sc / 2;
                                                 *cur = (si, take, _cc.clone());
-                                                if sc - take == 0 { *m = (0, 0, Vec::new()); } else { *m = (si, sc - take, _cc); }
+                                                if sc - take == 0 {
+                                                    *m = (0, 0, Vec::new());
+                                                } else {
+                                                    *m = (si, sc - take, _cc);
+                                                }
                                             } else if cv.1 > 0 {
-                                                if sv.is_none() { *m = (cv.0, 1, cv.2.clone()); *cur = (cv.0, cv.1 - 1, cv.2); }
-                                                else { let (si, sc, _cc) = sv.unwrap();
-                                                    if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 { *m = (si, sc + 1, _cc); *cur = (cv.0, cv.1 - 1, cv.2); } }
+                                                if sv.is_none() {
+                                                    *m = (cv.0, 1, cv.2.clone());
+                                                    *cur = (cv.0, cv.1 - 1, cv.2);
+                                                } else {
+                                                    let (si, sc, _cc) = sv.unwrap();
+                                                    if si == cv.0
+                                                        && _cc == cv.2
+                                                        && sc < item_stack_max(si, &_cc) as u8
+                                                    {
+                                                        *m = (si, sc + 1, _cc);
+                                                        *cur = (cv.0, cv.1 - 1, cv.2);
+                                                    }
+                                                }
                                             }
                                         }
                                         f.dirty = true;
@@ -13608,7 +19420,8 @@ fn handle(mut s: TcpStream) {
                                         *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
                                     }
                                     // echo whole furnace window (cheap, keeps client honest)
-                                    let (fi, fu, fo) = (f.input.clone(), f.fuel.clone(), f.output.clone());
+                                    let (fi, fu, fo) =
+                                        (f.input.clone(), f.fuel.clone(), f.output.clone());
                                     for (wsl, st) in [(0i16, fi), (1, fu), (2, fo)] {
                                         let mut p = vec![2u8];
                                         write_varint(&mut p, 0);
@@ -13617,7 +19430,10 @@ fn handle(mut s: TcpStream) {
                                         let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
                                     }
                                     if slot >= 3 {
-                                        let (it, c, _cc) = inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()));
+                                        let (it, c, _cc) = inv
+                                            .get(&(slot + 6))
+                                            .cloned()
+                                            .unwrap_or((0, 0, Vec::new()));
                                         let mut p = vec![2u8];
                                         write_varint(&mut p, 0);
                                         p.extend_from_slice(&slot.to_be_bytes());
@@ -13628,7 +19444,6 @@ fn handle(mut s: TcpStream) {
                                 continue;
                             }
                             if *me.open_merchant.lock().unwrap() {
-
                                 let sel = *me.trade_sel.lock().unwrap() as usize;
                                 let ts = trades();
                                 if slot == 2 && sel < ts.len() {
@@ -13636,53 +19451,111 @@ fn handle(mut s: TcpStream) {
                                     let mut cur = me.cursor.lock().unwrap();
                                     let mut mi = me.merchant_in.lock().unwrap();
                                     let have1 = mi[0].0 == ai && mi[0].1 >= ac;
-                                    let have2 = bin.map(|(bi, bc)| mi[1].0 == bi && mi[1].1 >= bc).unwrap_or(true);
-                                    if have1 && have2 && (cur.1 == 0 || (cur.0 == ci && cur.2.is_empty() && cur.1 + cc <= item_stack_max(ci, &Vec::new()) as u8)) {
+                                    let have2 = bin
+                                        .map(|(bi, bc)| mi[1].0 == bi && mi[1].1 >= bc)
+                                        .unwrap_or(true);
+                                    if have1
+                                        && have2
+                                        && (cur.1 == 0
+                                            || (cur.0 == ci
+                                                && cur.2.is_empty()
+                                                && cur.1 + cc
+                                                    <= item_stack_max(ci, &Vec::new()) as u8))
+                                    {
                                         *cur = (ci, cur.1 + cc, Vec::new());
-                                        mi[0].1 -= ac; if mi[0].1 == 0 { mi[0] = (0, 0, Vec::new()); }
-                                        if let Some((_, bc)) = bin { if mi[1].1 >= bc { mi[1].1 -= bc; if mi[1].1 == 0 { mi[1] = (0, 0, Vec::new()); } } }
+                                        mi[0].1 -= ac;
+                                        if mi[0].1 == 0 {
+                                            mi[0] = (0, 0, Vec::new());
+                                        }
+                                        if let Some((_, bc)) = bin {
+                                            if mi[1].1 >= bc {
+                                                mi[1].1 -= bc;
+                                                if mi[1].1 == 0 {
+                                                    mi[1] = (0, 0, Vec::new());
+                                                }
+                                            }
+                                        }
                                         let (s0, s1) = (mi[0].clone(), mi[1].clone());
-                                        drop(mi); drop(cur);
+                                        drop(mi);
+                                        drop(cur);
                                         // vanilla: each completed trade grants 3-6 xp to the player
-                                        let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                        xps().lock().unwrap().push(Xp { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px, y: py + 1.0, z: pz, val: (3 + world_rng::next_u64() % 4) as i16, age: 0 });
+                                        let (px, py, pz, ..) = {
+                                            let p = me.pos.lock().unwrap();
+                                            *p
+                                        };
+                                        xps().lock().unwrap().push(Xp {
+                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                            x: px,
+                                            y: py + 1.0,
+                                            z: pz,
+                                            val: (3 + world_rng::next_u64() % 4) as i16,
+                                            age: 0,
+                                        });
                                         // auto-refill from inventory
                                         let mut inv = me.inv.lock().unwrap();
                                         if s0.1 == 0 && inv_consume(&mut inv, ai, ac as i64) {
                                             let mut mi = me.merchant_in.lock().unwrap();
                                             mi[0] = (ai, ac, Vec::new());
                                         }
-                                        if s1.1 == 0 { if let Some((bi, bc)) = bin { if inv_consume(&mut inv, bi, bc as i64) {
-                                            let mut mi = me.merchant_in.lock().unwrap();
-                                            mi[1] = (bi, bc, Vec::new());
-                                        } } }
+                                        if s1.1 == 0 {
+                                            if let Some((bi, bc)) = bin {
+                                                if inv_consume(&mut inv, bi, bc as i64) {
+                                                    let mut mi = me.merchant_in.lock().unwrap();
+                                                    mi[1] = (bi, bc, Vec::new());
+                                                }
+                                            }
+                                        }
                                         let mi2 = me.merchant_in.lock().unwrap().clone();
-                                        let can2 = bin.map(|(bi, bc)| mi2[1].0 == bi && mi2[1].1 >= bc).unwrap_or(true);
-                                        let snap = inv.clone(); drop(inv);
+                                        let can2 = bin
+                                            .map(|(bi, bc)| mi2[1].0 == bi && mi2[1].1 >= bc)
+                                            .unwrap_or(true);
+                                        let snap = inv.clone();
+                                        drop(inv);
                                         for wsl in 3..39i16 {
-                                            let (it, c, _sc) = snap.get(&(wsl + 6)).cloned().unwrap_or((0, 0, Vec::new()));
+                                            let (it, c, _sc) = snap
+                                                .get(&(wsl + 6))
+                                                .cloned()
+                                                .unwrap_or((0, 0, Vec::new()));
                                             let mut p = vec![4u8];
                                             write_varint(&mut p, 0);
                                             p.extend_from_slice(&wsl.to_be_bytes());
                                             p.extend_from_slice(&slot_wire(&(it, c, _sc)));
-                                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                            let _ =
+                                                send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
                                         }
-                                        let out2 = if mi2[0].0 == ai && mi2[0].1 >= ac && can2 { (cc, ci) } else { (0, 0) };
-                                        for (wsl, stx) in [(0i16, mi2[0].clone()), (1, mi2[1].clone()), (2, if out2.1 > 0 { (out2.1, out2.0, Vec::new()) } else { (0, 0, Vec::new()) })] {
+                                        let out2 = if mi2[0].0 == ai && mi2[0].1 >= ac && can2 {
+                                            (cc, ci)
+                                        } else {
+                                            (0, 0)
+                                        };
+                                        for (wsl, stx) in [
+                                            (0i16, mi2[0].clone()),
+                                            (1, mi2[1].clone()),
+                                            (
+                                                2,
+                                                if out2.1 > 0 {
+                                                    (out2.1, out2.0, Vec::new())
+                                                } else {
+                                                    (0, 0, Vec::new())
+                                                },
+                                            ),
+                                        ] {
                                             let mut p = vec![4u8];
                                             write_varint(&mut p, 0);
                                             p.extend_from_slice(&wsl.to_be_bytes());
                                             p.extend_from_slice(&slot_wire(&stx));
-                                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                            let _ =
+                                                send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
                                         }
                                     }
                                 } else if slot >= 3 && slot <= 38 {
                                     let mut inv = me.inv.lock().unwrap();
                                     let mut cur = me.cursor.lock().unwrap();
                                     click_slot(&mut inv, &mut cur, slot + 6, btn as i8);
-                                    let (it, c, _cc) = inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()));
-                                    drop(cur); drop(inv);
+                                    let (it, c, _cc) =
+                                        inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()));
+                                    drop(cur);
+                                    drop(inv);
                                     let mut p = vec![4u8];
                                     write_varint(&mut p, 0);
                                     p.extend_from_slice(&slot.to_be_bytes());
@@ -13699,20 +19572,47 @@ fn handle(mut s: TcpStream) {
                                     if cur.1 > 0 {
                                         let n = if btn == 1 { 1 } else { cur.1 };
                                         let it = cur.clone();
-                                        if n >= cur.1 { *cur = (0, 0, Vec::new()); } else { cur.1 -= n; }
-                                        let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                        let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: it.0, cnt: n, comps: it.2.clone(), age: 0 };
-                                        drops().lock().unwrap().push(d);drop(cur); drop(grid); drop(inv);
+                                        if n >= cur.1 {
+                                            *cur = (0, 0, Vec::new());
+                                        } else {
+                                            cur.1 -= n;
+                                        }
+                                        let (px, py, pz, ..) = {
+                                            let p = me.pos.lock().unwrap();
+                                            *p
+                                        };
+                                        let d = Drop {
+                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                            x: px,
+                                            y: py + 1.3,
+                                            z: pz,
+                                            item: it.0,
+                                            cnt: n,
+                                            comps: it.2.clone(),
+                                            age: 0,
+                                        };
+                                        drops().lock().unwrap().push(d);
+                                        drop(cur);
+                                        drop(grid);
+                                        drop(inv);
                                         // spawn streams via interest_tick
                                         // drop meta streams via interest_tick
                                         continue;
                                     }
                                 } else if slot == 0 {
                                     if let Some((ri, rc, _rc)) = craft3_result(&grid) {
-                                        if cur.1 == 0 || (cur.0 == ri && cur.2 == _rc && cur.1 + rc <= item_stack_max(ri, &_rc) as u8) {
+                                        if cur.1 == 0
+                                            || (cur.0 == ri
+                                                && cur.2 == _rc
+                                                && cur.1 + rc <= item_stack_max(ri, &_rc) as u8)
+                                        {
                                             for i in 1..=9i16 {
                                                 if let Some((it, c, _cc)) = grid.get(&i).cloned() {
-                                                    if c <= 1 { grid.remove(&i); } else { grid.insert(i, (it, c - 1, _cc)); }
+                                                    if c <= 1 {
+                                                        grid.remove(&i);
+                                                    } else {
+                                                        grid.insert(i, (it, c - 1, _cc));
+                                                    }
                                                 }
                                             }
                                             *cur = (ri, cur.1 + rc, _rc.clone());
@@ -13725,12 +19625,19 @@ fn handle(mut s: TcpStream) {
                                     *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
                                 }
                                 // echo changed slot + result
-                                let (it, c, _ce) = if slot == 0 { (0, 0, Vec::new()) }
-                                    else if (1..=9).contains(&slot) { grid.get(&slot).cloned().unwrap_or((0, 0, Vec::new())) }
-                                    else if slot >= 10 { inv.get(&(slot - 1)).cloned().unwrap_or((0, 0, Vec::new())) }
-                                    else { (0, 0, Vec::new()) };
+                                let (it, c, _ce) = if slot == 0 {
+                                    (0, 0, Vec::new())
+                                } else if (1..=9).contains(&slot) {
+                                    grid.get(&slot).cloned().unwrap_or((0, 0, Vec::new()))
+                                } else if slot >= 10 {
+                                    inv.get(&(slot - 1)).cloned().unwrap_or((0, 0, Vec::new()))
+                                } else {
+                                    (0, 0, Vec::new())
+                                };
                                 let out = craft3_result(&grid).unwrap_or((0, 0, Vec::new()));
-                                drop(grid); drop(inv); drop(cur);
+                                drop(grid);
+                                drop(inv);
+                                drop(cur);
                                 if slot >= 0 {
                                     let mut p = vec![3u8];
                                     write_varint(&mut p, 0);
@@ -13746,13 +19653,31 @@ fn handle(mut s: TcpStream) {
                                 continue;
                             }
                             if slot == -999 {
-                                let cur = { let c = me.cursor.lock().unwrap(); c.clone() };
+                                let cur = {
+                                    let c = me.cursor.lock().unwrap();
+                                    c.clone()
+                                };
                                 if cur.1 > 0 {
                                     let n = if btn == 1 { 1 } else { cur.1 };
-                                    if n >= cur.1 { *me.cursor.lock().unwrap() = (0, 0, Vec::new()); }
-                                    else { me.cursor.lock().unwrap().1 -= n; }
-                                    let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                                    let d = Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: cur.0, cnt: n, comps: cur.2.clone(), age: 0 };
+                                    if n >= cur.1 {
+                                        *me.cursor.lock().unwrap() = (0, 0, Vec::new());
+                                    } else {
+                                        me.cursor.lock().unwrap().1 -= n;
+                                    }
+                                    let (px, py, pz, ..) = {
+                                        let p = me.pos.lock().unwrap();
+                                        *p
+                                    };
+                                    let d = Drop {
+                                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                        x: px,
+                                        y: py + 1.3,
+                                        z: pz,
+                                        item: cur.0,
+                                        cnt: n,
+                                        comps: cur.2.clone(),
+                                        age: 0,
+                                    };
                                     drops().lock().unwrap().push(d);
                                 }
                             } else if slot == 0 {
@@ -13760,20 +19685,33 @@ fn handle(mut s: TcpStream) {
                                 let mut cur = me.cursor.lock().unwrap();
                                 let mut grid = me.craft.lock().unwrap();
                                 if let Some((ri, rc, _rc)) = craft_result(&grid) {
-                                    if cur.1 == 0 || (cur.0 == ri && cur.2 == _rc && cur.1 + rc <= item_stack_max(ri, &_rc) as u8) {
+                                    if cur.1 == 0
+                                        || (cur.0 == ri
+                                            && cur.2 == _rc
+                                            && cur.1 + rc <= item_stack_max(ri, &_rc) as u8)
+                                    {
                                         for i in 1..=4i16 {
                                             if let Some((it, c, _cc)) = grid.get(&i).cloned() {
-                                                if c <= 1 { grid.remove(&i); } else { grid.insert(i, (it, c - 1, _cc)); }
+                                                if c <= 1 {
+                                                    grid.remove(&i);
+                                                } else {
+                                                    grid.insert(i, (it, c - 1, _cc));
+                                                }
                                             }
                                         }
                                         *cur = (ri, cur.1 + rc, _rc.clone());
                                         for i in 0..=4i16 {
-                                            let (it, c, _cc) = if i == 0 { craft_result(&grid).unwrap_or((0, 0, Vec::new())) } else { grid.get(&i).cloned().unwrap_or((0, 0, Vec::new())) };
+                                            let (it, c, _cc) = if i == 0 {
+                                                craft_result(&grid).unwrap_or((0, 0, Vec::new()))
+                                            } else {
+                                                grid.get(&i).cloned().unwrap_or((0, 0, Vec::new()))
+                                            };
                                             let mut p = vec![0u8];
                                             write_varint(&mut p, 0);
                                             p.extend_from_slice(&i.to_be_bytes());
                                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                                            let _ =
+                                                send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
                                         }
                                     }
                                 }
@@ -13783,7 +19721,8 @@ fn handle(mut s: TcpStream) {
                                 click_slot(&mut grid, &mut cur, slot, btn as i8);
                                 let ns = grid.get(&slot).cloned();
                                 let out = craft_result(&grid).unwrap_or((0, 0, Vec::new()));
-                                drop(grid); drop(cur);
+                                drop(grid);
+                                drop(cur);
                                 let mut p = vec![0u8];
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&slot.to_be_bytes());
@@ -13798,13 +19737,45 @@ fn handle(mut s: TcpStream) {
                                 // armor + offhand: vanilla restricts armor
                                 // slots to their matching piece type
                                 let armor_slot_ok = |it: i64, sl: i16| -> bool {
-                                    if it == 0 { return true }
+                                    if it == 0 {
+                                        return true;
+                                    }
                                     let n = |x: &str| name_to_item(x).unwrap_or(-1);
                                     match sl {
-                                        5 => it == n("leather_helmet") || it == n("golden_helmet") || it == n("chainmail_helmet") || it == n("iron_helmet") || it == n("diamond_helmet") || it == n("netherite_helmet") || it == n("turtle_helmet"),
-                                        6 => it == n("leather_chestplate") || it == n("golden_chestplate") || it == n("chainmail_chestplate") || it == n("iron_chestplate") || it == n("diamond_chestplate") || it == n("netherite_chestplate") || it == n("elytra"),
-                                        7 => it == n("leather_leggings") || it == n("golden_leggings") || it == n("chainmail_leggings") || it == n("iron_leggings") || it == n("diamond_leggings") || it == n("netherite_leggings"),
-                                        8 => it == n("leather_boots") || it == n("golden_boots") || it == n("chainmail_boots") || it == n("iron_boots") || it == n("diamond_boots") || it == n("netherite_boots"),
+                                        5 => {
+                                            it == n("leather_helmet")
+                                                || it == n("golden_helmet")
+                                                || it == n("chainmail_helmet")
+                                                || it == n("iron_helmet")
+                                                || it == n("diamond_helmet")
+                                                || it == n("netherite_helmet")
+                                                || it == n("turtle_helmet")
+                                        }
+                                        6 => {
+                                            it == n("leather_chestplate")
+                                                || it == n("golden_chestplate")
+                                                || it == n("chainmail_chestplate")
+                                                || it == n("iron_chestplate")
+                                                || it == n("diamond_chestplate")
+                                                || it == n("netherite_chestplate")
+                                                || it == n("elytra")
+                                        }
+                                        7 => {
+                                            it == n("leather_leggings")
+                                                || it == n("golden_leggings")
+                                                || it == n("chainmail_leggings")
+                                                || it == n("iron_leggings")
+                                                || it == n("diamond_leggings")
+                                                || it == n("netherite_leggings")
+                                        }
+                                        8 => {
+                                            it == n("leather_boots")
+                                                || it == n("golden_boots")
+                                                || it == n("chainmail_boots")
+                                                || it == n("iron_boots")
+                                                || it == n("diamond_boots")
+                                                || it == n("netherite_boots")
+                                        }
                                         _ => true,
                                     }
                                 };
@@ -13816,7 +19787,8 @@ fn handle(mut s: TcpStream) {
                                 }
                                 let ns = inv.get(&slot).cloned();
                                 let cp = cur.clone();
-                                drop(cur); drop(inv);
+                                drop(cur);
+                                drop(inv);
                                 let mut p = vec![0u8];
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&slot.to_be_bytes());
@@ -13833,7 +19805,8 @@ fn handle(mut s: TcpStream) {
                                 click_slot(&mut inv, &mut cur, slot, btn as i8);
                                 *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
                                 let ns = inv.get(&slot).cloned();
-                                drop(inv); drop(cur);
+                                drop(inv);
+                                drop(cur);
                                 let mut p = vec![0u8];
                                 write_varint(&mut p, 0);
                                 p.extend_from_slice(&slot.to_be_bytes());
@@ -13853,25 +19826,62 @@ fn handle(mut s: TcpStream) {
                                     if slot >= 0 && slot < rows + 36 {
                                         let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
                                         if slot < rows {
-                                            let (pos, gslot) = if slot < 27 { (cp, slot) } else { (cp2.unwrap(), slot - 27) };
+                                            let (pos, gslot) = if slot < 27 {
+                                                (cp, slot)
+                                            } else {
+                                                (cp2.unwrap(), slot - 27)
+                                            };
                                             let m = all.entry(pos).or_default();
-                                            let sst = m.remove(&gslot).unwrap_or((0, 0, Vec::new()));
-                                            if hst.1 > 0 { m.insert(gslot, hst.clone()); }
-                                            if sst.1 > 0 { inv.insert(hb, sst); }
+                                            let sst =
+                                                m.remove(&gslot).unwrap_or((0, 0, Vec::new()));
+                                            if hst.1 > 0 {
+                                                m.insert(gslot, hst.clone());
+                                            }
+                                            if sst.1 > 0 {
+                                                inv.insert(hb, sst);
+                                            }
                                         } else {
                                             let g = slot - rows + 9;
                                             let sst = inv.remove(&g).unwrap_or((0, 0, Vec::new()));
-                                            if sst.1 > 0 { inv.insert(hb, sst); }
-                                            if hst.1 > 0 { inv.insert(g, hst.clone()); }
+                                            if sst.1 > 0 {
+                                                inv.insert(hb, sst);
+                                            }
+                                            if hst.1 > 0 {
+                                                inv.insert(g, hst.clone());
+                                            }
                                             resync_slot(&me, 1, slot, &hst);
-                                            resync_slot(&me, 1, rows + (hb - 9), &inv.get(&hb).cloned().unwrap_or((0,0,Vec::new())));
-                                            drop(all); drop(inv);
+                                            resync_slot(
+                                                &me,
+                                                1,
+                                                rows + (hb - 9),
+                                                &inv.get(&hb).cloned().unwrap_or((
+                                                    0,
+                                                    0,
+                                                    Vec::new(),
+                                                )),
+                                            );
+                                            drop(all);
+                                            drop(inv);
                                             continue;
                                         }
-                                        let cur_st = { let (pos, gslot) = if slot < 27 { (cp, slot) } else { (cp2.unwrap(), slot - 27) };
-                                            all.get(&pos).and_then(|m| m.get(&gslot)).cloned().unwrap_or((0, 0, Vec::new())) };
+                                        let cur_st = {
+                                            let (pos, gslot) = if slot < 27 {
+                                                (cp, slot)
+                                            } else {
+                                                (cp2.unwrap(), slot - 27)
+                                            };
+                                            all.get(&pos)
+                                                .and_then(|m| m.get(&gslot))
+                                                .cloned()
+                                                .unwrap_or((0, 0, Vec::new()))
+                                        };
                                         resync_slot(&me, 1, slot, &cur_st);
-                                        resync_slot(&me, 1, rows + (hb - 9), &inv.get(&hb).cloned().unwrap_or((0,0,Vec::new())));
+                                        resync_slot(
+                                            &me,
+                                            1,
+                                            rows + (hb - 9),
+                                            &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
+                                        );
                                     }
                                 } else if let Some(fp) = furnace_pos {
                                     let mut fs = furnaces().lock().unwrap();
@@ -13880,30 +19890,65 @@ fn handle(mut s: TcpStream) {
                                         if slot >= 3 {
                                             let g = slot + 6;
                                             let sst = inv.remove(&g).unwrap_or((0, 0, Vec::new()));
-                                            if sst.1 > 0 { inv.insert(hb, sst); }
-                                            if hst.1 > 0 { inv.insert(g, hst.clone()); }
+                                            if sst.1 > 0 {
+                                                inv.insert(hb, sst);
+                                            }
+                                            if hst.1 > 0 {
+                                                inv.insert(g, hst.clone());
+                                            }
                                             resync_slot(&me, 2, slot, &hst);
                                         } else {
-                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                                            let f = fs.entry(fp).or_insert(Furnace {
+                                                input: (0, 0, Vec::new()),
+                                                fuel: (0, 0, Vec::new()),
+                                                output: (0, 0, Vec::new()),
+                                                burn_left: 0,
+                                                progress: 0,
+                                                dirty: false,
+                                                xp: 0.0,
+                                                recipe_cache: CachedLookup::default(),
+                                                fuel_cache: CachedLookup::default(),
+                                            });
                                             if slot == 2 {
                                                 // output is take-only — push it to hotbar, don't swap in
                                                 if f.output.1 > 0 {
-                                                    let st = std::mem::replace(&mut f.output, (0, 0, Vec::new()));
+                                                    let st = std::mem::replace(
+                                                        &mut f.output,
+                                                        (0, 0, Vec::new()),
+                                                    );
                                                     f.dirty = true;
-                                                    let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
+                                                    let (px, py, pz, ..) = {
+                                                        let p = me.pos.lock().unwrap();
+                                                        *p
+                                                    };
                                                     furnace_xp_pop(f, px, py, pz);
                                                     let rem = map_add_range(&mut inv, 9, 44, st);
-                                                    if rem.1 > 0 { fs.get_mut(&fp).unwrap().output = rem; }
+                                                    if rem.1 > 0 {
+                                                        fs.get_mut(&fp).unwrap().output = rem;
+                                                    }
                                                 }
                                             } else {
-                                                let m = if slot == 0 { &mut f.input } else { &mut f.fuel };
+                                                let m = if slot == 0 {
+                                                    &mut f.input
+                                                } else {
+                                                    &mut f.fuel
+                                                };
                                                 let sst = std::mem::replace(m, (0, 0, Vec::new()));
-                                                if hst.1 > 0 { *m = hst.clone(); }
+                                                if hst.1 > 0 {
+                                                    *m = hst.clone();
+                                                }
                                                 f.dirty = true;
-                                                if sst.1 > 0 { inv.insert(hb, sst); }
+                                                if sst.1 > 0 {
+                                                    inv.insert(hb, sst);
+                                                }
                                             }
                                         }
-                                        resync_slot(&me, 2, hb - 6, &inv.get(&hb).cloned().unwrap_or((0,0,Vec::new()))); // inv hotbar window slot = 30 + (hb-36)+9?
+                                        resync_slot(
+                                            &me,
+                                            2,
+                                            hb - 6,
+                                            &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
+                                        ); // inv hotbar window slot = 30 + (hb-36)+9?
                                     }
                                 } else {
                                     // inventory window: swap slot with hotbar (armor slots refuse)
@@ -13911,8 +19956,12 @@ fn handle(mut s: TcpStream) {
                                     if swappables {
                                         let a = inv.remove(&slot).unwrap_or((0, 0, Vec::new()));
                                         let b = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
-                                        if b.1 > 0 { inv.insert(slot, b.clone()); }
-                                        if a.1 > 0 { inv.insert(hb, a.clone()); }
+                                        if b.1 > 0 {
+                                            inv.insert(slot, b.clone());
+                                        }
+                                        if a.1 > 0 {
+                                            inv.insert(hb, a.clone());
+                                        }
                                         resync_slot(&me, 0, slot, &b);
                                         resync_slot(&me, 0, hb, &a);
                                     }
@@ -13931,52 +19980,83 @@ fn handle(mut s: TcpStream) {
                                     let mut all = chests().lock().unwrap();
                                     for pos in [cp].into_iter().chain(cp2) {
                                         let m = all.entry(pos).or_default();
-                                        let ks: Vec<i16> = m.iter().filter(|(_, v)| v.0 == cur.0 && v.2 == cur.2).map(|(&k, _)| k).collect();
+                                        let ks: Vec<i16> = m
+                                            .iter()
+                                            .filter(|(_, v)| v.0 == cur.0 && v.2 == cur.2)
+                                            .map(|(&k, _)| k)
+                                            .collect();
                                         for k in ks {
-                                            if cur.1 as i64 >= cap { break }
-                                            let take = (cap - cur.1 as i64).min(m[&k].1 as i64) as u8;
+                                            if cur.1 as i64 >= cap {
+                                                break;
+                                            }
+                                            let take =
+                                                (cap - cur.1 as i64).min(m[&k].1 as i64) as u8;
                                             m.get_mut(&k).unwrap().1 -= take;
                                             cur.1 += take;
-                                            if m[&k].1 == 0 { m.remove(&k); }
+                                            if m[&k].1 == 0 {
+                                                m.remove(&k);
+                                            }
                                         }
                                     }
                                 }
                                 if (cur.1 as i64) < cap {
-                                    let ks: Vec<i16> = inv.iter().filter(|(_, v)| v.0 == cur.0 && v.2 == cur.2).map(|(&k, _)| k).collect();
+                                    let ks: Vec<i16> = inv
+                                        .iter()
+                                        .filter(|(_, v)| v.0 == cur.0 && v.2 == cur.2)
+                                        .map(|(&k, _)| k)
+                                        .collect();
                                     for k in ks {
-                                        if cur.1 as i64 >= cap { break }
+                                        if cur.1 as i64 >= cap {
+                                            break;
+                                        }
                                         let take = (cap - cur.1 as i64).min(inv[&k].1 as i64) as u8;
                                         inv.get_mut(&k).unwrap().1 -= take;
                                         cur.1 += take;
-                                        if inv[&k].1 == 0 { inv.remove(&k); }
+                                        if inv[&k].1 == 0 {
+                                            inv.remove(&k);
+                                        }
                                     }
                                 }
                             }
                             let cp2 = cur.clone();
-                            drop(inv); drop(cur);
+                            drop(inv);
+                            drop(cur);
                             // cursor echo (window slot -1) + whole-inventory refresh is cheapest
-                            let mut pc = vec![0u8]; write_varint(&mut pc, 0);
+                            let mut pc = vec![0u8];
+                            write_varint(&mut pc, 0);
                             pc.extend_from_slice(&(-1i16).to_be_bytes());
                             pc.extend_from_slice(&slot_wire(&cp2));
-                            if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x15, pc); }
+                            if let Ok(mut w) = me.sock.lock() {
+                                let _ = send_packet(&mut *w, 0x15, pc);
+                            }
                         } else if mode == 5 {
                             // drag-paint: btn 0/4 start (left/right), 1/5 add slot, 2/6 end
                             let bt = btn as i32;
                             let mut dr = me.drag.lock().unwrap();
                             match bt {
-                                0 | 4 => { dr.0 = bt; dr.1.clear(); }
-                                1 | 5 => { if dr.0 >= 0 && dr.0 + 1 == bt { dr.1.push(slot); } }
+                                0 | 4 => {
+                                    dr.0 = bt;
+                                    dr.1.clear();
+                                }
+                                1 | 5 => {
+                                    if dr.0 >= 0 && dr.0 + 1 == bt {
+                                        dr.1.push(slot);
+                                    }
+                                }
                                 2 | 6 => {
                                     if dr.0 >= 0 && dr.0 + 2 == bt {
                                         let slots_taken = std::mem::take(&mut dr.1);
-                                        dr.0 = -1; drop(dr);
+                                        dr.0 = -1;
+                                        drop(dr);
                                         let mut cur = me.cursor.lock().unwrap();
                                         if cur.1 > 0 && !slots_taken.is_empty() {
                                             let per = (cur.1 as usize / slots_taken.len()) as u8;
                                             // vanilla right-drag paints exactly 1 per slot
                                             let per = if dr_btn_right(bt) { 1 } else { per };
                                             if per > 0 {
-                                                for wsl in slots_taken { paint_slot(&me, wsl, per, &mut cur); }
+                                                for wsl in slots_taken {
+                                                    paint_slot(&me, wsl, per, &mut cur);
+                                                }
                                             }
                                         }
                                     }
@@ -13988,14 +20068,27 @@ fn handle(mut s: TcpStream) {
                             // 1=whole stack); 1=shift-move between regions
                             let chest_pos = *me.open_chest.lock().unwrap();
                             let furnace_pos = *me.open_furnace.lock().unwrap();
-                            let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                            macro_rules! throw { ($st:expr) => { {
-                                let st: Stack = $st;
-                                if st.1 > 0 {
-                                    drops().lock().unwrap().push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                        x: px, y: py + 1.3, z: pz, item: st.0, cnt: st.1, comps: st.2, age: 0 });
-                                }
-                            } } }
+                            let (px, py, pz, ..) = {
+                                let p = me.pos.lock().unwrap();
+                                *p
+                            };
+                            macro_rules! throw {
+                                ($st:expr) => {{
+                                    let st: Stack = $st;
+                                    if st.1 > 0 {
+                                        drops().lock().unwrap().push(Drop {
+                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                            x: px,
+                                            y: py + 1.3,
+                                            z: pz,
+                                            item: st.0,
+                                            cnt: st.1,
+                                            comps: st.2,
+                                            age: 0,
+                                        });
+                                    }
+                                }};
+                            }
                             if let Some((cp, cp2)) = chest_pos {
                                 // window slots: 0..rows chest | rows..rows+36 inv(key=slot-rows+9)
                                 let rows = if cp2.is_some() { 54i16 } else { 27i16 };
@@ -14006,16 +20099,32 @@ fn handle(mut s: TcpStream) {
                                     if mode == 4 {
                                         let n = if btn == 1 { 255 } else { 1 };
                                         let got = if in_cont {
-                                            let (pos, gslot) = if slot < 27 { (cp, slot) } else { (cp2.unwrap(), slot - 27) };
+                                            let (pos, gslot) = if slot < 27 {
+                                                (cp, slot)
+                                            } else {
+                                                (cp2.unwrap(), slot - 27)
+                                            };
                                             map_take(all.entry(pos).or_default(), gslot, n)
-                                        } else { map_take(&mut inv, slot - rows + 9, n) };
-                                        if let Some(st) = got { throw!(st); }
+                                        } else {
+                                            map_take(&mut inv, slot - rows + 9, n)
+                                        };
+                                        if let Some(st) = got {
+                                            throw!(st);
+                                        }
                                     } else if in_cont {
                                         // shift chest -> inv
-                                        let (pos, gslot) = if slot < 27 { (cp, slot) } else { (cp2.unwrap(), slot - 27) };
-                                        if let Some(st) = map_take(all.entry(pos).or_default(), gslot, 255) {
+                                        let (pos, gslot) = if slot < 27 {
+                                            (cp, slot)
+                                        } else {
+                                            (cp2.unwrap(), slot - 27)
+                                        };
+                                        if let Some(st) =
+                                            map_take(all.entry(pos).or_default(), gslot, 255)
+                                        {
                                             let rem = map_add_range(&mut inv, 9, 44, st);
-                                            if rem.1 > 0 { all.get_mut(&pos).unwrap().insert(gslot, rem); }
+                                            if rem.1 > 0 {
+                                                all.get_mut(&pos).unwrap().insert(gslot, rem);
+                                            }
                                         }
                                     } else {
                                         // shift inv -> chest(s): merge into matching stacks
@@ -14023,34 +20132,63 @@ fn handle(mut s: TcpStream) {
                                         if let Some(st) = map_take(&mut inv, slot - rows + 9, 255) {
                                             let mut rem = st;
                                             for pos in [cp].into_iter().chain(cp2) {
-                                                if rem.1 == 0 { break }
+                                                if rem.1 == 0 {
+                                                    break;
+                                                }
                                                 let m = all.entry(pos).or_default();
                                                 for i in 0..27i16 {
-                                                    if rem.1 == 0 { break }
+                                                    if rem.1 == 0 {
+                                                        break;
+                                                    }
                                                     if let Some(c2) = m.get_mut(&i) {
                                                         if c2.0 == rem.0 && c2.2 == rem.2 {
-                                                            let room = (item_stack_max(c2.0, &c2.2) as i64 - c2.1 as i64).max(0) as u8;
-                                                            let t = room.min(rem.1); c2.1 += t; rem.1 -= t;
+                                                            let room = (item_stack_max(c2.0, &c2.2)
+                                                                as i64
+                                                                - c2.1 as i64)
+                                                                .max(0)
+                                                                as u8;
+                                                            let t = room.min(rem.1);
+                                                            c2.1 += t;
+                                                            rem.1 -= t;
                                                         }
                                                     }
                                                 }
                                             }
                                             for pos in [cp].into_iter().chain(cp2) {
-                                                if rem.1 == 0 { break }
+                                                if rem.1 == 0 {
+                                                    break;
+                                                }
                                                 let m = all.entry(pos).or_default();
                                                 for i in 0..27i16 {
-                                                    if !m.contains_key(&i) { m.insert(i, rem.clone()); rem.1 = 0; break }
+                                                    if !m.contains_key(&i) {
+                                                        m.insert(i, rem.clone());
+                                                        rem.1 = 0;
+                                                        break;
+                                                    }
                                                 }
                                             }
-                                            if rem.1 > 0 { inv.insert(slot - rows + 9, rem); }
+                                            if rem.1 > 0 {
+                                                inv.insert(slot - rows + 9, rem);
+                                            }
                                         }
                                     }
                                     // resync touched slot + inventory/chest echo kept cheap
                                     let cur_st = if in_cont {
-                                        let (pos, gslot) = if slot < 27 { (cp, slot) } else { (cp2.unwrap(), slot - 27) };
-                                        all.get(&pos).and_then(|m| m.get(&gslot)).cloned().unwrap_or((0, 0, Vec::new()))
+                                        let (pos, gslot) = if slot < 27 {
+                                            (cp, slot)
+                                        } else {
+                                            (cp2.unwrap(), slot - 27)
+                                        };
+                                        all.get(&pos)
+                                            .and_then(|m| m.get(&gslot))
+                                            .cloned()
+                                            .unwrap_or((0, 0, Vec::new()))
                                     } else {
-                                        inv.get(&(slot - rows + 9)).cloned().unwrap_or((0, 0, Vec::new()))
+                                        inv.get(&(slot - rows + 9)).cloned().unwrap_or((
+                                            0,
+                                            0,
+                                            Vec::new(),
+                                        ))
                                     };
                                     resync_slot(&me, 1, slot, &cur_st);
                                 }
@@ -14063,57 +20201,174 @@ fn handle(mut s: TcpStream) {
                                 if slot >= 0 && slot < 39 {
                                     if mode == 4 {
                                         if slot >= 3 {
-                                            if let Some(st) = map_take(&mut inv, slot + 6, if btn == 1 { 255 } else { 1 }) { throw!(st); }
+                                            if let Some(st) = map_take(
+                                                &mut inv,
+                                                slot + 6,
+                                                if btn == 1 { 255 } else { 1 },
+                                            ) {
+                                                throw!(st);
+                                            }
                                         } else {
-                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
-                                            let m = if slot == 0 { &mut f.input } else if slot == 1 { &mut f.fuel } else { &mut f.output };
+                                            let f = fs.entry(fp).or_insert(Furnace {
+                                                input: (0, 0, Vec::new()),
+                                                fuel: (0, 0, Vec::new()),
+                                                output: (0, 0, Vec::new()),
+                                                burn_left: 0,
+                                                progress: 0,
+                                                dirty: false,
+                                                xp: 0.0,
+                                                recipe_cache: CachedLookup::default(),
+                                                fuel_cache: CachedLookup::default(),
+                                            });
+                                            let m = if slot == 0 {
+                                                &mut f.input
+                                            } else if slot == 1 {
+                                                &mut f.fuel
+                                            } else {
+                                                &mut f.output
+                                            };
                                             let n = if btn == 1 { m.1 } else { 1.min(m.1) };
-                                            if n > 0 { let st = (m.0, n, m.2.clone()); m.1 -= n; if m.1 == 0 { *m = (0, 0, Vec::new()); } f.dirty = true;
-                                                if slot == 2 { let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p }; furnace_xp_pop(f, px, py, pz); }
-                                                throw!(st); }
+                                            if n > 0 {
+                                                let st = (m.0, n, m.2.clone());
+                                                m.1 -= n;
+                                                if m.1 == 0 {
+                                                    *m = (0, 0, Vec::new());
+                                                }
+                                                f.dirty = true;
+                                                if slot == 2 {
+                                                    let (px, py, pz, ..) = {
+                                                        let p = me.pos.lock().unwrap();
+                                                        *p
+                                                    };
+                                                    furnace_xp_pop(f, px, py, pz);
+                                                }
+                                                throw!(st);
+                                            }
                                         }
                                     } else if slot == 2 {
                                         // shift-take output into inventory
-                                        let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                                        let f = fs.entry(fp).or_insert(Furnace {
+                                            input: (0, 0, Vec::new()),
+                                            fuel: (0, 0, Vec::new()),
+                                            output: (0, 0, Vec::new()),
+                                            burn_left: 0,
+                                            progress: 0,
+                                            dirty: false,
+                                            xp: 0.0,
+                                            recipe_cache: CachedLookup::default(),
+                                            fuel_cache: CachedLookup::default(),
+                                        });
                                         if f.output.1 > 0 {
-                                            let st = std::mem::replace(&mut f.output, (0, 0, Vec::new()));
+                                            let st = std::mem::replace(
+                                                &mut f.output,
+                                                (0, 0, Vec::new()),
+                                            );
                                             f.dirty = true;
-                                            let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
+                                            let (px, py, pz, ..) = {
+                                                let p = me.pos.lock().unwrap();
+                                                *p
+                                            };
                                             furnace_xp_pop(f, px, py, pz);
                                             let rem = map_add_range(&mut inv, 9, 44, st);
-                                            if rem.1 > 0 { fs.get_mut(&fp).unwrap().output = rem; }
+                                            if rem.1 > 0 {
+                                                fs.get_mut(&fp).unwrap().output = rem;
+                                            }
                                         }
                                     } else if slot <= 1 {
                                         // shift input/fuel -> inv
-                                        let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                                        let f = fs.entry(fp).or_insert(Furnace {
+                                            input: (0, 0, Vec::new()),
+                                            fuel: (0, 0, Vec::new()),
+                                            output: (0, 0, Vec::new()),
+                                            burn_left: 0,
+                                            progress: 0,
+                                            dirty: false,
+                                            xp: 0.0,
+                                            recipe_cache: CachedLookup::default(),
+                                            fuel_cache: CachedLookup::default(),
+                                        });
                                         let m = if slot == 0 { &mut f.input } else { &mut f.fuel };
                                         if m.1 > 0 {
                                             let st = std::mem::replace(m, (0, 0, Vec::new()));
                                             f.dirty = true;
                                             let rem = map_add_range(&mut inv, 9, 44, st);
-                                            if rem.1 > 0 { let f2 = fs.get_mut(&fp).unwrap(); if slot == 0 { f2.input = rem } else { f2.fuel = rem } }
+                                            if rem.1 > 0 {
+                                                let f2 = fs.get_mut(&fp).unwrap();
+                                                if slot == 0 {
+                                                    f2.input = rem
+                                                } else {
+                                                    f2.fuel = rem
+                                                }
+                                            }
                                         }
                                     } else {
                                         // shift inv -> furnace input/fuel by type, else stays
                                         if let Some(st) = inv.get(&(slot + 6)).cloned() {
-                                            let f = fs.entry(fp).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
-                                            let dst: i16 = if smelt_out(st.0).is_some() { 0 } else if fuel_ticks(st.0) > 0 { 1 } else { -1 };
+                                            let f = fs.entry(fp).or_insert(Furnace {
+                                                input: (0, 0, Vec::new()),
+                                                fuel: (0, 0, Vec::new()),
+                                                output: (0, 0, Vec::new()),
+                                                burn_left: 0,
+                                                progress: 0,
+                                                dirty: false,
+                                                xp: 0.0,
+                                                recipe_cache: CachedLookup::default(),
+                                                fuel_cache: CachedLookup::default(),
+                                            });
+                                            let dst: i16 = if smelt_out(st.0).is_some() {
+                                                0
+                                            } else if fuel_ticks(st.0) > 0 {
+                                                1
+                                            } else {
+                                                -1
+                                            };
                                             if dst >= 0 {
-                                                let m = if dst == 0 { &mut f.input } else { &mut f.fuel };
-                                                let fits = m.1 == 0 || (m.0 == st.0 && m.2 == st.2 && (m.1 as i64) < item_stack_max(m.0, &m.2));
+                                                let m = if dst == 0 {
+                                                    &mut f.input
+                                                } else {
+                                                    &mut f.fuel
+                                                };
+                                                let fits = m.1 == 0
+                                                    || (m.0 == st.0
+                                                        && m.2 == st.2
+                                                        && (m.1 as i64)
+                                                            < item_stack_max(m.0, &m.2));
                                                 if fits {
                                                     inv.remove(&(slot + 6));
-                                                    let room = (item_stack_max(st.0, &st.2) as i64).min(255) as u8;
-                                                    let t = if m.1 == 0 { room.min(st.1) } else { (room - m.1).min(st.1) };
-                                                    if m.1 == 0 { *m = (st.0, t, st.2.clone()); } else { m.1 += t; }
+                                                    let room = (item_stack_max(st.0, &st.2) as i64)
+                                                        .min(255)
+                                                        as u8;
+                                                    let t = if m.1 == 0 {
+                                                        room.min(st.1)
+                                                    } else {
+                                                        (room - m.1).min(st.1)
+                                                    };
+                                                    if m.1 == 0 {
+                                                        *m = (st.0, t, st.2.clone());
+                                                    } else {
+                                                        m.1 += t;
+                                                    }
                                                     f.dirty = true;
-                                                    if t < st.1 { inv.insert(slot + 6, (st.0, st.1 - t, st.2)); }
+                                                    if t < st.1 {
+                                                        inv.insert(
+                                                            slot + 6,
+                                                            (st.0, st.1 - t, st.2),
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                    let cur_st = if slot >= 3 { inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new())) }
-                                        else { let f2 = fs.get(&fp).unwrap(); match slot { 0 => f2.input.clone(), 1 => f2.fuel.clone(), _ => f2.output.clone() } };
+                                    let cur_st = if slot >= 3 {
+                                        inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()))
+                                    } else {
+                                        let f2 = fs.get(&fp).unwrap();
+                                        match slot {
+                                            0 => f2.input.clone(),
+                                            1 => f2.fuel.clone(),
+                                            _ => f2.output.clone(),
+                                        }
+                                    };
                                     resync_slot(&me, 2, slot, &cur_st);
                                 }
                                 continue;
@@ -14123,53 +20378,88 @@ fn handle(mut s: TcpStream) {
                                 let mut inv = me.inv.lock().unwrap();
                                 let mut grid = me.craft.lock().unwrap();
                                 if mode == 4 {
-                                    let got = if (5..=8).contains(&slot) || (9..=44).contains(&slot) || slot == 45 {
+                                    let got = if (5..=8).contains(&slot)
+                                        || (9..=44).contains(&slot)
+                                        || slot == 45
+                                    {
                                         map_take(&mut inv, slot, if btn == 1 { 255 } else { 1 })
                                     } else if (1..=4).contains(&slot) {
                                         map_take(&mut grid, slot, if btn == 1 { 255 } else { 1 })
-                                    } else { None };
-                                    if let Some(st) = got { throw!(st); }
-                                    resync_slot(&me, 0, slot, &inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new())));
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(st) = got {
+                                        throw!(st);
+                                    }
+                                    resync_slot(
+                                        &me,
+                                        0,
+                                        slot,
+                                        &inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new())),
+                                    );
                                 } else if (9..=35).contains(&slot) {
                                     // shift from main inv: armor equips, else -> hotbar
                                     if let Some(st) = inv.get(&slot).cloned() {
                                         let asl = armor_slot_for(st.0);
                                         if asl >= 0 && !inv.contains_key(&asl) {
-                                            inv.remove(&slot); inv.insert(asl, st);
-                                            resync_slot(&me, 0, asl, &inv.get(&asl).cloned().unwrap());
+                                            inv.remove(&slot);
+                                            inv.insert(asl, st);
+                                            resync_slot(
+                                                &me,
+                                                0,
+                                                asl,
+                                                &inv.get(&asl).cloned().unwrap(),
+                                            );
                                         } else {
                                             inv.remove(&slot);
                                             let rem = map_add_range(&mut inv, 36, 44, st);
-                                            if rem.1 > 0 { inv.insert(slot, rem); }
+                                            if rem.1 > 0 {
+                                                inv.insert(slot, rem);
+                                            }
                                         }
                                     }
                                 } else if (36..=44).contains(&slot) {
                                     if let Some(st) = inv.get(&slot).cloned() {
                                         inv.remove(&slot);
                                         let rem = map_add_range(&mut inv, 9, 35, st);
-                                        if rem.1 > 0 { inv.insert(slot, rem); }
+                                        if rem.1 > 0 {
+                                            inv.insert(slot, rem);
+                                        }
                                     }
                                 } else if (5..=8).contains(&slot) || slot == 45 {
                                     // unequip into inventory
                                     if let Some(st) = inv.get(&slot).cloned() {
                                         inv.remove(&slot);
                                         let rem = map_add_range(&mut inv, 9, 44, st);
-                                        if rem.1 > 0 { inv.insert(slot, rem); }
+                                        if rem.1 > 0 {
+                                            inv.insert(slot, rem);
+                                        }
                                     }
                                 } else if (1..=4).contains(&slot) {
                                     if let Some(st) = grid.get(&slot).cloned() {
                                         grid.remove(&slot);
                                         let rem = map_add_range(&mut inv, 9, 44, st);
-                                        if rem.1 > 0 { grid.insert(slot, rem); }
+                                        if rem.1 > 0 {
+                                            grid.insert(slot, rem);
+                                        }
                                     }
                                 }
                                 *me.armor_pts.lock().unwrap() = armor_pts_of(&inv);
-                                drop(grid); drop(inv);
-                                resync_slot(&me, 0, slot, &{ let i2 = me.inv.lock().unwrap(); i2.get(&slot).cloned().unwrap_or((0, 0, Vec::new())) });
+                                drop(grid);
+                                drop(inv);
+                                resync_slot(&me, 0, slot, &{
+                                    let i2 = me.inv.lock().unwrap();
+                                    i2.get(&slot).cloned().unwrap_or((0, 0, Vec::new()))
+                                });
                                 // armor/offhand moves need armor slot echo too
                                 if (5..=8).contains(&slot) || slot == 45 || mode == 1 {
                                     for asl in 5..=8i16 {
-                                        let st2 = me.inv.lock().unwrap().get(&asl).cloned().unwrap_or((0, 0, Vec::new()));
+                                        let st2 =
+                                            me.inv.lock().unwrap().get(&asl).cloned().unwrap_or((
+                                                0,
+                                                0,
+                                                Vec::new(),
+                                            ));
                                         resync_slot(&me, 0, asl, &st2);
                                     }
                                 }
@@ -14187,10 +20477,18 @@ fn handle(mut s: TcpStream) {
         {
             // remove owned projectile/bobber entities
             let mut fb = bobbers().lock().unwrap();
-            let gone_b: Vec<i32> = fb.iter().filter(|b| b.owner == me_cleanup.eid).map(|b| b.eid).collect();
+            let gone_b: Vec<i32> = fb
+                .iter()
+                .filter(|b| b.owner == me_cleanup.eid)
+                .map(|b| b.eid)
+                .collect();
             fb.retain(|b| b.owner != me_cleanup.eid);
             let mut pq = pearls().lock().unwrap();
-            let gone_p: Vec<i32> = pq.iter().filter(|p| p.owner == me_cleanup.eid).map(|p| p.eid).collect();
+            let gone_p: Vec<i32> = pq
+                .iter()
+                .filter(|p| p.owner == me_cleanup.eid)
+                .map(|p| p.eid)
+                .collect();
             pq.retain(|p| p.owner != me_cleanup.eid);
             for eid in gone_b.iter().chain(gone_p.iter()) {
                 broadcast_seen_destroy(*eid);
@@ -14201,12 +20499,23 @@ fn handle(mut s: TcpStream) {
             // merchant inputs are placed back into the inventory (the
             // overflow falls on the ground as item entities)
             let mut back: Vec<Stack> = Vec::new();
-            let cur = std::mem::replace(&mut *me_cleanup.cursor.lock().unwrap(), (0, 0, Vec::new()));
-            if cur.1 > 0 { back.push(cur); }
-            for g in [&me_cleanup.craft, &me_cleanup.craft9] {
-                for (_, st) in std::mem::take(&mut *g.lock().unwrap()) { if st.1 > 0 { back.push(st); } }
+            let cur =
+                std::mem::replace(&mut *me_cleanup.cursor.lock().unwrap(), (0, 0, Vec::new()));
+            if cur.1 > 0 {
+                back.push(cur);
             }
-            for st in me_cleanup.merchant_in.lock().unwrap().iter().cloned() { if st.1 > 0 { back.push(st); } }
+            for g in [&me_cleanup.craft, &me_cleanup.craft9] {
+                for (_, st) in std::mem::take(&mut *g.lock().unwrap()) {
+                    if st.1 > 0 {
+                        back.push(st);
+                    }
+                }
+            }
+            for st in me_cleanup.merchant_in.lock().unwrap().iter().cloned() {
+                if st.1 > 0 {
+                    back.push(st);
+                }
+            }
             let mut inv = me_cleanup.inv.lock().unwrap();
             let mut to_drop: Vec<Stack> = Vec::new();
             for st in back {
@@ -14214,38 +20523,67 @@ fn handle(mut s: TcpStream) {
                 let mut left = st.1 as i64;
                 let cap = item_stack_max(st.0, &st.2) as i64;
                 for (_, v) in inv.iter_mut() {
-                    if left <= 0 { break }
+                    if left <= 0 {
+                        break;
+                    }
                     if v.0 == st.0 && v.2 == st.2 && (v.1 as i64) < cap {
                         let t = (cap - v.1 as i64).min(left);
-                        v.1 += t as u8; left -= t;
+                        v.1 += t as u8;
+                        left -= t;
                     }
                 }
                 while left > 0 {
                     if let Some(sl) = (9..=44).chain(36..=44).find(|sl| !inv.contains_key(sl)) {
                         let t = left.min(cap) as u8;
-                        inv.insert(sl, (st.0, t, st.2.clone())); left -= t as i64;
-                    } else { to_drop.push((st.0, left.min(cap) as u8, st.2.clone())); left -= cap.min(left); }
+                        inv.insert(sl, (st.0, t, st.2.clone()));
+                        left -= t as i64;
+                    } else {
+                        to_drop.push((st.0, left.min(cap) as u8, st.2.clone()));
+                        left -= cap.min(left);
+                    }
                 }
             }
             if !to_drop.is_empty() {
                 let (px, py, pz, ..) = *me_cleanup.pos.lock().unwrap();
                 let mut drp = drops().lock().unwrap();
                 for st in to_drop {
-                    drp.push(Drop { eid: NEXT_EID.fetch_add(1, Ordering::SeqCst), x: px, y: py + 1.3, z: pz, item: st.0, cnt: st.1, comps: st.2, age: 0 });
+                    drp.push(Drop {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        x: px,
+                        y: py + 1.3,
+                        z: pz,
+                        item: st.0,
+                        cnt: st.1,
+                        comps: st.2,
+                        age: 0,
+                    });
                 }
             }
             *me_cleanup.drag.lock().unwrap() = (-1, Vec::new());
-            inv_store().lock().unwrap().insert(name.clone(), inv.clone());
+            inv_store()
+                .lock()
+                .unwrap()
+                .insert(name.clone(), inv.clone());
             let p = *me_cleanup.pos.lock().unwrap();
-            pos_store().lock().unwrap().insert(name.clone(), (p.0, p.1, p.2, p.3, p.4));
+            pos_store()
+                .lock()
+                .unwrap()
+                .insert(name.clone(), (p.0, p.1, p.2, p.3, p.4));
         }
         let mut cls = clients().lock().unwrap();
         cls.retain(|c| c.eid != me_cleanup.eid);
         drop(cls);
-        broadcast(me_cleanup.eid, |_c| (0x42, {
-            let mut p = Vec::new(); write_varint(&mut p, 1); write_varint(&mut p, me_cleanup.eid as i64); p
-        }));
-        let mut p = Vec::new(); write_varint(&mut p, 1); p.extend_from_slice(&me_cleanup.uuid);
+        broadcast(me_cleanup.eid, |_c| {
+            (0x42, {
+                let mut p = Vec::new();
+                write_varint(&mut p, 1);
+                write_varint(&mut p, me_cleanup.eid as i64);
+                p
+            })
+        });
+        let mut p = Vec::new();
+        write_varint(&mut p, 1);
+        p.extend_from_slice(&me_cleanup.uuid);
         broadcast(me_cleanup.eid, |_c| (0x3d, p.clone()));
     }
 }
@@ -14256,226 +20594,361 @@ fn handle(mut s: TcpStream) {
 // food, shield). seq is acked here; callers must not ack again.
 fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat_release: bool) {
     let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x05, ack(seq));
-                { let inv = me.inv.lock().unwrap();
-                  let main = inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0);
-                  if main == 931 { // fishing rod: cast or reel
-                    drop(inv);
-                    let mut fb = bobbers().lock().unwrap();
-                    if let Some(ix) = fb.iter().position(|b| b.owner == me.eid) {
-                            let b = fb.remove(ix);
-                            broadcast_seen_destroy(b.eid);
-                            if b.bit { // catch!
-                                // datapack gameplay/fishing table wins; fallback raw fish
-                                let table: Option<Vec<LootPool>> = loot_tables().lock().unwrap()
-                                    .get("minecraft:gameplay/fishing").map(|p| p.iter().map(|pl| LootPool {
-                                        rolls: pl.rolls, chance: pl.chance, funcs: pl.funcs.clone(),
-                                        entries: pl.entries.iter().map(|e| LootEntry { item: e.item, min: e.min, max: e.max, funcs: e.funcs.clone() }).collect()
-                                    }).collect());
-                                let (fish, fcnt, fcomps) = table
-                                    .and_then(|p| roll_loot(&p).into_iter().next())
-                                    .unwrap_or((if (b.age as u64) % 5 == 0 { 936 } else { 935 }, 1, Vec::new()));
-                                let mut inv = me.inv.lock().unwrap();
-                                let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
-                                inv.insert(slot, (fish, fcnt, fcomps.clone()));
-                                let mut p = vec![4u8]; write_varint(&mut p, 0);
-                                p.extend_from_slice(&slot.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&(fish, fcnt, fcomps)));
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
-                            }
-                    } else {
-                        let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
-                        let yr = (yaw as f64).to_radians(); let pr = (pitch as f64).to_radians();
-                        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                        let b = Bobber { eid, owner: me.eid, x, y: y + 1.5, z,
-                            dx: -yr.sin() * pr.cos() * 1.2, dy: -pr.sin() * 1.2 + 0.2, dz: yr.cos() * pr.cos() * 1.2, age: 0, bit: false };
-                                                fb.push(b);
-                        // spawn streams via interest_tick
-                    }
-                    return;
-                  }
-                  if main == 993 { // ender pearl: throw (vanilla 20t cooldown)
-                    if me.pearl_cd.lock().unwrap().elapsed() < Duration::from_secs(1) { return; }
-                    *me.pearl_cd.lock().unwrap() = Instant::now();
-                    { let mut cp = Vec::new(); write_varint(&mut cp, 993); // itemID
-                      write_varint(&mut cp, 20);                          // cooldownTicks
-                      if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x17, cp); } }
-                    drop(inv);
-                    let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
-                    let yr = (yaw as f64).to_radians(); let pr = (pitch as f64).to_radians();
-                    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    let pe = Pearl { eid, owner: me.eid, x, y: y + 1.5, z,
-                        dx: -yr.sin() * pr.cos() * 2.0, dy: -pr.sin() * 2.0 + 0.3, dz: yr.cos() * pr.cos() * 2.0, ttl: server_ticks(PEARL_TTL_GT) as i32 };
-                                        pearls().lock().unwrap().push(pe);
-                    // spawn streams via interest_tick
-                    if *me.gm.lock().unwrap() != 1 {
-                        let mut inv = me.inv.lock().unwrap();
-                        let hs = 36 + held_slot;
-                        if let Some((it, c, _cc)) = inv.get(&hs).cloned() { if it == 993 {
-                            if c <= 1 { inv.remove(&hs); } else { inv.insert(hs, (it, c - 1, _cc)); }
-                        } }
-                        drop(inv);
-                        held_slot_resync(&me);
-                    }
-                    return;
-                  }
-                  if main == 912 || main == 927 { // snowball/egg: throw (egg may hatch a chicken)
-                    drop(inv);
-                    let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
-                    let yr = (yaw as f64).to_radians(); let pr = (pitch as f64).to_radians();
-                    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    let sb = Snowball { eid, owner: me.eid, x, y: y + 1.5, z,
-                        dx: -yr.sin() * pr.cos() * 1.5, dy: -pr.sin() * 1.5 + 0.25, dz: yr.cos() * pr.cos() * 1.5, ttl: server_ticks(SNOWBALL_TTL_GT) as i32,
-                        egg: main == 927 };
-                                        snowballs().lock().unwrap().push(sb);
-                    // spawn streams via interest_tick
-                    if *me.gm.lock().unwrap() != 1 {
-                        let mut inv2 = me.inv.lock().unwrap();
-                        let hs = 36 + held_slot;
-                        if let Some((it, c, _cc)) = inv2.get(&hs).cloned() { if it == 912 || it == 927 {
-                            if c <= 1 { inv2.remove(&hs); } else { inv2.insert(hs, (it, c - 1, _cc)); }
-                        } }
-                        drop(inv2);
-                        held_slot_resync(&me);
-                    }
-                    return;
-                  }
-                  if main == 1162 || (_h == Some(1) && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
-                    *me.blocking.lock().unwrap() = true;
-                    return;
-                  }
-                  let asl = armor_slot_for(main);
-                  if asl > 0 {
-                    // vanilla: right-click equips armor into its slot (swaps)
-                    drop(inv);
-                    let hs = 36 + held_slot;
-                    let mut inv2 = me.inv.lock().unwrap();
-                    if let Some(st) = inv2.get(&hs).cloned() {
-                        let cur = inv2.get(&asl).cloned().unwrap_or((0, 0, Vec::new()));
-                        inv2.insert(asl, (st.0, 1, st.2.clone()));
-                        let leftover = st.1 - 1;
-                        if cur.0 != 0 {
-                            if leftover > 0 {
-                                inv2.insert(hs, (st.0, leftover, st.2));
-                                let free = (9..=44i16).find(|sl| !inv2.contains_key(sl)).unwrap_or(9);
-                                inv2.insert(free, cur);
-                            } else { inv2.insert(hs, cur); }
-                        } else if leftover > 0 { inv2.insert(hs, (st.0, leftover, st.2)); }
-                        else { inv2.remove(&hs); }
-                    }
-                    drop(inv2);
-                    held_slot_resync(me);
-                    {
-                        let st = me.inv.lock().unwrap().get(&asl).cloned().unwrap_or((0, 0, Vec::new()));
-                        let mut p = vec![0u8];
-                        write_varint(&mut p, 0);
-                        p.extend_from_slice(&asl.to_be_bytes());
-                        p.extend_from_slice(&slot_wire(&st));
-                        if let Ok(mut w) = me.sock.lock() { let _ = send_packet(&mut *w, 0x15, p); }
-                    }
-                    return;
-                  }
-                  if main == 914 { // milk_bucket: clears all effects, leaves a bucket
-                    if !eat_release {
-                        // vanilla: milk is a 32-tick drink like food
-                        *me.eat_start.lock().unwrap() = Some(Instant::now());
-                        return;
-                    }
-                    drop(inv);
-                    let gone: Vec<i32> = { let mut ef = me.effs.lock().unwrap();
-                        let g: Vec<i32> = ef.iter().map(|e| e.id).collect(); ef.clear(); g };
-                    for id in &gone {
-                        let pk = remove_effect_pkt(me.eid, *id);
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x43, pk.clone());
-                        broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
-                    }
-                    if *me.gm.lock().unwrap() != 1 { let mut iv = me.inv.lock().unwrap();
-                        let hs = 36 + held_slot;
-                        iv.insert(hs, (name_to_item("bucket").unwrap_or(0), 1, Vec::new())); }
-                    held_slot_resync(me);
-                    return;
-                  }
-                  if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
-                    *me.bow_draw.lock().unwrap() = Some(Instant::now());
-                    return;
-                  } }
-                if *me.gm.lock().unwrap() != 1 {
-                    // prefer held slot; fall back to first food item in inventory
-                    let (slot, it) = {
-                        let inv = me.inv.lock().unwrap();
-                        let hs = 36 + held_slot;
-                        match inv.get(&hs) {
-                            Some((it, _, _)) if food_value(*it) > 0 => (hs, *it),
-                            _ => inv.iter().find(|(_, (i, _, _))| food_value(*i) > 0)
-                                    .map(|(&sl, (i, _, _))| (sl, *i)).unwrap_or((hs, 0)),
-                        }
-                    };
-                    let fv = food_value(it);
-                    let cur_food = *me.food.lock().unwrap();
-                    let edible = fv > 0 && (cur_food < 20 || always_edible(it));
-                    if edible && !eat_release {
-                        // vanilla: eating holds use for 32 ticks; nothing consumed yet
-                        *me.eat_start.lock().unwrap() = Some(Instant::now());
-                    }
-                    if edible && eat_release {
-                        let mut f = me.food.lock().unwrap();
-                        *f = (*f + fv).min(20);
-                        let nf = *f as f32;
-                        let mut st = me.sat.lock().unwrap();
-                        *st = (*st + sat_value(it)).min(nf);
-                        drop(st); drop(f);
-                        let ncnt = {
-                            let mut inv = me.inv.lock().unwrap();
-                            let (nc, cc2) = inv.get(&slot).map(|e| (e.1.saturating_sub(1), e.2.clone())).unwrap_or((0, Vec::new()));
-                            if nc == 0 { inv.remove(&slot); } else { inv.insert(slot, (it, nc, cc2)); }
-                            nc
-                        };
-                        let mut p = vec![0u8];
-                        write_varint(&mut p, 0);
-                        p.extend_from_slice(&slot.to_be_bytes());
-                        write_varint(&mut p, ncnt as i64);
-                        if ncnt > 0 { write_varint(&mut p, it); write_varint(&mut p, 0); write_varint(&mut p, 0); }
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
-                        let hh = *me.hp.lock().unwrap();
-                        let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, &me));
-                        // vanilla food side-effects (golden apple, pufferfish, ...)
-                        for &(ch, eid2, amp, ticks) in food_effects(it) {
-                            if (world_rng::next_u64() % 100) < ch {
-                                { let mut ef = me.effs.lock().unwrap();
-                                  ef.retain(|e| e.id != eid2);
-                                  ef.push(Eff { id: eid2, amp, left: ticks }); }
-                                if eid2 == 21 { *me.absorb.lock().unwrap() = (amp + 1) as f32 * 4.0; }
-                                let pk = entity_effect_pkt(me.eid, eid2, amp, ticks);
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x76, pk.clone());
-                                broadcast_seen(me.eid, |_c| (0x76, pk.clone()));
-                            }
-                        }
-                        // honey bottle clears poison only
-                        if it == name_to_item("honey_bottle").unwrap_or(-9) {
-                            let had = { let mut ef = me.effs.lock().unwrap();
-                                let h = ef.iter().any(|e| e.id == 18);
-                                ef.retain(|e| e.id != 18); h };
-                            if had {
-                                let pk = remove_effect_pkt(me.eid, 18);
-                                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x43, pk.clone());
-                                broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
-                            }
-                        }
-                        // chorus fruit: random teleport within +-8 blocks
-                        if it == name_to_item("chorus_fruit").unwrap_or(-9) {
-                            let (px, py, pz, ..) = { let p = me.pos.lock().unwrap(); *p };
-                            for _ in 0..16 {
-                                let nx = px + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
-                                let nz = pz + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
-                                let ny = surface_y(nx.round() as i32, nz.round() as i32);
-                                if (ny - py).abs() < 8.0 {
-                                    { let mut p = me.pos.lock().unwrap(); *p = (nx, ny, nz, p.3, p.4, true); }
-                                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x40, teleport_pkt(nx, ny, nz, 0.0, 0.0, 100));
-                                    break
-                                }
-                            }
+    {
+        let inv = me.inv.lock().unwrap();
+        let main = inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0);
+        if main == 931 {
+            // fishing rod: cast or reel
+            drop(inv);
+            let mut fb = bobbers().lock().unwrap();
+            if let Some(ix) = fb.iter().position(|b| b.owner == me.eid) {
+                let b = fb.remove(ix);
+                broadcast_seen_destroy(b.eid);
+                if b.bit {
+                    // catch!
+                    // datapack gameplay/fishing table wins; fallback raw fish
+                    let table: Option<Vec<LootPool>> = loot_tables()
+                        .lock()
+                        .unwrap()
+                        .get("minecraft:gameplay/fishing")
+                        .map(|p| {
+                            p.iter()
+                                .map(|pl| LootPool {
+                                    rolls: pl.rolls,
+                                    chance: pl.chance,
+                                    funcs: pl.funcs.clone(),
+                                    entries: pl
+                                        .entries
+                                        .iter()
+                                        .map(|e| LootEntry {
+                                            item: e.item,
+                                            min: e.min,
+                                            max: e.max,
+                                            funcs: e.funcs.clone(),
+                                        })
+                                        .collect(),
+                                })
+                                .collect()
+                        });
+                    let (fish, fcnt, fcomps) = table
+                        .and_then(|p| roll_loot(&p).into_iter().next())
+                        .unwrap_or((
+                            if (b.age as u64) % 5 == 0 { 936 } else { 935 },
+                            1,
+                            Vec::new(),
+                        ));
+                    let mut inv = me.inv.lock().unwrap();
+                    let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
+                    inv.insert(slot, (fish, fcnt, fcomps.clone()));
+                    let mut p = vec![4u8];
+                    write_varint(&mut p, 0);
+                    p.extend_from_slice(&slot.to_be_bytes());
+                    p.extend_from_slice(&slot_wire(&(fish, fcnt, fcomps)));
+                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+                }
+            } else {
+                let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+                let yr = (yaw as f64).to_radians();
+                let pr = (pitch as f64).to_radians();
+                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                let b = Bobber {
+                    eid,
+                    owner: me.eid,
+                    x,
+                    y: y + 1.5,
+                    z,
+                    dx: -yr.sin() * pr.cos() * 1.2,
+                    dy: -pr.sin() * 1.2 + 0.2,
+                    dz: yr.cos() * pr.cos() * 1.2,
+                    age: 0,
+                    bit: false,
+                };
+                fb.push(b);
+                // spawn streams via interest_tick
+            }
+            return;
+        }
+        if main == 993 {
+            // ender pearl: throw (vanilla 20t cooldown)
+            if me.pearl_cd.lock().unwrap().elapsed() < Duration::from_secs(1) {
+                return;
+            }
+            *me.pearl_cd.lock().unwrap() = Instant::now();
+            {
+                let mut cp = Vec::new();
+                write_varint(&mut cp, 993); // itemID
+                write_varint(&mut cp, 20); // cooldownTicks
+                if let Ok(mut w) = me.sock.lock() {
+                    let _ = send_packet(&mut *w, 0x17, cp);
+                }
+            }
+            drop(inv);
+            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+            let yr = (yaw as f64).to_radians();
+            let pr = (pitch as f64).to_radians();
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let pe = Pearl {
+                eid,
+                owner: me.eid,
+                x,
+                y: y + 1.5,
+                z,
+                dx: -yr.sin() * pr.cos() * 2.0,
+                dy: -pr.sin() * 2.0 + 0.3,
+                dz: yr.cos() * pr.cos() * 2.0,
+                ttl: server_ticks(PEARL_TTL_GT) as i32,
+            };
+            pearls().lock().unwrap().push(pe);
+            // spawn streams via interest_tick
+            if *me.gm.lock().unwrap() != 1 {
+                let mut inv = me.inv.lock().unwrap();
+                let hs = 36 + held_slot;
+                if let Some((it, c, _cc)) = inv.get(&hs).cloned() {
+                    if it == 993 {
+                        if c <= 1 {
+                            inv.remove(&hs);
+                        } else {
+                            inv.insert(hs, (it, c - 1, _cc));
                         }
                     }
                 }
+                drop(inv);
+                held_slot_resync(&me);
+            }
+            return;
+        }
+        if main == 912 || main == 927 {
+            // snowball/egg: throw (egg may hatch a chicken)
+            drop(inv);
+            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap();
+            let yr = (yaw as f64).to_radians();
+            let pr = (pitch as f64).to_radians();
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let sb = Snowball {
+                eid,
+                owner: me.eid,
+                x,
+                y: y + 1.5,
+                z,
+                dx: -yr.sin() * pr.cos() * 1.5,
+                dy: -pr.sin() * 1.5 + 0.25,
+                dz: yr.cos() * pr.cos() * 1.5,
+                ttl: server_ticks(SNOWBALL_TTL_GT) as i32,
+                egg: main == 927,
+            };
+            snowballs().lock().unwrap().push(sb);
+            // spawn streams via interest_tick
+            if *me.gm.lock().unwrap() != 1 {
+                let mut inv2 = me.inv.lock().unwrap();
+                let hs = 36 + held_slot;
+                if let Some((it, c, _cc)) = inv2.get(&hs).cloned() {
+                    if it == 912 || it == 927 {
+                        if c <= 1 {
+                            inv2.remove(&hs);
+                        } else {
+                            inv2.insert(hs, (it, c - 1, _cc));
+                        }
+                    }
+                }
+                drop(inv2);
+                held_slot_resync(&me);
+            }
+            return;
+        }
+        if main == 1162 || (_h == Some(1) && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
+            *me.blocking.lock().unwrap() = true;
+            return;
+        }
+        let asl = armor_slot_for(main);
+        if asl > 0 {
+            // vanilla: right-click equips armor into its slot (swaps)
+            drop(inv);
+            let hs = 36 + held_slot;
+            let mut inv2 = me.inv.lock().unwrap();
+            if let Some(st) = inv2.get(&hs).cloned() {
+                let cur = inv2.get(&asl).cloned().unwrap_or((0, 0, Vec::new()));
+                inv2.insert(asl, (st.0, 1, st.2.clone()));
+                let leftover = st.1 - 1;
+                if cur.0 != 0 {
+                    if leftover > 0 {
+                        inv2.insert(hs, (st.0, leftover, st.2));
+                        let free = (9..=44i16).find(|sl| !inv2.contains_key(sl)).unwrap_or(9);
+                        inv2.insert(free, cur);
+                    } else {
+                        inv2.insert(hs, cur);
+                    }
+                } else if leftover > 0 {
+                    inv2.insert(hs, (st.0, leftover, st.2));
+                } else {
+                    inv2.remove(&hs);
+                }
+            }
+            drop(inv2);
+            held_slot_resync(me);
+            {
+                let st = me
+                    .inv
+                    .lock()
+                    .unwrap()
+                    .get(&asl)
+                    .cloned()
+                    .unwrap_or((0, 0, Vec::new()));
+                let mut p = vec![0u8];
+                write_varint(&mut p, 0);
+                p.extend_from_slice(&asl.to_be_bytes());
+                p.extend_from_slice(&slot_wire(&st));
+                if let Ok(mut w) = me.sock.lock() {
+                    let _ = send_packet(&mut *w, 0x15, p);
+                }
+            }
+            return;
+        }
+        if main == 914 {
+            // milk_bucket: clears all effects, leaves a bucket
+            if !eat_release {
+                // vanilla: milk is a 32-tick drink like food
+                *me.eat_start.lock().unwrap() = Some(Instant::now());
+                return;
+            }
+            drop(inv);
+            let gone: Vec<i32> = {
+                let mut ef = me.effs.lock().unwrap();
+                let g: Vec<i32> = ef.iter().map(|e| e.id).collect();
+                ef.clear();
+                g
+            };
+            for id in &gone {
+                let pk = remove_effect_pkt(me.eid, *id);
+                let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x43, pk.clone());
+                broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
+            }
+            if *me.gm.lock().unwrap() != 1 {
+                let mut iv = me.inv.lock().unwrap();
+                let hs = 36 + held_slot;
+                iv.insert(hs, (name_to_item("bucket").unwrap_or(0), 1, Vec::new()));
+            }
+            held_slot_resync(me);
+            return;
+        }
+        if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
+            *me.bow_draw.lock().unwrap() = Some(Instant::now());
+            return;
+        }
+    }
+    if *me.gm.lock().unwrap() != 1 {
+        // prefer held slot; fall back to first food item in inventory
+        let (slot, it) = {
+            let inv = me.inv.lock().unwrap();
+            let hs = 36 + held_slot;
+            match inv.get(&hs) {
+                Some((it, _, _)) if food_value(*it) > 0 => (hs, *it),
+                _ => inv
+                    .iter()
+                    .find(|(_, (i, _, _))| food_value(*i) > 0)
+                    .map(|(&sl, (i, _, _))| (sl, *i))
+                    .unwrap_or((hs, 0)),
+            }
+        };
+        let fv = food_value(it);
+        let cur_food = *me.food.lock().unwrap();
+        let edible = fv > 0 && (cur_food < 20 || always_edible(it));
+        if edible && !eat_release {
+            // vanilla: eating holds use for 32 ticks; nothing consumed yet
+            *me.eat_start.lock().unwrap() = Some(Instant::now());
+        }
+        if edible && eat_release {
+            let mut f = me.food.lock().unwrap();
+            *f = (*f + fv).min(20);
+            let nf = *f as f32;
+            let mut st = me.sat.lock().unwrap();
+            *st = (*st + sat_value(it)).min(nf);
+            drop(st);
+            drop(f);
+            let ncnt = {
+                let mut inv = me.inv.lock().unwrap();
+                let (nc, cc2) = inv
+                    .get(&slot)
+                    .map(|e| (e.1.saturating_sub(1), e.2.clone()))
+                    .unwrap_or((0, Vec::new()));
+                if nc == 0 {
+                    inv.remove(&slot);
+                } else {
+                    inv.insert(slot, (it, nc, cc2));
+                }
+                nc
+            };
+            let mut p = vec![0u8];
+            write_varint(&mut p, 0);
+            p.extend_from_slice(&slot.to_be_bytes());
+            write_varint(&mut p, ncnt as i64);
+            if ncnt > 0 {
+                write_varint(&mut p, it);
+                write_varint(&mut p, 0);
+                write_varint(&mut p, 0);
+            }
+            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x15, p);
+            let hh = *me.hp.lock().unwrap();
+            let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x5d, health_pkt_c(hh, &me));
+            // vanilla food side-effects (golden apple, pufferfish, ...)
+            for &(ch, eid2, amp, ticks) in food_effects(it) {
+                if (world_rng::next_u64() % 100) < ch {
+                    {
+                        let mut ef = me.effs.lock().unwrap();
+                        ef.retain(|e| e.id != eid2);
+                        ef.push(Eff {
+                            id: eid2,
+                            amp,
+                            left: ticks,
+                        });
+                    }
+                    if eid2 == 21 {
+                        *me.absorb.lock().unwrap() = (amp + 1) as f32 * 4.0;
+                    }
+                    let pk = entity_effect_pkt(me.eid, eid2, amp, ticks);
+                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x76, pk.clone());
+                    broadcast_seen(me.eid, |_c| (0x76, pk.clone()));
+                }
+            }
+            // honey bottle clears poison only
+            if it == name_to_item("honey_bottle").unwrap_or(-9) {
+                let had = {
+                    let mut ef = me.effs.lock().unwrap();
+                    let h = ef.iter().any(|e| e.id == 18);
+                    ef.retain(|e| e.id != 18);
+                    h
+                };
+                if had {
+                    let pk = remove_effect_pkt(me.eid, 18);
+                    let _ = send_packet(&mut *me.sock.lock().unwrap(), 0x43, pk.clone());
+                    broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
+                }
+            }
+            // chorus fruit: random teleport within +-8 blocks
+            if it == name_to_item("chorus_fruit").unwrap_or(-9) {
+                let (px, py, pz, ..) = {
+                    let p = me.pos.lock().unwrap();
+                    *p
+                };
+                for _ in 0..16 {
+                    let nx = px + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
+                    let nz = pz + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
+                    let ny = surface_y(nx.round() as i32, nz.round() as i32);
+                    if (ny - py).abs() < 8.0 {
+                        {
+                            let mut p = me.pos.lock().unwrap();
+                            *p = (nx, ny, nz, p.3, p.4, true);
+                        }
+                        let _ = send_packet(
+                            &mut *me.sock.lock().unwrap(),
+                            0x40,
+                            teleport_pkt(nx, ny, nz, 0.0, 0.0, 100),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------- RCON (parity-fixture control plane) ----------
@@ -14495,39 +20968,79 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
     let mut authed = false;
     loop {
         let mut lb = [0u8; 4];
-        if s.read_exact(&mut lb).is_err() { return }
+        if s.read_exact(&mut lb).is_err() {
+            return;
+        }
         let len = i32::from_le_bytes(lb);
-        if !(4..=8200).contains(&len) { return }
+        if !(4..=8200).contains(&len) {
+            return;
+        }
         let mut body = vec![0u8; len as usize];
-        if s.read_exact(&mut body).is_err() { return }
-        if body.len() < 10 { return }
+        if s.read_exact(&mut body).is_err() {
+            return;
+        }
+        if body.len() < 10 {
+            return;
+        }
         let id = i32::from_le_bytes(body[..4].try_into().unwrap());
         let ty = i32::from_le_bytes(body[4..8].try_into().unwrap());
         let cmd = String::from_utf8_lossy(&body[8..body.len().saturating_sub(2)]).to_string();
         let (rid, rty, out) = if !authed {
-            if ty == 3 && cmd == pass { authed = true; (id, 2i32, String::new()) }
-            else if ty == 3 { (id, 2i32, String::new()) } // wrong pass handled below
-            else { return }
+            if ty == 3 && cmd == pass {
+                authed = true;
+                (id, 2i32, String::new())
+            } else if ty == 3 {
+                (id, 2i32, String::new())
+            }
+            // wrong pass handled below
+            else {
+                return;
+            }
         } else {
             match ty {
-                2 => (id, 0i32, run_command_ctx(&CmdCtx { me: None, x: 0.5, y: 16.0, z: 0.5 },
-                            &format!("/{}", cmd.trim_start_matches('/')), &mut None)),
+                2 => (
+                    id,
+                    0i32,
+                    run_command_ctx(
+                        &CmdCtx {
+                            me: None,
+                            x: 0.5,
+                            y: 16.0,
+                            z: 0.5,
+                        },
+                        &format!("/{}", cmd.trim_start_matches('/')),
+                        &mut None,
+                    ),
+                ),
                 _ => (id, 0i32, String::new()),
             }
         };
-        let rid = if ty == 3 && !authed && !pass.is_empty() && cmd != pass { -1 } else { rid };
+        let rid = if ty == 3 && !authed && !pass.is_empty() && cmd != pass {
+            -1
+        } else {
+            rid
+        };
         let mut p = Vec::with_capacity(out.len() + 14);
         p.extend_from_slice(&(10 + out.len() as i32).to_le_bytes());
         p.extend_from_slice(&rid.to_le_bytes());
         p.extend_from_slice(&rty.to_le_bytes());
         p.extend_from_slice(out.as_bytes());
         p.extend_from_slice(&[0, 0]);
-        if s.write_all(&p).is_err() { return }
-        if ty == 3 && rid == -1 { return }
+        if s.write_all(&p).is_err() {
+            return;
+        }
+        if ty == 3 && rid == -1 {
+            return;
+        }
     }
 }
 fn rcon_listener() {
-    let Some(port) = std::env::var("MC_SPINE_RCON_PORT").ok().and_then(|p| p.parse::<u16>().ok()) else { return };
+    let Some(port) = std::env::var("MC_SPINE_RCON_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        return;
+    };
     let pass = std::env::var("MC_SPINE_RCON_PASS").unwrap_or_default();
     if pass.trim().is_empty() {
         eprintln!("[rcon] refusing to start without a nonempty MC_SPINE_RCON_PASS");
@@ -14568,7 +21081,9 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     step("hoppers", hopper_tick);
     step("water", water_tick);
     let lava_period = server_ticks(FLUID_TICK_GT);
-    if TICK_IDX.load(Ordering::Relaxed) % lava_period == 0 { step("lava", lava_tick); }
+    if TICK_IDX.load(Ordering::Relaxed) % lava_period == 0 {
+        step("lava", lava_tick);
+    }
     step("observers", observer_tick);
     step("plugins", plugin_tick);
     step("actors", actor_tick);
@@ -14580,7 +21095,10 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
 
 fn main() {
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
-    if probe_args.first().is_some_and(|arg| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample")) {
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample"))
+    {
         #[cfg(feature = "fabric-probe")]
         {
             if let Err(error) = java_compat::run(&probe_args) {
@@ -14598,19 +21116,37 @@ fn main() {
 
     // quick profile: MC_SPINE_WG_PROFILE=n generates n^2 chunks then exits
     if let Ok(n) = std::env::var("MC_SPINE_WG_PROFILE") {
-        let seed: u64 = std::env::var("MC_SPINE_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        if !worldgen::init(seed, name_to_state) { eprintln!("[wg] load failed"); return; }
+        let seed: u64 = std::env::var("MC_SPINE_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if !worldgen::init(seed, name_to_state) {
+            eprintln!("[wg] load failed");
+            return;
+        }
         let n: i32 = n.parse().unwrap_or(4);
         let t0 = Instant::now();
-        for cx in 0..n { for cz in 0..n {
-            let c = worldgen::chunk_cols(cx, cz).unwrap();
-            let _ = c.surface(0, 0);
-        }}
-        eprintln!("[wgprof] {}x{} chunks in {:?} ({:.1} ms/chunk)", n, n, t0.elapsed(), t0.elapsed().as_secs_f64()*1000.0/(n*n) as f64);
+        for cx in 0..n {
+            for cz in 0..n {
+                let c = worldgen::chunk_cols(cx, cz).unwrap();
+                let _ = c.surface(0, 0);
+            }
+        }
+        eprintln!(
+            "[wgprof] {}x{} chunks in {:?} ({:.1} ms/chunk)",
+            n,
+            n,
+            t0.elapsed(),
+            t0.elapsed().as_secs_f64() * 1000.0 / (n * n) as f64
+        );
         {
             let c = worldgen::EVAL_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
             if c > 0 {
-                eprintln!("[wgprof] eval_c calls: {} ({:.0} per chunk)", c, c as f64 / (n * n) as f64);
+                eprintln!(
+                    "[wgprof] eval_c calls: {} ({:.0} per chunk)",
+                    c,
+                    c as f64 / (n * n) as f64
+                );
             }
         }
         if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {
@@ -14630,11 +21166,17 @@ fn main() {
             // side from (0,0), each section in the send layout `(ly<<8)|(lz<<4)|lx`.
             // `tools/carver_diff.py` reads it against a vanilla region file.
             let n: i32 = std::env::var("MC_SPINE_WG_DUMP_N")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6);
             let ox: i32 = std::env::var("MC_SPINE_WG_DUMP_X")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let oz: i32 = std::env::var("MC_SPINE_WG_DUMP_Z")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let (lo, hi) = (worldgen::min_y(), worldgen::max_y());
             let mut out: Vec<u8> = Vec::new();
             let t1 = Instant::now();
@@ -14653,8 +21195,13 @@ fn main() {
                 }
             }
             std::fs::write(&path, &out).unwrap();
-            eprintln!("[wgdump] {} chunks -> {} ({} bytes) in {:?}",
-                n * n, path, out.len(), t1.elapsed());
+            eprintln!(
+                "[wgdump] {} chunks -> {} ({} bytes) in {:?}",
+                n * n,
+                path,
+                out.len(),
+                t1.elapsed()
+            );
         }
         if std::env::var("WGDIFF").is_ok() {
             // vanilla reference values at (0,0,0) seed 0 from pumpkin test data
@@ -14669,13 +21216,43 @@ fn main() {
                 ("minecraft:overworld/final_density", 0.15719144),
             ] {
                 let got = worldgen::debug_eval(name, 0, 0, 0).unwrap_or(f64::NAN);
-                eprintln!("{:45} got={:+.10} want={:+.10} diff={:+.10}", name, got, want, got - want);
+                eprintln!(
+                    "{:45} got={:+.10} want={:+.10} diff={:+.10}",
+                    name,
+                    got,
+                    want,
+                    got - want
+                );
             }
         }
         if std::env::var("WGD2").is_ok() {
-            for name in ["minecraft:overworld/ridges","minecraft:overworld/ridges_folded","minecraft:overworld/jaggedness","minecraft:overworld/erosion","noise:jagged","noise:ridge","minecraft:overworld/continents","minecraft:overworld/offset","minecraft:overworld/depth","minecraft:overworld/factor","minecraft:overworld/jaggedness","minecraft:overworld/sloped_cheese","minecraft:shift_x","minecraft:overworld/caves/noodle","minecraft:overworld/caves/entrances","minecraft:overworld/caves/pillars","minecraft:overworld/caves/spaghetti_2d","minecraft:overworld/caves/spaghetti_roughness_function"] {
+            for name in [
+                "minecraft:overworld/ridges",
+                "minecraft:overworld/ridges_folded",
+                "minecraft:overworld/jaggedness",
+                "minecraft:overworld/erosion",
+                "noise:jagged",
+                "noise:ridge",
+                "minecraft:overworld/continents",
+                "minecraft:overworld/offset",
+                "minecraft:overworld/depth",
+                "minecraft:overworld/factor",
+                "minecraft:overworld/jaggedness",
+                "minecraft:overworld/sloped_cheese",
+                "minecraft:shift_x",
+                "minecraft:overworld/caves/noodle",
+                "minecraft:overworld/caves/entrances",
+                "minecraft:overworld/caves/pillars",
+                "minecraft:overworld/caves/spaghetti_2d",
+                "minecraft:overworld/caves/spaghetti_roughness_function",
+            ] {
                 for x in [0i32, 200, 1000] {
-                    eprintln!("{} x={} -> {:?}", name, x, worldgen::debug_eval(name, x, 0, 0));
+                    eprintln!(
+                        "{} x={} -> {:?}",
+                        name,
+                        x,
+                        worldgen::debug_eval(name, x, 0, 0)
+                    );
                 }
             }
         }
@@ -14689,37 +21266,55 @@ fn main() {
             for x in [-256i32, -128, -64, -32, 0, 32, 64, 128, 256, 400] {
                 for z in [-256i32, -128, 0, 128, 256, 400] {
                     let c = worldgen::chunk_cols(x >> 4, z >> 4).unwrap();
-                    eprintln!("SURF {x},{z},{}", c.surface((x & 15) as usize, (z & 15) as usize));
+                    eprintln!(
+                        "SURF {x},{z},{}",
+                        c.surface((x & 15) as usize, (z & 15) as usize)
+                    );
                 }
             }
         }
         if std::env::var("WGD").is_ok() {
             for x in [-64i32, -32, 0, 32, 64, 200, 500] {
                 let c = worldgen::chunk_cols(x >> 4, 0).unwrap();
-                eprintln!("x={} surf={} d@y60={:.4} d@y70={:.4} d@y0={:.4}",
-                    x, c.surface((x & 15) as usize, 0),
+                eprintln!(
+                    "x={} surf={} d@y60={:.4} d@y70={:.4} d@y0={:.4}",
+                    x,
+                    c.surface((x & 15) as usize, 0),
                     worldgen::density_in(&c, x, 60, 0),
                     worldgen::density_in(&c, x, 70, 0),
-                    worldgen::density_in(&c, x, 0, 0));
+                    worldgen::density_in(&c, x, 0, 0)
+                );
             }
         }
         if std::env::var("WGBPROF").is_ok() {
             let t0 = Instant::now();
-            for cx in 0..n { for cz in 0..n {
-                for sec in 0..24 {
-                    let _ = worldgen::biome_section(cx, sec * 16 - 64, cz);
+            for cx in 0..n {
+                for cz in 0..n {
+                    for sec in 0..24 {
+                        let _ = worldgen::biome_section(cx, sec * 16 - 64, cz);
+                    }
                 }
-            }}
+            }
             eprintln!("[wgbprof] {}x{} chunks x24 sec in {:?}", n, n, t0.elapsed());
         }
         if std::env::var("WGCOL").is_ok() {
             // dump vertical strips of state ids around the surface for sample coords
-            for x in [-2000i32, -1500, -1200, -900, -640, -500, -200, -64, 0, 64, 200, 400, 900, 1400, 2000] {
+            for x in [
+                -2000i32, -1500, -1200, -900, -640, -500, -200, -64, 0, 64, 200, 400, 900, 1400,
+                2000,
+            ] {
                 for z in [0i32] {
-                    let cc = match worldgen::chunk_cols(x >> 4, z >> 4) { Some(c) => c, None => continue };
+                    let cc = match worldgen::chunk_cols(x >> 4, z >> 4) {
+                        Some(c) => c,
+                        None => continue,
+                    };
                     let surf = cc.surface((x & 15) as usize, (z & 15) as usize);
                     let mut strip = String::new();
-                    for y in (surf - 6..=surf + 1).rev().chain((-8..=4).rev()).chain((-64..=-58).rev()) {
+                    for y in (surf - 6..=surf + 1)
+                        .rev()
+                        .chain((-8..=4).rev())
+                        .chain((-64..=-58).rev())
+                    {
                         let st = wg2_block(x, y, z).unwrap_or(99999);
                         strip.push_str(&format!("{}:{} ", y, st));
                     }
@@ -14734,14 +21329,11 @@ fn main() {
                 eprintln!("biome @123,123,123 = {} params {:?}", b, t);
             }
             const BCH: [&str; 64] = [
-                "bd","bj","bl","bc","bf","cg","co","cf","df",
-                "do","dd","df","dl","de","ds","dc","eb","eh",
-                "em","eb","ff","fo","fo","fp","fr","gr","is",
-                "jp","jg","lo","lc","ms","md","mf","nw","oc",
-                "ob","op","os","pl","rv","sv","sp","si",
-                "sb","sp","ss","st","ss","sj","pk","ss",
-                "sp","sw","ta","te","tv","wo","wf","wf",
-                "wg","wh","ws","wb",
+                "bd", "bj", "bl", "bc", "bf", "cg", "co", "cf", "df", "do", "dd", "df", "dl", "de",
+                "ds", "dc", "eb", "eh", "em", "eb", "ff", "fo", "fo", "fp", "fr", "gr", "is", "jp",
+                "jg", "lo", "lc", "ms", "md", "mf", "nw", "oc", "ob", "op", "os", "pl", "rv", "sv",
+                "sp", "si", "sb", "sp", "ss", "st", "ss", "sj", "pk", "ss", "sp", "sw", "ta", "te",
+                "tv", "wo", "wf", "wf", "wg", "wh", "ws", "wb",
             ];
             let _ = BCH;
             for z in -64..64i32 {
@@ -14749,22 +21341,22 @@ fn main() {
                 for x in -64..64i32 {
                     let b = worldgen::biome_at(x, 16, z).unwrap_or(-1);
                     row.push(match b {
-                        39 => '.',               // plains
-                        21 | 20 | 4 => 'F',      // forest/flower/birch
-                        54 | 47 | 37 | 38 => 'T', // taiga family
-                        14 => 'D',               // desert
-                        41 | 42 => 'S',          // savanna
+                        39 => '.',                                       // plains
+                        21 | 20 | 4 => 'F',                              // forest/flower/birch
+                        54 | 47 | 37 | 38 => 'T',                        // taiga family
+                        14 => 'D',                                       // desert
+                        41 | 42 => 'S',                                  // savanna
                         35 | 13 | 9 | 11 | 12 | 29 | 22 | 57 | 6 => '~', // oceans
-                        40 | 24 => '|',          // river
-                        3 | 8 => '#',            // beach
-                        45 | 25 | 23 | 46 | 26 | 50 | 27 => '^', // snowy/peaks
-                        0 | 19 | 63 => 'M',      // badlands
-                        16 | 28 | 49 | 1 => 'J', // jungle
-                        53 | 31 => 'W',          // swamp/mangrove
-                        32 => 'm',               // meadow
-                        5 => 'C',                // cherry grove
-                        33 => 'u',               // mushroom
-                        30 | 15 | 10 => '!',     // lush/dripstone/deepdark
+                        40 | 24 => '|',                                  // river
+                        3 | 8 => '#',                                    // beach
+                        45 | 25 | 23 | 46 | 26 | 50 | 27 => '^',         // snowy/peaks
+                        0 | 19 | 63 => 'M',                              // badlands
+                        16 | 28 | 49 | 1 => 'J',                         // jungle
+                        53 | 31 => 'W',                                  // swamp/mangrove
+                        32 => 'm',                                       // meadow
+                        5 => 'C',                                        // cherry grove
+                        33 => 'u',                                       // mushroom
+                        30 | 15 | 10 => '!',                             // lush/dripstone/deepdark
                         _ => '?',
                     });
                 }
@@ -14786,7 +21378,9 @@ fn main() {
                             let cc = worldgen::chunk_cols(cx, cz).unwrap();
                             let top = cc.wtop((x & 15) as usize, (z & 15) as usize);
                             for y in top - 2..top + 24 {
-                                if let Some(st) = worldgen::feature_state(x, y, z, feature::populate) {
+                                if let Some(st) =
+                                    worldgen::feature_state(x, y, z, feature::populate)
+                                {
                                     *hist.entry(st).or_default() += 1;
                                     n += 1;
                                 }
@@ -14799,7 +21393,9 @@ fn main() {
             let mut top: Vec<(u32, usize)> = hist.into_iter().collect();
             top.sort_by_key(|e| std::cmp::Reverse(e.1));
             for (st, c) in top.iter().take(25) {
-                let nm = crate::block_registry::breg().map(|r| r.name_of(*st).to_string()).unwrap_or_default();
+                let nm = crate::block_registry::breg()
+                    .map(|r| r.name_of(*st).to_string())
+                    .unwrap_or_default();
                 eprintln!("[feat]   {} x{} (id {})", nm, c, st);
             }
             // a surface column: find a log and print its column
@@ -14812,11 +21408,18 @@ fn main() {
                             let top = cc.wtop((x & 15) as usize, (z & 15) as usize);
                             for y in top..top + 20 {
                                 let st = wg2_block(x, y, z).unwrap_or(99999);
-                                let n = crate::block_registry::breg().map(|r| r.name_of(st).to_string()).unwrap_or_default();
+                                let n = crate::block_registry::breg()
+                                    .map(|r| r.name_of(st).to_string())
+                                    .unwrap_or_default();
                                 if n.contains("log") {
                                     eprintln!("[feat] LOG @{},{} surf={}", x, z, top);
                                     for yy in top - 3..top + 10 {
-                                        let nm = crate::block_registry::breg().map(|r| r.name_of(wg2_block(x, yy, z).unwrap_or(99999)).to_string()).unwrap_or_default();
+                                        let nm = crate::block_registry::breg()
+                                            .map(|r| {
+                                                r.name_of(wg2_block(x, yy, z).unwrap_or(99999))
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_default();
                                         eprintln!("[feat]   y={} {}", yy, nm);
                                     }
                                     break 'outer;
@@ -14834,7 +21437,15 @@ fn main() {
                 for x in -256..256 {
                     let c = worldgen::chunk_cols(x >> 4, z >> 4).unwrap();
                     let s = c.surface((x & 15) as usize, (z & 15) as usize);
-                    row.push(if s > 100 { '#' } else if s > 63 { ':' } else if s > 57 { '.' } else { '~' });
+                    row.push(if s > 100 {
+                        '#'
+                    } else if s > 63 {
+                        ':'
+                    } else if s > 57 {
+                        '.'
+                    } else {
+                        '~'
+                    });
                 }
                 eprintln!("{}", row);
             }
@@ -14842,7 +21453,10 @@ fn main() {
         return;
     }
     // datapack worldgen: seed from env (default 0), MC_SPINE_WG=old keeps flat generator
-    let wg_seed: u64 = std::env::var("MC_SPINE_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let wg_seed: u64 = std::env::var("MC_SPINE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     if std::env::var("MC_SPINE_WG").ok().as_deref() != Some("old") {
         if worldgen::init(wg_seed, name_to_state) {
             *WORLD_SPAWN.lock().unwrap() = (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5);
@@ -14871,21 +21485,37 @@ fn main() {
     http_server();
     load_datapacks();
     {
-        let loads: Vec<String> = packs().lock().unwrap().iter().flat_map(|p| p.load.clone()).collect();
-        for f in loads { run_function(&f, None, &mut None); }
+        let loads: Vec<String> = packs()
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|p| p.load.clone())
+            .collect();
+        for f in loads {
+            run_function(&f, None, &mut None);
+        }
     }
     // seed a few mobs near spawn (only if none restored from save)
     if mobs().lock().unwrap().is_empty() {
         let mut ms = mobs().lock().unwrap();
         // (etype, x, z): 22=cow, 124=zombie (1.21.1 entity ids)
-        for (i, (et, x, z)) in [(22i64, 5.5f64, 2.5f64), (22, -3.5, 4.5), (124, 8.5, 6.5), (124, -8.5, -6.5)].iter().enumerate() {
+        for (i, (et, x, z)) in [
+            (22i64, 5.5f64, 2.5f64),
+            (22, -3.5, 4.5),
+            (124, 8.5, 6.5),
+            (124, -8.5, -6.5),
+        ]
+        .iter()
+        .enumerate()
+        {
             ms.push(Arc::new(Mob {
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                 uuid: [i as u8; 16],
                 etype: *et,
                 pos: Mutex::new((*x, surface_y(*x as i32, *z as i32), *z, 0.0, 0.0)),
                 hp: Mutex::new(20.0),
-                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -14910,8 +21540,10 @@ fn main() {
     // without a handler the autosave window (30s) is lost on kill.
     {
         let mut sigs = signal_hook::iterator::Signals::new([
-            signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT])
-            .expect("signal hook");
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGINT,
+        ])
+        .expect("signal hook");
         thread::spawn(move || {
             if sigs.forever().next().is_some() {
                 save_world();
@@ -14919,10 +21551,15 @@ fn main() {
             }
         });
     }
-    let port: u16 = std::env::var("MC_SPINE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(25599);
+    let port: u16 = std::env::var("MC_SPINE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(25599);
     let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
-    eprintln!("mc-spine v0.6 listening {bind}:{port} (offline identities; no Mojang authentication)");
+    eprintln!(
+        "mc-spine v0.6 listening {bind}:{port} (offline identities; no Mojang authentication)"
+    );
     if bind != "127.0.0.1" && bind != "::1" {
         eprintln!("[security] non-loopback bind: restrict access with a firewall/private network");
     }
@@ -14957,11 +21594,17 @@ pub fn set_test_region(hot: HashSet<(i32, i32)>, warm: HashSet<(i32, i32)>) {
     r.warm = warm;
 }
 #[cfg(test)]
-pub fn set_test_region_warm(warm: HashSet<(i32, i32)>) { region().lock().unwrap().warm = warm; }
+pub fn set_test_region_warm(warm: HashSet<(i32, i32)>) {
+    region().lock().unwrap().warm = warm;
+}
 #[cfg(test)]
-pub fn test_region_warm_insert(c: (i32, i32)) { region().lock().unwrap().warm.insert(c); }
+pub fn test_region_warm_insert(c: (i32, i32)) {
+    region().lock().unwrap().warm.insert(c);
+}
 #[cfg(test)]
-pub fn test_region_warm_remove(c: &(i32, i32)) { region().lock().unwrap().warm.remove(c); }
+pub fn test_region_warm_remove(c: &(i32, i32)) {
+    region().lock().unwrap().warm.remove(c);
+}
 
 // Hold across setup, tick execution and restoration of shared world fixtures.
 #[cfg(test)]
@@ -14976,22 +21619,22 @@ fn world_guard() -> std::sync::MutexGuard<'static, ()> {
     WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 #[cfg(test)]
-mod fanout_tests;
-#[cfg(test)]
-mod registry_tests;
-#[cfg(test)]
-mod furnace_cache_tests;
-#[cfg(test)]
 mod effect_tests;
 #[cfg(test)]
-mod tick_tests;
-mod tick_queue;
+mod fanout_tests;
+#[cfg(test)]
+mod furnace_cache_tests;
 #[cfg(test)]
 mod merge_tests;
 #[cfg(test)]
 mod persistence_tests;
 #[cfg(test)]
+mod registry_tests;
+#[cfg(test)]
 mod test_support;
+mod tick_queue;
+#[cfg(test)]
+mod tick_tests;
 #[cfg(test)]
 mod security_command_tests {
     use super::command_allowed_for_player;
@@ -15002,11 +21645,16 @@ mod security_command_tests {
         }
         assert!(command_allowed_for_player("time", &["query", "daytime"]));
         for (cmd, args) in [
-            ("stop", vec![]), ("give", vec!["Steve", "diamond"]),
-            ("gamemode", vec!["creative"]), ("setblock", vec!["0", "64", "0", "stone"]),
-            ("execute", vec!["run", "stop"]), ("function", vec!["spine:hello"]),
-            ("time", vec!["set", "night"]), ("scoreboard", vec!["players", "set"]),
-            ("seed", vec![]), ("", vec![]),
+            ("stop", vec![]),
+            ("give", vec!["Steve", "diamond"]),
+            ("gamemode", vec!["creative"]),
+            ("setblock", vec!["0", "64", "0", "stone"]),
+            ("execute", vec!["run", "stop"]),
+            ("function", vec!["spine:hello"]),
+            ("time", vec!["set", "night"]),
+            ("scoreboard", vec!["players", "set"]),
+            ("seed", vec![]),
+            ("", vec![]),
         ] {
             assert!(!command_allowed_for_player(cmd, &args), "{cmd}");
         }
@@ -15042,7 +21690,10 @@ mod handshake_security_tests {
         let mut login = Vec::new();
         write_str(&mut login, "Test_Player");
         login.extend_from_slice(&[7u8; 16]);
-        assert_eq!(login_identity(&login), Some(("Test_Player".into(), [7; 16])));
+        assert_eq!(
+            login_identity(&login),
+            Some(("Test_Player".into(), [7; 16]))
+        );
     }
     #[test]
     fn malformed_handshake_is_rejected_without_panicking() {
@@ -15069,7 +21720,7 @@ mod handshake_security_tests {
         assert!(login_identity(&short).is_none());
         let mut long_name = Vec::new();
         write_str(&mut long_name, "APlayerWithAVeryLongUsername");
-        long_name.extend_from_slice(&[1u8;16]);
+        long_name.extend_from_slice(&[1u8; 16]);
         assert!(login_identity(&long_name).is_none());
     }
 }
@@ -15079,9 +21730,15 @@ mod resource_pack_url_tests {
     use super::resource_pack_url;
     #[test]
     fn loopback_only_by_default_and_explicit_external_url() {
-        assert_eq!(resource_pack_url("127.0.0.1", None).as_deref(), Some("http://127.0.0.1:25598/pack.zip"));
+        assert_eq!(
+            resource_pack_url("127.0.0.1", None).as_deref(),
+            Some("http://127.0.0.1:25598/pack.zip")
+        );
         assert!(resource_pack_url("0.0.0.0", None).is_none());
-        assert_eq!(resource_pack_url("0.0.0.0", Some("https://example.org/pack.zip")).as_deref(), Some("https://example.org/pack.zip"));
+        assert_eq!(
+            resource_pack_url("0.0.0.0", Some("https://example.org/pack.zip")).as_deref(),
+            Some("https://example.org/pack.zip")
+        );
         assert!(resource_pack_url("0.0.0.0", Some("javascript:alert(1)")).is_none());
     }
 }
@@ -15093,14 +21750,19 @@ mod save_integrity_tests {
     fn wrapped_world_roundtrip_and_legacy_acceptance() {
         let legacy = vec![0u8, b'M', b'E', b'T', b'3', 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(unwrap_world_payload(legacy.clone()), Ok(legacy.clone()));
-        assert_eq!(unwrap_world_payload(wrap_world_payload(&legacy)), Ok(legacy));
+        assert_eq!(
+            unwrap_world_payload(wrap_world_payload(&legacy)),
+            Ok(legacy)
+        );
     }
     #[test]
     fn truncated_and_damaged_new_saves_are_rejected() {
         let original = wrap_world_payload(b"world-data");
         for n in 0..original.len() {
             let short = original[..n].to_vec();
-            if n >= 3 { assert!(unwrap_world_payload(short).is_err(), "truncated to {n}"); }
+            if n >= 3 {
+                assert!(unwrap_world_payload(short).is_err(), "truncated to {n}");
+            }
         }
         let mut corrupt = original;
         *corrupt.last_mut().unwrap() ^= 1;

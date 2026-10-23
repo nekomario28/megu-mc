@@ -21,7 +21,9 @@ fn an_item_places_the_block_it_is_named_after() {
     let mut mismatches = Vec::new();
     let mut placeable = 0;
     for item in 0..4096i64 {
-        let Some(st) = item_to_state(item) else { continue };
+        let Some(st) = item_to_state(item) else {
+            continue;
+        };
         placeable += 1;
         if (st as usize) >= reg.state_count() {
             mismatches.push(format!("item {item} -> state {st}, outside the registry"));
@@ -59,7 +61,9 @@ fn every_block_that_drops_something_is_a_block_the_registry_knows() {
         let Some(item) = block_drop(st) else { continue };
         with_drop += 1;
         if !(0..4096).contains(&item) {
-            problems.push(format!("state {st} drops item {item}, outside the item space"));
+            problems.push(format!(
+                "state {st} drops item {item}, outside the item space"
+            ));
         }
         if reg.name_of(st) == "minecraft:air" {
             problems.push(format!("state {st} drops item {item} but has no name"));
@@ -132,17 +136,36 @@ fn report_which_blocks_use_the_default_hardness() {
     // Names that vanilla gives a distinctly non-soft hardness: if any of these
     // defaults, mining time is wrong by a large factor.
     let watch = [
-        "obsidian", "ancient_debris", "crying_obsidian", "deepslate", "iron_block",
-        "diamond_block", "gold_block", "emerald_block", "netherite_block", "stone",
-        "cobblestone", "end_stone", "netherrack", "spawner", "enchanting_table",
-        "anvil", "cauldron", "hopper", "furnace", "chest",
+        "obsidian",
+        "ancient_debris",
+        "crying_obsidian",
+        "deepslate",
+        "iron_block",
+        "diamond_block",
+        "gold_block",
+        "emerald_block",
+        "netherite_block",
+        "stone",
+        "cobblestone",
+        "end_stone",
+        "netherrack",
+        "spawner",
+        "enchanting_table",
+        "anvil",
+        "cauldron",
+        "hopper",
+        "furnace",
+        "chest",
     ];
     let flagged: Vec<&str> = watch
         .iter()
         .copied()
         .filter(|w| defaulted.contains(w))
         .collect();
-    println!("DEFAULT_HARDNESS {} blocks default; flagged={flagged:?}", defaulted.len());
+    println!(
+        "DEFAULT_HARDNESS {} blocks default; flagged={flagged:?}",
+        defaulted.len()
+    );
     println!("DEFAULT_SAMPLE {:?}", &defaulted[..defaulted.len().min(60)]);
 }
 
@@ -227,9 +250,10 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
     for b in &md {
         // Every tool id in the asset, so both the accepted and rejected cases run.
         let allowed: Vec<i64> = match b.get("harvestTools") {
-            Some(crate::json::J::Obj(entries)) => {
-                entries.iter().filter_map(|(k, _)| k.parse::<i64>().ok()).collect()
-            }
+            Some(crate::json::J::Obj(entries)) => entries
+                .iter()
+                .filter_map(|(k, _)| k.parse::<i64>().ok())
+                .collect(),
             _ => Vec::new(),
         };
         if !allowed.is_empty() {
@@ -244,13 +268,23 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
             }
             for item in [818i64, 819, 820, 825, 830, 835, 840, 845, 850] {
                 let expected = allowed.is_empty() || allowed.contains(&item);
-                assert_eq!(can_harvest(st as i64, item), expected, "state {st} of {name}, item {item}");
+                assert_eq!(
+                    can_harvest(st as i64, item),
+                    expected,
+                    "state {st} of {name}, item {item}"
+                );
                 checked += 1;
             }
         }
     }
-    assert!(needs_tool > 100, "the asset must have tool-requiring blocks");
-    assert!(checked > 100_000, "the check must cover the states, covered {checked}");
+    assert!(
+        needs_tool > 100,
+        "the asset must have tool-requiring blocks"
+    );
+    assert!(
+        checked > 100_000,
+        "the check must cover the states, covered {checked}"
+    );
 }
 
 /// Named cases, because the interesting half is the blocks that need NO tool: those
@@ -274,7 +308,11 @@ fn named_blocks_answer_can_harvest_the_vanilla_way() {
         ("diamond_ore", stone_pick, false),
     ] {
         let st = name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"));
-        assert_eq!(can_harvest(st as i64, item), expect, "{name} with item {item}");
+        assert_eq!(
+            can_harvest(st as i64, item),
+            expect,
+            "{name} with item {item}"
+        );
     }
 }
 
@@ -298,7 +336,10 @@ fn the_correct_tool_kind_is_the_assets_material() {
     let mut checked = 0usize;
     let mut with_kind = 0usize;
     for b in &md {
-        let material = b.get("material").map(|m| m.str().to_string()).unwrap_or_default();
+        let material = b
+            .get("material")
+            .map(|m| m.str().to_string())
+            .unwrap_or_default();
         let from_material = material.split(';').find_map(|part| match part {
             "mineable/shovel" => Some(1i8),
             "mineable/pickaxe" => Some(2),
@@ -325,7 +366,11 @@ fn the_correct_tool_kind_is_the_assets_material() {
                         }
                     }
                 }
-                if disagree { None } else { k }
+                if disagree {
+                    None
+                } else {
+                    k
+                }
             }
             _ => None,
         };
@@ -344,8 +389,14 @@ fn the_correct_tool_kind_is_the_assets_material() {
             checked += 1;
         }
     }
-    assert!(with_kind > 300, "the asset must name a tool for most blocks");
-    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
+    assert!(
+        with_kind > 300,
+        "the asset must name a tool for most blocks"
+    );
+    assert!(
+        checked > 20_000,
+        "the check must cover the state space, covered {checked}"
+    );
 }
 
 /// Named cases, including the two shapes that used to be missed: a block mined by a
@@ -446,7 +497,10 @@ fn the_drop_is_the_assets_drop_for_every_state() {
             checked += 1;
         }
     }
-    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
+    assert!(
+        checked > 20_000,
+        "the check must cover the state space, covered {checked}"
+    );
     assert_eq!(
         multi, 34,
         "the asset now has {multi} blocks with more than one drop, and only the first is modelled"
@@ -459,9 +513,9 @@ fn the_drop_is_the_assets_drop_for_every_state() {
 fn named_blocks_drop_what_vanilla_drops() {
     let item = |n: &str| name_to_item(n).unwrap_or_else(|| panic!("{n} must be an item"));
     for (name, expect) in [
-        ("stone", Some(35i64)),      // cobblestone
+        ("stone", Some(35i64)), // cobblestone
         ("granite", Some(2)),
-        ("grass_block", Some(28)),   // dirt
+        ("grass_block", Some(28)), // dirt
         ("dirt", Some(28)),
         ("sand", Some(57)),
         ("gravel", Some(61)),
@@ -470,7 +524,7 @@ fn named_blocks_drop_what_vanilla_drops() {
         ("iron_ore", Some(810)),
         ("diamond_ore", Some(805)),
         ("redstone_ore", Some(657)),
-        ("glass", None),             // nothing without silk touch
+        ("glass", None), // nothing without silk touch
         ("ice", None),
         ("bedrock", None),
     ] {
@@ -512,7 +566,10 @@ fn stack_size_comes_from_the_asset_for_every_state() {
             checked += 1;
         }
     }
-    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
+    assert!(
+        checked > 20_000,
+        "the check must cover the state space, covered {checked}"
+    );
 }
 
 /// The names, so the assertion reads as the behaviour. Signs stack to 16 and tools to 1,
@@ -528,8 +585,12 @@ fn named_items_stack_the_way_vanilla_stacks_them() {
         ("bucket", 64), // the block "bucket" does not exist; this is the water bucket
         ("diamond_pickaxe", 64),
     ] {
-        let Some(st) = name_to_state(name) else { continue };
-        let Some(item) = name_to_item(name) else { continue };
+        let Some(st) = name_to_state(name) else {
+            continue;
+        };
+        let Some(item) = name_to_item(name) else {
+            continue;
+        };
         // Only meaningful when the name is both a block and an item.
         assert_eq!(item_stack_max(item, &Vec::new()), want, "{name}");
         assert_eq!(stack_size_of(st), want, "{name} state");
@@ -551,7 +612,11 @@ fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
     // Downwards from each starting value, which is where the wrapping went wrong.
     for from in &values {
         let start = reg.with_prop(cane, "age", from);
-        assert_eq!(reg.name_of(start), "minecraft:sugar_cane", "age {from} left the block");
+        assert_eq!(
+            reg.name_of(start),
+            "minecraft:sugar_cane",
+            "age {from} left the block"
+        );
         for to in &values {
             let moved = reg.with_prop(start, "age", to);
             assert_eq!(
@@ -569,11 +634,19 @@ fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
     }
 
     // And a block with more than one property, where the digit has a multiplier.
-    let Some(stairs) = name_to_state("oak_stairs") else { panic!("oak_stairs must exist") };
+    let Some(stairs) = name_to_state("oak_stairs") else {
+        panic!("oak_stairs must exist")
+    };
     let facing = ["north", "south", "west", "east"];
     for f in facing {
         for half in ["top", "bottom"] {
-            for shape in ["straight", "inner_left", "inner_right", "outer_left", "outer_right"] {
+            for shape in [
+                "straight",
+                "inner_left",
+                "inner_right",
+                "outer_left",
+                "outer_right",
+            ] {
                 let mut s = stairs;
                 s = reg.with_prop(s, "facing", f);
                 s = reg.with_prop(s, "half", half);
@@ -633,8 +706,12 @@ fn light_values_come_from_the_asset_for_every_state() {
         let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
         let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
         let n = (hi - lo + 1) as usize;
-        let Some(pb) = by_name.get(&name) else { continue };
-        let Some(states) = pb.get("states").and_then(|s| s.into_arr()) else { continue };
+        let Some(pb) = by_name.get(&name) else {
+            continue;
+        };
+        let Some(states) = pb.get("states").and_then(|s| s.into_arr()) else {
+            continue;
+        };
         if states.len() != n {
             // Positional pairing is impossible for these; they are counted so the hole is
             // visible rather than silent.
@@ -656,8 +733,14 @@ fn light_values_come_from_the_asset_for_every_state() {
             checked += 1;
         }
     }
-    assert!(checked > 20_000, "the check must cover the state space, covered {checked}");
-    assert!(emitters > 100, "the asset must have light sources, found {emitters}");
+    assert!(
+        checked > 20_000,
+        "the check must cover the state space, covered {checked}"
+    );
+    assert!(
+        emitters > 100,
+        "the asset must have light sources, found {emitters}"
+    );
     // The two assets are different versions, so a handful of blocks cannot be paired.
     // If this grows, the pairing assumption has broken.
     assert!(
@@ -678,12 +761,13 @@ fn named_blocks_emit_the_light_vanilla_emits() {
         ("furnace", 0),
         ("stone", 0),
     ] {
-        let Some(st) = name_to_state(name) else { panic!("{name} must exist") };
+        let Some(st) = name_to_state(name) else {
+            panic!("{name} must exist")
+        };
         let got = breg().unwrap().luminance_of(st);
         assert_eq!(i64::from(got), lum, "{name}");
     }
 }
-
 
 /// The nibble layout is part of the contract: a wrong index lights the wrong column, and
 /// nothing else would notice. The floors are supplied rather than read from the world so the
@@ -699,7 +783,11 @@ fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
     };
 
     assert_eq!(nibble(floor + 1, 5, 7), 15, "above the floor must be lit");
@@ -716,7 +804,11 @@ fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
     };
     assert_eq!(nib2(75, 5, 7), 0, "the raised column must be dark at 75");
     assert_eq!(nib2(75, 6, 7), 15, "its neighbour must still be lit at 75");
@@ -737,11 +829,22 @@ fn sky_light_reads_lit_at_the_surface_and_dark_under_it() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
     };
-    assert_eq!(nibble(surface, 5, 7), 15, "the block above the surface must be lit");
+    assert_eq!(
+        nibble(surface, 5, 7),
+        15,
+        "the block above the surface must be lit"
+    );
     assert_eq!(nibble(surface + 20, 5, 7), 15, "and stay lit upward");
-    assert!(nibble(surface - 1, 5, 7) == 0, "the surface block must be dark");
+    assert!(
+        nibble(surface - 1, 5, 7) == 0,
+        "the surface block must be dark"
+    );
     assert!(nibble(surface - 30, 5, 7) == 0, "and stay dark downward");
 }
 
@@ -757,7 +860,11 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
     };
     assert_eq!(nib(70, 5, 7), 15, "the source is full");
     assert_eq!(nib(70, 6, 7), 14, "one step away loses one");
@@ -771,7 +878,11 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = cs[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
     };
     assert_eq!(cnib(70, 14, 0), 1, "fourteen steps away is one");
     assert_eq!(cnib(70, 15, 0), 0, "fifteen steps away is dark");
@@ -783,14 +894,21 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = secs2[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
     };
     assert_eq!(nib2(70, 0, 7), 14, "light must cross the chunk border");
     assert_eq!(nib2(70, 1, 7), 13, "and keep falling inside");
 
     // Nothing placed means nothing lit.
     let none = block_light_sections_from(0, 0, &[], |_, _, _| 0);
-    assert!(none.iter().all(|s| s.iter().all(|b| *b == 0)), "no source, no light");
+    assert!(
+        none.iter().all(|s| s.iter().all(|b| *b == 0)),
+        "no source, no light"
+    );
 
     // A block that stops light does not pass it on.
     let blocked = block_light_sections_from(0, 0, &sources, |x, _, _| if x == 6 { 15 } else { 0 });
@@ -798,7 +916,11 @@ fn block_light_falls_by_one_a_step_from_its_source() {
         let sec = ((y - LIGHT_MIN_Y) / 16) as usize;
         let sy = (y - LIGHT_MIN_Y - (sec as i32) * 16) as usize;
         let b = blocked[sec][sy * 128 + lz * 8 + (lx >> 1)];
-        if lx % 2 == 0 { b & 0x0f } else { b >> 4 }
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
     };
     assert_eq!(nib3(70, 6, 7), 0, "an opaque neighbour gets no light");
     assert_eq!(nib3(70, 7, 7), 0, "and passes none beyond it");
@@ -824,7 +946,11 @@ fn sky_light_reaches_sideways_through_an_opening() {
         }
         let in_cave = lz == 7 && (6..=12).contains(&lx) && (61..=69).contains(&y);
         let ceiling = y == 69 && lz == 7 && lx != 10;
-        if in_cave && !ceiling { 0 } else { 15 }
+        if in_cave && !ceiling {
+            0
+        } else {
+            15
+        }
     };
     let spill = sky_spill(
         0,
@@ -840,12 +966,20 @@ fn sky_light_reaches_sideways_through_an_opening() {
     assert_eq!(at(6, 61, 7), 11, "four steps lose four");
     // The spill holds dark cells only, so the shaft's own column above the floor is not in it: the
     // per-column rule already lights those to 15.
-    assert_eq!(at(10, 62, 7), 0, "the shaft's own column is the column rule's business");
+    assert_eq!(
+        at(10, 62, 7),
+        0,
+        "the shaft's own column is the column rule's business"
+    );
     assert_eq!(at(8, 69, 7), 0, "the ceiling stops what falls on it");
     assert_eq!(at(9, 69, 7), 0, "nor beside the shaft's opening");
     assert_eq!(at(10, 61, 8), 0, "the wall passes nothing");
     assert_eq!(at(10, 61, 9), 0, "and nothing arrives behind it");
-    assert_eq!(at(6, 66, 7), 6, "the far corner keeps the fall of nine steps");
+    assert_eq!(
+        at(6, 66, 7),
+        6,
+        "the far corner keeps the fall of nine steps"
+    );
 }
 
 /// The set of blocks that fall is decided by the asset through BReg.behaviour, not by a hand list.
@@ -861,22 +995,45 @@ fn the_falling_set_is_the_asset_set() {
         .collect();
     falling.sort();
     falling.dedup();
-    assert_eq!(falling.len(), 19, "sand, red_sand, gravel and 16 concrete powders: {falling:?}");
+    assert_eq!(
+        falling.len(),
+        19,
+        "sand, red_sand, gravel and 16 concrete powders: {falling:?}"
+    );
     for expect in [
-        "sand", "red_sand", "gravel",
-        "white_concrete_powder", "orange_concrete_powder", "magenta_concrete_powder",
-        "light_blue_concrete_powder", "yellow_concrete_powder", "lime_concrete_powder",
-        "pink_concrete_powder", "gray_concrete_powder", "light_gray_concrete_powder",
-        "cyan_concrete_powder", "purple_concrete_powder", "blue_concrete_powder",
-        "brown_concrete_powder", "green_concrete_powder", "red_concrete_powder",
+        "sand",
+        "red_sand",
+        "gravel",
+        "white_concrete_powder",
+        "orange_concrete_powder",
+        "magenta_concrete_powder",
+        "light_blue_concrete_powder",
+        "yellow_concrete_powder",
+        "lime_concrete_powder",
+        "pink_concrete_powder",
+        "gray_concrete_powder",
+        "light_gray_concrete_powder",
+        "cyan_concrete_powder",
+        "purple_concrete_powder",
+        "blue_concrete_powder",
+        "brown_concrete_powder",
+        "green_concrete_powder",
+        "red_concrete_powder",
         "black_concrete_powder",
     ] {
-        assert!(falling.iter().any(|n| n == expect), "{expect} must fall: {falling:?}");
+        assert!(
+            falling.iter().any(|n| n == expect),
+            "{expect} must fall: {falling:?}"
+        );
     }
     // The converse, so the assertion cannot pass by marking everything as falling.
     for not_falling in ["stone", "dirt", "oak_planks"] {
         let st = name_to_state(not_falling).expect("must exist");
-        assert_ne!(reg.behaviour_of(st), crate::block_registry::B_FALLING, "{not_falling} must not fall");
+        assert_ne!(
+            reg.behaviour_of(st),
+            crate::block_registry::B_FALLING,
+            "{not_falling} must not fall"
+        );
     }
 }
 
@@ -885,13 +1042,17 @@ fn the_falling_set_is_the_asset_set() {
 #[test]
 fn a_potted_plant_drops_both_entries_the_asset_lists() {
     let reg = breg().unwrap();
-    let two: Vec<&str> = ["potted_oak_sapling", "potted_fern", "potted_flowering_azalea_bush"]
-        .into_iter()
-        .filter(|n| {
-            let st = name_to_state(n).unwrap_or_else(|| panic!("{n} must exist"));
-            reg.block_drop(st).is_some() && reg.block_drop_second(st).is_some()
-        })
-        .collect();
+    let two: Vec<&str> = [
+        "potted_oak_sapling",
+        "potted_fern",
+        "potted_flowering_azalea_bush",
+    ]
+    .into_iter()
+    .filter(|n| {
+        let st = name_to_state(n).unwrap_or_else(|| panic!("{n} must exist"));
+        reg.block_drop(st).is_some() && reg.block_drop_second(st).is_some()
+    })
+    .collect();
     assert_eq!(two.len(), 3, "each of these drops two items, got {two:?}");
 
     // The single-drop case must stay single, or this would pass by marking everything two.
@@ -916,13 +1077,29 @@ fn note_block_keeps_solid_and_light_values_for_every_instrument() {
     let reg = breg().unwrap();
     let raw = std::fs::read("assets/blocks_1211.json").unwrap();
     let md = crate::json::jparse(&raw).unwrap();
-    let block = md.into_arr().unwrap().iter()
-        .find(|b| crate::json::jstr(b, "name").as_deref() == Some("note_block")).unwrap();
+    let block = md
+        .into_arr()
+        .unwrap()
+        .iter()
+        .find(|b| crate::json::jstr(b, "name").as_deref() == Some("note_block"))
+        .unwrap();
     let lo = crate::json::jnum(block, "minStateId").unwrap() as u32;
     let hi = crate::json::jnum(block, "maxStateId").unwrap() as u32;
     for st in lo..=hi {
-        assert!(reg.is_solid(st), "note block state {st} is a full solid block");
-        assert_eq!(reg.opacity_of(st), 15, "note block state {st} must block skylight");
-        for side in 0..6 { assert!(reg.side_solid(st, side), "note block state {st} side {side}"); }
+        assert!(
+            reg.is_solid(st),
+            "note block state {st} is a full solid block"
+        );
+        assert_eq!(
+            reg.opacity_of(st),
+            15,
+            "note block state {st} must block skylight"
+        );
+        for side in 0..6 {
+            assert!(
+                reg.side_solid(st, side),
+                "note block state {st} side {side}"
+            );
+        }
     }
 }

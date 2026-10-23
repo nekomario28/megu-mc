@@ -34,14 +34,22 @@ pub(crate) struct TickQueue {
 
 impl TickQueue {
     pub(crate) fn new() -> Self {
-        Self { buckets: (0..MAX_DELAY).map(|_| Vec::new()).collect(), waiting: HashMap::new(), cursor: 0 }
+        Self {
+            buckets: (0..MAX_DELAY).map(|_| Vec::new()).collect(),
+            waiting: HashMap::new(),
+            cursor: 0,
+        }
     }
 
-    pub(crate) fn is_empty(&self) -> bool { self.waiting.is_empty() }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
     /// Test-only: nothing in the tick path needs the count, only whether the queue
     /// has anything to do.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize { self.waiting.len() }
+    pub(crate) fn len(&self) -> usize {
+        self.waiting.len()
+    }
 
     /// Deadline bucket for `delay` ticks from the current one. A delay of zero or
     /// more than `MAX_DELAY` is clamped into range rather than dropped, because a
@@ -55,7 +63,9 @@ impl TickQueue {
 
     /// Queue `pos` if it is not already waiting. Returns whether it was added.
     pub(crate) fn schedule(&mut self, pos: (i32, i32, i32), delay: usize) -> bool {
-        if self.waiting.contains_key(&pos) { return false }
+        if self.waiting.contains_key(&pos) {
+            return false;
+        }
         let b = self.bucket_of(delay);
         self.buckets[b].push(pos);
         self.waiting.insert(pos, b);
@@ -81,7 +91,9 @@ impl TickQueue {
     /// because invalidation runs for every block change and would otherwise fill
     /// the queue with cells that are not registered with this system at all.
     pub(crate) fn promote(&mut self, pos: (i32, i32, i32)) -> bool {
-        if !self.waiting.contains_key(&pos) { return false }
+        if !self.waiting.contains_key(&pos) {
+            return false;
+        }
         self.reschedule(pos, 1);
         true
     }
@@ -104,7 +116,9 @@ impl TickQueue {
     /// number of due cells, and an empty bucket costs one swap of an empty Vec.
     pub(crate) fn due(&mut self) -> Vec<(i32, i32, i32)> {
         let out = std::mem::take(&mut self.buckets[self.cursor]);
-        for pos in &out { self.waiting.remove(pos); }
+        for pos in &out {
+            self.waiting.remove(pos);
+        }
         self.cursor = (self.cursor + 1) % MAX_DELAY;
         out
     }
@@ -123,8 +137,15 @@ mod tests {
         let mut q = TickQueue::new();
         q.schedule((1, 2, 3), 1);
         let ticks = run(4, &mut q);
-        assert_eq!(ticks[0], vec![(1, 2, 3)], "delay 1 must be due on the next tick");
-        assert!(ticks[1..].iter().all(|t| t.is_empty()), "it must not be due again");
+        assert_eq!(
+            ticks[0],
+            vec![(1, 2, 3)],
+            "delay 1 must be due on the next tick"
+        );
+        assert!(
+            ticks[1..].iter().all(|t| t.is_empty()),
+            "it must not be due again"
+        );
         assert!(q.is_empty());
     }
 
@@ -156,7 +177,10 @@ mod tests {
         q.schedule((7, 7, 7), 2);
         q.cancel((7, 7, 7));
         assert!(q.is_empty());
-        assert!(run(4, &mut q).iter().all(|t| t.is_empty()), "a cancelled cell must not fire");
+        assert!(
+            run(4, &mut q).iter().all(|t| t.is_empty()),
+            "a cancelled cell must not fire"
+        );
     }
 
     #[test]
@@ -168,16 +192,25 @@ mod tests {
         q.schedule((2, 2, 2), MAX_DELAY * 4);
         assert_eq!(q.len(), 2);
         let ticks = run(MAX_DELAY + 2, &mut q);
-        assert_eq!(ticks[0], vec![(1, 1, 1)], "delay 0 must still be queued, due next tick");
+        assert_eq!(
+            ticks[0],
+            vec![(1, 1, 1)],
+            "delay 0 must still be queued, due next tick"
+        );
         let late: Vec<_> = ticks.iter().flatten().copied().collect();
-        assert!(late.contains(&(2, 2, 2)), "an over-long delay must be clamped, not lost");
+        assert!(
+            late.contains(&(2, 2, 2)),
+            "an over-long delay must be clamped, not lost"
+        );
         assert!(q.is_empty());
     }
 
     #[test]
     fn the_ring_wraps_without_losing_entries() {
         let mut q = TickQueue::new();
-        for d in 1..=MAX_DELAY { q.schedule((d as i32, 0, 0), d); }
+        for d in 1..=MAX_DELAY {
+            q.schedule((d as i32, 0, 0), d);
+        }
         let ticks = run(MAX_DELAY + 1, &mut q);
         let fired: usize = ticks.iter().map(|t| t.len()).sum();
         assert_eq!(fired, MAX_DELAY, "every entry must fire exactly once");
@@ -191,9 +224,16 @@ mod tests {
         let mut q = TickQueue::new();
         q.schedule((1, 1, 1), MAX_DELAY);
         assert!(q.promote((1, 1, 1)), "a waiting cell must be promoted");
-        assert!(!q.promote((9, 9, 9)), "an unknown cell must not be inserted");
+        assert!(
+            !q.promote((9, 9, 9)),
+            "an unknown cell must not be inserted"
+        );
         assert_eq!(q.len(), 1, "promote must not add entries");
-        assert_eq!(run(2, &mut q)[0], vec![(1, 1, 1)], "it must now be due next tick");
+        assert_eq!(
+            run(2, &mut q)[0],
+            vec![(1, 1, 1)],
+            "it must now be due next tick"
+        );
         assert!(q.is_empty());
     }
 
@@ -201,7 +241,9 @@ mod tests {
     fn an_empty_queue_costs_nothing_to_poll() {
         let mut q = TickQueue::new();
         assert!(q.is_empty());
-        for _ in 0..MAX_DELAY * 2 { assert!(q.due().is_empty()); }
+        for _ in 0..MAX_DELAY * 2 {
+            assert!(q.due().is_empty());
+        }
         assert_eq!(q.len(), 0);
     }
 }

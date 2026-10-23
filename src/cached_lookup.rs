@@ -18,7 +18,9 @@ pub(crate) struct CachedLookup<K, V> {
 
 impl<K, V> Default for CachedLookup<K, V> {
     fn default() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -84,14 +86,26 @@ mod tests {
         let mut calls = 0;
         for _ in 0..50 {
             for key in 0..CAPACITY as i64 {
-                assert_eq!(cache.get_or_compute(key, || { calls += 1; key }), key);
+                assert_eq!(
+                    cache.get_or_compute(key, || {
+                        calls += 1;
+                        key
+                    }),
+                    key
+                );
             }
         }
-        assert_eq!(calls, CAPACITY, "a working set of CAPACITY must be computed once");
+        assert_eq!(
+            calls, CAPACITY,
+            "a working set of CAPACITY must be computed once"
+        );
         // And beyond that it is bounded rather than growing without limit.
         for key in 1000..1000 + CAPACITY as i64 * 4 {
             cache.get_or_compute(key, || key);
         }
-        assert!(cache.entries.len() <= CAPACITY, "the cache must stay bounded");
+        assert!(
+            cache.entries.len() <= CAPACITY,
+            "the cache must stay bounded"
+        );
     }
 }

@@ -6,7 +6,7 @@
 use crate::block_registry::{breg, bs_parts, ns_name, reg_props_axis, BReg};
 use crate::generation_context::FC;
 use crate::generation_math::{normal_new_l, Normal, Xor};
-use crate::json::{jarr, jf32, jint, jnum, jstr, js, J};
+use crate::json::{jarr, jf32, jint, jnum, js, jstr, J};
 
 // ---------- providers ----------
 
@@ -238,13 +238,42 @@ pub(crate) fn p_hp(j: &J) -> Option<HP> {
 
 pub(crate) enum BSP {
     Simple(u32),
-    Rotated { base: u32, axis: bool },
+    Rotated {
+        base: u32,
+        axis: bool,
+    },
     Weighted(Vec<(i32, u32)>),
-    RandomInt { src: Box<BSP>, prop: String, vals: Vec<i32> },
-    Noise { n: Normal, scale: f64, states: Vec<u32> },
-    NoiseThr { n: Normal, scale: f64, thr: f32, hchance: f32, def: u32, low: Vec<u32>, high: Vec<u32> },
-    Dual { n: Normal, scale: f64, variety: (i32, i32), slow_scale: f64, slow_variety: (i32, i32), states: Vec<u32> },
-    RuleBased { fb: Option<Box<BSP>>, rules: Vec<(Pr, BSP)> },
+    RandomInt {
+        src: Box<BSP>,
+        prop: String,
+        vals: Vec<i32>,
+    },
+    Noise {
+        n: Normal,
+        scale: f64,
+        states: Vec<u32>,
+    },
+    NoiseThr {
+        n: Normal,
+        scale: f64,
+        thr: f32,
+        hchance: f32,
+        def: u32,
+        low: Vec<u32>,
+        high: Vec<u32>,
+    },
+    Dual {
+        n: Normal,
+        scale: f64,
+        variety: (i32, i32),
+        slow_scale: f64,
+        slow_variety: (i32, i32),
+        states: Vec<u32>,
+    },
+    RuleBased {
+        fb: Option<Box<BSP>>,
+        rules: Vec<(Pr, BSP)>,
+    },
 }
 fn noise_state(states: &[u32], v: f64) -> u32 {
     // vanilla: midpoint(1.0, v) -> index into the list
@@ -264,7 +293,9 @@ impl BSP {
                         1 => "y",
                         _ => "z",
                     };
-                    breg().map(|reg| reg.with_prop(*base, "axis", ax)).unwrap_or(*base)
+                    breg()
+                        .map(|reg| reg.with_prop(*base, "axis", ax))
+                        .unwrap_or(*base)
                 }
             }
             BSP::Weighted(list) => {
@@ -298,7 +329,15 @@ impl BSP {
                 let v = n.get(x as f64 * scale, y as f64 * scale, z as f64 * scale);
                 noise_state(states, v)
             }
-            BSP::NoiseThr { n, scale, thr, hchance, def, low, high } => {
+            BSP::NoiseThr {
+                n,
+                scale,
+                thr,
+                hchance,
+                def,
+                low,
+                high,
+            } => {
                 let v = n.get(x as f64 * scale, y as f64 * scale, z as f64 * scale);
                 if v < *thr as f64 {
                     if low.is_empty() {
@@ -313,7 +352,14 @@ impl BSP {
                 }
                 *def
             }
-            BSP::Dual { n, scale, variety, slow_scale, slow_variety: _sv, states } => {
+            BSP::Dual {
+                n,
+                scale,
+                variety,
+                slow_scale,
+                slow_variety: _sv,
+                states,
+            } => {
                 if states.is_empty() {
                     return 0;
                 }
@@ -325,8 +371,8 @@ impl BSP {
                     z as f64 * slow_scale,
                 );
                 let span = variety.1 - variety.0 + 1;
-                let bucket = (((1.0 + sv) / 2.0) * span.max(1) as f64 + variety.0 as f64)
-                    .floor() as i32;
+                let bucket =
+                    (((1.0 + sv) / 2.0) * span.max(1) as f64 + variety.0 as f64).floor() as i32;
                 let bucket = bucket.clamp(0, span.max(1) - 1);
                 let per = states.len() as i32 / span.max(1).max(1);
                 let lo = (bucket * per).clamp(0, states.len() as i32 - 1) as usize;
@@ -343,7 +389,9 @@ impl BSP {
                         }
                     }
                 }
-                fb.as_ref().map(|f| f.get(ctx, r, x, y, z)).unwrap_or_else(|| ctx.get(x, y, z))
+                fb.as_ref()
+                    .map(|f| f.get(ctx, r, x, y, z))
+                    .unwrap_or_else(|| ctx.get(x, y, z))
             }
         }
     }
@@ -382,9 +430,7 @@ pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
     // Without this the whole *feature* fails to parse and is dropped silently.
     let ty = match jstr(j, "type") {
         Some(t) => t,
-        None if js(j, "fallback").is_some() || js(j, "rules").is_some() => {
-            "rule_based".to_string()
-        }
+        None if js(j, "fallback").is_some() || js(j, "rules").is_some() => "rule_based".to_string(),
         None => return None,
     };
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
@@ -518,7 +564,11 @@ pub(crate) fn p_pred(j: &J) -> Option<Pr> {
             if let Some(bs) = jarr(j, "blocks") {
                 for b in bs {
                     // entries may be plain names or block-state objects
-                    v.push(if let Some((n, _)) = bs_parts(b) { n } else { ns_name(b.str()) });
+                    v.push(if let Some((n, _)) = bs_parts(b) {
+                        n
+                    } else {
+                        ns_name(b.str())
+                    });
                 }
             } else if let Some(b) = jstr(j, "blocks")
                 .or_else(|| jstr(j, "block"))
@@ -538,7 +588,11 @@ pub(crate) fn p_pred(j: &J) -> Option<Pr> {
                 for f in fs {
                     // the 1.21.1 data writes plain names here, the 1.21.2 one
                     // block-state-shaped objects
-                    v.push(if let Some((n, _)) = bs_parts(f) { n } else { ns_name(f.str()) });
+                    v.push(if let Some((n, _)) = bs_parts(f) {
+                        n
+                    } else {
+                        ns_name(f.str())
+                    });
                 }
             } else if let Some(f) = jstr(j, "fluids").or_else(|| jstr(j, "fluid")) {
                 // `"fluids": "minecraft:water"` is a single value, not a list
@@ -600,9 +654,7 @@ pub(crate) fn p_rt(j: &J) -> Option<RT> {
         "any_of" => RT::Any(jarr(j, "rules")?.iter().filter_map(p_rt).collect()),
         "all_of" => RT::All(jarr(j, "rules")?.iter().filter_map(p_rt).collect()),
         "not" => RT::Not(Box::new(p_rt(js(j, "predicate")?)?)),
-        "height_match" => {
-            RT::Height(jint(j, "min_inclusive", 0), jint(j, "max_inclusive", 0))
-        }
+        "height_match" => RT::Height(jint(j, "min_inclusive", 0), jint(j, "max_inclusive", 0)),
         "random_block_match" => {
             RT::RandBlock(ns_name(&jstr(j, "block")?), jf32(j, "probability", 0.0))
         }
@@ -627,7 +679,7 @@ pub(crate) enum PM {
     BlockPred(Pr),
     Rarity(i32),
     Fixed,
-    SurfaceRel(i32, i32),   // min_inclusive, max_inclusive (i32::MIN/MAX for absent)
+    SurfaceRel(i32, i32), // min_inclusive, max_inclusive (i32::MIN/MAX for absent)
     SurfWaterDepth(i32),
     NoiseCount(i32, f64, f64),
     NoiseThrCount(f64, i32, i32),
@@ -643,7 +695,11 @@ pub(crate) fn p_mod(j: &J) -> Option<PM> {
         "count_on_every_layer" => PM::CountEveryLayer(p_ip(js(j, "count")?)?),
         "in_square" => PM::InSquare,
         "offset" | "random_offset" => PM::Offset(
-            p_ip(js(j, "x_spread").or_else(|| js(j, "x")).or_else(|| js(j, "xz_spread"))?)?,
+            p_ip(
+                js(j, "x_spread")
+                    .or_else(|| js(j, "x"))
+                    .or_else(|| js(j, "xz_spread"))?,
+            )?,
             p_ip(js(j, "y_spread").or_else(|| js(j, "y"))?)?,
         ),
         "height_range" => PM::HeightRange(p_hp(js(j, "height")?)?),
@@ -674,7 +730,11 @@ pub(crate) fn p_mod(j: &J) -> Option<PM> {
         ),
         "random_chance" => PM::RandomChance(jf32(j, "chance", 0.0)),
         "environment_scan" => PM::EnvScan(
-            if jstr(j, "direction_of_search").as_deref() == Some("up") { 1 } else { 0 },
+            if jstr(j, "direction_of_search").as_deref() == Some("up") {
+                1
+            } else {
+                0
+            },
             js(j, "allowed_search_condition").and_then(p_pred),
             p_pred(js(j, "target_condition")?)?,
             jint(j, "max_steps", 16),
@@ -707,10 +767,17 @@ pub(crate) fn is_dirtish(reg: &BReg, st: u32) -> bool {
     let n = reg.name_of(st);
     matches!(
         n,
-        "minecraft:grass_block" | "minecraft:mycelium" | "minecraft:podzol"
-            | "minecraft:moss_block" | "minecraft:pale_moss_block" | "minecraft:mud"
-            | "minecraft:muddy_mangrove_roots" | "minecraft:farmland"
-            | "minecraft:dirt_path" | "minecraft:rooted_dirt" | "minecraft:coarse_dirt"
+        "minecraft:grass_block"
+            | "minecraft:mycelium"
+            | "minecraft:podzol"
+            | "minecraft:moss_block"
+            | "minecraft:pale_moss_block"
+            | "minecraft:mud"
+            | "minecraft:muddy_mangrove_roots"
+            | "minecraft:farmland"
+            | "minecraft:dirt_path"
+            | "minecraft:rooted_dirt"
+            | "minecraft:coarse_dirt"
     ) || reg.in_tag(st, "minecraft:dirt")
 }
 pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z: i32) -> bool {
@@ -766,30 +833,39 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
         "minecraft:kelp" | "minecraft:kelp_plant" => {
             reg.name_of(below) != "minecraft:magma_block"
                 && (reg.side_solid(below, 1)
-                    || matches!(reg.name_of(below), "minecraft:kelp" | "minecraft:kelp_plant"))
+                    || matches!(
+                        reg.name_of(below),
+                        "minecraft:kelp" | "minecraft:kelp_plant"
+                    ))
         }
         "minecraft:seagrass" | "minecraft:tall_seagrass" => {
             is_water_st(reg, at)
-                && (reg.side_solid(below, 1)
-                    || reg.name_of(below) == "minecraft:magma_block")
+                && (reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block")
         }
         "minecraft:sea_pickle" => is_water_st(reg, at) && reg.is_solid(below),
         "minecraft:small_dripleaf" => {
             is_water_st(reg, at)
-                && matches!(reg.name_of(below), "minecraft:clay" | "minecraft:moss_block")
+                && matches!(
+                    reg.name_of(below),
+                    "minecraft:clay" | "minecraft:moss_block"
+                )
         }
         "minecraft:big_dripleaf" | "minecraft:big_dripleaf_stem" => {
             let bn = reg.name_of(below);
-            matches!(bn, "minecraft:clay" | "minecraft:moss_block" | "minecraft:big_dripleaf_stem")
-                || is_dirtish(reg, below)
+            matches!(
+                bn,
+                "minecraft:clay" | "minecraft:moss_block" | "minecraft:big_dripleaf_stem"
+            ) || is_dirtish(reg, below)
         }
         "minecraft:hanging_roots" | "minecraft:cave_vines" | "minecraft:cave_vines_plant" => {
             let above = ctx.get(x, y + 1, z);
             reg.side_solid(above, 0)
                 || matches!(
                     reg.name_of(above),
-                    "minecraft:cave_vines" | "minecraft:cave_vines_plant"
-                        | "minecraft:hanging_roots" | "minecraft:azalea_leaves"
+                    "minecraft:cave_vines"
+                        | "minecraft:cave_vines_plant"
+                        | "minecraft:hanging_roots"
+                        | "minecraft:azalea_leaves"
                 )
         }
         "minecraft:mangrove_propagule" => {
@@ -803,9 +879,12 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
             is_dirtish(reg, below)
                 || matches!(
                     reg.name_of(below),
-                    "minecraft:podzol" | "minecraft:mycelium"
-                        | "minecraft:crimson_nylium" | "minecraft:warped_nylium"
-                        | "minecraft:soul_soil" | "minecraft:basalt"
+                    "minecraft:podzol"
+                        | "minecraft:mycelium"
+                        | "minecraft:crimson_nylium"
+                        | "minecraft:warped_nylium"
+                        | "minecraft:soul_soil"
+                        | "minecraft:basalt"
                 )
         }
         _ => {
@@ -881,4 +960,3 @@ pub(crate) fn test_rt(rt: &RT, reg: &BReg, st: u32, y: i32, r: &mut Xor) -> bool
         RT::RandBlockState(s, p) => st == *s && r.next_f32() < *p,
     }
 }
-

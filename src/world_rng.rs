@@ -66,7 +66,9 @@ mod tests {
     // The stream is one global, so a test that reseeds it is mutating shared state and
     // must hold the same lock the rest of the suite uses for the world.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::WORLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -86,12 +88,15 @@ mod tests {
         let _g = guard();
         seed(12345);
         let got: Vec<u64> = (0..4).map(|_| next_u64()).collect();
-        assert_eq!(got, vec![
-            10977518812293740004,
-            13893246733018840292,
-            1412386850724336324,
-            13578198927181985541,
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                10977518812293740004,
+                13893246733018840292,
+                1412386850724336324,
+                13578198927181985541,
+            ]
+        );
     }
 
     #[test]
@@ -126,7 +131,10 @@ mod tests {
             assert!(v < 16, "next_below must not exceed its bound");
             seen[v as usize] = true;
         }
-        assert!(seen.iter().all(|&s| s), "every value in 0..16 must occur: {seen:?}");
+        assert!(
+            seen.iter().all(|&s| s),
+            "every value in 0..16 must occur: {seen:?}"
+        );
         assert_eq!(next_below(0), 0, "a zero bound must not divide by zero");
     }
 

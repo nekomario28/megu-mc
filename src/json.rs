@@ -121,11 +121,9 @@ impl<'a> JP<'a> {
                             b'u' => {
                                 let h = self.b.get(self.i..self.i + 4)?;
                                 self.i += 4;
-                                char::from_u32(u32::from_str_radix(
-                                    std::str::from_utf8(h).ok()?,
-                                    16,
+                                char::from_u32(
+                                    u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?,
                                 )
-                                .ok()?)
                                 .unwrap_or('?')
                             }
                             x => x as char,
@@ -151,11 +149,18 @@ impl<'a> JP<'a> {
             _ => {
                 let s0 = self.i;
                 while self.i < self.b.len()
-                    && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                    && matches!(
+                        self.b[self.i],
+                        b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
+                    )
                 {
                     self.i += 1;
                 }
-                std::str::from_utf8(&self.b[s0..self.i]).ok()?.parse().ok().map(J::Num)
+                std::str::from_utf8(&self.b[s0..self.i])
+                    .ok()?
+                    .parse()
+                    .ok()
+                    .map(J::Num)
             }
         }
     }
