@@ -2624,7 +2624,11 @@ fn pop_seed(seed: u64, bx: i32, bz: i32) -> u64 {
     let mut r = Xor::seed_worldgen(seed);
     let l = r.next_i64_legacy() | 1;
     let m = r.next_i64_legacy() | 1;
-    ((bx as i64).wrapping_mul(l).wrapping_add((bz as i64).wrapping_mul(m)) ^ seed as i64) as u64
+    let n = ((bx as i64).wrapping_mul(l).wrapping_add((bz as i64).wrapping_mul(m)) ^ seed as i64) as u64;
+    if std::env::var("POP_DBG").is_ok() {
+        eprintln!("POPDBG seed={seed} bx={bx} bz={bz} l={l} m={m} -> {n}");
+    }
+    n
 }
 
 /// populate chunk (sx,sz): evaluate the vanilla feature pipeline and merge
@@ -2680,13 +2684,20 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         return;
     }
     // biomes of the 3x3 neighborhood (chunk center at y=0, quart sample)
+    // Vanilla unions the *biome palettes of this chunk's sections*
+    // (`applyBiomeDecoration` collects `section.getBiomes()` into a set), so a
+    // feature runs if any 4x4x4 cell of the chunk carries its biome. Sampling a few
+    // columns at y=0 instead reads the cave biomes and misses a surface biome such as
+    // `river` - which silently skipped `trees_water` (step 9 index 48) in chunk
+    // (-2,1) and left the canopies of its trees missing here (measured: the draw
+    // streams for that chunk's trees_birch_and_oak then diverged at draw 120).
     let mut biomes: Vec<String> = vec![];
     let mut seen: HashSet<String> = HashSet::new();
     for dx in -1..=1 {
         for dz in -1..=1 {
-            if let Some(b) = g.biome_name_at((sx + dx) * 16 + 8, 0, (sz + dz) * 16 + 8) {
+            for b in g.chunk_biome_set(sx + dx, sz + dz).iter() {
                 if seen.insert(b.clone()) {
-                    biomes.push(b);
+                    biomes.push(b.clone());
                 }
             }
         }

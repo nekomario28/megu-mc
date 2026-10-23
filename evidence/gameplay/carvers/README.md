@@ -1761,3 +1761,34 @@ vanilla は (-16,26) の列に**別の木の樹冠**（葉が 66〜69）を持�
 次の計測: 窓（`-Dtreechunk`）を (-2,1)/(-2,2) まで広げ、両側の tree origin 一覧を
 比べて「無い木」を特定する。`-Dfseedarm` の窓も (-2,1) に移せば、その木の
 chain（selector/trunk/foliage）まで diff できる。
+
+## 48. 2 つの発見: feature 集合は 3×3 の section palette、残差は**装飾順**
+
+### (a) feature の実行条件を取り違えていた（修正）
+
+vanilla の `applyBiomeDecoration` は
+`ChunkPos.rangeClosed(chunkPos, 1)` の各 chunk について **section の biome palette を
+union** し（`$$11.retainAll(possibleBiomes)` したうえで）その集合で feature を選ぶ。
+こちらの前フィルタは **3×3 の中心 9 マスを y=0 でサンプル**していた。y=0 は地下なので
+**cave biome を読み、地表の biome（river など）を落とす**。
+
+実測: chunk (-2,1) の step 9 で `trees_water`（index **48**）ほか 48/60/73 の 3 つが
+こちらの一覧から欠けていた（vanilla 12 件 / こちら 9 件）。修正後は 12 件すべて一致。
+
+修正: `Gen::chunk_biome_set(cx,cz)`（その chunk の全 section・全 quart セル 1536 点の
+distinct biome、chunk 単位で LRU キャッシュ）を足し、前フィルタは 3×3 のそれを union する。
+
+### (b) それでも (-2,1) の木は一致しない → 残差は「装飾順」
+
+修正後も chunk (-2,1) の木は vanilla と 1 本も重ならない（こちら 6 / vanilla 4）。
+deco seed も feature 添字集合も一致しているので、違いは **feature 実行時に世界が
+どこまで装飾済みか** = 装飾の順序。
+
+- vanilla は「その時点までに装飾した chunk」の書き込みを全部見る（木の樹冠は
+  隣 chunk から 2 ブロックまで届く）。
+- こちらは `feat_state` が 3×3 をオンデマンドに populate するので、**こちらが
+  決めた順序**でしか蓄積しない。
+
+2×2 の固定具（(0,0)〜(1,1)）が 704 セルで動かないのは、影響する chunk (-2,1)/(-1,1) が
+固定具の外だから。順序依存の差を消すには「隣が全部装飾済みの chunk を装飾する」順序で
+回す（＝3×3 を先に埋める）か、サーバーが装飾した順序を再現する必要がある。

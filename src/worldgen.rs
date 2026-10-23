@@ -281,6 +281,10 @@ pub struct Gen {
     aq_skip: HashMap<(i32, i32), i32>,
     aq_sko: Vec<(i32, i32)>,
     prelim_c: HashMap<(i32, i32), i32>,
+    /// per chunk: the distinct biomes of its section palettes, i.e. what vanilla's
+    /// `applyBiomeDecoration` unions over the 3x3 before deciding which features run
+    chunk_biomes: HashMap<(i32, i32), std::sync::Arc<Vec<String>>>,
+    chunk_biomes_ord: std::collections::VecDeque<(i32, i32)>,
     prelim_ord: Vec<(i32, i32)>,
     clim_c: HashMap<(i32, i32), ([i64; 5], f64)>,
     clim_ord: Vec<(i32, i32)>,
@@ -412,6 +416,8 @@ impl Gen {
             aq_skip: HashMap::new(),
             aq_sko: Vec::new(),
             prelim_c: HashMap::new(),
+            chunk_biomes: HashMap::new(),
+            chunk_biomes_ord: std::collections::VecDeque::new(),
             prelim_ord: Vec::new(),
             clim_c: HashMap::new(),
             clim_ord: Vec::new(),
@@ -2122,6 +2128,45 @@ impl Gen {
         if solid {
             e.1 = e.1.max(y + 1);
         }
+    }
+
+    /// The distinct biomes of a chunk's sections, cached per chunk: vanilla unions
+    /// these over the 3x3 (and intersects with the generator's possible biomes)
+    /// before running a feature, so a *neighbour's* river makes `trees_water` run for
+    /// this chunk. Sampling a few columns at y=0 instead reads the cave biomes and
+    /// silently skipped it.
+    pub(crate) fn chunk_biome_set(&mut self, cx: i32, cz: i32) -> std::sync::Arc<Vec<String>> {
+        if let Some(v) = self.chunk_biomes.get(&(cx, cz)) {
+            return v.clone();
+        }
+        let mut seen: Vec<String> = vec![];
+        let mut set = std::collections::HashSet::new();
+        let (qx0, qz0) = (cx * 4, cz * 4);
+        let qy_max = (self.height / 16) * 4;
+        for qy in 0..qy_max {
+            for lx in 0..4 {
+                for lz in 0..4 {
+                    if let Some((_, leaf)) = self.biome_quart(qx0 + lx, qy, qz0 + lz, None) {
+                        if let Some(name) = self.biome_name_of_leaf(leaf) {
+                            if set.insert(name.clone()) {
+                                seen.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let arc = std::sync::Arc::new(seen);
+        self.chunk_biomes_ord.push_back((cx, cz));
+        while self.chunk_biomes.len() > 384 {
+            if let Some(old) = self.chunk_biomes_ord.pop_front() {
+                self.chunk_biomes.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.chunk_biomes.insert((cx, cz), arc.clone());
+        arc
     }
 
     /// Populate the 3x3 around a chunk if it has not been populated yet, so a

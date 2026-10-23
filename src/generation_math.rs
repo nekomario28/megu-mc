@@ -1192,3 +1192,22 @@ pub(crate) fn biome_zoom_seed(seed: u64) -> i64 {
     let d = sha256(&seed.to_le_bytes());
     i64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
 }
+
+#[cfg(test)]
+mod deco_seed_tests {
+    /// `setDecorationSeed` run on the Xoroshiro source, cross-checked against a
+    /// Python implementation of the same bytecode (and against the live server's
+    /// `FSEED` log): chunk (-1,0) -> 6716476193438028432, chunk (-2,1) ->
+    /// -4660739044861673552, both for world seed 0.
+    #[test]
+    fn decoration_seed_values() {
+        let f = |bx: i32, bz: i32| -> i64 {
+            let mut r = super::Xor::seed_worldgen(0);
+            let l = r.next_i64_legacy() | 1;
+            let m = r.next_i64_legacy() | 1;
+            (bx as i64).wrapping_mul(l).wrapping_add((bz as i64).wrapping_mul(m)) ^ 0
+        };
+        assert_eq!(f(-16, 0), 6716476193438028432);
+        assert_eq!(f(-32, 16), -4660739044861673552);
+    }
+}
