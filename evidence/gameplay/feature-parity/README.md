@@ -364,6 +364,7 @@ step 単位の分解・生ドローの突き合わせ・bytecode の読みは
 | 10 | rule-based state provider の `type` 欠落、`"fluids"` の単一値（disk 系が 0 書き込み） | `CF_MISSING=1` / `PF_UNKNOWN=1` | 2510 → 1856 |
 | 11 | 入れ子の **placed feature 参照**が modifier を落としていた（`would_survive` が走らず全候補で木が生える） | 木の本数 53 vs 38 → 生ドローの形 | 1856 → 1035 |
 | 12 | spring の上下が逆（below を見るべきところ above、走査は down でなく up） | 逆コンパイル | 木の位置の理解（水は tick で広がる） |
+| 13 | biome を 2 種取り違え（chunk container を読んでいたが、`BiomeFilter` は `BiomeManager.getBiome` を読む） | `dcz.t` の default が `F_().a(pos)` を呼ぶことを bytecode で確認 | 1035 → **940**、木 45 → 42 |
 
 ### 残差 1035 の読み方
 
@@ -380,9 +381,9 @@ step 単位の分解・生ドローの突き合わせ・bytecode の読みは
 
 ### 次の一単位
 
-1. chunk (1,0) の候補 (20,66,3) で vanilla の `BiomeFilter` が false（保存済み biome は
-   forest）。`eii.a` の中で `ctx.d().t(pos)`（`dcz.t(Ljd;)Ljm;`）と `ctx.e()`（topFeature）を
-   文字列で出す。→ 木 45 → 38 の見込み。
+1. 木の残差を chunk 別に潰す（(0,1) 8 vs 5 が最大）。同じ計装
+   （`InSquarePlacement` の生候補・`BiomeFilter` の可否・`would_survive`）を
+   chunk (0,1) に当てる。
 2. `ore_dirt` / `ore_gravel` の blob が vanilla の**部分集合**（121 + 96 セル）。同じ
    ore 機構で他の 4 種は一致しているので、この 2 つ固有の条件（run 順が先頭、
    `size:33`）を突き合わせる。
