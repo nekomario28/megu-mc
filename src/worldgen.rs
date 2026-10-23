@@ -3099,6 +3099,32 @@ pub fn hm_dump(spec: &str) {
     }
 }
 
+/// `MC_SPINE_BIOME_AT=x,y,z;x,y,z;...`: print both biome notions at each position.
+/// The container (what a saved chunk holds) and the blended lookup that
+/// `LevelReader.getBiome` returns are different answers; a placement filter reads
+/// the second, so seeing both at once is how a boundary disagreement is read.
+pub fn biome_at_dump(spec: &str) {
+    let mut gg = GEN.lock().unwrap();
+    let Some(g) = gg.as_mut() else { return };
+    for item in spec.split(';') {
+        let p: Vec<i32> = item.split(',').filter_map(|n| n.parse().ok()).collect();
+        if p.len() != 3 {
+            continue;
+        }
+        let (x, y, z) = (p[0], p[1], p[2]);
+        let blended = g.biome_blended(x, y, z).and_then(|(_, l)| g.biome_name_of_leaf(l));
+        let container = match g.biome_quart(x >> 2, y >> 2, z >> 2, None) {
+            Some((_, l)) => g.biome_name_of_leaf(l),
+            None => None,
+        };
+        eprintln!(
+            "BIOMEAT {x} {y} {z} blended={} container={}",
+            blended.unwrap_or_else(|| "?".into()),
+            container.unwrap_or_else(|| "?".into())
+        );
+    }
+}
+
 /// `MC_SPINE_BIOME_DUMP=cx,sy,cz`: print the quart-sampled biome name for every
 /// 4x4x4 cell of one section, to compare against a saved vanilla chunk.
 pub fn biome_dump(spec: &str) {

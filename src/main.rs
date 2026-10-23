@@ -14622,6 +14622,9 @@ fn main() {
         if let Ok(spec) = std::env::var("MC_SPINE_HM_DUMP") {
             worldgen::hm_dump(&spec);
         }
+        if let Ok(spec) = std::env::var("MC_SPINE_BIOME_AT") {
+            worldgen::biome_at_dump(&spec);
+        }
         if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP") {
             // Offline block dump for parity diffs: `MC_SPINE_WG_DUMP_N` chunks per
             // side from (0,0), each section in the send layout `(ly<<8)|(lz<<4)|lx`.
