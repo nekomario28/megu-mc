@@ -1734,3 +1734,30 @@ chunk (0,1) は候補列も biome 判定も木の本数も vanilla と一致し�
 次の計測: 窓を **chunk (-1,1)** の (feature 20, step 9) に移し、`(-1,64,17)` の木の
 **幹の高さ**（`nextInt(3)` → `nextInt(1)`）と selector/foliage のドローを vanilla と
 突き合わせる。木の高さが 2 違う = その 2 draw の値が違うはずで、1 箇所で決まる。
+
+### 47.1 chunk (-1,1) の窓で特定: draw 120 の候補 (-16,26)
+
+窓を chunk (-1,1) の (feature 20, step 9) に移すと、**120 draw まで一致**して
+そこで分岐する:
+
+```
+119 まで両側一致（候補 (-16,26) の in_square と selector の float 2 つ）
+ours 120: nextInt(3)=1       ← 幹の高さ（木を生成し始める）
+van  120: nextInt(16)=7      ← 次の候補の in_square（＝ (-16,26) を棄却）
+```
+
+セルを見ると理由が明確:
+
+| (-16, 63..71, 26) | こちら | vanilla |
+|---|---|---|
+| 65〜69 | oak_log（幹） | **oak_leaves**（隣の木の樹冠） |
+| 70 | oak_leaves | air |
+
+vanilla は (-16,26) の列に**別の木の樹冠**（葉が 66〜69）を持ち、その列の
+`OCEAN_FLOOR` は 70。候補 y=70 の下は葉なので sapling は育たず棄却。こちらは
+その樹冠が無く y=65（草の上）を読んで木を作る。その樹冠は chunk **(‑2,1)** 側の
+木（窓の外）由来で、こちらの tree 一覧にその木が無い（または樹冠が届いていない）。
+
+次の計測: 窓（`-Dtreechunk`）を (-2,1)/(-2,2) まで広げ、両側の tree origin 一覧を
+比べて「無い木」を特定する。`-Dfseedarm` の窓も (-2,1) に移せば、その木の
+chain（selector/trunk/foliage）まで diff できる。
