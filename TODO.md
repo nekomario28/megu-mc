@@ -302,3 +302,12 @@ port 側: `FSEED_TRACE` / `FSEED_ARM`（`NDRAW`/`FDRAW`/`XDRAW`）/ `ORE_TRACE` 
 - `randomTick` は `!persistent && distance==7` の葉を消すので、forceload chunk は樹冠が欠ける。
 - → `oak_leaves != oak_leaves`（distance のみ）は除外。ただし「こちらに葉・vanilla は air」
   の 578 は距離 1〜3 が大半で、幾何の差として残差に数える（次はここ）。
+
+## 未解決: BiomeFilter の false（2026-10-22）
+
+chunk (1,0) の候補 (20,66,3), feature (20,9) で vanilla の BiomeFilter は false、
+こちらは true（biome=forest）、保存済み world の quart (20,64,0) は forest。
+`BiomeFilter` は `level.getBiome(pos)` の biome の feature 集合を見るので、
+forest に `trees_birch_and_oak` がある以上 false は説明できない。
+次は `ctx.d().t(pos)`（`dcz.t(Ljd;)Ljm;`）の戻り値と `ctx.e()`（topFeature）を
+文字列でログして、どちらが想定と違うかを見る。木は 45 vs 38。

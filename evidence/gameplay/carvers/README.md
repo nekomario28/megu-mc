@@ -1430,3 +1430,39 @@ J::Str(s) => Some(Pf { feat: FRef::Name(ns_name(s)), mods: vec![], .. })
 
 残りは「45 vs 38 の木」と carver 層。木は `would_survive` の残差
 （`can_place` の dirt 判定 vs `BlockTags.DIRT` + farmland）を追う。
+
+## 40. 未解決: vanilla の `BiomeFilter` が「biome は forest」な位置で false を返す
+
+feature (20,9) = `trees_birch_and_oak` の木の本数は 45 vs 38 まで詰まった
+（chunk (‑1,0) は 6 vs 6、chunk (‑1,‑1)/(0,‑1)/(1,‑1)/(1,1) も一致）。残る差を
+追うと **矛盾する観測**に行き着いた:
+
+- chunk (1,0)、候補 (20,66,3):
+  - vanilla の `BiomeFilter`（`eii.a` をフック）: **false**
+  - こちらの `PM::Biome`: **true**（biome=forest）
+  - 保存済み world の quart (20,64,0) = **minecraft:forest**
+    （`featworld` / `treeworld` の両方で同じ、palette は river 36 / forest 28）
+- vanilla の `InSquarePlacement` 候補（chunk (1,0)、feature (20,9)）は 10 個、
+  そのうち `BiomeFilter` が true を返したものは **0 個**。
+
+`BiomeFilter` の逆コンパイルは
+
+```java
+eiv feature = ctx.e().orElseThrow(...);         // topFeature
+jm<ddw> biome = ctx.d().t(pos);                 // level.getBiome(pos)
+return ctx.f().a(biome).a(feature);             // biome の feature 集合が feature を含むか
+```
+
+で、`forest` の step 9 には `trees_birch_and_oak` が入っている（step 9 の添字集合は
+一致済み）。したがって「保存済み biome = forest なのに false」は説明がついていない。
+
+次に試すべき計測（1 回で足りるはず）:
+
+- `eii.a` のフック内で `ctx.d().t(pos)` の**戻り値（biome holder）を文字列化**して
+  ログする（`LevelReader.getBiome(BlockPos)` の obf は `dcz.t(Ljd;)Ljm;`）。
+  今回 `eiw.d()Ldds;` → `dcz.t` の連鎖で VerifyError を出したので、
+  正しい所有者インターフェースを確認してから挿す。
+- `ctx.e()`（topFeature）の `toString` も同時に出す（child の `oak_bees_0002` に
+  なっていないか）。
+
+候補の (x,z) が一致している以上、ここの解決で木は 45→38 に揃う見込み。
