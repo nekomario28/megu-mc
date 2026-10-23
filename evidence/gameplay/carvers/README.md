@@ -2172,3 +2172,48 @@ return false;                     // ← これが無かった
 feature 書き込みを読む）。ドローは最初の patch で一致しているので、次は
 **後続の patch インスタンス**（別 chunk の populate で走るもの）の y を
 `FSEED_ARM` で窓を切って両側 diff する。
+
+## 59. `seagrass` を実装（0 → 27 / vanilla 28）＝ 型を埋めると規則どおり一致する
+
+`SeagrassFeature`（`edk`）を bytecode から:
+
+```
+dx = a(8) - a(8); dz = a(8) - a(8)                 // 4 ドロー
+y = getHeight(OCEAN_FLOOR, x+dx, z+dz)             // ドロー無し
+if (level.getBlockState(p).is(WATER)) {            // ← 水判定が nextDouble より先
+   boolean tall = rand.j() < cfg.probability;      // 1 ドロー
+   st = tall ? tall_seagrass : seagrass
+   if (st.canSurvive(level, p)) { ... }
+}
+```
+
+`SeagrassBlock`（`dmx`）の `mayPlaceOn` は
+**「下が sturdy top face かつ magma でない」**（dirt 規則ではない ✓）。
+`tall` のときは上のセルも水でなければ**何も置かない**。
+
+結果（4×4 隔離固定具）:
+
+| ブロック | ours | vanilla | 共通 | ours-only | vanilla-only |
+|---|---|---|---|---|---|
+| `seagrass` | **27** | 28 | 26 | 1 | 2 |
+| `tall_seagrass` | 28 | 30 | 26 | 2 | 4 |
+
+＝ 残差はノイズ床（22/8chunk）と同規模 ✓。**型を実装し、そのブロック自身の
+`canSurvive` を読めば、規則どおり一致する**という手順の再現性が確認できた。
+
+### 残る残差の性格（重要な期待値）
+
+型を埋めていくと、残差は次の 2 クラスに収束する:
+
+1. **規則の未実装**（機械的に潰せる）: 残りの型（`flower` 6・`kelp`・`sea_pickle`・
+   `large_dripstone`・`geode`・`ice_spike`・`desert_well`・`fossil`・`sculk_patch` 等）、
+   未対応の modifier、スカラー/リスト差。
+2. **順序/可視性依存**（この固定具では再現不能）: ore の探索箱ゲート（§51）、
+   patch の y（§58.1〜58.2）、隣 origin の ore blob（§54）。
+   spawn 準備が周辺を先に装飾した world を参照にしているため、**こちらの
+   「3×3 を先に decorate」という近似が最良**で、0 セルには届かない。
+
+したがって出口条件（block diff 0）を狙うなら、**隣が未装飾であることが保証される
+固定具**（spawn から離れた chunk を自力生成）が必要で、その道は
+自前 protocol client で bot を歩かせること（`forceload` は遠方で失敗、`setworldspawn` は
+再準備しない）。

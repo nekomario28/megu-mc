@@ -54,6 +54,11 @@ enum Cf {
     /// patch unplaced (measured: 34 of the pack's 60 configured-feature types had no
     /// arm, and `short_grass` was 0 cells against vanilla's 102).
     RandomPatch { feature: Box<Pf>, tries: i32, xz: i32, y: i32 },
+    /// `minecraft:seagrass` (`edk`): draw dx/dz in ±8, take the OCEAN_FLOOR height
+    /// there, and if that cell is water draw `nextDouble() < probability` to choose
+    /// tall or short seagrass. The block's own survival rule (`SeagrassBlock`, `dmx`)
+    /// is "the block below has a sturdy top face and is not magma" - not the dirt rule.
+    Seagrass { prob: f64 },
     SimpleRand(Vec<Pf>),
     WeightedSel(Vec<(Pf, i32)>),
     BoolSel(Pf, Pf),
@@ -202,6 +207,7 @@ fn p_cf(j: &J) -> Option<Cf> {
             hole: jint(j, "hole_count", 1),
             valid: name_list(j, "valid_blocks").into_iter().collect(),
         },
+        "seagrass" => Cf::Seagrass { prob: jnum(j, "probability").unwrap_or(0.0) },
         "random_patch" => Cf::RandomPatch {
             feature: Box::new(pf_any(js(j, "feature")?)?),
             tries: jint(j, "tries", 0),
@@ -1104,6 +1110,41 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             if rocks == *rock && air == *hole {
                 ctx.set(pos.0, pos.1, pos.2, *fluid);
+            }
+        }
+        Cf::Seagrass { prob } => {
+            let Some(reg) = breg() else { return };
+            // dx, dz (4 draws), the heightmap read (none), the water test (none),
+            // then the tall/short draw - that order is what the streams compare
+            let (x, z) = (
+                pos.0 + rng.next_bound(8) - rng.next_bound(8),
+                pos.2 + rng.next_bound(8) - rng.next_bound(8),
+            );
+            let y = ctx.hm_oc(x, z);
+            if reg.name_of(ctx.get(x, y, z)) != "minecraft:water" {
+                return;
+            }
+            let tall = rng.next_f64() < *prob;
+            let below = ctx.get(x, y - 1, z);
+            // `SeagrassBlock.mayPlaceOn`: sturdy top face, and not magma
+            if !reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block" {
+                return;
+            }
+            let half = |v: &str| {
+                J::Obj(vec![("half".to_string(), J::Str(v.to_string()))])
+            };
+            if tall {
+                if reg.name_of(ctx.get(x, y + 1, z)) != "minecraft:water" {
+                    return;
+                }
+                let lo = reg
+                    .state_of("minecraft:tall_seagrass", Some(&half("lower")))
+                    ;
+                let hi = reg.state_of("minecraft:tall_seagrass", Some(&half("upper")));
+                ctx.set(x, y, z, lo);
+                ctx.set(x, y + 1, z, hi);
+            } else {
+                ctx.set(x, y, z, reg.state_of("minecraft:seagrass", None));
             }
         }
         Cf::RandomPatch { feature, tries, xz, y } => {
