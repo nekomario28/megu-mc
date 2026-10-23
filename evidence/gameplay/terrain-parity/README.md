@@ -31,7 +31,9 @@ overlay があると mc-spine 側だけに数セルの差が乗る。
 
 - (0,0) の履歴: 1221（3 修正前）→ 194（vertical_gradient 修正後）→
   5（surface rule 修正後）→ 0（interpolated 順序修正後）。
-- feature を止めない比較（同 chunk、seed 0）は **11856 → 10939**
+- feature を止めない比較（同 chunk、seed 0）は **11856 → 10939**（2026-10-20。
+  2026-10-22 時点の同じ 2×2 は **1035**、葉の `distance` を除くと 655。
+  [feature パリティ](../feature-parity/README.md) を参照）
   （11856 は VERT 修正前の作業記録 b53dbbe の値）。地形が一致してもこの数は
   ほとんど減らない。残差のトップ組は `deepslate <-> tuff`、
   `andesite/diorite/granite <-> stone` で、feature 層（同梱データの版差を含む）

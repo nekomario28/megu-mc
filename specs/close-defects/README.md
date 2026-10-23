@@ -72,3 +72,23 @@ feature 層の残差（chunk (0,0) で 10939 セル）は同梱 worldgen デー�
 [生成器の費用](../../evidence/gameplay/worldgen-cost/README.md)。
 次のスライスは生成の並列化（owner: region/chunk pipeline）で、それまでは
 `ore_dirt` / `monster_room` のループを削る。
+
+## 2026-10-22 更新: carver と ore vein が閉じ、feature 層は 0.26% へ
+
+地形パリティの 3 修正の後、**地形段階の ore vein** と **carver** が vanilla と一致した:
+
+- carver（cave / cave_extra / canyon）: 2×2 で **0 セル**。原因は `minecraft:uniform`
+  height provider の draw 数（1.21.1 は 1 draw、port は 2 draw）で、トンネルの
+  yaw/pitch/yScale/count/seed が 1 draw ずれていた。vanilla の生ドロー列と port の
+  `CARVE_RAW` を先頭から突き合わせて特定（証拠は §25）。
+- ore vein（地形段階）: **0 セル**。1.21.1 は router の vein 3 関数 + `ore_veins_enabled`
+  で地形段階に生成し、乱数は `fromHashOf("minecraft:ore")` の派生 positional factory。
+- feature 層: 2×2 で **1035 / 393216（0.26%）**。葉の `distance` 380 は tick 由来で、
+  除外すると **655**。原因 12 件（いずれも「宣言的なものが黙って落ちる」型）は
+  [feature パリティ](../../evidence/gameplay/feature-parity/README.md) と
+  [carvers §25〜§42](../../evidence/gameplay/carvers/README.md) に記録。
+
+未解決は 2 件: (1) chunk (1,0) の候補 (20,66,3) で vanilla の `BiomeFilter` が false を
+返す（保存済み biome は forest）— 木 45 vs 38 の主因、(2) `ore_dirt`/`ore_gravel` の
+blob が vanilla の部分集合（121 + 96 セル）。構造物（jigsaw / template pool / NBT）は
+未実装のまま。
