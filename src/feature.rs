@@ -2662,6 +2662,8 @@ pub(crate) fn feat_prof_dump() {
     }
 }
 
+/// Populate one chunk (and the 3x3 around it, as a feature read would) so that a
+/// diagnostic sees the same feature-layer state a generation loop would.
 pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     // Vanilla's chunk status order is CARVERS then FEATURES, and both write into
     // the chunk's block state, so the carver pass runs here — before the feature
