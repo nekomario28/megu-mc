@@ -480,7 +480,7 @@ pub(crate) enum Pr {
     Fluids(Vec<String>),
     Solid,
     Replaceable,
-    WouldSurvive,
+    WouldSurvive(String),
     InsideWB,
     HasSturdy([i32; 3], u8),
     Unobstructed,
@@ -532,7 +532,12 @@ pub(crate) fn p_pred(j: &J) -> Option<Pr> {
         "not" => Pr::Not(Box::new(p_pred(js(j, "predicate")?)?)),
         "any_of" => Pr::Any(jarr(j, "predicates")?.iter().filter_map(p_pred).collect()),
         "all_of" => Pr::All(jarr(j, "predicates")?.iter().filter_map(p_pred).collect()),
-        "would_survive" => Pr::WouldSurvive,
+        "would_survive" => Pr::WouldSurvive(
+            js(j, "state")
+                .and_then(bs_parts)
+                .map(|(n, _)| n)
+                .unwrap_or_default(),
+        ),
         "inside_world_bounds" => Pr::InsideWB,
         "has_sturdy_face" => {
             let d = match jstr(j, "direction").as_deref() {
@@ -602,6 +607,7 @@ pub(crate) enum PM {
     Biome,
     BlockPred(Pr),
     Rarity(i32),
+    Fixed,
     SurfaceRel(i32, i32),   // min_inclusive, max_inclusive (i32::MIN/MAX for absent)
     SurfWaterDepth(i32),
     NoiseCount(i32, f64, f64),
@@ -627,6 +633,9 @@ pub(crate) fn p_mod(j: &J) -> Option<PM> {
             _ => 0,
         }),
         "biome" => PM::Biome,
+        // keeps the position (used by the end platform); unparsed it was dropped,
+        // which silently changed the modifier count for that feature
+        "fixed_placement" => PM::Fixed,
         "block_predicate_filter" => PM::BlockPred(p_pred(js(j, "predicate")?)?),
         "rarity_filter" => PM::Rarity(jint(j, "chance", 1)),
         "surface_relative_threshold_filter" => PM::SurfaceRel(
@@ -805,10 +814,15 @@ pub(crate) fn test_pred(pr: &Pr, reg: &BReg, ctx: &mut FC, x: i32, y: i32, z: i3
         }
         Pr::Solid => reg.is_solid(ctx.get(x, y, z)),
         Pr::Replaceable => reg.is_replaceable(ctx.get(x, y, z)),
-        Pr::WouldSurvive => {
-            let st = ctx.get(x, y, z);
-            let n = reg.name_of(st);
-            can_place(reg, ctx, n, x, y, z)
+        Pr::WouldSurvive(want) => {
+            // vanilla's `would_survive` tests the *configured* state
+            // (`state.canSurvive(level, pos)`) at the candidate position, not the
+            // block that happens to be there.
+            if want.is_empty() {
+                false
+            } else {
+                can_place(reg, ctx, want, x, y, z)
+            }
         }
         Pr::InsideWB => !ctx.out_of_h(y),
         Pr::HasSturdy(off, d) => {

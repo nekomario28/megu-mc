@@ -208,6 +208,22 @@ public class Agent {
                 @Override public MethodVisitor visitMethod(int acc, String mn, String md,
                                                            String sig, String[] ex) {
                     MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (mn.equals("a") && md.equals("(I)I")) {
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int op) {
+                                if (op != Opcodes.IRETURN) { super.visitInsn(op); return; }
+                                super.visitVarInsn(Opcodes.ISTORE, 40);
+                                super.visitVarInsn(Opcodes.ILOAD, 1);
+                                super.visitInsn(Opcodes.I2L);
+                                super.visitVarInsn(Opcodes.ILOAD, 40);
+                                super.visitInsn(Opcodes.I2L);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rbound",
+                                                      "(JJ)V", false);
+                                super.visitVarInsn(Opcodes.ILOAD, 40);
+                                super.visitInsn(op);
+                            }
+                        };
+                    }
                     if (!mn.equals("c") || !md.equals("(I)I")) return mv;
                     return new MethodVisitor(Opcodes.ASM9, mv) {
                         @Override public void visitInsn(int op) {
@@ -308,6 +324,116 @@ public class Agent {
             return cw.toByteArray();
         } catch (Throwable t) {
             System.err.println("CARVEAGENT seeds failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * `RandomSource`'s default draws (`nextInt(bound)`, `nextFloat`) live on the
+     * interface, not on the implementing class, so they can only be seen here.
+     */
+    static byte[] instrumentDynDraws(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    boolean bound = mn.equals("a") && md.equals("(I)I");
+                    boolean plain = mn.equals("f") && md.equals("()I");
+                    boolean flt = mn.equals("i") && md.equals("()F");
+                    if (!bound && !plain && !flt) return mv;
+                    final int n = bound ? 2 : 1; // args pushed before the value
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            boolean ret = bound || plain ? op == Opcodes.IRETURN : op == Opcodes.FRETURN;
+                            if (!ret) { super.visitInsn(op); return; }
+                            super.visitVarInsn(plain || bound ? Opcodes.ISTORE : Opcodes.FSTORE, 40);
+                            super.visitLdcInsn(bound ? "nextInt" : (plain ? "nextInt()" : "nextFloat"));
+                            if (bound) { super.visitVarInsn(Opcodes.ILOAD, 1); super.visitInsn(Opcodes.I2L); }
+                            else super.visitLdcInsn(Long.valueOf(0L));
+                            super.visitVarInsn(plain || bound ? Opcodes.ILOAD : Opcodes.FLOAD, 40);
+                            if (flt) super.visitInsn(Opcodes.F2L);
+                            else if (plain || bound) super.visitInsn(Opcodes.I2L);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "rdraw",
+                                                  "(Ljava/lang/String;JJ)V", false);
+                            super.visitVarInsn(plain || bound ? Opcodes.ILOAD : Opcodes.FLOAD, 40);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT dyn draws failed: " + t);
+            return null;
+        }
+    }
+
+    /** InSquarePlacement: log the drawn (x, z) for every candidate. */
+    static byte[] instrumentInSquare(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a_") || !md.equals("(Leiw;Layw;Ljd;)Ljava/util/stream/Stream;")) {
+                        return mv;
+                    }
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            if (op != Opcodes.ARETURN) { super.visitInsn(op); return; }
+                            // locals: 0=this, 1=eiw, 2=ayw, 3=jd, 4=blockX, 5=blockZ
+                            super.visitVarInsn(Opcodes.ILOAD, 4);
+                            super.visitVarInsn(Opcodes.ILOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "insq",
+                                                  "(II)V", false);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT insquare failed: " + t);
+            return null;
+        }
+    }
+
+    /** BiomeFilter: log every candidate position and whether the biome accepts it. */
+    static byte[] instrumentBiomeFilter(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals("(Leiw;Layw;Ljd;)Z")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            if (op != Opcodes.IRETURN) { super.visitInsn(op); return; }
+                            super.visitVarInsn(Opcodes.ISTORE, 40);
+                            super.visitVarInsn(Opcodes.ALOAD, 3);
+                            for (String g : new String[] {"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 3);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                            }
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "biomef",
+                                                  "(IIIZ)V", false);
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, 0);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT biomefilter failed: " + t);
             return null;
         }
     }
@@ -544,6 +670,9 @@ public class Agent {
             if ("edq".equals(name)) return instrumentTree(buf);
             if ("duz".equals(name)) return instrumentDimension(buf);
             if ("deg".equals(name)) return instrumentBiomes(buf);
+            if ("eii".equals(name)) return instrumentBiomeFilter(buf);
+            if ("eis".equals(name)) return instrumentInSquare(buf);
+            if ("dyn".equals(name)) return instrumentDynDraws(buf);
             if ("dzx".equals(name)) {
                 byte[] b = instrumentSeeds(buf);
                 return instrumentRSeed(b != null ? b : buf);

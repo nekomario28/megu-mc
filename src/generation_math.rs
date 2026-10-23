@@ -103,6 +103,37 @@ pub(crate) fn mth_cos(v: f32) -> f32 {
     sin_table()[(v * SIN_STEPS + 16384.0) as i32 as usize & 65535]
 }
 
+/// `FSEED_ARM=cx,cz,i,step` logs the first draws of that placed feature the way
+/// the server's `WorldgenRandom.next(bits)` does, so both streams can be diffed.
+pub(crate) fn nxtrace(bits: u32, v: u64) {
+    let n = NTRACE.load(std::sync::atomic::Ordering::Relaxed);
+    if n < 0 {
+        return;
+    }
+    eprintln!("NDRAW {n} bits={bits} -> {v}");
+    NTRACE.store(
+        if n + 1 >= 20 { -1 } else { n + 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) static NTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The same trace for `nextFloat`, which `NTRACE` (ints) cannot show.
+pub(crate) fn fdraw(v: f32) {
+    let n = FTRACE.load(std::sync::atomic::Ordering::Relaxed);
+    if n < 0 {
+        return;
+    }
+    eprintln!("FDRAW {n} -> {v}");
+    FTRACE.store(
+        if n + 1 >= 20 { -1 } else { n + 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) static FTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 /// Env-gated draw trace for feature placement (`FSEED_ARM=i,step`).
 pub(crate) static XTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -155,7 +186,9 @@ impl Xor {
         n
     }
     pub(crate) fn next(&mut self, bits: u32) -> u64 {
-        self.next_long() >> (64 - bits)
+        let v = self.next_long() >> (64 - bits);
+        nxtrace(bits, v);
+        v
     }
     /// `WorldgenRandom`-style `nextLong()`: two `next(32)` calls, sign-extended.
     pub(crate) fn next_i64_legacy(&mut self) -> i64 {
@@ -216,7 +249,9 @@ impl Xor {
         }
     }
     pub(crate) fn next_f32(&mut self) -> f32 {
-        self.next(24) as f32 * 5.960_464_5E-8
+        let v = self.next(24) as f32 * 5.960_464_5E-8;
+        fdraw(v);
+        v
     }
     pub(crate) fn next_bool(&mut self) -> bool {
         if self.legacy {

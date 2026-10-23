@@ -32,6 +32,30 @@ public class CarveLog {
         RD.get()[1] = 0;
     }
 
+    /** InSquarePlacement: the (x,z) it drew, before any filter sees it. */
+    public static void insq(int x, int z) {
+        String p = System.getProperty("insqchunk");
+        if (p == null) return;
+        String[] a = p.split(",");
+        if (a.length != 2) return;
+        if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        if (!overworld()) return;
+        int[] f = FEAT.get();
+        System.out.println("INSQ " + x + " " + z + " feature=" + f[0] + "," + f[1]);
+    }
+
+    /** BiomeFilter verdicts: `-Dbiomefchunk=cx,cz` limits the log to one chunk. */
+    public static void biomef(int x, int y, int z, boolean ok) {
+        String p = System.getProperty("biomefchunk");
+        if (p == null) return;
+        String[] a = p.split(",");
+        if (a.length != 2) return;
+        if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
+        if (!overworld()) return;
+        int[] f = FEAT.get();
+        System.out.println("BIOMEF " + x + " " + y + " " + z + " " + ok + " feature=" + f[0] + "," + f[1]);
+    }
+
     /** `FeatureSorter.buildFeaturesPerStep`'s biome list, in iteration order. */
     public static void biomes(Object list) {
         if (System.getProperty("biomelist") == null) return;
@@ -128,6 +152,15 @@ public class CarveLog {
     public static boolean vwant(int x, int y, int z) {
         String p = System.getProperty("veindump");
         return p != null && p.equals(x + "," + y + "," + z);
+    }
+
+    /** `LegacyRandomSource.nextInt(bound)`: the bound and the value it returned. */
+    public static void rbound(long bound, long val) {
+        int[] st = RD.get();
+        if (st[0] != 1) return;
+        int i = st[1]++;
+        if (i >= 24) { st[0] = -1; return; }
+        System.out.println("RBOUND " + i + " bound=" + bound + " -> " + val);
     }
 
     /** Bound (0 = nextInt()) and value of one Xoroshiro draw. */

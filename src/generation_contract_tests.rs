@@ -200,7 +200,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             Pr::Fluids(vec!["minecraft:water".into()]),
             Pr::Solid,
             Pr::Replaceable,
-            Pr::WouldSurvive,
+            Pr::WouldSurvive("minecraft:oak_sapling".into()),
             Pr::InsideWB,
             Pr::HasSturdy([0, -1, 0], 1),
             Pr::Any(vec![]),

@@ -1282,3 +1282,46 @@ step 6 の不変性のおかげで ore は今まで正しく見えていた、�
 **教訓**: feature の RNG オフセットは「step 内の添字」で決まる。添字は
 全 biome の並びから作るトポロジカルソートなので、**入力の biome 集合と順序**が
 正しくないと、並びが同一の step（ore など）だけが正しく見える。
+
+## 36. 木の残差は「disk 系 feature が先に置くブロック」の差だった
+
+`OW_BIOMES` を実サーバーの 53 biome 順に直した後も、木の位置は 14/38 しか一致しない。
+決め手は 2 つ:
+
+1. **`InSquarePlacement` の生ログ**（`eis.a_` をフック、locals は 0=this/1=eiw/2=ayw/
+   3=jd/4=x/5=z）。chunk (‑1,0) の feature (20,9) で vanilla の候補列は
+   `(12,6),(10,4),(11,2),(12,6),(6,1),(10,2),(1,3),(6,8),(4,13),(13,11),(5,5)`
+   （chunk 相対）、こちらは `(12,6),(5,8),(7,11),…` と 2 個目からずれる。
+2. **`RandomSource` の default メソッド**（`dyn.a(I)I` / `dyn.i()F`）をフックした生ドロー列。
+   vanilla は `nextInt(10)=9, nextInt(16)=12, nextInt(16)=6, nextFloat, nextFloat,
+   nextInt(16)=10, nextInt(16)=4, …`。**2 個目の候補の前に float が 2 つだけで、
+   int を 1 つも引いていない** = 1 個目の候補では木を生成していない。
+
+`trees_birch_and_oak` は `random_selector`（chance 0.2 の birch / 0.1 の fancy oak、
+default は `oak_bees_0002`）で、default の placed feature は
+`block_predicate_filter(would_survive oak_sapling)` だけを持つ。つまり vanilla は
+候補 (‑4,63,6) で **sapling が育たない**と判定して木を 1 つも生成していない。
+
+理由は下のブロック。vanilla の最終世界では (‑4,62,6) は **gravel**、こちらは
+**grass_block**。`is_dirtish(gravel)` は false なので vanilla は正しく拒否し、
+こちらは「育てる」と判断して木を生成 → **消費ドロー数が変わり、以降の候補が
+すべてずれる**（木 1 本の差が 11 候補全体を動かす）。
+
+(‑4,62,6) の gravel は disk 系（`disk_gravel`）が置いたもので、同じ 2×2 の残差に
+`dirt != sand` 411 / `dirt != gravel` 168 があることと一致する。**次の単位は
+disk 系 feature（sand/clay/gravel）の実装**で、それが直れば木の位置も揃う見込み。
+
+### 計測器（今回追加）
+
+- `eis`（InSquarePlacement）の生 (x,z)、`eii`（BiomeFilter）の位置と可否、
+  `dyn` の default ドロー（`nextInt(bound)`/`nextInt()`/`nextFloat`）、
+  `deg.a` の biome リスト、`duz.a` の dimension（`LevelHeightAccessor.getMinBuildHeight`、
+  ‑64 のみ overworld）。
+- port 側: `TREE_TRACE` / `BIOMEF_TRACE` / `INSQ` 相当は無いが `FSEED_ARM` で
+  `NDRAW`（next(bits)）/ `FDRAW`（nextFloat）/ `XDRAW`（nextInt(bound)）を出力。
+- `PF_UNKNOWN=1`: 解析できず**黙って落ちる** placement modifier を表示
+  （`fixed_placement` が見つかったので実装した）。
+
+**注意**: `LevelHeightAccessor.getMinBuildHeight` の obf は `I_()`（`dcy`）。
+nether/end は同じ chunk 座標・同じ level seed で装飾するので、
+dimension で切らないと FSEED/BIOMEF のログが混ざる（今回それで 1 往復無駄にした）。

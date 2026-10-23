@@ -111,8 +111,19 @@ fn p_pf(j: &J) -> Option<Pf> {
     let mut mods = vec![];
     if let Some(ms) = jarr(j, "placement") {
         for m in ms {
-            if let Some(pm) = p_mod(m) {
-                mods.push(pm);
+            match p_mod(m) {
+                Some(pm) => mods.push(pm),
+                None => {
+                    // A dropped modifier silently changes every later draw, so
+                    // make it visible instead of guessing.
+                    if std::env::var("PF_UNKNOWN").is_ok() {
+                        eprintln!(
+                            "PFUNKNOWN {} modifier={}",
+                            jstr(j, "feature").unwrap_or_default(),
+                            jstr(m, "type").unwrap_or_default()
+                        );
+                    }
+                }
             }
         }
     }
@@ -568,9 +579,24 @@ fn mod_positions(
                 out.push((pos.0, top, pos.2));
             }
         }
+        PM::Fixed => out.push(pos),
         PM::Biome => {
             if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
-                if fr.ball.get(&b).map(|s| s.contains(&pf.name)).unwrap_or(false) {
+                let ok = fr.ball.get(&b).map(|s| s.contains(&pf.name)).unwrap_or(false);
+                if let Ok(spec) = std::env::var("BIOMEF_TRACE") {
+                    if let Some((a, c)) = spec.split_once(',') {
+                        if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
+                            if (pos.0 >> 4) == cx && (pos.2 >> 4) == cz {
+                                let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                                eprintln!(
+                                    "BIOMEF {} {} {} {} biome={} feature={},{}",
+                                    pos.0, pos.1, pos.2, ok, b, cf >> 32, cf & 0xFFFF
+                                );
+                            }
+                        }
+                    }
+                }
+                if ok {
                     out.push(pos);
                 }
             }
@@ -2622,6 +2648,10 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             if let Ok(spec) = std::env::var("FSEED_ARM") {
                 if spec == format!("{sx},{sz},{gi},{step}") {
                     crate::generation_math::XTRACE
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::generation_math::NTRACE
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::generation_math::FTRACE
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                 }
             }
