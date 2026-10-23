@@ -1045,7 +1045,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 if std::env::var("SIMPLE_TRACE").is_ok() {
                     static N: std::sync::atomic::AtomicI32 =
                         std::sync::atomic::AtomicI32::new(0);
-                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100_000 {
                         eprintln!(
                             "SIMPLE {} {} {} state={} below={} at={} ok={ok}",
                             pos.0, pos.1, pos.2, reg.name_of(st),

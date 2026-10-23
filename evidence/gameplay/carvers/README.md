@@ -2151,3 +2151,24 @@ return false;                     // ← これが無かった
 「地面の中」を叩いている、なら大幅に過少になる）。
 
 4×4 の総 diff は 42706（型の未実装が支配的なので、この数字は型を埋めるまで意味を持たない）。
+
+### 58.2 `canSurvive` の規則は正しい（試行の分布で確認）
+
+`SIMPLE_TRACE=1` を上限なしにして chunk (0,0) 周辺の `patch_grass_forest` の
+**全 351 試行**を記録した:
+
+| 判定 | 件数 |
+|---|---|
+| `ok=true`（設置） | 59 |
+| `ok=false`（棄却） | 292 |
+
+設置された 59 件はすべて `below=minecraft:grass_block`、棄却された中身は
+`air` 237・`water` 46・`oak_leaves` 7・`short_grass` 1・`sand` 1 ＝
+**「下が DIRT タグ」だけを通す**、という `mayPlaceOn` の規則どおり ✓。
+
+したがって §58.1 の 44 vs 102（過少）は `canSurvive` の実装ミスではない。残る説明は
+**patch の位置（= `heightmap(WORLD_SURFACE_WG)` の y）が先行する書き込みに依存する**という
+順序/可視性のクラス（§51 の ore ゲートと同じ形: ハイトマップ経由で他 chunk の
+feature 書き込みを読む）。ドローは最初の patch で一致しているので、次は
+**後続の patch インスタンス**（別 chunk の populate で走るもの）の y を
+`FSEED_ARM` で窓を切って両側 diff する。
