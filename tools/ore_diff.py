@@ -68,17 +68,22 @@ def main():
     names = load_names()
     raw = open(dump, "rb").read()
     ours, theirs = set(), set()
+    compared = 0
     for dz in range(n):
         for dx in range(n):
             cx, cz = x0 + dx, z0 + dz
+            # the reference's status decides first: a partially generated chunk holds
+            # no features, so counting *our* cells for it would read as "this port
+            # placed thousands of cells vanilla does not have"
+            chunk, _ = parse_nbt(chunk_bytes(world, cx, cz))
+            if chunk.get("Status") not in ("minecraft:full", "full"):
+                continue
+            compared += 1
             cells = raw[(dz * n + dx) * CELLS * 4:(dz * n + dx + 1) * CELLS * 4]
             got = [int.from_bytes(cells[i * 4:i * 4 + 4], "little") for i in range(CELLS)]
             for i, v in enumerate(got):
                 if names.get(v) == block:
                     ours.add((cx * 16 + (i & 15), (i >> 8) - 64, cz * 16 + ((i >> 4) & 15)))
-            chunk, _ = parse_nbt(chunk_bytes(world, cx, cz))
-            if chunk.get("Status") not in ("minecraft:full", "full"):
-                continue
             for s in chunk.get("sections", []):
                 idx = s.get("Y", 0) - MIN_Y // 16
                 bs = s.get("block_states")
@@ -103,6 +108,8 @@ def main():
                     if ids[p] == block:
                         y0 = MIN_Y + idx * 16
                         theirs.add((cx * 16 + (i & 15), y0 + (i >> 8), cz * 16 + ((i >> 4) & 15)))
+    if compared == 0:
+        raise SystemExit("NOTHING COMPARED: every requested chunk is incomplete in the reference")
     shared = ours & theirs
     print(f"{block}: ours {len(ours)} vanilla {len(theirs)} shared {len(shared)} "
           f"ours-only {len(ours - theirs)} vanilla-only {len(theirs - ours)}")

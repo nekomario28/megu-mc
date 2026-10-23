@@ -2001,3 +2001,37 @@ chunk (0,0) 単体で両モードを比べた（参照は feature あり world�
 (該当 chunk, 該当 feature) の窓で両側 diff する。境界列であることが
 「chunk 境界のクリップ」なのか「樹冠の形そのもの」なのかをまず切り分ける
 （固定具領域を 4×4 に広げて同じ木を見れば、クリップ説は消える）。
+
+## 56. 4×4 の隔離固定具: 樹冠の「欠け」は**スケジュール依存**だった（自分の訂正2回目）
+
+2×2 の隔離世界で `birch_leaves` が 21 セル欠けていた件（§55）を、**4×4 の隔離世界**で
+測り直すと:
+
+| ブロック | ours | vanilla | 共通 | ours-only | vanilla-only | クラスタ |
+|---|---|---|---|---|---|---|
+| `birch_leaves` | 471 | 471 | **471** | 0 | 0 | 両側で完全一致 |
+| `birch_log` | 59 | 60 | 59 | 0 | 1 | 幹 1 本だけ差 |
+| `oak_leaves` | 2311 | 2369 | 2116 | 195 | 253 | クラスタサイズはほぼ同じ |
+
+**樹冠は完全一致**した ＝ §55 の「ある 1 本の樹冠の片側が書かれていない」は
+**樹冠の形のバグではなく、その 2×2 world の装飾スケジュール（並列進行度）の差**だった。
+（同じ pack でも forceload 範囲が違えばスケジュールが変わり、こちらのモデルの
+一致/不一致も変わる。）自分の読み違いを2回記録したことになるので、
+「原因の説明は検証済み／仮説を分けて書く」規則（DESIGN 第6項）の実例として残す。
+
+### 4×4 隔離固定具の残差（8/16 chunk が参照側 full、tick 由来の葉 distance を除く）
+
+```
+chunks 4x4  differing cells: 938（carver 656 / deep 282）
+per chunk: 9 67 61 60 293 103 276 69
+内訳（tick 由来を除く生の差 2407 のうち）:
+  oak_leaves != oak_leaves 1166 / birch_leaves != birch_leaves 303 → 全て葉の distance（tick）
+  air != oak_leaves 252 / oak_leaves != air 186 → 葉の有無（落葉/tick と実差）
+  gravel != stone 116 / gravel != deepslate 70 / deepslate != gravel 39 → ore_gravel の blob
+  air != short_grass 101 / water != tall_seagrass 30 / grass_block != dirt 42
+```
+
+2×2 より代表的な固定具になった（16 chunk・種々の地形）ので、以降はこれを使う。
+`tools/ore_diff.py` も参照側の status を**先に**見て、不完全な chunk は両側とも
+集計から外すよう修正（§55 の 4×4 比較が「ours 6709 / vanilla 2372」と出たのは
+この欠陥だった）。
