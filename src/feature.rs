@@ -23,7 +23,16 @@ mod generation_contract_tests;
 // ---------- configured features ----------
 
 enum FRef {
+    /// a *configured* feature, referenced by name
     Name(String),
+    /// a *placed* feature, referenced by name. The configured-feature contract
+    /// (random_selector, simple_random_selector, weighted_random_selector,
+    /// sequence, ...) holds `Holder<PlacedFeature>`, so the referenced feature's
+    /// placement modifiers run too - with the same RNG. Treating the reference as
+    /// a bare configured feature dropped those modifiers, which silently removed
+    /// e.g. `block_predicate_filter(would_survive)`: every random_selector tree
+    /// candidate then grew a tree where vanilla rejected it.
+    Placed(String),
     Inline(Box<Cf>),
 }
 struct Pf {
@@ -88,7 +97,7 @@ fn name_list(j: &J, k: &str) -> Vec<String> {
 fn pf_any(j: &J) -> Option<Pf> {
     match j {
         J::Str(s) => Some(Pf {
-            feat: FRef::Name(ns_name(s)),
+            feat: FRef::Placed(ns_name(s)),
             mods: vec![],
             name: String::new(),
         }),
@@ -507,6 +516,15 @@ fn gen_cf_ref(fref: &FRef, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: 
                 }
             }
         }
+        FRef::Placed(n) => match fr.placed.get(n) {
+            // the child runs its own modifier chain on the same RNG stream
+            Some(pf) => gen_pf(pf, fr, ctx, rng, pos),
+            None => {
+                if std::env::var("CF_MISSING").is_ok() {
+                    eprintln!("CFMISSING placed {n}");
+                }
+            }
+        },
         FRef::Inline(cf) => gen_cf(cf, fr, ctx, rng, pos),
     }
 }

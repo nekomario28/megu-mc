@@ -3519,7 +3519,12 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // no "type" field and their fluid predicate names a single fluid, so both
         // parsed to nothing and the feature silently did no work.
         // 2x2 feature-on diff: 2510 -> 1856 (chunk (0,0): 540 -> 140).
-        assert_eq!(digest, "d71b0fa09e1ec756f945a8940cd3f46d",
+        // 2026-10-22: a nested *placed* feature reference now runs the referenced
+        // feature's own placement modifiers (the configured-feature contract holds
+        // Holder<PlacedFeature>). Dropping them hid
+        // block_predicate_filter(would_survive) on the random_selector children, so
+        // every tree candidate grew a tree. 2x2 feature-on diff: 1856 -> 1035.
+        assert_eq!(digest, "b43cb2458e47bf29ea759aef021db763",
             "feature population output changed from the vanilla-order capture");
     }
 

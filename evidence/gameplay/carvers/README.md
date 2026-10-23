@@ -1398,3 +1398,35 @@ forceload された chunk では樹冠が欠ける（水の流れと同じ種類
 （水・葉・作物・流体）は「worldgen 段階の値」と「tick 後の値」が別物で、
 固定具の world は後者を保持している。差を数える前に「これはどちらの段階か」を
 確かめる（葉は `updateShape` が state を返さないことが根拠になる）。
+
+## 39. 入れ子の「placed feature 参照」が modifier を落としていた（木の真因）
+
+`random_selector` / `simple_random_selector` / `weighted_random_selector` /
+`sequence` が保持するのは **`Holder<PlacedFeature>`** であって configured feature
+ではない。したがって参照先の *placement modifier* も、同じ RNG ストリームで
+実行される。こちらの `pf_any(J::Str)` は
+
+```rust
+J::Str(s) => Some(Pf { feat: FRef::Name(ns_name(s)), mods: vec![], .. })
+```
+
+と、**modifier を空にしていた**。その結果:
+
+- `trees_birch_and_oak`（random_selector）の子 `birch_bees_0002` /
+  `fancy_oak_bees_0002` / default `oak_bees_0002` の
+  `block_predicate_filter(would_survive oak_sapling)` が実行されず、
+- 候補ごとに必ず木を生成 → **消費ドロー数が増え、以降の候補位置がすべてずれる**
+  （chunk (‑1,0) で 11 候補中 vanilla 6 本 / こちら 9 本）。
+
+`FRef::Placed(String)` を足し、生成時に `fr.placed` から引いて `gen_pf` を呼ぶ
+（＝子の modifier 連鎖を同じ RNG で実行する）ようにした結果:
+
+| | 前 | 後 |
+|---|---|---|
+| 2×2 feature あり diff | 1856 | **1035** |
+| tick 由来（葉の distance）を除く | 1613 | **655** |
+| 木の本数（3×3、chunk (0,0) 周辺） | 53 | **45**（vanilla 38） |
+| chunk (0,0) 単体 | 140 | **92** |
+
+残りは「45 vs 38 の木」と carver 層。木は `would_survive` の残差
+（`can_place` の dirt 判定 vs `BlockTags.DIRT` + farmland）を追う。
