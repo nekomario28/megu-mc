@@ -2227,7 +2227,9 @@ if (level.getBlockState(p).is(WATER)) {            // ← 水判定が nextDoubl
 `p_cf` に `"flower" | "random_patch"` の別名を足しただけで花が置けるようになった
 （4×4 隔離固定具で dandelion 2/1・poppy 1/2 ＝ 参照とほぼ一致）。
 
-この4×4ダンプ (`/tmp/fl.bin` vs `/tmp/orefix-rp/world`) は `carver_diff.py` で
+この4×4ダンプは `/tmp` の作業ファイルなので既に残っていない（基点と隔離 pack は
+`tools/fixture_base.sh` → `tools/ore_fixture.sh` で作り直せる。以下の数字は当時の比較の
+記録であって、パスを保持しているという意味ではない）。`carver_diff.py` で
 42654差、内訳 deep 41394 / carver 1260、参照が full の8 chunk・skip 8 chunk だった。
 従って、この総数を「feature 残差」や「順序/可視性クラス」と呼ぶ根拠はない。
 §59 の型別比較（seagrass）とは対象も観測も異なる。fixture の生成段階、ore/disk

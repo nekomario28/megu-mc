@@ -37,7 +37,7 @@ cause — see the write_varint entry above.)
 
 Fix applied 2026-09-25 ~15:18 JST: reject `len < 0 || len > 16 MiB`
 before allocating (line 54). Verified: `cargo check` PASS (MemoryMax=4G
-scope). Pre-change file backed up at `src/main.rs.bak-precap`.
+scope). Pre-change file kept at `evidence/foundation/audit-snapshots/main.pre-cap.rs`.
 Regression probe: `probe_evil_packet.py` — sends a `0x7fffffff` length
 VarInt; patched server must reject with flat RSS. NOTE: any already-
 running server process still carries the OLD binary until restarted —

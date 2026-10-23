@@ -10,7 +10,7 @@ Target signature: **67 GB VM / 20 GB RSS in ~100 s, only while a client is conne
 ## Verdict — signature decomposition
 
 The VM≫RSS shape (~3.3× virtual over resident) plus "~100s" is the textbook signature of
-the **pre-cap `read_packet`** (now `src/main.rs.bak-precap`):
+the **pre-cap `read_packet`** (kept as `evidence/foundation/audit-snapshots/main.pre-cap.rs`):
 
 - `vec![0u8; len]` compiles to `alloc_zeroed` → for multi-GB sizes glibc serves it via
   `mmap` → **VmSize jumps instantly, VmRSS stays ~0** (zero pages, untouched).
@@ -138,7 +138,8 @@ The 2026-09-25 captures (`night-2026-09-25/oom-captures`, pid 3329328 @17:04, pi
 
 ### Root cause: pre-fix `write_varint` infinite loop on negative i64
 
-Incident-era builds (`.bak-precap` 15:17, `mc-spine-inst` 16:41 — both predate the fix) carried:
+Incident-era builds (the 15:17 pre-cap source and the 16:41 installed-patch copy, both kept in
+`evidence/foundation/audit-snapshots/`, and both predating the fix) carried:
 
 ```rust
 fn write_varint(out: &mut Vec<u8>, mut v: i64) {
@@ -189,7 +190,7 @@ Systematic re-check of the full file for "wire/state-derived count feeds a growi
 Vec/HashMap/String", since the file was live-edited after the first addendum.
 Method: enumerated every `read_varint` consumer, every `for`/`while`/`loop` bound,
 every alloc primitive, every container iteration. Snapshot kept at
-`/data/lane-scratch/mc-spine-audit-3/main_snapshot_1809.rs`.
+`evidence/foundation/audit-snapshots/main.2026-09-25T1809.rs` (kept in the repository; the hashes and what these files are not are in that directory's README).
 
 ## Verdict: no remaining wire/state-count → container-growth path exists in current source
 
