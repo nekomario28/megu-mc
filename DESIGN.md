@@ -65,7 +65,9 @@ world生成の一致を測るときは、次の三つを先に確かめる。ど
    残差を数える前に、差がworldgenの段階のものかを確かめ、そうでないセルは
    worldgenの残差として数えない（`tools/carver_diff.py`は葉の`distance`を既定で除外し、
    `--tick`で戻す）。
-2. **宣言的なものを黙って落とさない。** placement modifier、configured feature、
+2. **宣言的なものを黙って落とさない。** 名前だけでなく**種類（type/バリアント）**も
+   数える（データが使う型 60 に対しパーサの腕が 26、という差は「何も置かない feature」を
+   大量に生む）。 placement modifier、configured feature、
    datapackの参照は、解析に失敗すると「何もしないfeature」として静かに消える。
    落ちたものには名前を付ける（`PF_UNKNOWN=1`、`CF_MISSING=1`、`FEAT_TRACE=1`）。
 3. **数値が動かない変更を「仮説の棄却」と読まない。** 一致したままの変更は、
