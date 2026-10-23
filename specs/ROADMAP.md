@@ -95,23 +95,20 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   4×4 の隔離固定具では `birch_leaves` が **471 = 471 で完全一致**（クラスタも同一）
   ＝ 2×2 の 21 セル欠けは**その world の装飾スケジュール差**で、樹冠の形ではなかった。
   実施済み: `tools/world_diff.py` で参照を2回生成して比較 → **床 22 セル / 8 chunk**
-  （1 chunk の seagrass パッチに集中）。vanilla の worldgen はほぼ決定的で、
-  **938 セルはほぼ全部が実装差**。こちらのダンプも文脈非依存（chunk (1,0) が
-  n=1/n=2/2×2/4×4 で md5 一致）を確認済み。
-  残差 938 の内訳: 葉の在否 438 / gravel blob 225 / 植生 173 / その他 ≈100。
-  次の一単位はこの 3 つの塊を feature 単位で隔離して潰す。
-  16. **configured-feature の型カバレッジ**: `p_cf` の腕は 26、パックの型は 60
-  （`random_patch` 18・`flower` 6・`seagrass` 4・`kelp`・`geode`・`sea_pickle` 等が未実装）。
-  未実装型は**静かに何も置かない**ので、残差の数字はカバレッジを併記しないと読めない
-  （`random_patch` 実装で 938 → 42939 セル＝正しい方向）。順序:
-  ① `short_grass` の過少（44 vs 102、ドローは一致 → 試行数/受理率）
-  ② 残る型の実装（overworld に効く順）
-  ③ 残差の再基準化（順序非依存の塊＝葉の在否・gravel blob・植生）
-  **出口条件への含意**: 現在の固定具（spawn 準備が先に周辺を装飾した world）では、
-  順序/可視性依存クラス（ore 探索箱ゲート・patch の y・隣 origin の blob）が残るため
-  **block diff 0 には原理的に届かない**。0 を出口にするなら「隣が未装飾と保証される
-  固定具」＝ spawn から離れた chunk を自前 protocol client で生成する必要がある
-  （`forceload` は遠方で失敗し、`setworldspawn` は再準備しないことを実測済み）。
+  （1 chunk の seagrass パッチに集中）。ただし後続の4×4隔離ダンプ（`/tmp/fl.bin` と
+  `/tmp/orefix-rp/world`）は `carver_diff.py` で **42654 差**、内訳 deep 41394 / carver 1260、
+  比較可能な8 chunk・skip 8 chunk だった。これは以前の記録の「938 は葉438 / gravel225 /
+  植生173」や「4×4総 diff は feature 残差」と一致しない。fixture の段階・world・skip条件を
+  再確認するまで、この総数から feature の原因を推定しない。vanilla 実行間の床22も、この
+  新しい比較対象へそのまま一般化しない。
+  16. **configured-feature の型カバレッジ**: datapack 内 60 種、`p_cf` は現在29個の受理名
+  （別名のため型数との単純な割り算は意味を持たない）。未対応型は `Unknown` として実行時に
+  空振りしうるため、残差と同時に型ごとの落下ログを確認する。次は `kelp` など overworld に
+  ある型を一つ隔離し、vanilla bytecode とブロッククラスを確認して実装する。
+  **出口条件への含意は仮説**: chunk 装飾の順序/可視性が残差に影響する証拠はあるが、現在の
+  4×4出力は deep/carver に分類され、feature残差の根拠にならない。現固定具で block diff 0
+  が原理的に不可能とも、protocol client が唯一の方法ともまだ言えない。fixture の段階と
+  比較対象が揃った後に改めて判定する。
   16. **装飾順は chunk ごとに違う**: 現行の「3×3 を先に decorate」は固定具の world
   （spawn 準備で周辺が先に装飾される）と整合する。一律に「自分の chunk だけ」へ変えると
   マテリアルルール（feature ハイトマップを読む）まで動き、704 → **6709** に悪化する。

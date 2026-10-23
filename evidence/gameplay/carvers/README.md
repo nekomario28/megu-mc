@@ -2227,7 +2227,8 @@ if (level.getBlockState(p).is(WATER)) {            // ← 水判定が nextDoubl
 `p_cf` に `"flower" | "random_patch"` の別名を足しただけで花が置けるようになった
 （4×4 隔離固定具で dandelion 2/1・poppy 1/2 ＝ 参照とほぼ一致）。
 
-この固定具の総 diff は 42654 でほぼ動かない: 支配しているのは
-**順序/可視性クラス**（葉の在否・gravel blob・`short_grass` の y）で、型の実装は
-機械的だがこの領域では小さい。型を埋め切ったうえで残る数字が、そのまま
-「この固定具では再現できない部分」の大きさになる（§59 の期待値）。
+この4×4ダンプ (`/tmp/fl.bin` vs `/tmp/orefix-rp/world`) は `carver_diff.py` で
+42654差、内訳 deep 41394 / carver 1260、参照が full の8 chunk・skip 8 chunk だった。
+従って、この総数を「feature 残差」や「順序/可視性クラス」と呼ぶ根拠はない。
+§59 の型別比較（seagrass）とは対象も観測も異なる。fixture の生成段階、ore/disk
+隔離が参照とportの両方で成立したか、partial chunk の扱いを再検証してから再分類する。
