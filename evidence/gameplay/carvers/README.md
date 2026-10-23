@@ -2232,3 +2232,14 @@ if (level.getBlockState(p).is(WATER)) {            // ← 水判定が nextDoubl
 従って、この総数を「feature 残差」や「順序/可視性クラス」と呼ぶ根拠はない。
 §59 の型別比較（seagrass）とは対象も観測も異なる。fixture の生成段階、ore/disk
 隔離が参照とportの両方で成立したか、partial chunk の扱いを再検証してから再分類する。
+
+## 61. `kelp` の型実装（比較セルなし、parity は未検証）
+
+`KelpFeature` (`ecs`) は OCEAN_FLOOR の位置から開始し、水中で `1 + nextInt(10)` の
+最大高を試す。連続する水中セルに `kelp_plant` を置き、最後に `kelp` の頭を置くときだけ
+`age = nextInt(4) + 20` を引く。途中で継続できない場合は直前の plant を head に置換
+（ただしさらに上が head なら置かない）。この draw と停止順で実装した。
+
+現行4×4 fixture は両側とも kelp / kelp_plant が 0 セル。従ってコンパイルと全体テストは
+通るが、実装の挙動・draw parity を比較した証拠はない。kelp のある海洋 biome と完全生成
+reference chunk を持つ隔離 fixture を作るまで、この型は「実装済み・未検証」と扱う。

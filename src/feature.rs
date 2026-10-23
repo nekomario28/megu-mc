@@ -59,6 +59,9 @@ enum Cf {
     /// tall or short seagrass. The block's own survival rule (`SeagrassBlock`, `dmx`)
     /// is "the block below has a sturdy top face and is not magma" - not the dirt rule.
     Seagrass { prob: f64 },
+    /// Kelp grows upward from OCEAN_FLOOR, with one height draw and an age draw only
+    /// when placing the head (`KelpFeature`, `ecs`).
+    Kelp,
     SimpleRand(Vec<Pf>),
     WeightedSel(Vec<(Pf, i32)>),
     BoolSel(Pf, Pf),
@@ -208,6 +211,7 @@ fn p_cf(j: &J) -> Option<Cf> {
             valid: name_list(j, "valid_blocks").into_iter().collect(),
         },
         "seagrass" => Cf::Seagrass { prob: jnum(j, "probability").unwrap_or(0.0) },
+        "kelp" => Cf::Kelp,
         // `minecraft:flower` is the same config shape (a patch of simple blocks), just a
         // different type name - it was one of the 34 types with no arm, so every flower
         // patch in the pack did nothing.
@@ -1148,6 +1152,39 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 ctx.set(x, y + 1, z, hi);
             } else {
                 ctx.set(x, y, z, reg.state_of("minecraft:seagrass", None));
+            }
+        }
+        Cf::Kelp => {
+            let Some(reg) = breg() else { return };
+            let base_y = ctx.hm_oc(pos.0, pos.2);
+            let mut p = (pos.0, base_y, pos.2);
+            if !is_water_st(reg, ctx.get(p.0, p.1, p.2)) {
+                return;
+            }
+            let max_height = 1 + rng.next_bound(10);
+            for i in 0..=max_height {
+                let here_water = is_water_st(reg, ctx.get(p.0, p.1, p.2));
+                let below_water = is_water_st(reg, ctx.get(p.0, p.1 - 1, p.2));
+                let plant_survives = can_place(reg, ctx, "minecraft:kelp_plant", p.0, p.1, p.2);
+                if here_water && below_water && plant_survives {
+                    if i == max_height {
+                        let age = rng.next_bound(4) + 20;
+                        let head = reg.with_prop(reg.state_of("minecraft:kelp", None), "age", &age.to_string());
+                        ctx.set(p.0, p.1, p.2, head);
+                    } else {
+                        ctx.set(p.0, p.1, p.2, reg.state_of("minecraft:kelp_plant", None));
+                    }
+                    p.1 -= 1;
+                } else if i > 0 {
+                    let top = (p.0, p.1 + 1, p.2);
+                    let above_is_head = reg.name_of(ctx.get(top.0, top.1 + 1, top.2)) == "minecraft:kelp";
+                    if can_place(reg, ctx, "minecraft:kelp", top.0, top.1, top.2) && !above_is_head {
+                        let age = rng.next_bound(4) + 20;
+                        let head = reg.with_prop(reg.state_of("minecraft:kelp", None), "age", &age.to_string());
+                        ctx.set(top.0, top.1, top.2, head);
+                    }
+                    break;
+                }
             }
         }
         Cf::RandomPatch { feature, tries, xz, y } => {

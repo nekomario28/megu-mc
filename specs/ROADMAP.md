@@ -101,10 +101,11 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   植生173」や「4×4総 diff は feature 残差」と一致しない。fixture の段階・world・skip条件を
   再確認するまで、この総数から feature の原因を推定しない。vanilla 実行間の床22も、この
   新しい比較対象へそのまま一般化しない。
-  16. **configured-feature の型カバレッジ**: datapack 内 60 種、`p_cf` は現在29個の受理名
-  （別名のため型数との単純な割り算は意味を持たない）。未対応型は `Unknown` として実行時に
-  空振りしうるため、残差と同時に型ごとの落下ログを確認する。次は `kelp` など overworld に
-  ある型を一つ隔離し、vanilla bytecode とブロッククラスを確認して実装する。
+  16. **configured-feature の型カバレッジ**: datapack 内60種、`p_cf` は受理名を実装する
+  （alias を含むため単純な割り算はしない）。未対応型は `Unknown` として空振りしうる。
+  `kelp` の bytecode 準拠実装を追加したが、現fixtureの両側とも0セルで parity 未検証。
+  次は kelp が実在する海洋 biome の完全生成 reference fixture を作り、typed draw と
+  cell sets を比較する。その後に次の未対応型へ進む。
   **出口条件への含意は仮説**: chunk 装飾の順序/可視性が残差に影響する証拠はあるが、現在の
   4×4出力は deep/carver に分類され、feature残差の根拠にならない。現固定具で block diff 0
   が原理的に不可能とも、protocol client が唯一の方法ともまだ言えない。fixture の段階と

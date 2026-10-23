@@ -764,8 +764,9 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
                 || reg.name_of(below) == "minecraft:bamboo_sapling"
         }
         "minecraft:kelp" | "minecraft:kelp_plant" => {
-            is_water_st(reg, at)
-                && (reg.is_solid(below) || reg.name_of(below) == "minecraft:kelp")
+            reg.name_of(below) != "minecraft:magma_block"
+                && (reg.side_solid(below, 1)
+                    || matches!(reg.name_of(below), "minecraft:kelp" | "minecraft:kelp_plant"))
         }
         "minecraft:seagrass" | "minecraft:tall_seagrass" => {
             is_water_st(reg, at)
