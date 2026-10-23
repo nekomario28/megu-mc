@@ -309,13 +309,24 @@ public class CarveLog {
         System.out.println("RDRAW " + i + " nextInt()=" + value);
     }
 
+    /** A typed `nextDouble` draw. */
+    public static void rdrawD(String label, double value) {
+        int[] st = RD.get();
+        if (st[0] != 1) return;
+        int i = st[1]++;
+        if (i >= 200) { st[0] = -1; return; }
+        int[] f = FEAT.get();
+        System.out.println("RDRAW " + i + " f=" + f[0] + "," + f[1] + " " + label + "=" + value);
+    }
+
     /** `nextInt(bound)` with the bound in the label, as the port prints it. */
     public static void rdrawI(int bound, int value) {
         int[] st = RD.get();
         if (st[0] != 1) return;
         int i = st[1]++;
         if (i >= 200) { st[0] = -1; return; }
-        System.out.println("RDRAW " + i + " nextInt(" + bound + ")=" + value);
+        int[] f = FEAT.get();
+        System.out.println("RDRAW " + i + " f=" + f[0] + "," + f[1] + " nextInt(" + bound + ")=" + value);
     }
 
     /** A typed `nextFloat` draw (a float parameter keeps the value intact; the
@@ -325,7 +336,8 @@ public class CarveLog {
         if (st[0] != 1) return;
         int i = st[1]++;
         if (i >= 200) { st[0] = -1; return; }
-        System.out.println("RDRAW " + i + " " + label + "=" + value);
+        int[] f = FEAT.get();
+        System.out.println("RDRAW " + i + " f=" + f[0] + "," + f[1] + " " + label + "=" + value);
     }
 
     /** Bound (0 = nextInt()) and value of one Xoroshiro draw. */

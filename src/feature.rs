@@ -2733,6 +2733,8 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
                 .wrapping_add(*gi as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));
             CUR_FEAT.store(((*gi as i64) << 32) | step as i64, std::sync::atomic::Ordering::Relaxed);
+            crate::generation_math::XTRACE_FEAT
+                .store(((*gi as i64) << 32) | step as i64, std::sync::atomic::Ordering::Relaxed);
             // feature placement sees a `WorldgenRandom` (legacy draw semantics)
             let mut rng = Xor::seed_worldgen(deco);
             if let Ok(spec) = std::env::var("FSEED_ARM") {

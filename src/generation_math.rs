@@ -142,7 +142,8 @@ pub(crate) fn dtrace(kind: &str, value: f64) {
     if n < 0 {
         return;
     }
-    eprintln!("DRAW {n} {kind}={value}");
+    let f = XTRACE_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("DRAW {n} f={},{} {kind}={value}", f >> 32, f & 0xFFFF);
     DTRACE.store(
         if n + 1 >= 200 { -1 } else { n + 1 },
         std::sync::atomic::Ordering::Relaxed,
@@ -150,6 +151,11 @@ pub(crate) fn dtrace(kind: &str, value: f64) {
 }
 
 pub(crate) static DTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Which placed feature the trace is currently inside, so a draw can be attributed
+/// without guessing from the sequence shape.
+pub(crate) static XTRACE_FEAT: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
 
 /// Env-gated draw trace for feature placement (`FSEED_ARM=i,step`).
 pub(crate) static XTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -257,6 +263,11 @@ impl Xor {
         (m >> 32) as i32
     }
     pub(crate) fn next_f64(&mut self) -> f64 {
+        let traced = self.next_f64_inner();
+        dtrace("nextDouble", traced);
+        traced
+    }
+    fn next_f64_inner(&mut self) -> f64 {
         if self.legacy {
             // `dyn`'s default: ((next(26) << 27) + next(27)) * 2^-53
             let hi = self.next(26) as i64;

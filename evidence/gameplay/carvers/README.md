@@ -1862,3 +1862,54 @@ lapis/diamond も同様に部分集合。exposure 経路と tag は否定済み�
 次は 1 起源を選び、両側でその blob のセルを flood fill して並べる
 （`ORE_CELL_TRACE` はこちらの書き込み数を出す。vanilla 側は world から起源周辺を
 取り出せばよい）。
+
+## 51. 残差の正体: `OreFeature.place` の探索箱 vs ハイトマップ判定（＝装飾順）
+
+隔離固定具で `ore_gravel` を両側同じ条件にして比べると:
+
+| chunk | 起源の一致 |
+|---|---|
+| (0,0) | 14/14 |
+| (0,1) | 14/14 |
+| (1,1) | **9/14** |
+
+ドロー列を **nextDouble（vein の半径）と feature 帰属つき**で突き合わせると
+（`f=1,6` が付くので帰属を推測しなくてよい）、**最初の食い違いは draw 108**:
+
+```
+107 まで両側完全一致（in_square, height_range, 角度, y オフセット2つ）
+ours 108: nextDouble ...    ← 候補3で vein を生成し始める
+van  108: nextInt(16)=5     ← 候補3を捨てて次の候補の in_square へ
+```
+
+`OreFeature.place` の構造が理由:
+
+```java
+float angle = rand.i() * PI;               // ← ここまでは両側とも引く
+double l = pos.y + rand.a(3) - 2;          // ここも
+int o = pos.y - 2 - j;
+for (xp...) for (zp...)
+   if (o <= level.getHeight(Heightmap.Types.OCEAN_FLOOR_WG, xp, zp))   // ← ここで分岐
+      return this.a(level, rand, cfg, ...);   // vein の半径を引く
+return false;                                  // 引かずに終わる
+```
+
+候補 3 は **(23, 74, 30)** で、`o ≈ 69` に対し地形の `OCEAN_FLOOR_WG` は 64 前後。
+vanilla は `69 <= 64` が偽で vein を生成しない。こちらは**その列のハイトマップが
+樹冠で 69 以上に上がっている**ため箱が届くと判定して vein を生成する。
+
+つまり残差の ore 配置差（chunk (1,1) の 5 origin、ひいては 2×2 の ore/dirt/gravel
+非対称）は、**どの樹冠がその時点で見えているか = 装飾順の差**に帰着する。
+`OCEAN_FLOOR_WG` は葉を数えるので、隣 chunk の木が 2 ブロック届く範囲で判定が変わる。
+
+### 道具の改善（今回）
+
+- port / agent の DRAW ログに **feature 帰属**（`f=i,step`）を追加（`XTRACE_FEAT` /
+  `FEAT`）。「どの feature のチェーンか」を列の形から推測しなくてよくなった。
+- port の `nextDouble` を DRAW に追加、agent に `nextDouble`（`dyn.j()D`）フックを追加。
+  これが無いと vein の半径 33 ドローが両側 invisible で、**次の候補の in_square と
+  誤整列**して「108 で nextDouble vs nextInt(16)」の意味を取り違える。
+
+次の一単位: 装飾順を一致させる（「隣が全部装飾済みの chunk を装飾する」または
+server の順序を再現）か、`OCEAN_FLOOR_WG` の更新規則（葉を数える／prime の時点）を
+vanilla と突き合わせる。
