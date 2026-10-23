@@ -98,6 +98,11 @@ public class CarveLog {
 
     /** setFeatureSeed(seed, i, step): log the (i, step) pair for the target chunk. */
     public static void fseed(long seed, int i, int step) {
+        // Attribution must be right for *every* chunk, not just the logged one:
+        // a tree in a neighbouring chunk is otherwise reported with whatever
+        // feature was last logged (that is how "feature=0,10" showed up on trees).
+        FEAT.get()[0] = i;
+        FEAT.get()[1] = step;
         String p = System.getProperty("fseedchunk");
         if (p == null) return;
         String[] a = p.split(",");
@@ -105,8 +110,6 @@ public class CarveLog {
         int[] c = CHUNK.get();
         if (c[0] != Integer.parseInt(a[0]) || c[1] != Integer.parseInt(a[1])) return;
         if (c[2] != 1 || !overworld()) return;
-        FEAT.get()[0] = i;
-        FEAT.get()[1] = step;
         System.out.println("FSEED " + seed + " " + i + " " + step);
         String arm = System.getProperty("fseedarm");
         if (arm != null && arm.equals(i + "," + step)) {
