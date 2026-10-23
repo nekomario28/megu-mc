@@ -6,24 +6,31 @@ Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバー。�
 
 Cargoのpackage version `0.0.0` は保存時の値を維持している。`AUDIT_WIRE.md` と `SECURITY_NOTES.md` は当時の監査記録であり、現在の安全性や完成度を保証する資料ではない。
 
-## 現在地（2026-10-20）
+## 現在地（2026-10-22）
 
 目標は vanilla と同一の world 生成。到達点は測った範囲だけを書く。
 
 | 項目 | 状態 |
 |---|---|
-| 洞窟（carver） | **未実装**。36 chunk の y<60 空気は vanilla 3361 セル、mc-spine 0。洞窟の 96% は carver 由来（density 由来は 143 セル） |
-| 地形（feature/carver なし） | vanilla と **0 セル差**（seed 0、chunk (0,0)、(0,1)、(-1,-1)、(-2,0)）。density・surface rule・bedrock・光の非一様区間 digest が一致 |
-| feature 層 | 10302 / 98304 セル差（10.48%、chunk (0,0) の offline 比較）。placement modifier を vanilla の stream 順に直して 11017 → 10302。biome リストと block tag は 1.21.1 の jar に一致済み。残差は石系 ore の実行側 |
+| 地形（feature/carver なし） | vanilla と **0 セル差**（seed 0、(0,0) の 2×2）。density・surface rule・bedrock・鉱脈（ore vein）が一致。地形だけの高さマップは 256/256 列一致 |
+| 洞窟・峡谷（carver） | **0 セル差**（(0,0) の 2×2、cave / cave_extra / canyon、y=−64..319）。vanilla の生ドローと1 draw 単位で一致。証拠は [carvers](evidence/gameplay/carvers/README.md) |
+| feature 層 | **1035 / 393216 セル差（0.26%、(0,0) の 2×2）**。うち葉の `distance` 380 は tick 由来で、除外すると **655**。起点は 40975（10.4%/chunk） |
+| 構造物 | **未実装**（jigsaw / template pool / NBT とも無し） |
 | 軽量性（M3） | **未達**。代表負荷で CPU x1.10（8 回中央値、RSS は約 1/8）、spawn burst を除くと x1.79 |
-| 必須ゲート | `tests/verify.sh` がローカルで PASS（148 passed / 1 ignored、mutation 53 proved） |
+| 必須ゲート | `tests/verify.sh` がローカルで PASS（152 passed / 1 ignored） |
 | hosted CI | 支払い/上限ブロックで job が起動しない（コード失敗ではない）。ローカル verify で代替中 |
 
 順序と出口条件は [ロードマップ](specs/ROADMAP.md)、欠陥の状態は
 [close-defects](specs/close-defects/README.md) が持つ。数値の根拠は
 [地形](evidence/gameplay/terrain-parity/README.md)・
+[洞窟/峡谷](evidence/gameplay/carvers/README.md)・
 [feature](evidence/gameplay/feature-parity/README.md)・
 [費用](evidence/gameplay/worldgen-cost/README.md) の記録にある。
+
+vanilla と比べる手順そのものは
+[開発と評価の方針](DESIGN.md#開発と評価の方針)の「比較の約束」に書いてある
+（どの段階の成果物かを確かめる・黙って落ちる宣言を名前で出す・
+数値が動かない変更は未実行を疑う）。
 
 ## ビルドと確認
 
