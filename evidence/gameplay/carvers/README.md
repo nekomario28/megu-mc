@@ -2235,11 +2235,19 @@ if (level.getBlockState(p).is(WATER)) {            // ← 水判定が nextDoubl
 
 ## 61. `kelp` の型実装（比較セルなし、parity は未検証）
 
-`KelpFeature` (`ecs`) は OCEAN_FLOOR の位置から開始し、水中で `1 + nextInt(10)` の
-最大高を試す。連続する水中セルに `kelp_plant` を置き、最後に `kelp` の頭を置くときだけ
-`age = nextInt(4) + 20` を引く。途中で継続できない場合は直前の plant を head に置換
-（ただしさらに上が head なら置かない）。この draw と停止順で実装した。
+`KelpFeature` (`ecs`) は OCEAN_FLOOR の位置から**上方向**に進む（`BlockPos.d()` は
+official mappings で `above()`、`e()` は `below()`）。水が連続する間 `1 + nextInt(10)` の
+最大高まで `kelp_plant` を置き、上端を `kelp` にする。途中で継続できない場合は現在位置の
+1つ下（直前の plant）に head を置く。ただし候補位置のさらに下が既に `kelp` head なら置かない。
+head を置くときだけ
+`age = nextInt(4) + 20` を引く。
 
-現行4×4 fixture は両側とも kelp / kelp_plant が 0 セル。従ってコンパイルと全体テストは
-通るが、実装の挙動・draw parity を比較した証拠はない。kelp のある海洋 biome と完全生成
-reference chunk を持つ隔離 fixture を作るまで、この型は「実装済み・未検証」と扱う。
+最初の実装では `d()` を `below()` と誤読し、下向きに書いていた。seed 0 のlukewarm ocean
+座標 (1280,0) に合成した水柱を与える回帰テスト
+`kelp_feature_grows_up_from_the_ocean_floor_and_places_one_head` を追加し、head が基準高より
+上、stem が連続し、head が1個であることを検査する。このテストは逆向き実装で失敗する。
+
+現行4×4 fixture は両側とも kelp / kelp_plant が 0 セル。従って合成fixture上の方向・形と
+全体 test は通るが、vanilla と draw/cell parity を比較した証拠はない。kelp のある海洋 biome
+と完全生成 reference chunk を持つ隔離 fixture を作るまで、この型は「実装済み・参照未検証」
+と扱う。

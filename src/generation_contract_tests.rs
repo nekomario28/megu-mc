@@ -4,6 +4,7 @@ use crate::generation_math::{normal_new_l, Xor};
 use crate::generation_providers::{p_hp, p_ip, test_pred, test_rt, Pr, BSP, RT};
 use crate::json::jparse;
 use crate::worldgen::Gen;
+use super::{freg, gen_cf, Cf};
 
 fn context(g: &mut Gen) -> FC<'_> {
     FC::new(g)
@@ -17,6 +18,62 @@ fn follow(trace: &mut Vec<u8>, r: &mut Xor) {
     let _ = r.next_gauss();
     trace.extend_from_slice(&r.next_long().to_le_bytes());
     trace.extend_from_slice(&r.next_long().to_le_bytes());
+}
+
+#[test]
+fn kelp_feature_grows_up_from_the_ocean_floor_and_places_one_head() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (1280, 0); // sampled as lukewarm_ocean for seed 0
+    let base = ctx.hm_oc(x, z);
+    let sand = reg.state_of("minecraft:sand", None);
+    let water = reg.state_of("minecraft:water", None);
+    ctx.set(x, base - 1, z, sand);
+    for y in base..=base + 20 {
+        ctx.set(x, y, z, water);
+    }
+
+    let mut rng = Xor::seed(0);
+    gen_cf(&Cf::Kelp, freg(), &mut ctx, &mut rng, (x, 0, z));
+
+    let plant = reg.state_of("minecraft:kelp_plant", None);
+    let placed_heads: Vec<_> = ctx.wr.iter()
+        .filter_map(|(&(px, y, pz), &st)| {
+            (px == x && pz == z && reg.name_of(st) == "minecraft:kelp").then_some((y, st))
+        })
+        .collect();
+    assert_eq!(placed_heads.len(), 1, "KelpFeature must place exactly one terminal head");
+    let (top, head_state) = placed_heads[0];
+    let age = reg.get_prop(head_state, "age").unwrap().parse::<u8>().unwrap();
+    assert!((20..=23).contains(&age), "head age must come from nextInt(4)+20");
+    assert_eq!(reg.name_of(ctx.get(x, top, z)), "minecraft:kelp");
+    assert!(top > base, "the kelp head must be above its OCEAN_FLOOR origin");
+    for y in base..top {
+        assert_eq!(ctx.get(x, y, z), plant, "kelp stem must be continuous at y={y}");
+    }
+}
+
+#[test]
+fn kelp_stops_at_the_water_surface_and_replaces_the_last_plant_with_a_head() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (1280, 0);
+    let base = ctx.hm_oc(x, z);
+    ctx.set(x, base - 1, z, reg.state_of("minecraft:sand", None));
+    let water = reg.state_of("minecraft:water", None);
+    ctx.set(x, base, z, water);
+    ctx.set(x, base + 1, z, water);
+    ctx.set(x, base + 2, z, 0);
+
+    let mut rng = Xor::seed(0);
+    gen_cf(&Cf::Kelp, freg(), &mut ctx, &mut rng, (x, 0, z));
+
+    assert_eq!(reg.name_of(ctx.get(x, base, z)), "minecraft:kelp");
+    assert_eq!(reg.name_of(ctx.get(x, base + 1, z)), "minecraft:water");
+    let age = reg.get_prop(ctx.get(x, base, z), "age").unwrap().parse::<u8>().unwrap();
+    assert!((20..=23).contains(&age));
 }
 
 #[test]

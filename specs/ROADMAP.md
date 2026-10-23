@@ -103,7 +103,7 @@ Status: 2026-10-22 更新。作業ブランチは `fix/20tps-integrated`（`main
   新しい比較対象へそのまま一般化しない。
   16. **configured-feature の型カバレッジ**: datapack 内60種、`p_cf` は受理名を実装する
   （alias を含むため単純な割り算はしない）。未対応型は `Unknown` として空振りしうる。
-  `kelp` の bytecode 準拠実装を追加したが、現fixtureの両側とも0セルで parity 未検証。
+  `kelp` 実装と合成水柱での「上向き成長」回帰テストを追加したが、現fixtureの両側とも0セルで parity 未検証。
   次のfixtureは (a) kelp を含む海洋 biome で placed feature が選択される、(b) reference
   chunk が完全生成済み、(c) reference に正の kelp/kelp_plant 数がある、(d) draw trace と
   block cell sets を比較する、を満たすこと。0/0 なら parity gate は失敗させる。
