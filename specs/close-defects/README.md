@@ -84,8 +84,8 @@ feature 層の残差（chunk (0,0) で 10939 セル）は同梱 worldgen デー�
 - ore vein（地形段階）: **0 セル**。1.21.1 は router の vein 3 関数 + `ore_veins_enabled`
   で地形段階に生成し、乱数は `fromHashOf("minecraft:ore")` の派生 positional factory。
 - feature 層: 2×2 で **704 / 393216（0.18%）**。葉の `distance` は tick 由来で、
-  除外すると **285**。木は 39 本（vanilla 38）。原因 14 件（「宣言的なものが黙って落ちる」
-  型 12 件、biome の 2 定義、ハイトマップの所有者）は
+  除外すると **285**。木は 39 本（vanilla 38）。原因 15 件（「宣言的なものが黙って落ちる」
+  型 12 件、biome の 2 定義、ハイトマップの所有者、feature を選ぶ集合）は
   [feature パリティ](../../evidence/gameplay/feature-parity/README.md) と
   [carvers §25〜§42](../../evidence/gameplay/carvers/README.md) に記録。
 
