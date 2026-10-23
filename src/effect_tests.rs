@@ -35,7 +35,8 @@ pub(super) fn client_pair() -> (Client, TcpStream) {
         sneaking: Mutex::new(false),
         last_melee: Mutex::new(past),
         fall_fly: Mutex::new(false),
-        hurt_at: Mutex::new(past),
+        invulnerable: Mutex::new(0),
+        last_hurt: Mutex::new(0.0),
         shield_cd: Mutex::new(past),
         absorb: Mutex::new(0.0),
         pearl_cd: Mutex::new(past),
@@ -227,4 +228,64 @@ fn absorption_expiry_removes_unspent_shield() {
         "expired absorption must not intercept damage"
     );
     assert_eq!(*client.absorb.lock().unwrap(), 0.0);
+}
+
+/// `LivingEntity.hurt`'s invulnerability rule, checked against what the 1.21.1
+/// bytecode does: the full-immunity window is `invulnerableTime > 10`, an
+/// equal-or-weaker hit is rejected, a stronger one applies only the difference,
+/// and applying the difference does *not* refresh the timer.
+#[test]
+fn vulnerability_follows_vanillas_invulnerable_time_rule() {
+    let (c, _sock) = client_pair();
+
+    // a first hit applies in full and arms the twenty-tick window
+    assert_eq!(damage_after_invulnerability(&c, 5.0), Some(5.0));
+    assert_eq!(*c.invulnerable.lock().unwrap(), 20);
+    assert_eq!(*c.last_hurt.lock().unwrap(), 5.0);
+
+    // nine ticks later the window is still open (20 -> 11)
+    *c.invulnerable.lock().unwrap() = 11;
+    assert_eq!(
+        damage_after_invulnerability(&c, 5.0),
+        None,
+        "an equal hit is rejected"
+    );
+    assert_eq!(
+        damage_after_invulnerability(&c, 3.0),
+        None,
+        "a weaker hit is rejected"
+    );
+    assert_eq!(
+        damage_after_invulnerability(&c, 8.0),
+        Some(3.0),
+        "a stronger hit applies only the difference"
+    );
+    assert_eq!(
+        *c.invulnerable.lock().unwrap(),
+        11,
+        "the difference hit must not refresh the timer"
+    );
+    assert_eq!(
+        *c.last_hurt.lock().unwrap(),
+        8.0,
+        "the difference hit moves the recorded amount up"
+    );
+
+    // at ten ticks the full-immunity window is over
+    *c.invulnerable.lock().unwrap() = 10;
+    assert_eq!(damage_after_invulnerability(&c, 1.0), Some(1.0));
+    assert_eq!(*c.invulnerable.lock().unwrap(), 20);
+    assert_eq!(*c.last_hurt.lock().unwrap(), 1.0);
+}
+
+/// A rejected hit must leave the state it is measured against untouched - the
+/// melee and explosion callers rely on that to skip shield and armour damage.
+#[test]
+fn a_rejected_hit_changes_nothing() {
+    let (c, _sock) = client_pair();
+    assert_eq!(damage_after_invulnerability(&c, 4.0), Some(4.0));
+    *c.invulnerable.lock().unwrap() = 15;
+    assert_eq!(damage_after_invulnerability(&c, 4.0), None);
+    assert_eq!(*c.last_hurt.lock().unwrap(), 4.0);
+    assert_eq!(*c.invulnerable.lock().unwrap(), 15);
 }

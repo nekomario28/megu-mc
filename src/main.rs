@@ -265,7 +265,8 @@ struct Client {
     sneaking: Mutex<bool>,
     last_melee: Mutex<Instant>,
     fall_fly: Mutex<bool>,
-    hurt_at: Mutex<Instant>,
+    invulnerable: Mutex<i32>, // vanilla LivingEntity.invulnerableTime, in server ticks
+    last_hurt: Mutex<f32>,    // vanilla LivingEntity.lastHurt: the last accepted damage
     shield_cd: Mutex<Instant>,
     absorb: Mutex<f32>,
     pearl_cd: Mutex<Instant>,
@@ -2433,6 +2434,14 @@ fn keepalive_time_tick() {
                 *ex += 0.005 * (e.amp as f64 + 1.0) * GAME_TICKS_PER_TICK as f64;
             }
             let food = *c.food.lock().unwrap();
+            {
+                // vanilla: ServerPlayer decrements invulnerableTime once per tick
+                // (LivingEntity.tick skips players, ServerPlayer.tick does not)
+                let mut invulnerable = c.invulnerable.lock().unwrap();
+                if *invulnerable > 0 {
+                    *invulnerable -= 1;
+                }
+            }
             let mut h = c.hp.lock().unwrap();
             let mh = max_hp_of(&c.name);
             if GR_NATURAL_REGEN.load(Ordering::Relaxed) == 1 && food >= 18 && *h < mh && *h > 0.0 {
@@ -2483,7 +2492,10 @@ fn keepalive_time_tick() {
                 } else if t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 2.0).max(0.0);
                     dirty = true;
-                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    // vanilla: environmental damage arms the same timer, so a melee hit in
+                    // the next ten ticks is measured against this amount
+                    *c.last_hurt.lock().unwrap() = 2.0;
+                    *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -2510,7 +2522,10 @@ fn keepalive_time_tick() {
                 if in_lava && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
-                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    // vanilla: environmental damage arms the same timer, so a melee hit in
+                    // the next ten ticks is measured against this amount
+                    *c.last_hurt.lock().unwrap() = 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
+                    *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -2525,7 +2540,10 @@ fn keepalive_time_tick() {
                 if in_fire && t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
-                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    // vanilla: environmental damage arms the same timer, so a melee hit in
+                    // the next ten ticks is measured against this amount
+                    *c.last_hurt.lock().unwrap() = 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
+                    *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -2536,7 +2554,10 @@ fn keepalive_time_tick() {
                 if py < -64.0 && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0).max(0.0);
                     dirty = true;
-                    *c.hurt_at.lock().unwrap() = Instant::now();
+                    // vanilla: environmental damage arms the same timer, so a melee hit in
+                    // the next ten ticks is measured against this amount
+                    *c.last_hurt.lock().unwrap() = 4.0;
+                    *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -2553,7 +2574,10 @@ fn keepalive_time_tick() {
                     if hb != u32::MAX && !mob_passable(hb) {
                         *h = (*h - 1.0).max(0.0);
                         dirty = true;
-                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        // vanilla: environmental damage arms the same timer, so a melee hit in
+                        // the next ten ticks is measured against this amount
+                        *c.last_hurt.lock().unwrap() = 1.0;
+                        *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -2573,7 +2597,10 @@ fn keepalive_time_tick() {
                     if near_cactus {
                         *h = (*h - 1.0).max(0.0);
                         dirty = true;
-                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        // vanilla: environmental damage arms the same timer, so a melee hit in
+                        // the next ten ticks is measured against this amount
+                        *c.last_hurt.lock().unwrap() = 1.0;
+                        *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -2587,7 +2614,11 @@ fn keepalive_time_tick() {
                     if on_magma {
                         *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                         dirty = true;
-                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        // vanilla: environmental damage arms the same timer, so a melee hit in
+                        // the next ten ticks is measured against this amount
+                        *c.last_hurt.lock().unwrap() =
+                            1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
+                        *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -2600,7 +2631,10 @@ fn keepalive_time_tick() {
                     {
                         *h = (*h - 0.5).max(0.0);
                         dirty = true;
-                        *c.hurt_at.lock().unwrap() = Instant::now();
+                        // vanilla: environmental damage arms the same timer, so a melee hit in
+                        // the next ten ticks is measured against this amount
+                        *c.last_hurt.lock().unwrap() = 0.5;
+                        *c.invulnerable.lock().unwrap() = server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -3327,17 +3361,17 @@ fn arrow_tick() {
             if *c.gm.lock().unwrap() == 1 {
                 continue;
             }
-            let mut h = c.hp.lock().unwrap();
-            if c.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) {
-                continue;
-            }
-            *c.hurt_at.lock().unwrap() = Instant::now();
             let blocked_ar = *c.blocking.lock().unwrap()
                 && c.shield_cd.lock().unwrap().elapsed() > Duration::from_secs(5);
+            // a rejected hit must not cost shield durability (vanilla returns before that)
+            let Some(ad) = damage_after_invulnerability(c, if blocked_ar { 0.0 } else { admg })
+            else {
+                continue;
+            };
             if blocked_ar {
                 damage_shield(c, admg);
             }
-            let ad = if blocked_ar { 0.0 } else { admg };
+            let mut h = c.hp.lock().unwrap();
             *h = (*h
                 - if ad > 0.0 {
                     hurt_absorb(c, dmg_after(c, ad, 0))
@@ -3406,13 +3440,12 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
         };
         let dd = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
         if dd < power * 1.5 && *cl.gm.lock().unwrap() != 1 {
-            if cl.hurt_at.lock().unwrap().elapsed() < Duration::from_millis(500) {
-                continue;
-            }
-            *cl.hurt_at.lock().unwrap() = Instant::now();
-            let mut h = cl.hp.lock().unwrap();
             let raw = ((power * 1.5 - dd) * 3.0) as f32;
-            *h = (*h - hurt_absorb(&cl, dmg_after(&cl, raw, 2))).max(0.0);
+            let Some(accepted) = damage_after_invulnerability(&cl, raw) else {
+                continue;
+            };
+            let mut h = cl.hp.lock().unwrap();
+            *h = (*h - hurt_absorb(&cl, dmg_after(&cl, accepted, 2))).max(0.0);
             if *h <= 0.0 {
                 drop(h);
                 totem_check(&cl);
@@ -4563,17 +4596,16 @@ fn mob_tick() {
                                     if *cl.gm.lock().unwrap() == 1 {
                                         continue;
                                     }
-                                    if cl.hurt_at.lock().unwrap().elapsed()
-                                        < Duration::from_millis(500)
-                                    {
-                                        continue;
-                                    }
-                                    *cl.hurt_at.lock().unwrap() = Instant::now();
-                                    let mut h = cl.hp.lock().unwrap();
                                     let raw = ((1.0 - dd / 6.5).max(0.0)
                                         * diff_expl_dmg(43.0) as f64)
                                         as f32;
-                                    *h = (*h - hurt_absorb(cl, dmg_after(cl, raw, 2))).max(0.0);
+                                    let Some(accepted) = damage_after_invulnerability(cl, raw)
+                                    else {
+                                        continue;
+                                    };
+                                    let mut h = cl.hp.lock().unwrap();
+                                    *h =
+                                        (*h - hurt_absorb(cl, dmg_after(cl, accepted, 2))).max(0.0);
                                     if *h <= 0.0 {
                                         drop(h);
                                         totem_check(cl);
@@ -4856,24 +4888,19 @@ fn mob_tick() {
                                 };
                                 let dd = (cp0 - mx).powi(2) + (cp2 - mz).powi(2);
                                 if dd < 6.0 && *cl.gm.lock().unwrap() != 1 {
-                                    if cl.hurt_at.lock().unwrap().elapsed()
-                                        < Duration::from_millis(500)
-                                    {
-                                        continue;
-                                    }
-                                    *cl.hurt_at.lock().unwrap() = Instant::now();
-                                    let mut h = cl.hp.lock().unwrap();
                                     let bl = *cl.blocking.lock().unwrap()
                                         && cl.shield_cd.lock().unwrap().elapsed()
                                             > Duration::from_secs(5);
+                                    let raw = if bl { 0.0 } else { diff_mob_dmg(3.0) };
+                                    let Some(accepted) = damage_after_invulnerability(cl, raw)
+                                    else {
+                                        continue;
+                                    };
                                     if bl {
                                         damage_shield(cl, 2.0);
                                     }
-                                    let dmg = if bl {
-                                        0.0
-                                    } else {
-                                        dmg_after(cl, diff_mob_dmg(3.0), 0)
-                                    };
+                                    let mut h = cl.hp.lock().unwrap();
+                                    let dmg = dmg_after(cl, accepted, 0);
                                     *h = (*h - hurt_absorb(cl, dmg)).max(0.0);
                                     if dmg > 0.0 {
                                         damage_armor(cl, 2.0);
@@ -13967,6 +13994,33 @@ fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
     &[]
 }
 // damage absorbed by the absorption-effect pool before touching hp
+/// `LivingEntity.hurt`'s invulnerability rule, from the 1.21.1 bytecode: while
+/// `invulnerableTime > 10` a hit that does not bypass the cooldown is rejected
+/// when it is equal or weaker, and otherwise applies only the difference - and
+/// the timer is *not* refreshed, so the full-immunity window still ends ten
+/// ticks after the hit that started it. Otherwise the hit applies in full and
+/// the timer is set to 20 ticks.
+///
+/// Returns the damage the caller should apply (before armour, absorption and
+/// effects, which vanilla also applies to this number), or `None` for a hit
+/// that is rejected outright - the caller must then leave health, armour and
+/// the shield alone.
+fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<f32> {
+    let mut invulnerable = c.invulnerable.lock().unwrap();
+    let mut last_hurt = c.last_hurt.lock().unwrap();
+    if *invulnerable > 10 {
+        if amount <= *last_hurt {
+            return None;
+        }
+        let difference = amount - *last_hurt;
+        *last_hurt = amount;
+        return Some(difference);
+    }
+    *last_hurt = amount;
+    *invulnerable = server_ticks(20) as i32;
+    Some(amount)
+}
+
 fn hurt_absorb(c: &Client, dmg: f32) -> f32 {
     let mut a = c.absorb.lock().unwrap();
     if *a <= 0.0 {
@@ -17232,7 +17286,8 @@ fn handle(mut s: TcpStream) {
         sneaking: Mutex::new(false),
         last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
         fall_fly: Mutex::new(false),
-        hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        invulnerable: Mutex::new(0),
+        last_hurt: Mutex::new(0.0),
         shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
         absorb: Mutex::new(0.0),
         pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
@@ -18654,12 +18709,11 @@ fn handle(mut s: TcpStream) {
                                         .max(0.0)
                                         * (0.2 + 0.8 * chg * chg)
                                         * if crt { 1.5 } else { 1.0 };
-                                    if v.hurt_at.lock().unwrap().elapsed()
-                                        < Duration::from_millis(500)
-                                    {
+                                    let Some(accepted) = damage_after_invulnerability(v, dmg)
+                                    else {
                                         continue;
-                                    }
-                                    *v.hurt_at.lock().unwrap() = Instant::now();
+                                    };
+                                    let dmg = accepted;
                                     *me.walk_acc.lock().unwrap() += 0.1;
                                     // vanilla: an axe hit disables a raised shield for 5s
                                     if kind == 3 && *v.blocking.lock().unwrap() {

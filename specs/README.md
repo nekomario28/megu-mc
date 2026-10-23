@@ -36,6 +36,7 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **hosted CIはジョブが起動しません。** GitHub の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。**コード失敗ではない**ので、緑の判定は当面ローカルの `tests/verify.sh` が持ちます。復旧後に同一SHAで再取得します。
 - **比較の前提（固定具の基点）は再構成できます:** `tools/fixture_base.sh` が `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を組みます。jar は sha1 で固定（`59353fb4…`、既存の1.21.1導入ディレクトリを donor に使う）。基点が無いまま固定具を回すと比較は空振りします。
 - **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MC_SPINE_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
+- **被ダメ無敵は vanilla の `invulnerableTime` に載せ替えました**（slice 25、2026-10-24）。環境ダメージが timer を立てる点までは実装、環境ダメージ自身の差分適用は簡略（同 slice に明記）。
 - **開放中の項目:** LICENSE 未追加（#11）、独立レビュー（#7）。
 - **draft PR #2/#4/#6 は決着しました（2026-10-24）。** `main` に同一patchが無かった62コミットを読み、
   現行線に無い4点だけを取り込みました: play frameの上限をvanillaの2MiBへ、非有限・世界外の移動値の拒否、
