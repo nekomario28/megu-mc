@@ -3331,8 +3331,17 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    // These tests mutate the shared `GEN` static, so they must not run in
+    // parallel: one lock per test serializes the whole module.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap()
+    }
     #[test]
     fn biome_vectors() {
+        let _guard = lock_gen();
         // pumpkin multi_noise_sampler tests: seed, quart pos, params
         fn stub(_: &str) -> Option<u32> { Some(1) }
         assert!(init(123, stub));
@@ -3347,6 +3356,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_load() {
+        let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> { Some(1) }
         assert!(init(0, stub));
         let mut gg = GEN.lock().unwrap();
@@ -3377,6 +3387,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_real_ids() {
+        let _guard = lock_gen();
         assert!(init(0, crate::name_to_state));
         let cc = chunk_cols(0, 0).unwrap();
         let mut kinds: HashMap<u32, u32> = HashMap::new();
@@ -3406,6 +3417,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn aquifer_vectors() {
+        let _guard = lock_gen();
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
         let mut miss = 0u32;
         {
@@ -3456,6 +3468,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn aqdist() {
+        let _guard = lock_gen();
         if std::env::var("WGAQ").is_err() { return; }
         assert!(init(0, crate::name_to_state));
         let (mut air, mut wat, mut lav, mut sol, mut cave) = (0,0,0,0,0);
@@ -3482,6 +3495,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn perf_probe() {
+        let _guard = lock_gen();
         if std::env::var("WGPERF").is_err() { return; }
         assert!(init(0, crate::name_to_state));
         let t = std::time::Instant::now();
@@ -3507,6 +3521,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn feat_populate_perf() {
+        let _guard = lock_gen();
         let seed = 0u64;
         init(seed, crate::name_to_state);
         let t = std::time::Instant::now();
@@ -3534,6 +3549,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn lazy_population_keeps_neighborhood_order_and_cached_overrides() {
+        let _guard = lock_gen();
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
         let mut visited = Vec::new();
         let mut populate = |g: &mut Gen, sx: i32, sz: i32| {
@@ -3552,6 +3568,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn lazy_population_preserves_direct_feature_outputs() {
+        let _guard = lock_gen();
         // Preserve population results through the lazy lookup, including writes
         // outside the queried chunk. This is a refactor control, not a vanilla oracle.
         for (x, z) in [(-1i32, -1i32), (16, 16)] {
@@ -3611,6 +3628,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn vertical_gradient_seed_reads_the_name_hash_big_endian() {
+        let _guard = lock_gen();
         // vanilla StringHash.fromString = Guava Longs.fromBytes, i.e. big-endian,
         // then PositionalRandomFactory.fromHashOf XORs those words with the
         // world's forkPositional seed. Reading the md5 words little-endian put
@@ -3635,6 +3653,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn not_underwater_is_grass_only_above_the_water_surface() {
+        let _guard = lock_gen();
         // vanilla's WaterCondition (SurfaceRules$WaterConditionSource$1WaterCondition)
         // is already "not underwater": waterHeight == MIN (no fluid), or
         // blockY + stoneDepthAbove >= the water surface. The grass rule uses it
@@ -3654,6 +3673,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn surface_density_follows_vanillas_interpolated_order() {
+        let _guard = lock_gen();
         // vanilla samples `interpolated` over its input at 4x8x4 cell corners and
         // interpolates that, then applies squeeze/min/add per block. Interpolating
         // final_density as a whole is lerp(squeeze(X)); squeeze is cubic, so the
@@ -3665,6 +3685,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn feature_population_output_matches_the_pre_refactor_capture() {
+        let _guard = lock_gen();
         // Unlike the lazy-vs-direct comparison, this pins the values against a
         // digest recorded before the shared contracts moved, so a change made on
         // both sides at once cannot hide behind a passing local comparison.
@@ -3782,6 +3803,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn bundled_carver_configs_are_the_1_21_1_shapes() {
+        let _guard = lock_gen();
         // The four configured carvers the overworld's biomes reference. They were missing
         // entirely, so no cave could ever be carved; this keeps them present and shaped like
         // the 1.21.1 jar's files now that the carving code is the next piece.
@@ -3806,6 +3828,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn the_ore_vein_geometry_matches_vanillas_own_output() {
+        let _guard = lock_gen();
         // Vanilla's OreFeature.place (called through tools/vanilla-probe) writes these 666
         // cells for seed 60007, position (7,49,13) and size 64. Pinning them means the Rust
         // generator is compared against the game's own output, not only against the Python
@@ -3826,6 +3849,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart() {
+        let _guard = lock_gen();
         // The deep material rule asks for the biome once per block; the answer only depends on the
         // quart, so one shared cache replaced millions of B-tree searches. Pin that a repeat query
         // returns what the first one computed and what a direct lookup gives.
@@ -3848,6 +3872,7 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
 
     #[test]
     fn feat_determinism() {
+        let _guard = lock_gen();
         // same seed -> identical override maps; and feature writes must cross
         // chunk boundaries (e.g. a tree rooted in a neighbor must appear here)
         let g1 = Gen::load(0, crate::name_to_state).expect("datapack");
