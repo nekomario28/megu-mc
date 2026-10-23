@@ -3761,7 +3761,12 @@ const AQ_AP: &[((i32,i32,i32,f64),&str)] = &[((112,-100,64,0.037482421875),"none
         // tally inside one placement pass made candidate (0,17) read y=64 instead of
         // vanilla's 70 and grow a tree vanilla rejects on the leaf above it.
         // 2x2 feature-on diff: 940 -> 704; trees 42 -> 39 (vanilla 38).
-        assert_eq!(digest, "514a3361fecddfdeb8aaba3cb40703ac",
+        // 2026-10-23: `random_patch` is implemented and `matching_blocks` accepts a
+        // scalar `blocks`, so the vegetation that was inert now places. The capture
+        // moves with it; the fixture to read next is `tools/ore_fixture.sh`
+        // (938 -> 42939 cells over 8 chunks, short_grass 0 -> 362 against vanilla's 102,
+        // i.e. an over-placement to explain).
+        assert_eq!(digest, "90c0986409c4e0495a9a04e3ecb96d95",
             "feature population output changed from the vanilla-order capture");
     }
 
