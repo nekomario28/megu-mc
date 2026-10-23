@@ -1466,3 +1466,27 @@ return ctx.f().a(biome).a(feature);             // biome の feature 集合が f
   なっていないか）。
 
 候補の (x,z) が一致している以上、ここの解決で木は 45→38 に揃う見込み。
+
+## 41. 残差の正体: 石系 ore は vanilla の**上位集合**で、差は後続の spring が置く水
+
+2×2 の石系 ore（`ore_granite/diorite/andesite/tuff`）のセル集合を vanilla と比べると:
+
+| ブロック | ours | vanilla | 共通 | ours-only | vanilla-only |
+|---|---|---|---|---|---|
+| diorite | 4251 | 4032 | 4032 | **219** | **0** |
+| andesite | 5232 | 5112 | 5112 | **120** | **0** |
+| granite | 4007 | 3960 | 3960 | **47** | **0** |
+| tuff | 5568 | 5535 | 5535 | **33** | **0** |
+
+**vanilla-only が全部 0、ours-only が計 419**。つまり鉱脈の位置・形は（origin も
+セルも）vanilla を包含しており、差は「vanilla では後から別の feature がそのセルを
+置き換えた」側だけ。最大のペア `diorite != water` 113 が典型で、vanilla は
+step 8 の `spring_water` が diorite を水に置き換え、こちらは置き換えていない。
+
+したがって次の単位は **spring 系（`spring_water` / `spring_lava`）**:
+`SpringFeature` は面の条件（`rock_count` / `hole_count` / `valid_blocks`）で
+「岩盤に開いた穴」を探して流体を置く。`diorite != water` 113 + `diorite != gravel` 87 +
+`andesite != dirt` 80 などの大半がこの 1 機構の説明で片づく見込み。
+
+（なお `juxtapose` の注意: この比較は feature ありの world なので、carver/aquifer 層は
+別途 0 セルであることを確認済み — `tools/carver_fixture.sh tcur - - - 2` が 0。）

@@ -311,3 +311,9 @@ chunk (1,0) の候補 (20,66,3), feature (20,9) で vanilla の BiomeFilter は 
 forest に `trees_birch_and_oak` がある以上 false は説明できない。
 次は `ctx.d().t(pos)`（`dcz.t(Ljd;)Ljm;`）の戻り値と `ctx.e()`（topFeature）を
 文字列でログして、どちらが想定と違うかを見る。木は 45 vs 38。
+
+## 残差の正体（2026-10-22 最終）
+
+石系 ore のセル集合を vanilla と比較すると **vanilla-only 0 / ours-only 419** の
+「上位集合」。差は step 8 の `spring_water`（等）が後から diorite を水に置き換える
+分だけ。次の単位は spring 系（`SpringFeature` の rock_count/hole_count/valid_blocks）。
