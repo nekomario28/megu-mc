@@ -695,3 +695,68 @@ fixture に使える近傍の ice biome が未特定（`sea_pickle` の warm_oce
 
 型カバレッジの未実装到達型は 6 → **5**（`fossil` `sculk_patch` `dripstone_cluster`
 `large_dripstone` `speleothem_cluster`）。
+
+## 71. `dripstone_cluster` を実装した（`Cf::DripstoneCluster`）— `Column` と2つの tip
+
+`eby`（`DripstoneClusterFeature`）173行を移植。クラスタは半径を x/z 別に引く楕円で、各列は
+
+1. **`Column`（`dyo`）**で自分のいる空気/水のスパンを求める。上方向スキャンの終点が **ceiling**、
+   下方向スキャンの終点が **floor**（`create(floor, ceiling)` の引数順がそのままフィールド順）。
+   どちらも「空気でも水でもない最初のセル」で、`range` 回までしか動かない。
+2. `nextFloat < wetness` で「濡れた列」かを引き、濡れていて `canPlacePool` が通れば
+   **floor セル自体を水にして floor を1つ下げる**（後続の石筍がそのぶん深く立つ）。
+3. 天井側・床側それぞれ `nextDouble < chance` → thickness プロバイダ → `isLava` ガード →
+   `getDripstoneHeight`（`nextFloat > density` なら 0、そうでなければ距離バイアス付きの
+   clamped normal）。
+4. 両 tip が届く場合は **合流点を1ドローで決めて双方を短縮**し、`nextBoolean` で
+   `tip_merge` にするか決める。
+
+draw 順は列ごとに固定（`dx` 外・`dz` 内の順）。`wetness` は clamped normal（Gaussian 1回）、
+`density` は uniform float（`nextFloat` 1回）なので、**短絡も含めた順序がそのまま形を決める**。
+
+mappings で先に解決した名前: `dyo`=`Column`（`getCeiling()->b` / `getFloor()->c` /
+`withFloor()->a` / `getHeight()->d`）、`bpq`=`ClampedNormalFloat`、`bqa`=`TrapezoidFloat`、
+`bqb`=`UniformFloat`、`bps`=`ConstantFloat`、`ebz`=`DripstoneUtils`、`dtz`=`DripstoneThickness`、
+`dlq`=`PointedDripstoneBlock`、`dga.H/su/st`=LAVA/DRIPSTONE_BLOCK/POINTED_DRIPSTONE、
+タグ `awe.bf/bt`=`base_stone_overworld`/`dripstone_replaceable_blocks`、`ji.a/b`=DOWN/UP、
+`jd.h(int)`=**`atY(int)`**（`above(int)` は `b`）、`Mth.a/b(FFF...)`=`clampedMap(float/double)`。
+
+### 新しく入れた層: float provider（`FP`）
+
+`dripstone_cluster` が pack で最初の float provider 利用だったため、`bpu` の4型を全部書いた:
+`constant`（ドローなし）/`uniform`（`nextFloat` 1回、**`min_inclusive`/`max_exclusive`**）/
+`clamped_normal`（Gaussian 1回、f64 で計算して f32 へ切り戻し）/`trapezoid`（`nextFloat` 2回）。
+`clamped_normal` は **config の f32 を f64 に昇格**して計算する（`0.1f32 as f64` が値の一部）ので、
+`fp_clamped_normal` を feature と共有している。ドロー数と値は
+`float_providers_draw_and_clamp_like_the_vanilla_types` が双子 RNG で固定（4型すべて）。
+
+### 固定具が見つけた欠陥: `(dcz)` キャストは多重定義の識別
+
+最初の実装は天井/床のガードを `canBeAdjacentToWater` で書いていた。症状は
+**乾いたギャラリーで何も生えない**（`tips=0 blocks=0`）。`ebz` には `a(...)` が2つあり、
+
+- `a(dcz, jd)` = **`isLava`**（`LevelReader`）
+- `a(dcx, jd)` = `canBeAdjacentToWater`（`LevelAccessor`）
+
+逆コンパイル出力は `this.a((dcz)$$0, ...)` と **明示キャスト**を出しており、それが識別子だった。
+`isLava` なら石の天井は通る（正しい）。`canBeAdjacentToWater` だと石の天井が自分の鍾乳石を拒否する。
+**逆コンパイルの明示キャストは多重定義の識別マーカーとして読む**、が今回の教訓。
+
+### ゲート
+
+- `dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above`（乾いたギャラリー）:
+  (a) 全書き込みが引いた半径の内側、(b) `vertical_direction` ごとの run が **スパンの隣接セルから
+  始まる**（down は `ceiling-1`、up は `floor+1`）、(c) 層順が base → middle* → frustum → tip、
+  (d) dripstone block はスパン内に出ない、(e) dry の golden（tips=209 / blocks=675 / 64列）。
+- `dripstone_cluster_pools_lower_the_stalagmite_into_the_water`（**水で満たしたスパン**）:
+  `canPlacePool` は四方と上が base stone/水であることを要求するので、乾いた洞窟では決して通らない。
+  濡れた列では floor が1つ下がり、石筍が**プールの水を置き換えて waterlogged=true** で立つ。
+  ここを固定（プールのセルと tip が同一セルを共有しないことも）。
+- mutation 2本（`isLava` ガード、tip の向き）で **64 proved / 0 not a gate / 0 skipped**、clippy 0。
+
+**測っていないこと**: セル単位の vanilla 一致。`dripstone_caves` のチャンクを固定具にする必要があり、
+水スパン側は実地形の地下湖が要る。golden は「seed 31 + pack config の回帰ピン」であって
+vanilla との比較ではない。float provider の値も vanilla dump ではなく式の双子との一致まで。
+
+型カバレッジの未実装到達型は 5 → **4**（`fossil` `sculk_patch` `large_dripstone`
+`speleothem_cluster`）。

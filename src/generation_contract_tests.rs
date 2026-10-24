@@ -2,7 +2,7 @@ use super::{freg, gen_cf, Cf};
 use crate::block_registry::breg;
 use crate::generation_context::FC;
 use crate::generation_math::{normal_new_l, Xor};
-use crate::generation_providers::{p_hp, p_ip, test_pred, test_rt, Bsp, Pr, RT};
+use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr, RT};
 use crate::json::jparse;
 use crate::worldgen::Gen;
 
@@ -1191,4 +1191,280 @@ fn iceberg_builds_a_shape_around_sea_level() {
     );
     // and the water it was built in is still water elsewhere
     assert_eq!(ctx.get(x + 30, sea + 30, z), water, "far away stays water");
+}
+
+/// Load a configured feature straight from the pack's own JSON, so a test never
+/// restates a config that the pack already holds.
+fn pack_cf(name: &str) -> Cf {
+    let path = format!("datapacks/vanilla/data/minecraft/worldgen/feature/{name}.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    super::p_cf(&jparse(text.as_bytes()).expect("json")).expect("the config must parse")
+}
+
+/// The gallery of `dripstone_cluster_hangs_...`: a stone slab with a span of `fill`
+/// cells between a floor endpoint at y = 59 and a ceiling endpoint at y = 67. The
+/// origin sits in the middle of the span.
+fn dripstone_gallery(ctx: &mut FC, ox: i32, oz: i32, floor_y: i32, fill: u32) {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    for dx in -12..=12 {
+        for dz in -12..=12 {
+            for y in 40..=floor_y {
+                ctx.set(ox + dx, y, oz + dz, stone);
+            }
+            for y in floor_y + 1..=floor_y + 7 {
+                ctx.set(ox + dx, y, oz + dz, fill);
+            }
+            for y in floor_y + 8..=80 {
+                ctx.set(ox + dx, y, oz + dz, stone);
+            }
+        }
+    }
+}
+
+/// The cells a feature changed, given the fixture's own write set: a cell counts as
+/// the feature's when it is new *or* its state differs (a replacement is not "new").
+fn changed(
+    before: &std::collections::HashMap<(i32, i32, i32), u32>,
+    ctx: &FC,
+) -> Vec<((i32, i32, i32), u32)> {
+    let mut out: Vec<((i32, i32, i32), u32)> = ctx
+        .wr
+        .iter()
+        .filter(|(p, st)| before.get(*p) != Some(*st))
+        .map(|(&p, &st)| (p, st))
+        .collect();
+    out.sort();
+    out
+}
+
+/// `minecraft:dripstone_cluster` (`eby`, `DripstoneClusterFeature`) with a dry gallery
+/// (span of air). Pinned here: the orientation of every tip (a stalactite hangs below
+/// the ceiling with `vertical_direction=down` and starts at the ceiling's own
+/// neighbour cell, a stalagmite stands the other way up), the layer sequence
+/// (base -> middles -> frustum -> tip), that no dripstone block lands inside the span,
+/// that nothing is written outside the drawn radius, and the exact number of cells this
+/// seeded stream produces.
+#[test]
+fn dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above() {
+    let reg = breg().unwrap();
+    let cf = pack_cf("dripstone_cluster");
+    let Cf::DripstoneCluster(dcfg) = &cf else {
+        panic!("dripstone_cluster must parse as a cluster");
+    };
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let air = reg.state_of("minecraft:air", None);
+    let (ox, oz, oy) = (8, 8, 64);
+    let (floor_y, ceil_y) = (59, 67);
+    dripstone_gallery(&mut ctx, ox, oz, floor_y, air);
+
+    // replay the head of the stream for the radii the footprint bound needs
+    let (rx, rz) = {
+        let mut probe = Xor::seed(31);
+        let _ = dcfg.height.get(&mut probe);
+        let _ = dcfg.wetness.get(&mut probe);
+        let _ = dcfg.density.get(&mut probe);
+        let rx = dcfg.radius.get(&mut probe);
+        let rz = dcfg.radius.get(&mut probe);
+        (rx, rz)
+    };
+    let before = ctx.wr.clone();
+    let mut rng = Xor::seed(31);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (ox, oy, oz));
+
+    let mut blocks = 0usize;
+    let mut cols: std::collections::BTreeMap<(i32, i32), Vec<(i32, u32)>> = Default::default();
+    for ((px, py, pz), st) in changed(&before, &ctx) {
+        assert!(
+            (px - ox).abs() <= rx && (pz - oz).abs() <= rz,
+            "a write at {px},{py},{pz} is outside the drawn radius {rx}x{rz}"
+        );
+        match reg.name_of(st) {
+            "minecraft:pointed_dripstone" => {
+                cols.entry((px, pz)).or_default().push((py, st));
+            }
+            "minecraft:dripstone_block" => {
+                blocks += 1;
+                assert!(
+                    !(floor_y + 1..=ceil_y - 1).contains(&py),
+                    "a dripstone block inside the span at {px},{py},{pz}"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut tips = 0usize;
+    for ((px, pz), cells) in &cols {
+        for up in [false, true] {
+            let want = if up { "up" } else { "down" };
+            let mut run: Vec<(i32, String)> = cells
+                .iter()
+                .filter(|(_, st)| reg.get_prop(*st, "vertical_direction").as_deref() == Some(want))
+                .map(|(y, st)| (*y, reg.get_prop(*st, "thickness").unwrap_or_default()))
+                .collect();
+            if run.is_empty() {
+                continue;
+            }
+            run.sort_by_key(|(y, _)| if up { *y } else { -*y });
+            tips += run.len();
+            let first_y = run[0].0;
+            let want_y = if up { floor_y + 1 } else { ceil_y - 1 };
+            assert_eq!(
+                first_y, want_y,
+                "a {want} tip at {px},{pz} must start at the span's own neighbour cell"
+            );
+            let n = run.len() as i32;
+            let mut expect: Vec<&str> = Vec::new();
+            if n >= 3 {
+                expect.push("base");
+                expect.extend(std::iter::repeat_n("middle", (n - 3) as usize));
+            }
+            if n >= 2 {
+                expect.push("frustum");
+            }
+            expect.push("tip");
+            let last = run.last().unwrap().1.as_str();
+            assert!(
+                last == "tip" || last == "tip_merge",
+                "the tip of a {want} run at {px},{pz} is {last}"
+            );
+            let got: Vec<&str> = run[..run.len() - 1]
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect();
+            assert_eq!(
+                got,
+                expect[..expect.len() - 1],
+                "layer sequence of the {want} run at {px},{pz}"
+            );
+            if want == "down" {
+                assert!(
+                    first_y < ceil_y && run.iter().all(|(y, _)| *y > floor_y),
+                    "a stalactite belongs between the floor and the ceiling"
+                );
+            }
+        }
+    }
+    println!(
+        "DRIPSTONE dry: tips={tips} blocks={blocks} columns={} rx={rx} rz={rz}",
+        cols.len()
+    );
+    assert!(tips > 0, "the seeded stream must grow at least one tip");
+    // A regression pin, not a vanilla comparison: the seeded stream with the pack's
+    // own config produces exactly this, so any change to a draw, a gate or a loop
+    // bound moves it.
+    assert_eq!((tips, blocks), (209, 675), "golden cell counts");
+}
+
+/// The same feature with a **water** span. `canPlacePool` wants base stone or water on
+/// all four sides and above the floor cell, which a dry gallery's air cannot provide -
+/// so a pool only appears in an already-wet column. The pool turns the floor endpoint
+/// into water and moves the column's floor one cell *down* into the rock, so the
+/// stalagmite that follows starts one cell lower than in the dry case, replaces the
+/// pool's own water, and is waterlogged. That lowered tip is what this pins.
+#[test]
+fn dripstone_cluster_pools_lower_the_stalagmite_into_the_water() {
+    let reg = breg().unwrap();
+    let cf = pack_cf("dripstone_cluster");
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let water = reg.state_of("minecraft:water", None);
+    let (ox, oz, oy) = (8, 8, 64);
+    let floor_y = 59;
+    dripstone_gallery(&mut ctx, ox, oz, floor_y, water);
+
+    let before = ctx.wr.clone();
+    let mut rng = Xor::seed(31);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (ox, oy, oz));
+
+    let mut lowered = 0usize;
+    for ((px, py, pz), st) in changed(&before, &ctx) {
+        if py != floor_y {
+            continue;
+        }
+        if reg.name_of(st) == "minecraft:pointed_dripstone" {
+            // the pool's cell: the tip replaced the water it had just written
+            assert_eq!(
+                reg.get_prop(st, "vertical_direction").as_deref(),
+                Some("up"),
+                "a lowered tip at {px},{pz} must grow up"
+            );
+            assert_eq!(
+                reg.get_prop(st, "waterlogged").as_deref(),
+                Some("true"),
+                "the tip standing in the pool at {px},{pz} is waterlogged"
+            );
+            lowered += 1;
+        }
+        // Otherwise the column kept its water: that happens when the floor tip is not
+        // grown at all, and the two never share a cell.
+        assert!(
+            reg.name_of(st) == "minecraft:water"
+                || reg.name_of(st) == "minecraft:pointed_dripstone"
+                || reg.name_of(st) == "minecraft:dripstone_block",
+            "unexpected {} at the floor endpoint {px},{pz}",
+            reg.name_of(st)
+        );
+    }
+    println!("DRIPSTONE wet: lowered_tips={lowered} water_cells={water}");
+    assert!(
+        lowered > 0,
+        "a water-filled span must produce pools for this seed"
+    );
+}
+
+/// The float providers (`bpu` and its four types) arrived with the dripstone cluster.
+/// The feature's whole shape shifts if any of them consumes a different number of draws,
+/// so each is checked against a twin `Xor` allowed to draw exactly what the vanilla
+/// method draws - value *and* follow-on stream position.
+#[test]
+fn float_providers_draw_and_clamp_like_the_vanilla_types() {
+    // constant (`bps`): no draw
+    let p = p_fp(&jparse(br#"{"type":"constant","value":0.25}"#).unwrap()).unwrap();
+    let (mut a, mut b) = (Xor::seed(3), Xor::seed(3));
+    assert_eq!(p.get(&mut a), 0.25);
+    assert_eq!(a.next_long(), b.next_long(), "a constant draws nothing");
+
+    // uniform (`bqb`): one nextFloat, `min + r * (max - min)`, max exclusive
+    let p =
+        p_fp(&jparse(br#"{"type":"uniform","min_inclusive":0.3,"max_exclusive":0.7}"#).unwrap())
+            .unwrap();
+    let (mut a, mut b) = (Xor::seed(3), Xor::seed(3));
+    assert_eq!(p.get(&mut a), b.next_f32() * (0.7f32 - 0.3) + 0.3);
+    assert_eq!(a.next_long(), b.next_long(), "a uniform float draws once");
+
+    // clamped normal (`bpq`): one Gaussian (two doubles), f64 arithmetic, then clamp
+    let p = p_fp(
+        &jparse(br#"{"type":"clamped_normal","mean":0.1,"deviation":0.3,"min":0.1,"max":0.9}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    let (mut a, mut b) = (Xor::seed(3), Xor::seed(3));
+    // the config's floats are promoted to f64 (`Mth.nextGaussian(RandomSource, double,
+    // double)`), so the f32->f64 widening of `0.1` is part of the value
+    let want =
+        (0.1f32 as f64 + b.next_gauss() * 0.3f32 as f64).clamp(0.1f32 as f64, 0.9f32 as f64) as f32;
+    assert_eq!(p.get(&mut a), want);
+    assert_eq!(
+        a.next_long(),
+        b.next_long(),
+        "a clamped normal draws one Gaussian"
+    );
+
+    // trapezoid (`bqa`): two nextFloats, `min + r1*h + r2*g`
+    let p = p_fp(&jparse(br#"{"type":"trapezoid","min":-1.0,"max":2.0,"plateau":1.0}"#).unwrap())
+        .unwrap();
+    let (mut a, mut b) = (Xor::seed(3), Xor::seed(3));
+    let (f, g) = (3.0f32, (3.0f32 - 1.0) / 2.0);
+    assert_eq!(
+        p.get(&mut a),
+        -1.0 + b.next_f32() * (f - g) + b.next_f32() * g
+    );
+    assert_eq!(
+        a.next_long(),
+        b.next_long(),
+        "a trapezoid float draws twice"
+    );
 }

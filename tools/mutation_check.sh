@@ -506,6 +506,16 @@ check "an update packet sends block light only" \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
   update_light_packet_sends_block_light_only
 
+check "a dripstone tip rejects a lava ceiling, not a stone one" \
+  src/feature.rs 'Some(c) if roll1 && !drip_is_lava(ctx, (pos.0, c, pos.2)) => {' \
+  'Some(c) if roll1 && !drip_can_be_adjacent_to_water(ctx, (pos.0, c, pos.2)) => {' \
+  dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above
+
+check "a pointed dripstone carries the direction it was grown in" \
+  src/feature.rs 'let st = drip_pointed(reg, up, t);' \
+  'let st = drip_pointed(reg, true, t);' \
+  dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above
+
 check "an iceberg re-anchors itself to sea level" \
   src/feature.rs '    let pos = (origin.0, crate::worldgen::sea_level(), origin.2);' \
   '    let pos = (origin.0, origin.1, origin.2);' \

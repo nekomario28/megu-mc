@@ -94,6 +94,93 @@ impl IP {
     }
 }
 
+// ---------- float providers (`bpu` + its four types) ----------
+
+/// Float value providers. The dripstone cluster is the first feature in the pack to
+/// need one (`density` is a uniform float, `wetness` a clamped normal), so the set is
+/// written out in full rather than partially: an unparsed provider type must not look
+/// like a config that merely says zero.
+///
+/// * `minecraft:constant` (`bps`): no draw.
+/// * `minecraft:uniform` (`bqb`) = `Mth.nextFloat(random, min, max)`: one `nextFloat`,
+///   with `min_inclusive` / `max_exclusive` (not inclusive - the int provider's rule
+///   does not carry over).
+/// * `minecraft:clamped_normal` (`bpq`) = `Mth.clamp(Mth.nextGaussian(random, mean,
+///   deviation), min, max)`: one Gaussian (two draws, or none when the Marsaglia
+///   spare is already populated), computed in f64 and truncated back to f32.
+/// * `minecraft:trapezoid` (`bqa`): two `nextFloat`s, `min + r*h + r*g`.
+///
+/// The shared piece of `minecraft:clamped_normal`: `Mth.clamp(Mth.nextGaussian(random,
+/// mean, deviation), min, max)`. `Mth.nextGaussian` promotes its float arguments, so the
+/// arithmetic is f64 and only the result is f32 - the dripstone cluster's own tip length
+/// calls the same helper, so it lives here rather than in the feature.
+pub(crate) fn fp_clamped_normal(r: &mut Xor, mean: f32, dev: f32, lo: f32, hi: f32) -> f32 {
+    let v = mean as f64 + r.next_gauss() * dev as f64;
+    let (a, b) = (lo as f64, hi as f64);
+    (if v < a {
+        a
+    } else if v > b {
+        b
+    } else {
+        v
+    }) as f32
+}
+
+pub(crate) enum FP {
+    Const(f32),
+    Uniform(f32, f32),
+    Norm {
+        mean: f32,
+        dev: f32,
+        lo: f32,
+        hi: f32,
+    },
+    Trap {
+        lo: f32,
+        hi: f32,
+        plateau: f32,
+    },
+}
+impl FP {
+    pub(crate) fn get(&self, r: &mut Xor) -> f32 {
+        match self {
+            FP::Const(v) => *v,
+            FP::Uniform(lo, hi) => r.next_f32() * (hi - lo) + lo,
+            FP::Norm { mean, dev, lo, hi } => fp_clamped_normal(r, *mean, *dev, *lo, *hi),
+            FP::Trap { lo, hi, plateau } => {
+                // bqa: f = max - min; g = (f - plateau)/2; h = f - g
+                let f = hi - lo;
+                let g = (f - plateau) / 2.0;
+                let h = f - g;
+                lo + r.next_f32() * h + r.next_f32() * g
+            }
+        }
+    }
+}
+pub(crate) fn p_fp(j: &J) -> Option<FP> {
+    let ty = jstr(j, "type")?;
+    let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
+    Some(match ty {
+        "constant" | "literal" => FP::Const(jnum(j, "value").unwrap_or(0.0) as f32),
+        "uniform" => FP::Uniform(
+            jnum(j, "min_inclusive").unwrap_or(0.0) as f32,
+            jnum(j, "max_exclusive").unwrap_or(1.0) as f32,
+        ),
+        "clamped_normal" => FP::Norm {
+            mean: jnum(j, "mean").unwrap_or(0.0) as f32,
+            dev: jnum(j, "deviation").unwrap_or(1.0) as f32,
+            lo: jnum(j, "min").unwrap_or(0.0) as f32,
+            hi: jnum(j, "max").unwrap_or(0.0) as f32,
+        },
+        "trapezoid" => FP::Trap {
+            lo: jnum(j, "min").unwrap_or(0.0) as f32,
+            hi: jnum(j, "max").unwrap_or(0.0) as f32,
+            plateau: jnum(j, "plateau").unwrap_or(0.0) as f32,
+        },
+        _ => return None,
+    })
+}
+
 pub(crate) fn p_ip(j: &J) -> Option<IP> {
     if let J::Num(n) = j {
         return Some(IP::Const(*n as i32));

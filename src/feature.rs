@@ -98,6 +98,8 @@ enum Cf {
     /// archaeology loot table is not attached to the suspicious sand (no block-entity
     /// loot support), so brushing it yields nothing.
     DesertWell,
+    /// `minecraft:dripstone_cluster` (`eby`), config `eeg`.
+    DripstoneCluster(Box<DripstoneClusterCfg>),
     /// `minecraft:iceberg` (`ecr`), config `{state}`.
     Iceberg {
         state: u32,
@@ -285,6 +287,403 @@ struct GeodeCfg {
     max_gen_offset: i32,
     noise_multiplier: f64,
     invalid_blocks_threshold: i32,
+}
+
+// ---------- dripstone cluster (`eby`) ----------
+
+/// `DripstoneClusterConfiguration` (`eeg`). Every field is used, and three of them are
+/// providers whose draw count depends on the pack's chosen type.
+pub(crate) struct DripstoneClusterCfg {
+    /// `floor_to_ceiling_search_range`: how far the empty/water span is scanned.
+    range: i32,
+    /// `height`: the tip length before the column's own span caps it.
+    height: IP,
+    /// `radius`: drawn twice (x, then z), so a cluster is an ellipse.
+    radius: IP,
+    /// `max_stalagmite_stalactite_height_diff`: how far the two tips may differ.
+    max_diff: i32,
+    /// `height_deviation`: the Gaussian deviation of a tip's length.
+    height_deviation: i32,
+    /// `dripstone_block_layer_thickness`: layers of dripstone block behind a tip.
+    thickness: IP,
+    /// `density`: `nextFloat() > density` gives the column no tips at all.
+    density: FP,
+    /// `wetness`: chance the floor cell becomes a water pool.
+    wetness: FP,
+    /// `chance_of_dripstone_column_at_max_distance_from_center`.
+    chance: f32,
+    /// `max_distance_from_edge_affecting_chance_of_dripstone_column`.
+    max_dist_edge: i32,
+    /// `max_distance_from_center_affecting_height_bias`.
+    max_dist_center: i32,
+}
+
+/// `Column` (`dyo`): the span of empty/water cells a column sits in. `ceiling` is the
+/// first neither-empty-nor-water cell found scanning **up**, `floor` the one found
+/// scanning down - so `floor < pos.y < ceiling` whenever both are present.
+#[derive(Clone, Copy)]
+struct DripCol {
+    ceiling: Option<i32>,
+    floor: Option<i32>,
+}
+impl DripCol {
+    /// `Column.getHeight()`: only a two-sided column has one.
+    fn height(&self) -> Option<i32> {
+        match (self.ceiling, self.floor) {
+            (Some(c), Some(f)) => Some(c - f - 1),
+            _ => None,
+        }
+    }
+}
+
+/// `minecraft:dripstone_cluster` (`eby`, `DripstoneClusterFeature`).
+///
+/// A cluster is an ellipse of columns (the radius is drawn separately for x and z).
+/// Each column finds the empty/water span it sits in, may turn its floor cell into a
+/// water pool, then may hang a stalactite from the span's ceiling and stand a
+/// stalagmite on its floor. When the two tips would overlap, their meeting point is
+/// drawn and both lengths are shortened to it.
+///
+/// Draw order per column (it matters - the pack's `wetness` and `density` are
+/// providers, and both `clamped_normal` and `uniform` floats draw):
+/// `nextFloat < wetness`, `nextDouble < chance`, [thickness, height gate + Gaussian],
+/// `nextDouble < chance`, [thickness, (randomBetweenInclusive | height gate +
+/// Gaussian)], (meeting point), `nextBoolean`.
+fn gen_dripstone_cluster(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    origin: (i32, i32, i32),
+    cfg: &DripstoneClusterCfg,
+) {
+    if !drip_is_empty_or_water(ctx, origin) {
+        return;
+    }
+    let height = cfg.height.get(rng);
+    let wetness = cfg.wetness.get(rng);
+    let density = cfg.density.get(rng);
+    let rx = cfg.radius.get(rng);
+    let rz = cfg.radius.get(rng);
+    for dx in -rx..=rx {
+        for dz in -rz..=rz {
+            let chance = drip_chance(rx, rz, dx, dz, cfg);
+            let p = (origin.0 + dx, origin.1, origin.2 + dz);
+            drip_place_column(
+                ctx,
+                rng,
+                p,
+                dx,
+                dz,
+                wetness,
+                chance as f64,
+                height,
+                density,
+                cfg,
+            );
+        }
+    }
+}
+
+/// `DripstoneUtils.isEmptyOrWater(LevelAccessor, BlockPos)` (`ebz.a(dcx,jd)`), which is
+/// also the `start` predicate of the column scan.
+fn drip_is_empty_or_water(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    let st = ctx.get(pos.0, pos.1, pos.2);
+    reg.is_air(st) || reg.name_of(st) == "minecraft:water"
+}
+
+/// `DripstoneUtils.isNeitherEmptyNorWater` (`ebz.d`): the column scan's `end`
+/// predicate. Note lava counts as neither, so a lava lake can end a column.
+fn drip_is_neither_empty_nor_water(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    let st = ctx.get(pos.0, pos.1, pos.2);
+    !reg.is_air(st) && reg.name_of(st) != "minecraft:water"
+}
+
+/// One direction of `Column.scanDirection` (`dyo.a`): walk while the cell is still
+/// empty-or-water (at most `range - 1` steps), then accept the cell we stopped on only
+/// if it is neither.
+fn drip_scan(ctx: &mut FC, pos: (i32, i32, i32), range: i32, up: bool) -> Option<i32> {
+    let mut y = pos.1;
+    let mut i = 1;
+    while i < range && drip_is_empty_or_water(ctx, (pos.0, y, pos.2)) {
+        y += if up { 1 } else { -1 };
+        i += 1;
+    }
+    if drip_is_neither_empty_nor_water(ctx, (pos.0, y, pos.2)) {
+        Some(y)
+    } else {
+        None
+    }
+}
+
+/// `Column.getColumnAt` (`dyo.a`): the up scan is the ceiling, the down scan the floor
+/// (that is the field order of `Column.create(floor, ceiling)`).
+fn drip_column(ctx: &mut FC, pos: (i32, i32, i32), range: i32) -> Option<DripCol> {
+    if !drip_is_empty_or_water(ctx, pos) {
+        return None;
+    }
+    let ceiling = drip_scan(ctx, pos, range, true);
+    let floor = drip_scan(ctx, pos, range, false);
+    Some(DripCol { ceiling, floor })
+}
+
+/// `DripstoneClusterFeature.getChanceOfStalagmiteOrStalactite`
+/// (`eby.a(int,int,int,int,eeg)`): the config's chance at the cluster's edge rising to
+/// 1.0 `max_dist_edge` cells inside it (float `clampedMap` - the casts are in the
+/// bytecode too).
+fn drip_chance(rx: i32, rz: i32, dx: i32, dz: i32, cfg: &DripstoneClusterCfg) -> f32 {
+    let a = rx - dx.abs();
+    let b = rz - dz.abs();
+    let m = a.min(b);
+    clamped_map_f32(m as f32, 0.0, cfg.max_dist_edge as f32, cfg.chance, 1.0)
+}
+
+/// `DripstoneClusterFeature.getDripstoneHeight` (`eby.a(ayw,int,int,float,int,eeg)`):
+/// a `nextFloat` gate against the density, then a biased Gaussian whose mean falls from
+/// half the maximum at the cluster's centre to zero at `max_dist_center`.
+fn drip_height(
+    rng: &mut Xor,
+    dx: i32,
+    dz: i32,
+    density: f32,
+    max: i32,
+    cfg: &DripstoneClusterCfg,
+) -> i32 {
+    if rng.next_f32() > density {
+        return 0;
+    }
+    let dist = dx.abs() + dz.abs();
+    let mean = clamped_map_f64(
+        dist as f64,
+        0.0,
+        cfg.max_dist_center as f64,
+        max as f64 / 2.0,
+        0.0,
+    ) as f32;
+    fp_clamped_normal(rng, mean, cfg.height_deviation as f32, 0.0, max as f32) as i32
+}
+
+/// `DripstoneClusterFeature.canBeAdjacentToWater` (`eby.a(dcx,jd)`): base stone, or a
+/// water fluid state (the port models water as a block, so the fluid test is a name
+/// test).
+fn drip_can_be_adjacent_to_water(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    let st = ctx.get(pos.0, pos.1, pos.2);
+    reg.in_tag(st, "minecraft:base_stone_overworld") || reg.name_of(st) == "minecraft:water"
+}
+
+/// `DripstoneClusterFeature.isLava` (`eby.a(dcz,jd)`). Note the decompiled call sites
+/// cast to `dcz` (LevelReader) to pick this overload: `eby` has a *second* `a(dcx,jd)`
+/// (`canBeAdjacentToWater`), and reading the wrong one makes every stone ceiling reject
+/// its own stalactite - which is how this was found (the fixture grew nothing).
+fn drip_is_lava(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    reg.name_of(ctx.get(pos.0, pos.1, pos.2)) == "minecraft:lava"
+}
+
+/// `DripstoneClusterFeature.canPlacePool` (`eby.b`). The water-below test is *negated*
+/// in the bytecode as it appears here: a cell that already has water under it is
+/// rejected, and the cell must instead be base stone / water on all four sides and
+/// above.
+fn drip_can_place_pool(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    let n = reg.name_of(ctx.get(pos.0, pos.1, pos.2));
+    if n == "minecraft:water"
+        || n == "minecraft:dripstone_block"
+        || n == "minecraft:pointed_dripstone"
+    {
+        return false;
+    }
+    if reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)) == "minecraft:water" {
+        return false;
+    }
+    // `Direction.Plane.HORIZONTAL` is NORTH, EAST, SOUTH, WEST.
+    for (dx, dz) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
+        if !drip_can_be_adjacent_to_water(ctx, (pos.0 + dx, pos.1, pos.2 + dz)) {
+            return false;
+        }
+    }
+    drip_can_be_adjacent_to_water(ctx, (pos.0, pos.1 + 1, pos.2))
+}
+
+/// `DripstoneUtils.placeDripstoneBlockIfPossible` (`ebz.c(dcx,jd)`): a block in the
+/// `dripstone_replaceable_blocks` tag becomes a dripstone block, and nothing else does.
+/// The boolean *is* the loop's continue condition in `replaceBlocks...`.
+fn drip_place_dripstone_block(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    let st = ctx.get(pos.0, pos.1, pos.2);
+    if reg.in_tag(st, "minecraft:dripstone_replaceable_blocks") {
+        let block = reg.state_of("minecraft:dripstone_block", None);
+        ctx.set(pos.0, pos.1, pos.2, block);
+        true
+    } else {
+        false
+    }
+}
+
+/// `DripstoneClusterFeature.replaceBlocksWithDripstoneBlocks` (`eby.a(dds,jd,int,ji)`).
+fn drip_replace_blocks_with_dripstone_blocks(
+    ctx: &mut FC,
+    pos: (i32, i32, i32),
+    thickness: i32,
+    up: bool,
+) {
+    let mut p = pos;
+    for _ in 0..thickness {
+        if !drip_place_dripstone_block(ctx, p) {
+            return;
+        }
+        p.1 += if up { 1 } else { -1 };
+    }
+}
+
+/// `DripstoneUtils.createPointedDripstone` (`ebz.a(ji,dtz)`).
+fn drip_pointed(reg: &BReg, up: bool, thickness: &str) -> u32 {
+    let st = reg.state_of("minecraft:pointed_dripstone", None);
+    let st = reg.with_prop(st, "vertical_direction", if up { "up" } else { "down" });
+    reg.with_prop(st, "thickness", thickness)
+}
+
+/// `DripstoneUtils.buildBaseToTipColumn` (`ebz.a(ji,int,boolean,Consumer)`): base,
+/// then `height - 3` middles, then frustum, then the tip (`tip_merge` when the two
+/// tips of a column meet). Each layer is placed where the consumer's mutable position
+/// currently is, then the position moves on.
+fn drip_build_base_to_tip(ctx: &mut FC, pos: (i32, i32, i32), up: bool, height: i32, merge: bool) {
+    let Some(reg) = breg() else { return };
+    let mut steps: Vec<&str> = Vec::new();
+    if height >= 3 {
+        steps.push("base");
+        steps.extend(std::iter::repeat_n("middle", (height - 3) as usize));
+    }
+    if height >= 2 {
+        steps.push("frustum");
+    }
+    if height >= 1 {
+        steps.push(if merge { "tip_merge" } else { "tip" });
+    }
+    let dir = if up { 1 } else { -1 };
+    let mut m = pos;
+    for t in steps {
+        let st = drip_pointed(reg, up, t);
+        // `state.setValue(WATERLOGGED, level.isWaterAt(m))`
+        let wl = reg.name_of(ctx.get(m.0, m.1, m.2)) == "minecraft:water";
+        let st = reg.with_prop(st, "waterlogged", if wl { "true" } else { "false" });
+        ctx.set(m.0, m.1, m.2, st);
+        m.1 += dir;
+    }
+}
+
+/// `DripstoneUtils.growPointedDripstone` (`ebz.a(dcx,jd,ji,int,boolean)`): the tip only
+/// grows when the cell opposite the growth direction is dripstone block or in the
+/// `dripstone_replaceable_blocks` tag (`isDripstoneBase`).
+fn drip_grow_pointed_dripstone(
+    ctx: &mut FC,
+    pos: (i32, i32, i32),
+    up: bool,
+    height: i32,
+    merge: bool,
+) {
+    let Some(reg) = breg() else { return };
+    let base = ctx.get(pos.0, pos.1 + if up { -1 } else { 1 }, pos.2);
+    let is_base = reg.name_of(base) == "minecraft:dripstone_block"
+        || reg.in_tag(base, "minecraft:dripstone_replaceable_blocks");
+    if !is_base {
+        return;
+    }
+    drip_build_base_to_tip(ctx, pos, up, height, merge);
+}
+
+/// `DripstoneClusterFeature.placeColumn` (`eby.a(dds,ayw,jd,int,int,float,double,int,
+/// float,eeg)`) - one column of the cluster.
+#[allow(clippy::too_many_arguments)]
+fn drip_place_column(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    dx: i32,
+    dz: i32,
+    wetness: f32,
+    chance: f64,
+    height: i32,
+    density: f32,
+    cfg: &DripstoneClusterCfg,
+) {
+    let Some(reg) = breg() else { return };
+    let Some(col) = drip_column(ctx, pos, cfg.range) else {
+        return;
+    };
+    let (ceiling, floor) = (col.ceiling, col.floor);
+    if ceiling.is_none() && floor.is_none() {
+        return;
+    }
+
+    let wet = rng.next_f32() < wetness;
+    let col2 = match (wet, floor) {
+        (true, Some(f)) if drip_can_place_pool(ctx, (pos.0, f, pos.2)) => {
+            // The floor cell itself becomes water and the column's floor moves one
+            // down, so a later stalagmite stands in the pool.
+            let water = reg.state_of("minecraft:water", None);
+            ctx.set(pos.0, f, pos.2, water);
+            DripCol {
+                ceiling,
+                floor: Some(f - 1),
+            }
+        }
+        _ => col,
+    };
+    let floor2 = col2.floor;
+
+    let roll1 = rng.next_f64() < chance;
+    let h_ceil = match ceiling {
+        Some(c) if roll1 && !drip_is_lava(ctx, (pos.0, c, pos.2)) => {
+            let t = cfg.thickness.get(rng);
+            drip_replace_blocks_with_dripstone_blocks(ctx, (pos.0, c, pos.2), t, true);
+            let max = match floor2 {
+                Some(f) => height.min(c - f),
+                None => height,
+            };
+            drip_height(rng, dx, dz, density, max, cfg)
+        }
+        _ => 0,
+    };
+
+    let roll2 = rng.next_f64() < chance;
+    let h_floor = match floor2 {
+        Some(f) if roll2 && !drip_is_lava(ctx, (pos.0, f, pos.2)) => {
+            let t = cfg.thickness.get(rng);
+            drip_replace_blocks_with_dripstone_blocks(ctx, (pos.0, f, pos.2), t, false);
+            match ceiling {
+                Some(_) => (h_ceil + rng.next_inbetween(-cfg.max_diff, cfg.max_diff)).max(0),
+                None => drip_height(rng, dx, dz, density, height, cfg),
+            }
+        }
+        _ => 0,
+    };
+
+    // If the two tips would meet, draw the meeting point inside the span both can
+    // reach and shorten each side to it.
+    let (h1, h2) = match (ceiling, floor2) {
+        (Some(c), Some(f)) if c - h_ceil <= f + h_floor => {
+            let lo = (c - h_ceil).max(f + 1);
+            let hi = (f + h_floor).min(c - 1);
+            let pick = rng.next_inbetween(lo, hi + 1);
+            (c - pick, pick - 1 - f)
+        }
+        _ => (h_ceil, h_floor),
+    };
+
+    let merge = rng.next_bool()
+        && h1 > 0
+        && h2 > 0
+        && col2.height().is_some()
+        && h1 + h2 == col2.height().unwrap();
+
+    if let Some(c) = ceiling {
+        drip_grow_pointed_dripstone(ctx, (pos.0, c - 1, pos.2), false, h1, merge);
+    }
+    if let Some(f) = floor2 {
+        drip_grow_pointed_dripstone(ctx, (pos.0, f + 1, pos.2), true, h2, merge);
+    }
 }
 
 /// `minecraft:iceberg` (`ecr`, `IcebergFeature`), config `{state}` (packed_ice for
@@ -1252,6 +1651,27 @@ fn p_cf(j: &J) -> Option<Cf> {
             water_for_tree: jint(j, "allowed_vertical_water_for_tree", 0),
             allowed_tree_position: p_pred(js(j, "allowed_tree_position")?)?,
         })),
+        "dripstone_cluster" => Cf::DripstoneCluster(Box::new(DripstoneClusterCfg {
+            range: jint(j, "floor_to_ceiling_search_range", 12),
+            height: p_ip(js(j, "height")?)?,
+            radius: p_ip(js(j, "radius")?)?,
+            max_diff: jint(j, "max_stalagmite_stalactite_height_diff", 1),
+            height_deviation: jint(j, "height_deviation", 3),
+            thickness: p_ip(js(j, "dripstone_block_layer_thickness")?)?,
+            density: p_fp(js(j, "density")?)?,
+            wetness: p_fp(js(j, "wetness")?)?,
+            chance: jf32(
+                j,
+                "chance_of_dripstone_column_at_max_distance_from_center",
+                0.1,
+            ),
+            max_dist_edge: jint(
+                j,
+                "max_distance_from_edge_affecting_chance_of_dripstone_column",
+                3,
+            ),
+            max_dist_center: jint(j, "max_distance_from_center_affecting_height_bias", 8),
+        })),
         "iceberg" => Cf::Iceberg {
             state: {
                 let (n, p) = bs_parts(js(j, "state")?)?;
@@ -2153,6 +2573,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
     match cf {
         Cf::Unknown(_) => {}
         Cf::Iceberg { state } => gen_iceberg(ctx, rng, pos, *state),
+        Cf::DripstoneCluster(cfg) => gen_dripstone_cluster(ctx, rng, pos, cfg),
         Cf::DesertWell => gen_desert_well(ctx, rng, pos),
         Cf::RootSystem(c) => gen_root_system(ctx, rng, pos, c),
         Cf::IceSpike => gen_ice_spike(ctx, rng, pos),

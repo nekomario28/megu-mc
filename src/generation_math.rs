@@ -183,6 +183,59 @@ pub(crate) struct Xor {
     /// `RandomGenerator` forms instead, so both flavours are needed.
     legacy: bool,
 }
+/// `Mth.map(value, fromMin, fromMax, toMin, toMax)` - the unclamped linear map.
+pub(crate) fn map_f64(value: f64, from_min: f64, from_max: f64, to_min: f64, to_max: f64) -> f64 {
+    to_min + (value - from_min) * (to_max - to_min) / (from_max - from_min)
+}
+
+/// `Mth.clampedMap(double...)`: `map` clamped to the destination range (in either
+/// order - the clamp bounds are the min/max of the two destinations).
+pub(crate) fn clamped_map_f64(
+    value: f64,
+    from_min: f64,
+    from_max: f64,
+    to_min: f64,
+    to_max: f64,
+) -> f64 {
+    let v = map_f64(value, from_min, from_max, to_min, to_max);
+    let (lo, hi) = if to_min <= to_max {
+        (to_min, to_max)
+    } else {
+        (to_max, to_min)
+    };
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+/// `Mth.clampedMap(float...)` - the float overload, which the dripstone cluster's
+/// chance uses (the casts are load-bearing: the f32 division rounds differently).
+pub(crate) fn clamped_map_f32(
+    value: f32,
+    from_min: f32,
+    from_max: f32,
+    to_min: f32,
+    to_max: f32,
+) -> f32 {
+    let v = to_min + (value - from_min) * (to_max - to_min) / (from_max - from_min);
+    let (lo, hi) = if to_min <= to_max {
+        (to_min, to_max)
+    } else {
+        (to_max, to_min)
+    };
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
 impl Xor {
     pub(crate) fn seed(seed: u64) -> Self {
         let l = seed ^ 0x6A09E667F3BCC909;
