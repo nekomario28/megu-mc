@@ -11,6 +11,9 @@ pub enum Loader {
 pub struct Trample {
     pub position: (i32, i32, i32),
     pub state: u32,
+    // read by the Java adapter (java_compat.rs passes it as a JNI float), so it
+    // is only dead in builds without that feature
+    #[cfg_attr(not(feature = "java-compat"), allow(dead_code))]
     pub distance: f32,
 }
 

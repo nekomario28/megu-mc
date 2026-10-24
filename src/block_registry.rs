@@ -143,13 +143,13 @@ const FL_SOLID: u16 = 1 << 6;
 impl BReg {
     fn load() -> Option<BReg> {
         let md = jparse(&std::fs::read("assets/blocks_1211.json").ok()?)?
-            .into_arr()?
+            .as_arr()?
             .clone();
         let pb = jparse(&std::fs::read("assets/pblocks.json").ok()?)?;
-        let pb_blocks = pb.get("blocks")?.into_arr()?;
+        let pb_blocks = pb.get("blocks")?.as_arr()?;
         let property_data = jparse(&std::fs::read("assets/properties.json").ok()?)?;
         let mut property_definitions = HashMap::new();
-        for definition in property_data.into_arr()? {
+        for definition in property_data.as_arr()? {
             property_definitions.insert(jnum(definition, "hash_key")? as i64, definition);
         }
         let mut pb_by_name: HashMap<String, &J> = HashMap::new();
@@ -236,7 +236,7 @@ impl BReg {
             // answers; silk touch and fortune are handled where the block is broken.
             // 34 blocks list two drops (the potted plants drop the pot and the plant). Both are
             // read: modelling only the first lost one item per broken pot.
-            let (drop0, drop1) = match b.get("drops").and_then(|d| d.into_arr()) {
+            let (drop0, drop1) = match b.get("drops").and_then(|d| d.as_arr()) {
                 Some(a) => (
                     a.first().map(|j| j.num() as i64).unwrap_or(-1),
                     a.get(1).map(|j| j.num() as i64).unwrap_or(-1),
@@ -564,11 +564,7 @@ impl BReg {
                 .map(|q| q.vals.len().max(1) as u64)
                 .product();
             let len = p.vals.len().max(1) as u64;
-            let digit = if mult > 0 {
-                (off as u64 / mult) % len
-            } else {
-                0
-            };
+            let digit = (off as u64).checked_div(mult).map_or(0, |q| q % len);
             if let Some(nd) = p.vals.iter().position(|v| v == val) {
                 // Move this property's digit to `nd` by the difference, NOT by
                 // (nd + len - digit) % len. The offset already carries digit*mult, so
@@ -598,11 +594,7 @@ impl BReg {
                 .map(|q| q.vals.len().max(1) as u64)
                 .product();
             let len = p.vals.len().max(1) as u64;
-            let d = if mult > 0 {
-                (off as u64 / mult) % len
-            } else {
-                0
-            };
+            let d = (off as u64).checked_div(mult).map_or(0, |q| q % len);
             return p.vals.get(d as usize).cloned();
         }
         None

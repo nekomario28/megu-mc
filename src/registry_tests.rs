@@ -182,7 +182,7 @@ fn mining_time_is_the_asset_value_for_every_state() {
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
     let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
-        .into_arr()
+        .as_arr()
         .expect("the asset is an array")
         .clone();
     let mut checked = 0usize;
@@ -242,7 +242,7 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
     let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
-        .into_arr()
+        .as_arr()
         .expect("the asset is an array")
         .clone();
     let mut checked = 0usize;
@@ -330,7 +330,7 @@ fn the_correct_tool_kind_is_the_assets_material() {
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
     let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
-        .into_arr()
+        .as_arr()
         .expect("the asset is an array")
         .clone();
     let mut checked = 0usize;
@@ -471,13 +471,13 @@ fn the_drop_is_the_assets_drop_for_every_state() {
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
     let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
-        .into_arr()
+        .as_arr()
         .expect("the asset is an array")
         .clone();
     let mut checked = 0usize;
     let mut multi = 0usize;
     for b in &md {
-        let drops: Vec<i64> = match b.get("drops").and_then(|d| d.into_arr()) {
+        let drops: Vec<i64> = match b.get("drops").and_then(|d| d.as_arr()) {
             Some(a) => a.iter().map(|j| j.num() as i64).collect(),
             None => Vec::new(),
         };
@@ -549,7 +549,7 @@ fn stack_size_comes_from_the_asset_for_every_state() {
     let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
     let md = crate::json::jparse(&raw)
         .expect("the asset must parse")
-        .into_arr()
+        .as_arr()
         .expect("the asset is an array")
         .clone();
     let mut checked = 0usize;
@@ -681,7 +681,7 @@ fn light_values_come_from_the_asset_for_every_state() {
         .expect("pblocks must parse")
         .get("blocks")
         .expect("pblocks has blocks")
-        .into_arr()
+        .as_arr()
         .expect("blocks is an array")
         .clone();
     use std::collections::HashMap;
@@ -695,7 +695,7 @@ fn light_values_come_from_the_asset_for_every_state() {
     let raw_md = std::fs::read("assets/blocks_1211.json").expect("blocks_1211 must be readable");
     let md = crate::json::jparse(&raw_md)
         .expect("blocks_1211 must parse")
-        .into_arr()
+        .as_arr()
         .expect("blocks_1211 is an array")
         .clone();
     let mut checked = 0usize;
@@ -709,7 +709,7 @@ fn light_values_come_from_the_asset_for_every_state() {
         let Some(pb) = by_name.get(&name) else {
             continue;
         };
-        let Some(states) = pb.get("states").and_then(|s| s.into_arr()) else {
+        let Some(states) = pb.get("states").and_then(|s| s.as_arr()) else {
             continue;
         };
         if states.len() != n {
@@ -1078,7 +1078,7 @@ fn note_block_keeps_solid_and_light_values_for_every_instrument() {
     let raw = std::fs::read("assets/blocks_1211.json").unwrap();
     let md = crate::json::jparse(&raw).unwrap();
     let block = md
-        .into_arr()
+        .as_arr()
         .unwrap()
         .iter()
         .find(|b| crate::json::jstr(b, "name").as_deref() == Some("note_block"))

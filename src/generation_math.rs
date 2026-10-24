@@ -402,11 +402,11 @@ pub(crate) struct Lcg {
 impl Lcg {
     pub(crate) fn new(seed: u64) -> Self {
         Lcg {
-            seed: (seed ^ 0x5DEECE66D) & 0xFF_FFFF_FFFF_FF,
+            seed: (seed ^ 0x5_DEEC_E66D) & 0xFFFF_FFFF_FFFF,
         }
     }
     fn nx(&mut self, bits: u32) -> u64 {
-        self.seed = self.seed.wrapping_mul(0x5DEECE66D).wrapping_add(11) & 0xFF_FFFF_FFFF_FF;
+        self.seed = self.seed.wrapping_mul(0x5_DEEC_E66D).wrapping_add(11) & 0xFFFF_FFFF_FFFF;
         let v = self.seed >> (48 - bits);
         // CARVE_RAW=<cx>,<cz>: dump the first 16 raw next(bits) values after that
         // chunk's carver reseed, to diff against the server's RBITS trace.
@@ -528,6 +528,9 @@ fn wrap(x: f64) -> f64 {
 fn smooth(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
+// vanilla's own signature (`Mth.lerp3` takes the three weights and eight ends);
+// grouping them would invent a type the reference does not have
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn lerp3(
     a: f64,
     b: f64,
@@ -1275,7 +1278,6 @@ fn fiddle_raw(s: i64) -> f64 {
 
 /// `BiomeManager.getFiddledDistance` — a distance between the queried fractional
 /// position and one quart corner, jittered by the seed.
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn fiddled_distance(
     zoom: i64,
     bx: i32,

@@ -236,7 +236,7 @@ pub(crate) fn p_hp(j: &J) -> Option<HP> {
 
 // ---------- block state providers ----------
 
-pub(crate) enum BSP {
+pub(crate) enum Bsp {
     Simple(u32),
     Rotated {
         base: u32,
@@ -244,7 +244,7 @@ pub(crate) enum BSP {
     },
     Weighted(Vec<(i32, u32)>),
     RandomInt {
-        src: Box<BSP>,
+        src: Box<Bsp>,
         prop: String,
         vals: Vec<i32>,
     },
@@ -271,8 +271,8 @@ pub(crate) enum BSP {
         states: Vec<u32>,
     },
     RuleBased {
-        fb: Option<Box<BSP>>,
-        rules: Vec<(Pr, BSP)>,
+        fb: Option<Box<Bsp>>,
+        rules: Vec<(Pr, Bsp)>,
     },
 }
 fn noise_state(states: &[u32], v: f64) -> u32 {
@@ -280,11 +280,11 @@ fn noise_state(states: &[u32], v: f64) -> u32 {
     let val = ((1.0 + v) / 2.0).clamp(0.0, 0.9999);
     states[(val * states.len() as f64) as usize]
 }
-impl BSP {
+impl Bsp {
     pub(crate) fn get(&self, ctx: &mut FC, r: &mut Xor, x: i32, y: i32, z: i32) -> u32 {
         match self {
-            BSP::Simple(s) => *s,
-            BSP::Rotated { base, axis } => {
+            Bsp::Simple(s) => *s,
+            Bsp::Rotated { base, axis } => {
                 if !*axis {
                     *base
                 } else {
@@ -298,7 +298,7 @@ impl BSP {
                         .unwrap_or(*base)
                 }
             }
-            BSP::Weighted(list) => {
+            Bsp::Weighted(list) => {
                 let total: i32 = list.iter().map(|(w, _)| (*w).max(0)).sum();
                 if total <= 0 {
                     return list.first().map(|e| e.1).unwrap_or(0);
@@ -312,7 +312,7 @@ impl BSP {
                 }
                 list.last().unwrap().1
             }
-            BSP::RandomInt { src, prop, vals } => {
+            Bsp::RandomInt { src, prop, vals } => {
                 let st = src.get(ctx, r, x, y, z);
                 if !vals.is_empty() {
                     let i = r.next_bound(vals.len() as i32) as usize;
@@ -322,14 +322,14 @@ impl BSP {
                 }
                 st
             }
-            BSP::Noise { n, scale, states } => {
+            Bsp::Noise { n, scale, states } => {
                 if states.is_empty() {
                     return 0;
                 }
                 let v = n.get(x as f64 * scale, y as f64 * scale, z as f64 * scale);
                 noise_state(states, v)
             }
-            BSP::NoiseThr {
+            Bsp::NoiseThr {
                 n,
                 scale,
                 thr,
@@ -350,7 +350,7 @@ impl BSP {
                 }
                 *def
             }
-            BSP::Dual {
+            Bsp::Dual {
                 n,
                 scale,
                 variety,
@@ -379,7 +379,7 @@ impl BSP {
                 let v = n.get(x as f64 * scale, y as f64 * scale, z as f64 * scale);
                 noise_state(sub, v)
             }
-            BSP::RuleBased { fb, rules } => {
+            Bsp::RuleBased { fb, rules } => {
                 if let Some(reg) = breg() {
                     for (cond, prov) in rules {
                         if test_pred(cond, reg, ctx, x, y, z) {
@@ -417,10 +417,10 @@ fn st_list(j: &J, k: &str) -> Vec<u32> {
     }
     out
 }
-pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
+pub(crate) fn p_bsp(j: &J) -> Option<Bsp> {
     if let Some((n, p)) = bs_parts(j) {
         if js(j, "type").is_none() || js(j, "id").is_some() && jstr(j, "type").is_none() {
-            return Some(BSP::Simple(breg()?.state_of(&n, p)));
+            return Some(Bsp::Simple(breg()?.state_of(&n, p)));
         }
     }
     // 1.21.1 writes the rule-based provider as `{"fallback": ..., "rules": [...]}`
@@ -437,7 +437,7 @@ pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
         "rotated_block_provider" => {
             // vanilla RotatedBlockProvider randomizes the axis
             let (n, p) = bs_parts(js(j, "state")?)?;
-            BSP::Rotated {
+            Bsp::Rotated {
                 base: breg()?.state_of(&n, p),
                 axis: reg_props_axis(&n).is_some(),
             }
@@ -449,7 +449,7 @@ pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
                 let (n, p) = bs_parts(js(e, "data")?)?;
                 v.push((w, breg()?.state_of(&n, p)));
             }
-            BSP::Weighted(v)
+            Bsp::Weighted(v)
         }
         "randomized_int_state_provider" => {
             let mut vals = vec![];
@@ -458,20 +458,20 @@ pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
                     vals.push(v.num() as i32);
                 }
             }
-            BSP::RandomInt {
+            Bsp::RandomInt {
                 src: Box::new(p_bsp(js(j, "source")?)?),
                 prop: jstr(j, "property")?,
                 vals,
             }
         }
-        "noise_provider" => BSP::Noise {
+        "noise_provider" => Bsp::Noise {
             n: noise_j(j)?,
             scale: jnum(j, "scale").unwrap_or(1.0),
             states: st_list(j, "states"),
         },
         "noise_threshold_provider" => {
             let (dn, dp) = bs_parts(js(j, "default_state")?)?;
-            BSP::NoiseThr {
+            Bsp::NoiseThr {
                 n: noise_j(j)?,
                 scale: jnum(j, "scale").unwrap_or(1.0),
                 thr: jf32(j, "threshold", 0.0),
@@ -495,7 +495,7 @@ pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
                     _ => (1, 1),
                 }
             };
-            BSP::Dual {
+            Bsp::Dual {
                 n: noise_j(j)?,
                 scale: jnum(j, "scale").unwrap_or(1.0),
                 variety: pr("variety"),
@@ -515,7 +515,7 @@ pub(crate) fn p_bsp(j: &J) -> Option<BSP> {
                     }
                 }
             }
-            BSP::RuleBased {
+            Bsp::RuleBased {
                 fb: js(j, "fallback").and_then(p_bsp).map(Box::new),
                 rules,
             }

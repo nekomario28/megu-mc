@@ -6505,10 +6505,7 @@ fn block_updated(x: i32, y: i32, z: i32) {
     block_updated_inner(x, y, z);
     UPD_DEPTH.set(depth);
     if depth == 0 {
-        loop {
-            let Some((dx, dy, dz)) = UPD_DEFER.with(|d| d.borrow_mut().pop()) else {
-                break;
-            };
+        while let Some((dx, dy, dz)) = UPD_DEFER.with(|d| d.borrow_mut().pop()) {
             UPD_DEPTH.set(1);
             block_updated_inner(dx, dy, dz);
             UPD_DEPTH.set(0);
@@ -11196,7 +11193,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
         }
         let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
-        for i in 0..80 {
+        for (i, wi) in w.iter().enumerate().take(80) {
             let (f, k) = match i {
                 0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
                 20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
@@ -11208,7 +11205,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
                 .wrapping_add(f)
                 .wrapping_add(e)
                 .wrapping_add(k)
-                .wrapping_add(w[i]);
+                .wrapping_add(*wi);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -12118,10 +12115,8 @@ fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
         let nlongs = 4096 / per + if 4096 % per != 0 { 1 } else { 0 };
         write_varint(&mut v, nlongs as i64);
         let mut longs = vec![0u64; nlongs];
-        for i in 0..4096 {
-            let li = i / per;
-            let off = (i % per) * bpe;
-            longs[li] |= (idx[i] as u64) << off;
+        for (i, v) in idx.iter().enumerate().take(4096) {
+            longs[i / per] |= (*v as u64) << ((i % per) * bpe);
         }
         for l in longs {
             v.extend_from_slice(&l.to_be_bytes());
@@ -12797,10 +12792,10 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     v.extend_from_slice(&37i32.to_be_bytes());
     let per = 64 / 9;
     let mut longs = vec![0u64; 37];
-    for i in 0..256usize {
+    for (i, t) in tops.iter().enumerate().take(256) {
         let li = i / per;
         let off = (i % per) * 9;
-        let val = (tops[i] - MIN_Y).max(0) as u64; // tops already = top y+1; stored relative to min_y
+        let val = (*t - MIN_Y).max(0) as u64; // tops already = top y+1; stored relative to min_y
         if li < 37 {
             longs[li] |= (val & 0x1ff) << off;
         }
@@ -13001,6 +12996,9 @@ fn window_batch(view: i32) -> usize {
     side * side
 }
 
+// the window parameters are read together every batch; a struct would add a
+// name without removing a parameter
+#[expect(clippy::too_many_arguments)]
 fn stream_chunks(
     s: &mut TcpStream,
     sent: &mut std::collections::HashSet<(i32, i32)>,
@@ -15227,6 +15225,9 @@ fn json_smelts() -> &'static Mutex<Vec<(Ingr, i64, u8, f32)>> {
 // loot functions / item modifiers: the bounded subset with a real
 // consumer here. set_count folds into min/max at parse time.
 #[derive(Clone)]
+// the variants are the vanilla loot-function ids (set_name, set_lore, set_enchantments,
+// set_damage); shortening them would hide which function each one is
+#[allow(clippy::enum_variant_names)]
 enum LootFunc {
     SetName(String),
     SetLore(Vec<String>, bool),        // replace | append
@@ -16406,7 +16407,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                 p.extend_from_slice(&a.to_be_bytes()); p.extend_from_slice(&b.to_be_bytes()); p.extend_from_slice(&c.to_be_bytes());
                 let mut n = 0;
                 for e in &targets {
-                    if let Some(c2) = { clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned() } {
+                    let found = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                    if let Some(c2) = found {
                         if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, 0x66, p.clone()); n += 1; }
                     }
                 }
@@ -16419,7 +16421,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let payload = chat_nbt(&txt);
             let mut n = 0;
             for e in &targets {
-                if let Some(c2) = { clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned() } {
+                let found = clients().lock().unwrap().iter().find(|c2| c2.eid.to_string() == *e).cloned();
+                    if let Some(c2) = found {
                     if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, pkt_id, payload.clone()); n += 1; }
                 }
             }
@@ -16510,7 +16513,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let payload = json_component_nbt(&args[1..].join(" "));
             let mut n = 0;
             for e in &targets {
-                if let Some(c) = { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned() } {
+                let found = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                if let Some(c) = found {
                     let mut p = payload.clone(); p.push(0);
                     if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x6c, p); n += 1; }
                 }
@@ -16523,7 +16527,8 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
             let snd = args.get(2).copied().unwrap_or("");
             let mut n = 0;
             for e in &targets {
-                if let Some(c) = { clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned() } {
+                let found = clients().lock().unwrap().iter().find(|c| c.eid.to_string() == *e).cloned();
+                if let Some(c) = found {
                     let mut p = Vec::new();
                     if snd.is_empty() { p.push(0u8); }
                     else { p.push(2u8);
@@ -21797,19 +21802,17 @@ fn main() {
         eprintln!("[security] non-loopback bind: restrict access with a firewall/private network");
     }
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    for st in l.incoming() {
-        if let Ok(s) = st {
-            // connection cap: refuse above 64 live handler threads
-            if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 64 {
-                ACTIVE.fetch_sub(1, Ordering::SeqCst);
-                drop(s);
-                continue;
-            }
-            thread::spawn(move || {
-                let _slot = ConnectionSlot(&ACTIVE);
-                handle(s);
-            });
+    for s in l.incoming().flatten() {
+        // connection cap: refuse above 64 live handler threads
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 64 {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            drop(s);
+            continue;
         }
+        thread::spawn(move || {
+            let _slot = ConnectionSlot(&ACTIVE);
+            handle(s);
+        });
     }
 }
 

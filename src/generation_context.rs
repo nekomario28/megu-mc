@@ -18,7 +18,6 @@ pub(crate) struct FC<'a> {
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
     rc: HashMap<(i32, i32, i32), u32>, // terrain read-through cache
 
-    bc: HashMap<(i32, i32, i32), Option<String>>, // biome cache per quart
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
     prof: bool,
 }
@@ -28,7 +27,6 @@ impl<'a> FC<'a> {
             g,
             wr: HashMap::new(),
             rc: HashMap::new(),
-            bc: HashMap::new(),
             cc: None,
             prof: std::env::var("FEAT_PROFILE").is_ok(),
         }

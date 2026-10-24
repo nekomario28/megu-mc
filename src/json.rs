@@ -23,7 +23,7 @@ impl J {
             _ => "",
         }
     }
-    pub(crate) fn into_arr(&self) -> Option<&Vec<J>> {
+    pub(crate) fn as_arr(&self) -> Option<&Vec<J>> {
         match self {
             J::Arr(a) => Some(a),
             _ => None,
@@ -194,5 +194,5 @@ pub(crate) fn jbool(j: &J, k: &str, d: bool) -> bool {
     }
 }
 pub(crate) fn jarr<'a>(j: &'a J, k: &str) -> Option<&'a Vec<J>> {
-    js(j, k).and_then(|v| v.into_arr())
+    js(j, k).and_then(|v| v.as_arr())
 }

@@ -51,11 +51,11 @@ enum Cf {
     Disk {
         half: i32,
         radius: IP,
-        bsp: BSP,
+        bsp: Bsp,
         target: Pr,
     },
     SimpleBlock {
-        to: BSP,
+        to: Bsp,
         on: Vec<String>,
         in_: Vec<String>,
         under: Vec<String>,
@@ -99,7 +99,7 @@ enum Cf {
         extra_bottom: f32,
         extra_edge: f32,
         replaceable: String,
-        ground: BSP,
+        ground: Bsp,
         floor: bool,
         chance: f32,
         vfeat: Box<Pf>,
@@ -108,15 +108,15 @@ enum Cf {
         waterlog: bool,
     },
     BlockColumn {
-        layers: Vec<(IP, BSP)>,
+        layers: Vec<(IP, Bsp)>,
         down: bool,
         allowed: Option<Pr>,
         prio: bool,
     },
-    BlockPile(BSP),
+    BlockPile(Bsp),
     Lake {
-        fluid: BSP,
-        barrier: BSP,
+        fluid: Bsp,
+        barrier: Bsp,
     },
     BlueIce,
     BlockBlob {
@@ -140,7 +140,7 @@ enum Cf {
     Vines,
     MonsterRoom,
     Fallen {
-        trunk: BSP,
+        trunk: Bsp,
     },
     Tree(Box<crate::tree::TreeExtra>),
     Unknown(#[expect(dead_code)] String),
@@ -518,7 +518,7 @@ fn load_freg() -> FReg {
             if let Some(fs) = jarr(&j, "features") {
                 for s in fs {
                     let mut step = vec![];
-                    if let Some(arr) = s.into_arr() {
+                    if let Some(arr) = s.as_arr() {
                         for v in arr {
                             step.push(ns_name(v.str()));
                         }
@@ -584,10 +584,10 @@ fn load_freg() -> FReg {
     }
     order.reverse();
     let mut by_step: Vec<Vec<(u32, String)>> = vec![vec![]; max_steps];
-    for step in 0..max_steps {
+    for (step, slot) in by_step.iter_mut().enumerate() {
         for (gi, k) in order.iter().filter(|k| k.0 == step).enumerate() {
             if let Some(name) = name_of.get(k) {
-                by_step[step].push((gi as u32, name.clone()));
+                slot.push((gi as u32, name.clone()));
             }
         }
     }
@@ -1353,7 +1353,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             "KELP x={} z={} y0={base_y} maxh={max_height} stem={max_height} full-height head_y={}",
                             p.0,
                             p.2,
-                            base_y + max_height as i32
+                            base_y + max_height
                         );
                     }
                 } else if i > 0 {
@@ -2380,7 +2380,7 @@ struct CanyonShape {
     vertical_center: f32,
 }
 
-struct CarverReg {
+pub(crate) struct CarverReg {
     cfg: HashMap<String, CarverDef>,
     /// biome -> carver ids, in the order the biome lists them (the index is the
     /// seed offset, so the order is load-bearing)
@@ -3023,6 +3023,8 @@ impl CarveRun {
 
     /// `WorldCarver.carveEllipsoid`: clips the ellipsoid to this chunk and carves
     /// every cell inside it that the mask has not claimed and `skip` accepts.
+    // the parameters are `WorldCarver.carveEllipsoid`'s own inputs
+    #[expect(clippy::too_many_arguments)]
     fn ellipsoid(
         &mut self,
         g: &mut Gen,
@@ -3196,11 +3198,13 @@ pub(crate) fn feat_prof_record(name: &str, ns: u128) {
     e.0 += ns;
     e.1 += 1;
 }
+/// Dumps the feature-profile counters the test-gated probes fill.
+#[cfg(test)]
 pub(crate) fn feat_prof_dump() {
     let Some(m) = FEAT_PROF.get() else { return };
     let m = m.lock().unwrap();
     let mut v: Vec<(String, u128, u64)> = m.iter().map(|(k, (t, c))| (k.clone(), *t, *c)).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
     let total: u128 = v.iter().map(|x| x.1).sum();
     eprintln!("FEATPROF total={:.1}ms", total as f64 / 1e6);
     eprintln!(

@@ -283,7 +283,7 @@ pub struct Gen {
     // reach the crate root for a block state (see tools/layers_check.sh).
     bedrock_st: u32,
     // aquifer (vanilla NoiseBasedAquifer): DF ids + fluid states + caches
-    aq: Option<AQD>,
+    aq: Option<Aqd>,
     aq_lv: HashMap<(i32, i32, i32), (i32, u8)>,
     aq_lvo: Vec<(i32, i32, i32)>,
     aq_near: HashMap<(i32, i32, i32), (i32, i32, i32)>,
@@ -315,7 +315,7 @@ pub struct Gen {
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
     world_seed: u64,
 }
-struct AQD {
+struct Aqd {
     barrier: usize,
     flood: usize,
     spread: usize,
@@ -645,7 +645,7 @@ impl Gen {
             if let (Some(barrier), Some(flood), Some(spread), Some(lava), Some(excl)) =
                 (b, f, s, l, e)
             {
-                g.aq = Some(AQD {
+                g.aq = Some(Aqd {
                     barrier,
                     flood,
                     spread,
@@ -714,7 +714,7 @@ impl Gen {
         Some(match ty.as_str() {
             "sequence" => Rule::Seq(
                 j.get("sequence")?
-                    .into_arr()?
+                    .as_arr()?
                     .iter()
                     .filter_map(|c| self.rule_node(c, files, rf, cf, res))
                     .collect(),
@@ -939,7 +939,7 @@ impl Gen {
     fn parse_spline(&mut self, j: &J, files: &HashMap<String, Vec<u8>>) -> Option<Spl> {
         let coord = self.node(j.get("coordinate")?, files)?;
         let mut pts = Vec::new();
-        for p in j.get("points")?.into_arr()? {
+        for p in j.get("points")?.as_arr()? {
             let loc = p.get("location")?.num();
             let der = p.get("derivative").map(J::num).unwrap_or(0.0);
             let val = match p.get("value")? {
@@ -1025,10 +1025,10 @@ impl Gen {
             "interval_select" => {
                 let mut th = vec![];
                 let mut fns = vec![];
-                for f in j.get("functions")?.into_arr()? {
+                for f in j.get("functions")?.as_arr()? {
                     fns.push(self.node(f, files)?);
                 }
-                for t in j.get("thresholds")?.into_arr()? {
+                for t in j.get("thresholds")?.as_arr()? {
                     th.push(t.num());
                 }
                 DF::IntervalSelect {
@@ -2175,6 +2175,10 @@ impl Gen {
 
     /// Terrain-layer block state at a world position (no feature layer).
     /// Mirrors wg2_block: material window -> deep rules -> aquifer.
+    ///
+    /// Only the generation probes and the contract tests read through this: the
+    /// generator itself goes to the material rules directly.
+    #[cfg(test)]
     pub(crate) fn terrain_state(&mut self, x: i32, y: i32, z: i32) -> u32 {
         let cc = match self.cols(x >> 4, z >> 4) {
             Some(c) => c,
@@ -2480,6 +2484,7 @@ pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
 pub fn sea_level() -> i32 {
     GEN.lock().unwrap().as_ref().map(|g| g.sea).unwrap_or(63)
 }
+#[cfg(test)]
 pub fn default_state() -> u32 {
     GEN.lock().unwrap().as_ref().map(|g| g.def_st).unwrap_or(1)
 }
@@ -2488,6 +2493,7 @@ pub fn default_state() -> u32 {
 /// ore veins, deepslate gradient, underground fallback -> default block).
 /// stone_depth/fluid context is pinned "deep" — vanilla underground rules
 /// do not read them.
+#[cfg(test)]
 pub fn deep_state(x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
     let mut gg = GEN.lock().unwrap();
     match gg.as_mut() {
@@ -2958,6 +2964,7 @@ impl Gen {
 
 /// Vanilla aquifer: fluid state at a non-solid position.
 /// Some(state) = air/water/lava; None = barrier pushed it solid (material rules).
+#[cfg(test)]
 pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
     GEN.lock().unwrap().as_mut()?.aq_state(x, y, z, density)
 }
@@ -3033,7 +3040,7 @@ impl Gen {
         let def_blk = Gen::lvl_block(def.0, def.1, y);
         if y > g.aq_skip_above(x >> 4, z >> 4) {
             if aq_trace_at(x, z) {
-                eprintln!("AQD {x} {y} {z} d={density} skip {def_blk}");
+                eprintln!("Aqd {x} {y} {z} d={density} skip {def_blk}");
             }
             return Some(match def_blk {
                 1 => water,
@@ -3043,7 +3050,7 @@ impl Gen {
         }
         if def_blk == 2 {
             if aq_trace_at(x, z) {
-                eprintln!("AQD {x} {y} {z} d={density} lava");
+                eprintln!("Aqd {x} {y} {z} d={density} lava");
             }
             return Some(lava);
         }
@@ -3065,7 +3072,7 @@ impl Gen {
         }
         if sim12 <= 0.0 {
             if aq_trace_at(x, z) {
-                eprintln!("AQD {x} {y} {z} d={density} sim {blk} sim12={sim12:.4} l0={l2:?}");
+                eprintln!("Aqd {x} {y} {z} d={density} sim {blk} sim12={sim12:.4} l0={l2:?}");
             }
             return Some(match blk {
                 1 => water,
@@ -3077,7 +3084,7 @@ impl Gen {
         let pb = g.aq_pick(y - 1);
         if blk == 1 && Gen::lvl_block(pb.0, pb.1, y - 1) == 2 {
             if aq_trace_at(x, z) {
-                eprintln!("AQD {x} {y} {z} d={density} lavaunder {blk} sim12={sim12:.4} l0={l2:?}");
+                eprintln!("Aqd {x} {y} {z} d={density} lavaunder {blk} sim12={sim12:.4} l0={l2:?}");
             }
             return Some(water);
         }
@@ -3087,7 +3094,7 @@ impl Gen {
         let (mut c13, mut c23) = (0.0f64, 0.0f64);
         if density + sim12 * c12 > 0.0 {
             if aq_trace_at(x, z) {
-                eprintln!("AQD {x} {y} {z} d={density} null 12 sim={sim12:.4} c12={c12:.4} c13=0 c23=0 l0={:?} l1={:?} l2={:?}", l2, l3, (0, 0));
+                eprintln!("Aqd {x} {y} {z} d={density} null 12 sim={sim12:.4} c12={c12:.4} c13=0 c23=0 l0={:?} l1={:?} l2={:?}", l2, l3, (0, 0));
             }
             return None;
         }
@@ -3099,7 +3106,7 @@ impl Gen {
             let b13 = sim12 * sim13 * c13;
             if density + b13 > 0.0 {
                 if aq_trace_at(x, z) {
-                    eprintln!("AQD {x} {y} {z} d={density} null 13 sim={sim12:.4} c12={c12:.4} s13={sim13:.4} c13={c13:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
+                    eprintln!("Aqd {x} {y} {z} d={density} null 13 sim={sim12:.4} c12={c12:.4} s13={sim13:.4} c13={c13:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
                 }
                 return None;
             }
@@ -3110,13 +3117,13 @@ impl Gen {
             let b23 = sim12 * sim23 * c23;
             if density + b23 > 0.0 {
                 if aq_trace_at(x, z) {
-                    eprintln!("AQD {x} {y} {z} d={density} null 23 sim={sim12:.4} s23={sim23:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
+                    eprintln!("Aqd {x} {y} {z} d={density} null 23 sim={sim12:.4} s23={sim23:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
                 }
                 return None;
             }
         }
         if aq_trace_at(x, z) {
-            eprintln!("AQD {x} {y} {z} d={density} state {blk} sim={sim12:.4} c12={c12:.4} c13={c13:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
+            eprintln!("Aqd {x} {y} {z} d={density} state {blk} sim={sim12:.4} c12={c12:.4} c13={c13:.4} c23={c23:.4} l0={:?} l1={:?} l2={:?}", l2, l3, l4);
         }
         Some(match blk {
             1 => water,
@@ -3214,7 +3221,7 @@ enum BT {
 
 fn bt_params(j: &J) -> [[i32; 2]; 7] {
     let mut p = [[0i32; 2]; 7];
-    if let Some(a) = j.get("parameters").and_then(J::into_arr) {
+    if let Some(a) = j.get("parameters").and_then(J::as_arr) {
         for (i, e) in a.iter().take(7).enumerate() {
             p[i][0] = e.get("min").map(J::num).unwrap_or(0.0) as i32;
             p[i][1] = e.get("max").map(J::num).unwrap_or(0.0) as i32;
@@ -3248,7 +3255,7 @@ fn bt_parse(
         Some("branch") => {
             let ch = j
                 .get("subTree")
-                .and_then(J::into_arr)?
+                .and_then(J::as_arr)?
                 .iter()
                 .filter_map(|c| bt_parse(c, names, ids, leaf_ps))
                 .collect();
@@ -5031,7 +5038,7 @@ mod wg_tests {
                 }
             }
         }
-        eprintln!("AQDIST caves={cave} air={air} water={wat} lava={lav} solid={sol}");
+        eprintln!("AqdIST caves={cave} air={air} water={wat} lava={lav} solid={sol}");
     }
 
     #[test]
