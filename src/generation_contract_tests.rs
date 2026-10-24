@@ -485,3 +485,149 @@ fn carver_configs_parse_the_1_21_1_field_shapes() {
         ]
     );
 }
+
+/// A geode config whose shape is fully determined: one point at a fixed offset, no
+/// noise, no crack, no alternate layer, no inner placements. The decompiled
+/// `GeodeFeature` then compares `1/sqrt(distSqr + pointOffset)` against
+/// `1/sqrt(layer + points / outerWallDistance.max)`, which makes every layer a
+/// distance band around that one point.
+const GEODE_TEST_JSON: &str = r##"{
+  "type": "minecraft:geode",
+  "config": {
+    "blocks": {
+      "filling_provider": {"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:air"}},
+      "inner_layer_provider": {"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:amethyst_block"}},
+      "alternate_inner_layer_provider": {"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:budding_amethyst"}},
+      "middle_layer_provider": {"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:calcite"}},
+      "outer_layer_provider": {"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:smooth_basalt"}},
+      "inner_placements": [
+        {"Name":"minecraft:small_amethyst_bud","Properties":{"facing":"up","waterlogged":"false"}}
+      ],
+      "cannot_replace": "#minecraft:features_cannot_replace",
+      "invalid_blocks": "#minecraft:geode_invalid_blocks"
+    },
+    "layers": {"filling": 1.7, "inner_layer": 2.2, "middle_layer": 3.2, "outer_layer": 4.2},
+    "crack": {"generate_crack_chance": 0.0, "base_crack_size": 2.0, "crack_point_offset": 2},
+    "use_alternate_layer0_chance": 0.0,
+    "use_potential_placements_chance": 0.0,
+    "placements_require_layer0_alternate": true,
+    "outer_wall_distance": {"type":"minecraft:uniform","min_inclusive":1,"max_inclusive":1},
+    "distribution_points": {"type":"minecraft:uniform","min_inclusive":1,"max_inclusive":1},
+    "point_offset": {"type":"minecraft:uniform","min_inclusive":1,"max_inclusive":1},
+    "min_gen_offset": -16,
+    "max_gen_offset": 16,
+    "noise_multiplier": 0.0,
+    "invalid_blocks_threshold": 1
+  }
+}"##;
+
+/// The four layers are concentric, and which one a cell belongs to follows from the
+/// distance thresholds alone: with `d0 = points / max = 1`, a cell at squared
+/// distance `d` gets `1/sqrt(d + 1)` and the layers are `1/sqrt(1.7)`,
+/// `1/sqrt(2.2+1)`, `1/sqrt(3.2+1)` and `1/sqrt(4.2+1)` counting inwards. The
+/// expected layer of every written cell is derived here, not read back from the
+/// code, so a swapped branch, a wrong threshold, a wrong `d0` or a distance that
+/// skips `pointOffset` all fail.
+#[test]
+fn geode_layers_are_concentric_bands_around_its_points() {
+    let reg = breg().unwrap();
+    let cf = super::p_cf(&jparse(GEODE_TEST_JSON.as_bytes()).expect("json"))
+        .expect("the geode config must parse");
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let origin = (8, 8, 8);
+    let mut rng = Xor::seed(7);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, origin);
+
+    // the single point is at origin + outer_wall_distance = (9,9,9), point_offset = 1
+    let (d0, fill, inner, middle, outer) = (1.0 / 1.0, 1.7f64, 2.2f64, 3.2f64, 4.2f64);
+    let (d1, d2, d3, d4) = (
+        1.0 / fill.sqrt(),
+        1.0 / (inner + d0).sqrt(),
+        1.0 / (middle + d0).sqrt(),
+        1.0 / (outer + d0).sqrt(),
+    );
+    let expect = |x: i32, y: i32, z: i32| -> &'static str {
+        let sq = ((x - 9).pow(2) + (y - 9).pow(2) + (z - 9).pow(2)) as f64;
+        let v = 1.0 / (sq + 1.0).sqrt();
+        if v < d4 {
+            "outside"
+        } else if v >= d1 {
+            "minecraft:air"
+        } else if v >= d2 {
+            "minecraft:amethyst_block"
+        } else if v >= d3 {
+            "minecraft:calcite"
+        } else {
+            "minecraft:smooth_basalt"
+        }
+    };
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut wrong = vec![];
+    for (&(x, y, z), &st) in ctx.wr.iter() {
+        let want = expect(x, y, z);
+        *counts.entry(want).or_default() += 1;
+        if reg.name_of(st) != want {
+            wrong.push(((x, y, z), reg.name_of(st).to_string(), want));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} written cells are in the wrong layer, first few: {:?}",
+        wrong.len(),
+        ctx.wr.len(),
+        &wrong[..wrong.len().min(5)]
+    );
+    for layer in [
+        "minecraft:air",
+        "minecraft:amethyst_block",
+        "minecraft:calcite",
+        "minecraft:smooth_basalt",
+    ] {
+        assert!(
+            counts.get(layer).copied().unwrap_or(0) > 0,
+            "layer {layer} was never placed: {counts:?}"
+        );
+    }
+    assert_eq!(
+        counts.get("outside").copied().unwrap_or(0),
+        0,
+        "nothing outside the outermost threshold may be written"
+    );
+}
+
+/// `invalid_blocks_threshold` is a guard, not a filter: the first point that lands
+/// in air past the threshold abandons the whole geode, which is why an aborted one
+/// leaves no trace at all.
+#[test]
+fn geode_abandons_itself_when_a_point_lands_in_air() {
+    let reg = breg().unwrap();
+    let cf = super::p_cf(&jparse(GEODE_TEST_JSON.as_bytes()).expect("json"))
+        .expect("the geode config must parse");
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let air = reg.state_of("minecraft:air", None);
+    // the point is `origin + outer_wall_distance` = (9,9,9); make it air so the
+    // first point already counts as invalid and `0 >= threshold` cannot hold
+    ctx.set(9, 9, 9, air);
+    let cf = match cf {
+        Cf::Geode(mut g) => {
+            g.invalid_blocks_threshold = 0;
+            Cf::Geode(g)
+        }
+        _ => unreachable!("the test config is a geode"),
+    };
+    let mut rng = Xor::seed(7);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (8, 8, 8));
+    let placed = ctx
+        .wr
+        .values()
+        .filter(|&&st| {
+            matches!(
+                reg.name_of(st),
+                "minecraft:amethyst_block" | "minecraft:calcite" | "minecraft:smooth_basalt"
+            )
+        })
+        .count();
+    assert_eq!(placed, 0, "an abandoned geode must place nothing");
+}

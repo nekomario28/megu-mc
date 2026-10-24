@@ -387,3 +387,56 @@ step 単位の分解・生ドローの突き合わせ・bytecode の読みは
 2. `ore_dirt` / `ore_gravel` の blob が vanilla の**部分集合**（121 + 96 セル）。同じ
    ore 機構で他の 4 種は一致しているので、この 2 つ固有の条件（run 順が先頭、
    `size:33`）を突き合わせる。
+
+## 63. `geode` を実装した（`Cf::Geode`）と、まだ一致しない形
+
+`tools/feature_type_coverage.py` の計測で、overworld の biome から到達される未実装型は 11 件、
+`geode` は **56 biome** から到達される最大の欠落だった。`p_cf` の腕が無い型は `Cf::Unknown`
+に落ちて**何も置かない**ため、`CF_MISSING`（configured feature の解決失敗）にも出ず、
+「その biome に geode が無い」のと区別できなかった。
+
+### 実装
+
+`tools/bytecode_probe.sh` で難読名を引き（`GeodeFeature` = `eck`、設定は `eej` / `dyv` / `dyx` / `dyw`）、
+vineflower でソースに落として移植した（手順は `tools/README.md`）。要点:
+
+- `distribution_points.sample` 個の点を引き、各点を `outer_wall_distance` で3軸オフセット。
+  air か `invalid_blocks` に落ちた点が `invalid_blocks_threshold` を超えたら**配置ごと中止**。
+- `d0 = points / outer_wall_distance.max`、層の閾値は `1/sqrt(layer + d0)`（filling / inner /
+  middle / outer）。クラックは `base_crack_size + nextDouble()/2`（点が3個超なら `+d0`）。
+- 立方体の各ブロックで `d6 = Σ (1/sqrt(distSqr + pointOffset) + noise)`、**noise は点ごとに足す**。
+  `d6 < d4` は外、`d1` が filling（中空＋クラック時は隣接6方向をその流体に）、`d2` が inner
+  （`use_alternate_layer0_chance` の同じドローが結晶を吊るかの判定にも使われる）、`d3` が middle、
+  それ以外が outer。**書かない場合でも provider は呼ぶ**（ドローはそこで起きる）。
+- 結晶は `inner_placements` から1つ引き、6方向を順に試して `FACING` を向け、
+  `WATERLOGGED` は対象セルの流体から、air か**水源**の最初の方向に置く。
+- ノイズは `NormalNoise.create(rng, -4, 1.0)`。bytecode で `create(RandomSource,int,double...)` は
+  `NoiseParameters(firstOctave, amplitudes)` を作るだけ（＝1オクターブ）と確認したので
+  `normal_new_l(level_seed, -4, &[1.0])` とした。`WorldgenRandom(LegacyRandomSource)` の
+  `nextInt(bound)` は LCG では委譲される（bytecode の `instanceof dyz` 分岐）ので、素の LCG で足りる。
+
+### ゲート
+
+- `tick_tests`…ではなく `generation_contract_tests::geode_layers_are_concentric_bands_around_its_points`:
+  ノイズ0・クラック0・点1個の設定で、**各セルの属すべき層をテスト側で閾値から導出**して全セルを照合する
+  （分岐の入れ替え、閾値、`d0`、`distSqr` の `pointOffset` 抜けが落ちる）。
+- `generation_contract_tests::geode_abandons_itself_when_a_point_lands_in_air`:
+  `invalid_blocks_threshold` は閾値であってフィルタではなく、超えたら何も置かない。
+- `tools/geode_fixture.sh`（既定 seed 12 / chunk (0,0)、参照 chunks 4、geode セル 614）:
+  vanilla とセル単位で比較し、両側に geode が無ければ失敗する。
+
+### まだ一致しない（測定値）
+
+| ブロック | ours | vanilla | shared | IoU |
+|---|---|---|---|---|
+| amethyst_block | 162 | 157 | 110 | 0.53 |
+| calcite | 202 | 201 | 103 | 0.34 |
+| smooth_basalt | 237 | 256 | 74 | 0.18 |
+| 3層合計 | 601 | 614 | 287 | **0.31** |
+
+最良の平行移動（+1,0,0）でも IoU 0.389 なので、**ずれではなく形が違う**。y=-24〜-30 のスライスを
+見る限り層の並び・大きさは同じで、境界が1ブロック前後ずれる。ノイズを 0 にすると IoU 0.267、
+3倍にすると 0.074、6倍で 0.006 と単調に悪化する（＝ノイズの**向きは合っているが場が違う**）。
+次に触るなら、**port と vanilla agentのドロー列を geode の添字で突き合わせる**
+（`FSEED_ARM=cx,cz,i,step` は step 2 / i 2 が geode）か、`normal_new_l` の1オクターブ正規化を
+参照値と比べる。ここを飛ばして形を合わせにいくのは §CV1/§CV2 の失敗になる。

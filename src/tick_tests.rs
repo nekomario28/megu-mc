@@ -3213,3 +3213,24 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
         "the arrow crossed the target (the arrow ended at {arrow_x:?}) but did not hit it"
     );
 }
+
+#[test]
+fn tmp_geode_noise_scale() {
+    let n = crate::generation_math::normal_new_l(0, -4, &[1.0]);
+    let mut vs = vec![];
+    for i in 0..64 {
+        for j in 0..64 {
+            for k in 0..8 {
+                vs.push(n.get((5 + i * 3) as f64, (-32 + j) as f64, (3 + k * 3) as f64));
+            }
+        }
+    }
+    let mean = vs.iter().sum::<f64>() / vs.len() as f64;
+    let var = vs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vs.len() as f64;
+    let mn = vs.iter().cloned().fold(f64::MAX, f64::min);
+    let mx = vs.iter().cloned().fold(f64::MIN, f64::max);
+    eprintln!(
+        "GEODENOISE mean={mean:.4} sd={:.4} min={mn:.4} max={mx:.4}",
+        var.sqrt()
+    );
+}

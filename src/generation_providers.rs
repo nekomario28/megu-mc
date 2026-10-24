@@ -70,7 +70,30 @@ impl IP {
             }
         }
     }
+    /// `IntProvider.getMaxValue()`: the largest value this provider can return.
+    /// The geode's layer thresholds are `1/sqrt(layer + points/max)`, so this is a
+    /// real input rather than a bound for validation. Each arm mirrors the vanilla
+    /// provider's own `getMaxValue` (checked in the bytecode for `ClampedNormalInt`,
+    /// which returns its declared maximum rather than mean + 3 deviation: `b()`
+    /// loads field `h` and returns).
+    pub(crate) fn max_inclusive(&self) -> i32 {
+        match self {
+            IP::Const(v) => *v,
+            IP::Uniform(_, b)
+            | IP::BiasBottom(_, b)
+            | IP::VeryBias(_, b, _)
+            | IP::Trap(_, b, _) => *b,
+            IP::Clamped(_, _, hi) => *hi,
+            IP::Norm(_, _, _, hi) => *hi,
+            IP::Weighted(list) => list
+                .iter()
+                .map(|(_, p)| p.max_inclusive())
+                .max()
+                .unwrap_or(0),
+        }
+    }
 }
+
 pub(crate) fn p_ip(j: &J) -> Option<IP> {
     if let J::Num(n) = j {
         return Some(IP::Const(*n as i32));

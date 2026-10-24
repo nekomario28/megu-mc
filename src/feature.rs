@@ -67,6 +67,7 @@ enum Cf {
         hole: i32,
         valid: HashSet<String>,
     },
+    Geode(Box<GeodeCfg>),
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
     /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
     /// `nextInt(xz+1) - nextInt(xz+1)` per horizontal axis and the same with
@@ -202,6 +203,219 @@ fn p_pf(j: &J) -> Option<Pf> {
     })
 }
 
+/// `minecraft:geode` (`eck`, `GeodeFeature`), read from the decompiled 1.21.1
+/// class and its config records (`eej`/`dyv`/`dyx`/`dyw` in the mappings):
+///
+/// - `distribution_points.sample` points are drawn, each offset by
+///   `outer_wall_distance` on all three axes, rejected outright when more than
+///   `invalid_blocks_threshold` of them land in air or in `invalid_blocks`;
+/// - `d0 = points / outer_wall_distance.max` and the layer thresholds are
+///   `1/sqrt(layer + d0)` for inner/middle/outer (the crack uses
+///   `base_crack_size + random.nextDouble()/2` and adds `d0` only when there are
+///   more than three points);
+/// - every block of the `[min_gen_offset, max_gen_offset]` cube gets
+///   `d6 = sum over points of 1/sqrt(distSqr + point_offset) + noise` where the
+///   *noise term is added once per point*, `d7` the same over the crack points;
+/// - `d6 < d4` is outside, then the branches are `d1` (the filling provider: the
+///   hollow core, and with a crack the six neighbours are replaced by their
+///   fluid), `d2` (inner, or the alternate inner at `use_alternate_layer0_chance`
+///   - that same draw also decides whether the block becomes an inner placement
+///   to hang a crystal on), `d3` (middle) and `d4` (outer);
+/// - a block is only written where the existing block is *not* in
+///   `cannot_replace`, but the provider is asked for its state either way, which
+///   is where the draw happens;
+/// - crystals are placed from `inner_placements`, aimed at each of the six
+///   directions in turn, `WATERLOGGED` from the target's fluid, and stop at the
+///   first direction whose target is air or a water source.
+struct GeodeCfg {
+    filling: Bsp,
+    inner: Bsp,
+    alt_inner: Bsp,
+    middle: Bsp,
+    outer: Bsp,
+    placements: Vec<u32>,
+    cannot_replace: String,
+    invalid: String,
+    layers: [f64; 4], // filling, inner, middle, outer
+    crack_chance: f64,
+    crack_size: f64,
+    crack_offset: i32,
+    use_alt_layer0: f64,
+    use_potential_placements: f64,
+    placements_require_alt: bool,
+    outer_wall_distance: IP,
+    distribution_points: IP,
+    point_offset: IP,
+    min_gen_offset: i32,
+    max_gen_offset: i32,
+    noise_multiplier: f64,
+    invalid_blocks_threshold: i32,
+}
+
+/// `GeodeFeature.placeBlock`: the write is skipped when the existing block is in
+/// `cannot_replace`, and the caller has already asked the provider for its state.
+fn geode_place(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &str) {
+    let Some(reg) = breg() else { return };
+    if ctx.out_of_h(p.1) {
+        return;
+    }
+    if !reg.in_tag(ctx.get(p.0, p.1, p.2), cannot_replace) {
+        ctx.set(p.0, p.1, p.2, st);
+    }
+}
+
+fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg) {
+    let Some(reg) = breg() else { return };
+    let points_n = g.distribution_points.get(rng);
+    let noise = crate::generation_math::normal_new_l(ctx.g.wseed(), -4, &[1.0]);
+    let d0 = points_n as f64 / g.outer_wall_distance.max_inclusive().max(1) as f64;
+    let d1 = 1.0 / g.layers[0].sqrt();
+    let d2 = 1.0 / (g.layers[1] + d0).sqrt();
+    let d3 = 1.0 / (g.layers[2] + d0).sqrt();
+    let d4 = 1.0 / (g.layers[3] + d0).sqrt();
+    let d5 =
+        1.0 / (g.crack_size + rng.next_f64() / 2.0 + if points_n > 3 { d0 } else { 0.0 }).sqrt();
+    let has_crack = (rng.next_f32() as f64) < g.crack_chance;
+
+    let mut points: Vec<((i32, i32, i32), i32)> = Vec::with_capacity(points_n.max(0) as usize);
+    let mut invalid = 0;
+    for _ in 0..points_n.max(0) {
+        let p = (
+            origin.0 + g.outer_wall_distance.get(rng),
+            origin.1 + g.outer_wall_distance.get(rng),
+            origin.2 + g.outer_wall_distance.get(rng),
+        );
+        let st = ctx.get(p.0, p.1, p.2);
+        if reg.is_air(st) || reg.in_tag(st, &g.invalid) {
+            invalid += 1;
+            if invalid > g.invalid_blocks_threshold {
+                return;
+            }
+        }
+        points.push((p, g.point_offset.get(rng)));
+    }
+
+    let mut crack_points: Vec<(i32, i32, i32)> = Vec::new();
+    if has_crack {
+        let ext = points_n * 2 + 1;
+        let offsets = match rng.next_bound(4) {
+            0 => [(ext, 7, 0), (ext, 5, 0), (ext, 1, 0)],
+            1 => [(0, 7, ext), (0, 5, ext), (0, 1, ext)],
+            2 => [(ext, 7, ext), (ext, 5, ext), (ext, 1, ext)],
+            _ => [(0, 7, 0), (0, 5, 0), (0, 1, 0)],
+        };
+        for (a, b, c) in offsets {
+            crack_points.push((origin.0 + a, origin.1 + b, origin.2 + c));
+        }
+    }
+
+    let dist_sqr = |p: (i32, i32, i32), q: (i32, i32, i32)| {
+        let (dx, dy, dz) = ((p.0 - q.0) as f64, (p.1 - q.1) as f64, (p.2 - q.2) as f64);
+        dx * dx + dy * dy + dz * dz
+    };
+    let mut inner_placements: Vec<(i32, i32, i32)> = Vec::new();
+    for x in (origin.0 + g.min_gen_offset)..=(origin.0 + g.max_gen_offset) {
+        for y in (origin.1 + g.min_gen_offset)..=(origin.1 + g.max_gen_offset) {
+            for z in (origin.2 + g.min_gen_offset)..=(origin.2 + g.max_gen_offset) {
+                let at = (x, y, z);
+                let noise_v = noise.get(x as f64, y as f64, z as f64) * g.noise_multiplier;
+                let mut d6 = 0.0;
+                for (p, off) in points.iter() {
+                    d6 += 1.0 / (dist_sqr(at, *p) + *off as f64).sqrt() + noise_v;
+                }
+                let mut d7 = 0.0;
+                for cp in crack_points.iter() {
+                    d7 += 1.0 / (dist_sqr(at, *cp) + g.crack_offset as f64).sqrt() + noise_v;
+                }
+                if d6 < d4 {
+                    continue;
+                }
+                if has_crack && d7 >= d5 && d6 < d1 {
+                    let st = g.filling.get(ctx, rng, x, y, z);
+                    geode_place(ctx, at, st, &g.cannot_replace);
+                    for (dx, dy, dz) in [
+                        (0, -1, 0),
+                        (0, 1, 0),
+                        (0, 0, -1),
+                        (0, 0, 1),
+                        (-1, 0, 0),
+                        (1, 0, 0),
+                    ] {
+                        let np = (x + dx, y + dy, z + dz);
+                        if !ctx.out_of_h(np.1) {
+                            let ns = ctx.get(np.0, np.1, np.2);
+                            if !reg.is_air(ns) {
+                                // vanilla writes the neighbour's fluid legacy block: a
+                                // fluid keeps its own state, anything else becomes air
+                                let air = reg.state_of("minecraft:air", None);
+                                ctx.set(np.0, np.1, np.2, if reg.is_liquid(ns) { ns } else { air });
+                            }
+                        }
+                    }
+                } else if d6 >= d1 {
+                    let st = g.filling.get(ctx, rng, x, y, z);
+                    geode_place(ctx, at, st, &g.cannot_replace);
+                } else if d6 >= d2 {
+                    let alt = (rng.next_f32() as f64) < g.use_alt_layer0;
+                    let st = if alt {
+                        g.alt_inner.get(ctx, rng, x, y, z)
+                    } else {
+                        g.inner.get(ctx, rng, x, y, z)
+                    };
+                    geode_place(ctx, at, st, &g.cannot_replace);
+                    if (!g.placements_require_alt || alt)
+                        && (rng.next_f32() as f64) < g.use_potential_placements
+                    {
+                        inner_placements.push(at);
+                    }
+                } else if d6 >= d3 {
+                    let st = g.middle.get(ctx, rng, x, y, z);
+                    geode_place(ctx, at, st, &g.cannot_replace);
+                } else {
+                    let st = g.outer.get(ctx, rng, x, y, z);
+                    geode_place(ctx, at, st, &g.cannot_replace);
+                }
+            }
+        }
+    }
+
+    if g.placements.is_empty() {
+        return;
+    }
+    const DIRS: [(i32, i32, i32, &str); 6] = [
+        (0, -1, 0, "down"),
+        (0, 1, 0, "up"),
+        (0, 0, -1, "north"),
+        (0, 0, 1, "south"),
+        (-1, 0, 0, "west"),
+        (1, 0, 0, "east"),
+    ];
+    for p in inner_placements {
+        let mut st = g.placements[rng.next_bound(g.placements.len() as i32) as usize];
+        for (dx, dy, dz, dir) in DIRS {
+            if reg.has_prop(reg.name_of(st), "facing") {
+                st = reg.with_prop(st, "facing", dir);
+            }
+            let np = (p.0 + dx, p.1 + dy, p.2 + dz);
+            if ctx.out_of_h(np.1) {
+                continue;
+            }
+            let ns = ctx.get(np.0, np.1, np.2);
+            if reg.has_prop(reg.name_of(st), "waterlogged") {
+                let wl = if reg.is_liquid(ns) { "true" } else { "false" };
+                st = reg.with_prop(st, "waterlogged", wl);
+            }
+            // `BuddingAmethystBlock.canClusterGrowAtState`: air, or a water *source*
+            let water_source =
+                reg.is_liquid(ns) && reg.get_prop(ns, "level").map(|l| l == "0").unwrap_or(false);
+            if reg.is_air(ns) || water_source {
+                ctx.set(np.0, np.1, np.2, st);
+                break;
+            }
+        }
+    }
+}
+
 fn p_cf(j: &J) -> Option<Cf> {
     let ty = jstr(j, "type")?;
     // 1.21.1 wraps a configured feature's parameters in a "config" object;
@@ -229,6 +443,55 @@ fn p_cf(j: &J) -> Option<Cf> {
             bsp: p_bsp(js(j, "state_provider")?)?,
             target: p_pred(js(j, "target")?)?,
         },
+        "geode" => {
+            let b = js(j, "blocks")?;
+            let lay = js(j, "layers")?;
+            let crack = js(j, "crack")?;
+            let tag = |k: &str| -> Option<String> {
+                Some(
+                    ns_name(js(b, k)?.str().trim_start_matches('#'))
+                        .trim_start_matches('#')
+                        .to_string(),
+                )
+            };
+            let mut placements = vec![];
+            for p in jarr(b, "inner_placements")
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+            {
+                let (n, pr) = bs_parts(p)?;
+                placements.push(breg()?.state_of(&n, pr));
+            }
+            Cf::Geode(Box::new(GeodeCfg {
+                filling: p_bsp(js(b, "filling_provider")?)?,
+                inner: p_bsp(js(b, "inner_layer_provider")?)?,
+                alt_inner: p_bsp(js(b, "alternate_inner_layer_provider")?)?,
+                middle: p_bsp(js(b, "middle_layer_provider")?)?,
+                outer: p_bsp(js(b, "outer_layer_provider")?)?,
+                placements,
+                cannot_replace: tag("cannot_replace")?,
+                invalid: tag("invalid_blocks")?,
+                layers: [
+                    jnum(lay, "filling")?,
+                    jnum(lay, "inner_layer")?,
+                    jnum(lay, "middle_layer")?,
+                    jnum(lay, "outer_layer")?,
+                ],
+                crack_chance: jnum(crack, "generate_crack_chance")?,
+                crack_size: jnum(crack, "base_crack_size")?,
+                crack_offset: jint(crack, "crack_point_offset", 0),
+                use_alt_layer0: jnum(j, "use_alternate_layer0_chance")?,
+                use_potential_placements: jnum(j, "use_potential_placements_chance")?,
+                placements_require_alt: jbool(j, "placements_require_layer0_alternate", true),
+                outer_wall_distance: p_ip(js(j, "outer_wall_distance")?)?,
+                distribution_points: p_ip(js(j, "distribution_points")?)?,
+                point_offset: p_ip(js(j, "point_offset")?)?,
+                min_gen_offset: jint(j, "min_gen_offset", 0),
+                max_gen_offset: jint(j, "max_gen_offset", 0),
+                noise_multiplier: jnum(j, "noise_multiplier")?,
+                invalid_blocks_threshold: jint(j, "invalid_blocks_threshold", 0),
+            }))
+        }
         "simple_block" => Cf::SimpleBlock {
             to: p_bsp(js(j, "to_place")?)?,
             on: name_list(j, "can_place_on"),
@@ -1118,6 +1381,7 @@ pub(crate) fn ore_cells_for_test(
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::Geode(g) => gen_geode(ctx, rng, pos, g),
         Cf::Tree(t) => {
             if let Ok(spec) = std::env::var("TREE_TRACE") {
                 // same one-chunk radius as the agent's -Dtreechunk
