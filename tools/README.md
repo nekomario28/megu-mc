@@ -32,7 +32,7 @@
 | 変数 | 何が出るか |
 |---|---|
 | `MC_SPINE_WG_PROFILE=n` | `n×n` chunk を処理する**offline診断モード**。診断用envだけを付けて通常起動すると、サーバーがlistenし続けるので、先にこのモードを指定し、終了ログを確認する |
-| `MC_SPINE_WG_DUMP/_N/_X/_Z` | offline mode 内で block state dump（比較の入力） |
+| `MC_SPINE_WG_DUMP/_N/_X/_Z` | offline mode 内で block state dump（比較の入力）。**hot region の外では返らない**（実測: spawn から172 chunk で wall 240s / user 0.3s = 計算せず待っている、79 chunk なら5s）。遠い領域の固定具はこれを使えないので、先に `populate` の待ちを診断するか、領域を hot region 内に取る |
 | `MC_SPINE_WG_DUMP_HM=<path>` | 同じ領域の各列の OCEAN_FLOOR 高さ（絶対y、256×i32/chunk）を書く。`heightmap_diff.py` の参照と対にする |
 | `MC_SPINE_NOFEAT` / `_NOCARVE` / `_NOAQ` | 層を止めて帰属を分ける |
 | `MC_SPINE_FEAT_NBR=0` | 隣 chunk を decorate しない（順序の実験用） |
