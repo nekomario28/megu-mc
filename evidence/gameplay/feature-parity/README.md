@@ -500,3 +500,35 @@ ticket と worker のスケジュール）がそのまま出ている。つま�
 動かなかったのも同じ理由で説明できる（高さではなく先行状態の問題だった）。
 
 次に触るならこの固定具。`-Ddecoorder` の実測（この節）と `tools/kelp_fixture.sh` が入口。
+
+## 65. `sea_pickle` を実装した（`Cf::SeaPickle`）と、到達測定が塞がっている理由
+
+未実装の到達型 10 件のうち最も小さい `minecraft:sea_pickle`（`edj`、`SeaPickleFeature`）を移植した。
+
+- 設定は `CountConfiguration`（`{"count": 20}`）。`count` 回、`nextInt(8) - nextInt(8)` を x と z に
+  それぞれ2回引いて ±8 のオフセットを作り、その列の `OCEAN_FLOOR` 高さを取り、
+  **その後に** `nextInt(4) + 1` を引いて pickle 数にする（＝拒否される試行もドローを消費する）。
+- 生存条件は2つ: 対象セルが `minecraft:water` であること、下のブロックが
+  `SeaPickleBlock.mayPlaceOn`（`dmw.b`: UP の衝突面が空でない、または magma）を満たすこと。
+  port では seagrass と同じ `side_solid(below, 1)` に magma を加えた形。
+- 置く状態は `SeaPickleBlock` の既定（`pickles=1 waterlogged=true`）に `pickles` だけを上書きする
+  （bytecode の `this.k(this.E.b().a(c, 1).a(d, true))` で確認。既定は waterlogged=**true**）。
+
+ゲート: `sea_pickle_places_on_water_over_a_solid_top_face_and_draws_first`（海面パッチで2個置かれ、
+`pickles` が 1..4、`waterlogged=true`、y が列の OCEAN_FLOOR、下が固体上面、そして
+**RNG が試行あたり5ドロー×2 だけ進む**こと）と
+`sea_pickle_skips_cells_that_are_not_water`（air パッチでは何も置かず、それでも10ドロー消費）。
+型カバレッジの未実装到達型は 10 → **9**。
+
+### 到達/parity の測定が塞がっている（2つの理由、どちらも実測）
+
+1. `sea_pickle` は `warm_ocean` の step 9 にしか無い。spawn 近傍（±800）を seed 0,1,2,3,4,5,6,7,8,9,10,11,13,17,21 で
+   走査して warm_ocean は1つも無く、seed 0 で見つかったのは (-250,-2750)（spawn から172 chunk）だった。
+2. その遠さだと **port の offline dump が返ってこない**: `MC_SPINE_WG_DUMP_X=-16 …_Z=-172` は
+   wall 240 秒で `user 0m0.319s`（＝計算していない、待っている）。近い領域（kelp 固定具の (79,-1)、
+   79 chunk）は 5 秒で終わる。port の hot region の外では `populate` が待ちに入るらしく、
+   **dump ベースの固定具は hot region の外では作れない**（これは今回の変更とは別の、それ自体報告に値する事項）。
+
+次に測るなら、① hot region の外でも dump が進むようにする（`populate` の待ちを診断）か、
+② warm_ocean が spawn 近くにある seed を探して `tools/geode_fixture.sh` の形（ブロック4種を
+`sea_pickle` 1種に変えるだけ）で parity を取る、のどちらか。

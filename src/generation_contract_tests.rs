@@ -670,3 +670,135 @@ fn heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface() {
     );
     let _ = stone;
 }
+
+/// `minecraft:sea_pickle` (`edj`): `count` attempts, each `nextInt(8) - nextInt(8)`
+/// on both horizontal axes, the OCEAN_FLOOR height at that column, then a
+/// `nextInt(4) + 1` pickle count *before* the two survival tests. The count here is
+/// 2 so both the placements and the draws are pinned.
+const SEA_PICKLE_TEST_JSON: &str = r#"{
+  "type": "minecraft:sea_pickle",
+  "config": { "count": 2 }
+}"#;
+
+fn sea_pickle_cf() -> Cf {
+    super::p_cf(&jparse(SEA_PICKLE_TEST_JSON.as_bytes()).expect("json"))
+        .expect("the sea pickle config must parse")
+}
+
+/// The two tests are ordered after the pickle-count draw, so a rejected attempt
+/// still consumes its five draws. Both halves are checked: an ocean patch where
+/// both attempts land, and the generated terrain around it where neither does.
+#[test]
+fn sea_pickle_places_on_water_over_a_solid_top_face_and_draws_first() {
+    let reg = breg().unwrap();
+    let water = reg.state_of("minecraft:water", None);
+    let sand = reg.state_of("minecraft:sand", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (1280, 0); // lukewarm_ocean for seed 0
+
+    // a flat patch: sand with water above, everywhere the offsets can reach
+    for dx in -8..=8 {
+        for dz in -8..=8 {
+            let (px, pz) = (x + dx, z + dz);
+            let fy = ctx.hm_oc_terrain(px, pz);
+            ctx.set(px, fy - 1, pz, sand);
+            for y in fy..=fy + 4 {
+                ctx.set(px, y, pz, water);
+            }
+        }
+    }
+    let mut rng = Xor::seed(3);
+    gen_cf(&sea_pickle_cf(), freg(), &mut ctx, &mut rng, (x, 0, z));
+
+    let placed: Vec<((i32, i32, i32), u32)> = ctx
+        .wr
+        .iter()
+        .filter(|(_, &st)| reg.name_of(st) == "minecraft:sea_pickle")
+        .map(|(&p, &st)| (p, st))
+        .collect();
+    assert_eq!(
+        placed.len(),
+        2,
+        "both attempts land on prepared water: {placed:?}"
+    );
+    for ((px, py, pz), st) in &placed {
+        let pickles = reg.get_prop(*st, "pickles").expect("pickles property");
+        assert!(
+            (1..=4).contains(&pickles.parse::<i32>().unwrap()),
+            "pickles must come from nextInt(4) + 1, got {pickles}"
+        );
+        assert_eq!(
+            reg.get_prop(*st, "waterlogged").as_deref(),
+            Some("true"),
+            "the default sea pickle is waterlogged"
+        );
+        assert_eq!(
+            *py,
+            ctx.hm_oc_terrain(*px, *pz),
+            "the pickle sits at the column's OCEAN_FLOOR height"
+        );
+        assert!(
+            reg.side_solid(ctx.get(*px, py - 1, *pz), 1),
+            "the block below must have a solid top face"
+        );
+    }
+
+    // two attempts, five bound draws each (dx twice, dz twice, pickles once)
+    let mut expect = Xor::seed(3);
+    for _ in 0..10 {
+        let v = expect.next_bound(8);
+        let _ = v;
+    }
+    assert_eq!(
+        rng.next_bound(1 << 30),
+        expect.next_bound(1 << 30),
+        "the stream must advance by exactly two attempts of five draws"
+    );
+}
+
+/// The other half of the same rule: where the drawn cell is not water, nothing is
+/// placed and the draws are still spent. The patch is filled with air rather than
+/// left as generated - the origin is lukewarm_ocean, so its own terrain would be
+/// water and the attempt would legitimately succeed.
+#[test]
+fn sea_pickle_skips_cells_that_are_not_water() {
+    let reg = breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (1280, 0);
+    for dx in -8..=8 {
+        for dz in -8..=8 {
+            let (px, pz) = (x + dx, z + dz);
+            let fy = ctx.hm_oc_terrain(px, pz);
+            for y in fy..=fy + 4 {
+                ctx.set(px, y, pz, air);
+            }
+        }
+    }
+    let before = ctx.wr.len();
+    let mut rng = Xor::seed(3);
+    gen_cf(&sea_pickle_cf(), freg(), &mut ctx, &mut rng, (x, 0, z));
+    let pickles = ctx
+        .wr
+        .iter()
+        .filter(|(_, &st)| reg.name_of(st) == "minecraft:sea_pickle")
+        .count();
+    assert_eq!(pickles, 0, "nothing may be placed on unprepared terrain");
+    assert_eq!(
+        ctx.wr.len(),
+        before,
+        "a skipped attempt writes nothing at all"
+    );
+    let mut expect = Xor::seed(3);
+    for _ in 0..10 {
+        let v = expect.next_bound(8);
+        let _ = v;
+    }
+    assert_eq!(
+        rng.next_bound(1 << 30),
+        expect.next_bound(1 << 30),
+        "the skipped attempts still spent their draws"
+    );
+}

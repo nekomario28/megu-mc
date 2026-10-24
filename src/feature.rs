@@ -67,6 +67,14 @@ enum Cf {
         hole: i32,
         valid: HashSet<String>,
     },
+    /// `minecraft:sea_pickle` (`edj`, `SeaPickleFeature`): `count` attempts, each
+    /// drawing two `nextInt(8)` apart for an offset in +-8, taking the OCEAN_FLOOR
+    /// height there, then drawing the pickle count 1..4 *before* the two survival
+    /// tests (the target must be water, and the block below must satisfy
+    /// `SeaPickleBlock.mayPlaceOn`: a non-empty UP collision face, or magma).
+    SeaPickle {
+        count: IP,
+    },
     Geode(Box<GeodeCfg>),
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
     /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
@@ -492,6 +500,9 @@ fn p_cf(j: &J) -> Option<Cf> {
                 invalid_blocks_threshold: jint(j, "invalid_blocks_threshold", 0),
             }))
         }
+        "sea_pickle" => Cf::SeaPickle {
+            count: p_ip(js(j, "count")?)?,
+        },
         "simple_block" => Cf::SimpleBlock {
             to: p_bsp(js(j, "to_place")?)?,
             on: name_list(j, "can_place_on"),
@@ -1381,6 +1392,38 @@ pub(crate) fn ore_cells_for_test(
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::SeaPickle { count } => {
+            let Some(reg) = breg() else { return };
+            let water = reg.state_of("minecraft:water", None);
+            let n = count.get(rng);
+            for _ in 0..n.max(0) {
+                let dx = rng.next_bound(8) - rng.next_bound(8);
+                let dz = rng.next_bound(8) - rng.next_bound(8);
+                let (x, z) = (pos.0 + dx, pos.2 + dz);
+                let y = ctx.hm_oc(x, z);
+                // the pickles draw comes before both survival tests, so a rejected
+                // cell still moves the stream
+                let pickles = rng.next_bound(4) + 1;
+                if ctx.out_of_h(y) || y <= crate::worldgen::min_y() {
+                    continue;
+                }
+                if ctx.get(x, y, z) != water {
+                    continue;
+                }
+                let below = ctx.get(x, y - 1, z);
+                if !(reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block") {
+                    continue;
+                }
+                // `SeaPickleBlock`'s default state is pickles=1 waterlogged=true, and
+                // the feature only sets pickles
+                let props = J::Obj(vec![
+                    ("pickles".to_string(), J::Str(pickles.to_string())),
+                    ("waterlogged".to_string(), J::Str("true".to_string())),
+                ]);
+                let st = reg.state_of("minecraft:sea_pickle", Some(&props));
+                ctx.set(x, y, z, st);
+            }
+        }
         Cf::Geode(g) => gen_geode(ctx, rng, pos, g),
         Cf::Tree(t) => {
             if let Ok(spec) = std::env::var("TREE_TRACE") {
