@@ -578,3 +578,43 @@ Java の `!(a > b)` は NaN で真、Rust の `<=` は偽なので、否定の�
 次に触るなら `root_system`（純ロジック最小、木の placed feature 参照は `gen_pf` で既にある）、
 その次が `dripstone_cluster`/`large_dripstone`（クラスタ系）。`fossil` は構造物基盤を入れるまで着手しない。
 `desert_well` は block entity の loot table まで含めて扱えるときに。
+
+## 68. `root_system` を実装した（`Cf::RootSystem`）— ゲートは規則の単位テストまで
+
+`RootSystemFeature`（`edg`、config は 12 フィールド）を逆コンパイルして移植した。
+
+- 原点が空気でなければ即 false（**ドロー前**）。上へ1つずつ動かしながら
+  `allowed_tree_position` と `required_vertical_space_for_tree` を通る位置を探し、
+  足元が溶岩流体でなく `isSolid` であることを確認してから、入れ子の placed feature（木）を走らせる。
+  木が置けたら `origin.y` からその位置までの**根の柱**を作り、最後に**垂れ根**を周囲に撒く
+  （垂れ根は「木が置けたときだけ」＝vanilla の `if (placeRootsAndTree(...))`）。
+- 根の柱は 1層ごとに `root_placement_attempts` 回、中心から `±root_radius` の dx,dz を引いて
+  `root_replaceable` タグのセルだけを provider の状態に置き換える（タグに合わなければ**ドローしない**）。
+- 垂れ根は 3軸オフセット（各 `nextInt(span) - nextInt(span)`）を引き、空気セルで、かつ
+  **上のブロックが下面 solid** のときだけ置く（`HangingRootsBlock.canSurvive` と同じ条件なので1つのテストで足りる）。
+
+移植前に公式 mappings で解決した難読名（推測すると全部間違える種類）:
+`BlockPos.d()`=`above()`, `e()`=`below()`, `BlockState.i()`=`isAir()`, **`BlockState.e()`=`isSolid()`**
+（`isAir` ではない）, `LevelReader.u(pos)`=`isEmptyBlock`, `FluidTags.a`/`b`=`WATER`/`LAVA`。
+
+移植中に踏んだ罠: **`ctx.wr` はマップなので、既存セルへの上書きは `len()` を変えない**。
+「木が置けたか」を `wr.len()` の増分で判定していたため、置けていても0と読めた。マップ全体の比較
+（`let before = ctx.wr.clone(); ...; ctx.wr != before`）に変えて意味が通るようになった。
+
+### ゲート（現時点で主張できる範囲）
+
+- `root_system_vertical_water_allowance_follows_the_config`: `isValidVerticalState` の規則
+  （空気は常に可／水は `i + 1 <= allowed_vertical_water_for_tree` まで／その他は不可）と
+  `FluidTags.WATER`/`LAVA` の述語を単体で固定。
+- `root_system_does_nothing_when_its_origin_is_not_air`: 埋まった原点では何も置かず、**1ドローも消費しない**。
+- 型カバレッジの未実装到達型は 8 → **7**（`fossil` `iceberg` `sculk_patch` `desert_well`
+  `dripstone_cluster` `large_dripstone` `speleothem_cluster`）。clippy 0。
+
+### 未解決（正直に）
+
+**木→根の柱→垂れ根の end-to-end は未検証**。この固定具では入れ子の placed feature が何も書かず
+（inline `disk` と inline `simple_block` を、それぞれ候補位置で直接走らせても書き込み0）、
+その原因（harness 側か、port の `gen_cf` の当該アームの前提か）を切り分けていない。
+そのため parity も未測定で、上の2つのテストは「規則」と「入口」だけを固定している。
+次に触るなら、まず harness で入れ子 feature が書く最小例を作る（実在の `minecraft:oak` も
+この合成地形では0だったので、地形の作り方＝床/天井の高さや `ctx` の状態が疑わしい）。

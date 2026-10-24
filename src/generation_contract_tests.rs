@@ -909,3 +909,73 @@ fn ice_spike_does_nothing_without_snow() {
         "and draws nothing"
     );
 }
+
+/// `minecraft:root_system` (`edg`): the ported *rules*, unit-tested because they are
+/// where the obfuscated readings went wrong (`BlockState.e()` is `isSolid()`, not
+/// `isAir()`; `FluidTags.a`/`b` are WATER/LAVA).
+///
+/// The end-to-end path (tree placed -> root column -> hanging roots) is not covered
+/// here: it needs the nested placed feature to write, and in this harness the
+/// synthetic nested features tried (an inline `disk` and an inline `simple_block`,
+/// each also run directly at the candidate position) wrote nothing even though the
+/// target blocks were present. That is an open harness question, recorded in
+/// evidence/gameplay/feature-parity/README.md, not a claim about this feature.
+#[test]
+fn root_system_vertical_water_allowance_follows_the_config() {
+    let reg = breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let water = reg.state_of("minecraft:water", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    // air is always fine
+    assert!(super::root_valid_vertical(reg, air, 1, 2));
+    assert!(super::root_valid_vertical(reg, air, 9, 2));
+    // water only up to allowed_vertical_water_for_tree, counted from the base
+    assert!(super::root_valid_vertical(reg, water, 1, 2));
+    assert!(
+        !super::root_valid_vertical(reg, water, 2, 2),
+        "i + 1 <= max_water, so index 2 is past an allowance of 2"
+    );
+    assert!(!super::root_valid_vertical(reg, water, 1, 0));
+    // anything else is not a valid vertical state at all
+    assert!(!super::root_valid_vertical(reg, stone, 1, 2));
+    // and the fluid predicates separate the two tags
+    assert!(super::is_water_fluid(reg, water));
+    assert!(!super::is_lava_fluid(reg, water));
+    let lava = reg.state_of("minecraft:lava", None);
+    assert!(super::is_lava_fluid(reg, lava));
+    assert!(!super::is_water_fluid(reg, lava));
+}
+
+/// The origin must be air: a root system under a solid block returns immediately,
+/// before a single draw (the check is the first statement in vanilla's `place`).
+#[test]
+fn root_system_does_nothing_when_its_origin_is_not_air() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let cf = {
+        let text = std::fs::read_to_string(
+            "datapacks/vanilla/data/minecraft/worldgen/feature/rooted_azalea_tree.json",
+        )
+        .expect("the pack's rooted_azalea_tree config");
+        super::p_cf(&jparse(text.as_bytes()).expect("json")).expect("the config must parse")
+    };
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (8, 8);
+    for dx in -8..=8 {
+        for dz in -8..=8 {
+            for y in 60..=90 {
+                ctx.set(x + dx, y, z + dz, stone);
+            }
+        }
+    }
+    let before = ctx.wr.len();
+    let mut rng = Xor::seed(5);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (x, 70, z));
+    assert_eq!(ctx.wr.len(), before, "a buried origin places nothing");
+    assert_eq!(
+        rng.next_bound(1 << 30),
+        Xor::seed(5).next_bound(1 << 30),
+        "and draws nothing"
+    );
+}

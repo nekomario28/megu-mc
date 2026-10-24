@@ -81,6 +81,13 @@ enum Cf {
     /// spike and a downward drill that replaces snow/powder/air/ice with packed ice
     /// until y = 50.
     IceSpike,
+    /// `minecraft:root_system` (`edg`, `RootSystemFeature`): from the origin, walk
+    /// up while the position still passes `allowed_tree_position` and has
+    /// `required_vertical_space_for_tree` of air-or-water above it, then try to run
+    /// the nested placed feature (the "tree"); on success the same column gets a
+    /// root column of `rooted_dirt` up to that height, and then a field of hanging
+    /// roots is scattered around the origin.
+    RootSystem(Box<RootSystemCfg>),
     Geode(Box<GeodeCfg>),
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
     /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
@@ -264,6 +271,177 @@ struct GeodeCfg {
     max_gen_offset: i32,
     noise_multiplier: f64,
     invalid_blocks_threshold: i32,
+}
+
+/// `minecraft:root_system` (`edg`). Obfuscated letters resolved in the official
+/// mappings before writing this, because three of them are not guessable:
+/// `BlockPos.d()`/`e()` are `above()`/`below()`, `BlockState.i()` is `isAir()`,
+/// `BlockState.e()` is `isSolid()`, `LevelReader.u(pos)` is `isEmptyBlock`, and
+/// `FluidTags.a`/`b` are WATER/LAVA.
+struct RootSystemCfg {
+    feature: Pf,
+    required_vspace: i32,
+    root_radius: i32,
+    root_replaceable: String,
+    root_state: Bsp,
+    root_attempts: i32,
+    root_column_max_height: i32,
+    hanging_radius: i32,
+    hanging_span: i32,
+    hanging_state: Bsp,
+    hanging_attempts: i32,
+    water_for_tree: i32,
+    allowed_tree_position: Pr,
+}
+
+/// `getFluidState(pos).is(FluidTags.WATER)`: the port knows liquid *blocks*, not
+/// fluid states, so a waterlogged solid would not count here. In the azalea and
+/// sulfur pool configs the vertical space is open water, so the two agree.
+fn is_water_fluid(reg: &BReg, st: u32) -> bool {
+    reg.is_liquid(st) && reg.name_of(st).starts_with("minecraft:water")
+}
+
+fn is_lava_fluid(reg: &BReg, st: u32) -> bool {
+    reg.is_liquid(st) && reg.name_of(st).starts_with("minecraft:lava")
+}
+
+/// `RootSystemFeature.isValidVerticalState`: air, or water within
+/// `allowed_vertical_water_for_tree` blocks of the tree's base.
+fn root_valid_vertical(reg: &BReg, st: u32, i: i32, max_water: i32) -> bool {
+    if reg.is_air(st) {
+        return true;
+    }
+    i < max_water && is_water_fluid(reg, st)
+}
+
+fn root_has_space_for_tree(
+    ctx: &mut FC,
+    c: &RootSystemCfg,
+    reg: &BReg,
+    from: (i32, i32, i32),
+) -> bool {
+    let mut p = from;
+    for i in 1..=c.required_vspace {
+        p.1 += 1;
+        let st = ctx.get(p.0, p.1, p.2);
+        if !root_valid_vertical(reg, st, i, c.water_for_tree) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One layer of the root column: `root_placement_attempts` tries, each drawing
+/// dx and dz in +-`root_radius` *from the layer's centre* (`MutableBlockPos.move`
+/// resets to the position it is passed), replacing anything in the
+/// `root_replaceable` tag with the provider's state.
+fn root_place_layer(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &RootSystemCfg,
+    reg: &BReg,
+    x: i32,
+    y: i32,
+    z: i32,
+) {
+    for _ in 0..c.root_attempts {
+        let q = (
+            x + rng.next_bound(c.root_radius) - rng.next_bound(c.root_radius),
+            y,
+            z + rng.next_bound(c.root_radius) - rng.next_bound(c.root_radius),
+        );
+        if reg.in_tag(ctx.get(q.0, q.1, q.2), &c.root_replaceable) {
+            let st = c.root_state.get(ctx, rng, q.0, q.1, q.2);
+            ctx.set(q.0, q.1, q.2, st);
+        }
+    }
+}
+
+fn root_place_column(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &RootSystemCfg,
+    reg: &BReg,
+    from: (i32, i32, i32),
+    to_y: i32,
+) {
+    for y in from.1..to_y {
+        root_place_layer(ctx, rng, c, reg, from.0, y, from.2);
+    }
+}
+
+/// The hanging-root pass around the origin: each try draws a 3-axis offset
+/// (dx, dy, dz, each `nextInt(span) - nextInt(span)`), and places only into an
+/// empty cell whose block *above* is sturdy on its bottom face - which is also
+/// what `HangingRootsBlock.canSurvive` checks, so one test covers both.
+fn root_place_hanging(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &RootSystemCfg,
+    reg: &BReg,
+    origin: (i32, i32, i32),
+) {
+    for _ in 0..c.hanging_attempts {
+        let q = (
+            origin.0 + rng.next_bound(c.hanging_radius) - rng.next_bound(c.hanging_radius),
+            origin.1 + rng.next_bound(c.hanging_span) - rng.next_bound(c.hanging_span),
+            origin.2 + rng.next_bound(c.hanging_radius) - rng.next_bound(c.hanging_radius),
+        );
+        if !ctx.is_air(q.0, q.1, q.2) {
+            continue;
+        }
+        let st = c.hanging_state.get(ctx, rng, q.0, q.1, q.2);
+        let above = (q.0, q.1 + 1, q.2);
+        if reg.side_solid(ctx.get(above.0, above.1, above.2), 0) {
+            ctx.set(q.0, q.1, q.2, st);
+        }
+    }
+}
+
+fn gen_root_system(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &RootSystemCfg) {
+    let Some(reg) = breg() else { return };
+    if !ctx.is_air(pos.0, pos.1, pos.2) {
+        return;
+    }
+    let mut cursor = pos;
+    let mut placed_tree = false;
+    // `placeHangingRoots` runs only when the tree was placed (vanilla's
+    // `if (placeRootsAndTree(...))`), so the draws after it are conditional too
+    for i in 0..c.root_column_max_height {
+        cursor.1 += 1;
+        if !test_pred(
+            &c.allowed_tree_position,
+            reg,
+            ctx,
+            cursor.0,
+            cursor.1,
+            cursor.2,
+        ) {
+            continue;
+        }
+        if !root_has_space_for_tree(ctx, c, reg, cursor) {
+            continue;
+        }
+        let below = (cursor.0, cursor.1 - 1, cursor.2);
+        let bst = ctx.get(below.0, below.1, below.2);
+        // `getFluidState(below).is(LAVA) || !getBlockState(below).isSolid()`
+        if is_lava_fluid(reg, bst) || !reg.is_solid(bst) {
+            return;
+        }
+        // The port's features do not report success, and `ctx.wr` is a *map*: writing
+        // over a cell that is already recorded does not change its length. Compose the
+        // whole map instead of counting it, so a tree that only overwrites still counts.
+        let before = ctx.wr.clone();
+        gen_pf(&c.feature, freg(), ctx, rng, cursor);
+        if ctx.wr != before {
+            root_place_column(ctx, rng, c, reg, pos, pos.1 + i);
+            placed_tree = true;
+            break;
+        }
+    }
+    if placed_tree {
+        root_place_hanging(ctx, rng, c, reg, pos);
+    }
 }
 
 /// `GeodeFeature.placeBlock`: the write is skipped when the existing block is in
@@ -600,6 +778,21 @@ fn p_cf(j: &J) -> Option<Cf> {
                 invalid_blocks_threshold: jint(j, "invalid_blocks_threshold", 0),
             }))
         }
+        "root_system" => Cf::RootSystem(Box::new(RootSystemCfg {
+            feature: pf_any(js(j, "feature")?)?,
+            required_vspace: jint(j, "required_vertical_space_for_tree", 0),
+            root_radius: jint(j, "root_radius", 0),
+            root_replaceable: ns_name(js(j, "root_replaceable")?.str().trim_start_matches('#')),
+            root_state: p_bsp(js(j, "root_state_provider")?)?,
+            root_attempts: jint(j, "root_placement_attempts", 0),
+            root_column_max_height: jint(j, "root_column_max_height", 0),
+            hanging_radius: jint(j, "hanging_root_radius", 0),
+            hanging_span: jint(j, "hanging_roots_vertical_span", 0),
+            hanging_state: p_bsp(js(j, "hanging_root_state_provider")?)?,
+            hanging_attempts: jint(j, "hanging_root_placement_attempts", 0),
+            water_for_tree: jint(j, "allowed_vertical_water_for_tree", 0),
+            allowed_tree_position: p_pred(js(j, "allowed_tree_position")?)?,
+        })),
         "ice_spike" => Cf::IceSpike,
         "sea_pickle" => Cf::SeaPickle {
             count: p_ip(js(j, "count")?)?,
@@ -1493,6 +1686,7 @@ pub(crate) fn ore_cells_for_test(
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::RootSystem(c) => gen_root_system(ctx, rng, pos, c),
         Cf::IceSpike => gen_ice_spike(ctx, rng, pos),
         Cf::SeaPickle { count } => {
             let Some(reg) = breg() else { return };

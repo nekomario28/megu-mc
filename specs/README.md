@@ -61,8 +61,8 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 次は 53 列の y の差（`hm_oc` の読み vs vanilla の `getHeight`）を同じ列で両側ダンプして比べることです。装飾順を固定具に寄せる実験は**負の結果**でした（§62.3）。
 
-**型カバレッジ**は計測できるようにしました（`tools/feature_type_coverage.py`）: pack の 60 型中 28 型に `p_cf` の腕が無く、**overworld の biome から到達されるのは 8 型**（`fossil` `iceberg` `root_system` `sculk_patch` `desert_well` `dripstone_cluster` `large_dripstone` `speleothem_cluster`）。
-- **実装した型**: `geode`（最大の欠落、残差はノイズの場）、`sea_pickle`、`ice_spike`（生存条件・材質・ドロー順を契約テストで固定）。到達/parity は warm_ocean が spawn 近くに無いことと **offline dump が hot region の外で待ちに入る**（実測 240s wall / 0.3s user）ことで塞がっており、[feature-parity](../evidence/gameplay/feature-parity/README.md) §63/§65/§66 に記録。
+**型カバレッジ**は計測できるようにしました（`tools/feature_type_coverage.py`）: pack の 60 型中 27 型に `p_cf` の腕が無く、**overworld の biome から到達されるのは 7 型**（`fossil` `iceberg` `sculk_patch` `desert_well` `dripstone_cluster` `large_dripstone` `speleothem_cluster`）。
+- **実装した型**: `geode`（残差はノイズの場）、`sea_pickle`、`ice_spike`、`root_system`（`root_system` は規則と入口までを単体テストで固定し、end-to-end は未検証＝§68 に理由を記録）。未実装の到達型は 11 → **7**。
 - `geode`（**56 biome** から到達、最大の欠落）は**実装しました**（2026-10-24、`Cf::Geode`）。1.21.1 の `GeodeFeature`（`eck`）を逆コンパイルして層の閾値・点ごとのノイズ項・クラック・結晶の向きまで移植し、`tools/geode_fixture.sh`（seed 12 / chunk (0,0) に geode が出ることを port 側の trace で実測して選んだ固定具）で vanilla とセル単位に比較しています。**セル数はほぼ一致**（amethyst 162 vs 157、calcite 202 vs 201、smooth_basalt 237 vs 256）ですが**形はまだ一致しません**（3層合計 IoU 0.31、最良の平行移動でも 0.39）。残差はノイズの場に帰属させ、数値・固定具・次に測ることを evidence に残しました （[feature-parity](../evidence/gameplay/feature-parity/README.md) §63）。
   両側0個、全chunk skip、別stageの差分は成功扱いにしません。
 
