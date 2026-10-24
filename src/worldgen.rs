@@ -373,6 +373,24 @@ impl Gen {
     }
 
     pub(crate) fn dp_files(subdir: &str) -> HashMap<String, Vec<u8>> {
+        Self::dp_files_any(&[subdir])
+    }
+
+    /// Merge several candidate directory names, later *names* winning within a pack.
+    /// The reference build's own data uses 1.21.1's layout (`worldgen/configured_feature`)
+    /// while a converted pack may use the newer `worldgen/feature`; both have to load,
+    /// because the data is the reference and the conversion is not.
+    pub(crate) fn dp_files_any(subdirs: &[&str]) -> HashMap<String, Vec<u8>> {
+        let mut m = HashMap::new();
+        for subdir in subdirs {
+            for (k, v) in Self::dp_files_one(subdir) {
+                m.insert(k, v);
+            }
+        }
+        m
+    }
+
+    fn dp_files_one(subdir: &str) -> HashMap<String, Vec<u8>> {
         let mut m = HashMap::new();
         {
             for p in Gen::packs() {

@@ -2262,7 +2262,7 @@ fn load_freg() -> FReg {
         order: vec![],
         steps: 0,
     };
-    for (name, b) in Gen::dp_files("feature") {
+    for (name, b) in Gen::dp_files_any(&["configured_feature", "feature"]) {
         if let Some(j) = jparse(&b) {
             if let Some(cf) = p_cf(&j) {
                 reg.cfg.insert(name, cf);
