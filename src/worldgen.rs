@@ -517,10 +517,11 @@ impl Gen {
             g.height = n.get("height").map(J::num).unwrap_or(384.0) as i32;
         }
         let router = ns.get("noise_router");
-        let fd = router
-            .and_then(|r| r.get("final_density"))
-            .map(|j| j.str().to_string())?;
-        let idx = g.resolve_ref(&files, &fd)?;
+        // 1.21.1 writes the router entries as inline density functions (the newer
+        // dialect writes references), so this has to go through `router_df`, which
+        // accepts either.
+        let fd = router.and_then(|r| r.get("final_density"))?;
+        let idx = router_df(&mut g, &files, fd)?;
         g.final_density = idx;
         // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
         // from three router functions; 1.21.2+ moved them into a material rule.
@@ -621,14 +622,17 @@ impl Gen {
             g.sec_ni = g.noise_id("minecraft:surface_secondary");
             g.band_off_ni = g.noise_id("minecraft:clay_bands_offset");
             g.ore_split = Some(g.factory.of_str("minecraft:ore").splitter());
-            g.def_st = ns
-                .get("default_block")
-                .and_then(|b| res(b.str()))
-                .unwrap_or(1);
-            g.def_fl = ns
-                .get("default_fluid")
-                .and_then(|b| res(b.str()))
-                .unwrap_or(0);
+            // 1.21.1 = `{"Name": "minecraft:stone"}`, the newer dialect = a bare name.
+            let block_of = |v: Option<&J>| -> Option<u32> {
+                let v = v?;
+                res(if v.str().is_empty() {
+                    v.get("Name").map(|n| n.str()).unwrap_or("")
+                } else {
+                    v.str()
+                })
+            };
+            g.def_st = block_of(ns.get("default_block")).unwrap_or(1);
+            g.def_fl = block_of(ns.get("default_fluid")).unwrap_or(0);
             g.bands = create_bands(&mut g.factory.of_str("minecraft:clay_bands"), res);
             // The aquifer's `minEst` column comes from `aquifers.surface_level`
             // (`minecraft:overworld/preliminary_surface_level`, the raw
@@ -651,8 +655,19 @@ impl Gen {
         }
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
         let noaq = std::env::var("MC_SPINE_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
-        if let Some(aq) = ns.get("aquifers").filter(|_| !noaq) {
-            let get = |g: &mut Gen, k: &str| aq.get(k).and_then(|j| g.node(j, &files));
+        // 1.21.1 has no top-level `aquifers`: the same four functions sit in
+        // `noise_router` under their own names, and there is **no `exclusion`** at all
+        // (the newer dialect added it). Read either shape, and require `exclusion` only
+        // when the dialect offers it - the aquifer is installed without one otherwise,
+        // which is 1.21.1's own configuration.
+        let aq = ns.get("aquifers");
+        if !noaq && (aq.is_some() || router.is_some()) {
+            let get = |g: &mut Gen, k: &str| -> Option<usize> {
+                let j = aq
+                    .and_then(|a| a.get(k))
+                    .or_else(|| router.and_then(|r| r.get(k)))?;
+                router_df(g, &files, j)
+            };
             let (b, f, s, l, e) = (
                 get(&mut g, "barrier"),
                 get(&mut g, "fluid_level_floodedness"),
@@ -660,9 +675,11 @@ impl Gen {
                 get(&mut g, "lava"),
                 get(&mut g, "exclusion"),
             );
-            if let (Some(barrier), Some(flood), Some(spread), Some(lava), Some(excl)) =
-                (b, f, s, l, e)
-            {
+            if let (Some(barrier), Some(flood), Some(spread), Some(lava), excl) = (b, f, s, l, e) {
+                let excl = excl.unwrap_or_else(|| {
+                    g.dfs.push(DF::C(0.0));
+                    g.dfs.len() - 1
+                });
                 g.aq = Some(Aqd {
                     barrier,
                     flood,
@@ -902,12 +919,35 @@ impl Gen {
         if let Some(&i) = self.names.get(name) {
             return Some(i);
         }
-        let b = files.get(name)?;
-        let j = jparse(b)?;
+        let trace = |why: &str| {
+            if std::env::var("LOAD_TRACE").is_ok() {
+                eprintln!("[load] density reference {name}: {why}");
+            }
+        };
+        let b = match files.get(name) {
+            Some(b) => b,
+            None => {
+                trace("no such file in the pack");
+                return None;
+            }
+        };
+        let j = match jparse(b) {
+            Some(j) => j,
+            None => {
+                trace("the file is not valid JSON");
+                return None;
+            }
+        };
         let idx = self.dfs.len();
         self.names.insert(name.to_string(), idx);
         self.dfs.push(DF::Zero); // placeholder for recursion safety
-        let d = self.parse_df(&j, files)?;
+        let d = match self.parse_df(&j, files) {
+            Some(d) => d,
+            None => {
+                trace("its own definition did not parse");
+                return None;
+            }
+        };
         self.dfs[idx] = d;
         Some(idx)
     }
@@ -972,15 +1012,45 @@ impl Gen {
 
     fn parse_df(&mut self, j: &J, files: &HashMap<String, Vec<u8>>) -> Option<DF> {
         let ty = j.get("type")?.str().strip_prefix("minecraft:")?.to_string();
+        // The loader silently dropping a node looks exactly like a wrong world, so
+        // `LOAD_TRACE=1` names the type it could not build (CV2: print what was skipped).
+        let trace = |ty: &str, ok: bool| {
+            if !ok && std::env::var("LOAD_TRACE").is_ok() {
+                eprintln!("[load] density function type not built: {ty}");
+            }
+        };
         let n = |k: &str| j.get(k).map(J::num).unwrap_or(0.0);
         let sub = |g: &mut Gen, k: &str| -> Option<usize> { g.node(j.get(k)?, files) };
-        Some(match ty.as_str() {
-            "add" => DF::Add(sub(self, "left")?, sub(self, "right")?),
-            "sub" => DF::Sub(sub(self, "left")?, sub(self, "right")?),
-            "mul" => DF::Mul(sub(self, "left")?, sub(self, "right")?),
-            "min" => DF::Min(sub(self, "left")?, sub(self, "right")?),
-            "max" => DF::Max(sub(self, "left")?, sub(self, "right")?),
-            "div" => DF::Div(sub(self, "left")?, sub(self, "right")?),
+        // 1.21.1 names the two operands `argument1`/`argument2`, the newer dialect
+        // `left`/`right`. Same operation, same order, so accept either.
+        let bin = |g: &mut Gen, k: &str, alt: &str| -> Option<usize> {
+            g.node(j.get(k).or_else(|| j.get(alt))?, files)
+        };
+        let out = Some(match ty.as_str() {
+            "add" => DF::Add(
+                bin(self, "left", "argument1")?,
+                bin(self, "right", "argument2")?,
+            ),
+            "sub" => DF::Sub(
+                bin(self, "left", "argument1")?,
+                bin(self, "right", "argument2")?,
+            ),
+            "mul" => DF::Mul(
+                bin(self, "left", "argument1")?,
+                bin(self, "right", "argument2")?,
+            ),
+            "min" => DF::Min(
+                bin(self, "left", "argument1")?,
+                bin(self, "right", "argument2")?,
+            ),
+            "max" => DF::Max(
+                bin(self, "left", "argument1")?,
+                bin(self, "right", "argument2")?,
+            ),
+            "div" => DF::Div(
+                bin(self, "left", "argument1")?,
+                bin(self, "right", "argument2")?,
+            ),
             "negate" => DF::Neg(sub(self, "input")?),
             "abs" => DF::Abs(sub(self, "input")?),
             "square" => DF::Sq(sub(self, "input")?),
@@ -1002,6 +1072,13 @@ impl Gen {
                 fc: n("from_coordinate"),
                 fv: n("from_value"),
                 tc: n("to_coordinate"),
+                tv: n("to_value"),
+            },
+            // 1.21.1's name for the y gradient, with `from_y`/`to_y`. Both clamp.
+            "y_clamped_gradient" => DF::Grad {
+                fc: n("from_y"),
+                fv: n("from_value"),
+                tc: n("to_y"),
                 tv: n("to_value"),
             },
             "interpolated" => DF::Interp(sub(self, "input")?),
@@ -1087,7 +1164,9 @@ impl Gen {
                 cell_h: n("cell_height") as i32,
             },
             _ => DF::Zero,
-        })
+        });
+        trace(&ty, out.is_some());
+        out
     }
 
     pub(crate) fn eval(
