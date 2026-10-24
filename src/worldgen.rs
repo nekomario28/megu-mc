@@ -3511,6 +3511,42 @@ pub fn biome_at_dump(spec: &str) {
     }
 }
 
+/// `MC_SPINE_WG_DUMP_HM=<path>`: write the OCEAN_FLOOR height of every column of
+/// the dumped region, 256 i32 per chunk in the block dump's chunk order.
+///
+/// Why: the kelp residual in `evidence/gameplay/carvers/README.md` is attributed to
+/// "the two sides read a different `getHeight(OCEAN_FLOOR)`", and a stored vanilla
+/// chunk carries its own heightmap, so the attribution can be checked instead of
+/// assumed. The port's value is what a feature would read after generation - the
+/// chunk's own top and the feature layer, whichever is higher.
+pub fn heightmap_dump(path: &str, n: i32, ox: i32, oz: i32) {
+    let mut gg = GEN.lock().unwrap();
+    let Some(g) = gg.as_mut() else { return };
+    let mut out: Vec<u8> = Vec::new();
+    for dz in 0..n {
+        for dx in 0..n {
+            let (cx, cz) = (ox + dx, oz + dz);
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                    let base = g.top_oc(x, z);
+                    let h = g.feature_height(x, z, 1).max(base);
+                    out.extend_from_slice(&h.to_le_bytes());
+                }
+            }
+        }
+    }
+    match std::fs::write(path, &out) {
+        Ok(()) => eprintln!(
+            "[hmdump] {} chunks -> {} ({} bytes)",
+            n * n,
+            path,
+            out.len()
+        ),
+        Err(e) => eprintln!("[hmdump] {path}: {e}"),
+    }
+}
+
 /// `MC_SPINE_BIOME_DUMP=cx,sy,cz`: print the quart-sampled biome name for every
 /// 4x4x4 cell of one section, to compare against a saved vanilla chunk.
 pub fn biome_dump(spec: &str) {

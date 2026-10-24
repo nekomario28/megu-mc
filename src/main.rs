@@ -21461,6 +21461,21 @@ fn main() {
                 t1.elapsed()
             );
         }
+        if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP_HM") {
+            let n: i32 = std::env::var("MC_SPINE_WG_DUMP_N")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6);
+            let ox: i32 = std::env::var("MC_SPINE_WG_DUMP_X")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let oz: i32 = std::env::var("MC_SPINE_WG_DUMP_Z")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            worldgen::heightmap_dump(&path, n, ox, oz);
+        }
         if std::env::var("WGDIFF").is_ok() {
             // vanilla reference values at (0,0,0) seed 0 from pumpkin test data
             for (name, want) in [

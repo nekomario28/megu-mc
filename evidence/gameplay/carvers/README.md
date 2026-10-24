@@ -2351,6 +2351,42 @@ port は「置けたときだけ」`p.1 += 1` していたため、**基準セ�
 注: この経路は今回の fixture 領域では踏まれず、領域のセル数（`kelp` 494/484、`kelp_plant` 2761/2689）は
 修正前後で**同じ**だった。数値が動かない変更を「効果なし」と読まず、単体テストで経路の実行を証明している。
 
+### 62.2b `getHeight(OCEAN_FLOOR)` の差を測る道具を作り、**解釈が確定しない**ところで止めた
+
+§62.1 の「53列は両側の `getHeight(OCEAN_FLOOR)` の差」は**帰属であって測定ではない**。保存済みの
+vanilla chunk は heightmap を自分で持っているので、確認できるはずだった:
+
+- port 側: `MC_SPINE_WG_DUMP_HM=<path>`（`worldgen::heightmap_dump`）が、dump した領域の
+  各列の OCEAN_FLOOR（chunk の top と feature layer の高い方）を 256×i32/chunk で書く。
+- 参照側: `tools/heightmap_diff.py` が region file の `Heightmaps.OCEAN_FLOOR` を
+  9bit パックから展開して列ごとに比べる。
+
+分かったこと:
+
+1. **保存値は床からの相対値**。chunk (79,-1) の `WORLD_SURFACE=127`、海面の最上水ブロックは y=63
+   → `127 - (-64) = 63`。絶対値で書く port 側と比べるには変換が要る（変換を間違えると全列が±1でずれ、
+   実際に最初の2回はそうなった）。
+2. 変換後、6×6 領域 9216 列のうち **329 列が不一致**（領域外縁の chunk 225/5120、内部 104/4096）。
+   内部の不一致は chunk 内 `lz=0..8` に集中し、差は **port の方が低い**（-1〜-6）。
+3. **しかし、この数字はまだ「port の heightmap が違う」証拠にならない。** 保存された
+   `OCEAN_FLOOR` を「最後に残った非水ブロック + |min_y|」として素直に読むと、実ブロックと合わない列が
+   ある（例: chunk (80,0) 列 (1286,0) は保存値が 29 を指すが、最終ブロックで非水の最上位は y=31。
+   chunk (80,0) 列 (1280,0) では逆に保存値 25 に対し実ブロック 31）。保存 heightmap が
+   **生成途中の状態**なのか、こちらの展開が一部ずれているのかを切り分けられていない。
+
+つまり §62.1 の帰属は**確認も反証もできていない**。この節は「測定の入口はできた」までで、
+53列の原因は引き続き未確定として扱う。道具は再現手順つきで残す:
+
+```
+MC_SPINE_WG_DUMP_HM=/tmp/kelpfix-79--1/port_hm.bin MC_SPINE_WG_DUMP_N=6 \
+  MC_SPINE_WG_DUMP_X=79 MC_SPINE_WG_DUMP_Z=-1 MC_SPINE_SEED=0 ./target/release/mc-spine
+tools/heightmap_diff.py /tmp/kelpfix-79--1/world 79 -1 /tmp/kelpfix-79--1/port_hm.bin --n 6
+```
+
+次に触るなら、まず参照側の解釈を確定させる（保存 heightmap を「最終ブロックから計算した床」と
+突き合わせて、どの列でどんな差になるかを分類する）のが先。そこを飛ばして port 側を直すのは
+§CV1/§CV2 の「何が走ったかを確かめずに差分を読む」に当たる。
+
 ### 62.3 順序を固定具に合わせても残差は減らない（負の結果）
 
 「残差は装飾順だ」という仮説を、`MC_SPINE_POP_REGION=79,-1,84,4`（固定具の領域を辞書順に decorate）

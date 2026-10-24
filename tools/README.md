@@ -23,6 +23,7 @@
 | `carver_diff.py <dump> <world> [--n --x0 --z0 --cells --tick]` | port の dump と保存 world を block state 単位で diff。層別（carver/deep/surface）、tick 由来（葉の distance）を分離、`--cells` で座標と名前、**全 chunk skip なら exit 2** |
 | `ore_diff.py <dump> <world> <block> [...]` | **ブロック1種**のセル集合を比較（ours-only/vanilla-only＋クラスタサイズ＝「同数で形違い」と「セルが少ない」を区別）。参照が full でない chunk は両側とも除外し、比較ゼロなら失敗 |
 | `world_diff.py <worldA> <worldB> [...]` | 保存 world 同士を比較＝**参照自身の実行間ノイズ床**を測る |
+| `heightmap_diff.py <world> <cx> <cz> <port_hm.bin> [--n] [--heightmap]` | 保存 chunk の heightmap と port の dump を列ごとに比較（内訳: 領域外縁/内部、chunk内 lz/lx 別）。保存値は床からの相対値なので変換して比べる。**保存 heightmap が最終ブロックと一致しない列があり、現状の数字は「port が違う」証拠にはならない**（carvers §62.2b） |
 
 ## port 側の計測（env で切る）
 
@@ -30,6 +31,7 @@
 |---|---|
 | `MC_SPINE_WG_PROFILE=n` | `n×n` chunk を処理する**offline診断モード**。診断用envだけを付けて通常起動すると、サーバーがlistenし続けるので、先にこのモードを指定し、終了ログを確認する |
 | `MC_SPINE_WG_DUMP/_N/_X/_Z` | offline mode 内で block state dump（比較の入力） |
+| `MC_SPINE_WG_DUMP_HM=<path>` | 同じ領域の各列の OCEAN_FLOOR 高さ（絶対y、256×i32/chunk）を書く。`heightmap_diff.py` の参照と対にする |
 | `MC_SPINE_NOFEAT` / `_NOCARVE` / `_NOAQ` | 層を止めて帰属を分ける |
 | `MC_SPINE_FEAT_NBR=0` | 隣 chunk を decorate しない（順序の実験用） |
 | `MC_SPINE_POP_REGION=x0,z0,x1,z1` | その領域を辞書順で decorate（順序の実験用） |
