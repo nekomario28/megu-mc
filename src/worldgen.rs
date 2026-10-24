@@ -2484,10 +2484,6 @@ pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
 pub fn sea_level() -> i32 {
     GEN.lock().unwrap().as_ref().map(|g| g.sea).unwrap_or(63)
 }
-#[cfg(test)]
-pub fn default_state() -> u32 {
-    GEN.lock().unwrap().as_ref().map(|g| g.def_st).unwrap_or(1)
-}
 
 /// material-rule result for blocks below the surface window (bedrock,
 /// ore veins, deepslate gradient, underground fallback -> default block).
@@ -4164,7 +4160,9 @@ mod wg_tests {
         ((100, 100, 50), 1),
         ((100, 100, 100), 1),
     ];
-    const AQ_FL: &[((i32, i32, i32), (i32, u8))] = &[
+    type AqDensityKey = (i32, i32, i32, i32, i32);
+    type AqPointKey = (i32, i32, i32, f64);
+    const AQ_FL: &[(crate::BlockPos, (i32, u8))] = &[
         ((-100, -100, -100), (-32512, 2)),
         ((-100, -100, -50), (-32512, 2)),
         ((-100, -100, 0), (-32512, 2)),
@@ -4291,7 +4289,8 @@ mod wg_tests {
         ((100, 100, 50), (63, 1)),
         ((100, 100, 100), (63, 1)),
     ];
-    const AQ_CD: &[((i32, i32, i32, i32, i32), f64)] = &[
+    // (x, y, z, first height, second height) -> the density the reference reported
+    const AQ_CD: &[(AqDensityKey, f64)] = &[
         ((-100, -100, -100, 0, 0), 0.0),
         ((-100, -100, -50, 50, 0), -19.3),
         ((-100, -100, 0, 0, 0), 0.0),
@@ -4418,7 +4417,8 @@ mod wg_tests {
         ((100, 100, 50, 50, 0), -40.4),
         ((100, 100, 100, 0, 0), 0.0),
     ];
-    const AQ_AP: &[((i32, i32, i32, f64), &str)] = &[
+    // (x, y, z, density) -> which fluid the reference put there
+    const AQ_AP: &[(AqPointKey, &str)] = &[
         ((112, -100, 64, 0.037482421875), "none"),
         ((112, -100, 66, 0.037482421875), "none"),
         ((112, -100, 68, 0.037482421875), "none"),
@@ -4957,7 +4957,6 @@ mod wg_tests {
             }
             for (tbl, my) in [(AQ_FYT, true), (AQ_FYF, false)] {
                 for &((x, y, z), want) in tbl {
-                    let want = want;
                     let got = g.aq_fluid_y(x, y, z, (0, 1), 80, my);
                     if got != want {
                         miss += 1;
@@ -4973,7 +4972,6 @@ mod wg_tests {
                 }
             }
             for &((x, y, z), (wy, wk)) in AQ_FL {
-                let wy = wy;
                 let got = g.aq_fluid_level_at(x, y, z);
                 if got != (wy, wk) {
                     miss += 1;

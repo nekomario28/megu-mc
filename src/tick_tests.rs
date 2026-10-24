@@ -10,7 +10,7 @@ struct WorldSnapshot {
     falling: Vec<Fall>,
     drops: Vec<Drop>,
     forced: HashSet<(i32, i32)>,
-    region: (HashSet<(i32, i32)>, HashSet<(i32, i32)>),
+    region: crate::RegionSets,
 }
 impl WorldSnapshot {
     fn take() -> WorldSnapshot {
@@ -1003,7 +1003,6 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
             break;
         };
         let (x, v) = (a.x, a.dx);
-        drop(a);
         steps.push((x - prev_x, v));
         prev_x = x;
         prev_v = v;

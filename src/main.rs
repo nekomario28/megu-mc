@@ -239,6 +239,43 @@ struct Eff {
     amp: i32,
     left: i32,
 } // left: server ticks (TICK_MS)
+/// A block position. It is the key of every world registry below.
+type BlockPos = (i32, i32, i32);
+/// A chunk column, for the maps keyed by chunk rather than by block.
+type ChunkKey = (i32, i32);
+/// The shape every world registry in this file has: one map behind one mutex,
+/// built the first time something asks for it.
+type Registry<K, V> = OnceLock<Mutex<HashMap<K, V>>>;
+/// What those accessors hand out.
+type LockedMap<K, V> = Mutex<HashMap<K, V>>;
+/// A saved player position with its look direction.
+type PosRot = (f64, f64, f64, f32, f32);
+/// One stored sign: its four lines, front or back.
+type SignKey = (i32, i32, i32, u8);
+type SignLines = [String; 4];
+/// A block entity on its way out inside a chunk packet: position, type, NBT.
+type ChunkBlockEntity = (BlockPos, i64, Vec<u8>);
+/// An entity spawn queued for the clients that just became able to see it.
+type SpawnJob = (
+    i32,
+    f64,
+    f64,
+    f64,
+    Box<dyn Fn() -> Vec<(i64, Vec<u8>)> + Send>,
+);
+/// A throwable's hit, carried out of the borrow before it is applied:
+/// (eid, mob hit, dx, dz, egg, x, y, z).
+type ThrowHit = (i32, Option<i32>, f64, f64, bool, f64, f64, f64);
+/// A smelting recipe from a datapack: ingredient, result, count, experience.
+type SmeltRecipe = (Ingr, i64, u8, f32);
+/// A merchant's trade row: buy, buy count, optional second buy, sell, sell count.
+type TradeRow = (i64, u8, Option<(i64, u8)>, i64, u8);
+/// The advancement tree: player -> advancement -> finished criteria.
+type Advancements = HashMap<String, HashMap<String, HashSet<String>>>;
+/// The chunks a client has loaded, as (hot, warm) - the region snapshot.
+#[cfg(test)]
+type RegionSets = (HashSet<ChunkKey>, HashSet<ChunkKey>);
+
 struct Client {
     eid: i32,
     uuid: [u8; 16],
@@ -249,7 +286,7 @@ struct Client {
     inv: Mutex<HashMap<i16, Stack>>,
     cursor: Mutex<Stack>,
     drag: Mutex<(i32, Vec<i16>)>, // (button, painted window slots) for click-mode 5
-    open_chest: Mutex<Option<((i32, i32, i32), Option<(i32, i32, i32)>)>>, // (key/pos, double-chest partner)
+    open_chest: Mutex<Option<(BlockPos, Option<BlockPos>)>>, // (key/pos, double-chest partner)
     open_furnace: Mutex<Option<(i32, i32, i32)>>,
     craft: Mutex<HashMap<i16, Stack>>,
     craft9: Mutex<HashMap<i16, Stack>>,
@@ -297,7 +334,7 @@ fn angle(deg: f32) -> i8 {
     (deg / 360.0 * 256.0) as i8
 }
 
-static SKIN_CACHE: OnceLock<Mutex<HashMap<String, Option<(String, String)>>>> = OnceLock::new();
+static SKIN_CACHE: Registry<String, Option<(String, String)>> = OnceLock::new();
 fn skin_cache() -> &'static Mutex<HashMap<String, Option<(String, String)>>> {
     SKIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -486,13 +523,7 @@ fn interest_tick() {
     }
     // spawn payloads are built lazily on the visible-transition only —
     // steady-state cost is one distance check per entity per client.
-    let mut ents: Vec<(
-        i32,
-        f64,
-        f64,
-        f64,
-        Box<dyn Fn() -> Vec<(i64, Vec<u8>)> + Send>,
-    )> = Vec::new();
+    let mut ents: Vec<SpawnJob> = Vec::new();
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
         let m = m.clone();
@@ -2920,7 +2951,7 @@ fn keepalive_time_tick() {
     {
         // snowballs: fly, hit mob -> hurt flash
         let mut sl2 = snowballs().lock().unwrap();
-        let mut done: Vec<(i32, Option<i32>, f64, f64, bool, f64, f64, f64)> = vec![];
+        let mut done: Vec<ThrowHit> = vec![];
         for p0 in sl2.iter_mut() {
             if !region.is_hot(p0.x as i32, p0.z as i32) {
                 continue;
@@ -5079,8 +5110,8 @@ fn mob_tick() {
 
 // ---------- world ----------
 // overlay edits: (cx,cz) -> { packed_local_idx -> blockstate }
-static WORLD: OnceLock<Mutex<HashMap<(i32, i32), HashMap<u32, u32>>>> = OnceLock::new();
-fn world() -> &'static Mutex<HashMap<(i32, i32), HashMap<u32, u32>>> {
+static WORLD: Registry<ChunkKey, HashMap<u32, u32>> = OnceLock::new();
+fn world() -> &'static LockedMap<ChunkKey, HashMap<u32, u32>> {
     WORLD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 struct Furnace {
@@ -5094,8 +5125,8 @@ struct Furnace {
     recipe_cache: CachedLookup<(i64, u64), Option<(i64, u8)>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
-static FURNACES: OnceLock<Mutex<HashMap<(i32, i32, i32), Furnace>>> = OnceLock::new();
-static CROPS: OnceLock<Mutex<HashMap<(i32, i32, i32), u8>>> = OnceLock::new();
+static FURNACES: Registry<BlockPos, Furnace> = OnceLock::new();
+static CROPS: Registry<BlockPos, u8> = OnceLock::new();
 fn crops() -> &'static Mutex<HashMap<(i32, i32, i32), u8>> {
     CROPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -5235,8 +5266,8 @@ fn fuel_ticks(item: i64) -> i32 {
     }
     0
 }
-static CHESTS: OnceLock<Mutex<HashMap<(i32, i32, i32), HashMap<i16, Stack>>>> = OnceLock::new();
-fn chests() -> &'static Mutex<HashMap<(i32, i32, i32), HashMap<i16, Stack>>> {
+static CHESTS: Registry<BlockPos, HashMap<i16, Stack>> = OnceLock::new();
+fn chests() -> &'static LockedMap<BlockPos, HashMap<i16, Stack>> {
     CHESTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 static INV_STORE: OnceLock<Mutex<HashMap<String, HashMap<i16, Stack>>>> = OnceLock::new();
@@ -5244,8 +5275,8 @@ fn inv_store() -> &'static Mutex<HashMap<String, HashMap<i16, Stack>>> {
     INV_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // name -> (x,y,z,yaw,pitch): vanilla respawns a player where they left
-static POS_STORE: OnceLock<Mutex<HashMap<String, (f64, f64, f64, f32, f32)>>> = OnceLock::new();
-fn pos_store() -> &'static Mutex<HashMap<String, (f64, f64, f64, f32, f32)>> {
+static POS_STORE: Registry<String, PosRot> = OnceLock::new();
+fn pos_store() -> &'static LockedMap<String, PosRot> {
     POS_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 const MIN_Y: i32 = -64;
@@ -5735,8 +5766,8 @@ fn is_warm(x: i32, z: i32) -> bool {
 // up to 80 game ticks (4 s); any neighbor block change invalidates it back
 // to full rate. Event-driven reset + exponential backoff, not polling.
 // The tick counts live in backoff_ticks; only the 4 s ceiling belongs here.
-static BACKOFF: OnceLock<Mutex<HashMap<(i32, i32, i32), (u64, u32)>>> = OnceLock::new();
-fn backoff() -> &'static Mutex<HashMap<(i32, i32, i32), (u64, u32)>> {
+static BACKOFF: Registry<BlockPos, (u64, u32)> = OnceLock::new();
+fn backoff() -> &'static LockedMap<BlockPos, (u64, u32)> {
     BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
 }
 static TICK_IDX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -6025,7 +6056,7 @@ struct PluginCell {
     warm_ok: bool,
 }
 type CellKey = (usize, i32, i32, i32, u32);
-static PLUGIN_CELLS: OnceLock<Mutex<HashMap<(i32, i32), Vec<PluginCell>>>> = OnceLock::new();
+static PLUGIN_CELLS: Registry<ChunkKey, Vec<PluginCell>> = OnceLock::new();
 static PLUGIN_BACKOFF: OnceLock<Mutex<HashMap<CellKey, (u64, u8)>>> = OnceLock::new();
 static PLUGINS: OnceLock<Mutex<Vec<Box<dyn Plugin>>>> = OnceLock::new();
 fn plugin_cells() -> &'static Mutex<HashMap<(i32, i32), Vec<PluginCell>>> {
@@ -6174,9 +6205,8 @@ impl Plugin for GrowthLamp {
 
 // per-tick block-change batching (vanilla multi_block_change, 0x49):
 // N individual block_change packets -> 1 packet per touched section.
-static PENDING_BLOCKS: OnceLock<Mutex<HashMap<(i32, i32, i32), HashMap<u16, u32>>>> =
-    OnceLock::new();
-fn pending_blocks() -> &'static Mutex<HashMap<(i32, i32, i32), HashMap<u16, u32>>> {
+static PENDING_BLOCKS: Registry<BlockPos, HashMap<u16, u32>> = OnceLock::new();
+fn pending_blocks() -> &'static LockedMap<BlockPos, HashMap<u16, u32>> {
     PENDING_BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
@@ -12826,7 +12856,7 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     p.extend_from_slice(&data);
     // block entities ride inside the chunk packet in vanilla — signs
     // would otherwise render blank until edited after each chunk load
-    let be: Vec<((i32, i32, i32), i64, Vec<u8>)> = {
+    let be: Vec<ChunkBlockEntity> = {
         let sg = signs().lock().unwrap();
         sg.iter()
             .filter(|(&(x, _, z, _), _)| x >> 4 == cx && z >> 4 == cz)
@@ -13072,7 +13102,7 @@ fn stream_chunks(
         for n in light_dirty_for(gen, *cx, *cz) {
             dirty.insert(n);
         }
-        let snap: Vec<((i32, i32, i32, u8), [String; 4])> = signs()
+        let snap: Vec<(SignKey, SignLines)> = signs()
             .lock()
             .unwrap()
             .iter()
@@ -13157,7 +13187,7 @@ fn slot_wire(s: &Stack) -> Vec<u8> {
     p
 }
 // villager trades: (input item name, count, optional second input, output name, count)
-fn trades() -> Vec<(i64, u8, Option<(i64, u8)>, i64, u8)> {
+fn trades() -> Vec<TradeRow> {
     let mut v = Vec::new();
     for (a, ac, b, c, cc) in [
         ("wheat", 20u8, None, "emerald", 1u8),
@@ -14171,8 +14201,8 @@ fn food_value(item: i64) -> i32 {
     0
 }
 
-static SIGNS: OnceLock<Mutex<HashMap<(i32, i32, i32, u8), [String; 4]>>> = OnceLock::new();
-fn signs() -> &'static Mutex<HashMap<(i32, i32, i32, u8), [String; 4]>> {
+static SIGNS: Registry<SignKey, SignLines> = OnceLock::new();
+fn signs() -> &'static LockedMap<SignKey, SignLines> {
     SIGNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn nbt_named_str(v: &mut Vec<u8>, name: &str, val: &str) {
@@ -15217,8 +15247,8 @@ fn json_recipes() -> &'static Mutex<Vec<JsonRecipe>> {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 // datapack furnace recipes: smelting/blasting/smoking/campfire_cooking
-fn json_smelts() -> &'static Mutex<Vec<(Ingr, i64, u8, f32)>> {
-    static R: OnceLock<Mutex<Vec<(Ingr, i64, u8, f32)>>> = OnceLock::new();
+fn json_smelts() -> &'static Mutex<Vec<SmeltRecipe>> {
+    static R: OnceLock<Mutex<Vec<SmeltRecipe>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 // datapack entity loot tables: data/<ns>/loot_table[s]/entities/<mob>.json
@@ -15542,8 +15572,8 @@ fn send_attrs(c: &Arc<Client>) {
         let _ = send_packet(&mut w, 0x75, p);
     }
 }
-fn adv_prog() -> &'static Mutex<HashMap<String, HashMap<String, HashSet<String>>>> {
-    static R: OnceLock<Mutex<HashMap<String, HashMap<String, HashSet<String>>>>> = OnceLock::new();
+fn adv_prog() -> &'static Mutex<Advancements> {
+    static R: OnceLock<Mutex<Advancements>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // event -> mark matching criteria, grant when ALL criteria done, announce
@@ -21819,7 +21849,7 @@ fn main() {
 /// Test-only access to the region snapshot. The production code reads it through
 /// `region_guard`; these exist so a fixture can save, force and restore it.
 #[cfg(test)]
-pub fn test_region() -> (HashSet<(i32, i32)>, HashSet<(i32, i32)>) {
+pub fn test_region() -> RegionSets {
     let r = region().lock().unwrap();
     (r.hot.clone(), r.warm.clone())
 }

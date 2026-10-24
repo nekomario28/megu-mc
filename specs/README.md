@@ -24,12 +24,20 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。
 - **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
 - **コード検証:** `tests/verify.sh` が**通りました**（159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit）。`main` はこの統合ブランチと同じツリーを指しています（以前の main は tag `checkpoint/pre-consolidation-main`）。
-- **clippyの残件:** 457 → **83**。機械的に等価な変換（`&*`/`&mut *` の冗長、`x % n == 0` → `is_multiple_of`、
-  不要な `as`、`sort_by` → `sort_by_key`、`chunks_exact` → `as_chunks` など）を当て、171テスト・
-  mutation 53/53・wire smoke で確認しました。残る83件は判断が要るクラスです:
-  `type_complexity` 30（型エイリアスの設計を伴う）、`unnecessary_unwrap` 12、`blocks_in_conditions` 4、
-  `too_many_arguments` 5、死んだ関数/フィールド7（撤回した変更の残骸を含む）。掃引で数値を主張せず、
-  残りは名前付きの一覧としてここに置きます。
+- **clippyは0件になりました**（457 → 83 → **0**、`--all-targets`・release で確認、テスト176本green）。
+  前半は機械的に等価な変換（`&*`/`&mut *` の冗長、`x % n == 0` → `is_multiple_of`、不要な `as`、
+  `sort_by` → `sort_by_key` など）。残る判断が要るクラスは次のように閉じました:
+  - `unnecessary_unwrap` 14: `is_some()` を見て `unwrap()` は `if let`/`match` に。3つのスロット
+    クリック経路は `cv.1 == 0` で先に分岐し、Optionを「使う一本道」でだけ consume する形に。
+  - `type_complexity` 24: レジストリの形を名前で呼びました（`BlockPos`/`ChunkKey`/`Registry<K,V>`/
+    `LockedMap<K,V>`）、記録的なタプルは用途名（`SignKey`/`SignLines`/`ChunkBlockEntity`/`SpawnJob`/
+    `ThrowHit`/`SmeltRecipe`/`TradeRow`/`PosRot`/`Advancements`、テストの参照データはローカル別名）。
+  - `too_many_arguments` 6 は `#[expect]`（`#[allow]` ではなく、不要になったら鳴る形）で6件すべて
+    fulfilled。引数列は参照側のもの（`Mth.lerp3` の11引数、`WorldCarver.carveEllipsoid` の入力、
+    幹の入力）で、まとめると参照に無い型を発明することになります。
+  - 死んでいたものは消しました: `FC.bc`（共有biomeキャッシュに置換済み）、`default_state`。
+    生成プローブ用のアクセサ5つは `#[cfg(test)]`（コンパイラが「本番呼び出し無し」を認めた形）、
+    `Trample.distance` は `java-compat` フィーチャのadapterだけが読むのでその条件で `allow`。
 
 ## 保留・外部依存（値ではなく事実だけ）
 
