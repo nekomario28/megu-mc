@@ -1810,6 +1810,15 @@ pub fn enabled() -> bool {
     GEN.lock().unwrap().is_some()
 }
 
+/// Run `f` against the generator while holding the `GEN` lock. Diagnostics that
+/// need the *feature-facing* accessors live one layer up (they classify block
+/// states, which is generation-context knowledge), so they come through here
+/// instead of reaching for the static - a free function in worldgen would make
+/// worldgen depend on generation_context and close a cycle.
+pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
+    GEN.lock().unwrap().as_mut().map(f)
+}
+
 pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
     GEN.lock().unwrap().as_mut()?.cols(cx, cz)
 }
@@ -3508,56 +3517,6 @@ pub fn biome_at_dump(spec: &str) {
             blended.unwrap_or_else(|| "?".into()),
             container.unwrap_or_else(|| "?".into())
         );
-    }
-}
-
-/// `MC_SPINE_WG_DUMP_HM=<path>`: write the OCEAN_FLOOR height of every column of
-/// the dumped region, 256 i32 per chunk in the block dump's chunk order.
-///
-/// Why: the kelp residual in `evidence/gameplay/carvers/README.md` is attributed to
-/// "the two sides read a different `getHeight(OCEAN_FLOOR)`", and a stored vanilla
-/// chunk carries its own heightmap, so the attribution can be checked instead of
-/// assumed. The port's value is what a feature would read after generation - the
-/// chunk's own top and the feature layer, whichever is higher.
-pub fn heightmap_dump(path: &str, n: i32, ox: i32, oz: i32) {
-    heightmap_dump_mode(path, n, ox, oz, false)
-}
-
-/// `terrain_only`: the chunk column's own top, without the feature layer. A saved
-/// vanilla chunk carries heightmaps that may be from a stage before or after the
-/// features, so the two have to be dumped separately to be told apart.
-pub fn heightmap_dump_mode(path: &str, n: i32, ox: i32, oz: i32, terrain_only: bool) {
-    let mut gg = GEN.lock().unwrap();
-    let Some(g) = gg.as_mut() else { return };
-    // through the same accessor a feature reads, not the raw column top: the two
-    // differ wherever the aquifer pushes a solid above the noise surface, and it is
-    // the feature-facing value this tool exists to compare.
-    let mut fc = crate::generation_context::FC::new(g);
-    let mut out: Vec<u8> = Vec::new();
-    for dz in 0..n {
-        for dx in 0..n {
-            let (cx, cz) = (ox + dx, oz + dz);
-            for lz in 0..16 {
-                for lx in 0..16 {
-                    let (x, z) = (cx * 16 + lx, cz * 16 + lz);
-                    let h = if terrain_only {
-                        fc.hm_oc_terrain(x, z)
-                    } else {
-                        fc.hm_oc(x, z)
-                    };
-                    out.extend_from_slice(&h.to_le_bytes());
-                }
-            }
-        }
-    }
-    match std::fs::write(path, &out) {
-        Ok(()) => eprintln!(
-            "[hmdump] {} chunks -> {} ({} bytes)",
-            n * n,
-            path,
-            out.len()
-        ),
-        Err(e) => eprintln!("[hmdump] {path}: {e}"),
     }
 }
 

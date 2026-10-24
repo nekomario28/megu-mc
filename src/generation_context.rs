@@ -136,3 +136,49 @@ impl<'a> FC<'a> {
         y < self.g.min_y || y >= self.g.min_y + self.g.height
     }
 }
+
+/// `MC_SPINE_WG_DUMP_HM=<path>`: write the OCEAN_FLOOR height of every column of
+/// the dumped region, 256 i32 per chunk in the block dump's chunk order.
+///
+/// Why: the kelp residual was attributed to "the two sides read a different
+/// `getHeight(OCEAN_FLOOR)`", and a stored vanilla chunk carries its own heightmap,
+/// so the attribution can be checked instead of assumed. It goes through the same
+/// accessors a feature reads (`hm_oc`), which is the point: the raw column top and
+/// the feature-facing value differ wherever the aquifer pushes a solid above the
+/// noise surface.
+///
+/// `terrain_only` leaves the feature layer out, for telling the two apart.
+pub(crate) fn heightmap_dump(path: &str, n: i32, ox: i32, oz: i32, terrain_only: bool) {
+    let Some(out) = crate::worldgen::with_gen(|g| {
+        let mut fc = FC::new(g);
+        let mut out: Vec<u8> = Vec::new();
+        for dz in 0..n {
+            for dx in 0..n {
+                let (cx, cz) = (ox + dx, oz + dz);
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                        let h = if terrain_only {
+                            fc.hm_oc_terrain(x, z)
+                        } else {
+                            fc.hm_oc(x, z)
+                        };
+                        out.extend_from_slice(&h.to_le_bytes());
+                    }
+                }
+            }
+        }
+        out
+    }) else {
+        return;
+    };
+    match std::fs::write(path, &out) {
+        Ok(()) => eprintln!(
+            "[hmdump] {} chunks -> {} ({} bytes)",
+            n * n,
+            path,
+            out.len()
+        ),
+        Err(e) => eprintln!("[hmdump] {path}: {e}"),
+    }
+}
