@@ -802,3 +802,110 @@ fn sea_pickle_skips_cells_that_are_not_water() {
         "the skipped attempts still spent their draws"
     );
 }
+
+/// `minecraft:ice_spike` (`ecq`), whose config is `{}`. The feature walks down
+/// through air, requires a snow block, then stacks `radius` shrinking over
+/// `nextInt(4) + 7` layers; the drawn base offset and height are replayed here from
+/// a fresh stream, so the draw order is pinned as well as the shape.
+#[test]
+fn ice_spike_builds_a_tapering_spike_on_snow() {
+    let reg = breg().unwrap();
+    let snow = reg.state_of("minecraft:snow_block", None);
+    let packed = reg.state_of("minecraft:packed_ice", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (8, 8);
+    // a snow platform at y=70, high enough for the downward drill (it stops at 50)
+    let top = 70;
+    for dx in -10..=10 {
+        for dz in -10..=10 {
+            for y in top - 6..=top {
+                ctx.set(x + dx, y, z + dz, snow);
+            }
+            for y in top + 1..=top + 30 {
+                ctx.set(x + dx, y, z + dz, reg.state_of("minecraft:air", None));
+            }
+        }
+    }
+
+    // replay the first draws: base offset, height, radius term, and the
+    // floating-spike roll, which is only drawn when the radius exceeds one
+    let mut probe = Xor::seed(11);
+    let base_off = probe.next_bound(4);
+    let height = probe.next_bound(4) + 7;
+    let radius_max = height / 4 + probe.next_bound(2);
+    let mut float_off = 0;
+    if radius_max > 1 && probe.next_bound(60) == 0 {
+        float_off = 10 + probe.next_bound(30);
+    }
+    let base_y = top + base_off + float_off;
+
+    let mut rng = Xor::seed(11);
+    gen_cf(&Cf::IceSpike, freg(), &mut ctx, &mut rng, (x, top + 20, z));
+
+    let cells: Vec<(i32, i32, i32)> = ctx
+        .wr
+        .iter()
+        .filter(|(_, &st)| st == packed)
+        .map(|(&p, _)| p)
+        .collect();
+    assert!(!cells.is_empty(), "a snow platform must produce a spike");
+    assert!(
+        cells
+            .iter()
+            .any(|(x0, y, z0)| (*x0, *y, *z0) == (x, base_y, z)),
+        "the base cell is always placed (dx = dz = 0 is inside, and r >= 1 at h = 0)"
+    );
+    let tip = cells.iter().map(|(_, y, _)| *y).max().unwrap();
+    assert_eq!(
+        tip,
+        base_y + height - 1,
+        "the tip must be the drawn height above the drawn base"
+    );
+    let tip_cols: Vec<_> = cells.iter().filter(|(_, y, _)| *y == tip).collect();
+    assert_eq!(
+        tip_cols.len(),
+        1,
+        "the tip is a single column: {tip_cols:?}"
+    );
+    assert!(
+        cells.iter().any(|(_, y, _)| *y < top),
+        "the downward drill must replace the snow below the base"
+    );
+    // and the drill only writes the one material
+    assert!(ctx
+        .wr
+        .values()
+        .all(|&st| { st == packed || st == snow || reg.name_of(st) == "minecraft:air" }));
+}
+
+/// The snow requirement is checked before any draw, so a spike that finds stone
+/// places nothing and leaves the stream untouched.
+#[test]
+fn ice_spike_does_nothing_without_snow() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (8, 8);
+    for dx in -10..=10 {
+        for dz in -10..=10 {
+            for y in 60..=70 {
+                ctx.set(x + dx, y, z + dz, stone);
+            }
+        }
+    }
+    let before = ctx.wr.len();
+    let mut rng = Xor::seed(11);
+    gen_cf(&Cf::IceSpike, freg(), &mut ctx, &mut rng, (x, 90, z));
+    assert_eq!(
+        ctx.wr.len(),
+        before,
+        "a non-snow surface places nothing at all"
+    );
+    assert_eq!(
+        rng.next_bound(1 << 30),
+        Xor::seed(11).next_bound(1 << 30),
+        "and draws nothing"
+    );
+}

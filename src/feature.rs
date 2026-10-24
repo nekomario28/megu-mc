@@ -75,6 +75,12 @@ enum Cf {
     SeaPickle {
         count: IP,
     },
+    /// `minecraft:ice_spike` (`ecq`, `IceSpikeFeature`), config `{}`: walk down
+    /// through air to the first block, require it to be snow, then stack `radius`
+    /// that shrinks linearly over `nextInt(4) + 7` layers, with a rare floating
+    /// spike and a downward drill that replaces snow/powder/air/ice with packed ice
+    /// until y = 50.
+    IceSpike,
     Geode(Box<GeodeCfg>),
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
     /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
@@ -269,6 +275,100 @@ fn geode_place(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &str) 
     }
     if !reg.in_tag(ctx.get(p.0, p.1, p.2), cannot_replace) {
         ctx.set(p.0, p.1, p.2, st);
+    }
+}
+
+/// `Feature.isAirOrLeaves`: air, or any block in the vanilla leaves tag.
+fn is_air_or_leaves(reg: &BReg, st: u32) -> bool {
+    reg.is_air(st) || reg.in_tag(st, "minecraft:leaves")
+}
+
+/// `IceSpikeFeature` (`ecq`). The `&&`/`||` short circuits matter: the corner
+/// `nextFloat()` is drawn only for edge cells, so the stream depends on the shape
+/// the loop has reached.
+fn gen_ice_spike(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    // `Blocks.dP`/`dO`/`iC` in the bytecode: snow_block, ice, packed_ice
+    let snow = reg.state_of("minecraft:snow_block", None);
+    let ice_block = reg.state_of("minecraft:ice", None);
+    let packed = reg.state_of("minecraft:packed_ice", None);
+    let min_y = crate::worldgen::min_y();
+
+    let mut p = pos;
+    while ctx.is_air(p.0, p.1, p.2) && p.1 > min_y + 2 {
+        p.1 -= 1;
+    }
+    if ctx.get(p.0, p.1, p.2) != snow {
+        return;
+    }
+    p.1 += rng.next_bound(4);
+    let height = rng.next_bound(4) + 7;
+    let radius_max = height / 4 + rng.next_bound(2);
+    if radius_max > 1 && rng.next_bound(60) == 0 {
+        p.1 += 10 + rng.next_bound(30);
+    }
+
+    for h in 0..height {
+        let f = (1.0 - h as f32 / height as f32) * radius_max as f32;
+        let r = f.floor() as i32;
+        for dx in -r..=r {
+            let fx = dx.abs() as f32 - 0.25;
+            for dz in -r..=r {
+                let fz = dz.abs() as f32 - 0.25;
+                // Java negates float comparisons (`!(a > b)`), which is true for NaN
+                // where Rust's `<=` is false, so the negation is kept and only named
+                // out of clippy's way - the shape of the comparison is the reference's.
+                let outside = fx * fx + fz * fz > f * f;
+                let inside = (dx == 0 && dz == 0) || !outside;
+                let edge = dx != -r && dx != r && dz != -r && dz != r;
+                // the draw happens only when the cell is on the rim (Java `||`)
+                let passes = if edge {
+                    true
+                } else {
+                    let roll = rng.next_f32() > 0.75;
+                    !roll
+                };
+                if !(inside && passes) {
+                    continue;
+                }
+                for (yy, sign) in [(h, 1), (h, -1)] {
+                    if sign < 0 && (h == 0 || r <= 1) {
+                        continue;
+                    }
+                    let q = (p.0 + dx, p.1 + yy * sign, p.2 + dz);
+                    let at = ctx.get(q.0, q.1, q.2);
+                    if is_air_or_leaves(reg, at) || at == snow || at == ice_block {
+                        ctx.set(q.0, q.1, q.2, packed);
+                    }
+                }
+            }
+        }
+    }
+
+    let bottom_r = (radius_max - 1).clamp(0, 1);
+    for dx in -bottom_r..=bottom_r {
+        for dz in -bottom_r..=bottom_r {
+            let mut q = (p.0 + dx, p.1 - 1, p.2 + dz);
+            let mut budget = 50;
+            if dx.abs() == 1 && dz.abs() == 1 {
+                budget = rng.next_bound(5);
+            }
+            while q.1 > 50 {
+                let at = ctx.get(q.0, q.1, q.2);
+                if !(is_air_or_leaves(reg, at) || at == snow || at == ice_block || at == packed) {
+                    break;
+                }
+                ctx.set(q.0, q.1, q.2, packed);
+                q.1 -= 1;
+                budget -= 1;
+                if budget <= 0 {
+                    // `BlockPos.c(int)` is `below(int)`: the drill skips *down*, and
+                    // that is also what ends the loop (a jump up never reaches 50).
+                    q.1 -= rng.next_bound(5) + 1;
+                    budget = rng.next_bound(5);
+                }
+            }
+        }
     }
 }
 
@@ -500,6 +600,7 @@ fn p_cf(j: &J) -> Option<Cf> {
                 invalid_blocks_threshold: jint(j, "invalid_blocks_threshold", 0),
             }))
         }
+        "ice_spike" => Cf::IceSpike,
         "sea_pickle" => Cf::SeaPickle {
             count: p_ip(js(j, "count")?)?,
         },
@@ -1392,6 +1493,7 @@ pub(crate) fn ore_cells_for_test(
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::IceSpike => gen_ice_spike(ctx, rng, pos),
         Cf::SeaPickle { count } => {
             let Some(reg) = breg() else { return };
             let water = reg.state_of("minecraft:water", None);

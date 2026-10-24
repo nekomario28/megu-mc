@@ -532,3 +532,29 @@ ticket と worker のスケジュール）がそのまま出ている。つま�
 次に測るなら、① hot region の外でも dump が進むようにする（`populate` の待ちを診断）か、
 ② warm_ocean が spawn 近くにある seed を探して `tools/geode_fixture.sh` の形（ブロック4種を
 `sea_pickle` 1種に変えるだけ）で parity を取る、のどちらか。
+
+## 66. `ice_spike` を実装した（`Cf::IceSpike`）
+
+`IceSpikeFeature`（`ecq`、config は `{}`）を逆コンパイルして移植した。
+
+- 空気のあいだ下に降り、最初の非空気ブロックが `snow_block` であることを要求（駄目なら**ドローせず** false）。
+- `above(nextInt(4))`、`nextInt(4) + 7` 段、半径 `height / 4 + nextInt(2)`。半径が 1 を超えるときだけ
+  `nextInt(60) == 0` を引き、当たれば `above(10 + nextInt(30))` の**浮いた**spike になる。
+- 各段で `f = (1 - h/height) * radius`、`r = floor(f)`、`|dx|,|dz| <= r` のうち
+  「中心か `fx^2+fz^2 <= f^2`」かつ「辺でないか `nextFloat() > 0.75` でない」セルに packed_ice を置く。
+  **`nextFloat()` は辺のセルでだけ引かれる**（Java の `||` 短絡）ので、翻訳でもそのまま短絡させている。
+- 下向きには `h != 0 && r > 1` のとき `pos.offset(dx, -h, dz)` も同じ条件で埋める。
+- 仕上げに半径 `clamp(radius - 1, 0, 1)` の範囲で `above(-1)` から下へ掘る。掘る条件は
+  air/leaves/snow_block/**ice**/packed_ice（`Blocks.dO` は `powder_snow` ではなく `ice` だった）、
+  予算 50 を使い切ったら `below(nextInt(5) + 1)` だけ**下に飛ばして**予算を引き直す。ループは `y > 50` で止まる。
+
+移植中に踏んだ罠2つ（どちらも bytecode で確認して直した）: `BlockPos.c(int)` は `above(int)` ではなく
+**`below(int)`**（上に飛ばすと `y > 50` に到達せず無限ループになる。実際 60 秒以上回って気づいた）、
+`dga.dO` は `powder_snow` ではなく `ice`。clippy の `neg_cmp_op_on_partial_ord` は*直さない*:
+Java の `!(a > b)` は NaN で真、Rust の `<=` は偽なので、否定のまま変数に名前を付けて残した。
+
+ゲート: `ice_spike_builds_a_tapering_spike_on_snow`（雪の台の上で、`nextInt` 列を再生して求めた
+基準 y と高さから tip を導出、tip が1列であること、下向きに snow を置換していること、
+置いたブロックが packed_ice のみであること）と `ice_spike_does_nothing_without_snow`
+（雪でなければ何も置かず**1ドローも消費しない**）。mutation 2本を追加（高さと材質）で 58 proved / 0 not a gate。
+型カバレッジの未実装到達型は 9 → **8**。

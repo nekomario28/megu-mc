@@ -506,6 +506,16 @@ check "an update packet sends block light only" \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
   update_light_packet_sends_block_light_only
 
+check "an ice spike's tip is the drawn height above the drawn base" \
+  src/feature.rs '    let height = rng.next_bound(4) + 7;' \
+  '    let height = rng.next_bound(4) + 6;' \
+  ice_spike_builds_a_tapering_spike_on_snow
+
+check "an ice spike is built out of packed ice" \
+  src/feature.rs '                        ctx.set(q.0, q.1, q.2, packed);' \
+  '                        ctx.set(q.0, q.1, q.2, ice_block);' \
+  ice_spike_builds_a_tapering_spike_on_snow
+
 check "the heightmap a feature reads is the floor the blocks are at" \
   src/generation_context.rs '        let terrain = self.heightmap_above(x, z, start, base, false);' \
   '        let terrain = base;' \
