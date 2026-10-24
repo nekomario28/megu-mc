@@ -979,3 +979,120 @@ fn root_system_does_nothing_when_its_origin_is_not_air() {
         "and draws nothing"
     );
 }
+
+/// `minecraft:desert_well` (`ebw`), config `{}`. Every cell is a fixed offset from
+/// the sand block the walk-down lands on, so the shape is asserted exactly; the only
+/// randomness is which of the five shaft columns receives the two suspicious-sand
+/// blocks (`nextInt(5)` twice), and that is replayed from the same seed.
+#[test]
+fn desert_well_builds_its_shape_on_sand() {
+    let reg = breg().unwrap();
+    let states = |n: &str| reg.state_of(n, None);
+    let (sand, slab, sandstone, water, suspicious) = (
+        states("minecraft:sand"),
+        states("minecraft:sandstone_slab"),
+        states("minecraft:sandstone"),
+        states("minecraft:water"),
+        states("minecraft:suspicious_sand"),
+    );
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (8, 8);
+    let top = 70;
+    for dx in -6..=6 {
+        for dz in -6..=6 {
+            for y in top - 4..=top {
+                ctx.set(x + dx, y, z + dz, sand);
+            }
+        }
+    }
+    let mut rng = Xor::seed(9);
+    gen_cf(&Cf::DesertWell, freg(), &mut ctx, &mut rng, (x, top + 3, z));
+
+    let at = |ctx: &mut FC, p: (i32, i32, i32)| ctx.get(p.0, p.1, p.2);
+    // the walk-down lands on the sand's top cell and the well is built there
+    assert_eq!(
+        at(&mut ctx, (x, top, z)),
+        water,
+        "the well's column is water"
+    );
+    for (dx, dz) in [(1, 0), (0, 1), (-1, 0), (0, -1)] {
+        assert_eq!(
+            at(&mut ctx, (x + dx, top, z + dz)),
+            water,
+            "and one cell wider"
+        );
+        assert_eq!(
+            at(&mut ctx, (x + dx, top - 1, z + dz)),
+            sand,
+            "with a sand floor under the arms"
+        );
+    }
+    assert_eq!(at(&mut ctx, (x, top - 1, z)), sand);
+    // base plate, roof, posts and pillars
+    assert_eq!(at(&mut ctx, (x - 2, top - 2, z)), slab, "base plate");
+    assert_eq!(at(&mut ctx, (x, top + 4, z)), sandstone, "roof centre");
+    assert_eq!(at(&mut ctx, (x + 1, top + 4, z)), slab, "roof ring");
+    assert_eq!(at(&mut ctx, (x + 2, top + 1, z)), slab, "a post");
+    assert_eq!(at(&mut ctx, (x - 1, top + 1, z - 1)), sandstone, "a pillar");
+    assert_eq!(
+        at(&mut ctx, (x + 1, top + 3, z + 1)),
+        sandstone,
+        "up the pillar"
+    );
+
+    // the two suspicious-sand blocks, on the columns the two draws choose
+    let shaft = [
+        (x, top, z),
+        (x + 1, top, z),
+        (x, top, z + 1),
+        (x - 1, top, z),
+        (x, top, z - 1),
+    ];
+    let mut probe = Xor::seed(9);
+    let first = shaft[probe.next_bound(5) as usize];
+    let second = shaft[probe.next_bound(5) as usize];
+    assert_eq!(
+        at(&mut ctx, (first.0, first.1 + 1, first.2)),
+        suspicious,
+        "the first draw picks the column at +1"
+    );
+    assert_eq!(
+        at(&mut ctx, (second.0, second.1 + 2, second.2)),
+        suspicious,
+        "the second draw picks the column at +2"
+    );
+    let cells: Vec<((i32, i32, i32), u32)> = ctx.wr.iter().map(|(&p, &st)| (p, st)).collect();
+    assert_eq!(
+        cells.iter().filter(|(_, st)| *st == suspicious).count(),
+        2,
+        "exactly two suspicious-sand blocks"
+    );
+}
+
+/// The sand gate is the first thing after the walk-down and precedes the feature's
+/// only two draws, so a stone surface places nothing and spends nothing.
+#[test]
+fn desert_well_needs_sand_and_draws_nothing_otherwise() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (8, 8);
+    for dx in -6..=6 {
+        for dz in -6..=6 {
+            for y in 60..=70 {
+                ctx.set(x + dx, y, z + dz, stone);
+            }
+        }
+    }
+    let before = ctx.wr.clone();
+    let mut rng = Xor::seed(9);
+    gen_cf(&Cf::DesertWell, freg(), &mut ctx, &mut rng, (x, 73, z));
+    assert!(ctx.wr == before, "a stone surface places nothing");
+    assert_eq!(
+        rng.next_bound(1 << 30),
+        Xor::seed(9).next_bound(1 << 30),
+        "and draws nothing"
+    );
+}

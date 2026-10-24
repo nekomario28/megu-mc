@@ -618,3 +618,34 @@ Java の `!(a > b)` は NaN で真、Rust の `<=` は偽なので、否定の�
 そのため parity も未測定で、上の2つのテストは「規則」と「入口」だけを固定している。
 次に触るなら、まず harness で入れ子 feature が書く最小例を作る（実在の `minecraft:oak` も
 この合成地形では0だったので、地形の作り方＝床/天井の高さや `ctx` の状態が疑わしい）。
+
+## 69. `desert_well` を実装した（`Cf::DesertWell`）— 形と2ドローまで固定
+
+`DesertWellFeature`（`ebw`、config は `{}`）を移植した。テンプレートも block entity も要らない
+純ブロックロジックで、残りの中で最小（99行）。
+
+- 原点の**1つ上**から、空気のあいだ下へ降りる（`isEmptyBlock` かつ `y > min_y + 2`）。
+  着地したブロックが `sand` でなければ false（config の `BlockPredicate.matchesBlocks(SAND)`）。
+- 足元の柱が「1つ下と2つ下が両方空気」なら中止（井戸の足場に地面が要る）。
+- 以降は固定: slab の底板（dx,dz ±2 / dy −2..0）、水柱（原点と水平4方向）、その下に sand（同じ5セル）、
+  y+1 の縁、四隅の支柱、y+4 の屋根（中央 = sandstone、周 = slab）、四隅の砂岩柱（y+1..3）。
+- 最後に `suspicious_sand` を2つ、`[origin, east, south, west, north]` から `nextInt(5)` で2回選んだ列の
+  +1 と +2 に置く。
+
+mappings で先に解決した名前: `Blocks.I/J/aV/jF/G` = SAND / **SUSPICIOUS_SAND** / SANDSTONE /
+SANDSTONE_SLAB / WATER、`BlockPos.d()`/`e()` = `above()`/`below()`、
+**`.f()/.g()/.h()/.i()` = north/south/west/east**（この並びが2つの suspicious sand の位置を決める）、
+`LevelReader.u(pos)` = `isEmptyBlock`。
+
+### ゲート
+
+- `desert_well_builds_its_shape_on_sand`: 着地セルからの固定オフセットで水柱・砂床・底板・屋根・支柱・柱を
+  1セルずつ照合し、**2つの suspicious_sand が `nextInt(5)` の再生結果と一致すること**、合計ちょうど2個であること。
+- `desert_well_needs_sand_and_draws_nothing_otherwise`: 石の上では何も置かず**1ドローも消費しない**。
+- mutation 2本（屋根中央の材質、`nextInt(5)` の bound）で 60 proved / 0 not a gate。
+
+**既知の欠落（port の chest と同じ扱い）**: ブロックは置くが suspicious_sand に
+archaeology の loot table を付けない（block entity の loot を持たないため、brush しても何も出ない）。
+
+型カバレッジの未実装到達型は 7 → **6**（`fossil` `iceberg` `sculk_patch` `dripstone_cluster`
+`large_dripstone` `speleothem_cluster`）。

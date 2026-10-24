@@ -506,6 +506,16 @@ check "an update packet sends block light only" \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
   update_light_packet_sends_block_light_only
 
+check "a desert well's roof centre is sandstone, not a slab" \
+  src/feature.rs '            let st = if dx == 0 && dz == 0 { sandstone } else { slab };' \
+  '            let st = if dx == 0 && dz == 0 { slab } else { slab };' \
+  desert_well_builds_its_shape_on_sand
+
+check "a desert well picks its suspicious sand with nextInt(5)" \
+  src/feature.rs '    let i1 = rng.next_bound(shaft.len() as i32) as usize;' \
+  '    let i1 = rng.next_bound(shaft.len() as i32 - 1) as usize;' \
+  desert_well_builds_its_shape_on_sand
+
 check "an ice spike's tip is the drawn height above the drawn base" \
   src/feature.rs '    let height = rng.next_bound(4) + 7;' \
   '    let height = rng.next_bound(4) + 6;' \

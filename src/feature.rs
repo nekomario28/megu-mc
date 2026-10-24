@@ -88,6 +88,16 @@ enum Cf {
     /// root column of `rooted_dirt` up to that height, and then a field of hanging
     /// roots is scattered around the origin.
     RootSystem(Box<RootSystemCfg>),
+    /// `minecraft:desert_well` (`ebw`), config `{}`: walk down from the origin's
+    /// above-cell while it is empty, require `sand` (the config's
+    /// `BlockPredicate.matchesBlocks(SAND)`), then build a slab base plate, a water
+    /// column with a sand floor, a rim, four posts, a slab roof on sandstone pillars,
+    /// and two `suspicious_sand` blocks at a random horizontal neighbour.
+    ///
+    /// Known gap, the same one the port's chests carry: the blocks are placed but the
+    /// archaeology loot table is not attached to the suspicious sand (no block-entity
+    /// loot support), so brushing it yields nothing.
+    DesertWell,
     Geode(Box<GeodeCfg>),
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
     /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
@@ -271,6 +281,89 @@ struct GeodeCfg {
     max_gen_offset: i32,
     noise_multiplier: f64,
     invalid_blocks_threshold: i32,
+}
+
+/// `minecraft:desert_well` (`ebw`). Letters resolved in the mappings first:
+/// `Blocks.I/J/aV/jF/G` are SAND / SUSPICIOUS_SAND / SANDSTONE / SANDSTONE_SLAB /
+/// WATER, `BlockPos.d()`/`e()` are `above()`/`below()`, and `.f()/.g()/.h()/.i()` are
+/// north/south/west/east - that order matters, because the two suspicious sand blocks
+/// come from `nextInt(5)` over `[origin, east, south, west, north]`.
+fn gen_desert_well(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let sand = reg.state_of("minecraft:sand", None);
+    let slab = reg.state_of("minecraft:sandstone_slab", None);
+    let sandstone = reg.state_of("minecraft:sandstone", None);
+    let water = reg.state_of("minecraft:water", None);
+    let suspicious = reg.state_of("minecraft:suspicious_sand", None);
+    let min_y = crate::worldgen::min_y();
+
+    let mut p = (pos.0, pos.1 + 1, pos.2);
+    while p.1 > min_y + 2 && ctx.is_air(p.0, p.1, p.2) {
+        p.1 -= 1;
+    }
+    if ctx.get(p.0, p.1, p.2) != sand {
+        return;
+    }
+    // the footprint needs ground: two empty cells under one column reject the well
+    for dx in -2..=2 {
+        for dz in -2..=2 {
+            if ctx.is_air(p.0 + dx, p.1 - 1, p.2 + dz) && ctx.is_air(p.0 + dx, p.1 - 2, p.2 + dz) {
+                return;
+            }
+        }
+    }
+
+    for dy in -2..=0 {
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                ctx.set(p.0 + dx, p.1 + dy, p.2 + dz, slab);
+            }
+        }
+    }
+    ctx.set(p.0, p.1, p.2, water);
+    const HORIZ: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+    for (dx, dz) in HORIZ {
+        ctx.set(p.0 + dx, p.1, p.2 + dz, water);
+    }
+    let below = (p.0, p.1 - 1, p.2);
+    ctx.set(below.0, below.1, below.2, sand);
+    for (dx, dz) in HORIZ {
+        ctx.set(below.0 + dx, below.1, below.2 + dz, sand);
+    }
+
+    for dx in -2i32..=2 {
+        for dz in -2i32..=2 {
+            if dx.abs() == 2 || dz.abs() == 2 {
+                ctx.set(p.0 + dx, p.1 + 1, p.2 + dz, slab);
+            }
+        }
+    }
+    for (dx, dz) in [(2, 0), (-2, 0), (0, 2), (0, -2)] {
+        ctx.set(p.0 + dx, p.1 + 1, p.2 + dz, slab);
+    }
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            let st = if dx == 0 && dz == 0 { sandstone } else { slab };
+            ctx.set(p.0 + dx, p.1 + 4, p.2 + dz, st);
+        }
+    }
+    for y in 1..=3 {
+        for (dx, dz) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+            ctx.set(p.0 + dx, p.1 + y, p.2 + dz, sandstone);
+        }
+    }
+
+    let shaft = [
+        p,
+        (p.0 + 1, p.1, p.2),
+        (p.0, p.1, p.2 + 1),
+        (p.0 - 1, p.1, p.2),
+        (p.0, p.1, p.2 - 1),
+    ];
+    let i1 = rng.next_bound(shaft.len() as i32) as usize;
+    ctx.set(shaft[i1].0, shaft[i1].1 + 1, shaft[i1].2, suspicious);
+    let i2 = rng.next_bound(shaft.len() as i32) as usize;
+    ctx.set(shaft[i2].0, shaft[i2].1 + 2, shaft[i2].2, suspicious);
 }
 
 /// `minecraft:root_system` (`edg`). Obfuscated letters resolved in the official
@@ -793,6 +886,7 @@ fn p_cf(j: &J) -> Option<Cf> {
             water_for_tree: jint(j, "allowed_vertical_water_for_tree", 0),
             allowed_tree_position: p_pred(js(j, "allowed_tree_position")?)?,
         })),
+        "desert_well" => Cf::DesertWell,
         "ice_spike" => Cf::IceSpike,
         "sea_pickle" => Cf::SeaPickle {
             count: p_ip(js(j, "count")?)?,
@@ -1686,6 +1780,7 @@ pub(crate) fn ore_cells_for_test(
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::DesertWell => gen_desert_well(ctx, rng, pos),
         Cf::RootSystem(c) => gen_root_system(ctx, rng, pos, c),
         Cf::IceSpike => gen_ice_spike(ctx, rng, pos),
         Cf::SeaPickle { count } => {
