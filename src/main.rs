@@ -13562,42 +13562,51 @@ fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) 
     // merge only when components match too (vanilla: stacks with different NBT never merge)
     let mergeable = |a: &Stack, b: &Stack| a.0 == b.0 && a.2 == b.2;
     if btn == 0 {
-        if cv.1 == 0 && sv.is_some() {
-            *cur = sv.unwrap();
-            m.remove(&slot);
-        } else if cv.1 > 0 && sv.is_none() {
-            m.insert(slot, cv);
-            *cur = empty;
-        } else if cv.1 > 0 && sv.is_some() {
-            let svv = sv.unwrap();
-            let room = stack_max_of(&svv) - svv.1 as i64;
-            if mergeable(&svv, &cv) && room >= cv.1 as i64 {
-                m.insert(slot, (svv.0, svv.1 + cv.1, svv.2));
-                *cur = empty;
-            } else {
-                m.insert(slot, cv);
-                *cur = svv;
+        if cv.1 == 0 {
+            if let Some(s) = sv {
+                *cur = s;
+                m.remove(&slot);
+            }
+        } else {
+            match sv {
+                None => {
+                    m.insert(slot, cv);
+                    *cur = empty;
+                }
+                Some(svv) => {
+                    let room = stack_max_of(&svv) - svv.1 as i64;
+                    if mergeable(&svv, &cv) && room >= cv.1 as i64 {
+                        m.insert(slot, (svv.0, svv.1 + cv.1, svv.2));
+                        *cur = empty;
+                    } else {
+                        m.insert(slot, cv);
+                        *cur = svv;
+                    }
+                }
             }
         }
     } else if btn == 1 {
-        if cv.1 == 0 && sv.is_some() {
-            let (si, sc, cps) = sv.unwrap();
-            let take = sc - sc / 2;
-            *cur = (si, take, cps.clone());
-            if sc - take == 0 {
-                m.remove(&slot);
-            } else {
-                m.insert(slot, (si, sc - take, cps));
+        if cv.1 == 0 {
+            if let Some((si, sc, cps)) = sv {
+                let take = sc - sc / 2;
+                *cur = (si, take, cps.clone());
+                if sc - take == 0 {
+                    m.remove(&slot);
+                } else {
+                    m.insert(slot, (si, sc - take, cps));
+                }
             }
-        } else if cv.1 > 0 {
-            if sv.is_none() {
-                m.insert(slot, (cv.0, 1, cv.2.clone()));
-                *cur = (cv.0, cv.1 - 1, cv.2);
-            } else {
-                let svv = sv.unwrap();
-                if mergeable(&svv, &cv) && svv.1 < stack_max_of(&svv) as u8 {
-                    m.insert(slot, (svv.0, svv.1 + 1, svv.2));
+        } else {
+            match sv {
+                None => {
+                    m.insert(slot, (cv.0, 1, cv.2.clone()));
                     *cur = (cv.0, cv.1 - 1, cv.2);
+                }
+                Some(svv) => {
+                    if mergeable(&svv, &cv) && svv.1 < stack_max_of(&svv) as u8 {
+                        m.insert(slot, (svv.0, svv.1 + 1, svv.2));
+                        *cur = (cv.0, cv.1 - 1, cv.2);
+                    }
                 }
             }
         }
@@ -17693,8 +17702,9 @@ fn handle(mut s: TcpStream) {
                         } else {
                             draw_t >= 1.25 - 0.25 * (qc as f32).min(5.0)
                         };
-                        if (hit == 801 || hit == 1192) && arrow_slot.is_some() && can_fire {
-                            let asl = arrow_slot.unwrap();
+                        if let (true, true, Some(asl)) =
+                            ((hit == 801 || hit == 1192), can_fire, arrow_slot)
+                        {
                             let pow_f = (charge_t * charge_t + 2.0 * charge_t) / 3.0;
                             let inf = {
                                 let i2 = me.inv.lock().unwrap();
@@ -18022,8 +18032,8 @@ fn handle(mut s: TcpStream) {
                                 7511 | 7512 => Some((806, 72)),   // emerald -> emerald_ore
                                 _ => None,
                             };
-                            let (drop_item, drop_cnt) = if silk && ore.is_some() {
-                                (Some(ore.unwrap().1), 1)
+                            let (drop_item, drop_cnt) = if let (true, Some(o)) = (silk, ore) {
+                                (Some(o.1), 1)
                             } else {
                                 let it = match old {
                                     127 | 128 => Some(803),
@@ -19454,48 +19464,53 @@ fn handle(mut s: TcpStream) {
                                     let sv = gmap.get(&gslot).cloned();
                                     let cv = cur.clone();
                                     if btn == 0 {
-                                        if cv.1 == 0 && sv.is_some() {
-                                            *cur = sv.unwrap();
-                                            gmap.remove(&gslot);
-                                        } else if cv.1 > 0 && sv.is_none() {
-                                            gmap.insert(gslot, cv);
-                                            *cur = (0, 0, Vec::new());
-                                        } else if cv.1 > 0 && sv.is_some() {
-                                            let (si, sc, _cc) = sv.unwrap();
-                                            if si == cv.0
-                                                && _cc == cv.2
-                                                && sc as i64 + cv.1 as i64
-                                                    <= item_stack_max(si, &_cc)
-                                            {
-                                                gmap.insert(gslot, (si, sc + cv.1, _cc));
-                                                *cur = (0, 0, Vec::new());
-                                            } else {
-                                                gmap.insert(gslot, cv);
-                                                *cur = (si, sc, _cc);
+                                        if cv.1 == 0 {
+                                            if let Some(s) = sv {
+                                                *cur = s;
+                                                gmap.remove(&gslot);
+                                            }
+                                        } else {
+                                            match sv {
+                                                None => {
+                                                    gmap.insert(gslot, cv);
+                                                    *cur = (0, 0, Vec::new());
+                                                }
+                                                Some((si, sc, _cc)) => {
+                                                    if si == cv.0
+                                                        && _cc == cv.2
+                                                        && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc)
+                                                    {
+                                                        gmap.insert(gslot, (si, sc + cv.1, _cc));
+                                                        *cur = (0, 0, Vec::new());
+                                                    } else {
+                                                        gmap.insert(gslot, cv);
+                                                        *cur = (si, sc, _cc);
+                                                    }
+                                                }
                                             }
                                         }
                                     } else if btn == 1 {
-                                        if cv.1 == 0 && sv.is_some() {
-                                            let (si, sc, _cc) = sv.unwrap();
-                                            let take = sc - sc / 2;
-                                            *cur = (si, take, _cc.clone());
-                                            if sc - take == 0 {
-                                                gmap.remove(&gslot);
-                                            } else {
-                                                gmap.insert(gslot, (si, sc - take, _cc));
+                                        if cv.1 == 0 {
+                                            if let Some((si, sc, _cc)) = sv {
+                                                let take = sc - sc / 2;
+                                                *cur = (si, take, _cc.clone());
+                                                if sc - take == 0 {
+                                                    gmap.remove(&gslot);
+                                                } else {
+                                                    gmap.insert(gslot, (si, sc - take, _cc));
+                                                }
                                             }
-                                        } else if cv.1 > 0 {
-                                            if sv.is_none() {
-                                                gmap.insert(gslot, (cv.0, 1, cv.2.clone()));
-                                                *cur = (cv.0, cv.1 - 1, cv.2);
-                                            } else {
-                                                let (si, sc, _cc) = sv.unwrap();
-                                                if si == cv.0
-                                                    && _cc == cv.2
-                                                    && sc < item_stack_max(si, &_cc) as u8
-                                                {
-                                                    gmap.insert(gslot, (si, sc + 1, _cc));
+                                        } else {
+                                            match sv {
+                                                None => {
+                                                    gmap.insert(gslot, (cv.0, 1, cv.2.clone()));
                                                     *cur = (cv.0, cv.1 - 1, cv.2);
+                                                }
+                                                Some((si, sc, _cc)) => {
+                                                    if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 {
+                                                        gmap.insert(gslot, (si, sc + 1, _cc));
+                                                        *cur = (cv.0, cv.1 - 1, cv.2);
+                                                    }
                                                 }
                                             }
                                         }
@@ -19578,48 +19593,53 @@ fn handle(mut s: TcpStream) {
                                         let sv = if m.1 == 0 { None } else { Some(m.clone()) };
                                         let cv = cur.clone();
                                         if btn == 0 {
-                                            if cv.1 == 0 && sv.is_some() {
-                                                *cur = sv.unwrap();
-                                                *m = (0, 0, Vec::new());
-                                            } else if cv.1 > 0 && sv.is_none() {
-                                                *m = cv;
-                                                *cur = (0, 0, Vec::new());
-                                            } else if cv.1 > 0 && sv.is_some() {
-                                                let (si, sc, _cc) = sv.unwrap();
-                                                if si == cv.0
-                                                    && _cc == cv.2
-                                                    && sc as i64 + cv.1 as i64
-                                                        <= item_stack_max(si, &_cc)
-                                                {
-                                                    *m = (si, sc + cv.1, _cc);
-                                                    *cur = (0, 0, Vec::new());
-                                                } else {
-                                                    *m = cv;
-                                                    *cur = (si, sc, _cc);
+                                            if cv.1 == 0 {
+                                                if let Some(s) = sv {
+                                                    *cur = s;
+                                                    *m = (0, 0, Vec::new());
+                                                }
+                                            } else {
+                                                match sv {
+                                                    None => {
+                                                        *m = cv;
+                                                        *cur = (0, 0, Vec::new());
+                                                    }
+                                                    Some((si, sc, _cc)) => {
+                                                        if si == cv.0
+                                                            && _cc == cv.2
+                                                            && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc)
+                                                        {
+                                                            *m = (si, sc + cv.1, _cc);
+                                                            *cur = (0, 0, Vec::new());
+                                                        } else {
+                                                            *m = cv;
+                                                            *cur = (si, sc, _cc);
+                                                        }
+                                                    }
                                                 }
                                             }
                                         } else if btn == 1 {
-                                            if cv.1 == 0 && sv.is_some() {
-                                                let (si, sc, _cc) = sv.unwrap();
-                                                let take = sc - sc / 2;
-                                                *cur = (si, take, _cc.clone());
-                                                if sc - take == 0 {
-                                                    *m = (0, 0, Vec::new());
-                                                } else {
-                                                    *m = (si, sc - take, _cc);
+                                            if cv.1 == 0 {
+                                                if let Some((si, sc, _cc)) = sv {
+                                                    let take = sc - sc / 2;
+                                                    *cur = (si, take, _cc.clone());
+                                                    if sc - take == 0 {
+                                                        *m = (0, 0, Vec::new());
+                                                    } else {
+                                                        *m = (si, sc - take, _cc);
+                                                    }
                                                 }
-                                            } else if cv.1 > 0 {
-                                                if sv.is_none() {
-                                                    *m = (cv.0, 1, cv.2.clone());
-                                                    *cur = (cv.0, cv.1 - 1, cv.2);
-                                                } else {
-                                                    let (si, sc, _cc) = sv.unwrap();
-                                                    if si == cv.0
-                                                        && _cc == cv.2
-                                                        && sc < item_stack_max(si, &_cc) as u8
-                                                    {
-                                                        *m = (si, sc + 1, _cc);
+                                            } else {
+                                                match sv {
+                                                    None => {
+                                                        *m = (cv.0, 1, cv.2.clone());
                                                         *cur = (cv.0, cv.1 - 1, cv.2);
+                                                    }
+                                                    Some((si, sc, _cc)) => {
+                                                        if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 {
+                                                            *m = (si, sc + 1, _cc);
+                                                            *cur = (cv.0, cv.1 - 1, cv.2);
+                                                        }
                                                     }
                                                 }
                                             }
