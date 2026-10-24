@@ -440,3 +440,35 @@ vineflower でソースに落として移植した（手順は `tools/README.md`
 次に触るなら、**port と vanilla agentのドロー列を geode の添字で突き合わせる**
 （`FSEED_ARM=cx,cz,i,step` は step 2 / i 2 が geode）か、`normal_new_l` の1オクターブ正規化を
 参照値と比べる。ここを飛ばして形を合わせにいくのは §CV1/§CV2 の失敗になる。
+
+### 63.1 次の測定をやった：配置のドローは vanilla と完全一致、残差はノイズの場
+
+`tools/carve-agent`（`-Dfseedchunk=0,0 -Dfseedarm=2,2`）で vanilla 側の geode のドローを出し、
+port の `FSEED_ARM=0,0,2,2` と並べた（seed 12）:
+
+| # | vanilla (`RDRAW`) | port (`DRAW`) |
+|---|---|---|
+| 0 | nextFloat = 0.0014750957 | nextFloat = 0.0014750957489013672 |
+| 1 | nextInt(16) = 5 | nextInt(16) = 5 |
+| 2 | nextInt(16) = 3 | nextInt(16) = 3 |
+| 3 | nextInt(89) = 26 | nextInt(89) = 26 |
+| 4 | nextInt(2) = 0 | nextInt(2) = 0 |
+| — | nextDouble = 0.5666987405771309 | nextDouble = 0.17697429956041832 |
+| — | nextDouble = 0.9393808564749294 | nextFloat = 0.33311378955841064 |
+| — | nextDouble = 0.4303670590541948 | nextInt(3) = 2 |
+
+rarity（1/24 を切る 0.001475 ✓）、in_square の (5,3)、height の 26（→ y = -32）、
+`distribution_points` の `nextInt(2)=0`（→ 3点）まで**値まで一致**。つまり
+**原点・点数・pos は同一**で、その先の差はノイズに帰属する（§63 のセル比較・ノイズ倍率の単調悪化と整合）。
+
+ただし vanilla 側の 3 つの `nextDouble` は**同じ RNG の続きではない**: geode は
+`NormalNoise.create(new WorldgenRandom(new LegacyRandomSource(level.getSeed())), -4, 1.0)` を
+*配置のたびに*作るので、その構築ドローが同じ `f=2,2` として混ざって出る（agent は
+`FEAT` スレッドローカルでラベル付けするだけで、RNG の出所は見ていない）。しかも agent は
+noise 構築の `nextInt(bound)` を hook していない（`RBOUND` が 1 行も出ていない）ので、
+このログでは index を合わせた比較ができない。
+
+→ **次に必要なのは noise の値の oracle**: agent に `-Dnoisedump=x,y,z`（`eoh.a(DDD)D` を
+instrument して値を出す）を足し、port の `normal_new_l(12, -4, &[1.0])` と座標ごとに比べる。
+`tools/carve-agent/README.md` のビルド手順（ASM 9.8 + javac）で足せる。ここを飛ばして
+（例えば倍率を合わせにいくのは）§63 の測定が示すとおり悪化するだけ。
