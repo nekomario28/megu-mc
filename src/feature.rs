@@ -98,6 +98,10 @@ enum Cf {
     /// archaeology loot table is not attached to the suspicious sand (no block-entity
     /// loot support), so brushing it yields nothing.
     DesertWell,
+    /// `minecraft:iceberg` (`ecr`), config `{state}`.
+    Iceberg {
+        state: u32,
+    },
     Geode(Box<GeodeCfg>),
     RandSel(Vec<(Pf, f32)>, Option<Box<Pf>>),
     /// `minecraft:random_patch` (`edc`): `tries` times, pick a position by drawing
@@ -281,6 +285,368 @@ struct GeodeCfg {
     max_gen_offset: i32,
     noise_multiplier: f64,
     invalid_blocks_threshold: i32,
+}
+
+/// `minecraft:iceberg` (`ecr`, `IcebergFeature`), config `{state}` (packed_ice for
+/// `iceberg_packed`, blue_ice for `iceberg_blue`). The origin is moved to sea level,
+/// then two shapes are possible: a "tall" one (`flag1`, chosen by a `nextDouble`) and
+/// a flat one, each built from a height-dependent radius and then carved back with a
+/// signed-distance test (a circle for the flat shape, an ellipse rotated by
+/// `angle` for the tall one).
+///
+/// Letters resolved in the mappings first - this feature is dense with them:
+/// `Blocks.a/G/L/dN/dO/dP/iC/mW` are AIR / WATER / GRAVEL / SNOW / ICE / SNOW_BLOCK /
+/// PACKED_ICE / BLUE_ICE; `ChunkGenerator.f()` is `getSeaLevel()`; `RandomSource.h()`
+/// is `nextBoolean()`, `.i()` is `nextFloat()`, `.j()` is `nextDouble()`;
+/// `Mth.a(FFF)` is `clamp`; `BlockPos.f()/.g()/.h()/.i()` are north/south/west/east.
+///
+/// Every branch that draws is kept as the reference has it (a `||` still
+/// short-circuits, a `nextInt` inside an `if` is still inside it), because the
+/// iceberg is drawn from a single stream across all of its helpers.
+#[allow(clippy::too_many_arguments)]
+fn gen_iceberg(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), state: u32) {
+    let pos = (origin.0, crate::worldgen::sea_level(), origin.2);
+    let fire = rng.next_f64() > 0.7;
+    let angle = rng.next_f64() * 2.0 * std::f64::consts::PI;
+    let i = 11 - rng.next_bound(5);
+    let j = 3 + rng.next_bound(3);
+    let tall = rng.next_f64() > 0.7;
+    let mut l = if tall {
+        rng.next_bound(6) + 6
+    } else {
+        rng.next_bound(15) + 3
+    };
+    if !tall && rng.next_f64() > 0.9 {
+        l += rng.next_bound(19) + 7;
+    }
+    let i1 = (l + rng.next_bound(11)).min(18);
+    let j1 = (l + rng.next_bound(7) - rng.next_bound(5)).min(11);
+    let k1 = if tall { i } else { 11 };
+
+    for dx in -k1..k1 {
+        for dz in -k1..k1 {
+            for y in 0..l {
+                let r = if tall {
+                    iceberg_radius_round(y, l, j1)
+                } else {
+                    iceberg_radius_ellipse(rng, y, l, j1)
+                };
+                if tall || dx < r {
+                    iceberg_block(
+                        ctx, rng, pos, l, dx, y, dz, r, k1, tall, j, angle, fire, state,
+                    );
+                }
+            }
+        }
+    }
+    iceberg_smooth(ctx, pos, j1, l, tall, i);
+    for dx in -k1..k1 {
+        for dz in -k1..k1 {
+            let mut y = -1;
+            while y > -i1 {
+                // `Mth.floor(k1 * (1 - y^2 / (i1 * 8)))`: the tall shape's narrowing
+                // underside
+                let r = if tall {
+                    (k1 as f64 * (1.0 - (y as f64).powi(2) / (i1 as f64 * 8.0))).floor() as i32
+                } else {
+                    k1
+                };
+                let r2 = iceberg_radius_steep(rng, -y, i1, j1);
+                if dx < r2 {
+                    iceberg_block(
+                        ctx, rng, pos, i1, dx, y, dz, r2, r, tall, j, angle, fire, state,
+                    );
+                }
+                y -= 1;
+            }
+        }
+    }
+    let top = if tall {
+        rng.next_f64() > 0.1
+    } else {
+        rng.next_f64() > 0.7
+    };
+    if top {
+        iceberg_place_top(ctx, rng, j1, l, pos, tall, i, angle, j);
+    }
+}
+
+/// `IcebergFeature.heightDependentRadiusEllipse`: one `nextFloat`, plus a
+/// `nextInt(5)`/`nextInt(6)` pair only on the tall branch.
+fn iceberg_radius_ellipse(rng: &mut Xor, y: i32, max_height: i32, scale: i32) -> i32 {
+    let f = 3.5 - rng.next_f32();
+    let mut f1 = (1.0 - (y as f64).powi(2) / (max_height as f64 * f as f64)) as f32 * scale as f32;
+    if max_height > 15 + rng.next_bound(5) {
+        let v = if y < 3 + rng.next_bound(6) { y / 2 } else { y };
+        f1 = (1.0 - v as f32 / (max_height as f32 * f * 0.4)) * scale as f32;
+    }
+    (f1 / 2.0).floor() as i32
+}
+
+/// `heightDependentRadiusRound`: no draws.
+fn iceberg_radius_round(y: i32, max_height: i32, scale: i32) -> i32 {
+    let f1 = (1.0 - (y as f64).powi(2) / max_height as f64) as f32 * scale as f32;
+    (f1 / 2.0).floor() as i32
+}
+
+/// `heightDependentRadiusSteep`: one `nextFloat`.
+fn iceberg_radius_steep(rng: &mut Xor, y: i32, max_height: i32, scale: i32) -> i32 {
+    let f = 1.0 + rng.next_f32() / 2.0;
+    let f1 = (1.0 - y as f32 / (max_height as f32 * f)) * scale as f32;
+    (f1 / 2.0).floor() as i32
+}
+
+/// `isIcebergState`: the feature's own three materials.
+fn is_iceberg_state(reg: &BReg, st: u32) -> bool {
+    matches!(
+        reg.name_of(st),
+        "minecraft:packed_ice" | "minecraft:snow_block" | "minecraft:blue_ice"
+    )
+}
+
+/// `signedDistanceEllipse`: the rotated ellipse the tall shape carves with.
+fn iceberg_ellipse_dist(
+    dx: i32,
+    dz: i32,
+    offset: (i32, i32, i32),
+    r1: i32,
+    r2: i32,
+    angle: f64,
+) -> f64 {
+    let x = (dx - offset.0) as f64;
+    let z = (dz - offset.2) as f64;
+    (((x * angle.cos() - z * angle.sin()) / r1 as f64).powi(2)
+        + ((x * angle.sin() + z * angle.cos()) / r2 as f64).powi(2))
+        - 1.0
+}
+
+/// `signedDistanceCircle`: one `nextFloat` per call.
+fn iceberg_circle_dist(dx: i32, dz: i32, offset: (i32, i32, i32), r: i32, rng: &mut Xor) -> f64 {
+    let f = 10.0 * rng.next_f32().clamp(0.2, 0.8) as f64 / r as f64;
+    f + (dx - offset.0).pow(2) as f64 + (dz - offset.2).pow(2) as f64 - (r as f64).powi(2)
+}
+
+/// `heightDependentRadiusOffset`: no draws.
+fn iceberg_offset(y: i32, max_height: i32, j: i32) -> i32 {
+    if y > 0 && max_height - y <= 3 {
+        j - (4 - (max_height - y))
+    } else {
+        j
+    }
+}
+
+/// `placeIcebergBlock`: the write gate, with its `nextDouble` and `nextInt` draws.
+#[allow(clippy::too_many_arguments)]
+fn iceberg_place_block(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    level: i32,
+    max_height: i32,
+    tall: bool,
+    fire: bool,
+    state: u32,
+) {
+    let Some(reg) = breg() else { return };
+    let cur = ctx.get(pos.0, pos.1, pos.2);
+    let n = reg.name_of(cur);
+    if !(reg.is_air(cur)
+        || n == "minecraft:snow_block"
+        || n == "minecraft:ice"
+        || n == "minecraft:water")
+    {
+        return;
+    }
+    let roll = if !tall { true } else { rng.next_f64() > 0.05 };
+    let d = if tall { 3 } else { 2 };
+    let snow = fire
+        && n != "minecraft:water"
+        && (level as f64)
+            <= rng.next_bound((max_height / d).max(1)) as f64 + max_height as f64 * 0.6
+        && roll;
+    let st = if snow {
+        reg.state_of("minecraft:snow_block", None)
+    } else {
+        state
+    };
+    ctx.set(pos.0, pos.1, pos.2, st);
+}
+
+/// `generateIcebergBlock` (the ellipse/circle test plus the depth guard).
+#[allow(clippy::too_many_arguments)]
+fn iceberg_block(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    max_height: i32,
+    dx: i32,
+    y: i32,
+    dz: i32,
+    r: i32,
+    radius_scale: i32,
+    tall: bool,
+    j: i32,
+    angle: f64,
+    fire: bool,
+    state: u32,
+) {
+    let d0 = if tall {
+        iceberg_ellipse_dist(
+            dx,
+            dz,
+            pos,
+            radius_scale,
+            iceberg_offset(y, max_height, j),
+            angle,
+        )
+    } else {
+        iceberg_circle_dist(dx, dz, pos, r, rng)
+    };
+    if d0 >= 0.0 {
+        return;
+    }
+    let p = (pos.0 + dx, pos.1 + y, pos.2 + dz);
+    let d1 = if tall {
+        -0.5
+    } else {
+        -6.0 - rng.next_bound(3) as f64
+    };
+    if d0 > d1 && rng.next_f64() > 0.9 {
+        return;
+    }
+    iceberg_place_block(ctx, rng, p, max_height - y, max_height, tall, fire, state);
+}
+
+/// `IcebergFeature.smooth`: removes single ice cells whose neighbour count is too
+/// low, and cells whose block below is air.
+fn iceberg_smooth(
+    ctx: &mut FC,
+    pos: (i32, i32, i32),
+    radius: i32,
+    max_height: i32,
+    tall: bool,
+    i: i32,
+) {
+    let Some(reg) = breg() else { return };
+    let r = if tall { i } else { radius / 2 };
+    let air = reg.state_of("minecraft:air", None);
+    for dx in -r..=r {
+        for dz in -r..=r {
+            for y in 0..=max_height {
+                let p = (pos.0 + dx, pos.1 + y, pos.2 + dz);
+                let cur = ctx.get(p.0, p.1, p.2);
+                let n = reg.name_of(cur);
+                if !(is_iceberg_state(reg, cur) || n == "minecraft:snow") {
+                    continue;
+                }
+                if ctx.is_air(p.0, p.1 - 1, p.2) {
+                    ctx.set(p.0, p.1, p.2, air);
+                    ctx.set(p.0, p.1 - 1, p.2, air);
+                } else if is_iceberg_state(reg, cur) {
+                    let neighbours = [
+                        ctx.get(p.0 - 1, p.1, p.2),
+                        ctx.get(p.0 + 1, p.1, p.2),
+                        ctx.get(p.0, p.1, p.2 - 1),
+                        ctx.get(p.0, p.1, p.2 + 1),
+                    ];
+                    let empty = neighbours
+                        .iter()
+                        .filter(|&&s| !is_iceberg_state(reg, s))
+                        .count();
+                    if empty >= 3 {
+                        ctx.set(p.0, p.1, p.2, air);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `placeTop` and its per-ring helper: the pointed cap above sea level.
+#[allow(clippy::too_many_arguments)]
+fn iceberg_place_top(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    radius: i32,
+    max_height: i32,
+    pos: (i32, i32, i32),
+    tall: bool,
+    i: i32,
+    angle: f64,
+    j: i32,
+) {
+    let sx = if rng.next_bool() { -1 } else { 1 };
+    let sz = if rng.next_bool() { -1 } else { 1 };
+    let mut r1 = rng.next_bound((radius / 2 - 2).max(1));
+    if rng.next_bool() {
+        r1 = radius / 2 + 1 - rng.next_bound((radius - radius / 2 - 1).max(1));
+    }
+    let mut r2 = rng.next_bound((radius / 2 - 2).max(1));
+    if rng.next_bool() {
+        r2 = radius / 2 + 1 - rng.next_bound((radius - radius / 2 - 1).max(1));
+    }
+    if tall {
+        r1 = rng.next_bound((i - 5).max(1));
+        r2 = r1;
+    }
+    let offset = (sx * r1, 0, sz * r2);
+    let a = if tall {
+        angle + std::f64::consts::FRAC_PI_2
+    } else {
+        rng.next_f64() * 2.0 * std::f64::consts::PI
+    };
+    for y in 0..max_height - 3 {
+        let r = iceberg_radius_ellipse(rng, y, max_height, radius);
+        iceberg_top_ring(ctx, r, y, pos, false, a, offset, i, j);
+    }
+    let mut y = -1;
+    while y > -max_height + rng.next_bound(5) {
+        let r = iceberg_radius_steep(rng, -y, max_height, radius);
+        iceberg_top_ring(ctx, r, y, pos, true, a, offset, i, j);
+        y -= 1;
+    }
+}
+
+/// The inner ring helper of `placeTop`: it may leave water (the tall shape) or air.
+#[allow(clippy::too_many_arguments)]
+fn iceberg_top_ring(
+    ctx: &mut FC,
+    radius: i32,
+    y: i32,
+    pos: (i32, i32, i32),
+    tall: bool,
+    angle: f64,
+    offset: (i32, i32, i32),
+    i: i32,
+    j: i32,
+) {
+    let Some(reg) = breg() else { return };
+    let r1 = radius + 1 + i / 3;
+    let r2 = (radius - 3).min(3) + j / 2 - 1;
+    let air = reg.state_of("minecraft:air", None);
+    let water = reg.state_of("minecraft:water", None);
+    let snow = reg.state_of("minecraft:snow", None);
+    for dx in -r1..r1 {
+        for dz in -r1..r1 {
+            let d = iceberg_ellipse_dist(dx, dz, offset, r1, r2, angle);
+            if d >= 0.0 {
+                continue;
+            }
+            let p = (pos.0 + dx, pos.1 + y, pos.2 + dz);
+            let cur = ctx.get(p.0, p.1, p.2);
+            if !(is_iceberg_state(reg, cur) || reg.name_of(cur) == "minecraft:snow_block") {
+                continue;
+            }
+            if tall {
+                ctx.set(p.0, p.1, p.2, water);
+            } else {
+                ctx.set(p.0, p.1, p.2, air);
+                if ctx.get(p.0, p.1 - 1, p.2) == snow {
+                    ctx.set(p.0, p.1 - 1, p.2, air);
+                }
+            }
+        }
+    }
 }
 
 /// `minecraft:desert_well` (`ebw`). Letters resolved in the mappings first:
@@ -886,6 +1252,12 @@ fn p_cf(j: &J) -> Option<Cf> {
             water_for_tree: jint(j, "allowed_vertical_water_for_tree", 0),
             allowed_tree_position: p_pred(js(j, "allowed_tree_position")?)?,
         })),
+        "iceberg" => Cf::Iceberg {
+            state: {
+                let (n, p) = bs_parts(js(j, "state")?)?;
+                breg()?.state_of(&n, p)
+            },
+        },
         "desert_well" => Cf::DesertWell,
         "ice_spike" => Cf::IceSpike,
         "sea_pickle" => Cf::SeaPickle {
@@ -1780,6 +2152,7 @@ pub(crate) fn ore_cells_for_test(
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::Iceberg { state } => gen_iceberg(ctx, rng, pos, *state),
         Cf::DesertWell => gen_desert_well(ctx, rng, pos),
         Cf::RootSystem(c) => gen_root_system(ctx, rng, pos, c),
         Cf::IceSpike => gen_ice_spike(ctx, rng, pos),

@@ -2489,7 +2489,6 @@ pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
     Some(g.eval(id, x, y, z, &mut m))
 }
 
-#[expect(dead_code)]
 pub fn sea_level() -> i32 {
     GEN.lock().unwrap().as_ref().map(|g| g.sea).unwrap_or(63)
 }

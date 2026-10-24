@@ -649,3 +649,49 @@ archaeology の loot table を付けない（block entity の loot を持たな�
 
 型カバレッジの未実装到達型は 7 → **6**（`fossil` `iceberg` `sculk_patch` `dripstone_cluster`
 `large_dripstone` `speleothem_cluster`）。
+
+## 70. `iceberg` を実装した（`Cf::Iceberg { state }`）— 2つの形と signed distance
+
+`ecr`（`IcebergFeature`）231行を移植。config は `{state}` で、bundled pack の `iceberg_packed` は
+`packed_ice`、`iceberg_blue` は `blue_ice`。
+
+- 原点はまず **海面に移される**（`ChunkGenerator.getSeaLevel()`）。テストは原点を海面より12上から
+  渡し、この再アンカーが効いていることを固定する。
+- 頭のドローが形を決める: `nextDouble > 0.7`（fire）、`nextDouble * 2π`（angle）、`nextInt(5)`、
+  `nextInt(3)`、**2つ目の `nextDouble > 0.7` が tall/flat を選ぶ**、height（tall 6..11 / flat 3..17、
+  flat では `nextDouble > 0.9` のときさらに `nextInt(19) + 7`）、`min(height + nextInt(11), 18)`（i1）、
+  `min(height + nextInt(7) - nextInt(5), 11)`（j1）、半径スケール k1（tall は `11 - nextInt(5)` / flat 11）。
+- 上向きループは dx 外・dz 中・y 内の3重（**この順が draw 順**）。半径は tall が
+  `heightDependentRadiusRound`（ドローなし）/ flat が `heightDependentRadiusEllipse`
+  （`nextFloat` + 条件付き `nextInt(5)`/`nextInt(6)`）。
+- 書き込みゲート `placeIcebergBlock` は air/snow_block/ice/water にだけ書き、`!tall || nextDouble > 0.05`
+  のロール、`fire` なら `depth <= nextInt(max(height/3,1)) + height*0.6` で snow_block に切り替える
+  （**`&&` と `||` の短絡がドロー数を決める**ので順序ごと保存）。
+- 彫り込みは signed distance: flat は円（`IcebergFeature.signedDistanceCircle`、1コールにつき
+  `nextFloat`）、tall は `angle` で回した楕円（`signedDistanceEllipse`）。`d0 < 0` のセルだけ書き、
+  `d0 > d1 && nextDouble > 0.9` のセルは飛ばす（d1 は tall −0.5 / flat `-6 - nextInt(3)`）。
+- 下向きループは tall のとき `floor(k1 * (1 - y²/(i1*8)))` で細り、`heightDependentRadiusSteep`
+  （1コール1ドロー）を使う。`smooth` が孤立セルと「下が空気」のセルを air に戻す。
+- 最後に `nextDouble > 0.1`（tall）/ `> 0.7`（flat）で頂部パス。ここは `nextBoolean` 4回と
+  `nextInt` 数回で中心を決め、**ループ条件に `nextInt(5)` が入る**（反復ごとにドロー）ので
+  `while y > -max_height + rng.next_bound(5)` としてそのまま保存した。
+
+mappings で先に解決した名前: `Blocks.a/G/L/dN/dO/dP/iC/mW` = AIR / WATER / GRAVEL / SNOW / ICE /
+SNOW_BLOCK / **PACKED_ICE** / **BLUE_ICE**（`isIcebergState` = packed_ice || snow_block || blue_ice）、
+`ChunkGenerator.f()` = `getSeaLevel()`、`RandomSource.h()` = `nextBoolean()`、`.i()` = `nextFloat()`、
+`.j()` = `nextDouble()`、`Mth.a(FFF)` = `clamp`。
+
+### ゲート
+
+- `iceberg_builds_a_shape_around_sea_level`: 海を掘って原点を海面+12で渡し、(a) config の state
+  （packed_ice）が実際に置かれること、(b) 置かれたセルの dx/dz が再生した k1 の範囲内、
+  (c) dy が再生した i1/l の範囲内、(d) **水面より上と下の両方に氷がある**（iceberg の定義）を固定。
+  頭のドロー列を同じ seed で再生して境界に使うので、draw 順がずれれば落ちる。
+- mutation 2本（海面への再アンカー、config state の材質）で 62 proved / 0 not a gate / 0 skipped。
+
+**測っていないこと**: セル単位の vanilla 一致。`iceberg` は cold/ocean 系バイオーム限定で、
+fixture に使える近傍の ice biome が未特定（`sea_pickle` の warm_ocean と同じ到達性の問題）。
+したがって形の一致は未検証で、ここで固定したのは draw 順・範囲・海面跨ぎまで。
+
+型カバレッジの未実装到達型は 6 → **5**（`fossil` `sculk_patch` `dripstone_cluster`
+`large_dripstone` `speleothem_cluster`）。

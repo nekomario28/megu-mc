@@ -506,6 +506,24 @@ check "an update packet sends block light only" \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
   update_light_packet_sends_block_light_only
 
+check "an iceberg re-anchors itself to sea level" \
+  src/feature.rs '    let pos = (origin.0, crate::worldgen::sea_level(), origin.2);' \
+  '    let pos = (origin.0, origin.1, origin.2);' \
+  iceberg_builds_a_shape_around_sea_level
+
+check "an iceberg is built out of the config's state" \
+  src/feature.rs '    let st = if snow {
+        reg.state_of("minecraft:snow_block", None)
+    } else {
+        state
+    };' \
+  '    let st = if snow {
+        reg.state_of("minecraft:snow_block", None)
+    } else {
+        reg.state_of("minecraft:snow_block", None)
+    };' \
+  iceberg_builds_a_shape_around_sea_level
+
 check "a desert well's roof centre is sandstone, not a slab" \
   src/feature.rs '            let st = if dx == 0 && dz == 0 { sandstone } else { slab };' \
   '            let st = if dx == 0 && dz == 0 { slab } else { slab };' \

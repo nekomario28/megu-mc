@@ -1096,3 +1096,99 @@ fn desert_well_needs_sand_and_draws_nothing_otherwise() {
         "and draws nothing"
     );
 }
+
+/// `minecraft:iceberg` (`ecr`), config `{state}`. The shape parameters all come from
+/// the head of the draw stream (`nextDouble > 0.7`, `nextDouble*2pi`, `nextInt(5)`,
+/// `nextInt(3)`, a second `nextDouble > 0.7` choosing the tall shape, then the height
+/// and the two radii), so they are replayed here and used as the bounds the placed
+/// cells must satisfy - which ties the replay to what the placement actually used.
+#[test]
+fn iceberg_builds_a_shape_around_sea_level() {
+    let reg = breg().unwrap();
+    let packed = reg.state_of("minecraft:packed_ice", None);
+    let snow = reg.state_of("minecraft:snow_block", None);
+    let water = reg.state_of("minecraft:water", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let sea = crate::worldgen::sea_level();
+    let (x, z) = (8, 8);
+    // an ocean deep enough for the underside and wide enough for the widest shape
+    for dx in -40..=40 {
+        for dz in -40..=40 {
+            for y in sea - 40..=sea - 1 {
+                ctx.set(x + dx, y, z + dz, water);
+            }
+            for y in sea..=sea + 40 {
+                ctx.set(x + dx, y, z + dz, water);
+            }
+            ctx.set(x + dx, sea - 41, z + dz, stone);
+        }
+    }
+
+    // replay the head of the stream
+    let mut probe = Xor::seed(21);
+    let _fire = probe.next_f64() > 0.7;
+    let _angle = probe.next_f64() * 2.0 * std::f64::consts::PI;
+    let i = 11 - probe.next_bound(5);
+    let _j = 3 + probe.next_bound(3);
+    let tall = probe.next_f64() > 0.7;
+    let mut l = if tall {
+        probe.next_bound(6) + 6
+    } else {
+        probe.next_bound(15) + 3
+    };
+    if !tall && probe.next_f64() > 0.9 {
+        l += probe.next_bound(19) + 7;
+    }
+    let i1 = (l + probe.next_bound(11)).min(18);
+    let _j1 = (l + probe.next_bound(7) - probe.next_bound(5)).min(11);
+    let k1 = if tall { i } else { 11 };
+
+    let mut rng = Xor::seed(21);
+    // the origin is handed in *above* sea level and the feature re-anchors it, which
+    // is what the mutation anchor for that line checks
+    gen_cf(
+        &Cf::Iceberg { state: packed },
+        freg(),
+        &mut ctx,
+        &mut rng,
+        (x, sea + 12, z),
+    );
+
+    let cells: Vec<((i32, i32, i32), u32)> = ctx.wr.iter().map(|(&p, &st)| (p, st)).collect();
+    let ice: Vec<_> = cells
+        .iter()
+        .filter(|(_, st)| *st == packed || *st == snow)
+        .collect();
+    assert!(!ice.is_empty(), "the iceberg must place its material");
+    assert!(
+        cells.iter().any(|(_, st)| *st == packed),
+        "the config's state is what most of the shape is built from"
+    );
+    let mut dmin = i32::MAX;
+    let mut dmax = i32::MIN;
+    for ((px, py, pz), _) in ice {
+        let (dx, dy, dz) = (px - x, py - sea, pz - z);
+        assert!(
+            dx.abs() <= k1 + 4 && dz.abs() <= k1 + 4,
+            "a cell must stay near the footprint (k1 = {k1}): {dx},{dy},{dz}"
+        );
+        dmin = dmin.min(dy);
+        dmax = dmax.max(dy);
+    }
+    assert!(
+        dmin >= -(i1 - 1),
+        "the underside must not go below -i1 + 1 (i1 = {i1}), got {dmin}"
+    );
+    assert!(
+        dmax < l,
+        "the top must not go above l - 1 (l = {l}), got {dmax}"
+    );
+    assert!(
+        dmin < 0 && dmax > 0,
+        "an iceberg straddles sea level: below {dmin}, above {dmax}"
+    );
+    // and the water it was built in is still water elsewhere
+    assert_eq!(ctx.get(x + 30, sea + 30, z), water, "far away stays water");
+}
