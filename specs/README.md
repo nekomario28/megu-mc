@@ -61,6 +61,8 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 次は 53 列の y の差（`hm_oc` の読み vs vanilla の `getHeight`）を同じ列で両側ダンプして比べることです。装飾順を固定具に寄せる実験は**負の結果**でした（§62.3）。
 
-**型カバレッジ**は計測できるようにしました（`tools/feature_type_coverage.py`）: pack の 60 型中 31 型に `p_cf` の腕が無く、**overworld の biome から到達されるのは 11 型**（`fossil` `iceberg` `root_system` `sculk_patch` `geode` `desert_well` `dripstone_cluster` `ice_spike` `large_dripstone` `sea_pickle` `speleothem_cluster`）。`geode` は **56 biome** から到達され最優先です（旧記載の「13型」は人手の数え上げで、機械計測では 11）。両側0個、全chunk skip、別stageの差分は成功扱いにしません。
+**型カバレッジ**は計測できるようにしました（`tools/feature_type_coverage.py`）: pack の 60 型中 30 型に `p_cf` の腕が無く、**overworld の biome から到達されるのは 10 型**（`fossil` `iceberg` `root_system` `sculk_patch` `desert_well` `dripstone_cluster` `ice_spike` `large_dripstone` `sea_pickle` `speleothem_cluster`）。
+- `geode`（**56 biome** から到達、最大の欠落）は**実装しました**（2026-10-24、`Cf::Geode`）。1.21.1 の `GeodeFeature`（`eck`）を逆コンパイルして層の閾値・点ごとのノイズ項・クラック・結晶の向きまで移植し、`tools/geode_fixture.sh`（seed 12 / chunk (0,0) に geode が出ることを port 側の trace で実測して選んだ固定具）で vanilla とセル単位に比較しています。**セル数はほぼ一致**（amethyst 162 vs 157、calcite 202 vs 201、smooth_basalt 237 vs 256）ですが**形はまだ一致しません**（3層合計 IoU 0.31、最良の平行移動でも 0.39）。残差はノイズの場に帰属させ、数値・固定具・次に測ることを evidence に残しました （[feature-parity](../evidence/gameplay/feature-parity/README.md) §63）。
+  両側0個、全chunk skip、別stageの差分は成功扱いにしません。
 
 以後の順序は[ロードマップ](ROADMAP.md)に従います。比較規律は[DESIGN.mdの約束](../DESIGN.md#比較の約束)を参照してください。
