@@ -98,6 +98,8 @@ enum Cf {
     /// archaeology loot table is not attached to the suspicious sand (no block-entity
     /// loot support), so brushing it yields nothing.
     DesertWell,
+    /// `minecraft:large_dripstone` (`ecu`), config `eel`.
+    LargeDripstone(Box<LargeDripstoneCfg>),
     /// `minecraft:dripstone_cluster` (`eby`), config `eeg`.
     DripstoneCluster(Box<DripstoneClusterCfg>),
     /// `minecraft:iceberg` (`ecr`), config `{state}`.
@@ -289,6 +291,269 @@ struct GeodeCfg {
     invalid_blocks_threshold: i32,
 }
 
+// ---------- large dripstone (`ecu`) ----------
+
+/// `LargeDripstoneConfiguration` (`eel`): nine fields, all used.
+pub(crate) struct LargeDripstoneCfg {
+    /// `floor_to_ceiling_search_range` (codec default 30), the span scan range.
+    range: i32,
+    /// `column_radius`: the widest the spike may be, clamped by the cave's height.
+    radius: IP,
+    /// `height_scale`: sampled once per spike, scales the whole taper.
+    height_scale: FP,
+    /// `max_column_radius_to_cave_height_ratio`: caps the radius from the span height.
+    ratio: f32,
+    /// `stalactite_bluntness` / `stalagmite_bluntness`: sampled per direction.
+    stalactite_bluntness: FP,
+    stalagmite_bluntness: FP,
+    /// `wind_speed`: sampled only when both spikes are big enough to sway.
+    wind_speed: FP,
+    /// `min_radius_for_wind` / `min_bluntness_for_wind`: the sway gate.
+    min_radius_for_wind: i32,
+    min_bluntness_for_wind: f32,
+}
+
+/// `DripstoneUtils.getDripstoneHeight(double,double,double,double)` (`ebz.a`): the
+/// taper both dripstone features use. `d` is the distance from the column's axis,
+/// `max_radius` its radius, `height_scale` and `bluntness` the config's samples.
+/// Vanilla also declares an unused local `0.384` here; the literal appears twice in the
+/// expression, which is where that came from.
+fn drip_taper(mut d: f64, max_radius: f64, height_scale: f64, bluntness: f64) -> f64 {
+    if d < bluntness {
+        d = bluntness;
+    }
+    let t = d / max_radius * 0.384;
+    let a = 0.75 * t.powf(1.3333333333333333);
+    let b = t.powf(0.6666666666666666);
+    let c = 0.3333333333333333 * t.ln();
+    let v = height_scale * (a - b - c);
+    v.max(0.0) / 0.384 * max_radius
+}
+
+/// `DripstoneUtils.isCircleMostlyEmbeddedInStone` (`ebz.a(dds,jd,int)`): the support
+/// test both spike searches use - the centre must be solid, and six sample points per
+/// unit of radius around it must all be solid too. The loop accumulates in f32 and the
+/// step depends on the radius, so the number of samples is part of the behaviour.
+fn drip_circle_is_stone(ctx: &mut FC, pos: (i32, i32, i32), radius: i32) -> bool {
+    if drip_is_empty_or_water_or_lava(ctx, pos) {
+        return false;
+    }
+    let step = 6.0f32 / radius as f32;
+    let mut a = 0.0f32;
+    while a < (std::f64::consts::PI * 2.0) as f32 {
+        let dx = (mth_cos(a) * radius as f32) as i32;
+        let dz = (mth_sin(a) * radius as f32) as i32;
+        if drip_is_empty_or_water_or_lava(ctx, (pos.0 + dx, pos.1, pos.2 + dz)) {
+            return false;
+        }
+        a += step;
+    }
+    true
+}
+
+/// `LargeDripstoneFeature$WindOffsetter` (`ecu$b`): the sway. `none()` carries no
+/// vector (so every offset is the identity); otherwise the displacement is the wind
+/// vector scaled by the distance from the feature's own y, floored.
+struct DripWind {
+    y: i32,
+    v: Option<(f64, f64)>,
+}
+impl DripWind {
+    fn none() -> DripWind {
+        DripWind { y: 0, v: None }
+    }
+    fn new(y: i32, rng: &mut Xor, speed: f32) -> DripWind {
+        let a = mth_next_f32(rng, 0.0, std::f32::consts::PI);
+        // the components are f32 products widened to the Vec3's doubles
+        DripWind {
+            y,
+            v: Some(((mth_cos(a) * speed) as f64, (mth_sin(a) * speed) as f64)),
+        }
+    }
+    fn at(&self, p: (i32, i32, i32)) -> (i32, i32, i32) {
+        match self.v {
+            None => p,
+            Some((vx, vz)) => {
+                let dy = (self.y - p.1) as f64;
+                (
+                    p.0 + (vx * dy).floor() as i32,
+                    p.1,
+                    p.2 + (vz * dy).floor() as i32,
+                )
+            }
+        }
+    }
+}
+
+/// `LargeDripstoneFeature$LargeDripstone` (`ecu$a`): one spike, either hanging from
+/// the span's ceiling (`up == false`) or standing on its floor (`up == true`).
+struct DripSpike {
+    pos: (i32, i32, i32),
+    up: bool,
+    radius: i32,
+    /// The sampled bluntness / height scale, widened to f64 as the fields are.
+    bluntness: f64,
+    height_scale: f64,
+}
+impl DripSpike {
+    /// `getHeight(float)` (`ecu$a.a(F)`): truncate the taper at a distance from the axis.
+    fn height_at(&self, d: f32) -> i32 {
+        drip_taper(
+            d as f64,
+            self.radius as f64,
+            self.height_scale,
+            self.bluntness,
+        ) as i32
+    }
+    /// `isValid(eel)` (`ecu$a.a(eel)`): the wind only blows on big, blunt spikes.
+    fn valid(&self, cfg: &LargeDripstoneCfg) -> bool {
+        self.radius >= cfg.min_radius_for_wind
+            && self.bluntness >= cfg.min_bluntness_for_wind as f64
+    }
+    /// `LargeDripstoneFeature$LargeDripstone.place(WorldGenLevel, WindOffsetter)`
+    /// (`ecu$a.a(dds,ecu$b)`): find the solid cell the spike grows out of, walking away
+    /// from the cave (down for a stalagmite, up for a stalactite) at most
+    /// `min(10, getHeight(0))` steps, halving the radius when nothing is found.
+    fn find_base(&mut self, ctx: &mut FC, wind: &DripWind) -> bool {
+        let Some(reg) = breg() else { return false };
+        while self.radius > 1 {
+            let mut p = self.pos;
+            let steps = self.height_at(0.0).min(10);
+            for _ in 0..steps {
+                if reg.name_of(ctx.get(p.0, p.1, p.2)) == "minecraft:lava" {
+                    return false;
+                }
+                if drip_circle_is_stone(ctx, wind.at(p), self.radius) {
+                    self.pos = p;
+                    return true;
+                }
+                p.1 += if self.up { -1 } else { 1 };
+            }
+            self.radius /= 2;
+        }
+        false
+    }
+    /// `LargeDripstoneFeature$LargeDripstone.placeDripstone(WorldGenLevel,
+    /// RandomSource, WindOffsetter)` (`ecu$a.a(dds,ayw,ecu$b)`): the body. Every cell of
+    /// the disc gets a taper height, a 1-in-5 chance of a random 0.8..1.0 multiplier, and
+    /// dripstone blocks down (or up) until the taper runs out - stopping if it walks
+    /// into base stone after having placed something.
+    fn build(&self, ctx: &mut FC, rng: &mut Xor, wind: &DripWind) {
+        let Some(reg) = breg() else { return };
+        let drip = reg.state_of("minecraft:dripstone_block", None);
+        for dx in -self.radius..=self.radius {
+            for dz in -self.radius..=self.radius {
+                // `Mth.sqrt(float)` is a double sqrt narrowed to float
+                let dist = ((dx * dx + dz * dz) as f64).sqrt() as f32;
+                if dist > self.radius as f32 {
+                    continue;
+                }
+                let mut h = self.height_at(dist);
+                if h <= 0 {
+                    continue;
+                }
+                if rng.next_f32() < 0.2 {
+                    h = (h as f32 * mth_next_f32(rng, 0.8, 1.0)) as i32;
+                }
+                let mut p = (self.pos.0 + dx, self.pos.1, self.pos.2 + dz);
+                let mut placed = false;
+                let surface = if self.up {
+                    ctx.hm_ws(p.0, p.2)
+                } else {
+                    i32::MAX
+                };
+                let mut i = 0;
+                while i < h && p.1 < surface {
+                    let q = wind.at(p);
+                    let st = ctx.get(q.0, q.1, q.2);
+                    // `ebz.b(dcx,jd)` - two arguments, so `isEmptyOrWaterOrLava`, not the
+                    // one-argument `ebz.b(dtc)` (`isDripstoneBase`): the spike is built
+                    // *in* the empty cell and stops when it reaches base stone.
+                    if drip_is_empty_or_water_or_lava(ctx, q) {
+                        placed = true;
+                        ctx.set(q.0, q.1, q.2, drip);
+                    } else if placed && reg.in_tag(st, "minecraft:base_stone_overworld") {
+                        break;
+                    }
+                    p.1 += if self.up { 1 } else { -1 };
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+/// `minecraft:large_dripstone` (`ecu`, `LargeDripstoneFeature`).
+///
+/// The origin's column must be a *two-sided* `Column` (both a floor and a ceiling) at
+/// least 4 cells tall - that is the cave the spikes grow into. The radius is the cave
+/// height times `max_column_radius_to_cave_height_ratio`, clamped into the config's
+/// `column_radius` range, and then drawn once. Two spikes are made from it (a
+/// stalactite at `ceiling - 1` and a stalagmite at `floor + 1`), each finding its own
+/// solid base, and the wind offsetter is built only if both are big and blunt enough.
+///
+/// Draw order: the radius, then the first spike's bluntness + height scale, then the
+/// second's, then the wind's speed + angle (only when the gate passes), then the builds.
+///
+/// Note: the jar also carries `LargeDripstoneFeature.placeColumn`
+/// (`ecu.a(dds,jd,dyo$b,ecu$b)`), which writes `Blocks.DIAMOND_BLOCK`, `GOLD_BLOCK` and
+/// `CREEPER_HEAD` - and nothing calls it (no call site for its descriptor exists in the
+/// class, and `place` only calls the two methods above). It is dead in the reference
+/// build, so it is deliberately not ported; what *is* live writes `dripstone_block`.
+fn gen_large_dripstone(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    origin: (i32, i32, i32),
+    cfg: &LargeDripstoneCfg,
+) {
+    if !drip_is_empty_or_water(ctx, origin) {
+        return;
+    }
+    let Some(col) = drip_column(ctx, origin, cfg.range, DripEnd::DripstoneBaseOrLava) else {
+        return;
+    };
+    let (Some(ceiling), Some(floor)) = (col.ceiling, col.floor) else {
+        return;
+    };
+    let height = ceiling - floor - 1;
+    if height < 4 {
+        return;
+    }
+    let est = (height as f32 * cfg.ratio) as i32;
+    let est = est.clamp(cfg.radius.min_inclusive(), cfg.radius.max_inclusive());
+    let radius = rng.next_inbetween(cfg.radius.min_inclusive(), est);
+
+    let mut stalactite = DripSpike {
+        pos: (origin.0, ceiling - 1, origin.2),
+        up: false,
+        radius,
+        bluntness: cfg.stalactite_bluntness.get(rng) as f64,
+        height_scale: cfg.height_scale.get(rng) as f64,
+    };
+    let mut stalagmite = DripSpike {
+        pos: (origin.0, floor + 1, origin.2),
+        up: true,
+        radius,
+        bluntness: cfg.stalagmite_bluntness.get(rng) as f64,
+        height_scale: cfg.height_scale.get(rng) as f64,
+    };
+    let wind = if stalactite.valid(cfg) && stalagmite.valid(cfg) {
+        let speed = cfg.wind_speed.get(rng);
+        DripWind::new(origin.1, rng, speed)
+    } else {
+        DripWind::none()
+    };
+
+    let ok_hang = stalactite.find_base(ctx, &wind);
+    let ok_stand = stalagmite.find_base(ctx, &wind);
+    if ok_hang {
+        stalactite.build(ctx, rng, &wind);
+    }
+    if ok_stand {
+        stalagmite.build(ctx, rng, &wind);
+    }
+}
+
 // ---------- dripstone cluster (`eby`) ----------
 
 /// `DripstoneClusterConfiguration` (`eeg`). Every field is used, and three of them are
@@ -399,17 +664,36 @@ fn drip_is_neither_empty_nor_water(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
     !reg.is_air(st) && reg.name_of(st) != "minecraft:water"
 }
 
+/// The `end` predicate of a `Column` scan: the cluster stops at the first cell that is
+/// neither empty nor water, the large dripstone at the first dripstone base or lava
+/// cell (`LargeDripstoneFeature` passes `DripstoneUtils::isDripstoneBaseOrLava`).
+#[derive(Clone, Copy, PartialEq)]
+enum DripEnd {
+    NeitherEmptyNorWater,
+    DripstoneBaseOrLava,
+}
+
 /// One direction of `Column.scanDirection` (`dyo.a`): walk while the cell is still
 /// empty-or-water (at most `range - 1` steps), then accept the cell we stopped on only
-/// if it is neither.
-fn drip_scan(ctx: &mut FC, pos: (i32, i32, i32), range: i32, up: bool) -> Option<i32> {
+/// if it satisfies the end predicate.
+fn drip_scan(
+    ctx: &mut FC,
+    pos: (i32, i32, i32),
+    range: i32,
+    up: bool,
+    end: DripEnd,
+) -> Option<i32> {
     let mut y = pos.1;
     let mut i = 1;
     while i < range && drip_is_empty_or_water(ctx, (pos.0, y, pos.2)) {
         y += if up { 1 } else { -1 };
         i += 1;
     }
-    if drip_is_neither_empty_nor_water(ctx, (pos.0, y, pos.2)) {
+    let hit = match end {
+        DripEnd::NeitherEmptyNorWater => drip_is_neither_empty_nor_water(ctx, (pos.0, y, pos.2)),
+        DripEnd::DripstoneBaseOrLava => drip_is_dripstone_base_or_lava(ctx, (pos.0, y, pos.2)),
+    };
+    if hit {
         Some(y)
     } else {
         None
@@ -418,13 +702,35 @@ fn drip_scan(ctx: &mut FC, pos: (i32, i32, i32), range: i32, up: bool) -> Option
 
 /// `Column.getColumnAt` (`dyo.a`): the up scan is the ceiling, the down scan the floor
 /// (that is the field order of `Column.create(floor, ceiling)`).
-fn drip_column(ctx: &mut FC, pos: (i32, i32, i32), range: i32) -> Option<DripCol> {
+fn drip_column(ctx: &mut FC, pos: (i32, i32, i32), range: i32, end: DripEnd) -> Option<DripCol> {
     if !drip_is_empty_or_water(ctx, pos) {
         return None;
     }
-    let ceiling = drip_scan(ctx, pos, range, true);
-    let floor = drip_scan(ctx, pos, range, false);
+    let ceiling = drip_scan(ctx, pos, range, true, end);
+    let floor = drip_scan(ctx, pos, range, false, end);
     Some(DripCol { ceiling, floor })
+}
+
+/// `DripstoneUtils.isEmptyOrWaterOrLava` (`ebz.b(dcx,jd)`): the circle test's predicate.
+fn drip_is_empty_or_water_or_lava(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    let st = ctx.get(pos.0, pos.1, pos.2);
+    reg.is_air(st) || reg.name_of(st) == "minecraft:water" || reg.name_of(st) == "minecraft:lava"
+}
+
+/// `DripstoneUtils.isDripstoneBase(BlockState)` (`ebz.b(dtc)`): dripstone block, or a
+/// block in `dripstone_replaceable_blocks` (which includes the overworld base stones).
+fn drip_is_dripstone_base(reg: &BReg, st: u32) -> bool {
+    reg.name_of(st) == "minecraft:dripstone_block"
+        || reg.in_tag(st, "minecraft:dripstone_replaceable_blocks")
+}
+
+/// `DripstoneUtils.isDripstoneBaseOrLava(BlockState)` (`ebz.a(dtc)`): the large
+/// dripstone's column end predicate.
+fn drip_is_dripstone_base_or_lava(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
+    let Some(reg) = breg() else { return false };
+    let st = ctx.get(pos.0, pos.1, pos.2);
+    drip_is_dripstone_base(reg, st) || reg.name_of(st) == "minecraft:lava"
 }
 
 /// `DripstoneClusterFeature.getChanceOfStalagmiteOrStalactite`
@@ -585,9 +891,7 @@ fn drip_grow_pointed_dripstone(
 ) {
     let Some(reg) = breg() else { return };
     let base = ctx.get(pos.0, pos.1 + if up { -1 } else { 1 }, pos.2);
-    let is_base = reg.name_of(base) == "minecraft:dripstone_block"
-        || reg.in_tag(base, "minecraft:dripstone_replaceable_blocks");
-    if !is_base {
+    if !drip_is_dripstone_base(reg, base) {
         return;
     }
     drip_build_base_to_tip(ctx, pos, up, height, merge);
@@ -609,7 +913,7 @@ fn drip_place_column(
     cfg: &DripstoneClusterCfg,
 ) {
     let Some(reg) = breg() else { return };
-    let Some(col) = drip_column(ctx, pos, cfg.range) else {
+    let Some(col) = drip_column(ctx, pos, cfg.range, DripEnd::NeitherEmptyNorWater) else {
         return;
     };
     let (ceiling, floor) = (col.ceiling, col.floor);
@@ -1651,6 +1955,17 @@ fn p_cf(j: &J) -> Option<Cf> {
             water_for_tree: jint(j, "allowed_vertical_water_for_tree", 0),
             allowed_tree_position: p_pred(js(j, "allowed_tree_position")?)?,
         })),
+        "large_dripstone" => Cf::LargeDripstone(Box::new(LargeDripstoneCfg {
+            range: jint(j, "floor_to_ceiling_search_range", 30),
+            radius: p_ip(js(j, "column_radius")?)?,
+            height_scale: p_fp(js(j, "height_scale")?)?,
+            ratio: jf32(j, "max_column_radius_to_cave_height_ratio", 1.0),
+            stalactite_bluntness: p_fp(js(j, "stalactite_bluntness")?)?,
+            stalagmite_bluntness: p_fp(js(j, "stalagmite_bluntness")?)?,
+            wind_speed: p_fp(js(j, "wind_speed")?)?,
+            min_radius_for_wind: jint(j, "min_radius_for_wind", 0),
+            min_bluntness_for_wind: jf32(j, "min_bluntness_for_wind", 0.0),
+        })),
         "dripstone_cluster" => Cf::DripstoneCluster(Box::new(DripstoneClusterCfg {
             range: jint(j, "floor_to_ceiling_search_range", 12),
             height: p_ip(js(j, "height")?)?,
@@ -2574,6 +2889,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::Unknown(_) => {}
         Cf::Iceberg { state } => gen_iceberg(ctx, rng, pos, *state),
         Cf::DripstoneCluster(cfg) => gen_dripstone_cluster(ctx, rng, pos, cfg),
+        Cf::LargeDripstone(cfg) => gen_large_dripstone(ctx, rng, pos, cfg),
         Cf::DesertWell => gen_desert_well(ctx, rng, pos),
         Cf::RootSystem(c) => gen_root_system(ctx, rng, pos, c),
         Cf::IceSpike => gen_ice_spike(ctx, rng, pos),

@@ -10,6 +10,7 @@ use crate::json::{jarr, jf32, jint, jnum, js, jstr, J};
 
 // ---------- providers ----------
 
+#[derive(Clone)]
 pub(crate) enum IP {
     Const(i32),
     Uniform(i32, i32),
@@ -76,6 +77,20 @@ impl IP {
     /// provider's own `getMaxValue` (checked in the bytecode for `ClampedNormalInt`,
     /// which returns its declared maximum rather than mean + 3 deviation: `b()`
     /// loads field `h` and returns).
+    /// The provider's own minimum (`getMinValue`), for the `Mth.clamp` the dripstone
+    /// features do on a value derived from the cave's height.
+    pub(crate) fn min_inclusive(&self) -> i32 {
+        match self {
+            IP::Const(v) => *v,
+            IP::Uniform(a, _)
+            | IP::BiasBottom(a, _)
+            | IP::VeryBias(a, _, _)
+            | IP::Trap(a, _, _) => *a,
+            IP::Clamped(_, a, _) => *a,
+            IP::Norm(_, _, a, _) => *a,
+            IP::Weighted(l) => l.iter().map(|(_, p)| p.min_inclusive()).min().unwrap_or(0),
+        }
+    }
     pub(crate) fn max_inclusive(&self) -> i32 {
         match self {
             IP::Const(v) => *v,
@@ -126,6 +141,7 @@ pub(crate) fn fp_clamped_normal(r: &mut Xor, mean: f32, dev: f32, lo: f32, hi: f
     }) as f32
 }
 
+#[derive(Clone)]
 pub(crate) enum FP {
     Const(f32),
     Uniform(f32, f32),
@@ -145,7 +161,7 @@ impl FP {
     pub(crate) fn get(&self, r: &mut Xor) -> f32 {
         match self {
             FP::Const(v) => *v,
-            FP::Uniform(lo, hi) => r.next_f32() * (hi - lo) + lo,
+            FP::Uniform(lo, hi) => crate::generation_math::mth_next_f32(r, *lo, *hi),
             FP::Norm { mean, dev, lo, hi } => fp_clamped_normal(r, *mean, *dev, *lo, *hi),
             FP::Trap { lo, hi, plateau } => {
                 // bqa: f = max - min; g = (f - plateau)/2; h = f - g

@@ -760,3 +760,68 @@ vanilla との比較ではない。float provider の値も vanilla dump では�
 
 型カバレッジの未実装到達型は 5 → **4**（`fossil` `sculk_patch` `large_dripstone`
 `speleothem_cluster`）。
+
+## 72. `large_dripstone` を実装した（`Cf::LargeDripstone`）— 2つの spike と風
+
+`ecu`（`LargeDripstoneFeature`、195行）を移植。原型は `dripstone_cluster` と同じ `Column` だが、
+こちらは **両端のある Column（`dyo.b`）で高さ 4 以上**を要求する＝洞窟そのものを探す。
+
+- 半径は `(int)(洞窟高 * max_column_radius_to_cave_height_ratio)` を `column_radius` の範囲に
+  clamp してから `randomBetweenInclusive` で1回引く。
+- 天井側（`ceiling-1`、`up=false`）と床側（`floor+1`、`up=true`）に spike を作り、それぞれ
+  bluntness と height_scale を引く（**この順**）。両方が `valid`（半径と bluntness のしきい値）なら
+  `WindOffsetter` が作られ、風速と角度の2ドローが消費される。
+- `find_base` は洞窟から**離れる向き**（鍾乳石は上へ、石筍は下へ）に `min(10, getHeight(0))` 歩き、
+  円がほぼ石で埋まっているセルを根として採用する。見つからなければ半径を半分にして繰り返す。
+- `build` は**空のセルに** dripstone block を置き、既に何か置いた後に base stone に当たったら止まる
+  （= 洞窟の中に spike が生える）。天井側は y 上限なし、床側は `WORLD_SURFACE` で頭打ち。
+
+mappings で解決した名前: `eel`=`LargeDripstoneConfiguration`（9フィールド）、
+`ecu$a`=`LargeDripstoneFeature$LargeDripstone`、`ecu$b`=`...$WindOffsetter`、
+`Mth.sin/cos/sqrt(float)`=`a/b/c`、`dyo.b` の `ceiling()/floor()/height()`=`e/f/g`。
+
+### 固定具が見つけた欠陥: 引数の数でしか区別できない多重定義
+
+最初の実装は build の判定を `isDripstoneBase` で書いていた。症状は**スパン内に何も置かれない**
+（岩の中に置こうとするので、テストの「span の中にあること」で落ちる）。逆コンパイルは
+
+```java
+if (ebz.b($$0, $$11)) { … }
+```
+
+で、`ebz.b` には **2引数**（`b(dcx,jd)` = `isEmptyOrWaterOrLava`）と **1引数**（`b(dtc)` =
+`isDripstoneBase`）がある。引数の数が唯一の手掛かりで、`isEmptyOrWaterOrLava` が正しい
+（空セルに置く＝spike が生える）。`dripstone_cluster` のときの `(dcz)` キャストと同種の罠で、
+**「似た名前の多重定義は引数の数と明示キャストまで読む」**を skill §28 に追記。
+
+### 参照ビルドの死んだコード（記録のみ・移植せず）
+
+同じ jar の `ecu.a(dds,jd,dyo$b,ecu$b)`（mappings 名 `placeColumn`）は
+`Blocks.DIAMOND_BLOCK` / `GOLD_BLOCK` / `CREEPER_HEAD` を置くが、**誰も呼んでいない**:
+
+- `place`（`ecu.a(ecg)`）はこの4引数メソッドを呼ばず、内部クラスの2つだけを呼ぶ
+- javap で `ecu` 全体を走査しても、このメソッドのディスクリプタを参照する呼び出しが **0件**
+
+定数の奇妙さを確かめた手順も記録に値する: mappings（公式 `server.txt`）と **jar 自身の
+`<clinit>`**（`ldc "diamond_block"` → `putstatic dga.cz`）が独立に一致した。生きている経路が
+使う `dga.su`=`dripstone_block` は同じ `build` の判定（`state.is(dga.su)`）とも整合する。
+つまり vanilla 1.21.1 は未使用のデバッグ用らしきメソッドを出荷しており、**移植対象は生きた経路**。
+
+### ゲート
+
+- `large_dripstone_hangs_and_stands_a_tapered_spike`（スパン7）: 置かれたセルが全て `dripstone_block` で
+  **スパンの中**（岩の中ではない）、引いた半径の内側、そして各列のセルが
+  **天井側と床側それぞれの「端の隣セル」から連続する2本の run とちょうど一致**することを固定。
+  半径は再生値（=3）。golden 37セル / 9列。
+- `large_dripstone_sways_when_both_spikes_clear_the_wind_gate`（スパン15、seed は
+  wind gate を満たすものを探索し、満たさなければ落ちる）: 同じ seed で wind speed だけを
+  `Uniform(0.0,0.0)`（**同じドロー数**で変位ゼロ）に差し替えた run と比べ、
+  **各セルが `floor(wind * (origin_y - y))` だけ水平に動いた集合と厳密に一致**することを固定
+  （= 風の式そのもの）。golden 126セル、seed 7。
+- mutation 2本（build の判定、風の変位）で **66 proved / 0 not a gate / 0 skipped**、clippy 0。
+
+**測っていないこと**: セル単位の vanilla 一致（`dripstone_caves` のチャンク固定具が必要）。
+それは同時に、死んだ `placeColumn` が実地形で本当に呼ばれないかを確かめる唯一の手段でもある
+（そういう run を取るまでは「未呼び出し」は bytecode の観測であって地形の観測ではない）。
+
+型カバレッジの未実装到達型は 4 → **3**（`fossil` `sculk_patch` `speleothem_cluster`）。

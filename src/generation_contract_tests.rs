@@ -1,8 +1,8 @@
-use super::{freg, gen_cf, Cf};
+use super::{freg, gen_cf, Cf, LargeDripstoneCfg};
 use crate::block_registry::breg;
 use crate::generation_context::FC;
-use crate::generation_math::{normal_new_l, Xor};
-use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr, RT};
+use crate::generation_math::{mth_cos, mth_next_f32, mth_sin, normal_new_l, Xor};
+use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr, FP, RT};
 use crate::json::jparse;
 use crate::worldgen::Gen;
 
@@ -1204,7 +1204,7 @@ fn pack_cf(name: &str) -> Cf {
 /// The gallery of `dripstone_cluster_hangs_...`: a stone slab with a span of `fill`
 /// cells between a floor endpoint at y = 59 and a ceiling endpoint at y = 67. The
 /// origin sits in the middle of the span.
-fn dripstone_gallery(ctx: &mut FC, ox: i32, oz: i32, floor_y: i32, fill: u32) {
+fn dripstone_gallery(ctx: &mut FC, ox: i32, oz: i32, floor_y: i32, span: i32, fill: u32) {
     let reg = breg().unwrap();
     let stone = reg.state_of("minecraft:stone", None);
     for dx in -12..=12 {
@@ -1212,10 +1212,10 @@ fn dripstone_gallery(ctx: &mut FC, ox: i32, oz: i32, floor_y: i32, fill: u32) {
             for y in 40..=floor_y {
                 ctx.set(ox + dx, y, oz + dz, stone);
             }
-            for y in floor_y + 1..=floor_y + 7 {
+            for y in floor_y + 1..=floor_y + span {
                 ctx.set(ox + dx, y, oz + dz, fill);
             }
-            for y in floor_y + 8..=80 {
+            for y in floor_y + span + 1..=100 {
                 ctx.set(ox + dx, y, oz + dz, stone);
             }
         }
@@ -1257,7 +1257,7 @@ fn dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above() {
     let air = reg.state_of("minecraft:air", None);
     let (ox, oz, oy) = (8, 8, 64);
     let (floor_y, ceil_y) = (59, 67);
-    dripstone_gallery(&mut ctx, ox, oz, floor_y, air);
+    dripstone_gallery(&mut ctx, ox, oz, floor_y, 7, air);
 
     // replay the head of the stream for the radii the footprint bound needs
     let (rx, rz) = {
@@ -1373,7 +1373,7 @@ fn dripstone_cluster_pools_lower_the_stalagmite_into_the_water() {
     let water = reg.state_of("minecraft:water", None);
     let (ox, oz, oy) = (8, 8, 64);
     let floor_y = 59;
-    dripstone_gallery(&mut ctx, ox, oz, floor_y, water);
+    dripstone_gallery(&mut ctx, ox, oz, floor_y, 7, water);
 
     let before = ctx.wr.clone();
     let mut rng = Xor::seed(31);
@@ -1467,4 +1467,219 @@ fn float_providers_draw_and_clamp_like_the_vanilla_types() {
         b.next_long(),
         "a trapezoid float draws twice"
     );
+}
+
+/// `minecraft:large_dripstone` (`ecu`, `LargeDripstoneFeature`) in a gallery whose span
+/// is 7 tall. The span's height gives the radius (`height * 0.33` clamped into the
+/// pack's `column_radius` 3..19, so exactly 3) and the two spikes reach their bases at
+/// the span's own neighbour cells. The body is built *in* the empty cells and stops when
+/// it walks into base stone, so every placed cell is inside the span.
+#[test]
+fn large_dripstone_hangs_and_stands_a_tapered_spike() {
+    let reg = breg().unwrap();
+    let cf = pack_cf("large_dripstone");
+    let Cf::LargeDripstone(dcfg) = &cf else {
+        panic!("large_dripstone must parse as a large dripstone");
+    };
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let air = reg.state_of("minecraft:air", None);
+    let drip = reg.state_of("minecraft:dripstone_block", None);
+    let (ox, oz, oy) = (8, 8, 63);
+    let (floor_y, ceil_y) = (59, 67);
+    dripstone_gallery(&mut ctx, ox, oz, floor_y, 7, air);
+
+    // replay the radius draw (the span height and the config decide it)
+    let want_radius = {
+        let mut probe = Xor::seed(11);
+        let est = ((ceil_y - floor_y - 1) as f32 * dcfg.ratio) as i32;
+        let est = est.clamp(dcfg.radius.min_inclusive(), dcfg.radius.max_inclusive());
+        probe.next_inbetween(dcfg.radius.min_inclusive(), est)
+    };
+    let before = ctx.wr.clone();
+    let mut rng = Xor::seed(11);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (ox, oy, oz));
+
+    let changed = changed(&before, &ctx);
+    assert!(!changed.is_empty(), "the gallery must grow something");
+    let mut above = 0usize;
+    let mut below = 0usize;
+    let mut cols: std::collections::BTreeMap<(i32, i32), Vec<i32>> = Default::default();
+    for ((px, py, pz), st) in &changed {
+        assert_eq!(
+            *st, drip,
+            "the large dripstone is built out of dripstone blocks: {px},{py},{pz}"
+        );
+        assert!(
+            (floor_y + 1..=ceil_y - 1).contains(py),
+            "the body is built in the span, not in the rock: {px},{py},{pz}"
+        );
+        assert!(
+            ((px - ox).pow(2) + (pz - oz).pow(2)) as f64 <= (want_radius as f64).powi(2) + 1.0,
+            "a cell at {px},{pz} is outside the drawn radius {want_radius}"
+        );
+        if *py > oy {
+            above += 1;
+        } else {
+            below += 1;
+        }
+        cols.entry((*px, *pz)).or_default().push(*py);
+    }
+    assert!(
+        above > 0 && below > 0,
+        "both spikes must appear: {above} / {below}"
+    );
+
+    // Each spike's cells in a column are anchored at its own base and run contiguously
+    // away from the span's end - a spike can only place on empty cells and can only stop
+    // where a cell was already filled or its taper ran out, so the two anchored walks
+    // (down from the ceiling's neighbour, up from the floor's) reproduce the column
+    // exactly. A spike that reached neither end would show up here.
+    let (mut hang_runs, mut stand_runs) = (0, 0);
+    for ((px, pz), ys) in &cols {
+        let set: std::collections::BTreeSet<i32> = ys.iter().copied().collect();
+        let mut walk: std::collections::BTreeSet<i32> = Default::default();
+        let mut y = ceil_y - 1;
+        while set.contains(&y) {
+            walk.insert(y);
+            y -= 1;
+        }
+        if set.contains(&(ceil_y - 1)) {
+            hang_runs += 1;
+        }
+        y = floor_y + 1;
+        while set.contains(&y) {
+            walk.insert(y);
+            y += 1;
+        }
+        if set.contains(&(floor_y + 1)) {
+            stand_runs += 1;
+        }
+        assert_eq!(
+            &walk, &set,
+            "the cells at {px},{pz} must be the two anchored runs: {ys:?}"
+        );
+    }
+    assert!(
+        hang_runs > 0 && stand_runs > 0,
+        "both spikes must build: {hang_runs} hanging / {stand_runs} standing"
+    );
+    println!(
+        "LARGE dry: cells={} columns={} above={} below={} radius={want_radius} runs={hang_runs}/{stand_runs}",
+        changed.len(),
+        cols.len(),
+        above,
+        below
+    );
+    assert_eq!(changed.len(), 37, "golden cell count");
+}
+
+/// The same feature in a span tall enough to satisfy the wind gate
+/// (`min_radius_for_wind` / `min_bluntness_for_wind`). The sway is a per-y translation
+/// `floor(wind * (origin_y - y))`, so running the identical seed with the pack's wind
+/// speed and with a *zero-drawing* zero speed (same draws, no displacement) must produce
+/// the same cells moved by exactly that vector.
+#[test]
+fn large_dripstone_sways_when_both_spikes_clear_the_wind_gate() {
+    let reg = breg().unwrap();
+    let cf = pack_cf("large_dripstone");
+    let Cf::LargeDripstone(dcfg) = &cf else {
+        panic!("large_dripstone must parse as a large dripstone");
+    };
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let air = reg.state_of("minecraft:air", None);
+    let (ox, oz, oy) = (8, 8, 63);
+    let (floor_y, ceil_y) = (55, 71);
+    dripstone_gallery(&mut ctx, ox, oz, floor_y, 15, air);
+
+    // The gate is a precondition: with a failing seed there is no sway, and the
+    // comparison below would prove nothing. Pick the first seed that clears it and say
+    // which one, so the test cannot silently degrade into comparing two still shapes.
+    let est = ((ceil_y - floor_y - 1) as f32 * dcfg.ratio) as i32;
+    let est = est.clamp(dcfg.radius.min_inclusive(), dcfg.radius.max_inclusive());
+    let (seed, radius, wind_v) = (0u64..64)
+        .find_map(|seed| {
+            let mut probe = Xor::seed(seed);
+            let radius = probe.next_inbetween(dcfg.radius.min_inclusive(), est);
+            let hang_blunt = dcfg.stalactite_bluntness.get(&mut probe);
+            let _hang_scale = dcfg.height_scale.get(&mut probe);
+            let stand_blunt = dcfg.stalagmite_bluntness.get(&mut probe);
+            let _stand_scale = dcfg.height_scale.get(&mut probe);
+            if radius < dcfg.min_radius_for_wind
+                || hang_blunt < dcfg.min_bluntness_for_wind
+                || stand_blunt < dcfg.min_bluntness_for_wind
+            {
+                return None;
+            }
+            let speed = dcfg.wind_speed.get(&mut probe);
+            let angle = mth_next_f32(&mut probe, 0.0, std::f32::consts::PI);
+            Some((
+                seed,
+                radius,
+                (
+                    (mth_cos(angle) * speed) as f64,
+                    (mth_sin(angle) * speed) as f64,
+                ),
+            ))
+        })
+        .expect("some seed under 64 must clear the wind gate");
+
+    let before = ctx.wr.clone();
+    let mut rng = Xor::seed(seed);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (ox, oy, oz));
+    let with_wind = changed(&before, &ctx);
+
+    // `Uniform(0.0, 0.0)` draws exactly as much as the pack's uniform speed, so the two
+    // runs share a stream and differ only in the displacement
+    let plain_cfg = LargeDripstoneCfg {
+        range: dcfg.range,
+        radius: dcfg.radius.clone(),
+        height_scale: dcfg.height_scale.clone(),
+        ratio: dcfg.ratio,
+        stalactite_bluntness: dcfg.stalactite_bluntness.clone(),
+        stalagmite_bluntness: dcfg.stalagmite_bluntness.clone(),
+        wind_speed: FP::Uniform(0.0, 0.0),
+        min_radius_for_wind: dcfg.min_radius_for_wind,
+        min_bluntness_for_wind: dcfg.min_bluntness_for_wind,
+    };
+    let mut ctx2 = context(&mut g);
+    dripstone_gallery(&mut ctx2, ox, oz, floor_y, 15, air);
+    let before2 = ctx2.wr.clone();
+    let mut rng2 = Xor::seed(seed);
+    gen_cf(
+        &Cf::LargeDripstone(Box::new(plain_cfg)),
+        freg(),
+        &mut ctx2,
+        &mut rng2,
+        (ox, oy, oz),
+    );
+    let plain = changed(&before2, &ctx2);
+
+    assert!(!with_wind.is_empty() && with_wind.len() == plain.len());
+    let (vx, vz) = wind_v;
+    let expect: std::collections::BTreeSet<((i32, i32, i32), u32)> = with_wind
+        .iter()
+        .map(|((px, py, pz), st)| {
+            let dy = (oy - py) as f64;
+            (
+                (
+                    px - (vx * dy).floor() as i32,
+                    *py,
+                    pz - (vz * dy).floor() as i32,
+                ),
+                *st,
+            )
+        })
+        .collect();
+    let got: std::collections::BTreeSet<((i32, i32, i32), u32)> = plain.iter().copied().collect();
+    assert_eq!(
+        expect, got,
+        "the wind moves each cell by floor(wind * (origin_y - y))"
+    );
+    println!(
+        "LARGE wind: seed={seed} cells={} radius={radius} wind={vx:.4},{vz:.4}",
+        with_wind.len()
+    );
+    assert_eq!(with_wind.len(), 126, "golden cell count");
 }

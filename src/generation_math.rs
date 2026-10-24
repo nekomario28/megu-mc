@@ -183,6 +183,13 @@ pub(crate) struct Xor {
     /// `RandomGenerator` forms instead, so both flavours are needed.
     legacy: bool,
 }
+/// `Mth.nextFloat(RandomSource, float, float)` - `random.nextFloat() * (max - min) +
+/// min`, with the subtraction done in f32 (so `0.7f32 - 0.3` is not `0.4f32` to the
+/// last bit; the float-provider test caught exactly that).
+pub(crate) fn mth_next_f32(r: &mut Xor, min: f32, max: f32) -> f32 {
+    r.next_f32() * (max - min) + min
+}
+
 /// `Mth.map(value, fromMin, fromMax, toMin, toMax)` - the unclamped linear map.
 pub(crate) fn map_f64(value: f64, from_min: f64, from_max: f64, to_min: f64, to_max: f64) -> f64 {
     to_min + (value - from_min) * (to_max - to_min) / (from_max - from_min)

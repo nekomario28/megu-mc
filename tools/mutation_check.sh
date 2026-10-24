@@ -506,6 +506,16 @@ check "an update packet sends block light only" \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
   update_light_packet_sends_block_light_only
 
+check "a large dripstone body is built in the empty cells" \
+  src/feature.rs 'if drip_is_empty_or_water_or_lava(ctx, q) {' \
+  'if drip_is_dripstone_base(reg, st) {' \
+  large_dripstone_hangs_and_stands_a_tapered_spike
+
+check "the wind displaces a large dripstone cell by the distance to the origin" \
+  src/feature.rs '                    p.0 + (vx * dy).floor() as i32,' \
+  '                    p.0,' \
+  large_dripstone_sways_when_both_spikes_clear_the_wind_gate
+
 check "a dripstone tip rejects a lava ceiling, not a stone one" \
   src/feature.rs 'Some(c) if roll1 && !drip_is_lava(ctx, (pos.0, c, pos.2)) => {' \
   'Some(c) if roll1 && !drip_can_be_adjacent_to_water(ctx, (pos.0, c, pos.2)) => {' \

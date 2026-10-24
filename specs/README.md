@@ -62,7 +62,7 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 次は 53 列の y の差（`hm_oc` の読み vs vanilla の `getHeight`）を同じ列で両側ダンプして比べることです。装飾順を固定具に寄せる実験は**負の結果**でした（§62.3）。
 
 **型カバレッジ**は計測できるようにしました（`tools/feature_type_coverage.py`）: pack の 60 型中 26 型に `p_cf` の腕が無く、**overworld の biome から到達されるのは 6 型**（`fossil` `iceberg` `sculk_patch` `dripstone_cluster` `large_dripstone` `speleothem_cluster`）。
-- **実装した型**: `geode`（残差はノイズの場）、`sea_pickle`、`ice_spike`、`root_system`（規則と入口まで）、`desert_well`（形と2ドローまで。loot table は port の chest と同じく未実装＝§69 に明記）、`iceberg`（draw 順・範囲・海面跨ぎまで。セル単位の一致は未測定＝§70 に明記）、`dripstone_cluster`（Column の両端・tip の向きと層順・プールの降下まで。セル単位の一致は未測定＝§71 に明記）。未実装の到達型は 11 → **4**。
+- **実装した型**: `geode`（残差はノイズの場）、`sea_pickle`、`ice_spike`、`root_system`（規則と入口まで）、`desert_well`（形と2ドローまで。loot table は port の chest と同じく未実装＝§69 に明記）、`iceberg`（draw 順・範囲・海面跨ぎまで。セル単位の一致は未測定＝§70 に明記）、`dripstone_cluster`（Column の両端・tip の向きと層順・プールの降下まで。セル単位の一致は未測定＝§71 に明記）、`large_dripstone`（2つの spike の根と taper・風の変位式まで。死んだ `placeColumn` は記録のみ＝§72 に明記）。未実装の到達型は 11 → **3**。
 - `geode`（**56 biome** から到達、最大の欠落）は**実装しました**（2026-10-24、`Cf::Geode`）。1.21.1 の `GeodeFeature`（`eck`）を逆コンパイルして層の閾値・点ごとのノイズ項・クラック・結晶の向きまで移植し、`tools/geode_fixture.sh`（seed 12 / chunk (0,0) に geode が出ることを port 側の trace で実測して選んだ固定具）で vanilla とセル単位に比較しています。**セル数はほぼ一致**（amethyst 162 vs 157、calcite 202 vs 201、smooth_basalt 237 vs 256）ですが**形はまだ一致しません**（3層合計 IoU 0.31、最良の平行移動でも 0.39）。残差はノイズの場に帰属させ、数値・固定具・次に測ることを evidence に残しました （[feature-parity](../evidence/gameplay/feature-parity/README.md) §63）。
   両側0個、全chunk skip、別stageの差分は成功扱いにしません。
 
