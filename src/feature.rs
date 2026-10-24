@@ -220,7 +220,7 @@ fn p_pf(j: &J) -> Option<Pf> {
 ///   hollow core, and with a crack the six neighbours are replaced by their
 ///   fluid), `d2` (inner, or the alternate inner at `use_alternate_layer0_chance`
 ///   - that same draw also decides whether the block becomes an inner placement
-///   to hang a crystal on), `d3` (middle) and `d4` (outer);
+///     to hang a crystal on), `d3` (middle) and `d4` (outer);
 /// - a block is only written where the existing block is *not* in
 ///   `cannot_replace`, but the provider is asked for its state either way, which
 ///   is where the draw happens;
