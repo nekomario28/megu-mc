@@ -558,3 +558,23 @@ Java の `!(a > b)` は NaN で真、Rust の `<=` は偽なので、否定の�
 置いたブロックが packed_ice のみであること）と `ice_spike_does_nothing_without_snow`
 （雪でなければ何も置かず**1ドローも消費しない**）。mutation 2本を追加（高さと材質）で 58 proved / 0 not a gate。
 型カバレッジの未実装到達型は 9 → **8**。
+
+## 67. 残り8型の実測トリアージ（実装コストと、塞いでいるもの）
+
+未実装の到達型 8 件を逆コンパイルして行数と依存を数えた（`--only=` は公式 mappings で引く）。
+「小さい＝安い」ではないので、**新規インフラが要るか**を並べる。
+
+| 型 | 行数 | 引くサポート | 判定 |
+|---|---|---|---|
+| `fossil` | 58 | `enu`/`ent`/`enp`（StructureTemplate, StructurePlaceSettings, プロセッサ）, テンプレート ID のリスト（config） | **要テンプレート基盤**。port に構造物パイプラインが無く、58行に見えて一番高い |
+| `sculk_patch` | 60 | `dmu` = SculkSpreader（`dmu.b()`） | **要SculkSpreader移植**（charge/cursor の確率ウォーク、別クラスで100行超） |
+| `desert_well` | 99 | `dga` のみ ＋ `dqj.N` の **block entity** に archaeology の loot table（`ern.bd`） | 構造は純ロジックだが suspicious_sand の loot table を落とすと部分的（block は置けるが brush で何も出ない）→ 条件付き |
+| `root_system` | 109 | `duz`（BlockStateProvider）, `awk`（FluidTags）, `dmb`? ではなく **placed feature 参照**（`Holder treeFeature`）, BlockPredicate | **純ロジック**。port にある部品だけで書ける。設定は12フィールド |
+| `dripstone_cluster` | 173 | `dga` ＋ `awk` | 純ロジックだが大きい |
+| `large_dripstone` | 195 | `dga` ＋ `awk` | 同上 |
+| `iceberg` | 231 | `dga` のみ（`nextDouble` を4回引いて形を決める二形状） | 純ロジックだが最大。ヘルパ5本 |
+| `speleothem_cluster` | — | 公式 mappings にクラスが無い | **1.21.1 の型ではない**（このリポジトリの同梱 pack は 1.21.2+ 変換版）。1.21.1 を参照にしている以上、忠実な移植は原理的に不可 |
+
+次に触るなら `root_system`（純ロジック最小、木の placed feature 参照は `gen_pf` で既にある）、
+その次が `dripstone_cluster`/`large_dripstone`（クラスタ系）。`fossil` は構造物基盤を入れるまで着手しない。
+`desert_well` は block entity の loot table まで含めて扱えるときに。
