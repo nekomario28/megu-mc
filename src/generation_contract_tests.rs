@@ -2,7 +2,7 @@ use super::{freg, gen_cf, Cf};
 use crate::block_registry::breg;
 use crate::generation_context::FC;
 use crate::generation_math::{normal_new_l, Xor};
-use crate::generation_providers::{p_hp, p_ip, test_pred, test_rt, Pr, BSP, RT};
+use crate::generation_providers::{p_hp, p_ip, test_pred, test_rt, Bsp, Pr, RT};
 use crate::json::jparse;
 use crate::worldgen::Gen;
 
@@ -187,39 +187,39 @@ fn provider_values_and_following_rng_match_pre_extraction() {
     let wheat = reg.state_of("wheat", None);
     let noise = || normal_new_l(11, -2, &[1.0, 0.5]);
     let blocks = vec![
-        BSP::Simple(stone),
-        BSP::Rotated {
+        Bsp::Simple(stone),
+        Bsp::Rotated {
             base: log,
             axis: true,
         },
-        BSP::Rotated {
+        Bsp::Rotated {
             base: stone,
             axis: false,
         },
-        BSP::Weighted(vec![(-1, water), (1, dirt), (3, stone)]),
-        BSP::Weighted(vec![]),
-        BSP::Weighted(vec![(-1, dirt)]),
-        BSP::RandomInt {
-            src: Box::new(BSP::Simple(wheat)),
+        Bsp::Weighted(vec![(-1, water), (1, dirt), (3, stone)]),
+        Bsp::Weighted(vec![]),
+        Bsp::Weighted(vec![(-1, dirt)]),
+        Bsp::RandomInt {
+            src: Box::new(Bsp::Simple(wheat)),
             prop: "age".into(),
             vals: vec![0, 3, 7],
         },
-        BSP::RandomInt {
-            src: Box::new(BSP::Simple(wheat)),
+        Bsp::RandomInt {
+            src: Box::new(Bsp::Simple(wheat)),
             prop: "age".into(),
             vals: vec![],
         },
-        BSP::Noise {
+        Bsp::Noise {
             n: noise(),
             scale: 0.2,
             states: vec![stone, dirt, water],
         },
-        BSP::Noise {
+        Bsp::Noise {
             n: noise(),
             scale: 0.2,
             states: vec![],
         },
-        BSP::NoiseThr {
+        Bsp::NoiseThr {
             n: noise(),
             scale: 0.2,
             thr: f32::INFINITY,
@@ -228,7 +228,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             low: vec![dirt, water],
             high: vec![log],
         },
-        BSP::NoiseThr {
+        Bsp::NoiseThr {
             n: noise(),
             scale: 0.2,
             thr: f32::INFINITY,
@@ -237,7 +237,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             low: vec![],
             high: vec![log],
         },
-        BSP::NoiseThr {
+        Bsp::NoiseThr {
             n: noise(),
             scale: 0.2,
             thr: f32::NEG_INFINITY,
@@ -246,7 +246,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             low: vec![],
             high: vec![log, dirt],
         },
-        BSP::NoiseThr {
+        Bsp::NoiseThr {
             n: noise(),
             scale: 0.2,
             thr: f32::NEG_INFINITY,
@@ -255,7 +255,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             low: vec![],
             high: vec![log],
         },
-        BSP::NoiseThr {
+        Bsp::NoiseThr {
             n: noise(),
             scale: 0.2,
             thr: f32::NEG_INFINITY,
@@ -264,7 +264,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             low: vec![],
             high: vec![],
         },
-        BSP::Dual {
+        Bsp::Dual {
             n: noise(),
             scale: 0.2,
             variety: (1, 3),
@@ -272,7 +272,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             slow_variety: (1, 2),
             states: vec![stone, dirt, water, log, wheat, 0],
         },
-        BSP::Dual {
+        Bsp::Dual {
             n: noise(),
             scale: 0.2,
             variety: (1, 3),
@@ -280,18 +280,18 @@ fn provider_values_and_following_rng_match_pre_extraction() {
             slow_variety: (1, 2),
             states: vec![],
         },
-        BSP::RuleBased {
-            fb: Some(Box::new(BSP::Simple(dirt))),
+        Bsp::RuleBased {
+            fb: Some(Box::new(Bsp::Simple(dirt))),
             rules: vec![
-                (Pr::Not(Box::new(Pr::True)), BSP::Simple(log)),
-                (Pr::True, BSP::Weighted(vec![(1, stone), (2, water)])),
+                (Pr::Not(Box::new(Pr::True)), Bsp::Simple(log)),
+                (Pr::True, Bsp::Weighted(vec![(1, stone), (2, water)])),
             ],
         },
-        BSP::RuleBased {
-            fb: Some(Box::new(BSP::Simple(dirt))),
+        Bsp::RuleBased {
+            fb: Some(Box::new(Bsp::Simple(dirt))),
             rules: vec![],
         },
-        BSP::RuleBased {
+        Bsp::RuleBased {
             fb: None,
             rules: vec![],
         },
