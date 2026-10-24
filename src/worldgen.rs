@@ -432,6 +432,14 @@ impl Gen {
         m
     }
 
+    /// `LOAD_TRACE=1` names the step at which loading gave up. Without it a missing
+    /// piece of the worldgen data looks exactly like a wrong world (CV2).
+    fn load_trace(why: &str) {
+        if std::env::var("LOAD_TRACE").is_ok() {
+            eprintln!("[load] {why}");
+        }
+    }
+
     pub fn load(seed: u64, res: fn(&str) -> Option<u32>) -> Option<Gen> {
         let files = Self::df_files();
         let mut g = Gen {
@@ -510,7 +518,13 @@ impl Gen {
                 break 'outer;
             }
         }
-        let ns = ns_json?;
+        let ns = match ns_json {
+            Some(j) => j,
+            None => {
+                Self::load_trace("noise_settings/overworld.json was not found or is not JSON");
+                return None;
+            }
+        };
         g.sea = ns.get("sea_level").map(J::num).unwrap_or(63.0) as i32;
         if let Some(n) = ns.get("noise") {
             g.min_y = n.get("min_y").map(J::num).unwrap_or(-64.0) as i32;
@@ -520,8 +534,14 @@ impl Gen {
         // 1.21.1 writes the router entries as inline density functions (the newer
         // dialect writes references), so this has to go through `router_df`, which
         // accepts either.
-        let fd = router.and_then(|r| r.get("final_density"))?;
-        let idx = router_df(&mut g, &files, fd)?;
+        let Some(fd) = router.and_then(|r| r.get("final_density")) else {
+            Self::load_trace("noise_settings has no noise_router.final_density");
+            return None;
+        };
+        let Some(idx) = router_df(&mut g, &files, fd) else {
+            Self::load_trace("noise_router.final_density did not resolve");
+            return None;
+        };
         g.final_density = idx;
         // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
         // from three router functions; 1.21.2+ moved them into a material rule.
@@ -663,9 +683,18 @@ impl Gen {
         let aq = ns.get("aquifers");
         if !noaq && (aq.is_some() || router.is_some()) {
             let get = |g: &mut Gen, k: &str| -> Option<usize> {
-                let j = aq
+                let j = match aq
                     .and_then(|a| a.get(k))
-                    .or_else(|| router.and_then(|r| r.get(k)))?;
+                    .or_else(|| router.and_then(|r| r.get(k)))
+                {
+                    Some(j) => j,
+                    None => {
+                        Self::load_trace(&format!(
+                            "no aquifer function {k:?} in aquifers or noise_router"
+                        ));
+                        return None;
+                    }
+                };
                 router_df(g, &files, j)
             };
             let (b, f, s, l, e) = (
@@ -960,7 +989,16 @@ impl Gen {
             }
             J::Str(s) => self.resolve_ref(files, s),
             J::Obj(_) => {
-                let d = self.parse_df(j, files)?;
+                let d = match self.parse_df(j, files) {
+                    Some(d) => d,
+                    None => {
+                        Self::load_trace(&format!(
+                            "density node type {:?} did not parse",
+                            j.get("type").map(|t| t.str()).unwrap_or("<none>")
+                        ));
+                        return None;
+                    }
+                };
                 self.dfs.push(d);
                 Some(self.dfs.len() - 1)
             }
@@ -979,6 +1017,23 @@ impl Gen {
         );
         let b = std::fs::read(&path).ok()?;
         let j = jparse(&b)?;
+        // 1.21.1 noise files: `firstOctave` + `amplitudes`. The converted pack re-encoded
+        // the same octaves as `base_octave`/`base_amplitude`/`octave_count`; both load,
+        // and both construct the noise the modern way (see `normal_new_amps`).
+        if let Some(amps) = j.get("amplitudes").and_then(|a| a.as_arr()) {
+            let first = j
+                .get("firstOctave")
+                .or_else(|| j.get("first_octave"))
+                .map(|v| v.num())
+                .unwrap_or(-4.0) as i32;
+            let amps: Vec<f64> = amps.iter().map(|v| v.num()).collect();
+            let mut rng = self.factory.of_str(name);
+            let n = crate::generation_math::normal_new_amps(&mut rng, first, &amps);
+            self.noises.push(n);
+            self.noise_names
+                .insert(name.to_string(), self.noises.len() - 1);
+            return Some(self.noises.len() - 1);
+        }
         let base_octave = j.get("base_octave")?.num() as i32;
         let base_amplitude = j.get("base_amplitude")?.num();
         // absent modifiers = single implicit octave (vanilla amplitudes [1.0])
@@ -1023,43 +1078,43 @@ impl Gen {
         let sub = |g: &mut Gen, k: &str| -> Option<usize> { g.node(j.get(k)?, files) };
         // 1.21.1 names the two operands `argument1`/`argument2`, the newer dialect
         // `left`/`right`. Same operation, same order, so accept either.
-        let bin = |g: &mut Gen, k: &str, alt: &str| -> Option<usize> {
+        let either = |g: &mut Gen, k: &str, alt: &str| -> Option<usize> {
             g.node(j.get(k).or_else(|| j.get(alt))?, files)
         };
         let out = Some(match ty.as_str() {
             "add" => DF::Add(
-                bin(self, "left", "argument1")?,
-                bin(self, "right", "argument2")?,
+                either(self, "left", "argument1")?,
+                either(self, "right", "argument2")?,
             ),
             "sub" => DF::Sub(
-                bin(self, "left", "argument1")?,
-                bin(self, "right", "argument2")?,
+                either(self, "left", "argument1")?,
+                either(self, "right", "argument2")?,
             ),
             "mul" => DF::Mul(
-                bin(self, "left", "argument1")?,
-                bin(self, "right", "argument2")?,
+                either(self, "left", "argument1")?,
+                either(self, "right", "argument2")?,
             ),
             "min" => DF::Min(
-                bin(self, "left", "argument1")?,
-                bin(self, "right", "argument2")?,
+                either(self, "left", "argument1")?,
+                either(self, "right", "argument2")?,
             ),
             "max" => DF::Max(
-                bin(self, "left", "argument1")?,
-                bin(self, "right", "argument2")?,
+                either(self, "left", "argument1")?,
+                either(self, "right", "argument2")?,
             ),
             "div" => DF::Div(
-                bin(self, "left", "argument1")?,
-                bin(self, "right", "argument2")?,
+                either(self, "left", "argument1")?,
+                either(self, "right", "argument2")?,
             ),
-            "negate" => DF::Neg(sub(self, "input")?),
-            "abs" => DF::Abs(sub(self, "input")?),
-            "square" => DF::Sq(sub(self, "input")?),
-            "cube" => DF::Cube(sub(self, "input")?),
-            "half_negative" => DF::HNeg(sub(self, "input")?),
-            "quarter_negative" => DF::QNeg(sub(self, "input")?),
-            "squeeze" => DF::Squeeze(sub(self, "input")?),
+            "negate" => DF::Neg(either(self, "input", "argument")?),
+            "abs" => DF::Abs(either(self, "input", "argument")?),
+            "square" => DF::Sq(either(self, "input", "argument")?),
+            "cube" => DF::Cube(either(self, "input", "argument")?),
+            "half_negative" => DF::HNeg(either(self, "input", "argument")?),
+            "quarter_negative" => DF::QNeg(either(self, "input", "argument")?),
+            "squeeze" => DF::Squeeze(either(self, "input", "argument")?),
             "clamp" => DF::Clamp {
-                i: sub(self, "input")?,
+                i: either(self, "input", "argument")?,
                 lo: n("min"),
                 hi: n("max"),
             },
@@ -1081,9 +1136,9 @@ impl Gen {
                 tc: n("to_y"),
                 tv: n("to_value"),
             },
-            "interpolated" => DF::Interp(sub(self, "input")?),
+            "interpolated" => DF::Interp(either(self, "input", "argument")?),
             "cache" | "flat_cache" | "cache_2d" | "cache_once" | "cache_all_in_cell" => {
-                DF::Cache(sub(self, "input")?)
+                DF::Cache(either(self, "input", "argument")?)
             }
             "noise" => {
                 let zero = {
@@ -1108,10 +1163,39 @@ impl Gen {
                     ys: n("y_scale"),
                 }
             }
-            "shift_a" => DF::ShiftA(self.noise_id(j.get("noise")?.str())?),
-            "shift_b" => DF::ShiftB(self.noise_id(j.get("noise")?.str())?),
+            // 1.21.1's `shifted_noise` carries the shifts inline; the newer dialect
+            // splits them into `shift_a`/`shift_b` and composes them in `noise`. Same
+            // construction, so it maps onto the same variant.
+            "shifted_noise" => {
+                let zero = {
+                    self.dfs.push(DF::C(0.0));
+                    self.dfs.len() - 1
+                };
+                DF::Noise {
+                    ni: self.noise_id(j.get("noise")?.str())?,
+                    sx: j
+                        .get("shift_x")
+                        .and_then(|v| self.node(v, files))
+                        .unwrap_or(zero),
+                    sy: zero,
+                    sz: j
+                        .get("shift_z")
+                        .and_then(|v| self.node(v, files))
+                        .unwrap_or(zero),
+                    xzs: n("xz_scale"),
+                    ys: n("y_scale"),
+                }
+            }
+            // 1.21.1 names it in `argument`, the newer dialect in `noise`; either way it
+            // is a *noise* name (`minecraft:offset`), not a density-function reference.
+            "shift_a" | "shift_x" => {
+                DF::ShiftA(self.noise_id(j.get("noise").or_else(|| j.get("argument"))?.str())?)
+            }
+            "shift_b" | "shift_z" => {
+                DF::ShiftB(self.noise_id(j.get("noise").or_else(|| j.get("argument"))?.str())?)
+            }
             "range_choice" => DF::RangeChoice {
-                i: sub(self, "input")?,
+                i: either(self, "input", "argument")?,
                 mi: n("min_inclusive"),
                 ma: n("max_exclusive"),
                 wr: sub(self, "when_in_range")?,
@@ -1127,7 +1211,7 @@ impl Gen {
                     th.push(t.num());
                 }
                 DF::IntervalSelect {
-                    i: sub(self, "input")?,
+                    i: either(self, "input", "argument")?,
                     th,
                     fns,
                 }
@@ -1153,7 +1237,7 @@ impl Gen {
                     mym: ym / yf,
                 }
             }
-            "blend_density" => DF::BlendD(sub(self, "input")?),
+            "blend_density" => DF::BlendD(either(self, "input", "argument")?),
             "blend_alpha" => DF::C(1.0),
             "blend_offset" | "beardifier" | "end_outer_islands" | "end_islands"
             | "distance_to_point" | "slice" => DF::Zero,
@@ -1163,7 +1247,10 @@ impl Gen {
                 upper: sub(self, "upper_bound")?,
                 cell_h: n("cell_height") as i32,
             },
-            _ => DF::Zero,
+            _ => {
+                Self::load_trace(&format!("unknown density function type {ty:?} -> zero"));
+                DF::Zero
+            }
         });
         trace(&ty, out.is_some());
         out

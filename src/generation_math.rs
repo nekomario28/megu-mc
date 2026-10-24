@@ -822,6 +822,21 @@ pub(crate) fn normal_new(
     mods: &[f64],
 ) -> Normal {
     let octaves = build_octaves(base_octave, base_amplitude, mods.len(), mods);
+    normal_from_octaves(r, octaves)
+}
+
+/// The 1.21.1 encoding of the same construction: `firstOctave` plus one amplitude per
+/// octave, instead of `base_octave`/`base_amplitude` plus modifiers. `NormalNoise` only
+/// takes the legacy path when the `RandomSource` is a `LegacyRandomSource` (see
+/// `PerlinNoise.createLegacyForLegacyRandomSource` in `eoh`'s constructor); the router
+/// noises come from a name-derived Xoroshiro source, so the *modern* construction is the
+/// right one - the amplitudes are per-octave, that is all that changes.
+pub(crate) fn normal_new_amps(r: &mut Xor, first_octave: i32, amps: &[f64]) -> Normal {
+    let octaves = build_octaves(first_octave, 1.0, amps.len(), amps);
+    normal_from_octaves(r, octaves)
+}
+
+fn normal_from_octaves(r: &mut Xor, octaves: Vec<(i32, f64, f64)>) -> Normal {
     let target: f64 = octaves.iter().map(|o| o.2.abs()).sum();
     let nf = norm_factor(target, &octaves);
     let first = r.splitter();
