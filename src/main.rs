@@ -21474,7 +21474,8 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            worldgen::heightmap_dump(&path, n, ox, oz);
+            let terrain_only = std::env::var("MC_SPINE_WG_DUMP_HM_TERRAIN").is_ok();
+            worldgen::heightmap_dump_mode(&path, n, ox, oz, terrain_only);
         }
         if std::env::var("WGDIFF").is_ok() {
             // vanilla reference values at (0,0,0) seed 0 from pumpkin test data

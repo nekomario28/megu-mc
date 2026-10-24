@@ -2351,41 +2351,50 @@ port は「置けたときだけ」`p.1 += 1` していたため、**基準セ�
 注: この経路は今回の fixture 領域では踏まれず、領域のセル数（`kelp` 494/484、`kelp_plant` 2761/2689）は
 修正前後で**同じ**だった。数値が動かない変更を「効果なし」と読まず、単体テストで経路の実行を証明している。
 
-### 62.2b `getHeight(OCEAN_FLOOR)` の差を測る道具を作り、**解釈が確定しない**ところで止めた
+### 62.2b `getHeight(OCEAN_FLOOR)` の差を測る道具（最初の版は測定対象を間違えていた）
 
-§62.1 の「53列は両側の `getHeight(OCEAN_FLOOR)` の差」は**帰属であって測定ではない**。保存済みの
-vanilla chunk は heightmap を自分で持っているので、確認できるはずだった:
+§62.1 の「53列は両側の getHeight の差」を確認するために `tools/heightmap_diff.py` を作り、
+`MC_SPINE_WG_DUMP_HM` で port 側の高さを出して列ごとに比べた。最初の版は 9216 列中 329 列が
+不一致で、その内訳（外縁225/5120、内部104/4096、内部は chunk 内 `lz=0..8` に集中、port が低い）
+まで出していた。
 
-- port 側: `MC_SPINE_WG_DUMP_HM=<path>`（`worldgen::heightmap_dump`）が、dump した領域の
-  各列の OCEAN_FLOOR（chunk の top と feature layer の高い方）を 256×i32/chunk で書く。
-- 参照側: `tools/heightmap_diff.py` が region file の `Heightmaps.OCEAN_FLOOR` を
-  9bit パックから展開して列ごとに比べる。
+**ただしその時の dump は `ChunkCols::surface`（密度top）を書いていた**ので、
+「feature が読む値」ではなく「密度topと保存値の差」を測っていた（§62.4 で気づいた）。
+保存値の解釈については一度「未確定」と書いたが、それは*こちらの*アドホックなブロック解析が
+壊れていたためで、`vanilla_region_blocks.py` と同じ手順で読み直すと保存値は素直に
+「最終的な床 + 1」（WORLD_SURFACE はその列の水面 = 海面63）だった。確定に使った突き合わせ:
 
-分かったこと:
+| 比較 | 結果 |
+|---|---|
+| 保存 `OCEAN_FLOOR` − port の密度top | 8887/9216 一致、**329 不一致** |
+| 保存 `WORLD_SURFACE` − port の密度top | +12〜+16（= 水深）に集中 |
 
-1. **保存値は床からの相対値**。chunk (79,-1) の `WORLD_SURFACE=127`、海面の最上水ブロックは y=63
-   → `127 - (-64) = 63`。絶対値で書く port 側と比べるには変換が要る（変換を間違えると全列が±1でずれ、
-   実際に最初の2回はそうなった）。
-2. 変換後、6×6 領域 9216 列のうち **329 列が不一致**（領域外縁の chunk 225/5120、内部 104/4096）。
-   内部の不一致は chunk 内 `lz=0..8` に集中し、差は **port の方が低い**（-1〜-6）。
-3. **しかし、この数字はまだ「port の heightmap が違う」証拠にならない。** 保存された
-   `OCEAN_FLOOR` を「最後に残った非水ブロック + |min_y|」として素直に読むと、実ブロックと合わない列が
-   ある（例: chunk (80,0) 列 (1286,0) は保存値が 29 を指すが、最終ブロックで非水の最上位は y=31。
-   chunk (80,0) 列 (1280,0) では逆に保存値 25 に対し実ブロック 31）。保存 heightmap が
-   **生成途中の状態**なのか、こちらの展開が一部ずれているのかを切り分けられていない。
+つまり 329 列では port の密度topが実際の床より低く、**feature が読む高さも同じだけ低かった**。
 
-つまり §62.1 の帰属は**確認も反証もできていない**。この節は「測定の入口はできた」までで、
-53列の原因は引き続き未確定として扱う。道具は再現手順つきで残す:
+### 62.4 原因の特定と修正：heightmap は密度topではなく「そこにあるブロック」
 
-```
-MC_SPINE_WG_DUMP_HM=/tmp/kelpfix-79--1/port_hm.bin MC_SPINE_WG_DUMP_N=6 \
-  MC_SPINE_WG_DUMP_X=79 MC_SPINE_WG_DUMP_Z=-1 MC_SPINE_SEED=0 ./target/release/mc-spine
-tools/heightmap_diff.py /tmp/kelpfix-79--1/world 79 -1 /tmp/kelpfix-79--1/port_hm.bin --n 6
-```
+セル単位で突き合わせると、port のブロックと vanilla のブロックはほぼ一致していた
+（chunk (79,-1) 列 (1264,-16): 両側とも y=33 が床、差は y=33 の stone/sand の材料差のみ）。
+ところが port の `hm_oc` は 19（密度top + 1）を返していた。
 
-次に触るなら、まず参照側の解釈を確定させる（保存 heightmap を「最終ブロックから計算した床」と
-突き合わせて、どの列でどんな差になるかを分類する）のが先。そこを飛ばして port 側を直すのは
-§CV1/§CV2 の「何が走ったかを確かめずに差分を読む」に当たる。
+- vanilla の `OCEAN_FLOOR_WG` は地形段の `setBlock` ごとに更新される。密度が負でも
+  **aquifer が固体を押し上げたセルは数える**。
+- port の基準は `ChunkCols::surface` = 密度topだったので、その固体を含めていなかった。
+
+修正: `FC::hm_oc` / `hm_ws` で列を上から走査し、`is_solid`（`hm_ws` は流体も）を満たす
+最上位セル + 1 を返す。開始は `max(密度top, 海面+1)`、停止は密度top（定義上そこは固体）。
+分類は `FC` 側でやるので層規則はそのまま（`FC::set` と同じ理由）。
+
+| ゲート | 結果 |
+|---|---|
+| `tools/heightmap_diff.py`（seed 0 / 6x6 領域 = 9216 列） | 修正前 **329 不一致** → 修正後 **0 不一致** |
+| `generation_contract_tests::heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface` | 列 (1264,-16) の床が 34 であること。`hm_oc` を密度topに戻す mutation で赤くなる（mutation check 56 proved） |
+
+**ケルプへの効果は出なかった（負の結果）**: 修正の前後で領域のセル数は `kelp` 494/2761（port）で
+**同一**、`shared` は参照側の実行列ノイズ床の範囲で動いただけだった。つまり §62.1 の
+「53列 = 高さの読みの差」という帰属は**この修正では説明できない**（残差は §62.1 のもう半分、
+先行 feature の書き込みを見るかどうかのクラス）。固定具の数字は
+`tools/kelp_fixture.sh 79 -1 6 0` で再現できる。
 
 ### 62.3 順序を固定具に合わせても残差は減らない（負の結果）
 

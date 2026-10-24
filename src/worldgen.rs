@@ -3520,8 +3520,19 @@ pub fn biome_at_dump(spec: &str) {
 /// assumed. The port's value is what a feature would read after generation - the
 /// chunk's own top and the feature layer, whichever is higher.
 pub fn heightmap_dump(path: &str, n: i32, ox: i32, oz: i32) {
+    heightmap_dump_mode(path, n, ox, oz, false)
+}
+
+/// `terrain_only`: the chunk column's own top, without the feature layer. A saved
+/// vanilla chunk carries heightmaps that may be from a stage before or after the
+/// features, so the two have to be dumped separately to be told apart.
+pub fn heightmap_dump_mode(path: &str, n: i32, ox: i32, oz: i32, terrain_only: bool) {
     let mut gg = GEN.lock().unwrap();
     let Some(g) = gg.as_mut() else { return };
+    // through the same accessor a feature reads, not the raw column top: the two
+    // differ wherever the aquifer pushes a solid above the noise surface, and it is
+    // the feature-facing value this tool exists to compare.
+    let mut fc = crate::generation_context::FC::new(g);
     let mut out: Vec<u8> = Vec::new();
     for dz in 0..n {
         for dx in 0..n {
@@ -3529,8 +3540,11 @@ pub fn heightmap_dump(path: &str, n: i32, ox: i32, oz: i32) {
             for lz in 0..16 {
                 for lx in 0..16 {
                     let (x, z) = (cx * 16 + lx, cz * 16 + lz);
-                    let base = g.top_oc(x, z);
-                    let h = g.feature_height(x, z, 1).max(base);
+                    let h = if terrain_only {
+                        fc.hm_oc_terrain(x, z)
+                    } else {
+                        fc.hm_oc(x, z)
+                    };
                     out.extend_from_slice(&h.to_le_bytes());
                 }
             }

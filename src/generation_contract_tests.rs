@@ -631,3 +631,42 @@ fn geode_abandons_itself_when_a_point_lands_in_air() {
         .count();
     assert_eq!(placed, 0, "an abandoned geode must place nothing");
 }
+
+/// The heightmap a feature reads is the block that is there, not the noise surface.
+/// Vanilla maintains `OCEAN_FLOOR_WG` from every `setBlock` during terrain, so a
+/// solid the aquifer pushes above the noise surface counts; the port's basis was
+/// `ChunkCols::surface`, the density top, which reads the floor too low there.
+///
+/// Measured on the pinned kelp fixture (seed 0, chunk (79,-1)): this column's
+/// density top is 18 while both worlds hold stone at y=33, so the floor is 34. With
+/// the old basis the whole fixture region disagreed with vanilla's saved heightmap
+/// on 329 of 9216 columns and agreed on none of them; with the walk it is 0 of 9216.
+#[test]
+fn heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    let (x, z) = (1264, -16);
+    let stone = reg.state_of("minecraft:stone", None);
+    assert_eq!(
+        reg.name_of(ctx.get(x, 33, z)),
+        "minecraft:stone",
+        "the fixture column holds a solid at y=33"
+    );
+    assert!(
+        ctx.hm_oc(x, z) > 33,
+        "OCEAN_FLOOR must be above that solid, got {}",
+        ctx.hm_oc(x, z)
+    );
+    assert_eq!(
+        ctx.hm_oc(x, z),
+        34,
+        "the first free y above the floor is 34 (vanilla's saved OCEAN_FLOOR)"
+    );
+    // and the port's own block at the floor is above the density top it started from
+    assert!(
+        reg.name_of(ctx.get(x, 18, z)) != "minecraft:air",
+        "the density top itself is solid, so the walk has a floor to stop at"
+    );
+    let _ = stone;
+}

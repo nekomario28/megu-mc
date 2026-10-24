@@ -76,13 +76,51 @@ impl<'a> FC<'a> {
         let st = self.get(x, y, z);
         breg().map(|r| r.is_air(st)).unwrap_or(st == 0)
     }
+    /// The topmost cell of a column that the heightmap counts, searching down from
+    /// `from` and stopping at `base` (the density top, which is solid by
+    /// construction, so `base` is returned when nothing above it counts).
+    ///
+    /// This is not the density top, and that is the point: vanilla maintains
+    /// `OCEAN_FLOOR_WG`/`WORLD_SURFACE_WG` from every `setBlock` during terrain, so a
+    /// solid the aquifer pushes *above* the noise surface belongs to it. The port's
+    /// basis was the density top, which reads the floor too low wherever that
+    /// happens - measured on the kelp fixture: cell (1264,33,-16) is stone in the
+    /// port's own dump and sand in vanilla's, while the density top is 18, and 329 of
+    /// the 9216 columns in that region read the floor below the block that is there.
+    /// `fluid` selects the predicate: `OCEAN_FLOOR` counts motion-blocking blocks
+    /// only, `WORLD_SURFACE` also counts a fluid cell.
+    fn heightmap_above(&mut self, x: i32, z: i32, from: i32, base: i32, fluid: bool) -> i32 {
+        let reg = breg();
+        let mut y = from;
+        while y >= base {
+            let st = self.get(x, y, z);
+            let counts = reg
+                .map(|r| r.is_solid(st) || (fluid && r.is_liquid(st)))
+                .unwrap_or(false);
+            if counts {
+                return y + 1;
+            }
+            y -= 1;
+        }
+        base
+    }
     pub(crate) fn hm_ws(&mut self, x: i32, z: i32) -> i32 {
         let base = self.g.top_ws(x, z);
-        self.g.feature_height(x, z, 0).max(base)
+        let start = base.max(self.g.sea + 1);
+        let terrain = self.heightmap_above(x, z, start, base, true);
+        self.g.feature_height(x, z, 0).max(terrain)
+    }
+    /// The terrain part of `hm_oc`, without the feature layer.
+    pub(crate) fn hm_oc_terrain(&mut self, x: i32, z: i32) -> i32 {
+        let base = self.g.top_oc(x, z);
+        let start = base.max(self.g.sea + 1);
+        self.heightmap_above(x, z, start, base, false)
     }
     pub(crate) fn hm_oc(&mut self, x: i32, z: i32) -> i32 {
         let base = self.g.top_oc(x, z);
-        self.g.feature_height(x, z, 1).max(base)
+        let start = base.max(self.g.sea + 1);
+        let terrain = self.heightmap_above(x, z, start, base, false);
+        self.g.feature_height(x, z, 1).max(terrain)
     }
     /// `LevelReader.getBiome(BlockPos)`, i.e. `BiomeManager.getBiome` — the
     /// *blended* biome, and the one vanilla's `BiomeFilter` reads. It is not the

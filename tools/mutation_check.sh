@@ -506,6 +506,11 @@ check "an update packet sends block light only" \
   '    write_varint(&mut p, 1); // skyLightMask: sky is unchanged' \
   update_light_packet_sends_block_light_only
 
+check "the heightmap a feature reads is the floor the blocks are at" \
+  src/generation_context.rs '        let terrain = self.heightmap_above(x, z, start, base, false);' \
+  '        let terrain = base;' \
+  heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface
+
 check "the projectile sweep spans the whole tick, not a fraction of it" \
   src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
   '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
