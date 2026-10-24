@@ -7,6 +7,7 @@
 
 | 道具 | 何をするか |
 |---|---|
+| `vineflower.sh <class> [...]`（未スクリプト化、下記コマンド） | 1クラスを**ソースに逆コンパイル**して読む。`javap` はオフセットの引用に、こちらはアルゴリズムの移植に使う。入れ子 jar を展開して `--only=<obf>` を渡す: `unzip -q server.jar 'META-INF/versions/*' -d t && java -jar ~/.cache/mc-spine-work/mc121/vineflower-1.11.1.jar --folder --only=eck t/META-INF/versions/1.21.1/server-1.21.1.jar out`（`eck`=`GeodeFeature`。難読名は公式 mappings の `-> eck:` 行で引く） |
 | `bytecode_probe.sh <class> [pattern]` | 固定した1.21.1 jar から1クラスの `javap -p -c` を出す。公式mappingsで難読名に引き、入れ子jarから取り出す。証拠ページの javap 引用はこれで再現する |
 | `feature_type_coverage.py [--unimplemented] [--overworld]` | pack の configured-feature 型 × `p_cf` の腕 × placed feature の入れ子 × それを参照する biome を静的に数える。**到達されていない型を先に実装しない**ための計測 |
 | `kelp_fixture.sh <cx> <cz> [n] [seed]` | 海洋 biome を spawn から離れた場所で forceload し、**正の kelp セルをゲートで要求**してから port と block 単位で diff（0 なら失敗）。forceload は起動後に送る |
