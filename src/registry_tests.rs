@@ -667,86 +667,175 @@ fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
     }
 }
 
-/// Luminance and opacity are per-state fields in pblocks.json. That file is a different
-/// Minecraft version from blocks_1211.json - it has pale_oak_planks - so its state ids are
-/// its own numbering and cannot be used as the global state. The registry pairs the two by
-/// block name and state position, which is what this checks.
+/// Light, flags and solid faces are per-state facts in assets/block_states_1211.json, which
+/// tools/vanilla_data/gen_vanilla_data.sh reads out of the vanilla 1.21.1 server. The file is
+/// indexed by state id, so the safety check is that its block table is exactly the block table
+/// the registry numbers states by - same names, same first state, same count - and that the
+/// registry hands back what the file says for every state.
 #[test]
 fn light_values_come_from_the_asset_for_every_state() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let raw = std::fs::read("assets/pblocks.json").expect("pblocks must be readable");
-    let blocks = crate::json::jparse(&raw)
-        .expect("pblocks must parse")
-        .get("blocks")
-        .expect("pblocks has blocks")
-        .into_arr()
-        .expect("blocks is an array")
-        .clone();
-    use std::collections::HashMap;
-    let mut by_name: HashMap<String, &crate::json::J> = HashMap::new();
-    for b in &blocks {
-        if let Some(n) = crate::json::jstr(b, "name") {
-            by_name.insert(n, b);
-        }
-    }
+    let raw = std::fs::read("assets/block_states_1211.json").expect("facts must be readable");
+    let facts = crate::json::jparse(&raw).expect("facts must parse");
+    assert_eq!(
+        crate::json::jstr(&facts, "minecraft").as_deref(),
+        Some("1.21.1")
+    );
+    let col = |key: &str| -> Vec<u32> {
+        facts
+            .get(key)
+            .and_then(|a| a.into_arr())
+            .unwrap_or_else(|| panic!("{key} must be an array"))
+            .iter()
+            .map(|v| v.num() as u32)
+            .collect()
+    };
+    let (lum, opa) = (col("luminance"), col("light_block"));
+    assert_eq!(lum.len(), opa.len());
 
+    // same blocks, same numbering as blocks_1211.json
     let raw_md = std::fs::read("assets/blocks_1211.json").expect("blocks_1211 must be readable");
     let md = crate::json::jparse(&raw_md)
         .expect("blocks_1211 must parse")
         .into_arr()
         .expect("blocks_1211 is an array")
         .clone();
-    let mut checked = 0usize;
+    let listed: Vec<(String, u32, u32)> = facts
+        .get("blocks")
+        .and_then(|a| a.into_arr())
+        .expect("blocks table")
+        .iter()
+        .map(|b| {
+            let a = b.into_arr().expect("block entry");
+            (a[0].str().to_string(), a[1].num() as u32, a[2].num() as u32)
+        })
+        .collect();
+    let table: Vec<(String, u32, u32)> = md
+        .iter()
+        .map(|b| {
+            let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
+            let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
+            (
+                format!(
+                    "minecraft:{}",
+                    crate::json::jstr(b, "name").unwrap_or_default()
+                ),
+                lo,
+                hi - lo + 1,
+            )
+        })
+        .collect();
+    let (mut a, mut b) = (listed.clone(), table);
+    a.sort();
+    b.sort();
+    assert_eq!(
+        a, b,
+        "the facts file and blocks_1211.json number states differently"
+    );
+    assert_eq!(
+        listed.iter().map(|e| e.2 as usize).sum::<usize>(),
+        lum.len(),
+        "the facts file has a row per state"
+    );
+
     let mut emitters = 0usize;
-    let mut no_states = Vec::new();
-    for b in &md {
-        let name = crate::json::jstr(b, "name").unwrap_or_default();
-        let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
-        let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
-        let n = (hi - lo + 1) as usize;
-        let Some(pb) = by_name.get(&name) else {
-            continue;
-        };
-        let Some(states) = pb.get("states").and_then(|s| s.into_arr()) else {
-            continue;
-        };
-        if states.len() != n {
-            // Positional pairing is impossible for these; they are counted so the hole is
-            // visible rather than silent.
-            no_states.push(name);
-            continue;
-        }
-        for (i, s) in states.iter().enumerate() {
-            let st = lo + i as u32;
-            if (st as usize) >= reg.state_count() {
-                continue;
-            }
-            let lum = crate::json::jnum(s, "luminance").unwrap_or(0.0) as u8;
-            let op = crate::json::jnum(s, "opacity").unwrap_or(0.0) as u8;
-            assert_eq!(reg.luminance_of(st), lum, "luminance of {name} state {st}");
-            assert_eq!(reg.opacity_of(st), op, "opacity of {name} state {st}");
-            if lum > 0 {
-                emitters += 1;
-            }
-            checked += 1;
+    for (st, (&l, &o)) in lum.iter().zip(opa.iter()).enumerate() {
+        assert_eq!(
+            u32::from(reg.luminance_of(st as u32)),
+            l,
+            "luminance of state {st}"
+        );
+        assert_eq!(
+            u32::from(reg.opacity_of(st as u32)),
+            o,
+            "opacity of state {st}"
+        );
+        if l > 0 {
+            emitters += 1;
         }
     }
     assert!(
-        checked > 20_000,
-        "the check must cover the state space, covered {checked}"
+        lum.len() > 26_000,
+        "the check must cover the state space, covered {}",
+        lum.len()
     );
     assert!(
         emitters > 100,
         "the asset must have light sources, found {emitters}"
     );
-    // The two assets are different versions, so a handful of blocks cannot be paired.
-    // If this grows, the pairing assumption has broken.
+}
+
+/// Per-state light that depends on a property, with the values vanilla 1.21.1 gives them. The
+/// loaded numbers must move with the property, which a per-block table cannot do.
+#[test]
+fn light_follows_the_state_property_not_just_the_block() {
+    let reg = breg().unwrap();
+    let st = |name: &str, props: &[(&str, &str)]| {
+        let mut s = name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"));
+        for (k, v) in props {
+            s = reg.with_prop(s, k, v);
+        }
+        s
+    };
+    for (name, props, lum) in [
+        ("furnace", vec![("lit", "false")], 0u8),
+        ("furnace", vec![("lit", "true")], 13),
+        ("blast_furnace", vec![("lit", "true")], 13),
+        ("redstone_lamp", vec![("lit", "false")], 0),
+        ("redstone_lamp", vec![("lit", "true")], 15),
+        ("redstone_ore", vec![("lit", "true")], 9),
+        ("redstone_ore", vec![("lit", "false")], 0),
+        ("campfire", vec![("lit", "true")], 15),
+        ("campfire", vec![("lit", "false")], 0),
+        ("candle", vec![("candles", "1"), ("lit", "true")], 3),
+        ("candle", vec![("candles", "3"), ("lit", "true")], 9),
+        ("candle", vec![("candles", "3"), ("lit", "false")], 0),
+        ("light", vec![("level", "7")], 7),
+        ("respawn_anchor", vec![("charges", "0")], 0),
+        ("respawn_anchor", vec![("charges", "4")], 15),
+        ("lava", vec![], 15),
+        ("end_rod", vec![], 14),
+        ("crying_obsidian", vec![], 10),
+        ("magma_block", vec![], 3),
+        ("soul_fire", vec![], 10),
+    ] {
+        assert_eq!(reg.luminance_of(st(name, &props)), lum, "{name} {props:?}");
+    }
+    for (name, op) in [
+        ("stone", 15u8),
+        ("bedrock", 15),
+        ("air", 0),
+        ("glass", 0),
+        ("torch", 0),
+        ("water", 1),
+        ("oak_leaves", 1),
+        ("ice", 1),
+    ] {
+        assert_eq!(reg.opacity_of(st(name, &[])), op, "opacity of {name}");
+    }
+    // solid faces and flags
+    let stone = st("stone", &[]);
+    assert!(reg.is_solid(stone) && !reg.is_air(stone) && !reg.is_liquid(stone));
+    assert!((0..6).all(|d| reg.side_solid(stone, d)));
+    let slab_bottom = st("stone_slab", &[("type", "bottom")]);
     assert!(
-        no_states.len() <= 4,
-        "too many blocks cannot be paired by position: {no_states:?}"
+        reg.side_solid(slab_bottom, 0),
+        "a bottom slab's underside is a full face"
     );
+    assert!(
+        !reg.side_solid(slab_bottom, 1),
+        "a bottom slab's top is not"
+    );
+    assert!(reg.is_air(st("air", &[])) && reg.is_air(st("cave_air", &[])));
+    assert!(reg.is_replaceable(st("short_grass", &[])));
+    assert!(reg.is_liquid(st("water", &[])), "water holds a fluid");
+    assert!(
+        reg.is_liquid(st("oak_slab", &[("waterlogged", "true")])),
+        "a waterlogged slab holds a fluid"
+    );
+    assert!(!reg.is_liquid(st("oak_slab", &[("waterlogged", "false")])));
 }
 
 /// Named light sources, and the two that must not emit.
@@ -1067,7 +1156,7 @@ fn every_wire_state_has_complete_metadata() {
     let reg = breg().unwrap();
     assert!(
         reg.unpaired.is_empty(),
-        "these target states have missing property-matched metadata: {:?}",
+        "these states are not covered by assets/block_states_1211.json under the block table's numbering: {:?}",
         reg.unpaired
     );
 }

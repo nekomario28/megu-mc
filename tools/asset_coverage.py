@@ -6,8 +6,11 @@ finding, and each one was measured by hand with the same throwaway script. This 
 that script, so the remaining fields cost one command each instead of one survey.
 
 The asset is the owner of block knowledge. `assets/blocks_1211.json` carries fields per
-block; `assets/pblocks.json` carries fields per *state*, which is where the collision
-shapes, luminance and slipperiness live.
+block; `assets/block_states_1211.json` (generated from the 1.21.1 jar by
+tools/vanilla_data/) carries luminance, light opacity, flags and FULL-face bits per *state*.
+The former per-state `assets/pblocks.json` (collision shapes, slipperiness, ...) was removed
+because it was byte-identical to a file from another project and was not 1.21.1 data (see
+THIRD_PARTY.md); fields that only it carried are listed below as "REMOVED".
 
   --list                     every field, with whether the server reads it and what
                              covering it would take
@@ -47,19 +50,19 @@ FIELDS = {
     "transparent": ("blocks", "occlusion; partly via state_flags"),
     "boundingBox": ("blocks", "collision; no shape model"),
     "diggable": ("blocks", "covered by hardness < 0"),
-    "collision_shapes": ("pblocks", "per-state collision; NO MODEL - biggest gap"),
-    "outline_shapes": ("pblocks", "selection box; no model"),
-    "luminance": ("pblocks", "per-state light; no model"),
-    "opacity": ("pblocks", "per-state occlusion; partly via state_flags"),
-    "blast_resistance": ("pblock", "per-state explosion resistance; no model"),
-    "slipperiness": ("pblock", "ice/slime friction; no model"),
-    "velocity_multiplier": ("pblock", "honey/soul sand; no model"),
-    "jump_velocity_multiplier": ("pblock", "honey; no model"),
-    "instrument": ("pblocks", "note block sound; no model"),
-    "map_color": ("pblock", "map rendering; no model"),
-    "piston_behavior": ("pblocks", "pistons; no model"),
-    "state_flags": ("pblocks", "read by the registry"),
-    "side_flags": ("pblocks", "read by the registry"),
+    "collision_shapes": ("removed", "per-state collision; pblocks.json removed - needs extractor extension"),
+    "outline_shapes": ("removed", "selection box; pblocks.json removed - needs extractor extension"),
+    "luminance": ("states", "per-state light; read by the registry from block_states_1211.json"),
+    "opacity": ("states", "per-state light opacity; read by the registry from block_states_1211.json"),
+    "blast_resistance": ("removed", "per-state explosion resistance; pblocks.json removed"),
+    "slipperiness": ("removed", "ice/slime friction; pblocks.json removed"),
+    "velocity_multiplier": ("removed", "honey/soul sand; pblocks.json removed"),
+    "jump_velocity_multiplier": ("removed", "honey; pblocks.json removed"),
+    "instrument": ("removed", "note block sound; pblocks.json removed"),
+    "map_color": ("removed", "map rendering; pblocks.json removed"),
+    "piston_behavior": ("removed", "pistons; pblocks.json removed"),
+    "state_flags": ("states", "air/replaceable/liquid/solid/fluid bits; read by the registry"),
+    "side_flags": ("states", "full_sides bits; read by the registry"),
 }
 
 
@@ -67,8 +70,16 @@ def load_blocks():
     return json.loads((ROOT / "assets" / "blocks_1211.json").read_text())
 
 
-def load_pblocks():
-    return json.loads((ROOT / "assets" / "pblocks.json").read_text())["blocks"]
+STATE_FILE_KEYS = {
+    "luminance": "luminance",
+    "opacity": "light_block",
+    "state_flags": "flags",
+    "side_flags": "full_sides",
+}
+
+
+def load_states():
+    return json.loads((ROOT / "assets" / "block_states_1211.json").read_text())
 
 
 def per_state(source, field):
@@ -80,17 +91,11 @@ def per_state(source, field):
                 continue
             for st in range(e["minStateId"], e["maxStateId"] + 1):
                 out[st] = e[field]
-    elif source == "pblocks":
-        for e in load_pblocks():
-            for s in e.get("states") or []:
-                if field in s:
-                    out[s["id"]] = s[field]
-    else:  # block-level field in pblocks
-        for e in load_pblocks():
-            if field not in e:
-                continue
-            for s in e.get("states") or []:
-                out[s["id"]] = e[field]
+    elif source == "states":
+        arr = load_states()[STATE_FILE_KEYS[field]]
+        out = dict(enumerate(arr))
+    # source == "removed": the field has no data in the repository any more; it reports
+    # zero coverage, which is the truth, and the --list note says why.
     return out
 
 

@@ -360,9 +360,9 @@ check "breaking a chest drops the slots it owned" \
   '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z + 1000)) {' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
-check "a renamed block is still paired between the two assets" \
-  src/block_registry.rs '("minecraft:chain", "minecraft:iron_chain")' \
-  '("minecraft:chain", "minecraft:not_a_block")' \
+check "a block whose state range disagrees with the generated facts is not paired" \
+  src/block_registry.rs 'f_blocks.get(&name) == Some(&(lo, hi - lo + 1))' \
+  'f_blocks.get(&name) == Some(&(lo + 1, hi - lo + 1))' \
   every_wire_state_has_complete_metadata
 
 check "the client's view distance is read from its packet" \
