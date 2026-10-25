@@ -4,6 +4,8 @@
 #   assets/block_states_1211.json               per-state light, flags and solid faces
 #   datapacks/vanilla/biome_climate_tree.json   the game's overworld and nether biome search trees
 #   tests/data/biome_probe_1211.tsv             points looked up through the game's own tree
+#   tests/data/vanilla_vectors_1211.tsv         random questions put to the game (xoroshiro draws,
+#                                               climate noise, biome lookups, aquifer helpers) + its answers
 #   datapacks/vanilla/data/minecraft/           the game's own worldgen data (biome, configured_carver,
 #                                               configured_feature, density_function, noise,
 #                                               noise_settings, placed_feature) and tags/block,

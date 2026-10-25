@@ -18,9 +18,8 @@ pub(crate) struct CachedLookup<K, V> {
 
 impl<K, V> Default for CachedLookup<K, V> {
     fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        let entries = Vec::with_capacity(CAPACITY);
+        CachedLookup { entries }
     }
 }
 

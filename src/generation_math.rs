@@ -355,29 +355,30 @@ impl Split {
         let m = u64::from_be_bytes(h[8..16].try_into().unwrap());
         Xor::raw(l ^ self.lo, m ^ self.hi)
     }
-    // vanilla PositionalRandomFactory.at(x,y,z) — seed = hash_block_pos ^ lo
+    // `PositionalRandomFactory.at(x, y, z)`: low seed word = `Mth.getSeed(x, y, z) ^ lo`
     pub(crate) fn pos(&self, x: i32, y: i32, z: i32) -> Xor {
-        Xor::raw(hash_block_pos(x, y, z) as u64 ^ self.lo, self.hi)
+        Xor::raw(mth_get_seed(x, y, z) as u64 ^ self.lo, self.hi)
     }
 }
 
-pub(crate) fn hash_block_pos(x: i32, y: i32, z: i32) -> i64 {
-    let l = (x.wrapping_mul(3129871) as i64) ^ (z as i64).wrapping_mul(116129781) ^ (y as i64);
-    let l = l
-        .wrapping_mul(l)
+/// `Mth.getSeed(x, y, z)` (Yarn `MathHelper.hashCode(int, int, int)`).
+pub(crate) fn mth_get_seed(x: i32, y: i32, z: i32) -> i64 {
+    let mixed = (x.wrapping_mul(3129871) as i64) ^ (z as i64).wrapping_mul(116129781) ^ (y as i64);
+    let scrambled = mixed
+        .wrapping_mul(mixed)
         .wrapping_mul(42317861)
-        .wrapping_add(l.wrapping_mul(11));
-    l >> 16
+        .wrapping_add(mixed.wrapping_mul(11));
+    scrambled >> 16
 }
 
-// java String.hashCode (UTF-16 units)
+// `java.lang.String.hashCode()` (over the UTF-16 code units)
 #[expect(dead_code)]
-pub(crate) fn java_hash(s: &str) -> i32 {
-    let mut h = 0i32;
-    for u in s.encode_utf16() {
-        h = h.wrapping_mul(31).wrapping_add(u as i32);
+pub(crate) fn string_hash_code(s: &str) -> i32 {
+    let mut hash = 0i32;
+    for unit in s.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(unit as i32);
     }
-    h
+    hash
 }
 
 // ---------- legacy java.util.Random LCG (population seeds, legacy noise) ----------
@@ -484,9 +485,9 @@ impl Lcg {
             self.next_i32();
         }
     }
-    // legacy RandomDeriver.split_string: java_hash ^ seed
+    // legacy `LegacyRandomSource.Splitter.split(String)`: String.hashCode ^ seed
     pub(crate) fn split_str(seed: u64, name: &str) -> Self {
-        Lcg::new((java_hash(name) as i64 as u64) ^ seed)
+        Lcg::new((string_hash_code(name) as i64 as u64) ^ seed)
     }
 }
 
@@ -718,25 +719,32 @@ impl Normal {
     }
 }
 
-fn build_octaves(
-    base_octave: i32,
-    base_amplitude: f64,
-    count: usize,
-    mods: &[f64],
+/// Octave list `(octave index, frequency, amplitude)` of a normal noise. Octave `i`
+/// runs at `lacunarity^(first_octave + i)`; its weight starts from the geometric
+/// series that makes the first and last octaves' weights sum to `amplitude_scale`
+/// and is multiplied by the per-octave entry of `amplitude_mods` (missing = 1,
+/// zero = octave left out).
+fn octave_table(
+    first_octave: i32,
+    amplitude_scale: f64,
+    table_len: usize,
+    amplitude_mods: &[f64],
 ) -> Vec<(i32, f64, f64)> {
-    let mut f = LACUNARITY.powi(base_octave);
-    let mut a = base_amplitude
-        * (PERSISTENCE.powi(-(count as i32 - 1)) / (PERSISTENCE.powi(-(count as i32)) - 1.0));
-    let mut out = Vec::new();
-    for i in 0..count {
-        let m = if i < mods.len() { mods[i] } else { 1.0 };
-        if m != 0.0 {
-            out.push((base_octave + i as i32, f, a * m));
+    let count = table_len as i32;
+    let series_top = PERSISTENCE.powi(1 - count);
+    let series_sum = PERSISTENCE.powi(-count) - 1.0;
+    let mut frequency = LACUNARITY.powi(first_octave);
+    let mut weight = amplitude_scale * (series_top / series_sum);
+    let mut table = Vec::new();
+    for i in 0..table_len {
+        let modifier = amplitude_mods.get(i).copied().unwrap_or(1.0);
+        if modifier != 0.0 {
+            table.push((first_octave + i as i32, frequency, weight * modifier));
         }
-        f *= LACUNARITY;
-        a *= PERSISTENCE;
+        frequency *= LACUNARITY;
+        weight *= PERSISTENCE;
     }
-    out
+    table
 }
 fn estimate_dev(octaves: &[(i32, f64, f64)]) -> f64 {
     let mut var = 0.0;
@@ -759,7 +767,7 @@ fn norm_factor(target: f64, octaves: &[(i32, f64, f64)]) -> f64 {
 // value = (first + second) * valueFactor, valueFactor = (1/6) / (0.1 * (1 + 1/(span + 1))),
 // span = last non-zero amplitude index - first non-zero amplitude index.
 pub(crate) fn normal_from_amplitudes(r: &mut Xor, first_octave: i32, amps: &[f64]) -> Normal {
-    let octaves = build_octaves(first_octave, 1.0, amps.len(), amps);
+    let octaves = octave_table(first_octave, 1.0, amps.len(), amps);
     let idx: Vec<usize> = (0..amps.len()).filter(|&i| amps[i] != 0.0).collect();
     let nf = match (idx.first(), idx.last()) {
         (Some(&lo), Some(&hi)) => {
@@ -787,83 +795,59 @@ pub(crate) fn normal_from_amplitudes(r: &mut Xor, first_octave: i32, amps: &[f64
     Normal { layers }
 }
 
-// modern (non-legacy) NormalNoise: JSON carries precomputed base_amplitude
-pub(crate) fn normal_new(
-    r: &mut Xor,
-    base_octave: i32,
-    base_amplitude: f64,
-    mods: &[f64],
-) -> Normal {
-    let octaves = build_octaves(base_octave, base_amplitude, mods.len(), mods);
-    let target: f64 = octaves.iter().map(|o| o.2.abs()).sum();
-    let nf = norm_factor(target, &octaves);
-    let first = r.splitter();
-    let second = r.splitter();
-    let mut layers = Vec::with_capacity(octaves.len() * 2);
-    for (idx, f, a) in octaves {
-        let vf = nf * a;
-        layers.push(Octave {
-            n: Perlin::new(&mut first.of_str(&format!("octave_{}", idx))),
-            f,
-            a: vf,
-        });
-        layers.push(Octave {
-            n: Perlin::new(&mut second.of_str(&format!("octave_{}", idx))),
-            f: f * INPUT_FACTOR,
-            a: vf,
-        });
+// legacy (pre-1.18) NormalNoise octaves: the zero octave is seeded first, then the octaves
+// below it in descending order; absent or zero-amplitude octaves still advance the random
+// stream (by 262 draws, one Perlin table's worth).
+fn legacy_octave_perlins(
+    rng: &mut Lcg,
+    first_octave: i32,
+    amps: &[f64],
+) -> Vec<(Perlin, f64, f64)> {
+    let octave_total = amps.len() as i32;
+    let zero_slot = -first_octave;
+    let mut slots: Vec<Option<Perlin>> = (0..amps.len()).map(|_| None).collect();
+    let zero_octave = Perlin::new_l(rng);
+    if zero_slot >= 0 && zero_slot < octave_total && amps[zero_slot as usize] != 0.0 {
+        slots[zero_slot as usize] = Some(zero_octave);
     }
-    Normal { layers }
-}
-
-// legacy (pre-1.18) NormalNoise: init order = zero-octave then descending
-// below it; missing/zero amplitudes still consume the rng (skip 262).
-fn legacy_fbm(r: &mut Lcg, first_octave: i32, amps: &[f64]) -> Vec<(Perlin, f64, f64)> {
-    let octaves = amps.len() as i32;
-    let zi = -first_octave;
-    let mut levels: Vec<Option<Perlin>> = (0..amps.len()).map(|_| None).collect();
-    let zero = Perlin::new_l(r);
-    if zi >= 0 && zi < octaves && amps[zi as usize] != 0.0 {
-        levels[zi as usize] = Some(zero);
-    }
-    for i in (0..zi).rev() {
-        if i < octaves && amps[i as usize] != 0.0 {
-            levels[i as usize] = Some(Perlin::new_l(r));
+    for slot in (0..zero_slot).rev() {
+        if slot < octave_total && amps[slot as usize] != 0.0 {
+            slots[slot as usize] = Some(Perlin::new_l(rng));
         } else {
-            r.skip(262);
+            rng.skip(262);
         }
     }
-    let mut factor = LACUNARITY.powi(-zi);
-    let mut value_factor = LACUNARITY.powi(octaves - 1) / (LACUNARITY.powi(octaves) - 1.0);
-    let mut out = Vec::with_capacity(amps.len());
-    for (i, n) in levels.into_iter().enumerate() {
-        if let Some(n) = n {
-            out.push((n, factor, value_factor * amps[i]));
+    let mut frequency = LACUNARITY.powi(-zero_slot);
+    let mut weight = LACUNARITY.powi(octave_total - 1) / (LACUNARITY.powi(octave_total) - 1.0);
+    let mut octaves = Vec::with_capacity(amps.len());
+    for (slot, perlin) in slots.into_iter().enumerate() {
+        if let Some(perlin) = perlin {
+            octaves.push((perlin, frequency, weight * amps[slot]));
         }
-        factor *= LACUNARITY;
-        value_factor /= LACUNARITY;
+        frequency *= LACUNARITY;
+        weight /= LACUNARITY;
     }
-    out
+    octaves
 }
-fn parity_norm_factor(base_amp: f64, mods: &[f64]) -> f64 {
-    let mut min_o = i32::MAX;
-    let mut max_o = i32::MIN;
+fn parity_norm_factor(amplitude_scale: f64, mods: &[f64]) -> f64 {
+    let mut lowest = i32::MAX;
+    let mut highest = i32::MIN;
     for (i, m) in mods.iter().enumerate() {
         if *m != 0.0 {
-            min_o = min_o.min(i as i32);
-            max_o = max_o.max(i as i32);
+            lowest = lowest.min(i as i32);
+            highest = highest.max(i as i32);
         }
     }
-    if min_o > max_o {
+    if lowest > highest {
         return 0.0;
     }
-    let span = max_o - min_o;
-    base_amp * 0.5 * TARGET_DEV / (0.1 * (1.0 + 1.0 / (span + 1) as f64))
+    let span = highest - lowest;
+    amplitude_scale * 0.5 * TARGET_DEV / (0.1 * (1.0 + 1.0 / (span + 1) as f64))
 }
 // legacy NormalNoise (NoiseProvider/vegetation uses LegacyRandomSource)
 pub(crate) fn normal_new_l(seed: u64, first_octave: i32, amps: &[f64]) -> Normal {
     let mut r = Lcg::new(seed);
-    let octaves = build_octaves(first_octave, 1.0, amps.len(), amps);
+    let octaves = octave_table(first_octave, 1.0, amps.len(), amps);
     let target: f64 = octaves.iter().map(|o| o.2.abs()).sum();
     let mut nf = norm_factor(target, &octaves);
     let mut target = target;
@@ -873,8 +857,8 @@ pub(crate) fn normal_new_l(seed: u64, first_octave: i32, amps: &[f64]) -> Normal
         nf = parity;
     }
     let _ = target;
-    let first = legacy_fbm(&mut r, first_octave, amps);
-    let second = legacy_fbm(&mut r, first_octave, amps);
+    let first = legacy_octave_perlins(&mut r, first_octave, amps);
+    let second = legacy_octave_perlins(&mut r, first_octave, amps);
     let mut layers = Vec::with_capacity(first.len() + second.len());
     for (n, f, a) in first {
         layers.push(Octave { n, f, a: a * nf });
@@ -1077,7 +1061,7 @@ impl OSimp {
             }
         }
         if j > 0 {
-            // negative-octave samplers come from a fresh LegacyRand seeded by
+            // negative-octave samplers come from a second legacy generator seeded by
             // s0.sample_3d(origin) * 2^63
             let seed = (s0.get3(xo, yo, zo) * f64::from(9.223372E18f32)) as i64;
             let mut r2 = Lcg::new(seed as u64);
@@ -1143,33 +1127,68 @@ pub(crate) fn smear_fbm(
     }
 }
 
+/// Reader for `tests/data/vanilla_vectors_1211.tsv`: questions put to the 1.21.1 game itself
+/// and the answers it gave. A line is `kind <args...> | <answers...>`, tab separated.
+#[cfg(test)]
+pub(crate) mod vector_file {
+    pub(crate) fn read(kind: &str) -> Vec<(Vec<String>, Vec<String>)> {
+        let text = std::fs::read_to_string("tests/data/vanilla_vectors_1211.tsv").expect(
+            "tests/data/vanilla_vectors_1211.tsv is missing: run tools/vanilla_data/gen_vanilla_data.sh (see README)",
+        );
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f[0] != kind {
+                continue;
+            }
+            let bar = f
+                .iter()
+                .position(|&c| c == "|")
+                .expect("vector line without `|`");
+            let to_vec = |s: &[&str]| s.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+            rows.push((to_vec(&f[1..bar]), to_vec(&f[bar + 1..])));
+        }
+        assert!(!rows.is_empty(), "no `{kind}` vectors in the vector file");
+        rows
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::vector_file;
     use super::*;
+    /// One fixed script of draws on `Xoroshiro128PlusPlusRandom`, for five seeds, against the
+    /// answers the 1.21.1 game gave (`tests/data/vanilla_vectors_1211.tsv`, written by
+    /// tools/vanilla_data/gen_vanilla_data.sh); the script is `Vectors.xoro` in `Extract.java`.
     #[test]
     fn xoroshiro_parity() {
-        // pumpkin xoroshiro128.rs test vectors
-        let mut x = Xor::seed(0);
-        eprintln!("DBG seed0 lo={:#x} hi={:#x}", x.lo, x.hi);
-        let mut ng = x.split();
-        eprintln!("DBG ng lo={:#x} hi={:#x}", ng.lo, ng.hi);
-        let h = md5(b"TEST STRING");
-        eprintln!("DBG md5 = {:02x?}", h);
-        let raw = ng.next_long();
-        eprintln!("DBG ng.next_long = {:#x}", raw);
-        let v = raw as i32;
-        assert_eq!(v, 542195535);
-        {
-            let sp = ng.splitter();
-            let mut r1 = sp.of_str("TEST STRING");
-            eprintln!("DBG sp lo={:#x} hi={:#x}", sp.lo, sp.hi);
-            eprintln!("DBG r1 lo={:#x} hi={:#x}", r1.lo, r1.hi);
-            let rv = r1.next_long();
-            eprintln!("DBG r1.next_long = {:#x} i32={}", rv, rv as i32);
-            assert_eq!(rv as i32, -641435713);
+        let rows = vector_file::read("xoro");
+        assert!(rows.len() >= 5);
+        for (q, a) in rows {
+            let seed = q[0].parse::<i64>().unwrap() as u64;
+            let mut r = Xor::seed(seed);
+            let got = [
+                (r.next_long() as i64).to_string(),
+                (r.next_long() as i64).to_string(),
+                r.next_i32().to_string(),
+                r.next_bound(100).to_string(),
+                r.next_bound(1000003).to_string(),
+                r.next_f64().to_string(),
+                (r.next_bool() as i32).to_string(),
+            ];
+            assert_eq!(got[..], a[..7], "seed {seed}, direct draws");
+            let mut child = r.split();
+            assert_eq!(
+                (child.next_long() as i64).to_string(),
+                a[7],
+                "seed {seed}, split"
+            );
+            let sp = r.splitter();
+            let named = sp.of_str("minecraft:test_stream").next_long() as i64;
+            let at = sp.pos(-37, 64, 1021).next_long() as i64;
+            assert_eq!(named.to_string(), a[8], "seed {seed}, splitter by name");
+            assert_eq!(at.to_string(), a[9], "seed {seed}, splitter by position");
         }
-        assert_eq!(x.next_i32(), 653572596);
-        assert_eq!(ng.next_i32(), 435917842);
     }
 
     /// `RandomSource`'s default `nextLong` is `(long)next(32) << 32 + next(32)`

@@ -116,7 +116,7 @@ for (x,y,z) in cells {
 
 [issue #3](https://github.com/nekomario28/mc-spine/issues/3) の制約に従う。
 
-- Pumpkin は **GPL-3.0**。server コードと asset は**貼らない**。
+- Pumpkin のライセンスは GPL-3.0。server コードと asset は**貼らない**。
 - 参考にするのは高レベル挙動と設計。独立実装し、出典を issue に残す。
 - 参考にした点は slice に「何を参考にし、何を変えたか」を書く。
 
