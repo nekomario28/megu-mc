@@ -160,7 +160,7 @@ tick p50 は 33µs。つまり**ランダムtick が tick の約7割**。）
 
 **修正**：`profile_tick.py` が scratch dir に `assets/` と `datapacks/` を symlink する。
 これはこの枝の原則そのもの — **「fixture は変更したコードに到達しなければならない」**
-（[audit-performance の測定規律](/home/yuu/.agents/skills/audit-performance/references/measurement-discipline.md) に
+（[audit-performance の測定規律](<HOME>/.agents/skills/audit-performance/references/measurement-discipline.md) に
 同じ失敗を既に書いていた）。**書いてあるだけで、自分の fixture を確認していなかった。**
 
 ### 修正後の実測（release、2run）

@@ -1,4 +1,4 @@
-   Compiling mc-spine v0.0.0 (/home/yuu/Documents/Codex/2026-10-04/mc/outputs/mc-spine/native)
+   Compiling mc-spine v0.0.0 (<HOME>/Documents/Codex/2026-10-04/mc/outputs/mc-spine/native)
 warning: field `distance` is never read
   --> src/landing.rs:16:9
    |

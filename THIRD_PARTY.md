@@ -1,9 +1,9 @@
 # THIRD_PARTY.md — 第三者由来物の出所一覧 / Third-party provenance inventory
 
 > **これは事実の一覧です。法的な判断・結論ではありません。** 各ファイルを再配布してよいか、どのライセンスが適用されるかは、このドキュメントでは判断していません。
-> **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. Nothing was deleted or changed in the repository because of this document.
+> **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. (Revision note: the original version of this document changed nothing; the follow-up PR that this revision belongs to removes the three Pumpkin-identical data files and replaces them with generated data, see §3 and §5.)
 
-- 対象リビジョン / Revision: `main` @ `ef6e14a` (+ この PR / this PR)
+- 対象リビジョン / Revision: `main` @ `ef6e14a` (+ #16 + この PR / this PR)
 - リポジトリのコード本体は MIT ([LICENSE](LICENSE))。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または出所が文書化されていないもの)の一覧です。
 - 作成日 / Written: 2026-10-25 (Asia/Tokyo)
 
@@ -19,11 +19,12 @@
 
 | パス / Path | 内容・規模 / What & size | README の記述 | 出所 | 根拠・観察 (facts) |
 |---|---|---|---|---|
-| `datapacks/vanilla/` (`data/minecraft/**` 1083 files + `multi_noise_biome_tree.json` + `pack.mcmeta`) | worldgen の JSON (`worldgen/{placed_feature,feature,biome,noise,material_rule,density_function,...}`) と `tags/block` | Mojang 由来・MIT 対象外 | `unknown - owner to confirm` | `pack.mcmeta` の説明は "vanilla worldgen data"。取得手順の記録は見つからない。`tools/fixture_base.sh` 等は Minecraft 1.21.1 の server.jar を sha1 固定で使う。**`multi_noise_biome_tree.json` は Pumpkin (GPL-3.0) の `assets/multi_noise_biome_tree.json` @ `b0c48b2` とバイト単位で同一** (下記 §3)。 |
+| `datapacks/vanilla/` (`data/minecraft/**` 1083 files + `biome_climate_tree.json` + `pack.mcmeta`) | worldgen の JSON (`worldgen/{placed_feature,feature,biome,noise,material_rule,density_function,...}`) と `tags/block` | Mojang 由来・MIT 対象外 | `unknown - owner to confirm` (`data/minecraft/**`) / `documented` (`biome_climate_tree.json`) | `pack.mcmeta` の説明は "vanilla worldgen data"。`data/minecraft/**` の取得手順の記録は見つからない。**調査の事実: `data/minecraft/**` の worldgen 部分は 1.21.1 jar のデータとは一致しない** (多くが 26.x 形式。1.21.1 jar と意味的に一致するのは約420 JSON のみ。§6 参照)。`tools/fixture_base.sh` 等は Minecraft 1.21.1 の server.jar を sha1 固定で使う。`biome_climate_tree.json` は 1.21.1 jar から生成 (§5)。旧 `multi_noise_biome_tree.json` (Pumpkin と同一) は削除済み (§3)。 |
 | `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` | テスト用の小さな datapack (計 約25 files) | 記述なし | `unknown - owner to confirm` | テスト用途と思われるが、作成者の記録はない (`rectest`/`testpack` は `data/minecraft` 配下に1ファイルずつ持つ)。 |
-| `assets/blocks_1211.json` | ブロック物性 (1060 entries, 765 KB, `id/name/displayName/hardness/resistance/stackSize/diggable/material/...`) | Mojang 由来 | `undocumented` | 出所の記述なし。フィールド構成は PrismarineJS `minecraft-data` のブロックスキーマに似て見えるが、**未確認**。 |
-| `assets/pblocks.json` | ブロック状態データ (top-level `block_entity_types`/`shapes`/`blocks`, 7.5 MB) | Mojang 由来 | `undocumented` / `unknown - owner to confirm` | 出所の記述なし。**sha256 `cc748df1…3e28` は Pumpkin-MC/Pumpkin の `assets/blocks.json` と同一** (§3)。`src/block_registry.rs:119-120` に "pumpkin state_flags / side_flags" のコメントがある。 |
-| `assets/properties.json` | ブロックプロパティ定義 (124 entries, `hash_key/enum_name/serialized_name/type`) | Mojang 由来 | `undocumented` / `unknown - owner to confirm` | `RESTORATION.md` は「元の保存場所のローカル補助資産」と記述するのみ。**sha256 `da8e0949…ab85` は Pumpkin の `assets/properties.json` と同一** (§3)。 |
+| `assets/blocks_1211.json` | ブロック物性 (1060 entries, 765,435 bytes, sha256 `7d1d95c4…c654`, `id/name/displayName/hardness/resistance/stackSize/diggable/material/...`) | Mojang 由来 | `documented` (下記) | **PrismarineJS/minecraft-data の `data/pc/1.21.1/blocks.json` とバイト単位で同一** (2026-10-25 に GitHub API で取得して `cmp` で確認。最終変更 commit `d56346a4e32d`, 2024-10-26)。minecraft-data は MIT (同リポジトリの README「License: MIT」。リポジトリ直下に LICENSE ファイルは無く、著作権者名の記載は見つからなかったため、ここでは作成していない)。README は「一部のデータは wiki.vg / minecraft.gamepedia.com から抽出」とも記載。帰属表示は [NOTICE](NOTICE) と README を参照。 |
+| `assets/block_states_1211.json` | **生成物** (274,587 bytes)。Minecraft 1.21.1 の全 26,684 状態の luminance / light_block (opacity) / flags (air, replaceable, liquid, solid, fluid) / full_sides | Mojang 由来 (jar の事実値) | `documented` | `tools/vanilla_data/gen_vanilla_data.sh` で 1.21.1 の server jar (sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`) から再生成できる (§5)。旧 `assets/pblocks.json` / `properties.json` を置き換えた。**コミットする方針**。 |
+| `datapacks/vanilla/biome_climate_tree.json` | **生成物** (2,059,649 bytes)。1.21.1 の overworld (7,593 leaves) と nether (5 leaves) の multi-noise biome RTree | Mojang 由来 (jar の事実値) | `documented` | 同じツールで jar から再生成できる (§5)。旧 `multi_noise_biome_tree.json` を置き換えた。**コミットする方針**。 |
+| `tests/data/biome_probe_1211.tsv` | **生成物**。ゲーム自身の biome 検索結果 6,000 点 (seed 固定) | 事実値 | `documented` | 同じツールで再生成。`worldgen.rs` のテストが全点を検証する。 |
 | `resourcepack.zip` | 345 bytes。中身は `pack.mcmeta` (59 B, "spine test pack") と `assets/minecraft/textures/block/stone.png` (72 B) | Mojang 由来 | `unknown - owner to confirm` | 非常に小さいテスト用パックに見える。72 B の PNG が Mojang のテクスチャかどうかは未確認。`RESTORATION.md` は「元の保存場所のローカル補助資産」と記述。 |
 | `config_packets.bin` | 105,095 bytes。Configuration フェーズの送信パケット列 (先頭は `minecraft:brand` / `vanilla`、約900個の `minecraft:` 識別子を含む。registry / tag データと思われる) | Mojang 由来 | `undocumented` | 生成手順の記録は見つからない (読み込みは `src/main.rs` の `load_config_packets`)。実サーバーの出力を取り込んだものかは未確認。 |
 | `evidence/gameplay/**/*.javap.txt` (7 files) | Mojang クラスの `javap -p -c` 逆アセンブル: `FallingBlockEntity` (obf `cjg`, 38.6 KB), `ClientboundLightUpdatePacket` (`adj`), `ClientboundLightUpdatePacketData` (`adk`), `ClientPacketListener.applyLightData`, `DataLayer` (`dvd`), `LevelLightEngine` (`eot`) | **README に記載なし** | `documented` (生成方法) | `tools/bytecode_probe.sh` が、固定した 1.21.1 server.jar (sha1 `59353fb4…8dc05c`) と公式マッピング `server.txt` (sha1 `03f89854…0f35f570`) から生成する方法を記録している。ファイル自体の再配布可否は §4 の質問。 |
@@ -119,6 +120,9 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 ## 3. Pumpkin (GPL-3.0) との byte-for-byte 比較 / Byte-identity with Pumpkin files
 
+> **状況 / Status (この PR 以降 / since this PR)**: 下の3ファイルは作業ツリーから**削除済み**で、1.21.1 jar から生成した別形式・別内容のデータに置き換えた (§5)。**過去の commit (履歴) には残っています**。この PR は履歴を書き換えません。下の表は削除前の比較の記録です。
+> The three files below were **removed from the working tree** and replaced by data generated from the 1.21.1 jar (§5). They remain in git history; this PR does not rewrite history. The table is the record of the pre-removal comparison.
+
 2026-10-25 に、Pumpkin-MC/Pumpkin (`LICENSE` は GPL-3.0、issue #3 が参照する commit `b0c48b2d7688bbfa09956adf530b8bc56dcc0c56`, 2026-10-11) の公開ファイルを GitHub API で取得し、sha256 を比較した事実:
 
 | mc-spine のファイル | Pumpkin のファイル @ `b0c48b2` | sha256 | 結果 |
@@ -137,8 +141,8 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 ## 4. オーナーへの質問 / Questions for the owner
 
-1. `assets/pblocks.json`, `assets/properties.json`, `datapacks/vanilla/multi_noise_biome_tree.json` は、どこから入手しましたか? Pumpkin のリポジトリからですか、Mojang のリリースから自分で生成したものですか、第三者の配布物ですか? (§3 のとおり Pumpkin のファイルとバイト単位で同一です。)
-2. `assets/blocks_1211.json` はどこから入手しましたか? (`minecraft-data` など第三者のデータ集ですか?) そのライセンス表記は?
+1. (削除済み) `assets/pblocks.json`, `assets/properties.json`, `datapacks/vanilla/multi_noise_biome_tree.json` は、どこから入手しましたか? 履歴には残っているので、来歴の確認は引き続き必要です。 Pumpkin のリポジトリからですか、Mojang のリリースから自分で生成したものですか、第三者の配布物ですか? (§3 のとおり Pumpkin のファイルとバイト単位で同一です。)
+2. (調査済み) `assets/blocks_1211.json` は PrismarineJS/minecraft-data (MIT) の `data/pc/1.21.1/blocks.json` とバイト単位で同一でした (§1)。入手元がそこで正しいか確認してください。
 3. `datapacks/vanilla/data/**` (1083 files) は、Minecraft 1.21.1 の server.jar から自分で抽出しましたか? 抽出に使った手順・jar の sha はどこかに残っていますか? 他の人の抽出物ですか?
 4. `config_packets.bin` はどのように作りましたか? (実サーバーのキャプチャ? 生成スクリプト?) 手順を記録できますか?
 5. `evidence/gameplay/**/*.javap.txt` (Mojang クラスの逆アセンブル) と `*.mapping.txt` / `mappings.txt` (公式マッピング抜粋) は、このリポジトリに置いたまま再配布してよいと考えていますか? リポジトリを公開する (または公開状態にしておく) 予定がある場合、残す・生成スクリプトだけにする・削除する、のどれにしますか? (`tools/bytecode_probe.sh` は同じ出力を再生成できます。)
@@ -150,7 +154,29 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 回答が得られたら、この表の出所列を `documented` に更新し、README の記述 (README.md「ライセンスと第三者データ」) を更新してください。
 
-## 5. この文書の更新方法 / Maintaining this file
+## 5. 生成データと再生成ツール / Generated data and how to regenerate it
+
+方針 / Decision: 生成物 (`assets/block_states_1211.json`, `datapacks/vanilla/biome_climate_tree.json`, `tests/data/biome_probe_1211.tsv`) は**コミットする**。理由: ビルド・テストに Mojang の jar と Java を要求しないため。リポジトリは既に `datapacks/vanilla/` を (Mojang 由来として) コミットしている。再生成は任意で、結果が一致しなければ差分が出る (決定的)。
+Decision: the generated files are **committed** so that building and testing need neither a Mojang jar nor Java; regeneration is optional and deterministic.
+
+```
+tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappings DIR | --fetch-fabric-mappings]
+```
+
+- 入力 jar: Minecraft 1.21.1 server (bundler) jar, sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c` (スクリプトが検査)。jar 自体はリポジトリに含めない・ダウンロードしない。
+- 手順: (1) 公式 data generator (`--reports --server`) の `blocks.json` と `biome_parameters/*.json` を**参照値**にする。(2) `tools/vanilla_data/Extract.java` が jar の 1.21.1 ブートストラップを実行し、状態ごとの luminance / opacity / flags / full_sides と biome RTree をリフレクションで取り出す。(3) `build_vanilla_data.py` が参照値と突き合わせて (状態 id・名前・leaf 集合・枝の境界) から 3 つの出力を書く。
+- 難読名の解決: この jar は難読化されており、Mojang のマッピングは使っていない。代わりに Fabric の `intermediary-1.21.1-v2` と Yarn `1.21.1+build.3-v2` (どちらも CC0-1.0, maven.fabricmc.net) を使い、**実行時に**クラス・メンバー名を引く。sha256 を固定: intermediary `e8bd6a4c39e235ee2dc73063558610775c72a2572fa0c6b32915b149074012a6`、Yarn `4ec570889585cb958b7d3c9dd94ce4064b16ab797dffec152bc8486c59a4010b`。これらは**ツールの入力**であり、リポジトリには含めない。
+- 検証 (cargo test): `block_registry` / `registry_tests` が全 26,684 状態を独立に読み直して照合。`worldgen` が (a) 7,593 + 5 leaves が 1.21.1 のみの biome であること (pale_garden / dappled_forest / sulfur_caves が無いこと)、(b) ゲーム自身の検索結果 6,000 点のうち等距離の同点でない 5,415 点すべてが一致することを検査する (同点 585 点は、ゲーム内でも検索の履歴依存で答えが決まるため集計のみ)。
+- 旧データとの差: 旧 pblocks 由来の状態値と新ファイルは全 26,684 状態で一致 (差 0)。biome は旧 overworld tree の 133 leaf (`dappled_forest` 92 / `pale_garden` 40 / `sulfur_caves` 1) が 1.21.1 には存在せず、対応する位置は `plains` (92) と `dark_forest` (40) になる。
+- 含まれないもの: 衝突・選択形状 (`collision_shapes` / `outline_shapes`)、摩擦・速度係数、`blast_resistance`、`instrument`、`map_color`、`piston_behavior` (旧 pblocks にあったが、Rust 側の消費者は無かった)。必要になったら `Extract.java` を拡張する。
+
+## 6. バージョン不整合の調査結果 / Version-alignment findings
+
+- `datapacks/vanilla/data/minecraft/**` の worldgen 部分は、1.21.1 jar の `data/minecraft/**` と意味的には一致しない。207 ファイルが内容差、517 ファイルがリポジトリ側のみ、約420 JSON のみ一致 (placed_feature 233, tags/block 180, carver 4, density_function 2)。例: `base_amplitude` / `base_octave` noise、`axis` つきの `gradient` density function、`material_rule` / `aquifers` つきの noise_settings、`attributes` つきの biome、`worldgen/feature` ディレクトリ。Rust 側のローダー (`worldgen.rs` の `dp_files`) もこの形式を読むので、**1.21.1 形式に揃えるにはローダーの移植が必要で、この PR では行っていない**。
+- 既知の食い違いを示すコメントは `worldgen.rs` (約5358, 5405 行付近) と `tools/vanilla_tags_sync.py` / `tools/vanilla_nofeat_pack.py` にある。
+- `config_packets.bin` には 26.x の識別子は見つからなかった (908 個の識別子)。出所は引き続き未文書化。
+
+## 7. この文書の更新方法 / Maintaining this file
 
 - Rust 依存の表は `cargo metadata --format-version 1 --locked --all-features` から再生成できます。
 - 新しい第三者データ・逆アセンブル・マッピングをコミットするときは、§1 に行を足してください。

@@ -25,7 +25,7 @@ for _ in 0..26 { write_varint(&mut p, 2048); p.extend_from_slice(&[0xffu8; 2048]
 
 ## データ（既にある）
 
-`assets/pblocks.json` の**状態ごと**のフィールド：
+`assets/pblocks.json`(現在は `assets/block_states_1211.json` に移行済み。`luminance` / `light_block`)の**状態ごと**のフィールド：
 
 | フィールド | 意味 | 分布（実測） |
 |---|---|---|
@@ -62,7 +62,7 @@ for _ in 0..26 { write_varint(&mut p, 2048); p.extend_from_slice(&[0xffu8; 2048]
 1. **症状そのもの**：松明を置いた位置のブロックライトが 15、隣が 14、2つ隣が 13。
    松明が無ければ 0
 2. **空の光**：地表より上は 15、`opacity` の高いブロックの下は減衰
-3. **資産を独立に読む**：`luminance`/`opacity` を `pblocks.json` から読み、
+3. **資産を独立に読む**：`luminance`/`opacity` を `block_states_1211.json` から読み、
    全状態で registry の値と一致
 4. **負の対照**：`luminance` を無視すると症状テストが落ちる
 5. **費用**：`chunk_data` の前後を**連続測定**。`x1.10` 未満は主張しない

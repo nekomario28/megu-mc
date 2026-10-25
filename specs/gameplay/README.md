@@ -36,7 +36,13 @@ Status: 計画。slice 01 完了、slice 02 の手順1〜4 完了。
 （hardness / canHarvest / tool_kind / drops / stackSize）。どれも
 **手書きの値は間違っておらず、圧倒的に不完全だった**（356/26,684、13/23,364 等）。
 
-`assets/pblocks.json` は状態ごとに `collision_shapes` / `luminance` / `opacity` /
+> **注記 (2026-10-25, 出所整理)**: `assets/pblocks.json` と `assets/properties.json` は削除した。両ファイルは別プロジェクトのファイルとバイト一致し、
+> しかも 1.21.1 ではないバージョンのデータだった(35,723 状態 vs 1.21.1 の 26,684)。luminance / opacity / 状態フラグ / 面の full 判定は、1.21.1 jar から
+> 生成した `assets/block_states_1211.json`(`tools/vanilla_data/`)に移行済み。**`collision_shapes` / `outline_shapes` など形状・摩擦系のフィールドは現在リポジトリに無い**:
+> 必要になったら `tools/vanilla_data/Extract.java` を拡張して jar から抽出する(下の記述は削除前の調査記録)。
+> *Note: pblocks.json / properties.json were removed (see THIRD_PARTY.md). Per-state light/flags/faces now come from `assets/block_states_1211.json`; shape and friction fields would need an extension of `tools/vanilla_data/Extract.java`.*
+
+`assets/pblocks.json`(削除済み。上の注記参照)は状態ごとに `collision_shapes` / `luminance` / `opacity` /
 `blast_resistance` / `slipperiness` / `velocity_multiplier` / `instrument` /
 `piston_behavior` / `map_color` を持つ。
 
@@ -115,7 +121,7 @@ Status: 計画。slice 01 完了、slice 02 の手順1〜4 完了。
 
 ### slice 04 のデータ源（確認済み）
 
-**正しい源は `assets/pblocks.json` であり、実形状が入っている。**
+**当時の調査では源は `assets/pblocks.json` だった(現在は削除済み。形状は 1.21.1 jar から抽出し直す必要がある)。**
 状態ごとに `collision_shapes` / `outline_shapes`（**35,723 参照**）があり、
 参照先の `shapes` は **719 個の実 AABB**（`min` / `max`）。
 例：`oak_stairs` の既定状態は `[58, 59]` の2箱。

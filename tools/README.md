@@ -15,6 +15,7 @@
 | `ore_fixture.sh <tag> <keep> [n]` | `ore_*`/`disk_*` のうち `<keep>` 以外の placement を `count: 0` にした world を作る（1 feature 隔離） |
 | `vanilla_nofeat_pack.py <jar> <world> [--keep-carvers]` | biome の features と carvers を空にした pack を書く（地形だけの比較用） |
 | `vanilla_region_blocks.py` | region ファイルから chunk を取り出す共通層 |
+| `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings]` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv` を再生成する。jar の sha1 と Fabric mapping の sha256 を固定し、公式 data generator の出力と突き合わせてから書く。Java 21 が必要。出力は決定的 |
 
 ## 比較（両側を同じ土俵で読む）
 

@@ -41,3 +41,5 @@ Cargoのpackage version `0.0.0` は復元時の値です。`AUDIT_WIRE.md` と `
 コードはMIT（[LICENSE](LICENSE)）。`datapacks/vanilla/`、`assets/`、`resourcepack.zip`、`config_packets.bin` はMojang由来のデータ・資産であり、MITライセンスの対象外です。詳細は[復元と検証の記録](RESTORATION.md)と[第三者データの注意](SECURITY_NOTES.md)を参照してください。GPL/AGPLの実装コードは取り込んでいません。
 
 各ファイルの出所の一覧と、オーナー確認待ちの項目(出所が文書化されていないデータ、`evidence/gameplay/` の javap 逆アセンブル・Mojang 公式マッピング抜粋、Rust 依存のライセンス)は [THIRD_PARTY.md](THIRD_PARTY.md) にまとめています。事実の一覧であり、法的な判断ではありません。
+
+`assets/blocks_1211.json` は PrismarineJS/minecraft-data (MIT) の `data/pc/1.21.1/blocks.json` と同一で、帰属は [NOTICE](NOTICE) に記載しています。`assets/block_states_1211.json` と `datapacks/vanilla/biome_climate_tree.json` は 1.21.1 の server jar から `tools/vanilla_data/gen_vanilla_data.sh` で再生成できます([THIRD_PARTY.md](THIRD_PARTY.md) §5)。
