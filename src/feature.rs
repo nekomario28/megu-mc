@@ -4220,13 +4220,32 @@ fn load_creg() -> CarverReg {
     }
     for (name, b) in Gen::dp_files("biome") {
         if let Some(j) = jparse(&b) {
-            if let Some(list) = jarr(&j, "carvers") {
-                reg.biome
-                    .insert(name, list.iter().map(|v| ns_name(v.str())).collect());
+            if let Some(list) = carver_list(&j) {
+                reg.biome.insert(name, list);
             }
         }
     }
     reg
+}
+
+/// 1.21.1 writes `carvers` as `{"air": [...]}` and uses a bare string when the
+/// step has one carver; converted packs wrote a bare list (implicitly AIR).
+/// The order is the carver seed index.
+fn carver_list(j: &J) -> Option<Vec<String>> {
+    let carvers = js(j, "carvers")?;
+    let air = match carvers {
+        // `"carvers": {}` is a legitimate empty AIR step (the End biomes).
+        J::Obj(_) => match carvers.get("air") {
+            Some(air) => air,
+            None => return Some(Vec::new()),
+        },
+        _ => carvers,
+    };
+    match air {
+        J::Str(s) => Some(vec![ns_name(s)]),
+        J::Arr(a) => Some(a.iter().map(|v| ns_name(v.str())).collect()),
+        _ => None,
+    }
 }
 
 fn p_anchor(j: &J) -> Option<Anchor> {

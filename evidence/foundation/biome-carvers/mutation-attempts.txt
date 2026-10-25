@@ -1,0 +1,16 @@
+
+ok    biome carvers parse a single AIR id
+SKIP  biome carvers read the AIR object key
+      anchor is not present exactly once in src/feature.rs; the implementation moved, so this
+      mutation no longer describes it. Update the entry rather than deleting it.
+ok    biome carvers preserve the list order
+mutation check: 2 proved, 0 not a gate, 0 parked, 1 skipped
+
+ok    converted bare carver lists still parse
+mutation check: 1 proved, 0 not a gate, 0 parked, 0 skipped
+
+
+ok    biome carvers parse a single AIR id
+ok    biome carvers read the AIR object key
+ok    biome carvers preserve the list order
+mutation check: 3 proved, 0 not a gate, 0 parked, 0 skipped

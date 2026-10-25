@@ -1,0 +1,10 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 4 tests
+test feature::generation_contract_tests::carver_configs_parse_the_1_21_1_field_shapes ... ok
+test feature::generation_contract_tests::carver_lists_match_the_pinned_biomes ... ok
+test feature::generation_contract_tests::converted_carver_lists_still_parse ... ok
+test worldgen::wg_tests::bundled_carver_configs_are_the_1_21_1_shapes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 229 filtered out; finished in 0.00s

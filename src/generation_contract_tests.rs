@@ -3,7 +3,7 @@ use crate::block_registry::breg;
 use crate::generation_context::FC;
 use crate::generation_math::{mth_cos, mth_next_f32, mth_sin, normal_new_l, Xor};
 use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr, FP, RT};
-use crate::json::jparse;
+use crate::json::{jparse, J};
 use crate::worldgen::Gen;
 
 fn context(g: &mut Gen) -> FC<'_> {
@@ -486,6 +486,62 @@ fn carver_configs_parse_the_1_21_1_field_shapes() {
     );
 }
 
+/// Every biome's AIR carver list, in the order the carver seed index counts,
+/// against the pinned jar's own `BiomeGenerationSettings`. The list is written as
+/// `{"air": [...]}` in 1.21.1, not as a bare array.
+#[test]
+fn carver_lists_match_the_pinned_biomes() {
+    let fixture = jparse(include_bytes!(
+        "../evidence/foundation/biome-carvers/vanilla.json"
+    ))
+    .unwrap();
+    let J::Obj(biomes) = fixture.get("biomes").unwrap() else {
+        panic!("biomes must be an object");
+    };
+    let reg = super::creg();
+    let mut nonempty = 0;
+    for (name, list) in biomes {
+        let want: Vec<String> = list
+            .as_arr()
+            .expect("carver list")
+            .iter()
+            .map(|v| v.str().to_string())
+            .collect();
+        assert_eq!(reg.biome.get(name), Some(&want), "carvers for {name}");
+        nonempty += usize::from(!want.is_empty());
+    }
+    assert_eq!(biomes.len(), 64, "pinned biome coverage changed");
+    assert_eq!(nonempty, 58, "non-empty carver coverage changed");
+    assert_eq!(
+        reg.biome.get("minecraft:forest").map(Vec::as_slice),
+        Some(
+            [
+                "minecraft:cave",
+                "minecraft:cave_extra_underground",
+                "minecraft:canyon"
+            ]
+            .map(str::to_string)
+            .as_slice()
+        )
+    );
+}
+
+/// Converted packs wrote the AIR step as a bare list or string. No bundled
+/// biome uses that shape any more, so pin it directly.
+#[test]
+fn converted_carver_lists_still_parse() {
+    let list = jparse(br#"{"carvers":["minecraft:cave"]}"#).unwrap();
+    assert_eq!(
+        super::carver_list(&list),
+        Some(vec!["minecraft:cave".to_string()])
+    );
+    let single = jparse(br#"{"carvers":"minecraft:canyon"}"#).unwrap();
+    assert_eq!(
+        super::carver_list(&single),
+        Some(vec!["minecraft:canyon".to_string()])
+    );
+}
+
 /// A geode config whose shape is fully determined: one point at a fixed offset, no
 /// noise, no crack, no alternate layer, no inner placements. The decompiled
 /// `GeodeFeature` then compares `1/sqrt(distSqr + pointOffset)` against
@@ -952,13 +1008,7 @@ fn root_system_vertical_water_allowance_follows_the_config() {
 fn root_system_does_nothing_when_its_origin_is_not_air() {
     let reg = breg().unwrap();
     let stone = reg.state_of("minecraft:stone", None);
-    let cf = {
-        let text = std::fs::read_to_string(
-            "datapacks/vanilla/data/minecraft/worldgen/feature/rooted_azalea_tree.json",
-        )
-        .expect("the pack's rooted_azalea_tree config");
-        super::p_cf(&jparse(text.as_bytes()).expect("json")).expect("the config must parse")
-    };
+    let cf = pack_cf("rooted_azalea_tree");
     let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
     let mut ctx = context(&mut g);
     let (x, z) = (8, 8);
@@ -1196,9 +1246,16 @@ fn iceberg_builds_a_shape_around_sea_level() {
 /// Load a configured feature straight from the pack's own JSON, so a test never
 /// restates a config that the pack already holds.
 fn pack_cf(name: &str) -> Cf {
-    let path = format!("datapacks/vanilla/data/minecraft/worldgen/feature/{name}.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    super::p_cf(&jparse(text.as_bytes()).expect("json")).expect("the config must parse")
+    // Gen::dp_files_any(["configured_feature", "feature"]) overlays `feature`
+    // last, so a converted pack's `feature/` wins. Match that precedence.
+    for dir in ["feature", "configured_feature"] {
+        let path = format!("datapacks/vanilla/data/minecraft/worldgen/{dir}/{name}.json");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            return super::p_cf(&jparse(text.as_bytes()).expect("json"))
+                .expect("the config must parse");
+        }
+    }
+    panic!("no configured feature {name} in the pack");
 }
 
 /// The gallery of `dripstone_cluster_hangs_...`: a stone slab with a span of `fill`

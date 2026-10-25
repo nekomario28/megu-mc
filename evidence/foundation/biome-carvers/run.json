@@ -1,0 +1,207 @@
+{
+  "base_commit": "b477f0c9632d9073ad25f8c6b311fc2733a436cf",
+  "base_tree": "7435c58ccf1bb68fb72f5e78d5a34f9bfbf4814e",
+  "binary": {
+    "latest_source_mtime_ns": 1792972292657896817,
+    "mtime_ns": 1792972413902554208,
+    "note": "Built after mutation restoration; both wire checks use this binary.",
+    "path": "target/release/mc-spine",
+    "sha256": "2e5eb54ea01a12a69c1bbec38f71510ab0429c659203e21cd489bb153eb6731e"
+  },
+  "docs_sha256": {
+    "evidence/foundation/biome-carvers/README.md": "a3c5d9048f42772b9906f1960f30d8012b0c8548672dc967ade44a4cc64b544e",
+    "specs/README.md": "70e7e569fef8d15a75e76a86fd322f07365f1adc48a2ef8861cb340b01edf31a",
+    "specs/ROADMAP.md": "add1b4b12eb96116221edeff2b456eb33633f01a2053c2fb66058c3f4eb78ec5",
+    "specs/done/biome-carvers/README.md": "8f77fe5e3ff697fcdc966e7df54c95ea82223048e6d07444405e6a1e0366756d",
+    "tools/README.md": "b7aa4968a78da16a679cb1d5e45a6b7e5b0f19b1c9198ae576cff39e0bc495eb"
+  },
+  "evidence_sha256": {
+    "admission-final.txt": "a9dd76635924dce4c1914192244d3a9203ad7ef61de7a3b95ba7b3d8ebf7195e",
+    "admission-mutations.txt": "af10d0d4942387b788d3ec23855730e18834f59488cfe6d6cfea1889afbacc5e",
+    "admission-native.txt": "09872c15e3df95e1afbb468fd02318d7271ed7380d6ec2fa5c85c1b5eadc2f87",
+    "admission-review.txt": "3544f5dd4219b2cf733e92f4e428c1528dfeed387c19ff6b6e4f351a28901d1c",
+    "build.txt": "492ca46b8b2cfe12bc8ffcb88d4d27d17e33bfe079a3a22e598a23fba93094fb",
+    "clippy.txt": "432d5862408ca2ed984a608f3239b77a287408f8d3c15146ae3c480080339651",
+    "comparison.json": "f4c6a1ebde1cec343e152e47662f1b15d351c23858a58c57232c88beae5a1582",
+    "debt.txt": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
+    "environment.json": "1bd2baf21b9ca934b7547c4ea9cece9daca306aa8d04776871261875e90ceea5",
+    "focused.txt": "e0b3768860b5c4d7e4a23eb57a399a01e9f7eaf5c39b8c22d6ce88a36a511766",
+    "layers.txt": "9953c50d8143279d00c32819a9824c29b82c64787e94790e6432e8578f080616",
+    "log-normalization.json": "54181556db3f48c6b41cfa0bbb9ac5f636add3c362a43922bdb86182c1a41d43",
+    "mutation-attempts.txt": "effe0ef8d38ef064688d56832bbfc6c57fe9e7c99330a95a3d641d3460a5f21f",
+    "mutations.txt": "fead105e19a6712b33fec189136f5523fcdbb65d2e42ef10e410cc2b45e2bc55",
+    "native-replay.txt": "b533687fc96cea9f6e6e05af81b60b004535e138bde338241de897ba8e298734",
+    "oracle-record.txt": "32de27b803e085ef72344b6406619545c4db7826f229ce89ea2a0bbbd8313e71",
+    "python.txt": "0680cb616fb0428a973fa4ef606c386bdb1fc034e1520b3bd0c275c5ef4eff60",
+    "review.txt": "94025f99f6837abe0147d1525b14c6d089ef0173e1d0d27a5cbdebdcd478abef",
+    "source-hashes.sha256": "a31f95ac0c4df57127dfaeb50b00dad73aff40e4ada693de66788c3e5d4a0f98",
+    "suite.txt": "1e9969241016a30bb6543f0374119fce117ad9a22fd13daf701aceada69e030a",
+    "unit.jsonl": "6cc36490f133b01293673a7dc40b691b778a7b69a1881efff5173cea220e240a",
+    "vanilla.json": "3b1d4193955a0056667e96be0f291bfddcf8ba5f1ad0efb4e3f4c54f7c978ee4",
+    "wire.txt": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921"
+  },
+  "limits": [
+    "AIR carver lists only; carver cell geometry is prior bounded evidence, not a new whole-chunk differential.",
+    "spawners/spawn_costs and nether_cave execution are not implemented; suite green is not whole-world or native-world parity.",
+    "Full tests/verify.sh, whole mutation campaign, hosted CI, push, main merge and release were not run for this slice."
+  ],
+  "not_run": [
+    "full tests/verify.sh",
+    "whole mutation campaign",
+    "hosted CI",
+    "push/mirror refresh",
+    "main merge",
+    "release"
+  ],
+  "recorded_at": "2026-10-25T23:53:50.785119+00:00",
+  "reference": {
+    "biomes": 64,
+    "construction": "Real RegistryDataLoader/Biome.getGenerationSettings().getCarvers(AIR) public API; no server, world, Unsafe or constructor bypass.",
+    "datapack": "server jar data/minecraft/worldgen loaded by RegistryDataLoader",
+    "fixture_sha256": "3b1d4193955a0056667e96be0f291bfddcf8ba5f1ad0efb4e3f4c54f7c978ee4",
+    "inner_game_sha256": "c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a",
+    "minecraft": "1.21.1",
+    "nonempty_lists": 58,
+    "oracle_sha256": "43da9b8d77d5f9e23d81b1abe0eeaa7e6f4dd05f8d8ce57ae9efc8c9a2fe111c",
+    "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+  },
+  "results": {
+    "clippy_all_targets_warnings_denied": true,
+    "container_wire": "PASS",
+    "debt_over_limit": 0,
+    "focused": 4,
+    "gameplay_wire": "PASS",
+    "layers": {
+      "edges": 44,
+      "modules": 19,
+      "named_errors": 0
+    },
+    "native_replay_twice": true,
+    "selected_mutations": {
+      "not_a_gate": 0,
+      "parked": 0,
+      "proved": 4,
+      "skipped": 0,
+      "superseded_attempt": {
+        "proved": 2,
+        "skipped": 1
+      }
+    },
+    "suite_compare": {
+      "added_failures": [],
+      "baseline": [
+        213,
+        17,
+        1
+      ],
+      "current": [
+        232,
+        0,
+        1
+      ],
+      "new_tests": 2,
+      "poison_error_failures": 0,
+      "removed_failures": 17,
+      "unchanged_failure_baseline": false
+    }
+  },
+  "review": {
+    "all_fixed": true,
+    "found": [
+      "six empty-carver biomes were not inserted",
+      "pack_cf precedence inverted",
+      "converted branch untested",
+      "missing receipt",
+      "stale suite-red status"
+    ],
+    "post_fix_checks": "focused and full suite rerun; no independent execution by reviewer",
+    "static": true
+  },
+  "scope": "Pinned AIR carver list loading and own-layout configured-feature fixtures; not whole-world or spawner acceptance.",
+  "source_sha256": {
+    ".github/workflows/ci.yml": "27d4a3048e1d1e15daeb8d7d227298a8d6dd37f37438be0b2d121994c5fc7927",
+    "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
+    "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
+    "evidence/foundation/biome-carvers/README.md": "a3c5d9048f42772b9906f1960f30d8012b0c8548672dc967ade44a4cc64b544e",
+    "specs/README.md": "70e7e569fef8d15a75e76a86fd322f07365f1adc48a2ef8861cb340b01edf31a",
+    "specs/ROADMAP.md": "add1b4b12eb96116221edeff2b456eb33633f01a2053c2fb66058c3f4eb78ec5",
+    "specs/done/biome-carvers/README.md": "8f77fe5e3ff697fcdc966e7df54c95ea82223048e6d07444405e6a1e0366756d",
+    "src/aquifer_native_tests.rs": "00e436230df0ff8fbdbc78e98190ca4f99f63f146c40cb5353b9b1b94eee6ced",
+    "src/block_registry.rs": "c015c38549380894521d1fb50f78db1489e0586454bb3d6378f7553c00850c25",
+    "src/cached_lookup.rs": "0c5fdc139c95dfe7c0899b1ce8de39ff643d41d260d37616fab56985afa23307",
+    "src/chunk_ack.rs": "3457cf65ae2a69d3cbf5d8669cf098e30f71875a8bfd61cce8f29a885f3c4aaf",
+    "src/command_tests.rs": "51bc18221aad76dd33aafeb7dfb2f26d97a5bb2dfd90cfe191b74f1308e6cac9",
+    "src/container_tests.rs": "364079da8463c8a39ddec67e05a10b48ea09c0579c93b5fb886c3dcbae11a940",
+    "src/craft_tests.rs": "4fc80be6a7f3d4884c11f6c7c6edbd31ddd391ac8484b768cdeee9a6f49360e3",
+    "src/effect_tests.rs": "ea8f3fc7291211ba40a4b2a3d9689387742ac10681dd3d07ca750de029bededa",
+    "src/effects.rs": "46113e8b50487c3c4087554390036a9043a207ec478133d78294874b96cf6c66",
+    "src/entity_encoding_tests.rs": "d7be67a3bb0391919753cc53758600f1dbf403d08d1bfbc1b3299635e506da77",
+    "src/fanout_tests.rs": "d7ed3e90468289f7023616f511048d3ee3d2fe693d30239b4121c9402fe69eee",
+    "src/feature.rs": "a7cf81f5cd93ca81ff223588996b2079b4f05bd3c8362a0ad914551910037688",
+    "src/furnace_cache_tests.rs": "c6e1cab8ec3452e997dab6553efde373b2422d400ddf9af6c624d291b251ff42",
+    "src/generation_context.rs": "406c00c348a0e57b6f488a18c2ebf1d4850ac312b29a268bbf8ea29fbbaa28b3",
+    "src/generation_contract_tests.rs": "dea9caf8fed4cd47f3ca51d000b9e06995caad88098cdb6a3b061b0718417402",
+    "src/generation_math.rs": "cb14cd05c84d85c891a08bfbf39fee14cec356aeabcc2ac92ecf13d9f1a51dc3",
+    "src/generation_providers.rs": "03290c8d5cd7e938a060cd2364db5e345cc389890de4c3dc6ed53a3793d2b447",
+    "src/ingress_guard.rs": "9a71fd328f01738e5f3f0506fc2972fe457677a4c7ce0b74568e8ab3ac7d0469",
+    "src/java_compat.rs": "2060cfd3a8a48e7d66415eb9324c41c409a7b47cf22e567cc9ba7a3b5b7aef3b",
+    "src/json.rs": "34c9aba426704711f47e16bc5f2e38f9d7d0895625f006a2c4b770a667b49aaa",
+    "src/landing.rs": "427b678db12c06759e62fce160580d3a3d2d3ae03dd0bf9ace9ad2c2b6a5e84c",
+    "src/landing_types.rs": "90b214871b8f0d7315009599af1ca461a1f53024a7d4590185916b9683806d82",
+    "src/light_pack_tests.rs": "8a35f69ed04fb0300fe77444ebe1ba605c4f8ab890a3f407b51de34c3ddd4ed1",
+    "src/main.rs": "9c08b5c5f07508b892f6d0f278d9ca9e19a8ef14b60f9ae9f690d3b69b2adba0",
+    "src/merge_tests.rs": "5e3120d445bd7b70ec8ecce6eaebea366a9f19cc5712a0c12b404eb7e60897b2",
+    "src/persistence_tests.rs": "286452bf218f96ffa835e72151a18186aa29259c7224aed9ee23d89fdc957d37",
+    "src/primitives_tests.rs": "3faca3437cfccf5ed3d505289202c284ca1ab256d9cb9619e425ef36e27a7978",
+    "src/registry_tests.rs": "cd931153f57a3482edf0006b15d6f8648b5bc9cd7baa421de2dec270ea26cf11",
+    "src/test_support.rs": "78bff331c339a8cd736f88fee9cfd90de318566c9b99aee033b569490e24f033",
+    "src/tick_queue.rs": "565874a920f1466b28f281a38d0415d7e202f954cf79a38e0995c37797c25618",
+    "src/tick_stats.rs": "ece168a82d6e8d33f8eff0c253470a047feba35c83eaf7a8c7ead126a6fec342",
+    "src/tick_tests.rs": "66b81bd57927fb69d4dc34396dbc8b8b0a4710771caeb64d653bf65c430a31fe",
+    "src/tree.rs": "94540bdf5a1a0d9c4e03080c77ad61e5e778488966bc9f182d3da00825254981",
+    "src/weird_sampler_tests.rs": "03fda74db84ad32ae96f9208b343cb6d607c0806e680274782a433e28edbf910",
+    "src/world_rng.rs": "b440d78b383752426b43f796718a21387c023f32081d8a903f84a0cc5303d144",
+    "src/worldgen.rs": "6e64f7b0a55e5d1f4f39c536bd6aa2719e2e0e53f5668dca9a5a1abe97856baa",
+    "tests/biome_carver_oracle_test.py": "9dab06032b930161b24a198678a2941fd2c1ab8bbb0b106a3bd50c88e9dfe1db",
+    "tests/verify.sh": "3810b47dbdc08e01c774080cbc43dc2d4d44f8cc51b3a213302a038d1654020a",
+    "tools/README.md": "b7aa4968a78da16a679cb1d5e45a6b7e5b0f19b1c9198ae576cff39e0bc495eb",
+    "tools/biome-carver-oracle/BiomeCarverOracle.java": "43da9b8d77d5f9e23d81b1abe0eeaa7e6f4dd05f8d8ce57ae9efc8c9a2fe111c",
+    "tools/biome_carver_oracle.py": "4c6f111e51d6b366a4d0b4dccb79664690da4e8ffd198bb7171578e43ea080a5",
+    "tools/mutation_check.sh": "d9bd6349449541e6631254ec69405a413aca23e5231a3248eea4b05a5debae56",
+    "tools/suite_compare.py": "b4e3d397c5437ee4926aa74221637896d071f36544e2bd55fc3cc51468ae1531"
+  },
+  "units": [
+    {
+      "accounting_message": "mc-carver-final-3.service: Consumed 53.287s CPU time over 52.613s wall clock time, 789.2M memory peak.",
+      "cpu_usage_nsec": 53287705000,
+      "invocation": "aa9c393ebb1046cda090a84857fac18d",
+      "memory_peak_bytes": 827617280,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-carver-final-3.service"
+    },
+    {
+      "accounting_message": "mc-carver-mut4.service: Consumed 3min 58.440s CPU time over 4min 1.301s wall clock time, 898.9M memory peak.",
+      "cpu_usage_nsec": 238440775000,
+      "invocation": "b2627027eced437085c376cb3f463330",
+      "memory_peak_bytes": 942571520,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-carver-mut4.service"
+    },
+    {
+      "accounting_message": "mc-carver-oracle2.service: Consumed 6.042s CPU time over 6.040s wall clock time, 713.4M memory peak.",
+      "cpu_usage_nsec": 6042805000,
+      "invocation": "bc4e855f8bcc410981805f47a1a62256",
+      "memory_peak_bytes": 748142592,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-carver-oracle2.service"
+    },
+    {
+      "accounting_message": "mc-carver-review.service: Consumed 4.421s CPU time over 6min 12.370s wall clock time, 228.5M memory peak.",
+      "cpu_usage_nsec": 4421323000,
+      "invocation": "5b1a162e340d439cb8866cb34ea1f228",
+      "memory_peak_bytes": 239636480,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-carver-review.service"
+    }
+  ]
+}

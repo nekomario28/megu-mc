@@ -837,6 +837,26 @@ check "aquifer deep test promotes the f32 threshold" \
   '< -0.225' \
   aquifer_deep_level_reads_erosion_and_depth_in_f32
 
+check "converted bare carver lists still parse" \
+  src/feature.rs '        _ => carvers,' \
+  '        _ => return None,' \
+  converted_carver_lists_still_parse
+
+check "biome carvers parse a single AIR id" \
+  src/feature.rs 'J::Str(s) => Some(vec![ns_name(s)]),' \
+  'J::Str(_) => None,' \
+  carver_lists_match_the_pinned_biomes
+
+check "biome carvers read the AIR object key" \
+  src/feature.rs 'J::Obj(_) => match carvers.get("air") {' \
+  'J::Obj(_) => match carvers.get("liquid") {' \
+  carver_lists_match_the_pinned_biomes
+
+check "biome carvers preserve the list order" \
+  src/feature.rs 'J::Arr(a) => Some(a.iter().map(|v| ns_name(v.str())).collect()),' \
+  'J::Arr(a) => Some(a.iter().rev().map(|v| ns_name(v.str())).collect()),' \
+  carver_lists_match_the_pinned_biomes
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

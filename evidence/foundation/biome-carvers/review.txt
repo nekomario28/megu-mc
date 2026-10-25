@@ -1,0 +1,35 @@
+## Findings (static review; no build, test, Java, Cargo or jar execution performed)
+
+I read the changed files and resolved the oracle's obfuscated names against `/home/yuu/.cache/mc-spine-work/mc121/server.txt`; I only *read* the pinned jar bytes (zip read + hashes), I did not execute it.
+
+### 1. `carver_lists_match_the_pinned_biomes` cannot distinguish "empty list" from "biome absent"; the loader drops the six empty biomes — `src/generation_contract_tests.rs:510`, `src/feature.rs:4234-4243`, `src/feature.rs:4223`
+
+`let got = reg.biome.get(name).cloned().unwrap_or_default();` accepts a biome that was never inserted as `[]`. That is not hypothetical here: the six "empty" fixture entries are `"carvers": {}` in the pinned jar/pack (`datapacks/vanilla/data/minecraft/worldgen/biome/the_end.json`, `the_void.json`, `end_*.json`), and `carver_list` returns `None` for an object without an `air` key, so `load_creg` never inserts those six (registry has 58 entries, not 64). A regression that drops a biome entry for any reason (parse failure at `feature.rs:4222`, `carver_list` returning `None`, or an unknown step key) is invisible for exactly those six, which contradicts the stated invariant in `specs/done/biome-carvers/README.md` ("空・欠落・未知carverを「carverなし」と混同しない") and the evidence claim "compares every list" (`evidence/foundation/biome-carvers/README.md:43-44`). Fix: return `Some(vec![])` for the object form when the AIR step is absent (reporting an unrecognised step key the way `p_carver` reports unsupported carvers), then assert presence in the test (`assert_eq!(reg.biome.get(name), Some(&want))`, optionally `reg.biome.len() == 64`). Behaviour of `apply_carvers` is unaffected (absent == empty for AIR), so this is a gate/invariant defect, not a carving defect.
+
+### 2. `pack_cf` fallback precedence is inverted relative to the production loader — `src/generation_contract_tests.rs:1236` (and the claim at `evidence/foundation/biome-carvers/README.md:30-32`)
+
+The loader is `Gen::dp_files_any(&["configured_feature", "feature"])` (`src/feature.rs:2265`, `src/worldgen.rs:496-504`: "later *names* winning within a pack"), i.e. **`feature` overrides `configured_feature`**. `pack_cf` tries `configured_feature` first, so in a converted pack that ships both directories the dripstone/root/rooted-azalea tests pin the config production does *not* load — the helper's own comment ("the pack it is actually running on") is then false. Latent today (the bundled pack has 0 files under `worldgen/feature/`), but it is the exact scenario the fallback was added for. Fix: iterate `["feature", "configured_feature"]`, or read through the loader's merge helper so the precedence cannot drift.
+
+### 3. Converted bare-list/bare-string branch is unexercised — `src/feature.rs:4236-4238`
+
+`_ => carvers` (the non-object form) has no fixture, pack file, Rust test or mutation entry: every bundled biome is an object (`air` array ×53, `air` string ×5), and the three mutations only cover the `air` key, the string arm and list order. The README advertises converted-pack support (`evidence/.../README.md:22-24`), but nothing would notice if that branch were removed or inverted. A unit test over literal JSON (`{"carvers":["minecraft:cave"]}` and `"minecraft:cave"`) would close it; a mutation entry cannot, because no data reaches the branch.
+
+### 4. Missing verification receipt — `evidence/foundation/biome-carvers/README.md:81-82`
+
+The README ends with "See [the closed rationale] and `run.json`", but no `run.json` exists in `evidence/foundation/biome-carvers/` (only `README.md` and `vanilla.json`) or `specs/done/biome-carvers/` (only `README.md`); sibling evidence dirs (`aquifer/`, `surface-loader/`, `valence-primitives/`) do carry one plus logs. So the table's numbers (231 passed/0 failed/1 ignored, "3 proved" mutations, clippy/layers/wire PASS) have no receipt in the tree. Either add `run.json`/logs or drop the citation and the unbacked rows.
+
+### 5. Stale contradiction in the status file — `specs/README.md:31`
+
+The slice changes line 29 to "ローカルsuiteは緑 … 231 passed / 0 failed / 1 ignored", but line 31 still says "現在の移行ブランチでも警告0は確認しましたが、全テストgreenではありません。" Update that sentence; as written the same document asserts both states.
+
+## Checked and found sound
+
+- **AIR list semantics/order**: order is carried as `Vec` and used as the seed offset; the fixture order matches the jar's JSON array order verbatim.
+- **Single-string handling**: the jar really writes `"air": "minecraft:nether_cave"` for the 5 nether biomes; `J::Str` → one-element list, retained (mutation 1 does prove this arm).
+- **Fixture completeness/provenance**: sha1 `59353fb4…` matches the jar; `inner_game_sha256` matches `META-INF/versions/1.21.1/server-1.21.1.jar`; `oracle_sha256` matches `BiomeCarverOracle.java`; the 64 biomes / 58 non-empty / 6 empty / 5 single-carver shape and every list value are identical to the inner jar's `data/minecraft/worldgen/biome/*.json` (I diffed all 64).
+- **Oracle class/method chain**: `ab.a`=tryDetectVersion, `akt.a`=Bootstrap, `lt.aA`=BuiltInRegistries.REGISTRY, `ka.a(jz)`=fromRegistryOfRegistries, `akm.a(aue,ka,List)`=RegistryDataLoader.load + `akm.a`=WORLDGEN_REGISTRIES, `ats.b`=createVanillaPackSource, `atx.<init>(ass,List)`, `ass.b`=SERVER_DATA, `lu.aF`=BIOME, `dyu$a.a`=Carving.AIR, `jz.h`=entrySet, `ddw.d`=getGenerationSettings, `ddx.a(Carving)`=getCarvers, `jm.e`=unwrapKey, `akq.a`=location — all consistent.
+- **`nether_cave`**: list retained, `p_carver` refuses the type and `load_creg` reports it (`feature.rs:4214-4217`); `apply_carvers` skips the missing config per index without disturbing other indices.
+- **`load_creg` ordering**: `configured_carver` before biomes; no dependency between the loops, so ordering is not load-bearing.
+- **Mutation entries**: all three anchors occur exactly once (`grep` count 1) and each mutant makes the named test fail (string drop → 5 nether biomes mismatch; `liquid` key → all 58 lists empty; reversal → forest/multi-carver order mismatch).
+- **Wiring**: `tests/biome_carver_oracle_test.py` is in `tests/verify.sh:22` and `.github/workflows/ci.yml:52`; the Rust test rides the normal `cargo test` legs.
+- **Scope claims**: the suite-green statements are explicitly not whole-world/native parity claims (`evidence/.../README.md:65-68,76`, `specs/README.md:29`, `specs/ROADMAP.md:7`); no overclaim found there.
