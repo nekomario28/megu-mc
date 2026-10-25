@@ -1,0 +1,18 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+
+thread 'worldgen::wg_tests::pinned_biome_tree_uses_only_biomes_from_its_jar' (2769380) panicked at src/worldgen.rs:3780:9:
+biome tree contains foreign biomes: ["minecraft:dappled_forest", "minecraft:pale_garden", "minecraft:sulfur_caves"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test worldgen::wg_tests::pinned_biome_tree_uses_only_biomes_from_its_jar ... FAILED
+
+failures:
+
+failures:
+    worldgen::wg_tests::pinned_biome_tree_uses_only_biomes_from_its_jar
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--bin mc-spine`

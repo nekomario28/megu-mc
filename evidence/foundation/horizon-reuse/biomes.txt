@@ -1,0 +1,8 @@
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] no aquifer function "exclusion" in aquifers or noise_router
+[wgprof] 1x1 chunks in 10.963346ms (11.0 ms/chunk)
+BIOMEAT 3328 64 -1792 blended=minecraft:sunflower_plains container=minecraft:sunflower_plains
+BIOMEAT 3840 64 1536 blended=minecraft:plains container=minecraft:plains
+BIOMEAT -1024 64 512 blended=minecraft:forest container=minecraft:forest

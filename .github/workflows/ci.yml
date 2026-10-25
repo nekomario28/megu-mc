@@ -41,6 +41,8 @@ jobs:
         run: |
           python3 tests/layers_gate_test.py
           bash tools/layers_check.sh
+      - name: Pinned biome tree provenance and fail-closed export checks
+        run: python3 tests/biome_tree_test.py
       - name: Build (locked)
         run: |
           cargo build --locked --message-format=json-render-diagnostics > build-artifacts.json

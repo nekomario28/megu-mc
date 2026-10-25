@@ -592,13 +592,12 @@ impl Gen {
             for (i, k) in keys.iter().enumerate() {
                 match router
                     .and_then(|r| r.get(k))
-                    .map(|j| j.str().to_string())
-                    .and_then(|n| g.resolve_ref(&files, &n))
+                    .and_then(|j| router_df(&mut g, &files, j))
                 {
                     Some(v) => ids[i] = v,
                     None => {
+                        Self::load_trace(&format!("climate router field {k:?} did not resolve"));
                         ok = false;
-                        break;
                     }
                 }
             }
@@ -622,7 +621,8 @@ impl Gen {
                 }
             }
         }
-        // serialized overworld biome tree (pumpkin-derived, vanilla-equivalent)
+        // Vanilla's built-in climate tree, exported by tools/biome_tree_from_jar.py.
+        // The preset JSON only names the builder; it does not contain its intervals.
         {
             let tp = std::path::Path::new(&g.base).join("multi_noise_biome_tree.json");
             if let Ok(b) = std::fs::read(&tp) {
@@ -631,6 +631,12 @@ impl Gen {
                         g.btree = bt_parse(ow, &mut g.biome_names, &mut g.bleaf, &mut g.leaf_ps);
                     }
                 }
+            }
+            if g.btree.is_none() {
+                Self::load_trace(&format!(
+                    "no valid overworld biome tree at {}",
+                    tp.display()
+                ));
             }
         }
         // vanilla surface rules (material_rule) — needs biome tree loaded first
@@ -3768,6 +3774,34 @@ mod wg_tests {
     fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap()
     }
+    #[test]
+    fn pinned_biome_tree_uses_only_biomes_from_its_jar() {
+        let g = Gen::load(0, crate::name_to_state).expect("pinned pack must load");
+        let biomes = Gen::dp_files("biome");
+        assert!(!g.biome_names.is_empty(), "empty biome tree");
+        let unknown: Vec<_> = g
+            .biome_names
+            .iter()
+            .filter(|name| !biomes.contains_key(*name))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "biome tree contains foreign biomes: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_climate_router_resolves_inline_fields() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack must load");
+        // The tree existed, but temperature/vegetation are inline objects in 1.21.1.
+        // Treating them as reference strings silently disabled every biome query.
+        assert!(g.climate.is_some(), "climate router did not resolve");
+        for (qx, qy, qz) in [(0, 16, 0), (832, 16, -448), (-256, 16, 128)] {
+            let (_, leaf) = g.biome_quart(qx, qy, qz, None).expect("biome query");
+            assert!(!g.biome_names[leaf as usize].is_empty());
+        }
+    }
+
     #[test]
     fn biome_vectors() {
         let _guard = lock_gen();

@@ -1,0 +1,78 @@
+{
+  "measured_at": "2026-10-25T06:07:15.267548+00:00",
+  "base_commit": "c539079395d11343f7d0c9d71885e0ee8d4a5f63",
+  "branch": "pack/1211-own-data",
+  "donor": {
+    "repository": "https://github.com/ludovic111/horizon",
+    "commit": "0564ab0bcd3235daa6001033261b79aef5f81de1",
+    "license": "MIT",
+    "runtime_imported": false,
+    "harness_suite_executed": false,
+    "tracked_parity_script_files": 326
+  },
+  "checks": {
+    "rust_focused_command": "cargo test --release --offline --locked -j 1 pinned_ -- --nocapture",
+    "rust_focused": "3 passed (2 new guards + existing world RNG pin)",
+    "rust_full_command": "cargo test --release --offline --locked -j 1 -- --test-threads=1",
+    "rust_full_result": "test result: FAILED. 171 passed; 25 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.49s",
+    "poison_error_mentions": 15,
+    "full_gate_accepted": false,
+    "python_command": "python3 tests/biome_tree_test.py",
+    "python": "5 passed",
+    "release_build": "PASS",
+    "clippy_all_targets_deny_warnings": "PASS",
+    "fmt": "PASS",
+    "diff_check": "PASS",
+    "installer_fresh_destination": "PASS",
+    "second_oracle_export": "byte-identical to installed tree",
+    "negative_controls": {
+      "inline_climate_old_reader": "FAIL: climate router did not resolve",
+      "old_tree": "FAIL: dappled_forest / pale_garden / sulfur_caves",
+      "wrong_jar": "FAIL before execution; output preserved",
+      "horizon_compare_truncated_row": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "horizon_compare_empty_reference": [
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "export": {
+    "old_overworld_leaves": 7594,
+    "new_overworld_leaves": 7593,
+    "old_overworld_biomes": 56,
+    "new_overworld_biomes": 53,
+    "nether_leaves": 5,
+    "tree_provenance": {
+      "exporter_sha256": "9528401bb0c11c281ac24513f0079a2999856f58d968385713c41eee7619ae95",
+      "minecraft": "1.21.1",
+      "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+    }
+  },
+  "source_sha256": {
+    "src/worldgen.rs": "72fee9cd2c0304651b5b5bc66017e3be7292c00a27dd0149edbec1a093e0f3cd",
+    "tools/biome_tree_from_jar.py": "8f45effca8772822bd9f11514351c2d0cd8702ccfc8525508e496af55f6b4386",
+    "tools/biome-tree/ExportBiomeTree.java": "9528401bb0c11c281ac24513f0079a2999856f58d968385713c41eee7619ae95",
+    "tools/vanilla_pack_from_jar.sh": "4ff1f6e8691116473a897f5c3718b0d0f9237105f302c81251c400e0d9fb0cd4",
+    "tests/biome_tree_test.py": "417571f98440aff57a886f7b9c37f915e63a2deae0a3ce2ce0cdb262e4d0e906",
+    "tests/verify.sh": "5388b4a966f0efc2d5f97566999d4a346a039f43d215768d7bc86e12b1c9a3d7",
+    ".github/workflows/ci.yml": "0d9cc760ea1e9fe88ac802b10b7307a091ee1bda0a1bd8cbec10874d3ecc62e2",
+    "datapacks/vanilla/multi_noise_biome_tree.json": "e14aa823738b5a8cfde62572b68cce650fe6bcbde00f223a1ee4464b84fbfc68"
+  },
+  "independent_review": {
+    "tool": "codex review --uncommitted",
+    "result": "No actionable regressions identified; four Python checks ran; temp-file test sandbox-blocked; Rust/Java not verified by reviewer. Author ran all five Python checks and the Java exporter separately."
+  },
+  "acceptance_limits": [
+    "No all-coordinate vanilla biome comparison",
+    "No chunk/kelp/geode/ore/heightmap acceptance rerun",
+    "Surface rules, carvers, weird_scaled_sampler, aquifer semantics remain WIP",
+    "No canonical branch changes; no hosted CI execution"
+  ]
+}

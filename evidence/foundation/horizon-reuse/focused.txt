@@ -1,0 +1,10 @@
+   Compiling mc-spine v0.0.0 (<checkout>)
+    Finished `release` profile [optimized] target(s) in 29.17s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 3 tests
+test world_rng::tests::the_stream_is_the_pinned_xorshift64star_vector ... ok
+test worldgen::wg_tests::pinned_climate_router_resolves_inline_fields ... ok
+test worldgen::wg_tests::pinned_biome_tree_uses_only_biomes_from_its_jar ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 194 filtered out; finished in 0.03s

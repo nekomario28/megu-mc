@@ -1,0 +1,7 @@
+Running as unit: mc-spine-horizon-install-1792908370.scope; invocation ID: 7e4c64cab36f46af936e2c5ff1ce67c5
+repeat_export=byte-identical; installer=PASS
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 0.060s
+
+OK

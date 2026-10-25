@@ -79,9 +79,14 @@ fi
 n="$(find "$work/data/minecraft/tags/block" -type f | wc -l)"
 [ "$n" -gt 100 ] || { echo "vanilla pack: only $n block tags" >&2; exit 1; }
 
+# The climate preset JSON names a built-in; it does not contain the intervals or
+# search tree. Export those from the same jar before touching the installed pack.
+python3 "$ROOT/tools/biome_tree_from_jar.py" --jar "$JAR" --output "$work/multi_noise_biome_tree.json"
+
 rm -rf "$DEST/data/minecraft/worldgen" "$DEST/data/minecraft/tags"
 mkdir -p "$DEST/data/minecraft"
 cp -r "$work/data/minecraft/worldgen" "$DEST/data/minecraft/worldgen"
 mkdir -p "$DEST/data/minecraft/tags"
 cp -r "$work/data/minecraft/tags/block" "$DEST/data/minecraft/tags/block"
+cp "$work/multi_noise_biome_tree.json" "$DEST/multi_noise_biome_tree.json"
 echo "vanilla pack: installed into $DEST"
