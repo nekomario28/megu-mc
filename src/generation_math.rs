@@ -918,6 +918,7 @@ impl Simp {
     }
     /// Contribution of one 2D simplex corner: a radial falloff `(r0 - |v|^2)^4`
     /// (r0 = 0.5) scaled by the dot product of the offset with the corner's gradient.
+    #[inline]
     fn corner2(index: usize, dx: f64, dy: f64) -> f64 {
         let falloff = 0.5 - dx * dx - dy * dy;
         if falloff < 0.0 {
@@ -928,6 +929,7 @@ impl Simp {
         squared * squared * (gx * dx + gy * dy)
     }
     /// Contribution of one 3D simplex corner (falloff radius term r0 = 0.6).
+    #[inline]
     fn corner3(index: usize, dx: f64, dy: f64, dz: f64) -> f64 {
         let falloff = 0.6 - dx * dx - dy * dy - dz * dz;
         if falloff < 0.0 {
@@ -939,29 +941,32 @@ impl Simp {
     }
     /// Gradient index of a 3D lattice point: the three coordinates are chained
     /// through the permutation table.
+    #[inline]
     fn lattice_hash3(&self, i: i32, j: i32, k: i32) -> usize {
         let through_k = self.map(k);
         let through_j = self.map(j.wrapping_add(through_k));
         (self.map(i.wrapping_add(through_j)) % 12) as usize
     }
-    /// Which axes the walk from the cell origin to the opposite corner crosses,
-    /// largest fractional offset first. Returned as axis numbers (0 = x, 1 = y,
-    /// 2 = z); ties resolve toward the earlier axis in the comparisons below.
-    fn axis_order(fx: f64, fy: f64, fz: f64) -> [usize; 3] {
+    /// The lattice steps (0 or 1 per axis) that reach the second and third
+    /// corners of the simplex: the walk from the cell origin to the opposite
+    /// corner crosses the axes in order of decreasing fractional offset, and ties
+    /// resolve toward the earlier axis in the comparisons below.
+    #[inline]
+    fn corner_steps(fx: f64, fy: f64, fz: f64) -> ([i32; 3], [i32; 3]) {
         if fx >= fy {
             if fy >= fz {
-                [0, 1, 2]
+                ([1, 0, 0], [1, 1, 0])
             } else if fx >= fz {
-                [0, 2, 1]
+                ([1, 0, 0], [1, 0, 1])
             } else {
-                [2, 0, 1]
+                ([0, 0, 1], [1, 0, 1])
             }
         } else if fy < fz {
-            [2, 1, 0]
+            ([0, 0, 1], [0, 1, 1])
         } else if fx < fz {
-            [1, 2, 0]
+            ([0, 1, 0], [0, 1, 1])
         } else {
-            [1, 0, 2]
+            ([0, 1, 0], [1, 1, 0])
         }
     }
     pub(crate) fn get3(&self, x: f64, y: f64, z: f64) -> f64 {
@@ -980,12 +985,7 @@ impl Simp {
             z - (cell[2] as f64 - unskew),
         ];
         // Lattice steps (0/1 per axis) reaching the second and third corners.
-        let order = Self::axis_order(from_origin[0], from_origin[1], from_origin[2]);
-        let mut second = [0i32; 3];
-        let mut third = [0i32; 3];
-        second[order[0]] = 1;
-        third[order[0]] = 1;
-        third[order[1]] = 1;
+        let (second, third) = Self::corner_steps(from_origin[0], from_origin[1], from_origin[2]);
         // Offsets from the point to each of the four corners.
         let to_second = [0, 1, 2].map(|a| from_origin[a] - second[a] as f64 + 1.0 / 6.0);
         let to_third = [0, 1, 2].map(|a| from_origin[a] - third[a] as f64 + 1.0 / 3.0);
