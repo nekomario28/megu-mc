@@ -138,7 +138,7 @@ pub(crate) static FTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::Atom
 /// One chronological trace of the *typed* draws, mirroring the agent's hook on
 /// `RandomSource`'s default methods, so the two sequences can be diffed directly
 /// (the raw `next(bits)` traces cannot be interleaved with each other).
-pub(crate) fn dtrace(kind: &str, value: f64) {
+pub(crate) fn dtrace(kind: impl std::fmt::Display, value: f64) {
     let n = DTRACE.load(std::sync::atomic::Ordering::Relaxed);
     if n < 0 {
         return;
@@ -298,7 +298,7 @@ impl Xor {
     pub(crate) fn next_bound(&mut self, bound: i32) -> i32 {
         let v = self.next_bound_raw(bound);
         xtrace("nextInt", bound as i64, v as i64);
-        dtrace(&format!("nextInt({bound})"), v as f64);
+        dtrace(format_args!("nextInt({bound})"), v as f64);
         v
     }
     fn next_bound_raw(&mut self, bound: i32) -> i32 {
@@ -448,7 +448,7 @@ pub(crate) fn java_hash(s: &str) -> i32 {
 pub(crate) static RNG_TRACE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-fn rtrace(name: &str, v: String) {
+fn rtrace(name: &str, v: impl std::fmt::Display) {
     if RNG_TRACE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
@@ -486,7 +486,7 @@ impl Lcg {
     }
     pub(crate) fn next_i32(&mut self) -> i32 {
         let v = self.nx(32) as u32 as i32;
-        rtrace("nextInt", v.to_string());
+        rtrace("nextInt", v);
         v
     }
     pub(crate) fn next_i64(&mut self) -> i64 {
@@ -499,13 +499,13 @@ impl Lcg {
         let hi = self.nx(32) as u32 as i32 as i64;
         let lo = self.nx(32) as u32 as i32 as i64;
         let v = (hi << 32).wrapping_add(lo);
-        rtrace("nextLong", v.to_string());
+        rtrace("nextLong", v);
         v
     }
     // java nextInt(bound): power-of-2 fast path + rejection otherwise
     pub(crate) fn next_bound(&mut self, bound: i32) -> i32 {
         let v = self.next_bound_raw(bound);
-        rtrace("nextInt", format!("{v} (bound {bound})"));
+        rtrace("nextInt", format_args!("{v} (bound {bound})"));
         v
     }
     fn next_bound_raw(&mut self, bound: i32) -> i32 {
@@ -525,18 +525,18 @@ impl Lcg {
     }
     pub(crate) fn next_f32(&mut self) -> f32 {
         let v = self.nx(24) as f32 * 5.960_464_5E-8;
-        rtrace("nextFloat", format!("{v}"));
+        rtrace("nextFloat", v);
         v
     }
     pub(crate) fn next_f64(&mut self) -> f64 {
         let v = ((self.nx(26) << 27).wrapping_add(self.nx(27)) as f64)
             * f64::from_bits(0x3CA0000000000000);
-        rtrace("nextDouble", format!("{v}"));
+        rtrace("nextDouble", v);
         v
     }
     pub(crate) fn next_bool(&mut self) -> bool {
         let v = self.nx(1) != 0;
-        rtrace("nextBoolean", v.to_string());
+        rtrace("nextBoolean", v);
         v
     }
     pub(crate) fn skip(&mut self, n: i32) {

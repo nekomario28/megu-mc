@@ -28,7 +28,7 @@ impl<'a> FC<'a> {
             wr: HashMap::new(),
             rc: HashMap::new(),
             cc: None,
-            prof: std::env::var("FEAT_PROFILE").is_ok(),
+            prof: crate::trace_env::env_flag!("FEAT_PROFILE"),
         }
     }
     pub(crate) fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {

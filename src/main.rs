@@ -27,6 +27,7 @@ mod generation_providers;
 mod ingress_guard;
 mod json;
 mod tick_stats;
+mod trace_env;
 mod tree;
 mod world_rng;
 mod worldgen;
