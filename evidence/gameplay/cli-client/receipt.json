@@ -7,7 +7,6 @@
     "assets/blocks_1211.json": "7d1d95c4e0255f9f269293e8077c7923c9ec0ff902a9a475ed131da8b26bc654",
     "assets/pblocks.json": "cc748df18e6fbc3f0016c4616cc869c168d77bf5d8ec283f6ef3b5f412613e28",
     "assets/properties.json": "da8e094913cb05348092b2fcd6b32462dd81b3602d6d89b146529f0ac655ab85",
-    "config_packets.bin": "9fb932886e1da038d42f20ec385ec04517c1c0286d71b9d9eea91e8f5decb49a",
     "src/cached_lookup.rs": "a97db58064eed4f959dc28e55d8988795b5df50d6d56a8d2fc801f69ead3d57c",
     "src/effect_tests.rs": "f011c7367431f2c8e2af8c6d30a52ad3d5733951e9b30b358558d6dda66e7d1f",
     "src/effects.rs": "8a0517ca58b12cf6d254eca5b377add82e693f1b9e34753658dd57ead450a37b",
@@ -61,5 +60,6 @@
     "full vanilla parity",
     "representative-load performance superiority",
     "final completion of remaining L/T/H/F/N/Q"
-  ]
+  ],
+  "generated_inputs_note": "config_packets.bin is generated locally (tools/vanilla_data/gen_vanilla_data.sh --accept-eula) and not committed; its sha256 pin was removed."
 }

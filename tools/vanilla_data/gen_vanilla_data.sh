@@ -4,8 +4,24 @@
 #   assets/block_states_1211.json               per-state light, flags and solid faces
 #   datapacks/vanilla/biome_climate_tree.json   the game's overworld and nether biome search trees
 #   tests/data/biome_probe_1211.tsv             points looked up through the game's own tree
+#   datapacks/vanilla/data/minecraft/           the game's own worldgen data (biome, configured_carver,
+#                                               configured_feature, density_function, noise,
+#                                               noise_settings, placed_feature) and tags/block,
+#                                               copied from the data generator's output
+#   datapacks/vanilla/pack.mcmeta
+#   config_packets.bin                          the Configuration-phase packets a real 1.21.1 server
+#                                               sends (registries, tags, ...), only with --accept-eula
 #
-#   tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar [--mappings DIR] [--fetch-fabric-mappings]
+#   tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar [--mappings DIR] \
+#       [--fetch-fabric-mappings] [--accept-eula]
+#
+# None of these outputs is committed (.gitignore): they are Mojang's data, produced on your machine
+# from your own jar, so a fresh clone runs this once before `cargo test` / `cargo run`.
+#
+# --accept-eula: config_packets.bin is captured by starting the server jar once in a scratch
+# directory (offline, loopback only, ~20 s), which needs Mojang's EULA (https://aka.ms/MinecraftEULA).
+# Passing the flag says you accept it. Without it everything else is still generated, but the server
+# cannot send clients their registries until you run this again with the flag.
 #
 # The jar is the official 1.21.1 *bundler* server.jar, sha1 below (the same build
 # tools/fixture_base.sh pins). It is not downloaded or modified here: you supply it.
@@ -29,11 +45,13 @@ YARN_SHA256=4ec570889585cb958b7d3c9dd94ce4064b16ab797dffec152bc8486c59a4010b
 JAR="${MC_SPINE_VANILLA_JAR:-}"
 MAPS="${MC_SPINE_FABRIC_MAPPINGS:-$HOME/.cache/mc-spine-vanilla-data}"
 FETCH=0
+EULA=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --jar) JAR="$2"; shift 2 ;;
     --mappings) MAPS="$2"; shift 2 ;;
     --fetch-fabric-mappings) FETCH=1; shift ;;
+    --accept-eula) EULA=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -65,3 +83,21 @@ CP="$(find "$WORK/run/libraries" -name '*.jar' | tr '\n' ' ')"
 java "$HERE/Extract.java" "$WORK/out" "$WORK/map/inter/mappings/mappings.tiny" "$WORK/map/yarn/mappings/mappings.tiny" \
   "$WORK/run/versions/1.21.1/server-1.21.1.jar" $CP
 python3 "$HERE/build_vanilla_data.py" "$WORK/out" "$WORK/run/gen/reports" "$ROOT" "$JAR_SHA1"
+
+# worldgen data and block tags, as the data generator wrote them (1.21.1 layout)
+GEN="$WORK/run/gen/data/minecraft"
+DP="$ROOT/datapacks/vanilla"
+rm -rf "$DP/data"
+mkdir -p "$DP/data/minecraft/worldgen" "$DP/data/minecraft/tags"
+for d in biome configured_carver configured_feature density_function noise noise_settings placed_feature; do
+  cp -r "$GEN/worldgen/$d" "$DP/data/minecraft/worldgen/$d"
+done
+cp -r "$GEN/tags/block" "$DP/data/minecraft/tags/block"
+printf '{"pack": {"pack_format": 48, "description": "vanilla worldgen data (generated from the 1.21.1 server jar)"}}\n' > "$DP/pack.mcmeta"
+echo "datapacks/vanilla: $(find "$DP/data" -name '*.json' | wc -l) json files"
+
+if [ "$EULA" = 1 ]; then
+  python3 "$HERE/capture_config_packets.py" "$JAR" "$ROOT/config_packets.bin" --accept-eula
+else
+  echo "config_packets.bin not generated (needs --accept-eula, see the header of this script)" >&2
+fi

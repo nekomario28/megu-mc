@@ -218,6 +218,15 @@ impl SC {
 // bound on the shared quart -> biome cache
 const BIO_CAP: usize = 1 << 18;
 
+/// The block name of a block state given either as `"minecraft:stone"` or as
+/// `{"Name": "minecraft:stone", "Properties": {...}}` (the 1.21.1 form).
+fn state_name(j: &J) -> &str {
+    match j {
+        J::Str(s) => s,
+        _ => j.get("Name").map(J::str).unwrap_or(""),
+    }
+}
+
 /// One router entry: either a resource name or an inline density-function object.
 fn router_df(g: &mut Gen, files: &HashMap<String, Vec<u8>>, j: &J) -> Option<usize> {
     let name = j.str();
@@ -499,10 +508,8 @@ impl Gen {
             g.height = n.get("height").map(J::num).unwrap_or(384.0) as i32;
         }
         let router = ns.get("noise_router");
-        let fd = router
-            .and_then(|r| r.get("final_density"))
-            .map(|j| j.str().to_string())?;
-        let idx = g.resolve_ref(&files, &fd)?;
+        // 1.21.1 router entries are either a function name or an inline function object
+        let idx = router_df(&mut g, &files, router.and_then(|r| r.get("final_density"))?)?;
         g.final_density = idx;
         // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
         // from three router functions; 1.21.2+ moved them into a material rule.
@@ -553,8 +560,7 @@ impl Gen {
             for (i, k) in keys.iter().enumerate() {
                 match router
                     .and_then(|r| r.get(k))
-                    .map(|j| j.str().to_string())
-                    .and_then(|n| g.resolve_ref(&files, &n))
+                    .and_then(|j| router_df(&mut g, &files, j))
                 {
                     Some(v) => ids[i] = v,
                     None => {
@@ -606,11 +612,11 @@ impl Gen {
             g.ore_split = Some(g.factory.of_str("minecraft:ore").splitter());
             g.def_st = ns
                 .get("default_block")
-                .and_then(|b| res(b.str()))
+                .and_then(|b| res(state_name(b)))
                 .unwrap_or(1);
             g.def_fl = ns
                 .get("default_fluid")
-                .and_then(|b| res(b.str()))
+                .and_then(|b| res(state_name(b)))
                 .unwrap_or(0);
             g.bands = create_bands(&mut g.factory.of_str("minecraft:clay_bands"), res);
             // The aquifer's `minEst` column comes from `aquifers.surface_level`
@@ -627,21 +633,73 @@ impl Gen {
                 .map(|v| v.str().to_string())
             {
                 g.prelim_df = g.resolve_ref(&files, &aq);
+            } else if let Some(init) = router
+                .and_then(|r| r.get("initial_density_without_jaggedness"))
+                .and_then(|j| router_df(&mut g, &files, j))
+            {
+                // 1.21.1 has no preliminary_surface_level function: the game scans
+                // `initial_density_without_jaggedness` down from the top of the world in
+                // steps of the cell height (8) for the first value above 0.390625.
+                let off = g.push_df(DF::C(-0.390625));
+                let density = g.push_df(DF::Add(init, off));
+                let upper = g.push_df(DF::C((g.min_y + g.height) as f64));
+                g.prelim_df = Some(g.push_df(DF::FindTopSurface {
+                    density,
+                    lower: g.min_y,
+                    upper,
+                    cell_h: 8,
+                }));
             }
-            if let Some(mr) = ns.get("material_rule").map(|v| v.str().to_string()) {
-                g.surface_rule = g.resolve_rule(&mr, &files, &rfiles, &cfiles, res);
+            // `material_rule` names a rule file; 1.21.1 puts the whole `surface_rule` inline
+            match (ns.get("material_rule"), ns.get("surface_rule")) {
+                (Some(J::Str(mr)), _) => {
+                    g.surface_rule = g.resolve_rule(mr, &files, &rfiles, &cfiles, res);
+                }
+                (_, Some(sr @ J::Obj(_))) => {
+                    g.surface_rule = g.rule_node(sr, &files, &rfiles, &cfiles, res);
+                }
+                _ => {}
             }
         }
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
         let noaq = std::env::var("MC_SPINE_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
-        if let Some(aq) = ns.get("aquifers").filter(|_| !noaq) {
-            let get = |g: &mut Gen, k: &str| aq.get(k).and_then(|j| g.node(j, &files));
+        // `aquifers` is a block of its own in the newer layout; 1.21.1 keeps the four noises in
+        // `noise_router` and hard-codes the "deep" exclusion (erosion < -0.225 and depth > 0.9)
+        let aq_src = ns.get("aquifers").or_else(|| router.filter(|_| !noaq));
+        if let Some(aq) = aq_src.filter(|_| !noaq) {
+            let get = |g: &mut Gen, k: &str| aq.get(k).and_then(|j| router_df(g, &files, j));
+            let excl = match aq.get("exclusion") {
+                Some(j) => router_df(&mut g, &files, j),
+                None => {
+                    let er = router.and_then(|r| r.get("erosion"));
+                    let de = router.and_then(|r| r.get("depth"));
+                    match (er, de) {
+                        (Some(er), Some(de)) => {
+                            let (er, de) =
+                                (router_df(&mut g, &files, er), router_df(&mut g, &files, de));
+                            match (er, de) {
+                                (Some(er), Some(de)) => {
+                                    let c1 = g.push_df(DF::C(-0.225));
+                                    let a = g.push_df(DF::Sub(c1, er));
+                                    let c2 = g.push_df(DF::C(0.9));
+                                    let b = g.push_df(DF::Sub(de, c2));
+                                    let z = g.push_df(DF::C(0.0));
+                                    let m = g.push_df(DF::Max(b, z));
+                                    Some(g.push_df(DF::Min(a, m)))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+            };
             let (b, f, s, l, e) = (
                 get(&mut g, "barrier"),
                 get(&mut g, "fluid_level_floodedness"),
                 get(&mut g, "fluid_level_spread"),
                 get(&mut g, "lava"),
-                get(&mut g, "exclusion"),
+                excl,
             );
             if let (Some(barrier), Some(flood), Some(spread), Some(lava), Some(excl)) =
                 (b, f, s, l, e)
@@ -724,7 +782,7 @@ impl Gen {
                 self.cond_node(j.get("if_true")?, cf)?,
                 self.rule_node(j.get("then_run")?, files, rf, cf, res)?,
             ),
-            "block" => Rule::Block(res(j.get("result_state")?.str()).unwrap_or(self.def_st)),
+            "block" => Rule::Block(res(state_name(j.get("result_state")?)).unwrap_or(self.def_st)),
             "bandlands" => Rule::Bandlands,
             "ore_vein" => {
                 // 1.21.1 has no `material_rule`; when the 1.21.1 sampler is
@@ -881,6 +939,11 @@ impl Gen {
         })
     }
 
+    fn push_df(&mut self, d: DF) -> usize {
+        self.dfs.push(d);
+        self.dfs.len() - 1
+    }
+
     fn resolve_ref(&mut self, files: &HashMap<String, Vec<u8>>, name: &str) -> Option<usize> {
         if let Some(&i) = self.names.get(name) {
             return Some(i);
@@ -922,15 +985,26 @@ impl Gen {
         );
         let b = std::fs::read(&path).ok()?;
         let j = jparse(&b)?;
-        let base_octave = j.get("base_octave")?.num() as i32;
-        let base_amplitude = j.get("base_amplitude")?.num();
-        // absent modifiers = single implicit octave (vanilla amplitudes [1.0])
-        let mods: Vec<f64> = match j.get("amplitude_modifiers") {
-            Some(J::Arr(a)) => a.iter().map(J::num).collect(),
-            _ => vec![1.0; j.get("octave_count").map(J::num).unwrap_or(1.0).max(1.0) as usize],
-        };
         let mut rng = self.factory.of_str(name);
-        let n = normal_new(&mut rng, base_octave, base_amplitude, &mods);
+        let n = if let Some(first) = j.get("firstOctave") {
+            // 1.21.1: `firstOctave` and the amplitude list, as the game reads them
+            let amps: Vec<f64> = j
+                .get("amplitudes")?
+                .into_arr()?
+                .iter()
+                .map(J::num)
+                .collect();
+            normal_from_amplitudes(&mut rng, first.num() as i32, &amps)
+        } else {
+            let base_octave = j.get("base_octave")?.num() as i32;
+            let base_amplitude = j.get("base_amplitude")?.num();
+            // absent modifiers = single implicit octave (vanilla amplitudes [1.0])
+            let mods: Vec<f64> = match j.get("amplitude_modifiers") {
+                Some(J::Arr(a)) => a.iter().map(J::num).collect(),
+                _ => vec![1.0; j.get("octave_count").map(J::num).unwrap_or(1.0).max(1.0) as usize],
+            };
+            normal_new(&mut rng, base_octave, base_amplitude, &mods)
+        };
         self.noises.push(n);
         self.noise_names
             .insert(name.to_string(), self.noises.len() - 1);
@@ -956,8 +1030,59 @@ impl Gen {
     fn parse_df(&mut self, j: &J, files: &HashMap<String, Vec<u8>>) -> Option<DF> {
         let ty = j.get("type")?.str().strip_prefix("minecraft:")?.to_string();
         let n = |k: &str| j.get(k).map(J::num).unwrap_or(0.0);
-        let sub = |g: &mut Gen, k: &str| -> Option<usize> { g.node(j.get(k)?, files) };
+        // 1.21.1 names the operands of binary and unary functions `argument1`/`argument2`
+        // and `argument`; the newer layout calls them `left`/`right` and `input`.
+        let get = |k: &str| {
+            j.get(k).or_else(|| match k {
+                "left" => j.get("argument1"),
+                "right" => j.get("argument2"),
+                "input" => j.get("argument"),
+                _ => None,
+            })
+        };
+        let sub = |g: &mut Gen, k: &str| -> Option<usize> { g.node(get(k)?, files) };
         Some(match ty.as_str() {
+            "constant" => DF::C(n("argument")),
+            // 1.21.1 `y_clamped_gradient`
+            "y_clamped_gradient" => DF::Grad {
+                fc: n("from_y"),
+                fv: n("from_value"),
+                tc: n("to_y"),
+                tv: n("to_value"),
+            },
+            "weird_scaled_sampler" => {
+                // value = scale * |noise(p / scale)|, with the scale picked from the input by
+                // the rarity mapper. Lowered to |interval_select| over one scaled noise per
+                // scale, which is what the evaluator already runs.
+                let (th, scales): (&[f64], &[f64]) = match j.get("rarity_value_mapper").map(J::str)
+                {
+                    Some("type_1") => (&[-0.5, 0.0, 0.5], &[0.75, 1.0, 1.5, 2.0]),
+                    Some("type_2") => (&[-0.75, -0.5, 0.5, 0.75], &[0.5, 0.75, 1.0, 2.0, 3.0]),
+                    _ => return None,
+                };
+                let input = sub(self, "input")?;
+                let ni = self.noise_id(j.get("noise")?.str())?;
+                let zero = self.push_df(DF::C(0.0));
+                let mut fns = vec![];
+                for &d in scales {
+                    let nz = self.push_df(DF::Noise {
+                        ni,
+                        sx: zero,
+                        sy: zero,
+                        sz: zero,
+                        xzs: 1.0 / d,
+                        ys: 1.0 / d,
+                    });
+                    let c = self.push_df(DF::C(d));
+                    fns.push(self.push_df(DF::Mul(nz, c)));
+                }
+                let sel = self.push_df(DF::IntervalSelect {
+                    i: input,
+                    th: th.to_vec(),
+                    fns,
+                });
+                DF::Abs(sel)
+            }
             "add" => DF::Add(sub(self, "left")?, sub(self, "right")?),
             "sub" => DF::Sub(sub(self, "left")?, sub(self, "right")?),
             "mul" => DF::Mul(sub(self, "left")?, sub(self, "right")?),
@@ -991,7 +1116,7 @@ impl Gen {
             "cache" | "flat_cache" | "cache_2d" | "cache_once" | "cache_all_in_cell" => {
                 DF::Cache(sub(self, "input")?)
             }
-            "noise" => {
+            "noise" | "shifted_noise" => {
                 let zero = {
                     self.dfs.push(DF::C(0.0));
                     self.dfs.len() - 1
@@ -1014,8 +1139,12 @@ impl Gen {
                     ys: n("y_scale"),
                 }
             }
-            "shift_a" => DF::ShiftA(self.noise_id(j.get("noise")?.str())?),
-            "shift_b" => DF::ShiftB(self.noise_id(j.get("noise")?.str())?),
+            "shift_a" => {
+                DF::ShiftA(self.noise_id(j.get("noise").or_else(|| j.get("argument"))?.str())?)
+            }
+            "shift_b" => {
+                DF::ShiftB(self.noise_id(j.get("noise").or_else(|| j.get("argument"))?.str())?)
+            }
             "range_choice" => DF::RangeChoice {
                 i: sub(self, "input")?,
                 mi: n("min_inclusive"),

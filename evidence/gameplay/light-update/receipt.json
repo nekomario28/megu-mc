@@ -11,10 +11,10 @@
   },
   "contract": {
     "packet_id": "0x2a",
-    "source": "evidence/gameplay/light-update/ClientboundLightUpdatePacket.javap.txt",
-    "data": "evidence/gameplay/light-update/ClientboundLightUpdatePacketData.javap.txt",
-    "client_apply": "evidence/gameplay/light-update/ClientPacketListener-applyLightData.javap.txt",
-    "mappings": "evidence/gameplay/light-update/mappings.txt",
+    "source": "tools/bytecode_probe.sh net.minecraft.network.protocol.game.ClientboundLightUpdatePacket (generated locally, not committed)",
+    "data": "tools/bytecode_probe.sh net.minecraft.network.protocol.game.ClientboundLightUpdatePacketData (generated locally, not committed)",
+    "client_apply": "tools/bytecode_probe.sh net.minecraft.client.multiplayer.ClientPacketListener applyLightData (generated locally, not committed)",
+    "mappings": "Mojang's official mappings for 1.21.1, which tools/bytecode_probe.sh reads from your own copy (not committed)",
     "section_basis": "adk builds section getMinLightSection()+i, matching LIGHT_MIN_Y/16+i",
     "unmasked_unchanged": "ClientPacketListener.applyLightData only writes a section when its mask or empty mask bit is set"
   },
@@ -41,11 +41,7 @@
     "tests/protocol767_test.py": "aa32f244d8ad89880f6e1972a1e54c8a26a05c29a639b80262bd723d3f386ce1",
     "tools/mutation_check.sh": "5361b1e122b19fa472f0a954cba5099aecb041788604bded0e662795d4b7e56f",
     "tools/light_update_probe.py": "1057744c09a14b67f504067410b41b3fad6acf0a2b48f9bd572ee8c14f3c429a",
-    "evidence/gameplay/light-update/README.md": "1231bf3d31995a7ee5adb2e121c315117a20f69c12349808c1867aa0c1985fac",
-    "evidence/gameplay/light-update/ClientboundLightUpdatePacket.javap.txt": "23f5f310df96dc1d1edb2763d30d85c7537955c8a8d4671eba779ba1c00279aa",
-    "evidence/gameplay/light-update/ClientboundLightUpdatePacketData.javap.txt": "ddbd7312bbd62e2c3ef8cf02bbdb7e83bce5dc9deaa57c411ae2da9bed71877c",
-    "evidence/gameplay/light-update/ClientPacketListener-applyLightData.javap.txt": "9acab4eeafd89edbb7ea67d9134457861d0c04d8def17076fe10b011981f2d28",
-    "evidence/gameplay/light-update/mappings.txt": "52277a2edf6f08f02386d9739c8624d6aa7364119ba325d08ca65132467a74d9"
+    "evidence/gameplay/light-update/README.md": "1231bf3d31995a7ee5adb2e121c315117a20f69c12349808c1867aa0c1985fac"
   },
   "limits": [
     "The client probe is the repository's CLI decoder, not the vanilla client renderer; on-screen light parity remains for the excluded GUI path.",
@@ -71,5 +67,6 @@
   "integration_review_fixes": [
     "Skip a cached generated emitter whose cell now has an overlay entry (Codex integration review P2).",
     "Record the underlying generated emitter even when an overlay edit covers it, so removing the edit re-exposes it (Codex integration review P2)."
-  ]
+  ],
+  "generated_inputs_note": "Generated locally from the user's own 1.21.1 jar and not committed: config_packets.bin by tools/vanilla_data/gen_vanilla_data.sh --accept-eula; javap output by tools/bytecode_probe.sh. Their former sha256 pins were removed with the files."
 }

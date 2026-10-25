@@ -11976,7 +11976,13 @@ fn item_to_state(item: i64) -> Option<u32> {
 fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
     let data = match std::fs::read("config_packets.bin") {
         Ok(d) => d,
-        Err(_) => return vec![],
+        Err(_) => {
+            eprintln!(
+                "[spine] config_packets.bin is missing: clients get no registries. \
+                 Generate it with tools/vanilla_data/gen_vanilla_data.sh (see README)"
+            );
+            return vec![];
+        }
     };
     let mut out = Vec::new();
     let mut sl = &data[..];

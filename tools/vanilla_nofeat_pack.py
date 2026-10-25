@@ -5,9 +5,8 @@
 
 `<server.jar>` may be either the self-extracting bundle (the one with
 `libraries/` next to it) or the nested `server-1.21.1.jar`. The biome files are
-read from the jar itself, never from `datapacks/vanilla`: the repository's copy
-is not 1.21.1 data (it carries 1.21.2+ biome fields and newer feature lists),
-which would make a "terrain only" comparison compare two different games.
+read from the jar itself, not from `datapacks/vanilla`, so the comparison pack is
+self-contained and does not depend on whether that generated directory is current.
 
 The pack overrides every biome with `"features": []` and, unless
 `--keep-carvers` is passed, `"carvers": {}`. With `--keep-carvers` the world
