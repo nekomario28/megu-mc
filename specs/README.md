@@ -18,14 +18,15 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 ## 状態
 
 - **全体目標は未達。** M2（同じ入力で遊べる範囲のvanilla一致）とM3（同じ仕事での軽量性）は達成していません。完了条件は[PLAN](PLAN.md)を参照。
-- **worldgenは進行中。** terrain-only比較と cave / cave-extra / canyon carver は限定した2×2固定具で0セル差を確認しています。これは全seed・全chunk・featureを含む一致を示しません。
+- **worldgenは進行中。** 過去のterrain-only比較と cave / cave-extra / canyon carver は限定した固定具で一致しましたが、自前データ移行後の受け入れは未完です。旧固定具の緑を全seed・全chunk・featureを含む現在の一致へ広げません。
 - **1.21.1 自前データへの移行は WIP。** 気候 router の inline 関数を読むようにし、built-in biome tree を同じ固定 jar から再生成しました。inline surface rule・ブロック状態・温度条件まで接続しましたが、surface 全評価・aquifer などは未完です。[surface の部分検証](../evidence/foundation/surface-loader/README.md)を参照。旧統合線の緑を移行ブランチに引き継ぎません。[Horizon の再利用判断と検証範囲](../evidence/foundation/horizon-reuse/README.md)を参照。
 - **Horizon の再利用を gameplay にも拡大。** 通常スロットとチェスト転送から、1.21.1 実クラス参照と本番 wire 検査を対にして進めています。[移植順序](horizon-gameplay/README.md)、[チェストの検証範囲](../evidence/gameplay/containers/README.md)、[アイテム回収の部分実装](../evidence/gameplay/inventory-pickup/README.md)を参照。エンティティ全般やチェストの開閉・同期まで移植済みという意味ではありません。
 - **Valence は部品単位で評価。** 旧版 framework や registry は導入せず、entity角度・section palette・NBT文字列書き出し・有限AABB判定を既存 owner で修復しています。[再利用判断](../evidence/foundation/valence-reuse/README.md)、[角度](../evidence/gameplay/entity-angles/README.md)、[binary/geometryの検証範囲](../evidence/foundation/valence-primitives/README.md)、[分割した契約](valence-primitives/README.md)を参照。entity全体・任意NBT・worldのparityではありません。
 - **feature層は未確定。** 以前の差分値の一部は、生成stage・参照chunkの完成度・skip数が揃っていないため、現行feature残差として扱いません。保存world全体の差をfeature差と呼ばないこと。
-- **kelpは実装済みだがvanilla parityは未検証。** 合成回帰テストはありますが、既存のvanilla fixtureでは両側ともkelpが0個で、挙動を通った証拠になりません。正の参照セルを持つ完全生成chunkが必要です。
+- **kelpは実装済みだが移行後のvanilla parityは未確定。** 正の参照セルを持つ固定具とdraw列・列単位の比較は[過去の記録](../evidence/gameplay/carvers/README.md)にあります。古い一時worldを前提にせず、自前データの意味論を修正した後、同じseed・座標・stageで参照を再構成して比較します。
 - **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。
 - **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
+- **現在の移行ブランチは全体テストが赤です。** [直近の実行結果と正確な失敗名比較](../evidence/foundation/valence-primitives/README.md)を参照。mutex poisonの連鎖と一次失敗を区別し、部品の実クラス一致や警告0を全体合格の代用にしません。
 - **コード検証（旧統合線の履歴）:** `tests/verify.sh` 通過時の記録は159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit。これは現在のデータ移行ブランチの合格結果ではありません。現在の実行結果は上記の移行証拠を参照。
 - **clippy削減の履歴:** 457 → 83 → **0**（`--all-targets`・release、当時テスト176本green）。現在の移行ブランチでも警告0は確認しましたが、全テストgreenではありません。
   前半は機械的に等価な変換（`&*`/`&mut *` の冗長、`x % n == 0` → `is_multiple_of`、不要な `as`、
@@ -44,7 +45,7 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 ## 保留・外部依存（値ではなく事実だけ）
 
-- **hosted CIはジョブが起動しません。** GitHub の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。**コード失敗ではない**ので、緑の判定は当面ローカルの `tests/verify.sh` が持ちます。復旧後に同一SHAで再取得します。
+- **hosted CIの過去の未開始はコード失敗とは別です。** 当時の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。現在の作業ブランチへのpush自体はworkflowのpush対象ではなく、今回hosted CIは実行していません。必須ローカルゲートにも未実行の範囲があり、CI・ローカルとも未実行を緑にしません。
 - **比較の前提（固定具の基点）は再構成できます:** `tools/fixture_base.sh` が `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を組みます。jar は sha1 で固定（`59353fb4…`、既存の1.21.1導入ディレクトリを donor に使う）。基点が無いまま固定具を回すと比較は空振りします。
 - **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MC_SPINE_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
 - **被ダメ無敵は vanilla の `invulnerableTime` に載せ替えました**（slice 25、2026-10-24）。環境ダメージが timer を立てる点までは実装、環境ダメージ自身の差分適用は簡略（同 slice に明記）。
@@ -56,17 +57,6 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 ## 次の判別作業
 
-**正の kelp 参照を含む fixture はできました**（`tools/kelp_fixture.sh`。seed 0 の lukewarm ocean を spawn から離れた場所で forceload し、正セル数をゲートに要求）。初回測定は `kelp` 494/484（shared 398）、`kelp_plant` 2761/2689（shared 2292）で、差は **同じ植物の高さ・head の位置**に集中しています（[carvers §62](../evidence/gameplay/carvers/README.md)）。
+次に実行する最小sliceと順序・出口条件は[ロードマップ](ROADMAP.md)だけに置きます。過去の途中診断を、現在の「次の作業」として複製しません。
 
-**draw 列は一致しました**（chunk (81,0) の `kelp_warm`、先頭20ドローが port/参照で完全一致。port は `FSEED_ARM=81,0,91,9`、参照は `-Dfseedarm=91,9`。`gi` は両側とも全体通し番号で 91）。
-
-**列ごとの帰属まで進みました**（[carvers §62.1](../evidence/gameplay/carvers/README.md)）: 参照484列のうち **390 は茎まで一致**、**31 は「vanilla が同 step の seagrass の書き込みを見て棄却した列」**、**53 は「両側の `getHeight(OCEAN_FLOOR)` が違う列」**。`KelpFeature.place` の逆コンパイルで**実装差1件**（位置を毎回上げる）も見つけて修正しました（§62.2、負の対照つきテストで経路の実行を証明）。
-
-次は 53 列の y の差（`hm_oc` の読み vs vanilla の `getHeight`）を同じ列で両側ダンプして比べることです。装飾順を固定具に寄せる実験は**負の結果**でした（§62.3）。
-
-**型カバレッジ**は計測できるようにしました（`tools/feature_type_coverage.py`）: pack の 60 型中 26 型に `p_cf` の腕が無く、**overworld の biome から到達されるのは 6 型**（`fossil` `iceberg` `sculk_patch` `dripstone_cluster` `large_dripstone` `speleothem_cluster`）。
-- **実装した型**: `geode`（残差はノイズの場）、`sea_pickle`、`ice_spike`、`root_system`（規則と入口まで）、`desert_well`（形と2ドローまで。loot table は port の chest と同じく未実装＝§69 に明記）、`iceberg`（draw 順・範囲・海面跨ぎまで。セル単位の一致は未測定＝§70 に明記）、`dripstone_cluster`（Column の両端・tip の向きと層順・プールの降下まで。セル単位の一致は未測定＝§71 に明記）、`large_dripstone`（2つの spike の根と taper・風の変位式まで。死んだ `placeColumn` は記録のみ＝§72 に明記）。未実装の到達型は 11 → **3**（ただし `speleothem_cluster` は 1.21.1 の feature ではなく、同梱 pack が新方言へ変換された際に入ってきたもの。§73 で計測: 真の未実装は `fossil` `sculk_patch` の2つ、かつ同梱データ自体が参照ビルドのものではない）。
-- `geode`（**56 biome** から到達、最大の欠落）は**実装しました**（2026-10-24、`Cf::Geode`）。1.21.1 の `GeodeFeature`（`eck`）を逆コンパイルして層の閾値・点ごとのノイズ項・クラック・結晶の向きまで移植し、`tools/geode_fixture.sh`（seed 12 / chunk (0,0) に geode が出ることを port 側の trace で実測して選んだ固定具）で vanilla とセル単位に比較しています。**セル数はほぼ一致**（amethyst 162 vs 157、calcite 202 vs 201、smooth_basalt 237 vs 256）ですが**形はまだ一致しません**（3層合計 IoU 0.31、最良の平行移動でも 0.39）。残差はノイズの場に帰属させ、数値・固定具・次に測ることを evidence に残しました （[feature-parity](../evidence/gameplay/feature-parity/README.md) §63）。
-  両側0個、全chunk skip、別stageの差分は成功扱いにしません。
-
-以後の順序は[ロードマップ](ROADMAP.md)に従います。比較規律は[DESIGN.mdの約束](../DESIGN.md#比較の約束)を参照してください。
+kelpの列・draw列・heightmapの診断履歴は[carvers](../evidence/gameplay/carvers/README.md)、個別featureの実装と残差は[feature-parity](../evidence/gameplay/feature-parity/README.md)、同梱packと固定jarの方言・出自の差は[自前データ監査](../evidence/foundation/audit-snapshots/README.md)を参照してください。いずれも自前データ移行後の全体受け入れを代替しません。比較規律は[DESIGN.mdの約束](../DESIGN.md#比較の約束)を正本とします。

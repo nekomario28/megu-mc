@@ -1,47 +1,68 @@
 # ロードマップ
 
-現在の進捗は[状態ページ](README.md)、目標と合格条件は[PLAN](PLAN.md)を正本とします。この文書は**実装の順序と出口条件だけ**を定めます。測定履歴・細かな調査ログは証拠ページに残します。
+現在の状態は[README](README.md)、目標と合格条件は[PLAN](PLAN.md)、測定値と実行条件は各 `evidence/` を正本とします。この文書は**次に進む順序・依存関係・出口条件**を定めます。部品の実装、実クラスとの部分一致、全体合格を混同しません。
 
-## 順序
+## いまの判断 — 広げる前に収束する
 
-### R1 — worldgenのvanilla parity
+Horizon / Valence から使える部品は既存 owner に取り込みましたが、現在の最初の障害は、固定1.21.1データの意味論が未完で、移行後の全体テストが赤いことです。[直近の実行結果と失敗名比較](../evidence/foundation/valence-primitives/README.md)を基準に、まずR0へ収束します。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
-1. kelpが実際に出るvanilla fixtureを作り、placed featureの選択、参照chunkの完成、正の対象セル数を検査する。
-2. kelpのfeature実行、乱数消費、セル集合を比較し、合成テストだけでなくvanilla入力での結果を確かめる。
-3. 他のconfigured/placed featureも、データ型・実装型の対応表と正のcoverageを作ってから個別に照合する。未対応型を黙ってno-opにしない。
-4. 残差はgeneration stageごとに分類する。隣接chunkの書込みとdecorating orderを含む場合、chunk単位の独立実行を正しいと仮定しない。
+**次の最小slice:** `weird_scaled_sampler` を、固定jarの実クラスで検査できる単位に切る。rarity mapperと基礎ノイズの入力・出力を照合し、本番density-function評価へ接続する。正の値を持つ入力と意図的な故障で、従来のゼロ代替を実際に置換したと証明する。全chunkを先に生成し直すことや、別のdonor機能の追加は次の作業にしません。
 
-**出口:** 対象範囲を明示したfixtureで、全参照chunkが完全生成され、対象featureが実行されたことを確認し、差分集合・除外・skipを説明できる。0セルの両側一致や全skipは合格にしない。構造物対応は別の範囲として残す。
+## R0 — 自前データの意味論と回帰の基準を閉じる
 
-### R2 — CLIで確認できるゲーム挙動の拡張
+1. 全体テストの一次失敗とmutex poisonの連鎖を分ける。一次失敗は必要なら新しいプロセスで再現し、入力・loader・評価器・古いcaptureのどこに属するかを特定する。poisonを握り潰して緑にしない。
+2. `weird_scaled_sampler` を含む未評価density function、aquifer routerと旧方言にしか無いexclusionの扱い、biomeのcarver/spawner方言を、固定1.21.1の実際の意味で評価する。各差分を独立した小さい実クラス対照と本番経路のゲートにする。
+3. surfaceはsourceのdecodeや温度条件だけで閉じず、実際のbiome選択・列の走査状態・surface contextを含む適用結果を検査する。未知ノード・解決できない参照・落とした入力名は明示し、成功したように読み替えない。
 
-worldgenの範囲を固定した後、プレイヤー操作・状態更新・保存/再読込を、同一入力のvanilla対照で段階的に広げる。CLIのassertと独立した再取得を使い、対応していない機能を黙って省略しない。
+**出口:** 比較対象のrouter/biome/surface経路に未説明のゼロ代替・参照落ちが残らず、未解決・未対応の一覧と本番での到達性を説明できる。意味を変えた経路には実クラス対照と故障を検出するテストがある。全体の赤は一次原因へ帰属させ、原因未確認のcapture更新で消さない。個別の修正ごとに広い回帰を確認し、全体合格は必須テストが通ってから判定する。
 
-**出口:** PLANのM2範囲について、セッション完走と観測結果の一致を機能別の証拠で示す。画面操作は要求せず、CLI経路を使う。
+根拠: [自前データ監査](../evidence/foundation/audit-snapshots/README.md)、[surfaceの検証範囲](../evidence/foundation/surface-loader/README.md)。
 
-### R3 — 同じ仕事での軽量性
+## R1 — 同じ生成stageでworldgenを再受け入れする
 
-M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測定でCPU、メモリ、tick遅延を比較する。生成burstと定常区間を混同せず、最適化は出力不変を確認して評価する。
+1. loader/evaluatorの修正後、元の座標・seedのwhole-chunk、heightmap、ore、kelp、geodeを再比較する。古い一時worldが無ければ固定jarから再構成し、参照chunkの完成と正のcoverageを先に検査する。
+2. forestのstone/deepslate残差を、密度・aquifer・surface・carver・feature・生成後tickに分ける。surfaceを読めるようにしたことだけで、既存の大きな残差が消えたとは扱わない。
+3. biome lookup、隣接chunkの書込み、decorating order、乱数消費を、同じstageの参照と照合する。kelpの列やgeodeのノイズなど、残差を最小の中間値まで戻して検査する。
+4. 未検証featureは到達する正の固定具を用意してから広げる。未実装のfossilにはtemplate/processor、sculk patchにはspreader/runtimeの契約が先に必要。構造物やjigsawまで対応したと一括で主張しない。
 
-**出口:** PLANのM3条件を代表負荷で満たし、再現手順・計測ノイズ・機能範囲を証拠に記録する。RSSだけの改善や、機能不足によるCPU削減をM3達成としない。
+**出口:** 宣言した範囲で、全参照chunkの完成・対象経路の実行・セル/状態/heightmapの比較が成立し、差分集合・除外・skipを説明できる。両側ゼロ、全skip、保存worldのruntime差をfeature差と呼ぶ比較は合格にしない。未実装範囲は別に残す。
 
-### R4 — 統合・リリース判定
+根拠: [比較の約束](../DESIGN.md#比較の約束)、[worldgenの比較記録](../evidence/gameplay/carvers/README.md)、[featureの部分検証](../evidence/gameplay/feature-parity/README.md)。
 
-統合線は `main` に入っている。残るのは判定であって移植ではない: 対象revisionで
-必須ローカルゲートと独立レビューを再実行し、CIが開始されない場合はコード失敗と
-区別して記録する（未実行のゲートを成功扱いにしない）。
+## R2 — 部品の一致から、操作とlifecycleの一致へ広げる
 
-**出口:** PLANの全条件、ライセンス境界、既知の制約を確認し、未解決事項を明示したうえで公開可否を判断する。
+R0/R1の比較基準を主線とし、独立したgameplay修正は小さいsliceとして進められます。ただし部分的な緑でworldgenの受け入れを代替しません。
 
-### R5 — Mod互換の拡張
+- **inventory / chest:** slot挿入・転送から、実際の回収接触・delay/owner・actorとの状態共有、viewers・window/state ID・閉鎖/無効化・二重chestの配置・保存/再読込へ進む。特殊slotの制約は通常slotに混ぜない。
+- **entity / collision:** packet角度と有限AABB clipの先に、実寸法・pose・最寄りhit・ブロック/voxelによる遮蔽・support/fluid・属性・追跡lifecycleを置く。現在の近似boxと終点だけのblock判定は完了条件にしない。
+- **NBT / structures:** 必要な消費者を先に特定し、読み書き・名前/値・孤立surrogate・componentの長さ境界を往復検査する。modified UTF-8の書き出しやopaque lore保持だけで、任意NBTやtemplateを読めるとは扱わない。
 
-現在の契約を保ったまま、要求されたModを一つずつ選び、ロード・名前変換・イベント・状態変更の実経路を検証する。汎用互換を先に主張しない。
+**出口:** PLANのM2範囲を同じ入力のvanilla対照で操作し、状態更新・実通信・別接続からの再取得・保存/再読込を機能別に検査できる。helperだけの一致ではなく、本番の操作経路を通す。画面操作は要求せずCLIを使う。
 
-**出口:** 対象Mod・版・API範囲・実行テストを特定し、その組み合わせに限った互換性を証明する。
+既存の境界: [Horizonのgameplay計画](horizon-gameplay/README.md)、[Valence由来のbinary/geometry契約](valence-primitives/README.md)。donorの版・データは仕様の正本にせず、固定1.21.1の挙動を優先します。
+
+## R3 — 同じ仕事での軽量性
+
+M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測定でCPU、メモリ、tick遅延を比較します。生成burstと定常区間を分け、最適化した経路の実行と出力不変を先に確認します。
+
+**出口:** PLANのM3条件を代表負荷で満たし、再現手順・ノイズ・未対応機能を記録する。機能不足で仕事量が減った結果や、地形が異なる条件の旧測定を性能改善へ読み替えない。
+
+## R4 — 対象revisionの統合・リリース判定
+
+過去の統合線の検証を、今回の移行ブランチへ引き継ぎません。作業ブランチへのpushは保存・共有であり、mainへの統合や合格とは別です。
+
+**出口:** PLANの合格条件と公開対象の機能範囲を満たしたうえで、統合候補そのものに対して、全体テスト、必要な並列回帰・wire・adapter・層/負債ゲート、変異テスト、独立レビューを完了し、ライセンスと既知の制約を確認する。未実行・未開始のCIを緑とせず、ローカル実行とhosted CIを区別する。main更新やreleaseは、その判定とユーザーの指示を経て行う。
+
+## R5 — 要求されたMod単位の互換拡張
+
+現在の契約を保ち、対象Mod・版・API範囲を固定して、ロード・名前変換・イベント・状態変更の実経路を検査します。基盤全体の作り直しや汎用互換の宣言を先行させません。
+
+**出口:** 対象の組み合わせで実行テストが成立し、その組み合わせに限った互換性を証明できる。
 
 ## 横断規律
 
-- 証拠の強さを下げず、比較するstage・入力・生成完了状態を揃える。
-- 変化しない数値を根拠にする前に、新経路の実行を確認する。
-- 実装した機能、通過したテスト、vanilla parity、性能改善を別々に報告する。
-- 詳細な測定・失敗・棄却理由は対応する `evidence/` に置き、ロードマップへ複製しない。
+- まず小さい実クラス対照、本番経路、故障を検出するゲートを作り、必要な節目で広い回帰へ戻る。原因の変わらない重い比較を繰り返さない。
+- 比較前に、何が実行され、どのstageにあり、何がskipされたかを確かめる。値が変わらないだけで負の結果としない。
+- source・固定具・実測binary・参照jarを結び付け、試験前後の正常系と変異後の復元を確認する。
+- 古いcaptureの再記録を修正の代用にせず、意味の変化を説明してから更新する。
+- 実装、部分parity、全体合格、性能改善、push、統合を別々に報告する。数値と履歴は証拠ページへ集約する。
