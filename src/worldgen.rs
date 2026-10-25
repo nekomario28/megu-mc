@@ -2929,13 +2929,19 @@ impl Gen {
         // Pressure term: the distance is scaled by a divisor that depends on the
         // side of the mid-level the cell sits on and whether it is inside the
         // half-gap between the two levels.
-        let (numerator, divisor) = if sc > 0.0 {
-            (o, if o > 0.0 { 1.5 } else { 2.5 })
+        #[inline(always)]
+        fn scaled(v: f64, inside: f64, outside: f64) -> f64 {
+            if v > 0.0 {
+                v / inside
+            } else {
+                v / outside
+            }
+        }
+        let q = if sc > 0.0 {
+            scaled(o, 1.5, 2.5)
         } else {
-            let shifted = 3.0 + o;
-            (shifted, if shifted > 0.0 { 3.0 } else { 10.0 })
+            scaled(3.0 + o, 3.0, 10.0)
         };
-        let q = numerator / divisor;
         let r = if (-2.0..=2.0).contains(&q) {
             match *barrier {
                 Some(v) => v,
