@@ -267,7 +267,10 @@ impl Xor {
         let widen = |draw: i32| u64::from(draw as u32).wrapping_mul(span);
         let mut product = widen(self.next_i32());
         if (product & 0xFFFF_FFFF) < span {
-            let threshold = (bound.wrapping_neg() as u64) % span;
+            // `Integer.remainderUnsigned(~bound + 1, bound)`: the remainder is taken on the
+            // 32-bit unsigned values. Widening `-bound` to 64 bits first (sign extension)
+            // gives a different remainder for every bound that is not a power of two.
+            let threshold = u64::from((bound.wrapping_neg() as u32) % (bound as u32));
             while (product & 0xFFFF_FFFF) < threshold {
                 product = widen(self.next_i32());
             }
@@ -1334,5 +1337,81 @@ mod deco_seed_tests {
         };
         assert_eq!(f(-16, 0), 6716476193438028432);
         assert_eq!(f(-32, 16), -4660739044861673552);
+    }
+}
+
+/// `nextInt(bound)` against the game's own random classes.
+/// `tests/data/random_next_int_1211.tsv` is written by `tools/vanilla_data/gen_vanilla_data.sh`
+/// from the running 1.21.1 server jar: for each (class, seed, bound) it holds a hash of the
+/// first 256 `nextInt(bound)` results from one fresh generator, and that generator's next
+/// `nextLong()`. The bounds include large non-powers of two, where the modern generator's
+/// rejection path (`n < bound`, redraw while `n < (-bound) mod bound` in 32-bit unsigned
+/// arithmetic) is taken often.
+#[cfg(test)]
+mod next_int_vs_vanilla_tests {
+    use super::*;
+
+    fn fnv_of(results: impl Iterator<Item = i32>) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for x in results {
+            for by in 0..4 {
+                h ^= u64::from((x as u32 >> (8 * by)) & 0xff);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn next_int_streams_match_the_game_for_every_class_seed_and_bound() {
+        let data = std::fs::read_to_string("tests/data/random_next_int_1211.tsv")
+            .expect("vanilla nextInt vectors");
+        let (mut n, mut wrong) = (0usize, Vec::new());
+        let mut per_kind = std::collections::BTreeMap::new();
+        for line in data.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 6, "bad line {line:?}");
+            let kind = f[0];
+            let seed: i64 = f[1].parse().unwrap();
+            let bound: i32 = f[2].parse().unwrap();
+            let draws: usize = f[3].parse().unwrap();
+            let want_hash: u64 = f[4].parse().unwrap();
+            let want_after: i64 = f[5].parse().unwrap();
+            let (hash, after) = match kind {
+                "xoroshiro" => {
+                    let mut r = Xor::seed(seed as u64);
+                    let h = fnv_of((0..draws).map(|_| r.next_bound(bound)));
+                    (h, r.next_long() as i64)
+                }
+                "worldgen" => {
+                    let mut r = Xor::seed_worldgen(seed as u64);
+                    let h = fnv_of((0..draws).map(|_| r.next_bound(bound)));
+                    (h, r.next_i64_legacy())
+                }
+                "checked" => {
+                    let mut r = Lcg::new(seed as u64);
+                    let h = fnv_of((0..draws).map(|_| r.next_bound(bound)));
+                    (h, r.next_i64())
+                }
+                k => panic!("unknown kind {k}"),
+            };
+            n += 1;
+            *per_kind.entry(kind.to_string()).or_insert(0usize) += 1;
+            if hash != want_hash || after != want_after {
+                wrong.push(format!("{kind} seed {seed} bound {bound}"));
+            }
+        }
+        let mut bad_kind = std::collections::BTreeMap::new();
+        for w in &wrong {
+            *bad_kind.entry(w.split(' ').next().unwrap()).or_insert(0usize) += 1;
+        }
+        eprintln!("nextInt vectors checked: {n} {per_kind:?}, mismatches by kind {bad_kind:?}");
+        assert!(n >= 900, "vector set too small: {n}");
+        assert!(
+            wrong.is_empty(),
+            "{} of {n} streams differ from the game, first: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(8)]
+        );
     }
 }

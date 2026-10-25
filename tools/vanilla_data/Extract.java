@@ -326,6 +326,95 @@ public class Extract {
                 w.println(v[0] + "\t" + v[1] + "\t" + v[2] + "\t" + v[3] + "\t" + v[4] + "\t" + v[5] + "\t" + b + "\t" + (atBest.size() > 1 ? 1 : 0));
             }
         }
+
+        // Tie-heavy reference answers (biome_probe_ties.tsv). The first probe set is mostly
+        // unambiguous points; this one is built from the leaves' own range edges so that many
+        // points sit at the same distance from leaves of different biomes. There the answer is
+        // decided by the order in which the game scans a branch's children, so this is the set
+        // that pins the scan order. Same cleared-seed lookup and ambiguity flag as above.
+        Random rt = new Random(20260);
+        int tieKept = 0, tieTotal = 0;
+        try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(out.resolve("biome_probe_ties.tsv")))) {
+            while (tieKept < 2500) {
+                long[] box = leafBox.get(rt.nextInt(leafBox.size()));
+                long[] v = new long[6];
+                for (int k = 0; k < 6; k++) {
+                    long lo = box[2 * k], hi = box[2 * k + 1];
+                    switch (rt.nextInt(6)) {
+                        case 0: v[k] = lo; break;
+                        case 1: v[k] = hi; break;
+                        case 2: v[k] = lo - 1 - rt.nextInt(300); break;
+                        case 3: v[k] = hi + 1 + rt.nextInt(300); break;
+                        default: v[k] = lo + (long) (rt.nextDouble() * (hi - lo + 1)); break;
+                    }
+                }
+                previous.remove();
+                Object pt = pc.newInstance(v[0], v[1], v[2], v[3], v[4], v[5]);
+                String b = String.valueOf(mEntryGet.invoke(entriesOf[0], pt));
+                long best = Long.MAX_VALUE;
+                Set<String> atBest = new TreeSet<>();
+                for (int l = 0; l < leafBox.size(); l++) {
+                    long d = 0;
+                    long[] bx = leafBox.get(l);
+                    for (int k = 0; k < 7; k++) {
+                        long t = k < 6 ? v[k] : 0;
+                        long dd = t < bx[2 * k] ? bx[2 * k] - t : (t > bx[2 * k + 1] ? t - bx[2 * k + 1] : 0);
+                        d += dd * dd;
+                    }
+                    if (d < best) { best = d; atBest.clear(); }
+                    if (d == best) atBest.add(leafBiome.get(l));
+                }
+                if (!atBest.contains(b)) throw new IllegalStateException("game answer is not a nearest leaf: " + b);
+                boolean amb = atBest.size() > 1;
+                tieTotal++;
+                if (!amb && rt.nextInt(10) != 0) continue;   // keep every tie, a tenth of the rest
+                w.println(v[0] + "\t" + v[1] + "\t" + v[2] + "\t" + v[3] + "\t" + v[4] + "\t" + v[5] + "\t" + b + "\t" + (amb ? 1 : 0));
+                tieKept++;
+            }
+        }
+
+        // ---- bounded integer draws --------------------------------------------------------
+        // random_next_int.tsv: for each (generator, seed, bound), the first `draws` calls of
+        // nextInt(bound) on one fresh generator, folded into an FNV-1a hash of the results,
+        // then the generator's next nextLong() (which shows how many raw words the draws used).
+        //   kind: xoroshiro = Xoroshiro128PlusPlusRandom(seed)
+        //         worldgen  = ChunkRandom(Xoroshiro128PlusPlusRandom(seed))
+        //         checked   = CheckedRandom(seed)  (the classic java.util.Random algorithm)
+        Class<?> randC = cls("net/minecraft/util/math/random/Random");
+        Class<?> xoC = cls("net/minecraft/util/math/random/Xoroshiro128PlusPlusRandom");
+        Class<?> chunkRC = cls("net/minecraft/util/math/random/ChunkRandom");
+        Class<?> checkedC = cls("net/minecraft/util/math/random/CheckedRandom");
+        Constructor<?> xoCtor = xoC.getDeclaredConstructor(long.class);
+        Constructor<?> chunkCtor = chunkRC.getDeclaredConstructor(randC);
+        Constructor<?> checkedCtor = checkedC.getDeclaredConstructor(long.class);
+        xoCtor.setAccessible(true); chunkCtor.setAccessible(true); checkedCtor.setAccessible(true);
+        Method mNextInt = method(randC, "nextInt", int.class);
+        Method mNextLong = method(randC, "nextLong");
+        int[] bounds = {1, 2, 3, 5, 6, 7, 10, 12, 16, 24, 100, 1000, 12345, 65537, 1 << 20, (1 << 20) + 1,
+            100000007, 1 << 28, (1 << 28) + 1, 0x15555555, 0x2AAAAAAA, 0x3FFFFFFF, (1 << 30) + 1, 0x55555555,
+            0x5FFFFFFF, 0x60000000, 0x6AAAAAAA, 0x7000_0001, 0x7FFFFFF0, 0x7FFFFFFE, 0x7FFFFFFF};
+        String[] kinds = {"xoroshiro", "worldgen", "checked"};
+        try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(out.resolve("random_next_int.tsv")))) {
+            for (String kind : kinds) {
+                int nseeds = kind.equals("xoroshiro") ? 24 : 6;
+                for (int si = 0; si < nseeds; si++) {
+                    long seed = si == 0 ? 0 : (si < 8 ? si : new Random(900 + si).nextLong());
+                    for (int bound : bounds) {
+                        Object r = kind.equals("xoroshiro") ? xoCtor.newInstance(seed)
+                            : kind.equals("worldgen") ? chunkCtor.newInstance(xoCtor.newInstance(seed))
+                            : checkedCtor.newInstance(seed);
+                        int draws = 256;
+                        long h = 0xcbf29ce484222325L;
+                        for (int i = 0; i < draws; i++) {
+                            int x = (Integer) mNextInt.invoke(r, bound);
+                            for (int by = 0; by < 4; by++) { h ^= (x >>> (8 * by)) & 0xff; h *= 0x100000001b3L; }
+                        }
+                        long after = (Long) mNextLong.invoke(r);
+                        w.println(kind + "\t" + seed + "\t" + bound + "\t" + draws + "\t" + Long.toUnsignedString(h) + "\t" + after);
+                    }
+                }
+            }
+        }
     }
 
     static void collect(Object n, Class<?> branchC, Class<?> leafC, Field fParams, Field fSub, Field fValue,

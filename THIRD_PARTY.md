@@ -25,6 +25,8 @@
 | `assets/block_states_1211.json` | **生成物** (274,587 bytes)。Minecraft 1.21.1 の全 26,684 状態の luminance / light_block (opacity) / flags (air, replaceable, liquid, solid, fluid) / full_sides | Mojang 由来 (jar の事実値) | `documented` | `tools/vanilla_data/gen_vanilla_data.sh` で 1.21.1 の server jar (sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`) から再生成できる (§5)。旧 `assets/pblocks.json` / `properties.json` を置き換えた。**コミットする方針**。 |
 | `datapacks/vanilla/biome_climate_tree.json` | **生成物** (2,059,649 bytes)。1.21.1 の overworld (7,593 leaves) と nether (5 leaves) の multi-noise biome RTree | Mojang 由来 (jar の事実値) | `documented` | 同じツールで jar から再生成できる (§5)。旧 `multi_noise_biome_tree.json` を置き換えた。**コミットする方針**。 |
 | `tests/data/biome_probe_1211.tsv` | **生成物**。ゲーム自身の biome 検索結果 6,000 点 (seed 固定) | 事実値 | `documented` | 同じツールで再生成。`worldgen.rs` のテストが全点を検証する。 |
+| `tests/data/biome_probe_ties_1211.tsv` | **生成物**。leaf の range 端から作った同距離 tie の多い biome 検索結果 2,500 点 (seed 固定) | 事実値 | `documented` | 同じツールで再生成。tie をゲームと同じ子の走査順で解くことを `worldgen.rs` のテストが全点で検証する。 |
+| `tests/data/random_next_int_1211.tsv` | **生成物**。ゲームの乱数クラスの `nextInt(bound)` 256 回分のハッシュ 1,116 行 (数値のみ) | 事実値 | `documented` | 同じツールで再生成。`generation_math.rs` のテストが全行を検証する。 |
 | `resourcepack.zip` | 345 bytes。中身は `pack.mcmeta` (59 B, "spine test pack") と `assets/minecraft/textures/block/stone.png` (72 B) | Mojang 由来 | `unknown - owner to confirm` | 非常に小さいテスト用パックに見える。72 B の PNG が Mojang のテクスチャかどうかは未確認。`RESTORATION.md` は「元の保存場所のローカル補助資産」と記述。 |
 | `config_packets.bin` | 105,095 bytes。Configuration フェーズの送信パケット列 (先頭は `minecraft:brand` / `vanilla`、約900個の `minecraft:` 識別子を含む。registry / tag データと思われる) | Mojang 由来 | `undocumented` | 生成手順の記録は見つからない (読み込みは `src/main.rs` の `load_config_packets`)。実サーバーの出力を取り込んだものかは未確認。 |
 | `evidence/gameplay/**/*.javap.txt` (7 files) | Mojang クラスの `javap -p -c` 逆アセンブル: `FallingBlockEntity` (obf `cjg`, 38.6 KB), `ClientboundLightUpdatePacket` (`adj`), `ClientboundLightUpdatePacketData` (`adk`), `ClientPacketListener.applyLightData`, `DataLayer` (`dvd`), `LevelLightEngine` (`eot`) | **README に記載なし** | `documented` (生成方法) | `tools/bytecode_probe.sh` が、固定した 1.21.1 server.jar (sha1 `59353fb4…8dc05c`) と公式マッピング `server.txt` (sha1 `03f89854…0f35f570`) から生成する方法を記録している。ファイル自体の再配布可否は §4 の質問。 |
@@ -156,7 +158,7 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 ## 5. 生成データと再生成ツール / Generated data and how to regenerate it
 
-方針 / Decision: 生成物 (`assets/block_states_1211.json`, `datapacks/vanilla/biome_climate_tree.json`, `tests/data/biome_probe_1211.tsv`) は**コミットする**。理由: ビルド・テストに Mojang の jar と Java を要求しないため。リポジトリは既に `datapacks/vanilla/` を (Mojang 由来として) コミットしている。再生成は任意で、結果が一致しなければ差分が出る (決定的)。
+方針 / Decision: 生成物 (`assets/block_states_1211.json`, `datapacks/vanilla/biome_climate_tree.json`, `tests/data/biome_probe_1211.tsv`, `tests/data/biome_probe_ties_1211.tsv`, `tests/data/random_next_int_1211.tsv`) は**コミットする**。理由: ビルド・テストに Mojang の jar と Java を要求しないため。リポジトリは既に `datapacks/vanilla/` を (Mojang 由来として) コミットしている。再生成は任意で、結果が一致しなければ差分が出る (決定的)。
 Decision: the generated files are **committed** so that building and testing need neither a Mojang jar nor Java; regeneration is optional and deterministic.
 
 ```
