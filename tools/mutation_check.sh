@@ -857,6 +857,16 @@ check "biome carvers preserve the list order" \
   'J::Arr(a) => Some(a.iter().rev().map(|v| ns_name(v.str())).collect()),' \
   carver_lists_match_the_pinned_biomes
 
+check "nextInt takes the 32-bit unsigned redraw threshold" \
+  src/generation_math.rs 'let threshold = u64::from((bound.wrapping_neg() as u32) % (bound as u32));' \
+  'let threshold = (bound.wrapping_neg() as u64) % (bound as u64);' \
+  next_int_streams_match_the_game_for_every_class_seed_and_bound
+
+check "biome tree scans children in array order for ties" \
+  src/worldgen.rs '                for c in ch {' \
+  '                for c in ch.iter().rev() {' \
+  biome_tree_breaks_ties_the_way_vanilla_scans_children
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
