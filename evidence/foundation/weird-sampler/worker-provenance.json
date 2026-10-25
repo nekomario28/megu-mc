@@ -1,0 +1,43 @@
+{
+  "native_noise": {
+    "configured_thinking": "high",
+    "raw_log_sha256": "b59ab77b9f7b6a7fb2ca84489f7968438cc6b55be2f93025021e73d9a3adca7c",
+    "requested_provider_model_confirmed_in_final_metadata": true,
+    "unit": "mc-weird-noise-1.service"
+  },
+  "python": {
+    "configured_thinking": "medium",
+    "raw_log_sha256": "ee98e745de8d172aa8d6e654d3fe4e034b1e3be530320ae34fbd3b68a8589bce",
+    "requested_provider_model_confirmed_in_final_metadata": true,
+    "unit": "mc-weird-python-1.service"
+  },
+  "rationale_audit": {
+    "configured_thinking": "medium",
+    "raw_log_sha256": "7788eb736bb0527124b3e29731e7513468b17b1c015f6861d7eeb65435945a99",
+    "requested_provider_model_confirmed_in_final_metadata": true,
+    "unit": "mc-weird-doc-review-1.service"
+  },
+  "rationale_followup": {
+    "configured_thinking": "medium",
+    "raw_log_sha256": "481c4eda6e8efa5c6cb313436c6f46a3a11bb5b1e7df8404c0c8d0e4552b679a",
+    "requested_provider_model_confirmed_in_final_metadata": true,
+    "unit": "mc-weird-doc-followup-1.service"
+  },
+  "rejected_unknown_provider": {
+    "final_text": "",
+    "raw_log_sha256": "76b1f97aa8642d7320f7a40b99e76a4d507c536948007c514035b307661fd02f",
+    "requested_provider_model_confirmed_in_final_metadata": false
+  },
+  "rust": {
+    "configured_thinking": "high",
+    "raw_log_sha256": "7e21bbd1276eac9bf65ce6f0d6a49f9678d6b257cb849fb66f9ea088593a190b",
+    "requested_provider_model_confirmed_in_final_metadata": true,
+    "unit": "mc-weird-implementation-2.service"
+  },
+  "static_review": {
+    "configured_thinking": "high",
+    "raw_log_sha256": "83a45344148c552d694ced1ae72446e57bf4f96521a8d65f5a04054ad1f9d927",
+    "requested_provider_model_confirmed_in_final_metadata": true,
+    "unit": "mc-weird-review-1.service"
+  }
+}

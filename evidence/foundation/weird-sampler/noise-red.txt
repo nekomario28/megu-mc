@@ -1,0 +1,32 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 33.62s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 9 tests
+test worldgen::weird_sampler_tests::weird_sampler_converted_noise_diagnostic ... CONVERTED_NOISE 1.25,17.5,-23.75 3fe85b6f697bcb46
+CONVERTED_NOISE -97.5,32.25,131 bfe0c1c6d52ff834
+CONVERTED_NOISE 30000000,-64,-30000000 bfce35b6467ca0cd
+ok
+test worldgen::weird_sampler_tests::weird_sampler_installed_nodes_are_nonzero ... ok
+test worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples ...
+thread 'worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples' (3572395) panicked at src/weird_sampler_tests.rs:85:17:
+assertion `left == right` failed: weird-038: NormalNoise boundary
+  left: 4604541125296534787
+ right: 4604257135130000204
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test worldgen::wg_tests::weird_sampler_failed_named_reference_is_retried_not_cached_as_zero ... ok
+test worldgen::wg_tests::weird_sampler_input_is_reachable_through_the_interpolated_node ... ok
+test worldgen::wg_tests::weird_sampler_installed_pack_has_three_reachable_typed_nodes ... ok
+test worldgen::wg_tests::weird_sampler_production_evaluation_scales_all_axes_with_real_normal ... ok
+test worldgen::wg_tests::weird_sampler_rarity_thresholds_are_strict_across_adjacent_bits ... ok
+test worldgen::wg_tests::weird_sampler_requires_known_mapper_input_and_noise ... ok
+
+failures:
+
+failures:
+    worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples
+
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 219 filtered out; finished in 0.22s
+
+error: test failed, to rerun pass `--bin mc-spine`

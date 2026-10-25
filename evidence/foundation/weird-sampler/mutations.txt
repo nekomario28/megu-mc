@@ -1,0 +1,13 @@
+
+ok    weird sampler type_1 thresholds are strict
+ok    weird sampler type_2 thresholds are strict
+ok    weird sampler installed definitions do not become zero
+ok    weird sampler divides the vertical coordinate by rarity
+ok    weird sampler takes absolute noise before scaling
+ok    weird sampler keeps its input in grid reachability
+ok    weird sampler retains the callers interpolation context
+ok    weird sampler failed named parses do not cache a zero
+ok    weird sampler native noise uses the pinned final normalization
+ok    weird sampler native noise scales after adding both stacks
+ok    weird sampler native noise counts gaps in the amplitude span
+mutation check: 11 proved, 0 not a gate, 0 parked, 0 skipped

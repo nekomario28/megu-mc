@@ -741,6 +741,72 @@ check "arrow tick uses the continuous segment rather than just its end" \
   '    bounds.contains(end)' \
   primitives_arrow_tick_hits_between_the_old_samples
 
+# Pinned weird sampler: mapper, production path, context and native noise seams.
+check "weird sampler type_1 thresholds are strict" \
+  src/worldgen.rs $'Self::Type1 => {\n                if input < -0.5 {' \
+  $'Self::Type1 => {\n                if input <= -0.5 {' \
+  weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler type_2 thresholds are strict" \
+  src/worldgen.rs '                if input < -0.75 {' \
+  '                if input <= -0.75 {' \
+  weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler installed definitions do not become zero" \
+  src/worldgen.rs 'rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
+  'rarity * self.noises[*ni].get(xd, yd, zd).abs() * 0.0' \
+  weird_sampler_installed_nodes_are_nonzero
+
+check "weird sampler divides the vertical coordinate by rarity" \
+  src/worldgen.rs 'let yd = y as f64 / rarity;' \
+  'let yd = y as f64 * rarity;' \
+  weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler takes absolute noise before scaling" \
+  src/worldgen.rs 'rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
+  'rarity * self.noises[*ni].get(xd, yd, zd)' \
+  weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler keeps its input in grid reachability" \
+  src/worldgen.rs 'DF::WeirdScaledSampler { input, .. } => out.push(*input),' \
+  'DF::WeirdScaledSampler { .. } => {}' \
+  weird_sampler_input_is_reachable_through_the_interpolated_node
+
+check "weird sampler retains the callers interpolation context" \
+  src/worldgen.rs 'mapper.rarity(self.eval_c(*input, x, y, z, memo, cc))' \
+  'mapper.rarity(self.eval_c(*input, x, y, z, memo, None))' \
+  weird_sampler_uses_the_callers_interpolation_context
+
+check "weird sampler failed named parses do not cache a zero" \
+  src/worldgen.rs '                self.names.remove(name);' \
+  '                // broken: retain the failed recursion placeholder' \
+  weird_sampler_failed_named_reference_is_retried_not_cached_as_zero
+
+check "weird sampler native noise uses the pinned final normalization" \
+  src/generation_math.rs 'NATIVE_VALUE_FACTOR_NUMERATOR / (0.1 * (1.0 + 1.0 / span.wrapping_add(1) as f64))' \
+  '(NATIVE_VALUE_FACTOR_NUMERATOR * 2.0) / (0.1 * (1.0 + 1.0 / span.wrapping_add(1) as f64))' \
+  weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler native noise scales after adding both stacks" \
+  src/generation_math.rs '(first + second) * native.value_factor' \
+  'first * native.value_factor + second * native.value_factor' \
+  weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler native noise counts gaps in the amplitude span" \
+  src/generation_math.rs 'let span = native_amplitude_span(amps);' \
+  'let span = amps.iter().filter(|a| **a != 0.0).count() as i32 - 1;' \
+  weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler native noise keeps per-octave multiplication order" \
+  src/generation_math.rs 'first += o.a * o.n.get(x * o.f, y * o.f, z * o.f) * weight;' \
+  'first += (o.a * weight) * o.n.get(x * o.f, y * o.f, z * o.f);' \
+  worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples
+
+check "weird sampler multiplies the absolute noise by rarity" \
+  src/worldgen.rs 'rarity * self.noises[*ni].get(xd, yd, zd).abs()' \
+  'self.noises[*ni].get(xd, yd, zd).abs()' \
+  worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

@@ -1,0 +1,16 @@
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 10 tests
+test worldgen::weird_sampler_tests::weird_sampler_converted_noise_is_unchanged ... ok
+test worldgen::weird_sampler_tests::weird_sampler_failed_named_reference_is_retried_not_cached_as_zero ... ok
+test worldgen::weird_sampler_tests::weird_sampler_input_is_reachable_through_the_interpolated_node ... ok
+test worldgen::weird_sampler_tests::weird_sampler_installed_nodes_are_nonzero ... ok
+test worldgen::weird_sampler_tests::weird_sampler_installed_pack_has_three_reachable_typed_nodes ... ok
+test worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples ... ok
+test worldgen::weird_sampler_tests::weird_sampler_production_evaluation_scales_all_axes_with_real_normal ... ok
+test worldgen::weird_sampler_tests::weird_sampler_rarity_thresholds_are_strict_across_adjacent_bits ... ok
+test worldgen::weird_sampler_tests::weird_sampler_requires_known_mapper_input_and_noise ... ok
+test worldgen::weird_sampler_tests::weird_sampler_uses_the_callers_interpolation_context ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out; finished in 0.26s

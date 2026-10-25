@@ -1,0 +1,31 @@
+## Static review — weird_scaled_sampler / native NornalNoise slice
+
+**Status: NOT RUN** — no cargo build/test, no Java/jar, no mutation campaign, no Python test execution, no server/network. Evidence below is from reading the diff, the new files, the pinned bytecode dumps and read-only arithmetic/consistency checks over the committed JSON.
+
+### What I could confirm statically (no finding)
+
+- Mapper tables in `src/worldgen.rs:26-72` match `/tmp/mc-weird-rarity.txt`: `type_1` = `dzf$a.b` (−0.5/0/0.5 → 0.75/1.0/1.5/2.0), `type_2` = `dzf$a.a`. `dcmpg`+`ifge` semantics = strict `<`, NaN falls through, `-0.0` behaves as `0.0` — the Rust branches reproduce all of that, and the committed fixture agrees (`weird-009` = 1.5, `weird-016`/`weird-037` = last band).
+- Eval order `src/worldgen.rs:1748-1753` matches `dys$z.a(dyr$b,double)`: input→rarity, integer block coords `i2d/ddiv`, `Math.abs` **inside**, `rarity * abs(...)` outside.
+- Native noise matches `eoh`/`eoi`: value factor `0.1666…/(0.1*(1+1/(span+1)))` with span = last−first nonzero index over the *original* list (including the all-zero sentinel wrap to 1), per-octave `amp*sample*(e/2^i)` with `e = 2^(n−1)/(2^n−1)` and `n = amplitudes.len()` (gaps included), two stacks with `INPUT_FACTOR` on the second, sum then multiply. Converted/legacy paths are untouched except `native: None`.
+- Fixture is internally coherent: for all 216 sample rows `value_bits == rarity_bits * |noise_bits|` bit-exactly and `scaled_bits == pos/rarity`; noise signs are balanced (106 pos / 110 neg), so a dropped `abs` cannot pass.
+- Receipts check out against the pack: exactly 3 weird nodes reachable from `noise_router.final_density` (2 `type_1` in `caves/entrances.json`, 1 `type_2` in `caves/spaghetti_2d.json`), all three noise files present; **no** unresolved density reference or missing noise name anywhere in `noise_settings/overworld.json` + `density_function/**`, so the stricter `resolve_ref` failure cannot break the pinned load.
+- All 11 new mutation anchors occur exactly once (no silent `SKIP`), and each named test exists and can fail for the stated reason.
+
+### Findings (none is a confirmed new runtime defect)
+
+1. **`src/generation_math.rs:766-773` — pointer-keyed NCACHE vs. the new exact-bit tests (inference; pre-existing, not worsened).**
+   Trigger: a `Gen` is dropped and another built in the same thread (serial phase runs all tests on one thread), so a `Normal` can be re-allocated at an address already in `NCACHE`; a later `get()` at an identical coordinate returns the previous generator's value. The new tests are aware of this and dodge it (`src/weird_sampler_tests.rs:374-377` "keep both generators alive"), so the hazard remains unguarded by the new contract. Failure mode if it bites is a bit-mismatch (red), not a false green. Actionable only as a pre-existing cache-key fix (seed/identity in the key, or clear on load); out of this slice's scope.
+
+2. **`src/worldgen.rs:1154` — retry fix is partial for cycles (confirmed edge case, pre-existing cycle machinery).**
+   Trigger: `A` ↔ `B`, where `B` parses successfully while `A` is only its recursion placeholder, and `A` then fails (e.g. bad mapper). `names.remove(A)` lets a direct retry succeed at a **new** id, but the already-cached `B` still references the abandoned `DF::Zero` placeholder, so a caller of `B` still silently gets zero. The evidence README is careful ("a *direct* retry …"), so this is not an overclaim, and the brief excludes cycle repair; noted because it is exactly the zero-substitution class the change targets.
+
+3. **`src/worldgen.rs:1207` — `firstOctave` silently defaults to `-4` (confirmed minor, pre-existing line).**
+   Vanilla's codec requires the field. The new native path now consumes `firstOctave` in the pinned formula, so a noise JSON missing it produces a plausible-but-wrong noise instead of failing closed. The pinned pack always supplies it; no effect here, but the new contract inherits the leniency.
+
+4. **Receipt/coverage nit (not a defect).** The evidence README says a three-ULP error from precombining amplitude and octave weight was fixed by retaining `amplitude * sample * octave_weight`, but the new mutation entries only guard the *final* factor application (`(first+second)*vf` → `first*vf+second*vf`, `tools/mutation_check.sh:790-794`). The per-octave order is covered only by the fixture bits (which should catch it), not by a named mutation proof.
+
+Also worth noting as weak-but-not-false-green: `weird_sampler_production_evaluation_scales_all_axes_with_real_normal` (`src/weird_sampler_tests.rs:197`) checks one positive sample per node and skips `actual <= 0`, and `weird_sampler_installed_nodes_are_nonzero` only requires any of three fixed positions to be positive; the exact-bit corpus test at `src/weird_sampler_tests.rs:364` (which does assert `scaled`, raw noise and sampler bits against the Java fixture) is the real gate.
+
+### Verdict
+
+Static review found **no actionable correctness regression introduced by this slice** in the mapper, the sampler evaluation, the native NormalNoise construction, or the grid/context reachability change; the four items above are pre-existing hazards, an out-of-scope cycle edge, and receipt/coverage nits. Runtime confirmation (cargo, Java oracle, mutation, full suite) remains outstanding and was not performed.

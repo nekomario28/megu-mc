@@ -1,0 +1,25 @@
+Implemented in `/tmp/mc-weird-impl-wt/src/worldgen.rs` only.
+
+Changed symbols:
+- Added `RarityValueMapper` (`Type1`/`Type2`) with exact strict-threshold mapping and NaN last-branch behavior.
+- Added `DF::WeirdScaledSampler { input, ni, mapper }`.
+- Added `parse_df` arm for `minecraft:weird_scaled_sampler`: required `rarity_value_mapper` restricted to `type_1`/`type_2`, required input, required resolvable noise.
+- Updated `resolve_ref` to remove a failed name mapping so retries reparse instead of reusing the placeholder `DF::Zero`.
+- Updated `push_kids` to include the sampler input.
+- Updated `eval0_c` to evaluate input with the same `cc`, divide all three block coordinates by the mapped rarity, then multiply rarity by `abs(Normal::get(...))`.
+
+Tests added under `wg_tests`:
+- `weird_sampler_rarity_thresholds_are_strict_across_adjacent_bits`
+- `weird_sampler_requires_known_mapper_input_and_noise`
+- `weird_sampler_failed_named_reference_is_retried_not_cached_as_zero`
+- `weird_sampler_production_evaluation_scales_all_axes_with_real_normal`
+- `weird_sampler_input_is_reachable_through_the_interpolated_node`
+- `weird_sampler_installed_pack_has_three_reachable_typed_nodes`
+
+Uncertainty:
+- No compile check was performed, so borrow/type-check correctness is unverified.
+- The 3-node installed-pack test is based on inspected pack data (`entrances.json`: 2 × `type_1`; `spaghetti_2d.json`: 1 × `type_2`).
+- I did not add the unused mapper scale constants `2.0`/`3.0` from `dys$z.b()` because this codebase has no node-bounds consumer for them.
+- `resolve_ref` leaves the failed placeholder slot allocated but unreferenced; only the name mapping is removed.
+
+NOT RUN verification: no `cargo`, tests, rustfmt, Java, server, commit, push, or compute. Only static inspection and `git diff --check` were used.

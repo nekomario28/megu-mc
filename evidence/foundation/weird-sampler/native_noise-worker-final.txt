@@ -1,0 +1,29 @@
+Changed only `src/generation_math.rs`.
+
+**Changed symbols**
+- `Normal`
+  - Added private native representation: `native: Option<NativeNormal>`.
+  - `Normal::get`: native path now accumulates first and second Perlin stacks separately in increasing amplitude-index order, applies `INPUT_FACTOR` to the second stack’s coordinates before per-octave frequency scaling, then computes `(first + second) * value_factor`. Converted/legacy flat summation is unchanged.
+- New `NativeNormal { split, value_factor }`.
+- `normal_new_amps`
+  - No longer routes through `normal_from_octaves`.
+  - Uses `build_octaves(first_octave, 1.0, amps.len(), amps)` for native per-octave weights, without the extra variance normalization.
+- New `normal_native_from_octaves`
+  - Keeps the existing positional `splitter()` forks and `octave_N` naming, but stores the two stacks separately.
+- New `native_amplitude_span`
+  - Span is last nonzero index minus first nonzero index, using the original amplitude list; all-zero mirrors Java’s sentinel subtraction wrap.
+- New `native_value_factor`
+  - `0.16666666666666666 / (0.1 * (1.0 + 1.0 / (span + 1)))`.
+- New constant `NATIVE_VALUE_FACTOR_NUMERATOR`.
+- `normal_from_octaves`, `normal_new_l`
+  - Only updated construction to set `native: None`; converted/legacy behavior otherwise untouched.
+
+**Static consistency check**
+For the single-amplitude spaghetti shape, the old normalization factor is `0.872245164452229` and the native factor is `0.8333333333333333`, ratio `1.046694197343`, matching the recorded `+4.67%` mismatch. The resulting prediction for the recorded spaghetti_2d sample matches the native value.
+
+**Unverified limits**
+- No compilation or test execution was performed; only static inspection plus `rustfmt --check` and `git diff --check`.
+- Actual 1.21.1 NormalNoise/WeirdScaledSampler vectors were not replayed here.
+- The existing `octave_N`/positional-fork RNG construction was preserved per evidence; it was not re-derived from `eoi` bytecode.
+- Multi-amplitude and sparse-amplitude native shapes follow the derived span/weight rules but have no local native vectors in this task evidence.
+- All-zero amplitudes follow Java’s span behavior and produce zero, but that edge case was not exercised.

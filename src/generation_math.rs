@@ -720,6 +720,9 @@ const LACUNARITY: f64 = 2.0;
 const STD_DEV: f64 = 0.270_224_783_124_521_1;
 const TARGET_DEV: f64 = 1.0 / 3.0;
 const INPUT_FACTOR: f64 = 1.018_126_888_217_522_7;
+/// `NormalNoise`'s numerator for its final value factor; divided by the
+/// expected deviation of the first-to-last nonzero amplitude span.
+const NATIVE_VALUE_FACTOR_NUMERATOR: f64 = 0.166_666_666_666_666_66;
 
 pub(crate) struct Octave {
     n: Perlin,
@@ -744,8 +747,20 @@ fn nhash(k: NKey) -> usize {
     h = (h ^ k.3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 32) as usize & (NCACHE_N - 1)
 }
+/// Native 1.21.1 `NormalNoise` summation shape. The first `split` layers are
+/// one `PerlinNoise`, the rest the other; `value_factor` is applied once after
+/// the two stacks are added.
+struct NativeNormal {
+    split: usize,
+    value_factor: f64,
+    octave_weights: Vec<f64>,
+}
 pub(crate) struct Normal {
     layers: Vec<Octave>,
+    /// `Some` for the native `firstOctave`/`amplitudes` encoding, whose layers
+    /// keep their unnormalised per-octave weights. `None` for the converted and
+    /// legacy encodings, whose normalization is already folded into each `a`.
+    native: Option<NativeNormal>,
 }
 impl Normal {
     pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
@@ -766,10 +781,37 @@ impl Normal {
         }) {
             return v;
         }
-        let mut v = 0.0;
-        for o in &self.layers {
-            v += o.a * o.n.get(x * o.f, y * o.f, z * o.f);
-        }
+        let v = match &self.native {
+            Some(native) => {
+                let mut first = 0.0;
+                for (o, weight) in self.layers[..native.split]
+                    .iter()
+                    .zip(&native.octave_weights)
+                {
+                    first += o.a * o.n.get(x * o.f, y * o.f, z * o.f) * weight;
+                }
+                // Java multiplies the coordinate by INPUT_FACTOR before the
+                // second PerlinNoise applies its per-octave frequency scaling.
+                let ix = x * INPUT_FACTOR;
+                let iy = y * INPUT_FACTOR;
+                let iz = z * INPUT_FACTOR;
+                let mut second = 0.0;
+                for (o, weight) in self.layers[native.split..]
+                    .iter()
+                    .zip(&native.octave_weights)
+                {
+                    second += o.a * o.n.get(ix * o.f, iy * o.f, iz * o.f) * weight;
+                }
+                (first + second) * native.value_factor
+            }
+            None => {
+                let mut v = 0.0;
+                for o in &self.layers {
+                    v += o.a * o.n.get(x * o.f, y * o.f, z * o.f);
+                }
+                v
+            }
+        };
         NCACHE.with(|c| {
             c.borrow_mut()[idx] = (key, v);
         });
@@ -826,14 +868,85 @@ pub(crate) fn normal_new(
 }
 
 /// The 1.21.1 encoding of the same construction: `firstOctave` plus one amplitude per
-/// octave, instead of `base_octave`/`base_amplitude` plus modifiers. `NormalNoise` only
-/// takes the legacy path when the `RandomSource` is a `LegacyRandomSource` (see
-/// `PerlinNoise.createLegacyForLegacyRandomSource` in `eoh`'s constructor); the router
-/// noises come from a name-derived Xoroshiro source, so the *modern* construction is the
-/// right one - the amplitudes are per-octave, that is all that changes.
+/// octave, instead of `base_octave`/`base_amplitude` plus modifiers. This is the
+/// ordinary `NormalNoise.create` entry point; legacy Nether noise has an explicit
+/// alternate constructor. Router noises use name-derived Xoroshiro sources.
+/// Preserve `amplitude * sample * octave_weight`, then add both Perlin stacks
+/// and multiply by the span-derived value factor: precombining weights changes bits.
 pub(crate) fn normal_new_amps(r: &mut Xor, first_octave: i32, amps: &[f64]) -> Normal {
-    let octaves = build_octaves(first_octave, 1.0, amps.len(), amps);
-    normal_from_octaves(r, octaves)
+    let count = amps.len() as i32;
+    let mut frequency = LACUNARITY.powi(first_octave);
+    let mut weight = LACUNARITY.powi(count - 1) / (LACUNARITY.powi(count) - 1.0);
+    let mut octaves = Vec::new();
+    let mut octave_weights = Vec::new();
+    for (i, &amplitude) in amps.iter().enumerate() {
+        if amplitude != 0.0 {
+            octaves.push((first_octave + i as i32, frequency, amplitude));
+            octave_weights.push(weight);
+        }
+        frequency *= LACUNARITY;
+        weight /= LACUNARITY;
+    }
+    let value_factor = native_value_factor(amps);
+    normal_native_from_octaves(r, &octaves, value_factor, octave_weights)
+}
+
+/// `NormalNoise`'s span for `expectedDeviation`: the last nonzero amplitude
+/// index minus the first, over the original list (gaps count). With no nonzero
+/// amplitude Java's sentinels make the subtraction wrap to 1, so mirror that
+/// instead of special-casing the all-zero case.
+fn native_amplitude_span(amps: &[f64]) -> i32 {
+    let mut min_o = i32::MAX;
+    let mut max_o = i32::MIN;
+    for (i, a) in amps.iter().enumerate() {
+        if *a != 0.0 {
+            min_o = min_o.min(i as i32);
+            max_o = max_o.max(i as i32);
+        }
+    }
+    max_o.wrapping_sub(min_o)
+}
+fn native_value_factor(amps: &[f64]) -> f64 {
+    let span = native_amplitude_span(amps);
+    NATIVE_VALUE_FACTOR_NUMERATOR / (0.1 * (1.0 + 1.0 / span.wrapping_add(1) as f64))
+}
+
+/// Native `NormalNoise` builds the two `PerlinNoise` stacks with the same
+/// positional forks and octave names as the converted encoding, but keeps the
+/// per-octave weights separate and applies the final factor only after summing
+/// both stacks.
+fn normal_native_from_octaves(
+    r: &mut Xor,
+    octaves: &[(i32, f64, f64)],
+    value_factor: f64,
+    octave_weights: Vec<f64>,
+) -> Normal {
+    let first = r.splitter();
+    let second = r.splitter();
+    let mut layers = Vec::with_capacity(octaves.len() * 2);
+    for &(idx, f, a) in octaves {
+        layers.push(Octave {
+            n: Perlin::new(&mut first.of_str(&format!("octave_{}", idx))),
+            f,
+            a,
+        });
+    }
+    let split = layers.len();
+    for &(idx, f, a) in octaves {
+        layers.push(Octave {
+            n: Perlin::new(&mut second.of_str(&format!("octave_{}", idx))),
+            f,
+            a,
+        });
+    }
+    Normal {
+        layers,
+        native: Some(NativeNormal {
+            split,
+            value_factor,
+            octave_weights,
+        }),
+    }
 }
 
 fn normal_from_octaves(r: &mut Xor, octaves: Vec<(i32, f64, f64)>) -> Normal {
@@ -855,7 +968,10 @@ fn normal_from_octaves(r: &mut Xor, octaves: Vec<(i32, f64, f64)>) -> Normal {
             a: vf,
         });
     }
-    Normal { layers }
+    Normal {
+        layers,
+        native: None,
+    }
 }
 
 // legacy (pre-1.18) NormalNoise: init order = zero-octave then descending
@@ -928,7 +1044,10 @@ pub(crate) fn normal_new_l(seed: u64, first_octave: i32, amps: &[f64]) -> Normal
             a: a * nf,
         });
     }
-    Normal { layers }
+    Normal {
+        layers,
+        native: None,
+    }
 }
 
 // ---------- simplex (foliage / noise-based placement modifiers) ----------

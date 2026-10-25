@@ -1,0 +1,4 @@
+
+ok    weird sampler native noise keeps per-octave multiplication order
+ok    weird sampler multiplies the absolute noise by rarity
+mutation check: 2 proved, 0 not a gate, 0 parked, 0 skipped

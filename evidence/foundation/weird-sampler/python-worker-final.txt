@@ -1,0 +1,7 @@
+Changed:
+- `tools/weird_sampler_oracle.py`
+- `tests/weird_sampler_oracle_test.py`
+
+Status: **NOT RUN** — the Java oracle and fixture are not present in this worktree, so no real probe/`--check` was executed. No Java, builds, network, agents, commits, or pushes were run.
+
+Static checks: `py_compile` passed; deterministic corpus smoke check produced 146 rows; synthetic-fixture harness exercised all offline guards successfully.

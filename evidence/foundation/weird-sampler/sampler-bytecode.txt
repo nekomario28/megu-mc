@@ -1,0 +1,292 @@
+Compiled from "SourceFile"
+public final class dys$z extends java.lang.Record implements dys$x {
+  private final dyr e;
+
+  private final dyr$c f;
+
+  private final dys$z$a g;
+
+  private static final com.mojang.serialization.MapCodec<dys$z> h;
+
+  public static final ayh<dys$z> a;
+
+  protected dys$z(dyr, dyr$c, dys$z$a);
+    Code:
+         0: aload_0
+         1: invokespecial #55                 // Method java/lang/Record."<init>":()V
+         4: aload_0
+         5: aload_1
+         6: putfield      #57                 // Field e:Ldyr;
+         9: aload_0
+        10: aload_2
+        11: putfield      #59                 // Field f:Ldyr$c;
+        14: aload_0
+        15: aload_3
+        16: putfield      #61                 // Field g:Ldys$z$a;
+        19: return
+
+  public double a(dyr$b, double);
+    Code:
+         0: aload_0
+         1: getfield      #61                 // Field g:Ldys$z$a;
+         4: getfield      #70                 // Field dys$z$a.e:Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+         7: dload_2
+         8: invokeinterface #76,  3           // InterfaceMethod it/unimi/dsi/fastutil/doubles/Double2DoubleFunction.get:(D)D
+        13: dstore        4
+        15: dload         4
+        17: aload_0
+        18: getfield      #59                 // Field f:Ldyr$c;
+        21: aload_1
+        22: invokeinterface #79,  1           // InterfaceMethod dyr$b.a:()I
+        27: i2d
+        28: dload         4
+        30: ddiv
+        31: aload_1
+        32: invokeinterface #81,  1           // InterfaceMethod dyr$b.b:()I
+        37: i2d
+        38: dload         4
+        40: ddiv
+        41: aload_1
+        42: invokeinterface #83,  1           // InterfaceMethod dyr$b.c:()I
+        47: i2d
+        48: dload         4
+        50: ddiv
+        51: invokevirtual #86                 // Method dyr$c.a:(DDD)D
+        54: invokestatic  #91                 // Method java/lang/Math.abs:(D)D
+        57: dmul
+        58: dreturn
+
+  public dyr a(dyr$f);
+    Code:
+         0: aload_1
+         1: new           #2                  // class dys$z
+         4: dup
+         5: aload_0
+         6: getfield      #57                 // Field e:Ldyr;
+         9: aload_1
+        10: invokeinterface #96,  2           // InterfaceMethod dyr.a:(Ldyr$f;)Ldyr;
+        15: aload_1
+        16: aload_0
+        17: getfield      #59                 // Field f:Ldyr$c;
+        20: invokeinterface #99,  2           // InterfaceMethod dyr$f.a:(Ldyr$c;)Ldyr$c;
+        25: aload_0
+        26: getfield      #61                 // Field g:Ldys$z$a;
+        29: invokespecial #101                // Method "<init>":(Ldyr;Ldyr$c;Ldys$z$a;)V
+        32: invokeinterface #105,  2          // InterfaceMethod dyr$f.apply:(Ldyr;)Ldyr;
+        37: areturn
+
+  public double a();
+    Code:
+         0: dconst_0
+         1: dreturn
+
+  public double b();
+    Code:
+         0: aload_0
+         1: getfield      #61                 // Field g:Ldys$z$a;
+         4: getfield      #109                // Field dys$z$a.f:D
+         7: aload_0
+         8: getfield      #59                 // Field f:Ldyr$c;
+        11: invokevirtual #111                // Method dyr$c.a:()D
+        14: dmul
+        15: dreturn
+
+  public ayh<? extends dyr> c();
+    Code:
+         0: getstatic     #115                // Field a:Layh;
+         3: areturn
+
+  public final java.lang.String toString();
+    Code:
+         0: aload_0
+         1: invokedynamic #132,  0            // InvokeDynamic #0:toString:(Ldys$z;)Ljava/lang/String;
+         6: areturn
+
+  public final int hashCode();
+    Code:
+         0: aload_0
+         1: invokedynamic #136,  0            // InvokeDynamic #0:hashCode:(Ldys$z;)I
+         6: ireturn
+
+  public final boolean equals(java.lang.Object);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: invokedynamic #141,  0            // InvokeDynamic #0:equals:(Ldys$z;Ljava/lang/Object;)Z
+         7: ireturn
+
+  public dyr j();
+    Code:
+         0: aload_0
+         1: getfield      #57                 // Field e:Ldyr;
+         4: areturn
+
+  public dyr$c k();
+    Code:
+         0: aload_0
+         1: getfield      #59                 // Field f:Ldyr$c;
+         4: areturn
+
+  public dys$z$a l();
+    Code:
+         0: aload_0
+         1: getfield      #61                 // Field g:Ldys$z$a;
+         4: areturn
+
+  private static com.mojang.datafixers.kinds.App a(com.mojang.serialization.codecs.RecordCodecBuilder$Instance);
+    Code:
+         0: aload_0
+         1: getstatic     #153                // Field dyr.d:Lcom/mojang/serialization/Codec;
+         4: ldc           #155                // String input
+         6: invokeinterface #161,  2          // InterfaceMethod com/mojang/serialization/Codec.fieldOf:(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;
+        11: invokedynamic #178,  0            // InvokeDynamic #1:apply:()Ljava/util/function/Function;
+        16: invokevirtual #184                // Method com/mojang/serialization/MapCodec.forGetter:(Ljava/util/function/Function;)Lcom/mojang/serialization/codecs/RecordCodecBuilder;
+        19: getstatic     #186                // Field dyr$c.a:Lcom/mojang/serialization/Codec;
+        22: ldc           #188                // String noise
+        24: invokeinterface #161,  2          // InterfaceMethod com/mojang/serialization/Codec.fieldOf:(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;
+        29: invokedynamic #194,  0            // InvokeDynamic #2:apply:()Ljava/util/function/Function;
+        34: invokevirtual #184                // Method com/mojang/serialization/MapCodec.forGetter:(Ljava/util/function/Function;)Lcom/mojang/serialization/codecs/RecordCodecBuilder;
+        37: getstatic     #196                // Field dys$z$a.c:Lcom/mojang/serialization/Codec;
+        40: ldc           #198                // String rarity_value_mapper
+        42: invokeinterface #161,  2          // InterfaceMethod com/mojang/serialization/Codec.fieldOf:(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;
+        47: invokedynamic #204,  0            // InvokeDynamic #3:apply:()Ljava/util/function/Function;
+        52: invokevirtual #184                // Method com/mojang/serialization/MapCodec.forGetter:(Ljava/util/function/Function;)Lcom/mojang/serialization/codecs/RecordCodecBuilder;
+        55: invokevirtual #208                // Method com/mojang/serialization/codecs/RecordCodecBuilder$Instance.group:(Lcom/mojang/datafixers/kinds/App;Lcom/mojang/datafixers/kinds/App;Lcom/mojang/datafixers/kinds/App;)Lcom/mojang/datafixers/Products$P3;
+        58: aload_0
+        59: invokedynamic #216,  0            // InvokeDynamic #4:apply:()Lcom/mojang/datafixers/util/Function3;
+        64: invokevirtual #219                // Method com/mojang/datafixers/Products$P3.apply:(Lcom/mojang/datafixers/kinds/Applicative;Lcom/mojang/datafixers/util/Function3;)Lcom/mojang/datafixers/kinds/App;
+        67: areturn
+
+  static {};
+    Code:
+         0: invokedynamic #226,  0            // InvokeDynamic #5:apply:()Ljava/util/function/Function;
+         5: invokestatic  #230                // Method com/mojang/serialization/codecs/RecordCodecBuilder.mapCodec:(Ljava/util/function/Function;)Lcom/mojang/serialization/MapCodec;
+         8: putstatic     #232                // Field h:Lcom/mojang/serialization/MapCodec;
+        11: getstatic     #232                // Field h:Lcom/mojang/serialization/MapCodec;
+        14: invokestatic  #235                // Method dys.a:(Lcom/mojang/serialization/MapCodec;)Layh;
+        17: putstatic     #115                // Field a:Layh;
+        20: return
+}
+Compiled from "SourceFile"
+public final class dys$z$a extends java.lang.Enum<dys$z$a> implements azk {
+  public static final dys$z$a a;
+
+  public static final dys$z$a b;
+
+  public static final com.mojang.serialization.Codec<dys$z$a> c;
+
+  private final java.lang.String d;
+
+  final it.unimi.dsi.fastutil.doubles.Double2DoubleFunction e;
+
+  final double f;
+
+  private static final dys$z$a[] g;
+
+  public static dys$z$a[] values();
+    Code:
+         0: getstatic     #42                 // Field g:[Ldys$z$a;
+         3: invokevirtual #47                 // Method "[Ldys$z$a;".clone:()Ljava/lang/Object;
+         6: checkcast     #43                 // class "[Ldys$z$a;"
+         9: areturn
+
+  public static dys$z$a valueOf(java.lang.String);
+    Code:
+         0: ldc           #2                  // class dys$z$a
+         2: aload_0
+         3: invokestatic  #52                 // Method java/lang/Enum.valueOf:(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;
+         6: checkcast     #2                  // class dys$z$a
+         9: areturn
+
+  private dys$z$a(java.lang.String, it.unimi.dsi.fastutil.doubles.Double2DoubleFunction, double);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: iload_2
+         3: invokespecial #59                 // Method java/lang/Enum."<init>":(Ljava/lang/String;I)V
+         6: aload_0
+         7: aload_3
+         8: putfield      #61                 // Field d:Ljava/lang/String;
+        11: aload_0
+        12: aload         4
+        14: putfield      #63                 // Field e:Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+        17: aload_0
+        18: dload         5
+        20: putfield      #65                 // Field f:D
+        23: return
+
+  public java.lang.String c();
+    Code:
+         0: aload_0
+         1: getfield      #61                 // Field d:Ljava/lang/String;
+         4: areturn
+
+  private static dys$z$a[] a();
+    Code:
+         0: iconst_2
+         1: anewarray     #2                  // class dys$z$a
+         4: dup
+         5: iconst_0
+         6: getstatic     #71                 // Field a:Ldys$z$a;
+         9: aastore
+        10: dup
+        11: iconst_1
+        12: getstatic     #73                 // Field b:Ldys$z$a;
+        15: aastore
+        16: areturn
+
+  static {};
+    Code:
+         0: new           #2                  // class dys$z$a
+         3: dup
+         4: ldc           #77                 // String TYPE1
+         6: iconst_0
+         7: ldc           #79                 // String type_1
+         9: invokedynamic #95,  0             // InvokeDynamic #0:get:()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+        14: ldc2_w        #96                 // double 2.0d
+        17: invokespecial #99                 // Method "<init>":(Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+        20: putstatic     #71                 // Field a:Ldys$z$a;
+        23: new           #2                  // class dys$z$a
+        26: dup
+        27: ldc           #101                // String TYPE2
+        29: iconst_1
+        30: ldc           #103                // String type_2
+        32: invokedynamic #107,  0            // InvokeDynamic #1:get:()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+        37: ldc2_w        #108                // double 3.0d
+        40: invokespecial #99                 // Method "<init>":(Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+        43: putstatic     #73                 // Field b:Ldys$z$a;
+        46: invokestatic  #111                // Method a:()[Ldys$z$a;
+        49: putstatic     #42                 // Field g:[Ldys$z$a;
+        52: invokedynamic #119,  0            // InvokeDynamic #2:get:()Ljava/util/function/Supplier;
+        57: invokestatic  #122                // InterfaceMethod azk.a:(Ljava/util/function/Supplier;)Lazk$a;
+        60: putstatic     #124                // Field c:Lcom/mojang/serialization/Codec;
+        63: return
+}
+Compiled from "SourceFile"
+public interface dys$m extends dyr {
+  public abstract dys$l$a j();
+
+  public abstract dyr k();
+
+  public default ayh<? extends dyr> c();
+    Code:
+         0: aload_0
+         1: invokeinterface #28,  1           // InterfaceMethod j:()Ldys$l$a;
+         6: getfield      #32                 // Field dys$l$a.g:Layh;
+         9: areturn
+
+  public default dyr a(dyr$f);
+    Code:
+         0: aload_1
+         1: new           #12                 // class dys$l
+         4: dup
+         5: aload_0
+         6: invokeinterface #28,  1           // InterfaceMethod j:()Ldys$l$a;
+        11: aload_0
+        12: invokeinterface #37,  1           // InterfaceMethod k:()Ldyr;
+        17: aload_1
+        18: invokeinterface #39,  2           // InterfaceMethod dyr.a:(Ldyr$f;)Ldyr;
+        23: invokespecial #43                 // Method dys$l."<init>":(Ldys$l$a;Ldyr;)V
+        26: invokeinterface #47,  2           // InterfaceMethod dyr$f.apply:(Ldyr;)Ldyr;
+        31: areturn
+}

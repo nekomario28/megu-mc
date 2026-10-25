@@ -1,0 +1,336 @@
+Classfile jar:file:///tmp/mc121x/t/META-INF/versions/1.21.1/server-1.21.1.jar!/dys$z$a.class
+  Last modified 2024/08/08; size 2407 bytes
+  SHA-256 checksum 2a517783393307016d9bb126059e5b6840b4066ed8fe330a163cd448d1042000
+  Compiled from "SourceFile"
+public final class dys$z$a extends java.lang.Enum<dys$z$a> implements azk
+  minor version: 0
+  major version: 65
+  flags: (0x4031) ACC_PUBLIC, ACC_FINAL, ACC_SUPER, ACC_ENUM
+  this_class: #2                          // dys$z$a
+  super_class: #5                         // java/lang/Enum
+  interfaces: 1, fields: 7, methods: 6, attributes: 5
+Constant pool:
+    #1 = Utf8               dys$z$a
+    #2 = Class              #1            // dys$z$a
+    #3 = Utf8               Ljava/lang/Enum<Ldys$z$a;>;Lazk;
+    #4 = Utf8               java/lang/Enum
+    #5 = Class              #4            // java/lang/Enum
+    #6 = Utf8               azk
+    #7 = Class              #6            // azk
+    #8 = Utf8               SourceFile
+    #9 = Utf8               dys
+   #10 = Class              #9            // dys
+   #11 = Utf8               dys$z
+   #12 = Class              #11           // dys$z
+   #13 = Utf8               z
+   #14 = Utf8               a
+   #15 = Utf8               azk$a
+   #16 = Class              #15           // azk$a
+   #17 = Utf8               dzf$a
+   #18 = Class              #17           // dzf$a
+   #19 = Utf8               dzf
+   #20 = Class              #19           // dzf
+   #21 = Utf8               java/lang/invoke/MethodHandles$Lookup
+   #22 = Class              #21           // java/lang/invoke/MethodHandles$Lookup
+   #23 = Utf8               java/lang/invoke/MethodHandles
+   #24 = Class              #23           // java/lang/invoke/MethodHandles
+   #25 = Utf8               Lookup
+   #26 = Utf8               Ldys$z$a;
+   #27 = Utf8               b
+   #28 = Utf8               c
+   #29 = Utf8               Lcom/mojang/serialization/Codec;
+   #30 = Utf8               Lcom/mojang/serialization/Codec<Ldys$z$a;>;
+   #31 = Utf8               d
+   #32 = Utf8               Ljava/lang/String;
+   #33 = Utf8               e
+   #34 = Utf8               Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+   #35 = Utf8               f
+   #36 = Utf8               D
+   #37 = Utf8               g
+   #38 = Utf8               [Ldys$z$a;
+   #39 = Utf8               values
+   #40 = Utf8               ()[Ldys$z$a;
+   #41 = NameAndType        #37:#38       // g:[Ldys$z$a;
+   #42 = Fieldref           #2.#41        // dys$z$a.g:[Ldys$z$a;
+   #43 = Class              #38           // "[Ldys$z$a;"
+   #44 = Utf8               clone
+   #45 = Utf8               ()Ljava/lang/Object;
+   #46 = NameAndType        #44:#45       // clone:()Ljava/lang/Object;
+   #47 = Methodref          #43.#46       // "[Ldys$z$a;".clone:()Ljava/lang/Object;
+   #48 = Utf8               valueOf
+   #49 = Utf8               (Ljava/lang/String;)Ldys$z$a;
+   #50 = Utf8               (Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;
+   #51 = NameAndType        #48:#50       // valueOf:(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;
+   #52 = Methodref          #5.#51        // java/lang/Enum.valueOf:(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;
+   #53 = Utf8               $$0
+   #54 = Utf8               <init>
+   #55 = Utf8               (Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+   #56 = Utf8               (Ljava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+   #57 = Utf8               (Ljava/lang/String;I)V
+   #58 = NameAndType        #54:#57       // "<init>":(Ljava/lang/String;I)V
+   #59 = Methodref          #5.#58        // java/lang/Enum."<init>":(Ljava/lang/String;I)V
+   #60 = NameAndType        #31:#32       // d:Ljava/lang/String;
+   #61 = Fieldref           #2.#60        // dys$z$a.d:Ljava/lang/String;
+   #62 = NameAndType        #33:#34       // e:Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+   #63 = Fieldref           #2.#62        // dys$z$a.e:Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+   #64 = NameAndType        #35:#36       // f:D
+   #65 = Fieldref           #2.#64        // dys$z$a.f:D
+   #66 = Utf8               this
+   #67 = Utf8               $$1
+   #68 = Utf8               $$2
+   #69 = Utf8               ()Ljava/lang/String;
+   #70 = NameAndType        #14:#26       // a:Ldys$z$a;
+   #71 = Fieldref           #2.#70        // dys$z$a.a:Ldys$z$a;
+   #72 = NameAndType        #27:#26       // b:Ldys$z$a;
+   #73 = Fieldref           #2.#72        // dys$z$a.b:Ldys$z$a;
+   #74 = Utf8               <clinit>
+   #75 = Utf8               ()V
+   #76 = Utf8               TYPE1
+   #77 = String             #76           // TYPE1
+   #78 = Utf8               type_1
+   #79 = String             #78           // type_1
+   #80 = Utf8               (D)D
+   #81 = MethodType         #80           //  (D)D
+   #82 = NameAndType        #27:#80       // b:(D)D
+   #83 = Methodref          #18.#82       // dzf$a.b:(D)D
+   #84 = MethodHandle       6:#83         // REF_invokeStatic dzf$a.b:(D)D
+   #85 = Utf8               java/lang/invoke/LambdaMetafactory
+   #86 = Class              #85           // java/lang/invoke/LambdaMetafactory
+   #87 = Utf8               metafactory
+   #88 = Utf8               (Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+   #89 = NameAndType        #87:#88       // metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+   #90 = Methodref          #86.#89       // java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+   #91 = MethodHandle       6:#90         // REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+   #92 = Utf8               get
+   #93 = Utf8               ()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+   #94 = NameAndType        #92:#93       // get:()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+   #95 = InvokeDynamic      #0:#94        // #0:get:()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+   #96 = Double             2.0d
+   #98 = NameAndType        #54:#55       // "<init>":(Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+   #99 = Methodref          #2.#98        // dys$z$a."<init>":(Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+  #100 = Utf8               TYPE2
+  #101 = String             #100          // TYPE2
+  #102 = Utf8               type_2
+  #103 = String             #102          // type_2
+  #104 = NameAndType        #14:#80       // a:(D)D
+  #105 = Methodref          #18.#104      // dzf$a.a:(D)D
+  #106 = MethodHandle       6:#105        // REF_invokeStatic dzf$a.a:(D)D
+  #107 = InvokeDynamic      #1:#94        // #1:get:()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+  #108 = Double             3.0d
+  #110 = NameAndType        #14:#40       // a:()[Ldys$z$a;
+  #111 = Methodref          #2.#110       // dys$z$a.a:()[Ldys$z$a;
+  #112 = MethodType         #45           //  ()Ljava/lang/Object;
+  #113 = NameAndType        #39:#40       // values:()[Ldys$z$a;
+  #114 = Methodref          #2.#113       // dys$z$a.values:()[Ldys$z$a;
+  #115 = MethodHandle       6:#114        // REF_invokeStatic dys$z$a.values:()[Ldys$z$a;
+  #116 = MethodType         #40           //  ()[Ldys$z$a;
+  #117 = Utf8               ()Ljava/util/function/Supplier;
+  #118 = NameAndType        #92:#117      // get:()Ljava/util/function/Supplier;
+  #119 = InvokeDynamic      #2:#118       // #2:get:()Ljava/util/function/Supplier;
+  #120 = Utf8               (Ljava/util/function/Supplier;)Lazk$a;
+  #121 = NameAndType        #14:#120      // a:(Ljava/util/function/Supplier;)Lazk$a;
+  #122 = InterfaceMethodref #7.#121       // azk.a:(Ljava/util/function/Supplier;)Lazk$a;
+  #123 = NameAndType        #28:#29       // c:Lcom/mojang/serialization/Codec;
+  #124 = Fieldref           #2.#123       // dys$z$a.c:Lcom/mojang/serialization/Codec;
+  #125 = Utf8               Signature
+  #126 = Utf8               Code
+  #127 = Utf8               LineNumberTable
+  #128 = Utf8               LocalVariableTable
+  #129 = Utf8               MethodParameters
+  #130 = Utf8               InnerClasses
+  #131 = Utf8               BootstrapMethods
+  #132 = Utf8               NestHost
+{
+  public static final dys$z$a a;
+    descriptor: Ldys$z$a;
+    flags: (0x4019) ACC_PUBLIC, ACC_STATIC, ACC_FINAL, ACC_ENUM
+
+  public static final dys$z$a b;
+    descriptor: Ldys$z$a;
+    flags: (0x4019) ACC_PUBLIC, ACC_STATIC, ACC_FINAL, ACC_ENUM
+
+  public static final com.mojang.serialization.Codec<dys$z$a> c;
+    descriptor: Lcom/mojang/serialization/Codec;
+    flags: (0x0019) ACC_PUBLIC, ACC_STATIC, ACC_FINAL
+    Signature: #30                          // Lcom/mojang/serialization/Codec<Ldys$z$a;>;
+
+  private final java.lang.String d;
+    descriptor: Ljava/lang/String;
+    flags: (0x0012) ACC_PRIVATE, ACC_FINAL
+
+  final it.unimi.dsi.fastutil.doubles.Double2DoubleFunction e;
+    descriptor: Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+    flags: (0x0010) ACC_FINAL
+
+  final double f;
+    descriptor: D
+    flags: (0x0010) ACC_FINAL
+
+  private static final dys$z$a[] g;
+    descriptor: [Ldys$z$a;
+    flags: (0x101a) ACC_PRIVATE, ACC_STATIC, ACC_FINAL, ACC_SYNTHETIC
+
+  public static dys$z$a[] values();
+    descriptor: ()[Ldys$z$a;
+    flags: (0x0009) ACC_PUBLIC, ACC_STATIC
+    Code:
+      stack=1, locals=0, args_size=0
+         0: getstatic     #42                 // Field g:[Ldys$z$a;
+         3: invokevirtual #47                 // Method "[Ldys$z$a;".clone:()Ljava/lang/Object;
+         6: checkcast     #43                 // class "[Ldys$z$a;"
+         9: areturn
+      LineNumberTable:
+        line 592: 0
+
+  public static dys$z$a valueOf(java.lang.String);
+    descriptor: (Ljava/lang/String;)Ldys$z$a;
+    flags: (0x0009) ACC_PUBLIC, ACC_STATIC
+    Code:
+      stack=2, locals=1, args_size=1
+         0: ldc           #2                  // class dys$z$a
+         2: aload_0
+         3: invokestatic  #52                 // Method java/lang/Enum.valueOf:(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;
+         6: checkcast     #2                  // class dys$z$a
+         9: areturn
+      LineNumberTable:
+        line 592: 0
+      LocalVariableTable:
+        Start  Length  Slot  Name   Signature
+            0      10     0   $$0   Ljava/lang/String;
+    MethodParameters:
+      Name                           Flags
+      <no name>                      mandated
+
+  private dys$z$a(java.lang.String, it.unimi.dsi.fastutil.doubles.Double2DoubleFunction, double);
+    descriptor: (Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+    flags: (0x0002) ACC_PRIVATE
+    Code:
+      stack=3, locals=7, args_size=6
+         0: aload_0
+         1: aload_1
+         2: iload_2
+         3: invokespecial #59                 // Method java/lang/Enum."<init>":(Ljava/lang/String;I)V
+         6: aload_0
+         7: aload_3
+         8: putfield      #61                 // Field d:Ljava/lang/String;
+        11: aload_0
+        12: aload         4
+        14: putfield      #63                 // Field e:Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+        17: aload_0
+        18: dload         5
+        20: putfield      #65                 // Field f:D
+        23: return
+      LineNumberTable:
+        line 603: 0
+        line 604: 6
+        line 605: 11
+        line 606: 17
+        line 607: 23
+      LocalVariableTable:
+        Start  Length  Slot  Name   Signature
+            0      24     0  this   Ldys$z$a;
+            0      24     3   $$0   Ljava/lang/String;
+            0      24     4   $$1   Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+            0      24     5   $$2   D
+    Signature: #56                          // (Ljava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+    MethodParameters:
+      Name                           Flags
+      <no name>                      synthetic
+      <no name>                      synthetic
+      <no name>                      final
+      <no name>                      final
+      <no name>                      final
+
+  public java.lang.String c();
+    descriptor: ()Ljava/lang/String;
+    flags: (0x0001) ACC_PUBLIC
+    Code:
+      stack=1, locals=1, args_size=1
+         0: aload_0
+         1: getfield      #61                 // Field d:Ljava/lang/String;
+         4: areturn
+      LineNumberTable:
+        line 611: 0
+      LocalVariableTable:
+        Start  Length  Slot  Name   Signature
+            0       5     0  this   Ldys$z$a;
+
+  private static dys$z$a[] a();
+    descriptor: ()[Ldys$z$a;
+    flags: (0x100a) ACC_PRIVATE, ACC_STATIC, ACC_SYNTHETIC
+    Code:
+      stack=4, locals=0, args_size=0
+         0: iconst_2
+         1: anewarray     #2                  // class dys$z$a
+         4: dup
+         5: iconst_0
+         6: getstatic     #71                 // Field a:Ldys$z$a;
+         9: aastore
+        10: dup
+        11: iconst_1
+        12: getstatic     #73                 // Field b:Ldys$z$a;
+        15: aastore
+        16: areturn
+      LineNumberTable:
+        line 592: 0
+
+  static {};
+    descriptor: ()V
+    flags: (0x0008) ACC_STATIC
+    Code:
+      stack=8, locals=0, args_size=0
+         0: new           #2                  // class dys$z$a
+         3: dup
+         4: ldc           #77                 // String TYPE1
+         6: iconst_0
+         7: ldc           #79                 // String type_1
+         9: invokedynamic #95,  0             // InvokeDynamic #0:get:()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+        14: ldc2_w        #96                 // double 2.0d
+        17: invokespecial #99                 // Method "<init>":(Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+        20: putstatic     #71                 // Field a:Ldys$z$a;
+        23: new           #2                  // class dys$z$a
+        26: dup
+        27: ldc           #101                // String TYPE2
+        29: iconst_1
+        30: ldc           #103                // String type_2
+        32: invokedynamic #107,  0            // InvokeDynamic #1:get:()Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;
+        37: ldc2_w        #108                // double 3.0d
+        40: invokespecial #99                 // Method "<init>":(Ljava/lang/String;ILjava/lang/String;Lit/unimi/dsi/fastutil/doubles/Double2DoubleFunction;D)V
+        43: putstatic     #73                 // Field b:Ldys$z$a;
+        46: invokestatic  #111                // Method a:()[Ldys$z$a;
+        49: putstatic     #42                 // Field g:[Ldys$z$a;
+        52: invokedynamic #119,  0            // InvokeDynamic #2:get:()Ljava/util/function/Supplier;
+        57: invokestatic  #122                // InterfaceMethod azk.a:(Ljava/util/function/Supplier;)Lazk$a;
+        60: putstatic     #124                // Field c:Lcom/mojang/serialization/Codec;
+        63: return
+      LineNumberTable:
+        line 593: 0
+        line 594: 23
+        line 592: 46
+        line 597: 52
+}
+InnerClasses:
+  protected static final #13= #12 of #10; // z=class dys$z of class dys
+  public static final #14= #2 of #12;     // a=class dys$z$a of class dys$z
+  public static #14= #16 of #7;           // a=class azk$a of class azk
+  protected static final #14= #18 of #20; // a=class dzf$a of class dzf
+  public static final #25= #22 of #24;    // Lookup=class java/lang/invoke/MethodHandles$Lookup of class java/lang/invoke/MethodHandles
+Signature: #3                           // Ljava/lang/Enum<Ldys$z$a;>;Lazk;
+SourceFile: "SourceFile"
+BootstrapMethods:
+  0: #91 REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #81 (D)D
+      #84 REF_invokeStatic dzf$a.b:(D)D
+      #81 (D)D
+  1: #91 REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #81 (D)D
+      #106 REF_invokeStatic dzf$a.a:(D)D
+      #81 (D)D
+  2: #91 REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #112 ()Ljava/lang/Object;
+      #115 REF_invokeStatic dys$z$a.values:()[Ldys$z$a;
+      #116 ()[Ldys$z$a;
+NestHost: class dys

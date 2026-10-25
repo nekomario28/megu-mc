@@ -118,7 +118,8 @@ surface source の **decode は `apply` ではない**。深部の bedrock/deeps
 温度条件テストは biome leaf を明示しており、world の biome 選択の正しさを主張しない。
 block-state の比較は上記の有効入力に限定し、任意の不正 property の Codec エラー一致ではない。
 
-`weird_scaled_sampler`、preliminary surface/aquifer router、biome carver/spawner 方言、
-surface の scan context・biome lookup、同じ生成段階の全 chunk 比較は残る。
+このsurfaceチェックポイントではsamplerも未対応だったが、後続の[sampler/native noiseの限定検証](../weird-sampler/README.md)でゼロ代替を修復した。
+preliminary surface/aquifer router、biome carver/spawner 方言、
+surface の scan context・biome lookup、同じ生成段階の全 chunk 比較はこの記録では閉じていない。
 古い capture は再記録していない。forest の stone +4505 / deepslate −3397 をこの修正で解消したとも言わない。
 全 migration suite / `tests/verify.sh` / whole mutation campaign の受け入れ、push、canonical merge は別判定である。

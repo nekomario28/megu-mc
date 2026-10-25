@@ -97,6 +97,7 @@ cargo test --release --offline --locked -j 1 pinned_ -- --nocapture
 RTree の tie/search cache、気候ノイズの精度、surface、aquifer は別の比較対象。
 この気候 slice の後、[surface-loader](../surface-loader/README.md) で inline `surface_rule`、
 `Name` / `Properties`、biome temperature 条件を既存評価器へ接続した。
-**surface の全座標評価、biome `carvers`、`weird_scaled_sampler`、aquifer 意味論は未完**で、
+その後の[sampler/native noiseの限定検証](../weird-sampler/README.md)でsamplerのゼロ代替も修復した。
+**surface の全座標評価、biome `carvers`、aquifer 意味論は未完**で、
 世界の fixture 受け入れ・全ゲート緑・canonical への統合は主張しない。
-次は 1.21.1 実クラスを呼ぶ noise/aquifer oracle と同じ生成段階の比較で残差を分ける。
+現在の次の作業と出口条件は[ロードマップ](../../../specs/ROADMAP.md)を参照。

@@ -1,0 +1,376 @@
+Compiled from "SourceFile"
+public final class dyr$c extends java.lang.Record {
+  private final jm<eoh$a> b;
+
+  private final eoh c;
+
+  public static final com.mojang.serialization.Codec<dyr$c> a;
+
+  public dyr$c(jm<eoh$a>);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: aconst_null
+         3: invokespecial #31                 // Method "<init>":(Ljm;Leoh;)V
+         6: return
+
+  public dyr$c(jm<eoh$a>, eoh);
+    Code:
+         0: aload_0
+         1: invokespecial #38                 // Method java/lang/Record."<init>":()V
+         4: aload_0
+         5: aload_1
+         6: putfield      #40                 // Field b:Ljm;
+         9: aload_0
+        10: aload_2
+        11: putfield      #42                 // Field c:Leoh;
+        14: return
+
+  public double a(double, double, double);
+    Code:
+         0: aload_0
+         1: getfield      #42                 // Field c:Leoh;
+         4: ifnonnull     11
+         7: dconst_0
+         8: goto          22
+        11: aload_0
+        12: getfield      #42                 // Field c:Leoh;
+        15: dload_1
+        16: dload_3
+        17: dload         5
+        19: invokevirtual #46                 // Method eoh.a:(DDD)D
+        22: dreturn
+
+  public double a();
+    Code:
+         0: aload_0
+         1: getfield      #42                 // Field c:Leoh;
+         4: ifnonnull     13
+         7: ldc2_w        #50                 // double 2.0d
+        10: goto          20
+        13: aload_0
+        14: getfield      #42                 // Field c:Leoh;
+        17: invokevirtual #53                 // Method eoh.a:()D
+        20: dreturn
+
+  public final java.lang.String toString();
+    Code:
+         0: aload_0
+         1: invokedynamic #69,  0             // InvokeDynamic #0:toString:(Ldyr$c;)Ljava/lang/String;
+         6: areturn
+
+  public final int hashCode();
+    Code:
+         0: aload_0
+         1: invokedynamic #74,  0             // InvokeDynamic #0:hashCode:(Ldyr$c;)I
+         6: ireturn
+
+  public final boolean equals(java.lang.Object);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: invokedynamic #79,  0             // InvokeDynamic #0:equals:(Ldyr$c;Ljava/lang/Object;)Z
+         7: ireturn
+
+  public jm<eoh$a> b();
+    Code:
+         0: aload_0
+         1: getfield      #40                 // Field b:Ljm;
+         4: areturn
+
+  public eoh c();
+    Code:
+         0: aload_0
+         1: getfield      #42                 // Field c:Leoh;
+         4: areturn
+
+  private static dyr$c a(jm);
+    Code:
+         0: new           #2                  // class dyr$c
+         3: dup
+         4: aload_0
+         5: aconst_null
+         6: invokespecial #31                 // Method "<init>":(Ljm;Leoh;)V
+         9: areturn
+
+  static {};
+    Code:
+         0: getstatic     #87                 // Field eoh$a.b:Lcom/mojang/serialization/Codec;
+         3: invokedynamic #104,  0            // InvokeDynamic #1:apply:()Ljava/util/function/Function;
+         8: invokedynamic #110,  0            // InvokeDynamic #2:apply:()Ljava/util/function/Function;
+        13: invokeinterface #116,  3          // InterfaceMethod com/mojang/serialization/Codec.xmap:(Ljava/util/function/Function;Ljava/util/function/Function;)Lcom/mojang/serialization/Codec;
+        18: putstatic     #118                // Field a:Lcom/mojang/serialization/Codec;
+        21: return
+}
+Compiled from "SourceFile"
+interface dys$x extends dyr {
+  public abstract dyr j();
+
+  public default double a(dyr$b);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: aload_0
+         3: invokeinterface #21,  1           // InterfaceMethod j:()Ldyr;
+         8: aload_1
+         9: invokeinterface #23,  2           // InterfaceMethod dyr.a:(Ldyr$b;)D
+        14: invokeinterface #26,  4           // InterfaceMethod a:(Ldyr$b;D)D
+        19: dreturn
+
+  public default void a(double[], dyr$a);
+    Code:
+         0: aload_0
+         1: invokeinterface #21,  1           // InterfaceMethod j:()Ldyr;
+         6: aload_1
+         7: aload_2
+         8: invokeinterface #33,  3           // InterfaceMethod dyr.a:([DLdyr$a;)V
+        13: iconst_0
+        14: istore_3
+        15: iload_3
+        16: aload_1
+        17: arraylength
+        18: if_icmpge     46
+        21: aload_1
+        22: iload_3
+        23: aload_0
+        24: aload_2
+        25: iload_3
+        26: invokeinterface #36,  2           // InterfaceMethod dyr$a.a:(I)Ldyr$b;
+        31: aload_1
+        32: iload_3
+        33: daload
+        34: invokeinterface #26,  4           // InterfaceMethod a:(Ldyr$b;D)D
+        39: dastore
+        40: iinc          3, 1
+        43: goto          15
+        46: return
+
+  public abstract double a(dyr$b, double);
+}
+Compiled from "SourceFile"
+public class eoh {
+  private static final double a;
+
+  private static final double b;
+
+  private final double c;
+
+  private final eoi d;
+
+  private final eoi e;
+
+  private final double f;
+
+  private final eoh$a g;
+
+  public static eoh a(ayw, eoh$a);
+    Code:
+         0: new           #2                  // class eoh
+         3: dup
+         4: aload_0
+         5: aload_1
+         6: iconst_0
+         7: invokespecial #27                 // Method "<init>":(Layw;Leoh$a;Z)V
+        10: areturn
+
+  public static eoh a(ayw, int, double...);
+    Code:
+         0: aload_0
+         1: new           #7                  // class eoh$a
+         4: dup
+         5: iload_1
+         6: new           #33                 // class it/unimi/dsi/fastutil/doubles/DoubleArrayList
+         9: dup
+        10: aload_2
+        11: invokespecial #36                 // Method it/unimi/dsi/fastutil/doubles/DoubleArrayList."<init>":([D)V
+        14: invokespecial #39                 // Method eoh$a."<init>":(ILit/unimi/dsi/fastutil/doubles/DoubleList;)V
+        17: invokestatic  #41                 // Method b:(Layw;Leoh$a;)Leoh;
+        20: areturn
+
+  public static eoh b(ayw, eoh$a);
+    Code:
+         0: new           #2                  // class eoh
+         3: dup
+         4: aload_0
+         5: aload_1
+         6: iconst_1
+         7: invokespecial #27                 // Method "<init>":(Layw;Leoh$a;Z)V
+        10: areturn
+
+  private eoh(ayw, eoh$a, boolean);
+    Code:
+         0: aload_0
+         1: invokespecial #47                 // Method java/lang/Object."<init>":()V
+         4: aload_2
+         5: getfield      #49                 // Field eoh$a.c:I
+         8: istore        4
+        10: aload_2
+        11: getfield      #52                 // Field eoh$a.d:Lit/unimi/dsi/fastutil/doubles/DoubleList;
+        14: astore        5
+        16: aload_0
+        17: aload_2
+        18: putfield      #54                 // Field g:Leoh$a;
+        21: iload_3
+        22: ifeq          52
+        25: aload_0
+        26: aload_1
+        27: iload         4
+        29: aload         5
+        31: invokestatic  #59                 // Method eoi.b:(Layw;ILit/unimi/dsi/fastutil/doubles/DoubleList;)Leoi;
+        34: putfield      #61                 // Field d:Leoi;
+        37: aload_0
+        38: aload_1
+        39: iload         4
+        41: aload         5
+        43: invokestatic  #59                 // Method eoi.b:(Layw;ILit/unimi/dsi/fastutil/doubles/DoubleList;)Leoi;
+        46: putfield      #63                 // Field e:Leoi;
+        49: goto          76
+        52: aload_0
+        53: aload_1
+        54: iload         4
+        56: aload         5
+        58: invokestatic  #69                 // Method eoi.a:(Layw;ILit/unimi/dsi/fastutil/doubles/DoubleList;)Leoi;
+        61: putfield      #61                 // Field d:Leoi;
+        64: aload_0
+        65: aload_1
+        66: iload         4
+        68: aload         5
+        70: invokestatic  #69                 // Method eoi.a:(Layw;ILit/unimi/dsi/fastutil/doubles/DoubleList;)Leoi;
+        73: putfield      #63                 // Field e:Leoi;
+        76: ldc           #70                 // int 2147483647
+        78: istore        6
+        80: ldc           #71                 // int -2147483648
+        82: istore        7
+        84: aload         5
+        86: invokeinterface #75,  1           // InterfaceMethod it/unimi/dsi/fastutil/doubles/DoubleList.iterator:()Lit/unimi/dsi/fastutil/doubles/DoubleListIterator;
+        91: astore        8
+        93: aload         8
+        95: invokeinterface #81,  1           // InterfaceMethod it/unimi/dsi/fastutil/doubles/DoubleListIterator.hasNext:()Z
+       100: ifeq          149
+       103: aload         8
+       105: invokeinterface #85,  1           // InterfaceMethod it/unimi/dsi/fastutil/doubles/DoubleListIterator.nextIndex:()I
+       110: istore        9
+       112: aload         8
+       114: invokeinterface #89,  1           // InterfaceMethod it/unimi/dsi/fastutil/doubles/DoubleListIterator.nextDouble:()D
+       119: dstore        10
+       121: dload         10
+       123: dconst_0
+       124: dcmpl
+       125: ifeq          146
+       128: iload         6
+       130: iload         9
+       132: invokestatic  #95                 // Method java/lang/Math.min:(II)I
+       135: istore        6
+       137: iload         7
+       139: iload         9
+       141: invokestatic  #98                 // Method java/lang/Math.max:(II)I
+       144: istore        7
+       146: goto          93
+       149: aload_0
+       150: ldc2_w        #99                 // double 0.16666666666666666d
+       153: iload         7
+       155: iload         6
+       157: isub
+       158: invokestatic  #103                // Method a:(I)D
+       161: ddiv
+       162: putfield      #105                // Field c:D
+       165: aload_0
+       166: aload_0
+       167: getfield      #61                 // Field d:Leoi;
+       170: invokevirtual #107                // Method eoi.a:()D
+       173: aload_0
+       174: getfield      #63                 // Field e:Leoi;
+       177: invokevirtual #107                // Method eoi.a:()D
+       180: dadd
+       181: aload_0
+       182: getfield      #105                // Field c:D
+       185: dmul
+       186: putfield      #109                // Field f:D
+       189: return
+
+  public double a();
+    Code:
+         0: aload_0
+         1: getfield      #109                // Field f:D
+         4: dreturn
+
+  private static double a(int);
+    Code:
+         0: ldc2_w        #121                // double 0.1d
+         3: dconst_1
+         4: dconst_1
+         5: iload_0
+         6: iconst_1
+         7: iadd
+         8: i2d
+         9: ddiv
+        10: dadd
+        11: dmul
+        12: dreturn
+
+  public double a(double, double, double);
+    Code:
+         0: dload_1
+         1: ldc2_w        #10                 // double 1.0181268882175227d
+         4: dmul
+         5: dstore        7
+         7: dload_3
+         8: ldc2_w        #10                 // double 1.0181268882175227d
+        11: dmul
+        12: dstore        9
+        14: dload         5
+        16: ldc2_w        #10                 // double 1.0181268882175227d
+        19: dmul
+        20: dstore        11
+        22: aload_0
+        23: getfield      #61                 // Field d:Leoi;
+        26: dload_1
+        27: dload_3
+        28: dload         5
+        30: invokevirtual #125                // Method eoi.a:(DDD)D
+        33: aload_0
+        34: getfield      #63                 // Field e:Leoi;
+        37: dload         7
+        39: dload         9
+        41: dload         11
+        43: invokevirtual #125                // Method eoi.a:(DDD)D
+        46: dadd
+        47: aload_0
+        48: getfield      #105                // Field c:D
+        51: dmul
+        52: dreturn
+
+  public eoh$a b();
+    Code:
+         0: aload_0
+         1: getfield      #54                 // Field g:Leoh$a;
+         4: areturn
+
+  public void a(java.lang.StringBuilder);
+    Code:
+         0: aload_1
+         1: ldc           #130                // String NormalNoise {
+         3: invokevirtual #136                // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+         6: pop
+         7: aload_1
+         8: ldc           #138                // String first:
+        10: invokevirtual #136                // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+        13: pop
+        14: aload_0
+        15: getfield      #61                 // Field d:Leoi;
+        18: aload_1
+        19: invokevirtual #140                // Method eoi.a:(Ljava/lang/StringBuilder;)V
+        22: aload_1
+        23: ldc           #142                // String , second:
+        25: invokevirtual #136                // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+        28: pop
+        29: aload_0
+        30: getfield      #63                 // Field e:Leoi;
+        33: aload_1
+        34: invokevirtual #140                // Method eoi.a:(Ljava/lang/StringBuilder;)V
+        37: aload_1
+        38: ldc           #144                // String }
+        40: invokevirtual #136                // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+        43: pop
+        44: return
+}

@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 2 tests
+test worldgen::wg_tests::material_rules_load ... ok
+test worldgen::wg_tests::material_rules_real_ids ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 227 filtered out; finished in 0.15s

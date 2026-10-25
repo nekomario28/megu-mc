@@ -1,0 +1,33 @@
+Static recheck only (read/rg/git; no builds/tests/Java/Cargo/network).
+
+## Fact 1 — shared native constructor / non-sampler climate-terrain inputs — **SUPPORTED**
+
+- `specs/done/weird-sampler/README.md:15` states: `このnative constructorは共有されるため、cave以外の気候・地形noiseの入力も変わります。それらの利用先全体の受け入れは、この限定契約に含めません。`
+- Code confirms the sharing:
+  - `src/worldgen.rs:1188-1213` `noise_id` routes every noise JSON with `"amplitudes"` through `crate::generation_math::normal_new_amps`; it is the only noise-loading path (`normal_new` is the converted fallback at 1224).
+  - All 60 installed `datapacks/vanilla/data/minecraft/worldgen/noise/*.json` files use `firstOctave` + `amplitudes` (none use the converted keys), including `temperature`, `continentalness`, `erosion`, `offset`.
+  - Climate router fields (`src/worldgen.rs:696-716`) resolve through `router_df` → `resolve_ref`/`node` → shifted-noise parse → `noise_id`, so they consume the same constructor.
+  - `git diff src/generation_math.rs` shows `normal_new_amps` itself changed (old `build_octaves(...)`; new span-derived `value_factor` + separate octave weights in `normal_native_from_octaves`).
+- Exclusion of those consumers' acceptance is explicit in both places: done README above, and `evidence/foundation/weird-sampler/README.md` (“The native constructor is shared, so non-sampler climate/terrain noises change too… whole-world acceptance remains outside this seam”), consistent with the recorded `aquifer_vectors` failures.
+
+## Fact 2 — owner pointer includes `eval0_c` as well as `eval_c` — **SUPPORTED**
+
+`specs/done/weird-sampler/README.md:17` names `Gen::node` / `eval_c` / `eval0_c` / `push_kids`, and `normal_new_amps`. All are real, live definitions in the main checkout:
+
+- `src/worldgen.rs:1163` `fn node`
+- `src/worldgen.rs:1476` `fn eval_c`
+- `src/worldgen.rs:1651` `fn eval0_c` (dispatched from `eval_c` at line 1504)
+- `src/worldgen.rs:1519` `fn push_kids`
+- `src/generation_math.rs:876` `fn normal_new_amps`
+
+## Fact 3 — old spec absent / evidence links to done spec — **SUPPORTED**
+
+- `specs/weird-sampler` is absent from the worktree and from `HEAD` (`git ls-tree -r HEAD` empty; `test -e` absent; no tracked files). Only `specs/done/weird-sampler/` exists.
+- `evidence/foundation/weird-sampler/README.md:149` links `[the contract](../../../specs/done/weird-sampler/README.md)`, which resolves to the existing file. The reverse link in the done spec to the evidence README also resolves.
+
+## Remaining issues
+
+None against the three facts. Two non-blocking state notes:
+
+1. `evidence/foundation/weird-sampler/rationale_audit-worker-final.txt:26` still contains the pre-fix audit text claiming `specs/weird-sampler/README.md` exists and that the evidence README back-links to it. That is a historical review log, not a live pointer; no live document carries the stale path.
+2. `specs/done/weird-sampler/` and `evidence/foundation/weird-sampler/` are currently untracked (`??`) in this checkout. Their on-disk content and links are correct; the evidence README itself records that main integration was not performed.

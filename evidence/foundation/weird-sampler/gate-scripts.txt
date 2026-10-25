@@ -1,0 +1,15 @@
+gate self-test: assertion catches mutation PASS
+gate self-test: missing anchor PASS
+gate self-test: ignored test PASS
+gate self-test: zero matching tests PASS
+gate self-test: mutant stays green PASS
+gate self-test: compile failure PASS
+gate self-test: leftover mutation PASS
+gate self-test: wire harness error PASS
+gate self-test: guessed executable PASS
+gate self-test: missing Cargo artifact PASS
+gate self-test: unrelated failure is not proof PASS
+gate self-test: red baseline PASS
+gate self-test: red restored control PASS
+gate self-test: selected mutations PASS
+gate self-test: empty mutation selection PASS

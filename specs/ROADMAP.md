@@ -4,19 +4,19 @@
 
 ## いまの判断 — 広げる前に収束する
 
-Horizon / Valence から使える部品は既存 owner に取り込みましたが、現在の最初の障害は、固定1.21.1データの意味論が未完で、移行後の全体テストが赤いことです。[直近の実行結果と失敗名比較](../evidence/foundation/valence-primitives/README.md)を基準に、まずR0へ収束します。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
+Horizon / Valence から使える部品は既存 owner に取り込みましたが、現在の最初の障害は、固定1.21.1データの意味論が未完で、移行後の全体テストが赤いことです。[直近の実行結果と失敗名比較](../evidence/foundation/weird-sampler/README.md)を基準に、まずR0へ収束します。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
-**次の最小slice:** `weird_scaled_sampler` を、固定jarの実クラスで検査できる単位に切る。rarity mapperと基礎ノイズの入力・出力を照合し、本番density-function評価へ接続する。正の値を持つ入力と意図的な故障で、従来のゼロ代替を実際に置換したと証明する。全chunkを先に生成し直すことや、別のdonor機能の追加は次の作業にしません。
+**次の最小slice:** `aquifer_vectors` の一次失敗を、新しいプロセスと固定jarの実クラス対照で切り分ける。router入力・fluid level/spread・旧方言だけのexclusionの扱いを、同じseed・座標・stageで照合する。samplerとnative noiseの限定した修復は[その証拠](../evidence/foundation/weird-sampler/README.md)へ閉じ、全chunkの再生成や別のdonor機能へ先に広げません。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
 1. 全体テストの一次失敗とmutex poisonの連鎖を分ける。一次失敗は必要なら新しいプロセスで再現し、入力・loader・評価器・古いcaptureのどこに属するかを特定する。poisonを握り潰して緑にしない。
-2. `weird_scaled_sampler` を含む未評価density function、aquifer routerと旧方言にしか無いexclusionの扱い、biomeのcarver/spawner方言を、固定1.21.1の実際の意味で評価する。各差分を独立した小さい実クラス対照と本番経路のゲートにする。
-3. surfaceはsourceのdecodeや温度条件だけで閉じず、実際のbiome選択・列の走査状態・surface contextを含む適用結果を検査する。未知ノード・解決できない参照・落とした入力名は明示し、成功したように読み替えない。
+2. 残るdensity function / aquifer routerと旧方言にしか無いexclusionの扱い、biomeのcarver/spawner方言を、固定1.21.1の実際の意味で評価する。各差分を独立した小さい実クラス対照と本番経路のゲートにする。
+3. surfaceはsourceのdecodeや温度条件だけで閉じず、実際のbiome選択・列の走査状態・surface contextを含む適用結果を検査する。未知ノード・解決できない参照・落とした入力名は明示し、成功したように読み替えない。異なるseedや生成器の寿命をまたぐnoise cacheと、循環参照のplaceholderも、比較を隠さない条件で検査する。
 
 **出口:** 比較対象のrouter/biome/surface経路に未説明のゼロ代替・参照落ちが残らず、未解決・未対応の一覧と本番での到達性を説明できる。意味を変えた経路には実クラス対照と故障を検出するテストがある。全体の赤は一次原因へ帰属させ、原因未確認のcapture更新で消さない。個別の修正ごとに広い回帰を確認し、全体合格は必須テストが通ってから判定する。
 
-根拠: [自前データ監査](../evidence/foundation/audit-snapshots/README.md)、[surfaceの検証範囲](../evidence/foundation/surface-loader/README.md)。
+根拠: [自前データ監査](../evidence/foundation/audit-snapshots/README.md)、[sampler/native noiseの検証範囲](../evidence/foundation/weird-sampler/README.md)、[surfaceの検証範囲](../evidence/foundation/surface-loader/README.md)。
 
 ## R1 — 同じ生成stageでworldgenを再受け入れする
 

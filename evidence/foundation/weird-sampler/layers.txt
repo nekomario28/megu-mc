@@ -1,0 +1,6 @@
+gate_probe.py: [cycle] a: dependency cycle: a → b → a
+gate_probe.py: [forbidden-dependency] lower: 'lower' must not depend on 'upper'
+gate_probe.py: [layer-violation] lower: 'lower' (layer 1) depends on 'upper' (layer 0) — the dependency points upward
+gate_probe.py: [cycle] upper: dependency cycle: upper → lower → upper
+source graph: 19 modules, 44 edges, 0 named errors
+layers check: PASS (current debt is named, not resolved)

@@ -23,6 +23,54 @@ struct Spl {
     pts: Vec<(f64, SV, f64)>,
 }
 
+/// `dys$z$a`: the rarity mapper of a `weird_scaled_sampler`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RarityValueMapper {
+    Type1,
+    Type2,
+}
+
+impl RarityValueMapper {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "type_1" => Some(Self::Type1),
+            "type_2" => Some(Self::Type2),
+            _ => None,
+        }
+    }
+
+    /// `dzf$a.b` (TYPE1) / `dzf$a.a` (TYPE2). Strict comparisons: a value equal
+    /// to a threshold takes the next branch, and NaN falls through to the last.
+    fn rarity(self, input: f64) -> f64 {
+        match self {
+            Self::Type1 => {
+                if input < -0.5 {
+                    0.75
+                } else if input < 0.0 {
+                    1.0
+                } else if input < 0.5 {
+                    1.5
+                } else {
+                    2.0
+                }
+            }
+            Self::Type2 => {
+                if input < -0.75 {
+                    0.5
+                } else if input < -0.5 {
+                    0.75
+                } else if input < 0.5 {
+                    1.0
+                } else if input < 0.75 {
+                    2.0
+                } else {
+                    3.0
+                }
+            }
+        }
+    }
+}
+
 enum DF {
     C(f64),
     Add(usize, usize),
@@ -68,6 +116,11 @@ enum DF {
     },
     ShiftA(usize),
     ShiftB(usize),
+    WeirdScaledSampler {
+        input: usize,
+        ni: usize,
+        mapper: RarityValueMapper,
+    },
     RangeChoice {
         i: usize,
         mi: f64,
@@ -1095,6 +1148,10 @@ impl Gen {
         let d = match self.parse_df(&j, files) {
             Some(d) => d,
             None => {
+                // A failed parse must not leave this name pointing at the
+                // recursion placeholder: a retry has to reach `parse_df` again
+                // instead of silently resolving to `DF::Zero`.
+                self.names.remove(name);
                 trace("its own definition did not parse");
                 return None;
             }
@@ -1316,6 +1373,28 @@ impl Gen {
             "shift_b" | "shift_z" => {
                 DF::ShiftB(self.noise_id(j.get("noise").or_else(|| j.get("argument"))?.str())?)
             }
+            "weird_scaled_sampler" => {
+                let name = j
+                    .get("rarity_value_mapper")
+                    .map(J::str)
+                    .unwrap_or("<missing>");
+                let mapper = RarityValueMapper::parse(name).or_else(|| {
+                    Self::load_trace(&format!(
+                        "weird_scaled_sampler invalid rarity_value_mapper {name:?}"
+                    ));
+                    None
+                })?;
+                let name = j.get("noise").map(J::str).unwrap_or("<missing>");
+                let ni = self.noise_id(name).or_else(|| {
+                    Self::load_trace(&format!("weird_scaled_sampler unresolved noise {name:?}"));
+                    None
+                })?;
+                DF::WeirdScaledSampler {
+                    input: either(self, "input", "argument")?,
+                    ni,
+                    mapper,
+                }
+            }
             "range_choice" => DF::RangeChoice {
                 i: either(self, "input", "argument")?,
                 mi: n("min_inclusive"),
@@ -1453,6 +1532,7 @@ impl Gen {
             | DF::ShiftA(_)
             | DF::ShiftB(_)
             | DF::OldBlended { .. } => {}
+            DF::WeirdScaledSampler { input, .. } => out.push(*input),
             DF::Add(a, b)
             | DF::Sub(a, b)
             | DF::Mul(a, b)
@@ -1665,6 +1745,13 @@ impl Gen {
             }
             DF::ShiftA(ni) => self.noises[*ni].get(x as f64 * 0.25, 0.0, z as f64 * 0.25) * 4.0,
             DF::ShiftB(ni) => self.noises[*ni].get(z as f64 * 0.25, x as f64 * 0.25, 0.0) * 4.0,
+            DF::WeirdScaledSampler { input, ni, mapper } => {
+                let rarity = mapper.rarity(self.eval_c(*input, x, y, z, memo, cc));
+                let xd = x as f64 / rarity;
+                let yd = y as f64 / rarity;
+                let zd = z as f64 / rarity;
+                rarity * self.noises[*ni].get(xd, yd, zd).abs()
+            }
             DF::RangeChoice { i, mi, ma, wr, wo } => {
                 let v = self.eval_c(*i, x, y, z, memo, cc);
                 self.eval_c(
@@ -6098,3 +6185,7 @@ mod bedrock_bench {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "weird_sampler_tests.rs"]
+mod weird_sampler_tests;

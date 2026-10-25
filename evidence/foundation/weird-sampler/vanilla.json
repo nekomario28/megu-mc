@@ -1,0 +1,5325 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "rarity_bits": "3fe8000000000000"
+      },
+      "id": "weird-000",
+      "input_bits": "bfe0000000000001",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-001",
+      "input_bits": "bfe0000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-002",
+      "input_bits": "bfdfffffffffffff",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-003",
+      "input_bits": "8000000000000001",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff8000000000000"
+      },
+      "id": "weird-004",
+      "input_bits": "0000000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff8000000000000"
+      },
+      "id": "weird-005",
+      "input_bits": "0000000000000001",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff8000000000000"
+      },
+      "id": "weird-006",
+      "input_bits": "3fdfffffffffffff",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-007",
+      "input_bits": "3fe0000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-008",
+      "input_bits": "3fe0000000000001",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff8000000000000"
+      },
+      "id": "weird-009",
+      "input_bits": "8000000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-010",
+      "input_bits": "7ff0000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe8000000000000"
+      },
+      "id": "weird-011",
+      "input_bits": "fff0000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe8000000000000"
+      },
+      "id": "weird-012",
+      "input_bits": "bff8000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-013",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff8000000000000"
+      },
+      "id": "weird-014",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-015",
+      "input_bits": "3ff8000000000000",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-016",
+      "input_bits": "7ff8000000000001",
+      "mapper": "type_1",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe0000000000000"
+      },
+      "id": "weird-017",
+      "input_bits": "bfe8000000000001",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe8000000000000"
+      },
+      "id": "weird-018",
+      "input_bits": "bfe8000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe8000000000000"
+      },
+      "id": "weird-019",
+      "input_bits": "bfe7ffffffffffff",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe8000000000000"
+      },
+      "id": "weird-020",
+      "input_bits": "bfe0000000000001",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-021",
+      "input_bits": "bfe0000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-022",
+      "input_bits": "bfdfffffffffffff",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-023",
+      "input_bits": "3fdfffffffffffff",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-024",
+      "input_bits": "3fe0000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-025",
+      "input_bits": "3fe0000000000001",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-026",
+      "input_bits": "3fe7ffffffffffff",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4008000000000000"
+      },
+      "id": "weird-027",
+      "input_bits": "3fe8000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4008000000000000"
+      },
+      "id": "weird-028",
+      "input_bits": "3fe8000000000001",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-029",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3ff0000000000000"
+      },
+      "id": "weird-030",
+      "input_bits": "8000000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4008000000000000"
+      },
+      "id": "weird-031",
+      "input_bits": "7ff0000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe0000000000000"
+      },
+      "id": "weird-032",
+      "input_bits": "fff0000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe0000000000000"
+      },
+      "id": "weird-033",
+      "input_bits": "bff4000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "3fe8000000000000"
+      },
+      "id": "weird-034",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4000000000000000"
+      },
+      "id": "weird-035",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4008000000000000"
+      },
+      "id": "weird-036",
+      "input_bits": "3ff4000000000000",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "rarity_bits": "4008000000000000"
+      },
+      "id": "weird-037",
+      "input_bits": "7ff8000000000001",
+      "mapper": "type_2",
+      "op": "mapper"
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe59b7851fb3b4c",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fe0349a3d7c6c79"
+      },
+      "id": "weird-038",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc9a4dae3b7f41e",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc33ba42ac9f716"
+      },
+      "id": "weird-039",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3f75f0130c26167f",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3f75f0130c26167f"
+      },
+      "id": "weird-040",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc62d8ab3095d49",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fc62d8ab3095d49"
+      },
+      "id": "weird-041",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd838c4042d9a82",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe22a93032233e2"
+      },
+      "id": "weird-042",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfafaa31aa64dfa5",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fb7bfa53fcba7bc"
+      },
+      "id": "weird-043",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fcf7e0c2cdbba80",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fdf7e0c2cdbba80"
+      },
+      "id": "weird-044",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc6bdc721257589",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fd6bdc721257589"
+      },
+      "id": "weird-045",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc57275be64108d",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc015d84ecb0c6a"
+      },
+      "id": "weird-046",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fb8211c259e7d49",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb218d51c36ddf7"
+      },
+      "id": "weird-047",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd2959c82489bed",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fd2959c82489bed"
+      },
+      "id": "weird-048",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc91b760606e895",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fc91b760606e895"
+      },
+      "id": "weird-049",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd8418defcb6ba2",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe2312a73d890ba"
+      },
+      "id": "weird-050",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fcd4e6033fed055",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fd5fac826ff1c40"
+      },
+      "id": "weird-051",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfca06ca4e3441fb",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fda06ca4e3441fb"
+      },
+      "id": "weird-052",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fa3728dde22d68b",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fb3728dde22d68b"
+      },
+      "id": "weird-053",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe1fae601958ce3",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fdaf85902605354"
+      },
+      "id": "weird-054",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbb0ee590b2f4ad",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb44b2c2c863782"
+      },
+      "id": "weird-055",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfb3c05f3dc51837",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fb3c05f3dc51837"
+      },
+      "id": "weird-056",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfddf663470ad771",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fddf663470ad771"
+      },
+      "id": "weird-057",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf718fcfba237535",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3f7a57b797352fd0"
+      },
+      "id": "weird-058",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd5a13b834d3a43",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe038eca279ebb2"
+      },
+      "id": "weird-059",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd795e1662b818e",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fe795e1662b818e"
+      },
+      "id": "weird-060",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc1932da852a257",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fd1932da852a257"
+      },
+      "id": "weird-061",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbf513532e681eb",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb77ce7e62ce170"
+      },
+      "id": "weird-062",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc06b21d532c1f1",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb8a0b2bfcc22ea"
+      },
+      "id": "weird-063",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbd964e1f457001",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fbd964e1f457001"
+      },
+      "id": "weird-064",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbc7c0e253a6e5e",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fbc7c0e253a6e5e"
+      },
+      "id": "weird-065",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf8d4c6a008562f3",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3f95f94f80640a36"
+      },
+      "id": "weird-066",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd5e04d6cb6f6d4",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe0683a1189391f"
+      },
+      "id": "weird-067",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc70bfcfcb64f90",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fd70bfcfcb64f90"
+      },
+      "id": "weird-068",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fb96f2d6b676b49",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fc96f2d6b676b49"
+      },
+      "id": "weird-069",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf9bb72286ca68ed",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3f94c959e517ceb2"
+      },
+      "id": "weird-070",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fddc24f421c6f4a",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd651bb71955378"
+      },
+      "id": "weird-071",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3f9e105ff5c0fe85",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3f9e105ff5c0fe85"
+      },
+      "id": "weird-072",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fdd6ae14566d88c",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fdd6ae14566d88c"
+      },
+      "id": "weird-073",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc747dc5639a6f2",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fd175e540ab3d36"
+      },
+      "id": "weird-074",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfdfeb4ed305da40",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe7f07b1e4463b0"
+      },
+      "id": "weird-075",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf8b191774bda78b",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3f9b191774bda78b"
+      },
+      "id": "weird-076",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc7a8ebdf4589a1",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fd7a8ebdf4589a1"
+      },
+      "id": "weird-077",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe1650f2efc9ae5",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fda1796c67ae858"
+      },
+      "id": "weird-078",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc6b8de1a6e5874",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc10aa693d2c257"
+      },
+      "id": "weird-079",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc29f4447ce622e",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fc29f4447ce622e"
+      },
+      "id": "weird-080",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe4af6360faf70a",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fe4af6360faf70a"
+      },
+      "id": "weird-081",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfbb298d061c41dc",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fc45f29c4953165"
+      },
+      "id": "weird-082",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfa6def59911632a",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fb1273832cd0a60"
+      },
+      "id": "weird-083",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd9102bb0e24650",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fe9102bb0e24650"
+      },
+      "id": "weird-084",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc0143bd6030e71",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fd0143bd6030e71"
+      },
+      "id": "weird-085",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc9d5c61f8f1efa",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc3605497ab573c"
+      },
+      "id": "weird-086",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf661aadf425d22f",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3f609402771c5da3"
+      },
+      "id": "weird-087",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc7cd580be688ce",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fc7cd580be688ce"
+      },
+      "id": "weird-088",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd51db0bfc3e83c",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fd51db0bfc3e83c"
+      },
+      "id": "weird-089",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfa133308334427b",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fa9ccc8c4ce63b8"
+      },
+      "id": "weird-090",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd657e9f359e185",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe0c1ef76836924"
+      },
+      "id": "weird-091",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe1a39c6513f0a9",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3ff1a39c6513f0a9"
+      },
+      "id": "weird-092",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd0c5334f502b74",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fe0c5334f502b74"
+      },
+      "id": "weird-093",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc80fd12c57c746",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc20bdce141d574"
+      },
+      "id": "weird-094",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fb6173d58442516",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb0916e02331bd0"
+      },
+      "id": "weird-095",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd1a4d97e6de4d8",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fd1a4d97e6de4d8"
+      },
+      "id": "weird-096",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe0f06cb54d2d13",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fe0f06cb54d2d13"
+      },
+      "id": "weird-097",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fdbd17cfd9c0252",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe4dd1dbe3501be"
+      },
+      "id": "weird-098",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd6683a905b3a73",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe0ce2bec446bd6"
+      },
+      "id": "weird-099",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd38855dec1124d",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fe38855dec1124d"
+      },
+      "id": "weird-100",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fcd84b1083acb10",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fdd84b1083acb10"
+      },
+      "id": "weird-101",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd4b1af2ad13df4",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fcf0a86c039dcee"
+      },
+      "id": "weird-102",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fad809eb0f8f57a",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fa6207704bab81c"
+      },
+      "id": "weird-103",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc1d68e71669ae8",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fc1d68e71669ae8"
+      },
+      "id": "weird-104",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc4f8690149c348",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fc4f8690149c348"
+      },
+      "id": "weird-105",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fa97124ad859ae1",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fb314db82243429"
+      },
+      "id": "weird-106",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd626bd836a1292",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fe09d0e228f8dee"
+      },
+      "id": "weird-107",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfef352caf28f069",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fff352caf28f069"
+      },
+      "id": "weird-108",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf969d55bdd655ea",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fa69d55bdd655ea"
+      },
+      "id": "weird-109",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbfd1f950717f9c",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb7dd7afc551fb5"
+      },
+      "id": "weird-110",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc596b3dc2896ee",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc03106e51e7132"
+      },
+      "id": "weird-111",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fb71b33271e6fe0",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fb71b33271e6fe0"
+      },
+      "id": "weird-112",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc76edf5577abd8",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fc76edf5577abd8"
+      },
+      "id": "weird-113",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfa4a4a17effe026",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3faef6f23e7fd039"
+      },
+      "id": "weird-114",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbc98373a260c2e",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fc572296b9c8922"
+      },
+      "id": "weird-115",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd853fe4b4a9eba",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fe853fe4b4a9eba"
+      },
+      "id": "weird-116",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbd8036d82def60",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fcd8036d82def60"
+      },
+      "id": "weird-117",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfb3815830e1e835",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fad42044952dc50"
+      },
+      "id": "weird-118",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfcb777b54959e20",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc4999c7f703698"
+      },
+      "id": "weird-119",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc50dd4938a9362",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fc50dd4938a9362"
+      },
+      "id": "weird-120",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfcdca78af0081b9",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fcdca78af0081b9"
+      },
+      "id": "weird-121",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfa1636c9c1a9fba",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3faa1522ea27ef97"
+      },
+      "id": "weird-122",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc8f5a027648938",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fd2b8381d8b66ea"
+      },
+      "id": "weird-123",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfdb191d953225a9",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3feb191d953225a9"
+      },
+      "id": "weird-124",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fa95bcc0e91d09b",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fb95bcc0e91d09b"
+      },
+      "id": "weird-125",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd6afd7a6acbbed",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd103e1bd018cf2"
+      },
+      "id": "weird-126",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf954448e834c10c",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3f8fe66d5c4f2192"
+      },
+      "id": "weird-127",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfaae129514f1afe",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3faae129514f1afe"
+      },
+      "id": "weird-128",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfdd31ac3ae33d0c",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fdd31ac3ae33d0c"
+      },
+      "id": "weird-129",
+      "input_bits": "bfd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfcabe6ab9f1a1a7",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "c17312d000000000",
+          "0000000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fd40ed00b75393d"
+      },
+      "id": "weird-130",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd42a3fabaaf483",
+        "rarity_bits": "3ff8000000000000",
+        "scaled_bits": [
+          "417312d000000000",
+          "4069000000000000",
+          "c17312d000000000"
+        ],
+        "value_bits": "3fde3f5f81806ec4"
+      },
+      "id": "weird-131",
+      "input_bits": "3fd0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf9c4d9697c19cb4",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fac4d9697c19cb4"
+      },
+      "id": "weird-132",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fb49e9577a72de3",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fc49e9577a72de3"
+      },
+      "id": "weird-133",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_1",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe59b7851fb3b4c",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd59b7851fb3b4c"
+      },
+      "id": "weird-134",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd8733060193044",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4060000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc8733060193044"
+      },
+      "id": "weird-135",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfb095233287d0e4",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "bff5555555555555",
+          "c055555555555555",
+          "bff5555555555555"
+        ],
+        "value_bits": "3fa8dfb4cbcbb956"
+      },
+      "id": "weird-136",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd298f38383f703",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "4036aaaaaaaaaaab",
+          "4064000000000000",
+          "c044aaaaaaaaaaab"
+        ],
+        "value_bits": "3fcbe56d4545f284"
+      },
+      "id": "weird-137",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf93caba88f5be20",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "c17c9c3800000000",
+          "0000000000000000",
+          "c17c9c3800000000"
+        ],
+        "value_bits": "3f93caba88f5be20"
+      },
+      "id": "weird-138",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc329d230174229",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "417c9c3800000000",
+          "4072c00000000000",
+          "c17c9c3800000000"
+        ],
+        "value_bits": "3fc329d230174229"
+      },
+      "id": "weird-139",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fcf7e0c2cdbba80",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fdf7e0c2cdbba80"
+      },
+      "id": "weird-140",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc6bdc721257589",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fd6bdc721257589"
+      },
+      "id": "weird-141",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe59b7851fb3b4c",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "4000349a3d7c6c79"
+      },
+      "id": "weird-142",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fea15617601bd92",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4035555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "4003900918814e2e"
+      },
+      "id": "weird-143",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe326581ed00c19",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c000000000000000",
+          "c060000000000000",
+          "c000000000000000"
+        ],
+        "value_bits": "3fd326581ed00c19"
+      },
+      "id": "weird-144",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe1676db7959ab4",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "4041000000000000",
+          "406e000000000000",
+          "c04f000000000000"
+        ],
+        "value_bits": "3fd1676db7959ab4"
+      },
+      "id": "weird-145",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe2c288d62d6e49",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "c18312d000000000",
+          "0000000000000000",
+          "c18312d000000000"
+        ],
+        "value_bits": "3fdc23cd4144256e"
+      },
+      "id": "weird-146",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe7a47dd4febc3c",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "418312d000000000",
+          "4079000000000000",
+          "c18312d000000000"
+        ],
+        "value_bits": "3fe1bb5e5fbf0d2d"
+      },
+      "id": "weird-147",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe39e474fbe13db",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "c0fe240000000000",
+          "4069000000000000",
+          "4123f7e200000000"
+        ],
+        "value_bits": "3fe39e474fbe13db"
+      },
+      "id": "weird-148",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe04288be76cd82",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "40fe240000000000",
+          "c070000000000000",
+          "c123f7e200000000"
+        ],
+        "value_bits": "3fe04288be76cd82"
+      },
+      "id": "weird-149",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc57275be64108d",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd57275be64108d"
+      },
+      "id": "weird-150",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf46772b0b8db4aa",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4040000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3f56772b0b8db4aa"
+      },
+      "id": "weird-151",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfce8f1627626475",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "bfd5555555555555",
+          "c035555555555555",
+          "bfd5555555555555"
+        ],
+        "value_bits": "3fe6eb509d89cb58"
+      },
+      "id": "weird-152",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf9398a62081e155",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "4016aaaaaaaaaaab",
+          "4044000000000000",
+          "c024aaaaaaaaaaab"
+        ],
+        "value_bits": "3fad64f930c2d200"
+      },
+      "id": "weird-153",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfdd9b32eb9455f4",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c18c9c3800000000",
+          "0000000000000000",
+          "c18c9c3800000000"
+        ],
+        "value_bits": "3fcd9b32eb9455f4"
+      },
+      "id": "weird-154",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfb2c997a264ddfc",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "418c9c3800000000",
+          "4082c00000000000",
+          "c18c9c3800000000"
+        ],
+        "value_bits": "3fa2c997a264ddfc"
+      },
+      "id": "weird-155",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd0e84062b38377",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "c104180000000000",
+          "4070aaaaaaaaaaab",
+          "412a9fd800000000"
+        ],
+        "value_bits": "3fc95c60940d4532"
+      },
+      "id": "weird-156",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd6a10155faab1c",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "4104180000000000",
+          "c075555555555555",
+          "c12a9fd800000000"
+        ],
+        "value_bits": "3fd0f8c1007c0055"
+      },
+      "id": "weird-157",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe1fae601958ce3",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fe1fae601958ce3"
+      },
+      "id": "weird-158",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd60477d7de14ad",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4050000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd60477d7de14ad"
+      },
+      "id": "weird-159",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd30fda5f2fd134",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "bfe0000000000000",
+          "c040000000000000",
+          "bfe0000000000000"
+        ],
+        "value_bits": "3fe30fda5f2fd134"
+      },
+      "id": "weird-160",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc8130b5ddf91a3",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "4021000000000000",
+          "404e000000000000",
+          "c02f000000000000"
+        ],
+        "value_bits": "3fd8130b5ddf91a3"
+      },
+      "id": "weird-161",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfcc48cf9dd60bfa",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "c16312d000000000",
+          "0000000000000000",
+          "c16312d000000000"
+        ],
+        "value_bits": "3fe5369bb66088fc"
+      },
+      "id": "weird-162",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd007b26c9b5c11",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "416312d000000000",
+          "4059000000000000",
+          "c16312d000000000"
+        ],
+        "value_bits": "3fe80b8ba2e90a1a"
+      },
+      "id": "weird-163",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe1d2cee7f7374b",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c10e240000000000",
+          "4079000000000000",
+          "4133f7e200000000"
+        ],
+        "value_bits": "3fd1d2cee7f7374b"
+      },
+      "id": "weird-164",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd2567985f2a299",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "410e240000000000",
+          "c080000000000000",
+          "c133f7e200000000"
+        ],
+        "value_bits": "3fc2567985f2a299"
+      },
+      "id": "weird-165",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbf513532e681eb",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb77ce7e62ce170"
+      },
+      "id": "weird-166",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc06b21d532c1f1",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb8a0b2bfcc22ea"
+      },
+      "id": "weird-167",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbd964e1f457001",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fbd964e1f457001"
+      },
+      "id": "weird-168",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbc7c0e253a6e5e",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fbc7c0e253a6e5e"
+      },
+      "id": "weird-169",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc11ecc75e2fb5b",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c16c9c3800000000",
+          "0000000000000000",
+          "c16c9c3800000000"
+        ],
+        "value_bits": "3fd11ecc75e2fb5b"
+      },
+      "id": "weird-170",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe3ca0a5f3a8a61",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "416c9c3800000000",
+          "4062c00000000000",
+          "c16c9c3800000000"
+        ],
+        "value_bits": "3ff3ca0a5f3a8a61"
+      },
+      "id": "weird-171",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfb5304afca4ed04",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "c0e4180000000000",
+          "4050aaaaaaaaaaab",
+          "410a9fd800000000"
+        ],
+        "value_bits": "3fcfc8707af76386"
+      },
+      "id": "weird-172",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfab4b66b7339894",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "40e4180000000000",
+          "c055555555555555",
+          "c10a9fd800000000"
+        ],
+        "value_bits": "3fc4788d0966b26f"
+      },
+      "id": "weird-173",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf9bb72286ca68ed",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3f8bb72286ca68ed"
+      },
+      "id": "weird-174",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe6bee9b1f44950",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4060000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd6bee9b1f44950"
+      },
+      "id": "weird-175",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3f9391e207caf0f4",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "bff5555555555555",
+          "c055555555555555",
+          "bff5555555555555"
+        ],
+        "value_bits": "3f8d5ad30bb0696e"
+      },
+      "id": "weird-176",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd2562d7690a71f",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "4036aaaaaaaaaaab",
+          "4064000000000000",
+          "c044aaaaaaaaaaab"
+        ],
+        "value_bits": "3fcb814431d8faae"
+      },
+      "id": "weird-177",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe3d84bfaba0296",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "c17c9c3800000000",
+          "0000000000000000",
+          "c17c9c3800000000"
+        ],
+        "value_bits": "3fe3d84bfaba0296"
+      },
+      "id": "weird-178",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd46c9119eb0ddc",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "417c9c3800000000",
+          "4072c00000000000",
+          "c17c9c3800000000"
+        ],
+        "value_bits": "3fd46c9119eb0ddc"
+      },
+      "id": "weird-179",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf8b191774bda78b",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3f9b191774bda78b"
+      },
+      "id": "weird-180",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc7a8ebdf4589a1",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fd7a8ebdf4589a1"
+      },
+      "id": "weird-181",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf9bb72286ca68ed",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb4c959e517ceb2"
+      },
+      "id": "weird-182",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfbf1a7125fa2051",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4035555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd753d4dc7b983d"
+      },
+      "id": "weird-183",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bf9ffd0e5e9d15aa",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c000000000000000",
+          "c060000000000000",
+          "c000000000000000"
+        ],
+        "value_bits": "3f8ffd0e5e9d15aa"
+      },
+      "id": "weird-184",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd0637c4e80eb77",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "4041000000000000",
+          "406e000000000000",
+          "c04f000000000000"
+        ],
+        "value_bits": "3fc0637c4e80eb77"
+      },
+      "id": "weird-185",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc5a82a0aad00a4",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "c18312d000000000",
+          "0000000000000000",
+          "c18312d000000000"
+        ],
+        "value_bits": "3fc03e1f8801c07b"
+      },
+      "id": "weird-186",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fce8882dd42d15c",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "418312d000000000",
+          "4079000000000000",
+          "c18312d000000000"
+        ],
+        "value_bits": "3fc6e66225f21d05"
+      },
+      "id": "weird-187",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fdd6de74ea84592",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "c0fe240000000000",
+          "4069000000000000",
+          "4123f7e200000000"
+        ],
+        "value_bits": "3fdd6de74ea84592"
+      },
+      "id": "weird-188",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc894b7a121f81b",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "40fe240000000000",
+          "c070000000000000",
+          "c123f7e200000000"
+        ],
+        "value_bits": "3fc894b7a121f81b"
+      },
+      "id": "weird-189",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe1650f2efc9ae5",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3ff1650f2efc9ae5"
+      },
+      "id": "weird-190",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc006c310e17bd4",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4040000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd006c310e17bd4"
+      },
+      "id": "weird-191",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd176c430ed27b9",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "bfd5555555555555",
+          "c035555555555555",
+          "bfd5555555555555"
+        ],
+        "value_bits": "3fea32264963bb96"
+      },
+      "id": "weird-192",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd23ad7a57df12e",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "4016aaaaaaaaaaab",
+          "4044000000000000",
+          "c024aaaaaaaaaaab"
+        ],
+        "value_bits": "3feb5843783ce9c5"
+      },
+      "id": "weird-193",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 0
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc6283ee1aef93c",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c18c9c3800000000",
+          "0000000000000000",
+          "c18c9c3800000000"
+        ],
+        "value_bits": "3fb6283ee1aef93c"
+      },
+      "id": "weird-194",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd717d804189b0d",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "418c9c3800000000",
+          "4082c00000000000",
+          "c18c9c3800000000"
+        ],
+        "value_bits": "3fc717d804189b0d"
+      },
+      "id": "weird-195",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfdeedee6df3f579",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "c104180000000000",
+          "4070aaaaaaaaaaab",
+          "412a9fd800000000"
+        ],
+        "value_bits": "3fd73272d276f81b"
+      },
+      "id": "weird-196",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd79bbaa5650ef4",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "4104180000000000",
+          "c075555555555555",
+          "c12a9fd800000000"
+        ],
+        "value_bits": "3fd1b4cbfc0bcb37"
+      },
+      "id": "weird-197",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc9d5c61f8f1efa",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc9d5c61f8f1efa"
+      },
+      "id": "weird-198",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc10544839be236",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4050000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc10544839be236"
+      },
+      "id": "weird-199",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fa6ed83e9a63731",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "bfe0000000000000",
+          "c040000000000000",
+          "bfe0000000000000"
+        ],
+        "value_bits": "3fb6ed83e9a63731"
+      },
+      "id": "weird-200",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc79011a768bd8a",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "4021000000000000",
+          "404e000000000000",
+          "c02f000000000000"
+        ],
+        "value_bits": "3fd79011a768bd8a"
+      },
+      "id": "weird-201",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe09d843e2fd15a",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "c16312d000000000",
+          "0000000000000000",
+          "c16312d000000000"
+        ],
+        "value_bits": "3ff8ec465d47ba07"
+      },
+      "id": "weird-202",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc58e1ce709bb9d",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "416312d000000000",
+          "4059000000000000",
+          "c16312d000000000"
+        ],
+        "value_bits": "3fe02a95ad474cb6"
+      },
+      "id": "weird-203",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_2d",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe0c82a956a77c3",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c10e240000000000",
+          "4079000000000000",
+          "4133f7e200000000"
+        ],
+        "value_bits": "3fd0c82a956a77c3"
+      },
+      "id": "weird-204",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fddfe2b45aea6c4",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "410e240000000000",
+          "c080000000000000",
+          "c133f7e200000000"
+        ],
+        "value_bits": "3fcdfe2b45aea6c4"
+      },
+      "id": "weird-205",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc80fd12c57c746",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc20bdce141d574"
+      },
+      "id": "weird-206",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fb6173d58442516",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb0916e02331bd0"
+      },
+      "id": "weird-207",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfd1a4d97e6de4d8",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3fd1a4d97e6de4d8"
+      },
+      "id": "weird-208",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe0f06cb54d2d13",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fe0f06cb54d2d13"
+      },
+      "id": "weird-209",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe5607f881117d3",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c16c9c3800000000",
+          "0000000000000000",
+          "c16c9c3800000000"
+        ],
+        "value_bits": "3ff5607f881117d3"
+      },
+      "id": "weird-210",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fa63a6f7f9bca7e",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "416c9c3800000000",
+          "4062c00000000000",
+          "c16c9c3800000000"
+        ],
+        "value_bits": "3fb63a6f7f9bca7e"
+      },
+      "id": "weird-211",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfcddbe8664ed236",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "c0e4180000000000",
+          "4050aaaaaaaaaaab",
+          "410a9fd800000000"
+        ],
+        "value_bits": "3fe664ee4cbb1da8"
+      },
+      "id": "weird-212",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf78b682c6687fda",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "40e4180000000000",
+          "c055555555555555",
+          "c10a9fd800000000"
+        ],
+        "value_bits": "3f9288e214ce5fe4"
+      },
+      "id": "weird-213",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_1",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd4b1af2ad13df4",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fc4b1af2ad13df4"
+      },
+      "id": "weird-214",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc8340524e01da9",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4060000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb8340524e01da9"
+      },
+      "id": "weird-215",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf9e877063a72423",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "bff5555555555555",
+          "c055555555555555",
+          "bff5555555555555"
+        ],
+        "value_bits": "3f96e5944abd5b1a"
+      },
+      "id": "weird-216",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc659c788da1e86",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "4036aaaaaaaaaaab",
+          "4064000000000000",
+          "c044aaaaaaaaaaab"
+        ],
+        "value_bits": "3fc0c355a6a396e4"
+      },
+      "id": "weird-217",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd5d0da99da6cd8",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "c17c9c3800000000",
+          "0000000000000000",
+          "c17c9c3800000000"
+        ],
+        "value_bits": "3fd5d0da99da6cd8"
+      },
+      "id": "weird-218",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc3cedb10db81d2",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "417c9c3800000000",
+          "4072c00000000000",
+          "c17c9c3800000000"
+        ],
+        "value_bits": "3fc3cedb10db81d2"
+      },
+      "id": "weird-219",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfef352caf28f069",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c0ee240000000000",
+          "4059000000000000",
+          "4113f7e200000000"
+        ],
+        "value_bits": "3fff352caf28f069"
+      },
+      "id": "weird-220",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf969d55bdd655ea",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "40ee240000000000",
+          "c060000000000000",
+          "c113f7e200000000"
+        ],
+        "value_bits": "3fa69d55bdd655ea"
+      },
+      "id": "weird-221",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd4b1af2ad13df4",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fef0a86c039dcee"
+      },
+      "id": "weird-222",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc53b2581278b9d",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4035555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3fdfd8b841bb516c"
+      },
+      "id": "weird-223",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:spaghetti_3d_2",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3f9f20ab47f55f3c",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c000000000000000",
+          "c060000000000000",
+          "c000000000000000"
+        ],
+        "value_bits": "3f8f20ab47f55f3c"
+      },
+      "id": "weird-224",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fca4ceebb23565e",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "4041000000000000",
+          "406e000000000000",
+          "c04f000000000000"
+        ],
+        "value_bits": "3fba4ceebb23565e"
+      },
+      "id": "weird-225",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfda953c38930cec",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "c18312d000000000",
+          "0000000000000000",
+          "c18312d000000000"
+        ],
+        "value_bits": "3fd3efed2a6e49b1"
+      },
+      "id": "weird-226",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fe4c253324d3075",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "418312d000000000",
+          "4079000000000000",
+          "c18312d000000000"
+        ],
+        "value_bits": "3fdf237ccb73c8b0"
+      },
+      "id": "weird-227",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc4cf44d6dbe134",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "c0fe240000000000",
+          "4069000000000000",
+          "4123f7e200000000"
+        ],
+        "value_bits": "3fc4cf44d6dbe134"
+      },
+      "id": "weird-228",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfadde60721d3a84",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "40fe240000000000",
+          "c070000000000000",
+          "c123f7e200000000"
+        ],
+        "value_bits": "3fadde60721d3a84"
+      },
+      "id": "weird-229",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbfd1f950717f9c",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fcfd1f950717f9c"
+      },
+      "id": "weird-230",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc18167bad598b2",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4040000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd18167bad598b2"
+      },
+      "id": "weird-231",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fbda5cd51addc07",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "bfd5555555555555",
+          "c035555555555555",
+          "bfd5555555555555"
+        ],
+        "value_bits": "3fd63c59fd426505"
+      },
+      "id": "weird-232",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc0e3cdac58ad99",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "4016aaaaaaaaaaab",
+          "4044000000000000",
+          "c024aaaaaaaaaaab"
+        ],
+        "value_bits": "3fd955b482850466"
+      },
+      "id": "weird-233",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:temperature",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfdb9a9d53cec92f",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c18c9c3800000000",
+          "0000000000000000",
+          "c18c9c3800000000"
+        ],
+        "value_bits": "3fcb9a9d53cec92f"
+      },
+      "id": "weird-234",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fde013c9a43d5e3",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "418c9c3800000000",
+          "4082c00000000000",
+          "c18c9c3800000000"
+        ],
+        "value_bits": "3fce013c9a43d5e3"
+      },
+      "id": "weird-235",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc919e7fe502193",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "c104180000000000",
+          "4070aaaaaaaaaaab",
+          "412a9fd800000000"
+        ],
+        "value_bits": "3fc2d36dfebc192e"
+      },
+      "id": "weird-236",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fdebe44a2cbb487",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "4104180000000000",
+          "c075555555555555",
+          "c12a9fd800000000"
+        ],
+        "value_bits": "3fd70eb37a18c765"
+      },
+      "id": "weird-237",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfb3815830e1e835",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fb3815830e1e835"
+      },
+      "id": "weird-238",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfcbfeca977f64fb",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4050000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fcbfeca977f64fb"
+      },
+      "id": "weird-239",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3f6bd59b66ba531f",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "bfe0000000000000",
+          "c040000000000000",
+          "bfe0000000000000"
+        ],
+        "value_bits": "3f7bd59b66ba531f"
+      },
+      "id": "weird-240",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc873a5aeb5b100",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "4021000000000000",
+          "404e000000000000",
+          "c02f000000000000"
+        ],
+        "value_bits": "3fd873a5aeb5b100"
+      },
+      "id": "weird-241",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fec5cd644151f4d",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "c16312d000000000",
+          "0000000000000000",
+          "c16312d000000000"
+        ],
+        "value_bits": "400545a0b30fd77a"
+      },
+      "id": "weird-242",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fc336957bfb7004",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "416312d000000000",
+          "4059000000000000",
+          "c16312d000000000"
+        ],
+        "value_bits": "3fdcd1e039f92806"
+      },
+      "id": "weird-243",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:continentalness",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3f6cac729ffab998",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "c10e240000000000",
+          "4079000000000000",
+          "4133f7e200000000"
+        ],
+        "value_bits": "3f5cac729ffab998"
+      },
+      "id": "weird-244",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfbbc9b799dca2ef",
+        "rarity_bits": "3fe0000000000000",
+        "scaled_bits": [
+          "410e240000000000",
+          "c080000000000000",
+          "c133f7e200000000"
+        ],
+        "value_bits": "3fabc9b799dca2ef"
+      },
+      "id": "weird-245",
+      "input_bits": "bff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd6afd7a6acbbed",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "0000000000000000",
+          "0000000000000000"
+        ],
+        "value_bits": "3fd103e1bd018cf2"
+      },
+      "id": "weird-246",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf954448e834c10c",
+        "rarity_bits": "3fe8000000000000",
+        "scaled_bits": [
+          "0000000000000000",
+          "4055555555555555",
+          "0000000000000000"
+        ],
+        "value_bits": "3f8fe66d5c4f2192"
+      },
+      "id": "weird-247",
+      "input_bits": "bfe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        0,
+        64,
+        0
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfaae129514f1afe",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "bff0000000000000",
+          "c050000000000000",
+          "bff0000000000000"
+        ],
+        "value_bits": "3faae129514f1afe"
+      },
+      "id": "weird-248",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -1,
+        -64,
+        -1
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfdd31ac3ae33d0c",
+        "rarity_bits": "3ff0000000000000",
+        "scaled_bits": [
+          "4031000000000000",
+          "405e000000000000",
+          "c03f000000000000"
+        ],
+        "value_bits": "3fdd31ac3ae33d0c"
+      },
+      "id": "weird-249",
+      "input_bits": "0000000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        17,
+        120,
+        -31
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "3fd30688b1596850",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "c16c9c3800000000",
+          "0000000000000000",
+          "c16c9c3800000000"
+        ],
+        "value_bits": "3fe30688b1596850"
+      },
+      "id": "weird-250",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -30000000,
+        0,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfe42ba25a5c1f96",
+        "rarity_bits": "4000000000000000",
+        "scaled_bits": [
+          "416c9c3800000000",
+          "4062c00000000000",
+          "c16c9c3800000000"
+        ],
+        "value_bits": "3ff42ba25a5c1f96"
+      },
+      "id": "weird-251",
+      "input_bits": "3fe4000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        30000000,
+        300,
+        -30000000
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bfc500f972c69098",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "c0e4180000000000",
+          "4050aaaaaaaaaaab",
+          "410a9fd800000000"
+        ],
+        "value_bits": "3fdf81762c29d8e4"
+      },
+      "id": "weird-252",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        -123456,
+        200,
+        654321
+      ],
+      "seed": 42
+    },
+    {
+      "expected": {
+        "noise_bits": "bf665cc06e68af28",
+        "rarity_bits": "4008000000000000",
+        "scaled_bits": [
+          "40e4180000000000",
+          "c055555555555555",
+          "c10a9fd800000000"
+        ],
+        "value_bits": "3f80c59052ce835e"
+      },
+      "id": "weird-253",
+      "input_bits": "3ff0000000000000",
+      "mapper": "type_2",
+      "noise": "minecraft:offset",
+      "op": "sample",
+      "pos": [
+        123456,
+        -256,
+        -654321
+      ],
+      "seed": 42
+    }
+  ],
+  "minecraft": "1.21.1",
+  "noise_sha256": {
+    "minecraft:continentalness": "7a6cf57a552a237c3f02364db96c0f5ca858ce067e126fc2e23d607ea212c031",
+    "minecraft:offset": "685ec5d37332a7bcc5aec62ee1835b69af9c1c0b8daf7411753713ad135da59a",
+    "minecraft:spaghetti_2d": "37510ab77eedf6fb49aa8821739e0a10a91cd0b87aaa446dd1af737e83feff01",
+    "minecraft:spaghetti_3d_1": "37510ab77eedf6fb49aa8821739e0a10a91cd0b87aaa446dd1af737e83feff01",
+    "minecraft:spaghetti_3d_2": "37510ab77eedf6fb49aa8821739e0a10a91cd0b87aaa446dd1af737e83feff01",
+    "minecraft:temperature": "9d98e13680ce8a1bc9acf6ca30bda83b761b5109d37a0b6ed61b82f93dc5a61b"
+  },
+  "oracle_sha256": "afb97e062e222b55f737e4497fe23a2146493afe47acb171afbe99acfe820015",
+  "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+}

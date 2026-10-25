@@ -1,0 +1,22 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 32.77s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::weird_sampler_tests::weird_sampler_installed_nodes_are_nonzero ... FAILED
+
+failures:
+
+---- worldgen::weird_sampler_tests::weird_sampler_installed_nodes_are_nonzero stdout ----
+
+thread 'worldgen::weird_sampler_tests::weird_sampler_installed_nodes_are_nonzero' (3544016) panicked at src/weird_sampler_tests.rs:38:13:
+minecraft:overworld/caves/entrances: sampler still zero: [0.0, 0.0, 0.0]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    worldgen::weird_sampler_tests::weird_sampler_installed_nodes_are_nonzero
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 219 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `--bin mc-spine`
