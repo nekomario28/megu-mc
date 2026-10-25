@@ -21,7 +21,7 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **worldgenは進行中。** terrain-only比較と cave / cave-extra / canyon carver は限定した2×2固定具で0セル差を確認しています。これは全seed・全chunk・featureを含む一致を示しません。
 - **1.21.1 自前データへの移行は WIP。** 気候 router の inline 関数を読むようにし、built-in biome tree を同じ固定 jar から再生成しました。inline surface rule・ブロック状態・温度条件まで接続しましたが、surface 全評価・aquifer などは未完です。[surface の部分検証](../evidence/foundation/surface-loader/README.md)を参照。旧統合線の緑を移行ブランチに引き継ぎません。[Horizon の再利用判断と検証範囲](../evidence/foundation/horizon-reuse/README.md)を参照。
 - **Horizon の再利用を gameplay にも拡大。** 通常スロットとチェスト転送から、1.21.1 実クラス参照と本番 wire 検査を対にして進めています。[移植順序](horizon-gameplay/README.md)、[チェストの検証範囲](../evidence/gameplay/containers/README.md)、[アイテム回収の部分実装](../evidence/gameplay/inventory-pickup/README.md)を参照。エンティティ全般やチェストの開閉・同期まで移植済みという意味ではありません。
-- **Valence は部品単位で評価。** 旧版 framework や registry は導入せず、entity packet の角度境界を既存 owner で修復しました。[再利用判断](../evidence/foundation/valence-reuse/README.md)と[実クラス参照の範囲](../evidence/gameplay/entity-angles/README.md)を参照。entity 全体の移植・parity を意味しません。
+- **Valence は部品単位で評価。** 旧版 framework や registry は導入せず、entity角度・section palette・NBT文字列書き出し・有限AABB判定を既存 owner で修復しています。[再利用判断](../evidence/foundation/valence-reuse/README.md)、[角度](../evidence/gameplay/entity-angles/README.md)、[binary/geometryの検証範囲](../evidence/foundation/valence-primitives/README.md)、[分割した契約](valence-primitives/README.md)を参照。entity全体・任意NBT・worldのparityではありません。
 - **feature層は未確定。** 以前の差分値の一部は、生成stage・参照chunkの完成度・skip数が揃っていないため、現行feature残差として扱いません。保存world全体の差をfeature差と呼ばないこと。
 - **kelpは実装済みだがvanilla parityは未検証。** 合成回帰テストはありますが、既存のvanilla fixtureでは両側ともkelpが0個で、挙動を通った証拠になりません。正の参照セルを持つ完全生成chunkが必要です。
 - **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。

@@ -1,0 +1,24 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 32.28s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 4 tests
+
+thread 'primitives_tests::primitives_nbt_lore_append_preserves_java_string_bytes' (3391980) panicked at src/primitives_tests.rs:84:9:
+assertion `left == right` failed: primitive-031
+  left: Some([2, 8, 0, 6, 239, 191, 189, 239, 191, 189, 8, 0, 3, 110, 101, 119])
+ right: Some([2, 8, 0, 2, 192, 128, 8, 0, 3, 110, 101, 119])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test primitives_tests::primitives_nbt_lore_append_preserves_java_string_bytes ... FAILED
+test primitives_tests::primitives_nbt_bounded_prefix_does_not_split_a_scalar ... ok
+test primitives_tests::primitives_nbt_writers_match_native_modified_utf8 ... ok
+test primitives_tests::primitives_section_encoding_matches_native_palettes ... ok
+
+failures:
+
+failures:
+    primitives_tests::primitives_nbt_lore_append_preserves_java_string_bytes
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin mc-spine`

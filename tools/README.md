@@ -17,6 +17,7 @@
 | `inventory_oracle.py [--jar <server.jar>] [--check <fixture> \| --output <fixture>]` | 固定1.21.1の `Inventory.add` / merge・空き検索を実行する。入力／参照の完全性はcontainerと同じ検査を使う。Playerは生成を迂回した実ServerPlayerをabilities読み出しにだけ使い、entity/worldの実行とはしない。[範囲と再現](../evidence/gameplay/inventory-pickup/README.md)を参照 |
 | `surface_oracle.py [--jar <server.jar>] [--check <fixture> \| --output <fixture>]` | 固定1.21.1の `SurfaceRules.RuleSource.CODEC` / `BlockState.CODEC` / `Biome` の温度計算を呼ぶ。既定は入力・結果・provenance全体の照合。world／surface contextの実行とは区別する。[範囲と再現](../evidence/foundation/surface-loader/README.md)を参照 |
 | `packet_angles_oracle.py` | 固定1.21.1の実 spawn/teleport constructor と head量子化 helper を呼び、角度 byte の入力・結果・provenance を照合する。意図した記録のみ `--output`。[範囲と再現](../evidence/gameplay/entity-angles/README.md)を参照 |
+| `primitives_oracle.py` | 実1.21.1のpalette書き出し・StringTag・有限AABB clipを検査。既定は全入力・結果・provenanceを照合し、意図した記録だけ `--output`。worldや任意NBT decoderの検証とは分ける。[範囲](../evidence/foundation/valence-primitives/README.md)を参照 |
 | `vanilla_pack_from_jar.sh [dir]` | 同じ固定jarの worldgen JSON・block tag・built-in biome tree をまとめて更新する（JDK必須） |
 | `fixture_base.sh [dir]` | 固定具の基点（`CARVER_FIXTURE_BASE`、既定 `/tmp/carverfresh`）を組む。jar を sha1 で固定し、worldgen に効く設定をここで明示する。基点が無いと固定具は空振りする |
 | `carver_fixture.sh <tag> <cave> <extra> <canyon> [n]` | carver だけを残した world を作り、port と block 単位で diff。`ctl` pack で carver を差し替え |

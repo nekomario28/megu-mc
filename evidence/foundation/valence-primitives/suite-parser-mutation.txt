@@ -1,0 +1,72 @@
+BASELINE
+....
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+OK
+
+MUTANT
+FFFF
+======================================================================
+FAIL: test_exact_delta_does_not_claim_green_suite (__main__.SuiteCompareTests.test_exact_delta_does_not_claim_green_suite)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/yuu/oss-bounty/work/mc-spine/tests/suite_compare_test.py", line 38, in test_exact_delta_does_not_claim_green_suite
+    self.assertTrue(result["unchanged_failure_baseline"])
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_incomplete_and_duplicate_rosters_are_not_results (__main__.SuiteCompareTests.test_incomplete_and_duplicate_rosters_are_not_results)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/yuu/oss-bounty/work/mc-spine/tests/suite_compare_test.py", line 28, in test_incomplete_and_duplicate_rosters_are_not_results
+    with self.assertRaises(ValueError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_last_result_not_nested_child (__main__.SuiteCompareTests.test_last_result_not_nested_child)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/yuu/oss-bounty/work/mc-spine/tests/suite_compare_test.py", line 22, in test_last_result_not_nested_child
+    self.assertEqual((result["passed"], result["failed"], result["ignored"]), (194, 24, 1))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: (1, 0, 0) != (194, 24, 1)
+
+First differing element 0:
+1
+194
+
+- (1, 0, 0)
++ (194, 24, 1)
+
+======================================================================
+FAIL: test_same_count_different_failure_is_not_same_baseline (__main__.SuiteCompareTests.test_same_count_different_failure_is_not_same_baseline)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/yuu/oss-bounty/work/mc-spine/tests/suite_compare_test.py", line 34, in test_same_count_different_failure_is_not_same_baseline
+    self.assertEqual(result["added_failures"], ["b"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [] != ['b']
+
+Second list contains 1 additional elements.
+First extra element 0:
+'b'
+
+- []
++ ['b']
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.001s
+
+FAILED (failures=4)
+
+RESTORED
+....
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+OK
+
+suite parser mutation: 1 proved, source restored

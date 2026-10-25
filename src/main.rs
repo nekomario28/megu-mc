@@ -1240,11 +1240,10 @@ fn enchant_conflicts(a: i64, b: i64) -> bool {
     ];
     a != b && GROUPS.iter().any(|g| g.contains(&a) && g.contains(&b))
 }
-// TAG_String anonymous-NBT payload: type byte + u16 len + utf8
+// TAG_String anonymous-NBT payload: type byte + modified-UTF-8 string.
 fn nbt_string(text: &str) -> Vec<u8> {
     let mut d = vec![8u8];
-    d.extend_from_slice(&(text.len() as u16).to_be_bytes());
-    d.extend_from_slice(text.as_bytes());
+    nbt_str(&mut d, text);
     d
 }
 // parse the [k=v,...] suffix of a /give item argument; supported subset:
@@ -3144,45 +3143,70 @@ fn keepalive_time_tick() {
         run_function(&f, None, &mut None);
     }
 }
-/// The substeps a projectile samples in one tick. Vanilla intersects the whole
-/// segment a projectile travelled (`ProjectileUtil.getEntityHitResult`); the port
-/// samples that segment, and the samples have to span all of it or a projectile
-/// walks past a target the segment still crosses.
-const PROJECTILE_SWEEP_STEPS: usize = 4;
-
-/// The positions one tick's motion is sampled at: from where the projectile was
-/// (`pos - d`, `d` being the displacement this tick's integrator applied) to where
-/// it is now, `PROJECTILE_SWEEP_STEPS` intervals later.
-fn projectile_sweep(
-    pos: (f64, f64, f64),
-    d: (f64, f64, f64),
-) -> [(f64, f64, f64); PROJECTILE_SWEEP_STEPS + 1] {
-    let mut out = [(0.0, 0.0, 0.0); PROJECTILE_SWEEP_STEPS + 1];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;
-        *slot = (pos.0 - d.0 * back, pos.1 - d.1 * back, pos.2 - d.2 * back);
+/// Finite segment geometry. Unlike Valence's inclusive infinite ray, pinned
+/// AABB.clip tests entering faces, with epsilon on transverse bounds and open t.
+struct Aabb {
+    min: [f64; 3],
+    max: [f64; 3],
+}
+impl Aabb {
+    fn new(a: [f64; 3], b: [f64; 3]) -> Self {
+        Self {
+            min: std::array::from_fn(|i| a[i].min(b[i])),
+            max: std::array::from_fn(|i| a[i].max(b[i])),
+        }
     }
-    out
+    fn contains(&self, point: [f64; 3]) -> bool {
+        (0..3).all(|i| self.min[i] <= point[i] && point[i] < self.max[i])
+    }
+    fn clip(&self, start: [f64; 3], end: [f64; 3]) -> Option<[f64; 3]> {
+        const EPSILON: f64 = 1.0e-7;
+        let delta: [f64; 3] = std::array::from_fn(|i| end[i] - start[i]);
+        let mut nearest = 1.0;
+        let mut hit = false;
+        for axis in 0..3 {
+            let face = if delta[axis] > EPSILON {
+                self.min[axis]
+            } else if delta[axis] < -EPSILON {
+                self.max[axis]
+            } else {
+                continue;
+            };
+            let t = (face - start[axis]) / delta[axis];
+            let j = (axis + 1) % 3;
+            let k = (axis + 2) % 3;
+            let p = start[j] + t * delta[j];
+            let q = start[k] + t * delta[k];
+            if 0.0 < t
+                && t < nearest
+                && self.min[j] - EPSILON < p
+                && p < self.max[j] + EPSILON
+                && self.min[k] - EPSILON < q
+                && q < self.max[k] + EPSILON
+            {
+                nearest = t;
+                hit = true;
+            }
+        }
+        hit.then(|| std::array::from_fn(|i| start[i] + nearest * delta[i]))
+    }
 }
 
-/// The crude box both projectile hit tests put around a target's feet position:
-/// `rx` to either side, `y_lo` below and `y_hi` above. Generous on purpose - a
-/// block-accurate test would intersect the swept segment with the target's real
-/// AABB, which the port has not needed: at the speeds a vanilla arrow reaches, the
-/// samples below are closer together than the box is wide, so the box decides
-/// rather than the sampling. `the_projectile_sweep_covers_the_whole_tick` measures
-/// where that stops being true.
-fn projectile_reaches(
-    sample: (f64, f64, f64),
+/// Keep the existing approximate target boxes and start-inside contact policy;
+/// only sampling is retired here, not pose dimensions or nearest-target ordering.
+fn projectile_segment_hits(
+    start: [f64; 3],
+    end: [f64; 3],
     target: (f64, f64, f64),
     rx: f64,
     y_lo: f64,
     y_hi: f64,
 ) -> bool {
-    (target.0 - sample.0).abs() < rx
-        && (target.2 - sample.2).abs() < rx
-        && sample.1 > target.1 - y_lo
-        && sample.1 < target.1 + y_hi
+    let bounds = Aabb::new(
+        [target.0 - rx, target.1 - y_lo, target.2 - rx],
+        [target.0 + rx, target.1 + y_hi, target.2 + rx],
+    );
+    bounds.contains(start) || bounds.clip(start, end).is_some()
 }
 
 fn arrow_tick() {
@@ -3261,12 +3285,8 @@ fn arrow_tick() {
             a.y += a.dy;
             a.z += a.dz;
             let (ax, ay, az) = (a.x, a.y, a.z);
-            // The whole tick's motion, not a fraction of it: the samples used to
-            // start `0.675 * step` behind the arrow because a drag constant was
-            // standing in for a geometric span, which leaves the first third of the
-            // tick - where an arrow shot at point-blank range crosses its target -
-            // unsampled.
-            let sweep = projectile_sweep((ax, ay, az), (a.dx, a.dy, a.dz));
+            let segment_start = [ax - a.dx, ay - a.dy, az - a.dz];
+            let segment_end = [ax, ay, az];
             // block collision: arrows stick into solid blocks (vanilla)
             let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
             if bst != 0 && !mob_passable(bst) {
@@ -3286,85 +3306,88 @@ fn arrow_tick() {
                 (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
             });
             if a.owner >= 0 {
-                // player-shot arrow: hit mobs (sub-step to avoid tunneling)
-                // and other players (vanilla PvP) — the owner is skipped
+                // Player-shot arrow: intersect the whole segment with mobs and
+                // other players. The owner and last pierced target are skipped.
                 let ml = mobs().lock().unwrap();
                 'outer: for m in ml.iter() {
                     if m.eid == a.last_hit {
                         continue;
                     }
                     let (mx, my, mz, ..) = *m.pos.lock().unwrap();
-                    for s in sweep {
-                        if projectile_reaches(s, (mx, my, mz), 1.2, 0.4, 2.1) {
-                            let mut h = m.hp.lock().unwrap();
-                            *h -= a.dmg;
-                            let dh = *h;
-                            drop(h);
-                            if a.fire > 0 {
-                                *m.fuse.lock().unwrap() = a.fire;
-                            }
-                            if a.punch > 0 && a.kind == 0 {
-                                let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01);
-                                let kb = 0.3 * a.punch as f64;
-                                let mut p = m.pos.lock().unwrap();
-                                p.0 += a.dx / vl * kb;
-                                p.2 += a.dz / vl * kb;
-                                drop(p);
-                                broadcast_seen(m.eid, |_c| {
-                                    (
-                                        0x70,
-                                        entity_teleport(
-                                            m.eid,
-                                            m.pos.lock().unwrap().0,
-                                            m.pos.lock().unwrap().1,
-                                            m.pos.lock().unwrap().2,
-                                            m.pos.lock().unwrap().3,
-                                            m.pos.lock().unwrap().4,
-                                            true,
-                                        ),
-                                    )
-                                });
-                            }
-                            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-                            // channeling: trident hit in thunder calls lightning
-                            // (punch slot carries the level for kind==1)
-                            if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0
-                            {
-                                {
-                                    let mut h2 = m.hp.lock().unwrap();
-                                    *h2 -= 5.0;
-                                }
-                                *m.fuse.lock().unwrap() = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
-                                let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                bolts()
-                                    .lock()
-                                    .unwrap()
-                                    .push((be, server_ticks(BOLT_LIFE_GT) as i32));
-                                broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
-                                let ts =
-                                    sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
-                                broadcast(-1, |_c| (0x68, ts.clone()));
-                            }
-                            if dh <= 0.0 {
-                                mob_dead.push((m.eid, m.etype, mx, my, mz));
-                                let on = clients()
-                                    .lock()
-                                    .unwrap()
-                                    .iter()
-                                    .find(|c| c.eid == a.owner)
-                                    .map(|c| c.name.clone());
-                                if let Some(on) = on {
-                                    adv_event(&on, "player_killed_entity", Some(m.etype));
-                                }
-                            }
-                            if a.pierce > 0 {
-                                a.pierce -= 1;
-                                a.last_hit = m.eid;
-                            } else {
-                                dead.push(eid);
-                            }
-                            break 'outer;
+                    if projectile_segment_hits(
+                        segment_start,
+                        segment_end,
+                        (mx, my, mz),
+                        1.2,
+                        0.4,
+                        2.1,
+                    ) {
+                        let mut h = m.hp.lock().unwrap();
+                        *h -= a.dmg;
+                        let dh = *h;
+                        drop(h);
+                        if a.fire > 0 {
+                            *m.fuse.lock().unwrap() = a.fire;
                         }
+                        if a.punch > 0 && a.kind == 0 {
+                            let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01);
+                            let kb = 0.3 * a.punch as f64;
+                            let mut p = m.pos.lock().unwrap();
+                            p.0 += a.dx / vl * kb;
+                            p.2 += a.dz / vl * kb;
+                            drop(p);
+                            broadcast_seen(m.eid, |_c| {
+                                (
+                                    0x70,
+                                    entity_teleport(
+                                        m.eid,
+                                        m.pos.lock().unwrap().0,
+                                        m.pos.lock().unwrap().1,
+                                        m.pos.lock().unwrap().2,
+                                        m.pos.lock().unwrap().3,
+                                        m.pos.lock().unwrap().4,
+                                        true,
+                                    ),
+                                )
+                            });
+                        }
+                        broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+                        // channeling: trident hit in thunder calls lightning
+                        // (punch slot carries the level for kind==1)
+                        if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0 {
+                            {
+                                let mut h2 = m.hp.lock().unwrap();
+                                *h2 -= 5.0;
+                            }
+                            *m.fuse.lock().unwrap() = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
+                            let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                            bolts()
+                                .lock()
+                                .unwrap()
+                                .push((be, server_ticks(BOLT_LIFE_GT) as i32));
+                            broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
+                            let ts = sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
+                            broadcast(-1, |_c| (0x68, ts.clone()));
+                        }
+                        if dh <= 0.0 {
+                            mob_dead.push((m.eid, m.etype, mx, my, mz));
+                            let on = clients()
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .find(|c| c.eid == a.owner)
+                                .map(|c| c.name.clone());
+                            if let Some(on) = on {
+                                adv_event(&on, "player_killed_entity", Some(m.etype));
+                            }
+                        }
+                        if a.pierce > 0 {
+                            a.pierce -= 1;
+                            a.last_hit = m.eid;
+                        } else {
+                            dead.push(eid);
+                        }
+                        break 'outer;
                     }
                 }
                 drop(ml);
@@ -3378,20 +3401,25 @@ fn arrow_tick() {
                             let p = c.pos.lock().unwrap();
                             *p
                         };
-                        for s in sweep {
-                            if c.eid == a.last_hit {
-                                continue;
+                        if c.eid == a.last_hit {
+                            continue;
+                        }
+                        if projectile_segment_hits(
+                            segment_start,
+                            segment_end,
+                            (px, py, pz),
+                            0.7,
+                            0.3,
+                            2.0,
+                        ) {
+                            hits.push((c.eid, a.dmg));
+                            if a.pierce > 0 {
+                                a.pierce -= 1;
+                                a.last_hit = c.eid;
+                            } else {
+                                dead.push(eid);
                             }
-                            if projectile_reaches(s, (px, py, pz), 0.7, 0.3, 2.0) {
-                                hits.push((c.eid, a.dmg));
-                                if a.pierce > 0 {
-                                    a.pierce -= 1;
-                                    a.last_hit = c.eid;
-                                } else {
-                                    dead.push(eid);
-                                }
-                                break 'p2;
-                            }
+                            break 'p2;
                         }
                     }
                 }
@@ -3402,12 +3430,14 @@ fn arrow_tick() {
                         let p = c.pos.lock().unwrap();
                         *p
                     };
-                    // player hitbox ~0.6 wide, 1.8 tall
-                    if (px - ax).abs() < 0.7
-                        && (pz - az).abs() < 0.7
-                        && ay > py - 0.3
-                        && ay < py + 2.0
-                    {
+                    if projectile_segment_hits(
+                        segment_start,
+                        segment_end,
+                        (px, py, pz),
+                        0.7,
+                        0.3,
+                        2.0,
+                    ) {
                         hits.push((c.eid, a.dmg));
                         dead.push(eid);
                         break;
@@ -12142,94 +12172,68 @@ fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
 }
 
 // ---------- chunks ----------
+/// One network palette writer for block states and quart biomes. Values never
+/// straddle longs; global mode writes registry IDs, without a local palette.
+fn write_palette(
+    out: &mut Vec<u8>,
+    values: &[i64],
+    min_bits: usize,
+    max_bits: usize,
+    global_bits: usize,
+) {
+    let mut palette = Vec::new();
+    let mut lookup = HashMap::new();
+    let indices: Vec<_> = values
+        .iter()
+        .map(|&value| {
+            *lookup.entry(value).or_insert_with(|| {
+                let index = palette.len();
+                palette.push(value);
+                index
+            })
+        })
+        .collect();
+    if palette.len() == 1 {
+        out.push(0);
+        write_varint(out, palette[0]);
+        write_varint(out, 0);
+        return;
+    }
+    let bits = ((usize::BITS - (palette.len() - 1).leading_zeros()) as usize).max(min_bits);
+    let direct = bits > max_bits;
+    let bits = if direct { global_bits } else { bits };
+    out.push(bits as u8);
+    if !direct {
+        write_varint(out, palette.len() as i64);
+        for &value in &palette {
+            write_varint(out, value);
+        }
+    }
+    let per = 64 / bits;
+    write_varint(out, values.len().div_ceil(per) as i64);
+    for (chunk, indexed) in values.chunks(per).zip(indices.chunks(per)) {
+        let mut word = 0u64;
+        for (i, (&value, &index)) in chunk.iter().zip(indexed).enumerate() {
+            let entry = if direct { value as u64 } else { index as u64 };
+            word |= entry << (i * bits);
+        }
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+}
 fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
-    let mut v = Vec::new();
-    // palette
-    let mut pal: Vec<u32> = Vec::new();
-    let mut idx = vec![0u16; 4096];
-    for (i, &s) in states.iter().enumerate() {
-        match pal.iter().position(|&p| p == s) {
-            Some(p) => idx[i] = p as u16,
-            None => {
-                idx[i] = pal.len() as u16;
-                pal.push(s);
-            }
-        }
-    }
-    let bc = states.iter().filter(|&&s| s != 0).count() as i16;
-    v.extend_from_slice(&bc.to_be_bytes());
-    if pal.len() == 1 {
-        v.push(0);
-        write_varint(&mut v, pal[0] as i64);
-        write_varint(&mut v, 0);
-    } else {
-        let bits = 64 - (pal.len() as u64 - 1).leading_zeros();
-        let bpe = bits.max(4) as usize;
-        v.push(bpe as u8);
-        write_varint(&mut v, pal.len() as i64);
-        for &p in &pal {
-            write_varint(&mut v, p as i64);
-        }
-        let per = 64 / bpe;
-        let nlongs = 4096 / per + if 4096 % per != 0 { 1 } else { 0 };
-        write_varint(&mut v, nlongs as i64);
-        let mut longs = vec![0u64; nlongs];
-        for (i, v) in idx.iter().enumerate().take(4096) {
-            longs[i / per] |= (*v as u64) << ((i % per) * bpe);
-        }
-        for l in longs {
-            v.extend_from_slice(&l.to_be_bytes());
-        }
-    }
-    // biome palette: 4x4x4 quart cells, index (y<<4|z<<2|x)
-    let mut bpal: Vec<i64> = Vec::new();
-    let mut bidx = [0u8; 64];
-    for (i, &b) in biomes.iter().enumerate() {
-        match bpal.iter().position(|&p| p == b) {
-            Some(p) => bidx[i] = p as u8,
-            None => {
-                bidx[i] = bpal.len() as u8;
-                bpal.push(b);
-            }
-        }
-    }
-    if bpal.len() == 1 {
-        v.push(0);
-        write_varint(&mut v, bpal[0]);
-        write_varint(&mut v, 0);
-    } else {
-        // vanilla biome container: indirect palette up to 3 bpe, else 6-bit direct
-        let bits = (64 - (bpal.len() as u64 - 1).leading_zeros()).max(1) as usize;
-        let (bpe, direct) = if bits > 3 {
-            (6usize, true)
-        } else {
-            (bits, false)
-        };
-        v.push(bpe as u8);
-        if !direct {
-            write_varint(&mut v, bpal.len() as i64);
-            for &p in &bpal {
-                write_varint(&mut v, p);
-            }
-        }
-        let per = 64 / bpe;
-        let nlongs = 64 / per + if 64 % per != 0 { 1 } else { 0 };
-        write_varint(&mut v, nlongs as i64);
-        let mut longs = vec![0u64; nlongs];
-        for i in 0..64 {
-            let val = if direct {
-                biomes[i] as u64
-            } else {
-                bidx[i] as u64
-            };
-            let li = i / per;
-            longs[li] |= val << ((i % per) * bpe);
-        }
-        for l in longs {
-            v.extend_from_slice(&l.to_be_bytes());
-        }
-    }
-    v
+    let mut out = Vec::new();
+    // Protocol-767 air/void_air/cave_air IDs; do not depend on optional
+    // cross-version metadata to decide the section's wire count.
+    let non_air = states
+        .iter()
+        .filter(|&&state| !matches!(state, 0 | 12958 | 12959))
+        .count() as i16;
+    out.extend_from_slice(&non_air.to_be_bytes());
+    // The pinned registry has 26684 block states, requiring fifteen global bits.
+    write_palette(&mut out, &states.map(i64::from), 4, 8, 15);
+    // The protocol-767 configuration registry has 64 biome IDs (six global bits).
+    write_palette(&mut out, biomes, 1, 3, 6);
+    out
 }
 
 /// One 2048-byte sky light array per section, in the client's layout, from a per-column
@@ -12834,14 +12838,39 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
 }
 
 fn nbt_str(v: &mut Vec<u8>, s: &str) {
-    // NBT string length is u16 — clamp to a char boundary or oversized
-    // strings wrap the length field and desync every client that reads it.
-    let mut n = s.len().min(u16::MAX as usize);
-    while !s.is_char_boundary(n) {
-        n -= 1
+    // Java writeUTF encodes NUL as C0 80 and astral scalars as two three-byte
+    // UTF-16 surrogates. Keep our bounded-prefix policy for server-authored text
+    // (not Java's overflow exception), measured in encoded bytes, never half a scalar.
+    let start = v.len();
+    v.extend_from_slice(&[0, 0]);
+    for ch in s.chars() {
+        let size = match ch as u32 {
+            0 => 2,
+            1..=0x7f => 1,
+            0x80..=0x7ff => 2,
+            0x800..=0xffff => 3,
+            _ => 6,
+        };
+        if v.len() - start - 2 + size > u16::MAX as usize {
+            break;
+        }
+        for &unit in ch.encode_utf16(&mut [0; 2]).iter() {
+            match unit {
+                1..=0x7f => v.push(unit as u8),
+                0..=0x7ff => {
+                    v.push(0xc0 | (unit >> 6) as u8);
+                    v.push(0x80 | (unit & 0x3f) as u8);
+                }
+                _ => {
+                    v.push(0xe0 | (unit >> 12) as u8);
+                    v.push(0x80 | ((unit >> 6) & 0x3f) as u8);
+                    v.push(0x80 | (unit & 0x3f) as u8);
+                }
+            }
+        }
     }
-    v.extend_from_slice(&(n as u16).to_be_bytes());
-    v.extend_from_slice(&s.as_bytes()[..n]);
+    let length = (v.len() - start - 2) as u16;
+    v[start..start + 2].copy_from_slice(&length.to_be_bytes());
 }
 fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     let mut v = Vec::new();
@@ -15497,30 +15526,31 @@ fn apply_loot_funcs(st: &mut Stack, funcs: &[LootFunc]) {
         match f {
             LootFunc::SetName(t) => comp_set(&mut st.2, COMP_CUSTOM_NAME, nbt_string(t)),
             LootFunc::SetLore(ls, append) => {
-                let mut elems: Vec<String> = Vec::new();
+                let mut elems: Vec<Vec<u8>> = Vec::new();
                 if *append {
                     if let Some(d) = comp_get(&st.2, COMP_LORE) {
                         let (n, mut p) = read_varint_at(d, 0);
                         for _ in 0..n.min(64) {
-                            if p + 3 > d.len() {
+                            if p + 3 > d.len() || d[p] != 8 {
                                 break;
                             }
-                            p += 1; // tag byte
-                            let ln = u16::from_be_bytes([d[p], d[p + 1]]) as usize;
-                            p += 2;
-                            if p + ln > d.len() {
+                            let ln = u16::from_be_bytes([d[p + 1], d[p + 2]]) as usize;
+                            let end = p + 3 + ln;
+                            if end > d.len() {
                                 break;
                             }
-                            elems.push(String::from_utf8_lossy(&d[p..p + ln]).to_string());
-                            p += ln;
+                            // Existing StringTag bytes may contain Java lone surrogates.
+                            // Appending lore must not round-trip them through Rust String.
+                            elems.push(d[p..end].to_vec());
+                            p = end;
                         }
                     }
                 }
-                elems.extend(ls.iter().cloned());
+                elems.extend(ls.iter().map(|text| nbt_string(text)));
                 let mut d = Vec::new();
                 write_varint(&mut d, elems.len() as i64);
-                for t in &elems {
-                    d.extend_from_slice(&nbt_string(t));
+                for tag in &elems {
+                    d.extend_from_slice(tag);
                 }
                 comp_set(&mut st.2, COMP_LORE, d);
             }
@@ -21946,6 +21976,8 @@ mod furnace_cache_tests;
 mod merge_tests;
 #[cfg(test)]
 mod persistence_tests;
+#[cfg(test)]
+mod primitives_tests;
 #[cfg(test)]
 mod registry_tests;
 #[cfg(test)]

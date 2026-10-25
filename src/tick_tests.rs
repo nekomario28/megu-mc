@@ -3188,103 +3188,50 @@ fn region_change_mid_fall_keeps_the_entity() {
     assert_eq!(block_at(x, base + 1, z), sand, "it lands on the support");
 }
 
-/// The substep sampling exists so that a projectile crossing a target in one tick
-/// still hits it. The samples used to start `0.675 * step` behind the arrow - a
-/// drag constant standing in for a geometric span - so the first third of the tick
-/// was never tested, and an arrow fired at point-blank range crossed its target
-/// without touching it. This pins the span and measures where the old one missed.
+/// The continuous sweep includes the original tick start, not the old 0.675
+/// fraction. Keep the historical contact regression on the production geometry.
 #[test]
 fn the_projectile_sweep_covers_the_whole_tick() {
-    let pos = (10.0, 64.0, -3.0);
-    let step = (4.0, -0.5, 0.0);
-    let sweep = projectile_sweep(pos, step);
-    assert_eq!(
-        sweep[0],
-        (6.0, 64.5, -3.0),
-        "the first sample is the position the tick started from"
-    );
-    assert_eq!(
-        sweep[PROJECTILE_SWEEP_STEPS], pos,
-        "the last sample is the position the tick ended at"
-    );
+    assert!(projectile_segment_hits(
+        [6.0, 64.5, -3.0],
+        [10.0, 64.0, -3.0],
+        (6.0, 64.0, -3.0),
+        1.2,
+        0.4,
+        2.1,
+    ));
+    assert!(!projectile_segment_hits(
+        [7.975, 64.16875, -3.0],
+        [10.0, 64.0, -3.0],
+        (6.0, 64.0, -3.0),
+        1.2,
+        0.4,
+        2.1,
+    ));
+}
 
-    // A target standing where this tick started, so the segment crosses it at its
-    // very first point. `projectile_reaches` is the box the production hit test
-    // uses, and it is 1.2 wide, so the old span only missed targets *this* far
-    // behind its deepest sample.
-    let target = (6.0, 64.0, -3.0);
-    assert!(
-        projectile_reaches(sweep[0], target, 1.2, 0.4, 2.1),
-        "the tick's own segment must reach it"
-    );
-    // The span the code used before this fix, reconstructed here: 0.9 * (1 - t)
-    // behind the arrow for t = 0.25, 0.5, 0.75, 1.0.
-    let old: Vec<_> = (1..=4)
-        .map(|st| {
-            let t = st as f64 / 4.0;
-            (
-                pos.0 - step.0 * 0.9 * (1.0 - t),
-                pos.1 - step.1 * 0.9 * (1.0 - t),
-                pos.2 - step.2 * 0.9 * (1.0 - t),
-            )
-        })
-        .collect();
-    assert!(
-        !old.iter()
-            .any(|s| projectile_reaches(*s, target, 1.2, 0.4, 2.1)),
-        "the old span must miss it, or this test guards nothing: {old:?}"
-    );
-
-    // Where does the old span start missing targets the segment still crosses?
-    // Measured over the step sizes an arrow reaches: a fully charged shot moves
-    // 2.97 blocks on its first tick and a long-falling one approaches 4.95 with
-    // gravity 0.05 against drag 0.99 (the tick test below uses that step).
-    let mut first_gap = None;
-    for step_len in [1.0, 2.0, 2.97, 3.5, 3.7, 3.8, 4.0, 4.95, 6.0, 8.0] {
-        let mut gap = false;
-        let mut x = pos.0 - step_len;
-        while x <= pos.0 {
-            let target = (x, 64.0, -3.0);
-            let new_hits = projectile_sweep(pos, (step_len, 0.0, 0.0))
-                .iter()
-                .any(|s| projectile_reaches(*s, target, 1.2, 0.4, 2.1));
-            let old_hits = (1..=4).any(|st| {
-                let t = st as f64 / 4.0;
-                projectile_reaches(
-                    (pos.0 - step_len * 0.9 * (1.0 - t), pos.1, pos.2),
-                    target,
-                    1.2,
-                    0.4,
-                    2.1,
-                )
-            });
-            if new_hits && !old_hits {
-                gap = true;
-                break;
-            }
-            x += 0.01;
-        }
-        if gap && first_gap.is_none() {
-            first_gap = Some(step_len);
-        }
-    }
-    let first_gap = first_gap.expect("the old span never missed anything: nothing to fix");
-    // Measured: the deepest old sample sat 0.675 * step behind the arrow, so a
-    // target at the tick's start was outside its 1.2-wide box once
-    // 0.325 * step > 1.2, i.e. from 3.7 blocks per tick. A fully charged arrow
-    // steps 2.97 and never showed this; a long-falling one approaches 4.95 and did.
+/// Preserve point-blank start-inside behavior while retiring sampled intersection.
+#[test]
+fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
+    let (hp, arrow_x) = arrow_sweep_outcome(0.6, 5.0);
     assert_eq!(
-        first_gap, 3.7,
-        "the old span's first gap moved to {first_gap} blocks per tick"
+        hp,
+        Some(14.0),
+        "the arrow crossed the target but did not hit it: {arrow_x:?}"
     );
 }
 
-/// The same defect end to end: an arrow fired point-blank leaves the bow inside
-/// its target and is four blocks past it by the end of the same tick, so the
-/// crossing has to land on that tick. Only the production loop can show it - the
-/// unit test above pins the sampling, this pins that the arrow path uses it.
 #[test]
-fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
+fn primitives_arrow_tick_hits_between_the_old_samples() {
+    let (hp, arrow_x) = arrow_sweep_outcome(3.0, 20.0);
+    assert_eq!(
+        hp,
+        Some(14.0),
+        "continuous segment missed target between samples: {arrow_x:?}"
+    );
+}
+
+fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64>) {
     let _world_guard = world_guard();
     let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
@@ -3293,15 +3240,15 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
     let (old_hot, old_warm) = test_region();
     forceloaded().lock().unwrap().insert((0, 0));
-    // 5.0 blocks of velocity decay to a 4.95 block first step, which is what a
-    // long-falling arrow approaches (gravity 0.05 against drag 0.99).
+    // The point-blank case uses ordinary falling-arrow speed. The between-sample
+    // discriminator deliberately uses higher velocity, without claiming native physics.
     arrows().lock().unwrap().push(Arrow {
         eid: 8100,
         owner: 1,
         x: 0.5,
         y: 120.0,
         z: 0.5,
-        dx: 5.0,
+        dx: velocity,
         dy: 0.0,
         dz: 0.0,
         ttl: server_ticks(ARROW_TTL_GT) as i32,
@@ -3316,16 +3263,12 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
         last_hit: -1,
         stuck: false,
     });
-    // The target stands a tenth of a block in front of the archer, so the arrow's
-    // first tick starts inside its box and ends four blocks beyond it. It has to
-    // be this close: with the samples starting two thirds of the step behind the
-    // arrow, the nearest of them lands at x = 2.11, whose 1.2-wide box still
-    // reaches x = 0.91.
+    // One target isolates intersection from entity ordering or block occlusion.
     mobs().lock().unwrap().push(Arc::new(Mob {
         eid: 8101,
         uuid: [0u8; 16],
         etype: 124,
-        pos: Mutex::new((0.6, 120.0, 0.5, 0.0, 0.0)),
+        pos: Mutex::new((target_x, 120.0, 0.5, 0.0, 0.0)),
         hp: Mutex::new(20.0),
         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
         hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
@@ -3352,11 +3295,7 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
-    assert_eq!(
-        hp,
-        Some(14.0),
-        "the arrow crossed the target (the arrow ended at {arrow_x:?}) but did not hit it"
-    );
+    (hp, arrow_x)
 }
 
 #[test]

@@ -1,0 +1,6 @@
+base cf7f837915f3ba72c66a13c6c063c17e5aa2d564
+rustc 1.99.0 (b940084d7 2026-09-28)
+cargo 1.99.0 (5f94df478 2026-08-27)
+Python 3.14.8
+java_path /usr/lib/jvm/java-27-openjdk/bin/java
+recorded_at 2026-10-25T20:55:21+09:00

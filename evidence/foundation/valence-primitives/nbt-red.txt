@@ -1,0 +1,22 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 32.70s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 2 tests
+
+thread 'primitives_tests::primitives_nbt_writers_match_native_modified_utf8' (3388890) panicked at src/primitives_tests.rs:33:5:
+assertion `left == right` failed: primitive-031
+  left: (3, "62571891215b4efc1ceab744ce59dd0b66ea6f73")
+ right: (4, "d806f15be7d20290992e7ae9071b9ccfdfe34ac7")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test primitives_tests::primitives_nbt_writers_match_native_modified_utf8 ... FAILED
+test primitives_tests::primitives_section_encoding_matches_native_palettes ... ok
+
+failures:
+
+failures:
+    primitives_tests::primitives_nbt_writers_match_native_modified_utf8
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin mc-spine`

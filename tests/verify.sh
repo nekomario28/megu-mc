@@ -17,6 +17,8 @@ python3 tests/biome_tree_test.py
 python3 tests/container_oracle_test.py
 python3 tests/surface_oracle_test.py
 python3 tests/packet_angles_oracle_test.py
+python3 tests/primitives_oracle_test.py
+python3 tests/suite_compare_test.py
 
 echo "== module layering"
 python3 tests/layers_gate_test.py

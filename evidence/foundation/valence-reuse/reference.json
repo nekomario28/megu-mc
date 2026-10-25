@@ -1,5 +1,5 @@
 {
-  "adoption_mode": "BORROW_CONCEPT for byte-angle quantization boundary; no ByteAngle rounding formula, runtime dependency, ECS, or generated registry adopted.",
+  "adoption_mode": "BORROW_CONCEPT for byte-angle boundary and explicit AABB; ADAPT_ALGORITHM for network palettes and modified UTF-8 writes. No ByteAngle rounding formula, infinite-ray slab formula, JavaString representation, runtime dependency, ECS, or generated registry adopted.",
   "code_license": "MIT",
   "copyright": "2022 Ryan Johnson",
   "inspected_file_sha256": {
@@ -8,6 +8,7 @@
     "crates/java_string/src/cesu8.rs": "51be593274a5e680d426151772eb233cb420053db1a603d8870bb0017f443f9d",
     "crates/valence_entity/src/query.rs": "9ea5edb3f76780266a71c3470015a03b7ad6e14658058e1bec32aa8c37496416",
     "crates/valence_math/src/aabb.rs": "e8c5cce7de6522899326322040631123633ec4a379dc660100a5f800fb21fb09",
+    "crates/valence_nbt/src/binary/modified_utf8.rs": "c72d4731d64b6f00e887727a393e1de4de4f38eb80014c2391176fdfe169b724",
     "crates/valence_protocol/src/byte_angle.rs": "0896937ef9e0f6fd022897a581e673dc793ba9011bd1e2359bba505d0b6818a8",
     "crates/valence_protocol/src/lib.rs": "32f5db8d77a57d1ee791f1dab56d802e41919751f8fbd62ce42e6f5d14e9340c",
     "crates/valence_server/src/layer/chunk/paletted_container.rs": "962b2d1a16a84ca5ab503696de94521f3ade90133354239aaf8b1e8016a9cb62",

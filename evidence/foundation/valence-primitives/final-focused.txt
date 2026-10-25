@@ -1,0 +1,12 @@
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 6 tests
+test primitives_tests::primitives_aabb_clip_matches_native_finite_segments ... ok
+test primitives_tests::primitives_nbt_bounded_prefix_does_not_split_a_scalar ... ok
+test primitives_tests::primitives_nbt_lore_append_preserves_java_string_bytes ... ok
+test primitives_tests::primitives_nbt_writers_match_native_modified_utf8 ... ok
+test primitives_tests::primitives_section_encoding_matches_native_palettes ... ok
+test tick_tests::primitives_arrow_tick_hits_between_the_old_samples ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.10s

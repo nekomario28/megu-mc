@@ -1,0 +1,25 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 30.90s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 5 tests
+test primitives_tests::primitives_nbt_bounded_prefix_does_not_split_a_scalar ... ok
+test primitives_tests::primitives_nbt_lore_append_preserves_java_string_bytes ... ok
+test primitives_tests::primitives_nbt_writers_match_native_modified_utf8 ... ok
+test primitives_tests::primitives_section_encoding_matches_native_palettes ... ok
+test tick_tests::primitives_arrow_tick_hits_between_the_old_samples ...
+thread 'tick_tests::primitives_arrow_tick_hits_between_the_old_samples' (3398712) panicked at src/tick_tests.rs:3295:5:
+assertion `left == right` failed: continuous segment missed target between samples: Some(20.3)
+  left: Some(20.0)
+ right: Some(14.0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    tick_tests::primitives_arrow_tick_hits_between_the_old_samples
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `--bin mc-spine`

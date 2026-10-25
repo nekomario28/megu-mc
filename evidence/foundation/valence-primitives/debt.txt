@@ -1,0 +1,4 @@
+ok    wall-clock reads (clock RNG must not return): 0
+ok    ignored tests (parked gates): 1
+
+debt ratchet: 0 over limit

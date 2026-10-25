@@ -578,14 +578,14 @@ check "the heightmap a feature reads is the floor the blocks are at" \
   '        let terrain = base;' \
   heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface
 
-check "the projectile sweep spans the whole tick, not a fraction of it" \
-  src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
-  '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
+check "the projectile sweep retains start-inside contact" \
+  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
+  '    bounds.clip(start, end).is_some()' \
   the_projectile_sweep_covers_the_whole_tick
 
 check "an arrow hits the target it crosses on its first tick" \
-  src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
-  '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
+  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
+  '    bounds.clip(start, end).is_some()' \
   the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside
 
 check "a container transfer fills only the room in a matching stack" \
@@ -694,6 +694,52 @@ check "entity spawn head angles keep the constructor double precision" \
   src/main.rs '        angle_byte(f64::from(yaw) * 256.0 / 360.0, AngleRounding::Floor) as u8,' \
   '        angle(yaw) as u8,' \
   entity_angles_spawn_matches_native_constructors
+
+# Binary/geometry primitives: actual-class vectors plus production dispatch.
+check "section palettes switch to registry IDs above the indirect limit" \
+  src/main.rs '    let direct = bits > max_bits;' \
+  '    let direct = bits > max_bits + 1;' \
+  primitives_section_encoding_matches_native_palettes
+
+check "section packing leaves unused high bits instead of straddling words" \
+  src/main.rs '    let per = 64 / bits;' \
+  '    let per = (64 / bits).min(2);' \
+  primitives_section_encoding_matches_native_palettes
+
+check "section counts exclude all three pinned air states" \
+  src/main.rs '!matches!(state, 0 | 12958 | 12959)' \
+  'state != 0' \
+  primitives_section_encoding_matches_native_palettes
+
+check "NBT NUL uses modified UTF-8 instead of a zero byte" \
+  src/main.rs '            match unit {' \
+  $'            match unit {\n                0 => { v.push(0); continue; }' \
+  primitives_nbt_writers_match_native_modified_utf8
+
+check "NBT astral scalars retain both UTF-16 surrogates" \
+  src/main.rs '        for &unit in ch.encode_utf16(&mut [0; 2]).iter() {' \
+  '        for &unit in [ch as u16].iter() {' \
+  primitives_nbt_writers_match_native_modified_utf8
+
+check "lore append preserves opaque modified UTF-8 bytes" \
+  src/main.rs '                            elems.push(d[p..end].to_vec());' \
+  '                            elems.push(nbt_string(&String::from_utf8_lossy(&d[p + 3..end])));' \
+  primitives_nbt_lore_append_preserves_java_string_bytes
+
+check "AABB clip excludes the finite segment endpoint" \
+  src/main.rs '                && t < nearest' \
+  '                && t <= nearest' \
+  primitives_aabb_clip_matches_native_finite_segments
+
+check "AABB clip keeps the pinned epsilon" \
+  src/main.rs '        const EPSILON: f64 = 1.0e-7;' \
+  '        const EPSILON: f64 = 0.0;' \
+  primitives_aabb_clip_matches_native_finite_segments
+
+check "arrow tick uses the continuous segment rather than just its end" \
+  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
+  '    bounds.contains(end)' \
+  primitives_arrow_tick_hits_between_the_old_samples
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

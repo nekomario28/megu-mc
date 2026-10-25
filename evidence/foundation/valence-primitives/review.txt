@@ -1,0 +1,2548 @@
+OpenAI Codex v0.162.1
+--------
+workdir: /tmp/mc-primitives-review-wt
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: low
+reasoning summaries: none
+session id: 01a172dc-1f97-7eb1-a260-4a4dd6038672
+--------
+user
+<task>Review the uncommitted diff in this checkout for actionable correctness regressions, following code-review and refactor-clean. Read-only STATIC review only: do not run builds, tests, Java, downloads, or servers. This snapshot is copied from an implementing worktree whose mutation campaign is running elsewhere. Focus on the changed section palette writer, modified-UTF-8 writers and lore preservation, finite AABB clip and arrow dispatch, and oracle/test blind spots. Separate existing documented limitations from regressions caused by this diff.</task><output_contract>Report concrete actionable findings with paths and reasoning; if none, say so. State that this is static review and identify any evidence limits. Do not change files.</output_contract>
+2026-10-25T11:39:51.357568Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 426 Upgrade Required, url: ws://127.0.0.1:17841/v1/responses
+warning: loading hooks from both /home/yuu/.codex/hooks.json and /home/yuu/.codex/config.toml; prefer a single representation for this layer
+warning: loading hooks from both /home/yuu/.codex/hooks.json and /home/yuu/.codex/config.toml; prefer a single representation for this layer
+exec
+/usr/bin/bash -lc "cat /home/yuu/.codex/skills/code-review/SKILL.md; cat /home/yuu/.agents/skills/refactor-clean/SKILL.md; rg -n 'mc-spine' /home/yuu/.codex/memories/MEMORY.md" in /tmp/mc-primitives-review-wt
+ succeeded in 0ms:
+---
+name: code-review
+description: Review changed code for naming, stale references, unnecessary complexity, and comment quality. Use after implementation, before committing, for code audits, or when AGENTS.md/Skills and existing code disagree about conventions.
+allowed-tools: Read Grep Glob Bash
+metadata:
+  owner: nekomario28-project-incubator
+  version: "4"
+---
+
+# Code Review
+
+Review the diff or specified files against these principles.
+
+## First: distinguish description from prescription
+
+When an instruction file or Skill conflicts with code, classify the statement before applying the checklist: current-convention description, explicit migration, or binding safety/authority constraint. Verify the relevant implementation, callers and original tests, not a lone example or repository-wide majority. Preserve verified conventions for descriptive conflicts; follow explicit migrations within scope; never waive safety/authority constraints because code violates them. If units, rounding or other correctness/safety semantics remain unresolved after inspection, stop only the affected edit and ask the concrete missing decision first; continue independent safe work. Flag a guessed default, rounding mode or type-based policy even when the final reply offers to change it: post-hoc disclosure is not prior clarification.
+
+Check for unrequested rewrites made only to align with a description, especially edits to tests that hide compatibility breaks. Preserve the original tests as an independent check (use a temporary copy/worktree if needed; do not overwrite shared work). Report each documentation/code inconsistency and the chosen action in the final reply; do not call a description stale solely because code differs.
+
+## 1. Names must reflect current reality
+
+- Variable and function names should describe what they ARE, not what they used to be.
+- If the underlying mechanism changed (e.g. FUSE → NFS), all related names must update.
+- Ask: would a new reader be confused by this name?
+
+## 2. No stale references
+
+- After refactoring, grep for references to the old approach — dead detection logic, abandoned feature flags, comments mentioning removed code.
+- If something was tried and reverted, remove ALL traces. The codebase should look like the current approach was always the plan.
+
+## 3. Simplify detection and guard logic
+
+- A gate like "can this feature run" should check the ONE thing that actually matters.
+- Don't chain fallback detections (binary exists OR source exists OR toolchain exists) when one check covers it.
+
+## 4. Comments document WHY, not WHAT HAPPENED
+
+- **Keep:** non-obvious technical discoveries, platform quirks, "if you remove this, X breaks because Y."
+  - Good: `// com.apple.provenance causes SIGKILL when spawned as child process`
+  - Good: `// umount while server is alive panics the macOS NFS client`
+  - Good: `// NFS client uses cookie verifier to decide if cached readdir is valid`
+- **Remove:** narrative of what was tried, what was abandoned, what was renamed.
+  - Bad: `// We changed this from cp to cat to work around the provenance issue`
+  - Bad: `// Wrapper added because FUSE-T was zero-padding (see commit abc123)`
+  - Bad: `// Previously this was called fuseAvailable but we renamed it`
+- **Remove:** comments that just restate what the code does without adding reasoning.
+- Often no comment is needed at all.
+
+## 5. Separate install-time from runtime
+
+- Install scripts set up prerequisites (toolchains, system deps).
+- Runtime commands handle compilation, caching, binary management.
+- Don't mix these. If the install script is compiling binaries that the runtime also compiles, one of them is wrong.
+
+## 6. No intermediary artifacts
+
+- After iterating through multiple approaches, audit for logic that only existed as a stepping stone.
+- If a workaround was added for approach A and you switched to approach B, remove the workaround even if it's harmless.
+- The code should read as if written from scratch by someone who already knew the right answer.
+
+## 7. Tighten guarantees after changes
+
+- When a change makes something guaranteed (e.g. a variable is now always set, a file is always created, a function always returns), audit downstream code that still guards against the old "maybe" state.
+- Redundant null checks, fallback defaults, and `if (x)` guards on values that can no longer be null are misleading — they imply a possibility that doesn't exist.
+- Prefer `const` over `let` when reassignment is no longer needed.
+- **Never suppress a signal — fix the root cause.** `_` prefix on unused params, `// @ts-ignore`, `eslint-disable`, `as any` — these all hide real issues. If a parameter is unused, DELETE it and cascade the removal to every caller. If a type doesn't match, fix the type. Run the checker, fix every error, repeat. Mechanical changes across many files is exactly what an agent excels at — there is no "too many callers."
+
+## 8. When changes are tangled, start clean
+
+- If a file has been through 3+ rounds of conflicting edits, `git restore` it and re-apply only what's needed.
+- Don't try to surgically fix a mess — starting clean is faster and less error-prone.
+
+## 9. Tests must verify actual values, not just collection sizes
+
+- When testing deduplication, normalization, or idempotent operations, assert on the **stored value**, not just `toHaveLength(1)`.
+- Length alone doesn't prove the logic worked — a broken normalizer could silently drop one input, or store two different normalized forms that happen to match.
+- Pattern: add value in format A, re-add in format B, then assert both that the count is 1 AND that the stored value equals the expected normalized form.
+- Bad: `expect(data.phones).toHaveLength(1)` — passes even if normalization is broken
+- Good: `expect(data.phones).toHaveLength(1); expect(data.phones[0]).toBe('+12125551234')` — proves normalization recognized both formats
+
+## 10. No thin wrappers or re-export-only modules
+
+- If a module only forwards another package's functions or types, delete it and import the original package directly.
+- Do not preserve local compatibility shims for scaffold code or unshipped branch work. Replace the scaffold outright.
+- Re-export barrels are not useful unless they define a real public boundary with project-specific semantics. Avoid creating files whose only job is `export * from ...`.
+- Prefer using the upstream API name directly over inventing local aliases like `discoverAll()` for `loadSkills()`.
+
+## 11. Extract only around real ownership boundaries
+
+- Do not split files just to reduce line count. A new file should own a coherent responsibility that a reader can name.
+- Extract modules when they concentrate related policy, state transitions, resource handling, or domain-specific behavior.
+- Avoid moving one-off helper functions into a new file if the caller still needs to understand all the details to use them.
+- A good split usually reduces import pressure in the original file because dependencies move with the responsibility they serve.
+- If extraction increases total indirection without clarifying ownership, keep the code local.
+
+## 12. Decouple tests from implementation — drive the system end-to-end
+
+The most valuable test suite is the one most decoupled from the implementation it covers. Decoupled to the point where you exercise the backend by driving the frontend, and exercise a module by going through the same entry point a user goes through. A test that pokes at internals freezes the internals; a test that drives the public surface frees you to refactor everything underneath.
+
+- **Prefer the outermost entry point that still gives a fast, deterministic signal.** CLI binary > top-level exported function > internal helper > private method. If the CLI is what users invoke, write the test against the CLI. If a TUI is what users see, drive it through the same input pipeline real keystrokes hit, and assert on the rendered frame, not on intermediate state.
+- **Test behavior, not structure.** Assert on observable outcomes — exit codes, stdout, rendered output, files on disk, HTTP responses, persisted rows. Do not assert on which functions were called, in what order, with which intermediate shapes. Those are implementation details that should be free to change.
+- **A passing test should mean a real user gets the right result.** If a test can pass while the production path is broken, the test is wired wrong. Common smells: stubbing the thing under test, bypassing the router/dispatcher/parser, hand-constructing internal events that production would have built from input.
+- **Harnesses must wire the system the way production wires it.** Optional inputs that are always set in practice are part of the contract — pass equivalents in the harness (e.g. a settled status stream, the modal config, the same env vars). If you found a bug only by running against a real environment, the harness skipped something production sets; fix the harness so the next regression in the same shape is caught by the test suite, not by a user.
+- **Coupled tests are a refactor tax.** When renaming an internal function or moving a module breaks dozens of tests without changing any user-visible behavior, the suite is testing the wrong layer. Rewrite those tests against the outer surface and delete the brittle ones.
+- **Reserve unit tests for genuinely tricky pure logic** — parsers, normalizers, schedulers, state machines with subtle invariants. Everything else earns more value as an integration or end-to-end test.
+
+## 13. A failing check can be a toolchain defect, not a code defect
+
+Before hand-writing a type, adding a cast, pinning a value, or restructuring code to make a checker (type-checker, compiler, linter, test runner, build) pass, confirm the failure is a CODE defect and not a toolchain/environment artifact. Patching code to satisfy a broken or mismatched tool is a workaround that masks the real problem — the never-suppress-a-signal rule, one level up.
+
+- **Reproduce under the exact toolchain that reports the failure** — the CI/deploy version and config, not just your local one. A green local check proves nothing if it ran a different version: a pinned prerelease, a preview build, or version drift between your machine and CI can pass locally and fail in CI on identical source (or the reverse).
+- **If the same source passes under the real/pinned tool, the code is correct** — the fix belongs in the toolchain (pin the version, fix the config), not the code. When the output is ambiguous, probe the tool directly — force it to print the value, type, or error it actually computed — instead of guessing at the cause.
+- **Keep local == CI.** Confirm the checks that gate merge/deploy run the same toolchain the deploy runs; version drift makes every green check suspect, and "it passed locally" stops being evidence the deploy will.
+
+## 14. Identity comes from auth, never from the caller
+
+- Resolve the acting identity — org/tenant/workspace id, user id, actor — from the authenticated request (API key, session, or a verified internal key), never from a caller-supplied argument. A public mutation that reads `actorId`/`orgId` from its args is spoofing surface, not a feature.
+- The only exception is a trusted internal call: accept a caller-supplied actor ONLY when a valid internal key is present; otherwise derive it from auth and reject the supplied id.
+- To scope to a child inside the authed scope (a specific channel, share, app), take the _child_ id and verify it belongs to the auth-derived parent — don't trust a parallel parent id from the body.
+
+## 15. Public API actions are thin auth + dispatch, not inlined business logic
+
+- A public route authenticates, validates, derives identity, and dispatches to a model function or an internal action that owns the work. Keep that wrapper thin — it is the auth/runtime boundary.
+- Don't inline third-party SDK / analytics / email logic into the public boundary because "it's only 3 lines." Push it behind the dispatch.
+- In Convex specifically: do NOT add `'use node'` to a file holding many actions just to satisfy one — it forces every action in the file into the Node runtime. Split: auth+dispatch (default runtime) → `services/<thing>.ts` (`'use node'`, owns the SDK call).
+
+## 16. Public endpoints ship at minimum scope
+
+- One route, one item per request. Don't preemptively add `/batch` variants, paginated listings, or filter params before a concrete second caller needs them.
+- Inline the schema in the route; don't hoist a 4-line schema into a shared `schemas.ts` "for reuse" when nothing reuses it. Skip body-size caps unless the body is genuinely unbounded.
+
+## 17. Reuse existing types — derive, don't redeclare
+
+- If a type already exists upstream (a schema validator, protocol package, generated client, SDK), use it directly — don't redeclare its shape inline, even partially. Redeclared shapes drift.
+- For a variant, derive it: `Pick`/`Omit`/`Partial`/`Parameters`/`ReturnType`/indexed access/`Extract`/`Exclude`; Convex/Zod equivalents `Infer<typeof V>`, `FunctionArgs<typeof api.x.y>`, `z.input/z.output`.
+- Bad: `type UserSummary = { id: string; name: string; email: string }` next to an existing `User`. Good: `Pick<User, 'id' | 'name' | 'email'>`.
+
+## 18. Filter at the index, never `take()` + post-filter
+
+- When a list query returns rows from a sub-bucket of a table (active vs. archived, `status === X`), the **index** must do the filtering. Don't `.take(N)` the unfiltered query and `.filter()` in JS for the bucket you want.
+- Why it breaks: `.take(N)` returns the N rows at the head of the index's order. If the head is full of the _other_ bucket, the post-filter returns zero even when the bucket has hundreds of older rows. `take(N*2)` only delays the failure.
+- Pattern: put the discriminator in an index and use `.withIndex(..., q => q.eq(...))`, or `q.gt(field, 0)` for the "present" bucket (Convex sorts `undefined` before defined values). Same for `.first()`/`.unique()` and "is there any X" probes.
+
+## 19. Never `.collect()` — bound the read with `.take(N)`
+
+- Convex `.collect()` reads every matching row with no upper bound. For anything that accumulates per-tenant over time (sessions, events, ledger rows, audit rows), a query fine on day one eventually pulls thousands of rows on one reactive tick and silently degrades reactivity for the whole client.
+- Replace `.collect()` with `.take(N)` where N is a safety ceiling clearly above today's working set (100, 1000) — a cap against pathological data, not a UX paginator. Same for `.withIndex(...).filter(...).collect()`.
+- If you genuinely need every row (a migration, admin dump, one-shot maintenance), say so with a comment and run it from a cancellable mutation/action, never a reactive `query`.
+
+## 20. Don't remap rows just to rename or default fields
+
+- Object-literal `.map()`s that copy every field through to rename two or coalesce `undefined → false` are noise, and they drop new columns silently until someone updates the map. If the consumer needs every field, return the row; if a subset, `Pick`/`Omit` or destructure-and-rest. Only rename when the new name materially clarifies; only default when downstream truly can't handle absence.
+- Strip storage-only fields (`_id`, `_creationTime`, internal ids) once with a destructure-rest. Good: `return rows.map(({ _id, _creationTime, ...row }) => row)`.
+
+## 21. Internal APIs carry no version or compat machinery
+
+- When we own both producer and consumer (our own apps, services, and functions), do not add `protocolVersion` fields, version negotiation, capability flags, or "in case the other side is older" branches. Deploying is the version.
+- The one real compat axis is fields, not versions — and it's an asymmetry, not a knob: parse **requests strictly** (reject unknown fields), parse **responses/events tolerantly** (ignore unknown fields). That lets the producer add fields without a lockstep consumer release, which covers the only skew we actually have (components that update on their own schedule).
+- Smells: a version literal in a wire schema that nothing reads; an `if (payload.v >= 2)` branch whose only caller is code we deploy ourselves; a strict parser on a response, which turns every additive server change into a breaking one.
+- Exception: a genuinely external API (consumers we cannot redeploy) versions at the route (`/v1/`), never per-field.
+
+## 22. Things that must agree need one owner
+
+- When two declarations must stay consistent but each can change alone, they drift. Give the shared decision one home and have each site compose from it — a parallel enum, picker list, or switch that restates a set living elsewhere is the common case (deriving the shape is rule 17; this is the wider rule for any values that must agree).
+- The harder half: where near-twins legitimately differ, justify the difference in the code. An undocumented divergence between otherwise-identical things is indistinguishable from a drift bug — a reader can't tell intent from oversight.
+
+## 23. Don't hoist a single-use value into a named const unless it earns the name
+
+- A `const` extracted to module scope but referenced exactly once adds indirection without payoff: the reader has to jump to the declaration to learn the value, and the name restates what an inline value + short comment would say anyway. Inline it at the one call site and let a comment carry the WHY.
+- A single-use named const IS justified when at least one of these holds:
+  - It's **configuration that changes often** or that an operator/reader is expected to tune (timeouts/limits grouped as knobs, feature thresholds, retry budgets that get adjusted).
+  - It **sits next to related consts** and gains meaning from the cluster (a block of `*_TIMEOUT_MS`, a table of limits, sibling enum members) — the grouping is the documentation.
+  - Declaring it independently is **structurally meaningful**: it's exported as part of a module's public surface, referenced by a type, or co-located with the data/file it parameterizes so a future second caller finds it.
+- Otherwise inline. The reviewer test: if the name only exists to label a literal used once, and it neither changes often nor lives beside kin, it's noise — fold it into the call site with a comment explaining the value.
+- Bad: `const STOP_SESSION_CONNECT_TIMEOUT_MS = 5_000` declared on its own, used in exactly one `runAction({ connectTimeoutMs: STOP_SESSION_CONNECT_TIMEOUT_MS })`.
+- Good: `connectTimeoutMs: 5_000, // 5s: a cold sandbox must not hang on the 60s default connect` at the call site.
+
+## 24. Batch loops isolate per-item failures — one bad item never starves the rest
+
+- Any loop over independent work items (sweep, cron batch, queue drain, fleet pass, fanout) must catch per item and continue — collect failures into the result (a `failed` list) or log them. An uncaught per-item throw aborts the pass, and because the runner (cron, scheduler, sync rail) re-selects the same ordered set next tick, a deterministically-failing item becomes a permanent head-of-line blocker: everything behind it re-queues forever while metrics show the job "retrying".
+- In transactional contexts (e.g. a database mutation that processes a page and advances a cursor) the failure is worse: the uncaught throw also rolls back the cursor/progress writes, so the same page re-runs forever. A caught error keeps the transaction alive — but the failed item's own pre-throw writes persist, so catch at item boundaries whose writes are idempotent or safe to re-run.
+- Early-exit on failure is only correct when the failure is provably batch-wide (the shared downstream is unreachable), never for item-specific errors. If the pass's caller needs failure visibility, catch-record-continue and rethrow the first error after the pass completes.
+- Watch the ordering trap even with isolation: if successful items stay in the candidate set (e.g. re-snapshotting everything before the blocker each retry), the sweep also needs its selection to exclude already-done work.
+- Accepted shapes: per-item try/catch + `failed` in the result; `Promise.allSettled` keyed by item; catch-record-continue then rethrow-after-pass.
+- Bad: `for (const ws of candidates) { await archive(ws); await mark(ws) }` inside an hourly cron — one unreachable VM freezes every candidate behind it, forever.
+- Good: the same loop with the whole per-item body in try/catch pushing `{ workspaceId, error }` onto a `failed` array returned to the caller.
+
+## 25. Renaming what users see means sweeping what tests see
+
+- User-facing copy, accessible names, routes, and `data-*` attributes are load-bearing for test layers that do not run in your gates — live-staging harnesses, journey suites, external monitors. A rename that keeps every local gate green can silently break them hours later in someone else's session.
+- When a change renames visible copy or restructures a surface, repo-wide grep the OLD strings/selectors — explicitly including test-harness and e2e packages — and update every anchor in the same pass. The diff that renames is the diff that sweeps.
+- The reviewer test: pick a renamed string from the diff and grep the repo for it. Any surviving hit outside the diff is a break waiting for the next live run.
+- Structural beats copy: where a journey needs an anchor, prefer an owned `data-*` attribute on the surface over its display text — then product copy can change freely without touching tests. Flag journeys that anchor on copy when a structural attribute already exists.
+
+## 26. Leave the code better than you found it — a tidy diff is not worth an untidy repo
+
+- **Never revert an incidental improvement to keep your diff focused.** If the formatter, the linter, or a codemod also cleans files your change didn't touch, **commit that too** (as its own commit if it's noisy). Reverting it optimizes for how the diff reads at review time and taxes every future pass, which pays the same cost again and re-reverts it again. The repo's health outranks the diff's tidiness.
+- **Dead things go in the pass that finds them.** A dead column, argument, function, export, or a test whose only callers are tests — delete it, plus any comment defending it, right there. Don't file it; a note is a deferral, and the next reader has to re-derive that it's dead.
+- **A comment you discover is false is a defect.** Fix it in place. A wrong comment outlives the diff that would have corrected it and actively misleads — worse than no comment at all.
+- **Fix latent bugs your change surfaces.** Work that makes a rarely-run path run every time will expose ordering bugs, unreachable cleanup, and assertions that never fired. That is your bug now: it became reachable because of you.
+- **Verify before you "improve".** Confirm the thing is actually dead, wrong, or broken before deleting or rewriting it — grep for consumers, run the test. A confident deletion of something load-bearing is far worse than the untidiness you were fixing.
+- The limits: don't smuggle unrelated *behavior* changes into a feature commit, and don't rewrite a neighbouring module because you dislike its shape. This rule covers mechanical tidiness, dead code, false comments, and bugs you made reachable — not opportunistic redesign.
+- The reviewer test: after this change lands, is any file in the repo **worse off**, or carrying a known-wrong statement, than before it started? If yes, the pass isn't done.
+
+## 27. A pass must trace to the change
+
+- When a diff claims a fix or an improvement, check that the evidence isolates the claimed change: the failing check should fail without the fix, and the win should survive removal of incidental bundled edits (config bumps, unrelated tweaks).
+- A green that would pass anyway, or a gain driven by a change other than the claimed one, proves nothing about the claim — name the real lever or split the diff.
+- Scrutinize diffs that edit the implementation and its checker, fixture, or threshold together: an evaluator adjusted in the same change that makes it pass is the reward-hacking smell.
+
+## 28. Resolve findings with evidence, not wording
+
+- A review finding is closed by a discriminating check — a repro, a grep, a run — or an explicit accepted-risk note. Re-explaining intent doesn't answer a correctness question; when you disagree with a finding, produce the smallest piece of evidence that decides it.
+
+## 29. A rule belongs to the action, not to one of its entry points
+
+- When a change adds a rule to an action (route this URL to a viewer, block this host, trim on this event), enumerate every entry point that performs that action — initial load, later navigation, restored session, retry path — or route them through one owner. A rule added at one entry point silently misses the others: a PDF rule lived in the navigation helper while the *first* load built its view directly, so the feature worked only for the second URL. The symptom is "it works when I click, not when I launch", and a review is the cheapest place to catch it.
+
+## 30. A sanitizer must escape, not substitute
+
+- A function that makes a string safe for a channel (JSON line, log, shell, HTML) must *escape* the characters that need it, never replace them with lookalikes. Substituting `"` with `'` keeps the envelope parseable while corrupting the payload, and the corruption is silent: a probe that parsed the value as JSON got nothing and the feature under test was blamed. The same shape appears as a partial update — a function that sets several things (a title, then a status line) can throw between them, so a captured element that is null leaves half the surface updated and the other half stale. Both were found in one session, both looked like broken features.
+
+## 31. A promise chain must not depend on itself
+
+- Building a sequence with `chain = chain.then(...)` *inside* the callback that chain is running makes it depend on itself: the work never runs, and if another path also updates part of the surface (a title while a status line stays stale) the failure is invisible. Use a local accumulator inside the callback, or an explicit loop with `await`. A silent no-op that still reports progress elsewhere is the same shape as a sanitizer that corrupts payloads: the envelope looks fine and the content is missing.
+
+## 32. Address a target by identity, not by pixels
+
+- When a test or a person has to act on a specific element (a tab, a row, a button), the surface should expose its identity - an id, an index, or its geometry - so the actor does not have to find it by appearance. Two rounds of "the drag does not work" were really "the probe guessed a pixel": the tab labels merged into one OCR token and the address bar contained the same word, so the wrong element was pressed. Geometry from the product turned the same drag into a deterministic, verified one. If a UI element can only be located visually, that is a testability gap in the product, not just in the test.
+
+## 33. A result list has to stay reachable
+
+- A list that answers a search (matches, results, errors) is part of the surface, not decoration: it must remain visible while the thing it points at is inspected, or acting on it needs coordinates that no longer exist. A PDF match list placed in the scrolling document was scrolled out of view by the very jump it triggered, so a click at its reported geometry landed on the page instead; making the list sticky fixed the addressability. The same rule covers an item that is drawn but cannot be reached after the view moves.
+
+## 34. A coordinate belongs to a space
+
+- When one surface reports a position and another consumes it, say which space it is in and translate at the boundary. A viewer's `getBoundingClientRect()` is page-space while a synthetic click is window-space, so the same numbers addressed different pixels: a match-list click landed on the page canvas instead of the entry, and it looked like the handler was broken. Have the owner of the space publish its origin (the product traces its page rectangle) rather than letting the consumer guess an offset; a click that misses is a coordinate-space bug far more often than an event-delivery bug.
+
+## 35. Two controls must not share a word
+
+- A row holding two buttons that both say "save" — save the page, star the URL — is not a naming preference. A person cannot tell them apart, and a probe that finds a control by its text clicked the wrong one, which read as a broken button handler. Give each control a word of its own, and when a test locates a control by its label, match the whole token instead of a substring its neighbour also contains.
+
+## 36. A borrow belongs to a statement, not to an `if let` body
+- **Grep for the state change, not one synonym for it.** A claim that a table is never pruned came from
+  grepping `remove|retain` while the code calls `.clear()` forty lines below the insert, and the wrong
+  reading was published before it was corrected. When the question is "is this ever released", search for
+  every way the state can change - `clear`, `drop`, `take`, `swap`, `mem::replace`, assignment - and read
+  the whole function the structure lives in, not the neighbourhood of the first hit.
+- **After the second occurrence of a documented trap, write the check rather than another bullet.**
+  The borrow-in-an-`if let` trap was written in this repository, documented, and then written a third
+  time, each time by someone who had just read the explanation. A small mechanical guard for that one shape
+  found two more instances of it in the upstream engine. The guard is worth more than the rule: it was proven
+  to fail against the pre-fix spelling of the real bug, and it runs in CI against the applied patch series.
+
+- `if let Some(index) = cache.borrow().iter().position(..) { cache.borrow_mut().remove(index); }` panics with `RefCell already borrowed`: the temporary from `borrow()` lives until the end of the `if let`, so the body's `borrow_mut` is the second borrow. Resolve the lookup into a `let`, then mutate. This was written twice in one session - once in the product's navigation state and once in an engine patch - and the second copy was only visible because a probe ran the path; grep for `if let Some(..) = .*borrow()` before shipping either.
+
+## 37. A structured file's error is rarely on the line it names
+
+- A YAML registry failed to parse at line 9513 and the cause was on 9498: a folded scalar (`>-`) had a continuation line beginning with `:`, which ends the scalar and leaves the rest of the block misread as keys. Write long prose values for data files as a single quoted line, never as a wrapping block, and when a parser points at a line, read backwards for the real break.
+
+## 38. A flag needs a waker if anything waits on it
+
+- Setting an `AtomicBool` cancels work only where something checks it. Here the chain from the stop to the listener was complete, and the checks lived around receiving headers and while streaming a body, so a request waiting for headers kept its connection for the life of the process. If a wait can outlive the flag, the flag needs a notification the wait can select on - and the waiter must register before it reads the flag, or a cancellation landing in between is missed.
+
+## 38. A fork's diff is not the formatter's opinion
+
+- Running a formatter over a whole upstream file with a different toolchain version turns a 130-line change into 250 lines of reflowed `if let ... &&`, which buries the fix and would be rejected upstream as noise. Format what you wrote, then read the diff stat: when the change is much larger than the change, the formatter edited, not you. Keep a fork patch to its semantic hunks — a reviewer has to be able to see the idea.
+
+## 39. A guard earns its place only if it can fail on the property
+
+Before recommending a test/guard for an unpinned rule, name the mutant it kills and
+the property it pins. Assertions built on a stand-in harness (a fake executor, a patched
+oracle) pin the plumbing, not the behaviour — when the property only exists against the
+real engine/hardware, the guard belongs where that runs. Weigh the cost as well: a
+fail-closed default (a whitelist that already excludes new cases) plus one independent
+guard on the irreversible path is often enough, and a guard that moves a published
+count/timing invalidates a record only re-measurable elsewhere. Measured 2026-10-24
+(Sim-Agent 8864ad0): two documented recovery rules were unpinned — mutants survived all
+175 runnable tests — and the right call was to record the gap, not to add the two tests.
+
+## Your task
+
+Review: $ARGUMENTS
+
+If no arguments given, review `git diff --staged` or `git diff` (unstaged changes).
+
+For each issue found, cite the file and line number. Group by category. End with a clean/not-clean verdict.
+---
+name: refactor-clean
+description: Refactor cleanly instead of layering sediment. Use when a behaviour is about to be implemented a second time (a second gravity, scheduler, ticker, cache or path for a rule that already exists) - the two owners agree on the outcome and differ on the path, so only intermediate assertions catch them. Also use when a change reveals duplicated concepts, local adapters, obsolete owners, compatibility wrappers, parallel abstractions, an over-large module that has accreted many responsibilities, or "just tack this on" pressure in any code area; also to survey a codebase for duplicated implementations before deciding what to merge.
+routing_aliases: "refactor, code cleanup, リファクタ"
+routing_action_cues: "refactor, clean, テスト, 検査, 診断, 監査, 検証, 調査, 確認, 攻撃, 実行, 収集, 解析, 構築, 導入, 発見, レビュー, 使, 評価, 列挙, 書く, 作る, 説明, 比較, 描く, チェック, スキャン, 整理, 削除, 書, 作, 描, 磨, 読, 消, 送, する, して"
+---
+
+# Clean Refactoring
+
+Replace the old shape with the simpler shape the codebase would want if it were
+designed today. Refactoring is not adding a compatibility layer beside the problem;
+it is moving ownership until every concept has exactly one clear home. That cuts
+both ways: merging N duplicated owners into one, and splitting one over-loaded
+module into the several owners it was hiding.
+
+## Workflow
+
+1. Name the concept that lacks one clear owner — duplicated across several owners,
+   or several concepts fused into one over-loaded module. Identify the thing(s)
+   that should each have one owner: environment, pricing rule, geometry source,
+   state machine, data contract, renderer phase, API shape, UI state, or test
+   oracle.
+2. Find every current owner and consumer. Treat wrappers, aliases, pass-local
+   constants, copied structs, and "temporary" branches as sediment until proven
+   otherwise.
+3. Promote the concept to its natural home. Pick the module that would own it from
+   scratch, then make old call sites consume that owner directly.
+4. Delete or collapse the stale path in the same pass when feasible. If a bridge must
+   remain, make it tiny, named as compatibility, and give it a removal condition.
+5. Verify behavior through consumers, not just the new module. A clean refactor is
+   only proven when the surfaces that used to diverge now report or exercise the
+   same source of truth.
+6. **Prove the merged owner with a mutant** (see the rule below). A green suite
+   after a merge proves nothing yet — each copy's coverage went with the copy.
+
+For Rust trait-object mechanics — `dyn A + B` composition errors,
+object-safety-first trait design, shared default methods for a subset of
+implementors, accessor-pair borrows — read
+`references/rust-trait-objects.md` when those errors or that shape appear.
+
+To enumerate what is duplicated before choosing what to merge, rather than
+reading files hoping to notice, read `references/duplication-survey.md`.
+
+## Rules
+
+- **Every line is debt — the best mechanism is the one you don't write.**
+  Before building any guard, validator, convergence protocol, or cleanup
+  path, two checks gate it:
+  1. **Does the platform already do this?** Read the component/framework you
+     are working around before coding around it — its crons, retries,
+     defaults, and lifecycles. A hand-built janitor beside a component that
+     already vacuums itself is pure debt, and it will be debugged by someone
+     who doesn't know the component made it unnecessary.
+  2. **Does the failure it guards change any real outcome?** Trace the
+     guarded condition to its consumer. If the consumer is indifferent — an
+     ordering check feeding a consumer that doesn't care about order, a
+     validation on data only our own code produces — the guard tests nothing
+     and must not be written. A common shape: an invariant re-checked at read
+     time that the single write path already establishes, so the branch can
+     only fire on hand-corrupted rows. Ask which caller could produce the bad
+     state; if the honest answer is "none, short of someone editing the
+     database", delete the branch. "It could be inconsistent" is not a reason;
+     "the consumer would then do the wrong thing" is.
+  The bar is not "is this correct?" — defensive code is usually correct.
+  The bar is "what breaks, for whom, if this line doesn't exist?" No
+  concrete answer → no line.
+- **Measure the change, and treat a bad size-to-behaviour ratio as a shape
+  defect.** Before accepting a change, count what it actually cost — production
+  code apart from tests and docs, and comments apart from logic, because a
+  diff dominated by explanation is not the same as one dominated by machinery:
+
+  ```
+  git diff --numstat <base> -- ':!specs' ':!*.test.*' ':!**/test-harness'
+  ```
+
+  Then read the added lines, not just the total. **A small behavioural change
+  that costs a large number of lines is a red flag** — it is the most reliable
+  signal that the fix is fighting the existing shape rather than fitting it:
+  a special case layered where the general case belongs, a second owner
+  introduced beside the real one, or a wrapper bridging two things that should
+  have been merged. The correct response is to rework it from the shape the
+  code would want, **not** to commit it with a paragraph explaining why it had
+  to be big; that explanation is the smell, not the mitigation.
+
+  Two honesty rules, or the number means nothing: formatter churn in files the
+  change did not otherwise touch is not part of the change and must stay out of
+  the commit; and a net count near zero can still hide real weight — a new
+  cron, table column, index, endpoint, dependency, or config flag is a surface
+  someone now owns and maintains, so name those separately from the count.
+- **Do not over-weigh the sunk cost of the existing architecture.** "It already
+  exists and works" is not an argument for keeping a shape — coding agents make
+  large architecture switches cheap, so size a refactor by the quality of the end
+  state, not by the volume of code it replaces. When behavior must survive, pin it
+  with tests at the consumer surface and swap the architecture underneath — though
+  most of the time even the old seams shouldn't survive verbatim: a big refactor is
+  the chance to redraw them into the shape the codebase would want today, not to
+  faithfully rebuild the old interfaces on a new foundation.
+- **Merging N copies into one does not inherit their coverage.** Each copy was
+  exercised by different scenarios, and the merged owner takes an argument that
+  only one caller used to supply — a tag, a period, a predicate. A gate can then
+  pass while only ever entering the branch where that argument cannot matter, so
+  a green suite right after a merge is not evidence. **Prove the merged owner with
+  a mutant: pass the argument as a constant, ignore it, drop the predicate — and
+  require the gate to fail.** If it stays green, the gate has a hole covering
+  exactly the difference you just unified. Recurring tells: a trace whose scenario
+  exits before the branch under test, and a fanout test that accepts a mutant
+  sending to everyone. The general discipline is in `write-tests`; what is easy to
+  miss here is the *inverse* symptom — not a test going red, but a mutant staying
+  green, which reads as success. This is how a merge pays for itself twice: the
+  hole was already there, and nothing else would have found it.
+- **A merge or cache you expected to pay off may measure as nothing.** Do not ship
+  the claim on the expected gain; measure, and treat a flat number as a finding
+  about where the cost lives rather than a failed optimisation. `audit-performance`
+  owns the measurement discipline and the tells for a mechanism that is not
+  engaging.
+- Prefer one shared primitive over N adapters. An adapter is acceptable only at an
+  external boundary or as a short-lived migration seam.
+- **Split a module that owns too many concepts — decomposition is refactoring
+  too.** The dual of merging duplicates: when one file or function has accreted
+  unrelated responsibilities, divide it along ownership seams so each piece owns a
+  coherent slice a reader can name and the original thins to composition. **Past
+  ~1000 lines a file is a smell, not a verdict** — some modules earn their size (a
+  cohesive state machine, a generated table, one algorithm with tight internal
+  coupling), but a god-file that registers dozens of routes or handles many domains
+  inline is accreted responsibility, not cohesion. The split is right only when
+  each new module owns a nameable responsibility and import pressure drops because
+  dependencies moved with it; it's wrong when it's line-count relief that scatters
+  one concept across files a reader must reassemble.
+- **Know what already exists before you build something new.** Before writing a
+  new mechanism — a shape, computation, asset, state machine, data contract —
+  search the codebase for one that already does this, or something close enough
+  to share. Only once you know what's there can you make the real decision:
+  reuse it, consolidate two near-duplicates, or extract the shared core into an
+  independent module both call — and that decision belongs *before* you start,
+  not bolted on after. Reuse is not automatically the answer; the existing thing
+  may be wrong, or genuinely different, and then you build new deliberately. The
+  failure this prevents is building in ignorance of what's already there: two
+  implementations that must agree then silently drift, each re-deriving details
+  the other already settled (orientation, units, edge cases, ordering).
+- Do not preserve dev-only compatibility by default. Unshipped scaffolding should
+  move to the clean contract immediately.
+- **Zero lineage signaling: name things for what they are, never for where they
+  came from.** A name that encodes history — a slice file prefixed with the
+  mega-file it was split from, `foo-v2`/`foo-new`/`foo-legacy`, a module named
+  after the experiment that produced it, a wrapper named after the API it
+  replaced — carries no information to a reader who wasn't there, and actively
+  misleads the one who was once the old thing is gone. The test: would someone
+  who joined today, knowing nothing of the history, choose this name? If the
+  name only makes sense with the backstory, rename it; history lives in git,
+  not in identifiers. The same rule kills lineage comments ("previously this
+  was...", "moved from X") — they describe the diff, not the code, and rot the
+  moment the referent disappears.
+- **Prefer the idempotent contract over the refusal.** When an operation can be
+  asked for twice — a retry after a lost response, a user clicking the same
+  button again, a replayed webhook — reaching the requested end state should
+  succeed, not error. "Install X" where X is already installed at the place it
+  belongs is a success: return the thing. Refusal is correct only when the
+  second request means something genuinely different from the first — a
+  DIFFERENT thing already occupies the name, so honoring the request would
+  destroy or shadow it. The tell that you have it backwards: a caller has to
+  special-case your error code to recover normal behavior, or a retry path
+  needs a pre-flight "does it already exist?" read that races. Applies beyond
+  writes: deletes of absent things, unsubscribes, and "mark complete" toggles
+  are all idempotent by nature, and making them 404 or 409 pushes bookkeeping
+  onto every caller.
+- **Constrain the model to what production actually writes.** A schema that
+  permits more than any writer produces — a list where every flow stores one
+  element, a state nothing reaches — taxes every consumer with the general
+  case. The tell: a consumer asking "but which one?" when the data can only
+  contain one. Enforce the constraint at the write path; widen when a real
+  use arrives.
+- Make ownership visible in stats, tests, or debug output when divergence was the
+  bug class.
+- **A check that RE-DERIVES a value the code already computes will drift from
+  it.** A test or second consumer that recomputes geometry, state, or a derived
+  quantity independently can disagree with the code over a difference invisible
+  on paper — an operation-order or rounding subtlety — and fire false verdicts.
+  Export the owner's computed value and have the check consume that, so it
+  enforces exactly what the code produced: one owner for the computation, not two
+  that happen to mostly agree.
+- **A symmetric or featureless placeholder can hide an orientation or coordinate
+  bug in the thing it stands in for.** A symmetric stand-in renders the same
+  whether or not the coordinate frame is flipped, so the defect stays invisible
+  until a real asymmetric asset exposes it. When you swap a placeholder for the
+  real asset, re-verify orientation and framing, not just that it renders.
+- Update the spec or handoff with the new invariant, not the mechanical file list.
+- If the refactor starts widening into unrelated behavior, slice it: land the shared
+  contract first, then port consumers in reviewable passes.
+
+- **Extracting a shared primitive must keep what each caller could skip.** Two callers of
+  the same algorithm rarely do the same amount of work: one may fill a whole page in a single
+  assignment and only walk the pages that straddle a boundary, the other may skip the pages
+  with nothing in them. A merge that centralises the loop and drops those fast paths is
+  slower than either original, and no test fails, because the answer is identical either way.
+  **Observed: two light packers were merged into one; the shared form had to keep one
+  caller's whole-section fill and the other's skip of empty sections, or the merge would have
+  cost exactly the work each had avoided.** The shape is: the shared helper owns the layout,
+  each caller still decides which units are worth visiting.
+
+- **Say which parts of a design are exact and which are approximate, separately.** They read
+  identically in prose and have different evidentiary status. A bound derived from a constant
+  of the thing being computed is exact - a spread that loses one per step and starts at
+  fifteen cannot reach sixteen, so a three-by-three neighbourhood is not a guess. A bound
+  derived from "I only looked here" is an approximation - the same spread will not lower the
+  column's floor when it arrives sideways, so a deep cavity stays dark. Merging the two into
+  "this is approximate" throws away the part that could be claimed, and into "this matches
+  vanilla" overclaims the part that cannot.
+
+- **Assert the region you are about to replace contains exactly one definition.** Replacing a
+  function by line offset or by searching for its opening line will take whatever follows it
+  when the boundary is wrong, and the result compiles into something missing a neighbour.
+  **Observed: a replacement sliced from one function's opening to a marker further down and
+  deleted three unrelated functions along with it**, which the compiler then reported as three
+  names that do not exist. The fix is one line before the edit: brace-match from the opening
+  brace and require the region to hold exactly one `fn`. The second attempt did that and the
+  same edit was uneventful.
+
+- **Removing a fallback makes its worst case yours.** A second path usually exists for the
+  inputs the first handles badly, so deleting it is not free even when the first is faster on
+  everything ordinary. **Observed: replacing a hash map with a buffer sized from the sources'
+  bounding box was measured at x1.41 and the map was deleted; the buffer is thirty kilobytes for
+  one source and up to eight hundred for scattered ones, which the map bounded.** Say the new
+  worst case out loud when the old path goes, or an input nobody tested becomes the one that
+  allocates on a chunk send.
+
+- **Check the other code path before deriving a shortcut from this one.** A simplification that is
+  exact for the branch you are reading may be wrong on the branch that runs in production.
+  **Observed: a height-based opacity looked exact because `y < h` produced solid and `y >= h + 7`
+  air - in the fallback terrain function. The production path checks a worldgen density pipeline
+  first, with aquifers and caves, where `y < h` is not necessarily solid, so the shortcut would
+  have been an approximation wearing the words "it is only a height test".** Read the condition
+  that selects between the paths before optimising either, and if the shortcut is exact on one
+  and not the other, either scope it to that one explicitly or do not take it.
+
+- **Never hold a lock across a call that can take it back.** A loop that takes a mutex, then calls
+  something which re-enters the same mutex, deadlocks - and the fix is to hold the lock only around
+  the take and the put-back, never around the work. The dangerous shape is a queue or cache whose
+  entries are processed by mutating the world, because the world mutation path is usually where
+  the invalidation callback lives and it takes the same lock.
+  **Observed: a tick took its queue, then called the block setter, which reached the neighbour
+  check, which took the same queue's lock. With one entry in the queue the check returned before
+  locking, so nothing happened; with two stacked entries the block above the one being moved was
+  itself queued, and it deadlocked.**
+  Two things follow. First, read what the callee can reach before deciding the lock is safe to
+  hold. Second, a one-item test will not find this, so when a fix is about interaction between
+  entries, the test needs at least two - and if the failure also depends on their order, say so,
+  because the control may then pass for the wrong reason.
+
+## Before adding a behaviour, look for the one already there
+
+A behaviour that gains a second implementation does not usually break - it works, which is why it
+survives. Two owners of one rule are found by asserting an intermediate state, not an outcome,
+because the two implementations agree on the destination and differ on the path.
+
+**Observed: falling blocks gained a queue-based implementation while a hand-written one already
+existed. The block moved two cells in one call, the newer implementation's queued position was air
+by the time it looked, and every outcome-level test passed because the hand-written one had already
+put the block where the test expected to find it.** The test even recorded the anomaly in a comment -
+"the loop finished in one pass where two cells were expected, and that is not explained yet" - and
+asserted the landing instead.
+
+Three habits from that:
+
+- **Search for an existing implementation before writing the next one.** The name may not match:
+  this one was `settle_gravity`, and the new code was `falling_tick`. Search the behaviour, not the
+  word.
+- **A backtrace from inside the mutating function names the second owner in one run.** Put the
+  capture at the entry of the function that does the mutation, not at the call sites you know about.
+  The caller that is not in your head shows up immediately.
+- **An outcome assertion cannot distinguish two implementations.** Assert something in the middle -
+  after each step, at each tick - and assert that scheduling does not yet act. That is the shape
+  that fails when a second owner is added back.
+
+When the two owners disagree about *coverage* the failure is silent in one direction: the hand list
+named three blocks and the asset named nineteen, so sixteen concrete powders never fell and nothing
+failed. Pin the set by count as well as by name.
+192:# Task Group: mc-spine recovery, bounded Fabric/NeoForge compatibility, and lightweight-server design
+195:applies_to: cwd=/home/yuu/Documents/Codex/2026-10-04/mc/outputs/mc-spine/native; reuse_rule=use current repository history and canonical `native/DESIGN.md`; do not generalize pinned adapter tests into arbitrary-Mod or production-performance compatibility
+197:## Task 1: Recover mc-spine source/history and preserve provenance, outcome=success
+205:- mc-spine, Minecraft 1.21.1, protocol 767, RECOVERY-MANIFEST.json, v2.37, 860142fa, write_varint, signed i64, OOM, cargo build --offline --locked
+235:- The canonical recovered source is v2.37 `860142fa21e5c77ca3818d9e331756fa0df72b13`; `/data/lane-scratch/mc-spine` was an older/mixed copy. Recovery at `outputs/mc-spine/runtime` passed build, 9 tests, and SHA-256 checks for 2,461 restored entries. [Task 1]
+237:- Current mc-spine is a Java 1.21.1/protocol-767 Rust server with a 250ms/4Hz loop, shared Mutex, and custom overlay; 20TPS and region actors are not implemented. Any advantage over Pumpkin remains aspirational until same-version/seed/workload/result-order CPU, RSS, and tick-latency comparison. [Task 2]
+
+exec
+/usr/bin/bash -lc 'pwd; git status --short; find .. -name AGENTS.md -o -name AGENTS.override.md; git diff --stat' in /tmp/mc-primitives-review-wt
+ succeeded in 57ms:
+/tmp/mc-primitives-review-wt
+ M .github/workflows/ci.yml
+ M evidence/foundation/valence-reuse/README.md
+ M evidence/foundation/valence-reuse/reference.json
+ M specs/README.md
+ M src/main.rs
+ M src/tick_tests.rs
+ M tests/verify.sh
+ M tools/README.md
+ M tools/mutation_check.sh
+?? evidence/foundation/valence-primitives/
+?? specs/valence-primitives/
+?? src/primitives_tests.rs
+?? tests/primitives_oracle_test.py
+?? tests/suite_compare_test.py
+?? tools/primitives-oracle/
+?? tools/primitives_oracle.py
+?? tools/suite_compare.py
+find: ‘../codex-daemon-1000’: Permission denied
+../sarashina_bundle/sarashina-proofreader/AGENTS.md
+../civ-head-baseline/AGENTS.md
+find: ‘../systemd-private-af9063935c4b476f84824b5740cc3c76-power-profiles-daemon.service-41ZiOg’: Permission denied
+find: ‘../systemd-private-af9063935c4b476f84824b5740cc3c76-upower.service-Yy33to’: Permission denied
+find: ‘../systemd-private-af9063935c4b476f84824b5740cc3c76-polkit.service-8XjHRn’: Permission denied
+find: ‘../systemd-private-af9063935c4b476f84824b5740cc3c76-systemd-logind.service-80EXPB’: Permission denied
+find: ‘../systemd-private-af9063935c4b476f84824b5740cc3c76-bolt.service-qgHt9E’: Permission denied
+find: ‘../systemd-private-af9063935c4b476f84824b5740cc3c76-NetworkManager.service-6RjHz1’: Permission denied
+find: ‘../systemd-private-af9063935c4b476f84824b5740cc3c76-ananicy-cpp.service-kHNOR6’: Permission denied
+ .github/workflows/ci.yml                         |   2 +
+ evidence/foundation/valence-reuse/README.md      |   8 +-
+ evidence/foundation/valence-reuse/reference.json |   3 +-
+ specs/README.md                                  |   2 +-
+ src/main.rs                                      | 490 ++++++++++++-----------
+ src/tick_tests.rs                                | 143 ++-----
+ tests/verify.sh                                  |   2 +
+ tools/README.md                                  |   1 +
+ tools/mutation_check.sh                          |  56 ++-
+ 9 files changed, 365 insertions(+), 342 deletions(-)
+
+exec
+/usr/bin/bash -lc 'find . -name AGENTS.md -o -name AGENTS.override.md; git diff -- src/main.rs' in /tmp/mc-primitives-review-wt
+ succeeded in 0ms:
+diff --git a/src/main.rs b/src/main.rs
+index f355a2e..32a561a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1240,11 +1240,10 @@ fn enchant_conflicts(a: i64, b: i64) -> bool {
+     ];
+     a != b && GROUPS.iter().any(|g| g.contains(&a) && g.contains(&b))
+ }
+-// TAG_String anonymous-NBT payload: type byte + u16 len + utf8
++// TAG_String anonymous-NBT payload: type byte + modified-UTF-8 string.
+ fn nbt_string(text: &str) -> Vec<u8> {
+     let mut d = vec![8u8];
+-    d.extend_from_slice(&(text.len() as u16).to_be_bytes());
+-    d.extend_from_slice(text.as_bytes());
++    nbt_str(&mut d, text);
+     d
+ }
+ // parse the [k=v,...] suffix of a /give item argument; supported subset:
+@@ -3144,45 +3143,70 @@ fn keepalive_time_tick() {
+         run_function(&f, None, &mut None);
+     }
+ }
+-/// The substeps a projectile samples in one tick. Vanilla intersects the whole
+-/// segment a projectile travelled (`ProjectileUtil.getEntityHitResult`); the port
+-/// samples that segment, and the samples have to span all of it or a projectile
+-/// walks past a target the segment still crosses.
+-const PROJECTILE_SWEEP_STEPS: usize = 4;
+-
+-/// The positions one tick's motion is sampled at: from where the projectile was
+-/// (`pos - d`, `d` being the displacement this tick's integrator applied) to where
+-/// it is now, `PROJECTILE_SWEEP_STEPS` intervals later.
+-fn projectile_sweep(
+-    pos: (f64, f64, f64),
+-    d: (f64, f64, f64),
+-) -> [(f64, f64, f64); PROJECTILE_SWEEP_STEPS + 1] {
+-    let mut out = [(0.0, 0.0, 0.0); PROJECTILE_SWEEP_STEPS + 1];
+-    for (i, slot) in out.iter_mut().enumerate() {
+-        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;
+-        *slot = (pos.0 - d.0 * back, pos.1 - d.1 * back, pos.2 - d.2 * back);
++/// Finite segment geometry. Unlike Valence's inclusive infinite ray, pinned
++/// AABB.clip tests entering faces, with epsilon on transverse bounds and open t.
++struct Aabb {
++    min: [f64; 3],
++    max: [f64; 3],
++}
++impl Aabb {
++    fn new(a: [f64; 3], b: [f64; 3]) -> Self {
++        Self {
++            min: std::array::from_fn(|i| a[i].min(b[i])),
++            max: std::array::from_fn(|i| a[i].max(b[i])),
++        }
++    }
++    fn contains(&self, point: [f64; 3]) -> bool {
++        (0..3).all(|i| self.min[i] <= point[i] && point[i] < self.max[i])
++    }
++    fn clip(&self, start: [f64; 3], end: [f64; 3]) -> Option<[f64; 3]> {
++        const EPSILON: f64 = 1.0e-7;
++        let delta: [f64; 3] = std::array::from_fn(|i| end[i] - start[i]);
++        let mut nearest = 1.0;
++        let mut hit = false;
++        for axis in 0..3 {
++            let face = if delta[axis] > EPSILON {
++                self.min[axis]
++            } else if delta[axis] < -EPSILON {
++                self.max[axis]
++            } else {
++                continue;
++            };
++            let t = (face - start[axis]) / delta[axis];
++            let j = (axis + 1) % 3;
++            let k = (axis + 2) % 3;
++            let p = start[j] + t * delta[j];
++            let q = start[k] + t * delta[k];
++            if 0.0 < t
++                && t < nearest
++                && self.min[j] - EPSILON < p
++                && p < self.max[j] + EPSILON
++                && self.min[k] - EPSILON < q
++                && q < self.max[k] + EPSILON
++            {
++                nearest = t;
++                hit = true;
++            }
++        }
++        hit.then(|| std::array::from_fn(|i| start[i] + nearest * delta[i]))
+     }
+-    out
+ }
+
+-/// The crude box both projectile hit tests put around a target's feet position:
+-/// `rx` to either side, `y_lo` below and `y_hi` above. Generous on purpose - a
+-/// block-accurate test would intersect the swept segment with the target's real
+-/// AABB, which the port has not needed: at the speeds a vanilla arrow reaches, the
+-/// samples below are closer together than the box is wide, so the box decides
+-/// rather than the sampling. `the_projectile_sweep_covers_the_whole_tick` measures
+-/// where that stops being true.
+-fn projectile_reaches(
+-    sample: (f64, f64, f64),
++/// Keep the existing approximate target boxes and start-inside contact policy;
++/// only sampling is retired here, not pose dimensions or nearest-target ordering.
++fn projectile_segment_hits(
++    start: [f64; 3],
++    end: [f64; 3],
+     target: (f64, f64, f64),
+     rx: f64,
+     y_lo: f64,
+     y_hi: f64,
+ ) -> bool {
+-    (target.0 - sample.0).abs() < rx
+-        && (target.2 - sample.2).abs() < rx
+-        && sample.1 > target.1 - y_lo
+-        && sample.1 < target.1 + y_hi
++    let bounds = Aabb::new(
++        [target.0 - rx, target.1 - y_lo, target.2 - rx],
++        [target.0 + rx, target.1 + y_hi, target.2 + rx],
++    );
++    bounds.contains(start) || bounds.clip(start, end).is_some()
+ }
+
+ fn arrow_tick() {
+@@ -3261,12 +3285,8 @@ fn arrow_tick() {
+             a.y += a.dy;
+             a.z += a.dz;
+             let (ax, ay, az) = (a.x, a.y, a.z);
+-            // The whole tick's motion, not a fraction of it: the samples used to
+-            // start `0.675 * step` behind the arrow because a drag constant was
+-            // standing in for a geometric span, which leaves the first third of the
+-            // tick - where an arrow shot at point-blank range crosses its target -
+-            // unsampled.
+-            let sweep = projectile_sweep((ax, ay, az), (a.dx, a.dy, a.dz));
++            let segment_start = [ax - a.dx, ay - a.dy, az - a.dz];
++            let segment_end = [ax, ay, az];
+             // block collision: arrows stick into solid blocks (vanilla)
+             let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
+             if bst != 0 && !mob_passable(bst) {
+@@ -3286,85 +3306,88 @@ fn arrow_tick() {
+                 (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+             });
+             if a.owner >= 0 {
+-                // player-shot arrow: hit mobs (sub-step to avoid tunneling)
+-                // and other players (vanilla PvP) — the owner is skipped
++                // Player-shot arrow: intersect the whole segment with mobs and
++                // other players. The owner and last pierced target are skipped.
+                 let ml = mobs().lock().unwrap();
+                 'outer: for m in ml.iter() {
+                     if m.eid == a.last_hit {
+                         continue;
+                     }
+                     let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+-                    for s in sweep {
+-                        if projectile_reaches(s, (mx, my, mz), 1.2, 0.4, 2.1) {
+-                            let mut h = m.hp.lock().unwrap();
+-                            *h -= a.dmg;
+-                            let dh = *h;
+-                            drop(h);
+-                            if a.fire > 0 {
+-                                *m.fuse.lock().unwrap() = a.fire;
+-                            }
+-                            if a.punch > 0 && a.kind == 0 {
+-                                let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01);
+-                                let kb = 0.3 * a.punch as f64;
+-                                let mut p = m.pos.lock().unwrap();
+-                                p.0 += a.dx / vl * kb;
+-                                p.2 += a.dz / vl * kb;
+-                                drop(p);
+-                                broadcast_seen(m.eid, |_c| {
+-                                    (
+-                                        0x70,
+-                                        entity_teleport(
+-                                            m.eid,
+-                                            m.pos.lock().unwrap().0,
+-                                            m.pos.lock().unwrap().1,
+-                                            m.pos.lock().unwrap().2,
+-                                            m.pos.lock().unwrap().3,
+-                                            m.pos.lock().unwrap().4,
+-                                            true,
+-                                        ),
+-                                    )
+-                                });
+-                            }
+-                            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+-                            // channeling: trident hit in thunder calls lightning
+-                            // (punch slot carries the level for kind==1)
+-                            if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0
++                    if projectile_segment_hits(
++                        segment_start,
++                        segment_end,
++                        (mx, my, mz),
++                        1.2,
++                        0.4,
++                        2.1,
++                    ) {
++                        let mut h = m.hp.lock().unwrap();
++                        *h -= a.dmg;
++                        let dh = *h;
++                        drop(h);
++                        if a.fire > 0 {
++                            *m.fuse.lock().unwrap() = a.fire;
++                        }
++                        if a.punch > 0 && a.kind == 0 {
++                            let vl = (a.dx * a.dx + a.dz * a.dz).sqrt().max(0.01);
++                            let kb = 0.3 * a.punch as f64;
++                            let mut p = m.pos.lock().unwrap();
++                            p.0 += a.dx / vl * kb;
++                            p.2 += a.dz / vl * kb;
++                            drop(p);
++                            broadcast_seen(m.eid, |_c| {
++                                (
++                                    0x70,
++                                    entity_teleport(
++                                        m.eid,
++                                        m.pos.lock().unwrap().0,
++                                        m.pos.lock().unwrap().1,
++                                        m.pos.lock().unwrap().2,
++                                        m.pos.lock().unwrap().3,
++                                        m.pos.lock().unwrap().4,
++                                        true,
++                                    ),
++                                )
++                            });
++                        }
++                        broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
++                        // channeling: trident hit in thunder calls lightning
++                        // (punch slot carries the level for kind==1)
++                        if a.kind == 1 && a.punch > 0 && THUNDERING.load(Ordering::Relaxed) > 0 {
+                             {
+-                                {
+-                                    let mut h2 = m.hp.lock().unwrap();
+-                                    *h2 -= 5.0;
+-                                }
+-                                *m.fuse.lock().unwrap() = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
+-                                let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+-                                bolts()
+-                                    .lock()
+-                                    .unwrap()
+-                                    .push((be, server_ticks(BOLT_LIFE_GT) as i32));
+-                                broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
+-                                let ts =
+-                                    sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
+-                                broadcast(-1, |_c| (0x68, ts.clone()));
++                                let mut h2 = m.hp.lock().unwrap();
++                                *h2 -= 5.0;
+                             }
+-                            if dh <= 0.0 {
+-                                mob_dead.push((m.eid, m.etype, mx, my, mz));
+-                                let on = clients()
+-                                    .lock()
+-                                    .unwrap()
+-                                    .iter()
+-                                    .find(|c| c.eid == a.owner)
+-                                    .map(|c| c.name.clone());
+-                                if let Some(on) = on {
+-                                    adv_event(&on, "player_killed_entity", Some(m.etype));
+-                                }
+-                            }
+-                            if a.pierce > 0 {
+-                                a.pierce -= 1;
+-                                a.last_hit = m.eid;
+-                            } else {
+-                                dead.push(eid);
++                            *m.fuse.lock().unwrap() = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
++                            let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
++                            bolts()
++                                .lock()
++                                .unwrap()
++                                .push((be, server_ticks(BOLT_LIFE_GT) as i32));
++                            broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
++                            let ts = sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
++                            broadcast(-1, |_c| (0x68, ts.clone()));
++                        }
++                        if dh <= 0.0 {
++                            mob_dead.push((m.eid, m.etype, mx, my, mz));
++                            let on = clients()
++                                .lock()
++                                .unwrap()
++                                .iter()
++                                .find(|c| c.eid == a.owner)
++                                .map(|c| c.name.clone());
++                            if let Some(on) = on {
++                                adv_event(&on, "player_killed_entity", Some(m.etype));
+                             }
+-                            break 'outer;
+                         }
++                        if a.pierce > 0 {
++                            a.pierce -= 1;
++                            a.last_hit = m.eid;
++                        } else {
++                            dead.push(eid);
++                        }
++                        break 'outer;
+                     }
+                 }
+                 drop(ml);
+@@ -3378,20 +3401,25 @@ fn arrow_tick() {
+                             let p = c.pos.lock().unwrap();
+                             *p
+                         };
+-                        for s in sweep {
+-                            if c.eid == a.last_hit {
+-                                continue;
+-                            }
+-                            if projectile_reaches(s, (px, py, pz), 0.7, 0.3, 2.0) {
+-                                hits.push((c.eid, a.dmg));
+-                                if a.pierce > 0 {
+-                                    a.pierce -= 1;
+-                                    a.last_hit = c.eid;
+-                                } else {
+-                                    dead.push(eid);
+-                                }
+-                                break 'p2;
++                        if c.eid == a.last_hit {
++                            continue;
++                        }
++                        if projectile_segment_hits(
++                            segment_start,
++                            segment_end,
++                            (px, py, pz),
++                            0.7,
++                            0.3,
++                            2.0,
++                        ) {
++                            hits.push((c.eid, a.dmg));
++                            if a.pierce > 0 {
++                                a.pierce -= 1;
++                                a.last_hit = c.eid;
++                            } else {
++                                dead.push(eid);
+                             }
++                            break 'p2;
+                         }
+                     }
+                 }
+@@ -3402,12 +3430,14 @@ fn arrow_tick() {
+                         let p = c.pos.lock().unwrap();
+                         *p
+                     };
+-                    // player hitbox ~0.6 wide, 1.8 tall
+-                    if (px - ax).abs() < 0.7
+-                        && (pz - az).abs() < 0.7
+-                        && ay > py - 0.3
+-                        && ay < py + 2.0
+-                    {
++                    if projectile_segment_hits(
++                        segment_start,
++                        segment_end,
++                        (px, py, pz),
++                        0.7,
++                        0.3,
++                        2.0,
++                    ) {
+                         hits.push((c.eid, a.dmg));
+                         dead.push(eid);
+                         break;
+@@ -12142,94 +12172,68 @@ fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
+ }
+
+ // ---------- chunks ----------
+-fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
+-    let mut v = Vec::new();
+-    // palette
+-    let mut pal: Vec<u32> = Vec::new();
+-    let mut idx = vec![0u16; 4096];
+-    for (i, &s) in states.iter().enumerate() {
+-        match pal.iter().position(|&p| p == s) {
+-            Some(p) => idx[i] = p as u16,
+-            None => {
+-                idx[i] = pal.len() as u16;
+-                pal.push(s);
+-            }
+-        }
++/// One network palette writer for block states and quart biomes. Values never
++/// straddle longs; global mode writes registry IDs, without a local palette.
++fn write_palette(
++    out: &mut Vec<u8>,
++    values: &[i64],
++    min_bits: usize,
++    max_bits: usize,
++    global_bits: usize,
++) {
++    let mut palette = Vec::new();
++    let mut lookup = HashMap::new();
++    let indices: Vec<_> = values
++        .iter()
++        .map(|&value| {
++            *lookup.entry(value).or_insert_with(|| {
++                let index = palette.len();
++                palette.push(value);
++                index
++            })
++        })
++        .collect();
++    if palette.len() == 1 {
++        out.push(0);
++        write_varint(out, palette[0]);
++        write_varint(out, 0);
++        return;
+     }
+-    let bc = states.iter().filter(|&&s| s != 0).count() as i16;
+-    v.extend_from_slice(&bc.to_be_bytes());
+-    if pal.len() == 1 {
+-        v.push(0);
+-        write_varint(&mut v, pal[0] as i64);
+-        write_varint(&mut v, 0);
+-    } else {
+-        let bits = 64 - (pal.len() as u64 - 1).leading_zeros();
+-        let bpe = bits.max(4) as usize;
+-        v.push(bpe as u8);
+-        write_varint(&mut v, pal.len() as i64);
+-        for &p in &pal {
+-            write_varint(&mut v, p as i64);
+-        }
+-        let per = 64 / bpe;
+-        let nlongs = 4096 / per + if 4096 % per != 0 { 1 } else { 0 };
+-        write_varint(&mut v, nlongs as i64);
+-        let mut longs = vec![0u64; nlongs];
+-        for (i, v) in idx.iter().enumerate().take(4096) {
+-            longs[i / per] |= (*v as u64) << ((i % per) * bpe);
+-        }
+-        for l in longs {
+-            v.extend_from_slice(&l.to_be_bytes());
+-        }
+-    }
+-    // biome palette: 4x4x4 quart cells, index (y<<4|z<<2|x)
+-    let mut bpal: Vec<i64> = Vec::new();
+-    let mut bidx = [0u8; 64];
+-    for (i, &b) in biomes.iter().enumerate() {
+-        match bpal.iter().position(|&p| p == b) {
+-            Some(p) => bidx[i] = p as u8,
+-            None => {
+-                bidx[i] = bpal.len() as u8;
+-                bpal.push(b);
+-            }
++    let bits = ((usize::BITS - (palette.len() - 1).leading_zeros()) as usize).max(min_bits);
++    let direct = bits > max_bits;
++    let bits = if direct { global_bits } else { bits };
++    out.push(bits as u8);
++    if !direct {
++        write_varint(out, palette.len() as i64);
++        for &value in &palette {
++            write_varint(out, value);
+         }
+     }
+-    if bpal.len() == 1 {
+-        v.push(0);
+-        write_varint(&mut v, bpal[0]);
+-        write_varint(&mut v, 0);
+-    } else {
+-        // vanilla biome container: indirect palette up to 3 bpe, else 6-bit direct
+-        let bits = (64 - (bpal.len() as u64 - 1).leading_zeros()).max(1) as usize;
+-        let (bpe, direct) = if bits > 3 {
+-            (6usize, true)
+-        } else {
+-            (bits, false)
+-        };
+-        v.push(bpe as u8);
+-        if !direct {
+-            write_varint(&mut v, bpal.len() as i64);
+-            for &p in &bpal {
+-                write_varint(&mut v, p);
+-            }
+-        }
+-        let per = 64 / bpe;
+-        let nlongs = 64 / per + if 64 % per != 0 { 1 } else { 0 };
+-        write_varint(&mut v, nlongs as i64);
+-        let mut longs = vec![0u64; nlongs];
+-        for i in 0..64 {
+-            let val = if direct {
+-                biomes[i] as u64
+-            } else {
+-                bidx[i] as u64
+-            };
+-            let li = i / per;
+-            longs[li] |= val << ((i % per) * bpe);
+-        }
+-        for l in longs {
+-            v.extend_from_slice(&l.to_be_bytes());
++    let per = 64 / bits;
++    write_varint(out, values.len().div_ceil(per) as i64);
++    for (chunk, indexed) in values.chunks(per).zip(indices.chunks(per)) {
++        let mut word = 0u64;
++        for (i, (&value, &index)) in chunk.iter().zip(indexed).enumerate() {
++            let entry = if direct { value as u64 } else { index as u64 };
++            word |= entry << (i * bits);
+         }
++        out.extend_from_slice(&word.to_be_bytes());
+     }
+-    v
++}
++fn section_encode(states: &[u32; 4096], biomes: &[i64; 64]) -> Vec<u8> {
++    let mut out = Vec::new();
++    // Protocol-767 air/void_air/cave_air IDs; do not depend on optional
++    // cross-version metadata to decide the section's wire count.
++    let non_air = states
++        .iter()
++        .filter(|&&state| !matches!(state, 0 | 12958 | 12959))
++        .count() as i16;
++    out.extend_from_slice(&non_air.to_be_bytes());
++    // The pinned registry has 26684 block states, requiring fifteen global bits.
++    write_palette(&mut out, &states.map(i64::from), 4, 8, 15);
++    // The protocol-767 configuration registry has 64 biome IDs (six global bits).
++    write_palette(&mut out, biomes, 1, 3, 6);
++    out
+ }
+
+ /// One 2048-byte sky light array per section, in the client's layout, from a per-column
+@@ -12834,14 +12838,39 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
+ }
+
+ fn nbt_str(v: &mut Vec<u8>, s: &str) {
+-    // NBT string length is u16 — clamp to a char boundary or oversized
+-    // strings wrap the length field and desync every client that reads it.
+-    let mut n = s.len().min(u16::MAX as usize);
+-    while !s.is_char_boundary(n) {
+-        n -= 1
++    // Java writeUTF encodes NUL as C0 80 and astral scalars as two three-byte
++    // UTF-16 surrogates. Keep our bounded-prefix policy for server-authored text
++    // (not Java's overflow exception), measured in encoded bytes, never half a scalar.
++    let start = v.len();
++    v.extend_from_slice(&[0, 0]);
++    for ch in s.chars() {
++        let size = match ch as u32 {
++            0 => 2,
++            1..=0x7f => 1,
++            0x80..=0x7ff => 2,
++            0x800..=0xffff => 3,
++            _ => 6,
++        };
++        if v.len() - start - 2 + size > u16::MAX as usize {
++            break;
++        }
++        for &unit in ch.encode_utf16(&mut [0; 2]).iter() {
++            match unit {
++                1..=0x7f => v.push(unit as u8),
++                0..=0x7ff => {
++                    v.push(0xc0 | (unit >> 6) as u8);
++                    v.push(0x80 | (unit & 0x3f) as u8);
++                }
++                _ => {
++                    v.push(0xe0 | (unit >> 12) as u8);
++                    v.push(0x80 | ((unit >> 6) & 0x3f) as u8);
++                    v.push(0x80 | (unit & 0x3f) as u8);
++                }
++            }
++        }
+     }
+-    v.extend_from_slice(&(n as u16).to_be_bytes());
+-    v.extend_from_slice(&s.as_bytes()[..n]);
++    let length = (v.len() - start - 2) as u16;
++    v[start..start + 2].copy_from_slice(&length.to_be_bytes());
+ }
+ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
+     let mut v = Vec::new();
+@@ -15497,30 +15526,31 @@ fn apply_loot_funcs(st: &mut Stack, funcs: &[LootFunc]) {
+         match f {
+             LootFunc::SetName(t) => comp_set(&mut st.2, COMP_CUSTOM_NAME, nbt_string(t)),
+             LootFunc::SetLore(ls, append) => {
+-                let mut elems: Vec<String> = Vec::new();
++                let mut elems: Vec<Vec<u8>> = Vec::new();
+                 if *append {
+                     if let Some(d) = comp_get(&st.2, COMP_LORE) {
+                         let (n, mut p) = read_varint_at(d, 0);
+                         for _ in 0..n.min(64) {
+-                            if p + 3 > d.len() {
++                            if p + 3 > d.len() || d[p] != 8 {
+                                 break;
+                             }
+-                            p += 1; // tag byte
+-                            let ln = u16::from_be_bytes([d[p], d[p + 1]]) as usize;
+-                            p += 2;
+-                            if p + ln > d.len() {
++                            let ln = u16::from_be_bytes([d[p + 1], d[p + 2]]) as usize;
++                            let end = p + 3 + ln;
++                            if end > d.len() {
+                                 break;
+                             }
+-                            elems.push(String::from_utf8_lossy(&d[p..p + ln]).to_string());
+-                            p += ln;
++                            // Existing StringTag bytes may contain Java lone surrogates.
++                            // Appending lore must not round-trip them through Rust String.
++                            elems.push(d[p..end].to_vec());
++                            p = end;
+                         }
+                     }
+                 }
+-                elems.extend(ls.iter().cloned());
++                elems.extend(ls.iter().map(|text| nbt_string(text)));
+                 let mut d = Vec::new();
+                 write_varint(&mut d, elems.len() as i64);
+-                for t in &elems {
+-                    d.extend_from_slice(&nbt_string(t));
++                for tag in &elems {
++                    d.extend_from_slice(tag);
+                 }
+                 comp_set(&mut st.2, COMP_LORE, d);
+             }
+@@ -21947,6 +21977,8 @@ mod merge_tests;
+ #[cfg(test)]
+ mod persistence_tests;
+ #[cfg(test)]
++mod primitives_tests;
++#[cfg(test)]
+ mod registry_tests;
+ #[cfg(test)]
+ mod test_support;
+
+exec
+/usr/bin/bash -lc 'cat specs/valence-primitives/*; cat src/primitives_tests.rs' in /tmp/mc-primitives-review-wt
+ succeeded in 0ms:
+# Valence-inspired binary and geometry seams (local WIP)
+
+Authority: Minecraft 1.21.1 / protocol 767 and its authenticated jar, not
+Valence's 1.20.1 registries or packet constants. Donor revision and MIT license
+are recorded in [reuse evidence](../../evidence/foundation/valence-reuse/README.md).
+No Bevy, glam, java_string, ECS, or second protocol/collision engine is planned.
+
+Three independently testable slices, in risk-first order:
+
+1. **Section palettes** — repair `section_encode`: singleton / indirect / global
+   transitions, non-straddling long packing, real air-state counts. Share the
+   packing algorithm for blocks and biomes instead of keeping two copies. Compare
+   bytes with real `PalettedContainer.write` for deterministic initial-value and
+   insertion order; use real BlockState registry, synthetic identity biome IDs
+   with the installed registry's cardinality. This is encoding, not chunk/world
+   generation parity. Do not port Valence's in-memory container.
+2. **NBT strings** — keep `Comps` as opaque wire bytes. Replace ordinary UTF-8
+   writes with modified UTF-8 through the existing `nbt_str` owner; make
+   `nbt_string` use it. Retain the existing bounded-prefix policy for oversized
+   server-authored text, now measured in encoded bytes without splitting a scalar;
+   this policy is explicitly NOT Java writeUTF's overflow exception. Preserve old
+   encoded lore on append rather than lossy decoding it through Rust String.
+   Compare legal-size writes to actual StringTag.write, including NUL and astral
+   characters. Raw Java lone-surrogate strings remain opaque; no JavaString-wide
+   data-model migration or compatibility shim.
+3. **Finite AABB clipping** — replace sampled entity intersection in `arrow_tick`
+   with continuous segment geometry. Port pinned AABB.clip epsilon/open-endpoint
+   rules, not Valence's inclusive infinite-ray slab test. Keep existing approximate
+   entity boxes and existing start-inside contact policy explicit; block voxel
+   shapes, pose dimensions, nearest-target ordering, physics and tracking require
+   separate contracts. Compare clip coordinates with actual AABB.clip and prove
+   production tick reachability with a between-sample hit.
+
+Each slice needs a concrete red test, restored green control, and focused mutation
+proof. Oracle checks must reject incomplete/changed inputs/results and stale jar or
+source provenance. One shared authenticated Java probe can exercise the three
+independent seams without starting a server. Retain the full-suite failing-name
+baseline; do not re-record worldgen captures. Finish with formatting, clippy,
+existing wire regressions, static independent review and source-bound evidence.
+No hosted execution, publication, push, merge, save-format migration or old-data
+compatibility machinery is included.
+use super::*;
+
+fn cases(kind: &str) -> Vec<json::J> {
+    let fixture = json::jparse(include_bytes!(
+        "../evidence/foundation/valence-primitives/vanilla.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.get("minecraft").unwrap().str(), "1.21.1");
+    let rows: Vec<_> = fixture
+        .get("cases")
+        .unwrap()
+        .as_arr()
+        .unwrap()
+        .iter()
+        .filter(|j| j.get("kind").unwrap().str() == kind)
+        .cloned()
+        .collect();
+    assert!(!rows.is_empty(), "empty oracle coverage for {kind}");
+    rows
+}
+fn ints(row: &json::J, key: &str) -> Vec<i64> {
+    row.get(key)
+        .unwrap()
+        .as_arr()
+        .unwrap()
+        .iter()
+        .map(|j| j.num() as i64)
+        .collect()
+}
+fn assert_encoding(row: &json::J, wire: &[u8]) {
+    let want = row.get("expected").unwrap();
+    let hash: String = sha1(wire).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        (wire.len(), hash.as_str()),
+        (
+            want.get("length").unwrap().num() as usize,
+            want.get("sha1").unwrap().str()
+        ),
+        "{}",
+        row.get("id").unwrap().str()
+    );
+}
+
+#[test]
+fn primitives_aabb_clip_matches_native_finite_segments() {
+    for row in cases("clip") {
+        let numbers = |key: &str| -> Vec<f64> {
+            row.get(key)
+                .unwrap()
+                .as_arr()
+                .unwrap()
+                .iter()
+                .map(|j| j.num())
+                .collect()
+        };
+        let box_values = numbers("box");
+        let bounds = Aabb::new(
+            box_values[..3].try_into().unwrap(),
+            box_values[3..].try_into().unwrap(),
+        );
+        let start: [f64; 3] = numbers("start").try_into().unwrap();
+        let end: [f64; 3] = numbers("end").try_into().unwrap();
+        let got: Vec<_> = bounds
+            .clip(start, end)
+            .into_iter()
+            .flatten()
+            .map(|v| format!("{:016x}", v.to_bits()))
+            .collect();
+        let want: Vec<_> = row
+            .get("expected")
+            .unwrap()
+            .get("hit_bits")
+            .unwrap()
+            .as_arr()
+            .unwrap()
+            .iter()
+            .map(|j| j.str().to_string())
+            .collect();
+        assert_eq!(got, want, "{}", row.get("id").unwrap().str());
+    }
+}
+
+#[test]
+fn primitives_nbt_writers_match_native_modified_utf8() {
+    let mut checked = 0;
+    for row in cases("string") {
+        let units: Vec<_> = ints(&row, "units").into_iter().map(|v| v as u16).collect();
+        // Isolated-surrogate cases belong to the opaque-lore preservation gate,
+        // not Rust String's valid-Unicode writer contract.
+        if let Ok(text) = String::from_utf16(&units) {
+            let text = text.repeat(row.get("repeat").unwrap().num() as usize);
+            let mut wire = Vec::new();
+            nbt_str(&mut wire, &text);
+            assert_encoding(&row, &wire);
+            let tagged = nbt_string(&text);
+            assert_eq!(tagged[0], 8);
+            assert_eq!(&tagged[1..], wire);
+            let chat = chat_nbt(&text);
+            assert_eq!(&chat[8..chat.len() - 1], wire);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 9);
+}
+
+#[test]
+fn primitives_nbt_lore_append_preserves_java_string_bytes() {
+    let mut checked = 0;
+    for row in cases("string") {
+        let Some(hex) = row.get("expected").unwrap().get("hex") else {
+            continue;
+        };
+        let hex = hex.str();
+        let mut tagged = vec![8];
+        for i in (0..hex.len()).step_by(2) {
+            tagged.push(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+        }
+        let mut lore = vec![1];
+        lore.extend_from_slice(&tagged);
+        let mut stack = (1, 1, vec![(COMP_LORE, lore.clone())]);
+        apply_loot_funcs(&mut stack, &[LootFunc::SetLore(vec!["new".into()], true)]);
+        let mut expected = vec![2];
+        expected.extend_from_slice(&tagged);
+        expected.extend_from_slice(&nbt_string("new"));
+        assert_eq!(
+            comp_get(&stack.2, COMP_LORE),
+            Some(expected.as_slice()),
+            "{}",
+            row.get("id").unwrap().str()
+        );
+        // Persistence must keep the same opaque component payload.
+        let mut saved = Vec::new();
+        write_comps(&mut saved, &stack.2);
+        assert_eq!(read_comps(&saved, &mut 0), stack.2);
+        checked += 1;
+    }
+    assert_eq!(checked, 9);
+}
+
+#[test]
+fn primitives_nbt_bounded_prefix_does_not_split_a_scalar() {
+    for text in [
+        "a".repeat(65536),
+        char::from(0).to_string().repeat(32768),
+        "💣".repeat(10923),
+        format!("{}💣z", "a".repeat(65530)),
+    ] {
+        let tagged = nbt_string(&text);
+        let length = u16::from_be_bytes([tagged[1], tagged[2]]) as usize;
+        assert_eq!(tagged.len(), length + 3);
+        assert!(length <= 65535);
+        let mut writer = Vec::new();
+        nbt_str(&mut writer, &text);
+        assert_eq!(&tagged[1..], writer);
+        let expected = if text.starts_with('a') {
+            if text.len() == 65536 {
+                65535
+            } else {
+                65530
+            }
+        } else if text.starts_with(char::from(0)) {
+            65534
+        } else {
+            65532
+        };
+        assert_eq!(length, expected);
+    }
+}
+
+#[test]
+fn primitives_section_encoding_matches_native_palettes() {
+    for row in cases("section") {
+        let states = ints(&row, "states");
+        let biomes = ints(&row, "biomes");
+        let wire = section_encode(
+            &std::array::from_fn(|i| states[i % states.len()] as u32),
+            &std::array::from_fn(|i| biomes[i % biomes.len()]),
+        );
+        assert_encoding(&row, &wire);
+    }
+}
+
+exec
+/usr/bin/bash -lc "rg -n 'from_utf8|nbt_str\\(|COMP_CUSTOM_NAME|COMP_LORE' src/main.rs | head -100; cat tools/primitives_oracle.py" in /tmp/mc-primitives-review-wt
+ succeeded in 0ms:
+933:const COMP_CUSTOM_NAME: i64 = 5;
+934:const COMP_LORE: i64 = 7;
+1246:    nbt_str(&mut d, text);
+1348:                comp_set(&mut out, COMP_CUSTOM_NAME, nbt_string(t));
+1363:                comp_set(&mut out, COMP_LORE, d);
+7631:                let name = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+7720:                    *l = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+7752:                let name = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+7895:                let obj = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+7908:                    let entry = String::from_utf8_lossy(&payload[p..p + el]).to_string();
+8200:                let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+8213:                    st.insert(String::from_utf8_lossy(&payload[p..p + tl]).to_string());
+8235:                    st.insert(String::from_utf8_lossy(&payload[p..p + tl]).to_string());
+8262:                    let f2 = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+8284:                    let pn = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+8297:                        ids.insert(String::from_utf8_lossy(&payload[p..p + il]).to_string());
+8318:                    let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
+8331:                        let kn = String::from_utf8_lossy(&payload[p..p + kl]).to_string();
+8354:                        let on = String::from_utf8_lossy(&payload[p..p + ol]).to_string();
+8361:                        ot.insert(on, String::from_utf8_lossy(&payload[p..p + tl]).to_string());
+8369:                                Some(String::from_utf8_lossy(&payload[p..p + sl]).to_string());
+12840:fn nbt_str(v: &mut Vec<u8>, s: &str) {
+12879:    nbt_str(&mut v, "MOTION_BLOCKING");
+13057:    let locale = std::str::from_utf8(&p[..len]).ok()?;
+14377:    nbt_str(v, name);
+14378:    nbt_str(v, val);
+14382:    nbt_str(v, name);
+14401:    nbt_str(v, name); // TAG_Compound <name>
+14405:    nbt_str(v, "messages"); // TAG_List<String>
+14409:        nbt_str(v, &json_text(l));
+14451:    nbt_str(&mut v, "text");
+14452:    nbt_str(&mut v, text);
+15527:            LootFunc::SetName(t) => comp_set(&mut st.2, COMP_CUSTOM_NAME, nbt_string(t)),
+15531:                    if let Some(d) = comp_get(&st.2, COMP_LORE) {
+15555:                comp_set(&mut st.2, COMP_LORE, d);
+17260:                nbt_str(&mut v, k);
+17264:                nbt_str(&mut v, k);
+17265:                nbt_str(&mut v, val);
+17271:        nbt_str(&mut v, "text");
+17272:        nbt_str(&mut v, json);
+17301:    std::str::from_utf8(&p[..address_len]).ok()?;
+17315:    let name = std::str::from_utf8(&p[..name_len]).ok()?;
+18682:                        String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
+18692:                        String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
+19459:                        *l = String::from_utf8_lossy(&sl[..m]).into_owned();
+21305:        let cmd = String::from_utf8_lossy(&body[8..body.len().saturating_sub(2)]).to_string();
+#!/usr/bin/env python3
+"""Compare three small seams against actual authenticated 1.21.1 classes."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import random
+import subprocess
+import zipfile
+from vanilla_java import DEFAULT_JAR, JAR_SHA1, pinned_runtime, run_probe
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "tools/primitives-oracle/PrimitivesOracle.java"
+FIXTURE = ROOT / "evidence/foundation/valence-primitives/vanilla.json"
+
+
+def cases():
+    out = []
+    for n in [1, 2, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 1024, 4096]:
+        out.append(dict(kind="section", states=list(range(n)), biomes=[0]))
+    for n in [1, 2, 3, 4, 5, 8, 9, 16, 32, 64]:
+        out.append(dict(kind="section", states=[26683, 1], biomes=list(range(n))))
+    for states in [[12958], [12959], [0, 12958, 12959, 1], [26683], [1, 26683, 12959]]:
+        out.append(dict(kind="section", states=states, biomes=[63]))
+    for units, repeat in [([], 1), ([65, 66, 67], 1), ([0], 1), ([0, 127, 128, 2047, 2048, 65535], 1),
+                          ([26085, 26412, 35486], 1), ([0xd83d, 0xdca3], 1),
+                          ([0xd800], 1), ([0xdc00], 1), ([0xd800, 65, 0xdc00], 1),
+                          ([65], 65535), ([0], 32767), ([0xd83d, 0xdca3], 10922)]:
+        out.append(dict(kind="string", units=units, repeat=repeat))
+    box = [0, 0, 0, 1, 1, 1]
+    for start, end in [([-1, .5, .5], [2, .5, .5]), ([2, .5, .5], [-1, .5, .5]),
+                       ([.5, -1, .5], [.5, 2, .5]), ([.5, 2, .5], [.5, -1, .5]),
+                       ([.5, .5, -1], [.5, .5, 2]), ([.5, .5, 2], [.5, .5, -1]),
+                       ([-1, .5, .5], [0, .5, .5]), ([0, .5, .5], [1, .5, .5]),
+                       ([.5, .5, .5], [2, .5, .5]), ([.5, .5, .5], [.5, .5, .5]),
+                       ([-1, 0, 0], [2, 0, 0]), ([-1, 1, 1], [2, 1, 1]),
+                       ([-1, -1e-7, .5], [2, -1e-7, .5]),
+                       ([-1, -0.999e-7, .5], [2, -0.999e-7, .5]),
+                       ([-.5e-7, .5, .5], [.5e-7, .5, .5]),
+                       ([-.51e-7, .5, .5], [.51e-7, .5, .5]),
+                       ([-1, -1, -1], [2, 2, 2]), ([2, 2, 2], [-1, -1, -1]),
+                       ([-1, 2, .5], [2, 2, .5])]:
+        out.append(dict(kind="clip", box=box, start=start, end=end))
+    rng = random.Random(767)
+    for _ in range(80):
+        low = [rng.uniform(-30, 30) for _ in range(3)]
+        high = [x + rng.uniform(.001, 3) for x in low]
+        start = [x + rng.uniform(-3, 3) for x in low]
+        end = [x + rng.uniform(-3, 3) for x in high]
+        out.append(dict(kind="clip", box=low + high, start=start, end=end))
+    for i, row in enumerate(out):
+        row["id"] = f"primitive-{i:03}"
+    return out
+
+
+def require_equal(expected, actual):
+    if (not actual.get("cases") or
+            json.dumps(expected, sort_keys=True) != json.dumps(actual, sort_keys=True)):
+        raise ValueError("primitives differ, are incomplete, or have stale provenance")
+
+
+def validate(rows, requested):
+    if not rows or len(rows) != len(requested):
+        raise ValueError("empty/truncated primitive oracle")
+    for req, row in zip(requested, rows, strict=True):
+        result = row.get("expected", {})
+        if {k: v for k, v in row.items() if k != "expected"} != req:
+            raise ValueError("changed primitive request: " + req["id"])
+        keys = ({"sha1", "length", "non_air", "block_bits", "biome_bits"} if req["kind"] == "section"
+                else {"hit_bits"} if req["kind"] == "clip"
+                else {"sha1", "length"} | ({"hex"} if result.get("length", 100) < 100 else set()))
+        if set(result) != keys:
+            raise ValueError("changed primitive result: " + req["id"])
+        if req["kind"] == "clip":
+            bits = result["hit_bits"]
+            if not isinstance(bits, list) or len(bits) not in (0, 3):
+                raise ValueError("invalid hit")
+            for b in bits:
+                if type(b) is not str or len(b) != 16 or int(b, 16) < 0:
+                    raise ValueError("invalid hit bits")
+        else:
+            if type(result["sha1"]) is not str or len(bytes.fromhex(result["sha1"])) != 20:
+                raise ValueError("invalid digest")
+            for k in keys - {"sha1", "hex"}:
+                if type(result[k]) is not int or result[k] < 0:
+                    raise ValueError("invalid integer")
+            if "hex" in result and len(bytes.fromhex(result["hex"])) != result["length"]:
+                raise ValueError("invalid string bytes")
+
+
+def reference(jar):
+    requested = cases()
+    with pinned_runtime(jar) as (work, cp, _):
+        src, dst = work / "input.json", work / "output.json"
+        src.write_text(json.dumps({"cases": requested}))
+        run_probe(work, cp, SOURCE, "dev.mcspine.tools.PrimitivesOracle", src, dst)
+        rows = json.loads(dst.read_text())
+    validate(rows, requested)
+    return {"minecraft": "1.21.1", "server_sha1": JAR_SHA1,
+            "oracle_sha256": hashlib.sha256(SOURCE.read_bytes()).hexdigest(), "cases": rows}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--jar", type=Path, default=DEFAULT_JAR)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--output", type=Path)
+    mode.add_argument("--check", type=Path, default=FIXTURE)
+    args = parser.parse_args()
+    try:
+        actual = reference(args.jar)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(actual, indent=2, sort_keys=True) + "\n")
+        else:
+            require_equal(json.loads(args.check.read_text()), actual)
+        print(f"primitives: {len(actual['cases'])} actual-class cases, pinned 1.21.1")
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
+        parser.exit(1, f"primitives: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
+
+exec
+/usr/bin/bash -lc 'git diff -- src/tick_tests.rs tools/mutation_check.sh; cat tools/primitives-oracle/PrimitivesOracle.java; cat tools/suite_compare.py; cat tests/suite_compare_test.py' in /tmp/mc-primitives-review-wt
+ succeeded in 0ms:
+diff --git a/src/tick_tests.rs b/src/tick_tests.rs
+index af0a6a8..3c6dac4 100644
+--- a/src/tick_tests.rs
++++ b/src/tick_tests.rs
+@@ -3188,103 +3188,50 @@ fn region_change_mid_fall_keeps_the_entity() {
+     assert_eq!(block_at(x, base + 1, z), sand, "it lands on the support");
+ }
+
+-/// The substep sampling exists so that a projectile crossing a target in one tick
+-/// still hits it. The samples used to start `0.675 * step` behind the arrow - a
+-/// drag constant standing in for a geometric span - so the first third of the tick
+-/// was never tested, and an arrow fired at point-blank range crossed its target
+-/// without touching it. This pins the span and measures where the old one missed.
++/// The continuous sweep includes the original tick start, not the old 0.675
++/// fraction. Keep the historical contact regression on the production geometry.
+ #[test]
+ fn the_projectile_sweep_covers_the_whole_tick() {
+-    let pos = (10.0, 64.0, -3.0);
+-    let step = (4.0, -0.5, 0.0);
+-    let sweep = projectile_sweep(pos, step);
+-    assert_eq!(
+-        sweep[0],
+-        (6.0, 64.5, -3.0),
+-        "the first sample is the position the tick started from"
+-    );
++    assert!(projectile_segment_hits(
++        [6.0, 64.5, -3.0],
++        [10.0, 64.0, -3.0],
++        (6.0, 64.0, -3.0),
++        1.2,
++        0.4,
++        2.1,
++    ));
++    assert!(!projectile_segment_hits(
++        [7.975, 64.16875, -3.0],
++        [10.0, 64.0, -3.0],
++        (6.0, 64.0, -3.0),
++        1.2,
++        0.4,
++        2.1,
++    ));
++}
++
++/// Preserve point-blank start-inside behavior while retiring sampled intersection.
++#[test]
++fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
++    let (hp, arrow_x) = arrow_sweep_outcome(0.6, 5.0);
+     assert_eq!(
+-        sweep[PROJECTILE_SWEEP_STEPS], pos,
+-        "the last sample is the position the tick ended at"
++        hp,
++        Some(14.0),
++        "the arrow crossed the target but did not hit it: {arrow_x:?}"
+     );
++}
+
+-    // A target standing where this tick started, so the segment crosses it at its
+-    // very first point. `projectile_reaches` is the box the production hit test
+-    // uses, and it is 1.2 wide, so the old span only missed targets *this* far
+-    // behind its deepest sample.
+-    let target = (6.0, 64.0, -3.0);
+-    assert!(
+-        projectile_reaches(sweep[0], target, 1.2, 0.4, 2.1),
+-        "the tick's own segment must reach it"
+-    );
+-    // The span the code used before this fix, reconstructed here: 0.9 * (1 - t)
+-    // behind the arrow for t = 0.25, 0.5, 0.75, 1.0.
+-    let old: Vec<_> = (1..=4)
+-        .map(|st| {
+-            let t = st as f64 / 4.0;
+-            (
+-                pos.0 - step.0 * 0.9 * (1.0 - t),
+-                pos.1 - step.1 * 0.9 * (1.0 - t),
+-                pos.2 - step.2 * 0.9 * (1.0 - t),
+-            )
+-        })
+-        .collect();
+-    assert!(
+-        !old.iter()
+-            .any(|s| projectile_reaches(*s, target, 1.2, 0.4, 2.1)),
+-        "the old span must miss it, or this test guards nothing: {old:?}"
+-    );
+-
+-    // Where does the old span start missing targets the segment still crosses?
+-    // Measured over the step sizes an arrow reaches: a fully charged shot moves
+-    // 2.97 blocks on its first tick and a long-falling one approaches 4.95 with
+-    // gravity 0.05 against drag 0.99 (the tick test below uses that step).
+-    let mut first_gap = None;
+-    for step_len in [1.0, 2.0, 2.97, 3.5, 3.7, 3.8, 4.0, 4.95, 6.0, 8.0] {
+-        let mut gap = false;
+-        let mut x = pos.0 - step_len;
+-        while x <= pos.0 {
+-            let target = (x, 64.0, -3.0);
+-            let new_hits = projectile_sweep(pos, (step_len, 0.0, 0.0))
+-                .iter()
+-                .any(|s| projectile_reaches(*s, target, 1.2, 0.4, 2.1));
+-            let old_hits = (1..=4).any(|st| {
+-                let t = st as f64 / 4.0;
+-                projectile_reaches(
+-                    (pos.0 - step_len * 0.9 * (1.0 - t), pos.1, pos.2),
+-                    target,
+-                    1.2,
+-                    0.4,
+-                    2.1,
+-                )
+-            });
+-            if new_hits && !old_hits {
+-                gap = true;
+-                break;
+-            }
+-            x += 0.01;
+-        }
+-        if gap && first_gap.is_none() {
+-            first_gap = Some(step_len);
+-        }
+-    }
+-    let first_gap = first_gap.expect("the old span never missed anything: nothing to fix");
+-    // Measured: the deepest old sample sat 0.675 * step behind the arrow, so a
+-    // target at the tick's start was outside its 1.2-wide box once
+-    // 0.325 * step > 1.2, i.e. from 3.7 blocks per tick. A fully charged arrow
+-    // steps 2.97 and never showed this; a long-falling one approaches 4.95 and did.
++#[test]
++fn primitives_arrow_tick_hits_between_the_old_samples() {
++    let (hp, arrow_x) = arrow_sweep_outcome(3.0, 20.0);
+     assert_eq!(
+-        first_gap, 3.7,
+-        "the old span's first gap moved to {first_gap} blocks per tick"
++        hp,
++        Some(14.0),
++        "continuous segment missed target between samples: {arrow_x:?}"
+     );
+ }
+
+-/// The same defect end to end: an arrow fired point-blank leaves the bow inside
+-/// its target and is four blocks past it by the end of the same tick, so the
+-/// crossing has to land on that tick. Only the production loop can show it - the
+-/// unit test above pins the sampling, this pins that the arrow path uses it.
+-#[test]
+-fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
++fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64>) {
+     let _world_guard = world_guard();
+     let old_arrows = std::mem::take(&mut *arrows().lock().unwrap());
+     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap());
+@@ -3293,15 +3240,15 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
+     let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+     let (old_hot, old_warm) = test_region();
+     forceloaded().lock().unwrap().insert((0, 0));
+-    // 5.0 blocks of velocity decay to a 4.95 block first step, which is what a
+-    // long-falling arrow approaches (gravity 0.05 against drag 0.99).
++    // The point-blank case uses ordinary falling-arrow speed. The between-sample
++    // discriminator deliberately uses higher velocity, without claiming native physics.
+     arrows().lock().unwrap().push(Arrow {
+         eid: 8100,
+         owner: 1,
+         x: 0.5,
+         y: 120.0,
+         z: 0.5,
+-        dx: 5.0,
++        dx: velocity,
+         dy: 0.0,
+         dz: 0.0,
+         ttl: server_ticks(ARROW_TTL_GT) as i32,
+@@ -3316,16 +3263,12 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
+         last_hit: -1,
+         stuck: false,
+     });
+-    // The target stands a tenth of a block in front of the archer, so the arrow's
+-    // first tick starts inside its box and ends four blocks beyond it. It has to
+-    // be this close: with the samples starting two thirds of the step behind the
+-    // arrow, the nearest of them lands at x = 2.11, whose 1.2-wide box still
+-    // reaches x = 0.91.
++    // One target isolates intersection from entity ordering or block occlusion.
+     mobs().lock().unwrap().push(Arc::new(Mob {
+         eid: 8101,
+         uuid: [0u8; 16],
+         etype: 124,
+-        pos: Mutex::new((0.6, 120.0, 0.5, 0.0, 0.0)),
++        pos: Mutex::new((target_x, 120.0, 0.5, 0.0, 0.0)),
+         hp: Mutex::new(20.0),
+         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+         hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+@@ -3352,11 +3295,7 @@ fn the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside() {
+     TICK.store(old_tick, Ordering::Relaxed);
+     TICK_IDX.store(old_index, Ordering::Relaxed);
+     set_test_region(old_hot, old_warm);
+-    assert_eq!(
+-        hp,
+-        Some(14.0),
+-        "the arrow crossed the target (the arrow ended at {arrow_x:?}) but did not hit it"
+-    );
++    (hp, arrow_x)
+ }
+
+ #[test]
+diff --git a/tools/mutation_check.sh b/tools/mutation_check.sh
+index e9f2de4..cf8b29e 100755
+--- a/tools/mutation_check.sh
++++ b/tools/mutation_check.sh
+@@ -578,14 +578,14 @@ check "the heightmap a feature reads is the floor the blocks are at" \
+   '        let terrain = base;' \
+   heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface
+
+-check "the projectile sweep spans the whole tick, not a fraction of it" \
+-  src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
+-  '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
++check "the projectile sweep retains start-inside contact" \
++  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
++  '    bounds.clip(start, end).is_some()' \
+   the_projectile_sweep_covers_the_whole_tick
+
+ check "an arrow hits the target it crosses on its first tick" \
+-  src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
+-  '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
++  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
++  '    bounds.clip(start, end).is_some()' \
+   the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside
+
+ check "a container transfer fills only the room in a matching stack" \
+@@ -695,6 +695,52 @@ check "entity spawn head angles keep the constructor double precision" \
+   '        angle(yaw) as u8,' \
+   entity_angles_spawn_matches_native_constructors
+
++# Binary/geometry primitives: actual-class vectors plus production dispatch.
++check "section palettes switch to registry IDs above the indirect limit" \
++  src/main.rs '    let direct = bits > max_bits;' \
++  '    let direct = bits > max_bits + 1;' \
++  primitives_section_encoding_matches_native_palettes
++
++check "section packing leaves unused high bits instead of straddling words" \
++  src/main.rs '    let per = 64 / bits;' \
++  '    let per = (64 / bits).min(2);' \
++  primitives_section_encoding_matches_native_palettes
++
++check "section counts exclude all three pinned air states" \
++  src/main.rs '!matches!(state, 0 | 12958 | 12959)' \
++  'state != 0' \
++  primitives_section_encoding_matches_native_palettes
++
++check "NBT NUL uses modified UTF-8 instead of a zero byte" \
++  src/main.rs '            match unit {' \
++  $'            match unit {\n                0 => { v.push(0); continue; }' \
++  primitives_nbt_writers_match_native_modified_utf8
++
++check "NBT astral scalars retain both UTF-16 surrogates" \
++  src/main.rs '        for &unit in ch.encode_utf16(&mut [0; 2]).iter() {' \
++  '        for &unit in [ch as u16].iter() {' \
++  primitives_nbt_writers_match_native_modified_utf8
++
++check "lore append preserves opaque modified UTF-8 bytes" \
++  src/main.rs '                            elems.push(d[p..end].to_vec());' \
++  '                            elems.push(nbt_string(&String::from_utf8_lossy(&d[p + 3..end])));' \
++  primitives_nbt_lore_append_preserves_java_string_bytes
++
++check "AABB clip excludes the finite segment endpoint" \
++  src/main.rs '                && t < nearest' \
++  '                && t <= nearest' \
++  primitives_aabb_clip_matches_native_finite_segments
++
++check "AABB clip keeps the pinned epsilon" \
++  src/main.rs '        const EPSILON: f64 = 1.0e-7;' \
++  '        const EPSILON: f64 = 0.0;' \
++  primitives_aabb_clip_matches_native_finite_segments
++
++check "arrow tick uses the continuous segment rather than just its end" \
++  src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
++  '    bounds.contains(end)' \
++  primitives_arrow_tick_hits_between_the_old_samples
++
+ echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
+ if [ "$parked" -gt 0 ]; then
+   echo "  $parked gate(s) are parked and prove nothing until they run again."
+package dev.mcspine.tools;
+
+import com.google.gson.*;
+import io.netty.buffer.*;
+import java.io.*;
+import java.lang.reflect.*;
+import java.nio.file.*;
+import java.security.MessageDigest;
+import java.util.*;
+
+/** Actual pinned container, StringTag and AABB methods, without a running world. */
+public final class PrimitivesOracle {
+    static Class<?> cls(String name) throws Exception { return Class.forName(name); }
+    static String digest(byte[] bytes) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-1").digest(bytes));
+    }
+    static Object field(Object object, String name) throws Exception {
+        Field f = object.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(object);
+    }
+    static int[] integers(JsonArray array) {
+        int[] out = new int[array.size()];
+        for (int i = 0; i < out.length; i++) out[i] = array.get(i).getAsInt();
+        return out;
+    }
+    static Object vec(JsonArray array) throws Exception {
+        return cls("exc").getConstructor(double.class, double.class, double.class)
+            .newInstance(array.get(0).getAsDouble(), array.get(1).getAsDouble(), array.get(2).getAsDouble());
+    }
+    static byte[] palette(Object registry, Object[] values, String strategy, int count) throws Exception {
+        Class<?> container = cls("dvq"), strat = cls("dvq$d");
+        Object instance = container.getConstructor(cls("jr"), Object.class, strat)
+            .newInstance(registry, values[0], strat.getField(strategy).get(null));
+        Method set = container.getDeclaredMethod("b", int.class, Object.class);
+        set.setAccessible(true);
+        for (int i = 0; i < count; i++) set.invoke(instance, i, values[i % values.length]);
+        ByteBuf bytes = Unpooled.buffer();
+        try {
+            Object buf = cls("vw").getConstructor(ByteBuf.class).newInstance(bytes);
+            container.getMethod("b", cls("vw")).invoke(instance, buf);
+            byte[] result = new byte[bytes.readableBytes()];
+            bytes.getBytes(0, result);
+            return result;
+        } finally { bytes.release(); }
+    }
+    static Object blockRegistry;
+    static Object[] biomeValues;
+    static Object biomeRegistry;
+    static JsonObject section(JsonObject row) throws Exception {
+        int[] states = integers(row.getAsJsonArray("states")), biomes = integers(row.getAsJsonArray("biomes"));
+        Object[] blocks = new Object[states.length], bios = new Object[biomes.length];
+        Method byId = cls("js").getMethod("a", int.class);
+        int nonAir = 0;
+        for (int i = 0; i < blocks.length; i++) {
+            blocks[i] = byId.invoke(blockRegistry, states[i]);
+            if (blocks[i] == null) throw new IllegalArgumentException("unknown block state");
+        }
+        for (int i = 0; i < 4096; i++)
+            if (!(boolean) cls("dtc").getMethod("i").invoke(blocks[i % blocks.length])) nonAir++;
+        for (int i = 0; i < bios.length; i++) bios[i] = biomeValues[biomes[i]];
+        byte[] a = palette(blockRegistry, blocks, "d", 4096), b = palette(biomeRegistry, bios, "e", 64);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        new DataOutputStream(out).writeShort(nonAir);
+        out.write(a); out.write(b);
+        JsonObject expected = new JsonObject();
+        expected.addProperty("sha1", digest(out.toByteArray()));
+        expected.addProperty("length", out.size());
+        expected.addProperty("non_air", nonAir);
+        expected.addProperty("block_bits", a[0] & 255);
+        expected.addProperty("biome_bits", b[0] & 255);
+        return expected;
+    }
+    static JsonObject string(JsonObject row) throws Exception {
+        StringBuilder text = new StringBuilder();
+        int repeat = row.get("repeat").getAsInt();
+        for (int i = 0; i < repeat; i++)
+            for (int unit : integers(row.getAsJsonArray("units"))) text.append((char) unit);
+        Object tag = cls("uw").getMethod("a", String.class).invoke(null, text.toString());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        cls("uw").getMethod("a", DataOutput.class).invoke(tag, new DataOutputStream(out));
+        // Also exercise the JDK reader StringTag.load delegates to; keep raw UTF-16,
+        // including isolated surrogates, rather than JSON-encoding a lossy String.
+        String decoded = new DataInputStream(new ByteArrayInputStream(out.toByteArray())).readUTF();
+        if (!decoded.equals(text.toString())) throw new AssertionError("readUTF mismatch");
+        JsonObject expected = new JsonObject();
+        expected.addProperty("sha1", digest(out.toByteArray()));
+        expected.addProperty("length", out.size());
+        if (out.size() < 100) expected.addProperty("hex", HexFormat.of().formatHex(out.toByteArray()));
+        return expected;
+    }
+    static JsonObject clip(JsonObject row) throws Exception {
+        JsonArray box = row.getAsJsonArray("box");
+        Object aabb = cls("ewx").getConstructor(double.class, double.class, double.class,
+            double.class, double.class, double.class).newInstance(box.get(0).getAsDouble(),
+            box.get(1).getAsDouble(), box.get(2).getAsDouble(), box.get(3).getAsDouble(),
+            box.get(4).getAsDouble(), box.get(5).getAsDouble());
+        Optional<?> result = (Optional<?>) cls("ewx").getMethod("b", cls("exc"), cls("exc"))
+            .invoke(aabb, vec(row.getAsJsonArray("start")), vec(row.getAsJsonArray("end")));
+        JsonObject expected = new JsonObject();
+        JsonArray bits = new JsonArray();
+        if (result.isPresent()) for (String name : new String[]{"c", "d", "e"})
+            bits.add(String.format("%016x", Double.doubleToRawLongBits((double) field(result.get(), name))));
+        expected.add("hit_bits", bits);
+        return expected;
+    }
+    public static void main(String[] args) throws Exception {
+        cls("ab").getMethod("a").invoke(null);
+        cls("akt").getMethod("a").invoke(null);
+        blockRegistry = cls("dfy").getField("q").get(null);
+        biomeRegistry = cls("js").getConstructor().newInstance();
+        // Synthetic identity map: tests the real palette strategy, not biome content.
+        biomeValues = new Object[64];
+        for (int i = 0; i < 64; i++) {
+            biomeValues[i] = new Object();
+            cls("js").getMethod("a", Object.class, int.class).invoke(biomeRegistry, biomeValues[i], i);
+        }
+        JsonArray out = new JsonArray();
+        JsonObject input = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
+        for (JsonElement element : input.getAsJsonArray("cases")) {
+            JsonObject row = element.getAsJsonObject().deepCopy();
+            row.add("expected", switch (row.get("kind").getAsString()) {
+                case "section" -> section(row);
+                case "string" -> string(row);
+                case "clip" -> clip(row);
+                default -> throw new IllegalArgumentException("unknown probe");
+            });
+            out.add(row);
+        }
+        Files.writeString(Path.of(args[1]), new GsonBuilder().setPrettyPrinting().create().toJson(out));
+    }
+}
+#!/usr/bin/env python3
+"""Compare terminal Rust suite results, not nested child-process test summaries."""
+import argparse
+import json
+from pathlib import Path
+import re
+
+
+def summary(text):
+    matches = list(re.finditer(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;.*$", text, re.M))
+    if not matches:
+        raise ValueError("missing terminal suite result")
+    terminal = matches[-1]
+    passed, failed, ignored = map(int, terminal.groups()[1:])
+    # Cargo's final failed-name roster precedes the terminal summary; child
+    # processes may have printed their own '1 passed' or failure blocks earlier.
+    before = text[:terminal.start()]
+    roster = before.rsplit("\nfailures:\n", 1)[-1] if failed else ""
+    names = sorted(re.findall(r"^    (\S+)$", roster, re.M))
+    if len(names) != failed or len(set(names)) != failed:
+        raise ValueError("incomplete terminal failed-name roster")
+    if (terminal.group(1) == "ok") != (failed == 0):
+        raise ValueError("inconsistent terminal result")
+    return dict(passed=passed, failed=failed, ignored=ignored, failures=names)
+
+
+def compare(baseline, current, added_passes):
+    old, new = summary(baseline), summary(current)
+    result = dict(baseline=old, current=new,
+                  added_failures=sorted(set(new["failures"]) - set(old["failures"])),
+                  removed_failures=sorted(set(old["failures"]) - set(new["failures"])))
+    result["unchanged_failure_baseline"] = (old["failures"] == new["failures"]
+        and old["ignored"] == new["ignored"] and new["passed"] == old["passed"] + added_passes)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("baseline", type=Path)
+    parser.add_argument("current", type=Path)
+    parser.add_argument("--added-passes", type=int, required=True)
+    args = parser.parse_args()
+    try:
+        result = compare(args.baseline.read_text(), args.current.read_text(), args.added_passes)
+    except (OSError, ValueError) as error:
+        parser.exit(2, str(error) + "\n")
+    print(json.dumps(result, indent=2))
+    # This is attribution of a red baseline, never an overall acceptance verdict.
+    raise SystemExit(0 if result["unchanged_failure_baseline"] else 1)
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+"""A nested '1 passed' must not hide the terminal 194/24/1 migration result."""
+from pathlib import Path
+import sys
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+from suite_compare import summary, compare
+
+
+def log(passed, failures):
+    return ("test result: ok. 1 passed; 0 failed; 0 ignored; 0 filtered out\n"
+            + ("\nfailures:\n\n" + "".join(f"    {name}\n" for name in failures) if failures else "")
+            + f"\ntest result: {'FAILED' if failures else 'ok'}. {passed} passed; {len(failures)} failed; 1 ignored; 0 filtered out\n")
+
+
+class SuiteCompareTests(unittest.TestCase):
+    def test_last_result_not_nested_child(self):
+        names = [f"area::test_{i:02}" for i in range(24)]
+        result = summary(log(194, names))
+        self.assertEqual((result["passed"], result["failed"], result["ignored"]), (194, 24, 1))
+        self.assertEqual(result["failures"], names)
+
+    def test_incomplete_and_duplicate_rosters_are_not_results(self):
+        for text in ["", log(3, ["a", "b"]).replace("    b\n", ""),
+                     log(3, ["a", "a"])]:
+            with self.assertRaises(ValueError):
+                summary(text)
+
+    def test_same_count_different_failure_is_not_same_baseline(self):
+        result = compare(log(188, ["a"]), log(194, ["b"]), 6)
+        self.assertFalse(result["unchanged_failure_baseline"])
+        self.assertEqual(result["added_failures"], ["b"])
+
+    def test_exact_delta_does_not_claim_green_suite(self):
+        result = compare(log(188, ["a"]), log(194, ["a"]), 6)
+        self.assertTrue(result["unchanged_failure_baseline"])
+        self.assertEqual(result["current"]["failed"], 1)
+        self.assertFalse(compare(log(188, ["a"]), log(193, ["a"]), 6)["unchanged_failure_baseline"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+exec
+/usr/bin/bash -lc "cat evidence/foundation/valence-primitives/README.md; git diff -- .github/workflows/ci.yml tests/verify.sh; sed -n '3210,3320p' src/main.rs; cat tests/primitives_oracle_test.py; sed -n '1,65p' /home/yuu/.agents/skills/refactor-clean/SKILL.md" in /tmp/mc-primitives-review-wt
+ succeeded in 0ms:
+# Valence-inspired binary / geometry seams — local WIP
+
+Pinned authority is **Minecraft 1.21.1 / protocol 767**, server SHA-1
+`59353fb40c36d304f2035d51e7d6e6baa98dc05c`. This is not whole-server acceptance.
+[Donor provenance and license](../valence-reuse/README.md) identify the older
+Valence revision; its registries, Bevy, JavaString type and infinite-ray formula
+were not imported. No dependency was added or donor code executed.
+
+## What the comparison establishes
+
+`vanilla.json` is produced by [the authenticated oracle](../../../tools/primitives_oracle.py).
+Default execution compares every request, result and provenance field. Recording
+requires explicit `--output`; a wrong jar is rejected before extraction/Java and
+cannot overwrite an existing output. The Java class uses normal constructors and
+real methods, no Unsafe allocation, server startup, downloads or fake world.
+Guava can emit a deprecated Unsafe warning internally; that is not constructor
+bypass in this probe.
+
+- **Section encoding:** actual `PalettedContainer.write` with the real BlockState
+  ID map. The initial value is the first input; writes proceed in linear cell
+  order, so first-seen palette order is controlled. Singleton, indirect thresholds,
+  global registry IDs, non-straddling longs, high IDs and all three native air
+  states are covered. The non-air count calls actual `BlockState.isAir` per cell;
+  it is not a whole `LevelChunkSection` serialization test. Biomes use a synthetic
+  identity IdMapper of 64 entries with the actual SECTION_BIOMES strategy: this
+  proves bit packing, not biome contents or registry synchronization. Rust compares
+  length and SHA-1 of the complete encoded section, not only palette counts.
+- **NBT strings:** actual `StringTag.write(DataOutput)` and JDK `readUTF` on the
+  output. Legal-size Rust strings compare byte length and whole-output hash,
+  including NUL, BMP, astral pairs and the length boundary. Java isolated-surrogate
+  cases do not get coerced into Rust String: their recorded raw StringTag bytes
+  are preserved through production lore append and component persistence. This is
+  not an arbitrary NBT parser or structure-template implementation.
+- **AABB clip:** actual `AABB.clip(Vec3,Vec3)` returns positions, compared as raw
+  f64 bits. Positive/negative axes, zero/tiny direction, open endpoints, starting
+  inside, corner contact, epsilon boundaries and deterministic varied segments
+  are exercised. A production tick regression proves the continuous path reaches
+  a target between the retired sample positions; a separate point-blank
+  regression retains the existing start-inside contact policy.
+
+The corpus currently has **29 section / 12 string / 99 clip cases**. Nine string
+cases are valid Rust Unicode; three isolated-surrogate cases are deliberately
+opaque. The corpus guard checks exact generated input membership, not merely these
+counts. Native decode/write success does not imply full world or network parity.
+
+## Concrete failures and ownership
+
+The old 257-state section emitted **5,084 bytes**, versus native **8,200**: it
+continued writing a local palette above eight bits. The existing section encoder
+now uses one palette writer for blocks and biomes, switching to target-registry
+IDs and widths at the appropriate boundary. State IDs and cardinalities belong to
+protocol 767, not the donor. No speedup is claimed.
+
+The old NBT writer emitted an ordinary zero byte for NUL (**3 total bytes** rather
+than native **4**). Lore append subsequently replaced modified-UTF-8 bytes with
+lossy replacement characters. Both existing string writers now share modified
+UTF-8 emission, and lore append keeps existing StringTag bytes opaque.
+
+The old arrow tick left a synthetic high-speed target at **20 HP**, although the
+finite segment crossed its box. Continuous intersection applies the existing
+6-point damage and leaves **14 HP**. High velocity is a geometry discriminator,
+not a claim that the port's integrator matches native physics. The old point-blank
+and velocity-decay tests remain active; sample-specific assertions/mutations were
+retargeted to the continuous production owner, not left testing dead helpers.
+
+## Deliberate limits
+
+- The oversized-text policy remains a bounded Unicode-scalar prefix. It is now
+  measured in **modified-UTF-8 bytes** and cannot split an astral pair. Java
+  writeUTF instead throws above 65,535 bytes; overflow-policy parity is **not**
+  claimed. The custom save envelope/component-length limits are unchanged; the
+  small opaque-byte round-trip is not a promise that arbitrarily large components
+  fit the existing u16 component-payload field.
+- Lore append still supports its existing bounded list of StringTag components;
+  compound/list text components and general semantic patch equality are not added.
+- Arrow target boxes, pose dimensions, contact policy, target iteration order,
+  block occlusion/voxel collision, piercing, damage, movement and tracking are not
+  established by AABB primitive parity. Block collision still checks the end cell.
+  This change must not be described as a complete projectile/raycast engine.
+- Finite numeric inputs are the geometry contract exercised here. NaN/Infinity
+  construction or arbitrary invalid registries are not tested.
+
+## Gates and current result
+
+The Rust primitive tests consume the shared native fixture and exercise production
+section/chat/item writers, loot append and arrow tick. Python guards check corpus
+identity, result shapes, source/jar provenance, and fail-closed output behavior;
+these run from `tests/verify.sh` and CI alongside the Rust suite. Java is needed
+only to regenerate/recheck the native reference.
+
+The mutation campaign and final receipt are recorded in `run.json` and logs once
+completed. Full migration acceptance remains red; no old worldgen captures were
+re-recorded, and no push, merge, hosted CI, mirror refresh or publication is part
+of this local slice.
+
+A validation-harness mistake was also reproduced: selecting the first Rust test
+summary returned a child process's **1/0/0**, although the terminal suite result
+was **194/24/1**. [The shared summary reader](../../../tools/suite_compare.py) now
+requires the terminal summary and complete failed-name roster. Its four tests and
+an observed first-summary mutation pin that class. An unchanged red baseline is
+only attribution of failures, never a green acceptance signal.
+
+## Reproduce (admit/cap resources separately)
+
+```sh
+python3 tools/primitives_oracle.py
+python3 tests/primitives_oracle_test.py
+python3 tests/suite_compare_test.py
+cargo test --release --offline --locked -j 1 primitives_ -- --test-threads=1
+MUTATION_FILTER=primitives_ MUTATION_RELEASE=1 CARGO_BUILD_JOBS=1 \
+  bash tools/mutation_check.sh --offline
+```
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2464aab..f05e433 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -47,6 +47,8 @@ jobs:
+           python3 tests/container_oracle_test.py
+           python3 tests/surface_oracle_test.py
+           python3 tests/packet_angles_oracle_test.py
++          python3 tests/primitives_oracle_test.py
++          python3 tests/suite_compare_test.py
+       - name: Build (locked)
+         run: |
+           cargo build --locked --message-format=json-render-diagnostics > build-artifacts.json
+diff --git a/tests/verify.sh b/tests/verify.sh
+index f9ffbec..f31fd07 100755
+--- a/tests/verify.sh
++++ b/tests/verify.sh
+@@ -17,6 +17,8 @@ python3 tests/biome_tree_test.py
+ python3 tests/container_oracle_test.py
+ python3 tests/surface_oracle_test.py
+ python3 tests/packet_angles_oracle_test.py
++python3 tests/primitives_oracle_test.py
++python3 tests/suite_compare_test.py
+
+ echo "== module layering"
+ python3 tests/layers_gate_test.py
+}
+
+fn arrow_tick() {
+    let mut dead: Vec<i32> = vec![];
+    let mut hits: Vec<(i32, f32)> = vec![]; // (victim eid, arrow dmg)
+    let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
+    {
+        let mut ar = arrows().lock().unwrap();
+        let region = region_guard();
+        for a in ar.iter_mut() {
+            a.ttl -= 1;
+            let eid = a.eid;
+            if a.ttl <= 0 {
+                dead.push(eid);
+                continue;
+            }
+            if !region.is_hot(a.x as i32, a.z as i32) {
+                continue;
+            }
+            let (ax, ay, az) = (a.x, a.y, a.z);
+            // vanilla: a stuck arrow is picked up on contact (survival only)
+            if a.stuck {
+                let grab = {
+                    clients()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| *c.gm.lock().unwrap() != 1)
+                        .find(|c| {
+                            let p = c.pos.lock().unwrap();
+                            let (dx, dy, dz) = (p.0 - ax, (p.1 + 0.9) - ay, p.2 - az);
+                            dx * dx + dy * dy + dz * dz < 1.3
+                        })
+                        .cloned()
+                };
+                if let Some(c) = grab {
+                    let mut inv = c.inv.lock().unwrap();
+                    let slot: i16 = (9..=44i16)
+                        .find(|sl| {
+                            inv.get(sl)
+                                .map(|(i, c2, _)| *i == 802 && *c2 < 64)
+                                .unwrap_or(false)
+                        })
+                        .or_else(|| (9..=44).find(|sl| !inv.contains_key(sl)))
+                        .unwrap_or(9);
+                    let mut st = inv.get(&slot).cloned().unwrap_or((802, 0, Vec::new()));
+                    st.1 += 1;
+                    inv.insert(slot, st);
+                    drop(inv);
+                    let st =
+                        c.inv
+                            .lock()
+                            .unwrap()
+                            .get(&slot)
+                            .cloned()
+                            .unwrap_or((802, 1, Vec::new()));
+                    let mut p = vec![0u8];
+                    write_varint(&mut p, 0);
+                    p.extend_from_slice(&slot.to_be_bytes());
+                    p.extend_from_slice(&slot_wire(&st));
+                    if let Ok(mut w) = c.sock.lock() {
+                        let _ = send_packet(&mut w, 0x15, p);
+                    }
+                    dead.push(eid);
+                }
+                continue;
+            }
+            // vanilla AbstractArrow: scale the velocity by 0.99, add -0.05, then
+            // integrate position from that velocity. Applying drag to the
+            // displacement instead would leave the horizontal velocity undamped.
+            a.dx *= 0.99;
+            a.dy *= 0.99;
+            a.dz *= 0.99;
+            a.dy -= 0.05;
+            a.x += a.dx;
+            a.y += a.dy;
+            a.z += a.dz;
+            let (ax, ay, az) = (a.x, a.y, a.z);
+            let segment_start = [ax - a.dx, ay - a.dy, az - a.dz];
+            let segment_end = [ax, ay, az];
+            // block collision: arrows stick into solid blocks (vanilla)
+            let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
+            if bst != 0 && !mob_passable(bst) {
+                // tridents stick like arrows in vanilla too, but our trident
+                // return path handles its own landing — only plain arrows stick
+                if a.kind == 1 {
+                    dead.push(eid);
+                } else {
+                    a.stuck = true;
+                    a.dx = 0.0;
+                    a.dy = 0.0;
+                    a.dz = 0.0;
+                }
+                continue;
+            }
+            broadcast_seen(eid, |_c| {
+                (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+            });
+            if a.owner >= 0 {
+                // Player-shot arrow: intersect the whole segment with mobs and
+                // other players. The owner and last pierced target are skipped.
+                let ml = mobs().lock().unwrap();
+                'outer: for m in ml.iter() {
+                    if m.eid == a.last_hit {
+                        continue;
+                    }
+                    let (mx, my, mz, ..) = *m.pos.lock().unwrap();
+                    if projectile_segment_hits(
+                        segment_start,
+                        segment_end,
+                        (mx, my, mz),
+#!/usr/bin/env python3
+"""Offline corpus identity, coverage and fail-closed primitive-oracle guards."""
+import copy
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+import primitives_oracle as oracle
+
+
+class PrimitivesReferenceTests(unittest.TestCase):
+    def test_complete_cases_and_provenance(self):
+        fixture = json.loads(oracle.FIXTURE.read_text())
+        self.assertEqual(fixture["minecraft"], "1.21.1")
+        self.assertEqual(fixture["server_sha1"], oracle.JAR_SHA1)
+        self.assertEqual(fixture["oracle_sha256"], hashlib.sha256(oracle.SOURCE.read_bytes()).hexdigest())
+        oracle.validate(fixture["cases"], oracle.cases())
+        self.assertEqual([{k: v for k, v in row.items() if k != "expected"}
+                          for row in fixture["cases"]], oracle.cases())
+        sections = [r for r in fixture["cases"] if r["kind"] == "section"]
+        for n, bits in [(1, 0), (16, 4), (17, 5), (256, 8), (257, 15), (4096, 15)]:
+            self.assertTrue(any(len(r["states"]) == n and r["expected"]["block_bits"] == bits
+                                for r in sections), (n, bits))
+        for n, bits in [(1, 0), (8, 3), (9, 6), (64, 6)]:
+            self.assertTrue(any(len(r["biomes"]) == n and r["expected"]["biome_bits"] == bits
+                                for r in sections), (n, bits))
+        for state in [12958, 12959]:
+            self.assertTrue(any(r["states"] == [state] and r["expected"]["non_air"] == 0
+                                for r in sections))
+        clips = [r for r in fixture["cases"] if r["kind"] == "clip"]
+        self.assertTrue(any(r["expected"]["hit_bits"] for r in clips))
+        self.assertTrue(any(not r["expected"]["hit_bits"] for r in clips))
+        for units in [[0], [0xd83d, 0xdca3], [0xd800], [0xdc00]]:
+            self.assertTrue(any(r["kind"] == "string" and r["units"] == units
+                                for r in fixture["cases"]))
+
+    def test_comparison_rejects_empty_truncated_extra_changed_and_stale(self):
+        fixture = json.loads(oracle.FIXTURE.read_text())
+        oracle.require_equal(fixture, copy.deepcopy(fixture))
+        mutations = [lambda v: v.update(cases=[]), lambda v: v["cases"].pop(),
+                     lambda v: v["cases"].append(copy.deepcopy(v["cases"][0])),
+                     lambda v: v["cases"][0].update(states=[1]),
+                     lambda v: v["cases"][0]["expected"].pop("sha1"),
+                     lambda v: v["cases"][0]["expected"].update(extra=0),
+                     lambda v: v["cases"][0]["expected"].update(non_air=False),
+                     lambda v: v.update(oracle_sha256="0" * 64),
+                     lambda v: v.update(server_sha1="0" * 40),
+                     lambda v: v.update(minecraft="1.20.1")]
+        for mutate in mutations:
+            changed = copy.deepcopy(fixture)
+            mutate(changed)
+            with self.assertRaises(ValueError):
+                oracle.require_equal(fixture, changed)
+
+    def test_validation_rejects_missing_results_and_bool_integers(self):
+        rows = json.loads(oracle.FIXTURE.read_text())["cases"]
+        for field, value in [("length", False), ("sha1", "not a hash"), ("extra", 0)]:
+            changed = copy.deepcopy(rows)
+            changed[0]["expected"][field] = value
+            with self.assertRaises(ValueError):
+                oracle.validate(changed, oracle.cases())
+        with self.assertRaises(ValueError):
+            oracle.validate([], oracle.cases())
+
+    def test_wrong_jar_preserves_output_before_java(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar, output = Path(tmp) / "wrong.jar", Path(tmp) / "output.json"
+            jar.write_bytes(b"not the pinned jar")
+            output.write_text("keep this")
+            result = subprocess.run([sys.executable, str(ROOT / "tools/primitives_oracle.py"),
+                                     "--jar", str(jar), "--output", str(output)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not the pinned 1.21.1 server jar", result.stderr)
+            self.assertEqual(output.read_text(), "keep this")
+
+
+if __name__ == "__main__":
+    unittest.main()
+---
+name: refactor-clean
+description: Refactor cleanly instead of layering sediment. Use when a behaviour is about to be implemented a second time (a second gravity, scheduler, ticker, cache or path for a rule that already exists) - the two owners agree on the outcome and differ on the path, so only intermediate assertions catch them. Also use when a change reveals duplicated concepts, local adapters, obsolete owners, compatibility wrappers, parallel abstractions, an over-large module that has accreted many responsibilities, or "just tack this on" pressure in any code area; also to survey a codebase for duplicated implementations before deciding what to merge.
+routing_aliases: "refactor, code cleanup, リファクタ"
+routing_action_cues: "refactor, clean, テスト, 検査, 診断, 監査, 検証, 調査, 確認, 攻撃, 実行, 収集, 解析, 構築, 導入, 発見, レビュー, 使, 評価, 列挙, 書く, 作る, 説明, 比較, 描く, チェック, スキャン, 整理, 削除, 書, 作, 描, 磨, 読, 消, 送, する, して"
+---
+
+# Clean Refactoring
+
+Replace the old shape with the simpler shape the codebase would want if it were
+designed today. Refactoring is not adding a compatibility layer beside the problem;
+it is moving ownership until every concept has exactly one clear home. That cuts
+both ways: merging N duplicated owners into one, and splitting one over-loaded
+module into the several owners it was hiding.
+
+## Workflow
+
+1. Name the concept that lacks one clear owner — duplicated across several owners,
+   or several concepts fused into one over-loaded module. Identify the thing(s)
+   that should each have one owner: environment, pricing rule, geometry source,
+   state machine, data contract, renderer phase, API shape, UI state, or test
+   oracle.
+2. Find every current owner and consumer. Treat wrappers, aliases, pass-local
+   constants, copied structs, and "temporary" branches as sediment until proven
+   otherwise.
+3. Promote the concept to its natural home. Pick the module that would own it from
+   scratch, then make old call sites consume that owner directly.
+4. Delete or collapse the stale path in the same pass when feasible. If a bridge must
+   remain, make it tiny, named as compatibility, and give it a removal condition.
+5. Verify behavior through consumers, not just the new module. A clean refactor is
+   only proven when the surfaces that used to diverge now report or exercise the
+   same source of truth.
+6. **Prove the merged owner with a mutant** (see the rule below). A green suite
+   after a merge proves nothing yet — each copy's coverage went with the copy.
+
+For Rust trait-object mechanics — `dyn A + B` composition errors,
+object-safety-first trait design, shared default methods for a subset of
+implementors, accessor-pair borrows — read
+`references/rust-trait-objects.md` when those errors or that shape appear.
+
+To enumerate what is duplicated before choosing what to merge, rather than
+reading files hoping to notice, read `references/duplication-survey.md`.
+
+## Rules
+
+- **Every line is debt — the best mechanism is the one you don't write.**
+  Before building any guard, validator, convergence protocol, or cleanup
+  path, two checks gate it:
+  1. **Does the platform already do this?** Read the component/framework you
+     are working around before coding around it — its crons, retries,
+     defaults, and lifecycles. A hand-built janitor beside a component that
+     already vacuums itself is pure debt, and it will be debugged by someone
+     who doesn't know the component made it unnecessary.
+  2. **Does the failure it guards change any real outcome?** Trace the
+     guarded condition to its consumer. If the consumer is indifferent — an
+     ordering check feeding a consumer that doesn't care about order, a
+     validation on data only our own code produces — the guard tests nothing
+     and must not be written. A common shape: an invariant re-checked at read
+     time that the single write path already establishes, so the branch can
+     only fire on hand-corrupted rows. Ask which caller could produce the bad
+     state; if the honest answer is "none, short of someone editing the
+     database", delete the branch. "It could be inconsistent" is not a reason;
+     "the consumer would then do the wrong thing" is.
+  The bar is not "is this correct?" — defensive code is usually correct.
+  The bar is "what breaks, for whom, if this line doesn't exist?" No
+
+codex
+Static review found no actionable correctness regressions in the palette writer, modified-UTF-8 encoding, opaque lore preservation, or finite-segment arrow dispatch. Documented limitations—including approximate hitboxes, target ordering, endpoint-only block collision, and bounded string/lore handling—were not treated as new defects. No files were changed; builds, tests, Java, downloads, servers, and the external mutation campaign were not run or independently verified.
+Static review found no actionable correctness regressions in the palette writer, modified-UTF-8 encoding, opaque lore preservation, or finite-segment arrow dispatch. Documented limitations—including approximate hitboxes, target ordering, endpoint-only block collision, and bounded string/lore handling—were not treated as new defects. No files were changed; builds, tests, Java, downloads, servers, and the external mutation campaign were not run or independently verified.

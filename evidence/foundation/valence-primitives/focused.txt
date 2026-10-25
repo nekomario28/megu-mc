@@ -1,0 +1,30 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 32.80s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 6 tests
+test primitives_tests::primitives_aabb_clip_matches_native_finite_segments ... ok
+test primitives_tests::primitives_nbt_bounded_prefix_does_not_split_a_scalar ... ok
+test primitives_tests::primitives_nbt_lore_append_preserves_java_string_bytes ... ok
+test primitives_tests::primitives_nbt_writers_match_native_modified_utf8 ... ok
+test primitives_tests::primitives_section_encoding_matches_native_palettes ... ok
+test tick_tests::primitives_arrow_tick_hits_between_the_old_samples ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.09s
+
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 2 tests
+test tick_tests::the_production_arrow_loop_decays_horizontal_velocity ... ok
+test tick_tests::the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 217 filtered out; finished in 0.06s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test tick_tests::the_projectile_sweep_covers_the_whole_tick ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.00s

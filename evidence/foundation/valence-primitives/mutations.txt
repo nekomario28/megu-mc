@@ -1,0 +1,17 @@
+
+ok    section palettes switch to registry IDs above the indirect limit
+ok    section packing leaves unused high bits instead of straddling words
+ok    section counts exclude all three pinned air states
+ok    NBT NUL uses modified UTF-8 instead of a zero byte
+ok    NBT astral scalars retain both UTF-16 surrogates
+ok    lore append preserves opaque modified UTF-8 bytes
+ok    AABB clip excludes the finite segment endpoint
+ok    AABB clip keeps the pinned epsilon
+ok    arrow tick uses the continuous segment rather than just its end
+mutation check: 9 proved, 0 not a gate, 0 parked, 0 skipped
+
+ok    the projectile sweep retains start-inside contact
+mutation check: 1 proved, 0 not a gate, 0 parked, 0 skipped
+
+ok    an arrow hits the target it crosses on its first tick
+mutation check: 1 proved, 0 not a gate, 0 parked, 0 skipped
