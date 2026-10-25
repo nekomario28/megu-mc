@@ -1,0 +1,5 @@
+ok    a container transfer fills only the room in a matching stack
+ok    a chest quick move searches the player inventory in reverse
+ok    a chest item reaches the placement path
+ok    the real chest click dispatch preserves the mouse button
+mutation check: 4 proved, 0 not a gate, 0 parked, 0 skipped

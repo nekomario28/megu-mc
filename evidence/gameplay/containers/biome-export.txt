@@ -1,0 +1,6 @@
+WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-ligb6puh/library-23.jar)
+WARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper
+WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+biome tree: {'overworld': 7593, 'nether': 5}, pinned jar 59353fb40c36d304f2035d51e7d6e6baa98dc05c -> /tmp/tmp.x6sG0tnckt
+biome_export=byte-identical

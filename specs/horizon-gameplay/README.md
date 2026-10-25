@@ -1,0 +1,57 @@
+# Horizon の gameplay 再利用
+
+対象を worldgen に限定せず、チェスト・インベントリ・エンティティにも広げる。
+ただし移植の単位は crate ではなく **1.21.1 の観測可能な契約**とする。
+Horizon の 26.3 の registry、packet ID、データ、式を丸ごと採用しない。
+ライセンスと参照 revision は [再利用調査](../../evidence/foundation/horizon-reuse/README.md)が正本。
+
+## 共通の出口条件
+
+- 既存の所有者を差し替える。同じ規則を旧経路と新経路に二重実装しない。
+- 公式 mappings で 1.21.1 のクラス・overload を確認する。
+- 実クラス oracle → Rust の同一入力 → 本番経路の順で検査する。
+- 入力・結果の欠落、比較ゼロ、別版 jar は失敗。故障注入が指定した assertion を落とすこと。
+- gameplay の部分合格を、未完の datapack 移行やサーバー全体の合格に置き換えない。
+
+## 小さく移植する順序
+
+### 1. 通常スロットとチェスト転送
+
+Horizon `horizon-client/src/menu.rs` の `pickup_inner` / `move_to` を参考に、
+既存の通常スロット処理に組み込む。別のメニューエンジンは追加しない。
+
+対象は部分マージ、右クリックの分割・1個配置・異種交換、stack limit、
+単体／ラージチェストの Shift 移動先順序と両側へのマージ。
+実クラス参照は `Slot.safeInsert` と `ChestMenu.quickMoveStack`。
+[Pinned fixture と検証範囲](../../evidence/gameplay/containers/README.md)を参照。
+チェスト item が既存の default-state 配置経路に届かない問題も、wire 検査の前提として扱う。
+
+### 2. アイテムエンティティとプレイヤーの受け取り
+
+donor は `horizon-world/src/inventory_pickup.rs` / `player_inventory.rs` と
+`tools/test_inventory_pickup_parity.py`。
+次の観測点は選択 hotbar → offhand → 通常 inventory のマージ優先順位、
+空きスロット順序、部分回収、満杯時の entity 残量、pickup delay。
+既存の `drop_tick` と擬似 player の `actor_tick` は別の inventory 表現を使うため、
+添字を混ぜない。先に 1.21.1 `Inventory` / `ItemEntity` oracle を用意する。
+**この段階の runtime 実装はまだ移植していない。**
+
+### 3. チェストのワールド側契約
+
+開閉・複数閲覧者同期・ブロック更新でのメニュー無効化・破壊 drop・永続化を、
+既存の container 保存処理と結合する。二重チェストは隣接だけで判定せず、
+同じ block kind、facing、left/right の状態を 1.21.1 と照合する。
+1 の普通のスロットが通っても、この段階の合格にはしない。
+
+### 4. エンティティの属性・移動・接触
+
+候補は `horizon-world/src/attributes/entity.rs`、`entity_move.rs`、
+`entity_collision.rs`、`entity_fluid_tick.rs` とそれぞれの parity harness。
+属性 default は 1.21.1 の `DefaultAttributes` から採取し直す。
+移動は collision、支持面、着地、fluid、game event の呼出し順が契約であり、
+world callback を偽の値で埋めて「移植済み」にしない。
+先に 2 entity / 1 接触面の fixture を作り、最後に既存 tick へ接続する。
+
+AI・経路探索・戦利品・乗り物なども再利用対象から除外しないが、
+必要な registry / world callback が見える段階で独立した slice に分ける。
+ここで候補に挙げたことは、Horizon 全 suite の実行成功や対応完了を意味しない。

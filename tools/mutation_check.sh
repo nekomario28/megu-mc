@@ -81,7 +81,7 @@ control() {
   local name="$1" filter="$2" phase="$3" pattern
   run_filter "$filter"
   if [[ "$filter" == tests/*.py ]]; then
-    pattern='^(client settings|gameplay) wire: PASS$'
+    pattern='^(client settings|gameplay|containers) wire: PASS$'
   else
     pattern='^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored'
   fi
@@ -578,6 +578,26 @@ check "an arrow hits the target it crosses on its first tick" \
   src/main.rs '        let back = 1.0 - i as f64 / PROJECTILE_SWEEP_STEPS as f64;' \
   '        let back = 0.9 * (1.0 - (i + 1) as f64 / PROJECTILE_SWEEP_STEPS as f64);' \
   the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside
+
+check "a container transfer fills only the room in a matching stack" \
+  src/main.rs '    let moved = amount.min(source.1).min(room);' \
+  '    let moved = amount.min(source.1).min(room).min(0);' \
+  container_transfers_match_real_1_21_1_classes
+
+check "a chest quick move searches the player inventory in reverse" \
+  src/main.rs '            let rem = move_to_slots(inv, (9..=44).rev(), st);' \
+  '            let rem = move_to_slots(inv, 9..=44, st);' \
+  container_transfers_match_real_1_21_1_classes
+
+check "a chest item reaches the placement path" \
+  src/main.rs '        299 => 2955,' \
+  '        299 => return None,' \
+  container_chest_item_reaches_the_placed_default_state
+
+check "the real chest click dispatch preserves the mouse button" \
+  src/main.rs '                                    click_slot(gmap, &mut cur, gslot, btn as i8);' \
+  '                                    click_slot(gmap, &mut cur, gslot, 0);' \
+  tests/container_wire.py 'containers wire: FAIL chest-half-pickup'
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

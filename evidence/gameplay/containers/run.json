@@ -1,0 +1,94 @@
+{
+  "recorded_utc": "2026-10-25T06:59:04.989713+00:00",
+  "base_commit": "8e767192434c88abe7f1257efc1e241b7e0d4187",
+  "branch": "pack/1211-own-data",
+  "donor": {
+    "repository": "https://github.com/ludovic111/horizon",
+    "revision": "0564ab0bcd3235daa6001033261b79aef5f81de1",
+    "license": "third_party/licenses/horizon.txt",
+    "adapted": "horizon-client/src/menu.rs pickup_inner / move_to / quick_move; oracle approach"
+  },
+  "reference": {
+    "minecraft": "1.21.1",
+    "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
+    "cases": 82,
+    "fixture_sha256": "886fe43ef58899e49b3382a45c42ab73b862116e04c5a379ce8549afb424a02a",
+    "oracle_repeat": "complete structural equality",
+    "biome_export_after_shared_runtime_extraction": "byte-identical to installed tree"
+  },
+  "checks": {
+    "focused": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.06s",
+    "baseline_full_suite": "test result: FAILED. 171 passed; 25 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.49s",
+    "full_suite": "test result: FAILED. 176 passed; 25 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.41s",
+    "failure_names_added": [],
+    "failure_names_removed": [],
+    "independent_root_causes": "not equal to failure count; shared mutex poison cascades remain",
+    "new_mutation_gates": "4 proved; 0 not a gate; 0 parked; 0 skipped (selected new gates only, baseline/mutant/restored controls)",
+    "mutation_source_restored_byte_identical": true,
+    "wire": "PASS; actual localhost protocol 767, no predicted slots",
+    "oracle_python_tests": 3,
+    "biome_python_tests": 5,
+    "layers_gate_tests": 17,
+    "source_layers": "19 modules; 43 edges; 0 named errors",
+    "debt": "0 over limit",
+    "clippy": "all-targets -D warnings PASS",
+    "fmt": "PASS",
+    "shell_syntax": "PASS",
+    "gate_self_tests": "13 PASS",
+    "independent_review": "No actionable regressions; static/fixture checks only, no reviewer Rust/Java/runtime execution",
+    "full_verify": "NOT RUN; inherited migration failures block acceptance",
+    "hosted_ci": "NOT RUN"
+  },
+  "production_binary": {
+    "path": "target/release/mc-spine",
+    "sha256": "37f1b08345203a54d752efc32e608d1cf53c99cdcc0232fbe6a196a9fbc95ca0",
+    "mtime_utc": "2026-10-25T06:57:02.981055+00:00",
+    "not_older_than_source": true
+  },
+  "resource_bounds": {
+    "build_and_selected_mutations": "leased local systemd service; MemoryMax=6G; CPUQuota=200%; cargo -j 1",
+    "java_probes": "fresh light gate; MemoryMax=2G; CPUQuota=100%; JVM -Xmx768m",
+    "gpu": "NOT USED"
+  },
+  "source_sha256": {
+    "src/main.rs": "836738619b7dcd6635836dab93a9be702acd08dd9cf4d2a584d97dd7642fbe06",
+    "src/container_tests.rs": "59644c0059e38245bd42c966dc61071af98fe9dced34e5305bba3f5e7874aa21",
+    "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89",
+    "tools/biome_tree_from_jar.py": "a45b89368a8dcbfe7847b22be1ea93c71e95fdd66a2ceebe47e171284ffd0c60",
+    "tools/container_oracle.py": "2cf45d96ce90de928079e20455f82da41a1b5a371263e86e88db8d474ae2c8d9",
+    "tools/container-oracle/ContainerOracle.java": "e094b8b3e3f237830e43f1482a8d37a78f2e81d90190902a0261070e8e04608c",
+    "tools/mutation_check.sh": "681d234d5100ced63027acd468ed72f81bb0a34c7f2e885637fb6ba19dabb952",
+    "tests/container_wire.py": "06c9c1e91a0ab6cd82e20ab363c5f787c254c24818a1b73c8af08a1f51341bcb",
+    "tests/container_oracle_test.py": "dc5a9edfcf137d851e6519feebbe5b865778095d51752f638c658b0a75c9eee9",
+    "tests/gate_scripts.py": "0ce8007929669e4d6b74fc6b8b094b1a19e543338f20b87a7bb1b82b4c753598",
+    "tests/verify.sh": "90e355ae90212cfa80f92dbe8f5ed6a5e4836fdd08ccf4181d400dca0b714577",
+    ".github/workflows/ci.yml": "d076eaf5346b473e2685185a28e2f7671831e9e753fb02cc6a92c732824b7319",
+    "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
+    "assets/blocks_1211.json": "7d1d95c4e0255f9f269293e8077c7923c9ec0ff902a9a475ed131da8b26bc654",
+    "config_packets.bin": "9fb932886e1da038d42f20ec385ec04517c1c0286d71b9d9eea91e8f5decb49a"
+  },
+  "artifact_sha256": {
+    "baseline-suite.txt": "07bf1c13099880308c29abd5abdc8fc7b610bda8814722931872ce277926b364",
+    "biome-export.txt": "e0e82dca1d5379cdf2e5d1bc4c3154273f6fece42992e5e81077bfff41087c70",
+    "clippy.txt": "d56132a915a76ecdcc584cc0c1ee3fd63c820297afe195b3f89a0e824e1db3b8",
+    "debt.txt": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
+    "focused.txt": "ffff6b52bee7ead6cbd5b92e09d7b4ba0e40a3a2ddd6393c73c3584bed7e0132",
+    "gates.txt": "45a6bf1e7dfec635c7741a50ebadbe969126a66abae5c68fe24bd618fe42cbc7",
+    "layers.txt": "06ecfcad254290f4e80291a3ca1058b49b6a580530c6dd549056eefb1318fdbc",
+    "mutations.txt": "84d92e809c46b3fa7b2a07ddbbbaea3045826cf35d9e4f1021183ee736a64d8d",
+    "oracle-repeat.txt": "cc552b488f2bb59d897765beeef398e988ac02bde00f1b61ed0c6f86bd9ee527",
+    "python.txt": "102d82bd75fa942f58c38bfee252229e5d1a37ba9e4071a0af4aed321b40a656",
+    "red.txt": "a5633e81d52dae4d211e325c08b278eb0ee7ab3476bce84648155187a708955f",
+    "review.txt": "7afa8c68d6874755063e36b618eca22613ef755302a2622919db07d118d9830c",
+    "suite.txt": "423f85e5f83a1e6adc44b4df3d36cd7c58bdcca6b85adaa325ff79e07f80f978",
+    "wire.txt": "2a71f944131956f597ea1f8b5c40ce9fa33222a33064c5335ef4f4d5da567103"
+  },
+  "acceptance": {
+    "container_slice": "focused/native/wire/negative controls passed",
+    "whole_server": false,
+    "canonical_merge": false,
+    "push": false
+  },
+  "next": "Inventory/ItemEntity oracle and pickup insertion; entity runtime not transplanted yet",
+  "disposition": "CONVERGE: preserve this bounded slice before expanding entity dependencies"
+}

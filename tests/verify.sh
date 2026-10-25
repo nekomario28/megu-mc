@@ -14,6 +14,7 @@ echo "== gate exit contracts"
 python3 tests/gate_scripts.py
 python3 tests/protocol767_test.py
 python3 tests/biome_tree_test.py
+python3 tests/container_oracle_test.py
 
 echo "== module layering"
 python3 tests/layers_gate_test.py
@@ -53,6 +54,7 @@ binary=$(python3 tools/cargo_executable.py <"$build_manifest")
 timeout 180 python3 tests/wire_smoke.py "$binary"
 timeout 180 python3 tests/client_settings_wire.py "$binary"
 timeout 180 python3 tests/gameplay_wire.py "$binary"
+timeout 180 python3 tests/container_wire.py "$binary"
 
 echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe

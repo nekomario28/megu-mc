@@ -1,0 +1,2411 @@
+{
+  "cases": [
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-000",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-001",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-002",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "count": 63,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-003",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "count": 63,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-004",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-005",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 62,
+          "item": "stone"
+        },
+        "target": {
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-006",
+      "op": "insert",
+      "source": {
+        "count": 63,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 63,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 63,
+          "item": "stone"
+        }
+      },
+      "id": "container-007",
+      "op": "insert",
+      "source": {
+        "count": 63,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 62,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-008",
+      "op": "insert",
+      "source": {
+        "count": 63,
+        "item": "stone"
+      },
+      "target": {
+        "count": 63,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 63,
+      "expected": {
+        "source": {
+          "count": 62,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-009",
+      "op": "insert",
+      "source": {
+        "count": 63,
+        "item": "stone"
+      },
+      "target": {
+        "count": 63,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 63,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-010",
+      "op": "insert",
+      "source": {
+        "count": 63,
+        "item": "stone"
+      },
+      "target": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 63,
+      "expected": {
+        "source": {
+          "count": 63,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-011",
+      "op": "insert",
+      "source": {
+        "count": 63,
+        "item": "stone"
+      },
+      "target": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 63,
+          "item": "stone"
+        },
+        "target": {
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-012",
+      "op": "insert",
+      "source": {
+        "count": 64,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 64,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-013",
+      "op": "insert",
+      "source": {
+        "count": 64,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 63,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-014",
+      "op": "insert",
+      "source": {
+        "count": 64,
+        "item": "stone"
+      },
+      "target": {
+        "count": 63,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 64,
+      "expected": {
+        "source": {
+          "count": 63,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-015",
+      "op": "insert",
+      "source": {
+        "count": 64,
+        "item": "stone"
+      },
+      "target": {
+        "count": 63,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 64,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-016",
+      "op": "insert",
+      "source": {
+        "count": 64,
+        "item": "stone"
+      },
+      "target": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 64,
+      "expected": {
+        "source": {
+          "count": 64,
+          "item": "stone"
+        },
+        "target": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "container-017",
+      "op": "insert",
+      "source": {
+        "count": 64,
+        "item": "stone"
+      },
+      "target": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "snowball"
+        }
+      },
+      "id": "container-018",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "snowball"
+        }
+      },
+      "id": "container-019",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-020",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 15,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-021",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 15,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-022",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-023",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 14,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 1,
+          "item": "snowball"
+        }
+      },
+      "id": "container-024",
+      "op": "insert",
+      "source": {
+        "count": 15,
+        "item": "snowball"
+      },
+      "target": null
+    },
+    {
+      "amount": 15,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 15,
+          "item": "snowball"
+        }
+      },
+      "id": "container-025",
+      "op": "insert",
+      "source": {
+        "count": 15,
+        "item": "snowball"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 14,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-026",
+      "op": "insert",
+      "source": {
+        "count": 15,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 15,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 15,
+      "expected": {
+        "source": {
+          "count": 14,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-027",
+      "op": "insert",
+      "source": {
+        "count": 15,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 15,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 15,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-028",
+      "op": "insert",
+      "source": {
+        "count": 15,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 15,
+      "expected": {
+        "source": {
+          "count": 15,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-029",
+      "op": "insert",
+      "source": {
+        "count": 15,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 15,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 1,
+          "item": "snowball"
+        }
+      },
+      "id": "container-030",
+      "op": "insert",
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      },
+      "target": null
+    },
+    {
+      "amount": 16,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-031",
+      "op": "insert",
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 15,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-032",
+      "op": "insert",
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 15,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 16,
+      "expected": {
+        "source": {
+          "count": 15,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-033",
+      "op": "insert",
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 15,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 16,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-034",
+      "op": "insert",
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 16,
+      "expected": {
+        "source": {
+          "count": 16,
+          "item": "snowball"
+        },
+        "target": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "container-035",
+      "op": "insert",
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      },
+      "target": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-036",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-037",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-038",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-039",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-040",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-041",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-042",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-043",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-044",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-045",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-046",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-047",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-048",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-049",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-050",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-051",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-052",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        },
+        "target": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "container-053",
+      "op": "insert",
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      },
+      "target": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "cap": 16,
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-054",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "cap": 16,
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-055",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-056",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": null,
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-057",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 1,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-058",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 1,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-059",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 14,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-060",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 15,
+      "expected": {
+        "source": null,
+        "target": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        }
+      },
+      "id": "container-061",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 14,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-062",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 15,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 14,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-063",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-064",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 15,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-065",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "container-066",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 16,
+      "expected": {
+        "source": null,
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-067",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      },
+      "target": null
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-068",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 16,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-069",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 15,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 1,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-070",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 16,
+      "expected": {
+        "source": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "container-071",
+      "op": "insert",
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 10,
+      "expected": {
+        "source": {
+          "count": 10,
+          "item": "stone"
+        },
+        "target": {
+          "cap": 16,
+          "count": 4,
+          "item": "stone"
+        }
+      },
+      "id": "container-072",
+      "op": "insert",
+      "source": {
+        "count": 10,
+        "item": "stone"
+      },
+      "target": {
+        "cap": 16,
+        "count": 4,
+        "item": "stone"
+      }
+    },
+    {
+      "amount": 10,
+      "expected": {
+        "source": {
+          "count": 10,
+          "item": "stone"
+        },
+        "target": {
+          "count": 4,
+          "item": "dirt"
+        }
+      },
+      "id": "container-073",
+      "op": "insert",
+      "source": {
+        "count": 10,
+        "item": "stone"
+      },
+      "target": {
+        "count": 4,
+        "item": "dirt"
+      }
+    },
+    {
+      "clicked": 0,
+      "expected": {
+        "slots": {
+          "62": {
+            "count": 10,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-074",
+      "op": "quick_move",
+      "rows": 3,
+      "slots": {
+        "0": {
+          "count": 10,
+          "item": "stone"
+        }
+      }
+    },
+    {
+      "clicked": 0,
+      "expected": {
+        "slots": {
+          "27": {
+            "count": 64,
+            "item": "stone"
+          },
+          "61": {
+            "count": 2,
+            "item": "stone"
+          },
+          "62": {
+            "count": 64,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-075",
+      "op": "quick_move",
+      "rows": 3,
+      "slots": {
+        "0": {
+          "count": 10,
+          "item": "stone"
+        },
+        "27": {
+          "count": 60,
+          "item": "stone"
+        },
+        "62": {
+          "count": 60,
+          "item": "stone"
+        }
+      }
+    },
+    {
+      "clicked": 27,
+      "expected": {
+        "slots": {
+          "0": {
+            "count": 6,
+            "item": "stone"
+          },
+          "26": {
+            "count": 64,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-076",
+      "op": "quick_move",
+      "rows": 3,
+      "slots": {
+        "26": {
+          "count": 60,
+          "item": "stone"
+        },
+        "27": {
+          "count": 10,
+          "item": "stone"
+        }
+      }
+    },
+    {
+      "clicked": 0,
+      "expected": {
+        "slots": {
+          "0": {
+            "count": 10,
+            "item": "stone"
+          },
+          "27": {
+            "count": 64,
+            "item": "stone"
+          },
+          "28": {
+            "count": 64,
+            "item": "stone"
+          },
+          "29": {
+            "count": 64,
+            "item": "stone"
+          },
+          "30": {
+            "count": 64,
+            "item": "stone"
+          },
+          "31": {
+            "count": 64,
+            "item": "stone"
+          },
+          "32": {
+            "count": 64,
+            "item": "stone"
+          },
+          "33": {
+            "count": 64,
+            "item": "stone"
+          },
+          "34": {
+            "count": 64,
+            "item": "stone"
+          },
+          "35": {
+            "count": 64,
+            "item": "stone"
+          },
+          "36": {
+            "count": 64,
+            "item": "stone"
+          },
+          "37": {
+            "count": 64,
+            "item": "stone"
+          },
+          "38": {
+            "count": 64,
+            "item": "stone"
+          },
+          "39": {
+            "count": 64,
+            "item": "stone"
+          },
+          "40": {
+            "count": 64,
+            "item": "stone"
+          },
+          "41": {
+            "count": 64,
+            "item": "stone"
+          },
+          "42": {
+            "count": 64,
+            "item": "stone"
+          },
+          "43": {
+            "count": 64,
+            "item": "stone"
+          },
+          "44": {
+            "count": 64,
+            "item": "stone"
+          },
+          "45": {
+            "count": 64,
+            "item": "stone"
+          },
+          "46": {
+            "count": 64,
+            "item": "stone"
+          },
+          "47": {
+            "count": 64,
+            "item": "stone"
+          },
+          "48": {
+            "count": 64,
+            "item": "stone"
+          },
+          "49": {
+            "count": 64,
+            "item": "stone"
+          },
+          "50": {
+            "count": 64,
+            "item": "stone"
+          },
+          "51": {
+            "count": 64,
+            "item": "stone"
+          },
+          "52": {
+            "count": 64,
+            "item": "stone"
+          },
+          "53": {
+            "count": 64,
+            "item": "stone"
+          },
+          "54": {
+            "count": 64,
+            "item": "stone"
+          },
+          "55": {
+            "count": 64,
+            "item": "stone"
+          },
+          "56": {
+            "count": 64,
+            "item": "stone"
+          },
+          "57": {
+            "count": 64,
+            "item": "stone"
+          },
+          "58": {
+            "count": 64,
+            "item": "stone"
+          },
+          "59": {
+            "count": 64,
+            "item": "stone"
+          },
+          "60": {
+            "count": 64,
+            "item": "stone"
+          },
+          "61": {
+            "count": 64,
+            "item": "stone"
+          },
+          "62": {
+            "count": 64,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-077",
+      "op": "quick_move",
+      "rows": 3,
+      "slots": {
+        "0": {
+          "count": 10,
+          "item": "stone"
+        },
+        "27": {
+          "count": 64,
+          "item": "stone"
+        },
+        "28": {
+          "count": 64,
+          "item": "stone"
+        },
+        "29": {
+          "count": 64,
+          "item": "stone"
+        },
+        "30": {
+          "count": 64,
+          "item": "stone"
+        },
+        "31": {
+          "count": 64,
+          "item": "stone"
+        },
+        "32": {
+          "count": 64,
+          "item": "stone"
+        },
+        "33": {
+          "count": 64,
+          "item": "stone"
+        },
+        "34": {
+          "count": 64,
+          "item": "stone"
+        },
+        "35": {
+          "count": 64,
+          "item": "stone"
+        },
+        "36": {
+          "count": 64,
+          "item": "stone"
+        },
+        "37": {
+          "count": 64,
+          "item": "stone"
+        },
+        "38": {
+          "count": 64,
+          "item": "stone"
+        },
+        "39": {
+          "count": 64,
+          "item": "stone"
+        },
+        "40": {
+          "count": 64,
+          "item": "stone"
+        },
+        "41": {
+          "count": 64,
+          "item": "stone"
+        },
+        "42": {
+          "count": 64,
+          "item": "stone"
+        },
+        "43": {
+          "count": 64,
+          "item": "stone"
+        },
+        "44": {
+          "count": 64,
+          "item": "stone"
+        },
+        "45": {
+          "count": 64,
+          "item": "stone"
+        },
+        "46": {
+          "count": 64,
+          "item": "stone"
+        },
+        "47": {
+          "count": 64,
+          "item": "stone"
+        },
+        "48": {
+          "count": 64,
+          "item": "stone"
+        },
+        "49": {
+          "count": 64,
+          "item": "stone"
+        },
+        "50": {
+          "count": 64,
+          "item": "stone"
+        },
+        "51": {
+          "count": 64,
+          "item": "stone"
+        },
+        "52": {
+          "count": 64,
+          "item": "stone"
+        },
+        "53": {
+          "count": 64,
+          "item": "stone"
+        },
+        "54": {
+          "count": 64,
+          "item": "stone"
+        },
+        "55": {
+          "count": 64,
+          "item": "stone"
+        },
+        "56": {
+          "count": 64,
+          "item": "stone"
+        },
+        "57": {
+          "count": 64,
+          "item": "stone"
+        },
+        "58": {
+          "count": 64,
+          "item": "stone"
+        },
+        "59": {
+          "count": 64,
+          "item": "stone"
+        },
+        "60": {
+          "count": 64,
+          "item": "stone"
+        },
+        "61": {
+          "count": 64,
+          "item": "stone"
+        },
+        "62": {
+          "count": 64,
+          "item": "stone"
+        }
+      }
+    },
+    {
+      "clicked": 0,
+      "expected": {
+        "slots": {
+          "89": {
+            "count": 10,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-078",
+      "op": "quick_move",
+      "rows": 6,
+      "slots": {
+        "0": {
+          "count": 10,
+          "item": "stone"
+        }
+      }
+    },
+    {
+      "clicked": 0,
+      "expected": {
+        "slots": {
+          "54": {
+            "count": 64,
+            "item": "stone"
+          },
+          "88": {
+            "count": 2,
+            "item": "stone"
+          },
+          "89": {
+            "count": 64,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-079",
+      "op": "quick_move",
+      "rows": 6,
+      "slots": {
+        "0": {
+          "count": 10,
+          "item": "stone"
+        },
+        "54": {
+          "count": 60,
+          "item": "stone"
+        },
+        "89": {
+          "count": 60,
+          "item": "stone"
+        }
+      }
+    },
+    {
+      "clicked": 54,
+      "expected": {
+        "slots": {
+          "0": {
+            "count": 6,
+            "item": "stone"
+          },
+          "53": {
+            "count": 64,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-080",
+      "op": "quick_move",
+      "rows": 6,
+      "slots": {
+        "53": {
+          "count": 60,
+          "item": "stone"
+        },
+        "54": {
+          "count": 10,
+          "item": "stone"
+        }
+      }
+    },
+    {
+      "clicked": 0,
+      "expected": {
+        "slots": {
+          "0": {
+            "count": 10,
+            "item": "stone"
+          },
+          "54": {
+            "count": 64,
+            "item": "stone"
+          },
+          "55": {
+            "count": 64,
+            "item": "stone"
+          },
+          "56": {
+            "count": 64,
+            "item": "stone"
+          },
+          "57": {
+            "count": 64,
+            "item": "stone"
+          },
+          "58": {
+            "count": 64,
+            "item": "stone"
+          },
+          "59": {
+            "count": 64,
+            "item": "stone"
+          },
+          "60": {
+            "count": 64,
+            "item": "stone"
+          },
+          "61": {
+            "count": 64,
+            "item": "stone"
+          },
+          "62": {
+            "count": 64,
+            "item": "stone"
+          },
+          "63": {
+            "count": 64,
+            "item": "stone"
+          },
+          "64": {
+            "count": 64,
+            "item": "stone"
+          },
+          "65": {
+            "count": 64,
+            "item": "stone"
+          },
+          "66": {
+            "count": 64,
+            "item": "stone"
+          },
+          "67": {
+            "count": 64,
+            "item": "stone"
+          },
+          "68": {
+            "count": 64,
+            "item": "stone"
+          },
+          "69": {
+            "count": 64,
+            "item": "stone"
+          },
+          "70": {
+            "count": 64,
+            "item": "stone"
+          },
+          "71": {
+            "count": 64,
+            "item": "stone"
+          },
+          "72": {
+            "count": 64,
+            "item": "stone"
+          },
+          "73": {
+            "count": 64,
+            "item": "stone"
+          },
+          "74": {
+            "count": 64,
+            "item": "stone"
+          },
+          "75": {
+            "count": 64,
+            "item": "stone"
+          },
+          "76": {
+            "count": 64,
+            "item": "stone"
+          },
+          "77": {
+            "count": 64,
+            "item": "stone"
+          },
+          "78": {
+            "count": 64,
+            "item": "stone"
+          },
+          "79": {
+            "count": 64,
+            "item": "stone"
+          },
+          "80": {
+            "count": 64,
+            "item": "stone"
+          },
+          "81": {
+            "count": 64,
+            "item": "stone"
+          },
+          "82": {
+            "count": 64,
+            "item": "stone"
+          },
+          "83": {
+            "count": 64,
+            "item": "stone"
+          },
+          "84": {
+            "count": 64,
+            "item": "stone"
+          },
+          "85": {
+            "count": 64,
+            "item": "stone"
+          },
+          "86": {
+            "count": 64,
+            "item": "stone"
+          },
+          "87": {
+            "count": 64,
+            "item": "stone"
+          },
+          "88": {
+            "count": 64,
+            "item": "stone"
+          },
+          "89": {
+            "count": 64,
+            "item": "stone"
+          }
+        }
+      },
+      "id": "container-081",
+      "op": "quick_move",
+      "rows": 6,
+      "slots": {
+        "0": {
+          "count": 10,
+          "item": "stone"
+        },
+        "54": {
+          "count": 64,
+          "item": "stone"
+        },
+        "55": {
+          "count": 64,
+          "item": "stone"
+        },
+        "56": {
+          "count": 64,
+          "item": "stone"
+        },
+        "57": {
+          "count": 64,
+          "item": "stone"
+        },
+        "58": {
+          "count": 64,
+          "item": "stone"
+        },
+        "59": {
+          "count": 64,
+          "item": "stone"
+        },
+        "60": {
+          "count": 64,
+          "item": "stone"
+        },
+        "61": {
+          "count": 64,
+          "item": "stone"
+        },
+        "62": {
+          "count": 64,
+          "item": "stone"
+        },
+        "63": {
+          "count": 64,
+          "item": "stone"
+        },
+        "64": {
+          "count": 64,
+          "item": "stone"
+        },
+        "65": {
+          "count": 64,
+          "item": "stone"
+        },
+        "66": {
+          "count": 64,
+          "item": "stone"
+        },
+        "67": {
+          "count": 64,
+          "item": "stone"
+        },
+        "68": {
+          "count": 64,
+          "item": "stone"
+        },
+        "69": {
+          "count": 64,
+          "item": "stone"
+        },
+        "70": {
+          "count": 64,
+          "item": "stone"
+        },
+        "71": {
+          "count": 64,
+          "item": "stone"
+        },
+        "72": {
+          "count": 64,
+          "item": "stone"
+        },
+        "73": {
+          "count": 64,
+          "item": "stone"
+        },
+        "74": {
+          "count": 64,
+          "item": "stone"
+        },
+        "75": {
+          "count": 64,
+          "item": "stone"
+        },
+        "76": {
+          "count": 64,
+          "item": "stone"
+        },
+        "77": {
+          "count": 64,
+          "item": "stone"
+        },
+        "78": {
+          "count": 64,
+          "item": "stone"
+        },
+        "79": {
+          "count": 64,
+          "item": "stone"
+        },
+        "80": {
+          "count": 64,
+          "item": "stone"
+        },
+        "81": {
+          "count": 64,
+          "item": "stone"
+        },
+        "82": {
+          "count": 64,
+          "item": "stone"
+        },
+        "83": {
+          "count": 64,
+          "item": "stone"
+        },
+        "84": {
+          "count": 64,
+          "item": "stone"
+        },
+        "85": {
+          "count": 64,
+          "item": "stone"
+        },
+        "86": {
+          "count": 64,
+          "item": "stone"
+        },
+        "87": {
+          "count": 64,
+          "item": "stone"
+        },
+        "88": {
+          "count": 64,
+          "item": "stone"
+        },
+        "89": {
+          "count": 64,
+          "item": "stone"
+        }
+      }
+    }
+  ],
+  "minecraft": "1.21.1",
+  "oracle_sha256": "e094b8b3e3f237830e43f1482a8d37a78f2e81d90190902a0261070e8e04608c",
+  "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+}

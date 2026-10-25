@@ -12083,6 +12083,7 @@ fn item_to_state(item: i64) -> Option<u32> {
         188 => 519,
         290 => 2354,
         291 => 2355,
+        299 => 2955, // chest's 1.21.1 default state (single, north, dry)
         _ => return None,
     })
 }
@@ -13459,33 +13460,105 @@ fn map_take(map: &mut HashMap<i16, Stack>, k: i16, n: u8) -> Option<Stack> {
     }
     Some((st.0, take, st.2))
 }
-// insert st into map across keys lo..=hi: merge into matching stacks
-// first, then the first empty slot; returns the leftover
-fn map_add_range(map: &mut HashMap<i16, Stack>, lo: i16, hi: i16, st: Stack) -> Stack {
-    let mut rem = st;
-    for k in lo..=hi {
-        if rem.1 == 0 {
-            break;
-        }
-        if let Some(cur) = map.get_mut(&k) {
-            if cur.0 == rem.0 && cur.2 == rem.2 {
-                let room = (item_stack_max(cur.0, &cur.2) - cur.1 as i64).max(0) as u8;
-                let t = room.min(rem.1);
-                cur.1 += t;
-                rem.1 -= t;
-            }
+// Slot.safeInsert for an unrestricted slot: compatible components, bounded count.
+fn insert_into_slot(map: &mut HashMap<i16, Stack>, slot: i16, source: &mut Stack, amount: u8) {
+    let target = map.get(&slot).filter(|st| st.1 > 0);
+    if target.is_some_and(|st| st.0 != source.0 || st.2 != source.2) {
+        return;
+    }
+    let count = target.map_or(0, |st| st.1);
+    let room = (stack_max_of(source) - i64::from(count)).max(0) as u8;
+    let moved = amount.min(source.1).min(room);
+    if moved > 0 {
+        map.insert(slot, (source.0, count + moved, source.2.clone()));
+        source.1 -= moved;
+        if source.1 == 0 {
+            *source = (0, 0, Vec::new());
         }
     }
-    if rem.1 > 0 {
-        for k in lo..=hi {
-            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(k) {
-                e.insert(rem.clone());
-                rem.1 = 0;
+}
+fn merge_into_slots(
+    map: &mut HashMap<i16, Stack>,
+    order: impl Iterator<Item = i16>,
+    source: &mut Stack,
+) {
+    if stack_max_of(source) <= 1 {
+        return;
+    }
+    for slot in order {
+        if source.1 == 0 {
+            break;
+        }
+        if map.get(&slot).is_some_and(|st| st.1 > 0) {
+            insert_into_slot(map, slot, source, source.1);
+        }
+    }
+}
+// Horizon menu::move_to's two phases (MIT): merge first, then one empty slot.
+// The order is supplied by the menu; a chest sends items to inventory in reverse.
+fn move_to_slots(
+    map: &mut HashMap<i16, Stack>,
+    order: impl Iterator<Item = i16> + Clone,
+    mut source: Stack,
+) -> Stack {
+    merge_into_slots(map, order.clone(), &mut source);
+    if source.1 > 0 {
+        for slot in order {
+            if map.get(&slot).is_none_or(|st| st.1 == 0) {
+                let amount = source.1;
+                insert_into_slot(map, slot, &mut source, amount);
                 break;
             }
         }
     }
-    rem
+    source
+}
+// The single/double chest menu shares one transfer owner; storage remains per block.
+fn quick_move_chest(
+    all: &mut HashMap<BlockPos, HashMap<i16, Stack>>,
+    inv: &mut HashMap<i16, Stack>,
+    cp: BlockPos,
+    cp2: Option<BlockPos>,
+    slot: i16,
+) {
+    let rows = if cp2.is_some() { 54 } else { 27 };
+    if !(0..rows + 36).contains(&slot) {
+        return;
+    }
+    if slot < rows {
+        let (pos, key) = if slot < 27 {
+            (cp, slot)
+        } else {
+            (cp2.unwrap(), slot - 27)
+        };
+        if let Some(st) = map_take(all.entry(pos).or_default(), key, u8::MAX) {
+            let rem = move_to_slots(inv, (9..=44).rev(), st);
+            if rem.1 > 0 {
+                all.get_mut(&pos).unwrap().insert(key, rem);
+            }
+        }
+    } else if let Some(mut rem) = map_take(inv, slot - rows + 9, u8::MAX) {
+        // Merge across BOTH halves before considering any empty slot.
+        for pos in [cp].into_iter().chain(cp2) {
+            merge_into_slots(all.entry(pos).or_default(), 0..27, &mut rem);
+        }
+        'empty: for pos in [cp].into_iter().chain(cp2) {
+            if rem.1 == 0 {
+                break;
+            }
+            let map = all.entry(pos).or_default();
+            for key in 0..27 {
+                if map.get(&key).is_none_or(|st| st.1 == 0) {
+                    let amount = rem.1;
+                    insert_into_slot(map, key, &mut rem, amount);
+                    break 'empty;
+                }
+            }
+        }
+        if rem.1 > 0 {
+            inv.insert(slot - rows + 9, rem);
+        }
+    }
 }
 // drag-paint one slot: place `per` items of the cursor stack into the
 // resolved window slot (merging if compatible), then resync
@@ -13583,61 +13656,32 @@ fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
         let _ = send_packet(&mut w, 0x15, p);
     }
 }
+// Plain, unrestricted slots only; result/equipment slots retain their own policy.
+// Adapted from Horizon menu::pickup_inner (MIT; third_party/licenses/horizon.txt),
+// checked against 1.21.1 AbstractContainerMenu.doClick / Slot.safeInsert.
 fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) {
-    let sv = m.get(&slot).cloned();
-    let cv = cur.clone();
-    let empty: Stack = (0, 0, Vec::new());
-    // merge only when components match too (vanilla: stacks with different NBT never merge)
-    let mergeable = |a: &Stack, b: &Stack| a.0 == b.0 && a.2 == b.2;
-    if btn == 0 {
-        if cv.1 == 0 {
-            if let Some(s) = sv {
-                *cur = s;
-                m.remove(&slot);
-            }
-        } else {
-            match sv {
-                None => {
-                    m.insert(slot, cv);
-                    *cur = empty;
-                }
-                Some(svv) => {
-                    let room = stack_max_of(&svv) - svv.1 as i64;
-                    if mergeable(&svv, &cv) && room >= cv.1 as i64 {
-                        m.insert(slot, (svv.0, svv.1 + cv.1, svv.2));
-                        *cur = empty;
-                    } else {
-                        m.insert(slot, cv);
-                        *cur = svv;
-                    }
-                }
+    if !matches!(btn, 0 | 1) {
+        return;
+    }
+    if cur.1 == 0 {
+        if let Some(st) = m.get(&slot) {
+            let amount = if btn == 0 { st.1 } else { st.1.div_ceil(2) };
+            if let Some(taken) = map_take(m, slot, amount) {
+                *cur = taken;
             }
         }
-    } else if btn == 1 {
-        if cv.1 == 0 {
-            if let Some((si, sc, cps)) = sv {
-                let take = sc - sc / 2;
-                *cur = (si, take, cps.clone());
-                if sc - take == 0 {
-                    m.remove(&slot);
-                } else {
-                    m.insert(slot, (si, sc - take, cps));
-                }
-            }
-        } else {
-            match sv {
-                None => {
-                    m.insert(slot, (cv.0, 1, cv.2.clone()));
-                    *cur = (cv.0, cv.1 - 1, cv.2);
-                }
-                Some(svv) => {
-                    if mergeable(&svv, &cv) && svv.1 < stack_max_of(&svv) as u8 {
-                        m.insert(slot, (svv.0, svv.1 + 1, svv.2));
-                        *cur = (cv.0, cv.1 - 1, cv.2);
-                    }
-                }
-            }
-        }
+        return;
+    }
+    let target = m.get(&slot).filter(|st| st.1 > 0).cloned();
+    if target
+        .as_ref()
+        .is_none_or(|st| st.0 == cur.0 && st.2 == cur.2)
+    {
+        let amount = if btn == 0 { cur.1 } else { 1 };
+        insert_into_slot(m, slot, cur, amount);
+    } else if i64::from(cur.1) <= stack_max_of(cur) {
+        // Both mouse buttons swap unlike stacks, but never bypass the slot limit.
+        *cur = m.insert(slot, cur.clone()).unwrap();
     }
 }
 // vanilla item tags used by recipes
@@ -19496,60 +19540,7 @@ fn handle(mut s: TcpStream) {
                                         } else {
                                             (slot - rows + 9, &mut inv)
                                         };
-                                    let sv = gmap.get(&gslot).cloned();
-                                    let cv = cur.clone();
-                                    if btn == 0 {
-                                        if cv.1 == 0 {
-                                            if let Some(s) = sv {
-                                                *cur = s;
-                                                gmap.remove(&gslot);
-                                            }
-                                        } else {
-                                            match sv {
-                                                None => {
-                                                    gmap.insert(gslot, cv);
-                                                    *cur = (0, 0, Vec::new());
-                                                }
-                                                Some((si, sc, _cc)) => {
-                                                    if si == cv.0
-                                                        && _cc == cv.2
-                                                        && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc)
-                                                    {
-                                                        gmap.insert(gslot, (si, sc + cv.1, _cc));
-                                                        *cur = (0, 0, Vec::new());
-                                                    } else {
-                                                        gmap.insert(gslot, cv);
-                                                        *cur = (si, sc, _cc);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else if btn == 1 {
-                                        if cv.1 == 0 {
-                                            if let Some((si, sc, _cc)) = sv {
-                                                let take = sc - sc / 2;
-                                                *cur = (si, take, _cc.clone());
-                                                if sc - take == 0 {
-                                                    gmap.remove(&gslot);
-                                                } else {
-                                                    gmap.insert(gslot, (si, sc - take, _cc));
-                                                }
-                                            }
-                                        } else {
-                                            match sv {
-                                                None => {
-                                                    gmap.insert(gslot, (cv.0, 1, cv.2.clone()));
-                                                    *cur = (cv.0, cv.1 - 1, cv.2);
-                                                }
-                                                Some((si, sc, _cc)) => {
-                                                    if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 {
-                                                        gmap.insert(gslot, (si, sc + 1, _cc));
-                                                        *cur = (cv.0, cv.1 - 1, cv.2);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    click_slot(gmap, &mut cur, gslot, btn as i8);
                                     let (it, c2, _cc) =
                                         gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
                                     let mut p = vec![1u8];
@@ -20185,7 +20176,7 @@ fn handle(mut s: TcpStream) {
                                                         *p
                                                     };
                                                     furnace_xp_pop(f, px, py, pz);
-                                                    let rem = map_add_range(&mut inv, 9, 44, st);
+                                                    let rem = move_to_slots(&mut inv, 9..=44, st);
                                                     if rem.1 > 0 {
                                                         fs.get_mut(&fp).unwrap().output = rem;
                                                     }
@@ -20373,65 +20364,8 @@ fn handle(mut s: TcpStream) {
                                         if let Some(st) = got {
                                             throw!(st);
                                         }
-                                    } else if in_cont {
-                                        // shift chest -> inv
-                                        let (pos, gslot) = if slot < 27 {
-                                            (cp, slot)
-                                        } else {
-                                            (cp2.unwrap(), slot - 27)
-                                        };
-                                        if let Some(st) =
-                                            map_take(all.entry(pos).or_default(), gslot, 255)
-                                        {
-                                            let rem = map_add_range(&mut inv, 9, 44, st);
-                                            if rem.1 > 0 {
-                                                all.get_mut(&pos).unwrap().insert(gslot, rem);
-                                            }
-                                        }
                                     } else {
-                                        // shift inv -> chest(s): merge into matching stacks
-                                        // across both chests, then first empty slot
-                                        if let Some(st) = map_take(&mut inv, slot - rows + 9, 255) {
-                                            let mut rem = st;
-                                            for pos in [cp].into_iter().chain(cp2) {
-                                                if rem.1 == 0 {
-                                                    break;
-                                                }
-                                                let m = all.entry(pos).or_default();
-                                                for i in 0..27i16 {
-                                                    if rem.1 == 0 {
-                                                        break;
-                                                    }
-                                                    if let Some(c2) = m.get_mut(&i) {
-                                                        if c2.0 == rem.0 && c2.2 == rem.2 {
-                                                            let room = (item_stack_max(c2.0, &c2.2)
-                                                                - c2.1 as i64)
-                                                                .max(0)
-                                                                as u8;
-                                                            let t = room.min(rem.1);
-                                                            c2.1 += t;
-                                                            rem.1 -= t;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            for pos in [cp].into_iter().chain(cp2) {
-                                                if rem.1 == 0 {
-                                                    break;
-                                                }
-                                                let m = all.entry(pos).or_default();
-                                                for i in 0..27i16 {
-                                                    if let std::collections::hash_map::Entry::Vacant(e) = m.entry(i) {
-                                                        e.insert(rem.clone());
-                                                        rem.1 = 0;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            if rem.1 > 0 {
-                                                inv.insert(slot - rows + 9, rem);
-                                            }
-                                        }
+                                        quick_move_chest(&mut all, &mut inv, cp, cp2, slot);
                                     }
                                     // resync touched slot + inventory/chest echo kept cheap
                                     let cur_st = if in_cont {
@@ -20527,7 +20461,7 @@ fn handle(mut s: TcpStream) {
                                                 *p
                                             };
                                             furnace_xp_pop(f, px, py, pz);
-                                            let rem = map_add_range(&mut inv, 9, 44, st);
+                                            let rem = move_to_slots(&mut inv, 9..=44, st);
                                             if rem.1 > 0 {
                                                 fs.get_mut(&fp).unwrap().output = rem;
                                             }
@@ -20549,7 +20483,7 @@ fn handle(mut s: TcpStream) {
                                         if m.1 > 0 {
                                             let st = std::mem::take(m);
                                             f.dirty = true;
-                                            let rem = map_add_range(&mut inv, 9, 44, st);
+                                            let rem = move_to_slots(&mut inv, 9..=44, st);
                                             if rem.1 > 0 {
                                                 let f2 = fs.get_mut(&fp).unwrap();
                                                 if slot == 0 {
@@ -20670,7 +20604,7 @@ fn handle(mut s: TcpStream) {
                                             );
                                         } else {
                                             inv.remove(&slot);
-                                            let rem = map_add_range(&mut inv, 36, 44, st);
+                                            let rem = move_to_slots(&mut inv, 36..=44, st);
                                             if rem.1 > 0 {
                                                 inv.insert(slot, rem);
                                             }
@@ -20679,7 +20613,7 @@ fn handle(mut s: TcpStream) {
                                 } else if (36..=44).contains(&slot) {
                                     if let Some(st) = inv.get(&slot).cloned() {
                                         inv.remove(&slot);
-                                        let rem = map_add_range(&mut inv, 9, 35, st);
+                                        let rem = move_to_slots(&mut inv, 9..=35, st);
                                         if rem.1 > 0 {
                                             inv.insert(slot, rem);
                                         }
@@ -20688,7 +20622,7 @@ fn handle(mut s: TcpStream) {
                                     // unequip into inventory
                                     if let Some(st) = inv.get(&slot).cloned() {
                                         inv.remove(&slot);
-                                        let rem = map_add_range(&mut inv, 9, 44, st);
+                                        let rem = move_to_slots(&mut inv, 9..=44, st);
                                         if rem.1 > 0 {
                                             inv.insert(slot, rem);
                                         }
@@ -20696,7 +20630,7 @@ fn handle(mut s: TcpStream) {
                                 } else if (1..=4).contains(&slot) {
                                     if let Some(st) = grid.get(&slot).cloned() {
                                         grid.remove(&slot);
-                                        let rem = map_add_range(&mut inv, 9, 44, st);
+                                        let rem = move_to_slots(&mut inv, 9..=44, st);
                                         if rem.1 > 0 {
                                             grid.insert(slot, rem);
                                         }
@@ -21902,6 +21836,8 @@ fn world_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 #[cfg(test)]
 mod command_tests;
+#[cfg(test)]
+mod container_tests;
 #[cfg(test)]
 mod craft_tests;
 #[cfg(test)]

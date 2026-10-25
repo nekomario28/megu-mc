@@ -1,0 +1,5 @@
+Independent review: codex review --uncommitted
+
+No actionable regressions were identified in the staged, unstaged, or untracked changes. Static checks and fixture provenance checks passed; builds and runtime tests were not run in the read-only environment.
+
+The author separately ran the Rust/Java/Python and localhost-wire checks listed in run.json. The reviewer result is not substituted for those executions.

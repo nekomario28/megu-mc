@@ -1,0 +1,21 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 28.82s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+
+thread 'container_tests::container_pickup_fills_space_instead_of_swapping_a_partial_stack' (2815382) panicked at src/container_tests.rs:10:5:
+assertion `left == right` failed
+  left: (1, 10, [])
+ right: (1, 64, [])
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test container_tests::container_pickup_fills_space_instead_of_swapping_a_partial_stack ... FAILED
+
+failures:
+
+failures:
+    container_tests::container_pickup_fills_space_instead_of_swapping_a_partial_stack
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `--bin mc-spine`

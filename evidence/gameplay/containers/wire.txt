@@ -1,0 +1,2 @@
+{"carried_remainder": 6, "partial_merge": true, "protocol": 767, "right_swap": true, "shift_destination": 62}
+containers wire: PASS
