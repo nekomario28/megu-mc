@@ -13,6 +13,7 @@ use crate::generation_context::FC;
 use crate::generation_math::*;
 use crate::generation_providers::*;
 use crate::json::{jarr, jbool, jf32, jint, jnum, jparse, js, jstr, J};
+use crate::trace_env::{env_flag, env_str};
 use crate::worldgen::*;
 use std::collections::{HashMap, HashSet};
 
@@ -184,7 +185,7 @@ fn p_pf(j: &J) -> Option<Pf> {
                 None => {
                     // A dropped modifier silently changes every later draw, so
                     // make it visible instead of guessing.
-                    if std::env::var("PF_UNKNOWN").is_ok() {
+                    if env_flag!("PF_UNKNOWN") {
                         eprintln!(
                             "PFUNKNOWN {} modifier={}",
                             jstr(j, "feature").unwrap_or_default(),
@@ -651,7 +652,7 @@ fn gen_cf_ref(fref: &FRef, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: 
                     // A configured feature that failed to parse is skipped
                     // silently, which looks exactly like "the feature chose not
                     // to place anything".
-                    if std::env::var("CF_MISSING").is_ok() {
+                    if env_flag!("CF_MISSING") {
                         eprintln!("CFMISSING {n}");
                     }
                 }
@@ -661,7 +662,7 @@ fn gen_cf_ref(fref: &FRef, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: 
             // the child runs its own modifier chain on the same RNG stream
             Some(pf) => gen_pf(pf, fr, ctx, rng, pos),
             None => {
-                if std::env::var("CF_MISSING").is_ok() {
+                if env_flag!("CF_MISSING") {
                     eprintln!("CFMISSING placed {n}");
                 }
             }
@@ -729,7 +730,7 @@ fn mod_positions(
         }
         PM::InSquare => {
             let (x, z) = (pos.0 + rng.next_bound(16), pos.2 + rng.next_bound(16));
-            if let Ok(spec) = std::env::var("INSQ_TRACE") {
+            if let Some(spec) = env_str!("INSQ_TRACE") {
                 if let Some((a, c)) = spec.split_once(',') {
                     if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
                         if (x >> 4) == cx && (z >> 4) == cz {
@@ -769,7 +770,7 @@ fn mod_positions(
                     .get(&b)
                     .map(|s| s.contains(&pf.name))
                     .unwrap_or(false);
-                if let Ok(spec) = std::env::var("BIOMEF_TRACE") {
+                if let Some(spec) = env_str!("BIOMEF_TRACE") {
                     if let Some((a, c)) = spec.split_once(',') {
                         if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
                             if (pos.0 >> 4) == cx && (pos.2 >> 4) == cz {
@@ -1042,7 +1043,7 @@ fn gen_ore(
     targets: &[(RT, u32)],
     scattered: bool,
 ) {
-    if let Ok(spec) = std::env::var("ORE_TRACE") {
+    if let Some(spec) = env_str!("ORE_TRACE") {
         if let Some((a, b)) = spec.split_once(',') {
             if a.parse::<i32>() == Ok(pos.0 >> 4) && b.parse::<i32>() == Ok(pos.2 >> 4) {
                 let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
@@ -1105,7 +1106,7 @@ fn gen_ore(
                     ctx, rng, d, e, h, j, l, mm, min_x, min_y, min_z, width, height, size, discard,
                     targets,
                 );
-                if let Ok(spec) = std::env::var("ORE_CELL_TRACE") {
+                if let Some(spec) = env_str!("ORE_CELL_TRACE") {
                     if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
                         eprintln!(
                             "ORECELL origin={pos:?} size={size} wrote={} radius={:?}",
@@ -1143,7 +1144,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
     match cf {
         Cf::Unknown(_) => {}
         Cf::Tree(t) => {
-            if let Ok(spec) = std::env::var("TREE_TRACE") {
+            if let Some(spec) = env_str!("TREE_TRACE") {
                 // same one-chunk radius as the agent's -Dtreechunk
                 if let Some((a, b)) = spec.split_once(',') {
                     if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), b.parse::<i32>()) {
@@ -1190,7 +1191,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     let (x, z) = (pos.0 + cx, pos.2 + cz);
                     let mut y = top;
                     while y > bottom {
-                        if std::env::var("DISK_TRACE").is_ok() && cx == 0 && cz == 0 {
+                        if env_flag!("DISK_TRACE") && cx == 0 && cz == 0 {
                             let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
                             eprintln!(
                                 "DISK {x} {y} {z} block={} target={} feature={},{}",
@@ -1242,7 +1243,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             // already right and only this check was missing.
             if let Some(reg) = breg() {
                 let ok = can_place(reg, ctx, reg.name_of(st), pos.0, pos.1, pos.2);
-                if std::env::var("SIMPLE_TRACE").is_ok() {
+                if env_flag!("SIMPLE_TRACE") {
                     static N: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100_000 {
                         eprintln!(
@@ -1297,7 +1298,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     air += 1;
                 }
             }
-            if std::env::var("SPRING_TRACE").is_ok() {
+            if env_flag!("SPRING_TRACE") {
                 static SHOWN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
                 if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     eprintln!(
@@ -1348,7 +1349,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let Some(reg) = breg() else { return };
             let base_y = ctx.hm_oc(pos.0, pos.2);
             let mut p = (pos.0, base_y, pos.2);
-            let trace = std::env::var("KELP_TRACE").is_ok();
+            let trace = env_flag!("KELP_TRACE");
             if !is_water_st(reg, ctx.get(p.0, p.1, p.2)) {
                 if trace {
                     eprintln!("KELP x={} z={} y0={base_y} no-water-at-base", pos.0, pos.2);
@@ -2527,7 +2528,7 @@ fn p_carver(j: &J) -> Option<CarverDef> {
 /// `WorldgenRandom.setLargeFeatureSeed`: two raw longs and a XOR, no `|1` — the
 /// population seed used by the feature layer is a different function.
 fn set_large_feature_seed(r: &mut Lcg, seed: u64, cx: i32, cz: i32) {
-    if let Ok(spec) = std::env::var("CARVE_RAW") {
+    if let Some(spec) = env_str!("CARVE_RAW") {
         if let Some((a, b)) = spec.split_once(',') {
             if a.parse::<i32>() == Ok(cx) && b.parse::<i32>() == Ok(cz) {
                 crate::generation_math::RAW_ARM.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2644,7 +2645,7 @@ impl CarveRun {
 /// * `CARVE_ONLY=<carver id>` — run a single carver (cave / canyon / …).
 /// * `CARVE_DUMP_WRITES=<tx,tz>` — print the real (terrain-filtered) writes.
 pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
-    if std::env::var("MC_SPINE_NOCARVE").is_ok() {
+    if env_flag!("MC_SPINE_NOCARVE") {
         return;
     }
     let reg = creg();
@@ -2652,12 +2653,12 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
         return;
     }
     let Some(cc) = g.cols(tx, tz) else { return };
-    let trace = std::env::var("CARVE_TRACE").is_ok();
+    let trace = env_flag!("CARVE_TRACE");
     let here = format!("{tx},{tz}");
-    let probe_env = std::env::var("CARVE_PROBE").ok();
-    let probe_here = probe_env.as_deref() == Some("all") || probe_env.as_deref() == Some(&here);
-    let dump_here = std::env::var("CARVE_DUMP_WRITES").ok().as_deref() == Some(&here);
-    let only = std::env::var("CARVE_ONLY").ok();
+    let probe_env = env_str!("CARVE_PROBE");
+    let probe_here = probe_env == Some("all") || probe_env == Some(&here);
+    let dump_here = env_str!("CARVE_DUMP_WRITES") == Some(here.as_str());
+    let only = env_str!("CARVE_ONLY");
     let (min_y, height, wseed) = (g.min_y, g.height, g.wseed());
     let mut run = CarveRun {
         tx,
@@ -2684,7 +2685,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                 continue;
             };
             for (k, name) in list.iter().enumerate() {
-                if only.as_deref().is_some_and(|only| only != name) {
+                if only.is_some_and(|only| only != name) {
                     continue;
                 }
                 let Some(c) = reg.cfg.get(name) else { continue };
@@ -2694,13 +2695,13 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                     continue;
                 }
                 starts += 1;
-                if let Ok(spec) = std::env::var("CARVE_RNG") {
+                if let Some(spec) = env_str!("CARVE_RNG") {
                     if spec == format!("{ox},{oz}") || spec == "all" {
                         crate::generation_math::RNG_TRACE
                             .store(400, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                if std::env::var("CARVE_TRACE").is_ok() {
+                if env_flag!("CARVE_TRACE") {
                     eprintln!("START target={tx},{tz} origin={ox},{oz} k={k} {name} ({biome})");
                 }
                 run.mark = None;
@@ -2708,7 +2709,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                     CKind::Cave => run.cave(g, &cc, c, &mut r, ox, oz),
                     CKind::Canyon => run.canyon(g, &cc, c, &mut r, ox, oz),
                 }
-                if let Ok(spec) = std::env::var("CARVE_SRC") {
+                if let Some(spec) = env_str!("CARVE_SRC") {
                     if spec == "all" || spec == format!("{tx},{tz}") {
                         if let Some((x, y, z)) = run.mark {
                             eprintln!("SRC ox={ox} oz={oz} k={k} first={x},{y},{z}");
@@ -2761,7 +2762,7 @@ impl CarveRun {
         let inner = r.next_bound(15);
         let mid = r.next_bound(inner + 1);
         let tunnels = r.next_bound(mid + 1);
-        if std::env::var("CV_TRACE").is_ok() {
+        if env_flag!("CV_TRACE") {
             eprintln!("CVSTART ox={ox} oz={oz} inner={inner} mid={mid} tunnels={tunnels}");
         }
         for _ in 0..tunnels {
@@ -2781,7 +2782,7 @@ impl CarveRun {
                 self.ellipsoid(g, cc, c, x + 1.0, y, z, hr, hr * room_scale);
                 branches += r.next_bound(4);
             }
-            if std::env::var("CV_TRACE").is_ok() {
+            if env_flag!("CV_TRACE") {
                 eprintln!("CVTUN ox={ox} oz={oz} x={x} y={y} z={z} hrm={hrm} vrm={vrm} floor={} branches={branches}", self.floor);
             }
             for _ in 0..branches {
@@ -2791,7 +2792,7 @@ impl CarveRun {
                 // a tunnel is up to CARVE_STEPS long, minus up to a quarter
                 let count = CARVE_STEPS - r.next_bound(CARVE_STEPS / 4);
                 let seed = r.next_i64() as u64;
-                if let Ok(spec) = std::env::var("CV_TUN") {
+                if let Some(spec) = env_str!("CV_TUN") {
                     if spec == "all" || spec == format!("{ox},{oz}") {
                         eprintln!(
                             "TUN ox={ox} oz={oz} seed={seed} x={} y={} z={} yaw={yaw} pitch={pitch} count={count}",
@@ -3146,8 +3147,7 @@ impl CarveRun {
         // (`x & 15`), so a tunnel from a source chunk up to 8 chunks away paints
         // its cells into the target chunk at folded coordinates. Keep that as
         // the default; MC_SPINE_NOFOLD=1 clips instead, for experiments.
-        if std::env::var("MC_SPINE_NOFOLD").is_ok() && ((x >> 4) != self.tx || (z >> 4) != self.tz)
-        {
+        if env_flag!("MC_SPINE_NOFOLD") && ((x >> 4) != self.tx || (z >> 4) != self.tz) {
             return false;
         }
         if self.mark.is_none() {
@@ -3198,7 +3198,7 @@ fn pop_seed(seed: u64, bx: i32, bz: i32) -> u64 {
         .wrapping_mul(l)
         .wrapping_add((bz as i64).wrapping_mul(m))
         ^ seed as i64) as u64;
-    if std::env::var("POP_DBG").is_ok() {
+    if env_flag!("POP_DBG") {
         eprintln!("POPDBG seed={seed} bx={bx} bz={bz} l={l} m={m} -> {n}");
     }
     n
@@ -3249,7 +3249,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     apply_carvers(g, sx, sz);
     // Diagnostic: MC_SPINE_NOFEAT=1 skips the whole feature layer so a block diff can
     // attribute the remainder to terrain or to features.
-    if std::env::var("MC_SPINE_NOFEAT").is_ok() {
+    if env_flag!("MC_SPINE_NOFEAT") {
         return;
     }
     let fr = freg();
@@ -3275,7 +3275,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             }
         }
     }
-    if let Ok(spec) = std::env::var("FEAT_LIST") {
+    if let Some(spec) = env_str!("FEAT_LIST") {
         if let Ok(st) = spec.parse::<usize>() {
             if let Some(l) = fr.order.get(st) {
                 for (gi, name) in l.iter() {
@@ -3287,8 +3287,8 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     }
     let pop = pop_seed(g.wseed(), sx * 16, sz * 16);
     let mut ctx = FC::new(g);
-    let trace = std::env::var("FEAT_TRACE").is_ok();
-    let profile = std::env::var("FEAT_PROFILE").is_ok();
+    let trace = env_flag!("FEAT_TRACE");
+    let profile = env_flag!("FEAT_PROFILE");
     for step in 0..fr.steps {
         for (gi, name) in &fr.order[step] {
             let present = biomes.iter().any(|b| {
@@ -3317,7 +3317,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             );
             // feature placement sees a `WorldgenRandom` (legacy draw semantics)
             let mut rng = Xor::seed_worldgen(deco);
-            if let Ok(spec) = std::env::var("FSEED_ARM") {
+            if let Some(spec) = env_str!("FSEED_ARM") {
                 if spec == format!("{sx},{sz},{gi},{step}") {
                     crate::generation_math::XTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
                     crate::generation_math::NTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -3325,7 +3325,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
                     crate::generation_math::DTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            if let Ok(spec) = std::env::var("FSEED_TRACE") {
+            if let Some(spec) = env_str!("FSEED_TRACE") {
                 if let Some((a, b)) = spec.split_once(',') {
                     if a.parse::<i32>() == Ok(sx) && b.parse::<i32>() == Ok(sz) {
                         eprintln!("FSEED {pop} {gi} {step}");
