@@ -1,0 +1,13 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 6 tests
+test container_tests::container_chest_item_reaches_the_placed_default_state ... ok
+test container_tests::container_pickup_respects_component_limits_on_empty_slots_and_swaps ... ok
+test container_tests::container_pickup_fills_space_instead_of_swapping_a_partial_stack ... ok
+test container_tests::container_right_pickup_swaps_unlike_stacks_and_rounds_up_a_half ... ok
+test container_tests::container_transfers_match_real_1_21_1_classes ... ok
+test container_tests::pickup_inventory_matches_real_1_21_1_classes ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.06s
+

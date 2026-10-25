@@ -10,6 +10,12 @@ fn stack(value: &J) -> Stack {
     if let Some(cap) = value.get("cap") {
         comp_set_varint(&mut comps, 1, cap.num() as i64);
     }
+    if let Some(damage) = value.get("damage") {
+        comp_set_varint(&mut comps, COMP_DAMAGE, damage.num() as i64);
+    }
+    if crate::json::jbool(value, "unbreakable", false) {
+        comp_set(&mut comps, COMP_UNBREAKABLE, vec![1]);
+    }
     (item, value.get("count").unwrap().num() as u8, comps)
 }
 fn slot_map(value: &J) -> HashMap<i16, Stack> {
@@ -110,6 +116,91 @@ fn container_transfers_match_real_1_21_1_classes() {
     assert!(
         inserted > 0 && moved > 0,
         "empty/missing reference coverage"
+    );
+}
+
+fn inventory_menu_slot(native: i16) -> i16 {
+    match native {
+        0..=8 => native + 36,
+        9..=35 => native,
+        36..=39 => 44 - native,
+        40 => 45,
+        other => panic!("not a 1.21.1 inventory slot: {other}"),
+    }
+}
+fn inventory_slots(value: &J) -> HashMap<i16, Stack> {
+    slot_map(value)
+        .into_iter()
+        .filter(|(_, st)| st.1 > 0)
+        .map(|(slot, st)| (inventory_menu_slot(slot), st))
+        .collect()
+}
+#[test]
+fn pickup_inventory_matches_real_1_21_1_classes() {
+    let fixture = jparse(include_bytes!(
+        "../evidence/gameplay/inventory-pickup/vanilla.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.get("minecraft").unwrap().str(), "1.21.1");
+    assert_eq!(
+        fixture.get("server_sha1").unwrap().str(),
+        "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+    );
+    let mut ids = HashSet::new();
+    let (mut completed, mut partial, mut refused) = (0, 0, 0);
+    for row in fixture.get("cases").unwrap().as_arr().unwrap() {
+        let id = row.get("id").unwrap().str();
+        assert!(ids.insert(id), "duplicate case {id}");
+        assert_eq!(row.get("op").unwrap().str(), "inventory_add");
+        let mut source = stack(row.get("source").unwrap());
+        let original = source.1;
+        let mut inv = inventory_slots(row.get("slots").unwrap());
+        let selected = row.get("selected").unwrap().num() as i16;
+        let expected = row.get("expected").unwrap();
+        let space = expected.get("first_space").unwrap().num() as i16;
+        assert_eq!(
+            pickup_slot_with_space(&inv, selected, &source),
+            (space >= 0).then(|| inventory_menu_slot(space)),
+            "{id} first merge"
+        );
+        let empty = expected.get("first_empty").unwrap().num() as i16;
+        assert_eq!(
+            pickup_inventory_order().find(|key| !inv.contains_key(key)),
+            (empty >= 0).then(|| inventory_menu_slot(empty)),
+            "{id} first empty"
+        );
+        let accepted = pickup_into_inventory(
+            &mut inv,
+            selected,
+            crate::json::jbool(row, "creative", false),
+            &mut source,
+        );
+        assert_eq!(
+            accepted,
+            crate::json::jbool(expected, "accepted", false),
+            "{id} return"
+        );
+        assert_eq!(
+            source,
+            stack(expected.get("source").unwrap()),
+            "{id} remainder"
+        );
+        assert_eq!(
+            inv,
+            inventory_slots(expected.get("slots").unwrap()),
+            "{id} slots"
+        );
+        if original > 0 && source.1 == 0 {
+            completed += 1;
+        } else if source.1 < original {
+            partial += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    assert!(
+        completed > 0 && partial > 0 && refused > 0,
+        "missing reference outcomes"
     );
 }
 

@@ -1,0 +1,7 @@
+
+ok    pickup drains beyond the first partially filled slot
+ok    the pickup tick forwards the selected hotbar slot
+ok    partial insertion is not a successful ItemEntity take callback
+ok    a full nearby player does not monopolize the drop
+ok    the pickup tick forwards infinite materials to inventory insertion
+mutation check: 5 proved, 0 not a gate, 0 parked, 0 skipped

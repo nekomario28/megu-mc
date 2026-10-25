@@ -26,7 +26,9 @@ Horizon の crate や26.3データを runtime dependency にはしていない�
 Java 側でクリックアルゴリズムを再実装した oracle ではない。`safeInsert` は pickup 分岐全体のoracleではないため、分割・交換には回帰テストと bytecode 確認、本番 wire 検査を組み合わせている。
 
 jar は **抽出・Java起動より前**に検証する。biome exporter と認証済みclasspathの所有者を `tools/vanilla_java.py` に一本化した。
-署名は削除せず、プローブは独立packageで実行する。サーバーの起動・download・UnsafeによるPlayer偽装は不要。
+署名は削除せず、プローブは独立packageで実行する。この2操作の参照ではサーバー起動・download・Playerの生成は不要。
+同じJavaファイルにある `Inventory` 操作だけは、別fixtureでconstructorを迂回した実ServerPlayerを使う。
+その前提と限界は[回収の証拠](../inventory-pickup/README.md)で区別する。
 
 ## 再現
 
@@ -48,7 +50,9 @@ python3 tests/container_wire.py target/release/mc-spine
 
 ## 受け入れ境界
 
-検証の実行結果とファイルhashは `run.json`、対応する生ログはこのディレクトリに保存する。
+最初のslice時点の実行結果とファイルhashは `run.json`、対応する生ログはこのディレクトリに保存する。
+Inventory oracle追加後の再実行は[回収の記録](../inventory-pickup/README.md)を参照。
+チェストの入力・期待結果は変えず、共有Javaソースのprovenanceだけを更新した。
 このsliceの結果は、1.21.1 datapack移行ブランチ全体の受け入れではない。
 
 未検証・未移植: 複数閲覧者への同期、window/state-id整合、閉塞判定・開閉音、正しい向き／left-right／異種チェストの接続判定、shulkerの中身制約、任意component patchの意味的同値、特殊結果スロット、全エンティティ挙動。

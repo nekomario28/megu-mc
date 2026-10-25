@@ -16,7 +16,7 @@ CONTROL = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored"
 
 def run_case(cargo_output, cargo_status, *, missing_anchor=False, leftover=False, wire_error=False,
              stale_artifact=False, empty_artifact=False, baseline_error=False, restored_error=False,
-             wrong_failure=False):
+             wrong_failure=False, mutation_filter=None):
     with tempfile.TemporaryDirectory(prefix="spine-gate-") as tmp:
         root = Path(tmp)
         for folder in ["tools", "src", "bin", "tests"]:
@@ -87,6 +87,9 @@ sys.exit({cargo_status} if mutated else 0)
 ''')
         cargo.chmod(0o755)
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
+        env.pop("MUTATION_FILTER", None)
+        if mutation_filter is not None:
+            env["MUTATION_FILTER"] = mutation_filter
         result = subprocess.run(["bash", "tools/mutation_check.sh", "--offline"], cwd=root,
                                 env=env, capture_output=True, text=True, timeout=90)
         after = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in (root / "src").glob("*.rs")}
@@ -112,6 +115,8 @@ def main():
         ("unrelated failure is not proof", failed, 101, {"wrong_failure": True}, False, "neither compiled"),
         ("red baseline", failed, 101, {"baseline_error": True}, False, "baseline control"),
         ("red restored control", failed, 101, {"restored_error": True}, False, "restored control"),
+        ("selected mutations", failed, 101, {"mutation_filter": "pickup_"}, True, "proved"),
+        ("empty mutation selection", failed, 101, {"mutation_filter": "not-a-real-contract"}, False, "0 proved"),
     ]
     for name, output, status, kwargs, success, marker in cases:
         rc, log = run_case(output, status, **kwargs)

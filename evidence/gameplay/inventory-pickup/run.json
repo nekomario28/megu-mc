@@ -1,0 +1,130 @@
+{
+  "base_commit": "7e315b033bc194a3bb027a514b1be01dc133ed46",
+  "baseline_suite": {
+    "failed": 25,
+    "ignored": 1,
+    "passed": 176,
+    "state": "FAILED"
+  },
+  "binary": {
+    "mtime_ns": 1792914690930787898,
+    "path": "target/release/mc-spine",
+    "sha256": "d9160596d668bdb36d23074d1f7031a16661c72e8521bc647675cd46bb3914a9"
+  },
+  "container_fixture_changed_fields": [
+    "oracle_sha256"
+  ],
+  "disposition": "CONVERGE: preserve a bounded partial slice before entity lifecycle and actor representation work",
+  "failure_names": [
+    "feature::generation_contract_tests::carver_configs_parse_the_1_21_1_field_shapes",
+    "feature::generation_contract_tests::context_overrides_heights_bounds_and_biomes_keep_existing_results",
+    "feature::generation_contract_tests::dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above",
+    "feature::generation_contract_tests::dripstone_cluster_pools_lower_the_stalagmite_into_the_water",
+    "feature::generation_contract_tests::heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface",
+    "feature::generation_contract_tests::large_dripstone_hangs_and_stands_a_tapered_spike",
+    "feature::generation_contract_tests::large_dripstone_sways_when_both_spikes_clear_the_wind_gate",
+    "feature::generation_contract_tests::provider_values_and_following_rng_match_pre_extraction",
+    "feature::generation_contract_tests::root_system_does_nothing_when_its_origin_is_not_air",
+    "worldgen::wg_tests::aquifer_vectors",
+    "worldgen::wg_tests::biome_vectors",
+    "worldgen::wg_tests::bundled_carver_configs_are_the_1_21_1_shapes",
+    "worldgen::wg_tests::feat_determinism",
+    "worldgen::wg_tests::feat_populate_perf",
+    "worldgen::wg_tests::feature_population_output_matches_the_pre_refactor_capture",
+    "worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides",
+    "worldgen::wg_tests::lazy_population_preserves_direct_feature_outputs",
+    "worldgen::wg_tests::material_rules_load",
+    "worldgen::wg_tests::material_rules_real_ids",
+    "worldgen::wg_tests::not_underwater_is_grass_only_above_the_water_surface",
+    "worldgen::wg_tests::perf_probe",
+    "worldgen::wg_tests::surface_density_follows_vanillas_interpolated_order",
+    "worldgen::wg_tests::the_ore_vein_geometry_matches_vanillas_own_output",
+    "worldgen::wg_tests::the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart",
+    "worldgen::wg_tests::vertical_gradient_seed_reads_the_name_hash_big_endian"
+  ],
+  "failure_names_unchanged": true,
+  "final_suite": {
+    "failed": 25,
+    "ignored": 1,
+    "passed": 180,
+    "state": "FAILED"
+  },
+  "fixture_sha256": {
+    "evidence/gameplay/containers/vanilla.json": "e265367889f3baeca5ee779e5736fc529fb50f1fe6c85188ae7649ec3db29360",
+    "evidence/gameplay/inventory-pickup/vanilla.json": "c59670e26833407c90a4b8332283aeb17749b962d914ba2514d249db4e6ab2e2"
+  },
+  "focused": {
+    "failed": 0,
+    "ignored": 0,
+    "passed": 6,
+    "state": "ok"
+  },
+  "full_suite_accepted": false,
+  "gates": {
+    "clippy_all_targets": true,
+    "container_wire": true,
+    "diff_check": true,
+    "existing_gameplay_wire": true,
+    "fmt": true,
+    "new_pickup_vanilla_wire_comparison": false
+  },
+  "limitations": [
+    "constructor-bypassed real ServerPlayer for native abilities read only",
+    "ItemEntity.playerTouch not executed",
+    "actor inventory not ported",
+    "pickup delay, ownership, bounding box, scheduler and statistics unverified",
+    "arbitrary component semantic equivalence and item prototypes not established",
+    "full verify and whole mutation campaign not run",
+    "no hosted CI, canonical merge or push"
+  ],
+  "minecraft": "1.21.1",
+  "mutation_selection": {
+    "baseline_and_restored_controls": true,
+    "filter": "pickup_",
+    "not_a_gate": 0,
+    "parked": 0,
+    "proved": 5,
+    "skipped": 0,
+    "whole_campaign_run": false
+  },
+  "native_container_cases": 82,
+  "native_inventory_cases": 49,
+  "native_repeat": "both complete fixtures equal; see repeat.txt",
+  "oracle_sha256": "996e01ce497db82e3b4abecd26415e1b7250a50c5383c220cad1aed7e76e6e62",
+  "production_tick": {
+    "failed": 0,
+    "ignored": 0,
+    "passed": 3,
+    "state": "ok"
+  },
+  "recorded_at": "2026-10-25T07:57:41.429963+00:00",
+  "resources": {
+    "cargo_jobs": 1,
+    "gpu_used": false,
+    "route_reason": "Previous validation attempt (stopped at clippy) peaked at 1060728832 bytes; fresh light admission with the same lane and a strict 2 GiB cap, no lease or cloud route",
+    "unit": {
+      "CPUQuota_declared": "200%",
+      "MemoryPeak": 1434152960,
+      "authority": "invocation-bound journal completion marker and accounting; unit already reaped",
+      "invocation_id": "d3f52dac3450427a9dc123f1a30dc0c3",
+      "memory_max_bytes_declared": 2147483648,
+      "name": "mc-inventory-final-light2.service",
+      "wall_time": "8min 22.840s"
+    }
+  },
+  "schema": 1,
+  "scope": "Partial actual-Inventory insertion and real-player drop_tick; not complete ItemEntity/world parity",
+  "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
+  "source_sha256": {
+    "src/container_tests.rs": "364079da8463c8a39ddec67e05a10b48ea09c0579c93b5fb886c3dcbae11a940",
+    "src/main.rs": "203b06cfb379095237960e3e74c8f226c7136a1a0420f3dc394566ce32c5b19a",
+    "src/tick_tests.rs": "89420b8407f5ae16cae7b62a87cf1884bcd1042017f61c7c68eb8de5e986f8c2",
+    "tests/container_oracle_test.py": "1e3e88920a09afcbd475beb6af2fec494168cb8a64362f371d2ff53236f0cab6",
+    "tests/gate_scripts.py": "35c57181a6eab12d5866adcb6c68191b5f6025a129639f642b32d38c02af2dcc",
+    "tools/container-oracle/ContainerOracle.java": "996e01ce497db82e3b4abecd26415e1b7250a50c5383c220cad1aed7e76e6e62",
+    "tools/container_oracle.py": "521e04a44f58893285dd46f7af7d4888f0befc33aea5e3c4d0485297df40411d",
+    "tools/inventory_oracle.py": "20a066bb6d7006afa15b91cf1dca11c548a83dd1ca5ea1d95e624b0482a9bc47",
+    "tools/mutation_check.sh": "1f2a377713934bb55f057b2cebe9d9cbdea33c5521e813c4c15b48e917b47db5",
+    "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89"
+  }
+}

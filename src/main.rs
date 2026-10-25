@@ -4248,16 +4248,16 @@ fn hopper_tick() {
 fn drop_tick() {
     let region = region_guard();
     // player within 1.3 blocks picks up the drop
-    let mut taken: Vec<(i32, i32, Stack)> = vec![]; // (drop_eid, collector_eid, stack)
+    let mut taken: Vec<(i32, Arc<Client>)> = vec![];
     {
-        let ds: Vec<(i32, f64, f64, f64, Stack)> = drops()
+        let ds: Vec<(i32, f64, f64, f64)> = drops()
             .lock()
             .unwrap()
             .iter()
-            .map(|d| (d.eid, d.x, d.y, d.z, (d.item, d.cnt, d.comps.clone())))
+            .map(|d| (d.eid, d.x, d.y, d.z))
             .collect();
         let cls: Vec<Arc<Client>> = client_snapshot();
-        for (d_eid, dx, dy, dz, d_stk) in ds.iter() {
+        for (d_eid, dx, dy, dz) in ds.iter() {
             if !region.is_hot(*dx as i32, *dz as i32) {
                 continue;
             }
@@ -4267,8 +4267,7 @@ fn drop_tick() {
                     *p
                 };
                 if (px - dx).powi(2) + (py - dy).powi(2) + (pz - dz).powi(2) < 1.69 {
-                    taken.push((*d_eid, c.eid, d_stk.clone()));
-                    break;
+                    taken.push((*d_eid, c.clone()));
                 }
             }
         }
@@ -4338,49 +4337,56 @@ fn drop_tick() {
             }
         }
     }
-    for (deid, ceid, stk) in taken {
-        let (item, dcnt, dcomp) = (stk.0, stk.1, stk.2);
-        let cls: Vec<Arc<Client>> = client_snapshot();
-        if let Some(c) = cls.iter().find(|c| c.eid == ceid) {
-            // merge only into a same-item same-components slot (vanilla:
-            // differing NBT never stacks), else a free slot
+    for (deid, c) in taken {
+        let selected = *c.held.lock().unwrap();
+        let creative = *c.gm.lock().unwrap() == 1;
+        let (accepted, original, changed, remaining) = {
+            // Same inventory -> drops lock order as actor_tick. Read the live
+            // entity, not a stack snapshot another collector may have consumed.
             let mut inv = c.inv.lock().unwrap();
-            let smax = item_stack_max(item, &dcomp) as u8;
-            let slot = inv
-                .iter()
-                .find(|(_, (it, cnt, cc))| *it == item && *cc == dcomp && *cnt < smax)
-                .map(|(&sl, _)| sl)
-                .or_else(|| (9..=44).find(|sl| !inv.contains_key(sl)));
-            let Some(slot) = slot else {
-                drop(inv);
-                drop(cls);
+            let mut ds = drops().lock().unwrap();
+            let Some(d) = ds.iter_mut().find(|d| d.eid == deid) else {
                 continue;
             };
-            let cur = inv.get(&slot).map(|e| e.1).unwrap_or(0);
-            let room = (smax - cur).min(dcnt);
-            let cnt = cur + room;
-            inv.insert(slot, (item, cnt, dcomp.clone()));
+            let mut source = (d.item, d.cnt, d.comps.clone());
+            let original = source.1;
+            let before = inv.clone();
+            let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);
+            if source.1 == original {
+                continue;
+            }
+            d.cnt = source.1;
+            let remaining = (d.cnt > 0).then(|| drop_meta_pkt(d));
+            if d.cnt == 0 {
+                ds.retain(|d| d.eid != deid);
+            }
+            let changed: Vec<_> = (9..=45)
+                .filter_map(|slot| {
+                    inv.get(&slot)
+                        .filter(|st| before.get(&slot) != Some(st))
+                        .map(|st| (slot, st.clone()))
+                })
+                .collect();
+            (accepted, original, changed, remaining)
+        };
+        for (slot, st) in changed {
             let mut p = vec![0u8];
             write_varint(&mut p, 0);
             p.extend_from_slice(&slot.to_be_bytes());
-            p.extend_from_slice(&slot_wire(&(item, cnt, dcomp)));
+            p.extend_from_slice(&slot_wire(&st));
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x15, p);
             }
-            drop(inv);
-            drop(cls);
-            broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, ceid, room)));
-            let mut ds = drops().lock().unwrap();
-            if let Some(d) = ds.iter_mut().find(|d| d.eid == deid) {
-                d.cnt -= room;
-                if d.cnt == 0 {
-                    ds.retain(|x| x.eid != deid);
-                    broadcast_seen_destroy(deid);
-                } else {
-                    let pkt = drop_meta_pkt(d);
-                    broadcast_seen(deid, move |_c| (0x58, pkt.clone()));
-                }
-            }
+        }
+        // ItemEntity.playerTouch uses add's boolean, NOT the number inserted;
+        // its take callback receives the original entity count (cjh.b_(cmx)).
+        if accepted {
+            broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, c.eid, original)));
+        }
+        if let Some(pkt) = remaining {
+            broadcast_seen(deid, move |_c| (0x58, pkt.clone()));
+        } else {
+            broadcast_seen_destroy(deid);
         }
     }
     {
@@ -13474,6 +13480,72 @@ fn insert_into_slot(map: &mut HashMap<i16, Stack>, slot: i16, source: &mut Stack
         source.1 -= moved;
         if source.1 == 0 {
             *source = (0, 0, Vec::new());
+        }
+    }
+}
+// Inventory pickup uses hotbar-first native indices, not menu traversal order.
+fn pickup_inventory_order() -> impl Iterator<Item = i16> + Clone {
+    (36..=44).chain(9..=35)
+}
+fn pickup_is_damaged(st: &Stack) -> bool {
+    comp_varint(&st.2, COMP_DAMAGE).unwrap_or(0) > 0
+        && comp_get(&st.2, COMP_UNBREAKABLE).is_none()
+        && comp_varint(&st.2, COMP_MAX_DAMAGE)
+            .or_else(|| tool_max_damage(st.0))
+            .or_else(|| armor_max_damage(st.0))
+            .is_some_and(|max| max > 0)
+}
+fn pickup_slot_with_space(map: &HashMap<i16, Stack>, selected: i16, source: &Stack) -> Option<i16> {
+    [36 + selected, 45]
+        .into_iter()
+        .chain(pickup_inventory_order())
+        .find(|key| {
+            map.get(key).is_some_and(|st| {
+                st.1 > 0
+                    && st.0 == source.0
+                    && st.2 == source.2
+                    && stack_max_of(st) > 1
+                    && !pickup_is_damaged(st)
+                    && i64::from(st.1) < stack_max_of(st)
+            })
+        })
+}
+// 1.21.1 Inventory.add (cmw.f/c): selected -> offhand -> hotbar/main
+// merges, then hotbar/main empties, repeated until exhausted or no progress.
+// Horizon inventory_pickup informed the port; actual-class vectors pin this version.
+fn pickup_into_inventory(
+    map: &mut HashMap<i16, Stack>,
+    selected: i16,
+    creative: bool,
+    source: &mut Stack,
+) -> bool {
+    if source.0 == 0 || source.1 == 0 {
+        return false;
+    }
+    let damaged = pickup_is_damaged(source);
+    loop {
+        let before = source.1;
+        let free = || pickup_inventory_order().find(|key| map.get(key).is_none_or(|st| st.1 == 0));
+        let slot = if damaged {
+            free()
+        } else {
+            pickup_slot_with_space(map, selected, source).or_else(free)
+        };
+        if let Some(slot) = slot {
+            if damaged {
+                map.insert(slot, std::mem::take(source));
+            } else {
+                insert_into_slot(map, slot, source, source.1);
+            }
+        }
+        if source.1 == 0 || source.1 == before {
+            // Java compares with the LAST iteration's count. A partial insert
+            // that subsequently stalls returns false, despite changing slots.
+            if creative && source.1 == before {
+                *source = (0, 0, vec![]);
+                return true;
+            }
+            return source.1 < before;
         }
     }
 }

@@ -12,10 +12,16 @@
 # test green is reported as a failure of this script, not of the test suite.
 #
 # Run: bash tools/mutation_check.sh [--offline]
+# Focused runs: MUTATION_FILTER=<test-filter-substring> (zero matches fail).
+# Use MUTATION_RELEASE=1 and CARGO_BUILD_JOBS=1 for bounded release checks.
+# Select here, never copy this script to /tmp: its cwd is owned by this path.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-CARGO_FLAGS=(--locked -j 2)
+CARGO_FLAGS=(--locked -j "${CARGO_BUILD_JOBS:-2}")
+if [ "${MUTATION_RELEASE:-0}" = 1 ]; then
+  CARGO_FLAGS+=(--release)
+fi
 if [ "${1:-}" = "--offline" ] || [ "${CARGO_OFFLINE:-0}" = "1" ]; then
   CARGO_FLAGS=(--offline "${CARGO_FLAGS[@]}")
 fi
@@ -94,6 +100,9 @@ control() {
 # check <name> <file> <from> <to> <test-filter-or-wire-script> [exact-wire-failure]
 check() {
   local name="$1" mut_file_local="$2" from="$3" to="$4" test_filter="$5" expected_failure="${6:-}"
+  if [ -n "${MUTATION_FILTER:-}" ] && [[ "$test_filter" != *"$MUTATION_FILTER"* ]]; then
+    return
+  fi
   local status compiled caught=no
   mut_file="$mut_file_local"
   backup="$mut_file.mutation-backup"
@@ -598,6 +607,34 @@ check "the real chest click dispatch preserves the mouse button" \
   src/main.rs '                                    click_slot(gmap, &mut cur, gslot, btn as i8);' \
   '                                    click_slot(gmap, &mut cur, gslot, 0);' \
   tests/container_wire.py 'containers wire: FAIL chest-half-pickup'
+
+# Inventory pickup: prove the native loop AND its actual tick caller.
+check "pickup drains beyond the first partially filled slot" \
+  src/main.rs '        if source.1 == 0 || source.1 == before {' \
+  '        if true {' \
+  pickup_inventory_matches_real_1_21_1_classes
+
+check "the pickup tick forwards the selected hotbar slot" \
+  src/main.rs '            let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);' \
+  '            let accepted = pickup_into_inventory(&mut inv, 0, creative, &mut source);' \
+  pickup_tick_drains_across_selected_offhand_then_hotbar
+
+check "partial insertion is not a successful ItemEntity take callback" \
+  src/main.rs '        if accepted {
+            broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, c.eid, original)));' \
+  '        if original > 0 {
+            broadcast_seen(deid, |_c| (0x6f, collect_pkt(deid, c.eid, original)));' \
+  pickup_tick_keeps_the_partial_entity_without_a_take_event
+
+check "a full nearby player does not monopolize the drop" \
+  src/main.rs '                    taken.push((*d_eid, c.clone()));' \
+  '                    taken.push((*d_eid, c.clone())); break;' \
+  pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
+
+check "the pickup tick forwards infinite materials to inventory insertion" \
+  src/main.rs '        let creative = *c.gm.lock().unwrap() == 1;' \
+  '        let creative = false;' \
+  pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

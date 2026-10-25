@@ -5,9 +5,12 @@ import java.lang.reflect.*;
 import java.nio.file.*;
 import java.util.*;
 
-/** Actual 1.21.1 Slot.safeInsert and ChestMenu.quickMoveStack, not a second model.
+/** Actual 1.21.1 slot/menu and Inventory insertion, not a second model.
  * Reflection names below are resolved from Mojang's 1.21.1 server mappings.
- * No stand-in Player, Unsafe allocation, server startup, or signature stripping.
+ * Slot/menu probes use no Player. Inventory probes use a constructor-bypassed real
+ * ServerPlayer ONLY for hasInfiniteMaterials (native abilities.instabuild read).
+ * This does not validate player construction, ItemEntity callbacks, or a world.
+ * No overridden game methods, server startup, or signature stripping.
  * Harness approach informed by Horizon's VanillaMenuOracle (MIT notice in repo).
  */
 public final class ContainerOracle {
@@ -26,6 +29,16 @@ public final class ContainerOracle {
             stack.getMethod("b", type.getType(), Object.class).invoke(
                     result, type.get(null), Integer.valueOf(spec.get("cap").getAsInt()));
         }
+        if (spec.has("damage")) {
+            Field type = Class.forName("kq").getField("e"); // DataComponents.DAMAGE
+            stack.getMethod("b", type.getType(), Object.class).invoke(
+                    result, type.get(null), Integer.valueOf(spec.get("damage").getAsInt()));
+        }
+        if (spec.has("unbreakable")) {
+            Field type = Class.forName("kq").getField("f"); // DataComponents.UNBREAKABLE
+            Object patch = Class.forName("cxz").getConstructor(boolean.class).newInstance(true);
+            stack.getMethod("b", type.getType(), Object.class).invoke(result, type.get(null), patch);
+        }
         return result;
     }
 
@@ -38,7 +51,7 @@ public final class ContainerOracle {
             JsonObject result = new JsonObject();
             result.addProperty("item", entry.getKey());
             result.addProperty("count", count);
-            // All generated patches here contain only MAX_STACK_SIZE.
+            // Describe the supported effective patches, not arbitrary component data.
             int max = (int) stack.getMethod("j").invoke(value);
             int natural = switch (entry.getKey()) {
                 case "snowball" -> 16;
@@ -46,9 +59,35 @@ public final class ContainerOracle {
                 default -> 64;
             };
             if (max != natural) result.addProperty("cap", max);
+            int damage = (int) stack.getMethod("n").invoke(value); // getDamageValue
+            if (damage > 0) result.addProperty("damage", damage);
+            Field unbreakable = Class.forName("kq").getField("f");
+            if (stack.getMethod("a", unbreakable.getType()).invoke(value, unbreakable.get(null)) != null)
+                result.addProperty("unbreakable", true);
             return result;
         }
         throw new IllegalStateException("unrecognized reference item");
+    }
+
+    static Object inventoryPlayer(boolean infinite) throws Exception {
+        Class<?> player = Class.forName("cmx");
+        // In this authenticated build Player.hasInfiniteMaterials reads exactly
+        // Player.abilities.instabuild; no level, connection or gameMode is touched.
+        if (player.getMethod("fL").getDeclaringClass() != player)
+            throw new IllegalStateException("unexpected infinite-materials owner");
+        Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+        Field singleton = unsafeClass.getDeclaredField("theUnsafe");
+        singleton.setAccessible(true);
+        Object p = unsafeClass.getMethod("allocateInstance", Class.class).invoke(
+                singleton.get(null), Class.forName("aqv")); // real ServerPlayer, no overrides
+        Object abilities = Class.forName("cmu").getConstructor().newInstance();
+        abilities.getClass().getField("d").setBoolean(abilities, infinite);
+        Field field = player.getDeclaredField("cA");
+        field.setAccessible(true);
+        field.set(p, abilities);
+        if ((boolean) player.getMethod("fL").invoke(p) != infinite)
+            throw new IllegalStateException("native infinite-materials callback disagrees");
+        return p;
     }
 
     public static void main(String[] args) throws Exception {
@@ -90,6 +129,24 @@ public final class ContainerOracle {
                 JsonObject states = new JsonObject();
                 for (int i = 0; i < slots.size(); i++) {
                     JsonElement state = describe(slot.getMethod("g").invoke(slots.get(i)));
+                    if (!state.isJsonNull()) states.add(Integer.toString(i), state);
+                }
+                result.add("slots", states);
+            } else if (spec.get("op").getAsString().equals("inventory_add")) {
+                Object inv = inventory.getConstructor(Class.forName("cmx")).newInstance(
+                        inventoryPlayer(spec.get("creative").getAsBoolean()));
+                inventory.getField("k").setInt(inv, spec.get("selected").getAsInt());
+                for (var entry : spec.getAsJsonObject("slots").entrySet())
+                    inventory.getMethod("a", int.class, stack).invoke(
+                            inv, Integer.parseInt(entry.getKey()), make(entry.getValue()));
+                Object source = make(spec.get("source"));
+                result.addProperty("first_space", (int) inventory.getMethod("e", stack).invoke(inv, source));
+                result.addProperty("first_empty", (int) inventory.getMethod("h").invoke(inv));
+                result.addProperty("accepted", (boolean) inventory.getMethod("f", stack).invoke(inv, source));
+                result.add("source", describe(source));
+                JsonObject states = new JsonObject();
+                for (int i = 0; i < 41; i++) {
+                    JsonElement state = describe(inventory.getMethod("a", int.class).invoke(inv, i));
                     if (!state.isJsonNull()) states.add(Integer.toString(i), state);
                 }
                 result.add("slots", states);

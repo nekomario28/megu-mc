@@ -9,6 +9,7 @@ struct WorldSnapshot {
     world: HashMap<(i32, i32), HashMap<u32, u32>>,
     falling: Vec<Fall>,
     drops: Vec<Drop>,
+    clients: Vec<Arc<Client>>,
     forced: HashSet<(i32, i32)>,
     region: crate::RegionSets,
 }
@@ -18,6 +19,7 @@ impl WorldSnapshot {
             world: std::mem::take(&mut *world().lock().unwrap()),
             falling: std::mem::take(&mut *falling().lock().unwrap()),
             drops: std::mem::take(&mut *drops().lock().unwrap()),
+            clients: std::mem::take(&mut *clients().lock().unwrap()),
             forced: std::mem::take(&mut *forceloaded().lock().unwrap()),
             region: test_region(),
         }
@@ -31,8 +33,151 @@ impl std::ops::Drop for WorldSnapshot {
         *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
         *falling().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.falling);
         *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
         *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.forced);
         set_test_region(self.region.0.clone(), self.region.1.clone());
+    }
+}
+
+#[test]
+fn pickup_tick_drains_across_selected_offhand_then_hotbar() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (client, _receiver) = client_pair();
+    *client.held.lock().unwrap() = 4;
+    let stone = name_to_item("stone").unwrap();
+    *client.inv.lock().unwrap() = [9, 36, 40, 45]
+        .into_iter()
+        .map(|key| (key, (stone, 60, vec![])))
+        .collect();
+    let client = Arc::new(client);
+    clients().lock().unwrap().push(client.clone());
+    drops().lock().unwrap().push(Drop {
+        eid: 9999,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 10,
+        comps: vec![],
+        age: 100,
+    });
+    drop_tick();
+    let remaining: Vec<_> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
+    let actual = client.inv.lock().unwrap().clone();
+    assert!(
+        remaining.is_empty(),
+        "pickup left entity counts {remaining:?}"
+    );
+    assert_eq!(
+        actual,
+        HashMap::from([
+            (40, (stone, 64, vec![])),
+            (45, (stone, 64, vec![])),
+            (36, (stone, 62, vec![])),
+            (9, (stone, 60, vec![])),
+        ])
+    );
+}
+
+#[test]
+fn pickup_tick_keeps_the_partial_entity_without_a_take_event() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (client, mut receiver) = client_pair();
+    let stone = name_to_item("stone").unwrap();
+    let dirt = name_to_item("dirt").unwrap();
+    *client.inv.lock().unwrap() = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
+    client.inv.lock().unwrap().insert(45, (stone, 60, vec![]));
+    client.seen.lock().unwrap().insert(9999);
+    let client = Arc::new(client);
+    clients().lock().unwrap().push(client.clone());
+    drops().lock().unwrap().push(Drop {
+        eid: 9999,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 10,
+        comps: vec![],
+        age: 100,
+    });
+    drop_tick();
+    let remaining: Vec<_> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
+    let offhand = client.inv.lock().unwrap().get(&45).cloned();
+    client
+        .sock
+        .lock()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    let mut packets = Vec::new();
+    while let Some((id, _)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
+        packets.push(id);
+    }
+    assert_eq!(remaining, [6]);
+    assert_eq!(offhand, Some((stone, 64, vec![])));
+    assert!(
+        packets.contains(&0x15) && packets.contains(&0x58),
+        "missing slot/entity updates: {packets:?}"
+    );
+    assert!(
+        !packets.contains(&0x6f),
+        "partial add returned false but sent take: {packets:?}"
+    );
+}
+
+#[test]
+fn pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (first, _first_rx) = client_pair();
+    let (mut second, _second_rx) = client_pair();
+    second.eid += 1;
+    let first = Arc::new(first);
+    let second = Arc::new(second);
+    *clients().lock().unwrap() = vec![first.clone(), second.clone()];
+    let stone = name_to_item("stone").unwrap();
+    // With two eligible players, the live drop is consumed only once.
+    for (full, creative) in [(false, false), (true, false), (true, true)] {
+        *first.gm.lock().unwrap() = u8::from(creative);
+        first.inv.lock().unwrap().clear();
+        second.inv.lock().unwrap().clear();
+        if full {
+            *first.inv.lock().unwrap() = (9..=44).map(|key| (key, (stone, 64, vec![]))).collect();
+        }
+        drops().lock().unwrap().push(Drop {
+            eid: 9999,
+            x: 0.0,
+            y: 70.0,
+            z: 0.0,
+            item: stone,
+            cnt: 10,
+            comps: vec![],
+            age: 100,
+        });
+        drop_tick();
+        let remaining = drops().lock().unwrap().len();
+        let a = first.inv.lock().unwrap().clone();
+        let b = second.inv.lock().unwrap().clone();
+        assert_eq!(remaining, 0);
+        if full {
+            assert_eq!(a[&36].1, 64);
+            if creative {
+                assert!(
+                    b.is_empty(),
+                    "creative fallback consumes the entity before the next player"
+                );
+            } else {
+                assert_eq!(b, HashMap::from([(36, (stone, 10, vec![]))]));
+            }
+        } else {
+            assert_eq!(a, HashMap::from([(36, (stone, 10, vec![]))]));
+            assert!(b.is_empty(), "a stale candidate duplicated the item");
+        }
     }
 }
 

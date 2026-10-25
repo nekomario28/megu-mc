@@ -1,0 +1,8384 @@
+{
+  "cases": [
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {},
+        "source": null
+      },
+      "id": "inventory-000",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {},
+      "source": null
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 10,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-001",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {},
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 1,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "count": 62,
+            "item": "stone"
+          },
+          "4": {
+            "count": 64,
+            "item": "stone"
+          },
+          "40": {
+            "count": 64,
+            "item": "stone"
+          },
+          "9": {
+            "count": 60,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-002",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 60,
+          "item": "stone"
+        },
+        "4": {
+          "count": 60,
+          "item": "stone"
+        },
+        "40": {
+          "count": 60,
+          "item": "stone"
+        },
+        "9": {
+          "count": 60,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 1,
+        "first_space": 40,
+        "slots": {
+          "0": {
+            "count": 62,
+            "item": "stone"
+          },
+          "40": {
+            "count": 64,
+            "item": "stone"
+          },
+          "9": {
+            "count": 60,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-003",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 60,
+          "item": "stone"
+        },
+        "40": {
+          "count": 60,
+          "item": "stone"
+        },
+        "9": {
+          "count": 60,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 6,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 8,
+        "slots": {
+          "0": {
+            "count": 2,
+            "item": "stone"
+          },
+          "8": {
+            "count": 64,
+            "item": "stone"
+          },
+          "9": {
+            "count": 64,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-004",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "8": {
+          "count": 60,
+          "item": "stone"
+        },
+        "9": {
+          "count": 60,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 1,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-005",
+      "op": "inventory_add",
+      "selected": 8,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 1,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 9,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 10,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-006",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": 40,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "40": {
+            "count": 64,
+            "item": "stone"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 6,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-007",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "40": {
+          "count": 60,
+          "item": "stone"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 10,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-008",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "stone"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 6,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-009",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 60,
+          "item": "stone"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": true,
+      "expected": {
+        "accepted": true,
+        "first_empty": -1,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "stone"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-010",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 60,
+          "item": "stone"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": true,
+      "expected": {
+        "accepted": true,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-011",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 10,
+            "item": "stone"
+          },
+          "36": {
+            "count": 60,
+            "item": "stone"
+          },
+          "37": {
+            "count": 60,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-012",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "36": {
+          "count": 60,
+          "item": "stone"
+        },
+        "37": {
+          "count": 60,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 40,
+        "slots": {
+          "0": {
+            "count": 6,
+            "item": "stone"
+          },
+          "4": {
+            "cap": 99,
+            "count": 60,
+            "item": "stone"
+          },
+          "40": {
+            "count": 64,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-013",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "cap": 99,
+          "count": 60,
+          "item": "stone"
+        },
+        "40": {
+          "count": 60,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 10,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-014",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "40": null,
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 10,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "4": {
+            "count": 64,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-015",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "count": 63,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 1,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-016",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 1,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "count": 63,
+            "item": "stone"
+          },
+          "4": {
+            "count": 64,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-017",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "count": 63,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 64,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-018",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 64,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "stone"
+          },
+          "4": {
+            "count": 64,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-019",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "count": 63,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "count": 65,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 65,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-020",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 65,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "4": {
+            "count": 16,
+            "item": "snowball"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-021",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "count": 15,
+          "item": "snowball"
+        }
+      },
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 1,
+          "item": "snowball"
+        }
+      },
+      "id": "inventory-022",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 1,
+        "item": "snowball"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "count": 15,
+            "item": "snowball"
+          },
+          "4": {
+            "count": 16,
+            "item": "snowball"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-023",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "count": 15,
+          "item": "snowball"
+        }
+      },
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 16,
+          "item": "snowball"
+        }
+      },
+      "id": "inventory-024",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 16,
+        "item": "snowball"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "count": 16,
+            "item": "snowball"
+          },
+          "4": {
+            "count": 16,
+            "item": "snowball"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-025",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "count": 15,
+          "item": "snowball"
+        }
+      },
+      "source": {
+        "count": 17,
+        "item": "snowball"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 17,
+          "item": "snowball"
+        }
+      },
+      "id": "inventory-026",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 17,
+        "item": "snowball"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 1,
+            "item": "diamond_sword"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-027",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {},
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "inventory-028",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 1,
+            "item": "diamond_sword"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-029",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {},
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 1,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "inventory-030",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 1,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 1,
+            "item": "diamond_sword"
+          },
+          "1": {
+            "count": 1,
+            "item": "diamond_sword"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-031",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {},
+      "source": {
+        "count": 2,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 2,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "inventory-032",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 2,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "4": {
+            "cap": 16,
+            "count": 16,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-033",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "cap": 16,
+          "count": 1,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-034",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "cap": 16,
+            "count": 15,
+            "item": "stone"
+          },
+          "4": {
+            "cap": 16,
+            "count": 16,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-035",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "cap": 16,
+          "count": 16,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-036",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 16,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "0": {
+            "cap": 16,
+            "count": 16,
+            "item": "stone"
+          },
+          "4": {
+            "cap": 16,
+            "count": 16,
+            "item": "stone"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-037",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "cap": 16,
+          "count": 15,
+          "item": "stone"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 17,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "cap": 16,
+          "count": 17,
+          "item": "stone"
+        }
+      },
+      "id": "inventory-038",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 17,
+        "item": "stone"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 4,
+            "damage": 3,
+            "item": "diamond_sword"
+          },
+          "4": {
+            "count": 1,
+            "damage": 3,
+            "item": "diamond_sword"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-039",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "count": 1,
+          "damage": 3,
+          "item": "diamond_sword"
+        }
+      },
+      "source": {
+        "count": 4,
+        "damage": 3,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "count": 1,
+          "damage": 3,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "inventory-040",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 1,
+        "damage": 3,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": true,
+      "expected": {
+        "accepted": true,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-041",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "count": 1,
+        "damage": 3,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "cap": 16,
+            "count": 4,
+            "damage": 3,
+            "item": "diamond_sword"
+          },
+          "4": {
+            "cap": 16,
+            "count": 1,
+            "damage": 3,
+            "item": "diamond_sword"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-042",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "cap": 16,
+          "count": 1,
+          "damage": 3,
+          "item": "diamond_sword"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 4,
+        "damage": 3,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "cap": 16,
+          "count": 1,
+          "damage": 3,
+          "item": "diamond_sword"
+        }
+      },
+      "id": "inventory-043",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "damage": 3,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": true,
+      "expected": {
+        "accepted": true,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-044",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "damage": 3,
+        "item": "diamond_sword"
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": 4,
+        "slots": {
+          "4": {
+            "cap": 16,
+            "count": 5,
+            "damage": 3,
+            "item": "diamond_sword",
+            "unbreakable": true
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-045",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "cap": 16,
+          "count": 1,
+          "damage": 3,
+          "item": "diamond_sword",
+          "unbreakable": true
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 4,
+        "damage": 3,
+        "item": "diamond_sword",
+        "unbreakable": true
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": false,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": {
+          "cap": 16,
+          "count": 1,
+          "damage": 3,
+          "item": "diamond_sword",
+          "unbreakable": true
+        }
+      },
+      "id": "inventory-046",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "damage": 3,
+        "item": "diamond_sword",
+        "unbreakable": true
+      }
+    },
+    {
+      "creative": true,
+      "expected": {
+        "accepted": true,
+        "first_empty": -1,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "1": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "10": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "11": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "12": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "13": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "14": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "15": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "16": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "17": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "18": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "19": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "2": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "20": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "21": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "22": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "23": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "24": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "25": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "26": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "27": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "28": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "29": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "3": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "30": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "31": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "32": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "33": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "34": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "35": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "4": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "5": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "6": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "7": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "8": {
+            "count": 64,
+            "item": "dirt"
+          },
+          "9": {
+            "count": 64,
+            "item": "dirt"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-047",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "0": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "1": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "10": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "11": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "12": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "13": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "14": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "15": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "16": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "17": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "18": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "19": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "2": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "20": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "21": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "22": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "23": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "24": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "25": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "26": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "27": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "28": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "29": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "3": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "30": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "31": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "32": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "33": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "34": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "35": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "4": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "5": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "6": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "7": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "8": {
+          "count": 64,
+          "item": "dirt"
+        },
+        "9": {
+          "count": 64,
+          "item": "dirt"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 1,
+        "damage": 3,
+        "item": "diamond_sword",
+        "unbreakable": true
+      }
+    },
+    {
+      "creative": false,
+      "expected": {
+        "accepted": true,
+        "first_empty": 0,
+        "first_space": -1,
+        "slots": {
+          "0": {
+            "cap": 16,
+            "count": 5,
+            "item": "diamond_sword"
+          },
+          "4": {
+            "cap": 16,
+            "count": 1,
+            "damage": 3,
+            "item": "diamond_sword"
+          }
+        },
+        "source": null
+      },
+      "id": "inventory-048",
+      "op": "inventory_add",
+      "selected": 4,
+      "slots": {
+        "4": {
+          "cap": 16,
+          "count": 1,
+          "damage": 3,
+          "item": "diamond_sword"
+        }
+      },
+      "source": {
+        "cap": 16,
+        "count": 5,
+        "item": "diamond_sword"
+      }
+    }
+  ],
+  "minecraft": "1.21.1",
+  "oracle_sha256": "996e01ce497db82e3b4abecd26415e1b7250a50c5383c220cad1aed7e76e6e62",
+  "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+}

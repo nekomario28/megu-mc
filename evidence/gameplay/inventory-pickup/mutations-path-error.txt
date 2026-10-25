@@ -1,0 +1,16 @@
+sha256sum: src/main.rs: そのようなファイルやディレクトリはありません
+FAIL  pickup drains beyond the first partially filled slot: baseline control did not pass the required test
+error: could not find `Cargo.toml` in `/` or any parent directory
+sha256sum: src/main.rs: そのようなファイルやディレクトリはありません
+FAIL  the pickup tick forwards the selected hotbar slot: baseline control did not pass the required test
+error: could not find `Cargo.toml` in `/` or any parent directory
+sha256sum: src/main.rs: そのようなファイルやディレクトリはありません
+FAIL  partial insertion is not a successful ItemEntity take callback: baseline control did not pass the required test
+error: could not find `Cargo.toml` in `/` or any parent directory
+sha256sum: src/main.rs: そのようなファイルやディレクトリはありません
+FAIL  a full nearby player does not monopolize the drop: baseline control did not pass the required test
+error: could not find `Cargo.toml` in `/` or any parent directory
+sha256sum: src/main.rs: そのようなファイルやディレクトリはありません
+FAIL  the pickup tick forwards infinite materials to inventory insertion: baseline control did not pass the required test
+error: could not find `Cargo.toml` in `/` or any parent directory
+mutation check: 0 proved, 5 not a gate, 0 parked, 0 skipped

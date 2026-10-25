@@ -1,0 +1,19 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 31.47s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+
+thread 'tick_tests::pickup_tick_drains_across_selected_offhand_then_hotbar' (2920971) panicked at src/tick_tests.rs:69:5:
+pickup left entity counts [6]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tick_tests::pickup_tick_drains_across_selected_offhand_then_hotbar ... FAILED
+
+failures:
+
+failures:
+    tick_tests::pickup_tick_drains_across_selected_offhand_then_hotbar
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 202 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `--bin mc-spine`

@@ -54,8 +54,9 @@ def require_equal(expected, actual):
         raise ValueError("container reference differs, is incomplete, or has stale provenance")
 
 
-def reference(jar):
-    requested = cases()
+def reference(jar, requested=None):
+    if requested is None:
+        requested = cases()
     with pinned_runtime(jar) as (work, cp, _inner):
         input_path, output_path = work / "cases.json", work / "results.json"
         input_path.write_text(json.dumps(requested))

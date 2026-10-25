@@ -33,8 +33,13 @@ donor は `horizon-world/src/inventory_pickup.rs` / `player_inventory.rs` と
 次の観測点は選択 hotbar → offhand → 通常 inventory のマージ優先順位、
 空きスロット順序、部分回収、満杯時の entity 残量、pickup delay。
 既存の `drop_tick` と擬似 player の `actor_tick` は別の inventory 表現を使うため、
-添字を混ぜない。先に 1.21.1 `Inventory` / `ItemEntity` oracle を用意する。
-**この段階の runtime 実装はまだ移植していない。**
+添字を混ぜない。`Inventory.add` の実クラス参照で優先順位・残量・戻り値を固定し、
+実プレイヤーの `drop_tick` に接続した。[検証範囲](../../evidence/gameplay/inventory-pickup/README.md)を参照。
+部分挿入と成功通知は別の契約なので、戻り値を「入った個数」に置き換えない。
+
+この段階は部分実装。擬似 player の表現統合、pickup delay と所有者制限、
+`ItemEntity.playerTouch` 自体の実行、接触範囲・scheduler・統計／advancement は未検証。
+次は item entity の時間・所有者・接触条件を独立に固定し、その後で actor の表現を統合する。
 
 ### 3. チェストのワールド側契約
 

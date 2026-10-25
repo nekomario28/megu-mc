@@ -1,0 +1,10 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 3 tests
+test tick_tests::pickup_tick_drains_across_selected_offhand_then_hotbar ... ok
+test tick_tests::pickup_tick_keeps_the_partial_entity_without_a_take_event ... ok
+test tick_tests::pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.06s
+

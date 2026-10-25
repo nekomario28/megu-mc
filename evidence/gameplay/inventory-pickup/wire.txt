@@ -1,0 +1,4 @@
+{"carried_remainder": 6, "partial_merge": true, "protocol": 767, "right_swap": true, "shift_destination": 62}
+containers wire: PASS
+{"after": 0, "before": 112, "broken": [0, 10, 0], "chat_echo": "cli_gameplay_round_trip", "chunk_decode": true, "fresh_reader": true, "movement": true, "protocol": 767}
+gameplay wire: PASS
