@@ -636,6 +636,39 @@ check "the pickup tick forwards infinite materials to inventory insertion" \
   '        let creative = false;' \
   pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
+# Pinned surface-loader slice: codecs, weather dispatch, and its shared noise owner.
+check "the pinned inline surface rule is actually installed" \
+  src/worldgen.rs 'ns.get("surface_rule").or_else(|| ns.get("material_rule"))' \
+  'ns.get("material_rule")' \
+  pinned_surface_rule_places_bedrock_and_deepslate
+
+check "surface block states retain their properties" \
+  src/worldgen.rs '            Some(props) => Some(breg()?.state_of(&name, Some(props))),' \
+  '            Some(_props) => Some(default),' \
+  pinned_surface_block_states_match_the_native_codec
+
+check "the surface temperature condition uses biome weather" \
+  src/worldgen.rs '.is_some_and(|weather| weather.cold(c.x, c.y, c.z))' \
+  '.is_some_and(|weather| !weather.cold(c.x, c.y, c.z))' \
+  pinned_surface_temperature_matches_the_native_biome
+
+check "the frozen-temperature simplex stack keeps octave zero at its own index" \
+  src/generation_math.rs '        let zi = j;' \
+  '        let zi = -first;' \
+  pinned_surface_temperature_matches_the_native_biome
+
+check "simplex frequency starts at the highest octave, not the layer count" \
+  src/generation_math.rs '        let mut e = 2.0f64.powi(self.highest_octave);' \
+  '        let mut e = 2.0f64.powi(self.layers.len() as i32 - 1);' \
+  pinned_surface_temperature_matches_the_native_biome
+
+check "a surface sequence cannot silently discard an undecoded child" \
+  src/worldgen.rs '                    .map(|c| self.rule_node(c, files, rf, cf, res))
+                    .collect::<Option<_>>()?,' \
+  '                    .filter_map(|c| self.rule_node(c, files, rf, cf, res))
+                    .collect(),' \
+  surface_sequence_rejects_a_child_that_did_not_parse
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

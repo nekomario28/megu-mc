@@ -1,0 +1,82 @@
+{
+  "observed_at": "2026-10-25T09:10:49.455Z",
+  "repository": "https://github.com/ludovic111/horizon",
+  "retained_donor_revision": "0564ab0bcd3235daa6001033261b79aef5f81de1",
+  "remote_refs": {
+    "heads": 166,
+    "tag_refs_including_peeled": 224,
+    "main": "574d54e6e07c68807bc2825bac1d0fcee0a9e583",
+    "sampled_tags": [
+      {
+        "sha": "7bbd5b36a8d5665fb9a4ef965f40792de72fd975",
+        "ref": "refs/tags/launcher-v0.1.1"
+      },
+      {
+        "sha": "2e4c4d18612fcc5e4fc082755a831608bf166209",
+        "ref": "refs/tags/launcher-v0.1.1^{}"
+      },
+      {
+        "sha": "602e86e093f118ffd1bdbf54e912e875d65ca706",
+        "ref": "refs/tags/v0.2.0"
+      }
+    ]
+  },
+  "root_commit": {
+    "sha": "32a4383459471bc121c0fdbeacd8f55eaef6042c",
+    "parents": []
+  },
+  "scope": "All seven changes to research-lock.json on main from its root, plus v0.2.0 and launcher-v0.1.1. Other branch contents were not exhaustively inspected.",
+  "inspected": [
+    {
+      "ref": "3ac4d26cd0439b204e5d837d8b728ee9ee8d433b",
+      "minecraft": "26.3",
+      "server_sha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c"
+    },
+    {
+      "ref": "6d7f11feb2ef208eb6e81f0ad3597a4b95bfab28",
+      "minecraft": "26.3",
+      "server_sha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c"
+    },
+    {
+      "ref": "6fab5eb279381ee1f9aab4488afa453800d3c40a",
+      "minecraft": "26.3",
+      "server_sha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c"
+    },
+    {
+      "ref": "82eda1d8bf9adfe6eee7d14e49039126db529ab0",
+      "minecraft": "26.3",
+      "server_sha1": null
+    },
+    {
+      "ref": "37898e856b5de504ec0d5237ef061c0725087a63",
+      "minecraft": "26.3",
+      "server_sha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c"
+    },
+    {
+      "ref": "24a58c40d8f7162aff96baf13811de93ac828a03",
+      "minecraft": "26.3",
+      "server_sha1": null
+    },
+    {
+      "ref": "32a4383459471bc121c0fdbeacd8f55eaef6042c",
+      "minecraft": "26.3",
+      "server_sha1": null
+    },
+    {
+      "ref": "v0.2.0",
+      "minecraft": "26.3",
+      "server_sha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c"
+    },
+    {
+      "ref": "launcher-v0.1.1",
+      "minecraft": "26.3",
+      "server_sha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c"
+    },
+    {
+      "ref": "main",
+      "minecraft": "26.3",
+      "server_sha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c"
+    }
+  ],
+  "conclusion": "All inspected locks target Minecraft 26.3. No 1.21.1 line established. Horizon's software release tags are not Minecraft-version ports."
+}

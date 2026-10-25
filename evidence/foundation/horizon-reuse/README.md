@@ -6,12 +6,23 @@
 MIT（Copyright (c) 2026 Ludovic、原本を [`third_party/licenses/horizon.txt`](../../../third_party/licenses/horizon.txt) に保存）。
 Minecraft の jar・生成データまで MIT と解釈しない。Horizon の runtime crate は依存に追加していない。
 
+## 別の Minecraft 版はあるか
+
+公開 refs と main の `research-lock.json` 全履歴を調べた。root commit
+`32a4383459471bc121c0fdbeacd8f55eaef6042c`（親なし）から全7変更が **26.3** を指定し、
+古い `v0.2.0` と `launcher-v0.1.1` でも同じだった。Horizon の release tag は
+Horizon 自体の版番号であり、Minecraft の対応版番号ではない。
+[照合した revision と lock の結果](versions.json) を保存した。
+**確認範囲で 1.21.1 向け系統は見つからない**。全 remote branch の内容を精査したという主張ではない。
+参照 checkout を新しい main に切り替えず、上記 revision を引き続き donor とする。
+
 ## 採用判断
 
 | 候補 | 判断 | mc-spine での使い道と境界 |
 |---|---|---|
 | `VanillaBiomeExport.java` | **ADAPT（実施）** | built-in preset を vanilla 自身に構築させる。1.21.1 の公式 mappings で名前を解決した別の transport を書き、既存ローダの RTree 形式へ出力する。26.3 の preset データはコピーしない |
-| `tools/test_*_parity.py` の Java oracle + Rust probe | **ADAPT（次）** | `NormalNoise.getValue`、surface、aquifer を単位ごとに比較する。oracle は算術を再実装せず実クラスを呼ぶ。1.21.1 の jar、seed、RNG の種類、評価座標を固定する |
+| `tools/test_*_parity.py` の Java oracle + Rust probe | **ADAPT（実施・継続）** | container / Inventory に続き、surface codec と biome temperature の実クラス oracle を導入。`NormalNoise.getValue`、surface 全評価、aquifer は次の比較対象 |
+| material condition / `worldgen/biome_temperature.rs` | **ADAPT（部分実施）** | 既存 surface rule owner に inline 入力・ブロック状態・温度条件を接続。新しい surface engine は増やさない。[実行範囲](../surface-loader/README.md)。高度境界・浮動小数点幅は 1.21.1 で確認し直す |
 | `VanillaChunkGenerationOracle` / `test_chunk_generation_parity.py` | **BORROW_CONCEPT** | 保存後の world ではなく、同じ生成段階の block state・biome・block entity・scheduled tick・postprocessing を比較する。いまの保存 world 固定具の stage 混同を減らす方向 |
 | `parity.py` / `parity_shim.py` | **BORROW_CONCEPT** | oracle 結果と依存ファイルのハッシュを結びつけ、Rust だけ変わったとき Java の再実行を省く。ただし mc-spine にはまだ導入しない |
 | `structure/template.rs` / `structure/processor.rs` | **REFERENCE_ONLY（当面）** | `fossil` の前提になる NBT template、palette、座標変換、processor の設計候補。単一 feature のコピーでは足りない |
@@ -84,6 +95,8 @@ cargo test --release --offline --locked -j 1 pinned_ -- --nocapture
 
 これは **biome の入力データと読み込みの修復**であり、全座標の vanilla biome 一致ではない。
 RTree の tie/search cache、気候ノイズの精度、surface、aquifer は別の比較対象。
-`surface_rule`、biome `carvers`、`weird_scaled_sampler`、aquifer 意味論はまだ WIP で、
+この気候 slice の後、[surface-loader](../surface-loader/README.md) で inline `surface_rule`、
+`Name` / `Properties`、biome temperature 条件を既存評価器へ接続した。
+**surface の全座標評価、biome `carvers`、`weird_scaled_sampler`、aquifer 意味論は未完**で、
 世界の fixture 受け入れ・全ゲート緑・canonical への統合は主張しない。
-次は surface の方言を閉じ、1.21.1 実クラスを呼ぶ小さな noise/aquifer oracle を使って残差を分ける。
+次は 1.21.1 実クラスを呼ぶ noise/aquifer oracle と同じ生成段階の比較で残差を分ける。

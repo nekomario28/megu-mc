@@ -1,0 +1,19 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 33.16s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+
+thread 'worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate' (3075704) panicked at src/worldgen.rs:3796:35:
+inline surface_rule did not resolve
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate ... FAILED
+
+failures:
+
+failures:
+    worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 206 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--bin mc-spine`

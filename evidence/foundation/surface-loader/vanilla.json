@@ -1,0 +1,1313 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "decoded": true
+      },
+      "id": "surface-000",
+      "op": "surface_rule"
+    },
+    {
+      "expected": {
+        "state_id": 0
+      },
+      "id": "surface-001",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:air"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 79
+      },
+      "id": "surface-002",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:bedrock"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 22316
+      },
+      "id": "surface-003",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:calcite"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 11
+      },
+      "id": "surface-004",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:coarse_dirt"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 24904
+      },
+      "id": "surface-005",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:deepslate",
+        "Properties": {
+          "axis": "x"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 24905
+      },
+      "id": "surface-006",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:deepslate",
+        "Properties": {
+          "axis": "y"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 24906
+      },
+      "id": "surface-007",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:deepslate",
+        "Properties": {
+          "axis": "z"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 10
+      },
+      "id": "surface-008",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:dirt"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 9
+      },
+      "id": "surface-009",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:grass_block",
+        "Properties": {
+          "snowy": "false"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 8
+      },
+      "id": "surface-010",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:grass_block",
+        "Properties": {
+          "snowy": "true"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 118
+      },
+      "id": "surface-011",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:gravel"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 5780
+      },
+      "id": "surface-012",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:ice"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 24903
+      },
+      "id": "surface-013",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:mud"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 7270
+      },
+      "id": "surface-014",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:mycelium",
+        "Properties": {
+          "snowy": "false"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 9357
+      },
+      "id": "surface-015",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:orange_terracotta"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 10746
+      },
+      "id": "surface-016",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:packed_ice"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 13
+      },
+      "id": "surface-017",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:podzol",
+        "Properties": {
+          "snowy": "false"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 22318
+      },
+      "id": "surface-018",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:powder_snow"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 117
+      },
+      "id": "surface-019",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:red_sand"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 11079
+      },
+      "id": "surface-020",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:red_sandstone"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 112
+      },
+      "id": "surface-021",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:sand"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 535
+      },
+      "id": "surface-022",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:sandstone"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 5781
+      },
+      "id": "surface-023",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:snow_block"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 1
+      },
+      "id": "surface-024",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:stone"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 10744
+      },
+      "id": "surface-025",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:terracotta"
+      }
+    },
+    {
+      "expected": {
+        "state_id": 80
+      },
+      "id": "surface-026",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:water",
+        "Properties": {
+          "level": "0"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 95
+      },
+      "id": "surface-027",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:water",
+        "Properties": {
+          "level": "15"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 87
+      },
+      "id": "surface-028",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:water",
+        "Properties": {
+          "level": "7"
+        }
+      }
+    },
+    {
+      "expected": {
+        "state_id": 9356
+      },
+      "id": "surface-029",
+      "op": "state",
+      "state": {
+        "Name": "minecraft:white_terracotta"
+      }
+    },
+    {
+      "expected": {
+        "value_bits": "0"
+      },
+      "id": "surface-030",
+      "op": "simplex",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "source": "height"
+    },
+    {
+      "expected": {
+        "value_bits": "3fd2f9c26b663797"
+      },
+      "id": "surface-031",
+      "op": "simplex",
+      "pos": [
+        0.85,
+        -1.55
+      ],
+      "source": "height"
+    },
+    {
+      "expected": {
+        "value_bits": "3fe0af5021410a16"
+      },
+      "id": "surface-032",
+      "op": "simplex",
+      "pos": [
+        -6.85,
+        12.45
+      ],
+      "source": "height"
+    },
+    {
+      "expected": {
+        "value_bits": "0"
+      },
+      "id": "surface-033",
+      "op": "simplex",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "source": "frozen"
+    },
+    {
+      "expected": {
+        "value_bits": "bfdce546f0aea82c"
+      },
+      "id": "surface-034",
+      "op": "simplex",
+      "pos": [
+        0.85,
+        -1.55
+      ],
+      "source": "frozen"
+    },
+    {
+      "expected": {
+        "value_bits": "3fc12ccafd8c926c"
+      },
+      "id": "surface-035",
+      "op": "simplex",
+      "pos": [
+        -6.85,
+        12.45
+      ],
+      "source": "frozen"
+    },
+    {
+      "expected": {
+        "value_bits": "0"
+      },
+      "id": "surface-036",
+      "op": "simplex",
+      "pos": [
+        0.0,
+        0.0
+      ],
+      "source": "info"
+    },
+    {
+      "expected": {
+        "value_bits": "bfc32fc7c373e167"
+      },
+      "id": "surface-037",
+      "op": "simplex",
+      "pos": [
+        0.85,
+        -1.55
+      ],
+      "source": "info"
+    },
+    {
+      "expected": {
+        "value_bits": "bfd140335e69c358"
+      },
+      "id": "surface-038",
+      "op": "simplex",
+      "pos": [
+        -6.85,
+        12.45
+      ],
+      "source": "info"
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 0
+      },
+      "frozen": false,
+      "id": "surface-039",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 0
+      },
+      "frozen": false,
+      "id": "surface-040",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": -1163667702
+      },
+      "frozen": false,
+      "id": "surface-041",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": -1112025754
+      },
+      "frozen": false,
+      "id": "surface-042",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": -1097022394
+      },
+      "frozen": false,
+      "id": "surface-043",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 0
+      },
+      "frozen": false,
+      "id": "surface-044",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": -1163667702
+      },
+      "frozen": false,
+      "id": "surface-045",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1041865114
+      },
+      "frozen": false,
+      "id": "surface-046",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1041865114
+      },
+      "frozen": false,
+      "id": "surface-047",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1041781228
+      },
+      "frozen": false,
+      "id": "surface-048",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1031191452
+      },
+      "frozen": false,
+      "id": "surface-049",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": true,
+        "temperature_bits": -1105203470
+      },
+      "frozen": false,
+      "id": "surface-050",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1041865114
+      },
+      "frozen": false,
+      "id": "surface-051",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1041781228
+      },
+      "frozen": false,
+      "id": "surface-052",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1056964608
+      },
+      "frozen": false,
+      "id": "surface-053",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1056964608
+      },
+      "frozen": false,
+      "id": "surface-054",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1056922665
+      },
+      "frozen": false,
+      "id": "surface-055",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1053952678
+      },
+      "frozen": false,
+      "id": "surface-056",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1044805492
+      },
+      "frozen": false,
+      "id": "surface-057",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1056964608
+      },
+      "frozen": false,
+      "id": "surface-058",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1056922665
+      },
+      "frozen": false,
+      "id": "surface-059",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1073741824
+      },
+      "frozen": false,
+      "id": "surface-060",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1073741824
+      },
+      "frozen": false,
+      "id": "surface-061",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1073731338
+      },
+      "frozen": false,
+      "id": "surface-062",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1072988842
+      },
+      "frozen": false,
+      "id": "surface-063",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1071173358
+      },
+      "frozen": false,
+      "id": "surface-064",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1073741824
+      },
+      "frozen": false,
+      "id": "surface-065",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1073731338
+      },
+      "frozen": false,
+      "id": "surface-066",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-067",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-068",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-069",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1038206004
+      },
+      "frozen": true,
+      "id": "surface-070",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": -1097022394
+      },
+      "frozen": true,
+      "id": "surface-071",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 0
+      },
+      "frozen": true,
+      "id": "surface-072",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 0.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-073",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-074",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-075",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-076",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1038206004
+      },
+      "frozen": true,
+      "id": "surface-077",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": true,
+        "temperature_bits": -1105203470
+      },
+      "frozen": true,
+      "id": "surface-078",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1041865114
+      },
+      "frozen": true,
+      "id": "surface-079",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 0.15,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-080",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-081",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-082",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-083",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1038206004
+      },
+      "frozen": true,
+      "id": "surface-084",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1044805492
+      },
+      "frozen": true,
+      "id": "surface-085",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1056964608
+      },
+      "frozen": true,
+      "id": "surface-086",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 0.5,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-087",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-088",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045220557
+      },
+      "frozen": true,
+      "id": "surface-089",
+      "op": "temperature",
+      "pos": [
+        0,
+        80,
+        0
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-090",
+      "op": "temperature",
+      "pos": [
+        0,
+        81,
+        0
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1038206004
+      },
+      "frozen": true,
+      "id": "surface-091",
+      "op": "temperature",
+      "pos": [
+        17,
+        150,
+        -31
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1071173358
+      },
+      "frozen": true,
+      "id": "surface-092",
+      "op": "temperature",
+      "pos": [
+        -137,
+        320,
+        249
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1073741824
+      },
+      "frozen": true,
+      "id": "surface-093",
+      "op": "temperature",
+      "pos": [
+        12345,
+        64,
+        -98765
+      ]
+    },
+    {
+      "base_temperature": 2.0,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1045136671
+      },
+      "frozen": true,
+      "id": "surface-094",
+      "op": "temperature",
+      "pos": [
+        30000000,
+        81,
+        -30000000
+      ]
+    },
+    {
+      "base_temperature": 0.14999998,
+      "expected": {
+        "cold": true,
+        "temperature_bits": 1041865112
+      },
+      "frozen": false,
+      "id": "surface-095",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    },
+    {
+      "base_temperature": 0.15000002,
+      "expected": {
+        "cold": false,
+        "temperature_bits": 1041865115
+      },
+      "frozen": false,
+      "id": "surface-096",
+      "op": "temperature",
+      "pos": [
+        0,
+        64,
+        0
+      ]
+    }
+  ],
+  "minecraft": "1.21.1",
+  "oracle_sha256": "cdce9c83d577df626749af3c2e70351340df7f946389d385dde595a151d890a1",
+  "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
+  "settings_sha256": "6a6e1ddfbbbd85c3d8cb0a06a1b6f348185bb3717d3404d0089f7b42440688b4"
+}

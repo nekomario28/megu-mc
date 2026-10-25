@@ -38,6 +38,7 @@ graph = d.ModuleGraph(
         ("generation_context", "worldgen"), ("generation_context", "block_registry"),
         ("block_registry", "json"),
         ("worldgen", "json"), ("worldgen", "generation_math"),
+        ("worldgen", "block_registry"),
     ],
     roots=["main"],
     layers=layers,

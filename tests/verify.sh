@@ -15,6 +15,7 @@ python3 tests/gate_scripts.py
 python3 tests/protocol767_test.py
 python3 tests/biome_tree_test.py
 python3 tests/container_oracle_test.py
+python3 tests/surface_oracle_test.py
 
 echo "== module layering"
 python3 tests/layers_gate_test.py

@@ -1,0 +1,23 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 33.31s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 3 tests
+test worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate ... ok
+test worldgen::wg_tests::pinned_surface_block_states_match_the_native_codec ... ok
+
+thread 'worldgen::wg_tests::pinned_surface_temperature_matches_the_native_biome' (3086417) panicked at src/worldgen.rs:3983:13:
+assertion `left == right` failed: surface-061
+  left: 3182941542
+ right: 1038206004
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test worldgen::wg_tests::pinned_surface_temperature_matches_the_native_biome ... FAILED
+
+failures:
+
+failures:
+    worldgen::wg_tests::pinned_surface_temperature_matches_the_native_biome
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 207 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `--bin mc-spine`

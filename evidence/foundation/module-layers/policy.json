@@ -24,7 +24,7 @@
     ["tree", "block_registry"], ["tree", "generation_providers"], ["tree", "generation_context"],
     ["generation_providers", "block_registry"], ["generation_providers", "generation_context"],
     ["generation_context", "worldgen"], ["generation_context", "block_registry"],
-    ["block_registry", "json"],
+    ["block_registry", "json"], ["worldgen", "block_registry"],
     ["java_compat", "landing_types"], ["landing", "java_compat"], ["landing", "landing_types"],
     ["landing", "world_rng"],
     ["feature", "json"], ["tree", "json"], ["worldgen", "json"], ["generation_providers", "json"],

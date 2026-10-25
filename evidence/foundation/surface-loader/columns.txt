@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 2 tests
+test worldgen::wg_tests::material_rules_load ... surface_rule=Some(286) conds=141 rules=287 mats_loaded
+cols_with_mats=256 kinds={1: 2794, 65535: 27261, 24905: 3559, 9: 256}
+ok
+test worldgen::wg_tests::material_rules_real_ids ... real-id kinds={65535: 27264, 24905: 4502, 118: 256, 79: 1848}
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out; finished in 0.13s

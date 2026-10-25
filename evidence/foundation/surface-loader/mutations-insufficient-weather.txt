@@ -1,0 +1,7 @@
+
+ok    the pinned inline surface rule is actually installed
+ok    surface block states retain their properties
+ok    the surface temperature condition uses biome weather
+FAIL  the frozen-temperature simplex stack keeps octave zero at its own index
+      'pinned_surface_temperature_matches_the_native_biome' stayed green with the implementation broken. That test is not a gate.
+ok    simplex frequency starts at the highest octave, not the layer count

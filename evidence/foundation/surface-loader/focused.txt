@@ -1,0 +1,45 @@
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 3 tests
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] no aquifer function "exclusion" in aquifers or noise_router
+[load] no aquifer function "exclusion" in aquifers or noise_router
+test worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate ... ok
+test worldgen::wg_tests::pinned_surface_block_states_match_the_native_codec ... ok
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] no aquifer function "exclusion" in aquifers or noise_router
+test worldgen::wg_tests::pinned_surface_temperature_matches_the_native_biome ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 207 filtered out; finished in 0.10s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] unknown density function type "weird_scaled_sampler" -> zero
+[load] no aquifer function "exclusion" in aquifers or noise_router
+[load] surface rule did not parse: Obj([("type", Str("minecraft:block"))])
+[load] surface rule did not parse: Obj([("type", Str("minecraft:sequence")), ("sequence", Arr([Obj([("type", Str("minecraft:block")), ("result_state", Str("minecraft:dirt"))]), Obj([("type", Str("minecraft:block"))])]))])
+[load] unknown surface rule type "unknown_rule"
+[load] surface rule did not parse: Obj([("type", Str("minecraft:unknown_rule"))])
+[load] surface rule did not parse: Obj([("type", Str("minecraft:sequence")), ("sequence", Arr([Obj([("type", Str("minecraft:block")), ("result_state", Str("minecraft:dirt"))]), Obj([("type", Str("minecraft:unknown_rule"))])]))])
+[load] surface rule reference "minecraft:missing_rule": missing or invalid JSON
+[load] surface rule did not parse: Obj([("type", Str("minecraft:sequence")), ("sequence", Arr([Obj([("type", Str("minecraft:block")), ("result_state", Str("minecraft:dirt"))]), Str("minecraft:missing_rule")]))])
+[load] unknown surface condition type "unknown_condition"
+[load] surface rule did not parse: Obj([("type", Str("minecraft:condition")), ("if_true", Obj([("type", Str("minecraft:unknown_condition"))])), ("then_run", Obj([("type", Str("minecraft:block")), ("result_state", Str("minecraft:stone"))]))])
+[load] surface rule did not parse: Obj([("type", Str("minecraft:sequence")), ("sequence", Arr([Obj([("type", Str("minecraft:block")), ("result_state", Str("minecraft:dirt"))]), Obj([("type", Str("minecraft:condition")), ("if_true", Obj([("type", Str("minecraft:unknown_condition"))])), ("then_run", Obj([("type", Str("minecraft:block")), ("result_state", Str("minecraft:stone"))]))])]))])
+[load] surface rule reference "minecraft:bad_named_rule": did not parse
+[load] surface rule reference "minecraft:bad_named_rule": did not parse
+test worldgen::wg_tests::surface_sequence_rejects_a_child_that_did_not_parse ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 209 filtered out; finished in 0.08s

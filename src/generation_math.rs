@@ -1073,7 +1073,7 @@ impl Simp {
 // vanilla OctaveSimplexNoiseSampler over octave indices (can be negative)
 pub(crate) struct OSimp {
     layers: Vec<Option<Simp>>,
-    k: i32,
+    highest_octave: i32,
 }
 impl OSimp {
     pub(crate) fn new_l(r: &mut Lcg, octaves: &[i32]) -> Self {
@@ -1085,7 +1085,7 @@ impl OSimp {
             _ => {
                 return OSimp {
                     layers: Vec::new(),
-                    k: 0,
+                    highest_octave: 0,
                 }
             }
         };
@@ -1096,8 +1096,9 @@ impl OSimp {
             layers.push(None);
         }
         let (s0, xo, yo, zo) = Simp::new_l(r);
-        let zi = -first;
-        // octave 0 (index zi=-first) uses s0
+        // PerlinSimplexNoise stores octave zero at the highest-octave index,
+        // not at -first: those differ for the frozen-temperature stack [-2,-1,0].
+        let zi = j;
         if zi >= 0 && (zi as usize) < layers.len() && oc.contains(&0) {
             layers[zi as usize] = Some(s0.clone());
         }
@@ -1125,12 +1126,15 @@ impl OSimp {
                 }
             }
         }
-        OSimp { layers, k }
+        OSimp {
+            layers,
+            highest_octave: j,
+        }
     }
     pub(crate) fn sample(&self, x: f64, y: f64) -> f64 {
         let mut d = 0.0;
-        let mut e = 2.0f64.powi(self.k - 1);
-        let mut f = 1.0 / (2.0f64.powi(self.k) - 1.0);
+        let mut e = 2.0f64.powi(self.highest_octave);
+        let mut f = 1.0 / (2.0f64.powi(self.layers.len() as i32) - 1.0);
         for l in self.layers.iter() {
             if let Some(s) = l {
                 d += s.get2(x * e, y * e) * f;

@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use crate::block_registry::{breg, bs_parts};
 use crate::json::{jbool, jparse, J};
 
 use crate::generation_math::*;
@@ -144,6 +145,7 @@ enum Cond {
         sd: bool,
     },
     Steep,
+    Temperature,
     Not(usize),
     Hole,
     Prelim,
@@ -153,6 +155,64 @@ enum Cond {
         sec: i32,
         ceil: bool,
     },
+}
+
+// Adapted from Horizon's worldgen/biome_temperature.rs (0564ab0), but 1.21.1
+// fixes the altitude boundary at 80, not the newer sea_level + 17. Keep its
+// PerlinSimplex intermediates in f64 and narrow only where Biome's bytecode does.
+#[derive(Clone, Copy)]
+struct BiomeWeather {
+    temperature: f32,
+    frozen: bool,
+}
+impl BiomeWeather {
+    fn parse(j: &J) -> Option<Self> {
+        let J::Num(temperature) = j.get("temperature")? else {
+            return None;
+        };
+        let frozen = match j.get("temperature_modifier") {
+            None => false,
+            Some(J::Str(s)) if s == "none" => false,
+            Some(J::Str(s)) if s == "frozen" => true,
+            _ => return None,
+        };
+        Some(Self {
+            temperature: *temperature as f32,
+            frozen,
+        })
+    }
+
+    fn at(self, x: i32, y: i32, z: i32) -> f32 {
+        static NOISES: std::sync::OnceLock<(OSimp, OSimp, OSimp)> = std::sync::OnceLock::new();
+        let mut base = self.temperature;
+        if self.frozen || y > 80 {
+            let (height, frozen, info) = NOISES.get_or_init(|| {
+                (
+                    OSimp::new_l(&mut Lcg::new(1234), &[0]),
+                    OSimp::new_l(&mut Lcg::new(3456), &[-2, -1, 0]),
+                    OSimp::new_l(&mut Lcg::new(2345), &[0]),
+                )
+            });
+            let (dx, dz) = (x as f64, z as f64);
+            if self.frozen
+                && frozen.sample(dx * 0.05, dz * 0.05) * 7.0 + info.sample(dx * 0.2, dz * 0.2) < 0.3
+                && info.sample(dx * 0.09, dz * 0.09) < 0.8
+            {
+                base = 0.2;
+            }
+            if y > 80 {
+                let variation =
+                    (height.sample((x as f32 / 8.0) as f64, (z as f32 / 8.0) as f64) * 8.0) as f32;
+                base -= (variation + y as f32 - 80.0) * 0.05 / 40.0;
+            }
+        }
+        base
+    }
+
+    fn cold(self, x: i32, y: i32, z: i32) -> bool {
+        let warm = self.at(x, y, z) >= 0.15;
+        !warm
+    }
 }
 
 enum Rule {
@@ -262,6 +322,7 @@ pub struct Gen {
     btree: Option<BT>,
     leaf_ps: Vec<[[i32; 2]; 7]>,
     biome_names: Vec<String>,
+    biome_weather: Vec<BiomeWeather>,
     pub sea: i32,
     pub min_y: i32,
     pub height: i32,
@@ -455,6 +516,7 @@ impl Gen {
             btree: None,
             leaf_ps: Vec::new(),
             biome_names: Vec::new(),
+            biome_weather: Vec::new(),
             sea: 63,
             min_y: -64,
             height: 384,
@@ -639,6 +701,20 @@ impl Gen {
                 ));
             }
         }
+        // SurfaceRules.Temperature reads biome weather, not the noise-router
+        // temperature coordinate. Bind the settings to the same leaf identities.
+        let biome_files = Self::dp_files("biome");
+        for name in &g.biome_names {
+            let Some(weather) = biome_files
+                .get(name)
+                .and_then(|b| jparse(b))
+                .and_then(|j| BiomeWeather::parse(&j))
+            else {
+                Self::load_trace(&format!("biome weather did not parse: {name}"));
+                return None;
+            };
+            g.biome_weather.push(weather);
+        }
         // vanilla surface rules (material_rule) — needs biome tree loaded first
         // (biome conditions resolve to leaf ids).
         {
@@ -648,17 +724,8 @@ impl Gen {
             g.sec_ni = g.noise_id("minecraft:surface_secondary");
             g.band_off_ni = g.noise_id("minecraft:clay_bands_offset");
             g.ore_split = Some(g.factory.of_str("minecraft:ore").splitter());
-            // 1.21.1 = `{"Name": "minecraft:stone"}`, the newer dialect = a bare name.
-            let block_of = |v: Option<&J>| -> Option<u32> {
-                let v = v?;
-                res(if v.str().is_empty() {
-                    v.get("Name").map(|n| n.str()).unwrap_or("")
-                } else {
-                    v.str()
-                })
-            };
-            g.def_st = block_of(ns.get("default_block")).unwrap_or(1);
-            g.def_fl = block_of(ns.get("default_fluid")).unwrap_or(0);
+            g.def_st = Self::block_state(ns.get("default_block")?, res)?;
+            g.def_fl = Self::block_state(ns.get("default_fluid")?, res)?;
             g.bands = create_bands(&mut g.factory.of_str("minecraft:clay_bands"), res);
             // The aquifer's `minEst` column comes from `aquifers.surface_level`
             // (`minecraft:overworld/preliminary_surface_level`, the raw
@@ -675,8 +742,12 @@ impl Gen {
             {
                 g.prelim_df = g.resolve_ref(&files, &aq);
             }
-            if let Some(mr) = ns.get("material_rule").map(|v| v.str().to_string()) {
-                g.surface_rule = g.resolve_rule(&mr, &files, &rfiles, &cfiles, res);
+            if let Some(rule) = ns.get("surface_rule").or_else(|| ns.get("material_rule")) {
+                g.surface_rule = g.rule_node(rule, &files, &rfiles, &cfiles, res);
+                if g.surface_rule.is_none() {
+                    Self::load_trace("noise_settings surface_rule/material_rule did not resolve");
+                    return None;
+                }
             }
         }
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
@@ -732,6 +803,23 @@ impl Gen {
 
     // ---- material rule parsing ----
 
+    fn block_state(j: &J, res: fn(&str) -> Option<u32>) -> Option<u32> {
+        let Some((name, props)) = bs_parts(j) else {
+            Self::load_trace(&format!("invalid surface block state {j:?}"));
+            return None;
+        };
+        let Some(default) = res(&name) else {
+            Self::load_trace(&format!("unknown surface block {name:?}"));
+            return None;
+        };
+        // Keep state/property decoding with the registry, rather than a second
+        // surface-only list of state offsets. The callback still resolves names.
+        match props {
+            Some(props) => Some(breg()?.state_of(&name, Some(props))),
+            None => Some(default),
+        }
+    }
+
     fn resolve_rule(
         &mut self,
         name: &str,
@@ -743,12 +831,20 @@ impl Gen {
         if let Some(&i) = self.rule_ids.get(name) {
             return Some(i);
         }
-        let b = rf.get(name)?;
-        let j = jparse(b)?;
+        let Some(j) = rf.get(name).and_then(|b| jparse(b)) else {
+            Self::load_trace(&format!(
+                "surface rule reference {name:?}: missing or invalid JSON"
+            ));
+            return None;
+        };
         let idx = self.rules.len();
         self.rule_ids.insert(name.to_string(), idx);
         self.rules.push(Rule::Block(0)); // placeholder for recursion
-        let r = self.parse_rule(&j, files, rf, cf, res)?;
+        let Some(r) = self.parse_rule(&j, files, rf, cf, res) else {
+            self.rule_ids.remove(name);
+            Self::load_trace(&format!("surface rule reference {name:?}: did not parse"));
+            return None;
+        };
         self.rules[idx] = r;
         Some(idx)
     }
@@ -764,7 +860,10 @@ impl Gen {
         match j {
             J::Str(s) => self.resolve_rule(s, files, rf, cf, res),
             J::Obj(_) => {
-                let r = self.parse_rule(j, files, rf, cf, res)?;
+                let Some(r) = self.parse_rule(j, files, rf, cf, res) else {
+                    Self::load_trace(&format!("surface rule did not parse: {j:?}"));
+                    return None;
+                };
                 self.rules.push(r);
                 Some(self.rules.len() - 1)
             }
@@ -786,21 +885,21 @@ impl Gen {
                 j.get("sequence")?
                     .as_arr()?
                     .iter()
-                    .filter_map(|c| self.rule_node(c, files, rf, cf, res))
-                    .collect(),
+                    .map(|c| self.rule_node(c, files, rf, cf, res))
+                    .collect::<Option<_>>()?,
             ),
             "condition" => Rule::Cond(
                 self.cond_node(j.get("if_true")?, cf)?,
                 self.rule_node(j.get("then_run")?, files, rf, cf, res)?,
             ),
-            "block" => Rule::Block(res(j.get("result_state")?.str()).unwrap_or(self.def_st)),
+            "block" => Rule::Block(Self::block_state(j.get("result_state")?, res)?),
             "bandlands" => Rule::Bandlands,
             "ore_vein" => {
                 // 1.21.1 has no `material_rule`; when the 1.21.1 sampler is
                 // active (ore_veins_enabled), the 1.21.2+ rule would place a
                 // second vein on top of it.
                 if self.vein.is_some() {
-                    return None;
+                    return Some(Rule::Seq(Box::new([])));
                 }
                 let density = self.node(j.get("density")?, files)?;
                 // bounds check fast-path: density root is range_choice on minecraft:y
@@ -824,7 +923,10 @@ impl Gen {
                     ymax,
                 }
             }
-            _ => return None,
+            _ => {
+                Self::load_trace(&format!("unknown surface rule type {ty:?}"));
+                return None;
+            }
         })
     }
 
@@ -844,12 +946,22 @@ impl Gen {
         if let Some(&i) = self.cond_ids.get(name) {
             return Some(i);
         }
-        let b = cf.get(name)?;
-        let j = jparse(b)?;
+        let Some(j) = cf.get(name).and_then(|b| jparse(b)) else {
+            Self::load_trace(&format!(
+                "surface condition reference {name:?}: missing or invalid JSON"
+            ));
+            return None;
+        };
         let idx = self.conds.len();
         self.cond_ids.insert(name.to_string(), idx);
         self.conds.push(Cond::False);
-        let c = self.parse_cond(&j, cf)?;
+        let Some(c) = self.parse_cond(&j, cf) else {
+            self.cond_ids.remove(name);
+            Self::load_trace(&format!(
+                "surface condition reference {name:?}: did not parse"
+            ));
+            return None;
+        };
         self.conds[idx] = c;
         Some(idx)
     }
@@ -946,7 +1058,11 @@ impl Gen {
             "hole" => Cond::Hole,
             "above_preliminary_surface" => Cond::Prelim,
             "steep" => Cond::Steep,
-            _ => Cond::False,
+            "temperature" => Cond::Temperature,
+            _ => {
+                Self::load_trace(&format!("unknown surface condition type {ty:?}"));
+                return None;
+            }
         })
     }
 
@@ -1806,6 +1922,12 @@ impl Gen {
         let cd = self.conds[cid];
         match cd {
             Cond::False => false,
+            Cond::Temperature => {
+                let leaf = self.leaf_at(c);
+                self.biome_weather
+                    .get(leaf as usize)
+                    .is_some_and(|weather| weather.cold(c.x, c.y, c.z))
+            }
             Cond::Biome(mask) => {
                 let l = self.leaf_at(c);
                 l != u16::MAX && l < 64 && (mask >> l) & 1 == 1
@@ -3788,6 +3910,180 @@ mod wg_tests {
             unknown.is_empty(),
             "biome tree contains foreign biomes: {unknown:?}"
         );
+    }
+
+    #[test]
+    fn pinned_surface_rule_places_bedrock_and_deepslate() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack must load");
+        let root = g.surface_rule.expect("inline surface_rule did not resolve");
+        let surface = [64; 256];
+        for (y, expected) in [(-64, "minecraft:bedrock"), (-8, "minecraft:deepslate")] {
+            let mut c = SC::new();
+            c.y = y;
+            c.est_min = i32::MAX;
+            c.sda = 32000;
+            c.sdb = 32000;
+            assert_eq!(
+                g.eval_rule(root, &mut c, &surface),
+                crate::name_to_state(expected),
+                "pinned surface rule at y={y}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_surface_block_states_match_the_native_codec() {
+        let fixture = jparse(include_bytes!(
+            "../evidence/foundation/surface-loader/vanilla.json"
+        ))
+        .expect("surface reference JSON");
+        assert_eq!(fixture.get("minecraft").unwrap().str(), "1.21.1");
+        assert_eq!(
+            fixture.get("server_sha1").unwrap().str(),
+            "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+        );
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
+        let empty = HashMap::new();
+        let mut checked = 0;
+        let mut ids = HashSet::new();
+        for row in fixture.get("cases").unwrap().as_arr().unwrap() {
+            assert!(ids.insert(row.get("id").unwrap().str()));
+            if row.get("op").unwrap().str() != "state" {
+                continue;
+            }
+            let state = row.get("state").unwrap();
+            let rule = J::Obj(vec![
+                ("type".into(), J::Str("minecraft:block".into())),
+                ("result_state".into(), state.clone()),
+            ]);
+            let Some(Rule::Block(actual)) =
+                g.parse_rule(&rule, &empty, &empty, &empty, crate::name_to_state)
+            else {
+                panic!(
+                    "native state did not decode: {}",
+                    row.get("id").unwrap().str()
+                );
+            };
+            let expected = row.get("expected").unwrap().get("state_id").unwrap().num() as u32;
+            assert_eq!(actual, expected, "{}", row.get("id").unwrap().str());
+            // The retained converted dialect must still use the same registry.
+            let (name, props) = bs_parts(state).unwrap();
+            let mut converted = vec![("id".into(), J::Str(name))];
+            if let Some(props) = props {
+                converted.push(("properties".into(), props.clone()));
+            }
+            assert_eq!(
+                Gen::block_state(&J::Obj(converted), crate::name_to_state),
+                Some(expected)
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no native state cases compared");
+    }
+
+    #[test]
+    fn pinned_surface_temperature_matches_the_native_biome() {
+        let fixture = jparse(include_bytes!(
+            "../evidence/foundation/surface-loader/vanilla.json"
+        ))
+        .expect("surface reference JSON");
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
+        let empty = HashMap::new();
+        let condition = jparse(br#"{"type":"minecraft:temperature"}"#).unwrap();
+        let cid = g
+            .cond_node(&condition, &empty)
+            .expect("temperature condition");
+        let mut checked = 0;
+        let mut cold = 0;
+        let mut nonzero_noise = 0;
+        for row in fixture.get("cases").unwrap().as_arr().unwrap() {
+            if row.get("op").unwrap().str() == "simplex" {
+                let (seed, octaves): (u64, &[i32]) = match row.get("source").unwrap().str() {
+                    "height" => (1234, &[0]),
+                    "frozen" => (3456, &[-2, -1, 0]),
+                    "info" => (2345, &[0]),
+                    other => panic!("unknown native Biome noise field {other}"),
+                };
+                let pos = row.get("pos").unwrap().as_arr().unwrap();
+                let noise = OSimp::new_l(&mut Lcg::new(seed), octaves);
+                let actual = noise.sample(pos[0].num(), pos[1].num());
+                let bits = row
+                    .get("expected")
+                    .unwrap()
+                    .get("value_bits")
+                    .unwrap()
+                    .str();
+                assert_eq!(
+                    actual.to_bits(),
+                    u64::from_str_radix(bits, 16).unwrap(),
+                    "native Biome noise: {}",
+                    row.get("id").unwrap().str()
+                );
+                nonzero_noise += usize::from(actual != 0.0);
+                continue;
+            }
+            if row.get("op").unwrap().str() != "temperature" {
+                continue;
+            }
+            let p = row.get("pos").unwrap().as_arr().unwrap();
+            let (x, y, z) = (p[0].num() as i32, p[1].num() as i32, p[2].num() as i32);
+            let weather = BiomeWeather {
+                temperature: row.get("base_temperature").unwrap().num() as f32,
+                frozen: jbool(row, "frozen", false),
+            };
+            let expected = row.get("expected").unwrap();
+            let id = row.get("id").unwrap().str();
+            assert_eq!(
+                weather.at(x, y, z).to_bits(),
+                expected.get("temperature_bits").unwrap().num() as i32 as u32,
+                "{id}"
+            );
+            let is_cold = jbool(expected, "cold", false);
+            // Exercise the actual condition dispatch, with an explicit biome
+            // leaf. This does not claim that the world biome lookup is correct.
+            g.biome_weather[0] = weather;
+            g.bioq.insert((x >> 2, y >> 2, z >> 2), 0);
+            let mut c = SC::new();
+            (c.x, c.y, c.z) = (x, y, z);
+            assert_eq!(g.test_cond(cid, &mut c, &[64; 256]), is_cold, "{id}");
+            cold += usize::from(is_cold);
+            checked += 1;
+        }
+        assert!(cold > 0 && cold < checked, "no cold/warm contrast");
+        assert!(nonzero_noise > 0, "no nonzero native noise values compared");
+    }
+
+    #[test]
+    fn surface_sequence_rejects_a_child_that_did_not_parse() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
+        let empty = HashMap::new();
+        for child in [
+            r#"{"type":"minecraft:block"}"#,
+            r#"{"type":"minecraft:unknown_rule"}"#,
+            r#""minecraft:missing_rule""#,
+            r#"{"type":"minecraft:condition","if_true":{"type":"minecraft:unknown_condition"},"then_run":{"type":"minecraft:block","result_state":"minecraft:stone"}}"#,
+        ] {
+            let rule = jparse(format!(
+                r#"{{"type":"minecraft:sequence","sequence":[{{"type":"minecraft:block","result_state":"minecraft:dirt"}},{child}]}}"#
+            ).as_bytes()).unwrap();
+            assert!(
+                g.rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
+                    .is_none(),
+                "sequence silently dropped {child}"
+            );
+        }
+        let bad_name = "minecraft:bad_named_rule";
+        let named = HashMap::from([(
+            bad_name.to_string(),
+            br#"{"type":"minecraft:block"}"#.to_vec(),
+        )]);
+        for _ in 0..2 {
+            assert!(
+                g.resolve_rule(bad_name, &empty, &named, &empty, crate::name_to_state)
+                    .is_none(),
+                "failed named rule was cached as a valid placeholder"
+            );
+        }
     }
 
     #[test]

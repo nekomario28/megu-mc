@@ -1,0 +1,8 @@
+
+ok    the pinned inline surface rule is actually installed
+ok    surface block states retain their properties
+ok    the surface temperature condition uses biome weather
+ok    the frozen-temperature simplex stack keeps octave zero at its own index
+ok    simplex frequency starts at the highest octave, not the layer count
+ok    a surface sequence cannot silently discard an undecoded child
+mutation check: 6 proved, 0 not a gate, 0 parked, 0 skipped

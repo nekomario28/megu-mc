@@ -15,6 +15,7 @@
 | `biome_tree_from_jar.py --jar <server.jar> [--output <tree.json>]` | 固定1.21.1 jar の built-in preset を実クラスに構築させ、気候 RTree を抽出。JDK必須。別jar・不完全な木・jarに無いbiomeを拒否し、成功時だけ出力を置換する。jarとexporterのhashを記録 |
 | `container_oracle.py [--jar <server.jar>] [--check <fixture> \| --output <fixture>]` | 固定1.21.1の `Slot.safeInsert` / `ChestMenu.quickMoveStack` を実行する小型oracle。既定は記録済みfixtureとの完全一致検査。別jar・空／途中の出力・参照の欠落は失敗する。検証範囲は[チェストの証拠](../evidence/gameplay/containers/README.md)を参照 |
 | `inventory_oracle.py [--jar <server.jar>] [--check <fixture> \| --output <fixture>]` | 固定1.21.1の `Inventory.add` / merge・空き検索を実行する。入力／参照の完全性はcontainerと同じ検査を使う。Playerは生成を迂回した実ServerPlayerをabilities読み出しにだけ使い、entity/worldの実行とはしない。[範囲と再現](../evidence/gameplay/inventory-pickup/README.md)を参照 |
+| `surface_oracle.py [--jar <server.jar>] [--check <fixture> \| --output <fixture>]` | 固定1.21.1の `SurfaceRules.RuleSource.CODEC` / `BlockState.CODEC` / `Biome` の温度計算を呼ぶ。既定は入力・結果・provenance全体の照合。world／surface contextの実行とは区別する。[範囲と再現](../evidence/foundation/surface-loader/README.md)を参照 |
 | `vanilla_pack_from_jar.sh [dir]` | 同じ固定jarの worldgen JSON・block tag・built-in biome tree をまとめて更新する（JDK必須） |
 | `fixture_base.sh [dir]` | 固定具の基点（`CARVER_FIXTURE_BASE`、既定 `/tmp/carverfresh`）を組む。jar を sha1 で固定し、worldgen に効く設定をここで明示する。基点が無いと固定具は空振りする |
 | `carver_fixture.sh <tag> <cave> <extra> <canyon> [n]` | carver だけを残した world を作り、port と block 単位で diff。`ctl` pack で carver を差し替え |

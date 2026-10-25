@@ -1,0 +1,17 @@
+{
+  "changed": {
+    "columns.txt": {
+      "committed_sha256": "51850d469c12e1787c25847ee7f1b0008656826d4b1c709d73a604a0d5857c8c",
+      "raw_sha256": "9380f43c65da68eacb59f6b0649e1cba40fa8586719273f5ca5ff429ebe90a6e"
+    },
+    "focused.txt": {
+      "committed_sha256": "e1f83598016e455cd6c2eac555b9716542cf41d16960b338064a94d0bfecf51d",
+      "raw_sha256": "156d738d609b0188d3e69dd95a967141901dd0f21e7ed6e87656e71d6371b3e2"
+    },
+    "suite.txt": {
+      "committed_sha256": "3215be317bc015e5a2f2128f543d555d04a3a409b2f59c1a859a89f931ddfa47",
+      "raw_sha256": "11b3c60e48c1b7c8843fc0a9f416e884257707b74d181f1e928f6c0f88a713b1"
+    }
+  },
+  "transformation": "Remove trailing whitespace on lines and extra blank lines at EOF; no result values changed. Raw logs remain at the original /tmp paths for this run."
+}
