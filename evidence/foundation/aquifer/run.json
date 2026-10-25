@@ -1,0 +1,221 @@
+{
+  "base_commit": "bc7bf5a76a326594cbe5e3ebd91a3b82b0d7efad",
+  "base_tree": "bb156c8189f5215c83a352c7c83665673c56dcbe",
+  "binary": {
+    "latest_source_mtime_ns": 1792942830196723484,
+    "mtime_ns": 1792942940156410609,
+    "note": "Built after mutation restoration; both final wire checks use this binary.",
+    "path": "target/release/mc-spine",
+    "sha256": "e6cca66decb2f940a431fdd60c199eb83cb5030498411322feca31a58d2cff7d"
+  },
+  "docs_sha256": {
+    "evidence/foundation/aquifer/README.md": "b113904fffa8dc9231cc4d8f154b01182b6d2447820acd9d82f328375c1f6bbf",
+    "specs/README.md": "16128e9698494872c56f9715f511b96d3ebc46e175debac3147150e607a30712",
+    "specs/ROADMAP.md": "429e00ae854f065c83efbb7d00d968d33d49b8b9113de734d59d8519272c0371",
+    "specs/done/aquifer-native/README.md": "78f032d0a7d57b1ab41a0af8a02b895c981c29ad616a1c10e32f172cf6cf70c9",
+    "tools/README.md": "70a9b59584e7d3b68cda1c80386df0e01283abaee3b8014c8d946160176e95cd"
+  },
+  "evidence_sha256": {
+    "admission-final.txt": "6cc9b3fa7f3bf515ff7b0bf19b51123cd398968ebc9e80a0b718cd9c703d3ffc",
+    "admission-mutations.txt": "19e983911a1bc045ef94707cd2c1bdd0e8ac5ffd283ce53cd999a09bd1e32a73",
+    "admission-native.txt": "3d54147be19aa97db036e968cd0d3f7140f568ed6d0cbe21b3d3d92cc60a6059",
+    "admission-review.txt": "ed8ab7d0ff73ed2280372523e5dc4e90fec36c3935261c16de1adf300212f1b0",
+    "build.txt": "d10bc5fc3a6474bda04301400e3124cd27a096fd43cfa5cfabf183ca0b9fdc7c",
+    "clippy.txt": "05afaca702648765e85d9ffa986e06e70320252faceaac2d76ee162b54320daa",
+    "comparison.json": "6d802fc574bfc1b34328ad8d55f5010f2bbb15d53572ac69eba1ab7472bf71e4",
+    "debt.txt": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
+    "environment.json": "1bd2baf21b9ca934b7547c4ea9cece9daca306aa8d04776871261875e90ceea5",
+    "focused.txt": "71e9336301bea184cfdac7c29acd1a2053a696fbb39edfe9c510657f02c2c58b",
+    "layers.txt": "9953c50d8143279d00c32819a9824c29b82c64787e94790e6432e8578f080616",
+    "log-normalization.json": "2159f6eb1356e588ce4e634d4c52aa8abe983728ff57c668bf0254b3b4c7f26e",
+    "mutation-attempt.txt": "7fc341a8d0b392b9367e895c71b5216b76772aa4a44ee734fdbb35448ea995b4",
+    "mutations.txt": "6fd751526334b9543197d719347f4d13277e13756df935130c157709b153c978",
+    "native-replay.txt": "737c755cf6d988e9ee3ea55062afa244345c2dcaf753701052b253aa736f75bc",
+    "oracle-record.txt": "d469dfe08e0a743a0fed5109de0b7296f2754b31e3ba44f6c58c3335bebe7eba",
+    "python.txt": "a40cf3bc026303dda6ced8322c834d8c5059c2a56433e776501ac3c7b648df0a",
+    "review-followup.txt": "1d4131eae093cc486dee8a215b1ab03c43e7d548ff5df0f3cec805a313e0630a",
+    "review.txt": "2701c18c861a3eeb46df6b862ad813c823d0e7758c46674d995de60173fb8922",
+    "source-hashes.sha256": "1f66d7441f997898dae30323dad2cf27ecf08ba0d02447c6aa640fb8e48931aa",
+    "suite.txt": "0cf340e0ee56b27cbd46d3adb063f86e6279863d49bd509e4ac3f0a8ab758f89",
+    "unit.jsonl": "5064db5ababcfe25fd8173f5844e1aa721b5c0d68ef1a8bef602969dc8bb3e3c",
+    "vanilla.json": "ea651f18d9cd053b89cc0f8dd254acc5f58ec9d50b89e81cea5a095948bae2f0",
+    "wire.txt": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921"
+  },
+  "limits": [
+    "Single seed/chunk/density set; no native deep-dark chunk; deep predicate is a synthetic wiring test.",
+    "Donor aquifer_vectors are retained regression pins, not native parity.",
+    "Float spline changes all spline consumers; old feature captures remain red.",
+    "Full tests/verify.sh, whole mutation campaign, hosted CI, push, main merge and release not run for this slice."
+  ],
+  "not_run": [
+    "full tests/verify.sh",
+    "whole mutation campaign",
+    "hosted CI",
+    "push/mirror refresh",
+    "main merge",
+    "release"
+  ],
+  "recorded_at": "2026-10-25T15:42:31.340726+00:00",
+  "reference": {
+    "cases": {
+      "density": 3136,
+      "prelim": 64,
+      "state": 150
+    },
+    "construction": "Real RegistryDataLoader/ProtoChunk/NoiseChunk/Aquifer public API; no server, world, Unsafe or constructor bypass.",
+    "datapack": "server jar data/minecraft/worldgen loaded by RegistryDataLoader",
+    "fixture_sha256": "ea651f18d9cd053b89cc0f8dd254acc5f58ec9d50b89e81cea5a095948bae2f0",
+    "inner_game_sha256": "c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a",
+    "minecraft": "1.21.1",
+    "oracle_sha256": "70a4727b0a8ccf4ebe9e1d9a53a46fc6dabb47deb7a037e06c70244299b51e91",
+    "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+  },
+  "rejected_or_superseded": {
+    "deep_fields": "first review found c[2]/c[3] (continents/erosion); corrected to c[3]/c[4] (erosion/depth), rechecked by six mutations and the follow-up review",
+    "final_2_marker": "journal row lacked invocation binding; not cited",
+    "mutation_attempt_1": "spline/negation mutations were not gates; replaced",
+    "section_alignment": "SectionPos assumption; QuartPos is native"
+  },
+  "results": {
+    "clippy_all_targets_warnings_denied": true,
+    "container_wire": "PASS",
+    "debt_over_limit": 0,
+    "focused": 3,
+    "gameplay_wire": "PASS",
+    "layers": {
+      "edges": 44,
+      "modules": 19,
+      "named_errors": 0
+    },
+    "native_replay_twice": true,
+    "selected_mutations": {
+      "not_a_gate": 0,
+      "parked": 0,
+      "proved": 6,
+      "skipped": 0,
+      "superseded_attempt": {
+        "not_a_gate": 2,
+        "proved": 3
+      }
+    },
+    "suite_compare": {
+      "added_failures": [],
+      "baseline": [
+        205,
+        23,
+        1
+      ],
+      "current": [
+        213,
+        17,
+        1
+      ],
+      "poison_error_failures": 10,
+      "removed_failures": [
+        "feature::generation_contract_tests::heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface",
+        "worldgen::wg_tests::aquifer_vectors",
+        "worldgen::wg_tests::biome_vectors",
+        "worldgen::wg_tests::bundled_carver_configs_are_the_1_21_1_shapes",
+        "worldgen::wg_tests::feat_determinism",
+        "worldgen::wg_tests::feat_populate_perf"
+      ],
+      "unchanged_failure_baseline": false
+    }
+  },
+  "scope": "One pinned chunk/seed/density set for preliminary surface and aquifer fluids; not whole migration acceptance.",
+  "source_sha256": {
+    ".github/workflows/ci.yml": "f8c2197107a070ddf58049281a06a0b679fdf068c1f9846433d9167d9215b291",
+    "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
+    "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
+    "evidence/foundation/aquifer/README.md": "b113904fffa8dc9231cc4d8f154b01182b6d2447820acd9d82f328375c1f6bbf",
+    "specs/README.md": "16128e9698494872c56f9715f511b96d3ebc46e175debac3147150e607a30712",
+    "specs/ROADMAP.md": "429e00ae854f065c83efbb7d00d968d33d49b8b9113de734d59d8519272c0371",
+    "specs/done/aquifer-native/README.md": "78f032d0a7d57b1ab41a0af8a02b895c981c29ad616a1c10e32f172cf6cf70c9",
+    "src/aquifer_native_tests.rs": "00e436230df0ff8fbdbc78e98190ca4f99f63f146c40cb5353b9b1b94eee6ced",
+    "src/block_registry.rs": "c015c38549380894521d1fb50f78db1489e0586454bb3d6378f7553c00850c25",
+    "src/cached_lookup.rs": "0c5fdc139c95dfe7c0899b1ce8de39ff643d41d260d37616fab56985afa23307",
+    "src/chunk_ack.rs": "3457cf65ae2a69d3cbf5d8669cf098e30f71875a8bfd61cce8f29a885f3c4aaf",
+    "src/command_tests.rs": "51bc18221aad76dd33aafeb7dfb2f26d97a5bb2dfd90cfe191b74f1308e6cac9",
+    "src/container_tests.rs": "364079da8463c8a39ddec67e05a10b48ea09c0579c93b5fb886c3dcbae11a940",
+    "src/craft_tests.rs": "4fc80be6a7f3d4884c11f6c7c6edbd31ddd391ac8484b768cdeee9a6f49360e3",
+    "src/effect_tests.rs": "ea8f3fc7291211ba40a4b2a3d9689387742ac10681dd3d07ca750de029bededa",
+    "src/effects.rs": "46113e8b50487c3c4087554390036a9043a207ec478133d78294874b96cf6c66",
+    "src/entity_encoding_tests.rs": "d7be67a3bb0391919753cc53758600f1dbf403d08d1bfbc1b3299635e506da77",
+    "src/fanout_tests.rs": "d7ed3e90468289f7023616f511048d3ee3d2fe693d30239b4121c9402fe69eee",
+    "src/feature.rs": "f11fc12b994d4eed27c2c0f0be44a0681886e00ffb089d7fefe2652e667c48ff",
+    "src/furnace_cache_tests.rs": "c6e1cab8ec3452e997dab6553efde373b2422d400ddf9af6c624d291b251ff42",
+    "src/generation_context.rs": "406c00c348a0e57b6f488a18c2ebf1d4850ac312b29a268bbf8ea29fbbaa28b3",
+    "src/generation_contract_tests.rs": "6dccdc72f9aa9c827ad81c194f1a593e49584644dcdae946c5809c7610ed58a3",
+    "src/generation_math.rs": "cb14cd05c84d85c891a08bfbf39fee14cec356aeabcc2ac92ecf13d9f1a51dc3",
+    "src/generation_providers.rs": "03290c8d5cd7e938a060cd2364db5e345cc389890de4c3dc6ed53a3793d2b447",
+    "src/ingress_guard.rs": "9a71fd328f01738e5f3f0506fc2972fe457677a4c7ce0b74568e8ab3ac7d0469",
+    "src/java_compat.rs": "2060cfd3a8a48e7d66415eb9324c41c409a7b47cf22e567cc9ba7a3b5b7aef3b",
+    "src/json.rs": "34c9aba426704711f47e16bc5f2e38f9d7d0895625f006a2c4b770a667b49aaa",
+    "src/landing.rs": "427b678db12c06759e62fce160580d3a3d2d3ae03dd0bf9ace9ad2c2b6a5e84c",
+    "src/landing_types.rs": "90b214871b8f0d7315009599af1ca461a1f53024a7d4590185916b9683806d82",
+    "src/light_pack_tests.rs": "8a35f69ed04fb0300fe77444ebe1ba605c4f8ab890a3f407b51de34c3ddd4ed1",
+    "src/main.rs": "9c08b5c5f07508b892f6d0f278d9ca9e19a8ef14b60f9ae9f690d3b69b2adba0",
+    "src/merge_tests.rs": "5e3120d445bd7b70ec8ecce6eaebea366a9f19cc5712a0c12b404eb7e60897b2",
+    "src/persistence_tests.rs": "286452bf218f96ffa835e72151a18186aa29259c7224aed9ee23d89fdc957d37",
+    "src/primitives_tests.rs": "3faca3437cfccf5ed3d505289202c284ca1ab256d9cb9619e425ef36e27a7978",
+    "src/registry_tests.rs": "cd931153f57a3482edf0006b15d6f8648b5bc9cd7baa421de2dec270ea26cf11",
+    "src/test_support.rs": "78bff331c339a8cd736f88fee9cfd90de318566c9b99aee033b569490e24f033",
+    "src/tick_queue.rs": "565874a920f1466b28f281a38d0415d7e202f954cf79a38e0995c37797c25618",
+    "src/tick_stats.rs": "ece168a82d6e8d33f8eff0c253470a047feba35c83eaf7a8c7ead126a6fec342",
+    "src/tick_tests.rs": "66b81bd57927fb69d4dc34396dbc8b8b0a4710771caeb64d653bf65c430a31fe",
+    "src/tree.rs": "94540bdf5a1a0d9c4e03080c77ad61e5e778488966bc9f182d3da00825254981",
+    "src/weird_sampler_tests.rs": "03fda74db84ad32ae96f9208b343cb6d607c0806e680274782a433e28edbf910",
+    "src/world_rng.rs": "b440d78b383752426b43f796718a21387c023f32081d8a903f84a0cc5303d144",
+    "src/worldgen.rs": "6e64f7b0a55e5d1f4f39c536bd6aa2719e2e0e53f5668dca9a5a1abe97856baa",
+    "tests/aquifer_oracle_test.py": "125a4f847aeeda103f549f5dd3b7f52f2dceccaf1940254d64a353d539377484",
+    "tests/verify.sh": "597777408573936ab88c8ee818edb4590a872a9513f56e08078a8431c8b5e532",
+    "tools/README.md": "70a9b59584e7d3b68cda1c80386df0e01283abaee3b8014c8d946160176e95cd",
+    "tools/aquifer-oracle/AquiferOracle.java": "70a4727b0a8ccf4ebe9e1d9a53a46fc6dabb47deb7a037e06c70244299b51e91",
+    "tools/aquifer_oracle.py": "f0c018d2be803a837a788dde9b28e2e73b46df27fbf911193623fe72056a66fb",
+    "tools/mutation_check.sh": "940996cbd63b106e741b78e8fadc0a64afb4d8887c79d017954003d7162fcaf7",
+    "tools/suite_compare.py": "b4e3d397c5437ee4926aa74221637896d071f36544e2bd55fc3cc51468ae1531",
+    "tools/weird_sampler_oracle.py": "76de8d5ec2d5ff1dff61b85f0bfb0138d7646fedc5a16c91461dc822d3416f1b"
+  },
+  "units": [
+    {
+      "accounting_message": "mc-aq-final-5.service: Consumed 1min 19.581s CPU time over 1min 18.404s wall clock time, 920.9M memory peak.",
+      "cpu_usage_nsec": 79581054000,
+      "invocation": "87cba43d97ab46a2a0b257c9e004984d",
+      "memory_peak_bytes": 965656576,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-aq-final-5.service"
+    },
+    {
+      "accounting_message": "mc-aq-mut3.service: Consumed 6min 7.480s CPU time over 6min 9.551s wall clock time, 1G memory peak, 8K memory swap peak.",
+      "cpu_usage_nsec": 367480181000,
+      "invocation": "15bf7b2ac0b04657878c9c0a884dfde4",
+      "memory_peak_bytes": 1094160384,
+      "memory_swap_peak_bytes": 8192,
+      "unit": "mc-aq-mut3.service"
+    },
+    {
+      "accounting_message": "mc-aq-record9.service: Consumed 7.771s CPU time over 7.838s wall clock time, 850.7M memory peak.",
+      "cpu_usage_nsec": 7771203000,
+      "invocation": "44ed5287362340d8b18216d315be2e3a",
+      "memory_peak_bytes": 892043264,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-aq-record9.service"
+    },
+    {
+      "accounting_message": "mc-aq-review.service: Consumed 5.270s CPU time over 7min 52.380s wall clock time, 686.4M memory peak, 60.5M memory swap peak.",
+      "cpu_usage_nsec": 5270485000,
+      "invocation": "d4f0873b946945dda1ca0315acde9274",
+      "memory_peak_bytes": 719753216,
+      "memory_swap_peak_bytes": 63451136,
+      "unit": "mc-aq-review.service"
+    },
+    {
+      "accounting_message": "mc-aq-followup.service: Consumed 2.297s CPU time over 3min 47.379s wall clock time, 169.5M memory peak.",
+      "cpu_usage_nsec": 2297828000,
+      "invocation": "a5e174d5d6d44e5aaacbc28ea7499880",
+      "memory_peak_bytes": 177811456,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-aq-followup.service"
+    }
+  ]
+}

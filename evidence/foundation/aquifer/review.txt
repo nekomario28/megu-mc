@@ -1,0 +1,37 @@
+Static review only. No project build/test/runtime checks were performed (no Cargo, Java, server, or network use).
+
+## Findings
+
+### 1. Confirmed — the deep-aquifer predicate reads the wrong climate fields
+`src/worldgen.rs:3237-3243` uses `c[2]` (continents) and `c[3]` (erosion). Vanilla uses **erosion and depth**:
+
+- `dyk$c` sets `u = router.h()` and `v = router.i()` (`/tmp/mc121x/out/dyk.java:87-88`).
+- `server.txt` maps `NoiseRouter.h()` → `erosion` and `NoiseRouter.i()` → `depth` (`/home/yuu/.cache/mc-spine-work/mc121/server.txt`, `NoiseRouter -> dze`).
+- `OverworldBiomeBuilder.isDeepDarkRegion` compares the first argument against `EROSION_DEEP_DARK_DRYNESS_THRESHOLD` (`-0.225`) and the second against `DEPTH_DEEP_DARK_DRYNESS_THRESHOLD` (`0.9`) (`/tmp/mc121x/out/dem.java:406-407`; mappings lines `69219-69290`).
+- The repository’s own prior analysis says the same: `evidence/gameplay/carvers/README.md:270-273`.
+
+`src/worldgen.rs:696-702` confirms `c[2]=continents`, `c[3]=erosion`, `c[4]=depth`. The correct predicate is therefore `c[3] < -0.225f32` and `c[4] > 0.9f32`.
+
+Triggering input: any position where `continents < -0.225` but `erosion >= -0.225`, or where `erosion > 0.9` but `depth <= 0.9` (and the converse cases). Deep-dark selection is then wrong.
+
+The f32 promotion and short-circuit order are themselves correct. The problem is purely field selection. The comment at `src/worldgen.rs:807-810` and the test name/comment at `src/aquifer_native_tests.rs:117-141` repeat the wrong mapping. The mutation checks at `tools/mutation_check.sh:825-833` mutate `c[2]`/`c[3]` directly, so they verify the implementation’s current field choice rather than the vanilla fields. The corpus contains no positive assertion that a sampled cell is deep-dark, so the wrong mapping can remain green.
+
+### 2. Confirmed code path; reachability is inference — sentinel arithmetic does not reproduce Java overflow
+`src/worldgen.rs:1978` now returns `i32::MAX` when no preliminary-surface sample is found. `src/worldgen.rs:3195` then computes `let o = n + 8;`, and `src/worldgen.rs:3249` computes `min_est + 8 - y`, both with ordinary `+`. Java uses wrapping `int` arithmetic at the same points (`/tmp/mc121x/out/dyk.java:331-332` and `:367`): `Integer.MAX_VALUE + 8` becomes a large negative value.
+
+In Rust debug/test builds, `i32::MAX + 8` panics; in the release profile it happens to wrap like Java. The behavior is therefore build-mode dependent, and the new sentinel makes it reachable. Trigger: any queried preliminary column with no value above `0.390625` (for example a custom overworld noise setting whose initial density is constant `0.0`). The pinned fixture does not exercise this: all recorded prelim levels are `40..56`, not the sentinel.
+
+`prelim_min` also uses `saturating_add` at `src/worldgen.rs:2008`, which cannot reproduce Java’s overflow for a sentinel corner. Use explicit `wrapping_add`/`wrapping_sub` (or an explicit Java-compatible fallback) if parity across build modes is intended.
+
+### 3. Confirmed — validator accepts a boolean where a density of `1.0` is expected
+`tools/aquifer_oracle.py:82` checks only `assert got[3] == want[3]`. In Python, `True == 1.0` is true, so a tampered state row with `true` where the request density is `1.0` passes `validate_fixture`. The guard test at `tests/aquifer_oracle_test.py:43` mutates state row 0, whose request density is `0.0`, so it only rejects the boolean by accident. The density-`1.0` state rows are generated at `tools/aquifer_oracle.py:40-42`; mutating one of those to `true` is not tested.
+
+The same equality trap affects the full `expected != fixture` comparison, because Python dict equality also treats `True` and `1.0` as equal. Add a strict type check such as `type(got[3]) is float` and test a density-`1.0` row.
+
+### 4. Confirmed — broken documentation link
+`tools/README.md:21` links to `evidence/foundation/aquifer/README.md`, but `evidence/foundation/aquifer/` contains only `vanilla.json`. Add the referenced README or change the link.
+
+### 5. Minor — stale comment left after removing the donor skip
+`src/worldgen.rs:3110-3112` still describes `aq_skip_above` / `skip_sampling_above_y`, but that function was removed in this diff. The comment now sits above `aq_rpos_c` and no longer describes the code below it.
+
+No claim of full world/aquifer parity, re-recorded capture, merge/push, or main acceptance was found in the scoped files.

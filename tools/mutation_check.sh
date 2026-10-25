@@ -807,6 +807,36 @@ check "weird sampler multiplies the absolute noise by rarity" \
   'self.noises[*ni].get(xd, yd, zd).abs()' \
   worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples
 
+check "aquifer preliminary surface uses the pinned threshold" \
+  src/worldgen.rs 'if self.eval(id, ax, y, az, &mut HashMap::new()) > 0.390625 {' \
+  'if self.eval(id, ax, y, az, &mut HashMap::new()) > 0.0 {' \
+  aquifer_matches_the_pinned_chunk_through_its_public_api
+
+check "aquifer preliminary surface scans quart columns" \
+  src/worldgen.rs 'let ax = (x >> 2) << 2;' \
+  'let ax = (x >> 4) << 4;' \
+  aquifer_matches_the_pinned_chunk_through_its_public_api
+
+check "aquifer spline keeps the native float interpolation order" \
+  src/worldgen.rs 'let lerp = |delta: f32, start: f32, end: f32| start + delta * (end - start);' \
+  'let lerp = |delta: f32, start: f32, end: f32| (1.0 - delta) * start + delta * end;' \
+  aquifer_matches_the_pinned_chunk_through_its_public_api
+
+check "aquifer deep test keeps the depth threshold" \
+  src/worldgen.rs '&& self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64' \
+  '&& self.eval(c[4], x, y, z, &mut memo) > -2.0' \
+  aquifer_deep_level_reads_erosion_and_depth_in_f32
+
+check "aquifer deep test reads erosion and depth" \
+  src/worldgen.rs $'self.eval(c[3], x, y, z, &mut memo) < -0.225f32 as f64\n                    && self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64' \
+  $'self.eval(c[2], x, y, z, &mut memo) < -0.225f32 as f64\n                    && self.eval(c[3], x, y, z, &mut memo) > 0.9f32 as f64' \
+  aquifer_deep_level_reads_erosion_and_depth_in_f32
+
+check "aquifer deep test promotes the f32 threshold" \
+  src/worldgen.rs '< -0.225f32 as f64' \
+  '< -0.225' \
+  aquifer_deep_level_reads_erosion_and_depth_in_f32
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

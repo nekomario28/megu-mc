@@ -18,6 +18,7 @@ python3 tests/container_oracle_test.py
 python3 tests/surface_oracle_test.py
 python3 tests/packet_angles_oracle_test.py
 python3 tests/primitives_oracle_test.py
+python3 tests/aquifer_oracle_test.py
 python3 tests/weird_sampler_oracle_test.py
 python3 tests/suite_compare_test.py
 

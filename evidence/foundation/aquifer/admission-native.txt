@@ -1,0 +1,1 @@
+GO class=light avail=9.0GB swap_used=38.3% psi_cpu=12.15 psi_mem=0.02 load1=6.07/16

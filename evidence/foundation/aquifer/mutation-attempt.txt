@@ -1,0 +1,9 @@
+
+ok    aquifer preliminary surface uses the pinned threshold
+ok    aquifer preliminary surface scans quart columns
+FAIL  aquifer spline keeps the native float interpolation order
+      'aquifer_matches_the_pinned_chunk_through_its_public_api' stayed green with the implementation broken. That test is not a gate.
+ok    aquifer deep test keeps the erosion threshold
+FAIL  aquifer deep test promotes the f32 threshold
+      'aquifer_deep_level_reads_continents_and_erosion_in_f32' stayed green with the implementation broken. That test is not a gate.
+mutation check: 3 proved, 2 not a gate, 0 parked, 0 skipped

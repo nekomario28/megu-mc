@@ -1,0 +1,43 @@
+## Scope note
+
+Audited the **working tree**, not HEAD: `git status` shows `M src/worldgen.rs`, `?? src/aquifer_native_tests.rs`, `?? tests/aquifer_oracle_test.py`, `?? tools/aquifer_oracle.py` (HEAD = `bc7bf5a`).
+The routed skill (`implementation-stack-selection`) was **not applied**: it selects languages/build systems and explicitly excludes unambiguous existing stacks; this task is a read-only verification in an established Rust tree.
+
+No builds, tests, Cargo, Java, network or agents were run. Only `read`/`grep`/`sed` plus one `python3` JSON load of the fixture for inspection. Nothing below is runtime evidence.
+
+## 1. `aq_fluid_y` deep test uses climate[3]/[4] — **SUPPORTED**
+
+- `/home/yuu/.cache/mc-spine-work/mc121/server.txt:84077-84104` — `NoiseRouter` fields are `continents -> h`, `erosion -> i`, `depth -> j`; accessors `continents() -> g`, **`erosion() -> h`**, **`depth() -> i`**, `ridges() -> j`. So `h()/i()` are erosion/depth, as claimed. (Same file `:82767-82790`: `Aquifer$NoiseBasedAquifer` has its own fields `erosion -> u`, `depth -> v`.)
+- `src/worldgen.rs:695-719` — `Gen::load` builds `climate` from the router keys in the order `temperature, vegetation, continents, erosion, depth, ridges` → `c[2]=continents, c[3]=erosion, c[4]=depth`. Independent corroboration in the same file: `climate_col` (`:3717-3719`) feeds `cl[0],cl[1],cl[2],cl[3],cl[5]` into `[temp, veg, continentalness, erosion, weirdness]`, and `target7` (`:3750`) uses `climate?[4]` as the depth value.
+- `src/worldgen.rs:3239-3245` evaluates `c[3] < -0.225f32 as f64 && c[4] > 0.9f32 as f64` at the queried position — accessor pair and short-circuit order match `OverworldBiomeBuilder.isDeepDarkRegion(erosion, depth, ctx)`.
+- `src/aquifer_native_tests.rs:129-144` — sets `c[2]=DF::C(0.5)` (continents = non-deep; deep needs `< -0.225`), `c[3]=-1.0`, `c[4]=1.0`, and the first assertion expects `AQ_MIN`. A `c[2]/c[3]` implementation would read continents `0.5 < -0.225` = false → non-deep → returns `20`, so it fails. A swapped `c[4]/c[3]` pair also fails (`1.0 < -0.225` false). The boundary rows are internally consistent: `f64::from(-0.225f32) = -0.22499999403953552` is *not* `<` the promoted threshold → `20`; `-0.224999997` *is* `< -0.22499999403953552` (but not `< -0.225`) → `AQ_MIN`, which is exactly the f32-promotion discriminator the comment claims.
+
+**Limit (not a defect, but do not overstate the evidence):** `server.txt` is a mapping/signature index here; it proves the *names*, not the constructor body that assigns `u/v` from `h()/i()`, and `OverworldBiomeBuilder` (`dem`) was not decompiled in this cache (`out/` has no `dem.java`; `tmp/sr/dem.class` only). The constants/order rest on the earlier evidence pass (`evidence/foundation/aquifer/README.md:38-45`), not re-read here.
+
+## 2. Sentinel `i32::MAX` and ±8 arithmetic — **SUPPORTED**
+
+- `prelim_est_raw` (`src/worldgen.rs:1933-1975`) initialises `found = i32::MAX` in both scan dialects and returns it when no sample exceeds `0.390625`.
+- Wrapping on the complete path: `prelim_min` `:2009` `est.wrapping_add(self.run_depth(x, z)).wrapping_sub(8)`; `aq_fluid_level_at` `:3194` `let o = n.wrapping_add(8)`; `aq_fluid_y` `:3249` `min_est.wrapping_add(8).wrapping_sub(y)`.
+- Exhaustive grep for `±8` in the path regions (`:1930-2010`, `:3180-3300`, plus `prelim_est|prelim_min|est_min|min_est` call sites) finds **no remaining plain `+8`/`-8`**; the only other `8` literals are the cache size, the `(y-…)` scan offsets, and comment text. No build-mode difference from a bare `+8/-8`.
+- The wrapped sentinel stays benign: with `run_depth` from `minecraft:surface` (`:1871-1877`, `n*2.75 + 3.0 + r*0.25`, `n` ≈ [-1,1] → 0…≈6), `MAX.wrapping_add(r).wrapping_sub(8)` lands at `MAX-8+r` for `0<r<8`, so `scan_top < est_min` at `:2342` takes the `continue` before the plain `scan_top - est_min + 1` (`:2345`) and `vals[(y - est_min)]` (`:2391`).
+
+**Residual (latent, not currently reachable):** those two plain expressions are unguarded arithmetic on the sentinel. If `run_depth` ever exceeded 8 (i.e. surface noise `n > ~1.8`), the double wrap would land `est_min` *negative*, the `scan_top < est_min` guard would no longer fire, and `:2345` would overflow (debug panic, release garbage/giant `Vec`). Java has the same wrap in the `+8` step but no equivalent downstream subtraction, so this would be a divergence by build mode if it ever occurred. With the current noise range it does not occur.
+
+## 3. Oracle strict density type / 1.0-row boolean — **SUPPORTED**
+
+- `tools/aquifer_oracle.py:78-84` (state loop): `assert len(got) == 5 and got[:3] == want[:3]` then `assert type(want[3]) is float and type(got[3]) is float` before `assert got[3] == want[3]`.
+- `tests/aquifer_oracle_test.py:41-42` picks the first `request["state"]` row whose density is `1.0` (fixture row 144 = `[116,-60,72,1.0]`, result `[116,-60,72,1.0,None]`) and sets the *result* density to `True`.
+- A `bool` is rejected: `True == 1.0` is true, so the equality alone would pass; the `type(...) is float` conjunct is the rejector (`type(True) is bool`, and `bool` is not exactly `float`). `rejected()` catches `AssertionError`, so the case fails closed. An `int` `1` would be rejected too.
+- The `0.0`-row case at test line 40 and the 1.0-row case differ only in the request value, so both exercise the same assertion.
+
+**Adjacent residual gap (not the asked case):** `validate()` never type-checks integer positions (`got[:3] == want` and `got[:3] == want[:3]` accept `True` for `1`), and result `prelim` rows are only length-checked and de-duplicated (`:73-77`) — they are not cross-checked against `request["prelim"]` columns, unlike density rows. A fixture with substituted but unique prelim coordinates would pass `validate()`/`validate_fixture()`; only the whole-fixture equality in `main()` and the Rust replay would catch it. No current test claims otherwise, so this is a coverage gap, not a false assertion.
+
+## Bottom line
+
+| Point | Verdict |
+|---|---|
+| 1. `h()/i()` = erosion/depth; `climate[3]/[4]` = erosion/depth; test kills a `c[2]/c[3]` impl | Supported (mapping + independent index usage + test trace); constructor body itself not re-read |
+| 2. `MAX` sentinel + wrapping on all ±8 on that path | Supported; no plain ±8 remains. Latent sentinel-overflow only if `run_depth > 8` |
+| 3. Bool at a 1.0-density state row rejected | Supported via `type(...) is float`; position/prelim cross-check gaps noted |
+
+No runtime checks were performed; all findings are static.

@@ -1,0 +1,8 @@
+
+ok    aquifer preliminary surface uses the pinned threshold
+ok    aquifer preliminary surface scans quart columns
+ok    aquifer spline keeps the native float interpolation order
+ok    aquifer deep test keeps the depth threshold
+ok    aquifer deep test reads erosion and depth
+ok    aquifer deep test promotes the f32 threshold
+mutation check: 6 proved, 0 not a gate, 0 parked, 0 skipped

@@ -15,12 +15,12 @@ use crate::generation_math::*;
 // ---------- density functions ----------
 
 enum SV {
-    V(f64),
+    V(f32),
     S(Box<Spl>),
 }
 struct Spl {
     coord: usize,
-    pts: Vec<(f64, SV, f64)>,
+    pts: Vec<(f32, SV, f32)>,
 }
 
 /// `dys$z$a`: the rarity mapper of a `weird_scaled_sampler`.
@@ -379,6 +379,8 @@ pub struct Gen {
     pub sea: i32,
     pub min_y: i32,
     pub height: i32,
+    // NoiseSettings.getCellHeight() = size_vertical * 4
+    noise_cell_h: i32,
     rules: Vec<Rule>,
     conds: Vec<Cond>,
     rule_ids: HashMap<String, usize>,
@@ -402,8 +404,6 @@ pub struct Gen {
     aq_lvo: Vec<(i32, i32, i32)>,
     aq_near: HashMap<(i32, i32, i32), (i32, i32, i32)>,
     aq_neo: Vec<(i32, i32, i32)>,
-    aq_skip: HashMap<(i32, i32), i32>,
-    aq_sko: Vec<(i32, i32)>,
     prelim_c: HashMap<(i32, i32), i32>,
     /// per chunk: the distinct biomes of its section palettes, i.e. what vanilla's
     /// `applyBiomeDecoration` unions over the 3x3 before deciding which features run
@@ -434,7 +434,6 @@ struct Aqd {
     flood: usize,
     spread: usize,
     lava: usize,
-    excl: usize,
     split: Split,
     water: u32,
     lava_st: u32,
@@ -573,6 +572,7 @@ impl Gen {
             sea: 63,
             min_y: -64,
             height: 384,
+            noise_cell_h: 8,
             rules: vec![],
             conds: vec![],
             rule_ids: HashMap::new(),
@@ -593,8 +593,6 @@ impl Gen {
             aq_lvo: Vec::new(),
             aq_near: HashMap::new(),
             aq_neo: Vec::new(),
-            aq_skip: HashMap::new(),
-            aq_sko: Vec::new(),
             prelim_c: HashMap::new(),
             chunk_biomes: HashMap::new(),
             chunk_biomes_ord: std::collections::VecDeque::new(),
@@ -644,6 +642,7 @@ impl Gen {
         if let Some(n) = ns.get("noise") {
             g.min_y = n.get("min_y").map(J::num).unwrap_or(-64.0) as i32;
             g.height = n.get("height").map(J::num).unwrap_or(384.0) as i32;
+            g.noise_cell_h = (n.get("size_vertical").map(J::num).unwrap_or(2.0) as i32 * 4).max(1);
         }
         let router = ns.get("noise_router");
         // 1.21.1 writes the router entries as inline density functions (the newer
@@ -780,20 +779,20 @@ impl Gen {
             g.def_st = Self::block_state(ns.get("default_block")?, res)?;
             g.def_fl = Self::block_state(ns.get("default_fluid")?, res)?;
             g.bands = create_bands(&mut g.factory.of_str("minecraft:clay_bands"), res);
-            // The aquifer's `minEst` column comes from `aquifers.surface_level`
-            // (`minecraft:overworld/preliminary_surface_level`, the raw
-            // find_top_surface with cell_height 8). The noise router also carries
-            // a `chunk_surface_level`, but that is `interpolated(cell_size_xz=16)`
-            // wrapped around the same function - a different number, and not what
-            // NoiseBasedAquifer reads. Prefer the aquifers entry; keep the router
-            // key as a fallback for datapacks that only publish that one.
-            if let Some(aq) = ns
-                .get("aquifers")
-                .and_then(|a| a.get("surface_level"))
-                .or_else(|| router.and_then(|r| r.get("chunk_surface_level")))
-                .map(|v| v.str().to_string())
-            {
-                g.prelim_df = g.resolve_ref(&files, &aq);
+            // Vanilla NoiseChunk computes the preliminary surface from
+            // `noise_router.initial_density_without_jaggedness` in code (threshold
+            // 0.390625, quart-aligned column, cell-height steps). Older converted
+            // packs carry an explicit `aquifers.surface_level` find_top_surface or a
+            // `chunk_surface_level` router entry; keep those as legacy fallbacks.
+            let prelim = router
+                .and_then(|r| r.get("initial_density_without_jaggedness"))
+                .or_else(|| ns.get("aquifers").and_then(|a| a.get("surface_level")))
+                .or_else(|| router.and_then(|r| r.get("chunk_surface_level")));
+            if let Some(j) = prelim {
+                g.prelim_df = router_df(&mut g, &files, j);
+                if g.prelim_df.is_none() {
+                    Self::load_trace("preliminary surface density did not resolve");
+                }
             }
             if let Some(rule) = ns.get("surface_rule").or_else(|| ns.get("material_rule")) {
                 g.surface_rule = g.rule_node(rule, &files, &rfiles, &cfiles, res);
@@ -806,10 +805,10 @@ impl Gen {
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
         let noaq = std::env::var("MC_SPINE_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
         // 1.21.1 has no top-level `aquifers`: the same four functions sit in
-        // `noise_router` under their own names, and there is **no `exclusion`** at all
-        // (the newer dialect added it). Read either shape, and require `exclusion` only
-        // when the dialect offers it - the aquifer is installed without one otherwise,
-        // which is 1.21.1's own configuration.
+        // `noise_router` under their own names. 1.21.1's deep-aquifer test reads
+        // `erosion` and `depth` (OverworldBiomeBuilder.isDeepDark; NoiseRouter's
+        // h()/i() accessors), not an `exclusion` node; a converted pack's
+        // `exclusion` is not applied.
         let aq = ns.get("aquifers");
         if !noaq && (aq.is_some() || router.is_some()) {
             let get = |g: &mut Gen, k: &str| -> Option<usize> {
@@ -827,24 +826,18 @@ impl Gen {
                 };
                 router_df(g, &files, j)
             };
-            let (b, f, s, l, e) = (
+            let (b, f, s, l) = (
                 get(&mut g, "barrier"),
                 get(&mut g, "fluid_level_floodedness"),
                 get(&mut g, "fluid_level_spread"),
                 get(&mut g, "lava"),
-                get(&mut g, "exclusion"),
             );
-            if let (Some(barrier), Some(flood), Some(spread), Some(lava), excl) = (b, f, s, l, e) {
-                let excl = excl.unwrap_or_else(|| {
-                    g.dfs.push(DF::C(0.0));
-                    g.dfs.len() - 1
-                });
+            if let (Some(barrier), Some(flood), Some(spread), Some(lava)) = (b, f, s, l) {
                 g.aq = Some(Aqd {
                     barrier,
                     flood,
                     spread,
                     lava,
-                    excl,
                     split: g.factory.of_str("minecraft:aquifer").splitter(),
                     water: res("minecraft:water").unwrap_or(80),
                     lava_st: res("minecraft:lava").unwrap_or(1),
@@ -1232,10 +1225,10 @@ impl Gen {
         let coord = self.node(j.get("coordinate")?, files)?;
         let mut pts = Vec::new();
         for p in j.get("points")?.as_arr()? {
-            let loc = p.get("location")?.num();
-            let der = p.get("derivative").map(J::num).unwrap_or(0.0);
+            let loc = p.get("location")?.num() as f32;
+            let der = p.get("derivative").map(J::num).unwrap_or(0.0) as f32;
             let val = match p.get("value")? {
-                J::Num(n) => SV::V(*n),
+                J::Num(n) => SV::V(*n as f32),
                 x @ J::Obj(_) => SV::S(Box::new(self.parse_spline(x, files)?)),
                 _ => return None,
             };
@@ -1618,34 +1611,35 @@ impl Gen {
         memo: &mut HashMap<(usize, i32, i32, i32), f64>,
         cc: Option<&ChunkCols>,
     ) -> f64 {
-        let loc = self.eval_c(s.coord, x, y, z, memo, cc);
+        // CubicSpline stores locations/derivatives/constants as f32 and casts
+        // the coordinate to f32; interpolation is float arithmetic (Mth.lerp).
+        let loc = self.eval_c(s.coord, x, y, z, memo, cc) as f32;
         let n = s.pts.len();
         if n == 0 {
             return 0.0;
         }
-        let mut sv = |sv: &SV| -> f64 {
+        let mut sv = |sv: &SV| -> f32 {
             match sv {
                 SV::V(v) => *v,
-                SV::S(sp) => self.eval_spline_c(sp, x, y, z, memo, cc),
+                SV::S(sp) => self.eval_spline_c(sp, x, y, z, memo, cc) as f32,
             }
         };
-        let idx = s.pts.partition_point(|p| loc >= p.0);
-        if idx == 0 {
-            let p = &s.pts[0];
-            return sv(&p.1) + p.2 * (loc - p.0);
+        let idx = s.pts.partition_point(|p| loc >= p.0) as isize - 1;
+        if idx < 0 || idx == n as isize - 1 {
+            let p = if idx < 0 { &s.pts[0] } else { &s.pts[n - 1] };
+            let v = sv(&p.1);
+            let out = if p.2 == 0.0 { v } else { v + p.2 * (loc - p.0) };
+            return out as f64;
         }
-        if idx == n {
-            let p = &s.pts[n - 1];
-            return sv(&p.1) + p.2 * (loc - p.0);
-        }
-        let (x0, v0, d0) = (&s.pts[idx - 1].0, sv(&s.pts[idx - 1].1), s.pts[idx - 1].2);
-        let (x1, v1, d1) = (&s.pts[idx].0, sv(&s.pts[idx].1), s.pts[idx].2);
+        let i = idx as usize;
+        let (x0, v0, d0) = (s.pts[i].0, sv(&s.pts[i].1), s.pts[i].2);
+        let (x1, v1, d1) = (s.pts[i + 1].0, sv(&s.pts[i + 1].1), s.pts[i + 1].2);
         let t = (loc - x0) / (x1 - x0);
-        let h00 = (1.0 + 2.0 * t) * (1.0 - t) * (1.0 - t);
-        let h10 = t * (1.0 - t) * (1.0 - t);
-        let h01 = t * t * (3.0 - 2.0 * t);
-        let h11 = t * t * (t - 1.0);
-        h00 * v0 + h10 * d0 * (x1 - x0) + h01 * v1 + h11 * d1 * (x1 - x0)
+        let dx = x1 - x0;
+        let d0t = d0 * dx - (v1 - v0);
+        let d1t = -d1 * dx + (v1 - v0);
+        let lerp = |delta: f32, start: f32, end: f32| start + delta * (end - start);
+        (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 
     fn eval0_c(
@@ -1937,6 +1931,7 @@ impl Gen {
         self.prelim_est_raw(x, z)
     }
     fn prelim_est_raw(&mut self, x: i32, z: i32) -> i32 {
+        // NoiseChunk.preliminarySurfaceLevel keys by QuartPos (x >> 2, z >> 2).
         let k = (x >> 2, z >> 2);
         if let Some(&v) = self.prelim_c.get(&k) {
             return v;
@@ -1945,15 +1940,8 @@ impl Gen {
             Some(id) => {
                 let ax = (x >> 2) << 2;
                 let az = (z >> 2) << 2;
-                // 1.21.1 computes the preliminary surface in *code*, not from the
-                // datapack's `find_top_surface` node: `ChunkNoiseSampler.a(long)`
-                // starts at `minY + height` and steps down by 8 until
-                // `initial_density_without_jaggedness` exceeds 0.390625. The
-                // newer-format JSON carries its own `upper_bound` density
-                // function, which here evaluates to ~47 - starting there returns
-                // a surface up to 270 blocks too low, and only the aquifer reads
-                // it, so terrain parity never noticed.
                 match self.dfs.get(id) {
+                    // Converted dialect only: its node carries explicit bounds.
                     Some(DF::FindTopSurface {
                         density, cell_h, ..
                     }) => {
@@ -1969,10 +1957,26 @@ impl Gen {
                         }
                         found
                     }
-                    _ => self.eval(id, ax, 0, az, &mut HashMap::new()) as i32,
+                    // 1.21.1: scan initial_density_without_jaggedness from
+                    // minY + height down to minY by the noise cell height and
+                    // take the first value above 0.390625. The column is a
+                    // QuartPos column, not a section column.
+                    _ => {
+                        let step = self.noise_cell_h.max(1);
+                        let mut y = self.min_y + self.height;
+                        let mut found = i32::MAX;
+                        while y >= self.min_y {
+                            if self.eval(id, ax, y, az, &mut HashMap::new()) > 0.390625 {
+                                found = y;
+                                break;
+                            }
+                            y -= step;
+                        }
+                        found
+                    }
                 }
             }
-            None => self.min_y,
+            None => i32::MAX,
         };
         self.prelim_c.insert(k, v);
         self.prelim_ord.push(k);
@@ -2002,7 +2006,7 @@ impl Gen {
             h11 as f64,
         )
         .floor() as i32;
-        est.saturating_add(self.run_depth(x, z)) - 8
+        est.wrapping_add(self.run_depth(x, z)).wrapping_sub(8)
     }
 
     fn test_cond(&mut self, cid: usize, c: &mut SC, surf: &[i16; 256]) -> bool {
@@ -3104,32 +3108,6 @@ impl Gen {
             gz * 16 + r.next_bound(10),
         )
     }
-    // highest y still needing full sampling: max prelim surface over the
-    // chunk region +8, snapped to a cell boundary (pumpkin skip_sampling_above_y)
-    fn aq_skip_above(&mut self, cx: i32, cz: i32) -> i32 {
-        if let Some(&v) = self.aq_skip.get(&(cx, cz)) {
-            return v;
-        }
-        let mut mx = i32::MIN;
-        let mut z = (cz - 1) * 16;
-        while z <= (cz + 1) * 16 + 9 {
-            let mut x = (cx - 1) * 16;
-            while x <= (cx + 1) * 16 + 9 {
-                mx = mx.max(self.prelim_est(x, z));
-                x += 4;
-            }
-            z += 4;
-        }
-        let adj = mx + 8;
-        let v = (ly12(adj + 12) + 1) * 12 + 11 - 1;
-        self.aq_skip.insert((cx, cz), v);
-        self.aq_sko.push((cx, cz));
-        if self.aq_sko.len() > 4096 {
-            let old = self.aq_sko.remove(0);
-            self.aq_skip.remove(&old);
-        }
-        v
-    }
     // per-cell random position, cached per cell (pumpkin packed_positions)
     fn aq_rpos_c(&mut self, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
         let key = (gx, gy, gz);
@@ -3213,7 +3191,7 @@ impl Gen {
         for (ox, oz) in AQ_OFF {
             let (xx, zz) = (rx + ox * 16, rz + oz * 16);
             let n = self.prelim_est(xx, zz);
-            let o = n + 8;
+            let o = n.wrapping_add(8);
             let center = ox == 0 && oz == 0;
             if center && k > o {
                 return def;
@@ -3255,11 +3233,20 @@ impl Gen {
         map_y: bool,
     ) -> i32 {
         let mut memo = HashMap::new();
-        let deep = self.eval(self.aq.as_ref().unwrap().excl, x, y, z, &mut memo) > 0.0;
+        // OverworldBiomeBuilder.isDeepDark: erosion < -0.225F && depth > 0.9F.
+        // NoiseRouter.h()/i() are erosion/depth accessors (the fields are named
+        // continents/erosion/depth); keep the promoted f32 literals.
+        let deep = match self.climate {
+            Some(c) => {
+                self.eval(c[3], x, y, z, &mut memo) < -0.225f32 as f64
+                    && self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64
+            }
+            None => false,
+        };
         let (d, e) = if deep {
             (-1.0, -1.0)
         } else {
-            let top = min_est + 8 - y;
+            let top = min_est.wrapping_add(8).wrapping_sub(y);
             let f = if map_y {
                 1.0 - (top as f64).clamp(0.0, 64.0) / 64.0
             } else {
@@ -3343,7 +3330,8 @@ impl Gen {
                 p / 10.0
             }
         };
-        let r = if (-2.0..=2.0).contains(&q) {
+        // Vanilla: !(q < -2.0) && !(q > 2.0), which is true for NaN.
+        let r = if q.is_nan() || (-2.0..=2.0).contains(&q) {
             match *barrier {
                 Some(v) => v,
                 None => {
@@ -3441,16 +3429,6 @@ impl Gen {
         };
         let def = g.aq_pick(y);
         let def_blk = Gen::lvl_block(def.0, def.1, y);
-        if y > g.aq_skip_above(x >> 4, z >> 4) {
-            if aq_trace_at(x, z) {
-                eprintln!("Aqd {x} {y} {z} d={density} skip {def_blk}");
-            }
-            return Some(match def_blk {
-                1 => water,
-                2 => lava,
-                _ => 0,
-            });
-        }
         if def_blk == 2 {
             if aq_trace_at(x, z) {
                 eprintln!("Aqd {x} {y} {z} d={density} lava");
@@ -4260,7 +4238,10 @@ mod wg_tests {
         let surfaced = kinds.keys().any(|&k| [9u32, 10, 112, 118].contains(&k));
         assert!(surfaced || kinds.len() <= 2, "no surface mats resolved");
     }
-    // pumpkin aquifer_sampler.rs vectors (GlobalRandomConfig seed 0, chunk 7,4)
+    // Pumpkin-derived internal-method vectors, retained as regression pins. They
+    // include coordinates a vanilla chunk-scoped aquifer never queries and a donor
+    // GlobalRandomConfig; native behaviour is pinned separately by
+    // `aquifer_matches_the_pinned_chunk_through_its_public_api`.
     const AQ_NB: &[((i32, i32, i32), i32)] = &[
         ((-100, -100, -100), -103),
         ((-100, -100, -50), -103),
@@ -6189,3 +6170,7 @@ mod bedrock_bench {
 #[cfg(test)]
 #[path = "weird_sampler_tests.rs"]
 mod weird_sampler_tests;
+
+#[cfg(test)]
+#[path = "aquifer_native_tests.rs"]
+mod aquifer_native_tests;

@@ -1,0 +1,10 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 30.15s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 3 tests
+test worldgen::aquifer_native_tests::aquifer_deep_level_reads_erosion_and_depth_in_f32 ... ok
+test worldgen::aquifer_native_tests::aquifer_matches_the_pinned_chunk_through_its_public_api ... ok
+test worldgen::wg_tests::aquifer_vectors ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 228 filtered out; finished in 0.14s
