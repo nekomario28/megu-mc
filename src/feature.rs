@@ -901,6 +901,28 @@ fn ore_should_place(
     true
 }
 
+/// Offsets of every cell in a box, x-major, then y, then z (the order the
+/// generation loops draw their random numbers in).
+fn box_offsets(
+    xs: std::ops::RangeInclusive<i32>,
+    ys: impl Iterator<Item = i32> + Clone,
+    zs: std::ops::RangeInclusive<i32>,
+) -> impl Iterator<Item = (i32, i32, i32)> {
+    xs.flat_map(move |dx| {
+        let zs = zs.clone();
+        ys.clone()
+            .flat_map(move |dy| zs.clone().map(move |dz| (dx, dy, dz)))
+    })
+}
+
+/// One ball of an ore vein: centre and radius.
+struct VeinBall {
+    x: f64,
+    y: f64,
+    z: f64,
+    radius: f64,
+}
+
 #[expect(clippy::too_many_arguments)]
 fn gen_vein(
     ctx: &mut FC,
@@ -920,50 +942,52 @@ fn gen_vein(
     discard: f32,
     targets: &[(RT, u32)],
 ) {
-    let j = size.max(1);
-    let mut ds = vec![0.0; (j * 4) as usize];
-    for k in 0..j {
-        let f = k as f32 / j as f32;
-        ds[k as usize * 4] = sx + (ex - sx) * f as f64;
-        ds[k as usize * 4 + 1] = sy + (ey - sy) * f as f64;
-        ds[k as usize * 4 + 2] = sz + (ez - sz) * f as f64;
+    // A vein is a chain of balls spaced along the segment from (sx, sy, sz) to
+    // (ex, ey, ez); every ball's radius swells toward the middle of the chain.
+    let ball_count = size.max(1) as usize;
+    let mut balls: Vec<VeinBall> = Vec::with_capacity(ball_count);
+    for idx in 0..ball_count {
+        let frac = idx as f32 / ball_count as f32;
+        let along = f64::from(frac);
         // The radius is the one place vanilla uses the table: `Mth.sin(float)` over
         // the f32 fraction, then double arithmetic around it.
-        let hh = rng.next_f64() * j as f64 / 16.0;
-        let s1 = crate::generation_math::mth_sin(std::f32::consts::PI * f) + 1.0f32;
-        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;
+        let jitter = rng.next_f64() * ball_count as f64 / 16.0;
+        let swell = crate::generation_math::mth_sin(std::f32::consts::PI * frac) + 1.0f32;
+        balls.push(VeinBall {
+            x: sx + (ex - sx) * along,
+            y: sy + (ey - sy) * along,
+            z: sz + (ez - sz) * along,
+            radius: (f64::from(swell) * jitter + 1.0) / 2.0,
+        });
     }
-    for k in 0..(j - 1) {
-        if ds[k as usize * 4 + 3] <= 0.0 {
+    // Where two balls overlap enough that the smaller sits inside the larger,
+    // the smaller one is dropped (radius marked -1). Every comparison re-reads
+    // the current radii, so a ball dropped mid-scan stays dropped for the rest.
+    for first in 0..ball_count - 1 {
+        if balls[first].radius <= 0.0 {
             continue;
         }
-        for m in (k + 1)..j {
-            if ds[m as usize * 4 + 3] <= 0.0 {
+        for second in (first + 1)..ball_count {
+            if balls[second].radius <= 0.0 {
                 continue;
             }
-            let hv = ds[k as usize * 4 + 3] - ds[m as usize * 4 + 3];
-            let dv = ds[k as usize * 4] - ds[m as usize * 4];
-            let ev = ds[k as usize * 4 + 1] - ds[m as usize * 4 + 1];
-            let gv = ds[k as usize * 4 + 2] - ds[m as usize * 4 + 2];
-            if hv * hv > dv * dv + ev * ev + gv * gv {
-                if hv > 0.0 {
-                    ds[m as usize * 4 + 3] = -1.0;
-                } else {
-                    ds[k as usize * 4 + 3] = -1.0;
-                }
+            let (a, b) = (&balls[first], &balls[second]);
+            let radius_gap = a.radius - b.radius;
+            let (gap_x, gap_y, gap_z) = (a.x - b.x, a.y - b.y, a.z - b.z);
+            if radius_gap * radius_gap > gap_x * gap_x + gap_y * gap_y + gap_z * gap_z {
+                let dropped = if radius_gap > 0.0 { second } else { first };
+                balls[dropped].radius = -1.0;
             }
         }
     }
     let bsz = (hs.max(1) * vs.max(1) * hs.max(1)) as usize;
     let mut bits = vec![false; bsz];
-    for m in 0..j {
-        let d = ds[m as usize * 4 + 3];
+    for ball in &balls {
+        let d = ball.radius;
         if d <= 0.0 {
             continue;
         }
-        let cx = ds[m as usize * 4];
-        let cy = ds[m as usize * 4 + 1];
-        let cz = ds[m as usize * 4 + 2];
+        let (cx, cy, cz) = (ball.x, ball.y, ball.z);
         let x0 = ((cx - d).floor() as i32).max(xb);
         let y0 = ((cy - d).floor() as i32).max(yb);
         let z0 = ((cz - d).floor() as i32).max(zb);
@@ -1069,17 +1093,17 @@ fn gen_ore(
     let j = pos.2 as f64 - cos_f * g as f64;
     let l = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
     let mm = pos.1 as f64 + rng.next_bound(3) as f64 - 2.0;
-    let n = pos.0 - g.ceil() as i32 - i;
-    let o = pos.1 - 2 - i;
-    let p = pos.2 - g.ceil() as i32 - i;
-    let q = 2 * (g.ceil() as i32 + i);
-    let r2 = 2 * (2 + i);
+    let reach = g.ceil() as i32 + i;
+    let (min_x, min_y, min_z) = (pos.0 - reach, pos.1 - 2 - i, pos.2 - reach);
+    let width = 2 * reach;
+    let height = 2 * (2 + i);
     let before = ctx.wr.len();
-    for xp in n..=(n + q) {
-        for zp in p..=(p + q) {
-            if o <= ctx.hm_oc(xp, zp) {
+    for xp in min_x..=(min_x + width) {
+        for zp in min_z..=(min_z + width) {
+            if min_y <= ctx.hm_oc(xp, zp) {
                 gen_vein(
-                    ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets,
+                    ctx, rng, d, e, h, j, l, mm, min_x, min_y, min_z, width, height, size, discard,
+                    targets,
                 );
                 if let Ok(spec) = std::env::var("ORE_CELL_TRACE") {
                     if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
@@ -1640,21 +1664,25 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let gidx = |x: usize, z: usize, y: usize| (x * 16 + z) * 8 + y;
             let spots = rng.next_bound(4) + 4;
             for _ in 0..spots {
-                let xr = rng.next_f64() * 6.0 + 3.0;
-                let yr = rng.next_f64() * 4.0 + 2.0;
-                let zr = rng.next_f64() * 6.0 + 3.0;
-                let xp = rng.next_f64() * (16.0 - xr - 2.0) + 1.0 + xr / 2.0;
-                let yp = rng.next_f64() * (8.0 - yr - 4.0) + 2.0 + yr / 2.0;
-                let zp = rng.next_f64() * (16.0 - zr - 2.0) + 1.0 + zr / 2.0;
-                for xx in 1..15usize {
-                    for zz in 1..15usize {
-                        for yy in 1..7usize {
-                            let xd = (xx as f64 - xp) / (xr / 2.0);
-                            let yd = (yy as f64 - yp) / (yr / 2.0);
-                            let zd = (zz as f64 - zp) / (zr / 2.0);
-                            if xd * xd + yd * yd + zd * zd < 1.0 {
-                                grid[gidx(xx, zz, yy)] = true;
-                            }
+                // Axis lengths first (x, y, z), then the blob centre on each axis,
+                // each centre kept clear of the grid edge by its own length.
+                let len_x = rng.next_f64() * 6.0 + 3.0;
+                let len_y = rng.next_f64() * 4.0 + 2.0;
+                let len_z = rng.next_f64() * 6.0 + 3.0;
+                let mid_x = rng.next_f64() * (16.0 - len_x - 2.0) + 1.0 + len_x / 2.0;
+                let mid_y = rng.next_f64() * (8.0 - len_y - 4.0) + 2.0 + len_y / 2.0;
+                let mid_z = rng.next_f64() * (16.0 - len_z - 2.0) + 1.0 + len_z / 2.0;
+                let inside = |gx: usize, gy: usize, gz: usize| {
+                    let nx = (gx as f64 - mid_x) / (len_x / 2.0);
+                    let ny = (gy as f64 - mid_y) / (len_y / 2.0);
+                    let nz = (gz as f64 - mid_z) / (len_z / 2.0);
+                    nx * nx + ny * ny + nz * nz < 1.0
+                };
+                for gx in 1..15usize {
+                    for gz in 1..15usize {
+                        let column_hits = (1..7usize).filter(|&gy| inside(gx, gy, gz));
+                        for gy in column_hits {
+                            grid[gidx(gx, gz, gy)] = true;
                         }
                     }
                 }
@@ -1884,20 +1912,16 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
                 true
             };
-            for dx in -r..=r {
-                for dy in -r..=r {
-                    for dz in -r..=r {
-                        let bp = (pos.0 + dx, y + dy, pos.2 + dz);
-                        let draw = rng.next_f32();
-                        if draw >= *prob {
-                            continue;
-                        }
-                        if !enclosed(ctx, reg, bp) {
-                            continue;
-                        }
-                        ctx.set(bp.0, bp.1, bp.2, magma);
-                    }
+            for (dx, dy, dz) in box_offsets(-r..=r, -r..=r, -r..=r) {
+                let bp = (pos.0 + dx, y + dy, pos.2 + dz);
+                let draw = rng.next_f32();
+                if draw >= *prob {
+                    continue;
                 }
+                if !enclosed(ctx, reg, bp) {
+                    continue;
+                }
+                ctx.set(bp.0, bp.1, bp.2, magma);
             }
         }
         Cf::FreezeTop => {
@@ -2129,62 +2153,56 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let zr = rng.next_bound(2) + 2;
             let (min_x, max_x) = (-xr - 1, xr + 1);
             let (min_z, max_z) = (-zr - 1, zr + 1);
+            // Survey pass: floor and ceiling must be solid everywhere, and the room
+            // needs between one and five doorways (wall cells open at both
+            // levels above the floor).
             let mut holes = 0;
-            for dx in min_x..=max_x {
-                for dy in -1..=4i32 {
-                    for dz in min_z..=max_z {
-                        let cp = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
-                        let solid = reg.is_solid(ctx.get(cp.0, cp.1, cp.2));
-                        if (dy == -1 || dy == 4) && !solid {
-                            return;
-                        }
-                        let on_wall = dx == min_x || dx == max_x || dz == min_z || dz == max_z;
-                        if on_wall
-                            && dy == 0
-                            && ctx.is_air(cp.0, cp.1, cp.2)
-                            && ctx.is_air(cp.0, cp.1 + 1, cp.2)
-                        {
-                            holes += 1;
-                        }
+            for (dx, dy, dz) in box_offsets(min_x..=max_x, -1..=4i32, min_z..=max_z) {
+                let cp = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+                let solid = reg.is_solid(ctx.get(cp.0, cp.1, cp.2));
+                if (dy == -1 || dy == 4) && !solid {
+                    return;
+                }
+                // A doorway: a wall cell at floor level with headroom above it.
+                let side_wall = dx == min_x || dx == max_x || dz == min_z || dz == max_z;
+                let doorway_row = dy == 0;
+                if doorway_row && side_wall {
+                    let open_here = ctx.is_air(cp.0, cp.1, cp.2);
+                    if open_here && ctx.is_air(cp.0, cp.1 + 1, cp.2) {
+                        holes += 1;
                     }
                 }
             }
             if !(1..=5).contains(&holes) {
                 return;
             }
-            for dx in min_x..=max_x {
-                for dy in (-1..=3i32).rev() {
-                    for dz in min_z..=max_z {
-                        let wp = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
-                        let boundary = dx == min_x
-                            || dy == -1
-                            || dz == min_z
-                            || dx == max_x
-                            || dy == 4
-                            || dz == max_z;
-                        let cur = ctx.get(wp.0, wp.1, wp.2);
-                        if boundary {
-                            let below = ctx.get(wp.0, wp.1 - 1, wp.2);
-                            if wp.1 >= ctx.g.min_y && !reg.is_solid(below) {
-                                ctx.set(wp.0, wp.1, wp.2, cave_air);
-                            } else if reg.is_solid(cur) && reg.name_of(cur) != "minecraft:chest" {
-                                ctx.set(
-                                    wp.0,
-                                    wp.1,
-                                    wp.2,
-                                    if dy == -1 && rng.next_bound(4) != 0 {
-                                        mossy
-                                    } else {
-                                        cobble
-                                    },
-                                );
-                            }
-                        } else {
-                            let n = reg.name_of(cur);
-                            if n != "minecraft:chest" && n != "minecraft:spawner" {
-                                ctx.set(wp.0, wp.1, wp.2, cave_air);
-                            }
-                        }
+            // Build pass, top layer first.
+            for (dx, dy, dz) in box_offsets(min_x..=max_x, (-1..=3i32).rev(), min_z..=max_z) {
+                let wp = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+                let on_shell = dy == -1 || dy == 4;
+                let on_side = dx == min_x || dx == max_x || dz == min_z || dz == max_z;
+                let boundary = on_shell || on_side;
+                let cur = ctx.get(wp.0, wp.1, wp.2);
+                if boundary {
+                    let below = ctx.get(wp.0, wp.1 - 1, wp.2);
+                    if wp.1 >= ctx.g.min_y && !reg.is_solid(below) {
+                        ctx.set(wp.0, wp.1, wp.2, cave_air);
+                    } else if reg.is_solid(cur) && reg.name_of(cur) != "minecraft:chest" {
+                        ctx.set(
+                            wp.0,
+                            wp.1,
+                            wp.2,
+                            if dy == -1 && rng.next_bound(4) != 0 {
+                                mossy
+                            } else {
+                                cobble
+                            },
+                        );
+                    }
+                } else {
+                    let n = reg.name_of(cur);
+                    if n != "minecraft:chest" && n != "minecraft:spawner" {
+                        ctx.set(wp.0, wp.1, wp.2, cave_air);
                     }
                 }
             }
@@ -2710,7 +2728,11 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
     }
     if probe_here || dump_here {
         let tag = if probe_here { "CELL" } else { "WCELL" };
-        let mut cells: Vec<((u8, i32, u8), u32)> = run.out.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut cells: Vec<_> = run
+            .out
+            .iter()
+            .map(|(&cell, &state)| (cell, state))
+            .collect();
         cells.sort();
         for ((lx, y, lz), st) in cells {
             eprintln!(

@@ -1255,12 +1255,17 @@ impl Gen {
         }
         let (x0, v0, d0) = (&s.pts[idx - 1].0, sv(&s.pts[idx - 1].1), s.pts[idx - 1].2);
         let (x1, v1, d1) = (&s.pts[idx].0, sv(&s.pts[idx].1), s.pts[idx].2);
-        let t = (loc - x0) / (x1 - x0);
-        let h00 = (1.0 + 2.0 * t) * (1.0 - t) * (1.0 - t);
-        let h10 = t * (1.0 - t) * (1.0 - t);
-        let h01 = t * t * (3.0 - 2.0 * t);
-        let h11 = t * t * (t - 1.0);
-        h00 * v0 + h10 * d0 * (x1 - x0) + h01 * v1 + h11 * d1 * (x1 - x0)
+        // Cubic Hermite interpolation between the bracketing control points: each
+        // end's value and slope (slope scaled by the segment width) is weighted by
+        // its Hermite basis polynomial.
+        let width = x1 - x0;
+        let t = (loc - x0) / width;
+        let rest = 1.0 - t;
+        let weight_v0 = (1.0 + 2.0 * t) * rest * rest;
+        let weight_d0 = t * rest * rest;
+        let weight_v1 = t * t * (3.0 - 2.0 * t);
+        let weight_d1 = t * t * (t - 1.0);
+        weight_v0 * v0 + weight_d0 * d0 * width + weight_v1 * v1 + weight_d1 * d1 * width
     }
 
     fn eval0_c(
@@ -2921,20 +2926,16 @@ impl Gen {
         let sc = y as f64 + 0.5 - avg;
         let hd = diff as f64 / 2.0;
         let o = hd - sc.abs();
-        let q = if sc > 0.0 {
-            if o > 0.0 {
-                o / 1.5
-            } else {
-                o / 2.5
-            }
+        // Pressure term: the distance is scaled by a divisor that depends on the
+        // side of the mid-level the cell sits on and whether it is inside the
+        // half-gap between the two levels.
+        let (numerator, divisor) = if sc > 0.0 {
+            (o, if o > 0.0 { 1.5 } else { 2.5 })
         } else {
-            let p = 3.0 + o;
-            if p > 0.0 {
-                p / 3.0
-            } else {
-                p / 10.0
-            }
+            let shifted = 3.0 + o;
+            (shifted, if shifted > 0.0 { 3.0 } else { 10.0 })
         };
+        let q = numerator / divisor;
         let r = if (-2.0..=2.0).contains(&q) {
             match *barrier {
                 Some(v) => v,

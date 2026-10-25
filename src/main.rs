@@ -5330,11 +5330,8 @@ fn mob_passable(st: u32) -> bool {
 }
 fn mob_cell_solid(x: f64, y: f64, z: f64) -> bool {
     // feet cell solid?
-    !mob_passable(block_at(
-        x.floor() as i32,
-        y.floor() as i32,
-        z.floor() as i32,
-    ))
+    let [cx, cy, cz] = [x, y, z].map(|v| v.floor() as i32);
+    !mob_passable(block_at(cx, cy, cz))
 }
 fn mob_move_blocked(nx: f64, fy: f64, nz: f64) -> bool {
     // destination unreachable?
@@ -7537,8 +7534,7 @@ fn load_world_from(payload: &[u8]) {
                 p += 4;
                 let front = b[p];
                 p += 1;
-                let mut lines: [String; 4] =
-                    [String::new(), String::new(), String::new(), String::new()];
+                let mut lines: [String; 4] = Default::default();
                 for l in lines.iter_mut() {
                     if p + 2 > payload.len() {
                         break;
@@ -19127,8 +19123,7 @@ fn handle(mut s: TcpStream) {
                     let (sx, sy, sz) = read_pos(&b[..8]);
                     let front = if b[8] != 0 { 1u8 } else { 0u8 };
                     let mut sl = &b[9..];
-                    let mut lines: [String; 4] =
-                        [String::new(), String::new(), String::new(), String::new()];
+                    let mut lines: [String; 4] = Default::default();
                     for l in lines.iter_mut() {
                         let n = read_varint(&mut sl).unwrap_or(0).clamp(0, 256) as usize;
                         let m = n.min(sl.len());

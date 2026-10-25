@@ -142,14 +142,18 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
         return;
     }
     let water = name_to_state("water").unwrap_or(u32::MAX);
+    // Block containing a point.
+    let block_containing = |px: f64, py: f64, pz: f64| {
+        block_at(px.floor() as i32, py.floor() as i32, pz.floor() as i32)
+    };
     let gliding = *me.fall_fly.lock().unwrap();
     let mut peak = me.fall_from.lock().unwrap();
     if !ground && y > *peak {
         *peak = y;
     }
     if !ground
-        && (block_at(x.floor() as i32, y.floor() as i32, z.floor() as i32) == water
-            || block_at(x.floor() as i32, (y + 1.0).floor() as i32, z.floor() as i32) == water
+        && (block_containing(x, y, z) == water
+            || block_containing(x, y + 1.0, z) == water
             || gliding)
     {
         *peak = y;
@@ -162,8 +166,7 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
     drop(peak);
     let position = (x.floor() as i32, (y - 0.2).floor() as i32, z.floor() as i32);
     let state = block_at(position.0, position.1, position.2);
-    let wet = block_at(x.floor() as i32, (y - 0.5).floor() as i32, z.floor() as i32) == water
-        || block_at(x.floor() as i32, y.floor() as i32, z.floor() as i32) == water;
+    let wet = block_containing(x, y - 0.5, z) == water || block_containing(x, y, z) == water;
     let height = if gliding {
         0.6
     } else if *me.sneaking.lock().unwrap() {

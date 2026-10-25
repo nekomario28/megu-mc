@@ -37,6 +37,27 @@ fn set_if_can_replace(ctx: &mut FC, p: P3, st: u32) -> bool {
     }
     false
 }
+/// Place a trunk block where trees may replace the current block, recording it in
+/// `logs` when it was placed.
+fn place_log(ctx: &mut FC, logs: &mut Vec<P3>, p: P3, st: u32) -> bool {
+    let placed = set_if_can_replace(ctx, p, st);
+    if placed {
+        logs.push(p);
+    }
+    placed
+}
+/// In-place shuffle driven by the generation RNG: walk from the last slot down and
+/// swap each slot with one drawn uniformly from the slots up to and including it.
+fn shuffle_with(rng: &mut Xor, items: &mut [P3]) {
+    for top in (1..items.len()).rev() {
+        let pick = rng.next_bound(top as i32 + 1) as usize;
+        items.swap(top, pick);
+    }
+}
+/// The 2D offsets of a square block, x-major.
+fn square_offsets(lo: i32, hi: i32) -> impl Iterator<Item = (i32, i32)> {
+    (lo..=hi).flat_map(move |a| (lo..=hi).map(move |b| (a, b)))
+}
 fn set_if_can_replace_or_log(ctx: &mut FC, p: P3, st: u32) -> bool {
     let reg = match breg() {
         Some(r) => r,
@@ -98,6 +119,15 @@ pub(crate) struct TreeNode {
     pub center: P3,
     pub foliage_radius: i32,
     pub giant: bool,
+}
+impl TreeNode {
+    fn new(center: P3, foliage_radius: i32, giant: bool) -> Self {
+        TreeNode {
+            center,
+            foliage_radius,
+            giant,
+        }
+    }
 }
 
 // ---------- trunk placers ----------
@@ -247,30 +277,25 @@ impl TrunkPl {
                         }
                     }
                 }
-                nodes.push(TreeNode {
-                    center: (tx, ey, tz),
-                    foliage_radius: 0,
-                    giant: true,
-                });
-                for ox in -1..=2 {
-                    for oz in -1..=2 {
-                        if (!(0..=1).contains(&ox) || !(0..=1).contains(&oz))
-                            && rng.next_bound(3) <= 0
-                        {
-                            let len = rng.next_bound(3) + 2;
-                            for by in 0..len {
-                                let p = (start.0 + ox, ey - by - 1, start.2 + oz);
-                                if set_if_can_replace_or_log(ctx, p, trunk_st) {
-                                    logs.push(p);
-                                }
-                            }
-                            nodes.push(TreeNode {
-                                center: (start.0 + ox, ey, start.2 + oz),
-                                foliage_radius: 0,
-                                giant: false,
-                            });
+                nodes.push(TreeNode::new((tx, ey, tz), 0, true));
+                // Side limbs hang from the ring of cells around the 2x2 trunk core;
+                // each ring cell draws once and grows a limb on a zero.
+                let core = 0..=1;
+                for (ox, oz) in square_offsets(-1, 2) {
+                    if core.contains(&ox) && core.contains(&oz) {
+                        continue;
+                    }
+                    if rng.next_bound(3) > 0 {
+                        continue;
+                    }
+                    let limb_len = rng.next_bound(3) + 2;
+                    for drop in 1..=limb_len {
+                        let p = (start.0 + ox, ey - drop, start.2 + oz);
+                        if set_if_can_replace_or_log(ctx, p, trunk_st) {
+                            logs.push(p);
                         }
                     }
+                    nodes.push(TreeNode::new((start.0 + ox, ey, start.2 + oz), 0, false));
                 }
             }
             TP::Forking => {
@@ -288,18 +313,12 @@ impl TrunkPl {
                         tz += oz;
                         lean_steps -= 1;
                     }
-                    let p = (tx, yy, tz);
-                    if set_if_can_replace(ctx, p, trunk_st) {
-                        logs.push(p);
+                    if place_log(ctx, &mut logs, (tx, yy, tz), trunk_st) {
                         last_y = Some(yy + 1);
                     }
                 }
                 if let Some(ey) = last_y {
-                    nodes.push(TreeNode {
-                        center: (tx, ey, tz),
-                        foliage_radius: 1,
-                        giant: false,
-                    });
+                    nodes.push(TreeNode::new((tx, ey, tz), 1, false));
                 }
                 let (mut bx, mut bz) = (start.0, start.2);
                 let branch_dir = rand_horizontal(rng);
@@ -314,9 +333,7 @@ impl TrunkPl {
                             let (ox, oz) = hoff(branch_dir);
                             bx += ox;
                             bz += oz;
-                            let p = (bx, yy, bz);
-                            if set_if_can_replace(ctx, p, trunk_st) {
-                                logs.push(p);
+                            if place_log(ctx, &mut logs, (bx, yy, bz), trunk_st) {
                                 branch_last_y = Some(yy + 1);
                             }
                         }
@@ -324,11 +341,7 @@ impl TrunkPl {
                         branch_steps -= 1;
                     }
                     if let Some(ey) = branch_last_y {
-                        nodes.push(TreeNode {
-                            center: (bx, ey, bz),
-                            foliage_radius: 0,
-                            giant: false,
-                        });
+                        nodes.push(TreeNode::new((bx, ey, bz), 0, false));
                     }
                 }
             }
@@ -336,16 +349,15 @@ impl TrunkPl {
                 let j = height + 2;
                 let k = ((j as f64) * 0.618).floor() as i32;
                 set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
-                let l = ((1.382 + (1.0 * j as f64 / 13.0).powf(2.0)).floor() as i32).min(1);
+                let per_layer = ((1.382 + (1.0 * j as f64 / 13.0).powf(2.0)).floor() as i32).min(1);
                 let m = start.1 + k;
-                let mut list: Vec<(P3, i32)> = vec![];
-                list.push(((start.0, start.1 + k, start.2), m));
+                let mut list: Vec<(P3, i32)> = vec![((start.0, start.1 + k, start.2), m)];
                 for n in (0..=(j - 5)).rev() {
                     let f = fancy_branch_prob(j, n);
                     if f < 0.0 {
                         continue;
                     }
-                    for _ in 0..l {
+                    for _ in 0..per_layer {
                         let g = (1.0f32 * f * (rng.next_f32() + 0.328f32)) as f64;
                         let h = (rng.next_f32() * 2.0 * std::f32::consts::PI) as f64;
                         let p = g * h.sin() + 0.5;
@@ -786,16 +798,15 @@ fn gen_square(
     giant: bool,
     fst: u32,
 ) {
-    let i = giant as i32;
-    for x in -radius..=(radius + i) {
-        for z in -radius..=(radius + i) {
-            if leave_pos_invalid(fp, rng, x, y, z, radius, giant) {
-                continue;
-            }
-            let p = (center.0 + x, center.1 + y, center.2 + z);
-            if set_if_can_replace(ctx, p, fst) {
-                out.push(p);
-            }
+    // A giant canopy is one block wider on the positive sides (2x2 trunks).
+    let upper = radius + giant as i32;
+    for (x, z) in square_offsets(-radius, upper) {
+        if leave_pos_invalid(fp, rng, x, y, z, radius, giant) {
+            continue;
+        }
+        let p = (center.0 + x, center.1 + y, center.2 + z);
+        if set_if_can_replace(ctx, p, fst) {
+            out.push(p);
         }
     }
 }
@@ -1588,10 +1599,7 @@ impl Deco {
                     return;
                 }
                 let mut shuffled = foliage.to_vec();
-                for i in (1..shuffled.len()).rev() {
-                    let j = rng.next_bound(i as i32 + 1) as usize;
-                    shuffled.swap(i, j);
-                }
+                shuffle_with(rng, &mut shuffled);
                 let mut blacklist: std::collections::HashSet<P3> = Default::default();
                 for lp in shuffled {
                     let d = dirs[rng.next_bound(dirs.len() as i32) as usize];
@@ -1623,10 +1631,7 @@ impl Deco {
                     return;
                 }
                 let mut shuffled = logs.to_vec();
-                for i in (1..shuffled.len()).rev() {
-                    let j = rng.next_bound(i as i32 + 1) as usize;
-                    shuffled.swap(i, j);
-                }
+                shuffle_with(rng, &mut shuffled);
                 for lp in shuffled {
                     let d = dirs[rng.next_bound(dirs.len() as i32) as usize];
                     let (ox, oy, oz) = dir_off(d);
@@ -1680,10 +1685,7 @@ impl Deco {
                     return;
                 }
                 let mut shuffled = logs.to_vec();
-                for i in (1..shuffled.len()).rev() {
-                    let j = rng.next_bound(i as i32 + 1) as usize;
-                    shuffled.swap(i, j);
-                }
+                shuffle_with(rng, &mut shuffled);
                 for p in shuffled {
                     let mut all_logs = true;
                     for d in 0..6u8 {
@@ -1737,12 +1739,12 @@ impl Deco {
     }
 }
 fn self_circle(ctx: &mut FC, rng: &mut Xor, bsp: &BSP, p: P3) {
-    for xx in -2..=2i32 {
-        for zz in -2..=2i32 {
-            if xx.abs() != 2 || zz.abs() != 2 {
-                place_block_at(ctx, rng, bsp, (p.0 + xx, p.1, p.2 + zz));
-            }
+    // 5x5 disc without its four corner cells.
+    for (ox, oz) in square_offsets(-2, 2) {
+        if ox.abs() == 2 && oz.abs() == 2 {
+            continue;
         }
+        place_block_at(ctx, rng, bsp, (p.0 + ox, p.1, p.2 + oz));
     }
 }
 fn place_block_at(ctx: &mut FC, rng: &mut Xor, bsp: &BSP, p: P3) {
