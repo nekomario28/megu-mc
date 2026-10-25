@@ -1,0 +1,13 @@
+{
+  "files": {
+    "focused.txt": {
+      "committed_sha256": "e80772ae518d540e33f78ad47ec98d35751751d41e6dad34ededfa2ff6fd64e6",
+      "raw_sha256": "e402c0891100efe68cdbf430b381c08fc974030be5fdb0cf031439f245ef6fe3"
+    },
+    "suite.txt": {
+      "committed_sha256": "128886b5fba41d2eda6bf5d869a34cefc177c093e3082c374627993532d1c3b2",
+      "raw_sha256": "976d0817eba791786334bd6591a4c63171e57e1d71b1d5e54a35d718372f3188"
+    }
+  },
+  "transformation": "Only trailing line whitespace and extra EOF blank lines removed; no result values changed."
+}

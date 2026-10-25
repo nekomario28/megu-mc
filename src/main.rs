@@ -330,8 +330,36 @@ static NEXT_EID: AtomicI32 = AtomicI32::new(1000);
 fn clients() -> &'static Mutex<Vec<Arc<Client>>> {
     CLIENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
+enum AngleRounding {
+    Floor,
+    Truncate,
+}
+
+// 1.21.1 packet constructors have distinct rounding policies. Narrow through
+// Java's int boundary before the wrapping byte conversion, including overflow.
+fn angle_byte(scaled: f64, rounding: AngleRounding) -> i8 {
+    let value = scaled as i32; // Java's saturating floating-point -> int conversion.
+    let value = if matches!(rounding, AngleRounding::Floor) && scaled < f64::from(value) {
+        value.wrapping_sub(1) // Mth.floor also wraps below Integer.MIN_VALUE.
+    } else {
+        value
+    };
+    value as i8 // Java int -> byte wraps; a direct Rust float -> i8 saturates.
+}
 fn angle(deg: f32) -> i8 {
-    (deg / 360.0 * 256.0) as i8
+    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)
+}
+fn teleport_angle(deg: f32) -> i8 {
+    // ClientboundTeleportEntityPacket (afw) uses f2i, not Mth.floor.
+    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Truncate)
+}
+fn spawn_angles(out: &mut Vec<u8>, yaw: f32, pitch: f32) {
+    // ClientboundAddEntityPacket (abv): body uses f32, head uses f64.
+    out.extend_from_slice(&[
+        angle(pitch) as u8,
+        angle(yaw) as u8,
+        angle_byte(f64::from(yaw) * 256.0 / 360.0, AngleRounding::Floor) as u8,
+    ]);
 }
 
 static SKIN_CACHE: Registry<String, Option<(String, String)>> = OnceLock::new();
@@ -425,9 +453,7 @@ fn spawn_player(c: &Client) -> Vec<u8> {
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(pitch) as u8);
-    p.push(angle(yaw) as u8);
-    p.push(angle(yaw) as u8);
+    spawn_angles(&mut p, yaw, pitch);
     write_varint(&mut p, 0);
     p.extend_from_slice(&[0u8; 6]); // velocity
     p
@@ -445,8 +471,8 @@ fn entity_teleport(eid: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32, g: bo
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(yaw) as u8);
-    p.push(angle(pitch) as u8);
+    p.push(teleport_angle(yaw) as u8);
+    p.push(teleport_angle(pitch) as u8);
     p.push(g as u8);
     p
 }
@@ -2110,9 +2136,7 @@ fn spawn_mob(m: &Mob) -> Vec<u8> {
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(pitch) as u8);
-    p.push(angle(yaw) as u8);
-    p.push(angle(yaw) as u8);
+    spawn_angles(&mut p, yaw, pitch);
     write_varint(&mut p, 0);
     p.extend_from_slice(&[0u8; 6]);
     p
@@ -2125,9 +2149,7 @@ fn spawn_entity_pkt(eid: i32, etype: u32, x: f64, y: f64, z: f64, yaw: f32, pitc
     p.extend_from_slice(&x.to_be_bytes());
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
-    p.push(angle(pitch) as u8);
-    p.push(angle(yaw) as u8);
-    p.push(angle(yaw) as u8);
+    spawn_angles(&mut p, yaw, pitch);
     write_varint(&mut p, 0);
     p.extend_from_slice(&[0u8; 6]);
     p
@@ -21914,6 +21936,8 @@ mod container_tests;
 mod craft_tests;
 #[cfg(test)]
 mod effect_tests;
+#[cfg(test)]
+mod entity_encoding_tests;
 #[cfg(test)]
 mod fanout_tests;
 #[cfg(test)]

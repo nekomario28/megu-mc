@@ -1,0 +1,35 @@
+   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Finished `release` profile [optimized] target(s) in 33.75s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 3 tests
+
+thread 'entity_encoding_tests::entity_angles_head_update_matches_native_floor' (3255731) panicked at src/entity_encoding_tests.rs:81:9:
+assertion `left == right` failed: angle-019
+  left: [42, 127]
+ right: [42, 128]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test entity_encoding_tests::entity_angles_head_update_matches_native_floor ... FAILED
+
+thread 'entity_encoding_tests::entity_angles_spawn_matches_native_constructors' (3255732) panicked at src/entity_encoding_tests.rs:59:13:
+assertion `left == right` failed: angle-001
+  left: [127, 0, 0]
+ right: [0, 0, 0]
+test entity_encoding_tests::entity_angles_spawn_matches_native_constructors ... FAILED
+
+thread 'entity_encoding_tests::entity_angles_teleport_matches_native_constructor' (3255733) panicked at src/entity_encoding_tests.rs:72:9:
+assertion `left == right` failed: angle-001
+  left: [0, 127]
+ right: [0, 0]
+test entity_encoding_tests::entity_angles_teleport_matches_native_constructor ... FAILED
+
+failures:
+
+failures:
+    entity_encoding_tests::entity_angles_head_update_matches_native_floor
+    entity_encoding_tests::entity_angles_spawn_matches_native_constructors
+    entity_encoding_tests::entity_angles_teleport_matches_native_constructor
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 210 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin mc-spine`

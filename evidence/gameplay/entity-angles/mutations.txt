@@ -1,0 +1,7 @@
+
+ok    entity angles narrow through int before wrapping to a byte
+ok    entity head updates use floor rather than truncation
+ok    entity rotations multiply before division even at subnormal inputs
+ok    entity teleports truncate rather than sharing spawn rounding
+ok    entity spawn head angles keep the constructor double precision
+mutation check: 5 proved, 0 not a gate, 0 parked, 0 skipped

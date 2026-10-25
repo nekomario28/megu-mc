@@ -46,6 +46,7 @@ jobs:
           python3 tests/biome_tree_test.py
           python3 tests/container_oracle_test.py
           python3 tests/surface_oracle_test.py
+          python3 tests/packet_angles_oracle_test.py
       - name: Build (locked)
         run: |
           cargo build --locked --message-format=json-render-diagnostics > build-artifacts.json

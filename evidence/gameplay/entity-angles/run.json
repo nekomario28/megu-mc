@@ -1,0 +1,181 @@
+{
+  "base_commit": "ef6477114c9ba1f11f5f6aedcdeb200db70da49f",
+  "base_tree": "953e72f3ef57e64c154a5a54ebff8ae60347cb49",
+  "binary": {
+    "mtime_ns": 1792924116381750966,
+    "note": "Built and both wire checks run after all mutation restorations.",
+    "path": "target/release/mc-spine",
+    "sha256": "ba30ac9c4f22fd4832a6208f8aa84d230c51340beda0cf7828906d59514c2ee7"
+  },
+  "evidence_sha256": {
+    "clippy.txt": "043ba4cb57ca7b0fe2ef0e559c250d7421f558b1435c13d5f62523ff15877d76",
+    "debt.txt": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
+    "environment.txt": "10dafdcf18c71fa37ebc2637c5369477d9c30cb1fea828f0bc07ce4cc438f79c",
+    "focused.txt": "e80772ae518d540e33f78ad47ec98d35751751d41e6dad34ededfa2ff6fd64e6",
+    "gate-scripts.txt": "8a21d75ae4f810e1a82c9e5a0fdbf03214809389f4a5eb81ee2a1933dfa3ac19",
+    "layer-tests.txt": "19f8d08a206a48265b0cc264ec0759e9e47f4ae5ed9f686e5f4374dcf3c4de6d",
+    "layers.txt": "9953c50d8143279d00c32819a9824c29b82c64787e94790e6432e8578f080616",
+    "log-normalization.json": "3747f64818962a012c5d9201c16e0da595a26359a4df4dc40ace482aeb49f2b6",
+    "mutations.txt": "276a4bfc1a906f971f72739ce0c7e1576f38501fc67e4b8ba13dbd0b45c2ab6e",
+    "oracle.txt": "baa4db5e7ed9d64776967516553cd0e124ea2baf8fd576fd36ab811c91edeaac",
+    "python.txt": "6225fa5b00a286ef65cc4523ac48771613d3fc6456e8f63661d6fb64ebc7a9f5",
+    "red.txt": "74bb37b207c446cbcd613261f6dcd6b814187db0d29952f18da6949d37302a5e",
+    "repeat.txt": "c94fab91d21796a2b1b63e67350f1ac8bff2b0319e3adb9aa2d3afaac55f5e9d",
+    "review.txt": "1f18b7a059e9ca4c553dfc81961214118d062bd954c3c8b44e9dbfeebe2e05dc",
+    "source-hashes.sha256": "02065abcbe63763fc152f6db14678d2a4330720c120810f364ce1fd005b6d2fd",
+    "suite-comparison.json": "4f75d0f5ee239dbf6b7b6184f845d669f2d6fac05ad79e9bbe60e31a02dcb7b6",
+    "suite.txt": "128886b5fba41d2eda6bf5d869a34cefc177c093e3082c374627993532d1c3b2",
+    "unit.jsonl": "4fbda16d582316ec699f4749c833160ab5fb5c57c8d6fa724b359b36fd03b4f6",
+    "vanilla.json": "53ccd9ef65c21ce6042898384f8e89e8a2673685b2b72a951793f6b50b9c1434",
+    "wire.txt": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921"
+  },
+  "limits": [
+    "BORROW_CONCEPT from Valence, not its round/rem_euclid implementation or old registry data.",
+    "Raw red.txt is the initial 117-case corpus before six subnormal requests were added; IDs/pitch pairings changed with the corpus. Final 123-case positives and mutation controls are authoritative.",
+    "Only angle fields are compared; head update probes the real helper, not the whole ServerEntity tracker.",
+    "No world tick, independent body/head pose, interpolation, physics, or native-server-versus-port wire parity is claimed.",
+    "Full suite remains red. Full verify.sh, whole mutation campaign and hosted CI were not run.",
+    "Local WIP only: no push, merge, release or canonical acceptance."
+  ],
+  "recorded_at": "2026-10-25T10:31:39.276918+00:00",
+  "reference": {
+    "case_count": 123,
+    "construction": "Actual AddEntityPacket constructor; normal Marker with absent Level then actual TeleportEntityPacket constructor; actual Mth.floor helper for head updates. No constructor bypass.",
+    "fixture_sha256": "53ccd9ef65c21ce6042898384f8e89e8a2673685b2b72a951793f6b50b9c1434",
+    "minecraft": "1.21.1",
+    "oracle_sha256": "f47d6056de2c8428c7fcac3e0f4223896de68d8107c51dea5292e28f63d4de82",
+    "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+  },
+  "resource_contract": {
+    "admission": "Fresh light gate per unit; no heavy lease or GPU",
+    "cargo_jobs": 1,
+    "cpu_quota": "200% (review 100%)",
+    "java_xmx": "768m",
+    "native_and_review_memory_max_bytes": 1073741824,
+    "rust_memory_max_bytes": 2147483648
+  },
+  "results": {
+    "added_failure_names": [],
+    "clippy_all_targets_warnings_denied": true,
+    "container_wire": "PASS",
+    "debt_over_limit": 0,
+    "full_serial_release": {
+      "exit": 101,
+      "failed": 24,
+      "ignored": 1,
+      "passed": 188,
+      "poison_error_failures": 15
+    },
+    "gameplay_wire": "PASS",
+    "gate_self_tests": 15,
+    "independent_review": "No actionable defects; final review static only.",
+    "layer_gate_tests": 17,
+    "layers": {
+      "edges": 44,
+      "modules": 19,
+      "named_errors": 0
+    },
+    "mutations": {
+      "filter": "entity_angles_",
+      "not_a_gate": 0,
+      "parked": 0,
+      "proved": 5,
+      "skipped": 0
+    },
+    "native_repeat_complete_equality": true,
+    "new_python_tests": 3,
+    "new_rust_tests": 3,
+    "previous_oracle_python_tests": {
+      "biome": 5,
+      "container": 4,
+      "surface": 3
+    },
+    "previous_saved_full_release": {
+      "failed": 24,
+      "ignored": 1,
+      "passed": 185
+    },
+    "removed_failure_names": []
+  },
+  "scope": "Local bounded entity angle-field quantization. Not complete entity or packet/wire parity, and not full migration acceptance.",
+  "source_sha256": {
+    ".github/workflows/ci.yml": "0f009262de7f0e5bd7e071dc1d0c7e712d29be59ac5959494a25fcc7b4d023ca",
+    "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
+    "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
+    "evidence/foundation/valence-reuse/reference.json": "ab5f0937b8f4edd49fcfbacaba16a150935f830957178c687b1256bba3c8b410",
+    "src/block_registry.rs": "c015c38549380894521d1fb50f78db1489e0586454bb3d6378f7553c00850c25",
+    "src/cached_lookup.rs": "0c5fdc139c95dfe7c0899b1ce8de39ff643d41d260d37616fab56985afa23307",
+    "src/chunk_ack.rs": "3457cf65ae2a69d3cbf5d8669cf098e30f71875a8bfd61cce8f29a885f3c4aaf",
+    "src/command_tests.rs": "51bc18221aad76dd33aafeb7dfb2f26d97a5bb2dfd90cfe191b74f1308e6cac9",
+    "src/container_tests.rs": "364079da8463c8a39ddec67e05a10b48ea09c0579c93b5fb886c3dcbae11a940",
+    "src/craft_tests.rs": "4fc80be6a7f3d4884c11f6c7c6edbd31ddd391ac8484b768cdeee9a6f49360e3",
+    "src/effect_tests.rs": "ea8f3fc7291211ba40a4b2a3d9689387742ac10681dd3d07ca750de029bededa",
+    "src/effects.rs": "46113e8b50487c3c4087554390036a9043a207ec478133d78294874b96cf6c66",
+    "src/entity_encoding_tests.rs": "d7be67a3bb0391919753cc53758600f1dbf403d08d1bfbc1b3299635e506da77",
+    "src/fanout_tests.rs": "d7ed3e90468289f7023616f511048d3ee3d2fe693d30239b4121c9402fe69eee",
+    "src/feature.rs": "f11fc12b994d4eed27c2c0f0be44a0681886e00ffb089d7fefe2652e667c48ff",
+    "src/furnace_cache_tests.rs": "c6e1cab8ec3452e997dab6553efde373b2422d400ddf9af6c624d291b251ff42",
+    "src/generation_context.rs": "406c00c348a0e57b6f488a18c2ebf1d4850ac312b29a268bbf8ea29fbbaa28b3",
+    "src/generation_contract_tests.rs": "6dccdc72f9aa9c827ad81c194f1a593e49584644dcdae946c5809c7610ed58a3",
+    "src/generation_math.rs": "48fd4f08850ea6f6e1324f474abc5ce52cacf3b216c2040a644bc5e7af2ce4b8",
+    "src/generation_providers.rs": "03290c8d5cd7e938a060cd2364db5e345cc389890de4c3dc6ed53a3793d2b447",
+    "src/ingress_guard.rs": "9a71fd328f01738e5f3f0506fc2972fe457677a4c7ce0b74568e8ab3ac7d0469",
+    "src/java_compat.rs": "2060cfd3a8a48e7d66415eb9324c41c409a7b47cf22e567cc9ba7a3b5b7aef3b",
+    "src/json.rs": "34c9aba426704711f47e16bc5f2e38f9d7d0895625f006a2c4b770a667b49aaa",
+    "src/landing.rs": "427b678db12c06759e62fce160580d3a3d2d3ae03dd0bf9ace9ad2c2b6a5e84c",
+    "src/landing_types.rs": "90b214871b8f0d7315009599af1ca461a1f53024a7d4590185916b9683806d82",
+    "src/light_pack_tests.rs": "8a35f69ed04fb0300fe77444ebe1ba605c4f8ab890a3f407b51de34c3ddd4ed1",
+    "src/main.rs": "2c3e1ea5dba715d2659a67178c353de9bf44bf08dd2890497dde4ee54c09bfb0",
+    "src/merge_tests.rs": "5e3120d445bd7b70ec8ecce6eaebea366a9f19cc5712a0c12b404eb7e60897b2",
+    "src/persistence_tests.rs": "286452bf218f96ffa835e72151a18186aa29259c7224aed9ee23d89fdc957d37",
+    "src/registry_tests.rs": "cd931153f57a3482edf0006b15d6f8648b5bc9cd7baa421de2dec270ea26cf11",
+    "src/test_support.rs": "78bff331c339a8cd736f88fee9cfd90de318566c9b99aee033b569490e24f033",
+    "src/tick_queue.rs": "565874a920f1466b28f281a38d0415d7e202f954cf79a38e0995c37797c25618",
+    "src/tick_stats.rs": "ece168a82d6e8d33f8eff0c253470a047feba35c83eaf7a8c7ead126a6fec342",
+    "src/tick_tests.rs": "89420b8407f5ae16cae7b62a87cf1884bcd1042017f61c7c68eb8de5e986f8c2",
+    "src/tree.rs": "94540bdf5a1a0d9c4e03080c77ad61e5e778488966bc9f182d3da00825254981",
+    "src/world_rng.rs": "b440d78b383752426b43f796718a21387c023f32081d8a903f84a0cc5303d144",
+    "src/worldgen.rs": "76539e7894244c2786861724dedaaf288eb1b6382152b083ff7c7a61f8601746",
+    "tests/packet_angles_oracle_test.py": "3c04bebe0e342c1d7f1d144e1b725efa2bb6b197c7eec6bcda67eef97fda1aa1",
+    "tests/verify.sh": "49e275e1d6560a2c96dad2a4530ad0f0ab3a93c7b577eb4d445b78152640c81b",
+    "third_party/licenses/valence.txt": "01c39d867eb175cce2f8dcafd98f151d2e704b4adedc8c6a8e1c2721cd9663cd",
+    "tools/mutation_check.sh": "b200fc8bac14e0115d4855cfca429ab4589cbdaea67feb46a4ad6b85dad46def",
+    "tools/packet-angles-oracle/PacketAnglesOracle.java": "f47d6056de2c8428c7fcac3e0f4223896de68d8107c51dea5292e28f63d4de82",
+    "tools/packet_angles_oracle.py": "ce61fd4f4285f98b1eb66f4a687db771e2bcfad32e61e6dac8ff24ee2d776664",
+    "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89"
+  },
+  "units": [
+    {
+      "accounting_message": "mc-valence-checks-2.service: Consumed 2min 5.842s CPU time over 2min 6.893s wall clock time, 1G memory peak, 38.7M memory swap peak.",
+      "cpu_usage_nsec": 125842613000,
+      "invocation": "3769cb072a4b46e59681460900ad6fb9",
+      "memory_peak_bytes": 1077592064,
+      "memory_swap_peak_bytes": 40599552,
+      "unit": "mc-valence-checks-2.service"
+    },
+    {
+      "accounting_message": "mc-valence-mutations-1.service: Consumed 5min 32.746s CPU time over 5min 36.800s wall clock time, 1.1G memory peak, 43.4M memory swap peak.",
+      "cpu_usage_nsec": 332746169000,
+      "invocation": "936732b355984577b150e0b7960b5ecd",
+      "memory_peak_bytes": 1217200128,
+      "memory_swap_peak_bytes": 45547520,
+      "unit": "mc-valence-mutations-1.service"
+    },
+    {
+      "accounting_message": "mc-valence-native-2.service: Consumed 6.259s CPU time over 3.383s wall clock time, 743.4M memory peak.",
+      "cpu_usage_nsec": 6259730000,
+      "invocation": "0d9a74bbb31c4cb4a98ed46530ee0515",
+      "memory_peak_bytes": 779612160,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-valence-native-2.service"
+    },
+    {
+      "accounting_message": "mc-valence-review-2.service: Consumed 2.468s CPU time over 30.506s wall clock time, 1G memory peak.",
+      "cpu_usage_nsec": 2468525000,
+      "invocation": "7f4b8dfeb7d14358ab361c2fc8fc946c",
+      "memory_peak_bytes": 1073741824,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-valence-review-2.service"
+    }
+  ]
+}

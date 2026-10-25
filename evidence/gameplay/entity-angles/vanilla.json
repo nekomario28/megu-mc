@@ -1,0 +1,2098 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          62,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          62
+        ]
+      },
+      "id": "angle-000",
+      "pitch_bits": 1118908415,
+      "yaw_bits": 0
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          255,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          255
+        ]
+      },
+      "id": "angle-001",
+      "pitch_bits": 1144235520,
+      "yaw_bits": 1
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          127,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          128
+        ]
+      },
+      "id": "angle-002",
+      "pitch_bits": 3274964993,
+      "yaw_bits": 2
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          255,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          0
+        ]
+      },
+      "id": "angle-003",
+      "pitch_bits": 4284592614,
+      "yaw_bits": 3
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          63,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          63
+        ]
+      },
+      "id": "angle-004",
+      "pitch_bits": 1138772992,
+      "yaw_bits": 1036831949
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          0,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          0
+        ]
+      },
+      "id": "angle-005",
+      "pitch_bits": 2147483648,
+      "yaw_bits": 1060320051
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          64,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          64
+        ]
+      },
+      "id": "angle-006",
+      "pitch_bits": 3290267648,
+      "yaw_bits": 1065353216
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          128,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          128
+        ]
+      },
+      "id": "angle-007",
+      "pitch_bits": 1127546880,
+      "yaw_bits": 1068761087
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          127,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          127
+        ]
+      },
+      "id": "angle-008",
+      "pitch_bits": 1147184640,
+      "yaw_bits": 1068761088
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          0,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          0
+        ]
+      },
+      "id": "angle-009",
+      "pitch_bits": 3283353600,
+      "yaw_bits": 1068761089
+    },
+    {
+      "expected": {
+        "head_update": 32,
+        "spawn": [
+          63,
+          32,
+          32
+        ],
+        "teleport": [
+          32,
+          63
+        ]
+      },
+      "id": "angle-010",
+      "pitch_bits": 1118908416,
+      "yaw_bits": 1110704128
+    },
+    {
+      "expected": {
+        "head_update": 62,
+        "spawn": [
+          255,
+          62,
+          62
+        ],
+        "teleport": [
+          62,
+          255
+        ]
+      },
+      "id": "angle-011",
+      "pitch_bits": 1144235521,
+      "yaw_bits": 1118908415
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          127,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          128
+        ]
+      },
+      "id": "angle-012",
+      "pitch_bits": 3275057151,
+      "yaw_bits": 1118908416
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          0,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          0
+        ]
+      },
+      "id": "angle-013",
+      "pitch_bits": 0,
+      "yaw_bits": 1118908417
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          63,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          63
+        ]
+      },
+      "id": "angle-014",
+      "pitch_bits": 1138772993,
+      "yaw_bits": 1119092735
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          255,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          0
+        ]
+      },
+      "id": "angle-015",
+      "pitch_bits": 2147483649,
+      "yaw_bits": 1119092736
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          63,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          64
+        ]
+      },
+      "id": "angle-016",
+      "pitch_bits": 3290267649,
+      "yaw_bits": 1119092737
+    },
+    {
+      "expected": {
+        "head_update": 126,
+        "spawn": [
+          192,
+          126,
+          126
+        ],
+        "teleport": [
+          126,
+          192
+        ]
+      },
+      "id": "angle-017",
+      "pitch_bits": 1132920832,
+      "yaw_bits": 1127389183
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          127,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          127
+        ]
+      },
+      "id": "angle-018",
+      "pitch_bits": 1147184641,
+      "yaw_bits": 1127389184
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          255,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          0
+        ]
+      },
+      "id": "angle-019",
+      "pitch_bits": 3283386368,
+      "yaw_bits": 1127389185
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          63,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          63
+        ]
+      },
+      "id": "angle-020",
+      "pitch_bits": 1118908417,
+      "yaw_bits": 1127415808
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          0,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          0
+        ]
+      },
+      "id": "angle-021",
+      "pitch_bits": 1144258560,
+      "yaw_bits": 1127481343
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          127,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          127
+        ]
+      },
+      "id": "angle-022",
+      "pitch_bits": 3275057152,
+      "yaw_bits": 1127481344
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          0,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          0
+        ]
+      },
+      "id": "angle-023",
+      "pitch_bits": 1,
+      "yaw_bits": 1127481345
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          63,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          63
+        ]
+      },
+      "id": "angle-024",
+      "pitch_bits": 1138819071,
+      "yaw_bits": 1127546880
+    },
+    {
+      "expected": {
+        "head_update": 192,
+        "spawn": [
+          255,
+          192,
+          192
+        ],
+        "teleport": [
+          192,
+          0
+        ]
+      },
+      "id": "angle-025",
+      "pitch_bits": 2147483650,
+      "yaw_bits": 1132920832
+    },
+    {
+      "expected": {
+        "head_update": 254,
+        "spawn": [
+          63,
+          254,
+          254
+        ],
+        "teleport": [
+          254,
+          64
+        ]
+      },
+      "id": "angle-026",
+      "pitch_bits": 3290290687,
+      "yaw_bits": 1135823871
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          254,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          254
+        ]
+      },
+      "id": "angle-027",
+      "pitch_bits": 1135823871,
+      "yaw_bits": 1135823872
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          127,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          127
+        ]
+      },
+      "id": "angle-028",
+      "pitch_bits": 1147207679,
+      "yaw_bits": 1135823873
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          255,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          0
+        ]
+      },
+      "id": "angle-029",
+      "pitch_bits": 3283399679,
+      "yaw_bits": 1135837184
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          63,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          63
+        ]
+      },
+      "id": "angle-030",
+      "pitch_bits": 1119092735,
+      "yaw_bits": 1135869952
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          0,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          0
+        ]
+      },
+      "id": "angle-031",
+      "pitch_bits": 1144281599,
+      "yaw_bits": 1135902720
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          126,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          127
+        ]
+      },
+      "id": "angle-032",
+      "pitch_bits": 3275057153,
+      "yaw_bits": 1135916031
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          0,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          0
+        ]
+      },
+      "id": "angle-033",
+      "pitch_bits": 2,
+      "yaw_bits": 1135916032
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          64,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          64
+        ]
+      },
+      "id": "angle-034",
+      "pitch_bits": 1138819072,
+      "yaw_bits": 1135916033
+    },
+    {
+      "expected": {
+        "head_update": 62,
+        "spawn": [
+          255,
+          62,
+          62
+        ],
+        "teleport": [
+          62,
+          0
+        ]
+      },
+      "id": "angle-035",
+      "pitch_bits": 2147483651,
+      "yaw_bits": 1138772991
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          63,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          63
+        ]
+      },
+      "id": "angle-036",
+      "pitch_bits": 3290290688,
+      "yaw_bits": 1138772992
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          255,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          255
+        ]
+      },
+      "id": "angle-037",
+      "pitch_bits": 1135823872,
+      "yaw_bits": 1138772993
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          128,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          128
+        ]
+      },
+      "id": "angle-038",
+      "pitch_bits": 1147207680,
+      "yaw_bits": 1138819071
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          255,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          255
+        ]
+      },
+      "id": "angle-039",
+      "pitch_bits": 3283399680,
+      "yaw_bits": 1138819072
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          64,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          64
+        ]
+      },
+      "id": "angle-040",
+      "pitch_bits": 1119092736,
+      "yaw_bits": 1138819073
+    },
+    {
+      "expected": {
+        "head_update": 126,
+        "spawn": [
+          1,
+          126,
+          126
+        ],
+        "teleport": [
+          126,
+          1
+        ]
+      },
+      "id": "angle-041",
+      "pitch_bits": 1144281600,
+      "yaw_bits": 1141286399
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          64,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          65
+        ]
+      },
+      "id": "angle-042",
+      "pitch_bits": 3280404479,
+      "yaw_bits": 1141286400
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          0,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          0
+        ]
+      },
+      "id": "angle-043",
+      "pitch_bits": 3,
+      "yaw_bits": 1141286401
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          64,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          64
+        ]
+      },
+      "id": "angle-044",
+      "pitch_bits": 1138819073,
+      "yaw_bits": 1141309439
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          255,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          0
+        ]
+      },
+      "id": "angle-045",
+      "pitch_bits": 3184315597,
+      "yaw_bits": 1141309440
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          62,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          63
+        ]
+      },
+      "id": "angle-046",
+      "pitch_bits": 3290290689,
+      "yaw_bits": 1141309441
+    },
+    {
+      "expected": {
+        "head_update": 254,
+        "spawn": [
+          255,
+          254,
+          254
+        ],
+        "teleport": [
+          254,
+          255
+        ]
+      },
+      "id": "angle-047",
+      "pitch_bits": 1135823873,
+      "yaw_bits": 1144235519
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          128,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          128
+        ]
+      },
+      "id": "angle-048",
+      "pitch_bits": 1147207681,
+      "yaw_bits": 1144235520
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          254,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          255
+        ]
+      },
+      "id": "angle-049",
+      "pitch_bits": 3283399681,
+      "yaw_bits": 1144235521
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          64,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          64
+        ]
+      },
+      "id": "angle-050",
+      "pitch_bits": 1119092737,
+      "yaw_bits": 1144258560
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          1,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          1
+        ]
+      },
+      "id": "angle-051",
+      "pitch_bits": 1144281601,
+      "yaw_bits": 1144281599
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          64,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          64
+        ]
+      },
+      "id": "angle-052",
+      "pitch_bits": 3280404480,
+      "yaw_bits": 1144281600
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          0,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          0
+        ]
+      },
+      "id": "angle-053",
+      "pitch_bits": 1036831949,
+      "yaw_bits": 1144281601
+    },
+    {
+      "expected": {
+        "head_update": 62,
+        "spawn": [
+          126,
+          62,
+          62
+        ],
+        "teleport": [
+          62,
+          126
+        ]
+      },
+      "id": "angle-054",
+      "pitch_bits": 1141286399,
+      "yaw_bits": 1145710079
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          255,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          0
+        ]
+      },
+      "id": "angle-055",
+      "pitch_bits": 3212836864,
+      "yaw_bits": 1145710080
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          1,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          2
+        ]
+      },
+      "id": "angle-056",
+      "pitch_bits": 3291719167,
+      "yaw_bits": 1145710081
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          255,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          255
+        ]
+      },
+      "id": "angle-057",
+      "pitch_bits": 1135837184,
+      "yaw_bits": 1145733119
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          254,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          254
+        ]
+      },
+      "id": "angle-058",
+      "pitch_bits": 1149686527,
+      "yaw_bits": 1145733120
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          128,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          129
+        ]
+      },
+      "id": "angle-059",
+      "pitch_bits": 3288793087,
+      "yaw_bits": 1145733121
+    },
+    {
+      "expected": {
+        "head_update": 126,
+        "spawn": [
+          126,
+          126,
+          126
+        ],
+        "teleport": [
+          126,
+          126
+        ]
+      },
+      "id": "angle-060",
+      "pitch_bits": 1127389183,
+      "yaw_bits": 1147184639
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          62,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          62
+        ]
+      },
+      "id": "angle-061",
+      "pitch_bits": 1145710079,
+      "yaw_bits": 1147184640
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          63,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          64
+        ]
+      },
+      "id": "angle-062",
+      "pitch_bits": 3280404481,
+      "yaw_bits": 1147184641
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          0,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          0
+        ]
+      },
+      "id": "angle-063",
+      "pitch_bits": 1060320051,
+      "yaw_bits": 1147207679
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          127,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          127
+        ]
+      },
+      "id": "angle-064",
+      "pitch_bits": 1141286400,
+      "yaw_bits": 1147207680
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          255,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          0
+        ]
+      },
+      "id": "angle-065",
+      "pitch_bits": 3216244735,
+      "yaw_bits": 1147207681
+    },
+    {
+      "expected": {
+        "head_update": 254,
+        "spawn": [
+          1,
+          254,
+          254
+        ],
+        "teleport": [
+          254,
+          1
+        ]
+      },
+      "id": "angle-066",
+      "pitch_bits": 3291719168,
+      "yaw_bits": 1149686527
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          0,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          0
+        ]
+      },
+      "id": "angle-067",
+      "pitch_bits": 1135869952,
+      "yaw_bits": 1149686528
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          255,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          255
+        ]
+      },
+      "id": "angle-068",
+      "pitch_bits": 1149686528,
+      "yaw_bits": 1149686529
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          128,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          128
+        ]
+      },
+      "id": "angle-069",
+      "pitch_bits": 3288793088,
+      "yaw_bits": 1149698048
+    },
+    {
+      "expected": {
+        "head_update": 199,
+        "spawn": [
+          127,
+          199,
+          199
+        ],
+        "teleport": [
+          199,
+          127
+        ]
+      },
+      "id": "angle-070",
+      "pitch_bits": 1127389184,
+      "yaw_bits": 1259902592
+    },
+    {
+      "expected": {
+        "head_update": 97,
+        "spawn": [
+          63,
+          97,
+          96
+        ],
+        "teleport": [
+          97,
+          63
+        ]
+      },
+      "id": "angle-071",
+      "pitch_bits": 1145710080,
+      "yaw_bits": 1266679808
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          63,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          64
+        ]
+      },
+      "id": "angle-072",
+      "pitch_bits": 3280450559,
+      "yaw_bits": 2137108966
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          0,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          0
+        ]
+      },
+      "id": "angle-073",
+      "pitch_bits": 1065353216,
+      "yaw_bits": 2147483648
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          127,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          127
+        ]
+      },
+      "id": "angle-074",
+      "pitch_bits": 1141286401,
+      "yaw_bits": 2147483649
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          255,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          255
+        ]
+      },
+      "id": "angle-075",
+      "pitch_bits": 3216244736,
+      "yaw_bits": 2147483650
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          0,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          1
+        ]
+      },
+      "id": "angle-076",
+      "pitch_bits": 3291719169,
+      "yaw_bits": 2147483651
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          0,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          0
+        ]
+      },
+      "id": "angle-077",
+      "pitch_bits": 1135902720,
+      "yaw_bits": 3184315597
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          255,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          255
+        ]
+      },
+      "id": "angle-078",
+      "pitch_bits": 1149686529,
+      "yaw_bits": 3212836864
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          127,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          128
+        ]
+      },
+      "id": "angle-079",
+      "pitch_bits": 3288793089,
+      "yaw_bits": 3216244735
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          127,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          127
+        ]
+      },
+      "id": "angle-080",
+      "pitch_bits": 1127389185,
+      "yaw_bits": 3216244736
+    },
+    {
+      "expected": {
+        "head_update": 254,
+        "spawn": [
+          63,
+          254,
+          254
+        ],
+        "teleport": [
+          255,
+          63
+        ]
+      },
+      "id": "angle-081",
+      "pitch_bits": 1145710081,
+      "yaw_bits": 3216244737
+    },
+    {
+      "expected": {
+        "head_update": 192,
+        "spawn": [
+          63,
+          192,
+          192
+        ],
+        "teleport": [
+          192,
+          63
+        ]
+      },
+      "id": "angle-082",
+      "pitch_bits": 3280450560,
+      "yaw_bits": 3266576384
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          0,
+          128,
+          128
+        ],
+        "teleport": [
+          129,
+          0
+        ]
+      },
+      "id": "angle-083",
+      "pitch_bits": 1068761087,
+      "yaw_bits": 3274964991
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          127,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          127
+        ]
+      },
+      "id": "angle-084",
+      "pitch_bits": 1141309439,
+      "yaw_bits": 3274964992
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          254,
+          127,
+          127
+        ],
+        "teleport": [
+          128,
+          255
+        ]
+      },
+      "id": "angle-085",
+      "pitch_bits": 3216244737,
+      "yaw_bits": 3274964993
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          0,
+          127,
+          127
+        ],
+        "teleport": [
+          128,
+          0
+        ]
+      },
+      "id": "angle-086",
+      "pitch_bits": 3291742208,
+      "yaw_bits": 3275057151
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          0,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          0
+        ]
+      },
+      "id": "angle-087",
+      "pitch_bits": 1135916031,
+      "yaw_bits": 3275057152
+    },
+    {
+      "expected": {
+        "head_update": 126,
+        "spawn": [
+          0,
+          126,
+          126
+        ],
+        "teleport": [
+          127,
+          0
+        ]
+      },
+      "id": "angle-088",
+      "pitch_bits": 1149698048,
+      "yaw_bits": 3275057153
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          127,
+          64,
+          64
+        ],
+        "teleport": [
+          65,
+          128
+        ]
+      },
+      "id": "angle-089",
+      "pitch_bits": 3288816127,
+      "yaw_bits": 3280404479
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          127,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          127
+        ]
+      },
+      "id": "angle-090",
+      "pitch_bits": 1127415808,
+      "yaw_bits": 3280404480
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          63,
+          63,
+          63
+        ],
+        "teleport": [
+          64,
+          63
+        ]
+      },
+      "id": "angle-091",
+      "pitch_bits": 1145733119,
+      "yaw_bits": 3280404481
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          62,
+          63,
+          63
+        ],
+        "teleport": [
+          64,
+          63
+        ]
+      },
+      "id": "angle-092",
+      "pitch_bits": 3280450561,
+      "yaw_bits": 3280450559
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          1,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          1
+        ]
+      },
+      "id": "angle-093",
+      "pitch_bits": 1068761088,
+      "yaw_bits": 3280450560
+    },
+    {
+      "expected": {
+        "head_update": 62,
+        "spawn": [
+          128,
+          62,
+          62
+        ],
+        "teleport": [
+          63,
+          128
+        ]
+      },
+      "id": "angle-094",
+      "pitch_bits": 1141309440,
+      "yaw_bits": 3280450561
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          192,
+          1,
+          1
+        ],
+        "teleport": [
+          2,
+          192
+        ]
+      },
+      "id": "angle-095",
+      "pitch_bits": 3266576384,
+      "yaw_bits": 3283307519
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          0,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          0
+        ]
+      },
+      "id": "angle-096",
+      "pitch_bits": 3297181696,
+      "yaw_bits": 3283307520
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          1,
+          0,
+          0
+        ],
+        "teleport": [
+          1,
+          1
+        ]
+      },
+      "id": "angle-097",
+      "pitch_bits": 1135916032,
+      "yaw_bits": 3283307521
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          199,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          199
+        ]
+      },
+      "id": "angle-098",
+      "pitch_bits": 1259902592,
+      "yaw_bits": 3283353600
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          127,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          127
+        ]
+      },
+      "id": "angle-099",
+      "pitch_bits": 3288816128,
+      "yaw_bits": 3283386368
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          127,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          127
+        ]
+      },
+      "id": "angle-100",
+      "pitch_bits": 1127481343,
+      "yaw_bits": 3283399679
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          64,
+          255,
+          255
+        ],
+        "teleport": [
+          255,
+          64
+        ]
+      },
+      "id": "angle-101",
+      "pitch_bits": 1145733120,
+      "yaw_bits": 3283399680
+    },
+    {
+      "expected": {
+        "head_update": 254,
+        "spawn": [
+          1,
+          254,
+          254
+        ],
+        "teleport": [
+          255,
+          2
+        ]
+      },
+      "id": "angle-102",
+      "pitch_bits": 3283307519,
+      "yaw_bits": 3283399681
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          1,
+          128,
+          128
+        ],
+        "teleport": [
+          129,
+          1
+        ]
+      },
+      "id": "angle-103",
+      "pitch_bits": 1068761089,
+      "yaw_bits": 3288793087
+    },
+    {
+      "expected": {
+        "head_update": 128,
+        "spawn": [
+          128,
+          128,
+          128
+        ],
+        "teleport": [
+          128,
+          128
+        ]
+      },
+      "id": "angle-104",
+      "pitch_bits": 1141309441,
+      "yaw_bits": 3288793088
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          128,
+          127,
+          127
+        ],
+        "teleport": [
+          128,
+          129
+        ]
+      },
+      "id": "angle-105",
+      "pitch_bits": 3274964991,
+      "yaw_bits": 3288793089
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          57,
+          127,
+          127
+        ],
+        "teleport": [
+          128,
+          57
+        ]
+      },
+      "id": "angle-106",
+      "pitch_bits": 3407386240,
+      "yaw_bits": 3288816127
+    },
+    {
+      "expected": {
+        "head_update": 127,
+        "spawn": [
+          1,
+          127,
+          127
+        ],
+        "teleport": [
+          127,
+          1
+        ]
+      },
+      "id": "angle-107",
+      "pitch_bits": 1135916033,
+      "yaw_bits": 3288816128
+    },
+    {
+      "expected": {
+        "head_update": 126,
+        "spawn": [
+          97,
+          126,
+          126
+        ],
+        "teleport": [
+          127,
+          97
+        ]
+      },
+      "id": "angle-108",
+      "pitch_bits": 1266679808,
+      "yaw_bits": 3288816129
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          126,
+          64,
+          64
+        ],
+        "teleport": [
+          65,
+          127
+        ]
+      },
+      "id": "angle-109",
+      "pitch_bits": 3288816129,
+      "yaw_bits": 3290267647
+    },
+    {
+      "expected": {
+        "head_update": 64,
+        "spawn": [
+          128,
+          64,
+          64
+        ],
+        "teleport": [
+          64,
+          128
+        ]
+      },
+      "id": "angle-110",
+      "pitch_bits": 1127481344,
+      "yaw_bits": 3290267648
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          64,
+          63,
+          63
+        ],
+        "teleport": [
+          64,
+          64
+        ]
+      },
+      "id": "angle-111",
+      "pitch_bits": 1145733121,
+      "yaw_bits": 3290267649
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          1,
+          63,
+          63
+        ],
+        "teleport": [
+          64,
+          1
+        ]
+      },
+      "id": "angle-112",
+      "pitch_bits": 3283307520,
+      "yaw_bits": 3290290687
+    },
+    {
+      "expected": {
+        "head_update": 63,
+        "spawn": [
+          32,
+          63,
+          63
+        ],
+        "teleport": [
+          63,
+          32
+        ]
+      },
+      "id": "angle-113",
+      "pitch_bits": 1110704128,
+      "yaw_bits": 3290290688
+    },
+    {
+      "expected": {
+        "head_update": 62,
+        "spawn": [
+          254,
+          62,
+          62
+        ],
+        "teleport": [
+          63,
+          254
+        ]
+      },
+      "id": "angle-114",
+      "pitch_bits": 1144235519,
+      "yaw_bits": 3290290689
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          128,
+          1,
+          1
+        ],
+        "teleport": [
+          2,
+          128
+        ]
+      },
+      "id": "angle-115",
+      "pitch_bits": 3274964992,
+      "yaw_bits": 3291719167
+    },
+    {
+      "expected": {
+        "head_update": 1,
+        "spawn": [
+          159,
+          1,
+          1
+        ],
+        "teleport": [
+          1,
+          159
+        ]
+      },
+      "id": "angle-116",
+      "pitch_bits": 3414163456,
+      "yaw_bits": 3291719168
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          62,
+          0,
+          0
+        ],
+        "teleport": [
+          1,
+          62
+        ]
+      },
+      "id": "angle-117",
+      "pitch_bits": 1138772991,
+      "yaw_bits": 3291719169
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          255,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          255
+        ]
+      },
+      "id": "angle-118",
+      "pitch_bits": 2137108966,
+      "yaw_bits": 3291742208
+    },
+    {
+      "expected": {
+        "head_update": 0,
+        "spawn": [
+          64,
+          0,
+          0
+        ],
+        "teleport": [
+          0,
+          65
+        ]
+      },
+      "id": "angle-119",
+      "pitch_bits": 3290267647,
+      "yaw_bits": 3297181696
+    },
+    {
+      "expected": {
+        "head_update": 57,
+        "spawn": [
+          128,
+          57,
+          56
+        ],
+        "teleport": [
+          57,
+          128
+        ]
+      },
+      "id": "angle-120",
+      "pitch_bits": 1127481345,
+      "yaw_bits": 3407386240
+    },
+    {
+      "expected": {
+        "head_update": 159,
+        "spawn": [
+          126,
+          159,
+          159
+        ],
+        "teleport": [
+          159,
+          126
+        ]
+      },
+      "id": "angle-121",
+      "pitch_bits": 1147184639,
+      "yaw_bits": 3414163456
+    },
+    {
+      "expected": {
+        "head_update": 255,
+        "spawn": [
+          0,
+          255,
+          255
+        ],
+        "teleport": [
+          0,
+          1
+        ]
+      },
+      "id": "angle-122",
+      "pitch_bits": 3283307521,
+      "yaw_bits": 4284592614
+    }
+  ],
+  "minecraft": "1.21.1",
+  "oracle_sha256": "f47d6056de2c8428c7fcac3e0f4223896de68d8107c51dea5292e28f63d4de82",
+  "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
+}

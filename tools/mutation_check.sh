@@ -669,6 +669,32 @@ check "a surface sequence cannot silently discard an undecoded child" \
                     .collect(),' \
   surface_sequence_rejects_a_child_that_did_not_parse
 
+# Entity angle bytes: different constructors intentionally have different policies.
+check "entity angles narrow through int before wrapping to a byte" \
+  src/main.rs '    value as i8 // Java int -> byte wraps; a direct Rust float -> i8 saturates.' \
+  '    scaled as i8 // broken: saturation instead of byte wrapping' \
+  entity_angles_head_update_matches_native_floor
+
+check "entity head updates use floor rather than truncation" \
+  src/main.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
+  '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Truncate)' \
+  entity_angles_head_update_matches_native_floor
+
+check "entity rotations multiply before division even at subnormal inputs" \
+  src/main.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
+  '    angle_byte(f64::from(deg / 360.0 * 256.0), AngleRounding::Floor)' \
+  entity_angles_head_update_matches_native_floor
+
+check "entity teleports truncate rather than sharing spawn rounding" \
+  src/main.rs '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Truncate)' \
+  '    angle_byte(f64::from(deg * 256.0 / 360.0), AngleRounding::Floor)' \
+  entity_angles_teleport_matches_native_constructor
+
+check "entity spawn head angles keep the constructor double precision" \
+  src/main.rs '        angle_byte(f64::from(yaw) * 256.0 / 360.0, AngleRounding::Floor) as u8,' \
+  '        angle(yaw) as u8,' \
+  entity_angles_spawn_matches_native_constructors
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
