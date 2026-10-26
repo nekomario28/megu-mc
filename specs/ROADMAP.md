@@ -6,7 +6,7 @@
 
 Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **239 passed / 0 failed / 1 ignored** まで戻りました。steepのheightmap、条件式4,037行、合成stone/water列の実`buildSurface` scan 768列を実クラスと照合しました。R1のforest `(-64,32)` 3x3 same-stage比較では、**対象chunkのterrain・surface・carverは0差**、残差はfeatures 550とstructures 304に分離できました。[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)を追加しました。ただしreal-noise全surface・他座標・spawn_costs適用は未確認です。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
-**次の最小slice:** forest `(-64,32)` の残るore（lapis/diamond/coal/redstone）とtree（leaves）を単独で発火させる正の固定具で比較する。geodeは参照regionに0セルだったため別のplacement問題として切り分け、monster roomは対象chunkで0差と確認済み。構造物は別契約として扱う。terrain/surface/carverが対象chunkで0差であることは[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)、surface steep/条件式/合成buildSurface scanは[surface contextの証拠](../evidence/foundation/surface-context/README.md)に記録した。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
+**次の最小slice:** forest `(-64,32)` のlapisのours-only 5セルを、ore placement/origin/random消費の差として切り分ける。diamond/redstoneは単独fixtureで一致済み、geodeは参照regionに0セルで別のplacement問題、monster roomは対象chunkで0差。treeのone-feature overlayはharness失敗なので修正してから比較する。構造物は別契約として扱う。terrain/surface/carverが対象chunkで0差であることは[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)、surface steep/条件式/合成buildSurface scanは[surface contextの証拠](../evidence/foundation/surface-context/README.md)に記録した。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 

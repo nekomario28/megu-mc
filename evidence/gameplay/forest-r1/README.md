@@ -61,8 +61,20 @@ over terrain and the structure run adds another +2,320.
 - A one-feature reference with only `monster_room`/`monster_room_deep` in forest
   gives **207 region / 0 target**, identical to terrain-only. Monster rooms are
   therefore not the target residual; they are in the same surface-baseline set.
-- Ore and tree isolation remain. `ore_fixture.sh` and the tree step still need
-  positive references before they can be called attributed.
+- Ore isolation (same seed/region, only one placed ore feature enabled):
+  - `ore_lapis`: **ours 28 / vanilla 23**, shared 23, **ours-only 5**,
+    vanilla-only 0; cluster sizes differ by one extra 6-cell cluster.
+  - `ore_diamond`: **2 / 2**, shared 2, no extras.
+  - `ore_redstone`: **3 / 3**, shared 3, no extras.
+  - `ore_coal_upper`: 0 / 0; this is not a positive-coverage result.
+  The lapis extra cells are a concrete lead for the target ore residual; diamond
+  and redstone placement match in this region.
+- Tree isolation is still unresolved: the first one-feature overlay produced
+  no port features, so that run is a harness failure, not a negative result.
+  The tree step needs a corrected overlay before attribution.
+- `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
+  and for delayed `forceload`; without those fixes it read the wrong config path
+  and compared against a missing region.
 
 No old capture was re-recorded, and no fixture is used to excuse a missing chunk.
 The reference and dump are under `/tmp/chunkfix-*` and `/tmp/forestfix-*` for
@@ -76,6 +88,5 @@ this run; the script refuses to diff if the reference is incomplete.
 - `--tick` folds the known saved-world water/leaves changes into the diff; a
   per-cell leaf-distance comparison is still pending. Structure cells are
   intentionally excluded from the terrain/feature baseline and shown separately.
-- No fix is claimed here. Ore and tree residuals still need positive fixtures;
-  geode placement outside the target and the 207 surface cells are separate
-  follow-ups.
+- No fix is claimed here. Lapis placement, geode placement outside the target,
+  the tree harness, and the 207 regional surface cells are separate follow-ups.

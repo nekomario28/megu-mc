@@ -57,10 +57,25 @@ echo "{\"pack\": {\"pack_format\": 48, \"description\": \"$TAG\"}}" \
   > "$DIR/world/datapacks/ctlfix/pack.mcmeta"
 
 lox=$((X0*16)); loz=$((Z0*16)); hix=$(((X0+N)*16-1)); hiz=$(((Z0+N)*16-1))
-( cd "$DIR" && printf 'forceload add %d %d %d %d\nsave-all flush\nstop\n' "$lox" "$loz" "$hix" "$hiz" \
-  | timeout 240 systemd-run --scope --user -p MemoryMax=3G --unit="of-$TAG-$$" \
+( cd "$DIR" && ( sleep 8
+                 printf 'forceload add %d %d %d %d\n' "$lox" "$loz" "$hix" "$hiz"
+                 sleep 60
+                 printf 'save-all flush\n'
+                 sleep 10
+                 printf 'stop\n' ) \
+  | timeout 300 systemd-run --scope --user -p MemoryMax=3G --unit="of-$TAG-$$" \
       java -Xmx2G -Xms512M ${CARVE_AGENT:+-javaagent:$CARVE_AGENT} ${CARVE_AGENT_OPTS:-} \
       -jar server.jar nogui > run.log 2>&1 || true )
+missing=0
+for (( dx=0; dx<N; dx++ )); do
+  for (( dz=0; dz<N; dz++ )); do
+    python3 "$ROOT/tools/vanilla_region_blocks.py" "$DIR/world" $((X0+dx)) $((Z0+dz)) >/dev/null 2>&1 || missing=$((missing+1))
+  done
+done
+if [ "$missing" -gt 0 ]; then
+  echo "ore fixture: FAIL - $missing of $((N*N)) chunks are missing" >&2
+  exit 2
+fi
 
 # the same pack for this port, which reads every directory under datapacks/
 zero_all_but_keep "$CTL"
@@ -70,9 +85,12 @@ MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$DIR/dump.bin" MC_SPINE_WG_DUMP_N="$N" \
   MC_SPINE_WG_DUMP_X="$X0" MC_SPINE_WG_DUMP_Z="$Z0" \
   ./target/release/mc-spine >/dev/null 2>&1
 # the placed feature's *block* (ore_gravel places gravel), read from its config
-BLOCK="$(python3 - "$REPO_PF/../feature/$KEEP.json" <<'PY2'
-import json, sys
-d = json.load(open(sys.argv[1]))
+BLOCK="$(python3 - "$REPO_PF/$KEEP.json" <<'PY2'
+import json, os, sys
+placed = json.load(open(sys.argv[1]))
+name = placed["feature"].split(":")[-1]
+p = os.path.join(os.path.dirname(sys.argv[1]), "..", "configured_feature", name + ".json")
+d = json.load(open(p))
 c = d.get("config", d)
 print(c["targets"][0]["state"].get("Name", "minecraft:air").replace("minecraft:", ""))
 PY2
