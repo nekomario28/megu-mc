@@ -23,7 +23,11 @@ def fixture():
             (root / name).mkdir(parents=True)
         for path in (ROOT / "src").glob("*.rs"):
             shutil.copy2(path, root / "src" / path.name)
-        for name in ("Cargo.toml", "Cargo.lock", "config_packets.bin"):
+        # `cargo rustc` expands the crate but never runs it, and `config_packets.bin`
+        # is read at run time (src/main.rs). It used to be committed; it is generated
+        # now (tools/vanilla_data/gen_vanilla_data.sh), so the fixture must not need it
+        # for a fresh clone to pass this gate.
+        for name in ("Cargo.toml", "Cargo.lock"):
             shutil.copy2(ROOT / name, root / name)
         (root / "assets").symlink_to(ROOT / "assets", target_is_directory=True)
         for name in ("rust_module_graph.py", "check_layers.py"):

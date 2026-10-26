@@ -2,7 +2,7 @@
 // Loads vanilla worldgen JSONs (noise_settings / density_function / noise)
 // from datapacks/<pack>/data/minecraft/worldgen/ and evaluates the vanilla
 // density-function pipeline: per-chunk cell grid + trilinear interp.
-// Algorithm referenced from vanilla/Pumpkin; implementation is independent.
+// The behaviour follows vanilla 1.21.1; the implementation is this repository's own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -217,6 +217,15 @@ impl SC {
 
 // bound on the shared quart -> biome cache
 const BIO_CAP: usize = 1 << 18;
+
+/// The block name of a block state given either as `"minecraft:stone"` or as
+/// `{"Name": "minecraft:stone", "Properties": {...}}` (the 1.21.1 form).
+fn state_name(j: &J) -> &str {
+    match j {
+        J::Str(s) => s,
+        _ => j.get("Name").map(J::str).unwrap_or(""),
+    }
+}
 
 /// One router entry: either a resource name or an inline density-function object.
 fn router_df(g: &mut Gen, files: &HashMap<String, Vec<u8>>, j: &J) -> Option<usize> {
@@ -499,10 +508,8 @@ impl Gen {
             g.height = n.get("height").map(J::num).unwrap_or(384.0) as i32;
         }
         let router = ns.get("noise_router");
-        let fd = router
-            .and_then(|r| r.get("final_density"))
-            .map(|j| j.str().to_string())?;
-        let idx = g.resolve_ref(&files, &fd)?;
+        // 1.21.1 router entries are either a function name or an inline function object
+        let idx = router_df(&mut g, &files, router.and_then(|r| r.get("final_density"))?)?;
         g.final_density = idx;
         // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
         // from three router functions; 1.21.2+ moved them into a material rule.
@@ -553,8 +560,7 @@ impl Gen {
             for (i, k) in keys.iter().enumerate() {
                 match router
                     .and_then(|r| r.get(k))
-                    .map(|j| j.str().to_string())
-                    .and_then(|n| g.resolve_ref(&files, &n))
+                    .and_then(|j| router_df(&mut g, &files, j))
                 {
                     Some(v) => ids[i] = v,
                     None => {
@@ -606,11 +612,11 @@ impl Gen {
             g.ore_split = Some(g.factory.of_str("minecraft:ore").splitter());
             g.def_st = ns
                 .get("default_block")
-                .and_then(|b| res(b.str()))
+                .and_then(|b| res(state_name(b)))
                 .unwrap_or(1);
             g.def_fl = ns
                 .get("default_fluid")
-                .and_then(|b| res(b.str()))
+                .and_then(|b| res(state_name(b)))
                 .unwrap_or(0);
             g.bands = create_bands(&mut g.factory.of_str("minecraft:clay_bands"), res);
             // The aquifer's `minEst` column comes from `aquifers.surface_level`
@@ -627,21 +633,73 @@ impl Gen {
                 .map(|v| v.str().to_string())
             {
                 g.prelim_df = g.resolve_ref(&files, &aq);
+            } else if let Some(init) = router
+                .and_then(|r| r.get("initial_density_without_jaggedness"))
+                .and_then(|j| router_df(&mut g, &files, j))
+            {
+                // 1.21.1 has no preliminary_surface_level function: the game scans
+                // `initial_density_without_jaggedness` down from the top of the world in
+                // steps of the cell height (8) for the first value above 0.390625.
+                let off = g.push_df(DF::C(-0.390625));
+                let density = g.push_df(DF::Add(init, off));
+                let upper = g.push_df(DF::C((g.min_y + g.height) as f64));
+                g.prelim_df = Some(g.push_df(DF::FindTopSurface {
+                    density,
+                    lower: g.min_y,
+                    upper,
+                    cell_h: 8,
+                }));
             }
-            if let Some(mr) = ns.get("material_rule").map(|v| v.str().to_string()) {
-                g.surface_rule = g.resolve_rule(&mr, &files, &rfiles, &cfiles, res);
+            // `material_rule` names a rule file; 1.21.1 puts the whole `surface_rule` inline
+            match (ns.get("material_rule"), ns.get("surface_rule")) {
+                (Some(J::Str(mr)), _) => {
+                    g.surface_rule = g.load_named_rule(mr, &files, &rfiles, &cfiles, res);
+                }
+                (_, Some(sr @ J::Obj(_))) => {
+                    g.surface_rule = g.rule_node(sr, &files, &rfiles, &cfiles, res);
+                }
+                _ => {}
             }
         }
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
         let noaq = std::env::var("MC_SPINE_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
-        if let Some(aq) = ns.get("aquifers").filter(|_| !noaq) {
-            let get = |g: &mut Gen, k: &str| aq.get(k).and_then(|j| g.node(j, &files));
+        // `aquifers` is a block of its own in the newer layout; 1.21.1 keeps the four noises in
+        // `noise_router` and hard-codes the "deep" exclusion (erosion < -0.225 and depth > 0.9)
+        let aq_src = ns.get("aquifers").or_else(|| router.filter(|_| !noaq));
+        if let Some(aq) = aq_src.filter(|_| !noaq) {
+            let get = |g: &mut Gen, k: &str| aq.get(k).and_then(|j| router_df(g, &files, j));
+            let excl = match aq.get("exclusion") {
+                Some(j) => router_df(&mut g, &files, j),
+                None => {
+                    let er = router.and_then(|r| r.get("erosion"));
+                    let de = router.and_then(|r| r.get("depth"));
+                    match (er, de) {
+                        (Some(er), Some(de)) => {
+                            let (er, de) =
+                                (router_df(&mut g, &files, er), router_df(&mut g, &files, de));
+                            match (er, de) {
+                                (Some(er), Some(de)) => {
+                                    let c1 = g.push_df(DF::C(-0.225));
+                                    let a = g.push_df(DF::Sub(c1, er));
+                                    let c2 = g.push_df(DF::C(0.9));
+                                    let b = g.push_df(DF::Sub(de, c2));
+                                    let z = g.push_df(DF::C(0.0));
+                                    let m = g.push_df(DF::Max(b, z));
+                                    Some(g.push_df(DF::Min(a, m)))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+            };
             let (b, f, s, l, e) = (
                 get(&mut g, "barrier"),
                 get(&mut g, "fluid_level_floodedness"),
                 get(&mut g, "fluid_level_spread"),
                 get(&mut g, "lava"),
-                get(&mut g, "exclusion"),
+                excl,
             );
             if let (Some(barrier), Some(flood), Some(spread), Some(lava), Some(excl)) =
                 (b, f, s, l, e)
@@ -663,7 +721,7 @@ impl Gen {
 
     // ---- material rule parsing ----
 
-    fn resolve_rule(
+    fn load_named_rule(
         &mut self,
         name: &str,
         files: &HashMap<String, Vec<u8>>,
@@ -693,7 +751,7 @@ impl Gen {
         res: fn(&str) -> Option<u32>,
     ) -> Option<usize> {
         match j {
-            J::Str(s) => self.resolve_rule(s, files, rf, cf, res),
+            J::Str(s) => self.load_named_rule(s, files, rf, cf, res),
             J::Obj(_) => {
                 let r = self.parse_rule(j, files, rf, cf, res)?;
                 self.rules.push(r);
@@ -724,7 +782,7 @@ impl Gen {
                 self.cond_node(j.get("if_true")?, cf)?,
                 self.rule_node(j.get("then_run")?, files, rf, cf, res)?,
             ),
-            "block" => Rule::Block(res(j.get("result_state")?.str()).unwrap_or(self.def_st)),
+            "block" => Rule::Block(res(state_name(j.get("result_state")?)).unwrap_or(self.def_st)),
             "bandlands" => Rule::Bandlands,
             "ore_vein" => {
                 // 1.21.1 has no `material_rule`; when the 1.21.1 sampler is
@@ -881,6 +939,11 @@ impl Gen {
         })
     }
 
+    fn push_df(&mut self, d: DF) -> usize {
+        self.dfs.push(d);
+        self.dfs.len() - 1
+    }
+
     fn resolve_ref(&mut self, files: &HashMap<String, Vec<u8>>, name: &str) -> Option<usize> {
         if let Some(&i) = self.names.get(name) {
             return Some(i);
@@ -922,15 +985,16 @@ impl Gen {
         );
         let b = std::fs::read(&path).ok()?;
         let j = jparse(&b)?;
-        let base_octave = j.get("base_octave")?.num() as i32;
-        let base_amplitude = j.get("base_amplitude")?.num();
-        // absent modifiers = single implicit octave (vanilla amplitudes [1.0])
-        let mods: Vec<f64> = match j.get("amplitude_modifiers") {
-            Some(J::Arr(a)) => a.iter().map(J::num).collect(),
-            _ => vec![1.0; j.get("octave_count").map(J::num).unwrap_or(1.0).max(1.0) as usize],
-        };
         let mut rng = self.factory.of_str(name);
-        let n = normal_new(&mut rng, base_octave, base_amplitude, &mods);
+        // 1.21.1: `firstOctave` and the amplitude list, as the game reads them
+        let first = j.get("firstOctave")?;
+        let amps: Vec<f64> = j
+            .get("amplitudes")?
+            .into_arr()?
+            .iter()
+            .map(J::num)
+            .collect();
+        let n = normal_from_amplitudes(&mut rng, first.num() as i32, &amps);
         self.noises.push(n);
         self.noise_names
             .insert(name.to_string(), self.noises.len() - 1);
@@ -956,8 +1020,59 @@ impl Gen {
     fn parse_df(&mut self, j: &J, files: &HashMap<String, Vec<u8>>) -> Option<DF> {
         let ty = j.get("type")?.str().strip_prefix("minecraft:")?.to_string();
         let n = |k: &str| j.get(k).map(J::num).unwrap_or(0.0);
-        let sub = |g: &mut Gen, k: &str| -> Option<usize> { g.node(j.get(k)?, files) };
+        // 1.21.1 names the operands of binary and unary functions `argument1`/`argument2`
+        // and `argument`; the newer layout calls them `left`/`right` and `input`.
+        let get = |k: &str| {
+            j.get(k).or_else(|| match k {
+                "left" => j.get("argument1"),
+                "right" => j.get("argument2"),
+                "input" => j.get("argument"),
+                _ => None,
+            })
+        };
+        let sub = |g: &mut Gen, k: &str| -> Option<usize> { g.node(get(k)?, files) };
         Some(match ty.as_str() {
+            "constant" => DF::C(n("argument")),
+            // 1.21.1 `y_clamped_gradient`
+            "y_clamped_gradient" => DF::Grad {
+                fc: n("from_y"),
+                fv: n("from_value"),
+                tc: n("to_y"),
+                tv: n("to_value"),
+            },
+            "weird_scaled_sampler" => {
+                // value = scale * |noise(p / scale)|, with the scale picked from the input by
+                // the rarity mapper. Lowered to |interval_select| over one scaled noise per
+                // scale, which is what the evaluator already runs.
+                let (th, scales): (&[f64], &[f64]) = match j.get("rarity_value_mapper").map(J::str)
+                {
+                    Some("type_1") => (&[-0.5, 0.0, 0.5], &[0.75, 1.0, 1.5, 2.0]),
+                    Some("type_2") => (&[-0.75, -0.5, 0.5, 0.75], &[0.5, 0.75, 1.0, 2.0, 3.0]),
+                    _ => return None,
+                };
+                let input = sub(self, "input")?;
+                let ni = self.noise_id(j.get("noise")?.str())?;
+                let zero = self.push_df(DF::C(0.0));
+                let mut fns = vec![];
+                for &d in scales {
+                    let nz = self.push_df(DF::Noise {
+                        ni,
+                        sx: zero,
+                        sy: zero,
+                        sz: zero,
+                        xzs: 1.0 / d,
+                        ys: 1.0 / d,
+                    });
+                    let c = self.push_df(DF::C(d));
+                    fns.push(self.push_df(DF::Mul(nz, c)));
+                }
+                let sel = self.push_df(DF::IntervalSelect {
+                    i: input,
+                    th: th.to_vec(),
+                    fns,
+                });
+                DF::Abs(sel)
+            }
             "add" => DF::Add(sub(self, "left")?, sub(self, "right")?),
             "sub" => DF::Sub(sub(self, "left")?, sub(self, "right")?),
             "mul" => DF::Mul(sub(self, "left")?, sub(self, "right")?),
@@ -991,7 +1106,7 @@ impl Gen {
             "cache" | "flat_cache" | "cache_2d" | "cache_once" | "cache_all_in_cell" => {
                 DF::Cache(sub(self, "input")?)
             }
-            "noise" => {
+            "noise" | "shifted_noise" => {
                 let zero = {
                     self.dfs.push(DF::C(0.0));
                     self.dfs.len() - 1
@@ -1014,8 +1129,12 @@ impl Gen {
                     ys: n("y_scale"),
                 }
             }
-            "shift_a" => DF::ShiftA(self.noise_id(j.get("noise")?.str())?),
-            "shift_b" => DF::ShiftB(self.noise_id(j.get("noise")?.str())?),
+            "shift_a" => {
+                DF::ShiftA(self.noise_id(j.get("noise").or_else(|| j.get("argument"))?.str())?)
+            }
+            "shift_b" => {
+                DF::ShiftB(self.noise_id(j.get("noise").or_else(|| j.get("argument"))?.str())?)
+            }
             "range_choice" => DF::RangeChoice {
                 i: sub(self, "input")?,
                 mi: n("min_inclusive"),
@@ -1676,7 +1795,7 @@ impl Gen {
                 let t = |lx: i32, lz: i32| -> i32 {
                     surf[(lz.clamp(0, 15) as usize) * 16 + (lx.clamp(0, 15) as usize)] as i32
                 };
-                // pumpkin steep: north-facing (z+1 >= z-1 + 4) or west-facing (x-1 >= x+1 + 4)
+                // vanilla `steep` condition: north-facing (z+1 >= z-1 + 4) or west-facing (x-1 >= x+1 + 4)
                 let s = t(lx, lz + 1) >= t(lx, lz - 1) + 4 || t(lx - 1, lz) >= t(lx + 1, lz) + 4;
                 c.steep = Some(s);
                 s
@@ -1792,6 +1911,12 @@ pub(crate) struct ChunkCols {
 }
 
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
+
+/// The one instruction for a tree that has no generated vanilla data (README "Setup").
+/// Both the startup fallbacks and the tests that read the data print it, so a missing
+/// file names the command that writes it instead of the `Option` that came back empty.
+pub(crate) const VANILLA_DATA_MISSING: &str =
+    "Vanilla data missing. Run: tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-mappings --accept-eula";
 
 pub fn init(seed: u64, res: fn(&str) -> Option<u32>) -> bool {
     match Gen::load(seed, res) {
@@ -2679,7 +2804,7 @@ impl Gen {
         for dx in 0..=1 {
             for dy in -1..=1 {
                 for dz in 0..=1 {
-                    let (px, py, pz) = self.aq_rpos_c(sx + dx, sy + dy, sz + dz);
+                    let (px, py, pz) = self.aq_cell_site_cached(sx + dx, sy + dy, sz + dz);
                     eprintln!(
                         "APOS {} {} {} {} {} {}",
                         sx + dx,
@@ -2693,7 +2818,7 @@ impl Gen {
             }
         }
     }
-    fn aq_rpos(&self, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
+    fn aq_cell_site(&self, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
         let mut r = self.aq.as_ref().unwrap().split.pos(gx, gy, gz);
         (
             gx * 16 + r.next_bound(10),
@@ -2702,8 +2827,8 @@ impl Gen {
         )
     }
     // highest y still needing full sampling: max prelim surface over the
-    // chunk region +8, snapped to a cell boundary (pumpkin skip_sampling_above_y)
-    fn aq_skip_above(&mut self, cx: i32, cz: i32) -> i32 {
+    // chunk region +8, snapped to a cell boundary; above it the aquifer is not sampled
+    fn aq_full_sampling_top(&mut self, cx: i32, cz: i32) -> i32 {
         if let Some(&v) = self.aq_skip.get(&(cx, cz)) {
             return v;
         }
@@ -2727,13 +2852,13 @@ impl Gen {
         }
         v
     }
-    // per-cell random position, cached per cell (pumpkin packed_positions)
-    fn aq_rpos_c(&mut self, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
+    // per-cell random site, computed once per cell and kept in a bounded cache
+    fn aq_cell_site_cached(&mut self, gx: i32, gy: i32, gz: i32) -> (i32, i32, i32) {
         let key = (gx, gy, gz);
         if let Some(&v) = self.aq_near.get(&key) {
             return v;
         }
-        let v = self.aq_rpos(gx, gy, gz);
+        let v = self.aq_cell_site(gx, gy, gz);
         self.aq_near.insert(key, v);
         self.aq_neo.push(key);
         if self.aq_neo.len() > 16384 {
@@ -2751,7 +2876,7 @@ impl Gen {
     /// cell is inserted in front and the earlier one shifts down. Symmetric
     /// cells tie often, and which cells land in slots 2/3 picks the pairs the
     /// three pressure tests use, so the tie rule is observable.
-    fn aq_near4(&mut self, x: i32, y: i32, z: i32) -> [(i32, i32, i32); 4] {
+    fn aq_nearest_four(&mut self, x: i32, y: i32, z: i32) -> [(i32, i32, i32); 4] {
         let sx = lxz(x - 5);
         let sy = ly12(y + 1);
         let sz = lxz(z - 5);
@@ -2759,7 +2884,7 @@ impl Gen {
         for dx in 0..=1 {
             for dy in -1..=1 {
                 for dz in 0..=1 {
-                    let (px, py, pz) = self.aq_rpos_c(sx + dx, sy + dy, sz + dz);
+                    let (px, py, pz) = self.aq_cell_site_cached(sx + dx, sy + dy, sz + dz);
                     let (ex, ey, ez) = (px - x, py - y, pz - z);
                     let h = ex as i64 * ex as i64 + ey as i64 * ey as i64 + ez as i64 * ez as i64;
                     let p = ((px, py, pz), h);
@@ -2784,10 +2909,10 @@ impl Gen {
         [near[0].0, near[1].0, near[2].0, near[3].0]
     }
     // FluidLevel (max_y, kind) at a cell-random position, cached per cell
-    // (pumpkin get_water_level). Only ever called with a cell's own random
-    // position — arbitrary positions must use aq_fluid_level_at to avoid
-    // polluting the per-cell cache (pumpkin's get_fluid_level is uncached).
-    fn aq_water_level(&mut self, rx: i32, ry: i32, rz: i32) -> (i32, u8) {
+    // (vanilla `getFluidLevel`). Only ever called with a cell's own random
+    // position — arbitrary positions must use aq_fluid_level_at, which does not
+    // touch the per-cell cache.
+    fn aq_level_of_cell(&mut self, rx: i32, ry: i32, rz: i32) -> (i32, u8) {
         // Cache key = the cell the sample position belongs to: vanilla's
         // `NoiseBasedAquifer.a(long)` keys on `floorDiv(px,16)`, `floorDiv(py,12)`,
         // `floorDiv(pz,16)` - **without** the `-5/+1` offsets the neighbour
@@ -2830,8 +2955,8 @@ impl Gen {
                 min_est = n;
             }
         }
-        let p = self.aq_fluid_y(rx, ry, rz, def, min_est, bl);
-        let kind = self.aq_fluid_kind(rx, ry, rz, def, p);
+        let p = self.aq_fluid_block_y(rx, ry, rz, def, min_est, bl);
+        let kind = self.aq_fluid_block_kind(rx, ry, rz, def, p);
         (p, kind)
     }
     fn aq_lv_ins(&mut self, key: (i32, i32, i32), v: (i32, u8)) {
@@ -2842,14 +2967,14 @@ impl Gen {
             self.aq_lv.remove(&old);
         }
     }
-    fn aq_fluid_y(
+    fn aq_fluid_block_y(
         &mut self,
         x: i32,
         y: i32,
         z: i32,
         def: (i32, u8),
         min_est: i32,
-        map_y: bool,
+        surface_has_fluid: bool,
     ) -> i32 {
         let mut memo = HashMap::new();
         let deep = self.eval(self.aq.as_ref().unwrap().excl, x, y, z, &mut memo) > 0.0;
@@ -2857,7 +2982,7 @@ impl Gen {
             (-1.0, -1.0)
         } else {
             let top = min_est + 8 - y;
-            let f = if map_y {
+            let f = if surface_has_fluid {
                 1.0 - (top as f64).clamp(0.0, 64.0) / 64.0
             } else {
                 0.0
@@ -2873,12 +2998,12 @@ impl Gen {
         if e > 0.0 {
             def.0
         } else if d > 0.0 {
-            self.aq_noise_level(x, y, z, min_est)
+            self.aq_noise_based_fluid_level(x, y, z, min_est)
         } else {
             AQ_MIN
         }
     }
-    fn aq_noise_level(&mut self, x: i32, y: i32, z: i32, min_est: i32) -> i32 {
+    fn aq_noise_based_fluid_level(&mut self, x: i32, y: i32, z: i32, min_est: i32) -> i32 {
         let (gx, gy, gz) = (x.div_euclid(16), y.div_euclid(40), z.div_euclid(16));
         let s = self.eval(
             self.aq.as_ref().unwrap().spread,
@@ -2889,7 +3014,7 @@ impl Gen {
         ) * 10.0;
         min_est.min(((s / 3.0).floor() as i32) * 3 + gy * 40 + 20)
     }
-    fn aq_fluid_kind(&mut self, x: i32, y: i32, z: i32, def: (i32, u8), level: i32) -> u8 {
+    fn aq_fluid_block_kind(&mut self, x: i32, y: i32, z: i32, def: (i32, u8), level: i32) -> u8 {
         if level <= -10 && level != AQ_MIN && def.1 != 2 {
             let s = self.eval(
                 self.aq.as_ref().unwrap().lava,
@@ -2904,7 +3029,7 @@ impl Gen {
         }
         def.1
     }
-    fn aq_calc_density(
+    fn aq_calculate_density(
         &mut self,
         x: i32,
         y: i32,
@@ -2929,13 +3054,19 @@ impl Gen {
         // Pressure term: the distance is scaled by a divisor that depends on the
         // side of the mid-level the cell sits on and whether it is inside the
         // half-gap between the two levels.
-        let (numerator, divisor) = if sc > 0.0 {
-            (o, if o > 0.0 { 1.5 } else { 2.5 })
+        #[inline(always)]
+        fn scaled(v: f64, inside: f64, outside: f64) -> f64 {
+            if v > 0.0 {
+                v / inside
+            } else {
+                v / outside
+            }
+        }
+        let q = if sc > 0.0 {
+            scaled(o, 1.5, 2.5)
         } else {
-            let shifted = 3.0 + o;
-            (shifted, if shifted > 0.0 { 3.0 } else { 10.0 })
+            scaled(3.0 + o, 3.0, 10.0)
         };
-        let q = numerator / divisor;
         let r = if (-2.0..=2.0).contains(&q) {
             match *barrier {
                 Some(v) => v,
@@ -3033,7 +3164,7 @@ impl Gen {
         };
         let def = g.aq_pick(y);
         let def_blk = Gen::lvl_block(def.0, def.1, y);
-        if y > g.aq_skip_above(x >> 4, z >> 4) {
+        if y > g.aq_full_sampling_top(x >> 4, z >> 4) {
             if aq_trace_at(x, z) {
                 eprintln!("AQD {x} {y} {z} d={density} skip {def_blk}");
             }
@@ -3050,19 +3181,19 @@ impl Gen {
             return Some(lava);
         }
         g.aq_pos_trace(x, y, z);
-        let near = g.aq_near4(x, y, z);
+        let near = g.aq_nearest_four(x, y, z);
         let d = |p: (i32, i32, i32)| -> i64 {
             let (dx, dy, dz) = (p.0 - x, p.1 - y, p.2 - z);
             dx as i64 * dx as i64 + dy as i64 * dy as i64 + dz as i64 * dz as i64
         };
         let (d0, d1) = (d(near[0]), d(near[1]));
-        let l2 = g.aq_water_level(near[0].0, near[0].1, near[0].2);
+        let l2 = g.aq_level_of_cell(near[0].0, near[0].1, near[0].2);
         let blk = Gen::lvl_block(l2.0, l2.1, y);
         let sim12 = 1.0 - (d1 - d0).abs() as f64 / 25.0;
         if aq_trace_at(x, z) {
             eprintln!(
             "AQ x={x} y={y} z={z} sim12={sim12:.4} near0={:?} lvl0={:?} near1={:?} lvl1={:?} d0={d0} d1={d1}",
-            near[0], l2, near[1], g.aq_water_level(near[1].0, near[1].1, near[1].2)
+            near[0], l2, near[1], g.aq_level_of_cell(near[1].0, near[1].1, near[1].2)
         );
         }
         if sim12 <= 0.0 {
@@ -3084,8 +3215,8 @@ impl Gen {
             return Some(water);
         }
         let mut barrier = None;
-        let l3 = g.aq_water_level(near[1].0, near[1].1, near[1].2);
-        let c12 = g.aq_calc_density(x, y, z, l2, l3, &mut barrier);
+        let l3 = g.aq_level_of_cell(near[1].0, near[1].1, near[1].2);
+        let c12 = g.aq_calculate_density(x, y, z, l2, l3, &mut barrier);
         let (mut c13, mut c23) = (0.0f64, 0.0f64);
         if density + sim12 * c12 > 0.0 {
             if aq_trace_at(x, z) {
@@ -3093,11 +3224,11 @@ impl Gen {
             }
             return None;
         }
-        let l4 = g.aq_water_level(near[2].0, near[2].1, near[2].2);
+        let l4 = g.aq_level_of_cell(near[2].0, near[2].1, near[2].2);
         let d2 = d(near[2]);
         let sim13 = 1.0 - (d2 - d0).abs() as f64 / 25.0;
         if sim13 > 0.0 {
-            c13 = g.aq_calc_density(x, y, z, l2, l4, &mut barrier);
+            c13 = g.aq_calculate_density(x, y, z, l2, l4, &mut barrier);
             let b13 = sim12 * sim13 * c13;
             if density + b13 > 0.0 {
                 if aq_trace_at(x, z) {
@@ -3108,7 +3239,7 @@ impl Gen {
         }
         let sim23 = 1.0 - (d2 - d1).abs() as f64 / 25.0;
         if sim23 > 0.0 {
-            c23 = g.aq_calc_density(x, y, z, l3, l4, &mut barrier);
+            c23 = g.aq_calculate_density(x, y, z, l3, l4, &mut barrier);
             let b23 = sim12 * sim23 * c23;
             if density + b23 > 0.0 {
                 if aq_trace_at(x, z) {
@@ -3576,21 +3707,103 @@ mod wg_tests {
     fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap()
     }
+    /// Climate parameters and the biome at random quart positions, for three world seeds,
+    /// against what the 1.21.1 game's `MultiNoiseSampler` and biome source answered
+    /// (`tests/data/vanilla_vectors_1211.tsv`, written by tools/vanilla_data/gen_vanilla_data.sh).
+    /// Where two biomes are exactly equally near the answer depends on tree order, so the
+    /// biome is only compared when the game's answer was unambiguous.
     #[test]
     fn biome_vectors() {
+        crate::test_support::require_vanilla_data();
+        use crate::generation_math::vector_file;
         let _guard = lock_gen();
-        // pumpkin multi_noise_sampler tests: seed, quart pos, params
         fn stub(_: &str) -> Option<u32> {
             Some(1)
         }
-        assert!(init(123, stub));
-        let (b, t) = biome_debug(123, 123, 123).unwrap();
-        assert_eq!(t, [-5727, 55, 4996, 2371, -19774, 4421, 0]);
-        assert_eq!(b, 47); // snowy_taiga
-        assert!(init(13579, stub));
-        let (b, t) = biome_debug(123, 123, 123).unwrap();
-        assert_eq!(t, [7489, 3502, -2168, -3511, -21237, -5222, 0]);
-        assert_eq!(b, 57); // warm_ocean
+        let mut by_seed: std::collections::BTreeMap<i64, Vec<(Vec<String>, Vec<String>)>> =
+            Default::default();
+        for (q, ans) in vector_file::read("biome") {
+            by_seed
+                .entry(q[0].parse().unwrap())
+                .or_default()
+                .push((q, ans));
+        }
+        assert!(by_seed.len() >= 3);
+        let (mut checked, mut off_by_one) = (0usize, 0usize);
+        for (seed, rows) in by_seed {
+            assert!(init(seed as u64, stub));
+            let mut gg = GEN.lock().unwrap();
+            let g = gg.as_mut().unwrap();
+            for (q, ans) in rows {
+                let n = |i: usize| -> i32 { q[i].parse().unwrap() };
+                let t = g.target7(n(1), n(2), n(3)).unwrap();
+                let want: Vec<i64> = ans[..6].iter().map(|v| v.parse().unwrap()).collect();
+                // The game computes `depth` and the other spline outputs in `float`, this
+                // server in `f64`, so a parameter can land one unit (1/10000) away.
+                let exact = t[..6] == want[..];
+                if !exact {
+                    off_by_one += 1;
+                    eprintln!(
+                        "climate parameters at {q:?}: ours {:?}, game {want:?}",
+                        &t[..6]
+                    );
+                }
+                for (a, b) in t[..6].iter().zip(&want) {
+                    assert!(
+                        (a - b).abs() <= 1,
+                        "climate parameters at {q:?}: {t:?} vs {want:?}"
+                    );
+                }
+                if exact && ans[7] == "0" {
+                    let mut best = (i64::MAX, 0u16);
+                    g.btree.as_ref().unwrap().search(&t, &mut best);
+                    assert_eq!(g.biome_names[best.1 as usize], ans[6], "biome at {q:?}");
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("{checked} biome vectors, {off_by_one} with a parameter one unit off");
+        assert!(
+            off_by_one * 50 <= checked,
+            "too many parameters differ from the game"
+        );
+        assert!(checked >= 150, "too few biome vectors: {checked}");
+    }
+
+    /// The climate density functions the biome source reads, at random block positions,
+    /// against the game's `NoiseRouter` for the same seed (`tests/data/vanilla_vectors_1211.tsv`).
+    /// The game's splines work in `float`, so the answers agree to about 1e-8, not bit for bit.
+    #[test]
+    fn climate_functions_match_the_games_router() {
+        crate::test_support::require_vanilla_data();
+        use crate::generation_math::vector_file;
+        let _guard = lock_gen();
+        fn stub(_: &str) -> Option<u32> {
+            Some(1)
+        }
+        let mut by_seed: std::collections::BTreeMap<i64, Vec<(Vec<String>, Vec<String>)>> =
+            Default::default();
+        for (q, ans) in vector_file::read("density") {
+            by_seed
+                .entry(q[0].parse().unwrap())
+                .or_default()
+                .push((q, ans));
+        }
+        let (mut checked, mut worst) = (0usize, 0f64);
+        for (seed, rows) in by_seed {
+            assert!(init(seed as u64, stub));
+            for (q, ans) in rows {
+                let n = |i: usize| -> i32 { q[i].parse().unwrap() };
+                let name = format!("minecraft:overworld/{}", q[1]);
+                let got = debug_eval(&name, n(2), n(3), n(4)).unwrap();
+                let want: f64 = ans[0].parse().unwrap();
+                worst = worst.max((got - want).abs());
+                assert!((got - want).abs() <= 1e-6, "{q:?}: got {got}, game {want}");
+                checked += 1;
+            }
+        }
+        eprintln!("{checked} density vectors, largest difference {worst:e}");
+        assert!(checked >= 150, "too few density vectors: {checked}");
     }
 
     /// The biome tree is the 1.21.1 game's own, read out of the vanilla server jar by
@@ -3603,6 +3816,7 @@ mod wg_tests {
     /// pale_garden, sulfur_caves in place of plains / dark_forest) now match vanilla.
     #[test]
     fn biome_tree_gives_vanillas_answer_at_every_probe_point() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
             Some(1)
@@ -3658,6 +3872,7 @@ mod wg_tests {
     /// must therefore match exactly, ties included.
     #[test]
     fn biome_tree_breaks_ties_the_way_vanilla_scans_children() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
             Some(1)
@@ -3692,7 +3907,10 @@ mod wg_tests {
                 }
             }
         }
-        eprintln!("tie-break points: {n} ({tied} with different biomes equally near), differing: {}", wrong.len());
+        eprintln!(
+            "tie-break points: {n} ({tied} with different biomes equally near), differing: {}",
+            wrong.len()
+        );
         assert!(tied >= 2000, "the tie set must be large, got {tied}");
         assert!(
             wrong.is_empty(),
@@ -3705,6 +3923,7 @@ mod wg_tests {
     /// Every leaf is a 1.21.1 biome, and the leaf count is the data generator's 7,593 entries.
     #[test]
     fn biome_tree_leaves_are_1_21_1_biomes_only() {
+        crate::test_support::require_vanilla_data();
         let raw = std::fs::read("datapacks/vanilla/biome_climate_tree.json").unwrap();
         let j = jparse(&raw).unwrap();
         fn walk(n: &J, out: &mut Vec<String>) {
@@ -3740,6 +3959,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_load() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
             Some(1)
@@ -3777,6 +3997,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_real_ids() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         assert!(init(0, crate::name_to_state));
         let cc = chunk_cols(0, 0).unwrap();
@@ -3796,1357 +4017,100 @@ mod wg_tests {
         let surfaced = kinds.keys().any(|&k| [9u32, 10, 112, 118].contains(&k));
         assert!(surfaced || kinds.len() <= 2, "no surface mats resolved");
     }
-    // pumpkin aquifer_sampler.rs vectors (GlobalRandomConfig seed 0, chunk 7,4)
-    const AQ_NB: &[((i32, i32, i32), i32)] = &[
-        ((-100, -100, -100), -103),
-        ((-100, -100, -50), -103),
-        ((-100, -100, 0), -103),
-        ((-100, -100, 50), -103),
-        ((-100, -100, 100), -103),
-        ((-100, -50, -100), -63),
-        ((-100, -50, -50), -63),
-        ((-100, -50, 0), -63),
-        ((-100, -50, 50), -63),
-        ((-100, -50, 100), -63),
-        ((-100, 0, -100), 17),
-        ((-100, 0, -50), 17),
-        ((-100, 0, 0), 17),
-        ((-100, 0, 50), 17),
-        ((-100, 0, 100), 17),
-        ((-100, 50, -100), 57),
-        ((-100, 50, -50), 57),
-        ((-100, 50, 0), 57),
-        ((-100, 50, 50), 57),
-        ((-100, 50, 100), 57),
-        ((-100, 100, -100), 97),
-        ((-100, 100, -50), 97),
-        ((-100, 100, 0), 97),
-        ((-100, 100, 50), 97),
-        ((-100, 100, 100), 97),
-        ((-50, -100, -100), -103),
-        ((-50, -100, -50), -103),
-        ((-50, -100, 0), -103),
-        ((-50, -100, 50), -103),
-        ((-50, -100, 100), -100),
-        ((-50, -50, -100), -63),
-        ((-50, -50, -50), -63),
-        ((-50, -50, 0), -63),
-        ((-50, -50, 50), -63),
-        ((-50, -50, 100), -60),
-        ((-50, 0, -100), 17),
-        ((-50, 0, -50), 17),
-        ((-50, 0, 0), 17),
-        ((-50, 0, 50), 17),
-        ((-50, 0, 100), 20),
-        ((-50, 50, -100), 57),
-        ((-50, 50, -50), 57),
-        ((-50, 50, 0), 57),
-        ((-50, 50, 50), 57),
-        ((-50, 50, 100), 60),
-        ((-50, 100, -100), 97),
-        ((-50, 100, -50), 97),
-        ((-50, 100, 0), 97),
-        ((-50, 100, 50), 97),
-        ((-50, 100, 100), 100),
-        ((0, -100, -100), -103),
-        ((0, -100, -50), -103),
-        ((0, -100, 0), -103),
-        ((0, -100, 50), -100),
-        ((0, -100, 100), -100),
-        ((0, -50, -100), -63),
-        ((0, -50, -50), -63),
-        ((0, -50, 0), -63),
-        ((0, -50, 50), -60),
-        ((0, -50, 100), -60),
-        ((0, 0, -100), 17),
-        ((0, 0, -50), 17),
-        ((0, 0, 0), 17),
-        ((0, 0, 50), 20),
-        ((0, 0, 100), 20),
-        ((0, 50, -100), 57),
-        ((0, 50, -50), 57),
-        ((0, 50, 0), 57),
-        ((0, 50, 50), 60),
-        ((0, 50, 100), 60),
-        ((0, 100, -100), 97),
-        ((0, 100, -50), 97),
-        ((0, 100, 0), 97),
-        ((0, 100, 50), 100),
-        ((0, 100, 100), 100),
-        ((50, -100, -100), -103),
-        ((50, -100, -50), -103),
-        ((50, -100, 0), -103),
-        ((50, -100, 50), -100),
-        ((50, -100, 100), -100),
-        ((50, -50, -100), -63),
-        ((50, -50, -50), -63),
-        ((50, -50, 0), -63),
-        ((50, -50, 50), -60),
-        ((50, -50, 100), -60),
-        ((50, 0, -100), 17),
-        ((50, 0, -50), 17),
-        ((50, 0, 0), 17),
-        ((50, 0, 50), 20),
-        ((50, 0, 100), 20),
-        ((50, 50, -100), 57),
-        ((50, 50, -50), 57),
-        ((50, 50, 0), 57),
-        ((50, 50, 50), 60),
-        ((50, 50, 100), 60),
-        ((50, 100, -100), 97),
-        ((50, 100, -50), 97),
-        ((50, 100, 0), 97),
-        ((50, 100, 50), 100),
-        ((50, 100, 100), 100),
-        ((100, -100, -100), -103),
-        ((100, -100, -50), -103),
-        ((100, -100, 0), -103),
-        ((100, -100, 50), -103),
-        ((100, -100, 100), -100),
-        ((100, -50, -100), -63),
-        ((100, -50, -50), -63),
-        ((100, -50, 0), -63),
-        ((100, -50, 50), -63),
-        ((100, -50, 100), -60),
-        ((100, 0, -100), 17),
-        ((100, 0, -50), 17),
-        ((100, 0, 0), 17),
-        ((100, 0, 50), 17),
-        ((100, 0, 100), 20),
-        ((100, 50, -100), 57),
-        ((100, 50, -50), 57),
-        ((100, 50, 0), 57),
-        ((100, 50, 50), 57),
-        ((100, 50, 100), 60),
-        ((100, 100, -100), 97),
-        ((100, 100, -50), 97),
-        ((100, 100, 0), 97),
-        ((100, 100, 50), 97),
-        ((100, 100, 100), 100),
-    ];
-    const AQ_FYT: &[((i32, i32, i32), i32)] = &[
-        ((-100, -100, -100), -32512),
-        ((-100, -100, -50), -32512),
-        ((-100, -100, 0), -32512),
-        ((-100, -100, 50), -32512),
-        ((-100, -100, 100), -32512),
-        ((-100, -50, -100), -32512),
-        ((-100, -50, -50), -63),
-        ((-100, -50, 0), -63),
-        ((-100, -50, 50), -63),
-        ((-100, -50, 100), -32512),
-        ((-100, 0, -100), -32512),
-        ((-100, 0, -50), -32512),
-        ((-100, 0, 0), -32512),
-        ((-100, 0, 50), -32512),
-        ((-100, 0, 100), -32512),
-        ((-100, 50, -100), 57),
-        ((-100, 50, -50), 57),
-        ((-100, 50, 0), 57),
-        ((-100, 50, 50), 57),
-        ((-100, 50, 100), 57),
-        ((-100, 100, -100), 80),
-        ((-100, 100, -50), 0),
-        ((-100, 100, 0), 0),
-        ((-100, 100, 50), 0),
-        ((-100, 100, 100), 0),
-        ((-50, -100, -100), -32512),
-        ((-50, -100, -50), -32512),
-        ((-50, -100, 0), -32512),
-        ((-50, -100, 50), -32512),
-        ((-50, -100, 100), -32512),
-        ((-50, -50, -100), -32512),
-        ((-50, -50, -50), -32512),
-        ((-50, -50, 0), -32512),
-        ((-50, -50, 50), -32512),
-        ((-50, -50, 100), -32512),
-        ((-50, 0, -100), -32512),
-        ((-50, 0, -50), -32512),
-        ((-50, 0, 0), -32512),
-        ((-50, 0, 50), -32512),
-        ((-50, 0, 100), -32512),
-        ((-50, 50, -100), -32512),
-        ((-50, 50, -50), -32512),
-        ((-50, 50, 0), 57),
-        ((-50, 50, 50), 57),
-        ((-50, 50, 100), 60),
-        ((-50, 100, -100), 80),
-        ((-50, 100, -50), 0),
-        ((-50, 100, 0), 0),
-        ((-50, 100, 50), 0),
-        ((-50, 100, 100), 0),
-        ((0, -100, -100), -32512),
-        ((0, -100, -50), -32512),
-        ((0, -100, 0), -32512),
-        ((0, -100, 50), -32512),
-        ((0, -100, 100), -32512),
-        ((0, -50, -100), -32512),
-        ((0, -50, -50), -32512),
-        ((0, -50, 0), -32512),
-        ((0, -50, 50), -32512),
-        ((0, -50, 100), -32512),
-        ((0, 0, -100), -32512),
-        ((0, 0, -50), -32512),
-        ((0, 0, 0), -32512),
-        ((0, 0, 50), -32512),
-        ((0, 0, 100), -32512),
-        ((0, 50, -100), -32512),
-        ((0, 50, -50), -32512),
-        ((0, 50, 0), 57),
-        ((0, 50, 50), 60),
-        ((0, 50, 100), 60),
-        ((0, 100, -100), 0),
-        ((0, 100, -50), 0),
-        ((0, 100, 0), 0),
-        ((0, 100, 50), 0),
-        ((0, 100, 100), 0),
-        ((50, -100, -100), -32512),
-        ((50, -100, -50), -32512),
-        ((50, -100, 0), -32512),
-        ((50, -100, 50), -32512),
-        ((50, -100, 100), -100),
-        ((50, -50, -100), -32512),
-        ((50, -50, -50), -32512),
-        ((50, -50, 0), -32512),
-        ((50, -50, 50), -32512),
-        ((50, -50, 100), -60),
-        ((50, 0, -100), -32512),
-        ((50, 0, -50), -32512),
-        ((50, 0, 0), -32512),
-        ((50, 0, 50), -32512),
-        ((50, 0, 100), -32512),
-        ((50, 50, -100), -32512),
-        ((50, 50, -50), -32512),
-        ((50, 50, 0), 57),
-        ((50, 50, 50), 60),
-        ((50, 50, 100), 60),
-        ((50, 100, -100), 0),
-        ((50, 100, -50), 0),
-        ((50, 100, 0), 0),
-        ((50, 100, 50), 0),
-        ((50, 100, 100), 0),
-        ((100, -100, -100), -32512),
-        ((100, -100, -50), -32512),
-        ((100, -100, 0), -32512),
-        ((100, -100, 50), -103),
-        ((100, -100, 100), -100),
-        ((100, -50, -100), -32512),
-        ((100, -50, -50), -32512),
-        ((100, -50, 0), -32512),
-        ((100, -50, 50), -32512),
-        ((100, -50, 100), -60),
-        ((100, 0, -100), -32512),
-        ((100, 0, -50), -32512),
-        ((100, 0, 0), -32512),
-        ((100, 0, 50), -32512),
-        ((100, 0, 100), -32512),
-        ((100, 50, -100), -32512),
-        ((100, 50, -50), -32512),
-        ((100, 50, 0), 57),
-        ((100, 50, 50), 57),
-        ((100, 50, 100), 60),
-        ((100, 100, -100), 0),
-        ((100, 100, -50), 0),
-        ((100, 100, 0), 0),
-        ((100, 100, 50), 0),
-        ((100, 100, 100), 0),
-    ];
-    const AQ_FYF: &[((i32, i32, i32), i32)] = &[
-        ((-100, -100, -100), -32512),
-        ((-100, -100, -50), -32512),
-        ((-100, -100, 0), -32512),
-        ((-100, -100, 50), -32512),
-        ((-100, -100, 100), -32512),
-        ((-100, -50, -100), -32512),
-        ((-100, -50, -50), -63),
-        ((-100, -50, 0), -63),
-        ((-100, -50, 50), -63),
-        ((-100, -50, 100), -32512),
-        ((-100, 0, -100), -32512),
-        ((-100, 0, -50), -32512),
-        ((-100, 0, 0), -32512),
-        ((-100, 0, 50), -32512),
-        ((-100, 0, 100), -32512),
-        ((-100, 50, -100), -32512),
-        ((-100, 50, -50), -32512),
-        ((-100, 50, 0), -32512),
-        ((-100, 50, 50), -32512),
-        ((-100, 50, 100), -32512),
-        ((-100, 100, -100), -32512),
-        ((-100, 100, -50), -32512),
-        ((-100, 100, 0), -32512),
-        ((-100, 100, 50), -32512),
-        ((-100, 100, 100), -32512),
-        ((-50, -100, -100), -32512),
-        ((-50, -100, -50), -32512),
-        ((-50, -100, 0), -32512),
-        ((-50, -100, 50), -32512),
-        ((-50, -100, 100), -32512),
-        ((-50, -50, -100), -32512),
-        ((-50, -50, -50), -32512),
-        ((-50, -50, 0), -32512),
-        ((-50, -50, 50), -32512),
-        ((-50, -50, 100), -32512),
-        ((-50, 0, -100), -32512),
-        ((-50, 0, -50), -32512),
-        ((-50, 0, 0), -32512),
-        ((-50, 0, 50), -32512),
-        ((-50, 0, 100), -32512),
-        ((-50, 50, -100), -32512),
-        ((-50, 50, -50), -32512),
-        ((-50, 50, 0), -32512),
-        ((-50, 50, 50), -32512),
-        ((-50, 50, 100), -32512),
-        ((-50, 100, -100), -32512),
-        ((-50, 100, -50), -32512),
-        ((-50, 100, 0), 80),
-        ((-50, 100, 50), -32512),
-        ((-50, 100, 100), -32512),
-        ((0, -100, -100), -32512),
-        ((0, -100, -50), -32512),
-        ((0, -100, 0), -32512),
-        ((0, -100, 50), -32512),
-        ((0, -100, 100), -32512),
-        ((0, -50, -100), -32512),
-        ((0, -50, -50), -32512),
-        ((0, -50, 0), -32512),
-        ((0, -50, 50), -32512),
-        ((0, -50, 100), -32512),
-        ((0, 0, -100), -32512),
-        ((0, 0, -50), -32512),
-        ((0, 0, 0), -32512),
-        ((0, 0, 50), -32512),
-        ((0, 0, 100), -32512),
-        ((0, 50, -100), -32512),
-        ((0, 50, -50), -32512),
-        ((0, 50, 0), -32512),
-        ((0, 50, 50), -32512),
-        ((0, 50, 100), -32512),
-        ((0, 100, -100), -32512),
-        ((0, 100, -50), -32512),
-        ((0, 100, 0), 80),
-        ((0, 100, 50), -32512),
-        ((0, 100, 100), -32512),
-        ((50, -100, -100), -32512),
-        ((50, -100, -50), -32512),
-        ((50, -100, 0), -32512),
-        ((50, -100, 50), -32512),
-        ((50, -100, 100), -100),
-        ((50, -50, -100), -32512),
-        ((50, -50, -50), -32512),
-        ((50, -50, 0), -32512),
-        ((50, -50, 50), -32512),
-        ((50, -50, 100), -60),
-        ((50, 0, -100), -32512),
-        ((50, 0, -50), -32512),
-        ((50, 0, 0), -32512),
-        ((50, 0, 50), -32512),
-        ((50, 0, 100), -32512),
-        ((50, 50, -100), -32512),
-        ((50, 50, -50), -32512),
-        ((50, 50, 0), -32512),
-        ((50, 50, 50), -32512),
-        ((50, 50, 100), -32512),
-        ((50, 100, -100), -32512),
-        ((50, 100, -50), -32512),
-        ((50, 100, 0), 80),
-        ((50, 100, 50), -32512),
-        ((50, 100, 100), -32512),
-        ((100, -100, -100), -32512),
-        ((100, -100, -50), -32512),
-        ((100, -100, 0), -32512),
-        ((100, -100, 50), -103),
-        ((100, -100, 100), -100),
-        ((100, -50, -100), -32512),
-        ((100, -50, -50), -32512),
-        ((100, -50, 0), -32512),
-        ((100, -50, 50), -32512),
-        ((100, -50, 100), -60),
-        ((100, 0, -100), -32512),
-        ((100, 0, -50), -32512),
-        ((100, 0, 0), -32512),
-        ((100, 0, 50), -32512),
-        ((100, 0, 100), -32512),
-        ((100, 50, -100), -32512),
-        ((100, 50, -50), -32512),
-        ((100, 50, 0), -32512),
-        ((100, 50, 50), -32512),
-        ((100, 50, 100), -32512),
-        ((100, 100, -100), -32512),
-        ((100, 100, -50), -32512),
-        ((100, 100, 0), 80),
-        ((100, 100, 50), -32512),
-        ((100, 100, 100), -32512),
-    ];
-    const AQ_FBS: &[((i32, i32, i32), u8)] = &[
-        ((-100, -100, -100), 1),
-        ((-100, -100, -50), 2),
-        ((-100, -100, 0), 1),
-        ((-100, -100, 50), 1),
-        ((-100, -100, 100), 1),
-        ((-100, -50, -100), 1),
-        ((-100, -50, -50), 2),
-        ((-100, -50, 0), 2),
-        ((-100, -50, 50), 2),
-        ((-100, -50, 100), 1),
-        ((-100, 0, -100), 1),
-        ((-100, 0, -50), 1),
-        ((-100, 0, 0), 1),
-        ((-100, 0, 50), 1),
-        ((-100, 0, 100), 1),
-        ((-100, 50, -100), 1),
-        ((-100, 50, -50), 1),
-        ((-100, 50, 0), 1),
-        ((-100, 50, 50), 1),
-        ((-100, 50, 100), 1),
-        ((-100, 100, -100), 1),
-        ((-100, 100, -50), 1),
-        ((-100, 100, 0), 1),
-        ((-100, 100, 50), 1),
-        ((-100, 100, 100), 1),
-        ((-50, -100, -100), 1),
-        ((-50, -100, -50), 1),
-        ((-50, -100, 0), 2),
-        ((-50, -100, 50), 2),
-        ((-50, -100, 100), 1),
-        ((-50, -50, -100), 1),
-        ((-50, -50, -50), 1),
-        ((-50, -50, 0), 1),
-        ((-50, -50, 50), 1),
-        ((-50, -50, 100), 1),
-        ((-50, 0, -100), 2),
-        ((-50, 0, -50), 1),
-        ((-50, 0, 0), 1),
-        ((-50, 0, 50), 1),
-        ((-50, 0, 100), 1),
-        ((-50, 50, -100), 1),
-        ((-50, 50, -50), 1),
-        ((-50, 50, 0), 2),
-        ((-50, 50, 50), 2),
-        ((-50, 50, 100), 1),
-        ((-50, 100, -100), 1),
-        ((-50, 100, -50), 1),
-        ((-50, 100, 0), 2),
-        ((-50, 100, 50), 2),
-        ((-50, 100, 100), 2),
-        ((0, -100, -100), 1),
-        ((0, -100, -50), 2),
-        ((0, -100, 0), 2),
-        ((0, -100, 50), 2),
-        ((0, -100, 100), 1),
-        ((0, -50, -100), 1),
-        ((0, -50, -50), 1),
-        ((0, -50, 0), 1),
-        ((0, -50, 50), 1),
-        ((0, -50, 100), 1),
-        ((0, 0, -100), 2),
-        ((0, 0, -50), 2),
-        ((0, 0, 0), 1),
-        ((0, 0, 50), 1),
-        ((0, 0, 100), 1),
-        ((0, 50, -100), 1),
-        ((0, 50, -50), 1),
-        ((0, 50, 0), 1),
-        ((0, 50, 50), 1),
-        ((0, 50, 100), 1),
-        ((0, 100, -100), 1),
-        ((0, 100, -50), 2),
-        ((0, 100, 0), 1),
-        ((0, 100, 50), 1),
-        ((0, 100, 100), 1),
-        ((50, -100, -100), 1),
-        ((50, -100, -50), 2),
-        ((50, -100, 0), 2),
-        ((50, -100, 50), 2),
-        ((50, -100, 100), 1),
-        ((50, -50, -100), 1),
-        ((50, -50, -50), 1),
-        ((50, -50, 0), 1),
-        ((50, -50, 50), 1),
-        ((50, -50, 100), 1),
-        ((50, 0, -100), 2),
-        ((50, 0, -50), 2),
-        ((50, 0, 0), 1),
-        ((50, 0, 50), 1),
-        ((50, 0, 100), 1),
-        ((50, 50, -100), 1),
-        ((50, 50, -50), 1),
-        ((50, 50, 0), 1),
-        ((50, 50, 50), 1),
-        ((50, 50, 100), 1),
-        ((50, 100, -100), 1),
-        ((50, 100, -50), 2),
-        ((50, 100, 0), 1),
-        ((50, 100, 50), 1),
-        ((50, 100, 100), 1),
-        ((100, -100, -100), 1),
-        ((100, -100, -50), 2),
-        ((100, -100, 0), 1),
-        ((100, -100, 50), 1),
-        ((100, -100, 100), 1),
-        ((100, -50, -100), 2),
-        ((100, -50, -50), 2),
-        ((100, -50, 0), 2),
-        ((100, -50, 50), 2),
-        ((100, -50, 100), 2),
-        ((100, 0, -100), 1),
-        ((100, 0, -50), 2),
-        ((100, 0, 0), 1),
-        ((100, 0, 50), 1),
-        ((100, 0, 100), 2),
-        ((100, 50, -100), 1),
-        ((100, 50, -50), 1),
-        ((100, 50, 0), 1),
-        ((100, 50, 50), 1),
-        ((100, 50, 100), 1),
-        ((100, 100, -100), 2),
-        ((100, 100, -50), 2),
-        ((100, 100, 0), 1),
-        ((100, 100, 50), 1),
-        ((100, 100, 100), 1),
-    ];
-    const AQ_FL: &[((i32, i32, i32), (i32, u8))] = &[
-        ((-100, -100, -100), (-32512, 2)),
-        ((-100, -100, -50), (-32512, 2)),
-        ((-100, -100, 0), (-32512, 2)),
-        ((-100, -100, 50), (-32512, 2)),
-        ((-100, -100, 100), (-32512, 2)),
-        ((-100, -50, -100), (-32512, 1)),
-        ((-100, -50, -50), (-63, 2)),
-        ((-100, -50, 0), (-63, 2)),
-        ((-100, -50, 50), (-63, 2)),
-        ((-100, -50, 100), (-32512, 1)),
-        ((-100, 0, -100), (-32512, 1)),
-        ((-100, 0, -50), (-32512, 1)),
-        ((-100, 0, 0), (-32512, 1)),
-        ((-100, 0, 50), (-32512, 1)),
-        ((-100, 0, 100), (-32512, 1)),
-        ((-100, 50, -100), (-32512, 1)),
-        ((-100, 50, -50), (63, 1)),
-        ((-100, 50, 0), (63, 1)),
-        ((-100, 50, 50), (-32512, 1)),
-        ((-100, 50, 100), (63, 1)),
-        ((-100, 100, -100), (63, 1)),
-        ((-100, 100, -50), (63, 1)),
-        ((-100, 100, 0), (63, 1)),
-        ((-100, 100, 50), (63, 1)),
-        ((-100, 100, 100), (63, 1)),
-        ((-50, -100, -100), (-32512, 2)),
-        ((-50, -100, -50), (-32512, 2)),
-        ((-50, -100, 0), (-32512, 2)),
-        ((-50, -100, 50), (-32512, 2)),
-        ((-50, -100, 100), (-32512, 2)),
-        ((-50, -50, -100), (-32512, 1)),
-        ((-50, -50, -50), (-32512, 1)),
-        ((-50, -50, 0), (-32512, 1)),
-        ((-50, -50, 50), (-32512, 1)),
-        ((-50, -50, 100), (-32512, 1)),
-        ((-50, 0, -100), (-32512, 1)),
-        ((-50, 0, -50), (-32512, 1)),
-        ((-50, 0, 0), (-32512, 1)),
-        ((-50, 0, 50), (-32512, 1)),
-        ((-50, 0, 100), (-32512, 1)),
-        ((-50, 50, -100), (-32512, 1)),
-        ((-50, 50, -50), (63, 1)),
-        ((-50, 50, 0), (63, 1)),
-        ((-50, 50, 50), (-32512, 1)),
-        ((-50, 50, 100), (63, 1)),
-        ((-50, 100, -100), (63, 1)),
-        ((-50, 100, -50), (63, 1)),
-        ((-50, 100, 0), (63, 1)),
-        ((-50, 100, 50), (63, 1)),
-        ((-50, 100, 100), (63, 1)),
-        ((0, -100, -100), (-32512, 2)),
-        ((0, -100, -50), (-32512, 2)),
-        ((0, -100, 0), (-32512, 2)),
-        ((0, -100, 50), (-32512, 2)),
-        ((0, -100, 100), (-32512, 2)),
-        ((0, -50, -100), (-32512, 1)),
-        ((0, -50, -50), (-32512, 1)),
-        ((0, -50, 0), (-32512, 1)),
-        ((0, -50, 50), (-32512, 1)),
-        ((0, -50, 100), (-32512, 1)),
-        ((0, 0, -100), (-32512, 1)),
-        ((0, 0, -50), (-32512, 1)),
-        ((0, 0, 0), (-32512, 1)),
-        ((0, 0, 50), (-32512, 1)),
-        ((0, 0, 100), (-32512, 1)),
-        ((0, 50, -100), (-32512, 1)),
-        ((0, 50, -50), (63, 1)),
-        ((0, 50, 0), (63, 1)),
-        ((0, 50, 50), (-32512, 1)),
-        ((0, 50, 100), (-32512, 1)),
-        ((0, 100, -100), (63, 1)),
-        ((0, 100, -50), (63, 1)),
-        ((0, 100, 0), (63, 1)),
-        ((0, 100, 50), (63, 1)),
-        ((0, 100, 100), (63, 1)),
-        ((50, -100, -100), (-32512, 2)),
-        ((50, -100, -50), (-32512, 2)),
-        ((50, -100, 0), (-32512, 2)),
-        ((50, -100, 50), (-32512, 2)),
-        ((50, -100, 100), (-100, 2)),
-        ((50, -50, -100), (-32512, 1)),
-        ((50, -50, -50), (-32512, 1)),
-        ((50, -50, 0), (-32512, 1)),
-        ((50, -50, 50), (-32512, 1)),
-        ((50, -50, 100), (-60, 1)),
-        ((50, 0, -100), (-32512, 1)),
-        ((50, 0, -50), (-32512, 1)),
-        ((50, 0, 0), (-32512, 1)),
-        ((50, 0, 50), (-32512, 1)),
-        ((50, 0, 100), (-32512, 1)),
-        ((50, 50, -100), (-32512, 1)),
-        ((50, 50, -50), (63, 1)),
-        ((50, 50, 0), (63, 1)),
-        ((50, 50, 50), (63, 1)),
-        ((50, 50, 100), (-32512, 1)),
-        ((50, 100, -100), (-32512, 1)),
-        ((50, 100, -50), (63, 1)),
-        ((50, 100, 0), (63, 1)),
-        ((50, 100, 50), (63, 1)),
-        ((50, 100, 100), (63, 1)),
-        ((100, -100, -100), (-32512, 2)),
-        ((100, -100, -50), (-32512, 2)),
-        ((100, -100, 0), (-32512, 2)),
-        ((100, -100, 50), (-103, 2)),
-        ((100, -100, 100), (-100, 2)),
-        ((100, -50, -100), (-32512, 1)),
-        ((100, -50, -50), (-32512, 1)),
-        ((100, -50, 0), (-32512, 1)),
-        ((100, -50, 50), (-32512, 1)),
-        ((100, -50, 100), (-60, 2)),
-        ((100, 0, -100), (-32512, 1)),
-        ((100, 0, -50), (-32512, 1)),
-        ((100, 0, 0), (-32512, 1)),
-        ((100, 0, 50), (-32512, 1)),
-        ((100, 0, 100), (-32512, 1)),
-        ((100, 50, -100), (63, 1)),
-        ((100, 50, -50), (63, 1)),
-        ((100, 50, 0), (63, 1)),
-        ((100, 50, 50), (63, 1)),
-        ((100, 50, 100), (-32512, 1)),
-        ((100, 100, -100), (63, 1)),
-        ((100, 100, -50), (63, 1)),
-        ((100, 100, 0), (63, 1)),
-        ((100, 100, 50), (63, 1)),
-        ((100, 100, 100), (63, 1)),
-    ];
-    const AQ_CD: &[((i32, i32, i32, i32, i32), f64)] = &[
-        ((-100, -100, -100, 0, 0), 0.0),
-        ((-100, -100, -50, 50, 0), -19.3),
-        ((-100, -100, 0, 0, 0), 0.0),
-        ((-100, -100, 50, 50, 0), -19.3),
-        ((-100, -100, 100, 0, 0), 0.0),
-        ((-100, -50, -100, 0, 0), 0.0),
-        ((-100, -50, -50, 50, 0), -9.3),
-        ((-100, -50, 0, 0, 0), 0.0),
-        ((-100, -50, 50, 50, 0), -9.3),
-        ((-100, -50, 100, 0, 0), 0.0),
-        ((-100, 0, -100, 0, 0), 0.0),
-        ((-100, 0, -50, -50, 0), 0.20838508),
-        ((-100, 0, 0, 0, 0), 0.0),
-        ((-100, 0, 50, 50, 0), 2.069189),
-        ((-100, 0, 100, 0, 0), 0.0),
-        ((-100, 50, -100, 0, 0), 0.0),
-        ((-100, 50, -50, -50, 0), -40.4),
-        ((-100, 50, 0, 0, 0), 0.0),
-        ((-100, 50, 50, -50, 0), -40.4),
-        ((-100, 50, 100, 0, 0), 0.0),
-        ((-100, 100, -100, 0, 0), 0.0),
-        ((-100, 100, -50, -50, 0), -80.4),
-        ((-100, 100, 0, 0, 0), 0.0),
-        ((-100, 100, 50, -50, 0), -80.4),
-        ((-100, 100, 100, 0, 0), 0.0),
-        ((-50, -100, -100, 0, 50), -19.3),
-        ((-50, -100, -50, 50, 50), 0.0),
-        ((-50, -100, 0, 0, -50), -9.3),
-        ((-50, -100, 50, 50, -50), -9.3),
-        ((-50, -100, 100, 0, -50), -9.3),
-        ((-50, -50, -100, 0, 50), -9.3),
-        ((-50, -50, -50, 50, 50), 0.0),
-        ((-50, -50, 0, 0, -50), 2.2042949518442185),
-        ((-50, -50, 50, 50, -50), 1.8767275908406176),
-        ((-50, -50, 100, 0, -50), 2.3399656359995133),
-        ((-50, 0, -100, 0, -50), -0.08405951),
-        ((-50, 0, -50, -50, -50), 0.0),
-        ((-50, 0, 0, 0, -50), 0.3902410585192353),
-        ((-50, 0, 50, 50, -50), 66.0),
-        ((-50, 0, 100, 0, -50), -0.7930165090675787),
-        ((-50, 50, -100, 0, -50), -40.4),
-        ((-50, 50, -50, -50, -50), 0.0),
-        ((-50, 50, 0, 0, -50), -40.4),
-        ((-50, 50, 50, -50, 50), -0.35570822400215646),
-        ((-50, 50, 100, 0, 50), -0.16770224497207317),
-        ((-50, 100, -100, 0, -50), -80.4),
-        ((-50, 100, -50, -50, -50), 0.0),
-        ((-50, 100, 0, 0, -50), -80.4),
-        ((-50, 100, 50, -50, 50), -40.4),
-        ((-50, 100, 100, 0, 50), -40.4),
-        ((0, -100, -100, 0, 0), 0.0),
-        ((0, -100, -50, -50, 0), -9.3),
-        ((0, -100, 0, 0, 0), 0.0),
-        ((0, -100, 50, 50, 0), -19.3),
-        ((0, -100, 100, 0, 0), 0.0),
-        ((0, -50, -100, 0, 0), 0.0),
-        ((0, -50, -50, -50, 0), 2.857141340264507),
-        ((0, -50, 0, 0, 0), 0.0),
-        ((0, -50, 50, 50, 0), -9.3),
-        ((0, -50, 100, 0, 0), 0.0),
-        ((0, 0, -100, 0, 0), 0.0),
-        ((0, 0, -50, -50, 0), -0.1361016501707068),
-        ((0, 0, 0, 0, 0), 0.0),
-        ((0, 0, 50, 50, 0), 1.9841279541408636),
-        ((0, 0, 100, 0, 0), 0.0),
-        ((0, 50, -100, 0, 0), 0.0),
-        ((0, 50, -50, -50, 0), -40.4),
-        ((0, 50, 0, 0, 0), 0.0),
-        ((0, 50, 50, 50, 0), -0.36331007530382964),
-        ((0, 50, 100, 0, 0), 0.0),
-        ((0, 100, -100, 0, 0), 0.0),
-        ((0, 100, -50, -50, 0), -80.4),
-        ((0, 100, 0, 0, 0), 0.0),
-        ((0, 100, 50, 50, 0), -40.4),
-        ((0, 100, 100, 0, 0), 0.0),
-        ((50, -100, -100, 0, 50), -19.3),
-        ((50, -100, -50, -50, 50), -9.3),
-        ((50, -100, 0, 0, 50), -19.3),
-        ((50, -100, 50, -50, -50), 0.0),
-        ((50, -100, 100, 0, -50), -9.3),
-        ((50, -50, -100, 0, 50), -9.3),
-        ((50, -50, -50, -50, 50), 1.619242225388449),
-        ((50, -50, 0, 0, 50), -9.3),
-        ((50, -50, 50, -50, -50), 0.0),
-        ((50, -50, 100, 0, -50), 2.1561171703198188),
-        ((50, 0, -100, 0, 50), 2.6298865590685954),
-        ((50, 0, -50, -50, 50), 66.0),
-        ((50, 0, 0, 0, 50), 2.572198917833846),
-        ((50, 0, 50, 50, 50), 0.0),
-        ((50, 0, 100, 0, 50), 2.082884998883258),
-        ((50, 50, -100, 0, -50), -40.4),
-        ((50, 50, -50, 50, -50), -0.1894344852785401),
-        ((50, 50, 0, 0, 50), -0.7155260733519367),
-        ((50, 50, 50, 50, 50), 0.0),
-        ((50, 50, 100, 0, 50), -0.4132183490530098),
-        ((50, 100, -100, 0, -50), -80.4),
-        ((50, 100, -50, 50, -50), -40.4),
-        ((50, 100, 0, 0, 50), -40.4),
-        ((50, 100, 50, 50, 50), 0.0),
-        ((50, 100, 100, 0, 50), -40.4),
-        ((100, -100, -100, 0, 0), 0.0),
-        ((100, -100, -50, -50, 0), -9.3),
-        ((100, -100, 0, 0, 0), 0.0),
-        ((100, -100, 50, -50, 0), -9.3),
-        ((100, -100, 100, 0, 0), 0.0),
-        ((100, -50, -100, 0, 0), 0.0),
-        ((100, -50, -50, -50, 0), 1.6711026207576742),
-        ((100, -50, 0, 0, 0), 0.0),
-        ((100, -50, 50, -50, 0), 2.042353012197518),
-        ((100, -50, 100, 0, 0), 0.0),
-        ((100, 0, -100, 0, 0), 0.0),
-        ((100, 0, -50, -50, 0), 0.3145492757856567),
-        ((100, 0, 0, 0, 0), 0.0),
-        ((100, 0, 50, 50, 0), 2.27260703684609),
-        ((100, 0, 100, 0, 0), 0.0),
-        ((100, 50, -100, 0, 0), 0.0),
-        ((100, 50, -50, 50, 0), -0.16949328993376553),
-        ((100, 50, 0, 0, 0), 0.0),
-        ((100, 50, 50, 50, 0), 0.5196380801381327),
-        ((100, 50, 100, 0, 0), 0.0),
-        ((100, 100, -100, 0, 0), 0.0),
-        ((100, 100, -50, 50, 0), -40.4),
-        ((100, 100, 0, 0, 0), 0.0),
-        ((100, 100, 50, 50, 0), -40.4),
-        ((100, 100, 100, 0, 0), 0.0),
-    ];
-    const AQ_AP: &[((i32, i32, i32, f64), &str)] = &[
-        ((112, -100, 64, 0.037482421875), "none"),
-        ((112, -100, 66, 0.037482421875), "none"),
-        ((112, -100, 68, 0.037482421875), "none"),
-        ((112, -100, 70, 0.037482421875), "none"),
-        ((112, -100, 72, 0.037482421875), "none"),
-        ((112, -100, 74, 0.037482421875), "none"),
-        ((112, -80, 64, 0.037482421875), "none"),
-        ((112, -80, 66, 0.037482421875), "none"),
-        ((112, -80, 68, 0.037482421875), "none"),
-        ((112, -80, 70, 0.037482421875), "none"),
-        ((112, -80, 72, 0.037482421875), "none"),
-        ((112, -80, 74, 0.037482421875), "none"),
-        ((112, -60, 64, 0.04861063447117113), "none"),
-        ((112, -60, 66, 0.04924175767418443), "none"),
-        ((112, -60, 68, 0.04989611436947345), "none"),
-        ((112, -60, 70, 0.0505756649980066), "none"),
-        ((112, -60, 72, 0.051280297037227154), "none"),
-        ((112, -60, 74, 0.05200473277817172), "none"),
-        ((112, -40, 64, 0.10768778489063564), "none"),
-        ((112, -40, 66, 0.11167582884587932), "none"),
-        ((112, -40, 68, 0.1150242394949102), "none"),
-        ((112, -40, 70, 0.11846243756482717), "none"),
-        ((112, -40, 72, 0.12198087391634192), "none"),
-        ((112, -40, 74, 0.12558796524209848), "none"),
-        ((112, -20, 64, 0.10797485850904144), "none"),
-        ((112, -20, 66, 0.10725848123542484), "none"),
-        ((112, -20, 68, 0.1061187765379769), "none"),
-        ((112, -20, 70, 0.10630527141203541), "none"),
-        ((112, -20, 72, 0.10955530075188523), "none"),
-        ((112, -20, 74, 0.11296050502041746), "none"),
-        ((112, 0, 64, -0.0016242211141160837), "none"),
-        ((112, 0, 68, 0.0013878562706830444), "none"),
-        ((112, 0, 70, 0.0030297756784707407), "none"),
-        ((112, 0, 72, 0.004722310162617811), "none"),
-        ((112, 0, 74, 0.0064699315064971315), "none"),
-        ((112, 20, 64, 0.042774410930765096), "none"),
-        ((112, 20, 66, 0.040191327400772414), "none"),
-        ((112, 20, 68, 0.0375637494138927), "none"),
-        ((112, 20, 70, 0.03485919313914573), "none"),
-        ((112, 20, 72, 0.032058901444915404), "none"),
-        ((112, 20, 74, 0.029170651813548235), "none"),
-        ((112, 40, 64, 0.011596925999172775), "none"),
-        ((112, 40, 66, 0.014957019593043965), "none"),
-        ((112, 40, 68, 0.01827627643898028), "none"),
-        ((112, 40, 70, 0.021477214738188897), "none"),
-        ((112, 40, 72, 0.02448508577325224), "none"),
-        ((112, 40, 74, 0.027262647782191486), "none"),
-        ((112, 60, 64, 0.14338446306313316), "none"),
-        ((112, 60, 66, 0.16772904485726645), "none"),
-        ((112, 60, 68, 0.1756309873589998), "none"),
-        ((112, 60, 70, 0.1782686032102433), "none"),
-        ((112, 60, 72, 0.18822148746793055), "none"),
-        ((112, 60, 74, 0.20387997189913717), "none"),
-        ((112, 80, 64, -0.28931054817132484), "air"),
-        ((112, 80, 66, -0.2808098154769529), "air"),
-        ((112, 80, 68, -0.2806908647477032), "air"),
-        ((112, 80, 70, -0.28068300576359284), "air"),
-        ((112, 80, 72, -0.2805878392398348), "air"),
-        ((112, 80, 74, -0.27824504138444317), "air"),
-        ((112, 100, 64, -0.4583333333333333), "air"),
-        ((112, 100, 66, -0.4583333333333333), "air"),
-        ((112, 100, 68, -0.4583333333333333), "air"),
-        ((112, 100, 70, -0.4583333333333333), "air"),
-        ((112, 100, 72, -0.4583333333333333), "air"),
-        ((112, 100, 74, -0.4583333333333333), "air"),
-        ((114, -100, 64, 0.037482421875), "none"),
-        ((114, -100, 66, 0.037482421875), "none"),
-        ((114, -100, 68, 0.037482421875), "none"),
-        ((114, -100, 70, 0.037482421875), "none"),
-        ((114, -100, 72, 0.037482421875), "none"),
-        ((114, -100, 74, 0.037482421875), "none"),
-        ((114, -80, 64, 0.037482421875), "none"),
-        ((114, -80, 66, 0.037482421875), "none"),
-        ((114, -80, 68, 0.037482421875), "none"),
-        ((114, -80, 70, 0.037482421875), "none"),
-        ((114, -80, 72, 0.037482421875), "none"),
-        ((114, -80, 74, 0.037482421875), "none"),
-        ((114, -60, 64, 0.0491033911468506), "none"),
-        ((114, -60, 66, 0.04974948234981454), "none"),
-        ((114, -60, 68, 0.05041864489941496), "none"),
-        ((114, -60, 70, 0.051112999802414315), "none"),
-        ((114, -60, 72, 0.051832684146704056), "none"),
-        ((114, -60, 74, 0.05257231446254198), "none"),
-        ((114, -40, 64, 0.1122919611041932), "none"),
-        ((114, -40, 66, 0.11636247433302638), "none"),
-        ((114, -40, 68, 0.11979640774332366), "none"),
-        ((114, -40, 70, 0.12330055500715384), "none"),
-        ((114, -40, 72, 0.1268619579414046), "none"),
-        ((114, -40, 74, 0.13048474950215), "none"),
-        ((114, -20, 64, 0.10435296791344484), "none"),
-        ((114, -20, 66, 0.10558672714675042), "none"),
-        ((114, -20, 68, 0.10831868013423275), "none"),
-        ((114, -20, 70, 0.11121282163190734), "none"),
-        ((114, -20, 72, 0.11433776346079558), "none"),
-        ((114, -20, 74, 0.11770444723497474), "none"),
-        ((114, 0, 64, -0.0026209759846139574), "water"),
-        ((114, 0, 66, -0.0011869543056835608), "water"),
-        ((114, 0, 70, 0.002068623223791626), "none"),
-        ((114, 0, 72, 0.0038193250297024243), "none"),
-        ((114, 0, 74, 0.005646396361630968), "none"),
-        ((114, 20, 64, 0.04183884597405475), "none"),
-        ((114, 20, 66, 0.039334239558802865), "none"),
-        ((114, 20, 68, 0.0367933735261107), "none"),
-        ((114, 20, 70, 0.03417828296442246), "none"),
-        ((114, 20, 72, 0.03146119496538579), "none"),
-        ((114, 20, 74, 0.028640178813057193), "none"),
-        ((114, 40, 64, 0.0011727557986376189), "none"),
-        ((114, 40, 66, 0.004478197250912497), "none"),
-        ((114, 40, 68, 0.007807656734373648), "none"),
-        ((114, 40, 70, 0.0110982528501824), "none"),
-        ((114, 40, 72, 0.014287968294347897), "none"),
-        ((114, 40, 74, 0.017340060385442255), "none"),
-        ((114, 60, 64, 0.057307692379898946), "none"),
-        ((114, 60, 66, 0.07909878599088975), "none"),
-        ((114, 60, 68, 0.09103769264897049), "none"),
-        ((114, 60, 70, 0.10529675531043547), "none"),
-        ((114, 60, 72, 0.1261191394093652), "none"),
-        ((114, 60, 74, 0.15323465023530602), "none"),
-        ((114, 80, 64, -0.3135251519473628), "air"),
-        ((114, 80, 66, -0.3092766951165722), "air"),
-        ((114, 80, 68, -0.3063751991759311), "air"),
-        ((114, 80, 70, -0.3004342091280733), "air"),
-        ((114, 80, 72, -0.29703745590700253), "air"),
-        ((114, 80, 74, -0.2920638815250855), "air"),
-        ((114, 100, 64, -0.4583333333333333), "air"),
-        ((114, 100, 66, -0.4583333333333333), "air"),
-        ((114, 100, 68, -0.4583333333333333), "air"),
-        ((114, 100, 70, -0.4583333333333333), "air"),
-        ((114, 100, 72, -0.4583333333333333), "air"),
-        ((114, 100, 74, -0.4583333333333333), "air"),
-        ((116, -100, 64, 0.037482421875), "none"),
-        ((116, -100, 66, 0.037482421875), "none"),
-        ((116, -100, 68, 0.037482421875), "none"),
-        ((116, -100, 70, 0.037482421875), "none"),
-        ((116, -100, 72, 0.037482421875), "none"),
-        ((116, -100, 74, 0.037482421875), "none"),
-        ((116, -80, 64, 0.037482421875), "none"),
-        ((116, -80, 66, 0.037482421875), "none"),
-        ((116, -80, 68, 0.037482421875), "none"),
-        ((116, -80, 70, 0.037482421875), "none"),
-        ((116, -80, 72, 0.037482421875), "none"),
-        ((116, -80, 74, 0.037482421875), "none"),
-        ((116, -60, 64, 0.049510031628008565), "none"),
-        ((116, -60, 66, 0.0501688864114582), "none"),
-        ((116, -60, 68, 0.05085081029508635), "none"),
-        ((116, -60, 70, 0.051557962654552196), "none"),
-        ((116, -60, 72, 0.05229073376331405), "none"),
-        ((116, -60, 74, 0.05304386684600273), "none"),
-        ((116, -40, 64, 0.11647696380354154), "none"),
-        ((116, -40, 66, 0.12065670598690036), "none"),
-        ((116, -40, 68, 0.124186198423662), "none"),
-        ((116, -40, 70, 0.12776934001653206), "none"),
-        ((116, -40, 72, 0.1313900411197126), "none"),
-        ((116, -40, 74, 0.13504793394752057), "none"),
-        ((116, -20, 64, 0.10797310440989095), "none"),
-        ((116, -20, 66, 0.11052803071968675), "none"),
-        ((116, -20, 68, 0.11313075983384659), "none"),
-        ((116, -20, 70, 0.11589560860382501), "none"),
-        ((116, -20, 72, 0.11889599517563405), "none"),
-        ((116, -20, 74, 0.12214992807094607), "none"),
-        ((116, 0, 64, -0.003764380972543319), "water"),
-        ((116, 0, 66, -0.002339168705169207), "water"),
-        ((116, 0, 72, 0.0027605740566328273), "none"),
-        ((116, 0, 74, 0.0046712919320928475), "none"),
-        ((116, 20, 64, 0.04027812111674997), "none"),
-        ((116, 20, 66, 0.03846080745866824), "none"),
-        ((116, 20, 68, 0.03602535830962611), "none"),
-        ((116, 20, 70, 0.033477031827460015), "none"),
-        ((116, 20, 72, 0.03082854239914883), "none"),
-        ((116, 20, 74, 0.028967404819271153), "none"),
-        ((116, 40, 64, -0.009355588931802767), "none"),
-        ((116, 40, 66, -0.006094366713842806), "air"),
-        ((116, 40, 68, -0.0027537988904787606), "air"),
-        ((116, 40, 72, 0.00396682662711753), "none"),
-        ((116, 40, 74, 0.007260950530417173), "none"),
-        ((116, 60, 64, 0.022624582978071506), "none"),
-        ((116, 60, 66, 0.023942871216082746), "none"),
-        ((116, 60, 68, 0.037192323513527165), "none"),
-        ((116, 60, 70, 0.053305618429865455), "none"),
-        ((116, 60, 72, 0.06694547220363958), "none"),
-        ((116, 60, 74, 0.08711813973093903), "none"),
-        ((116, 80, 64, -0.3326652310213258), "air"),
-        ((116, 80, 66, -0.32962834810938174), "air"),
-        ((116, 80, 68, -0.32236370014057947), "air"),
-        ((116, 80, 70, -0.31670491006554574), "air"),
-        ((116, 80, 72, -0.3130639601887072), "air"),
-        ((116, 80, 74, -0.3124769234268471), "air"),
-        ((116, 100, 64, -0.4583333333333333), "air"),
-        ((116, 100, 66, -0.4583333333333333), "air"),
-        ((116, 100, 68, -0.4583333333333333), "air"),
-        ((116, 100, 70, -0.4583333333333333), "air"),
-        ((116, 100, 72, -0.4583333333333333), "air"),
-        ((116, 100, 74, -0.4583333333333333), "air"),
-        ((118, -100, 64, 0.037482421875), "none"),
-        ((118, -100, 66, 0.037482421875), "none"),
-        ((118, -100, 68, 0.037482421875), "none"),
-        ((118, -100, 70, 0.037482421875), "none"),
-        ((118, -100, 72, 0.037482421875), "none"),
-        ((118, -100, 74, 0.037482421875), "none"),
-        ((118, -80, 64, 0.037482421875), "none"),
-        ((118, -80, 66, 0.037482421875), "none"),
-        ((118, -80, 68, 0.037482421875), "none"),
-        ((118, -80, 70, 0.037482421875), "none"),
-        ((118, -80, 72, 0.037482421875), "none"),
-        ((118, -80, 74, 0.037482421875), "none"),
-        ((118, -60, 64, 0.04983026397203373), "none"),
-        ((118, -60, 66, 0.05049926028532013), "none"),
-        ((118, -60, 68, 0.05119129093033625), "none"),
-        ((118, -60, 70, 0.05190836104462707), "none"),
-        ((118, -60, 72, 0.0526510917415344), "none"),
-        ((118, -60, 74, 0.05341462434689053), "none"),
-        ((118, -40, 64, 0.12023506214440967), "none"),
-        ((118, -40, 66, 0.12453642919562771), "none"),
-        ((118, -40, 68, 0.1281709824736104), "none"),
-        ((118, -40, 70, 0.13184553502467083), "none"),
-        ((118, -40, 72, 0.13554113610267055), "none"),
-        ((118, -40, 74, 0.13925273367632113), "none"),
-        ((118, -20, 64, 0.11282016461369758), "none"),
-        ((118, -20, 66, 0.11526093589883914), "none"),
-        ((118, -20, 68, 0.11774539644635261), "none"),
-        ((118, -20, 70, 0.12038440430256446), "none"),
-        ((118, -20, 72, 0.12325317705242089), "none"),
-        ((118, -20, 74, 0.12637678353248477), "none"),
-        ((118, 0, 64, -0.00501589634392619), "water"),
-        ((118, 0, 66, -0.003601631485605401), "water"),
-        ((118, 0, 68, -0.0020166185756455924), "water"),
-        ((118, 0, 72, 0.0015704124446037308), "none"),
-        ((118, 0, 74, 0.0035605198020311826), "none"),
-        ((118, 20, 64, 0.040232966220497414), "none"),
-        ((118, 20, 66, 0.039486572716430204), "none"),
-        ((118, 20, 68, 0.03885242305023035), "none"),
-        ((118, 20, 70, 0.03837601204655802), "none"),
-        ((118, 20, 72, 0.03770430407795084), "none"),
-        ((118, 20, 74, 0.03707763999605109), "none"),
-        ((118, 40, 64, -0.016298811685686653), "none"),
-        ((118, 40, 66, -0.016656636719901533), "air"),
-        ((118, 40, 68, -0.01330299024830442), "air"),
-        ((118, 40, 70, -0.009864486324034218), "air"),
-        ((118, 40, 72, -0.006380723268648157), "air"),
-        ((118, 40, 74, -0.002886835272463701), "air"),
-        ((118, 60, 64, 0.006086790713922152), "none"),
-        ((118, 60, 66, 0.006014479808113486), "none"),
-        ((118, 60, 68, 0.008953321476532182), "none"),
-        ((118, 60, 70, 0.011915636473415587), "none"),
-        ((118, 60, 72, 0.01001192490238903), "none"),
-        ((118, 60, 74, 0.0075500927486281426), "none"),
-        ((118, 80, 64, -0.3462118919745469), "air"),
-        ((118, 80, 66, -0.34419241078645835), "air"),
-        ((118, 80, 68, -0.33580861045450133), "air"),
-        ((118, 80, 70, -0.33008534054566163), "air"),
-        ((118, 80, 72, -0.333649815109498), "air"),
-        ((118, 80, 74, -0.33771329428807284), "air"),
-        ((118, 100, 64, -0.4583333333333333), "air"),
-        ((118, 100, 66, -0.4583333333333333), "air"),
-        ((118, 100, 68, -0.4583333333333333), "air"),
-        ((118, 100, 70, -0.4583333333333333), "air"),
-        ((118, 100, 72, -0.4583333333333333), "air"),
-        ((118, 100, 74, -0.4583333333333333), "air"),
-        ((120, -100, 64, 0.037482421875), "none"),
-        ((120, -100, 66, 0.037482421875), "none"),
-        ((120, -100, 68, 0.037482421875), "none"),
-        ((120, -100, 70, 0.037482421875), "none"),
-        ((120, -100, 72, 0.037482421875), "none"),
-        ((120, -100, 74, 0.037482421875), "none"),
-        ((120, -80, 64, 0.037482421875), "none"),
-        ((120, -80, 66, 0.037482421875), "none"),
-        ((120, -80, 68, 0.037482421875), "none"),
-        ((120, -80, 70, 0.037482421875), "none"),
-        ((120, -80, 72, 0.037482421875), "none"),
-        ((120, -80, 74, 0.037482421875), "none"),
-        ((120, -60, 64, 0.05006400032487905), "none"),
-        ((120, -60, 66, 0.05074065517392799), "none"),
-        ((120, -60, 68, 0.05144011744518559), "none"),
-        ((120, -60, 70, 0.05216399757431933), "none"),
-        ((120, -60, 72, 0.052913091382129525), "none"),
-        ((120, -60, 74, 0.053683198493088384), "none"),
-        ((120, -40, 64, 0.1235607292468892), "none"),
-        ((120, -40, 66, 0.12798336289135304), "none"),
-        ((120, -40, 68, 0.13173164094126777), "none"),
-        ((120, -40, 70, 0.13550880522456066), "none"),
-        ((120, -40, 72, 0.1392932761010718), "none"),
-        ((120, -40, 74, 0.14307520910884483), "none"),
-        ((120, -20, 64, 0.11746888767713162), "none"),
-        ((120, -20, 66, 0.1198086187834423), "none"),
-        ((120, -20, 68, 0.12218509691580316), "none"),
-        ((120, -20, 70, 0.12469970986670785), "none"),
-        ((120, -20, 72, 0.1274266324562779), "none"),
-        ((120, -20, 74, 0.13039812171785095), "none"),
-        ((120, 0, 64, -0.006329576321547214), "water"),
-        ((120, 0, 66, -0.004930192503238298), "water"),
-        ((120, 0, 68, -0.003355964670343278), "water"),
-        ((120, 0, 70, -0.0016206542469077872), "water"),
-        ((120, 0, 74, 0.002332419553726638), "none"),
-        ((120, 20, 64, 0.04783863627983937), "none"),
-        ((120, 20, 66, 0.04699098011102891), "none"),
-        ((120, 20, 68, 0.046231913852781324), "none"),
-        ((120, 20, 70, 0.04560004002476374), "none"),
-        ((120, 20, 72, 0.04512419653798615), "none"),
-        ((120, 20, 74, 0.04482086018104904), "none"),
-        ((120, 40, 64, -0.017456523705167773), "none"),
-        ((120, 40, 66, -0.020044623482270124), "air"),
-        ((120, 40, 68, -0.022372181411266172), "air"),
-        ((120, 40, 70, -0.020228945291907708), "air"),
-        ((120, 40, 72, -0.01664436674077766), "air"),
-        ((120, 40, 74, -0.013001583733654043), "air"),
-        ((120, 60, 64, -0.010805185122555435), "water"),
-        ((120, 60, 66, -0.011684313707812422), "water"),
-        ((120, 60, 68, -0.007705484690135335), "water"),
-        ((120, 60, 70, -0.012326309226980426), "water"),
-        ((120, 60, 72, -0.019043795741958334), "water"),
-        ((120, 60, 74, -0.023185441889689514), "water"),
-        ((120, 80, 64, -0.3611328625547435), "air"),
-        ((120, 80, 66, -0.3586517592327399), "air"),
-        ((120, 80, 68, -0.3524534485283812), "air"),
-        ((120, 80, 70, -0.35323218454039057), "air"),
-        ((120, 80, 72, -0.36213549677301105), "air"),
-        ((120, 80, 74, -0.3684474143996314), "air"),
-        ((120, 100, 64, -0.4583333333333333), "air"),
-        ((120, 100, 66, -0.4583333333333333), "air"),
-        ((120, 100, 68, -0.4583333333333333), "air"),
-        ((120, 100, 70, -0.4583333333333333), "air"),
-        ((120, 100, 72, -0.4583333333333333), "air"),
-        ((120, 100, 74, -0.4583333333333333), "air"),
-        ((122, -100, 64, 0.037482421875), "none"),
-        ((122, -100, 66, 0.037482421875), "none"),
-        ((122, -100, 68, 0.037482421875), "none"),
-        ((122, -100, 70, 0.037482421875), "none"),
-        ((122, -100, 72, 0.037482421875), "none"),
-        ((122, -100, 74, 0.037482421875), "none"),
-        ((122, -80, 64, 0.037482421875), "none"),
-        ((122, -80, 66, 0.037482421875), "none"),
-        ((122, -80, 68, 0.037482421875), "none"),
-        ((122, -80, 70, 0.037482421875), "none"),
-        ((122, -80, 72, 0.037482421875), "none"),
-        ((122, -80, 74, 0.037482421875), "none"),
-        ((122, -60, 64, 0.050211152183993704), "none"),
-        ((122, -60, 66, 0.05089355899866971), "none"),
-        ((122, -60, 68, 0.05159826596516877), "none"),
-        ((122, -60, 70, 0.05232622949491639), "none"),
-        ((122, -60, 72, 0.053078329171471185), "none"),
-        ((122, -60, 74, 0.05385122904837061), "none"),
-        ((122, -40, 64, 0.12644943947294945), "none"),
-        ((122, -40, 66, 0.13095960991588632), "none"),
-        ((122, -40, 68, 0.13485451601704876), "none"),
-        ((122, -40, 70, 0.13874405974643175), "none"),
-        ((122, -40, 72, 0.1426292409194739), "none"),
-        ((122, -40, 74, 0.14649538659711875), "none"),
-        ((122, -20, 64, 0.12191638116406471), "none"),
-        ((122, -20, 66, 0.12416901766463509), "none"),
-        ((122, -20, 68, 0.1264480340172126), "none"),
-        ((122, -20, 70, 0.12884021810202248), "none"),
-        ((122, -20, 72, 0.13141636494496137), "none"),
-        ((122, -20, 74, 0.13421609155559988), "none"),
-        ((122, 0, 64, -0.007667256303541582), "water"),
-        ((122, 0, 66, -0.006288822820341533), "water"),
-        ((122, 0, 68, -0.004737470102527975), "water"),
-        ((122, 0, 70, -0.0030099389619020873), "water"),
-        ((122, 0, 72, -0.0010942861750551764), "water"),
-        ((122, 0, 74, 0.001001992078975999), "none"),
-        ((122, 20, 64, 0.05535892661135848), "none"),
-        ((122, 20, 66, 0.05444413322973901), "none"),
-        ((122, 20, 68, 0.05359719969130291), "none"),
-        ((122, 20, 70, 0.05284624631887433), "none"),
-        ((122, 20, 72, 0.052209127741325245), "none"),
-        ((122, 20, 74, 0.05170112238940831), "none"),
-        ((122, 40, 64, -0.013498316953033454), "none"),
-        ((122, 40, 66, -0.016896390550754353), "air"),
-        ((122, 40, 68, -0.01994683889106233), "air"),
-        ((122, 40, 70, -0.022658183924480487), "air"),
-        ((122, 40, 72, -0.02460705550987633), "air"),
-        ((122, 40, 74, -0.02133677750482264), "none"),
-        ((122, 60, 64, -0.02580014098083049), "water"),
-        ((122, 60, 66, -0.027410062228040422), "water"),
-        ((122, 60, 68, -0.02425659570836858), "water"),
-        ((122, 60, 70, -0.03261718168256943), "water"),
-        ((122, 60, 72, -0.04369665936638442), "water"),
-        ((122, 60, 74, -0.04490159197647781), "water"),
-        ((122, 80, 64, -0.37247525946547166), "air"),
-        ((122, 80, 66, -0.3727266378002749), "air"),
-        ((122, 80, 68, -0.36804742745663505), "air"),
-        ((122, 80, 70, -0.3736723706537362), "air"),
-        ((122, 80, 72, -0.3860951288334311), "air"),
-        ((122, 80, 74, -0.3923721309133264), "air"),
-        ((122, 100, 64, -0.4583333333333333), "air"),
-        ((122, 100, 66, -0.4583333333333333), "air"),
-        ((122, 100, 68, -0.4583333333333333), "air"),
-        ((122, 100, 70, -0.4583333333333333), "air"),
-        ((122, 100, 72, -0.4583333333333333), "air"),
-        ((122, 100, 74, -0.4583333333333333), "air"),
-        ((124, -100, 64, 0.037482421875), "none"),
-        ((124, -100, 66, 0.037482421875), "none"),
-        ((124, -100, 68, 0.037482421875), "none"),
-        ((124, -100, 70, 0.037482421875), "none"),
-        ((124, -100, 72, 0.037482421875), "none"),
-        ((124, -100, 74, 0.037482421875), "none"),
-        ((124, -80, 64, 0.037482421875), "none"),
-        ((124, -80, 66, 0.037482421875), "none"),
-        ((124, -80, 68, 0.037482421875), "none"),
-        ((124, -80, 70, 0.037482421875), "none"),
-        ((124, -80, 72, 0.037482421875), "none"),
-        ((124, -80, 74, 0.037482421875), "none"),
-        ((124, -60, 64, 0.05027131800090962), "none"),
-        ((124, -60, 66, 0.0509584844305151), "none"),
-        ((124, -60, 68, 0.05166719216129481), "none"),
-        ((124, -60, 70, 0.05239749814810798), "none"),
-        ((124, -60, 72, 0.053150241639753654), "none"),
-        ((124, -60, 74, 0.053923063702221205), "none"),
-        ((124, -40, 64, 0.1288961855391929), "none"),
-        ((124, -40, 66, 0.13348604127036617), "none"),
-        ((124, -40, 68, 0.13753360917037172), "none"),
-        ((124, -40, 70, 0.1415440368478666), "none"),
-        ((124, -40, 72, 0.1455395599824845), "none"),
-        ((124, -40, 74, 0.1495006614184435), "none"),
-        ((124, -20, 64, 0.12612367959767024), "none"),
-        ((124, -20, 66, 0.12830319402402945), "none"),
-        ((124, -20, 68, 0.1304960062341348), "none"),
-        ((124, -20, 70, 0.1327707947453995), "none"),
-        ((124, -20, 72, 0.13519345838131658), "none"),
-        ((124, -20, 74, 0.13781110986582973), "none"),
-        ((124, 0, 64, -0.009009809178163559), "water"),
-        ((124, 0, 66, -0.007660237459532607), "water"),
-        ((124, 0, 68, -0.0061446463166489424), "water"),
-        ((124, 0, 70, -0.004442459854201204), "water"),
-        ((124, 0, 72, -0.0025318494505197223), "water"),
-        ((124, 20, 64, 0.06277697412858188), "none"),
-        ((124, 20, 66, 0.06182400117210263), "none"),
-        ((124, 20, 68, 0.060920470163534336), "none"),
-        ((124, 20, 70, 0.06008166953195572), "none"),
-        ((124, 20, 72, 0.05931163578048011), "none"),
-        ((124, 20, 74, 0.05862261977236657), "none"),
-        ((124, 40, 64, -0.004596793013348681), "none"),
-        ((124, 40, 66, -0.007881293688553023), "none"),
-        ((124, 40, 68, -0.010851313478373932), "none"),
-        ((124, 40, 70, -0.013513605008223933), "water"),
-        ((124, 40, 72, -0.015880866729427373), "water"),
-        ((124, 40, 74, -0.017978317799117856), "water"),
-        ((124, 60, 64, -0.033729060298063454), "water"),
-        ((124, 60, 66, -0.04062740064249005), "water"),
-        ((124, 60, 68, -0.03660634922712756), "water"),
-        ((124, 60, 70, -0.04106936165998065), "water"),
-        ((124, 60, 72, -0.048715160337165046), "water"),
-        ((124, 60, 74, -0.053817378732386144), "water"),
-        ((124, 80, 64, -0.378513110274629), "air"),
-        ((124, 80, 66, -0.37887533037235366), "air"),
-        ((124, 80, 68, -0.3755672366866089), "air"),
-        ((124, 80, 70, -0.3806264904596738), "air"),
-        ((124, 80, 72, -0.39139114552312176), "air"),
-        ((124, 80, 74, -0.39905004304932734), "air"),
-        ((124, 100, 64, -0.4583333333333333), "air"),
-        ((124, 100, 66, -0.4583333333333333), "air"),
-        ((124, 100, 68, -0.4583333333333333), "air"),
-        ((124, 100, 70, -0.4583333333333333), "air"),
-        ((124, 100, 72, -0.4583333333333333), "air"),
-        ((124, 100, 74, -0.4583333333333333), "air"),
-        ((126, -100, 64, 0.037482421875), "none"),
-        ((126, -100, 66, 0.037482421875), "none"),
-        ((126, -100, 68, 0.037482421875), "none"),
-        ((126, -100, 70, 0.037482421875), "none"),
-        ((126, -100, 72, 0.037482421875), "none"),
-        ((126, -100, 74, 0.037482421875), "none"),
-        ((126, -80, 64, 0.037482421875), "none"),
-        ((126, -80, 66, 0.037482421875), "none"),
-        ((126, -80, 68, 0.037482421875), "none"),
-        ((126, -80, 70, 0.037482421875), "none"),
-        ((126, -80, 72, 0.037482421875), "none"),
-        ((126, -80, 74, 0.037482421875), "none"),
-        ((126, -60, 64, 0.05024330978368198), "none"),
-        ((126, -60, 66, 0.05093542123713047), "none"),
-        ((126, -60, 68, 0.05164825745773993), "none"),
-        ((126, -60, 70, 0.052380776473173525), "none"),
-        ((126, -60, 72, 0.053133618951577574), "none"),
-        ((126, -60, 74, 0.05390538149459787), "none"),
-        ((126, -40, 64, 0.1308942633558083), "none"),
-        ((126, -40, 66, 0.1355722846035891), "none"),
-        ((126, -40, 68, 0.13977234300629068), "none"),
-        ((126, -40, 70, 0.14391148475400958), "none"),
-        ((126, -40, 72, 0.1480252139578508), "none"),
-        ((126, -40, 74, 0.15208907413316627), "none"),
-        ((126, -20, 64, 0.13001056656809973), "none"),
-        ((126, -20, 66, 0.13213006749070327), "none"),
-        ((126, -20, 68, 0.1342494739710899), "none"),
-        ((126, -20, 70, 0.13641807828631622), "none"),
-        ((126, -20, 72, 0.13869641277763253), "none"),
-        ((126, -20, 74, 0.1411390651002113), "none"),
-        ((126, 0, 64, -0.010355206926252296), "water"),
-        ((126, 0, 66, -0.009043874021560911), "water"),
-        ((126, 0, 68, -0.007576245457331987), "water"),
-        ((126, 0, 70, -0.005915269354878528), "water"),
-        ((126, 0, 72, -0.0040306175772153365), "water"),
-        ((126, 0, 74, -0.0019328609472880898), "water"),
-        ((126, 20, 64, 0.0700499260773044), "none"),
-        ((126, 20, 66, 0.06908003164862005), "none"),
-        ((126, 20, 68, 0.0681425614589177), "none"),
-        ((126, 20, 70, 0.06723915989832648), "none"),
-        ((126, 20, 72, 0.066359174495176), "none"),
-        ((126, 20, 74, 0.06551116407146489), "none"),
-        ((126, 40, 64, 0.004497597038868666), "none"),
-        ((126, 40, 66, 0.0013502912778844962), "none"),
-        ((126, 40, 68, -0.0015191728313191184), "water"),
-        ((126, 40, 70, -0.0041188588354404134), "water"),
-        ((126, 40, 72, -0.006463772144671846), "water"),
-        ((126, 40, 74, -0.008581034519921562), "water"),
-        ((126, 60, 64, -0.03471424652823008), "water"),
-        ((126, 60, 66, -0.04732045558891548), "water"),
-        ((126, 60, 68, -0.04568337003176991), "water"),
-        ((126, 60, 70, -0.0428377824231183), "water"),
-        ((126, 60, 72, -0.04738820166968918), "water"),
-        ((126, 60, 74, -0.05663750895047857), "water"),
-        ((126, 80, 64, -0.37931742687180287), "air"),
-        ((126, 80, 66, -0.38265481838544235), "air"),
-        ((126, 80, 68, -0.3808041835281554), "air"),
-        ((126, 80, 70, -0.38160238129796925), "air"),
-        ((126, 80, 72, -0.387746448733821), "air"),
-        ((126, 80, 74, -0.3990668807989283), "air"),
-        ((126, 100, 64, -0.4583333333333333), "air"),
-        ((126, 100, 66, -0.4583333333333333), "air"),
-        ((126, 100, 68, -0.4583333333333333), "air"),
-        ((126, 100, 70, -0.4583333333333333), "air"),
-        ((126, 100, 72, -0.4583333333333333), "air"),
-        ((126, 100, 74, -0.4583333333333333), "air"),
-    ];
-
+    /// The aquifer's helper functions and `apply`, checked against answers the 1.21.1 game
+    /// gave for the same arguments. The answers come from `tests/data/vanilla_vectors_1211.tsv`,
+    /// which `tools/vanilla_data/gen_vanilla_data.sh` writes by calling the game's own
+    /// `AquiferSampler` (built the way `ChunkNoiseSampler` builds it) on random positions.
     #[test]
     fn aquifer_vectors() {
+        crate::test_support::require_vanilla_data();
+        use crate::generation_math::vector_file;
         let _guard = lock_gen();
-        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
-        let mut miss = 0u32;
-        {
-            let g = &mut g;
-            for &((x, y, z), want) in AQ_NB {
-                let got = g.aq_noise_level(x, y, z, 200);
-                if got != want {
-                    miss += 1;
-                    eprintln!("nb {x},{y},{z}: {got} != {want}");
-                }
-            }
-            for (tbl, my) in [(AQ_FYT, true), (AQ_FYF, false)] {
-                for &((x, y, z), want) in tbl {
-                    let want = want;
-                    let got = g.aq_fluid_y(x, y, z, (0, 1), 80, my);
-                    if got != want {
-                        miss += 1;
-                        eprintln!("fy[{my}] {x},{y},{z}: {got} != {want}");
-                    }
-                }
-            }
-            for &((x, y, z), want) in AQ_FBS {
-                let got = g.aq_fluid_kind(x, y, z, (0, 1), -10);
-                if got != want {
-                    miss += 1;
-                    eprintln!("fbs {x},{y},{z}: {got} != {want}");
-                }
-            }
-            for &((x, y, z), (wy, wk)) in AQ_FL {
-                let wy = wy;
-                let got = g.aq_fluid_level_at(x, y, z);
-                if got != (wy, wk) {
-                    miss += 1;
-                    eprintln!("fl {x},{y},{z}: {got:?} != ({wy},{wk})");
-                }
-            }
-            for &((x, y, z, h1, h2), want) in AQ_CD {
-                let mut b = None;
-                let got = g.aq_calc_density(x, y, z, (h1, 1), (h2, 1), &mut b);
-                if (got - want).abs() > 1e-4 {
-                    miss += 1;
-                    eprintln!("cd {x},{y},{z},{h1},{h2}: {got} != {want}");
-                }
-            }
-        }
         let water = crate::name_to_state("minecraft:water").unwrap();
         let lava = crate::name_to_state("minecraft:lava").unwrap();
-        for &((x, y, z, d), blk) in AQ_AP {
-            let got = g.aq_state(x, y, z, d);
-            let want = match blk {
-                "none" => None,
-                "air" => Some(0),
-                "water" => Some(water),
-                "lava" => Some(lava),
-                _ => unreachable!(),
-            };
-            if got != want {
-                miss += 1;
-                eprintln!("ap {x},{y},{z}: {got:?} != {want:?}");
+        let mut gens: HashMap<u64, Gen> = HashMap::new();
+        let mut miss = Vec::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for kind in [
+            "aq_noise_based_fluid_level",
+            "aq_fluid_block_y",
+            "aq_fluid_block_kind",
+            "aq_fluid_level",
+            "aq_calculate_density",
+            "aq_apply",
+        ] {
+            for (q, ans) in vector_file::read(kind) {
+                let seed: u64 = q[0].parse::<i64>().unwrap() as u64;
+                let g = gens
+                    .entry(seed)
+                    .or_insert_with(|| Gen::load(seed, crate::name_to_state).expect("datapack"));
+                let n = |i: usize| -> i32 { q[i].parse().unwrap() };
+                let (x, y, z) = (n(3), n(4), n(5));
+                *counts.entry(kind.to_string()).or_default() += 1;
+                let (got, want) = match kind {
+                    "aq_noise_based_fluid_level" => (
+                        g.aq_noise_based_fluid_level(x, y, z, n(6)).to_string(),
+                        ans[0].clone(),
+                    ),
+                    "aq_fluid_block_y" => (
+                        g.aq_fluid_block_y(x, y, z, (n(6), n(7) as u8), n(8), q[9] == "true")
+                            .to_string(),
+                        ans[0].clone(),
+                    ),
+                    "aq_fluid_block_kind" => (
+                        g.aq_fluid_block_kind(x, y, z, (n(6), n(7) as u8), n(8))
+                            .to_string(),
+                        ans[0].clone(),
+                    ),
+                    "aq_fluid_level" => {
+                        let (ly, lk) = g.aq_fluid_level_at(x, y, z);
+                        (format!("{ly} {lk}"), format!("{} {}", ans[0], ans[1]))
+                    }
+                    "aq_calculate_density" => {
+                        let mut barrier = None;
+                        let d = g.aq_calculate_density(
+                            x,
+                            y,
+                            z,
+                            (n(6), n(7) as u8),
+                            (n(8), n(9) as u8),
+                            &mut barrier,
+                        );
+                        let want: f64 = ans[0].parse().unwrap();
+                        if (d - want).abs() <= 1e-9 {
+                            continue;
+                        }
+                        (d.to_string(), ans[0].clone())
+                    }
+                    _ => {
+                        let got = match g.aq_state(x, y, z, q[6].parse().unwrap()) {
+                            None => "none",
+                            Some(0) => "air",
+                            Some(s) if s == water => "water",
+                            Some(s) if s == lava => "lava",
+                            Some(_) => "other",
+                        };
+                        (got.to_string(), ans[0].clone())
+                    }
+                };
+                if got != want {
+                    miss.push(format!("{kind} {q:?}: got {got}, game {want}"));
+                }
             }
         }
-        assert_eq!(miss, 0, "aquifer vector mismatches");
+        for (kind, c) in &counts {
+            eprintln!("{kind}: {c} vectors");
+        }
+        assert!(
+            counts.values().all(|&c| c >= 100),
+            "too few vectors: {counts:?}"
+        );
+        assert!(
+            miss.is_empty(),
+            "{} aquifer answers differ from the game, first: {:?}",
+            miss.len(),
+            &miss[..miss.len().min(5)]
+        );
     }
 
     #[test]
@@ -5223,6 +4187,7 @@ mod wg_tests {
 
     #[test]
     fn feat_populate_perf() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         let seed = 0u64;
         init(seed, crate::name_to_state);
@@ -5251,6 +4216,7 @@ mod wg_tests {
 
     #[test]
     fn lazy_population_keeps_neighborhood_order_and_cached_overrides() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
         let mut visited = Vec::new();
@@ -5272,6 +4238,7 @@ mod wg_tests {
 
     #[test]
     fn lazy_population_preserves_direct_feature_outputs() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // Preserve population results through the lazy lookup, including writes
         // outside the queried chunk. This is a refactor control, not a vanilla oracle.
@@ -5344,6 +4311,7 @@ mod wg_tests {
 
     #[test]
     fn vertical_gradient_seed_reads_the_name_hash_big_endian() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // vanilla StringHash.fromString = Guava Longs.fromBytes, i.e. big-endian,
         // then PositionalRandomFactory.fromHashOf XORs those words with the
@@ -5369,6 +4337,7 @@ mod wg_tests {
 
     #[test]
     fn not_underwater_is_grass_only_above_the_water_surface() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // vanilla's WaterCondition (SurfaceRules$WaterConditionSource$1WaterCondition)
         // is already "not underwater": waterHeight == MIN (no fluid), or
@@ -5389,6 +4358,7 @@ mod wg_tests {
 
     #[test]
     fn surface_density_follows_vanillas_interpolated_order() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // vanilla samples `interpolated` over its input at 4x8x4 cell corners and
         // interpolates that, then applies squeeze/min/add per block. Interpolating
@@ -5401,6 +4371,7 @@ mod wg_tests {
 
     #[test]
     fn feature_population_output_matches_the_pre_refactor_capture() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // Unlike the lazy-vs-direct comparison, this pins the values against a
         // digest recorded before the shared contracts moved, so a change made on
@@ -5521,6 +4492,7 @@ mod wg_tests {
 
     #[test]
     fn bundled_carver_configs_are_the_1_21_1_shapes() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // The four configured carvers the overworld's biomes reference. They were missing
         // entirely, so no cave could ever be carved; this keeps them present and shaped like
@@ -5553,6 +4525,7 @@ mod wg_tests {
 
     #[test]
     fn the_ore_vein_geometry_matches_vanillas_own_output() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // Vanilla's OreFeature.place (called through tools/vanilla-probe) writes these 666
         // cells for seed 60007, position (7,49,13) and size 64. Pinning them means the Rust
@@ -5582,6 +4555,7 @@ mod wg_tests {
 
     #[test]
     fn the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // The deep material rule asks for the biome once per block; the answer only depends on the
         // quart, so one shared cache replaced millions of B-tree searches. Pin that a repeat query
@@ -5611,6 +4585,7 @@ mod wg_tests {
 
     #[test]
     fn feat_determinism() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // same seed -> identical override maps; and feature writes must cross
         // chunk boundaries (e.g. a tree rooted in a neighbor must appear here)

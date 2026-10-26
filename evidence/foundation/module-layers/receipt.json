@@ -4,7 +4,6 @@
     ".github/workflows/ci.yml": "e7d4e0d2d80d3d84d1b2d07f601575b721cafcf32edae0b4193105363b28ea93",
     "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
     "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
-    "config_packets.bin": "9fb932886e1da038d42f20ec385ec04517c1c0286d71b9d9eea91e8f5decb49a",
     "evidence/foundation/module-layers/deps.py": "2df932ede1dfb5cb23ed2f3a969763116bc120788728c5778c57391cddd0feb4",
     "evidence/foundation/module-layers/deps_target.py": "bac5e0b685f51a4f449216a9ec4eb46f8931a82946510361ec5b9dd7685e202d",
     "evidence/foundation/module-layers/gate_probe.py": "1ae57ca2a6440e865df81fe548d71f91d88d48fb7d9686f5d44cb926866680e4",
@@ -66,5 +65,6 @@
       "headSha": "d6b9ad8db4774919c8b4fb032342e53b2548b660"
     }
   },
-  "mc_spine_target_ci": "not yet run; final Q remains open"
+  "mc_spine_target_ci": "not yet run; final Q remains open",
+  "generated_inputs_note": "config_packets.bin is generated locally (tools/vanilla_data/gen_vanilla_data.sh --accept-eula) and not committed; its sha256 pin was removed."
 }

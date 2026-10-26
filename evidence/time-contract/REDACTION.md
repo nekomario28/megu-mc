@@ -8,6 +8,15 @@
   エージェント用の個人メモ（memory ファイル）の抜粋、スキル定義ファイルの全文が含まれていたため。
   レビュー結論は各 `receipt.json` の `review` / `independent_review` と README に残る。receipt の該当 hash 行は削除した。
 
+## 追記: 他実装への言及を含むログ
+
+上の 4 個の削除済みレビュー生ログは、他のプロジェクト（Pumpkin）の名前に触れた引用を含んでいた。
+このブランチの系列では #20 で削除済みで、残っている `evidence/**/*.log` に該当する言及はない
+（`git grep -i pumpkin -- 'evidence/**/*.log'` が 0 件）。再計算した sha256 は上の表のとおりで、
+この変更では evidence のファイルを増減していないので、hash と receipt は再計算していない。
+元のログは `main` にのみ存在する。公開リポジトリから消えるのは `main` を置き換える、または書き換えるときで、
+この変更は `main` に触れない。
+
 `receipt.json` を持たない `activation-java.log` は `activation-receipt.json` が名前だけで参照し、hash は持たない。
 
 一部の receipt（`entity-fixture`、`game-tick-periods`、`stored-durations`）は、リポジトリに存在しないファイル名で

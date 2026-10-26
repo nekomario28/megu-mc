@@ -1424,6 +1424,7 @@ fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
 /// the first consumer of the stream.
 #[test]
 fn sixteen_random_ticks_raise_sugar_cane_one_block() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (old_hot, old_warm) = test_region();
@@ -1497,6 +1498,7 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
 /// nothing, and that is what makes it safe to compute unconditionally.
 #[test]
 fn measure_the_light_cost_per_chunk() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     forceloaded().lock().unwrap().insert((0, 0));
@@ -1693,6 +1695,7 @@ fn measure_the_light_cost_per_chunk() {
 /// first solid block below. The bytecode contract is evidence/gameplay/falling-vanilla.
 #[test]
 fn sand_falls_under_vanilla_gravity_until_it_lands() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -1785,6 +1788,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
 /// a platform whose cell is entirely above `floor(new_y)`.
 #[test]
 fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -1864,6 +1868,7 @@ fn beginning_a_falling_tick_leaves_the_queue_visible() {
 /// ticked to completion: every starting block must reappear exactly once.
 #[test]
 fn a_save_concurrent_with_falling_conserves_every_block() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
     let (oh, ow) = test_region();
@@ -1986,6 +1991,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
 /// transition must neither duplicate nor lose the item when its snapshot is reloaded.
 #[test]
 fn a_saved_below_world_drop_is_not_duplicated() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
     let (_, ow) = test_region();
@@ -2193,6 +2199,7 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
 /// block it never showed, because the check returns before locking when there is nothing above.
 #[test]
 fn two_stacked_sand_blocks_fall_without_deadlocking() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -2270,6 +2277,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
 /// it and left the block hanging in the air forever.
 #[test]
 fn a_new_block_in_a_passing_entity_cell_still_falls() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -2339,6 +2347,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
 /// block (a flower) and replaces it, rather than resting on top of it.
 #[test]
 fn a_falling_block_passes_through_a_replaceable_block() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -2398,6 +2407,7 @@ fn a_falling_block_passes_through_a_replaceable_block() {
 /// recursion bound.
 #[test]
 fn a_long_unsupported_column_converts_in_one_pass() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -2446,6 +2456,7 @@ fn a_long_unsupported_column_converts_in_one_pass() {
 /// would leave a ghost block on the client.
 #[test]
 fn placing_unsupported_sand_queues_air_not_a_ghost() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -2490,6 +2501,7 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
 /// list of three states kept that test green.
 #[test]
 fn every_falling_block_becomes_an_entity_and_lands() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -2552,6 +2564,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
 /// the way down and land it in a chunk nobody had ever visited.
 #[test]
 fn a_falling_block_waits_in_a_cold_chunk() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
@@ -2715,6 +2728,7 @@ fn drop_count(item: i64) -> usize {
 /// deferred to the next tick's re-check.
 #[test]
 fn a_support_placed_under_a_falling_entity_is_landed_on() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
     let (_, ow) = test_region();
@@ -2857,6 +2871,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
 /// placed or dropped, and no block falls twice.
 #[test]
 fn two_knockouts_of_adjacent_supports_conserve_every_block() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
     let (_, ow) = test_region();
@@ -2938,6 +2953,7 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
 /// after conversion.
 #[test]
 fn a_save_during_entity_conversion_has_no_duplicate_drop() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
     let (_, ow) = test_region();
@@ -3003,6 +3019,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
 /// chunk is warm again.
 #[test]
 fn region_change_mid_fall_keeps_the_entity() {
+    crate::test_support::require_vanilla_data();
     let _world_guard = world_guard();
     let _snap = WorldSnapshot::take();
     let (_, ow) = test_region();

@@ -493,7 +493,7 @@ fn load_freg() -> FReg {
         order: vec![],
         steps: 0,
     };
-    for (name, b) in Gen::dp_files("feature") {
+    for (name, b) in Gen::dp_files("configured_feature") {
         if let Some(j) = jparse(&b) {
             if let Some(cf) = p_cf(&j) {
                 reg.cfg.insert(name, cf);
@@ -2430,7 +2430,11 @@ fn load_creg() -> CarverReg {
     }
     for (name, b) in Gen::dp_files("biome") {
         if let Some(j) = jparse(&b) {
-            if let Some(list) = jarr(&j, "carvers") {
+            // 1.21.1 writes `"carvers": {"air": [..]}` (a step -> list map); only the air
+            // step is used by the overworld. A bare list is the shorter form of the same.
+            let list =
+                jarr(&j, "carvers").or_else(|| js(&j, "carvers").and_then(|c| jarr(c, "air")));
+            if let Some(list) = list {
                 reg.biome
                     .insert(name, list.iter().map(|v| ns_name(v.str())).collect());
             }
@@ -2575,7 +2579,7 @@ fn canyon_y(shape: CanyonShape, r: &mut Lcg, y_scale: f64, branch_count: f32, i:
 
 /// One target chunk's carving state: the shared mask, the cells written so far,
 /// and the `CarvingContext` facts the carve reads (world bounds, floor level).
-struct CarveRun {
+struct CarveSpan {
     tx: i32,
     tz: i32,
     min_y: i32,
@@ -2597,7 +2601,7 @@ struct CarveRun {
     mark: Option<(i32, i32, i32)>,
 }
 
-impl CarveRun {
+impl CarveSpan {
     #[inline]
     fn idx(&self, lx: i32, y: i32, lz: i32) -> usize {
         (((y - self.min_y) << 8) | ((lz & 15) << 4) | (lx & 15)) as usize
@@ -2659,7 +2663,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
     let dump_here = std::env::var("CARVE_DUMP_WRITES").ok().as_deref() == Some(&here);
     let only = std::env::var("CARVE_ONLY").ok();
     let (min_y, height, wseed) = (g.min_y, g.height, g.wseed());
-    let mut run = CarveRun {
+    let mut run = CarveSpan {
         tx,
         tz,
         min_y,
@@ -2754,7 +2758,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
     }
 }
 
-impl CarveRun {
+impl CarveSpan {
     /// `CaveWorldCarver.carve`.
     fn cave(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, r: &mut Lcg, ox: i32, oz: i32) {
         // nextInt(nextInt(nextInt(getRange()) + 1) + 1); getRange() is 15 here

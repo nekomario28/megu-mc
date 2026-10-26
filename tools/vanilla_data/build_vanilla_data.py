@@ -4,12 +4,14 @@ after checking it against the data generator's own reports.
 
   build_vanilla_data.py <extract-dir> <datagen-reports-dir> <repo-root> <jar-sha1>
 
-Reads   <extract-dir>/{state_facts.tsv,biome_tree.json,biome_probe.tsv,
-        biome_probe_ties.tsv,random_next_int.tsv}   (Extract.java)
+Reads   <extract-dir>/{state_facts.tsv,biome_tree.json,biome_probe.tsv,biome_probe_ties.tsv,
+        random_next_int.tsv,vanilla_vectors.tsv}   (Extract.java)
         <datagen-reports-dir>/{blocks.json,biome_parameters/minecraft/*.json}  (vanilla --reports)
 Writes  assets/block_states_1211.json        per-state light / flag / face facts, our schema
         datapacks/vanilla/biome_climate_tree.json   the game's own biome search trees
         tests/data/biome_probe_1211.tsv      points looked up through the game's tree
+        tests/data/vanilla_vectors_1211.tsv  questions put to the game (xoroshiro draws, climate noise,
+                                             biome lookups, aquifer helpers) and its answers
         tests/data/biome_probe_ties_1211.tsv tie-heavy points (range edges) for the scan order
         tests/data/random_next_int_1211.tsv  nextInt(bound) streams of the game's random classes
 
@@ -133,8 +135,8 @@ def dump_compact(obj):
 (root / "datapacks" / "vanilla" / "biome_climate_tree.json").write_text(json.dumps(tree, separators=(",", ":")) + "\n")
 (root / "tests" / "data").mkdir(parents=True, exist_ok=True)
 (root / "tests" / "data" / "biome_probe_1211.tsv").write_text((ex / "biome_probe.tsv").read_text())
+(root / "tests" / "data" / "vanilla_vectors_1211.tsv").write_text((ex / "vanilla_vectors.tsv").read_text())
 # Small reference vectors for the differential tests (numbers only, read from the running game).
 (root / "tests" / "data" / "biome_probe_ties_1211.tsv").write_text((ex / "biome_probe_ties.tsv").read_text())
 (root / "tests" / "data" / "random_next_int_1211.tsv").write_text((ex / "random_next_int.tsv").read_text())
-print("wrote assets/block_states_1211.json, datapacks/vanilla/biome_climate_tree.json, tests/data/biome_probe_1211.tsv,")
-print("      tests/data/biome_probe_ties_1211.tsv, tests/data/random_next_int_1211.tsv")
+print("wrote assets/block_states_1211.json, datapacks/vanilla/biome_climate_tree.json, tests/data/biome_probe_1211.tsv, tests/data/vanilla_vectors_1211.tsv, tests/data/biome_probe_ties_1211.tsv, tests/data/random_next_int_1211.tsv")

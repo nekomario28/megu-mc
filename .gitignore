@@ -24,3 +24,15 @@ logs/
 
 # Python bytecode
 *.pyc
+
+# Mojang data generated locally from your own 1.21.1 server jar by
+# tools/vanilla_data/gen_vanilla_data.sh (never committed; see README "Setup")
+/datapacks/vanilla/
+/assets/block_states_1211.json
+/tests/data/biome_probe_1211.tsv
+/tests/data/vanilla_vectors_1211.tsv
+/tests/data/biome_probe_ties_1211.tsv
+/tests/data/random_next_int_1211.tsv
+/config_packets.bin
+# an optional server resource pack you supply yourself
+/resourcepack.zip
