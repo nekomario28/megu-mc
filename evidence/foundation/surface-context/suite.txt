@@ -1,7 +1,7 @@
     Finished `release` profile [optimized] target(s) in 0.01s
      Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
 
-running 239 tests
+running 240 tests
 test block_registry::state_mapping_tests::property_names_and_values_determine_metadata_position ... ok
 test block_registry::tag_tests::base_stone_overworld_excludes_gravel_and_dirt ... ok
 test cached_lookup::tests::a_working_set_larger_than_one_is_retained ... ok
@@ -91,7 +91,7 @@ test persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities ... [
 [spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::furnace_and_sign_round_trip_keeps_only_live_owners ...
@@ -102,7 +102,7 @@ test persistence_tests::furnace_and_sign_round_trip_keeps_only_live_owners ... [
 [spine] loaded meta: 0 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.06s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.06s
 
 ok
 test persistence_tests::hostile_rotation_does_not_collapse_to_one_type ... ok
@@ -114,7 +114,7 @@ test persistence_tests::legacy_met3_millisecond_ages_convert_to_ticks_instead_of
 [spine] loaded meta: 1 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::legacy_persisted_durations_resume_with_their_original_wall_time ... ok
@@ -125,7 +125,7 @@ test persistence_tests::met2_without_mob_air_falls_back_to_a_full_supply ... [sp
 [spine] loaded meta: 1 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::met4_round_trip_leaves_persisted_durations_untouched ...
@@ -136,7 +136,7 @@ test persistence_tests::met4_round_trip_leaves_persisted_durations_untouched ...
 [spine] loaded meta: 1 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::met4_round_trip_preserves_drop_components_age_and_mob_air ...
@@ -147,7 +147,7 @@ test persistence_tests::met4_round_trip_preserves_drop_components_age_and_mob_ai
 [spine] loaded meta: 1 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::negative_drop_age_survives_a_save_reload_round_trip ...
@@ -166,7 +166,7 @@ test persistence_tests::negative_drop_age_survives_a_save_reload_round_trip ... 
 [spine] loaded meta: 1 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::saving_neither_mutates_live_state_nor_loses_resting_tridents ...
@@ -177,7 +177,7 @@ test persistence_tests::saving_neither_mutates_live_state_nor_loses_resting_trid
 [spine] loaded meta: 0 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip ...
@@ -188,7 +188,7 @@ test persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip 
 [spine] loaded meta: 0 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_round_trip ...
@@ -199,7 +199,7 @@ test persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_ro
 [spine] loaded meta: 0 mobs, 0 invs, 0 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.00s
 
 ok
 test persistence_tests::truncated_component_blobs_do_not_panic_the_loader ... ok
@@ -258,7 +258,7 @@ test tick_tests::a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load ..
 [spine] loaded meta: 0 mobs, 0 invs, 2 chests
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.06s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.06s
 
 ok
 test tick_tests::a_falling_block_passes_through_a_replaceable_block ... ok
@@ -349,6 +349,7 @@ test worldgen::wg_tests::pinned_climate_router_resolves_inline_fields ... ok
 test worldgen::wg_tests::pinned_surface_block_states_match_the_native_codec ... ok
 test worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate ... ok
 test worldgen::wg_tests::pinned_surface_temperature_matches_the_native_biome ... ok
+test worldgen::wg_tests::surface_build_scan_matches_the_pinned_classes_on_synthetic_columns ... ok
 test worldgen::wg_tests::surface_conditions_match_the_pinned_context_formulas ... ok
 test worldgen::wg_tests::surface_density_follows_vanillas_interpolated_order ... ok
 test worldgen::wg_tests::surface_sequence_rejects_a_child_that_did_not_parse ... ok
@@ -357,4 +358,4 @@ test worldgen::wg_tests::the_ore_vein_geometry_matches_vanillas_own_output ... o
 test worldgen::wg_tests::the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart ... ok
 test worldgen::wg_tests::vertical_gradient_seed_reads_the_name_hash_big_endian ... ok
 
-test result: ok. 238 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.76s
+test result: ok. 239 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.85s

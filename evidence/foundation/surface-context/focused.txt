@@ -1,41 +1,10 @@
-   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
-    Finished `release` profile [optimized] target(s) in 34.04s
-     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
-
-running 3 tests
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] no aquifer function "exclusion" in aquifers or noise_router
-[load] no aquifer function "exclusion" in aquifers or noise_router
-test worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate ... ok
-test worldgen::wg_tests::pinned_surface_block_states_match_the_native_codec ... ok
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] unknown density function type "weird_scaled_sampler" -> zero
-[load] no aquifer function "exclusion" in aquifers or noise_router
-test worldgen::wg_tests::pinned_surface_temperature_matches_the_native_biome ... ok
-
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 207 filtered out; finished in 0.13s
-
-    Finished `release` profile [optimized] target(s) in 0.01s
-     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
-
-running 1 test
-test worldgen::wg_tests::surface_sequence_rejects_a_child_that_did_not_parse ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 209 filtered out; finished in 0.09s
-
     Finished `release` profile [optimized] target(s) in 0.02s
      Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
 
 running 1 test
-test worldgen::wg_tests::surface_steep_reads_the_world_surface_heightmap ... ok
+test worldgen::wg_tests::surface_build_scan_matches_the_pinned_classes_on_synthetic_columns ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.08s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.08s
 
     Finished `release` profile [optimized] target(s) in 0.01s
      Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
@@ -43,4 +12,12 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; fi
 running 1 test
 test worldgen::wg_tests::surface_conditions_match_the_pinned_context_formulas ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.08s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.08s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::surface_steep_reads_the_world_surface_heightmap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.08s

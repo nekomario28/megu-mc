@@ -1,47 +1,50 @@
 {
-  "base_commit": "e1c6aac",
-  "base_tree": "4ef4344c6ca6535a3c4604a2c8409c0d23045e6e",
+  "base_commit": "5017ef6",
+  "base_tree": "4ee90ec72384b13b2215f28282eac97fdcc87610",
   "binary": {
-    "latest_source_mtime_ns": 1792976235315459786,
-    "mtime_ns": 1792976370916871316,
+    "latest_source_mtime_ns": 1792977009688143353,
+    "mtime_ns": 1792977154499728598,
     "note": "Built after mutation restoration; both wire checks use this binary.",
     "path": "target/release/mc-spine",
-    "sha256": "27be8cc855e178e555897a8ff752b0d7a59c0e745188a9a88904496ac1cd5206"
+    "sha256": "ac95eec5a8a1d2a170fc7fb6afc57727d679d41f551181974de6b5ce18c84cd7"
   },
   "branch": "pack/1211-own-data",
   "docs_sha256": {
-    "evidence/foundation/surface-context/README.md": "c9204b82eb8a265ee0f566f827fa4b684bcd351cba337bfe8623c1045431b0a0",
-    "specs/README.md": "9f3349027eda8bbbda6ce2b476b4d179b9ec9431c7c4e3887cb87cc34a24e0dd",
-    "specs/ROADMAP.md": "c3de3aef04efb20136fc76e158eb1731c7f0e1cd13720ba9e0be7ba293124ce4",
+    "evidence/foundation/surface-context/README.md": "1c388854b5fd7e196808034f3f613d8592ea4820a1ffb432571afc6d6ccc5ff8",
+    "specs/README.md": "7e2df95c3c6cba1fc983abba1311f1f7723217fadf39c771a51a73cbc17cfd31",
+    "specs/ROADMAP.md": "6af5e08d9e079cca2c0dcc981c6b72f3cff3a5b7ad62d173a7aef20ccf34dacc",
     "specs/done/surface-context/README.md": "52eb2c3160a407a44f5d1b1ba6c598492554400ecb7043d30b23edf5d8c80d26",
-    "tools/README.md": "59a6a57f75f3c3fa83f806658c8794f2b8226c1cb7e4d90eac21392c6de5a686"
+    "tools/README.md": "1cd6be09b80e936bbaf41537ff813273b83826c7ea4f2c7e9997d965562747af"
   },
   "evidence_sha256": {
     "admission-condition-mutation.txt": "6a101d76a856038f605b0e762c293f4cfb92d0de644ff6f96a1fe767ed786836",
-    "admission-final.txt": "ca1921681c27c1dd19d1c88c6b6ce3338e3b3a90a3af828eb679c65c77b2ca91",
+    "admission-final.txt": "91a5e968160edc6a4be45f9609a75a52e55ecd2178e5d9ef0a3ea430118059f1",
     "admission-mutations.txt": "1069ea1f030d07aec3abf65f4fcf7300e3dccd016edee4b09f59b0fc0eb2fc3f",
-    "build.txt": "70b2165abac91999f4b761a1ad3813850df81fe51dc13c46442cef98db4f94df",
-    "clippy.txt": "225c11a8d51c44bd82e061b1bd9ad14d72a724a27cf6ba2abdf49f28c27e006e",
-    "comparison.json": "e494224de519fc0d4bd8a8794b607b501d4c830ca536111475f30385bf07b1dd",
+    "admission-scan-mutation.txt": "bf30e1d8c42783777879b5973d1da28c8fb3e4768e68f9a3bb4f6117aea1748e",
+    "build.txt": "a6fe81deb4a6325cf559200ba358235ad4b2663c0da2c2de7f3fe9ec47fabea6",
+    "buildsurface.json": "f5eedac693dea135b76c639ea1e20b36d5f13fd50068d59e2aa4deb50700deb7",
+    "clippy.txt": "126638364ec8e3a0647a263a77f062972c79ebd4f96e05e2ba80e7b07383973d",
+    "comparison.json": "73dfd5b15d9162700bec8237c2691848a132a978e99d83c5397b8195c6c40ca9",
     "conditions.json": "b6259ed95fd7ed0226fc008f17b286e886e39e409a8c11f51ad2ccefd4336dd2",
     "debt.txt": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
     "environment.json": "1bd2baf21b9ca934b7547c4ea9cece9daca306aa8d04776871261875e90ceea5",
-    "focused.txt": "0637be003ca82c4bfaaaee523cce32e46fc19939d134c3ab53759e8e05009224",
-    "layer-tests.txt": "c4e4eef376ea3d53af9b78db738c281038334495cd5e2aeec87752a461fdc87c",
+    "focused.txt": "bbb3415b8ddaa4d905bbec20b869b4577a15f117b0a3983a763d615f4b90151f",
+    "layer-tests.txt": "3928104d33a316894fd75ee6d135ae516005b3231a1003c2ebd55f16a8259d1c",
     "layers.txt": "28495f98f078823d8a3931768e2082f3f50c7e8f355ed93af4ef21340151131a",
-    "log-normalization.json": "be150d4154a77b95c39666bbbe5638e70a93194e44ce1e550789ec0e670e5604",
+    "log-normalization.json": "f7ac29e1c562857ccab68b17232c33afb473542e64495b552d2e733ac1494bf8",
     "mutation-conditions.txt": "68fddfe6c006145dad9f85bb820eff6bb6b58e6d87658d7d3a6ff295736081f7",
+    "mutation-scan.txt": "fc2eba14da0bb1a6b4aa05999e60a5358b9f4df2d0f094d5658f7567b772b5a4",
     "mutations.txt": "6ae2cacd91071f00f4f876bdc371aebda66fb72011e52f7b8fa899feaa0c9d43",
-    "native.txt": "70dad04fbd22749a52e20a4907d1b100fae80b42258bfa0802ac0917543e45cc",
-    "python.txt": "36b3afde8b5530cd7e8f343619d42f62815b6771d9894f4f9e887e459be224dd",
-    "source-hashes.sha256": "d69cd3d8cf4e6263ecdc4b5cb5147567b98f451130b21dd3f7e418e27491991c",
-    "suite.txt": "bae812551ce9f51d94e9c02c03fc9fd9748bdf732aa9b0f8d1ce6e166a0bcd0d",
-    "unit.jsonl": "fa1c17c532cbb0d8cfd4a9f0aa30d2ec247d01864313d2e9c55fd55b86d34de9",
+    "native.txt": "344d93691532c94fe6ccf444ed4fa6279dd3c4503015b4965bf794311e78e928",
+    "python.txt": "497c597f0ae726276bd9cab41876e4bee36d0e5ef03b6510b3ae502316fb7557",
+    "source-hashes.sha256": "1d42ad225374899a35054726ca9a934fbb0f7cbd609d2c58f5430b10efbb1d79",
+    "suite.txt": "66a080016efee36d1940016287011a29e5890bf20e8a1cbdc3013c9eb798d8f9",
+    "unit.jsonl": "644fb366831f2d36ba3d8f57cb8c9cf3e4f2f886fc831b190f10387025a40121",
     "wire.txt": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921"
   },
   "limits": [
-    "Only condition formulas and steep heightmap are pinned; buildSurface scan start/water-height/stone-depth accumulation are not.",
-    "No full SurfaceSystem actual-class execution, whole-world surface comparison, performance, hosted CI, push or merge."
+    "Scan fixture is synthetic stone/water columns with one stone-depth rule; real noise terrain, cave fluids, biome extensions and whole-world application are not covered.",
+    "No full server/world execution; the scan oracle uses an ordinary ProtoChunk and actual buildSurface but a fixed biome/noise chunk context."
   ],
   "not_run": [
     "full tests/verify.sh",
@@ -50,21 +53,18 @@
     "push/mirror refresh",
     "main merge",
     "release",
-    "full SurfaceSystem buildSurface",
-    "whole-world surface comparison"
+    "whole-world surface comparison",
+    "real-noise surface scan"
   ],
-  "recorded_at": "2026-10-26T00:59:49.654815+00:00",
+  "recorded_at": "2026-10-26T01:12:56.079091+00:00",
   "reference": {
-    "basis": "actual dzp$g with synthetic t/B/C/D/E/x/v fields; actual SurfaceRules condition sources; no chunk/world/Unsafe. Steep from decompiled buildSurface/SteepMaterialCondition.",
-    "condition_kinds": [
-      "hole",
-      "prelim",
-      "stone",
-      "water"
-    ],
+    "basis": "actual dzp$g conditions; actual SurfaceSystem.buildSurface on a filled ProtoChunk with a stone-depth rule; no server/world/Unsafe.",
     "condition_oracle_sha256": "a96a50985ba047c75d5f182c5b6bfa8620e2b45d8e724d04c9f894400223d513",
     "condition_rows": 4037,
     "minecraft": "1.21.1",
+    "scan_columns": 768,
+    "scan_gold_cells": 1536,
+    "scan_oracle_sha256": "393637ca1f8960609a674bf5bc7949b7c830bde429525646bed47362a8ab8251",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
     "surface_decode_cases": 97
   },
@@ -73,7 +73,7 @@
     "baseline": {
       "failed": 0,
       "ignored": 1,
-      "passed": 237
+      "passed": 238
     },
     "clippy_all_targets_warnings_denied": true,
     "condition_oracle_twice": true,
@@ -83,7 +83,7 @@
       "exit": 0,
       "failed": 0,
       "ignored": 1,
-      "passed": 238
+      "passed": 239
     },
     "gameplay_wire": "PASS",
     "layer_gate_tests": 17,
@@ -92,25 +92,28 @@
       "modules": 20,
       "named_errors": 0
     },
-    "new_rust_tests": 2,
+    "new_rust_tests": 1,
     "removed_failures": [],
+    "scan_oracle_twice": true,
     "selected_mutations": {
       "not_a_gate": 0,
       "parked": 0,
-      "proved": 2,
+      "proved": 3,
       "skipped": 0
     },
+    "surface_tests_total": 3,
     "unchanged_failure_baseline": true
   },
-  "scope": "Surface steep heightmap correction and synthetic SurfaceRules condition formulas; not a full SurfaceSystem/buildSurface port.",
+  "scope": "Steep heightmap, synthetic SurfaceRules conditions, and actual buildSurface scan on synthetic stone/water columns.",
   "source_sha256": {
-    ".github/workflows/ci.yml": "a998bdc66600e962c04327e027588b98bf2ed47b1a2a60a2d428faf2da14bf51",
+    ".github/workflows/ci.yml": "9494dd030091b1e348d4d2141ab340efb8fec64686cd5f6d32cb71d83a005742",
     "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
     "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
-    "evidence/foundation/surface-context/README.md": "c9204b82eb8a265ee0f566f827fa4b684bcd351cba337bfe8623c1045431b0a0",
+    "evidence/foundation/surface-context/README.md": "1c388854b5fd7e196808034f3f613d8592ea4820a1ffb432571afc6d6ccc5ff8",
+    "evidence/foundation/surface-context/buildsurface.json": "f5eedac693dea135b76c639ea1e20b36d5f13fd50068d59e2aa4deb50700deb7",
     "evidence/foundation/surface-context/conditions.json": "b6259ed95fd7ed0226fc008f17b286e886e39e409a8c11f51ad2ccefd4336dd2",
-    "specs/README.md": "9f3349027eda8bbbda6ce2b476b4d179b9ec9431c7c4e3887cb87cc34a24e0dd",
-    "specs/ROADMAP.md": "c3de3aef04efb20136fc76e158eb1731c7f0e1cd13720ba9e0be7ba293124ce4",
+    "specs/README.md": "7e2df95c3c6cba1fc983abba1311f1f7723217fadf39c771a51a73cbc17cfd31",
+    "specs/ROADMAP.md": "6af5e08d9e079cca2c0dcc981c6b72f3cff3a5b7ad62d173a7aef20ccf34dacc",
     "specs/done/surface-context/README.md": "52eb2c3160a407a44f5d1b1ba6c598492554400ecb7043d30b23edf5d8c80d26",
     "src/aquifer_native_tests.rs": "00e436230df0ff8fbdbc78e98190ca4f99f63f146c40cb5353b9b1b94eee6ced",
     "src/block_registry.rs": "c015c38549380894521d1fb50f78db1489e0586454bb3d6378f7553c00850c25",
@@ -148,15 +151,17 @@
     "src/tree.rs": "94540bdf5a1a0d9c4e03080c77ad61e5e778488966bc9f182d3da00825254981",
     "src/weird_sampler_tests.rs": "03fda74db84ad32ae96f9208b343cb6d607c0806e680274782a433e28edbf910",
     "src/world_rng.rs": "b440d78b383752426b43f796718a21387c023f32081d8a903f84a0cc5303d144",
-    "src/worldgen.rs": "70486bd33a4ab4ae45bea878fa5484e29dccb93c8dc63c5cb59723aea9f19e27",
+    "src/worldgen.rs": "8fe97a8833681089e6e8f93a75f8873ed8f4e60a6526ac7aa457a9bbd2a1c9de",
     "tests/surface_condition_oracle_test.py": "4ea3004d59f5cdb88c90209bf91d5ea2adabcb1813c60e6d9931fa6df94afad4",
     "tests/surface_oracle_test.py": "fd114581a32ada44931a108cb001483533df01aa7a120bde2fd3e992b6be4cab",
-    "tests/verify.sh": "45f36355fc90b8fc61550a99d4bb4d5d1f314615702c3a3699311e96e150213f",
-    "tools/README.md": "59a6a57f75f3c3fa83f806658c8794f2b8226c1cb7e4d90eac21392c6de5a686",
-    "tools/mutation_check.sh": "1054ea05a0f33aede3721b610c774ba48dfef0a88b8a214a0f3d4835508bdbec",
+    "tests/surface_scan_oracle_test.py": "b4f2c43b5d57471aca2ff53af324cbacccf405b1e85563823d83af95ad67c194",
+    "tests/verify.sh": "f63ead3c9b41dd8b8f99125046beb047604a3bdc7d1510e319306a79143b0994",
+    "tools/README.md": "1cd6be09b80e936bbaf41537ff813273b83826c7ea4f2c7e9997d965562747af",
+    "tools/mutation_check.sh": "89b8265112d5082e656133253586ade5c54886424a05a60b33e972ec7133af05",
+    "tools/surface-context-oracle/BuildSurfaceScanOracle.java": "393637ca1f8960609a674bf5bc7949b7c830bde429525646bed47362a8ab8251",
     "tools/surface-context-oracle/SurfaceConditionOracle.java": "a96a50985ba047c75d5f182c5b6bfa8620e2b45d8e724d04c9f894400223d513",
-    "tools/surface-oracle/SurfaceOracle.java": "cdce9c83d577df626749af3c2e70351340df7f946389d385dde595a151d890a1",
     "tools/surface_condition_oracle.py": "b428f3e473beb4571179ac3120622db299b47204d221243ace59a9e0d5c12cf5",
-    "tools/surface_oracle.py": "4a8e8b02c166f58f4e5a2f25550ab7959cc197bc989f776151d3f917172b1130"
+    "tools/surface_oracle.py": "4a8e8b02c166f58f4e5a2f25550ab7959cc197bc989f776151d3f917172b1130",
+    "tools/surface_scan_oracle.py": "d26d5cc381429b1d84d02ff372845158fdf357cb5ba47302d90a317efe968b15"
   }
 }

@@ -1,2 +1,2 @@
     Checking mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.42s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.42s

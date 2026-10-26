@@ -1,17 +1,29 @@
 WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
-WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-ae4znpar/library-23.jar)
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-9auop9wp/library-23.jar)
 WARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper
 WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
-[09:58:17] [main/INFO]: [STDOUT]: surface condition oracle: 4037 rows
-surface condition oracle: 4037 rows match the pinned classes
+[10:11:14] [main/INFO]: [STDOUT]: buildSurface scan oracle: 768 columns
+buildSurface scan oracle: 768 columns match the pinned classes
 WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
-WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-u6cbp1fa/library-23.jar)
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-ry_xlh6h/library-23.jar)
 WARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper
 WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
-[09:58:20] [main/INFO]: [STDOUT]: surface condition oracle: 4037 rows
+[10:11:18] [main/INFO]: [STDOUT]: buildSurface scan oracle: 768 columns
+buildSurface scan oracle: 768 columns match the pinned classes
+WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-or853xm1/library-23.jar)
+WARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper
+WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+[10:11:21] [main/INFO]: [STDOUT]: surface condition oracle: 4037 rows
 surface condition oracle: 4037 rows match the pinned classes
 WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
-WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-9aain2ch/library-23.jar)
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-xh7yz2ou/library-23.jar)
+WARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper
+WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+[10:11:24] [main/INFO]: [STDOUT]: surface condition oracle: 4037 rows
+surface condition oracle: 4037 rows match the pinned classes
+WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/tmp/mc-vanilla-java-mnreegws/library-23.jar)
 WARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper
 WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
 surface: 97 actual-class cases, pinned 1.21.1
