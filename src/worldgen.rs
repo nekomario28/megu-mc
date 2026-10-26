@@ -6235,10 +6235,13 @@ mod wg_tests {
         // `min_clipped_height`, as the pinned class does. The one-feature forest
         // fixture moved from 47 port origins (26 shared) to 41/41 all shared, and
         // its feature draw stream matches the reference after the port's lazy
-        // aquifer samples. The capture moves with that native stage order; the
-        // target chunk's remaining 5 cells are tree-base grass/dirt.
+        // aquifer samples. The capture moves with that native stage order.
+        // 2026-10-26: the tree parser reads `dirt_provider` (the pinned
+        // TreeConfiguration field), so trunk placers set the base dirt; the
+        // target chunk's last 5 cells (grass vs dirt) became 0. The capture
+        // moves with the corrected tree-base write.
         assert_eq!(
-            digest, "97d922aa9a01d13375ef8a30eef95f64",
+            digest, "90c5430595fd08435802af4d23205ffe",
             "feature population output changed from the post-carver-visibility capture"
         );
     }

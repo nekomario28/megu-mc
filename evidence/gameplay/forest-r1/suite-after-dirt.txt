@@ -1,0 +1,6 @@
+command: cargo test --release -- --test-threads=1
+tests: 243 total
+result: 242 passed; 0 failed; 1 ignored
+unit: mc-tree-dirt-full (MemoryMax=2G, CPUQuota=200%, CARGO_BUILD_JOBS=1)
+peak memory: 884.7M
+wall: 41.2s

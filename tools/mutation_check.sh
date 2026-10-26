@@ -195,6 +195,17 @@ check "an unclipped tree rejects a clipped top" \
   'true' \
   tree::tests::a_clipped_tree_needs_a_min_clipped_height_that_the_clip_reaches
 
+check "a tree parser reads the pinned dirt provider" \
+  src/tree.rs 'dirt_provider: js(j, "dirt_provider")
+            .or_else(|| js(j, "below_trunk_provider"))' \
+  'dirt_provider: js(j, "below_trunk_provider")' \
+  tree::tests::a_tree_reads_the_dirt_provider_field_the_pinned_data_uses
+
+check "the tree path passes the dirt provider to the trunk placer" \
+  src/tree.rs '        &t.dirt_provider,' \
+  '        &None,' \
+  feature_population_output_matches_the_pre_refactor_capture
+
 check "the tree path uses the clip decision" \
   src/tree.rs 'if !clip_allows_top(top, height, t.min_clipped) {' \
   'if false && !clip_allows_top(top, height, t.min_clipped) {' \

@@ -148,7 +148,7 @@ impl TrunkPl {
         rng: &mut Xor,
         height: i32,
         start: P3,
-        below_trunk: &Option<Box<Bsp>>,
+        dirt_provider: &Option<Box<Bsp>>,
         trunk_st: u32,
         extra: &TreeExtra,
     ) -> (Vec<TreeNode>, Vec<P3>) {
@@ -156,7 +156,7 @@ impl TrunkPl {
         let mut logs = vec![];
         match &self.ty {
             TP::Straight => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
+                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
                 for i in 0..height {
                     let p = (start.0, start.1 + i, start.2);
                     if set_if_can_replace(ctx, p, trunk_st) {
@@ -177,7 +177,7 @@ impl TrunkPl {
                     (below.0, below.1, below.2 + 1),
                     (below.0 + 1, below.1, below.2 + 1),
                 ] {
-                    set_dirt(ctx, rng, dp, below_trunk);
+                    set_dirt(ctx, rng, dp, dirt_provider);
                 }
                 for y in 0..height {
                     for (dx, dz) in [(0, 0), (1, 0), (1, 1), (0, 1)] {
@@ -225,7 +225,7 @@ impl TrunkPl {
                     (below.0, below.1, below.2 + 1),
                     (below.0 + 1, below.1, below.2 + 1),
                 ] {
-                    set_dirt(ctx, rng, dp, below_trunk);
+                    set_dirt(ctx, rng, dp, dirt_provider);
                 }
                 let lean_dir = rand_horizontal(rng);
                 let lean_h = height - rng.next_bound(4);
@@ -276,7 +276,7 @@ impl TrunkPl {
                 }
             }
             TP::Forking => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
+                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
                 let lean_dir = rand_horizontal(rng);
                 let lean_h = height - rng.next_bound(4) - 1;
                 let mut lean_steps = 3 - rng.next_bound(3);
@@ -337,7 +337,7 @@ impl TrunkPl {
             TP::Fancy => {
                 let j = height + 2;
                 let k = ((j as f64) * 0.618).floor() as i32;
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
+                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
                 let l = ((1.382 + (1.0 * j as f64 / 13.0).powf(2.0)).floor() as i32).min(1);
                 let m = start.1 + k;
                 let mut list: Vec<(P3, i32)> = vec![];
@@ -405,7 +405,7 @@ impl TrunkPl {
                 let dir = rand_horizontal(rng);
                 let log_h = height - 1;
                 let mut pos = start;
-                set_dirt(ctx, rng, (pos.0, pos.1 - 1, pos.2), below_trunk);
+                set_dirt(ctx, rng, (pos.0, pos.1 - 1, pos.2), dirt_provider);
                 for i in 0..=log_h {
                     if i + 1 >= log_h + rng.next_bound(2) {
                         let (ox, oz) = hoff(dir);
@@ -526,7 +526,7 @@ impl TrunkPl {
                 start_off,
                 end_off,
             } => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
+                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
                 let first_off = (height - 1 + start_off.get(rng)).max(0);
                 let mut second_off = (height - 1 + {
                     // second uses min..max-1 of the same uniform range
@@ -600,7 +600,7 @@ impl TrunkPl {
                 above_branches,
                 branch_amount,
             } => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
+                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
                 let branch_h = height - above_branches.get(rng);
                 for y in 0..height {
                     let p = (start.0, start.1 + y, start.2);
@@ -1902,7 +1902,7 @@ impl RootP {
 
 pub(crate) struct TreeExtra {
     pub min_clipped: Option<i32>,
-    pub below_trunk: Option<Box<Bsp>>,
+    pub dirt_provider: Option<Box<Bsp>>,
     pub ignore_vines: bool,
     pub min_size: FS,
     pub decorators: Vec<Deco>,
@@ -1979,7 +1979,7 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         rng,
         top.max(0),
         trunk_start,
-        &t.below_trunk,
+        &t.dirt_provider,
         trunk_st,
         t,
     );
@@ -2356,7 +2356,10 @@ pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
     }
     Some(TreeExtra {
         min_clipped: mch,
-        below_trunk: js(j, "below_trunk_provider").and_then(p_bsp).map(Box::new),
+        dirt_provider: js(j, "dirt_provider")
+            .or_else(|| js(j, "below_trunk_provider"))
+            .and_then(p_bsp)
+            .map(Box::new),
         ignore_vines: jnum(j, "ignore_vines").unwrap_or(0.0) != 0.0
             || matches!(js(j, "ignore_vines"), Some(J::Str(s)) if s == "true"),
         min_size,
@@ -2382,6 +2385,20 @@ mod tests {
 
     fn state(name: &str) -> u32 {
         crate::name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"))
+    }
+
+    #[test]
+    fn a_tree_reads_the_dirt_provider_field_the_pinned_data_uses() {
+        let j = crate::json::jparse(include_bytes!(
+            "../datapacks/vanilla/data/minecraft/worldgen/configured_feature/oak.json"
+        ))
+        .expect("the pinned oak config must parse");
+        let config = js(&j, "config").expect("oak.json wraps its parameters in config");
+        let tree = p_tree(config).expect("the pinned oak config must load");
+        assert!(
+            tree.dirt_provider.is_some(),
+            "oak.json spells the trunk-base provider as dirt_provider"
+        );
     }
 
     #[test]

@@ -93,7 +93,7 @@ The one-feature tree overlay initially placed no features because `load_freg`
 built its `by_step` order only from graph edges: a feature that was the sole
 entry in a step had no edge and was dropped before placement. The loader now
 starts DFS from every `(step, firstIndex)` node, including dependency-free
-nodes. Full-suite output is now 241/0/1, so the ordinary pack is not
+nodes. Full-suite output is now 242/0/1, so the ordinary pack is not
 reordered; the one-feature fixture is now runnable.
 
 With only `trees_birch_and_oak` enabled in forest, the reference target chunk
@@ -129,11 +129,16 @@ one-feature run has **41 reference / 41 port origins, all 41 shared**, and the
 feature draw sequence after the port's lazy aquifer samples matches the
 reference (`tree-draws-after-clip.txt`, `tree-origins-after-clip.txt`).
 
-The target chunk is now **5 cells** from the 3x3 diff (all tree-base
-grass/dirt), down from the earlier origin mismatch. The full 3x3 diff is 771
-cells (`carver` 360, `deep` 411; 223 leaf-distance tick artifacts excluded);
-the remaining tree cells are canopy shape/leaf distance in neighbouring
-chunks, not tree origins.
+The target chunk was then **5 cells** (all tree-base grass/dirt) from the 3x3
+diff. Those were the trunk-base write: the pinned `TreeConfiguration` spells
+the provider `dirt_provider`, while the parser read `below_trunk_provider`.
+The parser now accepts `dirt_provider` first (and keeps the old spelling as a
+conversion fallback). With the provider read, the target chunk is **0 cells**.
+
+The full 3x3 diff after that is **728** cells (`carver` 360, `deep` 368; 223
+leaf-distance tick artifacts excluded); the remaining tree cells are canopy
+shape/leaf distance in neighbouring chunks, not tree origins or tree-base
+dirt.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path
