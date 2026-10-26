@@ -1,0 +1,8 @@
+chunks 3x3  band y=-64..319  differing cells: 207
+per chunk: 0 57 16 26 45 0 63 0 0
+layers: {'deep': 207}
+top pairs (got, want) x count:
+      10 !=      1  x77
+       1 !=      9  x67
+       9 !=     10  x50
+       1 !=     10  x13

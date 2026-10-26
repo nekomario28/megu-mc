@@ -52,9 +52,21 @@ over terrain and the structure run adds another +2,320.
   this is a separate unimplemented contract rather than a density/surface bug.
   The no-structure runs are the attribution baseline.
 
+## Feature isolation started
+
+- `tools/geode_fixture.sh -64 32 3 0`: the **reference region holds 0 geode
+  cells**, so no positive geode comparison is possible here. The normal port
+  dump does contain geode blocks in two neighbouring chunks (not the target),
+  which is a separate placement/false-positive question.
+- A one-feature reference with only `monster_room`/`monster_room_deep` in forest
+  gives **207 region / 0 target**, identical to terrain-only. Monster rooms are
+  therefore not the target residual; they are in the same surface-baseline set.
+- Ore and tree isolation remain. `ore_fixture.sh` and the tree step still need
+  positive references before they can be called attributed.
+
 No old capture was re-recorded, and no fixture is used to excuse a missing chunk.
-The reference and dump are under `/tmp/chunkfix-forest-*` for this run; the
-script refuses to diff if the reference is incomplete.
+The reference and dump are under `/tmp/chunkfix-*` and `/tmp/forestfix-*` for
+this run; the script refuses to diff if the reference is incomplete.
 
 ## Limits
 
@@ -64,5 +76,6 @@ script refuses to diff if the reference is incomplete.
 - `--tick` folds the known saved-world water/leaves changes into the diff; a
   per-cell leaf-distance comparison is still pending. Structure cells are
   intentionally excluded from the terrain/feature baseline and shown separately.
-- No fix is claimed here. The feature residuals must be isolated to geode,
-  monster room, ore and tree placement before changing an owner.
+- No fix is claimed here. Ore and tree residuals still need positive fixtures;
+  geode placement outside the target and the 207 surface cells are separate
+  follow-ups.
