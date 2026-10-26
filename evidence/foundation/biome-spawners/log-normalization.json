@@ -1,0 +1,97 @@
+{
+  "admission-final.txt": {
+    "changed": false,
+    "raw_sha256": "d41169f7b17c0dedda7c07694ef63e707bd2ae16b82872f1ba20abdfde3745ca",
+    "saved_sha256": "d41169f7b17c0dedda7c07694ef63e707bd2ae16b82872f1ba20abdfde3745ca"
+  },
+  "admission-mutations.txt": {
+    "changed": false,
+    "raw_sha256": "e6ff9791eca06f1c01b219e038166f5b9592d4c9a7c4bec3c748aa7e7befa2d4",
+    "saved_sha256": "e6ff9791eca06f1c01b219e038166f5b9592d4c9a7c4bec3c748aa7e7befa2d4"
+  },
+  "admission-native.txt": {
+    "changed": false,
+    "raw_sha256": "3846617e384e1384a8f015ef7fbfb4874bf7712588d3945a2a1f1c78c1f18f2b",
+    "saved_sha256": "3846617e384e1384a8f015ef7fbfb4874bf7712588d3945a2a1f1c78c1f18f2b"
+  },
+  "admission-parser-mutation.txt": {
+    "changed": false,
+    "raw_sha256": "36bc290a34822b0dfc7dad020e10402b232bc593da6e16fda4e106bf62ac6c9b",
+    "saved_sha256": "36bc290a34822b0dfc7dad020e10402b232bc593da6e16fda4e106bf62ac6c9b"
+  },
+  "build.txt": {
+    "changed": false,
+    "raw_sha256": "6965b3244229c52e12021d6cc26441f7957e49b60f991f629803628ecee77529",
+    "saved_sha256": "6965b3244229c52e12021d6cc26441f7957e49b60f991f629803628ecee77529"
+  },
+  "clippy.txt": {
+    "changed": false,
+    "raw_sha256": "0dd92b3a5f961469f762a53a01e75778bd71c05c96ef8a15ba3a0b299c56d948",
+    "saved_sha256": "0dd92b3a5f961469f762a53a01e75778bd71c05c96ef8a15ba3a0b299c56d948"
+  },
+  "comparison.json": {
+    "changed": false,
+    "raw_sha256": "5c71391f913c5d1d6ed7bd9b32347327b24b324935d809762aadeb7516a62937",
+    "saved_sha256": "5c71391f913c5d1d6ed7bd9b32347327b24b324935d809762aadeb7516a62937"
+  },
+  "debt.txt": {
+    "changed": false,
+    "raw_sha256": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
+    "saved_sha256": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b"
+  },
+  "focused.txt": {
+    "changed": true,
+    "raw_sha256": "d306f3090b1637af292cb0a8155d6c17bb6e1e4fa4d7dfcadcab83e9b317c30d",
+    "saved_sha256": "62356bf209d1c96b92b7c6a255b50f7a372049bb81d7ef4e6ad74a46ecc29bb4"
+  },
+  "layer-tests.txt": {
+    "changed": false,
+    "raw_sha256": "1bc469ee7bb78d3ff4c5c92cc585d05f625f1ed33cff5f57a3626e6fc46e6120",
+    "saved_sha256": "1bc469ee7bb78d3ff4c5c92cc585d05f625f1ed33cff5f57a3626e6fc46e6120"
+  },
+  "layers.txt": {
+    "changed": false,
+    "raw_sha256": "28495f98f078823d8a3931768e2082f3f50c7e8f355ed93af4ef21340151131a",
+    "saved_sha256": "28495f98f078823d8a3931768e2082f3f50c7e8f355ed93af4ef21340151131a"
+  },
+  "mutation-parser.txt": {
+    "changed": false,
+    "raw_sha256": "e978df071b9063b2ad5b2367760563324dc741fda55ae2675c810be1e165dcbd",
+    "saved_sha256": "e978df071b9063b2ad5b2367760563324dc741fda55ae2675c810be1e165dcbd"
+  },
+  "mutations.txt": {
+    "changed": false,
+    "raw_sha256": "3053161c1822835b513caeeb85058638e91c671033d0166a1b1753ed45db8e28",
+    "saved_sha256": "3053161c1822835b513caeeb85058638e91c671033d0166a1b1753ed45db8e28"
+  },
+  "native.txt": {
+    "changed": false,
+    "raw_sha256": "5404fc0b1de495c442c205b715f1ddc76b44df1fe3c5343475456a5307cdfd7b",
+    "saved_sha256": "5404fc0b1de495c442c205b715f1ddc76b44df1fe3c5343475456a5307cdfd7b"
+  },
+  "nextint-repeat.txt": {
+    "changed": false,
+    "raw_sha256": "4eee894f100e94e4b69db675e52e2b150d89f39e6425ee102feeaa387fd0cf67",
+    "saved_sha256": "4eee894f100e94e4b69db675e52e2b150d89f39e6425ee102feeaa387fd0cf67"
+  },
+  "python.txt": {
+    "changed": false,
+    "raw_sha256": "405004882bbf70b365c77c0506d3396a66b478fbab931d10efeae8fc2e48b0b4",
+    "saved_sha256": "405004882bbf70b365c77c0506d3396a66b478fbab931d10efeae8fc2e48b0b4"
+  },
+  "suite.txt": {
+    "changed": true,
+    "raw_sha256": "05efc1c0589f0f7e105e52414d2b3c960d5227580b98ddb2b309b30fe21f31c2",
+    "saved_sha256": "03a52f458d36362fdca112d6b9e972119224a5d7f0670206b6da2228461d15f0"
+  },
+  "tie-repeat.txt": {
+    "changed": false,
+    "raw_sha256": "15e130fe70c3b925a883939755d5aace2b014e2945c61bd099e6c9df941e4dc1",
+    "saved_sha256": "15e130fe70c3b925a883939755d5aace2b014e2945c61bd099e6c9df941e4dc1"
+  },
+  "wire.txt": {
+    "changed": false,
+    "raw_sha256": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921",
+    "saved_sha256": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921"
+  }
+}

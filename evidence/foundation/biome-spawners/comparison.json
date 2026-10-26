@@ -1,0 +1,17 @@
+{
+  "baseline": {
+    "passed": 234,
+    "failed": 0,
+    "ignored": 1,
+    "failures": []
+  },
+  "current": {
+    "passed": 236,
+    "failed": 0,
+    "ignored": 1,
+    "failures": []
+  },
+  "added_failures": [],
+  "removed_failures": [],
+  "unchanged_failure_baseline": true
+}
