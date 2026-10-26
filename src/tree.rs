@@ -663,6 +663,16 @@ fn fancy_branch_prob(h: i32, y: i32) -> f32 {
 fn fancy_high(h: i32, y: i32) -> bool {
     y as f64 >= h as f64 * 0.2
 }
+/// `TrunkPlacer.isFree`: air, `REPLACEABLE_BY_TREES` (which already contains
+/// leaves) **or logs** (`BlockTags.LOGS`, mapping `awe.u`). A stone cell is not
+/// free; a branch cannot pass through rock.
+fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
+    is_replaceable(
+        reg,
+        cur,
+        &["minecraft:replaceable_by_trees", "minecraft:logs"],
+    )
+}
 fn fancy_branch(ctx: &mut FC, a: P3, b: P3, trunk_st: u32, make: bool) -> (bool, Vec<P3>) {
     let mut logs = vec![];
     if !make && a == b {
@@ -702,10 +712,7 @@ fn fancy_branch(ctx: &mut FC, a: P3, b: P3, trunk_st: u32, make: bool) -> (bool,
             None => return (false, logs),
         };
         let cur = ctx.get(p.0, p.1, p.2);
-        if reg.is_air(cur)
-            || reg.in_tag(cur, "minecraft:replaceable_by_trees")
-            || reg.in_tag(cur, "minecraft:logs")
-        {
+        if fancy_branch_open(reg, cur) {
             continue;
         }
         return (false, logs);
@@ -2388,6 +2395,15 @@ mod tests {
 
     fn state(name: &str) -> u32 {
         crate::name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"))
+    }
+
+    #[test]
+    fn a_fancy_branch_passes_through_replaceables_and_logs_only() {
+        let reg = breg().expect("the block registry must load from assets/");
+        assert!(fancy_branch_open(reg, state("oak_log")));
+        assert!(fancy_branch_open(reg, state("oak_leaves")));
+        assert!(fancy_branch_open(reg, 0));
+        assert!(!fancy_branch_open(reg, state("stone")));
     }
 
     #[test]

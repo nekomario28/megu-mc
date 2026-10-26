@@ -221,6 +221,23 @@ check "a non-fluid aquifer state above nonpositive density stays solid" \
 }' \
   worldgen::wg_tests::a_nonpositive_density_with_an_aquifer_barrier_is_still_solid
 
+check "a fancy branch treats replaceables and logs as free" \
+  src/tree.rs 'fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
+    is_replaceable(
+        reg,
+        cur,
+        &["minecraft:replaceable_by_trees", "minecraft:logs"],
+    )
+}' \
+  'fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
+    is_replaceable(
+        reg,
+        cur,
+        &["minecraft:logs"],
+    )
+}' \
+  tree::tests::a_fancy_branch_passes_through_replaceables_and_logs_only
+
 check "a fancy tree starts its attachment list below the branch end" \
   src/tree.rs 'list.push(((start.0, start.1 + j - 5, start.2), m));' \
   'list.push(((start.0, start.1 + k, start.2), m));' \

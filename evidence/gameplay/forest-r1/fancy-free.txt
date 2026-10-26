@@ -1,0 +1,14 @@
+# Fancy branch free-cell predicate
+
+`TrunkPlacer.isFree` (`ehm.b`) is `validTreePos || BlockTags.LOGS`.
+`validTreePos` (`edq.c`) is air or `REPLACEABLE_BY_TREES` (mapping `awe.co`);
+`BlockTags.LOGS` is `awe.u`. Leaves are already in `REPLACEABLE_BY_TREES`, so
+both leaves and logs are free; stone is not.
+
+The branch check now names that predicate in one helper and pins all four cases.
+The 5x5 tree-on diff stays 72 (the remaining branch/canopy/leaf cells), so this
+refactor is not the 72-cell cause; it prevents a future tag swap from silently
+turning the branch into a stone-only path.
+
+Suite after the helper: 245 passed / 0 failed / 1 ignored.
+Mutation: fancy branch predicate 1 proved.
