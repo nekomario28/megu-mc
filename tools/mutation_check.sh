@@ -867,6 +867,16 @@ check "biome tree scans children in array order for ties" \
   '                for c in ch.iter().rev() {' \
   biome_tree_breaks_ties_the_way_vanilla_scans_children
 
+check "spawner entries keep the pinned entity type" \
+  src/feature.rs 'kind: ns_name(&jstr(j, "type")?),' \
+  'kind: "minecraft:zombie".to_string(),' \
+  biome_spawn_tables_match_the_pinned_classes
+
+check "nightly hostile respects the biome weighted roll" \
+  src/feature.rs 'let mut point = (roll % total as u64) as i64;' \
+  'let mut point = 0i64;' \
+  nightly_hostile_type_uses_the_pinned_biome_spawners
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

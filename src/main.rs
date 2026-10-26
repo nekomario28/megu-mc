@@ -2847,12 +2847,12 @@ fn keepalive_time_tick() {
                 let ang = (t as f64) * 2.399;
                 let (nx, nz) = (px + ang.cos() * 14.0, pz + ang.sin() * 14.0);
                 let ny = surface_y(nx.round() as i32, nz.round() as i32);
-                let et = match attempt % 5 {
-                    0 => 23,
-                    1 => 91,
-                    2 => 100,
-                    _ => 124,
-                };
+                let biome = worldgen::biome_name_at_block(
+                    nx.round() as i32,
+                    ny.round() as i32,
+                    nz.round() as i32,
+                );
+                let et = spawn_etype_for_biome(biome.as_deref(), attempt);
                 let m = Arc::new(Mob {
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     uuid: [0u8; 16],
@@ -11126,6 +11126,23 @@ fn particle_id(n: &str) -> Option<i32> {
     }
     None
 }
+/// Nightly hostile choice: use the pinned biome's weighted monster list for the
+/// four types this runtime can simulate, and keep the old rotation only when the
+/// biome has no usable entry. This is not NaturalSpawner: placement, group size,
+/// difficulty and category caps are still the tick loop's own contract.
+fn spawn_etype_for_biome(biome: Option<&str>, attempt: u64) -> i64 {
+    biome
+        .and_then(|b| feature::choose_supported_hostile(b, attempt))
+        .and_then(name_to_etype)
+        .filter(|e| matches!(e, 23 | 91 | 100 | 124))
+        .unwrap_or(match attempt % 5 {
+            0 => 23,
+            1 => 91,
+            2 => 100,
+            _ => 124,
+        })
+}
+
 fn name_to_etype(n: &str) -> Option<i64> {
     let n = n.strip_prefix("minecraft:").unwrap_or(n);
     Some(match n {

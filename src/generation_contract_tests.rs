@@ -542,6 +542,84 @@ fn converted_carver_lists_still_parse() {
     );
 }
 
+/// Every biome's `MobSpawnSettings` from the pinned jar: all eight categories,
+/// each weighted entry, the two spawn-cost fields and the creature probability.
+/// The nightly runtime uses only the supported monsters, but the whole loaded
+/// table is pinned so a loader change cannot silently drop a category.
+#[test]
+fn biome_spawn_tables_match_the_pinned_classes() {
+    let fixture = jparse(include_bytes!(
+        "../evidence/foundation/biome-spawners/vanilla.json"
+    ))
+    .unwrap();
+    let J::Obj(biomes) = fixture.get("biomes").unwrap() else {
+        panic!("biomes must be an object");
+    };
+    let reg = super::freg();
+    let mut entries = 0;
+    let mut costs = 0;
+    for (name, row) in biomes {
+        let got = reg.spawners.get(name).expect("biome spawners");
+        let J::Obj(want) = row.get("spawners").unwrap() else {
+            panic!("spawners must be an object");
+        };
+        assert_eq!(got.len(), want.len(), "categories for {name}");
+        for (category, list) in want {
+            let want_list = list.as_arr().unwrap();
+            let got_list = got.get(category).unwrap();
+            assert_eq!(got_list.len(), want_list.len(), "{name}/{category}");
+            for (g, w) in got_list.iter().zip(want_list) {
+                assert_eq!(g.kind, w.get("type").unwrap().str(), "{name}/{category}");
+                assert_eq!(g.min_count, w.get("min").unwrap().num() as i32);
+                assert_eq!(g.max_count, w.get("max").unwrap().num() as i32);
+                assert_eq!(g.weight, w.get("weight").unwrap().num() as i32);
+                entries += 1;
+            }
+        }
+        let J::Obj(want_costs) = row.get("spawn_costs").unwrap() else {
+            panic!("spawn_costs must be an object");
+        };
+        let got_costs = reg.spawn_costs.get(name).unwrap();
+        assert_eq!(got_costs.len(), want_costs.len(), "costs for {name}");
+        for (kind, want_cost) in want_costs {
+            let got_cost = got_costs.get(kind).unwrap();
+            assert_eq!(
+                got_cost.energy_budget.to_bits(),
+                want_cost.get("energy_budget").unwrap().num().to_bits()
+            );
+            assert_eq!(
+                got_cost.charge.to_bits(),
+                want_cost.get("charge").unwrap().num().to_bits()
+            );
+            costs += 1;
+        }
+        let probability = reg.spawn_probability.get(name).unwrap();
+        assert_eq!(
+            probability.to_bits(),
+            (row.get("creature_generation_probability").unwrap().num() as f32).to_bits()
+        );
+    }
+    assert_eq!(biomes.len(), 64, "pinned biome coverage changed");
+    assert_eq!(entries, 746, "weighted spawner entries changed");
+    assert_eq!(costs, 5, "spawn costs changed");
+    assert_eq!(
+        super::choose_supported_hostile("minecraft:plains", 0),
+        Some("minecraft:spider")
+    );
+    assert_eq!(
+        super::choose_supported_hostile("minecraft:the_end", 0),
+        None,
+        "the End has only unsupported endermen"
+    );
+    assert_eq!(
+        super::spawn_cost_for("minecraft:soul_sand_valley", "minecraft:enderman"),
+        Some(super::SpawnCost {
+            energy_budget: 0.15,
+            charge: 0.7
+        })
+    );
+}
+
 /// A geode config whose shape is fully determined: one point at a fixed offset, no
 /// noise, no crack, no alternate layer, no inner placements. The decompiled
 /// `GeodeFeature` then compares `1/sqrt(distSqr + pointOffset)` against

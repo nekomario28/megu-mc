@@ -2161,8 +2161,29 @@ pub(crate) struct FReg {
     bsteps: HashMap<String, Vec<Vec<String>>>,
     ball: HashMap<String, HashSet<String>>,
     btemp: HashMap<String, f32>,
+    // 1.21.1 `spawners`: biome -> MobCategory serialized name -> weighted entries.
+    spawners: HashMap<String, HashMap<String, Vec<SpawnerData>>>,
+    // 1.21.1 `spawn_costs`: biome -> entity id -> (energy_budget, charge).
+    spawn_costs: HashMap<String, HashMap<String, SpawnCost>>,
+    spawn_probability: HashMap<String, f32>,
     order: Vec<Vec<(u32, String)>>,
     steps: usize,
+}
+
+/// `MobSpawnSettings.SpawnerData`: type, min/max group size, Weight value.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SpawnerData {
+    pub kind: String,
+    pub min_count: i32,
+    pub max_count: i32,
+    pub weight: i32,
+}
+
+/// `MobSpawnSettings.MobSpawnCost` (both values are f64 in the codec).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpawnCost {
+    pub energy_budget: f64,
+    pub charge: f64,
 }
 
 // The biome list `FeatureSorter.buildFeaturesPerStep` receives for the overworld: the
@@ -2253,6 +2274,39 @@ fn dfs_step(
     order.push(v);
 }
 
+fn spawners_obj(j: &J) -> Vec<(String, &Vec<J>)> {
+    match j {
+        J::Obj(m) => m
+            .iter()
+            .filter_map(|(k, v)| v.as_arr().map(|a| (k.clone(), a)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn spawn_costs_obj(j: &J) -> Vec<(&str, &J)> {
+    match j {
+        J::Obj(m) => m.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn p_spawner_data(j: &J) -> Option<SpawnerData> {
+    Some(SpawnerData {
+        kind: ns_name(&jstr(j, "type")?),
+        min_count: jint(j, "minCount", 0),
+        max_count: jint(j, "maxCount", 0),
+        weight: jint(j, "weight", 1),
+    })
+}
+
+fn p_spawn_cost(j: &J) -> Option<SpawnCost> {
+    Some(SpawnCost {
+        energy_budget: jnum(j, "energy_budget")?,
+        charge: jnum(j, "charge")?,
+    })
+}
+
 fn load_freg() -> FReg {
     let mut reg = FReg {
         cfg: HashMap::new(),
@@ -2260,6 +2314,9 @@ fn load_freg() -> FReg {
         bsteps: HashMap::new(),
         ball: HashMap::new(),
         btemp: HashMap::new(),
+        spawners: HashMap::new(),
+        spawn_costs: HashMap::new(),
+        spawn_probability: HashMap::new(),
         order: vec![],
         steps: 0,
     };
@@ -2297,6 +2354,38 @@ fn load_freg() -> FReg {
                 }
             }
             max_steps = max_steps.max(steps.len());
+            // The JSON field is `creature_spawn_probability`; MobSpawnSettings
+            // defaults it to 0.1 when omitted.
+            let prob = jnum(&j, "creature_spawn_probability").unwrap_or(0.1);
+            reg.spawn_probability.insert(name.clone(), prob as f32);
+            if let Some(spawners) = js(&j, "spawners").and_then(|v| match v {
+                J::Obj(_) => Some(v),
+                _ => None,
+            }) {
+                let mut by_category = HashMap::new();
+                for (cat, list) in spawners_obj(spawners) {
+                    let mut entries = Vec::new();
+                    for e in list {
+                        if let Some(data) = p_spawner_data(e) {
+                            entries.push(data);
+                        }
+                    }
+                    by_category.insert(cat, entries);
+                }
+                reg.spawners.insert(name.clone(), by_category);
+            }
+            if let Some(costs) = js(&j, "spawn_costs").and_then(|v| match v {
+                J::Obj(_) => Some(v),
+                _ => None,
+            }) {
+                let mut by_entity = HashMap::new();
+                for (kind, cost) in spawn_costs_obj(costs) {
+                    if let Some(c) = p_spawn_cost(cost) {
+                        by_entity.insert(ns_name(kind), c);
+                    }
+                }
+                reg.spawn_costs.insert(name.clone(), by_entity);
+            }
             reg.ball
                 .insert(name.clone(), steps.iter().flatten().cloned().collect());
             reg.bsteps.insert(name, steps);
@@ -2369,6 +2458,53 @@ fn load_freg() -> FReg {
 static FREG: std::sync::OnceLock<FReg> = std::sync::OnceLock::new();
 fn freg() -> &'static FReg {
     FREG.get_or_init(load_freg)
+}
+
+/// The pinned biome's weighted spawner list for one MobCategory (serialized name).
+pub(crate) fn spawners_for(biome: &str, category: &str) -> Option<&'static [SpawnerData]> {
+    freg().spawners.get(biome)?.get(category).map(Vec::as_slice)
+}
+
+/// The pinned biome's spawn cost for an entity id, if the data declares one.
+#[cfg(test)]
+pub(crate) fn spawn_cost_for(biome: &str, entity: &str) -> Option<SpawnCost> {
+    freg().spawn_costs.get(biome)?.get(entity).copied()
+}
+
+/// Pick a weighted `monster` entry that this server can actually simulate.
+///
+/// This is deliberately narrower than `NaturalSpawner`: only the four hostile
+/// types the runtime owns are candidates. The weights and the entry order are
+/// the pinned data's, so the nightly spawn path no longer rotates through a
+/// hard-coded type list irrespective of biome. Mob-specific spawn placement,
+/// group size, difficulty and per-category caps remain the caller's contract.
+pub(crate) fn choose_supported_hostile(biome: &str, roll: u64) -> Option<&'static str> {
+    const SUPPORTED: [&str; 4] = [
+        "minecraft:zombie",
+        "minecraft:skeleton",
+        "minecraft:spider",
+        "minecraft:creeper",
+    ];
+    let list = spawners_for(biome, "monster")?;
+    let total: i64 = list
+        .iter()
+        .filter(|s| SUPPORTED.contains(&s.kind.as_str()) && s.weight > 0)
+        .map(|s| s.weight as i64)
+        .sum();
+    if total <= 0 {
+        return None;
+    }
+    let mut point = (roll % total as u64) as i64;
+    for s in list {
+        if !SUPPORTED.contains(&s.kind.as_str()) || s.weight <= 0 {
+            continue;
+        }
+        if point < s.weight as i64 {
+            return Some(s.kind.as_str());
+        }
+        point -= s.weight as i64;
+    }
+    None
 }
 
 fn foliage_noise() -> &'static OSimp {

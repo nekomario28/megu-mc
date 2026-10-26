@@ -4,19 +4,19 @@
 
 ## いまの判断 — 広げる前に収束する
 
-Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[PR統合後](../evidence/foundation/upstream-prs/README.md)で **234 passed / 0 failed / 1 ignored** まで戻りましたが、whole-world比較・forest残差・surface full contextは未確認です。緑を全体合格へ読み替えず、まずR0の残りとR1へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
+Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[biome spawner slice](../evidence/foundation/biome-spawners/README.md)で **236 passed / 0 failed / 1 ignored** まで戻りました。spawn tableは読み込み・夜間hostile選択まで接続しましたが、whole-world比較・forest残差・surface full context・spawn_costs適用は未確認です。緑を全体合格へ読み替えず、まずR0の残りとR1へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
-**次の最小slice:** biome の `spawners` / `spawn_costs` を固定jarの `MobSpawnSettings` 実クラスで読み、既存のmob ownerへ一つでも本番経路として接続する。`carvers` のAIR listとown-jar configured_feature pathは[carverの証拠](../evidence/foundation/biome-carvers/README.md)、Xoroshiro/biome tieは[PR統合の証拠](../evidence/foundation/upstream-prs/README.md)で限定範囲を閉じた。全chunkの再生成や別のdonor機能へ先に広げません。
+**次の最小slice:** surface のscan context・biome lookupを、固定jarの実クラスと本番のsurface適用で照合する。`spawners`/`spawn_costs`の読み込みと夜間hostileのweighted選択は[biome spawnerの証拠](../evidence/foundation/biome-spawners/README.md)、`carvers`のAIR listは[carverの証拠](../evidence/foundation/biome-carvers/README.md)、Xoroshiro/biome tieは[PR統合の証拠](../evidence/foundation/upstream-prs/README.md)で限定範囲を閉じた。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
 1. 全体テストの一次失敗とmutex poisonの連鎖を分ける。一次失敗は必要なら新しいプロセスで再現し、入力・loader・評価器・古いcaptureのどこに属するかを特定する。poisonを握り潰して緑にしない。
-2. 残るdensity function、biomeの`spawners`/`spawn_costs`、surfaceのscan contextを、固定1.21.1の実際の意味で評価する。aquiferのpreliminary surface・流体状態は[実クラス対照](../evidence/foundation/aquifer/README.md)、biome `carvers` のAIR listとown-jar configured_feature pathは[carverの証拠](../evidence/foundation/biome-carvers/README.md)で限定範囲を閉じた。全seed/chunk、deep-dark実chunk、mob spawn runtimeは未検証である。各差分を独立した小さい実クラス対照と本番経路のゲートにする。
+2. 残るdensity function、surfaceのscan context、`spawn_costs`の適用を、固定1.21.1の実際の意味で評価する。aquiferのpreliminary surface・流体状態は[実クラス対照](../evidence/foundation/aquifer/README.md)、biome `carvers` のAIR listとown-jar configured_feature pathは[carverの証拠](../evidence/foundation/biome-carvers/README.md)、`spawners`の読み込みと夜間hostile選択は[biome spawnerの証拠](../evidence/foundation/biome-spawners/README.md)で限定範囲を閉じた。全seed/chunk、deep-dark実chunk、NaturalSpawner、spawn_costsのenergy budgetは未検証である。各差分を独立した小さい実クラス対照と本番経路のゲートにする。
 3. surfaceはsourceのdecodeや温度条件だけで閉じず、実際のbiome選択・列の走査状態・surface contextを含む適用結果を検査する。未知ノード・解決できない参照・落とした入力名は明示し、成功したように読み替えない。異なるseedや生成器の寿命をまたぐnoise cacheと、循環参照のplaceholderも、比較を隠さない条件で検査する。
 
 **出口:** 比較対象のrouter/biome/surface経路に未説明のゼロ代替・参照落ちが残らず、未解決・未対応の一覧と本番での到達性を説明できる。ローカルsuiteの緑は必要条件であり、whole-world・native対照・CIの代用にしない。意味を変えた経路には実クラス対照と故障を検出するテストがある。全体の赤は一次原因へ帰属させ、原因未確認のcapture更新で消さない。個別の修正ごとに広い回帰を確認し、全体合格は必須テストが通ってから判定する。
 
-根拠: [自前データ監査](../evidence/foundation/audit-snapshots/README.md)、[sampler/native noiseの検証範囲](../evidence/foundation/weird-sampler/README.md)、[aquiferの検証範囲](../evidence/foundation/aquifer/README.md)、[carverの検証範囲](../evidence/foundation/biome-carvers/README.md)、[PR統合の検証範囲](../evidence/foundation/upstream-prs/README.md)、[surfaceの検証範囲](../evidence/foundation/surface-loader/README.md)。
+根拠: [自前データ監査](../evidence/foundation/audit-snapshots/README.md)、[sampler/native noiseの検証範囲](../evidence/foundation/weird-sampler/README.md)、[aquiferの検証範囲](../evidence/foundation/aquifer/README.md)、[carverの検証範囲](../evidence/foundation/biome-carvers/README.md)、[biome spawnerの検証範囲](../evidence/foundation/biome-spawners/README.md)、[PR統合の検証範囲](../evidence/foundation/upstream-prs/README.md)、[surfaceの検証範囲](../evidence/foundation/surface-loader/README.md)。
 
 ## R1 — 同じ生成stageでworldgenを再受け入れする
 

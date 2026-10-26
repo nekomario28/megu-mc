@@ -3831,6 +3831,11 @@ pub fn biome_debug(qx: i32, qy: i32, qz: i32) -> Option<(i64, [i64; 7])> {
     Some((biome_id(&g.biome_names[best.1 as usize].clone()), t))
 }
 
+/// Block-space biome name through the same quart lookup as the feature layer.
+pub fn biome_name_at_block(x: i32, y: i32, z: i32) -> Option<String> {
+    GEN.lock().unwrap().as_mut()?.biome_name_at(x, y, z)
+}
+
 /// quart-space biome id (public for debug/tests)
 pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
     let mut gg = GEN.lock().unwrap();

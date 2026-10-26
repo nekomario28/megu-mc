@@ -3318,3 +3318,17 @@ fn tmp_geode_noise_scale() {
         var.sqrt()
     );
 }
+
+#[test]
+fn nightly_hostile_type_uses_the_pinned_biome_spawners() {
+    // Plains' supported entries in list order: spider(100), zombie(95),
+    // skeleton(100), creeper(100); the runtime's entity ids are 100/124/91/23.
+    assert_eq!(spawn_etype_for_biome(Some("minecraft:plains"), 0), 100);
+    assert_eq!(spawn_etype_for_biome(Some("minecraft:plains"), 100), 124);
+    assert_eq!(spawn_etype_for_biome(Some("minecraft:plains"), 195), 91);
+    assert_eq!(spawn_etype_for_biome(Some("minecraft:plains"), 295), 23);
+    // The End only lists endermen, which this runtime does not own; keep the
+    // existing rotation rather than inventing a spawner entry.
+    assert_eq!(spawn_etype_for_biome(Some("minecraft:the_end"), 0), 23);
+    assert_eq!(spawn_etype_for_biome(None, 1), 91);
+}
