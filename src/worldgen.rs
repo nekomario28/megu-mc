@@ -2010,7 +2010,7 @@ impl Gen {
         est.wrapping_add(self.run_depth(x, z)).wrapping_sub(8)
     }
 
-    fn test_cond(&mut self, cid: usize, c: &mut SC, surf: &[i16; 256]) -> bool {
+    fn test_cond(&mut self, cid: usize, c: &mut SC, heightmap: &[i16; 256]) -> bool {
         let cd = self.conds[cid];
         match cd {
             Cond::False => false,
@@ -2072,14 +2072,14 @@ impl Gen {
                 let lx = c.x & 15;
                 let lz = c.z & 15;
                 let t = |lx: i32, lz: i32| -> i32 {
-                    surf[(lz.clamp(0, 15) as usize) * 16 + (lx.clamp(0, 15) as usize)] as i32
+                    heightmap[(lz.clamp(0, 15) as usize) * 16 + (lx.clamp(0, 15) as usize)] as i32
                 };
                 // pumpkin steep: north-facing (z+1 >= z-1 + 4) or west-facing (x-1 >= x+1 + 4)
                 let s = t(lx, lz + 1) >= t(lx, lz - 1) + 4 || t(lx - 1, lz) >= t(lx + 1, lz) + 4;
                 c.steep = Some(s);
                 s
             }
-            Cond::Not(i) => !self.test_cond(i, c, surf),
+            Cond::Not(i) => !self.test_cond(i, c, heightmap),
             Cond::Hole => c.run_depth <= 0,
             Cond::Prelim => c.y >= c.est_min,
             Cond::StoneD {
@@ -2100,7 +2100,7 @@ impl Gen {
         }
     }
 
-    fn eval_rule(&mut self, rid: usize, c: &mut SC, surf: &[i16; 256]) -> Option<u32> {
+    fn eval_rule(&mut self, rid: usize, c: &mut SC, heightmap: &[i16; 256]) -> Option<u32> {
         match &self.rules[rid] {
             Rule::Block(st) => Some(*st),
             Rule::Bandlands => {
@@ -2119,7 +2119,7 @@ impl Gen {
                     {
                         let sub = next?;
                         i += 1;
-                        if let Some(st) = self.eval_rule(sub, c, surf) {
+                        if let Some(st) = self.eval_rule(sub, c, heightmap) {
                             return Some(st);
                         }
                     }
@@ -2127,8 +2127,8 @@ impl Gen {
             }
             Rule::Cond(ci, ri) => {
                 let (ci, ri) = (*ci, *ri);
-                if self.test_cond(ci, c, surf) {
-                    self.eval_rule(ri, c, surf)
+                if self.test_cond(ci, c, heightmap) {
+                    self.eval_rule(ri, c, heightmap)
                 } else {
                     None
                 }
@@ -2388,7 +2388,11 @@ impl Gen {
                         c.sda = sda;
                         c.sdb = y - min + 1;
                         c.fluid = fluid;
-                        if let Some(st) = g.eval_rule(root, &mut c, &cc.surf) {
+                        // SurfaceRules.Context.SteepMaterialCondition reads
+                        // Heightmap.Types.WORLD_SURFACE_WG, not the stone-only
+                        // density top: under an ocean the water surface is the
+                        // height the four-neighbour slope test must see.
+                        if let Some(st) = g.eval_rule(root, &mut c, &cc.wtop) {
                             vals[(y - est_min) as usize] = st.min(u16::MAX as u32 - 1) as u16;
                         }
                         y -= 1;
@@ -2975,7 +2979,7 @@ impl Gen {
         c.sda = 1;
         c.sdb = 1;
         c.fluid = if is_fluid { y + 1 } else { i32::MIN };
-        self.eval_rule(root, &mut c, &cc.surf)
+        self.eval_rule(root, &mut c, &cc.wtop)
     }
 
     pub(crate) fn deep_state_i(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
@@ -2996,7 +3000,7 @@ impl Gen {
         c.sda = 32000;
         c.sdb = 32000;
         c.fluid = i32::MIN;
-        self.eval_rule(root, &mut c, &cc.surf)
+        self.eval_rule(root, &mut c, &cc.wtop)
             .unwrap_or(self.def_st)
     }
 }
@@ -3978,6 +3982,41 @@ mod wg_tests {
             unknown.is_empty(),
             "biome tree contains foreign biomes: {unknown:?}"
         );
+    }
+
+    /// `Context$SteepMaterialCondition` compares WORLD_SURFACE_WG heights at
+    /// z+1/z-1 and x-1/x+1 with a four-block threshold. The scan must pass the
+    /// surface/fluid heightmap, not the stone-only density top.
+    #[test]
+    fn surface_steep_reads_the_world_surface_heightmap() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        g.conds.push(Cond::Steep);
+        let cid = g.conds.len() - 1;
+        let mut c = SC::new();
+        c.x = 5;
+        c.z = 5;
+        let mut hm = [64i16; 256];
+        hm[6 * 16 + 5] = 68;
+        assert!(g.test_cond(cid, &mut c, &hm), "z+1 slope");
+        let mut c = SC::new();
+        c.x = 5;
+        c.z = 5;
+        let mut hm = [64i16; 256];
+        hm[6 * 16 + 5] = 67;
+        assert!(
+            !g.test_cond(cid, &mut c, &hm),
+            "three-block slope is not steep"
+        );
+        let mut c = SC::new();
+        c.x = 5;
+        c.z = 5;
+        let mut hm = [64i16; 256];
+        hm[5 * 16 + 4] = 68;
+        assert!(g.test_cond(cid, &mut c, &hm), "x-1 slope");
+        let mut c = SC::new();
+        c.x = 5;
+        c.z = 5;
+        assert!(!g.test_cond(cid, &mut c, &[64i16; 256]), "flat");
     }
 
     #[test]

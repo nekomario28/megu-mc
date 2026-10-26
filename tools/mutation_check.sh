@@ -877,6 +877,11 @@ check "nightly hostile respects the biome weighted roll" \
   'let mut point = 0i64;' \
   nightly_hostile_type_uses_the_pinned_biome_spawners
 
+check "surface steep keeps the four-block threshold" \
+  src/worldgen.rs 'let s = t(lx, lz + 1) >= t(lx, lz - 1) + 4 || t(lx - 1, lz) >= t(lx + 1, lz) + 4;' \
+  'let s = t(lx, lz + 1) >= t(lx, lz - 1) + 3 || t(lx - 1, lz) >= t(lx + 1, lz) + 3;' \
+  surface_steep_reads_the_world_surface_heightmap
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
