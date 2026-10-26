@@ -11,10 +11,20 @@
 //!   world border limit. A NaN position otherwise propagates into worldgen,
 //!   visibility, pathfinding and every float-to-int conversion on its way.
 //!
-//! Deliberately *not* here: a packet rate limit. Vanilla has none, and dropping
-//! a legitimate burst is a visible divergence from the behaviour this port
-//! exists to preserve. The branch this was taken from had a token bucket; it was
-//! left there with no measurement to justify it.
+//! Deliberately *not* here: a per-packet rate limit. Vanilla has none for
+//! movement and the like, and dropping a legitimate burst is a visible
+//! divergence from the behaviour this port exists to preserve. The branch this
+//! was taken from had a token bucket; it was left there with no measurement to
+//! justify it.
+//!
+//! That is not the same as "no limits at all", and an earlier version of this
+//! comment overstated it. The limits that exist are connection- and
+//! abuse-level, and live in `connection_limits.rs`: a per-IP concurrent
+//! connection cap, a handshake/login/configuration deadline, a play-state idle
+//! deadline, vanilla's own chat length rule and spam counter (the only
+//! per-message throttle vanilla has), and RCON failed-password lockout. There
+//! is still *no* per-IP connection *rate* limit and no packet-rate limit for
+//! gameplay packets; put a firewall / fail2ban in front of a public listener.
 
 /// Vanilla's limit: a three-byte VarInt length prefix, so at most 2^21 - 1 bytes.
 pub(crate) const MAX_PLAY_FRAME: usize = 2 * 1024 * 1024 - 1;
