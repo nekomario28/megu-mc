@@ -150,8 +150,11 @@ The remaining differences are neighbour terrain and canopy cells whose
 origins lie in neighbouring chunks outside the instrumented tree-origin
 radius. A second pass arming chunk `(-62,32)` found 40 reference / 42 port
 origins (32 shared, 8/10 one-sided), matching the boundary canopy split; see
-`outside-origin.txt`. They are not a return of the target tree origin,
-tree-base dirt, or fancy attachment residuals.
+`outside-origin.txt`. A 5x5 same-stage fixture confirms the interior origins
+are exact (25/25 shared; target 6/6) while the inner 3x3 still measures 319:
+the boundary canopy comes from the next chunk row (`z=31`) whose origins and
+terrain differ. See `five-by-five.txt`. They are not a return of the target
+tree origin, tree-base dirt, or fancy attachment residuals.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path

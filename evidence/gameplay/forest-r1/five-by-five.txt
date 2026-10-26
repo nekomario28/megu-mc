@@ -1,0 +1,16 @@
+# 5x5 same-stage fixture
+
+Command: reference/port generated from (-65,31) with N=5, seed 0, the same
+one-feature forest pack. The inner 3x3 starts at (-64,32).
+
+- full 5x5 diff: 1845 cells
+- inner 3x3 diff: 319 cells (carver 55, deep 264)
+- target chunk (-64,32): 0 cells
+- tree origins in the inner 3x3: reference 25 / port 25 / shared 25
+- target chunk origins: reference 6 / port 6 / shared 6
+
+The 319 inner cells remain because 111 canopy cells at the inner boundary
+belong to trees in chunk row z=31. Those origins are outside the inner 3x3;
+their trunk columns still differ (for example ref -992,506 / port -991,507,
+ref -989,511 / port -980,511). This is neighbour terrain/feature-stage residue,
+not a mismatch of the tree origins inside the interior.
