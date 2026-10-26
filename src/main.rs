@@ -348,7 +348,7 @@ fn skin_cache_put(
     }
     c.insert(key, (now, res));
 }
-fn fetch_skin(name: &str) -> Option<(String, String)> {
+fn load_skin_properties(name: &str) -> Option<(String, String)> {
     // offline-mode skin resolution: name -> uuid -> session profile textures
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(6)))
@@ -425,7 +425,7 @@ fn kick_skin(name: String, target: &Arc<Client>) {
     let t = target.clone();
     thread::spawn(move || {
         let _slot = slot;
-        let r = fetch_skin(&name);
+        let r = load_skin_properties(&name);
         skin_cache_put(
             &mut skin_cache().lock().unwrap(),
             key,
