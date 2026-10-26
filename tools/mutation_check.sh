@@ -201,6 +201,11 @@ check "a tree parser reads the pinned dirt provider" \
   'dirt_provider: js(j, "below_trunk_provider")' \
   tree::tests::a_tree_reads_the_dirt_provider_field_the_pinned_data_uses
 
+check "a fancy tree starts its attachment list below the branch end" \
+  src/tree.rs 'list.push(((start.0, start.1 + j - 5, start.2), m));' \
+  'list.push(((start.0, start.1 + k, start.2), m));' \
+  feature_population_output_matches_the_pre_refactor_capture
+
 check "the tree path passes the dirt provider to the trunk placer" \
   src/tree.rs '        &t.dirt_provider,' \
   '        &None,' \

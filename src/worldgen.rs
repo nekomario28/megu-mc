@@ -6238,10 +6238,12 @@ mod wg_tests {
         // aquifer samples. The capture moves with that native stage order.
         // 2026-10-26: the tree parser reads `dirt_provider` (the pinned
         // TreeConfiguration field), so trunk placers set the base dirt; the
-        // target chunk's last 5 cells (grass vs dirt) became 0. The capture
-        // moves with the corrected tree-base write.
+        // target chunk's last 5 cells (grass vs dirt) became 0.
+        // 2026-10-26: fancy trunk attachments start at `start + (height - 3)`,
+        // not `start + k`; the latter moved every fancy canopy up. The 3x3 diff
+        // moved 728 -> 319 while the target chunk stayed at 0.
         assert_eq!(
-            digest, "90c5430595fd08435802af4d23205ffe",
+            digest, "593c7cd603ddc8b5c6bcf8978a58468f",
             "feature population output changed from the post-carver-visibility capture"
         );
     }

@@ -341,7 +341,10 @@ impl TrunkPl {
                 let l = ((1.382 + (1.0 * j as f64 / 13.0).powf(2.0)).floor() as i32).min(1);
                 let m = start.1 + k;
                 let mut list: Vec<(P3, i32)> = vec![];
-                list.push(((start.0, start.1 + k, start.2), m));
+                // Vanilla starts the attachment list at `start.b(j - 5)`; `k`
+                // is the *upper end* height, not the attachment's own y. Using
+                // `start + k` moved every fancy canopy up by `k - (height - 3)`.
+                list.push(((start.0, start.1 + j - 5, start.2), m));
                 for n in (0..=(j - 5)).rev() {
                     let f = fancy_branch_prob(j, n);
                     if f < 0.0 {

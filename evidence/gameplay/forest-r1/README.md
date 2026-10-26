@@ -136,9 +136,19 @@ The parser now accepts `dirt_provider` first (and keeps the old spelling as a
 conversion fallback). With the provider read, the target chunk is **0 cells**.
 
 The full 3x3 diff after that is **728** cells (`carver` 360, `deep` 368; 223
-leaf-distance tick artifacts excluded); the remaining tree cells are canopy
-shape/leaf distance in neighbouring chunks, not tree origins or tree-base
-dirt.
+leaf-distance tick artifacts excluded).
+
+### Fancy trunk attachment height
+
+`FancyTrunkPlacer` starts its attachment list at `start + (j - 5)`, not at
+`start + k`: `k` is the upper end height used for branches. The port used
+`start + k`, which shifted every fancy canopy up by
+`k - (height - 3)` and moved its leaves out of the reference rows. With the
+list seeded at `j - 5`, the 3x3 diff drops **728 -> 319** (`carver` 55,
+`deep` 264; 223 tick artifacts excluded) and the target chunk stays **0**.
+The remaining differences are neighbour terrain and a small canopy/leaf cell
+set outside the instrumented tree-origin radius; they are not tree-base dirt
+or fancy attachment height.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path
@@ -159,6 +169,7 @@ this run; the script refuses to diff if the reference is incomplete.
 - The carver-visibility fix is included and its source/logs are in this
   directory (`lapis-before.txt`, `lapis-after.txt`,
   `features-after-carver-visibility.txt`, `feature-visibility-mutation.txt`).
-  The tree one-feature run is now positive but differs (728 cells), and geode
-  placement outside the target and the 207 regional surface cells remain
-  separate follow-ups.
+  The tree one-feature run is now positive; its final 3x3 diff is 319 cells
+  (`diff-after-fancy.txt`), mostly neighbour terrain plus a small canopy/leaf
+  set outside the instrumented origin radius. Geode placement outside the
+  target and the regional surface cells remain separate follow-ups.
