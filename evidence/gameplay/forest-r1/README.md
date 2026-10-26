@@ -52,7 +52,10 @@ the full-feature residual **2,190/382 -> 1,789/114**
 (`neighbor-carve.txt`, `features-after-neighbor-carve.txt`).
 
 The target's remaining 114 cells are 60 leaf-distance, 20 lava, about 30 ore,
-1 chest, and 1 grass cell; they are the next feature layers.
+1 chest, and 1 grass cell; they are the next feature layers. The lava source
+at `(-1024,-16,512)` was fixed by correcting `SpringFeature`'s above/below
+predicate; the 20 lava cells themselves are saved-world flow, not worldgen
+(`spring-orientation.txt`).
 
 ## What the remaining cells are
 

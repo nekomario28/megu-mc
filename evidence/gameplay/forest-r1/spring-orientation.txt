@@ -1,0 +1,14 @@
+# SpringFeature above/below orientation
+
+The target's remaining 20 lava cells are a flowing lava pool whose source is
+(-1024,-16,512). The source cell itself was missing in the port; the other 20
+are lava spread written by the saved world's runtime, not worldgen.
+
+`SpringFeature` (`edp`) tests `jd.d()` = **above** and, when
+`requires_block_below`, `jd.e()` = **below**; its rock/hole counts also use the
+four horizontals plus **below**. The port had the opposite pair (below/below2,
+and above in the count). After the fix the port writes the source at
+(-1024,-16,512) exactly like the reference.
+
+No-tick target residual remains 53: 20 flowing lava (runtime), ~30 missing ore
+cells, 1 chest, 1 grass. This is the next layer.

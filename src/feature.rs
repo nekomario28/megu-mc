@@ -3195,15 +3195,14 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             hole,
             valid,
         } => {
-            // `SpringFeature` (edp): the block *below* must be valid, and with
-            // `requires_block_below` the one below that too. This used to test the
-            // block above, which is the opposite geometry (a spring hanging from a
-            // ceiling instead of emerging from a rock floor).
+            // `SpringFeature` (`edp`): `pos.above()` must be valid, and with
+            // `requires_block_below` `pos.below()` too. The names are easy to
+            // invert: `jd.d()` is above (Direction.UP) and `jd.e()` is below.
             let Some(reg) = breg() else { return };
-            if !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2))) {
+            if !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 + 1, pos.2))) {
                 return;
             }
-            if *req_below && !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 - 2, pos.2))) {
+            if *req_below && !valid.contains(reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2))) {
                 return;
             }
             let at = ctx.get(pos.0, pos.1, pos.2);
@@ -3212,8 +3211,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             let mut rocks = 0;
             let mut air = 0;
-            // vanilla scans west, east, north, south and *above*
-            for d in [4u8, 5, 2, 3, 1] {
+            // vanilla counts the four horizontals and *below* (`jd.e()`)
+            for d in [4u8, 5, 2, 3, 0] {
                 let (dx, dy, dz) = dir_off(d);
                 let s = ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz);
                 if valid.contains(reg.name_of(s)) {
