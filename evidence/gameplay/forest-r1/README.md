@@ -99,7 +99,10 @@ reordered; the one-feature fixture is now runnable.
 With only `trees_birch_and_oak` enabled in forest, the reference target chunk
 has **332 oak leaves + 111 birch leaves**; the port has **188 + 71**. The target
 diff is **728 cells** (`carver` 694, `deep` 34), with both missing and extra
-tree cells. This is now a **tree placement/RNG residual**, not a harness
+tree cells. The instrumented reference logged **41** tree origins in the target
+neighbourhood; the port logged **47**, with **26 shared**, **15 reference-only**
+and **21 port-only** (`tree-origins.txt`). This is an origin/selection residual,
+not the previous loader omission. This is now a **tree placement/RNG residual**, not a harness
 failure; it is not yet attributed to tree shape, origin, or draw order.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
