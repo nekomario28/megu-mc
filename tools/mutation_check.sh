@@ -882,6 +882,11 @@ check "surface steep keeps the four-block threshold" \
   'let s = t(lx, lz + 1) >= t(lx, lz - 1) + 3 || t(lx - 1, lz) >= t(lx + 1, lz) + 3;' \
   surface_steep_reads_the_world_surface_heightmap
 
+check "surface stone depth selects the ceiling/below fields" \
+  src/worldgen.rs 'let sd = if ceil { c.sdb } else { c.sda };' \
+  'let sd = if ceil { c.sda } else { c.sdb };' \
+  surface_conditions_match_the_pinned_context_formulas
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

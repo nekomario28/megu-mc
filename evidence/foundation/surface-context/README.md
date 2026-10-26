@@ -33,27 +33,35 @@ here.
   `surface_steep_reads_the_world_surface_heightmap`.
 
 No surface oracle was able to construct a full vanilla `SurfaceSystem` and apply
-a rule to a generated chunk in this slice. The reference for this change is the
-decompiled actual class, not a running world; no claimed cell-level surface
-parity.
+a rule to a generated chunk in this slice. The steep reference is the decompiled
+actual class, not a running world; no claimed cell-level surface parity.
+
+A separate condition oracle now evaluates actual `SurfaceRules` conditions with
+a synthetic `dzp$g` context: **4,037 rows** covering stone depth (floor/ceiling,
+offset, surface-depth and secondary range), water block/start, hole and
+above-preliminary. It does not cover y anchors, steep, temperature, biome or
+noise conditions (those need a chunk/biome/noise source). The Rust test compares
+all 4,037 rows; a mutation that swaps ceiling/below fields is detected.
 
 ## Verification
 
 | Gate | Result |
 | --- | --- |
-| Focused surface test | `surface_steep_reads_the_world_surface_heightmap` passes |
-| Full serial release | **237 passed / 0 failed / 1 ignored**, exit 0 |
-| Progression | 236/0/1 -> 237/0/1; no failed names |
-| Selected mutation | 1 proved (four-block threshold); 0 not-a-gate/parked/skipped |
+| Focused surface tests | steep heightmap and 4,037 synthetic conditions pass |
+| Native condition oracle, twice | 4,037 rows, exact |
+| Full serial release | **238 passed / 0 failed / 1 ignored**, exit 0 |
+| Progression | 237/0/1 -> 238/0/1; no failed names |
+| Selected mutations | 2 proved (four-block threshold, ceiling/below field); 0 not-a-gate/parked/skipped |
 | fmt / all-target warnings-denied clippy | Passed |
 | Layers / debt / wire | 20 modules, 47 edges, 0 named errors; 0 over limit; wire PASS |
 
 ## Limits and not run
 
-- The scan's water-height, stone-depth, ocean-floor start and deep-state
-  interactions are not independently re-derived from a running actual chunk.
-  Surface conditions other than steep are covered by the existing decode/
-  primitive gates, not by this execution change.
+- The scan's ocean-floor start, water-height and stone-depth accumulation are
+  not independently re-derived from a running actual chunk; only the condition
+  formulas on synthetic fields and steep are pinned.
+- y anchors, steep/temperature/biome/noise condition sources are outside the
+  synthetic condition oracle.
 - Whole-world surface comparison, the full `tests/verify.sh`, whole mutation
   campaign, hosted CI, push, main merge and release were not run.
 - The change is native-bytecode-derived; it is not a claim that surface

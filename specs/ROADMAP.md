@@ -4,7 +4,7 @@
 
 ## いまの判断 — 広げる前に収束する
 
-Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **237 passed / 0 failed / 1 ignored** まで戻りました。surface steepのheightmapだけを実クラス由来で修正しましたが、whole-world比較・forest残差・surface scan全体・spawn_costs適用は未確認です。緑を全体合格へ読み替えず、まずR0の残りとR1へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
+Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **238 passed / 0 failed / 1 ignored** まで戻りました。surface steepのheightmapだけを実クラス由来で修正しましたが、whole-world比較・forest残差・surface scan全体・spawn_costs適用は未確認です。緑を全体合格へ読み替えず、まずR0の残りとR1へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
 **次の最小slice:** `SurfaceSystem.buildSurface` のscan（ocean-floor開始、water height、stone depth）を実クラスの条件評価とsynthetic columnで照合する。steepのheightmap修正は[surface contextの証拠](../evidence/foundation/surface-context/README.md)、`spawners`/`spawn_costs`の読み込みと夜間hostile選択は[biome spawnerの証拠](../evidence/foundation/biome-spawners/README.md)、`carvers`のAIR listは[carverの証拠](../evidence/foundation/biome-carvers/README.md)で限定範囲を閉じた。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
 

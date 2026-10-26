@@ -16,6 +16,7 @@ python3 tests/protocol767_test.py
 python3 tests/biome_tree_test.py
 python3 tests/container_oracle_test.py
 python3 tests/surface_oracle_test.py
+python3 tests/surface_condition_oracle_test.py
 python3 tests/packet_angles_oracle_test.py
 python3 tests/primitives_oracle_test.py
 python3 tests/aquifer_oracle_test.py
