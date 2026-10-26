@@ -1,0 +1,16 @@
+# Local CI replacement for the blocked GitHub runner
+
+Command:
+  systemd-run --user --wait --pipe --unit=mc-tree-local-ci \
+    -p MemoryMax=4G -p CPUQuota=200% -p RuntimeMaxSec=3600 \
+    --working-directory=<repo> bash tests/verify.sh
+
+Result:
+  verify: PASS
+  mutation check: 132 proved, 0 not a gate, 0 parked, 0 skipped
+  no src/*.mutation-backup
+
+Wall 18m 3s, CPU 18m 48s, peak RSS 1.4G. This runs the gate-contract
+oracles, layer/debt checks, serial and 8-thread suites, wire smoke tests,
+adapter feature checks, and the full mutation campaign. GitHub Actions for
+the Dependabot PRs remains blocked by the account billing/spending limit.
