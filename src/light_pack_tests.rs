@@ -100,6 +100,7 @@ fn light_sections_start_one_below_the_world() {
 /// must take it from the chunk's recorded generated sources.
 #[test]
 fn block_light_uses_generated_sources() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let mut gen = GenSources::new();
     gen.insert((0, 0), vec![((5, 70, 7), 15)]);
@@ -122,6 +123,7 @@ fn block_light_uses_generated_sources() {
 /// may not assume every source is inside the chunk being lit.
 #[test]
 fn block_light_sees_a_neighbours_generated_source() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let mut gen = GenSources::new();
     gen.insert((1, 0), vec![((20, 70, 7), 15)]); // next chunk, five blocks past the border
@@ -171,6 +173,7 @@ fn a_source_marks_an_already_generated_neighbour_for_a_light_update() {
 /// omitting it is what keeps the update small without dimming the world.
 #[test]
 fn update_light_packet_sends_block_light_only() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let mut gen = GenSources::new();
     gen.insert((0, 0), vec![((5, 70, 7), 15)]);
@@ -215,6 +218,7 @@ fn update_light_packet_sends_block_light_only() {
 /// source is skipped when the overlay now holds that cell, so the live overlay decides emission.
 #[test]
 fn a_removed_generated_emitter_stops_lighting() {
+    crate::test_support::require_vanilla_data();
     let _g = world_guard();
     let old_world = world().lock().unwrap().clone();
     let mut gen = GenSources::new();

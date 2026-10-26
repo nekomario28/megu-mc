@@ -22,6 +22,7 @@ fn follow(trace: &mut Vec<u8>, r: &mut Xor) {
 
 #[test]
 fn kelp_feature_grows_up_from_the_ocean_floor_and_places_one_head() {
+    crate::test_support::require_vanilla_data();
     let reg = breg().unwrap();
     let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
     let mut ctx = context(&mut g);
@@ -76,6 +77,7 @@ fn kelp_feature_grows_up_from_the_ocean_floor_and_places_one_head() {
 
 #[test]
 fn kelp_stops_at_the_water_surface_and_replaces_the_last_plant_with_a_head() {
+    crate::test_support::require_vanilla_data();
     let reg = breg().unwrap();
     let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
     let mut ctx = context(&mut g);
@@ -102,6 +104,7 @@ fn kelp_stops_at_the_water_surface_and_replaces_the_last_plant_with_a_head() {
 
 #[test]
 fn kelp_places_its_head_when_the_column_is_one_water_cell_deep() {
+    crate::test_support::require_vanilla_data();
     // `KelpFeature.place` moves the position up on *every* iteration - `pos.move(UP)`
     // sits outside its if/else - so a base cell that is water with air above it
     // rejects at i=0, then rejects again at i=1 as the head branch, and the head
@@ -139,6 +142,7 @@ fn kelp_places_its_head_when_the_column_is_one_water_cell_deep() {
 
 #[test]
 fn provider_values_and_following_rng_match_pre_extraction() {
+    crate::test_support::require_vanilla_data();
     let mut trace = Vec::new();
     let ints = [
         "3",
@@ -402,6 +406,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
 
 #[test]
 fn context_overrides_heights_bounds_and_biomes_keep_existing_results() {
+    crate::test_support::require_vanilla_data();
     let mut g = Gen::load(0, crate::name_to_state).unwrap();
     let reg = breg().unwrap();
     let stone = reg.state_of("stone", None);
@@ -447,6 +452,7 @@ fn context_overrides_heights_bounds_and_biomes_keep_existing_results() {
 /// marker in the file but is looked up without it.
 #[test]
 fn carver_configs_parse_the_1_21_1_field_shapes() {
+    crate::test_support::require_vanilla_data();
     use crate::generation_math::Lcg;
 
     let reg = super::creg();

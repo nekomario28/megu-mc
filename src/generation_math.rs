@@ -755,6 +755,38 @@ fn norm_factor(target: f64, octaves: &[(i32, f64, f64)]) -> f64 {
     }
 }
 
+// modern (non-legacy) NormalNoise from the 1.21.1 definition (`firstOctave`, `amplitudes`):
+// value = (first + second) * valueFactor, valueFactor = (1/6) / (0.1 * (1 + 1/(span + 1))),
+// span = last non-zero amplitude index - first non-zero amplitude index.
+pub(crate) fn normal_from_amplitudes(r: &mut Xor, first_octave: i32, amps: &[f64]) -> Normal {
+    let octaves = build_octaves(first_octave, 1.0, amps.len(), amps);
+    let idx: Vec<usize> = (0..amps.len()).filter(|&i| amps[i] != 0.0).collect();
+    let nf = match (idx.first(), idx.last()) {
+        (Some(&lo), Some(&hi)) => {
+            let span = (hi - lo) as f64;
+            (1.0 / 6.0) / (0.1 * (1.0 + 1.0 / (span + 1.0)))
+        }
+        _ => 0.0,
+    };
+    let first = r.splitter();
+    let second = r.splitter();
+    let mut layers = Vec::with_capacity(octaves.len() * 2);
+    for (idx, f, a) in octaves {
+        let vf = nf * a;
+        layers.push(Octave {
+            n: Perlin::new(&mut first.of_str(&format!("octave_{}", idx))),
+            f,
+            a: vf,
+        });
+        layers.push(Octave {
+            n: Perlin::new(&mut second.of_str(&format!("octave_{}", idx))),
+            f: f * INPUT_FACTOR,
+            a: vf,
+        });
+    }
+    Normal { layers }
+}
+
 // modern (non-legacy) NormalNoise: JSON carries precomputed base_amplitude
 pub(crate) fn normal_new(
     r: &mut Xor,

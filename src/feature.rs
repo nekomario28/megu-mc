@@ -493,7 +493,7 @@ fn load_freg() -> FReg {
         order: vec![],
         steps: 0,
     };
-    for (name, b) in Gen::dp_files("feature") {
+    for (name, b) in Gen::dp_files("configured_feature") {
         if let Some(j) = jparse(&b) {
             if let Some(cf) = p_cf(&j) {
                 reg.cfg.insert(name, cf);
@@ -2430,7 +2430,11 @@ fn load_creg() -> CarverReg {
     }
     for (name, b) in Gen::dp_files("biome") {
         if let Some(j) = jparse(&b) {
-            if let Some(list) = jarr(&j, "carvers") {
+            // 1.21.1 writes `"carvers": {"air": [..]}` (a step -> list map); only the air
+            // step is used by the overworld. A bare list is the shorter form of the same.
+            let list =
+                jarr(&j, "carvers").or_else(|| js(&j, "carvers").and_then(|c| jarr(c, "air")));
+            if let Some(list) = list {
                 reg.biome
                     .insert(name, list.iter().map(|v| ns_name(v.str())).collect());
             }
