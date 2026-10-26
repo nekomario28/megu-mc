@@ -6231,8 +6231,14 @@ mod wg_tests {
         // reference cave air; the isolated lapis fixture moved 28/23 -> 23/23.
         // The capture moves with the corrected stage order; the remaining forest
         // residual is still features/structures, not terrain or carvers.
+        // 2026-10-26: `TreeFeature` now rejects a clipped tree without a
+        // `min_clipped_height`, as the pinned class does. The one-feature forest
+        // fixture moved from 47 port origins (26 shared) to 41/41 all shared, and
+        // its feature draw stream matches the reference after the port's lazy
+        // aquifer samples. The capture moves with that native stage order; the
+        // target chunk's remaining 5 cells are tree-base grass/dirt.
         assert_eq!(
-            digest, "3c6c22e4d34e20c0a053ec664bbb4f5e",
+            digest, "97d922aa9a01d13375ef8a30eef95f64",
             "feature population output changed from the post-carver-visibility capture"
         );
     }

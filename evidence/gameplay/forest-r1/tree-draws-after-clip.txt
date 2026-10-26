@@ -1,0 +1,78 @@
+# tree draw trace after the clip fix (first 30)
+
+Reference (`RDRAW`) and port (`DRAW`) both start at feature 0,9. The port
+aquifer lazily samples its 16x12x16 grid while the tree reads blocks, so its
+nextInt(10)/nextInt(9)/nextInt(10) triples are not feature draws. The tree
+selector starts at port draw 12; from there the feature sequence matches.
+
+R 000 nextInt(10)=4
+R 001 nextInt(16)=10
+R 002 nextInt(16)=14
+R 003 nextFloat=0.86823493
+R 004 nextFloat=0.617628
+R 005 nextInt(3)=1
+R 006 nextInt(1)=0
+R 007 nextInt(16)=9
+R 008 nextInt(16)=5
+R 009 nextFloat=0.17197877
+R 010 nextInt(3)=2
+R 011 nextInt(1)=0
+R 012 nextInt(2)=0
+R 013 nextInt(2)=0
+R 014 nextInt(2)=1
+R 015 nextInt(2)=1
+R 016 nextInt(2)=0
+R 017 nextInt(2)=1
+R 018 nextInt(2)=0
+R 019 nextInt(2)=1
+R 020 nextInt(2)=0
+R 021 nextInt(2)=0
+R 022 nextInt(2)=0
+R 023 nextInt(2)=0
+R 024 nextInt(2)=0
+R 025 nextInt(2)=1
+R 026 nextInt(2)=1
+R 027 nextInt(2)=1
+R 028 nextFloat=0.039266944
+R 029 nextInt(16)=12
+
+P 000 nextInt(10)=4
+P 001 nextInt(16)=10
+P 002 nextInt(16)=14
+P 003 nextInt(10)=4
+P 004 nextInt(9)=4
+P 005 nextInt(10)=5
+P 006 nextInt(10)=3
+P 007 nextInt(9)=2
+P 008 nextInt(10)=5
+P 009 nextInt(10)=2
+P 010 nextInt(9)=0
+P 011 nextInt(10)=9
+P 012 nextFloat=0.8682349324226379
+P 013 nextFloat=0.6176279783248901
+P 014 nextInt(3)=1
+P 015 nextInt(1)=0
+P 016 nextInt(16)=9
+P 017 nextInt(16)=5
+P 018 nextFloat=0.17197877168655396
+P 019 nextInt(3)=2
+P 020 nextInt(1)=0
+P 021 nextInt(10)=1
+P 022 nextInt(9)=2
+P 023 nextInt(10)=9
+P 024 nextInt(10)=1
+P 025 nextInt(9)=4
+P 026 nextInt(10)=3
+P 027 nextInt(10)=9
+P 028 nextInt(9)=6
+P 029 nextInt(10)=8
+P 030 nextInt(2)=0
+P 031 nextInt(2)=0
+P 032 nextInt(2)=1
+P 033 nextInt(2)=1
+P 034 nextInt(2)=0
+P 035 nextInt(2)=1
+P 036 nextInt(2)=0
+P 037 nextInt(2)=1
+P 038 nextInt(2)=0
+P 039 nextInt(2)=0

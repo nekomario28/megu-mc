@@ -1,0 +1,45 @@
+# tree origins after the clip fix
+
+reference=41 port=41 shared=41 ref_only=0 port_only=0
+
+both -1040 69 527
+both -1040 69 534
+both -1037 69 532
+both -1036 65 521
+both -1036 68 526
+both -1035 69 529
+both -1035 69 535
+both -1035 69 539
+both -1031 69 536
+both -1030 67 522
+both -1028 67 542
+both -1025 65 539
+both -1024 69 528
+both -1022 63 539
+both -1022 69 519
+both -1021 68 531
+both -1018 64 535
+both -1016 63 533
+both -1016 68 527
+both -1016 70 524
+both -1015 68 517
+both -1014 67 526
+both -1013 62 539
+both -1012 57 503
+both -1012 63 531
+both -1012 69 520
+both -1011 59 500
+both -1008 62 537
+both -1008 65 518
+both -1007 66 521
+both -1006 64 518
+both -1005 63 529
+both -1004 58 512
+both -1003 63 532
+both -1002 62 517
+both -999 63 533
+both -997 63 542
+both -996 63 523
+both -995 60 511
+both -995 63 532
+both -994 58 501

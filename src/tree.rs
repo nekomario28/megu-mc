@@ -1915,6 +1915,10 @@ pub(crate) struct TreeExtra {
     pub trunk_placer: TrunkPl,
 }
 
+fn clip_allows_top(top: i32, height: i32, min_clipped: Option<i32>) -> bool {
+    top >= height || min_clipped.is_some_and(|min| top >= min)
+}
+
 pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> bool {
     let height = t.trunk_placer.height(rng);
     // Vanilla TreeFeature.place draws the foliage height and radius immediately after the
@@ -1954,12 +1958,13 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         }
         top
     };
-    if top < height {
-        if let Some(mch) = t.min_clipped {
-            if top < mch {
-                return false;
-            }
-        }
+    // `TreeFeature.place` accepts a clipped tree only when the config carries a
+    // `min_clipped_height` that the clipped top still reaches; without one, any
+    // obstruction in the min-size scan rejects the tree. This used to proceed
+    // when `min_clipped` was absent, which consumed the first tree's foliage
+    // draws instead of moving to the next count position.
+    if !clip_allows_top(top, height, t.min_clipped) {
+        return false;
     }
     let root_positions = match &t.root_placer {
         Some(rp) => match rp.generate(ctx, rng, pos, trunk_start) {
@@ -2377,6 +2382,24 @@ mod tests {
 
     fn state(name: &str) -> u32 {
         crate::name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"))
+    }
+
+    #[test]
+    fn a_clipped_tree_needs_a_min_clipped_height_that_the_clip_reaches() {
+        assert!(clip_allows_top(7, 7, None), "an unclipped tree is accepted");
+        assert!(clip_allows_top(8, 7, None), "a taller clip is accepted");
+        assert!(
+            !clip_allows_top(6, 7, None),
+            "an unclipped config must reject a clipped tree"
+        );
+        assert!(
+            clip_allows_top(6, 7, Some(6)),
+            "a min_clipped_height at the clip is accepted"
+        );
+        assert!(
+            !clip_allows_top(5, 7, Some(6)),
+            "a min_clipped_height above the clip is rejected"
+        );
     }
 
     /// The three placers used to spell the same test out separately with a

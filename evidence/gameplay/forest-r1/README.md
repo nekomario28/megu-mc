@@ -93,7 +93,7 @@ The one-feature tree overlay initially placed no features because `load_freg`
 built its `by_step` order only from graph edges: a feature that was the sole
 entry in a step had no edge and was dropped before placement. The loader now
 starts DFS from every `(step, firstIndex)` node, including dependency-free
-nodes. Full-suite output is unchanged (240/0/1), so the ordinary pack is not
+nodes. Full-suite output is now 241/0/1, so the ordinary pack is not
 reordered; the one-feature fixture is now runnable.
 
 With only `trees_birch_and_oak` enabled in forest, the reference target chunk
@@ -107,11 +107,33 @@ failure.
 
 The reference agent was armed on feature `0,9` and its first typed draws match the
 port through the in-square positions and the two random-selector chances. The
-first integer divergence is draw **7**: the reference asks `nextInt(16)=9`, the
-port asks `nextInt(2)=1` (`tree-draws.txt`). The float lines differ only in
-printing precision; the first integer divergence is the tree selection/height
-call, not the initial placement draws. It is not yet attributed to tree shape or
-height selection.
+first integer divergence was draw **7**: the reference asked `nextInt(16)=9`,
+the port asked `nextInt(2)=1` (`tree-draws.txt`). That draw is the next count
+position's `in_square`, not a tree-shape call: the reference rejected the first
+tree after its trunk height, while the port entered foliage.
+
+### Clip rejection: why the first tree stopped
+
+`TreeFeature.place` accepts a clipped tree only when the min-size scan reaches
+the requested height, or when the config supplies a `min_clipped_height` that
+the clipped top still reaches. `tree.rs` only rejected an absent
+`min_clipped_height` when it was `Some`; with `None` it continued after a clip.
+The first target tree (`-1014,67,526`) is exactly that case. The reference
+rejected it before any foliage draw, so the next count position followed
+immediately; the port consumed the first tree's foliage and desynchronised the
+rest of the stream.
+
+The condition is now the vanilla disjunction (`top >= height || min_clipped is
+present and top >= it`). A unit test pins all four branches. With the fix, the
+one-feature run has **41 reference / 41 port origins, all 41 shared**, and the
+feature draw sequence after the port's lazy aquifer samples matches the
+reference (`tree-draws-after-clip.txt`, `tree-origins-after-clip.txt`).
+
+The target chunk is now **5 cells** from the 3x3 diff (all tree-base
+grass/dirt), down from the earlier origin mismatch. The full 3x3 diff is 771
+cells (`carver` 360, `deep` 411; 223 leaf-distance tick artifacts excluded);
+the remaining tree cells are canopy shape/leaf distance in neighbouring
+chunks, not tree origins.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path

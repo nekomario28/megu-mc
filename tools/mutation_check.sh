@@ -190,6 +190,11 @@ verify_restored() {
   fi
 }
 
+check "an unclipped tree rejects a clipped top" \
+  src/tree.rs 'top >= height || min_clipped.is_some_and(|min| top >= min)' \
+  'true' \
+  tree::tests::a_clipped_tree_needs_a_min_clipped_height_that_the_clip_reaches
+
 check "lazy feature lookup applies its population input and retains cached overrides" \
   src/worldgen.rs '            for sx in x0..=x1 {
                 for sz in z0..=z1 {
