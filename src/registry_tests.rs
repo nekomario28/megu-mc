@@ -15,6 +15,7 @@ use crate::block_registry::breg;
 /// block an item places must be the block named after that item.
 #[test]
 fn an_item_places_the_block_it_is_named_after() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -52,6 +53,7 @@ fn an_item_places_the_block_it_is_named_after() {
 /// the drop must be inside the item id space the rest of the server uses.
 #[test]
 fn every_block_that_drops_something_is_a_block_the_registry_knows() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -84,6 +86,7 @@ fn every_block_that_drops_something_is_a_block_the_registry_knows() {
 /// have one state per name turns a typo into a failing test.
 #[test]
 fn every_hidden_block_name_resolves_to_the_block_it_names() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -118,6 +121,7 @@ fn every_hidden_block_name_resolves_to_the_block_it_names() {
 /// rather than assumed.
 #[test]
 fn report_which_blocks_use_the_default_hardness() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -176,6 +180,7 @@ fn report_which_blocks_use_the_default_hardness() {
 /// registry, so the check compares two routes to the same source.
 #[test]
 fn mining_time_is_the_asset_value_for_every_state() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -210,6 +215,7 @@ fn mining_time_is_the_asset_value_for_every_state() {
 /// returned the 0.6 default.
 #[test]
 fn named_blocks_have_their_vanilla_mining_time() {
+    crate::test_support::require_vanilla_data();
     for (name, expect) in [
         ("stone", 1.5f32),
         ("dirt", 0.5),
@@ -236,6 +242,7 @@ fn named_blocks_have_their_vanilla_mining_time() {
 /// answers from the block's own harvestTools set, and this reads the asset to check.
 #[test]
 fn can_harvest_is_the_assets_harvest_tools_set() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -291,6 +298,7 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
 /// were the ones answered wrongly.
 #[test]
 fn named_blocks_answer_can_harvest_the_vanilla_way() {
+    crate::test_support::require_vanilla_data();
     let wood_pick = 820i64; // 818 + tier*5 + kind, kind 2 = pickaxe
     let stone_pick = 825;
     let shovel = 819;
@@ -324,6 +332,7 @@ fn named_blocks_answer_can_harvest_the_vanilla_way() {
 /// answer, for every state.
 #[test]
 fn the_correct_tool_kind_is_the_assets_material() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -403,6 +412,7 @@ fn the_correct_tool_kind_is_the_assets_material() {
 /// non-pickaxe, and a block whose tool is stated only through its tier-gated set.
 #[test]
 fn named_blocks_name_their_tool() {
+    crate::test_support::require_vanilla_data();
     for (name, kind) in [
         ("dirt", 1i8),
         ("sand", 1),
@@ -429,6 +439,7 @@ fn named_blocks_name_their_tool() {
 /// hands, and a tool of the wrong type must not be.
 #[test]
 fn the_right_tool_is_faster_than_bare_hands() {
+    crate::test_support::require_vanilla_data();
     let hands = (0i64, 0u8, Vec::new());
     let iron_shovel = (818 + 3 * 5 + 1, 1u8, Vec::new());
     let iron_pick = (818 + 3 * 5 + 2, 1u8, Vec::new());
@@ -465,6 +476,7 @@ fn the_right_tool_is_faster_than_bare_hands() {
 /// reads the asset and requires the same answer for every state.
 #[test]
 fn the_drop_is_the_assets_drop_for_every_state() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -511,6 +523,7 @@ fn the_drop_is_the_assets_drop_for_every_state() {
 /// itself, and a block that drops nothing.
 #[test]
 fn named_blocks_drop_what_vanilla_drops() {
+    crate::test_support::require_vanilla_data();
     let item = |n: &str| name_to_item(n).unwrap_or_else(|| panic!("{n} must be an item"));
     for (name, expect) in [
         ("stone", Some(35i64)), // cobblestone
@@ -543,6 +556,7 @@ fn named_blocks_drop_what_vanilla_drops() {
 /// a re-derivation, and a partial one. This checks every state against the asset.
 #[test]
 fn stack_size_comes_from_the_asset_for_every_state() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -576,6 +590,7 @@ fn stack_size_comes_from_the_asset_for_every_state() {
 /// and both were previously answered from ranges over item ids.
 #[test]
 fn named_items_stack_the_way_vanilla_stacks_them() {
+    crate::test_support::require_vanilla_data();
     for (name, want) in [
         ("stone", 64i64),
         ("oak_log", 64),
@@ -603,6 +618,7 @@ fn named_items_stack_the_way_vanilla_stacks_them() {
 /// Every value of a 16-valued property is walked in both directions here.
 #[test]
 fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -674,6 +690,7 @@ fn setting_a_property_lower_than_its_current_value_stays_inside_the_block() {
 /// registry hands back what the file says for every state.
 #[test]
 fn light_values_come_from_the_asset_for_every_state() {
+    crate::test_support::require_vanilla_data();
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
@@ -771,6 +788,7 @@ fn light_values_come_from_the_asset_for_every_state() {
 /// loaded numbers must move with the property, which a per-block table cannot do.
 #[test]
 fn light_follows_the_state_property_not_just_the_block() {
+    crate::test_support::require_vanilla_data();
     let reg = breg().unwrap();
     let st = |name: &str, props: &[(&str, &str)]| {
         let mut s = name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"));
@@ -841,6 +859,7 @@ fn light_follows_the_state_property_not_just_the_block() {
 /// Named light sources, and the two that must not emit.
 #[test]
 fn named_blocks_emit_the_light_vanilla_emits() {
+    crate::test_support::require_vanilla_data();
     for (name, lum) in [
         ("torch", 14i64),
         ("lantern", 15),
@@ -908,6 +927,7 @@ fn sky_light_is_lit_above_the_floor_and_dark_at_and_below_it() {
 /// surface the player reads lit, and the ground under it dark.
 #[test]
 fn sky_light_reads_lit_at_the_surface_and_dark_under_it() {
+    crate::test_support::require_vanilla_data();
     // No region or forceload setup: sky light reads the world through block_at and
     // height_at, so it does not depend on the region. Touching the region here without
     // restoring it polluted the fixture for every test that ran after this one.
@@ -1077,6 +1097,7 @@ fn sky_light_reaches_sideways_through_an_opening() {
 /// stays in the air and nothing fails.
 #[test]
 fn the_falling_set_is_the_asset_set() {
+    crate::test_support::require_vanilla_data();
     let reg = breg().unwrap();
     let mut falling: Vec<String> = (0..reg.state_count() as u32)
         .filter(|&st| reg.behaviour_of(st) == crate::block_registry::B_FALLING)
@@ -1130,6 +1151,7 @@ fn the_falling_set_is_the_asset_set() {
 /// item per broken pot, and nothing said so, because a single drop is the normal case.
 #[test]
 fn a_potted_plant_drops_both_entries_the_asset_lists() {
+    crate::test_support::require_vanilla_data();
     let reg = breg().unwrap();
     let two: Vec<&str> = [
         "potted_oak_sapling",
@@ -1153,6 +1175,7 @@ fn a_potted_plant_drops_both_entries_the_asset_lists() {
 /// Names alone are insufficient: every target state needs complete metadata.
 #[test]
 fn every_wire_state_has_complete_metadata() {
+    crate::test_support::require_vanilla_data();
     let reg = breg().unwrap();
     assert!(
         reg.unpaired.is_empty(),
@@ -1163,6 +1186,7 @@ fn every_wire_state_has_complete_metadata() {
 
 #[test]
 fn note_block_keeps_solid_and_light_values_for_every_instrument() {
+    crate::test_support::require_vanilla_data();
     let reg = breg().unwrap();
     let raw = std::fs::read("assets/blocks_1211.json").unwrap();
     let md = crate::json::jparse(&raw).unwrap();

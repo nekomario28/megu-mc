@@ -10,9 +10,8 @@
 //! Indexing the queue by delay makes the per-tick cost proportional to the cells
 //! that come due, and the dedup map means a cell can be waiting only once.
 //!
-//! The shape follows the design of Pumpkin's chunk tick scheduler. Pumpkin is
-//! GPL-3.0, so only the design is referenced (see issue #3); this is an
-//! independent implementation.
+//! The shape follows the design of Pumpkin's chunk tick scheduler (a design
+//! reference only, see issue #3 and THIRD_PARTY.md); the code is this repository's own.
 
 use std::collections::HashMap;
 
@@ -23,7 +22,7 @@ pub(crate) const MAX_DELAY: usize = super::MAX_DELAY_TICKS;
 /// A cell that wants to be visited again later.
 ///
 /// `schedule` deduplicates: a cell already waiting keeps its earlier deadline, so
-/// repeated neighbour updates cannot push it further out. `reschedule` is for the
+/// repeated neighbour updates cannot push it further out. `requeue` is for the
 /// deliberate case where a cell that just ran wants to back off, and moves it.
 pub(crate) struct TickQueue {
     buckets: Vec<Vec<(i32, i32, i32)>>,
@@ -74,7 +73,7 @@ impl TickQueue {
 
     /// Move `pos` to a new deadline, inserting it if it is not waiting. A cell
     /// that just did work and wants to back off uses this instead of `schedule`.
-    pub(crate) fn reschedule(&mut self, pos: (i32, i32, i32), delay: usize) {
+    pub(crate) fn requeue(&mut self, pos: (i32, i32, i32), delay: usize) {
         if let Some(previous) = self.waiting.remove(&pos) {
             if let Some(i) = self.buckets[previous].iter().position(|&p| p == pos) {
                 self.buckets[previous].swap_remove(i);
@@ -94,7 +93,7 @@ impl TickQueue {
         if !self.waiting.contains_key(&pos) {
             return false;
         }
-        self.reschedule(pos, 1);
+        self.requeue(pos, 1);
         true
     }
 
@@ -164,7 +163,7 @@ mod tests {
     fn rescheduling_moves_the_deadline() {
         let mut q = TickQueue::new();
         q.schedule((0, 0, 0), 2);
-        q.reschedule((0, 0, 0), 5);
+        q.requeue((0, 0, 0), 5);
         let ticks = run(6, &mut q);
         assert!(ticks[1].is_empty(), "the old deadline must not fire");
         assert_eq!(ticks[4], vec![(0, 0, 0)]);

@@ -7,7 +7,6 @@
   "source_sha256": {
     "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
     "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
-    "config_packets.bin": "9fb932886e1da038d42f20ec385ec04517c1c0286d71b9d9eea91e8f5decb49a",
     "src/cached_lookup.rs": "a97db58064eed4f959dc28e55d8988795b5df50d6d56a8d2fc801f69ead3d57c",
     "src/effect_tests.rs": "f011c7367431f2c8e2af8c6d30a52ad3d5733951e9b30b358558d6dda66e7d1f",
     "src/effects.rs": "8a0517ca58b12cf6d254eca5b377add82e693f1b9e34753658dd57ead450a37b",
@@ -122,5 +121,6 @@
     "representative release performance",
     "all H/T/F/N/Q complete"
   ],
-  "target_hosted_ci": "pending"
+  "target_hosted_ci": "pending",
+  "generated_inputs_note": "Generated locally from the user's own 1.21.1 jar and not committed: config_packets.bin by tools/vanilla_data/gen_vanilla_data.sh --accept-eula; javap output by tools/bytecode_probe.sh. Their former sha256 pins were removed with the files."
 }

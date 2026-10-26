@@ -388,14 +388,14 @@ check "broken sign text cannot survive its block" \
   '        signs().lock().unwrap().retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 check "solid metadata must reach every note block state" \
-  src/block_registry.rs '                        reg.st_fl[st] = flags;' \
-  '                        reg.st_fl[st] = 0;' \
+  src/block_registry.rs '                    reg.st_fl[st] = f_fl[st] as u16;' \
+  '                    reg.st_fl[st] = 0;' \
   note_block_keeps_solid_and_light_values_for_every_instrument
 
 check "property remapping cannot reuse positional state offsets" \
-  src/block_registry.rs '        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;' \
-  '        out = offset;' \
-  property_names_and_values_determine_metadata_position
+  src/block_registry.rs '                let o = off as i64 + (nd as i64 - digit as i64) * mult as i64;' \
+  '                let o = off as i64 + nd as i64 * mult as i64;' \
+  setting_a_property_lower_than_its_current_value_stays_inside_the_block
 
 check "a predicate reads solidity, not replaceability" \
   src/generation_providers.rs '        Pr::Solid => reg.is_solid(ctx.get(x, y, z)),' \
@@ -413,8 +413,8 @@ check "placement modifiers advance positions in vanilla's draw order" \
             let x = pos.0 + rng.next_bound(16);' \
   feature_population_output_matches_the_pre_refactor_capture
 check "the ore vein radius matches vanilla's own output" \
-  src/feature.rs '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \
-  '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0 + 0.01;' \
+  src/feature.rs '            radius: (f64::from(swell) * jitter + 1.0) / 2.0,' \
+  '            radius: (f64::from(swell) * jitter + 1.0) / 2.0 + 0.01,' \
   the_ore_vein_geometry_matches_vanillas_own_output
 
 check "the frozen population digest notices shared provider changes" \

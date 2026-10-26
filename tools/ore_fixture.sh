@@ -9,8 +9,8 @@
 # files. Then only that one feature can place, and the two cell sets compare
 # directly (the carver work's `CARVE_ONLY` in fixture form).
 #
-# The repository's `datapacks/vanilla` is restored on exit (`trap ... EXIT`), with a
-# `git checkout` fallback: an uncommitted edit under that tree is otherwise lost.
+# Needs the generated `datapacks/vanilla` (tools/vanilla_data/gen_vanilla_data.sh). The control
+# pack for this port is written to `datapacks/ctlfix` and removed on exit (`trap ... EXIT`).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="$1"; KEEP="$2"; N="${3:-2}"
@@ -38,9 +38,6 @@ zero_all_but_keep() {  # $1 = target dir
 restore_repo() {
   rm -rf "$CTL"
   rmdir -p "$CTL_REL" 2>/dev/null || true
-  if ! git -C "$ROOT" diff --quiet -- datapacks/vanilla 2>/dev/null; then
-    ( cd "$ROOT" && git checkout -- datapacks/ ) 2>/dev/null || true
-  fi
 }
 trap restore_repo EXIT
 
@@ -70,7 +67,7 @@ MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$DIR/dump.bin" MC_SPINE_WG_DUMP_N="$N" \
   MC_SPINE_WG_DUMP_X="$X0" MC_SPINE_WG_DUMP_Z="$Z0" \
   ./target/release/mc-spine >/dev/null 2>&1
 # the placed feature's *block* (ore_gravel places gravel), read from its config
-BLOCK="$(python3 - "$REPO_PF/../feature/$KEEP.json" <<'PY2'
+BLOCK="$(python3 - "$REPO_PF/../configured_feature/$KEEP.json" <<'PY2'
 import json, sys
 d = json.load(open(sys.argv[1]))
 c = d.get("config", d)

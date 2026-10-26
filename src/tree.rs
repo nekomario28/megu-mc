@@ -2,12 +2,8 @@
 // feature-size clipping, decorators, mangrove root placer, and leaf-distance
 // propagation.
 //
-// Pumpkin's `feature/features/tree` was read for the *semantics*; this is not a
-// port of its code. Measured 2026-10-21 over all 38 of its files: the longest
-// contiguous shared token run is 58 (a four-corner loop header vanilla dictates),
-// 6-token Jaccard is at most 0.0205, and no comment line is shared — the same
-// band as an independently written control (`tools/provenance_scan.py`,
-// `evidence/foundation/provenance/`).
+// Type and feature names follow the vanilla `tree` configured-feature names in the
+// datapack (`trunk_placer`, `foliage_placer`, `minimum_size`, `decorators`, ...).
 
 use crate::block_registry::BReg;
 use crate::generation_math::Xor;
@@ -300,106 +296,115 @@ impl TrunkPl {
             }
             TP::Forking => {
                 set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
-                let lean_dir = rand_horizontal(rng);
-                let lean_h = height - rng.next_bound(4) - 1;
-                let mut lean_steps = 3 - rng.next_bound(3);
-                let (mut tx, mut tz) = (start.0, start.2);
-                let mut last_y = None;
-                for yo in 0..height {
-                    let yy = start.1 + yo;
-                    if yo >= lean_h && lean_steps > 0 {
-                        let (ox, oz) = hoff(lean_dir);
-                        tx += ox;
-                        tz += oz;
-                        lean_steps -= 1;
+                // A log at (column, row above the start), reporting whether it was placed.
+                let mut lay = |col: (i32, i32), row: i32| {
+                    place_log(ctx, &mut logs, (col.0, start.1 + row, col.1), trunk_st)
+                };
+                let main_lean = rand_horizontal(rng);
+                let bend_row = height - rng.next_bound(4) - 1;
+                let mut bend_left = 3 - rng.next_bound(3);
+                let mut column = (start.0, start.2);
+                let mut crown = None;
+                for row in 0..height {
+                    if row >= bend_row && bend_left > 0 {
+                        let step = hoff(main_lean);
+                        column = (column.0 + step.0, column.1 + step.1);
+                        bend_left -= 1;
                     }
-                    if place_log(ctx, &mut logs, (tx, yy, tz), trunk_st) {
-                        last_y = Some(yy + 1);
+                    if lay(column, row) {
+                        crown = Some(row + 1);
                     }
                 }
-                if let Some(ey) = last_y {
-                    nodes.push(TreeNode::new((tx, ey, tz), 1, false));
+                if let Some(top) = crown {
+                    nodes.push(TreeNode::new((column.0, start.1 + top, column.1), 1, false));
                 }
-                let (mut bx, mut bz) = (start.0, start.2);
-                let branch_dir = rand_horizontal(rng);
-                if branch_dir != lean_dir {
-                    let branch_pos = lean_h - rng.next_bound(2) - 1;
-                    let mut branch_steps = 1 + rng.next_bound(3);
-                    let mut branch_last_y = None;
-                    let mut yo = branch_pos;
-                    while yo < height && branch_steps > 0 {
-                        if yo >= 1 {
-                            let yy = start.1 + yo;
-                            let (ox, oz) = hoff(branch_dir);
-                            bx += ox;
-                            bz += oz;
-                            if place_log(ctx, &mut logs, (bx, yy, bz), trunk_st) {
-                                branch_last_y = Some(yy + 1);
-                            }
+                let side_lean = rand_horizontal(rng);
+                if side_lean != main_lean {
+                    let first_row = bend_row - rng.next_bound(2) - 1;
+                    let run_len = 1 + rng.next_bound(3);
+                    // the draws above fix the run; rows below the ground row are skipped
+                    // but still count against its length
+                    let rows = first_row.max(1)..height.min(first_row + run_len);
+                    let mut column = (start.0, start.2);
+                    let mut crown = None;
+                    for row in rows {
+                        let step = hoff(side_lean);
+                        column = (column.0 + step.0, column.1 + step.1);
+                        if lay(column, row) {
+                            crown = Some(row + 1);
                         }
-                        yo += 1;
-                        branch_steps -= 1;
                     }
-                    if let Some(ey) = branch_last_y {
-                        nodes.push(TreeNode::new((bx, ey, bz), 0, false));
+                    if let Some(top) = crown {
+                        nodes.push(TreeNode::new((column.0, start.1 + top, column.1), 0, false));
                     }
                 }
             }
             TP::Fancy => {
-                let j = height + 2;
-                let k = ((j as f64) * 0.618).floor() as i32;
+                let tall = height + 2;
+                let top_off = ((tall as f64) * 0.618).floor() as i32;
                 set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), below_trunk);
-                let per_layer = ((1.382 + (1.0 * j as f64 / 13.0).powf(2.0)).floor() as i32).min(1);
-                let m = start.1 + k;
-                let mut list: Vec<(P3, i32)> = vec![((start.0, start.1 + k, start.2), m)];
-                for n in (0..=(j - 5)).rev() {
-                    let f = fancy_branch_prob(j, n);
-                    if f < 0.0 {
+                let per_layer =
+                    ((1.382 + (1.0 * tall as f64 / 13.0).powf(2.0)).floor() as i32).min(1);
+                let ceiling = start.1 + top_off;
+                let mut limbs: Vec<(P3, i32)> =
+                    vec![((start.0, start.1 + top_off, start.2), ceiling)];
+                for layer in (0..=(tall - 5)).rev() {
+                    let reach = fancy_branch_prob(tall, layer);
+                    if reach < 0.0 {
                         continue;
                     }
                     for _ in 0..per_layer {
-                        let g = (1.0f32 * f * (rng.next_f32() + 0.328f32)) as f64;
-                        let h = (rng.next_f32() * 2.0 * std::f32::consts::PI) as f64;
-                        let p = g * h.sin() + 0.5;
-                        let q = g * h.cos() + 0.5;
-                        let bp = (
-                            start.0 + p.floor() as i32,
-                            start.1 + n - 1,
-                            start.2 + q.floor() as i32,
+                        let dist = (1.0f32 * reach * (rng.next_f32() + 0.328f32)) as f64;
+                        let angle = (rng.next_f32() * 2.0 * std::f32::consts::PI) as f64;
+                        let dx = dist * angle.sin() + 0.5;
+                        let dz = dist * angle.cos() + 0.5;
+                        let tip = (
+                            start.0 + dx.floor() as i32,
+                            start.1 + layer - 1,
+                            start.2 + dz.floor() as i32,
                         );
-                        let bp2 = (bp.0, bp.1 + 5, bp.2);
-                        let (ok, nl) = fancy_branch(ctx, bp, bp2, trunk_st, false);
+                        let tip_top = (tip.0, tip.1 + 5, tip.2);
+                        let (ok, nl) = fancy_branch(ctx, tip, tip_top, trunk_st, false);
                         logs.extend(nl);
                         if !ok {
                             continue;
                         }
-                        let r = start.0 - bp.0;
-                        let s = start.2 - bp.2;
-                        let t = bp.1 as f64 - ((r * r + s * s) as f64).sqrt() * 0.381;
-                        let u = if t > m as f64 { m } else { t as i32 };
-                        let bp3 = (start.0, u, start.2);
-                        let (ok, nl) = fancy_branch(ctx, bp3, bp, trunk_st, false);
+                        let rx = start.0 - tip.0;
+                        let rz = start.2 - tip.2;
+                        let slope_y = tip.1 as f64 - ((rx * rx + rz * rz) as f64).sqrt() * 0.381;
+                        let join_y = if slope_y > ceiling as f64 {
+                            ceiling
+                        } else {
+                            slope_y as i32
+                        };
+                        let base = (start.0, join_y, start.2);
+                        let (ok, nl) = fancy_branch(ctx, base, tip, trunk_st, false);
                         logs.extend(nl);
                         if !ok {
                             continue;
                         }
-                        list.push((bp, u));
+                        limbs.push((tip, join_y));
                     }
                 }
-                let (_, nl) =
-                    fancy_branch(ctx, start, (start.0, start.1 + k, start.2), trunk_st, true);
+                let (_, nl) = fancy_branch(
+                    ctx,
+                    start,
+                    (start.0, start.1 + top_off, start.2),
+                    trunk_st,
+                    true,
+                );
                 logs.extend(nl);
-                for (node_p, end_y) in &list {
-                    let i = *end_y;
-                    let bp = (start.0, i, start.2);
-                    if bp == *node_p || !fancy_high(j, i - start.1) {
+                for (node_p, end_y) in &limbs {
+                    let join = *end_y;
+                    let tip = (start.0, join, start.2);
+                    if tip == *node_p || !fancy_high(tall, join - start.1) {
                         continue;
                     }
-                    let (_, nl) = fancy_branch(ctx, bp, *node_p, trunk_st, true);
+                    let (_, nl) = fancy_branch(ctx, tip, *node_p, trunk_st, true);
                     logs.extend(nl);
                 }
-                for (node_p, end_y) in list {
-                    if fancy_high(j, end_y - start.1) {
+                for (node_p, end_y) in limbs {
+                    if fancy_high(tall, end_y - start.1) {
                         nodes.push(TreeNode {
                             center: node_p,
                             foliage_radius: 0,
@@ -2383,6 +2388,7 @@ mod tests {
     /// that the predicate actually reads them.
     #[test]
     fn the_replaceable_predicate_says_what_each_placer_used_to_say() {
+        crate::test_support::require_vanilla_data();
         let reg = breg().expect("the block registry must load from assets/");
         let stone = state("stone");
         let log = state("oak_log");

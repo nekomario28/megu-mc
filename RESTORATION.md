@@ -2,7 +2,7 @@
 
 保存元のmc-spineサブツリーはv2.37、元の履歴識別子は `860142fa21e5c77ca3818d9e331756fa0df72b13`。独立したGitリポジトリとして再開するため、復元ソースを最初のコミットとした。元の大きなリポジトリ全体の履歴や、稼働ワールド・旧バイナリは取り込んでいない。
 
-元の保存場所のローカル補助資産 `assets/properties.json` と `resourcepack.zip` を含む(当時の記述。`assets/properties.json` は後に削除され、状態データは `assets/block_states_1211.json` に置き換わった。THIRD_PARTY.md 参照)。ソース復元時のビルドと9個の既存テストは合格した。過去のクライアントfixture結果には対応するソースSHAがないため、現在の版の互換性証拠として使わない。
+元の保存場所のローカル補助資産 `assets/properties.json` と `resourcepack.zip` を含む(当時の記述。`assets/properties.json` は後に削除され、状態データは `assets/block_states_1211.json` に置き換わった。THIRD_PARTY.md 参照)。`resourcepack.zip`、`config_packets.bin`、`datapacks/vanilla/` はその後コミットから外され、jar から生成する形になった(THIRD_PARTY.md §9)。ソース復元時のビルドと9個の既存テストは合格した。過去のクライアントfixture結果には対応するソースSHAがないため、現在の版の互換性証拠として使わない。
 
 今回の追加は、依存値に対する単一エントリの共通キャッシュと、かまどの固定精錬・燃料判定への適用。動的datapack判定を省略しない。新規かまどと保存から復元したかまどは、どちらも空のキャッシュから始まる。
 

@@ -7,8 +7,10 @@
 // intermediary + Yarn mapping files, which the caller supplies (see gen_vanilla_data.sh). The
 // jar is never modified and nothing from Mojang is downloaded by this tool.
 //
-//   java Extract.java <out-dir> <intermediary.tiny> <yarn.tiny> <classpath-entry>...
-//   (a leading `--candidates` prints extra candidate predicates for diagnosis)
+//   java Extract.java [--candidates] [--queries FILE] <out-dir> <intermediary.tiny> <yarn.tiny> <classpath-entry>...
+//   `--candidates` prints extra candidate predicates for diagnosis.
+//   `--queries FILE` answers the queries in FILE (same line format as vanilla_vectors.tsv, without
+//   the answer) instead of the generated ones, to check some other table of points against the game.
 import java.io.*;
 import java.lang.reflect.*;
 import java.net.*;
@@ -141,7 +143,12 @@ public class Extract {
     public static void main(String[] a) throws Exception {
         int ai = 0;
         boolean candidates = false;
-        if (a[ai].equals("--candidates")) { candidates = true; ai++; }
+        Path queriesFile = null;
+        while (a[ai].startsWith("--")) {
+            if (a[ai].equals("--candidates")) { candidates = true; ai++; }
+            else if (a[ai].equals("--queries")) { queriesFile = Paths.get(a[ai + 1]); ai += 2; }
+            else throw new IllegalArgumentException(a[ai]);
+        }
         Path out = Paths.get(a[ai++]);
         readTiny(Paths.get(a[ai++]), true);
         readTiny(Paths.get(a[ai++]), false);
@@ -326,6 +333,9 @@ public class Extract {
                 w.println(v[0] + "\t" + v[1] + "\t" + v[2] + "\t" + v[3] + "\t" + v[4] + "\t" + v[5] + "\t" + b + "\t" + (atBest.size() > 1 ? 1 : 0));
             }
         }
+
+        Vectors.write(out.resolve(queriesFile == null ? "vanilla_vectors.tsv" : "queries_answered.tsv"), queriesFile,
+                entriesOf[0], mEntryGet, previous, pc, leafBox, leafBiome);
     }
 
     static void collect(Object n, Class<?> branchC, Class<?> leafC, Field fParams, Field fSub, Field fValue,
@@ -360,6 +370,257 @@ public class Extract {
             js.append("]}");
         } else {
             js.append("\"_type\":\"leaf\",\"biome\":\"").append(fValue.get(n)).append("\"}");
+        }
+    }
+}
+
+// Reference answers from the game for tests: random-number streams, the multi-noise biome
+// lookup, the overworld climate density functions and the aquifer's private helpers. Every line
+// is `kind <TAB> arguments... <TAB> | <TAB> answers...`; the inputs are drawn here from a fixed
+// seed (or read from `--queries`), the answers come from the game's own classes.
+class Vectors {
+    static final String[] KIND = {"air", "water", "lava"};
+    static Class<?> stateC, blockC, flC, implC, aqC, posC, dfC, cnsC, settingsC, ncC;
+    static Object lookup, settings, noiseParams, blockReg, beardifier, noBlend;
+    static Method mGetId, mBlockOf, mDefState, mSample, mValue, mGetWrapper, mGetOrThrow;
+    static Object[] kindState = new Object[3];
+    static Constructor<?> posCtor, flCtor, cnsCtor, mutCtor;
+    static Field fFlY, fFlState, fAquifer;
+    static final Map<Long, Object> noiseConfigs = new HashMap<>();
+    static final Map<String, Object[]> aquifers = new HashMap<>();
+
+    static void init() throws Exception {
+        stateC = Extract.cls("net/minecraft/block/BlockState");
+        blockC = Extract.cls("net/minecraft/block/Block");
+        aqC = Extract.cls("net/minecraft/world/gen/chunk/AquiferSampler");
+        flC = Extract.cls("net/minecraft/world/gen/chunk/AquiferSampler$FluidLevel");
+        implC = Extract.cls("net/minecraft/world/gen/chunk/AquiferSampler$Impl");
+        dfC = Extract.cls("net/minecraft/world/gen/densityfunction/DensityFunction");
+        posC = Extract.cls("net/minecraft/world/gen/densityfunction/DensityFunction$NoisePos");
+        cnsC = Extract.cls("net/minecraft/world/gen/chunk/ChunkNoiseSampler");
+        settingsC = Extract.cls("net/minecraft/world/gen/chunk/ChunkGeneratorSettings");
+        ncC = Extract.cls("net/minecraft/world/gen/noise/NoiseConfig");
+        Class<?> keyC = Extract.cls("net/minecraft/registry/RegistryKey");
+        Class<?> regKeys = Extract.cls("net/minecraft/registry/RegistryKeys");
+        Class<?> wrapC = Extract.cls("net/minecraft/registry/RegistryWrapper$WrapperLookup");
+        Class<?> entryLookupC = Extract.cls("net/minecraft/registry/RegistryEntryLookup");
+        Class<?> entryC = Extract.cls("net/minecraft/registry/entry/RegistryEntry");
+
+        lookup = Extract.method(Extract.cls("net/minecraft/registry/BuiltinRegistries"), "createWrapperLookup").invoke(null);
+        mGetWrapper = Extract.method(wrapC, "getWrapperOrThrow", keyC);
+        mGetOrThrow = Extract.method(entryLookupC, "getOrThrow", keyC);
+        mValue = Extract.method(entryC, "value");
+        Object settingsLookup = mGetWrapper.invoke(lookup, Extract.field(regKeys, "CHUNK_GENERATOR_SETTINGS").get(null));
+        noiseParams = mGetWrapper.invoke(lookup, Extract.field(regKeys, "NOISE_PARAMETERS").get(null));
+        Object overworldKey = Extract.field(settingsC, "OVERWORLD").get(null);
+        settings = mValue.invoke(mGetOrThrow.invoke(settingsLookup, overworldKey));
+
+        Class<?> regC = Extract.cls("net/minecraft/registry/Registry");
+        blockReg = Extract.field(Extract.cls("net/minecraft/registry/Registries"), "BLOCK").get(null);
+        mGetId = Extract.method(regC, "getId", Object.class);
+        mBlockOf = Extract.method(Extract.cls("net/minecraft/block/AbstractBlock$AbstractBlockState"), "getBlock");
+        mDefState = Extract.method(blockC, "getDefaultState");
+        Class<?> blocksC = Extract.cls("net/minecraft/block/Blocks");
+        String[] bn = {"AIR", "WATER", "LAVA"};
+        for (int i = 0; i < 3; i++) kindState[i] = mDefState.invoke(Extract.field(blocksC, bn[i]).get(null));
+
+        Class<?> posImpl = Extract.cls("net/minecraft/world/gen/densityfunction/DensityFunction$UnblendedNoisePos");
+        posCtor = posImpl.getDeclaredConstructor(int.class, int.class, int.class);
+        posCtor.setAccessible(true);
+        flCtor = flC.getDeclaredConstructor(int.class, stateC);
+        flCtor.setAccessible(true);
+        fFlY = Extract.field(flC, "y");
+        fFlState = Extract.field(flC, "state");
+        Class<?> beardC = Extract.cls("net/minecraft/world/gen/densityfunction/DensityFunctionTypes$Beardifier");
+        beardifier = Extract.field(beardC, "INSTANCE").get(null);
+        noBlend = Extract.method(Extract.cls("net/minecraft/world/gen/chunk/Blender"), "getNoBlending").invoke(null);
+        for (Constructor<?> c : cnsC.getDeclaredConstructors()) if (c.getParameterCount() == 9) cnsCtor = c;
+        cnsCtor.setAccessible(true);
+        fAquifer = Extract.field(cnsC, "aquiferSampler");
+        Class<?> mutC = Class.forName("org.apache.commons.lang3.mutable.MutableDouble", false, Extract.loader);
+        mutCtor = mutC.getConstructor(double.class);
+        mSample = Extract.method(dfC, "sample", posC);
+    }
+
+    static Object noiseConfig(long seed) throws Exception {
+        Object nc = noiseConfigs.get(seed);
+        if (nc == null) {
+            nc = Extract.method(ncC, "create", settingsC, Extract.cls("net/minecraft/registry/RegistryEntryLookup"), long.class)
+                    .invoke(null, settings, noiseParams, seed);
+            noiseConfigs.put(seed, nc);
+        }
+        return nc;
+    }
+
+    static Object pos(int x, int y, int z) throws Exception { return posCtor.newInstance(x, y, z); }
+
+    static Object level(int y, int kind) throws Exception { return flCtor.newInstance(y, kindState[kind]); }
+
+    static int kindOf(Object state) throws Exception {
+        String id = String.valueOf(mGetId.invoke(blockReg, mBlockOf.invoke(state)));
+        for (int i = 0; i < 3; i++) if (id.equals("minecraft:" + KIND[i])) return i;
+        throw new IllegalStateException("fluid answer is neither air, water nor lava: " + id);
+    }
+
+    // the chunk's own aquifer, built the way the game builds it (inside its ChunkNoiseSampler)
+    static Object aquifer(long seed, int cx, int cz) throws Exception {
+        String key = seed + "/" + cx + "/" + cz;
+        Object[] have = aquifers.get(key);
+        if (have == null) {
+            Object nc = noiseConfig(seed);
+            Object shape = Extract.method(settingsC, "generationShapeConfig").invoke(settings);
+            int cell = (Integer) Extract.method(shape.getClass(), "horizontalCellBlockCount").invoke(shape);
+            Object fluidSampler = Extract.method(Extract.cls("net/minecraft/world/gen/chunk/NoiseChunkGenerator"),
+                    "createFluidLevelSampler", settingsC).invoke(null, settings);
+            Object cns = cnsCtor.newInstance(16 / cell, nc, cx * 16, cz * 16, shape, beardifier, settings, fluidSampler, noBlend);
+            have = new Object[] {fAquifer.get(cns), cns};
+            aquifers.put(key, have);
+        }
+        return have[0];
+    }
+
+    static String num(double d) { return Double.toString(d); }
+
+    static String answer(String[] q, Object entries, Method mEntryGet, ThreadLocal<Object> previous,
+                         Constructor<?> pointCtor, List<long[]> leafBox, List<String> leafBiome) throws Exception {
+        switch (q[0]) {
+            case "xoro": return xoro(Long.parseLong(q[1]));
+            case "biome": {
+                long seed = Long.parseLong(q[1]);
+                int qx = Integer.parseInt(q[2]), qy = Integer.parseInt(q[3]), qz = Integer.parseInt(q[4]);
+                Object sampler = Extract.method(ncC, "getMultiNoiseSampler").invoke(noiseConfig(seed));
+                Object pt = Extract.method(sampler.getClass(), "sample", int.class, int.class, int.class).invoke(sampler, qx, qy, qz);
+                long[] v = (long[]) Extract.method(pt.getClass(), "getNoiseValueList").invoke(pt);
+                previous.remove();
+                String b = String.valueOf(mEntryGet.invoke(entries, pointCtor.newInstance(v[0], v[1], v[2], v[3], v[4], v[5])));
+                long best = Long.MAX_VALUE;
+                Set<String> atBest = new TreeSet<>();
+                for (int l = 0; l < leafBox.size(); l++) {
+                    long d = 0;
+                    long[] box = leafBox.get(l);
+                    for (int k = 0; k < 7; k++) {
+                        long t = k < 6 ? v[k] : 0;
+                        long dd = t < box[2 * k] ? box[2 * k] - t : (t > box[2 * k + 1] ? t - box[2 * k + 1] : 0);
+                        d += dd * dd;
+                    }
+                    if (d < best) { best = d; atBest.clear(); }
+                    if (d == best) atBest.add(leafBiome.get(l));
+                }
+                return v[0] + "\t" + v[1] + "\t" + v[2] + "\t" + v[3] + "\t" + v[4] + "\t" + v[5] + "\t" + b + "\t" + (atBest.size() > 1 ? 1 : 0);
+            }
+            case "density": {
+                Object router = Extract.method(ncC, "getNoiseRouter").invoke(noiseConfig(Long.parseLong(q[1])));
+                Object df = Extract.method(router.getClass(), q[2]).invoke(router);
+                return num((Double) mSample.invoke(df, pos(Integer.parseInt(q[3]), Integer.parseInt(q[4]), Integer.parseInt(q[5]))));
+            }
+        }
+        // the aquifer helpers: seed, chunk x, chunk z, then the call's own arguments
+        long seed = Long.parseLong(q[1]);
+        Object aq = aquifer(seed, Integer.parseInt(q[2]), Integer.parseInt(q[3]));
+        int[] n = new int[q.length];                       // integer arguments (others stay 0, read from q)
+        for (int i = 4; i < q.length; i++) {
+            try { n[i] = Integer.parseInt(q[i]); } catch (NumberFormatException e) { /* a boolean or a double */ }
+        }
+        Class<?> I = int.class;
+        switch (q[0]) {
+            case "aq_noise_based_fluid_level":
+                return String.valueOf(Extract.method(implC, "getNoiseBasedFluidLevel", I, I, I, I).invoke(aq, n[4], n[5], n[6], n[7]));
+            case "aq_fluid_block_y":
+                return String.valueOf(Extract.method(implC, "getFluidBlockY", I, I, I, flC, I, boolean.class)
+                        .invoke(aq, n[4], n[5], n[6], level(n[7], n[8]), n[9], Boolean.parseBoolean(q[10])));
+            case "aq_fluid_block_kind":
+                return String.valueOf(kindOf(Extract.method(implC, "getFluidBlockState", I, I, I, flC, I)
+                        .invoke(aq, n[4], n[5], n[6], level(n[7], n[8]), n[9])));
+            case "aq_fluid_level": {
+                Object fl = Extract.method(implC, "getFluidLevel", I, I, I).invoke(aq, n[4], n[5], n[6]);
+                return fFlY.get(fl) + "\t" + kindOf(fFlState.get(fl));
+            }
+            case "aq_calculate_density": {
+                Object barrier = mutCtor.newInstance(Double.NaN);
+                Object r = Extract.method(implC, "calculateDensity", posC, barrier.getClass(), flC, flC)
+                        .invoke(aq, pos(n[4], n[5], n[6]), barrier, level(n[7], n[8]), level(n[9], n[10]));
+                return num((Double) r);
+            }
+            case "aq_apply": {
+                Object st = Extract.method(aqC, "apply", posC, double.class)
+                        .invoke(aq, pos(n[4], n[5], n[6]), Double.parseDouble(q[7]));
+                return st == null ? "none" : KIND[kindOf(st)];
+            }
+        }
+        throw new IllegalArgumentException("unknown query " + q[0]);
+    }
+
+    // one fixed script of draws against a fresh generator, mirrored one-to-one by the test
+    static String xoro(long seed) throws Exception {
+        Class<?> rc = Extract.cls("net/minecraft/util/math/random/Xoroshiro128PlusPlusRandom");
+        Class<?> randC = Extract.cls("net/minecraft/util/math/random/Random");
+        Class<?> splitC = Extract.cls("net/minecraft/util/math/random/RandomSplitter");
+        Constructor<?> c = rc.getDeclaredConstructor(long.class);
+        c.setAccessible(true);
+        Object r = c.newInstance(seed);
+        Method nl = Extract.method(randC, "nextLong");
+        List<String> o = new ArrayList<>();
+        o.add(String.valueOf(nl.invoke(r)));
+        o.add(String.valueOf(nl.invoke(r)));
+        o.add(String.valueOf(Extract.method(randC, "nextInt").invoke(r)));
+        o.add(String.valueOf(Extract.method(randC, "nextInt", int.class).invoke(r, 100)));
+        o.add(String.valueOf(Extract.method(randC, "nextInt", int.class).invoke(r, 1000003)));
+        o.add(num((Double) Extract.method(randC, "nextDouble").invoke(r)));
+        o.add((Boolean) Extract.method(randC, "nextBoolean").invoke(r) ? "1" : "0");
+        Object child = Extract.method(randC, "split").invoke(r);
+        o.add(String.valueOf(nl.invoke(child)));
+        Object sp = Extract.method(randC, "nextSplitter").invoke(r);
+        o.add(String.valueOf(nl.invoke(Extract.method(splitC, "split", String.class).invoke(sp, "minecraft:test_stream"))));
+        o.add(String.valueOf(nl.invoke(Extract.method(splitC, "split", int.class, int.class, int.class).invoke(sp, -37, 64, 1021))));
+        return String.join("\t", o);
+    }
+
+    static List<String> generate() {
+        List<String> q = new ArrayList<>();
+        Random rnd = new Random(20261025L);
+        long[] seeds = {0L, 1211L, 20260101L, -7046029254386353131L, Long.MAX_VALUE};
+        for (long s : seeds) q.add("xoro\t" + s);
+        // multi-noise lookups: quart coordinates (x, y, z) over a few thousand blocks
+        long[] biomeSeeds = {1211L, 20260101L, -7046029254386353131L};
+        for (long s : biomeSeeds)
+            for (int i = 0; i < 60; i++)
+                q.add("biome\t" + s + "\t" + (rnd.nextInt(8001) - 4000) + "\t" + (rnd.nextInt(80) - 16) + "\t" + (rnd.nextInt(8001) - 4000));
+        // the climate functions the biome source reads, at block coordinates
+        String[] names = {"continents", "erosion", "depth", "ridges"};
+        for (long s : new long[] {0L, 20260101L})
+            for (String nm : names)
+                for (int i = 0; i < 24; i++)
+                    q.add("density\t" + s + "\t" + nm + "\t" + (rnd.nextInt(6001) - 3000) + "\t" + (rnd.nextInt(256) - 64) + "\t" + (rnd.nextInt(6001) - 3000));
+        // the aquifer's helpers in one chunk, queried at positions around it
+        long seed = 1211L;
+        int cx = -3, cz = 5;
+        String ctx = seed + "\t" + cx + "\t" + cz + "\t";
+        for (int i = 0; i < 160; i++) {
+            int x = rnd.nextInt(241) - 120, y = rnd.nextInt(192) - 64, z = rnd.nextInt(241) - 120;
+            q.add("aq_noise_based_fluid_level\t" + ctx + x + "\t" + y + "\t" + z + "\t" + (rnd.nextInt(161) - 32));
+            int defY = rnd.nextBoolean() ? 63 : rnd.nextInt(60) - 54;
+            q.add("aq_fluid_block_y\t" + ctx + x + "\t" + y + "\t" + z + "\t" + defY + "\t1\t" + (rnd.nextInt(160) - 32) + "\t" + rnd.nextBoolean());
+            q.add("aq_fluid_block_kind\t" + ctx + x + "\t" + y + "\t" + z + "\t" + defY + "\t1\t" + (rnd.nextInt(140) - 70));
+            q.add("aq_fluid_level\t" + ctx + x + "\t" + y + "\t" + z);
+            q.add("aq_calculate_density\t" + ctx + x + "\t" + y + "\t" + z + "\t" + (rnd.nextInt(140) - 70) + "\t1\t" + (rnd.nextInt(140) - 70) + "\t1");
+        }
+        // aquifer.apply for positions in the chunk itself (the game indexes its caches by chunk)
+        double[] dens = {-0.45, -0.2, -0.05, -0.01, 0.0, 0.004, 0.05, 0.15};
+        for (int i = 0; i < 200; i++)
+            q.add("aq_apply\t" + ctx + (cx * 16 + rnd.nextInt(16)) + "\t" + (rnd.nextInt(192) - 64) + "\t" + (cz * 16 + rnd.nextInt(16)) + "\t" + dens[rnd.nextInt(dens.length)]);
+        return q;
+    }
+
+    static void write(Path out, Path queriesFile, Object entries, Method mEntryGet, ThreadLocal<Object> previous,
+                      Constructor<?> pointCtor, List<long[]> leafBox, List<String> leafBiome) throws Exception {
+        init();
+        List<String> qs = queriesFile == null ? generate() : Files.readAllLines(queriesFile);
+        try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(out))) {
+            for (String line : qs) {
+                if (line.isBlank()) continue;
+                String[] q = line.split("\t");
+                w.println(line + "\t|\t" + answer(q, entries, mEntryGet, previous, pointCtor, leafBox, leafBiome));
+            }
         }
     }
 }

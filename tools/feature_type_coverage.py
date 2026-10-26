@@ -77,7 +77,7 @@ NON_OVERWORLD = {
 def main():
     only_unimplemented = "--unimplemented" in sys.argv
     overworld_only = "--overworld" in sys.argv
-    cfs = load_dir("feature")
+    cfs = load_dir("configured_feature")
     pfs = load_dir("placed_feature")
     biomes = load_dir("biome")
     arms = implemented_arms()
