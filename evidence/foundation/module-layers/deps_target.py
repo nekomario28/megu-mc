@@ -17,9 +17,10 @@ layers = [
     ["generation_context"],
     ["worldgen", "block_registry"],
     ["json", "generation_math"],
-    # leaf utilities the root uses: the wire-boundary frame limit, the debug-switch
-    # cache and the tick measurements. They own no game state and depend on nothing.
-    ["ingress_guard", "tick_stats", "chunk_ack", "trace_env"],
+    # leaf utilities the root uses: the wire-boundary frame limit, the connection
+    # limits, the debug-switch cache and the tick measurements. They own no game
+    # state and depend on nothing.
+    ["ingress_guard", "tick_stats", "chunk_ack", "connection_limits", "trace_env"],
 ]
 modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(

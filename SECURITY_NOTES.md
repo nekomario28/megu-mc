@@ -106,7 +106,8 @@ lane's job; external probes to :25597 hit RCON and reset.
 
 - `crops/furnaces/chests/inv_store` — world/player-file bounded growth,
   no caps needed beyond the above. Acceptable residual.
-- No authentication/rate-limit on the listener — unchanged.
+- No authentication on the listener — unchanged (see the 2026-10-25 section
+  below for the limits that now exist; there is still no online mode).
 
 ## Remaining findings (earlier pass)
 
@@ -116,8 +117,88 @@ lane's job; external probes to :25597 hit RCON and reset.
   accepting that persistence is intended growth.
 - One thread per client — now capped at 64 live handlers; excess
   connections are dropped at accept time.
-- No authentication/rate-limit on :25599 — any LAN host can drive the
-  above paths. Recommend binding behind firewall or adding a cheap
-  connection throttle.
+- No authentication on :25599 — any LAN host can drive the above paths.
+  Recommend binding behind a firewall. (A per-IP connection cap and
+  deadlines were added 2026-10-25, see below; still no connection *rate*
+  limit.)
 - String reads are length-clamped by `.min(sl.len())` — safe pattern,
   keep it if touched.
+
+## 2026-10-25 — network hardening (branch `hardening/network-limits`)
+
+### Offline mode trusts the client's identity — read this before exposing the port
+
+The server runs in **offline mode**: the name and UUID in the Login Start
+packet are whatever the client says they are. There is no Mojang session
+check, no encryption (RSA key exchange + AES/CFB8) and no compression, and
+**none of that is implemented here**. Anyone who can reach the listener can log
+in as any name, including one that already has saved inventory/position (the
+stores are keyed by name). Game traffic and RCON are plaintext.
+
+What changed to contain that, without pretending it is authentication:
+
+- **Public bind needs an explicit opt-in.** The game listener, the RCON
+  listener and the resource-pack HTTP listener refuse to bind a non-loopback
+  address (`MC_SPINE_BIND_ADDR`, `MC_SPINE_RCON_BIND_ADDR`,
+  `MC_SPINE_RESOURCE_PACK_BIND_ADDR`) unless `MC_SPINE_ALLOW_PUBLIC_BIND=1`
+  is set. The game listener exits with status 2 and a message; RCON and the
+  pack server log the reason and do not start. Existing deployments that bind
+  `0.0.0.0` must add the flag.
+- **Duplicate logins are refused** (same name, compared case-insensitively, or
+  same UUID) with a disconnect message. The identity is reserved atomically at
+  login and released only after the first session's inventory/position have
+  been saved, which closes the "connect twice, load stale state, overwrite
+  the real save" race. It does **not** stop someone from logging in as a player
+  who is currently offline.
+- **Optional allowlist**: `MC_SPINE_ALLOWLIST="Steve,Alex,01234567-89ab-..."`
+  (comma/space separated names and/or UUIDs; default unset = off). Since
+  identities are unauthenticated, an allowlist of *names* is a speed bump, not
+  a lock; it is useful together with a firewall.
+
+### Limits and their knobs (defaults are invisible on loopback)
+
+| env | default | effect |
+|---|---|---|
+| `MC_SPINE_MAX_CONN_PER_IP` | 4 for non-loopback peers; loopback unlimited unless the variable is set (then it applies everywhere); `0` = unlimited | concurrent connections per remote IP, in addition to the global 64 |
+| `MC_SPINE_LOGIN_TIMEOUT_SECS` | 15 (was a fixed 30) | one wall-clock budget for handshake + login + configuration |
+| `MC_SPINE_IDLE_TIMEOUT_SECS` | 60 | play state: no *complete* packet for this long drops the client (vanilla clients answer the 8 s keepalive and send movement) |
+| `MC_SPINE_RCON_MAX_FAILURES` | 5 | wrong RCON passwords from one IP before lockout |
+| `MC_SPINE_RCON_LOCKOUT_SECS` | 30 | first lockout; doubles per further failure, max 15 min; locked-out IPs are dropped at accept |
+| `MC_SPINE_BACKUP_INTERVAL_SECS` | 600 | see persistence below |
+
+Chat and chat commands follow vanilla: more than 256 characters, or a `§` /
+control character, disconnects the player; vanilla's spam counter (20 per
+message, drains 1 per 50 ms, kick above 200: a burst of 10, sustained 1/s)
+kicks with "Kicked for spamming!".
+
+Not covered: a per-IP connection *rate* limit, packet-rate limits for
+gameplay packets, and any limit on how fast an unauthenticated client may edit
+the world overlay. Use a firewall / fail2ban for a public listener.
+
+### Other behaviour changes
+
+- RCON: the password is compared in constant time; failures are logged with
+  the source IP (never the password), as is each executed command.
+- Join/leave log lines carry the remote IP; refused connections are logged
+  (at most one line per second).
+- The tick thread runs under `catch_unwind`. A panicking tick logs
+  `[FATAL] tick thread panicked: ...` and exits with status 70 so a supervisor
+  restarts the server from the last autosave, instead of leaving the listener
+  alive with a dead tick. The world is deliberately not saved on that path (it
+  may be half-updated). A panic also poisons every `Mutex` it held, and the
+  ~970 `lock().unwrap()` calls would panic on them in turn; that is
+  intentionally left alone: ending the process is the policy.
+- Broadcasts: a client whose socket write fails or times out is shut down,
+  so it is logged out by its own thread and later broadcasts fail instantly
+  instead of each waiting out the 2 s write timeout on the tick thread. There
+  is still no per-client bounded queue; one stuck client can still cost the
+  tick thread one write timeout before it is dropped.
+- Skin lookups: cache capped at 1024 entries (1 h TTL for hits, 5 min for
+  failures, oldest evicted), keyed by lower-cased name, at most 4 lookups /
+  threads in flight; a login that finds the pool busy simply has no skin.
+- World saves: failures are logged with the path; the tmp file is fsynced; the
+  backups are `world_overlay.bin.bak` (previous save) plus `.bak.1` and
+  `.bak.2`, which only advance when `.bak.1` is at least
+  `MC_SPINE_BACKUP_INTERVAL_SECS` old.
+- Configuration-phase read loops return on EOF/timeout instead of
+  `continue`-spinning at 100 % CPU.
