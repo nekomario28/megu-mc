@@ -1,0 +1,8 @@
+# Pinned for reproducible builds (audit item 197). CI installs the same version explicitly.
+# The source uses std APIs (slice::as_chunks, uN::is_multiple_of) that are unstable on older
+# compilers such as 1.85, so a floating "stable" or an old system cargo does not build it.
+[toolchain]
+channel = "1.98.0"
+# `cargo fmt` / `cargo clippy` need these; a minimal install of the pinned
+# toolchain does not carry them.
+components = ["rustfmt", "clippy"]

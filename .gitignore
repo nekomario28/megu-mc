@@ -12,3 +12,15 @@ __pycache__/
 /compat/neoforge-events/.build/
 /compat/neoforge-events/__pycache__/
 logs/
+
+# Secrets and key material (audit item 18)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+
+# Python bytecode
+*.pyc
