@@ -1,45 +1,47 @@
 {
-  "base_commit": "c9eb91c",
-  "base_tree": "a919a839e99690fe3f194249bc01a83d078da8c7",
+  "base_commit": "e1c6aac",
+  "base_tree": "4ef4344c6ca6535a3c4604a2c8409c0d23045e6e",
   "binary": {
-    "latest_source_mtime_ns": 1792975496931216934,
-    "mtime_ns": 1792975631402767128,
+    "latest_source_mtime_ns": 1792976235315459786,
+    "mtime_ns": 1792976370916871316,
     "note": "Built after mutation restoration; both wire checks use this binary.",
     "path": "target/release/mc-spine",
     "sha256": "27be8cc855e178e555897a8ff752b0d7a59c0e745188a9a88904496ac1cd5206"
   },
   "branch": "pack/1211-own-data",
   "docs_sha256": {
-    "evidence/foundation/surface-context/README.md": "fceb133ae94116f84a52e032b211e2bf6303f5c9bd1b4ad5db6c42037916957d",
-    "specs/README.md": "4102bf31be712732a96c538d9b7d05e63777980e51d0933809b5c6165fd7b6ac",
-    "specs/ROADMAP.md": "0603a128d4444fafdc686676ae0665bc3aba7c947191c3aaa1a8c063b0c54545",
+    "evidence/foundation/surface-context/README.md": "c9204b82eb8a265ee0f566f827fa4b684bcd351cba337bfe8623c1045431b0a0",
+    "specs/README.md": "9f3349027eda8bbbda6ce2b476b4d179b9ec9431c7c4e3887cb87cc34a24e0dd",
+    "specs/ROADMAP.md": "c3de3aef04efb20136fc76e158eb1731c7f0e1cd13720ba9e0be7ba293124ce4",
     "specs/done/surface-context/README.md": "52eb2c3160a407a44f5d1b1ba6c598492554400ecb7043d30b23edf5d8c80d26",
-    "tools/README.md": "d62afd42b82c67fc98f1aa8d37846304b10b3651c84726cb29543c99f6eb1da4"
+    "tools/README.md": "59a6a57f75f3c3fa83f806658c8794f2b8226c1cb7e4d90eac21392c6de5a686"
   },
   "evidence_sha256": {
-    "admission-final.txt": "6838ddd23f7bc5189b679d0fe16a4f8fc831fd1e2c27978443c9b34928ca4b1d",
+    "admission-condition-mutation.txt": "6a101d76a856038f605b0e762c293f4cfb92d0de644ff6f96a1fe767ed786836",
+    "admission-final.txt": "ca1921681c27c1dd19d1c88c6b6ce3338e3b3a90a3af828eb679c65c77b2ca91",
     "admission-mutations.txt": "1069ea1f030d07aec3abf65f4fcf7300e3dccd016edee4b09f59b0fc0eb2fc3f",
-    "build.txt": "5c4f8142b473e1bf271319fac9f316e4c454f12ccd7ef7dae30162f93370cd14",
-    "clippy.txt": "4e613ddef4ebcd0b8fc1f40acb1a78411938189bda58d48b23493641a22cce05",
-    "comparison.json": "3ed6066d838e14a366cd9e6183367e8bb4d267eb8796a92178d931fc8133e6bf",
+    "build.txt": "70b2165abac91999f4b761a1ad3813850df81fe51dc13c46442cef98db4f94df",
+    "clippy.txt": "225c11a8d51c44bd82e061b1bd9ad14d72a724a27cf6ba2abdf49f28c27e006e",
+    "comparison.json": "e494224de519fc0d4bd8a8794b607b501d4c830ca536111475f30385bf07b1dd",
+    "conditions.json": "b6259ed95fd7ed0226fc008f17b286e886e39e409a8c11f51ad2ccefd4336dd2",
     "debt.txt": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
     "environment.json": "1bd2baf21b9ca934b7547c4ea9cece9daca306aa8d04776871261875e90ceea5",
-    "focused.txt": "4de802b91abe915c69086fe59de5ef035825f0ad033e339ec3b61a20a58fde43",
-    "layer-tests.txt": "09b3c4b693990aa91ba768bfd96f0b195deca002dd088bb684268716015c7973",
+    "focused.txt": "0637be003ca82c4bfaaaee523cce32e46fc19939d134c3ab53759e8e05009224",
+    "layer-tests.txt": "c4e4eef376ea3d53af9b78db738c281038334495cd5e2aeec87752a461fdc87c",
     "layers.txt": "28495f98f078823d8a3931768e2082f3f50c7e8f355ed93af4ef21340151131a",
-    "log-normalization.json": "fe352854e875dfd5c9bddd464948af019a16b1ee3433f949ec1e70040c8dbaf1",
+    "log-normalization.json": "be150d4154a77b95c39666bbbe5638e70a93194e44ce1e550789ec0e670e5604",
+    "mutation-conditions.txt": "68fddfe6c006145dad9f85bb820eff6bb6b58e6d87658d7d3a6ff295736081f7",
     "mutations.txt": "6ae2cacd91071f00f4f876bdc371aebda66fb72011e52f7b8fa899feaa0c9d43",
-    "native.txt": "bb8f3e412fe3d40e0012ec83acd778efad4d6361e70418d4aa500712d913ec82",
-    "python.txt": "7ec4660bc2db2f03c5e98ed14edaa5a5dac6dc611a112c223a49c6ed11b8b04b",
-    "source-hashes.sha256": "5399d5a33ac886b0a452b09946c726fd795e61f4bf9c9373ac89b437db6053a4",
-    "suite.txt": "8a2ed1fdc24dbfd571fc66cc2a8a2d246e19fb37f69b3158837dbf10e9bceb65",
-    "unit.jsonl": "a0358d8234e48c5676e9be151afab3113219de7f2b8e2ffd32c213300211a702",
+    "native.txt": "70dad04fbd22749a52e20a4907d1b100fae80b42258bfa0802ac0917543e45cc",
+    "python.txt": "36b3afde8b5530cd7e8f343619d42f62815b6771d9894f4f9e887e459be224dd",
+    "source-hashes.sha256": "d69cd3d8cf4e6263ecdc4b5cb5147567b98f451130b21dd3f7e418e27491991c",
+    "suite.txt": "bae812551ce9f51d94e9c02c03fc9fd9748bdf732aa9b0f8d1ce6e166a0bcd0d",
+    "unit.jsonl": "fa1c17c532cbb0d8cfd4a9f0aa30d2ec247d01864313d2e9c55fd55b86d34de9",
     "wire.txt": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921"
   },
   "limits": [
-    "Only steep call-site heightmap is corrected; waterHeight/stoneDepth/ocean-floor start/deep-state scan not re-derived.",
-    "No full SurfaceSystem actual-class execution or whole-world surface comparison.",
-    "Full tests/verify.sh, whole mutation campaign, hosted CI, push, main merge and release were not run."
+    "Only condition formulas and steep heightmap are pinned; buildSurface scan start/water-height/stone-depth accumulation are not.",
+    "No full SurfaceSystem actual-class execution, whole-world surface comparison, performance, hosted CI, push or merge."
   ],
   "not_run": [
     "full tests/verify.sh",
@@ -51,28 +53,37 @@
     "full SurfaceSystem buildSurface",
     "whole-world surface comparison"
   ],
-  "recorded_at": "2026-10-26T00:47:38.705181+00:00",
+  "recorded_at": "2026-10-26T00:59:49.654815+00:00",
   "reference": {
-    "basis": "decompiled dzq SurfaceSystem.buildSurface and dzp$g$c SteepMaterialCondition; Heightmap.Types.WORLD_SURFACE_WG at four neighbours, threshold 4",
+    "basis": "actual dzp$g with synthetic t/B/C/D/E/x/v fields; actual SurfaceRules condition sources; no chunk/world/Unsafe. Steep from decompiled buildSurface/SteepMaterialCondition.",
+    "condition_kinds": [
+      "hole",
+      "prelim",
+      "stone",
+      "water"
+    ],
+    "condition_oracle_sha256": "a96a50985ba047c75d5f182c5b6bfa8620e2b45d8e724d04c9f894400223d513",
+    "condition_rows": 4037,
     "minecraft": "1.21.1",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
-    "surface_actual_cases": 97
+    "surface_decode_cases": 97
   },
   "results": {
     "added_failures": [],
     "baseline": {
       "failed": 0,
       "ignored": 1,
-      "passed": 236
+      "passed": 237
     },
     "clippy_all_targets_warnings_denied": true,
+    "condition_oracle_twice": true,
     "container_wire": "PASS",
     "debt_over_limit": 0,
     "full_serial_release": {
       "exit": 0,
       "failed": 0,
       "ignored": 1,
-      "passed": 237
+      "passed": 238
     },
     "gameplay_wire": "PASS",
     "layer_gate_tests": 17,
@@ -81,24 +92,25 @@
       "modules": 20,
       "named_errors": 0
     },
-    "new_rust_tests": 1,
+    "new_rust_tests": 2,
     "removed_failures": [],
     "selected_mutations": {
       "not_a_gate": 0,
       "parked": 0,
-      "proved": 1,
+      "proved": 2,
       "skipped": 0
     },
     "unchanged_failure_baseline": true
   },
-  "scope": "Surface steep heightmap correction; not a full SurfaceSystem/buildSurface port.",
+  "scope": "Surface steep heightmap correction and synthetic SurfaceRules condition formulas; not a full SurfaceSystem/buildSurface port.",
   "source_sha256": {
-    ".github/workflows/ci.yml": "50cd250f30c24f87714b7062315daa788356f6a32ae917d75dd66ade5143693e",
+    ".github/workflows/ci.yml": "a998bdc66600e962c04327e027588b98bf2ed47b1a2a60a2d428faf2da14bf51",
     "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
     "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
-    "evidence/foundation/surface-context/README.md": "fceb133ae94116f84a52e032b211e2bf6303f5c9bd1b4ad5db6c42037916957d",
-    "specs/README.md": "4102bf31be712732a96c538d9b7d05e63777980e51d0933809b5c6165fd7b6ac",
-    "specs/ROADMAP.md": "0603a128d4444fafdc686676ae0665bc3aba7c947191c3aaa1a8c063b0c54545",
+    "evidence/foundation/surface-context/README.md": "c9204b82eb8a265ee0f566f827fa4b684bcd351cba337bfe8623c1045431b0a0",
+    "evidence/foundation/surface-context/conditions.json": "b6259ed95fd7ed0226fc008f17b286e886e39e409a8c11f51ad2ccefd4336dd2",
+    "specs/README.md": "9f3349027eda8bbbda6ce2b476b4d179b9ec9431c7c4e3887cb87cc34a24e0dd",
+    "specs/ROADMAP.md": "c3de3aef04efb20136fc76e158eb1731c7f0e1cd13720ba9e0be7ba293124ce4",
     "specs/done/surface-context/README.md": "52eb2c3160a407a44f5d1b1ba6c598492554400ecb7043d30b23edf5d8c80d26",
     "src/aquifer_native_tests.rs": "00e436230df0ff8fbdbc78e98190ca4f99f63f146c40cb5353b9b1b94eee6ced",
     "src/block_registry.rs": "c015c38549380894521d1fb50f78db1489e0586454bb3d6378f7553c00850c25",
@@ -136,9 +148,15 @@
     "src/tree.rs": "94540bdf5a1a0d9c4e03080c77ad61e5e778488966bc9f182d3da00825254981",
     "src/weird_sampler_tests.rs": "03fda74db84ad32ae96f9208b343cb6d607c0806e680274782a433e28edbf910",
     "src/world_rng.rs": "b440d78b383752426b43f796718a21387c023f32081d8a903f84a0cc5303d144",
-    "src/worldgen.rs": "6b1e4c148b15539e9777cbd46bc37fe11172e93a9aa34c28614b67d981e54906",
-    "tests/verify.sh": "872ff516d4a00df674de1d5df8fb28183145c9be4c10e44adff9f1475661559e",
-    "tools/README.md": "d62afd42b82c67fc98f1aa8d37846304b10b3651c84726cb29543c99f6eb1da4",
-    "tools/mutation_check.sh": "68d7ced7f6f951b8455a6a65ac368a972a7624eeb710ff5f8271070c35739242"
+    "src/worldgen.rs": "70486bd33a4ab4ae45bea878fa5484e29dccb93c8dc63c5cb59723aea9f19e27",
+    "tests/surface_condition_oracle_test.py": "4ea3004d59f5cdb88c90209bf91d5ea2adabcb1813c60e6d9931fa6df94afad4",
+    "tests/surface_oracle_test.py": "fd114581a32ada44931a108cb001483533df01aa7a120bde2fd3e992b6be4cab",
+    "tests/verify.sh": "45f36355fc90b8fc61550a99d4bb4d5d1f314615702c3a3699311e96e150213f",
+    "tools/README.md": "59a6a57f75f3c3fa83f806658c8794f2b8226c1cb7e4d90eac21392c6de5a686",
+    "tools/mutation_check.sh": "1054ea05a0f33aede3721b610c774ba48dfef0a88b8a214a0f3d4835508bdbec",
+    "tools/surface-context-oracle/SurfaceConditionOracle.java": "a96a50985ba047c75d5f182c5b6bfa8620e2b45d8e724d04c9f894400223d513",
+    "tools/surface-oracle/SurfaceOracle.java": "cdce9c83d577df626749af3c2e70351340df7f946389d385dde595a151d890a1",
+    "tools/surface_condition_oracle.py": "b428f3e473beb4571179ac3120622db299b47204d221243ace59a9e0d5c12cf5",
+    "tools/surface_oracle.py": "4a8e8b02c166f58f4e5a2f25550ab7959cc197bc989f776151d3f917172b1130"
   }
 }
