@@ -1,0 +1,21 @@
+# Surface scan reads actual aquifer states
+
+Reference/port 5x5, no-feature control, inner 3x3 (-64,32).
+
+Before: 207 differing cells, all deep, top stone vs reference grass/dirt.
+After: 80 differing cells, all deep; target chunk still 0.
+Tree-on: 319 -> 192 differing cells; target chunk 0.
+Suite: 243 passed / 0 failed / 1 ignored.
+Mutation: `a non-fluid aquifer state above nonpositive density stays solid`
+(1 proved, 0 skipped).
+
+The surface scan used density>0 as the only Solid test. At
+(-1011,62,540), density is negative in both trees, but the reference's actual
+pre-surface cell is an aquifer barrier/default solid and receives grass. The
+scan now classifies the aquifer result: None -> Solid, explicit air -> Air,
+fluid -> Fluid, otherwise Solid. This keeps the cell in the surface window.
+
+The remaining 80 cells are a separate density-sign issue: for example at
+(-993,62,512), reference final density is +0.054 while the port reports
+-0.024; the port top remains one block low. This is next, not a surface
+material-rule failure.

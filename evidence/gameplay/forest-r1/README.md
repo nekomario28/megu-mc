@@ -160,14 +160,19 @@ next count position (`neighbor-support.txt`). This residual is downstream of
 neighbour terrain/surface, not tree RNG, trunk placement, dirt placement, or
 fancy attachments.
 
-A no-feature control over the same 5x5 region gives **207 all-deep
-dirt/stone/grass cells** and target 0 (`no-feature.txt`), so the tree-on split
-is **207 terrain + 112 feature/canopy**. The canopy side is the z=31 support
-block chain above; the terrain side is the remaining neighbouring surface
-residue. A probe at `(-1011,540)` shows the port density crossing negative at
-y=62 while the reference still has grass there (`surface-density.txt`): the
-primary residual is a density/top-height boundary, not the material rule or a
-tree write.
+A no-feature control over the same 5x5 region initially gave **207 all-deep
+dirt/stone/grass cells** and target 0 (`no-feature.txt`). The surface scan was
+classifying `density <= 0` as air even when the aquifer supplied a barrier or
+default solid; the reference scans the actual pre-surface block state. The
+scan now classifies the aquifer result (None -> Solid, explicit air -> Air,
+fluid -> Fluid, otherwise Solid). That reduces the no-feature residual
+**207 -> 80** and the tree-on residual **319 -> 192**, with target 0
+(`surface-classification.txt`, `no-feature-after-surface.txt`,
+`diff-after-surface.txt`).
+
+The remaining 80 cells are a density-sign boundary: at `(-993,62,512)` the
+reference final density is `+0.054` while the port reports `-0.024`, so the
+port top remains one block low. This is not a tree or material-rule failure.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path

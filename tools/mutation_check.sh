@@ -201,6 +201,17 @@ check "a tree parser reads the pinned dirt provider" \
   'dirt_provider: js(j, "below_trunk_provider")' \
   tree::tests::a_tree_reads_the_dirt_provider_field_the_pinned_data_uses
 
+check "a non-fluid aquifer state above nonpositive density stays solid" \
+  src/worldgen.rs '    } else {
+        SurfaceCell::Solid
+    }
+}' \
+  '    } else {
+        SurfaceCell::Air
+    }
+}' \
+  worldgen::wg_tests::a_nonpositive_density_with_an_aquifer_barrier_is_still_solid
+
 check "a fancy tree starts its attachment list below the branch end" \
   src/tree.rs 'list.push(((start.0, start.1 + j - 5, start.2), m));' \
   'list.push(((start.0, start.1 + k, start.2), m));' \

@@ -294,11 +294,32 @@ struct SurfMat {
 }
 
 /// One terrain cell as the surface scan sees it before the rule runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SurfaceCell {
     Air,
     Fluid,
     Solid,
+}
+
+/// Classify one pre-surface cell. Vanilla scans the chunk's actual block states;
+/// an aquifer barrier (`None`) is solid, and a non-fluid aquifer state is solid
+/// even when the density is non-positive. Such cells can still receive a
+/// surface material and must stay in the surface window.
+fn classify_surface_cell(
+    density: f64,
+    aquifer: Option<u32>,
+    aquifer_air: bool,
+    aquifer_fluid: bool,
+) -> SurfaceCell {
+    if density > 0.0 || aquifer.is_none() {
+        SurfaceCell::Solid
+    } else if aquifer_air {
+        SurfaceCell::Air
+    } else if aquifer_fluid {
+        SurfaceCell::Fluid
+    } else {
+        SurfaceCell::Solid
+    }
 }
 
 // scan context for material rules (vanilla MaterialRuleContext)
@@ -2372,24 +2393,17 @@ impl Gen {
         x: i32,
         y: i32,
         z: i32,
-        surf_y: i32,
-        water_surface: i32,
+        _surf_y: i32,
+        _water_surface: i32,
     ) -> SurfaceCell {
         let d = self.block_density(cc, x, y, z);
         if d > 0.0 {
             return SurfaceCell::Solid;
         }
-        let fluid = if y > surf_y {
-            y <= water_surface
-        } else {
-            self.aq_state(x, y, z, d)
-                .is_some_and(|st| self.is_fluid_state(st))
-        };
-        if fluid {
-            SurfaceCell::Fluid
-        } else {
-            SurfaceCell::Air
-        }
+        let aq = self.aq_state(x, y, z, d);
+        let air = aq.is_some_and(|st| st == 0 || breg().is_some_and(|r| r.is_air(st)));
+        let fluid = aq.is_some_and(|st| self.is_fluid_state(st));
+        classify_surface_cell(d, aq, air, fluid)
     }
 
     /// The top-down surface scan, separated from terrain sampling so a synthetic
@@ -3999,6 +4013,30 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    #[test]
+    fn a_nonpositive_density_with_an_aquifer_barrier_is_still_solid() {
+        assert_eq!(
+            classify_surface_cell(-0.01, None, false, false),
+            SurfaceCell::Solid
+        );
+        assert_eq!(
+            classify_surface_cell(-0.01, Some(1), false, false),
+            SurfaceCell::Solid
+        );
+        assert_eq!(
+            classify_surface_cell(-0.01, Some(0), true, false),
+            SurfaceCell::Air
+        );
+        assert_eq!(
+            classify_surface_cell(-0.01, Some(2), false, true),
+            SurfaceCell::Fluid
+        );
+        assert_eq!(
+            classify_surface_cell(0.01, Some(0), true, false),
+            SurfaceCell::Solid
+        );
+    }
 
     // These tests mutate the shared `GEN` static, so they must not run in
     // parallel: one lock per test serializes the whole module.
