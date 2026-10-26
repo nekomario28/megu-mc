@@ -53,12 +53,12 @@ pub(crate) struct BReg {
     dfl: Vec<u32>,
     st_lo: Vec<u32>,
     n_states: Vec<u32>,
-    st_blk: Vec<u32>,      // state id -> block idx
-    st_fl: Vec<u16>,       // state id -> FL_* bits (assets/block_states_1211.json `flags`)
-    st_side: Vec<u8>,      // state id -> bit d set when face d is fully solid (`full_sides`)
-    hardness: Vec<f32>,    // state id -> vanilla destroy time (-1 unbreakable)
-    htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
-    tool_kind: Vec<i8>,    // block idx -> tool kind mined at full speed (-1 = none)
+    st_blk: Vec<u32>,           // state id -> block idx
+    state_bits: Vec<u16>,       // state id -> FLAG_* bits (assets/block_states_1211.json `flags`)
+    state_solid_faces: Vec<u8>, // state id -> bit d set when face d is fully solid (`full_sides`)
+    hardness: Vec<f32>,         // state id -> vanilla destroy time (-1 unbreakable)
+    htools: Vec<Vec<i64>>,      // block idx -> tool item ids that can harvest it (empty = any)
+    tool_kind: Vec<i8>,         // block idx -> tool kind mined at full speed (-1 = none)
     /// States of blocks that assets/block_states_1211.json does not cover under the same name and
     /// state range as the block table. The registry gate requires this to be empty.
     pub(crate) unpaired: Vec<String>,
@@ -74,14 +74,14 @@ pub(crate) struct BReg {
 }
 
 // Bit meanings are fixed by `flag_bits` in assets/block_states_1211.json; load() checks them.
-const FL_AIR: u16 = 1;
-const FL_REPLACEABLE: u16 = 1 << 1;
+const FLAG_AIR: u16 = 1;
+const FLAG_REPLACEABLE: u16 = 1 << 1;
 /// BlockState.isLiquid(): water, lava, bubble column. Not read yet; kept so the file's bits are all named.
 #[allow(dead_code)]
-const FL_LIQUID: u16 = 1 << 2;
-const FL_SOLID: u16 = 1 << 3;
+const FLAG_LIQUID: u16 = 1 << 2;
+const FLAG_SOLID: u16 = 1 << 3;
 /// The state holds a non-empty fluid: water, lava, waterlogging, kelp, seagrass.
-const FL_FLUID: u16 = 1 << 4;
+const FLAG_FLUID: u16 = 1 << 4;
 
 impl BReg {
     fn load() -> Option<BReg> {
@@ -91,11 +91,11 @@ impl BReg {
         let facts = jparse(&std::fs::read("assets/block_states_1211.json").ok()?)?;
         let bits = facts.get("flag_bits")?;
         for (name, bit) in [
-            ("air", FL_AIR),
-            ("replaceable", FL_REPLACEABLE),
-            ("liquid", FL_LIQUID),
-            ("solid", FL_SOLID),
-            ("fluid", FL_FLUID),
+            ("air", FLAG_AIR),
+            ("replaceable", FLAG_REPLACEABLE),
+            ("liquid", FLAG_LIQUID),
+            ("solid", FLAG_SOLID),
+            ("fluid", FLAG_FLUID),
         ] {
             if jnum(bits, name)? as u16 != bit {
                 return None;
@@ -138,8 +138,8 @@ impl BReg {
             st_lo: vec![],
             n_states: vec![],
             st_blk: vec![0; n_states_max + 1],
-            st_fl: vec![0; n_states_max + 1],
-            st_side: vec![0; n_states_max + 1],
+            state_bits: vec![0; n_states_max + 1],
+            state_solid_faces: vec![0; n_states_max + 1],
             hardness: vec![0.6; n_states_max + 1],
             htools: vec![],
             tool_kind: vec![],
@@ -274,8 +274,8 @@ impl BReg {
                 reg.drops_second[st] = drop1;
                 reg.stack_size[st] = stack_size;
                 if facts_agree {
-                    reg.st_fl[st] = f_fl[st] as u16;
-                    reg.st_side[st] = f_sides[st] as u8;
+                    reg.state_bits[st] = f_fl[st] as u16;
+                    reg.state_solid_faces[st] = f_sides[st] as u8;
                     reg.luminance[st] = f_lum[st] as u8;
                     reg.opacity[st] = f_opa[st] as u8;
                 } else {
@@ -462,36 +462,36 @@ impl BReg {
     pub(crate) fn is_air(&self, st: u32) -> bool {
         st == 0
             || self
-                .st_fl
+                .state_bits
                 .get(st as usize)
-                .map(|f| f & FL_AIR != 0)
+                .map(|f| f & FLAG_AIR != 0)
                 .unwrap_or(true)
     }
     pub(crate) fn is_solid(&self, st: u32) -> bool {
-        self.st_fl
+        self.state_bits
             .get(st as usize)
-            .map(|f| f & FL_SOLID != 0)
+            .map(|f| f & FLAG_SOLID != 0)
             .unwrap_or(false)
     }
-    /// True when the state holds a fluid (FL_FLUID): water, lava, waterlogged blocks, kelp,
-    /// seagrass. This is wider than vanilla's `BlockState.isLiquid()` (FL_LIQUID), which is
+    /// True when the state holds a fluid (FLAG_FLUID): water, lava, waterlogged blocks, kelp,
+    /// seagrass. This is wider than vanilla's `BlockState.isLiquid()` (FLAG_LIQUID), which is
     /// only water, lava and bubble columns; the callers were written against the wider set.
     pub(crate) fn is_liquid(&self, st: u32) -> bool {
-        self.st_fl
+        self.state_bits
             .get(st as usize)
-            .map(|f| f & FL_FLUID != 0)
+            .map(|f| f & FLAG_FLUID != 0)
             .unwrap_or(false)
     }
     pub(crate) fn is_replaceable(&self, st: u32) -> bool {
         self.is_air(st)
             || self
-                .st_fl
+                .state_bits
                 .get(st as usize)
-                .map(|f| f & FL_REPLACEABLE != 0)
+                .map(|f| f & FLAG_REPLACEABLE != 0)
                 .unwrap_or(false)
     }
     pub(crate) fn side_solid(&self, st: u32, dir: usize) -> bool {
-        self.st_side
+        self.state_solid_faces
             .get(st as usize)
             .map(|f| f & (1 << dir) != 0)
             .unwrap_or(false)

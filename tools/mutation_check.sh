@@ -388,8 +388,8 @@ check "broken sign text cannot survive its block" \
   '        signs().lock().unwrap().retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 check "solid metadata must reach every note block state" \
-  src/block_registry.rs '                    reg.st_fl[st] = f_fl[st] as u16;' \
-  '                    reg.st_fl[st] = 0;' \
+  src/block_registry.rs '                    reg.state_bits[st] = f_fl[st] as u16;' \
+  '                    reg.state_bits[st] = 0;' \
   note_block_keeps_solid_and_light_values_for_every_instrument
 
 check "property remapping cannot reuse positional state offsets" \

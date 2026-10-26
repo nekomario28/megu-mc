@@ -348,7 +348,7 @@ fn skin_cache_put(
     }
     c.insert(key, (now, res));
 }
-fn fetch_skin(name: &str) -> Option<(String, String)> {
+fn load_skin_properties(name: &str) -> Option<(String, String)> {
     // offline-mode skin resolution: name -> uuid -> session profile textures
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(6)))
@@ -425,7 +425,7 @@ fn kick_skin(name: String, target: &Arc<Client>) {
     let t = target.clone();
     thread::spawn(move || {
         let _slot = slot;
-        let r = fetch_skin(&name);
+        let r = load_skin_properties(&name);
         skin_cache_put(
             &mut skin_cache().lock().unwrap(),
             key,
@@ -6193,7 +6193,7 @@ fn note_block_update(x: i32, y: i32, z: i32, st: u32) {
         .or_default()
         .insert((((x & 15) << 8) | ((z & 15) << 4) | (y & 15)) as u16, out);
 }
-fn flush_block_updates() {
+fn apply_queued_block_updates() {
     let map = std::mem::take(&mut *pending_blocks().lock().unwrap());
     for ((sx, sy, sz), recs) in map {
         let mut p = Vec::with_capacity(9 + recs.len() * 5);
@@ -20801,7 +20801,7 @@ fn handle(mut s: TcpStream) {
                 }
             _ => {}
         }
-        flush_block_updates();
+        apply_queued_block_updates();
     }
     {
         eprintln!("[spine] {} left (from {})", name, peer);
@@ -21462,18 +21462,17 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     step("mobs", mob_tick);
     step("falling", falling_tick);
     step("random_ticks", random_tick_pass);
-    step("block_updates", flush_block_updates);
+    step("block_updates", apply_queued_block_updates);
 }
 
 fn main() {
-    let probe_args: Vec<String> = std::env::args().skip(1).collect();
-    if probe_args
-        .first()
-        .is_some_and(|arg| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample"))
-    {
+    let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
+    let wants_probe =
+        |arg: &String| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample");
+    if cli_args.first().is_some_and(wants_probe) {
         #[cfg(feature = "fabric-probe")]
         {
-            if let Err(error) = java_compat::run(&probe_args) {
+            if let Err(error) = java_compat::run(&cli_args) {
                 eprintln!("[fabric-probe] {error}");
                 std::process::exit(1);
             }
@@ -21575,28 +21574,6 @@ fn main() {
                 t1.elapsed()
             );
         }
-        if std::env::var("WGDIFF").is_ok() {
-            // vanilla reference values at (0,0,0) seed 0 from pumpkin test data
-            for (name, want) in [
-                ("minecraft:overworld/continents", -0.008171953f64),
-                ("minecraft:overworld/erosion", -0.10391074),
-                ("minecraft:overworld/depth", 0.4118821),
-                ("minecraft:overworld/ridges", 0.011110324),
-                ("minecraft:overworld/temperature", 0.11823799),
-                ("minecraft:overworld/vegetation", -0.0013601681),
-                ("minecraft:overworld/barrier", -0.54002273),
-                ("minecraft:overworld/final_density", 0.15719144),
-            ] {
-                let got = worldgen::debug_eval(name, 0, 0, 0).unwrap_or(f64::NAN);
-                eprintln!(
-                    "{:45} got={:+.10} want={:+.10} diff={:+.10}",
-                    name,
-                    got,
-                    want,
-                    got - want
-                );
-            }
-        }
         if std::env::var("WGD2").is_ok() {
             for name in [
                 "minecraft:overworld/ridges",
@@ -21695,8 +21672,7 @@ fn main() {
             }
         }
         if std::env::var("WGBIOME").is_ok() {
-            // pumpkin multi-noise vectors: seed 123 @ quart(123,123,123) ->
-            // temp -5727 humid 55 cont 4996 ero 2371 depth -19774 weird 4421
+            // climate parameters and biome at one quart position, seed 123
             if let Some((b, t)) = worldgen::biome_debug(123, 123, 123) {
                 eprintln!("biome @123,123,123 = {} params {:?}", b, t);
             }

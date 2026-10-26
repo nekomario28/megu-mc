@@ -1,7 +1,7 @@
 # THIRD_PARTY.md — 第三者由来物の出所一覧 / Third-party provenance inventory
 
 > **これは事実の一覧です。法的な判断・結論ではありません。** 各ファイルを再配布してよいか、どのライセンスが適用されるかは、このドキュメントでは判断していません。
-> **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. (Revision note: the original version of this document changed nothing; the follow-up PR that this revision belongs to removes the three Pumpkin-identical data files and replaces them with generated data, see §3 and §5.)
+> **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. (Revision note: the original version of this document changed nothing; a follow-up PR removed the Mojang-derived and Pumpkin-identical data files and replaced them with generated data, see §3, §5 and §9; a further PR renamed identifiers and replaced test tables, see §10.)
 
 - 対象リビジョン / Revision: `main` @ `ef6e14a` (+ #16 + この PR / this PR)
 - リポジトリのコード本体は MIT ([LICENSE](LICENSE))。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または出所が文書化されていないもの)の一覧です。
@@ -150,7 +150,7 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 6. (対応済み・§9) `resourcepack.zip` は削除しました (任意機能)。履歴には残っています。
 7. `datapacks/{modtest,rectest,spinetest,tagtest,testpack}` と `*.storyboard.png` は自作ですか?
 8. このリポジトリは過去に公開されていた形跡があります (issue #11)。公開されていた期間に上記のファイルは含まれていましたか? 履歴にも残っています (この PR は履歴を書き換えません)。
-9. 外部からの貢献やコードの取り込み (`src/generation_math.rs` のテスト値 "pumpkin xoroshiro128.rs test vectors" など) について、出所とライセンスを記録しますか?
+9. 外部からの貢献やコードの取り込みについて、出所とライセンスを記録しますか? (以前ここに挙げていた `src/generation_math.rs` のテスト値は §10 で jar から生成した値に置き換え済み。)
 10. 依存クレートのうち `webpki-roots` は `CDLA-Permissive-2.0`、`unicode-ident` は `(MIT OR Apache-2.0) AND Unicode-3.0` を宣言しています。配布時の表記方法 (ライセンス全文の同梱など) はどうしますか? (`deny.toml` は許可リストに載せているだけで、表記義務の遵守を確認するものではありません。)
 
 回答が得られたら、この表の出所列を `documented` に更新し、README の記述 (README.md「ライセンスと第三者データ」) を更新してください。
@@ -202,13 +202,13 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 | `feature.rs` 2713 (テスト補助) | 1→0 | 書き直し |
 | `tree.rs` dark oak 幹 / foliage `gen_square` / decorators (shuffle ×3, alter ground) | 6→0 | 書き直し (共通ヘルパー化) |
 | `generation_providers.rs`, `landing.rs`, `main.rs` (座標・小さな反復) | 6→0 | 書き直し (自明な箇所) |
-| `tree.rs` forking 幹 (前 2 → 後 2 箇所), fancy 幹 (前 2 → 後 1 箇所) | 4→3 | **未書き直し**: vanilla 手順 (向き→傾き→枝) の乱数消費順序そのもの。差分テストが forking を通らず、挙動同一性を検証できないため触っていない |
-| `cached_lookup.rs` Default 実装, `main.rs` `args().skip(1).collect()`, `world_rng.rs` テストの反復 | 3→3 | **自明・定型**: 標準的な書き方のため、そのまま (歪めない) |
+| `tree.rs` forking 幹 (前 2 → 後 2 箇所), fancy 幹 (前 2 → 後 1 箇所) | 4→3 | この時点では未書き直し (§10 で書き直し) |
+| `cached_lookup.rs` Default 実装, `main.rs` `args().skip(1).collect()`, `world_rng.rs` テストの反復 | 3→3 | この時点では未書き直し (§10 で書き直し) |
 
 注意 / Notes:
 - `Xor::next_bound` の閾値計算は 64 ビット剰余で、vanilla の 32 ビット符号なし剰余と非 2 冪の bound で異なり得る既存の挙動です。**挙動を変えないため触っていません** (再抽選が起きる稀な経路のみ)。
 - `BT::search` は子を距離順に並べますが、vanilla は配列順に走査します (既存の挙動、未変更)。
-- この検査はコードのみです。テスト値の表 (`AQ_NB`, `biome_vectors` など Pumpkin のテストと数値が一致するもの) と、Pumpkin とバイト一致する `data/minecraft/tags/block` の 12 ファイルは対象外でした (**§9 で当該ファイルを削除し、jar からの生成に置き換えた**)。
+- この検査はコードのみです。テスト値の表 (`AQ_NB`, `biome_vectors` など Pumpkin のテストと数値が一致するもの) と、Pumpkin とバイト一致する `data/minecraft/tags/block` の 12 ファイルは対象外でした (**タグは §9 で削除して jar からの生成に、テスト値は §10 で jar から生成した照合値に置き換えた**)。
 - 履歴には書き直し前のコードが残っています (この PR は履歴を書き換えません)。
 
 ## 9. Mojang 由来データのコミット廃止 / Removing committed Mojang-derived data
@@ -228,4 +228,19 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 **Pumpkin との照合 (再確認、`b0c48b2` の全ファイルの git blob sha と比較)**: 旧 HEAD で一致したのは `tags/block` の 13 ファイルのみ (他のパスはなし)。この PR の HEAD にコミットされている全ファイルで一致は 0。生成された 784 ファイルのうち 6 個 (`tags/block/{trail_ruins_replaceable,tall_flowers,incorrect_for_diamond_tool,incorrect_for_netherite_tool,enchantment_power_provider,concrete_powder}.json`, 18–652 bytes) は、Pumpkin の短い JSON とバイト一致する。これは jar が出力する短いリストが同じ内容になっただけで (例: `enchantment_power_provider` は `["minecraft:bookshelf"]` で、Pumpkin の `c:bookshelves` と同一)、コミットされず、利用者の手元で生成される。
 
 **セットアップ**: `tools/vanilla_data/gen_vanilla_data.sh --jar server.jar --fetch-fabric-mappings --accept-eula` (README 参照)。`--accept-eula` を付けると Minecraft の EULA に同意したことになる (サーバーを一時起動するため)。付けなければ `config_packets.bin` 以外が生成される。
+
+## 10. 識別子の改名・テスト値の置き換え・文言の整理 / Renames, generated test vectors, wording cleanup
+
+この PR (#22 の上に積んだ変更) の内容。**挙動は変えていない**。履歴には旧コードが残っている (この PR は履歴を書き換えない)。事実の記録であり、ライセンスや複製についての判断ではない。
+
+| 項目 | 変更 |
+|---|---|
+| 識別子の改名 (src) | Pumpkin の識別子と一致していたものを、vanilla の名前、なければこのリポジトリ独自の名前に改名した。`hash_block_pos`→`mth_get_seed`、`java_hash`→`string_hash_code`、`build_octaves`→`octave_table`、`legacy_fbm`→`legacy_octave_perlins`、`resolve_rule`→`load_named_rule`、aquifer の `aq_*` 関数と定数、`fetch_skin`→`load_skin_properties`、`flush_block_updates`→`apply_queued_block_updates`、`reschedule`→`requeue`、`CarveRun`→`CarveSpan`、など。以前の一致範囲内のローカル変数名とコメントの言い回しも置き換えた。 |
+| tree / cached_lookup / world_rng / main | `tree.rs` の forking 幹 (`lay` クロージャで行ごとに配置、乱数の消費順序は不変) と fancy 幹のローカル名、`cached_lookup.rs` の Default、`world_rng.rs` のテストの反復、`main.rs` の引数処理を書き直した。`tree.rs` の型名・feature 名は vanilla のデータパックの `tree` configured feature の名前に従う (そのまま)。 |
+| 削除 | `normal_new` (未使用)、`noise_id` の旧スキーマ分岐 (1.21.1 のデータには存在しない形)、`main.rs` の `WGDIFF` デバッグ出力 (他実装から取った参照値を含んでいた)。 |
+| テスト値 | `AQ_NB` ほか 7 個の aquifer 表 (約 780 行)、`biome_vectors` の固定値、xoroshiro のテストベクタ (他実装のテストの数値と一致していた) を削除。代わりに `tools/vanilla_data/Extract.java` の `Vectors` が、利用者の 1.21.1 jar のゲーム本体の関数 (aquifer の `getFluidLevel` ほか、NoiseRouter、MultiNoiseSampler、Xoroshiro) をランダムな問い合わせで呼び、`tests/data/vanilla_vectors_1211.tsv` (git 管理外) に書き出す。テスト (`aquifer_vectors`, `biome_vectors`, `climate_functions_match_the_games_router`, `xoroshiro_parity`) がその値と照合する。 |
+| 旧表との差 | 旧表の 1270 個の aquifer 値と biome の 2 ベクタは、jar から得たゲームの値と全て一致した (期待値の変更なし)。新しいランダム問い合わせでの差は f32 (ゲーム) と f64 (このコード) の丸めのみ: biome の気候パラメータで 1 単位 (180 個中 1 個、depth 6177 と 6178)、density の最大差 4.08e-8。テストの許容誤差をそれに合わせて明記した。 |
+| 生成物 | `tests/data/vanilla_vectors_1211.tsv` を追加 (`.gitignore` 済み、NOTICE に記載)。 |
+| 残る言及 | README / THIRD_PARTY.md / NOTICE の帰属、`tick_queue.rs` の設計参照 (設計のみ、issue #3)、`specs/` と `DESIGN.md` の設計参照、`evidence/foundation/provenance/` の 2026-10-21 の測定記録。ブロック名 `pumpkin` / `carved_pumpkin` は Minecraft の名前。 |
+| `evidence/time-contract/**/*.log` ほか | 一部の AI レビューのログ (Pumpkin に触れた引用を含む) は `main` にのみ存在し、このブランチの系列 (#16→#19→#20→#22) では #20 で削除済み (`evidence/time-contract/REDACTION.md` 参照)。公開リポジトリから消えるのは `main` を置き換える・書き換えるときで、この PR は `main` に触れない。 |
 

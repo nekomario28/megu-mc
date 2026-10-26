@@ -1,8 +1,12 @@
 # 由来（provenance）監査: 「設計だけ参照」の実測
 
-2026-10-21。#3（由来メモ）は「Pumpkin など他実装の GPL コードは取り込んでいない」
-と宣言しているが、`src/tree.rs` の冒頭に "Ported from pumpkin … semantics" と
-書かれていたので、宣言が事実かを測った。宣言そのものは変えていない。判断材料を残す。
+2026-10-21 の測定の記録。#3（由来メモ）は「Pumpkin など他実装の GPL コードは取り込んでいない」
+と宣言しており、当時の `src/tree.rs` の冒頭には "Ported from pumpkin … semantics" と
+書かれていた。その文言と宣言がどう対応するかを測った。**この文言は後に削除済み**
+（`src/tree.rs` の冒頭は、型名・feature 名が vanilla のデータパック名に従うことだけを述べる）。
+
+> この文書は 2026-10-21 時点の測定の記録です。その後 `tree.rs` ほかのコードと名前を書き直したため、
+> 現在の数値は `tools/provenance_scan.py` で再計測してください。判断（法的なものを含む）は行いません。
 
 ## 方法
 
@@ -32,7 +36,7 @@ python3 tools/provenance_scan.py /tmp/mine_carver.rs /tmp/mine_carver.rs  # 同�
 | この repo の carver ⇔ Pumpkin の `cave.rs` | 16 | 0.0219 | 同じ 1.21.1 bytecode から独立に書いた対照 |
 | この repo の carver ⇔ Pumpkin の `canyon.rs` | 21 | 0.0137 | 同上 |
 
-つまり「同じアルゴリズムを独立に書いた」ときの一致は **16〜21 トークン**まで。
+この 2 組（同じ 1.21.1 bytecode から別々に書いた carver）では、最長の連続一致は 16〜21 トークンだった。
 
 ## 結果: `src/tree.rs` ⇔ Pumpkin `feature/features/tree/`（38 ファイル全部）
 
@@ -52,23 +56,22 @@ python3 tools/provenance_scan.py /tmp/mine_carver.rs /tmp/mine_carver.rs  # 同�
 vanilla の dark oak が 4 隅の柱を回るループで、忠実に書けば誰でもこの形になる。
 2 位の 44 トークン（`decorator/alter_ground.rs`）も
 `for xx in -2..=2 { for zz in -2..=2 { if xx.abs() != 2 || zz.abs() != 2` の
-リング条件で同じ性質。コメント一致が 0 であることと合わせて、
-**コピーではなく同じ仕様の独立実装**と判断する（Jaccard も対照実験の範囲内）。
+リング条件で同じ性質。この測定では、最長の連続一致はループの骨格で、一致コメント行は 0、
+Jaccard は対照実験の範囲内だった。
 
 ## 他の「pumpkin」への言及（同じ目で見た結果）
 
 | 箇所 | 内容 | 判断 |
 |---|---|---|
-| `src/tick_queue.rs` 冒頭 | 設計のみ参照、GPL なので独立実装と明記 | 問題なし（既に明記） |
-| `src/block_registry.rs` の `state_flags`/`side_flags` コメント | データ項目の意味の出所 | 問題なし（データは Mojang 由来） |
-| `src/generation_math.rs` の xoroshiro テストベクタ | 数値（事実） | 問題なし |
-| `src/tree.rs` 冒頭 | "Ported from pumpkin … semantics" | 実測は独立実装。文言を「semantics を参照」に寄せ、本監査を指す |
+| `src/tick_queue.rs` 冒頭 | 設計のみ参照と明記 | 現在も残している（設計の参照元の記録） |
+| `src/block_registry.rs` の `state_flags`/`side_flags` コメント | データ項目の意味の出所 | データは Mojang 由来（現在は生成物） |
+| `src/generation_math.rs` の xoroshiro テストベクタ | 他実装のテストの数値と一致 | **削除**。jar から生成した照合値（`tests/data/vanilla_vectors_1211.tsv`）に置き換えた |
+| `src/tree.rs` 冒頭 | "Ported from pumpkin … semantics" | **削除**。vanilla のデータパック名に従う旨だけを書く |
 
-## この監査が覆る条件
+## この測定の見方
 
-- `10 *` 以上のファイルで最長一致が 100 トークンを超える
-- 一致コメント行が 1 行でも出る
-- Pumpkin のコードを貼った後に「変数名だけ変える」編集をした場合（Jaccard は
-  下がるが最長一致は残るので、上の 2 指標で捕まる）
+- 最長一致が長い、または一致コメント行がある場合は、該当箇所を個別に確認する材料になる
+- 変数名だけを変えた編集では Jaccard は下がるが最長一致は残るので、上の 2 指標を併せて見る
+- 測定は目安であり、複製の有無や権利についての結論ではない
 
 再実行は `tools/provenance_scan.py` と、Pumpkin の該当ディレクトリだけで足りる。
