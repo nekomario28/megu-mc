@@ -1,0 +1,25 @@
+# Dungeon residual: the qualifying wall hole is in a neighbour chunk
+
+Full-feature reference (`forestfix-normal-nostruct`, structures off), target
+chunk (-64,32), seed 0. The target's cobblestone/mossy/lava/spawner/chest
+cluster is a dungeon around origin (-1013,-13,526).
+
+RE trace on the port's MonsterRoomFeature calls (`MONSTER_TRACE`):
+  MROOM -1013 -13 526
+  MDBG start xr=3 zr=3
+  MDBG holes=0
+
+The reference's no-feature carver world has one qualifying wall hole for that
+same bounding box:
+  (-1009,-13,530) air, (-1009,-12,530) air
+That column lies in chunk (-64,33), not the target chunk (-64,32).
+
+The port's feature context reads that neighbour before its carver overrides
+exist (the lazy 3x3 populate order reaches z=33 after the centre), so it sees
+deepslate at both cells, reports holes=0, and rejects the dungeon. The
+MonsterRoomFeature body itself matches the pinned class; this is a
+neighbour-carver visibility/order issue.
+
+Next fix: make a feature read the carver-stage result for neighbour chunks
+without populating their features, or reproduce vanilla's decoration order for
+the fixture. This is not a tree/ore material issue.

@@ -42,6 +42,13 @@ pairs are `deepslate` vs `cave_air` (138), `deepslate` vs `cobblestone` (91),
 cluster is a dungeon (`monster_room`) shape, so the next isolation is that
 feature in this exact region, not another tree pass.
 
+The target's dungeon residual is now attributed to neighbour carver
+visibility: the MonsterRoom call at `(-1013,-13,526)` has `xr=3,zr=3` and
+`holes=0`, while the reference's qualifying hole is at `(-1009,-13,530)` in
+chunk `(-64,33)`. The port's lazy 3x3 populate reaches that chunk after the
+centre, so the feature sees deepslate instead of the carver's air. See
+`monster-room-neighbor.txt`.
+
 ## What the remaining cells are
 
 - **surface-only residual outside the target**: 207 cells in the 3x3 region are
