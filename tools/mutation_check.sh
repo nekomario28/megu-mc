@@ -195,6 +195,11 @@ check "an unclipped tree rejects a clipped top" \
   'true' \
   tree::tests::a_clipped_tree_needs_a_min_clipped_height_that_the_clip_reaches
 
+check "the tree path uses the clip decision" \
+  src/tree.rs 'if !clip_allows_top(top, height, t.min_clipped) {' \
+  'if false && !clip_allows_top(top, height, t.min_clipped) {' \
+  feature_population_output_matches_the_pre_refactor_capture
+
 check "lazy feature lookup applies its population input and retains cached overrides" \
   src/worldgen.rs '            for sx in x0..=x1 {
                 for sz in z0..=z1 {
