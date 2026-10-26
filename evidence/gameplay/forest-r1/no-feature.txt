@@ -1,0 +1,14 @@
+# No-feature 5x5 control
+
+Same 5x5 region, seed 0, reference pack with every feature removed; port ran
+with `MC_SPINE_NOFEAT=1`. Inner 3x3 starts at (-64,32).
+
+- inner 3x3 diff: 207 cells, all classified `deep`
+- target chunk (-64,32): 0
+- top pairs: dirt != stone, grass != dirt, dirt != grass (no canopy/log pair)
+
+Therefore the tree-free residual is 207 neighbour surface/terrain cells.
+The 319 tree-on diff decomposes as 207 terrain + 112 feature/canopy cells.
+The canopy side is downstream of the z=31 support-block difference already
+recorded in `neighbor-support.txt`; it is not a tree-origin or tree-shape
+regression in the target chunk.
