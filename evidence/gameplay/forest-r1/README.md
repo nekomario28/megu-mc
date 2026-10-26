@@ -171,8 +171,11 @@ blocks of the actual pre-surface top. That reduces the no-feature residual
 (`material-window.txt`, `no-feature-after-material.txt`,
 `diff-after-material.txt`).
 
-The remaining 72 cells are leaf/canopy states (oak/birch leaf distance and a
-few missing/extra leaves), not terrain or tree-base material.
+The remaining 72 cells split into **55 leaf state/distance**, **14
+missing/extra canopy**, and **3 branch-log position** cells. They cluster around
+a neighbour fancy oak (for example origin `(-988,63,534)`), so the next layer is
+the fancy branch shape, not terrain, tree origin, tree-base dirt, or the
+surface material window (`remaining-72.txt`).
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path

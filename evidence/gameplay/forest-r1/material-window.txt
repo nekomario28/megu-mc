@@ -13,7 +13,7 @@ dirt as vanilla does.
 Measured on the 5x5 no-feature/tree fixtures:
 
 - no-feature inner 3x3: 80 -> 0
-- tree-on inner 3x3: 192 -> 72
+- tree-on inner 3x3: 192 -> 72 (55 leaf state, 14 canopy, 3 branch log)
 - target chunk: 0
 - heightmap regression test: PASS
 - full suite: 244 passed / 0 failed / 1 ignored (245 tests)

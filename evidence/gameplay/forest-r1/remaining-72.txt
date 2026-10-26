@@ -1,0 +1,14 @@
+# Remaining tree-on residual after the surface fix
+
+5x5 same-stage, seed 0, inner 3x3 (-64,32); no-feature diff is 0.
+
+72 differing cells:
+- 55 leaf state/distance cells (oak/birch leaves on both sides)
+- 14 cells where one side has canopy air/leaves (missing or extra canopy)
+- 3 cells where a branch log position differs
+
+The examples cluster around a fancy oak at (-988,63,534): reference has a
+branch log at (-989,69,535)/( -990,69,536), port at (-989,68,535)/
+(-990,69,536), and their canopies shift with it. This is downstream of the
+fancy branch shape, not the target chunk, tree origin, dirt provider, or the
+surface material window.
