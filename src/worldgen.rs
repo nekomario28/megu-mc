@@ -6329,8 +6329,11 @@ mod wg_tests {
         // 2026-10-26: fancy trunk attachments start at `start + (height - 3)`,
         // not `start + k`; the latter moved every fancy canopy up. The 3x3 diff
         // moved 728 -> 319 while the target chunk stayed at 0.
+        // 2026-10-26: the centre fancy limb is `h2 * 0.5` (vanilla assigns h2
+        // then returns half); the port returned h2, doubling the centre limb.
+        // The 3x3 diff moved 72 -> 51; the remainder is leaf distance.
         assert_eq!(
-            digest, "593c7cd603ddc8b5c6bcf8978a58468f",
+            digest, "9e5b16759c3ccc2a03d2ff4651fc278b",
             "feature population output changed from the post-carver-visibility capture"
         );
     }

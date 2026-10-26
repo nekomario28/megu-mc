@@ -221,6 +221,16 @@ check "a non-fluid aquifer state above nonpositive density stays solid" \
 }' \
   worldgen::wg_tests::a_nonpositive_density_with_an_aquifer_barrier_is_still_solid
 
+check "the fancy centre layer is half the trunk half-height" \
+  src/tree.rs '    if g == 0.0 {
+        // Vanilla assigns `h2 = f` for the exact centre layer, then still
+        // returns `h2 * 0.5`; returning h2 here made the centre limb twice as
+        // long and moved its candidate by a cell.
+        h2 * 0.5' \
+  '    if g == 0.0 {
+        h2' \
+  tree::tests::the_centre_fancy_layer_is_half_the_trunk_half_height
+
 check "a fancy branch treats replaceables and logs as free" \
   src/tree.rs 'fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
     is_replaceable(

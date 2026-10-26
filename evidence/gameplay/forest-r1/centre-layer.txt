@@ -1,0 +1,27 @@
+# Fancy centre limb: vanilla returns half, not the full half-height
+
+RE trace on the pinned 1.21.1 server (agent hooks on `ehh`):
+  FTREE -988 63 534 h=12
+  FDRAW 0.8886856 0.8894564
+  ...
+  FDRAW 0.033798635 0.89365786
+  reference FBR -989 69 535 ... make=0
+  reference list entry -989 69 535
+
+Port before the fix:
+  FDRAW 0.033798635 0.89365786      (same draws)
+  FBR -990 69 536 ... make=0
+
+The draws are identical. At the centre layer `n = j/2`, `FancyTrunkPlacer`
+assigns `h2 = f` and then executes `return h2 * 0.5F`. The port returned `h2`
+directly, doubling that limb. Changing it to `h2 * 0.5` moves the candidate
+back to `-989,69,535`.
+
+Fixture after the fix:
+- tree-on inner 3x3: 72 -> 51
+- target chunk: 0
+- no-feature: 0
+- remaining 51 are all leaf state/distance cells (no canopy/log cells)
+
+Suite: 246 passed / 0 failed / 1 ignored.
+Mutation: centre-layer predicate 1 proved.

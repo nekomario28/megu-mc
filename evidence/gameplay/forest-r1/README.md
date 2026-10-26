@@ -171,11 +171,11 @@ blocks of the actual pre-surface top. That reduces the no-feature residual
 (`material-window.txt`, `no-feature-after-material.txt`,
 `diff-after-material.txt`).
 
-The remaining 72 cells split into **55 leaf state/distance**, **14
-missing/extra canopy**, and **3 branch-log position** cells. They cluster around
-a neighbour fancy oak (for example origin `(-988,63,534)`), so the next layer is
-the fancy branch shape, not terrain, tree origin, tree-base dirt, or the
-surface material window (`remaining-72.txt`).
+The A/B trace then found the fancy centre limb bug: at `n = j/2` vanilla
+returns `h2 * 0.5`, while the port returned `h2`, doubling that limb and moving
+its candidate by a cell (`centre-layer.txt`). Fixing it reduces the tree-on
+residual **72 -> 51** and leaves only leaf state/distance cells
+(`remaining-51.txt`, `diff-after-centre.txt`). The target chunk stays 0.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path

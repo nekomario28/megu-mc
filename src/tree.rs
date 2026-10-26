@@ -351,8 +351,8 @@ impl TrunkPl {
                         continue;
                     }
                     for _ in 0..l {
-                        let g = (1.0f32 * f * (rng.next_f32() + 0.328f32)) as f64;
-                        let h = (rng.next_f32() * 2.0 * std::f32::consts::PI) as f64;
+                        let g = f as f64 * (rng.next_f32() as f64 + 0.328);
+                        let h = (rng.next_f32() * 2.0f32) as f64 * std::f64::consts::PI;
                         let p = g * h.sin() + 0.5;
                         let q = g * h.cos() + 0.5;
                         let bp = (
@@ -653,7 +653,10 @@ fn fancy_branch_prob(h: i32, y: i32) -> f32 {
     }
     let h2 = sq.sqrt();
     if g == 0.0 {
-        h2
+        // Vanilla assigns `h2 = f` for the exact centre layer, then still
+        // returns `h2 * 0.5`; returning h2 here made the centre limb twice as
+        // long and moved its candidate by a cell.
+        h2 * 0.5
     } else if g.abs() >= f {
         0.0
     } else {
@@ -2395,6 +2398,12 @@ mod tests {
 
     fn state(name: &str) -> u32 {
         crate::name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"))
+    }
+
+    #[test]
+    fn the_centre_fancy_layer_is_half_the_trunk_half_height() {
+        assert_eq!(fancy_branch_prob(14, 7), 3.5);
+        assert_eq!(fancy_branch_prob(12, 6), 3.0);
     }
 
     #[test]

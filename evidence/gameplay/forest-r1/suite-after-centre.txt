@@ -1,0 +1,5 @@
+command: cargo test --release -- --test-threads=1
+tests: 247 total
+result: 246 passed; 0 failed; 1 ignored
+unit: mc-tree-centre-full2 (MemoryMax=2G, CPUQuota=200%, CARGO_BUILD_JOBS=1)
+wall: 40s

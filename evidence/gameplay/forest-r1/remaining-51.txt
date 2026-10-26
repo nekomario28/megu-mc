@@ -1,0 +1,9 @@
+# Remaining tree-on residual after the centre-limb fix
+
+5x5 same-stage, seed 0, inner 3x3 (-64,32); no-feature diff is 0.
+
+51 differing cells, all `deep`: oak/birch leaf state/distance. Example:
+  (-1004,65,517): port distance 5, reference distance 2
+  (-1007,66,520): port distance 5, reference distance 1
+The same cell shapes and logs are present; only the `distance` property differs.
+This is the leaf-distance update layer, not branch placement.
