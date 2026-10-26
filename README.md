@@ -13,7 +13,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 - `--fetch-fabric-mappings`: 難読名の解決に使う Fabric の intermediary / Yarn マッピング (CC0, sha256 固定) の2ファイルだけをダウンロードします。手元にある場合は `--mappings DIR` を使います。それ以外は jar だけで動き、ネットワークは使いません。
 - `--accept-eula`: `config_packets.bin` を作るため、jar から実サーバーを一時ディレクトリで1回起動します（オフライン・ループバックのみ）。Minecraft の EULA (https://aka.ms/MinecraftEULA) への同意が必要で、このフラグが同意の意思表示になります。付けなくても他のデータは生成されますが、クライアントは registry を受け取れません。
 
-生成物（すべて `.gitignore` 済みでコミットされません）: `datapacks/vanilla/`、`assets/block_states_1211.json`、`tests/data/biome_probe_1211.tsv`、`tests/data/vanilla_vectors_1211.tsv`、`config_packets.bin`。`resourcepack.zip` は任意で、自分のリソースパックを置いたときだけ配信されます（置かなければ配信しません）。
+生成物（すべて `.gitignore` 済みでコミットされません）: `datapacks/vanilla/`、`assets/block_states_1211.json`、`tests/data/biome_probe_1211.tsv`、`tests/data/vanilla_vectors_1211.tsv`、`tests/data/biome_probe_ties_1211.tsv`、`tests/data/random_next_int_1211.tsv`、`config_packets.bin`。`resourcepack.zip` は任意で、自分のリソースパックを置いたときだけ配信されます（置かなければ配信しません）。
 
 ## 試す
 

@@ -1162,6 +1162,7 @@ mod tests {
     /// tools/vanilla_data/gen_vanilla_data.sh); the script is `Vectors.xoro` in `Extract.java`.
     #[test]
     fn xoroshiro_parity() {
+        crate::test_support::require_vanilla_data();
         let rows = vector_file::read("xoro");
         assert!(rows.len() >= 5);
         for (q, a) in rows {

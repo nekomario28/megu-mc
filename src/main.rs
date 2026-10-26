@@ -11978,8 +11978,8 @@ fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
         Ok(d) => d,
         Err(_) => {
             eprintln!(
-                "[spine] config_packets.bin is missing: clients get no registries. \
-                 Generate it with tools/vanilla_data/gen_vanilla_data.sh (see README)"
+                "[spine] config_packets.bin is missing: clients get no registries. {}",
+                worldgen::VANILLA_DATA_MISSING
             );
             return vec![];
         }
@@ -21534,7 +21534,10 @@ fn main() {
                 worldgen::dfdump(&spec);
             }
         } else {
-            eprintln!("[wg] worldgen datapack missing — flat generator");
+            eprintln!(
+                "[wg] worldgen datapack missing — flat generator. {}",
+                worldgen::VANILLA_DATA_MISSING
+            );
         }
     }
     WORLD_SEED.store(wg_seed, Ordering::Relaxed);

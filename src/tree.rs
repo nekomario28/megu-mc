@@ -2388,6 +2388,7 @@ mod tests {
     /// that the predicate actually reads them.
     #[test]
     fn the_replaceable_predicate_says_what_each_placer_used_to_say() {
+        crate::test_support::require_vanilla_data();
         let reg = breg().expect("the block registry must load from assets/");
         let stone = state("stone");
         let log = state("oak_log");

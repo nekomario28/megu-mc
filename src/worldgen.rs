@@ -1912,6 +1912,12 @@ pub(crate) struct ChunkCols {
 
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
 
+/// The one instruction for a tree that has no generated vanilla data (README "Setup").
+/// Both the startup fallbacks and the tests that read the data print it, so a missing
+/// file names the command that writes it instead of the `Option` that came back empty.
+pub(crate) const VANILLA_DATA_MISSING: &str =
+    "Vanilla data missing. Run: tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-mappings --accept-eula";
+
 pub fn init(seed: u64, res: fn(&str) -> Option<u32>) -> bool {
     match Gen::load(seed, res) {
         Some(g) => {
@@ -3707,6 +3713,7 @@ mod wg_tests {
     /// biome is only compared when the game's answer was unambiguous.
     #[test]
     fn biome_vectors() {
+        crate::test_support::require_vanilla_data();
         use crate::generation_math::vector_file;
         let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
@@ -3767,6 +3774,7 @@ mod wg_tests {
     /// The game's splines work in `float`, so the answers agree to about 1e-8, not bit for bit.
     #[test]
     fn climate_functions_match_the_games_router() {
+        crate::test_support::require_vanilla_data();
         use crate::generation_math::vector_file;
         let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
@@ -3807,6 +3815,7 @@ mod wg_tests {
     /// pale_garden, sulfur_caves in place of plains / dark_forest) now match vanilla.
     #[test]
     fn biome_tree_gives_vanillas_answer_at_every_probe_point() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
             Some(1)
@@ -3855,6 +3864,7 @@ mod wg_tests {
     /// Every leaf is a 1.21.1 biome, and the leaf count is the data generator's 7,593 entries.
     #[test]
     fn biome_tree_leaves_are_1_21_1_biomes_only() {
+        crate::test_support::require_vanilla_data();
         let raw = std::fs::read("datapacks/vanilla/biome_climate_tree.json").unwrap();
         let j = jparse(&raw).unwrap();
         fn walk(n: &J, out: &mut Vec<String>) {
@@ -3890,6 +3900,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_load() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         fn stub(_: &str) -> Option<u32> {
             Some(1)
@@ -3927,6 +3938,7 @@ mod wg_tests {
 
     #[test]
     fn material_rules_real_ids() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         assert!(init(0, crate::name_to_state));
         let cc = chunk_cols(0, 0).unwrap();
@@ -3952,6 +3964,7 @@ mod wg_tests {
     /// `AquiferSampler` (built the way `ChunkNoiseSampler` builds it) on random positions.
     #[test]
     fn aquifer_vectors() {
+        crate::test_support::require_vanilla_data();
         use crate::generation_math::vector_file;
         let _guard = lock_gen();
         let water = crate::name_to_state("minecraft:water").unwrap();
@@ -4115,6 +4128,7 @@ mod wg_tests {
 
     #[test]
     fn feat_populate_perf() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         let seed = 0u64;
         init(seed, crate::name_to_state);
@@ -4143,6 +4157,7 @@ mod wg_tests {
 
     #[test]
     fn lazy_population_keeps_neighborhood_order_and_cached_overrides() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
         let mut visited = Vec::new();
@@ -4164,6 +4179,7 @@ mod wg_tests {
 
     #[test]
     fn lazy_population_preserves_direct_feature_outputs() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // Preserve population results through the lazy lookup, including writes
         // outside the queried chunk. This is a refactor control, not a vanilla oracle.
@@ -4236,6 +4252,7 @@ mod wg_tests {
 
     #[test]
     fn vertical_gradient_seed_reads_the_name_hash_big_endian() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // vanilla StringHash.fromString = Guava Longs.fromBytes, i.e. big-endian,
         // then PositionalRandomFactory.fromHashOf XORs those words with the
@@ -4261,6 +4278,7 @@ mod wg_tests {
 
     #[test]
     fn not_underwater_is_grass_only_above_the_water_surface() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // vanilla's WaterCondition (SurfaceRules$WaterConditionSource$1WaterCondition)
         // is already "not underwater": waterHeight == MIN (no fluid), or
@@ -4281,6 +4299,7 @@ mod wg_tests {
 
     #[test]
     fn surface_density_follows_vanillas_interpolated_order() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // vanilla samples `interpolated` over its input at 4x8x4 cell corners and
         // interpolates that, then applies squeeze/min/add per block. Interpolating
@@ -4293,6 +4312,7 @@ mod wg_tests {
 
     #[test]
     fn feature_population_output_matches_the_pre_refactor_capture() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // Unlike the lazy-vs-direct comparison, this pins the values against a
         // digest recorded before the shared contracts moved, so a change made on
@@ -4413,6 +4433,7 @@ mod wg_tests {
 
     #[test]
     fn bundled_carver_configs_are_the_1_21_1_shapes() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // The four configured carvers the overworld's biomes reference. They were missing
         // entirely, so no cave could ever be carved; this keeps them present and shaped like
@@ -4445,6 +4466,7 @@ mod wg_tests {
 
     #[test]
     fn the_ore_vein_geometry_matches_vanillas_own_output() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // Vanilla's OreFeature.place (called through tools/vanilla-probe) writes these 666
         // cells for seed 60007, position (7,49,13) and size 64. Pinning them means the Rust
@@ -4474,6 +4496,7 @@ mod wg_tests {
 
     #[test]
     fn the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // The deep material rule asks for the biome once per block; the answer only depends on the
         // quart, so one shared cache replaced millions of B-tree searches. Pin that a repeat query
@@ -4503,6 +4526,7 @@ mod wg_tests {
 
     #[test]
     fn feat_determinism() {
+        crate::test_support::require_vanilla_data();
         let _guard = lock_gen();
         // same seed -> identical override maps; and feature writes must cross
         // chunk boundaries (e.g. a tree rooted in a neighbor must appear here)
