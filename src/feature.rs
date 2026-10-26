@@ -2436,7 +2436,12 @@ fn load_freg() -> FReg {
     let mut order: Vec<(usize, u32)> = vec![];
     let mut visited: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
     let mut in_progress: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
-    let mut keys: Vec<(usize, u32)> = edges.keys().copied().collect();
+    // Every feature is a node. The edge map alone omits a feature that is the
+    // only entry in its step (the one-feature fixtures exposed this: a valid
+    // `trees_birch_and_oak` step vanished before placement). Sort all nodes by
+    // (step, first-seen index) and let the DFS visit both connected and
+    // dependency-free nodes.
+    let mut keys: Vec<(usize, u32)> = name_of.keys().copied().collect();
     keys.sort_by_key(|a| (a.0, a.1));
     for k in keys {
         dfs_step(k, &edges, &mut visited, &mut in_progress, &mut order);

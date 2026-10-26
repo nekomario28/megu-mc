@@ -87,9 +87,21 @@ after this native-order explanation; its old hash is not reused as evidence.
   The lapis extra cells were the lead to the carver-visibility fix above; with
   that fix, lapis is **23/23** and all clusters match. Diamond and redstone
   placement also match in this region.
-- Tree isolation is still unresolved: the first one-feature overlay produced
-  no port features, so that run is a harness failure, not a negative result.
-  The tree step needs a corrected overlay before attribution.
+### Feature-order fix and tree isolation
+
+The one-feature tree overlay initially placed no features because `load_freg`
+built its `by_step` order only from graph edges: a feature that was the sole
+entry in a step had no edge and was dropped before placement. The loader now
+starts DFS from every `(step, firstIndex)` node, including dependency-free
+nodes. Full-suite output is unchanged (240/0/1), so the ordinary pack is not
+reordered; the one-feature fixture is now runnable.
+
+With only `trees_birch_and_oak` enabled in forest, the reference target chunk
+has **332 oak leaves + 111 birch leaves**; the port has **188 + 71**. The target
+diff is **728 cells** (`carver` 694, `deep` 34), with both missing and extra
+tree cells. This is now a **tree placement/RNG residual**, not a harness
+failure; it is not yet attributed to tree shape, origin, or draw order.
+
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path
   and compared against a missing region.
@@ -109,5 +121,6 @@ this run; the script refuses to diff if the reference is incomplete.
 - The carver-visibility fix is included and its source/logs are in this
   directory (`lapis-before.txt`, `lapis-after.txt`,
   `features-after-carver-visibility.txt`, `feature-visibility-mutation.txt`).
-  Geode placement outside the target, the tree harness, and the 207 regional
-  surface cells remain separate follow-ups.
+  The tree one-feature run is now positive but differs (728 cells), and geode
+  placement outside the target and the 207 regional surface cells remain
+  separate follow-ups.

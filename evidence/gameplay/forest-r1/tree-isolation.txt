@@ -1,0 +1,19 @@
+chunks 1x1  band y=-64..319  differing cells: 728
+per chunk: 728
+layers: {'carver': 694, 'deep': 34}
+top pairs (got, want) x count:
+       0 !=    248  x80
+       0 !=    244  x78
+       0 !=    252  x66
+       0 !=    240  x55
+     244 !=      0  x53
+     264 !=      0  x39
+       0 !=    300  x38
+       0 !=    256  x38
+     240 !=      0  x36
+     248 !=      0  x35
+       0 !=    296  x26
+       0 !=    304  x25
+     300 !=      0  x17
+     320 !=      0  x16
+       0 !=    131  x16
