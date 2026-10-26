@@ -10,6 +10,19 @@ fn context(g: &mut Gen) -> FC<'_> {
     FC::new(g)
 }
 
+/// A feature runs after the carver pass and must read the carver's air/fluid
+/// writes, not the uncarved terrain. This is the lapis-in-a-cave regression.
+#[test]
+fn feature_context_sees_carver_writes() {
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let cave_air = crate::name_to_state("minecraft:cave_air").expect("cave air");
+    let (x, y, z) = (0, -60, 0);
+    assert_ne!(g.terrain_state(x, y, z), cave_air);
+    g.feat_write(x, y, z, cave_air);
+    let mut ctx = context(&mut g);
+    assert_eq!(ctx.get(x, y, z), cave_air);
+}
+
 /// Pin how much randomness a provider consumed, without pinning platform libm's
 /// last bit: draw one Gaussian (so its spare is populated and later consumed),
 /// then record two raw draws. A provider that draws a different number of times

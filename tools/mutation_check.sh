@@ -892,6 +892,11 @@ check "surface scan keeps stone depth above the column" \
   '                    sda += 0;' \
   surface_build_scan_matches_the_pinned_classes_on_synthetic_columns
 
+check "feature context reads carver overrides" \
+  src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
+  '        if let Some(st) = Option::<u32>::None {' \
+  feature_context_sees_carver_writes
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

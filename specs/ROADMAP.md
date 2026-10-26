@@ -4,9 +4,9 @@
 
 ## いまの判断 — 広げる前に収束する
 
-Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **239 passed / 0 failed / 1 ignored** まで戻りました。steepのheightmap、条件式4,037行、合成stone/water列の実`buildSurface` scan 768列を実クラスと照合しました。R1のforest `(-64,32)` 3x3 same-stage比較では、**対象chunkのterrain・surface・carverは0差**、残差はfeatures 550とstructures 304に分離できました。[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)を追加しました。ただしreal-noise全surface・他座標・spawn_costs適用は未確認です。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
+Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **240 passed / 0 failed / 1 ignored** まで戻りました。steepのheightmap、条件式4,037行、合成stone/water列の実`buildSurface` scan 768列を実クラスと照合しました。R1のforest `(-64,32)` 3x3 same-stage比較では、**対象chunkのterrain・surface・carverは0差**、carver可視化の修正後はfeatures 401とstructures 304に分離できました。lapisは28/23→23/23で一致しました。[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)を追加しました。ただしreal-noise全surface・他座標・spawn_costs適用は未確認です。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
-**次の最小slice:** forest `(-64,32)` のlapisのours-only 5セルを、ore placement/origin/random消費の差として切り分ける。diamond/redstoneは単独fixtureで一致済み、geodeは参照regionに0セルで別のplacement問題、monster roomは対象chunkで0差。treeのone-feature overlayはharness失敗なので修正してから比較する。構造物は別契約として扱う。terrain/surface/carverが対象chunkで0差であることは[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)、surface steep/条件式/合成buildSurface scanは[surface contextの証拠](../evidence/foundation/surface-context/README.md)に記録した。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
+**次の最小slice:** forest `(-64,32)` の残るfeatures 401とstructures 304を、geode、tree、残りのfeatureへ分離する。lapisはcarver可視化の修正で一致済み、diamond/redstoneも一致、monster roomは0差、geodeは参照regionに0セルで別のplacement問題。treeのone-feature overlayはharnessを修正してから比較する。構造物は別契約として扱う。terrain/surface/carverが対象chunkで0差であることは[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)、surface steep/条件式/合成buildSurface scanは[surface contextの証拠](../evidence/foundation/surface-context/README.md)に記録した。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
@@ -21,7 +21,7 @@ Horizon / Valence から使える部品は既存 owner に取り込みました�
 ## R1 — 同じ生成stageでworldgenを再受け入れする
 
 1. loader/evaluatorの修正後、元の座標・seedのwhole-chunk、heightmap、ore、kelp、geodeを再比較する。forest `(-64,32)` の3x3ではterrain/surface/carverが対象chunkで0差、features 550・structures 304へ分離済み（[forest R1](../evidence/gameplay/forest-r1/README.md)）。古い一時worldが無ければ`tools/chunk_world_fixture.sh`で固定jarから再構成し、参照chunkの完成と正のcoverageを先に検査する。
-2. forestの残差を密度・aquifer・surface・carver・feature・生成後tickに分ける。対象chunkはすでにterrain/surface/carverが0差で、features/structuresが残る。周辺chunkのdirt/stone/grass 207差は別途列単位で帰属する。surfaceを読めるようにしたことだけで、既存の大きな残差が消えたとは扱わない。
+2. forestの残差を密度・aquifer・surface・carver・feature・生成後tickに分ける。対象chunkはすでにterrain/surface/carverが0差で、carver可視化後もfeatures 401/structures 304が残る。周辺chunkのdirt/stone/grass 207差は別途列単位で帰属する。surfaceを読めるようにしたことだけで、既存の大きな残差が消えたとは扱わない。
 3. biome lookup、隣接chunkの書込み、decorating order、乱数消費を、同じstageの参照と照合する。Xoroshiro `nextInt` の32bit unsignedしきい値とbiome treeのtie順は[実クラスvectorで検証済み](../evidence/foundation/upstream-prs/README.md)であり、同じstageの比較で使う。kelpの列やgeodeのノイズなど、残差を最小の中間値まで戻して検査する。
 4. 未検証featureは到達する正の固定具を用意してから広げる。未実装のfossilにはtemplate/processor、sculk patchにはspreader/runtimeの契約が先に必要。構造物やjigsawまで対応したと一括で主張しない。
 

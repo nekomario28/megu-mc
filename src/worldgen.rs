@@ -2675,6 +2675,13 @@ impl Gen {
     pub(crate) fn biome_name_of_leaf(&self, leaf: u16) -> Option<String> {
         self.biome_names.get(leaf as usize).cloned()
     }
+    /// Feature/carver override already recorded for this cell, without populating.
+    /// Features run after the carver pass and must see those air/fluid writes.
+    pub(crate) fn feature_override(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let k = ((y - self.min_y) as u32) << 8 | (((z & 15) as u32) << 4) | (x & 15) as u32;
+        self.feat_c.get(&(x >> 4, z >> 4))?.get(&k).copied()
+    }
+
     /// feature-layer lookup: populates the 3x3 neighborhood on demand, then
     /// returns the override state for (x,y,z) if a feature wrote one.
     pub(crate) fn feat_state(
@@ -6219,9 +6226,14 @@ mod wg_tests {
         // own noise floor.
         // 2026-10-23: `minecraft:flower` (the same patch config shape as random_patch, a
         // different type name) is implemented, so the flower patches in the pack place.
+        // 2026-10-26: features now read carver writes from the feature layer.
+        // Without that, an ore feature saw uncarved stone and placed lapis into
+        // reference cave air; the isolated lapis fixture moved 28/23 -> 23/23.
+        // The capture moves with the corrected stage order; the remaining forest
+        // residual is still features/structures, not terrain or carvers.
         assert_eq!(
-            digest, "549920689f0e8bc55538ad9aada6bc45",
-            "feature population output changed from the vanilla-order capture"
+            digest, "3c6c22e4d34e20c0a053ec664bbb4f5e",
+            "feature population output changed from the post-carver-visibility capture"
         );
     }
 

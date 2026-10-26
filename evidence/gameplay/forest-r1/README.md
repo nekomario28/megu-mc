@@ -24,7 +24,7 @@ tools/chunk_world_fixture.sh forest-structures -64 32 3 structures
 | --- | ---: | ---: | --- |
 | terrain (no features/carvers/structures) | **207** | **0** | deep 207 |
 | carvers (features off, real carvers) | **207** | **0** | deep 207 |
-| features (real features/carvers, no structures) | **4,588** | **550** | deep 2,663, carver 1,925 |
+| features (real features/carvers, no structures) | **3,550** | **401** | deep 2,058, carver 1,492 |
 | structures (real features/carvers/structures) | **6,908** | **854** | deep 3,111, carver 3,797 |
 
 The target chunk's **terrain, surface and carver outputs are exact**: both
@@ -39,7 +39,8 @@ over terrain and the structure run adds another +2,320.
   `dirt`↔`stone` (77), `stone`↔`grass_block` (67), `grass_block`↔`dirt` (50),
   and `stone`↔`dirt` (13). The target column has none; the next step is to
   isolate those other columns rather than call the target a surface miss.
-- **feature residual in the target**: 550 cells. Top block-state pairs include
+  The initial features run was 4,588/550 before the carver-visibility fix below.
+- **feature residual in the target after the fix**: 401 cells. Top block-state pairs include
   `deepslate` vs `cave_air` (138), `deepslate` vs `cobblestone` (91), `granite`
   vs `air` (84), `deepslate` vs `mossy_cobblestone` (39), `smooth_basalt`/
   `calcite` vs `air`/`deepslate` (geode-shaped), and ore cells
@@ -61,14 +62,31 @@ over terrain and the structure run adds another +2,320.
 - A one-feature reference with only `monster_room`/`monster_room_deep` in forest
   gives **207 region / 0 target**, identical to terrain-only. Monster rooms are
   therefore not the target residual; they are in the same surface-baseline set.
+### Carver visibility fix
+
+`FC::get` now reads feature-layer writes recorded by the carver pass before it
+falls back to terrain. Previously a feature saw uncarved stone and could place
+an ore into cells the reference carver had made air. This was the lapis cause:
+
+| lapis isolation | ours | vanilla | shared | ours-only |
+| --- | ---: | ---: | ---: | ---: |
+| before | 28 | 23 | 23 | **5** |
+| after | **23** | 23 | 23 | **0** |
+
+The clusters also match exactly after the fix. The full no-structure feature
+diff moved from 4,588/550 to **3,550/401** (region/target); terrain and carver
+stages remain 207/0. The `feature_population` regression pin was updated only
+after this native-order explanation; its old hash is not reused as evidence.
+
 - Ore isolation (same seed/region, only one placed ore feature enabled):
   - `ore_lapis`: **ours 28 / vanilla 23**, shared 23, **ours-only 5**,
     vanilla-only 0; cluster sizes differ by one extra 6-cell cluster.
   - `ore_diamond`: **2 / 2**, shared 2, no extras.
   - `ore_redstone`: **3 / 3**, shared 3, no extras.
   - `ore_coal_upper`: 0 / 0; this is not a positive-coverage result.
-  The lapis extra cells are a concrete lead for the target ore residual; diamond
-  and redstone placement match in this region.
+  The lapis extra cells were the lead to the carver-visibility fix above; with
+  that fix, lapis is **23/23** and all clusters match. Diamond and redstone
+  placement also match in this region.
 - Tree isolation is still unresolved: the first one-feature overlay produced
   no port features, so that run is a harness failure, not a negative result.
   The tree step needs a corrected overlay before attribution.
@@ -88,5 +106,8 @@ this run; the script refuses to diff if the reference is incomplete.
 - `--tick` folds the known saved-world water/leaves changes into the diff; a
   per-cell leaf-distance comparison is still pending. Structure cells are
   intentionally excluded from the terrain/feature baseline and shown separately.
-- No fix is claimed here. Lapis placement, geode placement outside the target,
-  the tree harness, and the 207 regional surface cells are separate follow-ups.
+- The carver-visibility fix is included and its source/logs are in this
+  directory (`lapis-before.txt`, `lapis-after.txt`,
+  `features-after-carver-visibility.txt`, `feature-visibility-mutation.txt`).
+  Geode placement outside the target, the tree harness, and the 207 regional
+  surface cells remain separate follow-ups.

@@ -1,0 +1,2 @@
+lapis_ore: ours 28 vanilla 23 shared 23 ours-only 5 vanilla-only 0
+  clusters  ours [6, 5, 5, 2, 2, 2, 2, 1]  vanilla [5, 5, 2, 2, 2, 2, 2, 1]

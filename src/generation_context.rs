@@ -38,6 +38,12 @@ impl<'a> FC<'a> {
         if let Some(&s) = self.rc.get(&(x, y, z)) {
             return s;
         }
+        // Carvers run before features and write into the feature layer. A feature
+        // reading terrain_cell alone would see the uncarved stone and, for example,
+        // place an ore into the reference cave air.
+        if let Some(st) = self.g.feature_override(x, y, z) {
+            return st;
+        }
         let (cx, cz) = (x >> 4, z >> 4);
         if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
             match self.g.cols(cx, cz) {
