@@ -38,5 +38,5 @@
     Checking jni v0.21.1
     Checking ureq v3.4.2
     Checking signal-hook v0.4.4
-    Checking mc-spine v0.0.0 (/home/yuu/Documents/Codex/2026-10-04/mc/outputs/mc-spine/native)
+    Checking mc-spine v0.0.0 (<HOME>/Documents/Codex/2026-10-04/mc/outputs/mc-spine/native)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.88s

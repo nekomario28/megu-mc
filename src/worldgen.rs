@@ -583,9 +583,10 @@ impl Gen {
                 }
             }
         }
-        // serialized overworld biome tree (pumpkin-derived, vanilla-equivalent)
+        // serialized overworld biome tree: the 1.21.1 game's own search tree, read out of the
+        // vanilla server jar by tools/vanilla_data/gen_vanilla_data.sh
         {
-            let tp = std::path::Path::new(&g.base).join("multi_noise_biome_tree.json");
+            let tp = std::path::Path::new(&g.base).join("biome_climate_tree.json");
             if let Ok(b) = std::fs::read(&tp) {
                 if let Some(j) = jparse(&b) {
                     if let Some(ow) = j.get("overworld") {
@@ -3588,6 +3589,97 @@ mod wg_tests {
         let (b, t) = biome_debug(123, 123, 123).unwrap();
         assert_eq!(t, [7489, 3502, -2168, -3511, -21237, -5222, 0]);
         assert_eq!(b, 57); // warm_ocean
+    }
+
+    /// The biome tree is the 1.21.1 game's own, read out of the vanilla server jar by
+    /// tools/vanilla_data/gen_vanilla_data.sh. tests/data/biome_probe_1211.tsv holds points that
+    /// were looked up through that same tree in the game (random points, and grid points that
+    /// land on range edges), with the biome the game returned and a flag for points where two
+    /// different biomes are equally near (there the answer depends on tree order, not on data).
+    /// Searching our copy must give the game's answer for every unambiguous point - this is the
+    /// check that the 133 leaves that used to be from a newer version (dappled_forest,
+    /// pale_garden, sulfur_caves in place of plains / dark_forest) now match vanilla.
+    #[test]
+    fn biome_tree_gives_vanillas_answer_at_every_probe_point() {
+        let _guard = lock_gen();
+        fn stub(_: &str) -> Option<u32> {
+            Some(1)
+        }
+        assert!(init(0, stub));
+        let mut gg = GEN.lock().unwrap();
+        let g = gg.as_mut().unwrap();
+        let tree = g.btree.as_ref().expect("biome_climate_tree.json must load");
+        let probes = std::fs::read_to_string("tests/data/biome_probe_1211.tsv")
+            .expect("probe points must be readable");
+        let mut n = 0usize;
+        let (mut tied, mut tied_same) = (0usize, 0usize);
+        let mut wrong = Vec::new();
+        for line in probes.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 8, "bad probe line {line:?}");
+            let mut t = [0i64; 7];
+            for i in 0..6 {
+                t[i] = f[i].parse().unwrap();
+            }
+            let mut best = (i64::MAX, 0u16);
+            tree.search(&t, &mut best);
+            let got = &g.biome_names[best.1 as usize];
+            if f[7] == "1" {
+                tied += 1;
+                if got == f[6] {
+                    tied_same += 1;
+                }
+            } else {
+                n += 1;
+                if got != f[6] {
+                    wrong.push(format!("{t:?}: game {} ours {got}", f[6]));
+                }
+            }
+        }
+        eprintln!("equidistant points: {tied}, same answer as the game on {tied_same}");
+        assert!(n >= 5000, "the probe set must be large, got {n}");
+        assert!(
+            wrong.is_empty(),
+            "{} of {n} points differ from vanilla, first: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(5)]
+        );
+    }
+
+    /// Every leaf is a 1.21.1 biome, and the leaf count is the data generator's 7,593 entries.
+    #[test]
+    fn biome_tree_leaves_are_1_21_1_biomes_only() {
+        let raw = std::fs::read("datapacks/vanilla/biome_climate_tree.json").unwrap();
+        let j = jparse(&raw).unwrap();
+        fn walk(n: &J, out: &mut Vec<String>) {
+            match n.get("_type").map(J::str) {
+                Some("leaf") => out.push(n.get("biome").unwrap().str().to_string()),
+                _ => {
+                    for c in n.get("subTree").and_then(J::into_arr).unwrap() {
+                        walk(c, out);
+                    }
+                }
+            }
+        }
+        let mut leaves = Vec::new();
+        walk(j.get("overworld").unwrap(), &mut leaves);
+        assert_eq!(leaves.len(), 7593);
+        let mut nether = Vec::new();
+        walk(j.get("nether").unwrap(), &mut nether);
+        assert_eq!(nether.len(), 5);
+        let set: std::collections::BTreeSet<&str> = leaves.iter().map(|s| s.as_str()).collect();
+        for newer in [
+            "minecraft:pale_garden",
+            "minecraft:dappled_forest",
+            "minecraft:sulfur_caves",
+        ] {
+            assert!(!set.contains(newer), "{newer} does not exist in 1.21.1");
+        }
+        assert_eq!(
+            set.len(),
+            53,
+            "the 1.21.1 climate tree places 53 distinct overworld biomes"
+        );
     }
 
     #[test]

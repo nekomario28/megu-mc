@@ -1,7 +1,9 @@
 // block_registry.rs — block-state ids, properties, tags and the per-state
-// values (hardness, drops, light, behaviour) read from assets/blocks_1211.json
-// and assets/pblocks.json. Terrain and feature generation read it; it knows
-// nothing about terrain, placement or features.
+// values (hardness, drops, light, behaviour). Block-level data comes from
+// assets/blocks_1211.json (minecraft-data, MIT - see THIRD_PARTY.md); the per-state light,
+// flag and face facts come from assets/block_states_1211.json, which
+// tools/vanilla_data/gen_vanilla_data.sh reads out of the vanilla 1.21.1 server jar.
+// Terrain and feature generation read it; it knows nothing about terrain, placement or features.
 
 use crate::json::{jarr, jnum, jparse, js, jstr, J};
 use std::collections::{HashMap, HashSet};
@@ -37,70 +39,6 @@ struct Prop {
     vals: Vec<String>,
 }
 
-fn metadata_properties(block: &J, definitions: &HashMap<i64, &J>) -> Option<Vec<Prop>> {
-    jarr(block, "properties")?
-        .iter()
-        .map(|key| {
-            let definition = definitions.get(&(key.num() as i64))?;
-            let vals = match jstr(definition, "type")?.as_str() {
-                "boolean" => vec!["true".into(), "false".into()],
-                "enum" => jarr(definition, "values")?
-                    .iter()
-                    .map(|v| v.str().to_string())
-                    .collect(),
-                "int" => (jnum(definition, "min")? as i32..=jnum(definition, "max")? as i32)
-                    .map(|v| v.to_string())
-                    .collect(),
-                _ => return None,
-            };
-            Some(Prop {
-                name: jstr(definition, "serialized_name")?,
-                vals,
-            })
-        })
-        .collect()
-}
-
-/// State arrays are mixed-radix products, but each asset may order or extend the
-/// property values differently. Translate names and values, never numeric state ids.
-fn metadata_offset(wire: &[Prop], offset: usize, metadata: &[Prop]) -> Option<usize> {
-    if wire.len() != metadata.len() {
-        return None;
-    }
-    let mut out = 0usize;
-    for prop in metadata {
-        let index = wire.iter().position(|p| p.name == prop.name)?;
-        let stride: usize = wire[index + 1..].iter().map(|p| p.vals.len()).product();
-        if stride == 0 || wire[index].vals.is_empty() {
-            return None;
-        }
-        let value = &wire[index].vals[(offset / stride) % wire[index].vals.len()];
-        let digit = prop.vals.iter().position(|v| v == value)?;
-        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;
-    }
-    Some(out)
-}
-
-#[cfg(test)]
-mod state_mapping_tests {
-    use super::*;
-    #[test]
-    fn property_names_and_values_determine_metadata_position() {
-        let prop = |name: &str, vals: &[&str]| Prop {
-            name: name.into(),
-            vals: vals.iter().map(|v| v.to_string()).collect(),
-        };
-        let wire = [prop("axis", &["x", "y"]), prop("wet", &["true", "false"])];
-        let metadata = [
-            prop("wet", &["false", "true"]),
-            prop("axis", &["z", "y", "x"]),
-        ];
-        for (offset, expected) in [5, 2, 4, 1].into_iter().enumerate() {
-            assert_eq!(metadata_offset(&wire, offset, &metadata), Some(expected));
-        }
-    }
-}
-
 /// What a block does when a random tick lands on it. Zero is the common case and the
 /// registry stores it for every block, so the dispatch is a compare against zero.
 pub(crate) const B_NONE: u8 = 0;
@@ -116,13 +54,13 @@ pub(crate) struct BReg {
     st_lo: Vec<u32>,
     n_states: Vec<u32>,
     st_blk: Vec<u32>,      // state id -> block idx
-    st_fl: Vec<u16>,       // pumpkin state_flags
-    st_side: Vec<u8>,      // pumpkin side_flags
+    st_fl: Vec<u16>,       // state id -> FL_* bits (assets/block_states_1211.json `flags`)
+    st_side: Vec<u8>,      // state id -> bit d set when face d is fully solid (`full_sides`)
     hardness: Vec<f32>,    // state id -> vanilla destroy time (-1 unbreakable)
     htools: Vec<Vec<i64>>, // block idx -> tool item ids that can harvest it (empty = any)
     tool_kind: Vec<i8>,    // block idx -> tool kind mined at full speed (-1 = none)
-    /// Target-version states that could not obtain complete metadata by property value.
-    /// The registry gate requires this to be empty, not merely the block names to match.
+    /// States of blocks that assets/block_states_1211.json does not cover under the same name and
+    /// state range as the block table. The registry gate requires this to be empty.
     pub(crate) unpaired: Vec<String>,
     drops: Vec<i64>, // state id -> item dropped with no enchantment (-1 = nothing)
     /// A few blocks drop twice: the potted plants drop the pot and the plant. Kept beside
@@ -135,37 +73,57 @@ pub(crate) struct BReg {
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
 }
 
+// Bit meanings are fixed by `flag_bits` in assets/block_states_1211.json; load() checks them.
 const FL_AIR: u16 = 1;
-const FL_REPLACEABLE: u16 = 1 << 4;
-const FL_LIQUID: u16 = 1 << 5;
-const FL_SOLID: u16 = 1 << 6;
+const FL_REPLACEABLE: u16 = 1 << 1;
+/// BlockState.isLiquid(): water, lava, bubble column. Not read yet; kept so the file's bits are all named.
+#[allow(dead_code)]
+const FL_LIQUID: u16 = 1 << 2;
+const FL_SOLID: u16 = 1 << 3;
+/// The state holds a non-empty fluid: water, lava, waterlogging, kelp, seagrass.
+const FL_FLUID: u16 = 1 << 4;
 
 impl BReg {
     fn load() -> Option<BReg> {
         let md = jparse(&std::fs::read("assets/blocks_1211.json").ok()?)?
             .into_arr()?
             .clone();
-        let pb = jparse(&std::fs::read("assets/pblocks.json").ok()?)?;
-        let pb_blocks = pb.get("blocks")?.into_arr()?;
-        let property_data = jparse(&std::fs::read("assets/properties.json").ok()?)?;
-        let mut property_definitions = HashMap::new();
-        for definition in property_data.into_arr()? {
-            property_definitions.insert(jnum(definition, "hash_key")? as i64, definition);
-        }
-        let mut pb_by_name: HashMap<String, &J> = HashMap::new();
-        for b in pb_blocks {
-            pb_by_name.insert(format!("minecraft:{}", jstr(b, "name")?), b);
-        }
-        // The two assets are different Minecraft versions, so a block renamed between them has no
-        // entry under the 1.21.1 name and silently loses every per-state value - solidity, opacity,
-        // luminance, shapes. 1.21.1's chain became iron_chain when chains gained material variants.
-        // This table is the only place that mapping lives, and `unpaired` below makes a new one
-        // visible instead of quiet.
-        const PB_ALIAS: [(&str, &str); 1] = [("minecraft:chain", "minecraft:iron_chain")];
-        for (old, new) in PB_ALIAS {
-            if let Some(b) = pb_by_name.get(new).copied() {
-                pb_by_name.insert(old.to_string(), b);
+        let facts = jparse(&std::fs::read("assets/block_states_1211.json").ok()?)?;
+        let bits = facts.get("flag_bits")?;
+        for (name, bit) in [
+            ("air", FL_AIR),
+            ("replaceable", FL_REPLACEABLE),
+            ("liquid", FL_LIQUID),
+            ("solid", FL_SOLID),
+            ("fluid", FL_FLUID),
+        ] {
+            if jnum(bits, name)? as u16 != bit {
+                return None;
             }
+        }
+        let nums = |key: &str| -> Option<Vec<u32>> {
+            Some(jarr(&facts, key)?.iter().map(|v| v.num() as u32).collect())
+        };
+        let (f_lum, f_opa, f_fl, f_sides) = (
+            nums("luminance")?,
+            nums("light_block")?,
+            nums("flags")?,
+            nums("full_sides")?,
+        );
+        if [f_opa.len(), f_fl.len(), f_sides.len()]
+            .iter()
+            .any(|&n| n != f_lum.len())
+        {
+            return None;
+        }
+        // name -> (first state id, state count) as the facts file numbers them
+        let mut f_blocks: HashMap<String, (u32, u32)> = HashMap::new();
+        for b in jarr(&facts, "blocks")? {
+            let a = b.into_arr()?;
+            f_blocks.insert(
+                a.first()?.str().to_string(),
+                (a.get(1)?.num() as u32, a.get(2)?.num() as u32),
+            );
         }
         let n_states_max = md
             .iter()
@@ -219,9 +177,10 @@ impl BReg {
                 }
             }
             reg.props.push(props.into_boxed_slice());
-            let pbr = pb_by_name.get(&name);
-            let metadata_props =
-                pbr.and_then(|block| metadata_properties(block, &property_definitions));
+            // The facts file is indexed by state id. It is only trusted for a block whose name,
+            // first state and state count are the ones the block table has.
+            let facts_agree =
+                f_blocks.get(&name) == Some(&(lo, hi - lo + 1)) && (hi as usize) < f_lum.len();
             // Destroy time is a property of the block, so it is read here once and
             // held per state rather than re-derived by a hand table. A hand table
             // covered 356 of the 26684 states, which meant mining time was wrong for
@@ -314,26 +273,13 @@ impl BReg {
                 reg.drops[st] = drop0;
                 reg.drops_second[st] = drop1;
                 reg.stack_size[st] = stack_size;
-                let values = metadata_props
-                    .as_deref()
-                    .and_then(|props| metadata_offset(&reg.props[bi as usize], i, props))
-                    .and_then(|index| pbr.and_then(|block| jarr(block, "states")?.get(index)))
-                    .and_then(|state| {
-                        Some((
-                            jnum(state, "state_flags")? as u16,
-                            jnum(state, "side_flags")? as u8,
-                            jnum(state, "luminance")? as u8,
-                            jnum(state, "opacity")? as u8,
-                        ))
-                    });
-                match values {
-                    Some((flags, sides, light, opacity)) => {
-                        reg.st_fl[st] = flags;
-                        reg.st_side[st] = sides;
-                        reg.luminance[st] = light;
-                        reg.opacity[st] = opacity;
-                    }
-                    None => reg.unpaired.push(format!("{name} state {st}")),
+                if facts_agree {
+                    reg.st_fl[st] = f_fl[st] as u16;
+                    reg.st_side[st] = f_sides[st] as u8;
+                    reg.luminance[st] = f_lum[st] as u8;
+                    reg.opacity[st] = f_opa[st] as u8;
+                } else {
+                    reg.unpaired.push(format!("{name} state {st}"));
                 }
             }
         }
@@ -527,10 +473,13 @@ impl BReg {
             .map(|f| f & FL_SOLID != 0)
             .unwrap_or(false)
     }
+    /// True when the state holds a fluid (FL_FLUID): water, lava, waterlogged blocks, kelp,
+    /// seagrass. This is wider than vanilla's `BlockState.isLiquid()` (FL_LIQUID), which is
+    /// only water, lava and bubble columns; the callers were written against the wider set.
     pub(crate) fn is_liquid(&self, st: u32) -> bool {
         self.st_fl
             .get(st as usize)
-            .map(|f| f & FL_LIQUID != 0)
+            .map(|f| f & FL_FLUID != 0)
             .unwrap_or(false)
     }
     pub(crate) fn is_replaceable(&self, st: u32) -> bool {

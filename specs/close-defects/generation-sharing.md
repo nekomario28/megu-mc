@@ -50,10 +50,10 @@ probeはseed 0、負/正座標・隣接領域への移動・再照会を含む�
 これは既存結果の保存対照であり、vanilla oracleではない。
 
 - 基準commit: `9c43051ffa203824ee53085abbdcc48b321d2139`
-- 所有worktree: `/home/yuu/.cache/mc-spine-audit/H-owner-baseline`
+- 所有worktree: `<HOME>/.cache/mc-spine-audit/H-owner-baseline`
 - probeの正本: [generation_capture.rs](../../evidence/foundation/module-layers/generation_capture.rs)
 - probe SHA-256: `2ffc81799773ac2dc70c322d7837f1ada476913dd4ec574168d6c95f9e2fed38`
-- 正準バイト列: `/home/yuu/.cache/mc-spine-audit/H-owner-baseline-1.bin`
+- 正準バイト列: `<HOME>/.cache/mc-spine-audit/H-owner-baseline-1.bin`
 - バイト列SHA-256: `0ab88652a45f7d0917c21c8d09f6b610c856f7315c954a9eb81fcde689e3277c`
 
 worktreeのworldgenへ足したのはtest限定のprobe importだけで、製品コードは基準commitのまま。

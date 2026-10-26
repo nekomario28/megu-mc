@@ -360,9 +360,9 @@ check "breaking a chest drops the slots it owned" \
   '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z + 1000)) {' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
-check "a renamed block is still paired between the two assets" \
-  src/block_registry.rs '("minecraft:chain", "minecraft:iron_chain")' \
-  '("minecraft:chain", "minecraft:not_a_block")' \
+check "a block whose state range disagrees with the generated facts is not paired" \
+  src/block_registry.rs 'f_blocks.get(&name) == Some(&(lo, hi - lo + 1))' \
+  'f_blocks.get(&name) == Some(&(lo + 1, hi - lo + 1))' \
   every_wire_state_has_complete_metadata
 
 check "the client's view distance is read from its packet" \
@@ -388,14 +388,14 @@ check "broken sign text cannot survive its block" \
   '        signs().lock().unwrap().retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 check "solid metadata must reach every note block state" \
-  src/block_registry.rs '                        reg.st_fl[st] = flags;' \
-  '                        reg.st_fl[st] = 0;' \
+  src/block_registry.rs '                    reg.st_fl[st] = f_fl[st] as u16;' \
+  '                    reg.st_fl[st] = 0;' \
   note_block_keeps_solid_and_light_values_for_every_instrument
 
 check "property remapping cannot reuse positional state offsets" \
-  src/block_registry.rs '        out = out.checked_mul(prop.vals.len())?.checked_add(digit)?;' \
-  '        out = offset;' \
-  property_names_and_values_determine_metadata_position
+  src/block_registry.rs '                let o = off as i64 + (nd as i64 - digit as i64) * mult as i64;' \
+  '                let o = off as i64 + nd as i64 * mult as i64;' \
+  setting_a_property_lower_than_its_current_value_stays_inside_the_block
 
 check "a predicate reads solidity, not replaceability" \
   src/generation_providers.rs '        Pr::Solid => reg.is_solid(ctx.get(x, y, z)),' \
