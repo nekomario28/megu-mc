@@ -21,7 +21,7 @@ Fixture after the fix:
 - tree-on inner 3x3: 72 -> 51
 - target chunk: 0
 - no-feature: 0
-- remaining 51 are all leaf state/distance cells (no canopy/log cells)
+- remaining 51 under --tick are leaf distance tick artifacts; without --tick the inner 3x3 is 0
 
 Suite: 246 passed / 0 failed / 1 ignored.
 Mutation: centre-layer predicate 1 proved.

@@ -1,9 +1,14 @@
-# Remaining tree-on residual after the centre-limb fix
+# The 51 remaining cells are saved-world leaf ticks, not worldgen
 
-5x5 same-stage, seed 0, inner 3x3 (-64,32); no-feature diff is 0.
+5x5 same-stage, seed 0, inner 3x3 (-64,32), after the fancy centre-limb fix.
 
-51 differing cells, all `deep`: oak/birch leaf state/distance. Example:
-  (-1004,65,517): port distance 5, reference distance 2
-  (-1007,66,520): port distance 5, reference distance 1
-The same cell shapes and logs are present; only the `distance` property differs.
-This is the leaf-distance update layer, not branch placement.
+With `--tick` (include runtime rewrites): 51 differing cells, all leaf
+`distance` values; example `(-1004,65,517)` port 5 / reference 2.
+
+Without `--tick` (exclude leaf distance rewritten by LeavesBlock's scheduled
+tick): **0 differing cells**, and the tool reports the 51 as excluded tick
+artifacts (`diff-after-centre-no-tick.txt`).
+
+So the tree/terrain/feature worldgen residual in the inner 3x3 is closed. The
+51 are the same class as the 223 excluded earlier, not a placement or BFS
+difference.

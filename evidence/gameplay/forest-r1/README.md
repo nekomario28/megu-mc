@@ -174,8 +174,10 @@ blocks of the actual pre-surface top. That reduces the no-feature residual
 The A/B trace then found the fancy centre limb bug: at `n = j/2` vanilla
 returns `h2 * 0.5`, while the port returned `h2`, doubling that limb and moving
 its candidate by a cell (`centre-layer.txt`). Fixing it reduces the tree-on
-residual **72 -> 51** and leaves only leaf state/distance cells
-(`remaining-51.txt`, `diff-after-centre.txt`). The target chunk stays 0.
+residual **72 -> 51** under `--tick`; those 51 are all leaf `distance` values
+rewritten by the saved world's LeavesBlock tick. Without `--tick` the inner 3x3
+is **0**, with the 51 reported as excluded tick artifacts
+(`remaining-51.txt`, `diff-after-centre-no-tick.txt`). The target chunk stays 0.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path

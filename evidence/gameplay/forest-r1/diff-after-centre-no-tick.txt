@@ -1,0 +1,4 @@
+chunks 3x3  band y=-64..319  differing cells: 0
+per chunk: 0 0 0 0 0 0 0 0 0
+layers: {}
+excluded as tick artifacts (leaf distance rewritten by LeavesBlock's tick): 51
