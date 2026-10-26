@@ -3426,26 +3426,27 @@ impl BT {
         }
         d
     }
+    /// `SearchTree.TreeNode.getResultingNode`. `best` is the incumbent (distance, leaf): the
+    /// previous result when the caller has one, else `(i64::MAX, _)`. A branch scans its
+    /// children **in array order**, descends into a child only when the child's box is
+    /// strictly nearer than the incumbent (`if (l > m)`), and a leaf replaces the incumbent
+    /// only when strictly nearer (`if (l > n)`). So among equally near leaves the incumbent
+    /// wins, then the one reached first in array order - which is why the order must not be
+    /// changed (sorting the children by distance reaches a different leaf on ties, and also
+    /// prunes differently).
     fn search(&self, t: &[i64; 7], best: &mut (i64, u16)) {
-        let d = self.dist(t);
-        if d > best.0 {
-            return;
-        }
         match self {
             BT::Leaf(_, id) => {
+                let d = self.dist(t);
                 if d < best.0 {
                     *best = (d, *id);
                 }
             }
             BT::Sub(_, ch) => {
-                // vanilla visits children in ascending distance order
-                let mut ordd: Vec<(i64, &BT)> = ch.iter().map(|c| (c.dist(t), c)).collect();
-                ordd.sort_by_key(|&(dd, _)| dd);
-                for (cd, c) in ordd {
-                    if cd > best.0 {
-                        break;
+                for c in ch {
+                    if best.0 > c.dist(t) {
+                        c.search(t, best);
                     }
-                    c.search(t, best);
                 }
             }
         }
@@ -3853,6 +3854,64 @@ mod wg_tests {
         }
         eprintln!("equidistant points: {tied}, same answer as the game on {tied_same}");
         assert!(n >= 5000, "the probe set must be large, got {n}");
+        assert!(
+            wrong.is_empty(),
+            "{} of {n} points differ from vanilla, first: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(5)]
+        );
+    }
+
+    /// The same lookup as the game's, on the tie-heavy probe set `tests/data/biome_probe_ties_1211.tsv`
+    /// (points on leaf range edges, nearly all with two different biomes at the same minimum
+    /// distance), and on the ambiguous points of the first probe set. When two leaves are
+    /// equally near, the game returns whichever it reaches first: `SearchTree.TreeBranchNode.
+    /// getResultingNode` scans a branch's children **in array order** and replaces its best only
+    /// on a strictly smaller distance (`if (l > m)` / `if (l > n)`), and it starts with no
+    /// previous result for these lookups (the extractor clears the thread-local). Every point
+    /// must therefore match exactly, ties included.
+    #[test]
+    fn biome_tree_breaks_ties_the_way_vanilla_scans_children() {
+        crate::test_support::require_vanilla_data();
+        let _guard = lock_gen();
+        fn stub(_: &str) -> Option<u32> {
+            Some(1)
+        }
+        assert!(init(0, stub));
+        let mut gg = GEN.lock().unwrap();
+        let g = gg.as_mut().unwrap();
+        let tree = g.btree.as_ref().expect("biome_climate_tree.json must load");
+        let (mut n, mut tied, mut wrong) = (0usize, 0usize, Vec::new());
+        for file in [
+            "tests/data/biome_probe_ties_1211.tsv",
+            "tests/data/biome_probe_1211.tsv",
+        ] {
+            let probes = std::fs::read_to_string(file).expect("probe points must be readable");
+            for line in probes.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                assert_eq!(f.len(), 8, "bad probe line {line:?}");
+                if !file.contains("ties") && f[7] != "1" {
+                    continue; // unambiguous points are covered by the test above
+                }
+                let mut t = [0i64; 7];
+                for i in 0..6 {
+                    t[i] = f[i].parse().unwrap();
+                }
+                let mut best = (i64::MAX, 0u16);
+                tree.search(&t, &mut best);
+                let got = &g.biome_names[best.1 as usize];
+                n += 1;
+                tied += (f[7] == "1") as usize;
+                if got != f[6] {
+                    wrong.push(format!("{t:?}: game {} ours {got}", f[6]));
+                }
+            }
+        }
+        eprintln!(
+            "tie-break points: {n} ({tied} with different biomes equally near), differing: {}",
+            wrong.len()
+        );
+        assert!(tied >= 2000, "the tie set must be large, got {tied}");
         assert!(
             wrong.is_empty(),
             "{} of {n} points differ from vanilla, first: {:?}",

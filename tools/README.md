@@ -15,7 +15,7 @@
 | `ore_fixture.sh <tag> <keep> [n]` | `ore_*`/`disk_*` のうち `<keep>` 以外の placement を `count: 0` にした world を作る（1 feature 隔離） |
 | `vanilla_nofeat_pack.py <jar> <world> [--keep-carvers]` | biome の features と carvers を空にした pack を書く（地形だけの比較用） |
 | `vanilla_region_blocks.py` | region ファイルから chunk を取り出す共通層 |
-| `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings] [--accept-eula]` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/**` (worldgen と tags/block)・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv`、`--accept-eula` 付きで `config_packets.bin` (`capture_config_packets.py` 経由) を生成する (全て `.gitignore`、新しい clone は `cargo test` の前に1回実行)。jar の sha1 と Fabric mapping の sha256 を固定し、公式 data generator の出力と突き合わせてから書く。Java 21 が必要。出力は決定的 |
+| `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings] [--accept-eula]` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/**` (worldgen と tags/block)・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv`・`biome_probe_ties_1211.tsv`（range 端の同距離 tie 点。子の走査順を固定）・`random_next_int_1211.tsv`（乱数クラスの `nextInt(bound)` 列のハッシュ、数値のみ）、`--accept-eula` 付きで `config_packets.bin` (`capture_config_packets.py` 経由) を生成する (全て `.gitignore`、新しい clone は `cargo test` の前に1回実行)。jar の sha1 と Fabric mapping の sha256 を固定し、公式 data generator の出力と突き合わせてから書く。Java 21 が必要。出力は決定的 |
 
 ## 比較（両側を同じ土俵で読む）
 

@@ -31,6 +31,8 @@ logs/
 /assets/block_states_1211.json
 /tests/data/biome_probe_1211.tsv
 /tests/data/vanilla_vectors_1211.tsv
+/tests/data/biome_probe_ties_1211.tsv
+/tests/data/random_next_int_1211.tsv
 /config_packets.bin
 # an optional server resource pack you supply yourself
 /resourcepack.zip
