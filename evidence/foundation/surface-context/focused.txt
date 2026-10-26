@@ -1,0 +1,7 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::surface_steep_reads_the_world_surface_heightmap ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.11s
