@@ -89,8 +89,8 @@ A' として残る作業: (1) 上の「再配布しない」を CONTRIBUTING / N
 
 ## 5. 確定・公開の前に解消が必要な項目 / Blockers
 **Apache-2.0 / MIT は、次が解消するまで確定・公開しないでください。**
-1. **Pumpkin (GPL-3.0) とのコード一致の残り**: THIRD_PARTY.md §8 の未書き直し 6 件 (forking / fancy 幹など)。
-2. **テスト値表** `AQ_NB`、`biome_vectors` ほか、Pumpkin のテストと数値が一致するもの。
+1. **Pumpkin (GPL-3.0) とのコード一致**: #25 (THIRD_PARTY.md §10) で残りの一致箇所を書き直し済み。再検査 (`tools/provenance_scan.py`) と、書き直しの独立確認が残る。
+2. **テスト値表**: #25 で `AQ_NB` ほかの表を削除し、vanilla から生成する `vanilla_vectors_1211.tsv` に置き換え済み (THIRD_PARTY.md §10)。他に Pumpkin と一致する数値表が残っていないかの確認が残る。
 3. **履歴**: 旧 Pumpkin 同一データ 3 ファイル、Pumpkin 一致コード、javap・マッピング、旧 `datapacks/vanilla/data/**` が git 履歴に残っている。公開するなら履歴を引き継がない新規リポジトリ (案 C) か、履歴の書き換え (別途承認が必要)。過去に public だった形跡 (issue #11) あり。
 4. 出所不明: `datapacks/{modtest,rectest,spinetest,tagtest,testpack}`、`*.storyboard.png`、`evidence/foundation/audit-snapshots`。
 5. `assets/blocks_1211.json` (MIT の表示のみ、wiki 由来の注記)。取得スクリプト化が望ましい。

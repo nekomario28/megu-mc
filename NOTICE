@@ -24,7 +24,8 @@ Derived from Minecraft, (c) Mojang Studios / Microsoft. This repository does not
 Mojang data. tools/vanilla_data/gen_vanilla_data.sh generates, from the user's own
 Minecraft 1.21.1 server jar (sha1 59353fb40c36d304f2035d51e7d6e6baa98dc05c), the files
 datapacks/vanilla/** (worldgen JSON and block tags), assets/block_states_1211.json,
-tests/data/biome_probe_1211.tsv and (with --accept-eula) config_packets.bin. They are
+tests/data/biome_probe_1211.tsv, tests/data/vanilla_vectors_1211.tsv (the game's answers to random test
+questions) and (with --accept-eula) config_packets.bin. They are
 git-ignored, are not covered by mc-spine's Apache-2.0 license, and must not be redistributed.
 The jar is not distributed here.
 

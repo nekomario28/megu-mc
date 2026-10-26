@@ -13,7 +13,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 - `--fetch-fabric-mappings`: 難読名の解決に使う Fabric の intermediary / Yarn マッピング (CC0, sha256 固定) の2ファイルだけをダウンロードします。手元にある場合は `--mappings DIR` を使います。それ以外は jar だけで動き、ネットワークは使いません。
 - `--accept-eula`: `config_packets.bin` を作るため、jar から実サーバーを一時ディレクトリで1回起動します（オフライン・ループバックのみ）。Minecraft の EULA (https://aka.ms/MinecraftEULA) への同意が必要で、このフラグが同意の意思表示になります。付けなくても他のデータは生成されますが、クライアントは registry を受け取れません。
 
-生成物（すべて `.gitignore` 済みでコミットされません）: `datapacks/vanilla/`、`assets/block_states_1211.json`、`tests/data/biome_probe_1211.tsv`、`config_packets.bin`。`resourcepack.zip` は任意で、自分のリソースパックを置いたときだけ配信されます（置かなければ配信しません）。
+生成物（すべて `.gitignore` 済みでコミットされません）: `datapacks/vanilla/`、`assets/block_states_1211.json`、`tests/data/biome_probe_1211.tsv`、`tests/data/vanilla_vectors_1211.tsv`、`tests/data/biome_probe_ties_1211.tsv`、`tests/data/random_next_int_1211.tsv`、`config_packets.bin`。`resourcepack.zip` は任意で、自分のリソースパックを置いたときだけ配信されます（置かなければ配信しません）。
 
 ## 試す
 
@@ -51,7 +51,7 @@ Cargoのpackage version `0.0.0` は復元時の値です。`AUDIT_WIRE.md` と `
 
 ## ライセンスと第三者データ
 
-コードは Apache-2.0（[LICENSE](LICENSE)、[NOTICE](NOTICE)）です。ただし**この選択は提案段階で、公開前の確認事項が残っています**（[LICENSING.md](LICENSING.md)：Pumpkin(GPL-3.0)との一致の残り、テスト値表、履歴に残る旧データなど。解消できない場合は GPL になる可能性があります）。貢献の条件は [CONTRIBUTING.md](CONTRIBUTING.md)。NeoForge / Fabric Loader / Mixin / Mojang のデータは**同梱も再配布もせず**、利用者の環境で取得・生成します（それぞれ元のライセンスのままで、mc-spine の Apache-2.0 の対象外）。Mojang由来のデータ（`datapacks/vanilla/`、`assets/block_states_1211.json`、`config_packets.bin`）はリポジトリに含めず、利用者が手元の jar から生成します（上記セットアップ）。生成物は Apache-2.0 の対象外です。詳細は[復元と検証の記録](RESTORATION.md)と[第三者データの注意](SECURITY_NOTES.md)を参照してください。Pumpkin (GPL-3.0, commit `b0c48b2`) のソースとの12トークン一致を調べる検査を行い、一致していた範囲のうち書き直せるものは vanilla の仕様・挙動から書き直しました。書き直していない範囲 (6件)、一致するテスト値は残っています。Pumpkin とバイト一致していたデータファイルは削除し jar からの生成に置き換えました (§9)。ただし git 履歴には旧ファイルが残っています（[THIRD_PARTY.md](THIRD_PARTY.md) §8）。これは調査結果の事実の記述であり、ライセンス上の判断ではありません。
+コードは Apache-2.0（[LICENSE](LICENSE)、[NOTICE](NOTICE)）です。ただし**この選択は提案段階で、公開前の確認事項が残っています**（[LICENSING.md](LICENSING.md)：Pumpkin(GPL-3.0)との一致の残り、テスト値表、履歴に残る旧データなど。解消できない場合は GPL になる可能性があります）。貢献の条件は [CONTRIBUTING.md](CONTRIBUTING.md)。NeoForge / Fabric Loader / Mixin / Mojang のデータは**同梱も再配布もせず**、利用者の環境で取得・生成します（それぞれ元のライセンスのままで、mc-spine の Apache-2.0 の対象外）。Mojang由来のデータ（`datapacks/vanilla/`、`assets/block_states_1211.json`、`config_packets.bin`）はリポジトリに含めず、利用者が手元の jar から生成します（上記セットアップ）。生成物は Apache-2.0 の対象外です。詳細は[復元と検証の記録](RESTORATION.md)と[第三者データの注意](SECURITY_NOTES.md)を参照してください。Pumpkin (GPL-3.0, commit `b0c48b2`) のソースとの12トークン一致を調べる検査を行い、一致していた範囲は vanilla の仕様・挙動から書き直し、識別子も改名しました。Pumpkin のテストと数値が一致していたテスト値は、手元の jar から生成した照合値に置き換えました。Pumpkin とバイト一致していたデータファイルは削除し jar からの生成に置き換えました (§9, §10)。`tick_queue.rs` は Pumpkin の設計だけを参考にしています。ただし git 履歴には旧ファイルと旧コードが残っています（[THIRD_PARTY.md](THIRD_PARTY.md) §8, §10）。これは調査結果の事実の記述であり、ライセンス上の判断ではありません。
 
 各ファイルの出所の一覧と、オーナー確認待ちの項目(Rust 依存のライセンス、履歴に残る旧データ、`assets/blocks_1211.json` の出所など。javap・マッピング抜粋・出所不明データは削除済み)は [THIRD_PARTY.md](THIRD_PARTY.md) にまとめています。事実の一覧であり、法的な判断ではありません。
 
