@@ -638,6 +638,7 @@ mod tag_tests {
     /// vanilla's, 121 cells missing, while its stone-variant sets were supersets).
     #[test]
     fn base_stone_overworld_excludes_gravel_and_dirt() {
+        crate::test_support::require_vanilla_data();
         let reg = super::breg().expect("registry");
         for name in [
             "stone",
