@@ -1,0 +1,5 @@
+command: cargo test --release -- --test-threads=1
+tests: 248 total
+result: 247 passed; 0 failed; 1 ignored
+unit: mc-carve-neighbors-full3 (MemoryMax=2G, CPUQuota=200%, CARGO_BUILD_JOBS=1)
+wall: 40s

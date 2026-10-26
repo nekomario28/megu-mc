@@ -1,0 +1,20 @@
+# Carve the decoration area before features
+
+Vanilla status order is CARVERS -> FEATURES for the chunks being decorated.
+`populate` ran the centre carver and then features; the lazy 3x3 populate
+reached chunk z+1 after the centre, so a feature reading a neighbour wall saw
+terrain deepslate instead of carver air.
+
+A `begin_carve` claim makes each chunk's carver pass run once. `populate` now
+claims/carves the 3x3 around the centre before running the centre's features.
+
+Measured on the full-feature reference (`forestfix-normal-nostruct`, structures
+off):
+
+- full features before: 2,190 region / 382 target
+- after neighbour pre-carve: **1,789 / 114**
+- dungeon at (-1013,-13,526): the qualifying hole is (-1009,-13/-12,530) in
+  chunk (-64,33); the dungeon now places (chest/spawner present, no cobble
+  residual)
+- tree one-feature inner 3x3: still 0 without `--tick` (51 leaf tick artifacts)
+- target residual now: 60 leaf-distance, 20 lava, ~30 ore, 1 chest, 1 grass

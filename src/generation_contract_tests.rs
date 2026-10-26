@@ -10,6 +10,14 @@ fn context(g: &mut Gen) -> FC<'_> {
     FC::new(g)
 }
 
+#[test]
+fn a_chunk_claims_its_carver_pass_once() {
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    assert!(g.begin_carve(1, 2), "the first pass is claimed");
+    assert!(!g.begin_carve(1, 2), "the second pass is a no-op");
+    assert!(g.begin_carve(1, 3), "a different chunk has its own claim");
+}
+
 /// A feature runs after the carver pass and must read the carver's air/fluid
 /// writes, not the uncarved terrain. This is the lapis-in-a-cave regression.
 #[test]

@@ -221,6 +221,15 @@ check "a non-fluid aquifer state above nonpositive density stays solid" \
 }' \
   worldgen::wg_tests::a_nonpositive_density_with_an_aquifer_barrier_is_still_solid
 
+check "a chunk claims its carver pass once" \
+  src/worldgen.rs '    pub(crate) fn begin_carve(&mut self, cx: i32, cz: i32) -> bool {
+        self.carved.insert((cx, cz))
+    }' \
+  '    pub(crate) fn begin_carve(&mut self, _cx: i32, _cz: i32) -> bool {
+        true
+    }' \
+  feature::generation_contract_tests::a_chunk_claims_its_carver_pass_once
+
 check "the fancy centre layer is half the trunk half-height" \
   src/tree.rs '    if g == 0.0 {
         // Vanilla assigns `h2 = f` for the exact centre layer, then still

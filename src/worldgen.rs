@@ -460,6 +460,7 @@ pub struct Gen {
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pop_done: HashSet<(i32, i32)>,
+    carved: HashSet<(i32, i32)>,
     /// Decoration region whose lexicographic scan order to follow (`MC_SPINE_POP_REGION`).
     pop_region: Option<(i32, i32, i32, i32)>,
     // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
@@ -645,6 +646,7 @@ impl Gen {
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            carved: HashSet::new(),
             pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                 if p.len() == 4 {
@@ -2897,6 +2899,13 @@ impl Gen {
     }
     pub(crate) fn wseed(&self) -> u64 {
         self.world_seed
+    }
+
+    /// Claim the one carver pass for a chunk. Vanilla writes CARVERS before
+    /// FEATURES for every chunk in the decoration area; claiming here lets the
+    /// feature context pre-carve its neighbours without carving them twice.
+    pub(crate) fn begin_carve(&mut self, cx: i32, cz: i32) -> bool {
+        self.carved.insert((cx, cz))
     }
     /// feature overrides for a whole chunk (populate flushes here)
     #[allow(dead_code)]
@@ -6332,8 +6341,13 @@ mod wg_tests {
         // 2026-10-26: the centre fancy limb is `h2 * 0.5` (vanilla assigns h2
         // then returns half); the port returned h2, doubling the centre limb.
         // The 3x3 diff moved 72 -> 51; the remainder is leaf distance.
+        // 2026-10-26: carvers for the 3x3 decoration area are claimed before
+        // features, so a feature can read a neighbour's carver air. This is
+        // vanilla's CARVERS -> FEATURES order; the dungeon that required a
+        // hole in chunk z+1 now places, and the full-feature target moved
+        // 382 -> 114.
         assert_eq!(
-            digest, "9e5b16759c3ccc2a03d2ff4651fc278b",
+            digest, "95fa4397cc1e760f0a0454b06cb502cb",
             "feature population output changed from the post-carver-visibility capture"
         );
     }

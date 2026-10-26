@@ -26,6 +26,7 @@ tools/chunk_world_fixture.sh forest-structures -64 32 3 structures
 | carvers (features off, real carvers) | **207** | **0** | deep 207 |
 | features (real features/carvers, no structures) | **3,550** | **401** | deep 2,058, carver 1,492 |
 | features after the tree fixes | **2,190** | **382** | deep 1,555, carver 635 |
+| features after neighbour pre-carve | **1,789** | **114** | deep 1,346, carver 443 |
 | structures (real features/carvers/structures) | **6,908** | **854** | deep 3,111, carver 3,797 |
 
 The target chunk's **terrain, surface and carver outputs are exact**: both
@@ -42,12 +43,16 @@ pairs are `deepslate` vs `cave_air` (138), `deepslate` vs `cobblestone` (91),
 cluster is a dungeon (`monster_room`) shape, so the next isolation is that
 feature in this exact region, not another tree pass.
 
-The target's dungeon residual is now attributed to neighbour carver
-visibility: the MonsterRoom call at `(-1013,-13,526)` has `xr=3,zr=3` and
-`holes=0`, while the reference's qualifying hole is at `(-1009,-13,530)` in
-chunk `(-64,33)`. The port's lazy 3x3 populate reaches that chunk after the
-centre, so the feature sees deepslate instead of the carver's air. See
-`monster-room-neighbor.txt`.
+The target's dungeon residual was traced to neighbour carver visibility: the
+MonsterRoom call at `(-1013,-13,526)` had `xr=3,zr=3` and `holes=0`, while the
+reference's qualifying hole is at `(-1009,-13/-12,530)` in chunk `(-64,33)`
+(`monster-room-neighbor.txt`). `populate` now claims/carves the 3x3 decoration
+area before running the centre's features. That places the dungeon and reduces
+the full-feature residual **2,190/382 -> 1,789/114**
+(`neighbor-carve.txt`, `features-after-neighbor-carve.txt`).
+
+The target's remaining 114 cells are 60 leaf-distance, 20 lava, about 30 ore,
+1 chest, and 1 grass cell; they are the next feature layers.
 
 ## What the remaining cells are
 

@@ -4603,6 +4603,9 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
         return;
     }
     let Some(cc) = g.cols(tx, tz) else { return };
+    if !g.begin_carve(tx, tz) {
+        return;
+    }
     let trace = env_flag!("CARVE_TRACE");
     let here = format!("{tx},{tz}");
     let probe_env = env_str!("CARVE_PROBE");
@@ -5197,6 +5200,15 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     // gate, because "no features" is a comparison fixture, not a carver switch
     // (`MC_SPINE_NOCARVE` is).
     apply_carvers(g, sx, sz);
+    // Vanilla carves the whole decoration area before decorating the centre, so
+    // a feature may read a neighbour's carver air. Pre-carve the same 3x3; the
+    // `begin_carve` claim makes the later per-chunk populate a no-op for its
+    // carver stage.
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            apply_carvers(g, sx + dx, sz + dz);
+        }
+    }
     // Diagnostic: MC_SPINE_NOFEAT=1 skips the whole feature layer so a block diff can
     // attribute the remainder to terrain or to features.
     if env_flag!("MC_SPINE_NOFEAT") {
