@@ -1,0 +1,5 @@
+command: cargo test --release -- --test-threads=1
+tests: 245 total
+result: 244 passed; 0 failed; 1 ignored
+unit: mc-tree-matfix6-full (MemoryMax=2G, CPUQuota=200%, CARGO_BUILD_JOBS=1)
+wall: 42s

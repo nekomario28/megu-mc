@@ -1,0 +1,20 @@
+# Surface material window over aquifer solids
+
+The scan could produce a material for a cell whose density is non-positive but
+whose actual pre-surface state is an aquifer/default solid. Applying that
+material unconditionally fixed the 80-cell visual diff but broke the existing
+heightmap contract: at the kelp fixture column (1264,33,-16) it turned a stone
+floor into sand.
+
+The material is now applied only within four blocks of the actual pre-surface
+top (`wtop`). Deep solids remain stone; the top aquifer solids receive grass/
+dirt as vanilla does.
+
+Measured on the 5x5 no-feature/tree fixtures:
+
+- no-feature inner 3x3: 80 -> 0
+- tree-on inner 3x3: 192 -> 72
+- target chunk: 0
+- heightmap regression test: PASS
+- full suite: 244 passed / 0 failed / 1 ignored (245 tests)
+- mutation `surface material does not reach deep solids`: 1 proved

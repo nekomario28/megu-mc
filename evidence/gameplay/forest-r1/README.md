@@ -93,7 +93,7 @@ The one-feature tree overlay initially placed no features because `load_freg`
 built its `by_step` order only from graph edges: a feature that was the sole
 entry in a step had no edge and was dropped before placement. The loader now
 starts DFS from every `(step, firstIndex)` node, including dependency-free
-nodes. Full-suite output is now 242/0/1, so the ordinary pack is not
+nodes. Full-suite output is now 244/0/1, so the ordinary pack is not
 reordered; the one-feature fixture is now runnable.
 
 With only `trees_birch_and_oak` enabled in forest, the reference target chunk
@@ -165,14 +165,14 @@ dirt/stone/grass cells** and target 0 (`no-feature.txt`). The surface scan was
 classifying `density <= 0` as air even when the aquifer supplied a barrier or
 default solid; the reference scans the actual pre-surface block state. The
 scan now classifies the aquifer result (None -> Solid, explicit air -> Air,
-fluid -> Fluid, otherwise Solid). That reduces the no-feature residual
-**207 -> 80** and the tree-on residual **319 -> 192**, with target 0
-(`surface-classification.txt`, `no-feature-after-surface.txt`,
-`diff-after-surface.txt`).
+fluid -> Fluid, otherwise Solid), and applies the material only within four
+blocks of the actual pre-surface top. That reduces the no-feature residual
+**207 -> 0** and the tree-on residual **319 -> 72**, with target 0
+(`material-window.txt`, `no-feature-after-material.txt`,
+`diff-after-material.txt`).
 
-The remaining 80 cells are a density-sign boundary: at `(-993,62,512)` the
-reference final density is `+0.054` while the port reports `-0.024`, so the
-port top remains one block low. This is not a tree or material-rule failure.
+The remaining 72 cells are leaf/canopy states (oak/birch leaf distance and a
+few missing/extra leaves), not terrain or tree-base material.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path

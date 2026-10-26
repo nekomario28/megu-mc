@@ -201,6 +201,15 @@ check "a tree parser reads the pinned dirt provider" \
   'dirt_provider: js(j, "below_trunk_provider")' \
   tree::tests::a_tree_reads_the_dirt_provider_field_the_pinned_data_uses
 
+check "surface material does not reach deep solids" \
+  src/worldgen.rs 'fn surface_material_applies(y: i32, surface_top: i32) -> bool {
+    y >= surface_top.saturating_sub(4)
+}' \
+  'fn surface_material_applies(_y: i32, _surface_top: i32) -> bool {
+    false
+}' \
+  worldgen::wg_tests::the_surface_material_window_stops_at_deep_solids
+
 check "a non-fluid aquifer state above nonpositive density stays solid" \
   src/worldgen.rs '    } else {
         SurfaceCell::Solid

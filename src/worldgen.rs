@@ -305,6 +305,13 @@ enum SurfaceCell {
 /// an aquifer barrier (`None`) is solid, and a non-fluid aquifer state is solid
 /// even when the density is non-positive. Such cells can still receive a
 /// surface material and must stay in the surface window.
+/// The four-block material window below the actual pre-surface top. A surface
+/// material may be applied to an aquifer/default solid above the density top,
+/// but not to deep solids far below the saved heightmap.
+fn surface_material_applies(y: i32, surface_top: i32) -> bool {
+    y >= surface_top.saturating_sub(4)
+}
+
 fn classify_surface_cell(
     density: f64,
     aquifer: Option<u32>,
@@ -2490,8 +2497,24 @@ impl Gen {
             let st = self.deep_state_cached(x, y, z, &cc);
             return self.vein_override(&cc, x, y, z, st);
         }
-        match self.aq_state(x, y, z, d) {
-            Some(0) => 0,
+        let aq = self.aq_state(x, y, z, d);
+        if let Some(st) = aq {
+            if st == 0 || breg().is_some_and(|r| r.is_air(st)) {
+                return 0;
+            }
+            return st;
+        }
+        let lx = (x & 15) as usize;
+        let lz = (z & 15) as usize;
+        let surface_top = cc.wtop[lz * 16 + lx] as i32;
+        if surface_material_applies(y, surface_top) {
+            if let Some(st) = cc.mat(lx, lz, y) {
+                if st != u32::MAX {
+                    return self.vein_override(&cc, x, y, z, st);
+                }
+            }
+        }
+        match aq {
             Some(st) => st,
             None => self.deep_state_cached(x, y, z, &cc),
         }
@@ -2662,7 +2685,24 @@ impl Gen {
             let st = self.deep_state_cached(x, y, z, cc);
             return self.vein_override(cc, x, y, z, st);
         }
-        match self.aq_state(x, y, z, d) {
+        let aq = self.aq_state(x, y, z, d);
+        if let Some(st) = aq {
+            if st == 0 || breg().is_some_and(|r| r.is_air(st)) {
+                return 0;
+            }
+            return st;
+        }
+        let lx = (x & 15) as usize;
+        let lz = (z & 15) as usize;
+        let surface_top = cc.wtop[lz * 16 + lx] as i32;
+        if surface_material_applies(y, surface_top) {
+            if let Some(st) = cc.mat(lx, lz, y) {
+                if st != u32::MAX {
+                    return self.vein_override(cc, x, y, z, st);
+                }
+            }
+        }
+        match aq {
             Some(st) => st,
             None => self.deep_state_cached(x, y, z, cc),
         }
@@ -4013,6 +4053,15 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    #[test]
+    fn the_surface_material_window_stops_at_deep_solids() {
+        assert!(surface_material_applies(62, 62));
+        assert!(surface_material_applies(59, 62));
+        assert!(surface_material_applies(58, 62));
+        assert!(!surface_material_applies(57, 62));
+        assert!(!surface_material_applies(33, 62));
+    }
 
     #[test]
     fn a_nonpositive_density_with_an_aquifer_barrier_is_still_solid() {
