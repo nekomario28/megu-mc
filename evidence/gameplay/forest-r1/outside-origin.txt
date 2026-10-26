@@ -1,0 +1,17 @@
+# Neighbor tree-origin coverage after the fancy fix
+
+Target fixture: seed 0, chunks (-64,32)..(-62,34), reference/port same stage.
+Target chunk (-64,32): 0 differing cells.
+
+A second reference/port pass armed tree logging on chunk (-62,32):
+  reference origins 40, port origins 42, shared 32
+  reference-only 8, port-only 10
+Example area (chunk -62,32 boundary):
+  reference-only: (-992,59,506), (-989,63,511), (-987,62,500)
+  port-only:      (-991,60,507), (-989,61,500), (-980,63,511)
+
+The 3x3 diff is 319 cells: 208 are dirt/stone/grass terrain differences
+(known regional surface residue) and 111 are oak/birch canopy cells whose
+origins lie in neighbouring chunks (including chunk -62,z31/33) outside the
+(-64,32) tree-origin logging radius. This is not a return of the target tree
+origin/dirt/fancy residuals; those three are closed at 0 for the target chunk.

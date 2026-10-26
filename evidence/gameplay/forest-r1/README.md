@@ -146,9 +146,12 @@ leaf-distance tick artifacts excluded).
 `k - (height - 3)` and moved its leaves out of the reference rows. With the
 list seeded at `j - 5`, the 3x3 diff drops **728 -> 319** (`carver` 55,
 `deep` 264; 223 tick artifacts excluded) and the target chunk stays **0**.
-The remaining differences are neighbour terrain and a small canopy/leaf cell
-set outside the instrumented tree-origin radius; they are not tree-base dirt
-or fancy attachment height.
+The remaining differences are neighbour terrain and canopy cells whose
+origins lie in neighbouring chunks outside the instrumented tree-origin
+radius. A second pass arming chunk `(-62,32)` found 40 reference / 42 port
+origins (32 shared, 8/10 one-sided), matching the boundary canopy split; see
+`outside-origin.txt`. They are not a return of the target tree origin,
+tree-base dirt, or fancy attachment residuals.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path
