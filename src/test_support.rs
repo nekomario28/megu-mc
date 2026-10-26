@@ -9,6 +9,8 @@ const GENERATED: &[&str] = &[
     "datapacks/vanilla/biome_climate_tree.json",
     "tests/data/biome_probe_1211.tsv",
     "tests/data/vanilla_vectors_1211.tsv",
+    "tests/data/biome_probe_ties_1211.tsv",
+    "tests/data/random_next_int_1211.tsv",
 ];
 
 /// Fail with the generator's own command unless the generated vanilla data is there.
