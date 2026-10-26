@@ -1,0 +1,17 @@
+# The target residual depends on the reference's extra loaded margin
+
+The canonical 3x3 reference (forceload -64..-62, z32..34) has a target
+chunk diff of 53 without --tick after the spring/ore-origin work.
+
+A 5x5 reference (forceload -65..-61, z31..35) changes the target chunk to
+**155** and the 5x5 region to 9,569. The extra margin changes which feature
+origins are populated and which neighbour writes exist; the target is not a
+region-independent chunk.
+
+Conclusion: compare a target chunk only against references with the same
+decoration margin, or compare the full matching region. The remaining 53 in
+the 3x3 fixture are not all worldgen-only: 20 are saved-world lava flow and
+some ore cells come from origins whose neighbour chunks are present in the
+reference margin but not in the 3x3 dump.
+
+This is a fixture invariant, not a new code defect.

@@ -58,6 +58,9 @@ predicate; the 20 lava cells themselves are saved-world flow, not worldgen
 (`spring-orientation.txt`). Ore origins were then compared: all **241/241**
 target origins and sizes match (`ore-origins.txt`), so the remaining ore cells
 are shape/overwrite, not placement.
+ A 5x5 margin control changes the target from 53 to 155
+(`margin-order.txt`): the target is only comparable against a reference with
+the same decoration margin. The canonical fixture is the 3x3 reference.
 
 ## What the remaining cells are
 
