@@ -22,6 +22,25 @@ pub(crate) fn require_vanilla_data() {
     if GENERATED.iter().any(|p| !std::path::Path::new(p).exists()) {
         panic!("{}", crate::worldgen::VANILLA_DATA_MISSING);
     }
+    // Present is not enough: a `datapacks/vanilla/` left over from before the generator
+    // (the old committed pack used another schema - `material_rule`, `aquifers`, no
+    // `surface_rule`) loads without an error and then shifts every value the frozen
+    // baselines pin, which reads as a code regression. `gen_vanilla_data.sh` stamps its
+    // pack.mcmeta; refuse anything that does not carry the stamp or the 1.21.1 schema.
+    let stamped = std::fs::read_to_string("datapacks/vanilla/pack.mcmeta")
+        .is_ok_and(|s| s.contains("generated from the 1.21.1 server jar"));
+    let current_schema = std::fs::read_to_string(
+        "datapacks/vanilla/data/minecraft/worldgen/noise_settings/overworld.json",
+    )
+    .is_ok_and(|s| s.contains("\"surface_rule\""));
+    if !stamped || !current_schema {
+        panic!(
+            "Stale vanilla data: datapacks/vanilla/ was not written by gen_vanilla_data.sh \
+             from the 1.21.1 jar (an older committed or copied pack). Delete datapacks/vanilla/ \
+             and regenerate. {}",
+            crate::worldgen::VANILLA_DATA_MISSING
+        );
+    }
 }
 
 pub(crate) fn isolated_world_test() -> bool {
