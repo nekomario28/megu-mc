@@ -180,3 +180,32 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 
 - Rust 依存の表は `cargo metadata --format-version 1 --locked --all-features` から再生成できます。
 - 新しい第三者データ・逆アセンブル・マッピングをコミットするときは、§1 に行を足してください。
+
+## 8. Pumpkin とのコード一致: 書き直しの結果 / Code-match rewrite results
+
+検査 / Scan: `scan5.py` (コメントと文字列を除いたトークン列を 12 トークン単位で Pumpkin `b0c48b2` の全 `.rs` と比較し、連続 24 トークン以上かつ識別子 6 個以上の一致を報告)。**一致が見つかるかどうかの目安であり、複製や権利についての判断ではありません。** A 12-token shingle scan against Pumpkin `b0c48b2`; runs of ≥24 tokens with ≥6 identifiers are reported. It is a screening tool, not a legal or copying verdict.
+
+方法 / Method: 該当箇所を、公開されているアルゴリズムの説明と vanilla の挙動 (既存の `javap`/仕様メモ、Gustavson の simplex noise 論文、Blackman/Vigna の xoroshiro、Stafford の Mix13、Lemire の範囲付き乱数) だけから書き直した。書き直し中に Pumpkin のソースは開いていない。浮動小数点の演算順序と乱数の消費順序は元のコードと同一に保った。確認: 既存テスト全て変更なし、加えて一時的な差分テスト (xoroshiro / simplex / Perlin / 地形列 / 3 seed × 49 チャンクの feature 配置のハッシュ) が書き直し前後で完全一致 (167 行)。この一時テストはコミットしていない。
+
+結果 / Result: 同じ検査の再実行で 49 件 → **6 件**。
+
+| 範囲 | 検査件数 前→後 | 扱い |
+|---|---|---|
+| `generation_math.rs` Xoroshiro / Stafford Mix13 / Lemire / Perlin 勾配 (5 件) | 5→0 | 書き直し (定数は公開アルゴリズムで固定) |
+| `generation_math.rs` simplex 2D/3D | 9→0 | 書き直し (角寄与・ハッシュ連鎖・軸順序を別構造に。`GRAD` 表は公開の勾配表) |
+| `worldgen.rs` spline (Hermite) | 1→0 | 書き直し (係数を端点ごとに分解。数式自体は三次 Hermite) |
+| `worldgen.rs` aquifer 圧力項 | 1→0 | 書き直し (分子/分母の組へ。係数 1.5/2.5/3/10 は vanilla の値) |
+| `feature.rs` ore / vein | 6→0 | 書き直し (球のチェーンを struct 化、重なり除去を分離) |
+| `feature.rs` lake / underwater magma | 3→0 | 書き直し |
+| `feature.rs` monster room | 4→0 | 書き直し |
+| `feature.rs` 2713 (テスト補助) | 1→0 | 書き直し |
+| `tree.rs` dark oak 幹 / foliage `gen_square` / decorators (shuffle ×3, alter ground) | 6→0 | 書き直し (共通ヘルパー化) |
+| `generation_providers.rs`, `landing.rs`, `main.rs` (座標・小さな反復) | 6→0 | 書き直し (自明な箇所) |
+| `tree.rs` forking 幹 (前 2 → 後 2 箇所), fancy 幹 (前 2 → 後 1 箇所) | 4→3 | **未書き直し**: vanilla 手順 (向き→傾き→枝) の乱数消費順序そのもの。差分テストが forking を通らず、挙動同一性を検証できないため触っていない |
+| `cached_lookup.rs` Default 実装, `main.rs` `args().skip(1).collect()`, `world_rng.rs` テストの反復 | 3→3 | **自明・定型**: 標準的な書き方のため、そのまま (歪めない) |
+
+注意 / Notes:
+- `Xor::next_bound` の閾値計算は 64 ビット剰余で、vanilla の 32 ビット符号なし剰余と非 2 冪の bound で異なり得る既存の挙動です。**挙動を変えないため触っていません** (再抽選が起きる稀な経路のみ)。
+- `BT::search` は子を距離順に並べますが、vanilla は配列順に走査します (既存の挙動、未変更)。
+- この検査はコードのみです。テスト値の表 (`AQ_NB`, `biome_vectors` など Pumpkin のテストと数値が一致するもの) と、Pumpkin とバイト一致する `data/minecraft/tags/block` の 12 ファイルは対象外で、残っています (事実の記録であり、独立再生成は未実施)。
+- 履歴には書き直し前のコードが残っています (この PR は履歴を書き換えません)。

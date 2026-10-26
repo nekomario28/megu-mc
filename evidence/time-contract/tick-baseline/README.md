@@ -38,8 +38,8 @@ fixtureは [`tick_tests.rs`](../../../src/tick_tests.rs) に置き、production�
 時計・炉の回帰テストはstageを欠落させる負の対照で失敗した。
 [`negative-control.log`](negative-control.log) は意図的なmutation失敗であり、修正前の不具合とは呼ばない。
 [`suite.log`](suite.log) は20 passed・1 explicitly ignored、[`features.log`](features.log) は
-Fabric/NeoForge付きcheck合格。[`review.log`](review.log) は独立レビューで指摘なし
-（レビュー自体は実行検証していない）。既存の `Trample.distance` warningは残る。
+Fabric/NeoForge付きcheck合格。独立レビューは指摘なし
+（レビュー自体は実行検証していない）。生ログは公開準備で削除した（[REDACTION.md](../REDACTION.md)）。既存の `Trample.distance` warningは残る。
 
 source/binary hashとbuild commandはresultsに収録。receiptはログ類のhashを保持する。
 この測定のコードは `ceb79b2`。現在のrunnerには後続の多数Actorケースとring最適化も含まれる。

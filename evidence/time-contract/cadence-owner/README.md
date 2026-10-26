@@ -22,8 +22,8 @@ wireはgame tickという二重単位は残る。数値・順序・発生tickは
 
 serial/parallelとも22 passed・1 ignored。対象テストの8thread実行を20回反復。
 Fabric/NeoForge checkも合格。[suite](time-contract-cadence-suite.log)、
-[parallel](time-contract-cadence-parallel.log)、[features](time-contract-cadence-features.log)、
-[review](time-contract-cadence-review.log)。
+[parallel](time-contract-cadence-parallel.log)、[features](time-contract-cadence-features.log)。
+独立レビューの生ログは公開準備で削除した（[REDACTION.md](../REDACTION.md)）。結論は `receipt.json` の `review` に残す。
 
 ## 未接続の境界
 

@@ -68,10 +68,15 @@ pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
 
 // ---------- Xoroshiro128++ with Java RandomSource semantics ----------
 
-fn stafford13(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
+/// Stafford's "Mix13" 64-bit finaliser (a published xor-shift/multiply avalanche
+/// permutation): two rounds of `v ^= v >> shift; v *= multiplier`, then a last
+/// xor-shift.
+fn stafford13(z: u64) -> u64 {
+    const ROUNDS: [(u32, u64); 2] = [(30, 0xBF58476D1CE4E5B9), (27, 0x94D049BB133111EB)];
+    let mixed = ROUNDS
+        .iter()
+        .fold(z, |v, &(shift, mul)| (v ^ (v >> shift)).wrapping_mul(mul));
+    mixed ^ (mixed >> 31)
 }
 
 // ---------- Mth.sin / Mth.cos (vanilla's lookup table) ----------
@@ -195,26 +200,24 @@ impl Xor {
         x
     }
     pub(crate) const fn raw(lo: u64, hi: u64) -> Self {
-        let (lo, hi) = if (lo | hi) == 0 {
-            (0x9E3779B97F4A7C15, 0x6A09E667F3BCC909)
-        } else {
-            (lo, hi)
-        };
+        // The all-zero state is the generator's one fixed point, so it is replaced
+        // by the two seeding constants.
+        let degenerate = lo == 0 && hi == 0;
         Xor {
-            lo,
-            hi,
+            lo: if degenerate { 0x9E3779B97F4A7C15 } else { lo },
+            hi: if degenerate { 0x6A09E667F3BCC909 } else { hi },
             g: None,
             legacy: false,
         }
     }
     pub(crate) fn next_long(&mut self) -> u64 {
-        let l = self.lo;
-        let m = self.hi;
-        let n = l.wrapping_add(m).rotate_left(17).wrapping_add(l);
-        let m = m ^ l;
-        self.lo = l.rotate_left(49) ^ m ^ (m << 21);
-        self.hi = m.rotate_left(28);
-        n
+        // xoroshiro128++: output = rotl(s0 + s1, 17) + s0, then the linear step.
+        let (s0, s1) = (self.lo, self.hi);
+        let output = s0.wrapping_add(s1).rotate_left(17).wrapping_add(s0);
+        let folded = s1 ^ s0;
+        self.lo = s0.rotate_left(49) ^ folded ^ (folded << 21);
+        self.hi = folded.rotate_left(28);
+        output
     }
     pub(crate) fn next(&mut self, bits: u32) -> u64 {
         let v = self.next_long() >> (64 - bits);
@@ -256,19 +259,20 @@ impl Xor {
                 }
             }
         }
-        // RandomGenerator.nextInt(bound): Lemire multiply-high + rejection
-        let mut l = (self.next_i32() as u64) & 0xFFFF_FFFF;
-        let mut m = l.wrapping_mul(bound as u64);
-        let mut n = m & 0xFFFF_FFFF;
-        if n < bound as u64 {
-            let i = ((!bound).wrapping_add(1) as u64) % (bound as u64);
-            while n < i {
-                l = (self.next_i32() as u64) & 0xFFFF_FFFF;
-                m = l.wrapping_mul(bound as u64);
-                n = m & 0xFFFF_FFFF;
+        // The modern bounded draw is Lemire's multiply-then-shift reduction: a
+        // 32-bit draw times the bound is a 64-bit product whose high word is the
+        // result, and products whose low word falls under a threshold are redrawn
+        // so every value stays equally likely.
+        let span = bound as u64;
+        let widen = |draw: i32| u64::from(draw as u32).wrapping_mul(span);
+        let mut product = widen(self.next_i32());
+        if (product & 0xFFFF_FFFF) < span {
+            let threshold = (bound.wrapping_neg() as u64) % span;
+            while (product & 0xFFFF_FFFF) < threshold {
+                product = widen(self.next_i32());
             }
         }
-        (m >> 32) as i32
+        (product >> 32) as i32
     }
     pub(crate) fn next_f64(&mut self) -> f64 {
         let traced = self.next_f64_inner();
@@ -590,8 +594,8 @@ impl Perlin {
         self.p[(x & 0xFF) as usize] as i32
     }
     fn grad_dot(hash: i32, x: f64, y: f64, z: f64) -> f64 {
-        let g = &GRAD[(hash & 15) as usize];
-        g[0] * x + g[1] * y + g[2] * z
+        let [gx, gy, gz] = GRAD[(hash & 15) as usize];
+        gx * x + gy * y + gz * z
     }
     #[allow(clippy::too_many_arguments)]
     fn sample_lerp(&self, x: i32, y: i32, z: i32, rx: f64, ry: f64, rz: f64, ory: f64) -> f64 {
@@ -880,115 +884,123 @@ impl Simp {
     fn map(&self, x: i32) -> i32 {
         self.p[(x & 0xFF) as usize] as i32
     }
-    fn grad(t: usize, x: f64, y: f64) -> f64 {
-        let d = 0.5 - x * x - y * y;
-        if d < 0.0 {
+    /// Contribution of one 2D simplex corner: a radial falloff `(r0 - |v|^2)^4`
+    /// (r0 = 0.5) scaled by the dot product of the offset with the corner's gradient.
+    #[inline]
+    fn corner2(index: usize, dx: f64, dy: f64) -> f64 {
+        let falloff = 0.5 - dx * dx - dy * dy;
+        if falloff < 0.0 {
             return 0.0;
         }
-        let g = &GRAD[t % 12];
-        let dd = d * d;
-        dd * dd * (g[0] * x + g[1] * y)
+        let [gx, gy, _] = GRAD[index % 12];
+        let squared = falloff * falloff;
+        squared * squared * (gx * dx + gy * dy)
     }
-    fn grad3(t: usize, x: f64, y: f64, z: f64) -> f64 {
-        let d = 0.6 - x * x - y * y - z * z;
-        if d < 0.0 {
+    /// Contribution of one 3D simplex corner (falloff radius term r0 = 0.6).
+    #[inline]
+    fn corner3(index: usize, dx: f64, dy: f64, dz: f64) -> f64 {
+        let falloff = 0.6 - dx * dx - dy * dy - dz * dz;
+        if falloff < 0.0 {
             return 0.0;
         }
-        let g = &GRAD[t % 12];
-        let dd = d * d;
-        dd * dd * (g[0] * x + g[1] * y + g[2] * z)
+        let [gx, gy, gz] = GRAD[index % 12];
+        let squared = falloff * falloff;
+        squared * squared * (gx * dx + gy * dy + gz * dz)
+    }
+    /// Gradient index of a 3D lattice point: the three coordinates are chained
+    /// through the permutation table.
+    #[inline]
+    fn lattice_hash3(&self, i: i32, j: i32, k: i32) -> usize {
+        let through_k = self.map(k);
+        let through_j = self.map(j.wrapping_add(through_k));
+        (self.map(i.wrapping_add(through_j)) % 12) as usize
+    }
+    /// The lattice steps (0 or 1 per axis) that reach the second and third
+    /// corners of the simplex: the walk from the cell origin to the opposite
+    /// corner crosses the axes in order of decreasing fractional offset, and ties
+    /// resolve toward the earlier axis in the comparisons below.
+    #[inline]
+    fn corner_steps(fx: f64, fy: f64, fz: f64) -> ([i32; 3], [i32; 3]) {
+        if fx >= fy {
+            if fy >= fz {
+                ([1, 0, 0], [1, 1, 0])
+            } else if fx >= fz {
+                ([1, 0, 0], [1, 0, 1])
+            } else {
+                ([0, 0, 1], [1, 0, 1])
+            }
+        } else if fy < fz {
+            ([0, 0, 1], [0, 1, 1])
+        } else if fx < fz {
+            ([0, 1, 0], [0, 1, 1])
+        } else {
+            ([0, 1, 0], [1, 1, 0])
+        }
     }
     pub(crate) fn get3(&self, x: f64, y: f64, z: f64) -> f64 {
-        let e = (x + y + z) * (1.0 / 3.0);
-        let i = (x + e).floor() as i32;
-        let j = (y + e).floor() as i32;
-        let k = (z + e).floor() as i32;
-        let g = i.wrapping_add(j).wrapping_add(k) as f64 * (1.0 / 6.0);
-        let n = x - (i as f64 - g);
-        let o = y - (j as f64 - g);
-        let p = z - (k as f64 - g);
-        let (q, r, s, t, u, v) = if n >= o {
-            if o >= p {
-                (1, 0, 0, 1, 1, 0)
-            } else if n >= p {
-                (1, 0, 0, 1, 0, 1)
-            } else {
-                (0, 0, 1, 1, 0, 1)
-            }
-        } else if o < p {
-            (0, 0, 1, 0, 1, 1)
-        } else if n < p {
-            (0, 1, 0, 0, 1, 1)
-        } else {
-            (0, 1, 0, 1, 1, 0)
+        // Skew the input into the lattice of unit cubes that tile into simplices
+        // (factor 1/3), find the cell, and unskew its origin (factor 1/6).
+        let skew = (x + y + z) * (1.0 / 3.0);
+        let cell = [
+            (x + skew).floor() as i32,
+            (y + skew).floor() as i32,
+            (z + skew).floor() as i32,
+        ];
+        let unskew = cell[0].wrapping_add(cell[1]).wrapping_add(cell[2]) as f64 * (1.0 / 6.0);
+        let from_origin = [
+            x - (cell[0] as f64 - unskew),
+            y - (cell[1] as f64 - unskew),
+            z - (cell[2] as f64 - unskew),
+        ];
+        // Lattice steps (0/1 per axis) reaching the second and third corners.
+        let (second, third) = Self::corner_steps(from_origin[0], from_origin[1], from_origin[2]);
+        // Offsets from the point to each of the four corners.
+        let to_second = [0, 1, 2].map(|a| from_origin[a] - second[a] as f64 + 1.0 / 6.0);
+        let to_third = [0, 1, 2].map(|a| from_origin[a] - third[a] as f64 + 1.0 / 3.0);
+        let to_last = from_origin.map(|v| v - 0.5);
+        let base = cell.map(|c| c & 0xFF);
+        let hash_at = |step: [i32; 3]| {
+            self.lattice_hash3(
+                base[0].wrapping_add(step[0]),
+                base[1].wrapping_add(step[1]),
+                base[2].wrapping_add(step[2]),
+            )
         };
-        let w = n - q as f64 + 1.0 / 6.0;
-        let aa = o - r as f64 + 1.0 / 6.0;
-        let ab = p - s as f64 + 1.0 / 6.0;
-        let ac = n - t as f64 + 1.0 / 3.0;
-        let ad = o - u as f64 + 1.0 / 3.0;
-        let ae = p - v as f64 + 1.0 / 3.0;
-        let af = n - 0.5;
-        let ag = o - 0.5;
-        let ah = p - 0.5;
-        let ai = i & 0xFF;
-        let aj = j & 0xFF;
-        let ak = k & 0xFF;
-        let al = self.map(ai.wrapping_add(self.map(aj.wrapping_add(self.map(ak))))) % 12;
-        let am = self.map(
-            ai.wrapping_add(q).wrapping_add(
-                self.map(
-                    aj.wrapping_add(r)
-                        .wrapping_add(self.map(ak.wrapping_add(s))),
-                ),
-            ),
-        ) % 12;
-        let an = self.map(
-            ai.wrapping_add(t).wrapping_add(
-                self.map(
-                    aj.wrapping_add(u)
-                        .wrapping_add(self.map(ak.wrapping_add(v))),
-                ),
-            ),
-        ) % 12;
-        let ao = self.map(
-            ai.wrapping_add(1).wrapping_add(
-                self.map(
-                    aj.wrapping_add(1)
-                        .wrapping_add(self.map(ak.wrapping_add(1))),
-                ),
-            ),
-        ) % 12;
-        32.0 * (Self::grad3(al as usize, n, o, p)
-            + Self::grad3(am as usize, w, aa, ab)
-            + Self::grad3(an as usize, ac, ad, ae)
-            + Self::grad3(ao as usize, af, ag, ah))
+        let first = Self::corner3(
+            hash_at([0, 0, 0]),
+            from_origin[0],
+            from_origin[1],
+            from_origin[2],
+        );
+        let second_c = Self::corner3(hash_at(second), to_second[0], to_second[1], to_second[2]);
+        let third_c = Self::corner3(hash_at(third), to_third[0], to_third[1], to_third[2]);
+        let last = Self::corner3(hash_at([1, 1, 1]), to_last[0], to_last[1], to_last[2]);
+        32.0 * (first + second_c + third_c + last)
     }
     pub(crate) fn get2(&self, x: f64, y: f64) -> f64 {
-        const SK: f64 = 0.5 * (1.7320508075688772 - 1.0);
-        const US: f64 = (3.0 - 1.7320508075688772) / 6.0;
-        let d = (x + y) * SK;
-        let i = (x + d).floor() as i32;
-        let j = (y + d).floor() as i32;
-        let e = (i.wrapping_add(j)) as f64 * US;
-        let f = i as f64 - e;
-        let g = j as f64 - e;
-        let h = x - f;
-        let k = y - g;
-        let (l, m) = if h > k { (1i32, 0i32) } else { (0i32, 1i32) };
-        let n = h - l as f64 + US;
-        let o = k - m as f64 + US;
-        let p = 2.0 * US + (h - 1.0);
-        let q = 2.0 * US + (k - 1.0);
-        let r = i & 0xFF;
-        let s = j & 0xFF;
-        let t = self.map(r.wrapping_add(self.map(s)));
-        let u = self.map(r.wrapping_add(l).wrapping_add(self.map(s.wrapping_add(m))));
-        let v = self.map(r.wrapping_add(1).wrapping_add(self.map(s.wrapping_add(1))));
-        let w = Self::grad(t as usize, h, k);
-        let z = Self::grad(u as usize, n, o);
-        let aa = Self::grad(v as usize, p, q);
-        70.0 * (w + z + aa)
+        // Skew factor (sqrt(3) - 1) / 2 and unskew factor (3 - sqrt(3)) / 6 map the
+        // plane onto a lattice of rhombi, each split into two triangles.
+        const SKEW: f64 = 0.5 * (1.7320508075688772 - 1.0);
+        const UNSKEW: f64 = (3.0 - 1.7320508075688772) / 6.0;
+        let skew = (x + y) * SKEW;
+        let (cx, cy) = ((x + skew).floor() as i32, (y + skew).floor() as i32);
+        let unskew = cx.wrapping_add(cy) as f64 * UNSKEW;
+        let (fx, fy) = (x - (cx as f64 - unskew), y - (cy as f64 - unskew));
+        // The middle corner is reached along whichever axis has the larger offset.
+        let (step_x, step_y) = if fx > fy { (1i32, 0i32) } else { (0i32, 1i32) };
+        let middle = (fx - step_x as f64 + UNSKEW, fy - step_y as f64 + UNSKEW);
+        let far = (2.0 * UNSKEW + (fx - 1.0), 2.0 * UNSKEW + (fy - 1.0));
+        let (bx, by) = (cx & 0xFF, cy & 0xFF);
+        let at = |sx: i32, sy: i32| {
+            self.map(
+                bx.wrapping_add(sx)
+                    .wrapping_add(self.map(by.wrapping_add(sy))),
+            ) as usize
+        };
+        let near_c = Self::corner2(at(0, 0), fx, fy);
+        let middle_c = Self::corner2(at(step_x, step_y), middle.0, middle.1);
+        let far_c = Self::corner2(at(1, 1), far.0, far.1);
+        70.0 * (near_c + middle_c + far_c)
     }
 }
 

@@ -277,8 +277,9 @@ pub(crate) enum BSP {
 }
 fn noise_state(states: &[u32], v: f64) -> u32 {
     // vanilla: midpoint(1.0, v) -> index into the list
-    let val = ((1.0 + v) / 2.0).clamp(0.0, 0.9999);
-    states[(val * states.len() as f64) as usize]
+    let unit = ((1.0 + v) / 2.0).clamp(0.0, 0.9999);
+    let slot = (unit * states.len() as f64) as usize;
+    states[slot]
 }
 impl BSP {
     pub(crate) fn get(&self, ctx: &mut FC, r: &mut Xor, x: i32, y: i32, z: i32) -> u32 {

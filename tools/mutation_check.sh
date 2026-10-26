@@ -413,8 +413,8 @@ check "placement modifiers advance positions in vanilla's draw order" \
             let x = pos.0 + rng.next_bound(16);' \
   feature_population_output_matches_the_pre_refactor_capture
 check "the ore vein radius matches vanilla's own output" \
-  src/feature.rs '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \
-  '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0 + 0.01;' \
+  src/feature.rs '            radius: (f64::from(swell) * jitter + 1.0) / 2.0,' \
+  '            radius: (f64::from(swell) * jitter + 1.0) / 2.0 + 0.01,' \
   the_ore_vein_geometry_matches_vanillas_own_output
 
 check "the frozen population digest notices shared provider changes" \
