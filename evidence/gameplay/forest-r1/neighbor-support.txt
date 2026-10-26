@@ -1,0 +1,24 @@
+# z=31 tree rejection is a terrain-support difference
+
+Fixture: 5x5 same-stage, seed 0, FSEED_ARM=(-62,31,0,9).
+
+Draw stream:
+  reference 0..4: count=9, in_square=(3,15), selector=(0.854,0.950)
+  port      0..4: same
+  reference 5: nextInt(3)          (tree height)
+  port      5: nextInt(16)         (next count position)
+
+The first candidate is (-989, 511). At its trunk base y=62:
+  reference: minecraft:dirt
+  port:      minecraft:stone
+
+The selected child's placed feature has
+`block_predicate_filter(would_survive, oak_sapling)`. Dirt supports the
+sapling; stone does not, so the port skips the tree and moves to the next
+count position. Tree origin sets for the fixture are 50 reference / 51 port
+(41 shared, 9/10 one-sided), but the first divergence is the support block,
+not tree RNG, trunk placement, dirt placement, or fancy attachments.
+
+Conclusion: the boundary canopy residual is downstream of the neighbour
+terrain/surface residual. The target chunk's tree origin/dirt/fancy checks
+remain at 0.

@@ -153,8 +153,12 @@ origins (32 shared, 8/10 one-sided), matching the boundary canopy split; see
 `outside-origin.txt`. A 5x5 same-stage fixture confirms the interior origins
 are exact (25/25 shared; target 6/6) while the inner 3x3 still measures 319:
 the boundary canopy comes from the next chunk row (`z=31`) whose origins and
-terrain differ. See `five-by-five.txt`. They are not a return of the target
-tree origin, tree-base dirt, or fancy attachment residuals.
+terrain differ. See `five-by-five.txt`. A focused z=31 trace shows the first
+tree candidate at `(-989,511)` has reference dirt and port stone at its base;
+the `would_survive` filter therefore rejects the port tree and moves to the
+next count position (`neighbor-support.txt`). This residual is downstream of
+neighbour terrain/surface, not tree RNG, trunk placement, dirt placement, or
+fancy attachments.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path
