@@ -10,7 +10,7 @@
     ["generation_context"],
     ["worldgen", "block_registry"],
     ["json", "generation_math"],
-    ["ingress_guard", "tick_stats", "chunk_ack"]
+    ["ingress_guard", "tick_stats", "chunk_ack", "trace_env"]
   ],
   "explicit_generation_modules": ["feature", "tree", "generation_providers", "generation_context", "worldgen", "block_registry", "json", "generation_math"],
   "forbidden": [["worldgen", "tree"]],
@@ -30,7 +30,8 @@
     ["feature", "json"], ["tree", "json"], ["worldgen", "json"], ["generation_providers", "json"],
     ["feature", "generation_math"], ["tree", "generation_math"], ["worldgen", "generation_math"],
     ["generation_providers", "generation_math"],
-    ["main", "ingress_guard"], ["main", "tick_stats"], ["main", "chunk_ack"]
+    ["main", "ingress_guard"], ["main", "tick_stats"], ["main", "chunk_ack"], ["main", "trace_env"],
+    ["feature", "trace_env"], ["worldgen", "trace_env"]
   ],
   "accepted_errors": []
 }
