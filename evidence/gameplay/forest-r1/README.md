@@ -103,7 +103,15 @@ tree cells. The instrumented reference logged **41** tree origins in the target
 neighbourhood; the port logged **47**, with **26 shared**, **15 reference-only**
 and **21 port-only** (`tree-origins.txt`). This is an origin/selection residual,
 not the previous loader omission. This is now a **tree placement/RNG residual**, not a harness
-failure; it is not yet attributed to tree shape, origin, or draw order.
+failure.
+
+The reference agent was armed on feature `0,9` and its first typed draws match the
+port through the in-square positions and the two random-selector chances. The
+first integer divergence is draw **7**: the reference asks `nextInt(16)=9`, the
+port asks `nextInt(2)=1` (`tree-draws.txt`). The float lines differ only in
+printing precision; the first integer divergence is the tree selection/height
+call, not the initial placement draws. It is not yet attributed to tree shape or
+height selection.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path
