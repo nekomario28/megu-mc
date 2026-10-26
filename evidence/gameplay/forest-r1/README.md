@@ -25,6 +25,7 @@ tools/chunk_world_fixture.sh forest-structures -64 32 3 structures
 | terrain (no features/carvers/structures) | **207** | **0** | deep 207 |
 | carvers (features off, real carvers) | **207** | **0** | deep 207 |
 | features (real features/carvers, no structures) | **3,550** | **401** | deep 2,058, carver 1,492 |
+| features after the tree fixes | **2,190** | **382** | deep 1,555, carver 635 |
 | structures (real features/carvers/structures) | **6,908** | **854** | deep 3,111, carver 3,797 |
 
 The target chunk's **terrain, surface and carver outputs are exact**: both
@@ -32,6 +33,14 @@ terrain and carvers stages report zero differences there. The carver run adds
 nothing over terrain in this region (still 207). Remaining target differences are
 features (+550) and structures (+304); the 3x3 regional feature total is +4,381
 over terrain and the structure run adds another +2,320.
+
+The current full-feature rerun against the same saved reference is
+**2,190 region / 382 target** (`features-after-tree.txt`). The target's top
+pairs are `deepslate` vs `cave_air` (138), `deepslate` vs `cobblestone` (91),
+`oak_leaves` distance-only (60), `deepslate` vs `mossy_cobblestone` (39),
+`air` vs `lava` (20), plus ore cells. The cobblestone/mossy/lava/spawner/chest
+cluster is a dungeon (`monster_room`) shape, so the next isolation is that
+feature in this exact region, not another tree pass.
 
 ## What the remaining cells are
 
