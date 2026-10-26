@@ -293,6 +293,14 @@ struct SurfMat {
     vals: Box<[u16]>, // u16::MAX = no override -> caller uses default
 }
 
+/// One terrain cell as the surface scan sees it before the rule runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SurfaceCell {
+    Air,
+    Fluid,
+    Solid,
+}
+
 // scan context for material rules (vanilla MaterialRuleContext)
 struct SC {
     x: i32,
@@ -2321,10 +2329,6 @@ impl Gen {
                     let x = cx * 16 + lx as i32;
                     let z = cz * 16 + lz as i32;
                     let surf_y = cc.surf[lz * 16 + lx] as i32;
-                    // vanilla's SurfaceSystem scan sets waterHeight to the topmost
-                    // fluid cell it has seen since the last air cell. For the window
-                    // the fluid above the terrain is the open water column, whose
-                    // top the heightmap probe already found.
                     let water_surface = if (cc.wtop[lz * 16 + lx] as i32) > surf_y {
                         cc.wtop[lz * 16 + lx] as i32
                     } else {
@@ -2340,67 +2344,11 @@ impl Gen {
                     rd[lz * 16 + lx] = c.run_depth as i16;
                     let est_min = g.prelim_min(x, z);
                     c.est_min = est_min;
-                    if scan_top < est_min {
-                        continue;
-                    }
-                    let mut vals = vec![u16::MAX; (scan_top - est_min + 1) as usize];
-                    let mut min = i32::MAX;
-                    let mut sda = 0i32;
-                    let mut fluid = i32::MIN;
-                    let mut y = scan_top;
-                    while y >= est_min {
-                        let d = g.block_density(&cc, x, y, z);
-                        if d <= 0.0 {
-                            // A fluid cell sets waterHeight once; air resets it, as
-                            // vanilla's buildSurface scan does. Above the terrain the
-                            // open column is water up to the probed surface; below it
-                            // only an aquifer water/lava cell counts.
-                            let fluid_cell = if y > surf_y {
-                                y <= water_surface
-                            } else {
-                                g.aq_state(x, y, z, d)
-                                    .is_some_and(|st| g.is_fluid_state(st))
-                            };
-                            if fluid_cell {
-                                if fluid == i32::MIN {
-                                    fluid = y + 1;
-                                }
-                            } else {
-                                sda = 0;
-                                fluid = i32::MIN;
-                            }
-                            y -= 1;
-                            continue;
-                        }
-                        if min >= y {
-                            min = g.min_y;
-                            let mut sy = y - 1;
-                            while sy >= g.min_y {
-                                if g.block_density(&cc, x, sy, z) <= 0.0 {
-                                    min = sy + 1;
-                                    break;
-                                }
-                                sy -= 1;
-                            }
-                        }
-                        sda += 1;
-                        c.y = y;
-                        c.sda = sda;
-                        c.sdb = y - min + 1;
-                        c.fluid = fluid;
-                        // SurfaceRules.Context.SteepMaterialCondition reads
-                        // Heightmap.Types.WORLD_SURFACE_WG, not the stone-only
-                        // density top: under an ocean the water surface is the
-                        // height the four-neighbour slope test must see.
-                        if let Some(st) = g.eval_rule(root, &mut c, &cc.wtop) {
-                            vals[(y - est_min) as usize] = st.min(u16::MAX as u32 - 1) as u16;
-                        }
-                        y -= 1;
-                    }
-                    mats[lz * 16 + lx] = Some(SurfMat {
-                        lo: est_min as i16,
-                        vals: vals.into_boxed_slice(),
-                    });
+                    let cells: Vec<SurfaceCell> = (g.min_y..=scan_top)
+                        .map(|y| g.surface_cell(&cc, x, y, z, surf_y, water_surface))
+                        .collect();
+                    mats[lz * 16 + lx] =
+                        g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
                 }
             }
         }
@@ -2418,6 +2366,90 @@ impl Gen {
 }
 
 impl Gen {
+    fn surface_cell(
+        &mut self,
+        cc: &ChunkCols,
+        x: i32,
+        y: i32,
+        z: i32,
+        surf_y: i32,
+        water_surface: i32,
+    ) -> SurfaceCell {
+        let d = self.block_density(cc, x, y, z);
+        if d > 0.0 {
+            return SurfaceCell::Solid;
+        }
+        let fluid = if y > surf_y {
+            y <= water_surface
+        } else {
+            self.aq_state(x, y, z, d)
+                .is_some_and(|st| self.is_fluid_state(st))
+        };
+        if fluid {
+            SurfaceCell::Fluid
+        } else {
+            SurfaceCell::Air
+        }
+    }
+
+    /// The top-down surface scan, separated from terrain sampling so a synthetic
+    /// column can be compared with the actual `SurfaceSystem.buildSurface`.
+    /// `cells` is indexed by `y - min_y`; the scan starts at its top cell.
+    fn scan_surface_column(
+        &mut self,
+        root: usize,
+        c: &mut SC,
+        est_min: i32,
+        cells: &[SurfaceCell],
+        heightmap: &[i16; 256],
+    ) -> Option<SurfMat> {
+        let min_y = self.min_y;
+        let scan_top = min_y + cells.len() as i32 - 1;
+        if scan_top < est_min {
+            return None;
+        }
+        let mut vals = vec![u16::MAX; (scan_top - est_min + 1) as usize];
+        let mut min = i32::MAX;
+        let mut sda = 0i32;
+        let mut fluid = i32::MIN;
+        for y in (est_min..=scan_top).rev() {
+            match cells[(y - min_y) as usize] {
+                SurfaceCell::Air => {
+                    sda = 0;
+                    fluid = i32::MIN;
+                }
+                SurfaceCell::Fluid => {
+                    if fluid == i32::MIN {
+                        fluid = y + 1;
+                    }
+                }
+                SurfaceCell::Solid => {
+                    if min >= y {
+                        min = min_y;
+                        for sy in (min_y..y).rev() {
+                            if cells[(sy - min_y) as usize] != SurfaceCell::Solid {
+                                min = sy + 1;
+                                break;
+                            }
+                        }
+                    }
+                    sda += 1;
+                    c.y = y;
+                    c.sda = sda;
+                    c.sdb = y - min + 1;
+                    c.fluid = fluid;
+                    if let Some(st) = self.eval_rule(root, c, heightmap) {
+                        vals[(y - est_min) as usize] = st.min(u16::MAX as u32 - 1) as u16;
+                    }
+                }
+            }
+        }
+        Some(SurfMat {
+            lo: est_min as i16,
+            vals: vals.into_boxed_slice(),
+        })
+    }
+
     /// Full block decision (feature layer, material window, aquifer, deep rules)
     /// without taking the GEN lock. `terrain_section` and the free `block_state`
     /// use it so a chunk fill takes one lock instead of five per block.
@@ -3982,6 +4014,80 @@ mod wg_tests {
             unknown.is_empty(),
             "biome tree contains foreign biomes: {unknown:?}"
         );
+    }
+
+    /// Actual `SurfaceSystem.buildSurface` scan on synthetic stone/water columns.
+    /// The Java oracle fills a ProtoChunk, runs the real buildSurface with a
+    /// stone-depth rule, and records the gold cells. The test feeds the same
+    /// column states through the production `scan_surface_column` path.
+    #[test]
+    fn surface_build_scan_matches_the_pinned_classes_on_synthetic_columns() {
+        let fixture = jparse(include_bytes!(
+            "../evidence/foundation/surface-context/buildsurface.json"
+        ))
+        .unwrap();
+        let rows = fixture.get("columns").unwrap().as_arr().unwrap();
+        let gold = crate::name_to_state("minecraft:gold_block").expect("gold block");
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut seen = 0usize;
+        for row in rows {
+            let offset = row.get("offset").unwrap().num() as i32;
+            let x = row.get("x").unwrap().num() as i32;
+            let z = row.get("z").unwrap().num() as i32;
+            let top = row.get("top").unwrap().num() as i32;
+            let sea = row.get("sea").unwrap().num() as i32;
+            g.conds.push(Cond::StoneD {
+                off: offset,
+                sdep: false,
+                sec: 0,
+                ceil: false,
+            });
+            let cid = g.conds.len() - 1;
+            g.rules.push(Rule::Block(gold));
+            let block = g.rules.len() - 1;
+            g.rules.push(Rule::Cond(cid, block));
+            let rid = g.rules.len() - 1;
+            let scan_top = top.max(sea);
+            let cells: Vec<SurfaceCell> = (g.min_y..=scan_top)
+                .map(|y| {
+                    if y <= top {
+                        SurfaceCell::Solid
+                    } else if y <= sea {
+                        SurfaceCell::Fluid
+                    } else {
+                        SurfaceCell::Air
+                    }
+                })
+                .collect();
+            let mut c = SC::new();
+            c.x = x;
+            c.z = z;
+            c.run_depth = 0;
+            c.sec_ok = true;
+            c.est_min = g.min_y;
+            let want: Vec<i32> = row
+                .get("gold")
+                .unwrap()
+                .as_arr()
+                .unwrap()
+                .iter()
+                .map(|v| v.num() as i32)
+                .collect();
+            let mat = g
+                .scan_surface_column(rid, &mut c, g.min_y, &cells, &[0i16; 256])
+                .expect("surface column");
+            let got: Vec<i32> = mat
+                .vals
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v != u16::MAX)
+                .map(|(i, _)| mat.lo as i32 + i as i32)
+                .collect();
+            assert_eq!(got, want, "scan offset {offset} column {x},{z} top {top}");
+            let _ = cid;
+            seen += 1;
+        }
+        assert_eq!(seen, 768, "buildSurface synthetic coverage changed");
     }
 
     /// Actual `SurfaceRules` condition formulas on synthetic context fields:

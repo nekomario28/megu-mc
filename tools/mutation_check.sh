@@ -887,6 +887,11 @@ check "surface stone depth selects the ceiling/below fields" \
   'let sd = if ceil { c.sda } else { c.sdb };' \
   surface_conditions_match_the_pinned_context_formulas
 
+check "surface scan keeps stone depth above the column" \
+  src/worldgen.rs '                    sda += 1;' \
+  '                    sda += 0;' \
+  surface_build_scan_matches_the_pinned_classes_on_synthetic_columns
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
