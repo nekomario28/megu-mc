@@ -1,9 +1,11 @@
-mc-spine third-party notices
-============================
+mc-spine
+Copyright 2026 nekomario28
 
-mc-spine's own code is MIT-licensed (see LICENSE). This file records attributions for
-third-party material that is committed in this repository. The full inventory, including
-items whose origin is not yet documented, is in THIRD_PARTY.md.
+mc-spine's own code is licensed under the Apache License, Version 2.0 (see LICENSE). This
+file records attributions for third-party material that is committed in this repository, and
+lists the components that are fetched or supplied at setup time but are NOT distributed here.
+The full inventory, including items whose origin is not yet documented, is in THIRD_PARTY.md.
+Licensing analysis and the open items before the licence is final: LICENSING.md.
 
 assets/blocks_1211.json
 -----------------------
@@ -22,10 +24,10 @@ Derived from Minecraft, (c) Mojang Studios / Microsoft. This repository does not
 Mojang data. tools/vanilla_data/gen_vanilla_data.sh generates, from the user's own
 Minecraft 1.21.1 server jar (sha1 59353fb40c36d304f2035d51e7d6e6baa98dc05c), the files
 datapacks/vanilla/** (worldgen JSON and block tags), assets/block_states_1211.json,
-tests/data/biome_probe_1211.tsv, tests/data/vanilla_vectors_1211.tsv, biome_probe_ties_1211.tsv,
-random_next_int_1211.tsv (the game's answers to random test questions) and (with --accept-eula)
-config_packets.bin. They are
-git-ignored, are not covered by mc-spine's MIT license, and must not be redistributed.
+tests/data/biome_probe_1211.tsv, tests/data/vanilla_vectors_1211.tsv,
+tests/data/biome_probe_ties_1211.tsv, tests/data/random_next_int_1211.tsv (the game's answers
+to random test questions) and (with --accept-eula) config_packets.bin. They are
+git-ignored, are not covered by mc-spine's Apache-2.0 license, and must not be redistributed.
 The jar is not distributed here.
 
 Tool inputs that are not distributed
@@ -33,3 +35,19 @@ Tool inputs that are not distributed
 tools/vanilla_data/ resolves obfuscated names with Fabric's intermediary (1.21.1) and Yarn
 (1.21.1+build.3) mappings, both published under CC0-1.0 by FabricMC. They are downloaded
 by the user when regenerating and are not part of this repository.
+
+JVM-side components (fetched at build/run time, not distributed)
+----------------------------------------------------------------
+compat/*/build.py download the following, pinned by URL and SHA-256 in compat/*/dependencies.json,
+into git-ignored .cache/ directories. No jar, class file or source of these is committed here,
+and mc-spine does not redistribute them. They keep their own licenses (as declared by the
+upstream projects; check the downloaded artifacts before redistributing any of them):
+  Fabric Loader 0.19.5 (Apache-2.0, FabricMC); SpongePowered Mixin 0.17.4 as built by FabricMC
+  (MIT); ASM 9.10.1 (BSD-3-Clause); NeoForge 21.1.172, NeoForged event bus 8.0.2, FancyModLoader
+  4.0.39 and MergeTool 2.0.0 (LGPL-2.1); log4j-api 2.23.1, JetBrains annotations 24.1.0 and
+  typetools 0.6.3 (Apache-2.0).
+The pinned third-party test mod (Seed Protect 1.0.0 by Itamio, from Modrinth) is used only as a
+test input and is not distributed here; its jar metadata says "All Rights Reserved" while its
+Modrinth page says MIT, so do not redistribute it.
+The Java sources under compat/ are mc-spine's own code. The classes under compat/*/java/net/minecraft/
+are empty placeholder shapes (a name only, no Minecraft code) that satisfy method signatures.

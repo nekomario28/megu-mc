@@ -1,32 +1,64 @@
+# ---- build outputs -------------------------------------------------------------------------
 /target/
-__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+*.profraw
+perf.data
+perf.data.*
+flamegraph*.svg
+
+# ---- logs and scratch ----------------------------------------------------------------------
 *.log
+# Curated, receipt-pinned run logs are tracked on purpose (the rule above would otherwise hide them
+# and `git ls-files -ci` would list them). New ones elsewhere under evidence/ need `git add -f`.
 !/evidence/*.log
+!/evidence/time-contract/**/*.log
+logs/
+*.tmp
+*.bak
+*.orig
+*.rej
+/scratch/
+/evidence/**/scratch/
+/evidence/**/tmp/
+
+# ---- local world / saves written by the server ---------------------------------------------
+# The server writes ./world_overlay.bin (+ .tmp while writing and .bak, the retained previous save).
 /world_overlay.bin
 /world_overlay.bin.*
+/world/
+/saves/
+*.mca
+
+# ---- JVM side: downloaded jars, build trees, mappings (never committed or redistributed) ----
+# compat/*/build.py download NeoForge / Fabric Loader / Mixin / ASM / the pinned mod into .cache/
+# (URL + sha256 pinned in dependencies.json) and compile our own classes into .build/.
+*.jar
+*.class
+/mods/
 /compat/fabric-probe/.cache/
 /compat/fabric-probe/.build/
-/compat/fabric-probe/__pycache__/
-
 /compat/neoforge-events/.cache/
 /compat/neoforge-events/.build/
-/compat/neoforge-events/__pycache__/
-logs/
+# Mojang/Fabric name mappings and decompiler output are inputs, not sources
+*.tiny
+/server.txt
+mappings*.txt
+*.mapping.txt
+*.javap.txt
+# a vanilla server dropped into the repo root
+/server.jar
+/libraries/
+/versions/
+/eula.txt
 
-# Secrets and key material (audit item 18)
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-*.p12
-*.jks
-
-# Python bytecode
-*.pyc
-
-# Mojang data generated locally from your own 1.21.1 server jar by
-# tools/vanilla_data/gen_vanilla_data.sh (never committed; see README "Setup")
+# ---- Mojang data generated locally from your own 1.21.1 server jar --------------------------
+# tools/vanilla_data/gen_vanilla_data.sh writes these; never committed (README "Setup", THIRD_PARTY.md section 9)
 /datapacks/vanilla/
 /assets/block_states_1211.json
 /tests/data/biome_probe_1211.tsv
@@ -36,3 +68,32 @@ logs/
 /config_packets.bin
 # an optional server resource pack you supply yourself
 /resourcepack.zip
+
+# ---- secrets and key material --------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+credentials*.json
+.netrc
+*.token
+
+# ---- editor, OS and local agent files ------------------------------------------------------
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+.DS_Store
+Thumbs.db
+/.codex/
+/.agents/
+/.claude/
+/.cursor/

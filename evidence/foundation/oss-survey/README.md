@@ -1,7 +1,8 @@
 # OSS survey — what can be imported into mc-spine (MIT)
 
-mc-spine is MIT. GPL/AGPL code (Pumpkin, SteelMC, Paper, Amidst) and unlicensed
-repos were therefore not used as a code source. This file records what the survey found, what is
+(Written when mc-spine was MIT; the proposed licence is now Apache-2.0, see LICENSING.md. The conclusion below is unchanged.)
+mc-spine is permissively licensed. That rules out GPL/AGPL code (Pumpkin, SteelMC, Paper, Amidst)
+and unlicensed repos. This file records what the survey found, what is
 *importable*, and what each candidate is actually good for. Reproduce with the
 queries in §6.
 

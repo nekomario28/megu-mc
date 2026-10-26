@@ -2,6 +2,7 @@
 #   cargo deny check advisories licenses bans sources
 # The license allowlist below was derived from `cargo metadata --all-features` for the
 # committed Cargo.lock; it lists licenses that actually occur, nothing speculative.
+# (78 crates, last checked 2026-10-26 with cargo-deny 0.20.2.)
 # It describes what the dependency tree contains and is NOT a legal opinion (see THIRD_PARTY.md).
 
 [graph]
@@ -29,10 +30,11 @@ allow = [
 ]
 confidence-threshold = 0.93
 
-# The root crate mc-spine declares no `license` field in Cargo.toml (LICENSE file is MIT);
-# do not fail the check on the workspace crate itself.
-[licenses.private]
-ignore = true
+# The root crate mc-spine declares `license = "Apache-2.0"` in Cargo.toml (matches LICENSE), so it
+# is checked like any other crate. Every license above is permissive: nothing in the dependency
+# tree is GPL/LGPL/AGPL/MPL/EPL, so the tree does not constrain an Apache-2.0 (or MIT) choice
+# for mc-spine. Keep copyleft licenses OFF this list; adding one should be a deliberate decision
+# (see LICENSING.md).
 
 [bans]
 multiple-versions = "warn"

@@ -4,7 +4,7 @@
 > **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. (Revision note: the original version of this document changed nothing; a follow-up PR removed the Mojang-derived and Pumpkin-identical data files and replaced them with generated data, see §3, §5 and §9; a further PR renamed identifiers and replaced test tables, see §10.)
 
 - 対象リビジョン / Revision: `main` @ `ef6e14a` (+ #16 + この PR / this PR)
-- リポジトリのコード本体は MIT ([LICENSE](LICENSE))。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または出所が文書化されていないもの)の一覧です。
+- リポジトリのコード本体は Apache-2.0 ([LICENSE](LICENSE)。提案段階で、公開前の確認事項は [LICENSING.md](LICENSING.md) を参照。以前は MIT でした)。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または出所が文書化されていないもの)の一覧です。
 - 作成日 / Written: 2026-10-25 (Asia/Tokyo)
 
 **出所の列の意味 / Origin column**
@@ -37,7 +37,7 @@
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
 
-`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`mc-spine` 自体はクレートメタデータに `license` を宣言していません (LICENSE ファイルは MIT)。
+`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`mc-spine` 自体は `Cargo.toml` で `license = "Apache-2.0"` を宣言しています (LICENSE と一致)。この表に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
 Copied verbatim from the `license` field of each crate's published metadata; this is what the crates declare, not an independent verification of their license texts. 78 crates (optional JNI adapters included).
 
 | crate | version | license (as declared) | 種別 |
