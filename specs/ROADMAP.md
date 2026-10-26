@@ -4,9 +4,9 @@
 
 ## いまの判断 — 広げる前に収束する
 
-Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[直近のcarver slice](../evidence/foundation/biome-carvers/README.md)で **232 passed / 0 failed / 1 ignored** まで戻りましたが、whole-world比較・forest残差・surface full contextは未確認です。緑を全体合格へ読み替えず、まずR0の残りとR1へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
+Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[PR統合後](../evidence/foundation/upstream-prs/README.md)で **234 passed / 0 failed / 1 ignored** まで戻りましたが、whole-world比較・forest残差・surface full contextは未確認です。緑を全体合格へ読み替えず、まずR0の残りとR1へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
-**次の最小slice:** biome の `spawners` / `spawn_costs` を固定jarの `MobSpawnSettings` 実クラスで読み、既存のmob ownerへ一つでも本番経路として接続する。`carvers` のAIR listとown-jar configured_feature pathは[carverの証拠](../evidence/foundation/biome-carvers/README.md)で閉じた。全chunkの再生成や別のdonor機能へ先に広げません。
+**次の最小slice:** biome の `spawners` / `spawn_costs` を固定jarの `MobSpawnSettings` 実クラスで読み、既存のmob ownerへ一つでも本番経路として接続する。`carvers` のAIR listとown-jar configured_feature pathは[carverの証拠](../evidence/foundation/biome-carvers/README.md)、Xoroshiro/biome tieは[PR統合の証拠](../evidence/foundation/upstream-prs/README.md)で限定範囲を閉じた。全chunkの再生成や別のdonor機能へ先に広げません。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
@@ -16,7 +16,7 @@ Horizon / Valence から使える部品は既存 owner に取り込みました�
 
 **出口:** 比較対象のrouter/biome/surface経路に未説明のゼロ代替・参照落ちが残らず、未解決・未対応の一覧と本番での到達性を説明できる。ローカルsuiteの緑は必要条件であり、whole-world・native対照・CIの代用にしない。意味を変えた経路には実クラス対照と故障を検出するテストがある。全体の赤は一次原因へ帰属させ、原因未確認のcapture更新で消さない。個別の修正ごとに広い回帰を確認し、全体合格は必須テストが通ってから判定する。
 
-根拠: [自前データ監査](../evidence/foundation/audit-snapshots/README.md)、[sampler/native noiseの検証範囲](../evidence/foundation/weird-sampler/README.md)、[aquiferの検証範囲](../evidence/foundation/aquifer/README.md)、[carverの検証範囲](../evidence/foundation/biome-carvers/README.md)、[surfaceの検証範囲](../evidence/foundation/surface-loader/README.md)。
+根拠: [自前データ監査](../evidence/foundation/audit-snapshots/README.md)、[sampler/native noiseの検証範囲](../evidence/foundation/weird-sampler/README.md)、[aquiferの検証範囲](../evidence/foundation/aquifer/README.md)、[carverの検証範囲](../evidence/foundation/biome-carvers/README.md)、[PR統合の検証範囲](../evidence/foundation/upstream-prs/README.md)、[surfaceの検証範囲](../evidence/foundation/surface-loader/README.md)。
 
 ## R1 — 同じ生成stageでworldgenを再受け入れする
 

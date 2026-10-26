@@ -20,6 +20,8 @@
 | `primitives_oracle.py` | 実1.21.1のpalette書き出し・StringTag・有限AABB clipを検査。既定は全入力・結果・provenanceを照合し、意図した記録だけ `--output`。worldや任意NBT decoderの検証とは分ける。[範囲](../evidence/foundation/valence-primitives/README.md)を参照 |
 | `biome_carver_oracle.py` | 固定1.21.1 jar の datapack から実 `Biome`／`BiomeGenerationSettings` の AIR carver 列を取得し、order込みで照合する。既定は全biomeの完全一致、意図した記録だけ `--output`。[範囲](../evidence/foundation/biome-carvers/README.md)を参照 |
 | `aquifer_oracle.py` | 固定1.21.1 jar の datapack を `RegistryDataLoader` に読ませ、実 `NoiseChunk`／`Aquifer` の preliminary surface と chunk 内の流体状態を照合する。既定は入力・結果・出自の全件一致、意図した記録だけ `--output`。[範囲](../evidence/foundation/aquifer/README.md)を参照 |
+| `biome_tie_oracle.py` | 固定1.21.1の実 `Climate` 木で、コミット済みのtie-heavy biome点を全件再検索する。thread-localのprevious結果を毎回消してtie順を固定。[範囲](../evidence/foundation/upstream-prs/README.md)を参照 |
+| `nextint_oracle.py` | 固定1.21.1の実 `Xoroshiro128PlusPlusRandom`／`WorldgenRandom`／`LegacyRandomSource` で、コミット済み `nextInt(bound)` 列を全行再計算する。jar認証後に実行し、参照値は変更しない。[範囲](../evidence/foundation/pr-integration/README.md)を参照 |
 | `weird_sampler_oracle.py` | 固定1.21.1の実mapper・NormalNoise・WeirdScaledSamplerを呼び、入力／raw f64結果／出自を全件照合する。world全体の検証とは分ける。[範囲と再現](../evidence/foundation/weird-sampler/README.md)を参照 |
 | `vanilla_pack_from_jar.sh [dir]` | 同じ固定jarの worldgen JSON・block tag・built-in biome tree をまとめて更新する（JDK必須） |
 | `fixture_base.sh [dir]` | 固定具の基点（`CARVER_FIXTURE_BASE`、既定 `/tmp/carverfresh`）を組む。jar を sha1 で固定し、worldgen に効く設定をここで明示する。基点が無いと固定具は空振りする |

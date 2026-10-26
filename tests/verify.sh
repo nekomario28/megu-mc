@@ -20,6 +20,8 @@ python3 tests/packet_angles_oracle_test.py
 python3 tests/primitives_oracle_test.py
 python3 tests/aquifer_oracle_test.py
 python3 tests/biome_carver_oracle_test.py
+python3 tests/nextint_oracle_test.py
+python3 tests/biome_tie_oracle_test.py
 python3 tests/weird_sampler_oracle_test.py
 python3 tests/suite_compare_test.py
 
