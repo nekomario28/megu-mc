@@ -1,0 +1,19 @@
+# Neighbour surface residual is a density/top-height sign
+
+No-feature 5x5 control, inner 3x3: 207 differing cells, all classified deep,
+top material pairs dirt/stone/grass. Target chunk 0.
+
+Probe column (-1011,540) in the port, no features:
+  y=60 d=+0.09163 surf=61 mat=dirt
+  y=61 d=+0.04502 surf=61 mat=grass
+  y=62 d=-0.00178 surf=61 mat=<unset>
+  y=63 d=-0.04858 surf=61 mat=<unset>
+
+Reference has grass at y=62. The port's density is positive through y=61 and
+just negative at y=62, so its surface window/top is one block lower. The final
+port cell at y=62 is a non-surface state (stone), not grass. This is a density
+sign/top-height boundary in the neighbour surface, not a tree, trunk, dirt, or
+canopy placement.
+
+The 112 canopy cells are downstream of this support/terrain difference; the
+207 terrain cells are the primary residual to attribute next.

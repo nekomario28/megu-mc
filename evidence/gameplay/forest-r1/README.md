@@ -164,7 +164,10 @@ A no-feature control over the same 5x5 region gives **207 all-deep
 dirt/stone/grass cells** and target 0 (`no-feature.txt`), so the tree-on split
 is **207 terrain + 112 feature/canopy**. The canopy side is the z=31 support
 block chain above; the terrain side is the remaining neighbouring surface
-residue.
+residue. A probe at `(-1011,540)` shows the port density crossing negative at
+y=62 while the reference still has grass there (`surface-density.txt`): the
+primary residual is a density/top-height boundary, not the material rule or a
+tree write.
 
 - `tools/ore_fixture.sh` was repaired for the own-jar `configured_feature` path
   and for delayed `forceload`; without those fixes it read the wrong config path
