@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use crate::json::{jbool, jparse, J};
 
 use crate::generation_math::*;
+use crate::trace_env::{env_flag, env_str};
 
 // ---------- density functions ----------
 
@@ -1652,7 +1653,7 @@ impl Gen {
 
     // find_top_surface of the preliminary_surface_level DF, cached per quart column
     pub(crate) fn prelim_est(&mut self, x: i32, z: i32) -> i32 {
-        if let Ok(spec) = std::env::var("PRELIM_DUMP") {
+        if let Some(spec) = env_str!("PRELIM_DUMP") {
             static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             let v = self.prelim_est_raw(x, z);
             if DONE.get().is_none() && spec == format!("{x},{z}") {
@@ -2206,7 +2207,7 @@ impl Gen {
             None => {
                 static ONCE: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(true);
-                if std::env::var("MC_SPINE_VEINDBG").is_ok()
+                if env_flag!("MC_SPINE_VEINDBG")
                     && ONCE.swap(false, std::sync::atomic::Ordering::Relaxed)
                 {
                     eprintln!("VEINCFG sampler active but vein=None");
@@ -2233,17 +2234,13 @@ impl Gen {
         } else {
             (-60i32, -8i32, v.iron_ore, v.iron_raw, v.iron_fill)
         };
-        let dbg = std::env::var("MC_SPINE_VEINTRACE")
-            .ok()
-            .and_then(|v| {
-                let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
-                if p.len() == 3 && p[0] == x && p[1] == y && p[2] == z {
-                    Some(())
-                } else {
-                    None
-                }
-            })
-            .is_some();
+        // `MC_SPINE_VEINTRACE="x,y,z"`: parsed once.
+        static VEIN_TRACE_AT: std::sync::OnceLock<Option<[i32; 3]>> = std::sync::OnceLock::new();
+        let dbg = *VEIN_TRACE_AT.get_or_init(|| {
+            let v = std::env::var("MC_SPINE_VEINTRACE").ok()?;
+            let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
+            <[i32; 3]>::try_from(p).ok()
+        }) == Some([x, y, z]);
         if dbg {
             let inner = match self.dfs[v.toggle] {
                 DF::Interp(i) => i,
@@ -2390,7 +2387,7 @@ impl Gen {
                 populate(self, cx, cz);
             }
         } else {
-            let nbr = std::env::var("MC_SPINE_FEAT_NBR")
+            let nbr = env_str!("MC_SPINE_FEAT_NBR")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             let (x0, x1) = if nbr { (cx - 1, cx + 1) } else { (cx, cx) };
