@@ -4,6 +4,21 @@ Status: 実装中。現在の作業状態は[状態ページ](README.md)、個�
 この文書は目標・検証契約・作業順を持ち、過去のチェックポイントやソースの行数を複製しない。
 **ユーザー指示により実画面・KDE経由の試験は不要。接続と操作はCLI経由で検証する。**
 
+## 現在のcheckpoint（2026-10-26）
+
+**M2は未達。** 現在はR1（同じ生成stageでのworldgen再受け入れ）のfeature層を閉じている段階です。ローカルsuiteは **247 passed / 0 failed / 1 ignored** ですが、これはM2/M3の合格ではありません。
+
+| 現在できていること | 現在できていないこと |
+|---|---|
+| target chunkのterrain/surface/carverは0差 | full feature 3x3は1,680–1,789差 |
+| tree one-feature worldgenは0差 | target featureは114（`--tick`）／53（no-tick） |
+| tree origin/dirt/fancy centre/attachmentを実クラスと照合 | ore形状/上書き、chest、grassが残る |
+| surface material windowとaquifer pre-surfaceを照合 | 構造物（jigsaw/template）は未実装 |
+| ore origins 241/241一致 | 同一margin fixtureでの完全一致は未達 |
+| ローカルsuite 247/0/1 | whole-world再生成、hosted CI、main統合は未実行 |
+
+比較の順序・fixture契約・出口条件は[ROADMAP](ROADMAP.md)を正本とします。特に、同じtargetでもreferenceのdecoration marginを変えると差が53→155に変わるため、fixtureのmarginを固定せずに「targetが完全一致した」と主張しません。
+
 ## 目標とチェックポイント
 
 Minecraft Java 1.21.1（protocol 767）の超軽量サーバーを作り、観測可能なvanilla挙動を維持する。
@@ -20,7 +35,7 @@ Minecraft Java 1.21.1（protocol 767）の超軽量サーバーを作り、観�
 相違を列挙することは調査には必要だが、近似を文書化するだけではvanilla維持の要求を閉じない。
 現状をM1達成や全機能準拠とは扱わない。
 
-現在の達成状況は[状態ページ](README.md)、測定値・比較条件・過去の測定訂正は
+現在の詳細は[状態ページ](README.md)と[ロードマップ](ROADMAP.md)、測定値・比較条件・過去の測定訂正は
 [代表負荷比較](../evidence/gameplay/load-compare/README.md)と
 [生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
 これらの証拠は限定したfixtureの結果であり、機能範囲が変わる測定を単一の代表値として混ぜません。

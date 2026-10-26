@@ -2,11 +2,29 @@
 
 現在の状態は[README](README.md)、目標と合格条件は[PLAN](PLAN.md)、測定値と実行条件は各 `evidence/` を正本とします。この文書は**次に進む順序・依存関係・出口条件**を定めます。部品の実装、実クラスとの部分一致、全体合格を混同しません。
 
-## いまの判断 — 広げる前に収束する
+## いまの判断 — R1のfeature層を、fixture契約から閉じる
 
-Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **247 passed / 0 failed / 1 ignored** まで戻りました。steepのheightmap、条件式4,037行、合成stone/water列の実`buildSurface` scan 768列を実クラスと照合しました。R1のforest `(-64,32)` 3x3 same-stage比較では、**対象chunkのterrain・surface・carverは0差**、carver可視化の修正後はfeatures 401とstructures 304に分離できました。lapisは28/23→23/23で一致しました。[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)を追加しました。ただしreal-noise全surface・他座標・spawn_costs適用は未確認です。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
+現在の checkpoint は **M2未達**です。ローカルsuiteは **247 passed / 0 failed / 1 ignored** ですが、これは全体合格ではありません。R0の自前データ意味論は限定範囲で閉じ、R1のforest `(-64,32)` では次まで到達しています。
 
-**次の最小slice:** forest `(-64,32)` の残るfeatures 401とstructures 304を、geode、tree、残りのfeatureへ分離する。lapisはcarver可視化の修正で一致済み、diamond/redstoneも一致、monster roomは0差、geodeは参照regionに0セルで別のplacement問題。treeのone-feature overlayはfeature-order修正後、`min_clipped_height`なしのclip拒否を修正してoriginが**41/41完全一致**した。対象chunkはtree-baseの`dirt_provider`読み込みとfancy attachment開始位置の修正で**0差**、3x3全体は728→0差（tick artifact 51を除く）である。残り51はsaved-worldのleaf distance tickでworldgen差ではない。構造物は別契約として扱う。terrain/surface/carverが対象chunkで0差であることは[forest R1の証拠](../evidence/gameplay/forest-r1/README.md)、surface steep/条件式/合成buildSurface scanは[surface contextの証拠](../evidence/foundation/surface-context/README.md)に記録した。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
+| 比較 | 結果 | 意味 |
+|---|---:|---|
+| target chunk の terrain / surface / carver | **0差** | 対象chunkの基盤は同じstageで一致 |
+| tree one-feature inner 3x3（`--tick`なし） | **0差** | tree origin / trunk / dirt / fancy中心枝は一致 |
+| tree one-feature の `--tick`差 | 51 | saved-worldのleaf distance tick。worldgen差ではない |
+| full feature 3x3（3x3 reference） | **1,680差（no-tick）** | `--tick`は保存worldのleaf/lava runtime差を加える。targetは114（`--tick`）／53（no-tick） |
+| target full feature（no-tick） | **53差** | lava flow 20、ore約30、chest 1、grass 1 |
+| target ore origins | **241/241一致** | origin/sizeは一致。形状または上書きが残る |
+| structures | 未実装 | jigsaw/template/NBT配置は別契約 |
+
+重要な制約:
+
+- **decoration margin依存。** 同じtargetでも3x3 referenceと5x5 referenceで差が53→155に変わる（[margin-order](../evidence/gameplay/forest-r1/margin-order.txt)）。target chunkを単独で「worldgen残差」と呼ばず、referenceと同じmarginで比較する。
+- **保存worldのruntime差をworldgen差と呼ばない。** lava flow、leaf distance、水の広がりは除外し、no-tick値と両方記録する。
+- **R1の「完全一致」の判定対象は、同じseed・同じdata・同じstage・同じmarginのreference/port。** originが一致してもセル集合は一致とは限らない（ore 241/241 origins）。
+- mainの取り込みは保留。remote mainの#22は、このbranchが読むcommitted datapack/assetsを削除するdata migrationであり、tree/worldgen ownerのrenameと同時に自動mergeしない。
+- hosted CI #26/#27/#28はbillingでjobが起動していない。ローカル実行とhosted CIを混同しない。
+
+**次の最小slice:** target no-tick 53のうち、runtimeでない **ore形状/上書き**を1つの共有originでセル単位に閉じる。次にchest/grass、最後に3x3全体の非target残差を同じfixture契約で分離する。構造物はその後に独立した契約として着手する。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
@@ -20,14 +38,53 @@ Horizon / Valence から使える部品は既存 owner に取り込みました�
 
 ## R1 — 同じ生成stageでworldgenを再受け入れする
 
-1. loader/evaluatorの修正後、元の座標・seedのwhole-chunk、heightmap、ore、kelp、geodeを再比較する。forest `(-64,32)` の3x3ではterrain/surface/carverが対象chunkで0差、features 550・structures 304へ分離済み（[forest R1](../evidence/gameplay/forest-r1/README.md)）。古い一時worldが無ければ`tools/chunk_world_fixture.sh`で固定jarから再構成し、参照chunkの完成と正のcoverageを先に検査する。
-2. forestの残差を密度・aquifer・surface・carver・feature・生成後tickに分ける。対象chunkはすでにterrain/surface/carverが0差で、carver可視化後もfeatures 401/structures 304が残る。周辺chunkのdirt/stone/grass 207差は別途列単位で帰属する。surfaceを読めるようにしたことだけで、既存の大きな残差が消えたとは扱わない。
-3. biome lookup、隣接chunkの書込み、decorating order、乱数消費を、同じstageの参照と照合する。Xoroshiro `nextInt` の32bit unsignedしきい値とbiome treeのtie順は[実クラスvectorで検証済み](../evidence/foundation/upstream-prs/README.md)であり、同じstageの比較で使う。kelpの列やgeodeのノイズなど、残差を最小の中間値まで戻して検査する。
-4. 未検証featureは到達する正の固定具を用意してから広げる。未実装のfossilにはtemplate/processor、sculk patchにはspreader/runtimeの契約が先に必要。構造物やjigsawまで対応したと一括で主張しない。
+### R1.0 fixture契約（先に固定する）
 
-**出口:** 宣言した範囲で、全参照chunkの完成・対象経路の実行・セル/状態/heightmapの比較が成立し、差分集合・除外・skipを説明できる。両側ゼロ、全skip、保存worldのruntime差をfeature差と呼ぶ比較は合格にしない。未実装範囲は別に残す。
+1. referenceとportで **seed、data pack、structures有無、forceload範囲、dump範囲、margin** を同じにする。
+2. referenceの全chunkが `full` であること、対象featureが実行されたこと、skip/excludedを記録する。
+3. `--tick` と `--tick`なしを両方保存する。leaf distance/lava flow/水広がりはruntime artifactとして分類し、worldgenの差分に混ぜない。
+4. malformed/empty/truncated dump、wrong jar、stale provenanceは比較前に拒否する。
 
-根拠: [比較の約束](../DESIGN.md#比較の約束)、[worldgenの比較記録](../evidence/gameplay/carvers/README.md)、[forest R1](../evidence/gameplay/forest-r1/README.md)、[featureの部分検証](../evidence/gameplay/feature-parity/README.md)、[surface contextの検証範囲](../evidence/foundation/surface-context/README.md)。
+**出口:** 同じfixture定義を一つの文書に固定し、3x3 canonical referenceとportのtarget差分が再現する。marginを変えた比較は別fixtureとして記録し、前の数値と混ぜない。
+
+### R1.1 tree / surface / carver（このcheckpointで閉じた範囲）
+
+- targetのterrain/surface/carver: 0差
+- tree one-feature: origin 41/41、target worldgen 0差
+- `min_clipped_height`なしのclip拒否、`dirt_provider`、fancy centre limb `h2 * 0.5`、fancy attachment開始位置を実クラスbytecodeと照合
+- surface materialはactual pre-surface stateを分類し、`wtop - 4` windowだけに適用
+
+**出口:** tree one-featureのno-tick 0差を維持し、理由のないcapture更新をしない。
+
+### R1.2 target feature残差（現在の主線）
+
+現在のtarget no-tick 53を、次の順で1層ずつ閉じる。
+
+1. **ore形状/上書き（約30）**
+   - ore origins 241/241一致を前提にする。
+   - 1つの共有originについて、referenceの `OreFeature.doPlace` とportの `gen_ore` / `gen_vein` のセル集合を比較する。
+   - `OreFeature` の `BitSet` は自動拡張、portの固定Vecは境界セルを落とし得る。サイズ差は実クラスbytecodeで確認し、fixtureで効果を測る。
+   - 後続featureによる上書き順（monster room/lake/spring/ore間）を同じoriginで比較する。
+   - 失敗時はorigin一致を「形状一致」と読み替えない。
+2. **chest 1**
+   - monster roomのchest向き・位置・loot/block entityの有無を、`MonsterRoomFeature`のbytecodeと照合する。
+   - chest blockだけでなく、後続のblock entity consumerが要求する範囲を分ける。
+3. **grass 1**
+   - patch/grassの配置predicateとbiome filterを単独fixtureで照合する。
+4. **lava flow 20**
+   - `SpringFeature` sourceは一致済み。flowはsaved-world tickとして分離し、worldgenの残差から除外する。
+5. **非target残差**
+   - targetが0になってから、3x3全体を同じfixtureで比較し、chunk境界のfeature origin/spillとruntime差を分ける。
+
+**出口:** targetのno-tick差が0。3x3の残差は、各セルが「未実装feature」「runtime artifact」「fixture margin」「未検証」のどれかに説明され、両側ゼロ・全skip・失敗の握り潰しがない。
+
+### R1.3 structures（R1.2の後）
+
+- jigsaw、template pool、NBT template、processor、structure placementを独立ownerとして設計する。
+- feature残差とstructure残差を同じ表で混ぜない。
+- 対象構造物のreference chunkが完成し、正のセル数・block entity・template参照が比較できるまで「構造物対応」と主張しない。
+
+**出口:** 対象構造物ごとに、同じseed/構造物設定で配置・セル・block entity・保存/再読込が一致する。未対応構造物は明示する。
 
 ## R2 — 部品の一致から、操作とlifecycleの一致へ広げる
 
