@@ -1,0 +1,111 @@
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 235 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test generation_math::next_int_vs_vanilla_tests::next_int_streams_match_the_game_for_every_class_seed_and_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::biome_tree_breaks_ties_the_way_vanilla_scans_children ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.10s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::biome_vectors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.11s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 4 tests
+test feature::generation_contract_tests::carver_configs_parse_the_1_21_1_field_shapes ... ok
+test feature::generation_contract_tests::carver_lists_match_the_pinned_biomes ... ok
+test feature::generation_contract_tests::converted_carver_lists_still_parse ... ok
+test worldgen::wg_tests::bundled_carver_configs_are_the_1_21_1_shapes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 231 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test generation_math::next_int_vs_vanilla_tests::next_int_streams_match_the_game_for_every_class_seed_and_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::biome_tree_breaks_ties_the_way_vanilla_scans_children ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.10s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::biome_vectors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.09s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 4 tests
+test feature::generation_contract_tests::carver_configs_parse_the_1_21_1_field_shapes ... ok
+test feature::generation_contract_tests::carver_lists_match_the_pinned_biomes ... ok
+test feature::generation_contract_tests::converted_carver_lists_still_parse ... ok
+test worldgen::wg_tests::bundled_carver_configs_are_the_1_21_1_shapes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 231 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test generation_math::next_int_vs_vanilla_tests::next_int_streams_match_the_game_for_every_class_seed_and_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::biome_tree_breaks_ties_the_way_vanilla_scans_children ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.08s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 1 test
+test worldgen::wg_tests::biome_vectors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 234 filtered out; finished in 0.10s
+
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 4 tests
+test feature::generation_contract_tests::carver_configs_parse_the_1_21_1_field_shapes ... ok
+test feature::generation_contract_tests::carver_lists_match_the_pinned_biomes ... ok
+test feature::generation_contract_tests::converted_carver_lists_still_parse ... ok
+test worldgen::wg_tests::bundled_carver_configs_are_the_1_21_1_shapes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 231 filtered out; finished in 0.00s

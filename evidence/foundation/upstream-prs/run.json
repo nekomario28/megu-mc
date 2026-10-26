@@ -1,0 +1,227 @@
+{
+  "base_commit": "bca17239d39ea60863bde8aa625e5a18132c05dc",
+  "base_tree": "af736ca7aa22a39e35b374fb898fa457501fdfa6",
+  "binary": {
+    "latest_source_mtime_ns": 1792973517785147949,
+    "mtime_ns": 1792973759735477607,
+    "note": "Built after mutation restoration; both wire checks use this binary.",
+    "path": "target/release/mc-spine",
+    "sha256": "4b92cf4f265911a88f6804d93e2b02e4d4435336d8fd36d32b61ad49d965293c"
+  },
+  "branch": "integrate/prs",
+  "deferred": {
+    "16/17/18": "independent hygiene/network/docs work",
+    "22": "data-generation/removal conflicts with committed fixtures",
+    "23": "license draft with unresolved owner blockers",
+    "25": "large rename based on #22"
+  },
+  "docs_sha256": {
+    "evidence/foundation/upstream-prs/README.md": "3a0432e8dd2c52688d69781f27ffb737dc6b600d5326fd58840875dc80252b85",
+    "specs/README.md": "ffdf9b79c00cdf104bb7cf62474e1c8e1db41d5d65a0e784c3116183b6942184",
+    "specs/ROADMAP.md": "e54a4f918a89645946af832718062911b22ddd6572014dd7c34baa1ca4915ef0",
+    "tools/README.md": "03b3dad7b230f780b7b02fc0758731caf2fdb7b6f8b507b534bed3795c6f3a3f"
+  },
+  "evidence_sha256": {
+    "admission-final.txt": "50e0c9a530064c34c9efeb7968948b6d144068d05e3428e2135e34640de7c225",
+    "admission-mutations.txt": "7f3f39b73e4f3244ffd13d9574a48afb29db9b5842f3721ce294c2bf37d1b434",
+    "admission-native.txt": "9412d64ef2c8746c6a29918abb012d7a82f05843394ae314e5bd0225e0dbeef9",
+    "build.txt": "6bfa9e18ffdef821c711a542cfebd7db0982665615563e5a191285e489609c6f",
+    "clippy.txt": "736e2582f563605dd272e5fb977840b0c0767377d27b6940c440caf75eec7157",
+    "comparison.json": "beb398105445d540d0a29b1b57365c1afac43af579d54ac00d882f4d1bbd48f7",
+    "debt.txt": "52a078f9ba6dc78fdeb45a32728a07578be4320ddbcdc0de1afdea2618bed34b",
+    "environment.json": "1bd2baf21b9ca934b7547c4ea9cece9daca306aa8d04776871261875e90ceea5",
+    "focused.txt": "116d78e7a95217796d77d1342c37a8def3fe223d23b57056557d115c039a9d4f",
+    "layer-tests.txt": "fe3334ab8e4c37db65c9832c66c1c6ec1f92a779113c57bcf5fcfa9ab204d308",
+    "layers.txt": "28495f98f078823d8a3931768e2082f3f50c7e8f355ed93af4ef21340151131a",
+    "log-normalization.json": "8c6956c6db54f346080737a6bd5f21e54afb9296332416fa3582fd75fa66fc2e",
+    "mutations.txt": "5cad38b25ed92c5080a06f0300e2630299d2682ac201e1d918a7bbfbb661cbaf",
+    "native.txt": "31742539e022f87f1cdf60a316b81fc4fd7a84315ce45e121b437e47841a2ae9",
+    "nextint-repeat.txt": "4eee894f100e94e4b69db675e52e2b150d89f39e6425ee102feeaa387fd0cf67",
+    "python.txt": "58de640a099d8e8a846163eac5ee7d6bf0254fef5da56a6060caa24f26a49da8",
+    "source-hashes.sha256": "e39597af31191aec60164f4027dafa64828cf760bfebe39e79d15e397996a4c7",
+    "suite.txt": "cceb77ea49939ff7a1e8f063449595c77bed6ababb49af9d8a3ee724504a79e2",
+    "tie-repeat.txt": "15e130fe70c3b925a883939755d5aace2b014e2945c61bd099e6c9df941e4dc1",
+    "unit.jsonl": "3410b14a2a2577ad397d86e19076073aea26cef8fd2c77ad2080738b2868c034",
+    "wire.txt": "95f9418668f4371b1b514cf03812daeafd8e9176ba19e36f45b51865148f8921"
+  },
+  "imported": {
+    "pr21": {
+      "changes": [
+        "32-bit unsigned nextInt redraw threshold",
+        "array-order biome tree scan for ties"
+      ],
+      "local": "f6a33d0",
+      "upstream": "6f12760982"
+    },
+    "pr24": {
+      "changes": [
+        "lazy trace formatting",
+        "cached env debug switches",
+        "trace_env layer"
+      ],
+      "local": "89c5bf4",
+      "upstream": "63d5e33506"
+    }
+  },
+  "limits": [
+    "Imported vectors are representative corpora, not exhaustive bound/seed/tree coverage.",
+    "Tie test pins lookup order on one tree, not generated-world biome parity.",
+    "#24 trace caching changes debug-only observation timing and was not benchmarked.",
+    "#22/#25/#23 were not imported; no data-publication or license decision is made here."
+  ],
+  "not_run": [
+    "full tests/verify.sh",
+    "whole mutation campaign",
+    "hosted CI",
+    "push/mirror refresh",
+    "remote PR update",
+    "main merge",
+    "release",
+    "whole-world comparison",
+    "#24 performance measurement"
+  ],
+  "recorded_at": "2026-10-26T00:19:36.905057+00:00",
+  "reference": {
+    "construction": "Actual 1.21.1 random classes and Climate parameter tree; no server/world, no constructor bypass; previous-result thread-local cleared per tie lookup.",
+    "minecraft": "1.21.1",
+    "nextint_oracle_sha256": "8afac81d2608d6e35b10d543b55b74b31b10ce6cd20c867f9d201cb8a169161a",
+    "nextint_rows": 1116,
+    "nextint_tsv_sha256": "a6dd4bb4028b0803c53a4367e684a53f55c195e43562b151f87952a19e73c341",
+    "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
+    "tie_flagged": 2287,
+    "tie_oracle_sha256": "fa3b0801babe405c4e7e06241642cc44fba26e600959c2cc9256a2a5c8eae645",
+    "tie_rows": 2500,
+    "tie_tsv_sha256": "f3aea42792ff088ed1e9bc8f7b3c25ee961124e04ddb5e8f932e2361fecc6895"
+  },
+  "results": {
+    "added_failures": [],
+    "baseline": {
+      "failed": 0,
+      "ignored": 1,
+      "passed": 232
+    },
+    "clippy_all_targets_warnings_denied": true,
+    "container_wire": "PASS",
+    "debt_over_limit": 0,
+    "full_serial_release": {
+      "exit": 0,
+      "failed": 0,
+      "ignored": 1,
+      "passed": 234
+    },
+    "gameplay_wire": "PASS",
+    "layer_gate_tests": 17,
+    "layers": {
+      "edges": 47,
+      "modules": 20,
+      "named_errors": 0
+    },
+    "native_nextint": {
+      "completed_twice": true,
+      "mismatches": 0,
+      "rows": 1116
+    },
+    "native_tie": {
+      "completed_twice": true,
+      "mismatches": 0,
+      "rows": 2500,
+      "tie_flagged": 2287
+    },
+    "new_rust_tests": 2,
+    "removed_failures": [],
+    "selected_mutations": {
+      "not_a_gate": 0,
+      "parked": 0,
+      "proved": 2,
+      "skipped": 0
+    },
+    "unchanged_failure_baseline": true
+  },
+  "scope": "Imported PR #21 and #24 adapted to the local worldgen branch; not remote merge or whole-world acceptance.",
+  "source_sha256": {
+    ".github/workflows/ci.yml": "606304d248bc7e240c3b089683665d7495bb7d41e05dc2c637ebddf0bad17ca7",
+    "Cargo.lock": "d25c08cab2305cf8b40ee77ec03a6c485e824ce7cdad534912e18f6363d710ad",
+    "Cargo.toml": "dada0264d572418c1aa1b02bc3a4375492dc288a749d2127977000b1eaf380ef",
+    "evidence/foundation/module-layers/deps_target.py": "0fe153579352b747f7fa8c5ac0b85f292e4ad7f9138786518bdc55f77807d12f",
+    "evidence/foundation/module-layers/policy.json": "c69fcb3df74d0deab36639e9c66937084917d244c9ca7adf389ffae414a31fe9",
+    "evidence/foundation/upstream-prs/README.md": "3a0432e8dd2c52688d69781f27ffb737dc6b600d5326fd58840875dc80252b85",
+    "specs/README.md": "ffdf9b79c00cdf104bb7cf62474e1c8e1db41d5d65a0e784c3116183b6942184",
+    "specs/ROADMAP.md": "e54a4f918a89645946af832718062911b22ddd6572014dd7c34baa1ca4915ef0",
+    "src/aquifer_native_tests.rs": "00e436230df0ff8fbdbc78e98190ca4f99f63f146c40cb5353b9b1b94eee6ced",
+    "src/block_registry.rs": "c015c38549380894521d1fb50f78db1489e0586454bb3d6378f7553c00850c25",
+    "src/cached_lookup.rs": "0c5fdc139c95dfe7c0899b1ce8de39ff643d41d260d37616fab56985afa23307",
+    "src/chunk_ack.rs": "3457cf65ae2a69d3cbf5d8669cf098e30f71875a8bfd61cce8f29a885f3c4aaf",
+    "src/command_tests.rs": "51bc18221aad76dd33aafeb7dfb2f26d97a5bb2dfd90cfe191b74f1308e6cac9",
+    "src/container_tests.rs": "364079da8463c8a39ddec67e05a10b48ea09c0579c93b5fb886c3dcbae11a940",
+    "src/craft_tests.rs": "4fc80be6a7f3d4884c11f6c7c6edbd31ddd391ac8484b768cdeee9a6f49360e3",
+    "src/effect_tests.rs": "ea8f3fc7291211ba40a4b2a3d9689387742ac10681dd3d07ca750de029bededa",
+    "src/effects.rs": "46113e8b50487c3c4087554390036a9043a207ec478133d78294874b96cf6c66",
+    "src/entity_encoding_tests.rs": "d7be67a3bb0391919753cc53758600f1dbf403d08d1bfbc1b3299635e506da77",
+    "src/fanout_tests.rs": "d7ed3e90468289f7023616f511048d3ee3d2fe693d30239b4121c9402fe69eee",
+    "src/feature.rs": "f93fe57690bb281aec24dad06a5182889719ba6fa3a6d6c75743dca57cc840b3",
+    "src/furnace_cache_tests.rs": "c6e1cab8ec3452e997dab6553efde373b2422d400ddf9af6c624d291b251ff42",
+    "src/generation_context.rs": "f7d5649633e4dff0fd1bf91f1c37571dcf0bd8c1b8bfc7d8f34c0676c3cb6ead",
+    "src/generation_contract_tests.rs": "dea9caf8fed4cd47f3ca51d000b9e06995caad88098cdb6a3b061b0718417402",
+    "src/generation_math.rs": "7008484c5726e6e2aacaa7bcf6754a380f43128e7193eaf3047d5ddc931cd162",
+    "src/generation_providers.rs": "03290c8d5cd7e938a060cd2364db5e345cc389890de4c3dc6ed53a3793d2b447",
+    "src/ingress_guard.rs": "9a71fd328f01738e5f3f0506fc2972fe457677a4c7ce0b74568e8ab3ac7d0469",
+    "src/java_compat.rs": "2060cfd3a8a48e7d66415eb9324c41c409a7b47cf22e567cc9ba7a3b5b7aef3b",
+    "src/json.rs": "34c9aba426704711f47e16bc5f2e38f9d7d0895625f006a2c4b770a667b49aaa",
+    "src/landing.rs": "427b678db12c06759e62fce160580d3a3d2d3ae03dd0bf9ace9ad2c2b6a5e84c",
+    "src/landing_types.rs": "90b214871b8f0d7315009599af1ca461a1f53024a7d4590185916b9683806d82",
+    "src/light_pack_tests.rs": "8a35f69ed04fb0300fe77444ebe1ba605c4f8ab890a3f407b51de34c3ddd4ed1",
+    "src/main.rs": "29e1d4616656dcd269c5c6e5f27f0163c941daa4fe1730c7b05bc09a709a04ec",
+    "src/merge_tests.rs": "5e3120d445bd7b70ec8ecce6eaebea366a9f19cc5712a0c12b404eb7e60897b2",
+    "src/persistence_tests.rs": "286452bf218f96ffa835e72151a18186aa29259c7224aed9ee23d89fdc957d37",
+    "src/primitives_tests.rs": "3faca3437cfccf5ed3d505289202c284ca1ab256d9cb9619e425ef36e27a7978",
+    "src/registry_tests.rs": "cd931153f57a3482edf0006b15d6f8648b5bc9cd7baa421de2dec270ea26cf11",
+    "src/test_support.rs": "78bff331c339a8cd736f88fee9cfd90de318566c9b99aee033b569490e24f033",
+    "src/tick_queue.rs": "565874a920f1466b28f281a38d0415d7e202f954cf79a38e0995c37797c25618",
+    "src/tick_stats.rs": "ece168a82d6e8d33f8eff0c253470a047feba35c83eaf7a8c7ead126a6fec342",
+    "src/tick_tests.rs": "66b81bd57927fb69d4dc34396dbc8b8b0a4710771caeb64d653bf65c430a31fe",
+    "src/trace_env.rs": "d68949ec892c40acd1a68fe13fc6443cbfe8ed5ac78c8268c8034c6a2312ff0a",
+    "src/tree.rs": "94540bdf5a1a0d9c4e03080c77ad61e5e778488966bc9f182d3da00825254981",
+    "src/weird_sampler_tests.rs": "03fda74db84ad32ae96f9208b343cb6d607c0806e680274782a433e28edbf910",
+    "src/world_rng.rs": "b440d78b383752426b43f796718a21387c023f32081d8a903f84a0cc5303d144",
+    "src/worldgen.rs": "c55529b7ce41f4d2b5995567d2c1730695a45599f65f4a6a3a656af47ea94a6e",
+    "tests/biome_tie_oracle_test.py": "50fa33c455600956f52d68efbcfe26b2bd2de4087490d9ba08e4eda63860bfe0",
+    "tests/data/README.md": "153bd061de5fe40de82faa1b8ac03a6f1f86d879b98ed5bf35c44f37729a9cd8",
+    "tests/data/biome_probe_ties_1211.tsv": "f3aea42792ff088ed1e9bc8f7b3c25ee961124e04ddb5e8f932e2361fecc6895",
+    "tests/data/random_next_int_1211.tsv": "a6dd4bb4028b0803c53a4367e684a53f55c195e43562b151f87952a19e73c341",
+    "tests/nextint_oracle_test.py": "3ebd4f16d59dcbbf33fdbcbe7fc2379e0cbb80e7caf4383d5fa19cb7bdb234d0",
+    "tests/verify.sh": "8679b171815cda8f71101d8b3cd20f2591a932599f3e8e93c06aad9559a1f522",
+    "tools/README.md": "03b3dad7b230f780b7b02fc0758731caf2fdb7b6f8b507b534bed3795c6f3a3f",
+    "tools/biome-tie-oracle/BiomeTieOracle.java": "fa3b0801babe405c4e7e06241642cc44fba26e600959c2cc9256a2a5c8eae645",
+    "tools/biome_carver_oracle.py": "4c6f111e51d6b366a4d0b4dccb79664690da4e8ffd198bb7171578e43ea080a5",
+    "tools/biome_tie_oracle.py": "de6c00325ad7a71a491a6a2c0eff73bd9f1a0984e5913c29cf6fa788fdcf5d8e",
+    "tools/mutation_check.sh": "43e24c7f8cea65bc8032e7e67545b7f6abf5d52ead5716679022782a9c7006e1",
+    "tools/nextint-oracle/NextIntOracle.java": "8afac81d2608d6e35b10d543b55b74b31b10ce6cd20c867f9d201cb8a169161a",
+    "tools/nextint_oracle.py": "54f03e127ba330ac141d2d6fe959d54e4af672ec6b228771813a27714b402c8c"
+  },
+  "units": [
+    {
+      "accounting_message": "mc-pr-int-final-4.service: Consumed 52.362s CPU time over 46.851s wall clock time, 814.7M memory peak.",
+      "cpu_usage_nsec": 52362195000,
+      "invocation": "f80d0c512dff45b497b7e572ab341aca",
+      "memory_peak_bytes": 854302720,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-pr-int-final-4.service"
+    },
+    {
+      "accounting_message": "mc-pr-int-mut.service: Consumed 2min 9.374s CPU time over 2min 11.678s wall clock time, 997.4M memory peak, 29.9M memory swap peak.",
+      "cpu_usage_nsec": 129374721000,
+      "invocation": "9d236b9124624aaab08c67575d90920b",
+      "memory_peak_bytes": 1045946368,
+      "memory_swap_peak_bytes": 31424512,
+      "unit": "mc-pr-int-mut.service"
+    },
+    {
+      "accounting_message": "mc-pr-int-oracles.service: Consumed 7.801s CPU time over 7.800s wall clock time, 687M memory peak.",
+      "cpu_usage_nsec": 7801163000,
+      "invocation": "bd055617dcb644aab898b22c191d8e23",
+      "memory_peak_bytes": 720404480,
+      "memory_swap_peak_bytes": 0,
+      "unit": "mc-pr-int-oracles.service"
+    }
+  ]
+}

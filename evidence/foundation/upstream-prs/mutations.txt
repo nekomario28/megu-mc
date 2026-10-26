@@ -1,0 +1,6 @@
+
+ok    nextInt takes the 32-bit unsigned redraw threshold
+mutation check: 1 proved, 0 not a gate, 0 parked, 0 skipped
+
+ok    biome tree scans children in array order for ties
+mutation check: 1 proved, 0 not a gate, 0 parked, 0 skipped
