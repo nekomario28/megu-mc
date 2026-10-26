@@ -55,7 +55,9 @@ The target's remaining 114 cells are 60 leaf-distance, 20 lava, about 30 ore,
 1 chest, and 1 grass cell; they are the next feature layers. The lava source
 at `(-1024,-16,512)` was fixed by correcting `SpringFeature`'s above/below
 predicate; the 20 lava cells themselves are saved-world flow, not worldgen
-(`spring-orientation.txt`).
+(`spring-orientation.txt`). Ore origins were then compared: all **241/241**
+target origins and sizes match (`ore-origins.txt`), so the remaining ore cells
+are shape/overwrite, not placement.
 
 ## What the remaining cells are
 

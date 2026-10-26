@@ -1,0 +1,15 @@
+# Target ore origins are exact; the residual is shape/overwrite
+
+Full-feature reference (structures off), target chunk (-64,32), seed 0.
+
+Reference agent (`-Dorechunk=-64,32`) and port (`ORE_TRACE=-64,32`) both log
+**241** ore origins in the target chunk. All 241 tuples `(x,y,z,size)` match:
+0 reference-only, 0 port-only.
+
+Therefore the remaining target ore cells are not a placement/origin problem.
+They are cells inside an origin's generated shape, or cells later overwritten.
+Example: the diamond cells at (-1024,-53/-52,521/522) are absent in the port
+while the nearby origin is shared; the port also has deepslate where the
+reference has gold/redstone in a neighbour chunk. Next: compare one shared
+origin's block set against the pinned `OreFeature.doPlace` draw order and the
+later feature writes that can overwrite it.
