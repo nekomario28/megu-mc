@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 mod cached_lookup;
 mod chunk_ack;
+mod connection_limits;
 mod effects;
 #[cfg(feature = "java-compat")]
 mod java_compat;
@@ -296,9 +297,56 @@ fn angle(deg: f32) -> i8 {
     (deg / 360.0 * 256.0) as i8
 }
 
-static SKIN_CACHE: OnceLock<Mutex<HashMap<String, Option<(String, String)>>>> = OnceLock::new();
-fn skin_cache() -> &'static Mutex<HashMap<String, Option<(String, String)>>> {
+// Bounded: one entry per distinct name an (unauthenticated) client logs in
+// with would otherwise grow forever, and each miss costs two outbound requests.
+const SKIN_CACHE_CAP: usize = 1024;
+const SKIN_TTL_HIT: Duration = Duration::from_secs(60 * 60);
+const SKIN_TTL_MISS: Duration = Duration::from_secs(5 * 60);
+/// Concurrent outbound lookups (and lookup threads); a login whose name is not
+/// cached while this many are in flight simply goes without a skin.
+const SKIN_LOOKUPS_MAX: usize = 4;
+static SKIN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+type SkinEntry = (Instant, Option<(String, String)>);
+static SKIN_CACHE: OnceLock<Mutex<HashMap<String, SkinEntry>>> = OnceLock::new();
+fn skin_cache() -> &'static Mutex<HashMap<String, SkinEntry>> {
     SKIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn skin_entry_fresh(e: &SkinEntry, now: Instant) -> bool {
+    let ttl = if e.1.is_some() {
+        SKIN_TTL_HIT
+    } else {
+        SKIN_TTL_MISS
+    };
+    now.saturating_duration_since(e.0) < ttl
+}
+/// Fresh cached result for `key` (outer `None` = not cached or expired).
+fn skin_cache_get(
+    c: &HashMap<String, SkinEntry>,
+    key: &str,
+    now: Instant,
+) -> Option<Option<(String, String)>> {
+    c.get(key)
+        .filter(|e| skin_entry_fresh(e, now))
+        .map(|e| e.1.clone())
+}
+/// Insert, keeping at most `cap` entries: expired ones go first, then the oldest.
+fn skin_cache_put(
+    c: &mut HashMap<String, SkinEntry>,
+    key: String,
+    res: Option<(String, String)>,
+    now: Instant,
+    cap: usize,
+) {
+    if c.len() >= cap && !c.contains_key(&key) {
+        c.retain(|_, e| skin_entry_fresh(e, now));
+        while c.len() >= cap {
+            let Some(oldest) = c.iter().min_by_key(|(_, e)| e.0).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            c.remove(&oldest);
+        }
+    }
+    c.insert(key, (now, res));
 }
 fn fetch_skin(name: &str) -> Option<(String, String)> {
     // offline-mode skin resolution: name -> uuid -> session profile textures
@@ -331,30 +379,61 @@ fn fetch_skin(name: &str) -> Option<(String, String)> {
     let signature = jstr(&full, "signature")?.to_string();
     Some((value, signature))
 }
+/// Give `t` its resolved textures and re-announce it so connected viewers see them.
+fn apply_skin(t: &Arc<Client>, res: Option<(String, String)>) {
+    if let Some((v, sig)) = res {
+        *t.skin.lock().unwrap() = Some((v.clone(), sig.clone()));
+        // re-add player info so already-connected viewers pick up the skin
+        let cs = clients().lock().unwrap();
+        if !cs.iter().any(|c| Arc::ptr_eq(c, t)) {
+            return;
+        }
+        let pi = player_info_add(t);
+        for c in cs.iter() {
+            let _ = send_packet(&mut c.sock.lock().unwrap(), 0x3e, pi.clone());
+        }
+    }
+}
+struct SkinLookupSlot;
+impl SkinLookupSlot {
+    fn try_acquire() -> Option<Self> {
+        if SKIN_INFLIGHT.fetch_add(1, Ordering::SeqCst) < SKIN_LOOKUPS_MAX {
+            Some(SkinLookupSlot)
+        } else {
+            SKIN_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
+    }
+}
+impl std::ops::Drop for SkinLookupSlot {
+    fn drop(&mut self) {
+        SKIN_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 fn kick_skin(name: String, target: &Arc<Client>) {
+    // Mojang names are case-insensitive; one cache entry per name, not per spelling.
+    let key = name.to_ascii_lowercase();
+    let hit = skin_cache_get(&skin_cache().lock().unwrap(), &key, Instant::now());
+    if let Some(res) = hit {
+        apply_skin(target, res);
+        return;
+    }
+    // Not cached: at most SKIN_LOOKUPS_MAX lookups (and threads) at a time.
+    let Some(slot) = SkinLookupSlot::try_acquire() else {
+        return;
+    };
     let t = target.clone();
     thread::spawn(move || {
-        let hit = skin_cache().lock().unwrap().get(&name).cloned();
-        let res = match hit {
-            Some(r) => r,
-            None => {
-                let r = fetch_skin(&name);
-                skin_cache().lock().unwrap().insert(name, r.clone());
-                r
-            }
-        };
-        if let Some((v, sig)) = res {
-            *t.skin.lock().unwrap() = Some((v.clone(), sig.clone()));
-            // re-add player info so already-connected viewers pick up the skin
-            let cs = clients().lock().unwrap();
-            if !cs.iter().any(|c| Arc::ptr_eq(c, &t)) {
-                return;
-            }
-            let pi = player_info_add(&t);
-            for c in cs.iter() {
-                let _ = send_packet(&mut c.sock.lock().unwrap(), 0x3e, pi.clone());
-            }
-        }
+        let _slot = slot;
+        let r = fetch_skin(&name);
+        skin_cache_put(
+            &mut skin_cache().lock().unwrap(),
+            key,
+            r.clone(),
+            Instant::now(),
+            SKIN_CACHE_CAP,
+        );
+        apply_skin(&t, r);
     });
 }
 fn player_info_add(c: &Client) -> Vec<u8> {
@@ -443,7 +522,14 @@ where
         }
         let pl = mk(c);
         if let Ok(mut w) = c.sock.lock() {
-            let _ = send_packet(&mut w, pl.0, pl.1);
+            if send_packet(&mut w, pl.0, pl.1).is_err() {
+                // A write that timed out or failed leaves the stream at an unknown
+                // frame boundary and the client behind; it is not coming back. Shut
+                // the socket so its own thread sees the close and logs it out, and
+                // so every later broadcast fails at once instead of waiting out the
+                // write timeout again (each one stalled the tick thread).
+                let _ = w.shutdown(std::net::Shutdown::Both);
+            }
         }
     }
 }
@@ -6925,16 +7011,68 @@ fn save_world() {
     // temporary file plus a retained backup means a failed write cannot destroy
     // the previous save.
     let framed = wrap_world_payload(&f);
-    let tmp = format!("{}.tmp", WORLD_FILE);
-    if std::fs::write(&tmp, &framed).is_err() {
-        return;
+    if let Err(error) = write_world_file(
+        std::path::Path::new(WORLD_FILE),
+        &framed,
+        connection_limits::backup_interval(),
+    ) {
+        eprintln!("[spine] WORLD SAVE FAILED: {error}");
     }
-    if std::path::Path::new(WORLD_FILE).exists() {
-        let _ = std::fs::copy(WORLD_FILE, format!("{}.bak", WORLD_FILE));
+}
+/// Write `framed` to `path` via `path.tmp` (fsynced), then rename over it.
+///
+/// Backups are `path.bak` (the previous save, so at most one autosave old),
+/// `path.bak.1` and `path.bak.2`. The older two only advance when `bak.1` is at
+/// least `interval` old, so three generations span more than a few autosaves.
+/// Every failure is returned with the path involved; the live file is only
+/// replaced after the tmp file is complete.
+fn write_world_file(
+    path: &std::path::Path,
+    framed: &[u8],
+    interval: Duration,
+) -> Result<(), String> {
+    let with = |suffix: &str| {
+        let mut o = path.as_os_str().to_owned();
+        o.push(suffix);
+        std::path::PathBuf::from(o)
+    };
+    let (tmp, bak, bak1, bak2) = (with(".tmp"), with(".bak"), with(".bak.1"), with(".bak.2"));
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        f.write_all(framed)
+            .and_then(|_| f.sync_all())
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     }
-    if let Err(error) = std::fs::rename(&tmp, WORLD_FILE) {
-        eprintln!("[spine] world save rename failed: {error}");
+    if path.exists() {
+        // Backup trouble is reported but never blocks the save itself.
+        let age = |p: &std::path::Path| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+        };
+        if bak.exists() && age(&bak1).is_none_or(|a| a >= interval) {
+            if bak1.exists() {
+                if let Err(e) = std::fs::rename(&bak1, &bak2) {
+                    eprintln!("[spine] backup rotate {} failed: {e}", bak1.display());
+                }
+            }
+            if let Err(e) = std::fs::copy(&bak, &bak1) {
+                eprintln!("[spine] backup rotate {} failed: {e}", bak.display());
+            }
+        }
+        if let Err(e) = std::fs::copy(path, &bak) {
+            eprintln!("[spine] backup {} failed: {e}", bak.display());
+        }
     }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        format!(
+            "cannot rename {} over {}: {e}",
+            tmp.display(),
+            path.display()
+        )
+    })
 }
 fn save_world_into(f: &mut Vec<u8>) {
     let w = world().lock().unwrap();
@@ -11183,6 +11321,14 @@ fn http_server() {
     let bind = std::env::var("MC_SPINE_RESOURCE_PACK_BIND_ADDR")
         .or_else(|_| std::env::var("MC_SPINE_BIND_ADDR"))
         .unwrap_or_else(|_| "127.0.0.1".into());
+    if let Err(why) = connection_limits::check_bind(
+        "resource pack http",
+        &bind,
+        connection_limits::public_bind_allowed(),
+    ) {
+        eprintln!("[spine] {why}");
+        return;
+    }
     let Ok(l) = TcpListener::bind((bind.as_str(), 25598)) else {
         eprintln!("[spine] resource pack bind failed on {bind}:25598");
         return;
@@ -16998,12 +17144,38 @@ fn login_identity(body: &[u8]) -> Option<(String, [u8; 16])> {
     Some((name.to_owned(), uuid))
 }
 
+/// Login-state Disconnect (0x00): the client shows `reason` on its disconnect screen.
+/// `reason` must be a plain string without quotes or backslashes (all callers pass literals).
+fn login_disconnect(s: &mut TcpStream, reason: &str) {
+    let mut pl = Vec::new();
+    write_str(&mut pl, &format!("{{\"text\":\"{reason}\"}}"));
+    let _ = send_packet(s, 0, pl);
+}
+/// Play-state Disconnect (0x1d); same delivery as the other clientbound packets.
+fn play_disconnect(s: &mut TcpStream, reason: &str) {
+    let _ = send_packet(s, 0x1d, chat_nbt(reason));
+}
+/// One line per refused connection, at most one per second so a flood cannot
+/// turn the log itself into the denial of service.
+fn log_refusal(ip: &str, why: &str) {
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now = START.get_or_init(Instant::now).elapsed().as_secs();
+    if LAST.swap(now, Ordering::Relaxed) != now {
+        eprintln!("[security] refused connection from {ip}: {why}");
+    }
+}
+
 fn handle(mut s: TcpStream) {
     s.set_nodelay(true).ok();
+    let peer = s
+        .peer_addr()
+        .map_or_else(|_| "unknown".to_string(), |a| a.ip().to_string());
     // Applied before handshake/login: idle unauthenticated sockets must expire.
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
-    let login_deadline = Instant::now() + Duration::from_secs(30);
+    // One wall-clock budget for handshake, login and configuration together.
+    let login_deadline = Instant::now() + connection_limits::login_timeout();
     let (id, hs) = match read_packet(&mut s, login_deadline) {
         Some(x) => x,
         None => return,
@@ -17039,6 +17211,27 @@ fn handle(mut s: TcpStream) {
     }
     let Some((name, uuid)) = login_identity(&lbody) else {
         return;
+    };
+    if let Some(list) = connection_limits::allowlist() {
+        if !list.permits(&name, &uuid) {
+            eprintln!("[security] login refused for {name} from {peer}: not on the allowlist");
+            login_disconnect(&mut s, "You are not white-listed on this server!");
+            return;
+        }
+    }
+    // Held until this function returns, i.e. through the player's save on
+    // logout: a second session under the same identity cannot start from stale
+    // saved state or write over this one.
+    let _login = match LOGINS.reserve(&name, uuid) {
+        Ok(g) => g,
+        Err(why) => {
+            eprintln!("[security] duplicate login refused for {name} from {peer}: {why:?}");
+            login_disconnect(
+                &mut s,
+                "A player with that name or UUID is already logged in.",
+            );
+            return;
+        }
     };
     let mut ls = Vec::new();
     ls.extend_from_slice(&uuid);
@@ -17083,7 +17276,9 @@ fn handle(mut s: TcpStream) {
                 break;
             }
             Some(_) => continue,
-            None => continue,
+            // EOF, malformed length or the login deadline: the client is gone.
+            // `continue` here spun at 100% CPU, since read_packet fails at once.
+            None => return,
         }
     }
     if !got_selpacks {
@@ -17112,7 +17307,7 @@ fn handle(mut s: TcpStream) {
             }
             Some((0x03, _)) => break,
             Some(_) => continue,
-            None => continue,
+            None => return,
         }
     }
     // ---- play ----
@@ -17200,7 +17395,12 @@ fn handle(mut s: TcpStream) {
     }
     // restore saved inventory for this name
     let saved_inv = inv_store().lock().unwrap().get(&name).cloned();
-    eprintln!("[spine] {} joined", name);
+    eprintln!(
+        "[spine] {} joined from {} (uuid {})",
+        name,
+        peer,
+        hex(&uuid)
+    );
     // ---- multiplayer: register self, tell others, learn others ----
     let me = Arc::new(Client {
         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -17304,6 +17504,11 @@ fn handle(mut s: TcpStream) {
 
     let mut player_chunk: (i32, i32) = (0, 0);
     let mut rx = RxBuf::new();
+    // play-state liveness: a client that stops sending complete packets (it
+    // answers our 8 s keepalive and moves, so this is never quiet for long)
+    let idle_limit = connection_limits::idle_timeout();
+    let mut last_rx = Instant::now();
+    let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
     'conn: loop {
         if last_ka.elapsed() > Duration::from_secs(8) {
             let mut ka = Vec::new();
@@ -17315,8 +17520,21 @@ fn handle(mut s: TcpStream) {
         }
         let (pid, b) = match rx.next(&mut s) {
             RxOut::Closed => break 'conn,
-            RxOut::Idle => continue,
-            RxOut::Frame(pid, b) => (pid, b),
+            RxOut::Idle => {
+                if last_rx.elapsed() > idle_limit {
+                    eprintln!(
+                        "[spine] {} disconnected: no packet for {:?}",
+                        me.name, idle_limit
+                    );
+                    play_disconnect(&mut me.sock.lock().unwrap(), "Timed out");
+                    break 'conn;
+                }
+                continue;
+            }
+            RxOut::Frame(pid, b) => {
+                last_rx = Instant::now();
+                (pid, b)
+            }
         };
 
         // a client that stopped answering chunk batches is gone, not slow
@@ -18355,6 +18573,16 @@ fn handle(mut s: TcpStream) {
                 if let Some(mlen) = read_varint(&mut sl) {
                     let m =
                         String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
+                    if !connection_limits::chat_text_valid(&m) {
+                        eprintln!("[spine] {} disconnected: illegal chat command", me.name);
+                        play_disconnect(&mut me.sock.lock().unwrap(), "Illegal characters in chat");
+                        break 'conn;
+                    }
+                    if !chat_throttle.allow(Instant::now()) {
+                        eprintln!("[spine] {} disconnected: chat spam", me.name);
+                        play_disconnect(&mut me.sock.lock().unwrap(), "Kicked for spamming!");
+                        break 'conn;
+                    }
 
                     run_command(Some(&me), &format!("/{}", m), &mut Some(&mut s));
                 }
@@ -18365,6 +18593,17 @@ fn handle(mut s: TcpStream) {
                 if let Some(mlen) = read_varint(&mut sl) {
                     let m =
                         String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
+                    // vanilla: over-long or illegal text disconnects, and so does spam
+                    if !connection_limits::chat_text_valid(&m) {
+                        eprintln!("[spine] {} disconnected: illegal chat message", me.name);
+                        play_disconnect(&mut me.sock.lock().unwrap(), "Illegal characters in chat");
+                        break 'conn;
+                    }
+                    if !chat_throttle.allow(Instant::now()) {
+                        eprintln!("[spine] {} disconnected: chat spam", me.name);
+                        play_disconnect(&mut me.sock.lock().unwrap(), "Kicked for spamming!");
+                        break 'conn;
+                    }
                     if m.starts_with('/') {
                         run_command(Some(&me), &m, &mut Some(&mut s));
                         continue;
@@ -20564,7 +20803,7 @@ fn handle(mut s: TcpStream) {
         flush_block_updates();
     }
     {
-        eprintln!("[spine] {} left", name);
+        eprintln!("[spine] {} left (from {})", name, peer);
         {
             // remove owned projectile/bobber entities
             let mut fb = bobbers().lock().unwrap();
@@ -21053,8 +21292,18 @@ impl std::ops::Drop for ConnectionSlot<'_> {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
+static IP_CONNS: connection_limits::IpConnections = connection_limits::IpConnections::new();
+static LOGINS: connection_limits::LoginRegistry = connection_limits::LoginRegistry::new();
+static RCON_AUTH: connection_limits::AuthThrottle = connection_limits::AuthThrottle::new();
+
+fn peer_label(s: &TcpStream) -> String {
+    s.peer_addr()
+        .map_or_else(|_| "unknown".to_string(), |a| a.ip().to_string())
+}
 fn rcon_conn(mut s: TcpStream, pass: String) {
     use std::io::Write;
+    let peer_ip = s.peer_addr().ok().map(|a| a.ip());
+    let peer = peer_ip.map_or_else(|| "unknown".to_string(), |ip| ip.to_string());
     s.set_nodelay(true).ok();
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
@@ -21080,10 +21329,26 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
         let ty = i32::from_le_bytes(body[4..8].try_into().unwrap());
         let cmd = String::from_utf8_lossy(&body[8..body.len().saturating_sub(2)]).to_string();
         let (rid, rty, out) = if !authed {
-            if ty == 3 && cmd == pass {
+            if ty == 3 && connection_limits::ct_eq(cmd.as_bytes(), pass.as_bytes()) {
                 authed = true;
+                if let Some(ip) = peer_ip {
+                    RCON_AUTH.record_success(ip);
+                }
+                eprintln!("[rcon] {peer} authenticated");
                 (id, 2i32, String::new())
             } else if ty == 3 {
+                // never log the attempted password
+                let fails = peer_ip.map_or(0, |ip| {
+                    RCON_AUTH.record_failure(
+                        ip,
+                        Instant::now(),
+                        connection_limits::rcon_max_failures(),
+                        connection_limits::rcon_lockout(),
+                    )
+                });
+                eprintln!("[security] rcon authentication failed from {peer} (failure #{fails})");
+                // slow a guessing client down; the lockout stops a patient one
+                std::thread::sleep(Duration::from_secs(1));
                 (id, 2i32, String::new())
             }
             // wrong pass handled below
@@ -21092,9 +21357,10 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
             }
         } else {
             match ty {
-                2 => (
-                    id,
-                    0i32,
+                2 => (id, 0i32, {
+                    // audit trail: who ran what (Debug-escaped so a command
+                    // cannot forge log lines)
+                    eprintln!("[rcon] {peer} exec: {cmd:?}");
                     run_command_ctx(
                         &CmdCtx {
                             me: None,
@@ -21104,16 +21370,12 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
                         },
                         &format!("/{}", cmd.trim_start_matches('/')),
                         &mut None,
-                    ),
-                ),
+                    )
+                }),
                 _ => (id, 0i32, String::new()),
             }
         };
-        let rid = if ty == 3 && !authed && !pass.is_empty() && cmd != pass {
-            -1
-        } else {
-            rid
-        };
+        let rid = if ty == 3 && !authed { -1 } else { rid };
         let mut p = Vec::with_capacity(out.len() + 14);
         p.extend_from_slice(&(10 + out.len() as i32).to_le_bytes());
         p.extend_from_slice(&rid.to_le_bytes());
@@ -21141,6 +21403,12 @@ fn rcon_listener() {
         return;
     }
     let bind = std::env::var("MC_SPINE_RCON_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    if let Err(why) =
+        connection_limits::check_bind("RCON", &bind, connection_limits::public_bind_allowed())
+    {
+        eprintln!("[rcon] {why}");
+        return;
+    }
     let Ok(l) = TcpListener::bind((bind.as_str(), port)) else {
         eprintln!("[rcon] bind failed on {bind}:{port}");
         return;
@@ -21148,6 +21416,17 @@ fn rcon_listener() {
     eprintln!("[rcon] listening {bind}:{port}");
     static RCON_ACTIVE: AtomicUsize = AtomicUsize::new(0);
     for s in l.incoming().flatten() {
+        // a locked-out address does not even get a handler thread
+        if let Ok(a) = s.peer_addr() {
+            if let Some(left) = RCON_AUTH.locked_for(a.ip(), Instant::now()) {
+                log_refusal(
+                    &a.ip().to_string(),
+                    &format!("rcon lockout, {}s left", left.as_secs()),
+                );
+                drop(s);
+                continue;
+            }
+        }
         if RCON_ACTIVE.fetch_add(1, Ordering::SeqCst) >= 8 {
             RCON_ACTIVE.fetch_sub(1, Ordering::SeqCst);
             drop(s);
@@ -21573,6 +21852,16 @@ fn main() {
         eprintln!("[mod-compatibility] {error}");
         std::process::exit(1);
     }
+    // Fail before any state is loaded or listener opened.
+    let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    if let Err(why) = connection_limits::check_bind(
+        "game listener",
+        &bind,
+        connection_limits::public_bind_allowed(),
+    ) {
+        eprintln!("[security] {why}");
+        std::process::exit(2);
+    }
     std::thread::spawn(rcon_listener);
     http_server();
     load_datapacks();
@@ -21627,7 +21916,16 @@ fn main() {
             std::thread::sleep(next_tick.saturating_duration_since(Instant::now()));
             next_tick = next_deadline(next_tick, Instant::now() > next_tick + TICK_INTERVAL);
             let started = Instant::now();
-            game_tick(|_, tick| tick());
+            // A panicking tick must not leave the listener serving a world that no
+            // longer advances. Log loudly and exit non-zero so a supervisor
+            // (systemd, docker) restarts from the last autosave. The world is not
+            // saved here: the panic may have left it half-updated, and a torn state
+            // must not replace the last good save. (The panic also poisons every
+            // Mutex it held; the lock().unwrap() calls elsewhere are left as they are.)
+            if let Err(msg) = connection_limits::catch_panic(|| game_tick(|_, tick| tick())) {
+                eprintln!("[FATAL] tick thread panicked: {msg}; exiting so the server restarts");
+                std::process::exit(70);
+            }
             // the working server's own record of G3: the tick body's cost against
             // the 50ms budget, once per 100 ticks
             if let Some(r) = stats.record(Instant::now(), started.elapsed()) {
@@ -21657,13 +21955,12 @@ fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(25599);
-    let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
     eprintln!(
         "mc-spine v0.6 listening {bind}:{port} (offline identities; no Mojang authentication)"
     );
-    if bind != "127.0.0.1" && bind != "::1" {
-        eprintln!("[security] non-loopback bind: restrict access with a firewall/private network");
+    if !connection_limits::is_loopback_bind(&bind) {
+        eprintln!("[security] non-loopback bind (MC_SPINE_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
     }
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
     for st in l.incoming() {
@@ -21671,11 +21968,26 @@ fn main() {
             // connection cap: refuse above 64 live handler threads
             if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 64 {
                 ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                log_refusal(&peer_label(&s), "server connection cap (64) reached");
                 drop(s);
                 continue;
             }
+            // ...and above the per-IP cap, so one host cannot take all 64 slots
+            let ip_slot = match s.peer_addr() {
+                Ok(a) => match IP_CONNS.acquire(a.ip(), connection_limits::per_ip_limit(a.ip())) {
+                    Some(slot) => Some(slot),
+                    None => {
+                        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                        log_refusal(&a.ip().to_string(), "per-IP connection limit reached");
+                        drop(s);
+                        continue;
+                    }
+                },
+                Err(_) => None,
+            };
             thread::spawn(move || {
                 let _slot = ConnectionSlot(&ACTIVE);
+                let _ip_slot = ip_slot;
                 handle(s);
             });
         }
@@ -21873,5 +22185,133 @@ mod save_integrity_tests {
         let mut corrupt = original;
         *corrupt.last_mut().unwrap() ^= 1;
         assert_eq!(unwrap_world_payload(corrupt), Err("save checksum mismatch"));
+    }
+}
+
+#[cfg(test)]
+mod save_backup_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spine-save-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saves_keep_three_backup_generations_and_no_tmp_left() {
+        let dir = scratch("gens");
+        let world = dir.join("world.bin");
+        // interval 0: every save rotates, so the generations are easy to read
+        for n in 1..=5u8 {
+            write_world_file(&world, &[n], Duration::ZERO).unwrap();
+        }
+        let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+        assert_eq!(read("world.bin"), [5]);
+        assert_eq!(read("world.bin.bak"), [4]);
+        assert_eq!(read("world.bin.bak.1"), [3]);
+        assert_eq!(read("world.bin.bak.2"), [2]);
+        assert!(!dir.join("world.bin.bak.3").exists());
+        assert!(!dir.join("world.bin.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_generations_do_not_advance_within_the_interval() {
+        let dir = scratch("interval");
+        let world = dir.join("world.bin");
+        for n in 1..=5u8 {
+            write_world_file(&world, &[n], Duration::from_secs(3600)).unwrap();
+        }
+        let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+        assert_eq!(read("world.bin"), [5]);
+        assert_eq!(
+            read("world.bin.bak"),
+            [4],
+            ".bak is always the previous save"
+        );
+        // bak.1 was created on the second save and is far younger than an hour
+        assert_eq!(read("world.bin.bak.1"), [1]);
+        assert!(!dir.join("world.bin.bak.2").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_is_reported_with_its_path_and_keeps_the_old_world() {
+        let dir = scratch("fail");
+        let world = dir.join("world.bin");
+        write_world_file(&world, b"good", Duration::ZERO).unwrap();
+        // a directory squatting on the tmp path makes the tmp write fail
+        std::fs::create_dir(dir.join("world.bin.tmp")).unwrap();
+        let err = write_world_file(&world, b"new", Duration::ZERO).unwrap_err();
+        assert!(err.contains("world.bin.tmp"), "{err}");
+        assert_eq!(std::fs::read(&world).unwrap(), b"good");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod skin_cache_tests {
+    use super::*;
+
+    fn skin(n: u8) -> Option<(String, String)> {
+        Some((format!("v{n}"), format!("s{n}")))
+    }
+
+    #[test]
+    fn the_cache_never_exceeds_its_cap_and_evicts_the_oldest() {
+        let mut c = HashMap::new();
+        let t0 = Instant::now();
+        for i in 0..10u8 {
+            skin_cache_put(
+                &mut c,
+                format!("n{i}"),
+                skin(i),
+                t0 + Duration::from_secs(i as u64),
+                4,
+            );
+            assert!(c.len() <= 4);
+        }
+        assert!(skin_cache_get(&c, "n9", t0 + Duration::from_secs(9)).is_some());
+        assert!(skin_cache_get(&c, "n0", t0 + Duration::from_secs(9)).is_none());
+        // re-inserting an existing key at the cap does not evict anything
+        let before = c.len();
+        skin_cache_put(
+            &mut c,
+            "n9".into(),
+            skin(99),
+            t0 + Duration::from_secs(10),
+            4,
+        );
+        assert_eq!(c.len(), before);
+    }
+
+    #[test]
+    fn entries_expire_and_misses_expire_sooner_than_hits() {
+        let mut c = HashMap::new();
+        let t0 = Instant::now();
+        skin_cache_put(&mut c, "hit".into(), skin(1), t0, 8);
+        skin_cache_put(&mut c, "miss".into(), None, t0, 8);
+        let soon = t0 + SKIN_TTL_MISS + Duration::from_secs(1);
+        assert_eq!(skin_cache_get(&c, "miss", t0), Some(None));
+        assert!(skin_cache_get(&c, "miss", soon).is_none());
+        assert_eq!(skin_cache_get(&c, "hit", soon), Some(skin(1)));
+        assert!(skin_cache_get(&c, "hit", t0 + SKIN_TTL_HIT + Duration::from_secs(1)).is_none());
+        // expired entries are dropped before live ones when making room
+        skin_cache_put(&mut c, "a".into(), skin(2), soon, 2);
+        assert!(c.contains_key("hit") && c.contains_key("a") && !c.contains_key("miss"));
+    }
+
+    #[test]
+    fn lookups_in_flight_are_bounded() {
+        let mut held = Vec::new();
+        while let Some(slot) = SkinLookupSlot::try_acquire() {
+            held.push(slot);
+            assert!(held.len() <= SKIN_LOOKUPS_MAX);
+        }
+        assert_eq!(held.len(), SKIN_LOOKUPS_MAX);
+        drop(held);
+        assert!(SkinLookupSlot::try_acquire().is_some());
     }
 }
