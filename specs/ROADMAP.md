@@ -4,15 +4,15 @@
 
 ## いまの判断 — 広げる前に収束する
 
-Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **239 passed / 0 failed / 1 ignored** まで戻りました。surface steepのheightmapだけを実クラス由来で修正しましたが、whole-world比較・forest残差・surface scan全体・spawn_costs適用は未確認です。緑を全体合格へ読み替えず、まずR0の残りとR1へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
+Horizon / Valence から使える部品は既存 owner に取り込みました。ローカルsuiteは[surface context slice](../evidence/foundation/surface-context/README.md)で **239 passed / 0 failed / 1 ignored** まで戻りました。steepのheightmap、条件式4,037行、合成stone/water列の実`buildSurface` scan 768列を実クラスと照合しました。ただしreal-noise地形への適用・whole-world比較・forest残差・spawn_costs適用は未確認です。緑を全体合格へ読み替えず、R1のsame-stage比較へ進みます。新しいframework・ECS・別の衝突エンジンを追加する段階ではありません。
 
-**次の最小slice:** `SurfaceSystem.buildSurface` のscan（ocean-floor開始、water height、stone depth）を実クラスの条件評価とsynthetic columnで照合する。steepのheightmap修正は[surface contextの証拠](../evidence/foundation/surface-context/README.md)、`spawners`/`spawn_costs`の読み込みと夜間hostile選択は[biome spawnerの証拠](../evidence/foundation/biome-spawners/README.md)、`carvers`のAIR listは[carverの証拠](../evidence/foundation/biome-carvers/README.md)で限定範囲を閉じた。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
+**次の最小slice:** R1のsame-stage受け入れとして、元のseed・座標のwhole-chunk、heightmap、ore、kelp、geodeを、固定jarから再構成した参照と比較する。まずforest `(-64,32)`のstone/deepslate残差を密度・aquifer・surface・carver・feature・生成後tickへ分ける。surface steep/条件式/合成buildSurface scanは[surface contextの証拠](../evidence/foundation/surface-context/README.md)、`spawners`/`spawn_costs`の読み込みと夜間hostile選択は[biome spawnerの証拠](../evidence/foundation/biome-spawners/README.md)、`carvers`のAIR listは[carverの証拠](../evidence/foundation/biome-carvers/README.md)で限定範囲を閉じた。`spawn_costs`のenergy budget適用とNaturalSpawner全体は未実装であり、全chunkの再生成や別のdonor機能へ先に広げません。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
 1. 全体テストの一次失敗とmutex poisonの連鎖を分ける。一次失敗は必要なら新しいプロセスで再現し、入力・loader・評価器・古いcaptureのどこに属するかを特定する。poisonを握り潰して緑にしない。
-2. 残るdensity function、surfaceのscan context（steepのheightmapは[修正済み](../evidence/foundation/surface-context/README.md)）、`spawn_costs`の適用を、固定1.21.1の実際の意味で評価する。aquiferのpreliminary surface・流体状態は[実クラス対照](../evidence/foundation/aquifer/README.md)、biome `carvers` のAIR listとown-jar configured_feature pathは[carverの証拠](../evidence/foundation/biome-carvers/README.md)、`spawners`の読み込みと夜間hostile選択は[biome spawnerの証拠](../evidence/foundation/biome-spawners/README.md)で限定範囲を閉じた。全seed/chunk、deep-dark実chunk、NaturalSpawner、spawn_costsのenergy budgetは未検証である。各差分を独立した小さい実クラス対照と本番経路のゲートにする。
-3. surfaceはsourceのdecodeや温度条件だけで閉じず、実際のbiome選択・列の走査状態・surface contextを含む適用結果を検査する。未知ノード・解決できない参照・落とした入力名は明示し、成功したように読み替えない。異なるseedや生成器の寿命をまたぐnoise cacheと、循環参照のplaceholderも、比較を隠さない条件で検査する。
+2. 残るdensity function、real-noise地形へのsurface適用（steep/条件式/合成scanは[照合済み](../evidence/foundation/surface-context/README.md)）、`spawn_costs`の適用を、固定1.21.1の実際の意味で評価する。aquiferのpreliminary surface・流体状態は[実クラス対照](../evidence/foundation/aquifer/README.md)、biome `carvers` のAIR listとown-jar configured_feature pathは[carverの証拠](../evidence/foundation/biome-carvers/README.md)、`spawners`の読み込みと夜間hostile選択は[biome spawnerの証拠](../evidence/foundation/biome-spawners/README.md)で限定範囲を閉じた。全seed/chunk、deep-dark実chunk、NaturalSpawner、spawn_costsのenergy budgetは未検証である。各差分を独立した小さい実クラス対照と本番経路のゲートにする。
+3. surfaceはsourceのdecodeや温度条件、合成列のscanだけで閉じず、実際のbiome選択・実noise列・surface contextを含む適用結果を検査する。未知ノード・解決できない参照・落とした入力名は明示し、成功したように読み替えない。異なるseedや生成器の寿命をまたぐnoise cacheと、循環参照のplaceholderも、比較を隠さない条件で検査する。
 
 **出口:** 比較対象のrouter/biome/surface経路に未説明のゼロ代替・参照落ちが残らず、未解決・未対応の一覧と本番での到達性を説明できる。ローカルsuiteの緑は必要条件であり、whole-world・native対照・CIの代用にしない。意味を変えた経路には実クラス対照と故障を検出するテストがある。全体の赤は一次原因へ帰属させ、原因未確認のcapture更新で消さない。個別の修正ごとに広い回帰を確認し、全体合格は必須テストが通ってから判定する。
 
@@ -20,14 +20,14 @@ Horizon / Valence から使える部品は既存 owner に取り込みました�
 
 ## R1 — 同じ生成stageでworldgenを再受け入れする
 
-1. loader/evaluatorの修正後、元の座標・seedのwhole-chunk、heightmap、ore、kelp、geodeを再比較する。古い一時worldが無ければ固定jarから再構成し、参照chunkの完成と正のcoverageを先に検査する。
+1. loader/evaluatorの修正後、元の座標・seedのwhole-chunk、heightmap、ore、kelp、geodeを再比較する。古い一時worldが無ければ`tools/chunk_fixture.sh`等で固定jarから再構成し、参照chunkの完成と正のcoverageを先に検査する。
 2. forestのstone/deepslate残差を、密度・aquifer・surface・carver・feature・生成後tickに分ける。surfaceを読めるようにしたことだけで、既存の大きな残差が消えたとは扱わない。
-3. biome lookup、隣接chunkの書込み、decorating order、乱数消費を、同じstageの参照と照合する。Xoroshiro `nextInt` の32bit unsignedしきい値とbiome treeのtie順は並行PRの候補であり、この枝へ持ち込む前に同じ実クラスvectorで再検証する。kelpの列やgeodeのノイズなど、残差を最小の中間値まで戻して検査する。
+3. biome lookup、隣接chunkの書込み、decorating order、乱数消費を、同じstageの参照と照合する。Xoroshiro `nextInt` の32bit unsignedしきい値とbiome treeのtie順は[実クラスvectorで検証済み](../evidence/foundation/upstream-prs/README.md)であり、同じstageの比較で使う。kelpの列やgeodeのノイズなど、残差を最小の中間値まで戻して検査する。
 4. 未検証featureは到達する正の固定具を用意してから広げる。未実装のfossilにはtemplate/processor、sculk patchにはspreader/runtimeの契約が先に必要。構造物やjigsawまで対応したと一括で主張しない。
 
 **出口:** 宣言した範囲で、全参照chunkの完成・対象経路の実行・セル/状態/heightmapの比較が成立し、差分集合・除外・skipを説明できる。両側ゼロ、全skip、保存worldのruntime差をfeature差と呼ぶ比較は合格にしない。未実装範囲は別に残す。
 
-根拠: [比較の約束](../DESIGN.md#比較の約束)、[worldgenの比較記録](../evidence/gameplay/carvers/README.md)、[featureの部分検証](../evidence/gameplay/feature-parity/README.md)。
+根拠: [比較の約束](../DESIGN.md#比較の約束)、[worldgenの比較記録](../evidence/gameplay/carvers/README.md)、[featureの部分検証](../evidence/gameplay/feature-parity/README.md)、[surface contextの検証範囲](../evidence/foundation/surface-context/README.md)。
 
 ## R2 — 部品の一致から、操作とlifecycleの一致へ広げる
 
