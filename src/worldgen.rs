@@ -2336,6 +2336,81 @@ pub(crate) struct ChunkCols {
 
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
 
+/// `GEN`'s lock, timing how long a caller waited for it and how long it held it.
+///
+/// The parallelization decision needs this split: `FEAT_PROFILE` can say how much
+/// work a populate does, but not how much of a server's wall time is spent queued
+/// behind the one world lock. Off unless `FEAT_PROFILE` is set, in which case the
+/// two `Instant` calls are paid on every acquisition.
+pub(crate) struct GenLock {
+    guard: std::sync::MutexGuard<'static, Option<Gen>>,
+    /// `Some` when profiling: the time spent inside `GEN.lock()`.
+    waited_ns: Option<u64>,
+    held_since: Option<std::time::Instant>,
+}
+static GEN_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GEN_HOLD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GEN_LOCK_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Drop for GenLock {
+    fn drop(&mut self) {
+        let (Some(waited), Some(since)) = (self.waited_ns, self.held_since) else {
+            return;
+        };
+        use std::sync::atomic::Ordering;
+        GEN_HOLD_NS.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        GEN_WAIT_NS.fetch_add(waited, Ordering::Relaxed);
+        GEN_LOCK_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for GenLock {
+    type Target = Option<Gen>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+impl std::ops::DerefMut for GenLock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+fn gen_lock() -> GenLock {
+    let prof = env_flag!("FEAT_PROFILE");
+    let started = prof.then(std::time::Instant::now);
+    let guard = GEN.lock().unwrap();
+    GenLock {
+        guard,
+        waited_ns: started.map(|t| t.elapsed().as_nanos() as u64),
+        held_since: started,
+    }
+}
+
+/// `GENLOCK wait=<ms> hold=<ms> n=<acquisitions>` under `FEAT_PROFILE`.
+///
+/// `wait / (wait + hold)` is the share of lock-attributed time spent queued; a
+/// worker-per-chunk design removes the queue, not the hold.
+pub fn report_gen_lock() {
+    if !env_flag!("FEAT_PROFILE") {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    let wait = GEN_WAIT_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+    let hold = GEN_HOLD_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+    let n = GEN_LOCK_N.swap(0, Ordering::Relaxed);
+    eprintln!(
+        "GENLOCK wait={wait:.1}ms hold={hold:.1}ms n={n} threads={}",
+        gen_threads_probe()
+    );
+}
+
+fn gen_threads_probe() -> usize {
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+}
+
 /// The one instruction for a tree that has no game data committed next to it. Both the
 /// startup fallbacks and the tests that read the data print it, so a missing file names the
 /// command that writes it instead of the `Option` that came back empty.
@@ -2352,7 +2427,7 @@ pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: Noise
     };
     match generator {
         Some(g) => {
-            *GEN.lock().unwrap() = Some(g);
+            *gen_lock() = Some(g);
             true
         }
         None => false,
@@ -2364,12 +2439,12 @@ pub fn dfdump(spec: &str) {
     if p.len() != 3 {
         return;
     }
-    if let Some(g) = GEN.lock().unwrap().as_mut() {
+    if let Some(g) = gen_lock().as_mut() {
         g.dump_dfs(p[0], p[1], p[2]);
     }
 }
 pub fn enabled() -> bool {
-    GEN.lock().unwrap().is_some()
+    gen_lock().is_some()
 }
 
 /// Run `f` against the generator while holding the `GEN` lock. Diagnostics that
@@ -2429,11 +2504,11 @@ pub(crate) fn parse_population_order(
 }
 
 pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
-    GEN.lock().unwrap().as_mut().map(f)
+    gen_lock().as_mut().map(f)
 }
 
 pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
-    GEN.lock().unwrap().as_mut()?.cols(cx, cz)
+    gen_lock().as_mut()?.cols(cx, cz)
 }
 
 impl Gen {
@@ -3221,14 +3296,14 @@ pub fn density_at(x: i32, y: i32, z: i32) -> Option<f64> {
 
 /// Block density for a column already fetched with `chunk_cols`.
 pub fn density_in(cc: &ChunkCols, x: i32, y: i32, z: i32) -> f64 {
-    match GEN.lock().unwrap().as_ref() {
+    match gen_lock().as_ref() {
         Some(g) => g.block_density(cc, x, y, z),
         None => 0.0,
     }
 }
 
 pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
-    let mut g = GEN.lock().unwrap();
+    let mut g = gen_lock();
     let g = g.as_mut()?;
     let mut m = HashMap::new();
     if let Some(nn) = name.strip_prefix("noise:") {
@@ -3241,7 +3316,7 @@ pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
 }
 
 pub fn sea_level() -> i32 {
-    GEN.lock().unwrap().as_ref().map(|g| g.sea).unwrap_or(63)
+    gen_lock().as_ref().map(|g| g.sea).unwrap_or(63)
 }
 
 /// material-rule result for blocks below the surface window (bedrock,
@@ -3250,7 +3325,7 @@ pub fn sea_level() -> i32 {
 /// do not read them.
 #[cfg(test)]
 pub fn deep_state(x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     match gg.as_mut() {
         Some(g) => g.deep_state_cached(x, y, z, cc),
         None => 1,
@@ -3352,7 +3427,7 @@ impl Gen {
     }
 }
 pub fn min_y() -> i32 {
-    GEN.lock().unwrap().as_ref().map(|g| g.min_y).unwrap_or(-64)
+    gen_lock().as_ref().map(|g| g.min_y).unwrap_or(-64)
 }
 pub fn max_y() -> i32 {
     GEN.lock()
@@ -3705,7 +3780,7 @@ impl Gen {
 /// Some(state) = air/water/lava; None = barrier pushed it solid (material rules).
 #[cfg(test)]
 pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
-    GEN.lock().unwrap().as_mut()?.aq_state(x, y, z, density)
+    gen_lock().as_mut()?.aq_state(x, y, z, density)
 }
 
 /// The block state at a world position, taking the GEN lock once.
@@ -3729,7 +3804,7 @@ pub fn terrain_section(
     cz: i32,
     mut populate: impl FnMut(&mut Gen, i32, i32),
 ) -> Option<Box<[u32; 4096]>> {
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     let g = gg.as_mut()?;
     let mut arr = Box::new([0u32; 4096]);
     for ly in 0..16i32 {
@@ -3753,7 +3828,7 @@ pub fn feature_state(
     z: i32,
     populate: impl FnMut(&mut Gen, i32, i32),
 ) -> Option<u32> {
-    GEN.lock().unwrap().as_mut()?.feat_state(x, y, z, populate)
+    gen_lock().as_mut()?.feat_state(x, y, z, populate)
 }
 
 impl Gen {
@@ -4200,7 +4275,7 @@ impl Gen {
 
 /// debug: (biome_id, [t,h,c,e,d,w,0]) at quart coords
 pub fn biome_debug(qx: i32, qy: i32, qz: i32) -> Option<(i64, [i64; 7])> {
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     let g = gg.as_mut()?;
     let t = g.target7(qx, qy, qz)?;
     let mut best = (i64::MAX, 0u16);
@@ -4210,12 +4285,12 @@ pub fn biome_debug(qx: i32, qy: i32, qz: i32) -> Option<(i64, [i64; 7])> {
 
 /// Block-space biome name through the same quart lookup as the feature layer.
 pub fn biome_name_at_block(x: i32, y: i32, z: i32) -> Option<String> {
-    GEN.lock().unwrap().as_mut()?.biome_name_at(x, y, z)
+    gen_lock().as_mut()?.biome_name_at(x, y, z)
 }
 
 /// quart-space biome id (public for debug/tests)
 pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     gg.as_mut()?.biome_quart(qx, qy, qz, None).map(|(b, _)| b)
 }
 
@@ -4227,7 +4302,7 @@ pub fn hm_dump(spec: &str, populate: fn(&mut Gen, i32, i32)) {
     if p.len() != 2 {
         return;
     }
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     let Some(g) = gg.as_mut() else { return };
     let (cx, cz) = (p[0], p[1]);
     // the feature layer's height a *running* world would hold only exists once the
@@ -4253,7 +4328,7 @@ pub fn hm_dump(spec: &str, populate: fn(&mut Gen, i32, i32)) {
 /// `LevelReader.getBiome` returns are different answers; a placement filter reads
 /// the second, so seeing both at once is how a boundary disagreement is read.
 pub fn biome_at_dump(spec: &str) {
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     let Some(g) = gg.as_mut() else { return };
     for item in spec.split(';') {
         let p: Vec<i32> = item.split(',').filter_map(|n| n.parse().ok()).collect();
@@ -4283,7 +4358,7 @@ pub fn biome_dump(spec: &str) {
     if p.len() != 3 {
         return;
     }
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     let Some(g) = gg.as_mut() else { return };
     let (cx, sy, cz) = (p[0], p[1], p[2]);
     let (qx0, qy0, qz0) = (cx * 4, sy >> 2, cz * 4);
@@ -4312,7 +4387,7 @@ pub fn biome_dump(spec: &str) {
 }
 
 pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
-    let mut gg = GEN.lock().unwrap();
+    let mut gg = gen_lock();
     let g = gg.as_mut()?;
     let mut out = Box::new([39i64; 64]); // plains
     let (qx0, qy0, qz0) = (cx * 4, sy >> 2, cz * 4);
@@ -5158,7 +5233,7 @@ mod wg_tests {
             Some(1)
         }
         assert!(init(0, stub));
-        let mut gg = GEN.lock().unwrap();
+        let mut gg = gen_lock();
         let g = gg.as_mut().unwrap();
         let tree = g.btree.as_ref().expect("biome tree must load");
         let (mut n, mut tied, mut wrong) = (0usize, 0usize, Vec::new());
@@ -5204,7 +5279,7 @@ mod wg_tests {
             Some(1)
         }
         assert!(init(0, stub));
-        let mut gg = GEN.lock().unwrap();
+        let mut gg = gen_lock();
         let g = gg.as_mut().unwrap();
         println!(
             "surface_rule={:?} conds={} rules={} mats_loaded",
@@ -6685,6 +6760,48 @@ mod wg_tests {
         );
     }
 
+    /// Lock-wait split under contention: three threads, each doing the work a
+    /// server thread does on the shared world lock (column generation, populate,
+    /// and a terrain/feature read). `GENLOCK` reports wait vs hold, so the
+    /// parallelization decision can separate "serialized work" from "queueing".
+    ///
+    /// Not a throughput claim: one host, one process, work chosen to hit the lock
+    /// rather than to match `load_compare.sh`'s movement column.
+    #[test]
+    fn gen_lock_contention() {
+        let _guard = lock_gen();
+        if !env_flag!("FEAT_PROFILE") {
+            return;
+        }
+        assert!(init(0, crate::name_to_state));
+        report_gen_lock(); // clear whatever the fixtures above accumulated
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for cx in 0..6 {
+                    for cz in 0..6 {
+                        let _ = chunk_cols(cx, cz);
+                    }
+                }
+            });
+            s.spawn(|| {
+                for cx in -1..=2 {
+                    for cz in -1..=2 {
+                        let _ =
+                            feature_state(cx * 16 + 8, 64, cz * 16 + 8, crate::feature::populate);
+                    }
+                }
+            });
+            s.spawn(|| {
+                for i in 0..200 {
+                    let _ = biome_name_at_block(i % 64, 64, (i / 64) % 64);
+                }
+            });
+        });
+        eprintln!("GENLOCK wall={:.1}ms", t0.elapsed().as_secs_f64() * 1e3);
+        report_gen_lock();
+    }
+
     #[test]
     fn feat_populate_perf() {
         let _guard = lock_gen();
@@ -6704,7 +6821,7 @@ mod wg_tests {
         let mut n = 0;
         for cx in -1..=1 {
             for cz in -1..=1 {
-                if let Some(m) = GEN.lock().unwrap().as_ref().unwrap().feat_map(cx, cz) {
+                if let Some(m) = gen_lock().as_ref().unwrap().feat_map(cx, cz) {
                     n += m.len();
                 }
             }
