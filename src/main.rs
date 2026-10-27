@@ -13691,6 +13691,42 @@ fn window_batch(view: i32) -> usize {
 // the window parameters are read together every batch; a struct would add a
 // name without removing a parameter
 #[expect(clippy::too_many_arguments)]
+/// Worker count for terrain prefetch: `MC_SPINE_GEN_WORKERS` (0/1 = inline), else the
+/// smaller of 4 and the machine's parallelism. Terrain is pure, so this only trades
+/// threads for wall time and never changes what is generated.
+fn gen_workers() -> usize {
+    if let Some(v) = crate::trace_env::env_str!("MC_SPINE_GEN_WORKERS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    // Default 1 (inline). Measured with `WARM=1 load_compare.sh`: 4 workers moved CPU
+    // 21.9 s -> 23.3 s (the work is the same; duplicated cold caches and thread setup
+    // cost a little) while the isolated terrain benchmark scales 17.1 -> 4.5 ms/chunk.
+    // CPU seconds are what M3 measures, so parallel terrain stays opt-in until a
+    // latency/TPS metric shows the trade is worth it.
+    1
+}
+
+/// Generate the batch's terrain on scratch generators before the sequential send loop
+/// touches it, so `chunk_cols`/`terrain_section` hit `col_c` instead of holding `GEN`
+/// for 11 ms per chunk. Features stay inside the sequential loop: their order is pinned.
+fn prefetch_batch_terrain(news: &[(i32, i32)]) {
+    let workers = gen_workers();
+    if workers <= 1 || news.len() <= 1 {
+        return;
+    }
+    let Some(data) = worldgen::data_snapshot() else {
+        return;
+    };
+    let cols: Vec<((i32, i32), std::sync::Arc<worldgen::ChunkCols>)> =
+        worldgen::prefetch_cols(&data, news, workers)
+            .into_iter()
+            .filter_map(|(k, c)| c.map(|c| (k, c)))
+            .collect();
+    let _ = worldgen::with_gen(|g| g.install_cols(cols));
+}
+
 fn stream_chunks(
     s: &mut TcpStream,
     sent: &mut std::collections::HashSet<(i32, i32)>,
@@ -13755,6 +13791,10 @@ fn stream_chunks(
     for c in &news {
         sent.insert(*c);
     }
+    // Terrain for the whole batch is pure per chunk, so it is computed off the lock
+    // before the send loop; everything after it (features, overlays, encoding) stays
+    // sequential in the order the client is served.
+    prefetch_batch_terrain(&news);
     let _ = send_packet(s, 0x0d, vec![]);
     let mut dirty: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     for (cx, cz) in &news {
