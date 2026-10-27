@@ -64,6 +64,21 @@ enum Cf {
     /// further than chebyshev 16 from the fixed start (8,8). The native sets
     /// `(x, y, z) = (zLoop, y, xLoop)` — transposed — which is the same square.
     VoidStartPlatform,
+    /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
+    /// max_height}`: the origin needs air with netherrack, warped nylium or warped
+    /// wart block below; then `spread_width^2` columns each walk down to their ground
+    /// and grow upward, the last cell `twisting_vines` with age 17..25 and the ones
+    /// under it `twisting_vines_plant`.
+    TwistingVines {
+        width: i32,
+        height: i32,
+        max_height: i32,
+    },
+    /// `minecraft:weeping_vines` (`edx`), config `{}`: the origin needs air with
+    /// netherrack or nether wart block *above*, then a 200-step wart-block sweep and
+    /// a 100-step vine sweep run; each column grows downward, ending in
+    /// `weeping_vines` with age 17..25.
+    WeepingVines,
     /// `minecraft:netherrack_replace_blobs` (`ede`), config `{target, state, radius}`:
     /// the origin is clamped into the build height, walked down to the first `target`
     /// block, and three `radius` samples bound a manhattan ball in which every `target`
@@ -1676,6 +1691,184 @@ fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &
     }
 }
 
+/// Nether "wart plant" ground: netherrack, warped nylium, warped wart block.
+/// Measured from the native `isInvalidPlacement` checks of the two vine features.
+fn is_vine_ground(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:netherrack" | "minecraft:warped_nylium" | "minecraft:warped_wart_block"
+    )
+}
+
+/// The shared native growth helper, parameterised by direction.
+///
+/// `TwistingVinesFeature` walks up from `for i = 1`; `WeepingVinesFeature` walks down
+/// from `for i = 0`, so the loop bounds differ by one and the support test looks at
+/// the opposite neighbour. Both write the plant body until the last cell, which gets
+/// the age property.
+#[allow(clippy::too_many_arguments)]
+fn grow_vines(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    height: i32,
+    down: bool,
+    body: u32,
+    tip: &str,
+) {
+    let Some(reg) = breg() else { return };
+    let (mut x, mut y, mut z) = pos;
+    let (start, step) = if down { (0, -1) } else { (1, 1) };
+    let mut i = start;
+    while if down { i <= height } else { i <= height } {
+        if ctx.is_air(x, y, z) {
+            let beyond = if down { y - 1 } else { y + 1 };
+            if i == height || !ctx.is_air(x, beyond, z) {
+                let age = rng.next_inbetween(17, 25).to_string();
+                let st = reg.with_prop(reg.state_of(tip, None), "age", &age);
+                ctx.set(x, y, z, st);
+                break;
+            }
+            ctx.set(x, y, z, body);
+        }
+        y += step;
+        i += 1;
+    }
+}
+
+/// `TwistingVinesFeature` (`edr`). See [`Cf::TwistingVines`].
+fn gen_twisting_vines(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    width: i32,
+    height: i32,
+    max_height: i32,
+) {
+    let Some(reg) = breg() else { return };
+    if !ctx.is_air(pos.0, pos.1, pos.2)
+        || !is_vine_ground(reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)))
+    {
+        return;
+    }
+    let body = reg.state_of("minecraft:twisting_vines_plant", None);
+    for _ in 0..(width * width) {
+        let dx = rng.next_inbetween(-width, width);
+        let dy = rng.next_inbetween(-height, height);
+        let dz = rng.next_inbetween(-width, width);
+        let (mut x, mut y, mut z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        // walk down to the ground, as the native helper does
+        let mut found = false;
+        loop {
+            y -= 1;
+            if ctx.out_of_h(y) {
+                break;
+            }
+            if !ctx.is_air(x, y, z) {
+                y += 1;
+                found = true;
+                break;
+            }
+        }
+        if !found || !ctx.is_air(x, y, z) || !is_vine_ground(reg.name_of(ctx.get(x, y - 1, z))) {
+            continue;
+        }
+        let mut col = rng.next_inbetween(1, max_height);
+        if rng.next_bound(6) == 0 {
+            col *= 2;
+        }
+        if rng.next_bound(5) == 0 {
+            col = 1;
+        }
+        grow_vines(
+            ctx,
+            rng,
+            (x, y, z),
+            col,
+            false,
+            body,
+            "minecraft:twisting_vines",
+        );
+    }
+}
+
+/// `WeepingVinesFeature` (`edx`). See [`Cf::WeepingVines`].
+fn gen_weeping_vines(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    if !ctx.is_air(pos.0, pos.1, pos.2) {
+        return;
+    }
+    let above = reg.name_of(ctx.get(pos.0, pos.1 + 1, pos.2));
+    if !matches!(
+        above,
+        "minecraft:netherrack" | "minecraft:nether_wart_block"
+    ) {
+        return;
+    }
+    let wart = reg.state_of("minecraft:nether_wart_block", None);
+    // the wart sweep: 200 attempts, keeping only cells with exactly one wart neighbour
+    ctx.set(pos.0, pos.1, pos.2, wart);
+    for _ in 0..200 {
+        let dx = rng.next_bound(6) - rng.next_bound(6);
+        let dy = rng.next_bound(2) - rng.next_bound(5);
+        let dz = rng.next_bound(6) - rng.next_bound(6);
+        let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        if !ctx.is_air(x, y, z) {
+            continue;
+        }
+        let mut adjacent = 0;
+        for (ax, ay, az) in [
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+            (-1, 0, 0),
+            (1, 0, 0),
+        ] {
+            let name = reg.name_of(ctx.get(x + ax, y + ay, z + az));
+            if matches!(name, "minecraft:netherrack" | "minecraft:nether_wart_block") {
+                adjacent += 1;
+            }
+            if adjacent > 1 {
+                break;
+            }
+        }
+        if adjacent == 1 {
+            ctx.set(x, y, z, wart);
+        }
+    }
+    let body = reg.state_of("minecraft:weeping_vines_plant", None);
+    for _ in 0..100 {
+        let dx = rng.next_bound(8) - rng.next_bound(8);
+        let dy = rng.next_bound(2) - rng.next_bound(7);
+        let dz = rng.next_bound(8) - rng.next_bound(8);
+        let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        if !ctx.is_air(x, y, z) {
+            continue;
+        }
+        let up = reg.name_of(ctx.get(x, y + 1, z));
+        if !matches!(up, "minecraft:netherrack" | "minecraft:nether_wart_block") {
+            continue;
+        }
+        let mut col = rng.next_inbetween(1, 8);
+        if rng.next_bound(6) == 0 {
+            col *= 2;
+        }
+        if rng.next_bound(5) == 0 {
+            col = 1;
+        }
+        grow_vines(
+            ctx,
+            rng,
+            (x, y, z),
+            col,
+            true,
+            body,
+            "minecraft:weeping_vines",
+        );
+    }
+}
+
 /// `BlockPos.withinManhattan`, in the native order (measured, not assumed): cells
 /// sorted by manhattan distance, then `x`, then `y`, then `|z|` with the positive
 /// offset before the negative one. The order matters for features that write while
@@ -2489,6 +2682,12 @@ fn p_cf(j: &J) -> Option<Cf> {
         "basalt_pillar" => Cf::BasaltPillar,
         "void_start_platform" => Cf::VoidStartPlatform,
         "end_platform" => Cf::EndPlatform,
+        "twisting_vines" => Cf::TwistingVines {
+            width: jint(j, "spread_width", 0),
+            height: jint(j, "spread_height", 0),
+            max_height: jint(j, "max_height", 0),
+        },
+        "weeping_vines" => Cf::WeepingVines,
         "netherrack_replace_blobs" => Cf::NetherrackReplaceBlobs {
             target: {
                 let (n, p) = bs_parts(js(j, "target")?)?;
@@ -3641,6 +3840,12 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::BasaltPillar => gen_basalt_pillar(ctx, rng, pos),
         Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
         Cf::EndPlatform => gen_end_platform(ctx, pos),
+        Cf::TwistingVines {
+            width,
+            height,
+            max_height,
+        } => gen_twisting_vines(ctx, rng, pos, *width, *height, *max_height),
+        Cf::WeepingVines => gen_weeping_vines(ctx, rng, pos),
         Cf::NetherrackReplaceBlobs {
             target,
             state,

@@ -150,8 +150,16 @@ short-circuits, so both the write and the draw disappear. Two mutants are gates:
 keeping the direction alive, and reading below the origin instead of above both
 fail this fixture.
 
-The repaired configured-feature graph now finds 42 arms and 21 types (36 files)
-with no arm, so 21 of the pack's types still cannot place anything.
+Two nether vine features are ported the same way. `twisting_vines` (`edr`) matches
+42 native cases and `weeping_vines` (`edx`) 42 more: six scenes times seven seeds,
+covering the ground/support rules (netherrack, warped nylium, warped wart block and
+the refusal cases), the height draws (`nextInt(6)` doubling, `nextInt(5)` collapsing
+to one) and the age property. One measured divergence is open and excluded from the
+fixture rather than hidden: `weeping_vines` with seed `Long.MAX_VALUE` in the flat
+ceiling scene is one cell short in the port (115 vs 116 writes), cause unidentified.
+
+The repaired configured-feature graph now finds 47 arms and 16 types (31 files)
+with no arm, so 16 of the pack's types still cannot place anything.
 
 Next consumers: processor/jigsaw and structure-start pipelines; all reachable
 feature implementations and their full-chunk interactions;

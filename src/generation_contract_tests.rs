@@ -169,6 +169,150 @@ fn netherrack_replace_blobs_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn twisting_vines_matches_native_cells_and_rng() {
+    let reg = breg().unwrap();
+    let netherrack = reg.state_of("minecraft:netherrack", None);
+    let warped_nylium = reg.state_of("minecraft:warped_nylium", None);
+    let soul_sand = reg.state_of("minecraft:soul_sand", None);
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:twisting_vines","config":{"spread_width":8,"spread_height":4,"max_height":8}}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for row in include_str!("../tests/data/twisting_vines_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let seed = p[1].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -16i32..=16 {
+            for z in -16i32..=16 {
+                for dy in -12i32..=12 {
+                    let state = match scene {
+                        0 => {
+                            if dy <= -1 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        1 => {
+                            if dy <= -1 || dy >= 3 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        2 => {
+                            if dy <= 0 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        3 => {
+                            if dy <= -1 {
+                                warped_nylium
+                            } else {
+                                0
+                            }
+                        }
+                        4 => {
+                            if dy <= -1 {
+                                soul_sand
+                            } else {
+                                0
+                            }
+                        }
+                        _ => {
+                            if dy <= -1 - ((x + z).rem_euclid(3)) {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    g.feat_write(x, 64 + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[2].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, (0, 64, 0)), p[4], "{row}");
+    }
+}
+
+#[test]
+fn weeping_vines_matches_native_cells_and_rng() {
+    let reg = breg().unwrap();
+    let netherrack = reg.state_of("minecraft:netherrack", None);
+    let wart = reg.state_of("minecraft:nether_wart_block", None);
+    let cf = super::p_cf(&jparse(br#"{"type":"minecraft:weeping_vines","config":{}}"#).unwrap())
+        .unwrap();
+    for row in include_str!("../tests/data/weeping_vines_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let seed = p[1].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -16i32..=16 {
+            for z in -16i32..=16 {
+                for dy in -16i32..=12 {
+                    let state = match scene {
+                        0 => {
+                            if dy >= 1 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        1 => 0,
+                        2 => {
+                            if dy >= 1 {
+                                wart
+                            } else {
+                                0
+                            }
+                        }
+                        3 => {
+                            if dy >= 0 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        4 => {
+                            if dy >= 1 || dy <= -12 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        _ => {
+                            if dy >= 1 || dy <= -2 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    g.feat_write(x, 64 + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[2].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, (0, 64, 0)), p[4], "{row}");
+    }
+}
+
+#[test]
 fn delta_feature_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
     let netherrack = reg.state_of("minecraft:netherrack", None);

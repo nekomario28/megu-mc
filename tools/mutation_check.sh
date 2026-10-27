@@ -1055,6 +1055,18 @@ check "netherrack replace blobs samples the radius three times" \
   '    let (i, j, k) = { let r = radius.get(rng); (r, r, r) };' \
   feature::generation_contract_tests::netherrack_replace_blobs_matches_native_cells_and_rng
 
+check "twisting vines grows upward from the planted cell" \
+  src/feature.rs '    let (start, step) = if down { (0, -1) } else { (1, 1) };' \
+  '    let (start, step) = if down { (0, -1) } else { (0, 1) };' \
+  feature::generation_contract_tests::twisting_vines_matches_native_cells_and_rng
+
+check "weeping vines keeps the wart neighbour count at one" \
+  src/feature.rs '        if adjacent == 1 {
+            ctx.set(x, y, z, wart);' \
+  '        if adjacent >= 1 {
+            ctx.set(x, y, z, wart);' \
+  feature::generation_contract_tests::weeping_vines_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \
