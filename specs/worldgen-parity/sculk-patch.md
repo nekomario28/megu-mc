@@ -376,6 +376,26 @@ port の sculk 4001 のうち **2666 (67%) が参照と完全一致**、vein は
 状態（= 参照の最終状態から復元できる範囲）と突き合わせ、`passes=true` になった
 述語のどれが vanilla と食い違うかを 1 つずつ反転して metric の向きを見る。
 
+## 述語の1つずつ反転（ablation）— 3つとも load-bearing、どれも「緩すぎ」ではない（2026-10-28）
+
+4x4 捕捉（参照 5082 = sculk 3881 + vein 1188 + catalyst 9 + shrieker 4、baseline port 4834 =
+sculk 4001 + vein 822 + catalyst 11、missing 2174 / extra 1926）に対して、
+`spc_vein_can_spread` / `spc_multiface_can_place` の3つの候補を1つずつ無効化して測った:
+
+| 無効化した条件 | port のセル | sculk / vein | 解釈 |
+|---|---|---|---|
+| （なし = baseline） | 4834 | 4001 / 822 | — |
+| `manhattan == 2` の `isFaceSturdy` 拒否 | **61152** | 2516 / **58585** | vein が 71 倍に爆発。この拒否が spread を局所に留めている = 必要不可欠 |
+| `state.canBeReplaced()`（`is_replaceable`）の受理 | 4526 | 3800 / 711 | sculk −201 / vein −111。参照からは**遠ざかる**（5082 から 4526 へ）= この受理は寄与していて過剰ではない |
+| `MultifaceBlock.canAttachTo`（`supports_multiface`） | **497** | 395 / 94 | ほぼ全滅。`supports_multiface` が spread 試行の約 95% を弾いている = 必要不可欠 |
+
+**結論**: 3つとも load-bearing で、無効化すると爆発するか崩壊するか、参照から遠ざかる。
+**どれも「緩すぎる」述語ではない**ので、分岐はこの3つ以外（カーソルの `facings`/`charge`/
+`decay` の勘定、または spread を呼ぶ時点・回数）にある。
+
+ablation のトグルは測定後に撤去し、4x4 dump が撤去前と**バイト同一**であることを確認した
+（= 測定は読み取り専用で、ツリーに痕跡を残していない）。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・
