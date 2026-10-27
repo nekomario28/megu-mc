@@ -6758,9 +6758,17 @@ fn local_idx(x: i32, y: i32, z: i32) -> u32 {
 }
 fn block_at(x: i32, y: i32, z: i32) -> u32 {
     let w = world().lock().unwrap();
-    w.get(&(x >> 4, z >> 4))
-        .and_then(|c| c.get(&local_idx(x, y, z)).copied())
-        .unwrap_or_else(|| base_state(x, y, z))
+    let hit = w
+        .get(&(x >> 4, z >> 4))
+        .and_then(|c| c.get(&local_idx(x, y, z)).copied());
+    if chunkprof::enabled() {
+        use std::sync::atomic::Ordering;
+        chunkprof::BLOCK_AT.fetch_add(1, Ordering::Relaxed);
+        if hit.is_none() {
+            chunkprof::BLOCK_AT_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    hit.unwrap_or_else(|| base_state(x, y, z))
 }
 fn set_block(x: i32, y: i32, z: i32, st: u32) {
     set_block_if(x, y, z, st, None);
@@ -6781,6 +6789,8 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
         c.insert(local_idx(x, y, z), st);
     }
     drop(w);
+    // the cached sky floors describe the blocks that were just changed
+    bump_floor_epoch();
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
         schedule_leaf_neighbors(x, y, z, st);
@@ -8104,6 +8114,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     let rv = rv_varint;
     let n = rv(payload, &mut p);
     let mut w = world().lock().unwrap();
+    bump_floor_epoch();
     for _ in 0..n {
         if p + 8 > payload.len() {
             break;
@@ -13184,7 +13195,50 @@ fn sky_spill(
 }
 
 /// The first opaque block y in each column, scanning down from the surface (the sky floor).
+/// Per-chunk sky floors, memoized.
+///
+/// `sky_floors` walks 256 columns and up to 24 cells each, and every `opacity` call is
+/// a `block_at` (one world lock). Measured under `MC_SPINE_CHUNK_PROFILE=1`: 32-62 ms
+/// per delivered chunk, in **10 calls** — the centre chunk plus the whole 3x3 window,
+/// each of which is the centre of some other chunk's delivery.
+///
+/// Invalidation: a floor is a function of the blocks in its chunk, so every write into
+/// the world bumps `FLOOR_EPOCH` and an entry computed under an older epoch is dropped.
+/// The epoch is world-wide rather than per chunk (an edit anywhere drops every entry):
+/// block writes are rare next to chunk reads, and a stale floor would light the wrong
+/// cells, which is exactly the class of bug this cache must not introduce.
+static FLOOR_EPOCH: AtomicU64 = AtomicU64::new(0);
+static SKY_FLOORS: OnceLock<Mutex<std::collections::VecDeque<((i32, i32), u64, [i32; 256])>>> =
+    OnceLock::new();
+
+fn sky_floors_cache() -> &'static Mutex<std::collections::VecDeque<((i32, i32), u64, [i32; 256])>> {
+    SKY_FLOORS.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Call after any write into `world()`: every cached floor is now suspect.
+fn bump_floor_epoch() {
+    FLOOR_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
 fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
+    let __t = chunkprof::enabled().then(std::time::Instant::now);
+    let epoch = FLOOR_EPOCH.load(Ordering::Relaxed);
+    {
+        let cache = sky_floors_cache().lock().unwrap();
+        if let Some((_, e, f)) = cache.iter().find(|(k, _, _)| *k == (cx, cz)) {
+            if *e == epoch {
+                let out = *f;
+                drop(cache);
+                if let Some(t) = __t {
+                    chunkprof::add(&chunkprof::FLOORS, t);
+                }
+                return out;
+            }
+        }
+    }
+    if __t.is_some() {
+        chunkprof::FLOORS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut floors = [0i32; 256];
     for lz in 0..16usize {
         for lx in 0..16usize {
@@ -13203,6 +13257,23 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
             }
             floors[(lz << 4) | lx] = y;
         }
+    }
+    {
+        let mut cache = sky_floors_cache().lock().unwrap();
+        if let Some(slot) = cache.iter_mut().find(|(k, _, _)| *k == (cx, cz)) {
+            slot.1 = epoch;
+            slot.2 = floors;
+        } else {
+            // Bounded FIFO: a moving viewer asks for a chunk's floors while it is in
+            // reach and never again, so eviction order is insertion order.
+            if cache.len() >= 256 {
+                cache.pop_front();
+            }
+            cache.push_back(((cx, cz), epoch, floors));
+        }
+    }
+    if let Some(t) = __t {
+        chunkprof::add(&chunkprof::FLOORS, t);
     }
     floors
 }
@@ -13585,13 +13656,21 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, gen: &GenSources) {
                         // The arrays follow as two counted lists, each entry prefixed by its length.
                         // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
                         // then the block light a torch contributes. Two counted lists, sky first.
+    let __tsky = chunkprof::enabled().then(std::time::Instant::now);
     let sky = sky_light_sections_world(cx, cz);
+    if let Some(t) = __tsky {
+        chunkprof::add(&chunkprof::SKY, t);
+    }
     write_varint(p, sky.len() as i64);
     for sec in sky {
         write_varint(p, 2048);
         p.extend_from_slice(&sec);
     }
+    let __tbl = chunkprof::enabled().then(std::time::Instant::now);
     let block = block_light_sections(cx, cz, gen);
+    if let Some(t) = __tbl {
+        chunkprof::add(&chunkprof::BLOCKLIGHT, t);
+    }
     write_varint(p, block.len() as i64);
     for sec in block {
         write_varint(p, 2048);
@@ -22193,6 +22272,12 @@ pub(crate) mod chunkprof {
     pub(super) static DATA: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION: AtomicU64 = AtomicU64::new(0);
     pub(super) static LIGHT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SKY: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BLOCKLIGHT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FLOORS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FLOORS_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BLOCK_AT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BLOCK_AT_MISS: AtomicU64 = AtomicU64::new(0);
     pub(super) static N: AtomicU64 = AtomicU64::new(0);
     pub(super) fn enabled() -> bool {
         crate::trace_env::env_flag!("MC_SPINE_CHUNK_PROFILE")
@@ -22204,11 +22289,17 @@ pub(crate) mod chunkprof {
         let n = N.load(Ordering::Relaxed).max(1);
         let per = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / 1e6 / n as f64;
         eprintln!(
-            "CHUNKPROF n={n} map={:.1}ms data={:.1} section={:.1} light={:.1}",
+            "CHUNKPROF n={n} map={:.1}ms data={:.1} section={:.1} light={:.1} (sky={:.1} block={:.1} floors={:.1} x{:.1} block_at={:.0} miss={:.0})",
             per(&MAP),
             per(&DATA),
             per(&SECTION),
-            per(&LIGHT)
+            per(&LIGHT),
+            per(&SKY),
+            per(&BLOCKLIGHT),
+            per(&FLOORS),
+            FLOORS_N.load(Ordering::Relaxed) as f64 / n as f64,
+            BLOCK_AT.load(Ordering::Relaxed) as f64 / n as f64,
+            BLOCK_AT_MISS.load(Ordering::Relaxed) as f64 / n as f64
         );
     }
 }

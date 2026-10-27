@@ -290,3 +290,29 @@ mc-spine 単体を同条件で走らせ、プロセス/スレッド/phase に分
 - 次の候補は (1) `write_light_arrays` 38-94 ms/chunk、(2) `chunk_data` の
   overlay/エンコード約 40 ms/chunk、(3) tick スレッドの待ち 10.8 ms/tick。
 - 地形並列の既定は 1（inline）のまま。配信経路を直した後に再測定する。
+
+## 2026-10-28: ライト配信経路の内訳（次に削る場所）
+
+`MC_SPINE_CHUNK_PROFILE=1` を sky / block light / floors / `block_at` に分けた。
+
+| 項目 | ms/chunk |
+|---|---|
+| `write_light_arrays` | 26-98 |
+| うち sky light | 25-81 |
+| うち block light | 0.9-1.4 |
+| うち `sky_floors`（10 回 → キャッシュ後 1.6-2.3 回） | 21-51 |
+| `block_at` 呼び出し | **21,619-29,536 回/chunk** |
+| うち overlay に当たらず `base_state` に落ちる割合 | **ほぼ 100%** |
+
+原因は `block_at` → `base_state` → `wg2_block` → `worldgen::block_state` =
+**セルごとの完全な地形評価（density + material rule + aquifer、GEN ロック）**。
+生成済みブロックは overlay（編集のみ）に入っていないので、地形の読みは
+必ずこの重い経路に落ちる。1-2 µs/call × 21-29k = 25-50 ms/chunk が説明できる。
+
+- `sky_floors` のチャンク単位メモ化（`FLOOR_EPOCH` で無効化）を入れた:
+  呼び出しは 10 → 1.6-2.3 回/chunk に減ったが、`block_at` の総数は 21-29k のまま
+  （残りは BFS とセクション詰め）。**壁時計の改善は測定できていない**:
+  測定時に他レーンが負荷 12 で動いており、A/B が分離できない。
+- 次の一手は「ライト経路の生成状態読みをまとめる」: チャンクの上位数セクションを
+  `terrain_section` 相当の一括読みで取り、列ごとの不透明プロファイルを作る。
+  セル単位 `block_at` をやめるのが本筋。
