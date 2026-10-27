@@ -1150,6 +1150,31 @@ check "pointed dripstone spreads in the horizontal plane order" \
     for (dx, dz) in [(1, 0), (0, -1), (0, 1), (-1, 0)] {' \
   feature::generation_contract_tests::pointed_dripstone_matches_native_cells_and_rng
 
+check "coral shuffle draws nextInt(i) and keeps the last slot for the swap" \
+  src/feature.rs '        let j = rng.next_bound(i as i32) as usize;' \
+  '        let j = rng.next_bound(i as i32 + 1) as usize;' \
+  feature::generation_contract_tests::coral_tree_matches_native_cells_and_rng
+
+check "coral claw runs its tail along the drawn direction, not the arm" \
+  src/feature.rs '            m.0 += ddx;' \
+  '            m.0 += adx;' \
+  feature::generation_contract_tests::coral_claw_matches_native_cells_and_rng
+
+check "coral mushroom keeps only the box's faces" \
+  src/feature.rs '                    && (lx == 0 || lx == xb || ly == 0 || ly == yb || lz == 0 || lz == zb);' \
+  '                    && (lx == 0 || lx == xb || ly == 0 || ly == yb || lz == 0 || lz == zb || true);' \
+  feature::generation_contract_tests::coral_mushroom_matches_native_cells_and_rng
+
+check "coral mushroom lowers its cap by the drawn length" \
+  src/feature.rs '                    coral_piece(ctx, rng, (pos.0 + lx, pos.1 + ly - len, pos.2 + lz), state);' \
+  '                    coral_piece(ctx, rng, (pos.0 + lx, pos.1 + ly, pos.2 + lz), state);' \
+  feature::generation_contract_tests::coral_mushroom_matches_native_cells_and_rng
+
+check "coral piece accepts a coral plant as its own cell" \
+  src/feature.rs '    if !(water(at) || reg.in_tag(at, "minecraft:corals")) || !water(at_above) {' \
+  '    if !water(at) || !water(at_above) {' \
+  feature::generation_contract_tests::coral_tree_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

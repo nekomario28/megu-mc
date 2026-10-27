@@ -1,0 +1,168 @@
+{
+  "_comment": "FeatureOracle cases for the coral shapes. Coordinates are origin-relative; ranges are inclusive; a cell covered by no ply is air. Every coral piece needs water in its own cell (or the `corals` tag) and water above, which is why the water scenes are the informative ones; the shape is truncated by the water box. No build-height origin cases here: the port-side scene cannot hold blocks outside the build height (the native scene can), so a shape that needs out-of-height water cannot be compared faithfully - pointed_dripstone covers the truncation guard.",
+  "type": "minecraft:coral_tree",
+  "class": "ebu",
+  "config": {},
+  "scenes": [
+    {
+      "name": "air",
+      "plies": []
+    },
+    {
+      "name": "water_deep",
+      "plies": [
+        {
+          "block": "minecraft:water",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -2,
+            4
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "water_shallow",
+      "plies": [
+        {
+          "block": "minecraft:water",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            0,
+            1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "water_floor",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        },
+        {
+          "block": "minecraft:water",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            0,
+            3
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "coral_at_origin",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        },
+        {
+          "block": "minecraft:water",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            0,
+            3
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        },
+        {
+          "block": "minecraft:tube_coral",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            0,
+            0
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dry",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -1,
+            0
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    -1,
+    15,
+    20,
+    42,
+    60007
+  ],
+  "oy": 64,
+  "extra": []
+}

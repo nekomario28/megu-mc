@@ -168,6 +168,10 @@ pub(crate) struct BReg {
     luminance: Vec<u8>,   // state id -> light the state emits (0 = none)
     opacity: Vec<u8>,     // state id -> how much light it stops
     tag: HashMap<String, HashSet<u32>>, // tag name -> block idx set (expanded)
+    /// tag name -> block idx list in the pack's own `values` order, nested tags expanded in
+    /// place. `getRandomElement(tag, random)` indexes into that order, so a set would return
+    /// a different member for the same draw.
+    tag_order: HashMap<String, Vec<u32>>,
 }
 
 const FL_AIR: u16 = 1;
@@ -228,6 +232,7 @@ impl BReg {
             luminance: vec![0; state_count],
             opacity: vec![0; state_count],
             tag: HashMap::new(),
+            tag_order: HashMap::new(),
         };
         for b in &md {
             let name = format!("minecraft:{}", jstr(b, "name")?);
@@ -423,11 +428,42 @@ impl BReg {
             done.insert(name.to_string(), out.clone());
             out
         }
+        fn expand_ordered(
+            name: &str,
+            raw: &HashMap<String, Vec<String>>,
+            idx: &HashMap<String, u32>,
+            done: &mut HashMap<String, Vec<u32>>,
+            stack: &mut HashSet<String>,
+        ) -> Vec<u32> {
+            if let Some(v) = done.get(name) {
+                return v.clone();
+            }
+            if stack.contains(name) {
+                return Vec::new();
+            }
+            stack.insert(name.to_string());
+            let mut out = Vec::new();
+            if let Some(members) = raw.get(name) {
+                for m in members {
+                    if let Some(inner) = m.strip_prefix('#') {
+                        out.extend(expand_ordered(&ns_name(inner), raw, idx, done, stack));
+                    } else if let Some(&bi) = idx.get(m) {
+                        out.push(bi);
+                    }
+                }
+            }
+            stack.remove(name);
+            done.insert(name.to_string(), out.clone());
+            out
+        }
         let names: Vec<String> = raw.keys().cloned().collect();
         for n in names {
             let mut stack = HashSet::new();
             let set = expand(&n, &raw, &reg.idx, &mut reg.tag, &mut stack);
-            reg.tag.insert(n, set);
+            reg.tag.insert(n.clone(), set);
+            let mut stack = HashSet::new();
+            let ordered = expand_ordered(&n, &raw, &reg.idx, &mut reg.tag_order, &mut stack);
+            reg.tag_order.insert(n, ordered);
         }
         Some(reg)
     }
@@ -737,6 +773,19 @@ impl BReg {
             .map(|&bi| self.props[bi as usize].iter().any(|p| p.name == prop))
             .unwrap_or(false)
     }
+    /// Ordered members of a block tag, as `getRandomElement(tag, random)` sees them.
+    pub(crate) fn tag_members(&self, tag: &str) -> &[u32] {
+        self.tag_order
+            .get(&ns_name(tag))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// A block index (a tag member) as its default state id.
+    pub(crate) fn default_state(&self, block_idx: u32) -> u32 {
+        self.dfl.get(block_idx as usize).copied().unwrap_or(0)
+    }
+
     pub(crate) fn in_tag(&self, st: u32, tag: &str) -> bool {
         let bi = match self.st_blk.get(st as usize) {
             Some(&b) => b,

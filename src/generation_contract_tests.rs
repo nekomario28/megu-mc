@@ -441,6 +441,36 @@ fn generic_feature_cases(cases_json: &str, fixture: &str) {
         let mut ctx = context(&mut g);
         let mut rng = Xor::seed_worldgen(seed);
         gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+        // `GENERIC_CASE_DUMP=<path>` writes this side's cells in the oracle's `--cells`
+        // format, so a failing digest can be diffed cell by cell instead of guessed at.
+        if let Ok(path) = std::env::var("GENERIC_CASE_DUMP") {
+            let mut rows: Vec<String> = ctx
+                .wr
+                .iter()
+                .map(|(&(x, y, z), &st)| {
+                    format!(
+                        "{}\t{}\t{}\t{},{},{} {}",
+                        p[0],
+                        oy,
+                        p[2], // the fixture's own signed spelling of the seed
+                        x,
+                        y - oy,
+                        z,
+                        block_state_cells_text(reg, st)
+                    )
+                })
+                .collect();
+            rows.sort();
+            let mut out = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("GENERIC_CASE_DUMP path");
+            use std::io::Write;
+            for r in rows {
+                writeln!(out, "{r}").unwrap();
+            }
+        }
         let probe = format!(
             "{},{},{}",
             rng.next_bound(1000),
@@ -463,6 +493,30 @@ fn pointed_dripstone_matches_native_cells_and_rng() {
     generic_feature_cases(
         include_str!("../tests/feature_cases/pointed_dripstone.json"),
         include_str!("../tests/data/pointed_dripstone_1211.tsv"),
+    );
+}
+
+#[test]
+fn coral_tree_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/coral_tree.json"),
+        include_str!("../tests/data/coral_tree_1211.tsv"),
+    );
+}
+
+#[test]
+fn coral_claw_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/coral_claw.json"),
+        include_str!("../tests/data/coral_claw_1211.tsv"),
+    );
+}
+
+#[test]
+fn coral_mushroom_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/coral_mushroom.json"),
+        include_str!("../tests/data/coral_mushroom_1211.tsv"),
     );
 }
 
@@ -778,6 +832,27 @@ fn block_cells_digest(
         .collect()
 }
 
+/// `minecraft:block[prop=value,...]` with the properties sorted by name: the canonical form
+/// `NativeHarness.normalizedStateName` writes, used by the digest and by `GENERIC_CASE_DUMP`.
+fn block_state_cells_text(reg: &crate::block_registry::BReg, state: u32) -> String {
+    let mut cell = reg.name_of(state).to_string();
+    let mut props = reg.properties_of(state).unwrap_or_default();
+    if !props.is_empty() {
+        props.sort();
+        cell.push('[');
+        for (i, (k, v)) in props.iter().enumerate() {
+            if i > 0 {
+                cell.push(',');
+            }
+            cell.push_str(k);
+            cell.push('=');
+            cell.push_str(v);
+        }
+        cell.push(']');
+    }
+    cell
+}
+
 /// The same cells, but with the state's properties sorted by name — the canonical form
 /// `NativeHarness.normalizedStateName` writes. A block name alone cannot show that a
 /// mushroom cap's `west`/`east`/`north`/`south` are wrong.
@@ -788,28 +863,13 @@ fn block_state_cells_digest(
 ) -> String {
     let mut cells = Vec::new();
     for (&(x, y, z), &state) in wr {
-        let mut cell = format!(
-            "{},{},{} {}",
+        cells.push(format!(
+            "{},{},{} {}\n",
             x - origin.0,
             y - origin.1,
             z - origin.2,
-            reg.name_of(state)
-        );
-        let mut props = reg.properties_of(state).unwrap_or_default();
-        if !props.is_empty() {
-            props.sort();
-            cell.push('[');
-            for (i, (k, v)) in props.iter().enumerate() {
-                if i > 0 {
-                    cell.push(',');
-                }
-                cell.push_str(k);
-                cell.push('=');
-                cell.push_str(v);
-            }
-            cell.push(']');
-        }
-        cells.push(cell + "\n");
+            block_state_cells_text(reg, state)
+        ));
     }
     cells.sort();
     crate::generation_math::md5(cells.concat().as_bytes())

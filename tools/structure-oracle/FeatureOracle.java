@@ -40,7 +40,12 @@ import java.util.*;
  * </pre>
  *
  * A cell matching no ply is air; later plies overwrite earlier ones. The row format is
- * `scene \t oy \t seed \t placed \t cells \t md5 \t rngProbe` where `rngProbe` is three
+ * `scene \t oy \t seed \t wrote \t cells \t md5 \t rngProbe`. `wrote` is
+ * `place(...) && cells > 0`, not the feature's own return value: vanilla's coral shapes
+ * report success after a piece fails (`return true` from the trunk loop), so a raw boolean
+ * records a fact the Rust port has no equivalent for - the port's `Cf` dispatch returns no
+ * success flag. What both sides can state is whether the placement produced cells.
+ * `rngProbe` is three
  * `nextInt(1000)` draws taken *after* the placement: it pins the number of draws a feature
  * consumed even when the drawn value does not reach a block (the coral features' `{}` config
  * is exactly that case), and any extra or missing draw shifts it.
@@ -132,7 +137,8 @@ public final class FeatureOracle {
         for (String cell : cells) {
             cellRows.add(sceneName + "\t" + oy + "\t" + seed + "\t" + cell.stripTrailing());
         }
-        return sceneName + "\t" + oy + "\t" + seed + "\t" + placed + "\t" + cells.size()
+        boolean wrote = placed && !cells.isEmpty();
+        return sceneName + "\t" + oy + "\t" + seed + "\t" + wrote + "\t" + cells.size()
                 + "\t" + digest + "\t" + probe;
     }
 

@@ -109,6 +109,13 @@ enum Cf {
     /// `nextFloat() < chance_of_taller_dripstone` *and* the cell beyond the tip is empty or
     /// water. `waterlogged` comes from the real fluid state, not a block-name test.
     PointedDripstone(PointedDripstoneCfg),
+    /// `minecraft:coral_tree`/`coral_claw`/`coral_mushroom` (`ebu`/`ebr`/`ebt` over `ebs`),
+    /// config `{}`. All three share `CoralFeature.place`: one coral block is drawn from the
+    /// `coral_blocks` tag (pack order) before the shape runs, so even a refused placement
+    /// consumes that draw. A piece is written only where the cell is water (or in the
+    /// `corals` tag) *and* the cell above it is water; writing one may put a coral plant
+    /// (25%), a sea pickle (5%) above it, and wall fans on a 20% per horizontal direction.
+    Coral(CoralShape),
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -1981,6 +1988,248 @@ fn red_mushroom_cap(
     }
 }
 
+/// The three coral shapes; `CoralFeature` (`ebs`) is their shared base.
+#[derive(Clone, Copy)]
+pub(crate) enum CoralShape {
+    Tree,
+    Claw,
+    Mushroom,
+}
+
+/// `Direction.Plane.HORIZONTAL`: NORTH, EAST, SOUTH, WEST, with its offset and the
+/// `facing` value a wall fan takes. The order is what the shuffles and the per-direction
+/// draws index into.
+const HORIZONTAL: [(i32, i32, &str); 4] = [
+    (0, -1, "north"),
+    (1, 0, "east"),
+    (0, 1, "south"),
+    (-1, 0, "west"),
+];
+
+/// `BuiltInRegistries.BLOCK.getRandomElement(tag, random)` (`Util.getRandom` over the tag's
+/// ordered member list), as a default block state.
+fn random_tag_block(reg: &BReg, tag: &str, rng: &mut Xor) -> Option<u32> {
+    let members = reg.tag_members(tag);
+    if members.is_empty() {
+        return None;
+    }
+    let bi = members[rng.next_bound(members.len() as i32) as usize];
+    Some(reg.default_state(bi))
+}
+
+/// `Util.shuffle(list, random)`: Fisher-Yates from the end, `nextInt(i)` for i = size..2, so
+/// the last element is never drawn for. Both the coral plane shuffle and the claw's
+/// `shuffledCopy(Stream)` go through this.
+fn util_shuffle<T>(list: &mut [T], rng: &mut Xor) {
+    for i in (2..=list.len()).rev() {
+        let j = rng.next_bound(i as i32) as usize;
+        list.swap(j, i - 1);
+    }
+}
+
+/// Index into [`HORIZONTAL`] one step clockwise / counter-clockwise (N -> E -> S -> W).
+fn horizontal_clockwise(i: usize) -> usize {
+    (i + 1) % 4
+}
+fn horizontal_counter_clockwise(i: usize) -> usize {
+    (i + 3) % 4
+}
+
+/// `CoralFeature.place` (`ebs.a`): draw the shape's coral block, then run the shape.
+fn gen_coral(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), shape: CoralShape) {
+    let Some(reg) = breg() else { return };
+    let Some(state) = random_tag_block(reg, "minecraft:coral_blocks", rng) else {
+        return;
+    };
+    match shape {
+        CoralShape::Tree => coral_tree(ctx, rng, pos, state),
+        CoralShape::Claw => coral_claw(ctx, rng, pos, state),
+        CoralShape::Mushroom => coral_mushroom(ctx, rng, pos, state),
+    }
+}
+
+/// `CoralFeature.placeCoralBlock` (`ebs.b`).
+///
+/// The precondition is the pair: this cell is water or in the `corals` tag, and the cell
+/// above it is water. Then the block, a possible plant/pickle above it, and one wall-fan
+/// draw per horizontal direction. Every write goes through `setBlock`, which refuses
+/// out-of-height cells (a coral at the top of the world is cut off).
+fn coral_piece(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32) -> bool {
+    let Some(reg) = breg() else { return false };
+    let (x, y, z) = pos;
+    let at = ctx.get(x, y, z);
+    let above = (x, y + 1, z);
+    let at_above = ctx.get(above.0, above.1, above.2);
+    let water = |st: u32| reg.name_of(st) == "minecraft:water";
+    if !(water(at) || reg.in_tag(at, "minecraft:corals")) || !water(at_above) {
+        return false;
+    }
+    if !ctx.out_of_h(y) {
+        ctx.set(x, y, z, state);
+    }
+    if rng.next_f32() < 0.25 {
+        if let Some(plant) = random_tag_block(reg, "minecraft:corals", rng) {
+            if !ctx.out_of_h(above.1) {
+                ctx.set(above.0, above.1, above.2, plant);
+            }
+        }
+    } else if rng.next_f32() < 0.05 {
+        // `SeaPickleBlock` default state keeps `waterlogged=true`; only `pickles` moves
+        let pickles = (rng.next_bound(4) + 1).to_string();
+        let st = reg.with_prop(
+            reg.state_of("minecraft:sea_pickle", None),
+            "pickles",
+            &pickles,
+        );
+        if !ctx.out_of_h(above.1) {
+            ctx.set(above.0, above.1, above.2, st);
+        }
+    }
+    for (dx, dz, facing) in HORIZONTAL {
+        if rng.next_f32() < 0.2 {
+            let p = (x + dx, y, z + dz);
+            if reg.name_of(ctx.get(p.0, p.1, p.2)) == "minecraft:water" {
+                if let Some(fan) = random_tag_block(reg, "minecraft:wall_corals", rng) {
+                    // wall fans carry `facing`; the plain fans in `corals` do not
+                    let st = if reg.get_prop(fan, "facing").is_some() {
+                        reg.with_prop(fan, "facing", facing)
+                    } else {
+                        fan
+                    };
+                    if !ctx.out_of_h(p.1) {
+                        ctx.set(p.0, p.1, p.2, st);
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `CoralTreeFeature` (`ebu`): a trunk of 1-3 pieces, then 2-4 horizontal branches of 2-6
+/// pieces with a 25% sideways kink after the first step and after every two straight ones.
+fn coral_tree(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32) {
+    let mut m = pos;
+    let trunk = rng.next_bound(3) + 1;
+    for _ in 0..trunk {
+        if !coral_piece(ctx, rng, m, state) {
+            return; // the native `place` still reports success
+        }
+        m.1 += 1;
+    }
+    let top = m;
+    let branches = rng.next_bound(3) + 2;
+    let mut dirs = HORIZONTAL;
+    util_shuffle(&mut dirs, rng);
+    for &(dx, dz, _) in dirs.iter().take(branches as usize) {
+        m = top;
+        m.0 += dx;
+        m.2 += dz;
+        let len = rng.next_bound(5) + 2;
+        let mut seg = 0;
+        let mut i = 0;
+        while i < len && coral_piece(ctx, rng, m, state) {
+            seg += 1;
+            m.1 += 1;
+            if i == 0 || (seg >= 2 && rng.next_f32() < 0.25) {
+                m.0 += dx;
+                m.2 += dz;
+                seg = 0;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `CoralClawFeature` (`ebr`): the origin, then 2-3 arms. One arm follows the drawn
+/// direction, the others step up and pick between their direction and UP; each arm then
+/// runs 2-5 (main) or 3-5 (side) steps along the original direction, stepping up on a 25%
+/// roll.
+fn coral_claw(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32) {
+    if !coral_piece(ctx, rng, pos, state) {
+        return; // the native `place` reports failure here
+    }
+    let dir = rng.next_bound(4) as usize; // `Plane.HORIZONTAL.getRandom`
+    let n = rng.next_bound(2) + 2;
+    let mut arms = [
+        dir,
+        horizontal_clockwise(dir),
+        horizontal_counter_clockwise(dir),
+    ];
+    util_shuffle(&mut arms, rng);
+    // the tail of every arm runs along the *drawn* direction, not along the arm
+    let (ddx, ddz, _) = HORIZONTAL[dir];
+    for &arm in arms.iter().take(n as usize) {
+        let (adx, adz, _) = HORIZONTAL[arm];
+        let mut m = pos;
+        let len1 = rng.next_bound(2) + 1;
+        m.0 += adx;
+        m.2 += adz;
+        // the draw order is the native's: the side arms pick their growth direction *before*
+        // their length, the main arm draws only the length
+        let (grow, len2) = if arm == dir {
+            ((adx, 0, adz), rng.next_bound(3) + 2)
+        } else {
+            m.1 += 1;
+            let g = if rng.next_bound(2) == 0 {
+                (adx, 0, adz)
+            } else {
+                (0, 1, 0)
+            };
+            (g, rng.next_bound(3) + 3)
+        };
+        let mut i = 0;
+        while i < len1 && coral_piece(ctx, rng, m, state) {
+            m.0 += grow.0;
+            m.1 += grow.1;
+            m.2 += grow.2;
+            i += 1;
+        }
+        // `move(grow.getOpposite())`, then up: the arm turns back and climbs one
+        m.0 -= grow.0;
+        m.1 -= grow.1;
+        m.2 -= grow.2;
+        m.1 += 1;
+        for _ in 0..len2 {
+            m.0 += ddx;
+            m.2 += ddz;
+            if !coral_piece(ctx, rng, m, state) {
+                break;
+            }
+            if rng.next_f32() < 0.25 {
+                m.1 += 1;
+            }
+        }
+    }
+}
+
+/// `CoralMushroomFeature` (`ebt`): a `(dx+1) x (dy+1) x (dz+1)` box (each 3-5) whose shell
+/// is thinned by a 10% roll, lowered by `len` (1-3).
+fn coral_mushroom(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32) {
+    // The native's first draw bounds the **y** offset and its second the **x** offset; the
+    // loop order is x (outer), y (middle), z (inner), and the shell test below uses the same
+    // pairing. Reading the bounds as (dx, dy, dz) in draw order shifts the whole cap.
+    let yb = rng.next_bound(3) + 3; // $$4
+    let xb = rng.next_bound(3) + 3; // $$5
+    let zb = rng.next_bound(3) + 3; // $$6
+    let len = rng.next_bound(3) + 1; // $$7
+    for lx in 0..=xb {
+        for ly in 0..=yb {
+            for lz in 0..=zb {
+                // the native `if` body is empty: the boolean *is* the skip, and the piece is
+                // written as its last conjunct, so the roll only happens on the shell
+                let shell = (lx != 0 && lx != xb || ly != 0 && ly != yb)
+                    && (lz != 0 && lz != zb || ly != 0 && ly != yb)
+                    && (lx != 0 && lx != xb || lz != 0 && lz != zb)
+                    && (lx == 0 || lx == xb || ly == 0 || ly == yb || lz == 0 || lz == zb);
+                if shell && !(rng.next_f32() < 0.1) {
+                    coral_piece(ctx, rng, (pos.0 + lx, pos.1 + ly - len, pos.2 + lz), state);
+                }
+            }
+        }
+    }
+}
+
 /// `PointedDripstoneFeature` (`eda`). See [`Cf::PointedDripstone`].
 fn gen_pointed_dripstone(
     ctx: &mut FC,
@@ -3067,6 +3316,9 @@ fn p_cf(j: &J) -> Option<Cf> {
             stem: p_bsp(js(j, "stem_provider")?)?,
             radius: jint(j, "foliage_radius", 0),
         },
+        "coral_tree" => Cf::Coral(CoralShape::Tree),
+        "coral_claw" => Cf::Coral(CoralShape::Claw),
+        "coral_mushroom" => Cf::Coral(CoralShape::Mushroom),
         "pointed_dripstone" => Cf::PointedDripstone(PointedDripstoneCfg {
             taller: jf32(j, "chance_of_taller_dripstone", 0.2),
             directional: jf32(j, "chance_of_directional_spread", 0.7),
@@ -4239,6 +4491,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             gen_huge_mushroom(ctx, rng, pos, cap, stem, *radius, HugeMushroom::Red)
         }
         Cf::PointedDripstone(c) => gen_pointed_dripstone(ctx, rng, pos, c),
+        Cf::Coral(shape) => gen_coral(ctx, rng, pos, *shape),
         Cf::TwistingVines {
             width,
             height,
