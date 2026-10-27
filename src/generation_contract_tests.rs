@@ -66,6 +66,42 @@ fn glowstone_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn nether_forest_vegetation_matches_native_cells_and_rng() {
+    let reg = breg().unwrap();
+    let weighted = r#"{"state_provider":{"type":"minecraft:weighted_state_provider","entries":[{"data":{"Name":"minecraft:crimson_roots"},"weight":87},{"data":{"Name":"minecraft:crimson_fungus"},"weight":11},{"data":{"Name":"minecraft:warped_fungus"},"weight":1}]},"spread_width":8,"spread_height":4}"#;
+    for row in include_str!("../tests/data/nether_forest_vegetation_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let (support, plant) = (p[0], p[1]);
+        let oy = p[2].parse::<i32>().unwrap();
+        let seed = p[3].parse::<i64>().unwrap() as u64;
+        let json = if plant == "weighted" {
+            format!(r#"{{"type":"minecraft:nether_forest_vegetation","config":{weighted}}}"#)
+        } else {
+            format!(
+                r#"{{"type":"minecraft:nether_forest_vegetation","config":{{"state_provider":{{"type":"minecraft:simple_state_provider","state":{{"Name":"{plant}"}}}},"spread_width":8,"spread_height":4}}}}"#
+            )
+        };
+        let cf = super::p_cf(&jparse(json.as_bytes()).unwrap()).unwrap();
+        let support = reg.state_of(support, None);
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -12i32..=12 {
+            for z in -12i32..=12 {
+                for dy in -6i32..=6 {
+                    let state = if dy == -1 { support } else { 0 };
+                    g.feat_write(x, oy + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[4].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[5].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, (0, oy, 0)), p[6], "{row}");
+    }
+}
+
+#[test]
 fn flower_type_names_share_one_native_class_and_one_port_arm() {
     let mut classes = std::collections::HashSet::new();
     let mut seen = 0;

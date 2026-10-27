@@ -7,6 +7,8 @@ default-method bodies). A fixture is only evidence of the scenes it contains, so
 every comparison here is scene-by-scene, not an aggregate.
 """
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +43,33 @@ ORACLES = {
 }
 
 
+def block_tags(path):
+    """Every block tag the pinned pack defines, with nested `#tag` references expanded."""
+    base = ROOT / 'datapacks/vanilla/data/minecraft/tags/block'
+    raw = {}
+    for f in base.rglob('*.json'):
+        tag = 'minecraft:' + f.relative_to(base).with_suffix('').as_posix()
+        values = json.loads(f.read_text()).get('values', [])
+        raw[tag] = [v if isinstance(v, str) else v.get('id') for v in values]
+
+    def expand(tag, seen=()):
+        if tag in seen:
+            return []
+        out = []
+        for value in raw.get(tag, []):
+            if value.startswith('#'):
+                inner = value[1:]
+                inner = inner if inner.startswith('minecraft:') else 'minecraft:' + inner
+                out += expand(inner, seen + (tag,))
+            else:
+                out.append(value if value.startswith('minecraft:') else 'minecraft:' + value)
+        return out
+
+    lines = [tag + '\t' + ','.join(expand(tag)) for tag in sorted(raw)]
+    path.write_text('\n'.join(lines) + '\n')
+    return path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('name', choices=sorted(ORACLES))
@@ -50,6 +79,7 @@ def main():
     fixture = ROOT / ORACLES[args.name]
     oracle = ROOT / f'tools/structure-oracle/{args.name.title().replace("_", "")}Oracle.java'
     with pinned_runtime(args.jar) as (work, cp, _):
+        os.environ['MC_NATIVE_BLOCK_TAGS'] = str(block_tags(work / 'block_tags.tsv'))
         output = work / f'{args.name}.tsv'
         run_probe(work, cp, oracle, 'dev.mcspine.tools.'
                   + oracle.stem, output, extra_sources=(HARNESS,))

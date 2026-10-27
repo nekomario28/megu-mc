@@ -1030,6 +1030,16 @@ check "end platform covers the obsidian row" \
   '            for dy in 0i32..3 {' \
   feature::generation_contract_tests::end_platform_matches_native_cells
 
+check "nether forest vegetation reads the nylium tag under the plant" \
+  src/generation_providers.rs '| "minecraft:warped_fungus" => reg.in_tag(below, "minecraft:nylium"),' \
+  '| "minecraft:warped_fungus" => reg.in_tag(below, "minecraft:netherrack"),' \
+  feature::generation_contract_tests::nether_forest_vegetation_matches_native_cells_and_rng
+
+check "nether forest vegetation keeps the ceiling guard" \
+  src/feature.rs '    if y < ctx.g.min_y + 1 || y + 1 >= ctx.g.min_y + ctx.g.height {' \
+  '    if y < ctx.g.min_y + 1 {' \
+  feature::generation_contract_tests::nether_forest_vegetation_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

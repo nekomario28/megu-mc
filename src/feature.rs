@@ -64,6 +64,17 @@ enum Cf {
     /// further than chebyshev 16 from the fixed start (8,8). The native sets
     /// `(x, y, z) = (zLoop, y, xLoop)` — transposed — which is the same square.
     VoidStartPlatform,
+    /// `minecraft:nether_forest_vegetation` (`ecx`): the origin's *below* block must be
+    /// in the `minecraft:nylium` tag, then `spread_width^2` offsets are tried, each
+    /// drawing three pairs of `nextInt` (x, y, z), sampling the state provider and
+    /// placing only where the cell is empty, above the floor and the state's own
+    /// `canSurvive` accepts the support (measured: only nylium accepts the nether
+    /// plants; netherrack, soul sand, soul soil and warped wart block do not).
+    NetherForestVegetation {
+        bsp: Bsp,
+        width: i32,
+        height: i32,
+    },
     /// `minecraft:end_platform` (`ecc`), config `{}`: obsidian at `dy = -1` and air
     /// at `dy = 0..2` over a 5x5 box (x from the dz offset, z from the dx offset),
     /// skipping cells that already hold the target *block*.
@@ -1645,6 +1656,37 @@ fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &
     }
 }
 
+/// `NetherForestVegetationFeature` (`ecx`). See [`Cf::NetherForestVegetation`].
+fn gen_nether_forest_vegetation(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    bsp: &Bsp,
+    width: i32,
+    height: i32,
+) {
+    let Some(reg) = breg() else { return };
+    if !reg.in_tag(ctx.get(pos.0, pos.1 - 1, pos.2), "minecraft:nylium") {
+        return;
+    }
+    let y = pos.1;
+    if y < ctx.g.min_y + 1 || y + 1 >= ctx.g.min_y + ctx.g.height {
+        return;
+    }
+    for _ in 0..(width * width) {
+        let x = pos.0 + rng.next_bound(width) - rng.next_bound(width);
+        let yy = y + rng.next_bound(height) - rng.next_bound(height);
+        let z = pos.2 + rng.next_bound(width) - rng.next_bound(width);
+        let st = bsp.get(ctx, rng, x, yy, z);
+        if ctx.is_air(x, yy, z)
+            && yy > ctx.g.min_y
+            && crate::generation_providers::can_place(reg, ctx, reg.name_of(st), x, yy, z)
+        {
+            ctx.set(x, yy, z, st);
+        }
+    }
+}
+
 /// `VoidStartPlatformFeature` (`edv`), config `{}`. See [`Cf::VoidStartPlatform`].
 fn gen_void_start_platform(ctx: &mut FC, pos: (i32, i32, i32)) {
     let Some(reg) = breg() else { return };
@@ -2304,6 +2346,11 @@ fn p_cf(j: &J) -> Option<Cf> {
         "basalt_pillar" => Cf::BasaltPillar,
         "void_start_platform" => Cf::VoidStartPlatform,
         "end_platform" => Cf::EndPlatform,
+        "nether_forest_vegetation" => Cf::NetherForestVegetation {
+            bsp: p_bsp(js(j, "state_provider")?)?,
+            width: jint(j, "spread_width", 0),
+            height: jint(j, "spread_height", 0),
+        },
         "monster_room" => Cf::MonsterRoom,
         "tree" => Cf::Tree(Box::new(crate::tree::p_tree(j)?)),
         "fallen_tree" => Cf::Fallen {
@@ -3428,6 +3475,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::BasaltPillar => gen_basalt_pillar(ctx, rng, pos),
         Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
         Cf::EndPlatform => gen_end_platform(ctx, pos),
+        Cf::NetherForestVegetation { bsp, width, height } => {
+            gen_nether_forest_vegetation(ctx, rng, pos, bsp, *width, *height)
+        }
         Cf::ChorusPlant => {
             let Some(reg) = breg() else { return };
             if ctx.is_air(pos.0, pos.1, pos.2)

@@ -911,6 +911,14 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
     let below = ctx.get(x, y - 1, z);
     let at = ctx.get(x, y, z);
     match name {
+        // Measured against the native `canSurvive` of the nether plants: only the
+        // `minecraft:nylium` tag accepts them (netherrack, soul sand, soul soil and
+        // warped wart block are refused) — see tests/data/nether_forest_vegetation_1211.tsv.
+        "minecraft:crimson_roots"
+        | "minecraft:warped_roots"
+        | "minecraft:nether_sprouts"
+        | "minecraft:crimson_fungus"
+        | "minecraft:warped_fungus" => reg.in_tag(below, "minecraft:nylium"),
         "minecraft:cactus" => {
             let base_ok = matches!(
                 reg.name_of(below),

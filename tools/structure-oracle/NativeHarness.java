@@ -5,6 +5,9 @@ import com.mojang.serialization.Codec;
 import com.mojang.serialization.JsonOps;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.lang.reflect.*;
 import java.util.*;
 
@@ -52,6 +55,8 @@ public final class NativeHarness {
         worldC = C("dds");
         heightC = C("dcy");
         STATES.clear();
+        String tags = System.getenv("MC_NATIVE_BLOCK_TAGS");
+        if (tags != null && !tags.isEmpty()) bindBlockTags(Path.of(tags));
     }
 
     /** BlockState for a block id, cached: `Blocks.X.defaultBlockState()`. */
@@ -82,6 +87,62 @@ public final class NativeHarness {
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }
+    }
+
+    /**
+     * Bind the pinned pack's block tags, as the real data pack would.
+     *
+     * Without this every `BlockState.is(TagKey)` is false in a bare bootstrap, which
+     * would make tag-gated features refuse for a reason that does not exist in game.
+     * The file is `tag<TAB>block,block,...`; nested `#tag` entries are expanded by
+     * the runner from the same datapack the port reads.
+     */
+    public static void bindBlockTags(Path file) throws Exception {
+        Object reg = C("lt").getField("e").get(null);
+        Method wrap = null, bind = null;
+        for (Method m : reg.getClass().getMethods()) {
+            if (m.getParameterCount() == 1 && m.getReturnType().getName().length() == 2
+                    && m.getReturnType() != void.class && wrap == null) {
+                wrap = m;
+            }
+            if (m.getParameterCount() == 1 && m.getReturnType() == void.class
+                    && Map.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                bind = m;
+            }
+        }
+        if (wrap == null || bind == null) throw new AssertionError("tag binding API not found");
+        Map<String, Object> tagKeys = new HashMap<>();
+        for (java.lang.reflect.Field f : C("awe").getFields()) {
+            if (!Modifier.isStatic(f.getModifiers())) continue;
+            Object v = f.get(null);
+            if (v == null) continue;
+            for (Method m : v.getClass().getMethods()) {
+                if (m.getParameterCount() == 0 && m.getReturnType().getName().equals("akr")) {
+                    tagKeys.put(String.valueOf(m.invoke(v)), v);
+                    break;
+                }
+            }
+        }
+        Map<Object, List<Object>> bound = new HashMap<>();
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            if (line.isBlank()) continue;
+            String[] parts = line.split("\t");
+            Object tagKey = tagKeys.get(parts[0]);
+            if (tagKey == null) continue; // a tag the vanilla BlockTags class does not name
+            List<Object> holders = new ArrayList<>();
+            if (parts.length > 1 && !parts[1].isBlank()) {
+                for (String blockId : parts[1].split(",")) {
+                    Object rl = newId(blockId);
+                    Object block = C("jz").getMethod("a", rlC).invoke(reg, rl);
+                    if (block == null) throw new AssertionError("tag member is not a block: " + blockId);
+                    holders.add(wrap.invoke(reg, block));
+                }
+            }
+            bound.put(tagKey, holders);
+        }
+        bind.invoke(reg, bound);
+        System.err.println("DBG bound " + bound.size() + " block tags; nylium has "
+                + bound.get(tagKeys.get("minecraft:nylium")).size() + " members");
     }
 
     // ---------- native objects ----------
@@ -185,6 +246,57 @@ public final class NativeHarness {
         return cfgInstance;
     }
 
+    /** Parse a state-provider JSON with its own codec (probe helper). */
+    public static Object provider(String json) throws Exception {
+        Class<?> type = C("egj"); // StateProvider
+        Object element = JsonParser.parseString(json);
+        for (java.lang.reflect.Field f : type.getFields()) {
+            if (Modifier.isStatic(f.getModifiers()) && Codec.class.isAssignableFrom(f.getType())) {
+                Codec<?> codec = (Codec<?>) f.get(null);
+                Object result = null;
+                for (Method m : Codec.class.getMethods()) {
+                    if (!m.getName().equals("parse") || m.getParameterCount() != 2) continue;
+                    if (!m.getParameterTypes()[0].isAssignableFrom(JsonOps.class)) continue;
+                    try {
+                        result = m.invoke(codec, JsonOps.INSTANCE, element);
+                        break;
+                    } catch (IllegalArgumentException e) {
+                        // next overload
+                    }
+                }
+                return result.getClass().getMethod("getOrThrow").invoke(result);
+            }
+        }
+        throw new AssertionError("no StateProvider codec");
+    }
+
+    public static Object providerState(Object provider, Object rng, int x, int y, int z)
+            throws Exception {
+        return C("egj").getMethod("a", C("ayw"), C("jd"))
+                .invoke(provider, rng, pos(x, y, z));
+    }
+
+    /**
+     * An RNG whose next `nextInt(bound)` is the given roll: a seed search is
+     * unacceptable, so the first draw is produced by an RNG we can prime. The
+     * native provider draws exactly one bound, so any RNG whose stream starts at
+     * that value works.
+     */
+    public static Object fixedRoll(int roll, int bound) throws Exception {
+        for (long seed = 0; seed < 100000; seed++) {
+            Object rng = rng(seed);
+            if ((int) C("ayw").getMethod("a", int.class).invoke(rng, bound) == roll) {
+                return rng(seed);
+            }
+        }
+        throw new AssertionError("no seed for roll " + roll);
+    }
+
+    /** `RandomSource.nextInt(bound)` (probe helper). */
+    public static int draw(Object rng, int bound) throws Exception {
+        return (int) C("ayw").getMethod("a", int.class).invoke(rng, bound);
+    }
+
     public static Object rng(long seed) throws Exception {
         return C("dzx").getConstructor(C("ayw"))
                 .newInstance(C("dzz").getConstructor(long.class).newInstance(seed));
@@ -201,6 +313,7 @@ public final class NativeHarness {
         public final Object proxy;
         public final Map<String, Object> writes = new LinkedHashMap<>();
         public final List<String> log = new ArrayList<>();
+        public final List<String> attempts = new ArrayList<>();
         public final Scene scene;
         public final int minY, height;
         private final Object heights;
@@ -232,6 +345,13 @@ public final class NativeHarness {
             if (m.getName().equals("a_") && pt.length == 1 && pt[0] == posC
                     && m.getReturnType() == stateC) {
                 int[] p = xyz(a[0]);
+                attempts.add(p[0] + "," + p[1] + "," + p[2]);
+                // Write-through: a feature that reads back a cell it just set must see
+                // its own write, as a real level would. Serving the static scene instead
+                // let a second attempt at the same cell overwrite it in the native run
+                // while the port (which writes through) skipped it.
+                Object written = writes.get(p[0] + "," + p[1] + "," + p[2]);
+                if (written != null) return written;
                 String block = scene.blockAt(p[0], p[1], p[2]);
                 return state(block == null ? "minecraft:air" : block);
             }
@@ -244,10 +364,14 @@ public final class NativeHarness {
                 writes.put(p[0] + "," + p[1] + "," + p[2], a[1]);
                 return true;
             }
-            // Height family: run the interface's own implementation.
-            if (!blockFamily(m)) {
+            // Build height: the interface that declares the same name and signature
+            // (`dcy`) has its own implementation; delegate to it. This is name-matched
+            // but asserted against that interface's declared methods, and it avoids
+            // running a default body from an interface that shares the obfuscated name.
+            Method heightMethod = heightFamily(m);
+            if (heightMethod != null) {
                 log.add("height " + m.getName());
-                return m.invoke(heights, a);
+                return heightMethod.invoke(heights, a);
             }
             // A default body the native class can compute itself, bound to this proxy.
             if (m.isDefault()) {
@@ -258,12 +382,28 @@ public final class NativeHarness {
                         .invokeWithArguments(a == null ? new Object[0] : a);
             }
             log.add("unsupported " + m);
+            System.err.println("harness log: " + String.join(" | ", log.subList(Math.max(0, log.size() - 12), log.size())));
             throw new UnsupportedOperationException(m.toString());
         }
     }
 
     public static Level level(Scene scene) {
         return new Level(scene, MIN_Y, HEIGHT, null);
+    }
+
+    /** Same name and parameter types declared by the height-accessor interface. */
+    static Method heightFamily(Method m) {
+        try {
+            for (Method h : heightC.getDeclaredMethods()) {
+                if (h.getName().equals(m.getName())
+                        && java.util.Arrays.equals(h.getParameterTypes(), m.getParameterTypes())) {
+                    return h;
+                }
+            }
+        } catch (Throwable t) {
+            throw new AssertionError(t);
+        }
+        return null;
     }
 
     static boolean declaresBlockState(Class<?> decl) {
