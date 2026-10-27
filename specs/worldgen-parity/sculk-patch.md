@@ -1,6 +1,6 @@
-# `sculk_patch` の移植計画（未着手・調査のみ）
+# `sculk_patch` の移植計画と実装状況
 
-2026-10-27。`sculk_patch` は他の feature 型と違い、**1 つのサブシステム**
+2026-10-27 起票 / 2026-10-28 実装（未検証）。`sculk_patch` は他の feature 型と違い、**1 つのサブシステム**
 （`SculkSpreader` と `SculkBehaviour` 実装群）を伴う。ここに、次に着手する人が
 知り直さなくて済むよう、実測した構造・分岐・罠・再利用できる部品を固定する。
 コードはまだ書いていない（半端な subsystem を緑と記録しないため）。
@@ -215,10 +215,49 @@ sculk を置いた直後に呼ぶ）で、block の形状更新が chunk を要�
 返せるのは `ChunkAccess` の実体だけで、それは「level を半端にモデル化しない」という
 harness の原則（`native-oracle.md`）に反する。よって whole-chunk 経路を採る。
 
+## 実装状況（2026-10-28）: port は入ったが **gate は赤**
+
+`SculkPatchFeature` / `SculkSpreader` / `SculkBlock` / vein 経路を port した
+(commit `8272b9e`)。`MultifaceSpreader.spreadAll` は **乱数を一切引かない**ことが
+bytecode で確定した（`dkz.a(dtc,dcx,jd,boolean)` が `Direction.stream()` を2回 map して
+配置数を数えるだけ。シャッフルは別 overload `spread(..., from, random, ...)` のもので、
+sculk 経路はそれを呼ばない）。これで vein の順序は厳密になった。
+
+**この作業で見つかって直した port の欠陥 2 件:**
+
+1. `Gen::chunk_biome_set` の y 範囲（`fix(worldgen): the chunk biome set swept the wrong
+   y range`）: y<0 だけに存在する biome が chunk の biome 集合から落ちていた。
+   深層暗黒チャンクに `deep_dark` が無いため `sculk_patch_deep_dark` と `sculk_vein` が
+   一度も走らず、参照 397 セルに対して port は **0** だった。
+2. `closerThan(new Vec3i(origin.x, pos.y, origin.z), 15.0)` の y 項は自分自身なので相殺する
+   （水平距離だけが bound）。y も比較していた最初の版は、層を跨いだ cursor を全部殺していた。
+
+**現在の測定**（seed 0、chunks (-16,112)-(-15,113)）:
+
+| | sculk | sculk_vein | sculk_catalyst | 合計 |
+|---|---|---|---|---|
+| 参照 | 265 | 131 | 1 | **397** |
+| port | 337 | 92 | 0 | **429** |
+
+`missing 209 / extra 241 / wrong-state 0`、`tools/sculk_gate.py --require-match` は **exit 1**。
+チャンク別の共有セル数: (-15,112) 67/68、(-15,113) 59/93、(-16,112) 13/17、(-16,113) 15/87。
+2 チャンクはほぼ一致し、機構は近いが配置が食い違う。
+
+**次の一手（診断の順序）:**
+
+1. step 7 は `sculk_vein`（multiface_growth, count 204..250）→ `sculk_patch_deep_dark` の順で、
+   **同じ RNG stream を共有**する。どちらかの draw 数がずれれば後続が全部ずれるので、まず
+   `sculk_vein` 単独の照合を行う（`multiface_1211.tsv` の fixture は既にあるが、この
+   biome/座標での実行は未照合）。
+2. 参照 datapack の `sculk_patch_deep_dark` の `count` を 1 にした capture を作れば、
+   1 chunk 1 patch に絞った厳密な比較ができる（参照再生成 3 分 + port dump 1 秒）。
+3. `biome` filter は port が blended（`Level.getBiome` 相当）を使う。vanilla の
+   `BiomeFilter` が `WorldGenRegion.getBiome`（= `BiomeManager` の fiddled 探索）である
+   ことは確認済みだが、候補セル単位での一致は未検証（候補の y は -64..256 に散る）。
+
 ## 未検証として残ること
 
-- **port はまだ実装していない**（397 セルすべてが未実装による欠落）。この文書は
-  調査記録と比較経路・合格条件の記録であり、parity の主張ではない。
-- 実装を試みた port は未検証だったので破棄した（`git checkout -- src/feature.rs`）。
+- port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・
+  合格条件の記録であり、parity の主張ではない。
 - 再開時は上の「実装に必要な残りの意味論」から始め、`tools/sculk_gate.py --require-match`
   が exit 0 になるまでを合格条件にする。
