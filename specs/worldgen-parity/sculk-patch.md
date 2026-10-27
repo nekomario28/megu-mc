@@ -396,6 +396,34 @@ sculk 4001 + vein 822 + catalyst 11、missing 2174 / extra 1926）に対して�
 ablation のトグルは測定後に撤去し、4x4 dump が撤去前と**バイト同一**であることを確認した
 （= 測定は読み取り専用で、ツリーに痕跡を残していない）。
 
+## カーソル側の計測（2026-10-28 後半、いずれも 2x2/4x4 の実測）
+
+ablation で 3つの spread 述語が load-bearing と分かった後、質量の出所と呼び出し回数を数えた。
+
+**呼び出し回数（2x2 の 3x3 近傍、`SPC_CALLS`）**: `spread-post-convert` 2750、
+`spread-cursor-1type` 1972、`spread-cursor-3type` **0**。書き込みタグ別では
+`decay` 5076 / `spread-post-convert` 4595 / `convert` 2750 / `attempt` 574 /
+`spread-cursor-1type` 22。→ vein の生成はほぼ**変換後の spread** が担い、カーソル自身の
+spread（`m()` = SAME_POSITION のみ）は 22 セルしか寄与しない。
+
+**カーソルの状態分布（`SPCATT`）**: `sculk`/`sculk_vein` 上の滞在が大半
+（sculk 564、vein 各種 900+）、`air` 上は `facings=None` 72 / `facings=Some` 150 程度。
+「カーソルが空気セルに居るときだけ自セルに vein を置ける」経路は確かに呼ばれている。
+
+**変換の入力（`SPC_TRACE_CONVERT`）**: `deepslate` 1612 / `tuff` 12 / `gravel` 10 —
+**air も vein もタグ外も 1 つも無い** = 変換の入力集合は正しい。
+
+**vein の面構成**: 最終 vein セルの state id 分布を両側で突き合わせると形は同じ
+（6面 ≈74% / 5面 25%）。違うのは**本数だけ**（参照 1188 に対し port 822、−31%）。
+
+**sculk の内訳**: port 4001 のうち 2666（67%）が参照と完全一致。
+
+→ まとめると: 規則は個別には正しく（変換入力・面構成・述語の load-bearing 性）、
+**量が 25% 前後ずれる**（変換が多く、vein が少ない）。これは「パッチの起動回数」か
+「1 カーソルの寿命（更新回数）」のどちらかが vanilla と違う形。次はそこを数える
+（`canSpreadFrom` を通過した候補数と、1 パッチあたりの `spreadOneCharge` 呼び出し回数を
+`SPC_CALLS` 方式で両側から測る。vanilla 側は参照の sculk セル数から逆算する）。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・
