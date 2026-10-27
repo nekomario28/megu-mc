@@ -10,6 +10,29 @@ vanilla は 62-64 スレッドでチャンク生成を並列化し、mc-spine �
 feature を単一実行している。個別 feature のループを削るより、同じ仕事を
 並列化する方が桁が大きい。
 
+## 決定実験（2026-10-27、実装前）
+
+並列化に投資する前に、残差が「計算量」か「直列化」か「ロック待ち」かを切り分けた。
+`b77f1fd` の前後で `FEAT_PROFILE=1 cargo test --release feat_populate_perf`
+（seed 0、25 chunk）を取った結果:
+
+| 項目 | 値 | 意味 |
+|---|---|---|
+| chunk_cols（地形） | 11.5 ms/chunk | 既存の測定。並列化の対象 |
+| feature populate | 20.8 → **7.6 ms/chunk** | 地形読みのメモ化で削減済み |
+| うち地形読み | 2.1 ms/chunk（28%） | `FC::get`/`terrain_cell` |
+| うち feature ロジック | 5.5 ms/chunk | ore のセル走査・dungeon の箱 |
+| 直列チャンク費用（合計） | **約 19 ms/chunk** | 1 スレッドで処理している量 |
+
+つまり残差は **チャンクあたり約 19 ms の直列仕事**で、vanilla は同じ仕事を
+62 スレッドに配る。個別ループの削減は feature 側の 5.5 ms が上限（すでに 63% 削った）
+なので、桁を変えるには並列化しかない。
+
+未計測（実装時に取る）: サーバ実行時の **GEN ロック待ち**。現在のロックは
+`Mutex<Option<Gen>>` 1 本で、tick スレッドと配信スレッドが同じロックを奪い合う。
+並列化の第一段（`GenData`/`Gen` 分離）でこの待ちが減る量も測る。テスト内は
+単一スレッドなので、この値はまだ無い。
+
 ## 現在の所有
 
 - `Gen`（`worldgen::GEN: Mutex<Option<Gen>>`）が世界生成の全状態を持つ:
@@ -72,6 +95,15 @@ feature を単一実行している。個別 feature のループを削るより
 
 ## 最初のコミット
 
+0. （済）feature の地形読みを削る決定実験とメモ化: `b77f1fd`、20.8 → 7.6 ms/chunk。
+   WG heightmap は `setBlock` で動くので `set` で列単位に無効化する（`huge_fungus`
+   が検出した罠）。mutation gate は `tools/mutation_check.sh` の共有の都合で保留。
 1. `GenData`（不変）と `Gen`（可変）の分離。挙動不変、テストのみ。
+   ここで GEN ロック待ちの計測（`FEAT_PROFILE` の拡張）も入れる: 並列化の
+   効果を「直列仕事の削減」と「ロック待ちの削減」に分けて報告するため。
 2. 1 チャンクの生成をジョブ構造体に切り出し、worker 数 1 で逐次実行（挙動不変）。
 3. worker 数 >1、マージ順のテスト、`load_compare.sh WARM=1` の前後測定。
+
+各段の出口では、既存の feature capture digest・地形 0 セル・`cargo test` 全体・
+mutation check が緑であることを要求する。段 3 の perf 主張は `WARM=1` を
+同一 binary・同一ホストの前後比較で取り、x1.10 未満の差は主張しない。

@@ -157,3 +157,42 @@ owner: region/chunk pipeline の決定が先。並列化までの間は、`ore_d
   14.3-18.7s とばらつく。中央値だけを比較に使い、単発の最良値は主張しない。
 - WARM=1 の 3 回は、移動列が決定的であること（warm と測定で別の区間を走る）に
   依存する。3 回だけなので中央値の信頼区間は広い。
+
+## 2026-10-27: feature の地形読みをメモ化（103 → b77f1fd）
+
+`FEAT_PROFILE=1 cargo test --release --feat_populate_perf`（seed 0、25 chunk）で、
+feature の費用を「地形読み」と「feature 自身のロジック」に分けた後の内訳。
+
+| | 変更前 | 変更後 |
+|---|---|---|
+| FEATPROF total（25 chunk） | 519.5 ms | **190.8 ms** |
+| 地形読み | 52.1 ms（242,044 回、215 ns/call） | 52.8 ms（242,044 回、218 ns/call） |
+| `ore_iron_upper` | 155.7 ms | **4.8 ms** |
+| `ore_coal_upper` | 81.1 ms | **2.4 ms** |
+| `ore_gravel` | 62.3 ms | 15.5 ms |
+| `ore_dirt` | 30.0 ms | 19.1 ms |
+| `monster_room_deep` | 10.7 ms | 10.5 ms |
+| `populate9` wall | 720 ms | **582 ms** |
+
+- 原因は「ロジック」ではなく **`getHeight(OCEAN_FLOOR_WG)` の再計算**だった。
+  ore は vein の bounding square の各列（`ore_iron_upper` で約1,500回）について
+  高さを問い合わせ、そのたびに列を `terrain_cell`（density + material rule +
+  aquifer）で走査し直していた。列の WG heightmap は最後の feature 書き込み
+  以降動かないので、`FC` でメモ化した。
+- **正しさの罠**: vanilla は `setBlock` ごとに WG heightmap も更新する。
+  メモを無効化せずに入れると `huge_fungus` のセルが変わった（hat は下の
+  ブロックから伸びる）。`set` で書いた列のエントリを落とす実装にした。
+  この無効化は mutation gate で固定する（`huge_fungus_matches_native_cells_and_rng`
+  が赤になる）。gate の追加は、同じ `tools/mutation_check.sh` を別レーンが
+  編集中のため保留。
+- これで feature は **20.8 → 7.6 ms/chunk**。残りの上位は `ore_dirt` 0.76、
+  `ore_gravel` 0.62、`monster_room(_deep)` 0.68 ms/chunk。
+
+### 主張しないこと
+
+- end-to-end の `load_compare.sh WARM=1` は再実行していない。**M3 の主張ではない**。
+  定常状態の差（x1.65-2.85、中央値 x1.79）の原因とされる「feature の単一スレッド
+  実行」はこの変更では消えていない。並列化の判断材料は
+  [チャンク生成の並列化](../../../specs/chunk-parallelism/README.md)。
+- FEAT_PROFILE は feature ごとに `Instant` を取る診断で、その overhead を含む。
+- 1 seed・1 ホスト・1 回。25 chunk は 3x3 populate の 1 回分で、定常負荷ではない。
