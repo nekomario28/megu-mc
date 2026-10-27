@@ -91,29 +91,17 @@ public final class NativeHarness {
      */
     public static String normalizedStateName(Object st) throws Exception {
         String name = nameOf(st);
-        Object props = null;
-        for (Method m : stateC.getMethods()) {
-            if (m.getParameterCount() == 0 && java.util.Collection.class.isAssignableFrom(m.getReturnType())) {
-                props = m.invoke(st);
-                break;
-            }
-        }
+        // `duf` is `properties.Property` and `dte` is `StateHolder`. Both lookups are by
+        // name because the shape heuristic this replaced was wrong twice over: it took
+        // `Property.toString()` as the property name ("dtt{name=down, ...}") and the
+        // first one-argument method it met as the value, which is `hasProperty` — so
+        // every property read `true`. A fixture built on that compared presence, not
+        // values, and a name-only fixture would have looked the same.
+        Class<?> propC = C("duf");
+        Method propName = propC.getMethod("f"); // Property.getName()
+        Method value = C("dte").getMethod("c", propC); // StateHolder.getValue(Property)
+        Object props = C("dte").getMethod("B").invoke(st); // StateHolder.getProperties()
         if (!(props instanceof java.util.Collection<?> c) || c.isEmpty()) return name;
-        Object first = c.iterator().next();
-        Method value = null;
-        for (Method m : stateC.getMethods()) {
-            if (m.getParameterCount() == 1 && m.getParameterTypes()[0].isAssignableFrom(first.getClass())) {
-                value = m;
-                break;
-            }
-        }
-        Method propName = null;
-        for (Method m : first.getClass().getMethods()) {
-            if (m.getParameterCount() == 0 && m.getReturnType() == String.class) {
-                propName = m;
-                break;
-            }
-        }
         java.util.TreeMap<String, String> sorted = new java.util.TreeMap<>();
         for (Object prop : c) {
             sorted.put(String.valueOf(propName.invoke(prop)), String.valueOf(value.invoke(st, prop)));
@@ -410,7 +398,11 @@ public final class NativeHarness {
             if (m.getName().equals("a") && pt.length == 3 && pt[0] == posC && pt[1] == stateC
                     && m.getReturnType() == boolean.class) {
                 int[] p = xyz(a[0]);
-                log.add("set " + p[0] + "," + p[1] + "," + p[2] + " " + nameOf(a[1]));
+                // The log is the cell-level diagnostic: a name-only line cannot show a
+                // property difference (the mushroom cap's four rim properties), so it
+                // prints the same canonical form the fixtures compare.
+                log.add("set " + p[0] + "," + p[1] + "," + p[2] + " "
+                        + normalizedStateName(a[1]));
                 if (p[1] < minY || p[1] >= minY + height) return false;
                 writes.put(p[0] + "," + p[1] + "," + p[2], a[1]);
                 return true;

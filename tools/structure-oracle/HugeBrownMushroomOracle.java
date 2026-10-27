@@ -48,19 +48,24 @@ public final class HugeBrownMushroomOracle {
         Class<?> cls = NativeHarness.featureClass("huge_brown_mushroom");
         if (!cls.getName().equals("ecm")) throw new AssertionError("class changed: " + cls);
         List<String> rows = new ArrayList<>();
+        // `args[1]`, when given, is the cell list: one line per written cell with the
+        // canonical state, so a port can be diffed cell by cell. The digest above can
+        // only say *that* two cell sets differ, never which property does.
+        List<String> cellRows = new ArrayList<>();
         for (int scene = 0; scene < 6; scene++) {
             for (long seed : new long[]{0, 1, -1, 42, 60007}) {
-                rows.add(run(scene, 64, seed));
+                rows.add(run(scene, 64, seed, cellRows));
             }
         }
-        rows.add(run(0, NativeHarness.MIN_Y + 1, 0));
-        rows.add(run(0, NativeHarness.MIN_Y, 0));
-        rows.add(run(0, NativeHarness.MIN_Y + NativeHarness.HEIGHT - 2, 0));
+        rows.add(run(0, NativeHarness.MIN_Y + 1, 0, cellRows));
+        rows.add(run(0, NativeHarness.MIN_Y, 0, cellRows));
+        rows.add(run(0, NativeHarness.MIN_Y + NativeHarness.HEIGHT - 2, 0, cellRows));
         Files.write(Path.of(args[0]), rows);
+        if (args.length > 1) Files.write(Path.of(args[1]), cellRows);
         System.out.println("native huge_brown_mushroom cases: " + rows.size());
     }
 
-    static String run(int scene, int oy, long seed) throws Exception {
+    static String run(int scene, int oy, long seed, List<String> cellRows) throws Exception {
         final int sc = scene;
         final int origin = oy;
         NativeHarness.Level level = NativeHarness.level((x, y, z) -> scene(sc, x, y - origin + 64, z));
@@ -75,6 +80,9 @@ public final class HugeBrownMushroomOracle {
         Collections.sort(cells);
         String digest = HexFormat.of().formatHex(MessageDigest.getInstance("MD5")
                 .digest(String.join("", cells).getBytes(StandardCharsets.UTF_8)));
+        for (String cell : cells) {
+            cellRows.add(scene + "\t" + oy + "\t" + seed + "\t" + cell.stripTrailing());
+        }
         return scene + "\t" + oy + "\t" + seed + "\t" + placed + "\t" + cells.size() + "\t" + digest;
     }
 }

@@ -217,6 +217,81 @@ fn end_gateway_matches_native_cells() {
 }
 
 #[test]
+fn huge_brown_mushroom_matches_native_cells_and_height() {
+    let reg = breg().unwrap();
+    let dirt = reg.state_of("minecraft:dirt", None);
+    let mycelium = reg.state_of("minecraft:mycelium", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let leaves = reg.state_of("minecraft:oak_leaves", None);
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:huge_brown_mushroom","config":{"cap_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:brown_mushroom_block","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"true","west":"true"}}},"foliage_radius":3,"stem_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:mushroom_stem","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"true","west":"true"}}}}}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for row in include_str!("../tests/data/huge_brown_mushroom_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let oy = p[1].parse::<i32>().unwrap();
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        // The native scene is an infinite ground below the origin plus (per scene) a
+        // leaf/stone slab at dy == 5 or a stone ceiling at dy >= 8; everything else is
+        // air. Write the whole box the feature can read, so no cell falls back to the
+        // generated terrain and silently changes a support or a can-place test.
+        for x in -4i32..=4 {
+            for z in -4i32..=4 {
+                for dy in -1i32..=14 {
+                    let state = match scene {
+                        0 => (dy == -1).then_some(dirt),
+                        1 => (dy == -1).then_some(mycelium),
+                        2 => (dy == -1).then_some(stone),
+                        3 => {
+                            if dy == -1 {
+                                Some(dirt)
+                            } else if dy == 5 && x.abs() <= 2 && z.abs() <= 2 {
+                                Some(leaves)
+                            } else {
+                                None
+                            }
+                        }
+                        4 => {
+                            if dy == -1 {
+                                Some(dirt)
+                            } else if dy == 5 && x.abs() <= 2 && z.abs() <= 2 {
+                                Some(stone)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => {
+                            if dy == -1 {
+                                Some(dirt)
+                            } else if dy >= 8 {
+                                Some(stone)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    g.feat_write(x, oy + dy, z, state.unwrap_or(0));
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(p[2].parse::<i64>().unwrap() as u64);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[3].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[4].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(
+            block_state_cells_digest(reg, &ctx.wr, (0, oy, 0)),
+            p[5],
+            "{row}"
+        );
+    }
+}
+
+#[test]
 fn twisting_vines_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
     let netherrack = reg.state_of("minecraft:netherrack", None);
@@ -520,6 +595,46 @@ fn block_cells_digest(
             z - origin.2,
             reg.name_of(state)
         ));
+    }
+    cells.sort();
+    crate::generation_math::md5(cells.concat().as_bytes())
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect()
+}
+
+/// The same cells, but with the state's properties sorted by name — the canonical form
+/// `NativeHarness.normalizedStateName` writes. A block name alone cannot show that a
+/// mushroom cap's `west`/`east`/`north`/`south` are wrong.
+fn block_state_cells_digest(
+    reg: &crate::block_registry::BReg,
+    wr: &std::collections::HashMap<(i32, i32, i32), u32>,
+    origin: (i32, i32, i32),
+) -> String {
+    let mut cells = Vec::new();
+    for (&(x, y, z), &state) in wr {
+        let mut cell = format!(
+            "{},{},{} {}",
+            x - origin.0,
+            y - origin.1,
+            z - origin.2,
+            reg.name_of(state)
+        );
+        let mut props = reg.properties_of(state).unwrap_or_default();
+        if !props.is_empty() {
+            props.sort();
+            cell.push('[');
+            for (i, (k, v)) in props.iter().enumerate() {
+                if i > 0 {
+                    cell.push(',');
+                }
+                cell.push_str(k);
+                cell.push('=');
+                cell.push_str(v);
+            }
+            cell.push(']');
+        }
+        cells.push(cell + "\n");
     }
     cells.sort();
     crate::generation_math::md5(cells.concat().as_bytes())

@@ -1074,6 +1074,30 @@ check "end gateway clears its own y layer" \
                     air' \
   feature::generation_contract_tests::end_gateway_matches_native_cells
 
+check "huge brown mushroom keeps the cap's corner-adjacent rim" \
+  src/feature.rs '                st = reg.with_prop(st, "west", rim(west || (dz_edge && dx == 1 - r)));' \
+  '                st = reg.with_prop(st, "west", rim(west));' \
+  feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
+
+check "huge brown mushroom omits the four cap corners" \
+  src/feature.rs '            if dx_edge && dz_edge {
+                continue;
+            }' \
+  '            if false && dx_edge && dz_edge {
+                continue;
+            }' \
+  feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
+
+check "huge brown mushroom doubles its height on a nextInt(12) draw" \
+  src/feature.rs '        height *= 2;' \
+  '        height += 0;' \
+  feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
+
+check "huge brown mushroom accepts the whole dirt tag as ground" \
+  src/feature.rs '    if !reg.in_tag(below, "minecraft:dirt") && !reg.in_tag(below, "minecraft:mushroom_grow_block") {' \
+  '    if !reg.in_tag(below, "minecraft:mushroom_grow_block") {' \
+  feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

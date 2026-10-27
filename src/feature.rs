@@ -70,6 +70,20 @@ enum Cf {
     /// exit-position block entity is not modelled (no worldgen block entities yet),
     /// so a placed gateway keeps its default exit.
     EndGateway,
+    /// `minecraft:huge_brown_mushroom` (`ecm` over `ebg`), config `{cap_provider,
+    /// stem_provider, foliage_radius}`. Measured: the height is `nextInt(3) + 4`,
+    /// doubled when the *following* `nextInt(12)` is 0; the origin's below must be in
+    /// the `dirt` **tag** (mycelium passes, stone does not) or `mushroom_grow_block`;
+    /// every cell of the stem and of the cap layers (centre column up to `dy == 3`,
+    /// the full radius square above) must be air or in the `leaves` tag; the stem runs
+    /// `0..height`, written only where the cell is not solid-render, and the cap sits
+    /// at `y + height` as a `2r+1` square minus its four corners, its `west`/`east`/
+    /// `north`/`south` properties overwritten from the cell's edge role.
+    HugeBrownMushroom {
+        cap: Bsp,
+        stem: Bsp,
+        radius: i32,
+    },
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -1727,6 +1741,89 @@ fn gen_end_gateway(ctx: &mut FC, pos: (i32, i32, i32)) {
     }
 }
 
+/// `HugeBrownMushroomFeature` (`ecm`) over `AbstractHugeMushroomFeature` (`ebg`).
+/// See [`Cf::HugeBrownMushroom`].
+fn gen_huge_brown_mushroom(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    cap: &Bsp,
+    stem: &Bsp,
+    radius: i32,
+) {
+    let Some(reg) = breg() else { return };
+    // `ebg.getTreeHeight`: `nextInt(3) + 4`, doubled on a following `nextInt(12) == 0`.
+    let mut height = rng.next_bound(3) + 4;
+    if rng.next_bound(12) == 0 {
+        height *= 2;
+    }
+    let (x, y, z) = pos;
+    // `isValidPosition`: `y >= minBuildHeight + 1 && y + height + 1 < maxBuildHeight`.
+    if y < ctx.g.min_y + 1 || y + height + 1 >= ctx.g.min_y + ctx.g.height {
+        return;
+    }
+    let below = ctx.get(x, y - 1, z);
+    // `Feature.isDirt` (`ece.b`) is the DIRT **tag**, not the `dirt` block: mycelium,
+    // podzol and mud pass, which the fixture's mycelium scene measures.
+    if !reg.in_tag(below, "minecraft:dirt") && !reg.in_tag(below, "minecraft:mushroom_grow_block") {
+        return;
+    }
+    // `getTreeRadiusForHeight` (brown): the centre column until `dy > 3`, then the
+    // full radius square (corners included — the cap removes them later).
+    for dy in 0..=height {
+        let k = if dy > 3 { radius } else { 0 };
+        for dx in -k..=k {
+            for dz in -k..=k {
+                if !is_air_or_leaves(reg, ctx.get(x + dx, y + dy, z + dz)) {
+                    return;
+                }
+            }
+        }
+    }
+    // `placeTrunk`: the provider is sampled only where the cell is not solid-render.
+    for dy in 0..height {
+        if !reg.is_solid_render(ctx.get(x, y + dy, z)) {
+            let st = stem.get(ctx, rng, x, y, z);
+            ctx.set(x, y + dy, z, st);
+        }
+    }
+    // `makeCap`: a `2r+1` square minus the four corners at `y = origin.y + height`.
+    let r = radius;
+    for dx in -r..=r {
+        for dz in -r..=r {
+            let west = dx == -r;
+            let east = dx == r;
+            let north = dz == -r;
+            let south = dz == r;
+            let dx_edge = west || east;
+            let dz_edge = north || south;
+            if dx_edge && dz_edge {
+                continue;
+            }
+            let (cx, cy, cz) = (x + dx, y + height, z + dz);
+            if reg.is_solid_render(ctx.get(cx, cy, cz)) {
+                continue;
+            }
+            let mut st = cap.get(ctx, rng, x, y, z);
+            // The native overwrites all four rim properties, but only when the
+            // provider's state has all four (`hasProperty`). A straight edge is true,
+            // an edge cell next to a corner also gets the perpendicular one.
+            if reg.get_prop(st, "west").is_some()
+                && reg.get_prop(st, "east").is_some()
+                && reg.get_prop(st, "north").is_some()
+                && reg.get_prop(st, "south").is_some()
+            {
+                let rim = |on: bool| if on { "true" } else { "false" };
+                st = reg.with_prop(st, "west", rim(west || (dz_edge && dx == 1 - r)));
+                st = reg.with_prop(st, "east", rim(east || (dz_edge && dx == r - 1)));
+                st = reg.with_prop(st, "north", rim(north || (dx_edge && dz == 1 - r)));
+                st = reg.with_prop(st, "south", rim(south || (dx_edge && dz == r - 1)));
+            }
+            ctx.set(cx, cy, cz, st);
+        }
+    }
+}
+
 /// Nether "wart plant" ground: netherrack, warped nylium, warped wart block.
 /// Measured from the native `isInvalidPlacement` checks of the two vine features.
 fn is_vine_ground(name: &str) -> bool {
@@ -2719,6 +2816,11 @@ fn p_cf(j: &J) -> Option<Cf> {
         "void_start_platform" => Cf::VoidStartPlatform,
         "end_platform" => Cf::EndPlatform,
         "end_gateway" => Cf::EndGateway,
+        "huge_brown_mushroom" => Cf::HugeBrownMushroom {
+            cap: p_bsp(js(j, "cap_provider")?)?,
+            stem: p_bsp(js(j, "stem_provider")?)?,
+            radius: jint(j, "foliage_radius", 0),
+        },
         "twisting_vines" => Cf::TwistingVines {
             width: jint(j, "spread_width", 0),
             height: jint(j, "spread_height", 0),
@@ -3878,6 +3980,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
         Cf::EndPlatform => gen_end_platform(ctx, pos),
         Cf::EndGateway => gen_end_gateway(ctx, pos),
+        Cf::HugeBrownMushroom { cap, stem, radius } => {
+            gen_huge_brown_mushroom(ctx, rng, pos, cap, stem, *radius)
+        }
         Cf::TwistingVines {
             width,
             height,

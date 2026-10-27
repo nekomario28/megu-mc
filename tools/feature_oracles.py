@@ -75,15 +75,22 @@ def main():
     p.add_argument('name', choices=sorted(ORACLES))
     p.add_argument('--jar', type=Path, default=DEFAULT_JAR)
     p.add_argument('--write', action='store_true')
+    p.add_argument('--cells', type=Path,
+                   help='also keep the per-case cell list (the digest cannot name a property)')
     args = p.parse_args()
     fixture = ROOT / ORACLES[args.name]
     oracle = ROOT / f'tools/structure-oracle/{args.name.title().replace("_", "")}Oracle.java'
     with pinned_runtime(args.jar) as (work, cp, _):
         os.environ['MC_NATIVE_BLOCK_TAGS'] = str(block_tags(work / 'block_tags.tsv'))
         output = work / f'{args.name}.tsv'
+        cells = work / f'{args.name}_cells.tsv'
+        argv = [output, cells] if args.cells else [output]
         run_probe(work, cp, oracle, 'dev.mcspine.tools.'
-                  + oracle.stem, output, extra_sources=(HARNESS,))
+                  + oracle.stem, *argv, extra_sources=(HARNESS,))
         actual = output.read_bytes()
+        cells_actual = cells.read_bytes() if args.cells else None
+    if cells_actual is not None:
+        args.cells.write_bytes(cells_actual)
     if args.write:
         fixture.write_bytes(actual)
     elif not fixture.exists() or fixture.read_bytes() != actual:
