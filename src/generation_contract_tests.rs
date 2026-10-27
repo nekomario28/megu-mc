@@ -66,6 +66,147 @@ fn glowstone_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn flower_type_names_share_one_native_class_and_one_port_arm() {
+    let mut classes = std::collections::HashSet::new();
+    let mut seen = 0;
+    for row in include_str!("../tests/data/feature_classes_1211.tsv").lines() {
+        let mut f = row.split('\t');
+        let name = f.next().unwrap();
+        if !matches!(name, "flower" | "no_bonemeal_flower" | "random_patch") {
+            continue;
+        }
+        seen += 1;
+        classes.insert(f.next().unwrap().to_string());
+    }
+    assert_eq!(seen, 3);
+    assert_eq!(
+        classes,
+        std::collections::HashSet::from(["edc".to_string()])
+    );
+    for ty in ["flower", "no_bonemeal_flower", "random_patch"] {
+        let json = format!(
+            r#"{{"type":"minecraft:{ty}","config":{{"feature":{{"feature":{{"type":"minecraft:simple_block","config":{{"to_place":{{"type":"minecraft:simple_state_provider","state":{{"Name":"minecraft:poppy"}}}}}}}},"placement":[]}},"tries":1,"xz_spread":0,"y_spread":0}}}}"#
+        );
+        let cf = super::p_cf(&jparse(json.as_bytes()).unwrap()).unwrap();
+        assert!(matches!(cf, Cf::RandomPatch { .. }), "{ty}");
+    }
+}
+
+/// Build the digest the native oracles record: cells relative to the origin, with
+/// the placed block name, sorted.
+fn block_cells_digest(
+    reg: &crate::block_registry::BReg,
+    wr: &std::collections::HashMap<(i32, i32, i32), u32>,
+    origin: (i32, i32, i32),
+) -> String {
+    let mut cells = Vec::new();
+    for (&(x, y, z), &state) in wr {
+        cells.push(format!(
+            "{},{},{} {}\n",
+            x - origin.0,
+            y - origin.1,
+            z - origin.2,
+            reg.name_of(state)
+        ));
+    }
+    cells.sort();
+    crate::generation_math::md5(cells.concat().as_bytes())
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect()
+}
+
+#[test]
+fn void_start_platform_matches_native_cells() {
+    let reg = breg().unwrap();
+    let cf =
+        super::p_cf(&jparse(br#"{"type":"minecraft:void_start_platform","config":{}}"#).unwrap())
+            .unwrap();
+    for row in include_str!("../tests/data/void_start_platform_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let origin: Vec<i32> = p[1].split(',').map(|v| v.parse().unwrap()).collect();
+        let origin = (origin[0], origin[1], origin[2]);
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(0);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, origin);
+        // The refusal branch of `void_start_platform` also returns true, so the write
+        // set is the evidence; the placed flag is asserted where it is informative.
+        assert_eq!(p[2], "true", "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, origin), p[5], "{row}");
+        assert_eq!(rng.next_i64(), p[4].parse::<i64>().unwrap(), "{row}");
+    }
+}
+
+#[test]
+fn end_platform_matches_native_cells() {
+    let reg = breg().unwrap();
+    let cf =
+        super::p_cf(&jparse(br#"{"type":"minecraft:end_platform","config":{}}"#).unwrap()).unwrap();
+    let obsidian = reg.state_of("minecraft:obsidian", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    for row in include_str!("../tests/data/end_platform_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for dx in -2i32..=2 {
+            for dz in -2i32..=2 {
+                for dy in -1i32..=2 {
+                    // the same scenes the native oracle scripts
+                    let state = match scene {
+                        0 => 0,
+                        1 => {
+                            if dy == -1 {
+                                obsidian
+                            } else {
+                                0
+                            }
+                        }
+                        2 => {
+                            if dy == -1 {
+                                if dx > 0 {
+                                    obsidian
+                                } else {
+                                    0
+                                }
+                            } else if dy >= 0 && dz < 0 {
+                                stone
+                            } else {
+                                0
+                            }
+                        }
+                        3 => {
+                            if dy >= 2 {
+                                stone
+                            } else {
+                                0
+                            }
+                        }
+                        _ => {
+                            if dy <= -1 {
+                                obsidian
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    g.feat_write(dx, 64 + dy, dz, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(0);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        // `end_platform` always returns true, so its writes are the only evidence.
+        assert_eq!(p[2], "true", "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, (0, 64, 0)), p[5], "{row}");
+        assert_eq!(rng.next_i64(), p[4].parse::<i64>().unwrap(), "{row}");
+    }
+}
+
+#[test]
 fn basalt_pillar_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
     let cf = super::p_cf(&jparse(br#"{"type":"minecraft:basalt_pillar","config":{}}"#).unwrap())

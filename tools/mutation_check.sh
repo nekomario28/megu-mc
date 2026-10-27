@@ -1020,6 +1020,16 @@ check "basalt pillar reads the ceiling above the origin" \
   '|| ctx.is_air(pos.0, pos.1 - 1, pos.2)' \
   feature::generation_contract_tests::basalt_pillar_matches_native_cells_and_rng
 
+check "void start platform stays inside the start chunks" \
+  src/feature.rs '    if cx.abs().max(cz.abs()) > 1 {' \
+  '    if cx.abs().max(cz.abs()) > 0 {' \
+  feature::generation_contract_tests::void_start_platform_matches_native_cells
+
+check "end platform covers the obsidian row" \
+  src/feature.rs '            for dy in -1i32..3 {' \
+  '            for dy in 0i32..3 {' \
+  feature::generation_contract_tests::end_platform_matches_native_cells
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

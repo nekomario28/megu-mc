@@ -58,6 +58,16 @@ enum Cf {
     /// `nextInt(10) < 10 - |dx|*|dz|`, each cell walked down at most three cells to its
     /// support. Writes outside the build height are refused, as native `setBlock` does.
     BasaltPillar,
+    /// `minecraft:void_start_platform` (`edv`), config `{}`: only in the origin's own
+    /// chunk when that chunk is within chebyshev 1 of chunk (0,0), writes the start
+    /// platform at `origin.y + 3` over the chunk's 16x16 columns, skipping columns
+    /// further than chebyshev 16 from the fixed start (8,8). The native sets
+    /// `(x, y, z) = (zLoop, y, xLoop)` — transposed — which is the same square.
+    VoidStartPlatform,
+    /// `minecraft:end_platform` (`ecc`), config `{}`: obsidian at `dy = -1` and air
+    /// at `dy = 0..2` over a 5x5 box (x from the dz offset, z from the dx offset),
+    /// skipping cells that already hold the target *block*.
+    EndPlatform,
     Ore {
         size: i32,
         discard: f32,
@@ -1635,6 +1645,52 @@ fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &
     }
 }
 
+/// `VoidStartPlatformFeature` (`edv`), config `{}`. See [`Cf::VoidStartPlatform`].
+fn gen_void_start_platform(ctx: &mut FC, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let cobble = reg.state_of("minecraft:cobblestone", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let (cx, cz) = (pos.0 >> 4, pos.2 >> 4);
+    // `ChunkPos(START)` is chunk (0,0) because START is (8, 3, 8).
+    if cx.abs().max(cz.abs()) > 1 {
+        return;
+    }
+    let start = (8, pos.1 + 3, 8);
+    // Measured cells: x spans the chunk's x range and z its z range, so the native
+    // `ChunkPos` accessors the body reads are the missing quadrature: iterating either
+    // way gives the same set because the chebyshev test is symmetric in (x, z).
+    for x in cx * 16..cx * 16 + 16 {
+        for z in cz * 16..cz * 16 + 16 {
+            if (start.0 - x).abs().max((start.2 - z).abs()) <= 16 {
+                let state = if (x, start.1, z) == start {
+                    cobble
+                } else {
+                    stone
+                };
+                ctx.set(x, start.1, z, state);
+            }
+        }
+    }
+}
+
+fn gen_end_platform(ctx: &mut FC, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let obsidian = reg.state_of("minecraft:obsidian", None);
+    let air = reg.state_of("minecraft:air", None);
+    for dx in -2i32..=2 {
+        for dz in -2i32..=2 {
+            for dy in -1i32..3 {
+                let (x, y, z) = (pos.0 + dz, pos.1 + dy, pos.2 + dx);
+                let want = if dy == -1 { obsidian } else { air };
+                // `getBlockState(p).is(block)`: compare the block, not the state
+                if reg.name_of(ctx.get(x, y, z)) != reg.name_of(want) {
+                    ctx.set(x, y, z, want);
+                }
+            }
+        }
+    }
+}
+
 /// `BasaltPillarFeature` (`ebj`), config `{}`. See [`Cf::BasaltPillar`].
 ///
 /// The four sideways attempts are listed in the native order — north, south, west,
@@ -2127,7 +2183,10 @@ fn p_cf(j: &J) -> Option<Cf> {
         // `minecraft:flower` is the same config shape (a patch of simple blocks), just a
         // different type name - it was one of the 34 types with no arm, so every flower
         // patch in the pack did nothing.
-        "flower" | "random_patch" => Cf::RandomPatch {
+        // `flower`, `no_bonemeal_flower` and `random_patch` are three registered
+        // names for the same `edc` RandomPatchFeature (tests/data/feature_classes_1211.tsv),
+        // so one arm serves all three.
+        "flower" | "no_bonemeal_flower" | "random_patch" => Cf::RandomPatch {
             feature: Box::new(pf_any(js(j, "feature")?)?),
             tries: jint(j, "tries", 0),
             xz: jint(j, "xz_spread", 0),
@@ -2243,6 +2302,8 @@ fn p_cf(j: &J) -> Option<Cf> {
         "chorus_plant" => Cf::ChorusPlant,
         "glowstone_blob" => Cf::Glowstone,
         "basalt_pillar" => Cf::BasaltPillar,
+        "void_start_platform" => Cf::VoidStartPlatform,
+        "end_platform" => Cf::EndPlatform,
         "monster_room" => Cf::MonsterRoom,
         "tree" => Cf::Tree(Box::new(crate::tree::p_tree(j)?)),
         "fallen_tree" => Cf::Fallen {
@@ -3365,6 +3426,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
         }
         Cf::BasaltPillar => gen_basalt_pillar(ctx, rng, pos),
+        Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
+        Cf::EndPlatform => gen_end_platform(ctx, pos),
         Cf::ChorusPlant => {
             let Some(reg) = breg() else { return };
             if ctx.is_air(pos.0, pos.1, pos.2)
