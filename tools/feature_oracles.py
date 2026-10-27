@@ -35,6 +35,7 @@ ORACLES = {
     'huge_brown_mushroom': 'tests/data/huge_brown_mushroom_1211.tsv',
     'huge_red_mushroom': 'tests/data/huge_red_mushroom_1211.tsv',
     'huge_fungus': 'tests/data/huge_fungus_1211.tsv',
+    'huge_fungus_crimson': 'tests/data/huge_fungus_crimson_1211.tsv',
     'end_gateway': 'tests/data/end_gateway_1211.tsv',
     'end_spike': 'tests/data/end_spike_1211.tsv',
     'fossil': 'tests/data/fossil_1211.tsv',

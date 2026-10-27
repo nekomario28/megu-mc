@@ -368,11 +368,20 @@ fn huge_red_mushroom_matches_native_cells_and_layers() {
     }
 }
 
-/// One inclusive `[min, max]` range from a cases file.
+/// One inclusive `[min, max]` pair.
+fn case_range_of(j: &J) -> [i32; 2] {
+    match j {
+        J::Arr(a) => {
+            assert_eq!(a.len(), 2, "a range must be [min, max]");
+            [a[0].num() as i32, a[1].num() as i32]
+        }
+        _ => panic!("a range must be [min, max]"),
+    }
+}
+
+/// One inclusive `[min, max]` range from a cases file, by key.
 fn case_range(j: &J, key: &str) -> [i32; 2] {
-    let a = jarr(j, key).expect("range");
-    assert_eq!(a.len(), 2, "{key} must be [min, max]");
-    [a[0].num() as i32, a[1].num() as i32]
+    case_range_of(js(j, key).unwrap_or_else(|| panic!("missing range {key}")))
 }
 
 /// Replay a native case set (`tools/structure-oracle/FeatureOracle.java`) through the port.
@@ -384,9 +393,23 @@ fn case_range(j: &J, key: &str) -> [i32; 2] {
 /// than silently reading generated terrain. The last fixture column is the oracle's
 /// post-placement `nextInt(1000)` triple, so a draw that changes no cell still fails.
 fn generic_feature_cases(cases_json: &str, fixture: &str) {
-    const AIR_BOX: [[i32; 2]; 3] = [[-8, 8], [-6, 6], [-8, 8]];
+    // The air box is the volume the scene is *defined* over: everything inside it that no ply
+    // covers is written as air, so the port never reads generated terrain. A tall feature
+    // (`huge_fungus` reaches dy 26) declares its own with `"box"`.
+    const DEFAULT_BOX: [[i32; 2]; 3] = [[-8, 8], [-6, 6], [-8, 8]];
     let reg = breg().unwrap();
     let cases = jparse(cases_json.as_bytes()).unwrap();
+    let air_box: [[i32; 2]; 3] = match jarr(&cases, "box") {
+        Some(b) => {
+            assert_eq!(b.len(), 3, "box must be [[x0,x1],[y0,y1],[z0,z1]]");
+            [
+                case_range_of(&b[0]),
+                case_range_of(&b[1]),
+                case_range_of(&b[2]),
+            ]
+        }
+        None => DEFAULT_BOX,
+    };
     let cf = super::p_cf(&cases).expect("the cases file is a configured feature");
     let mut scenes: Vec<(String, Vec<(u32, [[i32; 2]; 3])>)> = Vec::new();
     for scene in jarr(&cases, "scenes").expect("scenes") {
@@ -416,15 +439,15 @@ fn generic_feature_cases(cases_json: &str, fixture: &str) {
             .1;
         for (_, r) in plies {
             assert!(
-                (0..3).all(|k| r[k][0] >= AIR_BOX[k][0] && r[k][1] <= AIR_BOX[k][1]),
+                (0..3).all(|k| r[k][0] >= air_box[k][0] && r[k][1] <= air_box[k][1]),
                 "scene {} writes outside the air box: {row}",
                 p[0]
             );
         }
         let mut g = Gen::load(0, crate::name_to_state).unwrap();
-        for x in AIR_BOX[0][0]..=AIR_BOX[0][1] {
-            for z in AIR_BOX[2][0]..=AIR_BOX[2][1] {
-                for dy in AIR_BOX[1][0]..=AIR_BOX[1][1] {
+        for x in air_box[0][0]..=air_box[0][1] {
+            for z in air_box[2][0]..=air_box[2][1] {
+                for dy in air_box[1][0]..=air_box[1][1] {
                     g.feat_write(x, oy + dy, z, 0);
                 }
             }
@@ -517,6 +540,22 @@ fn coral_mushroom_matches_native_cells_and_rng() {
     generic_feature_cases(
         include_str!("../tests/feature_cases/coral_mushroom.json"),
         include_str!("../tests/data/coral_mushroom_1211.tsv"),
+    );
+}
+
+#[test]
+fn huge_fungus_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/huge_fungus.json"),
+        include_str!("../tests/data/huge_fungus_1211.tsv"),
+    );
+}
+
+#[test]
+fn huge_fungus_crimson_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/huge_fungus_crimson.json"),
+        include_str!("../tests/data/huge_fungus_crimson_1211.tsv"),
     );
 }
 

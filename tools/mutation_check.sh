@@ -1175,6 +1175,40 @@ check "coral piece accepts a coral plant as its own cell" \
   '    if !water(at) || !water(at_above) {' \
   feature::generation_contract_tests::coral_tree_matches_native_cells_and_rng
 
+check "huge fungus extends its hat from the block below" \
+  src/feature.rs '    if reg.name_of(ctx.get(p.0, p.1 - 1, p.2)) == reg.name_of(hat) {' \
+  '    if reg.name_of(ctx.get(p.0, p.1 + 1, p.2)) == reg.name_of(hat) {' \
+  feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
+
+check "huge fungus widens its widest hat rows" \
+  src/feature.rs '        if layers > 8 && dy < start + 4 {' \
+  '        if layers > 9 && dy < start + 4 {' \
+  feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
+
+check "huge fungus keeps the top hat row solid" \
+  src/feature.rs '                let interior = !x_edge && !z_edge && dy != height;' \
+  '                let interior = !x_edge && !z_edge;' \
+  feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
+
+check "huge fungus doubles a half of its vine lengths" \
+  src/feature.rs '    let mut len = rng.next_inbetween(1, 5);
+    if rng.next_bound(7) == 0 {
+        len *= 2;' \
+  '    let mut len = rng.next_inbetween(1, 5);
+    if rng.next_bound(8) == 0 {
+        len *= 2;' \
+  feature::generation_contract_tests::huge_fungus_crimson_matches_native_cells_and_rng
+
+check "huge fungus only grows its hat into replaceable cells" \
+  src/feature.rs '                if !hf_can_place(ctx, p, c, false) {' \
+  '                if !hf_can_place(ctx, p, c, true) {' \
+  feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
+
+check "a feature write invalidates the column's worldgen heightmaps" \
+  src/generation_context.rs '            self.hmwg.remove(&(x, z, kind));' \
+  '            let _ = kind;' \
+  feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

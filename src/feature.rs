@@ -116,6 +116,22 @@ enum Cf {
     /// `corals` tag) *and* the cell above it is water; writing one may put a coral plant
     /// (25%), a sea pickle (5%) above it, and wall fans on a 20% per horizontal direction.
     Coral(CoralShape),
+    /// `minecraft:huge_fungus` (`eco`), config `{valid_base_block, stem_state, hat_state,
+    /// decor_state, replaceable_blocks, planted}`.
+    ///
+    /// Measured from `eco` (and `edx` for the vines): the origin's **below** must be the
+    /// config's base block; the height is `nextInt(4..=13)`, doubled on a following
+    /// `nextInt(12) == 0`, and (when not `planted`) refused if it would pass the
+    /// generation depth. `!planted && nextFloat() < 0.06` makes a 3x3 stem (`huge`), whose
+    /// corner cells only get a stem on a 10% roll. The hat is the top
+    /// `min(nextInt(1 + height/3) + 5, height)` rows, its radius falling from 3/2 to 1/2 by
+    /// row, with a shroomlight/hat/decor roll per cell that depends on the cell's role
+    /// (interior, corner, edge). A hat that *is* `nether_wart_block` (the crimson config)
+    /// also sprouts weeping-vine columns; the warped config, whose hat is
+    /// `warped_wart_block`, never reaches that branch, which is why the fixtures carry both
+    /// configs. `planted` configurations clear a non-air block *below* the cell before
+    /// writing.
+    HugeFungus(HugeFungusCfg),
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -706,6 +722,25 @@ pub(crate) struct DripstoneClusterCfg {
     max_dist_edge: i32,
     /// `max_distance_from_center_affecting_height_bias`.
     max_dist_center: i32,
+}
+
+/// A configured block-state JSON (`{"Name": ..., "Properties": {...}}`) as a state id.
+fn bs_state(j: &J) -> Option<u32> {
+    let (name, props) = bs_parts(j)?;
+    Some(breg()?.state_of(&name, props))
+}
+
+/// `HugeFungusConfiguration` (`ecn`): four block states, a `replaceable_blocks` predicate and
+/// the `planted` flag.
+pub(crate) struct HugeFungusCfg {
+    base: u32,
+    stem: u32,
+    hat: u32,
+    decor: u32,
+    /// `replaceable_blocks` (`eaf`): the second chance `canPlace(..., true)` accepts, after
+    /// `BlockState::canBeReplaced` itself.
+    replaceable: Pr,
+    planted: bool,
 }
 
 /// `PointedDripstoneConfiguration` (`eer`): four float chances, all defaults present in the
@@ -2230,6 +2265,227 @@ fn coral_mushroom(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32)
     }
 }
 
+/// `HugeFungusFeature` (`eco`). See [`Cf::HugeFungus`].
+fn gen_huge_fungus(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &HugeFungusCfg) {
+    let Some(reg) = breg() else { return };
+    let (x, y, z) = pos;
+    // `getValidBasePos`: the block *below* the origin is the config's base block
+    if reg.name_of(ctx.get(x, y - 1, z)) != reg.name_of(c.base) {
+        return;
+    }
+    let mut height = rng.next_inbetween(4, 13);
+    if rng.next_bound(12) == 0 {
+        height *= 2;
+    }
+    // `chunkGenerator.getGenDepth()` is the level's build height, which is the harness's own
+    if !c.planted && y + height + 1 >= ctx.g.min_y + ctx.g.height {
+        return;
+    }
+    let huge = !c.planted && rng.next_f32() < 0.06;
+    let air = reg.state_of("minecraft:air", None);
+    hf_set(ctx, pos, air);
+    huge_fungus_stem(ctx, rng, c, pos, height, huge);
+    huge_fungus_hat(ctx, rng, c, pos, height, huge);
+}
+
+/// `setBlock`, which refuses cells outside the build height.
+fn hf_set(ctx: &mut FC, p: (i32, i32, i32), st: u32) {
+    if !ctx.out_of_h(p.1) {
+        ctx.set(p.0, p.1, p.2, st);
+    }
+}
+
+/// `HugeFungusFeature.isReplaceable`: `BlockState::canBeReplaced`, or the config's
+/// `replaceable_blocks` predicate when the caller allows it. The port's `is_replaceable` is
+/// the asset's replaceable bit, which is the same property the block models carry.
+fn hf_can_place(ctx: &mut FC, p: (i32, i32, i32), c: &HugeFungusCfg, allow: bool) -> bool {
+    let Some(reg) = breg() else { return false };
+    if reg.is_replaceable(ctx.get(p.0, p.1, p.2)) {
+        return true;
+    }
+    allow && test_pred(&c.replaceable, reg, ctx, p.0, p.1, p.2)
+}
+
+/// `HugeFungusFeature.placeStem`.
+fn huge_fungus_stem(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &HugeFungusCfg,
+    base: (i32, i32, i32),
+    height: i32,
+    huge: bool,
+) {
+    let Some(reg) = breg() else { return };
+    let air = reg.state_of("minecraft:air", None);
+    let r: i32 = if huge { 1 } else { 0 };
+    for dx in -r..=r {
+        for dz in -r..=r {
+            let corner = huge && dx.abs() == r && dz.abs() == r;
+            for dy in 0..height {
+                let p = (base.0 + dx, base.1 + dy, base.2 + dz);
+                if !hf_can_place(ctx, p, c, true) {
+                    continue;
+                }
+                if c.planted {
+                    if !reg.is_air(ctx.get(p.0, p.1 - 1, p.2)) {
+                        hf_set(ctx, p, air); // `destroyBlock(pos, true)` in worldgen
+                    }
+                    hf_set(ctx, p, c.stem);
+                } else if corner {
+                    if rng.next_f32() < 0.1 {
+                        hf_set(ctx, p, c.stem);
+                    }
+                } else {
+                    hf_set(ctx, p, c.stem);
+                }
+            }
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeHat`: the top `layers` rows, each a square whose radius comes from
+/// the row's distance to the top (`2` or `3` below `height - nextInt(3)`, widened by one for
+/// `huge`), every cell rolled by its role.
+fn huge_fungus_hat(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &HugeFungusCfg,
+    base: (i32, i32, i32),
+    height: i32,
+    huge: bool,
+) {
+    let Some(reg) = breg() else { return };
+    let wart = reg.name_of(c.hat) == "minecraft:nether_wart_block";
+    let layers = (rng.next_bound(1 + height / 3) + 5).min(height);
+    let start = height - layers;
+    let air = reg.state_of("minecraft:air", None);
+    for dy in start..=height {
+        let mut r = if dy < height - rng.next_bound(3) {
+            2
+        } else {
+            1
+        };
+        if layers > 8 && dy < start + 4 {
+            r = 3;
+        }
+        if huge {
+            r += 1;
+        }
+        for dx in -r..=r {
+            for dz in -r..=r {
+                let x_edge = dx == -r || dx == r;
+                let z_edge = dz == -r || dz == r;
+                let interior = !x_edge && !z_edge && dy != height;
+                let corner = x_edge && z_edge;
+                let lower = dy < start + 3;
+                let p = (base.0 + dx, base.1 + dy, base.2 + dz);
+                if !hf_can_place(ctx, p, c, false) {
+                    continue;
+                }
+                if c.planted && !reg.is_air(ctx.get(p.0, p.1 - 1, p.2)) {
+                    hf_set(ctx, p, air);
+                }
+                if lower {
+                    if !interior {
+                        huge_fungus_hat_block(ctx, rng, p, c.hat, wart);
+                    }
+                } else if interior {
+                    huge_fungus_hat_drop(ctx, rng, c, p, 0.1, 0.2, if wart { 0.1 } else { 0.0 });
+                } else if corner {
+                    huge_fungus_hat_drop(ctx, rng, c, p, 0.01, 0.7, if wart { 0.083 } else { 0.0 });
+                } else {
+                    huge_fungus_hat_drop(
+                        ctx,
+                        rng,
+                        c,
+                        p,
+                        5.0e-4,
+                        0.98,
+                        if wart { 0.07 } else { 0.0 },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeHatBlock`: a hat cell when the cell *below* already carries the hat
+/// block, otherwise a 15% chance of one; a wart-block hat can sprout a weeping vine.
+fn huge_fungus_hat_block(ctx: &mut FC, rng: &mut Xor, p: (i32, i32, i32), hat: u32, wart: bool) {
+    let Some(reg) = breg() else { return };
+    // the native checks the cell **below** (`jd.e()`), so a hat block extends the cap upward
+    if reg.name_of(ctx.get(p.0, p.1 - 1, p.2)) == reg.name_of(hat) {
+        hf_set(ctx, p, hat);
+    } else if rng.next_f32() < 0.15 {
+        hf_set(ctx, p, hat);
+        if wart && rng.next_bound(11) == 0 {
+            huge_fungus_weeping_vines(ctx, rng, p);
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeHatDropBlock`: decor, then hat, then (rarely) a weeping vine; the
+/// three chances are the cell's role.
+fn huge_fungus_hat_drop(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &HugeFungusCfg,
+    p: (i32, i32, i32),
+    decor_chance: f32,
+    hat_chance: f32,
+    vine_chance: f32,
+) {
+    if rng.next_f32() < decor_chance {
+        hf_set(ctx, p, c.decor);
+    } else if rng.next_f32() < hat_chance {
+        hf_set(ctx, p, c.hat);
+        if rng.next_f32() < vine_chance {
+            huge_fungus_weeping_vines(ctx, rng, p);
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeWeepingVines`: a vine hangs from the cell below the hat when that
+/// cell is empty; the length doubles on one `nextInt(7) == 0`.
+fn huge_fungus_weeping_vines(ctx: &mut FC, rng: &mut Xor, p: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let m = (p.0, p.1 - 1, p.2);
+    if !reg.is_air(ctx.get(m.0, m.1, m.2)) {
+        return;
+    }
+    let mut len = rng.next_inbetween(1, 5);
+    if rng.next_bound(7) == 0 {
+        len *= 2;
+    }
+    weeping_vines_column(ctx, rng, m, len, 23, 25);
+}
+
+/// `WeepingVinesFeature.placeWeepingVinesColumn` (`edx.a`): body cells while the cell below is
+/// empty, the last empty cell (or the last one before a non-empty cell) the aged tip.
+fn weeping_vines_column(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    height: i32,
+    min_age: i32,
+    max_age: i32,
+) {
+    let Some(reg) = breg() else { return };
+    let mut m = pos;
+    for i in 0..=height {
+        if reg.is_air(ctx.get(m.0, m.1, m.2)) {
+            if i == height || !reg.is_air(ctx.get(m.0, m.1 - 1, m.2)) {
+                let age = rng.next_inbetween(min_age, max_age).to_string();
+                let st = reg.with_prop(reg.state_of("minecraft:weeping_vines", None), "age", &age);
+                hf_set(ctx, m, st);
+                break;
+            }
+            hf_set(ctx, m, reg.state_of("minecraft:weeping_vines_plant", None));
+        }
+        m.1 -= 1;
+    }
+}
+
 /// `PointedDripstoneFeature` (`eda`). See [`Cf::PointedDripstone`].
 fn gen_pointed_dripstone(
     ctx: &mut FC,
@@ -3316,6 +3572,14 @@ fn p_cf(j: &J) -> Option<Cf> {
             stem: p_bsp(js(j, "stem_provider")?)?,
             radius: jint(j, "foliage_radius", 0),
         },
+        "huge_fungus" => Cf::HugeFungus(HugeFungusCfg {
+            base: bs_state(js(j, "valid_base_block")?)?,
+            stem: bs_state(js(j, "stem_state")?)?,
+            hat: bs_state(js(j, "hat_state")?)?,
+            decor: bs_state(js(j, "decor_state")?)?,
+            replaceable: p_pred(js(j, "replaceable_blocks")?)?,
+            planted: jbool(j, "planted", false),
+        }),
         "coral_tree" => Cf::Coral(CoralShape::Tree),
         "coral_claw" => Cf::Coral(CoralShape::Claw),
         "coral_mushroom" => Cf::Coral(CoralShape::Mushroom),
@@ -4492,6 +4756,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         }
         Cf::PointedDripstone(c) => gen_pointed_dripstone(ctx, rng, pos, c),
         Cf::Coral(shape) => gen_coral(ctx, rng, pos, *shape),
+        Cf::HugeFungus(c) => gen_huge_fungus(ctx, rng, pos, c),
         Cf::TwistingVines {
             width,
             height,
@@ -4761,7 +5026,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     eprintln!(
                         "SPRING {} {} {} at={} below={} below2={} rocks={rocks} holes={air} want={rock},{hole}",
-                        pos.0, pos.1, pos.2,
+                        pos.0,
+                        pos.1,
+                        pos.2,
                         reg.name_of(at),
                         reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
                         reg.name_of(ctx.get(pos.0, pos.1 - 2, pos.2)),
@@ -6251,7 +6518,10 @@ impl CarveRun {
                 branches += r.next_bound(4);
             }
             if env_flag!("CV_TRACE") {
-                eprintln!("CVTUN ox={ox} oz={oz} x={x} y={y} z={z} hrm={hrm} vrm={vrm} floor={} branches={branches}", self.floor);
+                eprintln!(
+                    "CVTUN ox={ox} oz={oz} x={x} y={y} z={z} hrm={hrm} vrm={vrm} floor={} branches={branches}",
+                    self.floor
+                );
             }
             for _ in 0..branches {
                 let yaw = r.next_f32() * TAU;
