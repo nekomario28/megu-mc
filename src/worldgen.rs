@@ -2376,6 +2376,32 @@ impl std::ops::DerefMut for GenLock {
     }
 }
 
+/// The part of `Gen` that never changes after `init`: the dimension facts every reader
+/// needs (`sea`, build height, the default block states).
+///
+/// Published separately from `GEN` so a reader does not queue behind a 13 ms generation
+/// hold to learn the build height. It is the first piece of the `GenData`/`Gen` split in
+/// `specs/chunk-parallelism`: immutable inputs readable without the world lock. Anything
+/// added here must be immutable after construction — the snapshot is taken once, and a
+/// later writer would silently diverge from the generator.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GenFacts {
+    pub preset: NoisePreset,
+    pub sea: i32,
+    pub min_y: i32,
+    pub height: i32,
+    pub def_st: u32,
+    pub def_fl: u32,
+    pub bedrock_st: u32,
+}
+
+static GEN_FACTS: Mutex<Option<GenFacts>> = Mutex::new(None);
+
+/// The immutable dimension facts, without the `GEN` lock. `None` before `init`.
+pub(crate) fn facts() -> Option<GenFacts> {
+    *GEN_FACTS.lock().unwrap()
+}
+
 fn gen_lock() -> GenLock {
     let prof = env_flag!("FEAT_PROFILE");
     let started = prof.then(std::time::Instant::now);
@@ -2427,6 +2453,15 @@ pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: Noise
     };
     match generator {
         Some(g) => {
+            *GEN_FACTS.lock().unwrap() = Some(GenFacts {
+                preset: g.preset,
+                sea: g.sea,
+                min_y: g.min_y,
+                height: g.height,
+                def_st: g.def_st,
+                def_fl: g.def_fl,
+                bedrock_st: g.bedrock_st,
+            });
             *gen_lock() = Some(g);
             true
         }
@@ -3316,7 +3351,7 @@ pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
 }
 
 pub fn sea_level() -> i32 {
-    gen_lock().as_ref().map(|g| g.sea).unwrap_or(63)
+    facts().map(|f| f.sea).unwrap_or(63)
 }
 
 /// material-rule result for blocks below the surface window (bedrock,
@@ -3427,14 +3462,10 @@ impl Gen {
     }
 }
 pub fn min_y() -> i32 {
-    gen_lock().as_ref().map(|g| g.min_y).unwrap_or(-64)
+    facts().map(|f| f.min_y).unwrap_or(-64)
 }
 pub fn max_y() -> i32 {
-    GEN.lock()
-        .unwrap()
-        .as_ref()
-        .map(|g| g.min_y + g.height - 1)
-        .unwrap_or(319)
+    facts().map(|f| f.min_y + f.height - 1).unwrap_or(319)
 }
 
 /// First solid (density>0) y when scanning down from max_y. -min_y-1 if none.
@@ -3790,8 +3821,7 @@ pub fn block_state(
     z: i32,
     populate: impl FnMut(&mut Gen, i32, i32),
 ) -> Option<u32> {
-    GEN.lock()
-        .unwrap()
+    gen_lock()
         .as_mut()
         .map(|g| g.block_state_at(x, y, z, populate))
 }
@@ -6758,6 +6788,39 @@ mod wg_tests {
             "PERF deep_state: {:.4} ms/call",
             t.elapsed().as_secs_f64() * 1000.0 / m as f64
         );
+    }
+
+    /// The published immutable facts must equal the generator's own values: they are
+    /// read without the world lock, so a divergence would be silent (and every
+    /// dimension-aware reader would be wrong).
+    #[test]
+    fn published_gen_facts_match_the_generator() {
+        let _guard = lock_gen();
+        assert!(init_preset(0, crate::name_to_state, NoisePreset::End));
+        let f = facts().expect("facts published at init");
+        let (g_sea, g_min_y, g_height, g_def_st, g_def_fl, g_bedrock, preset) = with_gen(|g| {
+            (
+                g.sea,
+                g.min_y,
+                g.height,
+                g.def_st,
+                g.def_fl,
+                g.bedrock_st,
+                g.preset,
+            )
+        })
+        .expect("generator");
+        assert_eq!(
+            (f.sea, f.min_y, f.height, f.def_st, f.def_fl, f.bedrock_st),
+            (g_sea, g_min_y, g_height, g_def_st, g_def_fl, g_bedrock)
+        );
+        assert_eq!(f.preset, preset);
+        assert_eq!(min_y(), f.min_y);
+        assert_eq!(max_y(), f.min_y + f.height - 1);
+        assert_eq!(sea_level(), f.sea);
+        // leave the shared fixture in the Overworld for the other tests
+        assert!(init(0, crate::name_to_state));
+        assert_eq!(facts().expect("facts").preset, NoisePreset::Overworld);
     }
 
     /// Lock-wait split under contention: three threads, each doing the work a
