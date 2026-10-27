@@ -7,8 +7,10 @@
 
 | 道具 | 何をするか |
 |---|---|
-| `vineflower.sh <class> [...]`（未スクリプト化、下記コマンド） | 1クラスを**ソースに逆コンパイル**して読む。`javap` はオフセットの引用に、こちらはアルゴリズムの移植に使う。入れ子 jar を展開して `--only=<obf>` を渡す: `unzip -q server.jar 'META-INF/versions/*' -d t && java -jar ~/.cache/mc-spine-work/mc121/vineflower-1.11.1.jar --folder --only=eck t/META-INF/versions/1.21.1/server-1.21.1.jar out`（`eck`=`GeodeFeature`。難読名は公式 mappings の `-> eck:` 行で引く） |
+| `vanilla_src.sh <official class...>` | 固定1.21.1 jar を**ソースに逆コンパイル**して読む（`javap` はオフセット引用、こちらはアルゴリズムの移植）。公式mappingsで難読名に引き、入れ子jarから本体と入れ子クラスを出す。jar と mappings の SHA-1 を検査し、**repo 内への出力は拒否**する（Mojang のコードは読解用で、再配布しない）。既定の出力は `~/.cache/mc-spine-work/mc121/src` |
+| `structure-oracle/NativeHarness.java` + `FeatureOracle.java` + `feature_oracles.py [<type> --cases <json> [--write] [--cells <path>]]` | 固定 jar の**実 feature クラス**を scripted level で実行し、`scene/oy/seed/wrote/cells/digest/rngProbe` を記録する。cases はデータ（origin 相対の ply・seeds・box）、`class` は registry と一致を assert。port 側は同じ cases を `generic_feature_cases` が読む。失敗時は `GENERIC_CASE_DUMP=<path>` で port セルを出して cell 単位で diff する。契約と**測った限界**（署名済み jar で `ChunkGenerator` を継承できない／`getLevel()` は供給不能／build height 外の scene は不可）は [native oracle の記録](../evidence/gameplay/feature-parity/native-oracle.md) |
 | `bytecode_probe.sh <class> [pattern]` | 固定した1.21.1 jar から1クラスの `javap -p -c` を出す。公式mappingsで難読名に引き、入れ子jarから取り出す。証拠ページの javap 引用はこれで再現する |
+| `feature_cases/gen.py <type> [--support <block>] [--force]` | 型の cases skeleton を pack と `tests/data/feature_classes_1211.tsv` から生成する（難読クラス名と config は機械的、scene は定型7種）。**型固有の判別 scene は手で足す**（そこが型の本体）。生成物は `tests/feature_cases/<type>.json` |
 | `feature_type_coverage.py [--unimplemented] [--overworld]` | pack の configured-feature 型 × `p_cf` の腕 × placed feature の入れ子 × それを参照する biome を静的に数える。**到達されていない型を先に実装しない**ための計測 |
 | `kelp_fixture.sh <cx> <cz> [n] [seed]` | 海洋 biome を spawn から離れた場所で forceload し、**正の kelp セルをゲートで要求**してから port と block 単位で diff（0 なら失敗）。forceload は起動後に送る |
 | `geode_fixture.sh [cx] [cz] [n] [seed]` | geode を含む vanilla 参照を作る（既定 seed 12 / chunk (0,0) は port の配置 trace で geode が発火することを実測済み）。参照に geode が無ければ失敗し、amethyst_block / budding_amethyst / calcite / smooth_basalt をセル単位で比較する |
