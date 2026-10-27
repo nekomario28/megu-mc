@@ -6725,6 +6725,9 @@ pub(crate) fn feat_prof_dump() {
     v.sort_by_key(|x| std::cmp::Reverse(x.1));
     let total: u128 = v.iter().map(|x| x.1).sum();
     eprintln!("FEATPROF total={:.1}ms", total as f64 / 1e6);
+    let scans = crate::generation_context::HM_SCAN_N.load(std::sync::atomic::Ordering::Relaxed);
+    let cells = crate::generation_context::HM_SCAN_CELLS.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("FEATPROF wg-heightmap scans={scans} cells={cells}");
     eprintln!(
         "FEATPROF terrain reads={:.1}ms n={} ({:.0} ns/call)",
         crate::generation_context::READ_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,

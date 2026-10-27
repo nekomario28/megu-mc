@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// FEAT_PROFILE diagnostic: time spent in feature-side terrain reads.
 pub(crate) static READ_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static READ_N: AtomicU64 = AtomicU64::new(0);
+/// FEAT_PROFILE: WG-heightmap work. `HM_SCAN_N` counts computed columns (memo misses),
+/// `HM_SCAN_CELLS` the `terrain_cell` evaluations those scans walked through. Measured
+/// 2026-10-27: 43,048 scans / 141,530 cells over 25 populated chunks.
+pub(crate) static HM_SCAN_N: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HM_SCAN_CELLS: AtomicU64 = AtomicU64::new(0);
 
 // ---------- generation context ----------
 
@@ -119,6 +124,10 @@ impl<'a> FC<'a> {
         } else {
             None
         };
+        let prof = self.prof;
+        if prof && kind.is_wg() {
+            HM_SCAN_N.fetch_add(1, Ordering::Relaxed);
+        }
         let mut y = from.min(self.g.min_y + self.g.height - 1);
         while y >= self.g.min_y {
             let st = if kind.is_wg() {
@@ -128,6 +137,9 @@ impl<'a> FC<'a> {
             } else {
                 self.get(x, y, z)
             };
+            if prof && kind.is_wg() {
+                HM_SCAN_CELLS.fetch_add(1, Ordering::Relaxed);
+            }
             if reg.is_some_and(|r| r.heightmap_counts(st, kind)) {
                 return y + 1;
             }

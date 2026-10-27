@@ -196,3 +196,42 @@ feature の費用を「地形読み」と「feature 自身のロジック」に�
   [チャンク生成の並列化](../../../specs/chunk-parallelism/README.md)。
 - FEAT_PROFILE は feature ごとに `Instant` を取る診断で、その overhead を含む。
 - 1 seed・1 ホスト・1 回。25 chunk は 3x3 populate の 1 回分で、定常負荷ではない。
+
+## 2026-10-27: 現行ビルドの feature 内訳（並列化の後）
+
+`FEAT_PROFILE=1 cargo test --release feat_populate_perf`（seed 0、25 chunk）。
+このブランチは evidence が x1.79 を記録した時点より feature が多い。
+
+| | ms / 25 chunk | ms/chunk |
+|---|---|---|
+| FEATPROF total | 171.7 | 6.9 |
+| うち地形読み (`FC::get`) | 43.8（242,044 回、181 ns） | 1.8 |
+| WG heightmap のスキャン | 43,048 回 / 141,530 cell | 1.7 / 5.7k cell |
+
+上位（ms / 25 chunk）: `trees_birch_and_oak` 17.5、`ore_dirt` 16.7、
+`ore_granite_lower` 14.5、`ore_tuff` 14.3、`ore_gravel` 13.9、
+`ore_diorite_lower` 13.8、`ore_andesite_lower` 13.3、`ore_coal_upper` 10.1、
+`monster_room_deep` 9.4、`freeze_top_layer` 8.4。**ore 系で 64%**。
+
+試して**効果が無かった**もの（いずれも測定で棄却、コミットしていない）:
+- `FC` にチャンク列キャッシュを足す（1,700 回/chunk の `Gen::cols` 参照を短縮）:
+  188.2 対 184.0 ms（ノイズ）。列参照は支配的でない。
+- `ORE_CELL_TRACE` の `format!` を列ごとに評価しないよう hoist: 189.2 対 188.2 ms。
+  `env_str!` が `None` のときは `is_some_and` が短絡するので、そもそも割り当ては無かった。
+- チャンク単位の WG heightmap 一括構築: 1 チャンクあたり 1,722 回のスキャンが
+  9 チャンクに分散（≈190/chunk）なので、256 列を先に作る方が高くつく。
+
+残る費用は vanilla と同じアルゴリズムの実仕事（ore の列走査 + 楕円体セル）で、
+vanilla が配列で O(1) で読むところを走査で払っている分。ここを削るには
+永続 heightmap 配列（メモリ、2026-10-20 に一度撤回）か、feature 自体の削減が要る。
+
+### end-to-end（`WARM=1 load_compare.sh 20 0`、同一ホスト）
+
+| build | vanilla CPU | mc-spine CPU | RSS |
+|---|---|---|---|
+| 地形並列 workers=1 | 5.27 s | 21.91 s | 145 MiB |
+| 地形並列 workers=4 | 4.90 s | 23.27 s | 162 MiB |
+
+現行ブランチは **x4.2-4.7**（evidence の x1.79 は feature が少ない時点の値）。
+並列化は CPU 秒を減らさない（仕事量は同じ、cold cache の重複で +6%）。
+CPU 秒を下げるには feature の実仕事を減らす必要がある。
