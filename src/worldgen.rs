@@ -2593,6 +2593,94 @@ pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
     gen_lock().as_mut().map(f)
 }
 
+/// A stable fingerprint of one chunk's generated columns, for determinism tests.
+/// Every field is part of the terrain answer, including the interpolated grids.
+pub(crate) fn cols_fingerprint(cc: &ChunkCols) -> u64 {
+    fn mix(h: &mut u64, v: u64) {
+        *h ^= v;
+        *h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &s in &cc.surf {
+        mix(&mut h, s as u64);
+    }
+    for &s in &cc.wtop {
+        mix(&mut h, s as u64);
+    }
+    for &s in &cc.rd {
+        mix(&mut h, s as u64);
+    }
+    for m in &cc.mats {
+        match m {
+            None => mix(&mut h, u64::MAX),
+            Some(m) => {
+                mix(&mut h, m.lo as u64);
+                for v in &m.vals {
+                    mix(&mut h, *v as u64);
+                }
+            }
+        }
+    }
+    for grid in &cc.grids {
+        match grid {
+            None => mix(&mut h, u64::MAX - 1),
+            Some(cells) => {
+                for v in cells.iter() {
+                    mix(&mut h, v.to_bits());
+                }
+            }
+        }
+    }
+    mix(&mut h, cc.ny as u64);
+    mix(&mut h, cc.cell_w as u64);
+    mix(&mut h, cc.cell_h as u64);
+    mix(&mut h, cc.min_y as u64);
+    h
+}
+
+/// Generate one chunk's columns on a scratch generator, without the world lock.
+///
+/// Stage 2A of `specs/chunk-parallelism`: terrain is a pure function of the immutable
+/// data and the seed — `cols` reads no feature write — so a worker can compute it while
+/// the owner keeps `GEN`. Features stay sequential: they read other chunks' writes, and
+/// their order is pinned to the native capture.
+pub fn chunk_cols_scratch(
+    data: &std::sync::Arc<GenData>,
+    cx: i32,
+    cz: i32,
+) -> Option<std::sync::Arc<ChunkCols>> {
+    Gen::fresh_scratch(data.clone()).cols(cx, cz)
+}
+
+/// Compute `keys` with up to `workers` scratch generators, returned in the caller's order.
+/// `workers <= 1` runs inline, which is the reference path; every worker count must give
+/// the same `ChunkCols` because `cols` is pure (the determinism test pins that).
+pub fn prefetch_cols(
+    data: &std::sync::Arc<GenData>,
+    keys: &[(i32, i32)],
+    workers: usize,
+) -> Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)> {
+    if workers <= 1 || keys.len() <= 1 {
+        return keys
+            .iter()
+            .map(|&(cx, cz)| ((cx, cz), chunk_cols_scratch(data, cx, cz)))
+            .collect();
+    }
+    let mut out: Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)> =
+        keys.iter().map(|&k| (k, None)).collect();
+    let per = keys.len().div_ceil(workers);
+    std::thread::scope(|s| {
+        for slice in out.chunks_mut(per) {
+            s.spawn(move || {
+                for (key, slot) in slice.iter_mut() {
+                    *slot = chunk_cols_scratch(data, key.0, key.1);
+                }
+            });
+        }
+    });
+    out
+}
+
 pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
     gen_lock().as_mut()?.cols(cx, cz)
 }
@@ -2657,6 +2745,69 @@ impl Gen {
     }
 
     /// Per-Gen cached chunk column builder (terrain layer only — no features).
+    /// A generator over the same immutable inputs with empty caches: the per-job scratch
+    /// for terrain work (`specs/chunk-parallelism`, stage 2A). Every cache on `Gen` is a
+    /// memoization of a pure function of `GenData` and the seed, so a cold copy produces
+    /// the same `ChunkCols`; it only re-does work the shared generator may already have
+    /// done. Nothing in `cols` reads another chunk's feature writes.
+    pub(crate) fn fresh_scratch(data: std::sync::Arc<GenData>) -> Gen {
+        Gen {
+            data,
+            memo: HashMap::new(),
+            aq_lv: HashMap::new(),
+            aq_lvo: Vec::new(),
+            aq_near: HashMap::new(),
+            aq_neo: Vec::new(),
+            prelim_c: HashMap::new(),
+            chunk_biomes: HashMap::new(),
+            chunk_biomes_ord: std::collections::VecDeque::new(),
+            prelim_ord: Vec::new(),
+            clim_c: HashMap::new(),
+            clim_ord: Vec::new(),
+            bioq: HashMap::new(),
+            bioq_ord: std::collections::VecDeque::new(),
+            col_c: HashMap::new(),
+            col_ord: Vec::new(),
+            feat_c: HashMap::new(),
+            feat_ord: Vec::new(),
+            deep_c: HashMap::new(),
+            deep_ord: std::collections::VecDeque::new(),
+            pop_done: HashSet::new(),
+            restored_tick_sources: HashSet::new(),
+            suppress_generated_ticks: false,
+            carved: HashSet::new(),
+            pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
+                let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
+                if p.len() == 4 {
+                    Some((p[0], p[1], p[2], p[3]))
+                } else {
+                    None
+                }
+            }),
+            feat_hm: HashMap::new(),
+            generated_leaf_ticks: Vec::new(),
+            generated_leaf_tick_set: HashSet::new(),
+            generated_fluid_ticks: Vec::new(),
+            generated_fluid_tick_set: HashSet::new(),
+        }
+    }
+
+    /// Install prefetched columns with the same FIFO eviction `cols` uses, so a caller
+    /// never grows `col_c` past its bound behind the cache's back.
+    pub(crate) fn install_cols(&mut self, cols: Vec<((i32, i32), std::sync::Arc<ChunkCols>)>) {
+        for ((cx, cz), arc) in cols {
+            if self.col_c.contains_key(&(cx, cz)) {
+                continue;
+            }
+            self.col_ord.push((cx, cz));
+            if self.col_ord.len() > 128 {
+                let old = self.col_ord.remove(0);
+                self.col_c.remove(&old);
+            }
+            self.col_c.insert((cx, cz), arc);
+        }
+    }
+
     pub(crate) fn cols(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
         if let Some(v) = self.col_c.get(&(cx, cz)) {
             return Some(v.clone());
@@ -6872,6 +7023,75 @@ mod wg_tests {
         // leave the shared fixture in the Overworld for the other tests
         assert!(init(0, crate::name_to_state));
         assert_eq!(facts().expect("facts").preset, NoisePreset::Overworld);
+    }
+
+    /// Stage 2A: terrain is pure, so a scratch generator on the same `GenData` must
+    /// reproduce the shared generator's columns exactly, for every worker count.
+    /// If this fails, the "no feature write is read by `cols`" premise is wrong and
+    /// terrain cannot be parallelised without changing the parity contract.
+    #[test]
+    fn scratch_terrain_matches_the_shared_generator_at_any_worker_count() {
+        let _guard = lock_gen();
+        assert!(init(0, crate::name_to_state));
+        let data = data_snapshot().expect("data published");
+        let keys: Vec<(i32, i32)> = (-1..=2)
+            .flat_map(|x| (-1..=2).map(move |z| (x * 3, z * 3)))
+            .collect();
+        // reference: the shared generator's own cache
+        let reference: Vec<u64> = keys
+            .iter()
+            .map(|&(cx, cz)| cols_fingerprint(&chunk_cols(cx, cz).expect("cols")))
+            .collect();
+        for workers in [1usize, 2, 4, 8] {
+            let got = prefetch_cols(&data, &keys, workers);
+            assert_eq!(got.len(), keys.len());
+            for (i, (key, cols)) in got.iter().enumerate() {
+                assert_eq!(key, &keys[i]);
+                let cc = cols.as_ref().expect("prefetched cols");
+                assert_eq!(
+                    cols_fingerprint(cc),
+                    reference[i],
+                    "worker count {workers} diverged at {key:?}"
+                );
+            }
+        }
+        // installing them must not change what the shared cache answers
+        let mut fresh = Gen::fresh_scratch(data.clone());
+        let installed = prefetch_cols(&data, &keys, 4)
+            .into_iter()
+            .filter_map(|(k, c)| c.map(|c| (k, c)))
+            .collect();
+        fresh.install_cols(installed);
+        for (i, &(cx, cz)) in keys.iter().enumerate() {
+            let cc = fresh.cols(cx, cz).expect("cached cols");
+            assert_eq!(cols_fingerprint(&cc), reference[i]);
+        }
+    }
+
+    /// Terrain throughput by worker count. `FEAT_PROFILE`-gated, and not a server
+    /// measurement: it isolates `cols` (no populate, no delivery, no lock).
+    #[test]
+    fn terrain_parallel_throughput() {
+        let _guard = lock_gen();
+        if !env_flag!("FEAT_PROFILE") {
+            return;
+        }
+        assert!(init(0, crate::name_to_state));
+        let data = data_snapshot().expect("data published");
+        let keys: Vec<(i32, i32)> = (0..6)
+            .flat_map(|x| (0..6).map(move |z| (x * 5 - 10, z * 5 - 10)))
+            .collect();
+        for workers in [1usize, 2, 4, 8] {
+            let t = std::time::Instant::now();
+            let got = prefetch_cols(&data, &keys, workers);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            assert!(got.iter().all(|(_, c)| c.is_some()));
+            eprintln!(
+                "TERRAIN workers={workers} chunks={} {ms:.1}ms ({:.2} ms/chunk)",
+                keys.len(),
+                ms / keys.len() as f64
+            );
+        }
     }
 
     /// The split's purpose: a worker's inputs are readable while the world lock is
