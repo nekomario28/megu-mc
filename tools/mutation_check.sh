@@ -1067,6 +1067,13 @@ check "weeping vines keeps the wart neighbour count at one" \
             ctx.set(x, y, z, wart);' \
   feature::generation_contract_tests::weeping_vines_matches_native_cells_and_rng
 
+check "end gateway clears its own y layer" \
+  src/feature.rs '                } else if dy == 0 {
+                    air' \
+  '                } else if dy == 1 {
+                    air' \
+  feature::generation_contract_tests::end_gateway_matches_native_cells
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

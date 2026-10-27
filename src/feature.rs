@@ -64,6 +64,12 @@ enum Cf {
     /// further than chebyshev 16 from the fixed start (8,8). The native sets
     /// `(x, y, z) = (zLoop, y, xLoop)` — transposed — which is the same square.
     VoidStartPlatform,
+    /// `minecraft:end_gateway` (`eca`), config `{exact}`: a 3x5x3 box where the origin
+    /// becomes `end_gateway`, the origin's whole y layer becomes air, the straight
+    /// above/below cells and the axis lines become bedrock, and the rest air. The
+    /// exit-position block entity is not modelled (no worldgen block entities yet),
+    /// so a placed gateway keeps its default exit.
+    EndGateway,
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -1691,6 +1697,36 @@ fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &
     }
 }
 
+/// `EndGatewayFeature` (`eca`). See [`Cf::EndGateway`].
+fn gen_end_gateway(ctx: &mut FC, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let gateway = reg.state_of("minecraft:end_gateway", None);
+    let bedrock = reg.state_of("minecraft:bedrock", None);
+    let air = reg.state_of("minecraft:air", None);
+    for dx in -1i32..=1 {
+        for dy in -2i32..=2 {
+            for dz in -1i32..=1 {
+                let (x, y, z) = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+                let state = if dx == 0 && dy == 0 && dz == 0 {
+                    gateway
+                } else if dy == 0 {
+                    air
+                } else if dy.abs() == 2 && dx == 0 && dz == 0 {
+                    bedrock
+                } else if (dx == 0 || dz == 0) && dy.abs() != 2 {
+                    bedrock
+                } else {
+                    air
+                };
+                // native `setBlock` refuses cells outside the build height
+                if !ctx.out_of_h(y) {
+                    ctx.set(x, y, z, state);
+                }
+            }
+        }
+    }
+}
+
 /// Nether "wart plant" ground: netherrack, warped nylium, warped wart block.
 /// Measured from the native `isInvalidPlacement` checks of the two vine features.
 fn is_vine_ground(name: &str) -> bool {
@@ -2682,6 +2718,7 @@ fn p_cf(j: &J) -> Option<Cf> {
         "basalt_pillar" => Cf::BasaltPillar,
         "void_start_platform" => Cf::VoidStartPlatform,
         "end_platform" => Cf::EndPlatform,
+        "end_gateway" => Cf::EndGateway,
         "twisting_vines" => Cf::TwistingVines {
             width: jint(j, "spread_width", 0),
             height: jint(j, "spread_height", 0),
@@ -3840,6 +3877,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::BasaltPillar => gen_basalt_pillar(ctx, rng, pos),
         Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
         Cf::EndPlatform => gen_end_platform(ctx, pos),
+        Cf::EndGateway => gen_end_gateway(ctx, pos),
         Cf::TwistingVines {
             width,
             height,

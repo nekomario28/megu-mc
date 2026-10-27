@@ -169,6 +169,54 @@ fn netherrack_replace_blobs_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn end_gateway_matches_native_cells() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let dirt = reg.state_of("minecraft:dirt", None);
+    let cf = super::p_cf(
+        &jparse(br#"{"type":"minecraft:end_gateway","config":{"exact":false}}"#).unwrap(),
+    )
+    .unwrap();
+    for row in include_str!("../tests/data/end_gateway_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let oy = p[1].parse::<i32>().unwrap();
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -3i32..=3 {
+            for z in -3i32..=3 {
+                for dy in -3i32..=3 {
+                    let state = match scene {
+                        0 => 0,
+                        1 => stone,
+                        2 => {
+                            if dy > 0 {
+                                stone
+                            } else {
+                                0
+                            }
+                        }
+                        _ => {
+                            if x.abs() == 1 || z.abs() == 1 {
+                                dirt
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    g.feat_write(x, oy + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(p[2].parse::<i64>().unwrap() as u64);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+        assert_eq!(p[3], "true", "{row}");
+        assert_eq!(ctx.wr.len(), p[4].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, (0, oy, 0)), p[5], "{row}");
+    }
+}
+
+#[test]
 fn twisting_vines_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
     let netherrack = reg.state_of("minecraft:netherrack", None);
