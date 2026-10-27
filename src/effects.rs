@@ -1,7 +1,11 @@
 use super::*;
 
 pub(super) fn tick_effects(c: &Client) {
+    let __t = crate::tickprof::enabled().then(std::time::Instant::now);
     adv_event(&c.name, "tick", None);
+    if let Some(t) = __t {
+        crate::tickprof::add("fx/adv_call", t.elapsed());
+    }
     let mut ef = c.effs.lock().unwrap();
     if ef.is_empty() {
         return;

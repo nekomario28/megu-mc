@@ -342,3 +342,29 @@ mc-spine 単体を同条件で走らせ、プロセス/スレッド/phase に分
 隣の floor と `wtop` から近似せず、そもそも必要セルだけ読む）、
 (b) バンドを配信時の states から必ず作る（＝配信順に依存するが、窓の中心は
 必ず配信済み）、(c) バンドのセル単価を配信パスと同じにする（同じ memo を共有）。
+
+## 2026-10-28: tick 本体の正体は advancement の全走査だった
+
+上の tick 内訳（`environment` 10.8 ms/tick）をさらに割ったら、`env/effects` =
+`effects::tick_effects` → `adv_event(name, "tick")` に 8.5-8.9 ms が集中していた。
+
+`adv_event` は**ロード済みの全 advancement × 全 criteria を毎イベント走査**し、
+advancement ごとに `adv_done()` を 2 回ロックし、`pp.entry(id.clone())` で
+ID 文字列を clone していた。tick ループは 1 プレイヤーにつき毎 tick `"tick"`
+イベントを投げるので、これが tick 本体の大半になる。
+
+修正: イベント名 → (advancement, criterion) の索引を起動時に 1 回作り、
+一致する候補だけを visit する（完了判定は従来どおり全 criteria を見る。
+criterion が一致しなければ新規完了はありえないので等価）。
+`env/effects` の分割計測用に `fx/adv_call` / `adv/total` を追加。
+
+| | 20 秒窓の CPU |
+|---|---|
+| 修正前（8 回の測定） | 27.9-30.8 s |
+| 修正後（2 回） | **12.0 / 12.1 s** |
+
+**ただしこの比較は交絡している**: 同じ 2 回でクライアントが読んだ packet 数が
+157-158（修正前は 600-800）で、ホスト負荷（load 10-17、他レーン）でクライアント
+自身が遅れていた。`env/effects` の値も 8.1 ms/tick のまま出ている。
+つまり「構造として O(all advancements)/tick → O(matching)/tick になった」ことは
+確かだが、**CPU 秒の改善幅は静かなホストで再測定するまで主張しない**。

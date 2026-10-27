@@ -2681,6 +2681,14 @@ pub fn prefetch_cols(
     out
 }
 
+/// Is this chunk's `ChunkCols` already in the generator's cache? Diagnostic only: it
+/// tells whether a caller that asks for columns also pays for their generation.
+pub fn cols_cached(cx: i32, cz: i32) -> bool {
+    gen_lock()
+        .as_ref()
+        .is_some_and(|g| g.col_c.contains_key(&(cx, cz)))
+}
+
 pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
     gen_lock().as_mut()?.cols(cx, cz)
 }

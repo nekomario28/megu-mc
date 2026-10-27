@@ -2440,8 +2440,23 @@ fn plate_powered(st: u32) -> bool {
 fn keepalive_time_tick() {
     // One region borrow for the stage. A static scan confirmed that nothing this
     // stage calls re-enters the region lock.
+    //
+    // Split under `MC_SPINE_TICK_PROFILE=1`: this step is the whole tick body under a
+    // moving viewer (9-11 ms of 9.3-11.4), so the split below says which part of it.
+    let __prof = tickprof::enabled();
+    let mut __t = __prof.then(std::time::Instant::now);
     let region = region_guard();
+    if let Some(t) = __t {
+        tickprof::add("env/region_guard", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
     let t = TICK.fetch_add(1, Ordering::Relaxed);
+    {
+        if let Some(t) = __t {
+            tickprof::add("env/clock", t.elapsed());
+        }
+        __t = __prof.then(std::time::Instant::now);
+    }
     // world clock advances every tick (20 tps => +20/s)
     let wt = if GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) == 1 {
         WORLD_TIME.fetch_add(GAME_TICKS_PER_TICK as u64, Ordering::Relaxed) % 24000
@@ -2510,6 +2525,12 @@ fn keepalive_time_tick() {
                 });
             }
         }
+    }
+    {
+        if let Some(t) = __t {
+            tickprof::add("env/weather+lightning", t.elapsed());
+        }
+        __t = __prof.then(std::time::Instant::now);
     }
     // transient lightning bolts: despawn after ~0.5s
     {
@@ -2821,6 +2842,12 @@ fn keepalive_time_tick() {
             }
         }
     }
+    {
+        if let Some(t) = __t {
+            tickprof::add("env/hunger+plates", t.elapsed());
+        }
+        __t = __prof.then(std::time::Instant::now);
+    }
     // pressure plates: an entity standing on one powers it; the plate
     // stays powered until the cell clears — vanilla bool order puts
     // powered at the even id, unpowered odd
@@ -2873,6 +2900,12 @@ fn keepalive_time_tick() {
             effects::tick_effects(c);
         }
     }
+    {
+        if let Some(t) = __t {
+            tickprof::add("env/effects", t.elapsed());
+        }
+        __t = __prof.then(std::time::Instant::now);
+    }
     // crop growth: ~1/30 chance per real second (per-tick denominator scales
     // with ticks per second, so a cadence change keeps the same rate)
     {
@@ -2905,6 +2938,12 @@ fn keepalive_time_tick() {
     if t % autosave == autosave - 1 {
         save_world();
         gc_backoff();
+    }
+    {
+        if let Some(t) = __t {
+            tickprof::add("env/crops", t.elapsed());
+        }
+        __t = __prof.then(std::time::Instant::now);
     }
     // night spawn cycle: dark hours -> hostiles near players (cap 12).
     // The count must cover every spawned hostile etype — counting only
@@ -3230,6 +3269,11 @@ fn keepalive_time_tick() {
     };
     for f in due {
         run_function(&f, None, &mut None);
+    }
+    {
+        if let Some(t) = __t {
+            tickprof::add("env/rest", t.elapsed());
+        }
     }
 }
 /// Finite segment geometry. Unlike Valence's inclusive infinite ray, pinned
@@ -5258,6 +5302,99 @@ fn mob_tick() {
 // ---------- world ----------
 // overlay edits: (cx,cz) -> { packed_local_idx -> blockstate }
 static WORLD: Registry<ChunkKey, HashMap<u32, u32>> = OnceLock::new();
+/// Wait/hold split for the two locks the tick thread and the connection thread share.
+///
+/// The tick profile put 10.8 ms of an 11.4 ms tick body in `environment`, a step that
+/// computes a clock read and a 1 Hz broadcast — so the question is what it waits for.
+/// `MC_SPINE_LOCKPROFILE=1` answers it for `WORLD` (the block overlay) and `REGION`.
+pub(crate) mod lockprof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(super) static WORLD_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static WORLD_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static WORLD_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static REGION_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static REGION_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static REGION_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn enabled() -> bool {
+        crate::trace_env::env_flag!("MC_SPINE_LOCKPROFILE")
+    }
+    pub(super) fn report() {
+        let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / 1e6;
+        eprintln!(
+            "LOCKPROF world wait={:.0}ms hold={:.0}ms n={} | region wait={:.0}ms hold={:.0}ms n={}",
+            ms(&WORLD_WAIT_NS),
+            ms(&WORLD_HOLD_NS),
+            WORLD_N.load(Ordering::Relaxed),
+            ms(&REGION_WAIT_NS),
+            ms(&REGION_HOLD_NS),
+            REGION_N.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// A guard that records how long its acquisition waited and how long it was held.
+struct TimedGuard<T: 'static> {
+    guard: std::sync::MutexGuard<'static, T>,
+    waited: Option<u64>,
+    held_since: Option<std::time::Instant>,
+    which: u8, // 0 = world, 1 = region
+}
+
+impl<T: 'static> std::ops::Drop for TimedGuard<T> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let (Some(waited), Some(since)) = (self.waited, self.held_since) else {
+            return;
+        };
+        let held = since.elapsed().as_nanos() as u64;
+        if self.which == 0 {
+            lockprof::WORLD_HOLD_NS.fetch_add(held, Ordering::Relaxed);
+            lockprof::WORLD_WAIT_NS.fetch_add(waited, Ordering::Relaxed);
+            lockprof::WORLD_N.fetch_add(1, Ordering::Relaxed);
+        } else {
+            lockprof::REGION_HOLD_NS.fetch_add(held, Ordering::Relaxed);
+            lockprof::REGION_WAIT_NS.fetch_add(waited, Ordering::Relaxed);
+            lockprof::REGION_N.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<T: 'static> std::ops::Deref for TimedGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+impl<T: 'static> std::ops::DerefMut for TimedGuard<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+fn timed_world() -> TimedGuard<HashMap<ChunkKey, HashMap<u32, u32>>> {
+    let prof = lockprof::enabled();
+    let t = prof.then(std::time::Instant::now);
+    let guard = world().lock().unwrap();
+    TimedGuard {
+        guard,
+        waited: t.map(|t| t.elapsed().as_nanos() as u64),
+        held_since: t,
+        which: 0,
+    }
+}
+
+fn timed_region() -> TimedGuard<Region> {
+    let prof = lockprof::enabled();
+    let t = prof.then(std::time::Instant::now);
+    let guard = region().lock().unwrap();
+    TimedGuard {
+        guard,
+        waited: t.map(|t| t.elapsed().as_nanos() as u64),
+        held_since: t,
+        which: 1,
+    }
+}
+
 fn world() -> &'static LockedMap<ChunkKey, HashMap<u32, u32>> {
     WORLD.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -5834,8 +5971,8 @@ fn region() -> &'static Mutex<Region> {
 }
 /// Borrow the region for the duration of one loop. This is the shape a per-item
 /// membership test in a hot loop should use.
-fn region_guard() -> std::sync::MutexGuard<'static, Region> {
-    region().lock().unwrap()
+fn region_guard() -> TimedGuard<Region> {
+    timed_region()
 }
 fn scheduled_tick_chunks() -> HashSet<(i32, i32)> {
     let mut chunks = region_guard().hot.clone();
@@ -6757,7 +6894,7 @@ fn local_idx(x: i32, y: i32, z: i32) -> u32 {
     (((y - MIN_Y) as u32) << 8) | (((z & 15) as u32) << 4) | (x & 15) as u32
 }
 fn block_at(x: i32, y: i32, z: i32) -> u32 {
-    let w = world().lock().unwrap();
+    let w = timed_world();
     let hit = w
         .get(&(x >> 4, z >> 4))
         .and_then(|c| c.get(&local_idx(x, y, z)).copied());
@@ -13248,11 +13385,19 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
         }
     }
     let reg = crate::block_registry::breg()?;
+    let __tr = chunkprof::enabled().then(std::time::Instant::now);
+    let warm = worldgen::cols_cached(cx, cz);
     let (y0, y1) = band_range(cx, cz)?;
+    if let (Some(t), false) = (__tr, warm) {
+        use std::sync::atomic::Ordering;
+        chunkprof::BAND_COLS_MISS.fetch_add(1, Ordering::Relaxed);
+        chunkprof::BAND_RANGE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     let rows = (y1 - y0 + 1) as usize;
     let mut op = vec![0u8; rows << 8];
     // One batched terrain pass per overlapping section, instead of one locked terrain
     // evaluation per cell.
+    let __ts = chunkprof::enabled().then(std::time::Instant::now);
     let mut sy = y0 & !15;
     while sy <= y1 {
         if let Some(sec) = worldgen::terrain_section(cx, sy, cz, feature::populate) {
@@ -13271,6 +13416,12 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
             }
         }
         sy += 16;
+    }
+    if let Some(t) = __ts {
+        chunkprof::BAND_SEC_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     // The overlay holds the edits and wins over the generated state, exactly as
     // `block_at` prefers it.
@@ -13464,6 +13615,9 @@ fn sky_floors_cache() -> &'static Mutex<std::collections::VecDeque<((i32, i32), 
 /// Call after any write into `world()`: every cached floor is now suspect.
 fn bump_world_epoch() {
     WORLD_EPOCH.fetch_add(1, Ordering::Relaxed);
+    if chunkprof::enabled() {
+        chunkprof::EPOCH_BUMPS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
@@ -16740,7 +16894,36 @@ fn adv_prog() -> &'static Mutex<Advancements> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 // event -> mark matching criteria, grant when ALL criteria done, announce
+/// Event name → the (advancement id, criterion name) pairs that can fire on it.
+///
+/// `adv_event` used to scan every loaded advancement (and every criterion of each) on
+/// every event, and the tick loop fires the `tick` event once per player per tick.
+/// Measured: `env/effects` — which is `effects::tick_effects` → `adv_event(name,
+/// "tick")` — was 8.87 ms of a 9.3 ms tick body under one moving viewer, i.e. most of
+/// the tick thread's CPU, for a lookup that can be a map hit.
+///
+/// The rest of the scan only exists to find advancements whose criteria all hold; an
+/// advancement can only newly complete on an event that matches one of its criteria, so
+/// visiting the matching ones is equivalent. Built once: the advancement map is filled
+/// at startup from the datapack and never mutated afterwards.
+fn adv_event_index() -> &'static HashMap<String, Vec<(String, String)>> {
+    static IDX: OnceLock<HashMap<String, Vec<(String, String)>>> = OnceLock::new();
+    IDX.get_or_init(|| {
+        let advs = advancements().lock().unwrap();
+        let mut idx: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (id, a) in advs.iter() {
+            for (cn, tr, _) in &a.criteria {
+                idx.entry(tr.clone())
+                    .or_default()
+                    .push((id.clone(), cn.clone()));
+            }
+        }
+        idx
+    })
+}
+
 fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
+    let __t = tickprof::enabled().then(std::time::Instant::now);
     if advancements().lock().unwrap().is_empty() {
         return;
     }
@@ -16754,30 +16937,57 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
             .map(|g| g.len() >= advs.len())
             .unwrap_or(false)
         {
+            if let Some(t) = __t {
+                tickprof::add("adv/total", t.elapsed());
+            }
             return;
         }
         let mut prog = adv_prog().lock().unwrap();
         let pp = prog.entry(pname.to_string()).or_default();
-        for (id, a) in advs.iter() {
-            if adv_done()
-                .lock()
-                .unwrap()
-                .get(pname)
-                .map(|g| g.contains(id))
-                .unwrap_or(false)
-            {
+        // Only the advancements that can fire on this event: their criteria are the
+        // only ones this call can complete. The completion test still walks *all* of an
+        // advancement's criteria, so a partially satisfied one is judged as before.
+        let Some(candidates) = adv_event_index().get(event) else {
+            if let Some(t) = __t {
+                tickprof::add("adv/total", t.elapsed());
+            }
+            return;
+        };
+        let done = adv_done().lock().unwrap();
+        let granted = done.get(pname);
+        // (advancement id -> the criteria this event satisfied), so an advancement
+        // reached by several criteria is only walked once.
+        let mut touched: HashMap<&str, ()> = HashMap::new();
+        for (id, cn) in candidates {
+            if granted.is_some_and(|g| g.contains(id)) {
                 continue;
             }
-            let p = pp.entry(id.clone()).or_default();
-            for (cn, tr, want) in &a.criteria {
-                if tr == event && (want.is_none() || *want == etype) {
-                    p.insert(cn.clone());
+            let Some(a) = advs.get(id) else { continue };
+            if a.criteria
+                .iter()
+                .any(|(_, tr, want)| tr == event && (want.is_none() || *want == etype))
+            {
+                let p = pp.entry(id.clone()).or_default();
+                for (cn2, tr, want) in &a.criteria {
+                    if tr == event && (want.is_none() || *want == etype) {
+                        p.insert(cn2.clone());
+                    }
                 }
-            }
-            if !a.criteria.is_empty() && a.criteria.iter().all(|(cn, _, _)| p.contains(cn)) {
-                grants.push(id.clone());
+                touched.insert(id.as_str(), ());
+                let _ = cn;
             }
         }
+        drop(done);
+        for id in touched.keys() {
+            let Some(a) = advs.get(*id) else { continue };
+            let p = pp.entry((*id).to_string()).or_default();
+            if !a.criteria.is_empty() && a.criteria.iter().all(|(cn, _, _)| p.contains(cn)) {
+                grants.push((*id).to_string());
+            }
+        }
+    }
+    if let Some(t) = __t {
+        tickprof::add("adv/total", t.elapsed());
     }
     for id in grants {
         adv_done()
@@ -22534,6 +22744,10 @@ pub(crate) mod chunkprof {
     pub(super) static BAND_CELLS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BAND_NS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BAND_NEW: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_RANGE_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_SEC_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_COLS_MISS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static EPOCH_BUMPS: AtomicU64 = AtomicU64::new(0);
     pub(super) static N: AtomicU64 = AtomicU64::new(0);
     pub(super) fn enabled() -> bool {
         crate::trace_env::env_flag!("MC_SPINE_CHUNK_PROFILE")
@@ -22567,6 +22781,14 @@ pub(crate) mod chunkprof {
                 / 1e6
                 / BAND_NEW.load(Ordering::Relaxed).max(1) as f64
         );
+        let new = BAND_NEW.load(Ordering::Relaxed).max(1) as f64;
+        eprintln!(
+            "CHUNKPROF   band parts: range={:.2}ms sections={:.2}ms cols_miss={:.1} epoch_bumps={:.2}/chunk",
+            BAND_RANGE_NS.load(Ordering::Relaxed) as f64 / 1e6 / new,
+            BAND_SEC_NS.load(Ordering::Relaxed) as f64 / 1e6 / new,
+            BAND_COLS_MISS.load(Ordering::Relaxed) as f64 / n as f64,
+            EPOCH_BUMPS.load(Ordering::Relaxed) as f64 / n as f64
+        );
     }
 }
 
@@ -22576,10 +22798,10 @@ pub(crate) mod tickprof {
     use std::sync::OnceLock;
     static NS: OnceLock<Mutex<Vec<(&'static str, u64)>>> = OnceLock::new();
     pub(super) static TICKS: AtomicU64 = AtomicU64::new(0);
-    pub(super) fn enabled() -> bool {
+    pub(crate) fn enabled() -> bool {
         crate::trace_env::env_flag!("MC_SPINE_TICK_PROFILE")
     }
-    pub(super) fn add(name: &'static str, elapsed: std::time::Duration) {
+    pub(crate) fn add(name: &'static str, elapsed: std::time::Duration) {
         let v = NS.get_or_init(|| Mutex::new(Vec::new()));
         let mut v = v.lock().unwrap();
         match v.iter_mut().find(|(n, _)| *n == name) {
@@ -22610,6 +22832,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     let n = tickprof::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if prof && n % 100 == 0 {
         tickprof::report();
+        lockprof::report();
     }
     let mut run = |name: &'static str, f: fn()| {
         if prof {
