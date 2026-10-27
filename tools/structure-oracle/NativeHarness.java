@@ -77,6 +77,11 @@ public final class NativeHarness {
         }
     }
 
+    /** Full state string (`block[prop=value,...]`), for fixtures that compare properties. */
+    public static String stateName(Object st) {
+        return String.valueOf(st);
+    }
+
     /** Registry name of a BlockState's block. */
     public static String nameOf(Object st) {
         try {
