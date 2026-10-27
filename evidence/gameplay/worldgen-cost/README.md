@@ -235,3 +235,58 @@ vanilla が配列で O(1) で読むところを走査で払っている分。こ
 現行ブランチは **x4.2-4.7**（evidence の x1.79 は feature が少ない時点の値）。
 並列化は CPU 秒を減らさない（仕事量は同じ、cold cache の重複で +6%）。
 CPU 秒を下げるには feature の実仕事を減らす必要がある。
+
+## 2026-10-28: 移動視点の CPU 内訳（feature は 7% だった）
+
+`WARM=1 load_compare.sh 20 0` の条件（seed 0、view 4 / sim 5、移動視点、圧縮なし）で、
+mc-spine 単体を同条件で走らせ、プロセス/スレッド/phase に分けて測った。
+ツールは `MC_SPINE_CHUNK_PROFILE=1` と `MC_SPINE_TICK_PROFILE=1`（下記）。
+
+### 総量と配分
+
+| | 20 秒窓 |
+|---|---|
+| サーバ単体（クライアント無し） | **0.02 s** |
+| 移動視点 1 人 | **29.8 s**（1.5 コア） |
+| うち tick スレッド | 16.0 s |
+| うち 接続スレッド（チャンク配信） | 14.0 s |
+| うち 地形+feature 生成（90 chunk × 19 ms） | **約 1.7 s（6%）** |
+
+切り分けは `/proc/<pid>/task/*/stat` を 1 秒ごとにポーリング（窓中に終了する
+スレッドも拾う）。**視点の teleport 頻度は支配的でない**: 送信間隔を 1/20 に
+落としても 29.48 s でほぼ同じ（＝チャンク配信側の仕事）。
+
+### チャンク 1 枚（`MC_SPINE_CHUNK_PROFILE`、n=90）
+
+| phase | ms/chunk |
+|---|---|
+| `map_chunk` 全体 | 103-162 |
+| うち `chunk_data` | 65-94 |
+| うち `terrain_section` 24 section（地形+feature） | **18-25** |
+| うち `write_light_arrays` | **38-94** |
+| 残り（overlay 走査・section エンコード・biome） | 約 40 |
+
+### tick 本体（`MC_SPINE_TICK_PROFILE`、n=400）
+
+| step | ms/tick |
+|---|---|
+| body 合計 | 11.4 |
+| **environment（`keepalive_time_tick`）** | **10.8** |
+| generated_fluids | 0.47 |
+| 他 19 step 合計 | < 0.06 |
+
+同じ実行の `[tick]` 統計: `avg_work_ms=19.2`、`max_work_ms=477`、
+`over_budget=13/100`、tps 17.5-18.5。
+
+`keepalive_time_tick` は world clock と 1 秒間隔の broadcast しかしない。
+アイドル時は tick body 0.04 ms/tick なので、**この 10.8 ms は計算ではなく
+待ち**（チャンク配信が世界/region ロックを保持している間）と解釈できる。
+確定にはロック待ち時間の内訳計測が要る（`GenLock` と同じ形を region/world に足す）。
+
+### 結論
+
+- feature の地形読み削減（`b77f1fd`、20.8 → 7.6 ms/chunk）と地形並列（stage 2A）は、
+  いずれも**この窓の 6% 側**を触っていた。M3（CPU 秒）は配信経路とロック待ちが支配。
+- 次の候補は (1) `write_light_arrays` 38-94 ms/chunk、(2) `chunk_data` の
+  overlay/エンコード約 40 ms/chunk、(3) tick スレッドの待ち 10.8 ms/tick。
+- 地形並列の既定は 1（inline）のまま。配信経路を直した後に再測定する。

@@ -13376,7 +13376,11 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             // lock up to five times per block (feature lookup, columns, density,
             // aquifer, deep rules) and could compute the generated state twice when
             // an overlay edit covered the cell.
+            let __ts = chunkprof::enabled().then(std::time::Instant::now);
             let base = worldgen::terrain_section(cx, sy, cz, feature::populate);
+            if let Some(t) = __ts {
+                chunkprof::add(&chunkprof::SECTION, t);
+            }
             {
                 let w = world().lock().unwrap();
                 let read = |wx: i32, wy: i32, wz: i32| -> u32 {
@@ -13500,6 +13504,7 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
 }
 
 fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
+    let __t = chunkprof::enabled().then(std::time::Instant::now);
     let mut p = Vec::new();
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
@@ -13513,7 +13518,11 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
         }
     }
     p.extend_from_slice(&heightmaps_nbt(&tops));
+    let __td = chunkprof::enabled().then(std::time::Instant::now);
     let data = chunk_data(cx, cz, gen);
+    if let Some(t) = __td {
+        chunkprof::add(&chunkprof::DATA, t);
+    }
     write_varint(&mut p, data.len() as i64);
     p.extend_from_slice(&data);
     // block entities ride inside the chunk packet in vanilla — signs
@@ -13546,7 +13555,18 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
         write_varint(&mut p, ty);
         p.extend_from_slice(&n);
     }
+    let __tl = chunkprof::enabled().then(std::time::Instant::now);
     write_light_arrays(&mut p, cx, cz, gen);
+    if let Some(t) = __tl {
+        chunkprof::add(&chunkprof::LIGHT, t);
+    }
+    if let Some(t) = __t {
+        let n = chunkprof::N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        chunkprof::add(&chunkprof::MAP, t);
+        if n % 30 == 0 {
+            chunkprof::report();
+        }
+    }
     p
 }
 
@@ -22161,30 +22181,111 @@ fn rcon_listener() {
     }
 }
 // The caller may observe a stage, but must execute it exactly once and in order.
+/// Delivery-path and tick-body profilers, both off unless their switch is set.
+///
+/// Measured 2026-10-28 with one moving viewer (`tools/load_compare.sh` conditions):
+/// ~29.5 s of CPU in a 20 s window, of which terrain+features are ~1.7 s. These two
+/// counters say where the rest is: `MC_SPINE_CHUNK_PROFILE=1` splits the chunk packet,
+/// `MC_SPINE_TICK_PROFILE=1` splits the tick body.
+pub(crate) mod chunkprof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(super) static MAP: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DATA: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SECTION: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LIGHT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static N: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn enabled() -> bool {
+        crate::trace_env::env_flag!("MC_SPINE_CHUNK_PROFILE")
+    }
+    pub(super) fn add(slot: &AtomicU64, t: std::time::Instant) {
+        slot.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    pub(super) fn report() {
+        let n = N.load(Ordering::Relaxed).max(1);
+        let per = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / 1e6 / n as f64;
+        eprintln!(
+            "CHUNKPROF n={n} map={:.1}ms data={:.1} section={:.1} light={:.1}",
+            per(&MAP),
+            per(&DATA),
+            per(&SECTION),
+            per(&LIGHT)
+        );
+    }
+}
+
+pub(crate) mod tickprof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static NS: OnceLock<Mutex<Vec<(&'static str, u64)>>> = OnceLock::new();
+    pub(super) static TICKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn enabled() -> bool {
+        crate::trace_env::env_flag!("MC_SPINE_TICK_PROFILE")
+    }
+    pub(super) fn add(name: &'static str, elapsed: std::time::Duration) {
+        let v = NS.get_or_init(|| Mutex::new(Vec::new()));
+        let mut v = v.lock().unwrap();
+        match v.iter_mut().find(|(n, _)| *n == name) {
+            Some(e) => e.1 += elapsed.as_nanos() as u64,
+            None => v.push((name, elapsed.as_nanos() as u64)),
+        }
+    }
+    pub(super) fn report() {
+        let n = TICKS.load(Ordering::Relaxed).max(1) as f64;
+        let v = NS.get_or_init(|| Mutex::new(Vec::new()));
+        let mut rows: Vec<(&str, f64)> = v
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, ns)| (*name, *ns as f64 / 1e6 / n))
+            .collect();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let total: f64 = rows.iter().map(|(_, ms)| ms).sum();
+        eprintln!("TICKPROF ticks={n} body={total:.2}ms/tick");
+        for (name, ms) in rows.iter().take(6) {
+            eprintln!("TICKPROF   {ms:7.3}  {name}");
+        }
+    }
+}
+
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
-    step("environment", keepalive_time_tick);
+    let prof = tickprof::enabled();
+    let n = tickprof::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if prof && n % 100 == 0 {
+        tickprof::report();
+    }
+    let mut run = |name: &'static str, f: fn()| {
+        if prof {
+            let t = std::time::Instant::now();
+            step(name, f);
+            tickprof::add(name, t.elapsed());
+        } else {
+            step(name, f);
+        }
+    };
+    run("environment", keepalive_time_tick);
     TICK_IDX.fetch_add(1, Ordering::Relaxed);
-    step("hot_regions", refresh_hot);
-    step("scheduled_blocks", scheduled_block_tick);
-    step("generated_fluids", generated_fluid_tick);
-    step("interest", interest_tick);
-    step("drops", drop_tick);
-    step("arrows", arrow_tick);
-    step("tnt", primed_tick);
-    step("furnaces", furnace_tick);
-    step("hoppers", hopper_tick);
-    step("water", water_tick);
+    run("hot_regions", refresh_hot);
+    run("scheduled_blocks", scheduled_block_tick);
+    run("generated_fluids", generated_fluid_tick);
+    run("interest", interest_tick);
+    run("drops", drop_tick);
+    run("arrows", arrow_tick);
+    run("tnt", primed_tick);
+    run("furnaces", furnace_tick);
+    run("hoppers", hopper_tick);
+    run("water", water_tick);
     let lava_period = server_ticks(FLUID_TICK_GT);
     if TICK_IDX.load(Ordering::Relaxed).is_multiple_of(lava_period) {
-        step("lava", lava_tick);
+        run("lava", lava_tick);
     }
-    step("observers", observer_tick);
-    step("plugins", plugin_tick);
-    step("actors", actor_tick);
-    step("mobs", mob_tick);
-    step("falling", falling_tick);
-    step("random_ticks", random_tick_pass);
-    step("block_updates", apply_queued_block_updates);
+    run("observers", observer_tick);
+    run("plugins", plugin_tick);
+    run("actors", actor_tick);
+    run("mobs", mob_tick);
+    run("falling", falling_tick);
+    run("random_ticks", random_tick_pass);
+    run("block_updates", apply_queued_block_updates);
 }
 
 fn main() {
