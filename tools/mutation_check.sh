@@ -457,8 +457,8 @@ check "the client's view distance is read from its packet" \
   client_information_carries_the_view_distance_after_the_locale
 
 check "containers must be decoded, not merely remain absent" \
-  src/main.rs 'fn load_world_from(payload: &[u8]) {' \
-  'fn load_world_from(payload: &[u8]) { return;' \
+  src/main.rs 'fn load_world_from(payload: &[u8]) -> Result<(), &'"'"'static str> {' \
+  'fn load_world_from(payload: &[u8]) -> Result<(), &'"'"'static str> { return Ok(());' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a broken furnace cannot retain its slots" \
@@ -491,7 +491,7 @@ check "a predicate reads solidity, not replaceability" \
 check "a context override outranks the cached terrain read" \
   src/generation_context.rs '        if let Some(&s) = self.wr.get(&(x, y, z)) {' \
   '        if let Some(&s) = self.rc.get(&(x, y, z)) {' \
-  context_overrides_heights_bounds_and_biomes_keep_existing_results
+  context_overrides_heights_bounds_and_biomes_track_live_state
 
 check "placement modifiers advance positions in vanilla's draw order" \
   src/feature.rs '            let (x, z) = (pos.0 + rng.next_bound(16), pos.2 + rng.next_bound(16));' \
