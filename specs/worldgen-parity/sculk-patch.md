@@ -453,11 +453,34 @@ sculk は 67% しか一致しない。
 
 **結論**: ずれは「1 回の spread 呼び出しの中」で決まっており、その判断は**その瞬間の
 セル状態**に依存する。参照の最終セルから中間状態を復元する方法はここで尽きた。
-次に必要なのは **native 実行**（＝以前記録した option 2: 最小の空 `ChunkAccess` を
-harness に足して sculk 経路を oracle で駆動する）。`SculkVeinBlock` の shape update が
-chunk を要求するのが唯一の障害で、空 chunk を返せば shape update は no-op になり、
-比較したいセル（sculk/vein は full cube）には影響しない見込み。これが sculk を
-推論ではなく証拠で閉じる唯一の道。
+
+## native 実行の再挑戦と、2 つ目の障害（2026-10-28、実測）
+
+option 2（harness に `ChunkAccess` を足す）を実際に試した。`NativeHarness` は
+`getChunk(int,int,ChunkStatus,boolean)` に対して**実物の `ProtoChunk`** を返せるように
+なった（`UpgradeData.EMPTY` + `LevelHeightAccessor.create` + 生成器と同じデータから構築。
+サブクラス化は不可: game のクラスは default package にあり、そこに足したクラスは
+signer 検査で落ちる）。これで最初の `UnsupportedOperationException`（`getChunk`）は解消。
+
+しかし次の障害が出た:
+
+```
+java.lang.IllegalStateException: Missing key in ResourceKey[minecraft:root / minecraft:block]:
+  ResourceKey[minecraft:worldgen/biome / minecraft:plains]
+```
+
+空の chunk が biome 問い合わせに**固定の `minecraft:plains`** で答え、それを chunk 構築時に
+渡した `Registry` から引こうとする。1.21 の biome は**動的 registry**で、
+`BuiltInRegistries` のどのフィールドにも無い（`lt` の 79 registry を列挙して確認）。
+つまり biome に答えられる chunk は**実 world の `RegistryAccess`** を必要とする。
+
+→ **sculk を native で駆動するには running server context が要る**（harness の拡張では
+届かない）。実装した `ProtoChunk` 返却は harness に残すが（`getChunk` を呼ぶ他の feature の
+ため）、sculk の合格判定は当面 whole-chunk 比較（`tools/sculk_gate.py`）に一本化する。
+
+現状の到達点: 規則は個別に正しく（述語 3 つは load-bearing、変換入力は正しい、vein の
+面構成も同じ）、量が ~25% ずれる。決定は 1 回の spread 呼び出しの中で、その瞬間の
+セル状態に依存する — これは最終セルからは復元できない。
 
 ## 未検証として残ること
 

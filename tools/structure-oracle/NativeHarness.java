@@ -532,6 +532,27 @@ public final class NativeHarness {
                 }
                 return ((java.util.function.Predicate<Object>) a[1]).test(at);
             }
+            // `getChunk(int,int,ChunkStatus,boolean)` (`dcz.a`): a *real* scratch `ProtoChunk`.
+            //
+            // `SculkVeinBlock`'s shape update asks the level for a chunk, which a scripted level
+            // cannot answer with anything of its own - a subclass is impossible, because the
+            // game's classes live in the default package and adding a class there fails the
+            // signer check. A vanilla `ProtoChunk` is constructible from data the harness has
+            // (`UpgradeData.EMPTY`, `LevelHeightAccessor.create`), and shape updates land in it
+            // instead of the level, which is what a scratch chunk is for.
+            //
+            // Measured limit: this gets the run past `getChunk`, and it then fails because an
+            // empty chunk answers a biome query with a fixed `minecraft:plains` key, looked up
+            // in whatever `Registry` the chunk was built with. Biomes are a *dynamic* registry
+            // in 1.21 - no `BuiltInRegistries` field names one - so a chunk that can answer
+            // biome queries needs a real world's `RegistryAccess`, which this harness does not
+            // have. Driving the sculk path natively therefore needs a running-server context,
+            // not more harness.
+            if (m.getName().equals("a") && pt.length == 4 && pt[0] == int.class && pt[1] == int.class
+                    && pt[2].getName().equals("dvz") && pt[3] == boolean.class
+                    && m.getReturnType().getName().equals("duy")) {
+                return scratchChunk((int) a[0], (int) a[1]);
+            }
             // setBlock(pos, state, flags) must be recorded.
             if (m.getName().equals("a") && pt.length == 3 && pt[0] == posC && pt[1] == stateC
                     && m.getReturnType() == boolean.class) {
@@ -592,6 +613,27 @@ public final class NativeHarness {
         Object settings = C("dzd").getMethod("e").invoke(null);
         Object holder = C("jm").getMethod("a", Object.class).invoke(null, settings);
         return C("dzb").getConstructor(C("dea"), C("jm")).newInstance(null, holder);
+    }
+
+    static final Map<Long, Object> SCRATCH_CHUNKS = new HashMap<>();
+
+    /** A `ProtoChunk` for this position, reused: shape updates may write into it freely. */
+    static Object scratchChunk(int cx, int cz) throws Exception {
+        long key = ((long) cx << 32) ^ (cz & 0xFFFF_FFFFL);
+        Object cached = SCRATCH_CHUNKS.get(key);
+        if (cached != null) return cached;
+        Object pos = C("dcd").getConstructor(int.class, int.class).newInstance(cx, cz);
+        Object upgrade = C("dvv").getField("a").get(null); // UpgradeData.EMPTY
+        Object heights = heightC.getMethod("e", int.class, int.class).invoke(null, MIN_Y, HEIGHT);
+        Object chunk = C("dvs")
+                .getConstructor(C("dcd"), C("dvv"), C("dcy"), C("jz"), C("eab"))
+                // The 4th argument erases to `Registry`; biomes are a *dynamic* registry in
+                // 1.21 (nothing in `BuiltInRegistries` names it), and a scratch chunk is only
+                // used for shape updates, which never ask it for a biome. The plain type of
+                // whatever registry is passed is not checked by reflection.
+                .newInstance(pos, upgrade, heights, C("lt").getField("e").get(null), null);
+        SCRATCH_CHUNKS.put(key, chunk);
+        return chunk;
     }
 
     /** Same name and parameter types declared by the height-accessor interface. */
