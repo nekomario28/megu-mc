@@ -1,0 +1,371 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/main.rs (target/release/deps/mc_spine-2163a57589363f2d)
+
+running 249 tests
+test block_registry::state_mapping_tests::property_names_and_values_determine_metadata_position ... ok
+test cached_lookup::tests::every_dependency_change_recomputes_even_after_false ... ok
+test cached_lookup::tests::a_working_set_larger_than_one_is_retained ... ok
+test cached_lookup::tests::repeated_miss_is_cached_and_changed_input_is_observed ... ok
+test chunk_ack::tests::a_malformed_acknowledgement_is_refused ... ok
+test chunk_ack::tests::an_acknowledged_client_gates_the_next_batch_on_its_ack ... ok
+test chunk_ack::tests::the_first_batch_is_not_gated_and_does_not_arm_the_timeout ... ok
+test chunk_ack::tests::the_requested_rate_is_clamped_to_the_window_and_to_positive ... ok
+test connection_slot_tests::panic_does_not_leak_connection_slot ... ok
+test container_tests::container_chest_item_reaches_the_placed_default_state ... ok
+test command_tests::tag_list_reports_every_matched_target ... ok
+test container_tests::container_pickup_respects_component_limits_on_empty_slots_and_swaps ... ok
+test effect_tests::a_rejected_hit_changes_nothing ... ok
+test effect_tests::absorption_expiry_removes_unspent_shield ... ok
+test effect_tests::death_protection_updates_state_and_sends_effect_changes ... ok
+test effect_tests::totem_replaces_existing_effects_with_vanilla_grant ... ok
+test effect_tests::vulnerability_follows_vanillas_invulnerable_time_rule ... ok
+test effect_tests::wither_death_protection_stops_old_effects_and_keeps_new_grants ... ok
+test entity_encoding_tests::entity_angles_head_update_matches_native_floor ... ok
+test entity_encoding_tests::entity_angles_spawn_matches_native_constructors ... ok
+test entity_encoding_tests::entity_angles_teleport_matches_native_constructor ... ok
+test craft_tests::a_shaped_recipe_matches_at_a_non_zero_grid_offset ... ok
+test block_registry::tag_tests::base_stone_overworld_excludes_gravel_and_dirt ... ok
+test container_tests::container_right_pickup_swaps_unlike_stacks_and_rounds_up_a_half ... ok
+test container_tests::container_pickup_fills_space_instead_of_swapping_a_partial_stack ... ok
+test container_tests::container_transfers_match_real_1_21_1_classes ... ok
+test feature::generation_contract_tests::a_chunk_claims_its_carver_pass_once ... ok
+test feature::generation_contract_tests::converted_carver_lists_still_parse ... ok
+test container_tests::pickup_inventory_matches_real_1_21_1_classes ... ok
+test feature::generation_contract_tests::carver_configs_parse_the_1_21_1_field_shapes ... ok
+test feature::generation_contract_tests::carver_lists_match_the_pinned_biomes ... ok
+test feature::generation_contract_tests::biome_spawn_tables_match_the_pinned_classes ... ok
+test feature::generation_contract_tests::float_providers_draw_and_clamp_like_the_vanilla_types ... ok
+test feature::generation_contract_tests::dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above ... ok
+test feature::generation_contract_tests::context_overrides_heights_bounds_and_biomes_keep_existing_results ... ok
+test feature::generation_contract_tests::dripstone_cluster_pools_lower_the_stalagmite_into_the_water ... ok
+test feature::generation_contract_tests::geode_abandons_itself_when_a_point_lands_in_air ... ok
+test feature::generation_contract_tests::desert_well_builds_its_shape_on_sand ... ok
+test feature::generation_contract_tests::feature_context_sees_carver_writes ... ok
+test feature::generation_contract_tests::desert_well_needs_sand_and_draws_nothing_otherwise ... ok
+test feature::generation_contract_tests::ice_spike_does_nothing_without_snow ... ok
+test feature::generation_contract_tests::geode_layers_are_concentric_bands_around_its_points ... ok
+test feature::generation_contract_tests::heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface ... ok
+test feature::generation_contract_tests::ice_spike_builds_a_tapering_spike_on_snow ... ok
+test feature::generation_contract_tests::kelp_feature_grows_up_from_the_ocean_floor_and_places_one_head ... ok
+test feature::generation_contract_tests::iceberg_builds_a_shape_around_sea_level ... ok
+test feature::generation_contract_tests::kelp_places_its_head_when_the_column_is_one_water_cell_deep ... ok
+test feature::generation_contract_tests::root_system_vertical_water_allowance_follows_the_config ... ok
+test feature::generation_contract_tests::ore_air_exposure_matches_native_decisions_and_rng ... ok
+test feature::generation_contract_tests::root_system_does_nothing_when_its_origin_is_not_air ... ok
+test furnace_cache_tests::a_content_reload_invalidates_cached_smelting ... ok
+test feature::generation_contract_tests::large_dripstone_hangs_and_stands_a_tapered_spike ... ok
+test feature::generation_contract_tests::kelp_stops_at_the_water_surface_and_replaces_the_last_plant_with_a_head ... ok
+test furnace_cache_tests::fuel_miss_does_not_delay_valid_fuel ... ok
+test generation_math::deco_seed_tests::decoration_seed_values ... ok
+test generation_math::next_int_vs_vanilla_tests::next_int_streams_match_the_game_for_every_class_seed_and_bound ... ok
+test generation_math::sha_tests::sha256_vectors ... ok
+test generation_math::tests::legacy_next_long_sign_extends_like_javas ... ok
+test generation_math::tests::mth_cos_is_the_sine_table_shifted ... ok
+test generation_math::tests::xoroshiro_parity ... ok
+test handshake_security_tests::malformed_handshake_is_rejected_without_panicking ... ok
+test handshake_security_tests::malformed_login_does_not_assume_zero_uuid ... ok
+test handshake_security_tests::valid_handshake_and_login_identity ... ok
+test ingress_guard::tests::a_normal_position_is_accepted ... ok
+test ingress_guard::tests::a_short_or_padded_movement_frame_is_refused ... ok
+test ingress_guard::tests::non_finite_coordinates_are_refused ... ok
+test ingress_guard::tests::other_packets_are_not_move_packets ... ok
+test ingress_guard::tests::positions_beyond_the_world_border_are_refused ... ok
+test feature::generation_contract_tests::large_dripstone_sways_when_both_spikes_clear_the_wind_gate ... ok
+test landing::tests::vanilla_eligibility_boundaries ... ok
+test feature::generation_contract_tests::provider_values_and_following_rng_match_pre_extraction ... ok
+test light_pack_tests::a_source_marks_an_already_generated_neighbour_for_a_light_update ... ok
+test feature::generation_contract_tests::sea_pickle_skips_cells_that_are_not_water ... ok
+test feature::generation_contract_tests::sea_pickle_places_on_water_over_a_solid_top_face_and_draws_first ... ok
+test light_pack_tests::light_sections_start_one_below_the_world ... ok
+test light_pack_tests::sparse_sky_composition_matches_every_dense_nibble ... ok
+test furnace_cache_tests::cached_smelting_beats_rescanning_datapack_recipes ... ok
+test furnace_cache_tests::cached_tick_matches_v237_with_input_output_recipe_and_tag_changes ... ok
+test landing::tests::stale_landing_does_not_replace_new_block ... ok
+test merge_tests::bucketed_merge_still_merges_at_all ... ok
+test light_pack_tests::block_light_sees_a_neighbours_generated_source ... ok
+test persistence_tests::hostile_rotation_does_not_collapse_to_one_type ... ok
+test light_pack_tests::block_light_uses_generated_sources ... ok
+
+running 1 test
+
+running 1 test
+test persistence_tests::furnace_and_sign_round_trip_keeps_only_live_owners ... test persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities ... [spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+
+
+running 1 test
+test persistence_tests::legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning ... test light_pack_tests::update_light_packet_sends_block_light_only ... ok
+[spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 1 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered outtest persistence_tests::legacy_persisted_durations_resume_with_their_original_wall_time ... ; finished in 0.00s
+
+ok
+
+running 1 test
+test persistence_tests::met4_round_trip_leaves_persisted_durations_untouched ... 
+running 1 test
+test persistence_tests::met2_without_mob_air_falls_back_to_a_full_supply ... [spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 1 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+
+[spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded meta: 1 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00stest light_pack_tests::a_removed_generated_emitter_stops_lighting ... 
+
+ok
+test merge_tests::bucketed_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs ... ok
+
+running 1 test
+test persistence_tests::negative_drop_age_survives_a_save_reload_round_trip ... 
+running 1 test
+test persistence_tests::met4_round_trip_preserves_drop_components_age_and_mob_air ... [spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 1 mobs, 0 invs, 0 chests
+[spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 1 mobs, 0 invs, 0 chests
+[spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 1 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+
+[spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 1 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+
+test persistence_tests::a_legacy_fal1_save_converts_its_blocks_to_entities ... ok
+test persistence_tests::legacy_met3_millisecond_ages_convert_to_ticks_instead_of_despawning ... ok
+
+running 1 test
+test persistence_tests::saving_neither_mutates_live_state_nor_loses_resting_tridents ... [spine] loaded 0 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 0 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+
+
+running 1 test
+test persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip ... [spine] loaded 0 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 0 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+
+test persistence_tests::met2_without_mob_air_falls_back_to_a_full_supply ... ok
+test persistence_tests::met4_round_trip_leaves_persisted_durations_untouched ... ok
+test persistence_tests::truncated_component_blobs_do_not_panic_the_loader ... ok
+
+running 1 test
+test persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_round_trip ... [spine] loaded 0 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 0 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.00s
+
+test primitives_tests::primitives_aabb_clip_matches_native_finite_segments ... ok
+test persistence_tests::negative_drop_age_survives_a_save_reload_round_trip ... ok
+test persistence_tests::met4_round_trip_preserves_drop_components_age_and_mob_air ... ok
+test primitives_tests::primitives_nbt_lore_append_preserves_java_string_bytes ... ok
+test primitives_tests::primitives_nbt_bounded_prefix_does_not_split_a_scalar ... ok
+test registry_tests::a_potted_plant_drops_both_entries_the_asset_lists ... ok
+test registry_tests::an_item_places_the_block_it_is_named_after ... ok
+test registry_tests::block_light_falls_by_one_a_step_from_its_source ... ok
+test primitives_tests::primitives_nbt_writers_match_native_modified_utf8 ... ok
+test registry_tests::every_block_that_drops_something_is_a_block_the_registry_knows ... ok
+test registry_tests::every_hidden_block_name_resolves_to_the_block_it_names ... ok
+test registry_tests::every_wire_state_has_complete_metadata ... ok
+test primitives_tests::primitives_section_encoding_matches_native_palettes ... ok
+test registry_tests::can_harvest_is_the_assets_harvest_tools_set ... ok
+test registry_tests::named_blocks_answer_can_harvest_the_vanilla_way ... ok
+test registry_tests::named_blocks_drop_what_vanilla_drops ... ok
+test registry_tests::named_blocks_emit_the_light_vanilla_emits ... ok
+test registry_tests::named_blocks_have_their_vanilla_mining_time ... ok
+test registry_tests::named_blocks_name_their_tool ... ok
+test registry_tests::named_items_stack_the_way_vanilla_stacks_them ... ok
+test registry_tests::mining_time_is_the_asset_value_for_every_state ... ok
+test registry_tests::report_which_blocks_use_the_default_hardness ... ok
+test registry_tests::setting_a_property_lower_than_its_current_value_stays_inside_the_block ... ok
+test registry_tests::sky_light_is_lit_above_the_floor_and_dark_at_and_below_it ... ok
+test registry_tests::sky_light_reaches_sideways_through_an_opening ... ok
+test registry_tests::sky_light_reads_lit_at_the_surface_and_dark_under_it ... ok
+test registry_tests::note_block_keeps_solid_and_light_values_for_every_instrument ... ok
+test persistence_tests::saving_neither_mutates_live_state_nor_loses_resting_tridents ... ok
+test persistence_tests::the_falling_entities_survive_a_save_and_load_round_trip ... ok
+test registry_tests::the_falling_set_is_the_asset_set ... ok
+test registry_tests::the_right_tool_is_faster_than_bare_hands ... ok
+test resource_pack_url_tests::loopback_only_by_default_and_explicit_external_url ... ok
+test save_integrity_tests::truncated_and_damaged_new_saves_are_rejected ... ok
+test save_integrity_tests::wrapped_world_roundtrip_and_legacy_acceptance ... ok
+test security_command_tests::clients_can_only_run_read_only_commands ... ok
+test tick_queue::tests::a_cell_becomes_due_after_exactly_its_delay ... ok
+test tick_queue::tests::a_repeated_schedule_keeps_the_earlier_deadline ... ok
+test tick_queue::tests::an_empty_queue_costs_nothing_to_poll ... ok
+test tick_queue::tests::cancelling_removes_it_from_its_bucket ... ok
+test tick_queue::tests::delays_are_clamped_rather_than_dropped ... ok
+test tick_queue::tests::promote_pulls_a_waiting_cell_forward_and_ignores_a_stranger ... ok
+test tick_queue::tests::rescheduling_moves_the_deadline ... ok
+test tick_queue::tests::the_ring_wraps_without_losing_entries ... ok
+test tick_stats::tests::a_window_reports_at_100_ticks_and_resets ... ok
+test tick_stats::tests::exactly_the_budget_is_not_an_overrun ... ok
+test tick_stats::tests::work_above_the_budget_counts_as_an_overrun ... ok
+test persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_round_trip ... ok
+
+running 1 test
+test tick_tests::a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load ... test registry_tests::stack_size_comes_from_the_asset_for_every_state ... ok
+test tick_tests::a_backoff_past_the_queue_cap_waits_for_its_real_deadline ... ok
+test tick_tests::a_falling_block_passes_through_a_replaceable_block ... ok
+test tick_tests::a_falling_block_waits_in_a_cold_chunk ... ok
+test registry_tests::the_correct_tool_kind_is_the_assets_material ... ok
+test tick_tests::a_fast_falling_block_lands_on_a_thin_platform_it_crosses ... ok
+test tick_tests::a_knockout_and_a_save_in_the_same_tick_conserve_the_block ... ok
+test tick_tests::a_long_unsupported_column_converts_in_one_pass ... ok
+test tick_tests::a_neighbour_change_promotes_a_waiting_fluid_cell ... ok
+test tick_tests::a_new_block_in_a_passing_entity_cell_still_falls ... ok
+test tick_tests::a_periodic_system_expresses_its_backoff_in_invocations ... ok
+test registry_tests::the_drop_is_the_assets_drop_for_every_state ... ok
+test tick_tests::a_save_concurrent_with_falling_conserves_every_block ... ok
+test tick_tests::a_save_during_entity_conversion_has_no_duplicate_drop ... ok
+test tick_tests::a_saved_below_world_drop_is_not_duplicated ... ok
+test tick_tests::a_support_placed_under_a_falling_entity_is_landed_on ... ok
+test tick_tests::air_supply_is_derived_everywhere_a_creature_is_constructed ... ok
+test tick_tests::beginning_a_falling_tick_leaves_the_queue_visible ... ok
+test tick_tests::cadence_owner_keeps_world_clock_at_vanilla_rate ... ok
+test tick_tests::client_information_carries_the_view_distance_after_the_locale ... ok
+test tick_tests::game_tick_periods_preserve_the_vanilla_real_time_interval ... ok
+test tick_tests::concurrent_knockout_and_falling_conserve_blocks ... ok
+test tick_tests::entity_life_and_pickup_delay_count_server_ticks_and_freeze_when_cold ... ok
+test tick_tests::every_falling_block_becomes_an_entity_and_lands ... ok
+test tick_tests::game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged ... ok
+test tick_tests::nightly_hostile_type_uses_the_pinned_biome_spawners ... ok
+test tick_tests::per_tick_rates_keep_the_same_chance_per_real_second ... ok
+test tick_tests::hopper_transfer_trace_is_stable_across_the_scheduler_migration ... ok
+test tick_tests::lava_spread_trace_is_stable_across_the_scheduler_migration ... ok
+[spine] loaded 2 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 1 furnaces
+[spine] loaded meta: 0 mobs, 0 invs, 0 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.09s
+
+test persistence_tests::furnace_and_sign_round_trip_keeps_only_live_owners ... ok
+[spine] loaded 1 dirty chunks
+[spine] rebuilt indexes: 0 water, 0 hoppers, 0 crops, 0 cells
+[spine] loaded 0 furnaces
+[spine] loaded meta: 0 mobs, 0 invs, 2 chests
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 248 filtered out; finished in 0.16s
+
+test tick_tests::a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load ... ok
+test registry_tests::light_values_come_from_the_asset_for_every_state ... ok
+test tick_tests::profile_game_tick ... ignored, explicit release-profile run from the isolated tick profiler
+test tick_tests::projectile_lifetimes_keep_their_real_time_at_any_cadence ... ok
+test tick_tests::measure_the_light_cost_per_chunk ... ok
+test tick_tests::pickup_tick_drains_across_selected_offhand_then_hotbar ... ok
+test tick_tests::remaining_tick_periods_and_chances_keep_their_real_time ... ok
+test tick_tests::pickup_tick_keeps_the_partial_entity_without_a_take_event ... ok
+test tick_tests::pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack ... ok
+test tick_tests::placing_unsupported_sand_queues_air_not_a_ghost ... ok
+test tick_tests::stored_tick_durations_match_the_vanilla_game_tick_values ... ok
+test tick_tests::primitives_arrow_tick_hits_between_the_old_samples ... ok
+test tick_tests::the_projectile_sweep_covers_the_whole_tick ... ok
+test tick_tests::region_change_mid_fall_keeps_the_entity ... ok
+test tick_tests::tick_pacing_holds_cadence_and_refuses_to_catch_up ... ok
+test tick_tests::region_membership_matches_hot_plus_skirt_across_input_changes ... ok
+test tick_tests::sand_falls_under_vanilla_gravity_until_it_lands ... ok
+test tick_tests::sixteen_random_ticks_raise_sugar_cane_one_block ... ok
+test tick_tests::the_production_arrow_loop_decays_horizontal_velocity ... ok
+test tick_tests::the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside ... ok
+test tree::tests::a_clipped_tree_needs_a_min_clipped_height_that_the_clip_reaches ... ok
+test tree::tests::a_fancy_branch_passes_through_replaceables_and_logs_only ... ok
+test tree::tests::a_tree_reads_the_dirt_provider_field_the_pinned_data_uses ... ok
+test tree::tests::the_centre_fancy_layer_is_half_the_trunk_half_height ... ok
+test tree::tests::the_replaceable_predicate_says_what_each_placer_used_to_say ... ok
+test tick_tests::tnt_fuse_counts_down_in_server_ticks_and_pauses_when_cold ... ok
+test world_rng::tests::a_zero_seed_does_not_stick_the_stream ... ok
+test tick_tests::tmp_geode_noise_scale ... ok
+test tick_tests::two_knockouts_of_adjacent_supports_conserve_every_block ... ok
+test tick_tests::two_stacked_sand_blocks_fall_without_deadlocking ... ok
+test fanout_tests::the_broadcast_helpers_still_select_the_same_clients ... ok
+test worldgen::aquifer_native_tests::aquifer_deep_level_reads_erosion_and_depth_in_f32 ... ok
+test worldgen::aquifer_native_tests::aquifer_matches_the_pinned_chunk_through_its_public_api ... ok
+test worldgen::bedrock_bench::time_deep_state_band ... ok
+test worldgen::weird_sampler_tests::weird_sampler_converted_noise_is_unchanged ... ok
+test worldgen::weird_sampler_tests::weird_sampler_failed_named_reference_is_retried_not_cached_as_zero ... ok
+test worldgen::weird_sampler_tests::weird_sampler_input_is_reachable_through_the_interpolated_node ... ok
+test worldgen::weird_sampler_tests::weird_sampler_installed_nodes_are_nonzero ... ok
+test worldgen::weird_sampler_tests::weird_sampler_installed_pack_has_three_reachable_typed_nodes ... ok
+test worldgen::weird_sampler_tests::weird_sampler_matches_native_mapper_and_samples ... ok
+test worldgen::weird_sampler_tests::weird_sampler_production_evaluation_scales_all_axes_with_real_normal ... ok
+test worldgen::weird_sampler_tests::weird_sampler_rarity_thresholds_are_strict_across_adjacent_bits ... ok
+test worldgen::weird_sampler_tests::weird_sampler_requires_known_mapper_input_and_noise ... ok
+test worldgen::weird_sampler_tests::weird_sampler_uses_the_callers_interpolation_context ... ok
+test worldgen::wg_tests::a_nonpositive_density_with_an_aquifer_barrier_is_still_solid ... ok
+test worldgen::wg_tests::aqdist ... ok
+test worldgen::wg_tests::aquifer_vectors ... ok
+test worldgen::wg_tests::biome_tree_breaks_ties_the_way_vanilla_scans_children ... ok
+test worldgen::wg_tests::biome_vectors ... ok
+test worldgen::wg_tests::bundled_carver_configs_are_the_1_21_1_shapes ... ok
+test worldgen::wg_tests::feat_determinism ... ok
+test worldgen::wg_tests::feat_populate_perf ... ok
+test worldgen::wg_tests::feature_population_output_matches_the_pre_refactor_capture ... ok
+test worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides ... ok
+test worldgen::wg_tests::lazy_population_preserves_direct_feature_outputs ... ok
+test worldgen::wg_tests::material_rules_load ... ok
+test worldgen::wg_tests::material_rules_real_ids ... ok
+test worldgen::wg_tests::not_underwater_is_grass_only_above_the_water_surface ... ok
+test worldgen::wg_tests::perf_probe ... ok
+test worldgen::wg_tests::pinned_biome_tree_uses_only_biomes_from_its_jar ... ok
+test worldgen::wg_tests::pinned_climate_router_resolves_inline_fields ... ok
+test worldgen::wg_tests::pinned_surface_block_states_match_the_native_codec ... ok
+test worldgen::wg_tests::pinned_surface_rule_places_bedrock_and_deepslate ... ok
+test worldgen::wg_tests::pinned_surface_temperature_matches_the_native_biome ... ok
+test worldgen::wg_tests::surface_build_scan_matches_the_pinned_classes_on_synthetic_columns ... ok
+test worldgen::wg_tests::surface_conditions_match_the_pinned_context_formulas ... ok
+test worldgen::wg_tests::surface_density_follows_vanillas_interpolated_order ... ok
+test worldgen::wg_tests::surface_sequence_rejects_a_child_that_did_not_parse ... ok
+test worldgen::wg_tests::surface_steep_reads_the_world_surface_heightmap ... ok
+test worldgen::wg_tests::the_ore_vein_geometry_matches_vanillas_own_output ... ok
+test worldgen::wg_tests::the_shared_biome_cache_returns_the_same_leaf_for_the_same_quart ... ok
+test worldgen::wg_tests::the_surface_material_window_stops_at_deep_solids ... ok
+test worldgen::wg_tests::vertical_gradient_seed_reads_the_name_hash_big_endian ... ok
+test tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count ... ok
+test tick_tests::water_spread_trace_is_stable_across_the_scheduler_migration ... ok
+test world_rng::tests::a_different_seed_gives_a_different_sequence ... ok
+test world_rng::tests::next_below_stays_in_range_and_covers_it ... ok
+test world_rng::tests::the_same_seed_gives_the_same_sequence ... ok
+test world_rng::tests::the_state_round_trips ... ok
+test world_rng::tests::the_stream_is_the_pinned_xorshift64star_vector ... ok
+
+test result: ok. 248 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.49s
+

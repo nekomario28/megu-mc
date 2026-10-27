@@ -1,0 +1,1 @@
+wire smoke: status, malformed handshake, RCON rejection/auth PASS

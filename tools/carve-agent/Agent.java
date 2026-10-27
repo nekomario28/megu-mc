@@ -567,8 +567,8 @@ public class Agent {
         }
     }
 
-    /** TreeFeature.place: log the trunk origin of every tree in a chunk. */
-    static byte[] instrumentTree(byte[] buf) {
+    /** Feature.place origins; the named logger applies its own chunk filter. */
+    static byte[] instrumentFeatureOrigin(byte[] buf, String logger) {
         try {
             ClassReader cr = new ClassReader(buf);
             ClassWriter cw = writer(cr);
@@ -585,19 +585,64 @@ public class Agent {
                                 super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ecg", "e", "()Ljd;", false);
                                 super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
                             }
-                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "tree", "(III)V", false);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", logger, "(III)V", false);
+                        }
+                        @Override public void visitMethodInsn(int op, String owner, String name, String desc, boolean itf) {
+                            boolean read = logger.equals("geode") && owner.equals("dds") && name.equals("a_") && desc.equals("(Ljd;)Ldtc;");
+                            if (read) {
+                                super.visitVarInsn(Opcodes.ASTORE, 200);
+                                super.visitVarInsn(Opcodes.ALOAD, 200);
+                            }
+                            super.visitMethodInsn(op, owner, name, desc, itf);
+                            if (read) {
+                                super.visitVarInsn(Opcodes.ASTORE, 201);
+                                for (String g : new String[] {"u", "v", "w"}) {
+                                    super.visitVarInsn(Opcodes.ALOAD, 200);
+                                    super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                                }
+                                super.visitVarInsn(Opcodes.ALOAD, 201);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "dfy", "i", "(Ldtc;)I", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "geodeRead", "(IIII)V", false);
+                                super.visitVarInsn(Opcodes.ALOAD, 201);
+                            }
                         }
                     };
                 }
             }, 0);
             return cw.toByteArray();
         } catch (Throwable t) {
-            System.err.println("CARVEAGENT tree failed: " + t);
+            System.err.println("CARVEAGENT " + logger + " origin failed: " + t);
             return null;
         }
     }
 
-    /** OreFeature.place: log the origin and size of every blob in a chunk. */
+    /** SeagrassFeature's actual block reads, preserving the operand stack. */
+    static byte[] instrumentSeagrass(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9,cw) {
+                @Override public MethodVisitor visitMethod(int acc,String mn,String md,String sig,String[] ex) {
+                    MethodVisitor mv=super.visitMethod(acc,mn,md,sig,ex);
+                    if(!mn.equals("a") || !md.equals("(Lecg;)Z")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9,mv) {
+                        @Override public void visitMethodInsn(int op,String owner,String name,String desc,boolean itf) {
+                            boolean read=owner.equals("dds") && name.equals("a_") && desc.equals("(Ljd;)Ldtc;");
+                            if(read) {super.visitInsn(Opcodes.DUP);super.visitVarInsn(Opcodes.ASTORE,40);}
+                            super.visitMethodInsn(op,owner,name,desc,itf);
+                            if(read) {
+                                super.visitInsn(Opcodes.DUP);super.visitVarInsn(Opcodes.ALOAD,40);super.visitInsn(Opcodes.SWAP);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC,"CarveLog","seagrassRead","(Ljava/lang/Object;Ljava/lang/Object;)V",false);
+                            }
+                        }
+                    };
+                }
+            },0);
+            return cw.toByteArray();
+        } catch(Throwable t) {System.err.println("CARVEAGENT seagrass failed: "+t);return null;}
+    }
+
+    /** OreFeature.place origins and canPlaceOre decisions (no changed game inputs). */
     static byte[] instrumentOre(byte[] buf) {
         try {
             ClassReader cr = new ClassReader(buf);
@@ -606,6 +651,25 @@ public class Agent {
                 @Override public MethodVisitor visitMethod(int acc, String mn, String md,
                                                            String sig, String[] ex) {
                     MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (mn.equals("a") && md.equals("(Ldtc;Ljava/util/function/Function;Layw;Leeq;Leeq$a;Ljd$a;)Z")) {
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int opcode) {
+                                if (opcode == Opcodes.IRETURN) {
+                                    super.visitVarInsn(Opcodes.ISTORE, 8);
+                                    for (String g : new String[] {"u", "v", "w"}) {
+                                        super.visitVarInsn(Opcodes.ALOAD, 5);
+                                        super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                                    }
+                                    super.visitVarInsn(Opcodes.ALOAD, 0);
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "dfy", "i", "(Ldtc;)I", false);
+                                    super.visitVarInsn(Opcodes.ILOAD, 8);
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "oreTest", "(IIIIZ)V", false);
+                                    super.visitVarInsn(Opcodes.ILOAD, 8);
+                                }
+                                super.visitInsn(opcode);
+                            }
+                        };
+                    }
                     if (!mn.equals("a") || !md.equals("(Lecg;)Z")) return mv;
                     return new MethodVisitor(Opcodes.ASM9, mv) {
                         @Override public void visitCode() {
@@ -620,6 +684,17 @@ public class Agent {
                             super.visitTypeInsn(Opcodes.CHECKCAST, "eeq");
                             super.visitFieldInsn(Opcodes.GETFIELD, "eeq", "c", "I");
                             super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "ore", "(IIII)V", false);
+                        }
+                        @Override public void visitMethodInsn(int op, String owner, String name, String desc, boolean itf) {
+                            super.visitMethodInsn(op, owner, name, desc, itf);
+                            if (owner.equals("dds") && name.equals("a") && desc.equals("(Ldyy$a;II)I")) {
+                                super.visitVarInsn(Opcodes.ISTORE, 40);
+                                super.visitVarInsn(Opcodes.ILOAD, 27);
+                                super.visitVarInsn(Opcodes.ILOAD, 28);
+                                super.visitVarInsn(Opcodes.ILOAD, 40);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "oreHeight", "(III)V", false);
+                                super.visitVarInsn(Opcodes.ILOAD, 40);
+                            }
                         }
                     };
                 }
@@ -724,6 +799,69 @@ public class Agent {
         };
     }
 
+    /** WorldGenRegion writes to one named cell, including the writer chunk. */
+    static byte[] instrumentWrites(byte[] buf,String callback) {
+        ClassReader cr = new ClassReader(buf);
+        ClassWriter cw = writer(cr);
+        cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+            @Override public MethodVisitor visitMethod(int acc, String mn, String md, String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                if (!mn.equals("a") || !md.equals("(Ljd;Ldtc;II)Z")) return mv;
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    @Override public void visitInsn(int opcode) {
+                        if (opcode == Opcodes.IRETURN) {
+                            super.visitVarInsn(Opcodes.ISTORE, 30);
+                            for (String g : new String[] {"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 1);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                            }
+                            super.visitVarInsn(Opcodes.ALOAD, 2);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "dfy", "i", "(Ldtc;)I", false);
+                            if(callback.equals("runtimeCell")) {
+                                super.visitVarInsn(Opcodes.ALOAD,0);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL,"dcw","I_","()I",false);
+                            }
+                            super.visitVarInsn(Opcodes.ILOAD, 30);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog",callback,
+                                callback.equals("runtimeCell") ? "(IIIIIZ)V" : "(IIIIZ)V",false);
+                            super.visitVarInsn(Opcodes.ILOAD, 30);
+                        }
+                        super.visitInsn(opcode);
+                    }
+                };
+            }
+        }, ClassReader.EXPAND_FRAMES);
+        return cw.toByteArray();
+    }
+
+    /** MushroomBlock.canSurvive: preserve and log the actual raw brightness. */
+    static byte[] instrumentMushroomLight(byte[] buf) {
+        ClassReader cr = new ClassReader(buf);
+        ClassWriter cw = writer(cr);
+        cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+            @Override public MethodVisitor visitMethod(int acc, String mn, String md, String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                if (!mn.equals("a") || !md.equals("(Ldtc;Ldcz;Ljd;)Z")) return mv;
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    @Override public void visitMethodInsn(int op, String owner, String name, String desc, boolean itf) {
+                        super.visitMethodInsn(op, owner, name, desc, itf);
+                        if (owner.equals("dcz") && name.equals("b") && desc.equals("(Ljd;I)I")) {
+                            super.visitVarInsn(Opcodes.ISTORE, 200);
+                            for (String g : new String[] {"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 3);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                            }
+                            super.visitVarInsn(Opcodes.ILOAD, 200);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "mushroomLight", "(IIII)V", false);
+                            super.visitVarInsn(Opcodes.ILOAD, 200);
+                        }
+                    }
+                };
+            }
+        }, ClassReader.EXPAND_FRAMES);
+        return cw.toByteArray();
+    }
+
     static class Transformer implements ClassFileTransformer {
         @Override public byte[] transform(ClassLoader l, String name, Class<?> c,
                                           ProtectionDomain pd, byte[] buf) {
@@ -735,7 +873,13 @@ public class Agent {
             if ("ebe".equals(name)) return instrumentCarveState(buf);
             if ("dzi".equals(name)) return instrumentVein(buf);
             if ("ecz".equals(name)) return instrumentOre(buf);
-            if ("edq".equals(name)) return instrumentTree(buf);
+            if ("edk".equals(name) && System.getProperty("seagrasschunk") != null) return instrumentSeagrass(buf);
+            if ("arb".equals(name) && (System.getProperty("featurecell") != null || System.getProperty("featurebox") != null)) return instrumentWrites(buf,"featureCell");
+            if ("dcw".equals(name) && (System.getProperty("runtimecell") != null || System.getProperty("runtimebox") != null)) return instrumentWrites(buf,"runtimeCell");
+            if ("dla".equals(name) && System.getProperty("mushroomchunk") != null) return instrumentMushroomLight(buf);
+            if ("edq".equals(name)) return instrumentFeatureOrigin(buf, "tree");
+            if ("edc".equals(name) && System.getProperty("patchchunk") != null) return instrumentFeatureOrigin(buf, "patch");
+            if ("eck".equals(name) && System.getProperty("geodechunk") != null) return instrumentFeatureOrigin(buf, "geode");
             if ("duz".equals(name)) return instrumentDimension(buf);
             if ("deg".equals(name)) return instrumentBiomes(buf);
             if ("eii".equals(name)) return instrumentBiomeFilter(buf);

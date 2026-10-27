@@ -145,8 +145,11 @@ pub(crate) fn dtrace(kind: impl std::fmt::Display, value: f64) {
     }
     let f = XTRACE_FEAT.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!("DRAW {n} f={},{} {kind}={value}", f >> 32, f & 0xFFFF);
+    let limit = crate::trace_env::env_str!("FEATURE_DRAW_LIMIT")
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(200);
     DTRACE.store(
-        if n + 1 >= 200 { -1 } else { n + 1 },
+        if n + 1 >= limit { -1 } else { n + 1 },
         std::sync::atomic::Ordering::Relaxed,
     );
 }
@@ -280,6 +283,15 @@ impl Xor {
         let v = self.next_long() >> (64 - bits);
         nxtrace(bits, v);
         v
+    }
+    /// The Java-facing nextLong: a wrapped WorldgenRandom consumes two
+    /// next(32) calls; a bare XoroshiroRandomSource consumes one engine word.
+    pub(crate) fn next_i64(&mut self) -> i64 {
+        if self.legacy {
+            self.next_i64_legacy()
+        } else {
+            self.next_long() as i64
+        }
     }
     /// `WorldgenRandom`-style `nextLong()`: two `next(32)` calls, sign-extended.
     pub(crate) fn next_i64_legacy(&mut self) -> i64 {
@@ -431,7 +443,6 @@ pub(crate) fn hash_block_pos(x: i32, y: i32, z: i32) -> i64 {
 }
 
 // java String.hashCode (UTF-16 units)
-#[expect(dead_code)]
 pub(crate) fn java_hash(s: &str) -> i32 {
     let mut h = 0i32;
     for u in s.encode_utf16() {
@@ -759,21 +770,20 @@ struct NativeNormal {
     value_factor: f64,
     octave_weights: Vec<f64>,
 }
+static NEXT_NORMAL_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 pub(crate) struct Normal {
+    // Addresses can be reused after drop (or change on move). Cache identity
+    // belongs to the sampler's lifetime, not its current allocation address.
+    cache_id: usize,
     layers: Vec<Octave>,
     /// `Some` for the native `firstOctave`/`amplitudes` encoding, whose layers
-    /// keep their unnormalised per-octave weights. `None` for the converted and
-    /// legacy encodings, whose normalization is already folded into each `a`.
+    /// keep their unnormalised per-octave weights. `None` for the converted
+    /// encoding, whose normalization is already folded into each `a`.
     native: Option<NativeNormal>,
 }
 impl Normal {
     pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
-        let key = (
-            self as *const Normal as usize,
-            x.to_bits(),
-            y.to_bits(),
-            z.to_bits(),
-        );
+        let key = (self.cache_id, x.to_bits(), y.to_bits(), z.to_bits());
         let idx = nhash(key);
         if let Some(v) = NCACHE.with(|c| {
             let slot = c.borrow()[idx];
@@ -878,21 +888,12 @@ pub(crate) fn normal_new(
 /// Preserve `amplitude * sample * octave_weight`, then add both Perlin stacks
 /// and multiply by the span-derived value factor: precombining weights changes bits.
 pub(crate) fn normal_new_amps(r: &mut Xor, first_octave: i32, amps: &[f64]) -> Normal {
-    let count = amps.len() as i32;
-    let mut frequency = LACUNARITY.powi(first_octave);
-    let mut weight = LACUNARITY.powi(count - 1) / (LACUNARITY.powi(count) - 1.0);
-    let mut octaves = Vec::new();
-    let mut octave_weights = Vec::new();
-    for (i, &amplitude) in amps.iter().enumerate() {
-        if amplitude != 0.0 {
-            octaves.push((first_octave + i as i32, frequency, amplitude));
-            octave_weights.push(weight);
-        }
-        frequency *= LACUNARITY;
-        weight /= LACUNARITY;
-    }
-    let value_factor = native_value_factor(amps);
-    normal_native_from_octaves(r, &octaves, value_factor, octave_weights)
+    let first = r.splitter();
+    let second = r.splitter();
+    normal_native(first_octave, amps, |stack, octave| {
+        let factory = if stack == 0 { &first } else { &second };
+        Perlin::new(&mut factory.of_str(&format!("octave_{octave}")))
+    })
 }
 
 /// `NormalNoise`'s span for `expectedDeviation`: the last nonzero amplitude
@@ -919,37 +920,40 @@ fn native_value_factor(amps: &[f64]) -> f64 {
 /// positional forks and octave names as the converted encoding, but keeps the
 /// per-octave weights separate and applies the final factor only after summing
 /// both stacks.
-fn normal_native_from_octaves(
-    r: &mut Xor,
-    octaves: &[(i32, f64, f64)],
-    value_factor: f64,
-    octave_weights: Vec<f64>,
+fn normal_native(
+    first_octave: i32,
+    amps: &[f64],
+    mut perlin: impl FnMut(usize, i32) -> Perlin,
 ) -> Normal {
-    let first = r.splitter();
-    let second = r.splitter();
-    let mut layers = Vec::with_capacity(octaves.len() * 2);
-    for &(idx, f, a) in octaves {
-        layers.push(Octave {
-            n: Perlin::new(&mut first.of_str(&format!("octave_{}", idx))),
-            f,
-            a,
-        });
-    }
-    let split = layers.len();
-    for &(idx, f, a) in octaves {
-        layers.push(Octave {
-            n: Perlin::new(&mut second.of_str(&format!("octave_{}", idx))),
-            f,
-            a,
-        });
+    let count = amps.len() as i32;
+    let mut layers = Vec::with_capacity(amps.len() * 2);
+    let mut octave_weights = Vec::new();
+    for stack in 0..2 {
+        let mut frequency = LACUNARITY.powi(first_octave);
+        let mut weight = LACUNARITY.powi(count - 1) / (LACUNARITY.powi(count) - 1.0);
+        for (i, &amplitude) in amps.iter().enumerate() {
+            if amplitude != 0.0 {
+                layers.push(Octave {
+                    n: perlin(stack, first_octave + i as i32),
+                    f: frequency,
+                    a: amplitude,
+                });
+                if stack == 0 {
+                    octave_weights.push(weight);
+                }
+            }
+            frequency *= LACUNARITY;
+            weight /= LACUNARITY;
+        }
     }
     Normal {
-        layers,
+        cache_id: NEXT_NORMAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         native: Some(NativeNormal {
-            split,
-            value_factor,
+            split: layers.len() / 2,
+            value_factor: native_value_factor(amps),
             octave_weights,
         }),
+        layers,
     }
 }
 
@@ -973,85 +977,25 @@ fn normal_from_octaves(r: &mut Xor, octaves: Vec<(i32, f64, f64)>) -> Normal {
         });
     }
     Normal {
+        cache_id: NEXT_NORMAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         layers,
         native: None,
     }
 }
 
-// legacy (pre-1.18) NormalNoise: init order = zero-octave then descending
-// below it; missing/zero amplitudes still consume the rng (skip 262).
-fn legacy_fbm(r: &mut Lcg, first_octave: i32, amps: &[f64]) -> Vec<(Perlin, f64, f64)> {
-    let octaves = amps.len() as i32;
-    let zi = -first_octave;
-    let mut levels: Vec<Option<Perlin>> = (0..amps.len()).map(|_| None).collect();
-    let zero = Perlin::new_l(r);
-    if zi >= 0 && zi < octaves && amps[zi as usize] != 0.0 {
-        levels[zi as usize] = Some(zero);
-    }
-    for i in (0..zi).rev() {
-        if i < octaves && amps[i as usize] != 0.0 {
-            levels[i as usize] = Some(Perlin::new_l(r));
-        } else {
-            r.skip(262);
-        }
-    }
-    let mut factor = LACUNARITY.powi(-zi);
-    let mut value_factor = LACUNARITY.powi(octaves - 1) / (LACUNARITY.powi(octaves) - 1.0);
-    let mut out = Vec::with_capacity(amps.len());
-    for (i, n) in levels.into_iter().enumerate() {
-        if let Some(n) = n {
-            out.push((n, factor, value_factor * amps[i]));
-        }
-        factor *= LACUNARITY;
-        value_factor /= LACUNARITY;
-    }
-    out
-}
-fn parity_norm_factor(base_amp: f64, mods: &[f64]) -> f64 {
-    let mut min_o = i32::MAX;
-    let mut max_o = i32::MIN;
-    for (i, m) in mods.iter().enumerate() {
-        if *m != 0.0 {
-            min_o = min_o.min(i as i32);
-            max_o = max_o.max(i as i32);
-        }
-    }
-    if min_o > max_o {
-        return 0.0;
-    }
-    let span = max_o - min_o;
-    base_amp * 0.5 * TARGET_DEV / (0.1 * (1.0 + 1.0 / (span + 1) as f64))
-}
-// legacy NormalNoise (NoiseProvider/vegetation uses LegacyRandomSource)
+/// NormalNoise.create over WorldgenRandom(LegacyRandomSource(seed)). The
+/// source is legacy, but the constructor is NOT createLegacyNetherBiome:
+/// each stack forks once, and each nonzero octave uses its named positional
+/// source. Vegetation providers and geodes share this construction.
 pub(crate) fn normal_new_l(seed: u64, first_octave: i32, amps: &[f64]) -> Normal {
     let mut r = Lcg::new(seed);
-    let octaves = build_octaves(first_octave, 1.0, amps.len(), amps);
-    let target: f64 = octaves.iter().map(|o| o.2.abs()).sum();
-    let mut nf = norm_factor(target, &octaves);
-    let mut target = target;
-    if nf != 0.0 {
-        let parity = parity_norm_factor(1.0, amps);
-        target *= parity / nf;
-        nf = parity;
-    }
-    let _ = target;
-    let first = legacy_fbm(&mut r, first_octave, amps);
-    let second = legacy_fbm(&mut r, first_octave, amps);
-    let mut layers = Vec::with_capacity(first.len() + second.len());
-    for (n, f, a) in first {
-        layers.push(Octave { n, f, a: a * nf });
-    }
-    for (n, f, a) in second {
-        layers.push(Octave {
-            n,
-            f: f * INPUT_FACTOR,
-            a: a * nf,
-        });
-    }
-    Normal {
-        layers,
-        native: None,
-    }
+    let seeds = [r.next_i64() as u64, r.next_i64() as u64];
+    normal_native(first_octave, amps, |stack, octave| {
+        Perlin::new_l(&mut Lcg::split_str(
+            seeds[stack],
+            &format!("octave_{octave}"),
+        ))
+    })
 }
 
 // ---------- simplex (foliage / noise-based placement modifiers) ----------

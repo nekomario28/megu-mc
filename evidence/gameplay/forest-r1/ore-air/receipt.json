@@ -1,0 +1,73 @@
+{
+  "recorded_at": "2026-10-26T21:18:22.009495+09:00",
+  "base_head": "f65bb80175f817d350c3598f73709e106b095b2f",
+  "reference": {
+    "path": "/tmp/forestfix-normal-nostruct",
+    "seed": 0,
+    "datapacks": {
+      "Disabled": [
+        "bundle",
+        "trade_rebalance"
+      ],
+      "Enabled": [
+        "vanilla"
+      ]
+    },
+    "structures": false,
+    "requested_forceload_chunks": [
+      -64,
+      32,
+      -62,
+      34
+    ],
+    "dump_chunks": [
+      -64,
+      32,
+      -62,
+      34
+    ],
+    "note": "Reuse canonical saved full chunks, not a fresh worldgen-stage oracle. All 9 statuses checked; runtime differences remain."
+  },
+  "sha256": {
+    "/tmp/mc-ore-air-20261026/dump.bin": "bdad2eb5c1fe9c5c9aeaf64e5e965029b5c40fe66df5a0ff8e3553665a0a8884",
+    "/tmp/forestfix-normal-nostruct/dump-spring.bin": "5b2a53de1b42aee38d772de313fda9154ddbd23f210a0f52a8d2861c881a5c1e",
+    "/tmp/forestfix-normal-nostruct/world/level.dat": "e8d6a8e7e8bd1ec4cc27979f596fe38788d837dfe0c58029818d45deb287630e",
+    "/tmp/forestfix-normal-nostruct/server.properties": "d9635bb6fc2e6ae426e095f7eb8d1aa2987a02f194bdbbb777ad601ee29d9431",
+    "/tmp/forestfix-normal-nostruct/world/region/r.-1.-1.mca": "fe69a50987e9c7f9f23ab31e4a49d5a5d1afe6da7e29b8a43c1c2691156d0c55",
+    "/tmp/forestfix-normal-nostruct/world/region/r.-1.0.mca": "184267cff723243e02986af0b9c0c95e982bc180546f0a1c9cd7c56c626b144e",
+    "/tmp/forestfix-normal-nostruct/world/region/r.-2.0.mca": "a0e30c02bed6d8fb126e7b3ac63cac06b17f838f90929248b3fe57595c132ec3",
+    "/tmp/forestfix-normal-nostruct/world/region/r.-2.1.mca": "c12c73d4b55e21fb491a18c9bb0b7d8915c10cf9408d2b3315bf0eaf2690e607",
+    "/tmp/forestfix-normal-nostruct/world/region/r.-3.0.mca": "32e67da0fa22ce363f59130dab92cf3fab2fc13a8cc89fcbae4e72f219414d4a",
+    "/tmp/forestfix-normal-nostruct/world/region/r.-3.1.mca": "85f7fd987b8634566efa00fdc3640fa16c9a39ad6d2f6c421e47a8b22b164cc4",
+    "/tmp/forestfix-normal-nostruct/world/region/r.0.-1.mca": "975b3f3e6b484a2598f200492da9126943df193baa678a5c80a87d07cc5ec94a",
+    "/tmp/forestfix-normal-nostruct/world/region/r.0.0.mca": "f72a4c402201abb3521beb42db3ee110bb17c8579b1e7675b399fa1d44ee4929"
+  },
+  "result": {
+    "before_no_tick": {
+      "region": 1680,
+      "target": 53
+    },
+    "after_no_tick": {
+      "region": 1447,
+      "target": 30
+    },
+    "after_tick": {
+      "region": 1554,
+      "target": 91
+    },
+    "target_remaining": {
+      "lava_flow": 20,
+      "coal_ore": 7,
+      "chest": 2,
+      "short_grass": 1
+    }
+  },
+  "not_run": [
+    "full tests/verify.sh",
+    "all mutation entries",
+    "adapter checks",
+    "fresh reference world",
+    "whole-world parity",
+    "hosted CI"
+  ]
+}

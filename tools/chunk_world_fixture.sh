@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate a pinned-vanilla chunk region and diff mc-spine's same-stage dump.
+# Generate a pinned-vanilla saved region and diff mc-spine's generation dump.
 #
 #   tools/chunk_world_fixture.sh <tag> <cx> <cz> <n> <mode>
 #
@@ -12,8 +12,9 @@
 # The reference is always seed 0 from tools/fixture_base.sh. Every chunk is
 # force-loaded after the server is up; the reference must be complete before the
 # diff, and the diff is written to /tmp/chunkfix-<tag>/diff.txt. This is the
-# same-stage forest/R1 fixture; a missing chunk or an empty region is an error,
-# not a zero result.
+# historical forest/R1 saved-world fixture: native ticks run before saving.
+# For a true paused generation boundary use carve-agent/native_fixture.sh.
+# A missing chunk or an empty region is an error, not a zero result.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="$1"; CX="$2"; CZ="$3"; N="${4:-3}"; MODE="${5:-features}"
@@ -36,7 +37,14 @@ case "$MODE" in
 esac
 lox=$((CX*16)); loz=$((CZ*16)); hix=$(((CX+N)*16-1)); hiz=$(((CZ+N)*16-1))
 echo "chunk fixture $TAG: mode $MODE, chunks ($CX,$CZ)+${N}x${N}, blocks ($lox,$loz)-($hix,$hiz)"
-( cd "$DIR"; ( sleep 8
+( cd "$DIR"; ( deadline=$((SECONDS+90))
+                 until grep -Fq 'Done (' run.log 2>/dev/null; do
+                   if (( SECONDS >= deadline )); then
+                     echo 'chunk fixture: server did not become ready' >&2
+                     printf 'stop\n'; exit 2
+                   fi
+                   sleep 0.1
+                 done
                  printf 'forceload add %d %d %d %d\n' "$lox" "$loz" "$hix" "$hiz"
                  sleep 75
                  printf 'save-all flush\n'
@@ -44,7 +52,7 @@ echo "chunk fixture $TAG: mode $MODE, chunks ($CX,$CZ)+${N}x${N}, blocks ($lox,$
                  printf 'stop\n' ) \
   | timeout 360 systemd-run --scope --user -p MemoryMax=3G --unit="cw-$TAG-$$" \
       java -Xmx2G -Xms512M -jar server.jar nogui > run.log 2>&1 ) || true
-if grep -q 'Unexpected error occurred' "$DIR/run.log"; then
+if grep -qi 'unexpected error occurred' "$DIR/run.log"; then
   echo "chunk fixture: server command error (see $DIR/run.log)" >&2
   exit 2
 fi

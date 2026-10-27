@@ -31,6 +31,671 @@ fn feature_context_sees_carver_writes() {
     assert_eq!(ctx.get(x, y, z), cave_air);
 }
 
+/// Native canPlaceOre vectors pin both the decision and the following RNG draw.
+/// In particular discard=1 means check all six neighbours, not reject all ore.
+#[test]
+fn ore_air_exposure_matches_native_decisions_and_rng() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+    let rule = RT::Block("minecraft:stone".into());
+    let mut ctx = context(&mut g);
+    let rows = include_str!("../tests/data/ore_air_1211.tsv");
+    let mut checked = 0;
+    for line in rows.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 6, "{line}");
+        let seed = fields[0].parse().unwrap();
+        let chance = fields[1].parse().unwrap();
+        let exposed: i32 = fields[2].parse().unwrap();
+        let matches: bool = fields[3].parse().unwrap();
+        let expected: bool = fields[4].parse().unwrap();
+        let following: i64 = fields[5].parse().unwrap();
+        ctx.set(0, 16, 0, if matches { stone } else { air });
+        for face in 0..6u8 {
+            let (x, y, z) = crate::generation_providers::dir_off(face);
+            ctx.set(
+                x,
+                16 + y,
+                z,
+                if exposed == face as i32 { air } else { stone },
+            );
+        }
+        let mut rng = Xor::seed(seed);
+        assert_eq!(
+            super::ore_should_place(chance, &mut ctx, &rule, (0, 16, 0), &mut rng),
+            expected,
+            "native canPlaceOre decision: {line}"
+        );
+        assert_eq!(
+            rng.next_long() as i64,
+            following,
+            "native following RNG: {line}"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 126,
+        "native exposure matrix must not be empty/truncated"
+    );
+}
+
+/// Compare every dungeon write (including chest facing) and the following RNG
+/// against the actual MonsterRoomFeature with real chest/spawner entities.
+fn monster_room_volume(seed: u64, wrapped: bool) -> Gen {
+    let reg = breg().unwrap();
+    let mut dimensions = if wrapped {
+        Xor::seed_worldgen(seed)
+    } else {
+        Xor::seed(seed)
+    };
+    let xr = dimensions.next_bound(2) + 2;
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let stone = reg.state_of("minecraft:stone", None);
+    let cave_air = reg.state_of("minecraft:cave_air", None);
+    for x in -6..=6 {
+        for y in 14..=20 {
+            for z in -6..=6 {
+                let hole = x == -xr - 1 && z == 0 && (y == 16 || y == 17);
+                g.feat_write(x, y, z, if hole { cave_air } else { stone });
+            }
+        }
+    }
+    g
+}
+
+#[test]
+fn monster_room_cells_and_rng_match_native() {
+    let reg = breg().unwrap();
+    let mut count = 0;
+    let mut total_chests = 0;
+    let mut wrapped_chests = 0;
+    for row in include_str!("../tests/data/monster_room_1211.tsv").lines() {
+        let f: Vec<_> = row.split('\t').collect();
+        assert_eq!(f.len(), 7);
+        let seed = f[0].parse().unwrap();
+        let wrapped = match f[6] {
+            "raw" => false,
+            "worldgen" => true,
+            other => panic!("unknown RNG: {other}"),
+        };
+        assert_eq!(f[1], "true", "native dungeon must place");
+        let mut g = monster_room_volume(seed, wrapped);
+        let mut ctx = context(&mut g);
+        let mut rng = if wrapped {
+            Xor::seed_worldgen(seed)
+        } else {
+            Xor::seed(seed)
+        };
+        gen_cf(&Cf::MonsterRoom, freg(), &mut ctx, &mut rng, (0, 16, 0));
+        let mut cells = Vec::new();
+        let mut chests = 0;
+        for (&(x, y, z), &st) in &ctx.wr {
+            let name = reg.name_of(st);
+            let facing = if name == "minecraft:chest" {
+                chests += 1;
+                reg.get_prop(st, "facing").unwrap()
+            } else {
+                "-".into()
+            };
+            cells.push(format!("{x},{y},{z}:{name}:{facing}\n"));
+        }
+        cells.sort();
+        let hash: String = crate::generation_math::md5(cells.concat().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(cells.len(), f[2].parse::<usize>().unwrap(), "writes: {row}");
+        assert_eq!(chests, f[3].parse::<usize>().unwrap(), "chests: {row}");
+        total_chests += chests;
+        if wrapped {
+            wrapped_chests += chests;
+        }
+        assert_eq!(hash, f[4], "native cell/facing set: {row}");
+        assert_eq!(rng.next_i64(), f[5].parse::<i64>().unwrap(), "RNG: {row}");
+        count += 1;
+    }
+    assert_eq!(count, 8);
+    assert!(wrapped_chests > 0, "exercise wrapped nextLong loot seeds");
+    assert!(
+        total_chests > 0,
+        "native fixture must exercise chest placement"
+    );
+}
+
+#[test]
+fn monster_room_preserves_protected_floor_and_centre() {
+    let mut g = monster_room_volume(0, false);
+    let bedrock = breg().unwrap().state_of("minecraft:bedrock", None);
+    for y in [15, 16] {
+        g.feat_write(0, y, 0, bedrock);
+    }
+    let mut ctx = context(&mut g);
+    gen_cf(
+        &Cf::MonsterRoom,
+        freg(),
+        &mut ctx,
+        &mut Xor::seed(0),
+        (0, 16, 0),
+    );
+    assert!(!ctx.wr.is_empty(), "fixture must reach room placement");
+    for y in [15, 16] {
+        assert_eq!(
+            ctx.get(0, y, 0),
+            bedrock,
+            "Feature.safeSetBlock protection at {y}"
+        );
+        assert!(!ctx.wr.contains_key(&(0, y, 0)));
+    }
+}
+
+#[test]
+fn simple_block_places_both_halves_or_neither() {
+    let reg = breg().unwrap();
+    for blocked in [false, true] {
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        g.feat_write(0, 199, 0, reg.state_of("minecraft:grass_block", None));
+        g.feat_write(0, 200, 0, 0);
+        g.feat_write(
+            0,
+            201,
+            0,
+            if blocked {
+                reg.state_of("minecraft:stone", None)
+            } else {
+                0
+            },
+        );
+        let mut ctx = context(&mut g);
+        let state = reg.state_of("minecraft:lilac", None);
+        let cf = Cf::SimpleBlock {
+            to: Bsp::Simple(state),
+            on: vec![],
+            in_: vec![],
+            under: vec![],
+        };
+        let mut rng = Xor::seed_worldgen(11);
+        let mut untouched = Xor::seed_worldgen(11);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 200, 0));
+        assert_eq!(rng.next_i64(), untouched.next_i64(), "no placement RNG");
+        if blocked {
+            assert!(ctx.wr.is_empty(), "do not leave a lower half");
+        } else {
+            assert_eq!(ctx.wr.len(), 2);
+            assert_eq!(ctx.get(0, 200, 0), reg.with_prop(state, "half", "lower"));
+            assert_eq!(ctx.get(0, 201, 0), reg.with_prop(state, "half", "upper"));
+        }
+    }
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    g.feat_write(0, 199, 0, reg.state_of("minecraft:clay", None));
+    g.feat_write(0, 200, 0, reg.state_of("minecraft:water", None));
+    g.feat_write(0, 201, 0, 0);
+    let mut ctx = context(&mut g);
+    let cf = Cf::SimpleBlock {
+        to: Bsp::Simple(reg.state_of("minecraft:small_dripleaf", None)),
+        on: vec![],
+        in_: vec![],
+        under: vec![],
+    };
+    gen_cf(
+        &cf,
+        freg(),
+        &mut ctx,
+        &mut Xor::seed_worldgen(11),
+        (0, 200, 0),
+    );
+    assert_eq!(ctx.wr.len(), 2);
+    assert_eq!(
+        reg.get_prop(ctx.get(0, 200, 0), "waterlogged").as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        reg.get_prop(ctx.get(0, 201, 0), "waterlogged").as_deref(),
+        Some("false")
+    );
+    assert!(!reg.is_double_plant(reg.state_of("minecraft:oak_stairs", None)));
+}
+
+#[test]
+fn mushrooms_in_fresh_generation_need_the_special_substrate() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    // The native fixture's uninitialized sky light reads 15 even under trees.
+    ctx.set(0, 202, 0, reg.state_of("minecraft:oak_leaves", None));
+    for (soil, expected) in [
+        ("dirt", false),
+        ("grass_block", false),
+        ("stone", false),
+        ("basalt", false),
+        ("podzol", true),
+        ("mycelium", true),
+    ] {
+        ctx.set(0, 199, 0, reg.state_of(&format!("minecraft:{soil}"), None));
+        for mushroom in ["minecraft:brown_mushroom", "minecraft:red_mushroom"] {
+            assert_eq!(
+                super::can_place(reg, &mut ctx, mushroom, 0, 200, 0),
+                expected,
+                "{soil} {mushroom}"
+            );
+        }
+    }
+}
+
+#[test]
+fn normal_cache_identity_survives_slot_reuse() {
+    use crate::generation_math::normal_new_amps;
+    let mut slot = Box::new(normal_new_amps(&mut Xor::seed(0), -4, &[1.0]));
+    let address = &*slot as *const _ as usize;
+    let first = slot.get(-982.0, -35.0, 520.0);
+    let next = normal_new_amps(&mut Xor::seed(1), -4, &[1.0]);
+    let expected = next.get(-982.0, -35.0, 520.0);
+    assert_ne!(first.to_bits(), expected.to_bits());
+    *slot = next;
+    assert_eq!(&*slot as *const _ as usize, address, "reuse the same slot");
+    assert_eq!(slot.get(-982.0, -35.0, 520.0).to_bits(), expected.to_bits());
+}
+
+#[test]
+fn normal_noise_legacy_source_matches_native_create() {
+    let cases: &[(i32, &[f64])] = &[
+        (-4, &[1.0]),
+        (-2, &[1.0, 0.5]),
+        (-3, &[1.0, 0.0, 0.25]),
+        (-2, &[0.0, 1.0]),
+        (1, &[1.0]),
+        (-2, &[0.0, 0.0]),
+    ];
+    let mut count = 0;
+    for row in include_str!("../tests/data/normal_noise_legacy_source_1211.tsv").lines() {
+        let f: Vec<_> = row.split('\t').collect();
+        let (first, amps) = cases[f[1].parse::<usize>().unwrap()];
+        let n = normal_new_l(f[0].parse().unwrap(), first, amps);
+        let got = n.get(
+            f[2].parse().unwrap(),
+            f[3].parse().unwrap(),
+            f[4].parse().unwrap(),
+        );
+        assert_eq!(
+            got.to_bits(),
+            u64::from_str_radix(f[5], 16).unwrap(),
+            "native NormalNoise.create: {row}"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 168);
+}
+
+/// Native OreFeature.place queried these 121 OCEAN_FLOOR_WG columns for
+/// (-1003,71,513), then skipped its vein. A neighbour's canopy must not cause
+/// the port to consume the 17 sphere-size draws that vanilla skipped.
+#[test]
+fn ore_uses_frozen_worldgen_floor() {
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let reg = breg().expect("blocks");
+    let fr = freg();
+    let mut ctx = context(&mut g);
+    // The actual failing trace read an earlier neighbour's oak leaf at y=70.
+    ctx.set(-1003, 70, 513, reg.state_of("minecraft:oak_leaves", None));
+    assert_eq!(ctx.hm_oc(-1003, 513), 71, "live floor sees the canopy");
+    let mut columns = 0;
+    for row in include_str!("../tests/data/ore_floor_wg_1211.tsv").lines() {
+        let v: Vec<i32> = row.split('\t').map(|s| s.parse().unwrap()).collect();
+        assert_eq!(ctx.hm_oc_wg(v[0], v[1]), v[2], "native WG floor at {row}");
+        columns += 1;
+    }
+    assert_eq!(columns, 121);
+    let mut expected = Xor::seed(0);
+    expected.next_f32();
+    expected.next_bound(3);
+    expected.next_bound(3);
+    let mut rng = Xor::seed(0);
+    let ore = Cf::Ore {
+        size: 17,
+        discard: 0.5,
+        targets: vec![(RT::True, reg.state_of("minecraft:coal_ore", None))],
+        scattered: false,
+    };
+    gen_cf(&ore, fr, &mut ctx, &mut rng, (-1003, 71, 513));
+    assert_eq!(
+        rng.next_long(),
+        expected.next_long(),
+        "native early-out RNG"
+    );
+    assert_eq!(ctx.wr.len(), 1, "vein must not run above the frozen floor");
+}
+
+/// The actual patch_grass_forest origins from neighbouring chunk (-64,33).
+/// Its 388 typed draws matched; only the parsed WORLD_SURFACE_WG height was
+/// wrong (+5 from the canopy), losing a grass cell in the target chunk.
+#[test]
+fn grass_patch_keeps_worldgen_heightmap_through_the_modifier() {
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let reg = breg().unwrap();
+    let mut ctx = context(&mut g);
+    let modifier = crate::generation_providers::p_mod(
+        &jparse(br#"{"type":"minecraft:heightmap","heightmap":"WORLD_SURFACE_WG"}"#).unwrap(),
+    )
+    .unwrap();
+    let pf = super::Pf {
+        feat: super::FRef::Name(String::new()),
+        mods: vec![],
+        name: String::new(),
+    };
+    let mut rows = 0;
+    for row in include_str!("../tests/data/grass_patch_floor_wg_1211.tsv").lines() {
+        let v: Vec<i32> = row.split('\t').map(|s| s.parse().unwrap()).collect();
+        ctx.set(
+            v[0],
+            v[1] + 4,
+            v[2],
+            reg.state_of("minecraft:oak_leaves", None),
+        );
+        assert_eq!(ctx.hm_ws(v[0], v[2]), v[1] + 5, "live canopy height");
+        let mut out = Vec::new();
+        super::mod_positions(
+            &modifier,
+            freg(),
+            &mut ctx,
+            &mut Xor::seed(0),
+            (v[0], 0, v[2]),
+            &pf,
+            &mut out,
+        );
+        assert_eq!(out, vec![(v[0], v[1], v[2])], "native patch origin: {row}");
+        rows += 1;
+    }
+    assert_eq!(rows, 2);
+}
+
+#[test]
+fn multiface_cells_and_following_rng_match_native() {
+    let reg = breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let water = reg.state_of("minecraft:water", None);
+    let flowing = reg.with_prop(water, "level", "8");
+    let leaves = reg.state_of("minecraft:oak_leaves", None);
+    let slab = reg.state_of("minecraft:oak_slab", None);
+    let lichen = reg.state_of("minecraft:glow_lichen", None);
+    let mut seen = std::collections::HashSet::new();
+    let mut spread_vectors = 0;
+    for row in include_str!("../tests/data/multiface_1211.tsv").lines() {
+        let f: Vec<_> = row.split('\t').collect();
+        assert_eq!(f.len(), 7, "{row}");
+        let kind: usize = f[0].parse().unwrap();
+        assert!(kind < 10);
+        let seed = f[1].parse::<i64>().unwrap() as u64;
+        let chance: f32 = f[2].parse().unwrap();
+        assert!(
+            seen.insert((kind, seed, chance.to_bits())),
+            "duplicate native case"
+        );
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        // Native asserts that every world read stays inside this controlled volume.
+        for x in -4i32..=4 {
+            for dy in -4i32..=4 {
+                for z in -4i32..=4 {
+                    let state = if kind == 9 && (x, dy, z) == (0, 0, 0) {
+                        lichen
+                    } else if kind == 0 || kind == 7 {
+                        if (x, dy, z) == (0, 0, 0) {
+                            air
+                        } else {
+                            stone
+                        }
+                    } else if x
+                        == match kind {
+                            2 => 2,
+                            3 => 3,
+                            _ => 1,
+                        }
+                    {
+                        match kind {
+                            5 => leaves,
+                            6 => slab,
+                            _ => stone,
+                        }
+                    } else {
+                        match kind {
+                            4 => water,
+                            8 => flowing,
+                            _ => air,
+                        }
+                    };
+                    g.feat_write(x, 200 + dy, z, state);
+                }
+            }
+        }
+        let on = match kind {
+            5 => "oak_leaves",
+            6 => "oak_slab",
+            _ => "stone",
+        };
+        let floor = if kind == 7 {
+            ",\"can_place_on_floor\":true"
+        } else {
+            ""
+        };
+        let json = format!(
+            r#"{{"type":"multiface_growth","block":"minecraft:glow_lichen","search_range":20,"can_place_on_ceiling":true,"can_place_on_wall":true,"chance_of_spreading":{chance},"can_be_placed_on":["minecraft:{on}"]{floor}}}"#
+        );
+        let cf = super::p_cf(&jparse(json.as_bytes()).unwrap()).unwrap();
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 200, 0));
+        assert_eq!(
+            !ctx.wr.is_empty(),
+            f[3].parse::<bool>().unwrap(),
+            "placed: {row}"
+        );
+        assert_eq!(
+            ctx.wr.len(),
+            f[4].parse::<usize>().unwrap(),
+            "writes: {row}"
+        );
+        spread_vectors += usize::from(ctx.wr.len() > 1);
+        let mut cells = Vec::new();
+        for (&(x, y, z), &state) in &ctx.wr {
+            assert_eq!(reg.name_of(state), "minecraft:glow_lichen");
+            let mut mask = 0u8;
+            for (i, p) in [
+                "down",
+                "up",
+                "north",
+                "south",
+                "west",
+                "east",
+                "waterlogged",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if reg.get_prop(state, p).as_deref() == Some("true") {
+                    mask |= 1 << i;
+                }
+            }
+            cells.push(format!("{x},{},{z}:{mask}\n", y - 200));
+        }
+        cells.sort();
+        let hash: String = crate::generation_math::md5(cells.concat().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hash, f[6], "cell/faces: {row}");
+        assert_eq!(
+            rng.next_i64(),
+            f[5].parse::<i64>().unwrap(),
+            "following RNG: {row}"
+        );
+    }
+    assert_eq!(seen.len(), 120);
+    assert!(spread_vectors > 0, "exercise spreading into another cell");
+}
+
+#[test]
+fn matching_fluids_reads_the_fluid_state_not_the_block_name() {
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let reg = breg().unwrap();
+    let water = reg.state_of("minecraft:water", None);
+    let lava = reg.state_of("minecraft:lava", None);
+    let stairs = reg.state_of("minecraft:oak_stairs", None);
+    let mut ctx = context(&mut g);
+    for (state, expected) in [
+        (reg.state_of("minecraft:stone", None), "minecraft:empty"),
+        (water, "minecraft:water"),
+        (
+            reg.with_prop(water, "level", "8"),
+            "minecraft:flowing_water",
+        ),
+        (reg.state_of("minecraft:seagrass", None), "minecraft:water"),
+        (
+            reg.state_of("minecraft:tall_seagrass", None),
+            "minecraft:water",
+        ),
+        (reg.state_of("minecraft:kelp", None), "minecraft:water"),
+        (
+            reg.with_prop(stairs, "waterlogged", "true"),
+            "minecraft:water",
+        ),
+        (
+            reg.with_prop(stairs, "waterlogged", "false"),
+            "minecraft:empty",
+        ),
+        (lava, "minecraft:lava"),
+        (reg.with_prop(lava, "level", "1"), "minecraft:flowing_lava"),
+    ] {
+        ctx.set(0, 200, 0, state);
+        for fluid in [
+            "minecraft:empty",
+            "minecraft:water",
+            "minecraft:flowing_water",
+            "minecraft:lava",
+            "minecraft:flowing_lava",
+        ] {
+            let json = format!(r#"{{"type":"matching_fluids","fluids":"{fluid}"}}"#);
+            let predicate =
+                crate::generation_providers::p_pred(&jparse(json.as_bytes()).unwrap()).unwrap();
+            assert_eq!(
+                test_pred(&predicate, reg, &mut ctx, 0, 200, 0),
+                fluid == expected,
+                "state={state}, wanted={fluid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn surface_relative_filter_keeps_its_heightmap_and_long_bounds() {
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let reg = breg().unwrap();
+    let mut ctx = context(&mut g);
+    let (x, z) = (-1003, 513);
+    let floor = ctx.hm_oc_wg(x, z);
+    ctx.set(x, 200, z, reg.state_of("minecraft:stone", None));
+    assert_eq!(ctx.hm_ws(x, z), 201);
+    let pf = super::Pf {
+        feat: super::FRef::Name(String::new()),
+        mods: vec![],
+        name: String::new(),
+    };
+    for (min, max, y, accept) in [
+        (i32::MIN, -13, floor - 13, true),
+        (i32::MIN, -13, floor - 12, false),
+        (i32::MAX, i32::MAX, i32::MAX, false),
+    ] {
+        let json = format!(
+            r#"{{"type":"surface_relative_threshold_filter","heightmap":"OCEAN_FLOOR_WG","min_inclusive":{min},"max_inclusive":{max}}}"#
+        );
+        let modifier =
+            crate::generation_providers::p_mod(&jparse(json.as_bytes()).unwrap()).unwrap();
+        let mut out = Vec::new();
+        super::mod_positions(
+            &modifier,
+            freg(),
+            &mut ctx,
+            &mut Xor::seed(0),
+            (x, y, z),
+            &pf,
+            &mut out,
+        );
+        assert_eq!(!out.is_empty(), accept, "{json}, y={y}");
+    }
+}
+
+#[test]
+fn heightmap_types_keep_their_predicates_and_removed_tops() {
+    use crate::block_registry::HeightmapKind as H;
+    let reg = breg().unwrap();
+    for (name, expected) in [
+        ("minecraft:short_grass", [true, false, false, false]),
+        ("minecraft:water", [true, false, true, true]),
+        ("minecraft:oak_leaves", [true, true, true, false]),
+        ("minecraft:stone", [true, true, true, true]),
+    ] {
+        let state = reg.state_of(name, None);
+        for (kind, counts) in [
+            H::WorldSurface,
+            H::OceanFloor,
+            H::MotionBlocking,
+            H::MotionBlockingNoLeaves,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert_eq!(reg.heightmap_counts(state, kind), counts, "{name} {kind:?}");
+        }
+    }
+    assert!(!reg.is_solid_render(reg.state_of("minecraft:tinted_glass", None)));
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let mut ctx = context(&mut g);
+    for (y, name) in [
+        (220, "stone"),
+        (221, "oak_leaves"),
+        (222, "water"),
+        (223, "short_grass"),
+    ] {
+        ctx.set(0, y, 0, reg.state_of(&format!("minecraft:{name}"), None));
+    }
+    for (kind, expected) in [
+        (H::WorldSurface, 224),
+        (H::OceanFloor, 222),
+        (H::MotionBlocking, 223),
+        (H::MotionBlockingNoLeaves, 223),
+    ] {
+        assert_eq!(ctx.heightmap(kind, 0, 0), expected, "{kind:?}");
+    }
+    // A maximum is a scan bound, not a permanent answer after another writer.
+    ctx.set(0, 223, 0, 0);
+    ctx.set(0, 222, 0, 0);
+    assert_eq!(ctx.heightmap(H::WorldSurface, 0, 0), 222);
+    assert_eq!(ctx.heightmap(H::MotionBlockingNoLeaves, 0, 0), 221);
+    ctx.set(0, 221, 0, 0);
+    assert_eq!(ctx.hm_oc(0, 0), 221);
+    assert_eq!(ctx.hm_ws(0, 0), 221);
+    for name in [
+        "WORLD_SURFACE_WG",
+        "WORLD_SURFACE",
+        "OCEAN_FLOOR_WG",
+        "OCEAN_FLOOR",
+        "MOTION_BLOCKING",
+        "MOTION_BLOCKING_NO_LEAVES",
+    ] {
+        let parsed = crate::generation_providers::p_mod(
+            &jparse(format!(r#"{{"type":"heightmap","heightmap":"{name}"}}"#).as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(parsed, crate::generation_providers::PM::Heightmap(h) if h == H::parse(name).unwrap())
+        );
+    }
+    assert!(crate::generation_providers::p_mod(
+        &jparse(br#"{"type":"heightmap","heightmap":"UNKNOWN_FLOOR"}"#).unwrap()
+    )
+    .is_none());
+}
+
 /// Pin how much randomness a provider consumed, without pinning platform libm's
 /// last bit: draw one Gaussian (so its spare is populated and later consumed),
 /// then record two raw draws. A provider that draws a different number of times
@@ -405,7 +1070,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
         }
     }
     // `UPDATE_BASELINE=1` re-records the fixture after a *verified* correction
-    // (the height providers now follow ehz/eib/ehv and below_top is off by one).
+    // (height providers and legacy-source NormalNoise have independent native vectors).
     if std::env::var("UPDATE_BASELINE").is_ok() {
         std::fs::write(
             "evidence/foundation/module-layers/provider-baseline.bin",
@@ -422,7 +1087,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
 }
 
 #[test]
-fn context_overrides_heights_bounds_and_biomes_keep_existing_results() {
+fn context_overrides_heights_bounds_and_biomes_track_live_state() {
     let mut g = Gen::load(0, crate::name_to_state).unwrap();
     let reg = breg().unwrap();
     let stone = reg.state_of("stone", None);
@@ -450,8 +1115,8 @@ fn context_overrides_heights_bounds_and_biomes_keep_existing_results() {
     assert_eq!(ctx.hm_oc(x, z), y + 1);
     ctx.set(x, y + 2, z, 0);
     assert_eq!(ctx.get(x, y + 2, z), 0);
-    // Existing monotonic height overrides intentionally survive an air overwrite.
-    assert_eq!(ctx.hm_ws(x, z), y + 3);
+    // Removing the water top reveals the stone again, like native Heightmap.update.
+    assert_eq!(ctx.hm_ws(x, z), y + 1);
     assert_eq!(ctx.hm_oc(x, z), y + 1);
     assert_eq!(ctx.biome(x, y, z), biome);
     assert_eq!(ctx.biome(x, y, z), biome);

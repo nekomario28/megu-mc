@@ -10,6 +10,7 @@
 // `evidence/foundation/provenance/`).
 
 use crate::block_registry::BReg;
+use crate::generation_leaf_queue::LeafQueue;
 use crate::generation_math::Xor;
 use crate::json::J;
 
@@ -2020,7 +2021,9 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
     update_leaves(ctx, &logs, &root_positions, &foliage);
     true
 }
-/// BFS leaf `distance` propagation — vanilla TreeFeature.updateLeaves
+/// Native TreeFeature.updateLeaves, not a global shortest-path relaxation.
+/// Only this tree's trunk writes seed bucket zero. Roots are already visited;
+/// foreign logs/leaves are discovered through neighbours, not independently seeded.
 fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) {
     if logs.is_empty() && foliage.is_empty() {
         return;
@@ -2050,90 +2053,58 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) {
         }
         Some(((p.0 - min.0) as usize * ys + (p.1 - min.1) as usize) * zs + (p.2 - min.2) as usize)
     };
-    // Deterministic multi-source shortest-path propagation (label correcting):
-    // logs/roots seed 0; leaves seed their stored `distance` (fresh=7, foreign
-    // trees may have written less); each cell converges to min distance, so the
-    // result is independent of queue/iteration order (Rust HashSet order is
-    // randomized per instance — vanilla's Java HashSet order is fixed).
-    const KIND_BLOCK: u8 = 0; // non-log, non-leaf (includes roots)
-    const KIND_LOG: u8 = 1;
-    const KIND_LEAF: u8 = 2;
-    let n = xs * ys * zs;
-    let mut kind = vec![KIND_BLOCK; n];
-    let mut best = vec![u16::MAX; n];
-    let mut queue: std::collections::VecDeque<(usize, u16)> = std::collections::VecDeque::new();
-    for y in min.1..=max.1 {
-        for x in min.0..=max.0 {
-            for z in min.2..=max.2 {
-                let Some(i) = idx((x, y, z)) else { continue };
-                let st = ctx.get(x, y, z);
-                if reg.in_tag(st, "minecraft:logs") {
-                    kind[i] = KIND_LOG;
-                    if best[i] > 0 {
-                        best[i] = 0;
-                        queue.push_back((i, 0));
-                    }
-                } else if reg.in_tag(st, "minecraft:leaves") {
-                    kind[i] = KIND_LEAF;
-                    let dd = reg
-                        .get_prop(st, "distance")
-                        .and_then(|v| v.parse::<u16>().ok())
-                        .unwrap_or(7);
-                    if dd < best[i] {
-                        best[i] = dd;
-                        queue.push_back((i, dd));
-                    }
-                }
-            }
+    let mut visited = vec![false; xs * ys * zs];
+    for &p in roots {
+        if let Some(i) = idx(p) {
+            visited[i] = true;
         }
     }
-    for p in roots {
-        if let Some(i) = idx(*p) {
-            kind[i] = KIND_BLOCK;
-            best[i] = u16::MAX;
-        }
+    // Native first collects trunk writes in a HashSet, then adds that set to
+    // bucket zero; the two insertion/iteration steps are separately observable.
+    let mut trunks = LeafQueue::new();
+    for &p in logs {
+        trunks.insert(p);
     }
-    while let Some((i, d)) = queue.pop_front() {
-        if d > best[i] {
-            continue; // stale entry — a shorter path already recorded
+    let mut buckets: Vec<_> = (0..7).map(|_| LeafQueue::new()).collect();
+    while let Some(p) = trunks.pop() {
+        buckets[0].insert(p);
+    }
+    let mut depth = 0;
+    while depth < 7 {
+        let Some(p) = buckets[depth].pop() else {
+            depth += 1;
+            continue;
+        };
+        let Some(i) = idx(p) else { continue };
+        // Native does not skip an already visited popped entry: a position
+        // can have been queued in multiple buckets and be written again.
+        if depth != 0 {
+            let st = ctx.get(p.0, p.1, p.2);
+            ctx.set(
+                p.0,
+                p.1,
+                p.2,
+                reg.with_prop(st, "distance", &depth.to_string()),
+            );
         }
-        // cell center -> absolute pos
-        let cz = min.2 + (i % zs) as i32;
-        let cy = min.1 + ((i / zs) % ys) as i32;
-        let cx = min.0 + (i / (zs * ys)) as i32;
-        for di in 0..6u8 {
-            let (ox, oy, oz) = dir_off(di);
-            let np = (cx + ox, cy + oy, cz + oz);
-            let Some(ni) = idx(np) else { continue };
-            if kind[ni] == KIND_BLOCK {
+        visited[i] = true;
+        for dir in 0..6 {
+            let (dx, dy, dz) = dir_off(dir);
+            let n = (p.0 + dx, p.1 + dy, p.2 + dz);
+            let Some(j) = idx(n) else { continue };
+            if visited[j] {
                 continue;
             }
-            let nd = (d + 1).min(7);
-            if nd < best[ni] {
-                best[ni] = nd;
-                queue.push_back((ni, nd));
-            }
-        }
-    }
-    // write back: leaves with a converged distance < stored
-    for y in min.1..=max.1 {
-        for x in min.0..=max.0 {
-            for z in min.2..=max.2 {
-                let Some(i) = idx((x, y, z)) else { continue };
-                if kind[i] != KIND_LEAF {
-                    continue;
-                }
-                let st = ctx.get(x, y, z);
-                if !reg.has_prop(reg.name_of(st), "distance") {
-                    continue;
-                }
-                let cur = reg
-                    .get_prop(st, "distance")
-                    .and_then(|v| v.parse::<u16>().ok())
-                    .unwrap_or(7);
-                if best[i] < cur && best[i] >= 1 {
-                    ctx.set(x, y, z, reg.with_prop(st, "distance", &best[i].to_string()));
-                }
+            let st = ctx.get(n.0, n.1, n.2);
+            let Some(d) = reg.distance_from_log(st) else {
+                continue;
+            };
+            let next = (d as usize).min(depth + 1);
+            if next < 7 {
+                buckets[next].insert(n);
+                // This cursor changes inside the direction loop in native
+                // bytecode; later neighbours use its new value.
+                depth = depth.min(next);
             }
         }
     }
@@ -2398,6 +2369,122 @@ mod tests {
 
     fn state(name: &str) -> u32 {
         crate::name_to_state(name).unwrap_or_else(|| panic!("{name} must exist"))
+    }
+
+    #[test]
+    fn leaf_updates_match_native_buckets_before_runtime_ticks() {
+        fn point(s: &str) -> P3 {
+            let a: Vec<i32> = s.split(',').map(|s| s.parse().unwrap()).collect();
+            assert_eq!(a.len(), 3);
+            (a[0], a[1], a[2])
+        }
+        fn positions(s: &str, origin: P3) -> Vec<P3> {
+            s.split(';')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let p = point(s);
+                    (p.0 + origin.0, p.1 + origin.1, p.2 + origin.2)
+                })
+                .collect()
+        }
+        let reg = breg().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for row in include_str!("../tests/data/leaf_distance_1211.tsv").lines() {
+            let f: Vec<_> = row.split('\t').collect();
+            assert_eq!(f.len(), 10);
+            assert!(seen.insert((f[0], f[1])), "duplicate native vector");
+            let origin = point(f[1]);
+            let min = positions(f[2], origin)[0];
+            let max = positions(f[3], origin)[0];
+            let logs = positions(f[4], origin);
+            let blocked = positions(f[5], origin);
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            for x in min.0..=max.0 {
+                for y in min.1..=max.1 {
+                    for z in min.2..=max.2 {
+                        g.feat_write(x, y, z, 0);
+                    }
+                }
+            }
+            for cell in f[6].split(';') {
+                let (pos, kind) = cell.split_once(':').unwrap();
+                let p = positions(pos, origin)[0];
+                let st = match kind {
+                    "T" => reg.state_of("minecraft:oak_log", None),
+                    "S" => reg.state_of("minecraft:stone", None),
+                    _ if kind.starts_with('C') => reg.with_prop(
+                        reg.state_of("minecraft:scaffolding", None),
+                        "distance",
+                        &kind[1..],
+                    ),
+                    _ => {
+                        let mut st = reg.state_of("minecraft:oak_leaves", None);
+                        st = reg.with_prop(st, "distance", &kind[1..]);
+                        st = reg.with_prop(
+                            st,
+                            "persistent",
+                            if kind.starts_with(['P', 'B']) {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                        );
+                        reg.with_prop(
+                            st,
+                            "waterlogged",
+                            if kind.starts_with(['W', 'B']) {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                        )
+                    }
+                };
+                g.feat_write(p.0, p.1, p.2, st);
+            }
+            let mut ctx = FC::new(&mut g);
+            // updateLeaves receives this exact box; the two foliage boundary
+            // positions only define its extent and are not placements.
+            update_leaves(&mut ctx, &logs, &blocked, &[min, max]);
+            for cell in f[7].split(';') {
+                let (pos, kind) = cell.split_once(':').unwrap();
+                let p = positions(pos, origin)[0];
+                let st = ctx.get(p.0, p.1, p.2);
+                assert_eq!(
+                    reg.get_prop(st, "distance").as_deref(),
+                    Some(&kind[1..]),
+                    "native vector {} at {pos}",
+                    f[0]
+                );
+                assert_eq!(
+                    reg.get_prop(st, "persistent").as_deref(),
+                    Some(if kind.starts_with(['P', 'B']) {
+                        "true"
+                    } else {
+                        "false"
+                    })
+                );
+                assert_eq!(
+                    reg.get_prop(st, "waterlogged").as_deref(),
+                    Some(if kind.starts_with(['W', 'B']) {
+                        "true"
+                    } else {
+                        "false"
+                    })
+                );
+            }
+            assert_eq!(
+                ctx.wr.len(),
+                f[8].parse::<usize>().unwrap(),
+                "native write coverage {}",
+                f[0]
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            117,
+            "native leaf vectors must not be empty/truncated"
+        );
     }
 
     #[test]

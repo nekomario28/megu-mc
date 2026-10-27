@@ -22,6 +22,7 @@ use chunk_ack::ChunkFeedback;
 mod block_registry;
 mod feature;
 mod generation_context;
+mod generation_leaf_queue;
 mod generation_math;
 mod generation_providers;
 mod ingress_guard;
@@ -21511,6 +21512,31 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            if let Ok(order_path) = std::env::var("MC_SPINE_POP_ORDER") {
+                let fail = |message: String| -> ! {
+                    eprintln!("[wgdump] population plan: {message}");
+                    std::process::exit(2);
+                };
+                if std::env::var_os("MC_SPINE_POP_REGION").is_some() {
+                    fail(
+                        "MC_SPINE_POP_ORDER and MC_SPINE_POP_REGION are mutually exclusive".into(),
+                    );
+                }
+                let text = std::fs::read_to_string(&order_path)
+                    .unwrap_or_else(|error| fail(format!("{order_path}: {error}")));
+                let order = worldgen::parse_population_order(&text, ox, oz, n)
+                    .unwrap_or_else(|error| fail(error));
+                let requested = order.len();
+                let executed =
+                    worldgen::with_gen(|g| g.populate_in_order(order, feature::populate))
+                        .unwrap_or_else(|| fail("generator not initialized".into()));
+                if executed != requested {
+                    fail(format!("{executed} of {requested} chunks executed; plan overlaps prior population (use MC_SPINE_WG_PROFILE=0)"));
+                }
+                eprintln!(
+                    "[wgdump] population plan {order_path}: {executed} source chunks executed"
+                );
+            }
             let (lo, hi) = (worldgen::min_y(), worldgen::max_y());
             let mut out: Vec<u8> = Vec::new();
             let t1 = Instant::now();

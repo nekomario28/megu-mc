@@ -275,16 +275,11 @@ check "the tree path uses the clip decision" \
 check "lazy feature lookup applies its population input and retains cached overrides" \
   src/worldgen.rs '            for sx in x0..=x1 {
                 for sz in z0..=z1 {
-                    if !self.pop_done.contains(&(sx, sz)) {
-                        self.pop_done.insert((sx, sz));
-                        populate(self, sx, sz);
-                    }' \
+                    self.populate_in_order([(sx, sz)], &mut populate);' \
   '            for sx in x0..=x1 {
                 for sz in z0..=z1 {
-                    if !self.pop_done.contains(&(sx, sz)) {
-                        self.pop_done.insert((sx, sz));
-                        let _ = (&mut populate, sx, sz);
-                    }' \
+                    self.pop_done.insert((sx, sz));
+                    let _ = (&mut populate, sx, sz);'  \
   worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides
 check "a placed gravity block is scheduled by its own cell" \
   src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {' \
@@ -503,6 +498,42 @@ check "placement modifiers advance positions in vanilla's draw order" \
   '            let z = pos.2 + rng.next_bound(16);
             let x = pos.0 + rng.next_bound(16);' \
   feature_population_output_matches_the_pre_refactor_capture
+check "certain air-exposure discard still places buried ore without an RNG draw" \
+  src/feature.rs '    if discard < 1.0 && r.next_f32() >= discard {' \
+  '    if discard >= 1.0 { return false; }
+    if r.next_f32() >= discard {' \
+  ore_air_exposure_matches_native_decisions_and_rng
+# Native feature-contract guards; select this group with
+# MUTATION_FILTER=feature::generation_contract_tests::
+check "ore early-out reads the frozen worldgen floor" \
+  src/feature.rs '            if o <= ctx.hm_oc_wg(xp, zp) {' \
+  '            if o <= ctx.hm_oc(xp, zp) {' \
+  feature::generation_contract_tests::ore_uses_frozen_worldgen_floor
+check "surface-relative placement keeps its configured heightmap" \
+  src/feature.rs '            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));' \
+  '            let y = i64::from(ctx.hm_ws(pos.0, pos.2));' \
+  feature::generation_contract_tests::surface_relative_filter_keeps_its_heightmap_and_long_bounds
+check "dungeon loot uses the wrapped nextLong method" \
+  src/feature.rs '                            let _loot_seed = rng.next_i64();' \
+  '                            let _loot_seed = rng.next_long();' \
+  feature::generation_contract_tests::monster_room_cells_and_rng_match_native
+check "simple double plants write both halves" \
+  src/feature.rs '                    for (dy, half) in [(0, "lower"), (1, "upper")] {' \
+  '                    for (dy, half) in [(0, "lower")] {' \
+  feature::generation_contract_tests::simple_block_places_both_halves_or_neither
+check "fresh-generation mushrooms do not infer shade from a canopy" \
+  src/generation_providers.rs '            reg.in_tag(below, "minecraft:mushroom_grow_block")' \
+  '            is_dirtish(reg, below)' \
+  feature::generation_contract_tests::mushrooms_in_fresh_generation_need_the_special_substrate
+check "matching_fluids uses the fluid rather than block type" \
+  src/generation_providers.rs '            let f = reg.fluid_name(st);' \
+  '            let f = reg.name_of(st);' \
+  feature::generation_contract_tests::matching_fluids_reads_the_fluid_state_not_the_block_name
+check "multiface growth performs native spreading" \
+  src/feature.rs '        if rng.next_f32() < cfg.spread {' \
+  '        if rng.next_f32() < 0.0 {' \
+  feature::generation_contract_tests::multiface_cells_and_following_rng_match_native
+
 check "the ore vein radius matches vanilla's own output" \
   src/feature.rs '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \
   '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0 + 0.01;' \
@@ -656,8 +687,8 @@ check "an ice spike is built out of packed ice" \
   ice_spike_builds_a_tapering_spike_on_snow
 
 check "the heightmap a feature reads is the floor the blocks are at" \
-  src/generation_context.rs '        let terrain = self.heightmap_above(x, z, start, base, false);' \
-  '        let terrain = base;' \
+  src/generation_context.rs '        self.heightmap_above(x, z, start, kind)' \
+  '        base' \
   heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface
 
 check "the projectile sweep retains start-inside contact" \

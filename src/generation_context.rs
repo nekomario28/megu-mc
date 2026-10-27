@@ -2,7 +2,7 @@
 // Gen plus the write-through overrides and caches the placement evaluators see.
 // It owns no datapack types and no feature/tree logic.
 
-use crate::block_registry::breg;
+use crate::block_registry::{breg, HeightmapKind};
 use crate::worldgen::Gen;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +68,16 @@ impl<'a> FC<'a> {
         st
     }
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
+        if crate::trace_env::env_str!("FEATURE_CELL_TRACE")
+            .is_some_and(|want| want.split(';').any(|cell| cell == format!("{x},{y},{z}")))
+        {
+            let f = crate::generation_math::XTRACE_FEAT.load(Ordering::Relaxed);
+            eprintln!(
+                "FCELL {x} {y} {z} state={st} feature={},{}",
+                f >> 32,
+                f & 0xFFFF
+            );
+        }
         self.wr.insert((x, y, z), st);
         // the heightmap lives on `Gen` so that a write for this chunk is visible to
         // the next chunk's placements too (vanilla updates the owning chunk's
@@ -82,51 +92,66 @@ impl<'a> FC<'a> {
         let st = self.get(x, y, z);
         breg().map(|r| r.is_air(st)).unwrap_or(st == 0)
     }
-    /// The topmost cell of a column that the heightmap counts, searching down from
-    /// `from` and stopping at `base` (the density top, which is solid by
-    /// construction, so `base` is returned when nothing above it counts).
-    ///
-    /// This is not the density top, and that is the point: vanilla maintains
-    /// `OCEAN_FLOOR_WG`/`WORLD_SURFACE_WG` from every `setBlock` during terrain, so a
-    /// solid the aquifer pushes *above* the noise surface belongs to it. The port's
-    /// basis was the density top, which reads the floor too low wherever that
-    /// happens - measured on the kelp fixture: cell (1264,33,-16) is stone in the
-    /// port's own dump and sand in vanilla's, while the density top is 18, and 329 of
-    /// the 9216 columns in that region read the floor below the block that is there.
-    /// `fluid` selects the predicate: `OCEAN_FLOOR` counts motion-blocking blocks
-    /// only, `WORLD_SURFACE` also counts a fluid cell.
-    fn heightmap_above(&mut self, x: i32, z: i32, from: i32, base: i32, fluid: bool) -> i32 {
+    /// Read the first available Y using the native type's state predicate.
+    /// WG maps freeze before CARVERS; live maps also see carver/feature writes.
+    /// Aquifers can push a solid above the density top (329/9216 columns on the
+    /// kelp fixture), so the density top alone is not a heightmap. Conversely,
+    /// a removed top must be scanned down, not retained as a max-only result.
+    fn heightmap_above(&mut self, x: i32, z: i32, from: i32, kind: HeightmapKind) -> i32 {
         let reg = breg();
-        let mut y = from;
-        while y >= base {
-            let st = self.get(x, y, z);
-            let counts = reg
-                .map(|r| r.is_solid(st) || (fluid && r.is_liquid(st)))
-                .unwrap_or(false);
-            if counts {
+        let terrain = if kind.is_wg() {
+            self.g.cols(x >> 4, z >> 4)
+        } else {
+            None
+        };
+        let mut y = from.min(self.g.min_y + self.g.height - 1);
+        while y >= self.g.min_y {
+            let st = if kind.is_wg() {
+                terrain
+                    .as_ref()
+                    .map_or(0, |c| self.g.terrain_cell(c, x, y, z))
+            } else {
+                self.get(x, y, z)
+            };
+            if reg.is_some_and(|r| r.heightmap_counts(st, kind)) {
                 return y + 1;
             }
             y -= 1;
         }
-        base
+        self.g.min_y
+    }
+    pub(crate) fn heightmap(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
+        let ws = matches!(
+            kind,
+            HeightmapKind::WorldSurface | HeightmapKind::WorldSurfaceWg
+        );
+        let base = if ws {
+            self.g.top_ws(x, z)
+        } else {
+            self.g.top_oc(x, z)
+        };
+        let mut start = base.max(self.g.sea + 1);
+        if !kind.is_wg() {
+            // The tracked maxima are scan bounds, not answers: a later writer
+            // may have removed that cell or a different predicate may reject it.
+            start = start.max(self.g.feature_height(x, z, 0));
+        }
+        self.heightmap_above(x, z, start, kind)
     }
     pub(crate) fn hm_ws(&mut self, x: i32, z: i32) -> i32 {
-        let base = self.g.top_ws(x, z);
-        let start = base.max(self.g.sea + 1);
-        let terrain = self.heightmap_above(x, z, start, base, true);
-        self.g.feature_height(x, z, 0).max(terrain)
+        self.heightmap(HeightmapKind::WorldSurface, x, z)
     }
-    /// The terrain part of `hm_oc`, without the feature layer.
+    /// Live reads, but without extending the scan bound to feature maxima.
+    /// Kept for the terrain-vs-feature heightmap diagnostic and kelp probes.
     pub(crate) fn hm_oc_terrain(&mut self, x: i32, z: i32) -> i32 {
         let base = self.g.top_oc(x, z);
-        let start = base.max(self.g.sea + 1);
-        self.heightmap_above(x, z, start, base, false)
+        self.heightmap_above(x, z, base.max(self.g.sea + 1), HeightmapKind::OceanFloor)
+    }
+    pub(crate) fn hm_oc_wg(&mut self, x: i32, z: i32) -> i32 {
+        self.heightmap(HeightmapKind::OceanFloorWg, x, z)
     }
     pub(crate) fn hm_oc(&mut self, x: i32, z: i32) -> i32 {
-        let base = self.g.top_oc(x, z);
-        let start = base.max(self.g.sea + 1);
-        let terrain = self.heightmap_above(x, z, start, base, false);
-        self.g.feature_height(x, z, 1).max(terrain)
+        self.heightmap(HeightmapKind::OceanFloor, x, z)
     }
     /// `LevelReader.getBiome(BlockPos)`, i.e. `BiomeManager.getBiome` — the
     /// *blended* biome, and the one vanilla's `BiomeFilter` reads. It is not the

@@ -2257,6 +2257,57 @@ pub fn enabled() -> bool {
 /// states, which is generation-context knowledge), so they come through here
 /// instead of reaching for the static - a free function in worldgen would make
 /// worldgen depend on generation_context and close a cycle.
+/// Validate an explicit FEATURES plan for a dump's one-chunk decoration halo.
+/// No entries are silently dropped or reordered; ticket order is caller input.
+pub(crate) fn parse_population_order(
+    text: &str,
+    ox: i32,
+    oz: i32,
+    n: i32,
+) -> Result<Vec<(i32, i32)>, String> {
+    if n <= 0 {
+        return Err("dump size must be positive".into());
+    }
+    let width = n.checked_add(2).ok_or("population footprint overflow")? as usize;
+    let expected = width
+        .checked_mul(width)
+        .ok_or("population footprint overflow")?;
+    let x0 = ox.checked_sub(1).ok_or("population coordinate overflow")?;
+    let z0 = oz.checked_sub(1).ok_or("population coordinate overflow")?;
+    let x1 = ox.checked_add(n).ok_or("population coordinate overflow")?;
+    let z1 = oz.checked_add(n).ok_or("population coordinate overflow")?;
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    for (i, line) in text.lines().enumerate() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 2 {
+            return Err(format!("population line {} needs x z: {line:?}", i + 1));
+        }
+        let x = fields[0]
+            .parse::<i32>()
+            .map_err(|_| format!("invalid population x on line {}: {line:?}", i + 1))?;
+        let z = fields[1]
+            .parse::<i32>()
+            .map_err(|_| format!("invalid population z on line {}: {line:?}", i + 1))?;
+        if x < x0 || x > x1 || z < z0 || z > z1 {
+            return Err(format!(
+                "population chunk ({x},{z}) is outside ({x0},{z0})..({x1},{z1})"
+            ));
+        }
+        if !seen.insert((x, z)) {
+            return Err(format!(
+                "duplicate population chunk ({x},{z}) on line {}",
+                i + 1
+            ));
+        }
+        order.push((x, z));
+    }
+    if order.len() != expected {
+        return Err(format!("incomplete population footprint: {} of {expected} source chunks in ({x0},{z0})..({x1},{z1})",order.len()));
+    }
+    Ok(order)
+}
+
 pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
     GEN.lock().unwrap().as_mut().map(f)
 }
@@ -2748,28 +2799,20 @@ impl Gen {
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) -> Option<u32> {
         let (cx, cz) = (x >> 4, z >> 4);
-        // Decoration order. Vanilla decorates a chunk when the ticket order reaches
-        // it; for a world's spawn area that is a lexicographic scan of a square around
-        // the spawn, so a chunk sees the canopies of everything *earlier* in that scan
-        // and nothing else. `MC_SPINE_POP_REGION=x0,z0,x1,z1` reproduces that order
-        // (which the fixture compares against); the default decorates this chunk's 3x3
-        // relatively, which is what a single-chunk read does.
+        // Order is an input: vanilla's ticket scheduler is not a coordinate
+        // sort. POP_REGION is a legacy lexicographic scan; the default is a
+        // lazy local 3x3. Neither claims to emulate tickets. Offline callers
+        // can prepopulate an observed plan through the same execution owner.
         if let Some((px0, pz0, px1, pz1)) = self.pop_region {
             for sx in px0..=px1 {
                 for sz in pz0..=pz1 {
                     if (sx, sz) > (cx, cz) {
                         break;
                     }
-                    if !self.pop_done.contains(&(sx, sz)) {
-                        self.pop_done.insert((sx, sz));
-                        populate(self, sx, sz);
-                    }
+                    self.populate_in_order([(sx, sz)], &mut populate);
                 }
             }
-            if !self.pop_done.contains(&(cx, cz)) {
-                self.pop_done.insert((cx, cz));
-                populate(self, cx, cz);
-            }
+            self.populate_in_order([(cx, cz)], &mut populate);
         } else {
             let nbr = env_str!("MC_SPINE_FEAT_NBR")
                 .map(|v| v != "0")
@@ -2778,10 +2821,7 @@ impl Gen {
             let (z0, z1) = if nbr { (cz - 1, cz + 1) } else { (cz, cz) };
             for sx in x0..=x1 {
                 for sz in z0..=z1 {
-                    if !self.pop_done.contains(&(sx, sz)) {
-                        self.pop_done.insert((sx, sz));
-                        populate(self, sx, sz);
-                    }
+                    self.populate_in_order([(sx, sz)], &mut populate);
                 }
             }
         }
@@ -2853,6 +2893,22 @@ impl Gen {
         arc
     }
 
+    /// Claim before executing each source chunk, exactly once in caller order.
+    pub(crate) fn populate_in_order(
+        &mut self,
+        order: impl IntoIterator<Item = (i32, i32)>,
+        mut populate: impl FnMut(&mut Gen, i32, i32),
+    ) -> usize {
+        let mut executed = 0;
+        for (x, z) in order {
+            if self.pop_done.insert((x, z)) {
+                populate(self, x, z);
+                executed += 1;
+            }
+        }
+        executed
+    }
+
     /// Populate the 3x3 around a chunk if it has not been populated yet, so a
     /// diagnostic reads the same feature-layer state a generation loop would. The
     /// driver is passed in, as at every other call site here: the choice of
@@ -2863,13 +2919,10 @@ impl Gen {
         cz: i32,
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) {
-        for dx in -1..=1 {
-            for dz in -1..=1 {
-                if !self.pop_done.contains(&(cx + dx, cz + dz)) {
-                    populate(self, cx + dx, cz + dz);
-                }
-            }
-        }
+        self.populate_in_order(
+            (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))),
+            &mut populate,
+        );
     }
 
     /// Highest non-air (`0`) / solid (`1`) feature-written block + 1 in a column.
@@ -4101,7 +4154,21 @@ mod wg_tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap()
+        TEST_LOCK.lock().unwrap_or_else(|poison| {
+            // This mutex only serializes tests; it protects no recoverable data.
+            TEST_LOCK.clear_poison();
+            poison.into_inner()
+        })
+    }
+    #[test]
+    fn poisoned_test_lock_does_not_cascade() {
+        let failed = std::panic::catch_unwind(|| {
+            let _guard = lock_gen();
+            panic!("intentional test failure");
+        });
+        assert!(failed.is_err());
+        let _guard = lock_gen();
+        assert!(!TEST_LOCK.is_poisoned());
     }
     #[test]
     fn pinned_biome_tree_uses_only_biomes_from_its_jar() {
@@ -6209,6 +6276,40 @@ mod wg_tests {
     }
 
     #[test]
+    fn ordered_population_claims_once_without_reordering_callbacks() {
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        let mut seen = Vec::new();
+        let count = g.populate_in_order([(2, 1), (-3, 4), (2, 1)], |g, x, z| {
+            assert!(g.pop_done.contains(&(x, z)), "claim precedes callback");
+            seen.push((x, z));
+        });
+        assert_eq!(seen, [(2, 1), (-3, 4)]);
+        assert_eq!(count, 2);
+        assert_eq!(
+            g.populate_in_order([(2, 1), (-3, 4)], |_, _, _| panic!("already populated")),
+            0
+        );
+    }
+
+    #[test]
+    fn population_plan_preserves_order_and_rejects_incomplete_or_dropped_inputs() {
+        let wanted: Vec<_> = (-1..=1)
+            .rev()
+            .flat_map(|x| (-1..=1).rev().map(move |z| (x, z)))
+            .collect();
+        let text: String = wanted.iter().map(|(x, z)| format!("{x}\t{z}\n")).collect();
+        assert_eq!(parse_population_order(&text, 0, 0, 1).unwrap(), wanted);
+        for input in ["", "0 0\n0 0\n", "0 0\n1\n", "unknown 0\n", "9 9\n"] {
+            assert!(
+                parse_population_order(input, 0, 0, 1).is_err(),
+                "must reject {input:?}"
+            );
+        }
+        assert!(parse_population_order(&text, 0, 0, 0).is_err());
+        assert!(parse_population_order(&text, i32::MIN, 0, 1).is_err());
+    }
+
+    #[test]
     fn feature_population_output_matches_the_pre_refactor_capture() {
         let _guard = lock_gen();
         // Unlike the lazy-vs-direct comparison, this pins the values against a
@@ -6346,9 +6447,21 @@ mod wg_tests {
         // vanilla's CARVERS -> FEATURES order; the dungeon that required a
         // hole in chunk z+1 now places, and the full-feature target moved
         // 382 -> 114.
+        // OreFeature's discard=1 still places buried ore (no RNG draw before
+        // checking neighbours). Native decision/RNG vectors pin the correction;
+        // forest target no-tick differences fall 53 -> 30, all 23 changed cells
+        // becoming matching diamond/lapis ore. See forest-r1/ore-air.md.
+        // Frozen WG heights, normal noise, wrapped dungeon RNG, fluid predicates
+        // and multiface spreading have independent native fixtures.
+        // 2026-10-27: leaf distances now follow actual TreeFeature buckets,
+        // including Java HashSet traversal, rather than global shortest paths.
+        // 117 native leaf cases and 15 actual HashSet operation cases pin that
+        // behavior. With explicit source order, the production dump matches all
+        // 884736 cells of the paused native 3x3, without property exclusions.
+        // Saved-world runtime differences remain separate: feature-contracts.md.
         assert_eq!(
-            digest, "95fa4397cc1e760f0a0454b06cb502cb",
-            "feature population output changed from the post-carver-visibility capture"
+            digest, "de36bbeffefbcfa49355f3b4c6e95f5d",
+            "feature population output changed from the native feature-contract capture"
         );
     }
 

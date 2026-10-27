@@ -126,7 +126,7 @@ enum Cf {
     /// tall or short seagrass. The block's own survival rule (`SeagrassBlock`, `dmx`)
     /// is "the block below has a sturdy top face and is not magma" - not the dirt rule.
     Seagrass {
-        prob: f64,
+        prob: f32,
     },
     /// Kelp grows upward from OCEAN_FLOOR (`BlockPos.above`, obfuscated `d`), with one
     /// height draw and an age draw only when placing the head (`KelpFeature`, `ecs`).
@@ -169,14 +169,7 @@ enum Cf {
         radius: i32,
     },
     FreezeTop,
-    Multiface {
-        name: String,
-        on: HashSet<String>,
-        ceiling: bool,
-        wall: bool,
-        floor: bool,
-        search: i32,
-    },
+    Multiface(Box<MultifaceCfg>),
     Bamboo(f32),
     Vines,
     MonsterRoom,
@@ -185,6 +178,14 @@ enum Cf {
     },
     Tree(Box<crate::tree::TreeExtra>),
     Unknown(#[expect(dead_code)] String),
+}
+
+pub(crate) struct MultifaceCfg {
+    name: String,
+    on: HashSet<String>,
+    dirs: Vec<u8>,
+    search: i32,
+    spread: f32,
 }
 
 fn name_list(j: &J, k: &str) -> Vec<String> {
@@ -1607,9 +1608,9 @@ fn gen_root_system(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &RootSy
     }
 }
 
-/// `GeodeFeature.placeBlock`: the write is skipped when the existing block is in
-/// `cannot_replace`, and the caller has already asked the provider for its state.
-fn geode_place(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &str) {
+/// `Feature.safeSetBlock` / `GeodeFeature.placeBlock`: skip protected existing
+/// blocks; the caller has already consumed its provider/RNG draws.
+fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &str) {
     let Some(reg) = breg() else { return };
     if ctx.out_of_h(p.1) {
         return;
@@ -1715,6 +1716,10 @@ fn gen_ice_spike(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
 
 fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg) {
     let Some(reg) = breg() else { return };
+    let trace = env_flag!("GEODE_TRACE");
+    if trace {
+        eprintln!("GEODE {} {} {}", origin.0, origin.1, origin.2);
+    }
     let points_n = g.distribution_points.get(rng);
     let noise = crate::generation_math::normal_new_l(ctx.g.wseed(), -4, &[1.0]);
     let d0 = points_n as f64 / g.outer_wall_distance.max_inclusive().max(1) as f64;
@@ -1735,6 +1740,9 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
             origin.2 + g.outer_wall_distance.get(rng),
         );
         let st = ctx.get(p.0, p.1, p.2);
+        if trace {
+            eprintln!("GREAD {} {} {} state={st}", p.0, p.1, p.2);
+        }
         if reg.is_air(st) || reg.in_tag(st, &g.invalid) {
             invalid += 1;
             if invalid > g.invalid_blocks_threshold {
@@ -1781,7 +1789,7 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
                 }
                 if has_crack && d7 >= d5 && d6 < d1 {
                     let st = g.filling.get(ctx, rng, x, y, z);
-                    geode_place(ctx, at, st, &g.cannot_replace);
+                    safe_feature_set(ctx, at, st, &g.cannot_replace);
                     for (dx, dy, dz) in [
                         (0, -1, 0),
                         (0, 1, 0),
@@ -1803,7 +1811,7 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
                     }
                 } else if d6 >= d1 {
                     let st = g.filling.get(ctx, rng, x, y, z);
-                    geode_place(ctx, at, st, &g.cannot_replace);
+                    safe_feature_set(ctx, at, st, &g.cannot_replace);
                 } else if d6 >= d2 {
                     let alt = (rng.next_f32() as f64) < g.use_alt_layer0;
                     let st = if alt {
@@ -1811,7 +1819,7 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
                     } else {
                         g.inner.get(ctx, rng, x, y, z)
                     };
-                    geode_place(ctx, at, st, &g.cannot_replace);
+                    safe_feature_set(ctx, at, st, &g.cannot_replace);
                     if (!g.placements_require_alt || alt)
                         && (rng.next_f32() as f64) < g.use_potential_placements
                     {
@@ -1819,10 +1827,10 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
                     }
                 } else if d6 >= d3 {
                     let st = g.middle.get(ctx, rng, x, y, z);
-                    geode_place(ctx, at, st, &g.cannot_replace);
+                    safe_feature_set(ctx, at, st, &g.cannot_replace);
                 } else {
                     let st = g.outer.get(ctx, rng, x, y, z);
-                    geode_place(ctx, at, st, &g.cannot_replace);
+                    safe_feature_set(ctx, at, st, &g.cannot_replace);
                 }
             }
         }
@@ -2037,7 +2045,7 @@ fn p_cf(j: &J) -> Option<Cf> {
             valid: name_list(j, "valid_blocks").into_iter().collect(),
         },
         "seagrass" => Cf::Seagrass {
-            prob: jnum(j, "probability").unwrap_or(0.0),
+            prob: jf32(j, "probability", 0.0),
         },
         "kelp" => Cf::Kelp,
         // `minecraft:flower` is the same config shape (a patch of simple blocks), just a
@@ -2134,14 +2142,25 @@ fn p_cf(j: &J) -> Option<Cf> {
             radius: jint(j, "placement_radius_around_floor", 1),
         },
         "freeze_top_layer" => Cf::FreezeTop,
-        "multiface_growth" => Cf::Multiface {
-            name: ns_name(&jstr(j, "block")?),
-            on: name_list(j, "can_be_placed_on").into_iter().collect(),
-            ceiling: jbool(j, "can_place_on_ceiling", false),
-            wall: jbool(j, "can_place_on_wall", false),
-            floor: jbool(j, "can_place_on_floor", true),
-            search: jint(j, "search_range", 10),
-        },
+        "multiface_growth" => {
+            let mut dirs = Vec::new();
+            if jbool(j, "can_place_on_ceiling", false) {
+                dirs.push(1);
+            }
+            if jbool(j, "can_place_on_floor", false) {
+                dirs.push(0);
+            }
+            if jbool(j, "can_place_on_wall", false) {
+                dirs.extend([2, 5, 3, 4]);
+            }
+            Cf::Multiface(Box::new(MultifaceCfg {
+                name: ns_name(&jstr(j, "block")?),
+                on: name_list(j, "can_be_placed_on").into_iter().collect(),
+                dirs,
+                search: jint(j, "search_range", 10),
+                spread: jf32(j, "chance_of_spreading", 0.5),
+            }))
+        }
         "bamboo" => Cf::Bamboo(jf32(j, "probability", 0.0)),
         "vines" => Cf::Vines,
         "monster_room" => Cf::MonsterRoom,
@@ -2663,11 +2682,7 @@ fn mod_positions(
             out.push((pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2));
         }
         PM::Heightmap(kind) => {
-            let top = if *kind == 1 {
-                ctx.hm_oc(pos.0, pos.2)
-            } else {
-                ctx.hm_ws(pos.0, pos.2)
-            };
+            let top = ctx.heightmap(*kind, pos.0, pos.2);
             if top > ctx.g.min_y {
                 out.push((pos.0, top, pos.2));
             }
@@ -2716,11 +2731,12 @@ fn mod_positions(
                 out.push(pos);
             }
         }
-        PM::SurfaceRel(min_i, max_i) => {
-            let y = ctx.hm_ws(pos.0, pos.2);
-            let lo = y.saturating_add(*min_i);
-            let hi = y.saturating_add(*max_i);
-            if lo <= pos.1 && pos.1 <= hi {
+        PM::SurfaceRel(kind, min_i, max_i) => {
+            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));
+            // SurfaceRelativeThresholdFilter widens before adding the offsets.
+            let lo = y + i64::from(*min_i);
+            let hi = y + i64::from(*max_i);
+            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
                 out.push(pos);
             }
         }
@@ -2797,10 +2813,9 @@ fn ore_should_place(
     if discard <= 0.0 {
         return true;
     }
-    if discard >= 1.0 {
-        return false;
-    }
-    if r.next_f32() >= discard {
+    // OreFeature.shouldSkipAirCheck returns false at chance=1: that means
+    // inspect the neighbours, not reject the cell. Endpoints consume no RNG.
+    if discard < 1.0 && r.next_f32() >= discard {
         return true;
     }
     for d in 0..6u8 {
@@ -2830,6 +2845,7 @@ fn gen_vein(
     size: i32,
     discard: f32,
     targets: &[(RT, u32)],
+    trace: bool,
 ) {
     let j = size.max(1);
     let mut ds = vec![0.0; (j * 4) as usize];
@@ -2906,7 +2922,12 @@ fn gen_vein(
                     }
                     bits[bi] = true;
                     for (rt, st) in targets {
-                        if ore_should_place(discard, ctx, rt, (xx, yy, zz), rng) {
+                        let before = if trace { ctx.get(xx, yy, zz) } else { 0 };
+                        let ok = ore_should_place(discard, ctx, rt, (xx, yy, zz), rng);
+                        if trace {
+                            eprintln!("OTEST {xx} {yy} {zz} state={before} ok={ok}");
+                        }
+                        if ok {
                             ctx.set(xx, yy, zz, *st);
                             break;
                         }
@@ -2988,9 +3009,13 @@ fn gen_ore(
     let before = ctx.wr.len();
     for xp in n..=(n + q) {
         for zp in p..=(p + q) {
-            if o <= ctx.hm_oc(xp, zp) {
+            // OreFeature.place asks for OCEAN_FLOOR_WG, not the live
+            // OCEAN_FLOOR used by placement modifiers after neighbour features.
+            if o <= ctx.hm_oc_wg(xp, zp) {
+                let trace = env_str!("ORE_CELL_TRACE")
+                    .is_some_and(|spec| spec == format!("{},{},{}", pos.0, pos.1, pos.2));
                 gen_vein(
-                    ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets,
+                    ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets, trace,
                 );
                 if let Some(spec) = env_str!("ORE_CELL_TRACE") {
                     if spec == format!("{},{},{}", pos.0, pos.1, pos.2) {
@@ -3024,6 +3049,154 @@ pub(crate) fn ore_cells_for_test(
     let mut v: Vec<(i32, i32, i32)> = ctx.wr.keys().copied().collect();
     v.sort();
     v
+}
+
+/// StructurePiece.reorient: horizontal order is NORTH, EAST, SOUTH, WEST;
+/// face away from one opaque wall, otherwise turn away from blocked fronts.
+fn orient_chest(ctx: &mut FC, pos: (i32, i32, i32), state: u32) -> u32 {
+    let Some(reg) = breg() else { return state };
+    let directions = [
+        (0, -1, "north"),
+        (1, 0, "east"),
+        (0, 1, "south"),
+        (-1, 0, "west"),
+    ];
+    let mut wall = None;
+    for (i, &(dx, dz, _)) in directions.iter().enumerate() {
+        let neighbour = ctx.get(pos.0 + dx, pos.1, pos.2 + dz);
+        if reg.name_of(neighbour) == "minecraft:chest" {
+            return state;
+        }
+        if reg.is_solid_render(neighbour) {
+            if wall.is_some() {
+                wall = None;
+                break;
+            }
+            wall = Some(i);
+        }
+    }
+    let face = if let Some(i) = wall {
+        (i + 2) % 4
+    } else {
+        let facing = reg.get_prop(state, "facing").unwrap_or_default();
+        let mut i = directions.iter().position(|d| d.2 == facing).unwrap_or(0);
+        for turn in [2, 1, 2] {
+            let (dx, dz, _) = directions[i];
+            if reg.is_solid_render(ctx.get(pos.0 + dx, pos.1, pos.2 + dz)) {
+                i = (i + turn) % 4;
+            }
+        }
+        i
+    };
+    reg.with_prop(state, "facing", directions[face].2)
+}
+
+fn multiface_relative(p: (i32, i32, i32), d: u8) -> (i32, i32, i32) {
+    let (x, y, z) = dir_off(d);
+    (p.0 + x, p.1 + y, p.2 + z)
+}
+fn multiface_shuffle(dirs: &mut [u8], rng: &mut Xor) {
+    for i in (1..dirs.len()).rev() {
+        let j = rng.next_bound(i as i32 + 1) as usize;
+        dirs.swap(i, j);
+    }
+}
+fn multiface_property(d: u8) -> &'static str {
+    ["down", "up", "north", "south", "west", "east"][d as usize]
+}
+fn multiface_state(ctx: &mut FC, reg: &BReg, p: (i32, i32, i32), name: &str, d: u8) -> Option<u32> {
+    let cur = ctx.get(p.0, p.1, p.2);
+    if reg.name_of(cur) == name
+        && reg.get_prop(cur, multiface_property(d)).as_deref() == Some("true")
+    {
+        return None;
+    }
+    let support = multiface_relative(p, d);
+    if !reg.supports_multiface(ctx.get(support.0, support.1, support.2), d) {
+        return None;
+    }
+    let base = if reg.name_of(cur) == name {
+        cur
+    } else {
+        let st = reg.state_of(name, None);
+        if reg.fluid_name(cur) == "minecraft:water" {
+            reg.with_prop(st, "waterlogged", "true")
+        } else {
+            st
+        }
+    };
+    Some(reg.with_prop(base, multiface_property(d), "true"))
+}
+fn multiface_spread(
+    ctx: &mut FC,
+    reg: &BReg,
+    rng: &mut Xor,
+    p: (i32, i32, i32),
+    name: &str,
+    state: u32,
+    from: u8,
+) {
+    let mut dirs = [0, 1, 2, 3, 4, 5];
+    multiface_shuffle(&mut dirs, rng);
+    for to in dirs {
+        if to / 2 == from / 2
+            || reg.get_prop(state, multiface_property(to)).as_deref() == Some("true")
+        {
+            continue;
+        }
+        let next = multiface_relative(p, to);
+        // MultifaceSpreader's SAME_POSITION, SAME_PLANE, WRAP_AROUND order.
+        for (target, face) in [
+            (p, to),
+            (next, from),
+            (multiface_relative(next, from), to ^ 1),
+        ] {
+            let cur = ctx.get(target.0, target.1, target.2);
+            if !(reg.is_air(cur)
+                || reg.name_of(cur) == name
+                || (is_water_st(reg, cur) && reg.fluid_name(cur) == "minecraft:water"))
+            {
+                continue;
+            }
+            if let Some(st) = multiface_state(ctx, reg, target, name, face) {
+                if ctx.out_of_h(target.1) {
+                    break;
+                }
+                ctx.set(target.0, target.1, target.2, st);
+                return;
+            }
+        }
+    }
+}
+fn multiface_try(
+    ctx: &mut FC,
+    reg: &BReg,
+    rng: &mut Xor,
+    p: (i32, i32, i32),
+    cfg: &MultifaceCfg,
+    dirs: &[u8],
+) -> bool {
+    for &d in dirs {
+        let support = multiface_relative(p, d);
+        if !cfg
+            .on
+            .contains(reg.name_of(ctx.get(support.0, support.1, support.2)))
+        {
+            continue;
+        }
+        let Some(st) = multiface_state(ctx, reg, p, &cfg.name, d) else {
+            return false;
+        };
+        if !ctx.out_of_h(p.1) {
+            ctx.set(p.0, p.1, p.2, st);
+        }
+        // The float draw happens even for zero/one spreading probabilities.
+        if rng.next_f32() < cfg.spread {
+            multiface_spread(ctx, reg, rng, p, &cfg.name, st, d);
+        }
+        return true;
+    }
+    false
 }
 
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
@@ -3185,6 +3358,30 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 if !ok {
                     return;
                 }
+                // SimpleBlockFeature delegates DoublePlantBlock placement:
+                // reject an occupied head before either write, force both
+                // halves, and copy waterlogging at each destination.
+                if reg.is_double_plant(st) {
+                    if !ctx.is_air(pos.0, pos.1 + 1, pos.2) {
+                        return;
+                    }
+                    for (dy, half) in [(0, "lower"), (1, "upper")] {
+                        let y = pos.1 + dy;
+                        let mut state = reg.with_prop(st, "half", half);
+                        if reg.get_prop(state, "waterlogged").is_some() {
+                            let wet = reg.has_water(ctx.get(pos.0, y, pos.2));
+                            state = reg.with_prop(
+                                state,
+                                "waterlogged",
+                                if wet { "true" } else { "false" },
+                            );
+                        }
+                        if !ctx.out_of_h(y) {
+                            ctx.set(pos.0, y, pos.2, state);
+                        }
+                    }
+                    return;
+                }
             }
             ctx.set(pos.0, pos.1, pos.2, st);
         }
@@ -3247,10 +3444,19 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 pos.2 + rng.next_bound(8) - rng.next_bound(8),
             );
             let y = ctx.hm_oc(x, z);
-            if reg.name_of(ctx.get(x, y, z)) != "minecraft:water" {
+            let trace_read = |y, st| {
+                if env_flag!("SEAGRASS_TRACE")
+                    && DTRACE.load(std::sync::atomic::Ordering::Relaxed) >= 0
+                {
+                    eprintln!("SEAREAD {x} {y} {z} state={st}");
+                }
+            };
+            let at = ctx.get(x, y, z);
+            trace_read(y, at);
+            if reg.name_of(at) != "minecraft:water" {
                 return;
             }
-            let tall = rng.next_f64() < *prob;
+            let tall = rng.next_f64() < f64::from(*prob);
             let below = ctx.get(x, y - 1, z);
             // `SeagrassBlock.mayPlaceOn`: sturdy top face, and not magma
             if !reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block" {
@@ -3258,7 +3464,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             let half = |v: &str| J::Obj(vec![("half".to_string(), J::Str(v.to_string()))]);
             if tall {
-                if reg.name_of(ctx.get(x, y + 1, z)) != "minecraft:water" {
+                let above = ctx.get(x, y + 1, z);
+                trace_read(y + 1, above);
+                if reg.name_of(above) != "minecraft:water" {
                     return;
                 }
                 let lo = reg.state_of("minecraft:tall_seagrass", Some(&half("lower")));
@@ -3340,6 +3548,19 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             xz,
             y,
         } => {
+            if env_str!("PATCH_TRACE")
+                .is_some_and(|want| want == format!("{},{}", pos.0 >> 4, pos.2 >> 4))
+            {
+                let f = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "PATCH {} {} {} feature={},{}",
+                    pos.0,
+                    pos.1,
+                    pos.2,
+                    f >> 32,
+                    f & 0xFFFF
+                );
+            }
             let (xs, ys) = (xz + 1, y + 1);
             for _ in 0..*tries {
                 // the arguments are evaluated left to right, so the draws go
@@ -3881,101 +4102,30 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
             }
         }
-        Cf::Multiface {
-            name,
-            on,
-            ceiling,
-            wall,
-            floor,
-            search,
-        } => {
+        Cf::Multiface(cfg) => {
             let Some(reg) = breg() else { return };
-            // valid placement directions (face the lichen occupies)
-            let mut dirs: Vec<u8> = vec![];
-            if *ceiling {
-                dirs.push(1);
-            }
-            if *floor {
-                dirs.push(0);
-            }
-            if *wall {
-                dirs.extend([2u8, 3, 4, 5]);
-            }
-            if dirs.is_empty() {
-                return;
-            }
-            let place_on_faces =
-                |ctx: &mut FC, rng: &mut Xor, p: (i32, i32, i32), exclude: Option<u8>| -> bool {
-                    // shuffled direction order
-                    let mut dd: Vec<u8> = dirs
-                        .iter()
-                        .copied()
-                        .filter(|d| Some(*d) != exclude)
-                        .collect();
-                    for i in (1..dd.len()).rev() {
-                        let j = rng.next_bound(i as i32 + 1) as usize;
-                        dd.swap(i, j);
-                    }
-                    for &d in &dd {
-                        let (dx, dy, dz) = dir_off(d);
-                        let nb = (p.0 + dx, p.1 + dy, p.2 + dz);
-                        let nb_st = ctx.get(nb.0, nb.1, nb.2);
-                        if !on.contains(reg.name_of(nb_st)) {
-                            continue;
-                        }
-                        let face_prop = match d {
-                            0 => "down",
-                            1 => "up",
-                            2 => "north",
-                            3 => "south",
-                            4 => "west",
-                            _ => "east",
-                        };
-                        let cur = ctx.get(p.0, p.1, p.2);
-                        let base = if reg.name_of(cur) == name.as_str() {
-                            cur
-                        } else {
-                            reg.state_of(name, None)
-                        };
-                        let mut st = reg.with_prop(base, face_prop, "true");
-                        if is_water_st(reg, cur) {
-                            st = reg.with_prop(st, "waterlogged", "true");
-                        }
-                        ctx.set(p.0, p.1, p.2, st);
-                        return true;
-                    }
-                    false
-                };
             let cur = ctx.get(pos.0, pos.1, pos.2);
             if !(reg.is_air(cur) || is_water_st(reg, cur)) {
                 return;
             }
-            if place_on_faces(ctx, rng, pos, None) {
+            let mut dirs = cfg.dirs.clone();
+            multiface_shuffle(&mut dirs, rng);
+            if multiface_try(ctx, reg, rng, pos, cfg, &dirs) {
                 return;
             }
-            // spread: walk in a shuffled direction, keep trying
             for &d in &dirs {
-                let (dx, dy, dz) = dir_off(d);
-                let mut p = pos;
-                for _ in 0..*search {
-                    p = (p.0 + dx, p.1 + dy, p.2 + dz);
-                    let c = ctx.get(p.0, p.1, p.2);
-                    if !(reg.is_air(c) || is_water_st(reg, c)) && reg.name_of(c) != name.as_str() {
+                let mut faces: Vec<_> =
+                    cfg.dirs.iter().copied().filter(|v| *v != (d ^ 1)).collect();
+                multiface_shuffle(&mut faces, rng);
+                // ecw resets to origin + direction on EVERY iteration; it does
+                // not walk search_range blocks down the corridor.
+                let p = multiface_relative(pos, d);
+                for _ in 0..cfg.search {
+                    let cur = ctx.get(p.0, p.1, p.2);
+                    if !(reg.is_air(cur) || is_water_st(reg, cur) || reg.name_of(cur) == cfg.name) {
                         break;
                     }
-                    if place_on_faces(
-                        ctx,
-                        rng,
-                        p,
-                        Some(match d {
-                            0 => 1,
-                            1 => 0,
-                            2 => 3,
-                            3 => 2,
-                            4 => 5,
-                            _ => 4,
-                        }),
-                    ) {
+                    if multiface_try(ctx, reg, rng, p, cfg, &faces) {
                         return;
                     }
                 }
@@ -4117,32 +4267,34 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             if wp.1 >= ctx.g.min_y && !reg.is_solid(below) {
                                 ctx.set(wp.0, wp.1, wp.2, cave_air);
                             } else if reg.is_solid(cur) && reg.name_of(cur) != "minecraft:chest" {
-                                ctx.set(
-                                    wp.0,
-                                    wp.1,
-                                    wp.2,
-                                    if dy == -1 && rng.next_bound(4) != 0 {
-                                        mossy
-                                    } else {
-                                        cobble
-                                    },
+                                let state = if dy == -1 && rng.next_bound(4) != 0 {
+                                    mossy
+                                } else {
+                                    cobble
+                                };
+                                safe_feature_set(
+                                    ctx,
+                                    wp,
+                                    state,
+                                    "minecraft:features_cannot_replace",
                                 );
                             }
                         } else {
                             let n = reg.name_of(cur);
                             if n != "minecraft:chest" && n != "minecraft:spawner" {
-                                ctx.set(wp.0, wp.1, wp.2, cave_air);
+                                safe_feature_set(
+                                    ctx,
+                                    wp,
+                                    cave_air,
+                                    "minecraft:features_cannot_replace",
+                                );
                             }
                         }
                     }
                 }
             }
-            // spawner at center
-            let spawner = reg.state_of("minecraft:spawner", None);
-            if ctx.is_air(pos.0, pos.1, pos.2) {
-                ctx.set(pos.0, pos.1, pos.2, spawner);
-            }
-            // chests (no loot table — chest block only)
+            // Chest placement precedes the spawner and its mob-selection draw.
+            // Block-entity loot contents are not yet persisted by the feature layer.
             let chest = reg.state_of("minecraft:chest", None);
             for _ in 0..2 {
                 for _ in 0..3 {
@@ -4156,10 +4308,28 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         .filter(|(dx, dz)| reg.is_solid(ctx.get(cx + dx, pos.1, cz + dz)))
                         .count();
                     if walls == 1 {
-                        ctx.set(cx, pos.1, cz, chest);
+                        let oriented = orient_chest(ctx, (cx, pos.1, cz), chest);
+                        safe_feature_set(
+                            ctx,
+                            (cx, pos.1, cz),
+                            oriented,
+                            "minecraft:features_cannot_replace",
+                        );
+                        // RandomizableContainer.setBlockEntityLootTable consumes
+                        // nextLong only if the chest block entity exists.
+                        if reg.name_of(ctx.get(cx, pos.1, cz)) == "minecraft:chest" {
+                            let _loot_seed = rng.next_i64();
+                        }
                         break;
                     }
                 }
+            }
+            let spawner = reg.state_of("minecraft:spawner", None);
+            safe_feature_set(ctx, pos, spawner, "minecraft:features_cannot_replace");
+            // MonsterRoomFeature.randomEntityId is called only with a spawner
+            // entity present. A protected centre must not consume this draw.
+            if reg.name_of(ctx.get(pos.0, pos.1, pos.2)) == "minecraft:spawner" {
+                let _mob = rng.next_bound(4);
             }
         }
         Cf::Fallen { trunk } => {
@@ -5279,17 +5449,24 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             // feature placement sees a `WorldgenRandom` (legacy draw semantics)
             let mut rng = Xor::seed_worldgen(deco);
             if let Some(spec) = env_str!("FSEED_ARM") {
-                if spec == format!("{sx},{sz},{gi},{step}") {
-                    crate::generation_math::XTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
-                    crate::generation_math::NTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
-                    crate::generation_math::FTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
-                    crate::generation_math::DTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
-                }
+                let arm = if spec
+                    .split(';')
+                    .any(|want| want == format!("{sx},{sz},{gi},{step}"))
+                {
+                    0
+                } else {
+                    -1
+                };
+                crate::generation_math::XTRACE.store(arm, std::sync::atomic::Ordering::Relaxed);
+                crate::generation_math::NTRACE.store(arm, std::sync::atomic::Ordering::Relaxed);
+                crate::generation_math::FTRACE.store(arm, std::sync::atomic::Ordering::Relaxed);
+                crate::generation_math::DTRACE.store(arm, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(spec) = env_str!("FSEED_TRACE") {
                 if let Some((a, b)) = spec.split_once(',') {
                     if a.parse::<i32>() == Ok(sx) && b.parse::<i32>() == Ok(sz) {
                         eprintln!("FSEED {pop} {gi} {step}");
+                        eprintln!("FNAME {gi} {step} {name}");
                     }
                 }
             }
@@ -5299,6 +5476,9 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             } else {
                 None
             };
+            if env_str!("FEATURE_CELL_TRACE").is_some() {
+                eprintln!("FCTX {sx} {sz} {gi} {step} {name}");
+            }
             gen_pf(pf, fr, &mut ctx, &mut rng, (sx * 16, 0, sz * 16));
             if let Some(t0) = t0 {
                 feat_prof_record(name, t0.elapsed().as_nanos());

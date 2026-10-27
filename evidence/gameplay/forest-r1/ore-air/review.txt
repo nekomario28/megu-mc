@@ -1,0 +1,8 @@
+Local Codex review --uncommitted, exit 0 (2026-10-26).
+No actionable defects were found in the staged, unstaged, or untracked changes.
+The ore-exposure correction is consistent with the added decision and RNG fixtures;
+tests were not executed by the reviewer in the read-only environment.
+Execution evidence is separate: suite.txt, parallel.txt, mutation.txt, native-replay.txt.
+Self-review: shared ore predicate remains the single owner for normal/scattered ore;
+no new runtime abstraction, geometry change or BitSet change. Documentation distinguishes
+raw no-tick counts from excluded runtime artifacts and corrects the two chest cells.

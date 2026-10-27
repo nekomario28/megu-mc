@@ -22,13 +22,13 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **1.21.1 自前データへの移行は WIP。** 気候 router の inline 関数を読むようにし、built-in biome tree を同じ固定 jar から再生成しました。inline surface rule・ブロック状態・温度条件を接続し、[samplerとnative noise](../evidence/foundation/weird-sampler/README.md)、[aquiferの限定した実クラス比較](../evidence/foundation/aquifer/README.md)、[biome carverのAIR list](../evidence/foundation/biome-carvers/README.md)、[biome spawn tableと夜間hostileの接続](../evidence/foundation/biome-spawners/README.md)も追加しました。surfaceのsteep・条件式・合成buildSurface scanは[限定比較済み](../evidence/foundation/surface-context/README.md)ですが、real-noise地形へのsurface全適用・aquiferの全seed/chunk・spawn_costsの適用・NaturalSpawner全体は未完です。[surface の部分検証](../evidence/foundation/surface-loader/README.md)を参照。旧統合線の緑を移行ブランチに引き継ぎません。[Horizon の再利用判断と検証範囲](../evidence/foundation/horizon-reuse/README.md)を参照。
 - **Horizon の再利用を gameplay にも拡大。** 通常スロットとチェスト転送から、1.21.1 実クラス参照と本番 wire 検査を対にして進めています。[移植順序](horizon-gameplay/README.md)、[チェストの検証範囲](../evidence/gameplay/containers/README.md)、[アイテム回収の部分実装](../evidence/gameplay/inventory-pickup/README.md)を参照。エンティティ全般やチェストの開閉・同期まで移植済みという意味ではありません。
 - **Valence は部品単位で評価。** 旧版 framework や registry は導入せず、entity角度・section palette・NBT文字列書き出し・有限AABB判定を既存 owner で修復しています。[再利用判断](../evidence/foundation/valence-reuse/README.md)、[角度](../evidence/gameplay/entity-angles/README.md)、[binary/geometryの検証範囲](../evidence/foundation/valence-primitives/README.md)、[分割した契約](valence-primitives/README.md)を参照。entity全体・任意NBT・worldのparityではありません。
-- **feature層は限定範囲で前進、全体は未確定。** forest `(-64,32)` の3x3 canonical fixtureで、terrain/surface/carverはtarget 0差、tree one-featureはworldgen 0差（`--tick`の51はleaf distance tick）。full featureは3x3全体1,680–1,789差、targetは114（`--tick`）／53（no-tick）で、target ore originsは241/241一致。残りはore形状/上書き、chest、grass、lava flow。decoration marginを変えるとtarget差が変わるため、fixture契約を固定してから比較します（[ROADMAP](ROADMAP.md)、[forest R1](../evidence/gameplay/forest-r1/README.md)）。保存world全体の差をfeature差と呼ばないこと。
+- **feature生成境界は限定一致、runtimeは未達。** seed 0・structures=falseのforest 3×3を、nativeと同じ明示source順・tick停止状態で通常バイナリからdumpし、884,736セルすべて0差。leaf属性や流体の除外はありません。元の保存参照との差1,803セルは残り、新しいnative tick有効controlとwriter traceで境界を確認しました。生成順は入力であり、vanilla ticket schedulerは未実装です。[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)を数値・範囲の正本とします。
 - **kelpは実装済みだが移行後のvanilla parityは未確定。** 正の参照セルを持つ固定具とdraw列・列単位の比較は[過去の記録](../evidence/gameplay/carvers/README.md)にあります。古い一時worldを前提にせず、自前データの意味論を修正した後、同じseed・座標・stageで参照を再構成して比較します。
 - **構造物は未実装。** jigsaw、template pool、NBT経由の構造物配置は未対応です。
 - **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
-- **ローカルsuiteは緑ですが、全体合格ではありません。** 直近は **247 passed / 0 failed / 1 ignored**。以前のredはcarver list欠落とown-jar feature pathに帰属して解消し、並行PR #21/#24のworldgen修正・trace遅延化も取り込みました。forest `(-64,32)` 3x3のsame-stage比較ではterrain/surface/carverが対象chunkで0差、tree one-featureはorigin 41/41・worldgen 0差（`--tick`の51はleaf distance tick）です。full featureは3x3全体1,680–1,789差、targetは114（`--tick`）／53（no-tick）で、target ore originsは241/241一致しています（[forest R1](../evidence/gameplay/forest-r1/README.md)）。whole-world・hosted CIは未実行で、suite緑を全体合格の代用にしません。
+- **ローカルsuiteと限定native一致は、全体合格ではありません。** 個別oracle・mutation・全体回帰のreceiptを確認し、hosted CI、whole-world、M2/M3を別々に判定します。以前のleaf-distance属性除外によるno-tick 0は受け入れ根拠から撤回しました。次の境界は[ROADMAP](ROADMAP.md)にあります。
 - **コード検証（旧統合線の履歴）:** `tests/verify.sh` 通過時の記録は159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit。これは現在のデータ移行ブランチの合格結果ではありません。現在の実行結果は上記の移行証拠を参照。
-- **clippy削減の履歴:** 457 → 83 → **0**（`--all-targets`・release、当時テスト176本green）。現在の移行ブランチでも警告0を確認し、直近のローカルsuiteは247 passed / 0 failed / 1 ignored、層ゲートは20 modules / 47 edges / 0 named errorsです。
+- **clippy削減の履歴:** 457 → 83 → **0**（`--all-targets`・release、当時テスト176本green）。現在の移行ブランチでも警告0を確認し、直近のローカルsuiteは248 passed / 0 failed / 1 ignored、層ゲートは20 modules / 47 edges / 0 named errorsです。
   前半は機械的に等価な変換（`&*`/`&mut *` の冗長、`x % n == 0` → `is_multiple_of`、不要な `as`、
   `sort_by` → `sort_by_key` など）。残る判断が要るクラスは次のように閉じました:
   - `unnecessary_unwrap` 14: `is_some()` を見て `unwrap()` は `if let`/`match` に。3つのスロット
@@ -49,7 +49,7 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **比較の前提（固定具の基点）は再構成できます:** `tools/fixture_base.sh` が `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を組みます。jar は sha1 で固定（`59353fb4…`、既存の1.21.1導入ディレクトリを donor に使う）。基点が無いまま固定具を回すと比較は空振りします。
 - **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MC_SPINE_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
 - **被ダメ無敵は vanilla の `invulnerableTime` に載せ替えました**（slice 25、2026-10-24）。環境ダメージが timer を立てる点までは実装、環境ダメージ自身の差分適用は簡略（同 slice に明記）。
-- **開放中の項目:** LICENSE 未追加（#11）、独立レビュー（#7）。
+- **開放中の項目:** 独立レビュー（#7）。LICENSEは存在し、未追加のissue #11はclosedです（remoteを再確認）。
 - **draft PR #2/#4/#6 は決着しました（2026-10-24）。** `main` に同一patchが無かった62コミットを読み、
   現行線に無い4点だけを取り込みました: play frameの上限をvanillaの2MiBへ、非有限・世界外の移動値の拒否、
   tickの実測（作業時間・TPS・予算超過）、チャンクバッチのACKペーシング。残りは現行線に新しい形であるか、

@@ -4,20 +4,18 @@ Status: 実装中。現在の作業状態は[状態ページ](README.md)、個�
 この文書は目標・検証契約・作業順を持ち、過去のチェックポイントやソースの行数を複製しない。
 **ユーザー指示により実画面・KDE経由の試験は不要。接続と操作はCLI経由で検証する。**
 
-## 現在のcheckpoint（2026-10-26）
+## 現在のcheckpoint（2026-10-27）
 
-**M2は未達。** 現在はR1（同じ生成stageでのworldgen再受け入れ）のfeature層を閉じている段階です。ローカルsuiteは **247 passed / 0 failed / 1 ignored** ですが、これはM2/M3の合格ではありません。
+**M2/M3は未達。** R1の限定した生成境界は、nativeと同じsource順・tick停止状態で3×3全セル一致に到達しました。保存後のruntime一致とは区別します。
 
 | 現在できていること | 現在できていないこと |
 |---|---|
-| target chunkのterrain/surface/carverは0差 | full feature 3x3は1,680–1,789差 |
-| tree one-feature worldgenは0差 | target featureは114（`--tick`）／53（no-tick） |
-| tree origin/dirt/fancy centre/attachmentを実クラスと照合 | ore形状/上書き、chest、grassが残る |
-| surface material windowとaquifer pre-surfaceを照合 | 構造物（jigsaw/template）は未実装 |
-| ore origins 241/241一致 | 同一margin fixtureでの完全一致は未達 |
-| ローカルsuite 247/0/1 | whole-world再生成、hosted CI、main統合は未実行 |
+| 通常の生成バイナリがpaused nativeの884,736セルと0差 | 元の保存参照との差1,803セルをportのtickで再現すること |
+| 新しいnative tick有効worldが元のcanonicalと0差 | vanilla ticket schedulerの再現（生成順は明示入力） |
+| 独立したnative feature/leaf/HashSet vectors | 全seed・biome・構造物での受け入れ |
+| 同一source footprint・生成順・stageを固定した比較 | whole-world、hosted CI、main統合 |
 
-比較の順序・fixture契約・出口条件は[ROADMAP](ROADMAP.md)を正本とします。特に、同じtargetでもreferenceのdecoration marginを変えると差が53→155に変わるため、fixtureのmarginを固定せずに「targetが完全一致した」と主張しません。
+測定値・hash・writer帰属は[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)、次の境界は[ROADMAP](ROADMAP.md)を正本とします。属性名による除外は廃止しました。生成順またはstageを変えた結果を同じ測定として扱いません。
 
 ## 目標とチェックポイント
 

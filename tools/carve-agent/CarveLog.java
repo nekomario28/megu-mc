@@ -10,9 +10,11 @@ public class CarveLog {
     public static void enter(int sx, int sz) { SRC.set(new int[]{sx, sz}); }
     public static void exit() { SRC.set(new int[]{Integer.MIN_VALUE, Integer.MIN_VALUE}); }
     public static void pre(int tx, int tz, int sx, int sz, int k, long seed) {
+        if (Boolean.getBoolean("carverquiet")) return;
         System.out.println("APRE t=" + tx + "," + tz + " s=" + sx + "," + sz + " k=" + k + " seed=" + seed);
     }
     public static void post(int tx, int tz, int sx, int sz, int k, boolean start) {
+        if (Boolean.getBoolean("carverquiet")) return;
         System.out.println("APOST t=" + tx + "," + tz + " s=" + sx + "," + sz + " k=" + k + " start=" + start);
     }
     /** Only log the reseed for the chunk named by -Drseed=<cx>,<cz>. */
@@ -245,21 +247,110 @@ public class CarveLog {
         FEAT.get()[1] = step;
         String p = System.getProperty("fseedchunk");
         if (p == null) return;
-        String[] a = p.split(",");
-        if (a.length != 2) return;
+        RD.get()[0] = -1;
         int[] c = CHUNK.get();
-        if (c[0] != Integer.parseInt(a[0]) || c[1] != Integer.parseInt(a[1])) return;
+        if (!java.util.Arrays.asList(p.split(";")).contains(c[0] + "," + c[1])) return;
         if (c[2] != 1 || !overworld()) return;
+        System.out.println("FCTX " + c[0] + " " + c[1] + " " + i + " " + step);
         System.out.println("FSEED " + seed + " " + i + " " + step);
         String arm = System.getProperty("fseedarm");
-        if (arm != null && arm.equals(i + "," + step)) {
+        if (arm != null && (arm.equals("*") || arm.equals(i + "," + step))) {
             RD.get()[0] = 1;
             RD.get()[1] = 0;
         }
     }
 
+    static final ThreadLocal<String> ORE_ORIGIN = new ThreadLocal<>();
+
+    static final ThreadLocal<int[]> GEODE_READ = ThreadLocal.withInitial(() -> new int[]{-1});
+    public static void geode(int x, int y, int z) {
+        GEODE_READ.get()[0] = -1;
+        String want = System.getProperty("geodechunk");
+        if (want == null || !overworld()) return;
+        String[] a = want.split(",");
+        if (Math.abs((x >> 4)-Integer.parseInt(a[0])) > 3 || Math.abs((z >> 4)-Integer.parseInt(a[1])) > 3) return;
+        GEODE_READ.get()[0] = 0;
+        System.out.println("GEODE " + x + " " + y + " " + z);
+    }
+    public static void geodeRead(int x, int y, int z, int state) {
+        int[] count = GEODE_READ.get();
+        if (count[0] < 0 || count[0]++ >= 4) return;
+        System.out.println("GREAD " + x + " " + y + " " + z + " state=" + state);
+    }
+
+    public static void patch(int x, int y, int z) {
+        String want = System.getProperty("patchchunk");
+        int[] c = CHUNK.get(), f = FEAT.get();
+        if (want == null || !want.equals(c[0] + "," + c[1]) || !overworld()) return;
+        System.out.println("PATCH " + x + " " + y + " " + z + " feature=" + f[0] + "," + f[1]);
+    }
+
+    static final java.util.Set<String> FEATURE_CELLS = new java.util.HashSet<>(
+        java.util.Arrays.asList(System.getProperty("featurecell", "").split(";")));
+    static final java.util.Set<String> RUNTIME_CELLS = new java.util.HashSet<>(
+        java.util.Arrays.asList(System.getProperty("runtimecell", "").split(";")));
+    static final int[] FEATURE_BOX=box("featurebox"), RUNTIME_BOX=box("runtimebox");
+    static int[] box(String property) {
+        String value=System.getProperty(property);if(value==null) return null;
+        int[] b=java.util.Arrays.stream(value.split(",")).mapToInt(Integer::parseInt).toArray();
+        if(b.length!=6 || b[0]>b[3] || b[1]>b[4] || b[2]>b[5]) throw new IllegalArgumentException(property+" needs minX,minY,minZ,maxX,maxY,maxZ");
+        return b;
+    }
+    static boolean inside(int[] b,int x,int y,int z) {
+        return b!=null && x>=b[0] && x<=b[3] && y>=b[1] && y<=b[4] && z>=b[2] && z<=b[5];
+    }
+    public static void runtimeCell(int x,int y,int z,int state,int minY,boolean wrote) {
+        if(minY != -64 || (!RUNTIME_CELLS.contains(x+","+y+","+z) && !inside(RUNTIME_BOX,x,y,z))) return;
+        String stack=java.util.Arrays.stream(Thread.currentThread().getStackTrace())
+            .skip(2).limit(8).map(StackTraceElement::toString).collect(java.util.stream.Collectors.joining(" | "));
+        System.out.println("RUNTIME "+x+" "+y+" "+z+" state="+state+" wrote="+wrote+" stack="+stack);
+    }
+
+    public static void featureCell(int x, int y, int z, int state, boolean wrote) {
+        if ((!FEATURE_CELLS.contains(x + "," + y + "," + z) && !inside(FEATURE_BOX,x,y,z)) || !overworld()) return;
+        int[] f = FEAT.get(), c = CHUNK.get();
+        System.out.println("FCELL " + x + " " + y + " " + z + " state=" + state
+            + " wrote=" + wrote + " feature=" + f[0] + "," + f[1] + " chunk=" + c[0] + "," + c[1]);
+    }
+
+    public static void seagrassRead(Object pos,Object state) {
+        int[] c=CHUNK.get(),f=FEAT.get();
+        if(!System.getProperty("seagrasschunk","").equals(c[0]+","+c[1]) || !overworld()) return;
+        try {
+            ClassLoader loader=state.getClass().getClassLoader();
+            Class<?> p=Class.forName("jd",true,loader),s=Class.forName("dtc",true,loader);
+            int x=(int)p.getMethod("u").invoke(pos),y=(int)p.getMethod("v").invoke(pos),z=(int)p.getMethod("w").invoke(pos);
+            int id=(int)Class.forName("dfy",true,loader).getMethod("i",s).invoke(null,state);
+            System.out.println("SEAREAD "+x+" "+y+" "+z+" state="+id+" feature="+f[0]+","+f[1]);
+        } catch(ReflectiveOperationException e) {throw new IllegalStateException("seagrass read probe",e);}
+    }
+
+    public static void mushroomLight(int x, int y, int z, int light) {
+        String want = System.getProperty("mushroomchunk");
+        if (want == null || !overworld()) return;
+        String[] a = want.split(",");
+        if (Math.abs((x >> 4)-Integer.parseInt(a[0])) > 2 || Math.abs((z >> 4)-Integer.parseInt(a[1])) > 2) return;
+        int[] f = FEAT.get(), c = CHUNK.get();
+        System.out.println("MLIGHT " + x + " " + y + " " + z + " light=" + light
+            + " feature=" + f[0] + "," + f[1] + " chunk=" + c[0] + "," + c[1]);
+    }
+
+    public static void oreHeight(int x, int z, int height) {
+        String want = System.getProperty("orecell");
+        if (want == null || !want.equals(ORE_ORIGIN.get()) || !overworld()) return;
+        System.out.println("OHEIGHT " + x + " " + z + " " + height);
+    }
+
+    /** canPlaceOre results for one origin; includes each replacement target. */
+    public static void oreTest(int x, int y, int z, int state, boolean ok) {
+        String want = System.getProperty("orecell");
+        if (want == null || !want.equals(ORE_ORIGIN.get()) || !overworld()) return;
+        System.out.println("OTEST " + x + " " + y + " " + z + " state=" + state + " ok=" + ok);
+    }
+
     /** OreFeature origins: `-Dorechunk=cx,cz` limits the log to one chunk. */
     public static void ore(int x, int y, int z, int size) {
+        ORE_ORIGIN.set(x + "," + y + "," + z);
         String p = System.getProperty("orechunk");
         if (p == null) return;
         String[] a = p.split(",");
@@ -311,7 +402,7 @@ public class CarveLog {
         int[] st = RD.get();
         if (st[0] != 1) return;
         int i = st[1]++;
-        if (i >= 200) { st[0] = -1; return; }
+        if (i >= Integer.getInteger("drawlimit", 200)) { st[0] = -1; return; }
         System.out.println("RDRAW " + i + " nextInt()=" + value);
     }
 
@@ -320,7 +411,7 @@ public class CarveLog {
         int[] st = RD.get();
         if (st[0] != 1) return;
         int i = st[1]++;
-        if (i >= 200) { st[0] = -1; return; }
+        if (i >= Integer.getInteger("drawlimit", 200)) { st[0] = -1; return; }
         int[] f = FEAT.get();
         System.out.println("RDRAW " + i + " f=" + f[0] + "," + f[1] + " " + label + "=" + value);
     }
@@ -330,7 +421,7 @@ public class CarveLog {
         int[] st = RD.get();
         if (st[0] != 1) return;
         int i = st[1]++;
-        if (i >= 200) { st[0] = -1; return; }
+        if (i >= Integer.getInteger("drawlimit", 200)) { st[0] = -1; return; }
         int[] f = FEAT.get();
         System.out.println("RDRAW " + i + " f=" + f[0] + "," + f[1] + " nextInt(" + bound + ")=" + value);
     }
@@ -341,7 +432,7 @@ public class CarveLog {
         int[] st = RD.get();
         if (st[0] != 1) return;
         int i = st[1]++;
-        if (i >= 200) { st[0] = -1; return; }
+        if (i >= Integer.getInteger("drawlimit", 200)) { st[0] = -1; return; }
         int[] f = FEAT.get();
         System.out.println("RDRAW " + i + " f=" + f[0] + "," + f[1] + " " + label + "=" + value);
     }
@@ -402,12 +493,14 @@ public class CarveLog {
     }
 
     public static void tunnel(long seed, double x, double y, double z, float yaw, float pitch, int count) {
+        if (Boolean.getBoolean("carverquiet")) return;
         int[] s = SRC.get();
         System.out.println("ATUN s=" + s[0] + "," + s[1] + " seed=" + seed
             + " x=" + (long) Math.floor(x) + " y=" + (long) Math.floor(y) + " z=" + (long) Math.floor(z)
             + " yaw=" + yaw + " pitch=" + pitch + " count=" + count);
     }
     public static void state(int x, int y, int z, int id) {
+        if (Boolean.getBoolean("carverquiet")) return;
         int[] s = SRC.get();
         int[] t = TGT.get();
         System.out.println("ASTATE t=" + t[0] + "," + t[1] + " s=" + s[0] + "," + s[1]

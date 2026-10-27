@@ -1,9 +1,11 @@
 """Authenticated, temporary Java classpath for small 1.21.1 reference probes."""
 from contextlib import contextmanager
+import errno
 import hashlib
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -22,6 +24,15 @@ def pinned_runtime(jar):
     with tempfile.TemporaryDirectory(prefix="mc-vanilla-java-") as tmp:
         work = Path(tmp)
         with zipfile.ZipFile(io.BytesIO(payload)) as outer:
+            required = sum(info.file_size for info in outer.infolist()
+                           if info.filename == "META-INF/versions/1.21.1/server-1.21.1.jar"
+                           or (info.filename.startswith("META-INF/libraries/")
+                               and info.filename.endswith(".jar"))) + 16 * 1024 * 1024
+            free = shutil.disk_usage(work).free
+            if free < required:
+                raise OSError(errno.ENOSPC,
+                              f"native probe needs {required} bytes, only {free} free at "
+                              f"{work.parent}; choose a filesystem with space via TMPDIR")
             inner = outer.read("META-INF/versions/1.21.1/server-1.21.1.jar")
             jars = [work / "server-game.jar"]
             jars[0].write_bytes(inner)
@@ -34,8 +45,9 @@ def pinned_runtime(jar):
         yield work, os.pathsep.join(map(str, jars)), inner
 
 
-def run_probe(work, classpath, source, main, *args):
-    subprocess.run(["javac", "-proc:none", "-cp", classpath, "-d", str(work), str(source)],
+def run_probe(work, classpath, source, main, *args, extra_sources=()):
+    subprocess.run(["javac", "-proc:none", "-cp", classpath, "-d", str(work), str(source),
+                    *map(str, extra_sources)],
                    check=True, timeout=60)
     subprocess.run(["java", "-Xmx768m", "-cp", str(work) + os.pathsep + classpath,
                     main, *map(str, args)], check=True, timeout=120, cwd=work)

@@ -1,0 +1,49 @@
+{
+  "started_at": "2026-10-26T19:25:51.648193+00:00",
+  "finished_at": "2026-10-26T19:25:52.036492+00:00",
+  "region": [
+    -64,
+    32,
+    3
+  ],
+  "y": [
+    -64,
+    319
+  ],
+  "cells_compared": 884736,
+  "production_vs_frozen": 0,
+  "fresh_ticked_native_vs_canonical": 0,
+  "frozen_vs_ticked": 1803,
+  "actual_last_writers": {
+    "FlowingFluid.tick": 40,
+    "LeavesBlock.tick": 1763
+  },
+  "frozen_boundary": {
+    "mode": "frozen",
+    "game_times": [
+      2,
+      2
+    ],
+    "chunks": 9,
+    "decorated_chunks": 25,
+    "runtime_writes": 0
+  },
+  "ticked_boundary": {
+    "mode": "ticked",
+    "game_times": [
+      2,
+      759
+    ],
+    "chunks": 9,
+    "decorated_chunks": 25,
+    "runtime_writes": 2109
+  },
+  "sha256": {
+    "production_dump": "632a7647430e338843777f785a5c28bf491ff4be1e2ebfa6bed18221ff37102b",
+    "native_frozen_dump": "632a7647430e338843777f785a5c28bf491ff4be1e2ebfa6bed18221ff37102b",
+    "native_ticked_dump": "a1b88beb1dbcb9f2527bd329498a2f8019060a2f528bdf71914d10ad2f15a0e5",
+    "native_frozen_order": "0bdd63519c5c5851db5e69d028ded368e15e52eaf636fe65410c1b781147d9f3",
+    "native_ticked_order": "7586938a6a91f7dc64ea023b888eabaeee94153cdd31a904244436f3482a2d7f"
+  },
+  "scope": "generation parity with explicit order; not port runtime parity"
+}

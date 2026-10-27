@@ -2,29 +2,19 @@
 
 現在の状態は[README](README.md)、目標と合格条件は[PLAN](PLAN.md)、測定値と実行条件は各 `evidence/` を正本とします。この文書は**次に進む順序・依存関係・出口条件**を定めます。部品の実装、実クラスとの部分一致、全体合格を混同しません。
 
-## いまの判断 — R1のfeature層を、fixture契約から閉じる
+## いまの判断 — 生成境界の一致からruntimeへ
 
-現在の checkpoint は **M2未達**です。ローカルsuiteは **247 passed / 0 failed / 1 ignored** ですが、これは全体合格ではありません。R0の自前データ意味論は限定範囲で閉じ、R1のforest `(-64,32)` では次まで到達しています。
+**M2未達**は変わりません。forest `(-64,32)` の3×3・seed 0・structures=falseで、明示した25 source chunk順に通常バイナリを実行し、paused nativeの884,736セルすべてが0差になりました。leaf distanceも流体も除外していません。
 
-| 比較 | 結果 | 意味 |
-|---|---:|---|
-| target chunk の terrain / surface / carver | **0差** | 対象chunkの基盤は同じstageで一致 |
-| tree one-feature inner 3x3（`--tick`なし） | **0差** | tree origin / trunk / dirt / fancy中心枝は一致 |
-| tree one-feature の `--tick`差 | 51 | saved-worldのleaf distance tick。worldgen差ではない |
-| full feature 3x3（3x3 reference） | **1,680差（no-tick）** | `--tick`は保存worldのleaf/lava runtime差を加える。targetは114（`--tick`）／53（no-tick） |
-| target full feature（no-tick） | **53差** | lava flow 20、ore約30、chest 1、grass 1 |
-| target ore origins | **241/241一致** | origin/sizeは一致。形状または上書きが残る |
-| structures | 未実装 | jigsaw/template/NBT配置は別契約 |
+元のcanonical保存参照との差は1,803セルのままです。新しいnative tick有効controlはcanonicalと0差で、差の全セルに実際のruntime最終writer（LeavesBlock.tick 1,763、FlowingFluid.tick 40）があります。これは**portのruntime一致を証明しません**。正本は[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)です。
 
-重要な制約:
+制約:
+- source footprintだけでなく**順序も入力**。通常のlazy scanをvanilla ticket schedulerと呼ばない。
+- 属性による除外をしない。stageは実際の時計・writer・保存状態で確定する。
+- mainの#22 data migrationとの統合は保留。hosted CIはbillingで起動しておらず、ローカル結果と混同しない。
+- 全seed/biome/構造物の合格ではない。JVM identity-hashによるleaf tree-bin tieも明示した未対応境界に残る。
 
-- **decoration margin依存。** 同じtargetでも3x3 referenceと5x5 referenceで差が53→155に変わる（[margin-order](../evidence/gameplay/forest-r1/margin-order.txt)）。target chunkを単独で「worldgen残差」と呼ばず、referenceと同じmarginで比較する。
-- **保存worldのruntime差をworldgen差と呼ばない。** lava flow、leaf distance、水の広がりは除外し、no-tick値と両方記録する。
-- **R1の「完全一致」の判定対象は、同じseed・同じdata・同じstage・同じmarginのreference/port。** originが一致してもセル集合は一致とは限らない（ore 241/241 origins）。
-- mainの取り込みは保留。remote mainの#22は、このbranchが読むcommitted datapack/assetsを削除するdata migrationであり、tree/worldgen ownerのrenameと同時に自動mergeしない。
-- hosted CI #26/#27/#28はbillingでjobが起動していない。ローカル実行とhosted CIを混同しない。
-
-**次の最小slice:** target no-tick 53のうち、runtimeでない **ore形状/上書き**を1つの共有originでセル単位に閉じる。次にchest/grass、最後に3x3全体の非target残差を同じfixture契約で分離する。構造物はその後に独立した契約として着手する。
+**次の最小slice:** nativeのscheduled leaf/fluid tickとpending queueを切り出し、portの既存runtime ownerへ統合する。同じ生成状態・同じtick入力と時点で、元のcanonicalに対する全セル差を閉じる。生成順の再現とruntimeの再現を一つの推測修正に混ぜない。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
@@ -42,7 +32,7 @@
 
 1. referenceとportで **seed、data pack、structures有無、forceload範囲、dump範囲、margin** を同じにする。
 2. referenceの全chunkが `full` であること、対象featureが実行されたこと、skip/excludedを記録する。
-3. `--tick` と `--tick`なしを両方保存する。leaf distance/lava flow/水広がりはruntime artifactとして分類し、worldgenの差分に混ぜない。
+3. paused生成状態とtick後状態を別artifactとして保存し、時計とwriterを記録する。属性名からruntimeと判断しない。`--tick`の有無でセルを除外しない。
 4. malformed/empty/truncated dump、wrong jar、stale provenanceは比較前に拒否する。
 
 **出口:** 同じfixture定義を一つの文書に固定し、3x3 canonical referenceとportのtarget差分が再現する。marginを変えた比較は別fixtureとして記録し、前の数値と混ぜない。
@@ -50,33 +40,26 @@
 ### R1.1 tree / surface / carver（このcheckpointで閉じた範囲）
 
 - targetのterrain/surface/carver: 0差
-- tree one-feature: origin 41/41、target worldgen 0差
+- tree origin 41/41の個別照合は維持。旧no-tick 0は属性除外を含む歴史値で、現在のfull-state受け入れの根拠にはしない。
 - `min_clipped_height`なしのclip拒否、`dirt_provider`、fancy centre limb `h2 * 0.5`、fancy attachment開始位置を実クラスbytecodeと照合
 - surface materialはactual pre-surface stateを分類し、`wtop - 4` windowだけに適用
 
-**出口:** tree one-featureのno-tick 0差を維持し、理由のないcapture更新をしない。
+**出口:** 現在のpaused full-state照合を維持し、理由のないcapture更新をしない。
 
-### R1.2 target feature残差（現在の主線）
+### R1.2 feature生成境界（限定受け入れ）
 
-現在のtarget no-tick 53を、次の順で1層ずつ閉じる。
+coal/chest/grassだけでなく非targetを含む3×3全体が、paused nativeと全state一致した。対応するnative vectorsと本番dump経路は[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)を参照する。
 
-1. **ore形状/上書き（約30）**
-   - ore origins 241/241一致を前提にする。
-   - 1つの共有originについて、referenceの `OreFeature.doPlace` とportの `gen_ore` / `gen_vein` のセル集合を比較する。
-   - `OreFeature` の `BitSet` は自動拡張、portの固定Vecは境界セルを落とし得る。サイズ差は実クラスbytecodeで確認し、fixtureで効果を測る。
-   - 後続featureによる上書き順（monster room/lake/spring/ore間）を同じoriginで比較する。
-   - 失敗時はorigin一致を「形状一致」と読み替えない。
-2. **chest 1**
-   - monster roomのchest向き・位置・loot/block entityの有無を、`MonsterRoomFeature`のbytecodeと照合する。
-   - chest blockだけでなく、後続のblock entity consumerが要求する範囲を分ける。
-3. **grass 1**
-   - patch/grassの配置predicateとbiome filterを単独fixtureで照合する。
-4. **lava flow 20**
-   - `SpringFeature` sourceは一致済み。flowはsaved-world tickとして分離し、worldgenの残差から除外する。
-5. **非target残差**
-   - targetが0になってから、3x3全体を同じfixtureで比較し、chunk境界のfeature origin/spillとruntime差を分ける。
+**出口:** 同じ明示source順で全884,736セル0差を維持する。全chunk FULL、全stateを比較し、部分比較・未実行・古いartifactを緑と扱わない。生成captureの更新はnativeの独立した証明の後だけ行う。
 
-**出口:** targetのno-tick差が0。3x3の残差は、各セルが「未実装feature」「runtime artifact」「fixture margin」「未検証」のどれかに説明され、両側ゼロ・全skip・失敗の握り潰しがない。
+### R1.2b 保存後のruntime境界（次）
+
+- Native LeavesBlock/FlowingFluidの実bodyとpending tick ownershipを調べる。
+- 既存runtime ownerへ統合し、第二の近似tick経路を増やさない。
+- 最初に同じ生成状態とpending入力、その後に同じスケジューリング・時点を確認する。
+- canonicalとの1,803セル差を数えたまま閉じる。writer帰属を実装済みと読み替えない。
+
+**出口:** port自身のruntimeを通った保存状態が、同じ入力・時点のnativeと全セル一致する。全seed/構造物の受け入れとは分ける。
 
 ### R1.3 structures（R1.2の後）
 

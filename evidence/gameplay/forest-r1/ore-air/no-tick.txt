@@ -1,0 +1,35 @@
+chunks 3x3  band y=-64..319  differing cells: 1447
+per chunk: 30 154 401 31 75 293 326 73 64
+layers: {'deep': 1006, 'carver': 441}
+excluded as tick artifacts (leaf distance rewritten by LeavesBlock's tick): 107
+# Target chunk cells only:
+  cell -1020,-20,517: got air want lava
+  cell -1021,-20,518: got air want lava
+  cell -1020,-20,518: got air want lava
+  cell -1019,-20,518: got air want lava
+  cell -1021,-20,519: got air want lava
+  cell -1020,-20,519: got air want lava
+  cell -1019,-20,519: got air want lava
+  cell -1020,-20,520: got air want lava
+  cell -1020,-19,515: got air want lava
+  cell -1020,-19,516: got air want lava
+  cell -1020,-19,517: got air want lava
+  cell -1020,-18,512: got air want lava
+  cell -1020,-18,513: got air want lava
+  cell -1020,-18,514: got air want lava
+  cell -1020,-18,515: got air want lava
+  cell -1022,-17,512: got air want lava
+  cell -1021,-17,512: got air want lava
+  cell -1020,-17,512: got air want lava
+  cell -1023,-16,512: got air want lava
+  cell -1022,-16,512: got air want lava
+  cell -1010,-13,525: got chest want chest
+  cell -1014,-13,526: got chest want cave_air
+  cell -1009,38,526: got andesite want coal_ore
+  cell -1010,38,527: got andesite want coal_ore
+  cell -1009,38,527: got andesite want coal_ore
+  cell -1009,39,526: got andesite want coal_ore
+  cell -1010,39,527: got andesite want coal_ore
+  cell -1009,39,527: got andesite want coal_ore
+  cell -1009,50,520: got stone want coal_ore
+  cell -1024,70,527: got air want short_grass

@@ -3,7 +3,7 @@
 // against a generation context; owns the vanilla value and RNG-consumption
 // semantics, not placement orchestration or tree generation.
 
-use crate::block_registry::{breg, bs_parts, ns_name, reg_props_axis, BReg};
+use crate::block_registry::{breg, bs_parts, ns_name, reg_props_axis, BReg, HeightmapKind};
 use crate::generation_context::FC;
 use crate::generation_math::{normal_new_l, Normal, Xor};
 use crate::json::{jarr, jf32, jint, jnum, js, jstr, J};
@@ -798,18 +798,26 @@ pub(crate) enum PM {
     InSquare,
     Offset(IP, IP),
     HeightRange(HP),
-    Heightmap(u8), // 0=world_surface 1=ocean_floor
+    Heightmap(HeightmapKind),
     Biome,
     BlockPred(Pr),
     Rarity(i32),
     Fixed,
-    SurfaceRel(i32, i32), // min_inclusive, max_inclusive (i32::MIN/MAX for absent)
+    SurfaceRel(HeightmapKind, i32, i32), // inclusive offsets; i32::MIN/MAX when absent
     SurfWaterDepth(i32),
     NoiseCount(i32, f64, f64),
     NoiseThrCount(f64, i32, i32),
     RandomChance(f32),
     EnvScan(u8, Option<Pr>, Pr, i32),
     Carving,
+}
+fn p_heightmap(j: &J) -> Option<HeightmapKind> {
+    let name = jstr(j, "heightmap")?;
+    let kind = HeightmapKind::parse(&name);
+    if kind.is_none() {
+        eprintln!("[feature] unsupported heightmap {name}");
+    }
+    kind
 }
 pub(crate) fn p_mod(j: &J) -> Option<PM> {
     let ty = jstr(j, "type")?;
@@ -827,10 +835,7 @@ pub(crate) fn p_mod(j: &J) -> Option<PM> {
             p_ip(js(j, "y_spread").or_else(|| js(j, "y"))?)?,
         ),
         "height_range" => PM::HeightRange(p_hp(js(j, "height")?)?),
-        "heightmap" => PM::Heightmap(match jstr(j, "heightmap").as_deref() {
-            Some(v) if v.contains("OCEAN_FLOOR") => 1,
-            _ => 0,
-        }),
+        "heightmap" => PM::Heightmap(p_heightmap(j)?),
         "biome" => PM::Biome,
         // keeps the position (used by the end platform); unparsed it was dropped,
         // which silently changed the modifier count for that feature
@@ -838,6 +843,7 @@ pub(crate) fn p_mod(j: &J) -> Option<PM> {
         "block_predicate_filter" => PM::BlockPred(p_pred(js(j, "predicate")?)?),
         "rarity_filter" => PM::Rarity(jint(j, "chance", 1)),
         "surface_relative_threshold_filter" => PM::SurfaceRel(
+            p_heightmap(j)?,
             jint(j, "min_inclusive", i32::MIN),
             jint(j, "max_inclusive", i32::MAX),
         ),
@@ -879,9 +885,6 @@ pub(crate) fn dir_off(d: u8) -> (i32, i32, i32) {
         4 => (-1, 0, 0),
         _ => (1, 0, 0),
     }
-}
-fn fluid_of(reg: &BReg, st: u32) -> &str {
-    reg.name_of(st)
 }
 pub(crate) fn is_water_st(reg: &BReg, st: u32) -> bool {
     reg.name_of(st) == "minecraft:water"
@@ -1000,16 +1003,12 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
                 || reg.name_of(below) == "minecraft:clay"
         }
         "minecraft:brown_mushroom" | "minecraft:red_mushroom" => {
-            is_dirtish(reg, below)
-                || matches!(
-                    reg.name_of(below),
-                    "minecraft:podzol"
-                        | "minecraft:mycelium"
-                        | "minecraft:crimson_nylium"
-                        | "minecraft:warped_nylium"
-                        | "minecraft:soul_soil"
-                        | "minecraft:basalt"
-                )
+            // FC runs fresh overworld FEATURES, before INITIALIZE_LIGHT.
+            // SkyLightSectionStorage's missing-column read is 15: all 41
+            // actual MushroomBlock reads on the forest fixture were 15,
+            // including beneath a canopy. Only MUSHROOM_GROW_BLOCK bypasses
+            // the <13 test. Initialized-light feature execution is not modeled.
+            reg.in_tag(below, "minecraft:mushroom_grow_block")
         }
         _ => {
             // BushBlock family (saplings, flowers, grasses, ferns, bushes,
@@ -1032,7 +1031,7 @@ pub(crate) fn test_pred(pr: &Pr, reg: &BReg, ctx: &mut FC, x: i32, y: i32, z: i3
         }
         Pr::Fluids(names) => {
             let st = ctx.get(x, y, z);
-            let f = fluid_of(reg, st);
+            let f = reg.fluid_name(st);
             names.iter().any(|t| t == f)
         }
         Pr::Solid => reg.is_solid(ctx.get(x, y, z)),
