@@ -255,6 +255,34 @@ sculk 経路はそれを呼ばない）。これで vein の順序は厳密に�
    `BiomeFilter` が `WorldGenRegion.getBiome`（= `BiomeManager` の fiddled 探索）である
    ことは確認済みだが、候補セル単位での一致は未検証（候補の y は -64..256 に散る）。
 
+## 分離診断の結果（2026-10-28、`tools/vanilla_sculk_pack.py` + fixture の `sculk_veins` / `sculk_one_patch` モード）
+
+step 7 は `sculk_vein` → `sculk_patch_deep_dark` の順で同じ decorator stream を共有するので、
+片方だけに絞った参照を作れるようにした（両側に同じ pack を入れる必要がある。port 側は
+`datapacks/vanilla/...` を一時的に差し替えて復元する）。
+
+| 診断 | 結果 |
+|---|---|
+| **1. `sculk_vein` 単独**（patch を biome の step 7 から外す） | 参照 8 セル / port 8 セル、**missing 0 extra 0 → PASS**。vein feature は完全一致 = patch に入る時点で stream は正しい |
+| **2. `count: 1` の patch 単独** | 参照に `sculk` が 1 セルも出ない（唯一の候補が石の中に落ち、`canSpreadFrom` が拒否）。**診断として使えない** → 次は `height_range` を深層暗黒の空洞帯（例: absolute -64..-30）に絞った variant が要る |
+| **3. biome filter を container 読みに変更** | 悪化（port 444 セル / extra 252、現行の blended は 429 / 241）。blended のまま据え置き |
+
+**セル単位の内訳**（現行 port vs 参照、4 chunks）:
+
+| 方向 | 内訳 |
+|---|---|
+| missing 209 | `sculk`→deepslate 105、`sculk_vein`→air 97、`sculk`→tuff 5、他 2 |
+| extra 241 | `sculk`→deepslate 147、`sculk_vein`→air 58、`sculk`→tuff 35、他 1 |
+
+つまり port は **sculk を多く育て、vein を少なく残す**（sculk:vein 比 3.7 対 参照 2.0）。
+どちらも patch 由来（vein feature は 8 セルだけ）なので、次の容疑は
+`spc_vein_convert`（vein→sculk 変換）の通り過ぎ、または vein の spread/decay の弱さ。
+
+**bytecode 照合で直したが metric が変わらなかったもの**（CV1 の教訓として記録）:
+`SculkBlock.canPlaceGrowth` は `pos.above()` を見る（`jd.d()` = above、成長も `pos.above()` に書く）
+のに port は below を見ていた。修正しても 429/209/241 は**ビット同一**で、
+この fixture の cursor は上下とも空気のセルに居るため差が出ない。修正は残す（bytecode 準拠）。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・

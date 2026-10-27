@@ -2913,12 +2913,15 @@ fn spc_decrease_charge(pos: (i32, i32, i32), origin: (i32, i32, i32), charge: i3
     (1).max((charge as f32 * ratio * 0.5) as i32)
 }
 
-/// `SculkBlock.canPlaceGrowth` (`dmq.a(dcx,jd)`): the cell below is air or a water source, and
-/// at most two sculk/sculk_shrieker cells exist in the `-4..4 x 0..2 x -4..4` box.
+/// `SculkBlock.canPlaceGrowth` (`dmq.a(dcx,jd)`): the cell **above** the cursor is air or a
+/// water source - the same cell the growth branch writes sculk into - and at most two
+/// sculk/sculk_shrieker cells exist in the `-4..4 x 0..2 x -4..4` box.
 fn spc_can_place_growth(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
-    let below = ctx.get(pos.0, pos.1 - 1, pos.2);
-    let water_source = reg.name_of(below) == "minecraft:water";
-    if !reg.is_air(below) && !water_source {
+    // `$$1.d()` is `above()`, and the growth branch writes at `$$7.d()` too: the cell the
+    // check inspects is the cell the sculk goes into, not the cell below the cursor.
+    let target = ctx.get(pos.0, pos.1 + 1, pos.2);
+    let water_source = reg.name_of(target) == "minecraft:water";
+    if !reg.is_air(target) && !water_source {
         return false;
     }
     let mut seen = 0;
