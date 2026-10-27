@@ -1040,6 +1040,21 @@ check "nether forest vegetation keeps the ceiling guard" \
   '    if y < ctx.g.min_y + 1 {' \
   feature::generation_contract_tests::nether_forest_vegetation_matches_native_cells_and_rng
 
+check "delta feature draws a double, not a float" \
+  src/feature.rs '    let flag = rng.next_f64() < 0.9;' \
+  '    let flag = rng.next_f32() < 0.9;' \
+  feature::generation_contract_tests::delta_feature_matches_native_cells_and_rng
+
+check "manhattan iteration keeps the native order" \
+  src/feature.rs '    cells.sort_by_key(|&(d, x, y, z)| (d, x, y, z.abs(), i32::from(z < 0)));' \
+  '    cells.sort_by_key(|&(d, x, y, z)| (d, x, y, z, i32::from(z < 0)));' \
+  feature::generation_contract_tests::within_manhattan_keeps_the_native_order
+
+check "netherrack replace blobs samples the radius three times" \
+  src/feature.rs '    let (i, j, k) = (radius.get(rng), radius.get(rng), radius.get(rng));' \
+  '    let (i, j, k) = { let r = radius.get(rng); (r, r, r) };' \
+  feature::generation_contract_tests::netherrack_replace_blobs_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

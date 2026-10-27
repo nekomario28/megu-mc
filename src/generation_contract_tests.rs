@@ -66,6 +66,190 @@ fn glowstone_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn within_manhattan_keeps_the_native_order() {
+    // Measured with a probe on the pinned jar (2,1,3):
+    // 0,0,0 -1,0,0 0,-1,0 0,0,1 0,0,-1 0,1,0 1,0,0 -2,0,0 -1,-1,0 -1,0,1 -1,0,-1 ...
+    let order = super::within_manhattan(2, 1, 3);
+    let first: Vec<_> = order.iter().take(11).copied().collect();
+    assert_eq!(
+        first,
+        vec![
+            (0, 0, 0),
+            (-1, 0, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+            (0, 1, 0),
+            (1, 0, 0),
+            (-2, 0, 0),
+            (-1, -1, 0),
+            (-1, 0, 1),
+            (-1, 0, -1),
+        ]
+    );
+    assert_eq!(order.len(), 5 * 3 * 7);
+}
+
+#[test]
+fn netherrack_replace_blobs_matches_native_cells_and_rng() {
+    let reg = breg().unwrap();
+    let basalt = reg.state_of("minecraft:basalt", None);
+    let netherrack = reg.state_of("minecraft:netherrack", None);
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:netherrack_replace_blobs","config":{"radius":{"type":"minecraft:uniform","min_inclusive":3,"max_inclusive":7},"state":{"Name":"minecraft:basalt","Properties":{"axis":"y"}},"target":{"Name":"minecraft:netherrack"}}}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for row in include_str!("../tests/data/netherrack_replace_blobs_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let oy = p[1].parse::<i32>().unwrap();
+        let seed = p[2].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -16i32..=16 {
+            for z in -16i32..=16 {
+                for dy in -20i32..=20 {
+                    let y = oy + dy;
+                    let r2 = x * x + dy * dy + z * z;
+                    let state = match scene {
+                        0 => {
+                            if dy <= -1 {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        1 => {
+                            if r2 <= 9 || (dy <= -4 && dy >= -8 && x.abs() <= 4 && z.abs() <= 4) {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        2 => 0,
+                        3 => {
+                            if dy <= -1 {
+                                if x.abs() <= 2 && z.abs() <= 2 && dy >= -3 {
+                                    basalt
+                                } else {
+                                    netherrack
+                                }
+                            } else {
+                                0
+                            }
+                        }
+                        4 => {
+                            if (1..=3).contains(&dy) {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                        _ => {
+                            if dy <= -1 && !(x.abs() <= 1 && z.abs() <= 1) {
+                                netherrack
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    g.feat_write(x, y, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[3].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[4].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, (0, oy, 0)), p[5], "{row}");
+    }
+}
+
+#[test]
+fn delta_feature_matches_native_cells_and_rng() {
+    let reg = breg().unwrap();
+    let netherrack = reg.state_of("minecraft:netherrack", None);
+    let lava = reg.state_of("minecraft:lava", None);
+    let bedrock = reg.state_of("minecraft:bedrock", None);
+    let bricks = reg.state_of("minecraft:nether_bricks", None);
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:delta_feature","config":{"contents":{"Name":"minecraft:lava","Properties":{"level":"0"}},"rim":{"Name":"minecraft:magma_block"},"rim_size":{"type":"minecraft:uniform","min_inclusive":0,"max_inclusive":2},"size":{"type":"minecraft:uniform","min_inclusive":3,"max_inclusive":7}}}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for row in include_str!("../tests/data/delta_feature_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let seed = p[1].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -16i32..=16 {
+            for z in -16i32..=16 {
+                for dy in -6i32..=6 {
+                    let hole = x.rem_euclid(3) == 0
+                        && z.rem_euclid(3) == 0
+                        && x.abs() <= 9
+                        && z.abs() <= 9;
+                    let state = match scene {
+                        0 => {
+                            if hole && (dy == 0 || dy == 1) {
+                                0
+                            } else {
+                                netherrack
+                            }
+                        }
+                        1 => netherrack,
+                        2 => {
+                            if hole && (dy == 0 || dy == 1) {
+                                if dy == 0 {
+                                    lava
+                                } else {
+                                    0
+                                }
+                            } else {
+                                netherrack
+                            }
+                        }
+                        3 => {
+                            if hole && dy == 0 {
+                                0
+                            } else {
+                                netherrack
+                            }
+                        }
+                        4 => {
+                            if hole && dy == 0 {
+                                bedrock
+                            } else {
+                                netherrack
+                            }
+                        }
+                        _ => {
+                            if hole && dy == 0 {
+                                bricks
+                            } else {
+                                netherrack
+                            }
+                        }
+                    };
+                    g.feat_write(x, 64 + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[2].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(block_cells_digest(reg, &ctx.wr, (0, 64, 0)), p[4], "{row}");
+    }
+}
+
+#[test]
 fn nether_forest_vegetation_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
     let weighted = r#"{"state_provider":{"type":"minecraft:weighted_state_provider","entries":[{"data":{"Name":"minecraft:crimson_roots"},"weight":87},{"data":{"Name":"minecraft:crimson_fungus"},"weight":11},{"data":{"Name":"minecraft:warped_fungus"},"weight":1}]},"spread_width":8,"spread_height":4}"#;

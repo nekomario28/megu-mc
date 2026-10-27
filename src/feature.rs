@@ -64,6 +64,26 @@ enum Cf {
     /// further than chebyshev 16 from the fixed start (8,8). The native sets
     /// `(x, y, z) = (zLoop, y, xLoop)` — transposed — which is the same square.
     VoidStartPlatform,
+    /// `minecraft:netherrack_replace_blobs` (`ede`), config `{target, state, radius}`:
+    /// the origin is clamped into the build height, walked down to the first `target`
+    /// block, and three `radius` samples bound a manhattan ball in which every `target`
+    /// cell becomes `state`. Measured: `radius` is sampled three times, not once.
+    NetherrackReplaceBlobs {
+        target: u32,
+        state: u32,
+        radius: IP,
+    },
+    /// `minecraft:delta_feature` (`ebv`), config `{contents, rim, size, rim_size}`:
+    /// with `nextFloat() < 0.9` a rim is drawn, then two `size` samples bound the
+    /// manhattan ball. A cell qualifies when it is neither `contents` nor in the
+    /// fixed cannot-replace list, every horizontal/down neighbour is non-air and the
+    /// cell above is air. The rim goes at the cell, `contents` at the rim offset.
+    DeltaFeature {
+        contents: u32,
+        rim: u32,
+        size: IP,
+        rim_size: IP,
+    },
     /// `minecraft:nether_forest_vegetation` (`ecx`): the origin's *below* block must be
     /// in the `minecraft:nylium` tag, then `spread_width^2` offsets are tried, each
     /// drawing three pairs of `nextInt` (x, y, z), sampling the state provider and
@@ -1656,6 +1676,129 @@ fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &
     }
 }
 
+/// `BlockPos.withinManhattan`, in the native order (measured, not assumed): cells
+/// sorted by manhattan distance, then `x`, then `y`, then `|z|` with the positive
+/// offset before the negative one. The order matters for features that write while
+/// they iterate, because a later candidate can read an earlier write.
+pub(crate) fn within_manhattan(xr: i32, yr: i32, zr: i32) -> Vec<(i32, i32, i32)> {
+    let mut cells = Vec::new();
+    for x in -xr..=xr {
+        for y in -yr..=yr {
+            for z in -zr..=zr {
+                let d = x.abs() + y.abs() + z.abs();
+                cells.push((d, x, y, z));
+            }
+        }
+    }
+    cells.sort_by_key(|&(d, x, y, z)| (d, x, y, z.abs(), i32::from(z < 0)));
+    cells.into_iter().map(|(_, x, y, z)| (x, y, z)).collect()
+}
+
+/// `ReplaceBlobsFeature` (`ede`). See [`Cf::NetherrackReplaceBlobs`].
+fn gen_netherrack_replace_blobs(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    target: u32,
+    state: u32,
+    radius: &IP,
+) {
+    let Some(reg) = breg() else { return };
+    let target = reg.name_of(target);
+    // `origin.mutable().clamp(Direction.UP, minY + 1, maxY - 1)`
+    let mut y = pos.1.clamp(ctx.g.min_y + 1, ctx.g.min_y + ctx.g.height - 1);
+    let mut found = None;
+    while y > ctx.g.min_y + 1 {
+        if reg.name_of(ctx.get(pos.0, y, pos.2)) == target {
+            found = Some((pos.0, y, pos.2));
+            break;
+        }
+        y -= 1;
+    }
+    let Some(p) = found else { return };
+    let (i, j, k) = (radius.get(rng), radius.get(rng), radius.get(rng));
+    let max = i.max(j).max(k);
+    for (dx, dy, dz) in within_manhattan(i, j, k) {
+        if dx.abs() + dy.abs() + dz.abs() > max {
+            break;
+        }
+        let (x, y, z) = (p.0 + dx, p.1 + dy, p.2 + dz);
+        if reg.name_of(ctx.get(x, y, z)) == target {
+            ctx.set(x, y, z, state);
+        }
+    }
+}
+
+/// `DeltaFeature` (`ebv`). See [`Cf::DeltaFeature`].
+fn gen_delta_feature(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    contents: u32,
+    rim: u32,
+    size: &IP,
+    rim_size: &IP,
+) {
+    let Some(reg) = breg() else { return };
+    // `nextDouble() < 0.9` (the native constant is a double, and `j()` is nextDouble)
+    let flag = rng.next_f64() < 0.9;
+    let (rim_x, rim_z) = if flag {
+        (rim_size.get(rng), rim_size.get(rng))
+    } else {
+        (0, 0)
+    };
+    let has_rim = flag && rim_x != 0 && rim_z != 0;
+    let (size_x, size_z) = (size.get(rng), size.get(rng));
+    let max_size = size_x.max(size_z);
+    // bedrock, nether_bricks, fence, stairs, nether_wart, chest, spawner
+    const CANNOT: [&str; 7] = [
+        "minecraft:bedrock",
+        "minecraft:nether_bricks",
+        "minecraft:nether_brick_fence",
+        "minecraft:nether_brick_stairs",
+        "minecraft:nether_wart",
+        "minecraft:chest",
+        "minecraft:spawner",
+    ];
+    let is_delta = |ctx: &mut FC, reg: &BReg, x: i32, y: i32, z: i32| -> bool {
+        let name = reg.name_of(ctx.get(x, y, z));
+        if name == reg.name_of(contents) || CANNOT.contains(&name) {
+            return false;
+        }
+        for (dx, dy, dz) in [
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+            (-1, 0, 0),
+            (1, 0, 0),
+        ] {
+            // air anywhere but above rejects; the cell above must be air
+            let empty = ctx.is_air(x + dx, y + dy, z + dz);
+            if (empty != (dy == 1)) {
+                return false;
+            }
+        }
+        true
+    };
+    for (dx, _, dz) in within_manhattan(size_x, 0, size_z) {
+        if dx.abs() + dz.abs() > max_size {
+            break;
+        }
+        let (x, z) = (pos.0 + dx, pos.2 + dz);
+        if !is_delta(ctx, reg, x, pos.1, z) {
+            continue;
+        }
+        if has_rim {
+            ctx.set(x, pos.1, z, rim);
+        }
+        let (qx, qz) = (x + rim_x, z + rim_z);
+        if is_delta(ctx, reg, qx, pos.1, qz) {
+            ctx.set(qx, pos.1, qz, contents);
+        }
+    }
+}
+
 /// `NetherForestVegetationFeature` (`ecx`). See [`Cf::NetherForestVegetation`].
 fn gen_nether_forest_vegetation(
     ctx: &mut FC,
@@ -2346,6 +2489,29 @@ fn p_cf(j: &J) -> Option<Cf> {
         "basalt_pillar" => Cf::BasaltPillar,
         "void_start_platform" => Cf::VoidStartPlatform,
         "end_platform" => Cf::EndPlatform,
+        "netherrack_replace_blobs" => Cf::NetherrackReplaceBlobs {
+            target: {
+                let (n, p) = bs_parts(js(j, "target")?)?;
+                breg()?.state_of(&n, p)
+            },
+            state: {
+                let (n, p) = bs_parts(js(j, "state")?)?;
+                breg()?.state_of(&n, p)
+            },
+            radius: p_ip(js(j, "radius")?)?,
+        },
+        "delta_feature" => Cf::DeltaFeature {
+            contents: {
+                let (n, p) = bs_parts(js(j, "contents")?)?;
+                breg()?.state_of(&n, p)
+            },
+            rim: {
+                let (n, p) = bs_parts(js(j, "rim")?)?;
+                breg()?.state_of(&n, p)
+            },
+            size: p_ip(js(j, "size")?)?,
+            rim_size: p_ip(js(j, "rim_size")?)?,
+        },
         "nether_forest_vegetation" => Cf::NetherForestVegetation {
             bsp: p_bsp(js(j, "state_provider")?)?,
             width: jint(j, "spread_width", 0),
@@ -3475,6 +3641,17 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::BasaltPillar => gen_basalt_pillar(ctx, rng, pos),
         Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
         Cf::EndPlatform => gen_end_platform(ctx, pos),
+        Cf::NetherrackReplaceBlobs {
+            target,
+            state,
+            radius,
+        } => gen_netherrack_replace_blobs(ctx, rng, pos, *target, *state, radius),
+        Cf::DeltaFeature {
+            contents,
+            rim,
+            size,
+            rim_size,
+        } => gen_delta_feature(ctx, rng, pos, *contents, *rim, size, rim_size),
         Cf::NetherForestVegetation { bsp, width, height } => {
             gen_nether_forest_vegetation(ctx, rng, pos, bsp, *width, *height)
         }
