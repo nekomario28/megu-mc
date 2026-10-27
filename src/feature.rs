@@ -2974,15 +2974,40 @@ fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool
     let state = ctx.get(x, y, z);
     match cursor.facings {
         // `facings == null`: `SculkVeinBlock.m()`, the spreader with only SAME_POSITION
-        None => spc_spread_all(ctx, reg, cursor.pos, state, &[0]),
+        None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
         // empty facings: the interface default uses `SculkVeinBlock.c()` (all three types)
-        Some(0) => spc_spread_all(ctx, reg, cursor.pos, state, &[0, 1, 2]),
+        Some(0) => spc_spread_all(
+            ctx,
+            reg,
+            cursor.pos,
+            state,
+            &[0, 1, 2],
+            "spread-cursor-3type",
+        ),
         Some(mask) => {
             if !reg.is_air(state) && reg.fluid_name(state) != "minecraft:water" {
                 return false;
             }
             spc_vein_attempt_spread(ctx, reg, cursor.pos, state, mask)
         }
+    }
+}
+
+/// Write one sculk-family cell, naming the call site when asked to.
+///
+/// `SPC_TRACE_CELL=x,y,z` prints every write to that cell with its call site, and
+/// `SPC_TRACE_ALL=1` prints all of them. The order and the call site are what localise a
+/// divergence: the first write that leaves the reference's cell set is where two otherwise
+/// identical-looking implementations part, and *which* call site produced it says which
+/// predicate to read next.
+fn spc_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, tag: &str) {
+    let all = std::env::var("SPC_TRACE_ALL").is_ok();
+    if all || std::env::var("SPC_TRACE_CELL").as_deref() == Ok(&format!("{},{},{}", p.0, p.1, p.2))
+    {
+        eprintln!("SPCSET {} {} {} state={} at={tag}", p.0, p.1, p.2, st);
+    }
+    if !ctx.out_of_h(p.1) {
+        ctx.set(p.0, p.1, p.2, st);
     }
 }
 
@@ -2999,6 +3024,7 @@ fn spc_spread_all(
     pos: (i32, i32, i32),
     state: u32,
     types: &[u8],
+    tag: &str,
 ) -> bool {
     let mut any = false;
     let is_vein = spc_kind(reg, state) == SpcKind::Vein;
@@ -3008,7 +3034,7 @@ fn spc_spread_all(
             continue;
         }
         for to in 0..6u8 {
-            if spc_spread(ctx, reg, pos, state, from, to, types) {
+            if spc_spread(ctx, reg, pos, state, from, to, types, tag) {
                 any = true;
             }
         }
@@ -3027,6 +3053,7 @@ fn spc_spread(
     from: u8,
     to: u8,
     types: &[u8],
+    tag: &str,
 ) -> bool {
     if to / 2 == from / 2 {
         return false;
@@ -3050,9 +3077,7 @@ fn spc_spread(
         }
         return match multiface_state(ctx, reg, target, SPC_VEIN, face) {
             Some(st) => {
-                if !ctx.out_of_h(target.1) {
-                    ctx.set(target.0, target.1, target.2, st);
-                }
+                spc_set(ctx, target, st, tag);
                 true
             }
             None => false,
@@ -3167,9 +3192,7 @@ fn spc_vein_attempt_spread(
     if reg.fluid_name(state) != "minecraft:empty" {
         vein = reg.with_prop(vein, "waterlogged", "true");
     }
-    if !ctx.out_of_h(pos.1) {
-        ctx.set(pos.0, pos.1, pos.2, vein);
-    }
+    spc_set(ctx, pos, vein, "attempt");
     true
 }
 
@@ -3194,14 +3217,12 @@ fn spc_vein_convert(ctx: &mut FC, reg: &BReg, rng: &mut Xor, pos: (i32, i32, i32
             continue;
         }
         let sculk = reg.state_of("minecraft:sculk", None);
-        if !ctx.out_of_h(nb.1) {
-            ctx.set(nb.0, nb.1, nb.2, sculk);
-        }
+        spc_set(ctx, nb, sculk, "convert");
         // `this.e.a(sculkState, level, newPos, worldGen)`: veins spread from the new sculk cell
         // (spreader `c()`, all three spread types). This call is what sustains the patch: with
         // it removed the whole capture collapses from 429 sculk-family cells to 16 (measured),
         // because the vein -> sculk conversion chain has no new veins to convert.
-        spc_spread_all(ctx, reg, nb, sculk, &[0, 1, 2]);
+        spc_spread_all(ctx, reg, nb, sculk, &[0, 1, 2], "spread-post-convert");
         let opposite = d ^ 1;
         for around in 0..6u8 {
             if around == opposite {
@@ -3239,9 +3260,7 @@ fn spc_vein_decay(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32), st: u32) {
             reg.state_of("minecraft:water", None)
         };
     }
-    if !ctx.out_of_h(pos.1) {
-        ctx.set(pos.0, pos.1, pos.2, st);
-    }
+    spc_set(ctx, pos, st, "decay");
 }
 
 /// `SculkBehaviour.decay` (`dmp.a(dcx,dtc,jd,ayw)`): only the vein behaviour does anything, and

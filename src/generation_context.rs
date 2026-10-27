@@ -93,6 +93,19 @@ impl<'a> FC<'a> {
                 f & 0xFFFF
             );
         }
+        // `FEATURE_WRITE_TRACE=<cx>,<cz>`: every feature write in that chunk, in the order it
+        // happened. A per-cell filter cannot answer "which write diverged first", and a digest
+        // cannot either - the order is the only place the first difference is visible.
+        if crate::trace_env::env_str!("FEATURE_WRITE_TRACE")
+            .is_some_and(|want| want == format!("{},{}", x >> 4, z >> 4))
+        {
+            let f = crate::generation_math::XTRACE_FEAT.load(Ordering::Relaxed);
+            eprintln!(
+                "FWRITE {x} {y} {z} state={st} feature={},{}",
+                f >> 32,
+                f & 0xFFFF
+            );
+        }
         self.wr.insert((x, y, z), st);
         // the heightmap lives on `Gen` so that a write for this chunk is visible to
         // the next chunk's placements too (vanilla updates the owning chunk's

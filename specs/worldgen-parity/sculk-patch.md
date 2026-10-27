@@ -312,6 +312,33 @@ missing 43 / extra 13。セル単位で見ると:
 trace して（`ctx.set` を chunk で絞って順に出す）、参照セル集合と突き合わせ、最初に集合から
 外れる書き込みの近傍を見る。そこが最初の分岐で、以降は stream のずれとして増幅される。
 
+## 書き込み順 trace で最初のずれを特定した（2026-10-28）
+
+`FC::set` に `FEATURE_WRITE_TRACE=<cx>,<cz>` を追加（その chunk の feature 書き込みを
+**順に**出す）。digest は「どこが違うか」しか言わないが、**順序**は「最初の違い」を出す。
+
+さらに `spc_set` ラッパで sculk 系の書き込みに**呼び出し元のタグ**を付けた
+（`convert` / `spread-post-convert` / `spread-cursor-1type` / `spread-cursor-3type` /
+`attempt` / `decay`）。`SPC_TRACE_CELL=x,y,z` で 1 セル、`SPC_TRACE_ALL=1` で全件。
+
+洞穴帯 one-patch 参照の chunk (-16,113) で測った結果:
+
+- 参照と port の**最初のずれ**は sculk でも vein の新規配置でもなく、
+  **port が vanilla の残す vein を air に decay した**こと
+  （`-242,-44,1823`: vanilla の最終状態は `sculk_vein`、port は `air`）。port 自身の順序では
+  そのセルに vein を書いた直後に decay で消している。
+- port 順序での**最初の「余分」な書き込み**は `-246,-42,1823` の vein で、
+  呼び出し元タグは **`spread-post-convert`**（変換後の vein spread）。
+
+したがって最初の分岐は「変換 → 変換後の vein spread → decay」の3つの並びの中にあり、
+global な症状（port は sculk 過多・vein 過少）とも一致する: 余分な sculk が周囲の vein の
+面を落とさせ（decay は隣が sculk の面を落とし、面が尽きた vein は air/water になる）、
+結果として vein が減る。
+
+次の一手は 1 つ: `spread-post-convert`（`this.e.a(sculkState, level, newPos, worldGen)`）の
+述語を、その最初の余分セル 1 つに絞って vanilla と突き合わせる。`SPC_TRACE_CELL` があるので
+「そのセルに書いた呼び出し元」は 1 秒で出る。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・
