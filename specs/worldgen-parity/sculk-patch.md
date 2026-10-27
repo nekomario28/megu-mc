@@ -122,7 +122,76 @@ growth 分岐まで検証するには、cases 用に `growth_rounds = 1` の con
   catalyst の `nextFloat` と `canSurvive`／shrieker の `CAN_SUMMON` と `isFaceSturdy`／
   `growth_rounds` 分岐の有無。
 
-## 実装を試みて分かった障害（2026-10-27、実測）
+## 比較経路：whole-chunk capture（2026-10-27 に確立・実測）
+
+feature 単体の oracle は使えない（下の「測った障害」）。**深層暗黒 biome の実チャンクを
+生成して sculk セルだけを照合する**経路が確立した。
+
+### 手順（再現コマンド）
+
+```bash
+# 1. 参照: 固定 1.21.1 の実サーバーで deep dark の 2x2 チャンクを生成
+tools/chunk_world_fixture.sh dd3 -16 112 2 features      # seed 0、約3分
+# 2. port の dump（1 秒）
+MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=/var/tmp/dd3.bin MC_SPINE_WG_DUMP_N=2 \
+  MC_SPINE_WG_DUMP_X=-16 MC_SPINE_WG_DUMP_Z=112 MC_SPINE_SEED=0 ./target/release/mc-spine
+# 3. sculk セルだけを照合
+tools/sculk_gate.py /tmp/chunkfix-dd3/world /var/tmp/dd3.bin 2 -16 112 [--require-match]
+```
+
+`chunk_world_fixture.sh` に `SEED` / `view-distance` / `simulation-distance` の固定を足した:
+参照が再現しないと 1 セルも証明できないため（既定 seed 0、距離 10）。
+
+### チャンクの選び方（実測）
+
+deep dark は origin 付近には無い。port の気候 router で走査して座標を決めた
+（`MC_SPINE_WG_PROFILE=1 MC_SPINE_BIOME_AT=...`、chunk 中心を y=-63 で):
+`container=minecraft:deep_dark` になるのは **chunk (-16,112) と (-15,112) 付近**
+（±512 ブロックの走査で 3468 点中 108 点が deep dark、多くは z≈1536-2048）。
+`container` を見るのは、feature 層の biome フィルタが読むのがそれだから
+（`blended` と `container` が違う地点もある）。
+
+### 参照（vanilla, seed 0, chunks (-16,112)-(-15,113)）の sculk セル
+
+| block | cells |
+|---|---|
+| `minecraft:sculk` | **265** |
+| `minecraft:sculk_vein` | **131** |
+| `minecraft:sculk_catalyst` | **1** |
+| 合計 | **397** |
+
+**port は現在 0**（feature 未実装）。したがって `tools/sculk_gate.py` は
+`--require-match` で exit 1 になり、これが実装の合格条件そのものになる。
+sculk が 1 セルも無い capture は exit 2（「何も証明しない」）で、緑にならない。
+
+同じ 4 チャンクの全セル比較（`tools/carver_diff.py`）では 1732 セルが違うが、その内訳は
+別の層の既知の差（leaf distance ≈1000、deepslate/stone の物性 ≈350、carver の空気 497）で、
+sculk ファミリに絞ることで主張が具体的になる。**領域一致は主張しない。**
+
+### 実装に必要な残りの意味論（decompile 済み・次のセッション用）
+
+- spreader は `dmu.b()`: chargeCount 50 / amountPerCharge 1 / chargeDecayRate 5 /
+  noGrowthRadius 10、`isWorldGeneration = true`（**merge しない**、同一位置のカーソルは
+  重複したまま残る）。
+- `ChargeCursor.update` の順序と `closerThan(pos, 15.0)` は `distSqr < 225`（等号は
+  範囲外＝charge 0）。`facings` の更新は `next != null` の外側でも走る。
+- `SculkBlock`: `nextInt(5) == 0` の門、`getSculkState` は `nextInt(11) == 0` で
+  shrieker（`CAN_SUMMON = worldGen`）、waterlogged は
+  `!getFluidState(pos).isEmpty()`（水以外の流体でも立つ）。
+- `SculkVeinBlock.attemptSpreadVein`: waterlogged は
+  `!state.getFluidState().isEmpty()`（**空でないとき** true。逆に読むと全滅する）。
+- vein の spread は `MultifaceSpreader`（既存の `multiface_spread` がそのまま使える）で、
+  `spreadAll` は `from` 6 方向（enum 順・シャッフル無し）ごとに、`to` 6 方向を
+  `Direction.allShuffled` でシャッフルして 1 セルまで置く。
+- vein の `canSpread` 連鎖は `dkz$b` / `dkz$a` / `SculkVeinSpreaderConfig` の 3 段で、
+  未確定の細部が残る: `SCULK/SCULK_CATALYST/SCULK_SENSOR` の拒否、
+  `target.distManhattan(pos) == 2` のときの `isFaceSturdy` 側面判定、
+  `FluidTags.WATER` 以外の流体の拒否、`FIRE` タグの拒否。
+- `isFaceSturdy` / `canAttachTo` は asset の側面フラグ（`is_solid && side_solid(face)`）で
+  近似する。deep dark の対象セルは full cube / air / water / sculk 系だけなので、
+  この範囲では結果が一致することを capture で確認する（範囲外では主張しない）。
+
+## 測った障害：feature 単体の oracle は使えない（2026-10-27）
 
 `FeatureOracle` で native を駆動しようとすると、記録済みの `place()` までは進むが
 最初の `updateCursors` で落ちる:
@@ -135,22 +204,12 @@ java.lang.UnsupportedOperationException: public abstract duy dcz.a(int,int,dvz,b
 `Block.updateFromNeighbourShapes`（`SculkVeinBlock` の private `a(dmu,dcx,jd,ayw)` が
 sculk を置いた直後に呼ぶ）で、block の形状更新が chunk を要求する。level proxy で
 返せるのは `ChunkAccess` の実体だけで、それは「level を半端にモデル化しない」という
-harness の原則（`native-oracle.md`）に反する。
-
-したがって `sculk_patch` の native 照合は **この oracle では不可能**で、次のどちらかが
-要る:
-
-1. **whole-chunk 経路**（R1.2 の capture）で深層暗黒 biome の実チャンクを生成し、
-   sculk セルを biome 単位で比較する。feature 単体の fixture は作れない。
-2. harness に「空の `ChunkAccess` を返す最小実装」を足す。sculk の vein が
-   `getChunk` の結果をどう使うか（`setBlock` 相当の書き戻しがあるか）を先に確認する
-   必要があり、書き戻しがあるなら proxy の write-through と衝突する。
-
-この試行で書いた port（`SculkSpreader` / `Cursor` / `SculkBlock` / vein 経路 / feature）は
-**未検証なので commit していない**（`git checkout -- src/feature.rs` で破棄）。
-残っているのはこの記録だけである。実装を再開するときは、上の 1 か 2 を先に決める。
+harness の原則（`native-oracle.md`）に反する。よって whole-chunk 経路を採る。
 
 ## 未検証として残ること
 
-- 現時点で `sculk_patch` のセルは 1 つも port と照合していない。この文書は調査記録で
-  あり、parity の主張ではない。
+- **port はまだ実装していない**（397 セルすべてが未実装による欠落）。この文書は
+  調査記録と比較経路・合格条件の記録であり、parity の主張ではない。
+- 実装を試みた port は未検証だったので破棄した（`git checkout -- src/feature.rs`）。
+- 再開時は上の「実装に必要な残りの意味論」から始め、`tools/sculk_gate.py --require-match`
+  が exit 0 になるまでを合格条件にする。

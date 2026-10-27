@@ -25,6 +25,13 @@ rm -rf "$DIR"; mkdir -p "$DIR/world"
 cp "$BASE/server.jar" "$DIR/"
 cp -r "$BASE/libraries" "$BASE/versions" "$DIR/"
 sed 's/^level-name=.*/level-name=world/' "$BASE/server.properties" > "$DIR/server.properties"
+# The base properties were chosen for a surface fixture. A deep-dark capture needs the
+# chunks actually generated (a shrunken view distance or a low simulation distance makes
+# the server save a chunk that was never decorated), and a fixed seed so the reference is
+# reproducible: `SEED` defaults to 0, which is the seed every other fixture uses.
+sed -i "s/^level-seed=.*/level-seed=${SEED:-0}/" "$DIR/server.properties"
+sed -i 's/^view-distance=.*/view-distance=10/' "$DIR/server.properties"
+sed -i 's/^simulation-distance=.*/simulation-distance=10/' "$DIR/server.properties"
 echo "eula=true" > "$DIR/eula.txt"
 case "$MODE" in
   terrain|carvers|features) echo 'generate-structures=false' >> "$DIR/server.properties" ;;
