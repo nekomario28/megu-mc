@@ -187,6 +187,15 @@ sculk ファミリに絞ることで主張が具体的になる。**領域一致
   未確定の細部が残る: `SCULK/SCULK_CATALYST/SCULK_SENSOR` の拒否、
   `target.distManhattan(pos) == 2` のときの `isFaceSturdy` 側面判定、
   `FluidTags.WATER` 以外の流体の拒否、`FIRE` タグの拒否。
+- **未確定として残した最大の点**: `MultifaceSpreader.spreadAll(state, level, pos, spreadOnly)` の
+  配管。decompile (`dkz.java`) には (a) `from` ごとに `config.isOtherBlockValidAsSource(state,
+  from)` で絞る、(b) `to` を乱数でシャッフルする、(c) `from` は `Direction.values()` の順
+  （シャッフルしない）という3点が見えるが、どの overload がどの乱数を受け取るかが
+  Vineflower の総称の混線で確定できなかった。既存の `multiface_spread`（`multiface_growth` で
+  検証済み）は 6-arg の `spread(state, level, pos, from, spreadOnly, random)` に相当するので、
+  vein では「`from` を 0..6 で回して、各 `from` で `multiface_spread` 相当を1回呼ぶ」形が
+  候補だが、**`isOtherBlockValidAsSource` の条件を確定してから**書く。ここを推測で埋めると
+  397 セルの draw 順がずれたまま「近い」結果になり、原因の切り分けに時間を溶かす。
 - `isFaceSturdy` / `canAttachTo` は asset の側面フラグ（`is_solid && side_solid(face)`）で
   近似する。deep dark の対象セルは full cube / air / water / sculk 系だけなので、
   この範囲では結果が一致することを capture で確認する（範囲外では主張しない）。
