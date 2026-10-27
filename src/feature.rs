@@ -3072,7 +3072,16 @@ fn spc_spread(
                 to ^ 1,
             ),
         };
-        if !spc_can_spread(ctx, reg, pos, target, face) {
+        let watch = std::env::var("SPC_TRACE_CELL").as_deref()
+            == Ok(&format!("{},{},{}", target.0, target.1, target.2));
+        let ok = spc_can_spread(ctx, reg, pos, target, face);
+        if watch {
+            eprintln!(
+                "SPCPRED target={target:?} pos={pos:?} from={from} to={to} type={t} face={face} state={} passes={ok} tag={tag}",
+                reg.name_of(ctx.get(target.0, target.1, target.2))
+            );
+        }
+        if !ok {
             continue;
         }
         return match multiface_state(ctx, reg, target, SPC_VEIN, face) {

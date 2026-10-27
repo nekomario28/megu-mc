@@ -31,6 +31,7 @@
 | `vanilla_pack_from_jar.sh [dir]` | 同じ固定jarの worldgen JSON・block tag・built-in biome tree をまとめて更新する（JDK必須） |
 | `fixture_base.sh [dir]` | 固定具の基点（`CARVER_FIXTURE_BASE`、既定 `/tmp/carverfresh`）を組む。jar を sha1 で固定し、worldgen に効く設定をここで明示する。基点が無いと固定具は空振りする |
 | `carver_fixture.sh <tag> <cave> <extra> <canyon> [n]` | carver だけを残した world を作り、port と block 単位で diff。`ctl` pack で carver を差し替え |
+| `vanilla_sculk_pack.py <jar> <world> --variant veins\|one-patch [--count N] [--height MIN:MAX]` | deep-dark の step 7 を片方だけに絞った datapack を書く（`sculk_vein` と `sculk_patch_deep_dark` は 同じ decorator stream を共有するので、全セル比較ではどちらが動いたか言えない）。port 側にも同じ ファイルを入れる必要がある（script は path を印字するだけで port の pack には触らない）。 fixture 側は `sculk_veins` / `sculk_one_patch` / `sculk_cave_patch` モード |
 | `sculk_gate.py <world> <dump.bin> <n> <x0> <z0> [--require-match]` | sculk ファミリ（`sculk`/`sculk_vein`/`sculk_catalyst`/`sculk_shrieker`）のセルだけを参照 region と port dump で照合する。feature 単体の oracle が使えない `sculk_patch` の合格条件。sculk の無い参照は exit 2（何も証明しない）。[経路と実測値](../specs/worldgen-parity/sculk-patch.md) |
 | `chunk_world_fixture.sh <tag> <cx> <cz> <n> <terrain\|carvers\|features\|structures>` | 固定jarの同一座標regionをforceloadし、mc-spineの同じstage dumpと`carver_diff`で比較する。参照chunkの完成を先に検査する |
 | `ore_fixture.sh <tag> <keep> [n]` | `ore_*`/`disk_*` のうち `<keep>` 以外の placement を `count: 0` にした world を作る（1 feature 隔離） |

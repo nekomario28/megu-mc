@@ -339,6 +339,43 @@ global な症状（port は sculk 過多・vein 過少）とも一致する: 余
 述語を、その最初の余分セル 1 つに絞って vanilla と突き合わせる。`SPC_TRACE_CELL` があるので
 「そのセルに書いた呼び出し元」は 1 秒で出る。
 
+## 述語レベルの trace と、**捕捉領域のマージン**という方法論の修正（2026-10-28）
+
+`spc_spread` に述語トレース（`SPC_TRACE_CELL` のセルに達した候補について
+`target/pos/from/to/type/face/state/passes/tag` を出す）を追加。特定した余分セル
+`-246,-42,1823` に効いた書き込みは:
+
+```
+target=(-246,-42,1823) pos=(-246,-43,1824) from=2(north) to=1(up) type=2(WRAP_AROUND)
+face=0(down) state=air passes=true tag=spread-post-convert
+```
+
+つまり `pos`（変換で sculk になったセル）が **chunk 114** にあり、そこから chunk 113 に
+vein を伸ばしていた。**前回の 2x2 捕捉は小さすぎた**: パッチの起点が隣 chunk にあると、
+こちらの chunk に書き込む一方でその起点の参照が捕捉領域の外に落ちる。R1 の規律
+（source footprint は入力）そのもの。
+
+そこで **1 chunk のマージンを持つ 4x4 捕捉**を取った（chunks (-18,110)+4x4, mode features）:
+
+| | sculk | sculk_vein | catalyst | shrieker | 合計 |
+|---|---|---|---|---|---|
+| 参照 | 3881 | 1188 | 9 | 4 | **5082** |
+| port | 4001 | 822 | 11 | 0 | **4834** |
+
+missing 2174 / extra 1926 / wrong-state 9。内訳を測ると**系統的なオフセットは無い**:
+port の sculk 4001 のうち **2666 (67%) が参照と完全一致**、vein は 822 中 233 が一致、
+残りは 1-2 セル散らばるか近傍に無い。→ 規則の系統誤りではなく、**列（sequence）が
+途中で分岐して増幅**している形。
+
+内部 chunk (-17,111) の書き込み順で最初に参照集合から外れるのは
+`-272,-38,1776` の vein（参照は `-272,-39,1776` に vein = **1 セル上**）で、やはり
+`spread-post-convert` 由来だった。
+
+**次の一手**: 分岐点は「変換 → 変換後 spread」の中の 1 述語に絞られている。
+`SPC_TRACE_CELL` と `SPCPRED` があるので、分岐セル 1 つについて vanilla 側の同じ瞬間の
+状態（= 参照の最終状態から復元できる範囲）と突き合わせ、`passes=true` になった
+述語のどれが vanilla と食い違うかを 1 つずつ反転して metric の向きを見る。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・
