@@ -82,6 +82,52 @@ public final class NativeHarness {
         return String.valueOf(st);
     }
 
+    /**
+     * `minecraft:block[prop=value,...]` with the properties sorted by name.
+     *
+     * `BlockState.toString()` is the native object's own rendering (`Block{...}[...]`);
+     * a portable comparison needs one spelling both sides can produce, so the fixture
+     * uses this canonical form and sorts the properties.
+     */
+    public static String normalizedStateName(Object st) throws Exception {
+        String name = nameOf(st);
+        Object props = null;
+        for (Method m : stateC.getMethods()) {
+            if (m.getParameterCount() == 0 && java.util.Collection.class.isAssignableFrom(m.getReturnType())) {
+                props = m.invoke(st);
+                break;
+            }
+        }
+        if (!(props instanceof java.util.Collection<?> c) || c.isEmpty()) return name;
+        Object first = c.iterator().next();
+        Method value = null;
+        for (Method m : stateC.getMethods()) {
+            if (m.getParameterCount() == 1 && m.getParameterTypes()[0].isAssignableFrom(first.getClass())) {
+                value = m;
+                break;
+            }
+        }
+        Method propName = null;
+        for (Method m : first.getClass().getMethods()) {
+            if (m.getParameterCount() == 0 && m.getReturnType() == String.class) {
+                propName = m;
+                break;
+            }
+        }
+        java.util.TreeMap<String, String> sorted = new java.util.TreeMap<>();
+        for (Object prop : c) {
+            sorted.put(String.valueOf(propName.invoke(prop)), String.valueOf(value.invoke(st, prop)));
+        }
+        StringBuilder sb = new StringBuilder(name).append('[');
+        boolean firstEntry = true;
+        for (var e : sorted.entrySet()) {
+            if (!firstEntry) sb.append(',');
+            sb.append(e.getKey()).append('=').append(e.getValue());
+            firstEntry = false;
+        }
+        return sb.append(']').toString();
+    }
+
     /** Registry name of a BlockState's block. */
     public static String nameOf(Object st) {
         try {
