@@ -70,6 +70,28 @@ def block_tags(path):
     return path
 
 
+def fluid_tags(inner_jar, path):
+    """Fluid tags from the pinned jar: the installed pack ships none.
+
+    `LevelReader.isWaterAt` is `getFluidState(pos).is(FluidTags.WATER)`, so an unbound
+    fluid tag makes water not water and every derived `waterlogged` property false.
+    """
+    import io
+    import zipfile
+
+    out = {}
+    with zipfile.ZipFile(io.BytesIO(inner_jar)) as jar:
+        for name in jar.namelist():
+            prefix = 'data/minecraft/tags/fluid/'
+            if not (name.startswith(prefix) and name.endswith('.json')):
+                continue
+            tag = 'minecraft:' + name[len(prefix):-len('.json')]
+            values = json.loads(jar.read(name)).get('values', [])
+            out[tag] = [v if isinstance(v, str) else v.get('id') for v in values]
+    path.write_text(''.join(f"{tag}\t{','.join(out[tag])}\n" for tag in sorted(out)))
+    return path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('name', choices=sorted(ORACLES))
@@ -77,18 +99,29 @@ def main():
     p.add_argument('--write', action='store_true')
     p.add_argument('--cells', type=Path,
                    help='also keep the per-case cell list (the digest cannot name a property)')
+    p.add_argument('--cases', type=Path,
+                   help='data-driven scenes: run tools/structure-oracle/FeatureOracle.java '
+                        'with this cases JSON instead of the per-type oracle class')
     args = p.parse_args()
+    if args.cases:
+        args.cases = args.cases.resolve()  # the probe runs with its own cwd
     fixture = ROOT / ORACLES[args.name]
-    oracle = ROOT / f'tools/structure-oracle/{args.name.title().replace("_", "")}Oracle.java'
-    with pinned_runtime(args.jar) as (work, cp, _):
+    if args.cases:
+        oracle = ROOT / 'tools/structure-oracle/FeatureOracle.java'
+        main = 'dev.mcspine.tools.FeatureOracle'
+    else:
+        oracle = ROOT / f'tools/structure-oracle/{args.name.title().replace("_", "")}Oracle.java'
+        main = 'dev.mcspine.tools.' + oracle.stem
+    with pinned_runtime(args.jar) as (work, cp, inner):
         os.environ['MC_NATIVE_BLOCK_TAGS'] = str(block_tags(work / 'block_tags.tsv'))
+        os.environ['MC_NATIVE_FLUID_TAGS'] = str(fluid_tags(inner, work / 'fluid_tags.tsv'))
         output = work / f'{args.name}.tsv'
         cells = work / f'{args.name}_cells.tsv'
-        argv = [output, cells] if args.cells else [output]
-        run_probe(work, cp, oracle, 'dev.mcspine.tools.'
-                  + oracle.stem, *argv, extra_sources=(HARNESS,))
+        argv = ([args.cases] if args.cases else []) + [output] \
+            + ([args.cells] if args.cells else [])
+        run_probe(work, cp, oracle, main, *argv, extra_sources=(HARNESS,))
         actual = output.read_bytes()
-        cells_actual = cells.read_bytes() if args.cells else None
+        cells_actual = args.cells.read_bytes() if args.cells else None
     if cells_actual is not None:
         args.cells.write_bytes(cells_actual)
     if args.write:

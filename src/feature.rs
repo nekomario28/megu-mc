@@ -96,6 +96,19 @@ enum Cf {
         stem: Bsp,
         radius: i32,
     },
+    /// `minecraft:pointed_dripstone` (`eda`), config `{chance_of_taller_dripstone,
+    /// chance_of_directional_spread, chance_of_spread_radius2, chance_of_spread_radius3}`.
+    ///
+    /// Measured from `eda` and `ebz` (`DripstoneUtils`), then confirmed cell by cell: the
+    /// origin needs a dripstone base (`dripstone_block` or the `dripstone_replaceable_blocks`
+    /// tag) below and/or above; both sides is a `nextBoolean` between hanging and standing,
+    /// neither refuses. The support cell and its horizontal neighbours become
+    /// `dripstone_block` where the tag allows it (three nested `!(nextFloat() > chance)`
+    /// gates, one draw each per horizontal direction NORTH/EAST/SOUTH/WEST, then up to two
+    /// `Direction.getRandom` steps), and the tip itself is `2` cells only when
+    /// `nextFloat() < chance_of_taller_dripstone` *and* the cell beyond the tip is empty or
+    /// water. `waterlogged` comes from the real fluid state, not a block-name test.
+    PointedDripstone(PointedDripstoneCfg),
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -688,6 +701,20 @@ pub(crate) struct DripstoneClusterCfg {
     max_dist_center: i32,
 }
 
+/// `PointedDripstoneConfiguration` (`eer`): four float chances, all defaults present in the
+/// codec, which is why the pack's configs may omit any of them.
+#[derive(Clone, Copy)]
+pub(crate) struct PointedDripstoneCfg {
+    /// `chance_of_taller_dripstone`: a two-cell tip instead of one.
+    taller: f32,
+    /// `chance_of_directional_spread`: per horizontal direction, one `nextFloat` gate.
+    directional: f32,
+    /// `chance_of_spread_radius2`: a second cell one `Direction.getRandom` step away.
+    radius2: f32,
+    /// `chance_of_spread_radius3`: a third cell one more step away.
+    radius3: f32,
+}
+
 /// `Column` (`dyo`): the span of empty/water cells a column sits in. `ceiling` is the
 /// first neither-empty-nor-water cell found scanning **up**, `floor` the one found
 /// scanning down - so `floor < pos.y < ceiling` whenever both are present.
@@ -924,8 +951,11 @@ fn drip_place_dripstone_block(ctx: &mut FC, pos: (i32, i32, i32)) -> bool {
     let Some(reg) = breg() else { return false };
     let st = ctx.get(pos.0, pos.1, pos.2);
     if reg.in_tag(st, "minecraft:dripstone_replaceable_blocks") {
-        let block = reg.state_of("minecraft:dripstone_block", None);
-        ctx.set(pos.0, pos.1, pos.2, block);
+        // native `setBlock` refuses out-of-height cells but the method still reports true
+        if !ctx.out_of_h(pos.1) {
+            let block = reg.state_of("minecraft:dripstone_block", None);
+            ctx.set(pos.0, pos.1, pos.2, block);
+        }
         true
     } else {
         false
@@ -979,7 +1009,11 @@ fn drip_build_base_to_tip(ctx: &mut FC, pos: (i32, i32, i32), up: bool, height: 
         // `state.setValue(WATERLOGGED, level.isWaterAt(m))`
         let wl = reg.name_of(ctx.get(m.0, m.1, m.2)) == "minecraft:water";
         let st = reg.with_prop(st, "waterlogged", if wl { "true" } else { "false" });
-        ctx.set(m.0, m.1, m.2, st);
+        // native `setBlock` refuses cells outside the build height (a tip at the top of the
+        // world is cut off); done here because every drip feature writes through this helper
+        if !ctx.out_of_h(m.1) {
+            ctx.set(m.0, m.1, m.2, st);
+        }
         m.1 += dir;
     }
 }
@@ -1945,6 +1979,90 @@ fn red_mushroom_cap(
             }
         }
     }
+}
+
+/// `PointedDripstoneFeature` (`eda`). See [`Cf::PointedDripstone`].
+fn gen_pointed_dripstone(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    c: &PointedDripstoneCfg,
+) {
+    let Some(reg) = breg() else { return };
+    let (x, y, z) = pos;
+    // `getTipDirection`: `isDripstoneBase(below)` and `isDripstoneBase(above)`; DOWN (hang)
+    // and UP (stand) are both possible, and `nextBoolean` is drawn only in that case.
+    let below = ctx.get(x, y - 1, z);
+    let above = ctx.get(x, y + 1, z);
+    let up_base = drip_is_dripstone_base(reg, below);
+    let down_base = drip_is_dripstone_base(reg, above);
+    let up = if up_base && down_base {
+        !rng.next_bool() // `nextBoolean() ? DOWN : UP`
+    } else if up_base {
+        true
+    } else if down_base {
+        false
+    } else {
+        return;
+    };
+    let base = if up { (x, y - 1, z) } else { (x, y + 1, z) };
+    pointed_dripstone_patch(ctx, rng, base, c);
+    // the tip is 2 cells when the taller draw passes and the cell past it is empty or water
+    let beyond = if up { (x, y + 1, z) } else { (x, y - 1, z) };
+    let taller = rng.next_f32() < c.taller && drip_is_empty_or_water(ctx, beyond);
+    let height = if taller { 2 } else { 1 };
+    drip_grow_pointed_dripstone(ctx, pos, up, height, false);
+}
+
+/// `PointedDripstoneFeature.createPatchOfDripstoneBlocks` (`eda.a(dcx,ayw,jd,eer)`).
+///
+/// The three gates are `!(nextFloat() > chance)` in the bytecode, and the draw happens
+/// before the test either way; the spread steps use `Direction.getRandom`, which is
+/// `VALUES[nextInt(6)]` over DOWN, UP, NORTH, SOUTH, WEST, EAST (vertical included).
+fn pointed_dripstone_patch(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    c: &PointedDripstoneCfg,
+) {
+    drip_place_dripstone_block(ctx, pos);
+    // `Direction.Plane.HORIZONTAL`: NORTH, EAST, SOUTH, WEST
+    for (dx, dz) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
+        let outside = rng.next_f32() > c.directional;
+        if outside {
+            continue;
+        }
+        let p1 = (pos.0 + dx, pos.1, pos.2 + dz);
+        drip_place_dripstone_block(ctx, p1);
+        let outside = rng.next_f32() > c.radius2;
+        if outside {
+            continue;
+        }
+        let d = direction_random(rng);
+        let p2 = (p1.0 + d.0, p1.1 + d.1, p1.2 + d.2);
+        drip_place_dripstone_block(ctx, p2);
+        let outside = rng.next_f32() > c.radius3;
+        if outside {
+            continue;
+        }
+        let d = direction_random(rng);
+        drip_place_dripstone_block(ctx, (p2.0 + d.0, p2.1 + d.1, p2.2 + d.2));
+    }
+}
+
+/// `Direction.getRandom(RandomSource)` (`ji.b(ayw)`): `VALUES[nextInt(6)]`, where the
+/// declaration order is DOWN, UP, NORTH, SOUTH, WEST, EAST. Vertical steps are reachable,
+/// so a patch cell can sit one layer above or below its seed.
+fn direction_random(rng: &mut Xor) -> (i32, i32, i32) {
+    const VALUES: [(i32, i32, i32); 6] = [
+        (0, -1, 0),
+        (0, 1, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+        (-1, 0, 0),
+        (1, 0, 0),
+    ];
+    VALUES[rng.next_bound(6) as usize]
 }
 
 /// Nether "wart plant" ground: netherrack, warped nylium, warped wart block.
@@ -2949,6 +3067,12 @@ fn p_cf(j: &J) -> Option<Cf> {
             stem: p_bsp(js(j, "stem_provider")?)?,
             radius: jint(j, "foliage_radius", 0),
         },
+        "pointed_dripstone" => Cf::PointedDripstone(PointedDripstoneCfg {
+            taller: jf32(j, "chance_of_taller_dripstone", 0.2),
+            directional: jf32(j, "chance_of_directional_spread", 0.7),
+            radius2: jf32(j, "chance_of_spread_radius2", 0.5),
+            radius3: jf32(j, "chance_of_spread_radius3", 0.5),
+        }),
         "twisting_vines" => Cf::TwistingVines {
             width: jint(j, "spread_width", 0),
             height: jint(j, "spread_height", 0),
@@ -4114,6 +4238,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::HugeRedMushroom { cap, stem, radius } => {
             gen_huge_mushroom(ctx, rng, pos, cap, stem, *radius, HugeMushroom::Red)
         }
+        Cf::PointedDripstone(c) => gen_pointed_dripstone(ctx, rng, pos, c),
         Cf::TwistingVines {
             width,
             height,

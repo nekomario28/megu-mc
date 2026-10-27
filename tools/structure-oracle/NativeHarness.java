@@ -34,6 +34,18 @@ public final class NativeHarness {
         String blockAt(int x, int y, int z);
     }
 
+    /**
+     * The same scene at block-state granularity.
+     *
+     * A block id cannot carry properties, and several features read them: a scene that must
+     * hold `pointed_dripstone[thickness=tip]` under a feature is not the block's default
+     * state. Kept as a separate interface so the string-returning scenes stay unambiguous.
+     */
+    public interface StateScene {
+        /** BlockState at this position; null means air. */
+        Object stateAt(int x, int y, int z);
+    }
+
     static final Map<String, Object> STATES = new HashMap<>();
     static Class<?> stateC, posC, rlC, worldC, heightC;
 
@@ -57,6 +69,12 @@ public final class NativeHarness {
         STATES.clear();
         String tags = System.getenv("MC_NATIVE_BLOCK_TAGS");
         if (tags != null && !tags.isEmpty()) bindBlockTags(Path.of(tags));
+        // Fluid tags are not optional trivia: `LevelReader.isWaterAt` is
+        // `getFluidState(pos).is(FluidTags.WATER)`, so without this binding water is not
+        // water and every `waterlogged` property a feature derives comes out false - the
+        // dripstone tip wrote `waterlogged=false` into a water cell until this existed.
+        String fluidTags = System.getenv("MC_NATIVE_FLUID_TAGS");
+        if (fluidTags != null && !fluidTags.isEmpty()) bindFluidTags(Path.of(fluidTags));
     }
 
     /** BlockState for a block id, cached: `Blocks.X.defaultBlockState()`. */
@@ -184,6 +202,61 @@ public final class NativeHarness {
                 + bound.get(tagKeys.get("minecraft:nylium")).size() + " members");
     }
 
+    /**
+     * Bind the pinned jar's fluid tags (`water`, `lava`), as the tag loader would.
+     *
+     * Same shape of binding as {@link #bindBlockTags}: the registry's own
+     * `wrapAsHolder`/`bindTags` pair is found by shape, and the tag keys come from the
+     * `FluidTags` class fields so a renamed tag is a loud miss rather than a silent empty
+     * set. The file is `tag<TAB>fluid,fluid,...`.
+     */
+    public static void bindFluidTags(Path file) throws Exception {
+        Object reg = C("lt").getField("c").get(null); // BuiltInRegistries.FLUID
+        Method wrap = null, bind = null;
+        for (Method m : reg.getClass().getMethods()) {
+            if (m.getParameterCount() == 1 && m.getReturnType().getName().length() == 2
+                    && m.getReturnType() != void.class && wrap == null) {
+                wrap = m;
+            }
+            if (m.getParameterCount() == 1 && m.getReturnType() == void.class
+                    && Map.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                bind = m;
+            }
+        }
+        if (wrap == null || bind == null) throw new AssertionError("fluid tag binding API not found");
+        Map<String, Object> tagKeys = new HashMap<>();
+        for (Field f : C("awk").getFields()) { // net.minecraft.tags.FluidTags
+            if (!Modifier.isStatic(f.getModifiers())) continue;
+            Object v = f.get(null);
+            if (v == null) continue;
+            for (Method m : v.getClass().getMethods()) {
+                if (m.getParameterCount() == 0 && m.getReturnType().getName().equals("akr")) {
+                    tagKeys.put(String.valueOf(m.invoke(v)), v);
+                    break;
+                }
+            }
+        }
+        Map<Object, List<Object>> bound = new HashMap<>();
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            if (line.isBlank()) continue;
+            String[] parts = line.split("\t");
+            Object tagKey = tagKeys.get(parts[0]);
+            if (tagKey == null) continue;
+            List<Object> holders = new ArrayList<>();
+            if (parts.length > 1 && !parts[1].isBlank()) {
+                for (String fluidId : parts[1].split(",")) {
+                    Object rl = newId(fluidId);
+                    Object fluid = reg.getClass().getMethod("a", rlC).invoke(reg, rl);
+                    if (fluid == null) throw new AssertionError("tag member is not a fluid: " + fluidId);
+                    holders.add(wrap.invoke(reg, fluid));
+                }
+            }
+            bound.put(tagKey, holders);
+        }
+        bind.invoke(reg, bound);
+        System.err.println("DBG bound " + bound.size() + " fluid tags");
+    }
+
     // ---------- native objects ----------
 
     static Object featureRegistry() throws Exception {
@@ -259,8 +332,20 @@ public final class NativeHarness {
             }
         }
         if (codec == null) throw new AssertionError("no codec on " + cfg);
-        Object element = JsonParser.parseString(json);
-        Class<?> ops = Class.forName("com.mojang.serialization.DynamicOps");
+        return getOrThrow(parse(codec, JsonParser.parseString(json)));
+    }
+
+    /**
+     * Decode a datapack block state (`{"Name": ..., "Properties": {...}}`) with the native
+     * `BlockState.CODEC`, so a scene can hold a non-default state without this harness
+     * guessing how a property's value is spelled.
+     */
+    public static Object stateFromJson(com.google.gson.JsonElement json) throws Exception {
+        return getOrThrow(parse((Codec<?>) stateC.getField("b").get(null), json));
+    }
+
+    /** `Codec.parse(DynamicOps, T)` for `JsonOps`; the overload is picked by assignability. */
+    static Object parse(Codec<?> codec, com.google.gson.JsonElement element) throws Exception {
         Object result = null;
         for (Method m : Codec.class.getMethods()) {
             if (!m.getName().equals("parse") || m.getParameterCount() != 2) continue;
@@ -273,16 +358,18 @@ public final class NativeHarness {
             }
         }
         if (result == null) throw new AssertionError("codec parse(DynamicOps, T) not found");
-        Object cfgInstance;
+        return result;
+    }
+
+    static Object getOrThrow(Object result) throws Exception {
         try {
-            cfgInstance = result.getClass().getMethod("getOrThrow").invoke(result);
+            return result.getClass().getMethod("getOrThrow").invoke(result);
         } catch (NoSuchMethodException e) {
-            cfgInstance = result.getClass()
+            return result.getClass()
                     .getMethod("getOrThrow", java.util.function.Function.class)
                     .invoke(result, (java.util.function.Function<String, IllegalStateException>)
                             msg -> new IllegalStateException(msg));
         }
-        return cfgInstance;
     }
 
     /** Parse a state-provider JSON with its own codec (probe helper). */
@@ -353,11 +440,11 @@ public final class NativeHarness {
         public final Map<String, Object> writes = new LinkedHashMap<>();
         public final List<String> log = new ArrayList<>();
         public final List<String> attempts = new ArrayList<>();
-        public final Scene scene;
+        public final StateScene scene;
         public final int minY, height;
         private final Object heights;
 
-        Level(Scene scene, int minY, int height, Object extraGenerator) {
+        Level(StateScene scene, int minY, int height, Object extraGenerator) {
             this.scene = scene;
             this.minY = minY;
             this.height = height;
@@ -391,8 +478,21 @@ public final class NativeHarness {
                 // while the port (which writes through) skipped it.
                 Object written = writes.get(p[0] + "," + p[1] + "," + p[2]);
                 if (written != null) return written;
-                String block = scene.blockAt(p[0], p[1], p[2]);
-                return state(block == null ? "minecraft:air" : block);
+                Object read = scene.stateAt(p[0], p[1], p[2]);
+                return read == null ? state("minecraft:air") : read;
+            }
+            // getFluidState: a worldgen level has no flowing fluids, so the block state's own
+            // fluid state is the whole answer. `Level.isWaterAt` (used by the dripstone tip's
+            // waterlogged property) goes through here.
+            if (m.getName().equals("b_") && pt.length == 1 && pt[0] == posC
+                    && m.getReturnType() == C("epe")) {
+                int[] p = xyz(a[0]);
+                Object at = writes.get(p[0] + "," + p[1] + "," + p[2]);
+                if (at == null) {
+                    at = scene.stateAt(p[0], p[1], p[2]);
+                    if (at == null) at = state("minecraft:air");
+                }
+                return stateC.getMethod("u").invoke(at); // BlockStateBase.getFluidState()
             }
             // setBlock(pos, state, flags) must be recorded.
             if (m.getName().equals("a") && pt.length == 3 && pt[0] == posC && pt[1] == stateC
@@ -431,6 +531,14 @@ public final class NativeHarness {
     }
 
     public static Level level(Scene scene) {
+        return levelFromStates((x, y, z) -> {
+            String block = scene.blockAt(x, y, z);
+            return block == null ? state("minecraft:air") : state(block);
+        });
+    }
+
+    /** A level whose scene resolves properties itself (see {@link StateScene}). */
+    public static Level levelFromStates(StateScene scene) {
         return new Level(scene, MIN_Y, HEIGHT, null);
     }
 

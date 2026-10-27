@@ -1123,6 +1123,33 @@ check "huge red mushroom uses the foliageRadius-2 rim threshold" \
   '    let rim = radius - 1;' \
   feature::generation_contract_tests::huge_red_mushroom_matches_native_cells_and_layers
 
+check "pointed dripstone hangs and stands in the drawn direction" \
+  src/feature.rs '        !rng.next_bool() // `nextBoolean() ? DOWN : UP`' \
+  '        rng.next_bool() // `nextBoolean() ? DOWN : UP`' \
+  feature::generation_contract_tests::pointed_dripstone_matches_native_cells_and_rng
+
+check "pointed dripstone gates its taller tip on the configured chance" \
+  src/feature.rs '    let taller = rng.next_f32() < c.taller && drip_is_empty_or_water(ctx, beyond);' \
+  '    let taller = rng.next_f32() < 1.0 && drip_is_empty_or_water(ctx, beyond);' \
+  feature::generation_contract_tests::pointed_dripstone_matches_native_cells_and_rng
+
+check "pointed dripstone only grows its taller tip into empty or water" \
+  src/feature.rs '    let taller = rng.next_f32() < c.taller && drip_is_empty_or_water(ctx, beyond);' \
+  '    let taller = rng.next_f32() < c.taller;' \
+  feature::generation_contract_tests::pointed_dripstone_matches_native_cells_and_rng
+
+check "pointed dripstone spreads with a six-way direction draw" \
+  src/feature.rs '    VALUES[rng.next_bound(6) as usize]' \
+  '    VALUES[rng.next_bound(4) as usize]' \
+  feature::generation_contract_tests::pointed_dripstone_matches_native_cells_and_rng
+
+check "pointed dripstone spreads in the horizontal plane order" \
+  src/feature.rs '    // `Direction.Plane.HORIZONTAL`: NORTH, EAST, SOUTH, WEST
+    for (dx, dz) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {' \
+  '    // `Direction.Plane.HORIZONTAL`: NORTH, EAST, SOUTH, WEST
+    for (dx, dz) in [(1, 0), (0, -1), (0, 1), (-1, 0)] {' \
+  feature::generation_contract_tests::pointed_dripstone_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

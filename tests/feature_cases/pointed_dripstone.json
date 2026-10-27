@@ -1,0 +1,258 @@
+{
+  "_comment": "tools/structure-oracle/FeatureOracle.java cases. Coordinates are origin-relative; ranges are inclusive; a cell covered by no ply is air. Scenes cover the four tip directions, the taller-dripstone gate, and the dripstone-block patch.",
+  "type": "minecraft:pointed_dripstone",
+  "class": "eda",
+  "config": {
+    "chance_of_directional_spread": 0.7,
+    "chance_of_spread_radius2": 0.5,
+    "chance_of_spread_radius3": 0.5,
+    "chance_of_taller_dripstone": 0.2
+  },
+  "scenes": [
+    {
+      "name": "air",
+      "plies": []
+    },
+    {
+      "name": "floor",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ceiling",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            1,
+            1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "both",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        },
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            1,
+            1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "water_tip",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        },
+        {
+          "block": "minecraft:water",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            0,
+            2
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "glass_above",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        },
+        {
+          "block": "minecraft:glass",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            1,
+            1
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "stone_origin",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -4,
+            0
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dripstone_floor",
+      "plies": [
+        {
+          "block": {
+            "Name": "minecraft:pointed_dripstone",
+            "Properties": {
+              "thickness": "base",
+              "vertical_direction": "up",
+              "waterlogged": "false"
+            }
+          },
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        },
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -4,
+            4
+          ],
+          "dy": [
+            -2,
+            -2
+          ],
+          "dz": [
+            -4,
+            4
+          ]
+        }
+      ]
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    -1,
+    15,
+    20,
+    21,
+    23,
+    42,
+    60007
+  ],
+  "oy": 64,
+  "extra": [
+    {
+      "scene": "floor",
+      "oy": -63,
+      "seed": 0
+    },
+    {
+      "scene": "floor",
+      "oy": 319,
+      "seed": 20
+    },
+    {
+      "scene": "ceiling",
+      "oy": 318,
+      "seed": 0
+    },
+    {
+      "scene": "air",
+      "oy": 318,
+      "seed": 0
+    }
+  ]
+}

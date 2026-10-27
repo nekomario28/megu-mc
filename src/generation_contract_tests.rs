@@ -1,9 +1,9 @@
 use super::{freg, gen_cf, Cf, LargeDripstoneCfg};
-use crate::block_registry::breg;
+use crate::block_registry::{breg, bs_parts};
 use crate::generation_context::FC;
 use crate::generation_math::{mth_cos, mth_next_f32, mth_sin, normal_new_l, Xor};
 use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr, FP, RT};
-use crate::json::{jparse, J};
+use crate::json::{jarr, jparse, js, jstr, J};
 use crate::worldgen::Gen;
 
 fn context(g: &mut Gen) -> FC<'_> {
@@ -366,6 +366,104 @@ fn huge_red_mushroom_matches_native_cells_and_layers() {
             "{row}"
         );
     }
+}
+
+/// One inclusive `[min, max]` range from a cases file.
+fn case_range(j: &J, key: &str) -> [i32; 2] {
+    let a = jarr(j, key).expect("range");
+    assert_eq!(a.len(), 2, "{key} must be [min, max]");
+    [a[0].num() as i32, a[1].num() as i32]
+}
+
+/// Replay a native case set (`tools/structure-oracle/FeatureOracle.java`) through the port.
+///
+/// The cases file drives both sides: the oracle builds its scene from it, and this builds the
+/// port's scene from the same JSON, so a feature type costs a cases file plus an arm in
+/// `p_cf` instead of a second test body. Plies are origin-relative inclusive boxes written
+/// over a fixed air box; a scene that needs to write outside that box fails loudly rather
+/// than silently reading generated terrain. The last fixture column is the oracle's
+/// post-placement `nextInt(1000)` triple, so a draw that changes no cell still fails.
+fn generic_feature_cases(cases_json: &str, fixture: &str) {
+    const AIR_BOX: [[i32; 2]; 3] = [[-8, 8], [-6, 6], [-8, 8]];
+    let reg = breg().unwrap();
+    let cases = jparse(cases_json.as_bytes()).unwrap();
+    let cf = super::p_cf(&cases).expect("the cases file is a configured feature");
+    let mut scenes: Vec<(String, Vec<(u32, [[i32; 2]; 3])>)> = Vec::new();
+    for scene in jarr(&cases, "scenes").expect("scenes") {
+        let mut plies = Vec::new();
+        for ply in jarr(scene, "plies").expect("plies") {
+            let (name, props) = bs_parts(js(ply, "block").expect("block")).expect("block");
+            plies.push((
+                reg.state_of(&name, props),
+                [
+                    case_range(ply, "dx"),
+                    case_range(ply, "dy"),
+                    case_range(ply, "dz"),
+                ],
+            ));
+        }
+        scenes.push((jstr(scene, "name").expect("scene name"), plies));
+    }
+    for row in fixture.lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        assert_eq!(p.len(), 7, "{row}");
+        let oy = p[1].parse::<i32>().unwrap();
+        let seed = p[2].parse::<i64>().unwrap() as u64;
+        let plies = &scenes
+            .iter()
+            .find(|(name, _)| name == p[0])
+            .unwrap_or_else(|| panic!("unknown scene in fixture: {row}"))
+            .1;
+        for (_, r) in plies {
+            assert!(
+                (0..3).all(|k| r[k][0] >= AIR_BOX[k][0] && r[k][1] <= AIR_BOX[k][1]),
+                "scene {} writes outside the air box: {row}",
+                p[0]
+            );
+        }
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in AIR_BOX[0][0]..=AIR_BOX[0][1] {
+            for z in AIR_BOX[2][0]..=AIR_BOX[2][1] {
+                for dy in AIR_BOX[1][0]..=AIR_BOX[1][1] {
+                    g.feat_write(x, oy + dy, z, 0);
+                }
+            }
+        }
+        for (state, r) in plies {
+            for x in r[0][0]..=r[0][1] {
+                for dy in r[1][0]..=r[1][1] {
+                    for z in r[2][0]..=r[2][1] {
+                        g.feat_write(x, oy + dy, z, *state);
+                    }
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+        let probe = format!(
+            "{},{},{}",
+            rng.next_bound(1000),
+            rng.next_bound(1000),
+            rng.next_bound(1000)
+        );
+        assert_eq!(!ctx.wr.is_empty(), p[3].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[4].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(
+            block_state_cells_digest(reg, &ctx.wr, (0, oy, 0)),
+            p[5],
+            "{row}"
+        );
+        assert_eq!(probe, p[6], "{row}");
+    }
+}
+
+#[test]
+fn pointed_dripstone_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/pointed_dripstone.json"),
+        include_str!("../tests/data/pointed_dripstone_1211.tsv"),
+    );
 }
 
 #[test]
