@@ -12,6 +12,8 @@ struct WorldSnapshot {
     clients: Vec<Arc<Client>>,
     forced: HashSet<(i32, i32)>,
     region: crate::RegionSets,
+    scheduled_blocks: scheduled_ticks::ScheduledTicks,
+    generated_fluids: Option<GeneratedFluidOwner>,
 }
 impl WorldSnapshot {
     fn take() -> WorldSnapshot {
@@ -22,6 +24,13 @@ impl WorldSnapshot {
             clients: std::mem::take(&mut *clients().lock().unwrap()),
             forced: std::mem::take(&mut *forceloaded().lock().unwrap()),
             region: test_region(),
+            scheduled_blocks: std::mem::replace(
+                &mut *block_ticks().lock().unwrap(),
+                scheduled_ticks::ScheduledTicks::new(),
+            ),
+            generated_fluids: GENERATED_FLUID_OWNER.get().map(|owner| {
+                std::mem::replace(&mut *owner.lock().unwrap(), GeneratedFluidOwner::new())
+            }),
         }
     }
 }
@@ -36,7 +45,122 @@ impl std::ops::Drop for WorldSnapshot {
         *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
         *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.forced);
         set_test_region(self.region.0.clone(), self.region.1.clone());
+        *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::replace(
+            &mut self.scheduled_blocks,
+            scheduled_ticks::ScheduledTicks::new(),
+        );
+        if let Some(owner) = GENERATED_FLUID_OWNER.get() {
+            *owner.lock().unwrap_or_else(|e| e.into_inner()) = self
+                .generated_fluids
+                .take()
+                .unwrap_or_else(GeneratedFluidOwner::new);
+        }
     }
+}
+
+#[test]
+fn scheduled_leaf_distance_matches_native_vectors() {
+    let reg = crate::block_registry::breg().unwrap();
+    let make = |kind: &str| -> u32 {
+        match kind {
+            "A" => reg.state_of("minecraft:air", None),
+            "S" => reg.state_of("minecraft:stone", None),
+            "T" => reg.state_of("minecraft:oak_log", None),
+            _ if kind.starts_with('C') => reg.with_prop(
+                reg.state_of("minecraft:scaffolding", None),
+                "distance",
+                &kind[1..],
+            ),
+            _ => {
+                let st = reg.with_prop(
+                    reg.state_of("minecraft:oak_leaves", None),
+                    "distance",
+                    &kind[1..],
+                );
+                let st = reg.with_prop(
+                    st,
+                    "persistent",
+                    if kind.starts_with(['P', 'B']) {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                );
+                reg.with_prop(
+                    st,
+                    "waterlogged",
+                    if kind.starts_with(['W', 'B']) {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+            }
+        }
+    };
+    let mut count = 0;
+    for line in include_str!("../tests/data/leaf_tick_1211.tsv").lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 4);
+        let mut neighbors = [make("A"); 6];
+        for (direction, kind) in fields[1].split(',').zip(fields[2].split(',')) {
+            neighbors[direction.parse::<usize>().unwrap()] = make(kind);
+        }
+        assert_eq!(
+            leaf_distance_update(reg, make(fields[0]), neighbors),
+            make(fields[3]),
+            "{line}"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 172);
+}
+
+#[test]
+fn leaf_updates_wait_for_an_eligible_chunk_and_propagate() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    let old_tick = TICK_IDX.load(Ordering::Relaxed);
+    let reg = crate::block_registry::breg().unwrap();
+    let log = reg.state_of("minecraft:oak_log", None);
+    let leaves = reg.with_prop(reg.state_of("minecraft:oak_leaves", None), "distance", "7");
+    let p = (2, 220, 0);
+    set_test_region(HashSet::new(), HashSet::new());
+    set_block(1, 220, 0, leaves);
+    set_block(p.0, p.1, p.2, leaves);
+    set_block(0, 220, 0, log);
+    TICK_IDX.store(old_tick + 1, Ordering::Relaxed);
+    scheduled_block_tick();
+    assert_eq!(
+        reg.get_prop(block_at(1, 220, 0), "distance").as_deref(),
+        Some("7")
+    );
+    set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
+    scheduled_block_tick();
+    assert_eq!(
+        reg.get_prop(block_at(1, 220, 0), "distance").as_deref(),
+        Some("1")
+    );
+    TICK_IDX.store(old_tick + 2, Ordering::Relaxed);
+    scheduled_block_tick();
+    assert_eq!(
+        reg.get_prop(block_at(p.0, p.1, p.2), "distance").as_deref(),
+        Some("2")
+    );
+    set_block(0, 220, 0, 0);
+    for tick in 3..=12 {
+        TICK_IDX.store(old_tick + tick, Ordering::Relaxed);
+        scheduled_block_tick();
+    }
+    assert_eq!(
+        reg.get_prop(block_at(1, 220, 0), "distance").as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        reg.get_prop(block_at(p.0, p.1, p.2), "distance").as_deref(),
+        Some("7")
+    );
+    TICK_IDX.store(old_tick, Ordering::Relaxed);
 }
 
 #[test]
@@ -2112,7 +2236,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         world().lock().unwrap().clear();
         falling().lock().unwrap().clear();
         drops().lock().unwrap().clear();
-        load_world_from(snap);
+        load_world_from(snap).unwrap();
         let mut t = 0;
         while !falling().lock().unwrap().is_empty() && t < 200 {
             falling_tick();
@@ -2232,7 +2356,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
         world().lock().unwrap().clear();
         falling().lock().unwrap().clear();
         drops().lock().unwrap().clear();
-        load_world_from(snap);
+        load_world_from(snap).unwrap();
         let mut t = 0;
         while !falling().lock().unwrap().is_empty() && t < 400 {
             falling_tick();
@@ -2765,7 +2889,7 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
     world().lock().unwrap().clear();
     chests().lock().unwrap().clear();
     drops().lock().unwrap().clear();
-    load_world_from(&payload);
+    load_world_from(&payload).unwrap();
     assert_eq!(
         block_at(live.0, live.1, live.2),
         name_to_state("chest").unwrap()
@@ -2921,7 +3045,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     world().lock().unwrap().clear();
     falling().lock().unwrap().clear();
     drops().lock().unwrap().clear();
-    load_world_from(&buf);
+    load_world_from(&buf).unwrap();
     let mut t = 0;
     while !falling().lock().unwrap().is_empty() && t < 200 {
         falling_tick();
@@ -2982,7 +3106,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
         world().lock().unwrap().clear();
         falling().lock().unwrap().clear();
         drops().lock().unwrap().clear();
-        load_world_from(&buf);
+        load_world_from(&buf).unwrap();
         let mut t = 0;
         while !falling().lock().unwrap().is_empty() && t < 400 {
             falling_tick();
@@ -3124,7 +3248,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
         world().lock().unwrap().clear();
         falling().lock().unwrap().clear();
         drops().lock().unwrap().clear();
-        load_world_from(snap);
+        load_world_from(snap).unwrap();
         let mut t = 0;
         while !falling().lock().unwrap().is_empty() && t < 200 {
             falling_tick();

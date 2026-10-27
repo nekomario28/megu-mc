@@ -2018,17 +2018,43 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
     for d in &t.decorators {
         d.run(ctx, rng, &root_positions, &logs, &foliage);
     }
-    update_leaves(ctx, &logs, &root_positions, &foliage);
+    if let Some(shape) = update_leaves(ctx, &logs, &root_positions, &foliage) {
+        schedule_leaf_edges(ctx, &shape);
+    }
     true
 }
 /// Native TreeFeature.updateLeaves, not a global shortest-path relaxation.
 /// Only this tree's trunk writes seed bucket zero. Roots are already visited;
 /// foreign logs/leaves are discovered through neighbours, not independently seeded.
-fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) {
-    if logs.is_empty() && foliage.is_empty() {
-        return;
+struct LeafShape {
+    min: P3,
+    max: P3,
+    filled: Vec<bool>,
+    ys: usize,
+    zs: usize,
+}
+
+impl LeafShape {
+    fn contains(&self, p: P3) -> bool {
+        if p.0 < self.min.0
+            || p.0 > self.max.0
+            || p.1 < self.min.1
+            || p.1 > self.max.1
+            || p.2 < self.min.2
+            || p.2 > self.max.2
+        {
+            return false;
+        }
+        self.filled[((p.0 - self.min.0) as usize * self.ys + (p.1 - self.min.1) as usize) * self.zs
+            + (p.2 - self.min.2) as usize]
     }
-    let Some(reg) = breg() else { return };
+}
+
+fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) -> Option<LeafShape> {
+    if logs.is_empty() && foliage.is_empty() {
+        return None;
+    }
+    let reg = breg()?;
     let mut min = (i32::MAX, i32::MAX, i32::MAX);
     let mut max = (i32::MIN, i32::MIN, i32::MIN);
     for p in logs.iter().chain(roots).chain(foliage) {
@@ -2045,7 +2071,7 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) {
         (max.2 - min.2 + 1) as usize,
     );
     if xs == 0 || ys == 0 || zs == 0 || xs * ys * zs > 4_000_000 {
-        return;
+        return None;
     }
     let idx = |p: P3| -> Option<usize> {
         if p.0 < min.0 || p.0 > max.0 || p.1 < min.1 || p.1 > max.1 || p.2 < min.2 || p.2 > max.2 {
@@ -2105,6 +2131,68 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) {
                 // This cursor changes inside the direction loop in native
                 // bytecode; later neighbours use its new value.
                 depth = depth.min(next);
+            }
+        }
+    }
+    Some(LeafShape {
+        min,
+        max,
+        filled: visited,
+        ys,
+        zs,
+    })
+}
+
+/// StructureTemplate.updateShapeAtEdge visits full/empty transitions in
+/// z, y, x axis order. Each face updates the inside, then its neighbour.
+fn schedule_leaf_edges(ctx: &mut FC, shape: &LeafShape) {
+    let Some(reg) = breg() else { return };
+    let min = [shape.min.0, shape.min.1, shape.min.2];
+    let max = [shape.max.0, shape.max.1, shape.max.2];
+    for (axis, outer, inner) in [(2, 0, 1), (1, 2, 0), (0, 1, 2)] {
+        for a in min[outer]..=max[outer] {
+            for b in min[inner]..=max[inner] {
+                let mut was_full = false;
+                for c in min[axis]..=max[axis] + 1 {
+                    let mut p = [0; 3];
+                    p[outer] = a;
+                    p[inner] = b;
+                    p[axis] = c;
+                    let now_full = shape.contains((p[0], p[1], p[2]));
+                    let sign = if !was_full && now_full {
+                        -1
+                    } else if was_full && !now_full {
+                        p[axis] -= 1;
+                        1
+                    } else {
+                        was_full = now_full;
+                        continue;
+                    };
+                    let mut q = p;
+                    q[axis] += sign;
+                    let p = (p[0], p[1], p[2]);
+                    let q = (q[0], q[1], q[2]);
+                    let ps = ctx.get(p.0, p.1, p.2);
+                    let qs = ctx.get(q.0, q.1, q.2);
+                    for (cell, st, neighbor) in [(p, ps, qs), (q, qs, ps)] {
+                        let name = reg.name_of(st);
+                        if !name.ends_with("_leaves") {
+                            continue;
+                        }
+                        let Some(distance) = reg
+                            .get_prop(st, "distance")
+                            .and_then(|v| v.parse::<u8>().ok())
+                        else {
+                            continue;
+                        };
+                        let next = reg.distance_from_log(neighbor).unwrap_or(7) + 1;
+                        if next != 1 || distance != 1 {
+                            ctx.g
+                                .schedule_generated_leaf(cell, reg.state_of(name, None));
+                        }
+                    }
+                    was_full = now_full;
+                }
             }
         }
     }
@@ -2445,7 +2533,7 @@ mod tests {
             let mut ctx = FC::new(&mut g);
             // updateLeaves receives this exact box; the two foliage boundary
             // positions only define its extent and are not placements.
-            update_leaves(&mut ctx, &logs, &blocked, &[min, max]);
+            let _ = update_leaves(&mut ctx, &logs, &blocked, &[min, max]);
             for cell in f[7].split(';') {
                 let (pos, kind) = cell.split_once(':').unwrap();
                 let p = positions(pos, origin)[0];
@@ -2485,6 +2573,81 @@ mod tests {
             117,
             "native leaf vectors must not be empty/truncated"
         );
+    }
+
+    #[test]
+    fn leaf_edge_schedules_match_native_order() {
+        fn point(s: &str) -> P3 {
+            let a: Vec<i32> = s.split(',').map(|v| v.parse().unwrap()).collect();
+            assert_eq!(a.len(), 3);
+            (a[0] - 1024, a[1] + 70, a[2] + 512)
+        }
+        fn points(s: &str) -> Vec<P3> {
+            s.split(';').filter(|v| !v.is_empty()).map(point).collect()
+        }
+        let reg = breg().unwrap();
+        let mut cases = 0;
+        for row in include_str!("../tests/data/leaf_edge_1211.tsv").lines() {
+            let f: Vec<_> = row.split('\t').collect();
+            assert_eq!(f.len(), 9);
+            let min = point(f[1]);
+            let max = point(f[2]);
+            let logs = points(f[3]);
+            let blocked = points(f[4]);
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            for x in min.0 - 1..=max.0 + 1 {
+                for y in min.1 - 1..=max.1 + 1 {
+                    for z in min.2 - 1..=max.2 + 1 {
+                        g.feat_write(x, y, z, 0);
+                    }
+                }
+            }
+            for cell in f[5].split(';') {
+                let (pos, kind) = cell.split_once(':').unwrap();
+                let p = point(pos);
+                let st = match kind {
+                    "T" => reg.state_of("minecraft:oak_log", None),
+                    "S" => reg.state_of("minecraft:stone", None),
+                    _ => {
+                        let st = reg.with_prop(
+                            reg.state_of("minecraft:oak_leaves", None),
+                            "distance",
+                            &kind[1..],
+                        );
+                        reg.with_prop(
+                            st,
+                            "persistent",
+                            if kind.starts_with('P') {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                        )
+                    }
+                };
+                g.feat_write(p.0, p.1, p.2, st);
+            }
+            let mut ctx = FC::new(&mut g);
+            let shape = update_leaves(&mut ctx, &logs, &blocked, &[min, max]).unwrap();
+            schedule_leaf_edges(&mut ctx, &shape);
+            let want: Vec<_> = f[8]
+                .split(';')
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    let (coord, rest) = v.split_once(':').unwrap();
+                    assert_eq!(rest, "Block{minecraft:oak_leaves}:1");
+                    (point(coord), reg.state_of("minecraft:oak_leaves", None))
+                })
+                .collect();
+            assert_eq!(
+                ctx.g.generated_leaf_ticks(),
+                want,
+                "native edge case {}",
+                f[0]
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 39);
     }
 
     #[test]

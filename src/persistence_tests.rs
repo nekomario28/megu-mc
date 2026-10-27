@@ -77,7 +77,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
                 payload.truncate(at + 4 + 1 + 1 + 8 + 8 + 8 + 4);
             }
         }
-        load_world_from(&payload);
+        load_world_from(&payload).unwrap();
         let d = drops()
             .lock()
             .unwrap()
@@ -379,7 +379,7 @@ fn saving_neither_mutates_live_state_nor_loses_resting_tridents() {
     save_world_into(&mut payload2);
     *drops().lock().unwrap() = Vec::new();
     *arrows().lock().unwrap() = Vec::new();
-    load_world_from(&payload);
+    load_world_from(&payload).unwrap();
     let loaded_drops: Vec<(i64, u8)> = drops()
         .lock()
         .unwrap()
@@ -447,7 +447,7 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
 
     // Clear it first: reading back a value that was never removed proves nothing.
     falling().lock().unwrap().clear();
-    load_world_from(&payload);
+    load_world_from(&payload).unwrap();
 
     let q = falling().lock().unwrap().clone();
     assert_eq!(
@@ -507,7 +507,7 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
 
     world().lock().unwrap().clear();
     falling().lock().unwrap().clear();
-    load_world_from(&payload);
+    load_world_from(&payload).unwrap();
 
     assert_eq!(
         block_at(1, 100, 2),
@@ -561,7 +561,7 @@ fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
     // Move the live stream elsewhere first: reading back a value that was never
     // replaced would prove nothing.
     world_rng::seed(999);
-    load_world_from(&payload);
+    load_world_from(&payload).unwrap();
     assert_eq!(
         world_rng::next_u64(),
         expected,
@@ -629,7 +629,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
     furnaces().lock().unwrap().clear();
     signs().lock().unwrap().clear();
     drops().lock().unwrap().clear();
-    load_world_from(&payload);
+    load_world_from(&payload).unwrap();
     let fs = furnaces().lock().unwrap();
     assert_eq!(fs.len(), 1);
     let loaded = fs

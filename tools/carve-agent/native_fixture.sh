@@ -46,6 +46,10 @@ PROPERTIES
 printf 'eula=true\n' > "$DIR/eula.txt"
 lox=$((CX*16)); loz=$((CZ*16)); hix=$(((CX+N)*16-1)); hiz=$(((CZ+N)*16-1))
 box="$lox,-64,$loz,$hix,319,$hiz"
+tick_args=()
+if [[ "${MC_TICK_TRACE:-0}" == 1 ]]; then
+    tick_args+=("-Dtickbox=$box")
+fi
 cd "$DIR"
 commands() {
     fail() { printf 'stop\n'; echo "$*" >&2; exit 2; }
@@ -84,7 +88,7 @@ commands() {
 }
 commands | timeout 240 java -XX:ActiveProcessorCount=2 -Xmx1G -Xms256M \
     -javaagent:"$DIR/agent/carveagent.jar" -Dcarverquiet=true -Ddim=-64 -Ddecoseed=0 -Ddecoorder=1 \
-    "-Dfeaturebox=$box" "-Druntimebox=$box" -jar server.jar nogui > run.log 2>&1
+    "-Dfeaturebox=$box" "-Druntimebox=$box" "${tick_args[@]}" -jar server.jar nogui > run.log 2>&1
 ! grep -qi 'CARVEAGENT .*failed\|unexpected error occurred\|Incorrect argument for command\|Unknown or incomplete command' run.log
 PYTHONPATH="$ROOT/tools" python3 - "$DIR" "$CX" "$CZ" "$N" "$MODE" <<'PY'
 import array,json,re,sys

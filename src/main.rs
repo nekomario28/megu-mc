@@ -5753,6 +5753,13 @@ fn region() -> &'static Mutex<Region> {
 fn region_guard() -> std::sync::MutexGuard<'static, Region> {
     region().lock().unwrap()
 }
+fn scheduled_tick_chunks() -> HashSet<(i32, i32)> {
+    let mut chunks = region_guard().hot.clone();
+    for &chunk in forceloaded().lock().unwrap().iter() {
+        extend_chunk_square(&mut chunks, chunk, 1);
+    }
+    chunks
+}
 static FORCELOADED: OnceLock<Mutex<HashSet<(i32, i32)>>> = OnceLock::new();
 fn forceloaded() -> &'static Mutex<HashSet<(i32, i32)>> {
     FORCELOADED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -5831,6 +5838,369 @@ fn backoff() -> &'static LockedMap<BlockPos, (u64, u32)> {
     BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
 }
 static TICK_IDX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOCK_TICKS: OnceLock<Mutex<scheduled_ticks::ScheduledTicks>> = OnceLock::new();
+static BLOCK_TICK_ORDER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+fn block_ticks() -> &'static Mutex<scheduled_ticks::ScheduledTicks> {
+    BLOCK_TICKS.get_or_init(|| Mutex::new(scheduled_ticks::ScheduledTicks::new()))
+}
+
+const LEAF_NEIGHBORS: [(i32, i32, i32); 6] = [
+    (0, -1, 0),
+    (0, 1, 0),
+    (0, 0, -1),
+    (0, 0, 1),
+    (-1, 0, 0),
+    (1, 0, 0),
+];
+
+fn leaf_block(reg: &crate::block_registry::BReg, state: u32) -> Option<u32> {
+    let name = reg.name_of(state);
+    name.ends_with("_leaves").then(|| reg.state_of(name, None))
+}
+
+fn leaf_distance_update(reg: &crate::block_registry::BReg, state: u32, neighbors: [u32; 6]) -> u32 {
+    let distance = neighbors
+        .into_iter()
+        .map(|n| reg.distance_from_log(n).unwrap_or(7) + 1)
+        .min()
+        .unwrap_or(7)
+        .min(7);
+    reg.with_prop(state, "distance", &distance.to_string())
+}
+
+/// LeavesBlock.updateShape is invoked for the neighbours of a changed block.
+fn schedule_leaf_neighbors(x: i32, y: i32, z: i32, changed_state: u32) {
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    let distance = reg.distance_from_log(changed_state).unwrap_or(7) + 1;
+    for (dx, dy, dz) in LEAF_NEIGHBORS {
+        let p = (x + dx, y + dy, z + dz);
+        if p.1 < MIN_Y || p.1 >= MIN_Y + 384 {
+            continue;
+        }
+        let st = block_at(p.0, p.1, p.2);
+        let Some(block) = leaf_block(reg, st) else {
+            continue;
+        };
+        if distance == 1 && reg.get_prop(st, "distance").as_deref() == Some("1") {
+            continue;
+        }
+        let due = TICK_IDX.load(Ordering::Relaxed) as i64 + 1;
+        let sub_order = BLOCK_TICK_ORDER.fetch_add(1, Ordering::Relaxed);
+        block_ticks()
+            .lock()
+            .unwrap()
+            .schedule(scheduled_ticks::ScheduledTick {
+                pos: p,
+                block,
+                due,
+                priority: 0,
+                sub_order,
+            });
+    }
+}
+
+fn scheduled_block_tick() {
+    with_save_guard(scheduled_block_tick_inner);
+}
+fn scheduled_block_tick_inner() {
+    let now = TICK_IDX.load(Ordering::Relaxed) as i64;
+    let generated = worldgen::with_gen(|g| g.take_generated_leaf_ticks()).unwrap_or_default();
+    if !generated.is_empty() {
+        let mut counts: HashMap<(i32, i32), i64> = HashMap::new();
+        for (pos, _) in &generated {
+            *counts.entry((pos.0 >> 4, pos.2 >> 4)).or_default() += 1;
+        }
+        let mut queue = block_ticks().lock().unwrap();
+        for (pos, block) in generated {
+            let remaining = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)).unwrap();
+            queue.schedule(scheduled_ticks::ScheduledTick {
+                pos,
+                block,
+                due: now,
+                priority: 0,
+                sub_order: -*remaining,
+            });
+            *remaining -= 1;
+        }
+    }
+    let eligible = scheduled_tick_chunks();
+    let due = block_ticks()
+        .lock()
+        .unwrap()
+        .collect(now, 65_536, |chunk| eligible.contains(&chunk));
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    for tick in due {
+        let (x, y, z) = tick.pos;
+        let st = block_at(x, y, z);
+        if leaf_block(reg, st) != Some(tick.block) {
+            continue;
+        }
+        let neighbors = LEAF_NEIGHBORS.map(|(dx, dy, dz)| block_at(x + dx, y + dy, z + dz));
+        let result = leaf_distance_update(reg, st, neighbors);
+        if result != st && set_block_if(x, y, z, result, Some(st)) {
+            note_block_update(x, y, z, result);
+        }
+    }
+}
+
+// The native fluid path currently owns generated spring cells. Other fluid
+// placements remain with the existing owner until shape/contact coverage lands.
+thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+static GENERATED_FLUID_OWNER: OnceLock<Mutex<GeneratedFluidOwner>> = OnceLock::new();
+
+struct GeneratedFluidOwner {
+    queue: scheduled_ticks::ScheduledTicks,
+    next_order: i64,
+    owned: HashSet<BlockPos>,
+    reported: HashSet<BlockPos>,
+}
+
+impl GeneratedFluidOwner {
+    fn new() -> Self {
+        Self {
+            queue: scheduled_ticks::ScheduledTicks::new(),
+            next_order: 0,
+            owned: HashSet::new(),
+            reported: HashSet::new(),
+        }
+    }
+    fn schedule(&mut self, pos: BlockPos, fluid: flowing_fluid::Fluid, now: i64, immediate: bool) {
+        self.owned.insert(pos);
+        let block = match (fluid.kind, fluid.source()) {
+            (flowing_fluid::Kind::Water, true) => 0,
+            (flowing_fluid::Kind::Water, false) => 1,
+            (flowing_fluid::Kind::Lava, true) => 2,
+            (flowing_fluid::Kind::Lava, false) => 3,
+        };
+        let delay = if immediate {
+            0
+        } else if fluid.kind == flowing_fluid::Kind::Water {
+            5
+        } else {
+            30
+        };
+        self.queue.schedule(scheduled_ticks::ScheduledTick {
+            pos,
+            block,
+            due: now + delay,
+            priority: 0,
+            sub_order: self.next_order,
+        });
+        self.next_order += 1;
+    }
+    fn write(&mut self, pos: BlockPos, cell: flowing_fluid::Cell, now: i64) -> Result<(), String> {
+        let old = block_at(pos.0, pos.1, pos.2);
+        let old_fluid = fluid_from_block(old);
+        let state = match cell {
+            flowing_fluid::Cell::Air => 0,
+            flowing_fluid::Cell::Fluid(f) => {
+                (if f.kind == flowing_fluid::Kind::Water {
+                    80
+                } else {
+                    96
+                }) + u32::from(f.level)
+            }
+            flowing_fluid::Cell::Solid => return Err("fluid plan cannot write a solid".into()),
+        };
+        if old == state {
+            return Ok(());
+        }
+        let previous = NATIVE_FLUID_WRITE.with(|v| v.replace(true));
+        struct ResetNativeFluidWrite(bool);
+        impl std::ops::Drop for ResetNativeFluidWrite {
+            fn drop(&mut self) {
+                NATIVE_FLUID_WRITE.with(|v| v.set(self.0));
+            }
+        }
+        let reset = ResetNativeFluidWrite(previous);
+        set_block(pos.0, pos.1, pos.2, state);
+        drop(reset);
+        let current = fluid_from_block(state);
+        if current.is_none() {
+            self.owned.remove(&pos);
+        }
+        if let Some(f) = current {
+            if old_fluid.is_none_or(|old| old.kind != f.kind) {
+                self.schedule(pos, f, now, false);
+            }
+        }
+        for (dx, dy, dz) in LEAF_NEIGHBORS {
+            let n = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+            if n.1 < MIN_Y || n.1 >= MIN_Y + 384 {
+                continue;
+            }
+            if let Some(f) = fluid_from_block(block_at(n.0, n.1, n.2)) {
+                if f.source() || current.is_some_and(|f| f.source()) {
+                    self.schedule(n, f, now, false);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn tick(&mut self, now: i64, eligible: &HashSet<(i32, i32)>) -> Result<(), String> {
+        let due = self
+            .queue
+            .collect(now, 65_536, |chunk| eligible.contains(&chunk));
+        let mut first_error = None;
+        for event in due {
+            let kind = if event.block < 2 {
+                flowing_fluid::Kind::Water
+            } else {
+                flowing_fluid::Kind::Lava
+            };
+            let source = event.block.is_multiple_of(2);
+            let plan = match flowing_fluid::tick(
+                &mut FluidReader,
+                event.pos,
+                kind,
+                source,
+                kind == flowing_fluid::Kind::Water,
+            ) {
+                Ok(plan) => {
+                    self.reported.remove(&event.pos);
+                    plan
+                }
+                Err(error) => {
+                    self.queue.schedule(scheduled_ticks::ScheduledTick {
+                        due: now + 1,
+                        ..event
+                    });
+                    if first_error.is_none() && self.reported.insert(event.pos) {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            for (pos, cell) in plan.writes {
+                self.write(pos, cell, now)?;
+                if pos == event.pos {
+                    if let Some(f) = plan.updated_self {
+                        self.schedule(pos, f, now, false);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn generated_fluid_tick() {
+    with_save_guard(generated_fluid_tick_inner);
+}
+fn generated_fluid_tick_inner() {
+    let now = TICK_IDX.load(Ordering::Relaxed) as i64;
+    let generated = worldgen::with_gen(|g| g.take_generated_fluid_ticks()).unwrap_or_default();
+    if generated.is_empty() && GENERATED_FLUID_OWNER.get().is_none() {
+        return;
+    }
+    let eligible = scheduled_tick_chunks();
+    let mut owner = GENERATED_FLUID_OWNER
+        .get_or_init(|| Mutex::new(GeneratedFluidOwner::new()))
+        .lock()
+        .unwrap();
+    for (pos, identity) in generated {
+        let kind = if identity < 2 {
+            flowing_fluid::Kind::Water
+        } else {
+            flowing_fluid::Kind::Lava
+        };
+        let fluid = flowing_fluid::Fluid {
+            kind,
+            level: if identity.is_multiple_of(2) { 0 } else { 1 },
+        };
+        owner.schedule(pos, fluid, now, true);
+    }
+    if let Err(error) = owner.tick(now, &eligible) {
+        eprintln!("[fluid] deferred native spring tick: {error}");
+    }
+}
+
+fn generated_fluid_changed(pos: BlockPos, old: u32, state: u32) -> bool {
+    if NATIVE_FLUID_WRITE.with(|v| v.get()) {
+        return true;
+    }
+    let Some(owner) = GENERATED_FLUID_OWNER.get() else {
+        return false;
+    };
+    let mut owner = owner.lock().unwrap();
+    let controlled = owner.owned.contains(&pos);
+    if old == state {
+        return controlled;
+    }
+    let current = fluid_from_block(state);
+    let now = TICK_IDX.load(Ordering::Relaxed) as i64;
+    if controlled {
+        if let Some(fluid) = current {
+            owner.schedule(pos, fluid, now, false);
+        } else {
+            owner.owned.remove(&pos);
+        }
+    }
+    for (dx, dy, dz) in LEAF_NEIGHBORS {
+        let n = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        if !owner.owned.contains(&n) {
+            continue;
+        }
+        if let Some(fluid) = fluid_from_block(block_at(n.0, n.1, n.2)) {
+            if fluid.source() || current.is_some_and(|f| f.source()) {
+                owner.schedule(n, fluid, now, false);
+            }
+        }
+    }
+    controlled
+}
+
+fn fluid_from_block(st: u32) -> Option<flowing_fluid::Fluid> {
+    if (80..=95).contains(&st) {
+        Some(flowing_fluid::Fluid {
+            kind: flowing_fluid::Kind::Water,
+            level: (st - 80) as u8,
+        })
+    } else if (96..=111).contains(&st) {
+        Some(flowing_fluid::Fluid {
+            kind: flowing_fluid::Kind::Lava,
+            level: (st - 96) as u8,
+        })
+    } else {
+        None
+    }
+}
+
+struct FluidReader;
+impl flowing_fluid::Reader for FluidReader {
+    type Error = String;
+    fn cell(&mut self, pos: BlockPos) -> Result<flowing_fluid::Cell, String> {
+        if pos.1 < MIN_Y || pos.1 >= MIN_Y + 384 {
+            return Err(format!("fluid read outside world at {pos:?}"));
+        }
+        let st = block_at(pos.0, pos.1, pos.2);
+        if let Some(f) = fluid_from_block(st) {
+            return Ok(flowing_fluid::Cell::Fluid(f));
+        }
+        let reg = crate::block_registry::breg().ok_or("missing block registry")?;
+        if reg.is_air(st) {
+            Ok(flowing_fluid::Cell::Air)
+        } else if reg.is_solid_render(st) {
+            Ok(flowing_fluid::Cell::Solid)
+        } else {
+            Err(format!(
+                "unsupported fluid shape {} at {pos:?}",
+                reg.name_of(st)
+            ))
+        }
+    }
+    fn unsupported_contact(&mut self, pos: BlockPos) -> String {
+        format!("unsupported fluid contact at {pos:?}")
+    }
+}
 fn sched_ready(x: i32, y: i32, z: i32) -> bool {
     let now = TICK_IDX.load(Ordering::Relaxed);
     backoff()
@@ -6327,7 +6697,9 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
         c.insert(local_idx(x, y, z), st);
     }
     drop(w);
+    let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
+        schedule_leaf_neighbors(x, y, z, st);
         // identity change: per-position metadata cannot survive the
         // block that owned it (a new chest at a broken chest's spot
         // must NOT resurrect the old contents — that is an item-dupe).
@@ -6387,7 +6759,9 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     let mut wtr = waters().lock().unwrap();
     if (80..=95).contains(&st) {
         wtr.insert((x, y, z));
-        water_queue().lock().unwrap().schedule((x, y, z), 1);
+        if !native_fluid_controlled {
+            water_queue().lock().unwrap().schedule((x, y, z), 1);
+        }
     } else {
         wtr.remove(&(x, y, z));
     }
@@ -6395,7 +6769,9 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     let mut lv = lavas().lock().unwrap();
     if (96..=111).contains(&st) {
         lv.insert((x, y, z));
-        lava_queue().lock().unwrap().schedule((x, y, z), 1);
+        if !native_fluid_controlled {
+            lava_queue().lock().unwrap().schedule((x, y, z), 1);
+        }
     } else {
         lv.remove(&(x, y, z));
     }
@@ -6929,6 +7305,10 @@ fn rebuild_derived_indexes() {
     // block state — a restart must rebuild them from the overlay exactly
     // as set_block would have registered them, or a reboot silently
     // freezes every machine vanilla would keep running.
+    let owned = GENERATED_FLUID_OWNER
+        .get()
+        .map(|owner| owner.lock().unwrap().owned.clone())
+        .unwrap_or_default();
     let w = world().lock().unwrap();
     let mut wtr = waters().lock().unwrap();
     let mut hh = hoppers().lock().unwrap();
@@ -6942,11 +7322,15 @@ fn rebuild_derived_indexes() {
             let y = (*idx >> 8) as i32 + MIN_Y;
             if (80..=95).contains(st) {
                 wtr.insert((x, y, z));
-                water_queue().lock().unwrap().schedule((x, y, z), 1);
+                if !owned.contains(&(x, y, z)) {
+                    water_queue().lock().unwrap().schedule((x, y, z), 1);
+                }
             }
             if (96..=111).contains(st) {
                 lavas().lock().unwrap().insert((x, y, z));
-                lava_queue().lock().unwrap().schedule((x, y, z), 1);
+                if !owned.contains(&(x, y, z)) {
+                    lava_queue().lock().unwrap().schedule((x, y, z), 1);
+                }
             }
             if (9225..=9234).contains(st) {
                 hh.insert((x, y, z));
@@ -7531,6 +7915,34 @@ fn save_world_into(f: &mut Vec<u8>) {
     // from the seed, so two runs of the same seed diverge after a restart.
     (*f).extend_from_slice(b"RNG1");
     (*f).extend_from_slice(&world_rng::saved_state().to_be_bytes());
+    let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
+        (
+            g.tick_sources(),
+            g.generated_leaf_ticks().to_vec(),
+            g.generated_fluid_ticks().to_vec(),
+        )
+    })
+    .unwrap_or_default();
+    let blocks = block_ticks().lock().unwrap().clone();
+    let (fluid_order, fluids, owned) = GENERATED_FLUID_OWNER
+        .get()
+        .map(|owner| {
+            let owner = owner.lock().unwrap();
+            (owner.next_order, owner.queue.clone(), owner.owned.clone())
+        })
+        .unwrap_or_else(|| (0, scheduled_ticks::ScheduledTicks::new(), HashSet::new()));
+    tick_persistence::TickState {
+        now: TICK_IDX.load(Ordering::Relaxed),
+        block_order: BLOCK_TICK_ORDER.load(Ordering::Relaxed),
+        blocks,
+        fluid_order,
+        fluids,
+        owned,
+        sources,
+        generated_blocks,
+        generated_fluids,
+    }
+    .append(f);
 }
 fn load_world() -> Result<(), &'static str> {
     let raw = match std::fs::read(WORLD_FILE) {
@@ -7538,11 +7950,17 @@ fn load_world() -> Result<(), &'static str> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err("failed to read world save"),
     };
-    load_world_from(&unwrap_world_payload(raw)?);
-    Ok(())
+    load_world_from(&unwrap_world_payload(raw)?)
 }
 
-fn load_world_from(payload: &[u8]) {
+fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
+    let tick_state = tick_persistence::TickState::read(payload)?;
+    if tick_state.as_ref().is_some_and(|s| {
+        (!s.sources.is_empty() || !s.generated_blocks.is_empty() || !s.generated_fluids.is_empty())
+            && worldgen::with_gen(|_| ()).is_none()
+    }) {
+        return Err("tick state requires initialized world generator");
+    }
     let mut p = 0usize;
     let b = payload;
     // bounds-safe varint read: truncated input stops the parse instead of
@@ -7572,7 +7990,6 @@ fn load_world_from(payload: &[u8]) {
     }
     eprintln!("[spine] loaded {} dirty chunks", w.len());
     drop(w);
-    rebuild_derived_indexes();
     // optional META tail
     if p + 4 <= payload.len() && matches!(&payload[p..p + 4], b"MET2" | b"MET3" | b"MET4") {
         let magic = &payload[p..p + 4];
@@ -8465,6 +8882,25 @@ fn load_world_from(payload: &[u8]) {
             world_rng::restore(u64::from_be_bytes(payload[p..p + 8].try_into().unwrap()));
         }
     }
+    if let Some(state) = tick_state {
+        TICK_IDX.store(state.now, Ordering::Relaxed);
+        BLOCK_TICK_ORDER.store(state.block_order, Ordering::Relaxed);
+        *block_ticks().lock().unwrap() = state.blocks;
+        let mut owner = GeneratedFluidOwner::new();
+        owner.queue = state.fluids;
+        owner.next_order = state.fluid_order;
+        owner.owned = state.owned;
+        *GENERATED_FLUID_OWNER
+            .get_or_init(|| Mutex::new(GeneratedFluidOwner::new()))
+            .lock()
+            .unwrap() = owner;
+        worldgen::with_gen(|g| {
+            g.restore_tick_sources(state.sources);
+            g.restore_generated_ticks(state.generated_blocks, state.generated_fluids);
+        });
+    }
+    rebuild_derived_indexes();
+    Ok(())
 }
 
 // ---------- name -> id tables (generated from minecraft-data 1.21.1) ----------
@@ -21408,6 +21844,8 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     step("environment", keepalive_time_tick);
     TICK_IDX.fetch_add(1, Ordering::Relaxed);
     step("hot_regions", refresh_hot);
+    step("scheduled_blocks", scheduled_block_tick);
+    step("generated_fluids", generated_fluid_tick);
     step("interest", interest_tick);
     step("drops", drop_tick);
     step("arrows", arrow_tick);
@@ -21497,6 +21935,9 @@ fn main() {
             worldgen::biome_at_dump(&spec);
         }
         if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP") {
+            if std::env::var("MC_SPINE_WG_DIAG_LOAD_WORLD").as_deref() == Ok("1") {
+                load_world().expect("load diagnostic world save");
+            }
             // Offline block dump for parity diffs: `MC_SPINE_WG_DUMP_N` chunks per
             // side from (0,0), each section in the send layout `(ly<<8)|(lz<<4)|lx`.
             // `tools/carver_diff.py` reads it against a vanilla region file.
@@ -21555,6 +21996,141 @@ fn main() {
                 }
             }
             std::fs::write(&path, &out).unwrap();
+            if let Ok(tick_path) = std::env::var("MC_SPINE_WG_LEAF_TICKS") {
+                let reg =
+                    crate::block_registry::breg().expect("block registry required for tick dump");
+                let ticks = worldgen::with_gen(|g| {
+                    g.generated_leaf_ticks()
+                        .iter()
+                        .map(|(p, st)| format!("{}\t{}\t{}\t{}\n", p.0, p.1, p.2, reg.name_of(*st)))
+                        .collect::<String>()
+                })
+                .expect("generator required for tick dump");
+                std::fs::write(tick_path, ticks).expect("write generated leaf tick dump");
+            }
+            if let Ok(path) = std::env::var("MC_SPINE_WG_FLUID_TICKS") {
+                let ticks = worldgen::with_gen(|g| {
+                    g.generated_fluid_ticks()
+                        .iter()
+                        .map(|(p, id)| format!("{}\t{}\t{}\t{id}\n", p.0, p.1, p.2))
+                        .collect::<String>()
+                })
+                .expect("generator required for fluid tick dump");
+                std::fs::write(path, ticks).expect("write generated fluid tick dump");
+            }
+            if let Ok(runtime_path) = std::env::var("MC_SPINE_WG_LEAF_RUNTIME_DUMP") {
+                if std::env::var_os("MC_SPINE_POP_ORDER").is_none() {
+                    eprintln!("[wgdump] leaf runtime diagnostic requires MC_SPINE_POP_ORDER");
+                    std::process::exit(2);
+                }
+                let steps: u64 = std::env::var("MC_SPINE_WG_LEAF_RUNTIME_STEPS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0 && *n <= 10_000)
+                    .expect("leaf runtime diagnostic needs 1..=10000 steps");
+                let halo: i32 = std::env::var("MC_SPINE_WG_LEAF_RUNTIME_HALO")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| (0..=3).contains(n))
+                    .unwrap_or(0);
+                let warm: HashSet<_> = (ox - halo..ox + n + halo)
+                    .flat_map(|x| (oz - halo..oz + n + halo).map(move |z| (x, z)))
+                    .collect();
+                {
+                    let mut region = region().lock().unwrap();
+                    region.hot = warm.clone();
+                    region.warm = warm;
+                }
+                let fluid_seeds = std::env::var("MC_SPINE_WG_DIAG_FLUID_SEEDS").ok();
+                let fluid_native =
+                    std::env::var("MC_SPINE_WG_DIAG_FLUID_NATIVE").as_deref() == Ok("1");
+                let production_fluid =
+                    std::env::var("MC_SPINE_WG_DIAG_PRODUCTION_FLUID").as_deref() == Ok("1");
+                let full_tick = std::env::var("MC_SPINE_WG_DIAG_FULL_TICK").as_deref() == Ok("1");
+                if full_tick {
+                    for x in ox..ox + n {
+                        for z in oz..oz + n {
+                            forceloaded().lock().unwrap().insert((x, z));
+                        }
+                    }
+                }
+                let mut fluid_diagnostic = GeneratedFluidOwner::new();
+                if let Some(path) = &fluid_seeds {
+                    let input = std::fs::read_to_string(path).expect("read diagnostic fluid seeds");
+                    for line in input.lines() {
+                        let p: Vec<i32> = line
+                            .split_whitespace()
+                            .map(|v| v.parse().expect("fluid seed coordinate"))
+                            .collect();
+                        assert_eq!(p.len(), 3, "fluid seed requires x y z");
+                        let state = block_at(p[0], p[1], p[2]);
+                        assert!(
+                            (80..=111).contains(&state),
+                            "fluid seed must be a liquid block"
+                        );
+                        if fluid_native {
+                            fluid_diagnostic.schedule(
+                                (p[0], p[1], p[2]),
+                                fluid_from_block(state).unwrap(),
+                                1,
+                                true,
+                            );
+                        } else {
+                            set_block(p[0], p[1], p[2], state);
+                        }
+                    }
+                }
+                for i in 1..=steps {
+                    if full_tick {
+                        game_tick(|_, tick| tick());
+                    } else {
+                        TICK_IDX.store(i, Ordering::Relaxed);
+                        scheduled_block_tick();
+                        if production_fluid {
+                            generated_fluid_tick();
+                        }
+                    }
+                    if !full_tick && fluid_seeds.is_some() {
+                        if fluid_native {
+                            let eligible = region_guard().warm.clone();
+                            fluid_diagnostic
+                                .tick(i as i64, &eligible)
+                                .expect("native fluid diagnostic");
+                        } else {
+                            water_tick();
+                            if i.is_multiple_of(server_ticks(FLUID_TICK_GT)) {
+                                lava_tick();
+                            }
+                        }
+                    }
+                }
+                if std::env::var("MC_SPINE_WG_DIAG_SAVE_WORLD").as_deref() == Ok("1") {
+                    save_world();
+                }
+                let edits = world().lock().unwrap();
+                for dz in 0..n {
+                    for dx in 0..n {
+                        if let Some(chunk) = edits.get(&(ox + dx, oz + dz)) {
+                            for (&index, &state) in chunk {
+                                assert!(
+                                    (index as usize) < 24 * 4096,
+                                    "overlay outside diagnostic height"
+                                );
+                                let cell = ((dz * n + dx) as usize * (24 * 4096)) + index as usize;
+                                let offset = cell * 4;
+                                if offset + 4 <= out.len() {
+                                    out[offset..offset + 4].copy_from_slice(&state.to_le_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+                std::fs::write(runtime_path, &out).expect("write leaf runtime diagnostic dump");
+                eprintln!(
+                    "[wgdump] runtime diagnostic: {steps} steps; fluid seeds={} native={fluid_native} production_fluid={production_fluid} full_tick={full_tick}",
+                    fluid_seeds.is_some()
+                );
+            }
             eprintln!(
                 "[wgdump] {} chunks -> {} ({} bytes) in {:?}",
                 n * n,
@@ -22014,6 +22590,7 @@ mod effect_tests;
 mod entity_encoding_tests;
 #[cfg(test)]
 mod fanout_tests;
+mod flowing_fluid;
 #[cfg(test)]
 mod furnace_cache_tests;
 #[cfg(test)]
@@ -22024,8 +22601,10 @@ mod persistence_tests;
 mod primitives_tests;
 #[cfg(test)]
 mod registry_tests;
+mod scheduled_ticks;
 #[cfg(test)]
 mod test_support;
+mod tick_persistence;
 mod tick_queue;
 #[cfg(test)]
 mod tick_tests;

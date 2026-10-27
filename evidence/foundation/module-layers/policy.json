@@ -7,12 +7,15 @@
     [
       "java_compat",
       "landing",
-      "effects"
+      "effects",
+      "tick_persistence"
     ],
     [
       "cached_lookup",
       "world_rng",
       "tick_queue",
+      "flowing_fluid",
+      "scheduled_ticks",
       "landing_types"
     ],
     [
@@ -61,6 +64,10 @@
     ]
   ],
   "allowed_edges": [
+    ["main", "tick_persistence"],
+    ["main", "flowing_fluid"],
+    ["main", "scheduled_ticks"],
+    ["tick_persistence", "scheduled_ticks"],
     ["main", "generation_leaf_queue"],
     ["tree", "generation_leaf_queue"],
     ["generation_context", "generation_math"],

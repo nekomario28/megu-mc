@@ -1,0 +1,31 @@
+{
+  "region": [
+    -64,
+    32,
+    3
+  ],
+  "cells_compared": 884736,
+  "source_game_times": [
+    2,
+    2
+  ],
+  "resume_game_times": [
+    4,
+    704
+  ],
+  "source_vs_resumed_frozen": 0,
+  "pre_freeze_runtime_writes": 0,
+  "frozen_vs_resumed_ticked": 1803,
+  "last_runtime_writers": {
+    "FlowingFluid.tick": 40,
+    "LeavesBlock.tick": 1763
+  },
+  "sha256": {
+    "source_native": "632a7647430e338843777f785a5c28bf491ff4be1e2ebfa6bed18221ff37102b",
+    "source_region": "cec70da5e61fac7f23f9ac98dc75ec035d93fa84ed4f51b05576eecbf803958d",
+    "resumed_frozen_region": "2e538e93a1df507cb694bf173d65108ba191c2ee8de9c7520a6fb1168ecc1117",
+    "resumed_ticked_region": "8c870c9eb65ff4968c20b3f4ea9369da17c7eda70c532c87bf62ac0e947832c9",
+    "resume_log": "2afc0520d8426f72eabb3b69be86a001ced666f3b1f8810d7b22196ef2d56099"
+  },
+  "scope": "same copied native world; no port runtime comparison"
+}

@@ -460,11 +460,20 @@ pub struct Gen {
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pop_done: HashSet<(i32, i32)>,
+    // Sources reconstructed after loading must recreate terrain but not enqueue
+    // the generation ticks a second time.
+    restored_tick_sources: HashSet<(i32, i32)>,
+    suppress_generated_ticks: bool,
     carved: HashSet<(i32, i32)>,
     /// Decoration region whose lexicographic scan order to follow (`MC_SPINE_POP_REGION`).
     pop_region: Option<(i32, i32, i32, i32)>,
     // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
+    // ProtoChunkTicks keeps the first entry for each position and block type.
+    generated_leaf_ticks: Vec<((i32, i32, i32), u32)>,
+    generated_leaf_tick_set: HashSet<((i32, i32, i32), u32)>,
+    generated_fluid_ticks: Vec<((i32, i32, i32), u32)>,
+    generated_fluid_tick_set: HashSet<((i32, i32, i32), u32)>,
     world_seed: u64,
 }
 struct Aqd {
@@ -646,6 +655,8 @@ impl Gen {
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            restored_tick_sources: HashSet::new(),
+            suppress_generated_ticks: false,
             carved: HashSet::new(),
             pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
@@ -658,6 +669,10 @@ impl Gen {
             vein: None,
             memo: HashMap::new(),
             feat_hm: HashMap::new(),
+            generated_leaf_ticks: Vec::new(),
+            generated_leaf_tick_set: HashSet::new(),
+            generated_fluid_ticks: Vec::new(),
+            generated_fluid_tick_set: HashSet::new(),
             world_seed: seed,
         };
         // noise settings (sea level, bounds, router names)
@@ -2317,6 +2332,64 @@ pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
 }
 
 impl Gen {
+    pub(crate) fn schedule_generated_leaf(&mut self, pos: (i32, i32, i32), block: u32) {
+        if self.suppress_generated_ticks {
+            return;
+        }
+        if self.generated_leaf_tick_set.insert((pos, block)) {
+            self.generated_leaf_ticks.push((pos, block));
+        }
+    }
+
+    pub(crate) fn generated_leaf_ticks(&self) -> &[((i32, i32, i32), u32)] {
+        &self.generated_leaf_ticks
+    }
+
+    pub(crate) fn take_generated_leaf_ticks(&mut self) -> Vec<((i32, i32, i32), u32)> {
+        self.generated_leaf_tick_set.clear();
+        std::mem::take(&mut self.generated_leaf_ticks)
+    }
+
+    pub(crate) fn schedule_generated_fluid(&mut self, pos: (i32, i32, i32), fluid: u32) {
+        if self.suppress_generated_ticks {
+            return;
+        }
+        if self.generated_fluid_tick_set.insert((pos, fluid)) {
+            self.generated_fluid_ticks.push((pos, fluid));
+        }
+    }
+
+    pub(crate) fn take_generated_fluid_ticks(&mut self) -> Vec<((i32, i32, i32), u32)> {
+        self.generated_fluid_tick_set.clear();
+        std::mem::take(&mut self.generated_fluid_ticks)
+    }
+
+    pub(crate) fn generated_fluid_ticks(&self) -> &[((i32, i32, i32), u32)] {
+        &self.generated_fluid_ticks
+    }
+
+    pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
+        self.pop_done
+            .union(&self.restored_tick_sources)
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn restore_tick_sources(&mut self, sources: HashSet<(i32, i32)>) {
+        self.restored_tick_sources = sources;
+    }
+
+    pub(crate) fn restore_generated_ticks(
+        &mut self,
+        blocks: Vec<((i32, i32, i32), u32)>,
+        fluids: Vec<((i32, i32, i32), u32)>,
+    ) {
+        self.generated_leaf_tick_set = blocks.iter().copied().collect();
+        self.generated_leaf_ticks = blocks;
+        self.generated_fluid_tick_set = fluids.iter().copied().collect();
+        self.generated_fluid_ticks = fluids;
+    }
+
     /// Per-Gen cached chunk column builder (terrain layer only — no features).
     pub(crate) fn cols(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
         if let Some(v) = self.col_c.get(&(cx, cz)) {
@@ -2902,7 +2975,9 @@ impl Gen {
         let mut executed = 0;
         for (x, z) in order {
             if self.pop_done.insert((x, z)) {
+                self.suppress_generated_ticks = self.restored_tick_sources.contains(&(x, z));
                 populate(self, x, z);
+                self.suppress_generated_ticks = false;
                 executed += 1;
             }
         }

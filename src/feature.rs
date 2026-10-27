@@ -3433,6 +3433,17 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
             if rocks == *rock && air == *hole {
                 ctx.set(pos.0, pos.1, pos.2, *fluid);
+                let identity = match reg.fluid_name(*fluid) {
+                    "minecraft:water" => 0,
+                    "minecraft:flowing_water" => 1,
+                    "minecraft:lava" => 2,
+                    "minecraft:flowing_lava" => 3,
+                    other => {
+                        eprintln!("[worldgen] unsupported spring fluid tick {other} at {pos:?}");
+                        return;
+                    }
+                };
+                ctx.g.schedule_generated_fluid(pos, identity);
             }
         }
         Cf::Seagrass { prob } => {

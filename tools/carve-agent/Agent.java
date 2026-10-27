@@ -862,9 +862,53 @@ public class Agent {
         return cw.toByteArray();
     }
 
+    /** Accepted proto/container entries and LevelTicks drain order. */
+    static byte[] instrumentTicks(byte[] buf, String owner) {
+        ClassReader cr = new ClassReader(buf);
+        ClassWriter cw = writer(cr);
+        cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+            @Override public MethodVisitor visitMethod(int acc, String mn, String md, String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                boolean proto = owner.equals("eyr") && mn.equals("a") && md.equals("(Leys;)V");
+                boolean chunk = owner.equals("eyo") && mn.equals("b") && md.equals("(Leyt;)V");
+                boolean drain = owner.equals("eyq") && mn.equals("c") && md.equals("(Leyt;)V");
+                boolean run = owner.equals("eyq") && mn.equals("a") && md.equals("(Ljava/util/function/BiConsumer;)V");
+                if (!(proto || chunk || drain || run)) return mv;
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    @Override public void visitCode() {
+                        super.visitCode();
+                        if (chunk || drain) {
+                            super.visitLdcInsn(chunk ? "chunk-add" : "drain");
+                            super.visitVarInsn(Opcodes.ALOAD, 1);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "scheduled", "(Ljava/lang/String;Ljava/lang/Object;)V", false);
+                        }
+                    }
+                    @Override public void visitMethodInsn(int op, String target, String name, String desc, boolean itf) {
+                        if (proto && op == Opcodes.INVOKEINTERFACE && target.equals("java/util/List")
+                                && name.equals("add") && desc.equals("(Ljava/lang/Object;)Z")) {
+                            super.visitInsn(Opcodes.DUP);
+                            super.visitLdcInsn("proto-add");
+                            super.visitInsn(Opcodes.SWAP);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "scheduled", "(Ljava/lang/String;Ljava/lang/Object;)V", false);
+                        }
+                        if (run && op == Opcodes.INVOKEINTERFACE && target.equals("java/util/function/BiConsumer")
+                                && name.equals("accept") && desc.equals("(Ljava/lang/Object;Ljava/lang/Object;)V")) {
+                            super.visitLdcInsn("run");
+                            super.visitVarInsn(Opcodes.ALOAD, 2);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "scheduled", "(Ljava/lang/String;Ljava/lang/Object;)V", false);
+                        }
+                        super.visitMethodInsn(op, target, name, desc, itf);
+                    }
+                };
+            }
+        }, ClassReader.EXPAND_FRAMES);
+        return cw.toByteArray();
+    }
+
     static class Transformer implements ClassFileTransformer {
         @Override public byte[] transform(ClassLoader l, String name, Class<?> c,
                                           ProtectionDomain pd, byte[] buf) {
+            if (System.getProperty("tickbox") != null && ("eyr".equals(name) || "eyo".equals(name) || "eyq".equals(name))) return instrumentTicks(buf, name);
             if ("ebb".equals(name)) {
                 byte[] b = instrumentCarve(buf);
                 return instrumentTunnel(b != null ? b : buf);

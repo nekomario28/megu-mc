@@ -9,8 +9,8 @@ import depsgx as d
 
 layers = [
     ["main"],
-    ["java_compat", "landing", "effects"],
-    ["cached_lookup", "world_rng", "tick_queue", "landing_types"],
+    ["java_compat", "landing", "effects", "tick_persistence"],
+    ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks"],
     ["feature"],
     ["tree"],
     ["generation_providers"],
@@ -28,6 +28,7 @@ graph = d.ModuleGraph(
         ("landing", "java_compat"), ("landing", "landing_types"),
         ("landing", "world_rng"),
         ("java_compat", "landing_types"),
+        ("tick_persistence", "scheduled_ticks"),
         ("feature", "tree"), ("feature", "worldgen"),
         ("feature", "block_registry"), ("feature", "generation_providers"),
         ("feature", "generation_context"), ("feature", "json"), ("feature", "generation_math"),

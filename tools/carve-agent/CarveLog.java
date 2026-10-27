@@ -299,6 +299,20 @@ public class CarveLog {
     static boolean inside(int[] b,int x,int y,int z) {
         return b!=null && x>=b[0] && x<=b[3] && y>=b[1] && y<=b[4] && z>=b[2] && z<=b[5];
     }
+    static final int[] TICK_BOX=box("tickbox");
+    public static void scheduled(String phase,Object tick) {
+        try {
+            Class<?> t=tick.getClass();
+            Object pos=t.getMethod("b").invoke(tick);
+            Class<?> p=pos.getClass();
+            int x=(Integer)p.getMethod("u").invoke(pos), y=(Integer)p.getMethod("v").invoke(pos), z=(Integer)p.getMethod("w").invoke(pos);
+            if(!inside(TICK_BOX,x,y,z)) return;
+            Object type=t.getMethod("a").invoke(tick), time=t.getMethod("c").invoke(tick), priority=t.getMethod("d").invoke(tick);
+            Object sub=phase.equals("proto-add") ? "saved" : t.getMethod("e").invoke(tick);
+            String stack=phase.equals("proto-add") ? java.util.Arrays.stream(Thread.currentThread().getStackTrace()).skip(2).limit(8).map(StackTraceElement::toString).collect(java.util.stream.Collectors.joining(" | ")) : "";
+            System.out.println("TICKTRACE "+phase+" "+x+" "+y+" "+z+" type="+type+" time="+time+" priority="+priority+" sub="+sub+" stack="+stack);
+        } catch (ReflectiveOperationException e) { throw new IllegalStateException("tick trace failed",e); }
+    }
     public static void runtimeCell(int x,int y,int z,int state,int minY,boolean wrote) {
         if(minY != -64 || (!RUNTIME_CELLS.contains(x+","+y+","+z) && !inside(RUNTIME_BOX,x,y,z))) return;
         String stack=java.util.Arrays.stream(Thread.currentThread().getStackTrace())

@@ -1,0 +1,100 @@
+{
+  "source": "existing r1-frozen-native and r1-ticked-native captures; not a shared-world replay",
+  "frozen_3x3": {
+    "chunk_rectangle": [
+      -64,
+      32,
+      3,
+      3
+    ],
+    "full_chunks": 9,
+    "tick_types": {
+      "block_ticks": {
+        "minecraft:birch_leaves": 492,
+        "minecraft:gravel": 26,
+        "minecraft:oak_leaves": 2393,
+        "minecraft:sand": 58
+      },
+      "fluid_ticks": {
+        "minecraft:lava": 1,
+        "minecraft:water": 28
+      }
+    },
+    "stored_delays": {
+      "block_ticks": {
+        "0": 2887,
+        "2": 82
+      },
+      "fluid_ticks": {
+        "0": 8,
+        "5": 21
+      }
+    },
+    "duplicate_type_and_position_entries": 0,
+    "region_sha256": {
+      "r.-2.1.mca": "f87cd8ad03d2950f46b5cac13829ecd59ccc3de7550b5d59e44209a4dab738b2"
+    }
+  },
+  "frozen_7x7": {
+    "chunk_rectangle": [
+      -66,
+      30,
+      7,
+      7
+    ],
+    "full_chunks": 49,
+    "tick_types": {
+      "block_ticks": {
+        "minecraft:birch_leaves": 1719,
+        "minecraft:gravel": 31,
+        "minecraft:magma_block": 1,
+        "minecraft:oak_leaves": 9394,
+        "minecraft:sand": 389
+      },
+      "fluid_ticks": {
+        "minecraft:flowing_water": 3,
+        "minecraft:lava": 1,
+        "minecraft:water": 84
+      }
+    },
+    "stored_delays": {
+      "block_ticks": {
+        "0": 11116,
+        "2": 417,
+        "20": 1
+      },
+      "fluid_ticks": {
+        "0": 19,
+        "5": 69
+      }
+    },
+    "duplicate_type_and_position_entries": 0,
+    "region_sha256": {
+      "r.-2.0.mca": "7e83e06cd21263255b157371cdcebd0a229e666e6c993f5d66879d202977fdaf",
+      "r.-2.1.mca": "f87cd8ad03d2950f46b5cac13829ecd59ccc3de7550b5d59e44209a4dab738b2",
+      "r.-3.0.mca": "a9feb7e9f504c9337a5c3b462893f50357278a4ad06f0dde31764045c81232a2",
+      "r.-3.1.mca": "885ee6163088d040271581b554b307b37cc49eda301c8cc7760e81e79119172c"
+    }
+  },
+  "ticked_3x3": {
+    "chunk_rectangle": [
+      -64,
+      32,
+      3,
+      3
+    ],
+    "full_chunks": 9,
+    "tick_types": {
+      "block_ticks": {},
+      "fluid_ticks": {}
+    },
+    "stored_delays": {
+      "block_ticks": {},
+      "fluid_ticks": {}
+    },
+    "duplicate_type_and_position_entries": 0,
+    "region_sha256": {
+      "r.-2.1.mca": "02f729a4dc7b76ade588dec2b683ad066ac861c78e2e47bc043f8a93c82d953c"
+    }
+  }
+}
