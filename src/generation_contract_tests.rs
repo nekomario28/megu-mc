@@ -66,6 +66,64 @@ fn glowstone_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn basalt_pillar_matches_native_cells_and_rng() {
+    let reg = breg().unwrap();
+    let cf = super::p_cf(&jparse(br#"{"type":"minecraft:basalt_pillar","config":{}}"#).unwrap())
+        .unwrap();
+    let basalt = reg.state_of("minecraft:basalt", None);
+    // The native check reads the cell above the origin, so every scene is built
+    // around a ceiling at dy = 1 (see tools/structure-oracle/BasaltPillarOracle.java).
+    let solid = |scene: i32, dx: i32, dy: i32, dz: i32| -> bool {
+        match scene {
+            0 => dy == 1 || dy <= -5,
+            1 => dy == 1 || dy <= -24,
+            2 => dy <= -5,
+            3 => dy == 0 || dy == 1 || dy <= -5,
+            4 => {
+                dy == 1
+                    || dy <= -5
+                    || (dx.abs() == 1 && dz == 0 && dy % 3 == 0)
+                    || (dz.abs() == 1 && dx == 0 && dy % 2 == 0)
+            }
+            5 => dy == 1,
+            6 => dy == 1 || dy <= -1 - ((dx * dx + dz * dz) % 3),
+            _ => unreachable!(),
+        }
+    };
+    for row in include_str!("../tests/data/basalt_pillar_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let seed = p[1].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -12i32..=12 {
+            for z in -12i32..=12 {
+                for dy in -140i32..=2 {
+                    let state = if solid(scene, x, dy, z) { basalt } else { 0 };
+                    g.feat_write(x, 64 + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[2].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        let mut cells = Vec::new();
+        for (&(x, y, z), &state) in &ctx.wr {
+            assert_eq!(reg.name_of(state), "minecraft:basalt");
+            cells.push(format!("{x},{},{z}\n", y - 64));
+        }
+        cells.sort();
+        let digest: String = crate::generation_math::md5(cells.concat().as_bytes())
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        assert_eq!(digest, p[5], "{row}");
+        assert_eq!(rng.next_i64(), p[4].parse::<i64>().unwrap(), "{row}");
+    }
+}
+
+#[test]
 fn chorus_plant_matches_native_cells_states_and_rng() {
     let reg = breg().unwrap();
     let cf =

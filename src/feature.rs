@@ -46,6 +46,18 @@ enum Cf {
     EndIsland,
     ChorusPlant,
     Glowstone,
+    /// `minecraft:basalt_pillar` (`ebj`, `BasaltPillarFeature`), config `{}`.
+    ///
+    /// The pillar **hangs**: the cell above the origin must be solid and the origin
+    /// itself air (measured, not assumed: `jd.d()` is above in 1.21.1). From there a
+    /// basalt column runs down through air. At every level it also tries one sideways
+    /// block per horizontal direction, and a direction that draws `nextInt(10) == 0`
+    /// is dropped for the rest of the column — the native `flag = flag && place(...)`
+    /// short-circuits, so both the write and the RNG draw disappear. At the lowest
+    /// level four `nextBoolean` side blocks may hang, then a 7x7 base patch fills where
+    /// `nextInt(10) < 10 - |dx|*|dz|`, each cell walked down at most three cells to its
+    /// support. Writes outside the build height are refused, as native `setBlock` does.
+    BasaltPillar,
     Ore {
         size: i32,
         discard: f32,
@@ -1623,6 +1635,67 @@ fn safe_feature_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, cannot_replace: &
     }
 }
 
+/// `BasaltPillarFeature` (`ebj`), config `{}`. See [`Cf::BasaltPillar`].
+///
+/// The four sideways attempts are listed in the native order — north, south, west,
+/// east (`ji.c`, `ji.d`, `ji.e`, `ji.f`, read from the enum's own names) — and the
+/// short circuit is reproduced literally: once a direction draws `nextInt(10) == 0`
+/// it is never attempted (or drawn) again down the rest of the column.
+fn gen_basalt_pillar(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let basalt = reg.state_of("minecraft:basalt", None);
+    if !ctx.is_air(pos.0, pos.1, pos.2) || ctx.is_air(pos.0, pos.1 + 1, pos.2) {
+        return;
+    }
+    // north, south, west, east
+    const SIDES: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+    let mut hang = [true; 4];
+    let (mut x, mut y, mut z) = pos;
+    while ctx.is_air(x, y, z) {
+        if ctx.out_of_h(y) {
+            return;
+        }
+        ctx.set(x, y, z, basalt);
+        for (i, (dx, dz)) in SIDES.iter().enumerate() {
+            if !hang[i] {
+                continue;
+            }
+            if rng.next_bound(10) != 0 {
+                ctx.set(x + dx, y, z + dz, basalt);
+            } else {
+                hang[i] = false;
+            }
+        }
+        y -= 1;
+    }
+    y += 1;
+    for (dx, dz) in SIDES {
+        if rng.next_bool() {
+            ctx.set(x + dx, y, z + dz, basalt);
+        }
+    }
+    y -= 1;
+    for dx in -3i32..=3 {
+        for dz in -3i32..=3 {
+            if rng.next_bound(10) >= 10 - (dx.abs() * dz.abs()) {
+                continue;
+            }
+            let (mut mx, mut my, mz) = (x + dx, y, z + dz);
+            let mut left = 3;
+            while ctx.is_air(mx, my - 1, mz) {
+                my -= 1;
+                left -= 1;
+                if left <= 0 {
+                    break;
+                }
+            }
+            if !ctx.is_air(mx, my - 1, mz) {
+                ctx.set(mx, my, mz, basalt);
+            }
+        }
+    }
+}
+
 /// `Feature.isAirOrLeaves`: air, or any block in the vanilla leaves tag.
 fn is_air_or_leaves(reg: &BReg, st: u32) -> bool {
     reg.is_air(st) || reg.in_tag(st, "minecraft:leaves")
@@ -2169,6 +2242,7 @@ fn p_cf(j: &J) -> Option<Cf> {
         "end_island" => Cf::EndIsland,
         "chorus_plant" => Cf::ChorusPlant,
         "glowstone_blob" => Cf::Glowstone,
+        "basalt_pillar" => Cf::BasaltPillar,
         "monster_room" => Cf::MonsterRoom,
         "tree" => Cf::Tree(Box::new(crate::tree::p_tree(j)?)),
         "fallen_tree" => Cf::Fallen {
@@ -3290,6 +3364,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 }
             }
         }
+        Cf::BasaltPillar => gen_basalt_pillar(ctx, rng, pos),
         Cf::ChorusPlant => {
             let Some(reg) = breg() else { return };
             if ctx.is_air(pos.0, pos.1, pos.2)

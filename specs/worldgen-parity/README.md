@@ -125,8 +125,34 @@ still reads the installed biome feature lists. Chorus plant generation matches
 42 native controlled worlds, including blocked/invalid origins, final connection
 states and the post-generation RNG value.
 
+Reading the remaining feature bodies needs three name tables that are read out of
+the pinned jar rather than guessed from a decompiler dump:
+`tests/data/feature_classes_1211.tsv` (`tools/feature_class_map.py`) maps all 59
+configured-feature types the pack names — inline ones included — to the actual
+registered class, and every one of them is registered (a type that is named but
+not registered would be a data bug, not a missing port);
+`tests/data/block_fields_1211.tsv` maps the bytecode's `dga.*` block fields to
+block ids (`dga.H` is lava, `dga.dY` basalt — guessing netherrack there would move
+every column by one block); and `tools/structure-oracle/EnumFieldsMap.java` reads
+the `ji` direction constants (`ji.a` down, `ji.b` up, `ji.c..f` north/south/west/east).
+A wrong direction read silently mirrors a column.
+
+`basalt_pillar` (`ebj`) matches native on 49 cases: seven controlled scenes (short
+column, deep column, air above the origin, solid origin, side ledges, no floor at
+all, stepped base) times seven signed seeds, comparing the placed flag, every
+written cell, and the RNG value after the call. Two properties are measured rather
+than assumed. The pillar hangs: the native check reads the cell *above* the origin
+(`jd.d()`), and the oracle asserts that the predicate it serves is the height
+accessor's `isOutsideBuildHeight` and the other one the block reader's, by the
+declared interface shapes. And a sideways attempt that draws `nextInt(10) == 0` is
+dropped for the rest of the column — the native `flag = flag && place(...)`
+short-circuits, so both the write and the draw disappear. Two mutants are gates:
+keeping the direction alive, and reading below the origin instead of above both
+fail this fixture.
+
+The repaired configured-feature graph now finds 42 arms and 21 types (36 files)
+with no arm, so 21 of the pack's types still cannot place anything.
+
 Next consumers: processor/jigsaw and structure-start pipelines; all reachable
 feature implementations and their full-chunk interactions;
 then whole-chunk multi-biome, normal-runtime, save/reload and wire comparisons.
-The repaired configured-feature graph currently finds 22 biome-reachable types
-without a placement arm, so registry/configuration presence is not acceptance.

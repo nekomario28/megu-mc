@@ -1010,6 +1010,16 @@ check "End decoration selects its own source feature indices" \
   '    let order = fr.order.get(&NoisePreset::Overworld).expect("dimension feature order");' \
   worldgen::wg_tests::end_features_match_native_full_feature_chunks
 
+check "basalt pillar keeps a dead hang-off direction dead" \
+  src/feature.rs '                hang[i] = false;' \
+  '                hang[i] = true;' \
+  feature::generation_contract_tests::basalt_pillar_matches_native_cells_and_rng
+
+check "basalt pillar reads the ceiling above the origin" \
+  src/feature.rs '|| ctx.is_air(pos.0, pos.1 + 1, pos.2)' \
+  '|| ctx.is_air(pos.0, pos.1 - 1, pos.2)' \
+  feature::generation_contract_tests::basalt_pillar_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \
