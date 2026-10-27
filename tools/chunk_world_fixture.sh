@@ -8,7 +8,7 @@
 #   carvers    no features, real carvers, no structures
 #   features   real features/carvers, no structures
 #   structures real features/carvers/structures
-#   sculk_veins / sculk_one_patch
+#   sculk_veins / sculk_one_patch / sculk_cave_patch
 #              features, with a datapack that isolates one deep-dark step-7 feature
 #              (`tools/vanilla_sculk_pack.py`; apply the same override to the port's pack)
 #
@@ -37,7 +37,7 @@ sed -i 's/^view-distance=.*/view-distance=10/' "$DIR/server.properties"
 sed -i 's/^simulation-distance=.*/simulation-distance=10/' "$DIR/server.properties"
 echo "eula=true" > "$DIR/eula.txt"
 case "$MODE" in
-  terrain|carvers|features|sculk_veins|sculk_one_patch) echo 'generate-structures=false' >> "$DIR/server.properties" ;;
+  terrain|carvers|features|sculk_veins|sculk_one_patch|sculk_cave_patch) echo 'generate-structures=false' >> "$DIR/server.properties" ;;
   structures) ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
@@ -50,6 +50,10 @@ case "$MODE" in
   # pack (`tools/vanilla_sculk_pack.py` prints the paths).
   sculk_veins) python3 "$ROOT/tools/vanilla_sculk_pack.py" "$DIR/server.jar" "$DIR/world" --variant veins ;;
   sculk_one_patch) python3 "$ROOT/tools/vanilla_sculk_pack.py" "$DIR/server.jar" "$DIR/world" --variant one-patch ;;
+  # the cave-band variant: a handful of candidates inside the deep-dark cave range, where a
+  # patch can actually start (`SCULK_COUNT`/`SCULK_HEIGHT`, default 4 and -64:-30)
+  sculk_cave_patch) python3 "$ROOT/tools/vanilla_sculk_pack.py" "$DIR/server.jar" "$DIR/world" --variant one-patch \
+    --count "${SCULK_COUNT:-4}" --height "${SCULK_HEIGHT:--64:-30}" ;;
 esac
 lox=$((CX*16)); loz=$((CZ*16)); hix=$(((CX+N)*16-1)); hiz=$(((CZ+N)*16-1))
 echo "chunk fixture $TAG: mode $MODE, chunks ($CX,$CZ)+${N}x${N}, blocks ($lox,$loz)-($hix,$hiz)"

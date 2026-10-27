@@ -283,6 +283,35 @@ step 7 は `sculk_vein` → `sculk_patch_deep_dark` の順で同じ decorator st
 のに port は below を見ていた。修正しても 429/209/241 は**ビット同一**で、
 この fixture の cursor は上下とも空気のセルに居るため差が出ない。修正は残す（bytecode 準拠）。
 
+## 分離診断 ① 洞穴帯 one-patch（2026-10-28）
+
+`--count` / `--height` を `vanilla_sculk_pack.py` に足し、fixture に `sculk_cave_patch`
+モードを追加（既定 `SCULK_COUNT=4 SCULK_HEIGHT=-64:-30`）。`height_range` を洞穴帯に絞らないと
+唯一の候補が石に落ちて patch が 1 度も走らない（それが plain `one-patch` の失敗理由）。
+
+参照（seed 0、chunks (-16,112)-(-15,113)、count 4、height -64..-30）: **62 セル**
+（sculk 23 + sculk_vein 39）。port: **32 セル**（sculk 13 + sculk_vein 19）、
+missing 43 / extra 13。セル単位で見ると:
+
+- chunk (-16,113): vanilla 26 / port 25 が**同じ場所**（x -245..-243, z 1820..1823）にあり、
+  数セルが ±1 ずれる（port が西に 1 セル余分に伸びる）。
+- chunk (-15,113): vanilla 35 は x=-240/-239 の縦の列、port は 6 セルで x=-227/-226 の別位置。
+  → 最初のパッチが数セルずれた時点で **draw 数が変わり、以降の候補位置がずれる**
+  （cell の違いが分岐条件を変え、`nextInt(50)`/`nextInt(11)`/`nextInt(10)` の消費が変わる）。
+
+## 分離診断 ② 変換チェーンの質量（2026-10-28、env で 1 条件ずつ切って測った）
+
+| 条件 | port のセル | 結論 |
+|---|---|---|
+| 基準（full capture） | sculk 337 + vein 92 = **429** | 参照は 397 |
+| `canPlaceGrowth` を常に false（growth 経路を無効化） | **ビット同一 429** | **growth 経路はこの fixture で 1 セルも寄与していない**。337 sculk は全部 `spc_vein_convert` 由来 |
+| 変換後の vein spread（`this.e.a(sculkState, ...)`）を無効化 | **16**（sculk 6 + vein 8 + catalyst 2） | この呼び出しがパッチ全体を支えている。無効化で 429 → 16 に崩壊 = 変換→vein spread→新しい vein→変換の連鎖が出力のほぼ全部 |
+
+したがって**探索範囲は変換チェーンに絞られた**（growth 経路と `findNextSculk` の骨格は
+質量を持たない）。次にやることは 1 つ: 変換の「最初のずれ」を特定する。port 側の書き込み順を
+trace して（`ctx.set` を chunk で絞って順に出す）、参照セル集合と突き合わせ、最初に集合から
+外れる書き込みの近傍を見る。そこが最初の分岐で、以降は stream のずれとして増幅される。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・

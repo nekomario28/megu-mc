@@ -3198,7 +3198,9 @@ fn spc_vein_convert(ctx: &mut FC, reg: &BReg, rng: &mut Xor, pos: (i32, i32, i32
             ctx.set(nb.0, nb.1, nb.2, sculk);
         }
         // `this.e.a(sculkState, level, newPos, worldGen)`: veins spread from the new sculk cell
-        // (spreader `c()`, all three spread types)
+        // (spreader `c()`, all three spread types). This call is what sustains the patch: with
+        // it removed the whole capture collapses from 429 sculk-family cells to 16 (measured),
+        // because the vein -> sculk conversion chain has no new veins to convert.
         spc_spread_all(ctx, reg, nb, sculk, &[0, 1, 2]);
         let opposite = d ^ 1;
         for around in 0..6u8 {

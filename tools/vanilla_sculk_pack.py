@@ -3,6 +3,13 @@
 
     tools/vanilla_sculk_pack.py <1.21.1 server.jar> <world-dir> --variant veins
     tools/vanilla_sculk_pack.py <1.21.1 server.jar> <world-dir> --variant one-patch
+        [--count N] [--height MIN:MAX]
+
+`--count N` overrides the patch's `count`; `--height MIN:MAX` replaces its
+`height_range` with a uniform absolute range. A plain `--variant one-patch` puts its single
+candidate anywhere in y = -64..256, which usually lands inside stone where
+`canSpreadFrom` refuses - the reference then has no sculk at all and proves nothing.
+Narrowing the height to the cave band is what makes the isolated patch actually run.
 
 Why: `sculk_vein` (multiface_growth, 204..250 per chunk) runs *before*
 `sculk_patch_deep_dark` in step 7 of the deep-dark feature list and shares the same
@@ -45,13 +52,27 @@ def main():
     if "--variant" not in argv:
         print(__doc__)
         return 2
+    def option(name, default=None):
+        return argv[argv.index(name) + 1] if name in argv else default
+
     at = argv.index("--variant")
     variant = argv[at + 1] if at + 1 < len(argv) else ""
-    args = [a for i, a in enumerate(argv) if i not in (at, at + 1)]
+    skip = {at, at + 1}
+    for name in ("--count", "--height"):
+        if name in argv:
+            skip |= {argv.index(name), argv.index(name) + 1}
+    args = [a for i, a in enumerate(argv) if i not in skip]
     if len(args) != 2:
         print(__doc__)
         return 2
     jar, world = args
+    count = int(option("--count", "1"))
+    height = option("--height")
+    if height is not None:
+        lo, hi = (int(v) for v in height.split(":"))
+        if lo >= hi:
+            print(f"--height {height}: min must be below max", file=sys.stderr)
+            return 2
     if variant not in ("veins", "one-patch"):
         print(f"unknown variant {variant}", file=sys.stderr)
         return 2
@@ -98,8 +119,15 @@ def main():
         patched = False
         for mod in placed.get("placement", []):
             if mod.get("type") == "minecraft:count" and not isinstance(mod.get("count"), dict):
-                mod["count"] = 1
+                mod["count"] = count
                 patched = True
+            if mod.get("type") == "minecraft:height_range" and height is not None:
+                lo, hi = (int(v) for v in height.split(":"))
+                mod["height"] = {
+                    "type": "minecraft:uniform",
+                    "min_inclusive": {"absolute": lo},
+                    "max_inclusive": {"absolute": hi},
+                }
         if not patched:
             print(f"{PLACED}: no plain count modifier to narrow", file=sys.stderr)
             return 1
