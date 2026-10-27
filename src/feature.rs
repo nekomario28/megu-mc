@@ -8056,6 +8056,10 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         }
     }
     let pop = pop_seed(g.wseed(), sx * 16, sz * 16);
+    crate::generation_math::CUR_POP_CHUNK.store(
+        ((sx as i64) << 32) | (sz as i64 & 0xFFFF_FFFF),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut ctx = FC::new(g);
     let trace = env_flag!("FEAT_TRACE");
     let profile = env_flag!("FEAT_PROFILE");

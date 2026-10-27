@@ -424,6 +424,41 @@ spread（`m()` = SAME_POSITION のみ）は 22 セルしか寄与しない。
 （`canSpreadFrom` を通過した候補数と、1 パッチあたりの `spreadOneCharge` 呼び出し回数を
 `SPC_CALLS` 方式で両側から測る。vanilla 側は参照の sculk セル数から逆算する）。
 
+## 「最初のずれ」の正しい測り方と、その結果（2026-10-28 深夜）
+
+**方法の修正**: 書き込み順で「最初のずれ」を探すとき、書き込みの state を参照の
+**最終** state と比べると誤検出する（同じセルが最後に air に decay される場合、
+途中の vein 書き込みが「余分」に見える）。正しくは
+
+1. port の**最終**セルと参照の**最終**セルを比べて、**食い違うセル集合 D** を作り、
+2. 書き込み順を歩いて、**D のセルに最初に触れた書き込み**を探す。
+
+書き込みに `pop=cx,cz`（どの chunk の population が書いたか）を足した。
+1 回の population は自身の chunk に書くので、`pop` で「1 パス分」に切って比較できる。
+
+**結果（6x6 捕捉 chunks (-20,108)+6x6、参照 5987 セル / port 5739、D = 5037 セル）**:
+`pop=(-19,110)` のパスで、D に属するセルに最初に触れた書き込みは
+
+```
+FWRITE -291 -40 1777 state=<vein> feature=1,7 pop=-19,110
+```
+
+で、呼び出し元は `spread-post-convert`（変換後の vein spread）。そのセルの port 側の履歴は
+`spread-post-convert` 3 回（面を足す）→ `decay` 2 回（面を落とすが生存）= 最終 **vein**、
+参照の最終は **air**。つまり **vanilla は面が尽きて air に decay したが、port は面が残った**。
+
+decay は「隣が sculk の面を落とす」ので、面が残るということは **その周囲の sculk が
+vanilla と違う**（変換の位置がずれている）ことを意味する。実際 4x4 で測ったとおり
+sculk は 67% しか一致しない。
+
+**結論**: ずれは「1 回の spread 呼び出しの中」で決まっており、その判断は**その瞬間の
+セル状態**に依存する。参照の最終セルから中間状態を復元する方法はここで尽きた。
+次に必要なのは **native 実行**（＝以前記録した option 2: 最小の空 `ChunkAccess` を
+harness に足して sculk 経路を oracle で駆動する）。`SculkVeinBlock` の shape update が
+chunk を要求するのが唯一の障害で、空 chunk を返せば shape update は no-op になり、
+比較したいセル（sculk/vein は full cube）には影響しない見込み。これが sculk を
+推論ではなく証拠で閉じる唯一の道。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・

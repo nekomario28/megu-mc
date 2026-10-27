@@ -97,13 +97,16 @@ impl<'a> FC<'a> {
         // happened. A per-cell filter cannot answer "which write diverged first", and a digest
         // cannot either - the order is the only place the first difference is visible.
         if crate::trace_env::env_str!("FEATURE_WRITE_TRACE")
-            .is_some_and(|want| want == format!("{},{}", x >> 4, z >> 4))
+            .is_some_and(|want| want == "all" || want == format!("{},{}", x >> 4, z >> 4))
         {
             let f = crate::generation_math::XTRACE_FEAT.load(Ordering::Relaxed);
+            let c = crate::generation_math::CUR_POP_CHUNK.load(Ordering::Relaxed);
             eprintln!(
-                "FWRITE {x} {y} {z} state={st} feature={},{}",
+                "FWRITE {x} {y} {z} state={st} feature={},{} pop={},{}",
                 f >> 32,
-                f & 0xFFFF
+                f & 0xFFFF,
+                c >> 32,
+                c & 0xFFFF_FFFF
             );
         }
         self.wr.insert((x, y, z), st);

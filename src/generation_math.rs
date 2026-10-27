@@ -159,6 +159,11 @@ pub(crate) static DTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::Atom
 /// Which placed feature the trace is currently inside, so a draw can be attributed
 /// without guessing from the sequence shape.
 pub(crate) static XTRACE_FEAT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+/// The chunk whose population pass is running (`cx<<32 | cz`), for the write trace: a cell can
+/// be written by its own chunk's pass or by a neighbour's, and "which pass wrote this" is what
+/// makes a single pass comparable on its own.
+pub(crate) static CUR_POP_CHUNK: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
 
 /// Env-gated draw trace for feature placement (`FSEED_ARM=i,step`).
 pub(crate) static XTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
