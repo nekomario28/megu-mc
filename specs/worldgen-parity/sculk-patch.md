@@ -122,6 +122,34 @@ growth 分岐まで検証するには、cases 用に `growth_rounds = 1` の con
   catalyst の `nextFloat` と `canSurvive`／shrieker の `CAN_SUMMON` と `isFaceSturdy`／
   `growth_rounds` 分岐の有無。
 
+## 実装を試みて分かった障害（2026-10-27、実測）
+
+`FeatureOracle` で native を駆動しようとすると、記録済みの `place()` までは進むが
+最初の `updateCursors` で落ちる:
+
+```
+java.lang.UnsupportedOperationException: public abstract duy dcz.a(int,int,dvz,boolean)
+```
+
+`LevelReader.getChunk(int,int,ChunkStatus,boolean)` である。呼び出し元は vein 側の
+`Block.updateFromNeighbourShapes`（`SculkVeinBlock` の private `a(dmu,dcx,jd,ayw)` が
+sculk を置いた直後に呼ぶ）で、block の形状更新が chunk を要求する。level proxy で
+返せるのは `ChunkAccess` の実体だけで、それは「level を半端にモデル化しない」という
+harness の原則（`native-oracle.md`）に反する。
+
+したがって `sculk_patch` の native 照合は **この oracle では不可能**で、次のどちらかが
+要る:
+
+1. **whole-chunk 経路**（R1.2 の capture）で深層暗黒 biome の実チャンクを生成し、
+   sculk セルを biome 単位で比較する。feature 単体の fixture は作れない。
+2. harness に「空の `ChunkAccess` を返す最小実装」を足す。sculk の vein が
+   `getChunk` の結果をどう使うか（`setBlock` 相当の書き戻しがあるか）を先に確認する
+   必要があり、書き戻しがあるなら proxy の write-through と衝突する。
+
+この試行で書いた port（`SculkSpreader` / `Cursor` / `SculkBlock` / vein 経路 / feature）は
+**未検証なので commit していない**（`git checkout -- src/feature.rs` で破棄）。
+残っているのはこの記録だけである。実装を再開するときは、上の 1 か 2 を先に決める。
+
 ## 未検証として残ること
 
 - 現時点で `sculk_patch` のセルは 1 つも port と照合していない。この文書は調査記録で
