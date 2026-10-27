@@ -109,7 +109,7 @@ pub(crate) const B_SUGAR_CANE: u8 = 1;
 pub(crate) const B_FALLING: u8 = 2;
 
 /// Native Heightmap.Types: WG variants share predicates, not update lifetimes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HeightmapKind {
     WorldSurfaceWg,
     WorldSurface,
@@ -791,6 +791,12 @@ impl BReg {
             Some(&b) => b,
             None => return false,
         };
+        // Look the tag up by the caller's own `&str` first: this runs once per candidate
+        // cell in the feature loops, and `ns_name` would allocate a `String` each time.
+        if let Some(set) = self.tag.get(tag) {
+            return set.contains(&bi);
+        }
+        // Unqualified names ("dirt") still resolve, through the one allocation they need.
         self.tag
             .get(&ns_name(tag))
             .map(|s| s.contains(&bi))
