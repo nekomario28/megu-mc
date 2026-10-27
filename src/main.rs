@@ -6790,7 +6790,7 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     }
     drop(w);
     // the cached sky floors describe the blocks that were just changed
-    bump_floor_epoch();
+    bump_world_epoch();
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
         schedule_leaf_neighbors(x, y, z, st);
@@ -8114,7 +8114,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     let rv = rv_varint;
     let n = rv(payload, &mut p);
     let mut w = world().lock().unwrap();
-    bump_floor_epoch();
+    bump_world_epoch();
     for _ in 0..n {
         if p + 8 > payload.len() {
             break;
@@ -13195,6 +13195,252 @@ fn sky_spill(
 }
 
 /// The first opaque block y in each column, scanning down from the surface (the sky floor).
+/// Opacity for the cells the light computation reads, per chunk, read in batches.
+///
+/// Measured with `MC_SPINE_CHUNK_PROFILE=1`: one delivered chunk makes **21,619-29,536**
+/// `block_at` calls, ~100% of which miss the overlay (it holds edits only) and fall
+/// through to `base_state` → `worldgen::block_state` — a full terrain evaluation with
+/// the worldgen lock. At 1-2 µs each that is the whole 25-50 ms the light phase costs.
+///
+/// The cells the light pass reads all sit near a column's surface (the sky floor scan
+/// walks from the surface down, the spill BFS spreads ±15 around a floor), so they can
+/// be read as a band per chunk instead: one batched terrain pass per overlapping
+/// section, the chunk's overlay applied on top. The band is `[min wtop - 18,
+/// max wtop + 18]`, which is the range both users reach into.
+///
+/// Invalidation is the same world-wide edit epoch the floor cache uses: any write into
+/// `world()` drops every band, because a band describes blocks.
+#[derive(Clone)]
+struct OpBand {
+    y0: i32,
+    y1: i32,
+    op: Vec<u8>,
+}
+
+impl OpBand {
+    fn get(&self, y: i32, lx: usize, lz: usize) -> Option<u8> {
+        if y < self.y0 || y > self.y1 {
+            return None;
+        }
+        Some(self.op[(((y - self.y0) as usize) << 8) | (lz << 4) | lx])
+    }
+}
+
+static OP_BANDS: OnceLock<
+    Mutex<std::collections::VecDeque<((i32, i32), u64, std::sync::Arc<OpBand>)>>,
+> = OnceLock::new();
+
+fn op_bands(
+) -> &'static Mutex<std::collections::VecDeque<((i32, i32), u64, std::sync::Arc<OpBand>)>> {
+    OP_BANDS.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
+    let __t = chunkprof::enabled().then(std::time::Instant::now);
+    if __t.is_some() {
+        chunkprof::BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Ok(bands) = op_bands().lock() {
+        if let Some((_, e, b)) = bands.iter().find(|(k, _, _)| *k == (cx, cz)) {
+            if *e == epoch {
+                return Some(b.clone());
+            }
+        }
+    }
+    let reg = crate::block_registry::breg()?;
+    let (y0, y1) = band_range(cx, cz)?;
+    let rows = (y1 - y0 + 1) as usize;
+    let mut op = vec![0u8; rows << 8];
+    // One batched terrain pass per overlapping section, instead of one locked terrain
+    // evaluation per cell.
+    let mut sy = y0 & !15;
+    while sy <= y1 {
+        if let Some(sec) = worldgen::terrain_section(cx, sy, cz, feature::populate) {
+            for ly in 0..16i32 {
+                let y = sy + ly;
+                if y < y0 || y > y1 {
+                    continue;
+                }
+                let row = ((y - y0) as usize) << 8;
+                for lz in 0..16usize {
+                    for lx in 0..16usize {
+                        let st = sec[((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize];
+                        op[row | (lz << 4) | lx] = reg.opacity_of(st);
+                    }
+                }
+            }
+        }
+        sy += 16;
+    }
+    // The overlay holds the edits and wins over the generated state, exactly as
+    // `block_at` prefers it.
+    {
+        let w = world().lock().unwrap();
+        if let Some(col) = w.get(&(cx, cz)) {
+            for (idx, st) in col {
+                let y = (*idx >> 8) as i32 + MIN_Y;
+                if y < y0 || y > y1 {
+                    continue;
+                }
+                let lx = (*idx & 15) as usize;
+                let lz = ((*idx >> 4) & 15) as usize;
+                op[(((y - y0) as usize) << 8) | (lz << 4) | lx] = reg.opacity_of(*st);
+            }
+        }
+    }
+    if __t.is_some() {
+        use std::sync::atomic::Ordering;
+        chunkprof::BAND_NEW.fetch_add(1, Ordering::Relaxed);
+        chunkprof::BAND_CELLS.fetch_add((rows << 8) as u64, Ordering::Relaxed);
+    }
+    let band = std::sync::Arc::new(OpBand { y0, y1, op });
+    {
+        let mut bands = op_bands().lock().unwrap();
+        if bands.len() >= 256 {
+            bands.pop_front();
+        }
+        bands.push_back(((cx, cz), epoch, band.clone()));
+    }
+    if let Some(t) = __t {
+        chunkprof::BAND_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Some(band)
+}
+
+/// Opacity of the world block at `(x, y, z)` without one locked terrain evaluation per
+/// cell: from the chunk's cached band when the cell is inside it, from `block_at`
+/// otherwise (above the band, below it, or before the generator is up).
+/// The y band a chunk's light-relevant cells live in: `[min wtop - 18, max wtop + 18]`.
+/// Both users stay inside it (the sky floor scan walks down from `surface + 17`, the
+/// spill BFS spreads ±15 around a floor), and it is derived from `ChunkCols`, so it
+/// costs one hash lookup rather than a terrain pass.
+fn band_range(cx: i32, cz: i32) -> Option<(i32, i32)> {
+    let cols = worldgen::chunk_cols(cx, cz)?;
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let t = cols.wtop(lx, lz);
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+    }
+    Some(((lo - 18).max(MIN_Y), (hi + 18).min(MIN_Y + 383)))
+}
+
+/// Record the opacity rows `chunk_data` has just computed for this section.
+///
+/// `chunk_data` evaluates the same cells the light band needs (the sections around a
+/// chunk's surface) and then throws the states away. Without this, the band was rebuilt
+/// from worldgen later — measured at 13.6-15.7 ms per new band (~700 ns/cell) against
+/// the ~200 ns/cell the delivery pass pays, i.e. the same work done twice. Installing
+/// the rows here makes the band nearly free for a chunk that was just streamed.
+fn install_band_rows(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    let Some((y0, y1)) = band_range(cx, cz) else {
+        return;
+    };
+    if sy + 15 < y0 || sy > y1 {
+        return;
+    }
+    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
+    let mut bands = op_bands().lock().unwrap();
+    let pos = match bands.iter().position(|(k, _, _)| *k == (cx, cz)) {
+        Some(i) => i,
+        None => {
+            if bands.len() >= 256 {
+                bands.pop_front();
+            }
+            let rows = (y1 - y0 + 1) as usize;
+            bands.push_back((
+                (cx, cz),
+                epoch,
+                std::sync::Arc::new(OpBand {
+                    y0,
+                    y1,
+                    op: vec![0u8; rows << 8],
+                }),
+            ));
+            bands.len() - 1
+        }
+    };
+    // A band from an older epoch is incomplete for the new world; rebuild onset.
+    if bands[pos].1 != epoch {
+        bands[pos].1 = epoch;
+        let rows = (y1 - y0 + 1) as usize;
+        bands[pos].2 = std::sync::Arc::new(OpBand {
+            y0,
+            y1,
+            op: vec![0u8; rows << 8],
+        });
+    }
+    let band = std::sync::Arc::make_mut(&mut bands[pos].2);
+    for ly in 0..16i32 {
+        let y = sy + ly;
+        if y < band.y0 || y > band.y1 {
+            continue;
+        }
+        let row = ((y - band.y0) as usize) << 8;
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                let st = states[((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize];
+                band.op[row | (lz << 4) | lx] = reg.opacity_of(st);
+            }
+        }
+    }
+}
+
+/// Apply a chunk's overlay edits to its band: the overlay wins over generated state,
+/// exactly as `block_at` prefers it. Called once per chunk delivery, after the rows.
+fn overlay_band(cx: i32, cz: i32) {
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
+    let mut bands = op_bands().lock().unwrap();
+    let Some(pos) = bands.iter().position(|(k, _, _)| *k == (cx, cz)) else {
+        return;
+    };
+    if bands[pos].1 != epoch {
+        return;
+    }
+    let band = std::sync::Arc::make_mut(&mut bands[pos].2);
+    let (y0, y1) = (band.y0, band.y1);
+    let w = world().lock().unwrap();
+    let Some(col) = w.get(&(cx, cz)) else {
+        return;
+    };
+    for (idx, st) in col {
+        let y = (*idx >> 8) as i32 + MIN_Y;
+        if y < y0 || y > y1 {
+            continue;
+        }
+        let lx = (*idx & 15) as usize;
+        let lz = ((*idx >> 4) & 15) as usize;
+        band.op[(((y - y0) as usize) << 8) | (lz << 4) | lx] = reg.opacity_of(*st);
+    }
+}
+
+fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
+    let Some(reg) = crate::block_registry::breg() else {
+        return 0;
+    };
+    if !worldgen::enabled() {
+        return reg.opacity_of(block_at(x, y, z));
+    }
+    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
+    if let Some(band) = op_band(x >> 4, z >> 4, epoch) {
+        if let Some(op) = band.get(y, (x & 15) as usize, (z & 15) as usize) {
+            return op;
+        }
+    }
+    reg.opacity_of(block_at(x, y, z))
+}
+
 /// Per-chunk sky floors, memoized.
 ///
 /// `sky_floors` walks 256 columns and up to 24 cells each, and every `opacity` call is
@@ -13203,11 +13449,11 @@ fn sky_spill(
 /// each of which is the centre of some other chunk's delivery.
 ///
 /// Invalidation: a floor is a function of the blocks in its chunk, so every write into
-/// the world bumps `FLOOR_EPOCH` and an entry computed under an older epoch is dropped.
+/// the world bumps `WORLD_EPOCH` and an entry computed under an older epoch is dropped.
 /// The epoch is world-wide rather than per chunk (an edit anywhere drops every entry):
 /// block writes are rare next to chunk reads, and a stale floor would light the wrong
 /// cells, which is exactly the class of bug this cache must not introduce.
-static FLOOR_EPOCH: AtomicU64 = AtomicU64::new(0);
+static WORLD_EPOCH: AtomicU64 = AtomicU64::new(0);
 static SKY_FLOORS: OnceLock<Mutex<std::collections::VecDeque<((i32, i32), u64, [i32; 256])>>> =
     OnceLock::new();
 
@@ -13216,13 +13462,13 @@ fn sky_floors_cache() -> &'static Mutex<std::collections::VecDeque<((i32, i32), 
 }
 
 /// Call after any write into `world()`: every cached floor is now suspect.
-fn bump_floor_epoch() {
-    FLOOR_EPOCH.fetch_add(1, Ordering::Relaxed);
+fn bump_world_epoch() {
+    WORLD_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
-    let epoch = FLOOR_EPOCH.load(Ordering::Relaxed);
+    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
     {
         let cache = sky_floors_cache().lock().unwrap();
         if let Some((_, e, f)) = cache.iter().find(|(k, _, _)| *k == (cx, cz)) {
@@ -13284,7 +13530,7 @@ fn sky_light_sections_world(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     let Some(reg) = crate::block_registry::breg() else {
         return vec![[0u8; 2048]; 26];
     };
-    let op = |x: i32, y: i32, z: i32| reg.opacity_of(block_at(x, y, z));
+    let op = |x: i32, y: i32, z: i32| opacity_windowed(x, y, z);
     let floors = sky_floors(cx, cz, &op);
     // Floors for the 3x3 window: a margin cell (a neighbour chunk) must be tested against its own
     // column, not wrapped onto the centre chunk's, or the BFS routes through cells that are not dark.
@@ -13451,6 +13697,11 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             let base = worldgen::terrain_section(cx, sy, cz, feature::populate);
             if let Some(t) = __ts {
                 chunkprof::add(&chunkprof::SECTION, t);
+            }
+            // Hand the states the light pass needs to its band, instead of letting it
+            // re-evaluate them through `block_state_at` later.
+            if let Some(rows) = &base {
+                install_band_rows(cx, cz, sy, rows);
             }
             {
                 let w = world().lock().unwrap();
@@ -13626,6 +13877,7 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
         write_varint(&mut p, ty);
         p.extend_from_slice(&n);
     }
+    overlay_band(cx, cz);
     let __tl = chunkprof::enabled().then(std::time::Instant::now);
     write_light_arrays(&mut p, cx, cz, gen);
     if let Some(t) = __tl {
@@ -22278,6 +22530,10 @@ pub(crate) mod chunkprof {
     pub(super) static FLOORS_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static BLOCK_AT: AtomicU64 = AtomicU64::new(0);
     pub(super) static BLOCK_AT_MISS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_CELLS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_NEW: AtomicU64 = AtomicU64::new(0);
     pub(super) static N: AtomicU64 = AtomicU64::new(0);
     pub(super) fn enabled() -> bool {
         crate::trace_env::env_flag!("MC_SPINE_CHUNK_PROFILE")
@@ -22300,6 +22556,16 @@ pub(crate) mod chunkprof {
             FLOORS_N.load(Ordering::Relaxed) as f64 / n as f64,
             BLOCK_AT.load(Ordering::Relaxed) as f64 / n as f64,
             BLOCK_AT_MISS.load(Ordering::Relaxed) as f64 / n as f64
+        );
+        eprintln!(
+            "CHUNKPROF   band lookups={:.0} new={:.1} build={:.2}ms cells={:.0} (per new={:.2}ms)",
+            BAND_N.load(Ordering::Relaxed) as f64 / n as f64,
+            BAND_NEW.load(Ordering::Relaxed) as f64 / n as f64,
+            BAND_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
+            BAND_CELLS.load(Ordering::Relaxed) as f64 / n as f64,
+            BAND_NS.load(Ordering::Relaxed) as f64
+                / 1e6
+                / BAND_NEW.load(Ordering::Relaxed).max(1) as f64
         );
     }
 }
