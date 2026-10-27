@@ -84,6 +84,18 @@ enum Cf {
         stem: Bsp,
         radius: i32,
     },
+    /// `minecraft:huge_red_mushroom` (`ecp` over `ebg`), config `{cap_provider,
+    /// stem_provider, foliage_radius}`. It shares `ebg`'s height draw, trunk and ground
+    /// test with the brown mushroom and differs in two measured places: the cap is four
+    /// layers `height-3 ..= height` (top layer one radius smaller, corners kept only on
+    /// that top layer, `up = dy >= height-1`, `west = dx < -(r-2)` and the rotations),
+    /// and the position check is the **centre column only**, because
+    /// `getTreeRadiusForHeight(-1, -1, r, dy)` is 0 for every `dy >= 0` for this species.
+    HugeRedMushroom {
+        cap: Bsp,
+        stem: Bsp,
+        radius: i32,
+    },
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -1741,15 +1753,54 @@ fn gen_end_gateway(ctx: &mut FC, pos: (i32, i32, i32)) {
     }
 }
 
-/// `HugeBrownMushroomFeature` (`ecm`) over `AbstractHugeMushroomFeature` (`ebg`).
-/// See [`Cf::HugeBrownMushroom`].
-fn gen_huge_brown_mushroom(
+/// Which huge mushroom a config names. `ecm` (brown) and `ecp` (red) both extend `ebg`
+/// and differ only in the radius `getTreeRadiusForHeight` reports and in `makeCap`.
+#[derive(Clone, Copy)]
+enum HugeMushroom {
+    /// `ecm`: one `2r+1` square at `y + height`; the position check covers the full
+    /// radius above `dy == 3`.
+    Brown,
+    /// `ecp`: four layers `height-3 ..= height`; the position check covers the centre
+    /// column only (see [`huge_mushroom_layer_radius`]).
+    Red,
+}
+
+/// `ebg.getTreeRadiusForHeight(b, radius, y)` — the radius the position check uses on
+/// layer `y`. The brown cap ignores `b` and switches to the full radius above `y == 3`.
+/// The red cap compares the layer against `b`, and every caller passes `b == -1`
+/// (`a(-1, -1, foliageRadius, dy)`), so it reports `0` for every `dy >= 0`: the red
+/// position check inspects the centre column and nothing else. Reusing the brown
+/// envelope for red rejects mushrooms that vanilla grows.
+fn huge_mushroom_layer_radius(kind: HugeMushroom, b: i32, radius: i32, y: i32) -> i32 {
+    match kind {
+        HugeMushroom::Brown => {
+            if y > 3 {
+                radius
+            } else {
+                0
+            }
+        }
+        HugeMushroom::Red => {
+            if (y < b && y >= b - 3) || y == b {
+                radius
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// `AbstractHugeMushroomFeature` (`ebg`): the shared height draw, position check and
+/// trunk; the cap is the species' own. See [`Cf::HugeBrownMushroom`] and
+/// [`Cf::HugeRedMushroom`].
+fn gen_huge_mushroom(
     ctx: &mut FC,
     rng: &mut Xor,
     pos: (i32, i32, i32),
     cap: &Bsp,
     stem: &Bsp,
     radius: i32,
+    kind: HugeMushroom,
 ) {
     let Some(reg) = breg() else { return };
     // `ebg.getTreeHeight`: `nextInt(3) + 4`, doubled on a following `nextInt(12) == 0`.
@@ -1764,14 +1815,13 @@ fn gen_huge_brown_mushroom(
     }
     let below = ctx.get(x, y - 1, z);
     // `Feature.isDirt` (`ece.b`) is the DIRT **tag**, not the `dirt` block: mycelium,
-    // podzol and mud pass, which the fixture's mycelium scene measures.
+    // podzol and mud pass, which the fixtures' mycelium scenes measure.
     if !reg.in_tag(below, "minecraft:dirt") && !reg.in_tag(below, "minecraft:mushroom_grow_block") {
         return;
     }
-    // `getTreeRadiusForHeight` (brown): the centre column until `dy > 3`, then the
-    // full radius square (corners included — the cap removes them later).
+    // The envelope is per species: `b` is the second argument the caller hard-codes.
     for dy in 0..=height {
-        let k = if dy > 3 { radius } else { 0 };
+        let k = huge_mushroom_layer_radius(kind, -1, radius, dy);
         for dx in -k..=k {
             for dz in -k..=k {
                 if !is_air_or_leaves(reg, ctx.get(x + dx, y + dy, z + dz)) {
@@ -1787,7 +1837,24 @@ fn gen_huge_brown_mushroom(
             ctx.set(x, y + dy, z, st);
         }
     }
-    // `makeCap`: a `2r+1` square minus the four corners at `y = origin.y + height`.
+    match kind {
+        HugeMushroom::Brown => brown_mushroom_cap(ctx, rng, pos, cap, radius, height),
+        HugeMushroom::Red => red_mushroom_cap(ctx, rng, pos, cap, radius, height),
+    }
+}
+
+/// `HugeBrownMushroomFeature.makeCap` (`ecm`): a `2r+1` square minus the four corners
+/// at `y = origin.y + height`.
+fn brown_mushroom_cap(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    cap: &Bsp,
+    radius: i32,
+    height: i32,
+) {
+    let Some(reg) = breg() else { return };
+    let (x, y, z) = pos;
     let r = radius;
     for dx in -r..=r {
         for dz in -r..=r {
@@ -1820,6 +1887,62 @@ fn gen_huge_brown_mushroom(
                 st = reg.with_prop(st, "south", rim(south || (dx_edge && dz == r - 1)));
             }
             ctx.set(cx, cy, cz, st);
+        }
+    }
+}
+
+/// `HugeRedMushroomFeature.makeCap` (`ecp`): four layers `height-3 ..= height`.
+///
+/// Measured from the bytecode and the fixture: the top layer's radius is `radius - 1`;
+/// a layer below the top keeps only the cells on exactly one edge (`dx_edge == dz_edge`
+/// is the skip condition, so corners and interior both go); and the five properties are
+/// set from the layer and the cell — `up = dy >= height - 1`, `west = dx < -(radius-2)`,
+/// `east = dx > radius-2`, and the same for `north`/`south` over `dz`. The threshold is
+/// `foliageRadius - 2`, not the layer radius, so it does not move with the top layer.
+fn red_mushroom_cap(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    cap: &Bsp,
+    radius: i32,
+    height: i32,
+) {
+    let Some(reg) = breg() else { return };
+    let (x, y, z) = pos;
+    let rim = radius - 2;
+    for dy in (height - 3)..=height {
+        let r = if dy < height { radius } else { radius - 1 };
+        for dx in -r..=r {
+            for dz in -r..=r {
+                let dx_edge = dx == -r || dx == r;
+                let dz_edge = dz == -r || dz == r;
+                // The guard is `dx_edge == dz_edge`, not "both are edges": on a layer
+                // below the top it keeps only the cells on exactly one edge (the rim,
+                // 12 cells for r = 2) and drops the corners *and* the interior, which
+                // the stem column passes through. The top layer keeps everything.
+                if dy < height && dx_edge == dz_edge {
+                    continue;
+                }
+                let (cx, cy, cz) = (x + dx, y + dy, z + dz);
+                if reg.is_solid_render(ctx.get(cx, cy, cz)) {
+                    continue;
+                }
+                let mut st = cap.get(ctx, rng, x, y, z);
+                if reg.get_prop(st, "west").is_some()
+                    && reg.get_prop(st, "east").is_some()
+                    && reg.get_prop(st, "north").is_some()
+                    && reg.get_prop(st, "south").is_some()
+                    && reg.get_prop(st, "up").is_some()
+                {
+                    let side = |on: bool| if on { "true" } else { "false" };
+                    st = reg.with_prop(st, "up", side(dy >= height - 1));
+                    st = reg.with_prop(st, "west", side(dx < -rim));
+                    st = reg.with_prop(st, "east", side(dx > rim));
+                    st = reg.with_prop(st, "north", side(dz < -rim));
+                    st = reg.with_prop(st, "south", side(dz > rim));
+                }
+                ctx.set(cx, cy, cz, st);
+            }
         }
     }
 }
@@ -2817,6 +2940,11 @@ fn p_cf(j: &J) -> Option<Cf> {
         "end_platform" => Cf::EndPlatform,
         "end_gateway" => Cf::EndGateway,
         "huge_brown_mushroom" => Cf::HugeBrownMushroom {
+            cap: p_bsp(js(j, "cap_provider")?)?,
+            stem: p_bsp(js(j, "stem_provider")?)?,
+            radius: jint(j, "foliage_radius", 0),
+        },
+        "huge_red_mushroom" => Cf::HugeRedMushroom {
             cap: p_bsp(js(j, "cap_provider")?)?,
             stem: p_bsp(js(j, "stem_provider")?)?,
             radius: jint(j, "foliage_radius", 0),
@@ -3981,7 +4109,10 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::EndPlatform => gen_end_platform(ctx, pos),
         Cf::EndGateway => gen_end_gateway(ctx, pos),
         Cf::HugeBrownMushroom { cap, stem, radius } => {
-            gen_huge_brown_mushroom(ctx, rng, pos, cap, stem, *radius)
+            gen_huge_mushroom(ctx, rng, pos, cap, stem, *radius, HugeMushroom::Brown)
+        }
+        Cf::HugeRedMushroom { cap, stem, radius } => {
+            gen_huge_mushroom(ctx, rng, pos, cap, stem, *radius, HugeMushroom::Red)
         }
         Cf::TwistingVines {
             width,

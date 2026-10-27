@@ -292,6 +292,83 @@ fn huge_brown_mushroom_matches_native_cells_and_height() {
 }
 
 #[test]
+fn huge_red_mushroom_matches_native_cells_and_layers() {
+    let reg = breg().unwrap();
+    let dirt = reg.state_of("minecraft:dirt", None);
+    let mycelium = reg.state_of("minecraft:mycelium", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let leaves = reg.state_of("minecraft:oak_leaves", None);
+    // the pinned pack's own red config: foliage_radius 2, and a stem whose `up` is false
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:huge_red_mushroom","config":{"cap_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:red_mushroom_block","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"true","west":"true"}}},"foliage_radius":2,"stem_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:mushroom_stem","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"false","west":"true"}}}}}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for row in include_str!("../tests/data/huge_red_mushroom_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let oy = p[1].parse::<i32>().unwrap();
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        // Scene 4 is the species difference: an obstruction in the cap band that misses
+        // the centre column. The red position check only inspects that column, so the
+        // mushroom grows and the cap skips the solid cell; the brown envelope would
+        // refuse the placement outright (0 cells).
+        for x in -3i32..=3 {
+            for z in -3i32..=3 {
+                for dy in -1i32..=15 {
+                    let state = match scene {
+                        0 => (dy == -1).then_some(dirt),
+                        1 => (dy == -1).then_some(mycelium),
+                        2 => (dy == -1).then_some(stone),
+                        3 => {
+                            if dy == -1 {
+                                Some(dirt)
+                            } else if (4..=8).contains(&dy) && x.abs() <= 2 && z.abs() <= 2 {
+                                Some(leaves)
+                            } else {
+                                None
+                            }
+                        }
+                        4 => {
+                            if dy == -1 {
+                                Some(dirt)
+                            } else if dy == 5 && x.abs() <= 1 && z.abs() <= 1 && (x != 0 || z != 0)
+                            {
+                                Some(stone)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => {
+                            if dy == -1 {
+                                Some(dirt)
+                            } else if dy >= 9 {
+                                Some(stone)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    g.feat_write(x, oy + dy, z, state.unwrap_or(0));
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(p[2].parse::<i64>().unwrap() as u64);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[3].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[4].parse::<usize>().unwrap(), "{row}");
+        assert_eq!(
+            block_state_cells_digest(reg, &ctx.wr, (0, oy, 0)),
+            p[5],
+            "{row}"
+        );
+    }
+}
+
+#[test]
 fn twisting_vines_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
     let netherrack = reg.state_of("minecraft:netherrack", None);

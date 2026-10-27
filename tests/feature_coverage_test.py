@@ -22,7 +22,7 @@ class FeatureCoverageTests(unittest.TestCase):
                     'config': {'features': [
                         {'feature': {'type': 'minecraft:coral_tree', 'config': {}}, 'placement': []},
                         {'feature': 'minecraft:mushroom', 'placement': []}]}},
-                'configured_feature/mushroom.json': {'type': 'minecraft:huge_red_mushroom', 'config': {}},
+                'configured_feature/mushroom.json': {'type': 'minecraft:huge_fungus', 'config': {}},
                 'placed_feature/top.json': {'feature': 'minecraft:root', 'placement': []},
                 'biome/test.json': {'features': [['minecraft:top']]},
             }
@@ -36,10 +36,10 @@ class FeatureCoverageTests(unittest.TestCase):
             text = output.getvalue()
             self.assertIn('2 files + 1 inline, 3 types', text)
             self.assertRegex(text, r'coral_tree\s+1\s+1\s+1')
-            # An unimplemented type has to be named by the report: `huge_brown_mushroom`
-            # used to serve here and now has an arm, so `huge_red_mushroom` (its sibling,
-            # still unimplemented) keeps the gap path exercised.
-            self.assertRegex(text, r'huge_red_mushroom\s+1\s+1\s+1')
+            # An unimplemented type has to be named by the report. Both huge mushrooms
+            # used to serve here and now have arms, so `huge_fungus` keeps the gap path
+            # exercised; pick the next type from `feature_type_coverage.py` when it lands.
+            self.assertRegex(text, r'huge_fungus\s+1\s+1\s+1')
 
     def test_missing_empty_and_invalid_input_cannot_report_zero_gaps(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(coverage, 'DATA', Path(tmp)):

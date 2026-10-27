@@ -1098,6 +1098,31 @@ check "huge brown mushroom accepts the whole dirt tag as ground" \
   '    if !reg.in_tag(below, "minecraft:mushroom_grow_block") {' \
   feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
 
+check "huge red mushroom checks the centre column only" \
+  src/feature.rs '            if (y < b && y >= b - 3) || y == b {' \
+  '            if y > 3 {' \
+  feature::generation_contract_tests::huge_red_mushroom_matches_native_cells_and_layers
+
+check "huge red mushroom writes only the rim below its top layer" \
+  src/feature.rs '                if dy < height && dx_edge == dz_edge {' \
+  '                if dy < height && dx_edge && dz_edge {' \
+  feature::generation_contract_tests::huge_red_mushroom_matches_native_cells_and_layers
+
+check "huge red mushroom shrinks its top layer by one radius" \
+  src/feature.rs '        let r = if dy < height { radius } else { radius - 1 };' \
+  '        let r = radius;' \
+  feature::generation_contract_tests::huge_red_mushroom_matches_native_cells_and_layers
+
+check "huge red mushroom sets up on the two top layers" \
+  src/feature.rs '                    st = reg.with_prop(st, "up", side(dy >= height - 1));' \
+  '                    st = reg.with_prop(st, "up", side(dy >= height));' \
+  feature::generation_contract_tests::huge_red_mushroom_matches_native_cells_and_layers
+
+check "huge red mushroom uses the foliageRadius-2 rim threshold" \
+  src/feature.rs '    let rim = radius - 2;' \
+  '    let rim = radius - 1;' \
+  feature::generation_contract_tests::huge_red_mushroom_matches_native_cells_and_layers
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \
