@@ -132,6 +132,21 @@ enum Cf {
     /// configs. `planted` configurations clear a non-air block *below* the cell before
     /// writing.
     HugeFungus(HugeFungusCfg),
+    /// `minecraft:basalt_columns` (`ebi`), config `{height, reach}` (both IntProviders).
+    ///
+    /// Measured from `ebi`: the origin must be air, or lava at/below sea level, with a
+    /// non-air block below that is not in the fixed cannot-place-on list; `height` is sampled
+    /// once, `nextFloat() < 0.9` picks the clustered variant (radius cap 5 / 50 attempts vs
+    /// 8 / 15), and each of the `attempts` draws is three `nextInt` (x, y, z) inside a
+    /// `radius +-1` box, with `reach` sampled once per surviving candidate. A candidate only
+    /// contributes when `height - manhattan(origin, pos) >= 0`; its column then writes basalt
+    /// upward from a surface found by walking down (over an ocean) or up (over land) at most
+    /// `dist` cells, `remaining - dist / 2 + 1` blocks, continuing through basalt and stopping
+    /// at anything else.
+    BasaltColumns {
+        height: IP,
+        reach: IP,
+    },
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -2486,6 +2501,158 @@ fn weeping_vines_column(
     }
 }
 
+/// `BasaltColumnsFeature` (`ebi`). See [`Cf::BasaltColumns`].
+fn gen_basalt_columns(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    height_ip: &IP,
+    reach_ip: &IP,
+) {
+    let Some(reg) = breg() else { return };
+    let sea = crate::worldgen::sea_level();
+    // the guard is the *mutable* overload: air (or ocean lava) here and a buildable block below
+    if !bc_can_start(ctx, reg, sea, pos) {
+        return;
+    }
+    let height = height_ip.get(rng);
+    // `nextFloat() < 0.9` picks the clustered variant: a smaller radius and more attempts
+    let clustered = rng.next_f32() < 0.9;
+    let radius = height.min(if clustered { 5 } else { 8 });
+    let attempts = if clustered { 50 } else { 15 };
+    for _ in 0..attempts {
+        // `BlockPos.randomBetweenClosed`: three nextInt per candidate, x then y then z - and
+        // the y draw happens even though the range is one cell (`nextInt(1)`), so dropping it
+        // shifts every later draw (it did: the candidate set came out interleaved).
+        let x = pos.0 - radius + rng.next_bound(2 * radius + 1);
+        let y = pos.1 + rng.next_bound(1);
+        let z = pos.2 - radius + rng.next_bound(2 * radius + 1);
+        let remaining = height - (x - pos.0).abs() - (y - pos.1).abs() - (z - pos.2).abs();
+        if remaining >= 0 {
+            bc_place_column(ctx, reg, sea, (x, y, z), remaining, reach_ip.get(rng));
+        }
+    }
+}
+
+/// The fixed `CANNOT_PLACE_ON` list (`ebi.a`): the blocks a column may not start on.
+const BC_CANNOT_PLACE_ON: [&str; 10] = [
+    "minecraft:lava",
+    "minecraft:bedrock",
+    "minecraft:magma_block",
+    "minecraft:soul_sand",
+    "minecraft:nether_bricks",
+    "minecraft:nether_brick_fence",
+    "minecraft:nether_brick_stairs",
+    "minecraft:nether_wart",
+    "minecraft:chest",
+    "minecraft:spawner",
+];
+
+/// `ebi.a(dcx,int,jd)`: air, or lava at or below sea level (the ocean case).
+fn bc_air_or_lava_ocean(ctx: &mut FC, reg: &BReg, sea: i32, p: (i32, i32, i32)) -> bool {
+    let st = ctx.get(p.0, p.1, p.2);
+    reg.is_air(st) || (reg.name_of(st) == "minecraft:lava" && p.1 <= sea)
+}
+
+/// `ebi.a(dcx,int,jd$a)`: the above, plus a non-air cell below that may be built on.
+fn bc_can_start(ctx: &mut FC, reg: &BReg, sea: i32, p: (i32, i32, i32)) -> bool {
+    if !bc_air_or_lava_ocean(ctx, reg, sea, p) {
+        return false;
+    }
+    let below = reg.name_of(ctx.get(p.0, p.1 - 1, p.2));
+    below != "minecraft:air" && !BC_CANNOT_PLACE_ON.contains(&below)
+}
+
+/// `BasaltColumnsFeature.placeColumn`: the square of `reach` around a candidate, a surface per
+/// column, and basalt upward from it.
+fn bc_place_column(
+    ctx: &mut FC,
+    reg: &BReg,
+    sea: i32,
+    pos: (i32, i32, i32),
+    remaining: i32,
+    reach: i32,
+) {
+    let basalt = reg.state_of("minecraft:basalt", None);
+    for dx in -reach..=reach {
+        for dz in -reach..=reach {
+            let p = (pos.0 + dx, pos.1, pos.2 + dz);
+            let dist = dx.abs() + dz.abs();
+            // The native's condition here is the *air* test (`a(dcx,int,jd)`), not the
+            // can-start test: an air/ocean cell walks **down** to its surface, anything else
+            // walks **up** to the first air cell.
+            let surface = if bc_air_or_lava_ocean(ctx, reg, sea, p) {
+                bc_find_surface(ctx, reg, sea, p, dist)
+            } else {
+                bc_find_air(ctx, reg, p, dist)
+            };
+            let Some(mut m) = surface else { continue };
+            let mut left = remaining - dist / 2;
+            while left >= 0 {
+                if bc_air_or_lava_ocean(ctx, reg, sea, m) {
+                    if !ctx.out_of_h(m.1) {
+                        ctx.set(m.0, m.1, m.2, basalt);
+                    }
+                    m.1 += 1;
+                } else if reg.name_of(ctx.get(m.0, m.1, m.2)) == "minecraft:basalt" {
+                    m.1 += 1;
+                } else {
+                    break;
+                }
+                left -= 1;
+            }
+        }
+    }
+}
+
+/// `ebi.a(dcx,int,jd$a,int)`: walk **down** at most `dist` cells for the first cell that can
+/// start a column - the *can-start* test, i.e. air/ocean-lava **and** a buildable block below,
+/// not merely an air cell. That is why a column never grows out over open air: it walks to the
+/// bottom of the world and gives up.
+fn bc_find_surface(
+    ctx: &mut FC,
+    reg: &BReg,
+    sea: i32,
+    pos: (i32, i32, i32),
+    dist: i32,
+) -> Option<(i32, i32, i32)> {
+    let mut m = pos;
+    let mut left = dist;
+    while m.1 > ctx.g.min_y + 1 && left > 0 {
+        left -= 1;
+        if bc_can_start(ctx, reg, sea, m) {
+            return Some(m);
+        }
+        m.1 -= 1;
+    }
+    None
+}
+
+/// `ebi.a(dcx,jd$a,int)`: walk **up** at most `dist` cells for the first air cell that is not
+/// under a cannot-place-on block.
+fn bc_find_air(
+    ctx: &mut FC,
+    reg: &BReg,
+    pos: (i32, i32, i32),
+    dist: i32,
+) -> Option<(i32, i32, i32)> {
+    let mut m = pos;
+    let mut left = dist;
+    let top = ctx.g.min_y + ctx.g.height;
+    while m.1 < top && left > 0 {
+        left -= 1;
+        let st = ctx.get(m.0, m.1, m.2);
+        if BC_CANNOT_PLACE_ON.contains(&reg.name_of(st)) {
+            return None;
+        }
+        if reg.is_air(st) {
+            return Some(m);
+        }
+        m.1 += 1;
+    }
+    None
+}
+
 /// `PointedDripstoneFeature` (`eda`). See [`Cf::PointedDripstone`].
 fn gen_pointed_dripstone(
     ctx: &mut FC,
@@ -3571,6 +3738,10 @@ fn p_cf(j: &J) -> Option<Cf> {
             cap: p_bsp(js(j, "cap_provider")?)?,
             stem: p_bsp(js(j, "stem_provider")?)?,
             radius: jint(j, "foliage_radius", 0),
+        },
+        "basalt_columns" => Cf::BasaltColumns {
+            height: p_ip(js(j, "height")?)?,
+            reach: p_ip(js(j, "reach")?)?,
         },
         "huge_fungus" => Cf::HugeFungus(HugeFungusCfg {
             base: bs_state(js(j, "valid_base_block")?)?,
@@ -4757,6 +4928,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::PointedDripstone(c) => gen_pointed_dripstone(ctx, rng, pos, c),
         Cf::Coral(shape) => gen_coral(ctx, rng, pos, *shape),
         Cf::HugeFungus(c) => gen_huge_fungus(ctx, rng, pos, c),
+        Cf::BasaltColumns { height, reach } => gen_basalt_columns(ctx, rng, pos, height, reach),
         Cf::TwistingVines {
             width,
             height,

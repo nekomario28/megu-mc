@@ -1209,6 +1209,35 @@ check "a feature write invalidates the column's worldgen heightmaps" \
   '            let _ = kind;' \
   feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
 
+check "basalt columns draws the candidate's y as well" \
+  src/feature.rs '        let y = pos.1 + rng.next_bound(1);' \
+  '        let y = pos.1;' \
+  feature::generation_contract_tests::basalt_columns_matches_native_cells_and_rng
+
+check "basalt columns walks down to a cell that can start a column" \
+  src/feature.rs '        if bc_can_start(ctx, reg, sea, m) {' \
+  '        if bc_air_or_lava_ocean(ctx, reg, sea, m) {' \
+  feature::generation_contract_tests::basalt_columns_matches_native_cells_and_rng
+
+check "basalt columns' origin must have a buildable block below" \
+  src/feature.rs '    if !bc_can_start(ctx, reg, sea, pos) {' \
+  '    if !bc_air_or_lava_ocean(ctx, reg, sea, pos) {' \
+  feature::generation_contract_tests::basalt_columns_matches_native_cells_and_rng
+
+check "basalt columns keeps bedrock out of its start cells" \
+  src/feature.rs 'const BC_CANNOT_PLACE_ON: [&str; 10] = [
+    "minecraft:lava",
+    "minecraft:bedrock",' \
+  'const BC_CANNOT_PLACE_ON: [&str; 10] = [
+    "minecraft:lava",
+    "minecraft:magma_block",' \
+  feature::generation_contract_tests::basalt_columns_matches_native_cells_and_rng
+
+check "basalt columns' clustered roll picks 50 attempts" \
+  src/feature.rs '    let attempts = if clustered { 50 } else { 15 };' \
+  '    let attempts = if clustered { 15 } else { 50 };' \
+  feature::generation_contract_tests::basalt_columns_matches_native_cells_and_rng
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

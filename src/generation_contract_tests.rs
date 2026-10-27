@@ -560,6 +560,14 @@ fn huge_fungus_crimson_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn basalt_columns_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/basalt_columns.json"),
+        include_str!("../tests/data/basalt_columns_1211.tsv"),
+    );
+}
+
+#[test]
 fn twisting_vines_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
     let netherrack = reg.state_of("minecraft:netherrack", None);
