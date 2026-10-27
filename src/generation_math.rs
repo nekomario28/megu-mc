@@ -416,6 +416,7 @@ impl Xor {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Split {
     pub(crate) lo: u64,
     pub(crate) hi: u64,
@@ -739,6 +740,7 @@ const INPUT_FACTOR: f64 = 1.018_126_888_217_522_7;
 /// expected deviation of the first-to-last nonzero amplitude span.
 const NATIVE_VALUE_FACTOR_NUMERATOR: f64 = 0.166_666_666_666_666_66;
 
+#[derive(Clone)]
 pub(crate) struct Octave {
     n: Perlin,
     f: f64,
@@ -765,12 +767,14 @@ fn nhash(k: NKey) -> usize {
 /// Native 1.21.1 `NormalNoise` summation shape. The first `split` layers are
 /// one `PerlinNoise`, the rest the other; `value_factor` is applied once after
 /// the two stacks are added.
+#[derive(Clone)]
 struct NativeNormal {
     split: usize,
     value_factor: f64,
     octave_weights: Vec<f64>,
 }
 static NEXT_NORMAL_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+#[derive(Clone)]
 pub(crate) struct Normal {
     // Addresses can be reused after drop (or change on move). Cache identity
     // belongs to the sampler's lifetime, not its current allocation address.
@@ -1171,6 +1175,7 @@ impl Simp {
 
 /// DensityFunctions.EndIslandDensityFunction's seeded simplex field. Float
 /// geometry, Java int overflow and truncating divisions are observable here.
+#[derive(Clone)]
 pub(crate) struct EndIslands {
     noise: Simp,
 }
@@ -1331,6 +1336,7 @@ impl OSimp {
 
 /// BlendedNoise constructs descending octaves from one sequential random source.
 /// RandomState chooses that source; both engines share the sampling arithmetic.
+#[derive(Clone)]
 pub(crate) struct BlendedNoise {
     min: Vec<Perlin>,
     max: Vec<Perlin>,

@@ -46,10 +46,12 @@ pub(crate) fn parse_world_seed(value: &str) -> Result<u64, std::num::ParseIntErr
         .or_else(|_| value.parse())
 }
 
+#[derive(Clone)]
 enum SV {
     V(f32),
     S(Box<Spl>),
 }
+#[derive(Clone)]
 struct Spl {
     coord: usize,
     pts: Vec<(f32, SV, f32)>,
@@ -103,6 +105,7 @@ impl RarityValueMapper {
     }
 }
 
+#[derive(Clone)]
 enum DF {
     C(f64),
     EndIslands(Box<EndIslands>),
@@ -294,6 +297,7 @@ impl BiomeWeather {
     }
 }
 
+#[derive(Clone)]
 enum Rule {
     Seq(Box<[usize]>),
     Cond(usize, usize),
@@ -418,7 +422,15 @@ struct VeinCfg {
     iron_fill: u32,
 }
 
-pub struct Gen {
+/// The immutable half of the generator: everything read from the datapack and the
+/// noise settings at `init`, plus the resolved block states and the seed.
+///
+/// `Clone` exists only so `Arc::make_mut` keeps the construction-time writes
+/// working; nothing mutates it after `load_preset` returns. A worker gets an
+/// `Arc<GenData>`/`&GenData`, which is the point of the split in
+/// `specs/chunk-parallelism`: the read-only inputs need no world lock.
+#[derive(Clone)]
+pub struct GenData {
     pub(crate) preset: NoisePreset,
     dfs: Vec<DF>,
     names: HashMap<String, usize>,
@@ -433,8 +445,6 @@ pub struct Gen {
     depth_split: Option<(f64, f64, f64, f64, usize)>,
     // 1.21.1 ore veins: `ore_veins_enabled` plus the router's vein functions
     vein: Option<VeinCfg>,
-    // scratch memo for the vein sampler's density evaluations
-    memo: HashMap<(usize, i32, i32, i32), f64>,
     btree: Option<BT>,
     leaf_ps: Vec<[[i32; 2]; 7]>,
     biome_names: Vec<String>,
@@ -465,6 +475,14 @@ pub struct Gen {
     bedrock_st: u32,
     // aquifer (vanilla NoiseBasedAquifer): DF ids + fluid states + caches
     aq: Option<Aqd>,
+    world_seed: u64,
+}
+pub struct Gen {
+    /// The immutable inputs. `Deref` keeps every existing field name working;
+    /// `DerefMut` exists only for construction (see below).
+    pub(crate) data: std::sync::Arc<GenData>,
+    // scratch memo for the vein sampler's density evaluations
+    memo: HashMap<(usize, i32, i32, i32), f64>,
     aq_lv: HashMap<(i32, i32, i32), (i32, u8)>,
     aq_lvo: Vec<(i32, i32, i32)>,
     aq_near: HashMap<(i32, i32, i32), (i32, i32, i32)>,
@@ -502,8 +520,26 @@ pub struct Gen {
     generated_leaf_tick_set: HashSet<((i32, i32, i32), u32)>,
     generated_fluid_ticks: Vec<((i32, i32, i32), u32)>,
     generated_fluid_tick_set: HashSet<((i32, i32, i32), u32)>,
-    world_seed: u64,
 }
+
+impl std::ops::Deref for Gen {
+    type Target = GenData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for Gen {
+    /// Construction-time only: `load_preset` fills the immutable fields after the
+    /// literal. `Arc::make_mut` clones when a snapshot is shared, so a write after
+    /// the generator is published would be a silent copy rather than an error —
+    /// keep mutation out of this path.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::sync::Arc::make_mut(&mut self.data)
+    }
+}
+
+#[derive(Clone)]
 struct Aqd {
     barrier: usize,
     flood: usize,
@@ -639,42 +675,46 @@ impl Gen {
     ) -> Option<Gen> {
         let files = Self::df_files();
         let mut g = Gen {
-            preset,
-            dfs: vec![],
-            names: HashMap::new(),
-            noises: vec![],
-            noise_names: HashMap::new(),
-            factory: Xor::seed(seed).splitter(),
-            base: String::new(),
-            final_density: 0,
-            climate: None,
-            depth_split: None,
-            btree: None,
-            leaf_ps: Vec::new(),
-            biome_names: Vec::new(),
-            biome_weather: Vec::new(),
-            sea: 63,
-            min_y: -64,
-            height: 384,
-            noise_cell_h: 8,
-            noise_cell_w: 4,
-            legacy_random_source: false,
-            rules: vec![],
-            conds: vec![],
-            rule_ids: HashMap::new(),
-            cond_ids: HashMap::new(),
-            bleaf: HashMap::new(),
-            surface_rule: None,
-            prelim_df: None,
-            surf_ni: None,
-            sec_ni: None,
-            band_off_ni: None,
-            bands: None,
-            ore_split: None,
-            def_st: 1,
-            def_fl: 0,
-            bedrock_st: res("minecraft:bedrock").unwrap_or(1),
-            aq: None,
+            data: std::sync::Arc::new(GenData {
+                preset,
+                dfs: vec![],
+                names: HashMap::new(),
+                noises: vec![],
+                noise_names: HashMap::new(),
+                factory: Xor::seed(seed).splitter(),
+                base: String::new(),
+                final_density: 0,
+                climate: None,
+                depth_split: None,
+                btree: None,
+                leaf_ps: Vec::new(),
+                biome_names: Vec::new(),
+                biome_weather: Vec::new(),
+                sea: 63,
+                min_y: -64,
+                height: 384,
+                noise_cell_h: 8,
+                noise_cell_w: 4,
+                legacy_random_source: false,
+                rules: vec![],
+                conds: vec![],
+                rule_ids: HashMap::new(),
+                cond_ids: HashMap::new(),
+                bleaf: HashMap::new(),
+                surface_rule: None,
+                prelim_df: None,
+                surf_ni: None,
+                sec_ni: None,
+                band_off_ni: None,
+                bands: None,
+                ore_split: None,
+                def_st: 1,
+                def_fl: 0,
+                bedrock_st: res("minecraft:bedrock").unwrap_or(1),
+                aq: None,
+                vein: None,
+                world_seed: seed,
+            }),
             aq_lv: HashMap::new(),
             aq_lvo: Vec::new(),
             aq_near: HashMap::new(),
@@ -705,14 +745,12 @@ impl Gen {
                     None
                 }
             }),
-            vein: None,
             memo: HashMap::new(),
             feat_hm: HashMap::new(),
             generated_leaf_ticks: Vec::new(),
             generated_leaf_tick_set: HashSet::new(),
             generated_fluid_ticks: Vec::new(),
             generated_fluid_tick_set: HashSet::new(),
-            world_seed: seed,
         };
         // noise settings (sea level, bounds, router names)
         let mut ns_json: Option<J> = None;
@@ -863,7 +901,8 @@ impl Gen {
             if let Ok(b) = std::fs::read(&tp) {
                 if let Some(j) = jparse(&b) {
                     if let Some(ow) = j.get(preset.name()) {
-                        g.btree = bt_parse(ow, &mut g.biome_names, &mut g.bleaf, &mut g.leaf_ps);
+                        let d = std::sync::Arc::make_mut(&mut g.data);
+                        d.btree = bt_parse(ow, &mut d.biome_names, &mut d.bleaf, &mut d.leaf_ps);
                     }
                 }
             }
@@ -878,9 +917,9 @@ impl Gen {
         // SurfaceRules.Temperature reads biome weather, not the noise-router
         // temperature coordinate. Bind the settings to the same leaf identities.
         let biome_files = Self::dp_files("biome");
-        for name in &g.biome_names {
+        for name in g.biome_names.clone() {
             let Some(weather) = biome_files
-                .get(name)
+                .get(&name)
                 .and_then(|b| jparse(b))
                 .and_then(|j| BiomeWeather::parse(&j))
             else {
@@ -1348,9 +1387,9 @@ impl Gen {
                 crate::generation_math::normal_new_amps(&mut rng, first, &amps)
             };
             self.noises.push(n);
-            self.noise_names
-                .insert(name.to_string(), self.noises.len() - 1);
-            return Some(self.noises.len() - 1);
+            let id = self.noises.len() - 1;
+            self.noise_names.insert(name.to_string(), id);
+            return Some(id);
         }
         let base_octave = j.get("base_octave")?.num() as i32;
         let base_amplitude = j.get("base_amplitude")?.num();
@@ -1362,9 +1401,9 @@ impl Gen {
         let mut rng = self.factory.of_str(name);
         let n = normal_new(&mut rng, base_octave, base_amplitude, &mods);
         self.noises.push(n);
-        self.noise_names
-            .insert(name.to_string(), self.noises.len() - 1);
-        Some(self.noises.len() - 1)
+        let id = self.noises.len() - 1;
+        self.noise_names.insert(name.to_string(), id);
+        Some(id)
     }
 
     fn parse_spline(&mut self, j: &J, files: &HashMap<String, Vec<u8>>) -> Option<Spl> {
@@ -2397,6 +2436,17 @@ pub(crate) struct GenFacts {
 
 static GEN_FACTS: Mutex<Option<GenFacts>> = Mutex::new(None);
 
+/// The immutable half as a shareable snapshot, published at `init`. A worker takes a
+/// clone of the `Arc` once and then reads the world's inputs without touching `GEN`:
+/// this lock is held for a clone, not for a generation step.
+static GEN_DATA: Mutex<Option<std::sync::Arc<GenData>>> = Mutex::new(None);
+
+/// `Arc<GenData>` without waiting for a generation step to finish. A job can keep the
+/// snapshot for its lifetime; the caches it must not share live on `Gen`, not here.
+pub fn data_snapshot() -> Option<std::sync::Arc<GenData>> {
+    GEN_DATA.lock().unwrap().clone()
+}
+
 /// The immutable dimension facts, without the `GEN` lock. `None` before `init`.
 pub(crate) fn facts() -> Option<GenFacts> {
     *GEN_FACTS.lock().unwrap()
@@ -2462,6 +2512,7 @@ pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: Noise
                 def_fl: g.def_fl,
                 bedrock_st: g.bedrock_st,
             });
+            *GEN_DATA.lock().unwrap() = Some(g.data.clone());
             *gen_lock() = Some(g);
             true
         }
@@ -4047,7 +4098,7 @@ fn biome_id(name: &str) -> i64 {
         .unwrap_or(39) // plains
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BT {
     Leaf([[i32; 2]; 7], u16),
     Sub([[i32; 2]; 7], Vec<BT>),
@@ -6821,6 +6872,44 @@ mod wg_tests {
         // leave the shared fixture in the Overworld for the other tests
         assert!(init(0, crate::name_to_state));
         assert_eq!(facts().expect("facts").preset, NoisePreset::Overworld);
+    }
+
+    /// The split's purpose: a worker's inputs are readable while the world lock is
+    /// held by a long generation step. The snapshot lock is taken for an `Arc` clone,
+    /// so the read must not wait for the 300 ms hold below.
+    #[test]
+    fn immutable_inputs_do_not_queue_on_the_world_lock() {
+        let _guard = lock_gen();
+        assert!(init(0, crate::name_to_state));
+        let snap = data_snapshot().expect("data published at init");
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|s| {
+            let held2 = held.clone();
+            let released2 = released.clone();
+            s.spawn(move || {
+                // take the world lock and keep it, as a 13 ms-or-longer generate does
+                let g = gen_lock();
+                held2.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !released2.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                drop(g);
+            });
+            while !held.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let t = std::time::Instant::now();
+            let again = data_snapshot().expect("snapshot");
+            let sea = again.sea;
+            let elapsed = t.elapsed();
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(sea, snap.sea);
+            assert!(
+                elapsed < std::time::Duration::from_millis(50),
+                "snapshot waited {elapsed:?} behind the world lock"
+            );
+        });
     }
 
     /// Lock-wait split under contention: three threads, each doing the work a
