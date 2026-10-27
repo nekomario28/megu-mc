@@ -13,12 +13,12 @@ Three cheap measurements separate them:
                              (a dozen or two tokens).
   shingle Jaccard (6-token)  overall shape overlap of the token stream.
   identical comment lines    the strongest single signal: prose is not implied by
-                             an algorithm, so a shared comment means a copy.
+                             an algorithm, so a shared comment is the strongest pointer for a manual look.
 
 Calibrate before judging: run the same three numbers on a pair known to be
 independent (this repo's carver against Pumpkin's carver, both written from the
 same 1.21.1 bytecode) and on a pair known to be identical (any file against
-itself). A candidate is "copied" only when it sits at the identical end.
+itself). A result is only a pointer for a manual look, not a verdict.
 
 The scan strips comments, strings and char literals before tokenizing, so it
 measures code shape only; the comment check is separate on purpose.

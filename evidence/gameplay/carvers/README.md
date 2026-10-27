@@ -365,7 +365,7 @@ preliminary_surface_level = find_top_surface(cell_height=8, density=add(...))
 量子化 8 は `find_top_surface.cell_height` と整合。系統的に下に出るのは
 `find_top_surface` の探索範囲/終了条件か、`interpolated` の扱いのどちらか。
 `minEst` は `f = clamp(minEst + 8 - y, 0, 64)` に入るので、14 の下振れは
-`aq_fluid_y` の 2 つの比較（`-0.3/0.8`, `-0.8/0.4`）を確実に跨ぐ。
+`aq_fluid_block_y` の 2 つの比較（`-0.3/0.8`, `-0.8/0.4`）を確実に跨ぐ。
 
 補足（同日、bytecode で確認）:
 

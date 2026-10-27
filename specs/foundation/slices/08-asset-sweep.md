@@ -36,7 +36,13 @@ Status: 調査完了。slice 03 の「表を1つに集約する」計画を**置
 | **`boundingBox`** | **モデルが無い**（衝突は `is_solid` の真偽のみ） | **未着手** |
 | `diggable` | `hardness < 0` で代替 | 実質OK |
 
-### `assets/pblocks.json`（**状態**単位、7.5MB）
+> **注記 (2026-10-25, 出所整理)**: `assets/pblocks.json` と `assets/properties.json` は削除した。両ファイルは別プロジェクトのファイルとバイト一致し、
+> しかも 1.21.1 ではないバージョンのデータだった(35,723 状態 vs 1.21.1 の 26,684)。luminance / opacity / 状態フラグ / 面の full 判定は、1.21.1 jar から
+> 生成した `assets/block_states_1211.json`(`tools/vanilla_data/`)に移行済み。**`collision_shapes` / `outline_shapes` など形状・摩擦系のフィールドは現在リポジトリに無い**:
+> 必要になったら `tools/vanilla_data/Extract.java` を拡張して jar から抽出する(下の記述は削除前の調査記録)。
+> *Note: pblocks.json / properties.json were removed (see THIRD_PARTY.md). Per-state light/flags/faces now come from `assets/block_states_1211.json`; shape and friction fields would need an extension of `tools/vanilla_data/Extract.java`.*
+
+### `assets/pblocks.json`（**状態**単位、7.5MB。削除済み — 上の注記参照）
 
 | フィールド | サーバー側 | 状態 |
 |---|---|---|

@@ -17,8 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Toolchain pinned (audit item 197); bump deliberately together with a green build.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.0
       # Fast and independent of the compiler: the plan states numbers about what is left to do, and
       # a number nothing checks drifts.
       - name: Debt is frozen at today's count, and must not grow
@@ -86,8 +91,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Toolchain pinned (audit item 197); bump deliberately together with a green build.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.0
       - name: Gate failures and missing checks must reject completion
         run: python3 tests/gate_scripts.py
       - name: Every pinned gate must fail when its implementation is broken

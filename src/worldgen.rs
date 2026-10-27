@@ -2336,6 +2336,12 @@ pub(crate) struct ChunkCols {
 
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
 
+/// The one instruction for a tree that has no game data committed next to it. Both the
+/// startup fallbacks and the tests that read the data print it, so a missing file names the
+/// command that writes it instead of the `Option` that came back empty.
+pub(crate) const VANILLA_DATA_MISSING: &str =
+    "Vanilla data missing. Regenerate it from your own 1.21.1 jar: tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-mappings --accept-eula";
+
 pub fn init(seed: u64, res: fn(&str) -> Option<u32>) -> bool {
     init_preset(seed, res, NoisePreset::Overworld)
 }

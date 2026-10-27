@@ -18,6 +18,6 @@
     "src/tree.rs keeps its main import block at the end of the file (legal, pre-existing shape)",
     "backoff_ticks shift overflow is physically unreachable"
   ],
-  "log": "/home/yuu/.cache/mc-spine-audit/Q-review.log",
+  "log": "<HOME>/.cache/mc-spine-audit/Q-review.log",
   "log_sha256": "a477116b9615913a937d1271c59753686038d7138cb7579628014a9796f317bf"
 }

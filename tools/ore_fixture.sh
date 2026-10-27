@@ -9,8 +9,8 @@
 # files. Then only that one feature can place, and the two cell sets compare
 # directly (the carver work's `CARVE_ONLY` in fixture form).
 #
-# The repository's `datapacks/vanilla` is restored on exit (`trap ... EXIT`), with a
-# `git checkout` fallback: an uncommitted edit under that tree is otherwise lost.
+# Needs the generated `datapacks/vanilla` (tools/vanilla_data/gen_vanilla_data.sh). The control
+# pack for this port is written to `datapacks/ctlfix` and removed on exit (`trap ... EXIT`).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="$1"; KEEP="$2"; N="${3:-2}"
@@ -38,9 +38,6 @@ zero_all_but_keep() {  # $1 = target dir
 restore_repo() {
   rm -rf "$CTL"
   rmdir -p "$CTL_REL" 2>/dev/null || true
-  if ! git -C "$ROOT" diff --quiet -- datapacks/vanilla 2>/dev/null; then
-    ( cd "$ROOT" && git checkout -- datapacks/ ) 2>/dev/null || true
-  fi
 }
 trap restore_repo EXIT
 
@@ -90,8 +87,7 @@ import json, os, sys
 placed = json.load(open(sys.argv[1]))
 name = placed["feature"].split(":")[-1]
 p = os.path.join(os.path.dirname(sys.argv[1]), "..", "configured_feature", name + ".json")
-d = json.load(open(p))
-c = d.get("config", d)
+d = json.load(open(p))c = d.get("config", d)
 print(c["targets"][0]["state"].get("Name", "minecraft:air").replace("minecraft:", ""))
 PY2
 )"

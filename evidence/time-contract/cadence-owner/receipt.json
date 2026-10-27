@@ -11,17 +11,16 @@
   "measurement": "mean tick within 2 percent of previous slice, all-process CPU 0.2862s -> 0.2827s; regression detection only, not a performance claim",
   "unconnected": "keepalive/timeouts, weather counters, suffocation air, projectile TTL, fishing, movement coefficients, MET4 persistence",
   "files_sha256": {
-    "README.md": "875800eb95f0d0506b79a95f099f21daf19ae427f54326d89b9a985beaaac6e3",
-    "build.log": "faeb413027f6f0bf57c4e86199aaa184644bd92d1a016599156204423768e0e1",
+    "README.md": "c9539e938884a79d4481a3603c6572c0e19fe6447ab25a2e467a05e22c5d26ae",
+    "build.log": "771dc8235d5aa5f3f7124cb59f5b48221e91d92969afafc7e1e574a60b6b57e3",
     "results.json": "43651df9b576149995d1b6f17f024c68dccfc7af2731b871e82d0d29670d458e",
     "run-0.log": "ee605e4a802545be65c0cb468dd9bc5a7fa5f74cbdeac7a11dc08f32adff6140",
     "run-1.log": "df63c7de9d042d86ffd7701cefe38f0fdf9bf77b5c729c50216e2f7d29c7ad34",
     "run-2.log": "788f3cabed4f8aaf856d54c5ed457fee5c6a534de44d5788a57436bfcc3d029c",
-    "time-contract-cadence-clock-negative.log": "a8f96938bd7504610bf44e4dcbcaf4021cc43e7541e703c96a587e08a1117aa8",
-    "time-contract-cadence-features.log": "b6476168e3defde8fa371e3353d33d385edf30dacf0268b09d6b08a10208e65c",
+    "time-contract-cadence-clock-negative.log": "055db8600b015881dd13024e2ec63f90bb748c2a19f1abb12cd67d4c6cab2ee5",
+    "time-contract-cadence-features.log": "7c8a93de22b775c666a8d2cdb119823ee15d7019eb39650a7bd0ad41672fb0dd",
     "time-contract-cadence-parallel.log": "414d52e5dbf61472186c397071aaa25f1e98512be3e3ee75aa63270b83164dde",
-    "time-contract-cadence-review.log": "802ba398cd81b7fe98c33cf80a6292af4a256b9ff8efc1d410320b9f56b53851",
-    "time-contract-cadence-suite.log": "e6597a577697cec756d14cfe0f2a8d9d15548a0e54ae058a512212376c5c4332",
-    "time-contract-cadence-wire-negative.log": "5281844d9470b5af3e47bfd8342335e3cce907339c6c0c9a3832bec69d789667"
+    "time-contract-cadence-suite.log": "bf4d3a0baa3e1c24c97d04e4b1f84119dcf6a5a4dbff7444830592153bcf0e96",
+    "time-contract-cadence-wire-negative.log": "3043346e905dfc1e119de11ddabfca3e0e3ca9b1647a1b2c1bc52e835beb37c1"
   }
 }

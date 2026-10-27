@@ -156,7 +156,7 @@ mc-spine の原点と完全一致し、stream 順にすると上表のとおり�
 - `azalea_grows_on` / `azalea_root_replaceable` は `substrate_overworld`（新しい版の tag）を
   参照していた。
 
-`tools/vanilla_tags_sync.py` で jar の block tag を書き戻した（16 追加 / 48 置換 / 120 は同一）。
+(当時) `tools/vanilla_tags_sync.py` で jar の block tag を書き戻した (このスクリプトは削除済み。タグは `gen_vanilla_data.sh` が jar から生成する)（16 追加 / 48 置換 / 120 は同一）。
 chunk (0,0) の feature 出力はこの変更だけでは変わらなかった（ore の target は
 `base_stone_overworld` で、差のある tag は地表側のため）。データの版ずれとしては直す。
 
@@ -166,7 +166,7 @@ chunk (0,0) の feature 出力はこの変更だけでは変わらなかった�
   vanilla を起動せずに比較できる。
 - `tools/ore_oracle.py`: `OreFeature.place` と placement modifier を bytecode から
   書き起こした独立実装。gi を振って vanilla のセルと照合できる。
-- `tools/vanilla_tags_sync.py`: 1.21.1 jar の block tag を同梱データへ同期。
+- (削除済み) `tools/vanilla_tags_sync.py`: 以前は jar の block tag を同梱データへ同期していた。現在は `gen_vanilla_data.sh` が生成する。
 
 ### 次
 

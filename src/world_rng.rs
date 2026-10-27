@@ -125,15 +125,15 @@ mod tests {
     fn next_below_stays_in_range_and_covers_it() {
         let _g = guard();
         seed(7);
-        let mut seen = [false; 16];
+        let mut hits = [0u32; 16];
         for _ in 0..4000 {
-            let v = next_below(16);
-            assert!(v < 16, "next_below must not exceed its bound");
-            seen[v as usize] = true;
+            let drawn = next_below(16);
+            assert!(drawn < 16, "next_below must not exceed its bound");
+            hits[drawn as usize] += 1;
         }
         assert!(
-            seen.iter().all(|&s| s),
-            "every value in 0..16 must occur: {seen:?}"
+            hits.iter().all(|&n| n > 0),
+            "every value in 0..16 must occur: {hits:?}"
         );
         assert_eq!(next_below(0), 0, "a zero bound must not divide by zero");
     }
