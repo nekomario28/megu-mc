@@ -2852,6 +2852,7 @@ fn keepalive_time_tick() {
     // stays powered until the cell clears — vanilla bool order puts
     // powered at the even id, unpowered odd
     {
+        let __tspots = __prof.then(std::time::Instant::now);
         let mut spots: Vec<(i32, i32, i32)> = Vec::new();
         {
             for c in clients().lock().unwrap().iter() {
@@ -2865,25 +2866,47 @@ fn keepalive_time_tick() {
                 spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
             }
         }
+        if let Some(t) = __tspots {
+            tickprof::add("plates/spot_gather", t.elapsed());
+        }
+        let __tloop = __prof.then(std::time::Instant::now);
         let mut pw = powered_plates().lock().unwrap();
+        if __prof {
+            use std::sync::atomic::Ordering;
+            tickprof::PLATE_SPOTS.fetch_add(spots.len() as u64, Ordering::Relaxed);
+        }
         for (x, y, z) in spots.iter().copied() {
-            let st = block_at(x, y, z);
+            // A pressure plate the server can power was placed by a player, so it is in
+            // the overlay; a generated one would come from a structure, which this server
+            // does not place yet. Reading the overlay only keeps this loop off the
+            // worldgen path entirely.
+            let st = overlay_block(x, y, z).unwrap_or(0);
             if plate_unpowered(st) {
+                if __prof {
+                    tickprof::PLATE_ON.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 set_block(x, y, z, st - 1);
                 note_block_update(x, y, z, st - 1);
                 redstone_update(x, y - 1, z, true); // plate powers the block below
                 pw.insert((x, y, z));
             } else if plate_powered(st) {
+                if __prof {
+                    tickprof::PLATE_OFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 pw.insert((x, y, z));
             }
         }
+        if let Some(t) = __tloop {
+            tickprof::add("plates/on_loop", t.elapsed());
+        }
+        let __toff = __prof.then(std::time::Instant::now);
         let off: Vec<(i32, i32, i32)> = pw
             .iter()
             .filter(|&&(x, y, z)| !spots.contains(&(x, y, z)))
             .copied()
             .collect();
         for (x, y, z) in off {
-            let st = block_at(x, y, z);
+            let st = overlay_block(x, y, z).unwrap_or(0);
             if plate_powered(st) {
                 set_block(x, y, z, st + 1);
                 note_block_update(x, y, z, st + 1);
@@ -2891,18 +2914,29 @@ fn keepalive_time_tick() {
             }
             pw.remove(&(x, y, z));
         }
+        if let Some(t) = __toff {
+            tickprof::add("plates/off_loop", t.elapsed());
+        }
     }
     // potion effects tick for ALL players (creative included — speed etc.
     // still apply there; damage effects are client-irrelevant in creative)
     {
+        let __tsnap = __prof.then(std::time::Instant::now);
         let cls: Vec<Arc<Client>> = client_snapshot();
+        if let Some(t) = __tsnap {
+            tickprof::add("env/client_snapshot", t.elapsed());
+        }
+        let __tloop = __prof.then(std::time::Instant::now);
         for c in cls.iter() {
             effects::tick_effects(c);
+        }
+        if let Some(t) = __tloop {
+            tickprof::add("env/effects_loop", t.elapsed());
         }
     }
     {
         if let Some(t) = __t {
-            tickprof::add("env/effects", t.elapsed());
+            tickprof::add("env/plates", t.elapsed());
         }
         __t = __prof.then(std::time::Instant::now);
     }
@@ -6893,6 +6927,20 @@ fn apply_queued_block_updates() {
 fn local_idx(x: i32, y: i32, z: i32) -> u32 {
     (((y - MIN_Y) as u32) << 8) | (((z & 15) as u32) << 4) | (x & 15) as u32
 }
+/// The overlay's state for a cell, or `None` when the cell still holds generated
+/// terrain. Use this instead of `block_at` where the *only* states that matter are ones
+/// a player or a tick wrote: `block_at` falls back to `base_state` → a full locked
+/// worldgen evaluation (density + material rule + aquifer + feature population) for
+/// every generated cell, measured at 1.6 ms per call in the pressure-plate loop —
+/// 19.5 ms of a tick, for 12 entity positions, none of which was on a plate.
+fn overlay_block(x: i32, y: i32, z: i32) -> Option<u32> {
+    world()
+        .lock()
+        .unwrap()
+        .get(&(x >> 4, z >> 4))
+        .and_then(|c| c.get(&local_idx(x, y, z)).copied())
+}
+
 fn block_at(x: i32, y: i32, z: i32) -> u32 {
     let w = timed_world();
     let hit = w
@@ -13815,10 +13863,16 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     let mut data = Vec::new();
     let reg = crate::block_registry::breg();
     let mut gen_sources_here: Vec<((i32, i32, i32), u8)> = Vec::new();
-    let overlay_empty = {
+    // One short lock for this chunk's edits, then work off the copy. The section loop
+    // below used to hold `world()` while it encoded 4096 cells per section, and the tick
+    // thread queues behind it: measured, the pressure-plate step waited 17.6 ms per tick
+    // on 16 `world()` reads, which is the whole tick body. The copy is the chunk's own
+    // edit map (a handful of entries, empty on a fresh chunk).
+    let overlay: HashMap<u32, u32> = {
         let w = world().lock().unwrap();
-        w.get(&(cx, cz)).is_none_or(|c| c.is_empty())
+        w.get(&(cx, cz)).cloned().unwrap_or_default()
     };
+    let overlay_empty = overlay.is_empty();
     let mut hs = [0i32; 256];
     let (mut hmin, mut hmax) = (i32::MAX, i32::MIN);
     for lz in 0..16 {
@@ -13858,12 +13912,12 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                 install_band_rows(cx, cz, sy, rows);
             }
             {
-                let w = world().lock().unwrap();
+                // Neighbour reads (the anti-xray exposure test) go through a per-call
+                // lock instead of holding `world()` across all 4096 cells: the hold is
+                // what the tick thread queues behind, and `base_state` is called with no
+                // lock held at all.
                 let read = |wx: i32, wy: i32, wz: i32| -> u32 {
-                    w.get(&(wx >> 4, wz >> 4))
-                        .and_then(|c| c.get(&local_idx(wx, wy, wz)))
-                        .copied()
-                        .unwrap_or_else(|| base_state(wx, wy, wz))
+                    overlay_block(wx, wy, wz).unwrap_or_else(|| base_state(wx, wy, wz))
                 };
                 for ly in 0..16 {
                     for lz in 0..16 {
@@ -13871,12 +13925,12 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                             let wx = cx * 16 + lx as i32;
                             let wz = cz * 16 + lz as i32;
                             let wy = sy + ly as i32;
+                            // Every cell of this loop is in this chunk, so the chunk's
+                            // own copy of its edits answers it.
                             let ov = if overlay_empty {
                                 None
                             } else {
-                                w.get(&(wx >> 4, wz >> 4))
-                                    .and_then(|c| c.get(&local_idx(wx, wy, wz)))
-                                    .copied()
+                                overlay.get(&local_idx(wx, wy, wz)).copied()
                             };
                             let gen = match &base {
                                 Some(a) => a[(ly << 8) | (lz << 4) | lx],
@@ -22798,6 +22852,9 @@ pub(crate) mod tickprof {
     use std::sync::OnceLock;
     static NS: OnceLock<Mutex<Vec<(&'static str, u64)>>> = OnceLock::new();
     pub(super) static TICKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PLATE_SPOTS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PLATE_ON: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PLATE_OFF: AtomicU64 = AtomicU64::new(0);
     pub(crate) fn enabled() -> bool {
         crate::trace_env::env_flag!("MC_SPINE_TICK_PROFILE")
     }
@@ -22809,21 +22866,37 @@ pub(crate) mod tickprof {
             None => v.push((name, elapsed.as_nanos() as u64)),
         }
     }
+    /// Print the last window and reset it. Averaging "since process start" mixed idle
+    /// ticks (0.04 ms) with loaded ones and understated the split by an order of
+    /// magnitude.
     pub(super) fn report() {
-        let n = TICKS.load(Ordering::Relaxed).max(1) as f64;
+        let n = TICKS.swap(0, Ordering::Relaxed).max(1) as f64;
         let v = NS.get_or_init(|| Mutex::new(Vec::new()));
-        let mut rows: Vec<(&str, f64)> = v
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(name, ns)| (*name, *ns as f64 / 1e6 / n))
-            .collect();
+        let mut rows: Vec<(&str, f64)> = {
+            let mut v = v.lock().unwrap();
+            let rows = v
+                .iter()
+                .map(|(name, ns)| (*name, *ns as f64 / 1e6 / n))
+                .collect();
+            for e in v.iter_mut() {
+                e.1 = 0;
+            }
+            rows
+        };
         rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         let total: f64 = rows.iter().map(|(_, ms)| ms).sum();
         eprintln!("TICKPROF ticks={n} body={total:.2}ms/tick");
-        for (name, ms) in rows.iter().take(6) {
-            eprintln!("TICKPROF   {ms:7.3}  {name}");
+        for (name, ms) in rows.iter().take(12) {
+            if *ms > 0.001 {
+                eprintln!("TICKPROF   {ms:7.3}  {name}");
+            }
         }
+        eprintln!(
+            "TICKPROF   counters: spots/tick={:.1} plate_on={:.2} plate_off={:.2}",
+            PLATE_SPOTS.load(Ordering::Relaxed) as f64 / n,
+            PLATE_ON.load(Ordering::Relaxed) as f64 / n,
+            PLATE_OFF.load(Ordering::Relaxed) as f64 / n
+        );
     }
 }
 
