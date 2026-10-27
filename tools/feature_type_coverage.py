@@ -20,7 +20,6 @@ It is a *static* reader: it does not run generation. `CF_MISSING=1` and
 parse during a run, which is the stronger evidence when the two disagree.
 """
 import json
-import os
 import re
 import sys
 from collections import defaultdict
@@ -34,34 +33,99 @@ def load_dir(kind):
     out = {}
     d = DATA / kind
     if not d.is_dir():
-        return out
-    for f in sorted(d.glob("*.json")):
-        try:
-            out[f.stem] = json.loads(f.read_text())
-        except json.JSONDecodeError:
-            continue
+        raise ValueError("missing pinned worldgen directory: " + str(d))
+    for f in sorted(d.rglob("*.json")):
+        out[f.relative_to(d).with_suffix('').as_posix()] = json.loads(f.read_text())
+    if not out:
+        raise ValueError("empty pinned worldgen directory: " + str(d))
     return out
 
 
 def implemented_arms():
     src = (ROOT / "src/feature.rs").read_text()
     m = re.search(r"fn p_cf\(j: &J\) -> Option<Cf> \{(.*?)\n\}\n", src, re.S)
-    return set(re.findall(r'"([a-z_0-9]+)"', m.group(1))) if m else set()
+    if not m:
+        raise ValueError("configured-feature parser was not found")
+    # This is the formatted outer match's literal arms, not every JSON key and
+    # block name mentioned inside a branch. It does not prove a branch works.
+    arms = set()
+    for pattern in re.findall(r'^        ((?:"[a-z_0-9]+"\s*\|\s*)*"[a-z_0-9]+")\s*=>', m.group(1), re.M):
+        arms.update(re.findall(r'"([a-z_0-9]+)"', pattern))
+    if not arms:
+        raise ValueError("no outer configured-feature arms found")
+    return arms
 
 
-def nested_names(node, acc):
-    """Every placed-feature name a configured-feature config refers to."""
-    if isinstance(node, dict):
-        if "feature" in node and isinstance(node["feature"], str):
-            acc.add(node["feature"].replace("minecraft:", ""))
-        for k, v in node.items():
-            if k in ("features", "feature", "default", "data"):
-                nested_names(v, acc)
-            elif isinstance(v, (dict, list)):
-                nested_names(v, acc)
-    elif isinstance(node, list):
-        for v in node:
-            nested_names(v, acc)
+def normalize_inline(cfs, pfs):
+    """Give inline configured features identities without confusing providers."""
+    inline = {}
+
+    def walk(value, origin, path):
+        if isinstance(value, list):
+            return [walk(v, origin, path + '/' + str(i)) for i, v in enumerate(value)]
+        if not isinstance(value, dict):
+            return value
+        out = {k: walk(v, origin, path + '/' + k) for k, v in value.items()}
+        feature = out.get('feature')
+        if isinstance(feature, dict) and 'type' in feature:
+            name = '@inline/' + origin + path + '/feature'
+            inline[name] = feature
+            out['feature'] = name
+        return out
+
+    configured = {name: walk(value, 'configured/' + name, '') for name, value in cfs.items()}
+    placed = {name: walk(value, 'placed/' + name, '') for name, value in pfs.items()}
+    configured.update(inline)
+    return configured, placed, set(inline)
+
+
+def configured_reach(cfs, pfs):
+    """Resolve named and inline placed/configured references with their roles."""
+    feature_keys = {'feature', 'features', 'default', 'vegetation_feature', 'tree_feature'}
+
+    def walk_config(node, seen):
+        result = set()
+        if isinstance(node, dict):
+            if 'feature' in node and 'placement' in node:
+                return visit_cf(node['feature'], seen)
+            for key, value in node.items():
+                if key in feature_keys:
+                    result.update(visit_pf(value, seen))
+                elif isinstance(value, (dict, list)):
+                    result.update(walk_config(value, seen))
+        elif isinstance(node, list):
+            for value in node:
+                result.update(walk_config(value, seen))
+        return result
+
+    def visit_cf(node, seen):
+        if not isinstance(node, str):
+            raise ValueError('configured reference was not normalized')
+        name = node.removeprefix('minecraft:')
+        marker = ('configured', name)
+        if marker in seen:
+            raise ValueError('cyclic configured feature: ' + name)
+        if name not in cfs:
+            raise ValueError('missing configured feature: ' + name)
+        cfg = cfs[name]
+        return {name} | walk_config(cfg.get('config', cfg), seen | {marker})
+
+    def visit_pf(node, seen):
+        if isinstance(node, str):
+            name = node.removeprefix('minecraft:')
+            marker = ('placed', name)
+            if marker in seen:
+                raise ValueError('cyclic placed feature: ' + name)
+            if name not in pfs:
+                raise ValueError('missing placed feature: ' + name)
+            return visit_pf(pfs[name], seen | {marker})
+        if isinstance(node, list):
+            return set().union(*(visit_pf(value, seen) for value in node))
+        if isinstance(node, dict):
+            return walk_config(node, seen)
+        raise ValueError('invalid placed feature reference')
+
+    return {name: visit_pf(value, {('placed', name)}) for name, value in pfs.items()}
 
 
 # Name-based, because the pack's biome files do not name their dimension: the
@@ -77,8 +141,10 @@ NON_OVERWORLD = {
 def main():
     only_unimplemented = "--unimplemented" in sys.argv
     overworld_only = "--overworld" in sys.argv
-    cfs = load_dir("feature")
+    cfs = load_dir("configured_feature")
     pfs = load_dir("placed_feature")
+    file_count = len(cfs)
+    cfs, pfs, inline = normalize_inline(cfs, pfs)
     biomes = load_dir("biome")
     arms = implemented_arms()
 
@@ -86,44 +152,30 @@ def main():
     for name, cfg in cfs.items():
         types[cfg.get("type", "?").replace("minecraft:", "")].append(name)
 
-    # which placed features reference each configured feature, and what they nest
+    # Configured references inside an inline placed feature stay configured;
+    # selector references are placed. Their names need not be interchangeable.
+    reach = configured_reach(cfs, pfs)
     pf_of_cf = defaultdict(set)
-    for pf, cfg in pfs.items():
-        pf_of_cf[cfg.get("feature", "").replace("minecraft:", "")].add(pf)
-    reach = {}
-
-    def reached_by(pf, seen):
-        if pf in seen:
-            return set()
-        seen.add(pf)
-        out = {pf}
-        cfg = cfs.get(pfs.get(pf, {}).get("feature", "").replace("minecraft:", ""))
-        if cfg:
-            acc = set()
-            nested_names(cfg, acc)
-            for nested in acc:
-                out |= reached_by(nested, seen)
-        return out
-
-    for pf in list(pfs):
-        reach[pf] = reached_by(pf, set())
+    for pf, configured in reach.items():
+        for cf in configured:
+            pf_of_cf[cf].add(pf)
 
     def biomes_reaching(pf):
         # a biome's `features` is one list per generation step
         names = [b for b, cfg in biomes.items()
-                 if any(pf in reach.get(f.replace("minecraft:", ""), set())
+                 if any(pf in reach.get(f.removeprefix("minecraft:"), set())
                         for step in cfg.get("features", [])
                         for f in step)]
         return names
 
     unimplemented = {t: v for t, v in types.items() if t not in arms}
-    print(f"configured features: {len(cfs)} files, {len(types)} types, "
+    print(f"configured features: {file_count} files + {len(inline)} inline, {len(types)} types, "
           f"{len(arms)} arms in p_cf, {len(unimplemented)} types with no arm "
           f"({sum(len(v) for v in unimplemented.values())} files)")
     rows = []
     for t, files in sorted(unimplemented.items(), key=lambda kv: -len(kv[1])):
         placed = sorted({pf for f in files for pf in pf_of_cf.get(f, ())})
-        biome_names = sorted({b for pf in placed for b in biomes_reaching(pf)})
+        biome_names = sorted({b for cf in files for b in biomes_reaching(cf)})
         if overworld_only:
             biome_names = [b for b in biome_names if b not in NON_OVERWORLD]
         rows.append((t, len(files), len(placed), len(biome_names)))

@@ -998,6 +998,38 @@ pub(crate) fn normal_new_l(seed: u64, first_octave: i32, amps: &[f64]) -> Normal
     })
 }
 
+/// RandomState's legacy Nether temperature/vegetation override: two consecutive
+/// PerlinNoise.createLegacyForLegacyNetherBiome stacks, octaves -7 and -6.
+pub(crate) fn normal_legacy_nether(seed: u64) -> Normal {
+    let mut r = Lcg::new(seed);
+    let mut octaves = Vec::with_capacity(4);
+    for _ in 0..2 {
+        // Constructor creates octave zero even when it is outside the array.
+        let _ = Perlin::new_l(&mut r);
+        for _ in (2..7).rev() {
+            r.skip(262);
+        }
+        let high = Perlin::new_l(&mut r);
+        let low = Perlin::new_l(&mut r);
+        octaves.extend([low, high]);
+    }
+    let mut iter = octaves.into_iter();
+    normal_native(-7, &[1.0, 1.0], |_, _| iter.next().unwrap())
+}
+
+pub(crate) fn legacy_world_factory_seed(seed: u64) -> u64 {
+    Lcg::new(seed).next_i64() as u64
+}
+
+pub(crate) fn legacy_named_factory_seed(seed: u64, name: &str) -> u64 {
+    Lcg::split_str(legacy_world_factory_seed(seed), name).next_i64() as u64
+}
+
+pub(crate) fn normal_legacy_named(seed: u64, name: &str, first: i32, amps: &[f64]) -> Normal {
+    let seed = legacy_world_factory_seed(seed) ^ java_hash(name) as i64 as u64;
+    normal_new_l(seed, first, amps)
+}
+
 // ---------- simplex (foliage / noise-based placement modifiers) ----------
 
 #[derive(Clone)]
@@ -1137,6 +1169,90 @@ impl Simp {
     }
 }
 
+/// DensityFunctions.EndIslandDensityFunction's seeded simplex field. Float
+/// geometry, Java int overflow and truncating divisions are observable here.
+pub(crate) struct EndIslands {
+    noise: Simp,
+}
+impl EndIslands {
+    pub(crate) fn new(seed: u64) -> Self {
+        let mut random = Lcg::new(seed);
+        random.skip(17292);
+        let (noise, _, _, _) = Simp::new_l(&mut random);
+        Self { noise }
+    }
+
+    pub(crate) fn height(&self, x: i32, z: i32) -> f32 {
+        let (cx, cz, rx, rz) = (x / 2, z / 2, x % 2, z % 2);
+        let sqrt = |value: f32| f64::from(value).sqrt() as f32;
+        let sum = x.wrapping_mul(x).wrapping_add(z.wrapping_mul(z));
+        let mut height = (100.0 - sqrt(sum as f32) * 8.0).clamp(-100.0, 80.0);
+        for dx in -12i32..=12 {
+            for dz in -12i32..=12 {
+                let nx = i64::from(cx.wrapping_add(dx));
+                let nz = i64::from(cz.wrapping_add(dz));
+                if nx * nx + nz * nz > 4096
+                    && self.noise.get2(nx as f64, nz as f64) < f64::from(-0.9f32)
+                {
+                    let scale =
+                        ((nx as f32).abs() * 3439.0 + (nz as f32).abs() * 147.0) % 13.0 + 9.0;
+                    let ox = (rx - dx * 2) as f32;
+                    let oz = (rz - dz * 2) as f32;
+                    let island = (100.0 - sqrt(ox * ox + oz * oz) * scale).clamp(-100.0, 80.0);
+                    // Java Math.max propagates NaN; Rust f32::max ignores it.
+                    height = if height.is_nan() {
+                        height
+                    } else if island.is_nan() {
+                        island
+                    } else if height == 0.0 && island == 0.0 {
+                        f32::from_bits(height.to_bits() & island.to_bits())
+                    } else {
+                        height.max(island)
+                    };
+                }
+            }
+        }
+        height
+    }
+
+    pub(crate) fn density(&self, x: i32, z: i32) -> f64 {
+        (f64::from(self.height(x / 8, z / 8)) - 8.0) / 128.0
+    }
+}
+
+#[cfg(test)]
+mod end_island_tests {
+    use super::*;
+    #[test]
+    fn end_island_density_and_float_height_match_native() {
+        let mut seed = None;
+        let mut field = EndIslands::new(0);
+        let mut count = 0;
+        for row in include_str!("../tests/data/end_islands_1211.tsv").lines() {
+            let f: Vec<_> = row.split('\t').collect();
+            assert_eq!(f.len(), 5);
+            let current = f[0].parse::<i64>().unwrap() as u64;
+            if seed != Some(current) {
+                field = EndIslands::new(current);
+                seed = Some(current);
+            }
+            let (x, z) = (f[1].parse().unwrap(), f[2].parse().unwrap());
+            assert_eq!(
+                field.height(x, z).to_bits(),
+                u32::from_str_radix(f[3], 16).unwrap(),
+                "native height {row}"
+            );
+            assert_eq!(
+                field.density(x, z).to_bits(),
+                u64::from_str_radix(f[4], 16).unwrap(),
+                "native density {row}"
+            );
+            count += 1;
+        }
+        assert_eq!(count, 560);
+    }
+}
+
 // vanilla OctaveSimplexNoiseSampler over octave indices (can be negative)
 pub(crate) struct OSimp {
     layers: Vec<Option<Simp>>,
@@ -1213,44 +1329,144 @@ impl OSimp {
     }
 }
 
-// fbm of smeared perlin (old_blended_noise internals)
-pub(crate) struct SmearStack {
-    layers: Vec<(Perlin, f64, f64)>, // noise, freq, amp
-    fudge_y: f64,
+/// BlendedNoise constructs descending octaves from one sequential random source.
+/// RandomState chooses that source; both engines share the sampling arithmetic.
+pub(crate) struct BlendedNoise {
+    min: Vec<Perlin>,
+    max: Vec<Perlin>,
+    main: Vec<Perlin>,
+    xzm: f64,
+    ym: f64,
+    xzf: f64,
+    yf: f64,
+    smear: f64,
 }
-impl SmearStack {
-    pub(crate) fn get(&self, x: f64, y: f64, z: f64) -> f64 {
-        let mut v = 0.0;
-        for (n, f, a) in &self.layers {
-            v += a * n.get_smeared(x * f, y * f, z * f, self.fudge_y * f);
+impl BlendedNoise {
+    pub(crate) fn legacy(seed: u64, xzs: f64, ys: f64, xzf: f64, yf: f64, smear: f64) -> Self {
+        let mut random = Lcg::new(seed);
+        Self::build(|| Perlin::new_l(&mut random), xzs, ys, xzf, yf, smear)
+    }
+
+    pub(crate) fn modern(
+        random: &mut Xor,
+        xzs: f64,
+        ys: f64,
+        xzf: f64,
+        yf: f64,
+        smear: f64,
+    ) -> Self {
+        Self::build(|| Perlin::new(random), xzs, ys, xzf, yf, smear)
+    }
+
+    fn build(
+        mut perlin: impl FnMut() -> Perlin,
+        xzs: f64,
+        ys: f64,
+        xzf: f64,
+        yf: f64,
+        smear: f64,
+    ) -> Self {
+        let min = (0..16).map(|_| perlin()).collect();
+        let max = (0..16).map(|_| perlin()).collect();
+        let main = (0..8).map(|_| perlin()).collect();
+        Self {
+            min,
+            max,
+            main,
+            xzm: 684.412 * xzs,
+            ym: 684.412 * ys,
+            xzf,
+            yf,
+            smear,
         }
-        v
     }
-}
-pub(crate) fn smear_fbm(
-    r: &mut Xor,
-    first_octave: i32,
-    smear_y: f64,
-    value_factor: f64,
-) -> SmearStack {
-    let octaves = -first_octave + 1;
-    let mut f = 1.0f64;
-    let mut vf = value_factor / (2f64.powi(octaves) - 1.0);
-    let mut layers = Vec::new();
-    for _ in (0..octaves).rev() {
-        layers.push((Perlin::new(r), f, vf));
-        f /= 2.0;
-        vf *= 2.0;
+
+    fn sample(layers: &[Perlin], x: f64, y: f64, z: f64, smear: f64) -> f64 {
+        let mut value = 0.0;
+        let mut frequency = 1.0;
+        for layer in layers {
+            value += layer.get_smeared(
+                x * frequency,
+                y * frequency,
+                z * frequency,
+                smear * frequency,
+            ) / frequency;
+            frequency /= 2.0;
+        }
+        value
     }
-    SmearStack {
-        layers,
-        fudge_y: smear_y,
+
+    pub(crate) fn get(&self, x: i32, y: i32, z: i32) -> f64 {
+        let x = f64::from(x) * self.xzm;
+        let y = f64::from(y) * self.ym;
+        let z = f64::from(z) * self.xzm;
+        let smear = self.ym * self.smear;
+        let main = Self::sample(
+            &self.main,
+            x / self.xzf,
+            y / self.yf,
+            z / self.xzf,
+            smear / self.yf,
+        );
+        let alpha = (main / 10.0 + 1.0) / 2.0;
+        let min = if alpha >= 1.0 {
+            0.0
+        } else {
+            Self::sample(&self.min, x, y, z, smear) / 512.0
+        };
+        let max = if alpha <= 0.0 {
+            0.0
+        } else {
+            Self::sample(&self.max, x, y, z, smear) / 512.0
+        };
+        if alpha < 0.0 {
+            min / 128.0
+        } else if alpha > 1.0 {
+            max / 128.0
+        } else {
+            (min + alpha * (max - min)) / 128.0
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dimension_blended_noise_matches_native_bits() {
+        let configs = [
+            [0.25, 0.25, 80.0, 160.0, 4.0],
+            [0.25, 0.375, 80.0, 60.0, 8.0],
+            [0.25, 0.125, 80.0, 160.0, 8.0],
+        ];
+        let mut current = None;
+        let mut noise = None;
+        for row in include_str!("../tests/data/blended_noise_1211.tsv").lines() {
+            let p: Vec<_> = row.split('\t').collect();
+            let seed = p[0].parse::<i64>().unwrap() as u64;
+            let c = p[1].parse::<usize>().unwrap();
+            if current != Some((seed, c)) {
+                let [xz, y, xf, yf, smear] = configs[c];
+                noise = Some(if c == 2 {
+                    let mut random = Xor::seed(seed).splitter().of_str("minecraft:terrain");
+                    BlendedNoise::modern(&mut random, xz, y, xf, yf, smear)
+                } else {
+                    BlendedNoise::legacy(seed, xz, y, xf, yf, smear)
+                });
+                current = Some((seed, c));
+            }
+            let actual = noise.as_ref().unwrap().get(
+                p[2].parse().unwrap(),
+                p[3].parse().unwrap(),
+                p[4].parse().unwrap(),
+            );
+            assert_eq!(
+                actual.to_bits(),
+                u64::from_str_radix(p[5], 16).unwrap(),
+                "{row}"
+            );
+        }
+    }
     #[test]
     fn xoroshiro_parity() {
         // pumpkin xoroshiro128.rs test vectors

@@ -6,11 +6,11 @@ Status: 実装中。現在の作業状態は[状態ページ](README.md)、個�
 
 ## 現在のcheckpoint（2026-10-27）
 
-**M2/M3は未達。** R1の限定した生成境界は、nativeと同じsource順・tick停止状態で3×3全セル一致に到達しました。保存後のruntime一致とは区別します。
+**M2/M3は未達。** `5b0e4a2` のcheckpointで、R1の限定した生成境界・700回の通常game_tick後・5 tickで保存して別プロセスで695 tick再開した後のいずれも、同じsource順のnativeと3×3全セル一致を確認しました。現在は[全worldgenの実装](worldgen-parity/README.md)へ範囲を拡張しています。checkpointの測定を、その後の未検証変更や全worldgenの合格へ読み替えません。
 
 | 現在できていること | 現在できていないこと |
 |---|---|
-| 通常の生成バイナリがpaused nativeの884,736セルと0差 | 元の保存参照との差1,803セルをportのtickで再現すること |
+| 通常の生成バイナリとruntime・再読込が対象884,736セルでnativeと0差（上記checkpoint） | 全ディメンション・biome・構造物での同じ受け入れ |
 | 新しいnative tick有効worldが元のcanonicalと0差 | vanilla ticket schedulerの再現（生成順は明示入力） |
 | 独立したnative feature/leaf/HashSet vectors | 全seed・biome・構造物での受け入れ |
 | 同一source footprint・生成順・stageを固定した比較 | whole-world、hosted CI、main統合 |

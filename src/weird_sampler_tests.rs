@@ -480,6 +480,8 @@ fn weird_sampler_uses_the_callers_interpolation_context() {
         grids: vec![None; g.dfs.len()],
         surf: [0; 256],
         ny: 2,
+        cell_w: 4,
+        cell_h: 8,
         min_y: 0,
         mats: (0..256).map(|_| None).collect(),
         rd: [0; 256],

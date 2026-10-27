@@ -1,5 +1,5 @@
 //! Shared asset/datapack value parser, independent of terrain generation.
-//! This moves the existing parsing contract; it does not redefine JSON acceptance.
+//! Booleans use numeric values, preserving false separately from null/missing.
 
 #[derive(Debug, Clone)]
 pub(crate) enum J {
@@ -140,7 +140,7 @@ impl<'a> JP<'a> {
             }
             b'f' => {
                 self.i += 5;
-                Some(J::Null)
+                Some(J::Num(0.0))
             }
             b'n' => {
                 self.i += 4;
@@ -195,4 +195,20 @@ pub(crate) fn jbool(j: &J, k: &str, d: bool) -> bool {
 }
 pub(crate) fn jarr<'a>(j: &'a J, k: &str) -> Option<&'a Vec<J>> {
     js(j, k).and_then(|v| v.as_arr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_false_overrides_a_true_default() {
+        let value = jparse(br#"{"aquifers_enabled":false,"enabled":true,"unset":null}"#).unwrap();
+        assert!(!jbool(&value, "aquifers_enabled", true));
+        assert!(jbool(&value, "enabled", false));
+        assert!(jbool(&value, "missing", true));
+        assert!(jbool(&value, "unset", true));
+        assert!(matches!(value.get("unset"), Some(J::Null)));
+        assert!(!matches!(value.get("aquifers_enabled"), Some(J::Null)));
+    }
 }

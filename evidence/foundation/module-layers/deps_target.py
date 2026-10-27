@@ -10,13 +10,13 @@ import depsgx as d
 layers = [
     ["main"],
     ["java_compat", "landing", "effects", "tick_persistence"],
-    ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks"],
-    ["feature"],
+    ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks", "structure_placement"],
+    ["feature", "structure_template"],
     ["tree"],
     ["generation_providers"],
     ["generation_context"],
     ["worldgen", "block_registry"],
-    ["json", "generation_math", "generation_leaf_queue"],
+    ["json", "generation_math", "generation_leaf_queue", "nbt", "structure_transform"],
     # leaf utilities the root uses: the wire-boundary frame limit and the tick
     # measurements. They own no game state and depend on nothing.
     ["ingress_guard", "tick_stats", "chunk_ack", "trace_env"],
@@ -29,6 +29,9 @@ graph = d.ModuleGraph(
         ("landing", "world_rng"),
         ("java_compat", "landing_types"),
         ("tick_persistence", "scheduled_ticks"),
+        ("structure_placement", "generation_math"),
+        ("structure_template", "nbt"), ("structure_template", "block_registry"),
+        ("structure_template", "structure_transform"),
         ("feature", "tree"), ("feature", "worldgen"),
         ("feature", "block_registry"), ("feature", "generation_providers"),
         ("feature", "generation_context"), ("feature", "json"), ("feature", "generation_math"),

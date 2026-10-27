@@ -15,6 +15,37 @@ use crate::trace_env::{env_flag, env_str};
 
 // ---------- density functions ----------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NoisePreset {
+    Overworld,
+    Nether,
+    End,
+}
+impl NoisePreset {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "overworld" => Some(Self::Overworld),
+            "nether" => Some(Self::Nether),
+            "end" => Some(Self::End),
+            _ => None,
+        }
+    }
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Overworld => "overworld",
+            Self::Nether => "nether",
+            Self::End => "end",
+        }
+    }
+}
+
+pub(crate) fn parse_world_seed(value: &str) -> Result<u64, std::num::ParseIntError> {
+    value
+        .parse::<i64>()
+        .map(|seed| seed as u64)
+        .or_else(|_| value.parse())
+}
+
 enum SV {
     V(f32),
     S(Box<Spl>),
@@ -74,6 +105,7 @@ impl RarityValueMapper {
 
 enum DF {
     C(f64),
+    EndIslands(Box<EndIslands>),
     Add(usize, usize),
     Sub(usize, usize),
     Mul(usize, usize),
@@ -104,7 +136,7 @@ enum DF {
         tv: f64,
     }, // axis always y here
     Cache(usize),
-    // vanilla `interpolated`: sampled at 4x8x4 cell corners, trilinearly
+    // vanilla `interpolated`: sampled at the preset's cell corners, trilinearly
     // interpolated at the query position (a per-chunk grid, see ChunkCols).
     Interp(usize),
     Noise {
@@ -135,15 +167,7 @@ enum DF {
         fns: Vec<usize>,
     },
     Spline(Box<Spl>),
-    OldBlended {
-        min: SmearStack,
-        max: SmearStack,
-        main: SmearStack,
-        xzm: f64,
-        ym: f64,
-        mxm: f64,
-        mym: f64,
-    },
+    Blended(Box<BlendedNoise>),
     BlendD(usize),
     Zero,
     FindTopSurface {
@@ -183,6 +207,7 @@ enum Cond {
         hi: f64,
     },
     VGrad {
+        legacy_seed: u64,
         lo_w: u64,
         hi_w: u64,
         t: YA,
@@ -394,6 +419,7 @@ struct VeinCfg {
 }
 
 pub struct Gen {
+    pub(crate) preset: NoisePreset,
     dfs: Vec<DF>,
     names: HashMap<String, usize>,
     noises: Vec<Normal>,
@@ -418,6 +444,8 @@ pub struct Gen {
     pub height: i32,
     // NoiseSettings.getCellHeight() = size_vertical * 4
     noise_cell_h: i32,
+    noise_cell_w: i32,
+    legacy_random_source: bool,
     rules: Vec<Rule>,
     conds: Vec<Cond>,
     rule_ids: HashMap<String, usize>,
@@ -449,7 +477,7 @@ pub struct Gen {
     prelim_ord: Vec<(i32, i32)>,
     clim_c: HashMap<(i32, i32), ([i64; 5], f64)>,
     clim_ord: Vec<(i32, i32)>,
-    // quart -> biome leaf, shared across SCs (the deep material rule asks per block)
+    // Surface-rule biome leaf cache; Nether's fuzzy source keys actual blocks.
     bioq: HashMap<(i32, i32, i32), u16>,
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
@@ -601,8 +629,17 @@ impl Gen {
     }
 
     pub fn load(seed: u64, res: fn(&str) -> Option<u32>) -> Option<Gen> {
+        Self::load_preset(seed, res, NoisePreset::Overworld)
+    }
+
+    pub(crate) fn load_preset(
+        seed: u64,
+        res: fn(&str) -> Option<u32>,
+        preset: NoisePreset,
+    ) -> Option<Gen> {
         let files = Self::df_files();
         let mut g = Gen {
+            preset,
             dfs: vec![],
             names: HashMap::new(),
             noises: vec![],
@@ -620,6 +657,8 @@ impl Gen {
             min_y: -64,
             height: 384,
             noise_cell_h: 8,
+            noise_cell_w: 4,
+            legacy_random_source: false,
             rules: vec![],
             conds: vec![],
             rule_ids: HashMap::new(),
@@ -678,7 +717,10 @@ impl Gen {
         // noise settings (sea level, bounds, router names)
         let mut ns_json: Option<J> = None;
         'outer: for p in Gen::packs() {
-            let f = p.join("data/minecraft/worldgen/noise_settings/overworld.json");
+            let f = p.join(format!(
+                "data/minecraft/worldgen/noise_settings/{}.json",
+                preset.name()
+            ));
             if let Ok(b) = std::fs::read(&f) {
                 ns_json = jparse(&b);
                 g.base = p.to_string_lossy().to_string();
@@ -688,15 +730,28 @@ impl Gen {
         let ns = match ns_json {
             Some(j) => j,
             None => {
-                Self::load_trace("noise_settings/overworld.json was not found or is not JSON");
+                Self::load_trace(&format!(
+                    "noise_settings/{}.json was not found or is not JSON",
+                    preset.name()
+                ));
                 return None;
             }
         };
         g.sea = ns.get("sea_level").map(J::num).unwrap_or(63.0) as i32;
+        g.legacy_random_source = jbool(&ns, "legacy_random_source", false);
         if let Some(n) = ns.get("noise") {
             g.min_y = n.get("min_y").map(J::num).unwrap_or(-64.0) as i32;
             g.height = n.get("height").map(J::num).unwrap_or(384.0) as i32;
             g.noise_cell_h = (n.get("size_vertical").map(J::num).unwrap_or(2.0) as i32 * 4).max(1);
+            g.noise_cell_w = n.get("size_horizontal").map(J::num).unwrap_or(1.0) as i32 * 4;
+            if g.noise_cell_w <= 0
+                || g.height <= 0
+                || 16 % g.noise_cell_w != 0
+                || g.height % g.noise_cell_h != 0
+            {
+                Self::load_trace("noise cell sizes do not divide the chunk dimensions");
+                return None;
+            }
         }
         let router = ns.get("noise_router");
         // 1.21.1 writes the router entries as inline density functions (the newer
@@ -791,18 +846,31 @@ impl Gen {
         }
         // Vanilla's built-in climate tree, exported by tools/biome_tree_from_jar.py.
         // The preset JSON only names the builder; it does not contain its intervals.
-        {
+        if preset == NoisePreset::End {
+            for name in [
+                "minecraft:the_end",
+                "minecraft:end_highlands",
+                "minecraft:end_midlands",
+                "minecraft:small_end_islands",
+                "minecraft:end_barrens",
+            ] {
+                let leaf = g.biome_names.len() as u16;
+                g.biome_names.push(name.to_string());
+                g.bleaf.insert(name.to_string(), leaf);
+            }
+        } else {
             let tp = std::path::Path::new(&g.base).join("multi_noise_biome_tree.json");
             if let Ok(b) = std::fs::read(&tp) {
                 if let Some(j) = jparse(&b) {
-                    if let Some(ow) = j.get("overworld") {
+                    if let Some(ow) = j.get(preset.name()) {
                         g.btree = bt_parse(ow, &mut g.biome_names, &mut g.bleaf, &mut g.leaf_ps);
                     }
                 }
             }
             if g.btree.is_none() {
                 Self::load_trace(&format!(
-                    "no valid overworld biome tree at {}",
+                    "no valid {} biome tree at {}",
+                    preset.name(),
                     tp.display()
                 ));
             }
@@ -1126,6 +1194,10 @@ impl Gen {
                 // big-endian; `Split::of_str` already reads it that way.
                 let h = md5(j.get("random_name")?.str().as_bytes());
                 Cond::VGrad {
+                    legacy_seed: legacy_named_factory_seed(
+                        self.world_seed,
+                        j.get("random_name")?.str(),
+                    ),
                     lo_w: u64::from_be_bytes(h[0..8].try_into().unwrap()),
                     hi_w: u64::from_be_bytes(h[8..16].try_into().unwrap()),
                     t: ya("true_at_and_below")?,
@@ -1236,6 +1308,22 @@ impl Gen {
         if let Some(&i) = self.noise_names.get(name) {
             return Some(i);
         }
+        if self.legacy_random_source {
+            let noise = match name {
+                "minecraft:temperature" => Some(normal_legacy_nether(self.world_seed)),
+                "minecraft:vegetation" => {
+                    Some(normal_legacy_nether(self.world_seed.wrapping_add(1)))
+                }
+                "minecraft:offset" => Some(normal_new_amps(&mut Xor::seed(0), 0, &[0.0])),
+                _ => None,
+            };
+            if let Some(noise) = noise {
+                let id = self.noises.len();
+                self.noises.push(noise);
+                self.noise_names.insert(name.to_owned(), id);
+                return Some(id);
+            }
+        }
         let path = format!(
             "{}/data/minecraft/worldgen/noise/{}.json",
             self.base,
@@ -1254,7 +1342,11 @@ impl Gen {
                 .unwrap_or(-4.0) as i32;
             let amps: Vec<f64> = amps.iter().map(|v| v.num()).collect();
             let mut rng = self.factory.of_str(name);
-            let n = crate::generation_math::normal_new_amps(&mut rng, first, &amps);
+            let n = if self.legacy_random_source {
+                normal_legacy_named(self.world_seed, name, first, &amps)
+            } else {
+                crate::generation_math::normal_new_amps(&mut rng, first, &amps)
+            };
             self.noises.push(n);
             self.noise_names
                 .insert(name.to_string(), self.noises.len() - 1);
@@ -1471,24 +1563,19 @@ impl Gen {
                 let xzf = n("xz_factor");
                 let yf = n("y_factor");
                 let smear = n("smear_scale_multiplier");
-                let xzm = 684.412 * xzs;
-                let ym = 684.412 * ys;
-                let lim_y = ym * smear;
-                let mut rng = self.factory.of_str("minecraft:terrain");
-                DF::OldBlended {
-                    min: smear_fbm(&mut rng, -15, lim_y, 0.99998474),
-                    max: smear_fbm(&mut rng, -15, lim_y, 0.99998474),
-                    main: smear_fbm(&mut rng, -7, lim_y / yf, 12.75),
-                    xzm,
-                    ym,
-                    mxm: xzm / xzf,
-                    mym: ym / yf,
-                }
+                DF::Blended(Box::new(if self.legacy_random_source {
+                    BlendedNoise::legacy(self.world_seed, xzs, ys, xzf, yf, smear)
+                } else {
+                    let mut rng = self.factory.of_str("minecraft:terrain");
+                    BlendedNoise::modern(&mut rng, xzs, ys, xzf, yf, smear)
+                }))
             }
             "blend_density" => DF::BlendD(either(self, "input", "argument")?),
             "blend_alpha" => DF::C(1.0),
-            "blend_offset" | "beardifier" | "end_outer_islands" | "end_islands"
-            | "distance_to_point" | "slice" => DF::Zero,
+            "end_islands" => DF::EndIslands(Box::new(EndIslands::new(self.world_seed))),
+            "blend_offset" | "beardifier" | "end_outer_islands" | "distance_to_point" | "slice" => {
+                DF::Zero
+            }
             "find_top_surface" => DF::FindTopSurface {
                 density: sub(self, "density")?,
                 lower: n("lower_bound") as i32,
@@ -1574,11 +1661,12 @@ impl Gen {
         }
         match &self.dfs[id] {
             DF::C(_)
+            | DF::EndIslands(_)
             | DF::Zero
             | DF::Grad { .. }
             | DF::ShiftA(_)
             | DF::ShiftB(_)
-            | DF::OldBlended { .. } => {}
+            | DF::Blended(_) => {}
             DF::WeirdScaledSampler { input, .. } => out.push(*input),
             DF::Add(a, b)
             | DF::Sub(a, b)
@@ -1707,6 +1795,7 @@ impl Gen {
     ) -> f64 {
         match &self.dfs[id] {
             DF::C(v) => *v,
+            DF::EndIslands(field) => field.density(x, z),
             DF::Zero => 0.0,
             DF::Add(a, b) => {
                 self.eval_c(*a, x, y, z, memo, cc) + self.eval_c(*b, x, y, z, memo, cc)
@@ -1823,29 +1912,7 @@ impl Gen {
                 self.eval_c(fns[pick.min(fns.len() - 1)], x, y, z, memo, cc)
             }
             DF::Spline(s) => self.eval_spline_c(s, x, y, z, memo, cc),
-            DF::OldBlended {
-                min,
-                max,
-                main,
-                xzm,
-                ym,
-                mxm,
-                mym,
-            } => {
-                let xv = x as f64;
-                let yv = y as f64;
-                let zv = z as f64;
-                let alpha = (main.get(xv * mxm, yv * mym, zv * mxm) + 0.5).clamp(0.0, 1.0);
-                if alpha == 0.0 {
-                    min.get(xv * xzm, yv * ym, zv * xzm)
-                } else if alpha == 1.0 {
-                    max.get(xv * xzm, yv * ym, zv * xzm)
-                } else {
-                    let a = min.get(xv * xzm, yv * ym, zv * xzm);
-                    let b = max.get(xv * xzm, yv * ym, zv * xzm);
-                    a + alpha * (b - a)
-                }
-            }
+            DF::Blended(noise) => noise.get(x, y, z),
             DF::BlendD(a) => self.eval_c(*a, x, y, z, memo, cc),
             DF::FindTopSurface {
                 density,
@@ -1928,7 +1995,13 @@ impl Gen {
             .map(|ni| self.noises[ni].get(x as f64, 0.0, z as f64))
             .unwrap_or(0.0);
         let mut r = self.factory.pos(x, 0, z);
-        (n * 2.75 + 3.0 + ((r.next_f64() * 0.25) as f32) as f64) as i32
+        let random = if self.legacy_random_source {
+            Lcg::new(legacy_world_factory_seed(self.world_seed) ^ hash_block_pos(x, 0, z) as u64)
+                .next_f64()
+        } else {
+            r.next_f64()
+        };
+        (n * 2.75 + 3.0 + random * 0.25) as i32
     }
 
     fn sec_depth(&self, c: &mut SC) -> f32 {
@@ -1944,18 +2017,25 @@ impl Gen {
 
     fn leaf_at(&mut self, c: &mut SC) -> u16 {
         let (qx, qy, qz) = (c.x >> 2, c.y >> 2, c.z >> 2);
-        let key = (qx, qy, qz);
-        // The biome is a pure function of the quart when the search is unseeded, and the material
-        // rule asks for the same quart once per block (64 blocks per quart). A per-Gen cache turns
-        // millions of B-tree searches into one per quart. The key is the tuple, not a packed u64:
-        // the old per-block packed key was collision-free by luck only.
+        // SurfaceRules.Context uses BiomeManager at the actual block position.
+        // Fuzzy biome boundaries are per block, not uniform inside a quart.
+        let key = if self.preset == NoisePreset::Nether {
+            (c.x, c.y, c.z)
+        } else {
+            (qx, qy, qz)
+        };
+        // Share the lookup across surface contexts. The Nether cache must retain
+        // block coordinates because fuzzy selection can vary inside one quart.
         if let Some(&l) = self.bioq.get(&key) {
             return l;
         }
-        let l = self
-            .biome_quart(qx, qy, qz, None)
-            .map(|(_, l)| l)
-            .unwrap_or(u16::MAX);
+        let l = if self.preset == NoisePreset::Nether {
+            self.biome_blended(c.x, c.y, c.z)
+        } else {
+            self.biome_quart(qx, qy, qz, None)
+        }
+        .map(|(_, l)| l)
+        .unwrap_or(u16::MAX);
         self.bioq.insert(key, l);
         self.bioq_ord.push_back(key);
         if self.bioq_ord.len() > BIO_CAP {
@@ -2094,7 +2174,13 @@ impl Gen {
                 }
                 ok
             }
-            Cond::VGrad { lo_w, hi_w, t, f } => {
+            Cond::VGrad {
+                legacy_seed,
+                lo_w,
+                hi_w,
+                t,
+                f,
+            } => {
                 let top = self.min_y + self.height - 1;
                 let ta = t.get(self.min_y, top);
                 let fa = f.get(self.min_y, top);
@@ -2108,7 +2194,11 @@ impl Gen {
                 let sp = xr.splitter();
                 let mut r = sp.pos(c.x, c.y, c.z);
                 let m = (c.y as f32 - ta as f32) / (fa as f32 - ta as f32) * (0.0 - 1.0) + 1.0;
-                r.next_f32() < m
+                if self.legacy_random_source {
+                    Lcg::new(legacy_seed ^ hash_block_pos(c.x, c.y, c.z) as u64).next_f32() < m
+                } else {
+                    r.next_f32() < m
+                }
             }
             Cond::YAbove { a, mult, sd } => {
                 let top = self.min_y + self.height - 1;
@@ -2230,12 +2320,14 @@ impl Gen {
 // ---------- chunk column generation ----------
 
 pub(crate) struct ChunkCols {
-    // 5 x 5 x ny corner grid per `interpolated` node reachable from
+    // Preset-sized horizontal/vertical corner grid per `interpolated` node reachable from
     // final_density, indexed by density-function id. Vanilla interpolates only
     // the input of `interpolated`; squeeze/min/add stay per block.
     grids: Vec<Option<Box<[f64]>>>,
     surf: [i16; 256],
-    ny: usize, // cell count y (48)
+    ny: usize, // vertical corner count, including both edges
+    cell_w: i32,
+    cell_h: i32,
     min_y: i32,
     mats: Vec<Option<SurfMat>>, // per-column material-rule results (surface window)
     rd: [i16; 256],             // per-column run_depth (surface noise)
@@ -2245,7 +2337,14 @@ pub(crate) struct ChunkCols {
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
 
 pub fn init(seed: u64, res: fn(&str) -> Option<u32>) -> bool {
-    match Gen::load(seed, res) {
+    init_preset(seed, res, NoisePreset::Overworld)
+}
+pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: NoisePreset) -> bool {
+    let generator = match preset {
+        NoisePreset::Overworld => Gen::load(seed, res),
+        NoisePreset::End | NoisePreset::Nether => Gen::load_preset(seed, res, preset),
+    };
+    match generator {
         Some(g) => {
             *GEN.lock().unwrap() = Some(g);
             true
@@ -2396,7 +2495,8 @@ impl Gen {
             return Some(v.clone());
         }
         let g = self;
-        let ny = ((g.height / 8) + 1) as usize;
+        let ny = ((g.height / g.noise_cell_h) + 1) as usize;
+        let nx = (16 / g.noise_cell_w + 1) as usize;
         let mut memo = HashMap::new();
         // One corner grid per `interpolated` node on the final_density path. The
         // grid holds the node's input; the enclosing operators are evaluated per
@@ -2408,14 +2508,14 @@ impl Gen {
                 DF::Interp(i) => i,
                 _ => continue,
             };
-            let mut cells = vec![0.0f64; 5 * 5 * ny];
-            for zi in 0..5usize {
-                for xi in 0..5usize {
+            let mut cells = vec![0.0f64; nx * nx * ny];
+            for zi in 0..nx {
+                for xi in 0..nx {
                     for yi in 0..ny {
-                        let bx = cx * 16 + (xi as i32) * 4;
-                        let by = g.min_y + (yi as i32) * 8;
-                        let bz = cz * 16 + (zi as i32) * 4;
-                        cells[(zi * 5 + xi) * ny + yi] = g.eval(inner, bx, by, bz, &mut memo);
+                        let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
+                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                        let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
+                        cells[(zi * nx + xi) * ny + yi] = g.eval(inner, bx, by, bz, &mut memo);
                     }
                 }
             }
@@ -2425,6 +2525,8 @@ impl Gen {
             grids,
             surf: [0i16; 256],
             ny,
+            cell_w: g.noise_cell_w,
+            cell_h: g.noise_cell_h,
             min_y: g.min_y,
             mats: Vec::new(),
             rd: [0i16; 256],
@@ -2496,7 +2598,13 @@ impl Gen {
                     c.steep = None;
                     c.nt.clear();
                     rd[lz * 16 + lx] = c.run_depth as i16;
-                    let est_min = g.prelim_min(x, z);
+                    // Nether surface rules decorate every cave floor/ceiling;
+                    // they have no above_preliminary_surface guard.
+                    let est_min = if g.preset == NoisePreset::Nether {
+                        g.min_y
+                    } else {
+                        g.prelim_min(x, z)
+                    };
                     c.est_min = est_min;
                     let cells: Vec<SurfaceCell> = (g.min_y..=scan_top)
                         .map(|y| g.surface_cell(&cc, x, y, z, surf_y, water_surface))
@@ -3067,22 +3175,25 @@ impl ChunkCols {
     #[inline]
     fn interp(&self, id: usize, x: i32, y: i32, z: i32) -> Option<f64> {
         let cells = self.grids.get(id)?.as_deref()?;
-        Some(trilinear(cells, self.ny, self.min_y, x, y, z))
+        Some(trilinear(cells, self, x, y, z))
     }
 }
 
 #[inline]
-fn trilinear(cells: &[f64], ny: usize, min_y: i32, x: i32, y: i32, z: i32) -> f64 {
+fn trilinear(cells: &[f64], columns: &ChunkCols, x: i32, y: i32, z: i32) -> f64 {
+    let (ny, min_y) = (columns.ny, columns.min_y);
+    let nx = (16 / columns.cell_w + 1) as usize;
+    let (width, height) = (f64::from(columns.cell_w), f64::from(columns.cell_h));
     let lx = (x & 15) as f64;
     let lz = (z & 15) as f64;
     let ly = (y - min_y) as f64;
-    let xi = (lx / 4.0).floor().min(3.0) as usize;
-    let zi = (lz / 4.0).floor().min(3.0) as usize;
-    let yi = (ly / 8.0).floor().min((ny - 2) as f64) as usize;
-    let fx = lx / 4.0 - xi as f64;
-    let fz = lz / 4.0 - zi as f64;
-    let fy = ly / 8.0 - yi as f64;
-    let g = |xi: usize, yi: usize, zi: usize| cells[(zi * 5 + xi) * ny + yi];
+    let xi = (lx / width).floor().min((nx - 2) as f64) as usize;
+    let zi = (lz / width).floor().min((nx - 2) as f64) as usize;
+    let yi = (ly / height).floor().min((ny - 2) as f64) as usize;
+    let fx = lx / width - xi as f64;
+    let fz = lz / width - zi as f64;
+    let fy = ly / height - yi as f64;
+    let g = |xi: usize, yi: usize, zi: usize| cells[(zi * nx + xi) * ny + yi];
     let c000 = g(xi, yi, zi);
     let c100 = g(xi + 1, yi, zi);
     let c010 = g(xi, yi + 1, zi);
@@ -4041,6 +4152,32 @@ impl Gen {
         qz: i32,
         last: Option<u16>,
     ) -> Option<(i64, u16)> {
+        if self.preset == NoisePreset::End {
+            let (cx, cz) = (qx.wrapping_mul(4) >> 4, qz.wrapping_mul(4) >> 4);
+            let leaf = if i64::from(cx) * i64::from(cx) + i64::from(cz) * i64::from(cz) <= 4096 {
+                0
+            } else {
+                let x = cx.wrapping_mul(2).wrapping_add(1).wrapping_mul(8);
+                let z = cz.wrapping_mul(2).wrapping_add(1).wrapping_mul(8);
+                let erosion = self.eval(
+                    self.climate?[3],
+                    x,
+                    qy.wrapping_mul(4),
+                    z,
+                    &mut HashMap::new(),
+                );
+                if erosion > 0.25 {
+                    1
+                } else if erosion >= -0.0625 {
+                    2
+                } else if erosion < -0.21875 {
+                    3
+                } else {
+                    4
+                }
+            };
+            return Some((biome_id(self.biome_names.get(leaf)?), leaf as u16));
+        }
         let t = self.target7(qx, qy, qz)?;
         // vanilla seeds the search with the previous result
         let mut best = (i64::MAX, 0u16);
@@ -4190,6 +4327,376 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    #[test]
+    fn interpolation_uses_noise_preset_cell_dimensions() {
+        for (cell_w, cell_h, min_y, world_height) in
+            [(4, 8, -64, 384), (8, 4, 0, 128), (4, 8, 0, 128)]
+        {
+            let nx = (16 / cell_w + 1) as usize;
+            let ny = (world_height / cell_h + 1) as usize;
+            let columns = ChunkCols {
+                grids: Vec::new(),
+                surf: [0; 256],
+                ny,
+                cell_w,
+                cell_h,
+                min_y,
+                mats: Vec::new(),
+                rd: [0; 256],
+                wtop: [0; 256],
+            };
+            let (cx, cz) = (-2, 3);
+            let field = |x, y, z| f64::from(x) * 3.0 + f64::from(y) * 0.5 + f64::from(z) * 7.0;
+            let mut grid = vec![0.0; nx * nx * ny];
+            for zi in 0..nx {
+                for xi in 0..nx {
+                    for yi in 0..ny {
+                        grid[(zi * nx + xi) * ny + yi] = field(
+                            cx * 16 + xi as i32 * cell_w,
+                            min_y + yi as i32 * cell_h,
+                            cz * 16 + zi as i32 * cell_w,
+                        );
+                    }
+                }
+            }
+            for z in cz * 16..(cz + 1) * 16 {
+                for x in cx * 16..(cx + 1) * 16 {
+                    for y in min_y..min_y + world_height {
+                        assert_eq!(
+                            trilinear(&grid, &columns, x, y, z).to_bits(),
+                            field(x, y, z).to_bits(),
+                            "cell {cell_w}x{cell_h}: {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn end_features_match_native_full_feature_chunks() {
+        compare_end_features(
+            -116,
+            1262,
+            "minecraft:end_stone",
+            include_bytes!("../tests/data/end_small_features_1211.bin.gz"),
+            include_str!("../tests/data/end_small_features_1211.order.tsv"),
+        );
+        compare_end_features(
+            128,
+            -128,
+            "minecraft:chorus_plant",
+            include_bytes!("../tests/data/end_highlands_features_1211.bin.gz"),
+            include_str!("../tests/data/end_highlands_features_1211.order.tsv"),
+        );
+    }
+
+    fn compare_end_features(
+        cx0: i32,
+        cz0: i32,
+        positive_name: &str,
+        compressed: &[u8],
+        order: &str,
+    ) {
+        use std::io::Read;
+        let mut expected = Vec::new();
+        flate2::read::GzDecoder::new(compressed)
+            .read_to_end(&mut expected)
+            .unwrap();
+        assert_eq!(expected.len(), 9 * 32768 * 4);
+        let mut g = Gen::load_preset(0, crate::name_to_state, NoisePreset::End).unwrap();
+        let order = order.lines().map(|line| {
+            let (x, z) = line.split_once('\t').unwrap();
+            (x.parse().unwrap(), z.parse().unwrap())
+        });
+        assert_eq!(g.populate_in_order(order, crate::feature::populate), 25);
+        let mut states = expected.as_chunks::<4>().0.iter();
+        let mut positive_features = 0;
+        for cz in cz0..cz0 + 3 {
+            for cx in cx0..cx0 + 3 {
+                for y in 0..128 {
+                    for z in cz * 16..(cz + 1) * 16 {
+                        for x in cx * 16..(cx + 1) * 16 {
+                            let want = u32::from_le_bytes(*states.next().unwrap());
+                            let got = g.block_state_at(x, y, z, |_, _, _| {});
+                            assert_eq!(got, want, "native End features: {x},{y},{z}");
+                            positive_features += usize::from(
+                                g.feature_override(x, y, z)
+                                    .is_some_and(|s| breg().unwrap().name_of(s) == positive_name),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(states.next().is_none());
+        assert!(positive_features > 0, "positive decorated cells required");
+    }
+
+    #[test]
+    fn nether_carvers_match_all_native_fixture_states() {
+        use std::io::Read;
+        let mut expected = Vec::new();
+        flate2::read::GzDecoder::new(
+            include_bytes!("../tests/data/nether_carvers_1211.bin.gz").as_slice(),
+        )
+        .read_to_end(&mut expected)
+        .unwrap();
+        assert_eq!(expected.len(), 9 * 32768 * 4);
+        let mut g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Nether).unwrap();
+        for cz in 0..3 {
+            for cx in 0..3 {
+                crate::feature::apply_carvers(&mut g, cx, cz);
+            }
+        }
+        let mut states = expected.as_chunks::<4>().0.iter();
+        let mut cave_air = 0;
+        for cz in 0..3 {
+            for cx in 0..3 {
+                for y in 0..128 {
+                    for z in cz * 16..(cz + 1) * 16 {
+                        for x in cx * 16..(cx + 1) * 16 {
+                            let want = u32::from_le_bytes(*states.next().unwrap());
+                            let got = g.block_state_at(x, y, z, |_, _, _| {});
+                            assert_eq!(got, want, "native Nether carvers: {x},{y},{z}");
+                            cave_air +=
+                                usize::from(breg().unwrap().name_of(got) == "minecraft:cave_air");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(states.next().is_none());
+        assert!(cave_air > 0, "positive carved cells required");
+    }
+
+    #[test]
+    fn dimension_terrain_matches_all_native_fixture_states() {
+        use std::io::Read;
+        type TerrainCase = (NoisePreset, u64, i32, i32, i32, &'static [u8]);
+        let cases: &[TerrainCase] = &[
+            (
+                NoisePreset::End,
+                0,
+                0,
+                0,
+                1,
+                include_bytes!("../tests/data/dimension_terrain_1211/0-end.bin.gz"),
+            ),
+            (
+                NoisePreset::End,
+                u64::MAX,
+                100,
+                -103,
+                3,
+                include_bytes!("../tests/data/dimension_terrain_1211/1-end.bin.gz"),
+            ),
+            (
+                NoisePreset::Nether,
+                0,
+                0,
+                0,
+                1,
+                include_bytes!("../tests/data/dimension_terrain_1211/2-nether.bin.gz"),
+            ),
+            (
+                NoisePreset::Nether,
+                u64::MAX,
+                -65,
+                32,
+                3,
+                include_bytes!("../tests/data/dimension_terrain_1211/3-nether.bin.gz"),
+            ),
+        ];
+        let mut compared = 0;
+        for &(preset, seed, cx, cz, n, bytes) in cases {
+            let mut expected = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut expected)
+                .unwrap();
+            assert_eq!(expected.len(), (n * n * 128 * 256 * 4) as usize);
+            let mut g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            assert_eq!((g.min_y, g.height), (0, 128));
+            let mut states = expected.as_chunks::<4>().0.iter();
+            for dz in 0..n {
+                for dx in 0..n {
+                    let columns = g.cols(cx + dx, cz + dz).unwrap();
+                    for y in 0..128 {
+                        for z in (cz + dz) * 16..(cz + dz + 1) * 16 {
+                            for x in (cx + dx) * 16..(cx + dx + 1) * 16 {
+                                let want = u32::from_le_bytes(*states.next().unwrap());
+                                assert_eq!(
+                                    g.terrain_cell(&columns, x, y, z),
+                                    want,
+                                    "{preset:?} seed={seed} at {x},{y},{z}"
+                                );
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(states.next().is_none());
+        }
+        assert_eq!(compared, 655_360);
+    }
+
+    #[test]
+    fn nether_cave_surfaces_and_lava_match_native_negative_seed() {
+        let mut g = Gen::load_preset(u64::MAX, crate::name_to_state, NoisePreset::Nether).unwrap();
+        assert_eq!(g.def_fl, crate::name_to_state("minecraft:lava").unwrap());
+        assert!(g.aq.is_none());
+        for (y, name) in [(27, "minecraft:soul_sand"), (30, "minecraft:lava")] {
+            assert_eq!(
+                g.terrain_state(-995, y, 512),
+                crate::name_to_state(name).unwrap(),
+                "native cell -995,{y},512"
+            );
+        }
+    }
+
+    #[test]
+    fn nether_surface_depth_and_named_random_match_native() {
+        let mut current = None;
+        let mut generator = None;
+        for row in include_str!("../tests/data/nether_surface_1211.tsv").lines() {
+            let p: Vec<_> = row.split('\t').collect();
+            let seed = parse_world_seed(p[0]).unwrap();
+            if current != Some(seed) {
+                generator = Some(
+                    Gen::load_preset(seed, crate::name_to_state, NoisePreset::Nether).unwrap(),
+                );
+                current = Some(seed);
+            }
+            let x = p[1].parse().unwrap();
+            let z = p[2].parse().unwrap();
+            assert_eq!(
+                generator.as_ref().unwrap().run_depth(x, z),
+                p[3].parse::<i32>().unwrap(),
+                "{row}"
+            );
+            let factory = legacy_named_factory_seed(seed, p[4]);
+            let y = p[5].parse().unwrap();
+            let value = Lcg::new(factory ^ hash_block_pos(x, y, z) as u64).next_f32();
+            assert_eq!(
+                value.to_bits(),
+                u32::from_str_radix(p[6], 16).unwrap(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn nether_biome_source_matches_native_nether_random_state() {
+        let mut current = None;
+        let mut generator = None;
+        let mut names = std::collections::BTreeSet::new();
+        for row in include_str!("../tests/data/nether_biome_1211.tsv").lines() {
+            let p: Vec<_> = row.split('\t').collect();
+            let seed = parse_world_seed(p[0]).unwrap();
+            if current != Some(seed) {
+                generator = Some(
+                    Gen::load_preset(seed, crate::name_to_state, NoisePreset::Nether)
+                        .expect("Nether datapack"),
+                );
+                current = Some(seed);
+            }
+            let g = generator.as_mut().unwrap();
+            let (_, leaf) = g
+                .biome_quart(
+                    p[1].parse().unwrap(),
+                    p[2].parse().unwrap(),
+                    p[3].parse().unwrap(),
+                    None,
+                )
+                .expect("Nether biome");
+            let name = &g.biome_names[usize::from(leaf)];
+            assert_eq!(name, p[4], "{row}");
+            names.insert(name.clone());
+        }
+        assert_eq!(names.len(), 5);
+    }
+
+    #[test]
+    fn signed_world_seed_preserves_java_long_bits() {
+        assert_eq!(parse_world_seed("-1").unwrap(), u64::MAX);
+        assert_eq!(parse_world_seed("-9223372036854775808").unwrap(), 1 << 63);
+        assert_eq!(parse_world_seed("18446744073709551615").unwrap(), u64::MAX);
+        assert!(parse_world_seed("unknown").is_err());
+    }
+
+    #[test]
+    fn end_biome_source_matches_native_end_random_state() {
+        let mut current = None;
+        let mut generator = None;
+        let mut names = std::collections::BTreeSet::new();
+        let mut count = 0;
+        for row in include_str!("../tests/data/end_biome_1211.tsv").lines() {
+            let f: Vec<_> = row.split('\t').collect();
+            assert_eq!(f.len(), 5);
+            let seed = f[0].parse::<i64>().unwrap() as u64;
+            if current != Some(seed) {
+                generator = Some(
+                    Gen::load_preset(seed, crate::name_to_state, NoisePreset::End)
+                        .expect("End datapack"),
+                );
+                current = Some(seed);
+            }
+            let g = generator.as_mut().unwrap();
+            let (_, leaf) = g
+                .biome_quart(
+                    f[1].parse().unwrap(),
+                    f[2].parse().unwrap(),
+                    f[3].parse().unwrap(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                g.biome_name_of_leaf(leaf).as_deref(),
+                Some(f[4]),
+                "native End biome: {row}"
+            );
+            names.insert(f[4]);
+            count += 1;
+        }
+        assert_eq!(count, 2352);
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "minecraft:the_end",
+                "minecraft:end_highlands",
+                "minecraft:end_midlands",
+                "minecraft:small_end_islands",
+                "minecraft:end_barrens"
+            ])
+        );
+    }
+
+    #[test]
+    fn end_island_density_node_uses_the_generators_seed() {
+        for seed in [0u64, 42] {
+            let mut g = Gen::load(seed, crate::name_to_state).expect("pinned datapack");
+            let config = jparse(br#"{"type":"minecraft:end_islands"}"#).unwrap();
+            let index = g.node(&config, &HashMap::new()).expect("End density node");
+            let mut checked = 0;
+            for row in include_str!("../tests/data/end_islands_1211.tsv").lines() {
+                let f: Vec<_> = row.split('\t').collect();
+                if f[0].parse::<i64>().unwrap() as u64 != seed {
+                    continue;
+                }
+                let (x, z) = (f[1].parse::<i32>().unwrap(), f[2].parse::<i32>().unwrap());
+                let actual = g.eval(index, x, 64, z, &mut HashMap::new());
+                assert_eq!(
+                    actual.to_bits(),
+                    u64::from_str_radix(f[4], 16).unwrap(),
+                    "production End density: {row}"
+                );
+                checked += 1;
+            }
+            assert_eq!(checked, 80);
+        }
+    }
 
     #[test]
     fn the_surface_material_window_stops_at_deep_solids() {

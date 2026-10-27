@@ -60,6 +60,35 @@ class StateComparison(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertIn("differing cells: 0", output)
 
+    def test_end_height_compares_the_top_section_without_overworld_padding(self):
+        count = 128 * 256
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = Path(tmp) / 'end.bin'
+            dump.write_bytes(bytes((count - 1) * 4) + struct.pack('<I', 1))
+            output = io.StringIO()
+            with patch.object(sys, 'argv', ['carver_diff.py', str(dump), tmp, '--n', '1', '--min-y', '0', '--height', '128', '--cells', '1']), patch.object(diff, 'vanilla_chunk', return_value=[0] * count) as reader, contextlib.redirect_stdout(output):
+                self.assertEqual(diff.main(), 1)
+            reader.assert_called_once()
+            self.assertEqual(reader.call_args.kwargs, {'min_y': 0, 'height': 128})
+            self.assertIn('band y=0..127', output.getvalue())
+            self.assertIn('cell 15,127,15', output.getvalue())
+
+    def test_native_end_sections_use_their_own_height(self):
+        chunk = {'Status': 'minecraft:full', 'sections': [
+            {'Y': y, 'block_states': {'palette': [{'Name': 'minecraft:end_stone'}]}}
+            for y in range(8)]}
+        with patch.object(diff, 'chunk_bytes', return_value=b''), patch.object(diff, 'parse_nbt', return_value=(chunk, 0)):
+            actual = diff.vanilla_chunk('unused', 0, 0, {('end_stone', ()): 12}, min_y=0, height=128)
+        self.assertEqual(actual, [12] * (128 * 256))
+
+    def test_extra_dump_bytes_cannot_be_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = Path(tmp) / 'dump.bin'
+            dump.write_bytes(bytes(diff.CELLS * 4 + 1))
+            with patch.object(sys, 'argv', ['carver_diff.py', str(dump), tmp, '--n', '1']):
+                with self.assertRaisesRegex(SystemExit, 'dump length'):
+                    diff.main()
+
 
 if __name__ == "__main__":
     unittest.main()

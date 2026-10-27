@@ -2,6 +2,7 @@
 // handshake -> status | login -> config (vanilla blob replay) -> play
 // (join_game + 9x9 chunks + teleport + health) -> consume loop with
 // creative block dig/place backed by a shared overlay world.
+use crate::json::{jparse, J};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -21870,6 +21871,166 @@ fn main() {
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
     if probe_args
         .first()
+        .is_some_and(|arg| arg == "--worldgen-biome")
+    {
+        assert_eq!(
+            probe_args.len(),
+            6,
+            "usage: --worldgen-biome <overworld|nether|end> <seed> <quart-x> <quart-y> <quart-z>"
+        );
+        let preset = worldgen::NoisePreset::parse(&probe_args[1])
+            .expect("implemented biome source: overworld, nether or end");
+        let seed = probe_args[2].parse::<i64>().expect("signed 64-bit seed") as u64;
+        let coordinate = |i: usize| probe_args[i].parse::<i32>().expect("quart coordinate");
+        let mut generator =
+            worldgen::Gen::load_preset(seed, name_to_state, preset).expect("load noise preset");
+        let (_, leaf) = generator
+            .biome_quart(coordinate(3), coordinate(4), coordinate(5), None)
+            .expect("sample biome");
+        println!(
+            "{}",
+            generator.biome_name_of_leaf(leaf).expect("biome identity")
+        );
+        return;
+    }
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg == "--worldgen-template")
+    {
+        assert!(
+            probe_args.len() == 2 || probe_args.len() == 4,
+            "usage: --worldgen-template <compressed-nbt-path> [mirror-index rotation-index]"
+        );
+        let bytes = std::fs::read(&probe_args[1]).expect("read compressed template");
+        let (_, root) = nbt::read_gzip(&bytes, 16 * 1024 * 1024).expect("decode template NBT");
+        let reg = block_registry::breg().expect("block registry");
+        let template = structure_template::Template::load(&root, reg).expect("load template");
+        let mirror = structure_transform::Mirror::from_index(
+            probe_args
+                .get(2)
+                .map_or(0, |s| s.parse().expect("mirror index")),
+        )
+        .expect("mirror index 0..=2");
+        let rotation = structure_transform::Rotation::from_index(
+            probe_args
+                .get(3)
+                .map_or(0, |s| s.parse().expect("rotation index")),
+        )
+        .expect("rotation index 0..=3");
+        println!(
+            "size={:?} palettes={} entities={}",
+            template.size,
+            template.palettes.len(),
+            template.entities.len()
+        );
+        let layout = template
+            .block_layout(reg)
+            .expect("serialize template layout");
+        let digest: String = generation_math::sha256(&layout)
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        println!("loaded_layout_sha256={digest}");
+        let bounds =
+            structure_transform::bounds(template.size, (0, 0, 0), (0, 0, 0), mirror, rotation);
+        println!(
+            "transformed_bounds={bounds:?} preview_blocks={}",
+            template
+                .transformed_blocks(0, mirror, rotation, (0, 0, 0), (0, 0, 0))
+                .expect("transform template blocks")
+                .len()
+        );
+        for info in &template.entities {
+            println!(
+                "entity pos={:?} block_pos={:?} nbt_type={}",
+                structure_transform::entity(info.pos, mirror, rotation, (0, 0, 0)),
+                info.block_pos,
+                info.nbt.id()
+            );
+        }
+        return;
+    }
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg == "--worldgen-structure-candidates")
+    {
+        assert_eq!(
+            probe_args.len(),
+            4,
+            "usage: --worldgen-structure-candidates <seed> <chunk-x> <chunk-z>"
+        );
+        let seed = probe_args[1].parse::<i64>().expect("signed 64-bit seed") as u64;
+        let x = probe_args[2].parse::<i32>().expect("chunk x");
+        let z = probe_args[3].parse::<i32>().expect("chunk z");
+        let mut sets: Vec<_> = worldgen::Gen::dp_files("structure_set")
+            .into_iter()
+            .collect();
+        assert!(!sets.is_empty(), "structure-set datapack unavailable");
+        sets.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, bytes) in sets {
+            let config = jparse(&bytes).expect("structure-set JSON");
+            let p = config.get("placement").expect("structure-set placement");
+            let integer = |field| match p.get(field) {
+                Some(J::Num(v))
+                    if v.fract() == 0.0 && *v >= i32::MIN as f64 && *v <= i32::MAX as f64 =>
+                {
+                    *v as i32
+                }
+                _ => panic!("invalid {field} in {name}"),
+            };
+            match p.get("type").map(J::str) {
+                Some("minecraft:random_spread") => {}
+                Some("minecraft:concentric_rings") => {
+                    let points = structure_placement::concentric_rings(
+                        seed,
+                        integer("distance"),
+                        integer("spread"),
+                        integer("count"),
+                        |_, _| None,
+                    )
+                    .expect("valid concentric rings");
+                    println!("{name}\t{points:?}\tpreferred_biome_relocation_unchecked=true\tbiome_and_pieces_unchecked=true");
+                    continue;
+                }
+                other => panic!("unsupported placement type {other:?} in {name}"),
+            }
+            let spread = match p.get("spread_type").map(J::str).unwrap_or("linear") {
+                "linear" => structure_placement::Spread::Linear,
+                "triangular" => structure_placement::Spread::Triangular,
+                other => panic!("unknown spread type {other} in {name}"),
+            };
+            let method = match p
+                .get("frequency_reduction_method")
+                .map(J::str)
+                .unwrap_or("default")
+            {
+                "default" => structure_placement::FrequencyReduction::Default,
+                "legacy_type_1" => structure_placement::FrequencyReduction::LegacyType1,
+                "legacy_type_2" => structure_placement::FrequencyReduction::LegacyType2,
+                "legacy_type_3" => structure_placement::FrequencyReduction::LegacyType3,
+                other => panic!("unknown frequency method {other} in {name}"),
+            };
+            let frequency = match p.get("frequency") {
+                None => 1.0,
+                Some(J::Num(v)) if (0.0..=1.0).contains(v) => *v as f32,
+                _ => panic!("invalid placement frequency in {name}"),
+            };
+            let salt = integer("salt");
+            let placement = structure_placement::RandomSpread::new(
+                integer("spacing"),
+                integer("separation"),
+                salt,
+                spread,
+            )
+            .expect("valid random-spread parameters");
+            let candidate = placement.candidate(seed, x, z);
+            println!("{name}\t{},{}\tfrequency={}\texclusion_unchecked={}\tbiome_and_pieces_unchecked=true", candidate.0, candidate.1,
+                method.allows(seed, salt, candidate.0, candidate.1, frequency), p.get("exclusion_zone").is_some());
+        }
+        return;
+    }
+    if probe_args
+        .first()
         .is_some_and(|arg| arg.starts_with("--fabric-probe") || arg.starts_with("--fabric-trample"))
     {
         #[cfg(feature = "fabric-probe")]
@@ -21891,9 +22052,26 @@ fn main() {
     if let Ok(n) = std::env::var("MC_SPINE_WG_PROFILE") {
         let seed: u64 = std::env::var("MC_SPINE_SEED")
             .ok()
-            .and_then(|v| v.parse().ok())
+            .map(|v| {
+                worldgen::parse_world_seed(&v)
+                    .expect("MC_SPINE_SEED must be a signed long or its unsigned bit pattern")
+            })
             .unwrap_or(0);
-        if !worldgen::init(seed, name_to_state) {
+        let preset = std::env::var("MC_SPINE_WG_PRESET").unwrap_or_else(|_| "overworld".into());
+        let preset =
+            worldgen::NoisePreset::parse(&preset).expect("implemented offline noise preset");
+        if preset != worldgen::NoisePreset::Overworld && std::env::var("MC_SPINE_NOFEAT").is_err() {
+            eprintln!("[wg] dimension decoration is not implemented; offline terrain comparison requires MC_SPINE_NOFEAT");
+            std::process::exit(2);
+        }
+        if preset != worldgen::NoisePreset::Overworld
+            && (std::env::var_os("MC_SPINE_WG_LEAF_RUNTIME_DUMP").is_some()
+                || std::env::var_os("MC_SPINE_WG_DIAG_LOAD_WORLD").is_some())
+        {
+            eprintln!("[wg] dimension-specific tick/save diagnostics are not implemented");
+            std::process::exit(2);
+        }
+        if !worldgen::init_preset(seed, name_to_state, preset) {
             eprintln!("[wg] load failed");
             return;
         }
@@ -22407,7 +22585,10 @@ fn main() {
     // datapack worldgen: seed from env (default 0), MC_SPINE_WG=old keeps flat generator
     let wg_seed: u64 = std::env::var("MC_SPINE_SEED")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .map(|v| {
+            worldgen::parse_world_seed(&v)
+                .expect("MC_SPINE_SEED must be a signed long or its unsigned bit pattern")
+        })
         .unwrap_or(0);
     if std::env::var("MC_SPINE_WG").ok().as_deref() != Some("old") {
         if worldgen::init(wg_seed, name_to_state) {
@@ -22595,6 +22776,7 @@ mod flowing_fluid;
 mod furnace_cache_tests;
 #[cfg(test)]
 mod merge_tests;
+mod nbt;
 #[cfg(test)]
 mod persistence_tests;
 #[cfg(test)]
@@ -22602,6 +22784,9 @@ mod primitives_tests;
 #[cfg(test)]
 mod registry_tests;
 mod scheduled_ticks;
+mod structure_placement;
+mod structure_template;
+mod structure_transform;
 #[cfg(test)]
 mod test_support;
 mod tick_persistence;

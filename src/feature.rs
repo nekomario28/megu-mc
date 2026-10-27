@@ -43,6 +43,9 @@ struct Pf {
 }
 
 enum Cf {
+    EndIsland,
+    ChorusPlant,
+    Glowstone,
     Ore {
         size: i32,
         discard: f32,
@@ -2163,6 +2166,9 @@ fn p_cf(j: &J) -> Option<Cf> {
         }
         "bamboo" => Cf::Bamboo(jf32(j, "probability", 0.0)),
         "vines" => Cf::Vines,
+        "end_island" => Cf::EndIsland,
+        "chorus_plant" => Cf::ChorusPlant,
+        "glowstone_blob" => Cf::Glowstone,
         "monster_room" => Cf::MonsterRoom,
         "tree" => Cf::Tree(Box::new(crate::tree::p_tree(j)?)),
         "fallen_tree" => Cf::Fallen {
@@ -2173,6 +2179,8 @@ fn p_cf(j: &J) -> Option<Cf> {
 }
 
 // ---------- feature registry + ordering ----------
+
+type FeatureOrder = Vec<Vec<(u32, String)>>;
 
 pub(crate) struct FReg {
     cfg: HashMap<String, Cf>,
@@ -2185,8 +2193,7 @@ pub(crate) struct FReg {
     // 1.21.1 `spawn_costs`: biome -> entity id -> (energy_budget, charge).
     spawn_costs: HashMap<String, HashMap<String, SpawnCost>>,
     spawn_probability: HashMap<String, f32>,
-    order: Vec<Vec<(u32, String)>>,
-    steps: usize,
+    order: HashMap<NoisePreset, FeatureOrder>,
 }
 
 /// `MobSpawnSettings.SpawnerData`: type, min/max group size, Weight value.
@@ -2204,69 +2211,6 @@ pub(crate) struct SpawnCost {
     pub energy_budget: f64,
     pub charge: f64,
 }
-
-// The biome list `FeatureSorter.buildFeaturesPerStep` receives for the overworld: the
-// noise biome source's possible biomes. It is *not* the 64-entry registry - the nether,
-// the end and `the_void` are absent - and the order matters: it seeds the per-feature
-// index that every placed feature's RNG offset is derived from. Steps whose lists differ
-// between biomes (2, 9, 10) are sensitive to it; the ore step (6) is not, because every
-// biome lists the same ores in the same order. Measured from a 1.21.1 server by logging
-// `deg.a`'s first argument (see tools/carve-agent).
-const OW_BIOMES: &[&str] = &[
-    "minecraft:mushroom_fields",
-    "minecraft:deep_frozen_ocean",
-    "minecraft:frozen_ocean",
-    "minecraft:deep_cold_ocean",
-    "minecraft:cold_ocean",
-    "minecraft:deep_ocean",
-    "minecraft:ocean",
-    "minecraft:deep_lukewarm_ocean",
-    "minecraft:lukewarm_ocean",
-    "minecraft:warm_ocean",
-    "minecraft:stony_shore",
-    "minecraft:swamp",
-    "minecraft:mangrove_swamp",
-    "minecraft:snowy_slopes",
-    "minecraft:snowy_plains",
-    "minecraft:snowy_beach",
-    "minecraft:windswept_gravelly_hills",
-    "minecraft:grove",
-    "minecraft:windswept_hills",
-    "minecraft:snowy_taiga",
-    "minecraft:windswept_forest",
-    "minecraft:taiga",
-    "minecraft:plains",
-    "minecraft:meadow",
-    "minecraft:beach",
-    "minecraft:forest",
-    "minecraft:old_growth_spruce_taiga",
-    "minecraft:flower_forest",
-    "minecraft:birch_forest",
-    "minecraft:dark_forest",
-    "minecraft:savanna_plateau",
-    "minecraft:savanna",
-    "minecraft:jungle",
-    "minecraft:badlands",
-    "minecraft:desert",
-    "minecraft:wooded_badlands",
-    "minecraft:jagged_peaks",
-    "minecraft:stony_peaks",
-    "minecraft:frozen_river",
-    "minecraft:river",
-    "minecraft:ice_spikes",
-    "minecraft:old_growth_pine_taiga",
-    "minecraft:sunflower_plains",
-    "minecraft:old_growth_birch_forest",
-    "minecraft:sparse_jungle",
-    "minecraft:bamboo_jungle",
-    "minecraft:eroded_badlands",
-    "minecraft:windswept_savanna",
-    "minecraft:cherry_grove",
-    "minecraft:frozen_peaks",
-    "minecraft:dripstone_caves",
-    "minecraft:lush_caves",
-    "minecraft:deep_dark",
-];
 
 /// Vanilla's DFS (obf `ayd.a`): post-order visit over the feature edges, neighbours in
 /// (step, featureIndex) order. A cycle is a data error, so it stops rather than recursing forever.
@@ -2336,8 +2280,7 @@ fn load_freg() -> FReg {
         spawners: HashMap::new(),
         spawn_costs: HashMap::new(),
         spawn_probability: HashMap::new(),
-        order: vec![],
-        steps: 0,
+        order: HashMap::new(),
     };
     for (name, b) in Gen::dp_files_any(&["configured_feature", "feature"]) {
         if let Some(j) = jparse(&b) {
@@ -2354,7 +2297,6 @@ fn load_freg() -> FReg {
             }
         }
     }
-    let mut max_steps = 0usize;
     for (name, b) in Gen::dp_files("biome") {
         if let Some(j) = jparse(&b) {
             if let Some(t) = jnum(&j, "temperature") {
@@ -2372,7 +2314,6 @@ fn load_freg() -> FReg {
                     steps.push(step);
                 }
             }
-            max_steps = max_steps.max(steps.len());
             // The JSON field is `creature_spawn_probability`; MobSpawnSettings
             // defaults it to 0.1 when omitted.
             let prob = jnum(&j, "creature_spawn_probability").unwrap_or(0.1);
@@ -2410,6 +2351,37 @@ fn load_freg() -> FReg {
             reg.bsteps.insert(name, steps);
         }
     }
+    let sources = jparse(include_bytes!("../assets/feature_order_1211.json"))
+        .expect("native biome-source iteration");
+    for preset in [
+        NoisePreset::Overworld,
+        NoisePreset::Nether,
+        NoisePreset::End,
+    ] {
+        let biomes: Vec<_> = sources
+            .get(preset.name())
+            .and_then(|v| jarr(v, "biomes"))
+            .expect("native possible biomes")
+            .iter()
+            .map(J::str)
+            .collect();
+        let max_steps = biomes
+            .iter()
+            .map(|name| {
+                reg.bsteps
+                    .get(*name)
+                    .expect("possible biome generation settings")
+                    .len()
+            })
+            .max()
+            .unwrap_or(0);
+        let order = sort_features(&reg, &biomes, max_steps);
+        reg.order.insert(preset, order);
+    }
+    reg
+}
+
+fn sort_features(reg: &FReg, biomes: &[&str], max_steps: usize) -> FeatureOrder {
     // Vanilla FeatureSorter.buildFeaturesPerStep (obf `deg.a`): a global first-seen index per
     // feature, cross-step edges over each biome's flattened feature list, a DFS post-order
     // reversed under a step-then-index comparator, then grouped by step. The old Kahn FIFO
@@ -2417,7 +2389,7 @@ fn load_freg() -> FReg {
     // chunk (0,0)) and every sky-spill column it touched.
     let mut fidx: HashMap<String, u32> = HashMap::new();
     let mut counter = 0u32;
-    for b in OW_BIOMES {
+    for b in biomes {
         let Some(steps) = reg.bsteps.get(*b) else {
             continue;
         };
@@ -2433,7 +2405,7 @@ fn load_freg() -> FReg {
     // A node is (step, featureIndex); the name is kept alongside for the output.
     let mut name_of: HashMap<(usize, u32), String> = HashMap::new();
     let mut edges: HashMap<(usize, u32), Vec<(usize, u32)>> = HashMap::new();
-    for b in OW_BIOMES {
+    for b in biomes {
         let Some(steps) = reg.bsteps.get(*b) else {
             continue;
         };
@@ -2474,9 +2446,7 @@ fn load_freg() -> FReg {
             }
         }
     }
-    reg.order = by_step;
-    reg.steps = max_steps;
-    reg
+    by_step
 }
 
 static FREG: std::sync::OnceLock<FReg> = std::sync::OnceLock::new();
@@ -3199,9 +3169,154 @@ fn multiface_try(
     false
 }
 
+fn chorus_state(ctx: &mut FC, pos: (i32, i32, i32)) -> u32 {
+    let reg = breg().unwrap();
+    let mut state = reg.state_of("minecraft:chorus_plant", None);
+    for (dx, dy, dz, property) in [
+        (0, -1, 0, "down"),
+        (0, 1, 0, "up"),
+        (0, 0, -1, "north"),
+        (0, 0, 1, "south"),
+        (-1, 0, 0, "west"),
+        (1, 0, 0, "east"),
+    ] {
+        let name = reg.name_of(ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz));
+        let connected = name == "minecraft:chorus_plant"
+            || name == "minecraft:chorus_flower"
+            || dy == -1 && name == "minecraft:end_stone";
+        state = reg.with_prop(state, property, if connected { "true" } else { "false" });
+    }
+    state
+}
+
+fn chorus_clear(ctx: &mut FC, pos: (i32, i32, i32), except: Option<(i32, i32)>) -> bool {
+    [(0, -1), (1, 0), (0, 1), (-1, 0)]
+        .into_iter()
+        .all(|(dx, dz)| except == Some((dx, dz)) || ctx.is_air(pos.0 + dx, pos.1, pos.2 + dz))
+}
+
+/// ChorusFlowerBlock.generatePlant's bounded recursive branch growth. The
+/// adjacent stem is refreshed after each write, as flags=2 does not notify it.
+fn grow_chorus(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    origin: (i32, i32, i32),
+    depth: i32,
+) {
+    let height = rng.next_bound(4) + 1 + i32::from(depth == 0);
+    for dy in 1..=height {
+        let next = (pos.0, pos.1 + dy, pos.2);
+        if !chorus_clear(ctx, next, None) {
+            return;
+        }
+        let state = chorus_state(ctx, next);
+        ctx.set(next.0, next.1, next.2, state);
+        let below = (next.0, next.1 - 1, next.2);
+        let state = chorus_state(ctx, below);
+        ctx.set(below.0, below.1, below.2, state);
+    }
+    let mut branched = false;
+    if depth < 4 {
+        let branches = rng.next_bound(4) + i32::from(depth == 0);
+        for _ in 0..branches {
+            let (dx, dz) = [(0, -1), (1, 0), (0, 1), (-1, 0)][rng.next_bound(4) as usize];
+            let next = (pos.0 + dx, pos.1 + height, pos.2 + dz);
+            if (next.0 - origin.0).abs() < 8
+                && (next.2 - origin.2).abs() < 8
+                && ctx.is_air(next.0, next.1, next.2)
+                && ctx.is_air(next.0, next.1 - 1, next.2)
+                && chorus_clear(ctx, next, Some((-dx, -dz)))
+            {
+                branched = true;
+                let state = chorus_state(ctx, next);
+                ctx.set(next.0, next.1, next.2, state);
+                let parent = (next.0 - dx, next.1, next.2 - dz);
+                let state = chorus_state(ctx, parent);
+                ctx.set(parent.0, parent.1, parent.2, state);
+                grow_chorus(ctx, rng, next, origin, depth + 1);
+            }
+        }
+    }
+    if !branched {
+        let reg = breg().unwrap();
+        let flower = reg.with_prop(reg.state_of("minecraft:chorus_flower", None), "age", "5");
+        ctx.set(pos.0, pos.1 + height, pos.2, flower);
+    }
+}
+
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::Glowstone => {
+            let Some(reg) = breg() else { return };
+            if !ctx.is_air(pos.0, pos.1, pos.2) {
+                return;
+            }
+            let above = reg.name_of(ctx.get(pos.0, pos.1 + 1, pos.2));
+            if !matches!(
+                above,
+                "minecraft:netherrack" | "minecraft:basalt" | "minecraft:blackstone"
+            ) {
+                return;
+            }
+            let state = reg.state_of("minecraft:glowstone", None);
+            ctx.set(pos.0, pos.1, pos.2, state);
+            for _ in 0..1500 {
+                let x = pos.0 + rng.next_bound(8) - rng.next_bound(8);
+                let y = pos.1 - rng.next_bound(12);
+                let z = pos.2 + rng.next_bound(8) - rng.next_bound(8);
+                if !ctx.is_air(x, y, z) {
+                    continue;
+                }
+                let mut adjacent = 0;
+                for (dx, dy, dz) in [
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                    (-1, 0, 0),
+                    (1, 0, 0),
+                ] {
+                    if ctx.get(x + dx, y + dy, z + dz) == state {
+                        adjacent += 1;
+                    }
+                    if adjacent > 1 {
+                        break;
+                    }
+                }
+                if adjacent == 1 {
+                    ctx.set(x, y, z, state);
+                }
+            }
+        }
+        Cf::ChorusPlant => {
+            let Some(reg) = breg() else { return };
+            if ctx.is_air(pos.0, pos.1, pos.2)
+                && reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)) == "minecraft:end_stone"
+            {
+                let state = chorus_state(ctx, pos);
+                ctx.set(pos.0, pos.1, pos.2, state);
+                grow_chorus(ctx, rng, pos, pos, 0);
+            }
+        }
+        Cf::EndIsland => {
+            let Some(reg) = breg() else { return };
+            let state = reg.state_of("minecraft:end_stone", None);
+            let mut radius = rng.next_bound(3) as f32 + 4.0;
+            let mut dy = 0;
+            while radius > 0.5 {
+                for dx in (-radius).floor() as i32..=radius.ceil() as i32 {
+                    for dz in (-radius).floor() as i32..=radius.ceil() as i32 {
+                        if (dx * dx + dz * dz) as f32 <= (radius + 1.0) * (radius + 1.0) {
+                            ctx.set(pos.0 + dx, pos.1 + dy, pos.2 + dz, state);
+                        }
+                    }
+                }
+                radius -= rng.next_bound(2) as f32 + 0.5;
+                dy -= 1;
+            }
+        }
         Cf::Iceberg { state } => gen_iceberg(ctx, rng, pos, *state),
         Cf::DripstoneCluster(cfg) => gen_dripstone_cluster(ctx, rng, pos, cfg),
         Cf::LargeDripstone(cfg) => gen_large_dripstone(ctx, rng, pos, cfg),
@@ -4409,6 +4524,7 @@ const TAU: f32 = 6.283_185_5;
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CKind {
     Cave,
+    NetherCave,
     Canyon,
 }
 
@@ -4425,7 +4541,7 @@ impl Anchor {
         match self {
             Anchor::Abs(v) => v,
             Anchor::AboveBottom(v) => min_y + v,
-            Anchor::BelowTop(v) => min_y + height - v,
+            Anchor::BelowTop(v) => min_y + height - 1 - v,
         }
     }
 }
@@ -4624,6 +4740,7 @@ fn p_carver(j: &J) -> Option<CarverDef> {
     let ty = jstr(j, "type")?;
     let kind = match ty.rsplit(':').next().unwrap_or(&ty) {
         "cave" => CKind::Cave,
+        "nether_cave" => CKind::NetherCave,
         "canyon" => CKind::Canyon,
         _ => return None,
     };
@@ -4839,7 +4956,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
                 }
                 run.mark = None;
                 match c.kind {
-                    CKind::Cave => run.cave(g, &cc, c, &mut r, ox, oz),
+                    CKind::Cave | CKind::NetherCave => run.cave(g, &cc, c, &mut r, ox, oz),
                     CKind::Canyon => run.canyon(g, &cc, c, &mut r, ox, oz),
                 }
                 if let Some(spec) = env_str!("CARVE_SRC") {
@@ -4888,7 +5005,7 @@ impl CarveRun {
     /// `CaveWorldCarver.carve`.
     fn cave(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, r: &mut Lcg, ox: i32, oz: i32) {
         // nextInt(nextInt(nextInt(getRange()) + 1) + 1); getRange() is 15 here
-        let inner = r.next_bound(15);
+        let inner = r.next_bound(if c.kind == CKind::NetherCave { 10 } else { 15 });
         let mid = r.next_bound(inner + 1);
         let tunnels = r.next_bound(mid + 1);
         if env_flag!("CV_TRACE") {
@@ -4917,7 +5034,11 @@ impl CarveRun {
             for _ in 0..branches {
                 let yaw = r.next_f32() * TAU;
                 let pitch = (r.next_f32() - 0.5) / 4.0;
-                let y_scale = cave_rng_y_scale(r);
+                let y_scale = if c.kind == CKind::NetherCave {
+                    (r.next_f32() * 2.0 + r.next_f32()) * 2.0
+                } else {
+                    cave_rng_y_scale(r)
+                };
                 // a tunnel is up to CARVE_STEPS long, minus up to a quarter
                 let count = CARVE_STEPS - r.next_bound(CARVE_STEPS / 4);
                 let seed = r.next_i64() as u64;
@@ -4932,7 +5053,25 @@ impl CarveRun {
                     }
                 }
                 self.tunnel(
-                    g, cc, c, seed, x, y, z, hrm, vrm, y_scale, yaw, pitch, 0, count, 1.0,
+                    g,
+                    cc,
+                    c,
+                    seed,
+                    x,
+                    y,
+                    z,
+                    hrm,
+                    vrm,
+                    y_scale,
+                    yaw,
+                    pitch,
+                    0,
+                    count,
+                    if c.kind == CKind::NetherCave {
+                        5.0
+                    } else {
+                        1.0
+                    },
                 );
             }
         }
@@ -5261,7 +5400,13 @@ impl CarveRun {
             return false;
         }
         let lava_level = c.lava.resolve(self.min_y, self.height);
-        let probed = if self.probe {
+        let probed = if c.kind == CKind::NetherCave {
+            Some(if y <= self.min_y + 31 {
+                self.probe_lava
+            } else {
+                self.probe_air
+            })
+        } else if self.probe {
             let lava = self.probe_lava;
             Some(if y <= lava_level {
                 lava
@@ -5395,7 +5540,8 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         return;
     }
     let fr = freg();
-    if fr.steps == 0 || breg().is_none() {
+    let order = fr.order.get(&g.preset).expect("dimension feature order");
+    if order.is_empty() || breg().is_none() {
         return;
     }
     // biomes of the 3x3 neighborhood (chunk center at y=0, quart sample)
@@ -5419,7 +5565,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     }
     if let Some(spec) = env_str!("FEAT_LIST") {
         if let Ok(st) = spec.parse::<usize>() {
-            if let Some(l) = fr.order.get(st) {
+            if let Some(l) = order.get(st) {
                 for (gi, name) in l.iter() {
                     eprintln!("FEATLIST {st} {gi} {name}");
                 }
@@ -5431,8 +5577,8 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     let mut ctx = FC::new(g);
     let trace = env_flag!("FEAT_TRACE");
     let profile = env_flag!("FEAT_PROFILE");
-    for step in 0..fr.steps {
-        for (gi, name) in &fr.order[step] {
+    for (step, entries) in order.iter().enumerate() {
+        for (gi, name) in entries {
             let present = biomes.iter().any(|b| {
                 fr.bsteps
                     .get(b)

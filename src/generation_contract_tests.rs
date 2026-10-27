@@ -11,6 +11,196 @@ fn context(g: &mut Gen) -> FC<'_> {
 }
 
 #[test]
+fn glowstone_matches_native_cells_and_rng() {
+    let reg = breg().unwrap();
+    let cf = super::p_cf(&jparse(br#"{"type":"minecraft:glowstone_blob","config":{}}"#).unwrap())
+        .unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let netherrack = reg.state_of("minecraft:netherrack", None);
+    let basalt = reg.state_of("minecraft:basalt", None);
+    let blackstone = reg.state_of("minecraft:blackstone", None);
+    for row in include_str!("../tests/data/glowstone_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let seed = p[1].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -8i32..=8 {
+            for z in -8i32..=8 {
+                for dy in -12..=1 {
+                    let state = if scene == 4 && (x, dy, z) == (0, 0, 0) {
+                        stone
+                    } else if dy == 1 && scene != 5 {
+                        match scene {
+                            1 => basalt,
+                            2 => blackstone,
+                            3 => stone,
+                            _ => netherrack,
+                        }
+                    } else if scene == 6 && dy < 0 && (x + z).rem_euclid(3) == 0 {
+                        netherrack
+                    } else {
+                        0
+                    };
+                    g.feat_write(x, 64 + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[2].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        let mut cells = Vec::new();
+        for (&(x, y, z), &state) in &ctx.wr {
+            assert_eq!(reg.name_of(state), "minecraft:glowstone");
+            cells.push(format!("{x},{},{z}\n", y - 64));
+        }
+        cells.sort();
+        let digest: String = crate::generation_math::md5(cells.concat().as_bytes())
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        assert_eq!(digest, p[5], "{row}");
+        assert_eq!(rng.next_i64(), p[4].parse::<i64>().unwrap(), "{row}");
+    }
+}
+
+#[test]
+fn chorus_plant_matches_native_cells_states_and_rng() {
+    let reg = breg().unwrap();
+    let cf =
+        super::p_cf(&jparse(br#"{"type":"minecraft:chorus_plant","config":{}}"#).unwrap()).unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let end_stone = reg.state_of("minecraft:end_stone", None);
+    for row in include_str!("../tests/data/chorus_plant_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let scene = p[0].parse::<i32>().unwrap();
+        let seed = p[1].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -10i32..=10 {
+            for z in -10i32..=10 {
+                for dy in -4..=36 {
+                    let obstacle = scene == 1 && x.abs() + z.abs() == 2 && (2..=8).contains(&dy)
+                        || scene == 3 && (x, dy, z) == (0, 0, 0)
+                        || scene == 5 && dy == 4 && x.abs() + z.abs() <= 5;
+                    let state = if obstacle {
+                        stone
+                    } else if dy < 0 && (scene != 4 || x == 0 && z == 0) {
+                        if scene == 2 {
+                            stone
+                        } else {
+                            end_stone
+                        }
+                    } else {
+                        0
+                    };
+                    g.feat_write(x, 64 + dy, z, state);
+                }
+            }
+        }
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        assert_eq!(!ctx.wr.is_empty(), p[2].parse::<bool>().unwrap(), "{row}");
+        assert_eq!(ctx.wr.len(), p[3].parse::<usize>().unwrap(), "{row}");
+        let mut cells = Vec::new();
+        for (&(x, y, z), &state) in &ctx.wr {
+            let value = match reg.name_of(state) {
+                "minecraft:chorus_plant" => {
+                    let mut mask = 0;
+                    for (i, name) in ["down", "up", "north", "south", "west", "east"]
+                        .iter()
+                        .enumerate()
+                    {
+                        if reg.get_prop(state, name).as_deref() == Some("true") {
+                            mask |= 1 << i;
+                        }
+                    }
+                    format!("plant:{mask}")
+                }
+                "minecraft:chorus_flower" => {
+                    assert_eq!(reg.get_prop(state, "age").as_deref(), Some("5"));
+                    "flower:5".to_string()
+                }
+                name => panic!("unexpected chorus state {name}"),
+            };
+            cells.push(format!("{x},{},{z}:{value}\n", y - 64));
+        }
+        cells.sort();
+        let digest: String = crate::generation_math::md5(cells.concat().as_bytes())
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        assert_eq!(digest, p[5], "{row}");
+        assert_eq!(rng.next_i64(), p[4].parse::<i64>().unwrap(), "{row}");
+    }
+}
+
+#[test]
+fn each_dimension_feature_order_matches_native_sorter_indices() {
+    let native = jparse(include_bytes!("../assets/feature_order_1211.json")).unwrap();
+    for preset in [
+        crate::worldgen::NoisePreset::Overworld,
+        crate::worldgen::NoisePreset::Nether,
+        crate::worldgen::NoisePreset::End,
+    ] {
+        let expected = native
+            .get(preset.name())
+            .unwrap()
+            .get("steps")
+            .unwrap()
+            .as_arr()
+            .unwrap();
+        let actual = freg().order.get(&preset).unwrap();
+        assert_eq!(actual.len(), expected.len(), "{preset:?}");
+        for (step, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let expected = expected.as_arr().unwrap();
+            assert_eq!(actual.len(), expected.len(), "{preset:?} step {step}");
+            for (index, ((slot, name), native)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(*slot as usize, index, "{preset:?} step {step}");
+                assert_eq!(name, native.str(), "{preset:?} step {step} index {index}");
+            }
+        }
+    }
+}
+
+#[test]
+fn end_island_feature_matches_native_writes_and_rng() {
+    let reg = breg().unwrap();
+    let cf =
+        super::p_cf(&jparse(br#"{"type":"minecraft:end_island","config":{}}"#).unwrap()).unwrap();
+    for row in include_str!("../tests/data/end_island_feature_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        let seed = p[0].parse::<i64>().unwrap() as u64;
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = context(&mut g);
+        let mut rng = Xor::seed_worldgen(seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+        assert_eq!(p[1], "true");
+        assert_eq!(ctx.wr.len(), p[2].parse::<usize>().unwrap(), "{row}");
+        let mut cells = Vec::new();
+        for (&(x, y, z), &state) in &ctx.wr {
+            assert_eq!(reg.name_of(state), "minecraft:end_stone");
+            cells.push(format!("{x},{},{z}\n", y - 64));
+        }
+        cells.sort();
+        let digest: String = crate::generation_math::md5(cells.concat().as_bytes())
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        assert_eq!(digest, p[4], "{row}");
+        assert_eq!(rng.next_i64(), p[3].parse::<i64>().unwrap(), "{row}");
+    }
+}
+
+#[test]
+fn carver_below_top_anchor_is_relative_to_the_last_block() {
+    // VerticalAnchor.BelowTop.resolveY: genDepth - 1 + minGenY - value.
+    assert_eq!(super::Anchor::BelowTop(1).resolve(0, 128), 126);
+    assert_eq!(super::Anchor::BelowTop(0).resolve(-64, 384), 319);
+}
+
+#[test]
 fn a_chunk_claims_its_carver_pass_once() {
     let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
     assert!(g.begin_carve(1, 2), "the first pass is claimed");

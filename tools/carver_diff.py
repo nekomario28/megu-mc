@@ -73,21 +73,24 @@ def load_states():
     return table
 
 
-def vanilla_chunk(world, cx, cz, table):
+def vanilla_chunk(world, cx, cz, table, min_y=MIN_Y, height=HEIGHT):
     """State ids for one chunk, or None when the world never finished generating it.
 
     A saved world holds partially generated chunks (`Status: minecraft:biomes`)
     wherever a client asked for terrain the server did not finish; comparing
     against those would report the whole chunk as missing terrain.
     """
+    if height <= 0 or height % 16 or min_y % 16:
+        raise ValueError('chunk height must be positive and section aligned')
+    sections = height // 16
     chunk, _ = parse_nbt(chunk_bytes(world, cx, cz))
     if chunk.get("Status") not in ("minecraft:full", "full"):
         return None
-    out = [-1] * CELLS
+    out = [-1] * (sections * 4096)
     for s in chunk.get("sections", []):
-        idx = s.get("Y", 0) - MIN_Y // 16
+        idx = s.get("Y", 0) - min_y // 16
         bs = s.get("block_states")
-        if not (0 <= idx < SECTIONS) or not bs:
+        if not (0 <= idx < sections) or not bs:
             continue  # a section without block_states is all air
         palette = bs.get("palette", [])
         if not palette:
@@ -113,13 +116,22 @@ def main():
         raise SystemExit(__doc__)
     dump, world = sys.argv[1], sys.argv[2]
     n, x0, z0 = 6, 0, 0
+    min_y, height = MIN_Y, HEIGHT
+    if '--min-y' in sys.argv:
+        min_y = int(sys.argv[sys.argv.index('--min-y') + 1])
+    if '--height' in sys.argv:
+        height = int(sys.argv[sys.argv.index('--height') + 1])
+    if height <= 0 or height % 16 or min_y % 16:
+        raise SystemExit('height must be positive and section aligned')
+    sections = height // 16
+    cell_count = sections * 4096
     if "--n" in sys.argv:
         n = int(sys.argv[sys.argv.index("--n") + 1])
     if "--x0" in sys.argv:
         x0 = int(sys.argv[sys.argv.index("--x0") + 1])
     if "--z0" in sys.argv:
         z0 = int(sys.argv[sys.argv.index("--z0") + 1])
-    band = (MIN_Y, MIN_Y + HEIGHT)
+    band = (min_y, min_y + height)
     compared = 0
     detail = []
     if "--cells" in sys.argv:
@@ -131,6 +143,8 @@ def main():
         lo, hi = sys.argv[sys.argv.index("--y") + 1].split(":")
         band = (int(lo), int(hi))
     raw = Path(dump).read_bytes()
+    if len(raw) != n * n * cell_count * 4:
+        raise SystemExit('dump length does not match the requested region and dimension height')
     table = load_states()
     total = 0
     per_chunk = {}
@@ -141,18 +155,18 @@ def main():
     for dz in range(n):
         for dx in range(n):
             (cx, cz) = (x0 + dx, z0 + dz)
-            cells = raw[(dz * n + dx) * CELLS * 4:(dz * n + dx + 1) * CELLS * 4]
-            if len(cells) != CELLS * 4:
+            cells = raw[(dz * n + dx) * cell_count * 4:(dz * n + dx + 1) * cell_count * 4]
+            if len(cells) != cell_count * 4:
                 raise SystemExit(f"dump too short at chunk {cx},{cz}")
-            got = [int.from_bytes(cells[i * 4:i * 4 + 4], "little") for i in range(CELLS)]
-            want = vanilla_chunk(world, cx, cz, table)
+            got = [int.from_bytes(cells[i * 4:i * 4 + 4], "little") for i in range(cell_count)]
+            want = vanilla_chunk(world, cx, cz, table, min_y=min_y, height=height)
             if want is None:
                 skipped.append((cx, cz))
                 continue
             compared += 1
             diff = 0
-            for sec in range(SECTIONS):
-                y0 = MIN_Y + sec * 16
+            for sec in range(sections):
+                y0 = min_y + sec * 16
                 if y0 + 16 <= band[0] or y0 >= band[1]:
                     continue
                 for i in range(4096):

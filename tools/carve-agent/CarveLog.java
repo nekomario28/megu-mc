@@ -160,7 +160,7 @@ public class CarveLog {
 
     /** Decoration order: chunk coordinates as applyBiomeDecoration is entered. */
     public static void decoOrder(int x, int z) {
-        if (System.getProperty("decoorder") == null) return;
+        if (System.getProperty("decoorder") == null || !overworld()) return;
         System.out.println("DECO " + x + " " + z);
     }
 
@@ -314,7 +314,7 @@ public class CarveLog {
         } catch (ReflectiveOperationException e) { throw new IllegalStateException("tick trace failed",e); }
     }
     public static void runtimeCell(int x,int y,int z,int state,int minY,boolean wrote) {
-        if(minY != -64 || (!RUNTIME_CELLS.contains(x+","+y+","+z) && !inside(RUNTIME_BOX,x,y,z))) return;
+        if(minY != Integer.parseInt(System.getProperty("dim", "-64")) || (!RUNTIME_CELLS.contains(x+","+y+","+z) && !inside(RUNTIME_BOX,x,y,z))) return;
         String stack=java.util.Arrays.stream(Thread.currentThread().getStackTrace())
             .skip(2).limit(8).map(StackTraceElement::toString).collect(java.util.stream.Collectors.joining(" | "));
         System.out.println("RUNTIME "+x+" "+y+" "+z+" state="+state+" wrote="+wrote+" stack="+stack);

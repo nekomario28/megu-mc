@@ -16,10 +16,12 @@
       "tick_queue",
       "flowing_fluid",
       "scheduled_ticks",
+      "structure_placement",
       "landing_types"
     ],
     [
-      "feature"
+      "feature",
+      "structure_template"
     ],
     [
       "tree"
@@ -37,7 +39,9 @@
     [
       "json",
       "generation_math",
-      "generation_leaf_queue"
+      "generation_leaf_queue",
+      "nbt",
+      "structure_transform"
     ],
     [
       "ingress_guard",
@@ -64,6 +68,14 @@
     ]
   ],
   "allowed_edges": [
+    ["main", "structure_transform"],
+    ["structure_template", "structure_transform"],
+    ["main", "structure_template"],
+    ["main", "nbt"],
+    ["structure_template", "nbt"],
+    ["structure_template", "block_registry"],
+    ["main", "structure_placement"],
+    ["structure_placement", "generation_math"],
     ["main", "tick_persistence"],
     ["main", "flowing_fluid"],
     ["main", "scheduled_ticks"],

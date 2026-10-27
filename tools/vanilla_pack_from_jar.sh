@@ -89,4 +89,5 @@ cp -r "$work/data/minecraft/worldgen" "$DEST/data/minecraft/worldgen"
 mkdir -p "$DEST/data/minecraft/tags"
 cp -r "$work/data/minecraft/tags/block" "$DEST/data/minecraft/tags/block"
 cp "$work/multi_noise_biome_tree.json" "$DEST/multi_noise_biome_tree.json"
+python3 "$ROOT/tools/vanilla_structure_assets.py" --jar "$JAR" --output "$DEST" --write
 echo "vanilla pack: installed into $DEST"

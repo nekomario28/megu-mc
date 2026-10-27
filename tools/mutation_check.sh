@@ -1005,6 +1005,11 @@ check "surface scan keeps stone depth above the column" \
   '                    sda += 0;' \
   surface_build_scan_matches_the_pinned_classes_on_synthetic_columns
 
+check "End decoration selects its own source feature indices" \
+  src/feature.rs '    let order = fr.order.get(&g.preset).expect("dimension feature order");' \
+  '    let order = fr.order.get(&NoisePreset::Overworld).expect("dimension feature order");' \
+  worldgen::wg_tests::end_features_match_native_full_feature_chunks
+
 check "feature context reads carver overrides" \
   src/generation_context.rs '        if let Some(st) = self.g.feature_override(x, y, z) {' \
   '        if let Some(st) = Option::<u32>::None {' \

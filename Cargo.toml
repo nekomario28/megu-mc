@@ -13,6 +13,7 @@ fabric-probe = ["java-compat"]
 neoforge-events = ["java-compat"]
 
 [dependencies]
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
 signal-hook = "0.4.4"
 ureq = { version = "3.4.2", features = ["rustls"] }

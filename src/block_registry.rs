@@ -202,7 +202,7 @@ impl BReg {
                 pb_by_name.insert(old.to_string(), b);
             }
         }
-        let n_states_max = md
+        let state_count = md
             .iter()
             .filter_map(|b| jnum(b, "maxStateId"))
             .fold(0.0, f64::max) as usize
@@ -214,19 +214,19 @@ impl BReg {
             dfl: vec![],
             st_lo: vec![],
             n_states: vec![],
-            st_blk: vec![0; n_states_max + 1],
-            st_fl: vec![0; n_states_max + 1],
-            st_side: vec![0; n_states_max + 1],
-            hardness: vec![0.6; n_states_max + 1],
+            st_blk: vec![0; state_count],
+            st_fl: vec![0; state_count],
+            st_side: vec![0; state_count],
+            hardness: vec![0.6; state_count],
             htools: vec![],
             tool_kind: vec![],
             unpaired: Vec::new(),
-            drops: vec![-1; n_states_max + 1],
-            drops_second: vec![-1; n_states_max + 1],
-            stack_size: vec![64; n_states_max + 1],
+            drops: vec![-1; state_count],
+            drops_second: vec![-1; state_count],
+            stack_size: vec![64; state_count],
             behaviour: vec![],
-            luminance: vec![0; n_states_max + 1],
-            opacity: vec![0; n_states_max + 1],
+            luminance: vec![0; state_count],
+            opacity: vec![0; state_count],
             tag: HashMap::new(),
         };
         for b in &md {
@@ -341,7 +341,7 @@ impl BReg {
             let n = (hi - lo + 1) as usize;
             for i in 0..n {
                 let st = (lo + i as u32) as usize;
-                if st > n_states_max {
+                if st >= state_count {
                     break;
                 }
                 reg.st_blk[st] = bi;
@@ -472,6 +472,35 @@ impl BReg {
             .and_then(|&b| self.bname.get(b as usize))
             .map(|s| s.as_str())
             .unwrap_or("minecraft:air")
+    }
+
+    /// Structure palettes start from the block's default state. Invalid names
+    /// or properties are errors for the template loader, not air substitutes.
+    pub(crate) fn checked_state(&self, name: &str, properties: &[(String, String)]) -> Option<u32> {
+        let bi = *self.idx.get(&ns_name(name))? as usize;
+        let mut state = self.dfl[bi];
+        for (key, value) in properties {
+            let property = self.props[bi].iter().find(|p| p.name == *key)?;
+            if !property.vals.contains(value) {
+                return None;
+            }
+            state = self.with_prop(state, key, value);
+        }
+        Some(state)
+    }
+
+    pub(crate) fn properties_of(&self, state: u32) -> Option<Vec<(String, String)>> {
+        let bi = *self.st_blk.get(state as usize)? as usize;
+        self.props[bi]
+            .iter()
+            .map(|p| Some((p.name.clone(), self.get_prop(state, &p.name)?)))
+            .collect()
+    }
+
+    pub(crate) fn is_template_solid(&self, state: u32) -> Option<bool> {
+        include_bytes!("../assets/template_solid_1211.bin")
+            .get(state as usize)
+            .map(|v| *v != 0)
     }
     /// Number of states the registry knows. Callers that walk the state space need
     /// this rather than a literal, so the extent has one owner.

@@ -2,11 +2,11 @@
 
 現在の状態は[README](README.md)、目標と合格条件は[PLAN](PLAN.md)、測定値と実行条件は各 `evidence/` を正本とします。この文書は**次に進む順序・依存関係・出口条件**を定めます。部品の実装、実クラスとの部分一致、全体合格を混同しません。
 
-## いまの判断 — 生成境界の一致からruntimeへ
+## いまの判断 — 限定fixtureのruntime一致から全worldgenへ
 
 **M2未達**は変わりません。forest `(-64,32)` の3×3・seed 0・structures=falseで、明示した25 source chunk順に通常バイナリを実行し、paused nativeの884,736セルすべてが0差になりました。leaf distanceも流体も除外していません。
 
-元のcanonical保存参照との差は1,803セルのままです。新しいnative tick有効controlはcanonicalと0差で、差の全セルに実際のruntime最終writer（LeavesBlock.tick 1,763、FlowingFluid.tick 40）があります。これは**portのruntime一致を証明しません**。正本は[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)です。
+`5b0e4a2` のcheckpointでは、portの通常game_tickで生成時との差1,803セルも再現し、700 tick後に全セル0差となりました。5 tickで保存し別プロセスで695 tick実行する経路も0差です。正本は[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)です。現在の拡張変更は別途回帰を要求します。
 
 制約:
 - source footprintだけでなく**順序も入力**。通常のlazy scanをvanilla ticket schedulerと呼ばない。
@@ -14,7 +14,7 @@
 - mainの#22 data migrationとの統合は保留。hosted CIはbillingで起動しておらず、ローカル結果と混同しない。
 - 全seed/biome/構造物の合格ではない。JVM identity-hashによるleaf tree-bin tieも明示した未対応境界に残る。
 
-**次の最小slice:** nativeのscheduled leaf/fluid tickとpending queueを切り出し、portの既存runtime ownerへ統合する。同じ生成状態・同じtick入力と時点で、元のcanonicalに対する全セル差を閉じる。生成順の再現とruntimeの再現を一つの推測修正に混ぜない。
+**現在の作業:** [全worldgen](worldgen-parity/README.md)。全64 biome、34構造物と3ディメンションへ広げ、配置候補・NBT/template・processor・jigsaw・構造物固有piece・地形/biome経路を実クラス対照で順に閉じる。部分的なhelper一致を構造物生成の受け入れにしない。
 
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
@@ -52,7 +52,7 @@ coal/chest/grassだけでなく非targetを含む3×3全体が、paused native�
 
 **出口:** 同じ明示source順で全884,736セル0差を維持する。全chunk FULL、全stateを比較し、部分比較・未実行・古いartifactを緑と扱わない。生成captureの更新はnativeの独立した証明の後だけ行う。
 
-### R1.2b 保存後のruntime境界（次）
+### R1.2b 保存後のruntime境界（限定fixtureのcheckpointあり）
 
 - Native LeavesBlock/FlowingFluidの実bodyとpending tick ownershipを調べる。
 - 既存runtime ownerへ統合し、第二の近似tick経路を増やさない。

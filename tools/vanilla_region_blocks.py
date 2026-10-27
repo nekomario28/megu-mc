@@ -15,6 +15,7 @@ vein's shape can be compared against a generator's own dump.
 """
 import os
 import sys
+import struct
 import zlib
 from collections import Counter
 
@@ -39,9 +40,9 @@ def parse_payload(buf, p, tag):
     if tag == 4:
         return int.from_bytes(buf[p:p + 8], "big", signed=True), p + 8
     if tag == 5:
-        return int.from_bytes(buf[p:p + 4], "big", signed=True) / 2.0, p + 4
+        return struct.unpack_from(">f", buf, p)[0], p + 4
     if tag == 6:
-        return int.from_bytes(buf[p:p + 8], "big", signed=True) / 2.0, p + 8
+        return struct.unpack_from(">d", buf, p)[0], p + 8
     if tag == 7:
         n = int.from_bytes(buf[p:p + 4], "big")
         return bytes(buf[p + 4:p + 4 + n]), p + 4 + n
