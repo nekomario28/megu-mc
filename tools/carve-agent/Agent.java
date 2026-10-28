@@ -1130,27 +1130,42 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
-        if ("dzz".equals(name) || "dzx".equals(name) || "dyz".equals(name) || "dzr".equals(name)
-                || "dzo".equals(name)) {
+        if ("dyn".equals(name) || "dzz".equals(name) || "dzx".equals(name) || "dyz".equals(name)
+                || "dzr".equals(name) || "dzo".equals(name)) {
             // The placement RNG's draws, logged only while a sculk patch is being placed (the
             // `armed` flag is set by the `ebq` hook). `(value, kind)` argument order so the value
             // can be DUP-ed before the call and survive the return.
             String[][] ints = {
                 // class, method, descriptor, kind
-                {"dzr", "c", "(I)I", "nextInt(bound)@dzr"},
-                {"dzo", "c", "(I)I", "nextInt(bound)@dzo"},
+                // `dyn` (BitRandomSource) is the mixin interface the legacy sources inherit their
+                // bounded/derived draws from - the placement's `nextInt(bound)` is here, which is
+                // why hooking only the concrete classes recorded `next(bits)` (the raw generator,
+                // full-range values) and missed the positions entirely.
+                {"dyn", "a", "(I)I", "nextInt(bound)@dyn"},
+                {"dyn", "f", "()I", "nextInt()@dyn"},
+                {"dyn", "h", "()Z", "nextBoolean@dyn"},
+                {"dzr", "c", "(I)I", "next(bits)@dzr"},
+                {"dzo", "c", "(I)I", "next(bits)@dzo"},
                 {"dzz", "a", "(I)I", "nextInt(bound)@dzz"},
                 {"dzz", "f", "()I", "nextInt()@dzz"},
-                {"dzx", "c", "(I)I", "nextInt(bound)@dzx"},
+                {"dzx", "c", "(I)I", "next(bits)@dzx"},
                 {"dzx", "l", "()I", "nextInt()@dzx"},
-                {"dyz", "c", "(I)I", "nextInt(bound)@dyz"},
+                {"dyz", "c", "(I)I", "next(bits)@dyz"},
             };
-            String[][] longs = {{"dzz", "g", "()J", "nextLong()@dzz"}};
-            String[][] doubles = {{"dzz", "j", "()D", "nextDouble()@dzz"}, {"dzz", "k", "()D", "gaussian@dzz"},
+            String[][] longs = {
+                {"dzz", "g", "()J", "nextLong()@dzz"},
+                {"dyn", "g", "()J", "nextLong()@dyn"},
+            };
+            String[][] doubles = {
+                {"dyn", "j", "()D", "nextDouble()@dyn"},
+                {"dzz", "j", "()D", "nextDouble()@dzz"}, {"dzz", "k", "()D", "gaussian@dzz"},
                 {"dyz", "k", "()D", "nextDouble()@dyz"},
                 {"dzr", "k", "()D", "nextDouble()@dzr"},
                 {"dzo", "k", "()D", "nextDouble()@dzo"}};
-            String[][] floats = {{"dzz", "i", "()F", "nextFloat()@dzz"}};
+            String[][] floats = {
+                {"dzz", "i", "()F", "nextFloat()@dzz"},
+                {"dyn", "i", "()F", "nextFloat()@dyn"},
+            };
             try {
                 ClassReader cr = new ClassReader(buf);
                 final int[] hooked = {0};

@@ -98,12 +98,29 @@ public class SculkLog {
     public static void place(String featureClass, int cx, int cz) {
         // Arming here (and disarming at every return of the same method) is what keeps the draw
         // trace small: only the draws made while a sculk patch is being placed are logged.
-        // Thread-local, not a single flag: placements run on many worker threads at once, and a
-        // shared flag is flipped by every other thread's `place` call (measured: sculk windows
-        // came out with 0 draws while one window collected 12932 of another thread's).
+        // Arming lives here (and `armPlacement` is the other, wider entry) because `SculkLog.patch`
+        // and the draw hooks need a window. Thread-local rather than a single flag: placements run
+        // on many worker threads at once, and a shared flag let another thread's call flip it
+        // (measured: sculk windows came out empty while one window collected 12932 draws of
+        // another thread's). NOTE: this window cannot contain the placement's *position* draws -
+        // those are made by the placement modifiers inside `PlacedFeature.placeWithBiomeCheck`,
+        // which runs before this method; arming there is the open next step (see the spec page).
         if ("edi".equals(featureClass)) ARMED.set(Boolean.TRUE); else ARMED.remove();
         if (Boolean.getBoolean("sculkquiet")) return;
         out("SPLACE " + featureClass + " " + cx + " " + cz);
+    }
+
+    /**
+     * Entry of `PlacedFeature.placeWithBiomeCheck` - the point *before* the placement modifiers.
+     *
+     * Measured why this is the right arm point: the modifiers (which draw the position) run in
+     * `PlacedFeature.placeWithBiomeCheck` -> `placeWithContext`, *before* it calls
+     * `ConfiguredFeature.place`. Arming on `ConfiguredFeature.place` produced sculk windows with
+     * no position draw in them at all (SPLACE -> SRNG -> SPATCH, nothing between), and `ebq` -
+     * which this agent originally labelled `PlacedFeature` - is `ConfiguredFeature`.
+     */
+    public static void armPlacement() {
+        ARMED.set(Boolean.TRUE);
     }
 
     /** The class of the `RandomSource` a placement was handed. */

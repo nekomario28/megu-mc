@@ -761,12 +761,26 @@ shutdown hook で flush）に切り替えた。**順序が保証された trace 
   出ているのに `dzx.c(I)I` の draw が窓に入らない理由は未解明で、**draw 列の比較はしていない**
   （比較として成立していないため主張しない）。
 
-  有力な説明（次の1手）: 窓は `ebq.placeWithBiomeCheck` の**入口**で arm しているが、**位置は
-  その入口より前に引かれている**可能性が高い。窓の中で `SPLACE` → `SRNG` → `SPATCH` が連続し、
-  間に `dzx` の draw が1本も無い（もし入口の中で引いていれば必ず出る）ため。つまり arm 点を
-  **placement modifier 側**（`PlacementModifier.getPositions` 相当）に移せば、位置の draw が
-  窓に入るはず。`dzz` の 297130 本は窓の中で別用途（spreader 等）の draw と見られる。
-  次は modifier クラスを特定して arm/disarm をそこへ移し、1 capture で検証する。
+  **原因は特定できた（推測ではなく写像と計測）**:
+
+  1. **`ebq` は `ConfiguredFeature`**（`net.minecraft.world.level.levelgen.feature.ConfiguredFeature`
+     -> ebq ✓）で、私が README と本文に書いた `PlacedFeature` は**誤り**（同 commit で訂正）。
+     `PlacedFeature` は **`eiv`** で、`eiv.b(Ldds;Lduz;Layw;Ljd;)Z` =
+     **`placeWithBiomeCheck`**、`eiv.a(...)` = `place`。
+  2. 配置位置を引く placement modifier は **`placeWithBiomeCheck` → `placeWithContext` の中**、
+     つまり `ConfiguredFeature.place`（= `ebq.a`、いま arm している場所）**より前**に走る。
+     したがって現在の窓は**定義上**位置の draw を含まない ✓（窓に `SPLACE`→`SRNG`→`SPATCH` が
+     連続し draw が1本も無い、という計測と一致）。
+  3. 旧ラベルも誤り: `dzx.c(I)I` は `next(bits)`（生の生成器、全域の値）で `nextInt(bound)` では
+     ない。legacy の有界 draw は **`dyn`（`BitRandomSource` mixin interface）** にあり、
+     フック後は `nextInt(bound)@dyn` を **313289 本**記録できている（値は小さく妥当）。
+
+  **次の1手（これで位置の draw が窓に入るはず）**: `eiv.b` の入口で `armPlacement`、
+  `IRETURN` 前に `disarm`（`SculkLog.armPlacement` は実装済み）。`ConfiguredFeature.place` の
+  窓は**残す**（パッチの origin と feature クラスの同定に必要）。そのうえで、pass (-16,112) の
+  `minecraft:sculk_patch_deep_dark`（port 側 `gi=1, step=7`）について、port の
+  `FSEED_ARM=-16,112,1,7` + `FEATURE_DRAW_LIMIT` の `DRAW` 列と native の `nextInt(bound)@dyn`
+  列を **draw 値そのもの**で突き合わせ、最初にずれる draw を出す。
 
 ## native trace の再現性（2026-10-28、2 capture で実測）
 
