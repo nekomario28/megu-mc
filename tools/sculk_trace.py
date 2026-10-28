@@ -51,6 +51,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CLASS_TABLE = ROOT / 'tests/data/feature_classes_1211.tsv'
 
 # `[21:49:44] [Worker-Main-7/INFO]: [STDOUT]: SPLACE edi ...` - a run.log line
+# the agent's own writer tags every line with its thread; the file's global order is lock
+# order, not any one thread's program order, so per-thread grouping is what makes a window readable
+THREAD_TAG = re.compile(r"^\[w=([^\]]+)\] ")
 LOG_PREFIX = re.compile(r"^\s*\[\d\d:\d\d:\d\d\] \[[^\]]+/(INFO|WARN|ERROR)\]: (?:\[STDOUT\]: )?")
 THREAD = re.compile(r"\[([A-Za-z0-9\-_ ]+)/(?:INFO|WARN|ERROR)\]:")
 CURSOR = re.compile(r"SCURSOR r=(-?\d+) i=(-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (-?\d+)")
@@ -62,9 +65,26 @@ def trace_lines(path):
     """Marker lines only, with any `run.log` prefix stripped."""
     out = []
     for raw in Path(path).read_text(errors='replace').splitlines():
-        line = LOG_PREFIX.sub('', raw).strip()
+        line = THREAD_TAG.sub('', LOG_PREFIX.sub('', raw)).strip()
         if line and line.split()[0].isupper():
             out.append(line)
+    return out
+
+
+def thread_of(raw):
+    m = THREAD_TAG.match(raw)
+    return m.group(1) if m else None
+
+
+def lines_by_thread(path):
+    """{thread: [marker lines]} in file order - within a thread that order is program order."""
+    out = collections.OrderedDict()
+    for raw in Path(path).read_text(errors='replace').splitlines():
+        thread = thread_of(raw)
+        line = THREAD_TAG.sub('', LOG_PREFIX.sub('', raw)).strip()
+        if thread is None or not line or not line.split()[0].isupper():
+            continue
+        out.setdefault(thread, []).append(line)
     return out
 
 

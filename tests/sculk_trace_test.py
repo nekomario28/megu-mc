@@ -138,6 +138,37 @@ class Grouping(unittest.TestCase):
             self.assertEqual(len(patches[0][1]), 1)
 
 
+class ThreadTags(unittest.TestCase):
+    """The agent tags each line with its thread: the file order is lock order, not program order."""
+
+    TAGGED = """\
+[w=Worker-Main-5] SPASS -16 112
+[w=Worker-Main-5] SPLACE edi -16 112
+[w=Worker-Main-7] SPASS -15 112
+[w=Worker-Main-5] SPATCH -248 -63 1816
+"""
+
+    def test_tag_is_stripped_from_marker_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(tmp, "t", self.TAGGED)
+            self.assertEqual(st.trace_lines(path)[:2], ["SPASS -16 112", "SPLACE edi -16 112"])
+
+    def test_lines_group_per_thread_in_file_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(tmp, "t", self.TAGGED)
+            by_thread = st.lines_by_thread(path)
+            self.assertEqual(list(by_thread), ['Worker-Main-5', 'Worker-Main-7'])
+            self.assertEqual(by_thread['Worker-Main-5'],
+                             ["SPASS -16 112", "SPLACE edi -16 112", "SPATCH -248 -63 1816"])
+            self.assertEqual(by_thread['Worker-Main-7'], ["SPASS -15 112"])
+
+    def test_untagged_lines_have_no_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(tmp, "t", "SPASS -16 112\n")
+            self.assertIsNone(st.thread_of("SPASS -16 112"))
+            self.assertEqual(st.lines_by_thread(path), {})
+
+
 class Sanity(unittest.TestCase):
     """The gate: a trace must be refused when it cannot answer the question asked of it."""
 

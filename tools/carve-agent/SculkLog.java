@@ -63,7 +63,12 @@ public class SculkLog {
     private static void out(String line) {
         if (Boolean.getBoolean("sculkquiet")) return;
         synchronized (LOCK) {
-            writer().println(line);
+            // The thread is part of the record: the lock keeps lines whole, but placements run on
+            // many worker threads, so the file's global order is not any one thread's program
+            // order. Reading a single window off the file mixed one thread's sculk placement with
+            // another's feature placements (measured: 28 consecutive `SPLACE ecw` lines inside
+            // what looked like one sculk window). With the tag a reader gets per-thread order.
+            writer().println("[w=" + Thread.currentThread().getName() + "] " + line);
         }
     }
 
