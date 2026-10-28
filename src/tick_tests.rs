@@ -3534,6 +3534,7 @@ fn chunk_delivery_path_bench() {
         (3usize, false),
     ] {
         assert!(worldgen::init(0, crate::name_to_state), "worldgen re-init");
+        let before = crate::chunkprof::counters();
         let mut per_chunk: Vec<f64> = Vec::new();
         for &(ox, oz) in &steps {
             let mut news: Vec<(i32, i32)> = Vec::new();
@@ -3556,6 +3557,26 @@ fn chunk_delivery_path_bench() {
         }
         let n = per_chunk.len() as f64;
         let total: f64 = per_chunk.iter().sum();
+        let after = crate::chunkprof::counters();
+        let deltas: Vec<u64> = after
+            .iter()
+            .zip(before.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+        // counters(): [0] chunks, [1] chunk_data ns, [2] section ns, [3] light ns,
+        // [4] band builds, [5] band cells, [6] block_at calls, [7] of which missed the
+        // overlay, [8] terrain sections. The ns ones and the counts are both load-free.
+        eprintln!(
+            "CHUNKBENCH   work/chunk: data={:.1}ms sections={} ({:.1}ms) light={:.1}ms band_new={} band_cells={} block_at={} miss={}",
+            deltas[1] as f64 / 1e6 / n,
+            deltas[8] / 300,
+            deltas[2] as f64 / 1e6 / n,
+            deltas[3] as f64 / 1e6 / n,
+            deltas[4] / 300,
+            deltas[5] / 300,
+            deltas[6] / 300,
+            deltas[7] / 300
+        );
         let med = {
             let mut v = per_chunk.clone();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());

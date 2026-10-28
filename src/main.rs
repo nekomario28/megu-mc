@@ -14125,6 +14125,9 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             // aquifer, deep rules) and could compute the generated state twice when
             // an overlay edit covered the cell.
             let __ts = chunkprof::enabled().then(std::time::Instant::now);
+            if __ts.is_some() {
+                chunkprof::SECTION_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let base = worldgen::terrain_section(cx, sy, cz, feature::populate);
             if let Some(t) = __ts {
                 chunkprof::add(&chunkprof::SECTION, t);
@@ -23029,6 +23032,7 @@ pub(crate) mod chunkprof {
     pub(super) static MAP: AtomicU64 = AtomicU64::new(0);
     pub(super) static DATA: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SECTION_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static LIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static RE_LIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static RE_LIGHT_N: AtomicU64 = AtomicU64::new(0);
@@ -23053,6 +23057,23 @@ pub(crate) mod chunkprof {
     pub(super) fn add(slot: &AtomicU64, t: std::time::Instant) {
         slot.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
+    /// A work snapshot, for the deterministic bench: these counters are load-independent,
+    /// where the bench's milliseconds are not (the same build measured 30.1 and 67.0
+    /// ms/chunk on this host within an hour, tracking the other lanes' load).
+    pub(crate) fn counters() -> [u64; 9] {
+        [
+            N.load(Ordering::Relaxed),
+            DATA.load(Ordering::Relaxed),
+            SECTION.load(Ordering::Relaxed),
+            LIGHT.load(Ordering::Relaxed),
+            BAND_NEW.load(Ordering::Relaxed),
+            BAND_CELLS.load(Ordering::Relaxed),
+            BLOCK_AT.load(Ordering::Relaxed),
+            BLOCK_AT_MISS.load(Ordering::Relaxed),
+            SECTION_N.load(Ordering::Relaxed),
+        ]
+    }
+
     pub(super) fn report() {
         let n = N.load(Ordering::Relaxed).max(1);
         let per = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / 1e6 / n as f64;
