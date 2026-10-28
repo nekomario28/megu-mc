@@ -462,3 +462,41 @@ CPU 総量はこの範囲では動いていない（待ちの場所が移った�
 主張しない。現在の内訳（`CHUNKPROF`, n=90）: `map_chunk` 91 ms/chunk
 （`chunk_data` 63 = 地形 16 + ライト 28 + 残り 19、`write_light_arrays` のうち
 sky 26 はバンド構築 24 が主）。
+
+## 2026-10-28: 訂正 — 交絡を取り除いた A/B と、その過程で見つけたデッドロック
+
+`/var/tmp/mc-ab.sh`（交互 A/B、`taskset` で各サーバを 2 コアに固定、client は
+`packets` 付きで記録）で、ブランチ開始 `dc62a60` と現在の HEAD を 3 ペア比較した。
+
+| pair | A（dc62a60） | B（HEAD） |
+|---|---|---|
+| 1 | 30.99 s | 29.30 s |
+| 2 | 31.21 | 29.46 |
+| 3 | 31.20 | 29.30 |
+
+**差は約 1.7 s（5.5%）**。以前「12 s 対 28 s（2.5 倍）」と見えたのは**計測ミス**で、
+B が**デッドロックして仕事をしていなかった**ためだった（A/B で `packets` が
+641-802 対 149-157 と食い違っていたのが兆候）。
+
+### 見つけたデッドロック（advancement 索引）
+
+`ef5f96b` で入れた `adv_event_index()` を、**`advancements()` のガードを保持したまま**
+呼んでいた。索引の初期化子も同じ `advancements()` をロックするので、
+非再入 Mutex の自己デッドロック。最初の `adv_event`（tick ごと・プレイヤーごと）で
+サーバが停止し、チャンク配信が 8 パケットで止まる。
+
+- 発見は capture harness（固定チャンクの受信バイト数と packet id ヒストグラムを
+  取る `/var/tmp/mc-slow/capture_chunk.py`）。**テスト suite は緑のまま**だった
+  （当該コミットで全 suite を回していなかった）。
+- 修正: 索引を `advancements()` を取る**前に**構築する。
+- 恒久ガード: `adv_event_returns_with_a_loaded_advancement_set`（別スレッドで
+  `adv_event` を呼び、10 秒で戻らなければ赤）。**バグを戻すと赤、修正で緑**を確認。
+
+### ついでに判明: 主な wire トラフィックはブロック差分（0x49）
+
+固定チャンクの capture で、何もしないクライアントに **0x49 (MultiBlockChange) が
+1,600-2,900 パケット/20 秒**届いていた。これは葉の distance 更新・作物・水などの
+毎tick の書き込みが近傍へ配信されているもので、leaf tick が生成のたびに
+（葉ごとに）積まれることが主因。vanilla は葉の distance/persistent を
+**配置時に決める**ので、この churn は性能だけでなく挙動の差分でもある。
+次の対象はここ（`scheduled_blocks` 12.5 ms/tick と 0x49 の大量送信が同じ根を持つ）。

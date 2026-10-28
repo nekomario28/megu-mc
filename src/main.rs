@@ -17068,7 +17068,13 @@ fn adv_event_index() -> &'static HashMap<String, Vec<(String, String)>> {
 
 fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
     let __t = tickprof::enabled().then(std::time::Instant::now);
-    if advancements().lock().unwrap().is_empty() {
+    // Build the index *before* taking `advancements()`: its initializer locks that same
+    // mutex, so calling it from inside the guard below is a self-deadlock on a
+    // non-reentrant mutex. That is what this did when the index was introduced — the
+    // first `adv_event` wedged the server, and the chunk stream stopped after eight
+    // packets (found by the capture harness, not by the suite, which was not re-run).
+    let index = adv_event_index();
+    if index.is_empty() {
         return;
     }
     let mut grants: Vec<String> = Vec::new();
@@ -17091,7 +17097,7 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         // Only the advancements that can fire on this event: their criteria are the
         // only ones this call can complete. The completion test still walks *all* of an
         // advancement's criteria, so a partially satisfied one is judged as before.
-        let Some(candidates) = adv_event_index().get(event) else {
+        let Some(candidates) = index.get(event) else {
             if let Some(t) = __t {
                 tickprof::add("adv/total", t.elapsed());
             }

@@ -1,6 +1,35 @@
 use super::*;
 use effect_tests::client_pair;
 
+/// `adv_event` used to build its (lazily initialized) event index while holding the
+/// advancement map's own lock, whose initializer locks that same non-reentrant mutex:
+/// the first call deadlocked the server and chunk streaming stopped after eight packets.
+/// The failure mode is a hang, so the call runs on another thread and the test fails
+/// (rather than hanging) if it does not return.
+#[test]
+fn adv_event_returns_with_a_loaded_advancement_set() {
+    advancements().lock().unwrap().insert(
+        "test:ping".to_string(),
+        Advancement {
+            title: "ping".to_string(),
+            criteria: vec![("crit".to_string(), "tick".to_string(), None)],
+        },
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        adv_event("GuardTester", "tick", None);
+        adv_event("GuardTester", "tick", None); // the index is built by now
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+        "adv_event did not return: the event index build deadlocks on the advancement map"
+    );
+    advancements().lock().unwrap().remove("test:ping");
+    adv_prog().lock().unwrap().remove("GuardTester");
+    adv_done().lock().unwrap().remove("GuardTester");
+}
+
 /// Captures the globals a world test mutates and restores them when dropped, so a failing assertion
 /// cannot leak them into a later test. A leaked hot set was the eight-thread flake: the pins made it
 /// deterministic for one test, but a panic on the straight-line restore left it polluted for the
