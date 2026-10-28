@@ -6156,6 +6156,59 @@ fn schedule_leaf_neighbors(x: i32, y: i32, z: i32, changed_state: u32) {
     }
 }
 
+/// Read many block states with two lock acquisitions instead of one pair per cell.
+///
+/// `block_at` takes the world lock and, for a generated cell, the worldgen lock — per
+/// call. `scheduled_block_tick` reads seven cells for every due leaf tick, and a live
+/// server measured **2.76 M worldgen lock acquisitions in one 100-tick window** (27,568
+/// per tick) with 16.8 ms of every tick spent waiting for that lock while the
+/// connection thread's section passes hold it. This resolves the same cells with one
+/// world-lock section (copying the touched chunks' edits) and one worldgen section.
+///
+/// The value per position is what `block_at` would return: the overlay wins, and
+/// `block_state_at` (the primitive `base_state` uses) supplies the generated state.
+fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
+    let mut overlays: HashMap<(i32, i32), HashMap<u32, u32>> = HashMap::new();
+    {
+        let w = world().lock().unwrap();
+        for &(x, _, z) in positions {
+            let key = (x >> 4, z >> 4);
+            if let std::collections::hash_map::Entry::Vacant(e) = overlays.entry(key) {
+                if let Some(col) = w.get(&key) {
+                    e.insert(col.clone());
+                }
+            }
+        }
+    }
+    let mut out = vec![0u32; positions.len()];
+    let generated: Vec<usize> = positions
+        .iter()
+        .enumerate()
+        .filter(|(_, &(x, y, z))| {
+            overlays
+                .get(&(x >> 4, z >> 4))
+                .is_none_or(|c| !c.contains_key(&local_idx(x, y, z)))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if !generated.is_empty() {
+        crate::worldgen::with_gen(|g| {
+            for &i in &generated {
+                let (x, y, z) = positions[i];
+                out[i] = g.block_state_at(x, y, z, crate::feature::populate);
+            }
+        });
+    }
+    for (i, &(x, y, z)) in positions.iter().enumerate() {
+        if let Some(col) = overlays.get(&(x >> 4, z >> 4)) {
+            if let Some(&st) = col.get(&local_idx(x, y, z)) {
+                out[i] = st;
+            }
+        }
+    }
+    out
+}
+
 fn scheduled_block_tick() {
     with_save_guard(scheduled_block_tick_inner);
 }
@@ -6188,13 +6241,33 @@ fn scheduled_block_tick_inner() {
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
-    for tick in due {
+    // All the cells this pass reads, in one batch: the tick's own cell, then its six
+    // neighbours (fixed layout, so the loop indexes it).
+    const STRIDE: usize = 7;
+    let mut positions: Vec<(i32, i32, i32)> = Vec::with_capacity(due.len() * STRIDE);
+    for tick in &due {
         let (x, y, z) = tick.pos;
-        let st = block_at(x, y, z);
+        positions.push(tick.pos);
+        for (dx, dy, dz) in LEAF_NEIGHBORS {
+            positions.push((x + dx, y + dy, z + dz));
+        }
+    }
+    let states = read_states_batched(&positions);
+    for (i, tick) in due.iter().enumerate() {
+        let (x, y, z) = tick.pos;
+        let b = i * STRIDE;
+        let st = states[b];
         if leaf_block(reg, st) != Some(tick.block) {
             continue;
         }
-        let neighbors = LEAF_NEIGHBORS.map(|(dx, dy, dz)| block_at(x + dx, y + dy, z + dz));
+        let neighbors = [
+            states[b + 1],
+            states[b + 2],
+            states[b + 3],
+            states[b + 4],
+            states[b + 5],
+            states[b + 6],
+        ];
         let result = leaf_distance_update(reg, st, neighbors);
         if result != st && set_block_if(x, y, z, result, Some(st)) {
             note_block_update(x, y, z, result);
