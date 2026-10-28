@@ -14,6 +14,46 @@ public class SculkLog {
     static int round = -1;
     static int idx = 0;
 
+    /**
+     * Writes trace lines to our own file instead of `System.out`.
+     *
+     * The game routes stdout through log4j, and the console appender does not preserve a
+     * thread's line order (measured: in `Worker-Main-5`'s lines the sculk windows hold none of
+     * the placement's draws, while the same thread's stream holds 41208 of them - so anything
+     * that reads a window or a pass positionally off `run.log` is reading scrambled order).
+     * A single lock plus a buffered writer keeps the true order; a shutdown hook flushes.
+     */
+    private static final Object LOCK = new Object();
+    private static java.io.PrintWriter writer;
+
+    private static java.io.PrintWriter writer() {
+        if (writer == null) {
+            String path = System.getProperty("sculktrace", "sculk-trace.txt");
+            try {
+                writer = new java.io.PrintWriter(new java.io.BufferedWriter(
+                        new java.io.FileWriter(path, false), 1 << 16));
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
+            Runtime.getRuntime().addShutdownHook(new Thread() {
+                @Override public void run() {
+                    synchronized (LOCK) {
+                        writer.flush();
+                        writer.close();
+                    }
+                }
+            });
+        }
+        return writer;
+    }
+
+    private static void out(String line) {
+        if (Boolean.getBoolean("sculkquiet")) return;
+        synchronized (LOCK) {
+            writer().println(line);
+        }
+    }
+
     /** `SculkSpreader.updateCursors` entry: one round, cursor index starts over. */
     public static void round() {
         round++;
@@ -28,13 +68,13 @@ public class SculkLog {
      */
     public static void mark(String what) {
         if (Boolean.getBoolean("sculkquiet")) return;
-        System.out.println("SCMARK " + what + " r=" + round + " i=" + (idx - 1));
+        out("SCMARK " + what + " r=" + round + " i=" + (idx - 1));
     }
 
     /** `MultifaceSpreader.spreadAll` entry: the number of spread types its config carries. */
     public static void spreadall(int types) {
         if (Boolean.getBoolean("sculkquiet")) return;
-        System.out.println("SSPREADALL types=" + types + " r=" + round + " i=" + (idx - 1));
+        out("SSPREADALL types=" + types + " r=" + round + " i=" + (idx - 1));
     }
 
     /** `ChunkGenerator.applyBiomeDecoration` entry: the chunk whose decoration pass this is.
@@ -45,7 +85,7 @@ public class SculkLog {
      */
     public static void pass(int cx, int cz) {
         if (Boolean.getBoolean("sculkquiet")) return;
-        System.out.println("SPASS " + cx + " " + cz);
+        out("SPASS " + cx + " " + cz);
     }
 
     /** `PlacedFeature.placeWithBiomeCheck` entry: which feature is attempted, in which chunk.
@@ -56,14 +96,53 @@ public class SculkLog {
      * position the chunk generator passes in.
      */
     public static void place(String featureClass, int cx, int cz) {
+        // Arming here (and disarming at every return of the same method) is what keeps the draw
+        // trace small: only the draws made while a sculk patch is being placed are logged.
+        // Thread-local, not a single flag: placements run on many worker threads at once, and a
+        // shared flag is flipped by every other thread's `place` call (measured: sculk windows
+        // came out with 0 draws while one window collected 12932 of another thread's).
+        if ("edi".equals(featureClass)) ARMED.set(Boolean.TRUE); else ARMED.remove();
         if (Boolean.getBoolean("sculkquiet")) return;
-        System.out.println("SPLACE " + featureClass + " " + cx + " " + cz);
+        out("SPLACE " + featureClass + " " + cx + " " + cz);
+    }
+
+    /** The class of the `RandomSource` a placement was handed. */
+    public static void rngClass(String name) {
+        if (Boolean.getBoolean("sculkquiet")) return;
+        out("SRNG " + name);
+    }
+
+    /** Called before every `return` of `PlacedFeature.placeWithBiomeCheck`. */
+    public static void disarm() {
+        ARMED.remove();
+    }
+
+    private static final ThreadLocal<Boolean> ARMED = new ThreadLocal<>();
+
+    private static boolean armed() {
+        return Boolean.TRUE.equals(ARMED.get());
+    }
+
+    public static void drawI(int value, String kind) {
+        if (armed()) out("SDRAW " + kind + " " + value);
+    }
+
+    public static void drawJ(long value, String kind) {
+        if (armed()) out("SDRAW " + kind + " " + value);
+    }
+
+    public static void drawD(double value, String kind) {
+        if (armed()) out("SDRAW " + kind + " " + value);
+    }
+
+    public static void drawF(float value, String kind) {
+        if (armed()) out("SDRAW " + kind + " " + value);
     }
 
     /** `SculkPatchFeature.place` entry: the patch's origin, so a run's trace splits by patch. */
     public static void patch(int x, int y, int z) {
         if (Boolean.getBoolean("sculkquiet")) return;
-        System.out.println("SPATCH " + x + " " + y + " " + z);
+        out("SPATCH " + x + " " + y + " " + z);
     }
 
     public static void cursor(int x, int y, int z, int charge, int decayDelay, int updateDelay,
@@ -76,7 +155,7 @@ public class SculkLog {
                 if (o instanceof Enum<?> e) mask |= 1 << e.ordinal();
             }
         }
-        System.out.println("SCURSOR r=" + round + " i=" + (idx++) + " " + x + " " + y + " " + z
+        out("SCURSOR r=" + round + " i=" + (idx++) + " " + x + " " + y + " " + z
                 + " " + charge + " " + decayDelay + " " + updateDelay + " " + mask);
     }
 }

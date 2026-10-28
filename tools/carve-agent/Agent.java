@@ -1130,6 +1130,102 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("dzz".equals(name) || "dzx".equals(name) || "dyz".equals(name) || "dzr".equals(name)
+                || "dzo".equals(name)) {
+            // The placement RNG's draws, logged only while a sculk patch is being placed (the
+            // `armed` flag is set by the `ebq` hook). `(value, kind)` argument order so the value
+            // can be DUP-ed before the call and survive the return.
+            String[][] ints = {
+                // class, method, descriptor, kind
+                {"dzr", "c", "(I)I", "nextInt(bound)@dzr"},
+                {"dzo", "c", "(I)I", "nextInt(bound)@dzo"},
+                {"dzz", "a", "(I)I", "nextInt(bound)@dzz"},
+                {"dzz", "f", "()I", "nextInt()@dzz"},
+                {"dzx", "c", "(I)I", "nextInt(bound)@dzx"},
+                {"dzx", "l", "()I", "nextInt()@dzx"},
+                {"dyz", "c", "(I)I", "nextInt(bound)@dyz"},
+            };
+            String[][] longs = {{"dzz", "g", "()J", "nextLong()@dzz"}};
+            String[][] doubles = {{"dzz", "j", "()D", "nextDouble()@dzz"}, {"dzz", "k", "()D", "gaussian@dzz"},
+                {"dyz", "k", "()D", "nextDouble()@dyz"},
+                {"dzr", "k", "()D", "nextDouble()@dzr"},
+                {"dzo", "k", "()D", "nextDouble()@dzo"}};
+            String[][] floats = {{"dzz", "i", "()F", "nextFloat()@dzz"}};
+            try {
+                ClassReader cr = new ClassReader(buf);
+                final int[] hooked = {0};
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        String kind = null, logger = null, desc = null;
+                        int opcode = 0, localOp = 0;
+                        for (String[] row : ints) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                logger = "drawI";
+                                desc = "(ILjava/lang/String;)V";
+                                opcode = Opcodes.IRETURN;
+                                localOp = Opcodes.ILOAD;
+                            }
+                        }
+                        for (String[] row : longs) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                logger = "drawJ";
+                                desc = "(JLjava/lang/String;)V";
+                                opcode = Opcodes.LRETURN;
+                            }
+                        }
+                        for (String[] row : doubles) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                logger = "drawD";
+                                desc = "(DLjava/lang/String;)V";
+                                opcode = Opcodes.DRETURN;
+                            }
+                        }
+                        for (String[] row : floats) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                logger = "drawF";
+                                desc = "(FLjava/lang/String;)V";
+                                opcode = Opcodes.FRETURN;
+                            }
+                        }
+                        if (kind == null) return mv;
+                        hooked[0]++;
+                        final String k = kind, lg = logger, dsc = desc;
+                        final int ret = opcode;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int op) {
+                                if (op == ret) {
+                                    // a long/double needs DUP2 (DUP only covers a category-1
+                                    // value, measured: `dyz.k()D @7: dup` failed verification)
+                                    super.visitInsn(ret == Opcodes.LRETURN || ret == Opcodes.DRETURN
+                                            ? Opcodes.DUP2 : Opcodes.DUP);
+                                    super.visitLdcInsn(k);
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", lg, dsc,
+                                            false);
+                                }
+                                super.visitInsn(op);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT rng draw hook installed for " + name
+                        + (hooked[0] == 0 ? " (no method matched)" : " (" + hooked[0] + " methods)"));
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT rng draw hook failed for " + name + ": " + t);
+                return null;
+            }
+        }
         if ("duz".equals(name)) {
             try {
                 ClassReader cr = new ClassReader(buf);
@@ -1187,6 +1283,15 @@ class SculkTransformer implements ClassFileTransformer {
                         // attempted in, at entry, one line per attempt.
                         if (!mn.equals("a") || !md.equals("(Ldds;Lduz;Layw;Ljd;)Z")) return mv;
                         return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int op) {
+                                // the method returns boolean, so its return opcode is IRETURN
+                                if (op == Opcodes.IRETURN) {
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                            "disarm", "()V", false);
+                                }
+                                super.visitInsn(op);
+                            }
+
                             @Override public void visitCode() {
                                 super.visitCode();
                                 super.visitVarInsn(Opcodes.ALOAD, 0);
@@ -1206,6 +1311,15 @@ class SculkTransformer implements ClassFileTransformer {
                                 super.visitInsn(Opcodes.ISHR);
                                 super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "place",
                                         "(Ljava/lang/String;II)V", false);
+                                // the RNG instance the placement was handed, so the class to hook
+                                // is a measurement rather than a guess
+                                super.visitVarInsn(Opcodes.ALOAD, 3);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Object",
+                                        "getClass", "()Ljava/lang/Class;", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Class",
+                                        "getName", "()Ljava/lang/String;", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "rngClass",
+                                        "(Ljava/lang/String;)V", false);
                             }
                         };
                     }

@@ -60,6 +60,12 @@ printf 'Premain-Class: Agent\n' > j1/META-INF/MANIFEST.MF
 (cd j1 && jar cfm ../carveagent.jar META-INF/MANIFEST.MF .)
 ```
 
+`SculkLog` writes to its own file, not stdout: `-Dsculktrace=<path>` (default
+`sculk-trace.txt`). The game routes stdout through log4j, whose console appender does not
+preserve a thread's line order, so anything that attributes a line to the `SPASS`/`SPLACE`
+window it sits between reads scrambled order (measured: a thread's sculk windows held none of
+its 41208 draws). One lock plus a buffered writer keeps program order.
+
 `SculkLog.patch` only takes three ints, like the other SculkLog methods, so it needs no game
 class on the bootstrap classpath.
 
