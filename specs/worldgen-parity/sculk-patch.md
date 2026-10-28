@@ -661,6 +661,7 @@ native trace に対して行っており、そちらは再現する範囲で有�
 | `tools/carve-agent/`（`Agent.java` + `CarveLog.java` + `SculkLog.java`） | 固定 jar を ASM で instrument。`SculkLog` は bootstrap から読める primitive/JDK 型のみ。build は README の `sh`（`SculkLog.java` を含める、ASM は `~/.m2` の最新を使う） |
 | `JAVA_AGENT=<carveagent.jar> tools/chunk_world_fixture.sh <tag> -16 112 1 features` | 参照サーバーを agent 付きで起動（`JAVA_OPTS="-Dfeaturebox=..."` で feature 書き込みも） |
 | port 側 `SPC_CURSOR_TRACE=1` / `SPC_TRACE_ALL=1` / `FEATURE_WRITE_TRACE=<cx>,<cz>|all` / `GENERIC_CASE_DUMP=<path>` | 同じ形の trace（`SCURSOR` 相当 / 書き込みと呼び出し元 / 呼び出し元なしの書き込み順 / fixture 差分） |
+| `cargo test sculk_cursor` | **これが今の反復ループ**（5 秒）。port がチャンク (-16,112) を in-process 生成し、native スライスと `(round, index)` で比較。ratchet（現在 30 行一致を要求）なので退行は赤、前進したら数字を上げる。CLI も dump も手作業も不要 |
 | `tools/sculk_trace.py extract <run.log> [--rounds N]` / `compare <native> <port>` | `SCURSOR` 行を抽出し、**(round, index) で整列**して比較。共有キーが食い違えば exit 1（gate として使える） |
 | `tests/data/sculk_cursor_1211.tsv` | native 側の先頭 60 行（round 0..5）。再生成: `tools/sculk_trace.py extract <run.log> --rounds 5`。**port 側は同じ capture が必要**（`SPC_CURSOR_TRACE=1` の dump を同じ chunk で） |
 | `~/.cache/mc-spine-audit/sculk-traces/`（repo 外・再生成可能） | これまでの native/port の完全な trace（`traces-mk*.txt` = agent run の生 log 抽出、`port_after_fixes.txt`）。repo には先頭スライスだけを置き、完全版は再生成コマンドで作る |

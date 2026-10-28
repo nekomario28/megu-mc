@@ -567,6 +567,75 @@ fn basalt_columns_matches_native_cells_and_rng() {
     );
 }
 
+/// The sculk cursor trace of chunk (-16,112) against the native slice captured with
+/// `tools/carve-agent` (`tests/data/sculk_cursor_1211.tsv`).
+///
+/// This is the loop the sculk work uses: `cargo test sculk_cursor` generates the chunk
+/// in-process and compares cursor trajectories by (round, index) - no CLI dump, no fixture
+/// server. The assertion is a **ratchet**: it requires the matched prefix the port has already
+/// reached (rounds 0-2 = 30 lines) and prints the first divergence, so a regression fails and
+/// progress can raise the number. `SPC_TRACE_LOCK` serialises the two tests that run the
+/// spreader, because the trace sink is process-wide.
+#[test]
+fn sculk_cursor_matches_the_native_trace() {
+    // The sink is thread-local and the generator lock keeps the other generator tests out, so
+    // this trace is this test's alone (a process-wide sink interleaved a concurrent sculk test's
+    // cursors: 5310 lines, no match).
+    let _gen = crate::worldgen::lock_gen_for_tests();
+    super::spc_trace_begin();
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    // `feat_state` populates the chunk that contains (x, z), and a chunk's population is what
+    // arms the patch whose origin may sit in a *neighbouring* chunk - which is why the native
+    // slice's first cursor is at (-261,-42,1785), in chunk (-17,112), while the population that
+    // produced it is chunk (-16,112)'s. Generating any other chunk gives a different scene (and
+    // 5798 lines instead of 5150, measured).
+    let _ = g.feat_state(-256, 64, 1792, super::populate);
+    let lines = super::spc_trace_take();
+    let native: Vec<String> = include_str!("../tests/data/sculk_cursor_1211.tsv")
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    let matched = lines
+        .iter()
+        .zip(native.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    eprintln!(
+        "sculk cursor trace: {} lines, {matched} of {} native lines match",
+        lines.len(),
+        native.len()
+    );
+    if matched < native.len() {
+        eprintln!(
+            "first divergence at line {matched}: port {:?} native {:?}",
+            lines.get(matched),
+            native.get(matched)
+        );
+    }
+    // ratchet: raise this as the port gets closer to the native trajectory
+    assert!(
+        matched >= 30,
+        "sculk cursor trace regressed: {matched} of {} native lines match (was 30)",
+        native.len()
+    );
+}
+
+/// The same chunk's cursor trace, captured for the record: `SPC_CURSOR_TRACE=1` on the CLI dump
+/// must produce the same first lines as the in-process test above.
+#[test]
+fn sculk_cursor_trace_is_the_same_shape_as_the_agents() {
+    let first = include_str!("../tests/data/sculk_cursor_1211.tsv")
+        .lines()
+        .next()
+        .unwrap();
+    assert!(first.starts_with("SCURSOR r=0 i=0 "), "{first}");
+    assert_eq!(
+        first.split_whitespace().count(),
+        10,
+        "SCURSOR, r, i, x, y, z, charge, decay, update, mask"
+    );
+}
+
 /// The 18 neighbours' *order* is the draw: `findNextSculk` shuffles this list, so a different
 /// base order is a different permutation for the same random stream. Measured through the
 /// pinned jar: `BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` yields `(-1,-1,-1) (0,-1,-1)

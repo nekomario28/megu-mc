@@ -4338,6 +4338,15 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 }
 
 #[cfg(test)]
+/// The generator lock, for tests outside `wg_tests` that drive `feature::populate`.
+///
+/// `wg_tests` is private, so the reachable path is this wrapper: a parent module can see a
+/// child's private items, and the lock has to be the *same* mutex the generator tests use.
+#[cfg(test)]
+pub(crate) fn lock_gen_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    wg_tests::lock_gen()
+}
+
 mod wg_tests {
     use super::*;
 
@@ -4748,7 +4757,7 @@ mod wg_tests {
     // parallel: one lock per test serializes the whole module.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap_or_else(|poison| {
             // This mutex only serializes tests; it protects no recoverable data.
             TEST_LOCK.clear_poison();

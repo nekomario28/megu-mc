@@ -2691,7 +2691,51 @@ const SPC_ORIGIN_RADIUS_SQ: i64 = 225;
 const SPC_VEIN: &str = "minecraft:sculk_vein";
 
 /// Counts `SculkSpreader.updateCursors` calls, matching the reference agent's counter.
-static SPC_ROUND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+///
+/// Thread-local like the trace sink: a process-wide counter made a test's trace start at
+/// whatever round another test had reached (measured: `r=16` as the first line instead of `r=0`).
+/// A CLI run has one thread, so its numbering is unchanged.
+thread_local! {
+    static SPC_ROUND: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Where the sculk cursor trace goes: a test installs a **thread-local** sink and reads the lines
+/// back in-process, the CLI gets them on stderr with `SPC_CURSOR_TRACE=1`.
+///
+/// Thread-local rather than a global with a lock, because the suite runs its tests on threads: a
+/// process-wide sink let a concurrently running sculk test's cursors land in this test's trace
+/// (measured: 5310 lines instead of 5150, and no line matched). A thread-local sink cannot be
+/// polluted by another test, because population runs on the thread that asked for it.
+thread_local! {
+    static SPC_TRACE_SINK: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn spc_trace_begin() {
+    SPC_TRACE_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn spc_trace_take() -> Vec<String> {
+    SPC_TRACE_SINK
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// One `SCURSOR` line: identical to the reference agent's `SculkLog.cursor` output.
+fn spc_trace(line: String) {
+    let collected = SPC_TRACE_SINK.with(|s| match s.borrow_mut().as_mut() {
+        Some(lines) => {
+            lines.push(line.clone());
+            true
+        }
+        None => false,
+    });
+    if !collected && std::env::var("SPC_CURSOR_TRACE").is_ok() {
+        eprintln!("{line}");
+    }
+}
 
 /// Which `SculkBehaviour` a state carries: `SculkBlock`, `SculkVeinBlock`, or the default
 /// (everything else, including air).
@@ -2782,11 +2826,17 @@ impl SculkSpreader {
         // The reference agent's `SculkLog.round()` counts every `updateCursors` call the same
         // way, and `i` is the cursor's index in this round's list: a cursor that reaches charge
         // 0 is dropped, so without those two numbers the two traces cannot be aligned.
-        let round = SPC_ROUND.fetch_add(1, Ordering::Relaxed);
+        let round = SPC_ROUND.with(|r| {
+            let v = r.get();
+            r.set(v + 1);
+            v
+        });
+        let traced = std::env::var("SPC_CURSOR_TRACE").is_ok()
+            || SPC_TRACE_SINK.with(|s| s.borrow().is_some());
         let mut kept = Vec::with_capacity(self.cursors.len());
         for (idx, mut cursor) in std::mem::take(&mut self.cursors).into_iter().enumerate() {
-            if std::env::var("SPC_CURSOR_TRACE").is_ok() {
-                eprintln!(
+            if traced {
+                spc_trace(format!(
                     "SCURSOR r={round} i={idx} {} {} {} {} {} {} {}",
                     cursor.pos.0,
                     cursor.pos.1,
@@ -2795,7 +2845,7 @@ impl SculkSpreader {
                     cursor.decay_delay,
                     cursor.update_delay,
                     cursor.facings.map_or(-1, |m| m as i32)
-                );
+                ));
             }
             spc_cursor_update(ctx, rng, &mut cursor, origin, spread_only);
             if cursor.charge > 0 {
