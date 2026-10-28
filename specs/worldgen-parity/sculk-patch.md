@@ -941,7 +941,36 @@ port 側の `SculkPatchFeature`/`SculkSpreader` が引いていない（また�
 （`SPATCH` は `canSpreadFrom` の**前**に出しているので、両側で同じ意味 ✓）。port 側でどこが
 弾いているかを `SPMARK`/`SSPREADALL` と突き合わせて確定し、`DTRACE` で draw を1本ずつ揃える。
 
-## 効率化の基盤（2026-10-28）
+## 消えていた draw の正体: `Util.shuffle`（2026-10-28、原因特定）
+
+前節の「port は feature 内で draw しない」を追い切った。順に**仮説を消していった**結果:
+
+| 仮説 | 判定 | 実測 |
+|---|---|---|
+| feature が早期 return している | **棄却** | 「spread したパッチ / 告知されたパッチ」= native 57/1197 (4.8%)、port 34/915 (3.7%)、arm 窓内では両側 ≈4.8% |
+| draw の trace が上限で切れている | **棄却** | `FEATURE_DRAW_LIMIT=200000` でも port の窓は 512×`nextInt(16)` + 256×`nextInt(321)` + **`nextFloat` 1本**のまま |
+| `SculkSpreader` / `ChargeCursor` が引いている | **棄却** | 固定 jar の decompile と bytecode の invoke 一覧に RNG 呼び出しが無い |
+| `SculkBlock` / `SculkVeinBlock` / `MultifaceSpreader` が引いている | **棄却** | 同じく RNG invoke 無し |
+| **`Util.shuffle` が引いている** | **確定** | `dmu$a`（= `ChargeCursor`）が `ad.a(Lit/unimi/dsi/fastutil/objects/ObjectArrayList;Layw;)` を呼び、`ad` = `net.minecraft.Util` の `shuffle(List, RandomSource)`。Fisher-Yates は `nextInt(i+1)` を i=n-1..1 で引くので最初の bound が **リスト長-1** になる |
+
+native が窓の中で引いていた bound は `(16)/(321)`（modifier）以外に **49, 37, 5, 3, 2**。
+`49` = **長さ50のリストの shuffle の初回 draw** ✓、以後 37, 5, 3, 2 = それぞれの長さのリスト ✓✓。
+つまり **vanilla は候補リストを配置 RNG でシャッフルしている**。
+
+これは以前の作業メモ「18近傍リストは x-fastest（測った）＝ order is the draw」を**読み違えていた**
+ことを意味する: 近傍の順序は**固定の列挙順ではなくシャッフル**で、その draw が
+`RandomSource` に乗る。port の `spc_cursor_update` は `rng` を**一切使っていない**（grep で確認）ので、
+ここが丸ごと欠けている。シャッフル順が違えば近傍を処理する順序が変わり、**セル配置が変わる**ので、
+sculk のセル差（5082 対 4834）の主因である可能性が高い。
+
+**次の1手（実装）**: `dmu$a` の制御フローを読み、どのリストをどのタイミングで
+`Util.shuffle` しているかを確定して、port の `spc_cursor_update`（と周辺）で同じ shuffle を
+同じ順に引く。検証は `DTRACE` で1本ずつ（bound と値の両方）、その後に
+`tools/sculk_gate.py --require-match`。
+
+（`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、
+`net.minecraft.world.level.block.SculkSpreader` のように**正しいパッケージ**で渡すこと。
+`dmu$a` のような obfuscated 名を直接渡すと "not in server.txt" で止まる。）## 効率化の基盤（2026-10-28）
 
 このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。
 その手作業が実際に時間を食った箇所を道具に固定した:
