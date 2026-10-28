@@ -764,12 +764,27 @@ shutdown hook で flush）に切り替えた。**順序が保証された trace 
 `SPATCH` = 1131 件、`nextInt(bound)@dyn` = 45 件、`nextFloat()@dyn` = 55 件）。この構造が
 「健全な trace」と「arm が1段深い trace」を分ける判定条件になっている（下の sanity）。
 
-**未解明の観測（主張しない）**: capture `fix1` で、sculk パッチの位置 draw 列は
-`279, 8, 8, 1`（`nextInt(bound)@dyn`）だった。port 側 `FSEED_ARM=-16,112,1,7`
-（`minecraft:sculk_patch_deep_dark`）の列は `15, 11, 280, 12, 6, 156, …`。**279 と 280** が
-近いのは気になるが、draw の**順序**も**個数**も違うので、いまは「同じ列ではない」以上のことは
-言えない。次の計測は **native 側でも bound をログする**（`dyn.a(I)I` の引数を出す）ことで、
-`(kind, bound, value)` で 1対1 に対応づけられるようにすること。
+**bound をログして draw 列を1対1で突き合わせた（2026-10-28、結果）**
+
+native 側でも `nextInt` の **bound** を出すようにした（`dyn.a(I)I` の引数を `SculkLog.drawIBound`
+へ渡す）。これで port の `nextInt(16)=15` と native の `nextInt(bound)@dyn(16) 15` が
+**同じ問い**として join できる。`sculk_trace.py compare-draws` は port の列を native の流れから
+探し、一致長と最初の食い違いを出す。
+
+`minecraft:sculk_patch_deep_dark`、chunk (-16,112)、pass (-16,112) での結果:
+
+| | |
+|---|---|
+| port の draw 列（`FSEED_ARM=-16,112,1,7`） | `(16,15) (16,11) (321,280) (16,12) (16,6) (321,156) …` 40本 |
+| native の同じ列の出現 | **1箇所**（native 通し index 58437、pass (-16,112) 内） |
+| 一致した長さ | **24本**（bound も値も一致） |
+| 最初の食い違い（25本目） | port `nextInt(16)=12` / native `nextInt(49)=6` |
+
+つまり **placement の位置 draw は 24 本まで完全に一致**し、その先で**違う問い**を引き始める
+（bound が 16 と 49 で違う）。port 側の `nextInt(16)` は次の位置の x を引いているのに対し、
+native 側は別のもの（49 を bound とする draw）に進んでいる。**この先の解釈はまだしていない**
+（一致長の内訳を「位置何個分か」に分解するのが次の計測: 1位置あたり3本 = `(16,16,321)` なので
+24本 = 8位置分で、そこから先が食い違う）。
 
 ## 効率化の基盤（2026-10-28）
 
@@ -780,7 +795,7 @@ shutdown hook で flush）に切り替えた。**順序が保証された trace 
 |---|---|
 | `tools/build_carve_agent.sh` | agent のビルド手順。手で打つと `head` が javac の終了コードを飲み、半分適用された編集から jar を作り、「動いているように見える古い jar」ができる（**実測で2回**）。組んだ後に中身（ASM・ロガー・マーカー文字列・フックの配線）を検証してから返す |
 | `tools/sculk_capture.sh <tag>` | capture を1コマンドに（agent を組む → fixture → `PROVENANCE-<tag>.txt` → `sanity`）。trace は `-Dsculktrace=` で **`SculkLog` 自前の writer** に書く |
-| `tools/sculk_trace.py ...` | 解析を1つに（`summary`/`sanity`/`passes`/`windows`/`draws`/`names`/`compare-passes`/`compare-draws`/`extract`/`patches`）。`run.log` に対する位置ベース解析は**拒否**する |
+| `tools/sculk_trace.py ...` | 解析を1つに（`summary`/`sanity`/`passes`/`windows`/`draws`/`names`/`compare-passes`/`compare-draws`/`extract`/`patches`）。`compare-draws` は port の draw 列を native の流れから `(bound, value)` で探し、**一致長と最初の食い違い**を出す。`run.log` に対する位置ベース解析は**拒否**する |
 | `tests/sculk_trace_test.py` | 道具自身のテスト（19件）。**sanity が壊れた trace を不合格にすること**を含む（下記） |
 
 **行順の教訓（実測）**: `run.log` は log4j 経由で、**同じスレッドの行順すら**プログラム順と

@@ -206,6 +206,65 @@ def args(native, port, limit=1):
     return type('A', (), {'native': str(native), 'port': str(port), 'limit': limit})
 
 
+class CompareDraws(unittest.TestCase):
+    """Joining on (bound, value): the bound is what makes two draws the same question."""
+
+    NATIVE = """\
+SPASS -16 112
+SDRAW nextInt(bound)@dyn(16) 15
+SDRAW nextInt(bound)@dyn(16) 11
+SDRAW nextInt(bound)@dyn(321) 280
+SDRAW nextInt(bound)@dyn(16) 12
+SDRAW nextInt(bound)@dyn(49) 6
+SPLACE edi -16 112
+SRNG dzx
+SPATCH -248 -63 1816
+"""
+
+    def _args(self, native, port, window=0):
+        return type('A', (), {'native': str(native), 'port': str(port), 'window': window})
+
+    def test_matching_prefix_is_found_and_its_length_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = write(tmp, "native.txt", self.NATIVE)
+            port = write(tmp, "port.log", "DRAW 0 f=1,7 nextInt(16)=15\n"
+                                          "DRAW 1 f=1,7 nextInt(16)=11\n"
+                                          "DRAW 2 f=1,7 nextInt(321)=280\n"
+                                          "DRAW 3 f=1,7 nextInt(16)=12\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = st.cmd_compare_draws(self._args(native, port, window=3))
+            self.assertIn("identical prefix from native index 0: 4 of 4", out.getvalue())
+            self.assertEqual(rc, 0)
+
+    def test_divergence_reports_the_two_draws(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = write(tmp, "native.txt", self.NATIVE)
+            port = write(tmp, "port.log", "DRAW 0 f=1,7 nextInt(16)=15\n"
+                                          "DRAW 1 f=1,7 nextInt(16)=11\n"
+                                          "DRAW 2 f=1,7 nextInt(321)=280\n"
+                                          "DRAW 3 f=1,7 nextInt(16)=12\n"
+                                          "DRAW 4 f=1,7 nextInt(16)=7\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = st.cmd_compare_draws(self._args(native, port, window=3))
+            self.assertIn("identical prefix from native index 0: 4 of 5", out.getvalue())
+            self.assertIn("first divergence: port (16, 7) native (49, 6)", out.getvalue())
+            self.assertEqual(rc, 1)
+
+    def test_absent_sequence_is_reported_as_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = write(tmp, "native.txt", self.NATIVE)
+            port = write(tmp, "port.log", "DRAW 0 f=1,7 nextInt(64)=63\n"
+                                          "DRAW 1 f=1,7 nextInt(64)=1\n"
+                                          "DRAW 2 f=1,7 nextInt(64)=2\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = st.cmd_compare_draws(self._args(native, port, window=3))
+            self.assertIn("does not occur", out.getvalue())
+            self.assertEqual(rc, 1)
+
+
 class ComparePasses(unittest.TestCase):
     def test_identical_passes_report_as_identical(self):
         with tempfile.TemporaryDirectory() as tmp:

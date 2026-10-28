@@ -491,38 +491,61 @@ def parse_port_draws(path):
     return out
 
 
-def cmd_compare_draws(args):
-    """Compare a native window's draw values against the port's armed draw trace."""
-    native = window_summary(split_windows(trace_lines(args.native), arm=args.arm))
-    want = [w for w in native if not args.cls or w['cls'] == args.cls]
-    port = [v for _, _, _, v in parse_port_draws(args.port)]
-    if not want:
-        print(f"sculk_trace: no window with class {args.cls} in {args.native}", file=sys.stderr)
-        return 2
-    print(f"native windows: {len(want)}, port draws: {len(port)}")
-    best = None
-    for row in want:
-        values = row['draws']
-        if not values:
+def native_bounded_draws(path):
+    """[(bound, value)] from an ordered trace's `nextInt(bound)@cls(<bound>) <value>` lines."""
+    out = []
+    for line in trace_lines(path):
+        if not line.startswith('SDRAW '):
             continue
-        same = 0
-        for a, b in zip(values[args.offset:], port):
-            if a == b:
-                same += 1
-            else:
-                break
-        if best is None or same > best[0]:
-            best = (same, row, values)
-    if best is None:
-        print("sculk_trace: no native window holds any draw - nothing to compare (run `sanity`)",
+        m = re.match(r'SDRAW (\S*bound\S*)?\((\d+)\) (\d+)$', line)
+        if m:
+            out.append((int(m.group(2)), int(m.group(3))))
+    return out
+
+
+def cmd_compare_draws(args):
+    """Find where the port's draw sequence sits in the native stream, and where it parts.
+
+    Joined on `(bound, value)`: the port logs `nextInt(16)=15`, the native logs
+    `nextInt(bound)@dyn(16) 15`, so the *bound* is what makes the two sequences the same question
+    rather than two streams of integers. The answer is a *position* in the native stream plus a
+    match length, which is what turns "the placement differs" into "they agree for 24 draws and
+    then ask different questions".
+    """
+    native = native_bounded_draws(args.native)
+    port = [(int(m.group(1)), int(m.group(2)))
+            for line in Path(args.port).read_text(errors='replace').splitlines()
+            if (m := re.search(r'nextInt\((\d+)\)=(\d+)', line))]
+    if not port:
+        print("sculk_trace: the port trace has no bounded draws (run with FSEED_ARM=..., )",
               file=sys.stderr)
         return 2
-    same, row, values = best
-    print(f"best window: cls={row['cls']} src={row['src']} draws={len(values)}")
-    print(f"identical prefix against the port trace: {same}")
-    print(f"  native: {values[args.offset:args.offset + 8]}")
-    print(f"  port  : {port[:8]}")
-    return 0 if same else 1
+    if not native:
+        print(f"sculk_trace: {args.native} has no bounded draws with a bound - it was produced by "
+              f"an agent build that did not log them", file=sys.stderr)
+        return 2
+    if args.window:
+        probe = port[:args.window]
+    else:
+        probe = port[:min(6, len(port))]
+    hits = [i for i in range(len(native) - len(probe) + 1) if native[i:i + len(probe)] == probe]
+    print(f"native bounded draws {len(native)}, port bounded draws {len(port)}")
+    print(f"probe (port's first {len(probe)}): {probe}")
+    if not hits:
+        print("the port's sequence does not occur in the native stream - the two placements are "
+              "not drawing the same questions anywhere in this capture")
+        return 1
+    print(f"occurrences: {len(hits)} at native index {hits[:4]}")
+    at = hits[0]
+    same = 0
+    for a, b in zip(port, native[at:]):
+        if a != b:
+            break
+        same += 1
+    print(f"identical prefix from native index {at}: {same} of {len(port)}")
+    if same < len(port):
+        print(f"  first divergence: port {port[same]} native {native[at + same]}")
+    return 0 if same == len(port) else 1
 
 
 def cmd_patches(args):
@@ -608,12 +631,13 @@ def main():
                    help='how many divergent passes to list (in trace order)')
     s.set_defaults(func=cmd_compare_passes)
 
-    s = sub.add_parser('compare-draws', help="native window draws vs the port's DRAW trace")
+    s = sub.add_parser('compare-draws',
+                       help="find the port's draw sequence in the native stream, joined on "
+                            "(bound, value)")
     s.add_argument('native')
     s.add_argument('port')
-    s.add_argument('--class', dest='cls')
-    s.add_argument('--arm', choices=['trailing', 'leading'], default='trailing')
-    s.add_argument('--offset', type=int, default=0)
+    s.add_argument('--window', type=int, default=0,
+                   help='probe length (default: the first 6 port draws, then extend)')
     s.set_defaults(func=cmd_compare_draws)
 
     s = sub.add_parser('patches', help='patch-scoped cursor rows (needs an ordered trace)')

@@ -1223,11 +1223,15 @@ class SculkTransformer implements ClassFileTransformer {
                         MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
                         String kind = null, logger = null, desc = null;
                         int opcode = 0, localOp = 0;
+                        boolean bounded = false;
                         for (String[] row : ints) {
                             if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
                                 kind = row[3];
-                                logger = "drawI";
-                                desc = "(ILjava/lang/String;)V";
+                                // `(I)I` is `nextInt(bound)`: log the bound too, so the value can
+                                // be matched against the port's `nextInt(<bound>)=<value>`.
+                                bounded = md.equals("(I)I") && !row[3].contains("bits");
+                                logger = bounded ? "drawIBound" : "drawI";
+                                desc = bounded ? "(IILjava/lang/String;)V" : "(ILjava/lang/String;)V";
                                 opcode = Opcodes.IRETURN;
                                 localOp = Opcodes.ILOAD;
                             }
@@ -1260,6 +1264,7 @@ class SculkTransformer implements ClassFileTransformer {
                         hooked[0]++;
                         final String k = kind, lg = logger, dsc = desc;
                         final int ret = opcode;
+                        final boolean bd = bounded;
                         return new MethodVisitor(Opcodes.ASM9, mv) {
                             @Override public void visitInsn(int op) {
                                 if (op == ret) {
@@ -1267,6 +1272,9 @@ class SculkTransformer implements ClassFileTransformer {
                                     // value, measured: `dyz.k()D @7: dup` failed verification)
                                     super.visitInsn(ret == Opcodes.LRETURN || ret == Opcodes.DRETURN
                                             ? Opcodes.DUP2 : Opcodes.DUP);
+                                    if (bd) {
+                                        super.visitVarInsn(Opcodes.ILOAD, 1);
+                                    }
                                     super.visitLdcInsn(k);
                                     super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", lg, dsc,
                                             false);

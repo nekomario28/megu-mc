@@ -144,6 +144,18 @@ public class SculkLog {
         if (armed()) out("SDRAW " + kind + " " + value);
     }
 
+    /**
+     * A bounded draw, with the bound it was given.
+     *
+     * The bound is what makes the native trace joinable against the port's: the port logs
+     * `nextInt(16)=15` (bound and value), and without the bound the native side is a bare stream
+     * of integers that can only be compared positionally. Argument order keeps the value DUP-ed
+     * on the stack so it survives the call.
+     */
+    public static void drawIBound(int value, int bound, String kind) {
+        if (armed()) out("SDRAW " + kind + "(" + bound + ") " + value);
+    }
+
     public static void drawJ(long value, String kind) {
         if (armed()) out("SDRAW " + kind + " " + value);
     }
