@@ -919,9 +919,27 @@ port 側の `SculkPatchFeature`/`SculkSpreader` が引いていない（また�
 
 **次の1手（順序づけ）**: raw search をやめ、**パスを揃えて**比較する。候補は
 (a) port 側を `MC_SPINE_POP_ORDER` で native と同じパス順に固定する、
-(b) **各スレッドの最初の sculk 窓**を両側から取り出して比べる（今は thread タグがあるので可能）。
-どちらでも「port の arm 窓＝modifier の 768 本のみ、native は feature 内で `(5)/(49)/(65)/(3)/(2)`
-も引く」という差（同一 recipe の pair で実測済み）を1本ずつ詰められる。
+(b) **各スレッドの最初の sculk 窓**を両側から取り出して比べる（thread タグで可能になった）。
+
+### 差の正体を ratio で押さえた（2026-10-28、thread 単位で集計）
+
+窓の対応づけに依らない指標として「**パッチが placement の triple 以外の draw を引いたか**」を
+両側で数えた（native は thread 単位のプログラム順で ✓）:
+
+| 側 | feature が何か引いたパッチ |
+|---|---|
+| native | **45 / 1197**（3.8%） |
+| port | **1 / 915**（0.1%） |
+
+**約38倍の差**。同じく port の arm 窓の draw 内訳は `nextInt(16)`×512 + `nextInt(321)`×256 +
+**`nextFloat` が1本だけ**（= 21 受理に対して1回しか feature が draw していない）。port の
+`gen_sculk_patch` は `next_f32`（catalyst chance）・`extra_rare_growths`・`next_bound(5)` と
+**draw するコードを持っている**ので、差は「draw が無い」ではなく **feature がそこで走っていない
+（早期 return している）か、走っても draw に到達していない**側にある。
+
+次の1手（step ② の入口）: `SPATCH` の直後で**早期 return している割合**を両側で比べる
+（`SPATCH` は `canSpreadFrom` の**前**に出しているので、両側で同じ意味 ✓）。port 側でどこが
+弾いているかを `SPMARK`/`SSPREADALL` と突き合わせて確定し、`DTRACE` で draw を1本ずつ揃える。
 
 ## 効率化の基盤（2026-10-28）
 
