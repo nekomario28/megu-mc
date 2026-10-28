@@ -14496,7 +14496,7 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                                 }
                             }
                             // anti-xray + palette compression: buried hidden blocks sent as stone
-                            let mut hidden_cell = hidden.contains(st) && !no_xray;
+                            let mut hidden_cell = hidden.contains(st);
                             if chunkprof::enabled() && hidden_cell {
                                 chunkprof::HIDDEN_N
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
