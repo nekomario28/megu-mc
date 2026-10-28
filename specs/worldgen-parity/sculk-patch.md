@@ -621,26 +621,34 @@ native は隣接セルに書いている。→ この経路で**3 型の spreade
 `gen_sculk_patch` の入口。agent の再ビルド手順は `tools/carve-agent/README.md`）。
 これで「どのパッチが」「どこで spreading したか」を突き合わせられる。
 
-seed 0、native は chunk (-16,112) を起点に生成された **7×7 chunk** 分、port は同じ箱を
-`MC_SPINE_WG_DUMP_N=8` で dump して計測（native capture 1回=3分、port dump は秒）:
+seed 0、native は chunk (-16,112) を起点に生成された領域、port は `MC_SPINE_WG_DUMP_N=8`
+で近傍を含む 82 chunk を dump して計測（native capture 1回=3分、port dump は秒）。
 
-| | place 呼び出し | spreading した origin 数 | cursor 行 |
-|---|---|---|---|
-| native (mk6 capture) | 1231 | **57** | 28175 |
-| port (8×8 dump) | 2260 | **79** | 44612 |
+**最初に出した数字は coverage artifact だった（自分で訂正、2026-10-28）**。生の合計
+（native 1231 place / port 2260 place、spreading 57 対 79、共通 21）を並べると「port が
+1.8倍試行して 63% の位置で spreading していない」ように見えるが、これは**両者が dump した
+chunk 集合が違う**だけだった。両側が実際に試行した origin に制限すると:
 
-- **共通の spreading origin: 21**（= 21 パッチ分、10961 cursor 行が比較可能）
-- **食い違い（未解明、次の調査対象）**:
-  1. place 呼び出し数が 1231 対 2260（同じ箱で 1.8 倍）。同じ placement 設定なら試行数は
-     揃うはずなので、**placement の試行そのものが違う**可能性
-  2. spreading した origin が native 57 / port 79 で、**共通は 21 のみ**。
-     native の spreading 位置の 63% は port では spreading していない
-     （= 同じ chunk・同じ seed でもパッチの成否が違う）
+| 指標 | 値 |
+|---|---|
+| 両者が dump した chunk（共通） | 45（native 45 / port 82） |
+| その中の試行 origin | native 1228 / port 1231（**ほぼ一致**） |
+| 試行集合が**完全一致**する chunk | **25** / 45 |
+| 試行集合が違う chunk | **20** / 45（例: chunk (-19,110) は native 44 対 port 31 draws） |
+| 共通試行のうち native が spreading | 23 |
+| 共通試行のうち port が spreading | 21（**native の 21/23 に一致、port 単独の spreading は 0**） |
+| 差が出たパッチ | **2**: origin `(-277,-33,1822)` と `(-264,-38,1794)` |
 
-この 2 点は「セル数が 5082 対 4834」という差の**原因候補**である。ただし**両側の呼び出し
-集合が同じであることを先に確認しないと比較として成立しない**ので、いまはパッチ単位の
-fixture をこれ以上増やさず、この数を未解明のまま記録する（`patches`/`compare` の
-patch 対応は実装済みで、上記集合の差が説明でき次第そのまま使える）。
+つまり:
+
+1. **placement の RNG は chunk (-16,112) で完全一致**（19/19 draws、y も一致）。
+2. **同一試行に対するパッチの成否は 21/23 で一致**し、port が native に無い位置で
+   spreading することは無い。**残る差は 2 パッチだけ**（→ r=3 i=0 の分岐と同じ族）。
+3. 一方 **45 chunk 中 20 chunk で draw 列そのものが違う**（試行数も 44 対 31 など）。
+   試行数が同じで位置が違う = **その chunk の上流（同じ chunk 内で先に走る別 feature）が
+   消費した RNG が違う**ということで、これは sculk 本体ではなく**上流の feature 順序/RNG
+   消費**の問題である可能性が高い。次の調査対象はここ（`MC_SPINE_POP_ORDER` /
+   `XTRACE_FEAT` / `SCMARK` が両側にある）。
 
 ## native trace の再現性（2026-10-28、2 capture で実測）
 
