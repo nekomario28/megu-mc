@@ -759,8 +759,14 @@ shutdown hook で flush）に切り替えた。**順序が保証された trace 
 - **まだ未解決**: 順序保証付き trace でも、sculk の窓には**配置の draw が1本も入っていない**
   （窓 1219 のうち 1166 が draw 0 本、残りは 1窓あたり 1万本前後 = 別用途の draw）。`SRNG dzx` が
   出ているのに `dzx.c(I)I` の draw が窓に入らない理由は未解明で、**draw 列の比較はしていない**
-  （比較として成立していないため主張しない）。次は「どのインスタンス/どのメソッドが配置位置を
-  引いているか」を `dzx` の全メソッドにタグを付けて1 capture で確定させる。
+  （比較として成立していないため主張しない）。
+
+  有力な説明（次の1手）: 窓は `ebq.placeWithBiomeCheck` の**入口**で arm しているが、**位置は
+  その入口より前に引かれている**可能性が高い。窓の中で `SPLACE` → `SRNG` → `SPATCH` が連続し、
+  間に `dzx` の draw が1本も無い（もし入口の中で引いていれば必ず出る）ため。つまり arm 点を
+  **placement modifier 側**（`PlacementModifier.getPositions` 相当）に移せば、位置の draw が
+  窓に入るはず。`dzz` の 297130 本は窓の中で別用途（spreader 等）の draw と見られる。
+  次は modifier クラスを特定して arm/disarm をそこへ移し、1 capture で検証する。
 
 ## native trace の再現性（2026-10-28、2 capture で実測）
 
