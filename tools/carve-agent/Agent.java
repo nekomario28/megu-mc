@@ -1130,6 +1130,59 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("ad".equals(name)) {
+            // `Util.shuffledCopy(ObjectArrayList|Stream, RandomSource)`: log the list size and the
+            // caller class at entry, so a shuffle's bound can be traced back to the list that owns
+            // it (a `nextInt(49)` is a 50-element list, and the caller names it).
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        boolean list = mn.equals("a")
+                                && md.equals("(Lit/unimi/dsi/fastutil/objects/ObjectArrayList;Layw;)Ljava/util/List;");
+                        boolean stream = mn.equals("a")
+                                && md.equals("(Ljava/util/stream/Stream;Layw;)Ljava/util/List;");
+                        if (!list && !stream) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                if (list) {
+                                    super.visitVarInsn(Opcodes.ALOAD, 0);
+                                    super.visitMethodInsn(Opcodes.INVOKEVIRTUAL,
+                                            "it/unimi/dsi/fastutil/objects/ObjectArrayList", "size", "()I", false);
+                                } else {
+                                    super.visitInsn(Opcodes.ICONST_M1);
+                                }
+                                super.visitTypeInsn(Opcodes.NEW, "java/lang/Throwable");
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Throwable",
+                                        "<init>", "()V", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Throwable",
+                                        "getStackTrace", "()[Ljava/lang/StackTraceElement;", false);
+                                super.visitInsn(Opcodes.ICONST_1);
+                                super.visitInsn(Opcodes.AALOAD);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StackTraceElement",
+                                        "getClassName", "()Ljava/lang/String;", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "shuffle",
+                                        "(ILjava/lang/String;)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT ad shuffledCopy hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT ad hook failed: " + t);
+                return null;
+            }
+        }
         if ("eiv".equals(name)) {
             // `eiv` is `PlacedFeature` (`net.minecraft.world.level.levelgen.placement.PlacedFeature`).
             // Its `b(Ldds;Lduz;Layw;Ljd;)Z` is `placeWithBiomeCheck` - the placement's outermost

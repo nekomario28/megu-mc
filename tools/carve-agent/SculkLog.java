@@ -127,6 +127,21 @@ public class SculkLog {
     }
 
     /**
+     * `Util.shuffledCopy(list, random)` - logged with the list's size and its caller.
+     *
+     * `Util.shuffle` is Fisher-Yates (`nextInt(i+1)` for i = n-1..1), so a shuffle of an n-element
+     * list draws `nextInt(n)`, `nextInt(n-1)`, ... The bound alone therefore fingerprints the list
+     * length: a `(49)` draw is a 50-element list. Reading which class asks for a 50-element shuffle
+     * out of bytecode meant walking callers by hand; one line here answers it, and the caller class
+     * comes from a stack trace because the shuffle call itself carries no clue.
+     *
+     * Gated on the placement window (`armed`) so the volume stays to what is being investigated.
+     */
+    public static void shuffle(int size, String caller) {
+        if (armed()) out("SSHUFFLE size=" + size + " caller=" + caller);
+    }
+
+    /**
      * Entry of `PlacedFeature.placeWithBiomeCheck` - the point *before* the placement modifiers.
      *
      * Measured why this is the right arm point: the modifiers (which draw the position) run in
