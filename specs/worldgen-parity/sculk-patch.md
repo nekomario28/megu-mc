@@ -1079,8 +1079,33 @@ placement 窓の中だけで取ると、窓の中で起きた shuffle は
 **float 列の差が「その直後の int 列の差」として現れる**（いま見ている「25本目で port `(16)12` /
 native `(49)6`」がまさにその形）。分岐点は float 側にある可能性が高く、私の比較はそこを見ていない。
 
-**次の1手**: `compare-draws` を**全 draw 種**（`nextInt`/`nextLong`/`nextDouble`/`nextFloat` を
-順序どおり1列に正規化）で突き合わせ、最初にずれる draw が float か int かを確定する。
+**実施結果**: `compare-draws` を全 draw 種（`nextInt`/`nextLong`/`nextDouble`/`nextFloat` を
+kind ごと正規化し、float は 1e-6 許容で比較）に拡張した。結果は**変わらず** 24本一致 →
+25本目は **int**（port `nextInt(16)=12` / native `nextInt(49)=6`）で、float ではない。
+
+### `(49)` の呼び出し元をスタックトレースで確定（2026-10-28）
+
+bound が 16/321 以外のときだけ `new Throwable().getStackTrace()` の上位3フレームを
+`STRACE bound=<n> value=<v> | frame1 | frame2 | frame3` として出すようにして1 capture。
+`bound=49` の行は **`dyn.a | ayo.b | ehz.a`** に集中していた:
+
+- `ayo` = `net.minecraft.util.Mth` ✓
+- **`ehz` = `net.minecraft.world.level.levelgen.heightproviders.TrapezoidHeight`** ✓
+- つまり `(49)` は **台形 height provider の draw** であり、**sculk の経路ではない** ✓
+
+bound 49 = 台形の span が50のときの初回 draw ✓。したがって「25本目で分岐」は
+**sculk の描く列の違いではなく、窓の切り方の違い**である: port の窓は
+`(chunk -16,112, gi=1, step=7)` = **1つの feature** だが、native 側で突き合わせている列は
+**パス全体**（スレッド単位）なので、sculk の配置が終わった後は**別の feature の draw**が続く。
+24本一致した後に出てくる 49 はその「次の feature」のもので、sculk の差ではなかった。
+
+**次の1手（窓の切り方）**: native 側も **feature 単位**で切る。native は
+`SPLACE <feature-class>` と `SRNG <rng-class>` を feature ごとに出しているので、それで
+区切った列を作り、port の (gi,step) 窓と対応させる（`SPLACE` の feature クラスと、port の
+`SATTEMPT <name>` の順序は突き合わせ済みなので対応づけは可能）。その後で draw を1本ずつ比較する。
+
+**計器として再利用できる**: 「bound/種別だけが手がかり」のときは**その場でスタックトレースを
+出す**のが最も速い（bytecode を読んで呼び出し元を辿る手作業を3回踏んだ後の結論）。
 
 
 （`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、

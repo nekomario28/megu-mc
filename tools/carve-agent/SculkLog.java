@@ -184,7 +184,20 @@ public class SculkLog {
      * on the stack so it survives the call.
      */
     public static void drawIBound(int value, int bound, String kind) {
-        if (armed()) out("SDRAW " + kind + "(" + bound + ") " + value);
+        if (!armed()) return;
+        out("SDRAW " + kind + "(" + bound + ") " + value);
+        // A bound that is neither a placement modifier's nor a known shuffle gives no clue on its
+        // own, and walking callers out of bytecode by hand is how three hypotheses died already.
+        // For those, one stack trace names the caller at the moment it happens.
+        if (bound != 16 && bound != 321) {
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            StringBuilder sb = new StringBuilder("STRACE bound=").append(bound).append(" value=")
+                    .append(value);
+            for (int i = 1; i < st.length && i <= 3; i++) {
+                sb.append(" | ").append(st[i].getClassName()).append('.').append(st[i].getMethodName());
+            }
+            out(sb.toString());
+        }
     }
 
     public static void drawJ(long value, String kind) {

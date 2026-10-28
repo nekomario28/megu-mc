@@ -569,6 +569,72 @@ def native_bounded_draws(path):
     return out
 
 
+# One logical draw, from either side:
+#   agent: `SDRAW nextInt(bound)@dyn(16) 12`, `SDRAW nextFloat()@dyn 0.5`
+#   port : `DRAW 3 f=1,7 nextInt(16)=12`,    `DRAW 4 f=1,7 nextFloat=0.5`
+# The agent reports one logical draw through several hooks (the raw generator `@dzx` and a
+# parallel stream `@dzz` show up alongside the legacy mixin `@dyn`), so only `@dyn` counts - it is
+# the draw the port's own trace has. Everything else is an implementation detail of the same draw.
+AGENT_DRAW = re.compile(r'SDRAW (nextInt\(bound\)@dyn)\((\d+)\) (\S+)$'
+                        r'|SDRAW (next(?:Float|Double|Long|Int)\(\)@dyn) (\S+)$')
+PORT_DRAW = re.compile(r'DRAW \d+ f=-?\d+,-?\d+ (nextInt)\((\d+)\)=(\S+)$'
+                       r'|DRAW \d+ f=-?\d+,-?\d+ (next(?:Float|Double|Long|Int))=(\S+)$')
+
+
+def normalize_draw(kind, bound, value):
+    """(kind_key, is_float, value) with the two sides' spellings unified."""
+    if kind.endswith('nextInt(bound)@dyn'):
+        key = f'nextInt({bound})'
+    else:
+        key = kind.replace('()@dyn', '').replace('@dyn', '')
+    try:
+        if key in ('nextFloat', 'nextDouble'):
+            return key, True, float(value)
+        return key, False, int(value)
+    except ValueError:
+        return None
+
+
+def draws_of_trace(path, thread=None):
+    """[(kind, is_float, value)] in program order, from an agent trace (optionally one thread)."""
+    out = []
+    source = [lines_by_thread(path)[thread]] if thread else         (list(lines_by_thread(path).values()) or [trace_lines(path)])
+    for lines in source:
+        for line in lines:
+            m = AGENT_DRAW.match(line)
+            if not m:
+                continue
+            if m.group(1):
+                item = normalize_draw(m.group(1), m.group(2), m.group(3))
+            else:
+                item = normalize_draw(m.group(4), None, m.group(5))
+            if item:
+                out.append(item)
+    return out
+
+
+def draws_of_port(path):
+    """[(kind, is_float, value)] in program order, from a port log."""
+    out = []
+    for line in Path(path).read_text(errors='replace').splitlines():
+        m = PORT_DRAW.match(line.strip())
+        if not m:
+            continue
+        if m.group(1):
+            item = normalize_draw(m.group(1) + '(bound)@dyn', m.group(2), m.group(3))
+        else:
+            item = normalize_draw(m.group(4) + '()@dyn', None, m.group(5))
+        if item:
+            out.append(item)
+    return out
+
+
+def same_draw(a, b):
+    if a[0] != b[0] or a[1] != b[1]:
+        return False
+    return abs(a[2] - b[2]) < 1e-6 if a[1] else a[2] == b[2]
+
+
 def native_bounded_draws(path):
     """[(bound, value)] from an ordered trace's `nextInt(bound)@cls(<bound>) <value>` lines.
 
@@ -611,34 +677,34 @@ def cmd_compare_draws(args):
     the answer is a thread, a position and a match length, which is what turns "the placement
     differs" into "they agree for N draws and then ask different questions".
     """
-    port = [(int(m.group(1)), int(m.group(2)))
-            for line in Path(args.port).read_text(errors='replace').splitlines()
-            if (m := re.search(r'nextInt\((\d+)\)=(\d+)', line))]
+    port = draws_of_port(args.port)
     if not port:
-        print("sculk_trace: the port trace has no bounded draws (run with FSEED_ARM=... plus "
+        print("sculk_trace: the port trace has no draws (run with FSEED_ARM=... plus "
               "FEATURE_DRAW_LIMIT)", file=sys.stderr)
         return 2
-    by_thread = native_bounded_draws_by_thread(args.native)
-    if not by_thread:
-        by_thread = {'(untagged)': native_bounded_draws(args.native)}
+    threads = lines_by_thread(args.native)
+    by_thread = {t: draws_of_trace(args.native, t) for t in threads} if threads else \
+        {'(untagged)': draws_of_trace(args.native)}
+    by_thread = {t: v for t, v in by_thread.items() if v}
     total = sum(len(v) for v in by_thread.values())
     if not total:
-        print(f"sculk_trace: {args.native} has no bounded draws with a bound - an agent build that "
-              f"did not log them", file=sys.stderr)
+        print(f"sculk_trace: {args.native} has no draws - an agent build without the draw hooks",
+              file=sys.stderr)
         return 2
-    probe_len = args.window if args.window else min(6, len(port))
+    probe_len = args.window if args.window else min(8, len(port))
     probe = port[:probe_len]
-    print(f"native bounded draws {total} over {len(by_thread)} threads, port {len(port)}")
+    print(f"native draws {total} over {len(by_thread)} threads, port {len(port)} (all kinds)")
     print(f"probe (port's first {probe_len}): {probe}")
     best = None
     for thread, seq in by_thread.items():
-        hits = [i for i in range(len(seq) - len(probe) + 1) if seq[i:i + probe_len] == probe]
+        hits = [i for i in range(len(seq) - len(probe) + 1)
+                if all(same_draw(a, b) for a, b in zip(probe, seq[i:i + probe_len]))]
         if not hits:
             continue
         at = hits[0]
         same = 0
         for a, b in zip(port, seq[at:]):
-            if a != b:
+            if not same_draw(a, b):
                 break
             same += 1
         cand = (same, thread, at, seq, len(hits))
@@ -652,7 +718,8 @@ def cmd_compare_draws(args):
     print(f"occurrences: {hits}; best in thread {thread} at that thread's draw {at}")
     print(f"identical prefix there: {same} of {len(port)}")
     if same < len(port):
-        print(f"  first divergence: port {port[same]} native {seq[at + same]}")
+        print(f"  first divergence: port {port[same]} native {seq[at + same]}"
+              f"   <- kind {port[same][0]}")
     return 0 if same == len(port) else 1
 
 
