@@ -14227,9 +14227,9 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
         cx,
         cz,
         gen,
-        // Read per call rather than through the cached `env_flag!`, so a test can pass both
-        // settings and compare them without mutating the process environment.
-        std::env::var("MC_SPINE_PREFETCH_NEIGHBOUR").is_ok(),
+        // On by default. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` turns it off (the digest guard
+        // passes the setting explicitly, so it can compare both without the environment).
+        std::env::var("MC_SPINE_NO_PREFETCH_NEIGHBOUR").is_err(),
     )
 }
 
@@ -14266,16 +14266,16 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
     // (and the previous one back) means those reads are array reads too: measured, the
     // 621 reads that still fell through to `base_state` cost 36.5 ms of the encode loop's
     // 39 ms (58 µs each, because a cold cell re-runs the material rules).
-    // `MC_SPINE_PREFETCH_NEIGHBOUR=1`: compute the +x neighbour's sections for the same y
-    // band, publish them, and let that neighbour's own delivery consume them from the store
-    // instead of recomputing. It answers the exposure test's deep horizontal reads, which
-    // are the encode loop's cost (measured 482 `base_state` calls at 75 µs = 37 ms of 42).
+    // Prefetch the +x neighbour's sections for the same y band, publish them, and let that
+    // neighbour's own delivery consume them from the store instead of recomputing. It
+    // answers the exposure test's deep horizontal reads, which are the encode loop's cost
+    // (measured: 482 `base_state` calls at 75 µs = 37 ms of the loop's 42).
     //
-    // Opt-in, and off by default: computing a neighbour's terrain populates it, and the
-    // order chunks are populated in is an *input* to the feature layer (a chunk's features
-    // read the writes of the chunks populated before it). The pinned captures use an
-    // explicit source order, so changing production's order is a parity decision, not a
-    // performance one - this switch exists to measure what it would buy.
+    // On by default. It does populate the neighbour a step before its arrival, and the order
+    // chunks are populated in *is* an input to the feature layer, so that had to be checked
+    // rather than assumed: `chunk_delivery_digest` compares terrain-state digests with this
+    // setting on and off over 2 seeds x 3 sweep directions (60 sweeps) and finds them
+    // identical, and it asserts that stays true. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` reverts.
     let mut carried_next: Option<Box<[u32; 4096]>> = None;
     let mut prev_base: Option<Box<[u32; 4096]>> = None;
     for sec in 0..24 {
@@ -14317,6 +14317,12 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
             if prefetch {
                 if let Some(rows) = &base {
                     publish_section(cx, cz, sy, rows);
+                    // Only +x. The exposure test also reads +z and the diagonal, and
+                    // prefetching those too (measured) takes encode from 29 to 12 ms but
+                    // raises the window's CPU from 29.6 to 32.1 s: the diagonal's sections
+                    // are often computed for a chunk that is not delivered next. The +x
+                    // neighbour is the one a sweep is about to deliver, so only it is
+                    // worth computing early.
                     if let Some(nbr) = worldgen::terrain_section(cx + 1, sy, cz, feature::populate)
                     {
                         publish_section(cx + 1, cz, sy, &nbr);

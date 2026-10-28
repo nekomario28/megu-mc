@@ -121,3 +121,44 @@ per-chunk の所有に分ければ消える種類の時間。段 2/3 の効果�
 各段の出口では、既存の feature capture digest・地形 0 セル・`cargo test` 全体・
 mutation check が緑であることを要求する。段 3 の perf 主張は `WARM=1` を
 同一 binary・同一ホストの前後比較で取り、x1.10 未満の差は主張しない。
+
+## 2026-10-28: 採用した最適化（この spec の段 2 までの結果）
+
+`FEAT_PROFILE` / `CHUNKPROF` / `LOOPPROF` / `LOCKPROF` / `GENLOCK` と決定論的 bench
+（`chunk_delivery_path_bench`, `chunk_delivery_digest`）を常設したうえで、段 1〜2 の
+範囲を次のように実装した（すべて既定で有効）。
+
+1. **生成 tick キューを `Gen` から出した**（葉・流体）。tick スレッドは 1 tick ごとに
+   それを drain するが、`Gen`（ワールドロック）の下にあると**新しいチャンクの
+   populate 待ち**になる。分離後: tick body 13.8 → **0.17 ms/tick**、`GENLOCK wait`
+   1451 → 86 ms/100 tick、**20 TPS かつ予算超過 0/100**（以前は 17.5-19.4 TPS、
+   8-13/100 超過）。総 CPU は不変（待っていただけだった）。
+2. **チャンク単位の状態バンド**（`[min wtop-18, max wtop+18]`、`chunk_data` が
+   計算済み states から install、書き込みは write-through patch、per-chunk version）。
+   ライト経路のセル読みがワールド評価から配列読みへ: `block_at` 21,619-29,536 →
+   **25-46 回/chunk**。
+3. **anti-xray 露出テストを手持ちの配列から返す**（同一セクション＋繰り越した上下
+   セクション）: `base_state` 6,795 → **482 回/chunk**。
+4. **+x 隣チャンクのセクション先読み**（既定 on、`MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` で
+   off）: 露出テストが読む深い水平近傍を、隣の配信時に消費される形で先に計算する。
+   encode 42 → **29 ms/chunk**（+z と対角まで広げると 12 ms まで下がるが、窓の CPU が
+   29.6 → 32.1 s に増えるので +x のみ）。
+   - **順序契約への影響を検証した**: 隣を先に計算する＝到着前に populate するので、
+     feature 層が見る「先に populate されたチャンク」が変わりうる。`chunk_delivery_digest`
+     が 2 seed × 3 掃引方向（60 掃引）で flag off/on の地形 states を比較し、
+     **一致**することを assert する（control = 同じ設定 2 回の再現性も assert）。
+   - 検証中に**別のバグ**を発見した: 状態バンドが `worldgen::init` を生き延び、
+     次の generator の世界に対して前の世界の状態を返していた。`generation_seq` を
+     導入して世代が違えばキャッシュを捨てる形にした（これが直る前は上の digest 比較が
+     「世界が変わる」と誤って報告していた）。
+5. 併せて: `chunk_data` の長い `world()` 保持の除去、ライト BFS の長保持の除去、
+   感圧板ループの overlay のみ読み、scheduled-tick のセル読み一括化、advancement の
+   イベント索引（全走査の廃止。導入時に自己デッドロックを作り、恒久ガードを追加）。
+
+### 測定の規律（このホストで必要だったこと）
+
+- end-to-end は同じバイナリでも 11.9-29.4 s と振れる（他レーン）。**wall clock の A/B では
+  20% 級は分離できない**。→ 決定論的な bench と、負荷非依存のカウンタを常設した。
+- 「速く見えた」例が 2 つあり、どちらも**計測の取り違え**だった: (a) 壊れたビルド
+  （advancement のデッドロック）が 2.5 倍軽く見えた、(b) bench の 2 パス目だけ warm で
+  順序仮説が 40% 良く見えた。どちらも control を足した瞬間に消えた。
