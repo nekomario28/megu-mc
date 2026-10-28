@@ -663,6 +663,7 @@ native trace に対して行っており、そちらは再現する範囲で有�
 | port 側 `SPC_CURSOR_TRACE=1` / `SPC_TRACE_ALL=1` / `FEATURE_WRITE_TRACE=<cx>,<cz>|all` / `GENERIC_CASE_DUMP=<path>` | 同じ形の trace（`SCURSOR` 相当 / 書き込みと呼び出し元 / 呼び出し元なしの書き込み順 / fixture 差分） |
 | `tools/sculk_trace.py extract <run.log> [--rounds N]` / `compare <native> <port>` | `SCURSOR` 行を抽出し、**(round, index) で整列**して比較。共有キーが食い違えば exit 1（gate として使える） |
 | `tests/data/sculk_cursor_1211.tsv` | native 側の先頭 60 行（round 0..5）。再生成: `tools/sculk_trace.py extract <run.log> --rounds 5`。**port 側は同じ capture が必要**（`SPC_CURSOR_TRACE=1` の dump を同じ chunk で） |
+| `~/.cache/mc-spine-audit/sculk-traces/`（repo 外・再生成可能） | これまでの native/port の完全な trace（`traces-mk*.txt` = agent run の生 log 抽出、`port_after_fixes.txt`）。repo には先頭スライスだけを置き、完全版は再生成コマンドで作る |
 
 現在の比較結果（この capture、round 0..5 のスライス）:
 
