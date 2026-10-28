@@ -959,14 +959,42 @@ native が窓の中で引いていた bound は `(16)/(321)`（modifier）以外
 
 これは以前の作業メモ「18近傍リストは x-fastest（測った）＝ order is the draw」を**読み違えていた**
 ことを意味する: 近傍の順序は**固定の列挙順ではなくシャッフル**で、その draw が
-`RandomSource` に乗る。port の `spc_cursor_update` は `rng` を**一切使っていない**（grep で確認）ので、
-ここが丸ごと欠けている。シャッフル順が違えば近傍を処理する順序が変わり、**セル配置が変わる**ので、
-sculk のセル差（5082 対 4834）の主因である可能性が高い。
+`RandomSource` に乗る。vanilla の該当箇所は
 
-**次の1手（実装）**: `dmu$a` の制御フローを読み、どのリストをどのタイミングで
-`Util.shuffle` しているかを確定して、port の `spc_cursor_update`（と周辺）で同じ shuffle を
-同じ順に引く。検証は `DTRACE` で1本ずつ（bound と値の両方）、その後に
-`tools/sculk_gate.py --require-match`。
+```java
+private static final ObjectArrayList<Vec3i> c =
+    Util.toArrayList(new ObjectArrayList(18),
+        p -> BlockPos.betweenClosed(new BlockPos(-1,-1,-1), new BlockPos(1,1,1)));
+private static List<Vec3i> a(RandomSource random) { return Util.shuffledCopy(c, random); }
+// 呼び出し側: for (Vec3i off : a(random)) { ... }
+```
+
+= **候補リストを毎回コピーして配置 RNG でシャッフルしてから回す** ✓。
+
+### 訂正: port はすでにシャッフルを実装している（私の主張が誤り）
+
+「port の `spc_cursor_update` は `rng` を一切使っていない」は**誤り**だった。`rng` を使うのは
+`spc_find_next_sculk` で、そこは正しく `util_shuffle(&mut offsets, rng)` を呼んでいる
+（`util_shuffle` は `rng.next_bound(i)` = vanilla の Fisher-Yates と同形 ✓、`next_bound` は
+`dtrace` を出すので trace にも乗る ✓）。`spc_cursor_update` 本体に `rng.` が無いのは、draw が
+その関数にあるのではなく呼び先にあるためで、「欠けている」ことの証拠ではなかった。
+
+### 残っている問い（より鋭い形）
+
+同じ pass（chunk -16,112 の `sculk_patch_deep_dark`）で:
+
+| | 告知されたパッチ | entry 検査を通った | cursor を更新した |
+|---|---|---|---|
+| port（`port-armed.log`） | 915（全 chunk） | — | **arm 窓の中では 0** |
+| native | — | — | arm 窓の中で shuffle の draw が見える |
+
+つまり arm 窓の draw 差は「コードに draw が無い」ではなく、**その pass で cursor 更新に到達した
+パッチが 0 だった**ことによる。n=1 の差なので**系統差の証拠にはならない**（全体の通過率は
+native 4.8% / port 3.7% で同程度）。
+
+**次の1手**: 同じ chunk の pass を両側で対応させ、(a) 告知数、(b) entry 検査通過数、
+(c) cursor 更新数 を数える。そこで差が出れば draw を1本ずつ、出なければ「pass 内の feature 実行
+タイミング」へ進む。
 
 （`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、
 `net.minecraft.world.level.block.SculkSpreader` のように**正しいパッケージ**で渡すこと。
