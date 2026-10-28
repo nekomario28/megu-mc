@@ -2453,7 +2453,10 @@ pub(crate) fn facts() -> Option<GenFacts> {
 }
 
 fn gen_lock() -> GenLock {
-    let prof = env_flag!("FEAT_PROFILE");
+    // Either switch turns the timing on: `FEAT_PROFILE` for generation-only runs,
+    // `MC_SPINE_TICK_PROFILE` for a live server, where the tick thread is the caller
+    // that queues behind a section pass.
+    let prof = env_flag!("FEAT_PROFILE") || env_flag!("MC_SPINE_TICK_PROFILE");
     let started = prof.then(std::time::Instant::now);
     let guard = GEN.lock().unwrap();
     GenLock {
@@ -2468,7 +2471,7 @@ fn gen_lock() -> GenLock {
 /// `wait / (wait + hold)` is the share of lock-attributed time spent queued; a
 /// worker-per-chunk design removes the queue, not the hold.
 pub fn report_gen_lock() {
-    if !env_flag!("FEAT_PROFILE") {
+    if !env_flag!("FEAT_PROFILE") && !env_flag!("MC_SPINE_TICK_PROFILE") {
         return;
     }
     use std::sync::atomic::Ordering;

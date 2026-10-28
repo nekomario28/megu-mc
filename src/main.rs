@@ -13206,10 +13206,20 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
     // path that needs both takes them in that order, and this pass must not be the one that
     // reverses it.
     let lava: Vec<(i32, i32, i32)> = lavas().lock().unwrap().iter().copied().collect();
-    // One guard for the whole pass. The spread reads a cell per neighbour per visited cell -
-    // tens of thousands of reads for a single torch - and each read taking the mutex was what
-    // made this the expensive half of the light work.
-    let w = world().lock().unwrap();
+    // The 3x3 window's edits, copied under one short lock, then read without it.
+    //
+    // This pass used to hold `world()` from here to the end: it reads a cell per neighbour
+    // per visited cell (tens of thousands of reads for a single torch), and taking the
+    // mutex per read was what made this the expensive half of the light work. Holding it
+    // instead meant every tick-thread read queued behind a whole light pass. The copy is
+    // the window's own edit maps — a handful of entries per chunk, empty on fresh chunks.
+    let w: HashMap<(i32, i32), HashMap<u32, u32>> = {
+        let guard = world().lock().unwrap();
+        (-1..=1)
+            .flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz)))
+            .filter_map(|k| guard.get(&k).map(|c| (k, c.clone())))
+            .collect()
+    };
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
     // Generated light sources for this chunk and the eight neighbours (recorded by `chunk_data`
     // as each was streamed). `block_light_sections_from` clips them to the search area, so an
@@ -13609,11 +13619,18 @@ fn overlay_band(cx: i32, cz: i32) {
     }
     let band = std::sync::Arc::make_mut(&mut bands[pos].2);
     let (y0, y1) = (band.y0, band.y1);
-    let w = world().lock().unwrap();
-    let Some(col) = w.get(&(cx, cz)) else {
-        return;
+    // Copy the edits, then apply them: the guard would otherwise be held while the band
+    // rows are written, and the tick thread reads `world()` every tick.
+    let col: Vec<(u32, u32)> = {
+        let w = world().lock().unwrap();
+        match w.get(&(cx, cz)) {
+            Some(c) => c.iter().map(|(k, v)| (*k, *v)).collect(),
+            None => {
+                return;
+            }
+        }
     };
-    for (idx, st) in col {
+    for (idx, st) in &col {
         let y = (*idx >> 8) as i32 + MIN_Y;
         if y < y0 || y > y1 {
             continue;
@@ -22906,6 +22923,9 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     if prof && n % 100 == 0 {
         tickprof::report();
         lockprof::report();
+        // The worldgen lock is the other queue the tick thread sits in: a section pass
+        // holds it for tens of milliseconds while the tick reads block states.
+        crate::worldgen::report_gen_lock();
     }
     let mut run = |name: &'static str, f: fn()| {
         if prof {
