@@ -838,6 +838,42 @@ compare-biomef` で候補の**列**を突き合わせた結果:
 （この罠の再発防止）。次の測定は **1 phase 内**で、`SPATCH` から次のマーカーまでを1パッチ分として
 切り出し、`(bound, value)` で両側を突き合わせる。
 
+## 分岐は「feature 自身の draw」に絞られた（2026-10-28、実測）
+
+`tools/sculk_port_run.sh` を足して **port 側も1コマンド・1 run** で取れるようにし（`MC_SPINE_WG_PROFILE=0`
+で warm-up pass を切る = 配置行と arm 済み draw 行が同じ run に入る）、arm を
+`-16,112,1,7`（`sculk_patch_deep_dark`）にして両側を突き合わせた:
+
+| | port（`port-armed.log`） | native（`sculk-trace-order.txt`） |
+|---|---|---|
+| arm 窓の中の draw 数 | **768 = 256 × 3** | modifier の draw + **feature の draw** |
+| 一致した長さ | **24 本**（8 候補分） | 同 |
+| 25 本目 | `nextInt(16)=12`（次の候補の x） | **`nextInt(49)=6`**（feature の中） |
+
+順序保証付き trace を並べると形がはっきりする。native は**候補を受理した瞬間に feature を走らせ**、
+その中で draw する:
+
+```
+... SDRAW nextInt(bound)@dyn(321) 0
+    BIOMEF -248 -64 1794 true feature=1,7     ← 受理
+    SPLACE edi -16 112
+    SRNG dzx
+    SPATCH -248 -64 1794                      ← patch の origin = 受理された位置
+```
+
+一方 port は 768 本＝**modifier の draw だけ**で、feature の draw が1本も無い（256 候補 ×3）。
+つまり **port 側の sculk feature 経路が、native が引く draw（例 `nextInt(49)`）を引いていない**。
+placement（候補 256・判定・採用 21・順序）は完全一致しているので、残る差はここ。
+
+### 未解決（次の1手）
+
+native trace には **`BIOMEF` 行が続くのに draw が1本も出ない区間**がある（実測: 受理された候補の
+feature 実行後）。`BIOMEF` は armed に依らず出るが `SDRAW` は armed 依存なので、その区間は
+**armed が落ちている**。原因は未確定だが、arm の実装が**2系統ある**ことが疑わしい
+（`SculkLog.armPlacement`/`disarm` による `eiv.b` ベースの arm と、`SculkLog.place` が
+feature クラスで `ARMED` を set/remove する古い経路）。次は後者を消して `armPlacement` に一本化し、
+再 capture して「native が引く feature 内 draw」を最後まで追えるようにする。
+
 ## 効率化の基盤（2026-10-28）
 
 このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。

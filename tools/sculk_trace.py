@@ -200,9 +200,39 @@ def class_of_type(name):
     return None
 
 
+def is_port_trace(path):
+    """A port trace carries `DRAW n f=<gi>,<step> <kind>=<value>` and no `SPLACE` windows."""
+    raw = Path(path).read_text(errors='replace')
+    return 'DRAW ' in raw and 'SPLACE' not in raw and 'SPATCH' in raw
+
+
 def sanity_problems(path, required=()):
-    """Structural checks that fail loudly instead of producing quiet nonsense."""
+    """Structural checks that fail loudly instead of producing quiet nonsense.
+
+    Two flavours: the agent's ordered trace (SPASS/SPLACE/SDRAW/SPATCH) and the port's own stderr
+    (SPASS/SPATCH/DRAW). They answer the same questions, so the checks are shared - the flavour
+    only decides how a draw is spelled.
+    """
     problems = []
+    port_flavour = is_port_trace(path)
+    if port_flavour:
+        for kind in required:
+            if kind not in Path(path).read_text(errors='replace'):
+                problems.append(f"{path}: no {kind} lines (required by --require)")
+        if 'SPASS' not in Path(path).read_text(errors='replace'):
+            problems.append(f"{path}: port trace without SPASS - the pass grouping has nothing "
+                            f"to use")
+        raw = Path(path).read_text(errors='replace')
+        draws = re.findall(r'DRAW \d+ f=-?\d+,-?\d+ (\S+)=(\S+)', raw)
+        small = [(k, v) for k, v in draws if 'nextInt' in k and v.lstrip('-').isdigit()
+                 and abs(int(v)) < 1024]
+        if not draws:
+            problems.append(f"{path}: port trace with no `DRAW` lines - the run was not armed "
+                            f"(`FSEED_ARM=cx,cz,gi,step` + `FEATURE_DRAW_LIMIT`)")
+        elif not small:
+            problems.append(f"{path}: port trace draws nothing position-like (a bounded `nextInt` "
+                            f"under 1024) although it has {len(draws)} draws")
+        return problems
     lines = trace_lines(path)
     kinds = collections.Counter(l.split()[0] for l in lines)
     if not lines:
@@ -220,11 +250,17 @@ def sanity_problems(path, required=()):
     # while its `DRAW` lines came from the dump pass, 12k lines later - so a "what drew this"
     # reading off that file silently mixes two runs.
     raw = Path(path).read_text(errors='replace')
-    if '[wgprof]' in raw and '[wgdump]' in raw:
+    # The profile pass is what makes it two runs - and it is harmless when it is a no-op:
+    # `MC_SPINE_WG_PROFILE=0` still prints the banner and generates nothing, so the banner alone
+    # is not the signal. (Found by this guard firing wrongly on the very capture that avoided the
+    # trap; a guard that cries wolf gets switched off, which is worse than not having it.)
+    prof = re.search(r'\[wgprof\] (\d+)x(\d+) chunks', raw)
+    if prof and (int(prof.group(1)) or int(prof.group(2))) and '[wgdump]' in raw:
         problems.append(
-            f"{path}: this file holds two port phases ([wgprof] then [wgdump]) - the placement "
-            f"lines and the armed draw lines come from different runs, so anything that reads "
-            f"both as one sequence is mixing runs; slice by phase first")
+            f"{path}: this file holds two port phases ([wgprof] {prof.group(1)}x{prof.group(2)} "
+            f"then [wgdump]) - the placement lines and the armed draw lines come from different "
+            f"runs, so anything that reads both as one sequence is mixing runs; slice by phase "
+            f"first")
     if kinds['SPLACE'] and not kinds['SPASS']:
         problems.append(f"{path}: SPLACE without SPASS - the pass grouping has nothing to use")
     windows = window_summary(split_windows(lines, arm='trailing'))

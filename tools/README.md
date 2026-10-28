@@ -35,6 +35,7 @@
 | `tools/carve-agent/`（`Agent.java` + `CarveLog.java` + `SculkLog.java`、`JAVA_AGENT=` で参照サーバーに載せる） | 固定 jar を ASM で instrument して**native の中間状態**を取る。sculk 用に `SCURSOR r=<round> i=<index> x y z charge decayDelay updateDelay facingMask`（`dmp$a` の `ChargeCursor.update` 入口）と `SCMARK`（呼び出し元）/`SSPREADALL types=<n>`（spread type 数）を出す。`-Dfeaturebox=minX,minY,minZ,maxX,maxY,maxZ` で feature 層の書き込みを `FCELL x y z state=<id> feature=<gi>,<step> chunk=<pop>` としても出る。port 側は対応する `SPC_CURSOR_TRACE` / `SPC_TRACE_ALL` / `FEATURE_WRITE_TRACE`（+`GENERIC_CASE_DUMP`）で同じ形を出せる。[計器と実測](../specs/worldgen-parity/sculk-patch.md) |
 | `build_carve_agent.sh [out-dir]` | carve-agent の jar を組んで**検証する**（`Agent.class`/ASM/ロガーの中身、マーカー文字列、フックの配線まで確認してから返す）。手順を手で打つと `head` が javac の終了コードを飲んだり、半分適用された編集から jar を作ったりして「動いているように見える古い jar」ができる（実測で2回踏んだ）。`sculk_capture.sh` はこれを使う |
 | `sculk_capture.sh <tag> [--chunk CX CZ] [--n N] [--mode M] [--jar PATH] [--settle S]` | **native capture を1コマンドに**する。agent を組む → fixture を回す（trace は `-Dsculktrace=` で自前ファイルへ）→ `PROVENANCE-<tag>.txt`（seed/chunk/agent sha/行数）を書く → `sculk_trace.py sanity` で**読めない trace を不合格**にする。既定の保存先 `~/.cache/mc-spine-audit/sculk-traces/` |
+| `sculk_port_run.sh <tag> [--n N --x CX --z CZ --arm cx,cz,gi,step --limit N]` | **port 側の run を1コマンドに**（`MC_SPINE_WG_PROFILE=0` で warm-up を切る／`FEATURE_ATTEMPT_TRACE`・`SPC_CURSOR_TRACE`・`FSEED_ARM`＋`FEATURE_DRAW_LIMIT` を1箇所に／provenance／`sanity`）。env を1つ忘れると trace が答えられない問いが生まれる（例: `FEATURE_ATTEMPT_TRACE` 無しだと `SPASS` が無く pass 比較が無意味）ので、一緒に運ぶ env は1ファイルに置く |
 | `sculk_capture.sh <tag> --jvm-opt=-Dfoo=bar` | JVM プロパティを capture に渡す（例: `-Dbiomefchunk=cx,cz` で native 側の biome フィルタ判定 `BIOMEF` を出し、port の `BIOMEF_TRACE=cx,cz` と突き合わせる。実測: sculk patch の候補 256/256、判定 256/256、採用 21/21 が一致）|
 | `sculk_trace.py compare-draws <native> <port-draw.log>` | port の draw 列を native の流れから **`(bound, value)`** で探し、一致長と最初の食い違いを出す（native 側は `SculkLog.drawIBound` が bound を出す）。実測: `sculk_patch_deep_dark` chunk (-16,112) で **24本一致**、25本目で port `nextInt(16)=12` / native `nextInt(49)=6` |
 | `sculk_trace.py summary\|sanity\|passes\|windows\|draws\|names\|compare-passes\|extract\|patches` | trace の読み取り・検査・比較を**1つの道具**にした。`sanity` は「窓に draw が入っていない」「`SPLACE` が feature 表に無いクラスを指す」「`run.log`（= log4j、行順がプログラム順でない）を位置で切ろうとしている」「port のログに `[wgprof]` と `[wgdump]` の2 phase が混ざっている（= 配置行と arm 済み draw 行が別 run のもの）」を**不合格にする**。実測: 健全な capture = SANE、`ebq`（=`ConfiguredFeature`）で arm した capture = UNUSABLE、draw フック無し = UNUSABLE。`compare-passes` は pass 単位で試行 origin 集合を突き合わせ、差の分布と最初の食い違いを出す |
@@ -74,6 +75,10 @@
 | `MC_SPINE_POP_REGION` / `MC_SPINE_DFDUMP` / `MC_SPINE_HM_DUMP` / `MC_SPINE_BIOME_AT` / `MC_SPINE_BIOME_DUMP` | 密度値・ハイトマップ・biome の2定義の実測 |
 
 ## sculk trace の読み方（この順で）
+
+この節の教訓の一般形は skill `trace-oracle-reliability`（計器を作る側の失敗型: arm 点が1段深い／
+行順がプログラム順でない／1ファイルに2 run／フック状態のスコープ／古い jar／ラベル≠実体／
+落ちたことのある gate）に蒸留してある。
 
 1. `tools/sculk_capture.sh <tag>` — 組んで・回して・`sanity` で弾く。trace の行順は
    **プログラム順**（`SculkLog` が自前の writer に書く）。`run.log` は log4j 経由で、同じ
