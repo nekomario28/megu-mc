@@ -2992,25 +2992,41 @@ fn spc_growth_state(
 fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool {
     let (x, y, z) = cursor.pos;
     let state = ctx.get(x, y, z);
-    match cursor.facings {
-        // `facings == null`: `SculkVeinBlock.m()`, the spreader with only SAME_POSITION
-        None if std::env::var("SPC_NO_CURSOR_SPREAD").is_ok() => false,
-        None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
-        // empty facings: the interface default uses `SculkVeinBlock.c()` (all three types)
-        Some(0) => spc_spread_all(
+    match spc_kind(reg, state) {
+        // `SculkBlock` (`dmq`) and `SculkVeinBlock` (`dmv`) do **not** override the five-argument
+        // `attemptSpreadVein`, so the interface default runs: it ignores `facings` and spreads
+        // with `SculkVeinBlock.c()` - **all three** spread types. Measured against the native
+        // agent: the `spreadAll` of a cursor standing on a vein reports `types=3`, and that is
+        // where its neighbour-cell placements come from. Treating this like the default
+        // behaviour (SAME_POSITION only) was the port's first divergence.
+        SpcKind::Sculk | SpcKind::Vein => spc_spread_all(
             ctx,
             reg,
             cursor.pos,
             state,
             &[0, 1, 2],
-            "spread-cursor-3type",
+            "spread-behaviour-3type",
         ),
-        Some(mask) => {
-            if !reg.is_air(state) && reg.fluid_name(state) != "minecraft:water" {
-                return false;
+        // Every other block uses `dmp$1`: null facings -> `m()` (SAME_POSITION only), empty
+        // facings -> the interface default (all three), otherwise the static four-argument
+        // overload with the faces the cursor stored.
+        SpcKind::Other => match cursor.facings {
+            None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
+            Some(0) => spc_spread_all(
+                ctx,
+                reg,
+                cursor.pos,
+                state,
+                &[0, 1, 2],
+                "spread-cursor-3type",
+            ),
+            Some(mask) => {
+                if !reg.is_air(state) && reg.fluid_name(state) != "minecraft:water" {
+                    return false;
+                }
+                spc_vein_attempt_spread(ctx, reg, cursor.pos, state, mask)
             }
-            spc_vein_attempt_spread(ctx, reg, cursor.pos, state, mask)
-        }
+        },
     }
 }
 
@@ -3337,9 +3353,15 @@ fn spc_find_next_sculk(
     pos: (i32, i32, i32),
 ) -> Option<(i32, i32, i32)> {
     let mut offsets: Vec<(i32, i32, i32)> = Vec::with_capacity(18);
-    for x in -1i32..=1 {
+    // `BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` order, measured through the pinned jar:
+    // `(-1,-1,-1) (0,-1,-1) (1,-1,-1) (-1,0,-1) ...` — **x varies fastest**, then y, then z.
+    // The order is the draw: `util_shuffle` below turns this list into the permutation
+    // `findNextSculk` walks, so iterating x outermost (as this did) yields a different pick for
+    // the same random stream. That, not a rule, is what made the port's first divergent cursor
+    // choose a different neighbour while every earlier write matched exactly.
+    for z in -1i32..=1 {
         for y in -1i32..=1 {
-            for z in -1i32..=1 {
+            for x in -1i32..=1 {
                 if (x == 0 || y == 0 || z == 0) && !(x == 0 && y == 0 && z == 0) {
                     offsets.push((x, y, z));
                 }

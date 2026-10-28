@@ -614,6 +614,46 @@ native は隣接セルに書いている。→ この経路で**3 型の spreade
 `types=-2`（ReflectiveOperationException）で失敗したので、`dmv$a` の `a()` を直接
 `getDeclaredMethod` で引く形に直す。これで「1 型か 3 型か」が 1 行で確定する。
 
+## 2件の根本原因を修正（2026-10-28、いずれも native 計測が起点）
+
+### 1. `attemptSpreadVein` の spread type は**振る舞いごとに違う**
+
+native の `spreadAll` 入口で config の spread type 数を出したら
+**`SSPREADALL types=3`**（1 ではなく 3）。bytecode で裏づけ:
+
+- `dmp` の **interface 既定** `a(dcx,jd,dtc,Collection,boolean)` は
+  `((dky)Blocks.SCULK_VEIN).c().a(state, level, pos, wg)` = **`c()` = 3 型**（`facings` を無視）
+- `SculkBlock` (`dmq`) も `SculkVeinBlock` (`dmv`) も**この 5 引数を override していない**
+  （`dmv` にあるのは *static* 4 引数のほう）→ **vein/sculk 上の cursor は常に 3 型**
+- `dmp$1`（その他のブロック）だけが `facings == null` で `m()` = 1 型
+
+port は常に `dmp$1` の規則を使っていた ✗ → **修正**。
+
+### 2. `findNextSculk` の 18 近傍リストの**順序**が逆だった
+
+`BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` の反復順を固定 jar で実測すると
+`(-1,-1,-1) (0,-1,-1) (1,-1,-1) (-1,0,-1) ...` = **x が最速**、次に y、最後に z。
+port は x を最外にしていた ✗ → 同じ乱数 stream でも `util_shuffle` の順列が変わり、
+`findNextSculk` の選択が変わる（＝**規則ではなく順序**が最初の分岐点だった）。
+
+### 計測した効果（cursor trace、同じ native trace と整列）
+
+| | 最初の食い違い | 共有キーの食い違い |
+|---|---|---|
+| 修正前 | r=1 i=0 | 4654 |
+| 修正後 | **r=3 i=0** | **4527** |
+
+つまり最初のパッチの **round 0〜2 が完全一致**（round 3 で分岐）。
+
+### 注意: 全域セル数の before/after は**この区画では主張できない**
+
+同じ 6x6 recipe（seed 0、(-20,108)+6x6、features）で参照を取り直すと
+**参照自体が 5933→5733 と動いた**（前回 5987 / 今回 5733）。同一 recipe の参照が
+254 セル動く以上、capture をまたいだ比較は無効。このページの before/after はすべて
+**同一 capture 内**（同じ `/tmp/chunkfix-*` の参照）で測っている。原因（生成順の
+非決定性か、pack の差か）は**未解明のまま記録**する。トレース比較は同じ capture の
+native trace に対して行っており、そちらは再現する範囲で有効。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・
