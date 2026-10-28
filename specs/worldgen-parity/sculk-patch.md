@@ -1044,9 +1044,16 @@ draw ではない（`getInt` の手前で必ず float を引くため）。bound
 **sculk 経路のどこかが50要素のリストをシャッフルしている**。既知の近傍リストは
 `ChargeCursor.c` = `betweenClosed(-1,-1,-1)..(1,1,1)` の **27要素**（初回 draw は 27）なので別物。
 
-次の1手: 50要素のリストをシャッフルしている箇所を固定 jar の bytecode から特定する
-（`SculkSpreader` の周辺、`SculkBlock`、vein 側の順に `ad.a(List, RandomSource)` の呼び出し元を
-辿る）。それが分かれば port 側で同じ位置に同じ draw を入れられる。
+読みで絞った結果（固定 jar の bytecode）: sculk 関連クラス（`dmu`/`dmu$a`/`dmq`/`dmv`/`dmp`/
+`dky`/`dkz`/`edi`）のうち **`Util.shuffledCopy` を呼ぶのは `dmu$a` だけ**で、そのリストは
+`betweenClosed(-1,-1,-1)..(1,1,1)` の **27要素**（初回 draw は 27、49 ではない）。つまり `(49)` は
+**armed 窓が間接的に呼ぶ別のクラス**（ブロック設置系のヘルパーなど）にある。
+
+**次の1手（計器）**: `ad.a(Ljava/util/List;Layw;)Ljava/util/List;`（= `Util.shuffledCopy`）に
+フックを入れ、**リストの要素数と、`new Throwable().getStackTrace()` から取った呼び出し元クラス名**
+を `SSHUFFLE <size> <caller> <thread>` として順序保証付き writer に出す。これを sculk 窓の中の
+位置と突き合わせれば、49要素リストの持ち主が1回の capture で確定する（読解より速い）。
+そのあと port 側の同じ位置に同じ draw を入れて、`compare-draws`（thread 単位）で1本ずつ確認する。
 
 （`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、
 `net.minecraft.world.level.block.SculkSpreader` のように**正しいパッケージ**で渡すこと。
