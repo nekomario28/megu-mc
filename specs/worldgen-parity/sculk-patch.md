@@ -644,11 +644,30 @@ chunk 集合が違う**だけだった。両側が実際に試行した origin �
 1. **placement の RNG は chunk (-16,112) で完全一致**（19/19 draws、y も一致）。
 2. **同一試行に対するパッチの成否は 21/23 で一致**し、port が native に無い位置で
    spreading することは無い。**残る差は 2 パッチだけ**（→ r=3 i=0 の分岐と同じ族）。
-3. 一方 **45 chunk 中 20 chunk で draw 列そのものが違う**（試行数も 44 対 31 など）。
-   試行数が同じで位置が違う = **その chunk の上流（同じ chunk 内で先に走る別 feature）が
-   消費した RNG が違う**ということで、これは sculk 本体ではなく**上流の feature 順序/RNG
-   消費**の問題である可能性が高い。次の調査対象はここ（`MC_SPINE_POP_ORDER` /
-   `XTRACE_FEAT` / `SCMARK` が両側にある）。
+3. 一方 **45 chunk 中 20 chunk で draw 列そのものが違う**（chunk (-19,110) は native 44
+   対 port 31、chunk (-19,112) は 42 対 36、chunk (-18,110) は 23 対 24）。この 3 chunk を
+   詳しく見ると:
+
+   - 試行位置の集合は**どちらも相手の部分集合ではない**（native-only も port-only もある）
+     → 「片方が余分に試行した」のではなく、**RNG stream 自体がずれている**
+   - (x,z) だけでなく **y も違う**（native ys `-64,-63,-62,…` 対 port `-63,-61,-60,…` のように
+     似ているが一致しない）
+
+   バニラは chunk 内の feature 配置で **1本の RNG stream を共有**するので、この形のずれは
+   「**その chunk で sculk より先に走る別の feature が消費した乱数が違う**」ことを意味する
+   （chunk (-16,112) は 19/19 一致なので、そこでは上流が一致している）。つまりこの 20 chunk
+   の差は sculk 本体の問題ではない可能性が高い。
+
+   **注意（射程）**: これまで cell-for-cell で一致させてきた feature fixture は、feature を
+   placement pipeline を通さず**直接**置いて比較している（`tools/feature_oracles.py`）。
+   したがって placement pipeline 側の RNG ずれは**あの fixture 群では検出できない**。
+   上の 20 chunk の不一致は、その未計測領域を初めて見た数字である。
+
+   次の一手: chunk の feature 配置列を両側で突き合わせ、**最初にずれる feature** を特定する。
+   port 側は `MC_SPINE_POP_ORDER` / `XTRACE_FEAT` があるが、native 側で「配置を試行した
+   feature と位置」を出すフックがまだ無い → `ebq`（`PlacedFeature`）の配置メソッドに
+   `SPLACE <place-x> <place-z> <pos-x> <pos-y> <pos-z>` を足すのが次の計測（パターンは
+   `edi` フックと同じ）。
 
 ## native trace の再現性（2026-10-28、2 capture で実測）
 
