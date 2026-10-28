@@ -569,48 +569,90 @@ def native_bounded_draws(path):
     return out
 
 
+def native_bounded_draws(path):
+    """[(bound, value)] from an ordered trace's `nextInt(bound)@cls(<bound>) <value>` lines.
+
+    Kept for traces with no thread tag (older captures); new ones should use
+    `native_bounded_draws_by_thread`.
+    """
+    out = []
+    for line in trace_lines(path):
+        m = re.match(r'SDRAW (?:\S*bound\S*)?\((\d+)\) (\d+)$', line)
+        if m:
+            out.append((int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def native_bounded_draws_by_thread(path):
+    """{thread: [(bound, value)]} - one sequence per thread, in that thread's program order.
+
+    This is the form a comparison needs. The file's global order is lock order, so searching for
+    the port's sequence in it can stitch together two threads' lines and report a match that no
+    single run ever produced; per-thread sequences make that impossible.
+    """
+    out = collections.OrderedDict()
+    for thread, lines in lines_by_thread(path).items():
+        seq = []
+        for line in lines:
+            m = re.match(r'SDRAW (?:\S*bound\S*)?\((\d+)\) (\d+)$', line)
+            if m:
+                seq.append((int(m.group(1)), int(m.group(2))))
+        if seq:
+            out[thread] = seq
+    return out
+
+
 def cmd_compare_draws(args):
-    """Find where the port's draw sequence sits in the native stream, and where it parts.
+    """Find the port's draw sequence inside the native stream, one thread at a time.
 
     Joined on `(bound, value)`: the port logs `nextInt(16)=15`, the native logs
-    `nextInt(bound)@dyn(16) 15`, so the *bound* is what makes the two sequences the same question
-    rather than two streams of integers. The answer is a *position* in the native stream plus a
-    match length, which is what turns "the placement differs" into "they agree for 24 draws and
-    then ask different questions".
+    `nextInt(bound)@dyn(16) 15`, so the bound - not the value alone - is what makes two draws the
+    same question. Only within-thread matches count (see `native_bounded_draws_by_thread`), and
+    the answer is a thread, a position and a match length, which is what turns "the placement
+    differs" into "they agree for N draws and then ask different questions".
     """
-    native = native_bounded_draws(args.native)
     port = [(int(m.group(1)), int(m.group(2)))
             for line in Path(args.port).read_text(errors='replace').splitlines()
             if (m := re.search(r'nextInt\((\d+)\)=(\d+)', line))]
     if not port:
-        print("sculk_trace: the port trace has no bounded draws (run with FSEED_ARM=..., )",
-              file=sys.stderr)
+        print("sculk_trace: the port trace has no bounded draws (run with FSEED_ARM=... plus "
+              "FEATURE_DRAW_LIMIT)", file=sys.stderr)
         return 2
-    if not native:
-        print(f"sculk_trace: {args.native} has no bounded draws with a bound - it was produced by "
-              f"an agent build that did not log them", file=sys.stderr)
+    by_thread = native_bounded_draws_by_thread(args.native)
+    if not by_thread:
+        by_thread = {'(untagged)': native_bounded_draws(args.native)}
+    total = sum(len(v) for v in by_thread.values())
+    if not total:
+        print(f"sculk_trace: {args.native} has no bounded draws with a bound - an agent build that "
+              f"did not log them", file=sys.stderr)
         return 2
-    if args.window:
-        probe = port[:args.window]
-    else:
-        probe = port[:min(6, len(port))]
-    hits = [i for i in range(len(native) - len(probe) + 1) if native[i:i + len(probe)] == probe]
-    print(f"native bounded draws {len(native)}, port bounded draws {len(port)}")
-    print(f"probe (port's first {len(probe)}): {probe}")
-    if not hits:
-        print("the port's sequence does not occur in the native stream - the two placements are "
-              "not drawing the same questions anywhere in this capture")
+    probe_len = args.window if args.window else min(6, len(port))
+    probe = port[:probe_len]
+    print(f"native bounded draws {total} over {len(by_thread)} threads, port {len(port)}")
+    print(f"probe (port's first {probe_len}): {probe}")
+    best = None
+    for thread, seq in by_thread.items():
+        hits = [i for i in range(len(seq) - len(probe) + 1) if seq[i:i + probe_len] == probe]
+        if not hits:
+            continue
+        at = hits[0]
+        same = 0
+        for a, b in zip(port, seq[at:]):
+            if a != b:
+                break
+            same += 1
+        cand = (same, thread, at, seq, len(hits))
+        if best is None or cand[0] > best[0]:
+            best = cand
+    if best is None:
+        print("the port's sequence does not occur in any single native thread's stream - the two "
+              "sides are not drawing the same questions anywhere in this capture")
         return 1
-    print(f"occurrences: {len(hits)} at native index {hits[:4]}")
-    at = hits[0]
-    same = 0
-    for a, b in zip(port, native[at:]):
-        if a != b:
-            break
-        same += 1
-    print(f"identical prefix from native index {at}: {same} of {len(port)}")
+    same, thread, at, seq, hits = best
+    print(f"occurrences: {hits}; best in thread {thread} at that thread's draw {at}")
+    print(f"identical prefix there: {same} of {len(port)}")
     if same < len(port):
-        print(f"  first divergence: port {port[same]} native {native[at + same]}")
+        print(f"  first divergence: port {port[same]} native {seq[at + same]}")
     return 0 if same == len(port) else 1
 
 

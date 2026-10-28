@@ -1014,11 +1014,39 @@ native の trace は**スレッドが混ざったファイル**なので、`comp
 3. ただし両者は**同じパス構成**で走っていないと列が一致しない（feature の stream 位置は
    そのパスで先に走ったものに依存する）ので、**capture と port run を同じ条件で対にする**。
 
-次の3手:
+### thread 単位化して確定したこと（2026-10-28）
 
-1. `compare-draws` を **thread 単位**のネイティブ列に対して行う（別スレッド連結を不可能にする）。
-2. **対になる capture/port run を固定**する（同一 seed・同一 dump 範囲・同一 warm-up 有無）。
-3. そのうえで最初にずれる draw を確定し、`SculkPatchFeature`/`SculkSpreader` の draw 順を詰める。
+`compare-draws` を `lines_by_thread` ベースに作り替えた（別スレッドの行を連結して一致と誤認する
+経路を構造的に消した）。結果:
+
+| | |
+|---|---|
+| port の列（768本）が native の**単一スレッド**内で見つかった回数 | 1 |
+| そのスレッド | `Worker-Main-13` |
+| 一致した長さ | **24本**（= 8候補 × 3） |
+| 最初の食い違い | port `(16) 12` / native **`(49) 6`** |
+
+→ **24本一致は本物**（別スレッド連結ではなかった）。同じスレッドのプログラム順で見ると、その位置は:
+
+```
+... (16) 2, (321) 0
+SPLACE edi / SRNG / SPATCH  ×20        ← 受理された候補の feature 呼び出し（間には draw が無い）
+SDRAW nextLong()@dzz ...
+SDRAW next(bits)@dzx ...
+SDRAW nextInt(bound)@dyn(49) 6         ← 分岐点
+```
+
+**`(49)` の正体**: vanilla の `edi`（= `SculkPatchFeature`）の draw は decompile 済みで、
+順序は「spreader ループ → `random.nextFloat() <= catalystChance` → `extraRareGrowths.getInt(random)`
+→ rare ごとに `nextInt(5)`×2」。この `(49)` の**直前に `nextFloat` が無い**ので、rare growth の
+draw ではない（`getInt` の手前で必ず float を引くため）。bound 49 = **長さ50のリストの
+`Util.shuffledCopy` の初回 draw**（Fisher-Yates は i=n-1..1 で `nextInt(i+1)`）なので、
+**sculk 経路のどこかが50要素のリストをシャッフルしている**。既知の近傍リストは
+`ChargeCursor.c` = `betweenClosed(-1,-1,-1)..(1,1,1)` の **27要素**（初回 draw は 27）なので別物。
+
+次の1手: 50要素のリストをシャッフルしている箇所を固定 jar の bytecode から特定する
+（`SculkSpreader` の周辺、`SculkBlock`、vein 側の順に `ad.a(List, RandomSource)` の呼び出し元を
+辿る）。それが分かれば port 側で同じ位置に同じ draw を入れられる。
 
 （`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、
 `net.minecraft.world.level.block.SculkSpreader` のように**正しいパッケージ**で渡すこと。
