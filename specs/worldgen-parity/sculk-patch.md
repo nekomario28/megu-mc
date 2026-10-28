@@ -865,14 +865,30 @@ compare-biomef` で候補の**列**を突き合わせた結果:
 つまり **port 側の sculk feature 経路が、native が引く draw（例 `nextInt(49)`）を引いていない**。
 placement（候補 256・判定・採用 21・順序）は完全一致しているので、残る差はここ。
 
-### 未解決（次の1手）
+### arm の二重実装を消して確定した数字（2026-10-28）
 
-native trace には **`BIOMEF` 行が続くのに draw が1本も出ない区間**がある（実測: 受理された候補の
-feature 実行後）。`BIOMEF` は armed に依らず出るが `SDRAW` は armed 依存なので、その区間は
-**armed が落ちている**。原因は未確定だが、arm の実装が**2系統ある**ことが疑わしい
-（`SculkLog.armPlacement`/`disarm` による `eiv.b` ベースの arm と、`SculkLog.place` が
-feature クラスで `ARMED` を set/remove する古い経路）。次は後者を消して `armPlacement` に一本化し、
-再 capture して「native が引く feature 内 draw」を最後まで追えるようにする。
+`SculkLog.place` が feature クラスで `ARMED` を set/remove する古い経路を削除し、
+**arm は `armPlacement`/`disarm`（`eiv.b`）の1系統だけ**にした（窓の中で別の feature が置かれると
+フラグが落ち、「draw が無い」ように見える trace になっていた）。再 capture（`singlearm`）でも
+同じ 24 本一致・同じ 25 本目の分岐を再現 ✓、sanity も通る ✓。
+
+そして bound ごとに数えると差がはっきりする:
+
+| 側 | arm 窓の中の bounded draw |
+|---|---|
+| port（`port-armed.log`） | **`(16)` × 512、`(321)` × 256 だけ** = 256候補×3 の modifier draw のみ。**feature の draw は 0 本** |
+| native | `(16)`、`(321)` に加えて **`(5)`、`(49)`、`(65)`、`(3)`、`(2)` など** = placement の中で feature 自身が引いている |
+
+placement（候補 256・判定・採用 21・順序）は完全一致なので、**残る差は sculk feature 経路が
+placement の RNG から引く draw そのもの**である。native が引いている bound（2/3/5/49/65 …）を
+port 側の `SculkPatchFeature`/`SculkSpreader` が引いていない（または別の RNG を使っている）。
+
+次の3手:
+
+1. native が feature 内で引く bound の**全リスト**と、どのパッチ段階で引かれるかを `SCMARK` と
+   突き合わせて確定する（`SCMARK` は既に窓の中にある）。
+2. port 側の `SculkSpreader` が同じ draw を同じ順で引くようにする（`DTRACE` で1本ずつ比較できる）。
+3. その後 `tools/sculk_gate.py --require-match` を取り直す。
 
 ## 効率化の基盤（2026-10-28）
 

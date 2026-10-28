@@ -111,14 +111,12 @@ public class SculkLog {
     public static void place(String featureClass, int cx, int cz) {
         // Arming here (and disarming at every return of the same method) is what keeps the draw
         // trace small: only the draws made while a sculk patch is being placed are logged.
-        // Arming lives here (and `armPlacement` is the other, wider entry) because `SculkLog.patch`
-        // and the draw hooks need a window. Thread-local rather than a single flag: placements run
-        // on many worker threads at once, and a shared flag let another thread's call flip it
-        // (measured: sculk windows came out empty while one window collected 12932 draws of
-        // another thread's). NOTE: this window cannot contain the placement's *position* draws -
-        // those are made by the placement modifiers inside `PlacedFeature.placeWithBiomeCheck`,
-        // which runs before this method; arming there is the open next step (see the spec page).
-        if ("edi".equals(featureClass)) ARMED.set(Boolean.TRUE); else ARMED.remove();
+        // Arming is *not* done here. It was, and that produced a second mechanism competing with
+        // `armPlacement` (which arms at `PlacedFeature.placeWithBiomeCheck`, where the position
+        // draws are made): a non-sculk feature placed inside an armed window flipped the flag off
+        // and the draws stopped mid-window while the non-draw markers continued - a trace that
+        // looks like "nothing draws here" rather than "the instrument stopped looking". One place
+        // arms, one place disarms.
         if (Boolean.getBoolean("sculkquiet")) return;
         out("SPLACE " + featureClass + " " + cx + " " + cz);
     }
