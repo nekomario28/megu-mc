@@ -748,39 +748,53 @@ shutdown hook で flush）に切り替えた。**順序が保証された trace 
 `SPATCH`/`SPASS` を位置で切る既存のツール（`tools/sculk_trace.py` の patch-scoped 比較を含む）は
 **順序保証付きの trace を入力にする**必要がある。
 
-## 配置 RNG の draw trace（2026-10-28、途中）
+## 配置 RNG の draw trace: arm 点を1段上げて解決（2026-10-28）
 
-- `ebq.placeWithBiomeCheck` が受け取る RNG のクラスは**実測で `dzx` = `WorldgenRandom`**
-  （`SRNG dzx` 65471 回。port 側の「feature placement sees a `WorldgenRandom`」という
-  モデルと一致）。5 クラス（`dzz`/`dzx`/`dyz`/`dzr`/`dzo`）の `nextInt`/`nextDouble` 等に
-  return 直前フックを入れ、`armed` を **thread-local** にして sculk 配置の窓だけ記録する。
-- `long`/`double` の return 前は **`DUP2`**（`DUP` では `dyz.k()D @7: dup` で VerifyError、
-  実測）。
-- **まだ未解決**: 順序保証付き trace でも、sculk の窓には**配置の draw が1本も入っていない**
-  （窓 1219 のうち 1166 が draw 0 本、残りは 1窓あたり 1万本前後 = 別用途の draw）。`SRNG dzx` が
-  出ているのに `dzx.c(I)I` の draw が窓に入らない理由は未解明で、**draw 列の比較はしていない**
-  （比較として成立していないため主張しない）。
+**修正が効いたことを計測で確認**した。arm 点を `ConfiguredFeature.place`（`ebq.a`）から
+**`PlacedFeature.placeWithBiomeCheck`（`eiv.b`）** へ移した結果、sculk パッチの**位置を引く draw
+が窓に入る**ようになった:
 
-  **原因は特定できた（推測ではなく写像と計測）**:
+| | 位置らしい draw（小さな bounded `nextInt`）が直前に来る sculk マーカー |
+|---|---|
+| `ebq.a` で arm（修正前） | **0** / 1209 |
+| `eiv.b` で arm（修正後、capture `fix1`） | **45** / 1231 |
 
-  1. **`ebq` は `ConfiguredFeature`**（`net.minecraft.world.level.levelgen.feature.ConfiguredFeature`
-     -> ebq ✓）で、私が README と本文に書いた `PlacedFeature` は**誤り**（同 commit で訂正）。
-     `PlacedFeature` は **`eiv`** で、`eiv.b(Ldds;Lduz;Layw;Ljd;)Z` =
-     **`placeWithBiomeCheck`**、`eiv.a(...)` = `place`。
-  2. 配置位置を引く placement modifier は **`placeWithBiomeCheck` → `placeWithContext` の中**、
-     つまり `ConfiguredFeature.place`（= `ebq.a`、いま arm している場所）**より前**に走る。
-     したがって現在の窓は**定義上**位置の draw を含まない ✓（窓に `SPLACE`→`SRNG`→`SPATCH` が
-     連続し draw が1本も無い、という計測と一致）。
-  3. 旧ラベルも誤り: `dzx.c(I)I` は `next(bits)`（生の生成器、全域の値）で `nextInt(bound)` では
-     ない。legacy の有界 draw は **`dyn`（`BitRandomSource` mixin interface）** にあり、
-     フック後は `nextInt(bound)@dyn` を **313289 本**記録できている（値は小さく妥当）。
+構造も見えた（実測）: 配置 modifier は**位置リストを1回だけ引いてから、各位置に feature を置く**
+ので、modifier の draw は**その組の最初のマーカーの直前**に来る（`SPLACE edi` の直前が
+`SPATCH` = 1131 件、`nextInt(bound)@dyn` = 45 件、`nextFloat()@dyn` = 55 件）。この構造が
+「健全な trace」と「arm が1段深い trace」を分ける判定条件になっている（下の sanity）。
 
-  **次の1手（これで位置の draw が窓に入るはず）**: `eiv.b` の入口で `armPlacement`、
-  `IRETURN` 前に `disarm`（`SculkLog.armPlacement` は実装済み）。`ConfiguredFeature.place` の
-  窓は**残す**（パッチの origin と feature クラスの同定に必要）。そのうえで、pass (-16,112) の
-  `minecraft:sculk_patch_deep_dark`（port 側 `gi=1, step=7`）について、port の
-  `FSEED_ARM=-16,112,1,7` + `FEATURE_DRAW_LIMIT` の `DRAW` 列と native の `nextInt(bound)@dyn`
-  列を **draw 値そのもの**で突き合わせ、最初にずれる draw を出す。
+**未解明の観測（主張しない）**: capture `fix1` で、sculk パッチの位置 draw 列は
+`279, 8, 8, 1`（`nextInt(bound)@dyn`）だった。port 側 `FSEED_ARM=-16,112,1,7`
+（`minecraft:sculk_patch_deep_dark`）の列は `15, 11, 280, 12, 6, 156, …`。**279 と 280** が
+近いのは気になるが、draw の**順序**も**個数**も違うので、いまは「同じ列ではない」以上のことは
+言えない。次の計測は **native 側でも bound をログする**（`dyn.a(I)I` の引数を出す）ことで、
+`(kind, bound, value)` で 1対1 に対応づけられるようにすること。
+
+## 効率化の基盤（2026-10-28）
+
+このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。
+その手作業が実際に時間を食った箇所を道具に固定した:
+
+| 道具 | 何を固定したか |
+|---|---|
+| `tools/build_carve_agent.sh` | agent のビルド手順。手で打つと `head` が javac の終了コードを飲み、半分適用された編集から jar を作り、「動いているように見える古い jar」ができる（**実測で2回**）。組んだ後に中身（ASM・ロガー・マーカー文字列・フックの配線）を検証してから返す |
+| `tools/sculk_capture.sh <tag>` | capture を1コマンドに（agent を組む → fixture → `PROVENANCE-<tag>.txt` → `sanity`）。trace は `-Dsculktrace=` で **`SculkLog` 自前の writer** に書く |
+| `tools/sculk_trace.py ...` | 解析を1つに（`summary`/`sanity`/`passes`/`windows`/`draws`/`names`/`compare-passes`/`compare-draws`/`extract`/`patches`）。`run.log` に対する位置ベース解析は**拒否**する |
+| `tests/sculk_trace_test.py` | 道具自身のテスト（19件）。**sanity が壊れた trace を不合格にすること**を含む（下記） |
+
+**行順の教訓（実測）**: `run.log` は log4j 経由で、**同じスレッドの行順すら**プログラム順と
+一致しない（ある窓に draw が1本も無いのに、同じスレッドの stream には 41208 本ある）。この
+ページの per-pass 比較の初版（27/49）はその行順を信じて出した数字で、順序保証付き trace で
+測り直すと **29/49** だった。
+
+**sanity は「反例で落ちること」を確認済み**: 健全な capture = SANE、`ebq` で arm した
+capture = UNUSABLE（メッセージで arm 点を名指しする）、draw フック無し = UNUSABLE。
+`run.log` を位置で切ろうとすると `passes`/`windows`/`draws` は exit 2 で拒否する。
+
+**capture 間のぶれ（注意）**: 「最初に食い違う pass」は capture 依存で、mk14 では `(-19,110)`、
+`fix1` では `(-17,111)` だった（trace 内の pass 順が違うため）。数字を引用するときは capture を
+明記する。
 
 ## native trace の再現性（2026-10-28、2 capture で実測）
 

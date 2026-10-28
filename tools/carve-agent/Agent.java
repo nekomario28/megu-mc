@@ -1130,6 +1130,49 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("eiv".equals(name)) {
+            // `eiv` is `PlacedFeature` (`net.minecraft.world.level.levelgen.placement.PlacedFeature`).
+            // Its `b(Ldds;Lduz;Layw;Ljd;)Z` is `placeWithBiomeCheck` - the placement's outermost
+            // entry, so the *position draws* the placement modifiers make happen inside the armed
+            // window. Arming on `ConfiguredFeature.place` (`ebq`) cannot see them: the modifiers
+            // run before that method is reached (measured: those windows held no position draw at
+            // all - SPLACE -> SRNG -> SPATCH with nothing between).
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        if (!mn.equals("b") || !md.equals("(Ldds;Lduz;Layw;Ljd;)Z")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int op) {
+                                if (op == Opcodes.IRETURN) {
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                            "disarm", "()V", false);
+                                }
+                                super.visitInsn(op);
+                            }
+
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                        "armPlacement", "()V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT eiv placement-window hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT eiv hook failed: " + t);
+                return null;
+            }
+        }
         if ("dyn".equals(name) || "dzz".equals(name) || "dzx".equals(name) || "dyz".equals(name)
                 || "dzr".equals(name) || "dzo".equals(name)) {
             // The placement RNG's draws, logged only while a sculk patch is being placed (the
