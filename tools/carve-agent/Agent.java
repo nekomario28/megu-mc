@@ -26,6 +26,7 @@ public class Agent {
             System.err.println("CARVEAGENT bootstrap failed: " + t);
         }
         inst.addTransformer(new Transformer());
+        inst.addTransformer(new SculkTransformer());
     }
 
     static boolean hasTunnel(byte[] buf) {
@@ -1002,6 +1003,136 @@ public class Agent {
                 System.err.println("CARVEAGENT transform failed: " + t);
                 return null;
             }
+        }
+    }
+}
+
+/**
+ * `SculkSpreader$ChargeCursor.update` (`dmu$a.a(dcx,jd,ayw,dmu,boolean)`): log the cursor's
+ * position, charge, delays and facing mask at entry.
+ *
+ * Entry is the comparable point: the same fields are what the port's `SPC_CURSOR_TRACE`
+ * prints before its own update body runs, and a cursor's trajectory is then two index-aligned
+ * lists rather than two cell sets. The hook only reads fields and calls `jd.u()/v()/w()`, so
+ * it draws no random and cannot change the spread's decisions.
+ */
+class SculkTransformer implements ClassFileTransformer {
+    @Override public byte[] transform(ClassLoader loader, String name, Class<?> beingRedefined,
+            ProtectionDomain domain, byte[] buf) {
+        if ("dmu".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        if (!mn.equals("a") || !md.equals("(Ldcx;Ljd;Layw;Z)V")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "round", "()V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT updateCursors hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT updateCursors transform failed: " + t);
+                return null;
+            }
+        }
+        if ("dmv".equals(name) || "dmq".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                final String owner = name;
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        String what = null;
+                        if (owner.equals("dmv") && mn.equals("a")
+                                && md.equals("(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I")) {
+                            what = "one-charge-vein";
+                        } else if (owner.equals("dmv") && mn.equals("a")
+                                && md.equals("(Ldmu;Ldcx;Ljd;Layw;)Z")) {
+                            what = "convert";
+                        } else if (owner.equals("dmv") && mn.equals("a")
+                                && md.equals("(Ldcx;Ljd;Ldtc;Ljava/util/Collection;)Z")) {
+                            what = "attempt-vein";
+                        } else if (owner.equals("dmq") && mn.equals("a")
+                                && md.equals("(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I")) {
+                            what = "one-charge-sculk";
+                        }
+                        if (what == null) return mv;
+                        final String tag = what;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitLdcInsn(tag);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "mark",
+                                        "(Ljava/lang/String;)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT " + name + " markers installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT " + name + " marker transform failed: " + t);
+                return null;
+            }
+        }
+        if (!"dmu$a".equals(name)) return null;
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                @Override protected String getCommonSuperClass(String a, String b) {
+                    return "java/lang/Object";
+                }
+            };
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                        String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals("(Ldcx;Ljd;Layw;Ldmu;Z)V")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            for (String getter : new String[]{"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 0);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dmu$a", "d", "Ljd;");
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", getter, "()I", false);
+                            }
+                            super.visitVarInsn(Opcodes.ALOAD, 0);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dmu$a", "e", "I");
+                            super.visitVarInsn(Opcodes.ALOAD, 0);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dmu$a", "g", "I");
+                            super.visitVarInsn(Opcodes.ALOAD, 0);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dmu$a", "f", "I");
+                            super.visitVarInsn(Opcodes.ALOAD, 0);
+                            super.visitFieldInsn(Opcodes.GETFIELD, "dmu$a", "h", "Ljava/util/Set;");
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "cursor",
+                                    "(IIIIIILjava/util/Set;)V", false);
+                        }
+                    };
+                }
+            }, 0);
+            System.err.println("SCULKAGENT cursor hook installed");
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("SCULKAGENT transform failed: " + t);
+            return null;
         }
     }
 }

@@ -16,6 +16,7 @@ use crate::json::{jarr, jbool, jf32, jint, jnum, jparse, js, jstr, J};
 use crate::trace_env::{env_flag, env_str};
 use crate::worldgen::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 
 #[cfg(test)]
 #[path = "generation_contract_tests.rs"]
@@ -116,6 +117,48 @@ enum Cf {
     /// `corals` tag) *and* the cell above it is water; writing one may put a coral plant
     /// (25%), a sea pickle (5%) above it, and wall fans on a 20% per horizontal direction.
     Coral(CoralShape),
+    /// `minecraft:huge_fungus` (`eco`), config `{valid_base_block, stem_state, hat_state,
+    /// decor_state, replaceable_blocks, planted}`.
+    ///
+    /// Measured from `eco` (and `edx` for the vines): the origin's **below** must be the
+    /// config's base block; the height is `nextInt(4..=13)`, doubled on a following
+    /// `nextInt(12) == 0`, and (when not `planted`) refused if it would pass the
+    /// generation depth. `!planted && nextFloat() < 0.06` makes a 3x3 stem (`huge`), whose
+    /// corner cells only get a stem on a 10% roll. The hat is the top
+    /// `min(nextInt(1 + height/3) + 5, height)` rows, its radius falling from 3/2 to 1/2 by
+    /// row, with a shroomlight/hat/decor roll per cell that depends on the cell's role
+    /// (interior, corner, edge). A hat that *is* `nether_wart_block` (the crimson config)
+    /// also sprouts weeping-vine columns; the warped config, whose hat is
+    /// `warped_wart_block`, never reaches that branch, which is why the fixtures carry both
+    /// configs. `planted` configurations clear a non-air block *below* the cell before
+    /// writing.
+    HugeFungus(HugeFungusCfg),
+    /// `minecraft:basalt_columns` (`ebi`), config `{height, reach}` (both IntProviders).
+    ///
+    /// Measured from `ebi`: the origin must be air, or lava at/below sea level, with a
+    /// non-air block below that is not in the fixed cannot-place-on list; `height` is sampled
+    /// once, `nextFloat() < 0.9` picks the clustered variant (radius cap 5 / 50 attempts vs
+    /// 8 / 15), and each of the `attempts` draws is three `nextInt` (x, y, z) inside a
+    /// `radius +-1` box, with `reach` sampled once per surviving candidate. A candidate only
+    /// contributes when `height - manhattan(origin, pos) >= 0`; its column then writes basalt
+    /// upward from a surface found by walking down (over an ocean) or up (over land) at most
+    /// `dist` cells, `remaining - dist / 2 + 1` blocks, continuing through basalt and stopping
+    /// at anything else.
+    BasaltColumns {
+        height: IP,
+        reach: IP,
+    },
+    /// `minecraft:sculk_patch` (`edi`), config `{charge_count, amount_per_charge,
+    /// spread_attempts, growth_rounds, spread_rounds, extra_rare_growths, catalyst_chance}`.
+    ///
+    /// The only feature that carries a subsystem: a world-generation `SculkSpreader` whose
+    /// charge cursors walk the 18 face/edge neighbours of the patch, turning
+    /// `sculk_replaceable_world_gen` cells into `sculk`/`sculk_vein`, decaying charge by
+    /// distance and (world-gen) never merging cursors. The vein spread itself is
+    /// **deterministic** - `MultifaceSpreader.spreadAll` maps `Direction.stream()` twice and
+    /// draws no random - which is why the port's vein order is exact. `levelEvent`
+    /// (sound/particle) and block-shape updates are not modelled.
+    SculkPatch(SculkPatchCfg),
     /// `minecraft:twisting_vines` (`edr`), config `{spread_width, spread_height,
     /// max_height}`: the origin needs air with netherrack, warped nylium or warped
     /// wart block below; then `spread_width^2` columns each walk down to their ground
@@ -706,6 +749,25 @@ pub(crate) struct DripstoneClusterCfg {
     max_dist_edge: i32,
     /// `max_distance_from_center_affecting_height_bias`.
     max_dist_center: i32,
+}
+
+/// A configured block-state JSON (`{"Name": ..., "Properties": {...}}`) as a state id.
+fn bs_state(j: &J) -> Option<u32> {
+    let (name, props) = bs_parts(j)?;
+    Some(breg()?.state_of(&name, props))
+}
+
+/// `HugeFungusConfiguration` (`ecn`): four block states, a `replaceable_blocks` predicate and
+/// the `planted` flag.
+pub(crate) struct HugeFungusCfg {
+    base: u32,
+    stem: u32,
+    hat: u32,
+    decor: u32,
+    /// `replaceable_blocks` (`eaf`): the second chance `canPlace(..., true)` accepts, after
+    /// `BlockState::canBeReplaced` itself.
+    replaceable: Pr,
+    planted: bool,
 }
 
 /// `PointedDripstoneConfiguration` (`eer`): four float chances, all defaults present in the
@@ -2230,6 +2292,1196 @@ fn coral_mushroom(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32)
     }
 }
 
+/// `HugeFungusFeature` (`eco`). See [`Cf::HugeFungus`].
+fn gen_huge_fungus(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &HugeFungusCfg) {
+    let Some(reg) = breg() else { return };
+    let (x, y, z) = pos;
+    // `getValidBasePos`: the block *below* the origin is the config's base block
+    if reg.name_of(ctx.get(x, y - 1, z)) != reg.name_of(c.base) {
+        return;
+    }
+    let mut height = rng.next_inbetween(4, 13);
+    if rng.next_bound(12) == 0 {
+        height *= 2;
+    }
+    // `chunkGenerator.getGenDepth()` is the level's build height, which is the harness's own
+    if !c.planted && y + height + 1 >= ctx.g.min_y + ctx.g.height {
+        return;
+    }
+    let huge = !c.planted && rng.next_f32() < 0.06;
+    let air = reg.state_of("minecraft:air", None);
+    hf_set(ctx, pos, air);
+    huge_fungus_stem(ctx, rng, c, pos, height, huge);
+    huge_fungus_hat(ctx, rng, c, pos, height, huge);
+}
+
+/// `setBlock`, which refuses cells outside the build height.
+fn hf_set(ctx: &mut FC, p: (i32, i32, i32), st: u32) {
+    if !ctx.out_of_h(p.1) {
+        ctx.set(p.0, p.1, p.2, st);
+    }
+}
+
+/// `HugeFungusFeature.isReplaceable`: `BlockState::canBeReplaced`, or the config's
+/// `replaceable_blocks` predicate when the caller allows it. The port's `is_replaceable` is
+/// the asset's replaceable bit, which is the same property the block models carry.
+fn hf_can_place(ctx: &mut FC, p: (i32, i32, i32), c: &HugeFungusCfg, allow: bool) -> bool {
+    let Some(reg) = breg() else { return false };
+    if reg.is_replaceable(ctx.get(p.0, p.1, p.2)) {
+        return true;
+    }
+    allow && test_pred(&c.replaceable, reg, ctx, p.0, p.1, p.2)
+}
+
+/// `HugeFungusFeature.placeStem`.
+fn huge_fungus_stem(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &HugeFungusCfg,
+    base: (i32, i32, i32),
+    height: i32,
+    huge: bool,
+) {
+    let Some(reg) = breg() else { return };
+    let air = reg.state_of("minecraft:air", None);
+    let r: i32 = if huge { 1 } else { 0 };
+    for dx in -r..=r {
+        for dz in -r..=r {
+            let corner = huge && dx.abs() == r && dz.abs() == r;
+            for dy in 0..height {
+                let p = (base.0 + dx, base.1 + dy, base.2 + dz);
+                if !hf_can_place(ctx, p, c, true) {
+                    continue;
+                }
+                if c.planted {
+                    if !reg.is_air(ctx.get(p.0, p.1 - 1, p.2)) {
+                        hf_set(ctx, p, air); // `destroyBlock(pos, true)` in worldgen
+                    }
+                    hf_set(ctx, p, c.stem);
+                } else if corner {
+                    if rng.next_f32() < 0.1 {
+                        hf_set(ctx, p, c.stem);
+                    }
+                } else {
+                    hf_set(ctx, p, c.stem);
+                }
+            }
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeHat`: the top `layers` rows, each a square whose radius comes from
+/// the row's distance to the top (`2` or `3` below `height - nextInt(3)`, widened by one for
+/// `huge`), every cell rolled by its role.
+fn huge_fungus_hat(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &HugeFungusCfg,
+    base: (i32, i32, i32),
+    height: i32,
+    huge: bool,
+) {
+    let Some(reg) = breg() else { return };
+    let wart = reg.name_of(c.hat) == "minecraft:nether_wart_block";
+    let layers = (rng.next_bound(1 + height / 3) + 5).min(height);
+    let start = height - layers;
+    let air = reg.state_of("minecraft:air", None);
+    for dy in start..=height {
+        let mut r = if dy < height - rng.next_bound(3) {
+            2
+        } else {
+            1
+        };
+        if layers > 8 && dy < start + 4 {
+            r = 3;
+        }
+        if huge {
+            r += 1;
+        }
+        for dx in -r..=r {
+            for dz in -r..=r {
+                let x_edge = dx == -r || dx == r;
+                let z_edge = dz == -r || dz == r;
+                let interior = !x_edge && !z_edge && dy != height;
+                let corner = x_edge && z_edge;
+                let lower = dy < start + 3;
+                let p = (base.0 + dx, base.1 + dy, base.2 + dz);
+                if !hf_can_place(ctx, p, c, false) {
+                    continue;
+                }
+                if c.planted && !reg.is_air(ctx.get(p.0, p.1 - 1, p.2)) {
+                    hf_set(ctx, p, air);
+                }
+                if lower {
+                    if !interior {
+                        huge_fungus_hat_block(ctx, rng, p, c.hat, wart);
+                    }
+                } else if interior {
+                    huge_fungus_hat_drop(ctx, rng, c, p, 0.1, 0.2, if wart { 0.1 } else { 0.0 });
+                } else if corner {
+                    huge_fungus_hat_drop(ctx, rng, c, p, 0.01, 0.7, if wart { 0.083 } else { 0.0 });
+                } else {
+                    huge_fungus_hat_drop(
+                        ctx,
+                        rng,
+                        c,
+                        p,
+                        5.0e-4,
+                        0.98,
+                        if wart { 0.07 } else { 0.0 },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeHatBlock`: a hat cell when the cell *below* already carries the hat
+/// block, otherwise a 15% chance of one; a wart-block hat can sprout a weeping vine.
+fn huge_fungus_hat_block(ctx: &mut FC, rng: &mut Xor, p: (i32, i32, i32), hat: u32, wart: bool) {
+    let Some(reg) = breg() else { return };
+    // the native checks the cell **below** (`jd.e()`), so a hat block extends the cap upward
+    if reg.name_of(ctx.get(p.0, p.1 - 1, p.2)) == reg.name_of(hat) {
+        hf_set(ctx, p, hat);
+    } else if rng.next_f32() < 0.15 {
+        hf_set(ctx, p, hat);
+        if wart && rng.next_bound(11) == 0 {
+            huge_fungus_weeping_vines(ctx, rng, p);
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeHatDropBlock`: decor, then hat, then (rarely) a weeping vine; the
+/// three chances are the cell's role.
+fn huge_fungus_hat_drop(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    c: &HugeFungusCfg,
+    p: (i32, i32, i32),
+    decor_chance: f32,
+    hat_chance: f32,
+    vine_chance: f32,
+) {
+    if rng.next_f32() < decor_chance {
+        hf_set(ctx, p, c.decor);
+    } else if rng.next_f32() < hat_chance {
+        hf_set(ctx, p, c.hat);
+        if rng.next_f32() < vine_chance {
+            huge_fungus_weeping_vines(ctx, rng, p);
+        }
+    }
+}
+
+/// `HugeFungusFeature.placeWeepingVines`: a vine hangs from the cell below the hat when that
+/// cell is empty; the length doubles on one `nextInt(7) == 0`.
+fn huge_fungus_weeping_vines(ctx: &mut FC, rng: &mut Xor, p: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let m = (p.0, p.1 - 1, p.2);
+    if !reg.is_air(ctx.get(m.0, m.1, m.2)) {
+        return;
+    }
+    let mut len = rng.next_inbetween(1, 5);
+    if rng.next_bound(7) == 0 {
+        len *= 2;
+    }
+    weeping_vines_column(ctx, rng, m, len, 23, 25);
+}
+
+/// `WeepingVinesFeature.placeWeepingVinesColumn` (`edx.a`): body cells while the cell below is
+/// empty, the last empty cell (or the last one before a non-empty cell) the aged tip.
+fn weeping_vines_column(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    height: i32,
+    min_age: i32,
+    max_age: i32,
+) {
+    let Some(reg) = breg() else { return };
+    let mut m = pos;
+    for i in 0..=height {
+        if reg.is_air(ctx.get(m.0, m.1, m.2)) {
+            if i == height || !reg.is_air(ctx.get(m.0, m.1 - 1, m.2)) {
+                let age = rng.next_inbetween(min_age, max_age).to_string();
+                let st = reg.with_prop(reg.state_of("minecraft:weeping_vines", None), "age", &age);
+                hf_set(ctx, m, st);
+                break;
+            }
+            hf_set(ctx, m, reg.state_of("minecraft:weeping_vines_plant", None));
+        }
+        m.1 -= 1;
+    }
+}
+
+/// `BasaltColumnsFeature` (`ebi`). See [`Cf::BasaltColumns`].
+fn gen_basalt_columns(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    height_ip: &IP,
+    reach_ip: &IP,
+) {
+    let Some(reg) = breg() else { return };
+    let sea = crate::worldgen::sea_level();
+    // the guard is the *mutable* overload: air (or ocean lava) here and a buildable block below
+    if !bc_can_start(ctx, reg, sea, pos) {
+        return;
+    }
+    let height = height_ip.get(rng);
+    // `nextFloat() < 0.9` picks the clustered variant: a smaller radius and more attempts
+    let clustered = rng.next_f32() < 0.9;
+    let radius = height.min(if clustered { 5 } else { 8 });
+    let attempts = if clustered { 50 } else { 15 };
+    for _ in 0..attempts {
+        // `BlockPos.randomBetweenClosed`: three nextInt per candidate, x then y then z - and
+        // the y draw happens even though the range is one cell (`nextInt(1)`), so dropping it
+        // shifts every later draw (it did: the candidate set came out interleaved).
+        let x = pos.0 - radius + rng.next_bound(2 * radius + 1);
+        let y = pos.1 + rng.next_bound(1);
+        let z = pos.2 - radius + rng.next_bound(2 * radius + 1);
+        let remaining = height - (x - pos.0).abs() - (y - pos.1).abs() - (z - pos.2).abs();
+        if remaining >= 0 {
+            bc_place_column(ctx, reg, sea, (x, y, z), remaining, reach_ip.get(rng));
+        }
+    }
+}
+
+/// The fixed `CANNOT_PLACE_ON` list (`ebi.a`): the blocks a column may not start on.
+const BC_CANNOT_PLACE_ON: [&str; 10] = [
+    "minecraft:lava",
+    "minecraft:bedrock",
+    "minecraft:magma_block",
+    "minecraft:soul_sand",
+    "minecraft:nether_bricks",
+    "minecraft:nether_brick_fence",
+    "minecraft:nether_brick_stairs",
+    "minecraft:nether_wart",
+    "minecraft:chest",
+    "minecraft:spawner",
+];
+
+/// `ebi.a(dcx,int,jd)`: air, or lava at or below sea level (the ocean case).
+fn bc_air_or_lava_ocean(ctx: &mut FC, reg: &BReg, sea: i32, p: (i32, i32, i32)) -> bool {
+    let st = ctx.get(p.0, p.1, p.2);
+    reg.is_air(st) || (reg.name_of(st) == "minecraft:lava" && p.1 <= sea)
+}
+
+/// `ebi.a(dcx,int,jd$a)`: the above, plus a non-air cell below that may be built on.
+fn bc_can_start(ctx: &mut FC, reg: &BReg, sea: i32, p: (i32, i32, i32)) -> bool {
+    if !bc_air_or_lava_ocean(ctx, reg, sea, p) {
+        return false;
+    }
+    let below = reg.name_of(ctx.get(p.0, p.1 - 1, p.2));
+    below != "minecraft:air" && !BC_CANNOT_PLACE_ON.contains(&below)
+}
+
+/// `BasaltColumnsFeature.placeColumn`: the square of `reach` around a candidate, a surface per
+/// column, and basalt upward from it.
+fn bc_place_column(
+    ctx: &mut FC,
+    reg: &BReg,
+    sea: i32,
+    pos: (i32, i32, i32),
+    remaining: i32,
+    reach: i32,
+) {
+    let basalt = reg.state_of("minecraft:basalt", None);
+    for dx in -reach..=reach {
+        for dz in -reach..=reach {
+            let p = (pos.0 + dx, pos.1, pos.2 + dz);
+            let dist = dx.abs() + dz.abs();
+            // The native's condition here is the *air* test (`a(dcx,int,jd)`), not the
+            // can-start test: an air/ocean cell walks **down** to its surface, anything else
+            // walks **up** to the first air cell.
+            let surface = if bc_air_or_lava_ocean(ctx, reg, sea, p) {
+                bc_find_surface(ctx, reg, sea, p, dist)
+            } else {
+                bc_find_air(ctx, reg, p, dist)
+            };
+            let Some(mut m) = surface else { continue };
+            let mut left = remaining - dist / 2;
+            while left >= 0 {
+                if bc_air_or_lava_ocean(ctx, reg, sea, m) {
+                    if !ctx.out_of_h(m.1) {
+                        ctx.set(m.0, m.1, m.2, basalt);
+                    }
+                    m.1 += 1;
+                } else if reg.name_of(ctx.get(m.0, m.1, m.2)) == "minecraft:basalt" {
+                    m.1 += 1;
+                } else {
+                    break;
+                }
+                left -= 1;
+            }
+        }
+    }
+}
+
+/// `ebi.a(dcx,int,jd$a,int)`: walk **down** at most `dist` cells for the first cell that can
+/// start a column - the *can-start* test, i.e. air/ocean-lava **and** a buildable block below,
+/// not merely an air cell. That is why a column never grows out over open air: it walks to the
+/// bottom of the world and gives up.
+fn bc_find_surface(
+    ctx: &mut FC,
+    reg: &BReg,
+    sea: i32,
+    pos: (i32, i32, i32),
+    dist: i32,
+) -> Option<(i32, i32, i32)> {
+    let mut m = pos;
+    let mut left = dist;
+    while m.1 > ctx.g.min_y + 1 && left > 0 {
+        left -= 1;
+        if bc_can_start(ctx, reg, sea, m) {
+            return Some(m);
+        }
+        m.1 -= 1;
+    }
+    None
+}
+
+/// `ebi.a(dcx,jd$a,int)`: walk **up** at most `dist` cells for the first air cell that is not
+/// under a cannot-place-on block.
+fn bc_find_air(
+    ctx: &mut FC,
+    reg: &BReg,
+    pos: (i32, i32, i32),
+    dist: i32,
+) -> Option<(i32, i32, i32)> {
+    let mut m = pos;
+    let mut left = dist;
+    let top = ctx.g.min_y + ctx.g.height;
+    while m.1 < top && left > 0 {
+        left -= 1;
+        let st = ctx.get(m.0, m.1, m.2);
+        if BC_CANNOT_PLACE_ON.contains(&reg.name_of(st)) {
+            return None;
+        }
+        if reg.is_air(st) {
+            return Some(m);
+        }
+        m.1 += 1;
+    }
+    None
+}
+
+/// `SculkPatchConfiguration` (`eez`).
+pub(crate) struct SculkPatchCfg {
+    charge_count: i32,
+    amount_per_charge: i32,
+    spread_attempts: i32,
+    growth_rounds: i32,
+    spread_rounds: i32,
+    extra_rare_growths: IP,
+    catalyst_chance: f32,
+}
+
+/// `SculkSpreader.createWorldGenSpreader()` (`dmu.b()` = `new dmu(true, bU, 50, 1, 5, 10)`):
+/// chargeCount, amountPerCharge, chargeDecayRate, noGrowthRadius. `isWorldGeneration` is
+/// true, which means cursors are **never merged** (see [`SculkSpreader::update`]).
+const SPC_CHARGE_COUNT: i32 = 50;
+const SPC_AMOUNT: i32 = 1;
+const SPC_DECAY_RATE: i32 = 5;
+const SPC_NO_GROWTH_RADIUS: i32 = 10;
+const SPC_MAX_CURSORS: usize = 32;
+const SPC_MAX_CHARGE: i32 = 1000;
+/// `BlockPos.closerThan(pos, 15.0)` is `distSqr < 225`.
+const SPC_ORIGIN_RADIUS_SQ: i64 = 225;
+
+const SPC_VEIN: &str = "minecraft:sculk_vein";
+
+/// Counts `SculkSpreader.updateCursors` calls, matching the reference agent's counter.
+static SPC_ROUND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Which `SculkBehaviour` a state carries: `SculkBlock`, `SculkVeinBlock`, or the default
+/// (everything else, including air).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpcKind {
+    Sculk,
+    Vein,
+    Other,
+}
+
+fn spc_kind(reg: &BReg, st: u32) -> SpcKind {
+    match reg.name_of(st) {
+        "minecraft:sculk" => SpcKind::Sculk,
+        SPC_VEIN => SpcKind::Vein,
+        _ => SpcKind::Other,
+    }
+}
+
+fn spc_has_face(reg: &BReg, st: u32, d: u8) -> bool {
+    reg.get_prop(st, multiface_property(d)).as_deref() == Some("true")
+}
+
+/// `MultifaceBlock.pack(Collection<Direction>)` as the 6-bit face mask (`dmu$a` stores it).
+fn spc_face_mask(reg: &BReg, st: u32) -> Option<u8> {
+    let mut mask = 0u8;
+    for d in 0..6u8 {
+        if spc_has_face(reg, st, d) {
+            mask |= 1 << d;
+        }
+    }
+    (mask != 0).then_some(mask)
+}
+
+/// `SculkSpreader.ChargeCursor` (`dmu$a`).
+#[derive(Clone)]
+struct SpcCursor {
+    pos: (i32, i32, i32),
+    charge: i32,
+    decay_delay: i32,
+    update_delay: i32,
+    facings: Option<u8>,
+}
+
+impl SpcCursor {
+    fn new(pos: (i32, i32, i32), charge: i32) -> Self {
+        SpcCursor {
+            pos,
+            charge,
+            decay_delay: 1,
+            update_delay: 0,
+            facings: None,
+        }
+    }
+}
+
+/// `SculkSpreader` (`dmu`), world-generation flavour.
+struct SculkSpreader {
+    cursors: Vec<SpcCursor>,
+}
+
+impl SculkSpreader {
+    fn new() -> Self {
+        SculkSpreader {
+            cursors: Vec::new(),
+        }
+    }
+
+    /// `dmu.a(jd,int)`: split the amount into <=1000 chunks, keeping at most 32 cursors
+    /// (the split still runs past the cap).
+    fn add_cursor(&mut self, pos: (i32, i32, i32), mut amount: i32) {
+        while amount > 0 {
+            let part = amount.min(SPC_MAX_CHARGE);
+            if self.cursors.len() < SPC_MAX_CURSORS {
+                self.cursors.push(SpcCursor::new(pos, part));
+            }
+            amount -= part;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.cursors.clear();
+    }
+
+    /// `dmu.a(dcx,jd,ayw,boolean)`: update every cursor and keep the survivors. A world-gen
+    /// spreader does **not** merge cursors that land on the same position (the merge branch is
+    /// behind `!isWorldGeneration()`), so duplicates stay.
+    fn update(&mut self, ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), spread_only: bool) {
+        // The reference agent's `SculkLog.round()` counts every `updateCursors` call the same
+        // way, and `i` is the cursor's index in this round's list: a cursor that reaches charge
+        // 0 is dropped, so without those two numbers the two traces cannot be aligned.
+        let round = SPC_ROUND.fetch_add(1, Ordering::Relaxed);
+        let mut kept = Vec::with_capacity(self.cursors.len());
+        for (idx, mut cursor) in std::mem::take(&mut self.cursors).into_iter().enumerate() {
+            if std::env::var("SPC_CURSOR_TRACE").is_ok() {
+                eprintln!(
+                    "SCURSOR r={round} i={idx} {} {} {} {} {} {} {}",
+                    cursor.pos.0,
+                    cursor.pos.1,
+                    cursor.pos.2,
+                    cursor.charge,
+                    cursor.decay_delay,
+                    cursor.update_delay,
+                    cursor.facings.map_or(-1, |m| m as i32)
+                );
+            }
+            spc_cursor_update(ctx, rng, &mut cursor, origin, spread_only);
+            if cursor.charge > 0 {
+                kept.push(cursor);
+            }
+        }
+        self.cursors = kept;
+    }
+}
+
+/// `ChargeCursor.update` (`dmu$a.a(dcx,jd,ayw,dmu,boolean)`).
+fn spc_cursor_update(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    cursor: &mut SpcCursor,
+    origin: (i32, i32, i32),
+    spread_only: bool,
+) {
+    if cursor.charge <= 0 {
+        return;
+    }
+    if cursor.update_delay > 0 {
+        cursor.update_delay -= 1;
+        return;
+    }
+    let Some(reg) = breg() else { return };
+    let (x, y, z) = cursor.pos;
+    let mut state = ctx.get(x, y, z);
+    let mut kind = spc_kind(reg, state);
+    if spread_only && spc_attempt_spread_vein(ctx, reg, cursor) {
+        // `if (behaviour.isWorldGen())` only holds for the default behaviour, which re-reads
+        if kind == SpcKind::Other {
+            state = ctx.get(x, y, z);
+            kind = spc_kind(reg, state);
+        }
+        // `levelEvent(3006, ...)` is sound/particles only; not modelled
+    }
+    cursor.charge = spc_spread_one(ctx, reg, rng, cursor, origin, kind, spread_only);
+    if cursor.charge <= 0 {
+        spc_decay(ctx, reg, cursor, kind);
+        return;
+    }
+    if let Some(next) = spc_find_next_sculk(ctx, reg, rng, cursor.pos) {
+        spc_decay(ctx, reg, cursor, kind);
+        cursor.pos = next;
+        // `pos.closerThan(new Vec3i(origin.x, pos.y, origin.z), 15.0)`: the y term is the
+        // cursor's own, so it cancels and only the horizontal distance is bounded.
+        let dx = i64::from(cursor.pos.0 - origin.0);
+        let dz = i64::from(cursor.pos.2 - origin.2);
+        if dx * dx + dz * dz >= SPC_ORIGIN_RADIUS_SQ {
+            cursor.charge = 0;
+            return;
+        }
+        state = ctx.get(cursor.pos.0, cursor.pos.1, cursor.pos.2);
+    }
+    // note: this runs whether or not `next` was found, against whatever `state` holds
+    if spc_kind(reg, state) != SpcKind::Other {
+        cursor.facings = spc_face_mask(reg, state);
+    }
+    cursor.decay_delay = spc_decay_delay(kind, cursor.decay_delay);
+    cursor.update_delay = 1;
+}
+
+/// `SculkBlock.spreadOneCharge` (`dmq.a`), the vein's (`dmv.a`) and the default's
+/// (`dmp$1.a`) — the cursor's new charge.
+fn spc_spread_one(
+    ctx: &mut FC,
+    reg: &BReg,
+    rng: &mut Xor,
+    cursor: &SpcCursor,
+    origin: (i32, i32, i32),
+    kind: SpcKind,
+    spread_only: bool,
+) -> i32 {
+    match kind {
+        SpcKind::Sculk => {
+            if cursor.charge == 0 || rng.next_bound(SPC_DECAY_RATE) != 0 {
+                return cursor.charge;
+            }
+            // `pos.closerThan(origin, amountPerCharge)` with amount 1 is "the same cell"
+            let within = cursor.pos == origin;
+            if !within && spc_can_place_growth(ctx, reg, cursor.pos) {
+                if rng.next_bound(SPC_CHARGE_COUNT) < cursor.charge {
+                    let above = (cursor.pos.0, cursor.pos.1 + 1, cursor.pos.2);
+                    let st = spc_growth_state(ctx, reg, rng, above, true);
+                    if !ctx.out_of_h(above.1) {
+                        ctx.set(above.0, above.1, above.2, st);
+                    }
+                }
+                return (cursor.charge - SPC_CHARGE_COUNT).max(0);
+            }
+            if rng.next_bound(SPC_NO_GROWTH_RADIUS) != 0 {
+                return cursor.charge;
+            }
+            cursor.charge
+                - if within {
+                    1
+                } else {
+                    spc_decrease_charge(cursor.pos, origin, cursor.charge)
+                }
+        }
+        SpcKind::Vein => {
+            if spread_only && spc_vein_convert(ctx, reg, rng, cursor.pos) {
+                return cursor.charge - 1;
+            }
+            if rng.next_bound(SPC_DECAY_RATE) == 0 {
+                (cursor.charge as f32 * 0.5).floor() as i32
+            } else {
+                cursor.charge
+            }
+        }
+        // `dmp$1`: `decayDelay > 0 ? charge : 0`
+        SpcKind::Other => {
+            if cursor.decay_delay > 0 {
+                cursor.charge
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// `SculkBlock.decreaseCharge` (`dmq.a(dmu,jd,jd,int)`): `Mth.sqrt` of the *float* square root,
+/// the `Mth.ceil(24 - amount)` denominator, and the `(int)` truncation are all the native's.
+fn spc_decrease_charge(pos: (i32, i32, i32), origin: (i32, i32, i32), charge: i32) -> i32 {
+    let (dx, dy, dz) = (
+        f64::from(pos.0 - origin.0),
+        f64::from(pos.1 - origin.1),
+        f64::from(pos.2 - origin.2),
+    );
+    let sqrt = (dx * dx + dy * dy + dz * dz) as f32;
+    let over = sqrt.sqrt() - SPC_AMOUNT as f32;
+    let denom = ((24 - SPC_AMOUNT) as f32).ceil();
+    let ratio = 1.0f32.min(over / denom);
+    (1).max((charge as f32 * ratio * 0.5) as i32)
+}
+
+/// `SculkBlock.canPlaceGrowth` (`dmq.a(dcx,jd)`): the cell **above** the cursor is air or a
+/// water source - the same cell the growth branch writes sculk into - and at most two
+/// sculk/sculk_shrieker cells exist in the `-4..4 x 0..2 x -4..4` box.
+fn spc_can_place_growth(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
+    // `$$1.d()` is `above()`, and the growth branch writes at `$$7.d()` too: the cell the
+    // check inspects is the cell the sculk goes into, not the cell below the cursor.
+    let target = ctx.get(pos.0, pos.1 + 1, pos.2);
+    let water_source = reg.name_of(target) == "minecraft:water";
+    if !reg.is_air(target) && !water_source {
+        return false;
+    }
+    let mut seen = 0;
+    for dx in -4i32..=4 {
+        for dy in 0i32..=2 {
+            for dz in -4i32..=4 {
+                let name = reg.name_of(ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz));
+                if name == "minecraft:sculk" || name == "minecraft:sculk_shrieker" {
+                    seen += 1;
+                    if seen > 2 {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `SculkBlock.getSculkState` (`dmq.a(dcx,jd,ayw,boolean)`): a shrieker on one `nextInt(11)`
+/// in eleven, `sculk` otherwise; `WATERLOGGED` when the cell holds **any** fluid.
+fn spc_growth_state(
+    ctx: &mut FC,
+    reg: &BReg,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+    world_gen: bool,
+) -> u32 {
+    let mut st = if rng.next_bound(11) == 0 {
+        reg.with_prop(
+            reg.state_of("minecraft:sculk_shrieker", None),
+            "can_summon",
+            if world_gen { "true" } else { "false" },
+        )
+    } else {
+        reg.state_of("minecraft:sculk", None)
+    };
+    if reg.get_prop(st, "waterlogged").is_some()
+        && reg.fluid_name(ctx.get(pos.0, pos.1, pos.2)) != "minecraft:empty"
+    {
+        st = reg.with_prop(st, "waterlogged", "true");
+    }
+    st
+}
+
+/// `SculkBehaviour.attemptSpreadVein` (`dmp.a(dcx,jd,dtc,Collection,boolean)`): the vein,
+/// the default and the `v_` implementations.
+fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool {
+    let (x, y, z) = cursor.pos;
+    let state = ctx.get(x, y, z);
+    match cursor.facings {
+        // `facings == null`: `SculkVeinBlock.m()`, the spreader with only SAME_POSITION
+        None if std::env::var("SPC_NO_CURSOR_SPREAD").is_ok() => false,
+        None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
+        // empty facings: the interface default uses `SculkVeinBlock.c()` (all three types)
+        Some(0) => spc_spread_all(
+            ctx,
+            reg,
+            cursor.pos,
+            state,
+            &[0, 1, 2],
+            "spread-cursor-3type",
+        ),
+        Some(mask) => {
+            if !reg.is_air(state) && reg.fluid_name(state) != "minecraft:water" {
+                return false;
+            }
+            spc_vein_attempt_spread(ctx, reg, cursor.pos, state, mask)
+        }
+    }
+}
+
+/// Write one sculk-family cell, naming the call site when asked to.
+///
+/// `SPC_TRACE_CELL=x,y,z` prints every write to that cell with its call site, and
+/// `SPC_TRACE_ALL=1` prints all of them. The order and the call site are what localise a
+/// divergence: the first write that leaves the reference's cell set is where two otherwise
+/// identical-looking implementations part, and *which* call site produced it says which
+/// predicate to read next.
+fn spc_set(ctx: &mut FC, p: (i32, i32, i32), st: u32, tag: &str) {
+    let all = std::env::var("SPC_TRACE_ALL").is_ok();
+    if all || std::env::var("SPC_TRACE_CELL").as_deref() == Ok(&format!("{},{},{}", p.0, p.1, p.2))
+    {
+        eprintln!("SPCSET {} {} {} state={} at={tag}", p.0, p.1, p.2, st);
+    }
+    if !ctx.out_of_h(p.1) {
+        ctx.set(p.0, p.1, p.2, st);
+    }
+}
+
+/// `MultifaceSpreader.spreadAll` (`dkz.a(dtc,dcx,jd,boolean)`): `from` in `Direction.values()`
+/// order (filtered by `isOtherBlockValidAsSource`), then `to` in `Direction.values()` order.
+///
+/// **No random source is involved**: `spreadAll` maps `Direction.stream()` twice and counts the
+/// placements, so the vein's spread order is fully deterministic. (The shuffled list belongs to
+/// the *other* overload, `spread(state, level, pos, from, random, spreadOnly)`, which the
+/// multiface feature uses and the sculk path never calls.)
+fn spc_spread_all(
+    ctx: &mut FC,
+    reg: &BReg,
+    pos: (i32, i32, i32),
+    state: u32,
+    types: &[u8],
+    tag: &str,
+) -> bool {
+    let mut any = false;
+    let is_vein = spc_kind(reg, state) == SpcKind::Vein;
+    for from in 0..6u8 {
+        // `config.isOtherBlockValidAsSource(state, from)` = `config.a(state) || hasFace(from)`
+        if is_vein && !spc_has_face(reg, state, from) {
+            continue;
+        }
+        for to in 0..6u8 {
+            if spc_spread(ctx, reg, pos, state, from, to, types, tag) {
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// `MultifaceSpreader.spread(state, level, pos, from, to, spreadOnly)` (`dkz.a`): the axis gate,
+/// the source gate, then the spread types in order, taking the first candidate the predicate
+/// accepts and placing there (a failed placement does not fall through to the next type).
+fn spc_spread(
+    ctx: &mut FC,
+    reg: &BReg,
+    pos: (i32, i32, i32),
+    state: u32,
+    from: u8,
+    to: u8,
+    types: &[u8],
+    tag: &str,
+) -> bool {
+    if to / 2 == from / 2 {
+        return false;
+    }
+    // `config.a(state) || (config.a(state, to) && !config.a(state, from))`
+    let is_vein = spc_kind(reg, state) == SpcKind::Vein;
+    if is_vein && !(spc_has_face(reg, state, to) && !spc_has_face(reg, state, from)) {
+        return false;
+    }
+    for t in types {
+        let (target, face) = match t {
+            0 => (pos, to),
+            1 => (multiface_relative(pos, to), from),
+            _ => (
+                multiface_relative(multiface_relative(pos, to), from),
+                to ^ 1,
+            ),
+        };
+        let watch = std::env::var("SPC_TRACE_CELL").as_deref()
+            == Ok(&format!("{},{},{}", target.0, target.1, target.2));
+        let ok = spc_can_spread(ctx, reg, pos, target, face);
+        if watch {
+            eprintln!(
+                "SPCPRED target={target:?} pos={pos:?} from={from} to={to} type={t} face={face} state={} passes={ok} tag={tag}",
+                reg.name_of(ctx.get(target.0, target.1, target.2))
+            );
+        }
+        if !ok {
+            continue;
+        }
+        return match multiface_state(ctx, reg, target, SPC_VEIN, face) {
+            Some(st) => {
+                spc_set(ctx, target, st, tag);
+                true
+            }
+            None => false,
+        };
+    }
+    false
+}
+
+/// The spread predicate (`dkz$a.a(dcc,jd,dkz$c)`, `dmv$a.a(dcc,jd,jd,ji,dtc)` and
+/// `MultifaceBlock.a(dcc,dtc,jd,ji)`).
+fn spc_can_spread(
+    ctx: &mut FC,
+    reg: &BReg,
+    pos: (i32, i32, i32),
+    target: (i32, i32, i32),
+    dir: u8,
+) -> bool {
+    let state = ctx.get(target.0, target.1, target.2);
+    if !spc_vein_can_spread(ctx, reg, pos, target, dir, state) {
+        return false;
+    }
+    spc_multiface_can_place(ctx, reg, state, target, dir)
+}
+
+/// `SculkVeinSpreaderConfig.canSpread` (`dmv$a.a(dcc,jd,jd,ji,dtc)`).
+fn spc_vein_can_spread(
+    ctx: &mut FC,
+    reg: &BReg,
+    pos: (i32, i32, i32),
+    target: (i32, i32, i32),
+    dir: u8,
+    state: u32,
+) -> bool {
+    let (tdx, tdy, tdz) = dir_off(dir);
+    let nb = ctx.get(target.0 + tdx, target.1 + tdy, target.2 + tdz);
+    let name = reg.name_of(nb);
+    // `dga.bQ` is `moving_piston`, not `sculk_sensor` (measured from the mappings): the
+    // neighbour in the face direction is rejected when it is sculk, sculk_catalyst or a
+    // moving piston.
+    if matches!(
+        name,
+        "minecraft:sculk" | "minecraft:sculk_catalyst" | "minecraft:moving_piston"
+    ) {
+        return false;
+    }
+    let manhattan = (target.0 - pos.0).abs() + (target.1 - pos.1).abs() + (target.2 - pos.2).abs();
+    if manhattan == 2 {
+        // the cell past the target, in the direction the face points away from
+        let (ox, oy, oz) = dir_off(dir ^ 1);
+        let side = (target.0 + ox, target.1 + oy, target.2 + oz);
+        let side_st = ctx.get(side.0, side.1, side.2);
+        if spc_face_sturdy(reg, side_st, dir) {
+            return false;
+        }
+    }
+    let fluid = reg.fluid_name(state);
+    if fluid != "minecraft:empty" && fluid != "minecraft:water" {
+        return false;
+    }
+    if reg.in_tag(state, "minecraft:fire") {
+        return false;
+    }
+    // `state.canBeReplaced() || super.canSpread(...)` (`dkz$a`)
+    // `reg.is_replaceable` is the asset's replaceable bit, the same property
+    // `Feature.isReplaceable` uses (`huge_fungus`).
+    reg.is_replaceable(state)
+        || reg.is_air(state)
+        || reg.name_of(state) == SPC_VEIN
+        || (reg.name_of(state) == "minecraft:water" && reg.fluid_name(state) == "minecraft:water")
+}
+
+/// `MultifaceBlock.a(dcc,dtc,jd,ji)`: the face must be enabled for this block, the target must
+/// not already be this block with that face, and the neighbour behind the face must support it.
+fn spc_multiface_can_place(
+    ctx: &mut FC,
+    reg: &BReg,
+    state: u32,
+    target: (i32, i32, i32),
+    dir: u8,
+) -> bool {
+    // sculk vein enables all six faces (`MultifaceBlock`'s direction flags)
+    if reg.name_of(state) == SPC_VEIN && spc_has_face(reg, state, dir) {
+        return false;
+    }
+    let (dx, dy, dz) = dir_off(dir);
+    let nb = ctx.get(target.0 + dx, target.1 + dy, target.2 + dz);
+    reg.supports_multiface(nb, dir)
+}
+
+/// `SculkVeinBlock.attemptSpreadVein` (`dmv.a(dcx,jd,dtc,Collection<Direction>)`).
+fn spc_vein_attempt_spread(
+    ctx: &mut FC,
+    reg: &BReg,
+    pos: (i32, i32, i32),
+    state: u32,
+    mask: u8,
+) -> bool {
+    let mut vein = reg.state_of(SPC_VEIN, None);
+    let mut any = false;
+    for d in 0..6u8 {
+        if mask & (1 << d) == 0 {
+            continue;
+        }
+        let (dx, dy, dz) = dir_off(d);
+        let nb = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        if reg.supports_multiface(ctx.get(nb.0, nb.1, nb.2), d) {
+            vein = reg.with_prop(vein, multiface_property(d), "true");
+            any = true;
+        }
+    }
+    if !any {
+        return false;
+    }
+    // `if (!state.getFluidState().isEmpty())` — any fluid, water or not
+    if reg.fluid_name(state) != "minecraft:empty" {
+        vein = reg.with_prop(vein, "waterlogged", "true");
+    }
+    spc_set(ctx, pos, vein, "attempt");
+    true
+}
+
+/// `SculkVeinBlock.a(dmu,dcx,jd,ayw)` (private): turn a vein into sculk where a
+/// `sculk_replaceable_world_gen` neighbour sits behind one of its faces, then clean up the
+/// veins around the new sculk cell and let veins spread from it.
+fn spc_vein_convert(ctx: &mut FC, reg: &BReg, rng: &mut Xor, pos: (i32, i32, i32)) -> bool {
+    let state = ctx.get(pos.0, pos.1, pos.2);
+    // `Direction.allShuffled(random)` — this one *does* draw (five nextInt for six directions)
+    let mut dirs: Vec<u8> = (0..6u8).collect();
+    util_shuffle(&mut dirs, rng);
+    for d in dirs {
+        if !spc_has_face(reg, state, d) {
+            continue;
+        }
+        let (dx, dy, dz) = dir_off(d);
+        let nb = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        if !reg.in_tag(
+            ctx.get(nb.0, nb.1, nb.2),
+            "minecraft:sculk_replaceable_world_gen",
+        ) {
+            continue;
+        }
+        let sculk = reg.state_of("minecraft:sculk", None);
+        spc_set(ctx, nb, sculk, "convert");
+        // `this.e.a(sculkState, level, newPos, worldGen)`: veins spread from the new sculk cell
+        // (spreader `c()`, all three spread types). This call is what sustains the patch: with
+        // it removed the whole capture collapses from 429 sculk-family cells to 16 (measured),
+        // because the vein -> sculk conversion chain has no new veins to convert.
+        spc_spread_all(ctx, reg, nb, sculk, &[0, 1, 2], "spread-post-convert");
+        let opposite = d ^ 1;
+        for around in 0..6u8 {
+            if around == opposite {
+                continue;
+            }
+            let (ax, ay, az) = dir_off(around);
+            let p = (nb.0 + ax, nb.1 + ay, nb.2 + az);
+            let st = ctx.get(p.0, p.1, p.2);
+            if reg.name_of(st) == SPC_VEIN {
+                spc_vein_decay(ctx, reg, p, st);
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// `SculkVeinBlock.a(dcx,dtc,jd,ayw)`: drop the faces whose neighbour became sculk, and turn a
+/// vein with no faces left into water or air.
+fn spc_vein_decay(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32), st: u32) {
+    let mut st = st;
+    for d in 0..6u8 {
+        if !spc_has_face(reg, st, d) {
+            continue;
+        }
+        let (dx, dy, dz) = dir_off(d);
+        if reg.name_of(ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz)) == "minecraft:sculk" {
+            st = reg.with_prop(st, multiface_property(d), "false");
+        }
+    }
+    if (0..6u8).all(|d| !spc_has_face(reg, st, d)) {
+        st = if reg.fluid_name(ctx.get(pos.0, pos.1, pos.2)) == "minecraft:empty" {
+            reg.state_of("minecraft:air", None)
+        } else {
+            reg.state_of("minecraft:water", None)
+        };
+    }
+    spc_set(ctx, pos, st, "decay");
+}
+
+/// `SculkBehaviour.decay` (`dmp.a(dcx,dtc,jd,ayw)`): only the vein behaviour does anything, and
+/// its body is [`spc_vein_decay`].
+fn spc_decay(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor, kind: SpcKind) {
+    if kind != SpcKind::Vein {
+        return;
+    }
+    let st = ctx.get(cursor.pos.0, cursor.pos.1, cursor.pos.2);
+    if reg.name_of(st) == SPC_VEIN {
+        spc_vein_decay(ctx, reg, cursor.pos, st);
+    }
+}
+
+/// `SculkBehaviour.decayDelay` (`j_`): `SculkBlock` and `SculkVeinBlock` both inherit the
+/// interface default (`1`); only the *default* behaviour - the anonymous class in `dmp`, used
+/// for every other block - returns `max(x - 1, 0)`. Reading the override the other way round
+/// makes every cursor standing on a vein decay, which is where the earlier "the port decays
+/// veins vanilla keeps" observation came from.
+fn spc_decay_delay(kind: SpcKind, delay: i32) -> i32 {
+    match kind {
+        SpcKind::Other => (delay - 1).max(0),
+        _ => 1,
+    }
+}
+
+/// `BlockState.isFaceSturdy(level, pos, dir)`, from the asset's own side flags. Full cubes are
+/// exact; a partial shape would need the collision shape. The deep-dark scenes only contain
+/// full cubes, air, water and the sculk family.
+fn spc_face_sturdy(reg: &BReg, st: u32, dir: u8) -> bool {
+    reg.is_solid(st) && reg.side_solid(st, dir as usize)
+}
+
+/// `ChargeCursor.findNextSculk` (`dmu$a.a(dcx,jd,ayw)`): the 18 face/edge neighbours in shuffled
+/// order, keeping the last reachable `SculkBehaviour` cell, and stopping early when it has
+/// substrate access.
+fn spc_find_next_sculk(
+    ctx: &mut FC,
+    reg: &BReg,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+) -> Option<(i32, i32, i32)> {
+    let mut offsets: Vec<(i32, i32, i32)> = Vec::with_capacity(18);
+    for x in -1i32..=1 {
+        for y in -1i32..=1 {
+            for z in -1i32..=1 {
+                if (x == 0 || y == 0 || z == 0) && !(x == 0 && y == 0 && z == 0) {
+                    offsets.push((x, y, z));
+                }
+            }
+        }
+    }
+    util_shuffle(&mut offsets, rng);
+    let mut target = pos;
+    for off in offsets {
+        let p = (pos.0 + off.0, pos.1 + off.1, pos.2 + off.2);
+        let st = ctx.get(p.0, p.1, p.2);
+        if spc_kind(reg, st) == SpcKind::Other {
+            continue;
+        }
+        if !spc_cursor_can_spread(ctx, reg, pos, p) {
+            continue;
+        }
+        target = p;
+        if spc_vein_has_substrate_access(ctx, reg, p, st) {
+            break;
+        }
+    }
+    (target != pos).then_some(target)
+}
+
+/// `ChargeCursor.canSpread` (`dmu$a.a(dcx,jd,jd)`): adjacent is free, otherwise the direction
+/// on each shared axis must have an open face.
+fn spc_cursor_can_spread(
+    ctx: &mut FC,
+    reg: &BReg,
+    from: (i32, i32, i32),
+    to: (i32, i32, i32),
+) -> bool {
+    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+    if dx.abs() + dy.abs() + dz.abs() == 1 {
+        return true;
+    }
+    // `Direction.fromAxisAndDirection(axis, sign)`: DOWN/UP, NORTH/SOUTH, WEST/EAST
+    let axis_dir =
+        |delta: i32, negative: u8, positive: u8| if delta < 0 { negative } else { positive };
+    let mut open = |dir: u8| {
+        let (ox, oy, oz) = dir_off(dir);
+        let p = (from.0 + ox, from.1 + oy, from.2 + oz);
+        let st = ctx.get(p.0, p.1, p.2);
+        !spc_face_sturdy(reg, st, dir ^ 1)
+    };
+    if dx == 0 {
+        open(axis_dir(dy, 0, 1)) || open(axis_dir(dz, 2, 3))
+    } else if dy == 0 {
+        open(axis_dir(dx, 4, 5)) || open(axis_dir(dz, 2, 3))
+    } else {
+        open(axis_dir(dx, 4, 5)) || open(axis_dir(dy, 0, 1))
+    }
+}
+
+/// `SculkVeinBlock.a(dcx,dtc,jd)` (`hasSubstrateAccess`): a face of the vein points at a block
+/// in `sculk_replaceable`.
+fn spc_vein_has_substrate_access(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32), st: u32) -> bool {
+    for d in 0..6u8 {
+        if !spc_has_face(reg, st, d) {
+            continue;
+        }
+        let (dx, dy, dz) = dir_off(d);
+        if reg.in_tag(
+            ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz),
+            "minecraft:sculk_replaceable",
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `SculkPatchFeature.canSpreadFrom` (`edi.a(dcx,jd)`).
+fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
+    let st = ctx.get(pos.0, pos.1, pos.2);
+    if spc_kind(reg, st) != SpcKind::Other {
+        return true;
+    }
+    let water_source = reg.name_of(st) == "minecraft:water";
+    if !reg.is_air(st) && !water_source {
+        return false;
+    }
+    for d in 0..6u8 {
+        let (dx, dy, dz) = dir_off(d);
+        let nb = ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        if spc_face_sturdy(reg, nb, d ^ 1) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `SculkPatchFeature.place` (`edi.a(ecg)`).
+fn gen_sculk_patch(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &SculkPatchCfg) {
+    let Some(reg) = breg() else { return };
+    if !spc_can_spread_from(ctx, reg, pos) {
+        return;
+    }
+    let mut spreader = SculkSpreader::new();
+    let rounds = c.spread_rounds + c.growth_rounds;
+    for i in 0..rounds {
+        for _ in 0..c.charge_count {
+            spreader.add_cursor(pos, c.amount_per_charge);
+        }
+        let spread_only = i < c.spread_rounds;
+        for _ in 0..c.spread_attempts {
+            spreader.update(ctx, rng, pos, spread_only);
+        }
+        spreader.clear();
+    }
+    // `nextFloat() <= catalystChance` and `below.canSurvive(level, below)`, which is the
+    // default (true) for a sculk catalyst
+    if rng.next_f32() <= c.catalyst_chance {
+        let st = reg.state_of("minecraft:sculk_catalyst", None);
+        if !ctx.out_of_h(pos.1) {
+            ctx.set(pos.0, pos.1, pos.2, st);
+        }
+    }
+    let rare = c.extra_rare_growths.get(rng);
+    for _ in 0..rare {
+        let p = (
+            pos.0 + rng.next_bound(5) - 2,
+            pos.1,
+            pos.2 + rng.next_bound(5) - 2,
+        );
+        if reg.is_air(ctx.get(p.0, p.1, p.2)) {
+            let below = ctx.get(p.0, p.1 - 1, p.2);
+            if spc_face_sturdy(reg, below, 1) {
+                let st = reg.with_prop(
+                    reg.state_of("minecraft:sculk_shrieker", None),
+                    "can_summon",
+                    "true",
+                );
+                if !ctx.out_of_h(p.1) {
+                    ctx.set(p.0, p.1, p.2, st);
+                }
+            }
+        }
+    }
+}
+
 /// `PointedDripstoneFeature` (`eda`). See [`Cf::PointedDripstone`].
 fn gen_pointed_dripstone(
     ctx: &mut FC,
@@ -3316,6 +4568,27 @@ fn p_cf(j: &J) -> Option<Cf> {
             stem: p_bsp(js(j, "stem_provider")?)?,
             radius: jint(j, "foliage_radius", 0),
         },
+        "sculk_patch" => Cf::SculkPatch(SculkPatchCfg {
+            charge_count: jint(j, "charge_count", 0),
+            amount_per_charge: jint(j, "amount_per_charge", 0),
+            spread_attempts: jint(j, "spread_attempts", 0),
+            growth_rounds: jint(j, "growth_rounds", 0),
+            spread_rounds: jint(j, "spread_rounds", 0),
+            extra_rare_growths: p_ip(js(j, "extra_rare_growths")?)?,
+            catalyst_chance: jf32(j, "catalyst_chance", 0.0),
+        }),
+        "basalt_columns" => Cf::BasaltColumns {
+            height: p_ip(js(j, "height")?)?,
+            reach: p_ip(js(j, "reach")?)?,
+        },
+        "huge_fungus" => Cf::HugeFungus(HugeFungusCfg {
+            base: bs_state(js(j, "valid_base_block")?)?,
+            stem: bs_state(js(j, "stem_state")?)?,
+            hat: bs_state(js(j, "hat_state")?)?,
+            decor: bs_state(js(j, "decor_state")?)?,
+            replaceable: p_pred(js(j, "replaceable_blocks")?)?,
+            planted: jbool(j, "planted", false),
+        }),
         "coral_tree" => Cf::Coral(CoralShape::Tree),
         "coral_claw" => Cf::Coral(CoralShape::Claw),
         "coral_mushroom" => Cf::Coral(CoralShape::Mushroom),
@@ -3474,8 +4747,15 @@ fn load_freg() -> FReg {
     };
     for (name, b) in Gen::dp_files_any(&["configured_feature", "feature"]) {
         if let Some(j) = jparse(&b) {
-            if let Some(cf) = p_cf(&j) {
-                reg.cfg.insert(name, cf);
+            match p_cf(&j) {
+                Some(cf) => {
+                    reg.cfg.insert(name, cf);
+                }
+                None => {
+                    if env_flag!("CF_UNPARSED") {
+                        eprintln!("CFUNPARSED {name}");
+                    }
+                }
             }
         }
     }
@@ -4492,6 +5772,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         }
         Cf::PointedDripstone(c) => gen_pointed_dripstone(ctx, rng, pos, c),
         Cf::Coral(shape) => gen_coral(ctx, rng, pos, *shape),
+        Cf::HugeFungus(c) => gen_huge_fungus(ctx, rng, pos, c),
+        Cf::BasaltColumns { height, reach } => gen_basalt_columns(ctx, rng, pos, height, reach),
+        Cf::SculkPatch(c) => gen_sculk_patch(ctx, rng, pos, c),
         Cf::TwistingVines {
             width,
             height,
@@ -4761,7 +6044,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     eprintln!(
                         "SPRING {} {} {} at={} below={} below2={} rocks={rocks} holes={air} want={rock},{hole}",
-                        pos.0, pos.1, pos.2,
+                        pos.0,
+                        pos.1,
+                        pos.2,
                         reg.name_of(at),
                         reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
                         reg.name_of(ctx.get(pos.0, pos.1 - 2, pos.2)),
@@ -6251,7 +7536,10 @@ impl CarveRun {
                 branches += r.next_bound(4);
             }
             if env_flag!("CV_TRACE") {
-                eprintln!("CVTUN ox={ox} oz={oz} x={x} y={y} z={z} hrm={hrm} vrm={vrm} floor={} branches={branches}", self.floor);
+                eprintln!(
+                    "CVTUN ox={ox} oz={oz} x={x} y={y} z={z} hrm={hrm} vrm={vrm} floor={} branches={branches}",
+                    self.floor
+                );
             }
             for _ in 0..branches {
                 let yaw = r.next_f32() * TAU;
@@ -6799,6 +8087,10 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         }
     }
     let pop = pop_seed(g.wseed(), sx * 16, sz * 16);
+    crate::generation_math::CUR_POP_CHUNK.store(
+        ((sx as i64) << 32) | (sz as i64 & 0xFFFF_FFFF),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut ctx = FC::new(g);
     let trace = env_flag!("FEAT_TRACE");
     let profile = env_flag!("FEAT_PROFILE");

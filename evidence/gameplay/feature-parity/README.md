@@ -825,3 +825,23 @@ if (ebz.b($$0, $$11)) { … }
 （そういう run を取るまでは「未呼び出し」は bytecode の観測であって地形の観測ではない）。
 
 型カバレッジの未実装到達型は 4 → **3**（`fossil` `sculk_patch` `speleothem_cluster`）。
+
+## 2026-10-28: biome 集合の y 範囲修正と、その影響範囲
+
+`Gen::chunk_biome_set` が `qy in 0..height/16*4` で走査していたため、**y < 0 だけに存在する
+biome が chunk の biome 集合から落ちていた**（`biome_quart` は block y ÷ 4 を取る）。
+修正は `min_y / 4` から走査する（commit `b13b65f`、guard テスト
+`chunk_biome_set_covers_the_negative_y_range`）。
+
+実測した影響:
+
+- 深層暗黒の chunk (-16,112)-(-15,113)（seed 0）では `deep_dark` が集合に入らず、
+  `sculk_patch_deep_dark` と `sculk_vein` が**一度も走っていなかった**（port の sculk 系
+  セル 0 / 参照 397）。修正後は同区画で 429 セルを書く。
+- 一方、**forest (-64,32) 3x3 の生成は 1 セルも変わらない**（修正版と旧版の port dump を
+  `cmp` で比較して 0 セル）。したがって上の feature capture digest
+  `d1847cd981c73740ca39422c62ad5506` を含め、この区画で記録済みの値は修正の影響を受けない。
+- `tools/chunk_world_fixture.sh forest -4 2 3 features`（tick 後に保存する saved-world
+  比較）は 2566 セル差だが、これは R1 の **paused native** 0 差とは別の fixture であり
+  （script の docstring のとおり runtime 側）、sculk feature はこの区画の biome 集合に
+  入らないため、この 2 つの変更（sculk port と biome 集合修正）はどちらも寄与しない。

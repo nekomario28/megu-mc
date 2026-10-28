@@ -8,6 +8,14 @@
 #   carvers    no features, real carvers, no structures
 #   features   real features/carvers, no structures
 #   structures real features/carvers/structures
+#   sculk_veins / sculk_one_patch / sculk_cave_patch
+#
+# `JAVA_OPTS=<flags>` passes JVM flags (e.g. the agent's `-Dfeaturebox=...`).
+# `JAVA_AGENT=<carveagent.jar>` runs the reference under the instrumentation agent
+# (`tools/carve-agent/`), which is how a native stage's *intermediate* state (e.g. a sculk
+# cursor's per-update position/charge/facings) is observed rather than inferred.
+#              features, with a datapack that isolates one deep-dark step-7 feature
+#              (`tools/vanilla_sculk_pack.py`; apply the same override to the port's pack)
 #
 # The reference is always seed 0 from tools/fixture_base.sh. Every chunk is
 # force-loaded after the server is up; the reference must be complete before the
@@ -25,15 +33,32 @@ rm -rf "$DIR"; mkdir -p "$DIR/world"
 cp "$BASE/server.jar" "$DIR/"
 cp -r "$BASE/libraries" "$BASE/versions" "$DIR/"
 sed 's/^level-name=.*/level-name=world/' "$BASE/server.properties" > "$DIR/server.properties"
+# The base properties were chosen for a surface fixture. A deep-dark capture needs the
+# chunks actually generated (a shrunken view distance or a low simulation distance makes
+# the server save a chunk that was never decorated), and a fixed seed so the reference is
+# reproducible: `SEED` defaults to 0, which is the seed every other fixture uses.
+sed -i "s/^level-seed=.*/level-seed=${SEED:-0}/" "$DIR/server.properties"
+sed -i 's/^view-distance=.*/view-distance=10/' "$DIR/server.properties"
+sed -i 's/^simulation-distance=.*/simulation-distance=10/' "$DIR/server.properties"
 echo "eula=true" > "$DIR/eula.txt"
 case "$MODE" in
-  terrain|carvers|features) echo 'generate-structures=false' >> "$DIR/server.properties" ;;
+  terrain|carvers|features|sculk_veins|sculk_one_patch|sculk_cave_patch) echo 'generate-structures=false' >> "$DIR/server.properties" ;;
   structures) ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
 case "$MODE" in
   terrain) python3 "$ROOT/tools/vanilla_nofeat_pack.py" "$DIR/server.jar" "$DIR/world" >/dev/null ;;
   carvers) python3 "$ROOT/tools/vanilla_nofeat_pack.py" "$DIR/server.jar" "$DIR/world" --keep-carvers >/dev/null ;;
+  # `sculk_vein` and `sculk_patch_deep_dark` share step 7 of the deep-dark feature list, so
+  # a whole-region comparison cannot say which of the two moved. These two modes narrow the
+  # reference to one of them; the caller has to apply the same override to the port's own
+  # pack (`tools/vanilla_sculk_pack.py` prints the paths).
+  sculk_veins) python3 "$ROOT/tools/vanilla_sculk_pack.py" "$DIR/server.jar" "$DIR/world" --variant veins ;;
+  sculk_one_patch) python3 "$ROOT/tools/vanilla_sculk_pack.py" "$DIR/server.jar" "$DIR/world" --variant one-patch ;;
+  # the cave-band variant: a handful of candidates inside the deep-dark cave range, where a
+  # patch can actually start (`SCULK_COUNT`/`SCULK_HEIGHT`, default 4 and -64:-30)
+  sculk_cave_patch) python3 "$ROOT/tools/vanilla_sculk_pack.py" "$DIR/server.jar" "$DIR/world" --variant one-patch \
+    --count "${SCULK_COUNT:-4}" --height "${SCULK_HEIGHT:--64:-30}" ;;
 esac
 lox=$((CX*16)); loz=$((CZ*16)); hix=$(((CX+N)*16-1)); hiz=$(((CZ+N)*16-1))
 echo "chunk fixture $TAG: mode $MODE, chunks ($CX,$CZ)+${N}x${N}, blocks ($lox,$loz)-($hix,$hiz)"
@@ -51,7 +76,9 @@ echo "chunk fixture $TAG: mode $MODE, chunks ($CX,$CZ)+${N}x${N}, blocks ($lox,$
                  sleep 10
                  printf 'stop\n' ) \
   | timeout 360 systemd-run --scope --user -p MemoryMax=3G --unit="cw-$TAG-$$" \
-      java -Xmx2G -Xms512M -jar server.jar nogui > run.log 2>&1 ) || true
+      java -Xmx2G -Xms512M ${JAVA_AGENT:+-javaagent:$JAVA_AGENT} \
+        ${JAVA_AGENT:+-XX:+EnableDynamicAgentLoading} ${JAVA_OPTS:-} \
+        -jar server.jar nogui > run.log 2>&1 ) || true
 if grep -qi 'unexpected error occurred' "$DIR/run.log"; then
   echo "chunk fixture: server command error (see $DIR/run.log)" >&2
   exit 2

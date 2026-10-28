@@ -3416,8 +3416,15 @@ impl Gen {
         let mut seen: Vec<String> = vec![];
         let mut set = std::collections::HashSet::new();
         let (qx0, qz0) = (cx * 4, cz * 4);
-        let qy_max = (self.height / 16) * 4;
-        for qy in 0..qy_max {
+        // The quart y index is the *block* y divided by four, so the sweep has to start at
+        // `min_y / 4` (-16 in the overworld), not at 0. Starting at 0 covered y = 0..383 and
+        // silently omitted every biome that lives only below y = 0: the chunk's biome set had
+        // no `deep_dark`, so `sculk_patch_deep_dark` and `sculk_vein` never ran for a deep-dark
+        // chunk (measured: 0 of the 397 sculk cells vanilla places), and the same hole applies
+        // to any cave biome confined to the negative range.
+        let qy_min = self.min_y / 4;
+        let qy_max = (self.min_y + self.height) / 4;
+        for qy in qy_min..qy_max {
             for lx in 0..4 {
                 for lz in 0..4 {
                     if let Some((_, leaf)) = self.biome_quart(qx0 + lx, qy, qz0 + lz, None) {
@@ -5128,6 +5135,42 @@ mod wg_tests {
         assert!(
             unknown.is_empty(),
             "biome tree contains foreign biomes: {unknown:?}"
+        );
+    }
+
+    /// The chunk biome set must cover the whole build height, not y >= 0.
+    ///
+    /// `biome_quart` takes the *block* y divided by four, so a sweep of `0..height/4` reads
+    /// y = 0..383 and drops every biome confined below y = 0. Measured consequence: a deep-dark
+    /// chunk had no `deep_dark` in its set, so `sculk_patch_deep_dark` and `sculk_vein` never
+    /// ran there (0 of the 397 sculk cells vanilla places), while `pointed_dripstone` ran
+    /// because `dripstone_caves` also occurs above y = 0.
+    #[test]
+    fn chunk_biome_set_covers_the_negative_y_range() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack must load");
+        let (cx, cz) = (-16, 112);
+        let set = g.chunk_biome_set(cx, cz);
+        assert!(
+            set.iter().any(|b| b == "minecraft:deep_dark"),
+            "deep-dark chunk lost its below-zero biome: {set:?}"
+        );
+        // and the set must be the union over *every* quart layer of the chunk
+        let mut union = std::collections::HashSet::new();
+        for qy in g.min_y / 4..(g.min_y + g.height) / 4 {
+            for lx in 0..4 {
+                for lz in 0..4 {
+                    if let Some((_, leaf)) = g.biome_quart(cx * 4 + lx, qy, cz * 4 + lz, None) {
+                        if let Some(name) = g.biome_name_of_leaf(leaf) {
+                            union.insert(name);
+                        }
+                    }
+                }
+            }
+        }
+        let from_set: std::collections::HashSet<String> = set.iter().cloned().collect();
+        assert_eq!(
+            from_set, union,
+            "chunk biome set is not the union of its own quart layers"
         );
     }
 

@@ -22,7 +22,7 @@ class FeatureCoverageTests(unittest.TestCase):
                     'config': {'features': [
                         {'feature': {'type': 'minecraft:sculk_patch', 'config': {}}, 'placement': []},
                         {'feature': 'minecraft:mushroom', 'placement': []}]}},
-                'configured_feature/mushroom.json': {'type': 'minecraft:huge_fungus', 'config': {}},
+                'configured_feature/mushroom.json': {'type': 'minecraft:fossil', 'config': {}},
                 'placed_feature/top.json': {'feature': 'minecraft:root', 'placement': []},
                 'biome/test.json': {'features': [['minecraft:top']]},
             }
@@ -36,11 +36,11 @@ class FeatureCoverageTests(unittest.TestCase):
             text = output.getvalue()
             self.assertIn('2 files + 1 inline, 3 types', text)
             self.assertRegex(text, r'sculk_patch\s+1\s+1\s+1')
-            # An unimplemented type has to be named by the report. Both huge mushrooms and
-            # the coral trio used to serve here and now have arms, so `huge_fungus` and
-            # `sculk_patch` keep the gap path exercised; pick the next type from
+            # An unimplemented type has to be named by the report. The huge mushrooms, the
+            # coral trio and `huge_fungus` used to serve here and now have arms, so `fossil`
+            # and `sculk_patch` keep the gap path exercised; pick the next type from
             # `feature_type_coverage.py` when they land.
-            self.assertRegex(text, r'huge_fungus\s+1\s+1\s+1')
+            self.assertRegex(text, r'fossil\s+1\s+1\s+1')
 
     def test_missing_empty_and_invalid_input_cannot_report_zero_gaps(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(coverage, 'DATA', Path(tmp)):

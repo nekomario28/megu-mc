@@ -344,14 +344,23 @@ public final class NativeHarness {
         return getOrThrow(parse((Codec<?>) stateC.getField("b").get(null), json));
     }
 
-    /** `Codec.parse(DynamicOps, T)` for `JsonOps`; the overload is picked by assignability. */
+    /**
+     * `Codec.parse(DynamicOps, T)`; the overload is picked by assignability.
+     *
+     * The ops are **registry-backed** (`RegistryOps` over `BuiltInRegistries.REGISTRY`). A
+     * plain `JsonOps` decodes most configs but not the ones whose codecs resolve block or
+     * biome references: `huge_fungus`'s `replaceable_blocks` (`matching_blocks`) failed with
+     * "Can't access registry minecraft:block" until this existed. The bootstrap the harness
+     * already runs is what fills that registry, so the provider is available here.
+     */
     static Object parse(Codec<?> codec, com.google.gson.JsonElement element) throws Exception {
+        Object ops = ops();
         Object result = null;
         for (Method m : Codec.class.getMethods()) {
             if (!m.getName().equals("parse") || m.getParameterCount() != 2) continue;
-            if (!m.getParameterTypes()[0].isAssignableFrom(JsonOps.class)) continue;
+            if (!m.getParameterTypes()[0].isAssignableFrom(ops.getClass())) continue;
             try {
-                result = m.invoke(codec, JsonOps.INSTANCE, element);
+                result = m.invoke(codec, ops, element);
                 break;
             } catch (IllegalArgumentException e) {
                 // try the next overload
@@ -359,6 +368,20 @@ public final class NativeHarness {
         }
         if (result == null) throw new AssertionError("codec parse(DynamicOps, T) not found");
         return result;
+    }
+
+    static Object OPS;
+
+    /** `RegistryOps.create(JsonOps.INSTANCE, RegistryAccess.fromRegistryOfRegistries(REGISTRY))`. */
+    static Object ops() throws Exception {
+        if (OPS != null) return OPS;
+        Object registry = C("lt").getField("aA").get(null); // BuiltInRegistries.REGISTRY
+        // `ka` = RegistryAccess, `jz` = Registry, `akp` = RegistryOps, `jo$a` = HolderLookup$Provider
+        Object access = C("ka").getMethod("a", C("jz")).invoke(null, registry);
+        OPS = C("akp")
+                .getMethod("a", Class.forName("com.mojang.serialization.DynamicOps"), C("jo$a"))
+                .invoke(null, JsonOps.INSTANCE, access);
+        return OPS;
     }
 
     static Object getOrThrow(Object result) throws Exception {
@@ -494,6 +517,42 @@ public final class NativeHarness {
                 }
                 return stateC.getMethod("u").invoke(at); // BlockStateBase.getFluidState()
             }
+            // `isStateAtPosition(pos, predicate)` (`ddc.a(jd, Predicate)`): the predicate is
+            // applied to the state this level already serves, so no block knowledge is
+            // duplicated here. `Feature.isReplaceable` reaches this through
+            // `BlockState::canBeReplaced`.
+            if (m.getName().equals("a") && pt.length == 2 && pt[0] == posC
+                    && pt[1] == java.util.function.Predicate.class
+                    && m.getReturnType() == boolean.class) {
+                int[] p = xyz(a[0]);
+                Object at = writes.get(p[0] + "," + p[1] + "," + p[2]);
+                if (at == null) {
+                    at = scene.stateAt(p[0], p[1], p[2]);
+                    if (at == null) at = state("minecraft:air");
+                }
+                return ((java.util.function.Predicate<Object>) a[1]).test(at);
+            }
+            // `getChunk(int,int,ChunkStatus,boolean)` (`dcz.a`): a *real* scratch `ProtoChunk`.
+            //
+            // `SculkVeinBlock`'s shape update asks the level for a chunk, which a scripted level
+            // cannot answer with anything of its own - a subclass is impossible, because the
+            // game's classes live in the default package and adding a class there fails the
+            // signer check. A vanilla `ProtoChunk` is constructible from data the harness has
+            // (`UpgradeData.EMPTY`, `LevelHeightAccessor.create`), and shape updates land in it
+            // instead of the level, which is what a scratch chunk is for.
+            //
+            // Measured limit: this gets the run past `getChunk`, and it then fails because an
+            // empty chunk answers a biome query with a fixed `minecraft:plains` key, looked up
+            // in whatever `Registry` the chunk was built with. Biomes are a *dynamic* registry
+            // in 1.21 - no `BuiltInRegistries` field names one - so a chunk that can answer
+            // biome queries needs a real world's `RegistryAccess`, which this harness does not
+            // have. Driving the sculk path natively therefore needs a running-server context,
+            // not more harness.
+            if (m.getName().equals("a") && pt.length == 4 && pt[0] == int.class && pt[1] == int.class
+                    && pt[2].getName().equals("dvz") && pt[3] == boolean.class
+                    && m.getReturnType().getName().equals("duy")) {
+                return scratchChunk((int) a[0], (int) a[1]);
+            }
             // setBlock(pos, state, flags) must be recorded.
             if (m.getName().equals("a") && pt.length == 3 && pt[0] == posC && pt[1] == stateC
                     && m.getReturnType() == boolean.class) {
@@ -540,6 +599,41 @@ public final class NativeHarness {
     /** A level whose scene resolves properties itself (see {@link StateScene}). */
     public static Level levelFromStates(StateScene scene) {
         return new Level(scene, MIN_Y, HEIGHT, null);
+    }
+
+    /**
+     * A real `NoiseBasedChunkGenerator` over vanilla's `NoiseGeneratorSettings.dummy()`.
+     *
+     * `dummy()` is `NoiseSettings.create(-64, 384, 1, 2)` with sea level 63, so
+     * `getGenDepth()` and `getSeaLevel()` answer with vanilla's numbers for this world
+     * rather than a stub. Only the biome source is `null`: neither `dummy()` nor the two
+     * accessors touch it.
+     */
+    static Object probeGenerator() throws Exception {
+        Object settings = C("dzd").getMethod("e").invoke(null);
+        Object holder = C("jm").getMethod("a", Object.class).invoke(null, settings);
+        return C("dzb").getConstructor(C("dea"), C("jm")).newInstance(null, holder);
+    }
+
+    static final Map<Long, Object> SCRATCH_CHUNKS = new HashMap<>();
+
+    /** A `ProtoChunk` for this position, reused: shape updates may write into it freely. */
+    static Object scratchChunk(int cx, int cz) throws Exception {
+        long key = ((long) cx << 32) ^ (cz & 0xFFFF_FFFFL);
+        Object cached = SCRATCH_CHUNKS.get(key);
+        if (cached != null) return cached;
+        Object pos = C("dcd").getConstructor(int.class, int.class).newInstance(cx, cz);
+        Object upgrade = C("dvv").getField("a").get(null); // UpgradeData.EMPTY
+        Object heights = heightC.getMethod("e", int.class, int.class).invoke(null, MIN_Y, HEIGHT);
+        Object chunk = C("dvs")
+                .getConstructor(C("dcd"), C("dvv"), C("dcy"), C("jz"), C("eab"))
+                // The 4th argument erases to `Registry`; biomes are a *dynamic* registry in
+                // 1.21 (nothing in `BuiltInRegistries` names it), and a scratch chunk is only
+                // used for shape updates, which never ask it for a biome. The plain type of
+                // whatever registry is passed is not checked by reflection.
+                .newInstance(pos, upgrade, heights, C("lt").getField("e").get(null), null);
+        SCRATCH_CHUNKS.put(key, chunk);
+        return chunk;
     }
 
     /** Same name and parameter types declared by the height-accessor interface. */
@@ -606,7 +700,17 @@ public final class NativeHarness {
             }
         }
         if (ctxCtor == null) throw new AssertionError("FeaturePlaceContext constructor not found");
-        Object ctx = ctxCtor.newInstance(Optional.empty(), level.proxy, null, rng, pos(x, y, z), cfg);
+        // The context's generator slot is a real one: `ChunkGenerator.getSeaLevel()` and
+        // `getGenDepth()` are abstract, so a feature that reads either (basalt_columns,
+        // huge_fungus) dies on a null. Vanilla's own `NoiseGeneratorSettings.dummy()` is a
+        // real settings object with min y -64 / height 384 / sea level 63 (the same numbers
+        // this harness's level reports), and `NoiseBasedChunkGenerator` is constructible
+        // from it without registries. Subclassing `ChunkGenerator` from here is not an
+        // option: the game's classes are signed, and a class we add to their package fails
+        // with "signer information does not match".
+        Object generator = probeGenerator();
+        Object ctx = ctxCtor.newInstance(Optional.empty(), level.proxy, generator, rng,
+                pos(x, y, z), cfg);
         Method place = null;
         for (Class<?> c = feature.getClass(); c != null && place == null; c = c.getSuperclass()) {
             for (Method m : c.getDeclaredMethods()) {

@@ -1,0 +1,213 @@
+{
+  "_comment": "FeatureOracle cases for basalt_columns (the pack's `large_basalt_columns`: height uniform 5..10, reach uniform 2..3). Coordinates are origin-relative; ranges are inclusive; a cell covered by no ply is air. `ocean_lava` is the lava-at-or-below-sea-level case (`getSeaLevel()` is 63) and `lava_above_sea` the one that must refuse; `canopy` stops the columns, `bedrock_below` exercises the cannot-place-on list's find-surface branch.",
+  "type": "minecraft:basalt_columns",
+  "class": "ebi",
+  "config": {
+    "height": {
+      "type": "minecraft:uniform",
+      "max_inclusive": 10,
+      "min_inclusive": 5
+    },
+    "reach": {
+      "type": "minecraft:uniform",
+      "max_inclusive": 3,
+      "min_inclusive": 2
+    }
+  },
+  "scenes": [
+    {
+      "name": "air",
+      "plies": []
+    },
+    {
+      "name": "floor",
+      "plies": [
+        {
+          "block": "minecraft:netherrack",
+          "dx": [
+            -6,
+            6
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -6,
+            6
+          ]
+        }
+      ]
+    },
+    {
+      "name": "floor_wide",
+      "plies": [
+        {
+          "block": "minecraft:netherrack",
+          "dx": [
+            -12,
+            12
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -12,
+            12
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ocean_lava",
+      "plies": [
+        {
+          "block": "minecraft:netherrack",
+          "dx": [
+            -12,
+            12
+          ],
+          "dy": [
+            -6,
+            -6
+          ],
+          "dz": [
+            -12,
+            12
+          ]
+        },
+        {
+          "block": "minecraft:lava",
+          "dx": [
+            -12,
+            12
+          ],
+          "dy": [
+            -5,
+            -1
+          ],
+          "dz": [
+            -12,
+            12
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lava_above_sea",
+      "plies": [
+        {
+          "block": "minecraft:netherrack",
+          "dx": [
+            -12,
+            12
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -12,
+            12
+          ]
+        },
+        {
+          "block": "minecraft:lava",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            0,
+            0
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "canopy",
+      "plies": [
+        {
+          "block": "minecraft:netherrack",
+          "dx": [
+            -12,
+            12
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -12,
+            12
+          ]
+        },
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -12,
+            12
+          ],
+          "dy": [
+            8,
+            8
+          ],
+          "dz": [
+            -12,
+            12
+          ]
+        }
+      ]
+    },
+    {
+      "name": "bedrock_below",
+      "plies": [
+        {
+          "block": "minecraft:bedrock",
+          "dx": [
+            -12,
+            12
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -12,
+            12
+          ]
+        }
+      ]
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    -1,
+    15,
+    20,
+    42,
+    60007
+  ],
+  "oy": 64,
+  "extra": [],
+  "box": [
+    [
+      -12,
+      12
+    ],
+    [
+      -6,
+      20
+    ],
+    [
+      -12,
+      12
+    ]
+  ]
+}

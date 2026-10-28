@@ -80,3 +80,21 @@ Box selectors complement explicit cell selectors so a previously unknown
 changed cell can still be attributed. The Java logger's primitive-only
 boundary remains unchanged; unsupported proxy world operations must fail,
 never return a plausible default.
+
+## sculk hook (2026-10-28)
+
+`SculkTransformer` hooks `SculkSpreader$ChargeCursor.update` (`dmu$a.a(dcx,jd,ayw,dmu,boolean)`)
+and prints, at method entry, `SCURSOR <x> <y> <z> <charge> <decayDelay> <updateDelay> <mask>`
+via the bootstrap `SculkLog`. `mask` is `-1` for a null facing set (the spreader's
+SAME_POSITION-only variant), `0` for an empty set (the all-types variant), otherwise the face
+mask over Direction's declaration order (down, up, north, south, west, east) - the same index
+the port's own face mask uses, so a cursor's trajectory becomes two index-aligned lists.
+
+The hook only reads fields and calls `jd.u()/v()/w()`, so it draws no random and cannot change
+the spread. `-Dsculkquiet=true` silences it. Build it with `SculkLog.java` alongside
+`CarveLog.java` (same jar list), and drive a features capture with
+
+```sh
+JAVA_AGENT=/path/to/carveagent.jar tools/chunk_world_fixture.sh sculk -16 112 1 features
+grep -o 'SCURSOR .*' /tmp/chunkfix-sculk/run.log | head
+```

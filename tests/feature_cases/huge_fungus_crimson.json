@@ -1,0 +1,281 @@
+{
+  "_comment": "FeatureOracle cases for huge_fungus with the pack's `crimson_fungus` config. The hat is `minecraft:nether_wart_block`, which is what enables the weeping-vine decoration (`hatState.is(Blocks.NETHER_WART_BLOCK)`); the warped config never reaches it, which is why this second case set exists. Coordinates are origin-relative; a cell covered by no ply is air.",
+  "type": "minecraft:huge_fungus",
+  "class": "eco",
+  "config": {
+    "decor_state": {
+      "Name": "minecraft:shroomlight"
+    },
+    "hat_state": {
+      "Name": "minecraft:nether_wart_block"
+    },
+    "planted": false,
+    "replaceable_blocks": {
+      "type": "minecraft:matching_blocks",
+      "blocks": [
+        "minecraft:oak_sapling",
+        "minecraft:spruce_sapling",
+        "minecraft:birch_sapling",
+        "minecraft:jungle_sapling",
+        "minecraft:acacia_sapling",
+        "minecraft:cherry_sapling",
+        "minecraft:dark_oak_sapling",
+        "minecraft:mangrove_propagule",
+        "minecraft:dandelion",
+        "minecraft:torchflower",
+        "minecraft:poppy",
+        "minecraft:blue_orchid",
+        "minecraft:allium",
+        "minecraft:azure_bluet",
+        "minecraft:red_tulip",
+        "minecraft:orange_tulip",
+        "minecraft:white_tulip",
+        "minecraft:pink_tulip",
+        "minecraft:oxeye_daisy",
+        "minecraft:cornflower",
+        "minecraft:wither_rose",
+        "minecraft:lily_of_the_valley",
+        "minecraft:brown_mushroom",
+        "minecraft:red_mushroom",
+        "minecraft:wheat",
+        "minecraft:sugar_cane",
+        "minecraft:attached_pumpkin_stem",
+        "minecraft:attached_melon_stem",
+        "minecraft:pumpkin_stem",
+        "minecraft:melon_stem",
+        "minecraft:lily_pad",
+        "minecraft:nether_wart",
+        "minecraft:cocoa",
+        "minecraft:carrots",
+        "minecraft:potatoes",
+        "minecraft:chorus_plant",
+        "minecraft:chorus_flower",
+        "minecraft:torchflower_crop",
+        "minecraft:pitcher_crop",
+        "minecraft:beetroots",
+        "minecraft:sweet_berry_bush",
+        "minecraft:warped_fungus",
+        "minecraft:crimson_fungus",
+        "minecraft:weeping_vines",
+        "minecraft:weeping_vines_plant",
+        "minecraft:twisting_vines",
+        "minecraft:twisting_vines_plant",
+        "minecraft:cave_vines",
+        "minecraft:cave_vines_plant",
+        "minecraft:spore_blossom",
+        "minecraft:azalea",
+        "minecraft:flowering_azalea",
+        "minecraft:moss_carpet",
+        "minecraft:pink_petals",
+        "minecraft:big_dripleaf",
+        "minecraft:big_dripleaf_stem",
+        "minecraft:small_dripleaf"
+      ]
+    },
+    "stem_state": {
+      "Name": "minecraft:crimson_stem",
+      "Properties": {
+        "axis": "y"
+      }
+    },
+    "valid_base_block": {
+      "Name": "minecraft:crimson_nylium"
+    }
+  },
+  "scenes": [
+    {
+      "name": "air",
+      "plies": []
+    },
+    {
+      "name": "base",
+      "plies": [
+        {
+          "block": "minecraft:crimson_nylium",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "base_wide",
+      "plies": [
+        {
+          "block": "minecraft:crimson_nylium",
+          "dx": [
+            -3,
+            3
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -3,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "name": "base_saplings",
+      "plies": [
+        {
+          "block": "minecraft:crimson_nylium",
+          "dx": [
+            -3,
+            3
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -3,
+            3
+          ]
+        },
+        {
+          "block": "minecraft:oak_sapling",
+          "dx": [
+            -1,
+            1
+          ],
+          "dy": [
+            0,
+            14
+          ],
+          "dz": [
+            -1,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "base_stone_core",
+      "plies": [
+        {
+          "block": "minecraft:crimson_nylium",
+          "dx": [
+            -3,
+            3
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -3,
+            3
+          ]
+        },
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            2,
+            2
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "base_ceiling",
+      "plies": [
+        {
+          "block": "minecraft:crimson_nylium",
+          "dx": [
+            -3,
+            3
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -3,
+            3
+          ]
+        },
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            -3,
+            3
+          ],
+          "dy": [
+            9,
+            9
+          ],
+          "dz": [
+            -3,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrong_base",
+      "plies": [
+        {
+          "block": "minecraft:netherrack",
+          "dx": [
+            -3,
+            3
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            -3,
+            3
+          ]
+        }
+      ]
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    -1,
+    15,
+    20,
+    42,
+    60007
+  ],
+  "oy": 64,
+  "extra": [],
+  "box": [
+    [
+      -4,
+      4
+    ],
+    [
+      -6,
+      28
+    ],
+    [
+      -4,
+      4
+    ]
+  ]
+}
