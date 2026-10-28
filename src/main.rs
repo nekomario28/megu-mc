@@ -14382,9 +14382,6 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                         };
                         if wy >= sy && wy < sy + 16 {
                             if let Some(v) = section_of(&base, wy - sy) {
-                                if chunkprof::enabled() {
-                                    chunkprof::RD_SECTION.fetch_add(1, Ordering::Relaxed);
-                                }
                                 if let Some(t) = __t {
                                     chunkprof::add(&chunkprof::READ_NS, t);
                                 }
@@ -14411,9 +14408,6 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                         chunkprof::READ_BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     if let Some(st) = stored_state(wx, wy, wz) {
-                        if chunkprof::enabled() {
-                            chunkprof::RD_STORE.fetch_add(1, Ordering::Relaxed);
-                        }
                         if let Some(t) = __t {
                             chunkprof::add(&chunkprof::READ_NS, t);
                         }
@@ -14433,18 +14427,15 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                     } else {
                         None
                     };
-                    if chunkprof::enabled() {
-                        if band.is_some() {
-                            chunkprof::RD_BAND.fetch_add(1, Ordering::Relaxed);
-                        } else if overlay_hit.is_some() {
-                            chunkprof::RD_OVERLAY.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
                     let out = match band.or(overlay_hit) {
                         Some(st) => st,
                         None => {
                             if chunkprof::enabled() {
                                 chunkprof::EXPOSURE_READ_BASE
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if chunkprof::enabled() {
+                                chunkprof::EXPOSURE_READS
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             let __tbs = chunkprof::enabled().then(std::time::Instant::now);
@@ -23390,10 +23381,6 @@ pub(crate) mod chunkprof {
     pub(super) static OVERLAY_APPLY: AtomicU64 = AtomicU64::new(0);
     pub(super) static HIDDEN_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static EXPOSURE_READS: AtomicU64 = AtomicU64::new(0);
-    pub(super) static RD_SECTION: AtomicU64 = AtomicU64::new(0);
-    pub(super) static RD_STORE: AtomicU64 = AtomicU64::new(0);
-    pub(super) static RD_BAND: AtomicU64 = AtomicU64::new(0);
-    pub(super) static RD_OVERLAY: AtomicU64 = AtomicU64::new(0);
     pub(super) static EXPOSURE_READ_BASE: AtomicU64 = AtomicU64::new(0);
     pub(super) static LIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static RE_LIGHT: AtomicU64 = AtomicU64::new(0);
@@ -23478,13 +23465,9 @@ pub(crate) mod chunkprof {
             READ_BAND_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64
         );
         eprintln!(
-            "CHUNKPROF   encode/chunk: hidden={:.0} reads={:.0} (section={:.0} store={:.0} band={:.0} overlay={:.0} base_state={:.0})",
+            "CHUNKPROF   encode/chunk: hidden={:.0} reads={:.0} base_state={:.0}",
             HIDDEN_N.load(Ordering::Relaxed) as f64 / n as f64,
             EXPOSURE_READS.load(Ordering::Relaxed) as f64 / n as f64,
-            RD_SECTION.load(Ordering::Relaxed) as f64 / n as f64,
-            RD_STORE.load(Ordering::Relaxed) as f64 / n as f64,
-            RD_BAND.load(Ordering::Relaxed) as f64 / n as f64,
-            RD_OVERLAY.load(Ordering::Relaxed) as f64 / n as f64,
             EXPOSURE_READ_BASE.load(Ordering::Relaxed) as f64 / n as f64
         );
         eprintln!(
