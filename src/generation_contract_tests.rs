@@ -591,6 +591,13 @@ fn sculk_cursor_matches_the_native_trace() {
     // 5798 lines instead of 5150, measured).
     let _ = g.feat_state(-256, 64, 1792, super::populate);
     let lines = super::spc_trace_take();
+    // Only the cursor lines take part in this comparison; the `SPATCH` markers the port now emits
+    // (same format as the reference agent's, `SculkLog.patch`) split the trace by patch and are
+    // what a patch-scoped comparison would use - see the spec page for why that is not done yet.
+    let lines: Vec<String> = lines
+        .into_iter()
+        .filter(|l| l.starts_with("SCURSOR"))
+        .collect();
     let native: Vec<String> = include_str!("../tests/data/sculk_cursor_1211.tsv")
         .lines()
         .map(|l| l.to_string())

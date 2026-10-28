@@ -1130,6 +1130,45 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("edi".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        // `SculkPatchFeature.place(FeaturePlaceContext)`: log the origin
+                        if (!mn.equals("a") || !md.equals("(Lecg;)Z")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.ALOAD, 1);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ecg", "e", "()Ljd;", false);
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "u", "()I", false);
+                                super.visitInsn(Opcodes.SWAP);
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "v", "()I", false);
+                                super.visitInsn(Opcodes.SWAP);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "w", "()I", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "patch",
+                                        "(III)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT edi patch hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT edi patch hook failed: " + t);
+                return null;
+            }
+        }
         if (!"dmu$a".equals(name)) return null;
         try {
             ClassReader cr = new ClassReader(buf);

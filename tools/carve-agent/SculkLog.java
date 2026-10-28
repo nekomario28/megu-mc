@@ -37,6 +37,12 @@ public class SculkLog {
         System.out.println("SSPREADALL types=" + types + " r=" + round + " i=" + (idx - 1));
     }
 
+    /** `SculkPatchFeature.place` entry: the patch's origin, so a run's trace splits by patch. */
+    public static void patch(int x, int y, int z) {
+        if (Boolean.getBoolean("sculkquiet")) return;
+        System.out.println("SPATCH " + x + " " + y + " " + z);
+    }
+
     public static void cursor(int x, int y, int z, int charge, int decayDelay, int updateDelay,
                               java.util.Set<?> facings) {
         if (Boolean.getBoolean("sculkquiet")) return;

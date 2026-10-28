@@ -18,6 +18,18 @@ Original carver hooks (both ASM, applied at class load):
   `Block.BLOCK_STATE_REGISTRY` in the instrumented bytecode, so no game class is
   referenced from the bootstrap logger.
 
+Sculk hook (the sculk cursor/parity work in `specs/worldgen-parity/sculk-patch.md`):
+
+- `dmu$a` (`SculkSpreader$ChargeCursor`) / its update hook logs `SCURSOR r=<round> i=<index>
+  x y z charge decayDelay updateDelay facingMask` and `SSPREAD`/`SSPREADALL`/`SCMARK` around
+  the spread calls.
+- `edi` (`SculkPatchFeature`) / `place(FeaturePlaceContext)`: at method entry, logs
+  `SPATCH x y z` with `ecg.e()` (the placement origin). The trace of a run splits by patch on
+  these, which is what makes two runs comparable: captures order patches differently and `r`
+  counts every `updateCursors` call in the whole run (measured: the same patch is `r=0` in one
+  capture, `r=192` in another). Only a few of the logged calls go on to spread (mk6 capture:
+  1231 `SPATCH`, 57 origins spread).
+
 `CarveLog` is appended to the bootstrap class loader (the game classes live in
 the bundler's child loader, so an app-loader class is not visible to them) and
 takes only primitives, so it never needs a game type. Frames are recomputed with
@@ -37,6 +49,9 @@ cp -r c1/* j1/ && (cd c1 && jar xf "$ASM" org) && cp -r c1/org j1/
 printf 'Premain-Class: Agent\n' > j1/META-INF/MANIFEST.MF
 (cd j1 && jar cfm ../carveagent.jar META-INF/MANIFEST.MF .)
 ```
+
+`SculkLog.patch` only takes three ints, like the other SculkLog methods, so it needs no game
+class on the bootstrap classpath.
 
 Both loggers go into `carvelog.jar` (the bootstrap-visible one); the agent jar carries ASM
 itself, so nothing else has to be on the classpath.

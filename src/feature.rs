@@ -3514,6 +3514,11 @@ fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
 
 /// `SculkPatchFeature.place` (`edi.a(ecg)`).
 fn gen_sculk_patch(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &SculkPatchCfg) {
+    // Patch marker, in the reference agent's `SPATCH` format (`SculkLog.patch`, hooked into
+    // `SculkPatchFeature.place`): the trace of a run is split by patch via these, because
+    // captures order patches differently and number rounds globally. Logged at entry, before
+    // `canSpreadFrom`, exactly like the agent's hook.
+    spc_trace(format!("SPATCH {} {} {}", pos.0, pos.1, pos.2));
     let Some(reg) = breg() else { return };
     if !spc_can_spread_from(ctx, reg, pos) {
         return;

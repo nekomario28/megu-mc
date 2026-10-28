@@ -614,6 +614,34 @@ native は隣接セルに書いている。→ この経路で**3 型の spreade
 `types=-2`（ReflectiveOperationException）で失敗したので、`dmv$a` の `a()` を直接
 `getDeclaredMethod` で引く形に直す。これで「1 型か 3 型か」が 1 行で確定する。
 
+## パッチ単位の比較を計測した（2026-10-28、ここで新しい食い違いが出た）
+
+`SculkPatchFeature.place` の入口にフックを足し、両側が **パッチの origin** を
+`SPATCH x y z` として出すようにした（agent: `SculkLog.patch` + `edi` フック、port:
+`gen_sculk_patch` の入口。agent の再ビルド手順は `tools/carve-agent/README.md`）。
+これで「どのパッチが」「どこで spreading したか」を突き合わせられる。
+
+seed 0、native は chunk (-16,112) を起点に生成された **7×7 chunk** 分、port は同じ箱を
+`MC_SPINE_WG_DUMP_N=8` で dump して計測（native capture 1回=3分、port dump は秒）:
+
+| | place 呼び出し | spreading した origin 数 | cursor 行 |
+|---|---|---|---|
+| native (mk6 capture) | 1231 | **57** | 28175 |
+| port (8×8 dump) | 2260 | **79** | 44612 |
+
+- **共通の spreading origin: 21**（= 21 パッチ分、10961 cursor 行が比較可能）
+- **食い違い（未解明、次の調査対象）**:
+  1. place 呼び出し数が 1231 対 2260（同じ箱で 1.8 倍）。同じ placement 設定なら試行数は
+     揃うはずなので、**placement の試行そのものが違う**可能性
+  2. spreading した origin が native 57 / port 79 で、**共通は 21 のみ**。
+     native の spreading 位置の 63% は port では spreading していない
+     （= 同じ chunk・同じ seed でもパッチの成否が違う）
+
+この 2 点は「セル数が 5082 対 4834」という差の**原因候補**である。ただし**両側の呼び出し
+集合が同じであることを先に確認しないと比較として成立しない**ので、いまはパッチ単位の
+fixture をこれ以上増やさず、この数を未解明のまま記録する（`patches`/`compare` の
+patch 対応は実装済みで、上記集合の差が説明でき次第そのまま使える）。
+
 ## native trace の再現性（2026-10-28、2 capture で実測）
 
 同じ fixture（seed 0、chunk (-16,112)、agent 付き、`FIXTURE_SETTLE=75`）を**2回**取り直して
