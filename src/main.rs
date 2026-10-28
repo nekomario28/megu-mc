@@ -14382,6 +14382,9 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                         };
                         if wy >= sy && wy < sy + 16 {
                             if let Some(v) = section_of(&base, wy - sy) {
+                                if chunkprof::enabled() {
+                                    chunkprof::RD_SECTION.fetch_add(1, Ordering::Relaxed);
+                                }
                                 if let Some(t) = __t {
                                     chunkprof::add(&chunkprof::READ_NS, t);
                                 }
@@ -14408,6 +14411,9 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                         chunkprof::READ_BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     if let Some(st) = stored_state(wx, wy, wz) {
+                        if chunkprof::enabled() {
+                            chunkprof::RD_STORE.fetch_add(1, Ordering::Relaxed);
+                        }
                         if let Some(t) = __t {
                             chunkprof::add(&chunkprof::READ_NS, t);
                         }
@@ -14427,6 +14433,13 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                     } else {
                         None
                     };
+                    if chunkprof::enabled() {
+                        if band.is_some() {
+                            chunkprof::RD_BAND.fetch_add(1, Ordering::Relaxed);
+                        } else if overlay_hit.is_some() {
+                            chunkprof::RD_OVERLAY.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let out = match band.or(overlay_hit) {
                         Some(st) => st,
                         None => {
@@ -14483,12 +14496,11 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                                 }
                             }
                             // anti-xray + palette compression: buried hidden blocks sent as stone
-                            if chunkprof::enabled() && is_hidden(st) {
+                            let mut hidden_cell = hidden.contains(st) && !no_xray;
+                            if chunkprof::enabled() && hidden_cell {
                                 chunkprof::HIDDEN_N
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            let __th = chunkprof::enabled().then(std::time::Instant::now);
-                            let mut hidden_cell = hidden.contains(st);
                             if hidden_cell {
                                 for (dx, dy, dz) in [
                                     (1, 0, 0),
@@ -14509,11 +14521,6 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                             } else {
                                 st
                             };
-                            if let Some(t) = __th {
-                                chunkprof::add(&chunkprof::XRAY, t);
-                                chunkprof::XRAY_N
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
                             arr[(ly << 8) | (lz << 4) | lx] = vis;
                         }
                     }
@@ -23368,8 +23375,6 @@ pub(crate) mod chunkprof {
     pub(super) static SECTION: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static ENCODE: AtomicU64 = AtomicU64::new(0);
-    pub(super) static XRAY: AtomicU64 = AtomicU64::new(0);
-    pub(super) static XRAY_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static READ_NS: AtomicU64 = AtomicU64::new(0);
     pub(super) static READ_BAND_NS: AtomicU64 = AtomicU64::new(0);
     pub(super) static READ_BAND_N: AtomicU64 = AtomicU64::new(0);
@@ -23385,6 +23390,10 @@ pub(crate) mod chunkprof {
     pub(super) static OVERLAY_APPLY: AtomicU64 = AtomicU64::new(0);
     pub(super) static HIDDEN_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static EXPOSURE_READS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RD_SECTION: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RD_STORE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RD_BAND: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RD_OVERLAY: AtomicU64 = AtomicU64::new(0);
     pub(super) static EXPOSURE_READ_BASE: AtomicU64 = AtomicU64::new(0);
     pub(super) static LIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static RE_LIGHT: AtomicU64 = AtomicU64::new(0);
@@ -23469,11 +23478,13 @@ pub(crate) mod chunkprof {
             READ_BAND_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64
         );
         eprintln!(
-            "CHUNKPROF   encode/chunk: hidden={:.0} xray_tests={:.0} xray={:.2}ms exposure_reads={:.0} of which base_state={:.0}",
+            "CHUNKPROF   encode/chunk: hidden={:.0} reads={:.0} (section={:.0} store={:.0} band={:.0} overlay={:.0} base_state={:.0})",
             HIDDEN_N.load(Ordering::Relaxed) as f64 / n as f64,
-            XRAY_N.load(Ordering::Relaxed) as f64 / n as f64,
-            XRAY.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
             EXPOSURE_READS.load(Ordering::Relaxed) as f64 / n as f64,
+            RD_SECTION.load(Ordering::Relaxed) as f64 / n as f64,
+            RD_STORE.load(Ordering::Relaxed) as f64 / n as f64,
+            RD_BAND.load(Ordering::Relaxed) as f64 / n as f64,
+            RD_OVERLAY.load(Ordering::Relaxed) as f64 / n as f64,
             EXPOSURE_READ_BASE.load(Ordering::Relaxed) as f64 / n as f64
         );
         eprintln!(
