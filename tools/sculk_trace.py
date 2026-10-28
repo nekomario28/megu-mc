@@ -215,6 +215,16 @@ def sanity_problems(path, required=()):
             f"{path}: this is a game log - log4j does not preserve a thread's line order, so "
             f"every positional grouping below is meaningless (use the agent's own file, "
             f"-Dsculktrace=<path>)")
+    # The port's dump path runs a profile pass and then the dump pass, and only the second one is
+    # armed (`FSEED_ARM`). Measured: its placement lines (`SPATCH`) came from the profile pass
+    # while its `DRAW` lines came from the dump pass, 12k lines later - so a "what drew this"
+    # reading off that file silently mixes two runs.
+    raw = Path(path).read_text(errors='replace')
+    if '[wgprof]' in raw and '[wgdump]' in raw:
+        problems.append(
+            f"{path}: this file holds two port phases ([wgprof] then [wgdump]) - the placement "
+            f"lines and the armed draw lines come from different runs, so anything that reads "
+            f"both as one sequence is mixing runs; slice by phase first")
     if kinds['SPLACE'] and not kinds['SPASS']:
         problems.append(f"{path}: SPLACE without SPASS - the pass grouping has nothing to use")
     windows = window_summary(split_windows(lines, arm='trailing'))

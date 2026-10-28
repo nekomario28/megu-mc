@@ -826,10 +826,17 @@ compare-biomef` で候補の**列**を突き合わせた結果:
 **棄却**された（仮説を立てて計測で消す、という形で処理）。
 
 したがって draw 25 本目の食い違い（port `nextInt(16)=12` / native `nextInt(49)=6`）は
-**配置の side ではなく feature の中**（`SculkPatchFeature` / `SculkSpreader`）にある。位置は
-同じ順で採用されているので、次の計測は **パッチごと**（`SPATCH` の後の draw）に両側を比べること。
-native も port も `SPATCH` と `SDRAW` を同じ trace に出しているので、`SPATCH` から次の
-マーカーまでを1パッチ分として切り出し、`(bound, value)` で突き合わせられる。
+**配置の side ではなく feature の中**（`SculkPatchFeature` / `SculkSpreader`）にある。
+
+次の計測（**パッチごとの draw**）に進む前に踏んだ罠: **port の dump ログは2つの phase からなる**。
+`MC_SPINE_WG_DUMP` は `MC_SPINE_WG_PROFILE` で gate されているので、port はまず profile pass
+（arm 無し）を回し、次に dump pass（arm 有り）を回す。実測では chunk (-16,112) の `SPATCH` 行は
+**profile pass** のもので、`DRAW` 行は 1万2千行あと = **dump pass** のものだった。つまり
+そのファイルから「どのパッチが何を引いたか」を読むと **2つの run を混ぜる**。
+
+`sculk_trace.py sanity` が `[wgprof]` と `[wgdump]` の両方を見つけたら不合格にするようにした
+（この罠の再発防止）。次の測定は **1 phase 内**で、`SPATCH` から次のマーカーまでを1パッチ分として
+切り出し、`(bound, value)` で両側を突き合わせる。
 
 ## 効率化の基盤（2026-10-28）
 

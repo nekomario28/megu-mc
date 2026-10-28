@@ -180,6 +180,17 @@ class Sanity(unittest.TestCase):
             self.assertTrue(any("SSPREADALL" in p for p in problems))
 
 
+class PortPhaseMixing(unittest.TestCase):
+    def test_two_port_phases_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = "SPASS -16 112\n" + NO_DRAWS[NO_DRAWS.index('SPLACE'):] + \
+                   "[wgprof] 1x1 chunks in 1ms\nSPATCH -1 -2 3\nDRAW 0 f=1,7 nextInt(16)=15\n" \
+                   "[wgdump] 1 chunks\n"
+            path = write(tmp, "port.log", text)
+            problems = st.sanity_problems(path)
+            self.assertTrue(any("two port phases" in p for p in problems), problems)
+
+
 class Names(unittest.TestCase):
     def test_class_maps_to_its_types(self):
         self.assertEqual(st.class_names('edi'), ['sculk_patch'])
