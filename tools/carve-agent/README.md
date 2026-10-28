@@ -27,14 +27,19 @@ default would try to load obfuscated classes.
 ## Build
 
 ```sh
-ASM=~/.m2/repository/org/ow2/asm/asm/9.8/asm-9.8.jar
+# the highest ASM in the local cache (9.7 and up all work)
+ASM=$(ls ~/.m2/repository/org/ow2/asm/asm/*/asm-*.jar | sort -V | tail -1)
+mkdir -p c1 c2 j1/META-INF
 javac -nowarn -cp "$ASM" -d c1 tools/carve-agent/Agent.java
-javac -nowarn -d c2 tools/carve-agent/CarveLog.java
+javac -nowarn -d c2 tools/carve-agent/CarveLog.java tools/carve-agent/SculkLog.java
 (cd c2 && jar cf ../carvelog.jar .)
 cp -r c1/* j1/ && (cd c1 && jar xf "$ASM" org) && cp -r c1/org j1/
 printf 'Premain-Class: Agent\n' > j1/META-INF/MANIFEST.MF
 (cd j1 && jar cfm ../carveagent.jar META-INF/MANIFEST.MF .)
 ```
+
+Both loggers go into `carvelog.jar` (the bootstrap-visible one); the agent jar carries ASM
+itself, so nothing else has to be on the classpath.
 
 `carvelog.jar` and `carveagent.jar` must sit in the same directory.
 

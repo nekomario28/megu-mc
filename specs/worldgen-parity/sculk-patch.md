@@ -614,6 +614,70 @@ native は隣接セルに書いている。→ この経路で**3 型の spreade
 `types=-2`（ReflectiveOperationException）で失敗したので、`dmv$a` の `a()` を直接
 `getDeclaredMethod` で引く形に直す。これで「1 型か 3 型か」が 1 行で確定する。
 
+## 2件の根本原因を修正（2026-10-28、いずれも native 計測が起点）
+
+### 1. `attemptSpreadVein` の spread type は**振る舞いごとに違う**
+
+native の `spreadAll` 入口で config の spread type 数を出したら
+**`SSPREADALL types=3`**（1 ではなく 3）。bytecode で裏づけ:
+
+- `dmp` の **interface 既定** `a(dcx,jd,dtc,Collection,boolean)` は
+  `((dky)Blocks.SCULK_VEIN).c().a(state, level, pos, wg)` = **`c()` = 3 型**（`facings` を無視）
+- `SculkBlock` (`dmq`) も `SculkVeinBlock` (`dmv`) も**この 5 引数を override していない**
+  （`dmv` にあるのは *static* 4 引数のほう）→ **vein/sculk 上の cursor は常に 3 型**
+- `dmp$1`（その他のブロック）だけが `facings == null` で `m()` = 1 型
+
+port は常に `dmp$1` の規則を使っていた ✗ → **修正**。
+
+### 2. `findNextSculk` の 18 近傍リストの**順序**が逆だった
+
+`BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` の反復順を固定 jar で実測すると
+`(-1,-1,-1) (0,-1,-1) (1,-1,-1) (-1,0,-1) ...` = **x が最速**、次に y、最後に z。
+port は x を最外にしていた ✗ → 同じ乱数 stream でも `util_shuffle` の順列が変わり、
+`findNextSculk` の選択が変わる（＝**規則ではなく順序**が最初の分岐点だった）。
+
+### 計測した効果（cursor trace、同じ native trace と整列）
+
+| | 最初の食い違い | 共有キーの食い違い |
+|---|---|---|
+| 修正前 | r=1 i=0 | 4654 |
+| 修正後 | **r=3 i=0** | **4527** |
+
+つまり最初のパッチの **round 0〜2 が完全一致**（round 3 で分岐）。
+
+### 注意: 全域セル数の before/after は**この区画では主張できない**
+
+同じ 6x6 recipe（seed 0、(-20,108)+6x6、features）で参照を取り直すと
+**参照自体が 5933→5733 と動いた**（前回 5987 / 今回 5733）。同一 recipe の参照が
+254 セル動く以上、capture をまたいだ比較は無効。このページの before/after はすべて
+**同一 capture 内**（同じ `/tmp/chunkfix-*` の参照）で測っている。原因（生成順の
+非決定性か、pack の差か）は**未解明のまま記録**する。トレース比較は同じ capture の
+native trace に対して行っており、そちらは再現する範囲で有効。
+
+## 恒久化した道具と再現手順（2026-10-28）
+
+| 道具 | 何をするか |
+|---|---|
+| `tools/carve-agent/`（`Agent.java` + `CarveLog.java` + `SculkLog.java`） | 固定 jar を ASM で instrument。`SculkLog` は bootstrap から読める primitive/JDK 型のみ。build は README の `sh`（`SculkLog.java` を含める、ASM は `~/.m2` の最新を使う） |
+| `JAVA_AGENT=<carveagent.jar> tools/chunk_world_fixture.sh <tag> -16 112 1 features` | 参照サーバーを agent 付きで起動（`JAVA_OPTS="-Dfeaturebox=..."` で feature 書き込みも） |
+| port 側 `SPC_CURSOR_TRACE=1` / `SPC_TRACE_ALL=1` / `FEATURE_WRITE_TRACE=<cx>,<cz>|all` / `GENERIC_CASE_DUMP=<path>` | 同じ形の trace（`SCURSOR` 相当 / 書き込みと呼び出し元 / 呼び出し元なしの書き込み順 / fixture 差分） |
+| `tools/sculk_trace.py extract <run.log> [--rounds N]` / `compare <native> <port>` | `SCURSOR` 行を抽出し、**(round, index) で整列**して比較。共有キーが食い違えば exit 1（gate として使える） |
+| `tests/data/sculk_cursor_1211.tsv` | native 側の先頭 60 行（round 0..5）。再生成: `tools/sculk_trace.py extract <run.log> --rounds 5`。**port 側は同じ capture が必要**（`SPC_CURSOR_TRACE=1` の dump を同じ chunk で） |
+| `~/.cache/mc-spine-audit/sculk-traces/`（repo 外・再生成可能） | これまでの native/port の完全な trace（`traces-mk*.txt` = agent run の生 log 抽出、`port_after_fixes.txt`）。repo には先頭スライスだけを置き、完全版は再生成コマンドで作る |
+
+現在の比較結果（この capture、round 0..5 のスライス）:
+
+```
+native keys 60, port keys 5150, shared 60
+differing 7; first at r=3 i=0
+  native (-262,-43,1785, 30, 1, 1, 4)
+  port   (-261,-44,1784, 30, 1, 1, 4)
+```
+
+＝ round 0〜2 は完全一致、round 3 の先頭で分岐。**この 1 点を追うのが次の作業**で、
+`SSPREADALL`（spread type 数）/ `SCMARK`（呼び出し元）/ `FCELL`（書き込み列）/
+`SSPREAD`（pos/from/to）がすべて同じ log に揃っている。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・

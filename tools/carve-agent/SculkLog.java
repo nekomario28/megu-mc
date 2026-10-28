@@ -31,6 +31,12 @@ public class SculkLog {
         System.out.println("SCMARK " + what + " r=" + round + " i=" + (idx - 1));
     }
 
+    /** `MultifaceSpreader.spreadAll` entry: the number of spread types its config carries. */
+    public static void spreadall(int types) {
+        if (Boolean.getBoolean("sculkquiet")) return;
+        System.out.println("SSPREADALL types=" + types + " r=" + round + " i=" + (idx - 1));
+    }
+
     public static void cursor(int x, int y, int z, int charge, int decayDelay, int updateDelay,
                               java.util.Set<?> facings) {
         if (Boolean.getBoolean("sculkquiet")) return;

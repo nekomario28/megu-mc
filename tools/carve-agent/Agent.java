@@ -1093,6 +1093,43 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("dkz".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        if (!mn.equals("a") || !md.equals("(Ldtc;Ldcx;Ljd;Z)J")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                // `this.b.a().length`: the config's own spread-type array, read in
+                                // the instrumented class because the implementation is
+                                // package-private and a bootstrap logger cannot reflect into it.
+                                super.visitVarInsn(Opcodes.ALOAD, 0);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dkz", "b", "Ldkz$b;");
+                                super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dkz$b", "a",
+                                        "()[Ldkz$e;", true);
+                                super.visitInsn(Opcodes.ARRAYLENGTH);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "spreadall",
+                                        "(I)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT dkz spreadAll hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT dkz spreadAll hook failed: " + t);
+                return null;
+            }
+        }
         if (!"dmu$a".equals(name)) return null;
         try {
             ClassReader cr = new ClassReader(buf);
