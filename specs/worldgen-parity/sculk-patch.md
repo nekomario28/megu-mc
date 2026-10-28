@@ -573,6 +573,47 @@ charge は両方 31（変換が起きた ✓）。`r=1 i=2` は完全一致、�
 **書き込み列そのもの**を整列比較する（carver agent の `ASTATE` が block state id を
 registry 経由で取る作法をそのまま使える）。
 
+## 書き込み列の整列比較（2026-10-28、agent の featurebox + port の SPCSET）
+
+`tools/carve-agent` は既に `-Dfeaturebox=minX,minY,minZ,maxX,maxY,maxZ` で **feature 層の
+書き込みを state id 付きで**出す（`FCELL x y z state=<id> wrote=<bool> feature=<gi>,<step>
+chunk=<pop>`, id は `dfy.i(BlockState)` = jar の registry id ✓ port の asset と同じ番号）。
+`chunk_world_fixture.sh` に `JAVA_OPTS=` を足して agent の property を渡せるようにし、
+port 側は同じ窓（`SCURSOR r=0 i=0` 〜 `i=9`）の `SPCSET` を並べれば**書き込み列そのもの**を
+整列比較できる。
+
+**結果（seed 0、chunk (-16,112)、最初のパッチの round 0）**: native 19 書き込み / port 18。
+**最初の 10 書き込みが完全一致**（state id 込み）:
+
+```
+origin vein 22911 / 22907, north neighbour sculk 22799, (down,north) vein 22911 / 22910,
+west vein 22911, east+down vein 22923, east vein 22911, (down,north) vein 22910, origin vein 22923
+```
+
+つまり **cursor i=0 の 1 回目の更新は「自分のセルに vein → 変換 → 変換後の spread → decay」まで
+native と完全一致** ✓。最初の食い違いは i=1 の 1 回目:
+
+| | native | port |
+|---|---|---|
+| i=1 の最初の書き込み | vein @(-261,-41,1786) | sculk @(-261,-41,1785)（変換） |
+| その位置 | `SCMARK one-charge-vein` より前 | `convert` の直後 |
+
+native は `attemptSpreadVein`（`SCMARK attempt-vein` は出ない = facings==null 経路）で
+**隣接セルに vein を 3 つ書いてから**変換している。
+
+### 未解決の矛盾（次の1点）
+
+`dmp$1.a`（facings==null）は `((dmv)Blocks.SCULK_VEIN).m().a(state, level, pos, wg)` を呼び、
+`dmv.m()` は **1 型** spreader（bytecode 確認: `m()` は `f` を返し、`f` は
+`new dmv.a(dkz$e.a)` = 1 要素。`dkz$e$1.a` = `new SpreadPos(pos, to)` = SAME_POSITION、
+`$2` = SAME_PLANE、`$3` = WRAP_AROUND）。1 型なら書き込み先は **cursor 自身のセルだけ**なのに、
+native は隣接セルに書いている。→ この経路で**3 型の spreader が使われている**としか読めない。
+
+次の計測は 1 つ: `dkz.a(dtc,dcx,jd,boolean)`（spreadAll）入口で `this.b.a().length`
+（config が持つ spread type の数）を出す。反射で config の配列長を読む実装は書いたが
+`types=-2`（ReflectiveOperationException）で失敗したので、`dmv$a` の `a()` を直接
+`getDeclaredMethod` で引く形に直す。これで「1 型か 3 型か」が 1 行で確定する。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・

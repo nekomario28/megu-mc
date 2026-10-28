@@ -20,6 +20,17 @@ public class SculkLog {
         idx = 0;
     }
 
+    /**
+     * Entry marker for one sculk call site, so the native log names each step.
+     *
+     * `cursor` prints the index it is about to advance past, so the current cursor's index is
+     * `idx - 1` here; printing `idx` would label every marker as the next cursor's.
+     */
+    public static void mark(String what) {
+        if (Boolean.getBoolean("sculkquiet")) return;
+        System.out.println("SCMARK " + what + " r=" + round + " i=" + (idx - 1));
+    }
+
     public static void cursor(int x, int y, int z, int charge, int decayDelay, int updateDelay,
                               java.util.Set<?> facings) {
         if (Boolean.getBoolean("sculkquiet")) return;

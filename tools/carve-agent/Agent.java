@@ -1047,6 +1047,52 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("dmv".equals(name) || "dmq".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                final String owner = name;
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        String what = null;
+                        if (owner.equals("dmv") && mn.equals("a")
+                                && md.equals("(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I")) {
+                            what = "one-charge-vein";
+                        } else if (owner.equals("dmv") && mn.equals("a")
+                                && md.equals("(Ldmu;Ldcx;Ljd;Layw;)Z")) {
+                            what = "convert";
+                        } else if (owner.equals("dmv") && mn.equals("a")
+                                && md.equals("(Ldcx;Ljd;Ldtc;Ljava/util/Collection;)Z")) {
+                            what = "attempt-vein";
+                        } else if (owner.equals("dmq") && mn.equals("a")
+                                && md.equals("(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I")) {
+                            what = "one-charge-sculk";
+                        }
+                        if (what == null) return mv;
+                        final String tag = what;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitLdcInsn(tag);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "mark",
+                                        "(Ljava/lang/String;)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT " + name + " markers installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT " + name + " marker transform failed: " + t);
+                return null;
+            }
+        }
         if (!"dmu$a".equals(name)) return null;
         try {
             ClassReader cr = new ClassReader(buf);
