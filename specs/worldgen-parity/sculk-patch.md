@@ -614,6 +614,21 @@ native は隣接セルに書いている。→ この経路で**3 型の spreade
 `types=-2`（ReflectiveOperationException）で失敗したので、`dmv$a` の `a()` を直接
 `getDeclaredMethod` で引く形に直す。これで「1 型か 3 型か」が 1 行で確定する。
 
+## native trace の再現性（2026-10-28、2 capture で実測）
+
+同じ fixture（seed 0、chunk (-16,112)、agent 付き、`FIXTURE_SETTLE=75`）を**2回**取り直して
+比較した:
+
+- **capture 間で「どのパッチが先に出るか」と `r`（run 全体の `updateCursors` 通し番号）は違う**
+  （mk5 は `r=0`、別 capture は同じパッチが `r=192`）
+- しかし**同じパッチ（origin `-261,-42,1785`）の trajectory は 60/60 行バイト同一** ✓
+  （`r` をパッチ内の round に正規化して比較）
+
+→ 結論: パッチ単位で切り出せば native trace は**再現する oracle**。
+`tools/sculk_trace.py extract --origin` がその切り出しを行い、上のスライスは
+**どちらの capture からでも同一に再生成できる**（実測で確認）。サーバー run（3分）が要るのは
+スライスを**延長**するときだけ。
+
 ## 2件の根本原因を修正（2026-10-28、いずれも native 計測が起点）
 
 ### 1. `attemptSpreadVein` の spread type は**振る舞いごとに違う**
@@ -663,7 +678,7 @@ native trace に対して行っており、そちらは再現する範囲で有�
 | port 側 `SPC_CURSOR_TRACE=1` / `SPC_TRACE_ALL=1` / `FEATURE_WRITE_TRACE=<cx>,<cz>|all` / `GENERIC_CASE_DUMP=<path>` | 同じ形の trace（`SCURSOR` 相当 / 書き込みと呼び出し元 / 呼び出し元なしの書き込み順 / fixture 差分） |
 | `cargo test sculk_cursor` | **これが今の反復ループ**（5 秒）。port がチャンク (-16,112) を in-process 生成し、native スライスと `(round, index)` で比較。ratchet（現在 30 行一致を要求）なので退行は赤、前進したら数字を上げる。CLI も dump も手作業も不要 |
 | `tools/sculk_trace.py extract <run.log> [--rounds N]` / `compare <native> <port>` | `SCURSOR` 行を抽出し、**(round, index) で整列**して比較。共有キーが食い違えば exit 1（gate として使える） |
-| `tests/data/sculk_cursor_1211.tsv` | native 側の先頭 60 行（round 0..5）。再生成: `tools/sculk_trace.py extract <run.log> --rounds 5`。**port 側は同じ capture が必要**（`SPC_CURSOR_TRACE=1` の dump を同じ chunk で） |
+| `tests/data/sculk_cursor_1211.tsv` | chunk (-16,112) の population が最初に走らせたパッチ（origin `-261,-42,1785`）の 60 行（round 0..5）。再生成: `tools/sculk_trace.py extract <run.log> --origin -261,-42,1785 --lines 60`。**capture はどのパッチが先に出るか・`r` の番号が違う**ので、パッチを origin で選び `r` をパッチ内の round に正規化する |
 | `~/.cache/mc-spine-audit/sculk-traces/`（repo 外・再生成可能） | これまでの native/port の完全な trace（`traces-mk*.txt` = agent run の生 log 抽出、`port_after_fixes.txt`）。repo には先頭スライスだけを置き、完全版は再生成コマンドで作る |
 
 現在の比較結果（この capture、round 0..5 のスライス）:
