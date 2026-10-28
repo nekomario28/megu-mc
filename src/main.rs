@@ -13577,6 +13577,12 @@ struct OpBand {
     cells: Vec<u32>,
 }
 
+/// Caches that describe a generator must not outlive it: `band_state` and `stored_state`
+/// answer only for bands published under the current `worldgen::generation_seq`.
+fn current_gen_seq() -> u64 {
+    worldgen::generation_seq()
+}
+
 impl OpBand {
     fn get(&self, y: i32, lx: usize, lz: usize) -> Option<u32> {
         if y < self.y0 || y > self.y1 {
@@ -13595,6 +13601,7 @@ impl OpBand {
 struct BandCache {
     map: HashMap<(i32, i32), (u64, std::sync::Arc<OpBand>)>,
     order: std::collections::VecDeque<(i32, i32)>,
+    generation: u64,
 }
 
 static OP_BANDS: OnceLock<Mutex<BandCache>> = OnceLock::new();
@@ -13604,12 +13611,24 @@ fn op_bands() -> &'static Mutex<BandCache> {
         Mutex::new(BandCache {
             map: HashMap::new(),
             order: std::collections::VecDeque::new(),
+            generation: current_gen_seq(),
         })
     })
 }
 
 impl BandCache {
-    fn get(&self, key: (i32, i32)) -> Option<std::sync::Arc<OpBand>> {
+    /// Drop everything if the generator has been replaced since the last entry was stored.
+    fn sync_generation(&mut self) {
+        let seq = current_gen_seq();
+        if self.generation != seq {
+            self.map.clear();
+            self.order.clear();
+            self.generation = seq;
+        }
+    }
+
+    fn get(&mut self, key: (i32, i32)) -> Option<std::sync::Arc<OpBand>> {
+        self.sync_generation();
         self.map.get(&key).map(|(_, b)| b.clone())
     }
     /// Insert (or replace) and evict the oldest entry when the bound is passed.
@@ -13723,6 +13742,7 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
 struct SectionStore {
     map: HashMap<(i32, i32), Vec<Option<std::sync::Arc<Vec<u32>>>>>,
     order: std::collections::VecDeque<(i32, i32)>,
+    generation: u64,
 }
 
 static SECTION_STORE: std::sync::OnceLock<Mutex<SectionStore>> = std::sync::OnceLock::new();
@@ -13732,6 +13752,7 @@ fn section_store() -> &'static Mutex<SectionStore> {
         Mutex::new(SectionStore {
             map: HashMap::new(),
             order: std::collections::VecDeque::new(),
+            generation: current_gen_seq(),
         })
     })
 }
@@ -13750,6 +13771,12 @@ fn publish_section(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
         return;
     };
     let mut store = section_store().lock().unwrap();
+    let seq = current_gen_seq();
+    if store.generation != seq {
+        store.map.clear();
+        store.order.clear();
+        store.generation = seq;
+    }
     if !store.map.contains_key(&(cx, cz)) {
         store.map.insert((cx, cz), (0..24).map(|_| None).collect());
         store.order.push_back((cx, cz));
@@ -13767,6 +13794,9 @@ fn publish_section(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
 fn take_published(cx: i32, cz: i32, sy: i32) -> Option<Box<[u32; 4096]>> {
     let idx = section_index(sy)?;
     let mut store = section_store().lock().unwrap();
+    if store.generation != current_gen_seq() {
+        return None;
+    }
     let sections = store.map.get_mut(&(cx, cz))?;
     let arc = sections[idx].take()?;
     let mut out = Box::new([0u32; 4096]);
@@ -13777,6 +13807,9 @@ fn take_published(cx: i32, cz: i32, sy: i32) -> Option<Box<[u32; 4096]>> {
 fn stored_state(x: i32, y: i32, z: i32) -> Option<u32> {
     let idx = section_index(y & !15)?;
     let store = section_store().lock().unwrap();
+    if store.generation != current_gen_seq() {
+        return None;
+    }
     let sections = store.map.get(&(x >> 4, z >> 4))?;
     let sec = sections[idx].as_ref()?;
     Some(sec[(((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize)])
@@ -14190,6 +14223,17 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
 }
 
 fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
+    chunk_data_opt(
+        cx,
+        cz,
+        gen,
+        // Read per call rather than through the cached `env_flag!`, so a test can pass both
+        // settings and compare them without mutating the process environment.
+        std::env::var("MC_SPINE_PREFETCH_NEIGHBOUR").is_ok(),
+    )
+}
+
+fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec<u8> {
     let mut data = Vec::new();
     let reg = crate::block_registry::breg();
     let mut gen_sources_here: Vec<((i32, i32, i32), u8)> = Vec::new();
@@ -14232,8 +14276,6 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     // read the writes of the chunks populated before it). The pinned captures use an
     // explicit source order, so changing production's order is a parity decision, not a
     // performance one - this switch exists to measure what it would buy.
-    let prefetch = crate::trace_env::env_flag!("MC_SPINE_PREFETCH_NEIGHBOUR");
-
     let mut carried_next: Option<Box<[u32; 4096]>> = None;
     let mut prev_base: Option<Box<[u32; 4096]>> = None;
     for sec in 0..24 {

@@ -636,3 +636,29 @@ parity の影響を実測で確かめようとして capture harness を使っ�
 配信バイトを比較できなかった。→ 検証は「移動する決定的 driver で配信バイトを比較」か
 「2 プロセスで `chunk_data` の出力を直接 diff」のどちらかが必要で、まだ行っていない。
 したがってこのスイッチは**計測専用**として置き、既定は off。
+
+## 2026-10-28: 先読みの parity 検証 → **別のバグを発見**（キャッシュが generator を生き延びる）
+
+先読み（`MC_SPINE_PREFETCH_NEIGHBOUR`）が世界を変えるかを、決定論的な
+`chunk_delivery_digest`（2 seed × 3 掃引方向、地形 states の MD5 を
+flag off/on で比較。同じ設定を 2 回回す control 付き）で測った。
+
+**1回目の結果は「変わる」**（seed 60007、chunk (2,-1)）。だが **control も同じ chunk で
+落ちた** — つまり同じ設定を 2 回回しても一致しない＝**世界が再現しない**。切り分け:
+
+- `chunk_data` を呼ばず `terrain_section` だけを回すと **control は通る**（地形自体は再現する）
+- したがって原因は `chunk_data` が触る**プロセス全体のキャッシュ**
+
+正体: `main.rs` の **state band が `worldgen::init` を生き延びる**こと。前の掃引で
+`install_band_rows` が入れた band を、次の（別 generator の）掃引の anti-xray 露出テストが
+読み、その band の状態が今の地形と食い違う → filler 判定が変わる → 配信バイトが変わる。
+
+対処: `worldgen::generation_seq()`（init ごとに +1）を公開し、band と section store は
+**世代が違えば全体を捨てる**（`BandCache::sync_generation`、store は generation 不一致で miss）。
+
+修正後: **control 通過**、そして **flag off/on は 60 掃引すべてで一致**（`PREFETCH-DIFF 0`）
+→ 先読みは（この範囲では）世界を変えない。以前の「parity を変える」という結論は
+**この stale cache の artifact だった**ので撤回する。
+
+`chunk_delivery_digest` は恒久ガードとして残す（同じ設定 2 回の再現性を assert し、
+先読みが世界を変えたら赤くなる）。

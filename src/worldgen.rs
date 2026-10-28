@@ -2405,6 +2405,17 @@ pub fn take_generated_fluid_ticks() -> Vec<((i32, i32, i32), u32)> {
 
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
 
+/// Bumped by every `init`. The caches above the generator (`main.rs`'s state band and
+/// section store) describe *this* generator, so they must not answer for a replacement:
+/// a band left over from a previous `init` fed the anti-xray exposure test states from
+/// another world, which changed one chunk's delivered bytes between two sweeps in the same
+/// process (seed 60007, chunk 2,-1 — found by the digest guard).
+static GEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn generation_seq() -> u64 {
+    GEN_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Serializes tests that mutate the process-global generator, including ones in other
 /// test modules (`worldgen::wg_tests`' own `lock_gen` still uses it too).
 static GEN_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -2555,6 +2566,7 @@ pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: Noise
             });
             *GEN_DATA.lock().unwrap() = Some(g.data.clone());
             *gen_lock() = Some(g);
+            GEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
         None => false,

@@ -3595,3 +3595,102 @@ fn chunk_delivery_path_bench() {
     }
     assert_eq!(outers_first.len(), inners_first.len());
 }
+
+/// The delivered bytes of a fixed sweep, one digest per chunk, for comparing two builds or
+/// two flag settings **from outside the process** (the prefetch switch changes when a
+/// neighbour is populated, and population order is an input to the feature layer, so the
+/// question "does it change the world?" needs a byte comparison).
+///
+///   MC_SPINE_CHUNK_DIGEST=1 cargo test --release --nocapture chunk_delivery_digest > a.txt
+///   MC_SPINE_PREFETCH_NEIGHBOUR=1 MC_SPINE_CHUNK_DIGEST=1 ... > b.txt ; diff a.txt b.txt
+///
+/// The digest is over the `chunk_data` payload, which is what the client would receive for
+/// that chunk (blocks, biomes, light arrays).
+#[test]
+fn chunk_delivery_digest() {
+    if std::env::var("MC_SPINE_CHUNK_DIGEST").is_err() {
+        return;
+    }
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_test();
+    assert!(worldgen::init(0, crate::name_to_state), "worldgen");
+    let mut gen_sources: GenSources = HashMap::new();
+    // A sweep that walks in +x, so the prefetch switch's +x neighbour is the one that will
+    // be delivered next.
+    // Hash the *terrain states*, not the encoded packet: the packet's bytes are not
+    // reproducible across processes (two identical runs of this test differ), while the
+    // question here is whether the world the worldgen layer produces is the same. Decoding
+    // the packet would be equivalent and much longer.
+    let sweep = |seed: u64,
+                 dir: (i32, i32),
+                 prefetch: bool,
+                 gen_sources: &mut GenSources|
+     -> Vec<((i32, i32), String)> {
+        assert!(
+            worldgen::init(seed, crate::name_to_state),
+            "worldgen re-init"
+        );
+        let mut out = Vec::new();
+        for step in 0..10 {
+            for lane in -1..=1 {
+                let (cx, cz) = (dir.0 * step, dir.1 * step);
+                let (cx, cz) = if dir.0 != 0 {
+                    (cx, cz + lane)
+                } else {
+                    (cx + lane, cz)
+                };
+                let _ = chunk_data_opt(cx, cz, gen_sources, prefetch);
+                let mut bytes: Vec<u8> = Vec::new();
+                for sec in 0..24 {
+                    let sy = sec * 16 + crate::worldgen::min_y();
+                    if let Some(arr) =
+                        worldgen::terrain_section(cx, sy, cz, crate::feature::populate)
+                    {
+                        for st in arr.iter() {
+                            bytes.extend_from_slice(&st.to_le_bytes());
+                        }
+                    }
+                }
+                out.push((
+                    (cx, cz),
+                    generation_math::md5(&bytes)
+                        .iter()
+                        .map(|v| format!("{v:02x}"))
+                        .collect::<String>(),
+                ));
+            }
+        }
+        out
+    };
+    // Two seeds and three sweep directions. The switch prefetches the +x neighbour, so a
+    // +z sweep exercises the case where the prefetched chunk is not the one delivered next.
+    let mut changed: Vec<(u64, (i32, i32), (i32, i32))> = Vec::new();
+    for seed in [0u64, 60007] {
+        for dir in [(1, 0), (0, 1), (-1, 0)] {
+            let plain = sweep(seed, dir, false, &mut gen_sources);
+            // control: the same setting twice must reproduce, or the yardstick is not
+            // measuring the world
+            let again = sweep(seed, dir, false, &mut gen_sources);
+            assert_eq!(plain, again, "the same sweep twice differs (seed {seed})");
+            let prefetched = sweep(seed, dir, true, &mut gen_sources);
+            for (((cx, cz), a), (_, b)) in plain.iter().zip(prefetched.iter()) {
+                println!("DIGEST\t{seed}\t{dir:?}\t{cx}\t{cz}\t{a}");
+                if a != b {
+                    changed.push((seed, dir, (*cx, *cz)));
+                }
+            }
+        }
+    }
+    // Pinned: the prefetch is world-neutral here — which is what makes it safe to consider
+    // enabling. It populates the +x neighbour a step early, and population order is an input
+    // to the feature layer, so this is a property to keep proving rather than assume: an
+    // earlier version of this test reported one changed chunk, and that turned out to be a
+    // stale band cache surviving `worldgen::init` (fixed in the same commit), not the
+    // prefetch. A future change that makes the switch change the world has to fail here.
+    assert!(
+        changed.is_empty(),
+        "the prefetch switch changed {} chunk(s): {changed:?}",
+        changed.len()
+    );
+    println!("PREFETCH-DIFF\t{}", changed.len());
+}
