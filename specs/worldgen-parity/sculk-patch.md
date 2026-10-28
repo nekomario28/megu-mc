@@ -992,9 +992,33 @@ private static List<Vec3i> a(RandomSource random) { return Util.shuffledCopy(c, 
 パッチが 0 だった**ことによる。n=1 の差なので**系統差の証拠にはならない**（全体の通過率は
 native 4.8% / port 3.7% で同程度）。
 
-**次の1手**: 同じ chunk の pass を両側で対応させ、(a) 告知数、(b) entry 検査通過数、
-(c) cursor 更新数 を数える。そこで差が出れば draw を1本ずつ、出なければ「pass 内の feature 実行
-タイミング」へ進む。
+同じ chunk の pass を両側で対応させて数えた結果（**同一**）:
+
+| pass (-16,112) | 告知された sculk パッチ | cursor を更新した |
+|---|---|---|
+| native（thread 単位のプログラム順） | **20** | **0** |
+| port | **20** | **0** |
+
+つまりこの pass では**両側とも spreader が1回も走っていない**（entry 検査で落ちている）。
+「arm 窓に feature の draw が無い」は**系統差ではなく n=1 の標本**で、私の追い方は間違っていた
+（訂正済み）。
+
+### ここで分かった、draw 比較の正しい前提
+
+native の trace は**スレッドが混ざったファイル**なので、`compare-draws` がやっていた
+「ファイル上の連続列を探す」は**別スレッドの行を連結して一致と見なせる**危険がある。24本一致も
+その可能性を排除できていない。正しい比較は:
+
+1. native 側は **`lines_by_thread` で thread 単位のプログラム順**にしてから列を作る、
+2. port 側は単一プロセスの1本の列（そのまま）と比べる、
+3. ただし両者は**同じパス構成**で走っていないと列が一致しない（feature の stream 位置は
+   そのパスで先に走ったものに依存する）ので、**capture と port run を同じ条件で対にする**。
+
+次の3手:
+
+1. `compare-draws` を **thread 単位**のネイティブ列に対して行う（別スレッド連結を不可能にする）。
+2. **対になる capture/port run を固定**する（同一 seed・同一 dump 範囲・同一 warm-up 有無）。
+3. そのうえで最初にずれる draw を確定し、`SculkPatchFeature`/`SculkSpreader` の draw 順を詰める。
 
 （`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、
 `net.minecraft.world.level.block.SculkSpreader` のように**正しいパッケージ**で渡すこと。
