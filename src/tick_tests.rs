@@ -3517,6 +3517,35 @@ fn chunk_delivery_path_bench() {
     if std::env::var("MC_SPINE_CHUNK_BENCH").is_err() {
         return;
     }
+    // `MC_SPINE_BENCH_WRITER=1` runs a thread that writes blocks the way the tick loop does
+    // (~500 writes/s for 90 chunks x 111 writes/chunk in 20 s), so the bench can tell
+    // whether the cost the production profile shows is computation or contention on the
+    // store/band/world locks that every write takes.
+    let writer_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = if std::env::var("MC_SPINE_BENCH_WRITER").is_ok() {
+        let stop = writer_stop.clone();
+        Some(std::thread::spawn(move || {
+            // `=inside` writes into the sweep's own chunks, so the encode loop sees a
+            // non-empty overlay and takes its per-cell lookup path; the default writes far
+            // away, so only the locks are shared.
+            let inside = std::env::var("MC_SPINE_BENCH_WRITER").as_deref() == Ok("inside");
+            let (x, z) = if inside {
+                (0, 0)
+            } else {
+                (50 * 16 + 3, 50 * 16 + 5)
+            };
+            let base = block_at(x, 64, z);
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let st = if n % 2 == 0 { base } else { 0 };
+                let _ = set_block_if(x, 64, z, st, None);
+                n += 1;
+                std::thread::sleep(std::time::Duration::from_micros(2000));
+            }
+        }))
+    } else {
+        None
+    };
     let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _gen_guard = crate::worldgen::lock_gen_for_test();
     assert!(worldgen::init(0, crate::name_to_state), "worldgen");
@@ -3567,6 +3596,10 @@ fn chunk_delivery_path_bench() {
         // [4] band builds, [5] band cells, [6] block_at calls, [7] of which missed the
         // overlay, [8] terrain sections. The ns ones and the counts are both load-free.
         eprintln!(
+            "CHUNKBENCH   encode={:.1}ms/chunk",
+            deltas[9] as f64 / 1e6 / n
+        );
+        eprintln!(
             "CHUNKBENCH   work/chunk: data={:.1}ms sections={} ({:.1}ms) light={:.1}ms band_new={} band_cells={} block_at={} miss={}",
             deltas[1] as f64 / 1e6 / n,
             deltas[8] / 300,
@@ -3594,6 +3627,10 @@ fn chunk_delivery_path_bench() {
         }
     }
     assert_eq!(outers_first.len(), inners_first.len());
+    writer_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
 }
 
 /// The delivered bytes of a fixed sweep, one digest per chunk, for comparing two builds or

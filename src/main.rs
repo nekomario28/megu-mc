@@ -23409,7 +23409,7 @@ pub(crate) mod chunkprof {
     /// A work snapshot, for the deterministic bench: these counters are load-independent,
     /// where the bench's milliseconds are not (the same build measured 30.1 and 67.0
     /// ms/chunk on this host within an hour, tracking the other lanes' load).
-    pub(crate) fn counters() -> [u64; 9] {
+    pub(crate) fn counters() -> [u64; 10] {
         [
             N.load(Ordering::Relaxed),
             DATA.load(Ordering::Relaxed),
@@ -23420,6 +23420,7 @@ pub(crate) mod chunkprof {
             BLOCK_AT.load(Ordering::Relaxed),
             BLOCK_AT_MISS.load(Ordering::Relaxed),
             SECTION_N.load(Ordering::Relaxed),
+            ENCODE.load(Ordering::Relaxed),
         ]
     }
 
