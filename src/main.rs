@@ -5870,6 +5870,25 @@ fn hidden_extra() -> &'static Mutex<HashSet<u32>> {
 fn is_hidden(st: u32) -> bool {
     hidden_states().contains(&st) || hidden_extra().lock().unwrap().contains(&st)
 }
+
+/// `is_hidden` for a whole chunk's encode loop: the same answer without taking the
+/// `hidden_extra` mutex per cell (the loop asks 36,864 times per chunk) and without
+/// re-resolving the `OnceLock` each time.
+struct HiddenSet {
+    base: &'static HashSet<u32>,
+    extra: HashSet<u32>,
+}
+impl HiddenSet {
+    fn new() -> HiddenSet {
+        HiddenSet {
+            base: hidden_states(),
+            extra: hidden_extra().lock().unwrap().clone(),
+        }
+    }
+    fn contains(&self, st: u32) -> bool {
+        self.base.contains(&st) || self.extra.contains(&st)
+    }
+}
 // neighbors that expose a face (non-occluding): air, liquids, leaves, glass, ice, torches, signs
 fn exposes(st: u32) -> bool {
     st == 0
@@ -5888,11 +5907,17 @@ fn exposes(st: u32) -> bool {
 // block is only hidden when fully surrounded, so every voter is opaque.
 // Falls back to the terrain function when the neighborhood is empty.
 fn hidden_filler(x: i32, y: i32, z: i32, h: i32) -> u32 {
-    hidden_filler_with(&|a: i32, b: i32, c: i32| block_at(a, b, c), x, y, z, h)
+    hidden_filler_with(&mut |a: i32, b: i32, c: i32| block_at(a, b, c), x, y, z, h)
 }
 // `rd` supplies block reads — chunk_data already holds world() and passes
 // its own reader; taking the lock here would self-deadlock.
-fn hidden_filler_with<F: Fn(i32, i32, i32) -> u32>(rd: &F, x: i32, y: i32, z: i32, h: i32) -> u32 {
+fn hidden_filler_with<F: FnMut(i32, i32, i32) -> u32>(
+    rd: &mut F,
+    x: i32,
+    y: i32,
+    z: i32,
+    h: i32,
+) -> u32 {
     let mut counts: HashMap<u32, u32> = HashMap::new();
     for (dx, dy, dz) in [
         (1, 0, 0),
@@ -14091,10 +14116,14 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     // thread queues behind it: measured, the pressure-plate step waited 17.6 ms per tick
     // on 16 `world()` reads, which is the whole tick body. The copy is the chunk's own
     // edit map (a handful of entries, empty on a fresh chunk).
+    let __to = chunkprof::enabled().then(std::time::Instant::now);
     let overlay: HashMap<u32, u32> = {
         let w = world().lock().unwrap();
         w.get(&(cx, cz)).cloned().unwrap_or_default()
     };
+    if let Some(t) = __to {
+        chunkprof::add(&chunkprof::OVERLAY_APPLY, t);
+    }
     let overlay_empty = overlay.is_empty();
     let mut hs = [0i32; 256];
     let (mut hmin, mut hmax) = (i32::MAX, i32::MIN);
@@ -14106,12 +14135,28 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             hmax = hmax.max(h);
         }
     }
+    // The anti-xray exposure test reads ±1 in y as well as x/z, and its vertical
+    // neighbours are the adjacent sections. Carrying the next section's terrain forward
+    // (and the previous one back) means those reads are array reads too: measured, the
+    // 621 reads that still fell through to `base_state` cost 36.5 ms of the encode loop's
+    // 39 ms (58 µs each, because a cold cell re-runs the material rules).
+    let mut carried_next: Option<Box<[u32; 4096]>> = None;
+    let mut prev_base: Option<Box<[u32; 4096]>> = None;
     for sec in 0..24 {
         let sy = sec * 16 + MIN_Y;
+        let __tb = chunkprof::enabled().then(std::time::Instant::now);
         let biomes = worldgen::biome_section(cx, sy, cz).unwrap_or_else(|| Box::new([39i64; 64])); // plains
-                                                                                                   // uniform fast path only when overlay empty AND terrain can't reach the section
+        if let Some(t) = __tb {
+            chunkprof::add(&chunkprof::BIOMES, t);
+        }
+        // uniform fast path only when overlay empty AND terrain can't reach the section
         let wg = worldgen::enabled();
+        let __tf = chunkprof::enabled().then(std::time::Instant::now);
         if overlay_empty && ((!wg && sy + 15 < hmin - 4) || sy > hmax + 8) {
+            if __tf.is_some() {
+                chunkprof::add(&chunkprof::FASTPATH, __tf.unwrap());
+                chunkprof::FASTPATH_N.fetch_add(1, Ordering::Relaxed);
+            }
             let st = if sy + 15 < hmin - 4 { 1 } else { 0 };
             let mut arr = [0u32; 4096];
             if st != 0 {
@@ -14128,23 +14173,130 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             if __ts.is_some() {
                 chunkprof::SECTION_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let base = worldgen::terrain_section(cx, sy, cz, feature::populate);
+            let base = match carried_next.take() {
+                Some(b) => Some(b),
+                None => worldgen::terrain_section(cx, sy, cz, feature::populate),
+            };
+            // The section above, computed now so this section's reads have it and the next
+            // iteration does not pay for it twice.
+            let next_base = if sy + 16 < MIN_Y + 384 {
+                worldgen::terrain_section(cx, sy + 16, cz, feature::populate)
+            } else {
+                None
+            };
             if let Some(t) = __ts {
                 chunkprof::add(&chunkprof::SECTION, t);
             }
             // Hand the states the light pass needs to its band, instead of letting it
             // re-evaluate them through `block_state_at` later.
             if let Some(rows) = &base {
+                let __ti = chunkprof::enabled().then(std::time::Instant::now);
                 install_band_rows(cx, cz, sy, rows);
+                if let Some(t) = __ti {
+                    chunkprof::add(&chunkprof::BAND_INSTALL, t);
+                }
             }
+            let __te = chunkprof::enabled().then(std::time::Instant::now);
             {
                 // Neighbour reads (the anti-xray exposure test) go through a per-call
                 // lock instead of holding `world()` across all 4096 cells: the hold is
                 // what the tick thread queues behind, and `base_state` is called with no
                 // lock held at all.
-                let read = |wx: i32, wy: i32, wz: i32| -> u32 {
-                    overlay_block(wx, wy, wz).unwrap_or_else(|| base_state(wx, wy, wz))
+                // The anti-xray exposure test is the encode loop's cost: it reads six
+                // neighbours per hidden cell, and 6,795 of its 8,715 reads per chunk fell
+                // through to a full worldgen evaluation (`base_state`, ~5 µs each = 34 ms
+                // of the 45 ms). Almost all of those cells are ones this section's own
+                // `base` array already holds, so answer from it: same chunk and section ->
+                // the array (after the overlay, which wins), else the band (the surface
+                // window), else the overlay, else worldgen.
+                let mut read = |wx: i32, wy: i32, wz: i32| -> u32 {
+                    if chunkprof::enabled() {
+                        chunkprof::EXPOSURE_READS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let __t = chunkprof::enabled().then(std::time::Instant::now);
+                    if (wx >> 4) == cx && (wz >> 4) == cz {
+                        if !overlay_empty {
+                            if let Some(&st) = overlay.get(&local_idx(wx, wy, wz)) {
+                                return st;
+                            }
+                        }
+                        let lx = (wx & 15) as usize;
+                        let lz = (wz & 15) as usize;
+                        let section_of = |arr: &Option<Box<[u32; 4096]>>, dy: i32| -> Option<u32> {
+                            let a = arr.as_ref()?;
+                            let idx = ((dy as usize) << 8) | (lz << 4) | lx;
+                            Some(a[idx])
+                        };
+                        if wy >= sy && wy < sy + 16 {
+                            if let Some(v) = section_of(&base, wy - sy) {
+                                if let Some(t) = __t {
+                                    chunkprof::add(&chunkprof::READ_NS, t);
+                                }
+                                return v;
+                            }
+                        } else if wy == sy - 1 {
+                            if let Some(v) = section_of(&prev_base, 15) {
+                                if let Some(t) = __t {
+                                    chunkprof::add(&chunkprof::READ_NS, t);
+                                }
+                                return v;
+                            }
+                        } else if wy == sy + 16 {
+                            if let Some(v) = section_of(&next_base, 0) {
+                                if let Some(t) = __t {
+                                    chunkprof::add(&chunkprof::READ_NS, t);
+                                }
+                                return v;
+                            }
+                        }
+                    }
+                    let __tb = chunkprof::enabled().then(std::time::Instant::now);
+                    if __tb.is_some() {
+                        chunkprof::READ_BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let band = band_state(wx, wy, wz);
+                    if let Some(t) = __tb {
+                        chunkprof::add(&chunkprof::BAND_LOOKUP_NS, t);
+                    }
+                    let overlay_hit = if band.is_none() {
+                        let __to = chunkprof::enabled().then(std::time::Instant::now);
+                        let v = overlay_block(wx, wy, wz);
+                        if let Some(t) = __to {
+                            chunkprof::add(&chunkprof::OVERLAY_READ_NS, t);
+                        }
+                        v
+                    } else {
+                        None
+                    };
+                    let out = match band.or(overlay_hit) {
+                        Some(st) => st,
+                        None => {
+                            if chunkprof::enabled() {
+                                chunkprof::EXPOSURE_READ_BASE
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let __tbs = chunkprof::enabled().then(std::time::Instant::now);
+                            if __tbs.is_some() {
+                                chunkprof::BASE_STATE_N
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let st = base_state(wx, wy, wz);
+                            if let Some(t) = __tbs {
+                                chunkprof::add(&chunkprof::BASE_STATE_NS, t);
+                            }
+                            st
+                        }
+                    };
+                    if let Some(t) = __tb {
+                        chunkprof::add(&chunkprof::READ_BAND_NS, t);
+                    }
+                    if let Some(t) = __t {
+                        chunkprof::add(&chunkprof::READ_NS, t);
+                    }
+                    out
                 };
+                let hidden = HiddenSet::new();
                 for ly in 0..16 {
                     for lz in 0..16 {
                         for lx in 0..16 {
@@ -14173,28 +14325,52 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                                 }
                             }
                             // anti-xray + palette compression: buried hidden blocks sent as stone
-                            let vis = if is_hidden(st)
-                                && ![
+                            if chunkprof::enabled() && is_hidden(st) {
+                                chunkprof::HIDDEN_N
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let __th = chunkprof::enabled().then(std::time::Instant::now);
+                            let mut hidden_cell = hidden.contains(st);
+                            if hidden_cell {
+                                for (dx, dy, dz) in [
                                     (1, 0, 0),
                                     (-1, 0, 0),
                                     (0, 1, 0),
                                     (0, -1, 0),
                                     (0, 0, 1),
                                     (0, 0, -1),
-                                ]
-                                .iter()
-                                .any(|(dx, dy, dz)| exposes(read(wx + dx, wy + dy, wz + dz)))
-                            {
-                                hidden_filler_with(&read, wx, wy, wz, hs[(lz << 4) | lx])
+                                ] {
+                                    if exposes(read(wx + dx, wy + dy, wz + dz)) {
+                                        hidden_cell = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            let vis = if hidden_cell {
+                                hidden_filler_with(&mut read, wx, wy, wz, hs[(lz << 4) | lx])
                             } else {
                                 st
                             };
+                            if let Some(t) = __th {
+                                chunkprof::add(&chunkprof::XRAY, t);
+                                chunkprof::XRAY_N
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             arr[(ly << 8) | (lz << 4) | lx] = vis;
                         }
                     }
                 }
             }
+            if let Some(t) = __te {
+                chunkprof::add(&chunkprof::ENCODE, t);
+            }
+            prev_base = base;
+            carried_next = next_base;
+            let __tl = chunkprof::enabled().then(std::time::Instant::now);
             data.extend_from_slice(&section_encode(&arr, &biomes));
+            if let Some(t) = __tl {
+                chunkprof::add(&chunkprof::ENC_SECTION, t);
+            }
         }
     }
     gen.insert((cx, cz), gen_sources_here);
@@ -23033,6 +23209,25 @@ pub(crate) mod chunkprof {
     pub(super) static DATA: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ENCODE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static XRAY: AtomicU64 = AtomicU64::new(0);
+    pub(super) static XRAY_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static READ_BAND_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static READ_BAND_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_LOOKUP_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static OVERLAY_READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BASE_STATE_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BASE_STATE_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ENC_SECTION: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BIOMES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_INSTALL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FASTPATH: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FASTPATH_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static OVERLAY_APPLY: AtomicU64 = AtomicU64::new(0);
+    pub(super) static HIDDEN_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static EXPOSURE_READS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static EXPOSURE_READ_BASE: AtomicU64 = AtomicU64::new(0);
     pub(super) static LIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static RE_LIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static RE_LIGHT_N: AtomicU64 = AtomicU64::new(0);
@@ -23101,6 +23296,38 @@ pub(crate) mod chunkprof {
                 / BAND_NEW.load(Ordering::Relaxed).max(1) as f64
         );
         let new = BAND_NEW.load(Ordering::Relaxed).max(1) as f64;
+        eprintln!(
+            "CHUNKPROF   read parts/chunk: band_lookup={:.2}ms overlay_read={:.2}ms base_state n={:.0} {:.2}ms",
+            BAND_LOOKUP_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
+            OVERLAY_READ_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
+            BASE_STATE_N.load(Ordering::Relaxed) as f64 / n as f64,
+            BASE_STATE_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64
+        );
+        eprintln!(
+            "CHUNKPROF   read/chunk: n={:.0} ms={:.2} band_path n={:.0} ms={:.2}",
+            EXPOSURE_READS.load(Ordering::Relaxed) as f64 / n as f64,
+            READ_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
+            READ_BAND_N.load(Ordering::Relaxed) as f64 / n as f64,
+            READ_BAND_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64
+        );
+        eprintln!(
+            "CHUNKPROF   encode/chunk: hidden={:.0} xray_tests={:.0} xray={:.2}ms exposure_reads={:.0} of which base_state={:.0}",
+            HIDDEN_N.load(Ordering::Relaxed) as f64 / n as f64,
+            XRAY_N.load(Ordering::Relaxed) as f64 / n as f64,
+            XRAY.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
+            EXPOSURE_READS.load(Ordering::Relaxed) as f64 / n as f64,
+            EXPOSURE_READ_BASE.load(Ordering::Relaxed) as f64 / n as f64
+        );
+        eprintln!(
+            "CHUNKPROF   phases/chunk: overlay_copy={:.2}ms biomes={:.2}ms fastpath={:.2}ms x{:.1} band_install={:.2}ms encode={:.2}ms section_encode={:.2}ms",
+            per(&OVERLAY_APPLY),
+            per(&BIOMES),
+            per(&FASTPATH),
+            FASTPATH_N.load(Ordering::Relaxed) as f64 / n as f64,
+            per(&BAND_INSTALL),
+            per(&ENCODE),
+            per(&ENC_SECTION)
+        );
         eprintln!(
             "CHUNKPROF   relight n={:.1}/chunk time={:.1}ms/chunk",
             RE_LIGHT_N.load(Ordering::Relaxed) as f64 / n as f64,

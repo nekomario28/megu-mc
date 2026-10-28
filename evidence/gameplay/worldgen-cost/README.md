@@ -553,3 +553,37 @@ load client の pacing も加わるので、**wall-clock の A/B では 20% 程�
 
 追加した計測: `LOOPPROF`（tick ループの body と sleep — スピンを見る）、
 `CHUNKPROF relight`（隣接チャンクの再ライト送信 — 実測 0 回/chunk）。
+
+## 2026-10-28: 配信経路の内訳を「セル単位」まで割った（次の一手の特定）
+
+`CHUNKPROF` に `chunk_data` の phase 分割を足して測った（20 秒窓、seed 0、移動視点）:
+
+| phase | ms/chunk |
+|---|---|
+| `chunk_data` 全体 | 58-67 |
+| ├ **encode ループ**（24 section のうち実地形を通る ~14 の 4096 セル） | **42** |
+| ├ biome_section | 2 |
+| ├ `section_encode`（パレット詰め） | 0.3 |
+| ├ band install / overlay copy | 0.01 |
+| └ （残りは fast path と地形 pass 自体） | — |
+| `write_light_arrays` | 27（band が全読みを処理: block_at 0 回） |
+
+encode ループ 42 ms の正体は **anti-xray の露出テスト**（`is_hidden` なセル 360/chunk が
+6 近傍を読み、`hidden_filler_with` も 6 セル読む → 8,900 読み/chunk）:
+
+| | 前 | 後 |
+|---|---|---|
+| `base_state` への落下（= セル単位の地形評価） | **6,795** | **482** |
+| その時間 | 36.5 ms | 37.3 ms（1 回 **75 µs**） |
+| `is_hidden` の per-cell Mutex | 41,643 回 | 0（チャンク単位のスナップショット） |
+
+- 同一セクションと上下セクションの読みを、**すでに手元にある `base` 配列**（および
+  1 つ先/前のセクションを繰り越した配列）から返すようにした。世界評価は
+  6,795 → 482 に減った。
+- 残る 482 は**チャンク境界の水平近傍**で、しかも**深い**セル（鉱石）なので
+  surface band の範囲外 → 1 回 75 µs の `base_state`。合計 37 ms。
+- 近傍セクションを `terrain_section` でまとめて読む案も試したが **悪化**
+  （encode 42 → 48 ms。1 セクション 4096 セルを計算する方が、必要な数セルより高い）→ 撤回。
+- `MC_SPINE_NO_XRAY=1` で露出テストを切ると encode は **0.68 ms**。つまり encode の
+  実質全部がこのテストで、**次の一手は「深い近傍セルの状態を安く読む」**＝
+  フル高さのチャンク状態表現（band の全 y 版、メモリ試算 393 KB/chunk）。
