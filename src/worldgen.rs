@@ -2405,6 +2405,14 @@ pub fn take_generated_fluid_ticks() -> Vec<((i32, i32, i32), u32)> {
 
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
 
+/// Serializes tests that mutate the process-global generator, including ones in other
+/// test modules (`worldgen::wg_tests`' own `lock_gen` still uses it too).
+static GEN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_gen_for_test() -> std::sync::MutexGuard<'static, ()> {
+    GEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `GEN`'s lock, timing how long a caller waited for it and how long it held it.
 ///
 /// The parallelization decision needs this split: `FEAT_PROFILE` can say how much
@@ -5087,14 +5095,13 @@ mod wg_tests {
         );
     }
 
-    // These tests mutate the shared `GEN` static, so they must not run in
-    // parallel: one lock per test serializes the whole module.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    // These tests mutate the shared `GEN` static, so they must not run in parallel. This
+    // is the module-level lock (also used by the delivery-path bench in another test
+    // module): one lock for every test that touches the generator.
     fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poison| {
+        super::GEN_TEST_LOCK.lock().unwrap_or_else(|poison| {
             // This mutex only serializes tests; it protects no recoverable data.
-            TEST_LOCK.clear_poison();
+            super::GEN_TEST_LOCK.clear_poison();
             poison.into_inner()
         })
     }
@@ -5106,7 +5113,7 @@ mod wg_tests {
         });
         assert!(failed.is_err());
         let _guard = lock_gen();
-        assert!(!TEST_LOCK.is_poisoned());
+        assert!(!super::GEN_TEST_LOCK.is_poisoned());
     }
     #[test]
     fn pinned_biome_tree_uses_only_biomes_from_its_jar() {

@@ -530,3 +530,26 @@ B が**デッドロックして仕事をしていなかった**ためだった�
 検証: 全 suite **339 passed / 0 failed / 1 ignored**。
 `leaf_edge_schedules_match_native_order`（葉 tick の native 順を固定するガード）は
 キューの所有者が変わったため「ケースごとに drain して比較」に適応（意図は不変）。
+
+## 2026-10-28: 決定論的ベンチ（配信経路）と、順序仮説の棄却
+
+このホストの end-to-end は同じコードでも 11.9〜29.4 s と 2.5 倍振れる（他レーン）。
+load client の pacing も加わるので、**wall-clock の A/B では 20% 程度の差は分離できない**。
+そこで socket を介さない決定論的な尺度 `chunk_delivery_path_bench` を追加した
+（`stream_chunks` と同じ順序 — section 地形 → band install → overlay → light arrays —
+を固定の掃引で回し、pass ごとに generator を再 init して cold にする）:
+
+| pass | 順序 | mean |
+|---|---|---|
+| 0 | natural | 30.2 ms/chunk |
+| 1 | outer-first | 30.3 |
+| 2 | outer-first | 31.0 |
+| 3 | natural | 31.0 |
+
+- **「バッチを外周優先で送れば隣の band/floors が温まっている」仮説は棄却**。
+  cold 前提では差がない（最初の版は 2 パス目だけ warm で 40% 良く見えた — 計測の
+  取り違えで、bench を cold 化したら消えた）。実装は入れていない。
+- 同じ bench で「band 読みが on-demand 構築するか」も比較できる（次の判断材料）。
+
+追加した計測: `LOOPPROF`（tick ループの body と sleep — スピンを見る）、
+`CHUNKPROF relight`（隣接チャンクの再ライト送信 — 実測 0 回/chunk）。

@@ -13713,7 +13713,13 @@ fn band_state(x: i32, y: i32, z: i32) -> Option<u32> {
     // `set_block_if`), so a band that exists is current for the cells it covers. Asking
     // for the version here would make every leaf write invalidate the chunk whose band the
     // same write has just been applied to.
-    let band = op_band(cx, cz, chunk_version(cx, cz))?;
+    //
+    // And no build: a reader that misses falls back to `block_at`, which costs ~1.5 µs for
+    // this one cell. Building a band costs ~28 ms (it evaluates the surface sections, and
+    // for an unpopulated chunk that includes its population), so it only pays when the
+    // reader wants thousands of cells from that chunk — which is `chunk_data`, and it
+    // installs the band from states it already has (`install_band_rows`).
+    let band = op_bands().lock().unwrap().get((cx, cz))?;
     band.get(y, (x & 15) as usize, (z & 15) as usize)
 }
 
@@ -14558,7 +14564,13 @@ fn stream_chunks(
             }
         }
     }
-    // the client's requested chunks/tick bounds this batch
+    // The client's requested chunks/tick bounds this batch.
+    //
+    // Ordering the batch outermost-first was tried here, so that a chunk finds its 3x3
+    // neighbours' bands and floors already cached (they are installed when the neighbour
+    // is delivered). The deterministic bench (`chunk_delivery_path_bench`, cold cache per
+    // pass) shows no difference: 30.2/31.0 natural vs 30.3/31.0 outer-first ms/chunk. The
+    // natural order stays.
     news.truncate(ack.batch_size());
     if news.is_empty() {
         return;
@@ -14598,7 +14610,14 @@ fn stream_chunks(
         if !sent.contains(&(cx, cz)) {
             continue;
         }
-        if send_packet(s, 0x2a, update_light_packet(cx, cz, gen)).is_err() {
+        let __t = chunkprof::enabled().then(std::time::Instant::now);
+        let pkt = update_light_packet(cx, cz, gen);
+        if let Some(t) = __t {
+            use std::sync::atomic::Ordering;
+            chunkprof::add(&chunkprof::RE_LIGHT, t);
+            chunkprof::RE_LIGHT_N.fetch_add(1, Ordering::Relaxed);
+        }
+        if send_packet(s, 0x2a, pkt).is_err() {
             return;
         }
     }
@@ -23011,6 +23030,8 @@ pub(crate) mod chunkprof {
     pub(super) static DATA: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION: AtomicU64 = AtomicU64::new(0);
     pub(super) static LIGHT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RE_LIGHT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RE_LIGHT_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static SKY: AtomicU64 = AtomicU64::new(0);
     pub(super) static BLOCKLIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static FLOORS: AtomicU64 = AtomicU64::new(0);
@@ -23059,6 +23080,11 @@ pub(crate) mod chunkprof {
                 / BAND_NEW.load(Ordering::Relaxed).max(1) as f64
         );
         let new = BAND_NEW.load(Ordering::Relaxed).max(1) as f64;
+        eprintln!(
+            "CHUNKPROF   relight n={:.1}/chunk time={:.1}ms/chunk",
+            RE_LIGHT_N.load(Ordering::Relaxed) as f64 / n as f64,
+            RE_LIGHT.load(Ordering::Relaxed) as f64 / 1e6 / n as f64
+        );
         eprintln!(
             "CHUNKPROF   band parts: range={:.2}ms sections={:.2}ms cols_miss={:.1} epoch_bumps={:.2}/chunk",
             BAND_RANGE_NS.load(Ordering::Relaxed) as f64 / 1e6 / new,
@@ -23129,12 +23155,28 @@ pub(crate) mod tickprof {
     }
 }
 
+/// What the tick loop's wall time is actually spent on: the body, and the sleep between
+/// bodies. A thread that burns CPU with a cheap body is spinning, and this is what says so.
+pub(crate) mod loopprof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(super) static SLEEP_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BODY_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BODY_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn report() {
+        let n = BODY_N.swap(0, Ordering::Relaxed).max(1) as f64;
+        let sleep = SLEEP_NS.swap(0, Ordering::Relaxed) as f64 / 1e6 / n;
+        let body = BODY_NS.swap(0, Ordering::Relaxed) as f64 / 1e6 / n;
+        eprintln!("LOOPPROF ticks={n} body={body:.3}ms sleep={sleep:.3}ms per tick");
+    }
+}
+
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     let prof = tickprof::enabled();
     let n = tickprof::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if prof && n % 100 == 0 {
         tickprof::report();
         lockprof::report();
+        loopprof::report();
         // The worldgen lock is the other queue the tick thread sits in: a section pass
         // holds it for tens of milliseconds while the tick reads block states.
         crate::worldgen::report_gen_lock();
@@ -23960,9 +24002,12 @@ fn main() {
         let mut stats = tick_stats::TickStats::new(next_tick, TICK_INTERVAL);
         loop {
             next_tick += TICK_INTERVAL;
-            std::thread::sleep(next_tick.saturating_duration_since(Instant::now()));
+            let __s0 = std::time::Instant::now();
+            std::thread::sleep(next_tick.saturating_duration_since(__s0));
+            loopprof::SLEEP_NS.fetch_add(__s0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             next_tick = next_deadline(next_tick, Instant::now() > next_tick + TICK_INTERVAL);
             let started = Instant::now();
+            loopprof::BODY_N.fetch_add(1, Ordering::Relaxed);
             // A panicking tick must not leave the listener serving a world that no
             // longer advances. Log loudly and exit non-zero so a supervisor
             // (systemd, docker) restarts from the last autosave. The world is not
@@ -23975,6 +24020,7 @@ fn main() {
             }
             // the working server's own record of G3: the tick body's cost against
             // the 50ms budget, once per 100 ticks
+            loopprof::BODY_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if let Some(r) = stats.record(Instant::now(), started.elapsed()) {
                 eprintln!(
                     "[tick] observed_tps={:.2} avg_work_ms={:.2} max_work_ms={:.2} over_budget={}/{}",

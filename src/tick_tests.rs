@@ -3502,3 +3502,75 @@ fn nightly_hostile_type_uses_the_pinned_biome_spawners() {
     assert_eq!(spawn_etype_for_biome(Some("minecraft:the_end"), 0), 23);
     assert_eq!(spawn_etype_for_biome(None, 1), 91);
 }
+
+/// A deterministic yardstick for the chunk delivery path, with no socket in the loop.
+///
+/// The end-to-end numbers on this host swing by 2-3x between runs (other lanes), and the
+/// load client's own pacing adds a second source of variance, so a wall-clock A/B there
+/// cannot resolve a change. This drives the same sequence `stream_chunks` drives —
+/// section terrain, band install, overlay, light arrays — over a fixed sweep of chunk
+/// centres, and prints the same counters `MC_SPINE_CHUNK_PROFILE` prints in production.
+///
+///   MC_SPINE_CHUNK_BENCH=1 cargo test --release --nocapture chunk_delivery_path_bench
+#[test]
+fn chunk_delivery_path_bench() {
+    if std::env::var("MC_SPINE_CHUNK_BENCH").is_err() {
+        return;
+    }
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_test();
+    assert!(worldgen::init(0, crate::name_to_state), "worldgen");
+    let mut gen_sources: GenSources = HashMap::new();
+    // a left-to-right sweep, the shape a moving viewer drives: each step moves one chunk
+    let steps: Vec<(i32, i32)> = (0..12).map(|i| (i, 0)).collect();
+    let mut outers_first = Vec::new();
+    let mut inners_first = Vec::new();
+    // Alternate the order between passes and re-init before each, so neither order gets a
+    // warm cache the other did not: pass 2 is compared with pass 3, not with pass 1.
+    for (run, central) in [
+        (0usize, false),
+        (1usize, true),
+        (2usize, true),
+        (3usize, false),
+    ] {
+        assert!(worldgen::init(0, crate::name_to_state), "worldgen re-init");
+        let mut per_chunk: Vec<f64> = Vec::new();
+        for &(ox, oz) in &steps {
+            let mut news: Vec<(i32, i32)> = Vec::new();
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    news.push((ox + dx, oz + dz));
+                }
+            }
+            // outers-first (the order `stream_chunks` now uses) vs the natural order
+            if central {
+                news.sort_by_key(|&(cx, cz)| {
+                    std::cmp::Reverse((cx - ox).abs().max((cz - oz).abs()))
+                });
+            }
+            for (cx, cz) in news {
+                let t = std::time::Instant::now();
+                let _ = chunk_data(cx, cz, &mut gen_sources);
+                per_chunk.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let n = per_chunk.len() as f64;
+        let total: f64 = per_chunk.iter().sum();
+        let med = {
+            let mut v = per_chunk.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        eprintln!(
+            "CHUNKBENCH pass={run} order={} chunks={n} total={total:.0}ms median={med:.1}ms mean={:.1}ms",
+            if central { "outer-first" } else { "natural" },
+            total / n
+        );
+        if central {
+            inners_first = per_chunk;
+        } else {
+            outers_first = per_chunk;
+        }
+    }
+    assert_eq!(outers_first.len(), inners_first.len());
+}
