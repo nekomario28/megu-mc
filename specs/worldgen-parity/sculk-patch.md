@@ -1049,11 +1049,39 @@ draw ではない（`getInt` の手前で必ず float を引くため）。bound
 `betweenClosed(-1,-1,-1)..(1,1,1)` の **27要素**（初回 draw は 27、49 ではない）。つまり `(49)` は
 **armed 窓が間接的に呼ぶ別のクラス**（ブロック設置系のヘルパーなど）にある。
 
-**次の1手（計器）**: `ad.a(Ljava/util/List;Layw;)Ljava/util/List;`（= `Util.shuffledCopy`）に
-フックを入れ、**リストの要素数と、`new Throwable().getStackTrace()` から取った呼び出し元クラス名**
-を `SSHUFFLE <size> <caller> <thread>` として順序保証付き writer に出す。これを sculk 窓の中の
-位置と突き合わせれば、49要素リストの持ち主が1回の capture で確定する（読解より速い）。
-そのあと port 側の同じ位置に同じ draw を入れて、`compare-draws`（thread 単位）で1本ずつ確認する。
+**実施結果（2026-10-28、フックを入れて1 capture）**: `SSHUFFLE size=<n> caller=<cls>` を
+placement 窓の中だけで取ると、窓の中で起きた shuffle は
+
+| shuffle | 回数 |
+|---|---|
+| `size=-1 caller=een`（Stream 版） | 55 |
+| `size=5 caller=een` | 11 |
+| `size=6 caller=een` | 3 |
+
+のみ。**50要素の shuffle は存在しない** → `(49)` は `Util.shuffledCopy` ではない（bound 49 =
+50要素というフィンガープリント仮説は**棄却**）。
+
+さらにデータパックを読むと `sculk_patch_deep_dark` の config は
+
+```json
+{"amount_per_charge":32,"catalyst_chance":0.5,"charge_count":10,
+ "extra_rare_growths":0,"growth_rounds":0,"spread_attempts":64,"spread_rounds":1}
+```
+
+で **`extra_rare_growths` は定数 0** ✓。定数プロバイダの `getInt(random)` は**draw しない**ので、
+`edi` が引くのは **`nextFloat()` 1本だけ**（catalyst chance 0.5 の判定）。したがって `(49)` は
+`edi` でも rare growth でもない（前回の私の読みは誤り）。
+
+### 本当の穴は比較器の側だった
+
+`compare-draws` は **`nextInt(bound)` しか join していない**ので、`nextFloat`/`nextLong`/
+`nextDouble` は**見えていない**。`edi` は entry を通るパッチごとに float を1本引くため、
+**float 列の差が「その直後の int 列の差」として現れる**（いま見ている「25本目で port `(16)12` /
+native `(49)6`」がまさにその形）。分岐点は float 側にある可能性が高く、私の比較はそこを見ていない。
+
+**次の1手**: `compare-draws` を**全 draw 種**（`nextInt`/`nextLong`/`nextDouble`/`nextFloat` を
+順序どおり1列に正規化）で突き合わせ、最初にずれる draw が float か int かを確定する。
+
 
 （`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、
 `net.minecraft.world.level.block.SculkSpreader` のように**正しいパッケージ**で渡すこと。
