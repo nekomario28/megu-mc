@@ -9,6 +9,10 @@
 #   features   real features/carvers, no structures
 #   structures real features/carvers/structures
 #   sculk_veins / sculk_one_patch / sculk_cave_patch
+#
+# `JAVA_AGENT=<carveagent.jar>` runs the reference under the instrumentation agent
+# (`tools/carve-agent/`), which is how a native stage's *intermediate* state (e.g. a sculk
+# cursor's per-update position/charge/facings) is observed rather than inferred.
 #              features, with a datapack that isolates one deep-dark step-7 feature
 #              (`tools/vanilla_sculk_pack.py`; apply the same override to the port's pack)
 #
@@ -71,7 +75,8 @@ echo "chunk fixture $TAG: mode $MODE, chunks ($CX,$CZ)+${N}x${N}, blocks ($lox,$
                  sleep 10
                  printf 'stop\n' ) \
   | timeout 360 systemd-run --scope --user -p MemoryMax=3G --unit="cw-$TAG-$$" \
-      java -Xmx2G -Xms512M -jar server.jar nogui > run.log 2>&1 ) || true
+      java -Xmx2G -Xms512M ${JAVA_AGENT:+-javaagent:$JAVA_AGENT} \
+        ${JAVA_AGENT:+-XX:+EnableDynamicAgentLoading} -jar server.jar nogui > run.log 2>&1 ) || true
 if grep -qi 'unexpected error occurred' "$DIR/run.log"; then
   echo "chunk fixture: server command error (see $DIR/run.log)" >&2
   exit 2

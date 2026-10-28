@@ -517,6 +517,62 @@ port 側は `SPC_CALLS` / `SPC_TRACE_CELL` で同じ形（pos/charge/facings/判
 
 これは「推論ではなく証拠で閉じる」唯一の残った道で、作業量は probe mod 1 本。
 
+## native の**中間状態**を観測した（2026-10-28、`tools/carve-agent` の sculk hook）
+
+harness は 2 段目で閉じていたが、**リポジトリに既にあった javaagent**（`tools/carve-agent/`、
+ASM、bootstrap の `CarveLog`）を使えば参照サーバーの内側を直接見られる。追加したのは:
+
+- `SculkLog`（bootstrap、primitive + JDK 型のみ）: `SCURSOR r=<round> i=<index> x y z
+  charge decayDelay updateDelay facingsMask`。`r` は `SculkSpreader.updateCursors` の呼び出し
+  回数、`i` はそのラウンド内の cursor 添字。**charge 0 の cursor はリストから消える**ので、
+  この 2 つが無いと死んだ cursor 以降を整列できない。mask は Direction の宣言順
+  （down/up/north/south/west/east）で、port 側の面マスクと同じ添字。`-1` は null
+  （SAME_POSITION のみの spreader）、`0` は空集合（全 type の spreader）。
+- `Agent.java` の `SculkTransformer`: `dmu$a.a(dcx,jd,ayw,dmu,boolean)` の入口で
+  `this.d`（jd.u()/v()/w()）・`e`（charge）・`g`・`f`・`h` をそのまま渡す。**乱数は引かない**
+  ので spread の判断を変えない。
+- `tools/chunk_world_fixture.sh` に `JAVA_AGENT=<carveagent.jar>`（features モードのまま）。
+
+実行（seed 0、chunk (-16,112)、参照キャプチャ約3分）:
+
+```sh
+JAVA_AGENT=/var/tmp/sa/carveagent.jar tools/chunk_world_fixture.sh sa2 -16 112 1 features
+grep -o 'SCURSOR .*' /tmp/chunkfix-sa2/run.log | head
+# 28175 行。先頭は r=0 i=0..9 = 最初のパッチの 10 cursor の 1 回目の更新（すべて一致）
+```
+
+port 側も同じ行を `SPC_CURSOR_TRACE=1` で出すようにし、**(round, index) で整列**して比較する
+と、最初の食い違いは **r=1 i=0**:
+
+```
+native (-261,-43,1784, charge 31, decay 1, update 1, facings 20)
+port   (-260,-42,1785, charge 31, decay 1, update 1, facings  4)
+```
+
+つまり round 0（最初の更新）を終えた時点で、両者の cursor は**別のセルへ動き**、面構成も違う。
+charge は両方 31（変換が起きた ✓）。`r=1 i=2` は完全一致、共有キー 4684 中 4654 が食い違い。
+
+### この比較で見つけた bytecode 由来のバグ 2 件（修正済み）
+
+1. **`decayDelay`（`j_`）の向きが逆だった**: `SculkBlock` と `SculkVeinBlock` は interface 既定
+   （`1`）を継承し、`max(x-1,0)` を返すのは **`dmp` の匿名既定実装だけ**。port は vein 側に
+   その実装を置いていた（＝vein に乗った cursor が毎回 decay する）→ 修正。トレースで
+   `r=1 i=2` が一致するようになった（全体セル数は不変: 4x4 4834 / 6x6 5739 のまま）。
+2. **`SculkVeinSpreaderConfig.canSpread` の隣接拒否リスト**: `dga.bQ` は `sculk_sensor` ではなく
+   **`moving_piston`**（mappings で確認）。port は `sculk_sensor` を拒否していた → 修正。
+
+どちらも**全体セル数は変えない**（メトリクスが鈍い）が、**トレースでは観測できる** —
+これが「最終セルでは復元できない中間状態を見る」ための新しい計器の価値。
+
+### 次の一手（この計器で）
+
+最初の食い違い（r=1 i=0）は「round 0 の後の cursor 位置と面構成」。両者の round 0 は
+同じ 22 draw（convert の 5 + findNextSculk の 17）を消費しているはずで、charge も一致する
+ので、**候補セル集合**（＝round 0 に書いた vein/sculk のセル）が違う。次は
+`setBlock`（`dds.a(jd,dtc,int)`）を同じ agent で hook して `SWRITE x y z stateId` を出し、
+**書き込み列そのもの**を整列比較する（carver agent の `ASTATE` が block state id を
+registry 経由で取る作法をそのまま使える）。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・

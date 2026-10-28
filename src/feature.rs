@@ -16,6 +16,7 @@ use crate::json::{jarr, jbool, jf32, jint, jnum, jparse, js, jstr, J};
 use crate::trace_env::{env_flag, env_str};
 use crate::worldgen::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 
 #[cfg(test)]
 #[path = "generation_contract_tests.rs"]
@@ -2689,6 +2690,9 @@ const SPC_ORIGIN_RADIUS_SQ: i64 = 225;
 
 const SPC_VEIN: &str = "minecraft:sculk_vein";
 
+/// Counts `SculkSpreader.updateCursors` calls, matching the reference agent's counter.
+static SPC_ROUND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// Which `SculkBehaviour` a state carries: `SculkBlock`, `SculkVeinBlock`, or the default
 /// (everything else, including air).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2775,8 +2779,24 @@ impl SculkSpreader {
     /// spreader does **not** merge cursors that land on the same position (the merge branch is
     /// behind `!isWorldGeneration()`), so duplicates stay.
     fn update(&mut self, ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), spread_only: bool) {
+        // The reference agent's `SculkLog.round()` counts every `updateCursors` call the same
+        // way, and `i` is the cursor's index in this round's list: a cursor that reaches charge
+        // 0 is dropped, so without those two numbers the two traces cannot be aligned.
+        let round = SPC_ROUND.fetch_add(1, Ordering::Relaxed);
         let mut kept = Vec::with_capacity(self.cursors.len());
-        for mut cursor in std::mem::take(&mut self.cursors) {
+        for (idx, mut cursor) in std::mem::take(&mut self.cursors).into_iter().enumerate() {
+            if std::env::var("SPC_CURSOR_TRACE").is_ok() {
+                eprintln!(
+                    "SCURSOR r={round} i={idx} {} {} {} {} {} {} {}",
+                    cursor.pos.0,
+                    cursor.pos.1,
+                    cursor.pos.2,
+                    cursor.charge,
+                    cursor.decay_delay,
+                    cursor.update_delay,
+                    cursor.facings.map_or(-1, |m| m as i32)
+                );
+            }
             spc_cursor_update(ctx, rng, &mut cursor, origin, spread_only);
             if cursor.charge > 0 {
                 kept.push(cursor);
@@ -2974,6 +2994,7 @@ fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool
     let state = ctx.get(x, y, z);
     match cursor.facings {
         // `facings == null`: `SculkVeinBlock.m()`, the spreader with only SAME_POSITION
+        None if std::env::var("SPC_NO_CURSOR_SPREAD").is_ok() => false,
         None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
         // empty facings: the interface default uses `SculkVeinBlock.c()` (all three types)
         Some(0) => spc_spread_all(
@@ -3123,9 +3144,12 @@ fn spc_vein_can_spread(
     let (tdx, tdy, tdz) = dir_off(dir);
     let nb = ctx.get(target.0 + tdx, target.1 + tdy, target.2 + tdz);
     let name = reg.name_of(nb);
+    // `dga.bQ` is `moving_piston`, not `sculk_sensor` (measured from the mappings): the
+    // neighbour in the face direction is rejected when it is sculk, sculk_catalyst or a
+    // moving piston.
     if matches!(
         name,
-        "minecraft:sculk" | "minecraft:sculk_catalyst" | "minecraft:sculk_sensor"
+        "minecraft:sculk" | "minecraft:sculk_catalyst" | "minecraft:moving_piston"
     ) {
         return false;
     }
@@ -3284,10 +3308,14 @@ fn spc_decay(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor, kind: SpcKind) {
     }
 }
 
-/// `SculkBehaviour.decayDelay` (`j_`): the default returns 1, the vein's `max(x - 1, 0)`.
+/// `SculkBehaviour.decayDelay` (`j_`): `SculkBlock` and `SculkVeinBlock` both inherit the
+/// interface default (`1`); only the *default* behaviour - the anonymous class in `dmp`, used
+/// for every other block - returns `max(x - 1, 0)`. Reading the override the other way round
+/// makes every cursor standing on a vein decay, which is where the earlier "the port decays
+/// veins vanilla keeps" observation came from.
 fn spc_decay_delay(kind: SpcKind, delay: i32) -> i32 {
     match kind {
-        SpcKind::Vein => (delay - 1).max(0),
+        SpcKind::Other => (delay - 1).max(0),
         _ => 1,
     }
 }
