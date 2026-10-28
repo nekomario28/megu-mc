@@ -654,6 +654,29 @@ port は x を最外にしていた ✗ → 同じ乱数 stream でも `util_shu
 非決定性か、pack の差か）は**未解明のまま記録**する。トレース比較は同じ capture の
 native trace に対して行っており、そちらは再現する範囲で有効。
 
+## 恒久化した道具と再現手順（2026-10-28）
+
+| 道具 | 何をするか |
+|---|---|
+| `tools/carve-agent/`（`Agent.java` + `CarveLog.java` + `SculkLog.java`） | 固定 jar を ASM で instrument。`SculkLog` は bootstrap から読める primitive/JDK 型のみ。build は README の `sh`（`SculkLog.java` を含める、ASM は `~/.m2` の最新を使う） |
+| `JAVA_AGENT=<carveagent.jar> tools/chunk_world_fixture.sh <tag> -16 112 1 features` | 参照サーバーを agent 付きで起動（`JAVA_OPTS="-Dfeaturebox=..."` で feature 書き込みも） |
+| port 側 `SPC_CURSOR_TRACE=1` / `SPC_TRACE_ALL=1` / `FEATURE_WRITE_TRACE=<cx>,<cz>|all` / `GENERIC_CASE_DUMP=<path>` | 同じ形の trace（`SCURSOR` 相当 / 書き込みと呼び出し元 / 呼び出し元なしの書き込み順 / fixture 差分） |
+| `tools/sculk_trace.py extract <run.log> [--rounds N]` / `compare <native> <port>` | `SCURSOR` 行を抽出し、**(round, index) で整列**して比較。共有キーが食い違えば exit 1（gate として使える） |
+| `tests/data/sculk_cursor_1211.tsv` | native 側の先頭 60 行（round 0..5）。再生成: `tools/sculk_trace.py extract <run.log> --rounds 5`。**port 側は同じ capture が必要**（`SPC_CURSOR_TRACE=1` の dump を同じ chunk で） |
+
+現在の比較結果（この capture、round 0..5 のスライス）:
+
+```
+native keys 60, port keys 5150, shared 60
+differing 7; first at r=3 i=0
+  native (-262,-43,1785, 30, 1, 1, 4)
+  port   (-261,-44,1784, 30, 1, 1, 4)
+```
+
+＝ round 0〜2 は完全一致、round 3 の先頭で分岐。**この 1 点を追うのが次の作業**で、
+`SSPREADALL`（spread type 数）/ `SCMARK`（呼び出し元）/ `FCELL`（書き込み列）/
+`SSPREAD`（pos/from/to）がすべて同じ log に揃っている。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・

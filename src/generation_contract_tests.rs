@@ -567,6 +567,101 @@ fn basalt_columns_matches_native_cells_and_rng() {
     );
 }
 
+/// The 18 neighbours' *order* is the draw: `findNextSculk` shuffles this list, so a different
+/// base order is a different permutation for the same random stream. Measured through the
+/// pinned jar: `BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` yields `(-1,-1,-1) (0,-1,-1)
+/// (1,-1,-1) (-1,0,-1) ...` - x varies fastest, then y, then z - and the centre is dropped.
+/// (The port iterated x outermost, which is what made its first divergent cursor pick a
+/// different neighbour while every earlier write matched.)
+#[test]
+fn sculk_offsets_keep_vanillas_iteration_order() {
+    let offsets = super::spc_offsets();
+    assert_eq!(offsets.len(), 18, "18 face/edge neighbours");
+    // the first five and the last, copied from the probe's `KEPT` line
+    assert_eq!(offsets[0], (0, -1, -1));
+    assert_eq!(offsets[1], (-1, 0, -1));
+    assert_eq!(offsets[2], (0, 0, -1));
+    assert_eq!(offsets[3], (1, 0, -1));
+    assert_eq!(offsets[4], (0, 1, -1));
+    assert_eq!(*offsets.last().unwrap(), (0, 1, 1));
+    // a corner (three non-zero coordinates) is not a neighbour
+    assert!(!offsets.contains(&(1, -1, -1)));
+    assert!(
+        !offsets.contains(&(0, 0, 0)),
+        "the centre is not a neighbour"
+    );
+}
+
+/// `SculkBehaviour.decayDelay` (`j_`): `SculkBlock` and `SculkVeinBlock` inherit the interface
+/// default (1); `max(x - 1, 0)` belongs to the anonymous default implementation in `dmp`.
+/// Reading it the other way round made every cursor standing on a vein decay.
+#[test]
+fn sculk_decay_delay_follows_the_behaviour() {
+    use super::{spc_decay_delay, SpcKind};
+    assert_eq!(
+        spc_decay_delay(SpcKind::Vein, 1),
+        1,
+        "the vein inherits the default"
+    );
+    assert_eq!(spc_decay_delay(SpcKind::Sculk, 0), 1, "and so does sculk");
+    assert_eq!(
+        spc_decay_delay(SpcKind::Other, 1),
+        0,
+        "only the default behaviour decrements"
+    );
+    assert_eq!(
+        spc_decay_delay(SpcKind::Other, 0),
+        0,
+        "and it clamps at zero"
+    );
+}
+
+/// A sculk patch on a synthetic deepslate floor must convert its neighbourhood and leave both
+/// sculk and veins behind. Not a parity claim - the native fixture for that is the capture in
+/// `specs/worldgen-parity/sculk-patch.md` - but a net under the spread machinery, which the
+/// trace work showed can be wrong in ways no cell total notices.
+#[test]
+fn sculk_patch_converts_a_deepslate_floor() {
+    use crate::generation_providers::IP;
+    let reg = breg().unwrap();
+    let deepslate = reg.state_of("minecraft:deepslate", None);
+    let cf = Cf::SculkPatch(super::SculkPatchCfg {
+        charge_count: 10,
+        amount_per_charge: 32,
+        spread_attempts: 16,
+        growth_rounds: 0,
+        spread_rounds: 1,
+        extra_rare_growths: IP::Const(0),
+        catalyst_chance: 0.0,
+    });
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    for x in -6i32..=6 {
+        for z in -6i32..=6 {
+            for dy in -3i32..=3 {
+                // a floor with a cave above it: the origin is air over the floor
+                g.feat_write(x, 64 + dy, z, if dy <= -1 { deepslate } else { 0 });
+            }
+        }
+    }
+    let mut ctx = context(&mut g);
+    let mut rng = Xor::seed_worldgen(0);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
+    let names: Vec<&str> = ctx
+        .wr
+        .values()
+        .map(|&st| reg.name_of(st))
+        .filter(|n| *n != "minecraft:deepslate" && *n != "minecraft:air")
+        .collect();
+    assert!(
+        names.iter().any(|n| *n == "minecraft:sculk"),
+        "no sculk written: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| *n == "minecraft:sculk_vein"),
+        "no vein written: {names:?}"
+    );
+}
+
 #[test]
 fn twisting_vines_matches_native_cells_and_rng() {
     let reg = breg().unwrap();

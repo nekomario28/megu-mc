@@ -3343,6 +3343,28 @@ fn spc_face_sturdy(reg: &BReg, st: u32, dir: u8) -> bool {
     reg.is_solid(st) && reg.side_solid(st, dir as usize)
 }
 
+/// The 18 face/edge neighbours, in `BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` order with the
+/// centre removed.
+///
+/// The *order* is the draw: `findNextSculk` shuffles this list, so a different base order is a
+/// different permutation for the same random stream. Measured through the pinned jar:
+/// `betweenClosed(-1,-1,-1, 1,1,1)` yields `(-1,-1,-1) (0,-1,-1) (1,-1,-1) (-1,0,-1) ...` —
+/// **x varies fastest**, then y, then z. The port iterated x outermost, which is why its first
+/// divergent cursor picked a different neighbour while every earlier write matched exactly.
+fn spc_offsets() -> Vec<(i32, i32, i32)> {
+    let mut out = Vec::with_capacity(18);
+    for z in -1i32..=1 {
+        for y in -1i32..=1 {
+            for x in -1i32..=1 {
+                if (x == 0 || y == 0 || z == 0) && !(x == 0 && y == 0 && z == 0) {
+                    out.push((x, y, z));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `ChargeCursor.findNextSculk` (`dmu$a.a(dcx,jd,ayw)`): the 18 face/edge neighbours in shuffled
 /// order, keeping the last reachable `SculkBehaviour` cell, and stopping early when it has
 /// substrate access.
@@ -3352,22 +3374,7 @@ fn spc_find_next_sculk(
     rng: &mut Xor,
     pos: (i32, i32, i32),
 ) -> Option<(i32, i32, i32)> {
-    let mut offsets: Vec<(i32, i32, i32)> = Vec::with_capacity(18);
-    // `BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` order, measured through the pinned jar:
-    // `(-1,-1,-1) (0,-1,-1) (1,-1,-1) (-1,0,-1) ...` — **x varies fastest**, then y, then z.
-    // The order is the draw: `util_shuffle` below turns this list into the permutation
-    // `findNextSculk` walks, so iterating x outermost (as this did) yields a different pick for
-    // the same random stream. That, not a rule, is what made the port's first divergent cursor
-    // choose a different neighbour while every earlier write matched exactly.
-    for z in -1i32..=1 {
-        for y in -1i32..=1 {
-            for x in -1i32..=1 {
-                if (x == 0 || y == 0 || z == 0) && !(x == 0 && y == 0 && z == 0) {
-                    offsets.push((x, y, z));
-                }
-            }
-        }
-    }
+    let mut offsets = spc_offsets();
     util_shuffle(&mut offsets, rng);
     let mut target = pos;
     for off in offsets {

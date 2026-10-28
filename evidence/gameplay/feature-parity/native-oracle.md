@@ -98,3 +98,26 @@ GENERIC_CASE_DUMP=/tmp/port.tsv cargo test <type>
 
 `tools/vanilla_src.sh <official class...>` は同じ固定 jar を Vineflower でソースに落とす
 （読解用・repo 外・jar と mappings の SHA-1 を検査）。README の「未スクリプト化」は解消済み。
+
+## The route that works when the harness cannot: the instrumentation agent
+
+The two limits above (no `ChunkAccess`, `getChunk` answered but biomes unresolvable) close this
+harness for features whose path reaches the level's chunk or a biome query - `sculk_patch` is
+one. The repository already carries the other instrument: `tools/carve-agent/`, an ASM
+`javaagent` that instruments the pinned server itself and logs through a bootstrap class. It is
+driven with `JAVA_AGENT=<carveagent.jar> tools/chunk_world_fixture.sh <tag> <cx> <cz> <n> features`,
+and it observes the *intermediate* state a scripted level cannot:
+
+- `SCURSOR r=<round> i=<index> x y z charge decayDelay updateDelay facingMask` at
+  `SculkSpreader$ChargeCursor.update` entry - `r` counts `updateCursors` calls and `i` is the
+  cursor's index inside that round, because a cursor that reaches charge 0 is dropped and the
+  list shifts. The port prints the same line under `SPC_CURSOR_TRACE=1`, so a cursor's
+  trajectory is two lists aligned by (round, index) instead of two cell sets.
+- `SCMARK` at the sculk call sites, `SSPREADALL types=<n>` at `MultifaceSpreader.spreadAll`
+  entry, and `-Dfeaturebox=...` for `FCELL x y z state=<id> feature=<gi>,<step> chunk=<pop>`
+  (the id comes from the jar's own registry, the same numbering the port's asset uses).
+
+Two properties make this a usable oracle: the hooks only read fields and call `jd.u()/v()/w()`,
+so they draw no random and cannot change a spread; and the port can emit the same shapes, so
+the comparison is index-aligned rather than aggregate. The method is written up, with what it
+found, in [`specs/worldgen-parity/sculk-patch.md`](../../../specs/worldgen-parity/sculk-patch.md).
