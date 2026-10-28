@@ -7127,6 +7127,7 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     // every cell it covers. The version still moves for the sky floors, which are derived
     // from the column rather than stored per cell.
     band_patch(x, y, z, st);
+    store_patch(x, y, z, st);
     bump_world_epoch(x, z);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
@@ -13715,6 +13716,87 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
 /// Keep a chunk's band in step with a write. Cells outside the band are not tracked
 /// there (readers fall back), and a chunk with no band yet needs nothing: its first build
 /// reads the world as it is then.
+/// Sections computed for a chunk, kept so a reader (the anti-xray exposure test, or the
+/// chunk's own delivery after a neighbour prefetched it) can read an array instead of
+/// evaluating cells. Bounded to the last 32 chunks (~7 MB at 10-14 published sections of
+/// 16 KB each).
+struct SectionStore {
+    map: HashMap<(i32, i32), Vec<Option<std::sync::Arc<Vec<u32>>>>>,
+    order: std::collections::VecDeque<(i32, i32)>,
+}
+
+static SECTION_STORE: std::sync::OnceLock<Mutex<SectionStore>> = std::sync::OnceLock::new();
+
+fn section_store() -> &'static Mutex<SectionStore> {
+    SECTION_STORE.get_or_init(|| {
+        Mutex::new(SectionStore {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+fn section_index(sy: i32) -> Option<usize> {
+    let idx = (sy - MIN_Y) >> 4;
+    if (0..24).contains(&idx) {
+        Some(idx as usize)
+    } else {
+        None
+    }
+}
+
+fn publish_section(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
+    let Some(idx) = section_index(sy) else {
+        return;
+    };
+    let mut store = section_store().lock().unwrap();
+    if !store.map.contains_key(&(cx, cz)) {
+        store.map.insert((cx, cz), (0..24).map(|_| None).collect());
+        store.order.push_back((cx, cz));
+        while store.order.len() > 32 {
+            if let Some(old) = store.order.pop_front() {
+                store.map.remove(&old);
+            }
+        }
+    }
+    if let Some(sections) = store.map.get_mut(&(cx, cz)) {
+        sections[idx] = Some(std::sync::Arc::new(states.to_vec()));
+    }
+}
+
+fn take_published(cx: i32, cz: i32, sy: i32) -> Option<Box<[u32; 4096]>> {
+    let idx = section_index(sy)?;
+    let mut store = section_store().lock().unwrap();
+    let sections = store.map.get_mut(&(cx, cz))?;
+    let arc = sections[idx].take()?;
+    let mut out = Box::new([0u32; 4096]);
+    out.copy_from_slice(arc.as_slice());
+    Some(out)
+}
+
+fn stored_state(x: i32, y: i32, z: i32) -> Option<u32> {
+    let idx = section_index(y & !15)?;
+    let store = section_store().lock().unwrap();
+    let sections = store.map.get(&(x >> 4, z >> 4))?;
+    let sec = sections[idx].as_ref()?;
+    Some(sec[(((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize)])
+}
+
+fn store_patch(x: i32, y: i32, z: i32, st: u32) {
+    let Some(idx) = section_index(y & !15) else {
+        return;
+    };
+    let mut store = section_store().lock().unwrap();
+    let Some(sections) = store.map.get_mut(&(x >> 4, z >> 4)) else {
+        return;
+    };
+    let Some(sec) = sections[idx].as_mut() else {
+        return;
+    };
+    let cells = std::sync::Arc::make_mut(sec);
+    cells[(((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize)] = st;
+}
+
 fn band_patch(x: i32, y: i32, z: i32, st: u32) {
     let (cx, cz) = (x >> 4, z >> 4);
     let mut bands = op_bands().lock().unwrap();
@@ -14140,6 +14222,18 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     // (and the previous one back) means those reads are array reads too: measured, the
     // 621 reads that still fell through to `base_state` cost 36.5 ms of the encode loop's
     // 39 ms (58 µs each, because a cold cell re-runs the material rules).
+    // `MC_SPINE_PREFETCH_NEIGHBOUR=1`: compute the +x neighbour's sections for the same y
+    // band, publish them, and let that neighbour's own delivery consume them from the store
+    // instead of recomputing. It answers the exposure test's deep horizontal reads, which
+    // are the encode loop's cost (measured 482 `base_state` calls at 75 µs = 37 ms of 42).
+    //
+    // Opt-in, and off by default: computing a neighbour's terrain populates it, and the
+    // order chunks are populated in is an *input* to the feature layer (a chunk's features
+    // read the writes of the chunks populated before it). The pinned captures use an
+    // explicit source order, so changing production's order is a parity decision, not a
+    // performance one - this switch exists to measure what it would buy.
+    let prefetch = crate::trace_env::env_flag!("MC_SPINE_PREFETCH_NEIGHBOUR");
+
     let mut carried_next: Option<Box<[u32; 4096]>> = None;
     let mut prev_base: Option<Box<[u32; 4096]>> = None;
     for sec in 0..24 {
@@ -14175,8 +14269,18 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
             }
             let base = match carried_next.take() {
                 Some(b) => Some(b),
-                None => worldgen::terrain_section(cx, sy, cz, feature::populate),
+                None => take_published(cx, cz, sy)
+                    .or_else(|| worldgen::terrain_section(cx, sy, cz, feature::populate)),
             };
+            if prefetch {
+                if let Some(rows) = &base {
+                    publish_section(cx, cz, sy, rows);
+                    if let Some(nbr) = worldgen::terrain_section(cx + 1, sy, cz, feature::populate)
+                    {
+                        publish_section(cx + 1, cz, sy, &nbr);
+                    }
+                }
+            }
             // The section above, computed now so this section's reads have it and the next
             // iteration does not pay for it twice.
             let next_base = if sy + 16 < MIN_Y + 384 {
@@ -14254,6 +14358,12 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
                     let __tb = chunkprof::enabled().then(std::time::Instant::now);
                     if __tb.is_some() {
                         chunkprof::READ_BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Some(st) = stored_state(wx, wy, wz) {
+                        if let Some(t) = __t {
+                            chunkprof::add(&chunkprof::READ_NS, t);
+                        }
+                        return st;
                     }
                     let band = band_state(wx, wy, wz);
                     if let Some(t) = __tb {
