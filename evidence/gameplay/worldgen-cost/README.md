@@ -500,3 +500,33 @@ B が**デッドロックして仕事をしていなかった**ためだった�
 （葉ごとに）積まれることが主因。vanilla は葉の distance/persistent を
 **配置時に決める**ので、この churn は性能だけでなく挙動の差分でもある。
 次の対象はここ（`scheduled_blocks` 12.5 ms/tick と 0x49 の大量送信が同じ根を持つ）。
+
+## 2026-10-28: tick 本体の 14 ms は「世界ロック待ち」だった（生成キューを Gen から出す）
+
+先の `sched/eligible` をさらに割ったら、14.1 ms/tick は
+`worldgen::with_gen(|g| g.take_generated_leaf_ticks())` の**1 回の取得**に集中していた
+（キューには 519 tick/tick しか入っていない）。つまりキューの中身ではなく、
+**GEN ロック待ち**。保持しているのは配信スレッドの生成で、新しいチャンクの最初の
+セルは `populate`（数十 ms）を GEN 保持のまま走らせる。
+
+対処: 生成時に積む 2 つのキュー（葉 tick・流体 tick）を `Gen` から出し、それぞれ
+専用のロックへ（`take_generated_leaf_ticks` / `take_generated_fluid_ticks` は
+世界ロックを取らない）。`ProtoChunkTicks` 相当のキューがワールドロックの下に
+ある必要はない。
+
+| | 前 | 後 |
+|---|---|---|
+| tick body | 13.8 ms/tick | **0.17** |
+| `scheduled_blocks` | 14.2 | 0.072 |
+| `generated_fluids` | 13.6 | 0.002 |
+| `GENLOCK wait`（100 tick 窓） | 1451 ms | **86 ms** |
+| `[tick]` | tps 17.5-19.4、over_budget 8-13/100 | **tps 20.00、over_budget 0/100、avg_work 0.05-0.10 ms** |
+| 20 秒窓の CPU | 28-29 s | 28.1 s（**不変**） |
+
+**CPU は変わらない**（待っていた時間は元々他人が働いていた時間）。変わったのは
+**tick の健全性**: 20 TPS を維持し、予算超過が 0 になった。つまり残る 28 s は
+配信スレッドの実仕事（生成 + 配信: `map_chunk` 91 ms/chunk）で、そこが次の的。
+
+検証: 全 suite **339 passed / 0 failed / 1 ignored**。
+`leaf_edge_schedules_match_native_order`（葉 tick の native 順を固定するガード）は
+キューの所有者が変わったため「ケースごとに drain して比較」に適応（意図は不変）。

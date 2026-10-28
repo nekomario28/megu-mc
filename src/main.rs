@@ -6009,9 +6009,20 @@ fn region_guard() -> TimedGuard<Region> {
     timed_region()
 }
 fn scheduled_tick_chunks() -> HashSet<(i32, i32)> {
+    let __t = tickprof::enabled().then(std::time::Instant::now);
     let mut chunks = region_guard().hot.clone();
-    for &chunk in forceloaded().lock().unwrap().iter() {
-        extend_chunk_square(&mut chunks, chunk, 1);
+    if let Some(t) = __t {
+        tickprof::add("sched/hot_clone", t.elapsed());
+        tickprof::HOT_N.fetch_add(chunks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let __tf = tickprof::enabled().then(std::time::Instant::now);
+    let forced: Vec<(i32, i32)> = forceloaded().lock().unwrap().iter().copied().collect();
+    for chunk in &forced {
+        extend_chunk_square(&mut chunks, *chunk, 1);
+    }
+    if let Some(t) = __tf {
+        tickprof::add("sched/forceload_expand", t.elapsed());
+        tickprof::FORCED_N.fetch_add(forced.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     chunks
 }
@@ -6181,15 +6192,24 @@ fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
         }
     }
     let mut out = vec![0u32; positions.len()];
-    let generated: Vec<usize> = positions
-        .iter()
-        .enumerate()
-        .filter(|(_, &(x, y, z))| {
+    // The chunk band first: it is the states `chunk_data` already evaluated, so a leaf's
+    // neighbours cost an array read instead of a worldgen evaluation. Falls back to the
+    // live overlay, then to a batched worldgen pass for cells the band does not cover.
+    let mut unresolved: Vec<usize> = Vec::new();
+    for (i, &(x, y, z)) in positions.iter().enumerate() {
+        match band_state(x, y, z) {
+            Some(st) => out[i] = st,
+            None => unresolved.push(i),
+        }
+    }
+    let generated: Vec<usize> = unresolved
+        .into_iter()
+        .filter(|&i| {
+            let (x, y, z) = positions[i];
             overlays
                 .get(&(x >> 4, z >> 4))
                 .is_none_or(|c| !c.contains_key(&local_idx(x, y, z)))
         })
-        .map(|(i, _)| i)
         .collect();
     if !generated.is_empty() {
         crate::worldgen::with_gen(|g| {
@@ -6213,8 +6233,18 @@ fn scheduled_block_tick() {
     with_save_guard(scheduled_block_tick_inner);
 }
 fn scheduled_block_tick_inner() {
+    let __prof = tickprof::enabled();
+    let mut __t = __prof.then(std::time::Instant::now);
     let now = TICK_IDX.load(Ordering::Relaxed) as i64;
-    let generated = worldgen::with_gen(|g| g.take_generated_leaf_ticks()).unwrap_or_default();
+    // Its own lock: this drain used to take the worldgen lock, and a section's first cell
+    // populates the chunk under that lock (tens of ms), so the tick thread waited behind
+    // generation for a queue that has nothing to do with it.
+    let generated = worldgen::take_generated_leaf_ticks();
+    if let Some(t) = __t {
+        tickprof::add("sched/take_generated", t.elapsed());
+        tickprof::GEN_TICKS.fetch_add(generated.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    __t = __prof.then(std::time::Instant::now);
     if !generated.is_empty() {
         let mut counts: HashMap<(i32, i32), i64> = HashMap::new();
         for (pos, _) in &generated {
@@ -6233,11 +6263,23 @@ fn scheduled_block_tick_inner() {
             *remaining -= 1;
         }
     }
+    if let Some(t) = __t {
+        tickprof::add("sched/schedule_loop", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
     let eligible = scheduled_tick_chunks();
+    if let Some(t) = __t {
+        tickprof::add("sched/eligible", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
     let due = block_ticks()
         .lock()
         .unwrap()
         .collect(now, 65_536, |chunk| eligible.contains(&chunk));
+    if let Some(t) = __t {
+        tickprof::add("sched/collect", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
@@ -6253,6 +6295,10 @@ fn scheduled_block_tick_inner() {
         }
     }
     let states = read_states_batched(&positions);
+    if let Some(t) = __t {
+        tickprof::add("sched/read_batch", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
     for (i, tick) in due.iter().enumerate() {
         let (x, y, z) = tick.pos;
         let b = i * STRIDE;
@@ -6272,6 +6318,9 @@ fn scheduled_block_tick_inner() {
         if result != st && set_block_if(x, y, z, result, Some(st)) {
             note_block_update(x, y, z, result);
         }
+    }
+    if let Some(t) = __t {
+        tickprof::add("sched/write_loop", t.elapsed());
     }
 }
 
@@ -6425,7 +6474,7 @@ fn generated_fluid_tick() {
 }
 fn generated_fluid_tick_inner() {
     let now = TICK_IDX.load(Ordering::Relaxed) as i64;
-    let generated = worldgen::with_gen(|g| g.take_generated_fluid_ticks()).unwrap_or_default();
+    let generated = worldgen::take_generated_fluid_ticks();
     if generated.is_empty() && GENERATED_FLUID_OWNER.get().is_none() {
         return;
     }
@@ -7047,8 +7096,13 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
         c.insert(local_idx(x, y, z), st);
     }
     drop(w);
-    // the cached sky floors describe the blocks that were just changed
-    bump_world_epoch();
+    // The band is a write-through view of the chunk, not an invalidated one: a leaf tick
+    // writes every tick, so invalidating would rebuild a whole band per write (14 ms).
+    // The written cell is patched instead, which keeps the band equal to `block_at` for
+    // every cell it covers. The version still moves for the sky floors, which are derived
+    // from the column rather than stored per cell.
+    band_patch(x, y, z, st);
+    bump_world_epoch(x, z);
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
         schedule_leaf_neighbors(x, y, z, st);
@@ -8323,7 +8377,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         (
             g.tick_sources(),
             g.generated_leaf_ticks().to_vec(),
-            g.generated_fluid_ticks().to_vec(),
+            worldgen::take_generated_fluid_ticks(),
         )
     })
     .unwrap_or_default();
@@ -8372,7 +8426,6 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     let rv = rv_varint;
     let n = rv(payload, &mut p);
     let mut w = world().lock().unwrap();
-    bump_world_epoch();
     for _ in 0..n {
         if p + 8 > payload.len() {
             break;
@@ -8392,6 +8445,8 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             let st = rv(payload, &mut p) as u32;
             c.insert(idx, st);
         }
+        // every chunk this restore touched has new cells
+        bump_world_epoch(cx << 4, cz << 4);
     }
     eprintln!("[spine] loaded {} dirty chunks", w.len());
     drop(w);
@@ -13479,28 +13534,69 @@ fn sky_spill(
 /// Invalidation is the same world-wide edit epoch the floor cache uses: any write into
 /// `world()` drops every band, because a band describes blocks.
 #[derive(Clone)]
+/// A chunk's cells in the y band its readers touch, as block states.
+///
+/// This is the port's substitute for vanilla's per-chunk block array: without it every
+/// read of a generated cell is a full worldgen evaluation (`base_state` → density +
+/// material rule + aquifer, with the worldgen lock). The band covers what the light pass
+/// and the scheduled-tick pass actually read — `[min wtop - 18, max wtop + 18]` — so a
+/// leaf's distance update, a torch's spread and a sky-floor scan are array reads.
+///
+/// It is built by `chunk_data` from the states it has just evaluated (`install_band_rows`),
+/// so a streamed chunk costs nothing extra; a chunk that has not been streamed yet is
+/// built on demand from `terrain_section`.
 struct OpBand {
     y0: i32,
     y1: i32,
-    op: Vec<u8>,
+    cells: Vec<u32>,
 }
 
 impl OpBand {
-    fn get(&self, y: i32, lx: usize, lz: usize) -> Option<u8> {
+    fn get(&self, y: i32, lx: usize, lz: usize) -> Option<u32> {
         if y < self.y0 || y > self.y1 {
             return None;
         }
-        Some(self.op[(((y - self.y0) as usize) << 8) | (lz << 4) | lx])
+        Some(self.cells[(((y - self.y0) as usize) << 8) | (lz << 4) | lx])
     }
 }
 
-static OP_BANDS: OnceLock<
-    Mutex<std::collections::VecDeque<((i32, i32), u64, std::sync::Arc<OpBand>)>>,
-> = OnceLock::new();
+/// Band cache: a hash index plus insertion order for eviction.
+///
+/// The first version was a `VecDeque` scanned linearly, which measured ~0.4 µs per
+/// lookup — and the scheduled-tick pass asks for ~28,000 cells per tick, so the lookup
+/// alone was most of its 12.5 ms. A `HashMap` makes it a hash hit; the `order` deque only
+/// exists for the bound.
+struct BandCache {
+    map: HashMap<(i32, i32), (u64, std::sync::Arc<OpBand>)>,
+    order: std::collections::VecDeque<(i32, i32)>,
+}
 
-fn op_bands(
-) -> &'static Mutex<std::collections::VecDeque<((i32, i32), u64, std::sync::Arc<OpBand>)>> {
-    OP_BANDS.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+static OP_BANDS: OnceLock<Mutex<BandCache>> = OnceLock::new();
+
+fn op_bands() -> &'static Mutex<BandCache> {
+    OP_BANDS.get_or_init(|| {
+        Mutex::new(BandCache {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+impl BandCache {
+    fn get(&self, key: (i32, i32)) -> Option<std::sync::Arc<OpBand>> {
+        self.map.get(&key).map(|(_, b)| b.clone())
+    }
+    /// Insert (or replace) and evict the oldest entry when the bound is passed.
+    fn put(&mut self, key: (i32, i32), version: u64, band: std::sync::Arc<OpBand>) {
+        if self.map.insert(key, (version, band)).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > 256 {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
 }
 
 fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
@@ -13508,12 +13604,11 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
     if __t.is_some() {
         chunkprof::BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Ok(bands) = op_bands().lock() {
-        if let Some((_, e, b)) = bands.iter().find(|(k, _, _)| *k == (cx, cz)) {
-            if *e == epoch {
-                return Some(b.clone());
-            }
-        }
+    // A band is reused while it exists, whatever its build version: writes patch it, so
+    // it is current for the cells it covers (see `band_patch`). Rebuilding on a version
+    // change would rebuild once per leaf write.
+    if let Some(b) = op_bands().lock().unwrap().get((cx, cz)) {
+        return Some(b);
     }
     let reg = crate::block_registry::breg()?;
     let __tr = chunkprof::enabled().then(std::time::Instant::now);
@@ -13525,7 +13620,7 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
         chunkprof::BAND_RANGE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     let rows = (y1 - y0 + 1) as usize;
-    let mut op = vec![0u8; rows << 8];
+    let mut op = vec![0u32; rows << 8];
     // One batched terrain pass per overlapping section, instead of one locked terrain
     // evaluation per cell.
     let __ts = chunkprof::enabled().then(std::time::Instant::now);
@@ -13540,8 +13635,8 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
                 let row = ((y - y0) as usize) << 8;
                 for lz in 0..16usize {
                     for lx in 0..16usize {
-                        let st = sec[((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize];
-                        op[row | (lz << 4) | lx] = reg.opacity_of(st);
+                        op[row | (lz << 4) | lx] =
+                            sec[((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize];
                     }
                 }
             }
@@ -13566,7 +13661,7 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
                 }
                 let lx = (*idx & 15) as usize;
                 let lz = ((*idx >> 4) & 15) as usize;
-                op[(((y - y0) as usize) << 8) | (lz << 4) | lx] = reg.opacity_of(*st);
+                op[(((y - y0) as usize) << 8) | (lz << 4) | lx] = *st;
             }
         }
     }
@@ -13575,14 +13670,11 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
         chunkprof::BAND_NEW.fetch_add(1, Ordering::Relaxed);
         chunkprof::BAND_CELLS.fetch_add((rows << 8) as u64, Ordering::Relaxed);
     }
-    let band = std::sync::Arc::new(OpBand { y0, y1, op });
-    {
-        let mut bands = op_bands().lock().unwrap();
-        if bands.len() >= 256 {
-            bands.pop_front();
-        }
-        bands.push_back(((cx, cz), epoch, band.clone()));
-    }
+    let band = std::sync::Arc::new(OpBand { y0, y1, cells: op });
+    op_bands()
+        .lock()
+        .unwrap()
+        .put((cx, cz), epoch, band.clone());
     if let Some(t) = __t {
         chunkprof::BAND_NS.fetch_add(
             t.elapsed().as_nanos() as u64,
@@ -13590,6 +13682,39 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
         );
     }
     Some(band)
+}
+
+/// The state at `(x, y, z)` from the chunk's band, when the band is current for that
+/// chunk and covers the cell. `None` means the caller must fall back to the overlay or to
+/// a worldgen evaluation.
+/// Keep a chunk's band in step with a write. Cells outside the band are not tracked
+/// there (readers fall back), and a chunk with no band yet needs nothing: its first build
+/// reads the world as it is then.
+fn band_patch(x: i32, y: i32, z: i32, st: u32) {
+    let (cx, cz) = (x >> 4, z >> 4);
+    let mut bands = op_bands().lock().unwrap();
+    let Some((_, slot)) = bands.map.get_mut(&(cx, cz)) else {
+        return;
+    };
+    let band = std::sync::Arc::make_mut(slot);
+    if y < band.y0 || y > band.y1 {
+        return;
+    }
+    band.cells[(((y - band.y0) as usize) << 8) | (((z & 15) as usize) << 4) | (x & 15) as usize] =
+        st;
+}
+
+fn band_state(x: i32, y: i32, z: i32) -> Option<u32> {
+    if !worldgen::enabled() {
+        return None;
+    }
+    let (cx, cz) = (x >> 4, z >> 4);
+    // No version check: the band is write-through (`band_patch` above patches every
+    // `set_block_if`), so a band that exists is current for the cells it covers. Asking
+    // for the version here would make every leaf write invalidate the chunk whose band the
+    // same write has just been applied to.
+    let band = op_band(cx, cz, chunk_version(cx, cz))?;
+    band.get(y, (x & 15) as usize, (z & 15) as usize)
 }
 
 /// Opacity of the world block at `(x, y, z)` without one locked terrain evaluation per
@@ -13629,38 +13754,24 @@ fn install_band_rows(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
     if sy + 15 < y0 || sy > y1 {
         return;
     }
-    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
+    let epoch = chunk_version(cx, cz);
     let mut bands = op_bands().lock().unwrap();
-    let pos = match bands.iter().position(|(k, _, _)| *k == (cx, cz)) {
-        Some(i) => i,
-        None => {
-            if bands.len() >= 256 {
-                bands.pop_front();
-            }
-            let rows = (y1 - y0 + 1) as usize;
-            bands.push_back((
-                (cx, cz),
-                epoch,
-                std::sync::Arc::new(OpBand {
-                    y0,
-                    y1,
-                    op: vec![0u8; rows << 8],
-                }),
-            ));
-            bands.len() - 1
-        }
-    };
-    // A band from an older epoch is incomplete for the new world; rebuild onset.
-    if bands[pos].1 != epoch {
-        bands[pos].1 = epoch;
+    if bands.get((cx, cz)).is_none() {
         let rows = (y1 - y0 + 1) as usize;
-        bands[pos].2 = std::sync::Arc::new(OpBand {
-            y0,
-            y1,
-            op: vec![0u8; rows << 8],
-        });
+        bands.put(
+            (cx, cz),
+            epoch,
+            std::sync::Arc::new(OpBand {
+                y0,
+                y1,
+                cells: vec![0u32; rows << 8],
+            }),
+        );
     }
-    let band = std::sync::Arc::make_mut(&mut bands[pos].2);
+    let Some((_, slot)) = bands.map.get_mut(&(cx, cz)) else {
+        return;
+    };
+    let band = std::sync::Arc::make_mut(slot);
     for ly in 0..16i32 {
         let y = sy + ly;
         if y < band.y0 || y > band.y1 {
@@ -13669,8 +13780,8 @@ fn install_band_rows(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
         let row = ((y - band.y0) as usize) << 8;
         for lz in 0..16usize {
             for lx in 0..16usize {
-                let st = states[((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize];
-                band.op[row | (lz << 4) | lx] = reg.opacity_of(st);
+                band.cells[row | (lz << 4) | lx] =
+                    states[((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize];
             }
         }
     }
@@ -13682,15 +13793,11 @@ fn overlay_band(cx: i32, cz: i32) {
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
-    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
     let mut bands = op_bands().lock().unwrap();
-    let Some(pos) = bands.iter().position(|(k, _, _)| *k == (cx, cz)) else {
+    let Some((_, slot)) = bands.map.get_mut(&(cx, cz)) else {
         return;
     };
-    if bands[pos].1 != epoch {
-        return;
-    }
-    let band = std::sync::Arc::make_mut(&mut bands[pos].2);
+    let band = std::sync::Arc::make_mut(slot);
     let (y0, y1) = (band.y0, band.y1);
     // Copy the edits, then apply them: the guard would otherwise be held while the band
     // rows are written, and the tick thread reads `world()` every tick.
@@ -13710,7 +13817,7 @@ fn overlay_band(cx: i32, cz: i32) {
         }
         let lx = (*idx & 15) as usize;
         let lz = ((*idx >> 4) & 15) as usize;
-        band.op[(((y - y0) as usize) << 8) | (lz << 4) | lx] = reg.opacity_of(*st);
+        band.cells[(((y - y0) as usize) << 8) | (lz << 4) | lx] = *st;
     }
 }
 
@@ -13721,11 +13828,8 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
     if !worldgen::enabled() {
         return reg.opacity_of(block_at(x, y, z));
     }
-    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
-    if let Some(band) = op_band(x >> 4, z >> 4, epoch) {
-        if let Some(op) = band.get(y, (x & 15) as usize, (z & 15) as usize) {
-            return op;
-        }
+    if let Some(st) = band_state(x, y, z) {
+        return reg.opacity_of(st);
     }
     reg.opacity_of(block_at(x, y, z))
 }
@@ -13737,12 +13841,8 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
 /// per delivered chunk, in **10 calls** — the centre chunk plus the whole 3x3 window,
 /// each of which is the centre of some other chunk's delivery.
 ///
-/// Invalidation: a floor is a function of the blocks in its chunk, so every write into
-/// the world bumps `WORLD_EPOCH` and an entry computed under an older epoch is dropped.
-/// The epoch is world-wide rather than per chunk (an edit anywhere drops every entry):
-/// block writes are rare next to chunk reads, and a stale floor would light the wrong
-/// cells, which is exactly the class of bug this cache must not introduce.
-static WORLD_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Invalidation: a floor is a function of the blocks in its chunk, so an entry is used
+/// only while that chunk's write version has not moved (`bump_world_epoch`).
 static SKY_FLOORS: OnceLock<Mutex<std::collections::VecDeque<((i32, i32), u64, [i32; 256])>>> =
     OnceLock::new();
 
@@ -13750,9 +13850,36 @@ fn sky_floors_cache() -> &'static Mutex<std::collections::VecDeque<((i32, i32), 
     SKY_FLOORS.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
 }
 
-/// Call after any write into `world()`: every cached floor is now suspect.
-fn bump_world_epoch() {
-    WORLD_EPOCH.fetch_add(1, Ordering::Relaxed);
+/// A per-chunk write version. Cached per-chunk data (the state band, the sky floors) is
+/// valid only while this has not moved for *that* chunk.
+///
+/// A world-wide epoch was wrong here for a live server: leaves, crops and fluids write
+/// every tick, so one write anywhere would invalidate every cached band and the next
+/// light pass would rebuild the whole 3x3 (14 ms each). A write only changes its own
+/// chunk's cells, and each cache entry describes one chunk, so the version is per chunk.
+static CHUNK_VERSIONS: OnceLock<Mutex<HashMap<(i32, i32), u64>>> = OnceLock::new();
+static CHUNK_VERSION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn chunk_versions() -> &'static Mutex<HashMap<(i32, i32), u64>> {
+    CHUNK_VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn chunk_version(cx: i32, cz: i32) -> u64 {
+    chunk_versions()
+        .lock()
+        .unwrap()
+        .get(&(cx, cz))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Call after any write into `world()` at `(x, z)`: that chunk's caches are now suspect.
+fn bump_world_epoch(x: i32, z: i32) {
+    let seq = CHUNK_VERSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    chunk_versions()
+        .lock()
+        .unwrap()
+        .insert((x >> 4, z >> 4), seq);
     if chunkprof::enabled() {
         chunkprof::EPOCH_BUMPS.fetch_add(1, Ordering::Relaxed);
     }
@@ -13760,7 +13887,7 @@ fn bump_world_epoch() {
 
 fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32; 256] {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
-    let epoch = WORLD_EPOCH.load(Ordering::Relaxed);
+    let epoch = chunk_version(cx, cz);
     {
         let cache = sky_floors_cache().lock().unwrap();
         if let Some((_, e, f)) = cache.iter().find(|(k, _, _)| *k == (cx, cz)) {
@@ -22948,6 +23075,9 @@ pub(crate) mod tickprof {
     use std::sync::OnceLock;
     static NS: OnceLock<Mutex<Vec<(&'static str, u64)>>> = OnceLock::new();
     pub(super) static TICKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static HOT_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FORCED_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static GEN_TICKS: AtomicU64 = AtomicU64::new(0);
     pub(super) static PLATE_SPOTS: AtomicU64 = AtomicU64::new(0);
     pub(super) static PLATE_ON: AtomicU64 = AtomicU64::new(0);
     pub(super) static PLATE_OFF: AtomicU64 = AtomicU64::new(0);
@@ -22988,7 +23118,10 @@ pub(crate) mod tickprof {
             }
         }
         eprintln!(
-            "TICKPROF   counters: spots/tick={:.1} plate_on={:.2} plate_off={:.2}",
+            "TICKPROF   counters: hot/tick={:.0} forceloaded/tick={:.0} gen_leaf_ticks/tick={:.0} spots/tick={:.1} plate_on={:.2} plate_off={:.2}",
+            HOT_N.load(Ordering::Relaxed) as f64 / n,
+            FORCED_N.load(Ordering::Relaxed) as f64 / n,
+            GEN_TICKS.load(Ordering::Relaxed) as f64 / n,
             PLATE_SPOTS.load(Ordering::Relaxed) as f64 / n,
             PLATE_ON.load(Ordering::Relaxed) as f64 / n,
             PLATE_OFF.load(Ordering::Relaxed) as f64 / n
@@ -23362,13 +23495,10 @@ fn main() {
                 std::fs::write(tick_path, ticks).expect("write generated leaf tick dump");
             }
             if let Ok(path) = std::env::var("MC_SPINE_WG_FLUID_TICKS") {
-                let ticks = worldgen::with_gen(|g| {
-                    g.generated_fluid_ticks()
-                        .iter()
-                        .map(|(p, id)| format!("{}\t{}\t{}\t{id}\n", p.0, p.1, p.2))
-                        .collect::<String>()
-                })
-                .expect("generator required for fluid tick dump");
+                let ticks = worldgen::take_generated_fluid_ticks()
+                    .iter()
+                    .map(|(p, id)| format!("{}\t{}\t{}\t{id}\n", p.0, p.1, p.2))
+                    .collect::<String>();
                 std::fs::write(path, ticks).expect("write generated fluid tick dump");
             }
             if let Ok(runtime_path) = std::env::var("MC_SPINE_WG_LEAF_RUNTIME_DUMP") {
