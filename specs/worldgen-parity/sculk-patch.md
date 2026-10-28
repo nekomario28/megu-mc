@@ -482,6 +482,41 @@ java.lang.IllegalStateException: Missing key in ResourceKey[minecraft:root / min
 面構成も同じ）、量が ~25% ずれる。決定は 1 回の spread 呼び出しの中で、その瞬間の
 セル状態に依存する — これは最終セルからは復元できない。
 
+## パッチ数を絞った比較（count=1、マージン付き 4x4）— 2026-10-28
+
+洞穴帯に絞った `count=1`（1 chunk 1 patch）で 4x4（マージン1）を取ると:
+
+| | sculk | sculk_vein | catalyst | 合計 |
+|---|---|---|---|---|
+| 参照 | 386 | 209 | 0 | **595** |
+| port | 416 | 203 | 2 | **621** |
+
+missing 275 / extra 301。**総量は +4%、vein は −3%** で、count=256 のときの −31% より
+はるかに近い。つまり**パッチ数が増えるほど deficit が積み上がる**（1 パッチあたりの
+差が、候補数に比例して増幅する）形。
+
+**最初に D（最終状態が食い違うセル）に触れた書き込みを実行順で見ると**、両方向が出る:
+
+- `feature=0,7`（`sculk_vein` feature）が置いた vein を port は後で air に decay し、
+  vanilla は保持（`-282,-29,1770`）→ **port の方が decay が進む**場合
+- `feature=1,6`（ore の step）が書いた gravel が port の最終状態で残り、vanilla は
+  sculk（`-267,-36,1769` ほか）→ **port のパッチが vanilla の覆ったセルを覆えていない**
+
+どちらも「パッチのカーソルがどこを回ったか」の差で、規則の差ではない（述語 3 つは
+load-bearing、変換入力は正しい、vein の面構成も同じ、をすべて実測済み）。
+
+## 次の道: running-server context で native の中間状態を観測する
+
+harness は 2 段目の障害（動的 biome registry）で閉じている。中間状態（各 update の
+cursor pos / charge / facings）を native から取る唯一の現実的な道は、
+**参照サーバーに開発用の probe mod を載せて `SculkSpreader$ChargeCursor.update` を
+ログする**こと。このリポジトリには既に `--features fabric-probe` と
+`specs/mod-compatibility/` の足場があり、参照は固定 jar なので mod 側の版も固定できる。
+port 側は `SPC_CALLS` / `SPC_TRACE_CELL` で同じ形（pos/charge/facings/判断）を既に出せる
+ので、**両側のトレースを index で突き合わせる**のが次の比較単位になる。
+
+これは「推論ではなく証拠で閉じる」唯一の残った道で、作業量は probe mod 1 本。
+
 ## 未検証として残ること
 
 - port は入ったが **未検証**（missing 209 / extra 241）。この文書は調査記録と比較経路・
