@@ -786,6 +786,42 @@ native 側は別のもの（49 を bound とする draw）に進んでいる。*
 （一致長の内訳を「位置何個分か」に分解するのが次の計測: 1位置あたり3本 = `(16,16,321)` なので
 24本 = 8位置分で、そこから先が食い違う）。
 
+## placement pipeline は sculk patch について完全一致（2026-10-28、実測）
+
+draw レベルで 24 本一致した先の分岐を追うために、**配置候補と biome フィルタの判定**を両側で
+突き合わせた（native は `-Dbiomefchunk=-16,112` の `BIOMEF x y z ok feature=<gi>,<step>`、
+port は `BIOMEF_TRACE=-16,112`、`tools/sculk_capture.sh --jvm-opt=` で JVM プロパティを渡す）。
+
+`minecraft:sculk_patch_deep_dark`（placement は `count:256` + `in_square` + `height_range` +
+`biome`）の chunk (-16,112)、pass (-16,112) について:
+
+| 指標 | native | port | 一致 |
+|---|---|---|---|
+| 配置候補の位置集合（`count:256`） | 256 | 256 | **完全一致** ✓ |
+| biome フィルタの判定 | 256 | 256 | **256/256 一致** ✓ |
+| 採用された位置（feature が走る） | 21 | 21 | **完全一致** ✓ |
+
+つまり **位置の生成（`in_square`+`height_range` の draw）・高さ・biome 判定・採用数のすべてが
+一致**している。placement pipeline はこの feature について正しい。
+
+### 先に踏んだ罠（記録）
+
+最初に `feature=3,7` を両側で突き合わせて「位置集合が 109/600 しか共通でない」という数字を出した
+が、**port 側の `3,7` は `minecraft:pointed_dripstone` で sculk ではなかった**（`SATTEMPT` trace で
+確認）。同じ `(gi,step)` ラベルが別の feature を指していた。ラベルが同じであることは意味である
+ことの証拠ではないので、比較前に feature の同一性を必ず確認する。
+
+### 24 本一致の先の分岐について（新しい作業仮説）
+
+候補集合・判定・採用集合が一致しているのに draw 列が 25 本目で割れる（port `nextInt(16)=12` /
+native `nextInt(49)=6`）ので、**候補の「順序」が違う**可能性が高い。ただし **native 側の `BIOMEF` は
+`System.out`（= log4j）に出ているため行順がプログラム順でない**（このページで既に計測済み）ので、
+順序の比較は今のデータではできない。
+
+次の1手: `CarveLog.biomef` の出力を `SculkLog` の**順序保証付き writer** に移し、1 capture 取って
+候補位置の**列**を両側で突き合わせる（集合は一致しているので、違いは順序か、feature 実行の
+タイミングだけのはず）。
+
 ## 効率化の基盤（2026-10-28）
 
 このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。

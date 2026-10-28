@@ -9,6 +9,7 @@
 #
 # Usage: tools/sculk_capture.sh <tag> [--chunk CX CZ] [--n N] [--mode features]
 #                               [--jar PATH] [--settle SECONDS] [--no-sanity]
+#                               [--jvm-opt -Dfoo=bar]...   (repeatable; passed to the server JVM)
 # Output: the trace path on stdout; provenance and the fixture log beside it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -21,6 +22,7 @@ MODE=features
 JAR=""
 SETTLE=75
 RUN_SANITY=1
+EXTRA_OPTS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --chunk) CHUNK_X=$2; CHUNK_Z=$3; shift 3 ;;
@@ -29,7 +31,12 @@ while [ $# -gt 0 ]; do
     --jar) JAR=$2; shift 2 ;;
     --settle) SETTLE=$2; shift 2 ;;
     --no-sanity) RUN_SANITY=0; shift ;;
+    --jvm-opt) EXTRA_OPTS="$EXTRA_OPTS $2"; shift 2 ;;
+    # `--jvm-opt=-Dfoo=bar` as well: the usage line shows the `=` form, and a mismatch between
+    # what the usage shows and what the parser accepts silently made the *value* become the tag.
+    --jvm-opt=*) EXTRA_OPTS="$EXTRA_OPTS ${1#--jvm-opt=}"; shift ;;
     -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    --*) echo "sculk_capture: unknown option $1" >&2; exit 2 ;;
     *) TAG=$1; shift ;;
   esac
 done
@@ -64,7 +71,7 @@ JAR_SHA="$(sha256sum "$JAR" | cut -d' ' -f1)"
 echo "sculk_capture: capturing $TAG (chunk $CHUNK_X,$CHUNK_Z x$N, mode $MODE, settle ${SETTLE}s)" >&2
 FIXTURE_DIR="$FIXTURE_DIR" \
 JAVA_AGENT="$JAR" \
-JAVA_OPTS="-Dsculktrace=$TRACE -Dfeaturebox=-265,-47,1780,-257,-38,1790" \
+JAVA_OPTS="-Dsculktrace=$TRACE -Dfeaturebox=-265,-47,1780,-257,-38,1790$EXTRA_OPTS" \
 FIXTURE_SETTLE="$SETTLE" \
   tools/chunk_world_fixture.sh "$TAG" "$CHUNK_X" "$CHUNK_Z" "$N" "$MODE" \
   > "$OUT/fixture-$TAG.log" 2>&1 || {
@@ -84,6 +91,7 @@ fi
   echo "chunk: $CHUNK_X,$CHUNK_Z n=$N mode=$MODE settle=$SETTLE"
   echo "seed: 0 (fixture default)"
   echo "agent: $JAR sha256=$JAR_SHA"
+  echo "extra jvm opts:$EXTRA_OPTS"
   echo "trace: $TRACE"
   echo "fixture log: $OUT/fixture-$TAG.log"
   echo "lines: $(wc -l < "$TRACE")"
