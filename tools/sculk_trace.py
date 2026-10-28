@@ -548,6 +548,53 @@ def cmd_compare_draws(args):
     return 0 if same == len(port) else 1
 
 
+def parse_biomef(path, feature=None):
+    """[(x, y, z, ok)] from `BIOMEF x y z <ok> [biome=<id>] feature=<gi>,<step>` lines.
+
+    Both sides emit this shape - the native via the `eii` hook (gated by `-Dbiomefchunk=cx,cz`,
+    written through `SculkLog.line` so the order is program order) and the port under
+    `BIOMEF_TRACE=cx,cz`. Comparing only the *verdicts* answers "does the filter agree"; comparing
+    the *sequence* answers "are the same candidates visited in the same order", which is a
+    different question and the one that matters when the draw streams part.
+    """
+    out = []
+    pattern = re.compile(r'BIOMEF (-?\d+) (-?\d+) (-?\d+) (true|false)'
+                         r'(?: biome=\S+)? feature=(\d+),(\d+)')
+    for line in Path(path).read_text(errors='replace').splitlines():
+        m = pattern.search(line)
+        if not m:
+            continue
+        if feature is not None and (int(m.group(5)), int(m.group(6))) != feature:
+            continue
+        out.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == 'true'))
+    return out
+
+
+def cmd_compare_biomef(args):
+    feature = tuple(int(v) for v in args.feature.split(','))
+    native = parse_biomef(args.native, feature)
+    port = parse_biomef(args.port, feature)
+    print(f"feature={args.feature}: candidates logged native {len(native)}, port {len(port)}")
+    if not native or not port:
+        print("sculk_trace: one side logged no candidates - check -Dbiomefchunk / BIOMEF_TRACE and "
+              "that the feature index is the same placed feature on both sides (the index is into "
+              "the step list, and two different features can share it)", file=sys.stderr)
+        return 2
+    ns, ps = [c[:3] for c in native], [c[:3] for c in port]
+    na, pa = [c[:3] for c in native if c[3]], [c[:3] for c in port if c[3]]
+    print(f"  position set identical: {set(ns) == set(ps)};  sequence identical: {ns == ps}")
+    print(f"  accepted: native {len(na)}, port {len(pa)}; set identical: {set(na) == set(pa)}; "
+          f"sequence identical: {na == pa}")
+    bad = sum(1 for a, b in zip(native, port) if a[:3] == b[:3] and a[3] != b[3])
+    print(f"  verdict disagreements on aligned positions: {bad}")
+    if ns != ps:
+        i = next((i for i, (a, b) in enumerate(zip(ns, ps)) if a != b), min(len(ns), len(ps)))
+        print(f"  first order difference at {i}: native {ns[i] if i < len(ns) else None} "
+              f"port {ps[i] if i < len(ps) else None}")
+    ok = set(ns) == set(ps) and ns == ps and na == pa and bad == 0
+    return 0 if ok else 1
+
+
 def cmd_patches(args):
     lines = trace_lines(args.log)
     keep = None
@@ -640,6 +687,13 @@ def main():
                    help='probe length (default: the first 6 port draws, then extend)')
     s.set_defaults(func=cmd_compare_draws)
 
+    s = sub.add_parser('compare-biomef',
+                       help='candidate positions and biome-filter verdicts, native vs port')
+    s.add_argument('native')
+    s.add_argument('port')
+    s.add_argument('--feature', required=True, help='gi,step as both sides log it')
+    s.set_defaults(func=cmd_compare_biomef)
+
     s = sub.add_parser('patches', help='patch-scoped cursor rows (needs an ordered trace)')
     s.add_argument('log')
     s.add_argument('--origins')
@@ -655,7 +709,7 @@ def main():
     for name in ['trace', 'native']:
         path = getattr(args, name, None)
         if isinstance(path, str) and reads_unordered(path) and args.cmd in (
-                'passes', 'windows', 'draws', 'patches', 'compare-passes'):
+                'passes', 'windows', 'draws', 'patches', 'compare-passes', 'compare-biomef'):
             print(f"sculk_trace: refusing {args.cmd} on {path}: it is a game log and its line order "
                   f"is not program order (pass --allow-unordered only for set questions)",
                   file=sys.stderr)

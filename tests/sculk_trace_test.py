@@ -265,6 +265,56 @@ SPATCH -248 -63 1816
             self.assertEqual(rc, 1)
 
 
+class CompareBiomef(unittest.TestCase):
+    """Candidate sequence and verdicts: the set can match while the order does not."""
+
+    NATIVE = """\
+BIOMEF -241 216 1803 false feature=1,7
+BIOMEF -244 92 1798 false feature=1,7
+BIOMEF -256 134 1806 true feature=1,7
+BIOMEF -248 81 1795 true feature=1,7
+BIOMEF -230 10 1799 false feature=1,7
+"""
+
+    def _args(self, native, port, feature='1,7'):
+        return type('A', (), {'native': str(native), 'port': str(port), 'feature': feature})
+
+    def test_identical_sides_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = write(tmp, "native.txt", self.NATIVE)
+            port = write(tmp, "port.log",
+                         self.NATIVE.replace("feature=1,7", "biome=minecraft:forest feature=1,7"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = st.cmd_compare_biomef(self._args(native, port))
+            self.assertEqual(rc, 0)
+            self.assertIn("sequence identical: True", out.getvalue())
+
+    def test_reordered_candidates_are_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = self.NATIVE.splitlines()
+            lines[0], lines[3] = lines[3], lines[0]
+            native = write(tmp, "native.txt", "\n".join(lines) + "\n")
+            port = write(tmp, "port.log", self.NATIVE)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = st.cmd_compare_biomef(self._args(native, port))
+            self.assertEqual(rc, 1)
+            self.assertIn("sequence identical: False", out.getvalue())
+            self.assertIn("first order difference", out.getvalue())
+
+    def test_a_different_verdict_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = write(tmp, "native.txt", self.NATIVE)
+            port = write(tmp, "port.log",
+                         self.NATIVE.replace("-256 134 1806 true", "-256 134 1806 false"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = st.cmd_compare_biomef(self._args(native, port))
+            self.assertEqual(rc, 1)
+            self.assertIn("verdict disagreements on aligned positions: 1", out.getvalue())
+
+
 class ComparePasses(unittest.TestCase):
     def test_identical_passes_report_as_identical(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -195,7 +195,9 @@ public class CarveLog {
         if ((x >> 4) != Integer.parseInt(a[0]) || (z >> 4) != Integer.parseInt(a[1])) return;
         if (!overworld()) return;
         int[] f = FEAT.get();
-        System.out.println("BIOMEF " + x + " " + y + " " + z + " " + ok + " feature=" + f[0] + "," + f[1]);
+        // through SculkLog's ordered writer: the candidate *sequence* is what is compared, and
+        // log4j does not preserve a thread's line order
+        SculkLog.line("BIOMEF " + x + " " + y + " " + z + " " + ok + " feature=" + f[0] + "," + f[1]);
     }
 
     /** `FeatureSorter.buildFeaturesPerStep`'s biome list, in iteration order. */

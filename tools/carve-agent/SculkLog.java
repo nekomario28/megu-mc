@@ -47,6 +47,19 @@ public class SculkLog {
         return writer;
     }
 
+    /**
+     * A line from another logger, so it lands in the same order-preserving file.
+     *
+     * `CarveLog` writes through `System.out`, i.e. log4j, whose console appender does not keep a
+     * thread's line order (measured: a sculk window holding none of its own draws while the same
+     * thread's stream held 41208 of them). Any trace whose *sequence* is read has to come through
+     * here - `BIOMEF` is one: comparing the candidate *order* against the port's is the next
+     * measurement for the draw-25 divergence, and it is unanswerable from `run.log`.
+     */
+    public static void line(String text) {
+        out(text);
+    }
+
     private static void out(String line) {
         if (Boolean.getBoolean("sculkquiet")) return;
         synchronized (LOCK) {
