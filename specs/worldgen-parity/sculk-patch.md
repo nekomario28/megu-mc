@@ -669,6 +669,53 @@ chunk 集合が違う**だけだった。両側が実際に試行した origin �
    `SPLACE <place-x> <place-z> <pos-x> <pos-y> <pos-z>` を足すのが次の計測（パターンは
    `edi` フックと同じ）。
 
+## パス単位で突き合わせる（2026-10-28、ここで初めて apples-to-apples になった）
+
+前節の per-chunk 比較は**間違った粒度**だった。バニラの
+`ChunkGenerator.applyBiomeDecoration(WorldGenLevel, ChunkAccess, StructureManager)` は
+**自分のチャンクの 3×3 biome source を1回のパスで装飾する**ので、`PlacedFeature` の配置は
+**source チャンクの座標**でログされ、あるチャンクの配置は 9 個のパスに散らばる。したがって:
+
+- 両側に**パスのマーカー**を入れた。agent は `duz.applyBiomeDecoration` の入口で
+  `SPASS <cx> <cz>`（`SculkLog.pass`）、port は `populate` の頭で同じ `SPASS`。
+- 両側に**配置試行の列**を入れた。agent は `ebq.placeWithBiomeCheck` の入口で
+  `SPLACE <feature-class> <cx> <cz>`（`SculkLog.place`）、port は
+  `SATTEMPT <feature-name> <cx> <cz> <gi> <step>`（`FEATURE_ATTEMPT_TRACE=1`）。
+- 注: `SPLACE` が出すのは **feature のクラス**であって配置 feature id ではない（`edi` は
+  `minecraft:sculk_patch` に固有なので sculk の比較はこれで足りるが、鉱石系は 1 クラスに
+  数十 id が乗る。実測: chunk (-16,112) の native 配置試行 550 件は **14 クラス**にしか
+  割れない）。
+
+`SPASS` で切って sculk patch の**試行 origin 集合**を比べた結果（native capture mk8、
+port は同じ箱の dump）:
+
+| 指標 | 値 |
+|---|---|
+| パス数 | native 130 / port 100、共通 **49** |
+| **試行集合が完全一致したパス** | **27 / 49** |
+| 共通パスの sculk 試行数 | native 1193 / port 1231 |
+| 一致するパスの例 | pass (-16,111) 33/33 **shared 33**、pass (-16,112) 21/21 **shared 21**、pass (-16,113) 32/32 **shared 32** |
+| 食い違うパスの例 | pass (-17,113) native 28 / port 38、**shared 6** |
+
+つまり**パスによっては完全一致（27/49）し、別のパスでは大きく食い違う**。パス1回の中で
+feature は1本の RNG stream を共有するので、この形は「**そのパスの、sculk より先に走る
+feature のどれかが乱数を違う量だけ消費している**」ことを示す。一致するパスでは上流も一致し
+ている。
+
+次の計測（未着手）: 食い違うパス（例 (-17,113)）で**最初にずれる feature** を特定する。
+2ルートあり、`SPLACE` の粒度不足（上記）を考えると後者が本命:
+
+1. 配置 feature の同一性を出す（`ebq` の config オブジェクトを何かで同定する）
+2. **配置 RNG の draw を出す**（`dzz`=`XoroshiroRandomSource` / `dyz`=`LegacyRandomSource`
+   の `nextInt` 系の戻り値を `SDRAW` としてログする）。port 側は既に
+   `DRAW n f=<gi>,<step> kind=value`（`FSEED_ARM` + `FEATURE_DRAW_LIMIT`）を持つので、
+   名前の対応表が要らずに draw 列そのものを突き合わせられる。
+
+計測の射程: これらのフックは state を**読むだけ**（`getfield` / `getClass().getName()` /
+`println`）で、状態を書き換えない。ただし「出力が変わらないこと」を**計測で**示したのは
+mk6 capture（`SCURSOR` 28175 行が hook 前後で一致）までで、mk7/mk8 のフックについては
+静的な論拠のみ（capture 間で行数が動くため、行数比較では control にならない）。
+
 ## native trace の再現性（2026-10-28、2 capture で実測）
 
 同じ fixture（seed 0、chunk (-16,112)、agent 付き、`FIXTURE_SETTLE=75`）を**2回**取り直して

@@ -37,6 +37,29 @@ public class SculkLog {
         System.out.println("SSPREADALL types=" + types + " r=" + round + " i=" + (idx - 1));
     }
 
+    /** `ChunkGenerator.applyBiomeDecoration` entry: the chunk whose decoration pass this is.
+     *
+     * One pass covers the 3x3 biome sources around its chunk (vanilla's `ChunkPos.rangeClosed`),
+     * so the `SPLACE` lines of a chunk are logged under nine different base positions and only
+     * the pass marker says which decoration pass they belong to.
+     */
+    public static void pass(int cx, int cz) {
+        if (Boolean.getBoolean("sculkquiet")) return;
+        System.out.println("SPASS " + cx + " " + cz);
+    }
+
+    /** `PlacedFeature.placeWithBiomeCheck` entry: which feature is attempted, in which chunk.
+     *
+     * One line per attempt, in attempt order, so the *placement pipeline* can be compared with
+     * the port's `SATTEMPT` trace. The feature arrives as its class name (the logger lives in the
+     * bootstrap loader and cannot reference a game class); the chunk is derived from the base
+     * position the chunk generator passes in.
+     */
+    public static void place(String featureClass, int cx, int cz) {
+        if (Boolean.getBoolean("sculkquiet")) return;
+        System.out.println("SPLACE " + featureClass + " " + cx + " " + cz);
+    }
+
     /** `SculkPatchFeature.place` entry: the patch's origin, so a run's trace splits by patch. */
     public static void patch(int x, int y, int z) {
         if (Boolean.getBoolean("sculkquiet")) return;

@@ -23,6 +23,16 @@ Sculk hook (the sculk cursor/parity work in `specs/worldgen-parity/sculk-patch.m
 - `dmu$a` (`SculkSpreader$ChargeCursor`) / its update hook logs `SCURSOR r=<round> i=<index>
   x y z charge decayDelay updateDelay facingMask` and `SSPREAD`/`SSPREADALL`/`SCMARK` around
   the spread calls.
+- `duz` (`ChunkGenerator`) / `applyBiomeDecoration(WorldGenLevel, ChunkAccess,
+  StructureManager)`: at method entry, logs `SPASS cx cz` with the decorated chunk. One pass
+  decorates the 3x3 biome sources around its chunk, so a chunk's placements are logged under
+  nine different base positions and only the pass marker groups them correctly. The port emits
+  the same marker from `populate` (`FEATURE_ATTEMPT_TRACE=1`).
+- `ebq` (`PlacedFeature`) / `placeWithBiomeCheck(ServerLevelAccessor, ChunkGenerator,
+  RandomSource, BlockPos)`: at method entry, logs `SPLACE <feature-class> <cx> <cz>`, one line
+  per attempt. The feature arrives as its *class* - `edi` is unique to `minecraft:sculk_patch`,
+  but e.g. one ore class carries dozens of placed feature ids (measured: 550 attempts in one
+  chunk over 14 classes), so this identifies a feature type, not a placed feature.
 - `edi` (`SculkPatchFeature`) / `place(FeaturePlaceContext)`: at method entry, logs
   `SPATCH x y z` with `ecg.e()` (the placement origin). The trace of a run splits by patch on
   these, which is what makes two runs comparable: captures order patches differently and `r`

@@ -8168,6 +8168,12 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         }
     }
     let pop = pop_seed(g.wseed(), sx * 16, sz * 16);
+    // Pass marker, matching the agent's `SPASS` (a hook on `ChunkGenerator.applyBiomeDecoration`):
+    // the native side logs a chunk's placements under the nine base positions of its 3x3 biome
+    // sources, so only the pass marker makes the two sides' attempt lists comparable.
+    if env_str!("FEATURE_ATTEMPT_TRACE").is_some() {
+        eprintln!("SPASS {sx} {sz}");
+    }
     crate::generation_math::CUR_POP_CHUNK.store(
         ((sx as i64) << 32) | (sz as i64 & 0xFFFF_FFFF),
         std::sync::atomic::Ordering::Relaxed,
@@ -8190,6 +8196,13 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             let Some(pf) = fr.placed.get(name) else {
                 continue;
             };
+            // Feature-attempt trace, for comparing the *placement pipeline* with the native side
+            // (`SPLACE` from the agent's `ebq.a` hook): one line per (chunk, placed feature) in
+            // the order they are attempted, which is what localises an RNG-stream divergence to
+            // the first feature that differs. `FEATURE_ATTEMPT_TRACE=1`.
+            if env_str!("FEATURE_ATTEMPT_TRACE").is_some() {
+                eprintln!("SATTEMPT {name} {sx} {sz} {gi} {step}");
+            }
             let deco = pop
                 .wrapping_add(*gi as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));

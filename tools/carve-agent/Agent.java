@@ -1130,6 +1130,93 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("duz".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        // `ChunkGenerator.applyBiomeDecoration(WorldGenLevel, ChunkAccess,
+                        // StructureManager)`: log the decorated chunk, so the placement lines of
+                        // a pass can be told apart from the 8 neighbouring passes that log the
+                        // same biome sources.
+                        if (!mn.equals("a") || !md.equals("(Ldds;Lduy;Lddq;)V")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.ALOAD, 2);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "duy", "f", "()Ldcd;",
+                                        false);
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "e", "I");
+                                super.visitInsn(Opcodes.SWAP);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "f", "I");
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "pass",
+                                        "(II)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT duz decoration-pass hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT duz decoration-pass hook failed: " + t);
+                return null;
+            }
+        }
+        if ("ebq".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        // `PlacedFeature.placeWithBiomeCheck(ServerLevelAccessor, ChunkGenerator,
+                        // RandomSource, BlockPos)`: log the feature class and the chunk it is
+                        // attempted in, at entry, one line per attempt.
+                        if (!mn.equals("a") || !md.equals("(Ldds;Lduz;Layw;Ljd;)Z")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.ALOAD, 0);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ebq", "b", "()Lece;",
+                                        false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Object",
+                                        "getClass", "()Ljava/lang/Class;", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Class",
+                                        "getName", "()Ljava/lang/String;", false);
+                                super.visitVarInsn(Opcodes.ALOAD, 4);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "u", "()I", false);
+                                super.visitInsn(Opcodes.ICONST_4);
+                                super.visitInsn(Opcodes.ISHR);
+                                super.visitVarInsn(Opcodes.ALOAD, 4);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "w", "()I", false);
+                                super.visitInsn(Opcodes.ICONST_4);
+                                super.visitInsn(Opcodes.ISHR);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "place",
+                                        "(Ljava/lang/String;II)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT ebq placement hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT ebq placement hook failed: " + t);
+                return null;
+            }
+        }
         if ("edi".equals(name)) {
             try {
                 ClassReader cr = new ClassReader(buf);
