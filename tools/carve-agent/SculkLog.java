@@ -102,6 +102,10 @@ public class SculkLog {
      * the pass marker says which decoration pass they belong to.
      */
     public static void pass(int cx, int cz) {
+        // also recorded on the thread, because a placement window carries no coordinates of its own
+        // and two instruments (`BIOMEF` and `SPWINDOW`) have to be joinable to be reconciled
+        PASS.get()[0] = cx;
+        PASS.get()[1] = cz;
         if (Boolean.getBoolean("sculkquiet")) return;
         out("SPASS " + cx + " " + cz);
     }
@@ -163,12 +167,34 @@ public class SculkLog {
      * window held 769 - a comparison between different units, not a difference in behaviour.
      */
     public static void windowStart() {
-        out("SPWINDOW start");
+        WIN.get()[1]++;                    // depth: placements nest
+        if (WIN.get()[1] == 1) {
+            WIN.get()[0] = SERIAL.incrementAndGet();
+        }
+        out("SPWINDOW start s=" + WIN.get()[0] + " d=" + WIN.get()[1]
+                + " pass=" + PASS.get()[0] + "," + PASS.get()[1]);
     }
 
     public static void windowEnd() {
-        out("SPWINDOW end");
+        int depth = WIN.get()[1]--;
+        out("SPWINDOW end s=" + WIN.get()[0] + " d=" + depth);
     }
+
+    /** The window a `BIOMEF`/`SPATCH` line belongs to, so two instruments can be joined.
+     *
+     * This exists because two of them disagreed: `BIOMEF` counted 256 candidates for one chunk's
+     * sculk placement while `SPWINDOW`-delimited windows held at most 381 draws, and no 768-draw
+     * window existed in that pass at all. A contradiction between instruments is not settled by
+     * believing one - it is settled by giving both the same identifier and counting again.
+     */
+    public static int windowSerial() {
+        return WIN.get()[0];
+    }
+
+    private static final java.util.concurrent.atomic.AtomicInteger SERIAL =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private static final ThreadLocal<int[]> WIN = ThreadLocal.withInitial(() -> new int[]{0, 0});
+    private static final ThreadLocal<int[]> PASS = ThreadLocal.withInitial(() -> new int[]{0, 0});
 
 
     /** The class of the `RandomSource` a placement was handed. */
@@ -232,7 +258,7 @@ public class SculkLog {
     /** `SculkPatchFeature.place` entry: the patch's origin, so a run's trace splits by patch. */
     public static void patch(int x, int y, int z) {
         if (Boolean.getBoolean("sculkquiet")) return;
-        out("SPATCH " + x + " " + y + " " + z);
+        out("SPATCH " + x + " " + y + " " + z + " s=" + windowSerial());
     }
 
     public static void cursor(int x, int y, int z, int charge, int decayDelay, int updateDelay,

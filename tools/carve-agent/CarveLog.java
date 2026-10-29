@@ -197,7 +197,8 @@ public class CarveLog {
         int[] f = FEAT.get();
         // through SculkLog's ordered writer: the candidate *sequence* is what is compared, and
         // log4j does not preserve a thread's line order
-        SculkLog.line("BIOMEF " + x + " " + y + " " + z + " " + ok + " feature=" + f[0] + "," + f[1]);
+        SculkLog.line("BIOMEF " + x + " " + y + " " + z + " " + ok + " feature=" + f[0] + "," + f[1]
+                + " s=" + SculkLog.windowSerial());
     }
 
     /** `FeatureSorter.buildFeaturesPerStep`'s biome list, in iteration order. */
