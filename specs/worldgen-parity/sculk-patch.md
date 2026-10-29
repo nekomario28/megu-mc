@@ -1214,6 +1214,50 @@ nextInt(321)`）は native と1本も違わない** ✓✓。
 残っているのは **feature 内の draw**（`edi` は entry を通ったパッチごとに `nextFloat` を1本引く）と
 cursor 側で、そこの比較も同じ手順（同一 pass・同一窓）で行えばよい。
 
+## 現時点の cell ゲートと、失敗の**形**（2026-10-28）
+
+合格条件である `tools/sculk_gate.py --require-match` を、いまのビルドで取り直した
+（native `chunk_world_fixture.sh gate -16 112 2 features` / port `--n 2 --x -16 --z 112`）:
+
+| | sculk | sculk_vein | sculk_catalyst | 合計 |
+|---|---|---|---|---|
+| reference（native） | 175 | 125 | 1 | **301** |
+| port | **348** | **78** | 1 | 427 |
+
+`missing 130 / extra 256 / wrong-state 1` → **387 セル不一致で FAIL（exit 1）**。ただし数字の
+**形**が具体的で、原因の層を指している:
+
+```
+missing: -254,-44,1792 vanilla sculk_vein port air       ← port が vein を置くべき所に置いていない
+extra:   -253,-45,1792 vanilla sculk      port deepslate ← port が sculk を作るべきでない所に作っている
+wrong-state: -236,-51,1792 vanilla sculk  port sculk_catalyst
+```
+
+すなわち **port は sculk 過多・vein 過少** = 1回の spread で **`SculkBlock`（sculk 化）を選びすぎ、
+`SculkVeinBlock`（vein 設置）を選び足りない**。placement は完全一致（候補・判定・採用・順序・draw 列）
+なので、差はこの **behaviour 選択**の層にある。
+
+### 次の計器（この層を直接見る）
+
+native 側は behaviour 選択の呼び出し地点を既にログしている（この capture での件数）:
+
+| `SCMARK` site | native |
+|---|---|
+| `convert` | 13011 |
+| `one-charge-vein` | 13011 |
+| `one-charge-sculk` | 6316 |
+| `attempt-vein` | 2002 |
+| `SSPREADALL types=3` | 28249 |
+| `SSPREADALL types=1` | 520 |
+
+**port には `SCMARK`/`SSPREADALL` が存在しない**（`SCURSOR` だけ）。したがって次の一手は
+**port の cursor 経路に同じ2つのマーカーを足す**こと。そうすれば「同じ窓の中で、どの behaviour が
+何回選ばれたか」を site 単位で突き合わせられ、sculk/vein の比（native 6316:13011 ≈ 1:2）が
+どこで崩れているかが1回の実行で分かる。
+
+（`sculk_port_run.sh` は draw を arm していない実行を `sanity` が正しく拒否するが、cell ゲートには
+draw が不要なので、arm 無しの実行を許可する口を足すのが望ましい。）
+
 ## 効率化の基盤（2026-10-28）
 
 このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。
