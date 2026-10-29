@@ -35,7 +35,8 @@ Sculk hook (the sculk cursor/parity work in `specs/worldgen-parity/sculk-patch.m
   `PlacedFeature` is `eiv`: `eiv.b(...)` is `placeWithBiomeCheck` and `eiv.a(...)` is `place`.
   The placement modifiers run *before* `ConfiguredFeature.place` (inside
   `placeWithBiomeCheck`), so the `SPLACE` window cannot contain the placement's position draws -
-  arming on `eiv.b` is the open next step (`SculkLog.armPlacement` exists for it).
+  the armed window is owned by `eiv.b`, not by each `ebq` call. ConfiguredFeature returns
+  must not disarm it, and nested placement returns must leave the outer window armed.
 - Draw hooks: the legacy sources' bounded draws come from the mixin interface `dyn`
   (`BitRandomSource`), not from the concrete classes - measured 313289 `nextInt(bound)@dyn`
   lines; `dzx.c(I)I` is `next(bits)`, the raw generator (full-range values). The feature arrives as its *class* - `edi` is unique to `minecraft:sculk_patch`,
@@ -57,16 +58,19 @@ default would try to load obfuscated classes.
 ## Build
 
 ```sh
-# the highest ASM in the local cache (9.7 and up all work)
-ASM=$(ls ~/.m2/repository/org/ow2/asm/asm/*/asm-*.jar | sort -V | tail -1)
-mkdir -p c1 c2 j1/META-INF
-javac -nowarn -cp "$ASM" -d c1 tools/carve-agent/Agent.java
-javac -nowarn -d c2 tools/carve-agent/CarveLog.java tools/carve-agent/SculkLog.java
-(cd c2 && jar cf ../carvelog.jar .)
-cp -r c1/* j1/ && (cd c1 && jar xf "$ASM" org) && cp -r c1/org j1/
-printf 'Premain-Class: Agent\n' > j1/META-INF/MANIFEST.MF
-(cd j1 && jar cfm ../carveagent.jar META-INF/MANIFEST.MF .)
+bash tools/build_carve_agent.sh /path/to/new-agent-directory
 ```
+
+The builder verifies jar membership and executes `AgentContractProbe` before publishing
+jars. This runs a transformed ConfiguredFeature return inside an armed placement, including a
+nested placement, so a logger that contains every marker but stops recording too early is refused.
+Set `ASM_JAR` to select an explicit ASM dependency; otherwise the builder searches local caches.
+Do not replace this gate with a hand-retyped compilation recipe.
+
+For a bounded draw capture, `-Dsculkdrawpass=cx,cz` restricts expensive draw/stack traces to
+one decoration pass without suppressing pass, patch, or cursor records. The trace records the
+scope as `SDRAW_SCOPE`; omit the property to record all passes. Port `RAW_DRAW` records belong
+to positional RNGs, not the native `@dyn` WorldgenRandom stream, and the comparator reports their exclusion.
 
 `SculkLog` writes to its own file, not stdout: `-Dsculktrace=<path>` (default
 `sculk-trace.txt`). The game routes stdout through log4j, whose console appender does not

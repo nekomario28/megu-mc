@@ -32,6 +32,8 @@ public class SculkLog {
             try {
                 writer = new java.io.PrintWriter(new java.io.BufferedWriter(
                         new java.io.FileWriter(path, false), 1 << 16));
+                writer.println("[w=" + Thread.currentThread().getName() + "] SDRAW_SCOPE pass="
+                        + System.getProperty("sculkdrawpass", "all"));
             } catch (java.io.IOException e) {
                 throw new RuntimeException(e);
             }
@@ -205,13 +207,19 @@ public class SculkLog {
 
     /** Called before every `return` of `PlacedFeature.placeWithBiomeCheck`. */
     public static void disarm() {
-        ARMED.remove();
+        // windowEnd already decremented depth. A nested placement must not stop
+        // the outer placement's remaining draws.
+        if (WIN.get()[1] == 0) ARMED.remove();
     }
 
     private static final ThreadLocal<Boolean> ARMED = new ThreadLocal<>();
+    // Restrict expensive draw/stack traces without hiding pass/patch/cursor markers.
+    private static final String DRAW_PASS = System.getProperty("sculkdrawpass", "");
 
     private static boolean armed() {
-        return Boolean.TRUE.equals(ARMED.get());
+        int[] pass = PASS.get();
+        return Boolean.TRUE.equals(ARMED.get())
+                && (DRAW_PASS.isEmpty() || DRAW_PASS.equals(pass[0] + "," + pass[1]));
     }
 
     public static void drawI(int value, String kind) {

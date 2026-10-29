@@ -2586,18 +2586,15 @@ pub fn enabled() -> bool {
     GEN_READY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Run `f` against the generator while holding the `GEN` lock. Diagnostics that
-/// need the *feature-facing* accessors live one layer up (they classify block
-/// states, which is generation-context knowledge), so they come through here
-/// instead of reaching for the static - a free function in worldgen would make
-/// worldgen depend on generation_context and close a cycle.
-/// Validate an explicit FEATURES plan for a dump's one-chunk decoration halo.
-/// No entries are silently dropped or reordered; ticket order is caller input.
+/// Validate an explicit FEATURES plan covering a dump's one-chunk decoration halo.
+/// Recorded plans may include additional observed sources; exact plans may not.
+/// Neither mode silently drops or reorders entries.
 pub(crate) fn parse_population_order(
     text: &str,
     ox: i32,
     oz: i32,
     n: i32,
+    allow_extra: bool,
 ) -> Result<Vec<(i32, i32)>, String> {
     if n <= 0 {
         return Err("dump size must be positive".into());
@@ -2623,7 +2620,7 @@ pub(crate) fn parse_population_order(
         let z = fields[1]
             .parse::<i32>()
             .map_err(|_| format!("invalid population z on line {}: {line:?}", i + 1))?;
-        if x < x0 || x > x1 || z < z0 || z > z1 {
+        if !allow_extra && (x < x0 || x > x1 || z < z0 || z > z1) {
             return Err(format!(
                 "population chunk ({x},{z}) is outside ({x0},{z0})..({x1},{z1})"
             ));
@@ -2636,12 +2633,18 @@ pub(crate) fn parse_population_order(
         }
         order.push((x, z));
     }
-    if order.len() != expected {
-        return Err(format!("incomplete population footprint: {} of {expected} source chunks in ({x0},{z0})..({x1},{z1})",order.len()));
+    let covered = seen
+        .iter()
+        .filter(|&&(x, z)| x0 <= x && x <= x1 && z0 <= z && z <= z1)
+        .count();
+    if covered != expected {
+        return Err(format!("incomplete population footprint: {covered} of {expected} source chunks in ({x0},{z0})..({x1},{z1})"));
     }
     Ok(order)
 }
 
+/// Run a diagnostic against the generator under GEN. Feature-facing accessors
+/// stay in the caller's layer to avoid worldgen depending on generation_context.
 pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
     gen_lock().as_mut().map(f)
 }
@@ -7557,15 +7560,42 @@ mod wg_tests {
             .flat_map(|x| (-1..=1).rev().map(move |z| (x, z)))
             .collect();
         let text: String = wanted.iter().map(|(x, z)| format!("{x}\t{z}\n")).collect();
-        assert_eq!(parse_population_order(&text, 0, 0, 1).unwrap(), wanted);
+        assert_eq!(
+            parse_population_order(&text, 0, 0, 1, false).unwrap(),
+            wanted
+        );
         for input in ["", "0 0\n0 0\n", "0 0\n1\n", "unknown 0\n", "9 9\n"] {
             assert!(
-                parse_population_order(input, 0, 0, 1).is_err(),
+                parse_population_order(input, 0, 0, 1, false).is_err(),
                 "must reject {input:?}"
             );
         }
-        assert!(parse_population_order(&text, 0, 0, 0).is_err());
-        assert!(parse_population_order(&text, i32::MIN, 0, 1).is_err());
+        assert!(parse_population_order(&text, 0, 0, 0, false).is_err());
+        assert!(parse_population_order(&text, i32::MIN, 0, 1, false).is_err());
+    }
+
+    #[test]
+    fn recorded_population_plan_preserves_extras_without_hiding_missing_sources() {
+        let core: Vec<_> = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |z| (x, z)))
+            .collect();
+        let mut wanted = vec![(9, 9)];
+        wanted.extend_from_slice(&core);
+        wanted.push((-20, 3));
+        let text: String = wanted.iter().map(|(x, z)| format!("{x}\t{z}\n")).collect();
+        assert_eq!(
+            parse_population_order(&text, 0, 0, 1, true).unwrap(),
+            wanted
+        );
+        assert!(parse_population_order(&text, 0, 0, 1, false).is_err());
+        // Nine entries is not nine required sources: an extra cannot replace a core cell.
+        let missing: String = wanted[..core.len()]
+            .iter()
+            .map(|(x, z)| format!("{x} {z}\n"))
+            .collect();
+        assert!(parse_population_order(&missing, 0, 0, 1, true).is_err());
+        assert!(parse_population_order(&(text.clone() + "9 9\n"), 0, 0, 1, true).is_err());
+        assert!(parse_population_order(&(text + "bad extra\n"), 0, 0, 1, true).is_err());
     }
 
     #[test]

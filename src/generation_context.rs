@@ -22,12 +22,9 @@ pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
     rc: HashMap<(i32, i32, i32), u32>, // terrain read-through cache
-    /// `*_WG` heightmaps, memoized per column. They are not pure functions of the
-    /// terrain — vanilla updates them from every `setBlock` — so `set` drops the written
-    /// column's entries; between writes, re-reading one means re-scanning the column.
-    /// The ore features ask for one per column of a vein's bounding square (about 1500
-    /// per attempt for `ore_iron_upper`), which is why the memo pays. The live
-    /// (`none-WG`) variants are never cached: feature writes move them constantly.
+    /// Frozen pre-CARVERS `*_WG` heightmaps, memoized per column. Feature writes
+    /// do not invalidate this terrain-only view. Live (non-WG) variants are never
+    /// cached: they follow carver and feature writes.
     hmwg: HashMap<(i32, i32, HeightmapKind), i32>,
 
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
@@ -81,13 +78,6 @@ impl<'a> FC<'a> {
         st
     }
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
-        // A write moves the column's worldgen heightmaps too (vanilla updates
-        // `OCEAN_FLOOR_WG`/`WORLD_SURFACE_WG` from every `setBlock`), so the memo above
-        // is not a pure-function cache: drop this column's entries. Neighbouring
-        // columns are untouched by a single write, which is why the key is the column.
-        for kind in [HeightmapKind::OceanFloorWg, HeightmapKind::WorldSurfaceWg] {
-            self.hmwg.remove(&(x, z, kind));
-        }
         if crate::trace_env::env_str!("FEATURE_CELL_TRACE")
             .is_some_and(|want| want.split(';').any(|cell| cell == format!("{x},{y},{z}")))
         {

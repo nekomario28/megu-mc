@@ -5,6 +5,36 @@
 知り直さなくて済むよう、実測した構造・分岐・罠・再利用できる部品を固定する。
 実装は `src/feature.rs` にある。以下は調査履歴を含み、過去の推論には訂正がある。
 
+## 計器とreplayの追加監査（2026-10-29）
+
+`MC_SPINE_POP_ORDER_SCOPE=recorded` は観測した範囲外sourceも順序通り実行する
+診断専用経路。既定のexact範囲制約は維持し、recordedでも必要haloの欠落と重複は拒否する。
+最初のfrozen captureの全145 passesをreplayしても、16件を選択したreplayとdumpは
+byte-identicalで52差分のままだった。省略したsourceが当該52差分の原因という仮説は棄却する。
+
+乱数の計器には別の欠陥があった。`ConfiguredFeature` のreturnが外側のplacementを
+途中でdisarmし、active窓を30 drawsしか記録していなかった。windowのownerは
+`PlacedFeature` に統一し、nested placementのreturnも外側の記録を止めないようにした。
+agentのbuilderは変換後のJavaクラスを実行してこの寿命を検査する。旧計器で失敗することも
+確認した。マーカーの存在だけでは、窓全体を採れている証明にならない。
+
+portでは遅延評価されたraw positional RNGがfeatureの乱数ログに混入していた。
+`RAW_DRAW` とWorldgenRandomの `DRAW` を分離し、比較器は除外したraw drawsの数と型を表示する。
+floatは絶対誤差ではなくJava側のf32/f64に戻したbit列で比較する。
+新しいfrozen captureのpass `(-15,112)` ではactive窓の **12,335 / 12,335 draws** が一致し、
+raw-sourceのfloat 3件を明示的に除外した。これはこの窓の乱数列の証明であり、全セルの証明ではない。
+
+新captureも時刻2→2、runtime writes=0だが、source順は以前と異なる。
+その全145 passesをreplayしたsculk gateは **213差分で失敗**した。
+先の52との差を今回の計器修正のworldgen回帰とは解釈しない。計器分類の前後では、
+この新しい順序に対するport dumpはbyte-identicalだった。nativeの順序をまたぐ再現性と
+残る支持面/catalystの差は未解決。参照スキップも有効にして、
+`minecraft:patch_sugar_cane` の欠落26件をpass付きで記録した。
+この欠落を今回のsculk残差の原因とはまだ判定していない。mainへの統合条件は満たしていない。
+
+また、dump指定だけでは通常serverへfall-throughできたため、offline profile指定が
+欠けたdump要求を保存データに触れる前にexit 2で拒否するCLI回帰ガードを追加した。
+
 ## 追加監査：拡散面と減衰の訂正（2026-10-29）
 
 vanilla 本体と照合し、修正前に失敗する回帰テストで次を確認した。
@@ -37,7 +67,8 @@ active patchの **562 cursor行すべて**が一致した。これは当該patch
 ただしnativeはspawnなどを含め合計145 decoration passesを実行しており、
 16件は全体ではない。trace比較は共有するnonempty 17 patches中16件が一致、
 portに存在しないnonempty 61 patchesのキーを監査出力に列挙した。
-選択範囲外の影響と残る1 patchの分岐は未解決である。
+この時点では選択範囲外の影響も疑ったが、上記の全145 passes replayで
+当該52差分に対する影響は否定した。残るpatchの分岐は未解決である。
 
 また、従来fixtureを既定port順序で比較した差分は **341** であり、
 中間修正時の320より増えた。参照値の正しさをセル総数で判断せず、
@@ -112,7 +143,7 @@ vanilla の逆コンパイル結果は repo 外の cache に保持する。
 
 | config | charge_count | amount_per_charge | spread_attempts | growth_rounds | spread_rounds | catalyst_chance | extra_rare_growths |
 |---|---|---|---|---|---|---|---|
-| `sculk_patch_deep_dark` | 10 | 32 | 64 | **0** | 1 | 0.5 | uniform 1..3 |
+| `sculk_patch_deep_dark` | 10 | 32 | 64 | **0** | 1 | 0.5 | 0 |
 | `sculk_patch_ancient_city` | 10 | 32 | 64 | **0** | 1 | 0.5 | 0 |
 
 **重要**: 両方とも `growth_rounds = 0` なので、pack の config では

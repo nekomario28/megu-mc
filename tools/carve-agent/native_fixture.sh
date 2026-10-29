@@ -39,7 +39,7 @@ mkdir -p "$DIR/agent" "$DIR/world"
 DIR="$(cd "$DIR" && pwd)"
 date -Iseconds > "$DIR/started.txt"
 printf '%s\n' "$MODE" > "$DIR/mode.txt"
-sha256sum "$ROOT/tools/carve-agent/Agent.java" "$ROOT/tools/carve-agent/CarveLog.java" "$ROOT/tools/carve-agent/SculkLog.java" "$ROOT/tools/build_carve_agent.sh" "$ROOT/tools/carve-agent/native_fixture.sh" "$BASE/server.jar" > "$DIR/inputs.sha256"
+sha256sum "$ROOT/tools/carve-agent/Agent.java" "$ROOT/tools/carve-agent/CarveLog.java" "$ROOT/tools/carve-agent/SculkLog.java" "$ROOT/tools/carve-agent/AgentContractProbe.java" "$ROOT/tools/build_carve_agent.sh" "$ROOT/tools/carve-agent/native_fixture.sh" "$BASE/server.jar" > "$DIR/inputs.sha256"
 java -version > "$DIR/java-version.txt" 2>&1
 # One build owner: it discovers the installed ASM and verifies both the hook wiring
 # and CarveLog/SculkLog membership before this capture executes any game code.

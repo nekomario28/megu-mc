@@ -2217,6 +2217,36 @@ fn surface_relative_filter_keeps_its_heightmap_and_long_bounds() {
 }
 
 #[test]
+fn wg_heightmaps_stay_frozen_while_live_heightmaps_follow_writes() {
+    use crate::block_registry::HeightmapKind as H;
+    let reg = breg().unwrap();
+    for warm in [false, true] {
+        let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+        let kinds = [H::WorldSurfaceWg, H::OceanFloorWg];
+        let expected = {
+            let mut baseline = context(&mut g);
+            kinds.map(|kind| baseline.heightmap(kind, 0, 0))
+        };
+        let mut ctx = context(&mut g);
+        if warm {
+            for (kind, height) in kinds.into_iter().zip(expected) {
+                assert_eq!(ctx.heightmap(kind, 0, 0), height);
+            }
+        }
+        // Remove the old terrain tops and add a new feature far above them.
+        for height in expected {
+            ctx.set(0, height - 1, 0, reg.state_of("minecraft:air", None));
+        }
+        ctx.set(0, 240, 0, reg.state_of("minecraft:stone", None));
+        for (kind, height) in kinds.into_iter().zip(expected) {
+            assert_eq!(ctx.heightmap(kind, 0, 0), height, "{kind:?}, warm={warm}");
+        }
+        assert_eq!(ctx.heightmap(H::WorldSurface, 0, 0), 241);
+        assert_eq!(ctx.heightmap(H::OceanFloor, 0, 0), 241);
+    }
+}
+
+#[test]
 fn heightmap_types_keep_their_predicates_and_removed_tops() {
     use crate::block_registry::HeightmapKind as H;
     let reg = breg().unwrap();

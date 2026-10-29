@@ -27,15 +27,16 @@ def run_case(cargo_output, cargo_status, *, missing_anchor=False, leftover=False
         for name in ["mutation_check.sh", "cargo_executable.py"]:
             shutil.copy2(ROOT / "tools" / name, root / "tools" / name)
         script = root / "tools/mutation_check.sh"
-        wire_calls = re.findall(r"tests/(\w+\.py) '([^']+)'", script.read_text())
+        cli_calls = re.findall(r"tests/(\w+\.py) '([^']+)'", script.read_text())
         backends = {"client_settings_wire.py": "client settings wire: PASS",
                     "gameplay_wire.py": "gameplay wire: PASS",
-                    "container_wire.py": "containers wire: PASS"}
-        # Match identities, not a frozen count: a new wire gate needs a fake backend too.
+                    "container_wire.py": "containers wire: PASS",
+                    "population_plan_test.py": "population plan: PASS"}
+        # Match identities, not a frozen count: a new CLI gate needs a fake backend too.
         registered = set(re.findall(r"tests/\w+\.py", script.read_text()))
-        assert {"tests/" + name for name, _ in wire_calls} == registered
-        assert {name for name, _ in wire_calls} == set(backends), "missing fake wire backend"
-        markers = [marker for _, marker in wire_calls]
+        assert {"tests/" + name for name, _ in cli_calls} == registered
+        assert {name for name, _ in cli_calls} == set(backends), "missing fake CLI backend"
+        markers = [marker for _, marker in cli_calls]
         for name, passed in backends.items():
             (root / "tests" / name).write_text(f'''import sys
 from pathlib import Path

@@ -44,6 +44,7 @@ import argparse
 import collections
 import json
 import re
+import struct
 import sys
 from pathlib import Path
 
@@ -713,11 +714,14 @@ def feature_windows(path, want_cls=None, arm='leading'):
     return out
 
 
-def draws_of_port(path):
-    """[(kind, is_float, value)] in program order, from a port log."""
+def draws_of_port(path, source='DRAW'):
+    """Typed draws from one RNG source; RAW_DRAW is not the WorldgenRandom stream."""
     out = []
     for line in Path(path).read_text(errors='replace').splitlines():
-        m = PORT_DRAW.match(line.strip())
+        line = line.strip()
+        if not line.startswith(source + ' '):
+            continue
+        m = PORT_DRAW.match('DRAW ' + line[len(source) + 1:])
         if not m:
             continue
         if m.group(1):
@@ -732,7 +736,12 @@ def draws_of_port(path):
 def same_draw(a, b):
     if a[0] != b[0] or a[1] != b[1]:
         return False
-    return abs(a[2] - b[2]) < 1e-6 if a[1] else a[2] == b[2]
+    if a[1]:
+        # Java's decimal float spelling round-trips to f32, not Python's f64.
+        # An epsilon accepted adjacent RNG values (and many distinct doubles).
+        fmt = '>f' if a[0] == 'nextFloat' else '>d'
+        return struct.pack(fmt, a[2]) == struct.pack(fmt, b[2])
+    return a[2] == b[2]
 
 
 def native_bounded_draws(path):
@@ -804,6 +813,10 @@ def cmd_compare_draws(args):
     probe = port[:probe_len]
     unit = {'window': 'placement windows', 'feature': 'features', 'thread': 'threads'}[args.split]
     print(f"native draws {total} over {len(by_thread)} {unit}, port {len(port)} (all kinds)")
+    raw = draws_of_port(args.port, source='RAW_DRAW')
+    if raw:
+        counts = dict(sorted(collections.Counter(draw[0] for draw in raw).items()))
+        print(f"excluded raw-source draws: {len(raw)} {counts} (not native @dyn)")
     print(f"probe (port's first {probe_len}): {probe}")
     best = None
     for thread, seq in by_thread.items():

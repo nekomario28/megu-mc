@@ -49,15 +49,16 @@ else:
 
 
 class AgentBuildGuards(unittest.TestCase):
-    def run_builder(self, *, omit_class=None, omit_marker=None, missing_asm=False):
+    def run_builder(self, *, omit_class=None, omit_marker=None, missing_asm=False, fail_probe=False):
         with tempfile.TemporaryDirectory(prefix='agent-build-contract-') as tmp:
             root = Path(tmp)
             (root / 'tools/carve-agent').mkdir(parents=True)
             shutil.copy2(ROOT / 'tools/build_carve_agent.sh', root / 'tools/build_carve_agent.sh')
-            for name in ('Agent', 'CarveLog', 'SculkLog'):
+            for name in ('Agent', 'CarveLog', 'SculkLog', 'AgentContractProbe'):
                 (root / f'tools/carve-agent/{name}.java').write_text('// compiler input\n')
             (root / 'fake-bin').mkdir()
-            for name, content in (('javac', JAVAC), ('jar', JAR)):
+            java = '#!/bin/sh\nif [ "${FAKE_FAIL_PROBE:-0}" = 1 ]; then echo "agent lifetime probe failed" >&2; exit 1; fi\n'
+            for name, content in (('javac', JAVAC), ('jar', JAR), ('java', java)):
                 path = root / 'fake-bin' / name
                 path.write_text(content)
                 path.chmod(0o755)
@@ -68,6 +69,7 @@ class AgentBuildGuards(unittest.TestCase):
                        ASM_JAR='missing.jar' if missing_asm else asm.name)
             env.pop('FAKE_OMIT_CLASS', None)
             env.pop('FAKE_OMIT_MARKER', None)
+            env['FAKE_FAIL_PROBE'] = '1' if fail_probe else '0'
             if omit_class:
                 env['FAKE_OMIT_CLASS'] = omit_class
             if omit_marker:
@@ -104,6 +106,12 @@ class AgentBuildGuards(unittest.TestCase):
         rc, log, jars = self.run_builder(omit_marker='dmu')
         self.assertNotEqual(rc, 0)
         self.assertIn('agent does not wire hooks for: dmu', log)
+        self.assertEqual(jars, {})
+
+    def test_failed_lifetime_probe_cannot_publish_jars(self):
+        rc, log, jars = self.run_builder(fail_probe=True)
+        self.assertNotEqual(rc, 0)
+        self.assertIn('agent lifetime probe failed', log)
         self.assertEqual(jars, {})
 
     def test_explicit_missing_asm_does_not_fall_back_to_another_version(self):

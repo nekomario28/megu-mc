@@ -87,7 +87,7 @@ control() {
   local name="$1" filter="$2" phase="$3" pattern
   run_filter "$filter"
   if [[ "$filter" == tests/*.py ]]; then
-    pattern='^(client settings|gameplay|containers) wire: PASS$'
+    pattern='^((client settings|gameplay|containers) wire: PASS|population plan: PASS)$'
   else
     pattern='^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored'
   fi
@@ -1136,6 +1136,33 @@ check "sculk decay denominator uses square(int), not ceil" \
   'let denom = (24 - SPC_NO_GROWTH_RADIUS) as f32;' \
   feature::generation_contract_tests::sculk_charge_decay_matches_native
 
+check "recorded population mode accepts observed extra sources" \
+  src/worldgen.rs 'if !allow_extra && (x < x0 || x > x1 || z < z0 || z > z1) {' \
+  'if x < x0 || x > x1 || z < z0 || z > z1 {' \
+  worldgen::wg_tests::recorded_population_plan_preserves_extras_without_hiding_missing_sources
+
+check "recorded population mode does not silently drop extra sources" \
+  src/worldgen.rs '        order.push((x, z));' \
+  '        if x0 <= x && x <= x1 && z0 <= z && z <= z1 { order.push((x, z)); }' \
+  worldgen::wg_tests::recorded_population_plan_preserves_extras_without_hiding_missing_sources
+
+check "recorded population extras cannot replace a missing required source" \
+  src/worldgen.rs '    let covered = seen
+        .iter()
+        .filter(|&&(x, z)| x0 <= x && x <= x1 && z0 <= z && z <= z1)
+        .count();' \
+  '    let covered = expected;' \
+  worldgen::wg_tests::recorded_population_plan_preserves_extras_without_hiding_missing_sources
+
+check "typed feature draws exclude raw positional RNGs" \
+  src/generation_math.rs 'let source = if wrapped { "DRAW" } else { "RAW_DRAW" };' \
+  'let source = "DRAW";' \
+  generation_math::tests::draw_trace_separates_wrapped_and_raw_sources
+
+check "dump-only requests cannot fall through to runtime persistence" \
+  src/main.rs '        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()' \
+  '        && false' tests/population_plan_test.py 'population plan: FAIL missing-profile'
+
 # Both huge mushrooms and huge fungus double height. Bind this mutation to the
 # mushroom's initial height draw; a bare `height *= 2` now matches both bodies.
 check "huge brown mushroom doubles its height on a nextInt(12) draw" \
@@ -1260,10 +1287,15 @@ check "huge fungus only grows its hat into replaceable cells" \
   '                if !hf_can_place(ctx, p, c, true) {' \
   feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
 
-check "a feature write invalidates the column's worldgen heightmaps" \
-  src/generation_context.rs '            self.hmwg.remove(&(x, z, kind));' \
-  '            let _ = kind;' \
-  feature::generation_contract_tests::huge_fungus_matches_native_cells_and_rng
+check "feature writes preserve frozen WG heightmaps while moving live heights" \
+  src/generation_context.rs '    pub(crate) fn heightmap(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {' \
+  '    pub(crate) fn heightmap(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
+        let kind = match kind {
+            HeightmapKind::WorldSurfaceWg => HeightmapKind::WorldSurface,
+            HeightmapKind::OceanFloorWg => HeightmapKind::OceanFloor,
+            other => other,
+        };' \
+  feature::generation_contract_tests::wg_heightmaps_stay_frozen_while_live_heightmaps_follow_writes
 
 check "basalt columns draws the candidate's y as well" \
   src/feature.rs '        let y = pos.1 + rng.next_bound(1);' \

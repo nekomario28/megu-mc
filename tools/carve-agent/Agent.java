@@ -1401,20 +1401,11 @@ class SculkTransformer implements ClassFileTransformer {
                     @Override public MethodVisitor visitMethod(int acc, String mn, String md,
                             String sig, String[] ex) {
                         MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
-                        // `PlacedFeature.placeWithBiomeCheck(ServerLevelAccessor, ChunkGenerator,
-                        // RandomSource, BlockPos)`: log the feature class and the chunk it is
-                        // attempted in, at entry, one line per attempt.
+                        // ConfiguredFeature.place: log each accepted position. The caller's
+                        // PlacedFeature owns the placement window, including its remaining
+                        // modifier/feature draws after this method returns.
                         if (!mn.equals("a") || !md.equals("(Ldds;Lduz;Layw;Ljd;)Z")) return mv;
                         return new MethodVisitor(Opcodes.ASM9, mv) {
-                            @Override public void visitInsn(int op) {
-                                // the method returns boolean, so its return opcode is IRETURN
-                                if (op == Opcodes.IRETURN) {
-                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
-                                            "disarm", "()V", false);
-                                }
-                                super.visitInsn(op);
-                            }
-
                             @Override public void visitCode() {
                                 super.visitCode();
                                 super.visitVarInsn(Opcodes.ALOAD, 0);

@@ -137,14 +137,17 @@ pub(crate) static FTRACE: std::sync::atomic::AtomicI32 = std::sync::atomic::Atom
 
 /// One chronological trace of the *typed* draws, mirroring the agent's hook on
 /// `RandomSource`'s default methods, so the two sequences can be diffed directly
-/// (the raw `next(bits)` traces cannot be interleaved with each other).
-pub(crate) fn dtrace(kind: impl std::fmt::Display, value: f64) {
+/// (the raw `next(bits)` traces cannot be interleaved with each other). Positional
+/// aquifer/ore RNGs can run lazily inside a feature; keep their records separate
+/// from WorldgenRandom, matching the native comparator's `@dyn` boundary.
+pub(crate) fn dtrace(wrapped: bool, kind: impl std::fmt::Display, value: f64) {
     let n = DTRACE.load(std::sync::atomic::Ordering::Relaxed);
     if n < 0 {
         return;
     }
     let f = XTRACE_FEAT.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!("DRAW {n} f={},{} {kind}={value}", f >> 32, f & 0xFFFF);
+    let source = if wrapped { "DRAW" } else { "RAW_DRAW" };
+    eprintln!("{source} {n} f={},{} {kind}={value}", f >> 32, f & 0xFFFF);
     let limit = crate::trace_env::env_str!("FEATURE_DRAW_LIMIT")
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(200);
@@ -315,7 +318,7 @@ impl Xor {
     pub(crate) fn next_bound(&mut self, bound: i32) -> i32 {
         let v = self.next_bound_raw(bound);
         xtrace("nextInt", bound as i64, v as i64);
-        dtrace(format_args!("nextInt({bound})"), v as f64);
+        dtrace(self.legacy, format_args!("nextInt({bound})"), v as f64);
         v
     }
     fn next_bound_raw(&mut self, bound: i32) -> i32 {
@@ -353,7 +356,7 @@ impl Xor {
     }
     pub(crate) fn next_f64(&mut self) -> f64 {
         let traced = self.next_f64_inner();
-        dtrace("nextDouble", traced);
+        dtrace(self.legacy, "nextDouble", traced);
         traced
     }
     fn next_f64_inner(&mut self) -> f64 {
@@ -370,7 +373,7 @@ impl Xor {
     pub(crate) fn next_f32(&mut self) -> f32 {
         let v = self.next(24) as f32 * 5.960_464_5E-8;
         fdraw(v);
-        dtrace("nextFloat", v as f64);
+        dtrace(self.legacy, "nextFloat", v as f64);
         v
     }
     pub(crate) fn next_bool(&mut self) -> bool {
@@ -1443,6 +1446,46 @@ impl BlendedNoise {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draw_trace_separates_wrapped_and_raw_sources() {
+        const CHILD: &str = "MC_SPINE_DRAW_TRACE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            DTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
+            XTRACE_FEAT.store((1_i64 << 32) | 7, std::sync::atomic::Ordering::Relaxed);
+            for mut rng in [Xor::seed_worldgen(0), Xor::seed(0)] {
+                rng.next_bound(16);
+                rng.next_f32();
+                rng.next_f64();
+            }
+            return;
+        }
+        // Isolate the global diagnostic counters from parallel tests, and inspect
+        // actual emitted records rather than a format helper's intended output.
+        let name = format!(
+            "{}::draw_trace_separates_wrapped_and_raw_sources",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD, "1")
+            .env("FEATURE_DRAW_LIMIT", "100")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        for prefix in ["DRAW ", "RAW_DRAW "] {
+            let lines: Vec<_> = stderr
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect();
+            assert_eq!(lines.len(), 3, "missing {prefix} source records: {stderr}");
+            assert!(lines[0].contains(" nextInt(16)="), "{stderr}");
+            assert!(lines[1].contains(" nextFloat="), "{stderr}");
+            assert!(lines[2].contains(" nextDouble="), "{stderr}");
+        }
+    }
+
     #[test]
     fn dimension_blended_noise_matches_native_bits() {
         let configs = [

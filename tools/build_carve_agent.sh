@@ -119,6 +119,12 @@ PYCHECK
 }
 wiring_in_agent || fail "the compiled agent does not wire every hook the tools read"
 
+# Marker membership cannot detect a hook that stops recording too early. Execute
+# the transformed ConfiguredFeature return while its caller's window is still armed.
+mkdir -p "$WORK/probe"
+javac -nowarn -cp "$ASM:$WORK/agent:$WORK/logger" -d "$WORK/probe" "$SRC/AgentContractProbe.java"
+java -Xmx128m -cp "$ASM:$WORK/agent:$WORK/logger:$WORK/probe" AgentContractProbe "$WORK/probe/trace.txt" >&2
+
 cp "$WORK/carveagent.jar" "$WORK/carvelog.jar" "$OUT/"
 cp "$SRC/Agent.java" "$SRC/CarveLog.java" "$SRC/SculkLog.java" "$OUT/" 2>/dev/null || true
 

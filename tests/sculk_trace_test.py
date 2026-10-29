@@ -267,6 +267,30 @@ SPATCH -248 -63 1816
         return type('A', (), {'native': str(native), 'port': str(port), 'window': window,
                              'split': 'thread'})
 
+    def test_float_comparison_uses_the_native_type_not_an_absolute_tolerance(self):
+        self.assertTrue(st.same_draw(('nextFloat', True, 0.107397735),
+                                     ('nextFloat', True, 0.10739773511886597)))
+        self.assertFalse(st.same_draw(('nextFloat', True, 0.5),
+                                      ('nextFloat', True, 0.5000000596046448)))
+        self.assertFalse(st.same_draw(('nextDouble', True, 0.5),
+                                      ('nextDouble', True, 0.5000000000000001)))
+
+    def test_raw_source_draws_are_separate_and_reported_not_silently_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            native = write(tmp, 'native.txt', self.NATIVE)
+            port = write(tmp, 'port.log', 'DRAW 0 f=1,7 nextInt(16)=15\n'
+                         'RAW_DRAW 1 f=1,7 nextFloat=0.8254984021186829\n'
+                         'DRAW 2 f=1,7 nextInt(16)=11\n'
+                         'DRAW 3 f=1,7 nextInt(321)=280\n')
+            self.assertEqual(st.draws_of_port(port, source='RAW_DRAW'),
+                             [('nextFloat', True, 0.8254984021186829)])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = st.cmd_compare_draws(self._args(native, port))
+            self.assertEqual(rc, 0)
+            self.assertIn("excluded raw-source draws: 1 {'nextFloat': 1}", out.getvalue())
+            self.assertIn('identical prefix there: 3 of 3', out.getvalue())
+
     def test_matching_prefix_is_found_and_its_length_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
             native = write(tmp, "native.txt", self.NATIVE)

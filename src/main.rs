@@ -23792,6 +23792,13 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
 }
 
 fn main() {
+    // A dump request must never fall through to the live server/save path.
+    if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
+        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()
+    {
+        eprintln!("[wgdump] MC_SPINE_WG_DUMP requires MC_SPINE_WG_PROFILE (use 0 for dump only)");
+        std::process::exit(2);
+    }
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
     // main's diagnostics pass the same argument list by their own name
     let cli_args = &probe_args;
@@ -24069,7 +24076,14 @@ fn main() {
                 }
                 let text = std::fs::read_to_string(&order_path)
                     .unwrap_or_else(|error| fail(format!("{order_path}: {error}")));
-                let order = worldgen::parse_population_order(&text, ox, oz, n)
+                let allow_extra = match std::env::var("MC_SPINE_POP_ORDER_SCOPE").as_deref() {
+                    Err(std::env::VarError::NotPresent) | Ok("exact") => false,
+                    Ok("recorded") => true,
+                    other => fail(format!(
+                        "invalid MC_SPINE_POP_ORDER_SCOPE {other:?}; expected exact or recorded"
+                    )),
+                };
+                let order = worldgen::parse_population_order(&text, ox, oz, n, allow_extra)
                     .unwrap_or_else(|error| fail(error));
                 let requested = order.len();
                 let executed =
@@ -24079,7 +24093,8 @@ fn main() {
                     fail(format!("{executed} of {requested} chunks executed; plan overlaps prior population (use MC_SPINE_WG_PROFILE=0)"));
                 }
                 eprintln!(
-                    "[wgdump] population plan {order_path}: {executed} source chunks executed"
+                    "[wgdump] population plan {order_path}: {executed} source chunks executed (scope={})",
+                    if allow_extra { "recorded" } else { "exact" }
                 );
             }
             let (lo, hi) = (worldgen::min_y(), worldgen::max_y());
