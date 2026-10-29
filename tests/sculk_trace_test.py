@@ -264,7 +264,8 @@ SPATCH -248 -63 1816
 """
 
     def _args(self, native, port, window=0):
-        return type('A', (), {'native': str(native), 'port': str(port), 'window': window})
+        return type('A', (), {'native': str(native), 'port': str(port), 'window': window,
+                             'split': 'thread'})
 
     def test_matching_prefix_is_found_and_its_length_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -276,7 +277,8 @@ SPATCH -248 -63 1816
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = st.cmd_compare_draws(self._args(native, port, window=3))
-            self.assertIn("identical prefix from native index 0: 4 of 4", out.getvalue())
+            self.assertIn("at that unit's draw 0", out.getvalue())
+            self.assertIn("identical prefix there: 4 of 4", out.getvalue())
             self.assertEqual(rc, 0)
 
     def test_divergence_reports_the_two_draws(self):
@@ -290,8 +292,10 @@ SPATCH -248 -63 1816
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = st.cmd_compare_draws(self._args(native, port, window=3))
-            self.assertIn("identical prefix from native index 0: 4 of 5", out.getvalue())
-            self.assertIn("first divergence: port (16, 7) native (49, 6)", out.getvalue())
+            self.assertIn("at that unit's draw 0", out.getvalue())
+            self.assertIn("identical prefix there: 4 of 5", out.getvalue())
+            self.assertIn("first divergence: port ('nextInt(16)', False, 7) "
+                          "native ('nextInt(49)', False, 6)", out.getvalue())
             self.assertEqual(rc, 1)
 
     def test_absent_sequence_is_reported_as_absent(self):

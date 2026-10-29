@@ -3,7 +3,54 @@
 2026-10-27 起票 / 2026-10-28 実装（未検証）。`sculk_patch` は他の feature 型と違い、**1 つのサブシステム**
 （`SculkSpreader` と `SculkBehaviour` 実装群）を伴う。ここに、次に着手する人が
 知り直さなくて済むよう、実測した構造・分岐・罠・再利用できる部品を固定する。
-コードはまだ書いていない（半端な subsystem を緑と記録しないため）。
+実装は `src/feature.rs` にある。以下は調査履歴を含み、過去の推論には訂正がある。
+
+## a/b 再監査による訂正（2026-10-29）
+
+以下は後段の「修正対象が確定」「比が signal」という過去の結論を撤回・更新する。
+
+- **a: 集計比では原因を特定できない。** 異なる decoration 範囲の sculk:vein 比
+  0.485 対 0.742 は同じ入力の比較ではない。約4倍の範囲差という説明も未立証。
+  768/768 draw 一致は all-rejected placement 窓だけであり、active placement 全体の
+  完全一致は証明していない。`spc_kind` の分類と charge の kind 別 dispatch は
+  vanilla の各メソッドに対応しているため、比を合わせるためには変更しない。
+- **b: regrow は欠落していない。** `spc_vein_attempt_spread` は既に
+  `SculkVeinBlock.regrow` の remembered facings、支持面の確認、水没状態を実装している。
+  旧 port の `attempt-vein=0` はマーカー未設置による値で、経路未実装の証拠ではない。
+  この関数入口にマーカーを追加し、air/water 両方で下向き remembered face だけが
+  復元されるテストを追加した。`SSPREADALL types` は方向数ではなく spread type 数。
+- vanilla `SculkBlock` 本体と公式 mappings を照合し、別途3つの実装差を修正した。
+  `Blocks.qQ` は **SCULK_SENSOR**（SCULK は qS）なので、通常成長先と密度制限の
+  対象を sensor に修正。`Mth.k(float)` は **square** なので decay penalty の
+  `(float)Math.sqrt(distanceSquared) - amount` を二乗する。旧実装で3テストの失敗を
+  観測した（成長先 sculk、床を密度に算入、距離4・charge100の減衰6対期待19）。
+
+検証結果: Rust **346 passed / 0 failed / 1 ignored**、sculk focused **9 passed**。
+Python 計器テストは旧引数（`split` 欠落）と旧出力形式を期待する3件が HEAD 時点で
+壊れていたため、現行APIに合わせて修正し **29 passed**。独立 Codex review は
+actionable regression なし（Python は reviewer の read-only sandbox では実行不可、
+こちらの実行で確認）。
+
+新 release バイナリで seed 0 / (-16,112) / n=2 を取り直した:
+
+| | sculk | vein | catalyst | 合計 |
+|---|---:|---:|---:|---:|
+| 既存 native fixture | 175 | 125 | 1 | 301 |
+| 新 port dump | 260 | 101 | 2 | 363 |
+
+`missing=143 / extra=205 / wrong-state=1`、**349セル不一致、exit 1**。
+以前の387セルから数字は変わったが、今回は native fixture を再生成していないため
+paired native 再現性・active placement 窓の一致は未証明。`regrow` のマーカーは
+新 port 実行で **503回**、`one-charge-sculk=1947 / one-charge-vein=3431`。
+比の改善を原因証明には使わない。
+
+成果物は `~/.cache/mc-spine-audit/sculk-traces/ab-20261029T153108/`:
+`provenance.txt`（開始・終了時刻、HEAD、binary SHA256）、`source.patch`、
+`port.bin`、`port.log`、`gate.txt`。新 binary SHA256 は
+`994879ac5a64a5d4738e2a8f6556886185050cefbd7b08376ccbcaca9ab80bad`。
+
+これは全セル一致の証明ではない。合格条件は引き続き `sculk_gate.py --require-match`。
+vanilla の逆コンパイル結果は repo 外の cache に保持する。
 
 ## 対象クラス（固定 jar、公式 mappings）
 

@@ -2975,27 +2975,28 @@ fn spc_spread_one(
     }
 }
 
-/// `SculkBlock.decreaseCharge` (`dmq.a(dmu,jd,jd,int)`): `Mth.sqrt` of the *float* square root,
-/// the `Mth.ceil(24 - amount)` denominator, and the `(int)` truncation are all the native's.
+/// `SculkBlock.getDecayPenalty`: square the float excess of the double distance sqrt,
+/// divide by `Mth.ceil(24 - amount)`, then truncate the float charge penalty.
 fn spc_decrease_charge(pos: (i32, i32, i32), origin: (i32, i32, i32), charge: i32) -> i32 {
     let (dx, dy, dz) = (
         f64::from(pos.0 - origin.0),
         f64::from(pos.1 - origin.1),
         f64::from(pos.2 - origin.2),
     );
-    let sqrt = (dx * dx + dy * dy + dz * dz) as f32;
-    let over = sqrt.sqrt() - SPC_AMOUNT as f32;
+    // Mth.k(float) is square, not sqrt. Java casts Math.sqrt's result to float first.
+    let excess = (dx * dx + dy * dy + dz * dz).sqrt() as f32 - SPC_AMOUNT as f32;
+    let over = excess * excess;
     let denom = ((24 - SPC_AMOUNT) as f32).ceil();
     let ratio = 1.0f32.min(over / denom);
     (1).max((charge as f32 * ratio * 0.5) as i32)
 }
 
 /// `SculkBlock.canPlaceGrowth` (`dmq.a(dcx,jd)`): the cell **above** the cursor is air or a
-/// water source - the same cell the growth branch writes sculk into - and at most two
-/// sculk/sculk_shrieker cells exist in the `-4..4 x 0..2 x -4..4` box.
+/// water source - the growth target - and at most two sensor/shrieker cells exist
+/// in the `-4..4 x 0..2 x -4..4` box.
 fn spc_can_place_growth(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
     // `$$1.d()` is `above()`, and the growth branch writes at `$$7.d()` too: the cell the
-    // check inspects is the cell the sculk goes into, not the cell below the cursor.
+    // check inspects is the growth target, not the cell below the cursor.
     let target = ctx.get(pos.0, pos.1 + 1, pos.2);
     let water_source = reg.name_of(target) == "minecraft:water";
     if !reg.is_air(target) && !water_source {
@@ -3006,7 +3007,8 @@ fn spc_can_place_growth(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool 
         for dy in 0i32..=2 {
             for dz in -4i32..=4 {
                 let name = reg.name_of(ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz));
-                if name == "minecraft:sculk" || name == "minecraft:sculk_shrieker" {
+                // Blocks.qQ = SCULK_SENSOR; qS, not qQ, is SCULK.
+                if name == "minecraft:sculk_sensor" || name == "minecraft:sculk_shrieker" {
                     seen += 1;
                     if seen > 2 {
                         return false;
@@ -3019,7 +3021,7 @@ fn spc_can_place_growth(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool 
 }
 
 /// `SculkBlock.getSculkState` (`dmq.a(dcx,jd,ayw,boolean)`): a shrieker on one `nextInt(11)`
-/// in eleven, `sculk` otherwise; `WATERLOGGED` when the cell holds **any** fluid.
+/// in eleven, `sculk_sensor` otherwise; `WATERLOGGED` when the cell holds **any** fluid.
 fn spc_growth_state(
     ctx: &mut FC,
     reg: &BReg,
@@ -3034,7 +3036,8 @@ fn spc_growth_state(
             if world_gen { "true" } else { "false" },
         )
     } else {
-        reg.state_of("minecraft:sculk", None)
+        // Blocks.qQ in SculkBlock.getRandomGrowthState is SCULK_SENSOR.
+        reg.state_of("minecraft:sculk_sensor", None)
     };
     if reg.get_prop(st, "waterlogged").is_some()
         && reg.fluid_name(ctx.get(pos.0, pos.1, pos.2)) != "minecraft:empty"
@@ -3120,8 +3123,8 @@ fn spc_spread_all(
     types: &[u8],
     tag: &str,
 ) -> bool {
-    // `SSPREADALL types=<n>` hooks `MultifaceSpreader.spreadAll`, i.e. this implementation - not the
-    // call sites. `n` is the number of directions it spreads, which is exactly `types.len()`.
+    // `SSPREADALL types=<n>` hooks MultifaceSpreader.spreadAll at entry.
+    // n counts spread types (same-position, same-plane, wrap-around), not directions.
     spc_trace(format!("SSPREADALL types={}", types.len()));
     let mut any = false;
     let is_vein = spc_kind(reg, state) == SpcKind::Vein;
@@ -3281,6 +3284,8 @@ fn spc_vein_attempt_spread(
     state: u32,
     mask: u8,
 ) -> bool {
+    // SculkVeinBlock.regrow: this path already existed, but was missing its native marker.
+    spc_trace("SCMARK attempt-vein".to_string());
     let mut vein = reg.state_of(SPC_VEIN, None);
     let mut any = false;
     for d in 0..6u8 {
