@@ -13791,17 +13791,33 @@ fn publish_section(cx: i32, cz: i32, sy: i32, states: &[u32; 4096]) {
     }
 }
 
+/// The published section, *without* removing it: the light pass for this chunk and for its
+/// neighbours reads the same sections, so consuming one must not empty the store. The LRU
+/// bound is what keeps the memory in check.
 fn take_published(cx: i32, cz: i32, sy: i32) -> Option<Box<[u32; 4096]>> {
     let idx = section_index(sy)?;
-    let mut store = section_store().lock().unwrap();
+    let store = section_store().lock().unwrap();
     if store.generation != current_gen_seq() {
         return None;
     }
-    let sections = store.map.get_mut(&(cx, cz))?;
-    let arc = sections[idx].take()?;
+    let sections = store.map.get(&(cx, cz))?;
+    let arc = sections[idx].as_ref()?;
     let mut out = Box::new([0u32; 4096]);
     out.copy_from_slice(arc.as_slice());
     Some(out)
+}
+
+/// Is this section already published? The ring prefetch asks before computing, so a section
+/// is computed once no matter how many neighbours want it.
+fn has_section(cx: i32, cz: i32, sy: i32) -> bool {
+    let Some(idx) = section_index(sy) else {
+        return false;
+    };
+    let store = section_store().lock().unwrap();
+    if store.generation != current_gen_seq() {
+        return false;
+    }
+    store.map.get(&(cx, cz)).is_some_and(|s| s[idx].is_some())
 }
 
 fn stored_state(x: i32, y: i32, z: i32) -> Option<u32> {
@@ -13974,7 +13990,13 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
     if !worldgen::enabled() {
         return reg.opacity_of(block_at(x, y, z));
     }
-    if let Some(st) = band_state(x, y, z) {
+    // The published sections first, then the surface band. The band stops 18 blocks below
+    // the surface, and the light pass reads the 3x3 ring: a neighbour that has not been
+    // delivered yet has no band, and every one of its cells used to fall through to
+    // `block_at` (a full worldgen evaluation). Measured: 13,571 such calls per delivered
+    // chunk, ~20 ms. The +x neighbour's sections are in the store already (the delivery
+    // path's prefetch publishes them), and they cover the full height.
+    if let Some(st) = stored_state(x, y, z).or_else(|| band_state(x, y, z)) {
         return reg.opacity_of(st);
     }
     reg.opacity_of(block_at(x, y, z))
@@ -14233,6 +14255,18 @@ fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     )
 }
 
+const NEIGHBOUR_RING: [(i32, i32); 9] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (0, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+
 fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec<u8> {
     let mut data = Vec::new();
     let reg = crate::block_registry::breg();
@@ -14330,12 +14364,22 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                     // are often computed for a chunk that is not delivered next. The +x
                     // neighbour is the one a sweep is about to deliver, so only it is
                     // worth computing early.
-                    if chunkprof::enabled() {
-                        chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Some(nbr) = worldgen::terrain_section(cx + 1, sy, cz, feature::populate)
-                    {
-                        publish_section(cx + 1, cz, sy, &nbr);
+                    // +x only. Publishing the whole 3x3 ring answers the light pass's
+                    // ring reads (light 34.9 -> 14.8 ms, `block_at` 14,012 -> 2,991) but
+                    // costs far more in terrain: measured 19 terrain passes per chunk
+                    // against 10, because the ring includes rows and diagonals whose own
+                    // deliveries are not next. The section phase went 33.4 -> 106.2 ms and
+                    // the window's CPU 29.3 -> 31.0 s, so it is a net loss and only +x is
+                    // prefetched.
+                    if !has_section(cx + 1, cz, sy) {
+                        if chunkprof::enabled() {
+                            chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(nbr) =
+                            worldgen::terrain_section(cx + 1, sy, cz, feature::populate)
+                        {
+                            publish_section(cx + 1, cz, sy, &nbr);
+                        }
                     }
                 }
             }

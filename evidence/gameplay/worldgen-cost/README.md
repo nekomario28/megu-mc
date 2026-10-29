@@ -860,3 +860,30 @@ writer スレッド版の bench（`MC_SPINE_BENCH_WRITER=1`）は contention を
 
 露出テストの仕事量は不変（hidden 349-360 / reads 8,519-8,921 / base_state 57-64）、
 `chunk_delivery_digest` も `PREFETCH-DIFF 0`（順序を変えても世界は同じ）。
+
+## 2026-10-28: ライト経路のリング読みを、公開済みセクションから返す（+ リング先読みは棄却）
+
+**ライトの `block_at` フォールバック 13,571/chunk**（リングが未 install のため）に対して:
+
+1. `opacity_windowed` を **store → band → block_at** の順にした（store はフル高さをカバーし、
+   +x 隣の分は先読みで入っている）。→ `block_at` 14,012 → 9,150、ただし light 34.9 → 46.5 ms
+   （store の Mutex を 14k 回取るため。改善は限定的）。
+2. **リング全体（8近傍）の先読み**も試した: light 34.9 → 14.8 ms、`block_at` → 2,991 と
+   大きく改善するが、**terrain passes が 10 → 19/chunk**、section 位相 33.4 → **106.2 ms**、
+   窓の CPU 29.3 → 31.0 s と**純損失**（リングには次に配信されない行・対角が含まれる）→ 棄却。
+3. 採用: **公開済みセクションを消費する形**（`take_published` を「取り出し」から
+   「覗き見」に変更＝consumed しても store に残す、`has_section` で先読みをスキップ）。
+   これで +x 先読みが**無駄にならず**、リングの一部の読みも store から返る。
+
+| | 前 | 後 |
+|---|---|---|
+| bench terrain passes/chunk | 10 | **3** |
+| bench: sections 9 パス | 20.0 ms | **13.9** |
+| bench per-chunk mean | 29.7 ms | **23.6** |
+| 本番 `map_chunk` | 103.5 ms | **94.6** |
+| 本番 `section` | 33.4 | **31.7** |
+| 本番 `light` | 34.9 | **32.8** |
+| 本番 `block_at` | 14,012 | **9,221** |
+| 窓の CPU | 29.3-29.3 s | **28.72 s** |
+
+`chunk_delivery_digest` = `PREFETCH-DIFF 0`、suite 348 green。
