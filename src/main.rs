@@ -14311,8 +14311,15 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
             }
             let base = match carried_next.take() {
                 Some(b) => Some(b),
-                None => take_published(cx, cz, sy)
-                    .or_else(|| worldgen::terrain_section(cx, sy, cz, feature::populate)),
+                None => match take_published(cx, cz, sy) {
+                    Some(b) => Some(b),
+                    None => {
+                        if chunkprof::enabled() {
+                            chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
+                        }
+                        worldgen::terrain_section(cx, sy, cz, feature::populate)
+                    }
+                },
             };
             if prefetch {
                 if let Some(rows) = &base {
@@ -14323,6 +14330,9 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                     // are often computed for a chunk that is not delivered next. The +x
                     // neighbour is the one a sweep is about to deliver, so only it is
                     // worth computing early.
+                    if chunkprof::enabled() {
+                        chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Some(nbr) = worldgen::terrain_section(cx + 1, sy, cz, feature::populate)
                     {
                         publish_section(cx + 1, cz, sy, &nbr);
@@ -14332,7 +14342,17 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
             // The section above, computed now so this section's reads have it and the next
             // iteration does not pay for it twice.
             let next_base = if sy + 16 < MIN_Y + 384 {
-                worldgen::terrain_section(cx, sy + 16, cz, feature::populate)
+                // The +x neighbour's delivery published this one a step ago in a sweep, so
+                // ask the store before computing it again.
+                match take_published(cx, cz, sy + 16) {
+                    Some(b) => Some(b),
+                    None => {
+                        if chunkprof::enabled() {
+                            chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
+                        }
+                        worldgen::terrain_section(cx, sy + 16, cz, feature::populate)
+                    }
+                }
             } else {
                 None
             };
@@ -23365,6 +23385,9 @@ pub(crate) mod chunkprof {
     pub(super) static DATA: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION: AtomicU64 = AtomicU64::new(0);
     pub(super) static SECTION_N: AtomicU64 = AtomicU64::new(0);
+    /// Every `terrain_section` call from the delivery path: base, the +x prefetch, and the
+    /// section above. A count above one per section means the same section is computed twice.
+    pub(super) static TERRAIN_N: AtomicU64 = AtomicU64::new(0);
     pub(super) static ENCODE: AtomicU64 = AtomicU64::new(0);
     pub(super) static READ_NS: AtomicU64 = AtomicU64::new(0);
     pub(super) static READ_BAND_NS: AtomicU64 = AtomicU64::new(0);
@@ -23409,7 +23432,7 @@ pub(crate) mod chunkprof {
     /// A work snapshot, for the deterministic bench: these counters are load-independent,
     /// where the bench's milliseconds are not (the same build measured 30.1 and 67.0
     /// ms/chunk on this host within an hour, tracking the other lanes' load).
-    pub(crate) fn counters() -> [u64; 13] {
+    pub(crate) fn counters() -> [u64; 14] {
         [
             N.load(Ordering::Relaxed),
             DATA.load(Ordering::Relaxed),
@@ -23424,6 +23447,7 @@ pub(crate) mod chunkprof {
             HIDDEN_N.load(Ordering::Relaxed),
             EXPOSURE_READS.load(Ordering::Relaxed),
             EXPOSURE_READ_BASE.load(Ordering::Relaxed),
+            TERRAIN_N.load(Ordering::Relaxed),
         ]
     }
 
