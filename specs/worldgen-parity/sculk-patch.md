@@ -1184,6 +1184,36 @@ forceload 範囲内の chunk。深い y の deep_dark が必要なら、その c
 よう forceload/settle を調整する）。そうすれば `FSEED_ARM` の窓と `SPWINDOW` の窓が同じものになり、
 draw を1本ずつ比べられる。
 
+## 同一単位で比べたら **768/768 完全一致**（2026-10-28）
+
+`SPWINDOW` の窓を pass で絞れるようにし、`SPWINDOW start` に窓番号を入れたことで、
+「どの窓とどの窓を比べているか」が初めて確定した。native 側で **768 bounded draw（= 256候補×3）**
+を持つ窓は pass (-14,110) / (-13,110) / (-14,109) / (-13,109) にあり（いずれも `patches=0` =
+全候補が biome フィルタで落ちた sculk 配置）、port 側もその chunk で arm を取れる:
+
+```
+tools/sculk_port_run.sh near --x=-14 --z=110 --n=2 --arm=-14,110,1,7
+tools/sculk_trace.py compare-draws <native join capture> port-near.log --pass-chunk=-14,110
+```
+
+結果:
+
+| | |
+|---|---|
+| port の窓 | 768 draw（float 無し = 採用 0 ✓ native の `patches=0` と一致） |
+| native の窓 | `Worker-Main-12#37 pass=(-14,110)`、768 bounded draw |
+| **一致** | **768 / 768 = 完全一致** ✓✓ |
+
+つまり **sculk patch の placement の RNG stream（候補 256 個 × `nextInt(16), nextInt(16),
+nextInt(321)`）は native と1本も違わない** ✓✓。
+
+**このセッションで追っていた「draw の分岐」は、対応しない窓同士を比べていたための artifact だった**
+（24本一致 → 25本目で分岐、という観測はすべてスケールの違う窓の比較から出ていた）。placement は
+候補集合・biome 判定・採用集合・順序・**draw 列**まで一致している。
+
+残っているのは **feature 内の draw**（`edi` は entry を通ったパッチごとに `nextFloat` を1本引く）と
+cursor 側で、そこの比較も同じ手順（同一 pass・同一窓）で行えばよい。
+
 ## 効率化の基盤（2026-10-28）
 
 このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。
