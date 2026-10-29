@@ -48,7 +48,11 @@
       "connection_limits",
       "ingress_guard",
       "tick_stats",
-      "trace_env"
+      "trace_env",
+      "chunkprof",
+      "lockprof",
+      "loopprof",
+      "tickprof"
     ]
   ],
   "explicit_generation_modules": [
@@ -69,6 +73,26 @@
     ]
   ],
   "allowed_edges": [
+    [
+      "main",
+      "chunkprof"
+    ],
+    [
+      "main",
+      "lockprof"
+    ],
+    [
+      "main",
+      "loopprof"
+    ],
+    [
+      "main",
+      "tickprof"
+    ],
+    [
+      "effects",
+      "tickprof"
+    ],
     [
       "main",
       "structure_transform"

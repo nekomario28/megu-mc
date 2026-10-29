@@ -23,7 +23,6 @@ case "$STAGE" in
     *) echo 'unsupported fixture generation stage' >&2; exit 2 ;;
 esac
 BASE="${CARVER_FIXTURE_BASE:-/tmp/carverfresh}"
-ASM="${ASM_JAR:-$HOME/.m2/repository/org/ow2/asm/asm/9.8/asm-9.8.jar}"
 [[ "$CX" =~ ^-?[0-9]+$ && "$CZ" =~ ^-?[0-9]+$ && "$N" =~ ^[1-3]$ ]] || { echo 'invalid region (n must be 1..3)' >&2; exit 2; }
 [[ "$MODE" == frozen || "$MODE" == ticked ]] || { echo 'mode must be frozen or ticked' >&2; exit 2; }
 [[ ! -e "$DIR" ]] || { echo "refusing to overwrite capture: $DIR" >&2; exit 2; }
@@ -36,17 +35,16 @@ if hashlib.sha1(Path(sys.argv[1]).read_bytes()).hexdigest()!=JAR_SHA1:
 seed=int(sys.argv[2])
 if not -(1<<63)<=seed<(1<<63): raise SystemExit('fixture seed must be signed 64-bit')
 PY
-mkdir -p "$DIR/agent/c1" "$DIR/agent/c2" "$DIR/agent/j1" "$DIR/world"
+mkdir -p "$DIR/agent" "$DIR/world"
 DIR="$(cd "$DIR" && pwd)"
 date -Iseconds > "$DIR/started.txt"
 printf '%s\n' "$MODE" > "$DIR/mode.txt"
-sha256sum "$ROOT/tools/carve-agent/Agent.java" "$ROOT/tools/carve-agent/CarveLog.java" "$ROOT/tools/carve-agent/native_fixture.sh" "$BASE/server.jar" > "$DIR/inputs.sha256"
+sha256sum "$ROOT/tools/carve-agent/Agent.java" "$ROOT/tools/carve-agent/CarveLog.java" "$ROOT/tools/carve-agent/SculkLog.java" "$ROOT/tools/build_carve_agent.sh" "$ROOT/tools/carve-agent/native_fixture.sh" "$BASE/server.jar" > "$DIR/inputs.sha256"
 java -version > "$DIR/java-version.txt" 2>&1
-javac -J-Xmx256m -nowarn -cp "$ASM" -d "$DIR/agent/c1" "$ROOT/tools/carve-agent/Agent.java"
-javac -J-Xmx256m -nowarn -d "$DIR/agent/c2" "$ROOT/tools/carve-agent/CarveLog.java"
-(cd "$DIR/agent/c2"; jar cf ../carvelog.jar .)
-cp -r "$DIR/agent/c1/"* "$DIR/agent/j1/"
-(cd "$DIR/agent/j1"; jar xf "$ASM" org; printf 'Premain-Class: Agent\n' > MANIFEST.MF; jar cfm ../carveagent.jar MANIFEST.MF .)
+# One build owner: it discovers the installed ASM and verifies both the hook wiring
+# and CarveLog/SculkLog membership before this capture executes any game code.
+bash "$ROOT/tools/build_carve_agent.sh" "$DIR/agent" > "$DIR/agent-build.log" 2>&1
+sha256sum "$DIR/agent/carveagent.jar" "$DIR/agent/carvelog.jar" >> "$DIR/inputs.sha256"
 for p in server.jar libraries versions; do ln -s "$BASE/$p" "$DIR/$p"; done
 # No public listener, authentication dependency, preexisting world, or spawn ticket.
 cat > "$DIR/server.properties" <<'PROPERTIES'

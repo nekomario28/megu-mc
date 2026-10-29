@@ -515,8 +515,8 @@ pub struct Gen {
     pop_region: Option<(i32, i32, i32, i32)>,
     // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
     feat_hm: HashMap<(i32, i32), (i32, i32)>,
-    // ProtoChunkTicks keeps the first entry for each position and block type.
-    generated_leaf_tick_set: HashSet<((i32, i32, i32), u32)>,
+    // Each generator owns its pending ticks; only the active world's handles are published.
+    generated_ticks: GeneratedTickQueues,
 }
 
 impl std::ops::Deref for Gen {
@@ -744,7 +744,7 @@ impl Gen {
             }),
             memo: HashMap::new(),
             feat_hm: HashMap::new(),
-            generated_leaf_tick_set: HashSet::new(),
+            generated_ticks: GeneratedTickQueues::default(),
         };
         // noise settings (sea level, bounds, router names)
         let mut ns_json: Option<J> = None;
@@ -2367,40 +2367,34 @@ pub(crate) struct ChunkCols {
     wtop: [i16; 256],           // per-column top of solid-or-fluid (heightmap basis)
 }
 
-/// Leaf block ticks queued by feature placement, drained once per tick.
-///
-/// `ProtoChunkTicks` in vanilla holds the same thing; the point of the separate lock is
-/// that draining it must not wait for a chunk's generation.
-static GEN_LEAF_TICKS: std::sync::OnceLock<
-    Mutex<(Vec<((i32, i32, i32), u32)>, HashSet<((i32, i32, i32), u32)>)>,
-> = std::sync::OnceLock::new();
+type GeneratedTick = ((i32, i32, i32), u32);
+type PendingGeneratedTicks = (Vec<GeneratedTick>, HashSet<GeneratedTick>);
 
-fn gen_leaf_tick_queue(
-) -> &'static Mutex<(Vec<((i32, i32, i32), u32)>, HashSet<((i32, i32, i32), u32)>)> {
-    GEN_LEAF_TICKS.get_or_init(|| Mutex::new((Vec::new(), HashSet::new())))
+/// Per-world pending ticks. Sharing these handles with runtime avoids taking GEN
+/// to drain, without mixing independent generators or reinitialized worlds.
+#[derive(Clone, Default)]
+struct GeneratedTickQueues {
+    leaves: std::sync::Arc<Mutex<PendingGeneratedTicks>>,
+    fluids: std::sync::Arc<Mutex<PendingGeneratedTicks>>,
 }
 
-/// Take every queued leaf tick, without the worldgen lock.
-pub fn take_generated_leaf_ticks() -> Vec<((i32, i32, i32), u32)> {
-    let mut q = gen_leaf_tick_queue().lock().unwrap();
+static GEN_TICK_QUEUES: Mutex<Option<GeneratedTickQueues>> = Mutex::new(None);
+
+fn drain_generated_ticks(queue: &Mutex<PendingGeneratedTicks>) -> Vec<GeneratedTick> {
+    let mut q = queue.lock().unwrap();
     q.1.clear();
     std::mem::take(&mut q.0)
 }
 
-/// The same for generated fluid ticks.
-static GEN_FLUID_TICKS: std::sync::OnceLock<
-    Mutex<(Vec<((i32, i32, i32), u32)>, HashSet<((i32, i32, i32), u32)>)>,
-> = std::sync::OnceLock::new();
-
-fn gen_fluid_tick_queue(
-) -> &'static Mutex<(Vec<((i32, i32, i32), u32)>, HashSet<((i32, i32, i32), u32)>)> {
-    GEN_FLUID_TICKS.get_or_init(|| Mutex::new((Vec::new(), HashSet::new())))
+/// Drain the active world's leaf queue without waiting for the worldgen lock.
+pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
+    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();
+    queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.leaves))
 }
 
-pub fn take_generated_fluid_ticks() -> Vec<((i32, i32, i32), u32)> {
-    let mut q = gen_fluid_tick_queue().lock().unwrap();
-    q.1.clear();
-    std::mem::take(&mut q.0)
+pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
+    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();
+    queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))
 }
 
 static GEN: Mutex<Option<Gen>> = Mutex::new(None);
@@ -2561,6 +2555,7 @@ pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: Noise
                 bedrock_st: g.bedrock_st,
             });
             *GEN_DATA.lock().unwrap() = Some(g.data.clone());
+            *GEN_TICK_QUEUES.lock().unwrap() = Some(g.generated_ticks.clone());
             *gen_lock() = Some(g);
             GEN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
             GEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2754,24 +2749,21 @@ pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
 impl Gen {
     /// Queue a leaf block tick.
     ///
-    /// The queue lives in its own lock rather than on `Gen`: the tick thread drains it
-    /// once per tick (`take_generated_leaf_ticks`), and holding the worldgen lock for that
-    /// meant waiting behind whatever generation is in flight. Measured: 519 queued ticks
-    /// per tick, 14.1 ms of every tick spent in that one acquisition, because a section's
-    /// first cell populates the chunk under `GEN`.
+    /// Each generator owns its queue, while runtime shares the active world's handle.
+    /// The separate lock lets the tick thread drain without waiting for generation;
+    /// process-global contents would mix independent generators and their tick order.
     pub(crate) fn schedule_generated_leaf(&mut self, pos: (i32, i32, i32), block: u32) {
         if self.suppress_generated_ticks {
             return;
         }
-        let q = gen_leaf_tick_queue();
-        let mut q = q.lock().unwrap();
+        let mut q = self.generated_ticks.leaves.lock().unwrap();
         if q.1.insert((pos, block)) {
             q.0.push((pos, block));
         }
     }
 
     pub(crate) fn generated_leaf_ticks(&self) -> Vec<((i32, i32, i32), u32)> {
-        gen_leaf_tick_queue().lock().unwrap().0.clone()
+        self.generated_ticks.leaves.lock().unwrap().0.clone()
     }
 
     /// Queue a generated fluid tick: same reasoning as the leaf queue above — the tick
@@ -2780,8 +2772,7 @@ impl Gen {
         if self.suppress_generated_ticks {
             return;
         }
-        let q = gen_fluid_tick_queue();
-        let mut q = q.lock().unwrap();
+        let mut q = self.generated_ticks.fluids.lock().unwrap();
         if q.1.insert((pos, fluid)) {
             q.0.push((pos, fluid));
         }
@@ -2803,14 +2794,13 @@ impl Gen {
         blocks: Vec<((i32, i32, i32), u32)>,
         fluids: Vec<((i32, i32, i32), u32)>,
     ) {
-        // The leaf queue is a separate lock now; restoring fills it exactly as
-        // generation would have.
-        let q = gen_leaf_tick_queue();
-        let mut q = q.lock().unwrap();
-        q.1 = blocks.iter().copied().collect();
-        q.0 = blocks;
-        let fq = gen_fluid_tick_queue();
-        let mut fq = fq.lock().unwrap();
+        // Restore only this world's queues, never another generator's pending work.
+        {
+            let mut q = self.generated_ticks.leaves.lock().unwrap();
+            q.1 = blocks.iter().copied().collect();
+            q.0 = blocks;
+        }
+        let mut fq = self.generated_ticks.fluids.lock().unwrap();
         fq.1 = fluids.iter().copied().collect();
         fq.0 = fluids;
     }
@@ -2856,7 +2846,7 @@ impl Gen {
                 }
             }),
             feat_hm: HashMap::new(),
-            generated_leaf_tick_set: HashSet::new(),
+            generated_ticks: GeneratedTickQueues::default(),
         }
     }
 
@@ -4712,7 +4702,6 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
     Some(out)
 }
 
-#[cfg(test)]
 /// The generator lock, for tests outside `wg_tests` that drive `feature::populate`.
 ///
 /// `wg_tests` is private, so the reachable path is this wrapper: a parent module can see a
@@ -4722,8 +4711,82 @@ pub(crate) fn lock_gen_for_tests() -> std::sync::MutexGuard<'static, ()> {
     wg_tests::lock_gen()
 }
 
+#[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    #[test]
+    fn generated_ticks_belong_to_their_generator() {
+        let mut first = Gen::load(0, crate::name_to_state).unwrap();
+        let mut second = Gen::load(1, crate::name_to_state).unwrap();
+        let leaf = ((1, 80, 2), 264);
+        first.schedule_generated_leaf(leaf.0, leaf.1);
+        assert!(
+            second.generated_leaf_ticks().is_empty(),
+            "another generator's ticks leaked"
+        );
+        second.restore_generated_ticks(Vec::new(), Vec::new());
+        assert_eq!(
+            first.generated_leaf_ticks(),
+            vec![leaf],
+            "restore cleared another world"
+        );
+    }
+
+    #[test]
+    fn runtime_drains_only_published_ticks_without_the_gen_lock() {
+        let _guard = lock_gen();
+        assert!(init(0, crate::name_to_state));
+        let _ = take_generated_leaf_ticks();
+        let _ = take_generated_fluid_ticks();
+        let leaf = ((1, 80, 2), 264);
+        let fluid = ((3, 60, 4), 1);
+        with_gen(|g| {
+            g.schedule_generated_leaf(leaf.0, leaf.1);
+            g.schedule_generated_leaf(leaf.0, leaf.1);
+            g.schedule_generated_fluid(fluid.0, fluid.1);
+        })
+        .unwrap();
+        let mut local = Gen::load(42, crate::name_to_state).unwrap();
+        local.schedule_generated_leaf((9, 80, 9), 264);
+        local.schedule_generated_fluid((9, 60, 9), 1);
+        // Hold GEN while another thread drains: reintroducing a GEN acquisition
+        // here must fail promptly rather than deadlock the test process.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = with_gen(|_| {
+            let worker = std::thread::spawn(move || {
+                tx.send((take_generated_leaf_ticks(), take_generated_fluid_ticks()))
+                    .unwrap();
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(2));
+            (worker, got)
+        })
+        .unwrap();
+        worker.0.join().unwrap();
+        let (leaves, fluids) = worker.1.expect("runtime drain waited on GEN");
+        assert_eq!(
+            leaves,
+            vec![leaf],
+            "unpublished generator leaked into runtime"
+        );
+        assert_eq!(
+            fluids,
+            vec![fluid],
+            "unpublished generator leaked into runtime"
+        );
+        assert_eq!(local.generated_leaf_ticks(), vec![((9, 80, 9), 264)]);
+        with_gen(|g| g.schedule_generated_leaf(leaf.0, leaf.1)).unwrap();
+        assert_eq!(
+            take_generated_leaf_ticks(),
+            vec![leaf],
+            "drain retained the dedup set"
+        );
+        with_gen(|g| g.restore_generated_ticks(vec![leaf], vec![fluid])).unwrap();
+        local.restore_generated_ticks(Vec::new(), Vec::new());
+        assert!(init(1, crate::name_to_state));
+        assert!(take_generated_leaf_ticks().is_empty());
+        assert!(take_generated_fluid_ticks().is_empty());
+    }
 
     #[test]
     fn interpolation_uses_noise_preset_cell_dimensions() {

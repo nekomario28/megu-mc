@@ -2628,13 +2628,9 @@ mod tests {
                 g.feat_write(p.0, p.1, p.2, st);
             }
             let mut ctx = FC::new(&mut g);
-            // The queue is process-global now (its own lock, so the tick drain does not
-            // wait on the worldgen lock), so clear it before the case and take what this
-            // tree scheduled: the assertion is about one tree's native order.
-            let _ = crate::worldgen::take_generated_leaf_ticks();
             let shape = update_leaves(&mut ctx, &logs, &blocked, &[min, max]).unwrap();
             schedule_leaf_edges(&mut ctx, &shape);
-            let got = crate::worldgen::take_generated_leaf_ticks();
+            let got = ctx.g.generated_leaf_ticks();
             let want: Vec<_> = f[8]
                 .split(';')
                 .filter(|v| !v.is_empty())

@@ -18,14 +18,24 @@ SRC=tools/carve-agent
 
 # The ASM jar lives in the local Maven cache, or in a mod-loader's bundled libraries. Take the
 # highest version found rather than a hard-coded one.
-ASM="$(ls ~/.m2/repository/org/ow2/asm/asm/*/asm-*.jar 2>/dev/null | sort -V | tail -1 || true)"
-if [ -z "$ASM" ]; then
-  ASM="$(find /home/yuu/Documents -name 'asm-9*.jar' -path '*libraries*' 2>/dev/null | sort -V | tail -1 || true)"
+if [ -n "${ASM_JAR:-}" ]; then
+  ASM="$ASM_JAR"
+  if [ ! -f "$ASM" ]; then
+    echo "build_carve_agent: ASM_JAR does not exist: $ASM" >&2
+    exit 1
+  fi
+else
+  ASM="$(ls ~/.m2/repository/org/ow2/asm/asm/*/asm-*.jar 2>/dev/null | sort -V | tail -1 || true)"
+  if [ -z "$ASM" ]; then
+    ASM="$(find "$HOME/Documents" -name 'asm-9*.jar' -path '*libraries*' 2>/dev/null | sort -V | tail -1 || true)"
+  fi
+  if [ -z "$ASM" ] || [ ! -f "$ASM" ]; then
+    echo "build_carve_agent: no ASM jar found (set ASM_JAR or install in ~/.m2 or ~/Documents)" >&2
+    exit 1
+  fi
 fi
-if [ -z "$ASM" ] || [ ! -f "$ASM" ]; then
-  echo "build_carve_agent: no ASM jar found (looked in ~/.m2 and /home/yuu/Documents)" >&2
-  exit 1
-fi
+# Preserve an explicit relative ASM_JAR even inside the temporary jar-build directories.
+ASM="$(realpath "$ASM")"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

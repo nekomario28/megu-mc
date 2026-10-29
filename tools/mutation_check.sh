@@ -1088,9 +1088,37 @@ check "huge brown mushroom omits the four cap corners" \
             }' \
   feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
 
+check "independent generators cannot share generated tick queues" \
+  src/worldgen.rs '            generated_ticks: GeneratedTickQueues::default(),
+        };' \
+  '            generated_ticks: GEN_TICK_QUEUES.lock().unwrap().get_or_insert_with(GeneratedTickQueues::default).clone(),
+        };' \
+  worldgen::wg_tests::generated_ticks_belong_to_their_generator
+
+check "runtime drains the published generator queues" \
+  src/worldgen.rs '            *GEN_TICK_QUEUES.lock().unwrap() = Some(g.generated_ticks.clone());' \
+  '            *GEN_TICK_QUEUES.lock().unwrap() = None;' \
+  worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
+
+check "runtime tick drain does not wait for the generation lock" \
+  src/worldgen.rs 'pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
+    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();' \
+  'pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
+    let _guard = gen_lock();
+    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();' \
+  worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
+
+# Both huge mushrooms and huge fungus double height. Bind this mutation to the
+# mushroom's initial height draw; a bare `height *= 2` now matches both bodies.
 check "huge brown mushroom doubles its height on a nextInt(12) draw" \
-  src/feature.rs '        height *= 2;' \
-  '        height += 0;' \
+  src/feature.rs '    let mut height = rng.next_bound(3) + 4;
+    if rng.next_bound(12) == 0 {
+        height *= 2;
+    }' \
+  '    let mut height = rng.next_bound(3) + 4;
+    if rng.next_bound(12) == 0 {
+        height += 0;
+    }' \
   feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
 
 check "huge brown mushroom accepts the whole dirt tag as ground" \

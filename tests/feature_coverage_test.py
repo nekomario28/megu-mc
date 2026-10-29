@@ -31,15 +31,19 @@ class FeatureCoverageTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(json.dumps(value))
             output = io.StringIO()
-            with patch.object(coverage, 'DATA', root), patch.object(sys, 'argv', ['coverage', '--unimplemented']), contextlib.redirect_stdout(output):
+            # Pin the supported set for this graph/filter test. Real parser-arm
+            # extraction is tested below; adding a feature must not silently stop
+            # this fixture exercising inline and named missing-type reporting.
+            with patch.object(coverage, 'DATA', root), \
+                 patch.object(coverage, 'implemented_arms', return_value={'simple_random_selector'}), \
+                 patch.object(sys, 'argv', ['coverage', '--unimplemented']), \
+                 contextlib.redirect_stdout(output):
                 self.assertEqual(coverage.main(), 0)
             text = output.getvalue()
             self.assertIn('2 files + 1 inline, 3 types', text)
             self.assertRegex(text, r'sculk_patch\s+1\s+1\s+1')
-            # An unimplemented type has to be named by the report. The huge mushrooms, the
-            # coral trio and `huge_fungus` used to serve here and now have arms, so `fossil`
-            # and `sculk_patch` keep the gap path exercised; pick the next type from
-            # `feature_type_coverage.py` when they land.
+            # Both the inline and named types absent from the supplied supported
+            # set must be named, regardless of the current port's feature set.
             self.assertRegex(text, r'fossil\s+1\s+1\s+1')
 
     def test_missing_empty_and_invalid_input_cannot_report_zero_gaps(self):
