@@ -613,8 +613,12 @@ def draws_of_trace(path, thread=None):
     return out
 
 
-def placement_windows(path, want_cls=None):
-    """[(thread, classes, draws)] - one entry per `SPWINDOW start`..`SPWINDOW end` pair.
+def placement_windows(path, want_cls=None, want_pass=None):
+    """[(thread, classes, draws, pass chunk)] - one entry per `SPWINDOW` pair.
+
+    The pass chunk matters: a placement window carries no coordinates of its own, so filtering by
+    draw count alone picks *any* chunk's placement - which is how a port window for chunk
+    (-16,112) got compared against other chunks' windows and looked like a stream difference.
 
     This is the unit a port `FSEED_ARM=cx,cz,gi,step` run covers: one placed-feature placement, i.e.
     the modifier draws for every candidate plus every accepted position's feature call. Segmenting
@@ -625,17 +629,24 @@ def placement_windows(path, want_cls=None):
     out = []
     sources = lines_by_thread(path) or {'(untagged)': trace_lines(path)}
     for thread, lines in sources.items():
-        seq, classes, open_ = [], set(), False
+        seq, classes, depth, pchunk = [], set(), 0, None
         for line in lines:
+            if line.startswith('SPASS '):
+                f = line.split()
+                pchunk = (int(f[1]), int(f[2]))
+                continue
             if line.startswith('SPWINDOW start'):
-                seq, classes, open_ = [], set(), True
+                if depth == 0:
+                    seq, classes = [], set()
+                depth += 1
                 continue
             if line.startswith('SPWINDOW end'):
-                if open_:
-                    out.append((thread, classes, seq))
-                open_ = False
+                depth -= 1
+                if depth <= 0:
+                    out.append((thread, classes, seq, pchunk))
+                    depth = 0
                 continue
-            if not open_:
+            if depth == 0:
                 continue
             if line.startswith('SPLACE '):
                 classes.add(line.split()[1])
@@ -647,10 +658,12 @@ def placement_windows(path, want_cls=None):
                     else normalize_draw(m.group(4), None, m.group(5)))
             if item:
                 seq.append(item)
-        if open_:
-            out.append((thread, classes, seq))
+        if depth > 0:
+            out.append((thread, classes, seq, pchunk))
     if want_cls:
         out = [w for w in out if want_cls in w[1]]
+    if want_pass:
+        out = [w for w in out if w[3] == want_pass]
     return out
 
 
@@ -770,9 +783,10 @@ def cmd_compare_draws(args):
               "FEATURE_DRAW_LIMIT)", file=sys.stderr)
         return 2
     if args.split == 'window':
-        windows = placement_windows(args.native, args.feature_class)
-        by_thread = {f"{t}#{i}({'+'.join(sorted(c))})": seq
-                     for i, (t, c, seq) in enumerate(windows) if seq}
+        want_pass = tuple(int(v) for v in args.pass_chunk.split(',')) if args.pass_chunk else None
+        windows = placement_windows(args.native, args.feature_class, want_pass)
+        by_thread = {f"{t}#{i} pass={p} ({'+'.join(sorted(c)) or '-'})": seq
+                     for i, (t, c, seq, p) in enumerate(windows) if seq}
     elif args.split == 'feature':
         windows = feature_windows(args.native, args.feature_class, args.feature_arm)
         by_thread = {f"{t}#{i}({c})": seq for i, (t, c, seq) in enumerate(windows) if seq}
@@ -965,6 +979,7 @@ def main():
                         'the unit a port FSEED_ARM run covers), a single feature invocation '
                         '(SPLACE segments, leading), or a whole thread stream')
     s.add_argument('--feature-class', help='only consider native windows of this SPLACE class')
+    s.add_argument('--pass-chunk', help='only consider windows inside the pass for this cx,cz')
     s.add_argument('--feature-arm', choices=['leading', 'trailing'], default='leading',
                    help='where a feature\'s draws sit relative to its SPLACE marker: leading for '
                         'an agent that arms at placeWithBiomeCheck (the default)')
