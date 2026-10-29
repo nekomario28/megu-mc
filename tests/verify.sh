@@ -19,6 +19,7 @@ python3 tests/feature_coverage_test.py
 python3 tests/test_saved_tick_inventory.py
 python3 tests/biome_tree_test.py
 python3 tests/carver_diff_test.py
+python3 tests/sculk_trace_test.py
 python3 tests/vanilla_java_test.py
 python3 tests/forest_stage_check_test.py
 python3 tests/container_oracle_test.py

@@ -3547,7 +3547,7 @@ fn chunk_delivery_path_bench() {
         None
     };
     let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _gen_guard = crate::worldgen::lock_gen_for_test();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "worldgen");
     let mut gen_sources: GenSources = HashMap::new();
     // a left-to-right sweep, the shape a moving viewer drives: each step moves one chunk
@@ -3653,7 +3653,7 @@ fn chunk_delivery_digest() {
         return;
     }
     let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _gen_guard = crate::worldgen::lock_gen_for_test();
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
     assert!(worldgen::init(0, crate::name_to_state), "worldgen");
     let mut gen_sources: GenSources = HashMap::new();
     // A sweep that walks in +x, so the prefetch switch's +x neighbour is the one that will

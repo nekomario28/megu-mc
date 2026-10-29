@@ -2420,10 +2420,6 @@ pub fn generation_seq() -> u64 {
 /// test modules (`worldgen::wg_tests`' own `lock_gen` still uses it too).
 static GEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-pub(crate) fn lock_gen_for_test() -> std::sync::MutexGuard<'static, ()> {
-    GEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// `GEN`'s lock, timing how long a caller waited for it and how long it held it.
 ///
 /// The parallelization decision needs this split: `FEAT_PROFILE` can say how much
@@ -4717,6 +4713,15 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 }
 
 #[cfg(test)]
+/// The generator lock, for tests outside `wg_tests` that drive `feature::populate`.
+///
+/// `wg_tests` is private, so the reachable path is this wrapper: a parent module can see a
+/// child's private items, and the lock has to be the *same* mutex the generator tests use.
+#[cfg(test)]
+pub(crate) fn lock_gen_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    wg_tests::lock_gen()
+}
+
 mod wg_tests {
     use super::*;
 
@@ -5123,10 +5128,10 @@ mod wg_tests {
         );
     }
 
-    // These tests mutate the shared `GEN` static, so they must not run in parallel. This
-    // is the module-level lock (also used by the delivery-path bench in another test
-    // module): one lock for every test that touches the generator.
-    fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
+    // These tests mutate the shared `GEN` static, so they must not run in parallel. The
+    // lock is the module-level one, also used by tests in other modules (the delivery-path
+    // bench) and visible to them: one lock for every test that touches the generator.
+    pub(super) fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
         super::GEN_TEST_LOCK.lock().unwrap_or_else(|poison| {
             // This mutex only serializes tests; it protects no recoverable data.
             super::GEN_TEST_LOCK.clear_poison();

@@ -2691,7 +2691,51 @@ const SPC_ORIGIN_RADIUS_SQ: i64 = 225;
 const SPC_VEIN: &str = "minecraft:sculk_vein";
 
 /// Counts `SculkSpreader.updateCursors` calls, matching the reference agent's counter.
-static SPC_ROUND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+///
+/// Thread-local like the trace sink: a process-wide counter made a test's trace start at
+/// whatever round another test had reached (measured: `r=16` as the first line instead of `r=0`).
+/// A CLI run has one thread, so its numbering is unchanged.
+thread_local! {
+    static SPC_ROUND: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Where the sculk cursor trace goes: a test installs a **thread-local** sink and reads the lines
+/// back in-process, the CLI gets them on stderr with `SPC_CURSOR_TRACE=1`.
+///
+/// Thread-local rather than a global with a lock, because the suite runs its tests on threads: a
+/// process-wide sink let a concurrently running sculk test's cursors land in this test's trace
+/// (measured: 5310 lines instead of 5150, and no line matched). A thread-local sink cannot be
+/// polluted by another test, because population runs on the thread that asked for it.
+thread_local! {
+    static SPC_TRACE_SINK: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn spc_trace_begin() {
+    SPC_TRACE_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn spc_trace_take() -> Vec<String> {
+    SPC_TRACE_SINK
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// One `SCURSOR` line: identical to the reference agent's `SculkLog.cursor` output.
+fn spc_trace(line: String) {
+    let collected = SPC_TRACE_SINK.with(|s| match s.borrow_mut().as_mut() {
+        Some(lines) => {
+            lines.push(line.clone());
+            true
+        }
+        None => false,
+    });
+    if !collected && std::env::var("SPC_CURSOR_TRACE").is_ok() {
+        eprintln!("{line}");
+    }
+}
 
 /// Which `SculkBehaviour` a state carries: `SculkBlock`, `SculkVeinBlock`, or the default
 /// (everything else, including air).
@@ -2782,11 +2826,17 @@ impl SculkSpreader {
         // The reference agent's `SculkLog.round()` counts every `updateCursors` call the same
         // way, and `i` is the cursor's index in this round's list: a cursor that reaches charge
         // 0 is dropped, so without those two numbers the two traces cannot be aligned.
-        let round = SPC_ROUND.fetch_add(1, Ordering::Relaxed);
+        let round = SPC_ROUND.with(|r| {
+            let v = r.get();
+            r.set(v + 1);
+            v
+        });
+        let traced = std::env::var("SPC_CURSOR_TRACE").is_ok()
+            || SPC_TRACE_SINK.with(|s| s.borrow().is_some());
         let mut kept = Vec::with_capacity(self.cursors.len());
         for (idx, mut cursor) in std::mem::take(&mut self.cursors).into_iter().enumerate() {
-            if std::env::var("SPC_CURSOR_TRACE").is_ok() {
-                eprintln!(
+            if traced {
+                spc_trace(format!(
                     "SCURSOR r={round} i={idx} {} {} {} {} {} {} {}",
                     cursor.pos.0,
                     cursor.pos.1,
@@ -2795,7 +2845,7 @@ impl SculkSpreader {
                     cursor.decay_delay,
                     cursor.update_delay,
                     cursor.facings.map_or(-1, |m| m as i32)
-                );
+                ));
             }
             spc_cursor_update(ctx, rng, &mut cursor, origin, spread_only);
             if cursor.charge > 0 {
@@ -2870,6 +2920,9 @@ fn spc_spread_one(
     kind: SpcKind,
     spread_only: bool,
 ) -> i32 {
+    // Mirrors the native agent's `SCMARK one-charge-sculk` (a hook on
+    // `dmq.a(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I`, the block behaviour's charge use).
+    spc_trace("SCMARK one-charge-sculk".to_string());
     match kind {
         SpcKind::Sculk => {
             if cursor.charge == 0 || rng.next_bound(SPC_DECAY_RATE) != 0 {
@@ -2990,6 +3043,9 @@ fn spc_growth_state(
 /// `SculkBehaviour.attemptSpreadVein` (`dmp.a(dcx,jd,dtc,Collection,boolean)`): the vein,
 /// the default and the `v_` implementations.
 fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool {
+    // Same site as the native agent's `SCMARK attempt-vein` (a hook on
+    // `dmv.a(Ldcx;Ljd;Ldtc;Ljava/util/Collection;)Z`), so the two counts are the same quantity.
+    spc_trace("SCMARK attempt-vein".to_string());
     let (x, y, z) = cursor.pos;
     let state = ctx.get(x, y, z);
     match spc_kind(reg, state) {
@@ -2999,19 +3055,28 @@ fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool
         // agent: the `spreadAll` of a cursor standing on a vein reports `types=3`, and that is
         // where its neighbour-cell placements come from. Treating this like the default
         // behaviour (SAME_POSITION only) was the port's first divergence.
-        SpcKind::Sculk | SpcKind::Vein => spc_spread_all(
-            ctx,
-            reg,
-            cursor.pos,
-            state,
-            &[0, 1, 2],
-            "spread-behaviour-3type",
-        ),
+        // The native agent logs `SSPREADALL types=<n>` at this call (the interface default spreads
+        // with all three types); mirror it here so the counts are the same quantity.
+        SpcKind::Sculk | SpcKind::Vein => {
+            spc_trace("SSPREADALL types=3".to_string());
+            spc_spread_all(
+                ctx,
+                reg,
+                cursor.pos,
+                state,
+                &[0, 1, 2],
+                "spread-behaviour-3type",
+            )
+        }
         // Every other block uses `dmp$1`: null facings -> `m()` (SAME_POSITION only), empty
         // facings -> the interface default (all three), otherwise the static four-argument
         // overload with the faces the cursor stored.
         SpcKind::Other => match cursor.facings {
-            None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
+            None => {
+                // the port's one-type case, matching the native's `SSPREADALL types=1`
+                spc_trace("SSPREADALL types=1".to_string());
+                spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type")
+            }
             Some(0) => spc_spread_all(
                 ctx,
                 reg,
@@ -3464,6 +3529,11 @@ fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
 
 /// `SculkPatchFeature.place` (`edi.a(ecg)`).
 fn gen_sculk_patch(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &SculkPatchCfg) {
+    // Patch marker, in the reference agent's `SPATCH` format (`SculkLog.patch`, hooked into
+    // `SculkPatchFeature.place`): the trace of a run is split by patch via these, because
+    // captures order patches differently and number rounds globally. Logged at entry, before
+    // `canSpreadFrom`, exactly like the agent's hook.
+    spc_trace(format!("SPATCH {} {} {}", pos.0, pos.1, pos.2));
     let Some(reg) = breg() else { return };
     if !spc_can_spread_from(ctx, reg, pos) {
         return;
@@ -8116,6 +8186,12 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         }
     }
     let pop = pop_seed(g.wseed(), sx * 16, sz * 16);
+    // Pass marker, matching the agent's `SPASS` (a hook on `ChunkGenerator.applyBiomeDecoration`):
+    // the native side logs a chunk's placements under the nine base positions of its 3x3 biome
+    // sources, so only the pass marker makes the two sides' attempt lists comparable.
+    if env_str!("FEATURE_ATTEMPT_TRACE").is_some() {
+        eprintln!("SPASS {sx} {sz}");
+    }
     crate::generation_math::CUR_POP_CHUNK.store(
         ((sx as i64) << 32) | (sz as i64 & 0xFFFF_FFFF),
         std::sync::atomic::Ordering::Relaxed,
@@ -8138,6 +8214,13 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             let Some(pf) = fr.placed.get(name) else {
                 continue;
             };
+            // Feature-attempt trace, for comparing the *placement pipeline* with the native side
+            // (`SPLACE` from the agent's `ebq.a` hook): one line per (chunk, placed feature) in
+            // the order they are attempted, which is what localises an RNG-stream divergence to
+            // the first feature that differs. `FEATURE_ATTEMPT_TRACE=1`.
+            if env_str!("FEATURE_ATTEMPT_TRACE").is_some() {
+                eprintln!("SATTEMPT {name} {sx} {sz} {gi} {step}");
+            }
             let deco = pop
                 .wrapping_add(*gi as u64)
                 .wrapping_add(10_000u64.wrapping_mul(step as u64));

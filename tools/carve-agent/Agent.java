@@ -1130,6 +1130,369 @@ class SculkTransformer implements ClassFileTransformer {
                 return null;
             }
         }
+        if ("ad".equals(name)) {
+            // `Util.shuffledCopy(ObjectArrayList|Stream, RandomSource)`: log the list size and the
+            // caller class at entry, so a shuffle's bound can be traced back to the list that owns
+            // it (a `nextInt(49)` is a 50-element list, and the caller names it).
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        boolean list = mn.equals("a")
+                                && md.equals("(Lit/unimi/dsi/fastutil/objects/ObjectArrayList;Layw;)Ljava/util/List;");
+                        boolean stream = mn.equals("a")
+                                && md.equals("(Ljava/util/stream/Stream;Layw;)Ljava/util/List;");
+                        if (!list && !stream) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                if (list) {
+                                    super.visitVarInsn(Opcodes.ALOAD, 0);
+                                    super.visitMethodInsn(Opcodes.INVOKEVIRTUAL,
+                                            "it/unimi/dsi/fastutil/objects/ObjectArrayList", "size", "()I", false);
+                                } else {
+                                    super.visitInsn(Opcodes.ICONST_M1);
+                                }
+                                super.visitTypeInsn(Opcodes.NEW, "java/lang/Throwable");
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Throwable",
+                                        "<init>", "()V", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Throwable",
+                                        "getStackTrace", "()[Ljava/lang/StackTraceElement;", false);
+                                super.visitInsn(Opcodes.ICONST_1);
+                                super.visitInsn(Opcodes.AALOAD);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StackTraceElement",
+                                        "getClassName", "()Ljava/lang/String;", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "shuffle",
+                                        "(ILjava/lang/String;)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT ad shuffledCopy hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT ad hook failed: " + t);
+                return null;
+            }
+        }
+        if ("eiv".equals(name)) {
+            // `eiv` is `PlacedFeature` (`net.minecraft.world.level.levelgen.placement.PlacedFeature`).
+            // Its `b(Ldds;Lduz;Layw;Ljd;)Z` is `placeWithBiomeCheck` - the placement's outermost
+            // entry, so the *position draws* the placement modifiers make happen inside the armed
+            // window. Arming on `ConfiguredFeature.place` (`ebq`) cannot see them: the modifiers
+            // run before that method is reached (measured: those windows held no position draw at
+            // all - SPLACE -> SRNG -> SPATCH with nothing between).
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        if (!mn.equals("b") || !md.equals("(Ldds;Lduz;Layw;Ljd;)Z")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int op) {
+                                if (op == Opcodes.IRETURN) {
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                            "windowEnd", "()V", false);
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                            "disarm", "()V", false);
+                                }
+                                super.visitInsn(op);
+                            }
+
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                        "armPlacement", "()V", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                        "windowStart", "()V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT eiv placement-window hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT eiv hook failed: " + t);
+                return null;
+            }
+        }
+        if ("dyn".equals(name) || "dzz".equals(name) || "dzx".equals(name) || "dyz".equals(name)
+                || "dzr".equals(name) || "dzo".equals(name)) {
+            // The placement RNG's draws, logged only while a sculk patch is being placed (the
+            // `armed` flag is set by the `ebq` hook). `(value, kind)` argument order so the value
+            // can be DUP-ed before the call and survive the return.
+            String[][] ints = {
+                // class, method, descriptor, kind
+                // `dyn` (BitRandomSource) is the mixin interface the legacy sources inherit their
+                // bounded/derived draws from - the placement's `nextInt(bound)` is here, which is
+                // why hooking only the concrete classes recorded `next(bits)` (the raw generator,
+                // full-range values) and missed the positions entirely.
+                {"dyn", "a", "(I)I", "nextInt(bound)@dyn"},
+                {"dyn", "f", "()I", "nextInt()@dyn"},
+                {"dyn", "h", "()Z", "nextBoolean@dyn"},
+                {"dzr", "c", "(I)I", "next(bits)@dzr"},
+                {"dzo", "c", "(I)I", "next(bits)@dzo"},
+                {"dzz", "a", "(I)I", "nextInt(bound)@dzz"},
+                {"dzz", "f", "()I", "nextInt()@dzz"},
+                {"dzx", "c", "(I)I", "next(bits)@dzx"},
+                {"dzx", "l", "()I", "nextInt()@dzx"},
+                {"dyz", "c", "(I)I", "next(bits)@dyz"},
+            };
+            String[][] longs = {
+                {"dzz", "g", "()J", "nextLong()@dzz"},
+                {"dyn", "g", "()J", "nextLong()@dyn"},
+            };
+            String[][] doubles = {
+                {"dyn", "j", "()D", "nextDouble()@dyn"},
+                {"dzz", "j", "()D", "nextDouble()@dzz"}, {"dzz", "k", "()D", "gaussian@dzz"},
+                {"dyz", "k", "()D", "nextDouble()@dyz"},
+                {"dzr", "k", "()D", "nextDouble()@dzr"},
+                {"dzo", "k", "()D", "nextDouble()@dzo"}};
+            String[][] floats = {
+                {"dzz", "i", "()F", "nextFloat()@dzz"},
+                {"dyn", "i", "()F", "nextFloat()@dyn"},
+            };
+            try {
+                ClassReader cr = new ClassReader(buf);
+                final int[] hooked = {0};
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        String kind = null, logger = null, desc = null;
+                        int opcode = 0, localOp = 0;
+                        boolean bounded = false;
+                        for (String[] row : ints) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                // `(I)I` is `nextInt(bound)`: log the bound too, so the value can
+                                // be matched against the port's `nextInt(<bound>)=<value>`.
+                                bounded = md.equals("(I)I") && !row[3].contains("bits");
+                                logger = bounded ? "drawIBound" : "drawI";
+                                desc = bounded ? "(IILjava/lang/String;)V" : "(ILjava/lang/String;)V";
+                                opcode = Opcodes.IRETURN;
+                                localOp = Opcodes.ILOAD;
+                            }
+                        }
+                        for (String[] row : longs) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                logger = "drawJ";
+                                desc = "(JLjava/lang/String;)V";
+                                opcode = Opcodes.LRETURN;
+                            }
+                        }
+                        for (String[] row : doubles) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                logger = "drawD";
+                                desc = "(DLjava/lang/String;)V";
+                                opcode = Opcodes.DRETURN;
+                            }
+                        }
+                        for (String[] row : floats) {
+                            if (row[0].equals(name) && row[1].equals(mn) && row[2].equals(md)) {
+                                kind = row[3];
+                                logger = "drawF";
+                                desc = "(FLjava/lang/String;)V";
+                                opcode = Opcodes.FRETURN;
+                            }
+                        }
+                        if (kind == null) return mv;
+                        hooked[0]++;
+                        final String k = kind, lg = logger, dsc = desc;
+                        final int ret = opcode;
+                        final boolean bd = bounded;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int op) {
+                                if (op == ret) {
+                                    // a long/double needs DUP2 (DUP only covers a category-1
+                                    // value, measured: `dyz.k()D @7: dup` failed verification)
+                                    super.visitInsn(ret == Opcodes.LRETURN || ret == Opcodes.DRETURN
+                                            ? Opcodes.DUP2 : Opcodes.DUP);
+                                    if (bd) {
+                                        super.visitVarInsn(Opcodes.ILOAD, 1);
+                                    }
+                                    super.visitLdcInsn(k);
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", lg, dsc,
+                                            false);
+                                }
+                                super.visitInsn(op);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT rng draw hook installed for " + name
+                        + (hooked[0] == 0 ? " (no method matched)" : " (" + hooked[0] + " methods)"));
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT rng draw hook failed for " + name + ": " + t);
+                return null;
+            }
+        }
+        if ("duz".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        // `ChunkGenerator.applyBiomeDecoration(WorldGenLevel, ChunkAccess,
+                        // StructureManager)`: log the decorated chunk, so the placement lines of
+                        // a pass can be told apart from the 8 neighbouring passes that log the
+                        // same biome sources.
+                        if (!mn.equals("a") || !md.equals("(Ldds;Lduy;Lddq;)V")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.ALOAD, 2);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "duy", "f", "()Ldcd;",
+                                        false);
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "e", "I");
+                                super.visitInsn(Opcodes.SWAP);
+                                super.visitFieldInsn(Opcodes.GETFIELD, "dcd", "f", "I");
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "pass",
+                                        "(II)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT duz decoration-pass hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT duz decoration-pass hook failed: " + t);
+                return null;
+            }
+        }
+        if ("ebq".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        // `PlacedFeature.placeWithBiomeCheck(ServerLevelAccessor, ChunkGenerator,
+                        // RandomSource, BlockPos)`: log the feature class and the chunk it is
+                        // attempted in, at entry, one line per attempt.
+                        if (!mn.equals("a") || !md.equals("(Ldds;Lduz;Layw;Ljd;)Z")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitInsn(int op) {
+                                // the method returns boolean, so its return opcode is IRETURN
+                                if (op == Opcodes.IRETURN) {
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                            "disarm", "()V", false);
+                                }
+                                super.visitInsn(op);
+                            }
+
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.ALOAD, 0);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ebq", "b", "()Lece;",
+                                        false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Object",
+                                        "getClass", "()Ljava/lang/Class;", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Class",
+                                        "getName", "()Ljava/lang/String;", false);
+                                super.visitVarInsn(Opcodes.ALOAD, 4);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "u", "()I", false);
+                                super.visitInsn(Opcodes.ICONST_4);
+                                super.visitInsn(Opcodes.ISHR);
+                                super.visitVarInsn(Opcodes.ALOAD, 4);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "w", "()I", false);
+                                super.visitInsn(Opcodes.ICONST_4);
+                                super.visitInsn(Opcodes.ISHR);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "place",
+                                        "(Ljava/lang/String;II)V", false);
+                                // the RNG instance the placement was handed, so the class to hook
+                                // is a measurement rather than a guess
+                                super.visitVarInsn(Opcodes.ALOAD, 3);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Object",
+                                        "getClass", "()Ljava/lang/Class;", false);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Class",
+                                        "getName", "()Ljava/lang/String;", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "rngClass",
+                                        "(Ljava/lang/String;)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT ebq placement hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT ebq placement hook failed: " + t);
+                return null;
+            }
+        }
+        if ("edi".equals(name)) {
+            try {
+                ClassReader cr = new ClassReader(buf);
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+                    @Override protected String getCommonSuperClass(String a, String b) {
+                        return "java/lang/Object";
+                    }
+                };
+                cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                    @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                            String sig, String[] ex) {
+                        MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                        // `SculkPatchFeature.place(FeaturePlaceContext)`: log the origin
+                        if (!mn.equals("a") || !md.equals("(Lecg;)Z")) return mv;
+                        return new MethodVisitor(Opcodes.ASM9, mv) {
+                            @Override public void visitCode() {
+                                super.visitCode();
+                                super.visitVarInsn(Opcodes.ALOAD, 1);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "ecg", "e", "()Ljd;", false);
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "u", "()I", false);
+                                super.visitInsn(Opcodes.SWAP);
+                                super.visitInsn(Opcodes.DUP);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "v", "()I", false);
+                                super.visitInsn(Opcodes.SWAP);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jd", "w", "()I", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "patch",
+                                        "(III)V", false);
+                            }
+                        };
+                    }
+                }, 0);
+                System.err.println("SCULKAGENT edi patch hook installed");
+                return cw.toByteArray();
+            } catch (Throwable t) {
+                System.err.println("SCULKAGENT edi patch hook failed: " + t);
+                return null;
+            }
+        }
         if (!"dmu$a".equals(name)) return null;
         try {
             ClassReader cr = new ClassReader(buf);

@@ -18,6 +18,36 @@ Original carver hooks (both ASM, applied at class load):
   `Block.BLOCK_STATE_REGISTRY` in the instrumented bytecode, so no game class is
   referenced from the bootstrap logger.
 
+Sculk hook (the sculk cursor/parity work in `specs/worldgen-parity/sculk-patch.md`):
+
+- `dmu$a` (`SculkSpreader$ChargeCursor`) / its update hook logs `SCURSOR r=<round> i=<index>
+  x y z charge decayDelay updateDelay facingMask` and `SSPREAD`/`SSPREADALL`/`SCMARK` around
+  the spread calls.
+- `duz` (`ChunkGenerator`) / `applyBiomeDecoration(WorldGenLevel, ChunkAccess,
+  StructureManager)`: at method entry, logs `SPASS cx cz` with the decorated chunk. One pass
+  decorates the 3x3 biome sources around its chunk, so a chunk's placements are logged under
+  nine different base positions and only the pass marker groups them correctly. The port emits
+  the same marker from `populate` (`FEATURE_ATTEMPT_TRACE=1`).
+- `ebq` (`ConfiguredFeature` - **not** `PlacedFeature`; the mapping is
+  `net.minecraft.world.level.levelgen.feature.ConfiguredFeature -> ebq`) /
+  `place(WorldGenLevel, ChunkGenerator, RandomSource, BlockPos)`: at method entry, logs
+  `SPLACE <feature-class> <cx> <cz>` and `SRNG <rng-class>`, one line per feature placement.
+  `PlacedFeature` is `eiv`: `eiv.b(...)` is `placeWithBiomeCheck` and `eiv.a(...)` is `place`.
+  The placement modifiers run *before* `ConfiguredFeature.place` (inside
+  `placeWithBiomeCheck`), so the `SPLACE` window cannot contain the placement's position draws -
+  arming on `eiv.b` is the open next step (`SculkLog.armPlacement` exists for it).
+- Draw hooks: the legacy sources' bounded draws come from the mixin interface `dyn`
+  (`BitRandomSource`), not from the concrete classes - measured 313289 `nextInt(bound)@dyn`
+  lines; `dzx.c(I)I` is `next(bits)`, the raw generator (full-range values). The feature arrives as its *class* - `edi` is unique to `minecraft:sculk_patch`,
+  but e.g. one ore class carries dozens of placed feature ids (measured: 550 attempts in one
+  chunk over 14 classes), so this identifies a feature type, not a placed feature.
+- `edi` (`SculkPatchFeature`) / `place(FeaturePlaceContext)`: at method entry, logs
+  `SPATCH x y z` with `ecg.e()` (the placement origin). The trace of a run splits by patch on
+  these, which is what makes two runs comparable: captures order patches differently and `r`
+  counts every `updateCursors` call in the whole run (measured: the same patch is `r=0` in one
+  capture, `r=192` in another). Only a few of the logged calls go on to spread (mk6 capture:
+  1231 `SPATCH`, 57 origins spread).
+
 `CarveLog` is appended to the bootstrap class loader (the game classes live in
 the bundler's child loader, so an app-loader class is not visible to them) and
 takes only primitives, so it never needs a game type. Frames are recomputed with
@@ -37,6 +67,15 @@ cp -r c1/* j1/ && (cd c1 && jar xf "$ASM" org) && cp -r c1/org j1/
 printf 'Premain-Class: Agent\n' > j1/META-INF/MANIFEST.MF
 (cd j1 && jar cfm ../carveagent.jar META-INF/MANIFEST.MF .)
 ```
+
+`SculkLog` writes to its own file, not stdout: `-Dsculktrace=<path>` (default
+`sculk-trace.txt`). The game routes stdout through log4j, whose console appender does not
+preserve a thread's line order, so anything that attributes a line to the `SPASS`/`SPLACE`
+window it sits between reads scrambled order (measured: a thread's sculk windows held none of
+its 41208 draws). One lock plus a buffered writer keeps program order.
+
+`SculkLog.patch` only takes three ints, like the other SculkLog methods, so it needs no game
+class on the bootstrap classpath.
 
 Both loggers go into `carvelog.jar` (the bootstrap-visible one); the agent jar carries ASM
 itself, so nothing else has to be on the classpath.

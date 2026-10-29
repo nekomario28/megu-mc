@@ -26,7 +26,11 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="$1"; CX="$2"; CZ="$3"; N="${4:-3}"; MODE="${5:-features}"
-DIR="/tmp/chunkfix-$TAG"
+# Captures are 120-200 MB each (`libraries/` + `versions/` + the world), which is why the
+# fixture root is configurable: /tmp is a 6 GB tmpfs on this host and two runs died with
+# ENOSPC. `FIXTURE_DIR` (default /tmp) moves them to disk-backed storage.
+FIXTURE_DIR="${FIXTURE_DIR:-/tmp}"
+DIR="$FIXTURE_DIR/chunkfix-$TAG"
 BASE="${CARVER_FIXTURE_BASE:-/tmp/carverfresh}"
 "$ROOT/tools/fixture_base.sh" "$BASE" >/dev/null
 rm -rf "$DIR"; mkdir -p "$DIR/world"
@@ -71,7 +75,12 @@ echo "chunk fixture $TAG: mode $MODE, chunks ($CX,$CZ)+${N}x${N}, blocks ($lox,$
                    sleep 0.1
                  done
                  printf 'forceload add %d %d %d %d\n' "$lox" "$loz" "$hix" "$hiz"
-                 sleep 75
+                 # How long to let the force-loaded chunks finish after `forceload add`. 75 s
+                 # was sized for a surface fixture at 20 TPS; a capture that only needs its
+                 # target chunk populated can pass a smaller `FIXTURE_SETTLE`. The reference is
+                 # still verified chunk by chunk below (`Status: minecraft:full`), so a too
+                 # short settle is a loud failure, not a silent one.
+                 sleep "${FIXTURE_SETTLE:-75}"
                  printf 'save-all flush\n'
                  sleep 10
                  printf 'stop\n' ) \

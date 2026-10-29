@@ -33,7 +33,13 @@
 | `carver_fixture.sh <tag> <cave> <extra> <canyon> [n]` | carver だけを残した world を作り、port と block 単位で diff。`ctl` pack で carver を差し替え |
 | `vanilla_sculk_pack.py <jar> <world> --variant veins\|one-patch [--count N] [--height MIN:MAX]` | deep-dark の step 7 を片方だけに絞った datapack を書く（`sculk_vein` と `sculk_patch_deep_dark` は 同じ decorator stream を共有するので、全セル比較ではどちらが動いたか言えない）。port 側にも同じ ファイルを入れる必要がある（script は path を印字するだけで port の pack には触らない）。 fixture 側は `sculk_veins` / `sculk_one_patch` / `sculk_cave_patch` モード |
 | `tools/carve-agent/`（`Agent.java` + `CarveLog.java` + `SculkLog.java`、`JAVA_AGENT=` で参照サーバーに載せる） | 固定 jar を ASM で instrument して**native の中間状態**を取る。sculk 用に `SCURSOR r=<round> i=<index> x y z charge decayDelay updateDelay facingMask`（`dmp$a` の `ChargeCursor.update` 入口）と `SCMARK`（呼び出し元）/`SSPREADALL types=<n>`（spread type 数）を出す。`-Dfeaturebox=minX,minY,minZ,maxX,maxY,maxZ` で feature 層の書き込みを `FCELL x y z state=<id> feature=<gi>,<step> chunk=<pop>` としても出る。port 側は対応する `SPC_CURSOR_TRACE` / `SPC_TRACE_ALL` / `FEATURE_WRITE_TRACE`（+`GENERIC_CASE_DUMP`）で同じ形を出せる。[計器と実測](../specs/worldgen-parity/sculk-patch.md) |
-| `sculk_trace.py extract <run.log> [--rounds N]` / `sculk_trace.py compare <native> <port>` | `SculkSpreader$ChargeCursor.update` の trace を抽出し **(round, index) で整列**して比較する（cell の集合ではなく trajectory を比べる）。共有キーが食い違えば exit 1。native 側の先頭スライスは `tests/data/sculk_cursor_1211.tsv` |
+| `build_carve_agent.sh [out-dir]` | carve-agent の jar を組んで**検証する**（`Agent.class`/ASM/ロガーの中身、マーカー文字列、フックの配線まで確認してから返す）。手順を手で打つと `head` が javac の終了コードを飲んだり、半分適用された編集から jar を作ったりして「動いているように見える古い jar」ができる（実測で2回踏んだ）。`sculk_capture.sh` はこれを使う |
+| `sculk_capture.sh <tag> [--chunk CX CZ] [--n N] [--mode M] [--jar PATH] [--settle S]` | **native capture を1コマンドに**する。agent を組む → fixture を回す（trace は `-Dsculktrace=` で自前ファイルへ）→ `PROVENANCE-<tag>.txt`（seed/chunk/agent sha/行数）を書く → `sculk_trace.py sanity` で**読めない trace を不合格**にする。既定の保存先 `~/.cache/mc-spine-audit/sculk-traces/` |
+| `sculk_port_run.sh <tag> [--n N --x CX --z CZ --arm cx,cz,gi,step --limit N]` | **port 側の run を1コマンドに**（`MC_SPINE_WG_PROFILE=0` で warm-up を切る／`FEATURE_ATTEMPT_TRACE`・`SPC_CURSOR_TRACE`・`FSEED_ARM`＋`FEATURE_DRAW_LIMIT` を1箇所に／provenance／`sanity`）。env を1つ忘れると trace が答えられない問いが生まれる（例: `FEATURE_ATTEMPT_TRACE` 無しだと `SPASS` が無く pass 比較が無意味）ので、一緒に運ぶ env は1ファイルに置く |
+| `sculk_capture.sh <tag> --jvm-opt=-Dfoo=bar` | JVM プロパティを capture に渡す（例: `-Dbiomefchunk=cx,cz` で native 側の biome フィルタ判定 `BIOMEF` を出し、port の `BIOMEF_TRACE=cx,cz` と突き合わせる。実測: sculk patch の候補 256/256、判定 256/256、採用 21/21 が一致）|
+| `sculk_trace.py compare-draws <native> <port-draw.log>` | port の draw 列を native の流れから **`(bound, value)`** で探し、一致長と最初の食い違いを出す（native 側は `SculkLog.drawIBound` が bound を出す）。実測: `sculk_patch_deep_dark` chunk (-16,112) で **24本一致**、25本目で port `nextInt(16)=12` / native `nextInt(49)=6` |
+| `sculk_trace.py summary\|sanity\|passes\|windows\|draws\|names\|compare-passes\|extract\|patches` | trace の読み取り・検査・比較を**1つの道具**にした。`sanity` は「窓に draw が入っていない」「`SPLACE` が feature 表に無いクラスを指す」「`run.log`（= log4j、行順がプログラム順でない）を位置で切ろうとしている」「port のログに `[wgprof]` と `[wgdump]` の2 phase が混ざっている（= 配置行と arm 済み draw 行が別 run のもの）」を**不合格にする**。実測: 健全な capture = SANE、`ebq`（=`ConfiguredFeature`）で arm した capture = UNUSABLE、draw フック無し = UNUSABLE。`compare-passes` は pass 単位で試行 origin 集合を突き合わせ、差の分布と最初の食い違いを出す |
+| `sculk_trace.py extract <run.log> [--origin x,y,z] [--lines N]` | `SculkSpreader$ChargeCursor.update` の trace を抽出し **(round, index) で整列**して比較する（cell の集合ではなく trajectory を比べる）。共有キーが食い違えば exit 1。native 側の先頭スライスは `tests/data/sculk_cursor_1211.tsv`。capture はパッチの出現順と `r` の通し番号が実行ごとに変わるので、`--origin` でパッチを選び `r` をパッチ内 round に正規化する（実測: 同一パッチは 2 capture で 60/60 一致）|
 | `sculk_gate.py <world> <dump.bin> <n> <x0> <z0> [--require-match]` | sculk ファミリ（`sculk`/`sculk_vein`/`sculk_catalyst`/`sculk_shrieker`）のセルだけを参照 region と port dump で照合する。feature 単体の oracle が使えない `sculk_patch` の合格条件。sculk の無い参照は exit 2（何も証明しない）。[経路と実測値](../specs/worldgen-parity/sculk-patch.md) |
 | `chunk_world_fixture.sh <tag> <cx> <cz> <n> <terrain\|carvers\|features\|structures>` | 固定jarの同一座標regionをforceloadし、mc-spineの同じstage dumpと`carver_diff`で比較する。参照chunkの完成を先に検査する |
 | `ore_fixture.sh <tag> <keep> [n]` | `ore_*`/`disk_*` のうち `<keep>` 以外の placement を `count: 0` にした world を作る（1 feature 隔離） |
@@ -67,6 +73,26 @@
 | `SIMPLE_TRACE` / `ORE_TRACE` / `TREE_TRACE` / `ORE_CELL_TRACE` | 個別 feature の試行・origin・書き込み数 |
 | `PF_UNKNOWN` / `CF_MISSING` | **落ちた** placement modifier / configured feature の名前 |
 | `MC_SPINE_POP_REGION` / `MC_SPINE_DFDUMP` / `MC_SPINE_HM_DUMP` / `MC_SPINE_BIOME_AT` / `MC_SPINE_BIOME_DUMP` | 密度値・ハイトマップ・biome の2定義の実測 |
+
+## sculk trace の読み方（この順で）
+
+この節の教訓の一般形は skill `trace-oracle-reliability`（計器を作る側の失敗型: arm 点が1段深い／
+行順がプログラム順でない／1ファイルに2 run／フック状態のスコープ／古い jar／ラベル≠実体／
+落ちたことのある gate）に蒸留してある。
+
+1. `tools/sculk_capture.sh <tag>` — 組んで・回して・`sanity` で弾く。trace の行順は
+   **プログラム順**（`SculkLog` が自前の writer に書く）。`run.log` は log4j 経由で、同じ
+   スレッドの行順すら保たない（実測: ある窓に draw が1本も無いのに、同じスレッドの stream には
+   41208 本ある）ので、**位置で切る解析を `run.log` に対してやってはいけない**
+   （`sculk_trace.py` はそれを拒否する）。
+2. `tools/sculk_trace.py summary <trace>` — 種類ごとの件数、窓のうち draw を持つものの数、
+   `SPLACE` に出てくるクラスと feature 型（`tests/data/feature_classes_1211.tsv` 経由）。
+3. `tools/sculk_trace.py sanity <trace>` — 読めない trace を不合格にする。特に
+   「draw はあるのに位置らしい draw（小さな `nextInt`）が窓に無い」は、**arm 点が1段深い**
+   （`ebq`=`ConfiguredFeature.place` ではなく `eiv.b`=`PlacedFeature.placeWithBiomeCheck`）
+   という形で、これを一度踏んでいる（下の spec ページ）。
+4. `tools/sculk_trace.py compare-passes <native> <port>` — pass 単位の突き合わせ。
+   `--arm leading|trailing` は agent の arm 位置で決まる（`sanity` がどちらかを報告する）。
 
 ## 参照側の計測（javaagent: `tools/carve-agent/`）
 
