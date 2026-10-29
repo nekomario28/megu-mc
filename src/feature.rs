@@ -2920,6 +2920,9 @@ fn spc_spread_one(
     kind: SpcKind,
     spread_only: bool,
 ) -> i32 {
+    // Mirrors the native agent's `SCMARK one-charge-sculk` (a hook on
+    // `dmq.a(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I`, the block behaviour's charge use).
+    spc_trace("SCMARK one-charge-sculk".to_string());
     match kind {
         SpcKind::Sculk => {
             if cursor.charge == 0 || rng.next_bound(SPC_DECAY_RATE) != 0 {
@@ -3040,6 +3043,9 @@ fn spc_growth_state(
 /// `SculkBehaviour.attemptSpreadVein` (`dmp.a(dcx,jd,dtc,Collection,boolean)`): the vein,
 /// the default and the `v_` implementations.
 fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool {
+    // Same site as the native agent's `SCMARK attempt-vein` (a hook on
+    // `dmv.a(Ldcx;Ljd;Ldtc;Ljava/util/Collection;)Z`), so the two counts are the same quantity.
+    spc_trace("SCMARK attempt-vein".to_string());
     let (x, y, z) = cursor.pos;
     let state = ctx.get(x, y, z);
     match spc_kind(reg, state) {
@@ -3049,19 +3055,28 @@ fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool
         // agent: the `spreadAll` of a cursor standing on a vein reports `types=3`, and that is
         // where its neighbour-cell placements come from. Treating this like the default
         // behaviour (SAME_POSITION only) was the port's first divergence.
-        SpcKind::Sculk | SpcKind::Vein => spc_spread_all(
-            ctx,
-            reg,
-            cursor.pos,
-            state,
-            &[0, 1, 2],
-            "spread-behaviour-3type",
-        ),
+        // The native agent logs `SSPREADALL types=<n>` at this call (the interface default spreads
+        // with all three types); mirror it here so the counts are the same quantity.
+        SpcKind::Sculk | SpcKind::Vein => {
+            spc_trace("SSPREADALL types=3".to_string());
+            spc_spread_all(
+                ctx,
+                reg,
+                cursor.pos,
+                state,
+                &[0, 1, 2],
+                "spread-behaviour-3type",
+            )
+        }
         // Every other block uses `dmp$1`: null facings -> `m()` (SAME_POSITION only), empty
         // facings -> the interface default (all three), otherwise the static four-argument
         // overload with the faces the cursor stored.
         SpcKind::Other => match cursor.facings {
-            None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
+            None => {
+                // the port's one-type case, matching the native's `SSPREADALL types=1`
+                spc_trace("SSPREADALL types=1".to_string());
+                spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type")
+            }
             Some(0) => spc_spread_all(
                 ctx,
                 reg,

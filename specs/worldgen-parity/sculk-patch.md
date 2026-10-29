@@ -1258,6 +1258,38 @@ native 側は behaviour 選択の呼び出し地点を既にログしている�
 （`sculk_port_run.sh` は draw を arm していない実行を `sanity` が正しく拒否するが、cell ゲートには
 draw が不要なので、arm 無しの実行を許可する口を足すのが望ましい。）
 
+### マーカーを port に足した結果: **数字はまだ同じ量ではない**（2026-10-28）
+
+port の cursor 経路に `SCMARK attempt-vein` / `SCMARK one-charge-sculk` / `SSPREADALL types=3|1` を
+足し、同じ領域（`--n 2 --x -16 --z 112`）で数えた:
+
+| site | native | port |
+|---|---|---|
+| `SSPREADALL types=3` | 28249 | 4814 |
+| `SSPREADALL types=1` | 520 | 154 |
+| `SCMARK one-charge-sculk` | 6316 | 5485 |
+| `SCMARK attempt-vein` | 2002 | **5485** |
+| `SCMARK one-charge-vein` | 13011 | （未ミラー） |
+| `SCMARK convert` | 13011 | （未ミラー） |
+
+**結論: この数字はまだ比較できない**。理由はアンカーが同じ関数ではないこと:
+
+- native の `SSPREADALL` は **spreadAll の実装側**で出る（1回の呼び出しの中で複数回出得る）のに対し、
+  port 側は match アームで **呼び出しごとに1回**出している → 量が違う
+- native の `attempt-vein` は `dmv.a(Ldcx;Ljd;Ldtc;Collection)Z` という**別のメソッド**のフックで、
+  port 側は `spc_attempt_spread_vein` の入口に出している → 量が違う（2.7倍はその差）
+- `one-charge-vein` / `convert` は port に未ミラー
+
+**教訓（このセッションで繰り返した罠の再演）**: ラベルを合わせただけでは同じ量にならない。
+各マーカーは **mappings で対応するメソッドを確定してから**同じ関数に置く必要がある。ラベルが同じで
+件数が違うときは「実装差」ではなく「計器差」を先に疑う。
+
+**次の1手**: `SCMARK`/`SSPREADALL` の各ラベルについて、native 側のフック対象メソッド
+（`dmv.a(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I` = `one-charge-vein`、`dmv.a(Ldmu;Ldcx;Ljd;Layw;)Z` = `convert`、
+`dmv.a(Ldcx;Ljd;Ldtc;Collection)Z` = `attempt-vein`、`dmq.a(Ldmu$a;...)I` = `one-charge-sculk`）を
+port のどの関数が実装しているかを1つずつ対応づけ（mappings と port の該当箇所を並べて確認）、
+そのうえで同じ地点に置き直して数え直す。
+
 ## 効率化の基盤（2026-10-28）
 
 このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。
