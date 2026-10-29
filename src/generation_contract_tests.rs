@@ -692,6 +692,105 @@ fn sculk_decay_delay_follows_the_behaviour() {
     );
 }
 
+/// Blocks.qQ is the sensor, not sculk: pin both growth outcomes and their draw count.
+#[test]
+fn sculk_growth_is_sensor_or_shrieker_not_sculk() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    g.feat_write(0, 80, 0, 0);
+    let mut ctx = context(&mut g);
+    let mut rng = Xor::seed_worldgen(0);
+    let mut expected_rng = Xor::seed_worldgen(0);
+    for _ in 0..64 {
+        let rare = expected_rng.next_bound(11) == 0;
+        let st = super::spc_growth_state(&mut ctx, reg, &mut rng, (0, 80, 0), true);
+        assert_eq!(
+            reg.name_of(st),
+            if rare {
+                "minecraft:sculk_shrieker"
+            } else {
+                "minecraft:sculk_sensor"
+            }
+        );
+    }
+    assert_eq!(rng.next_bound(1000), expected_rng.next_bound(1000));
+}
+
+#[test]
+fn sculk_growth_density_counts_sensors_not_sculk_floor() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    for x in -4..=4 {
+        for y in 80..=83 {
+            for z in -4..=4 {
+                g.feat_write(x, y, z, 0);
+            }
+        }
+    }
+    let sculk = reg.state_of("minecraft:sculk", None);
+    for x in -4..=4 {
+        g.feat_write(x, 80, 0, sculk);
+    }
+    let mut ctx = context(&mut g);
+    assert!(
+        super::spc_can_place_growth(&mut ctx, reg, (0, 80, 0)),
+        "sculk floor is not growth density"
+    );
+    let sensor = reg.state_of("minecraft:sculk_sensor", None);
+    for x in 1..=3 {
+        ctx.set(x, 81, 0, sensor);
+    }
+    assert!(
+        !super::spc_can_place_growth(&mut ctx, reg, (0, 80, 0)),
+        "three nearby sensors suppress new growth"
+    );
+}
+
+#[test]
+fn sculk_regrow_restores_supported_remembered_faces() {
+    let reg = breg().unwrap();
+    for waterlogged in [false, true] {
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -1..=1 {
+            for y in 79..=81 {
+                for z in -1..=1 {
+                    g.feat_write(x, y, z, 0);
+                }
+            }
+        }
+        let deepslate = reg.state_of("minecraft:deepslate", None);
+        g.feat_write(0, 79, 0, deepslate);
+        if waterlogged {
+            g.feat_write(0, 80, 0, reg.state_of("minecraft:water", None));
+        }
+        let mut ctx = context(&mut g);
+        let mut cursor = super::SpcCursor::new((0, 80, 0), 10);
+        cursor.facings = Some(0b000011); // remembered down + up; only down is supported
+        super::spc_trace_begin();
+        let grew = super::spc_attempt_spread_vein(&mut ctx, reg, &cursor);
+        let trace = super::spc_trace_take();
+        assert!(grew);
+        let st = ctx.get(0, 80, 0);
+        assert_eq!(reg.name_of(st), "minecraft:sculk_vein");
+        assert_eq!(super::spc_face_mask(reg, st), Some(1));
+        assert_eq!(
+            reg.get_prop(st, "waterlogged").as_deref(),
+            Some(if waterlogged { "true" } else { "false" })
+        );
+        assert_eq!(
+            trace.iter().filter(|s| *s == "SCMARK attempt-vein").count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn sculk_charge_decay_uses_squared_excess_distance() {
+    // Mth.square(sqrt(distanceSquared) - 1), not sqrt(distanceSquared) - 1.
+    assert_eq!(super::spc_decrease_charge((4, 0, 0), (0, 0, 0), 100), 19);
+    assert_eq!(super::spc_decrease_charge((6, 0, 0), (0, 0, 0), 100), 50);
+}
+
 /// A sculk patch on a synthetic deepslate floor must convert its neighbourhood and leave both
 /// sculk and veins behind. Not a parity claim - the native fixture for that is the capture in
 /// `specs/worldgen-parity/sculk-patch.md` - but a net under the spread machinery, which the
