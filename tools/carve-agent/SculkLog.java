@@ -154,6 +154,23 @@ public class SculkLog {
         ARMED.set(Boolean.TRUE);
     }
 
+    /** The placement window's boundaries, so the trace carries the unit a port run covers.
+     *
+     * A port `FSEED_ARM=cx,cz,gi,step` run logs one *placement*: the modifier draws for every
+     * candidate plus every accepted position's feature call. The agent only marked
+     * `ConfiguredFeature.place` (`SPLACE`), which fires once per accepted position, so segmenting a
+     * thread at `SPLACE` produced ~20 windows per placement with ~35 draws each while the port's
+     * window held 769 - a comparison between different units, not a difference in behaviour.
+     */
+    public static void windowStart() {
+        out("SPWINDOW start");
+    }
+
+    public static void windowEnd() {
+        out("SPWINDOW end");
+    }
+
+
     /** The class of the `RandomSource` a placement was handed. */
     public static void rngClass(String name) {
         if (Boolean.getBoolean("sculkquiet")) return;

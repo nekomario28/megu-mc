@@ -1110,7 +1110,33 @@ bound 49 = 台形の span が50のときの初回 draw ✓。したがって「2
 
 （`tools/vanilla_src.sh` は **class 名の lookup に公式 mappings を使う**ので、
 `net.minecraft.world.level.block.SculkSpreader` のように**正しいパッケージ**で渡すこと。
-`dmu$a` のような obfuscated 名を直接渡すと "not in server.txt" で止まる。）## 効率化の基盤（2026-10-28）
+`dmu$a` のような obfuscated 名を直接渡すと "not in server.txt" で止まる。）## 窓の単位を揃えた（2026-10-28、`SPWINDOW`）
+
+前節の結論「窓の切り方が違う」を受けて、agent に**placement 窓の境界マーカー**
+（`SPWINDOW start` / `SPWINDOW end`、`PlacedFeature.placeWithBiomeCheck` の入口と return 前）を
+足した。これが port の `FSEED_ARM=cx,cz,gi,step` の窓と**同じ単位**（modifier の draw 全部＋
+受理された位置の feature 呼び出し全部）になる。
+
+計測（6703 個の placement 窓）:
+
+| 窓の draw 数 | 個数 |
+|---|---|
+| 1 | 1721 |
+| 70 | 522 |
+| 6 / 5 / 7 / 14 | 405 / 394 / 391 / 319 |
+| **> 700** | **9**（うち **ちょうど 768 draw・`SPLACE` なし** の窓が1つ） |
+
+**768 draw で `SPLACE` が無い窓** = 「256 候補すべてが biome フィルタで落ちて feature が
+一度も呼ばれなかった sculk 配置」で、これは **port の 768+1 の窓と同じもの** ✓。
+
+`SPLACE` を含む窓は 45 個で draw 数は 3〜24 と小さい → それらは
+`sculk_patch_ancient_city`（placement が**空**）のような**別配置**で、以前 24 本一致した相手も
+こちらの形だった。つまり「24本一致して25本目で分岐」は**スケールの違う窓同士**を比べていた。
+
+**次の1手**: native の **768 draw の窓**（`SPWINDOW` で切り、draw 数の分布から選べる）と port の
+`FSEED_ARM` 窓を突き合わせる。ここで初めて同一単位の比較になる。
+
+## 効率化の基盤（2026-10-28）
 
 このページの計測は3手順（capture / 突き合わせ / 検証）を毎回手で書き直して進めていた。
 その手作業が実際に時間を食った箇所を道具に固定した:

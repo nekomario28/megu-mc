@@ -63,6 +63,21 @@ if [ ! -f "$(dirname "$JAR")/carvelog.jar" ]; then
   exit 1
 fi
 
+# A capture that times out can leave the reference server running: the fixture wraps a
+# `systemd-run --scope` in `timeout`, and the java process outlives it. A second capture then fails
+# with "server did not become ready" and a null-pointer crash while initializing a world it cannot
+# have - measured twice in one session, and the cause was a server started 25 minutes earlier.
+# (`pgrep -f javaagent` cannot match this script: its own command line says `--jar .../carveagent.jar`.)
+# The pattern is anchored at the executable: a bare `pgrep -f javaagent` also matches any shell
+# whose command line happens to contain the word (it matched the very command that added this
+# guard). Only a real `java ... -javaagent:` process counts.
+if pgrep -f '^[^ ]*java .*-javaagent' > /dev/null 2>&1; then
+  echo "sculk_capture: a reference server is already running with an agent:" >&2
+  pgrep -af '^[^ ]*java .*-javaagent' | sed 's/^/  /' >&2
+  echo "  kill it first, then retry (a timed-out capture leaves one behind)" >&2
+  exit 1
+fi
+
 TRACE="$OUT/sculk-trace-$TAG.txt"
 rm -f "$TRACE"
 STAMP="$(date -Iseconds)"

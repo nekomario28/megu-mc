@@ -613,6 +613,93 @@ def draws_of_trace(path, thread=None):
     return out
 
 
+def placement_windows(path, want_cls=None):
+    """[(thread, classes, draws)] - one entry per `SPWINDOW start`..`SPWINDOW end` pair.
+
+    This is the unit a port `FSEED_ARM=cx,cz,gi,step` run covers: one placed-feature placement, i.e.
+    the modifier draws for every candidate plus every accepted position's feature call. Segmenting
+    at `SPLACE` instead gives one window per *feature invocation* (an accepted position), which is
+    a different unit and produced a false comparison: ~35 draws per native window against 769 in
+    the port's.
+    """
+    out = []
+    sources = lines_by_thread(path) or {'(untagged)': trace_lines(path)}
+    for thread, lines in sources.items():
+        seq, classes, open_ = [], set(), False
+        for line in lines:
+            if line.startswith('SPWINDOW start'):
+                seq, classes, open_ = [], set(), True
+                continue
+            if line.startswith('SPWINDOW end'):
+                if open_:
+                    out.append((thread, classes, seq))
+                open_ = False
+                continue
+            if not open_:
+                continue
+            if line.startswith('SPLACE '):
+                classes.add(line.split()[1])
+                continue
+            m = AGENT_DRAW.match(line)
+            if not m:
+                continue
+            item = (normalize_draw(m.group(1), m.group(2), m.group(3)) if m.group(1)
+                    else normalize_draw(m.group(4), None, m.group(5)))
+            if item:
+                seq.append(item)
+        if open_:
+            out.append((thread, classes, seq))
+    if want_cls:
+        out = [w for w in out if want_cls in w[1]]
+    return out
+
+
+def feature_windows(path, want_cls=None, arm='leading'):
+    """[(thread, feature class, [(kind, is_float, value)])] - one entry per `SPLACE` segment.
+
+    A port window (an `FSEED_ARM=cx,cz,gi,step` run) covers exactly one feature's placement, so a
+    comparison needs the native side split the same way. Splitting a thread's stream at every
+    `SPLACE` does that. Splitting at a pass boundary does not, and reading past a feature's end is
+    how a trapezoid height provider's draw (`nextInt(49)`) got mistaken for the sculk feature's
+    next draw.
+    """
+    out = []
+    sources = lines_by_thread(path) or {'(untagged)': trace_lines(path)}
+    for thread, lines in sources.items():
+        cls, seq, open_ = None, [], False
+        for line in lines:
+            if line.startswith('SPLACE '):
+                if open_:
+                    out.append((thread, cls, seq))
+                cls, seq, open_ = line.split()[1], [], True
+                continue
+            if not open_:
+                continue
+            m = AGENT_DRAW.match(line)
+            if not m:
+                continue
+            item = (normalize_draw(m.group(1), m.group(2), m.group(3)) if m.group(1)
+                    else normalize_draw(m.group(4), None, m.group(5)))
+            if item:
+                seq.append(item)
+        if open_:
+            out.append((thread, cls, seq))
+    if arm == 'leading':
+        # The agent arms at `PlacedFeature.placeWithBiomeCheck`, which runs *before* the feature's
+        # own `SPLACE` marker, so a feature's draws sit in the segment that precedes its marker.
+        # Shift each segment's draws onto the following window (the same distinction as
+        # `split_windows(arm=...)`).
+        shifted = []
+        pending = out[0][2] if out else []
+        for thread, cls, _seq in out:
+            shifted.append((thread, cls, pending))
+            pending = _seq
+        out = shifted[1:] if shifted else []
+    if want_cls:
+        out = [w for w in out if w[1] == want_cls]
+    return out
+
+
 def draws_of_port(path):
     """[(kind, is_float, value)] in program order, from a port log."""
     out = []
@@ -682,10 +769,18 @@ def cmd_compare_draws(args):
         print("sculk_trace: the port trace has no draws (run with FSEED_ARM=... plus "
               "FEATURE_DRAW_LIMIT)", file=sys.stderr)
         return 2
-    threads = lines_by_thread(args.native)
-    by_thread = {t: draws_of_trace(args.native, t) for t in threads} if threads else \
-        {'(untagged)': draws_of_trace(args.native)}
-    by_thread = {t: v for t, v in by_thread.items() if v}
+    if args.split == 'window':
+        windows = placement_windows(args.native, args.feature_class)
+        by_thread = {f"{t}#{i}({'+'.join(sorted(c))})": seq
+                     for i, (t, c, seq) in enumerate(windows) if seq}
+    elif args.split == 'feature':
+        windows = feature_windows(args.native, args.feature_class, args.feature_arm)
+        by_thread = {f"{t}#{i}({c})": seq for i, (t, c, seq) in enumerate(windows) if seq}
+    else:
+        threads = lines_by_thread(args.native)
+        by_thread = {t: draws_of_trace(args.native, t) for t in threads} if threads else \
+            {'(untagged)': draws_of_trace(args.native)}
+        by_thread = {t: v for t, v in by_thread.items() if v}
     total = sum(len(v) for v in by_thread.values())
     if not total:
         print(f"sculk_trace: {args.native} has no draws - an agent build without the draw hooks",
@@ -693,7 +788,8 @@ def cmd_compare_draws(args):
         return 2
     probe_len = args.window if args.window else min(8, len(port))
     probe = port[:probe_len]
-    print(f"native draws {total} over {len(by_thread)} threads, port {len(port)} (all kinds)")
+    unit = {'window': 'placement windows', 'feature': 'features', 'thread': 'threads'}[args.split]
+    print(f"native draws {total} over {len(by_thread)} {unit}, port {len(port)} (all kinds)")
     print(f"probe (port's first {probe_len}): {probe}")
     best = None
     for thread, seq in by_thread.items():
@@ -715,11 +811,15 @@ def cmd_compare_draws(args):
               "sides are not drawing the same questions anywhere in this capture")
         return 1
     same, thread, at, seq, hits = best
-    print(f"occurrences: {hits}; best in thread {thread} at that thread's draw {at}")
-    print(f"identical prefix there: {same} of {len(port)}")
-    if same < len(port):
+    print(f"occurrences: {hits}; best in {thread} at that unit's draw {at}")
+    print(f"identical prefix there: {same} of {len(port)} "
+          f"(native window holds {len(seq) - at} from there)")
+    if same < len(port) and at + same < len(seq):
         print(f"  first divergence: port {port[same]} native {seq[at + same]}"
               f"   <- kind {port[same][0]}")
+    elif same < len(port):
+        print(f"  native window ended first: the port's next draw is {port[same]} "
+              f"(kind {port[same][0]}) but this feature's window has nothing more")
     return 0 if same == len(port) else 1
 
 
@@ -859,7 +959,15 @@ def main():
     s.add_argument('native')
     s.add_argument('port')
     s.add_argument('--window', type=int, default=0,
-                   help='probe length (default: the first 6 port draws, then extend)')
+                   help='probe length (default: the first 8 port draws, then extend)')
+    s.add_argument('--split', choices=['window', 'feature', 'thread'], default='window',
+                   help='the native unit to compare against: a placement window (SPWINDOW pairs, '
+                        'the unit a port FSEED_ARM run covers), a single feature invocation '
+                        '(SPLACE segments, leading), or a whole thread stream')
+    s.add_argument('--feature-class', help='only consider native windows of this SPLACE class')
+    s.add_argument('--feature-arm', choices=['leading', 'trailing'], default='leading',
+                   help='where a feature\'s draws sit relative to its SPLACE marker: leading for '
+                        'an agent that arms at placeWithBiomeCheck (the default)')
     s.set_defaults(func=cmd_compare_draws)
 
     s = sub.add_parser('compare-biomef',

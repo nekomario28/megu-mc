@@ -1206,6 +1206,8 @@ class SculkTransformer implements ClassFileTransformer {
                             @Override public void visitInsn(int op) {
                                 if (op == Opcodes.IRETURN) {
                                     super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                            "windowEnd", "()V", false);
+                                    super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
                                             "disarm", "()V", false);
                                 }
                                 super.visitInsn(op);
@@ -1215,6 +1217,8 @@ class SculkTransformer implements ClassFileTransformer {
                                 super.visitCode();
                                 super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
                                         "armPlacement", "()V", false);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog",
+                                        "windowStart", "()V", false);
                             }
                         };
                     }
