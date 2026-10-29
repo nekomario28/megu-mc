@@ -2920,11 +2920,12 @@ fn spc_spread_one(
     kind: SpcKind,
     spread_only: bool,
 ) -> i32 {
-    // Mirrors the native agent's `SCMARK one-charge-sculk` (a hook on
-    // `dmq.a(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I`, the block behaviour's charge use).
-    spc_trace("SCMARK one-charge-sculk".to_string());
     match kind {
         SpcKind::Sculk => {
+            // The native label `one-charge-sculk` hooks `SculkBlock.attemptUseCharge`, so it belongs
+            // inside this arm - not at the function entry, where it would also count the vein and
+            // default paths (that mistiming is why the first count came out 5485 against 6316).
+            spc_trace("SCMARK one-charge-sculk".to_string());
             if cursor.charge == 0 || rng.next_bound(SPC_DECAY_RATE) != 0 {
                 return cursor.charge;
             }
@@ -2951,6 +2952,9 @@ fn spc_spread_one(
                 }
         }
         SpcKind::Vein => {
+            // `one-charge-vein` hooks `SculkVeinBlock.attemptUseCharge`; `convert` hooks
+            // `SculkVeinBlock.attemptPlaceSculk`, which is what `spc_vein_convert` implements.
+            spc_trace("SCMARK one-charge-vein".to_string());
             if spread_only && spc_vein_convert(ctx, reg, rng, cursor.pos) {
                 return cursor.charge - 1;
             }
@@ -3043,9 +3047,6 @@ fn spc_growth_state(
 /// `SculkBehaviour.attemptSpreadVein` (`dmp.a(dcx,jd,dtc,Collection,boolean)`): the vein,
 /// the default and the `v_` implementations.
 fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool {
-    // Same site as the native agent's `SCMARK attempt-vein` (a hook on
-    // `dmv.a(Ldcx;Ljd;Ldtc;Ljava/util/Collection;)Z`), so the two counts are the same quantity.
-    spc_trace("SCMARK attempt-vein".to_string());
     let (x, y, z) = cursor.pos;
     let state = ctx.get(x, y, z);
     match spc_kind(reg, state) {
@@ -3055,28 +3056,19 @@ fn spc_attempt_spread_vein(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor) -> bool
         // agent: the `spreadAll` of a cursor standing on a vein reports `types=3`, and that is
         // where its neighbour-cell placements come from. Treating this like the default
         // behaviour (SAME_POSITION only) was the port's first divergence.
-        // The native agent logs `SSPREADALL types=<n>` at this call (the interface default spreads
-        // with all three types); mirror it here so the counts are the same quantity.
-        SpcKind::Sculk | SpcKind::Vein => {
-            spc_trace("SSPREADALL types=3".to_string());
-            spc_spread_all(
-                ctx,
-                reg,
-                cursor.pos,
-                state,
-                &[0, 1, 2],
-                "spread-behaviour-3type",
-            )
-        }
+        SpcKind::Sculk | SpcKind::Vein => spc_spread_all(
+            ctx,
+            reg,
+            cursor.pos,
+            state,
+            &[0, 1, 2],
+            "spread-behaviour-3type",
+        ),
         // Every other block uses `dmp$1`: null facings -> `m()` (SAME_POSITION only), empty
         // facings -> the interface default (all three), otherwise the static four-argument
         // overload with the faces the cursor stored.
         SpcKind::Other => match cursor.facings {
-            None => {
-                // the port's one-type case, matching the native's `SSPREADALL types=1`
-                spc_trace("SSPREADALL types=1".to_string());
-                spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type")
-            }
+            None => spc_spread_all(ctx, reg, cursor.pos, state, &[0], "spread-cursor-1type"),
             Some(0) => spc_spread_all(
                 ctx,
                 reg,
@@ -3128,6 +3120,9 @@ fn spc_spread_all(
     types: &[u8],
     tag: &str,
 ) -> bool {
+    // `SSPREADALL types=<n>` hooks `MultifaceSpreader.spreadAll`, i.e. this implementation - not the
+    // call sites. `n` is the number of directions it spreads, which is exactly `types.len()`.
+    spc_trace(format!("SSPREADALL types={}", types.len()));
     let mut any = false;
     let is_vein = spc_kind(reg, state) == SpcKind::Vein;
     for from in 0..6u8 {
@@ -3314,6 +3309,8 @@ fn spc_vein_attempt_spread(
 /// `sculk_replaceable_world_gen` neighbour sits behind one of its faces, then clean up the
 /// veins around the new sculk cell and let veins spread from it.
 fn spc_vein_convert(ctx: &mut FC, reg: &BReg, rng: &mut Xor, pos: (i32, i32, i32)) -> bool {
+    // The native label `convert` hooks `SculkVeinBlock.attemptPlaceSculk`, which is this function.
+    spc_trace("SCMARK convert".to_string());
     let state = ctx.get(pos.0, pos.1, pos.2);
     // `Direction.allShuffled(random)` — this one *does* draw (five nextInt for six directions)
     let mut dirs: Vec<u8> = (0..6u8).collect();

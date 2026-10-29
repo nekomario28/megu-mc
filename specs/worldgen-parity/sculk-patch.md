@@ -1284,11 +1284,65 @@ port の cursor 経路に `SCMARK attempt-vein` / `SCMARK one-charge-sculk` / `S
 各マーカーは **mappings で対応するメソッドを確定してから**同じ関数に置く必要がある。ラベルが同じで
 件数が違うときは「実装差」ではなく「計器差」を先に疑う。
 
-**次の1手**: `SCMARK`/`SSPREADALL` の各ラベルについて、native 側のフック対象メソッド
-（`dmv.a(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I` = `one-charge-vein`、`dmv.a(Ldmu;Ldcx;Ljd;Layw;)Z` = `convert`、
-`dmv.a(Ldcx;Ljd;Ldtc;Collection)Z` = `attempt-vein`、`dmq.a(Ldmu$a;...)I` = `one-charge-sculk`）を
-port のどの関数が実装しているかを1つずつ対応づけ（mappings と port の該当箇所を並べて確認）、
-そのうえで同じ地点に置き直して数え直す。
+### ラベル → フック対象メソッドの確定（2026-10-28、mappings で解決）
+
+agent のフック記述子を公式 mappings に当てて、各ラベルが**どのメソッド**のものかを確定した:
+
+| native ラベル | フック対象メソッド | この capture の件数 |
+|---|---|---|
+| `one-charge-vein` | `SculkVeinBlock.attemptUseCharge(ChargeCursor, LevelAccessor, BlockPos, RandomSource, SculkSpreader, boolean)` | 13011 |
+| `convert` | `SculkVeinBlock.attemptPlaceSculk(SculkSpreader, LevelAccessor, BlockPos, RandomSource)` | 13011 |
+| `attempt-vein` | `SculkVeinBlock.regrow(LevelAccessor, BlockPos, BlockState, Collection)` | 2002 |
+| `one-charge-sculk` | `SculkBlock.attemptUseCharge(ChargeCursor, …)` | 6316 |
+| `SSPREADALL types=n` | `MultifaceSpreader.spreadAll(BlockState, LevelAccessor, BlockPos, boolean)`（`types` = 展開する方向数） | 28249 / 520 |
+
+構造の含意（読めてきたこと）:
+
+- `one-charge-vein` と `convert` が**同数（13011）** = charge を使うたびに vein 設置が1回走る
+- `attempt-vein`（= `regrow`）は 2002 だけ = vein の**再成長**は別経路でまれ
+- sculk:vein の charge 比は **6316 : 13011 ≈ 1 : 2**（port は 5485 : 未計測）
+
+port 側の対応（現時点の同定）:
+
+| native | port の対応関数 | 状態 |
+|---|---|---|
+| `one-charge-vein` | `spc_attempt_spread_vein` の入口 | **ラベルを `attempt-vein` にしていたのは誤り** |
+| `attempt-vein`（`regrow`） | vein 経路の**内側**（`spc_spread_all` 経由の再成長） | 未同定 |
+| `convert`（`attemptPlaceSculk`） | vein 設置の実装（multiface 設置） | 未同定 |
+| `one-charge-sculk` | `spc_spread_one` | 置けている（件数 6316 対 5485） |
+| `SSPREADALL`（`spreadAll`） | `spc_spread_all` の**実装側**（今は match アームで1回） | 置き場所が違う |
+
+### 同じ地点に置き直して数え直した結果（2026-10-28）
+
+port 側で location を確定できた（`spc_spread_one` は `kind` で分岐しており、`Sculk` アームが
+`one-charge-sculk`、`Vein` アームが `one-charge-vein`、`spc_vein_convert` が `convert`、
+`spc_spread_all` の `types.len()` が `SSPREADALL types=<n>`）:
+
+| site | native | port | port/native |
+|---|---|---|---|
+| `SCURSOR` | 39213 | 10915 | **0.28** |
+| `SSPREADALL types=3` | 28249 | 7357 | 0.26 |
+| `SSPREADALL types=1` | 520 | 154 | 0.30 |
+| `one-charge-sculk` | 6316 | 2273 | **0.36** |
+| `one-charge-vein` | 13011 | 3065 | **0.24** |
+| `convert` | 13011 | 3065 | 0.24 |
+| `attempt-vein`（`regrow`） | 2002 | **0** | 0.00 |
+
+**読み方**:
+
+1. `SCURSOR` 自体が 0.28 = **全体が約3.6倍小さい**。これは capture の範囲の違い（native の
+   fixture は 2×2 を decorate するだけでなく、その 3×3 ソースとして周辺も decorate するので
+   実質 ~4×4）で説明できる。したがって**件数そのものではなく比**が signal。
+2. **sculk:vein の charge 比は native 0.485 に対し port 0.742** = port は **1.5倍 sculk（= ブロック
+   化）を選びやすい**。cell ゲートの失敗（sculk 348 / vein 78 対 175 / 125 = sculk 過多・vein 過少）
+   と**同じ向き**で、挙動選択の層で定量化できた。
+3. `attempt-vein`（= `SculkVeinBlock.regrow`）は port で **0 件** = vein の再成長経路が
+   走っていない（未実装か未ミラー）。native は 2002 回走っている。
+
+**次の1手（修正対象が確定）**: (a) port で sculk を選びすぎる理由を `spc_spread_one` の
+`kind` 判定（`spc_kind`）と `spc_attempt_spread_vein` の入口条件（`spread_only`）で確認する —
+native は `attemptUseCharge` が sculk:vein = 1:2 なのに対し port は 1:1.35。
+(b) `regrow` 経路が port に無い件を確認して実装する。この2つが cell ゲートの残差に直結する。
 
 ## 効率化の基盤（2026-10-28）
 
