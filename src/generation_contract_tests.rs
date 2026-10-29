@@ -572,10 +572,9 @@ fn basalt_columns_matches_native_cells_and_rng() {
 ///
 /// This is the loop the sculk work uses: `cargo test sculk_cursor` generates the chunk
 /// in-process and compares cursor trajectories by (round, index) - no CLI dump, no fixture
-/// server. The assertion is a **ratchet**: it requires the matched prefix the port has already
-/// reached (rounds 0-2 = 30 lines) and prints the first divergence, so a regression fails and
-/// progress can raise the number. `SPC_TRACE_LOCK` serialises the two tests that run the
-/// spreader, because the trace sink is process-wide.
+/// server. The assertion requires every row of the pinned native slice, not every cursor
+/// in the whole chunk. The sink is thread-local; matching this bounded slice is not a
+/// full-cell or whole-patch parity claim.
 #[test]
 fn sculk_cursor_matches_the_native_trace() {
     // The sink is thread-local and the generator lock keeps the other generator tests out, so
@@ -619,11 +618,10 @@ fn sculk_cursor_matches_the_native_trace() {
             native.get(matched)
         );
     }
-    // ratchet: raise this as the port gets closer to the native trajectory
-    assert!(
-        matched >= 30,
-        "sculk cursor trace regressed: {matched} of {} native lines match (was 30)",
-        native.len()
+    assert_eq!(
+        matched,
+        native.len(),
+        "sculk cursor trace diverged within the pinned native slice"
     );
 }
 
@@ -772,7 +770,7 @@ fn sculk_regrow_restores_supported_remembered_faces() {
         assert!(grew);
         let st = ctx.get(0, 80, 0);
         assert_eq!(reg.name_of(st), "minecraft:sculk_vein");
-        assert_eq!(super::spc_face_mask(reg, st), Some(1));
+        assert_eq!(super::spc_face_mask(reg, st), 1);
         assert_eq!(
             reg.get_prop(st, "waterlogged").as_deref(),
             Some(if waterlogged { "true" } else { "false" })
@@ -784,11 +782,137 @@ fn sculk_regrow_restores_supported_remembered_faces() {
     }
 }
 
+/// MultifaceSpreader spreads FROM an existing face TOWARD an absent face.
 #[test]
-fn sculk_charge_decay_uses_squared_excess_distance() {
-    // Mth.square(sqrt(distanceSquared) - 1), not sqrt(distanceSquared) - 1.
-    assert_eq!(super::spc_decrease_charge((4, 0, 0), (0, 0, 0), 100), 19);
-    assert_eq!(super::spc_decrease_charge((6, 0, 0), (0, 0, 0), 100), 50);
+fn sculk_vein_spreads_from_its_existing_face() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let stone = reg.state_of("minecraft:deepslate", None);
+    for x in -2..=2 {
+        for z in -2..=2 {
+            for y in 78..=82 {
+                g.feat_write(x, y, z, if y == 79 { stone } else { 0 });
+            }
+        }
+    }
+    let vein = reg.with_prop(reg.state_of("minecraft:sculk_vein", None), "down", "true");
+    g.feat_write(0, 80, 0, vein);
+    let mut ctx = context(&mut g);
+    let cursor = super::SpcCursor::new((0, 80, 0), 10);
+    assert!(super::spc_attempt_spread_vein(&mut ctx, reg, &cursor));
+    for (x, z) in [(0, -1), (0, 1), (-1, 0), (1, 0)] {
+        let state = ctx.get(x, 80, z);
+        assert_eq!(
+            reg.name_of(state),
+            "minecraft:sculk_vein",
+            "neighbour {x},{z}"
+        );
+        assert_eq!(
+            super::spc_face_mask(reg, state),
+            1,
+            "floor-facing neighbour {x},{z}"
+        );
+    }
+}
+
+/// Vein inherits SculkBehaviour.canChangeBlockStateOnSpread=true; sculk alone overrides it.
+#[test]
+fn sculk_vein_cursor_remembers_faces_added_by_spread() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    // Bedrock supports faces but is not sculk-replaceable. The sealed cage also
+    // keeps findNextSculk from moving away and masking the current-cell reread.
+    let bedrock = reg.state_of("minecraft:bedrock", None);
+    for x in -1..=1 {
+        for y in 79..=81 {
+            for z in -1..=1 {
+                g.feat_write(x, y, z, bedrock);
+            }
+        }
+    }
+    let vein = reg.with_prop(reg.state_of("minecraft:sculk_vein", None), "down", "true");
+    g.feat_write(0, 80, 0, vein);
+    let mut ctx = context(&mut g);
+    let mut cursor = super::SpcCursor::new((0, 80, 0), 32);
+    let mut rng = Xor::seed_worldgen(0);
+    super::spc_cursor_update(&mut ctx, &mut rng, &mut cursor, (0, 80, 0), true);
+    // The original down face spreads to four perpendicular faces, not up.
+    assert_eq!(super::spc_face_mask(reg, ctx.get(0, 80, 0)), 0b111101);
+    assert_eq!(cursor.pos, (0, 80, 0));
+    assert_eq!(
+        cursor.facings,
+        Some(0b111101),
+        "cursor kept pre-spread faces"
+    );
+}
+
+/// availableFaces(sculk) is an empty set, distinct from an uninitialized cursor's null.
+#[test]
+fn sculk_cursor_keeps_empty_faces_distinct_from_unknown() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let bedrock = reg.state_of("minecraft:bedrock", None);
+    for x in -1..=1 {
+        for y in 79..=81 {
+            for z in -1..=1 {
+                g.feat_write(x, y, z, bedrock);
+            }
+        }
+    }
+    g.feat_write(0, 80, 0, reg.state_of("minecraft:sculk", None));
+    let mut ctx = context(&mut g);
+    let mut cursor = super::SpcCursor::new((0, 80, 0), 32);
+    assert_eq!(cursor.facings, None);
+    let mut rng = Xor::seed_worldgen(0);
+    super::spc_cursor_update(&mut ctx, &mut rng, &mut cursor, (0, 80, 0), true);
+    assert_eq!(cursor.pos, (0, 80, 0));
+    assert!(cursor.charge > 0);
+    assert_eq!(cursor.facings, Some(0), "known empty faces became unknown");
+}
+
+/// A wrap-around candidate's blocking corner is relative to its source, not its target.
+#[test]
+fn sculk_vein_wrap_checks_the_source_corner() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:deepslate", None);
+    for source_corner in [false, true] {
+        for target_corner in [false, true] {
+            let mut g = Gen::load(0, crate::name_to_state).unwrap();
+            for x in -1..=3 {
+                for y in 78..=81 {
+                    for z in -1..=1 {
+                        g.feat_write(x, y, z, 0);
+                    }
+                }
+            }
+            g.feat_write(0, 79, 0, stone); // support west of the candidate
+            g.feat_write(1, 80, 0, if source_corner { stone } else { 0 });
+            g.feat_write(2, 79, 0, if target_corner { stone } else { 0 });
+            let mut ctx = context(&mut g);
+            assert_eq!(
+                super::spc_can_spread(&mut ctx, reg, (0, 80, 0), (1, 79, 0), 4),
+                !source_corner,
+                "source corner={source_corner}, unrelated target-relative cell={target_corner}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sculk_charge_decay_matches_native() {
+    // Captured by invoking the pinned jar's private getDecayPenalty itself.
+    // Both the numerator and denominator use Mth.square, with different overloads.
+    let fixture = include_str!("../tests/data/sculk_decay_1211.tsv");
+    assert!(!fixture.is_empty());
+    for row in fixture.lines() {
+        let fields: Vec<i32> = row.split('\t').map(|s| s.parse().unwrap()).collect();
+        let [x, y, z, charge, expected]: [i32; 5] = fields.try_into().unwrap();
+        assert_eq!(
+            super::spc_decrease_charge((x, y, z), (0, 0, 0), charge),
+            expected,
+            "native decay at ({x},{y},{z}), charge {charge}"
+        );
+    }
 }
 
 /// A sculk patch on a synthetic deepslate floor must convert its neighbourhood and leave both

@@ -5,7 +5,47 @@
 知り直さなくて済むよう、実測した構造・分岐・罠・再利用できる部品を固定する。
 実装は `src/feature.rs` にある。以下は調査履歴を含み、過去の推論には訂正がある。
 
-## a/b 再監査による訂正（2026-10-29）
+## 追加監査：拡散面と減衰の訂正（2026-10-29）
+
+vanilla 本体と照合し、修正前に失敗する回帰テストで次を確認した。
+
+- `MultifaceSpreader` は **既存の from 面から、未配置の to 面へ**広げる。
+  判定の逆転により、既存 vein からの拡散をすべて拒否していた。
+- wrap-around の遮蔽判定は **source.relative(face.opposite)**。
+  target 基準で調べると、無関係なセルが拡散可否を変えていた。
+- `canChangeBlockStateOnSpread` は vein を含め既定 true、sculk だけ false。
+  vein の拡散後に state を読み直さないと、cursor が追加前の面を記憶する。
+- `availableFaces(sculk)` は **空集合**であり null ではない。
+  cursor の `Some(0)` と未初期化の `None` は別の分岐に進むため区別する。
+- `getDecayPenalty` の分母は **`Mth.square(int)`**。`Mth.h(int)` を ceil と読んだ
+  下記の期待値19は誤りで、撤回する。分子は float square、分母は int square である。
+  spreader の引数名も `growthSpawnCost=50 / noGrowthRadius=1 /
+  chargeDecayRate=5 / additionalDecayRate=10` に訂正した。
+
+減衰の参照値は式の再実装ではなく、固定 jar の private `getDecayPenalty` 自体を呼ぶ
+[`SculkDecayOracle`](../../tools/structure-oracle/SculkDecayOracle.java) で得る。
+`python3 tools/feature_oracles.py sculk_decay` でコミット済みのscalar fixtureと照合できる。
+距離4・charge100の実値は **1**、距離6・charge100は **2**。
+
+保存済みnative traceとの同一pass `(-17,111)`、origin `(-261,-42,1785)` の比較では、
+active patchの **562 cursor行すべて**が一致した。これは当該patchのcursor状態だけの証明であり、
+全patch・乱数列・最終セル全体の一致を意味しない。
+
+新しいfrozen native captureでは、時刻は2→2、runtime writesは0。
+その記録から選択した16 source chunksの順序をreplayすると、sculk gateは
+旧binary **349差分**、修正binary **52差分**（missing 36 / extra 15 / wrong-state 1）。
+ただしnativeはspawnなどを含め合計145 decoration passesを実行しており、
+16件は全体ではない。trace比較は共有するnonempty 17 patches中16件が一致、
+portに存在しないnonempty 61 patchesのキーを監査出力に列挙した。
+選択範囲外の影響と残る1 patchの分岐は未解決である。
+
+また、従来fixtureを既定port順序で比較した差分は **341** であり、
+中間修正時の320より増えた。参照値の正しさをセル総数で判断せず、
+入力・順序・範囲を揃えた比較と `--require-match` の合格を引き続き要求する。
+全trace・binary・provenanceはrepo外の
+`~/.cache/mc-spine-audit/sculk-spread-20261029/` に保持する。
+
+## a/b 再監査による訂正（同日、追加監査前の記録）
 
 以下は後段の「修正対象が確定」「比が signal」という過去の結論を撤回・更新する。
 
@@ -23,7 +63,8 @@
   `Blocks.qQ` は **SCULK_SENSOR**（SCULK は qS）なので、通常成長先と密度制限の
   対象を sensor に修正。`Mth.k(float)` は **square** なので decay penalty の
   `(float)Math.sqrt(distanceSquared) - amount` を二乗する。旧実装で3テストの失敗を
-  観測した（成長先 sculk、床を密度に算入、距離4・charge100の減衰6対期待19）。
+  観測した（成長先 sculk、床を密度に算入）。減衰の「距離4・charge100なら19」という
+  当時の期待値は分母の誤読を含んでいたため撤回し、上記の実jar参照テストに置き換えた。
 
 検証結果: Rust **346 passed / 0 failed / 1 ignored**、sculk focused **9 passed**。
 Python 計器テストは旧引数（`split` 欠落）と旧出力形式を期待する3件が HEAD 時点で
@@ -217,8 +258,8 @@ sculk ファミリに絞ることで主張が具体的になる。**領域一致
 
 ### 実装に必要な残りの意味論（decompile 済み・次のセッション用）
 
-- spreader は `dmu.b()`: chargeCount 50 / amountPerCharge 1 / chargeDecayRate 5 /
-  noGrowthRadius 10、`isWorldGeneration = true`（**merge しない**、同一位置のカーソルは
+- spreader は `dmu.b()`: growthSpawnCost 50 / noGrowthRadius 1 / chargeDecayRate 5 /
+  additionalDecayRate 10、`isWorldGeneration = true`（**merge しない**、同一位置のカーソルは
   重複したまま残る）。
 - `ChargeCursor.update` の順序と `closerThan(pos, 15.0)` は `distSqr < 225`（等号は
   範囲外＝charge 0）。`facings` の更新は `next != null` の外側でも走る。

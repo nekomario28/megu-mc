@@ -1108,6 +1108,34 @@ check "runtime tick drain does not wait for the generation lock" \
     let queues = GEN_TICK_QUEUES.lock().unwrap().clone();' \
   worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
 
+check "sculk vein spreads from a present face toward an absent face" \
+  src/feature.rs 'if is_vein && !(spc_has_face(reg, state, from) && !spc_has_face(reg, state, to)) {' \
+  'if is_vein && !(spc_has_face(reg, state, to) && !spc_has_face(reg, state, from)) {' \
+  feature::generation_contract_tests::sculk_vein_spreads_from_its_existing_face
+
+check "sculk wrap-around uses the source corner" \
+  src/feature.rs 'let side = (pos.0 + ox, pos.1 + oy, pos.2 + oz);' \
+  'let side = (target.0 + ox, target.1 + oy, target.2 + oz);' \
+  feature::generation_contract_tests::sculk_vein_wrap_checks_the_source_corner
+
+check "sculk vein rereads faces after spread" \
+  src/feature.rs 'if kind != SpcKind::Sculk {' 'if kind == SpcKind::Other {' \
+  feature::generation_contract_tests::sculk_vein_cursor_remembers_faces_added_by_spread
+
+check "sculk known empty faces are not unknown" \
+  src/feature.rs 'cursor.facings = Some(spc_face_mask(reg, state));' \
+  'cursor.facings = (spc_face_mask(reg, state) != 0).then_some(spc_face_mask(reg, state));' \
+  feature::generation_contract_tests::sculk_cursor_keeps_empty_faces_distinct_from_unknown
+
+check "sculk decay numerator squares the excess distance" \
+  src/feature.rs 'let over = excess * excess;' 'let over = excess;' \
+  feature::generation_contract_tests::sculk_charge_decay_matches_native
+
+check "sculk decay denominator uses square(int), not ceil" \
+  src/feature.rs 'let denom = (24 - SPC_NO_GROWTH_RADIUS).pow(2) as f32;' \
+  'let denom = (24 - SPC_NO_GROWTH_RADIUS) as f32;' \
+  feature::generation_contract_tests::sculk_charge_decay_matches_native
+
 # Both huge mushrooms and huge fungus double height. Bind this mutation to the
 # mushroom's initial height draw; a bare `height *= 2` now matches both bodies.
 check "huge brown mushroom doubles its height on a nextInt(12) draw" \

@@ -2,7 +2,7 @@
 """Run one native feature oracle and write or compare its fixture.
 
 Each oracle is a class in `tools/structure-oracle/` that drives the *actual* pinned
-1.21.1 feature class through `NativeHarness` (a scripted level plus the class's own
+1.21.1 feature or block-behaviour class through `NativeHarness` (a scripted level plus the class's own
 default-method bodies). A fixture is only evidence of the scenes it contains, so
 every comparison here is scene-by-scene, not an aggregate.
 """
@@ -40,6 +40,7 @@ ORACLES = {
     'end_spike': 'tests/data/end_spike_1211.tsv',
     'fossil': 'tests/data/fossil_1211.tsv',
     'sculk_patch': 'tests/data/sculk_patch_1211.tsv',
+    'sculk_decay': 'tests/data/sculk_decay_1211.tsv',
     'bonus_chest': 'tests/data/bonus_chest_1211.tsv',
 }
 

@@ -2677,12 +2677,12 @@ pub(crate) struct SculkPatchCfg {
 }
 
 /// `SculkSpreader.createWorldGenSpreader()` (`dmu.b()` = `new dmu(true, bU, 50, 1, 5, 10)`):
-/// chargeCount, amountPerCharge, chargeDecayRate, noGrowthRadius. `isWorldGeneration` is
+/// growthSpawnCost, noGrowthRadius, chargeDecayRate, additionalDecayRate. `isWorldGeneration` is
 /// true, which means cursors are **never merged** (see [`SculkSpreader::update`]).
-const SPC_CHARGE_COUNT: i32 = 50;
-const SPC_AMOUNT: i32 = 1;
+const SPC_GROWTH_SPAWN_COST: i32 = 50;
+const SPC_NO_GROWTH_RADIUS: i32 = 1;
 const SPC_DECAY_RATE: i32 = 5;
-const SPC_NO_GROWTH_RADIUS: i32 = 10;
+const SPC_ADDITIONAL_DECAY_RATE: i32 = 10;
 const SPC_MAX_CURSORS: usize = 32;
 const SPC_MAX_CHARGE: i32 = 1000;
 /// `BlockPos.closerThan(pos, 15.0)` is `distSqr < 225`.
@@ -2759,14 +2759,14 @@ fn spc_has_face(reg: &BReg, st: u32, d: u8) -> bool {
 }
 
 /// `MultifaceBlock.pack(Collection<Direction>)` as the 6-bit face mask (`dmu$a` stores it).
-fn spc_face_mask(reg: &BReg, st: u32) -> Option<u8> {
+fn spc_face_mask(reg: &BReg, st: u32) -> u8 {
     let mut mask = 0u8;
     for d in 0..6u8 {
         if spc_has_face(reg, st, d) {
             mask |= 1 << d;
         }
     }
-    (mask != 0).then_some(mask)
+    mask
 }
 
 /// `SculkSpreader.ChargeCursor` (`dmu$a`).
@@ -2876,8 +2876,9 @@ fn spc_cursor_update(
     let mut state = ctx.get(x, y, z);
     let mut kind = spc_kind(reg, state);
     if spread_only && spc_attempt_spread_vein(ctx, reg, cursor) {
-        // `if (behaviour.isWorldGen())` only holds for the default behaviour, which re-reads
-        if kind == SpcKind::Other {
+        // SculkBehaviour.canChangeBlockStateOnSpread defaults to true (including
+        // vein); only SculkBlock overrides it to false.
+        if kind != SpcKind::Sculk {
             state = ctx.get(x, y, z);
             kind = spc_kind(reg, state);
         }
@@ -2903,7 +2904,9 @@ fn spc_cursor_update(
     }
     // note: this runs whether or not `next` was found, against whatever `state` holds
     if spc_kind(reg, state) != SpcKind::Other {
-        cursor.facings = spc_face_mask(reg, state);
+        // availableFaces returns a set even for non-multiface sculk: empty is
+        // known (Some(0)), not the uninitialized cursor's unknown (None).
+        cursor.facings = Some(spc_face_mask(reg, state));
     }
     cursor.decay_delay = spc_decay_delay(kind, cursor.decay_delay);
     cursor.update_delay = 1;
@@ -2929,19 +2932,19 @@ fn spc_spread_one(
             if cursor.charge == 0 || rng.next_bound(SPC_DECAY_RATE) != 0 {
                 return cursor.charge;
             }
-            // `pos.closerThan(origin, amountPerCharge)` with amount 1 is "the same cell"
+            // `pos.closerThan(origin, noGrowthRadius)` with radius 1 is "the same cell"
             let within = cursor.pos == origin;
             if !within && spc_can_place_growth(ctx, reg, cursor.pos) {
-                if rng.next_bound(SPC_CHARGE_COUNT) < cursor.charge {
+                if rng.next_bound(SPC_GROWTH_SPAWN_COST) < cursor.charge {
                     let above = (cursor.pos.0, cursor.pos.1 + 1, cursor.pos.2);
                     let st = spc_growth_state(ctx, reg, rng, above, true);
                     if !ctx.out_of_h(above.1) {
                         ctx.set(above.0, above.1, above.2, st);
                     }
                 }
-                return (cursor.charge - SPC_CHARGE_COUNT).max(0);
+                return (cursor.charge - SPC_GROWTH_SPAWN_COST).max(0);
             }
-            if rng.next_bound(SPC_NO_GROWTH_RADIUS) != 0 {
+            if rng.next_bound(SPC_ADDITIONAL_DECAY_RATE) != 0 {
                 return cursor.charge;
             }
             cursor.charge
@@ -2976,7 +2979,7 @@ fn spc_spread_one(
 }
 
 /// `SculkBlock.getDecayPenalty`: square the float excess of the double distance sqrt,
-/// divide by `Mth.ceil(24 - amount)`, then truncate the float charge penalty.
+/// divide by the integer square of `24 - noGrowthRadius`, then truncate the float penalty.
 fn spc_decrease_charge(pos: (i32, i32, i32), origin: (i32, i32, i32), charge: i32) -> i32 {
     let (dx, dy, dz) = (
         f64::from(pos.0 - origin.0),
@@ -2984,9 +2987,10 @@ fn spc_decrease_charge(pos: (i32, i32, i32), origin: (i32, i32, i32), charge: i3
         f64::from(pos.2 - origin.2),
     );
     // Mth.k(float) is square, not sqrt. Java casts Math.sqrt's result to float first.
-    let excess = (dx * dx + dy * dy + dz * dz).sqrt() as f32 - SPC_AMOUNT as f32;
+    let excess = (dx * dx + dy * dy + dz * dz).sqrt() as f32 - SPC_NO_GROWTH_RADIUS as f32;
     let over = excess * excess;
-    let denom = ((24 - SPC_AMOUNT) as f32).ceil();
+    // Mth.h(int) is square(int); the ceil overloads take float/double.
+    let denom = (24 - SPC_NO_GROWTH_RADIUS).pow(2) as f32;
     let ratio = 1.0f32.min(over / denom);
     (1).max((charge as f32 * ratio * 0.5) as i32)
 }
@@ -3158,9 +3162,9 @@ fn spc_spread(
     if to / 2 == from / 2 {
         return false;
     }
-    // `config.a(state) || (config.a(state, to) && !config.a(state, from))`
+    // MultifaceSpreader: spread FROM a present face TOWARD an absent face.
     let is_vein = spc_kind(reg, state) == SpcKind::Vein;
-    if is_vein && !(spc_has_face(reg, state, to) && !spc_has_face(reg, state, from)) {
+    if is_vein && !(spc_has_face(reg, state, from) && !spc_has_face(reg, state, to)) {
         return false;
     }
     for t in types {
@@ -3234,9 +3238,9 @@ fn spc_vein_can_spread(
     }
     let manhattan = (target.0 - pos.0).abs() + (target.1 - pos.1).abs() + (target.2 - pos.2).abs();
     if manhattan == 2 {
-        // the cell past the target, in the direction the face points away from
+        // SculkVeinSpreaderConfig checks source.relative(face.getOpposite()).
         let (ox, oy, oz) = dir_off(dir ^ 1);
-        let side = (target.0 + ox, target.1 + oy, target.2 + oz);
+        let side = (pos.0 + ox, pos.1 + oy, pos.2 + oz);
         let side_st = ctx.get(side.0, side.1, side.2);
         if spc_face_sturdy(reg, side_st, dir) {
             return false;
