@@ -10,21 +10,23 @@ from vanilla_java import DEFAULT_JAR, pinned_runtime, run_probe
 ROOT = Path(__file__).resolve().parent.parent
 ASSET = ROOT / "assets/block_predicates_1211.bin"
 SUPPORT = ROOT / "assets/multiface_support_1211.bin"
+COLLISION_FULL = ROOT / "assets/collision_shape_full_1211.bin"
 
 
 def encode(rows, blocks):
     native = {}
     for row in rows.splitlines():
-        text, value, support = row.split("\t")
+        text, value, support, collision_full = row.split("\t")
         match = re.fullmatch(r"Block\{minecraft:(.*?)\}(?:\[(.*)\])?", text)
         if (match is None or not value.isdigit() or not 0 <= int(value) < 256
-                or not support.isdigit() or not 0 <= int(support) < 64):
+                or not support.isdigit() or not 0 <= int(support) < 64
+                or collision_full not in ("0", "1")):
             raise ValueError("invalid native state: " + row)
         name, props = match.groups()
         key = (name, tuple(sorted(tuple(p.split("=")) for p in props.split(","))) if props else ())
         if key in native:
             raise ValueError("duplicate native state: " + text)
-        native[key] = (int(value), int(support))
+        native[key] = (int(value), int(support), int(collision_full))
     wire = {}
     for block in blocks:
         for state in range(block["minStateId"], block["maxStateId"] + 1):
@@ -40,7 +42,7 @@ def encode(rows, blocks):
             wire[state] = native.pop(key)  # missing names/properties fail, never substitute false
     if native or not wire or set(wire) != set(range(len(wire))):
         raise ValueError("native/wire state sets differ or contain gaps")
-    return tuple(bytes(wire[i][column] for i in range(len(wire))) for column in range(2))
+    return tuple(bytes(wire[i][column] for i in range(len(wire))) for column in range(3))
 
 
 def main():
@@ -52,8 +54,8 @@ def main():
         output = work / "block-predicates.tsv"
         run_probe(work, classpath, ROOT / "tools/block-predicate-oracle/BlockPredicateOracle.java",
                   "dev.mcspine.tools.BlockPredicateOracle", output)
-        predicates, support = encode(output.read_text(), json.loads((ROOT / "assets/blocks_1211.json").read_text()))
-    for path, data in [(ASSET, predicates), (SUPPORT, support)]:
+        predicates, support, collision_full = encode(output.read_text(), json.loads((ROOT / "assets/blocks_1211.json").read_text()))
+    for path, data in [(ASSET, predicates), (SUPPORT, support), (COLLISION_FULL, collision_full)]:
         if args.write:
             path.write_bytes(data)
         elif data != path.read_bytes():

@@ -32,8 +32,10 @@ def main():
         run_probe(work, cp, ROOT / 'tools/structure-oracle/StructureTemplateOracle.java',
                   'dev.mcspine.tools.StructureTemplateOracle', templates, out, states)
         actual = out.read_bytes()
-        rows = '\n'.join(line + '\t0' for line in states.read_text().splitlines())
-        solid, _ = encode(rows, json.loads((ROOT / 'assets/blocks_1211.json').read_text()))
+        # This oracle consumes only the solid and support columns; collision fullness is
+        # not sampled here, so encode a false placeholder and discard that output column.
+        rows = '\n'.join(line + '\t0\t0' for line in states.read_text().splitlines())
+        solid, _, _ = encode(rows, json.loads((ROOT / 'assets/blocks_1211.json').read_text()))
     for path, data in [(VECTORS, actual), (SOLID, solid)]:
         if args.write:
             path.write_bytes(data)

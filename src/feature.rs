@@ -3556,9 +3556,11 @@ fn gen_sculk_patch(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &SculkP
         }
         spreader.clear();
     }
-    // `nextFloat() <= catalystChance` and `below.canSurvive(level, below)`, which is the
-    // default (true) for a sculk catalyst
-    if rng.next_f32() <= c.catalyst_chance {
+    // Vanilla `BlockStateBase.isCollisionShapeFullBlock(level, below)` gates catalyst
+    // placement. Consume the chance draw first, even when the support shape is not full.
+    if rng.next_f32() <= c.catalyst_chance
+        && reg.is_collision_shape_full_block(ctx.get(pos.0, pos.1 - 1, pos.2))
+    {
         let st = reg.state_of("minecraft:sculk_catalyst", None);
         if !ctx.out_of_h(pos.1) {
             ctx.set(pos.0, pos.1, pos.2, st);

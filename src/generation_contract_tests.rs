@@ -576,6 +576,46 @@ fn basalt_columns_matches_native_cells_and_rng() {
 /// in the whole chunk. The sink is thread-local; matching this bounded slice is not a
 /// full-cell or whole-patch parity claim.
 #[test]
+fn sculk_catalyst_requires_a_full_collision_block_below() {
+    let reg = breg().unwrap();
+    // Keep collision fullness distinct from render solidity and one sturdy face.
+    let air = reg.state_of("minecraft:air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let bottom_props = jparse(br#"{"type":"bottom"}"#).unwrap();
+    let double_props = jparse(br#"{"type":"double"}"#).unwrap();
+    let bottom_slab = reg.state_of("minecraft:oak_slab", Some(&bottom_props));
+    let double_slab = reg.state_of("minecraft:oak_slab", Some(&double_props));
+    assert!(!reg.is_collision_shape_full_block(air));
+    assert!(reg.is_collision_shape_full_block(stone));
+    assert!(!reg.is_collision_shape_full_block(bottom_slab));
+    assert!(reg.is_collision_shape_full_block(double_slab));
+    // Zero spread/growth rounds are legal in eez's codec. Isolate the terminal
+    // placement gate observed at (-236,-51,1792), where the below state was air.
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:sculk_patch","config":{
+        "charge_count":1,"amount_per_charge":1,"spread_attempts":1,
+        "growth_rounds":0,"spread_rounds":0,"extra_rare_growths":0,"catalyst_chance":1.0
+    }}"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let origin = (0, 120, 0);
+    for (below, expected) in [
+        ("minecraft:stone", "minecraft:sculk_catalyst"),
+        ("minecraft:air", "minecraft:sculk"),
+    ] {
+        let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+        let mut ctx = context(&mut g);
+        ctx.set(0, 119, 0, reg.state_of(below, None));
+        ctx.set(0, 120, 0, reg.state_of("minecraft:sculk", None));
+        gen_cf(&cf, freg(), &mut ctx, &mut Xor::seed_worldgen(0), origin);
+        assert_eq!(reg.name_of(ctx.get(0, 120, 0)), expected, "support={below}");
+    }
+}
+
+#[test]
 fn sculk_cursor_matches_the_native_trace() {
     // The sink is thread-local and the generator lock keeps the other generator tests out, so
     // this trace is this test's alone (a process-wide sink interleaved a concurrent sculk test's

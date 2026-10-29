@@ -639,6 +639,14 @@ impl BReg {
     pub(crate) fn is_solid_render(&self, st: u32) -> bool {
         self.native_predicates(st) & 1 != 0
     }
+    /// Pinned `BlockStateBase.isCollisionShapeFullBlock`; distinct from render, heightmap,
+    /// and sturdy-face predicates. Kept separately because each byte of native_predicates
+    /// already has a documented consumer.
+    pub(crate) fn is_collision_shape_full_block(&self, st: u32) -> bool {
+        include_bytes!("../assets/collision_shape_full_1211.bin")
+            .get(st as usize)
+            .is_some_and(|full| *full != 0)
+    }
     pub(crate) fn heightmap_counts(&self, st: u32, kind: HeightmapKind) -> bool {
         self.native_predicates(st) & kind.mask() != 0
     }
