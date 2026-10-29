@@ -13820,6 +13820,21 @@ fn has_section(cx: i32, cz: i32, sy: i32) -> bool {
     store.map.get(&(cx, cz)).is_some_and(|s| s[idx].is_some())
 }
 
+/// The published section as a shared slice, for a scan that reads many of its cells.
+fn stored_section(cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<Vec<u32>>> {
+    let idx = section_index(sy)?;
+    let store = section_store().lock().unwrap();
+    if store.generation != current_gen_seq() {
+        return None;
+    }
+    store.map.get(&(cx, cz))?.get(idx)?.clone()
+}
+
+/// The surface band for a chunk, if installed and current.
+fn band_for(cx: i32, cz: i32) -> Option<std::sync::Arc<OpBand>> {
+    op_bands().lock().unwrap().get((cx, cz))
+}
+
 fn stored_state(x: i32, y: i32, z: i32) -> Option<u32> {
     let idx = section_index(y & !15)?;
     let store = section_store().lock().unwrap();
@@ -13983,6 +13998,43 @@ fn overlay_band(cx: i32, cz: i32) {
     }
 }
 
+/// One chunk-section or band, held for the duration of a scan.
+///
+/// The light pass reads a column at a time (the sky floor scan walks down, the spill BFS
+/// walks out), so consecutive reads share a chunk *and* a section. Fetching the store entry
+/// and then the band entry per read meant two mutex acquisitions per cell — 1,127 of them
+/// per delivered chunk for the floors alone, measured at 15 µs each. Holding the source
+/// across the scan removes the per-cell locks; a write during the scan patches a *copy*
+/// (`Arc::make_mut`), so a read may see the pre-write value for the length of one scan. The
+/// per-chunk version invalidates the derived floors on that same write, so the next pass
+/// recomputes them.
+thread_local! {
+    static CELL_SOURCE: std::cell::RefCell<Option<((i32, i32, i32), CellSource)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Clone)]
+enum CellSource {
+    Section(std::sync::Arc<Vec<u32>>),
+    Band(std::sync::Arc<OpBand>),
+}
+
+/// The section (full height) or band entry covering `(x, y, z)`, with the store's and the
+/// band's locks taken at most once per distinct chunk-section.
+fn cell_source(x: i32, y: i32, z: i32) -> Option<CellSource> {
+    let key = (x >> 4, y >> 4, z >> 4);
+    if let Some((k, src)) = CELL_SOURCE.with(|c| c.borrow().clone()) {
+        if k == key {
+            return Some(src);
+        }
+    }
+    let src = stored_section(x >> 4, z >> 4, y & !15)
+        .map(CellSource::Section)
+        .or_else(|| band_for(x >> 4, z >> 4).map(CellSource::Band))?;
+    CELL_SOURCE.with(|c| *c.borrow_mut() = Some((key, src.clone())));
+    Some(src)
+}
+
 fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
     let Some(reg) = crate::block_registry::breg() else {
         return 0;
@@ -13996,7 +14048,14 @@ fn opacity_windowed(x: i32, y: i32, z: i32) -> u8 {
     // `block_at` (a full worldgen evaluation). Measured: 13,571 such calls per delivered
     // chunk, ~20 ms. The +x neighbour's sections are in the store already (the delivery
     // path's prefetch publishes them), and they cover the full height.
-    if let Some(st) = stored_state(x, y, z).or_else(|| band_state(x, y, z)) {
+    let st = cell_source(x, y, z).and_then(|src| match src {
+        CellSource::Section(sec) => {
+            let idx = (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize);
+            sec.get(idx).copied()
+        }
+        CellSource::Band(b) => b.get(y, (x & 15) as usize, (z & 15) as usize),
+    });
+    if let Some(st) = st {
         return reg.opacity_of(st);
     }
     reg.opacity_of(block_at(x, y, z))
@@ -14072,23 +14131,60 @@ fn sky_floors(cx: i32, cz: i32, opacity: &impl Fn(i32, i32, i32) -> u8) -> [i32;
     if __t.is_some() {
         chunkprof::FLOORS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    // Start each column just above the highest cell that can block light, instead of a fixed
+    // 17 above the terrain top: the scan below walks down until it finds one, and with the
+    // old start that walk was ~17 air cells of the 24-step budget, ~6,000 `opacity` calls
+    // per call to this function (measured 13.5 ms each, 23 ms per delivered chunk).
+    //
+    // The bound is the same basis the live heightmaps use: the chunk's own `wtop` (the
+    // topmost solid-or-fluid of the *generated* column) raised by whatever the feature layer
+    // wrote above it, which is where trees live. Both are reads of state that already exists,
+    // so this costs one pass over the chunk's columns rather than a per-cell scan.
+    let __ts = chunkprof::enabled().then(std::time::Instant::now);
+    let starts: [i32; 256] = {
+        let cols = worldgen::chunk_cols(cx, cz);
+        let feature = worldgen::with_gen(|g| {
+            let mut v = [i32::MIN; 256];
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+                    v[(lz << 4) | lx] = g.feature_height(x, z, 0);
+                }
+            }
+            v
+        })
+        .unwrap_or([i32::MIN; 256]);
+        let mut starts = [0i32; 256];
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                let i = (lz << 4) | lx;
+                let base = cols
+                    .as_ref()
+                    .map(|c| c.wtop(lx, lz) as i32)
+                    .unwrap_or_else(|| height_at(cx * 16 + lx as i32, cz * 16 + lz as i32));
+                starts[i] = base.max(feature[i]) + 1;
+            }
+        }
+        starts
+    };
     let mut floors = [0i32; 256];
     for lz in 0..16usize {
         for lx in 0..16usize {
+            let i = (lz << 4) | lx;
             let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-            // Vanilla's floor is the first light-blocking block from the top. Scan down from above
-            // the water/leaf top so a leaf is seen before the ground, but start from a bounded
-            // height: scanning from the world top costs 384 lookups a column and stalls large views.
-            let mut y = height_at(x, z) + 17;
+            let mut y = starts[i].min(MIN_Y + 383);
             let mut steps = 0;
             while steps < 24 {
+                if chunkprof::enabled() {
+                    chunkprof::FLOORS_CELLS.fetch_add(1, Ordering::Relaxed);
+                }
                 if opacity(x, y, z) > 0 {
                     break;
                 }
                 y -= 1;
                 steps += 1;
             }
-            floors[(lz << 4) | lx] = y;
+            floors[i] = y;
         }
     }
     {
@@ -23456,6 +23552,8 @@ pub(crate) mod chunkprof {
     pub(super) static BLOCKLIGHT: AtomicU64 = AtomicU64::new(0);
     pub(super) static FLOORS: AtomicU64 = AtomicU64::new(0);
     pub(super) static FLOORS_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FLOORS_CELLS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FLOORS_STARTS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BLOCK_AT: AtomicU64 = AtomicU64::new(0);
     pub(super) static BLOCK_AT_MISS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BAND_N: AtomicU64 = AtomicU64::new(0);
@@ -23556,6 +23654,12 @@ pub(crate) mod chunkprof {
             "CHUNKPROF   relight n={:.1}/chunk time={:.1}ms/chunk",
             RE_LIGHT_N.load(Ordering::Relaxed) as f64 / n as f64,
             RE_LIGHT.load(Ordering::Relaxed) as f64 / 1e6 / n as f64
+        );
+        eprintln!(
+            "CHUNKPROF   floors: calls={:.2}/chunk cells={:.0}/chunk starts={:.2}ms/chunk",
+            FLOORS_N.load(Ordering::Relaxed) as f64 / n as f64,
+            FLOORS_CELLS.load(Ordering::Relaxed) as f64 / n as f64,
+            FLOORS_STARTS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64
         );
         eprintln!(
             "CHUNKPROF   band parts: range={:.2}ms sections={:.2}ms cols_miss={:.1} epoch_bumps={:.2}/chunk",

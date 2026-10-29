@@ -2566,6 +2566,7 @@ pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: Noise
             });
             *GEN_DATA.lock().unwrap() = Some(g.data.clone());
             *gen_lock() = Some(g);
+            GEN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
             GEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
@@ -2582,8 +2583,16 @@ pub fn dfdump(spec: &str) {
         g.dump_dfs(p[0], p[1], p[2]);
     }
 }
+/// Is a generator loaded?
+///
+/// An atomic rather than `gen_lock().is_some()`: this is asked once per cell read on the
+/// light and block-read paths, and taking the worldgen lock there made every read queue
+/// behind whatever generation is in flight. `init_preset` is the only writer, and the
+/// generator is never dropped once loaded (tests that re-init only replace it).
+static GEN_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn enabled() -> bool {
-    gen_lock().is_some()
+    GEN_READY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Run `f` against the generator while holding the `GEN` lock. Diagnostics that
