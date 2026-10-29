@@ -3596,8 +3596,11 @@ fn chunk_delivery_path_bench() {
         // [4] band builds, [5] band cells, [6] block_at calls, [7] of which missed the
         // overlay, [8] terrain sections. The ns ones and the counts are both load-free.
         eprintln!(
-            "CHUNKBENCH   encode={:.1}ms/chunk",
-            deltas[9] as f64 / 1e6 / n
+            "CHUNKBENCH   encode={:.1}ms/chunk hidden={} reads={} base_state={}",
+            deltas[9] as f64 / 1e6 / n,
+            deltas[10] / 300,
+            deltas[11] / 300,
+            deltas[12] / 300
         );
         eprintln!(
             "CHUNKBENCH   work/chunk: data={:.1}ms sections={} ({:.1}ms) light={:.1}ms band_new={} band_cells={} block_at={} miss={}",
