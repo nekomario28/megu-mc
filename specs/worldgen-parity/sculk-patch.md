@@ -1284,11 +1284,38 @@ port の cursor 経路に `SCMARK attempt-vein` / `SCMARK one-charge-sculk` / `S
 各マーカーは **mappings で対応するメソッドを確定してから**同じ関数に置く必要がある。ラベルが同じで
 件数が違うときは「実装差」ではなく「計器差」を先に疑う。
 
-**次の1手**: `SCMARK`/`SSPREADALL` の各ラベルについて、native 側のフック対象メソッド
-（`dmv.a(Ldmu$a;Ldcx;Ljd;Layw;Ldmu;Z)I` = `one-charge-vein`、`dmv.a(Ldmu;Ldcx;Ljd;Layw;)Z` = `convert`、
-`dmv.a(Ldcx;Ljd;Ldtc;Collection)Z` = `attempt-vein`、`dmq.a(Ldmu$a;...)I` = `one-charge-sculk`）を
-port のどの関数が実装しているかを1つずつ対応づけ（mappings と port の該当箇所を並べて確認）、
-そのうえで同じ地点に置き直して数え直す。
+### ラベル → フック対象メソッドの確定（2026-10-28、mappings で解決）
+
+agent のフック記述子を公式 mappings に当てて、各ラベルが**どのメソッド**のものかを確定した:
+
+| native ラベル | フック対象メソッド | この capture の件数 |
+|---|---|---|
+| `one-charge-vein` | `SculkVeinBlock.attemptUseCharge(ChargeCursor, LevelAccessor, BlockPos, RandomSource, SculkSpreader, boolean)` | 13011 |
+| `convert` | `SculkVeinBlock.attemptPlaceSculk(SculkSpreader, LevelAccessor, BlockPos, RandomSource)` | 13011 |
+| `attempt-vein` | `SculkVeinBlock.regrow(LevelAccessor, BlockPos, BlockState, Collection)` | 2002 |
+| `one-charge-sculk` | `SculkBlock.attemptUseCharge(ChargeCursor, …)` | 6316 |
+| `SSPREADALL types=n` | `MultifaceSpreader.spreadAll(BlockState, LevelAccessor, BlockPos, boolean)`（`types` = 展開する方向数） | 28249 / 520 |
+
+構造の含意（読めてきたこと）:
+
+- `one-charge-vein` と `convert` が**同数（13011）** = charge を使うたびに vein 設置が1回走る
+- `attempt-vein`（= `regrow`）は 2002 だけ = vein の**再成長**は別経路でまれ
+- sculk:vein の charge 比は **6316 : 13011 ≈ 1 : 2**（port は 5485 : 未計測）
+
+port 側の対応（現時点の同定）:
+
+| native | port の対応関数 | 状態 |
+|---|---|---|
+| `one-charge-vein` | `spc_attempt_spread_vein` の入口 | **ラベルを `attempt-vein` にしていたのは誤り** |
+| `attempt-vein`（`regrow`） | vein 経路の**内側**（`spc_spread_all` 経由の再成長） | 未同定 |
+| `convert`（`attemptPlaceSculk`） | vein 設置の実装（multiface 設置） | 未同定 |
+| `one-charge-sculk` | `spc_spread_one` | 置けている（件数 6316 対 5485） |
+| `SSPREADALL`（`spreadAll`） | `spc_spread_all` の**実装側**（今は match アームで1回） | 置き場所が違う |
+
+**次の1手**: port の `spc_attempt_spread_vein` / `spc_spread_one` / vein 設置経路を読み、
+`attemptUseCharge` 相当（入口 ✓）/ `regrow` 相当 / `attemptPlaceSculk` 相当 / `spreadAll` 相当の
+**4つの地点**を確定して、そこに同じラベルを置き直す。それから数え直せば、sculk:vein の比が
+どこで崩れているか（sculk 過多・vein 過少）が site 単位で見える。
 
 ## 効率化の基盤（2026-10-28）
 
