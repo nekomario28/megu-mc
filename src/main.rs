@@ -6339,7 +6339,7 @@ fn scheduled_block_tick_inner() {
 
 // Generated source-fluid reservations share the proto handoff, but only their
 // supported fluid/shape/contact paths belong to this runtime owner.
-thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; } }
+thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 // A fluid owner can write through set_block while it holds its queue mutex.
 // Its neighbor notifications must not re-acquire that mutex. Defer just the
 // waterlogged source positions and drain them after the owner releases it.
