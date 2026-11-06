@@ -757,6 +757,97 @@ mod tests {
     }
 
     #[test]
+    fn pane_wall_and_waterlogged_connections_preserve_unrelated_properties() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let air = reg.state_of("minecraft:air", None);
+        let pane = reg.state_of("minecraft:glass_pane", None);
+        let bars = reg.with_prop(reg.state_of("minecraft:iron_bars", None), "waterlogged", "true");
+        let wall = reg.state_of("minecraft:cobblestone_wall", None);
+        let stair = reg.state_of("minecraft:oak_stairs", None);
+        let p = (8, 72, 8);
+        let north = (8, 72, 7);
+        let south = (8, 72, 9);
+        let west = (7, 72, 8);
+        let east = (9, 72, 8);
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: bone, nbt: None }]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_writes = Some(Vec::new());
+        for (at, st) in [
+            (p, air), (north, wall), (south, stair), (west, bars),
+            (east, pane), ((8, 71, 8), air), ((8, 73, 8), air),
+            ((8, 73, 7), air), ((8, 72, 10), air),
+        ] {
+            ctx.test_base_cell(at, st);
+        }
+        let mut rng = Xor::seed_worldgen(0);
+        assert!(template.place_solid_blocks(
+            &mut ctx,
+            &mut rng,
+            Placement {
+                origin: p, pivot: (0, 0, 0),
+                mirror: Mirror::None, rotation: Rotation::None,
+            },
+            &[], [8, 72, 8, 8, 72, 8],
+        ).unwrap());
+        assert_eq!(reg.get_prop(ctx.get(north.0, north.1, north.2), "south").as_deref(), Some("low"));
+        assert_eq!(reg.get_prop(ctx.get(north.0, north.1, north.2), "up").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "west").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(ctx.get(west.0, west.1, west.2), "east").as_deref(), Some("true"));
+        assert_eq!(
+            reg.get_prop(ctx.get(west.0, west.1, west.2), "waterlogged").as_deref(),
+            Some("true"),
+            "shape updates must not lose the waterlogged state"
+        );
+        assert_eq!(ctx.get(south.0, south.1, south.2), stair,
+            "an ordinary cube cannot change the corner of a straight stair");
+        let writes = ctx.test_writes.as_ref().unwrap();
+        assert_eq!(writes.first(), Some(&(p, bone)));
+        assert_eq!(writes.len(), 4, "only the center and three connectors change");
+        // The existing fluid engine cannot execute waterlogged block-state
+        // water. Do not enqueue a phantom ordinary water block tick here.
+        assert!(ctx.g.generated_fluid_ticks().is_empty());
+    }
+
+    #[test]
+    fn stairs_recompute_outer_inner_and_preserve_waterlogged_on_neighbor_changes() {
+        use std::collections::HashMap;
+        let reg = crate::block_registry::breg().unwrap();
+        let stair = reg.with_prop(
+            reg.state_of("minecraft:oak_stairs", None), "waterlogged", "true",
+        );
+        let west_stair = reg.with_prop(stair, "facing", "west");
+        let top_stair = reg.with_prop(west_stair, "half", "top");
+        let p = (0, 70, 0);
+        let air = reg.state_of("minecraft:air", None);
+        let eval = |neighbors: HashMap<(i32, i32, i32), u32>| {
+            reg.stair_after_neighbors(stair, p, |q| neighbors.get(&q).copied().unwrap_or(air))
+        };
+        let outer = eval(HashMap::from([((0, 70, -1), west_stair)]))
+            .expect("front turn");
+        assert_eq!(reg.get_prop(outer, "shape").as_deref(), Some("outer_left"));
+        assert_eq!(reg.get_prop(outer, "waterlogged").as_deref(), Some("true"));
+        let inner = eval(HashMap::from([((0, 70, 1), west_stair)]))
+            .expect("rear turn");
+        assert_eq!(reg.get_prop(inner, "shape").as_deref(), Some("inner_left"));
+        assert!(eval(HashMap::from([((0, 70, -1), top_stair)])).is_none(),
+            "different stair halves do not make a corner");
+        assert!(eval(HashMap::from([
+            ((0, 70, -1), west_stair), ((1, 70, 0), stair),
+        ])).is_none(), "aligned flank blocks the outer corner");
+        assert!(eval(HashMap::new()).is_none(), "already-straight state is stable");
+    }
+
+    #[test]
     fn every_pinned_template_matches_native_typed_nbt_and_loaded_order() {
         let reg = crate::block_registry::breg().unwrap();
         let mut count = 0;
