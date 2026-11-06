@@ -903,6 +903,48 @@ impl BReg {
             .then(|| self.with_prop(state, "shape", shape))
     }
 
+    /// A known fragile support block is removed if its direct attachment
+    /// becomes air or liquid. The direction points FROM the fragile block
+    /// TOWARDS its old support, in the six native direction indices.
+    ///
+    /// This handles known torch/lantern families only. Rails, buttons, plates,
+    /// plants and conditional face-sturdiness are separate shape contracts.
+    pub(crate) fn fragile_loses_support(
+        &self,
+        state: u32,
+        toward_support: u8,
+        new_support: u32,
+    ) -> bool {
+        if !self.is_air(new_support) && !self.is_liquid(new_support) {
+            return false;
+        }
+        let name = self.name_of(state);
+        match name {
+            "minecraft:torch" | "minecraft:soul_torch" | "minecraft:redstone_torch" => {
+                toward_support == 0
+            }
+            "minecraft:wall_torch"
+            | "minecraft:soul_wall_torch"
+            | "minecraft:redstone_wall_torch" => {
+                let face = self.get_prop(state, "facing");
+                let behind = match face.as_deref() {
+                    Some("north") => 3,
+                    Some("south") => 2,
+                    Some("west") => 5,
+                    Some("east") => 4,
+                    _ => return false,
+                };
+                toward_support == behind
+            }
+            "minecraft:lantern" | "minecraft:soul_lantern" => {
+                let hanging = self.get_prop(state, "hanging");
+                toward_support
+                    == if hanging.as_deref() == Some("true") { 1 } else { 0 }
+            }
+            _ => false,
+        }
+    }
+
     /// set a property by name on a resolved state; missing -> unchanged
     pub(crate) fn with_prop(&self, st: u32, prop: &str, val: &str) -> u32 {
         let bi = match self.st_blk.get(st as usize) {
