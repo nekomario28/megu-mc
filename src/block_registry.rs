@@ -850,9 +850,6 @@ impl BReg {
         if let Some(connected) = self.wall_after_full_neighbor(state, neighbor, above, direction) {
             return Some(connected);
         }
-        if !self.is_air(neighbor) {
-            return None;
-        }
         let key = match direction {
             2 => "north",
             3 => "south",
@@ -861,7 +858,19 @@ impl BReg {
             _ => return None,
         };
         let name = self.name_of(state);
-        if name.ends_with("_fence") || name.ends_with("_pane") || name == "minecraft:iron_bars" {
+        let other = self.name_of(neighbor);
+        let fence = name.ends_with("_fence");
+        let other_fence = other.ends_with("_fence");
+        let fence_connect = fence && other_fence
+            && ((name == "minecraft:nether_brick_fence")
+                == (other == "minecraft:nether_brick_fence"));
+        let pane = name.ends_with("_pane") || name == "minecraft:iron_bars";
+        let other_pane = other.ends_with("_pane") || other == "minecraft:iron_bars";
+        if fence_connect || (pane && other_pane) {
+            return (self.get_prop(state, key).as_deref() != Some("true"))
+                .then(|| self.with_prop(state, key, "true"));
+        }
+        if self.is_air(neighbor) && (fence || pane) {
             return (self.get_prop(state, key).as_deref() == Some("true"))
                 .then(|| self.with_prop(state, key, "false"));
         }
