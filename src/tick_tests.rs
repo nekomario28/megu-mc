@@ -358,6 +358,68 @@ impl std::ops::Drop for WorldSnapshot {
 }
 
 #[test]
+fn fragile_support_loss_drops_torches_and_lanterns_exactly_once() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+    let wall_torch = reg.with_prop(
+        reg.state_of("minecraft:wall_torch", None), "facing", "north",
+    );
+    let lantern = reg.with_prop(
+        reg.state_of("minecraft:lantern", None), "hanging", "true",
+    );
+    let cases = [
+        ((3, 230, 3), (3, 229, 3), reg.state_of("minecraft:torch", None)),
+        ((7, 230, 3), (7, 230, 4), wall_torch),
+        ((11, 230, 3), (11, 231, 3), lantern),
+    ];
+    for (block, support, state) in cases {
+        assert!(reg.block_drop(state).is_some(),
+            "supported fragile family must have a known drop");
+        set_block(support.0, support.1, support.2, stone);
+        set_block(block.0, block.1, block.2, state);
+        assert_eq!(block_at(block.0, block.1, block.2), state);
+        // Removing an unrelated side does not break an attached block.
+        let unrelated = (block.0 + 1, block.1, block.2);
+        set_block(unrelated.0, unrelated.1, unrelated.2, air);
+        assert_eq!(block_at(block.0, block.1, block.2), state);
+        let before = drops().lock().unwrap().len();
+        set_block(support.0, support.1, support.2, air);
+        assert_eq!(block_at(block.0, block.1, block.2), air,
+            "support loss must clear the fragile block");
+        assert_eq!(drops().lock().unwrap().len(), before + 1,
+            "exactly one drop from the detached block");
+        let last = drops().lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.item, reg.block_drop(state).unwrap());
+        set_block(support.0, support.1, support.2, air);
+        assert_eq!(drops().lock().unwrap().len(), before + 1,
+            "repeated notifications must not duplicate drops");
+    }
+}
+
+#[test]
+fn fragile_direction_matching_is_not_just_any_air_neighbor() {
+    let reg = crate::block_registry::breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let floor = reg.state_of("minecraft:torch", None);
+    let wall = reg.with_prop(reg.state_of("minecraft:wall_torch", None), "facing", "north");
+    let hanging = reg.with_prop(reg.state_of("minecraft:lantern", None), "hanging", "true");
+    assert!(reg.fragile_loses_support(floor, 0, air));
+    assert!(!reg.fragile_loses_support(floor, 1, air));
+    assert!(!reg.fragile_loses_support(floor, 0, stone));
+    assert!(reg.fragile_loses_support(wall, 3, air));
+    assert!(!reg.fragile_loses_support(wall, 2, air));
+    assert!(reg.fragile_loses_support(hanging, 1, air));
+    assert!(!reg.fragile_loses_support(hanging, 0, air));
+    assert!(!reg.fragile_loses_support(stone, 0, air));
+}
+
+#[test]
 fn scheduled_leaf_distance_matches_native_vectors() {
     let reg = crate::block_registry::breg().unwrap();
     let make = |kind: &str| -> u32 {
