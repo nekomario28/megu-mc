@@ -15,6 +15,7 @@ public final class NeighborShapeOracle {
     record Case(String id, String original, String neighbor, String direction,
                 String from, String to) {}
     static final String STAIR = "{\"Name\":\"minecraft:oak_stairs\",\"Properties\":{\"facing\":\"north\",\"half\":\"bottom\",\"shape\":\"straight\",\"waterlogged\":\"false\"}}";
+    static final String HANGING_LANTERN = "{\\"Name\\":\\"minecraft:lantern\\",\\"Properties\\":{\\"hanging\\":\\"true\\",\\"waterlogged\\":\\"false\\"}}";
     static final String WEST_STAIR = "{\"Name\":\"minecraft:oak_stairs\",\"Properties\":{\"facing\":\"west\",\"half\":\"bottom\",\"shape\":\"straight\",\"waterlogged\":\"false\"}}";
     static final Case[] CASES = {
         new Case("oak_north_bone","minecraft:oak_fence","minecraft:bone_block","NORTH","north=false","north=true"),
@@ -27,6 +28,9 @@ public final class NeighborShapeOracle {
         new Case("wall_west_bone","minecraft:cobblestone_wall","minecraft:bone_block","WEST","west=none","west=low"),
         new Case("stairs_outer_left",STAIR,WEST_STAIR,"NORTH","shape=straight","shape=outer_left"),
         new Case("stairs_inner_left",STAIR,WEST_STAIR,"SOUTH","shape=straight","shape=inner_left"),
+        new Case("torch_down_air","minecraft:torch","minecraft:air","DOWN","minecraft:torch","minecraft:air"),
+        new Case("wall_torch_south_air","minecraft:wall_torch","minecraft:air","SOUTH","minecraft:wall_torch","minecraft:air"),
+        new Case("lantern_up_air",HANGING_LANTERN,"minecraft:air","UP","minecraft:lantern","minecraft:air"),
         new Case("oak_west_air","minecraft:oak_fence","minecraft:air","WEST","",""),
         new Case("pane_west_air","minecraft:glass_pane","minecraft:air","WEST","",""),
         new Case("bone_west_bone","minecraft:bone_block","minecraft:bone_block","WEST","","")
@@ -50,18 +54,20 @@ public final class NeighborShapeOracle {
             Object initial = stateOf(c.original());
             Object neighbor = stateOf(c.neighbor());
             Enum<?> face = Enum.valueOf((Class) direction.asSubclass(Enum.class), c.direction());
-            int dx = 0, dz = 0;
+            int dx = 0, dy = 0, dz = 0;
             switch (c.direction()) {
+                case "DOWN": dy = -1; break;
+                case "UP": dy = 1; break;
                 case "NORTH": dz = -1; break;
                 case "SOUTH": dz = 1; break;
                 case "WEST": dx = -1; break;
                 case "EAST": dx = 1; break;
                 default: throw new AssertionError(c.direction());
             }
-            final int nx = dx, nz = dz;
+            final int nx = dx, ny = 64 + dy, nz = dz;
             NativeHarness.Level level = NativeHarness.levelFromStates((x, y, z) -> {
                 if (x == 0 && y == 64 && z == 0) return initial;
-                if (x == nx && y == 64 && z == nz) return neighbor;
+                if (x == nx && y == ny && z == nz) return neighbor;
                 return NativeHarness.state("minecraft:air");
             });
             Method update = null;
@@ -76,7 +82,7 @@ public final class NeighborShapeOracle {
             }
             if (update == null) throw new AssertionError("native updateShape method unavailable");
             Object actual = update.invoke(initial, face, neighbor, level.proxy,
-                    NativeHarness.pos(0, 64, 0), NativeHarness.pos(nx, 64, nz));
+                    NativeHarness.pos(0, 64, 0), NativeHarness.pos(nx, ny, nz));
             String before = NativeHarness.normalizedStateName(initial);
             String after = NativeHarness.normalizedStateName(actual);
             String expected = before;
