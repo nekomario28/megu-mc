@@ -416,8 +416,28 @@ impl Template {
             let outside = ctx.get(q.0, q.1, q.2);
             crate::tree::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
             crate::tree::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
-            if let Some(updated) = reg.fence_after_full_neighbor(outside, inside, direction ^ 1) {
-                ctx.set(q.0, q.1, q.2, updated);
+            // Full-cube positive connections have one registry-owned contract.
+            // The wall case reads the cell above; stair shape uses a live
+            // read-through view of the just-placed template, not old terrain.
+            let updated = reg.fence_after_full_neighbor(outside, inside, direction ^ 1)
+                .or_else(|| reg.pane_after_full_neighbor(outside, inside, direction ^ 1))
+                .or_else(|| {
+                    if reg.name_of(outside).ends_with("_wall") {
+                        let above = ctx.get(q.0, q.1.wrapping_add(1), q.2);
+                        reg.wall_after_full_neighbor(outside, inside, above, direction ^ 1)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    if reg.name_of(outside).ends_with("_stairs") {
+                        reg.stair_after_neighbors(outside, q, |p| ctx.get(p.0, p.1, p.2))
+                    } else {
+                        None
+                    }
+                });
+            if let Some(state) = updated {
+                ctx.set(q.0, q.1, q.2, state);
             }
             if matches!(reg.name_of(outside), "minecraft:water" | "minecraft:lava") {
                 match reg.fluid_name(outside) {
