@@ -13,7 +13,7 @@ class NativeNeighborOutputTest(unittest.TestCase):
         rows = []
         for case in CASES:
             before = "minecraft:oak_fence[west=false]"
-            after = before if case.endswith("_air") or case == "bone_west_bone" else "minecraft:oak_fence[west=true]"
+            after = before if case in {"oak_west_air", "pane_west_air", "bone_west_bone"} else "minecraft:oak_fence[west=true]"
             rows.append(f"{case}\t{before}\t{after}")
         return rows
 
