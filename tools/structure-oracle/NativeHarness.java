@@ -468,6 +468,10 @@ public final class NativeHarness {
         public final List<String> events = new ArrayList<>();
         public long gameTime = 100L;
         private long subTickCount;
+        // Opt-in for the survival matrix: a real, uninitialized native light engine.
+        // This does not reproduce a populated ServerLevel lighting environment.
+        public boolean useUninitializedLightEngine;
+        private Object nativeLightEngine;
         public final StateScene scene;
         public final int minY, height;
         private final Object heights;
@@ -545,8 +549,29 @@ public final class NativeHarness {
                     });
         }
 
+        private Object lightEngine() throws Exception {
+            if (!useUninitializedLightEngine)
+                throw new UnsupportedOperationException("native lighting needs a real-world context");
+            if (nativeLightEngine == null) {
+                // Both engines are disabled deliberately. This is an explicit
+                // synthetic lighting context, not evidence for populated worlds.
+                Object chunks = Proxy.newProxyInstance(NativeHarness.class.getClassLoader(),
+                        new Class<?>[]{C("dvl")}, (self, method, args) -> {
+                            if (method.getName().equals("q") && method.getParameterCount() == 0)
+                                return proxy;
+                            throw new UnsupportedOperationException("uninitialized light chunks: " + method);
+                        });
+                nativeLightEngine = C("eot")
+                        .getConstructor(C("dvl"), boolean.class, boolean.class)
+                        .newInstance(chunks, false, false);
+            }
+            return nativeLightEngine;
+        }
+
         private Object handle(Object proxy, Method m, Object[] a) throws Throwable {
             Class<?>[] pt = m.getParameterTypes();
+            if (m.getName().equals("y_") && pt.length == 0
+                    && m.getReturnType() == C("eot")) return lightEngine();
             if (m.getName().equals("G_") && pt.length == 0
                     && m.getReturnType() == long.class) return subTickCount++;
             if (m.getName().equals("A_") && pt.length == 0
