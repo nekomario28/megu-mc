@@ -6,8 +6,6 @@ loaded from the native built-in pack. Unsupported calls are recorded and cause
 failure; no incomplete matrix is ever labelled a parity pass.
 """
 import argparse
-from contextlib import contextmanager
-import itertools
 from pathlib import Path
 import shutil
 import subprocess
@@ -92,12 +90,9 @@ def main():
             "javac", "-proc:none", "-cp", classpath, "-d", str(work),
             str(ROOT / "tools/structure-oracle/NativeSurvivalOracle.java"),
             str(ROOT / "tools/structure-oracle/NativeHarness.java"),
-            str(ROOT / "tools/structure-oracle/VanillaBlockTags.java"),
+            str(ROOT / "tools/vanilla-probe/VanillaBlockTags.java"),
             str(ROOT / "tools/structure-oracle/NativeFluidTags.java"),
         ]
-        # Native block-tag loader was introduced under vanilla-probe, not the
-        # structure-oracle directory; use the actual shared source.
-        javac[6] = str(ROOT / "tools/vanilla-probe/VanillaBlockTags.java")
         subprocess.run(javac, check=True, timeout=120)
         result = subprocess.run([
             "java", "-Xmx1024m", "-cp", str(work) + os.pathsep + classpath,
