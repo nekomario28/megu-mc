@@ -44,6 +44,14 @@ class NativeNeighborOutputTest(unittest.TestCase):
         ids = re.findall(r'new Case\("([^"]+)"', source)
         self.assertEqual(tuple(ids), CASES)
 
+    def test_nether_fence_must_not_join_wood(self):
+        rows = self.sample()
+        i = CASES.index("nether_no_wood_join")
+        parts = rows[i].split("\t")
+        rows[i] = "\t".join((parts[0], parts[1], "minecraft:nether_brick_fence[east=true]"))
+        with self.assertRaises(ValueError):
+            validate_rows("\n".join(rows))
+
     def test_native_negative_control_must_not_change(self):
         rows = self.sample()
         # Only the native result is corrupted; the input state stays intact.
