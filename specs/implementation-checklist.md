@@ -59,6 +59,11 @@
 3. **P1-2 → P1-3 → P1-4** を個別の小さな変更と検証単位で進める。各段の完了はこの台帳のチェックを更新し、具体的な再現値は `evidence/` に記録。
 4. **P2以降は先行ゲートを満たした部分から**展開する。P0-3/P4が未解決の間は `main` へ統合・外部配布しない。
 
+## 現在の作業実績（2026-11-06、全体gate未実行）
+
+- **P0-2 は部分対応・未完了**: [Draft PR #32](https://github.com/nekomario28/mc-spine/pull/32) で、未知のdensity型をゼロ代替しない修正と、`noise`/ `shifted_noise` の不正入力拒否・Y軸シフトを追加。固定データのdensity定義35件とnoise settings 7件についてJSON型名を静的に確認し、parserの型分岐に未対応の名前は見つからなかった。**Rustビルド・全体suite・ネストした値の実行・native比較は未実行**。明示ゼロ扱いの意味論、loaderの部分失敗とsurface/biomeの検証は残す。
+- **P0-3 は追跡実態を確定・未完了**: [data tracking監査](../evidence/foundation/data-tracking-20261106/README.md) にGitツリーの数量・ファイル・文書矛盾を記録。出所・バイト照合・消費者切替・歴史的ライセンス問題の解決には未着手。データ削除やリリースはしていない。
+
 ## レビューで明示する未実行・未解決
 
 作成時点のHEADコミット本文にはRustテスト **384 passed / 1 ignored**、
