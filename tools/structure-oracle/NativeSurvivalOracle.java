@@ -53,6 +53,7 @@ public final class NativeSurvivalOracle {
         // canSurvive implementations depend on them. Load and verify native
         // built-in pack tags rather than allowing an all-false false-positive.
         VanillaBlockTags.load(NativeHarness.C("lt").getField("e").get(null));
+        NativeFluidTags.load();
         Method survives = NativeHarness.C("dtc")
                 .getMethod("a", NativeHarness.C("dcz"), NativeHarness.C("jd"));
         Object center = NativeHarness.pos(0, 64, 0);
