@@ -38,7 +38,7 @@ class SurvivalMatrixGuardTest(unittest.TestCase):
 
     def test_wrong_native_state_identity_is_rejected(self):
         rows = list(self.rows)
-        rows[0] = rows[0].replace(canonical(self.states[0][1]), "minecraft:air")
+        rows[0] = rows[0].replace(canonical(self.states[0][1]), "minecraft:invalid_oracle_state")
         with self.assertRaises(ValueError):
             self.check(rows)
 
