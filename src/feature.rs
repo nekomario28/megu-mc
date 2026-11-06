@@ -45,6 +45,7 @@ struct Pf {
 
 enum Cf {
     EndIsland,
+    Fossil(Box<Fossil>),
     ChorusPlant,
     Glowstone,
     /// `minecraft:basalt_pillar` (`ebj`, `BasaltPillarFeature`), config `{}`.
@@ -399,6 +400,7 @@ fn p_pf(j: &J) -> Option<Pf> {
                             jstr(m, "type").unwrap_or_default()
                         );
                     }
+                    return None;
                 }
             }
         }
@@ -2886,11 +2888,11 @@ fn spc_cursor_update(
     }
     cursor.charge = spc_spread_one(ctx, reg, rng, cursor, origin, kind, spread_only);
     if cursor.charge <= 0 {
-        spc_decay(ctx, reg, cursor, kind);
+        spc_decay(ctx, reg, cursor, kind, state);
         return;
     }
     if let Some(next) = spc_find_next_sculk(ctx, reg, rng, cursor.pos) {
-        spc_decay(ctx, reg, cursor, kind);
+        spc_decay(ctx, reg, cursor, kind, state);
         cursor.pos = next;
         // `pos.closerThan(new Vec3i(origin.x, pos.y, origin.z), 15.0)`: the y term is the
         // cursor's own, so it cancels and only the horizontal distance is bounded.
@@ -3384,12 +3386,12 @@ fn spc_vein_decay(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32), st: u32) {
 }
 
 /// `SculkBehaviour.decay` (`dmp.a(dcx,dtc,jd,ayw)`): only the vein behaviour does anything, and
-/// its body is [`spc_vein_decay`].
-fn spc_decay(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor, kind: SpcKind) {
+/// its body is [`spc_vein_decay`]. The native caller passes its captured state:
+/// conversion may have spread extra faces onto this cell in the meantime.
+fn spc_decay(ctx: &mut FC, reg: &BReg, cursor: &SpcCursor, kind: SpcKind, st: u32) {
     if kind != SpcKind::Vein {
         return;
     }
-    let st = ctx.get(cursor.pos.0, cursor.pos.1, cursor.pos.2);
     if reg.name_of(st) == SPC_VEIN {
         spc_vein_decay(ctx, reg, cursor.pos, st);
     }
@@ -4365,6 +4367,157 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
     }
 }
 
+/// FossilFeature's two immutable templates share one placement origin and RNG.
+/// Resource resolution happens while loading the configured feature, not per attempt.
+struct Fossil {
+    base: Vec<crate::structure_template::Template>,
+    overlay: Vec<crate::structure_template::Template>,
+    base_processors: Vec<crate::structure_template::Processor>,
+    overlay_processors: Vec<crate::structure_template::Processor>,
+    max_empty_corners: i32,
+}
+impl Fossil {
+    fn parse(j: &J) -> Option<Self> {
+        use crate::structure_template::{Processor, Template};
+        let reg = breg()?;
+        let resource = |kind: &str, id: &str, ext: &str| {
+            let bytes = Gen::dp_resource(kind, id, ext);
+            if bytes.is_none() && env_flag!("CF_UNPARSED") {
+                eprintln!("FOSSIL_RESOURCE_UNRESOLVED kind={kind} id={id}");
+            }
+            bytes
+        };
+        let templates = |key: &str| -> Option<Vec<Template>> {
+            jarr(j, key)?
+                .iter()
+                .map(|v| {
+                    let J::Str(id) = v else { return None };
+                    let bytes = resource("structure", id, "nbt")?;
+                    let (_, root) = crate::nbt::read_gzip(&bytes, 16 * 1024 * 1024).ok()?;
+                    Template::load(&root, reg).ok()
+                })
+                .collect()
+        };
+        let processors = |key: &str| {
+            let value = js(j, key)?;
+            let decoded;
+            let value = if let J::Str(id) = value {
+                decoded = jparse(&resource("worldgen/processor_list", id, "json")?)?;
+                &decoded
+            } else {
+                value
+            };
+            Processor::list(value, reg).ok()
+        };
+        let base = templates("fossil_structures")?;
+        let overlay = templates("overlay_structures")?;
+        if base.is_empty() || base.len() != overlay.len() {
+            return None;
+        }
+        let base_processors = processors("fossil_processors")?;
+        let overlay_processors = processors("overlay_processors")?;
+        jnum(j, "max_empty_corners_allowed")?;
+        let max_empty_corners = jint(j, "max_empty_corners_allowed", 0);
+        if !(0..=7).contains(&max_empty_corners) {
+            return None;
+        }
+        for (templates, processors) in [(&base, &base_processors), (&overlay, &overlay_processors)]
+        {
+            for template in templates {
+                template.validate_solid_placement(processors, reg).ok()?;
+            }
+        }
+        Some(Self {
+            base,
+            overlay,
+            base_processors,
+            overlay_processors,
+            max_empty_corners,
+        })
+    }
+
+    fn place(&self, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) -> bool {
+        use crate::structure_template::Placement;
+        use crate::structure_transform::{Mirror, Rotation};
+        let rotation = Rotation::from_index(rng.next_bound(4) as u8).unwrap();
+        let index = rng.next_bound(self.base.len() as i32) as usize;
+        let base = &self.base[index];
+        let (sx, sy, sz) = base.size;
+        let (rx, rz) = match rotation {
+            Rotation::Clockwise90 | Rotation::Counterclockwise90 => (sz, sx),
+            _ => (sx, sz),
+        };
+        let centered = (
+            pos.0.wrapping_add(rx.wrapping_neg() / 2),
+            pos.2.wrapping_add(rz.wrapping_neg() / 2),
+        );
+        let mut floor = pos.1;
+        for dx in 0..rx {
+            for dz in 0..rz {
+                floor = floor
+                    .min(ctx.hm_oc_wg(centered.0.wrapping_add(dx), centered.1.wrapping_add(dz)));
+            }
+        }
+        let y = (floor.wrapping_sub(15).wrapping_sub(rng.next_bound(10))).max(ctx.g.min_y + 10);
+        let offset = match rotation {
+            Rotation::None => (0, 0),
+            Rotation::Clockwise90 => (sz.wrapping_sub(1), 0),
+            Rotation::Clockwise180 => (sx.wrapping_sub(1), sz.wrapping_sub(1)),
+            Rotation::Counterclockwise90 => (0, sx.wrapping_sub(1)),
+        };
+        let origin = (
+            centered.0.wrapping_add(offset.0),
+            y,
+            centered.1.wrapping_add(offset.1),
+        );
+        let bounds = crate::structure_transform::bounds(
+            (sx, sy, sz),
+            origin,
+            (0, 0, 0),
+            Mirror::None,
+            rotation,
+        );
+        let Some(reg) = breg() else { return false };
+        let mut empty = 0;
+        for x in [bounds[0], bounds[3]] {
+            for y in [bounds[1], bounds[4]] {
+                for z in [bounds[2], bounds[5]] {
+                    let state = ctx.get(x, y, z);
+                    if reg.is_air(state)
+                        || matches!(reg.name_of(state), "minecraft:water" | "minecraft:lava")
+                    {
+                        empty += 1;
+                    }
+                }
+            }
+        }
+        if empty > self.max_empty_corners {
+            return false;
+        }
+        let clip = [
+            (pos.0 >> 4) * 16 - 16,
+            ctx.g.min_y,
+            (pos.2 >> 4) * 16 - 16,
+            (pos.0 >> 4) * 16 + 31,
+            ctx.g.min_y + ctx.g.height,
+            (pos.2 >> 4) * 16 + 31,
+        ];
+        let placement = Placement {
+            origin,
+            pivot: (0, 0, 0),
+            mirror: Mirror::None,
+            rotation,
+        };
+        base.place_solid_blocks(ctx, rng, placement, &self.base_processors, clip)
+            .expect("prevalidated fossil base");
+        self.overlay[index]
+            .place_solid_blocks(ctx, rng, placement, &self.overlay_processors, clip)
+            .expect("prevalidated fossil overlay");
+        // Native ignores both placeInWorld return values, including empty/rotted templates.
+        true
+    }
+}
+
 fn p_cf(j: &J) -> Option<Cf> {
     let ty = jstr(j, "type")?;
     // 1.21.1 wraps a configured feature's parameters in a "config" object;
@@ -4372,6 +4525,7 @@ fn p_cf(j: &J) -> Option<Cf> {
     let j = js(j, "config").unwrap_or(j);
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
     Some(match ty {
+        "fossil" => Cf::Fossil(Box::new(Fossil::parse(j)?)),
         "ore" | "scattered_ore" => {
             let mut targets = vec![];
             for t in jarr(j, "targets").map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -4564,9 +4718,7 @@ fn p_cf(j: &J) -> Option<Cf> {
         "simple_random_selector" => {
             let mut v = vec![];
             for e in jarr(j, "features")? {
-                if let Some(pf) = pf_any(e) {
-                    v.push(pf);
-                }
+                v.push(pf_any(e)?);
             }
             Cf::SimpleRand(v)
         }
@@ -4585,9 +4737,7 @@ fn p_cf(j: &J) -> Option<Cf> {
         "sequence" => {
             let mut v = vec![];
             for e in jarr(j, "features")? {
-                if let Some(pf) = pf_any(e) {
-                    v.push(pf);
-                }
+                v.push(pf_any(e)?);
             }
             Cf::Seq(v)
         }
@@ -4610,7 +4760,10 @@ fn p_cf(j: &J) -> Option<Cf> {
         "block_column" => {
             let mut layers = vec![];
             for e in jarr(j, "layers")? {
-                layers.push((p_ip(js(e, "height")?)?, p_bsp(js(e, "contents")?)?));
+                layers.push((
+                    p_ip(js(e, "height")?)?,
+                    p_bsp(js(e, "provider").or_else(|| js(e, "contents"))?)?,
+                ));
             }
             Cf::BlockColumn {
                 layers,
@@ -5825,6 +5978,9 @@ fn grow_chorus(
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
+        Cf::Fossil(config) => {
+            config.place(ctx, rng, pos);
+        }
         Cf::Glowstone => {
             let Some(reg) = breg() else { return };
             if !ctx.is_air(pos.0, pos.1, pos.2) {

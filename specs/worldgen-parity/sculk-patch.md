@@ -5,6 +5,21 @@
 知り直さなくて済むよう、実測した構造・分岐・罠・再利用できる部品を固定する。
 実装は `src/feature.rs` にある。以下は調査履歴を含み、過去の推論には訂正がある。
 
+## Cursor内のstateの寿命
+
+`ChargeCursor.update` はspread後に必要ならstateを読み直すが、続くcharge使用と
+変換処理が終わった時点で、もう一度読み直すわけではない。charge消尽時と移動直前の
+`onDischarged` には、**変換前に保持していたstate**を渡す。変換先のsculkからsourceへ
+新しいvein面が広がることがあるため、callback引数をlive stateへ置き換えるとその面が
+余計に残る。これはspread後のrereadを禁止する規則ではなく、別の時点のsnapshotである。
+
+この境界は [`SculkDischargeOracle`](../../tools/structure-oracle/SculkDischargeOracle.java)
+がnative callbackへcaptured/liveの異なるstateを与えるfixtureと、実際のcursor更新から
+変換・消尽／移動の両経路を通す回帰テストで固定する。
+`python3 tools/feature_oracles.py sculk_discharge` は固定jarのcallbackとの比較であり、
+world全体やruntimeの一致を意味しない。以下の監査記録の数値は、それぞれのcaptureと
+当時のsourceに対する結果として読むこと。
+
 ## 計器とreplayの追加監査（2026-10-29）
 
 `MC_SPINE_POP_ORDER_SCOPE=recorded` は観測した範囲外sourceも順序通り実行する

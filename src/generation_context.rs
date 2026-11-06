@@ -29,6 +29,10 @@ pub(crate) struct FC<'a> {
 
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
     prof: bool,
+    #[cfg(test)]
+    pub(crate) test_no_terrain: bool,
+    #[cfg(test)]
+    pub(crate) test_writes: Option<Vec<((i32, i32, i32), u32)>>,
 }
 impl<'a> FC<'a> {
     pub(crate) fn new(g: &'a mut Gen) -> Self {
@@ -39,6 +43,10 @@ impl<'a> FC<'a> {
             hmwg: HashMap::new(),
             cc: None,
             prof: crate::trace_env::env_flag!("FEAT_PROFILE"),
+            #[cfg(test)]
+            test_no_terrain: false,
+            #[cfg(test)]
+            test_writes: None,
         }
     }
     pub(crate) fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {
@@ -54,6 +62,11 @@ impl<'a> FC<'a> {
         if let Some(st) = self.g.feature_override(x, y, z) {
             return st;
         }
+        #[cfg(test)]
+        assert!(
+            !self.test_no_terrain,
+            "unprovided scripted world input at {x},{y},{z}"
+        );
         let (cx, cz) = (x >> 4, z >> 4);
         if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
             match self.g.cols(cx, cz) {
@@ -78,6 +91,10 @@ impl<'a> FC<'a> {
         st
     }
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
+        #[cfg(test)]
+        if let Some(writes) = &mut self.test_writes {
+            writes.push(((x, y, z), st));
+        }
         if crate::trace_env::env_str!("FEATURE_CELL_TRACE")
             .is_some_and(|want| want.split(';').any(|cell| cell == format!("{x},{y},{z}")))
         {
@@ -158,11 +175,27 @@ impl<'a> FC<'a> {
             if let Some(&v) = self.hmwg.get(&(x, z, kind)) {
                 return v;
             }
+            #[cfg(test)]
+            assert!(
+                !self.test_no_terrain,
+                "unprovided frozen height input at {x},{z}: {kind:?}"
+            );
             let v = self.heightmap_uncached(kind, x, z);
             self.hmwg.insert((x, z, kind), v);
             return v;
         }
         self.heightmap_uncached(kind, x, z)
+    }
+    /// Initial scripted cells use the existing read-through cache, below writes.
+    #[cfg(test)]
+    pub(crate) fn test_base_cell(&mut self, pos: (i32, i32, i32), state: u32) {
+        self.rc.insert(pos, state);
+    }
+    /// Frozen stage inputs for scripted native-oracle worlds. No live-map override.
+    #[cfg(test)]
+    pub(crate) fn test_frozen_height(&mut self, kind: HeightmapKind, x: i32, z: i32, y: i32) {
+        assert!(kind.is_wg());
+        self.hmwg.insert((x, z, kind), y);
     }
     fn heightmap_uncached(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
         let ws = matches!(

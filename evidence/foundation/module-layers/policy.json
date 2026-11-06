@@ -41,7 +41,8 @@
       "generation_math",
       "generation_leaf_queue",
       "nbt",
-      "structure_transform"
+      "structure_transform",
+      "voxel_faces"
     ],
     [
       "chunk_ack",
@@ -64,7 +65,8 @@
     "block_registry",
     "json",
     "generation_math",
-    "generation_leaf_queue"
+    "generation_leaf_queue",
+    "voxel_faces"
   ],
   "forbidden": [
     [
@@ -73,6 +75,14 @@
     ]
   ],
   "allowed_edges": [
+    ["main", "voxel_faces"],
+    ["tree", "voxel_faces"],
+    ["structure_template", "voxel_faces"],
+    ["structure_template", "generation_context"],
+    ["structure_template", "generation_math"],
+    ["feature", "structure_template"],
+    ["feature", "structure_transform"],
+    ["feature", "nbt"],
     [
       "main",
       "chunkprof"
@@ -100,6 +110,10 @@
     [
       "structure_template",
       "structure_transform"
+    ],
+    [
+      "structure_template",
+      "json"
     ],
     [
       "main",

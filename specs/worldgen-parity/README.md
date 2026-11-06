@@ -48,6 +48,12 @@ separate. No guessed zero/default substitutions or fixture filtering may close a
 missing behavior. Work stays on the current branch; no new external publication
 is authorized by this implementation request.
 
+Nested parser acceptance is a separate gate from dispatch-arm coverage. The
+[feature codec contract](bulk-codecs.md) explains required-child rejection,
+predicate offsets and the shared native column scenes used to check them.
+The [sculk contract](sculk-patch.md) distinguishes the post-spread state snapshot
+from later live reads: callback arguments retain their native read boundary.
+
 ## Current native contracts
 
 `tools/structure_placement_oracle.py` reads all 20 sets from the pinned jar and
@@ -71,8 +77,16 @@ native typed NBT canonical digest and the actual StructureTemplate.load palette
 block order/state/block-entity digest. NBT also matches 41 synthetic native cases
 including malformed strings, lone surrogates, NaNs and depth boundaries.
 Block/entity transforms and bounding boxes match 192 native cases; all 26,684
-states have captured mirror/rotation mappings. This is template loading and
-transform preview, not world placement or a generated structure claim.
+states have captured mirror/rotation mappings. Those checks establish loading
+and transform preview. The separate [pre-placement processing contract](template-processing.md)
+fixes the source/candidate/world read boundaries and RNG ownership for supported
+processor shapes. The [fossil placement contract](fossil-placement.md) connects
+the bounded full-cube path through production feature dispatch and actual native
+feature comparisons on scripted worlds. Tree and template share native voxel
+face order, including per-chunk fluid reservation order. Generic neighbor state
+changes, initialization, runtime delivery and whole-chunk acceptance are tracked
+in the [finalization plan](../template-finalization/README.md), not claimed by
+these bounded contracts.
 
 The native-wide state count test exposed a phantom extra slot in the existing
 registry; its allocation now has exactly the asset-defined state count. The
@@ -158,9 +172,11 @@ to one) and the age property. One measured divergence is open and excluded from 
 fixture rather than hidden: `weeping_vines` with seed `Long.MAX_VALUE` in the flat
 ceiling scene is one cell short in the port (115 vs 116 writes), cause unidentified.
 
-The repaired configured-feature graph now finds 47 arms and 16 types (31 files)
-with no arm, so 16 of the pack's types still cannot place anything.
+Remaining unsupported configured-feature identities are explicit in the parser
+inventory tests in `src/generation_contract_tests.rs`. Run the actual recursive
+parsers as well as `tools/feature_type_coverage.py`: an outer dispatch arm cannot
+prove that its children, providers or placement modifiers execute.
 
-Next consumers: processor/jigsaw and structure-start pipelines; all reachable
+Next consumers: general template placement and neighbor effects, remaining processors, jigsaw and structure-start pipelines; all reachable
 feature implementations and their full-chunk interactions;
 then whole-chunk multi-biome, normal-runtime, save/reload and wire comparisons.

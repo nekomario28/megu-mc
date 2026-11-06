@@ -1,0 +1,187 @@
+{
+  "type": "minecraft:block_column",
+  "class": "ebl",
+  "config": {
+    "direction": "up",
+    "prioritize_tip": false,
+    "layers": [
+      {
+        "height": {
+          "type": "minecraft:biased_to_bottom",
+          "min_inclusive": 0,
+          "max_inclusive": 4
+        },
+        "provider": {
+          "type": "minecraft:weighted_state_provider",
+          "entries": [
+            {
+              "data": {
+                "Name": "minecraft:stone"
+              },
+              "weight": 2
+            },
+            {
+              "data": {
+                "Name": "minecraft:granite"
+              },
+              "weight": 1
+            }
+          ]
+        }
+      },
+      {
+        "height": 1,
+        "provider": {
+          "type": "minecraft:simple_state_provider",
+          "state": {
+            "Name": "minecraft:moss_block"
+          }
+        }
+      }
+    ],
+    "allowed_placement": {
+      "type": "minecraft:all_of",
+      "predicates": [
+        {
+          "type": "minecraft:matching_blocks",
+          "blocks": "minecraft:air"
+        },
+        {
+          "type": "minecraft:matching_fluids",
+          "fluids": [
+            "minecraft:water"
+          ],
+          "offset": [
+            1,
+            0,
+            0
+          ]
+        }
+      ]
+    }
+  },
+  "scenes": [
+    {
+      "name": "open",
+      "plies": [
+        {
+          "block": "minecraft:water",
+          "dx": [
+            1,
+            1
+          ],
+          "dy": [
+            0,
+            6
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "blocked_first_step",
+      "plies": [
+        {
+          "block": "minecraft:water",
+          "dx": [
+            1,
+            1
+          ],
+          "dy": [
+            0,
+            6
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        },
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            1,
+            1
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "blocked_third_step",
+      "plies": [
+        {
+          "block": "minecraft:water",
+          "dx": [
+            1,
+            1
+          ],
+          "dy": [
+            0,
+            6
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        },
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            3,
+            3
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrong_side",
+      "plies": [
+        {
+          "block": "minecraft:water",
+          "dx": [
+            -1,
+            -1
+          ],
+          "dy": [
+            0,
+            6
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dry",
+      "plies": []
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    -1,
+    42,
+    60007
+  ],
+  "oy": 64
+}

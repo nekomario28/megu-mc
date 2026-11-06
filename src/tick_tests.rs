@@ -1,6 +1,276 @@
 use super::*;
 use effect_tests::client_pair;
 
+#[test]
+fn generated_fluid_handoff_matches_native_proto_unpack() {
+    fn ticks(text: &str) -> Vec<scheduled_ticks::ScheduledTick> {
+        text.split(';')
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let a: Vec<_> = v.split(',').collect();
+                assert_eq!(a.len(), 7);
+                assert_eq!(a[5], "NORMAL");
+                scheduled_ticks::ScheduledTick {
+                    pos: (
+                        a[1].parse().unwrap(),
+                        a[2].parse().unwrap(),
+                        a[3].parse().unwrap(),
+                    ),
+                    block: match a[0] {
+                        "W" => 0,
+                        "L" => 2,
+                        _ => panic!("unknown native identity"),
+                    },
+                    due: a[4].parse().unwrap(),
+                    priority: 0,
+                    sub_order: a[6].parse().unwrap(),
+                }
+            })
+            .collect()
+    }
+    fn schedule_live(
+        owner: &mut GeneratedFluidOwner,
+        events: Vec<scheduled_ticks::ScheduledTick>,
+        now: i64,
+    ) {
+        for t in events {
+            assert_eq!(t.due, now);
+            owner.schedule(
+                t.pos,
+                flowing_fluid::Fluid {
+                    kind: if t.block == 0 {
+                        flowing_fluid::Kind::Water
+                    } else {
+                        flowing_fluid::Kind::Lava
+                    },
+                    level: 0,
+                },
+                now,
+                true,
+            );
+        }
+    }
+    fn render(events: Vec<scheduled_ticks::ScheduledTick>) -> String {
+        events
+            .into_iter()
+            .map(|t| {
+                assert_eq!(t.priority, 0);
+                format!(
+                    "{},{},{},{},{},NORMAL,{}",
+                    match t.block {
+                        0 => "W",
+                        2 => "L",
+                        _ => panic!("unknown delivered identity"),
+                    },
+                    t.pos.0,
+                    t.pos.1,
+                    t.pos.2,
+                    t.due,
+                    t.sub_order
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+    let mut cases = 0;
+    for row in include_str!("../tests/data/proto_tick_1211.tsv").lines() {
+        let a: Vec<_> = row.split('\t').collect();
+        assert_eq!(a.len(), 8);
+        let now: i64 = a[1].parse().unwrap();
+        let limit: usize = a[2].parse().unwrap();
+        let cold: HashSet<_> = a[3]
+            .split(';')
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let (x, z) = v.split_once(',').unwrap();
+                (x.parse::<i32>().unwrap(), z.parse::<i32>().unwrap())
+            })
+            .collect();
+        let mut owner = GeneratedFluidOwner::new();
+        schedule_live(&mut owner, ticks(a[4]), now);
+        let pending: Vec<_> = ticks(a[5])
+            .into_iter()
+            .map(|t| {
+                assert_eq!(t.due, 0);
+                (t.pos, t.block)
+            })
+            .collect();
+        owner.unpack_generated(pending.clone(), now);
+        for (p, _) in pending {
+            assert!(owner.owned.contains(&p), "generated fluid ownership {p:?}");
+        }
+        schedule_live(&mut owner, ticks(a[6]), now);
+        if cases % 3 == 2 {
+            let mut bytes = Vec::new();
+            owner.queue.encode(&mut bytes);
+            let mut input = bytes.as_slice();
+            owner.queue = scheduled_ticks::ScheduledTicks::decode(&mut input).unwrap();
+            assert!(input.is_empty());
+        }
+        let first = render(owner.queue.collect(now, limit, |c| !cold.contains(&c)));
+        let second = render(owner.queue.collect(now + 1, limit, |_| true));
+        assert_eq!(
+            format!("{first}|{second}"),
+            a[7],
+            "actual native proto unpack -> LevelTicks callback, case {} (not fluid physics)",
+            a[0]
+        );
+        cases += 1;
+    }
+    assert_eq!(cases, 18);
+}
+
+#[test]
+fn generated_dispatchers_unpack_the_published_generator_queues() {
+    let _world_guard = world_guard();
+    let _gen_guard = worldgen::lock_gen_for_tests();
+    let is_parent = std::env::var_os("MC_SPINE_GENERATED_DISPATCH_CHILD").as_deref()
+        != Some(std::ffi::OsStr::new("1"));
+    let epoch = worldgen::generation_seq();
+    if is_parent {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tick_tests::generated_dispatchers_unpack_the_published_generator_queues",
+                "--test-threads=1",
+            ])
+            .env("MC_SPINE_GENERATED_DISPATCH_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "isolated dispatcher fixture timed out: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "isolated dispatcher fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed; 0 ignored;"),
+            "isolated dispatcher test did not execute"
+        );
+    } else {
+        generated_dispatcher_fixture();
+    }
+    if is_parent {
+        assert_eq!(worldgen::generation_seq(),epoch,"dispatcher fixture changed the parent generator; even restoring world maps leaves real generation active in later tick tests");
+    }
+}
+
+// Gen initialization is process-global and cannot be undone by WorldSnapshot.
+// Keep this fixture in the child; otherwise later cadence tests generate terrain.
+fn generated_dispatcher_fixture() {
+    struct TickTime(u64);
+    impl std::ops::Drop for TickTime {
+        fn drop(&mut self) {
+            TICK_IDX.store(self.0, Ordering::Relaxed);
+        }
+    }
+    let _time = TickTime(TICK_IDX.load(Ordering::Relaxed));
+    let _snapshot = WorldSnapshot::take();
+    assert!(worldgen::init(0, name_to_state));
+    set_test_region(HashSet::new(), HashSet::new());
+    let row: Vec<_> = include_str!("../tests/data/proto_tick_1211.tsv")
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .collect();
+    assert_eq!(row[0], "0");
+    assert!(row[3].is_empty() && row[4].is_empty() && row[6].is_empty());
+    let now: i64 = row[1].parse().unwrap();
+    TICK_IDX.store(now as u64, Ordering::Relaxed);
+    let reg = crate::block_registry::breg().unwrap();
+    for fluid in [true, false] {
+        // Native W/L are opaque identities here. Real registry leaf identities
+        // exercise the block dispatcher; ineligible chunks prevent physics.
+        let ids = if fluid {
+            [0, 2]
+        } else {
+            [
+                reg.state_of("minecraft:oak_leaves", None),
+                reg.state_of("minecraft:birch_leaves", None),
+            ]
+        };
+        worldgen::with_gen(|g| {
+            for entry in row[5].split(';') {
+                let a: Vec<_> = entry.split(',').collect();
+                let p = (
+                    a[1].parse().unwrap(),
+                    a[2].parse().unwrap(),
+                    a[3].parse().unwrap(),
+                );
+                let id = ids[usize::from(a[0] == "L")];
+                if fluid {
+                    g.schedule_generated_fluid(p, id);
+                } else {
+                    g.schedule_generated_leaf(p, id);
+                }
+            }
+        })
+        .unwrap();
+        let events = if fluid {
+            generated_fluid_tick();
+            assert!(
+                worldgen::take_generated_fluid_ticks().is_empty(),
+                "dispatcher did not drain published fluids"
+            );
+            GENERATED_FLUID_OWNER
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .queue
+                .collect(now, 65536, |_| true)
+        } else {
+            scheduled_block_tick();
+            assert!(
+                worldgen::take_generated_leaf_ticks().is_empty(),
+                "dispatcher did not drain published leaves"
+            );
+            block_ticks().lock().unwrap().collect(now, 65536, |_| true)
+        };
+        let text = events
+            .into_iter()
+            .map(|t| {
+                assert_eq!(t.priority, 0);
+                let label = if t.block == ids[0] {
+                    "W"
+                } else {
+                    assert_eq!(t.block, ids[1]);
+                    "L"
+                };
+                format!(
+                    "{label},{},{},{},{},NORMAL,{}",
+                    t.pos.0, t.pos.1, t.pos.2, t.due, t.sub_order
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(
+            text,
+            row[7].split_once('|').unwrap().0,
+            "native collector metadata through production dispatcher; fluid={fluid}"
+        );
+    }
+}
+
 /// `adv_event` used to build its (lazily initialized) event index while holding the
 /// advancement map's own lock, whose initializer locks that same non-reentrant mutex:
 /// the first call deadlocked the server and chunk streaming stopped after eight packets.

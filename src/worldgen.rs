@@ -593,6 +593,52 @@ impl Gen {
         dirs
     }
 
+    /// Read one resource with the same later-pack-wins ordering as JSON inventories.
+    pub(crate) fn dp_resource(kind: &str, id: &str, extension: &str) -> Option<Vec<u8>> {
+        Self::dp_resource_in(&Self::packs(), kind, id, extension)
+    }
+    fn dp_resource_in(
+        packs: &[std::path::PathBuf],
+        kind: &str,
+        id: &str,
+        extension: &str,
+    ) -> Option<Vec<u8>> {
+        let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+        let valid = |s: &str, slash: bool| {
+            !s.is_empty()
+                && s.bytes().all(|b| {
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b"._-".contains(&b)
+                        || (slash && b == b'/')
+                })
+        };
+        if !valid(namespace, false)
+            || matches!(namespace, "." | "..")
+            || !valid(path, true)
+            || std::path::Path::new(path)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        for pack in packs.iter().rev() {
+            let file = pack
+                .join("data")
+                .join(namespace)
+                .join(kind)
+                .join(format!("{path}.{extension}"));
+            match std::fs::read(file) {
+                Ok(bytes) => return Some(bytes),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::NotADirectory => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
     pub(crate) fn dp_files(subdir: &str) -> HashMap<String, Vec<u8>> {
         Self::dp_files_any(&[subdir])
     }
@@ -2781,6 +2827,11 @@ impl Gen {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn generated_fluid_ticks(&self) -> Vec<GeneratedTick> {
+        self.generated_ticks.fluids.lock().unwrap().0.clone()
+    }
+
     pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
         self.pop_done
             .union(&self.restored_tick_sources)
@@ -4717,6 +4768,67 @@ pub(crate) fn lock_gen_for_tests() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod wg_tests {
     use super::*;
+
+    #[test]
+    fn datapack_resources_respect_priority_and_confine_id_paths() {
+        let root = std::env::temp_dir().join(format!("mc-resource-paths-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let low = root.join("low");
+        let high = root.join("high");
+        for pack in [&low, &high] {
+            std::fs::create_dir_all(pack.join("data/minecraft/structure/fossil")).unwrap();
+        }
+        std::fs::write(low.join("data/minecraft/structure/fossil/test.nbt"), b"low").unwrap();
+        std::fs::write(
+            high.join("data/minecraft/structure/fossil/test.nbt"),
+            b"high",
+        )
+        .unwrap();
+        let packs = [low, high.clone()];
+        assert_eq!(
+            Gen::dp_resource_in(&packs, "structure", "minecraft:fossil/test", "nbt"),
+            Some(b"high".to_vec())
+        );
+        let readme = root.join("README.txt");
+        std::fs::write(&readme, b"not a pack directory").unwrap();
+        let entries = [packs[0].clone(), packs[1].clone(), readme];
+        assert_eq!(
+            Gen::dp_resource_in(&entries, "structure", "minecraft:fossil/test", "nbt"),
+            Some(b"high".to_vec()),
+            "ordinary datapacks/ entries must not mask real resources"
+        );
+        std::fs::create_dir_all(packs[0].join("data/minecraft/structure/nested")).unwrap();
+        std::fs::write(
+            packs[0].join("data/minecraft/structure/nested/test.nbt"),
+            b"nested-low",
+        )
+        .unwrap();
+        std::fs::write(
+            high.join("data/minecraft/structure/nested"),
+            b"not a directory",
+        )
+        .unwrap();
+        assert_eq!(
+            Gen::dp_resource_in(&packs, "structure", "minecraft:nested/test", "nbt"),
+            Some(b"nested-low".to_vec()),
+            "a non-directory prefix is an absent resource, not a shadowing resource"
+        );
+        std::fs::create_dir_all(high.join("structure")).unwrap();
+        std::fs::write(high.join("structure/escape.nbt"), b"outside namespace").unwrap();
+        std::fs::write(
+            high.join("data/minecraft/escape.nbt"),
+            b"outside resource kind",
+        )
+        .unwrap();
+        // The targets EXIST: removing either path guard must really expose a file.
+        for id in ["..:escape", "minecraft:../escape"] {
+            assert!(
+                Gen::dp_resource_in(&packs, "structure", id, "nbt").is_none(),
+                "unsafe resource id resolved: {id}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn generated_ticks_belong_to_their_generator() {

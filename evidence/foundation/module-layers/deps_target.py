@@ -16,7 +16,7 @@ layers = [
     ["generation_providers"],
     ["generation_context"],
     ["worldgen", "block_registry"],
-    ["json", "generation_math", "generation_leaf_queue", "nbt", "structure_transform"],
+    ["json", "generation_math", "generation_leaf_queue", "nbt", "structure_transform", "voxel_faces"],
     # Leaf utilities and profiling counters. Profilers read trace_env flags but
     # do not depend on generation or runtime owners.
     ["ingress_guard", "tick_stats", "chunk_ack", "connection_limits", "trace_env",
@@ -32,7 +32,10 @@ graph = d.ModuleGraph(
         ("tick_persistence", "scheduled_ticks"),
         ("structure_placement", "generation_math"),
         ("structure_template", "nbt"), ("structure_template", "block_registry"),
-        ("structure_template", "structure_transform"),
+        ("structure_template", "structure_transform"), ("structure_template", "json"),
+        ("structure_template", "generation_context"), ("structure_template", "generation_math"),
+        ("structure_template", "voxel_faces"), ("tree", "voxel_faces"),
+        ("feature", "structure_template"), ("feature", "structure_transform"), ("feature", "nbt"),
         ("feature", "tree"), ("feature", "worldgen"),
         ("feature", "block_registry"), ("feature", "generation_providers"),
         ("feature", "generation_context"), ("feature", "json"), ("feature", "generation_math"),

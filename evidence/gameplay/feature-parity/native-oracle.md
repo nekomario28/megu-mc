@@ -5,6 +5,10 @@
 `src/generation_contract_tests.rs::generic_feature_cases`。feature 型を1つ移植する
 たびに同じ配管を作り直していたので、必要な能力と**測って分かった限界**をここに固定する。
 
+この文書は上記日付の汎用 harness の記録。現在の fossil は、別の level／template-manager
+境界を持つ [専用の配置契約](../../../specs/worldgen-parity/fossil-placement.md) と native
+oracle で検証する。そこでの限定的な `getLevel()` 供給は、下記の entity 制約を解消しない。
+
 ## 何をするものか
 
 - `FeatureOracle <cases.json> <out.tsv> [cells.tsv]` は、cases ファイル

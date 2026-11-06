@@ -1,0 +1,147 @@
+{
+  "type": "minecraft:block_column",
+  "class": "ebl",
+  "config": {
+    "direction": "down",
+    "prioritize_tip": true,
+    "layers": [
+      {
+        "height": {
+          "type": "minecraft:weighted_list",
+          "distribution": [
+            {
+              "data": {
+                "type": "minecraft:uniform",
+                "min_inclusive": 0,
+                "max_inclusive": 5
+              },
+              "weight": 2
+            },
+            {
+              "data": 2,
+              "weight": 1
+            }
+          ]
+        },
+        "provider": {
+          "type": "minecraft:weighted_state_provider",
+          "entries": [
+            {
+              "data": {
+                "Name": "minecraft:cave_vines_plant",
+                "Properties": {
+                  "berries": "false"
+                }
+              },
+              "weight": 4
+            },
+            {
+              "data": {
+                "Name": "minecraft:cave_vines_plant",
+                "Properties": {
+                  "berries": "true"
+                }
+              },
+              "weight": 1
+            }
+          ]
+        }
+      },
+      {
+        "height": 1,
+        "provider": {
+          "type": "minecraft:randomized_int_state_provider",
+          "property": "age",
+          "source": {
+            "type": "minecraft:weighted_state_provider",
+            "entries": [
+              {
+                "data": {
+                  "Name": "minecraft:cave_vines",
+                  "Properties": {
+                    "age": "0",
+                    "berries": "false"
+                  }
+                },
+                "weight": 4
+              },
+              {
+                "data": {
+                  "Name": "minecraft:cave_vines",
+                  "Properties": {
+                    "age": "0",
+                    "berries": "true"
+                  }
+                },
+                "weight": 1
+              }
+            ]
+          },
+          "values": {
+            "type": "minecraft:uniform",
+            "min_inclusive": 23,
+            "max_inclusive": 25
+          }
+        }
+      }
+    ],
+    "allowed_placement": {
+      "type": "minecraft:matching_blocks",
+      "blocks": "minecraft:air"
+    }
+  },
+  "scenes": [
+    {
+      "name": "open",
+      "plies": []
+    },
+    {
+      "name": "blocked_first_step",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            -1,
+            -1
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "blocked_third_step",
+      "plies": [
+        {
+          "block": "minecraft:stone",
+          "dx": [
+            0,
+            0
+          ],
+          "dy": [
+            -3,
+            -3
+          ],
+          "dz": [
+            0,
+            0
+          ]
+        }
+      ]
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    -1,
+    42,
+    60007
+  ],
+  "oy": 64
+}

@@ -41,7 +41,10 @@ ORACLES = {
     'fossil': 'tests/data/fossil_1211.tsv',
     'sculk_patch': 'tests/data/sculk_patch_1211.tsv',
     'sculk_decay': 'tests/data/sculk_decay_1211.tsv',
+    'sculk_discharge': 'tests/data/sculk_discharge_1211.tsv',
     'bonus_chest': 'tests/data/bonus_chest_1211.tsv',
+    'block_column_up': 'tests/data/block_column_up_1211.tsv',
+    'block_column_down': 'tests/data/block_column_down_1211.tsv',
 }
 
 

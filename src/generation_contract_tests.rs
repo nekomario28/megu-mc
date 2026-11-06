@@ -6,8 +6,532 @@ use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr,
 use crate::json::{jarr, jparse, js, jstr, J};
 use crate::worldgen::Gen;
 
+fn fossil_set_json(object: &mut J, key: &str, value: J) {
+    let J::Obj(fields) = object else {
+        panic!("expected object")
+    };
+    if let Some((_, old)) = fields.iter_mut().find(|(k, _)| k == key) {
+        *old = value;
+    } else {
+        fields.push((key.to_owned(), value));
+    }
+}
+
+fn fossil_case_feature(case: &J) -> Cf {
+    use crate::structure_template::{BlockInfo, Template};
+    let reg = breg().unwrap();
+    let id = format!("minecraft:{}", jstr(case, "config").unwrap());
+    let bytes = Gen::dp_resource("worldgen/configured_feature", &id, "json").unwrap();
+    let mut root = jparse(&bytes).unwrap();
+    let config = js(&root, "config").unwrap();
+    let mut config = config.clone();
+    if js(case, "single").is_some() {
+        for key in ["fossil_structures", "overlay_structures"] {
+            let first = jarr(&config, key).unwrap()[0].clone();
+            fossil_set_json(&mut config, key, J::Arr(vec![first]));
+        }
+    }
+    if let Some(J::Obj(overrides)) = js(case, "overrides") {
+        for (key, value) in overrides {
+            fossil_set_json(&mut config, key, value.clone());
+        }
+    }
+    fossil_set_json(&mut root, "config", config);
+    let mut cf = super::p_cf(&root).expect("fossil configured feature must resolve all children");
+    let Cf::Fossil(fossil) = &mut cf else {
+        panic!("fossil dispatch parsed as another type")
+    };
+    for (key, templates, processors) in [
+        ("base_template", &mut fossil.base, &fossil.base_processors),
+        (
+            "overlay_template",
+            &mut fossil.overlay,
+            &fossil.overlay_processors,
+        ),
+    ] {
+        if let Some(spec) = js(case, key) {
+            let size = jarr(spec, "size").unwrap();
+            let palettes = jarr(spec, "palettes")
+                .unwrap()
+                .iter()
+                .map(|values| {
+                    let mut blocks: Vec<_> = values
+                        .as_arr()
+                        .unwrap()
+                        .iter()
+                        .map(|b| {
+                            let pos = jarr(b, "pos").unwrap();
+                            let (name, properties) = bs_parts(js(b, "state").unwrap()).unwrap();
+                            BlockInfo {
+                                pos: (
+                                    pos[0].num() as i32,
+                                    pos[1].num() as i32,
+                                    pos[2].num() as i32,
+                                ),
+                                state: reg.state_of(&name, properties),
+                                nbt: None,
+                            }
+                        })
+                        .collect();
+                    blocks.sort_by_key(|b| (b.pos.1, b.pos.0, b.pos.2));
+                    blocks
+                })
+                .collect();
+            let template = Template {
+                size: (
+                    size[0].num() as i32,
+                    size[1].num() as i32,
+                    size[2].num() as i32,
+                ),
+                palettes,
+                entities: Vec::new(),
+            };
+            template.validate_solid_placement(processors, reg).unwrap();
+            assert_eq!(
+                templates.len(),
+                1,
+                "synthetic templates require an explicit single pair"
+            );
+            templates[0] = template;
+        }
+    }
+    cf
+}
+
+fn fossil_native_case(case: &J, row: &[&str], through_dispatch: bool) {
+    use crate::block_registry::HeightmapKind;
+    let reg = breg().unwrap();
+    let cf = fossil_case_feature(case);
+    let origin = jarr(case, "origin").unwrap();
+    let origin = (
+        origin[0].num() as i32,
+        origin[1].num() as i32,
+        origin[2].num() as i32,
+    );
+    let seed = jstr(case, "seed").unwrap().parse::<i64>().unwrap() as u64;
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    ctx.test_no_terrain = true;
+    ctx.test_writes = Some(Vec::new());
+    let J::Obj(inputs) = jparse(row[7].as_bytes()).unwrap() else {
+        panic!("missing initial native cells")
+    };
+    for (key, name) in inputs {
+        let p: Vec<i32> = key.split(',').map(|v| v.parse().unwrap()).collect();
+        ctx.test_base_cell((p[0], p[1], p[2]), reg.state_of(name.str(), None));
+    }
+    let J::Obj(heights) = jparse(row[6].as_bytes()).unwrap() else {
+        panic!("missing frozen native heights")
+    };
+    for (key, height) in heights {
+        let p: Vec<i32> = key.split(',').map(|v| v.parse().unwrap()).collect();
+        ctx.test_frozen_height(HeightmapKind::OceanFloorWg, p[0], p[1], height.num() as i32);
+    }
+    let mut rng = Xor::seed_worldgen(seed);
+    if through_dispatch {
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, origin);
+    } else {
+        let Cf::Fossil(fossil) = &cf else {
+            panic!("not fossil")
+        };
+        assert_eq!(
+            fossil.place(&mut ctx, &mut rng, origin),
+            row[1].parse::<bool>().unwrap(),
+            "native result: {}",
+            row[0]
+        );
+    }
+    let sha = |s: &str| -> String {
+        crate::generation_math::sha256(s.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let cell = |p: (i32, i32, i32), state: u32| {
+        format!(
+            "{},{},{} {}\n",
+            p.0,
+            p.1,
+            p.2,
+            block_state_cells_text(reg, state)
+        )
+    };
+    let mut cells: Vec<_> = ctx.wr.iter().map(|(&p, &state)| cell(p, state)).collect();
+    cells.sort();
+    assert_eq!(
+        ctx.wr.len(),
+        row[2].parse::<usize>().unwrap(),
+        "native cell count: {}",
+        row[0]
+    );
+    assert_eq!(
+        sha(&cells.concat()),
+        row[3],
+        "native full-state cells: {}",
+        row[0]
+    );
+    let writes: String = ctx
+        .test_writes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|&(p, state)| cell(p, state))
+        .collect();
+    assert_eq!(sha(&writes), row[4], "native ordered writes: {}", row[0]);
+    let probe = format!(
+        "{},{},{}",
+        rng.next_bound(1000),
+        rng.next_bound(1000),
+        rng.next_bound(1000)
+    );
+    assert_eq!(probe, row[5], "native following RNG: {}", row[0]);
+    let mut per_chunk: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut pending: Vec<_> = ctx
+        .g
+        .generated_fluid_ticks()
+        .iter()
+        .map(|&(p, kind)| {
+            let name = match kind {
+                0 => "minecraft:water",
+                1 => "minecraft:flowing_water",
+                2 => "minecraft:lava",
+                3 => "minecraft:flowing_lava",
+                _ => panic!("unknown fluid"),
+            };
+            let cell = format!("{},{},{} {name}", p.0, p.1, p.2);
+            per_chunk
+                .entry(format!("{},{}", p.0 >> 4, p.2 >> 4))
+                .or_default()
+                .push(cell.clone());
+            cell
+        })
+        .collect();
+    pending.sort();
+    let wanted = jparse(row[8].as_bytes()).unwrap();
+    let wanted: Vec<_> = wanted
+        .as_arr()
+        .unwrap()
+        .iter()
+        .map(|v| v.str().to_owned())
+        .collect();
+    assert_eq!(
+        pending, wanted,
+        "native proto-fluid tick membership (not delivery order): {}",
+        row[0]
+    );
+    let reference = include_str!("../tests/data/fossil_proto_fluids_1211.tsv")
+        .lines()
+        .map(|line| line.split_once('\t').unwrap())
+        .find(|(id, _)| *id == row[0])
+        .expect("native proto-fluid order case")
+        .1;
+    let J::Obj(groups) = jparse(reference.as_bytes()).unwrap() else {
+        panic!("expected native chunk groups");
+    };
+    let wanted: std::collections::BTreeMap<_, _> = groups
+        .into_iter()
+        .map(|(chunk, cells)| {
+            (
+                chunk,
+                cells
+                    .as_arr()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.str().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        per_chunk, wanted,
+        "native per-chunk proto-fluid insertion (not delivery): {}",
+        row[0]
+    );
+}
+
+#[test]
+fn fossil_feature_matches_actual_native_placement() {
+    let cases = jparse(include_bytes!("../tests/data/fossil_cases_1211.json")).unwrap();
+    let cases = cases.as_arr().unwrap();
+    let rows: Vec<_> = include_str!("../tests/data/fossil_1211.tsv")
+        .lines()
+        .collect();
+    assert_eq!(
+        cases.len(),
+        rows.len(),
+        "every declared native case must execute"
+    );
+    assert!(!rows.is_empty());
+    for (case, line) in cases.iter().zip(rows) {
+        let row: Vec<_> = line.split('\t').collect();
+        assert_eq!(row.len(), 9);
+        assert_eq!(jstr(case, "id").unwrap(), row[0]);
+        fossil_native_case(case, &row, false);
+    }
+}
+
+#[test]
+fn fossil_window_clipping_matches_native() {
+    let cases = jparse(include_bytes!("../tests/data/fossil_cases_1211.json")).unwrap();
+    let rows: Vec<_> = include_str!("../tests/data/fossil_1211.tsv")
+        .lines()
+        .collect();
+    let mut checked = 0;
+    for (case, line) in cases.as_arr().unwrap().iter().zip(rows) {
+        if jstr(case, "id").unwrap().starts_with("wide-") {
+            fossil_native_case(case, &line.split('\t').collect::<Vec<_>>(), false);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "clipping cases disappeared");
+}
+
+#[test]
+fn fossil_production_dispatch_matches_native() {
+    let cases = jparse(include_bytes!("../tests/data/fossil_cases_1211.json")).unwrap();
+    let rows: Vec<_> = include_str!("../tests/data/fossil_1211.tsv")
+        .lines()
+        .collect();
+    let mut checked = 0;
+    for (case, line) in cases.as_arr().unwrap().iter().zip(rows) {
+        let id = jstr(case, "id").unwrap();
+        if [
+            "fossil_coal-0-8-50-8",
+            "fossil_diamonds--1-16--60-31",
+            "half-water-0",
+            "write-through-solid-0",
+            "wide-clip-0",
+            "all-rotted-0",
+            "air-0",
+        ]
+        .contains(&id.as_str())
+        {
+            fossil_native_case(case, &line.split('\t').collect::<Vec<_>>(), true);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 7, "production-route membership changed");
+}
+
+#[test]
+fn fossil_required_resources_and_children_fail_closed() {
+    let id = "minecraft:fossil_coal";
+    let base = Gen::dp_resource("worldgen/configured_feature", id, "json").unwrap();
+    for (key, value) in [
+        ("fossil_structures", J::Arr(vec![])),
+        ("overlay_structures", J::Arr(vec![])),
+        (
+            "fossil_structures",
+            J::Arr(vec![J::Str("minecraft:missing_fossil".to_owned())]),
+        ),
+        ("max_empty_corners_allowed", J::Num(8.0)),
+        ("fossil_processors", jparse(br#"{"processors":[{"processor_type":"minecraft:rule","rules":[{"input_predicate":{"predicate_type":"minecraft:always_true"},"location_predicate":{"predicate_type":"minecraft:always_true"},"output_state":{"Name":"minecraft:torch"}}]}]}"#).unwrap()),
+        (
+            "fossil_processors",
+            jparse(br#"{"processors":[{"processor_type":"minecraft:unsupported"}]}"#).unwrap(),
+        ),
+    ] {
+        let mut root = jparse(&base).unwrap();
+        let mut config = js(&root, "config").unwrap().clone();
+        fossil_set_json(&mut config, key, value);
+        fossil_set_json(&mut root, "config", config);
+        assert!(
+            super::p_cf(&root).is_none(),
+            "required child was silently skipped: {key}"
+        );
+    }
+    for (value, wanted) in [(4.5, 4), (-0.5, 0)] {
+        let mut root = jparse(&base).unwrap();
+        let mut config = js(&root, "config").unwrap().clone();
+        fossil_set_json(&mut config, "max_empty_corners_allowed", J::Num(value));
+        fossil_set_json(&mut root, "config", config);
+        let Some(Cf::Fossil(parsed)) = super::p_cf(&root) else {
+            panic!("native integer control rejected")
+        };
+        assert_eq!(
+            parsed.max_empty_corners, wanted,
+            "native int codec control: {value}"
+        );
+    }
+    for bad in [
+        "../minecraft:fossil/spine_1",
+        "..:fossil/spine_1",
+        "minecraft:../fossil/spine_1",
+        "minecraft:/fossil/spine_1",
+    ] {
+        assert!(
+            Gen::dp_resource("structure", bad, "nbt").is_none(),
+            "resource escaped namespace: {bad}"
+        );
+    }
+}
+
+#[test]
+fn fossil_scripted_inputs_are_fail_closed_and_write_through() {
+    use crate::block_registry::HeightmapKind;
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    ctx.test_no_terrain = true;
+    let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.get(3, 30, 4)));
+    assert!(
+        missing.is_err(),
+        "missing native cells fell through to generated terrain"
+    );
+    let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.hm_oc_wg(3, 4)));
+    assert!(
+        missing.is_err(),
+        "missing native frozen maps fell through to generated terrain"
+    );
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let bone = reg.state_of("minecraft:bone_block", None);
+    ctx.test_base_cell((3, 30, 4), stone);
+    ctx.test_frozen_height(HeightmapKind::OceanFloorWg, 3, 4, 64);
+    assert_eq!(ctx.get(3, 30, 4), stone);
+    ctx.set(3, 30, 4, bone);
+    assert_eq!(
+        ctx.get(3, 30, 4),
+        bone,
+        "captured base cells must not mask writes"
+    );
+    assert_eq!(
+        ctx.hm_oc_wg(3, 4),
+        64,
+        "placement writes must not alter frozen maps"
+    );
+}
+
 fn context(g: &mut Gen) -> FC<'_> {
     FC::new(g)
+}
+
+/// Outer match-arm coverage missed supported types rejected by nested field codecs.
+#[test]
+fn pinned_configured_features_parse_except_explicit_unimplemented_types() {
+    let files = Gen::dp_files("configured_feature");
+    assert!(!files.is_empty(), "missing pinned configured features");
+    let mut unparsed = Vec::new();
+    let mut unimplemented = Vec::new();
+    for (name, bytes) in files {
+        let json = jparse(&bytes).unwrap_or_else(|| panic!("invalid JSON: {name}"));
+        match super::p_cf(&json) {
+            None => unparsed.push(name),
+            Some(Cf::Unknown(_)) => unimplemented.push(name),
+            Some(_) => {}
+        }
+    }
+    unparsed.sort();
+    assert!(
+        unparsed.is_empty(),
+        "unparsed configured features: {unparsed:?}"
+    );
+    unimplemented.sort();
+    assert_eq!(
+        unimplemented,
+        ["minecraft:bonus_chest", "minecraft:end_spike",],
+        "unexpected parser losses (or resolved exceptions; remove them above)"
+    );
+}
+
+#[test]
+fn pinned_inline_features_and_modifiers_are_not_dropped() {
+    fn walk(node: &J, path: &str, checked: &mut usize) {
+        match node {
+            J::Obj(fields) => {
+                if js(node, "feature").is_some() && jarr(node, "placement").is_some() {
+                    let pf = super::p_pf(node)
+                        .unwrap_or_else(|| panic!("unparsed placed feature: {path}"));
+                    assert_eq!(
+                        pf.mods.len(),
+                        jarr(node, "placement").unwrap().len(),
+                        "lost modifier: {path}"
+                    );
+                    *checked += 1;
+                }
+                if js(node, "type").is_some() && js(node, "config").is_some() && path.contains('/')
+                {
+                    assert!(
+                        !matches!(super::p_cf(node), None | Some(Cf::Unknown(_))),
+                        "unparsed inline configured feature: {path}"
+                    );
+                    *checked += 1;
+                }
+                for (key, value) in fields {
+                    walk(value, &format!("{path}/{key}"), checked);
+                }
+            }
+            J::Arr(values) => {
+                for (i, value) in values.iter().enumerate() {
+                    walk(value, &format!("{path}/{i}"), checked);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut checked = 0;
+    for kind in ["configured_feature", "placed_feature"] {
+        for (name, bytes) in Gen::dp_files(kind) {
+            let json = jparse(&bytes).unwrap_or_else(|| panic!("invalid JSON: {name}"));
+            walk(&json, &name, &mut checked);
+        }
+    }
+    assert!(
+        checked > 0,
+        "no inline features or placed features inspected"
+    );
+    println!("parsed {checked} inline configured / placed feature nodes without dropped modifiers");
+}
+
+#[test]
+fn block_column_provider_accepts_native_and_legacy_keys() {
+    for key in ["provider", "contents"] {
+        let text = format!(
+            r#"{{"type":"block_column","config":{{"layers":[{{"height":1,"{key}":{{"type":"simple_state_provider","state":{{"Name":"minecraft:stone"}}}}}}],"direction":"up"}}}}"#
+        );
+        assert!(
+            super::p_cf(&jparse(text.as_bytes()).unwrap()).is_some(),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn block_column_up_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/block_column_up.json"),
+        include_str!("../tests/data/block_column_up_1211.tsv"),
+    );
+}
+
+#[test]
+fn block_column_down_matches_native_cells_and_rng() {
+    generic_feature_cases(
+        include_str!("../tests/feature_cases/block_column_down.json"),
+        include_str!("../tests/data/block_column_down_1211.tsv"),
+    );
+}
+
+#[test]
+fn required_feature_children_cannot_silently_disappear() {
+    for ty in ["simple_random_selector", "sequence"] {
+        let json = jparse(format!(r#"{{"type":"{ty}","config":{{"features":[{{"feature":{{"type":"glowstone_blob","config":{{}}}},"placement":[]}},{{"feature":{{"type":"block_column","config":{{}}}},"placement":[]}}]}}}}"#).as_bytes()).unwrap();
+        assert!(
+            super::p_cf(&json).is_none(),
+            "{ty} dropped an invalid child"
+        );
+    }
+    let json = jparse(br#"{"feature":"minecraft:glowstone_blob","placement":[{"type":"minecraft:unsupported_modifier"}]}"#).unwrap();
+    assert!(
+        super::p_pf(&json).is_none(),
+        "a dropped modifier changes placement and RNG"
+    );
+    for ty in ["all_of", "any_of"] {
+        let json = jparse(format!(r#"{{"type":"{ty}","predicates":[{{"type":"true"}},{{"type":"unsupported_predicate"}}]}}"#).as_bytes()).unwrap();
+        assert!(
+            crate::generation_providers::p_pred(&json).is_none(),
+            "{ty} dropped an invalid predicate"
+        );
+    }
 }
 
 #[test]
@@ -884,6 +1408,108 @@ fn sculk_vein_cursor_remembers_faces_added_by_spread() {
         Some(0b111101),
         "cursor kept pre-spread faces"
     );
+}
+
+/// The native caller passes the state captured after spread but before conversion.
+/// Conversion can spread a new north face back onto the source, which discharge
+/// must not retain just because it appeared in the live world in the meantime.
+#[test]
+fn sculk_cursor_discharges_the_captured_state_after_conversion() {
+    let reg = breg().unwrap();
+    for initial_charge in [1, 2] {
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -2..=2 {
+            for y in 78..=82 {
+                for z in -2..=2 {
+                    g.feat_write(x, y, z, 0);
+                }
+            }
+        }
+        let bedrock = reg.state_of("minecraft:bedrock", None);
+        g.feat_write(0, 80, -1, bedrock);
+        g.feat_write(0, 80, 1, bedrock);
+        g.feat_write(0, 79, 0, reg.state_of("minecraft:deepslate", None));
+        let vein = reg.with_prop(reg.state_of("minecraft:sculk_vein", None), "south", "true");
+        g.feat_write(0, 80, 0, vein);
+        let mut ctx = context(&mut g);
+        let mut cursor = super::SpcCursor::new((0, 80, 0), initial_charge);
+        let mut rng = Xor::seed_worldgen(0);
+        super::spc_cursor_update(&mut ctx, &mut rng, &mut cursor, (0, 80, 0), true);
+        assert_eq!(
+            cursor.charge,
+            initial_charge - 1,
+            "conversion uses one charge"
+        );
+        if initial_charge == 2 {
+            assert_ne!(cursor.pos, (0, 80, 0), "exercise discharge before moving");
+        }
+        assert_eq!(reg.name_of(ctx.get(0, 79, 0)), "minecraft:sculk");
+        assert_eq!(
+            super::spc_face_mask(reg, ctx.get(0, 80, 0)),
+            8,
+            "discharge must use captured down+south, not live down+north+south"
+        );
+    }
+}
+
+#[test]
+fn sculk_discharge_matches_native_state_snapshots() {
+    let reg = breg().unwrap();
+    let vein = |mask: u8| {
+        let mut st = reg.state_of("minecraft:sculk_vein", None);
+        for d in 0..6 {
+            st = reg.with_prop(
+                st,
+                super::multiface_property(d),
+                if mask & (1 << d) == 0 {
+                    "false"
+                } else {
+                    "true"
+                },
+            );
+        }
+        st
+    };
+    for row in include_str!("../tests/data/sculk_discharge_1211.tsv").lines() {
+        let p: Vec<_> = row.split('\t').collect();
+        assert_eq!(p.len(), 5, "{row}");
+        let captured = vein(p[0].parse().unwrap());
+        let live = vein(p[1].parse().unwrap());
+        let mut g = Gen::load(0, crate::name_to_state).unwrap();
+        for x in -1..=1 {
+            for y in 79..=81 {
+                for z in -1..=1 {
+                    g.feat_write(x, y, z, 0);
+                }
+            }
+        }
+        g.feat_write(0, 80, 0, live);
+        g.feat_write(
+            0,
+            79,
+            0,
+            reg.state_of(
+                if p[2] == "1" {
+                    "minecraft:sculk"
+                } else {
+                    "minecraft:bedrock"
+                },
+                None,
+            ),
+        );
+        let mut ctx = context(&mut g);
+        super::spc_vein_decay(&mut ctx, reg, (0, 80, 0), captured);
+        assert_eq!(
+            block_state_cells_text(reg, ctx.get(0, 80, 0)),
+            p[3],
+            "{row}"
+        );
+        assert_eq!(
+            Xor::seed_worldgen(0).next_bound(1000).to_string(),
+            p[4],
+            "{row}"
+        );
+    }
 }
 
 /// availableFaces(sculk) is an empty set, distinct from an uninitialized cursor's null.
@@ -2550,12 +3176,16 @@ fn provider_values_and_following_rng_match_pre_extraction() {
         Bsp::RandomInt {
             src: Box::new(Bsp::Simple(wheat)),
             prop: "age".into(),
-            vals: vec![0, 3, 7],
+            vals: Some(crate::generation_providers::IP::Weighted(vec![
+                (1, crate::generation_providers::IP::Const(0)),
+                (1, crate::generation_providers::IP::Const(3)),
+                (1, crate::generation_providers::IP::Const(7)),
+            ])),
         },
         Bsp::RandomInt {
             src: Box::new(Bsp::Simple(wheat)),
             prop: "age".into(),
-            vals: vec![],
+            vals: None,
         },
         Bsp::Noise {
             n: noise(),
@@ -2732,7 +3362,7 @@ fn provider_values_and_following_rng_match_pre_extraction() {
         }
     }
     // `UPDATE_BASELINE=1` re-records the fixture after a *verified* correction
-    // (height providers and legacy-source NormalNoise have independent native vectors).
+    // (height providers, NormalNoise and biased integer heights have independent native vectors).
     if std::env::var("UPDATE_BASELINE").is_ok() {
         std::fs::write(
             "evidence/foundation/module-layers/provider-baseline.bin",

@@ -488,6 +488,83 @@ check "a predicate reads solidity, not replaceability" \
   '        Pr::Solid => reg.is_replaceable(ctx.get(x, y, z)),' \
   provider_values_and_following_rng_match_pre_extraction
 
+check "block columns read native provider fields" \
+  src/feature.rs 'p_bsp(js(e, "provider").or_else(|| js(e, "contents"))?)?' \
+  'p_bsp(js(e, "contents")?)?' \
+  block_column_provider_accepts_native_and_legacy_keys
+
+check "biased integer heights use the nested bound" \
+  src/generation_providers.rs '                a + r.next_bound(bound)' \
+  '                a + r.next_bound(b - a + 1)' \
+  block_column_up_matches_native_cells_and_rng
+
+check "block-column predicates read their configured offset" \
+  src/generation_providers.rs 'supports_offset && offset != [0, 0, 0]' \
+  'supports_offset && offset == [0, 0, 0]' \
+  block_column_up_matches_native_cells_and_rng
+
+check "randomized state providers sample their integer provider" \
+  src/generation_providers.rs '                    let value = vals.get(r);' \
+  '                    let value = vals.min_inclusive();' \
+  block_column_down_matches_native_cells_and_rng
+
+check "selectors cannot shrink after a nested parser failure" \
+  src/feature.rs '        "simple_random_selector" => {
+            let mut v = vec![];
+            for e in jarr(j, "features")? {
+                v.push(pf_any(e)?);' \
+  '        "simple_random_selector" => {
+            let mut v = vec![];
+            for e in jarr(j, "features")? {
+                if let Some(pf) = pf_any(e) { v.push(pf); }' \
+  required_feature_children_cannot_silently_disappear
+
+check "sequences cannot shrink after a nested parser failure" \
+  src/feature.rs '        "sequence" => {
+            let mut v = vec![];
+            for e in jarr(j, "features")? {
+                v.push(pf_any(e)?);' \
+  '        "sequence" => {
+            let mut v = vec![];
+            for e in jarr(j, "features")? {
+                if let Some(pf) = pf_any(e) { v.push(pf); }' \
+  required_feature_children_cannot_silently_disappear
+
+check "required placement modifiers cannot disappear" \
+  src/feature.rs '                    return None;
+                }
+            }
+        }
+    }
+    Some(Pf {' \
+  '                    continue;
+                }
+            }
+        }
+    }
+    Some(Pf {' \
+  required_feature_children_cannot_silently_disappear
+
+check "all-of predicates cannot drop an unsupported child" \
+  src/generation_providers.rs '        "all_of" => Pr::All(
+            jarr(j, "predicates")?
+                .iter()
+                .map(p_pred)
+                .collect::<Option<_>>()?,
+        ),' \
+  '        "all_of" => Pr::All(jarr(j, "predicates")?.iter().filter_map(p_pred).collect()),' \
+  required_feature_children_cannot_silently_disappear
+
+check "any-of predicates cannot drop an unsupported child" \
+  src/generation_providers.rs '        "any_of" => Pr::Any(
+            jarr(j, "predicates")?
+                .iter()
+                .map(p_pred)
+                .collect::<Option<_>>()?,
+        ),' \
+  '        "any_of" => Pr::Any(jarr(j, "predicates")?.iter().filter_map(p_pred).collect()),' \
+  required_feature_children_cannot_silently_disappear
+
 check "a context override outranks the cached terrain read" \
   src/generation_context.rs '        if let Some(&s) = self.wr.get(&(x, y, z)) {' \
   '        if let Some(&s) = self.rc.get(&(x, y, z)) {' \
@@ -1108,6 +1185,205 @@ check "runtime tick drain does not wait for the generation lock" \
     let queues = GEN_TICK_QUEUES.lock().unwrap().clone();' \
   worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
 
+check "generated handoff retains native negative suborders" \
+  src/scheduled_ticks.rs 'sub_order: -*remaining,' 'sub_order: 0,' \
+  tick_tests::generated_fluid_handoff_matches_native_proto_unpack
+
+check "generated handoff counts each chunk rather than the whole batch" \
+  src/scheduled_ticks.rs '        for (pos, _) in &pending {
+            *counts.entry((pos.0 >> 4, pos.2 >> 4)).or_default() += 1;
+        }
+        for (pos, block) in pending {
+            let remaining = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)).unwrap();' \
+  '        for _ in &pending {
+            *counts.entry((0, 0)).or_default() += 1;
+        }
+        for (pos, block) in pending {
+            let remaining = counts.get_mut(&(0, 0)).unwrap();' \
+  tick_tests::generated_fluid_handoff_matches_native_proto_unpack
+
+check "generated handoff uses the activation time" \
+  src/scheduled_ticks.rs 'due: now,' 'due: 0,' \
+  tick_tests::generated_fluid_handoff_matches_native_proto_unpack
+
+check "generated handoff increments each native negative suborder" \
+  src/scheduled_ticks.rs '*remaining -= 1;' '*remaining += 1;' \
+  tick_tests::generated_fluid_handoff_matches_native_proto_unpack
+
+check "fluid handoff does not consume the ordinary runtime counter" \
+  src/main.rs 'self.queue.unpack_generated(pending, now);' \
+  'self.next_order += pending.len() as i64; self.queue.unpack_generated(pending, now);' \
+  tick_tests::generated_fluid_handoff_matches_native_proto_unpack
+
+check "fluid handoff adopts the generated positions" \
+  src/main.rs 'self.owned.extend(pending.iter().map(|&(pos, _)| pos));' 'let _ = pending.iter();' \
+  tick_tests::generated_fluid_handoff_matches_native_proto_unpack
+
+check "dispatcher fixture cannot initialize the parent generator" \
+  src/tick_tests.rs $'if is_parent {\n        let mut child' $'if false {\n        let mut child' \
+  tick_tests::generated_dispatchers_unpack_the_published_generator_queues
+
+check "fluid dispatcher imports its published generator queue" \
+  src/main.rs 'owner.unpack_generated(generated, now);' 'let _ = generated;' \
+  tick_tests::generated_dispatchers_unpack_the_published_generator_queues
+
+check "block dispatcher imports its published generator queue" \
+  src/main.rs '        block_ticks()
+            .lock()
+            .unwrap()
+            .unpack_generated(generated, now);' '        let _ = generated;' \
+  tick_tests::generated_dispatchers_unpack_the_published_generator_queues
+
+check "shared voxel faces retain native axis order" \
+  src/voxel_faces.rs '2 | 3 => (0, p.0, p.1, p.2.wrapping_add(positive)),' \
+  '2 | 3 => (3, p.0, p.1, p.2.wrapping_add(positive)),' \
+  voxel_faces::tests::exposed_faces_match_actual_native_sequence
+
+check "shared voxel faces omit internal occupied neighbors" \
+  src/voxel_faces.rs 'if !occupied.contains(&q) {' 'if occupied.contains(&q) {' \
+  voxel_faces::tests::exposed_faces_match_actual_native_sequence
+
+check "shared voxel faces deduplicate written positions" \
+  src/voxel_faces.rs 'let occupied: HashSet<_> = points.into_iter().collect();' \
+  'let occupied: Vec<_> = points.into_iter().collect();' \
+  voxel_faces::tests::exposed_faces_match_actual_native_sequence
+
+check "shared voxel faces preserve transition direction" \
+  src/voxel_faces.rs 'faces.push((direction, p, q));' 'faces.push((direction ^ 1, p, q));' \
+  voxel_faces::tests::exposed_faces_match_actual_native_sequence
+
+check "tree consumes shared voxel faces in native order" \
+  src/tree.rs 'crate::voxel_faces::exposed_faces(shape.positions())' \
+  'crate::voxel_faces::exposed_faces(shape.positions()).into_iter().rev()' \
+  tree::tests::leaf_edge_schedules_match_native_order
+
+check "solid template consumes shared voxel faces in native order" \
+  src/structure_template.rs 'crate::voxel_faces::exposed_faces(written)' \
+  'crate::voxel_faces::exposed_faces(written).into_iter().rev()' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "fossil parser resolves the production type rather than Unknown" \
+  src/feature.rs '"fossil" => Cf::Fossil(Box::new(Fossil::parse(j)?)),' \
+  '"fossil" => Cf::Unknown("fossil".to_owned()),' \
+  feature::generation_contract_tests::fossil_production_dispatch_matches_native
+
+check "fossil production dispatch executes placement" \
+  src/feature.rs 'config.place(ctx, rng, pos);' 'let _ = (config, ctx, rng, pos);' \
+  feature::generation_contract_tests::fossil_production_dispatch_matches_native
+
+check "fossil overlay uses the selected paired index" \
+  src/feature.rs 'self.overlay[index]' 'self.overlay[(index + 1) % self.overlay.len()]' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "fossil reads the frozen ocean floor stage" \
+  src/feature.rs 'ctx.hm_oc_wg(centered.0.wrapping_add(dx), centered.1.wrapping_add(dz))' \
+  'ctx.hm_oc(centered.0.wrapping_add(dx), centered.1.wrapping_add(dz))' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "fossil centers the rotated footprint" \
+  src/feature.rs 'Rotation::Clockwise90 | Rotation::Counterclockwise90 => (sz, sx),' \
+  'Rotation::Clockwise90 | Rotation::Counterclockwise90 => (sx, sz),' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "fossil depth clamps above the dimension minimum" \
+  src/feature.rs '(floor.wrapping_sub(15).wrapping_sub(rng.next_bound(10))).max(ctx.g.min_y + 10)' \
+  '(floor.wrapping_sub(15).wrapping_sub(rng.next_bound(10)))' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "fossil empty-corner threshold retains equality" \
+  src/feature.rs 'if empty > self.max_empty_corners {' 'if empty >= self.max_empty_corners {' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "fossil writes the base before processing the overlay" \
+  src/feature.rs $'        base.place_solid_blocks(ctx, rng, placement, &self.base_processors, clip)\n            .expect("prevalidated fossil base");\n        self.overlay[index]\n            .place_solid_blocks(ctx, rng, placement, &self.overlay_processors, clip)\n            .expect("prevalidated fossil overlay");' \
+  $'        self.overlay[index].place_solid_blocks(ctx, rng, placement, &self.overlay_processors, clip).unwrap();\n        base.place_solid_blocks(ctx, rng, placement, &self.base_processors, clip).unwrap();' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "solid template palette selection advances the shared RNG" \
+  src/structure_template.rs 'let palette = rng.next_bound(self.palettes.len() as i32) as usize;' 'let palette = 0;' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "solid template clipping does not skip processor draws" \
+  src/structure_template.rs '|_| rng.next_f32(),' \
+  '|p| if p.0 < clip[0] || p.1 < clip[1] || p.2 < clip[2] || p.0 > clip[3] || p.1 > clip[4] || p.2 > clip[5] { 0.0 } else { rng.next_f32() },' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "solid template clipping retains the upper window face" \
+  src/structure_template.rs '|| p.0 > clip[3]' '|| p.0 >= clip[3]' \
+  feature::generation_contract_tests::fossil_window_clipping_matches_native
+
+check "solid template states rotate at placement" \
+  src/structure_template.rs $'                block.state,\n                placement.mirror,\n                placement.rotation,' \
+  $'                block.state,\n                placement.mirror,\n                crate::structure_transform::Rotation::None,' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "solid template boundary schedules source water" \
+  src/structure_template.rs '"minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),' '"minecraft:water" => (),' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "solid template boundary schedules source lava" \
+  src/structure_template.rs '"minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),' '"minecraft:lava" => (),' \
+  feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
+
+check "fossil parser rejects unimplemented template outputs" \
+  src/feature.rs 'template.validate_solid_placement(processors, reg).ok()?;' 'let _ = (template, processors, reg);' \
+  feature::generation_contract_tests::fossil_required_resources_and_children_fail_closed
+
+check "datapack resource lookup keeps the highest-priority pack" \
+  src/worldgen.rs 'for pack in packs.iter().rev() {' 'for pack in packs.iter() {' \
+  worldgen::wg_tests::datapack_resources_respect_priority_and_confine_id_paths
+
+check "non-directory pack entries do not mask lower resources" \
+  src/worldgen.rs '|| e.kind() == std::io::ErrorKind::NotADirectory' '|| false' \
+  worldgen::wg_tests::datapack_resources_respect_priority_and_confine_id_paths
+
+check "datapack resource namespaces cannot escape data roots" \
+  src/worldgen.rs '            || matches!(namespace, "." | "..")' '' \
+  worldgen::wg_tests::datapack_resources_respect_priority_and_confine_id_paths
+
+check "datapack resource paths cannot traverse the resource kind" \
+  src/worldgen.rs 'std::path::Component::Normal(_)' 'std::path::Component::Normal(_) | std::path::Component::ParentDir' \
+  worldgen::wg_tests::datapack_resources_respect_priority_and_confine_id_paths
+
+check "template rot eligibility uses the original state snapshot" \
+  src/structure_template.rs 'reg.name_of(original.state)' 'reg.name_of(current.state)' \
+  structure_template::tests::processor_stage_matches_native_cells_and_rng
+
+check "template rules see preceding processor output" \
+  src/structure_template.rs 'r.input.matches(current.state, reg)' 'r.input.matches(original.state, reg)' \
+  structure_template::tests::processor_stage_matches_native_cells_and_rng
+
+check "template protection reads the world rather than the candidate" \
+  src/structure_template.rs 'reg.in_tag(world(current.pos), tag)' 'reg.in_tag(current.state, tag)' \
+  structure_template::tests::processor_stage_matches_native_cells_and_rng
+
+check "template processors use transformed world coordinates" \
+  src/structure_template.rs 'p.0.wrapping_add(placement.origin.0)' 'p.0' \
+  structure_template::tests::processor_stage_matches_native_cells_and_rng
+
+check "template state rotation belongs after processors" \
+  src/structure_template.rs 'let mut current = original.clone();' \
+  'let mut current = original.clone(); current.state = crate::structure_transform::state(current.state, placement.mirror, placement.rotation).unwrap();' \
+  structure_template::tests::processor_stage_matches_native_cells_and_rng
+
+check "template rot still draws at full integrity" \
+  src/structure_template.rs '&& draw(current.pos) > *integrity' \
+  '&& *integrity < 1.0 && draw(current.pos) > *integrity' \
+  structure_template::tests::processor_stage_matches_native_cells_and_rng
+
+check "template rot retains equality at zero integrity" \
+  src/structure_template.rs 'draw(current.pos) > *integrity' 'draw(current.pos) >= *integrity' \
+  structure_template::tests::processor_stage_matches_native_cells_and_rng
+
+check "template processor lists do not drop unsupported children" \
+  src/structure_template.rs 'processors.iter().map(|p| Self::parse(p, reg)).collect()' \
+  'processors.iter().filter_map(|p| Self::parse(p, reg).ok()).map(Ok).collect()' \
+  structure_template::tests::processor_lists_reject_unsupported_required_children
+
+check "template integrity codec rejects negative zero" \
+  src/structure_template.rs ' || integrity.is_sign_negative()' '' \
+  structure_template::tests::processor_lists_reject_unsupported_required_children
+
 check "sculk vein spreads from a present face toward an absent face" \
   src/feature.rs 'if is_vein && !(spc_has_face(reg, state, from) && !spc_has_face(reg, state, to)) {' \
   'if is_vein && !(spc_has_face(reg, state, to) && !spc_has_face(reg, state, from)) {' \
@@ -1121,6 +1397,22 @@ check "sculk wrap-around uses the source corner" \
 check "sculk vein rereads faces after spread" \
   src/feature.rs 'if kind != SpcKind::Sculk {' 'if kind == SpcKind::Other {' \
   feature::generation_contract_tests::sculk_vein_cursor_remembers_faces_added_by_spread
+
+check "sculk exhausted cursor discharges its captured state" \
+  src/feature.rs '        spc_decay(ctx, reg, cursor, kind, state);
+        return;' \
+  '        let live = ctx.get(cursor.pos.0, cursor.pos.1, cursor.pos.2);
+        spc_decay(ctx, reg, cursor, kind, live);
+        return;' \
+  feature::generation_contract_tests::sculk_cursor_discharges_the_captured_state_after_conversion
+
+check "sculk moving cursor discharges its captured state" \
+  src/feature.rs '        spc_decay(ctx, reg, cursor, kind, state);
+        cursor.pos = next;' \
+  '        let live = ctx.get(cursor.pos.0, cursor.pos.1, cursor.pos.2);
+        spc_decay(ctx, reg, cursor, kind, live);
+        cursor.pos = next;' \
+  feature::generation_contract_tests::sculk_cursor_discharges_the_captured_state_after_conversion
 
 check "sculk known empty faces are not unknown" \
   src/feature.rs 'cursor.facings = Some(spc_face_mask(reg, state));' \

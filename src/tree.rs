@@ -2028,25 +2028,22 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
 /// foreign logs/leaves are discovered through neighbours, not independently seeded.
 struct LeafShape {
     min: P3,
-    max: P3,
     filled: Vec<bool>,
     ys: usize,
     zs: usize,
 }
 
 impl LeafShape {
-    fn contains(&self, p: P3) -> bool {
-        if p.0 < self.min.0
-            || p.0 > self.max.0
-            || p.1 < self.min.1
-            || p.1 > self.max.1
-            || p.2 < self.min.2
-            || p.2 > self.max.2
-        {
-            return false;
-        }
-        self.filled[((p.0 - self.min.0) as usize * self.ys + (p.1 - self.min.1) as usize) * self.zs
-            + (p.2 - self.min.2) as usize]
+    fn positions(&self) -> impl Iterator<Item = P3> + '_ {
+        self.filled.iter().enumerate().filter_map(|(i, &filled)| {
+            filled.then(|| {
+                (
+                    self.min.0 + (i / (self.ys * self.zs)) as i32,
+                    self.min.1 + (i / self.zs % self.ys) as i32,
+                    self.min.2 + (i % self.zs) as i32,
+                )
+            })
+        })
     }
 }
 
@@ -2136,63 +2133,33 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) -> Opt
     }
     Some(LeafShape {
         min,
-        max,
         filled: visited,
         ys,
         zs,
     })
 }
 
-/// StructureTemplate.updateShapeAtEdge visits full/empty transitions in
-/// z, y, x axis order. Each face updates the inside, then its neighbour.
+/// Each native face updates the inside, then its neighbour.
 fn schedule_leaf_edges(ctx: &mut FC, shape: &LeafShape) {
     let Some(reg) = breg() else { return };
-    let min = [shape.min.0, shape.min.1, shape.min.2];
-    let max = [shape.max.0, shape.max.1, shape.max.2];
-    for (axis, outer, inner) in [(2, 0, 1), (1, 2, 0), (0, 1, 2)] {
-        for a in min[outer]..=max[outer] {
-            for b in min[inner]..=max[inner] {
-                let mut was_full = false;
-                for c in min[axis]..=max[axis] + 1 {
-                    let mut p = [0; 3];
-                    p[outer] = a;
-                    p[inner] = b;
-                    p[axis] = c;
-                    let now_full = shape.contains((p[0], p[1], p[2]));
-                    let sign = if !was_full && now_full {
-                        -1
-                    } else if was_full && !now_full {
-                        p[axis] -= 1;
-                        1
-                    } else {
-                        was_full = now_full;
-                        continue;
-                    };
-                    let mut q = p;
-                    q[axis] += sign;
-                    let p = (p[0], p[1], p[2]);
-                    let q = (q[0], q[1], q[2]);
-                    let ps = ctx.get(p.0, p.1, p.2);
-                    let qs = ctx.get(q.0, q.1, q.2);
-                    for (cell, st, neighbor) in [(p, ps, qs), (q, qs, ps)] {
-                        let name = reg.name_of(st);
-                        if !name.ends_with("_leaves") {
-                            continue;
-                        }
-                        let Some(distance) = reg
-                            .get_prop(st, "distance")
-                            .and_then(|v| v.parse::<u8>().ok())
-                        else {
-                            continue;
-                        };
-                        let next = reg.distance_from_log(neighbor).unwrap_or(7) + 1;
-                        if next != 1 || distance != 1 {
-                            ctx.g
-                                .schedule_generated_leaf(cell, reg.state_of(name, None));
-                        }
-                    }
-                    was_full = now_full;
-                }
+    for (_, p, q) in crate::voxel_faces::exposed_faces(shape.positions()) {
+        let ps = ctx.get(p.0, p.1, p.2);
+        let qs = ctx.get(q.0, q.1, q.2);
+        for (cell, st, neighbor) in [(p, ps, qs), (q, qs, ps)] {
+            let name = reg.name_of(st);
+            if !name.ends_with("_leaves") {
+                continue;
+            }
+            let Some(distance) = reg
+                .get_prop(st, "distance")
+                .and_then(|v| v.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            let next = reg.distance_from_log(neighbor).unwrap_or(7) + 1;
+            if next != 1 || distance != 1 {
+                ctx.g
+                    .schedule_generated_leaf(cell, reg.state_of(name, None));
             }
         }
     }

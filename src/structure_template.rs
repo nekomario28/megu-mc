@@ -1,5 +1,5 @@
-//! StructureTemplate's typed load and block ordering. Placement/processor effects
-//! are separate; loading a template does not place its cells into a world.
+//! StructureTemplate load, processing and bounded full-cube terrain placement.
+//! Load/processing remain read-only; solid placement writes through the generation context.
 use crate::block_registry::BReg;
 use crate::nbt::{NbtString, Tag};
 use std::collections::BTreeMap;
@@ -71,7 +71,357 @@ fn state_from_tag(value: &Tag, reg: &BReg) -> Result<u32, &'static str> {
         .ok_or("unknown palette block or property")
 }
 
+/// Coordinates are transformed before processing, states only during placement.
+#[derive(Clone, Copy)]
+pub(crate) struct Placement {
+    pub origin: Pos,
+    pub pivot: Pos,
+    pub mirror: crate::structure_transform::Mirror,
+    pub rotation: crate::structure_transform::Rotation,
+}
+
+fn state_from_json(value: &crate::json::J, reg: &BReg) -> Result<u32, &'static str> {
+    use crate::json::J;
+    let Some(J::Str(name)) = value.get("Name") else {
+        return Err("missing template state name");
+    };
+    let mut properties = Vec::new();
+    if let Some(props) = value.get("Properties") {
+        let J::Obj(props) = props else {
+            return Err("template state properties must be an object");
+        };
+        for (key, val) in props {
+            let J::Str(val) = val else {
+                return Err("template state property must be a string");
+            };
+            properties.push((key.clone(), val.clone()));
+        }
+    }
+    reg.checked_state(name, &properties)
+        .ok_or("unknown template state")
+}
+
+#[derive(Clone, Debug)]
+enum RuleTest {
+    Always,
+    Block(String),
+}
+impl RuleTest {
+    fn parse(value: &crate::json::J, reg: &BReg) -> Result<Self, &'static str> {
+        match value.get("predicate_type").map(crate::json::J::str) {
+            Some("minecraft:always_true") => Ok(Self::Always),
+            Some("minecraft:block_match") => {
+                let name = value.get("block").ok_or("missing rule block")?.str();
+                let state = reg.checked_state(name, &[]).ok_or("unknown rule block")?;
+                Ok(Self::Block(reg.name_of(state).to_owned()))
+            }
+            _ => Err("unsupported template rule test"),
+        }
+    }
+    fn matches(&self, state: u32, reg: &BReg) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Block(name) => reg.name_of(state) == name,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub(crate) struct BlockRule {
+    input: RuleTest,
+    location: RuleTest,
+    output: u32,
+}
+
+/// Supported processor shapes, not a claim that every native processor is ported.
+#[derive(Clone, Debug)]
+pub(crate) enum Processor {
+    BlockRot {
+        integrity: f32,
+        rottable: Option<Vec<String>>,
+    },
+    Protected(String),
+    Rules(Vec<BlockRule>),
+}
+impl Processor {
+    /// Reject an unsupported required child rather than shorten a processor list.
+    pub(crate) fn list(value: &crate::json::J, reg: &BReg) -> Result<Vec<Self>, &'static str> {
+        let processors = value
+            .get("processors")
+            .and_then(crate::json::J::as_arr)
+            .ok_or("missing template processor list")?;
+        processors.iter().map(|p| Self::parse(p, reg)).collect()
+    }
+    fn parse(value: &crate::json::J, reg: &BReg) -> Result<Self, &'static str> {
+        use crate::json::J;
+        match value.get("processor_type").map(J::str) {
+            Some("minecraft:block_rot") => {
+                let Some(J::Num(integrity)) = value.get("integrity") else {
+                    return Err("missing block rot integrity");
+                };
+                let integrity = *integrity as f32;
+                // Native floatRange compares boxed floats: -0.0 sorts below +0.0.
+                if !integrity.is_finite() || integrity.is_sign_negative() || integrity > 1.0 {
+                    return Err("block rot integrity outside 0..=1");
+                }
+                let rottable = match value.get("rottable_blocks") {
+                    None => None,
+                    Some(J::Arr(values)) => Some(
+                        values
+                            .iter()
+                            .map(|v| {
+                                let J::Str(name) = v else {
+                                    return Err("rottable block must be an identity");
+                                };
+                                let state = reg
+                                    .checked_state(name, &[])
+                                    .ok_or("unknown rottable block")?;
+                                Ok(reg.name_of(state).to_owned())
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                    _ => return Err("unsupported rottable holder set (explicit block lists only)"),
+                };
+                Ok(Self::BlockRot {
+                    integrity,
+                    rottable,
+                })
+            }
+            Some("minecraft:protected_blocks") => {
+                let Some(J::Str(name)) = value.get("value") else {
+                    return Err("missing protected block identity");
+                };
+                let tag = name
+                    .strip_prefix('#')
+                    .filter(|tag| !tag.is_empty())
+                    .ok_or("protected blocks requires a tag identity")?;
+                let tag = crate::block_registry::ns_name(tag);
+                let (namespace, path) = tag
+                    .split_once(':')
+                    .ok_or("invalid protected tag identity")?;
+                if namespace.is_empty()
+                    || !namespace.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b)
+                    })
+                    || !path.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"/_.-".contains(&b)
+                    })
+                {
+                    return Err("invalid protected tag identity");
+                }
+                Ok(Self::Protected(tag))
+            }
+            Some("minecraft:rule") => {
+                let rules = value
+                    .get("rules")
+                    .and_then(J::as_arr)
+                    .ok_or("missing template rules")?;
+                Ok(Self::Rules(
+                    rules
+                        .iter()
+                        .map(|r| {
+                            // More general position tests and NBT modifiers need their own native cases.
+                            if r.get("position_predicate").is_some()
+                                || r.get("block_entity_modifier").is_some()
+                            {
+                                return Err(
+                                    "unsupported template rule position test or NBT modifier",
+                                );
+                            }
+                            let output =
+                                r.get("output_state").ok_or("missing rule output state")?;
+                            Ok(BlockRule {
+                                input: RuleTest::parse(
+                                    r.get("input_predicate").ok_or("missing rule input test")?,
+                                    reg,
+                                )?,
+                                location: RuleTest::parse(
+                                    r.get("location_predicate")
+                                        .ok_or("missing rule location test")?,
+                                    reg,
+                                )?,
+                                output: state_from_json(output, reg)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            }
+            _ => Err("unsupported template processor type"),
+        }
+    }
+}
+
 impl Template {
+    /// Native processBlockInfos stage: no writes, clipping, state rotation,
+    /// palette selection, entities, fluids, or shape updates. The caller supplies
+    /// settings.getRandom(current_world_pos).nextFloat, preserving shared versus
+    /// position-seeded RNG ownership. Rules here have deterministic tests only.
+    pub(crate) fn process_blocks(
+        &self,
+        palette: usize,
+        placement: Placement,
+        processors: &[Processor],
+        reg: &BReg,
+        mut world: impl FnMut(Pos) -> u32,
+        mut draw: impl FnMut(Pos) -> f32,
+    ) -> Result<Vec<BlockInfo>, &'static str> {
+        let mut result = Vec::new();
+        for original in self
+            .palettes
+            .get(palette)
+            .ok_or("palette outside template")?
+        {
+            let p = crate::structure_transform::block(
+                original.pos,
+                placement.mirror,
+                placement.rotation,
+                placement.pivot,
+            );
+            let mut current = original.clone();
+            current.pos = (
+                p.0.wrapping_add(placement.origin.0),
+                p.1.wrapping_add(placement.origin.1),
+                p.2.wrapping_add(placement.origin.2),
+            );
+            let mut keep = true;
+            for processor in processors {
+                match processor {
+                    Processor::BlockRot {
+                        integrity,
+                        rottable,
+                    } => {
+                        // Membership uses the source snapshot, not preceding rule output.
+                        if rottable.as_ref().is_none_or(|names| {
+                            names.iter().any(|n| n == reg.name_of(original.state))
+                        }) && draw(current.pos) > *integrity
+                        {
+                            keep = false;
+                        }
+                    }
+                    Processor::Protected(tag) => {
+                        if reg.in_tag(world(current.pos), tag) {
+                            keep = false;
+                        }
+                    }
+                    Processor::Rules(rules) => {
+                        let existing = world(current.pos);
+                        if let Some(rule) = rules.iter().find(|r| {
+                            r.input.matches(current.state, reg) && r.location.matches(existing, reg)
+                        }) {
+                            current.state = rule.output;
+                        }
+                    }
+                }
+                if !keep {
+                    break;
+                }
+            }
+            if keep {
+                result.push(current);
+            }
+        }
+        Ok(result)
+    }
+
+    /// The fossil palette contract: no entities/NBT, and only full-cube outputs.
+    /// This is not the general template entity/fluid/shape-finalization pipeline.
+    pub(crate) fn validate_solid_placement(
+        &self,
+        processors: &[Processor],
+        reg: &BReg,
+    ) -> Result<(), &'static str> {
+        if !self.entities.is_empty()
+            || self
+                .palettes
+                .iter()
+                .flatten()
+                .any(|b| b.nbt.is_some() || reg.is_template_solid(b.state) != Some(true))
+        {
+            return Err("solid template placement requires full cubes without entities or NBT");
+        }
+        for processor in processors {
+            if let Processor::Rules(rules) = processor {
+                if rules
+                    .iter()
+                    .any(|r| reg.is_template_solid(r.output) != Some(true))
+                {
+                    return Err("solid template rule has a non-full output");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared-RNG, prevalidated full-cube placement. A whole processor pass reads
+    /// the world before this template's writes; the next template sees those writes.
+    /// Clipping is AFTER processing, including draws for discarded coordinates.
+    pub(crate) fn place_solid_blocks(
+        &self,
+        ctx: &mut crate::generation_context::FC,
+        rng: &mut crate::generation_math::Xor,
+        placement: Placement,
+        processors: &[Processor],
+        clip: [i32; 6],
+    ) -> Result<bool, &'static str> {
+        if self.palettes.is_empty() {
+            return Ok(false);
+        }
+        let palette = rng.next_bound(self.palettes.len() as i32) as usize;
+        if self.palettes[palette].is_empty()
+            || self.size.0 < 1
+            || self.size.1 < 1
+            || self.size.2 < 1
+        {
+            return Ok(false);
+        }
+        let reg = crate::block_registry::breg().ok_or("missing block registry")?;
+        let blocks = self.process_blocks(
+            palette,
+            placement,
+            processors,
+            reg,
+            |p| ctx.get(p.0, p.1, p.2),
+            |_| rng.next_f32(),
+        )?;
+        let mut written = Vec::new();
+        for block in blocks {
+            let p = block.pos;
+            if p.0 < clip[0]
+                || p.1 < clip[1]
+                || p.2 < clip[2]
+                || p.0 > clip[3]
+                || p.1 > clip[4]
+                || p.2 > clip[5]
+            {
+                continue;
+            }
+            let state = crate::structure_transform::state(
+                block.state,
+                placement.mirror,
+                placement.rotation,
+            )
+            .ok_or("unknown template state transform")?;
+            if p.1 >= ctx.g.min_y && p.1 < ctx.g.min_y + ctx.g.height {
+                ctx.set(p.0, p.1, p.2, state);
+                written.push(p);
+            }
+        }
+        // Native updateShapeAtEdge visits exposed voxel faces after ALL writes.
+        // Full-cube fossil outputs do not change their own shape. Source-liquid
+        // neighbors schedule proto ticks; general neighbor state rewrites remain
+        // outside this full-cube terrain placement contract.
+        for (_, _, q) in crate::voxel_faces::exposed_faces(written) {
+            let state = ctx.get(q.0, q.1, q.2);
+            if matches!(reg.name_of(state), "minecraft:water" | "minecraft:lava") {
+                match reg.fluid_name(state) {
+                    "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
+                    "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
+                    _ => {}
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Transformation-only preview. Processors and world placement side effects
     /// must be applied by the structure pipeline, not inferred from this list.
     pub(crate) fn transformed_blocks(
@@ -241,6 +591,34 @@ mod tests {
         bytes.iter().map(|v| format!("{v:02x}")).collect()
     }
     #[test]
+    fn fossil_template_admission_rejects_unhandled_data() {
+        let reg = crate::block_registry::breg().unwrap();
+        let bone = reg.state_of("minecraft:bone_block", None);
+        for kind in 0..4 {
+            let mut template = Template {
+                size: (1, 1, 1),
+                palettes: vec![vec![BlockInfo {
+                    pos: (0, 0, 0),
+                    state: bone,
+                    nbt: None,
+                }]],
+                entities: vec![],
+            };
+            let mut processors = Vec::new();
+            match kind {
+                0=>template.palettes[0][0].nbt=Some(Tag::Compound(BTreeMap::new())),
+                1=>template.entities.push(EntityInfo {pos:[0.0;3],block_pos:(0,0,0),nbt:Tag::Compound(BTreeMap::new())}),
+                2=>template.palettes[0][0].state=reg.state_of("minecraft:torch",None),
+                _=>processors=Processor::list(&crate::json::jparse(br#"{"processors":[{"processor_type":"minecraft:rule","rules":[{"input_predicate":{"predicate_type":"minecraft:always_true"},"location_predicate":{"predicate_type":"minecraft:always_true"},"output_state":{"Name":"minecraft:torch"}}]}]}"#).unwrap(),reg).unwrap(),
+            }
+            assert!(
+                template.validate_solid_placement(&processors, reg).is_err(),
+                "unhandled template input {kind} passed fossil admission"
+            );
+        }
+    }
+
+    #[test]
     fn every_pinned_template_matches_native_typed_nbt_and_loaded_order() {
         let reg = crate::block_registry::breg().unwrap();
         let mut count = 0;
@@ -275,5 +653,174 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 1180);
+    }
+
+    #[test]
+    fn processor_stage_matches_native_cells_and_rng() {
+        use crate::generation_math::{hash_block_pos, Lcg, Xor};
+        use crate::json::{jparse, J};
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let cases = jparse(include_bytes!(
+            "../tests/data/template_processor_cases_1211.json"
+        ))
+        .unwrap();
+        let cases = cases.as_arr().unwrap();
+        let expected: Vec<_> = include_str!("../tests/data/template_processors_1211.tsv")
+            .lines()
+            .collect();
+        assert_eq!(cases.len(), expected.len());
+        assert_eq!(cases.len(), 270);
+        let pos = |j: &J| {
+            let a = j.as_arr().unwrap();
+            (a[0].num() as i32, a[1].num() as i32, a[2].num() as i32)
+        };
+        for (case, row) in cases.iter().zip(expected) {
+            let f: Vec<_> = row.split('\t').collect();
+            let id = case.get("id").unwrap().str();
+            assert_eq!(f[0], id);
+            let empty_blocks = J::Arr(Vec::new());
+            let blocks = case
+                .get("blocks")
+                .unwrap_or(&empty_blocks)
+                .as_arr()
+                .unwrap()
+                .iter()
+                .map(|b| BlockInfo {
+                    pos: pos(b.get("pos").unwrap()),
+                    state: state_from_json(b.get("state").unwrap(), reg).unwrap(),
+                    nbt: b.get("marker").map(|m| {
+                        Tag::Compound(BTreeMap::from([(
+                            NbtString::text("marker"),
+                            Tag::Int(m.num() as i32),
+                        )]))
+                    }),
+                })
+                .collect();
+            let mut template = if let Some(path) = case.get("template") {
+                let data = std::fs::read(path.str()).unwrap();
+                let (_, root) = crate::nbt::read_gzip(&data, 16 * 1024 * 1024).unwrap();
+                Template::load(&root, reg).unwrap()
+            } else {
+                Template {
+                    size: (8, 8, 8),
+                    palettes: vec![blocks],
+                    entities: Vec::new(),
+                }
+            };
+            let original = template.block_layout(reg).unwrap();
+            let processors = Processor::list(case, reg).unwrap();
+            let world: Vec<_> = case
+                .get("world")
+                .unwrap()
+                .as_arr()
+                .unwrap()
+                .iter()
+                .map(|s| state_from_json(s, reg).unwrap())
+                .collect();
+            let mut rng = Xor::seed_worldgen(case.get("seed").unwrap().num() as i64 as u64);
+            let mode = case.get("random").unwrap().str();
+            let mut shared_draws = 0;
+            let mut reads = 0;
+            let processed = template
+                .process_blocks(
+                    0,
+                    Placement {
+                        origin: pos(case.get("origin").unwrap()),
+                        pivot: pos(case.get("pivot").unwrap()),
+                        mirror: Mirror::from_index(case.get("mirror").unwrap().num() as u8)
+                            .unwrap(),
+                        rotation: Rotation::from_index(case.get("rotation").unwrap().num() as u8)
+                            .unwrap(),
+                    },
+                    &processors,
+                    reg,
+                    |p| {
+                        reads += 1;
+                        let key =
+                            p.0.wrapping_mul(31)
+                                .wrapping_add(p.1.wrapping_mul(7))
+                                .wrapping_add(p.2.wrapping_mul(13));
+                        world[key.rem_euclid(world.len() as i32) as usize]
+                    },
+                    |p| {
+                        if mode == "positional" {
+                            Lcg::new(hash_block_pos(p.0, p.1, p.2) as u64).next_f32()
+                        } else {
+                            shared_draws += 1;
+                            if mode == "zero" {
+                                0.0
+                            } else {
+                                rng.next_f32()
+                            }
+                        }
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                template.block_layout(reg).unwrap(),
+                original,
+                "source mutated: {id}"
+            );
+            assert_eq!(
+                processed.len(),
+                f[1].parse::<usize>().unwrap(),
+                "count: {id}"
+            );
+            template.palettes = vec![processed];
+            assert_eq!(
+                hex(&sha256(&template.block_layout(reg).unwrap())),
+                f[2],
+                "full typed cells: {id}"
+            );
+            assert_eq!(
+                rng.next_bound(1000003),
+                f[3].parse::<i32>().unwrap(),
+                "following RNG: {id}"
+            );
+            assert_eq!(
+                shared_draws,
+                f[4].parse::<usize>().unwrap(),
+                "shared float calls: {id}"
+            );
+            assert_eq!(reads, f[5].parse::<usize>().unwrap(), "world reads: {id}");
+        }
+    }
+
+    #[test]
+    fn processor_lists_reject_unsupported_required_children() {
+        use crate::json::jparse;
+        let reg = crate::block_registry::breg().unwrap();
+        let reject = |body: &str| {
+            let json = format!("{{\"processors\":[{body}]}}");
+            assert!(
+                Processor::list(&jparse(json.as_bytes()).unwrap(), reg).is_err(),
+                "accepted {body}"
+            );
+        };
+        for bad in [
+            r#"{"processor_type":"minecraft:gravity"}"#,
+            r#"{"processor_type":"minecraft:protected_blocks","value":"bedrock"}"#,
+            r##"{"processor_type":"minecraft:protected_blocks","value":"#BadTag"}"##,
+            r#"{"processor_type":"minecraft:block_rot","integrity":-0.0}"#,
+            r#"{"processor_type":"minecraft:block_rot","integrity":-1e-60}"#,
+            r#"{"processor_type":"minecraft:block_rot","integrity":1.1}"#,
+            r#"{"processor_type":"minecraft:block_rot","integrity":0.1,"rottable_blocks":["no_such_block"]}"#,
+            r#"{"processor_type":"minecraft:rule","rules":[{}]}"#,
+        ] {
+            reject(bad);
+        }
+        // A supported sibling does not make a required unsupported child optional.
+        reject(
+            r#"{"processor_type":"minecraft:block_rot","integrity":1},{"processor_type":"minecraft:gravity"}"#,
+        );
+        for extra in [
+            r#""position_predicate":{"predicate_type":"minecraft:always_true"},"#,
+            r#""block_entity_modifier":{"type":"minecraft:passthrough"},"#,
+        ] {
+            reject(&format!(
+                r#"{{"processor_type":"minecraft:rule","rules":[{{{extra}"input_predicate":{{"predicate_type":"minecraft:always_true"}},"location_predicate":{{"predicate_type":"minecraft:always_true"}},"output_state":{{"Name":"minecraft:stone"}}}}]}}"#
+            ));
+        }
     }
 }

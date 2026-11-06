@@ -40,6 +40,17 @@ public final class StructureTemplateOracle {
         keys=compound.getMethod("e"); get=compound.getMethod("c",String.class);
         elementType=list.getMethod("f"); size=list.getMethod("size"); listGet=list.getMethod("k",int.class);
     }
+    /** Shared canonical cell encoding for loader and processor oracles. */
+    static void writeBlockInfo(Object info, DataOutputStream out) throws Exception {
+        Class<?> infoClass=Class.forName("ent$c"), posClass=Class.forName("jd");
+        Object p=infoClass.getMethod("a").invoke(info);
+        for(String coordinate:new String[]{"u","v","w"}) out.writeInt((int)posClass.getMethod(coordinate).invoke(p));
+        Object state=infoClass.getMethod("b").invoke(info);
+        named(Class.forName("uq").getMethod("a",Class.forName("dtc")).invoke(null,state),out);
+        Object nbt=infoClass.getMethod("c").invoke(info);
+        out.writeBoolean(nbt!=null);
+        if(nbt!=null) named(nbt,out);
+    }
     public static void main(String[] args) throws Exception {
         Class.forName("ab").getMethod("a").invoke(null);
         Class.forName("akt").getMethod("a").invoke(null);
@@ -53,11 +64,6 @@ public final class StructureTemplateOracle {
         Field palettes=template.getDeclaredField("l"), entities=template.getDeclaredField("m");
         palettes.setAccessible(true); entities.setAccessible(true);
         Method blocks=Class.forName("ent$a").getMethod("a");
-        Method infoPos=Class.forName("ent$c").getMethod("a");
-        Method infoState=Class.forName("ent$c").getMethod("b");
-        Method infoNbt=Class.forName("ent$c").getMethod("c");
-        Method stateNbt=Class.forName("uq").getMethod("a",state);
-        Method xp=pos.getMethod("u"),yp=pos.getMethod("v"),zp=pos.getMethod("w");
         List<String> rows=new ArrayList<>();
         try(var paths=Files.walk(Path.of(args[0]))) {
             for(Path file:paths.filter(p->p.toString().endsWith(".nbt")).sorted().toList()) {
@@ -71,13 +77,7 @@ public final class StructureTemplateOracle {
                 DataOutputStream out=new DataOutputStream(ordered); out.writeInt(ps.size());
                 for(Object p:ps) {
                     List<?> bs=(List<?>)blocks.invoke(p); out.writeInt(bs.size());
-                    for(Object info:bs) {
-                        Object bp=infoPos.invoke(info);
-                        out.writeInt((int)xp.invoke(bp));out.writeInt((int)yp.invoke(bp));out.writeInt((int)zp.invoke(bp));
-                        named(stateNbt.invoke(null,infoState.invoke(info)),out);
-                        Object nbt=infoNbt.invoke(info);out.writeBoolean(nbt!=null);
-                        if(nbt!=null) named(nbt,out);
-                    }
+                    for(Object info:bs) writeBlockInfo(info,out);
                 }
                 rows.add(Path.of(args[0]).relativize(file).toString()+"\t"+hash(raw.toByteArray())+"\t"+ps.size()+"\t"+es.size()+"\t"+hash(ordered.toByteArray()));
             }

@@ -27,9 +27,9 @@ impl IP {
             IP::Const(v) => *v,
             IP::Uniform(a, b) => r.next_inbetween(*a, *b),
             IP::BiasBottom(a, b) => {
-                let u1 = r.next_inbetween(*a, *b);
-                let u2 = r.next_inbetween(*a, *b);
-                u1.min(u2)
+                // BiasedToBottomInt (bpo): the second bound depends on the first draw.
+                let bound = r.next_bound(b - a + 1) + 1;
+                a + r.next_bound(bound)
             }
             IP::VeryBias(a, b, _) => {
                 let u1 = r.next_inbetween(*a, *b);
@@ -372,7 +372,7 @@ pub(crate) enum Bsp {
     RandomInt {
         src: Box<Bsp>,
         prop: String,
-        vals: Vec<i32>,
+        vals: Option<IP>,
     },
     Noise {
         n: Normal,
@@ -441,10 +441,10 @@ impl Bsp {
             }
             Bsp::RandomInt { src, prop, vals } => {
                 let st = src.get(ctx, r, x, y, z);
-                if !vals.is_empty() {
-                    let i = r.next_bound(vals.len() as i32) as usize;
+                if let Some(vals) = vals {
+                    let value = vals.get(r);
                     if let Some(reg) = breg() {
-                        return reg.with_prop(st, prop, &vals[i].to_string());
+                        return reg.with_prop(st, prop, &value.to_string());
                     }
                 }
                 st
@@ -579,12 +579,16 @@ pub(crate) fn p_bsp(j: &J) -> Option<Bsp> {
             Bsp::Weighted(v)
         }
         "randomized_int_state_provider" => {
-            let mut vals = vec![];
-            if let Some(vs) = jarr(j, "values") {
-                for v in vs {
-                    vals.push(v.num() as i32);
-                }
-            }
+            // 1.21.1 has an IntProvider here, not a list of equally likely values.
+            // Keep the older converted array spelling with the same draw semantics.
+            let vals = match js(j, "values") {
+                Some(J::Arr(vs)) if vs.is_empty() => None,
+                Some(J::Arr(vs)) => Some(IP::Weighted(
+                    vs.iter().map(|v| (1, IP::Const(v.num() as i32))).collect(),
+                )),
+                Some(provider) => Some(p_ip(provider)?),
+                None => None,
+            };
             Bsp::RandomInt {
                 src: Box::new(p_bsp(js(j, "source")?)?),
                 prop: jstr(j, "property")?,
@@ -667,6 +671,7 @@ pub(crate) enum Pr {
     Any(Vec<Pr>),
     All(Vec<Pr>),
     Not(Box<Pr>),
+    Offset(Box<Pr>, [i32; 3]),
 }
 fn off_arr(j: &J) -> [i32; 3] {
     jarr(j, "offset")
@@ -682,7 +687,7 @@ fn off_arr(j: &J) -> [i32; 3] {
 pub(crate) fn p_pred(j: &J) -> Option<Pr> {
     let ty = jstr(j, "type")?;
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
-    Some(match ty {
+    let pred = match ty {
         "true" | "always_true" => Pr::True,
         "matching_blocks" | "block_match" | "blockstate_match" => {
             let mut v = vec![];
@@ -728,8 +733,18 @@ pub(crate) fn p_pred(j: &J) -> Option<Pr> {
         "solid" => Pr::Solid,
         "replaceable" => Pr::Replaceable,
         "not" => Pr::Not(Box::new(p_pred(js(j, "predicate")?)?)),
-        "any_of" => Pr::Any(jarr(j, "predicates")?.iter().filter_map(p_pred).collect()),
-        "all_of" => Pr::All(jarr(j, "predicates")?.iter().filter_map(p_pred).collect()),
+        "any_of" => Pr::Any(
+            jarr(j, "predicates")?
+                .iter()
+                .map(p_pred)
+                .collect::<Option<_>>()?,
+        ),
+        "all_of" => Pr::All(
+            jarr(j, "predicates")?
+                .iter()
+                .map(p_pred)
+                .collect::<Option<_>>()?,
+        ),
         "would_survive" => Pr::WouldSurvive(
             js(j, "state")
                 .and_then(bs_parts)
@@ -750,6 +765,25 @@ pub(crate) fn p_pred(j: &J) -> Option<Pr> {
         }
         "unobstructed" => Pr::Unobstructed,
         _ => return None,
+    };
+    // The native state-testing predicates, survival, bounds and unobstructed
+    // predicates evaluate at pos + offset. HasSturdy already owns its offset.
+    let offset = off_arr(j);
+    let supports_offset = matches!(
+        pred,
+        Pr::Blocks(_)
+            | Pr::Tag(_)
+            | Pr::Fluids(_)
+            | Pr::Solid
+            | Pr::Replaceable
+            | Pr::WouldSurvive(_)
+            | Pr::InsideWB
+            | Pr::Unobstructed
+    );
+    Some(if supports_offset && offset != [0, 0, 0] {
+        Pr::Offset(Box::new(pred), offset)
+    } else {
+        pred
     })
 }
 
@@ -1075,6 +1109,7 @@ pub(crate) fn test_pred(pr: &Pr, reg: &BReg, ctx: &mut FC, x: i32, y: i32, z: i3
         Pr::Any(v) => v.iter().any(|p| test_pred(p, reg, ctx, x, y, z)),
         Pr::All(v) => v.iter().all(|p| test_pred(p, reg, ctx, x, y, z)),
         Pr::Not(p) => !test_pred(p, reg, ctx, x, y, z),
+        Pr::Offset(p, off) => test_pred(p, reg, ctx, x + off[0], y + off[1], z + off[2]),
     }
 }
 

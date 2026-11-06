@@ -6271,22 +6271,10 @@ fn scheduled_block_tick_inner() {
     }
     __t = __prof.then(std::time::Instant::now);
     if !generated.is_empty() {
-        let mut counts: HashMap<(i32, i32), i64> = HashMap::new();
-        for (pos, _) in &generated {
-            *counts.entry((pos.0 >> 4, pos.2 >> 4)).or_default() += 1;
-        }
-        let mut queue = block_ticks().lock().unwrap();
-        for (pos, block) in generated {
-            let remaining = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)).unwrap();
-            queue.schedule(scheduled_ticks::ScheduledTick {
-                pos,
-                block,
-                due: now,
-                priority: 0,
-                sub_order: -*remaining,
-            });
-            *remaining -= 1;
-        }
+        block_ticks()
+            .lock()
+            .unwrap()
+            .unpack_generated(generated, now);
     }
     if let Some(t) = __t {
         tickprof::add("sched/schedule_loop", t.elapsed());
@@ -6349,8 +6337,8 @@ fn scheduled_block_tick_inner() {
     }
 }
 
-// The native fluid path currently owns generated spring cells. Other fluid
-// placements remain with the existing owner until shape/contact coverage lands.
+// Generated source-fluid reservations share the proto handoff, but only their
+// supported fluid/shape/contact paths belong to this runtime owner.
 thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 static GENERATED_FLUID_OWNER: OnceLock<Mutex<GeneratedFluidOwner>> = OnceLock::new();
 
@@ -6369,6 +6357,10 @@ impl GeneratedFluidOwner {
             owned: HashSet::new(),
             reported: HashSet::new(),
         }
+    }
+    fn unpack_generated(&mut self, pending: Vec<(BlockPos, u32)>, now: i64) {
+        self.owned.extend(pending.iter().map(|&(pos, _)| pos));
+        self.queue.unpack_generated(pending, now);
     }
     fn schedule(&mut self, pos: BlockPos, fluid: flowing_fluid::Fluid, now: i64, immediate: bool) {
         self.owned.insert(pos);
@@ -6508,18 +6500,7 @@ fn generated_fluid_tick_inner() {
         .get_or_init(|| Mutex::new(GeneratedFluidOwner::new()))
         .lock()
         .unwrap();
-    for (pos, identity) in generated {
-        let kind = if identity < 2 {
-            flowing_fluid::Kind::Water
-        } else {
-            flowing_fluid::Kind::Lava
-        };
-        let fluid = flowing_fluid::Fluid {
-            kind,
-            level: if identity.is_multiple_of(2) { 0 } else { 1 },
-        };
-        owner.schedule(pos, fluid, now, true);
-    }
+    owner.unpack_generated(generated, now);
     if let Err(error) = owner.tick(now, &eligible) {
         eprintln!("[fluid] deferred native spring tick: {error}");
     }
@@ -23831,8 +23812,8 @@ fn main() {
         .is_some_and(|arg| arg == "--worldgen-template")
     {
         assert!(
-            probe_args.len() == 2 || probe_args.len() == 4,
-            "usage: --worldgen-template <compressed-nbt-path> [mirror-index rotation-index]"
+            probe_args.len() == 2 || probe_args.len() == 4 || probe_args.len() == 5,
+            "usage: --worldgen-template <compressed-nbt-path> [mirror-index rotation-index [processor-list-json-for-air-preview]]"
         );
         let bytes = std::fs::read(&probe_args[1]).expect("read compressed template");
         let (_, root) = nbt::read_gzip(&bytes, 16 * 1024 * 1024).expect("decode template NBT");
@@ -23873,6 +23854,45 @@ fn main() {
                 .expect("transform template blocks")
                 .len()
         );
+        if let Some(path) = probe_args.get(4) {
+            let bytes = std::fs::read(path).expect("read processor-list JSON");
+            let config = jparse(&bytes).expect("processor-list JSON");
+            let processors = structure_template::Processor::list(&config, reg)
+                .expect("supported template processors and required children");
+            let air = reg.checked_state("minecraft:air", &[]).expect("air state");
+            let processed = template
+                .process_blocks(
+                    0,
+                    structure_template::Placement {
+                        origin: (0, 0, 0),
+                        pivot: (0, 0, 0),
+                        mirror,
+                        rotation,
+                    },
+                    &processors,
+                    reg,
+                    |_| air,
+                    |p| {
+                        generation_math::Lcg::new(
+                            generation_math::hash_block_pos(p.0, p.1, p.2) as u64
+                        )
+                        .next_f32()
+                    },
+                )
+                .expect("process template preview");
+            let mut preview = template.clone();
+            preview.palettes = vec![processed];
+            let digest: String =
+                generation_math::sha256(&preview.block_layout(reg).expect("processed layout"))
+                    .iter()
+                    .map(|v| format!("{v:02x}"))
+                    .collect();
+            println!("processor_preview_world=minecraft:air random=position_seeded writes=0");
+            println!(
+                "processed_pre_placement_blocks={} layout_sha256={digest}",
+                preview.palettes[0].len()
+            );
+        }
         for info in &template.entities {
             println!(
                 "entity pos={:?} block_pos={:?} nbt_type={}",
@@ -24750,6 +24770,7 @@ mod tick_persistence;
 mod tick_queue;
 #[cfg(test)]
 mod tick_tests;
+mod voxel_faces;
 #[cfg(test)]
 mod security_command_tests {
     use super::command_allowed_for_player;

@@ -279,6 +279,27 @@ impl ScheduledTicks {
         }
     }
 
+    /// Generator queues represent zero-delay, normal-priority proto ticks.
+    /// Native unpack starts each chunk at minus its own pending-list length;
+    /// ordinary runtime schedules retain their separate nonnegative counter.
+    pub(crate) fn unpack_generated(&mut self, pending: Vec<(Pos, u32)>, now: i64) {
+        let mut counts: HashMap<ChunkPos, i64> = HashMap::new();
+        for (pos, _) in &pending {
+            *counts.entry((pos.0 >> 4, pos.2 >> 4)).or_default() += 1;
+        }
+        for (pos, block) in pending {
+            let remaining = counts.get_mut(&(pos.0 >> 4, pos.2 >> 4)).unwrap();
+            self.schedule(ScheduledTick {
+                pos,
+                block,
+                due: now,
+                priority: 0,
+                sub_order: -*remaining,
+            });
+            *remaining -= 1;
+        }
+    }
+
     // Keep the native heap and fastutil table layout: reconstructing only the
     // set of entries can change the order of equal-priority chunk ticks.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
