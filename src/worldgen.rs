@@ -1662,8 +1662,11 @@ impl Gen {
                 cell_h: n("cell_height") as i32,
             },
             _ => {
-                Self::load_trace(&format!("unknown density function type {ty:?} -> zero"));
-                DF::Zero
+                // An unrecognized required density function is not a constant zero.
+                // Returning None propagates through node/resolve_ref into the
+                // noise-router loader instead of silently changing the terrain.
+                Self::load_trace(&format!("unsupported density function type {ty:?}"));
+                return None;
             }
         });
         trace(&ty, out.is_some());
@@ -5271,6 +5274,40 @@ mod wg_tests {
             }
             assert_eq!(checked, 80);
         }
+    }
+
+    #[test]
+    fn unsupported_density_types_fail_closed_at_every_reference_boundary() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned datapack");
+        let empty = HashMap::new();
+
+        // Unknown nodes must never masquerade as a legitimate zero function.
+        let unknown = jparse(br#"{"type":"minecraft:unsupported_density"}"#).unwrap();
+        assert!(g.node(&unknown, &empty).is_none());
+
+        // A required child inside a valid operator must propagate the failure.
+        let nested = jparse(
+            br#"{"type":"minecraft:add","argument1":1,"argument2":{"type":"minecraft:unsupported_density"}}"#,
+        )
+        .unwrap();
+        assert!(g.node(&nested, &empty).is_none());
+
+        // A failing named definition must not leave the recursion placeholder
+        // cached as a valid reference on subsequent loads.
+        let mut files = HashMap::new();
+        files.insert(
+            "minecraft:broken".to_string(),
+            br#"{"type":"minecraft:unsupported_density"}"#.to_vec(),
+        );
+        for _ in 0..2 {
+            assert!(g.resolve_ref("minecraft:broken", &files).is_none());
+            assert!(!g.names.contains_key("minecraft:broken"));
+        }
+
+        // An intentional numeric zero remains valid and must still evaluate.
+        let valid = jparse(br#"{"type":"minecraft:add","argument1":2,"argument2":0}"#).unwrap();
+        let id = g.node(&valid, &empty).expect("known density operators");
+        assert_eq!(g.eval(id, 0, 0, 0, &mut HashMap::new()), 2.0);
     }
 
     #[test]
