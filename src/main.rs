@@ -6573,7 +6573,8 @@ fn fluid_from_block(st: u32) -> Option<flowing_fluid::Fluid> {
 /// SimpleWaterloggedBlock reports a WATER source without becoming LiquidBlock.
 fn waterlogged_source(st: u32) -> bool {
     let Some(reg) = crate::block_registry::breg() else { return false };
-    reg.get_prop(st, "waterlogged").as_deref() == Some("true")
+    reg.has_water(st)
+        && reg.get_prop(st, "waterlogged").as_deref() == Some("true")
         && reg.fluid_name(st) == "minecraft:water"
 }
 
@@ -6591,19 +6592,10 @@ fn schedule_waterlogged_source(p: BlockPos) {
     );
 }
 
-/// Re-schedule a fluid-source tick when a waterlogged block or a direct
-/// neighbor changes. Do not lose scheduling while the fluid tick owner has
-/// its mutex: the caller will drain WATERLOGGED_DEFER after the tick.
-fn note_waterlogged_neighbors(x: i32, y: i32, z: i32) {
-    let mut positions = Vec::new();
-    for (dx, dy, dz) in std::iter::once((0, 0, 0)).chain(LEAF_NEIGHBORS) {
-        let p = (x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz));
-        if p.1 >= MIN_Y && p.1 < MIN_Y + 384
-            && waterlogged_source(block_at(p.0, p.1, p.2))
-        {
-            positions.push(p);
-        }
-    }
+/// Schedule already-read waterlogged sources. Do not re-read the six neighbor
+/// cells: the shape-update visitor already does that for every block write.
+/// Fluid-owned writes defer until the owner lock is released.
+fn schedule_waterlogged_positions(positions: Vec<BlockPos>) {
     if NATIVE_FLUID_WRITE.with(|v| v.get()) {
         WATERLOGGED_DEFER.with(|v| v.borrow_mut().extend(positions));
     } else {
@@ -7707,6 +7699,10 @@ fn note_fragile_supports(x: i32, y: i32, z: i32) {
 fn note_connected_shapes(x: i32, y: i32, z: i32) {
     let Some(reg) = crate::block_registry::breg() else { return };
     let changed = block_at(x, y, z);
+    let mut wet = Vec::new();
+    if waterlogged_source(changed) {
+        wet.push((x, y, z));
+    }
     // Native immediate neighbor notifications: WEST, EAST, NORTH, SOUTH, DOWN, UP.
     for (direction, (dx, dy, dz)) in [
         (4u8, (-1, 0, 0)),
@@ -7721,6 +7717,9 @@ fn note_connected_shapes(x: i32, y: i32, z: i32) {
             continue;
         }
         let old = block_at(q.0, q.1, q.2);
+        if waterlogged_source(old) {
+            wet.push(q);
+        }
         let name = reg.name_of(old);
         let above = if name.ends_with("_wall") {
             block_at(q.0, q.1.wrapping_add(1), q.2)
@@ -7738,6 +7737,7 @@ fn note_connected_shapes(x: i32, y: i32, z: i32) {
             set_block_if(q.0, q.1, q.2, new_state, Some(old));
         }
     }
+    schedule_waterlogged_positions(wet);
 }
 
 fn block_updated_inner(x: i32, y: i32, z: i32) {
@@ -7746,7 +7746,6 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
     note_falling(x, y, z);
     note_fragile_supports(x, y, z);
     note_connected_shapes(x, y, z);
-    note_waterlogged_neighbors(x, y, z);
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [
         (0, 0, 0),
