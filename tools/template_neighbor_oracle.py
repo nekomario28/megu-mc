@@ -17,7 +17,13 @@ CASES = (
     "oak_west_bone",
     "oak_east_bone",
     "nether_west_bone",
+    "pane_west_bone",
+    "bars_east_bone",
+    "wall_west_bone",
+    "stairs_outer_left",
+    "stairs_inner_left",
     "oak_west_air",
+    "pane_west_air",
     "bone_west_bone",
 )
 
