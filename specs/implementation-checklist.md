@@ -68,7 +68,7 @@
 
 - **P1-1 続報（2026-11-06）**: Draft PR #33でフェンス/ガラス板・鉄格子の接続と切断、壁の直線・T字（覆い無しに限定）、既存runtimeの連鎖更新、水没ブロックのwater source判定と+5ゲームtickのfluid scheduling、生成時proto tick予約まで追加。Java nativeオラクル25ケース、Rust回帰追加。**native JAR実行・Rust compile/実行・網羅的な支持判定・複雑な壁・全配送比較は未完了**のため、P1-1は未チェック。
 
-## レビューで明示する未実行・未解決
+- **P1-1 Native検証基盤の追加（2026-11-07）**: [Draft PR #34](https://github.com/nekomario28/mc-spine/pull/34) を #33 の上に積み、固定1.21.1の全1,060ブロック種類・26,684状態×12支持場面＝320,208件を `BlockState.canSurvive` で判定するオラクルを実装。Nativeタグ読込、形状更新時のset/tick要求順、Native `LevelTicks` へ投入した後の配送順、ポータブルな欠落/順序破壊テストを追加。**全状態Native実行・Rust本体との一致、ServerLevelの連鎖・tick効果、全環境における支持判定は未完了**。本項を完了とは扱わない。\n\n## レビューで明示する未実行・未解決
 
 作成時点のHEADコミット本文にはRustテスト **384 passed / 1 ignored**、
 **255 mutants** が記録されている。これは当該コミットの自己申告の検証記録で、
