@@ -848,7 +848,6 @@ impl BReg {
         };
         let (dx, _, dz) = offset(&facing)?;
         let front = get(at((dx, 0, dz)));
-        let back = get(at((-dx, 0, -dz)));
         let stair_face = |other: u32| -> Option<String> {
             (self.name_of(other).ends_with("_stairs")
                 && self.get_prop(other, "half").as_deref() == Some(half.as_str()))
@@ -893,6 +892,9 @@ impl BReg {
             }
         }
         if shape == "straight" {
+            // Native only reads the rear stair if the front did not already
+            // establish an outer corner; keep scripted-world reads bounded.
+            let back = get(at((-dx, 0, -dz)));
             if let Some(dir) = stair_face(back) {
                 if perpendicular(&dir) && can_take(&dir, &mut get) {
                     shape = if dir == ccw { "inner_left" } else { "inner_right" };
