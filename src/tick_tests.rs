@@ -420,6 +420,54 @@ fn fragile_direction_matching_is_not_just_any_air_neighbor() {
 }
 
 #[test]
+fn multiway_wall_post_and_compatible_fence_pane_connections() {
+    let reg = crate::block_registry::breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let waterlogged = reg.with_prop(
+        reg.state_of("minecraft:cobblestone_wall", None), "waterlogged", "true",
+    );
+    let north = reg.wall_after_full_neighbor(waterlogged, stone, air, 2).unwrap();
+    assert_eq!(reg.get_prop(north, "north").as_deref(), Some("low"));
+    assert_eq!(reg.get_prop(north, "up").as_deref(), Some("true"));
+    let straight = reg.wall_after_full_neighbor(north, stone, air, 3).unwrap();
+    assert_eq!(reg.get_prop(straight, "south").as_deref(), Some("low"));
+    assert_eq!(reg.get_prop(straight, "up").as_deref(), Some("false"));
+    let tee = reg.wall_after_full_neighbor(straight, stone, air, 5).unwrap();
+    assert_eq!(reg.get_prop(tee, "east").as_deref(), Some("low"));
+    assert_eq!(reg.get_prop(tee, "up").as_deref(), Some("true"));
+    let straight_again = reg.wall_after_full_neighbor(tee, air, air, 5).unwrap();
+    assert_eq!(straight_again, straight, "T junction disconnect restores straight wall");
+    assert_eq!(reg.get_prop(straight_again, "waterlogged").as_deref(), Some("true"));
+    assert_eq!(
+        reg.wall_after_full_neighbor(straight_again, air, air, 3).unwrap(),
+        north,
+        "single-arm wall must keep its post"
+    );
+
+    let fence = reg.state_of("minecraft:oak_fence", None);
+    let spruce = reg.state_of("minecraft:spruce_fence", None);
+    let nether = reg.state_of("minecraft:nether_brick_fence", None);
+    let joined = reg.connection_after_neighbor(fence, spruce, air, 5).unwrap();
+    assert_eq!(reg.get_prop(joined, "east").as_deref(), Some("true"));
+    assert!(reg.connection_after_neighbor(fence, nether, air, 5).is_none());
+    assert_eq!(
+        reg.connection_after_neighbor(joined, air, air, 5).unwrap(),
+        fence,
+        "wood fence disconnect"
+    );
+    let pane = reg.state_of("minecraft:glass_pane", None);
+    let bars = reg.state_of("minecraft:iron_bars", None);
+    let joined = reg.connection_after_neighbor(pane, bars, air, 4).unwrap();
+    assert_eq!(reg.get_prop(joined, "west").as_deref(), Some("true"));
+    assert_eq!(
+        reg.connection_after_neighbor(joined, air, air, 4).unwrap(),
+        pane,
+        "glass pane disconnect"
+    );
+}
+
+#[test]
 fn runtime_connected_shapes_connect_and_disconnect_with_waterlogged_retained() {
     crate::test_support::require_vanilla_data();
     let _guard = world_guard();
