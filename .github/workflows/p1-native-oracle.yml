@@ -31,7 +31,7 @@ jobs:
           test "$(wc -l < "${RUNNER_TEMP}/mcspine-states.tsv")" -eq 26684
 
   native:
-    name: Pinned 1.21.1 Java oracle (default-state smoke)
+    name: Pinned 1.21.1 Java oracle (all 26684 states)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -48,9 +48,9 @@ jobs:
         run: |
           curl --fail --location --retry 3 --silent --show-error             "https://piston-data.mojang.com/v1/objects/${PINNED_SHA1}/server.jar"             --output "${RUNNER_TEMP}/server.jar"
           printf '%s  %s\n' "${PINNED_SHA1}" "${RUNNER_TEMP}/server.jar" | sha1sum --check -
-      - name: Compile and execute native canSurvive over all default states
+      - name: Compile and execute all 320208 native canSurvive observations
         run: |
-          python3 tools/native_survival_oracle.py             --scope default --timeout 900             --jar "${RUNNER_TEMP}/server.jar"             --output "${RUNNER_TEMP}/native-survival.tsv"
+          python3 tools/native_survival_oracle.py             --scope all --timeout 900             --jar "${RUNNER_TEMP}/server.jar"             --output "${RUNNER_TEMP}/native-survival.tsv"
       - name: Execute real native request and LevelTicks delivery probes
         run: |
           python3 tools/native_neighbor_trace.py             --jar "${RUNNER_TEMP}/server.jar"             --output "${RUNNER_TEMP}/native-requests.tsv"
