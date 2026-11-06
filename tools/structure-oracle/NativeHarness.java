@@ -117,12 +117,13 @@ public final class NativeHarness {
         // values, and a name-only fixture would have looked the same.
         Class<?> propC = C("duf");
         Method propName = propC.getMethod("f"); // Property.getName()
+        Method propValueName = propC.getMethod("a", Comparable.class); // Property.getName(T)
         Method value = C("dte").getMethod("c", propC); // StateHolder.getValue(Property)
         Object props = C("dte").getMethod("B").invoke(st); // StateHolder.getProperties()
         if (!(props instanceof java.util.Collection<?> c) || c.isEmpty()) return name;
         java.util.TreeMap<String, String> sorted = new java.util.TreeMap<>();
         for (Object prop : c) {
-            sorted.put(String.valueOf(propName.invoke(prop)), String.valueOf(value.invoke(st, prop)));
+            sorted.put(String.valueOf(propName.invoke(prop)), String.valueOf(propValueName.invoke(prop, value.invoke(st, prop))));
         }
         StringBuilder sb = new StringBuilder(name).append('[');
         boolean firstEntry = true;
