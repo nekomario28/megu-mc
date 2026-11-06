@@ -80,6 +80,9 @@ public final class NativeSurvivalOracle {
                         return (bit(x, y, z) & context.mask()) != 0
                                 ? support : NativeHarness.state("minecraft:air");
                     });
+                    // A controlled, uninitialized native lighting context; it
+                    // does not stand in for an initialized ServerLevel.
+                    level.useUninitializedLightEngine = true;
                     String result;
                     try {
                         result = (boolean) survives.invoke(current, level.proxy, center) ? "T" : "F";
