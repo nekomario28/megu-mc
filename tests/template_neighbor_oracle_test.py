@@ -32,8 +32,7 @@ class NativeNeighborOutputTest(unittest.TestCase):
 
     def test_native_negative_control_must_not_change(self):
         rows = self.sample()
-        rows[-1] = rows[-1].replace("\t" + "minecraft:oak_fence[west=false]", "\t" + "minecraft:oak_fence[west=true]", 1)
-        # Explicitly modify the result column, not the before-state.
+        # Only the native result is corrupted; the input state stays intact.
         parts = rows[-1].split("\t")
         rows[-1] = "\t".join((parts[0], parts[1], "minecraft:oak_fence[west=true]"))
         with self.assertRaises(ValueError):
