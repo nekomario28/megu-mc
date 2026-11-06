@@ -25,6 +25,15 @@ CASES = (
     "torch_down_air",
     "wall_torch_south_air",
     "lantern_up_air",
+    "wall_post_to_straight",
+    "wall_straight_to_tee",
+    "wall_straight_disconnect",
+    "wall_tee_disconnect",
+    "pane_east_disconnect",
+    "fence_east_disconnect",
+    "pane_bars_join",
+    "wood_fence_join",
+    "nether_no_wood_join",
     "oak_west_air",
     "pane_west_air",
     "bone_west_bone",
@@ -41,7 +50,7 @@ def validate_rows(text: str) -> None:
             raise ValueError(f"native neighbor probe omitted or reordered case {want}: {line!r}")
         if not fields[1].startswith("minecraft:") or not fields[2].startswith("minecraft:"):
             raise ValueError(f"native neighbor probe omitted block-state text: {line!r}")
-        unchanged = want in {"oak_west_air", "pane_west_air", "bone_west_bone"}
+        unchanged = want in {"oak_west_air", "pane_west_air", "bone_west_bone", "nether_no_wood_join"}
         if unchanged and fields[1] != fields[2]:
             raise ValueError(f"negative neighbor control changed state: {want}")
         if not unchanged and fields[1] == fields[2]:
