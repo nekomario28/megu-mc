@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Portable guard for the native neighbor-oracle output contract (no JAR needed)."""
+import sys
+from pathlib import Path
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from template_neighbor_oracle import CASES, validate_rows
+
+
+class NativeNeighborOutputTest(unittest.TestCase):
+    def sample(self):
+        rows = []
+        for case in CASES:
+            before = "minecraft:oak_fence[west=false]"
+            after = before if case.endswith("_air") or case == "bone_west_bone" else "minecraft:oak_fence[west=true]"
+            rows.append(f"{case}\t{before}\t{after}")
+        return rows
+
+    def test_complete_native_output_is_accepted(self):
+        validate_rows("\n".join(self.sample()) + "\n")
+
+    def test_missing_case_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_rows("\n".join(self.sample()[:-1]))
+
+    def test_reordered_case_is_rejected(self):
+        rows = self.sample()
+        rows[0], rows[1] = rows[1], rows[0]
+        with self.assertRaises(ValueError):
+            validate_rows("\n".join(rows))
+
+    def test_native_negative_control_must_not_change(self):
+        rows = self.sample()
+        rows[-1] = rows[-1].replace("\t" + "minecraft:oak_fence[west=false]", "\t" + "minecraft:oak_fence[west=true]", 1)
+        # Explicitly modify the result column, not the before-state.
+        parts = rows[-1].split("\t")
+        rows[-1] = "\t".join((parts[0], parts[1], "minecraft:oak_fence[west=true]"))
+        with self.assertRaises(ValueError):
+            validate_rows("\n".join(rows))
+
+
+if __name__ == "__main__":
+    unittest.main()
