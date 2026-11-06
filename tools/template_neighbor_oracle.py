@@ -38,9 +38,11 @@ def validate_rows(text: str) -> None:
             raise ValueError(f"native neighbor probe omitted or reordered case {want}: {line!r}")
         if not fields[1].startswith("minecraft:") or not fields[2].startswith("minecraft:"):
             raise ValueError(f"native neighbor probe omitted block-state text: {line!r}")
-        if want.endswith("_air") or want == "bone_west_bone":
-            if fields[1] != fields[2]:
-                raise ValueError(f"negative neighbor control changed state: {want}")
+        unchanged = want.endswith("_air") or want == "bone_west_bone"
+        if unchanged and fields[1] != fields[2]:
+            raise ValueError(f"negative neighbor control changed state: {want}")
+        if not unchanged and fields[1] == fields[2]:
+            raise ValueError(f"positive neighbor control did not change state: {want}")
 
 
 def main() -> int:
