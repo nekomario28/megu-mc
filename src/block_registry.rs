@@ -703,6 +703,52 @@ impl BReg {
             .map(|f| f & (1 << dir) != 0)
             .unwrap_or(false)
     }
+    /// Bounded shape update when an exposed template face supplies a newly
+    /// placed ordinary full cube to an existing horizontal fence. The direction
+    /// points FROM the fence TOWARDS the new neighbour, using the native
+    /// DOWN/UP/NORTH/SOUTH/WEST/EAST indices.
+    ///
+    /// This is deliberately not a general BlockState.updateShape implementation.
+    /// Fences also connect to eligible gates/fences and some non-full faces,
+    /// and other block families have different rules. The solid-template path
+    /// only adds full-cube neighbours, so it can prove this positive transition
+    /// without fabricating negative/replacement transitions or runtime behavior.
+    pub(crate) fn fence_after_full_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        toward_neighbor: u8,
+    ) -> Option<u32> {
+        if !self.name_of(state).ends_with("_fence") {
+            return None;
+        }
+        let key = match toward_neighbor {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        // A fully colliding cube is not necessarily a valid fence support:
+        // non-occluding blocks and vanilla's connection exceptions are excluded.
+        if self.is_template_solid(neighbor) != Some(true)
+            || !self.is_collision_shape_full_block(neighbor)
+            || !self.is_solid_render(neighbor)
+            || matches!(
+                self.name_of(neighbor),
+                "minecraft:barrier"
+                    | "minecraft:carved_pumpkin"
+                    | "minecraft:jack_o_lantern"
+                    | "minecraft:melon"
+                    | "minecraft:pumpkin"
+            )
+        {
+            return None;
+        }
+        (self.get_prop(state, key).as_deref() == Some("false"))
+            .then(|| self.with_prop(state, key, "true"))
+    }
+
     /// set a property by name on a resolved state; missing -> unchanged
     pub(crate) fn with_prop(&self, st: u32, prop: &str, val: &str) -> u32 {
         let bi = match self.st_blk.get(st as usize) {
