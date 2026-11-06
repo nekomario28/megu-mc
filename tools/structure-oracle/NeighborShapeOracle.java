@@ -15,7 +15,7 @@ public final class NeighborShapeOracle {
     record Case(String id, String original, String neighbor, String direction,
                 String from, String to) {}
     static final String STAIR = "{\"Name\":\"minecraft:oak_stairs\",\"Properties\":{\"facing\":\"north\",\"half\":\"bottom\",\"shape\":\"straight\",\"waterlogged\":\"false\"}}";
-    static final String HANGING_LANTERN = "{\\"Name\\":\\"minecraft:lantern\\",\\"Properties\\":{\\"hanging\\":\\"true\\",\\"waterlogged\\":\\"false\\"}}";
+    static final String HANGING_LANTERN = "{\"Name\":\"minecraft:lantern\",\"Properties\":{\"hanging\":\"true\",\"waterlogged\":\"false\"}}";
     static final String WEST_STAIR = "{\"Name\":\"minecraft:oak_stairs\",\"Properties\":{\"facing\":\"west\",\"half\":\"bottom\",\"shape\":\"straight\",\"waterlogged\":\"false\"}}";
     static final Case[] CASES = {
         new Case("oak_north_bone","minecraft:oak_fence","minecraft:bone_block","NORTH","north=false","north=true"),
