@@ -6,7 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from native_neighbor_trace import SCENES, validate_trace
+from native_neighbor_trace import SCENES, validate_trace, validate_delivery
 
 
 class NativeRequestTraceGuardTest(unittest.TestCase):
@@ -54,6 +54,26 @@ class NativeRequestTraceGuardTest(unittest.TestCase):
         bad_order[i] = bad_order[i].replace(" NORMAL 1", " NORMAL 0")
         with self.assertRaises(ValueError):
             validate_trace(bad_order)
+
+    def test_native_level_ticks_delivery_matches_requests(self):
+        booked = [
+            "mixed_scheduling_requests\t0\ttick fluid minecraft:water 0,64,0 105 NORMAL 0\n",
+            "mixed_scheduling_requests\t1\ttick block minecraft:oak_leaves 0,64,0 101 NORMAL 1\n",
+            "mixed_scheduling_requests\t2\ttick block minecraft:sand 1,64,0 102 NORMAL 2\n",
+        ]
+        delivered = [
+            "mixed_scheduling_requests\tblock\t101\tminecraft:oak_leaves\t0,64,0\n",
+            "mixed_scheduling_requests\tblock\t102\tminecraft:sand\t1,64,0\n",
+            "mixed_scheduling_requests\tfluid\t105\tminecraft:water\t0,64,0\n",
+        ]
+        self.assertEqual(validate_delivery(booked, delivered), 3)
+        with self.assertRaises(ValueError):
+            validate_delivery(booked, delivered[:-1])
+        with self.assertRaises(ValueError):
+            validate_delivery(booked, delivered + delivered[-1:])
+        with self.assertRaises(ValueError):
+            validate_delivery(booked, [v.replace("\t105\t", "\t104\t")
+                                       for v in delivered])
 
     def test_native_scene_list_matches_java(self):
         import re
