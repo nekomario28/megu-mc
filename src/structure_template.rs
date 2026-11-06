@@ -439,12 +439,14 @@ impl Template {
             if let Some(state) = updated {
                 ctx.set(q.0, q.1, q.2, state);
             }
-            if matches!(reg.name_of(outside), "minecraft:water" | "minecraft:lava") {
-                match reg.fluid_name(outside) {
-                    "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
-                    "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
-                    _ => {}
-                }
+            // A waterlogged pane/stair/fence reports the same source
+            // FluidState as a water block. Native ProtoChunkTicks preserves
+            // identity/position, not the scheduled delay; unpack happens on
+            // chunk activation. This is NOT the 5-GT live-world update path.
+            match reg.fluid_name(outside) {
+                "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
+                "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
+                _ => {}
             }
         }
         Ok(true)
@@ -815,7 +817,11 @@ mod tests {
         assert_eq!(writes.len(), 4, "only the center and three connectors change");
         // The existing fluid engine cannot execute waterlogged block-state
         // water. Do not enqueue a phantom ordinary water block tick here.
-        assert!(ctx.g.generated_fluid_ticks().is_empty());
+        assert_eq!(
+            ctx.g.generated_fluid_ticks(),
+            vec![(west, 0)],
+            "waterlogged bars reserve native water source via the proto queue"
+        );
     }
 
     #[test]
