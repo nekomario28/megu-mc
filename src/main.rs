@@ -7604,10 +7604,45 @@ fn falling_tick() {
     }
 }
 
+/// Support loss is a neighbor update, not a periodic scan. Use the same
+/// compare-and-set that protects falling-block creation: repeated notifications
+/// and concurrent mutations may not duplicate drops. This covers only the
+/// known torch and lantern attachment families (other shapes are separate).
+fn note_fragile_supports(x: i32, y: i32, z: i32) {
+    let Some(reg) = crate::block_registry::breg() else { return };
+    let support = block_at(x, y, z);
+    for (dir, (dx, dy, dz)) in LEAF_NEIGHBORS.iter().copied().enumerate() {
+        let q = (x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz));
+        if q.1 < MIN_Y || q.1 >= MIN_Y + 384 {
+            continue;
+        }
+        let state = block_at(q.0, q.1, q.2);
+        if !reg.fragile_loses_support(state, (dir as u8) ^ 1, support) {
+            continue;
+        }
+        if set_block_if(q.0, q.1, q.2, 0, Some(state)) {
+            note_block_update(q.0, q.1, q.2, 0);
+            if let Some(item) = reg.block_drop(state) {
+                drops().lock().unwrap().push(Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: q.0 as f64 + 0.5,
+                    y: q.1 as f64 + 0.5,
+                    z: q.2 as f64 + 0.5,
+                    item,
+                    cnt: 1,
+                    comps: Vec::new(),
+                    age: 0,
+                });
+            }
+        }
+    }
+}
+
 fn block_updated_inner(x: i32, y: i32, z: i32) {
     // A block losing its support falls. Checked here rather than by scanning, because this is
     // called exactly when something under it changed.
     note_falling(x, y, z);
+    note_fragile_supports(x, y, z);
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [
         (0, 0, 0),
