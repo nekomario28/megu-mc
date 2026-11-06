@@ -420,6 +420,60 @@ fn fragile_direction_matching_is_not_just_any_air_neighbor() {
 }
 
 #[test]
+fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+    let pane = reg.with_prop(
+        reg.state_of("minecraft:glass_pane", None), "waterlogged", "true",
+    );
+    let p = (6, 211, 6);
+    let east = (7, 211, 6);
+    assert!(waterlogged_source(pane));
+    assert_eq!(reg.fluid_name(pane), "minecraft:water");
+    {
+        // Explicit closed chamber, so FluidReader never silently consults
+        // unspecified generated terrain as a fixture input.
+        let mut world = world().lock().unwrap();
+        let chunk = world.entry((0, 0)).or_default();
+        for y in 210..=212 {
+            for z in 2..=10 {
+                for x in 2..=10 {
+                    chunk.insert(local_idx(x, y, z), stone);
+                }
+            }
+        }
+        chunk.insert(local_idx(p.0, p.1, p.2), pane);
+        chunk.insert(local_idx(east.0, east.1, east.2), air);
+    }
+    assert_eq!(
+        flowing_fluid::Reader::cell(&mut FluidReader, p).unwrap(),
+        flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+            kind: flowing_fluid::Kind::Water, level: 0,
+        })
+    );
+    let mut owner = GeneratedFluidOwner::new();
+    owner.schedule(
+        p, flowing_fluid::Fluid { kind: flowing_fluid::Kind::Water, level: 0 },
+        100, false,
+    );
+    let eligible = HashSet::from([(0, 0)]);
+    owner.tick(104, &eligible).unwrap();
+    assert_eq!(block_at(east.0, east.1, east.2), air,
+        "waterlogged water must not flow before the 5-GT deadline");
+    owner.tick(105, &eligible).unwrap();
+    assert_eq!(block_at(p.0, p.1, p.2), pane,
+        "the fluid source must not destroy its waterlogged block");
+    assert_eq!(block_at(east.0, east.1, east.2), 81,
+        "the 5-GT source tick must spread to the only open side");
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+}
+
+#[test]
 fn scheduled_leaf_distance_matches_native_vectors() {
     let reg = crate::block_registry::breg().unwrap();
     let make = |kind: &str| -> u32 {
