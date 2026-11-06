@@ -1,5 +1,6 @@
 package dev.mcspine.tools;
 
+import com.google.gson.JsonParser;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -7,67 +8,87 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Native BlockState.updateShape on a scripted level, not a reimplementation.
- * This proves only isolated fence/full-cube transitions. Whole placement order,
- * fluid delivery, other block families and live-server behavior are separate.
+/** Calls registered 1.21.1 BlockState.updateShape with actual native states.
+ * This is isolated updateShape, not all of StructureTemplate.updateShapeAtEdge.
  */
 public final class NeighborShapeOracle {
-    private static final String[][] CASES = {
-        {"oak_north_bone", "minecraft:oak_fence", "minecraft:bone_block", "NORTH", "north"},
-        {"oak_south_bone", "minecraft:oak_fence", "minecraft:bone_block", "SOUTH", "south"},
-        {"oak_west_bone", "minecraft:oak_fence", "minecraft:bone_block", "WEST", "west"},
-        {"oak_east_bone", "minecraft:oak_fence", "minecraft:bone_block", "EAST", "east"},
-        {"nether_west_bone", "minecraft:nether_brick_fence", "minecraft:bone_block", "WEST", "west"},
-        {"oak_west_air", "minecraft:oak_fence", "minecraft:air", "WEST", "-"},
-        {"bone_west_bone", "minecraft:bone_block", "minecraft:bone_block", "WEST", "-"}
+    record Case(String id, String original, String neighbor, String direction,
+                String from, String to) {}
+    static final String STAIR = "{\"Name\":\"minecraft:oak_stairs\",\"Properties\":{\"facing\":\"north\",\"half\":\"bottom\",\"shape\":\"straight\",\"waterlogged\":\"false\"}}";
+    static final String WEST_STAIR = "{\"Name\":\"minecraft:oak_stairs\",\"Properties\":{\"facing\":\"west\",\"half\":\"bottom\",\"shape\":\"straight\",\"waterlogged\":\"false\"}}";
+    static final Case[] CASES = {
+        new Case("oak_north_bone","minecraft:oak_fence","minecraft:bone_block","NORTH","north=false","north=true"),
+        new Case("oak_south_bone","minecraft:oak_fence","minecraft:bone_block","SOUTH","south=false","south=true"),
+        new Case("oak_west_bone","minecraft:oak_fence","minecraft:bone_block","WEST","west=false","west=true"),
+        new Case("oak_east_bone","minecraft:oak_fence","minecraft:bone_block","EAST","east=false","east=true"),
+        new Case("nether_west_bone","minecraft:nether_brick_fence","minecraft:bone_block","WEST","west=false","west=true"),
+        new Case("pane_west_bone","minecraft:glass_pane","minecraft:bone_block","WEST","west=false","west=true"),
+        new Case("bars_east_bone","minecraft:iron_bars","minecraft:bone_block","EAST","east=false","east=true"),
+        new Case("wall_west_bone","minecraft:cobblestone_wall","minecraft:bone_block","WEST","west=none","west=low"),
+        new Case("stairs_outer_left",STAIR,WEST_STAIR,"NORTH","shape=straight","shape=outer_left"),
+        new Case("stairs_inner_left",STAIR,WEST_STAIR,"SOUTH","shape=straight","shape=inner_left"),
+        new Case("oak_west_air","minecraft:oak_fence","minecraft:air","WEST","",""),
+        new Case("pane_west_air","minecraft:glass_pane","minecraft:air","WEST","",""),
+        new Case("bone_west_bone","minecraft:bone_block","minecraft:bone_block","WEST","","")
     };
+
+    static Object stateOf(String spec) throws Exception {
+        return spec.startsWith("{")
+                ? NativeHarness.stateFromJson(JsonParser.parseString(spec))
+                : NativeHarness.state(spec);
+    }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     public static void main(String[] args) throws Exception {
         if (args.length != 1) throw new IllegalArgumentException("output TSV path required");
         NativeHarness.bootstrap();
-        Class<?> state = NativeHarness.C("dtc");
+        Class<?> blockState = NativeHarness.C("dtc");
         Class<?> direction = NativeHarness.C("ji");
-        Class<?> accessor = NativeHarness.C("dcx");
-        Class<?> pos = NativeHarness.C("jd");
-
-        // BlockBehaviour.BlockStateBase.updateShape: a(Direction, BlockState,
-        // LevelAccessor, BlockPos, BlockPos). The actual registered block decides.
-        Method update = state.getMethod("a", direction, state, accessor, pos, pos);
+        Class<?> blockPos = NativeHarness.C("jd");
         List<String> rows = new ArrayList<>();
-        for (String[] c : CASES) {
-            Object initial = NativeHarness.state(c[1]);
-            Object neighbor = NativeHarness.state(c[2]);
-            Enum<?> face = Enum.valueOf((Class) direction.asSubclass(Enum.class), c[3]);
-            int dx = 0, dy = 0, dz = 0;
-            switch (c[3]) {
+        for (Case c : CASES) {
+            Object initial = stateOf(c.original());
+            Object neighbor = stateOf(c.neighbor());
+            Enum<?> face = Enum.valueOf((Class) direction.asSubclass(Enum.class), c.direction());
+            int dx = 0, dz = 0;
+            switch (c.direction()) {
                 case "NORTH": dz = -1; break;
                 case "SOUTH": dz = 1; break;
                 case "WEST": dx = -1; break;
                 case "EAST": dx = 1; break;
-                default: throw new AssertionError("unhandled case direction " + c[3]);
+                default: throw new AssertionError(c.direction());
             }
-            final int nx = dx, ny = 64 + dy, nz = dz;
+            final int nx = dx, nz = dz;
             NativeHarness.Level level = NativeHarness.levelFromStates((x, y, z) -> {
                 if (x == 0 && y == 64 && z == 0) return initial;
-                if (x == nx && y == ny && z == nz) return neighbor;
+                if (x == nx && y == 64 && z == nz) return neighbor;
                 return NativeHarness.state("minecraft:air");
             });
+            Method update = null;
+            for (Method method : blockState.getMethods()) {
+                Class<?>[] p = method.getParameterTypes();
+                if (method.getName().equals("a") && method.getReturnType() == blockState
+                        && p.length == 5 && p[0] == direction && p[1] == blockState
+                        && p[2].isInstance(level.proxy) && p[3] == blockPos && p[4] == blockPos) {
+                    if (update != null) throw new AssertionError("ambiguous native updateShape");
+                    update = method;
+                }
+            }
+            if (update == null) throw new AssertionError("native updateShape method unavailable");
             Object actual = update.invoke(initial, face, neighbor, level.proxy,
-                    NativeHarness.pos(0, 64, 0), NativeHarness.pos(nx, ny, nz));
+                    NativeHarness.pos(0, 64, 0), NativeHarness.pos(nx, 64, nz));
             String before = NativeHarness.normalizedStateName(initial);
             String after = NativeHarness.normalizedStateName(actual);
             String expected = before;
-            if (!c[4].equals("-")) {
-                String key = c[4] + "=false";
-                if (!before.contains(key))
-                    throw new AssertionError("native fence default lacks " + key + ": " + before);
-                expected = before.replace(key, c[4] + "=true");
+            if (!c.from().isEmpty()) {
+                if (!before.contains(c.from()))
+                    throw new AssertionError("missing native property " + c.id() + ": " + before);
+                expected = before.replace(c.from(), c.to());
             }
             if (!expected.equals(after))
-                throw new AssertionError(c[0] + " native state mismatch: " + after
+                throw new AssertionError(c.id() + " native state mismatch: " + after
                         + " expected " + expected + " from " + before);
-            rows.add(c[0] + "\t" + before + "\t" + after);
+            rows.add(c.id() + "\t" + before + "\t" + after);
         }
         Files.write(Path.of(args[0]), rows, StandardCharsets.UTF_8);
         System.out.println("NATIVE_NEIGHBOR_SHAPES " + rows.size());
