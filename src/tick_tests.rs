@@ -420,6 +420,44 @@ fn fragile_direction_matching_is_not_just_any_air_neighbor() {
 }
 
 #[test]
+fn runtime_connected_shapes_connect_and_disconnect_with_waterlogged_retained() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+    set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+    let fence = reg.state_of("minecraft:oak_fence", None);
+    let pane = reg.with_prop(
+        reg.state_of("minecraft:glass_pane", None), "waterlogged", "true",
+    );
+    let wall = reg.state_of("minecraft:cobblestone_wall", None);
+    let p = (6, 220, 6);
+    let east = (7, 220, 6);
+    let west = (5, 220, 6);
+    let north = (6, 220, 5);
+    for (pos, state) in [(p, air), (east, fence), (west, pane),
+        (north, wall), ((6, 221, 5), air)] {
+        set_block(pos.0, pos.1, pos.2, state);
+    }
+    set_block(p.0, p.1, p.2, stone);
+    assert_eq!(reg.get_prop(block_at(east.0, east.1, east.2), "west").as_deref(), Some("true"));
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "east").as_deref(), Some("true"));
+    assert_eq!(reg.get_prop(block_at(north.0, north.1, north.2), "south").as_deref(), Some("low"));
+    set_block(p.0, p.1, p.2, air);
+    assert_eq!(reg.get_prop(block_at(east.0, east.1, east.2), "west").as_deref(), Some("false"));
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "east").as_deref(), Some("false"));
+    assert_eq!(reg.get_prop(block_at(north.0, north.1, north.2), "south").as_deref(), Some("none"));
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "waterlogged").as_deref(), Some("true"));
+    // Re-applying the same state does not start an endless shape cascade.
+    set_block(p.0, p.1, p.2, air);
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "east").as_deref(), Some("false"));
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+}
+
+#[test]
 fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
     crate::test_support::require_vanilla_data();
     let _guard = world_guard();
