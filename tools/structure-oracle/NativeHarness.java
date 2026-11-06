@@ -463,6 +463,10 @@ public final class NativeHarness {
         public final Map<String, Object> writes = new LinkedHashMap<>();
         public final List<String> log = new ArrayList<>();
         public final List<String> attempts = new ArrayList<>();
+        /** Native-ordered setBlock and tick-schedule requests, without guessed delivery. */
+        public final List<String> events = new ArrayList<>();
+        public long gameTime = 100L;
+        private long subTickCount;
         public final StateScene scene;
         public final int minY, height;
         private final Object heights;
@@ -488,8 +492,68 @@ public final class NativeHarness {
             return declaresBlockState(m.getDeclaringClass());
         }
 
+        private Object tickCollector(boolean fluid) {
+            String kind = fluid ? "fluid" : "block";
+            return Proxy.newProxyInstance(NativeHarness.class.getClassLoader(),
+                    new Class<?>[]{C("eyp")}, (proxy, method, args) -> {
+                        Class<?>[] p = method.getParameterTypes();
+                        if (method.getName().equals("a") && p.length == 1
+                                && p[0] == C("eyt") && method.getReturnType() == void.class) {
+                            Object tick = args[0];
+                            Class<?> tickClass = C("eyt");
+                            Object type = tickClass.getMethod("a").invoke(tick);
+                            int[] pos = xyz(tickClass.getMethod("b").invoke(tick));
+                            long due = (long) tickClass.getMethod("c").invoke(tick);
+                            Object priority = tickClass.getMethod("d").invoke(tick);
+                            long sub = (long) tickClass.getMethod("e").invoke(tick);
+                            Object registry = C("lt").getField(fluid ? "c" : "e").get(null);
+                            Object id = registry.getClass().getMethod("b", Object.class)
+                                    .invoke(registry, type);
+                            events.add("tick " + kind + " " + id + " "
+                                    + pos[0] + "," + pos[1] + "," + pos[2] + " "
+                                    + due + " " + priority + " " + sub);
+                            return null;
+                        }
+                        if (method.getReturnType() == boolean.class && p.length == 2
+                                && p[0] == posC) return false;
+                        if (method.getName().equals("a") && p.length == 0
+                                && method.getReturnType() == int.class) return events.size();
+                        if (method.getDeclaringClass() == Object.class) {
+                            return switch (method.getName()) {
+                                case "toString" -> "native-" + kind + "-tick-recorder";
+                                case "hashCode" -> System.identityHashCode(proxy);
+                                case "equals" -> proxy == args[0];
+                                default -> throw new UnsupportedOperationException(method.toString());
+                            };
+                        }
+                        throw new UnsupportedOperationException("native tick access: " + method);
+                    });
+        }
+
+        private Object levelData() {
+            return Proxy.newProxyInstance(NativeHarness.class.getClassLoader(),
+                    new Class<?>[]{C("erb")}, (proxy, method, args) -> {
+                        if (method.getParameterCount() == 0
+                                && method.getReturnType() == long.class
+                                && (method.getName().equals("c") || method.getName().equals("d"))) {
+                            return gameTime;
+                        }
+                        if (method.getDeclaringClass() == Object.class
+                                && method.getName().equals("toString")) return "native-probe-level-data";
+                        throw new UnsupportedOperationException("native level data: " + method);
+                    });
+        }
+
         private Object handle(Object proxy, Method m, Object[] a) throws Throwable {
             Class<?>[] pt = m.getParameterTypes();
+            if (m.getName().equals("G_") && pt.length == 0
+                    && m.getReturnType() == long.class) return subTickCount++;
+            if (m.getName().equals("A_") && pt.length == 0
+                    && m.getReturnType() == C("erb")) return levelData();
+            if (m.getName().equals("P") && pt.length == 0
+                    && m.getReturnType() == C("eyp")) return tickCollector(false);
+            if (m.getName().equals("O") && pt.length == 0
+                    && m.getReturnType() == C("eyp")) return tickCollector(true);
             // getBlockState: the one read the harness supplies.
             if (m.getName().equals("a_") && pt.length == 1 && pt[0] == posC
                     && m.getReturnType() == stateC) {
@@ -560,8 +624,10 @@ public final class NativeHarness {
                 // The log is the cell-level diagnostic: a name-only line cannot show a
                 // property difference (the mushroom cap's four rim properties), so it
                 // prints the same canonical form the fixtures compare.
-                log.add("set " + p[0] + "," + p[1] + "," + p[2] + " "
-                        + normalizedStateName(a[1]));
+                String event = "set " + p[0] + "," + p[1] + "," + p[2] + " "
+                        + normalizedStateName(a[1]);
+                log.add(event);
+                events.add(event);
                 if (p[1] < minY || p[1] >= minY + height) return false;
                 writes.put(p[0] + "," + p[1] + "," + p[2], a[1]);
                 return true;
