@@ -32,16 +32,16 @@ class NativeNeighborOutputTest(unittest.TestCase):
 
     def test_native_positive_control_must_change(self):
         rows = self.sample()
-        parts = rows[0].split("\\t")
-        rows[0] = "\\t".join((parts[0], parts[1], parts[1]))
+        parts = rows[0].split("\t")
+        rows[0] = "\t".join((parts[0], parts[1], parts[1]))
         with self.assertRaises(ValueError):
-            validate_rows("\\n".join(rows))
+            validate_rows("\n".join(rows))
 
     def test_java_probe_and_python_case_ids_match(self):
         import re
         source = (Path(__file__).resolve().parents[1]
                   / "tools/structure-oracle/NeighborShapeOracle.java").read_text()
-        ids = re.findall(r'new Case\\("([^"]+)"', source)
+        ids = re.findall(r'new Case\("([^"]+)"', source)
         self.assertEqual(tuple(ids), CASES)
 
     def test_native_negative_control_must_not_change(self):
