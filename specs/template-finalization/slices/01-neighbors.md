@@ -89,8 +89,8 @@ promoting this from a bounded slice to a broader shape-update implementation.
   `note_falling` / `falling_tick` and tests in `tick_tests.rs` already
   cover support loss, multi-block cascade, motion, conservation and save/reload.
   These are gameplay-port tests, **not** new 1.21.1 native full-placement captures.
-- **Native oracle** now includes 13 isolated shape cases covering fences,
-  panes/bars, the simple wall and stair corners plus negative controls.
+- **Native oracle** now includes 16 isolated shape/support-loss cases covering fences,
+  panes/bars, the simple wall, stair corners, torch/lantern survival and negative controls.
   Portable validation checks Java/Python case IDs, missing/reordered rows,
   positive no-op and negative unexpectedly changing states.
 
