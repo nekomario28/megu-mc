@@ -124,3 +124,9 @@ neighbor shape recursion with ordered writes, fragile drops from real
 whole-chunk correctness. Keep P1-1 **open** until those are compared against
 native running 1.21.1 (including failure cases); do not promote PR #33 to
 ready solely on the portable checks.
+
+## Runtime follow-up (2026-11-06)
+
+PR #33 now adds bounded attach/detach for fences, panes/iron bars and low walls, straight/T wall posts, and reuse of the existing runtime neighbor recursion and compare-and-set writes. Waterlogged block states are read as water sources by the existing fluid engine: live neighbor updates schedule a +5 game-tick water event; fluid-owned writes defer wakeups until its queue mutex is unlocked. During template generation, waterlogged edges reserve source-water identity in the existing proto tick queue. No second gravity or fluid engine was created.
+
+The new Rust tests target runtime detach, multiway wall posts, retention of waterlogged properties, and a closed-chamber +4/+5-tick flow. The direct native Java oracle has 25 cases. These are **authored tests, not executed Rust/native results**. Exhaustive survival for rails/plants/multiblocks, tall or covered wall shapes, all cross-fluid behavior and fully native-ordered cascades are still unverified. Keep P1-1 open and PR #33 in Draft.
