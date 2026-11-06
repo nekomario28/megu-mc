@@ -749,6 +749,160 @@ impl BReg {
             .then(|| self.with_prop(state, key, "true"))
     }
 
+    /// The solid-template placer admits only ordinary full cube outputs.
+    /// Adjacent panes connect to that face (including iron bars, whose name
+    /// does not end in "_pane"). Other, non-full neighbors need their own
+    /// native updateShape contract.
+    pub(crate) fn pane_after_full_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        toward_neighbor: u8,
+    ) -> Option<u32> {
+        let name = self.name_of(state);
+        if !name.ends_with("_pane") && name != "minecraft:iron_bars" {
+            return None;
+        }
+        let key = match toward_neighbor {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        if self.is_template_solid(neighbor) != Some(true)
+            || !self.is_collision_shape_full_block(neighbor)
+            || !self.is_solid_render(neighbor)
+        {
+            return None;
+        }
+        (self.get_prop(state, key).as_deref() == Some("false"))
+            .then(|| self.with_prop(state, key, "true"))
+    }
+
+    /// Positive, isolated wall side transition in the only fully pinned case:
+    /// previously unconnected wall, air above, and a new opaque full cube.
+    /// This keeps UP=true; multi-sided or covered wall posts must be computed
+    /// from their full shape context instead of assuming LOW/UP.
+    pub(crate) fn wall_after_full_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        above: u32,
+        toward_neighbor: u8,
+    ) -> Option<u32> {
+        if !self.name_of(state).ends_with("_wall") {
+            return None;
+        }
+        let key = match toward_neighbor {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        if self.get_prop(state, key).as_deref() != Some("none")
+            || self.get_prop(state, "up").as_deref() != Some("true")
+            || !self.is_air(above)
+            || self.is_template_solid(neighbor) != Some(true)
+            || !self.is_collision_shape_full_block(neighbor)
+            || !self.is_solid_render(neighbor)
+        {
+            return None;
+        }
+        if ["north", "south", "west", "east"]
+            .iter()
+            .any(|side| *side != key && self.get_prop(state, side).as_deref() != Some("none"))
+        {
+            return None;
+        }
+        Some(self.with_prop(state, key, "low"))
+    }
+
+    /// Stair shape selection is a function of surrounding STAIR orientations,
+    /// not whether the changed neighbor is a solid cube. After template writes,
+    /// the caller supplies a write-through world view. The result is the state
+    /// change only; waterlogged, half and facing properties are preserved.
+    pub(crate) fn stair_after_neighbors(
+        &self,
+        state: u32,
+        pos: (i32, i32, i32),
+        mut get: impl FnMut((i32, i32, i32)) -> u32,
+    ) -> Option<u32> {
+        if !self.name_of(state).ends_with("_stairs") {
+            return None;
+        }
+        let facing = self.get_prop(state, "facing")?;
+        let half = self.get_prop(state, "half")?;
+        let offset = |direction: &str| -> Option<(i32, i32, i32)> {
+            Some(match direction {
+                "north" => (0, 0, -1),
+                "south" => (0, 0, 1),
+                "west" => (-1, 0, 0),
+                "east" => (1, 0, 0),
+                _ => return None,
+            })
+        };
+        let at = |(dx, dy, dz): (i32, i32, i32)| {
+            (pos.0.wrapping_add(dx), pos.1.wrapping_add(dy), pos.2.wrapping_add(dz))
+        };
+        let (dx, _, dz) = offset(&facing)?;
+        let front = get(at((dx, 0, dz)));
+        let back = get(at((-dx, 0, -dz)));
+        let stair_face = |other: u32| -> Option<String> {
+            (self.name_of(other).ends_with("_stairs")
+                && self.get_prop(other, "half").as_deref() == Some(half.as_str()))
+                .then(|| self.get_prop(other, "facing"))
+                .flatten()
+        };
+        let perpendicular = |direction: &str| match facing.as_str() {
+            "north" | "south" => matches!(direction, "east" | "west"),
+            "east" | "west" => matches!(direction, "north" | "south"),
+            _ => false,
+        };
+        let ccw = match facing.as_str() {
+            "north" => "west",
+            "south" => "east",
+            "west" => "south",
+            "east" => "north",
+            _ => return None,
+        };
+        // Vanilla's canTakeShape checks the flank opposite the front stair's
+        // turn, or the same direction as the back stair's turn. Without that
+        // check a third aligned stair becomes an incorrect inside corner.
+        let can_take = |side: &str, get: &mut dyn FnMut((i32, i32, i32)) -> u32| -> bool {
+            let Some(o) = offset(side) else { return false };
+            let s = get(at(o));
+            !self.name_of(s).ends_with("_stairs")
+                || self.get_prop(s, "half").as_deref() != Some(half.as_str())
+                || self.get_prop(s, "facing").as_deref() != Some(facing.as_str())
+        };
+        let mut shape = "straight";
+        if let Some(dir) = stair_face(front) {
+            if perpendicular(&dir) {
+                let opposite = match dir.as_str() {
+                    "north" => "south",
+                    "south" => "north",
+                    "west" => "east",
+                    "east" => "west",
+                    _ => return None,
+                };
+                if can_take(opposite, &mut get) {
+                    shape = if dir == ccw { "outer_left" } else { "outer_right" };
+                }
+            }
+        }
+        if shape == "straight" {
+            if let Some(dir) = stair_face(back) {
+                if perpendicular(&dir) && can_take(&dir, &mut get) {
+                    shape = if dir == ccw { "inner_left" } else { "inner_right" };
+                }
+            }
+        }
+        (self.get_prop(state, "shape").as_deref() != Some(shape))
+            .then(|| self.with_prop(state, "shape", shape))
+    }
+
     /// set a property by name on a resolved state; missing -> unchanged
     pub(crate) fn with_prop(&self, st: u32, prop: &str, val: &str) -> u32 {
         let bi = match self.st_blk.get(st as usize) {
