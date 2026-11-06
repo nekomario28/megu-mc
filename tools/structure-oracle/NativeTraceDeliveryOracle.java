@@ -82,8 +82,7 @@ public final class NativeTraceDeliveryOracle {
                 for (Tick t : appointments) {
                     @SuppressWarnings({"rawtypes", "unchecked"})
                     Object priorityValue = Enum.valueOf(
-                            (Class<? extends Enum>) priority.asSubclass(Enum.class),
-                            t.priority());
+                            (Class<Enum>) priority, t.priority());
                     schedule.invoke(queue, tick.newInstance(t.identity().intern(),
                             position.newInstance(t.x(), t.y(), t.z()), t.due(),
                             priorityValue, t.suborder()));
