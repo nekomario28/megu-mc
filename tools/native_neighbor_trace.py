@@ -7,7 +7,6 @@ This does not claim LevelTicks delivery or a full ServerLevel neighbor cascade.
 """
 import argparse
 import hashlib
-import os
 from pathlib import Path
 import shutil
 
@@ -77,11 +76,48 @@ def validate_trace(lines):
     return {"scenes": len(seen), "events": len(events), "tick_requests": sum(map(len, ticks.values()))}
 
 
+def validate_delivery(request_rows, delivered_rows):
+    """An appointment survives once per identity/position in its own native queue."""
+    source = {}
+    for raw in request_rows:
+        cols = raw.rstrip("\n").split("\t", 2)
+        if len(cols) != 3 or not cols[2].startswith("tick "):
+            continue
+        parts = cols[2].split(" ")
+        if len(parts) != 7:
+            raise ValueError(f"malformed native request {raw!r}")
+        _, phase, identity, pos, due, priority, sub = parts
+        source.setdefault((cols[0], phase, identity, pos), int(due))
+    observed = set()
+    for row in delivered_rows:
+        fields = row.rstrip("\n").split("\t")
+        if len(fields) != 5:
+            raise ValueError(f"bad native delivery {row!r}")
+        case, phase, at, identity, pos = fields
+        key = case, phase, identity, pos
+        if key not in source:
+            raise ValueError(f"delivered unrequested native tick: {key}")
+        if key in observed:
+            raise ValueError(f"duplicate native tick delivery: {key}")
+        if int(at) != source[key]:
+            raise ValueError(f"native due/delivery mismatch at {key}: {at} != {source[key]}")
+        observed.add(key)
+    if observed != set(source):
+        raise ValueError(f"missing native tick delivery for {set(source)-observed}")
+    if not observed:
+        raise ValueError("no native tick delivery")
+    return len(observed)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jar", type=Path, default=DEFAULT_JAR)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compare", type=Path, help="previously captured native reference")
+    parser.add_argument("--delivery-output", type=Path,
+                        help="LevelTicks delivery output, default next to request trace")
+    parser.add_argument("--compare-delivery", type=Path,
+                        help="previous native delivery baseline")
     args = parser.parse_args()
     with pinned_runtime(args.jar) as (work, classpath, _):
         src = ROOT / "tools/structure-oracle"
@@ -99,10 +135,26 @@ def main():
             raise ValueError("native request trace is nondeterministic across fresh JVMs")
         if args.compare and left.read_bytes() != args.compare.read_bytes():
             raise ValueError(f"native ordered trace differs from {args.compare}")
+        delivered_a = work / "delivered-first.tsv"
+        delivered_b = work / "delivered-repeat.tsv"
+        delivery_source = src / "NativeTraceDeliveryOracle.java"
+        for target in (delivered_a, delivered_b):
+            run_probe(work, classpath, delivery_source,
+                      "dev.mcspine.tools.NativeTraceDeliveryOracle", left, target)
+            with left.open(encoding="utf-8") as requests, target.open(encoding="utf-8") as delivered:
+                delivery_count = validate_delivery(requests, delivered)
+        if delivered_a.read_bytes() != delivered_b.read_bytes():
+            raise ValueError("native LevelTicks delivery is nondeterministic across JVMs")
+        if args.compare_delivery and delivered_a.read_bytes() != args.compare_delivery.read_bytes():
+            raise ValueError(f"native delivery diverged from {args.compare_delivery}")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(left, args.output)
+        delivery_output = args.delivery_output or args.output.with_suffix(".delivered.tsv")
+        delivery_output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(delivered_a, delivery_output)
     digest = hashlib.sha256(args.output.read_bytes()).hexdigest()
     print(f"native requests: {summary} sha256={digest} output={args.output}")
+    print(f"native LevelTicks deliveries: {delivery_count} output={delivery_output}")
     return 0
 
 
