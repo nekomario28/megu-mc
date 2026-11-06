@@ -819,6 +819,56 @@ impl BReg {
         Some(self.with_prop(state, key, "low"))
     }
 
+    /// Bounded runtime counterpart for immediate air removal / full-cube
+    /// replacement. This can disconnect a previously connected side. For
+    /// non-full neighbors, other connection types (gates, fences, walls and
+    /// panes) require independent native classification and are not guessed.
+    pub(crate) fn connection_after_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        above: u32,
+        direction: u8,
+    ) -> Option<u32> {
+        if let Some(connected) = self.fence_after_full_neighbor(state, neighbor, direction) {
+            return Some(connected);
+        }
+        if let Some(connected) = self.pane_after_full_neighbor(state, neighbor, direction) {
+            return Some(connected);
+        }
+        if let Some(connected) = self.wall_after_full_neighbor(state, neighbor, above, direction) {
+            return Some(connected);
+        }
+        if !self.is_air(neighbor) {
+            return None;
+        }
+        let key = match direction {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        let name = self.name_of(state);
+        if name.ends_with("_fence") || name.ends_with("_pane") || name == "minecraft:iron_bars" {
+            return (self.get_prop(state, key).as_deref() == Some("true"))
+                .then(|| self.with_prop(state, key, "false"));
+        }
+        // The isolated post remains raised in this case. Do not silently
+        // overwrite tall/multi-sided wall shape geometry with a guessed post.
+        if name.ends_with("_wall")
+            && self.is_air(above)
+            && self.get_prop(state, "up").as_deref() == Some("true")
+            && self.get_prop(state, key).as_deref() == Some("low")
+            && ["north", "south", "west", "east"].iter().all(|other| {
+                *other == key || self.get_prop(state, other).as_deref() == Some("none")
+            })
+        {
+            return Some(self.with_prop(state, key, "none"));
+        }
+        None
+    }
+
     /// Stair shape selection is a function of surrounding STAIR orientations,
     /// not whether the changed neighbor is a solid cube. After template writes,
     /// the caller supplies a write-through world view. The result is the state
