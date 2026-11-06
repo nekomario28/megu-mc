@@ -393,8 +393,8 @@ fn fragile_support_loss_drops_torches_and_lanterns_exactly_once() {
             "support loss must clear the fragile block");
         assert_eq!(drops().lock().unwrap().len(), before + 1,
             "exactly one drop from the detached block");
-        let last = drops().lock().unwrap().last().cloned().unwrap();
-        assert_eq!(last.item, reg.block_drop(state).unwrap());
+        let last_item = drops().lock().unwrap().last().unwrap().item;
+        assert_eq!(last_item, reg.block_drop(state).unwrap());
         set_block(support.0, support.1, support.2, air);
         assert_eq!(drops().lock().unwrap().len(), before + 1,
             "repeated notifications must not duplicate drops");
