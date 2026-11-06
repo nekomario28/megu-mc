@@ -1,0 +1,70 @@
+name: P1 native oracle verification
+
+# The ordinary ci.yml only runs for PRs targeting main and selected pushes.
+# Stacked P1-1 drafts need their own explicit gate until they are merged.
+on:
+  push:
+    branches:
+      - 'test/native-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: Native fixture guards (no game JAR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Inventory, coverage and fail-closed parser checks
+        run: |
+          python3 tests/native_survival_inventory_test.py
+          python3 tests/native_survival_oracle_test.py
+          python3 tests/native_neighbor_trace_test.py
+      - name: Enumerate all pinned states
+        run: |
+          python3 tools/native_support_inventory.py --scope all --output "${RUNNER_TEMP}/mcspine-states.tsv"
+          test "$(wc -l < "${RUNNER_TEMP}/mcspine-states.tsv")" -eq 26684
+
+  native:
+    name: Pinned 1.21.1 Java oracle (default-state smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Retrieve the official pinned server JAR, verify BEFORE use
+        env:
+          PINNED_SHA1: 59353fb40c36d304f2035d51e7d6e6baa98dc05c
+        run: |
+          curl --fail --location --retry 3 --silent --show-error             "https://piston-data.mojang.com/v1/objects/${PINNED_SHA1}/server.jar"             --output "${RUNNER_TEMP}/server.jar"
+          printf '%s  %s\n' "${PINNED_SHA1}" "${RUNNER_TEMP}/server.jar" | sha1sum --check -
+      - name: Compile and execute native canSurvive over all default states
+        run: |
+          python3 tools/native_survival_oracle.py             --scope default --timeout 900             --jar "${RUNNER_TEMP}/server.jar"             --output "${RUNNER_TEMP}/native-survival.tsv"
+      - name: Execute real native request and LevelTicks delivery probes
+        run: |
+          python3 tools/native_neighbor_trace.py             --jar "${RUNNER_TEMP}/server.jar"             --output "${RUNNER_TEMP}/native-requests.tsv"
+
+  rust:
+    name: Rust P1-1 compile and serialized tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # pinned
+        with:
+          toolchain: 1.98.0
+      - name: Compile and run serialized regressions on this exact PR head
+        run: cargo test --locked -- --test-threads=1
