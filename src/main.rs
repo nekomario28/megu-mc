@@ -7638,11 +7638,52 @@ fn note_fragile_supports(x: i32, y: i32, z: i32) {
     }
 }
 
+/// Update immediate connected-block shapes through the existing world owner.
+/// Each actual state change re-enters `block_updated`, which already bounds
+/// recursion and drains deep update chains. Never hold a world lock across
+/// set_block_if, which itself sends block and packet updates.
+fn note_connected_shapes(x: i32, y: i32, z: i32) {
+    let Some(reg) = crate::block_registry::breg() else { return };
+    let changed = block_at(x, y, z);
+    // Native immediate neighbor notifications: WEST, EAST, NORTH, SOUTH, DOWN, UP.
+    for (direction, (dx, dy, dz)) in [
+        (4u8, (-1, 0, 0)),
+        (5, (1, 0, 0)),
+        (2, (0, 0, -1)),
+        (3, (0, 0, 1)),
+        (0, (0, -1, 0)),
+        (1, (0, 1, 0)),
+    ] {
+        let q = (x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz));
+        if q.1 < MIN_Y || q.1 >= MIN_Y + 384 {
+            continue;
+        }
+        let old = block_at(q.0, q.1, q.2);
+        let name = reg.name_of(old);
+        let above = if name.ends_with("_wall") {
+            block_at(q.0, q.1.wrapping_add(1), q.2)
+        } else {
+            0
+        };
+        let updated = reg.connection_after_neighbor(old, changed, above, direction ^ 1)
+            .or_else(|| {
+                if direction <= 1 || !name.ends_with("_stairs") { return None; }
+                reg.stair_after_neighbors(old, q, |p| block_at(p.0, p.1, p.2))
+            });
+        if let Some(new_state) = updated {
+            // Avoid stale read/modified/written races: another update may have
+            // touched this neighbor after `old` was read.
+            set_block_if(q.0, q.1, q.2, new_state, Some(old));
+        }
+    }
+}
+
 fn block_updated_inner(x: i32, y: i32, z: i32) {
     // A block losing its support falls. Checked here rather than by scanning, because this is
     // called exactly when something under it changed.
     note_falling(x, y, z);
     note_fragile_supports(x, y, z);
+    note_connected_shapes(x, y, z);
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [
         (0, 0, 0),
