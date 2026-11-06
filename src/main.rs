@@ -6339,7 +6339,14 @@ fn scheduled_block_tick_inner() {
 
 // Generated source-fluid reservations share the proto handoff, but only their
 // supported fluid/shape/contact paths belong to this runtime owner.
-thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; } }
+// A fluid owner can write through set_block while it holds its queue mutex.
+// Its neighbor notifications must not re-acquire that mutex. Defer just the
+// waterlogged source positions and drain them after the owner releases it.
+thread_local! {
+    static WATERLOGGED_DEFER: std::cell::RefCell<Vec<BlockPos>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 static GENERATED_FLUID_OWNER: OnceLock<Mutex<GeneratedFluidOwner>> = OnceLock::new();
 
 struct GeneratedFluidOwner {
@@ -6504,6 +6511,12 @@ fn generated_fluid_tick_inner() {
     if let Err(error) = owner.tick(now, &eligible) {
         eprintln!("[fluid] deferred native spring tick: {error}");
     }
+    drop(owner);
+    // The collector's own writes can wake adjacent waterlogged sources.
+    // Schedule them for the next water tick *after* leaving the owner lock.
+    for p in WATERLOGGED_DEFER.with(|v| std::mem::take(&mut *v.borrow_mut())) {
+        schedule_waterlogged_source(p);
+    }
 }
 
 fn generated_fluid_changed(pos: BlockPos, old: u32, state: u32) -> bool {
@@ -6557,6 +6570,49 @@ fn fluid_from_block(st: u32) -> Option<flowing_fluid::Fluid> {
     }
 }
 
+/// SimpleWaterloggedBlock reports a WATER source without becoming LiquidBlock.
+fn waterlogged_source(st: u32) -> bool {
+    let Some(reg) = crate::block_registry::breg() else { return false };
+    reg.get_prop(st, "waterlogged").as_deref() == Some("true")
+        && reg.fluid_name(st) == "minecraft:water"
+}
+
+fn schedule_waterlogged_source(p: BlockPos) {
+    if !waterlogged_source(block_at(p.0, p.1, p.2)) {
+        return;
+    }
+    let now = TICK_IDX.load(Ordering::Relaxed) as i64;
+    let owner = GENERATED_FLUID_OWNER.get_or_init(|| Mutex::new(GeneratedFluidOwner::new()));
+    owner.lock().unwrap().schedule(
+        p,
+        flowing_fluid::Fluid { kind: flowing_fluid::Kind::Water, level: 0 },
+        now,
+        false, // Native SimpleWaterloggedBlock books a water tick 5 GT later.
+    );
+}
+
+/// Re-schedule a fluid-source tick when a waterlogged block or a direct
+/// neighbor changes. Do not lose scheduling while the fluid tick owner has
+/// its mutex: the caller will drain WATERLOGGED_DEFER after the tick.
+fn note_waterlogged_neighbors(x: i32, y: i32, z: i32) {
+    let mut positions = Vec::new();
+    for (dx, dy, dz) in std::iter::once((0, 0, 0)).chain(LEAF_NEIGHBORS) {
+        let p = (x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz));
+        if p.1 >= MIN_Y && p.1 < MIN_Y + 384
+            && waterlogged_source(block_at(p.0, p.1, p.2))
+        {
+            positions.push(p);
+        }
+    }
+    if NATIVE_FLUID_WRITE.with(|v| v.get()) {
+        WATERLOGGED_DEFER.with(|v| v.borrow_mut().extend(positions));
+    } else {
+        for p in positions {
+            schedule_waterlogged_source(p);
+        }
+    }
+}
+
 struct FluidReader;
 impl flowing_fluid::Reader for FluidReader {
     type Error = String;
@@ -6567,6 +6623,12 @@ impl flowing_fluid::Reader for FluidReader {
         let st = block_at(pos.0, pos.1, pos.2);
         if let Some(f) = fluid_from_block(st) {
             return Ok(flowing_fluid::Cell::Fluid(f));
+        }
+        if waterlogged_source(st) {
+            return Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+                kind: flowing_fluid::Kind::Water,
+                level: 0,
+            }));
         }
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
         if reg.is_air(st) {
@@ -7684,6 +7746,7 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
     note_falling(x, y, z);
     note_fragile_supports(x, y, z);
     note_connected_shapes(x, y, z);
+    note_waterlogged_neighbors(x, y, z);
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [
         (0, 0, 0),
