@@ -780,10 +780,11 @@ impl BReg {
             .then(|| self.with_prop(state, key, "true"))
     }
 
-    /// Positive, isolated wall side transition in the only fully pinned case:
-    /// previously unconnected wall, air above, and a new opaque full cube.
-    /// This keeps UP=true; multi-sided or covered wall posts must be computed
-    /// from their full shape context instead of assuming LOW/UP.
+    /// Recompute LOW/NONE wall sides for horizontal changes that are ordinary
+    /// opaque full cubes, other walls, or air. With air above, a straight
+    /// opposite two-sided wall suppresses its central post; corners, endpoints
+    /// and T junctions retain it. Native TALL/covered walls need shape coverage
+    /// checks and are intentionally not rewritten by this bounded rule.
     pub(crate) fn wall_after_full_neighbor(
         &self,
         state: u32,
@@ -791,7 +792,7 @@ impl BReg {
         above: u32,
         toward_neighbor: u8,
     ) -> Option<u32> {
-        if !self.name_of(state).ends_with("_wall") {
+        if !self.name_of(state).ends_with("_wall") || !self.is_air(above) {
             return None;
         }
         let key = match toward_neighbor {
@@ -801,22 +802,32 @@ impl BReg {
             5 => "east",
             _ => return None,
         };
-        if self.get_prop(state, key).as_deref() != Some("none")
-            || self.get_prop(state, "up").as_deref() != Some("true")
-            || !self.is_air(above)
-            || self.is_template_solid(neighbor) != Some(true)
-            || !self.is_collision_shape_full_block(neighbor)
-            || !self.is_solid_render(neighbor)
-        {
+        let other_name = self.name_of(neighbor);
+        let cube = self.is_template_solid(neighbor) == Some(true)
+            && self.is_collision_shape_full_block(neighbor)
+            && self.is_solid_render(neighbor);
+        let wanted = if cube || other_name.ends_with("_wall") {
+            "low"
+        } else if self.is_air(neighbor) {
+            "none"
+        } else {
             return None;
-        }
+        };
         if ["north", "south", "west", "east"]
             .iter()
-            .any(|side| *side != key && self.get_prop(state, side).as_deref() != Some("none"))
+            .any(|side| self.get_prop(state, side).as_deref() == Some("tall"))
         {
             return None;
         }
-        Some(self.with_prop(state, key, "low"))
+        let next = self.with_prop(state, key, wanted);
+        let north = self.get_prop(next, "north").as_deref() == Some("low");
+        let south = self.get_prop(next, "south").as_deref() == Some("low");
+        let east = self.get_prop(next, "east").as_deref() == Some("low");
+        let west = self.get_prop(next, "west").as_deref() == Some("low");
+        let straight = (north && south && !east && !west)
+            || (east && west && !north && !south);
+        let result = self.with_prop(next, "up", if straight { "false" } else { "true" });
+        (result != state).then_some(result)
     }
 
     /// Bounded runtime counterpart for immediate air removal / full-cube
