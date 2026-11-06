@@ -644,7 +644,9 @@ public final class NativeHarness {
                 return scratchChunk((int) a[0], (int) a[1]);
             }
             // setBlock(pos, state, flags) must be recorded.
-            if (m.getName().equals("a") && pt.length == 3 && pt[0] == posC && pt[1] == stateC
+            if (m.getName().equals("a") && (pt.length == 3 || pt.length == 4)
+                    && pt[0] == posC && pt[1] == stateC && pt[2] == int.class
+                    && (pt.length == 3 || pt[3] == int.class)
                     && m.getReturnType() == boolean.class) {
                 int[] p = xyz(a[0]);
                 // The log is the cell-level diagnostic: a name-only line cannot show a
