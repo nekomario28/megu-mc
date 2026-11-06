@@ -49,7 +49,7 @@ This batch implements **a subset**, not general native `updateShapeAtEdge` parit
 python3 tests/template_neighbor_oracle_test.py
 cargo test --locked fence_full_cube_edge_changes_only_the_facing_connection -- --test-threads=1
 cargo test --locked solid_template_edges_update_fences_and_reserve_native_leaf_ticks -- --test-threads=1
-cargo test --locked native_edge -- --test-threads=1
+cargo test --locked leaf_edge_schedules_match_native_order -- --test-threads=1
 python3 tools/template_neighbor_oracle.py --jar /path/to/1.21.1/server.jar
 bash tests/verify.sh
 ```
