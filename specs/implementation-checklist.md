@@ -64,6 +64,8 @@
 - **P0-2 は部分対応・未完了**: [Draft PR #32](https://github.com/nekomario28/mc-spine/pull/32) で、未知のdensity型をゼロ代替しない修正と、`noise`/ `shifted_noise` の不正入力拒否・Y軸シフトを追加。固定データのdensity定義35件とnoise settings 7件についてJSON型名を静的に確認し、parserの型分岐に未対応の名前は見つからなかった。**Rustビルド・全体suite・ネストした値の実行・native比較は未実行**。明示ゼロ扱いの意味論、loaderの部分失敗とsurface/biomeの検証は残す。
 - **P0-3 は追跡実態を確定・未完了**: [data tracking監査](../evidence/foundation/data-tracking-20261106/README.md) にGitツリーの数量・ファイル・文書矛盾を記録。出所・バイト照合・消費者切替・歴史的ライセンス問題の解決には未着手。データ削除やリリースはしていない。
 
+- **P1-1 は部分実装・未完了**: [Draft PR #33](https://github.com/nekomario28/mc-spine/pull/33) で、既存Treeと共通の葉tick予約、フルキューブに接するフェンス・ガラス板/鉄格子・限定条件の壁、既存階段の内角/外角計算、waterlogged属性保持、runtimeの松明/ランタン支持喪失とexactly-once dropを追加。ポータブルPython 6件とスタブ環境のJava構文コンパイルのみ成功。**Rust compile/実行・公式jarのnative照合・tick実物理・汎用neighbor chain・水没fluid配送は未完了**。既存gravity/leaf/fluid runtimeを重複実装せず利用し、P1-1チェックは未チェックのまま維持。参照：[段階的実装の境界](https://github.com/nekomario28/mc-spine/blob/feat/template-neighbor-finalization-20261106/specs/template-finalization/slices/01-neighbors.md)。
+
 ## レビューで明示する未実行・未解決
 
 作成時点のHEADコミット本文にはRustテスト **384 passed / 1 ignored**、
