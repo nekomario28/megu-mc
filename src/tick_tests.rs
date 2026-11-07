@@ -2494,6 +2494,46 @@ fn falling_world_tick_test() {
     falling_tick();
 }
 
+/// A delayed gravity callback must re-read support; re-adding the floor
+/// before due time prevents conversion, and a subsequent removal rebooks.
+#[test]
+fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    let old_tick = TICK_IDX.load(Ordering::Relaxed);
+    let (hot, warm) = test_region();
+    let mut eligible = warm.clone();
+    eligible.insert((0, 0));
+    set_test_region(hot.clone(), eligible);
+    let reg = crate::block_registry::breg().unwrap();
+    let sand = reg.state_of("minecraft:sand", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let (x, y, z) = (12, 220, 12);
+    set_block(x, y, z, 0);
+    set_block(x, y + 1, z, 0);
+    set_block(x, y, z, stone);
+    set_block(x, y + 1, z, sand);
+    set_block(x, y, z, 0);
+    assert_eq!(block_at(x, y + 1, z), sand);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), sand, "t+1 must not spawn a falling entity");
+    set_block(x, y, z, stone);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), sand, "a restored support cancels the fall");
+    assert!(falling().lock().unwrap().iter().all(|f| (f.x.floor() as i32, f.y.floor() as i32, f.z.floor() as i32) != (x, y + 1, z)));
+    set_block(x, y, z, 0);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), sand, "rescheduled callback still waits +1 GT");
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), 0, "second callback converts unsupported sand");
+    assert_eq!(falling().lock().unwrap().iter().filter(|f| f.state == sand
+        && f.x.floor() as i32 == x && f.z.floor() as i32 == z).count(), 1,
+        "gravity conversion is exactly once");
+    TICK_IDX.store(old_tick, Ordering::Relaxed);
+    set_test_region(hot, warm);
+}
+
 /// Sand over air falls as a vanilla falling-block entity: the block leaves the world, the
 /// entity integrates `dy -= 0.04` per tick (`y_n = y0 - 0.02 n(n+1)`), and it lands on the
 /// first solid block below. The bytecode contract is evidence/gameplay/falling-vanilla.
