@@ -66,7 +66,7 @@ jobs:
         run: |
           test -s "$MC_NATIVE_TICK_REQUESTS"
           test -s "$MC_NATIVE_TICK_DELIVERIES"
-          cargo test --locked native_level_ticks_port_delivery_pair -- --ignored --nocapture
+          cargo test --locked --features native-oracle native_level_ticks_port_delivery_pair -- --nocapture
       - name: Capture all 25 native updateShape cases
         run: |
           python3 tools/template_neighbor_oracle.py \
@@ -77,13 +77,13 @@ jobs:
           MC_NATIVE_NEIGHBOR_SHAPES: ${{ runner.temp }}/native-neighbor-shapes.tsv
         run: |
           test -s "$MC_NATIVE_NEIGHBOR_SHAPES"
-          cargo test --locked native_neighbor_shape_port_pair -- --ignored --nocapture
+          cargo test --locked --features native-oracle native_neighbor_shape_port_pair -- --nocapture
       - name: Paired native/Rust fragile support matrix (mandatory)
         env:
           MC_NATIVE_SURVIVAL_MATRIX: ${{ runner.temp }}/native-survival.tsv
         run: |
           test -s "$MC_NATIVE_SURVIVAL_MATRIX"
-          cargo test --locked native_survival_fragile_port_pair -- --ignored --nocapture
+          cargo test --locked --features native-oracle native_survival_fragile_port_pair -- --nocapture
 
   rust:
     name: Rust P1-1 compile and serialized tests
