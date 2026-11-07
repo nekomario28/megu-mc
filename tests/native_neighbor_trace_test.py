@@ -17,6 +17,10 @@ class NativeRequestTraceGuardTest(unittest.TestCase):
             "waterlogged_stairs": ["tick fluid minecraft:water 0,64,0 105 NORMAL 0"],
             "leaf_next_to_log": ["tick block minecraft:oak_leaves 0,64,0 101 NORMAL 0"],
             "falling_sand": ["tick block minecraft:sand 0,64,0 102 NORMAL 0"],
+            "falling_gravel": ["tick block minecraft:gravel 0,64,0 102 NORMAL 0"],
+            "falling_red_sand": ["tick block minecraft:red_sand 0,64,0 102 NORMAL 0"],
+            "falling_concrete_powder": ["tick block minecraft:white_concrete_powder 0,64,0 102 NORMAL 0"],
+            "falling_sand_supported": ["tick block minecraft:sand 0,64,0 102 NORMAL 0"],
             "fragile_torch": ["shape fragile_torch minecraft:air"],
             "mixed_scheduling_requests": [
                 "tick fluid minecraft:water 0,64,0 105 NORMAL 0",
@@ -54,6 +58,23 @@ class NativeRequestTraceGuardTest(unittest.TestCase):
         bad_order[i] = bad_order[i].replace(" NORMAL 1", " NORMAL 0")
         with self.assertRaises(ValueError):
             validate_trace(bad_order)
+
+    def test_falling_two_tick_bookings_fail_closed(self):
+        base = self.sample()
+        for case in ("falling_sand", "falling_gravel", "falling_red_sand",
+                     "falling_concrete_powder", "falling_sand_supported"):
+            selected = next(i for i, row in enumerate(base)
+                            if row.startswith(case + "\\t"))
+            for corrupted in (
+                base[selected].replace(" 102 NORMAL", " 101 NORMAL"),
+                base[selected].replace(" 102 NORMAL", " 103 NORMAL"),
+                base[selected].replace(" NORMAL", " HIGH"),
+                base[selected].replace(" NORMAL 0", " NORMAL 1"),
+            ):
+                rows = list(base)
+                rows[selected] = corrupted
+                with self.subTest(case=case, corrupted=corrupted), self.assertRaises(ValueError):
+                    validate_trace(rows)
 
     def test_native_level_ticks_delivery_matches_requests(self):
         booked = [
