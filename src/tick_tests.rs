@@ -4402,3 +4402,118 @@ fn native_neighbor_shape_port_pair() {
             "native/Rust updateShape mismatches:\n{}", mismatches.join("\n"));
     println!("PAIRED_NATIVE_NEIGHBOR_SHAPES cases={checked} mismatches=0");
 }
+
+
+/// Replays native-created tick appointments through the Rust per-chunk scheduler,
+/// compares every callback in source order, and never merges block/fluid queues.
+/// Requires outputs of native_neighbor_trace.py from the same pinned Java run.
+#[test]
+#[ignore = "requires both native request and LevelTicks delivery TSVs"]
+fn native_level_ticks_port_delivery_pair() {
+    #[derive(Clone)]
+    struct Request {
+        phase: String,
+        identity: String,
+        pos: (i32, i32, i32),
+        due: i64,
+        suborder: i64,
+    }
+    let requests_path = std::env::var("MC_NATIVE_TICK_REQUESTS")
+        .expect("real native request TSV required");
+    let delivery_path = std::env::var("MC_NATIVE_TICK_DELIVERIES")
+        .expect("real native delivery TSV required");
+    let requests = std::fs::read_to_string(&requests_path)
+        .unwrap_or_else(|e| panic!("native requests {requests_path}: {e}"));
+    let native_delivery = std::fs::read_to_string(&delivery_path)
+        .unwrap_or_else(|e| panic!("native deliveries {delivery_path}: {e}"));
+    let mut cases: Vec<(String, Vec<Request>)> = Vec::new();
+    for (index, line) in requests.lines().enumerate() {
+        let columns: Vec<_> = line.splitn(3, '\t').collect();
+        assert_eq!(columns.len(), 3, "malformed native request line {index}");
+        // The source index includes shape and set events; the native Python
+        // validator checks complete per-scene event ordering before this runs.
+        columns[1].parse::<usize>().expect("native event index");
+        if !columns[2].starts_with("tick ") {
+            // Preserve first-occurrence scene order, including scenes with no ticks.
+            if !cases.iter().any(|(name, _)| name == columns[0]) {
+                cases.push((columns[0].to_string(), Vec::new()));
+            }
+            continue;
+        }
+        let fields: Vec<_> = columns[2].split_ascii_whitespace().collect();
+        assert_eq!(fields.len(), 7, "malformed scheduled tick at row {index}");
+        assert_eq!(fields[0], "tick");
+        assert!(matches!(fields[1], "block" | "fluid"), "unknown phase");
+        assert_eq!(fields[5], "NORMAL",
+                   "unmodelled priority must fail closed, never silently coerce");
+        let coords: Vec<_> = fields[3].split(',').collect();
+        assert_eq!(coords.len(), 3, "native tick position missing coordinate");
+        let pos = (coords[0].parse::<i32>().unwrap(),
+                   coords[1].parse::<i32>().unwrap(),
+                   coords[2].parse::<i32>().unwrap());
+        let request = Request {
+            phase: fields[1].to_string(),
+            identity: fields[2].to_string(),
+            pos,
+            due: fields[4].parse().expect("native due time"),
+            suborder: fields[6].parse().expect("native suborder"),
+        };
+        if let Some((_, saved)) = cases.iter_mut().find(|(name, _)| name == columns[0]) {
+            saved.push(request);
+        } else {
+            cases.push((columns[0].to_string(), vec![request]));
+        }
+    }
+    let mut replay = Vec::new();
+    let mut scheduled = 0;
+    for (case, requests) in cases {
+        for phase in ["block", "fluid"] {
+            let entries: Vec<_> = requests.iter().filter(|r| r.phase == phase).collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let mut queue = scheduled_ticks::ScheduledTicks::new();
+            let mut names = std::collections::HashMap::<String, u32>::new();
+            let mut reverse = Vec::<String>::new();
+            for r in entries {
+                let id = match names.get(&r.identity) {
+                    Some(&id) => id,
+                    None => {
+                        let id = reverse.len() as u32;
+                        names.insert(r.identity.clone(), id);
+                        reverse.push(r.identity.clone());
+                        id
+                    }
+                };
+                assert!((100..=140).contains(&r.due), "native due outside capture horizon");
+                let _inserted = queue.schedule(scheduled_ticks::ScheduledTick {
+                    pos: r.pos,
+                    block: id,
+                    due: r.due,
+                    priority: 0,
+                    sub_order: r.suborder,
+                });
+                scheduled += 1;
+            }
+            // Java LevelTicks.collect runs once per game tick, not a single
+            // batch at max time: preserve the callback's actual delivery time.
+            for at in 100..=140 {
+                for t in queue.collect(at, 65_536, |_| true) {
+                    replay.push(format!(
+                        "{case}\t{phase}\t{at}\t{}\t{},{},{}",
+                        reverse[t.block as usize], t.pos.0, t.pos.1, t.pos.2,
+                    ));
+                }
+            }
+        }
+    }
+    let native: Vec<String> = native_delivery.lines().map(str::to_owned).collect();
+    assert!(!native.is_empty(), "native delivery output cannot be empty");
+    assert_eq!(replay.len(), native.len(),
+               "native/Rust callback count diverged, scheduled {scheduled}");
+    for (index, (port, reference)) in replay.iter().zip(native.iter()).enumerate() {
+        assert_eq!(port, reference, "native/Rust LevelTicks diverged at callback #{index}");
+    }
+    println!("PAIRED_NATIVE_LEVEL_TICKS requests={scheduled} deliveries={}",
+             native.len());
+}
