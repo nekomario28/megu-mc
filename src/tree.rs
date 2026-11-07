@@ -2139,42 +2139,14 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) -> Opt
     })
 }
 
-/// The native LeavesBlock.updateShape scheduling contract used by both
-/// tree finalization and the bounded solid-template edge visitor. It reserves
-/// a tick rather than immediately changing leaf distance. Keep the existing
-/// native tree-edge ordering/deduplication tests as the regression oracle.
-pub(crate) fn schedule_leaf_edge_state(
-    ctx: &mut FC,
-    reg: &BReg,
-    cell: P3,
-    st: u32,
-    neighbor: u32,
-) {
-    let name = reg.name_of(st);
-    if !name.ends_with("_leaves") {
-        return;
-    }
-    let Some(distance) = reg
-        .get_prop(st, "distance")
-        .and_then(|v| v.parse::<u8>().ok())
-    else {
-        return;
-    };
-    let next = reg.distance_from_log(neighbor).unwrap_or(7) + 1;
-    if next != 1 || distance != 1 {
-        ctx.g
-            .schedule_generated_leaf(cell, reg.state_of(name, None));
-    }
-}
-
 /// Each native face updates the inside, then its neighbour.
 fn schedule_leaf_edges(ctx: &mut FC, shape: &LeafShape) {
     let Some(reg) = breg() else { return };
     for (_, p, q) in crate::voxel_faces::exposed_faces(shape.positions()) {
         let ps = ctx.get(p.0, p.1, p.2);
         let qs = ctx.get(q.0, q.1, q.2);
-        schedule_leaf_edge_state(ctx, reg, p, ps, qs);
-        schedule_leaf_edge_state(ctx, reg, q, qs, ps);
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, ps, qs);
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, qs, ps);
     }
 }
 
