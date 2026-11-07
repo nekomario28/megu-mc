@@ -287,8 +287,10 @@ check "a placed gravity block is scheduled by its own cell" \
   every_falling_block_becomes_an_entity_and_lands
 
 check "scheduled falling conversion queues air, not a ghost" \
-  src/main.rs '        note_block_update(px, py, pz, 0);' \
-  '        note_block_update(px, py, pz, st);' \
+  src/main.rs '        note_block_update(px, py, pz, 0);
+        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);' \
+  '        note_block_update(px, py, pz, st);
+        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);' \
   placing_unsupported_sand_queues_air_not_a_ghost
 
 check "a block above a removed support is scheduled" \
