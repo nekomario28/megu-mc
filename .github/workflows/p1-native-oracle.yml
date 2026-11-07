@@ -25,6 +25,7 @@ jobs:
           python3 tests/native_survival_inventory_test.py
           python3 tests/native_survival_oracle_test.py
           python3 tests/native_neighbor_trace_test.py
+          python3 tests/template_neighbor_oracle_test.py
       - name: Enumerate all pinned states
         run: |
           python3 tools/native_support_inventory.py --scope all --output "${RUNNER_TEMP}/mcspine-states.tsv"
@@ -58,6 +59,17 @@ jobs:
         run: |
           python3 tools/native_neighbor_trace.py             --jar "${RUNNER_TEMP}/server.jar"             --output "${RUNNER_TEMP}/native-requests.tsv"
 
+      - name: Capture all 25 native updateShape cases
+        run: |
+          python3 tools/template_neighbor_oracle.py \
+            --jar "${RUNNER_TEMP}/server.jar" \
+            --output "${RUNNER_TEMP}/native-neighbor-shapes.tsv"
+      - name: Paired native/Rust neighbor shape states (mandatory)
+        env:
+          MC_NATIVE_NEIGHBOR_SHAPES: ${{ runner.temp }}/native-neighbor-shapes.tsv
+        run: |
+          test -s "$MC_NATIVE_NEIGHBOR_SHAPES"
+          cargo test --locked native_neighbor_shape_port_pair -- --ignored --nocapture
       - name: Paired native/Rust fragile support matrix (mandatory)
         env:
           MC_NATIVE_SURVIVAL_MATRIX: ${{ runner.temp }}/native-survival.tsv
