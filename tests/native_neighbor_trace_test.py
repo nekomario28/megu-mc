@@ -64,7 +64,7 @@ class NativeRequestTraceGuardTest(unittest.TestCase):
         for case in ("falling_sand", "falling_gravel", "falling_red_sand",
                      "falling_concrete_powder", "falling_sand_supported"):
             selected = next(i for i, row in enumerate(base)
-                            if row.startswith(case + "\\t"))
+                            if row.startswith(case + "\t"))
             for corrupted in (
                 base[selected].replace(" 102 NORMAL", " 101 NORMAL"),
                 base[selected].replace(" 102 NORMAL", " 103 NORMAL"),
