@@ -60,6 +60,10 @@ public final class NeighborShapeOracle {
     public static void main(String[] args) throws Exception {
         if (args.length != 1) throw new IllegalArgumentException("output TSV path required");
         NativeHarness.bootstrap();
+        // Shape behavior uses vanilla BLOCK/FLUID tags, which a bare bootstrap
+        // does not populate. The native built-in pack is authoritative.
+        VanillaBlockTags.load(NativeHarness.C("lt").getField("e").get(null));
+        NativeFluidTags.load();
         Class<?> blockState = NativeHarness.C("dtc");
         Class<?> direction = NativeHarness.C("ji");
         Class<?> blockPos = NativeHarness.C("jd");
@@ -113,7 +117,8 @@ public final class NeighborShapeOracle {
             if (!expected.equals(after))
                 throw new AssertionError(c.id() + " native state mismatch: " + after
                         + " expected " + expected + " from " + before);
-            rows.add(c.id() + "\t" + before + "\t" + after);
+            rows.add(c.id() + "\t" + before + "\t" + after + "\t"
+                    + NativeHarness.normalizedStateName(neighbor) + "\t" + c.direction());
         }
         Files.write(Path.of(args[0]), rows, StandardCharsets.UTF_8);
         System.out.println("NATIVE_NEIGHBOR_SHAPES " + rows.size());
