@@ -2459,6 +2459,41 @@ fn measure_the_light_cost_per_chunk() {
     );
 }
 
+/// Only count bookable gravity callbacks in currently eligible chunks.
+/// Cold chunks can retain persistent callbacks without blocking live tests.
+fn eligible_falling_bookings() -> bool {
+    let Some(reg) = crate::block_registry::breg() else { return false };
+    let eligible = scheduled_tick_chunks();
+    block_ticks().lock().unwrap().has_pending_matching(|t| {
+        reg.behaviour_of(t.block) == crate::block_registry::B_FALLING
+            && eligible.contains(&(t.pos.0 >> 4, t.pos.2 >> 4))
+    })
+}
+
+fn advance_falling_scheduled_tick() {
+    TICK_IDX.fetch_add(1, Ordering::Relaxed);
+    scheduled_block_tick();
+}
+
+fn drain_falling_bookings(max: usize) {
+    for _ in 0..max {
+        if !eligible_falling_bookings() { return; }
+        advance_falling_scheduled_tick();
+    }
+    assert!(!eligible_falling_bookings(), "falling callbacks did not drain within {max} game ticks");
+}
+
+fn falling_work_in_progress() -> bool {
+    !falling().lock().unwrap().is_empty() || eligible_falling_bookings()
+}
+
+/// The real game tick always runs scheduled callbacks before entity physics.
+/// Never advance only the entity in a test that expects a pending block to move.
+fn falling_world_tick_test() {
+    advance_falling_scheduled_tick();
+    falling_tick();
+}
+
 /// Sand over air falls as a vanilla falling-block entity: the block leaves the world, the
 /// entity integrates `dy -= 0.04` per tick (`y_n = y0 - 0.02 n(n+1)`), and it lands on the
 /// first solid block below. The bytecode contract is evidence/gameplay/falling-vanilla.
