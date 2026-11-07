@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - 'test/native-*'
+      - 'feat/p1-falling-*'
   workflow_dispatch:
 
 # CI runs compiler/tests only. Explicitly select the already-installed pinned
