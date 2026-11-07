@@ -32,6 +32,12 @@ public final class NativeNeighborTraceOracle {
         new Scene("waterlogged_stairs", WATER_STAIRS, "minecraft:stone", "SOUTH"),
         new Scene("leaf_next_to_log", LEAVES, "minecraft:oak_log", "NORTH"),
         new Scene("falling_sand", "minecraft:sand", "minecraft:air", "DOWN"),
+        new Scene("falling_gravel", "minecraft:gravel", "minecraft:air", "DOWN"),
+        new Scene("falling_red_sand", "minecraft:red_sand", "minecraft:air", "DOWN"),
+        new Scene("falling_concrete_powder", "minecraft:white_concrete_powder", "minecraft:air", "DOWN"),
+        // Isolated updateShape against a full supporting block still books a
+        // delayed callback; the callback must re-check support before spawning.
+        new Scene("falling_sand_supported", "minecraft:sand", "minecraft:stone", "DOWN"),
         new Scene("fragile_torch", "minecraft:torch", "minecraft:air", "DOWN")
     };
 
