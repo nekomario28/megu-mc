@@ -3395,30 +3395,31 @@ fn a_falling_block_waits_in_a_cold_chunk() {
         set_block(11, y, 11, 0);
     }
     set_block(11, base, 11, name_to_state("stone").unwrap());
-    set_block(11, base + 3, 11, name_to_state("sand").unwrap());
-    // The block still leaves the world and becomes an entity even in a cold chunk; only the
-    // entity's tick is deferred.
-    assert_eq!(block_at(11, base + 3, 11), 0, "the block leaves the world");
+    let sand = name_to_state("sand").unwrap();
+    set_block(11, base + 3, 11, sand);
+    // A scheduled block callback cannot run in a cold chunk, and a falling
+    // entity must not be created before callback collection.
+    for _ in 0..4 {
+        advance_falling_scheduled_tick();
+    }
+    assert_eq!(block_at(11, base + 3, 11), sand, "cold: block remains");
+    assert!(falling().lock().unwrap().is_empty(), "cold: no falling entity");
+    // After warming, the overdue block callback runs first and the entity
+    // moves only when the entity-physics stage runs.
+    let mut warm = ow.clone();
+    warm.extend([(0, 0)]);
+    set_test_region(oh.clone(), warm);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(11, base + 3, 11), 0, "warm: callback converts block");
     let y0 = {
         let q = falling().lock().unwrap();
         assert_eq!(q.len(), 1);
         q[0].y
     };
-
     falling_tick();
     let q = falling().lock().unwrap().clone();
-    assert_eq!(q.len(), 1, "a cold chunk must not land or drop the entity");
-    assert_eq!(q[0].y, y0, "and must not move it");
-    // Warming the chunk must let it resume, not leave it frozen.
-    let mut warm = ow.clone();
-    warm.extend([(0, 0)]);
-    set_test_region(oh.clone(), warm);
-    falling_tick();
-    let q = falling().lock().unwrap().clone();
-    assert!(
-        q.len() == 1 && q[0].y < y0,
-        "a warmed chunk must resume the fall: {q:?}"
-    );
+    assert!(q.len() == 1 && q[0].y < y0,
+            "warm: entity physics resumes after scheduled callback: {q:?}");
 
     set_test_region(oh, ow);
     *falling().lock().unwrap() = old_falling;
@@ -3563,6 +3564,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     }
     set_block(x, base, z, stone);
     set_block(x, base + 4, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3601,6 +3603,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     drops().lock().unwrap().clear();
     set_block(x, base, z, stone);
     set_block(x, base + 4, z, sand);
+    drain_falling_bookings(4);
     falling_tick();
     set_block(x, base + 2, z, stone);
     let mut buf = Vec::new();
@@ -3613,8 +3616,8 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     drops().lock().unwrap().clear();
     load_world_from(&buf).unwrap();
     let mut t = 0;
-    while !falling().lock().unwrap().is_empty() && t < 200 {
-        falling_tick();
+    while falling_work_in_progress() && t < 200 {
+        falling_world_tick_test();
         t += 1;
     }
     assert!(t < 200, "the reloaded entity must land");
@@ -3656,7 +3659,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
         for i in 1..=height {
             set_block(x, base + i, z, sand);
         }
-        set_block(x, base, z, 0); // the column becomes entities in this call
+        set_block(x, base, z, 0); // callbacks are pending; blocks remain until due
         let live = sand_count(x, z, base, base + height + 4)
             + falling().lock().unwrap().len()
             + drop_count(sand_item);
@@ -3674,8 +3677,8 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
         drops().lock().unwrap().clear();
         load_world_from(&buf).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 400 {
-            falling_tick();
+        while falling_work_in_progress() && t < 400 {
+            falling_world_tick_test();
             t += 1;
         }
         assert!(t < 400, "the snapshot's entities must settle");
@@ -3734,16 +3737,16 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
     let b = knock(vec![(1, 2), (2, 2)]);
     let mut ticks = 0;
     while ticks < 800 {
-        falling_tick();
+        falling_world_tick_test();
         ticks += 1;
-        if a.is_finished() && b.is_finished() && falling().lock().unwrap().is_empty() {
+        if a.is_finished() && b.is_finished() && !falling_work_in_progress() {
             break;
         }
     }
     a.join().expect("knocker a");
     b.join().expect("knocker b");
-    while !falling().lock().unwrap().is_empty() && ticks < 1600 {
-        falling_tick();
+    while falling_work_in_progress() && ticks < 1600 {
+        falling_world_tick_test();
         ticks += 1;
     }
     assert!(ticks < 1600, "the fall must settle");
@@ -3787,6 +3790,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
         set_block(x, y, z, 0);
     }
     set_block(x, MIN_Y + 1, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3818,8 +3822,8 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
         drops().lock().unwrap().clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 200 {
-            falling_tick();
+        while falling_work_in_progress() && t < 200 {
+            falling_world_tick_test();
             t += 1;
         }
         assert_eq!(
@@ -3854,6 +3858,7 @@ fn region_change_mid_fall_keeps_the_entity() {
     }
     set_block(x, base, z, stone);
     set_block(x, base + 4, z, sand);
+    drain_falling_bookings(4);
     falling_tick();
     let before = falling().lock().unwrap()[0].y;
     // Cold: the entity must be kept and not advanced.
