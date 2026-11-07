@@ -4308,3 +4308,97 @@ fn native_survival_fragile_port_pair() {
     println!("PAIRED_NATIVE_FRAGILE_SUPPORT states={rows} compared={compared} family_count={}",
              families.len());
 }
+
+
+/// Native BlockState.updateShape, one callback per scene, versus the Rust port.
+/// Requires an actual JAR-produced 25-case TSV with the original/neighbor/result
+/// states and the direction; normal tests never synthesize a passing baseline.
+#[test]
+#[ignore = "requires MC_NATIVE_NEIGHBOR_SHAPES from pinned 1.21.1 Java probe"]
+fn native_neighbor_shape_port_pair() {
+    fn parse(reg: &crate::block_registry::BReg, text: &str) -> u32 {
+        let (name, properties) = match text.split_once('[') {
+            Some((n, ps)) => (n, Some(ps.strip_suffix(']').expect("closing state ]"))),
+            None => (text, None),
+        };
+        let pairs: Vec<(String, String)> = properties
+            .map(|ps| {
+                ps.split(',').map(|pair| {
+                    let (key, value) = pair.split_once('=').expect("name=value");
+                    (key.to_string(), value.to_string())
+                }).collect()
+            }).unwrap_or_default();
+        let id = reg.checked_state(name, &pairs)
+            .unwrap_or_else(|| panic!("Rust registry lacks native state {text}"));
+        let mut rust_props = reg.properties_of(id).expect("valid native state");
+        rust_props.sort();
+        let canonical = if rust_props.is_empty() {
+            reg.name_of(id).to_string()
+        } else {
+            format!("{}[{}]", reg.name_of(id), rust_props.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>().join(","))
+        };
+        assert_eq!(canonical, text, "native state is not the mapped Rust state");
+        id
+    }
+
+    const CASES: [&str; 25] = [
+        "oak_north_bone", "oak_south_bone", "oak_west_bone",
+        "oak_east_bone", "nether_west_bone", "pane_west_bone",
+        "bars_east_bone", "wall_west_bone", "stairs_outer_left",
+        "stairs_inner_left", "torch_down_air", "wall_torch_south_air",
+        "lantern_up_air", "wall_post_to_straight", "wall_straight_to_tee",
+        "wall_straight_disconnect", "wall_tee_disconnect",
+        "pane_east_disconnect", "fence_east_disconnect",
+        "pane_bars_join", "wood_fence_join", "nether_no_wood_join",
+        "oak_west_air", "pane_west_air", "bone_west_bone",
+    ];
+    let path = std::env::var("MC_NATIVE_NEIGHBOR_SHAPES")
+        .expect("native updateShape TSV required");
+    let input = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("native neighbor shapes {path}: {e}"));
+    let reg = crate::block_registry::breg().expect("pinned block registry");
+    let air = reg.state_of("minecraft:air", None);
+    let mut checked = 0;
+    let mut mismatches = Vec::new();
+    for (i, line) in input.lines().enumerate() {
+        let cols: Vec<_> = line.split('\t').collect();
+        assert_eq!(cols.len(), 5, "incomplete native shape row {i}");
+        assert!(i < CASES.len(), "unrecognized native shape row {i}");
+        assert_eq!(cols[0], CASES[i], "reordered native shape at {i}");
+        let original = parse(reg, cols[1]);
+        let expected = parse(reg, cols[2]);
+        let neighbor = parse(reg, cols[3]);
+        let (dir, delta) = match cols[4] {
+            "DOWN" => (0, (0, -1, 0)),
+            "UP" => (1, (0, 1, 0)),
+            "NORTH" => (2, (0, 0, -1)),
+            "SOUTH" => (3, (0, 0, 1)),
+            "WEST" => (4, (-1, 0, 0)),
+            "EAST" => (5, (1, 0, 0)),
+            other => panic!("unknown native direction {other}"),
+        };
+        let result = if reg.fragile_loses_support(original, dir, neighbor) {
+            air
+        } else if reg.name_of(original).ends_with("_stairs") {
+            let target = (delta.0, 64 + delta.1, delta.2);
+            reg.stair_after_neighbors(original, (0, 64, 0),
+                |p| if p == target { neighbor } else { air })
+                .unwrap_or(original)
+        } else {
+            reg.connection_after_neighbor(original, neighbor, air, dir)
+                .unwrap_or(original)
+        };
+        if result != expected {
+            mismatches.push(format!(
+                "{} native={} rust={} (id {result})",
+                cols[0], cols[2], reg.name_of(result)));
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, CASES.len(), "native shape cases missing");
+    assert!(mismatches.is_empty(),
+            "native/Rust updateShape mismatches:\n{}", mismatches.join("\n"));
+    println!("PAIRED_NATIVE_NEIGHBOR_SHAPES cases={checked} mismatches=0");
+}
