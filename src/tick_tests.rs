@@ -2505,7 +2505,7 @@ fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
     let (hot, warm) = test_region();
     let mut eligible = warm.clone();
     eligible.insert((0, 0));
-    set_test_region(hot.clone(), eligible);
+    set_test_region(eligible.clone(), eligible);
     let reg = crate::block_registry::breg().unwrap();
     let sand = reg.state_of("minecraft:sand", None);
     let stone = reg.state_of("minecraft:stone", None);
@@ -2546,7 +2546,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let original: Vec<(i32, u32)> = (base..=base + 4).map(|y| (y, block_at(3, y, 3))).collect();
@@ -2644,7 +2644,7 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let start = 150;
@@ -2724,7 +2724,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let base = 150;
@@ -2850,7 +2850,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     warm.extend([(0, 0), (1, 0)]);
     // Falling does not depend on the hot set, so start from an empty one rather than whatever a
     // previous test left, and restore the ambient region at the end.
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let stone = name_to_state("stone").expect("stone must exist");
@@ -2981,7 +2981,7 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
             warm.insert((x, z));
         }
     }
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let base = 120;
@@ -3058,7 +3058,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let original: Vec<(i32, u32)> = (base..=base + 5).map(|y| (y, block_at(5, y, 5))).collect();
@@ -3137,7 +3137,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let (x, z) = (7, 7);
@@ -3209,7 +3209,7 @@ fn a_falling_block_passes_through_a_replaceable_block() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let reg = crate::block_registry::breg().unwrap();
     let flower = name_to_state("short_grass")
         .or_else(|| name_to_state("dandelion"))
@@ -3270,7 +3270,7 @@ fn a_long_unsupported_column_converts_in_one_pass() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").unwrap();
     let stone = name_to_state("stone").unwrap();
     let base = 150;
@@ -3322,7 +3322,7 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").unwrap();
     let (x, y, z) = (3, 150, 3);
     let original: Vec<(i32, u32)> = (y - 1..=y + 1).map(|yy| (yy, block_at(x, yy, z))).collect();
@@ -3367,7 +3367,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let reg = crate::block_registry::breg().unwrap();
     let names: std::collections::BTreeSet<String> = (0..reg.state_count() as u32)
         .filter(|&st| reg.behaviour_of(st) == crate::block_registry::B_FALLING)
@@ -3429,7 +3429,7 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
-    set_test_region(oh.clone(), std::collections::HashSet::new());
+    set_test_region(HashSet::new(), HashSet::new());
     let base = 150;
     for y in base..=base + 4 {
         set_block(11, y, 11, 0);
@@ -3448,7 +3448,7 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     // moves only when the entity-physics stage runs.
     let mut warm = ow.clone();
     warm.extend([(0, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     advance_falling_scheduled_tick();
     assert_eq!(block_at(11, base + 3, 11), 0, "warm: callback converts block");
     let y0 = {
@@ -3595,7 +3595,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let (x, z, base) = (3, 3, 150);
@@ -3682,7 +3682,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let stone = name_to_state("stone").expect("stone must exist");
@@ -3744,7 +3744,7 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
             warm.insert((x, z));
         }
     }
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let stone = name_to_state("stone").expect("stone must exist");
@@ -3822,7 +3822,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let (x, z) = (7, 7);
@@ -3889,7 +3889,7 @@ fn region_change_mid_fall_keeps_the_entity() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm.clone());
+    set_test_region(warm.clone(), warm.clone());
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let (x, z, base) = (9, 9, 140);
@@ -3911,7 +3911,7 @@ fn region_change_mid_fall_keeps_the_entity() {
     assert_eq!(held[0].y, before, "a cold chunk does not advance it");
     drop(held);
     // Warm again: it lands on the support.
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let mut ticks = 0;
     while !falling().lock().unwrap().is_empty() && ticks < 200 {
         falling_tick();
