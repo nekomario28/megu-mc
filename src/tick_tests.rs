@@ -4207,3 +4207,104 @@ fn chunk_delivery_digest() {
     );
     println!("PREFETCH-DIFF\t{}", changed.len());
 }
+
+
+/// Paired with the authenticated native 1.21.1 canSurvive matrix, not an
+/// independently guessed all-block survival model. This is explicitly ignored
+/// by normal cargo test: CI must pass a real matrix and opt in.
+#[test]
+#[ignore = "requires MC_NATIVE_SURVIVAL_MATRIX from the pinned Java oracle"]
+fn native_survival_fragile_port_pair() {
+    const SCENES: [(&str, u8); 12] = [
+        ("empty", 0),
+        ("floor_stone", 1),
+        ("ceiling_stone", 2),
+        ("north_stone", 4),
+        ("south_stone", 8),
+        ("west_stone", 16),
+        ("east_stone", 32),
+        ("all_stone", 63),
+        ("all_except_floor", 62),
+        ("all_except_north", 59),
+        ("floor_water", 0),
+        ("floor_lava", 0),
+    ];
+    let path = std::env::var("MC_NATIVE_SURVIVAL_MATRIX")
+        .expect("native fixture path required; not a synthetic fallback");
+    let matrix = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("native matrix {path}: {e}"));
+    let reg = crate::block_registry::breg().expect("load pinned block registry");
+    assert_eq!(reg.state_count(), 26_684);
+
+    let mut rows = 0_usize;
+    let mut compared = 0_usize;
+    let mut families = std::collections::HashSet::new();
+    let mut disagreements = Vec::new();
+    let air = reg.state_of("minecraft:air", None);
+    for (index, line) in matrix.lines().enumerate() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 5, "malformed native row {index}");
+        let sid = (index / SCENES.len()) as u32;
+        assert_eq!(fields[0], sid.to_string(), "native row state order {index}");
+        assert_eq!(fields[1], SCENES[index % SCENES.len()].0,
+                   "native scene order {index}");
+        assert!(matches!(fields[2], "T" | "F"),
+                "unavailable native truth in row {index}: {}", fields[2]);
+        // Compare full property identity too: native state ids alone can
+        // accidentally refer to different variants if property order changes.
+        let mut properties = reg.properties_of(sid).expect("pinned state properties");
+        properties.sort();
+        let native_id = if properties.is_empty() {
+            reg.name_of(sid).to_string()
+        } else {
+            format!("{}[{}]", reg.name_of(sid), properties.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>().join(","))
+        };
+        assert_eq!(fields[3], native_id, "native/Rust state identity for {sid}");
+        rows += 1;
+
+        let name = reg.name_of(sid);
+        // Only these families have an implemented Rust negative-support rule.
+        // Non-fragile families are intentionally not declared correct by default.
+        let facing = match name {
+            "minecraft:torch" | "minecraft:soul_torch"
+            | "minecraft:redstone_torch" => Some(0_u8),
+            "minecraft:lantern" | "minecraft:soul_lantern" =>
+                Some(if reg.get_prop(sid, "hanging").as_deref() == Some("true")
+                     { 1 } else { 0 }),
+            "minecraft:wall_torch" | "minecraft:soul_wall_torch"
+            | "minecraft:redstone_wall_torch" => {
+                match reg.get_prop(sid, "facing").as_deref() {
+                    Some("north") => Some(3),
+                    Some("south") => Some(2),
+                    Some("west") => Some(5),
+                    Some("east") => Some(4),
+                    other => panic!("invalid native-facing torch {sid}: {other:?}"),
+                }
+            }
+            _ => None,
+        };
+        if let Some(toward) = facing {
+            assert!(reg.fragile_loses_support(sid, toward, air),
+                    "missing Rust support rule for {native_id}");
+            let bit = 1_u8 << toward;
+            let predicted = (SCENES[index % SCENES.len()].1 & bit) != 0;
+            let observed = fields[2] == "T";
+            if predicted != observed && disagreements.len() < 30 {
+                disagreements.push(format!(
+                    "{sid} {native_id} {}: native={} rust={}",
+                    fields[1], observed, predicted));
+            }
+            families.insert(name.to_string());
+            compared += 1;
+        }
+    }
+    assert_eq!(rows, 26_684 * SCENES.len(), "not the full native matrix");
+    assert_eq!(families.len(), 8, "fragile family coverage regressed");
+    assert!(compared >= 150, "too few paired fragile-family observations: {compared}");
+    assert!(disagreements.is_empty(),
+            "native/Rust fragile support divergences: {}", disagreements.join("; "));
+    println!("PAIRED_NATIVE_FRAGILE_SUPPORT states={rows} compared={compared} family_count={}",
+             families.len());
+}
