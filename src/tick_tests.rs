@@ -2537,9 +2537,14 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
             .name_of(block_at(3, y, 3))
             .to_string()
     };
-    // Removing the support converts the block into an entity in the same call; the block does
-    // not stay in the world while it falls.
+    // Removing support books a callback for two game ticks later, and only
+    // the due callback can convert the still-unsupported block into an entity.
     set_block(3, base + 2, 3, 0);
+    assert_eq!(block_at(3, base + 3, 3), sand, "reserved, not immediately converted");
+    assert!(falling().lock().unwrap().is_empty());
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(3, base + 3, 3), sand, "no fall at +1 GT");
+    advance_falling_scheduled_tick();
     assert_eq!(
         block_at(3, base + 3, 3),
         0,
@@ -2610,6 +2615,7 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     set_block(3, 60, 3, stone); // the world floor below the platform
     set_block(3, 97, 3, stone); // one-block platform at 97 (top face 98)
     set_block(3, start, 3, sand);
+    drain_falling_bookings(4);
 
     // Tick 50 leaves the feet at y=99 (above the platform); tick 51 moves to y=96.96, whose
     // floor is below the platform. A scan starting at the new cell would pass through it.
@@ -2719,10 +2725,11 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         })
     };
 
-    // Knock out every support: all blocks become entities.
+    // Knock out every support; queued callbacks then convert the blocks.
     for &(x, z) in &columns {
         set_block(x, base + 1, z, 0);
     }
+    drain_falling_bookings(2 * height as usize + 4);
     assert_eq!(
         falling().lock().unwrap().len(),
         expected,
@@ -2779,8 +2786,8 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         drops().lock().unwrap().clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 200 {
-            falling_tick();
+        while falling_work_in_progress() && t < 200 {
+            falling_world_tick_test();
             t += 1;
         }
         assert_eq!(
@@ -2851,6 +2858,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     }
     // Knock out the support so the block falls out of the world.
     set_block(1, MIN_Y + 3, 1, 0);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -2900,8 +2908,8 @@ fn a_saved_below_world_drop_is_not_duplicated() {
         drops().lock().unwrap().clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 400 {
-            falling_tick();
+        while falling_work_in_progress() && t < 400 {
+            falling_world_tick_test();
             t += 1;
         }
         let n: u32 = drops()
@@ -2963,15 +2971,15 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
     };
     let mut ticks = 0;
     while ticks < 800 {
-        falling_tick();
+        falling_world_tick_test();
         ticks += 1;
-        if knocker.is_finished() && falling().lock().unwrap().is_empty() {
+        if knocker.is_finished() && !falling_work_in_progress() {
             break;
         }
     }
     knocker.join().expect("knocker thread");
-    while !falling().lock().unwrap().is_empty() && ticks < 1600 {
-        falling_tick();
+    while falling_work_in_progress() && ticks < 1600 {
+        falling_world_tick_test();
         ticks += 1;
     }
     assert!(ticks < 1600, "the fall must settle");
@@ -3034,6 +3042,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     // Removing the support converts the lower block, whose removal makes the upper one
     // unsupported, so both become entities in the same call.
     set_block(5, base + 2, 5, 0);
+    drain_falling_bookings(8);
     assert_eq!(
         falling().lock().unwrap().len(),
         2,
@@ -3098,6 +3107,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     }
     set_block(x, base, z, name_to_state("stone").unwrap());
     set_block(x, base + 3, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3105,6 +3115,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     );
     // The entity is still at y = base+3, so its cell is exactly the cell we now refill.
     set_block(x, base + 3, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         2,
@@ -3178,6 +3189,7 @@ fn a_falling_block_passes_through_a_replaceable_block() {
     set_block(x, base + 1, z, flower);
     set_block(x, base + 3, z, sand);
     set_block(x, base + 2, z, 0);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3241,6 +3253,7 @@ fn a_long_unsupported_column_converts_in_one_pass() {
         "a supported column must not fall yet"
     );
     set_block(x, base, z, 0);
+    drain_falling_bookings(2 * height as usize + 10);
     assert_eq!(
         falling().lock().unwrap().len(),
         height as usize,
@@ -3276,7 +3289,9 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     set_block(x, y - 1, z, 0);
     set_block(x, y, z, 0);
     place_block(x, y, z, sand);
-    assert_eq!(block_at(x, y, z), 0, "unsupported sand leaves the world");
+    assert_eq!(block_at(x, y, z), sand, "sand remains during 2-GT booking");
+    drain_falling_bookings(4);
+    assert_eq!(block_at(x, y, z), 0, "due callback leaves air");
     let idx = ((x & 15) as u16) << 8 | ((z & 15) as u16) << 4 | (y & 15) as u16;
     let queued = pending_blocks()
         .lock()
@@ -3330,6 +3345,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
         set_block(x, base, 9, name_to_state("stone").unwrap());
         *falling().lock().unwrap() = Vec::new();
         set_block(x, base + 3, 9, st);
+        drain_falling_bookings(4);
         assert_eq!(
             block_at(x, base + 3, 9),
             0,
