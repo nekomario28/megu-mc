@@ -111,7 +111,10 @@ public final class NeighborShapeOracle {
                 for (int i = 0; i < from.length; i++) {
                     if (!expected.contains(from[i]))
                         throw new AssertionError("missing native property " + c.id() + ": " + expected);
-                    expected = expected.replace(from[i], to[i]);
+                    // A removed fragile block becomes plain air; replacing the
+                    // name prefix must not carry its former state properties.
+                    expected = to[i].equals("minecraft:air")
+                            ? "minecraft:air" : expected.replace(from[i], to[i]);
                 }
             }
             if (!expected.equals(after))
