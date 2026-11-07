@@ -1,8 +1,9 @@
 // generation_context.rs — the local generation context: one mutable borrow of
 // Gen plus the write-through overrides and caches the placement evaluators see.
-// It owns no datapack types and no feature/tree logic.
+// It owns no datapack types; common feature and template tick reservations
+// live here without importing higher-level tree or template implementations.
 
-use crate::block_registry::{breg, HeightmapKind};
+use crate::block_registry::{breg, BReg, HeightmapKind};
 use crate::worldgen::Gen;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +16,36 @@ pub(crate) static READ_N: AtomicU64 = AtomicU64::new(0);
 /// 2026-10-27: 43,048 scans / 141,530 cells over 25 populated chunks.
 pub(crate) static HM_SCAN_N: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HM_SCAN_CELLS: AtomicU64 = AtomicU64::new(0);
+
+/// The native LeavesBlock.updateShape scheduling contract used by both
+/// tree finalization and the bounded solid-template edge visitor. It reserves
+/// a tick rather than immediately changing leaf distance. Keep the existing
+/// native tree-edge ordering/deduplication tests as the regression oracle.
+/// Shared at the generation-context layer to avoid a template -> tree dependency.
+pub(crate) fn schedule_leaf_edge_state(
+    ctx: &mut FC<'_>,
+    reg: &BReg,
+    cell: (i32, i32, i32),
+    st: u32,
+    neighbor: u32,
+) {
+    let name = reg.name_of(st);
+    if !name.ends_with("_leaves") {
+        return;
+    }
+    let Some(distance) = reg
+        .get_prop(st, "distance")
+        .and_then(|v| v.parse::<u8>().ok())
+    else {
+        return;
+    };
+    let next = reg.distance_from_log(neighbor).unwrap_or(7) + 1;
+    if next != 1 || distance != 1 {
+        ctx.g
+            .schedule_generated_leaf(cell, reg.state_of(name, None));
+    }
+}
+
 
 // ---------- generation context ----------
 
