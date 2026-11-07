@@ -4210,10 +4210,10 @@ fn chunk_delivery_digest() {
 
 
 /// Paired with the authenticated native 1.21.1 canSurvive matrix, not an
-/// independently guessed all-block survival model. This is explicitly ignored
-/// by normal cargo test: CI must pass a real matrix and opt in.
+/// independently guessed all-block survival model. It is compiled only with
+/// native-oracle enabled; CI must pass a real matrix, not a placeholder.
+#[cfg(feature = "native-oracle")]
 #[test]
-#[ignore = "requires MC_NATIVE_SURVIVAL_MATRIX from the pinned Java oracle"]
 fn native_survival_fragile_port_pair() {
     const SCENES: [(&str, u8); 12] = [
         ("empty", 0),
@@ -4313,8 +4313,8 @@ fn native_survival_fragile_port_pair() {
 /// Native BlockState.updateShape, one callback per scene, versus the Rust port.
 /// Requires an actual JAR-produced 25-case TSV with the original/neighbor/result
 /// states and the direction; normal tests never synthesize a passing baseline.
+#[cfg(feature = "native-oracle")]
 #[test]
-#[ignore = "requires MC_NATIVE_NEIGHBOR_SHAPES from pinned 1.21.1 Java probe"]
 fn native_neighbor_shape_port_pair() {
     fn parse(reg: &crate::block_registry::BReg, text: &str) -> u32 {
         let (name, properties) = match text.split_once('[') {
@@ -4407,8 +4407,8 @@ fn native_neighbor_shape_port_pair() {
 /// Replays native-created tick appointments through the Rust per-chunk scheduler,
 /// compares every callback in source order, and never merges block/fluid queues.
 /// Requires outputs of native_neighbor_trace.py from the same pinned Java run.
+#[cfg(feature = "native-oracle")]
 #[test]
-#[ignore = "requires both native request and LevelTicks delivery TSVs"]
 fn native_level_ticks_port_delivery_pair() {
     #[derive(Clone)]
     struct Request {
