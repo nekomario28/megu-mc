@@ -414,8 +414,8 @@ impl Template {
         for (direction, p, q) in crate::voxel_faces::exposed_faces(written) {
             let inside = ctx.get(p.0, p.1, p.2);
             let outside = ctx.get(q.0, q.1, q.2);
-            crate::tree::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
-            crate::tree::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
+            crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
+            crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
             // Full-cube positive connections have one registry-owned contract.
             // The wall case reads the cell above; stair shape uses a live
             // read-through view of the just-placed template, not old terrain.
