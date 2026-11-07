@@ -90,3 +90,34 @@ jobs:
           toolchain: 1.98.0
       - name: Compile and run serialized regressions on this exact PR head
         run: cargo test --locked -- --test-threads=1
+
+
+  full:
+    name: P1 full verification (serial, parallel, wire, adapters, mutation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # pinned
+        with:
+          toolchain: 1.98.0
+      - name: Install pinned gxkit dependency inspector
+        env:
+          GXKIT_REV: d6b9ad8db4774919c8b4fb032342e53b2548b660
+        run: |
+          git init "$RUNNER_TEMP/gxkit"
+          git -C "$RUNNER_TEMP/gxkit" remote add origin https://github.com/nekomario28/gxkit.git
+          git -C "$RUNNER_TEMP/gxkit" fetch --depth=1 origin "$GXKIT_REV"
+          git -C "$RUNNER_TEMP/gxkit" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/gxkit" rev-parse HEAD)" = "$GXKIT_REV"
+          python3 -m venv "$RUNNER_TEMP/gxkit-venv"
+          "$RUNNER_TEMP/gxkit-venv/bin/python" -m pip install \
+            "$RUNNER_TEMP/gxkit/packages/gxcore" \
+            "$RUNNER_TEMP/gxkit/packages/depsgx"
+          echo "$RUNNER_TEMP/gxkit-venv/bin" >> "$GITHUB_PATH"
+      - name: Fetch locked crates before offline verification
+        run: cargo fetch --locked
+      - name: Run full repository pre-merge verification
+        run: bash tests/verify.sh
