@@ -8,6 +8,12 @@ on:
       - 'test/native-*'
   workflow_dispatch:
 
+# CI runs compiler/tests only. Explicitly select the already-installed pinned
+# compiler so rustup does not auto-sync optional rustfmt/clippy from
+# rust-toolchain.toml when Cargo first starts (runner component-file conflict).
+env:
+  RUSTUP_TOOLCHAIN: '1.98.0'
+
 permissions:
   contents: read
 
