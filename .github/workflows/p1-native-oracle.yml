@@ -59,6 +59,14 @@ jobs:
         run: |
           python3 tools/native_neighbor_trace.py             --jar "${RUNNER_TEMP}/server.jar"             --output "${RUNNER_TEMP}/native-requests.tsv"
 
+      - name: Compare native LevelTicks callbacks with Rust queue (mandatory)
+        env:
+          MC_NATIVE_TICK_REQUESTS: ${{ runner.temp }}/native-requests.tsv
+          MC_NATIVE_TICK_DELIVERIES: ${{ runner.temp }}/native-requests.delivered.tsv
+        run: |
+          test -s "$MC_NATIVE_TICK_REQUESTS"
+          test -s "$MC_NATIVE_TICK_DELIVERIES"
+          cargo test --locked native_level_ticks_port_delivery_pair -- --ignored --nocapture
       - name: Capture all 25 native updateShape cases
         run: |
           python3 tools/template_neighbor_oracle.py \
