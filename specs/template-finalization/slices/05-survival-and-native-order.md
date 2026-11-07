@@ -1,6 +1,6 @@
 # P1-1: exhaustive support inventory and ordered native event baselines
 
-Status: **test infrastructure only**. A complete list of block states is NOT a
+Status: **native and bounded Rust paired tests implemented; full P1-1 parity remains open**. A complete list of block states is NOT a
 complete implementation of `BlockState.canSurvive`, nor is a native scheduling
 request a native executed tick. This slice is stacked on the draft P1-1 branch
 and does not independently change `perf/worldgen-parallel` or `main`.
@@ -83,12 +83,32 @@ Each generated local output should be retained by the operator with JAR hash,
 commit SHA, scope, and SHA-256. Native matrices and traces are not checked in
 before evaluating their provenance, reproducibility and licensing.
 
+## Recorded evidence (2026-11-07)
+
+- [CI: Native/JVM and Rust pairing, run #42338550702](https://github.com/nekomario28/mc-spine/actions/runs/42338550702): 26,684 states in 12 **synthetic** contexts (320,208 rows, zero unsupported); 336 support decisions across 8 implemented fragile families matched Rust; 25 single-callback native state transitions matched Rust; native 8 appointments / 8 deliveries matched Rust's queue at identical time, identity, position and order. All native and dedicated Rust pairing jobs passed.
+- Run #42338550702's **full repository verification failed** at the ignored-test debt ratchet, not at the native pairing tests. The source-layer dependency violation from the previous run was repaired, and 17/17 layering tests passed.
+- The three fixture-only Rust tests now require the explicit Cargo feature \`native-oracle\`; the native CI supplies real JAR-generated TSVs. There are no added \`#[ignore]\` gates and the debt limit was **not** raised. Confirm the complete post-fix \`tests/verify.sh\` run before claiming a green full suite.
+- The runtime still creates falling entities immediately on support removal while native FallingBlock.updateShape **schedules a 2-game-tick block callback**. This remains a known behavior mismatch; do not treat 8/8 delivery parity (which replays already-authored requests) as booking parity or full tick effects.
+
+Reproduce the mandatory paired tests after collecting fixtures from the same JAR and commit:
+
+\`\`\`sh
+MC_NATIVE_SURVIVAL_MATRIX=/tmp/mcspine-native-support.tsv \
+  cargo test --locked --features native-oracle native_survival_fragile_port_pair -- --nocapture
+MC_NATIVE_NEIGHBOR_SHAPES=/tmp/mcspine-neighbor-shapes.tsv \
+  cargo test --locked --features native-oracle native_neighbor_shape_port_pair -- --nocapture
+MC_NATIVE_TICK_REQUESTS=/tmp/mcspine-native-request.tsv \
+MC_NATIVE_TICK_DELIVERIES=/tmp/mcspine-native-request.delivered.tsv \
+  cargo test --locked --features native-oracle native_level_ticks_port_delivery_pair -- --nocapture
+\`\`\`
+
 ## Criteria before closing P1-1
 
-- [ ] All 26,684 pinned states visited; 320,208 rows produced, 0 `U:` rows,
-  native identities match the block property registry.
-- [ ] Native 1.21.1 events and deliveries run twice with identical order and
-  digests, all queued positions eligible and all recorded appointments delivered.
+- [x] All 26,684 pinned states visited; 320,208 rows produced, 0 `U:` rows,
+  native identities match the block property registry **in the 12 synthetic scenes**.
+- [x] Native 1.21.1 events and deliveries run twice with identical order and
+  digests, all queued positions eligible and all recorded appointments delivered
+  **in the isolated test harness**.
 - [ ] Capture **paired port observations** at the same initial blocks, world
   seed, time and chunk eligibility. Compare write order, block state, tick
   identity/due/priority/sub-order and delivered world states. Fix the first
