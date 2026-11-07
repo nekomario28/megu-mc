@@ -15,7 +15,9 @@ from vanilla_java import DEFAULT_JAR, pinned_runtime, run_probe
 ROOT = Path(__file__).resolve().parents[1]
 SCENES = (
     "waterlogged_pane", "waterlogged_fence", "waterlogged_stairs",
-    "leaf_next_to_log", "falling_sand", "fragile_torch",
+    "leaf_next_to_log", "falling_sand", "falling_gravel",
+    "falling_red_sand", "falling_concrete_powder", "falling_sand_supported",
+    "fragile_torch",
     "mixed_scheduling_requests", "native_neighbor_pass",
 )
 
@@ -66,8 +68,26 @@ def validate_trace(lines):
             raise ValueError(f"{case} did not book native 5-tick water event")
     if not any(kind == "block" for kind, *_ in ticks.get("leaf_next_to_log", [])):
         raise ValueError("native leaves did not reserve a block tick")
-    if not any(kind == "block" for kind, *_ in ticks.get("falling_sand", [])):
-        raise ValueError("native sand did not reserve a block tick")
+    # Native FallingBlock.updateShape books exactly one NORMAL-priority tick at
+    # game-time 100 + 2. This includes the supported-state callback: the actual
+    # falling decision is deferred until its scheduled callback runs.
+    falling = {
+        "falling_sand": "minecraft:sand",
+        "falling_gravel": "minecraft:gravel",
+        "falling_red_sand": "minecraft:red_sand",
+        "falling_concrete_powder": "minecraft:white_concrete_powder",
+        "falling_sand_supported": "minecraft:sand",
+    }
+    for case, identity in falling.items():
+        scheduled = ticks.get(case, [])
+        if scheduled != [("block", identity, 102, 0)]:
+            raise ValueError(
+                f"{case} must schedule one exact 2-GT native falling callback: {scheduled!r}"
+            )
+        raw = [event for c, event in events
+               if c == case and event.startswith("tick ")]
+        if len(raw) != 1 or not raw[0].endswith(" 102 NORMAL 0"):
+            raise ValueError(f"{case} native priority/suborder differ: {raw!r}")
     if sets.get("native_neighbor_pass", 0) == 0:
         raise ValueError("native neighbor pass did not produce a state change")
     suborders = [row[3] for row in ticks.get("mixed_scheduling_requests", [])]
