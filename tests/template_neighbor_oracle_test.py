@@ -14,7 +14,7 @@ class NativeNeighborOutputTest(unittest.TestCase):
         for case in CASES:
             before = "minecraft:oak_fence[west=false]"
             after = before if case in {"oak_west_air", "pane_west_air", "bone_west_bone", "nether_no_wood_join"} else "minecraft:oak_fence[west=true]"
-            rows.append(f"{case}\t{before}\t{after}")
+            rows.append(f"{case}\t{before}\t{after}\tminecraft:bone_block\tWEST")
         return rows
 
     def test_complete_native_output_is_accepted(self):
@@ -48,7 +48,7 @@ class NativeNeighborOutputTest(unittest.TestCase):
         rows = self.sample()
         i = CASES.index("nether_no_wood_join")
         parts = rows[i].split("\t")
-        rows[i] = "\t".join((parts[0], parts[1], "minecraft:nether_brick_fence[east=true]"))
+        rows[i] = "\t".join((parts[0], parts[1], "minecraft:nether_brick_fence[east=true]", *parts[3:]))
         with self.assertRaises(ValueError):
             validate_rows("\n".join(rows))
 
@@ -56,7 +56,7 @@ class NativeNeighborOutputTest(unittest.TestCase):
         rows = self.sample()
         # Only the native result is corrupted; the input state stays intact.
         parts = rows[-1].split("\t")
-        rows[-1] = "\t".join((parts[0], parts[1], "minecraft:oak_fence[west=true]"))
+        rows[-1] = "\t".join((parts[0], parts[1], "minecraft:oak_fence[west=true]", *parts[3:]))
         with self.assertRaises(ValueError):
             validate_rows("\n".join(rows))
 
