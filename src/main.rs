@@ -6317,10 +6317,12 @@ fn scheduled_block_tick_inner() {
         let b = i * STRIDE;
         let st = states[b];
         if reg.behaviour_of(tick.block) == crate::block_registry::B_FALLING {
-            // The original gravity state can have been removed or replaced
-            // during the two-tick wait. A new support can also prevent the fall.
-            // Use the same CAS used by legacy falling conversion.
-            if st == tick.block && fallable_state(states[b + 1]) {
+            // Native scheduled ticks hold a Block identity, not a complete
+            // BlockState. Reorienting an anvil during the wait must not cancel
+            // its pending callback; replacing it with another block does.
+            if reg.behaviour_of(st) == crate::block_registry::B_FALLING
+                && reg.name_of(st) == reg.name_of(tick.block)
+                && fallable_state(states[b + 1]) {
                 spawn_fall(x, y, z, st);
             }
             continue;
@@ -7511,7 +7513,9 @@ fn note_falling(x: i32, y: i32, z: i32) {
         let sub_order = BLOCK_TICK_ORDER.fetch_add(1, Ordering::Relaxed);
         block_ticks().lock().unwrap().schedule(scheduled_ticks::ScheduledTick {
             pos: (px, py, pz),
-            block: st,
+            // Native ScheduledTick de-duplicates per block identity, independent
+            // of facing/waterlogged properties of the current state.
+            block: reg.state_of(reg.name_of(st), None),
             due,
             priority: 0,
             sub_order,
