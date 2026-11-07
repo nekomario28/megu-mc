@@ -6316,6 +6316,15 @@ fn scheduled_block_tick_inner() {
         let (x, y, z) = tick.pos;
         let b = i * STRIDE;
         let st = states[b];
+        if reg.behaviour_of(tick.block) == crate::block_registry::B_FALLING {
+            // The original gravity state can have been removed or replaced
+            // during the two-tick wait. A new support can also prevent the fall.
+            // Use the same CAS used by legacy falling conversion.
+            if st == tick.block && fallable_state(states[b + 1]) {
+                spawn_fall(x, y, z, st);
+            }
+            continue;
+        }
         if leaf_block(reg, st) != Some(tick.block) {
             continue;
         }
@@ -7478,39 +7487,41 @@ fn fallable(x: i32, y: i32, z: i32) -> bool {
     fallable_state(block_at(x, y, z))
 }
 
-/// Queue the block above a change if that change took its support away. Vanilla does this from
-/// the neighbour update; here it is the same place, so a falling block is scheduled exactly when
-/// something under it changes and never on a scan.
-/// Schedules a fall for the cell above and for the cell itself, if either is a gravity block that
-/// has nothing under it. Called from every block change, so one place covers both directions.
-///
-/// The cell itself is not optional: placing a gravity block in mid-air, or pushing one there with a
-/// piston, changes that cell while leaving everything under it untouched, and a check that only
-/// looked upward left the block hanging.
+/// FallingBlock's neighbor callback reserves a block tick two game ticks in
+/// the future, even if a support was just installed. The callback re-reads
+/// both the block and its support: placement/replacement can cancel the fall.
+/// Use the same scheduled-block queue as leaf ticks, with the same persistent
+/// due/priority/suborder and (position, block identity) de-duplication.
+/// Booking the changed cell is essential for unsupported gravity placements.
 fn note_falling(x: i32, y: i32, z: i32) {
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
-    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {
-        if py <= MIN_Y {
+    let due = TICK_IDX.load(Ordering::Relaxed) as i64 + 2;
+    for (px, py, pz) in [(x, y, z), (x, y.saturating_add(1), z)] {
+        if py <= MIN_Y || py >= MIN_Y + 384 {
             continue;
         }
         let st = block_at(px, py, pz);
         if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
             continue;
         }
-        if !fallable(px, py - 1, pz) {
-            continue;
-        }
-        spawn_fall(px, py, pz, st);
+        // Reserve first; no world write or falling entity is created until
+        // the native-style delayed callback is actually collected.
+        let sub_order = BLOCK_TICK_ORDER.fetch_add(1, Ordering::Relaxed);
+        block_ticks().lock().unwrap().schedule(scheduled_ticks::ScheduledTick {
+            pos: (px, py, pz),
+            block: st,
+            due,
+            priority: 0,
+            sub_order,
+        });
     }
 }
 
-/// Turn a gravity block that has lost its support into a falling-block entity, as vanilla
-/// does: the block leaves the world and the entity owns its state until it lands. Removing
-/// the block reaches `note_falling` again, so an unsupported column converts in one pass
-/// instead of one cell per tick, bounded by the neighbour-update recursion depth
-/// (`UPD_DEPTH`); a column taller than that leaves the blocks above the bound in place.
+/// Convert a still-unsupported gravity block from its *due* scheduled callback.
+/// Removing it schedules the block above for a future two-GT callback; a stacked
+/// column must not collapse synchronously before the first callback has run.
 fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
     // Claim the block with a compare-and-set instead of a check then a clear: two threads can
     // both see the unsupported gravity block, and only the one that actually removes it may
@@ -7535,9 +7546,9 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
     });
 }
 
-/// Place a block and queue the update for whatever the world now holds. Placing an unsupported
-/// gravity block converts it to an entity in the same call, so notifying the requested state
-/// instead of the post-conversion state would leave a ghost block on the client.
+/// Place a block and queue its actual state. Falling blocks now remain blocks
+/// during the two-tick booking window; only the scheduled callback may turn
+/// one into an entity, emitting the intervening air update.
 fn place_block(wx: i32, wy: i32, wz: i32, st: u32) {
     set_block(wx, wy, wz, st);
     note_block_update(wx, wy, wz, block_at(wx, wy, wz));
