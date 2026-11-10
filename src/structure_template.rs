@@ -406,17 +406,47 @@ impl Template {
             }
         }
         // Native updateShapeAtEdge visits exposed voxel faces after ALL writes.
-        // Full-cube fossil outputs do not change their own shape. Source-liquid
-        // neighbors schedule proto ticks; general neighbor state rewrites remain
-        // outside this full-cube terrain placement contract.
-        for (_, _, q) in crate::voxel_faces::exposed_faces(written) {
-            let state = ctx.get(q.0, q.1, q.2);
-            if matches!(reg.name_of(state), "minecraft:water" | "minecraft:lava") {
-                match reg.fluid_name(state) {
-                    "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
-                    "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
-                    _ => {}
-                }
+        // Reuse the native-tested tree leaf scheduling owner and the same face
+        // visitor as the existing fluid proto-tick path. A bounded positive
+        // state transition is supported for an existing fence next to a newly
+        // placed ordinary full cube. Other block-specific shape updates remain
+        // outside this fossil-only placement contract.
+        for (direction, p, q) in crate::voxel_faces::exposed_faces(written) {
+            let inside = ctx.get(p.0, p.1, p.2);
+            let outside = ctx.get(q.0, q.1, q.2);
+            crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
+            crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
+            // Full-cube positive connections have one registry-owned contract.
+            // The wall case reads the cell above; stair shape uses a live
+            // read-through view of the just-placed template, not old terrain.
+            let updated = reg.fence_after_full_neighbor(outside, inside, direction ^ 1)
+                .or_else(|| reg.pane_after_full_neighbor(outside, inside, direction ^ 1))
+                .or_else(|| {
+                    if reg.name_of(outside).ends_with("_wall") {
+                        let above = ctx.get(q.0, q.1.wrapping_add(1), q.2);
+                        reg.wall_after_full_neighbor(outside, inside, above, direction ^ 1)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    if reg.name_of(outside).ends_with("_stairs") {
+                        reg.stair_after_neighbors(outside, q, |p| ctx.get(p.0, p.1, p.2))
+                    } else {
+                        None
+                    }
+                });
+            if let Some(state) = updated {
+                ctx.set(q.0, q.1, q.2, state);
+            }
+            // A waterlogged pane/stair/fence reports the same source
+            // FluidState as a water block. Native ProtoChunkTicks preserves
+            // identity/position, not the scheduled delay; unpack happens on
+            // chunk activation. This is NOT the 5-GT live-world update path.
+            match reg.fluid_name(outside) {
+                "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
+                "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
+                _ => {}
             }
         }
         Ok(true)
@@ -616,6 +646,211 @@ mod tests {
                 "unhandled template input {kind} passed fossil admission"
             );
         }
+    }
+
+    #[test]
+    fn fence_full_cube_edge_changes_only_the_facing_connection() {
+        let reg = crate::block_registry::breg().unwrap();
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let fence = reg.state_of("minecraft:oak_fence", None);
+        assert_eq!(reg.is_template_solid(bone), Some(true));
+        for (direction, property) in [
+            (2, "north"),
+            (3, "south"),
+            (4, "west"),
+            (5, "east"),
+        ] {
+            let updated = reg
+                .fence_after_full_neighbor(fence, bone, direction)
+                .expect("full bone-block face must connect an oak fence");
+            assert_eq!(reg.get_prop(updated, property).as_deref(), Some("true"));
+            for other in ["north", "south", "west", "east"] {
+                if other != property {
+                    assert_eq!(
+                        reg.get_prop(updated, other),
+                        reg.get_prop(fence, other),
+                        "neighbor update changed the wrong fence side"
+                    );
+                }
+            }
+            assert!(
+                reg.fence_after_full_neighbor(updated, bone, direction).is_none(),
+                "already-connected fence must not be written again"
+            );
+        }
+        assert!(reg.fence_after_full_neighbor(fence, bone, 0).is_none());
+        assert!(reg.fence_after_full_neighbor(fence, bone, 1).is_none());
+        assert!(reg.fence_after_full_neighbor(fence, reg.state_of("minecraft:air", None), 4).is_none());
+        assert!(reg.fence_after_full_neighbor(bone, bone, 4).is_none());
+    }
+
+    #[test]
+    fn solid_template_edges_update_fences_and_reserve_native_leaf_ticks() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let fence = reg.state_of("minecraft:oak_fence", None);
+        let leaves = reg.with_prop(
+            reg.state_of("minecraft:oak_leaves", None),
+            "distance",
+            "7",
+        );
+        let air = reg.state_of("minecraft:air", None);
+        let center = (8, 72, 8);
+        let east = (9, 72, 8);
+        let north = (8, 72, 7);
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo {
+                pos: (0, 0, 0),
+                state: bone,
+                nbt: None,
+            }]],
+            entities: Vec::new(),
+        };
+        assert!(template.validate_solid_placement(&[], reg).is_ok());
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_writes = Some(Vec::new());
+        for (pos, state) in [
+            (center, air),
+            ((7, 72, 8), air),
+            (east, fence),
+            (north, leaves),
+            ((8, 72, 9), air),
+            ((8, 71, 8), air),
+            ((8, 73, 8), air),
+        ] {
+            ctx.test_base_cell(pos, state);
+        }
+        let mut rng = Xor::seed_worldgen(91);
+        assert!(
+            template
+                .place_solid_blocks(
+                    &mut ctx,
+                    &mut rng,
+                    Placement {
+                        origin: center,
+                        pivot: (0, 0, 0),
+                        mirror: Mirror::None,
+                        rotation: Rotation::None,
+                    },
+                    &[],
+                    [8, 72, 8, 8, 72, 8],
+                )
+                .unwrap()
+        );
+        assert_eq!(ctx.get(center.0, center.1, center.2), bone);
+        let updated_fence = ctx.get(east.0, east.1, east.2);
+        assert_eq!(reg.get_prop(updated_fence, "west").as_deref(), Some("true"));
+        assert_eq!(
+            ctx.g.generated_leaf_ticks(),
+            vec![(north, reg.state_of("minecraft:oak_leaves", None))],
+            "template finalization must use tree's native tick owner"
+        );
+        assert!(ctx.g.generated_fluid_ticks().is_empty());
+        let writes = ctx.test_writes.as_ref().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0], (center, bone));
+        assert_eq!(writes[1], (east, updated_fence));
+    }
+
+    #[test]
+    fn pane_wall_and_waterlogged_connections_preserve_unrelated_properties() {
+        use crate::generation_context::FC;
+        use crate::generation_math::Xor;
+        use crate::structure_transform::{Mirror, Rotation};
+        let reg = crate::block_registry::breg().unwrap();
+        let bone = reg.state_of("minecraft:bone_block", None);
+        let air = reg.state_of("minecraft:air", None);
+        let pane = reg.state_of("minecraft:glass_pane", None);
+        let bars = reg.with_prop(reg.state_of("minecraft:iron_bars", None), "waterlogged", "true");
+        let wall = reg.state_of("minecraft:cobblestone_wall", None);
+        let stair = reg.state_of("minecraft:oak_stairs", None);
+        let p = (8, 72, 8);
+        let north = (8, 72, 7);
+        let south = (8, 72, 9);
+        let west = (7, 72, 8);
+        let east = (9, 72, 8);
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: bone, nbt: None }]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_writes = Some(Vec::new());
+        for (at, st) in [
+            (p, air), (north, wall), (south, stair), (west, bars),
+            (east, pane), ((8, 71, 8), air), ((8, 73, 8), air),
+            ((8, 73, 7), air), ((8, 72, 10), air),
+        ] {
+            ctx.test_base_cell(at, st);
+        }
+        let mut rng = Xor::seed_worldgen(0);
+        assert!(template.place_solid_blocks(
+            &mut ctx,
+            &mut rng,
+            Placement {
+                origin: p, pivot: (0, 0, 0),
+                mirror: Mirror::None, rotation: Rotation::None,
+            },
+            &[], [8, 72, 8, 8, 72, 8],
+        ).unwrap());
+        assert_eq!(reg.get_prop(ctx.get(north.0, north.1, north.2), "south").as_deref(), Some("low"));
+        assert_eq!(reg.get_prop(ctx.get(north.0, north.1, north.2), "up").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(ctx.get(east.0, east.1, east.2), "west").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(ctx.get(west.0, west.1, west.2), "east").as_deref(), Some("true"));
+        assert_eq!(
+            reg.get_prop(ctx.get(west.0, west.1, west.2), "waterlogged").as_deref(),
+            Some("true"),
+            "shape updates must not lose the waterlogged state"
+        );
+        assert_eq!(ctx.get(south.0, south.1, south.2), stair,
+            "an ordinary cube cannot change the corner of a straight stair");
+        let writes = ctx.test_writes.as_ref().unwrap();
+        assert_eq!(writes.first(), Some(&(p, bone)));
+        assert_eq!(writes.len(), 4, "only the center and three connectors change");
+        // The existing fluid engine cannot execute waterlogged block-state
+        // water. Do not enqueue a phantom ordinary water block tick here.
+        assert_eq!(
+            ctx.g.generated_fluid_ticks(),
+            vec![(west, 0)],
+            "waterlogged bars reserve native water source via the proto queue"
+        );
+    }
+
+    #[test]
+    fn stairs_recompute_outer_inner_and_preserve_waterlogged_on_neighbor_changes() {
+        use std::collections::HashMap;
+        let reg = crate::block_registry::breg().unwrap();
+        let stair = reg.with_prop(
+            reg.state_of("minecraft:oak_stairs", None), "waterlogged", "true",
+        );
+        let west_stair = reg.with_prop(stair, "facing", "west");
+        let top_stair = reg.with_prop(west_stair, "half", "top");
+        let p = (0, 70, 0);
+        let air = reg.state_of("minecraft:air", None);
+        let eval = |neighbors: HashMap<(i32, i32, i32), u32>| {
+            reg.stair_after_neighbors(stair, p, |q| neighbors.get(&q).copied().unwrap_or(air))
+        };
+        let outer = eval(HashMap::from([((0, 70, -1), west_stair)]))
+            .expect("front turn");
+        assert_eq!(reg.get_prop(outer, "shape").as_deref(), Some("outer_left"));
+        assert_eq!(reg.get_prop(outer, "waterlogged").as_deref(), Some("true"));
+        let inner = eval(HashMap::from([((0, 70, 1), west_stair)]))
+            .expect("rear turn");
+        assert_eq!(reg.get_prop(inner, "shape").as_deref(), Some("inner_left"));
+        assert!(eval(HashMap::from([((0, 70, -1), top_stair)])).is_none(),
+            "different stair halves do not make a corner");
+        assert!(eval(HashMap::from([
+            ((0, 70, -1), west_stair), ((1, 70, 0), stair),
+        ])).is_none(), "aligned flank blocks the outer corner");
+        assert!(eval(HashMap::new()).is_none(), "already-straight state is stable");
     }
 
     #[test]

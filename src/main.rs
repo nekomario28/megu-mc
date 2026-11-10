@@ -6340,6 +6340,13 @@ fn scheduled_block_tick_inner() {
 // Generated source-fluid reservations share the proto handoff, but only their
 // supported fluid/shape/contact paths belong to this runtime owner.
 thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+// A fluid owner can write through set_block while it holds its queue mutex.
+// Its neighbor notifications must not re-acquire that mutex. Defer just the
+// waterlogged source positions and drain them after the owner releases it.
+thread_local! {
+    static WATERLOGGED_DEFER: std::cell::RefCell<Vec<BlockPos>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 static GENERATED_FLUID_OWNER: OnceLock<Mutex<GeneratedFluidOwner>> = OnceLock::new();
 
 struct GeneratedFluidOwner {
@@ -6504,6 +6511,12 @@ fn generated_fluid_tick_inner() {
     if let Err(error) = owner.tick(now, &eligible) {
         eprintln!("[fluid] deferred native spring tick: {error}");
     }
+    drop(owner);
+    // The collector's own writes can wake adjacent waterlogged sources.
+    // Schedule them for the next water tick *after* leaving the owner lock.
+    for p in WATERLOGGED_DEFER.with(|v| std::mem::take(&mut *v.borrow_mut())) {
+        schedule_waterlogged_source(p);
+    }
 }
 
 fn generated_fluid_changed(pos: BlockPos, old: u32, state: u32) -> bool {
@@ -6557,6 +6570,41 @@ fn fluid_from_block(st: u32) -> Option<flowing_fluid::Fluid> {
     }
 }
 
+/// SimpleWaterloggedBlock reports a WATER source without becoming LiquidBlock.
+fn waterlogged_source(st: u32) -> bool {
+    let Some(reg) = crate::block_registry::breg() else { return false };
+    reg.has_water(st)
+        && reg.get_prop(st, "waterlogged").as_deref() == Some("true")
+        && reg.fluid_name(st) == "minecraft:water"
+}
+
+fn schedule_waterlogged_source(p: BlockPos) {
+    if !waterlogged_source(block_at(p.0, p.1, p.2)) {
+        return;
+    }
+    let now = TICK_IDX.load(Ordering::Relaxed) as i64;
+    let owner = GENERATED_FLUID_OWNER.get_or_init(|| Mutex::new(GeneratedFluidOwner::new()));
+    owner.lock().unwrap().schedule(
+        p,
+        flowing_fluid::Fluid { kind: flowing_fluid::Kind::Water, level: 0 },
+        now,
+        false, // Native SimpleWaterloggedBlock books a water tick 5 GT later.
+    );
+}
+
+/// Schedule already-read waterlogged sources. Do not re-read the six neighbor
+/// cells: the shape-update visitor already does that for every block write.
+/// Fluid-owned writes defer until the owner lock is released.
+fn schedule_waterlogged_positions(positions: Vec<BlockPos>) {
+    if NATIVE_FLUID_WRITE.with(|v| v.get()) {
+        WATERLOGGED_DEFER.with(|v| v.borrow_mut().extend(positions));
+    } else {
+        for p in positions {
+            schedule_waterlogged_source(p);
+        }
+    }
+}
+
 struct FluidReader;
 impl flowing_fluid::Reader for FluidReader {
     type Error = String;
@@ -6567,6 +6615,12 @@ impl flowing_fluid::Reader for FluidReader {
         let st = block_at(pos.0, pos.1, pos.2);
         if let Some(f) = fluid_from_block(st) {
             return Ok(flowing_fluid::Cell::Fluid(f));
+        }
+        if waterlogged_source(st) {
+            return Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+                kind: flowing_fluid::Kind::Water,
+                level: 0,
+            }));
         }
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
         if reg.is_air(st) {
@@ -7604,10 +7658,94 @@ fn falling_tick() {
     }
 }
 
+/// Support loss is a neighbor update, not a periodic scan. Use the same
+/// compare-and-set that protects falling-block creation: repeated notifications
+/// and concurrent mutations may not duplicate drops. This covers only the
+/// known torch and lantern attachment families (other shapes are separate).
+fn note_fragile_supports(x: i32, y: i32, z: i32) {
+    let Some(reg) = crate::block_registry::breg() else { return };
+    let support = block_at(x, y, z);
+    for (dir, (dx, dy, dz)) in LEAF_NEIGHBORS.iter().copied().enumerate() {
+        let q = (x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz));
+        if q.1 < MIN_Y || q.1 >= MIN_Y + 384 {
+            continue;
+        }
+        let state = block_at(q.0, q.1, q.2);
+        if !reg.fragile_loses_support(state, (dir as u8) ^ 1, support) {
+            continue;
+        }
+        if set_block_if(q.0, q.1, q.2, 0, Some(state)) {
+            note_block_update(q.0, q.1, q.2, 0);
+            if let Some(item) = reg.block_drop(state) {
+                drops().lock().unwrap().push(Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: q.0 as f64 + 0.5,
+                    y: q.1 as f64 + 0.5,
+                    z: q.2 as f64 + 0.5,
+                    item,
+                    cnt: 1,
+                    comps: Vec::new(),
+                    age: 0,
+                });
+            }
+        }
+    }
+}
+
+/// Update immediate connected-block shapes through the existing world owner.
+/// Each actual state change re-enters `block_updated`, which already bounds
+/// recursion and drains deep update chains. Never hold a world lock across
+/// set_block_if, which itself sends block and packet updates.
+fn note_connected_shapes(x: i32, y: i32, z: i32) {
+    let Some(reg) = crate::block_registry::breg() else { return };
+    let changed = block_at(x, y, z);
+    let mut wet = Vec::new();
+    if waterlogged_source(changed) {
+        wet.push((x, y, z));
+    }
+    // Native immediate neighbor notifications: WEST, EAST, NORTH, SOUTH, DOWN, UP.
+    for (direction, (dx, dy, dz)) in [
+        (4u8, (-1, 0, 0)),
+        (5, (1, 0, 0)),
+        (2, (0, 0, -1)),
+        (3, (0, 0, 1)),
+        (0, (0, -1, 0)),
+        (1, (0, 1, 0)),
+    ] {
+        let q = (x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz));
+        if q.1 < MIN_Y || q.1 >= MIN_Y + 384 {
+            continue;
+        }
+        let old = block_at(q.0, q.1, q.2);
+        if waterlogged_source(old) {
+            wet.push(q);
+        }
+        let name = reg.name_of(old);
+        let above = if name.ends_with("_wall") {
+            block_at(q.0, q.1.wrapping_add(1), q.2)
+        } else {
+            0
+        };
+        let updated = reg.connection_after_neighbor(old, changed, above, direction ^ 1)
+            .or_else(|| {
+                if direction <= 1 || !name.ends_with("_stairs") { return None; }
+                reg.stair_after_neighbors(old, q, |p| block_at(p.0, p.1, p.2))
+            });
+        if let Some(new_state) = updated {
+            // Avoid stale read/modified/written races: another update may have
+            // touched this neighbor after `old` was read.
+            set_block_if(q.0, q.1, q.2, new_state, Some(old));
+        }
+    }
+    schedule_waterlogged_positions(wet);
+}
+
 fn block_updated_inner(x: i32, y: i32, z: i32) {
     // A block losing its support falls. Checked here rather than by scanning, because this is
     // called exactly when something under it changed.
     note_falling(x, y, z);
+    note_fragile_supports(x, y, z);
+    note_connected_shapes(x, y, z);
     // piston eval: changed cell + its 6 neighbors
     for (dx, dy, dz) in [
         (0, 0, 0),

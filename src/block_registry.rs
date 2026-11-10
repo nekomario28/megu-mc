@@ -703,6 +703,320 @@ impl BReg {
             .map(|f| f & (1 << dir) != 0)
             .unwrap_or(false)
     }
+    /// Bounded shape update when an exposed template face supplies a newly
+    /// placed ordinary full cube to an existing horizontal fence. The direction
+    /// points FROM the fence TOWARDS the new neighbour, using the native
+    /// DOWN/UP/NORTH/SOUTH/WEST/EAST indices.
+    ///
+    /// This is deliberately not a general BlockState.updateShape implementation.
+    /// Fences also connect to eligible gates/fences and some non-full faces,
+    /// and other block families have different rules. The solid-template path
+    /// only adds full-cube neighbours, so it can prove this positive transition
+    /// without fabricating negative/replacement transitions or runtime behavior.
+    pub(crate) fn fence_after_full_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        toward_neighbor: u8,
+    ) -> Option<u32> {
+        if !self.name_of(state).ends_with("_fence") {
+            return None;
+        }
+        let key = match toward_neighbor {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        // A fully colliding cube is not necessarily a valid fence support:
+        // non-occluding blocks and vanilla's connection exceptions are excluded.
+        if self.is_template_solid(neighbor) != Some(true)
+            || !self.is_collision_shape_full_block(neighbor)
+            || !self.is_solid_render(neighbor)
+            || matches!(
+                self.name_of(neighbor),
+                "minecraft:barrier"
+                    | "minecraft:carved_pumpkin"
+                    | "minecraft:jack_o_lantern"
+                    | "minecraft:melon"
+                    | "minecraft:pumpkin"
+            )
+        {
+            return None;
+        }
+        (self.get_prop(state, key).as_deref() == Some("false"))
+            .then(|| self.with_prop(state, key, "true"))
+    }
+
+    /// The solid-template placer admits only ordinary full cube outputs.
+    /// Adjacent panes connect to that face (including iron bars, whose name
+    /// does not end in "_pane"). Other, non-full neighbors need their own
+    /// native updateShape contract.
+    pub(crate) fn pane_after_full_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        toward_neighbor: u8,
+    ) -> Option<u32> {
+        let name = self.name_of(state);
+        if !name.ends_with("_pane") && name != "minecraft:iron_bars" {
+            return None;
+        }
+        let key = match toward_neighbor {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        if self.is_template_solid(neighbor) != Some(true)
+            || !self.is_collision_shape_full_block(neighbor)
+            || !self.is_solid_render(neighbor)
+        {
+            return None;
+        }
+        (self.get_prop(state, key).as_deref() == Some("false"))
+            .then(|| self.with_prop(state, key, "true"))
+    }
+
+    /// Recompute LOW/NONE wall sides for horizontal changes that are ordinary
+    /// opaque full cubes, other walls, or air. With air above, a straight
+    /// opposite two-sided wall suppresses its central post; corners, endpoints
+    /// and T junctions retain it. Native TALL/covered walls need shape coverage
+    /// checks and are intentionally not rewritten by this bounded rule.
+    pub(crate) fn wall_after_full_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        above: u32,
+        toward_neighbor: u8,
+    ) -> Option<u32> {
+        if !self.name_of(state).ends_with("_wall") || !self.is_air(above) {
+            return None;
+        }
+        let key = match toward_neighbor {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        let other_name = self.name_of(neighbor);
+        let cube = self.is_template_solid(neighbor) == Some(true)
+            && self.is_collision_shape_full_block(neighbor)
+            && self.is_solid_render(neighbor);
+        let wanted = if cube || other_name.ends_with("_wall") {
+            "low"
+        } else if self.is_air(neighbor) {
+            "none"
+        } else {
+            return None;
+        };
+        if ["north", "south", "west", "east"]
+            .iter()
+            .any(|side| self.get_prop(state, side).as_deref() == Some("tall"))
+        {
+            return None;
+        }
+        let next = self.with_prop(state, key, wanted);
+        let north = self.get_prop(next, "north").as_deref() == Some("low");
+        let south = self.get_prop(next, "south").as_deref() == Some("low");
+        let east = self.get_prop(next, "east").as_deref() == Some("low");
+        let west = self.get_prop(next, "west").as_deref() == Some("low");
+        let straight = (north && south && !east && !west)
+            || (east && west && !north && !south);
+        let result = self.with_prop(next, "up", if straight { "false" } else { "true" });
+        (result != state).then_some(result)
+    }
+
+    /// Bounded runtime counterpart for immediate air removal / full-cube
+    /// replacement. This can disconnect a previously connected side. For
+    /// non-full neighbors, other connection types (gates, fences, walls and
+    /// panes) require independent native classification and are not guessed.
+    pub(crate) fn connection_after_neighbor(
+        &self,
+        state: u32,
+        neighbor: u32,
+        above: u32,
+        direction: u8,
+    ) -> Option<u32> {
+        if let Some(connected) = self.fence_after_full_neighbor(state, neighbor, direction) {
+            return Some(connected);
+        }
+        if let Some(connected) = self.pane_after_full_neighbor(state, neighbor, direction) {
+            return Some(connected);
+        }
+        if let Some(connected) = self.wall_after_full_neighbor(state, neighbor, above, direction) {
+            return Some(connected);
+        }
+        let key = match direction {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            5 => "east",
+            _ => return None,
+        };
+        let name = self.name_of(state);
+        let other = self.name_of(neighbor);
+        let fence = name.ends_with("_fence");
+        let other_fence = other.ends_with("_fence");
+        let fence_connect = fence && other_fence
+            && ((name == "minecraft:nether_brick_fence")
+                == (other == "minecraft:nether_brick_fence"));
+        let pane = name.ends_with("_pane") || name == "minecraft:iron_bars";
+        let other_pane = other.ends_with("_pane") || other == "minecraft:iron_bars";
+        if fence_connect || (pane && other_pane) {
+            return (self.get_prop(state, key).as_deref() != Some("true"))
+                .then(|| self.with_prop(state, key, "true"));
+        }
+        if self.is_air(neighbor) && (fence || pane) {
+            return (self.get_prop(state, key).as_deref() == Some("true"))
+                .then(|| self.with_prop(state, key, "false"));
+        }
+        // The isolated post remains raised in this case. Do not silently
+        // overwrite tall/multi-sided wall shape geometry with a guessed post.
+        if name.ends_with("_wall")
+            && self.is_air(above)
+            && self.get_prop(state, "up").as_deref() == Some("true")
+            && self.get_prop(state, key).as_deref() == Some("low")
+            && ["north", "south", "west", "east"].iter().all(|other| {
+                *other == key || self.get_prop(state, other).as_deref() == Some("none")
+            })
+        {
+            return Some(self.with_prop(state, key, "none"));
+        }
+        None
+    }
+
+    /// Stair shape selection is a function of surrounding STAIR orientations,
+    /// not whether the changed neighbor is a solid cube. After template writes,
+    /// the caller supplies a write-through world view. The result is the state
+    /// change only; waterlogged, half and facing properties are preserved.
+    pub(crate) fn stair_after_neighbors(
+        &self,
+        state: u32,
+        pos: (i32, i32, i32),
+        mut get: impl FnMut((i32, i32, i32)) -> u32,
+    ) -> Option<u32> {
+        if !self.name_of(state).ends_with("_stairs") {
+            return None;
+        }
+        let facing = self.get_prop(state, "facing")?;
+        let half = self.get_prop(state, "half")?;
+        let offset = |direction: &str| -> Option<(i32, i32, i32)> {
+            Some(match direction {
+                "north" => (0, 0, -1),
+                "south" => (0, 0, 1),
+                "west" => (-1, 0, 0),
+                "east" => (1, 0, 0),
+                _ => return None,
+            })
+        };
+        let at = |(dx, dy, dz): (i32, i32, i32)| {
+            (pos.0.wrapping_add(dx), pos.1.wrapping_add(dy), pos.2.wrapping_add(dz))
+        };
+        let (dx, _, dz) = offset(&facing)?;
+        let front = get(at((dx, 0, dz)));
+        let stair_face = |other: u32| -> Option<String> {
+            (self.name_of(other).ends_with("_stairs")
+                && self.get_prop(other, "half").as_deref() == Some(half.as_str()))
+                .then(|| self.get_prop(other, "facing"))
+                .flatten()
+        };
+        let perpendicular = |direction: &str| match facing.as_str() {
+            "north" | "south" => matches!(direction, "east" | "west"),
+            "east" | "west" => matches!(direction, "north" | "south"),
+            _ => false,
+        };
+        let ccw = match facing.as_str() {
+            "north" => "west",
+            "south" => "east",
+            "west" => "south",
+            "east" => "north",
+            _ => return None,
+        };
+        // Vanilla's canTakeShape checks the flank opposite the front stair's
+        // turn, or the same direction as the back stair's turn. Without that
+        // check a third aligned stair becomes an incorrect inside corner.
+        let can_take = |side: &str, get: &mut dyn FnMut((i32, i32, i32)) -> u32| -> bool {
+            let Some(o) = offset(side) else { return false };
+            let s = get(at(o));
+            !self.name_of(s).ends_with("_stairs")
+                || self.get_prop(s, "half").as_deref() != Some(half.as_str())
+                || self.get_prop(s, "facing").as_deref() != Some(facing.as_str())
+        };
+        let mut shape = "straight";
+        if let Some(dir) = stair_face(front) {
+            if perpendicular(&dir) {
+                let opposite = match dir.as_str() {
+                    "north" => "south",
+                    "south" => "north",
+                    "west" => "east",
+                    "east" => "west",
+                    _ => return None,
+                };
+                if can_take(opposite, &mut get) {
+                    shape = if dir == ccw { "outer_left" } else { "outer_right" };
+                }
+            }
+        }
+        if shape == "straight" {
+            // Native only reads the rear stair if the front did not already
+            // establish an outer corner; keep scripted-world reads bounded.
+            let back = get(at((-dx, 0, -dz)));
+            if let Some(dir) = stair_face(back) {
+                if perpendicular(&dir) && can_take(&dir, &mut get) {
+                    shape = if dir == ccw { "inner_left" } else { "inner_right" };
+                }
+            }
+        }
+        (self.get_prop(state, "shape").as_deref() != Some(shape))
+            .then(|| self.with_prop(state, "shape", shape))
+    }
+
+    /// A known fragile support block is removed if its direct attachment
+    /// becomes air or liquid. The direction points FROM the fragile block
+    /// TOWARDS its old support, in the six native direction indices.
+    ///
+    /// This handles known torch/lantern families only. Rails, buttons, plates,
+    /// plants and conditional face-sturdiness are separate shape contracts.
+    pub(crate) fn fragile_loses_support(
+        &self,
+        state: u32,
+        toward_support: u8,
+        new_support: u32,
+    ) -> bool {
+        if !self.is_air(new_support) && !self.is_liquid(new_support) {
+            return false;
+        }
+        let name = self.name_of(state);
+        match name {
+            "minecraft:torch" | "minecraft:soul_torch" | "minecraft:redstone_torch" => {
+                toward_support == 0
+            }
+            "minecraft:wall_torch"
+            | "minecraft:soul_wall_torch"
+            | "minecraft:redstone_wall_torch" => {
+                let face = self.get_prop(state, "facing");
+                let behind = match face.as_deref() {
+                    Some("north") => 3,
+                    Some("south") => 2,
+                    Some("west") => 5,
+                    Some("east") => 4,
+                    _ => return false,
+                };
+                toward_support == behind
+            }
+            "minecraft:lantern" | "minecraft:soul_lantern" => {
+                let hanging = self.get_prop(state, "hanging");
+                toward_support
+                    == if hanging.as_deref() == Some("true") { 1 } else { 0 }
+            }
+            _ => false,
+        }
+    }
+
     /// set a property by name on a resolved state; missing -> unchanged
     pub(crate) fn with_prop(&self, st: u32, prop: &str, val: &str) -> u32 {
         let bi = match self.st_blk.get(st as usize) {

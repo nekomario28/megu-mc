@@ -358,6 +358,208 @@ impl std::ops::Drop for WorldSnapshot {
 }
 
 #[test]
+fn fragile_support_loss_drops_torches_and_lanterns_exactly_once() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+    let wall_torch = reg.with_prop(
+        reg.state_of("minecraft:wall_torch", None), "facing", "north",
+    );
+    let lantern = reg.with_prop(
+        reg.state_of("minecraft:lantern", None), "hanging", "true",
+    );
+    let cases = [
+        ((3, 230, 3), (3, 229, 3), reg.state_of("minecraft:torch", None)),
+        ((7, 230, 3), (7, 230, 4), wall_torch),
+        ((11, 230, 3), (11, 231, 3), lantern),
+    ];
+    for (block, support, state) in cases {
+        assert!(reg.block_drop(state).is_some(),
+            "supported fragile family must have a known drop");
+        set_block(support.0, support.1, support.2, stone);
+        set_block(block.0, block.1, block.2, state);
+        assert_eq!(block_at(block.0, block.1, block.2), state);
+        // Removing an unrelated side does not break an attached block.
+        let unrelated = (block.0 + 1, block.1, block.2);
+        set_block(unrelated.0, unrelated.1, unrelated.2, air);
+        assert_eq!(block_at(block.0, block.1, block.2), state);
+        let before = drops().lock().unwrap().len();
+        set_block(support.0, support.1, support.2, air);
+        assert_eq!(block_at(block.0, block.1, block.2), air,
+            "support loss must clear the fragile block");
+        assert_eq!(drops().lock().unwrap().len(), before + 1,
+            "exactly one drop from the detached block");
+        let last_item = drops().lock().unwrap().last().unwrap().item;
+        assert_eq!(last_item, reg.block_drop(state).unwrap());
+        set_block(support.0, support.1, support.2, air);
+        assert_eq!(drops().lock().unwrap().len(), before + 1,
+            "repeated notifications must not duplicate drops");
+    }
+}
+
+#[test]
+fn fragile_direction_matching_is_not_just_any_air_neighbor() {
+    let reg = crate::block_registry::breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let floor = reg.state_of("minecraft:torch", None);
+    let wall = reg.with_prop(reg.state_of("minecraft:wall_torch", None), "facing", "north");
+    let hanging = reg.with_prop(reg.state_of("minecraft:lantern", None), "hanging", "true");
+    assert!(reg.fragile_loses_support(floor, 0, air));
+    assert!(!reg.fragile_loses_support(floor, 1, air));
+    assert!(!reg.fragile_loses_support(floor, 0, stone));
+    assert!(reg.fragile_loses_support(wall, 3, air));
+    assert!(!reg.fragile_loses_support(wall, 2, air));
+    assert!(reg.fragile_loses_support(hanging, 1, air));
+    assert!(!reg.fragile_loses_support(hanging, 0, air));
+    assert!(!reg.fragile_loses_support(stone, 0, air));
+}
+
+#[test]
+fn multiway_wall_post_and_compatible_fence_pane_connections() {
+    let reg = crate::block_registry::breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let waterlogged = reg.with_prop(
+        reg.state_of("minecraft:cobblestone_wall", None), "waterlogged", "true",
+    );
+    let north = reg.wall_after_full_neighbor(waterlogged, stone, air, 2).unwrap();
+    assert_eq!(reg.get_prop(north, "north").as_deref(), Some("low"));
+    assert_eq!(reg.get_prop(north, "up").as_deref(), Some("true"));
+    let straight = reg.wall_after_full_neighbor(north, stone, air, 3).unwrap();
+    assert_eq!(reg.get_prop(straight, "south").as_deref(), Some("low"));
+    assert_eq!(reg.get_prop(straight, "up").as_deref(), Some("false"));
+    let tee = reg.wall_after_full_neighbor(straight, stone, air, 5).unwrap();
+    assert_eq!(reg.get_prop(tee, "east").as_deref(), Some("low"));
+    assert_eq!(reg.get_prop(tee, "up").as_deref(), Some("true"));
+    let straight_again = reg.wall_after_full_neighbor(tee, air, air, 5).unwrap();
+    assert_eq!(straight_again, straight, "T junction disconnect restores straight wall");
+    assert_eq!(reg.get_prop(straight_again, "waterlogged").as_deref(), Some("true"));
+    assert_eq!(
+        reg.wall_after_full_neighbor(straight_again, air, air, 3).unwrap(),
+        north,
+        "single-arm wall must keep its post"
+    );
+
+    let fence = reg.state_of("minecraft:oak_fence", None);
+    let spruce = reg.state_of("minecraft:spruce_fence", None);
+    let nether = reg.state_of("minecraft:nether_brick_fence", None);
+    let joined = reg.connection_after_neighbor(fence, spruce, air, 5).unwrap();
+    assert_eq!(reg.get_prop(joined, "east").as_deref(), Some("true"));
+    assert!(reg.connection_after_neighbor(fence, nether, air, 5).is_none());
+    assert_eq!(
+        reg.connection_after_neighbor(joined, air, air, 5).unwrap(),
+        fence,
+        "wood fence disconnect"
+    );
+    let pane = reg.state_of("minecraft:glass_pane", None);
+    let bars = reg.state_of("minecraft:iron_bars", None);
+    let joined = reg.connection_after_neighbor(pane, bars, air, 4).unwrap();
+    assert_eq!(reg.get_prop(joined, "west").as_deref(), Some("true"));
+    assert_eq!(
+        reg.connection_after_neighbor(joined, air, air, 4).unwrap(),
+        pane,
+        "glass pane disconnect"
+    );
+}
+
+#[test]
+fn runtime_connected_shapes_connect_and_disconnect_with_waterlogged_retained() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+    set_test_region(HashSet::from([(0, 0)]), HashSet::from([(0, 0)]));
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+    let fence = reg.state_of("minecraft:oak_fence", None);
+    let pane = reg.with_prop(
+        reg.state_of("minecraft:glass_pane", None), "waterlogged", "true",
+    );
+    let wall = reg.state_of("minecraft:cobblestone_wall", None);
+    let p = (6, 220, 6);
+    let east = (7, 220, 6);
+    let west = (5, 220, 6);
+    let north = (6, 220, 5);
+    for (pos, state) in [(p, air), (east, fence), (west, pane),
+        (north, wall), ((6, 221, 5), air)] {
+        set_block(pos.0, pos.1, pos.2, state);
+    }
+    set_block(p.0, p.1, p.2, stone);
+    assert_eq!(reg.get_prop(block_at(east.0, east.1, east.2), "west").as_deref(), Some("true"));
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "east").as_deref(), Some("true"));
+    assert_eq!(reg.get_prop(block_at(north.0, north.1, north.2), "south").as_deref(), Some("low"));
+    set_block(p.0, p.1, p.2, air);
+    assert_eq!(reg.get_prop(block_at(east.0, east.1, east.2), "west").as_deref(), Some("false"));
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "east").as_deref(), Some("false"));
+    assert_eq!(reg.get_prop(block_at(north.0, north.1, north.2), "south").as_deref(), Some("none"));
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "waterlogged").as_deref(), Some("true"));
+    // Re-applying the same state does not start an endless shape cascade.
+    set_block(p.0, p.1, p.2, air);
+    assert_eq!(reg.get_prop(block_at(west.0, west.1, west.2), "east").as_deref(), Some("false"));
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+}
+
+#[test]
+fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+    let pane = reg.with_prop(
+        reg.state_of("minecraft:glass_pane", None), "waterlogged", "true",
+    );
+    let p = (6, 211, 6);
+    let east = (7, 211, 6);
+    assert!(waterlogged_source(pane));
+    assert_eq!(reg.fluid_name(pane), "minecraft:water");
+    {
+        // Explicit closed chamber, so FluidReader never silently consults
+        // unspecified generated terrain as a fixture input.
+        let mut world = world().lock().unwrap();
+        let chunk = world.entry((0, 0)).or_default();
+        for y in 210..=212 {
+            for z in 2..=10 {
+                for x in 2..=10 {
+                    chunk.insert(local_idx(x, y, z), stone);
+                }
+            }
+        }
+        chunk.insert(local_idx(p.0, p.1, p.2), pane);
+        chunk.insert(local_idx(east.0, east.1, east.2), air);
+    }
+    assert_eq!(
+        flowing_fluid::Reader::cell(&mut FluidReader, p).unwrap(),
+        flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+            kind: flowing_fluid::Kind::Water, level: 0,
+        })
+    );
+    let mut owner = GeneratedFluidOwner::new();
+    owner.schedule(
+        p, flowing_fluid::Fluid { kind: flowing_fluid::Kind::Water, level: 0 },
+        100, false,
+    );
+    let eligible = HashSet::from([(0, 0)]);
+    owner.tick(104, &eligible).unwrap();
+    assert_eq!(block_at(east.0, east.1, east.2), air,
+        "waterlogged water must not flow before the 5-GT deadline");
+    owner.tick(105, &eligible).unwrap();
+    assert_eq!(block_at(p.0, p.1, p.2), pane,
+        "the fluid source must not destroy its waterlogged block");
+    assert_eq!(block_at(east.0, east.1, east.2), 81,
+        "the 5-GT source tick must spread to the only open side");
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+}
+
+#[test]
 fn scheduled_leaf_distance_matches_native_vectors() {
     let reg = crate::block_registry::breg().unwrap();
     let make = |kind: &str| -> u32 {

@@ -2145,23 +2145,8 @@ fn schedule_leaf_edges(ctx: &mut FC, shape: &LeafShape) {
     for (_, p, q) in crate::voxel_faces::exposed_faces(shape.positions()) {
         let ps = ctx.get(p.0, p.1, p.2);
         let qs = ctx.get(q.0, q.1, q.2);
-        for (cell, st, neighbor) in [(p, ps, qs), (q, qs, ps)] {
-            let name = reg.name_of(st);
-            if !name.ends_with("_leaves") {
-                continue;
-            }
-            let Some(distance) = reg
-                .get_prop(st, "distance")
-                .and_then(|v| v.parse::<u8>().ok())
-            else {
-                continue;
-            };
-            let next = reg.distance_from_log(neighbor).unwrap_or(7) + 1;
-            if next != 1 || distance != 1 {
-                ctx.g
-                    .schedule_generated_leaf(cell, reg.state_of(name, None));
-            }
-        }
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, ps, qs);
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, qs, ps);
     }
 }
 
