@@ -1542,47 +1542,34 @@ impl Gen {
                     self.dfs.push(DF::C(0.0));
                     self.dfs.len() - 1
                 };
-                DF::Noise {
-                    ni: self.noise_id(j.get("noise")?.str())?,
-                    sx: j
-                        .get("shift_x")
-                        .and_then(|v| self.node(v, files))
-                        .unwrap_or(zero),
-                    sy: j
-                        .get("shift_y")
-                        .and_then(|v| self.node(v, files))
-                        .unwrap_or(zero),
-                    sz: j
-                        .get("shift_z")
-                        .and_then(|v| self.node(v, files))
-                        .unwrap_or(zero),
-                    xzs: n("xz_scale"),
-                    ys: n("y_scale"),
-                }
-            }
-            // 1.21.1's `shifted_noise` carries the shifts inline; the newer dialect
-            // splits them into `shift_a`/`shift_b` and composes them in `noise`. Same
-            // construction, so it maps onto the same variant.
-            "shifted_noise" => {
-                let zero = {
-                    self.dfs.push(DF::C(0.0));
-                    self.dfs.len() - 1
+                // For this dialect, omitted shifts mean zero, but a present
+                // unparseable shift is not equivalent to an omitted one.
+                let shift = |g: &mut Gen, k: &str| -> Option<usize> {
+                    match j.get(k) {
+                        Some(value) => g.node(value, files),
+                        None => Some(zero),
+                    }
                 };
                 DF::Noise {
                     ni: self.noise_id(j.get("noise")?.str())?,
-                    sx: j
-                        .get("shift_x")
-                        .and_then(|v| self.node(v, files))
-                        .unwrap_or(zero),
-                    sy: zero,
-                    sz: j
-                        .get("shift_z")
-                        .and_then(|v| self.node(v, files))
-                        .unwrap_or(zero),
+                    sx: shift(self, "shift_x")?,
+                    sy: shift(self, "shift_y")?,
+                    sz: shift(self, "shift_z")?,
                     xzs: n("xz_scale"),
                     ys: n("y_scale"),
                 }
             }
+            // Native 1.21.1 shifted_noise specifies all three density shifts.
+            // Reading shift_y as constant zero was only correct by coincidence
+            // for the currently pinned vanilla data (whose shift_y is zero).
+            "shifted_noise" => DF::Noise {
+                ni: self.noise_id(j.get("noise")?.str())?,
+                sx: self.node(j.get("shift_x")?, files)?,
+                sy: self.node(j.get("shift_y")?, files)?,
+                sz: self.node(j.get("shift_z")?, files)?,
+                xzs: n("xz_scale"),
+                ys: n("y_scale"),
+            },
             // 1.21.1 names it in `argument`, the newer dialect in `noise`; either way it
             // is a *noise* name (`minecraft:offset`), not a density-function reference.
             "shift_a" | "shift_x" => {
@@ -1662,8 +1649,11 @@ impl Gen {
                 cell_h: n("cell_height") as i32,
             },
             _ => {
-                Self::load_trace(&format!("unknown density function type {ty:?} -> zero"));
-                DF::Zero
+                // An unrecognized required density function is not a constant zero.
+                // Returning None propagates through node/resolve_ref into the
+                // noise-router loader instead of silently changing the terrain.
+                Self::load_trace(&format!("unsupported density function type {ty:?}"));
+                return None;
             }
         });
         trace(&ty, out.is_some());
@@ -5270,6 +5260,68 @@ mod wg_tests {
                 checked += 1;
             }
             assert_eq!(checked, 80);
+        }
+    }
+
+    #[test]
+    fn unsupported_density_types_fail_closed_at_every_reference_boundary() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned datapack");
+        let empty = HashMap::new();
+
+        // Unknown nodes must never masquerade as a legitimate zero function.
+        let unknown = jparse(br#"{"type":"minecraft:unsupported_density"}"#).unwrap();
+        assert!(g.node(&unknown, &empty).is_none());
+
+        // A required child inside a valid operator must propagate the failure.
+        let nested = jparse(
+            br#"{"type":"minecraft:add","argument1":1,"argument2":{"type":"minecraft:unsupported_density"}}"#,
+        )
+        .unwrap();
+        assert!(g.node(&nested, &empty).is_none());
+
+        // A failing named definition must not leave the recursion placeholder
+        // cached as a valid reference on subsequent loads.
+        let mut files = HashMap::new();
+        files.insert(
+            "minecraft:broken".to_string(),
+            br#"{"type":"minecraft:unsupported_density"}"#.to_vec(),
+        );
+        for _ in 0..2 {
+            assert!(g.resolve_ref(&files, "minecraft:broken").is_none());
+            assert!(!g.names.contains_key("minecraft:broken"));
+        }
+
+        // An intentional numeric zero remains valid and must still evaluate.
+        let valid = jparse(br#"{"type":"minecraft:add","argument1":2,"argument2":0}"#).unwrap();
+        let id = g.node(&valid, &empty).expect("known density operators");
+        assert_eq!(g.eval(id, 0, 0, 0, &mut HashMap::new()), 2.0);
+    }
+
+    #[test]
+    fn shifted_noise_preserves_y_and_rejects_invalid_required_shifts() {
+        let mut g = Gen::load(0, crate::name_to_state).expect("pinned datapack");
+        let empty = HashMap::new();
+        let good = jparse(
+            br#"{"type":"minecraft:shifted_noise","noise":"minecraft:temperature","shift_x":0,"shift_y":3,"shift_z":0,"xz_scale":1,"y_scale":1}"#,
+        )
+        .unwrap();
+        let id = g.node(&good, &empty).expect("valid shifted noise");
+        let DF::Noise { sy, .. } = &g.dfs[id] else {
+            panic!("shifted_noise did not use the noise evaluator");
+        };
+        match &g.dfs[*sy] {
+            DF::C(y) => assert_eq!(*y, 3.0, "nonzero shift_y must not be dropped"),
+            _ => panic!("expected literal y shift"),
+        }
+
+        // The native codec requires all three shifts. Missing or unparseable
+        // children must not be silently replaced by a zero density.
+        for invalid in [
+            r#"{"type":"minecraft:shifted_noise","noise":"minecraft:temperature","shift_x":0,"shift_z":0,"xz_scale":1,"y_scale":1}"#,
+            r#"{"type":"minecraft:shifted_noise","noise":"minecraft:temperature","shift_x":0,"shift_y":{"type":"minecraft:unsupported_density"},"shift_z":0,"xz_scale":1,"y_scale":1}"#,
+            r#"{"type":"minecraft:noise","noise":"minecraft:temperature","shift_x":{"type":"minecraft:unsupported_density"},"xz_scale":1,"y_scale":1}"#,
+        ] {
+            assert!(g.node(&jparse(invalid.as_bytes()).unwrap(), &empty).is_none(), "{invalid}");
         }
     }
 
