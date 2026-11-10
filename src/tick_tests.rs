@@ -4207,3 +4207,313 @@ fn chunk_delivery_digest() {
     );
     println!("PREFETCH-DIFF\t{}", changed.len());
 }
+
+
+/// Paired with the authenticated native 1.21.1 canSurvive matrix, not an
+/// independently guessed all-block survival model. It is compiled only with
+/// native-oracle enabled; CI must pass a real matrix, not a placeholder.
+#[cfg(feature = "native-oracle")]
+#[test]
+fn native_survival_fragile_port_pair() {
+    const SCENES: [(&str, u8); 12] = [
+        ("empty", 0),
+        ("floor_stone", 1),
+        ("ceiling_stone", 2),
+        ("north_stone", 4),
+        ("south_stone", 8),
+        ("west_stone", 16),
+        ("east_stone", 32),
+        ("all_stone", 63),
+        ("all_except_floor", 62),
+        ("all_except_north", 59),
+        ("floor_water", 0),
+        ("floor_lava", 0),
+    ];
+    let path = std::env::var("MC_NATIVE_SURVIVAL_MATRIX")
+        .expect("native fixture path required; not a synthetic fallback");
+    let matrix = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("native matrix {path}: {e}"));
+    let reg = crate::block_registry::breg().expect("load pinned block registry");
+    assert_eq!(reg.state_count(), 26_684);
+
+    let mut rows = 0_usize;
+    let mut compared = 0_usize;
+    let mut families = std::collections::HashSet::new();
+    let mut disagreements = Vec::new();
+    let air = reg.state_of("minecraft:air", None);
+    for (index, line) in matrix.lines().enumerate() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 5, "malformed native row {index}");
+        let sid = (index / SCENES.len()) as u32;
+        assert_eq!(fields[0], sid.to_string(), "native row state order {index}");
+        assert_eq!(fields[1], SCENES[index % SCENES.len()].0,
+                   "native scene order {index}");
+        assert!(matches!(fields[2], "T" | "F"),
+                "unavailable native truth in row {index}: {}", fields[2]);
+        // Compare full property identity too: native state ids alone can
+        // accidentally refer to different variants if property order changes.
+        let mut properties = reg.properties_of(sid).expect("pinned state properties");
+        properties.sort();
+        let native_id = if properties.is_empty() {
+            reg.name_of(sid).to_string()
+        } else {
+            format!("{}[{}]", reg.name_of(sid), properties.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>().join(","))
+        };
+        assert_eq!(fields[3], native_id, "native/Rust state identity for {sid}");
+        rows += 1;
+
+        let name = reg.name_of(sid);
+        // Only these families have an implemented Rust negative-support rule.
+        // Non-fragile families are intentionally not declared correct by default.
+        let facing = match name {
+            "minecraft:torch" | "minecraft:soul_torch"
+            | "minecraft:redstone_torch" => Some(0_u8),
+            "minecraft:lantern" | "minecraft:soul_lantern" =>
+                Some(if reg.get_prop(sid, "hanging").as_deref() == Some("true")
+                     { 1 } else { 0 }),
+            "minecraft:wall_torch" | "minecraft:soul_wall_torch"
+            | "minecraft:redstone_wall_torch" => {
+                match reg.get_prop(sid, "facing").as_deref() {
+                    Some("north") => Some(3),
+                    Some("south") => Some(2),
+                    Some("west") => Some(5),
+                    Some("east") => Some(4),
+                    other => panic!("invalid native-facing torch {sid}: {other:?}"),
+                }
+            }
+            _ => None,
+        };
+        if let Some(toward) = facing {
+            assert!(reg.fragile_loses_support(sid, toward, air),
+                    "missing Rust support rule for {native_id}");
+            let bit = 1_u8 << toward;
+            let predicted = (SCENES[index % SCENES.len()].1 & bit) != 0;
+            let observed = fields[2] == "T";
+            if predicted != observed && disagreements.len() < 30 {
+                disagreements.push(format!(
+                    "{sid} {native_id} {}: native={} rust={}",
+                    fields[1], observed, predicted));
+            }
+            families.insert(name.to_string());
+            compared += 1;
+        }
+    }
+    assert_eq!(rows, 26_684 * SCENES.len(), "not the full native matrix");
+    assert_eq!(families.len(), 8, "fragile family coverage regressed");
+    assert!(compared >= 150, "too few paired fragile-family observations: {compared}");
+    assert!(disagreements.is_empty(),
+            "native/Rust fragile support divergences: {}", disagreements.join("; "));
+    println!("PAIRED_NATIVE_FRAGILE_SUPPORT states={rows} compared={compared} family_count={}",
+             families.len());
+}
+
+
+/// Native BlockState.updateShape, one callback per scene, versus the Rust port.
+/// Requires an actual JAR-produced 25-case TSV with the original/neighbor/result
+/// states and the direction; normal tests never synthesize a passing baseline.
+#[cfg(feature = "native-oracle")]
+#[test]
+fn native_neighbor_shape_port_pair() {
+    fn parse(reg: &crate::block_registry::BReg, text: &str) -> u32 {
+        let (name, properties) = match text.split_once('[') {
+            Some((n, ps)) => (n, Some(ps.strip_suffix(']').expect("closing state ]"))),
+            None => (text, None),
+        };
+        let pairs: Vec<(String, String)> = properties
+            .map(|ps| {
+                ps.split(',').map(|pair| {
+                    let (key, value) = pair.split_once('=').expect("name=value");
+                    (key.to_string(), value.to_string())
+                }).collect()
+            }).unwrap_or_default();
+        let id = reg.checked_state(name, &pairs)
+            .unwrap_or_else(|| panic!("Rust registry lacks native state {text}"));
+        let mut rust_props = reg.properties_of(id).expect("valid native state");
+        rust_props.sort();
+        let canonical = if rust_props.is_empty() {
+            reg.name_of(id).to_string()
+        } else {
+            format!("{}[{}]", reg.name_of(id), rust_props.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>().join(","))
+        };
+        assert_eq!(canonical, text, "native state is not the mapped Rust state");
+        id
+    }
+
+    const CASES: [&str; 25] = [
+        "oak_north_bone", "oak_south_bone", "oak_west_bone",
+        "oak_east_bone", "nether_west_bone", "pane_west_bone",
+        "bars_east_bone", "wall_west_bone", "stairs_outer_left",
+        "stairs_inner_left", "torch_down_air", "wall_torch_south_air",
+        "lantern_up_air", "wall_post_to_straight", "wall_straight_to_tee",
+        "wall_straight_disconnect", "wall_tee_disconnect",
+        "pane_east_disconnect", "fence_east_disconnect",
+        "pane_bars_join", "wood_fence_join", "nether_no_wood_join",
+        "oak_west_air", "pane_west_air", "bone_west_bone",
+    ];
+    let path = std::env::var("MC_NATIVE_NEIGHBOR_SHAPES")
+        .expect("native updateShape TSV required");
+    let input = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("native neighbor shapes {path}: {e}"));
+    let reg = crate::block_registry::breg().expect("pinned block registry");
+    let air = reg.state_of("minecraft:air", None);
+    let mut checked = 0;
+    let mut mismatches = Vec::new();
+    for (i, line) in input.lines().enumerate() {
+        let cols: Vec<_> = line.split('\t').collect();
+        assert_eq!(cols.len(), 5, "incomplete native shape row {i}");
+        assert!(i < CASES.len(), "unrecognized native shape row {i}");
+        assert_eq!(cols[0], CASES[i], "reordered native shape at {i}");
+        let original = parse(reg, cols[1]);
+        let expected = parse(reg, cols[2]);
+        let neighbor = parse(reg, cols[3]);
+        let (dir, delta) = match cols[4] {
+            "DOWN" => (0, (0, -1, 0)),
+            "UP" => (1, (0, 1, 0)),
+            "NORTH" => (2, (0, 0, -1)),
+            "SOUTH" => (3, (0, 0, 1)),
+            "WEST" => (4, (-1, 0, 0)),
+            "EAST" => (5, (1, 0, 0)),
+            other => panic!("unknown native direction {other}"),
+        };
+        let result = if reg.fragile_loses_support(original, dir, neighbor) {
+            air
+        } else if reg.name_of(original).ends_with("_stairs") {
+            let target = (delta.0, 64 + delta.1, delta.2);
+            reg.stair_after_neighbors(original, (0, 64, 0),
+                |p| if p == target { neighbor } else { air })
+                .unwrap_or(original)
+        } else {
+            reg.connection_after_neighbor(original, neighbor, air, dir)
+                .unwrap_or(original)
+        };
+        if result != expected {
+            mismatches.push(format!(
+                "{} native={} rust={} (id {result})",
+                cols[0], cols[2], reg.name_of(result)));
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, CASES.len(), "native shape cases missing");
+    assert!(mismatches.is_empty(),
+            "native/Rust updateShape mismatches:\n{}", mismatches.join("\n"));
+    println!("PAIRED_NATIVE_NEIGHBOR_SHAPES cases={checked} mismatches=0");
+}
+
+
+/// Replays native-created tick appointments through the Rust per-chunk scheduler,
+/// compares every callback in source order, and never merges block/fluid queues.
+/// Requires outputs of native_neighbor_trace.py from the same pinned Java run.
+#[cfg(feature = "native-oracle")]
+#[test]
+fn native_level_ticks_port_delivery_pair() {
+    #[derive(Clone)]
+    struct Request {
+        phase: String,
+        identity: String,
+        pos: (i32, i32, i32),
+        due: i64,
+        suborder: i64,
+    }
+    let requests_path = std::env::var("MC_NATIVE_TICK_REQUESTS")
+        .expect("real native request TSV required");
+    let delivery_path = std::env::var("MC_NATIVE_TICK_DELIVERIES")
+        .expect("real native delivery TSV required");
+    let requests = std::fs::read_to_string(&requests_path)
+        .unwrap_or_else(|e| panic!("native requests {requests_path}: {e}"));
+    let native_delivery = std::fs::read_to_string(&delivery_path)
+        .unwrap_or_else(|e| panic!("native deliveries {delivery_path}: {e}"));
+    let mut cases: Vec<(String, Vec<Request>)> = Vec::new();
+    for (index, line) in requests.lines().enumerate() {
+        let columns: Vec<_> = line.splitn(3, '\t').collect();
+        assert_eq!(columns.len(), 3, "malformed native request line {index}");
+        // The source index includes shape and set events; the native Python
+        // validator checks complete per-scene event ordering before this runs.
+        columns[1].parse::<usize>().expect("native event index");
+        if !columns[2].starts_with("tick ") {
+            // Preserve first-occurrence scene order, including scenes with no ticks.
+            if !cases.iter().any(|(name, _)| name == columns[0]) {
+                cases.push((columns[0].to_string(), Vec::new()));
+            }
+            continue;
+        }
+        let fields: Vec<_> = columns[2].split_ascii_whitespace().collect();
+        assert_eq!(fields.len(), 7, "malformed scheduled tick at row {index}");
+        assert_eq!(fields[0], "tick");
+        assert!(matches!(fields[1], "block" | "fluid"), "unknown phase");
+        assert_eq!(fields[5], "NORMAL",
+                   "unmodelled priority must fail closed, never silently coerce");
+        let coords: Vec<_> = fields[3].split(',').collect();
+        assert_eq!(coords.len(), 3, "native tick position missing coordinate");
+        let pos = (coords[0].parse::<i32>().unwrap(),
+                   coords[1].parse::<i32>().unwrap(),
+                   coords[2].parse::<i32>().unwrap());
+        let request = Request {
+            phase: fields[1].to_string(),
+            identity: fields[2].to_string(),
+            pos,
+            due: fields[4].parse().expect("native due time"),
+            suborder: fields[6].parse().expect("native suborder"),
+        };
+        if let Some((_, saved)) = cases.iter_mut().find(|(name, _)| name == columns[0]) {
+            saved.push(request);
+        } else {
+            cases.push((columns[0].to_string(), vec![request]));
+        }
+    }
+    let mut replay = Vec::new();
+    let mut scheduled = 0;
+    for (case, requests) in cases {
+        for phase in ["block", "fluid"] {
+            let entries: Vec<_> = requests.iter().filter(|r| r.phase == phase).collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let mut queue = scheduled_ticks::ScheduledTicks::new();
+            let mut names = std::collections::HashMap::<String, u32>::new();
+            let mut reverse = Vec::<String>::new();
+            for r in entries {
+                let id = match names.get(&r.identity) {
+                    Some(&id) => id,
+                    None => {
+                        let id = reverse.len() as u32;
+                        names.insert(r.identity.clone(), id);
+                        reverse.push(r.identity.clone());
+                        id
+                    }
+                };
+                assert!((100..=140).contains(&r.due), "native due outside capture horizon");
+                let _inserted = queue.schedule(scheduled_ticks::ScheduledTick {
+                    pos: r.pos,
+                    block: id,
+                    due: r.due,
+                    priority: 0,
+                    sub_order: r.suborder,
+                });
+                scheduled += 1;
+            }
+            // Java LevelTicks.collect runs once per game tick, not a single
+            // batch at max time: preserve the callback's actual delivery time.
+            for at in 100..=140 {
+                for t in queue.collect(at, 65_536, |_| true) {
+                    replay.push(format!(
+                        "{case}\t{phase}\t{at}\t{}\t{},{},{}",
+                        reverse[t.block as usize], t.pos.0, t.pos.1, t.pos.2,
+                    ));
+                }
+            }
+        }
+    }
+    let native: Vec<String> = native_delivery.lines().map(str::to_owned).collect();
+    assert!(!native.is_empty(), "native delivery output cannot be empty");
+    assert_eq!(replay.len(), native.len(),
+               "native/Rust callback count diverged, scheduled {scheduled}");
+    for (index, (port, reference)) in replay.iter().zip(native.iter()).enumerate() {
+        assert_eq!(port, reference, "native/Rust LevelTicks diverged at callback #{index}");
+    }
+    println!("PAIRED_NATIVE_LEVEL_TICKS requests={scheduled} deliveries={}",
+             native.len());
+}

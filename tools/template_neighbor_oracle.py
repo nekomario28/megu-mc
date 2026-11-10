@@ -46,8 +46,11 @@ def validate_rows(text: str) -> None:
         raise ValueError(f"native neighbor probe returned {len(rows)} rows; expected {len(CASES)}")
     for want, line in zip(CASES, rows):
         fields = line.split("\t")
-        if len(fields) != 3 or fields[0] != want:
+        if len(fields) != 5 or fields[0] != want:
             raise ValueError(f"native neighbor probe omitted or reordered case {want}: {line!r}")
+        if (fields[4] not in {"UP", "DOWN", "NORTH", "SOUTH", "WEST", "EAST"}
+                or not fields[3].startswith("minecraft:")):
+            raise ValueError(f"native neighbor probe omitted neighbor/direction: {line!r}")
         if not fields[1].startswith("minecraft:") or not fields[2].startswith("minecraft:"):
             raise ValueError(f"native neighbor probe omitted block-state text: {line!r}")
         unchanged = want in {"oak_west_air", "pane_west_air", "bone_west_bone", "nether_no_wood_join"}
@@ -60,15 +63,22 @@ def validate_rows(text: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jar", type=Path, default=DEFAULT_JAR)
+    parser.add_argument("--output", type=Path, help="save the 25 paired state transitions")
     args = parser.parse_args()
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "neighbor-shapes.tsv"
         run_probe(
             work, classpath, REPO / "tools/structure-oracle/NeighborShapeOracle.java",
             "dev.mcspine.tools.NeighborShapeOracle", output,
-            extra_sources=(REPO / "tools/structure-oracle/NativeHarness.java",),
+            extra_sources=(REPO / "tools/structure-oracle/NativeHarness.java",
+                           REPO / "tools/vanilla-probe/VanillaBlockTags.java",
+                           REPO / "tools/structure-oracle/NativeFluidTags.java"),
         )
         validate_rows(output.read_text(encoding="utf-8"))
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copyfile(output, args.output)
     print(f"native neighbor shapes: {len(CASES)} cases matched")
     return 0
 

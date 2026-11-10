@@ -9,6 +9,8 @@ lto = true
 strip = true
 
 [features]
+# Opt-in CI-only Java fixtures; tests hard-fail without native files.
+native-oracle = []
 java-compat = ["dep:jni"]
 fabric-probe = ["java-compat"]
 neoforge-events = ["java-compat"]
