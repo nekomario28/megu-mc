@@ -279,6 +279,16 @@ impl ScheduledTicks {
         }
     }
 
+    /// Test-only inspection of queued identities; the production scheduler
+    /// exposes collections only when their eligible game tick is due.
+    #[cfg(test)]
+    pub(crate) fn has_pending_matching(
+        &self,
+        pred: impl Fn(&ScheduledTick) -> bool,
+    ) -> bool {
+        self.chunks.values().any(|chunk| chunk.heap.iter().any(&pred))
+    }
+
     /// Generator queues represent zero-delay, normal-priority proto ticks.
     /// Native unpack starts each chunk at minus its own pending-list length;
     /// ordinary runtime schedules retain their separate nonnegative counter.

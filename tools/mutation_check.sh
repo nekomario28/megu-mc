@@ -282,17 +282,19 @@ check "lazy feature lookup applies its population input and retains cached overr
                     let _ = (&mut populate, sx, sz);'  \
   worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides
 check "a placed gravity block is scheduled by its own cell" \
-  src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {' \
-  '    for (px, py, pz) in [(x, y + 1, z), (x, y + 1, z)] {' \
+  src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y.saturating_add(1), z)] {' \
+  '    for (px, py, pz) in [(x, y.saturating_add(1), z), (x, y.saturating_add(1), z)] {' \
   every_falling_block_becomes_an_entity_and_lands
 
-check "placing unsupported sand queues air, not a ghost" \
-  src/main.rs '    note_block_update(wx, wy, wz, block_at(wx, wy, wz));' \
-  '    note_block_update(wx, wy, wz, st);' \
+check "scheduled falling conversion queues air, not a ghost" \
+  src/main.rs '        note_block_update(px, py, pz, 0);
+        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);' \
+  '        note_block_update(px, py, pz, st);
+        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);' \
   placing_unsupported_sand_queues_air_not_a_ghost
 
 check "a block above a removed support is scheduled" \
-  src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y + 1, z)] {' \
+  src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y.saturating_add(1), z)] {' \
   '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
   sand_falls_under_vanilla_gravity_until_it_lands
 

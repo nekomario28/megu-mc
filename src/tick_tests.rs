@@ -2459,6 +2459,81 @@ fn measure_the_light_cost_per_chunk() {
     );
 }
 
+/// Only count bookable gravity callbacks in currently eligible chunks.
+/// Cold chunks can retain persistent callbacks without blocking live tests.
+fn eligible_falling_bookings() -> bool {
+    let Some(reg) = crate::block_registry::breg() else { return false };
+    let eligible = scheduled_tick_chunks();
+    block_ticks().lock().unwrap().has_pending_matching(|t| {
+        reg.behaviour_of(t.block) == crate::block_registry::B_FALLING
+            && eligible.contains(&(t.pos.0 >> 4, t.pos.2 >> 4))
+    })
+}
+
+fn advance_falling_scheduled_tick() {
+    TICK_IDX.fetch_add(1, Ordering::Relaxed);
+    scheduled_block_tick();
+}
+
+fn drain_falling_bookings(max: usize) {
+    for _ in 0..max {
+        if !eligible_falling_bookings() { return; }
+        advance_falling_scheduled_tick();
+    }
+    assert!(!eligible_falling_bookings(), "falling callbacks did not drain within {max} game ticks");
+}
+
+fn falling_work_in_progress() -> bool {
+    !falling().lock().unwrap().is_empty() || eligible_falling_bookings()
+}
+
+/// The real game tick always runs scheduled callbacks before entity physics.
+/// Never advance only the entity in a test that expects a pending block to move.
+fn falling_world_tick_test() {
+    advance_falling_scheduled_tick();
+    falling_tick();
+}
+
+/// A delayed gravity callback must re-read support; re-adding the floor
+/// before due time prevents conversion, and a subsequent removal rebooks.
+#[test]
+fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    let old_tick = TICK_IDX.load(Ordering::Relaxed);
+    let (hot, warm) = test_region();
+    let mut eligible = warm.clone();
+    eligible.insert((0, 0));
+    set_test_region(eligible.clone(), eligible);
+    let reg = crate::block_registry::breg().unwrap();
+    let sand = reg.state_of("minecraft:sand", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let (x, y, z) = (12, 220, 12);
+    set_block(x, y, z, 0);
+    set_block(x, y + 1, z, 0);
+    set_block(x, y, z, stone);
+    set_block(x, y + 1, z, sand);
+    set_block(x, y, z, 0);
+    assert_eq!(block_at(x, y + 1, z), sand);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), sand, "t+1 must not spawn a falling entity");
+    set_block(x, y, z, stone);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), sand, "a restored support cancels the fall");
+    assert!(falling().lock().unwrap().iter().all(|f| (f.x.floor() as i32, f.y.floor() as i32, f.z.floor() as i32) != (x, y + 1, z)));
+    set_block(x, y, z, 0);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), sand, "rescheduled callback still waits +1 GT");
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(x, y + 1, z), 0, "second callback converts unsupported sand");
+    assert_eq!(falling().lock().unwrap().iter().filter(|f| f.state == sand
+        && f.x.floor() as i32 == x && f.z.floor() as i32 == z).count(), 1,
+        "gravity conversion is exactly once");
+    TICK_IDX.store(old_tick, Ordering::Relaxed);
+    set_test_region(hot, warm);
+}
+
 /// Sand over air falls as a vanilla falling-block entity: the block leaves the world, the
 /// entity integrates `dy -= 0.04` per tick (`y_n = y0 - 0.02 n(n+1)`), and it lands on the
 /// first solid block below. The bytecode contract is evidence/gameplay/falling-vanilla.
@@ -2471,7 +2546,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let original: Vec<(i32, u32)> = (base..=base + 4).map(|y| (y, block_at(3, y, 3))).collect();
@@ -2502,9 +2577,14 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
             .name_of(block_at(3, y, 3))
             .to_string()
     };
-    // Removing the support converts the block into an entity in the same call; the block does
-    // not stay in the world while it falls.
+    // Removing support books a callback for two game ticks later, and only
+    // the due callback can convert the still-unsupported block into an entity.
     set_block(3, base + 2, 3, 0);
+    assert_eq!(block_at(3, base + 3, 3), sand, "reserved, not immediately converted");
+    assert!(falling().lock().unwrap().is_empty());
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(3, base + 3, 3), sand, "no fall at +1 GT");
+    advance_falling_scheduled_tick();
     assert_eq!(
         block_at(3, base + 3, 3),
         0,
@@ -2564,7 +2644,7 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let start = 150;
@@ -2575,6 +2655,7 @@ fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     set_block(3, 60, 3, stone); // the world floor below the platform
     set_block(3, 97, 3, stone); // one-block platform at 97 (top face 98)
     set_block(3, start, 3, sand);
+    drain_falling_bookings(4);
 
     // Tick 50 leaves the feet at y=99 (above the platform); tick 51 moves to y=96.96, whose
     // floor is below the platform. A scan starting at the new cell would pass through it.
@@ -2643,7 +2724,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let base = 150;
@@ -2684,10 +2765,11 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         })
     };
 
-    // Knock out every support: all blocks become entities.
+    // Knock out every support; queued callbacks then convert the blocks.
     for &(x, z) in &columns {
         set_block(x, base + 1, z, 0);
     }
+    drain_falling_bookings(2 * height as usize + 4);
     assert_eq!(
         falling().lock().unwrap().len(),
         expected,
@@ -2744,8 +2826,8 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
         drops().lock().unwrap().clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 200 {
-            falling_tick();
+        while falling_work_in_progress() && t < 200 {
+            falling_world_tick_test();
             t += 1;
         }
         assert_eq!(
@@ -2768,7 +2850,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     warm.extend([(0, 0), (1, 0)]);
     // Falling does not depend on the hot set, so start from an empty one rather than whatever a
     // previous test left, and restore the ambient region at the end.
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let stone = name_to_state("stone").expect("stone must exist");
@@ -2816,6 +2898,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     }
     // Knock out the support so the block falls out of the world.
     set_block(1, MIN_Y + 3, 1, 0);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -2865,8 +2948,8 @@ fn a_saved_below_world_drop_is_not_duplicated() {
         drops().lock().unwrap().clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 400 {
-            falling_tick();
+        while falling_work_in_progress() && t < 400 {
+            falling_world_tick_test();
             t += 1;
         }
         let n: u32 = drops()
@@ -2898,7 +2981,7 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
             warm.insert((x, z));
         }
     }
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let base = 120;
@@ -2928,15 +3011,15 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
     };
     let mut ticks = 0;
     while ticks < 800 {
-        falling_tick();
+        falling_world_tick_test();
         ticks += 1;
-        if knocker.is_finished() && falling().lock().unwrap().is_empty() {
+        if knocker.is_finished() && !falling_work_in_progress() {
             break;
         }
     }
     knocker.join().expect("knocker thread");
-    while !falling().lock().unwrap().is_empty() && ticks < 1600 {
-        falling_tick();
+    while falling_work_in_progress() && ticks < 1600 {
+        falling_world_tick_test();
         ticks += 1;
     }
     assert!(ticks < 1600, "the fall must settle");
@@ -2975,7 +3058,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let original: Vec<(i32, u32)> = (base..=base + 5).map(|y| (y, block_at(5, y, 5))).collect();
@@ -2999,6 +3082,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
     // Removing the support converts the lower block, whose removal makes the upper one
     // unsupported, so both become entities in the same call.
     set_block(5, base + 2, 5, 0);
+    drain_falling_bookings(8);
     assert_eq!(
         falling().lock().unwrap().len(),
         2,
@@ -3053,7 +3137,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let base = 150;
     let (x, z) = (7, 7);
@@ -3063,6 +3147,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     }
     set_block(x, base, z, name_to_state("stone").unwrap());
     set_block(x, base + 3, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3070,6 +3155,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
     );
     // The entity is still at y = base+3, so its cell is exactly the cell we now refill.
     set_block(x, base + 3, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         2,
@@ -3123,7 +3209,7 @@ fn a_falling_block_passes_through_a_replaceable_block() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let reg = crate::block_registry::breg().unwrap();
     let flower = name_to_state("short_grass")
         .or_else(|| name_to_state("dandelion"))
@@ -3143,6 +3229,7 @@ fn a_falling_block_passes_through_a_replaceable_block() {
     set_block(x, base + 1, z, flower);
     set_block(x, base + 3, z, sand);
     set_block(x, base + 2, z, 0);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3183,7 +3270,7 @@ fn a_long_unsupported_column_converts_in_one_pass() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").unwrap();
     let stone = name_to_state("stone").unwrap();
     let base = 150;
@@ -3206,6 +3293,7 @@ fn a_long_unsupported_column_converts_in_one_pass() {
         "a supported column must not fall yet"
     );
     set_block(x, base, z, 0);
+    drain_falling_bookings(2 * height as usize + 10);
     assert_eq!(
         falling().lock().unwrap().len(),
         height as usize,
@@ -3234,14 +3322,16 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").unwrap();
     let (x, y, z) = (3, 150, 3);
     let original: Vec<(i32, u32)> = (y - 1..=y + 1).map(|yy| (yy, block_at(x, yy, z))).collect();
     set_block(x, y - 1, z, 0);
     set_block(x, y, z, 0);
     place_block(x, y, z, sand);
-    assert_eq!(block_at(x, y, z), 0, "unsupported sand leaves the world");
+    assert_eq!(block_at(x, y, z), sand, "sand remains during 2-GT booking");
+    drain_falling_bookings(4);
+    assert_eq!(block_at(x, y, z), 0, "due callback leaves air");
     let idx = ((x & 15) as u16) << 8 | ((z & 15) as u16) << 4 | (y & 15) as u16;
     let queued = pending_blocks()
         .lock()
@@ -3277,7 +3367,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
     warm.extend([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-    set_test_region(oh.clone(), warm);
+    set_test_region(warm.clone(), warm);
     let reg = crate::block_registry::breg().unwrap();
     let names: std::collections::BTreeSet<String> = (0..reg.state_count() as u32)
         .filter(|&st| reg.behaviour_of(st) == crate::block_registry::B_FALLING)
@@ -3295,6 +3385,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
         set_block(x, base, 9, name_to_state("stone").unwrap());
         *falling().lock().unwrap() = Vec::new();
         set_block(x, base + 3, 9, st);
+        drain_falling_bookings(4);
         assert_eq!(
             block_at(x, base + 3, 9),
             0,
@@ -3338,36 +3429,37 @@ fn a_falling_block_waits_in_a_cold_chunk() {
     let old_falling = std::mem::take(&mut *falling().lock().unwrap());
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
     let (oh, ow) = test_region();
-    set_test_region(oh.clone(), std::collections::HashSet::new());
+    set_test_region(HashSet::new(), HashSet::new());
     let base = 150;
     for y in base..=base + 4 {
         set_block(11, y, 11, 0);
     }
     set_block(11, base, 11, name_to_state("stone").unwrap());
-    set_block(11, base + 3, 11, name_to_state("sand").unwrap());
-    // The block still leaves the world and becomes an entity even in a cold chunk; only the
-    // entity's tick is deferred.
-    assert_eq!(block_at(11, base + 3, 11), 0, "the block leaves the world");
+    let sand = name_to_state("sand").unwrap();
+    set_block(11, base + 3, 11, sand);
+    // A scheduled block callback cannot run in a cold chunk, and a falling
+    // entity must not be created before callback collection.
+    for _ in 0..4 {
+        advance_falling_scheduled_tick();
+    }
+    assert_eq!(block_at(11, base + 3, 11), sand, "cold: block remains");
+    assert!(falling().lock().unwrap().is_empty(), "cold: no falling entity");
+    // After warming, the overdue block callback runs first and the entity
+    // moves only when the entity-physics stage runs.
+    let mut warm = ow.clone();
+    warm.extend([(0, 0)]);
+    set_test_region(warm.clone(), warm);
+    advance_falling_scheduled_tick();
+    assert_eq!(block_at(11, base + 3, 11), 0, "warm: callback converts block");
     let y0 = {
         let q = falling().lock().unwrap();
         assert_eq!(q.len(), 1);
         q[0].y
     };
-
     falling_tick();
     let q = falling().lock().unwrap().clone();
-    assert_eq!(q.len(), 1, "a cold chunk must not land or drop the entity");
-    assert_eq!(q[0].y, y0, "and must not move it");
-    // Warming the chunk must let it resume, not leave it frozen.
-    let mut warm = ow.clone();
-    warm.extend([(0, 0)]);
-    set_test_region(oh.clone(), warm);
-    falling_tick();
-    let q = falling().lock().unwrap().clone();
-    assert!(
-        q.len() == 1 && q[0].y < y0,
-        "a warmed chunk must resume the fall: {q:?}"
-    );
+    assert!(q.len() == 1 && q[0].y < y0,
+            "warm: entity physics resumes after scheduled callback: {q:?}");
 
     set_test_region(oh, ow);
     *falling().lock().unwrap() = old_falling;
@@ -3503,7 +3595,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let (x, z, base) = (3, 3, 150);
@@ -3512,6 +3604,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     }
     set_block(x, base, z, stone);
     set_block(x, base + 4, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3550,6 +3643,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     drops().lock().unwrap().clear();
     set_block(x, base, z, stone);
     set_block(x, base + 4, z, sand);
+    drain_falling_bookings(4);
     falling_tick();
     set_block(x, base + 2, z, stone);
     let mut buf = Vec::new();
@@ -3562,8 +3656,8 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
     drops().lock().unwrap().clear();
     load_world_from(&buf).unwrap();
     let mut t = 0;
-    while !falling().lock().unwrap().is_empty() && t < 200 {
-        falling_tick();
+    while falling_work_in_progress() && t < 200 {
+        falling_world_tick_test();
         t += 1;
     }
     assert!(t < 200, "the reloaded entity must land");
@@ -3588,7 +3682,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let stone = name_to_state("stone").expect("stone must exist");
@@ -3605,7 +3699,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
         for i in 1..=height {
             set_block(x, base + i, z, sand);
         }
-        set_block(x, base, z, 0); // the column becomes entities in this call
+        set_block(x, base, z, 0); // callbacks are pending; blocks remain until due
         let live = sand_count(x, z, base, base + height + 4)
             + falling().lock().unwrap().len()
             + drop_count(sand_item);
@@ -3623,8 +3717,8 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
         drops().lock().unwrap().clear();
         load_world_from(&buf).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 400 {
-            falling_tick();
+        while falling_work_in_progress() && t < 400 {
+            falling_world_tick_test();
             t += 1;
         }
         assert!(t < 400, "the snapshot's entities must settle");
@@ -3650,7 +3744,7 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
             warm.insert((x, z));
         }
     }
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let stone = name_to_state("stone").expect("stone must exist");
@@ -3683,16 +3777,16 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
     let b = knock(vec![(1, 2), (2, 2)]);
     let mut ticks = 0;
     while ticks < 800 {
-        falling_tick();
+        falling_world_tick_test();
         ticks += 1;
-        if a.is_finished() && b.is_finished() && falling().lock().unwrap().is_empty() {
+        if a.is_finished() && b.is_finished() && !falling_work_in_progress() {
             break;
         }
     }
     a.join().expect("knocker a");
     b.join().expect("knocker b");
-    while !falling().lock().unwrap().is_empty() && ticks < 1600 {
-        falling_tick();
+    while falling_work_in_progress() && ticks < 1600 {
+        falling_world_tick_test();
         ticks += 1;
     }
     assert!(ticks < 1600, "the fall must settle");
@@ -3728,7 +3822,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let sand = name_to_state("sand").expect("sand must exist");
     let sand_item = name_to_item("sand").expect("sand item must exist");
     let (x, z) = (7, 7);
@@ -3736,6 +3830,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
         set_block(x, y, z, 0);
     }
     set_block(x, MIN_Y + 1, z, sand);
+    drain_falling_bookings(4);
     assert_eq!(
         falling().lock().unwrap().len(),
         1,
@@ -3767,8 +3862,8 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
         drops().lock().unwrap().clear();
         load_world_from(snap).unwrap();
         let mut t = 0;
-        while !falling().lock().unwrap().is_empty() && t < 200 {
-            falling_tick();
+        while falling_work_in_progress() && t < 200 {
+            falling_world_tick_test();
             t += 1;
         }
         assert_eq!(
@@ -3794,7 +3889,7 @@ fn region_change_mid_fall_keeps_the_entity() {
     let (_, ow) = test_region();
     let mut warm = ow.clone();
     warm.insert((0, 0));
-    set_test_region(HashSet::new(), warm.clone());
+    set_test_region(warm.clone(), warm.clone());
     let sand = name_to_state("sand").expect("sand must exist");
     let stone = name_to_state("stone").expect("stone must exist");
     let (x, z, base) = (9, 9, 140);
@@ -3803,6 +3898,7 @@ fn region_change_mid_fall_keeps_the_entity() {
     }
     set_block(x, base, z, stone);
     set_block(x, base + 4, z, sand);
+    drain_falling_bookings(4);
     falling_tick();
     let before = falling().lock().unwrap()[0].y;
     // Cold: the entity must be kept and not advanced.
@@ -3815,7 +3911,7 @@ fn region_change_mid_fall_keeps_the_entity() {
     assert_eq!(held[0].y, before, "a cold chunk does not advance it");
     drop(held);
     // Warm again: it lands on the support.
-    set_test_region(HashSet::new(), warm);
+    set_test_region(warm.clone(), warm);
     let mut ticks = 0;
     while !falling().lock().unwrap().is_empty() && ticks < 200 {
         falling_tick();

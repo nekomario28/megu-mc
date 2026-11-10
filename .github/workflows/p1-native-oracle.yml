@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - 'test/native-*'
+      - 'feat/p1-falling-*'
   workflow_dispatch:
 
 # CI runs compiler/tests only. Explicitly select the already-installed pinned
@@ -113,7 +114,10 @@ jobs:
   full:
     name: P1 full verification (serial, parallel, wire, adapters, mutation)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Measured: the previous 60-minute bound cancelled this job while it was still
+    # in the wire stage (and the same body takes ~45 min on a local 2-core scope),
+    # so the mutation stage never ran and the red was capacity, not a failure.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
