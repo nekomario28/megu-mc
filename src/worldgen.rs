@@ -5287,7 +5287,7 @@ mod wg_tests {
             br#"{"type":"minecraft:unsupported_density"}"#.to_vec(),
         );
         for _ in 0..2 {
-            assert!(g.resolve_ref("minecraft:broken", &files).is_none());
+            assert!(g.resolve_ref(&files, "minecraft:broken").is_none());
             assert!(!g.names.contains_key("minecraft:broken"));
         }
 
