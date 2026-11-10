@@ -1217,6 +1217,10 @@ check "fluid handoff does not consume the ordinary runtime counter" \
   'self.next_order += pending.len() as i64; self.queue.unpack_generated(pending, now);' \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
+check "a block write is not split from its tick booking by a save" \
+  src/main.rs '    with_save_guard(|| set_block_if_inner(x, y, z, st, expected))' '    set_block_if_inner(x, y, z, st, expected)' \
+  tick_tests::a_block_write_waits_for_an_in_progress_save_before_booking
+
 check "fluid handoff adopts the generated positions" \
   src/main.rs 'self.owned.extend(pending.iter().map(|&(pos, _)| pos));' 'let _ = pending.iter();' \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack

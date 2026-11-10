@@ -4613,3 +4613,149 @@ fn native_level_ticks_port_delivery_pair() {
     println!("PAIRED_NATIVE_LEVEL_TICKS requests={scheduled} deliveries={}",
              native.len());
 }
+
+/// A save must not be able to observe the block write without the tick booking
+/// that belongs to it. The save path holds `SAVE_LOCK` while it serialises the
+/// world and the queue, so holding it here makes a write where a concurrent save
+/// would be: the write must not complete until the snapshot is done.
+#[test]
+fn a_block_write_waits_for_an_in_progress_save_before_booking() {
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (tag, _) = client_pair();
+    drop(tag);
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0)]);
+    set_test_region(warm.clone(), warm);
+    let sand = name_to_state("sand").expect("sand");
+    set_block(1, 200, 1, 0);
+    *block_ticks().lock().unwrap() = scheduled_ticks::ScheduledTicks::new();
+
+    let save = crate::SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        set_block(1, 200, 1, sand);
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "the write completed while a save held the lock, so a snapshot can persist \
+         the block without its callback and leave it hanging after a reload"
+    );
+    drop(save);
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the write must finish once the save releases the lock"
+    );
+    writer.join().unwrap();
+
+    let due = TICK_IDX.load(Ordering::Relaxed) as i64 + 2;
+    let booked: Vec<_> = block_ticks()
+        .lock()
+        .unwrap()
+        .collect(due, 64, |_| true)
+        .into_iter()
+        .map(|t| (t.pos, t.block))
+        .collect();
+    assert_eq!(
+        booked,
+        vec![((1, 200, 1), sand)],
+        "the write must leave exactly one callback for the block it placed"
+    );
+    let _ = oh;
+}
+
+/// The invariant the lock protects, checked on the persisted form: a snapshot may
+/// not hold a gravity block standing over a fallable cell without the callback
+/// that will move it.
+#[test]
+fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0), (1, 0)]);
+    set_test_region(warm.clone(), warm);
+    let sand = name_to_state("sand").unwrap();
+    let stone = name_to_state("stone").unwrap();
+    for y in 190..=196 {
+        set_block(1, y, 1, 0);
+    }
+    set_block(1, 190, 1, stone);
+    set_block(1, 191, 1, sand);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(stop.clone());
+    let snaps = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let saver = {
+        let stop = stop.clone();
+        let snaps = snaps.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) && n < 12 {
+                let _lock = crate::SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let mut buf = Vec::new();
+                save_world_into(&mut buf);
+                snaps.lock().unwrap().push(buf);
+                n += 1;
+            }
+            n
+        })
+    };
+    // A falling column exercises the write and the booking from several paths.
+    for y in 191..=193 {
+        set_block(1, y, 1, sand);
+        TICK_IDX.fetch_add(1, Ordering::Relaxed);
+    }
+    set_block(1, 190, 1, 0);
+    drain_falling_bookings(16);
+    stop.store(true, Ordering::Relaxed);
+    let n = saver.join().expect("saver");
+    assert!(n > 0, "the saver must capture at least one snapshot");
+
+    let reg = crate::block_registry::breg().unwrap();
+    let snapshots = snaps.lock().unwrap().clone();
+    for (i, snap) in snapshots.iter().enumerate() {
+        world().lock().unwrap().clear();
+        falling().lock().unwrap().clear();
+        drops().lock().unwrap().clear();
+        *block_ticks().lock().unwrap() = scheduled_ticks::ScheduledTicks::new();
+        load_world_from(snap).unwrap();
+        let pending: std::collections::HashSet<_> = block_ticks()
+            .lock()
+            .unwrap()
+            .collect(i64::MAX / 4, 4096, |_| true)
+            .into_iter()
+            .map(|t| t.pos)
+            .collect();
+        let cells: Vec<_> = world()
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(&(cx, cz), cells)| {
+                cells.iter().map(move |(&idx, &st)| {
+                    // local_idx: (y - MIN_Y) << 8 | (z & 15) << 4 | (x & 15)
+                    let lx = (idx & 15) as i32;
+                    let ly = (idx >> 8) as i32 + MIN_Y;
+                    let lz = ((idx >> 4) & 15) as i32;
+                    ((cx << 4) + lx, ly, (cz << 4) + lz, st)
+                })
+            })
+            .collect();
+        for (x, y, z, st) in cells {
+            if reg.behaviour_of(st) != crate::block_registry::B_FALLING {
+                continue;
+            }
+            let below = crate::fallable_state(block_at(x, y - 1, z));
+            assert!(
+                !below || pending.contains(&(x, y, z)),
+                "snapshot {i} holds {:?} at {x},{y},{z} with a fallable cell below and no callback: \
+                 it would hang after a reload",
+                reg.name_of(st)
+            );
+        }
+    }
+    let _ = oh;
+}

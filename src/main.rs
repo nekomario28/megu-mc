@@ -7151,7 +7151,16 @@ fn block_at(x: i32, y: i32, z: i32) -> u32 {
 fn set_block(x: i32, y: i32, z: i32, st: u32) {
     set_block_if(x, y, z, st, None);
 }
+/// A block write and the scheduled-tick reservations it causes are one
+/// persistence transaction. The signal-thread save holds `SAVE_LOCK` while it
+/// serialises the world and the queue, so a snapshot taken between the write
+/// and `block_updated`'s booking would persist a gravity block with no
+/// callback and leave it hanging after a reload. Re-entrant, so a nested
+/// write (a cascade placing another block) does not take the lock twice.
 fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
+    with_save_guard(|| set_block_if_inner(x, y, z, st, expected))
+}
+fn set_block_if_inner(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
     let mut w = world().lock().unwrap();
     let c = w.entry((x >> 4, z >> 4)).or_default();
     let old = c
