@@ -186,7 +186,13 @@ public final class TemplateInitOracle {
         StringBuilder out = new StringBuilder();
         for (int i = 0; i < n; i++) {
             if (i > 0) out.append('|');
-            out.append(C("uh").getMethod("k", int.class).invoke(messages, i));
+            // The stored string, not Java's `'...'` rendering of the tag, so the fixture
+            // carries exactly what native holds.
+            String text = String.valueOf(C("uh").getMethod("k", int.class).invoke(messages, i));
+            if (text.startsWith("'") && text.endsWith("'") && text.length() >= 2) {
+                text = text.substring(1, text.length() - 1).replace("\\'", "'").replace("\\\\", "\\");
+            }
+            out.append(text);
         }
         return out.toString();
     }

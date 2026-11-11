@@ -370,8 +370,64 @@ impl Template {
         Ok(out)
     }
 
+    /// A sign side's four lines, decoded from the game's own message form.
+    ///
+    /// Native stores each message as a JSON string component (`'"Hi"'`); older or edited
+    /// data may carry a text object. Anything else is refused rather than shown blank.
+    pub(crate) fn sign_lines(tag: &Tag) -> Result<[String; 4], &'static str> {
+        let Tag::Compound(_) = tag else {
+            return Err("template block NBT must be a compound");
+        };
+        let front = tag
+            .get("front_text")
+            .ok_or("a sign template needs front_text")?;
+        let Tag::Compound(_) = front else {
+            return Err("front_text must be a compound");
+        };
+        let Some(Tag::List(_, messages)) = front.get("messages") else {
+            return Err("front_text.messages must be a list");
+        };
+        if messages.len() != 4 {
+            return Err("a sign side has exactly four messages");
+        }
+        let mut lines: [String; 4] = Default::default();
+        for (slot, message) in messages.iter().enumerate() {
+            let Tag::String(text) = message else {
+                return Err("a sign message must be a string component");
+            };
+            let raw = text.to_utf8().map_err(|_| "sign message is not UTF-8")?;
+            let parsed = crate::json::jparse(raw.as_bytes()).ok_or("sign message is not JSON")?;
+            lines[slot] = match &parsed {
+                crate::json::J::Str(s) => s.clone(),
+                crate::json::J::Obj(_) => match parsed.get("text") {
+                    Some(crate::json::J::Str(s)) => s.clone(),
+                    _ => return Err("unsupported sign component"),
+                },
+                _ => return Err("unsupported sign component"),
+            };
+        }
+        Ok(lines)
+    }
+
+    /// Which of the two supported block-entity payloads a tag carries.
+    ///
+    /// `Items` and `front_text` do not share a cell in native data: a container stores its
+    /// table *or* its items, and a sign stores a side. A tag with neither is refused.
+    pub(crate) fn staged_payload(
+        tag: &Tag,
+    ) -> Result<crate::generation_context::StagedBlockEntity, &'static str> {
+        if tag.get("front_text").is_some() {
+            return Ok(crate::generation_context::StagedBlockEntity::Sign(
+                Self::sign_lines(tag)?,
+            ));
+        }
+        Ok(crate::generation_context::StagedBlockEntity::Container(
+            Self::container_items(tag)?,
+        ))
+    }
+
     /// The general template contract: no template entities yet, and NBT limited to
-    /// container `Items`. Callers add their own restrictions on top (the fossil path
+    /// a container's `Items` or a sign's `front_text`. Callers add their own restrictions on top (the fossil path
     /// requires full cubes), so admission is not baked into placement and one owner
     /// serves every caller.
     pub(crate) fn validate_placement(&self) -> Result<(), &'static str> {
@@ -380,7 +436,7 @@ impl Template {
         }
         for info in self.palettes.iter().flatten() {
             if let Some(tag) = &info.nbt {
-                Self::container_items(tag)?;
+                Self::staged_payload(tag)?;
             }
         }
         Ok(())
@@ -487,8 +543,8 @@ impl Template {
                 written.push(p);
                 if let Some(tag) = &block.nbt {
                     // Admission checked this tag; the write itself still fails closed
-                    // rather than staging contents the caller never validated.
-                    ctx.containers.push((p, Self::container_items(tag)?));
+                    // rather than staging data the caller never validated.
+                    ctx.block_entities.push((p, Self::staged_payload(tag)?));
                 }
             }
         }
@@ -824,10 +880,15 @@ mod tests {
                     );
                 }
                 let staged: Vec<_> = ctx
-                    .containers
+                    .block_entities
                     .iter()
                     .filter(|(p, _)| *p == cell)
-                    .map(|(_, v)| v.clone())
+                    .filter_map(|(_, v)| match v {
+                        crate::generation_context::StagedBlockEntity::Container(items) => {
+                            Some(items.clone())
+                        }
+                        _ => None,
+                    })
                     .next()
                     .unwrap_or_default();
                 assert_eq!(
@@ -837,7 +898,7 @@ mod tests {
                     field[2]
                 );
             }
-            assert_eq!(ctx.containers.len(), 1, "{case}: one NBT cell stages contents");
+            assert_eq!(ctx.block_entities.len(), 1, "{case}: one NBT cell stages contents");
         }
     }
 
@@ -877,14 +938,14 @@ mod tests {
             assert!(template
                 .place_blocks(&mut ctx, &mut rng, placement, &[], [0, 0, 0, 31, 255, 31])
                 .is_ok());
-            assert_eq!(ctx.containers.len(), 1, "placement stages the contents");
-            let mut staged = std::mem::take(&mut ctx.containers);
-            g.stage_containers(&mut staged);
+            assert_eq!(ctx.block_entities.len(), 1, "placement stages the contents");
+            let mut staged = std::mem::take(&mut ctx.block_entities);
+            g.stage_block_entities(&mut staged);
         }
-        let staged = g.take_staged_containers();
+        let staged = g.take_staged_block_entities();
         assert_eq!(staged.len(), 1, "the generator holds the staged contents once");
-        assert!(g.take_staged_containers().is_empty(), "taking them twice yields nothing");
-        crate::materialize_containers(staged);
+        assert!(g.take_staged_block_entities().is_empty(), "taking them twice yields nothing");
+        crate::materialize_block_entities(staged);
         let redstone = crate::name_to_item("minecraft:redstone").unwrap() as i64;
         assert_eq!(
             crate::chests().lock().unwrap().get(&(2, 70, 2)).cloned(),
@@ -990,6 +1051,120 @@ mod tests {
             "an empty store must show an empty slot, so the window is not a stale copy"
         );
         let _ = reg;
+    }
+
+    /// The fixture's sign row, end to end: the template's `front_text` decodes to four
+    /// lines, placement stages them, and the handoff writes them into the sign store so
+    /// the chunk packet carries the text.
+    #[test]
+    fn template_sign_text_matches_native_and_reaches_the_sign_store() {
+        use crate::generation_context::StagedBlockEntity;
+        let reg = crate::block_registry::breg().unwrap();
+        let sign_state = reg.state_of("minecraft:oak_sign", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        // The native fixture's raw form for the first line, so this test starts from the
+        // captured shape rather than from what the port happens to emit.
+        let rows: Vec<Vec<String>> = include_str!("../tests/data/template_init_1211.tsv")
+            .lines()
+            .map(|l| l.split('\t').map(str::to_owned).collect())
+            .filter(|f: &Vec<String>| f[0] == "none" && f[6] != "-")
+            .collect();
+        assert_eq!(rows.len(), 1, "the fixture carries exactly one sign row");
+        let native_text = rows[0][6].clone();
+        let first_message = native_text.split('|').next().unwrap().to_string();
+        let mut front = std::collections::BTreeMap::new();
+        front.insert(
+            NbtString::text("messages"),
+            Tag::List(
+                8,
+                vec![
+                    Tag::String(NbtString::text(&first_message)),
+                    Tag::String(NbtString::text("\"\"")),
+                    Tag::String(NbtString::text("\"\"")),
+                    Tag::String(NbtString::text("\"\"")),
+                ],
+            ),
+        );
+        let mut tag = std::collections::BTreeMap::new();
+        tag.insert(
+            NbtString::text("front_text"),
+            Tag::Compound(front),
+        );
+        let template = Template {
+            size: (2, 2, 2),
+            palettes: vec![vec![
+                BlockInfo { pos: (1, 0, 1), state: stone, nbt: None },
+                BlockInfo { pos: (1, 1, 1), state: sign_state, nbt: Some(Tag::Compound(tag)) },
+            ]],
+            entities: Vec::new(),
+        };
+        assert!(template.validate_placement().is_ok());
+
+        let cell = parse_cell(&rows[0][2]);
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        {
+            let mut ctx = crate::generation_context::FC::new(&mut g);
+            ctx.test_no_terrain = true;
+            let air = reg.state_of("minecraft:air", None);
+            for base in [cell, (cell.0, cell.1 - 1, cell.2)] {
+                ctx.test_base_cell(base, air);
+                for (dx, dy, dz) in
+                    [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+                {
+                    ctx.test_base_cell((base.0 + dx, base.1 + dy, base.2 + dz), air);
+                }
+            }
+            let mut rng = crate::generation_math::Xor::seed_worldgen(11);
+            let placement = Placement {
+                origin: (10, 80, 10),
+                pivot: (0, 0, 0),
+                mirror: crate::structure_transform::Mirror::None,
+                rotation: crate::structure_transform::Rotation::None,
+            };
+            assert!(template
+                .place_blocks(&mut ctx, &mut rng, placement, &[], [0, 0, 0, 31, 255, 31])
+                .is_ok());
+            let staged = ctx
+                .block_entities
+                .iter()
+                .find(|(p, _)| *p == cell)
+                .map(|(_, v)| v.clone())
+                .expect("the sign cell stages a payload");
+            assert_eq!(
+                staged,
+                StagedBlockEntity::Sign(["Hi".into(), String::new(), String::new(), String::new()]),
+                "the template's front_text decodes to four lines"
+            );
+            assert_eq!(
+                reg.name_of(ctx.get(cell.0, cell.1, cell.2)),
+                "minecraft:oak_sign"
+            );
+            let mut staged_all = std::mem::take(&mut ctx.block_entities);
+            g.stage_block_entities(&mut staged_all);
+        }
+        crate::materialize_block_entities(g.take_staged_block_entities());
+        assert_eq!(
+            crate::signs().lock().unwrap().get(&(cell.0, cell.1, cell.2, 1)).cloned(),
+            Some(["Hi".to_string(), String::new(), String::new(), String::new()]),
+            "the sign store holds the front lines the template carried"
+        );
+        crate::signs().lock().unwrap().remove(&(cell.0, cell.1, cell.2, 1));
+    }
+
+    /// A sign tag with a shape the port cannot represent is refused, not blanked.
+    #[test]
+    fn unsupported_sign_components_are_refused() {
+        let mut front = std::collections::BTreeMap::new();
+        front.insert(
+            NbtString::text("messages"),
+            Tag::List(1, vec![Tag::Byte(1), Tag::Byte(1), Tag::Byte(1), Tag::Byte(1)]),
+        );
+        let mut tag = std::collections::BTreeMap::new();
+        tag.insert(NbtString::text("front_text"), Tag::Compound(front));
+        assert_eq!(
+            Template::staged_payload(&Tag::Compound(tag)),
+            Err("a sign message must be a string component")
+        );
     }
 
     /// The sign NBT the port emits must be the shape the game writes, or a client shows

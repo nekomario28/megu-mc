@@ -233,8 +233,21 @@ reports the text, so the fixture carries both families (8 rows, two rotations):
 | clockwise_90 | 9,81,11 | `oak_sign[rotation=4,…]` | `a2de47a0…`, same text |
 
 The sign needs the stone under it (the shape pass removes an unsupported one) and its
-state rotates while the text does not. Port-side staging for sign text is still not
-implemented, so the comparison test covers the chest and stone rows only.
+state rotates while the text does not.
+
+**Port side (same day).** One staging channel now carries both families:
+`StagedBlockEntity::{Container, Sign}` in the generation context, decoded by
+`Template::staged_payload` (a tag with `front_text` is a sign, otherwise container
+`Items`; anything else is refused). `Template::sign_lines` accepts the game's JSON string
+components and a plain text object, and refuses every other shape rather than showing
+blank lines. The handoff writes each variant into the store that owns it — `chests()` or
+`signs()` keyed `front = 1` — so the existing chunk-packet block-entity path carries the
+text without a second owner.
+
+`template_sign_text_matches_native_and_reaches_the_sign_store` starts from the fixture's
+captured message, stages `["Hi","","",""]`, and checks the sign store; two compiling
+mutants cover the decode and the store routing. The container comparison test also runs
+against the same fixture.
 
 ### Earlier note: the port has no general placement path (2026-11-11)
 

@@ -1253,6 +1253,18 @@ check "staged containers are taken from the generator once" \
   src/worldgen.rs '        std::mem::take(&mut self.staged_containers)' '        Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
+check "a placed sign stages its front lines" \
+  src/structure_template.rs '                Self::sign_lines(tag)?,' '                Default::default(),' \
+  template_sign_text_matches_native_and_reaches_the_sign_store
+
+check "a sign message that is not a string component is refused" \
+  src/structure_template.rs '                return Err("a sign message must be a string component");' '                lines[slot] = String::new(); continue;' \
+  unsupported_sign_components_are_refused
+
+check "staged signs reach the sign store" \
+  src/main.rs '                        (pos.0, pos.1, pos.2, 1),' '                        (pos.0, pos.1, pos.2, 0),' \
+  template_sign_text_matches_native_and_reaches_the_sign_store
+
 check "a placed container stages its contents" \
   src/structure_template.rs 'ctx.containers.push((p, Self::container_items(tag)?));' 'let _ = Self::container_items(tag)?;' \
   template_container_items_match_native_placement

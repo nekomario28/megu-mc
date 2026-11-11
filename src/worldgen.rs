@@ -506,7 +506,7 @@ pub struct Gen {
     /// Generation-owned: they are moved into the runtime container store as soon as
     /// this generator's lock is released (see `block_state`), never kept as a second
     /// live store.
-    staged_containers: Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)>,
+    staged_block_entities: Vec<((i32, i32, i32), crate::generation_context::StagedBlockEntity)>,
     feat_ord: Vec<(i32, i32)>,
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
@@ -778,7 +778,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
-            staged_containers: Vec::new(),
+            staged_block_entities: Vec::new(),
             feat_ord: Vec::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
@@ -2880,7 +2880,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
-            staged_containers: Vec::new(),
+            staged_block_entities: Vec::new(),
             feat_ord: Vec::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
@@ -3567,14 +3567,19 @@ impl Gen {
         }
         self.feat_c.entry(key).or_default().insert(k, st);
     }
-    pub(crate) fn stage_containers(&mut self, items: &mut Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)>) {
-        self.staged_containers.append(items);
+    pub(crate) fn stage_block_entities(
+        &mut self,
+        items: &mut Vec<((i32, i32, i32), crate::generation_context::StagedBlockEntity)>,
+    ) {
+        self.staged_block_entities.append(items);
     }
 
     /// Hand the staged contents to the caller. Taken by value so a second call cannot
     /// double-apply them.
-    pub(crate) fn take_staged_containers(&mut self) -> Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)> {
-        std::mem::take(&mut self.staged_containers)
+    pub(crate) fn take_staged_block_entities(
+        &mut self,
+    ) -> Vec<((i32, i32, i32), crate::generation_context::StagedBlockEntity)> {
+        std::mem::take(&mut self.staged_block_entities)
     }
 
     pub(crate) fn wseed(&self) -> u64 {
@@ -4156,10 +4161,10 @@ pub fn block_state(
         let mut guard = gen_lock();
         let g = guard.as_mut()?;
         let state = g.block_state_at(x, y, z, populate);
-        (state, g.take_staged_containers())
+        (state, g.take_staged_block_entities())
     };
     if !staged.is_empty() {
-        crate::materialize_containers(staged);
+        crate::materialize_block_entities(staged);
     }
     Some(state)
 }

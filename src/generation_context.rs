@@ -49,6 +49,15 @@ pub(crate) fn schedule_leaf_edge_state(
 
 // ---------- generation context ----------
 
+/// The block-entity payloads a template can carry today, decoded at admission.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum StagedBlockEntity {
+    /// `Items`: slot, item id, count.
+    Container(Vec<(i16, i64, u8)>),
+    /// A sign side: the four lines of its front text.
+    Sign([String; 4]),
+}
+
 pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
@@ -58,10 +67,11 @@ pub(crate) struct FC<'a> {
     /// cached: they follow carver and feature writes.
     hmwg: HashMap<(i32, i32, HeightmapKind), i32>,
 
-    /// Container contents a template placed with NBT. Generation-owned staging, not a
-    /// live store: the runtime handoff into `chests()` is a separate contract, and a
-    /// port that only staged this would still have empty chests in game.
-    pub(crate) containers: Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)>,
+    /// Block-entity data a template placed with NBT. Generation-owned staging, not a live
+    /// store: the runtime handoff writes each variant into the one store that owns it
+    /// (`chests()` / `signs()`), so a port that only staged this would still have empty
+    /// containers and blank signs in game.
+    pub(crate) block_entities: Vec<((i32, i32, i32), StagedBlockEntity)>,
 
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
     prof: bool,
@@ -77,7 +87,7 @@ impl<'a> FC<'a> {
             wr: HashMap::new(),
             rc: HashMap::new(),
             hmwg: HashMap::new(),
-            containers: Vec::new(),
+            block_entities: Vec::new(),
             cc: None,
             prof: crate::trace_env::env_flag!("FEAT_PROFILE"),
             #[cfg(test)]
