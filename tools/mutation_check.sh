@@ -1253,6 +1253,14 @@ check "staged containers are taken from the generator once" \
   src/worldgen.rs '        std::mem::take(&mut self.staged_containers)' '        Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
+check "an entity offset flips the axis native flips" \
+  src/structure_transform.rs '        Mirror::LeftRight => z = 1.0 - z,' '        Mirror::LeftRight => x = 1.0 - x,' \
+  structure_transform::tests::entity_offset_transform_matches_native
+
+check "an entity offset keeps the pivot" \
+  src/structure_transform.rs '            f64::from(px.wrapping_add(pz).wrapping_add(1)) - z,' '            f64::from(px.wrapping_sub(pz).wrapping_add(1)) - z,' \
+  structure_transform::tests::entity_offset_transform_matches_native
+
 check "a placed sign stages its front lines" \
   src/structure_template.rs '                Self::sign_lines(tag)?,' '                Default::default(),' \
   template_sign_text_matches_native_and_reaches_the_sign_store

@@ -14,6 +14,12 @@ pub(crate) enum Rotation {
     Counterclockwise90,
 }
 impl Mirror {
+    /// Native's mirror **index** (what a template file stores), not its name.
+    ///
+    /// The enum names are swapped relative to native's: this `LeftRight` flips `z` like
+    /// native's `FRONT_BACK`, and this `FrontBack` flips `x` like native's `LEFT_RIGHT`.
+    /// `from_index` is what keeps the composition right — a caller that maps a name
+    /// instead of an index gets the wrong mirror.
     pub(crate) fn from_index(index: u8) -> Option<Self> {
         match index {
             0 => Some(Self::None),
@@ -175,6 +181,37 @@ mod tests {
         }
         assert_eq!(count, 192);
     }
+    /// The captured native entity transform, every row.
+    ///
+    /// `entity` existed before this corpus but had no native comparison; the fixture is
+    /// `StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)` over two pivots,
+    /// three mirrors, four rotations and nine offsets, so a formula that ignores the
+    /// pivot or the half-block offset cannot pass.
+    #[test]
+    fn entity_offset_transform_matches_native() {
+        let pivots = [(10, 64, -4), (0, 0, 0)];
+        let mut rows = 0;
+        for line in include_str!("../tests/data/template_entity_1211.tsv").lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 11, "{line}");
+            let pivot = pivots[f[0].parse::<usize>().unwrap()];
+            // Indices, not names: the port's mirror names are swapped (see `from_index`).
+            let mirror = Mirror::from_index(f[1].parse().unwrap()).unwrap();
+            let rotation = Rotation::from_index(f[2].parse().unwrap()).unwrap();
+            let at = |i: usize| f[i].parse::<f64>().unwrap();
+            let got = entity([at(5), at(6), at(7)], mirror, rotation, pivot);
+            let want = [at(8), at(9), at(10)];
+            for axis in 0..3 {
+                assert!(
+                    (got[axis] - want[axis]).abs() < 1e-9,
+                    "{line}: got {got:?} want {want:?}"
+                );
+            }
+            rows += 1;
+        }
+        assert_eq!(rows, 216, "every captured row is checked");
+    }
+
     #[test]
     fn every_native_state_transform_is_in_the_same_registry() {
         let count = crate::block_registry::breg().unwrap().state_count() as u32;
