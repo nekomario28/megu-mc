@@ -175,6 +175,25 @@ Still open, and deliberately not claimed: template entities, block entity kinds 
 a container with explicit `Items`, and the native comparison for the window bytes (the
 fixture pins placement, not the packet layout).
 
+### Sign text: probed, not captured (2026-11-11)
+
+A sign was added to the oracle to pin the second block-entity family. Three things were
+measured before stopping:
+
+1. A standing sign placed **without support is removed by the shape pass** — the write
+   log shows `oak_sign` then `minecraft:air`, so a fixture must give it ground.
+2. With stone under it the sign survives and the state rotates as expected
+   (`rotation=0` at none, `rotation=4` at 90 degrees).
+3. The NBT did **not** take effect: the saved entity reports four empty components
+   (`'""'` each) instead of the `{"text":"Hi"}` written into the template tag. The cause
+   is not established. The leading candidate is that the state write replaces the
+   pre-registered entity with a fresh one, so `loadWithComponents` applies to an
+   instance that is then discarded; that is not proven.
+
+Because the decode is unverified, the fixture keeps the container rows only and the port
+does not implement sign text. Logs: `init-sign*.log` in the audit directory. The next
+attempt should check entity identity across the state write before trusting the tag.
+
 ### Earlier note: the port has no general placement path (2026-11-11)
 
 Tried to wire initialization into the existing placement and stopped at a real seam
