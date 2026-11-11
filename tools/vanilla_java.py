@@ -45,9 +45,18 @@ def pinned_runtime(jar):
         yield work, os.pathsep.join(map(str, jars)), inner
 
 
-def run_probe(work, classpath, source, main, *args, extra_sources=()):
+def run_probe(work, classpath, source, main, *args, extra_sources=(), capture=False):
+    """Compile and run one probe. `capture=True` returns its stdout instead of echoing it.
+
+    The native oracle runners need the probe's lines to validate and store them, and a
+    subprocess that writes straight to our stdout cannot be parsed afterwards.
+    """
     subprocess.run(["javac", "-proc:none", "-cp", classpath, "-d", str(work), str(source),
                     *map(str, extra_sources)],
                    check=True, timeout=60)
-    subprocess.run(["java", "-Xmx768m", "-cp", str(work) + os.pathsep + classpath,
-                    main, *map(str, args)], check=True, timeout=120, cwd=work)
+    command = ["java", "-Xmx768m", "-cp", str(work) + os.pathsep + classpath,
+               main, *map(str, args)]
+    if capture:
+        return subprocess.run(command, check=True, timeout=300, cwd=work,
+                              capture_output=True, text=True).stdout
+    subprocess.run(command, check=True, timeout=120, cwd=work)

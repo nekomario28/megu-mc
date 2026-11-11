@@ -92,6 +92,33 @@ cannot pass. Vanilla creates the entity in `LevelChunk.setBlockState`, which nee
 
 Log: `init-probe-attempt3.log` (probe source in the audit directory).
 
+### Observed contract (2026-11-11, `tools/template_init_oracle.py`)
+
+The datapack recipe above plus one supplied entity reaches the native load. What the
+run reports, in `tests/data/template_init_1211.tsv` (4 cells, two rotations):
+
+| case | cell | state | entity |
+|---|---|---|---|
+| none | 10,80,10 | `chest[facing=north,type=single,waterlogged=false]` | `d8d35ce8…` |
+| none | 11,80,10 | `stone` | absent |
+| clockwise_90 | 10,80,10 | `chest[facing=east,…]` | `d8d35ce8…` |
+| clockwise_90 | 10,80,11 | `stone` | absent |
+
+Three facts a port has to reproduce, none of which are visible from the template
+bytes alone:
+
+1. The tag is decoded **through the live entity**, not copied: `CustomName` arrives as
+   the string `{"text":"Crate"}` and is saved back as the component `'"Crate"'`.
+2. A `LootTable` without a seed gets one generated from the placement's
+   `RandomSource` (`LootTableSeed`), so placement is not a pure copy and the seed must
+   come from the same draw order.
+3. The state is written **rotated** (north → east) and the tag is loaded after the
+   air clear and the state write, so the entity sees the final state.
+
+Boundary: the entity is created by `LevelChunk.setBlockState` in a real server; a
+`ProtoChunk` does not, so the oracle registers one at the target and only claims the
+*load* path. Entities in the template, packet NBT, and save/reload remain unobserved.
+
 **No native initialization observation exists.** The contract above is bytecode
 evidence, not an executed comparison, and it must be confirmed by a run before any
 port work is accepted. Choosing the server route is a decision, not a next step:

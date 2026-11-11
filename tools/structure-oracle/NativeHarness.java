@@ -475,6 +475,16 @@ public final class NativeHarness {
         public final StateScene scene;
         public final int minY, height;
         private final Object heights;
+        /**
+         * When set, `getBlockEntity`, `registryAccess` and every `setBlock` go to a real
+         * chunk instead of the recorded scene. Ran against a datapack-loaded registry
+         * access this is what lets native code that *initialises* a block entity run at
+         * all: `StructureTemplate.placeInWorld` asserts `getBlockEntity` is non-null
+         * before it writes the state and loads the tag. Building the entity itself is
+         * still the caller's job (a `LevelChunk` does it; a `ProtoChunk` does not).
+         */
+        public Object chunk;
+        public Object registryAccess;
 
         Level(StateScene scene, int minY, int height, Object extraGenerator) {
             this.scene = scene;
@@ -570,6 +580,14 @@ public final class NativeHarness {
 
         private Object handle(Object proxy, Method m, Object[] a) throws Throwable {
             Class<?>[] pt = m.getParameterTypes();
+            if (chunk != null) {
+                if (m.getName().equals("c_") && pt.length == 1 && pt[0] == posC) {
+                    return chunk.getClass().getMethod("c_", posC).invoke(chunk, a[0]);
+                }
+                if (m.getName().equals("H_") && pt.length == 0) {
+                    return registryAccess;
+                }
+            }
             if (m.getName().equals("y_") && pt.length == 0
                     && m.getReturnType() == C("eot")) return lightEngine();
             if (m.getName().equals("G_") && pt.length == 0
@@ -658,6 +676,17 @@ public final class NativeHarness {
                 events.add(event);
                 if (p[1] < minY || p[1] >= minY + height) return false;
                 writes.put(p[0] + "," + p[1] + "," + p[2], a[1]);
+                if (chunk != null) {
+                    for (Method w : chunk.getClass().getMethods()) {
+                        if (w.getName().equals("a") && w.getParameterCount() == 3
+                                && w.getParameterTypes()[0] == posC
+                                && w.getParameterTypes()[1] == stateC
+                                && w.getParameterTypes()[2] == boolean.class) {
+                            w.invoke(chunk, a[0], a[1], false);
+                            break;
+                        }
+                    }
+                }
                 return true;
             }
             // Build height: the interface that declares the same name and signature
@@ -693,6 +722,14 @@ public final class NativeHarness {
     /** A level whose scene resolves properties itself (see {@link StateScene}). */
     public static Level levelFromStates(StateScene scene) {
         return new Level(scene, MIN_Y, HEIGHT, null);
+    }
+
+    /** A level backed by a real chunk: block entities and registry access are real. */
+    public static Level levelOnChunk(StateScene scene, Object chunk, Object registryAccess) {
+        Level level = new Level(scene, MIN_Y, HEIGHT, null);
+        level.chunk = chunk;
+        level.registryAccess = registryAccess;
+        return level;
     }
 
     /**
