@@ -202,11 +202,29 @@ Follow-up probes narrowed it down and refuted the first hypothesis:
   correctly in this harness, so the harness can host a real load; signs specifically do
   not take one.
 
-The remaining candidate is that the sign's own loader needs a level the harness does not
-give it (our entity never receives `setLevel`), and silently falls back to empty text.
-That is untested. Because the decode is unverified, the fixture keeps the container rows
-only, the port does not implement sign text, and the oracle change was reverted. Logs:
-`init-sign*.log` and `sign-probe*.log` in the audit directory.
+**Resolved by encoding instead of guessing.** Asking the game's own codec
+(`SignText.DIRECT_CODEC.encodeStart` with the level's ops) what a sign text looks like:
+
+```
+{color:"white", filtered_messages:['""','""','""','""'], has_glowing_text:0b,
+ messages:['"Hi"','""','""','""']}
+```
+
+So the earlier hand-written tag was wrong in two ways: each message is a **JSON string
+component** (`'"Hi"'`, not `{"text":"Hi"}`) and a **`filtered_messages` list is always
+present**. The codec also defaulted `color` to `white`. That is why every hand-built
+variant loaded as empty text; no level is involved (the bytecode shows
+`loadAdditional` uses only the decode provider and logs failures through
+`resultOrPartial`).
+
+Consequence for the port: `sign_side_nbt` wrote `color:"black"`, a `{"text":...}` message
+and no `filtered_messages`, so a real client would have shown blank lines. It now writes
+the game's shape, and `sign_side_nbt_matches_the_shape_the_game_writes` pins it with two
+compiling mutants (message form, filtered list). Log: `sign-probe6.log`.
+
+The template *fixture* still carries containers only: the sign rows need the corrected
+tag threaded through the oracle, which is the next step, and the port-side staging for
+sign text is not implemented yet.
 
 ### Earlier note: the port has no general placement path (2026-11-11)
 

@@ -16480,9 +16480,9 @@ fn nbt_named_byte(v: &mut Vec<u8>, name: &str, b: u8) {
     nbt_str(v, name);
     v.push(b);
 }
+/// A plain string component, as the game encodes it: `"Hi"`, not `{"text":"Hi"}`.
 fn json_text(s: &str) -> String {
-    // {"text":"..."} with escaping
-    let mut o = String::from("{\"text\":\"");
+    let mut o = String::from("\"");
     for c in s.chars() {
         match c {
             '"' => o.push_str("\\\""),
@@ -16491,20 +16491,31 @@ fn json_text(s: &str) -> String {
             c => o.push(c),
         }
     }
-    o.push_str("\"}");
+    o.push('"');
     o
 }
+/// A sign side, in the shape the game itself writes.
+///
+/// Measured from native (`SignText.DIRECT_CODEC` encoded with the level's ops, see
+/// `~/.cache/mc-spine-audit/save-booking-20261110/sign-probe6.log`):
+/// `{color, filtered_messages:[4], has_glowing_text, messages:[4]}` with each message a
+/// **JSON string** component (`'"Hi"'`), not a `{"text":...}` object, and with
+/// `filtered_messages` present. A tag without that list loads as empty text natively, so
+/// writing the shorter shape here would make a client show blank lines.
 fn sign_side_nbt(v: &mut Vec<u8>, name: &str, lines: &[String; 4]) {
     v.push(10);
     nbt_str(v, name); // TAG_Compound <name>
-    nbt_named_str(v, "color", "black");
+    nbt_named_str(v, "color", "white");
     nbt_named_byte(v, "has_glowing_text", 0);
-    v.push(9);
-    nbt_str(v, "messages"); // TAG_List<String>
-    v.push(8);
-    v.extend_from_slice(&4i32.to_be_bytes());
-    for l in lines {
-        nbt_str(v, &json_text(l));
+    for list in ["filtered_messages", "messages"] {
+        v.push(9);
+        nbt_str(v, list); // TAG_List<String>
+        v.push(8);
+        v.extend_from_slice(&4i32.to_be_bytes());
+        for l in lines {
+            let text = if list == "messages" { json_text(l) } else { String::new() };
+            nbt_str(v, &text);
+        }
     }
     v.push(0);
 }

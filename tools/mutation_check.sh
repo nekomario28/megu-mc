@@ -1233,6 +1233,14 @@ check "fluid handoff does not consume the ordinary runtime counter" \
   'self.next_order += pending.len() as i64; self.queue.unpack_generated(pending, now);' \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
+check "a sign message is a JSON string component" \
+  src/main.rs "    o.push('\"');" "    o.push(' ');" \
+  sign_side_nbt_matches_the_shape_the_game_writes
+
+check "a sign side carries filtered_messages" \
+  src/main.rs '    for list in ["filtered_messages", "messages"] {' '    for list in ["messages"] {' \
+  sign_side_nbt_matches_the_shape_the_game_writes
+
 check "the open window reads the live store, not a copy" \
   src/main.rs '    let ch = all.get(&pos).cloned().unwrap_or_default();' '    let ch: HashMap<i16, Stack> = HashMap::new();' \
   a_placed_chest_shows_its_staged_contents_in_the_open_window

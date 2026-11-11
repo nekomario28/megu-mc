@@ -991,6 +991,45 @@ mod tests {
         let _ = reg;
     }
 
+    /// The sign NBT the port emits must be the shape the game writes, or a client shows
+    /// blank lines: `messages` are JSON string components and a `filtered_messages` list
+    /// is present. The expectation is the encoding native produced in
+    /// `sign-probe6.log`, kept here as the contract this owner has to match.
+    #[test]
+    fn sign_side_nbt_matches_the_shape_the_game_writes() {
+        let lines = [
+            "Hi".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
+        let mut out = Vec::new();
+        crate::sign_side_nbt(&mut out, "front_text", &lines);
+        // `sign_side_nbt` writes a named compound, so read it as one.
+        let (name, tag) = crate::nbt::read_named(&out).expect("sign side parses");
+        assert_eq!(name.to_utf8().unwrap(), "front_text");
+        assert_eq!(tag.get("color").cloned(), Some(crate::nbt::Tag::String(crate::nbt::NbtString::text("white"))));
+        assert_eq!(tag.get("has_glowing_text").cloned(), Some(crate::nbt::Tag::Byte(0)));
+        let messages = match tag.get("messages") {
+            Some(crate::nbt::Tag::List(kind, items)) => {
+                assert_eq!(*kind, 8, "messages are a string list");
+                items.clone()
+            }
+            other => panic!("messages must be a string list, got {other:?}"),
+        };
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages[0],
+            crate::nbt::Tag::String(crate::nbt::NbtString::text("\"Hi\"")),
+            "a literal is a JSON string component, not a text object"
+        );
+        let filtered = match tag.get("filtered_messages") {
+            Some(crate::nbt::Tag::List(_, items)) => items.clone(),
+            other => panic!("filtered_messages must be present, got {other:?}"),
+        };
+        assert_eq!(filtered.len(), 4, "native always writes four filtered slots");
+    }
+
     /// The fossil contract must not move: a chest is still refused there, even though the
     /// shared placement owner now handles one for other callers.
     #[test]
