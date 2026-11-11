@@ -10,6 +10,9 @@ export PYTHONDONTWRITEBYTECODE=1
 # Keep a bound, but give the server load headroom.
 export MC_PROBE_DEADLINE="${MC_PROBE_DEADLINE:-30}"
 
+echo "== portable fluid trace comparator"
+python3 tests/fluid_trace_diff_test.py
+
 echo "== gate exit contracts"
 python3 tests/gate_scripts.py
 python3 tests/evidence_receipt_test.py
