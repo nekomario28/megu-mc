@@ -88,10 +88,10 @@ public final class TemplateInitOracle {
         C("ub").getMethod("a", String.class, String.class).invoke(lootTag, "CustomName", "{\"text\":\"Crate\"}");
         Object itemsTag = savedTag(chunk0, chestState, 6, 80, 4, provider);
 
-        Object chestInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
-                pos(0, 0, 0), chestState, lootTag);
         Object itemsInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
-                pos(0, 0, 1), chestState, itemsTag);
+                pos(0, 0, 0), chestState, itemsTag);
+        Object chestInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
+                pos(0, 0, 1), chestState, lootTag);
         Object stoneInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
                 pos(1, 0, 0), stoneState, null);
         Object palette = make(C("ent$a"), new Class<?>[]{List.class}, List.of(chestInfo, itemsInfo, stoneInfo));

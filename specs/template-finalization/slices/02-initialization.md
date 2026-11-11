@@ -130,6 +130,33 @@ Boundary: the entity is created by `LevelChunk.setBlockState` in a real server; 
 `ProtoChunk` does not, so the oracle registers one at the target and only claims the
 *load* path. Entities in the template, packet NBT, and save/reload remain unobserved.
 
+
+### Block: the port has no general placement path (2026-11-11)
+
+Tried to wire initialization into the existing placement and stopped at a real seam
+rather than loosening it:
+
+- `Template::place_solid_blocks` is the **fossil** path. Its admission is
+  "full-cube states only" (`is_template_solid == Some(true)`, the 26,684-state asset),
+  and a chest is not one: `validate_solid_placement` refuses it with
+  `solid template placement requires full cubes`. Native `placeInWorld` writes any
+  state, so the restriction is the port's, not the game's.
+- There is no general template placement path to put initialization into: the
+  structure-start / jigsaw pipeline that would call it does not exist yet.
+
+So initialization cannot be delivered by relaxing the fossil rule — that rule exists
+for fossils and every fossil palette entry is a full cube. The decoding contract is
+nevertheless settled and captured: `container_items` shape (Items list of
+Slot/id/count), the loot-table shadowing rule, the rotated cells, and the generated
+`LootTableSeed` all come from `tests/data/template_init_1211.tsv`.
+
+Stopped here with the WIP patch stored outside the repository
+(`~/.cache/mc-spine-audit/save-booking-20261110/init-port-wip.patch`): it adds a
+`Tag` decoder plus generation-owned container staging, and it is only useful once a
+general placement path exists to stage into. The next slice is that path (or an
+explicit decision to let non-fossil templates reuse the solid placement with a
+named non-full-cube exception).
+
 **No native initialization observation exists.** The contract above is bytecode
 evidence, not an executed comparison, and it must be confirmed by a run before any
 port work is accepted. Choosing the server route is a decision, not a next step:
