@@ -1246,11 +1246,11 @@ check "the open window reads the live store, not a copy" \
   a_placed_chest_shows_its_staged_contents_in_the_open_window
 
 check "staged containers reach the live store" \
-  src/main.rs '        for (pos, items) in staged {' '        for (pos, items) in Vec::<( (i32,i32,i32), Vec<(i16,i64,u8)>)>::new() {' \
+  src/main.rs '        for (pos, payload) in staged {' '        for (pos, payload) in Vec::<(( i32,i32,i32), crate::generation_context::StagedBlockEntity)>::new() {' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
 check "staged containers are taken from the generator once" \
-  src/worldgen.rs '        std::mem::take(&mut self.staged_containers)' '        Vec::new()' \
+  src/worldgen.rs '        std::mem::take(&mut self.staged_block_entities)' '        Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
 check "an entity offset flips the axis native flips" \
@@ -1262,7 +1262,7 @@ check "an entity offset keeps the pivot" \
   structure_transform::tests::entity_offset_transform_matches_native
 
 check "a placed sign stages its front lines" \
-  src/structure_template.rs '                Self::sign_lines(tag)?,' '                Default::default(),' \
+  src/structure_template.rs '            return Ok(StagedBlockEntity::Sign(Self::sign_lines(tag)?));' '            return Ok(StagedBlockEntity::Sign(Default::default()));' \
   template_sign_text_matches_native_and_reaches_the_sign_store
 
 check "a sign message that is not a string component is refused" \
@@ -1286,7 +1286,8 @@ check "furnace contents land in the furnace store" \
   template_furnace_contents_reach_the_furnace_store
 
 check "a placed container stages its contents" \
-  src/structure_template.rs 'ctx.containers.push((p, Self::container_items(tag)?));' 'let _ = Self::container_items(tag)?;' \
+  src/structure_template.rs '                    ctx.block_entities
+                        .push((p, Self::staged_payload(tag, state, reg)?));' '                    let _ = Self::staged_payload(tag, state, reg)?;' \
   template_container_items_match_native_placement
 
 check "template NBT other than container Items is refused" \
