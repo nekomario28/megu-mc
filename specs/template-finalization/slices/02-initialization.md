@@ -222,9 +222,19 @@ and no `filtered_messages`, so a real client would have shown blank lines. It no
 the game's shape, and `sign_side_nbt_matches_the_shape_the_game_writes` pins it with two
 compiling mutants (message form, filtered list). Log: `sign-probe6.log`.
 
-The template *fixture* still carries containers only: the sign rows need the corrected
-tag threaded through the oracle, which is the next step, and the port-side staging for
-sign text is not implemented yet.
+**Captured.** With that tag, the oracle places a sign on stone and the saved entity now
+reports the text, so the fixture carries both families (8 rows, two rotations):
+
+| case | cell | state | entity |
+|---|---|---|---|
+| none | 11,80,11 | `stone` | absent |
+| none | 11,81,11 | `oak_sign[rotation=0,…]` | `745749e0…`, text `'"Hi"'` then three empty |
+| clockwise_90 | 9,80,11 | `stone` | absent |
+| clockwise_90 | 9,81,11 | `oak_sign[rotation=4,…]` | `a2de47a0…`, same text |
+
+The sign needs the stone under it (the shape pass removes an unsupported one) and its
+state rotates while the text does not. Port-side staging for sign text is still not
+implemented, so the comparison test covers the chest and stone rows only.
 
 ### Earlier note: the port has no general placement path (2026-11-11)
 

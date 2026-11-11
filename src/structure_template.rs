@@ -757,10 +757,12 @@ mod tests {
             ),
         );
         let template = Template {
-            size: (2, 1, 1),
+            // Same two cells as the fixture rows compared below: the items chest at the
+            // template origin and the stone block at (1,0,1).
+            size: (2, 1, 2),
             palettes: vec![vec![
                 BlockInfo { pos: (0, 0, 0), state: chest, nbt: Some(Tag::Compound(items)) },
-                BlockInfo { pos: (1, 0, 0), state: stone, nbt: None },
+                BlockInfo { pos: (1, 0, 1), state: stone, nbt: None },
             ]],
             entities: Vec::new(),
         };
@@ -774,9 +776,8 @@ mod tests {
                 .lines()
                 .map(|line| line.split('\t').map(str::to_owned).collect())
                 .filter(|f: &Vec<String>| f[0] == case)
-                // This template is the items chest and the stone block. The fixture's
-                // third row is the loot-table chest, which the port refuses, so it is
-                // not a cell this placement writes.
+                // This template is the items chest and the stone block. The fixture's other
+                // rows are the loot-table chest (refused) and the sign (not staged yet).
                 .filter(|f: &Vec<String>| f[4] == "absent" || f[5] != "-")
                 .collect();
             let cells: Vec<(i32, i32, i32)> = rows.iter().map(|f| parse_cell(&f[2])).collect();

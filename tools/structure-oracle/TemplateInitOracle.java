@@ -92,12 +92,22 @@ public final class TemplateInitOracle {
                 pos(0, 0, 0), chestState, itemsTag);
         Object chestInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
                 pos(0, 0, 1), chestState, lootTag);
+        // The sign stands on stone, because a standing sign without support is removed by
+        // the shape pass. Its text comes from the game's own SignText codec: a hand-written
+        // tag without `filtered_messages` and with a text object loads as empty lines.
         Object stoneInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
-                pos(1, 0, 0), stoneState, null);
-        Object palette = make(C("ent$a"), new Class<?>[]{List.class}, List.of(chestInfo, itemsInfo, stoneInfo));
+                pos(1, 0, 1), stoneState, null);
+        Object signState = NativeHarness.state("oak_sign");
+        Object signTag = make(C("ub"), new Class<?>[]{});
+        C("ub").getMethod("a", String.class, C("uy")).invoke(signTag, "front_text", signTextOf(provider, "Hi"));
+        C("ub").getMethod("a", String.class, byte.class).invoke(signTag, "is_waxed", (byte) 0);
+        Object signInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
+                pos(1, 1, 1), signState, signTag);
+        Object palette = make(C("ent$a"), new Class<?>[]{List.class},
+                List.of(chestInfo, itemsInfo, stoneInfo, signInfo));
         Object template = make(C("ent"), new Class<?>[]{});
         fset(C("ent"), "l", template, List.of(palette));
-        fset(C("ent"), "n", template, make(C("kh"), new Class<?>[]{int.class, int.class, int.class}, 2, 1, 2));
+        fset(C("ent"), "n", template, make(C("kh"), new Class<?>[]{int.class, int.class, int.class}, 2, 2, 2));
         fset(C("ent"), "m", template, new ArrayList<>());
 
         String[] names = {"none", "clockwise_90"};
@@ -107,12 +117,13 @@ public final class TemplateInitOracle {
             Object target = pos(10, 80, 10);
             // Both chests need an entity where the rotation puts them: a ProtoChunk does
             // not create one. Offsets rotate with the template: (0,0,1) -> (-1,0,0) at 90.
-            int[][] chestOffsets = {{0, 0, 0}, {0, 0, 1}};
-            for (int[] off : chestOffsets) {
-                int ox = off[0], oz = off[2];
+            Object[][] beCells = {
+                {0, 0, 0, chestState}, {0, 0, 1, chestState}, {1, 1, 1, signState}};
+            for (Object[] cell : beCells) {
+                int ox = (int) cell[0], oy = (int) cell[1], oz = (int) cell[2];
                 int rx = r == 0 ? ox : -oz;
                 int rz = r == 0 ? oz : ox;
-                Object entity = blockEntityFor(chestState, pos(10 + rx, 80, 10 + rz));
+                Object entity = blockEntityFor(cell[3], pos(10 + rx, 80 + oy, 10 + rz));
                 chunk.getClass().getMethod("a", C("dqh")).invoke(chunk, entity);
             }
             NativeHarness.Level level = NativeHarness.levelOnChunk(
@@ -131,16 +142,53 @@ public final class TemplateInitOracle {
                 Object be = chunk.getClass().getMethod("c_", C("jd")).invoke(chunk, at);
                 String nbtHash = "absent";
                 String contents = "-";
+                String text = "-";
                 if (be != null) {
                     Object out = be.getClass().getMethod("b", C("jo$a")).invoke(be, provider);
                     nbtHash = StructureTemplateOracle.hash(canonicalBytes(out));
                     contents = contentsOf(be);
+                    text = signText(out);
                 }
                 System.out.println("INIT\t" + names[r] + "\t" + placed + "\t" + cell + "\t"
                         + NativeHarness.normalizedStateName(level.writes.get(cell)) + "\t" + nbtHash
-                        + "\t" + contents);
+                        + "\t" + contents + "\t" + text);
             }
         }
+    }
+
+    /** The front side the game itself encodes for four literal components. */
+    static Object signTextOf(Object worldgen, String first) throws Exception {
+        Object ops = C("jo$a").getMethod("a", Class.forName("com.mojang.serialization.DynamicOps"))
+                .invoke(worldgen, C("up").getField("a").get(null));
+        Object front = java.lang.reflect.Array.newInstance(C("wz"), 4);
+        Object back = java.lang.reflect.Array.newInstance(C("wz"), 4);
+        for (int i = 0; i < 4; i++) {
+            java.lang.reflect.Array.set(front, i,
+                    C("wz").getMethod("a", String.class).invoke(null, i == 0 ? first : ""));
+            java.lang.reflect.Array.set(back, i, C("wz").getMethod("a", String.class).invoke(null, ""));
+        }
+        Object text = make(C("drt"), new Class<?>[]{Class.forName("[Lwz;"), Class.forName("[Lwz;"),
+                C("cti"), boolean.class}, front, back, C("cti").getField("a").get(null), false);
+        Object codec = C("drt").getField("a").get(null);
+        Object encoded = Class.forName("com.mojang.serialization.Codec")
+                .getMethod("encodeStart", Class.forName("com.mojang.serialization.DynamicOps"), Object.class)
+                .invoke(codec, ops, text);
+        return encoded.getClass().getMethod("getOrThrow").invoke(encoded);
+    }
+
+    /** Front-side lines as native stored them, joined with `|`; `-` when not a sign. */
+    static String signText(Object tag) throws Exception {
+        Object front = C("ub").getMethod("c", String.class).invoke(tag, "front_text");
+        if (front == null) return "-";
+        Object messages = C("ub").getMethod("c", String.class).invoke(front, "messages");
+        if (messages == null) return "-";
+        int n = ((Number) C("uh").getMethod("size").invoke(messages)).intValue();
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            if (i > 0) out.append('|');
+            out.append(C("uh").getMethod("k", int.class).invoke(messages, i));
+        }
+        return out.toString();
     }
 
     static Object pos(int x, int y, int z) throws Exception {

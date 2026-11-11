@@ -13,7 +13,7 @@ class TemplateInitOutputTest(unittest.TestCase):
         return FIXTURE.read_text()
 
     def test_the_checked_fixture_validates(self):
-        self.assertEqual(len(validate_rows(self.fixture_text())), 6)
+        self.assertEqual(len(validate_rows(self.fixture_text())), 8)
 
     def test_a_missing_cell_is_rejected(self):
         rows = self.fixture_text().splitlines()
@@ -57,17 +57,16 @@ class TemplateInitOutputTest(unittest.TestCase):
     def test_probe_lines_are_extracted_around_the_log_prefix(self):
         hash = "d8d35ce80a1d3a91d843d7e6ad48b54eae9c14966df803f1cafbbe89a63a9a01"
         lines = []
-        for case, cells in (("none", [("1,2,3", "minecraft:chest", hash, "-"),
-                                      ("1,2,4", "minecraft:chest", hash, "0=3 minecraft:redstone"),
-                                      ("2,2,3", "minecraft:stone", "absent", "-")]),
-                            ("clockwise_90", [("1,2,3", "minecraft:chest", hash, "-"),
-                                              ("1,2,4", "minecraft:chest", hash, "0=3 minecraft:redstone"),
-                                              ("2,2,3", "minecraft:stone", "absent", "-")])):
-            for cell, state, nbt, contents in cells:
+        cells = [("1,2,3", "minecraft:chest", hash, "-", "-"),
+                 ("1,2,4", "minecraft:chest", hash, "0=3 minecraft:redstone", "-"),
+                 ("2,2,3", "minecraft:stone", "absent", "-", "-"),
+                 ("2,3,3", "minecraft:oak_sign[rotation=0]", hash, "-", "'\"Hi\"'|'\"\"'|'\"\"'|'\"\"'")]
+        for case in ("none", "clockwise_90"):
+            for cell, state, nbt, contents, text in cells:
                 lines.append("[12:00:00] [main/INFO]: [STDOUT]: INIT\t" + case + "\ttrue\t"
-                             + cell + "\t" + state + "\t" + nbt + "\t" + contents)
+                             + cell + "\t" + state + "\t" + nbt + "\t" + contents + "\t" + text)
         rows = rows_from_stdout("\n".join(lines) + "\n")
-        self.assertEqual(len(rows), 6)
+        self.assertEqual(len(rows), 8)
 
 
 if __name__ == "__main__":
