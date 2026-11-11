@@ -63,3 +63,38 @@ variability, and dump before any runtime tick.
   `decorated` fixture, because a single "diff count" cannot say which stage diverged.
 - Every full block state, plus heightmaps and pending ticks, with chunks that were skipped
   named rather than counted as equal.
+
+## First Overworld capture, and the stage mismatch it exposed (2026-11-11)
+
+A pinned 1.21.1 server was started once in an isolated directory (`/var/tmp/mc-native-overworld-20261111`,
+seed 0, `level-type=normal`, no players) with a datapack that empties every biome's
+`features` and `carvers` (`tools/nofeat_pack.py`; 2,545 placed-feature references and 264
+carver entries dropped, the same counts the historical End/Nether capture recorded). It
+generated its spawn chunks and was stopped, and chunk 0,0 was read back from the region
+file with `tools/terrain_chunk_dump.py` — name-based, because the numeric id space has no
+documented property-to-id order.
+
+Result: 32,526 non-air cells, deepslate/stone/dirt/bedrock/water/grass and **no ores**, so
+the pack did what it says.
+
+Comparing it against the port's own dump of the same chunk (98,304 cells, every y) gives
+**6,635 differences (6.75 %)** — and every one of them is a feature-placed block the port
+bakes into its terrain dump, against a native world where features were stripped:
+
+| native | port | cells |
+|---|---|---:|
+| stone | andesite / diorite / granite | 3,673 |
+| deepslate | tuff | 1,417 |
+| deepslate | gravel / dirt / sand | 760 |
+| stone | coal_ore / iron_ore | 178 |
+| … 25 more pairs | | |
+
+So this is **not** a parity result, and it is worth recording precisely because the first
+number looked like one: the two sides are at different stages. The port's `MC_SPINE_WG_DUMP`
+is not terrain-only — it includes the blocks a feature pass places — while the native
+world had every feature removed. Either the native capture must keep features, or the port
+needs a stage-limited dump; comparing the current pair would measure the nofeit pack.
+
+Next: run the same server **without** the stripper (features on) into a fresh directory,
+capture twice to measure the server's own variability, and only then interpret a residual —
+per dimension and per stage, never as one number.
