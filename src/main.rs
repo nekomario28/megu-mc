@@ -5585,6 +5585,27 @@ fn fuel_ticks(item: i64) -> i32 {
     0
 }
 static CHESTS: Registry<BlockPos, HashMap<i16, Stack>> = OnceLock::new();
+/// Move template-staged container contents into the one live container store.
+///
+/// Called after feature population has released the generator lock, so the order is
+/// save -> containers here and save -> world -> containers on the save path: the store
+/// is never written while the save is reading it, and a second call for the same
+/// position simply rewrites identical contents.
+fn materialize_containers(staged: Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)>) {
+    if staged.is_empty() {
+        return;
+    }
+    with_save_guard(|| {
+        let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
+        for (pos, items) in staged {
+            let slots = store.entry(pos).or_default();
+            for (slot, item, count) in items {
+                slots.insert(slot, (item, count, Vec::new()));
+            }
+        }
+    });
+}
+
 fn chests() -> &'static LockedMap<BlockPos, HashMap<i16, Stack>> {
     CHESTS.get_or_init(|| Mutex::new(HashMap::new()))
 }

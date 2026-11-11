@@ -840,6 +840,69 @@ mod tests {
         }
     }
 
+    /// The handoff the fixture cannot show: staged contents must reach the one live
+    /// container store, and survive a save/reload, or a placed chest is right in the
+    /// generation layer and empty in game.
+    #[test]
+    fn staged_container_contents_reach_the_store_and_survive_a_save() {
+        let reg = crate::block_registry::breg().unwrap();
+        let chest = reg.state_of("minecraft:chest", None);
+        let mut items = std::collections::BTreeMap::new();
+        items.insert(
+            NbtString::text("Items"),
+            Tag::List(10, vec![container_entry(0, "minecraft:redstone", 3)]),
+        );
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: chest, nbt: Some(Tag::Compound(items)) }]],
+            entities: Vec::new(),
+        };
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        {
+            let mut ctx = crate::generation_context::FC::new(&mut g);
+            ctx.test_no_terrain = true;
+            let cell = (2, 70, 2);
+            ctx.test_base_cell(cell, reg.state_of("minecraft:air", None));
+            for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+                ctx.test_base_cell((cell.0 + dx, cell.1 + dy, cell.2 + dz), reg.state_of("minecraft:air", None));
+            }
+            let mut rng = crate::generation_math::Xor::seed_worldgen(3);
+            let placement = Placement {
+                origin: cell,
+                pivot: (0, 0, 0),
+                mirror: crate::structure_transform::Mirror::None,
+                rotation: crate::structure_transform::Rotation::None,
+            };
+            assert!(template
+                .place_blocks(&mut ctx, &mut rng, placement, &[], [0, 0, 0, 31, 255, 31])
+                .is_ok());
+            assert_eq!(ctx.containers.len(), 1, "placement stages the contents");
+            let mut staged = std::mem::take(&mut ctx.containers);
+            g.stage_containers(&mut staged);
+        }
+        let staged = g.take_staged_containers();
+        assert_eq!(staged.len(), 1, "the generator holds the staged contents once");
+        assert!(g.take_staged_containers().is_empty(), "taking them twice yields nothing");
+        crate::materialize_containers(staged);
+        let redstone = crate::name_to_item("minecraft:redstone").unwrap() as i64;
+        assert_eq!(
+            crate::chests().lock().unwrap().get(&(2, 70, 2)).cloned(),
+            Some([(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect()),
+            "the live store holds what the template staged"
+        );
+        // Save and reload: the contents must come back, not just the block.
+        let mut buffer = Vec::new();
+        crate::save_world_into(&mut buffer);
+        crate::chests().lock().unwrap().clear();
+        crate::load_world_from(&buffer).unwrap();
+        assert_eq!(
+            crate::chests().lock().unwrap().get(&(2, 70, 2)).cloned(),
+            Some([(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect()),
+            "a saved container comes back with its contents"
+        );
+        crate::chests().lock().unwrap().remove(&(2, 70, 2));
+    }
+
     /// The fossil contract must not move: a chest is still refused there, even though the
     /// shared placement owner now handles one for other callers.
     #[test]

@@ -151,9 +151,21 @@ contents match `tests/data/template_init_1211.tsv`. `the_fossil_contract_still_r
 pins that a chest is still refused on the fossil path, and both behaviours have their
 own compiling mutant.
 
-Still open, and deliberately not claimed: the runtime handoff that turns staged contents
-into live chests, packet NBT, and save/reload. A chest placed this way is correct in the
-generation layer and empty in game until that handoff exists.
+**Handoff (same day).** `Gen::stage_containers` holds the staged cells per generator, and
+`worldgen::block_state` — the one place that owns the generator lock — takes them out
+*after* releasing it and calls `materialize_containers`, which inserts into `chests()`
+under the save guard. The order matters: the block write path takes save → generator, so
+doing this the other way round would be an ABBA deadlock. A second call for the same
+position rewrites identical contents, and `take_staged_containers` empties the holding
+area so nothing is applied twice.
+
+`staged_container_contents_reach_the_store_and_survive_a_save` proves the whole chain:
+placement stages, the generator holds it once, the live store receives it, and a
+save/reload brings the contents back. Both the materialiser and the take have their own
+compiling mutant.
+
+Still open, and deliberately not claimed: packet NBT for the opened container, template
+entities, and any block entity kind other than a container with explicit `Items`.
 
 ### Earlier note: the port has no general placement path (2026-11-11)
 

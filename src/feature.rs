@@ -8453,7 +8453,11 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             }
         }
     }
+    // Taken before the writes because `ctx` borrows the generator; the containers ride
+    // the same population and move into the runtime store as soon as the lock is released.
+    let mut staged_containers = std::mem::take(&mut ctx.containers);
     for ((x, y, z), st) in std::mem::take(&mut ctx.wr) {
         g.feat_write(x, y, z, st);
     }
+    g.stage_containers(&mut staged_containers);
 }

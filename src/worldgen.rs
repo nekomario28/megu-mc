@@ -502,6 +502,11 @@ pub struct Gen {
     col_ord: Vec<(i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
     feat_c: HashMap<(i32, i32), HashMap<u32, u32>>,
+    /// Container contents staged by template placement during feature population.
+    /// Generation-owned: they are moved into the runtime container store as soon as
+    /// this generator's lock is released (see `block_state`), never kept as a second
+    /// live store.
+    staged_containers: Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)>,
     feat_ord: Vec<(i32, i32)>,
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
@@ -773,6 +778,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
+            staged_containers: Vec::new(),
             feat_ord: Vec::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
@@ -2874,6 +2880,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
+            staged_containers: Vec::new(),
             feat_ord: Vec::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
@@ -3560,6 +3567,16 @@ impl Gen {
         }
         self.feat_c.entry(key).or_default().insert(k, st);
     }
+    pub(crate) fn stage_containers(&mut self, items: &mut Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)>) {
+        self.staged_containers.append(items);
+    }
+
+    /// Hand the staged contents to the caller. Taken by value so a second call cannot
+    /// double-apply them.
+    pub(crate) fn take_staged_containers(&mut self) -> Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)> {
+        std::mem::take(&mut self.staged_containers)
+    }
+
     pub(crate) fn wseed(&self) -> u64 {
         self.world_seed
     }
@@ -4132,9 +4149,19 @@ pub fn block_state(
     z: i32,
     populate: impl FnMut(&mut Gen, i32, i32),
 ) -> Option<u32> {
-    gen_lock()
-        .as_mut()
-        .map(|g| g.block_state_at(x, y, z, populate))
+    // The lock is released before the containers move: materialising them takes the
+    // save lock, and the block write path already takes save -> generator, so doing it
+    // the other way round here would be an ABBA deadlock.
+    let (state, staged) = {
+        let mut guard = gen_lock();
+        let g = guard.as_mut()?;
+        let state = g.block_state_at(x, y, z, populate);
+        (state, g.take_staged_containers())
+    };
+    if !staged.is_empty() {
+        crate::materialize_containers(staged);
+    }
+    Some(state)
 }
 
 /// Base terrain states for one 16x16x16 section, in the send layout

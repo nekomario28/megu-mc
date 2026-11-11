@@ -1233,6 +1233,14 @@ check "fluid handoff does not consume the ordinary runtime counter" \
   'self.next_order += pending.len() as i64; self.queue.unpack_generated(pending, now);' \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
+check "staged containers reach the live store" \
+  src/main.rs '        for (pos, items) in staged {' '        for (pos, items) in Vec::<( (i32,i32,i32), Vec<(i16,i64,u8)>)>::new() {' \
+  staged_container_contents_reach_the_store_and_survive_a_save
+
+check "staged containers are taken from the generator once" \
+  src/worldgen.rs '        std::mem::take(&mut self.staged_containers)' '        Vec::new()' \
+  staged_container_contents_reach_the_store_and_survive_a_save
+
 check "a placed container stages its contents" \
   src/structure_template.rs 'ctx.containers.push((p, Self::container_items(tag)?));' 'let _ = Self::container_items(tag)?;' \
   template_container_items_match_native_placement
