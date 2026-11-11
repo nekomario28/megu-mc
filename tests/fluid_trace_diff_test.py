@@ -74,7 +74,7 @@ def main() -> None:
     expect_invalid(fixture(BASE), fixture(BASE).replace("34\n", "26684\n"))
     expect_invalid(fixture(BASE), fixture(BASE).replace("# version=1.21.1", "# version=1.21.8"))
     expect_invalid(fixture(BASE), fixture(BASE).replace("# scenario=water_hole", "# scenario=other"))
-    print("fluid trace comparator: 15 positive/negative controls PASS")
+    print("fluid trace comparator: 14 positive/negative controls PASS")
 
 
 if __name__ == "__main__":
