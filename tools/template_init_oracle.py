@@ -26,7 +26,7 @@ from vanilla_java import DEFAULT_JAR, pinned_runtime, run_probe  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 FIXTURE = REPO / "tests/data/template_init_1211.tsv"
-COLUMNS = ("case", "placed", "cell", "state", "nbt")
+COLUMNS = ("case", "placed", "cell", "state", "nbt", "contents")
 
 
 def datapack(inner, work):
@@ -47,7 +47,7 @@ def validate_rows(text):
     for row in rows:
         if len(row) != len(COLUMNS):
             raise ValueError(f"expected {len(COLUMNS)} columns, got {len(row)}: {row}")
-        case, placed, cell, state, nbt = row
+        case, placed, cell, state, nbt, contents = row
         if placed not in ("true", "false"):
             raise ValueError(f"placed must be true or false: {row}")
         key = (case, cell)
@@ -61,6 +61,13 @@ def validate_rows(text):
             raise ValueError(f"state must be namespaced: {state}")
         if nbt != "absent" and (len(nbt) != 64 or any(c not in "0123456789abcdef" for c in nbt)):
             raise ValueError(f"nbt must be a SHA-256 or 'absent': {nbt}")
+        if contents != "-":
+            for entry in contents.split(";"):
+                slot, _, stack = entry.partition("=")
+                if not slot.isdigit() or " " not in stack:
+                    raise ValueError(f"contents entry must be slot=count id: {entry}")
+        if contents != "-" and nbt == "absent":
+            raise ValueError(f"contents reported without a block entity: {cell}")
     cases = {row[0] for row in rows}
     if cases != {"none", "clockwise_90"}:
         raise ValueError(f"both rotations must be covered, got {sorted(cases)}")
@@ -68,14 +75,18 @@ def validate_rows(text):
     # has lost or duplicated a write, which is exactly what this oracle exists to see.
     for case in cases:
         cells = [row for row in rows if row[0] == case]
-        if len(cells) != 2:
-            raise ValueError(f"case {case} reported {len(cells)} cells, expected 2")
+        if len(cells) != 3:
+            raise ValueError(f"case {case} reported {len(cells)} cells, expected 3")
     # The negative control is the point: a cell without NBT must report no entity.
     if not any(row[4] == "absent" for row in rows):
         raise ValueError("no cell without a block entity: the control is missing")
     # And the placed case must actually carry an entity, or nothing was initialized.
     if not any(row[4] != "absent" for row in rows):
         raise ValueError("no cell with a block entity: nothing was initialized")
+    # One cell must show decoded stacks: a fixture with entities but no contents would
+    # pass while the item component path was broken.
+    if not any(row[5] != "-" for row in rows):
+        raise ValueError("no cell with decoded contents: the item path was not exercised")
     return rows
 
 

@@ -95,14 +95,18 @@ Log: `init-probe-attempt3.log` (probe source in the audit directory).
 ### Observed contract (2026-11-11, `tools/template_init_oracle.py`)
 
 The datapack recipe above plus one supplied entity reaches the native load. What the
-run reports, in `tests/data/template_init_1211.tsv` (4 cells, two rotations):
+run reports, in `tests/data/template_init_1211.tsv` (6 cells, two rotations, three
+palette entries: a loot-table chest, an explicit-contents chest, and a plain stone
+control):
 
 | case | cell | state | entity |
 |---|---|---|---|
 | none | 10,80,10 | `chest[facing=north,type=single,waterlogged=false]` | `d8d35ce8…` |
 | none | 11,80,10 | `stone` | absent |
+| none | 10,80,11 | `chest[facing=north,…]` | `583036aa…` (`0=3 redstone`, `2=1 diamond`) |
 | clockwise_90 | 10,80,10 | `chest[facing=east,…]` | `d8d35ce8…` |
 | clockwise_90 | 10,80,11 | `stone` | absent |
+| clockwise_90 | 9,80,10 | `chest[facing=east,…]` | `2ee5a92e…` (same stacks) |
 
 Three facts a port has to reproduce, none of which are visible from the template
 bytes alone:
@@ -114,6 +118,13 @@ bytes alone:
    come from the same draw order.
 3. The state is written **rotated** (north → east) and the tag is loaded after the
    air clear and the state write, so the entity sees the final state.
+
+4. **A loot table shadows the items.** A container that still holds a loot table
+   saves the table *instead of* its contents, so one cell cannot show both: the
+   first attempt to observe `Items` failed for exactly this reason (the tag carried
+   `LootTable` and the stacks were silently absent from the saved entity). They are
+   separate palette entries for that reason, and a port that stores both in one place
+   would be wrong in the same way.
 
 Boundary: the entity is created by `LevelChunk.setBlockState` in a real server; a
 `ProtoChunk` does not, so the oracle registers one at the target and only claims the

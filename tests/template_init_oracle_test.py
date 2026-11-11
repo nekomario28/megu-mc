@@ -13,7 +13,7 @@ class TemplateInitOutputTest(unittest.TestCase):
         return FIXTURE.read_text()
 
     def test_the_checked_fixture_validates(self):
-        self.assertEqual(len(validate_rows(self.fixture_text())), 4)
+        self.assertEqual(len(validate_rows(self.fixture_text())), 6)
 
     def test_a_missing_cell_is_rejected(self):
         rows = self.fixture_text().splitlines()
@@ -25,12 +25,22 @@ class TemplateInitOutputTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_rows("\n".join(rows + [rows[0]]) + "\n")
 
-    def test_a_missing_entity_or_a_missing_control_is_rejected(self):
+    def test_a_fixture_without_entities_is_rejected(self):
         rows = [line.split("\t") for line in self.fixture_text().splitlines()]
-        for index, row in enumerate(rows):
-            row = list(row)
-            row[4] = "absent"
-            rows[index] = row
+        rows = [[*row[:4], "absent", "-"] for row in rows]
+        with self.assertRaises(ValueError):
+            validate_rows("\n".join("\t".join(r) for r in rows) + "\n")
+
+    def test_a_fixture_without_decoded_contents_is_rejected(self):
+        rows = [line.split("\t") for line in self.fixture_text().splitlines()]
+        rows = [[*row[:5], "-"] for row in rows]
+        with self.assertRaises(ValueError):
+            validate_rows("\n".join("\t".join(r) for r in rows) + "\n")
+
+    def test_contents_without_an_entity_is_rejected(self):
+        rows = [line.split("\t") for line in self.fixture_text().splitlines()]
+        entity_row = next(r for r in rows if r[5] != "-")
+        entity_row[4] = "absent"
         with self.assertRaises(ValueError):
             validate_rows("\n".join("\t".join(r) for r in rows) + "\n")
 
@@ -45,15 +55,19 @@ class TemplateInitOutputTest(unittest.TestCase):
             rows_from_stdout("nothing here\n")
 
     def test_probe_lines_are_extracted_around_the_log_prefix(self):
-        rows = rows_from_stdout("[12:00:00] [main/INFO]: [STDOUT]: INIT\tnone\ttrue\t1,2,3\t"
-                                "minecraft:chest\td8d35ce80a1d3a91d843d7e6ad48b54eae9c14966df803f1cafbbe89a63a9a01\n"
-                                "[12:00:00] [main/INFO]: [STDOUT]: INIT\tnone\ttrue\t2,2,3\t"
-                                "minecraft:stone\tabsent\n"
-                                "[12:00:00] [main/INFO]: [STDOUT]: INIT\tclockwise_90\ttrue\t1,2,3\t"
-                                "minecraft:chest\td8d35ce80a1d3a91d843d7e6ad48b54eae9c14966df803f1cafbbe89a63a9a01\n"
-                                "[12:00:00] [main/INFO]: [STDOUT]: INIT\tclockwise_90\ttrue\t2,2,3\t"
-                                "minecraft:stone\tabsent\n")
-        self.assertEqual(len(rows), 4)
+        hash = "d8d35ce80a1d3a91d843d7e6ad48b54eae9c14966df803f1cafbbe89a63a9a01"
+        lines = []
+        for case, cells in (("none", [("1,2,3", "minecraft:chest", hash, "-"),
+                                      ("1,2,4", "minecraft:chest", hash, "0=3 minecraft:redstone"),
+                                      ("2,2,3", "minecraft:stone", "absent", "-")]),
+                            ("clockwise_90", [("1,2,3", "minecraft:chest", hash, "-"),
+                                              ("1,2,4", "minecraft:chest", hash, "0=3 minecraft:redstone"),
+                                              ("2,2,3", "minecraft:stone", "absent", "-")])):
+            for cell, state, nbt, contents in cells:
+                lines.append("[12:00:00] [main/INFO]: [STDOUT]: INIT\t" + case + "\ttrue\t"
+                             + cell + "\t" + state + "\t" + nbt + "\t" + contents)
+        rows = rows_from_stdout("\n".join(lines) + "\n")
+        self.assertEqual(len(rows), 6)
 
 
 if __name__ == "__main__":

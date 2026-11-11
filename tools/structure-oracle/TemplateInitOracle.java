@@ -76,41 +76,45 @@ public final class TemplateInitOracle {
         Object provider = worldgen;
         Object chestState = NativeHarness.state("chest");
         Object stoneState = NativeHarness.state("stone");
-        Object zero = C("jd").getConstructor(int.class, int.class, int.class).newInstance(0, 0, 0);
-
-        // Template: a chest that carries NBT at (0,0,0), a plain stone block at (1,0,0).
-        // The tag is produced by a real entity, then extended with the two keys a
-        // structure would store, so the decoding path is the game's own.
         Object chunk0 = chunk(0, 0, worldgen);
-        Object seedPos = C("jd").getConstructor(int.class, int.class, int.class).newInstance(4, 80, 4);
-        Object seedEntity = blockEntityFor(chestState, seedPos);
-        chunk0.getClass().getMethod("a", C("dqh")).invoke(chunk0, seedEntity);
-        chunk0.getClass().getMethod("a", C("jd"), C("dtc"), boolean.class).invoke(chunk0, seedPos, chestState, false);
-        Object saved = seedEntity.getClass().getMethod("b", C("jo$a")).invoke(seedEntity, provider);
-        Object tag = C("ub").getConstructor().newInstance();
-        for (Object key : (Set<?>) C("ub").getMethod("e").invoke(saved)) {
-            Object value = C("ub").getMethod("c", String.class).invoke(saved, key);
-            C("ub").getMethod("a", String.class, C("uy")).invoke(tag, key, value);
-        }
-        C("ub").getMethod("a", String.class, String.class).invoke(tag, "LootTable", "minecraft:chests/simple_dungeon");
-        C("ub").getMethod("a", String.class, String.class).invoke(tag, "CustomName", "{\"text\":\"Crate\"}");
 
-        Object chestInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")}, zero, chestState, tag);
+        // Two tags, built from real entities so the encoding is the game's own:
+        // a loot-table chest and a chest with explicit stacks. They must be separate
+        // cells: a container that still holds a loot table saves the table INSTEAD of
+        // its items (`RandomizableContainerBlockEntity.saveAdditional`), so one cell
+        // cannot show both.
+        Object lootTag = savedTag(chunk0, chestState, 4, 80, 4, provider);
+        C("ub").getMethod("a", String.class, String.class).invoke(lootTag, "LootTable", "minecraft:chests/simple_dungeon");
+        C("ub").getMethod("a", String.class, String.class).invoke(lootTag, "CustomName", "{\"text\":\"Crate\"}");
+        Object itemsTag = savedTag(chunk0, chestState, 6, 80, 4, provider);
+
+        Object chestInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
+                pos(0, 0, 0), chestState, lootTag);
+        Object itemsInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
+                pos(0, 0, 1), chestState, itemsTag);
         Object stoneInfo = make(C("ent$c"), new Class<?>[]{C("jd"), C("dtc"), C("ub")},
-                C("jd").getConstructor(int.class, int.class, int.class).newInstance(1, 0, 0), stoneState, null);
-        Object palette = make(C("ent$a"), new Class<?>[]{List.class}, List.of(chestInfo, stoneInfo));
+                pos(1, 0, 0), stoneState, null);
+        Object palette = make(C("ent$a"), new Class<?>[]{List.class}, List.of(chestInfo, itemsInfo, stoneInfo));
         Object template = make(C("ent"), new Class<?>[]{});
         fset(C("ent"), "l", template, List.of(palette));
-        fset(C("ent"), "n", template, make(C("kh"), new Class<?>[]{int.class, int.class, int.class}, 2, 1, 1));
+        fset(C("ent"), "n", template, make(C("kh"), new Class<?>[]{int.class, int.class, int.class}, 2, 1, 2));
         fset(C("ent"), "m", template, new ArrayList<>());
 
         String[] names = {"none", "clockwise_90"};
         Object[] rotations = {C("dmm").getField("a").get(null), C("dmm").getField("b").get(null)};
         for (int r = 0; r < names.length; r++) {
             Object chunk = chunk(0, 0, worldgen);
-            Object target = C("jd").getConstructor(int.class, int.class, int.class).newInstance(10, 80, 10);
-            Object entity = blockEntityFor(chestState, target);
-            chunk.getClass().getMethod("a", C("dqh")).invoke(chunk, entity);
+            Object target = pos(10, 80, 10);
+            // Both chests need an entity where the rotation puts them: a ProtoChunk does
+            // not create one. Offsets rotate with the template: (0,0,1) -> (-1,0,0) at 90.
+            int[][] chestOffsets = {{0, 0, 0}, {0, 0, 1}};
+            for (int[] off : chestOffsets) {
+                int ox = off[0], oz = off[2];
+                int rx = r == 0 ? ox : -oz;
+                int rz = r == 0 ? oz : ox;
+                Object entity = blockEntityFor(chestState, pos(10 + rx, 80, 10 + rz));
+                chunk.getClass().getMethod("a", C("dqh")).invoke(chunk, entity);
+            }
             NativeHarness.Level level = NativeHarness.levelOnChunk(
                     (x, y, z) -> NativeHarness.state("minecraft:air"), chunk, provider);
             Object settings = make(C("enp"), new Class<?>[]{});
@@ -123,18 +127,71 @@ public final class TemplateInitOracle {
             Collections.sort(cells);
             for (String cell : cells) {
                 String[] xyz = cell.split(",");
-                Object pos = C("jd").getConstructor(int.class, int.class, int.class)
-                        .newInstance(Integer.parseInt(xyz[0]), Integer.parseInt(xyz[1]), Integer.parseInt(xyz[2]));
-                Object be = chunk.getClass().getMethod("c_", C("jd")).invoke(chunk, pos);
+                Object at = pos(Integer.parseInt(xyz[0]), Integer.parseInt(xyz[1]), Integer.parseInt(xyz[2]));
+                Object be = chunk.getClass().getMethod("c_", C("jd")).invoke(chunk, at);
                 String nbtHash = "absent";
+                String contents = "-";
                 if (be != null) {
                     Object out = be.getClass().getMethod("b", C("jo$a")).invoke(be, provider);
                     nbtHash = StructureTemplateOracle.hash(canonicalBytes(out));
+                    contents = contentsOf(be);
                 }
                 System.out.println("INIT\t" + names[r] + "\t" + placed + "\t" + cell + "\t"
-                        + NativeHarness.normalizedStateName(level.writes.get(cell)) + "\t" + nbtHash);
+                        + NativeHarness.normalizedStateName(level.writes.get(cell)) + "\t" + nbtHash
+                        + "\t" + contents);
             }
         }
+    }
+
+    static Object pos(int x, int y, int z) throws Exception {
+        return C("jd").getConstructor(int.class, int.class, int.class).newInstance(x, y, z);
+    }
+
+    /** A chest tag produced by a real entity: one redstone at slot 0, one diamond at slot 2. */
+    static Object savedTag(Object chunk, Object chestState, int x, int y, int z, Object provider) throws Exception {
+        Object at = pos(x, y, z);
+        Object entity = blockEntityFor(chestState, at);
+        chunk.getClass().getMethod("a", C("dqh")).invoke(chunk, entity);
+        chunk.getClass().getMethod("a", C("jd"), C("dtc"), boolean.class).invoke(chunk, at, chestState, false);
+        setStack(entity, 0, "minecraft:redstone", 3);
+        setStack(entity, 2, "minecraft:diamond", 1);
+        return entity.getClass().getMethod("b", C("jo$a")).invoke(entity, provider);
+    }
+
+    static void setStack(Object entity, int slot, String id, int count) throws Exception {
+        Object item = C("lt").getField("g").get(null);
+        Object rl = C("akr").getMethod("a", String.class).invoke(null, id);
+        Object value = item.getClass().getMethod("a", C("akr")).invoke(item, rl);
+        Object stack = C("cuq").getDeclaredConstructor(C("dcv"), int.class).newInstance(value, count);
+        for (Method m : entity.getClass().getMethods()) {
+            if (m.getName().equals("a") && m.getParameterCount() == 2
+                    && m.getParameterTypes()[0] == int.class && m.getParameterTypes()[1] == C("cuq")) {
+                m.invoke(entity, slot, stack);
+                return;
+            }
+        }
+        throw new AssertionError("no setItem on the container");
+    }
+
+    /** Contents read through the live container, so the fixture is semantic, not a blob. */
+    static String contentsOf(Object entity) throws Exception {
+        StringBuilder out = new StringBuilder();
+        for (Method m : entity.getClass().getMethods()) {
+            if (m.getName().equals("a") && m.getParameterCount() == 1
+                    && m.getParameterTypes()[0] == int.class
+                    && m.getReturnType().getSimpleName().equals("cuq")) {
+                for (int slot = 0; slot < 9; slot++) {
+                    Object stack = m.invoke(entity, slot);
+                    String text = String.valueOf(stack);
+                    // An empty stack renders as "0 minecraft:air"; it is not a stored item.
+                    if (text.startsWith("0 ")) continue;
+                    if (out.length() > 0) out.append(';');
+                    out.append(slot).append('=').append(text);
+                }
+                return out.length() == 0 ? "-" : out.toString();
+            }
+        }
+        return "-";
     }
 
     static byte[] canonicalBytes(Object tag) throws Exception {
