@@ -249,6 +249,26 @@ captured message, stages `["Hi","","",""]`, and checks the sign store; two compi
 mutants cover the decode and the store routing. The container comparison test also runs
 against the same fixture.
 
+### Entity geometry captured; creation still refused (2026-11-11)
+
+`StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)` is the placement-visible
+half of template entities and needs no level, so it is captured in
+`tests/data/template_entity_1211.tsv`: 216 rows over two pivots, three mirrors, four
+rotations and nine offsets. `structure_transform::entity` already existed but had **no
+native comparison**; it now passes all 216 rows, and two compiling mutants cover the
+mirror axis and the pivot term.
+
+The capture also documented a trap: the port's `Mirror` variant names are **swapped**
+relative to native (`LeftRight` flips `z` like native `FRONT_BACK`). `from_index` keeps the
+composition correct, so a caller must map the stored *index*, never the name; the doc
+comment now says so.
+
+Creation is a different matter and stays refused: native `placeEntities` calls
+`createEntityIgnoreException` → `EntityType.create(tag, level)`, and this harness has no
+`Level` (the same wall as sign `setText` and as the chunk's biome). A template carrying
+entities is therefore rejected by `validate_placement` — correct-by-failure rather than
+silent loss — and no port entity placement is claimed.
+
 ### Earlier note: the port has no general placement path (2026-11-11)
 
 Tried to wire initialization into the existing placement and stopped at a real seam
