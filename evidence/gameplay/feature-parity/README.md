@@ -3,6 +3,16 @@
 2026-10-20。地形（density・surface rule・bedrock）が 0 セル一致した後の、
 feature 層の残差を閉じるための記録。
 
+> **更新 (2026-11-12): 同じ seed 0 / chunk (0,0) で残差は 0 セルになった。**
+> 下の「11.1%」は 2026-10-20 時点の記録で、その後の codec・feature・template の修正前の値。
+> 現在の実測は、pinned 1.21.1 server を隔離ディレクトリで動かして取った chunk (0,0) を
+> `tests/data/overworld_chunk_0_0_1211.tsv.gz` として固定し、
+> `worldgen::wg_tests::overworld_chunk_matches_native_capture_state_for_state` が
+> **正規化 state（名前＋全プロパティ）で 32,518 / 32,518 セル一致**を要求する。
+> 参照側は同一入力の2回実行で 4 セルばらつく（diorite ↔ andesite、座標は provenance に記載）ので、
+> 「0 セル」は**そのばらつきの床に対して**の値。範囲は 1 chunk・1 seed・Overworld・
+> ストラクチャ/エンティティ対象外で、11.1% が測った別シーンの残差を丸めたものではない。
+
 ## 出発点
 
 feature/carver を止めない比較（seed 0、chunk (0,0)、wire 復号）は
