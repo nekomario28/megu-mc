@@ -1253,6 +1253,14 @@ check "staged containers are taken from the generator once" \
   src/worldgen.rs '        std::mem::take(&mut self.staged_block_entities)' '        Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
+check "the canonical state keeps its properties" \
+  src/block_registry.rs '            format!("{}[{}]", name, parts.join(","))' '            name' \
+  overworld_chunk_matches_native_capture_state_for_state
+
+check "an Overworld chunk falls back to the deep state" \
+  src/worldgen.rs '            let st = self.deep_state_cached(x, y, z, cc);' '            let st = self.def_st;' \
+  overworld_chunk_matches_native_capture_state_for_state
+
 check "an entity offset flips the axis native flips" \
   src/structure_transform.rs '        Mirror::LeftRight => z = 1.0 - z,' '        Mirror::LeftRight => x = 1.0 - x,' \
   structure_transform::tests::entity_offset_transform_matches_native

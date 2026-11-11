@@ -132,3 +132,19 @@ compared, and one chunk says nothing about other seeds, biomes or the second cap
 Everything needed to repeat it is in the tree: `tools/nofeat_pack.py` (stage-limited
 capture), `tools/terrain_chunk_dump.py` (name-based dump), and the port's own
 `MC_SPINE_WG_DUMP` (requires `MC_SPINE_WG_PROFILE`, else it refuses to run).
+
+## The Overworld corpus is now in the tree, at full state level (2026-11-11)
+
+`tests/data/overworld_chunk_0_0_1211.tsv.gz` (88 KB, 32,518 non-air cells, with a
+`.provenance.json`) is that capture, and
+`worldgen::wg_tests::overworld_chunk_matches_native_capture_state_for_state` regenerates the
+chunk and compares **canonical state strings** — name plus every property, sorted — so a
+stair facing the wrong way or a water level that is off now fails the gate. The port matches
+all 32,518 cells, and two compiling mutants cover it: dropping the properties from the
+canonical form, and replacing the deep-state fallback with the dimension default.
+
+The name-only comparison above is kept in the record because it is what exposed the stage
+mismatch; this test supersedes it as the gate.
+
+Still true, and not claimed: one chunk, one seed, Overworld only, no structures/entities,
+and the reference itself varies in 4 cells between runs (named in the provenance).

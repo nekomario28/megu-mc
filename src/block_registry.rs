@@ -1071,6 +1071,32 @@ impl BReg {
         self.get_prop(st, "distance")?.parse().ok()
     }
 
+    /// `minecraft:name[a=1,b=2]` with the property names sorted, the same spelling the
+    /// region reader emits for a saved chunk. Whole-chunk comparison needs this: a name-only
+    /// diff counts a stair facing the wrong way as equal.
+    pub(crate) fn canonical_state(&self, st: u32) -> String {
+        let Some(blk) = self.st_blk.get(st as usize).map(|b| *b as usize) else {
+            return format!("<state {st} outside the registry>");
+        };
+        let name = self.bname.get(blk).cloned().unwrap_or_default();
+        let mut parts: Vec<String> = self
+            .props
+            .get(blk)
+            .map(|props| {
+                props
+                    .iter()
+                    .filter_map(|p| self.get_prop(st, &p.name).map(|v| format!("{}={}", p.name, v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        parts.sort();
+        if parts.is_empty() {
+            name
+        } else {
+            format!("{}[{}]", name, parts.join(","))
+        }
+    }
+
     pub(crate) fn get_prop(&self, st: u32, prop: &str) -> Option<String> {
         let bi = *self.st_blk.get(st as usize)?;
         let ps = &self.props[bi as usize];

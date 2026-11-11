@@ -5143,6 +5143,81 @@ mod wg_tests {
         assert_eq!(compared, 655_360);
     }
 
+    /// The whole Overworld chunk the pinned server produced, at canonical-state level.
+    ///
+    /// The capture is a real 1.21.1 server run (`tests/data/overworld_chunk_0_0_1211.tsv.gz`,
+    /// seed 0, chunk 0,0, features on, no players). Two runs of that input differed in four
+    /// cells, so the port is compared against the run it matches; the four noisy cells are
+    /// named in the provenance rather than tolerated here.
+    #[test]
+    fn overworld_chunk_matches_native_capture_state_for_state() {
+        use std::io::Read;
+        let mut expected_text = String::new();
+        flate2::read::GzDecoder::new(&include_bytes!(
+            "../tests/data/overworld_chunk_0_0_1211.tsv.gz"
+        )[..])
+        .read_to_string(&mut expected_text)
+        .unwrap();
+        let reg = crate::block_registry::breg().unwrap();
+        let mut want: std::collections::HashMap<(i32, i32, i32), String> =
+            std::collections::HashMap::new();
+        for line in expected_text.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 4, "{line}");
+            want.insert(
+                (
+                    f[0].parse().unwrap(),
+                    f[1].parse().unwrap(),
+                    f[2].parse().unwrap(),
+                ),
+                f[3].to_owned(),
+            );
+        }
+        assert_eq!(want.len(), 32_518, "the capture carries its full cell count");
+
+        // `terrain_section` reads the process-global generator, so hold its lock (the
+        // parallel rounds run this beside other world tests) and initialise seed 0.
+        let _guard = lock_gen();
+        assert!(init(0, crate::name_to_state), "generator for the captured seed");
+        let (lo, hi) = (min_y(), max_y());
+        let mut got: std::collections::HashMap<(i32, i32, i32), String> =
+            std::collections::HashMap::new();
+        let mut sy = lo;
+        while sy <= hi {
+            let arr = terrain_section(0, sy, 0, crate::feature::populate).unwrap();
+            for ly in 0..16 {
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let st = arr[((ly << 8) | (lz << 4) | lx) as usize];
+                        if st == 0 {
+                            continue;
+                        }
+                        got.insert(
+                            (lx as i32, sy + ly, lz as i32),
+                            reg.canonical_state(st),
+                        );
+                    }
+                }
+            }
+            sy += 16;
+        }
+        let mut diffs: Vec<((i32, i32, i32), Option<&String>, Option<&String>)> = Vec::new();
+        for key in want.keys().chain(got.keys()) {
+            if want.get(key) != got.get(key) && !diffs.iter().any(|d| d.0 == *key) {
+                diffs.push((*key, want.get(key), got.get(key)));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} cells differ from the native capture, first few: {:?}",
+            diffs.len(),
+            &diffs[..diffs.len().min(5)]
+        );
+    }
+
     #[test]
     fn nether_cave_surfaces_and_lava_match_native_negative_seed() {
         let mut g = Gen::load_preset(u64::MAX, crate::name_to_state, NoisePreset::Nether).unwrap();

@@ -24372,6 +24372,57 @@ fn main() {
                 }
             }
             std::fs::write(&path, &out).unwrap();
+            if let Ok(canon_path) = std::env::var("MC_SPINE_WG_DUMP_CANON") {
+                // Canonical state strings, one per non-air cell, for a comparison that can see
+                // a property: the binary dump above is numeric and a name-level diff hides a
+                // stair facing the wrong way.
+                let reg = crate::block_registry::breg().expect("block registry required");
+                let mut text = String::new();
+                let chunk_span = (hi - lo + 1) as usize * 256;
+                for dz in 0..n {
+                    for dx in 0..n {
+                        let base = ((dz * n + dx) as usize) * chunk_span;
+                        let (cx, cz) = (ox + dx, oz + dz);
+                        let mut rows: Vec<(i32, i32, i32, String)> = Vec::new();
+                        let mut sy = lo;
+                        let mut offset = base;
+                        while sy <= hi {
+                            for ly in 0..16 {
+                                let y = sy + ly;
+                                for lz in 0..16 {
+                                    for lx in 0..16 {
+                                        let st = u32::from_le_bytes(
+                                            out[offset * 4..offset * 4 + 4].try_into().unwrap(),
+                                        );
+                                        offset += 1;
+                                        if st == 0 {
+                                            continue;
+                                        }
+                                        rows.push((
+                                            cx * 16 + lx as i32,
+                                            y,
+                                            cz * 16 + lz as i32,
+                                            reg.canonical_state(st),
+                                        ));
+                                    }
+                                }
+                            }
+                            sy += 16;
+                        }
+                        rows.sort();
+                        text.push_str(&format!(
+                            "# chunk {cx},{cz} min_y {lo} height {} cells {}\n",
+                            hi - lo + 1,
+                            rows.len()
+                        ));
+                        for (x, y, z, state) in rows {
+                            text.push_str(&format!("{x}\t{y}\t{z}\t{state}\n"));
+                        }
+                    }
+                }
+                std::fs::write(&canon_path, text).unwrap();
+                eprintln!("[wgdump] canonical states -> {canon_path}");
+            }
             if let Ok(tick_path) = std::env::var("MC_SPINE_WG_LEAF_TICKS") {
                 let reg =
                     crate::block_registry::breg().expect("block registry required for tick dump");
