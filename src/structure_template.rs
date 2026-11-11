@@ -417,8 +417,8 @@ impl Template {
         tag: &Tag,
         state: u32,
         reg: &BReg,
-    ) -> Result<crate::generation_context::StagedBlockEntity, &'static str> {
-        use crate::generation_context::{ContainerKind, StagedBlockEntity};
+    ) -> Result<crate::staged_block_entity::StagedBlockEntity, &'static str> {
+        use crate::staged_block_entity::{ContainerKind, StagedBlockEntity};
         if tag.get("front_text").is_some() {
             return Ok(StagedBlockEntity::Sign(Self::sign_lines(tag)?));
         }
@@ -900,7 +900,7 @@ mod tests {
                     .iter()
                     .filter(|(p, _)| *p == cell)
                     .filter_map(|(_, v)| match v {
-                        crate::generation_context::StagedBlockEntity::Container { slots, .. } => {
+                        crate::staged_block_entity::StagedBlockEntity::Container { slots, .. } => {
                             Some(slots.clone())
                         }
                         _ => None,
@@ -1074,7 +1074,7 @@ mod tests {
     /// the chunk packet carries the text.
     #[test]
     fn template_sign_text_matches_native_and_reaches_the_sign_store() {
-        use crate::generation_context::StagedBlockEntity;
+        use crate::staged_block_entity::StagedBlockEntity;
         let reg = crate::block_registry::breg().unwrap();
         let sign_state = reg.state_of("minecraft:oak_sign", None);
         let stone = reg.state_of("minecraft:stone", None);
@@ -1171,7 +1171,7 @@ mod tests {
     /// that store, so a misplaced staging would look like an empty furnace forever.
     #[test]
     fn template_furnace_contents_reach_the_furnace_store() {
-        use crate::generation_context::{ContainerKind, StagedBlockEntity};
+        use crate::staged_block_entity::{ContainerKind, StagedBlockEntity};
         let reg = crate::block_registry::breg().unwrap();
         let furnace = reg.state_of("minecraft:furnace", None);
         let mut items = std::collections::BTreeMap::new();

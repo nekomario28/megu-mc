@@ -506,7 +506,7 @@ pub struct Gen {
     /// Generation-owned: they are moved into the runtime container store as soon as
     /// this generator's lock is released (see `block_state`), never kept as a second
     /// live store.
-    staged_block_entities: Vec<((i32, i32, i32), crate::generation_context::StagedBlockEntity)>,
+    staged_block_entities: Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>,
     feat_ord: Vec<(i32, i32)>,
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
@@ -3569,7 +3569,7 @@ impl Gen {
     }
     pub(crate) fn stage_block_entities(
         &mut self,
-        items: &mut Vec<((i32, i32, i32), crate::generation_context::StagedBlockEntity)>,
+        items: &mut Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>,
     ) {
         self.staged_block_entities.append(items);
     }
@@ -3578,7 +3578,7 @@ impl Gen {
     /// double-apply them.
     pub(crate) fn take_staged_block_entities(
         &mut self,
-    ) -> Vec<((i32, i32, i32), crate::generation_context::StagedBlockEntity)> {
+    ) -> Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)> {
         std::mem::take(&mut self.staged_block_entities)
     }
 
@@ -4148,15 +4148,19 @@ pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
 }
 
 /// The block state at a world position, taking the GEN lock once.
+/// One cell, with the block entities the population staged handed to `sink`.
+///
+/// The sink is the caller's, not this module's: materialising them takes the save lock,
+/// and the block write path already takes save -> generator, so doing it while this lock
+/// is held would be an ABBA deadlock — and calling into the crate root from here would
+/// put generation above the layer that owns the stores.
 pub fn block_state(
     x: i32,
     y: i32,
     z: i32,
     populate: impl FnMut(&mut Gen, i32, i32),
+    mut sink: impl FnMut(Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>),
 ) -> Option<u32> {
-    // The lock is released before the containers move: materialising them takes the
-    // save lock, and the block write path already takes save -> generator, so doing it
-    // the other way round here would be an ABBA deadlock.
     let (state, staged) = {
         let mut guard = gen_lock();
         let g = guard.as_mut()?;
@@ -4164,7 +4168,7 @@ pub fn block_state(
         (state, g.take_staged_block_entities())
     };
     if !staged.is_empty() {
-        crate::materialize_block_entities(staged);
+        sink(staged);
     }
     Some(state)
 }

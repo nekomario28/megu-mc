@@ -5592,7 +5592,7 @@ static CHESTS: Registry<BlockPos, HashMap<i16, Stack>> = OnceLock::new();
 /// is never written while the save is reading it, and a second call for the same
 /// position simply rewrites identical contents.
 fn materialize_block_entities(
-    staged: Vec<((i32, i32, i32), crate::generation_context::StagedBlockEntity)>,
+    staged: Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>,
 ) {
     if staged.is_empty() {
         return;
@@ -5600,8 +5600,8 @@ fn materialize_block_entities(
     with_save_guard(|| {
         for (pos, payload) in staged {
             match payload {
-                crate::generation_context::StagedBlockEntity::Container { kind, slots } => {
-                    use crate::generation_context::ContainerKind;
+                crate::staged_block_entity::StagedBlockEntity::Container { kind, slots } => {
+                    use crate::staged_block_entity::ContainerKind;
                     match kind {
                         ContainerKind::Chest => {
                             let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
@@ -5637,7 +5637,7 @@ fn materialize_block_entities(
                         }
                     }
                 }
-                crate::generation_context::StagedBlockEntity::Sign(lines) => {
+                crate::staged_block_entity::StagedBlockEntity::Sign(lines) => {
                     // Key `front = 1`: the template's text is the front side.
                     signs().lock().unwrap_or_else(|e| e.into_inner()).insert(
                         (pos.0, pos.1, pos.2, 1),
@@ -5742,7 +5742,7 @@ fn column_state(x: i32, y: i32, z: i32, h: i32) -> u32 {
 fn wg2_block(x: i32, y: i32, z: i32) -> Option<u32> {
     // One lock for the whole decision (feature layer -> material window ->
     // aquifer -> deep rules); the five free accessors each took the lock again.
-    worldgen::block_state(x, y, z, feature::populate)
+    worldgen::block_state(x, y, z, feature::populate, materialize_block_entities)
 }
 
 fn door_base(st: u32) -> Option<u32> {
@@ -25007,6 +25007,7 @@ mod tick_persistence;
 mod tick_queue;
 #[cfg(test)]
 mod tick_tests;
+mod staged_block_entity;
 mod voxel_faces;
 #[cfg(test)]
 mod security_command_tests {

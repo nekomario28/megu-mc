@@ -42,6 +42,7 @@
       "generation_leaf_queue",
       "nbt",
       "structure_transform",
+      "staged_block_entity",
       "voxel_faces"
     ],
     [
@@ -75,157 +76,49 @@
     ]
   ],
   "allowed_edges": [
-    ["main", "voxel_faces"],
-    ["tree", "voxel_faces"],
-    ["structure_template", "voxel_faces"],
-    ["structure_template", "generation_context"],
-    ["structure_template", "generation_math"],
-    ["feature", "structure_template"],
-    ["feature", "structure_transform"],
-    ["feature", "nbt"],
     [
-      "main",
-      "chunkprof"
-    ],
-    [
-      "main",
-      "lockprof"
-    ],
-    [
-      "main",
-      "loopprof"
-    ],
-    [
-      "main",
-      "tickprof"
+      "block_registry",
+      "json"
     ],
     [
       "effects",
       "tickprof"
     ],
     [
-      "main",
-      "structure_transform"
+      "feature",
+      "block_registry"
     ],
     [
-      "structure_template",
-      "structure_transform"
+      "feature",
+      "generation_context"
     ],
     [
-      "structure_template",
+      "feature",
+      "generation_math"
+    ],
+    [
+      "feature",
+      "generation_providers"
+    ],
+    [
+      "feature",
       "json"
     ],
     [
-      "main",
+      "feature",
+      "nbt"
+    ],
+    [
+      "feature",
       "structure_template"
     ],
     [
-      "main",
-      "nbt"
+      "feature",
+      "structure_transform"
     ],
     [
-      "structure_template",
-      "nbt"
-    ],
-    [
-      "structure_template",
-      "block_registry"
-    ],
-    [
-      "main",
-      "structure_placement"
-    ],
-    [
-      "structure_placement",
-      "generation_math"
-    ],
-    [
-      "main",
-      "tick_persistence"
-    ],
-    [
-      "main",
-      "flowing_fluid"
-    ],
-    [
-      "main",
-      "scheduled_ticks"
-    ],
-    [
-      "tick_persistence",
-      "scheduled_ticks"
-    ],
-    [
-      "main",
-      "generation_leaf_queue"
-    ],
-    [
-      "tree",
-      "generation_leaf_queue"
-    ],
-    [
-      "generation_context",
-      "generation_math"
-    ],
-    [
-      "main",
-      "java_compat"
-    ],
-    [
-      "main",
-      "landing"
-    ],
-    [
-      "main",
-      "effects"
-    ],
-    [
-      "main",
-      "cached_lookup"
-    ],
-    [
-      "main",
-      "world_rng"
-    ],
-    [
-      "main",
-      "tick_queue"
-    ],
-    [
-      "main",
-      "landing_types"
-    ],
-    [
-      "main",
-      "block_registry"
-    ],
-    [
-      "main",
-      "generation_context"
-    ],
-    [
-      "main",
-      "generation_providers"
-    ],
-    [
-      "main",
-      "feature"
-    ],
-    [
-      "main",
-      "tree"
-    ],
-    [
-      "main",
-      "worldgen"
-    ],
-    [
-      "main",
-      "json"
-    ],
-    [
-      "main",
-      "generation_math"
+      "feature",
+      "trace_env"
     ],
     [
       "feature",
@@ -236,52 +129,36 @@
       "worldgen"
     ],
     [
-      "feature",
+      "generation_context",
       "block_registry"
     ],
     [
-      "feature",
-      "generation_providers"
+      "generation_context",
+      "generation_math"
     ],
     [
-      "feature",
-      "generation_context"
-    ],
-    [
-      "tree",
-      "block_registry"
-    ],
-    [
-      "tree",
-      "generation_providers"
-    ],
-    [
-      "tree",
-      "generation_context"
-    ],
-    [
-      "generation_providers",
-      "block_registry"
-    ],
-    [
-      "generation_providers",
-      "generation_context"
+      "generation_context",
+      "staged_block_entity"
     ],
     [
       "generation_context",
       "worldgen"
     ],
     [
-      "generation_context",
+      "generation_providers",
       "block_registry"
     ],
     [
-      "block_registry",
+      "generation_providers",
+      "generation_context"
+    ],
+    [
+      "generation_providers",
+      "generation_math"
+    ],
+    [
+      "generation_providers",
       "json"
-    ],
-    [
-      "worldgen",
-      "block_registry"
     ],
     [
       "java_compat",
@@ -300,36 +177,52 @@
       "world_rng"
     ],
     [
-      "feature",
-      "json"
+      "main",
+      "block_registry"
     ],
     [
-      "tree",
-      "json"
+      "main",
+      "cached_lookup"
     ],
     [
-      "worldgen",
-      "json"
+      "main",
+      "chunk_ack"
     ],
     [
-      "generation_providers",
-      "json"
+      "main",
+      "chunkprof"
     ],
     [
-      "feature",
+      "main",
+      "connection_limits"
+    ],
+    [
+      "main",
+      "effects"
+    ],
+    [
+      "main",
+      "feature"
+    ],
+    [
+      "main",
+      "flowing_fluid"
+    ],
+    [
+      "main",
+      "generation_context"
+    ],
+    [
+      "main",
+      "generation_leaf_queue"
+    ],
+    [
+      "main",
       "generation_math"
     ],
     [
-      "tree",
-      "generation_math"
-    ],
-    [
-      "worldgen",
-      "generation_math"
-    ],
-    [
-      "generation_providers",
-      "generation_math"
+      "main",
+      "generation_providers"
     ],
     [
       "main",
@@ -337,27 +230,175 @@
     ],
     [
       "main",
+      "java_compat"
+    ],
+    [
+      "main",
+      "json"
+    ],
+    [
+      "main",
+      "landing"
+    ],
+    [
+      "main",
+      "landing_types"
+    ],
+    [
+      "main",
+      "lockprof"
+    ],
+    [
+      "main",
+      "loopprof"
+    ],
+    [
+      "main",
+      "nbt"
+    ],
+    [
+      "main",
+      "scheduled_ticks"
+    ],
+    [
+      "main",
+      "staged_block_entity"
+    ],
+    [
+      "main",
+      "structure_placement"
+    ],
+    [
+      "main",
+      "structure_template"
+    ],
+    [
+      "main",
+      "structure_transform"
+    ],
+    [
+      "main",
+      "tick_persistence"
+    ],
+    [
+      "main",
+      "tick_queue"
+    ],
+    [
+      "main",
       "tick_stats"
     ],
     [
       "main",
-      "chunk_ack"
+      "tickprof"
     ],
     [
-      "feature",
+      "main",
       "trace_env"
+    ],
+    [
+      "main",
+      "tree"
+    ],
+    [
+      "main",
+      "voxel_faces"
+    ],
+    [
+      "main",
+      "world_rng"
+    ],
+    [
+      "main",
+      "worldgen"
+    ],
+    [
+      "structure_placement",
+      "generation_math"
+    ],
+    [
+      "structure_template",
+      "block_registry"
+    ],
+    [
+      "structure_template",
+      "generation_context"
+    ],
+    [
+      "structure_template",
+      "generation_math"
+    ],
+    [
+      "structure_template",
+      "json"
+    ],
+    [
+      "structure_template",
+      "nbt"
+    ],
+    [
+      "structure_template",
+      "staged_block_entity"
+    ],
+    [
+      "structure_template",
+      "structure_transform"
+    ],
+    [
+      "structure_template",
+      "voxel_faces"
+    ],
+    [
+      "tick_persistence",
+      "scheduled_ticks"
+    ],
+    [
+      "tree",
+      "block_registry"
+    ],
+    [
+      "tree",
+      "generation_context"
+    ],
+    [
+      "tree",
+      "generation_leaf_queue"
+    ],
+    [
+      "tree",
+      "generation_math"
+    ],
+    [
+      "tree",
+      "generation_providers"
+    ],
+    [
+      "tree",
+      "json"
+    ],
+    [
+      "tree",
+      "voxel_faces"
+    ],
+    [
+      "worldgen",
+      "block_registry"
+    ],
+    [
+      "worldgen",
+      "generation_math"
+    ],
+    [
+      "worldgen",
+      "json"
+    ],
+    [
+      "worldgen",
+      "staged_block_entity"
     ],
     [
       "worldgen",
       "trace_env"
-    ],
-    [
-      "main",
-      "trace_env"
-    ],
-    [
-      "main",
-      "connection_limits"
     ]
   ],
   "accepted_errors": []

@@ -49,27 +49,6 @@ pub(crate) fn schedule_leaf_edge_state(
 
 // ---------- generation context ----------
 
-/// The block-entity payloads a template can carry today, decoded at admission.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum StagedBlockEntity {
-    /// `Items`: slot, item id, count, plus the store that owns them.
-    Container { kind: ContainerKind, slots: Vec<(i16, i64, u8)> },
-    /// A sign side: the four lines of its front text.
-    Sign([String; 4]),
-}
-
-/// Which container store owns a placed container's contents.
-///
-/// The port keeps one store per menu, so a furnace's `Items` written into `chests()` would
-/// be invisible: the furnace window reads `furnaces()`. The kind is decided from the placed
-/// block state at admission, and an unrecognized container is refused rather than staged
-/// where nothing will read it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum ContainerKind {
-    Chest,
-    Furnace,
-}
-
 pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
@@ -83,7 +62,7 @@ pub(crate) struct FC<'a> {
     /// store: the runtime handoff writes each variant into the one store that owns it
     /// (`chests()` / `signs()`), so a port that only staged this would still have empty
     /// containers and blank signs in game.
-    pub(crate) block_entities: Vec<((i32, i32, i32), StagedBlockEntity)>,
+    pub(crate) block_entities: Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>,
 
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
     prof: bool,

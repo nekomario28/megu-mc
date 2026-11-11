@@ -16,7 +16,7 @@ layers = [
     ["generation_providers"],
     ["generation_context"],
     ["worldgen", "block_registry"],
-    ["json", "generation_math", "generation_leaf_queue", "nbt", "structure_transform", "voxel_faces"],
+    ["json", "generation_math", "generation_leaf_queue", "nbt", "staged_block_entity", "structure_transform", "voxel_faces"],
     # Leaf utilities and profiling counters. Profilers read trace_env flags but
     # do not depend on generation or runtime owners.
     ["ingress_guard", "tick_stats", "chunk_ack", "connection_limits", "trace_env",
