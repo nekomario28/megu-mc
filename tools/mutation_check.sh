@@ -1246,7 +1246,7 @@ check "the open window reads the live store, not a copy" \
   a_placed_chest_shows_its_staged_contents_in_the_open_window
 
 check "staged containers reach the live store" \
-  src/main.rs '        for (pos, payload) in staged {' '        for (pos, payload) in Vec::<(( i32,i32,i32), crate::generation_context::StagedBlockEntity)>::new() {' \
+  src/main.rs '        for (pos, payload) in staged {' '        for (pos, payload) in Vec::<(( i32,i32,i32), crate::staged_block_entity::StagedBlockEntity)>::new() {' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
 check "staged containers are taken from the generator once" \
