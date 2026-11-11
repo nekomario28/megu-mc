@@ -903,6 +903,94 @@ mod tests {
         crate::chests().lock().unwrap().remove(&(2, 70, 2));
     }
 
+    /// The window a player opens reads the same store the handoff writes, so the packet
+    /// carries what the template staged. This is the claim "packet NBT" made concrete for
+    /// a container; if a later change copies the contents somewhere else, this fails.
+    #[test]
+    fn a_placed_chest_shows_its_staged_contents_in_the_open_window() {
+        use crate::effect_tests::client_pair;
+        let reg = crate::block_registry::breg().unwrap();
+        let redstone = crate::name_to_item("minecraft:redstone").unwrap();
+        let pos = (2, 70, 2);
+        crate::chests().lock().unwrap().insert(
+            pos,
+            [(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect(),
+        );
+        let (client, mut receiver) = client_pair();
+        let inv = client.inv.lock().unwrap().clone();
+        crate::open_chest_window(
+            &mut client.sock.lock().unwrap(),
+            pos,
+            None,
+            &inv,
+            "Chest",
+        );
+        // 0x33 opens the window, 0x13 carries the slots.
+        let (id, _) = crate::read_packet(&mut receiver, std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .expect("the open-window packet");
+        assert_eq!(id, 0x33, "an open-window packet precedes the items");
+        let (id, payload) = crate::read_packet(&mut receiver, std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .expect("the window-items packet");
+        assert_eq!(id, 0x13, "window items come after the screen");
+        let mut at = 0usize;
+        let mut varint = || {
+            let mut value = 0u32;
+            let mut shift = 0;
+            loop {
+                let byte = payload[at];
+                at += 1;
+                value |= ((byte & 0x7f) as u32) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+            }
+        };
+        assert_eq!(varint(), 1, "window id");
+        let _state = varint();
+        assert_eq!(varint(), 27 + 36, "chest slots plus the player inventory");
+        assert_eq!(varint(), 3, "slot 0 holds the staged count");
+        assert_eq!(varint(), redstone as u32, "slot 0 holds the staged item");
+        assert_eq!(varint(), 0, "the staged stack carries no components");
+
+        // The same window over an empty store: the packet follows the store, not a copy.
+        crate::chests().lock().unwrap().remove(&pos);
+        crate::open_chest_window(
+            &mut client.sock.lock().unwrap(),
+            pos,
+            None,
+            &inv,
+            "Chest",
+        );
+        let _ = crate::read_packet(&mut receiver, std::time::Instant::now() + std::time::Duration::from_secs(2));
+        let (id, payload) = crate::read_packet(&mut receiver, std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .expect("the second window-items packet");
+        assert_eq!(id, 0x13);
+        let mut at = 0usize;
+        let mut varint = || {
+            let mut value = 0u32;
+            let mut shift = 0;
+            loop {
+                let byte = payload[at];
+                at += 1;
+                value |= ((byte & 0x7f) as u32) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+            }
+        };
+        let _ = varint();
+        let _ = varint();
+        assert_eq!(varint(), 27 + 36);
+        assert_eq!(
+            varint(),
+            0,
+            "an empty store must show an empty slot, so the window is not a stale copy"
+        );
+        let _ = reg;
+    }
+
     /// The fossil contract must not move: a chest is still refused there, even though the
     /// shared placement owner now handles one for other callers.
     #[test]

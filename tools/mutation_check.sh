@@ -1233,6 +1233,10 @@ check "fluid handoff does not consume the ordinary runtime counter" \
   'self.next_order += pending.len() as i64; self.queue.unpack_generated(pending, now);' \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
+check "the open window reads the live store, not a copy" \
+  src/main.rs '    let ch = all.get(&pos).cloned().unwrap_or_default();' '    let ch: HashMap<i16, Stack> = HashMap::new();' \
+  a_placed_chest_shows_its_staged_contents_in_the_open_window
+
 check "staged containers reach the live store" \
   src/main.rs '        for (pos, items) in staged {' '        for (pos, items) in Vec::<( (i32,i32,i32), Vec<(i16,i64,u8)>)>::new() {' \
   staged_container_contents_reach_the_store_and_survive_a_save

@@ -164,8 +164,16 @@ placement stages, the generator holds it once, the live store receives it, and a
 save/reload brings the contents back. Both the materialiser and the take have their own
 compiling mutant.
 
-Still open, and deliberately not claimed: packet NBT for the opened container, template
-entities, and any block entity kind other than a container with explicit `Items`.
+**Packet (same day).** The open-window packet reads `chests()` directly, so a placed
+chest's staged contents are what the client receives — by construction, not by a second
+copy. `a_placed_chest_shows_its_staged_contents_in_the_open_window` decodes the `0x13`
+payload and checks slot 0 (count, item id, component count), then empties the store and
+checks the same window reports an empty slot, so a stale copy would fail. The mutant that
+replaces the store read with an empty map is caught.
+
+Still open, and deliberately not claimed: template entities, block entity kinds other than
+a container with explicit `Items`, and the native comparison for the window bytes (the
+fixture pins placement, not the packet layout).
 
 ### Earlier note: the port has no general placement path (2026-11-11)
 
