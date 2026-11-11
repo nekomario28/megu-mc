@@ -24,6 +24,7 @@ python3 tests/native_cargo_gate_test.py
 python3 tests/feature_coverage_test.py
 python3 tests/test_saved_tick_inventory.py
 python3 tests/biome_tree_test.py
+python3 tests/nofeat_pack_test.py
 python3 tests/carver_diff_test.py
 python3 tests/sculk_trace_test.py
 python3 tests/carve_agent_build_test.py
