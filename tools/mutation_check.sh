@@ -1233,6 +1233,14 @@ check "fluid handoff does not consume the ordinary runtime counter" \
   'self.next_order += pending.len() as i64; self.queue.unpack_generated(pending, now);' \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
+check "a placed container stages its contents" \
+  src/structure_template.rs 'ctx.containers.push((p, Self::container_items(tag)?));' 'let _ = Self::container_items(tag)?;' \
+  template_container_items_match_native_placement
+
+check "template NBT other than container Items is refused" \
+  src/structure_template.rs '            if key != "Items" {' '            if false {' \
+  the_fossil_contract_still_refuses_a_container
+
 check "a block write is not split from its tick booking by a save" \
   src/main.rs '    with_save_guard(|| set_block_if_inner(x, y, z, st, expected))' '    set_block_if_inner(x, y, z, st, expected)' \
   tick_tests::a_block_write_waits_for_an_in_progress_save_before_booking

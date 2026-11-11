@@ -131,7 +131,31 @@ Boundary: the entity is created by `LevelChunk.setBlockState` in a real server; 
 *load* path. Entities in the template, packet NBT, and save/reload remain unobserved.
 
 
-### Block: the port has no general placement path (2026-11-11)
+### General placement owner + container staging (2026-11-11)
+
+The seam above was closed by splitting the owner instead of loosening the fossil rule:
+
+- `Template::place_blocks` is the shared placement owner: processors, coordinate
+  transform, clipping after processing, writes, the bounded edge pass and container
+  staging. `place_solid_blocks` keeps the fossil contract (full cubes, no NBT) and then
+  delegates, so a future caller can place a chest without changing what fossils accept.
+- `Template::validate_placement` is the general admission: template entities refused,
+  block NBT accepted only as a container `Items` list of `Slot`/`id`/`count`.
+  `container_items` decodes it to `(slot, item, count)` and refuses every other key,
+  because a loot table would shadow the items natively.
+- Accepted contents are staged in `FC::containers` — generation-owned, not a live store.
+
+Tested against the captured native rows (`template_container_items_match_native_placement`):
+both rotations, every written cell, the rotated `facing` property, and the staged
+contents match `tests/data/template_init_1211.tsv`. `the_fossil_contract_still_refuses_a_container`
+pins that a chest is still refused on the fossil path, and both behaviours have their
+own compiling mutant.
+
+Still open, and deliberately not claimed: the runtime handoff that turns staged contents
+into live chests, packet NBT, and save/reload. A chest placed this way is correct in the
+generation layer and empty in game until that handoff exists.
+
+### Earlier note: the port has no general placement path (2026-11-11)
 
 Tried to wire initialization into the existing placement and stopped at a real seam
 rather than loosening it:

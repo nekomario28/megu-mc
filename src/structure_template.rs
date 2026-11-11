@@ -322,6 +322,70 @@ impl Template {
         Ok(result)
     }
 
+    /// The one template NBT contract this crate accepts today: a container's `Items`.
+    ///
+    /// Native loads the tag through the live block entity with the level's registry
+    /// access, and a container that also holds a `LootTable` saves that table *instead
+    /// of* its items (`tests/data/template_init_1211.tsv` has both cases). Anything
+    /// else is refused rather than stored and silently shadowed later.
+    pub(crate) fn container_items(tag: &Tag) -> Result<Vec<(i16, i64, u8)>, &'static str> {
+        let Tag::Compound(values) = tag else {
+            return Err("template block NBT must be a compound");
+        };
+        for key in values.keys() {
+            let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
+            if key != "Items" {
+                return Err("unsupported template block NBT: only container Items are handled");
+            }
+        }
+        let Some(Tag::List(_, entries)) = tag.get("Items") else {
+            return Err("template container Items must be a list");
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Tag::Compound(_) = entry else {
+                return Err("template container item must be a compound");
+            };
+            let slot = match entry.get("Slot") {
+                Some(Tag::Byte(v)) => *v as i16,
+                _ => return Err("template container item needs a byte Slot"),
+            };
+            if !(0..=255).contains(&slot) {
+                return Err("template container slot is out of range");
+            }
+            let count = match entry.get("count") {
+                Some(Tag::Int(v)) => *v,
+                _ => return Err("template container item needs an int count"),
+            };
+            if !(1..=64).contains(&count) {
+                return Err("template container count is out of range");
+            }
+            let id = match entry.get("id") {
+                Some(Tag::String(v)) => v.to_utf8().map_err(|_| "item id is not UTF-8")?,
+                _ => return Err("template container item needs a string id"),
+            };
+            let item = crate::name_to_item(&id).ok_or("unknown item id in template NBT")?;
+            out.push((slot, item, count as u8));
+        }
+        Ok(out)
+    }
+
+    /// The general template contract: no template entities yet, and NBT limited to
+    /// container `Items`. Callers add their own restrictions on top (the fossil path
+    /// requires full cubes), so admission is not baked into placement and one owner
+    /// serves every caller.
+    pub(crate) fn validate_placement(&self) -> Result<(), &'static str> {
+        if !self.entities.is_empty() {
+            return Err("template placement does not handle template entities");
+        }
+        for info in self.palettes.iter().flatten() {
+            if let Some(tag) = &info.nbt {
+                Self::container_items(tag)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The fossil palette contract: no entities/NBT, and only full-cube outputs.
     /// This is not the general template entity/fluid/shape-finalization pipeline.
     pub(crate) fn validate_solid_placement(
@@ -351,10 +415,28 @@ impl Template {
         Ok(())
     }
 
-    /// Shared-RNG, prevalidated full-cube placement. A whole processor pass reads
-    /// the world before this template's writes; the next template sees those writes.
-    /// Clipping is AFTER processing, including draws for discarded coordinates.
+    /// The fossil entry point. It keeps the full-cube/no-NBT admission that
+    /// `validate_solid_placement` states, then runs the shared placement owner, so
+    /// loosening placement for other callers cannot loosen the fossil contract.
     pub(crate) fn place_solid_blocks(
+        &self,
+        ctx: &mut crate::generation_context::FC,
+        rng: &mut crate::generation_math::Xor,
+        placement: Placement,
+        processors: &[Processor],
+        clip: [i32; 6],
+    ) -> Result<bool, &'static str> {
+        let reg = crate::block_registry::breg().ok_or("missing block registry")?;
+        self.validate_solid_placement(processors, reg)?;
+        self.place_blocks(ctx, rng, placement, processors, clip)
+    }
+
+    /// Shared-RNG placement for any admitted template: processors, the coordinate
+    /// transform, clipping after processing, writes, the bounded edge pass and container
+    /// staging. A whole processor pass reads the world before this template's writes;
+    /// the next template sees those writes. Clipping is AFTER processing, including
+    /// draws for discarded coordinates.
+    pub(crate) fn place_blocks(
         &self,
         ctx: &mut crate::generation_context::FC,
         rng: &mut crate::generation_math::Xor,
@@ -403,6 +485,11 @@ impl Template {
             if p.1 >= ctx.g.min_y && p.1 < ctx.g.min_y + ctx.g.height {
                 ctx.set(p.0, p.1, p.2, state);
                 written.push(p);
+                if let Some(tag) = &block.nbt {
+                    // Admission checked this tag; the write itself still fails closed
+                    // rather than staging contents the caller never validated.
+                    ctx.containers.push((p, Self::container_items(tag)?));
+                }
             }
         }
         // Native updateShapeAtEdge visits exposed voxel faces after ALL writes.
@@ -646,6 +733,186 @@ mod tests {
                 "unhandled template input {kind} passed fossil admission"
             );
         }
+    }
+
+    /// The native fixture is the expectation. The same two-cell template (a chest with
+    /// explicit contents and a stone block) placed at 10,80,10 with no rotation and with
+    /// 90 degrees must write the same cells, the same rotated state and the same staged
+    /// contents as the captured native rows. Reading the fixture instead of restating it
+    /// is the point: drift fails against what the game actually did.
+    #[test]
+    fn template_container_items_match_native_placement() {
+        let reg = crate::block_registry::breg().unwrap();
+        let chest = reg.state_of("minecraft:chest", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let mut items = std::collections::BTreeMap::new();
+        items.insert(
+            NbtString::text("Items"),
+            Tag::List(
+                10,
+                vec![
+                    container_entry(0, "minecraft:redstone", 3),
+                    container_entry(2, "minecraft:diamond", 1),
+                ],
+            ),
+        );
+        let template = Template {
+            size: (2, 1, 1),
+            palettes: vec![vec![
+                BlockInfo { pos: (0, 0, 0), state: chest, nbt: Some(Tag::Compound(items)) },
+                BlockInfo { pos: (1, 0, 0), state: stone, nbt: None },
+            ]],
+            entities: Vec::new(),
+        };
+        assert!(template.validate_placement().is_ok());
+
+        for (case, rotation) in [
+            ("none", crate::structure_transform::Rotation::None),
+            ("clockwise_90", crate::structure_transform::Rotation::Clockwise90),
+        ] {
+            let rows: Vec<Vec<String>> = include_str!("../tests/data/template_init_1211.tsv")
+                .lines()
+                .map(|line| line.split('\t').map(str::to_owned).collect())
+                .filter(|f: &Vec<String>| f[0] == case)
+                // This template is the items chest and the stone block. The fixture's
+                // third row is the loot-table chest, which the port refuses, so it is
+                // not a cell this placement writes.
+                .filter(|f: &Vec<String>| f[4] == "absent" || f[5] != "-")
+                .collect();
+            let cells: Vec<(i32, i32, i32)> = rows.iter().map(|f| parse_cell(&f[2])).collect();
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            let mut ctx = crate::generation_context::FC::new(&mut g);
+            ctx.test_no_terrain = true;
+            let air = reg.state_of("minecraft:air", None);
+            // The bounded edge pass reads the six neighbours of every written cell, and
+            // a scripted world panics rather than inventing terrain for an unprovided one.
+            for cell in &cells {
+                ctx.test_base_cell(*cell, air);
+                for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+                    ctx.test_base_cell((cell.0 + dx, cell.1 + dy, cell.2 + dz), air);
+                }
+            }
+            let mut rng = crate::generation_math::Xor::seed_worldgen(7);
+            let placement = Placement {
+                origin: (10, 80, 10),
+                pivot: (0, 0, 0),
+                mirror: crate::structure_transform::Mirror::None,
+                rotation,
+            };
+            let clip = [0, 0, 0, 31, 255, 31];
+            assert!(template
+                .place_blocks(&mut ctx, &mut rng, placement, &[], clip)
+                .is_ok());
+
+            for field in &rows {
+                let cell = parse_cell(&field[2]);
+                let placed = ctx.get(cell.0, cell.1, cell.2);
+                // A state with no properties is written without brackets.
+                let (name, props) = match field[3].split_once('[') {
+                    Some((name, props)) => (name, props.trim_end_matches(']')),
+                    None => (field[3].as_str(), ""),
+                };
+                assert_eq!(reg.name_of(placed), name, "{case} {} state", field[2]);
+                for property in props.split(',').filter(|p| !p.is_empty()) {
+                    let (key, value) = property.split_once('=').unwrap();
+                    assert_eq!(
+                        reg.get_prop(placed, key).as_deref(),
+                        Some(value),
+                        "{case} {} property {key}",
+                        field[2]
+                    );
+                }
+                let staged: Vec<_> = ctx
+                    .containers
+                    .iter()
+                    .filter(|(p, _)| *p == cell)
+                    .map(|(_, v)| v.clone())
+                    .next()
+                    .unwrap_or_default();
+                assert_eq!(
+                    staged,
+                    parse_native_contents(&field[5]),
+                    "{case} {} contents",
+                    field[2]
+                );
+            }
+            assert_eq!(ctx.containers.len(), 1, "{case}: one NBT cell stages contents");
+        }
+    }
+
+    /// The fossil contract must not move: a chest is still refused there, even though the
+    /// shared placement owner now handles one for other callers.
+    #[test]
+    fn the_fossil_contract_still_refuses_a_container() {
+        let reg = crate::block_registry::breg().unwrap();
+        let mut items = std::collections::BTreeMap::new();
+        items.insert(NbtString::text("Items"), Tag::List(10, vec![container_entry(0, "minecraft:redstone", 3)]));
+        let mut plain = std::collections::BTreeMap::new();
+        plain.insert(
+            NbtString::text("LootTable"),
+            Tag::String(NbtString::text("minecraft:chests/simple_dungeon")),
+        );
+        let chest = reg.state_of("minecraft:chest", None);
+        let with_items = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: chest, nbt: Some(Tag::Compound(items)) }]],
+            entities: Vec::new(),
+        };
+        assert_eq!(
+            with_items.validate_placement(),
+            Ok(()),
+            "the general contract admits container contents"
+        );
+        assert_eq!(
+            with_items.validate_solid_placement(&[], reg),
+            Err("solid template placement requires full cubes without entities or NBT"),
+            "the fossil contract still refuses a container"
+        );
+        let with_loot = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo { pos: (0, 0, 0), state: chest, nbt: Some(Tag::Compound(plain)) }]],
+            entities: Vec::new(),
+        };
+        assert_eq!(
+            with_loot.validate_placement(),
+            Err("unsupported template block NBT: only container Items are handled"),
+            "a loot table is refused rather than stored and shadowed"
+        );
+    }
+
+    fn container_entry(slot: i8, id: &str, count: i32) -> Tag {
+        let mut entry = std::collections::BTreeMap::new();
+        entry.insert(NbtString::text("Slot"), Tag::Byte(slot));
+        entry.insert(NbtString::text("id"), Tag::String(NbtString::text(id)));
+        entry.insert(NbtString::text("count"), Tag::Int(count));
+        Tag::Compound(entry)
+    }
+
+    fn parse_cell(text: &str) -> (i32, i32, i32) {
+        let mut it = text.split(',');
+        (
+            it.next().unwrap().parse().unwrap(),
+            it.next().unwrap().parse().unwrap(),
+            it.next().unwrap().parse().unwrap(),
+        )
+    }
+
+    /// `0=3 minecraft:redstone;2=1 minecraft:diamond` -> [(0, redstone, 3), (2, diamond, 1)]
+    fn parse_native_contents(text: &str) -> Vec<(i16, i64, u8)> {
+        if text == "-" {
+            return Vec::new();
+        }
+        text.split(';')
+            .map(|entry| {
+                let (slot, stack) = entry.split_once('=').unwrap();
+                let (count, id) = stack.split_once(' ').unwrap();
+                (
+                    slot.parse().unwrap(),
+                    crate::name_to_item(id).unwrap(),
+                    count.parse().unwrap(),
+                )
+            })
+            .collect()
     }
 
     #[test]

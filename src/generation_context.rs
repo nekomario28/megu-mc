@@ -58,6 +58,11 @@ pub(crate) struct FC<'a> {
     /// cached: they follow carver and feature writes.
     hmwg: HashMap<(i32, i32, HeightmapKind), i32>,
 
+    /// Container contents a template placed with NBT. Generation-owned staging, not a
+    /// live store: the runtime handoff into `chests()` is a separate contract, and a
+    /// port that only staged this would still have empty chests in game.
+    pub(crate) containers: Vec<((i32, i32, i32), Vec<(i16, i64, u8)>)>,
+
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
     prof: bool,
     #[cfg(test)]
@@ -72,6 +77,7 @@ impl<'a> FC<'a> {
             wr: HashMap::new(),
             rc: HashMap::new(),
             hmwg: HashMap::new(),
+            containers: Vec::new(),
             cc: None,
             prof: crate::trace_env::env_flag!("FEAT_PROFILE"),
             #[cfg(test)]
