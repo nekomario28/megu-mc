@@ -98,3 +98,37 @@ needs a stage-limited dump; comparing the current pair would measure the nofeit 
 Next: run the same server **without** the stripper (features on) into a fresh directory,
 capture twice to measure the server's own variability, and only then interpret a residual —
 per dimension and per stage, never as one number.
+
+## First Overworld parity measurement (2026-11-11)
+
+Two pinned servers were run **with features on** (no stripper), seed 0, no players, 3-chunk
+view distance, into separate directories. The second was launched before the first had
+released port 25565, so it failed to bind and stopped without saving; that attempt and its
+log are kept, and the run was repeated sequentially:
+
+| run | cells | dump SHA-256 |
+|---|---:|---|
+| A | 32,518 | `af908b1a…` |
+| B | 32,518 | `3e7749b0…` |
+
+**A and B differ in 4 cells** — `(14,24,0)`, `(15,24,0)`, `(14,25,0)`, `(15,25,0)`, diorite
+in one run and andesite in the other. So the native reference for this chunk is not
+bit-reproducible, and 4 cells is the floor any comparison has to be read against.
+
+Against that floor, the port's own dump of the same chunk:
+
+| comparison | differing cells (of 98,304) |
+|---|---:|
+| port vs run A | **4** — exactly A's own noise, port agreeing with B |
+| port vs run B | **0** |
+
+That is the strongest whole-chunk result in this repository so far, and it is deliberately
+narrow: one chunk, seed 0, Overworld, **block names only** — a cell that differs in a
+property (stair facing, water level, log axis) is counted as equal here. Property-level
+comparison needs the port to emit a canonical state string, which it does not have yet, so
+this is a name-level result, not a full-state one. Structures and entities were not
+compared, and one chunk says nothing about other seeds, biomes or the second capture window.
+
+Everything needed to repeat it is in the tree: `tools/nofeat_pack.py` (stage-limited
+capture), `tools/terrain_chunk_dump.py` (name-based dump), and the port's own
+`MC_SPINE_WG_DUMP` (requires `MC_SPINE_WG_PROFILE`, else it refuses to run).
