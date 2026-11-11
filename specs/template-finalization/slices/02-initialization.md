@@ -9,3 +9,69 @@ live block-entity map. Test handoff, packet NBT and save/reload independently.
 No data migration is authorized by this plan; stop for a concrete decision if an
 existing persistence contract cannot be preserved. Acceptance requires positive
 initialized instances and a compiling omission mutant, not empty entity lists.
+
+## Native contract for a block with NBT (bytecode, 2026-11-11)
+
+Read from the pinned `StructureTemplate.placeInWorld` (`ent.a(ddl,jd,jd,enp,ayw,int)`,
+official mappings 1.21.1). Offsets are from `javap -c`:
+
+| Offset | Call | Meaning |
+|---:|---|---|
+| 306 | `ent$c.c:Lub` | the palette entry carries a `CompoundTag` |
+| 315 | `ddl.c_(jd)Ldqh` + `bqi.a_` | `getBlockEntity(pos)` and **assert non-null** |
+| 330-338 | `dga.hW.o()` then `ddl.a(jd,dtc,int)` | write `Blocks.AIR` default state with flags `20` |
+| 344-351 | `ddl.a(jd,dtc,int)` | write the transformed state |
+| 460-511 | `ddl.c_(jd)`, `ddl.H_()`, `dqh.c(Lub,Ljo$a)` | re-fetch the block entity and `loadWithComponents(nbt, registryAccess)` |
+
+So initialization is not "record the NBT blob". The native level must (a) already
+answer `getBlockEntity` at that position, (b) be cleared to air first, (c) take the
+transformed state, and (d) load the tag *through the live block entity* with the
+level's `RegistryAccess`. A port that stores the tag on the template and skips the
+entity has nothing to load it into, and a port that loads it without a registry
+provider cannot resolve components.
+
+## What blocks a runnable witness
+
+The scripted-level harness answers reads and records writes; it does not implement
+`getBlockEntity` (`c_`) or `registryAccess` (`H_`). `loadWithComponents` takes a
+`HolderLookup.Provider`, and this harness deliberately has no `RegistryAccess`
+(the same boundary that stopped the sculk path). A real witness therefore needs one
+of:
+
+1. a level proxy that serves a real `ProtoChunk`'s block entities *and* a
+   `RegistryAccess` built from the built-in registries; or
+2. a captured run inside a real server context (the path that previously produced
+   the save-incident, so it needs an isolated worktree and a captured input).
+
+### Attempt 1 (2026-11-11): scripted ProtoChunk — failed at chunk construction
+
+`NativeHarness.scratchChunk` cannot build the chunk at all in this context:
+
+```
+java.lang.IllegalStateException: Missing key in ResourceKey[minecraft:root / minecraft:block]:
+  ResourceKey[minecraft:worldgen/biome / minecraft:plains]
+  at dvj.<init> / duy.a / duy.<init> / dvs.<init>
+```
+
+The chunk resolves its default biome through a `RegistryAccess`, and 1.21 has no
+static biome registry to satisfy that — the same wall the sculk path hit. So the
+route is **not** "more harness": it needs either a registry access loaded from the
+vanilla data half of a real startup, or a captured run inside a running server.
+
+Log: `~/.cache/mc-spine-audit/save-booking-20261110/init-probe-attempt.log`.
+
+**No native initialization observation exists.** The contract above is bytecode
+evidence, not an executed comparison, and it must be confirmed by a run before any
+port work is accepted. Choosing the server route is a decision, not a next step:
+the last unplanned runtime launch in this work left a save it could not restore, so
+that route needs an isolated worktree, a fixed input and an explicit go-ahead.
+
+## Order for the implementation slice
+
+1. Confirm the contract with one executed witness (chest with items, sign with
+   text, rotated 90°, plus a template that stores no NBT as the negative control).
+2. Add initialization to the shared placement path *after* `validate_solid_placement`
+   admits NBT, reusing the existing `chests()`/`signs()` stores; never a new map.
+3. Pin, as separate evidence: handoff into those stores, the packet NBT, and
+   save/reload. A template that places a chest with contents and reloads empty is
+   the failure this slice exists to prevent.
