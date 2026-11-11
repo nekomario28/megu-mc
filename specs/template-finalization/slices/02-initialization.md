@@ -60,6 +60,38 @@ vanilla data half of a real startup, or a captured run inside a running server.
 
 Log: `~/.cache/mc-spine-audit/save-booking-20261110/init-probe-attempt.log`.
 
+### Attempt 2 (2026-11-11): datapack registry access — chunk constructs, entity does not
+
+Loading the vanilla datapack by hand gets past the biome wall. The recipe, each
+step measured:
+
+```java
+// inner jar extracted: pack.mcmeta + data/, 64 worldgen/biome/*.json
+Object location = PackLocationInfo("vanilla", literal("vanilla"), PackSource.DEFAULT, Optional.empty());
+Object pack     = new PathPackResources(location, extractedDir);
+Object rm       = new MultiPackResourceManager(PackType.SERVER_DATA, List.of(pack));
+Object base     = RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.WRITABLE_REGISTRY); // private: getDeclaredField + setAccessible
+Object worldgen = RegistryDataLoader.load(rm, base, RegistryDataLoader.WORLDGEN_REGISTRIES);
+Object biomes   = worldgen.registryOrThrow(Registries.BIOME);
+Object chunk    = new ProtoChunk(chunkPos, UpgradeData.EMPTY, heightAccessor, biomes, null);
+```
+
+`RegistryAccess.EMPTY` as the base fails: the loaders cannot resolve `minecraft:block`
+or `minecraft:item`. The writable root registry works, and the chunk then constructs
+(step 1 below is no longer the blocker).
+
+But a `ProtoChunk` does not create block entities. After
+`setBlockState(pos, chest, false)` the state is `minecraft:chest` and
+`getBlockEntity(pos)` is **null**, so `placeInWorld`'s own assertion at offset 315
+cannot pass. Vanilla creates the entity in `LevelChunk.setBlockState`, which needs a
+`Level`, which needs a server. The two honest continuations are:
+
+1. supply the entity ourselves and observe only `loadWithComponents` (real decoding,
+   synthetic creation — must be labelled as such), or
+2. capture the whole path in a running server.
+
+Log: `init-probe-attempt3.log` (probe source in the audit directory).
+
 **No native initialization observation exists.** The contract above is bytecode
 evidence, not an executed comparison, and it must be confirmed by a run before any
 port work is accepted. Choosing the server route is a decision, not a next step:
