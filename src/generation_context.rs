@@ -52,10 +52,22 @@ pub(crate) fn schedule_leaf_edge_state(
 /// The block-entity payloads a template can carry today, decoded at admission.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum StagedBlockEntity {
-    /// `Items`: slot, item id, count.
-    Container(Vec<(i16, i64, u8)>),
+    /// `Items`: slot, item id, count, plus the store that owns them.
+    Container { kind: ContainerKind, slots: Vec<(i16, i64, u8)> },
     /// A sign side: the four lines of its front text.
     Sign([String; 4]),
+}
+
+/// Which container store owns a placed container's contents.
+///
+/// The port keeps one store per menu, so a furnace's `Items` written into `chests()` would
+/// be invisible: the furnace window reads `furnaces()`. The kind is decided from the placed
+/// block state at admission, and an unrecognized container is refused rather than staged
+/// where nothing will read it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ContainerKind {
+    Chest,
+    Furnace,
 }
 
 pub(crate) struct FC<'a> {

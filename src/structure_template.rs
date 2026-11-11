@@ -415,15 +415,29 @@ impl Template {
     /// table *or* its items, and a sign stores a side. A tag with neither is refused.
     pub(crate) fn staged_payload(
         tag: &Tag,
+        state: u32,
+        reg: &BReg,
     ) -> Result<crate::generation_context::StagedBlockEntity, &'static str> {
+        use crate::generation_context::{ContainerKind, StagedBlockEntity};
         if tag.get("front_text").is_some() {
-            return Ok(crate::generation_context::StagedBlockEntity::Sign(
-                Self::sign_lines(tag)?,
-            ));
+            return Ok(StagedBlockEntity::Sign(Self::sign_lines(tag)?));
         }
-        Ok(crate::generation_context::StagedBlockEntity::Container(
-            Self::container_items(tag)?,
-        ))
+        let kind = match reg.name_of(state) {
+            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
+                ContainerKind::Chest
+            }
+            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                ContainerKind::Furnace
+            }
+            other => {
+                let _ = other;
+                return Err("template container NBT on a block with no supported store");
+            }
+        };
+        Ok(StagedBlockEntity::Container {
+            kind,
+            slots: Self::container_items(tag)?,
+        })
     }
 
     /// The general template contract: no template entities yet, and NBT limited to
@@ -431,12 +445,13 @@ impl Template {
     /// requires full cubes), so admission is not baked into placement and one owner
     /// serves every caller.
     pub(crate) fn validate_placement(&self) -> Result<(), &'static str> {
+        let reg = crate::block_registry::breg().ok_or("missing block registry")?;
         if !self.entities.is_empty() {
             return Err("template placement does not handle template entities");
         }
         for info in self.palettes.iter().flatten() {
             if let Some(tag) = &info.nbt {
-                Self::staged_payload(tag)?;
+                Self::staged_payload(tag, info.state, reg)?;
             }
         }
         Ok(())
@@ -544,7 +559,8 @@ impl Template {
                 if let Some(tag) = &block.nbt {
                     // Admission checked this tag; the write itself still fails closed
                     // rather than staging data the caller never validated.
-                    ctx.block_entities.push((p, Self::staged_payload(tag)?));
+                    ctx.block_entities
+                        .push((p, Self::staged_payload(tag, state, reg)?));
                 }
             }
         }
@@ -884,8 +900,8 @@ mod tests {
                     .iter()
                     .filter(|(p, _)| *p == cell)
                     .filter_map(|(_, v)| match v {
-                        crate::generation_context::StagedBlockEntity::Container(items) => {
-                            Some(items.clone())
+                        crate::generation_context::StagedBlockEntity::Container { slots, .. } => {
+                            Some(slots.clone())
                         }
                         _ => None,
                     })
@@ -1151,9 +1167,108 @@ mod tests {
         crate::signs().lock().unwrap().remove(&(cell.0, cell.1, cell.2, 1));
     }
 
+    /// A furnace's `Items` belong in `furnaces()`, not `chests()`: the furnace window reads
+    /// that store, so a misplaced staging would look like an empty furnace forever.
+    #[test]
+    fn template_furnace_contents_reach_the_furnace_store() {
+        use crate::generation_context::{ContainerKind, StagedBlockEntity};
+        let reg = crate::block_registry::breg().unwrap();
+        let furnace = reg.state_of("minecraft:furnace", None);
+        let mut items = std::collections::BTreeMap::new();
+        items.insert(
+            NbtString::text("Items"),
+            Tag::List(
+                10,
+                vec![
+                    container_entry(0, "minecraft:iron_ore", 2),
+                    container_entry(1, "minecraft:coal", 5),
+                ],
+            ),
+        );
+        let template = Template {
+            size: (1, 1, 1),
+            palettes: vec![vec![BlockInfo {
+                pos: (0, 0, 0),
+                state: furnace,
+                nbt: Some(Tag::Compound(items)),
+            }]],
+            entities: Vec::new(),
+        };
+        assert!(template.validate_placement().is_ok());
+        let cell = (3, 71, 3);
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        {
+            let mut ctx = crate::generation_context::FC::new(&mut g);
+            ctx.test_no_terrain = true;
+            let air = reg.state_of("minecraft:air", None);
+            ctx.test_base_cell(cell, air);
+            for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+                ctx.test_base_cell((cell.0 + dx, cell.1 + dy, cell.2 + dz), air);
+            }
+            let mut rng = crate::generation_math::Xor::seed_worldgen(13);
+            let placement = Placement {
+                origin: cell,
+                pivot: (0, 0, 0),
+                mirror: crate::structure_transform::Mirror::None,
+                rotation: crate::structure_transform::Rotation::None,
+            };
+            assert!(template
+                .place_blocks(&mut ctx, &mut rng, placement, &[], [0, 0, 0, 31, 255, 31])
+                .is_ok());
+            assert_eq!(
+                ctx.block_entities.first().map(|(_, v)| v.clone()),
+                Some(StagedBlockEntity::Container {
+                    kind: ContainerKind::Furnace,
+                    slots: vec![
+                        (0, crate::name_to_item("minecraft:iron_ore").unwrap(), 2),
+                        (1, crate::name_to_item("minecraft:coal").unwrap(), 5),
+                    ],
+                }),
+                "a furnace is staged with the furnace kind"
+            );
+            let mut staged = std::mem::take(&mut ctx.block_entities);
+            g.stage_block_entities(&mut staged);
+        }
+        crate::materialize_block_entities(g.take_staged_block_entities());
+        let ore = crate::name_to_item("minecraft:iron_ore").unwrap();
+        let coal = crate::name_to_item("minecraft:coal").unwrap();
+        {
+            let store = crate::furnaces().lock().unwrap();
+            let f = store.get(&cell).expect("the furnace store holds the placed furnace");
+            assert_eq!(f.input, (ore, 2, Vec::new()), "slot 0 is the input");
+            assert_eq!(f.fuel, (coal, 5, Vec::new()), "slot 1 is the fuel");
+            assert_eq!(f.output, (0, 0, Vec::new()), "slot 2 is empty");
+            assert!(f.dirty, "a placed furnace needs a resync");
+        }
+        assert!(
+            crate::chests().lock().unwrap().get(&cell).is_none(),
+            "a furnace must not be staged into the chest store"
+        );
+        crate::furnaces().lock().unwrap().remove(&cell);
+    }
+
+    /// A container the port has no store for is refused rather than staged where nothing
+    /// would read it.
+    #[test]
+    fn unsupported_container_states_are_refused() {
+        let reg = crate::block_registry::breg().unwrap();
+        let dispenser = reg.state_of("minecraft:dispenser", None);
+        let mut items = std::collections::BTreeMap::new();
+        items.insert(
+            NbtString::text("Items"),
+            Tag::List(10, vec![container_entry(0, "minecraft:arrow", 1)]),
+        );
+        assert_eq!(
+            Template::staged_payload(&Tag::Compound(items), dispenser, reg),
+            Err("template container NBT on a block with no supported store")
+        );
+    }
+
     /// A sign tag with a shape the port cannot represent is refused, not blanked.
     #[test]
     fn unsupported_sign_components_are_refused() {
+        let reg = crate::block_registry::breg().unwrap();
+        let sign_state = reg.state_of("minecraft:oak_sign", None);
         let mut front = std::collections::BTreeMap::new();
         front.insert(
             NbtString::text("messages"),
@@ -1162,7 +1277,7 @@ mod tests {
         let mut tag = std::collections::BTreeMap::new();
         tag.insert(NbtString::text("front_text"), Tag::Compound(front));
         assert_eq!(
-            Template::staged_payload(&Tag::Compound(tag)),
+            Template::staged_payload(&Tag::Compound(tag), sign_state, reg),
             Err("a sign message must be a string component")
         );
     }

@@ -249,6 +249,18 @@ captured message, stages `["Hi","","",""]`, and checks the sign store; two compi
 mutants cover the decode and the store routing. The container comparison test also runs
 against the same fixture.
 
+### A second container store, and a refusal for the rest (2026-11-11)
+
+The port keeps one store per menu, so staging a furnace's `Items` into `chests()` would be
+invisible: the furnace window reads `furnaces()`. `StagedBlockEntity::Container` now carries
+`ContainerKind` decided from the *placed state* at admission — chest/trapped_chest/barrel to
+`chests()`, furnace/blast_furnace/smoker to `furnaces()` (slots 0/1/2 → input/fuel/output,
+`dirty` set) — and any other container is **refused** rather than staged where nothing reads
+it. Two compiling mutants cover the kind decision and the slot mapping.
+
+This is the shape the next kinds take: decide the destination at admission from the state,
+write into the store that owns it, and refuse what has no store.
+
 ### Entity geometry captured; creation still refused (2026-11-11)
 
 `StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)` is the placement-visible

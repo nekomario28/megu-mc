@@ -1273,6 +1273,18 @@ check "staged signs reach the sign store" \
   src/main.rs '                        (pos.0, pos.1, pos.2, 1),' '                        (pos.0, pos.1, pos.2, 0),' \
   template_sign_text_matches_native_and_reaches_the_sign_store
 
+check "a furnace is staged as a furnace, not a chest" \
+  src/structure_template.rs '"minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {' '"minecraft:dispenser" => {' \
+  template_furnace_contents_reach_the_furnace_store
+
+check "a container with no store is refused" \
+  src/structure_template.rs '                return Err("template container NBT on a block with no supported store");' '                ContainerKind::Chest' \
+  unsupported_container_states_are_refused
+
+check "furnace contents land in the furnace store" \
+  src/main.rs '                                    0 => furnace.input = stack,' '                                    0 => furnace.output = stack,' \
+  template_furnace_contents_reach_the_furnace_store
+
 check "a placed container stages its contents" \
   src/structure_template.rs 'ctx.containers.push((p, Self::container_items(tag)?));' 'let _ = Self::container_items(tag)?;' \
   template_container_items_match_native_placement

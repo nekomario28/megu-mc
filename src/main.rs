@@ -5600,11 +5600,41 @@ fn materialize_block_entities(
     with_save_guard(|| {
         for (pos, payload) in staged {
             match payload {
-                crate::generation_context::StagedBlockEntity::Container(items) => {
-                    let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
-                    let slots = store.entry(pos).or_default();
-                    for (slot, item, count) in items {
-                        slots.insert(slot, (item, count, Vec::new()));
+                crate::generation_context::StagedBlockEntity::Container { kind, slots } => {
+                    use crate::generation_context::ContainerKind;
+                    match kind {
+                        ContainerKind::Chest => {
+                            let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
+                            let entry = store.entry(pos).or_default();
+                            for (slot, item, count) in slots {
+                                entry.insert(slot, (item, count, Vec::new()));
+                            }
+                        }
+                        ContainerKind::Furnace => {
+                            let mut store =
+                                furnaces().lock().unwrap_or_else(|e| e.into_inner());
+                            let furnace = store.entry(pos).or_insert(Furnace {
+                                input: (0, 0, Vec::new()),
+                                fuel: (0, 0, Vec::new()),
+                                output: (0, 0, Vec::new()),
+                                burn_left: 0,
+                                progress: 0,
+                                dirty: false,
+                                xp: 0.0,
+                                recipe_cache: CachedLookup::default(),
+                                fuel_cache: CachedLookup::default(),
+                            });
+                            for (slot, item, count) in slots {
+                                let stack = (item, count, Vec::new());
+                                match slot {
+                                    0 => furnace.input = stack,
+                                    1 => furnace.fuel = stack,
+                                    2 => furnace.output = stack,
+                                    _ => {}
+                                }
+                            }
+                            furnace.dirty = true;
+                        }
                     }
                 }
                 crate::generation_context::StagedBlockEntity::Sign(lines) => {
