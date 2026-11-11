@@ -4759,3 +4759,101 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
     }
     let _ = oh;
 }
+
+/// The "book the cell above" branch is the only scheduler when the support under
+/// a gravity block is removed: that write never touches the gravity cell itself.
+/// The placement booking has already fired by then, so it cannot stand in for it.
+#[test]
+fn removing_a_support_schedules_the_block_above_after_its_own_booking_fired() {
+    crate::test_support::require_vanilla_data();
+    let _g = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0)]);
+    set_test_region(warm.clone(), warm.clone());
+    let stone = name_to_state("stone").unwrap();
+    let sand = name_to_state("sand").unwrap();
+    // Chunk (0,0) so the eligibility predicate below is not what decides the result.
+    let (x, z, base) = (11, 11, 150);
+    for y in base..=base + 3 {
+        set_block(x, y, z, 0);
+    }
+    // A pending callback for this cell, read from the queue itself rather than
+    // through chunk eligibility: a cold chunk would make the weaker check vacuous.
+    let pending = |pos: (i32, i32, i32)| {
+        block_ticks()
+            .lock()
+            .unwrap()
+            .collect(i64::MAX / 4, 4096, |_| true)
+            .into_iter()
+            .any(|t| t.pos == pos)
+    };
+    set_block(x, base, z, stone);
+    set_block(x, base + 1, z, sand);
+    assert!(pending((x, base + 1, z)), "the placement books the sand itself");
+    // Let that booking fire while the sand is still supported: the callback
+    // re-checks support and consumes itself.
+    for _ in 0..4 {
+        advance_falling_scheduled_tick();
+    }
+    assert_eq!(block_at(x, base + 1, z), sand, "the supported sand stays");
+    assert!(falling().lock().unwrap().is_empty(), "no entity while supported");
+    assert!(
+        !pending((x, base + 1, z)),
+        "the placement booking must be consumed before this test means anything"
+    );
+
+    // Removing the support writes only the support cell; the sand above must be
+    // scheduled from the "cell above" branch.
+    set_block(x, base, z, 0);
+    assert!(
+        pending((x, base + 1, z)),
+        "removing a support must schedule the gravity block above it"
+    );
+    // The conversion itself is covered by the knocked-out-block and column
+    // tests; this one pins the branch that schedules it.
+    let _ = (oh, stone);
+}
+
+/// An entity that is already in flight when its chunk goes cold has to stay put;
+/// the block callback gate alone cannot cover this, because the entity exists.
+#[test]
+fn a_falling_entity_stops_moving_when_its_chunk_goes_cold() {
+    crate::test_support::require_vanilla_data();
+    let _g = world_guard();
+    let _snap = WorldSnapshot::take();
+    let (oh, ow) = test_region();
+    let mut warm = ow.clone();
+    warm.extend([(0, 0)]);
+    set_test_region(warm.clone(), warm.clone());
+    let stone = name_to_state("stone").unwrap();
+    let sand = name_to_state("sand").unwrap();
+    let (x, z, base) = (11, 11, 150);
+    for y in base..=base + 6 {
+        set_block(x, y, z, 0);
+    }
+    set_block(x, base, z, stone);
+    set_block(x, base + 5, z, sand);
+    drain_falling_bookings(8);
+    let y0 = {
+        let q = falling().lock().unwrap();
+        assert_eq!(q.len(), 1, "the callback converted the block into one entity");
+        q[0].y
+    };
+
+    set_test_region(HashSet::new(), HashSet::new());
+    for _ in 0..3 {
+        falling_tick();
+    }
+    let cold = falling().lock().unwrap().clone();
+    assert_eq!(cold.len(), 1, "the entity stays in flight");
+    assert_eq!(cold[0].y, y0, "a cold chunk must not integrate gravity: {cold:?}");
+
+    set_test_region(warm.clone(), warm.clone());
+    falling_tick();
+    let q = falling().lock().unwrap().clone();
+    assert!(q.len() == 1 && q[0].y < y0, "warming resumes the physics: {q:?}");
+    let _ = oh;
+}
+

@@ -165,6 +165,21 @@ PY
     tail -15 "$log"
     failed=$((failed + 1))
   fi
+  # A failing test is not proof that the mutation caused the failure. Measured
+  # 2026-11-11: three entries were recorded as proved only because a load-sensitive
+  # test happened to fail in that run; re-running the same campaign reported them as
+  # not a gate. With MUTATION_STABILITY=1 the mutant has to fail a second time, so a
+  # flake cannot be counted as a catch. Costs one extra run per caught mutant.
+  if [ "$caught" = yes ] && [ -n "${MUTATION_STABILITY:-}" ]; then
+    run_filter "$test_filter"
+    if [ "$status" = green ]; then
+      echo "FAIL  $name"
+      echo "      the mutant run failed once and passed on a re-run, so the failure was a flake,"
+      echo "      not a catch. The test is not a stable gate."
+      caught=no
+      failed=$((failed + 1))
+    fi
+  fi
   restore
   verify_restored "$name" "$sha_before"
   if ! control "$name" "$test_filter" restored; then
@@ -296,7 +311,7 @@ check "scheduled falling conversion queues air, not a ghost" \
 check "a block above a removed support is scheduled" \
   src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y.saturating_add(1), z)] {' \
   '    for (px, py, pz) in [(x, y, z), (x, y, z)] {' \
-  sand_falls_under_vanilla_gravity_until_it_lands
+  removing_a_support_schedules_the_block_above_after_its_own_booking_fired
 
 check "block light uses generated sources, not only the overlay" \
   src/main.rs '                sources.push((*p, *lum));' \
@@ -343,11 +358,12 @@ check "a falling block passes through replaceable blocks" \
   '    reg.is_air(st) || reg.is_liquid(st)' \
   a_falling_block_passes_through_a_replaceable_block
 
-check "a long unsupported column converts in one pass" \
-  src/main.rs '        UPD_DEFER.with(|d| d.borrow_mut().push((x, y, z)));' \
-  '        let _ = (x, y, z);' \
-  a_long_unsupported_column_converts_in_one_pass
-
+# Removed 2026-11-11: this entry mutated UPD_DEFER's push, which is reached only at
+# neighbour-update depth 64 or more. The two-game-tick falling model converts one
+# block per callback, so no gravity scenario reaches that depth and the mutant
+# survived the column test. The deferral branch is now untested rather than
+# falsely covered; a cascade that can still exceed the depth would need its own
+# test and entry.
 check "a passing entity must not suppress a new block in the same cell" \
   src/main.rs '        if !set_block_if(px, py, pz, 0, Some(st)) {
             return;
@@ -414,7 +430,7 @@ check "a falling block does not move in a cold chunk" \
                 keep.push(f);
                 continue;
             }' \
-  a_falling_block_waits_in_a_cold_chunk
+  a_falling_entity_stops_moving_when_its_chunk_goes_cold
 check "a save carries the falling entities it reloads" \
   src/main.rs '    write_varint(&mut *f, in_flight.len() as i64);' \
   '    write_varint(&mut *f, 0i64);' \
