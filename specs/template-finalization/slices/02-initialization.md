@@ -190,9 +190,23 @@ measured before stopping:
    pre-registered entity with a fresh one, so `loadWithComponents` applies to an
    instance that is then discarded; that is not proven.
 
-Because the decode is unverified, the fixture keeps the container rows only and the port
-does not implement sign text. Logs: `init-sign*.log` in the audit directory. The next
-attempt should check entity identity across the state write before trusting the tag.
+Follow-up probes narrowed it down and refuted the first hypothesis:
+
+- The entity is the **same instance** before and after placement (`same=true`), so no
+  replacement happens; and calling `loadWithComponents` **directly** on the pre-registered
+  sign also yields four empty components. So the tag, not the placement, is what fails.
+- Four message encodings all load as empty: `'{"text":"Hi"}'`, `'Hi'`, `'"Hi"'`, and
+  `[{text:"Hi"},{text:""},…]`. A vanilla-format JSON string is among them, so "the port's
+  encoder is wrong" is not supported either.
+- One notable asymmetry: the same `loadWithComponents` call applies a chest's `Items`
+  correctly in this harness, so the harness can host a real load; signs specifically do
+  not take one.
+
+The remaining candidate is that the sign's own loader needs a level the harness does not
+give it (our entity never receives `setLevel`), and silently falls back to empty text.
+That is untested. Because the decode is unverified, the fixture keeps the container rows
+only, the port does not implement sign text, and the oracle change was reverted. Logs:
+`init-sign*.log` and `sign-probe*.log` in the audit directory.
 
 ### Earlier note: the port has no general placement path (2026-11-11)
 
