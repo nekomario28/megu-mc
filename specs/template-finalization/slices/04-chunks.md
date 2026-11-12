@@ -196,11 +196,16 @@ each is attributable rather than "small differences":
 
 Three of the four are understood and bounded:
 
-- The 32 edge cells are the interesting one: every one sits in the last column of the chunk,
-  underground, where native has carved air. An edge-only pattern points at the carver's
-  neighbour margin (vanilla carves with a margin from already-generated neighbours) rather
-  than at a wrong rule, and it did not show up at seed 0 because that chunk's edges had no
-  caves. Not fixed, and worth its own slice.
+- The 32 edge cells are the interesting one: every one sits in the last column of the chunk
+  (`x = 63`), at `y 8..11` for the slice inspected, where native has a cave pocket and the port
+  has stone. An edge-only pattern points at the carver's neighbour margin rather than at a
+  wrong rule, and it did not show up at seed 0 because that chunk's edges had no caves.
+  **The obvious explanation is wrong:** `feature.rs` already folds a tunnel's coordinates into
+  the target chunk (`x & 15`) and documents that vanilla lets a tunnel from up to eight chunks
+  away paint into the target. So the fold exists; what is missing is the neighbouring chunks'
+  *carver seeds* being run for this chunk — vanilla's `applyCarvers` covers the chunk plus its
+  margin, and an edge cell can be carved by a neighbour-seeded tunnel. Confirming that needs
+  the carve pass's seed loop, which is the next thing to read. Not fixed.
 - The 30 are a single diorite/granite blob: same shape, different type, i.e. an RNG/order
   difference in ore placement, not a missing feature.
 - The 18 are the biome-blend disagreement already noted: the port's blended biome and the
