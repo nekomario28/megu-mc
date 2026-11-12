@@ -18,6 +18,29 @@
 
 **現在の作業:** [全worldgen](worldgen-parity/README.md)。全64 biome、34構造物と3ディメンションへ広げ、配置候補・NBT/template・processor・jigsaw・構造物固有piece・地形/biome経路を実クラス対照で順に閉じる。部分的なhelper一致を構造物生成の受け入れにしない。
 
+## 直近の実行順（2026-11-13）
+
+長期のR0〜R5は維持し、直近は次の小さい出口で進める。
+[実行台帳](implementation-checklist.md)で実装済み・限定検証済み・未検証を分け、
+[調査手順](worldgen-parity/investigation-workflow.md)を各差分の着手前に確認する。
+
+| 順序 | 対象 | 次の出口 |
+|---|---|---|
+| 1 | P0-1 / P0-4: 基準と入力の固定 | seed 4242の両native runとportを、hash・絶対座標・stage・設定・skip一覧を持つ再現可能な診断にする。未確定入力を埋めるまで受け入れfixtureに昇格しない |
+| 2 | P0-2 / P1-4: snowy残差 | 該当セルの上下state、quart/blended biome、実際の判定位置・温度・writerを比較。surfaceと雪配置を分けて最初の分岐を特定する |
+| 3 | 残るair・ore型・planks差 | 各群で最初の相違stageとwriterを特定。形や近さだけでcarver/RNG/構造物に帰属させない |
+| 4 | P1-1 → P1-2 → P1-3 / P1-4 | 汎用neighbor、実初期化、tick効果、正にFossilが置かれる実chunkを独立に閉じる。既存の限定契約は維持する |
+| 5 | P2: 構造物と範囲拡張 | 必要なtemplate/processor/start/piece経路から、正の配置fixture、多seed・biome境界、通常Nether/Endへ段階拡張 |
+| 6 | P3: M2 → M3 | CLI操作・保存再開を同一入力で受け入れ、その同じ機能/負荷でCPU・RSS・tick予算を測る |
+
+資産の出所・再生成・配布方針（P0-3）は並行した残件。
+内部調査の続行と、外部配布・リリースの承認は別判断である。
+
+**原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
+撤回する。訂正根拠・区別すべきlookup・次の反証は
+[chunk差分記録](template-finalization/slices/04-chunks.md)を参照。
+これはcarver全体の合格を意味しない。
+
 ## R0 — 自前データの意味論と回帰の基準を閉じる
 
 1. 全体テストの一次失敗とmutex poisonの連鎖を分ける。一次失敗は必要なら新しいプロセスで再現し、入力・loader・評価器・古いcaptureのどこに属するかを特定する。poisonを握り潰して緑にしない。
@@ -102,7 +125,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 **出口:** 対象Mod・版・API範囲・実行テストを特定し、その組み合わせに限った互換性を証明する。
 ## 横断規律
 
-- まず小さい実クラス対照、本番経路、故障を検出するゲートを作り、必要な節目で広い回帰へ戻る。原因の変わらない重い比較を繰り返さない。
+- [最小の因果差分から進める手順](worldgen-parity/investigation-workflow.md)を使う。既存captureの再利用→stage/writer特定→小さい実クラス対照→本番到達確認→compiling mutant→変更が固まった対象SHAの全gateと進める。原因の変わらない重い比較を繰り返さない。
 - 比較前に、何が実行され、どのstageにあり、何がskipされたかを確かめる。値が変わらないだけで負の結果としない。
 - source・固定具・実測binary・参照jarを結び付け、試験前後の正常系と変異後の復元を確認する。
 - 古いcaptureの再記録を修正の代用にせず、意味の変化を説明してから更新する。

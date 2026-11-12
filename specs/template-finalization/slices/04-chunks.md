@@ -30,7 +30,10 @@ does not need the Overworld's biome source:
 `runtime_writes: 0`). So "no whole-chunk result" is too strong: End and Nether terrain are
 covered at this stage.
 
-## The gap, stated precisely
+## Historical gap before the Overworld captures
+
+The two gaps below describe the pre-capture state, not the current corpus. The later
+canonical-state seed-0 section supersedes the decorated-Overworld gap.
 
 1. **Overworld terrain** has no native corpus. Its `terrain_cell` mixes biomes, the
    aquifer and the material rule — the three parts that only exist for the Overworld — so
@@ -39,7 +42,7 @@ covered at this stage.
    any dimension. Every capture above is `stage: terrain`, and its provenance records zero
    runtime writes, so nothing in the tree compares a *decorated* chunk.
 
-## Why an Overworld corpus is not a local script
+## Historical capture prerequisite: an actual Level
 
 Generating a native chunk offline needs `ChunkGenerator.fillFromNoise(Blender, RandomState,
 StructureManager, ChunkAccess)`, and `StructureManager` is constructed from a `Level`. That
@@ -54,7 +57,7 @@ a server start. The last unplanned launch left a save that could not be restored
 protocol has to be: isolated working directory, fixed input, capture two runs to measure
 variability, and dump before any runtime tick.
 
-## What the port must match when that capture exists
+## Acceptance requirements, including future captures
 
 - The same biome source: the port's `NoisePreset::Overworld` sampling must be the same
   `MultiNoiseBiomeSource` the server used, or the comparison measures biome choice, not
@@ -104,7 +107,7 @@ Next: run the same server **without** the stripper (features on) into a fresh di
 capture twice to measure the server's own variability, and only then interpret a residual —
 per dimension and per stage, never as one number.
 
-## First Overworld parity measurement (2026-11-11)
+## Historical name-level Overworld measurement (2026-11-11)
 
 Two pinned servers were run **with features on** (no stripper), seed 0, no players, 3-chunk
 view distance, into separate directories. The second was launched before the first had
@@ -118,24 +121,25 @@ log are kept, and the run was repeated sequentially:
 
 **A and B differ in 4 cells** — `(14,24,0)`, `(15,24,0)`, `(14,25,0)`, `(15,25,0)`, diorite
 in one run and andesite in the other. So the native reference for this chunk is not
-bit-reproducible, and 4 cells is the floor any comparison has to be read against.
+bit-reproducible in those runs. This observed variability is not a universal floor or
+a tolerance mask for later comparisons.
 
-Against that floor, the port's own dump of the same chunk:
+For those two named references, the port's own dump of the same chunk:
 
 | comparison | differing cells (of 98,304) |
 |---|---:|
 | port vs run A | **4** — exactly A's own noise, port agreeing with B |
 | port vs run B | **0** |
 
-That is the strongest whole-chunk result in this repository so far, and it is deliberately
-narrow: one chunk, seed 0, Overworld, **block names only** — a cell that differs in a
-property (stair facing, water level, log axis) is counted as equal here. Property-level
-comparison needs the port to emit a canonical state string, which it does not have yet, so
-this is a name-level result, not a full-state one. Structures and entities were not
-compared, and one chunk says nothing about other seeds, biomes or the second capture window.
+That historical observation is deliberately narrow: one chunk, seed 0, Overworld,
+**block names only** — a cell that differs in a
+property (stair facing, water level, log axis) is counted as equal here.
+At this historical point, property-level comparison still needed a canonical-state dump. The later section implements that gate;
+this earlier result remains name-level evidence, not a full-state one.
+Structures and entities were not compared, and one chunk says nothing about other seeds, biomes or the second capture window.
 
-Everything needed to repeat it is in the tree: `tools/nofeat_pack.py` (stage-limited
-capture), `tools/terrain_chunk_dump.py` (name-based dump), and the port's own
+The historical measurement used the tooling now in the tree: `tools/nofeat_pack.py` (stage-limited
+capture), `tools/terrain_chunk_dump.py` (now a canonical-state dump), and the port's own
 `MC_SPINE_WG_DUMP` (requires `MC_SPINE_WG_PROFILE`, else it refuses to run).
 
 ## The Overworld corpus is now in the tree, at full state level (2026-11-11)
@@ -163,63 +167,84 @@ port. Two things came out of it, in this order:
    are also absolute for chunk (0,0) — the seed-0 result was right by coincidence and the
    first 4242 comparison reported 64,592 differences in a perfectly symmetric pattern. Fixed
    (absolute coordinates), and the seed-0 fixture was verified byte-identical afterwards.
-2. **The port had no `snowy` rule at all.** With coordinates fixed, 302 of ~32,300 cells
-   differed: **238** were `grass_block[snowy=true]` natively against `[snowy=false]` in the
-   port. `SnowyDirtBlock` sets that flag from the biome's *base* temperature, which the port
-   never consulted. `Gen::apply_snowy` now does, at the blended biome of the cell (not the
-   surface rule's quart-snapped leaf), and `snowy_grass_follows_the_biome_temperature` pins
-   it with a compiling mutant.
+2. **A snowy-state path changed the measured residual.** With coordinates fixed, the
+   original comparison had 302 differences, including 238 native `snowy=true` grass cells
+   that were false in the port. `Gen::apply_snowy` now consults the blended biome and its
+   base temperature; the test `snowy_grass_follows_the_biome_temperature` pins that port
+   behavior. It does **not** independently prove this is the native SnowyDirtBlock contract.
+   The existing `Cf::FreezeTop` snow/ice placement path is another owner to compare.
 
-After the fix: **82 cells remain**, in three classes — 32 `air`/`stone`, 30 `diorite`/`granite`
-(the same ore-blob class that varies between two native runs of seed 0), and 2 `oak_planks`
-natively against `air` (a missing structure piece). **18** `grass_block[snowy=true]` cells are
-still false positives on biome boundaries, where the port's blended biome disagrees with the
-native lookup; that is a biome-blend residual, not the snowy rule.
+After that change, the reported residual is **82 cells in four state-pair groups**:
+32 air/stone, 30 diorite/granite, 18 snowy false/true, and 2 oak_planks/air.
+The snowy discrepancy is not yet attributed to an incorrect biome lookup: the lookup
+position, upper/lower cell, stage and writer must first be compared with native.
 
-So the honest statement of coverage is: **seed 0 chunk (0,0) matches exactly; seed 4242 chunk
-(3,−2) matches in 99.7 % of cells with three named residual classes.** The single-chunk result
-did not generalise, which is exactly why the second seed was worth capturing.
+Seed 0's named capture matches exactly; seed 4242 remains an exploratory comparison,
+not a second committed acceptance fixture. Counts are retained instead of a percentage
+that mixes non-air row counts with the full chunk volume.
 
-## The 82 residual cells at seed 4242, classified (2026-11-12)
+## The 82 residual cells: observations, not established causes (reviewed 2026-11-13)
 
-A second native run of the same seed and chunk differs from the first in **23 cells**, all
-`diorite → andesite` — that is this chunk's reference variability (seed 0 had 4). Comparing
-the port against run A leaves 82 cells, in four classes with disjoint bounding boxes, so
-each is attributable rather than "small differences":
+The second native run differs from the first in **23 cells**, all diorite → andesite.
+The retained port dump differs from run A in **82 cells** and from run B in **105**.
+These are observed run pairs, not a justified general noise model or an allowed mask.
+Keep both references and all mismatches visible.
 
-| cells | where | what |
-|---:|---|---|
-| 32 | `x = 63` (the chunk's +x column), `y 5..12`, `z −30..−17` | native air, port stone |
-| 30 | `x 52..56`, `y 19..22`, `z −19..−17` | native diorite, port granite — one small ore blob typed differently |
-| 18 | `y 64..65`, `x 50..59` | `snowy=true` here vs `snowy=false` natively — biome-boundary blend |
-| 2 | `(62..63, 21, −17)` | native `oak_planks`, port air — a structure piece |
+| cells vs A | observed bounds | native → port | cause status |
+|---:|---|---|---|
+| 32 | x=63, y=5..12, z=-30..-17 | air → stone | Unknown writer/stage; final air does not establish a carver origin |
+| 30 | x=52..56, y=19..22, z=-19..-17 | diorite → granite | Ore-type/order hypothesis; not proved by shape or counts |
+| 18 | x=50..59, y=64..65, z=-31..-20 | grass snowy=false → true | Lookup position, biome, temperature, stage and writer remain to compare |
+| 2 | x=62..63, y=21, z=-17 | oak_planks → air | Structure-origin hypothesis; the responsible native piece/writer is not identified |
 
-Three of the four are understood and bounded:
+### Retraction of the previous causal diagnosis
 
-- The 32 edge cells are the interesting one: every one sits in the last column of the chunk
-  (`x = 63`), at `y 8..11` for the slice inspected, where native has a cave pocket and the port
-  has stone. An edge-only pattern points at the carver's neighbour margin rather than at a
-  wrong rule, and it did not show up at seed 0 because that chunk's edges had no caves.
-  **The obvious explanation is wrong:** `feature.rs` already folds a tunnel's coordinates into
-  the target chunk (`x & 15`) and documents that vanilla lets a tunnel from up to eight chunks
-  away paint into the target. So the fold exists, and the **neighbour seeds are run too**:
-  the carve pass loops `ox in tx-8..=tx+8`, `oz in tz-8..=tz+8`, seeds each neighbour with
-  `set_large_feature_seed(seed, k, ox, oz)`, and clips the ellipsoid to the target chunk's
-  columns. Both obvious explanations are refuted, and the remaining candidate is the *input*
-  that picks a neighbour's carver list: `g.biome_name_at(ox * 16, 0, oz * 16)`, the biome at
-  the neighbour's corner at y=0.
-- That candidate is supported by the geometry: the 32 edge cells (`z -30..-17`) and the 18
-  snowy cells (`z -31..-20`) sit in the same snow-covered band — every `x = 63` column there
-  has a `snow` surface block — so one biome boundary runs through both clusters. A wrong
-  biome at a neighbour corner would both pick the wrong carver list (missing the cave) and
-  mark the wrong `snowy` flag, i.e. **50 of the 82 cells may share one cause**: biome
-  assignment at that boundary. That is the next thing to measure, not the carver.
-- The 30 are a single diorite/granite blob: same shape, different type, i.e. an RNG/order
-  difference in ore placement, not a missing feature.
-- The 18 are the biome-blend disagreement already noted: the port's blended biome and the
-  native lookup answer differently on that boundary.
-- The 2 planks are a structure the port does not place at all (no jigsaw/structure pipeline).
+Earlier revisions suggested a missing carver margin, then missing neighbour seeds,
+then a biome boundary that selected a different carver list for the air and snowy cells.
+These are not established explanations:
 
-So the honest coverage statement stays: **one chunk matches exactly, a second matches in
-99.7 % with four named causes**, and the largest one is an edge-margin question rather than
-a rule the port got wrong.
+- The port already walks the 17×17 neighbour seed region. Existing folding/clipping code
+  rules out merely **absent** neighbour iteration; it does not prove the whole carver path.
+- Both `evidence/foundation/biome-carvers/vanilla.json` and the installed biome JSON group
+  all **53 Overworld biomes** under the same ordered list:
+  `cave, cave_extra_underground, canyon`. A normal Overworld biome misassignment alone
+  cannot change that list.
+- `Gen::biome_name_at`, used for carver selection, is quart-sampled at neighbour corners
+  at y=0. `Gen::apply_snowy` uses `biome_blended` at a surface block; `Cf::FreezeTop`
+  separately selects a biome at its heightmap position and places snow/ice.
+  Comparing those distinct queries as though they were one stimulus hides the stage boundary.
+- Sharing a snow-covered z band does not prove one causal boundary. No paired native
+  lookup or writer trace has yet established that the 32+18 cells have one cause.
+
+The previous claim of “four named causes” is therefore withdrawn, while the observations,
+earlier commits, original captures and expected states are preserved. No implementation
+is changed merely to fit that diagnosis.
+
+## Next bounded measurement
+
+Use the [investigation workflow](../../worldgen-parity/investigation-workflow.md).
+First make the seed-4242 diagnostic reproducible: record both reference hashes, port
+source/binary, settings, absolute coordinate bounds, FULL status, actual stage/clock,
+population inputs and all unknown/skipped fields. Reuse retained worlds before starting
+another server; do not promote this comparison to acceptance while those inputs are unresolved.
+
+Then inspect the **18 snowy cells**, including each block above/below, raw quart biome,
+block-position blended biome, actual native read positions, temperature query, and the
+before/after state at each relevant writer. Distinguish surface evaluation, snow feature
+placement and runtime updates. Do not assume the grass and snow-space biome are identical.
+
+For the other three groups, find the first divergent stage independently, using a narrow
+native trace only if existing captures cannot answer it. A fix needs a native counterexample,
+proof the production path executed, a pre-change failure, a compiling mutant and restored
+normal controls before a settled-batch full gate. Heightmaps, block entities, pending ticks,
+runtime, packet/light and positive Fossil/structure acceptance remain separate open gates.
+
+## Local artifact locations
+
+On the reorganized host, source is `~/mc-spine`; retained captures are under
+`~/mc-spine-local/captures/native/`, TSV exports under `captures/exports/`, and audit
+records under `~/mc-spine-local/audit/historical/save-booking-20261110/`.
+Historical temporary paths above record where captures originally ran; their compatibility
+aliases have been retired. The local `~/mc-spine-local/inventory/` maps old paths to new ones.
+Native worlds/jars and exploratory dumps remain local; this document does not authorize
+their redistribution or change tracked fixture expectations.

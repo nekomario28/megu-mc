@@ -1,7 +1,8 @@
 # 実装・検証チェックリスト（`perf/worldgen-parallel`）
 
 作成: 2026-11-06。基点: `48dfe73b4e1db64d5ce295f0e533d30780a8fc37`。
-状態: **計画のみ**。この文書の追加は実装・試験の完了を意味しない。
+更新: 2026-11-13。状態: **部分実装・限定検証済み。上位P0〜P4の完了は別判定**。
+作成時点の履歴と、下記の現行棚卸しを混同しない。
 
 この文書は**作業順、担当する既存owner、完了ゲートを一覧化する実行台帳**。
 目標の正本は [PLAN](PLAN.md)、順序と出口条件の正本は [ROADMAP](ROADMAP.md)。
@@ -13,19 +14,36 @@
 ## 判断と運用
 
 - 対象は **Minecraft Java 1.21.1 / protocol 767**、固定公式jar `59353fb40c36d304f2035d51e7d6e6baa98dc05c`。
-- **最初は計画だけのDraft PRを、この作業ブランチ宛て**に提出する。プログラム変更、`main` 更新、公開・releaseは別の判断。既存のhost上の未コミット作業（`fossil-placement-20261106` 監査の34ファイルなど）は上書き・stash・restoreしない。
+- 計画のみのDraft PRと34ファイルの未コミットbatchは作成時点の前提であり、現在の着手条件ではない。最初に実際のHEAD・index・worktree・remoteを確認し、他作業を上書き・stash・restoreしない。push・統合・公開/releaseにはその都度の指示と検証範囲の確認が必要。
 - 各項目は **native実クラスの同一入力 → Rust独立比較 → 本番経路で再実行 → 故障注入（compiling mutant）→ 広い回帰** の順で閉じる。fixtureの0件実行・skip・old captureを「一致」に数えない。
 - 同じseed、dimension、datapack、structures設定、source順、margin、chunk FULL、時計、生成stageを固定。**生成停止（paused）とruntime tick後を別々**に比較し、全block state、書き込み順、RNG、NBT、pending/delivered tick、保存/再読込、wireを混同しない。
 - **ステータスは実際に検証した項目だけ `[x]`** にする。`tests/verify.sh`、native JAR比較、GitHub Actions、第三者レビューは別々に記録する。ホストCI未起動は成功ではない。
 - 既に確認済みの限定契約（forest 3×3の旧checkpoint、template processor・fossil・proto tickのnative fixtures）は消さずに回帰として維持する。新HEADでの全体合格には置き換えない。
 
+## 現行の棚卸し（2026-11-13、上位項目の一括完了ではない）
+
+| 項目 | 現在ある限定契約 | 残す出口 |
+|---|---|---|
+| P0-1 | [ローカル全gate checkpoint](../evidence/gameplay/feature-parity/verification-20261112.md)がある | 次の挙動変更の対象SHAで再検証。hosted CI・独立レビューとは別 |
+| P0-2 / P0-4 | seed 0のcanonical-state gateと、seed 4242の探索captureがある | 2つ目のseedの再現契約・stage/writer帰属。未知入力とskipの到達性監査 |
+| P1-0 / P1-1 | tree/templateの共通面順と限定neighbor/support比較基盤 | 全contextの汎用neighbor chain、予約から実効果まで |
+| P1-2 | supported container Items・sign front textを既存storeへstaging。entity offset変換も比較済み | 実entity生成、任意NBT、loot/finalizer、実Levelを要する受け入れ |
+| P1-3 | proto-to-level handoffと限定callback順 | chunk activation、実block/fluid効果、native保存/再開 |
+| P1-4 | 1つのOverworld chunkの全state比較 | 正のFossil実chunk、heightmap/NBT/pending tick、runtime・wire/light |
+| P2〜P4 | 個別helper・dimension terrainの比較はある | 全構造物・通常dimension・M2/M3・資産出所・独立レビュー・リリース判断 |
+
+ソース所有者と境界は [template finalization](template-finalization/README.md)、
+詳細は各sliceを参照。表の「ある」は上位チェックを `[x]` にする根拠ではない。
+測定結果は証拠ページ、次の順序は [ROADMAP](ROADMAP.md)、実行方法は
+[因果差分の調査手順](worldgen-parity/investigation-workflow.md)に置く。
+
 ## 優先順・依存関係・完了条件
 
 ### P0 — 作業の検証基盤と入力意味論（並行して先行）
 
-- [ ] **P0-1 HEAD再現と失敗の基線固定** — `48dfe73b4` のコード・入力資産・固定jarのdigestを紐付け、`tests/verify.sh`（serial / 8-thread×3 / wire / adapter / layers / debt / mutations）で現在の一次失敗を収集。テスト失敗をmutex poisonやCI課金停止と混同しない。各結果に実行環境・終了コード・省略項目を記録する。
-- [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `src/worldgen.rs` の未知density型 `DF::Zero`、明示のゼロ扱いノード、surface ruleの未対応、`spawn_costs` とNaturalSpawner等を分類。固定datapackの実際に到達する経路を列挙し、必須の未知ノードは黙ってゼロにせず拒否する。修正は実クラスfixtureと本番チャンク差分で確認。未到達な旧形式の互換性を推測して広げない。
-- [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー）** — この枝は `datapacks/vanilla/`、1,180 NBTテンプレート、`config_packets.bin`、`assets/pblocks.json` 等を追跡しており、`main` の「jarからローカル生成・非コミット」方針およびREADME/THIRD_PARTYの記述と矛盾する。各blobの出所・権利・ハッシュと再生成手順を一覧化し、検証可能なローカル生成物へ切り替える方針を確定する。**無条件の一括削除でテスト入力を消さない**。LICENSE・Pumpkin一致・履歴・第三者資産を含め確認が済むまで `main` へマージ／公開しない。内部実装の他のP1作業は継続可能。
+- [ ] **P0-1 HEAD再現と失敗の基線固定** — これから検証する対象SHAのコード・入力資産・固定jarのdigestを紐付け、`tests/verify.sh`（serial / 8-thread×3 / wire / adapter / layers / debt / mutations）で現在の一次失敗を収集。テスト失敗をmutex poisonやCI課金停止と混同しない。各結果に実行環境・終了コード・省略項目を記録する。
+- [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `src/worldgen.rs` の未知density型の拒否、再帰用placeholderと明示ゼロ扱いノード、surface ruleの未対応を区別し、`spawn_costs` とNaturalSpawner等を分類。固定datapackの実際に到達する経路を列挙し、必須の未知ノードは黙ってゼロにせず拒否する。修正は実クラスfixtureと本番チャンク差分で確認。未到達な旧形式の互換性を推測して広げない。
+- [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー）** — この枝は `datapacks/vanilla/`、1,180 NBTテンプレート、`config_packets.bin`、`assets/pblocks.json` 等を追跡しており、README/THIRD_PARTYの「jarからローカル生成・非コミット」という記述と矛盾する。各blobの出所・権利・ハッシュと再生成手順を一覧化し、検証可能なローカル生成物へ切り替える方針を確定する。**無条件の一括削除でテスト入力を消さない**。LICENSE・Pumpkin一致・履歴・第三者資産を含め確認が済むまで `main` へマージ／公開しない。内部実装の他のP1作業は継続可能。
 - [ ] **P0-4 native比較契約の固定** — Fossilが**正に配置される**fixture、complete FULL chunks、必要halo、sourceの生成順、2回のnative採取の再現性を定義。artifactに入力・SHA・対象セル数・除外数・pending tick・writerを記録し、古い測定値の流用を防ぐ。
 
 ### P1 — Template finalization（**最優先の実装列**）
@@ -54,12 +72,15 @@
 
 ## 次の着手
 
-1. **P0-1/P0-2/P0-4** を検証基盤として固定。P0-3の出所調査は同時進行するが、内部実装を全停止させない。
-2. 最初のコードPRは **P1-1（neighbor state transitions）だけ**。既存 `template-finalization` の単一owner規則に従い、native失敗fixtureとそれを直す最小実装をセットにする。
-3. **P1-2 → P1-3 → P1-4** を個別の小さな変更と検証単位で進める。各段の完了はこの台帳のチェックを更新し、具体的な再現値は `evidence/` に記録。
-4. **P2以降は先行ゲートを満たした部分から**展開する。P0-3/P4が未解決の間は `main` へ統合・外部配布しない。
+[ROADMAPの直近の実行順](ROADMAP.md#直近の実行順2026-11-13)を参照する。
+最初は既存captureの再現診断とsnowyセルの読み取り位置・writer比較。
+P1-1/P1-2/P1-3は既存の限定実装を再利用して不足する出口だけを追加する。
+下記の作成時点の「未実行」を、現在の未実装一覧や最新gate結果に読み替えない。
+資産・出所の監査は未完であり、新しいデータの再配布やリリースの承認にはならない。
 
-## 現在の作業実績（2026-11-06、全体gate未実行）
+## 履歴: 作成時点の作業実績（2026-11-06〜07）
+
+以下は当時の記録。現在の状態は上の棚卸しと各sliceを優先する。
 
 - **P0-2 は部分対応・未完了**: [Draft PR #32](https://github.com/nekomario28/mc-spine/pull/32) で、未知のdensity型をゼロ代替しない修正と、`noise`/ `shifted_noise` の不正入力拒否・Y軸シフトを追加。固定データのdensity定義35件とnoise settings 7件についてJSON型名を静的に確認し、parserの型分岐に未対応の名前は見つからなかった。**Rustビルド・全体suite・ネストした値の実行・native比較は未実行**。明示ゼロ扱いの意味論、loaderの部分失敗とsurface/biomeの検証は残す。
 - **P0-3 は追跡実態を確定・未完了**: [data tracking監査](../evidence/foundation/data-tracking-20261106/README.md) にGitツリーの数量・ファイル・文書矛盾を記録。出所・バイト照合・消費者切替・歴史的ライセンス問題の解決には未着手。データ削除やリリースはしていない。
@@ -68,10 +89,12 @@
 
 - **P1-1 続報（2026-11-06）**: Draft PR #33でフェンス/ガラス板・鉄格子の接続と切断、壁の直線・T字（覆い無しに限定）、既存runtimeの連鎖更新、水没ブロックのwater source判定と+5ゲームtickのfluid scheduling、生成時proto tick予約まで追加。Java nativeオラクル25ケース、Rust回帰追加。**native JAR実行・Rust compile/実行・網羅的な支持判定・複雑な壁・全配送比較は未完了**のため、P1-1は未チェック。
 
-- **P1-1 Native検証基盤の追加（2026-11-07）**: [Draft PR #34](https://github.com/nekomario28/mc-spine/pull/34) を #33 の上に積み、固定1.21.1の全1,060ブロック種類・26,684状態×12支持場面＝320,208件を `BlockState.canSurvive` で判定するオラクルを実装。Nativeタグ読込、形状更新時のset/tick要求順、Native `LevelTicks` へ投入した後の配送順、ポータブルな欠落/順序破壊テストを追加。**全状態Native実行・Rust本体との一致、ServerLevelの連鎖・tick効果、全環境における支持判定は未完了**。本項を完了とは扱わない。\n\n## レビューで明示する未実行・未解決
+- **P1-1 Native検証基盤の追加（2026-11-07）**: [Draft PR #34](https://github.com/nekomario28/mc-spine/pull/34) を #33 の上に積み、固定1.21.1の全1,060ブロック種類・26,684状態×12支持場面＝320,208件を `BlockState.canSurvive` で判定するオラクルを実装。Nativeタグ読込、形状更新時のset/tick要求順、Native `LevelTicks` へ投入した後の配送順、ポータブルな欠落/順序破壊テストを追加。**全状態Native実行・Rust本体との一致、ServerLevelの連鎖・tick効果、全環境における支持判定は未完了**。本項を完了とは扱わない。
+
+## 履歴: 作成時点のレビュー注意
 
 作成時点のHEADコミット本文にはRustテスト **384 passed / 1 ignored**、
 **255 mutants** が記録されている。これは当該コミットの自己申告の検証記録で、
 本計画PRで独立再実行した結果ではない。hosted CIにも当該作業ブランチの実行記録はない。
-現行ソースには汎用neighbor遷移、template entityの実初期化、
+当時の残件には汎用neighbor遷移、template entityの実初期化、
 unrestricted runtime tick、全chunk parityの実装/受け入れが残る。

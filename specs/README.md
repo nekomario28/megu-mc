@@ -17,8 +17,13 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 ## 状態
 
+直近の実行順は [ROADMAP](ROADMAP.md)、限定実装と残る出口は
+[実行台帳](implementation-checklist.md)、効率的な検証方法は
+[因果差分の調査手順](worldgen-parity/investigation-workflow.md)を参照する。
+過去のcheckpoint・履歴節を現在の全体合格や次の作業と混同しない。
+
 - **全体目標は未達。** M2（同じ入力で遊べる範囲のvanilla一致）とM3（同じ仕事での軽量性）は達成していません。完了条件は[PLAN](PLAN.md)を参照。
-- **worldgenは進行中。** 過去のterrain-only比較と cave / cave-extra / canyon carver は限定した固定具で一致しましたが、自前データ移行後の受け入れは未完です。旧固定具の緑を全seed・全chunk・featureを含む現在の一致へ広げません。**2026-11-12 追記：** seed 0 の chunk (0,0) を pinned 1.21.1 server（隔離実行・プレイヤー無し・features あり）から採取し、`tests/data/overworld_chunk_0_0_1211.tsv.gz` として固定しました。`overworld_chunk_matches_native_capture_state_for_state` が**正規化 state（名前＋全プロパティ）で 32,518 / 32,518 セル一致**を要求します。参照側は同一入力の2回実行で 4 セルばらつく（座標は provenance）ので、0 差はその床に対しての値です。範囲は **1 chunk・1 seed・Overworld・ストラクチャ/エンティティ対象外**で、全seedや他次元へは広げません。
+- **worldgenは進行中。** 過去のterrain-only比較と cave / cave-extra / canyon carver は限定した固定具で一致しましたが、自前データ移行後の受け入れは未完です。旧固定具の緑を全seed・全chunk・featureを含む現在の一致へ広げません。**2026-11-12 追記：** seed 0 の chunk (0,0) を pinned 1.21.1 server（隔離実行・プレイヤー無し・features あり）から採取し、`tests/data/overworld_chunk_0_0_1211.tsv.gz` として固定しました。`overworld_chunk_matches_native_capture_state_for_state` が**正規化 state（名前＋全プロパティ）で 32,518 / 32,518 セル一致**を要求します。参照側は同一入力の2回実行で 4 セルばらつく（座標は provenance）ため、0 差は名前を特定したcaptureとの比較結果です。観測したrun間差を許容マスクや普遍的な床にはしません。範囲は **1 chunk・1 seed・Overworld・ストラクチャ/エンティティ対象外**で、全seedや他次元へは広げません。
 - **1.21.1 自前データへの移行は WIP。** 気候 router の inline 関数を読むようにし、built-in biome tree を同じ固定 jar から再生成しました。inline surface rule・ブロック状態・温度条件を接続し、[samplerとnative noise](../evidence/foundation/weird-sampler/README.md)、[aquiferの限定した実クラス比較](../evidence/foundation/aquifer/README.md)、[biome carverのAIR list](../evidence/foundation/biome-carvers/README.md)、[biome spawn tableと夜間hostileの接続](../evidence/foundation/biome-spawners/README.md)も追加しました。surfaceのsteep・条件式・合成buildSurface scanは[限定比較済み](../evidence/foundation/surface-context/README.md)ですが、real-noise地形へのsurface全適用・aquiferの全seed/chunk・spawn_costsの適用・NaturalSpawner全体は未完です。[surface の部分検証](../evidence/foundation/surface-loader/README.md)を参照。旧統合線の緑を移行ブランチに引き継ぎません。[Horizon の再利用判断と検証範囲](../evidence/foundation/horizon-reuse/README.md)を参照。
 - **Horizon の再利用を gameplay にも拡大。** 通常スロットとチェスト転送から、1.21.1 実クラス参照と本番 wire 検査を対にして進めています。[移植順序](horizon-gameplay/README.md)、[チェストの検証範囲](../evidence/gameplay/containers/README.md)、[アイテム回収の部分実装](../evidence/gameplay/inventory-pickup/README.md)を参照。エンティティ全般やチェストの開閉・同期まで移植済みという意味ではありません。
 - **Valence は部品単位で評価。** 旧版 framework や registry は導入せず、entity角度・section palette・NBT文字列書き出し・有限AABB判定を既存 owner で修復しています。[再利用判断](../evidence/foundation/valence-reuse/README.md)、[角度](../evidence/gameplay/entity-angles/README.md)、[binary/geometryの検証範囲](../evidence/foundation/valence-primitives/README.md)、[分割した契約](valence-primitives/README.md)を参照。entity全体・任意NBT・worldのparityではありません。

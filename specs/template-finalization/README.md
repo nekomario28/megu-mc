@@ -5,32 +5,39 @@ scripted-level acceptance for a running world. Keep the authenticated 1.21.1 gam
 as a behavioral reference, not distributable source. Decompilations and captures
 stay outside the repository.
 
-## Next Agent Prompt
+## Current handoff (2026-11-13)
 
-You are extending the existing uncommitted fossil/processor batch. Its baseline
-is the 34-file manifest in the host audit `fossil-placement-20261106`; do not
-restore, stash, publish or overwrite that work. The shared voxel-face owner is
-now connected to tree and template. The new native per-chunk fluid insertion
-assertion rejects the exact pre-change template module on `half-water-0`.
-Generated block/fluid ticks also share the native per-chunk negative-suborder
-handoff; the native collector callback contract is pinned separately from fluid
-physics. Next: implement actual neighbor-state transitions; face order does not
-close that contract. Full-cube states can themselves override shape updates;
-absence of template NBT does not imply absence of a block-entity factory.
-Preserve the original fossil inputs and nine-column expectations.
-Update this handoff and the checklist when stopping. No compatibility layer or
-save format migration is part of the face-order slice.
+The old uncommitted 34-file fossil batch is historical context, not the current
+working tree. Preserve its original fixtures and nine-column expectations, but
+inspect the actual source/index before working. Use the
+[current roadmap](../ROADMAP.md) and
+[causal investigation workflow](../worldgen-parity/investigation-workflow.md).
+
+The shared voxel visitor, native-style generated tick handoff, bounded
+processor/fossil path, supported container/sign staging and entity offset
+transforms exist. None closes all four finalization contracts. Actual template
+entity creation remains refused; arbitrary NBT, general neighbor recursion,
+world tick effects and whole-chunk structure acceptance remain separate work.
+
+Next, make the second-seed comparison reproducible and inspect the snowy cells'
+upper/lower positions, biome lookup and writer before changing behavior.
+Investigate air/ore/plank residuals independently; do not infer a carver cause
+from the final air state or merge causes because their coordinate bands overlap.
 
 - [ ] [Neighbor finalization](slices/01-neighbors.md):
   - [x] Shared face sequence and per-chunk source-fluid reservation order.
   - [ ] Native block-state changes and the remaining scheduled effects.
-- [ ] [Initialization](slices/02-initialization.md): block/entity NBT admission,
-  transformation, initialization and existing runtime ownership.
+- [ ] [Initialization](slices/02-initialization.md):
+  - Supported container Items and sign front text use staging into existing stores.
+  - Entity offset transforms are compared; actual entity creation is still refused.
+  - General live initialization, arbitrary NBT and finalizers remain open.
 - [ ] [Tick delivery](slices/03-delivery.md):
   - [x] Generated proto-to-level handoff and controlled cross-chunk callbacks.
   - [ ] Actual world tick effects, server activation order and native persistence.
-- [ ] [Whole chunks](slices/04-chunks.md): matching inputs, margins, generation
-  stage and recorded population order, followed by a separately staged runtime.
+- [ ] [Whole chunks](slices/04-chunks.md):
+  - A seed-0 Overworld canonical-state fixture exists; seed 4242 remains exploratory.
+  - Positive Fossil/structure chunks, heightmaps, initialization and pending ticks
+    need matching input/stage/order contracts, followed by separate runtime gates.
 
 ## Single-owner invariants
 
