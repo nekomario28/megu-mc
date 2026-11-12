@@ -1,44 +1,59 @@
 #!/usr/bin/env python3
-"""The no-feature pack has to declare the data-pack format, not the resource one."""
+"""Portable checks for the pinned 1.21.1 terrain-only capture pack."""
+from pathlib import Path
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-import nofeat_pack  # noqa: E402
+TOOL = ROOT / "tools/nofeat_pack.py"
 
 
 class NoFeaturePackTests(unittest.TestCase):
-    def test_declares_the_1211_data_pack_format(self):
-        self.assertEqual(nofeat_pack.DATA_PACK_FORMAT_1211, 48)
-
-    def test_writes_a_pack_that_empties_features_and_carvers(self):
+    def test_generated_pack_has_correct_native_version_and_no_features(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            src = root / "pack"
-            biome = src / "data/minecraft/worldgen/biome"
-            biome.mkdir(parents=True)
-            (biome / "plains.json").write_text(
-                json.dumps(
-                    {
-                        "features": [["minecraft:oak"], [], ["minecraft:coal_ore"]],
-                        "carvers": {"air": ["minecraft:cave"]},
-                        "temperature": 0.8,
-                    }
-                )
+            src = Path(tmp) / "source"
+            dst = Path(tmp) / "terrain-only"
+            path = src / "data/minecraft/worldgen/biome/plains.json"
+            path.parent.mkdir(parents=True)
+            original = {
+                "temperature": 0.8,
+                "precipitation": True,
+                "features": [["minecraft:ore"], [], ["minecraft:tree"]],
+                "carvers": {"air": ["minecraft:cave"], "liquid": []},
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+            run = subprocess.run(
+                [sys.executable, str(TOOL), str(src), str(dst)],
+                text=True, capture_output=True, check=False,
             )
-            out = root / "nofeat"
-            sys.argv = ["nofeat_pack.py", str(src), str(out)]
-            self.assertEqual(nofeat_pack.main(), 0)
-            meta = json.loads((out / "pack.mcmeta").read_text())
-            self.assertEqual(meta["pack"]["pack_format"], 48)
-            stripped = json.loads((out / "data/minecraft/worldgen/biome/plains.json").read_text())
-            self.assertEqual(stripped["features"], [[] for _ in range(nofeat_pack.STEPS)])
-            self.assertEqual(stripped["carvers"], {})
-            self.assertEqual(stripped["temperature"], 0.8)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("dropped 2 placed-feature references", run.stdout)
+            self.assertIn("dropped 1 carver entries", run.stdout)
+            pack = json.loads((dst / "pack.mcmeta").read_text(encoding="utf-8"))
+            # 34 belongs to the 1.21.1 RESOURCE pack, not the DATA pack.
+            self.assertEqual(pack["pack"]["pack_format"], 48)
+            parsed = json.loads(
+                (dst / "data/minecraft/worldgen/biome/plains.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(parsed["features"], [[] for _ in range(11)])
+            self.assertEqual(parsed["carvers"], {})
+            self.assertEqual(parsed["temperature"], original["temperature"])
+            self.assertEqual(parsed["precipitation"], original["precipitation"])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
+
+    def test_missing_source_biomes_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "empty", Path(tmp) / "out"
+            src.mkdir()
+            run = subprocess.run(
+                [sys.executable, str(TOOL), str(src), str(dst)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("no biome json", run.stderr)
 
 
 if __name__ == "__main__":
