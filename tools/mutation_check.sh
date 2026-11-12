@@ -1253,6 +1253,10 @@ check "staged containers are taken from the generator once" \
   src/worldgen.rs '        std::mem::take(&mut self.staged_block_entities)' '        Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
+check "snowy grass follows the biome temperature" \
+  src/worldgen.rs '            if !(weather.temperature < 0.15) {' '            if true {' \
+  snowy_grass_follows_the_biome_temperature
+
 check "the canonical state keeps its properties" \
   src/block_registry.rs '            format!("{}[{}]", name, parts.join(","))' '            name' \
   overworld_chunk_matches_native_capture_state_for_state

@@ -153,3 +153,29 @@ mismatch; this test supersedes it as the gate.
 
 Still true, and not claimed: one chunk, one seed, Overworld only, no structures/entities,
 and the reference itself varies in 4 cells between runs (named in the provenance).
+
+## A second seed found what one chunk could not (2026-11-12)
+
+A capture at seed 4242, chunk (3,−2) was compared at canonical-state level against the
+port. Two things came out of it, in this order:
+
+1. **My own dumper was wrong.** `terrain_chunk_dump.py` emitted *local* coordinates, which
+   are also absolute for chunk (0,0) — the seed-0 result was right by coincidence and the
+   first 4242 comparison reported 64,592 differences in a perfectly symmetric pattern. Fixed
+   (absolute coordinates), and the seed-0 fixture was verified byte-identical afterwards.
+2. **The port had no `snowy` rule at all.** With coordinates fixed, 302 of ~32,300 cells
+   differed: **238** were `grass_block[snowy=true]` natively against `[snowy=false]` in the
+   port. `SnowyDirtBlock` sets that flag from the biome's *base* temperature, which the port
+   never consulted. `Gen::apply_snowy` now does, at the blended biome of the cell (not the
+   surface rule's quart-snapped leaf), and `snowy_grass_follows_the_biome_temperature` pins
+   it with a compiling mutant.
+
+After the fix: **82 cells remain**, in three classes — 32 `air`/`stone`, 30 `diorite`/`granite`
+(the same ore-blob class that varies between two native runs of seed 0), and 2 `oak_planks`
+natively against `air` (a missing structure piece). **18** `grass_block[snowy=true]` cells are
+still false positives on biome boundaries, where the port's blended biome disagrees with the
+native lookup; that is a biome-blend residual, not the snowy rule.
+
+So the honest statement of coverage is: **seed 0 chunk (0,0) matches exactly; seed 4242 chunk
+(3,−2) matches in 99.7 % of cells with three named residual classes.** The single-chunk result
+did not generalise, which is exactly why the second seed was worth capturing.

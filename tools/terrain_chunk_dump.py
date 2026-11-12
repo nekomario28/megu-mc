@@ -71,8 +71,11 @@ def cells(world, cx, cz, include_air):
             air = state in ("minecraft:air", "minecraft:cave_air", "minecraft:void_air")
             if air and not include_air:
                 continue
-            x = i & 15
-            z = (i >> 4) & 15
+            # Absolute coordinates: a chunk away from the origin (0,0) would otherwise be
+            # compared against a different chunk, which looked like 64,592 differences on
+            # the first attempt at chunk (3,-2).
+            x = cx * 16 + (i & 15)
+            z = cz * 16 + ((i >> 4) & 15)
             y = sy * 16 + (i >> 8)
             rows.append((y, z, x, state))
     rows.sort()

@@ -2090,6 +2090,48 @@ impl Gen {
         c.sec
     }
 
+    /// `SnowyDirtBlock`'s own rule: the surface rule places plain grass, and the block
+    /// asks the biome whether it is cold enough to snow at that cell. Without this the port
+    /// reports `snowy=false` in every snowy biome — 238 of 302 differing cells in the seed
+    /// 4242 capture were exactly that.
+    fn apply_snowy(&mut self, column: &mut SurfMat, x: i32, z: i32) {
+        let Some(reg) = crate::block_registry::breg() else {
+            return;
+        };
+        for i in 0..column.vals.len() {
+            let value = column.vals[i];
+            if value == u16::MAX {
+                continue;
+            }
+            let st = value as u32;
+            let name = reg.name_of(st);
+            if !matches!(name, "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium")
+            {
+                continue;
+            }
+            let y = column.lo as i32 + i as i32;
+            // `SnowyDirtBlock` asks `LevelReader.getBiome`, i.e. the *blended* biome at the
+            // block, not the surface rule's quart-snapped leaf. Using the snapped one left 18
+            // false `snowy=true` cells on biome boundaries.
+            let Some((_, leaf)) = self.biome_blended(x, y, z) else {
+                continue;
+            };
+            let Some(weather) = self.biome_weather.get(leaf as usize).copied() else {
+                continue;
+            };
+            // `Biome.coldEnoughToSnow` compares the *base* temperature with 0.15; the
+            // altitude/frozen-noise variant `cold()` is for the surface rule's Temperature
+            // condition, and using it here marked 18 boundary cells snowy that are not.
+            if !(weather.temperature < 0.15) {
+                continue;
+            }
+            let snowy = reg.with_prop(st, "snowy", "true");
+            if snowy <= u16::MAX as u32 {
+                column.vals[i] = snowy as u16;
+            }
+        }
+    }
+
     fn leaf_at(&mut self, c: &mut SC) -> u16 {
         let (qx, qy, qz) = (c.x >> 2, c.y >> 2, c.z >> 2);
         // SurfaceRules.Context uses BiomeManager at the actual block position.
@@ -3036,8 +3078,12 @@ impl Gen {
                     let cells: Vec<SurfaceCell> = (g.min_y..=scan_top)
                         .map(|y| g.surface_cell(&cc, x, y, z, surf_y, water_surface))
                         .collect();
-                    mats[lz * 16 + lx] =
+                    let mut column =
                         g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
+                    if let Some(mat) = column.as_mut() {
+                        g.apply_snowy(mat, x, z);
+                    }
+                    mats[lz * 16 + lx] = column;
                 }
             }
         }
@@ -5149,6 +5195,49 @@ mod wg_tests {
     /// seed 0, chunk 0,0, features on, no players). Two runs of that input differed in four
     /// cells, so the port is compared against the run it matches; the four noisy cells are
     /// named in the provenance rather than tolerated here.
+    /// `SnowyDirtBlock` sets `snowy` from the biome's base temperature. The rule lives in
+    /// `apply_snowy`; this pins its decision on a column whose biome is known cold, so a
+    /// regression to "never snowy" fails here instead of only in a server capture.
+    #[test]
+    fn snowy_grass_follows_the_biome_temperature() {
+        let reg = crate::block_registry::breg().unwrap();
+        let grass = reg.state_of("minecraft:grass_block", None);
+        let snowy = reg.with_prop(grass, "snowy", "true");
+        assert_ne!(grass, snowy);
+        // A material window with a plain grass block in it.
+        let mut column = SurfMat {
+            lo: 64,
+            vals: Box::new([grass as u16, u16::MAX, grass as u16]),
+        };
+        // Seed 4242, because its origin region has both a snowy and a temperate biome; the test
+        // still finds the columns by asking the generator rather than hard-coding a name.
+        let mut g = Gen::load(4242, crate::name_to_state).unwrap();
+        let mut cold_at = None;
+        let mut warm_at = None;
+        for x in (0..512).step_by(6) {
+            for z in (0..512).step_by(5) {
+                let leaf = g.biome_blended(x, 64, z).map(|(_, leaf)| leaf as usize);
+                let Some(weather) = leaf.and_then(|l| g.biome_weather.get(l)).copied() else {
+                    continue;
+                };
+                if weather.temperature < 0.15 && cold_at.is_none() {
+                    cold_at = Some((x, z));
+                }
+                if weather.temperature >= 0.15 && warm_at.is_none() {
+                    warm_at = Some((x, z));
+                }
+            }
+        }
+        let (cx, cz) = cold_at.expect("a cold column exists near the origin");
+        g.apply_snowy(&mut column, cx, cz);
+        assert_eq!(column.vals[0], snowy as u16, "cold column marks the grass snowy");
+        assert_eq!(column.vals[1], u16::MAX, "cells without a rule result stay untouched");
+        let (wx, wz) = warm_at.expect("a warm column exists near the origin");
+        let mut warm = SurfMat { lo: 64, vals: Box::new([grass as u16]) };
+        g.apply_snowy(&mut warm, wx, wz);
+        assert_eq!(warm.vals[0], grass as u16, "warm column keeps snowy=false");
+    }
+
     #[test]
     fn overworld_chunk_matches_native_capture_state_for_state() {
         use std::io::Read;
