@@ -179,3 +179,34 @@ native lookup; that is a biome-blend residual, not the snowy rule.
 So the honest statement of coverage is: **seed 0 chunk (0,0) matches exactly; seed 4242 chunk
 (3,−2) matches in 99.7 % of cells with three named residual classes.** The single-chunk result
 did not generalise, which is exactly why the second seed was worth capturing.
+
+## The 82 residual cells at seed 4242, classified (2026-11-12)
+
+A second native run of the same seed and chunk differs from the first in **23 cells**, all
+`diorite → andesite` — that is this chunk's reference variability (seed 0 had 4). Comparing
+the port against run A leaves 82 cells, in four classes with disjoint bounding boxes, so
+each is attributable rather than "small differences":
+
+| cells | where | what |
+|---:|---|---|
+| 32 | `x = 63` (the chunk's +x column), `y 5..12`, `z −30..−17` | native air, port stone |
+| 30 | `x 52..56`, `y 19..22`, `z −19..−17` | native diorite, port granite — one small ore blob typed differently |
+| 18 | `y 64..65`, `x 50..59` | `snowy=true` here vs `snowy=false` natively — biome-boundary blend |
+| 2 | `(62..63, 21, −17)` | native `oak_planks`, port air — a structure piece |
+
+Three of the four are understood and bounded:
+
+- The 32 edge cells are the interesting one: every one sits in the last column of the chunk,
+  underground, where native has carved air. An edge-only pattern points at the carver's
+  neighbour margin (vanilla carves with a margin from already-generated neighbours) rather
+  than at a wrong rule, and it did not show up at seed 0 because that chunk's edges had no
+  caves. Not fixed, and worth its own slice.
+- The 30 are a single diorite/granite blob: same shape, different type, i.e. an RNG/order
+  difference in ore placement, not a missing feature.
+- The 18 are the biome-blend disagreement already noted: the port's blended biome and the
+  native lookup answer differently on that boundary.
+- The 2 planks are a structure the port does not place at all (no jigsaw/structure pipeline).
+
+So the honest coverage statement stays: **one chunk matches exactly, a second matches in
+99.7 % with four named causes**, and the largest one is an edge-margin question rather than
+a rule the port got wrong.
