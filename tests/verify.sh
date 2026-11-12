@@ -17,6 +17,7 @@ python3 tests/nbt_region_test.py
 python3 tests/structure_oracle_test.py
 python3 tests/template_neighbor_oracle_test.py
 python3 tests/template_init_oracle_test.py
+python3 tests/nofeat_pack_test.py
 python3 tests/native_survival_inventory_test.py
 python3 tests/native_survival_oracle_test.py
 python3 tests/native_neighbor_trace_test.py

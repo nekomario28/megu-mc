@@ -69,7 +69,12 @@ variability, and dump before any runtime tick.
 A pinned 1.21.1 server was started once in an isolated directory (`/var/tmp/mc-native-overworld-20261111`,
 seed 0, `level-type=normal`, no players) with a datapack that empties every biome's
 `features` and `carvers` (`tools/nofeat_pack.py`; 2,545 placed-feature references and 264
-carver entries dropped, the same counts the historical End/Nether capture recorded). It
+carver entries dropped, the same counts the historical End/Nether capture recorded).
+
+The pack first declared `pack_format 34`, which is 1.21.1's **resource**-pack format; the
+data format is 48. It still loaded (the log says "Found new data pack file/nofeat, loading
+it automatically", and the captured chunk had no ores), but the declaration was wrong and is
+now 48 with a test, after the same fix appeared in another session's draft. It
 generated its spawn chunks and was stopped, and chunk 0,0 was read back from the region
 file with `tools/terrain_chunk_dump.py` — name-based, because the numeric id space has no
 documented property-to-id order.

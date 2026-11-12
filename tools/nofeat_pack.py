@@ -19,6 +19,10 @@ import sys
 from pathlib import Path
 
 STEPS = 11  # GenerationStep.Decorated .. TopLayer, each a list of placed features
+# 1.21.1's *data* pack format is 48; 34 is the resource-pack format for the same release.
+# A wrong number still loads (the server reported "Found new data pack … loading it
+# automatically" and the stripped world had no ores), but it is the wrong declaration.
+DATA_PACK_FORMAT_1211 = 48
 
 
 def strip(biome):
@@ -52,7 +56,14 @@ def main():
         dropped_carvers += dc
         (target / path.name).write_text(json.dumps(biome, separators=(",", ":")))
     (out / "pack.mcmeta").write_text(
-        json.dumps({"pack": {"pack_format": 34, "description": "terrain only: features and carvers removed"}})
+        json.dumps(
+            {
+                "pack": {
+                    "pack_format": DATA_PACK_FORMAT_1211,
+                    "description": "terrain only: features and carvers removed",
+                }
+            }
+        )
     )
     print(
         f"wrote {len(biomes)} biomes to {out} "
