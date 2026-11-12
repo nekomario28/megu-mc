@@ -2181,10 +2181,30 @@ fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
         "the ladder must climb past the cap: {visits:?}"
     );
     let expected: Vec<u64> = (1..=deltas.len() as u64).map(backoff_ticks).collect();
-    assert_eq!(
-        deltas, expected,
-        "the guard must hold each visit to the real backoff, not the queue's 4s cap: {visits:?}"
-    );
+    // The claim is "not early": a queue-cap failure visits at MAX_DELAY (80 ticks) where the
+    // real ladder is 160 or 320, so an early visit is the bug. The upper bound is the
+    // measured clock drift: under the full gate's load a visit lands 1–3 ticks late (41,
+    // 162, 163 against 40, 160, 160), which is the global tick counter moving inside the
+    // window, not the guard releasing early. Six isolated runs and two full 8-thread suites
+    // show no drift at all, so the tolerance stays small and one-sided.
+    for (index, (got, want)) in deltas.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            *got >= *want,
+            "visit {} came {} ticks into a {}-tick backoff: the guard released early \
+             instead of holding the real deadline (visits: {visits:?})",
+            index + 1,
+            got,
+            want
+        );
+        assert!(
+            *got <= want + 4,
+            "visit {} came {} ticks into a {}-tick backoff, more than clock drift explains \
+             (visits: {visits:?})",
+            index + 1,
+            got,
+            want
+        );
+    }
 }
 
 /// Vanilla grows sugar cane one stage per random tick and adds a block on the tick that

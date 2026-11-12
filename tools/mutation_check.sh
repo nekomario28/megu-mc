@@ -1253,6 +1253,12 @@ check "staged containers are taken from the generator once" \
   src/worldgen.rs '        std::mem::take(&mut self.staged_block_entities)' '        Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
+check "the backoff guard holds a visit past the queue cap" \
+  src/main.rs 'fn sched_ready(x: i32, y: i32, z: i32) -> bool {
+    let now = TICK_IDX.load(Ordering::Relaxed);' 'fn sched_ready(x: i32, y: i32, z: i32) -> bool {
+    let now = TICK_IDX.load(Ordering::Relaxed) + 10_000;' \
+  a_backoff_past_the_queue_cap_waits_for_its_real_deadline
+
 check "snowy grass follows the biome temperature" \
   src/worldgen.rs '            if !(weather.temperature < 0.15) {' '            if true {' \
   snowy_grass_follows_the_biome_temperature
