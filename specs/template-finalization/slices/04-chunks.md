@@ -202,10 +202,18 @@ Three of the four are understood and bounded:
   wrong rule, and it did not show up at seed 0 because that chunk's edges had no caves.
   **The obvious explanation is wrong:** `feature.rs` already folds a tunnel's coordinates into
   the target chunk (`x & 15`) and documents that vanilla lets a tunnel from up to eight chunks
-  away paint into the target. So the fold exists; what is missing is the neighbouring chunks'
-  *carver seeds* being run for this chunk — vanilla's `applyCarvers` covers the chunk plus its
-  margin, and an edge cell can be carved by a neighbour-seeded tunnel. Confirming that needs
-  the carve pass's seed loop, which is the next thing to read. Not fixed.
+  away paint into the target. So the fold exists, and the **neighbour seeds are run too**:
+  the carve pass loops `ox in tx-8..=tx+8`, `oz in tz-8..=tz+8`, seeds each neighbour with
+  `set_large_feature_seed(seed, k, ox, oz)`, and clips the ellipsoid to the target chunk's
+  columns. Both obvious explanations are refuted, and the remaining candidate is the *input*
+  that picks a neighbour's carver list: `g.biome_name_at(ox * 16, 0, oz * 16)`, the biome at
+  the neighbour's corner at y=0.
+- That candidate is supported by the geometry: the 32 edge cells (`z -30..-17`) and the 18
+  snowy cells (`z -31..-20`) sit in the same snow-covered band — every `x = 63` column there
+  has a `snow` surface block — so one biome boundary runs through both clusters. A wrong
+  biome at a neighbour corner would both pick the wrong carver list (missing the cave) and
+  mark the wrong `snowy` flag, i.e. **50 of the 82 cells may share one cause**: biome
+  assignment at that boundary. That is the next thing to measure, not the carver.
 - The 30 are a single diorite/granite blob: same shape, different type, i.e. an RNG/order
   difference in ore placement, not a missing feature.
 - The 18 are the biome-blend disagreement already noted: the port's blended biome and the
