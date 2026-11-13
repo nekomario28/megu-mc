@@ -95,3 +95,8 @@ jar、decompile、native worldはローカルに保持し、既存fixtureも権�
 履歴のprovenanceにある旧pathは書き換えず、ローカルの `inventory/` の移動台帳で解決する。
 P0-3の資産/出所監査、独立レビュー、hosted CI、M2/M3は別々の未完了境界であり、
 文書のpushやローカルsuiteの緑をリリース承認と扱わない。
+
+## 7. 汎用理論とフィードバック階層（L0〜L5）
+
+生存者バイアス・ポパーの反証主義・パールの因果推論（ステージ介入）・制約理論（TOC）・情報利得（Writer単位のパレート圧縮）・スイスチーズモデル（ポカヨケ）を統合した汎用方法論と、5ステップ高速収束サイクルは [high-speed-convergence.md](../methodology/high-speed-convergence.md) を参照する。
+
