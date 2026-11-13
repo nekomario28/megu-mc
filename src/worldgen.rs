@@ -721,6 +721,45 @@ impl Gen {
         res: fn(&str) -> Option<u32>,
         preset: NoisePreset,
     ) -> Option<Gen> {
+        #[cfg(test)]
+        {
+            if std::env::var_os("LOAD_TRACE").is_none()
+                && std::env::var_os("MC_SPINE_VEINDBG").is_none()
+            {
+                use std::sync::{Mutex, OnceLock};
+                type Key = (u64, u8, usize, bool, Vec<std::path::PathBuf>);
+                static CACHE: OnceLock<Mutex<HashMap<Key, Option<std::sync::Arc<GenData>>>>> =
+                    OnceLock::new();
+                let preset_id = match preset {
+                    NoisePreset::Overworld => 0,
+                    NoisePreset::Nether => 1,
+                    NoisePreset::End => 2,
+                };
+                let noaq = std::env::var_os("MC_SPINE_NOAQ").is_some();
+                let key = (seed, preset_id, res as usize, noaq, Self::packs());
+                let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+                    return hit
+                        .as_ref()
+                        .map(|d| Self::fresh_scratch(std::sync::Arc::clone(d)));
+                }
+                let built = Self::load_preset_uncached(seed, res, preset);
+                let entry = built.as_ref().map(|g| std::sync::Arc::clone(&g.data));
+                cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, entry);
+                return built;
+            }
+        }
+        Self::load_preset_uncached(seed, res, preset)
+    }
+
+    fn load_preset_uncached(
+        seed: u64,
+        res: fn(&str) -> Option<u32>,
+        preset: NoisePreset,
+    ) -> Option<Gen> {
         let files = Self::df_files();
         let mut g = Gen {
             data: std::sync::Arc::new(GenData {
