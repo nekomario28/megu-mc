@@ -6,6 +6,12 @@ use crate::generation_math::Lcg;
 type Bounds = [i32; 6];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Variant {
+    Normal,
+    Mesa,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Facing {
     North,
     South,
@@ -53,6 +59,7 @@ pub(crate) struct Piece {
     pub(crate) kind: Kind,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Layout {
     pub(crate) pieces: Vec<Piece>,
     /// Context, discarded double, room, children, height adjustment: no draws.
@@ -311,6 +318,30 @@ impl Builder {
 /// Native findGenerationPoint / generatePiecesAndAdjust, NORMAL branch only.
 /// Candidate admission is the caller's responsibility; this always builds a layout.
 pub(crate) fn normal_layout(seed: u64, cx: i32, cz: i32, sea_level: i32, min_y: i32) -> Layout {
+    layout(seed, cx, cz, sea_level, min_y, None)
+}
+
+/// Mesa shares piece construction but adjusts the aggregate centre to a
+/// noise-generator WORLD_SURFACE_WG base height, not a decorated live floor.
+pub(crate) fn mesa_layout(
+    seed: u64,
+    cx: i32,
+    cz: i32,
+    sea_level: i32,
+    min_y: i32,
+    mut surface: impl FnMut(i32, i32) -> i32,
+) -> Layout {
+    layout(seed, cx, cz, sea_level, min_y, Some(&mut surface))
+}
+
+fn layout(
+    seed: u64,
+    cx: i32,
+    cz: i32,
+    sea_level: i32,
+    min_y: i32,
+    mesa_surface: Option<&mut dyn FnMut(i32, i32) -> i32>,
+) -> Layout {
     let mut random = Lcg::for_large_feature(seed, cx, cz);
     let context = random.state48();
     // elw.findGenerationPoint discards this nextDouble before constructing the room.
@@ -342,12 +373,32 @@ pub(crate) fn normal_layout(seed: u64, cx: i32, cz: i32, sea_level: i32, min_y: 
     let after_children = builder.random.state48();
     let low = builder.pieces.iter().map(|p| p.bounds[1]).min().unwrap();
     let high = builder.pieces.iter().map(|p| p.bounds[4]).max().unwrap();
-    let ceiling = sea_level - 10;
-    let mut target = high - low + 1 + min_y + 1;
-    if target < ceiling {
-        target += builder.random.next_bound(ceiling - target);
-    }
-    let vertical_shift = target - high;
+    let vertical_shift = if let Some(surface) = mesa_surface {
+        let centre = |axis: usize| {
+            let lo = builder.pieces.iter().map(|p| p.bounds[axis]).min().unwrap();
+            let hi = builder
+                .pieces
+                .iter()
+                .map(|p| p.bounds[axis + 3])
+                .max()
+                .unwrap();
+            lo + (hi - lo + 1) / 2
+        };
+        let surface = surface(centre(0), centre(2));
+        let target = if surface <= sea_level {
+            sea_level
+        } else {
+            sea_level + builder.random.next_bound(surface - sea_level + 1)
+        };
+        target - centre(1)
+    } else {
+        let ceiling = sea_level - 10;
+        let mut target = high - low + 1 + min_y + 1;
+        if target < ceiling {
+            target += builder.random.next_bound(ceiling - target);
+        }
+        target - high
+    };
     for p in &mut builder.pieces {
         p.bounds = translated(p.bounds, 0, vertical_shift, 0);
         if let Kind::Room { entrances } = &mut p.kind {

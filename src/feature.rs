@@ -8343,7 +8343,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     }
     let fr = freg();
     let order = fr.order.get(&g.preset).expect("dimension feature order");
-    if order.is_empty() || breg().is_none() {
+    if breg().is_none() {
         return;
     }
     // biomes of the 3x3 neighborhood (chunk center at y=0, quart sample)
@@ -8386,10 +8386,15 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         ((sx as i64) << 32) | (sz as i64 & 0xFFFF_FFFF),
         std::sync::atomic::Ordering::Relaxed,
     );
+    let mut structures = crate::mineshaft::References::collect(g, sx, sz);
     let mut ctx = FC::new(g);
     let trace = env_flag!("FEAT_TRACE");
     let profile = env_flag!("FEAT_PROFILE");
-    for (step, entries) in order.iter().enumerate() {
+    for step in 0..order.len().max(structures.step_count()) {
+        // Structures have steps even when the biome has no placed features.
+        // Their registry slots and RNG streams are independent.
+        structures.place_step(&mut ctx, step, pop as u64, sx, sz);
+        let Some(entries) = order.get(step) else { continue };
         for (gi, name) in entries {
             let present = biomes.iter().any(|b| {
                 fr.bsteps
@@ -8481,9 +8486,9 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     }
     // Taken before the writes because `ctx` borrows the generator; the containers ride
     // the same population and move into the runtime store as soon as the lock is released.
-    let mut staged_block_entities = std::mem::take(&mut ctx.block_entities);
+    let mut staged_payloads = std::mem::take(&mut ctx.payloads);
     for ((x, y, z), st) in std::mem::take(&mut ctx.wr) {
         g.feat_write(x, y, z, st);
     }
-    g.stage_block_entities(&mut staged_block_entities);
+    g.stage_payloads((sx, sz), &mut staged_payloads);
 }

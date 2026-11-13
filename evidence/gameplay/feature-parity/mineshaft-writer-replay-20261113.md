@@ -4,9 +4,14 @@ Status: historical causal investigation checkpoint at `a205e2d56405edd9931661628
 This writer-replay checkpoint made no Rust/runtime change, fresh HEAD build, or
 production zero-diff result. Subsequent seed-derived construction is recorded in
 [the layout checkpoint](mineshaft-layout-20261113.md), not retroactively added to
-this scripted experiment.
+this scripted experiment. The later
+[generation-stage capture and caller-seeded writer replay](mineshaft-stage-writer-20261113.md)
+uses the actual requested WG map and obtains conditional whole-volume A/B agreement;
+this historical seed-0/1 experiment and its remaining mismatches are not rewritten.
 The preceding [snowy/residual record](seed-4242-chunk-3-m2-20261113.md) remains
-an exploratory comparison, not an acceptance fixture.
+an exploratory comparison, not an acceptance fixture. The later
+[Rust connection checkpoint](mineshaft-production-20261113.md) tests ordinary
+production generation independently of this saved-piece experiment.
 
 ## Retained comparison
 
@@ -38,6 +43,11 @@ actual captured biome lookup). Worldgen RNG seeds 0 and 1 were fixed before
 running, not searched to fit. Both runs have three biome gate calls, twelve height
 calls and no unsupported calls. All block writes are recorded with child identity.
 Unserved positions and unsupported native requests fail rather than defaulting.
+The later [admission/height-query checkpoint](mineshaft-admission-20261113.md)
+observed that `StructurePiece.isInterior` requests **OCEAN_FLOOR_WG**, not
+MOTION_BLOCKING. This historical handler did not distinguish heightmap types;
+its counts therefore apply only to the explicit substitute-height condition.
+`unsupported=0` is not proof that the height query's semantics matched native.
 
 An initial attempt to include neighbor context rejected `(4,-2)` as
 `initialize_light`, not `FULL`; `(4,-1)` and `(4,0)` have that status too.

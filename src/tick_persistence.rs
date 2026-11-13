@@ -16,6 +16,16 @@ pub(crate) struct TickState {
     pub generated_blocks: Vec<Entry>,
     pub generated_fluids: Vec<Entry>,
 }
+/// Prefix for preceding save sections. This is the same checked framing used
+/// by the tick reader; do not scan arbitrary NBT bytes for a marker.
+pub(crate) fn prefix(payload: &[u8]) -> Result<&[u8], &'static str> {
+    if !payload.ends_with(b"TIK1") { return Ok(payload); }
+    let end = payload.len().checked_sub(12).ok_or("truncated tick state footer")?;
+    let size = usize::try_from(u64::from_be_bytes(payload[end..end+8].try_into().unwrap()))
+        .map_err(|_| "invalid tick state size")?;
+    let start = end.checked_sub(size).ok_or("invalid tick state size")?;
+    Ok(&payload[..start])
+}
 fn position(out: &mut Vec<u8>, p: Pos) {
     for n in [p.0, p.1, p.2] {
         out.extend_from_slice(&n.to_be_bytes());
@@ -59,13 +69,8 @@ impl TickState {
         if !payload.ends_with(b"TIK1") {
             return Ok(None);
         }
-        if payload.len() < 12 {
-            return Err("truncated tick state footer");
-        }
+        let start = prefix(payload)?.len();
         let end = payload.len() - 12;
-        let size = u64::from_be_bytes(payload[end..end + 8].try_into().unwrap());
-        let size = usize::try_from(size).map_err(|_| "invalid tick state size")?;
-        let start = end.checked_sub(size).ok_or("invalid tick state size")?;
         let mut input = &payload[start..end];
         fn take<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], &'static str> {
             let (v, rest) = input.split_at_checked(N).ok_or("truncated tick state")?;

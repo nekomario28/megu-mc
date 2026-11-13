@@ -1,5 +1,6 @@
 //! Scheduled block ticks, using the native per-chunk collection contract.
 
+use crate::generation_math::fastutil_mix64;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -67,12 +68,6 @@ fn chunk_from_key(key: u64) -> ChunkPos {
     (key as u32 as i32, (key >> 32) as u32 as i32)
 }
 
-fn hash(key: u64) -> u64 {
-    let h = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let h = h ^ (h >> 32);
-    h ^ (h >> 16)
-}
-
 /// The native next-deadline map is fastutil's Long2LongOpenHashMap. Its
 /// descending-table iteration supplies the insertion order of tied chunks.
 #[derive(Clone)]
@@ -93,7 +88,7 @@ impl NextChunks {
 
     fn slot(&self, key: u64) -> usize {
         let mask = self.slots.len() - 1;
-        let mut i = hash(key) as usize & mask;
+        let mut i = fastutil_mix64(key) as usize & mask;
         while self.slots[i].is_some_and(|(old, _)| old != key) {
             i = (i + 1) & mask;
         }
@@ -142,7 +137,7 @@ impl NextChunks {
         let mut hole = i;
         let mut scan = (i + 1) & mask;
         while let Some((other, due)) = self.slots[scan] {
-            let home = hash(other) as usize & mask;
+            let home = fastutil_mix64(other) as usize & mask;
             let move_here = if hole <= scan {
                 hole >= home || home > scan
             } else {

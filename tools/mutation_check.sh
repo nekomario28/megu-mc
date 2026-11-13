@@ -88,7 +88,7 @@ control() {
   local name="$1" filter="$2" phase="$3" pattern
   run_filter "$filter"
   if [[ "$filter" == tests/*.py ]]; then
-    pattern='^((client settings|gameplay|containers) wire: PASS|population plan: PASS)$'
+    pattern='^((client settings|gameplay|containers) wire: PASS|population plan: PASS|mineshaft dispatch: PASS)$'
   else
     pattern='^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored'
   fi
@@ -468,8 +468,8 @@ check "a block in a cold chunk keeps its position across ticks" \
             }' \
   region_change_mid_fall_keeps_the_entity
 check "breaking a chest drops the slots it owned" \
-  src/main.rs '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z)) {' \
-  '        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z + 1000)) {' \
+  src/main.rs '        if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Block((x, y, z))) {' \
+  '        if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Block((x, y, z + 1000))) {' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a state whose metadata row cannot be matched is reported as unpaired" \
@@ -1254,11 +1254,11 @@ check "the open window reads the live store, not a copy" \
   a_placed_chest_shows_its_staged_contents_in_the_open_window
 
 check "staged containers reach the live store" \
-  src/main.rs '        for (pos, payload) in staged {' '        for (pos, payload) in Vec::<(( i32,i32,i32), crate::staged_block_entity::StagedBlockEntity)>::new() {' \
+  src/main.rs '    for (pos, payload) in staged {' '    for (pos, payload) in Vec::<(( i32,i32,i32), crate::generation_payload::GenerationPayload)>::new() {' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
 check "staged containers are taken from the generator once" \
-  src/worldgen.rs '        std::mem::take(&mut self.staged_block_entities)' '        Vec::new()' \
+  src/worldgen.rs '        std::mem::take(&mut self.staged_payloads)' '        Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
 check "the backoff guard holds a visit past the queue cap" \
@@ -1304,7 +1304,7 @@ check "an entity offset keeps the pivot" \
   structure_transform::tests::entity_offset_transform_matches_native
 
 check "a placed sign stages its front lines" \
-  src/structure_template.rs '            return Ok(StagedBlockEntity::Sign(Self::sign_lines(tag)?));' '            return Ok(StagedBlockEntity::Sign(Default::default()));' \
+  src/structure_template.rs '            return Ok(GenerationPayload::Sign(Self::sign_lines(tag)?));' '            return Ok(GenerationPayload::Sign(Default::default()));' \
   template_sign_text_matches_native_and_reaches_the_sign_store
 
 check "a sign message that is not a string component is refused" \
@@ -1312,7 +1312,7 @@ check "a sign message that is not a string component is refused" \
   unsupported_sign_components_are_refused
 
 check "staged signs reach the sign store" \
-  src/main.rs '                        (pos.0, pos.1, pos.2, 1),' '                        (pos.0, pos.1, pos.2, 0),' \
+  src/main.rs '                    .insert((pos.0, pos.1, pos.2, 1), lines);' '                    .insert((pos.0, pos.1, pos.2, 0), lines);' \
   template_sign_text_matches_native_and_reaches_the_sign_store
 
 check "a furnace is staged as a furnace, not a chest" \
@@ -1324,11 +1324,11 @@ check "a container with no store is refused" \
   unsupported_container_states_are_refused
 
 check "furnace contents land in the furnace store" \
-  src/main.rs '                                    0 => furnace.input = stack,' '                                    0 => furnace.output = stack,' \
+  src/main.rs '                                0 => furnace.input = stack,' '                                0 => furnace.output = stack,' \
   template_furnace_contents_reach_the_furnace_store
 
 check "a placed container stages its contents" \
-  src/structure_template.rs '                    ctx.block_entities
+  src/structure_template.rs '                    ctx.payloads
                         .push((p, Self::staged_payload(tag, state, reg)?));' '                    let _ = Self::staged_payload(tag, state, reg)?;' \
   template_container_items_match_native_placement
 
@@ -1773,6 +1773,165 @@ check "normal mineshaft height adjustment also moves room entrances" \
 check "large feature seeding uses the requested start chunk x" \
   src/generation_math.rs 'i64::from(x).wrapping_mul(a)' 'i64::from(0).wrapping_mul(a)' \
   mineshaft_layout::tests::normal_layout_matches_native_pieces_and_rng_boundaries
+
+# Admission, real structure dispatch and typed-stage writer contracts.
+check "mineshaft admission retries a rejected weighted entry" \
+  src/mineshaft.rs '        choices.remove(selected);' '        return None;' \
+  mineshaft::tests::native_admission_retries_with_fresh_layout_and_noise_biomes
+
+check "mineshaft decoration follows registry slots rather than selector order" \
+  src/mineshaft.rs '    result.sort_by_key(|(_, e)| e.slot);' \
+  '    result.sort_by_key(|(_, e)| std::cmp::Reverse(e.slot));' \
+  mineshaft::tests::native_registry_dispatch_order_is_independent_of_selector_order
+
+check "mineshaft dispatcher uses the native structure slot" \
+  src/mineshaft.rs '.wrapping_add(e.slot as u64)' '.wrapping_add(0)' \
+  mineshaft::tests::native_dispatcher_preserves_registry_slot_and_shared_piece_rng
+
+check "mineshaft pieces share their caller RNG rather than reseeding" \
+  src/mineshaft_piece.rs '    for (i, piece) in pieces.iter_mut().enumerate() {' \
+  '    for (i, piece) in pieces.iter_mut().enumerate() {
+        *random = Xor::seed_worldgen(0);' \
+  mineshaft::tests::native_dispatcher_preserves_registry_slot_and_shared_piece_rng
+
+check "mineshaft writer respects its chunk clip" \
+  src/mineshaft_piece.rs '        if !contains(&self.clip, p) {
+            return;
+        }
+        let old = self.ctx.get(p.0, p.1, p.2);' \
+  '        let old = self.ctx.get(p.0, p.1, p.2);' \
+  mineshaft::tests::native_writer_order_clipping_and_rng_on_authored_scenes
+
+check "mineshaft interior reads typed OCEAN_FLOOR_WG" \
+  src/mineshaft_piece.rs 'HeightmapKind::OceanFloorWg' 'HeightmapKind::WorldSurfaceWg' \
+  mineshaft::tests::native_writer_order_clipping_and_rng_on_authored_scenes
+
+check "mineshaft interior compares transformed y plus one" \
+  src/mineshaft_piece.rs 'let p = self.pos((p.0, p.1 + 1, p.2));' 'let p = self.pos(p);' \
+  mineshaft::tests::native_writer_order_clipping_and_rng_on_authored_scenes
+
+check "mineshaft production reaches floors below nominal corridor bounds" \
+  src/mineshaft_piece.rs 'self.floor((x, -1, z));' 'self.floor((x, 0, z));' \
+  mineshaft::tests::production_populate_reaches_admission_dispatch_and_out_of_bounds_floor
+
+check "mineshaft Mesa target uses an inclusive height draw" \
+  src/mineshaft_layout.rs 'builder.random.next_bound(surface - sea_level + 1)' \
+  'builder.random.next_bound(surface - sea_level)' \
+  mineshaft::tests::native_mesa_adjustment_uses_generator_height_and_preserves_rng
+
+check "mineshaft anchors reject falling CENTER supports" \
+  src/block_registry.rs 'v & 192 == 64' 'v & 64 != 0' \
+  mineshaft::tests::mineshaft_support_distinguishes_full_faces_center_and_falling_blocks
+
+check "shared fastutil mix preserves mineshaft reference iteration" \
+  src/generation_math.rs '    h ^ (h >> 16)' '    key' \
+  mineshaft::tests::native_reference_iteration_survives_duplicates_zero_and_rehash
+
+check "shared fastutil mix preserves scheduled chunk ordering" \
+  src/generation_math.rs '    h ^ (h >> 16)' '    key' \
+  scheduled_ticks::tests::native_collection_order_and_deduplication
+
+check "mineshaft structure dispatch is not gated by placed features" \
+  src/feature.rs 'order.len().max(structures.step_count())' 'order.len()' \
+  tests/mineshaft_dispatch_test.py 'mineshaft dispatch: FAIL structures without placed features'
+
+check "mineshaft spawner block stages its native block entity" \
+  src/mineshaft_piece.rs '.push((p, crate::generation_payload::GenerationPayload::Spawner));' '.extend(std::iter::empty());' \
+  mineshaft::tests::native_writer_order_clipping_and_rng_on_authored_scenes
+
+check "mineshaft chest entities retain their actual native loot seed" \
+  src/mineshaft_piece.rs 'GenerationPayload::ChestMinecart { loot_seed },' 'GenerationPayload::ChestMinecart { loot_seed: 0 },' \
+  mineshaft::tests::native_writer_order_clipping_and_rng_on_authored_scenes
+
+check "structure types own independent native reference containers" \
+  src/mineshaft.rs 'groups.entry(entry).or_default().push(key);' 'groups.entry(0).or_default().push(key);' \
+  mineshaft::tests::native_reference_containers_do_not_share_capacity_between_types
+
+check "generated objects are serialized before scheduled ticks" \
+  src/main.rs '    generated.append(f);' '    let _ = &generated;' \
+  mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
+
+check "generated object source claims survive restart" \
+  src/main.rs '            g.payload_sources = generated.sources;' '            g.payload_sources.clear();' \
+  mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
+
+check "mineshaft one-shot piece flags survive restart" \
+  src/main.rs '            g.mineshaft_spawners = generated.spider_flags;' '            g.mineshaft_spawners.clear();' \
+  mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
+
+check "regenerating cached blocks cannot recreate generated entities" \
+  src/worldgen.rs 'if self.payload_sources.insert(source) {' 'if { self.payload_sources.insert(source); true } {' \
+  mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
+
+check "generated chest minecarts reach the actual entity tracker" \
+  src/main.rs '    for cart in generated_content().lock().unwrap().carts.iter() {' '    for cart in Vec::<generated_content::Cart>::new().iter() {' \
+  mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
+
+check "generated spawner packets use the native registry type" \
+  src/main.rs 'Some((pos, 9, bytes))' 'Some((pos, 8, bytes))' \
+  mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
+
+check "block reads cannot take a save lock while holding entity locks" \
+  src/main.rs '    worldgen::block_state(x, y, z, feature::populate)' '    with_save_guard(|| worldgen::block_state(x, y, z, feature::populate))' \
+  mineshaft::tests::queued_generation_payloads_never_take_the_save_lock_on_a_cell_read
+
+check "generated spawner handoff preserves a user air edit" \
+  src/main.rs '                    .or_insert(state);' '                    .and_modify(|v| *v=state).or_insert(state);' \
+  mineshaft::tests::queued_generation_payloads_never_take_the_save_lock_on_a_cell_read
+
+check "deferred cart loot unpacks its seeded abandoned_mineshaft table" \
+  src/main.rs '                let slots = roll_cart_loot(seed);' '                let slots = HashMap::new();' \
+  mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
+
+check "unpacked empty chest minecarts persist their empty container without re-rolling" \
+  src/main.rs '                        fields.insert(crate::nbt::NbtString::text("Items"), stacks_to_items_nbt(&slots));' \
+  '                        if !slots.is_empty() { fields.insert(crate::nbt::NbtString::text("Items"), stacks_to_items_nbt(&slots)); }' \
+  mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
+
+check "breaking a chest minecart removes its runtime container entry" \
+  src/main.rs '            if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Cart(uuid)) {' \
+  '            if let Some(slots) = chests().lock().unwrap().get(&ContainerKey::Cart(uuid)).cloned() {' \
+  mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
+
+check "cave-spider spawner light check rejects lit blocks" \
+  src/main.rs '        let bl = nibble_at(bl_secs, bx, by, bz);' \
+  '        let bl = 0;' \
+  mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
+
+check "cave-spider spawner counts living nearby spiders for MaxNearbyEntities" \
+  src/main.rs '            .filter(|m| m.etype == cave_spider && *m.hp.lock().unwrap() > 0.0)' \
+  '            .filter(|m| m.etype == cave_spider && *m.hp.lock().unwrap() < 0.0)' \
+  mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
+
+check "breaking a spawner block removes its owned NBT entry" \
+  src/main.rs '    if Some(st) != name_to_state("spawner") {
+        generated_content().lock().unwrap().spawners.remove(&(x,y,z));
+    }' \
+  '    if Some(st) != name_to_state("spawner") {
+        let _ = (x, y, z);
+    }' \
+  mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
+
+check "unpacked chest minecarts use comparator fill signal in drag calculation" \
+  src/main.rs '            .filter(|(_, _, _, loot_pending)| !*loot_pending)' \
+  '            .filter(|(_, _, _, loot_pending)| *loot_pending)' \
+  mineshaft_runtime_tests::cart_runtime_tick_motion_collision_comparator_tracker_and_persistence
+
+check "moving chest minecarts broadcast entity teleport packets to trackers" \
+  src/main.rs '        if send_pos {
+            broadcast_seen(eid, |_c| {
+                (
+                    0x70,' \
+  '        if false && send_pos {
+            broadcast_seen(eid, |_c| {
+                (
+                    0x70,' \
+  mineshaft_runtime_tests::cart_runtime_tick_motion_collision_comparator_tracker_and_persistence
+
+check "chest minecart tick persists updated motion into generated NBT" \
+  src/main.rs '                cart.set_motion(state.velocity);' \
+  '                let _ = state.velocity;' \
+  mineshaft_runtime_tests::cart_runtime_tick_motion_collision_comparator_tracker_and_persistence
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

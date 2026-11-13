@@ -64,6 +64,8 @@ registry（状態・metadata・タグ）は `block_registry.rs`、値/高さ/状
 `generation_context.rs` が所有する。既存定義の移動であり、式・分岐・反復順・RNG消費・
 保存形式を変えず、旧feature側の再exportや互換wrapperは残さない。
 現行のモジュール集合・許可辺は `policy.json` を正本とし、件数はsource-bound gateの実行結果で確認する。accepted findingsは空である。
+
+[mineshaft接続](../../gameplay/feature-parity/mineshaft-production-20261113.md)では、admission/dispatchとpiece書込みを別の所有者にし、どちらも既存のFCを使う。純粋なlayoutと配置候補の数学は下位の層に置き、地形からdispatcherへの逆参照は作らない。native fastutil mixも共有数学が所有し、structure参照とscheduled tickの両消費者を負例で検査する。Genのone-shot flagsとsource claimsは必要な可変状態として明示し、[保存時にsnapshot・再開時に復元](../../gameplay/feature-parity/mineshaft-entities-20261113.md)する。`generation_payload` は既存staging契約、`generated_content` は下位のtyped NBT/snapshot契約であり、runtimeへのhandoffはアプリケーション境界が持つ。NBT storeやworld実装、旧型名の互換wrapperをGen側に増やさない。
 移動前後を独立プロセスで2回比較した全上書き値と、provider/predicateの値とRNG消費を固定した
 fixture、実population出力のMD5対照が保存を検査する。これはvanilla準拠や代表負荷の証明ではなく、
 T/F/N/Qと既存ignoredテストは別の未完了契約として残る。

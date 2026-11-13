@@ -417,10 +417,10 @@ impl Template {
         tag: &Tag,
         state: u32,
         reg: &BReg,
-    ) -> Result<crate::staged_block_entity::StagedBlockEntity, &'static str> {
-        use crate::staged_block_entity::{ContainerKind, StagedBlockEntity};
+    ) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
+        use crate::generation_payload::{ContainerKind, GenerationPayload};
         if tag.get("front_text").is_some() {
-            return Ok(StagedBlockEntity::Sign(Self::sign_lines(tag)?));
+            return Ok(GenerationPayload::Sign(Self::sign_lines(tag)?));
         }
         let kind = match reg.name_of(state) {
             "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
@@ -434,7 +434,7 @@ impl Template {
                 return Err("template container NBT on a block with no supported store");
             }
         };
-        Ok(StagedBlockEntity::Container {
+        Ok(GenerationPayload::Container {
             kind,
             slots: Self::container_items(tag)?,
         })
@@ -559,7 +559,7 @@ impl Template {
                 if let Some(tag) = &block.nbt {
                     // Admission checked this tag; the write itself still fails closed
                     // rather than staging data the caller never validated.
-                    ctx.block_entities
+                    ctx.payloads
                         .push((p, Self::staged_payload(tag, state, reg)?));
                 }
             }
@@ -896,11 +896,11 @@ mod tests {
                     );
                 }
                 let staged: Vec<_> = ctx
-                    .block_entities
+                    .payloads
                     .iter()
                     .filter(|(p, _)| *p == cell)
                     .filter_map(|(_, v)| match v {
-                        crate::staged_block_entity::StagedBlockEntity::Container { slots, .. } => {
+                        crate::generation_payload::GenerationPayload::Container { slots, .. } => {
                             Some(slots.clone())
                         }
                         _ => None,
@@ -914,7 +914,7 @@ mod tests {
                     field[2]
                 );
             }
-            assert_eq!(ctx.block_entities.len(), 1, "{case}: one NBT cell stages contents");
+            assert_eq!(ctx.payloads.len(), 1, "{case}: one NBT cell stages contents");
         }
     }
 
@@ -954,17 +954,17 @@ mod tests {
             assert!(template
                 .place_blocks(&mut ctx, &mut rng, placement, &[], [0, 0, 0, 31, 255, 31])
                 .is_ok());
-            assert_eq!(ctx.block_entities.len(), 1, "placement stages the contents");
-            let mut staged = std::mem::take(&mut ctx.block_entities);
-            g.stage_block_entities(&mut staged);
+            assert_eq!(ctx.payloads.len(), 1, "placement stages the contents");
+            let mut staged = std::mem::take(&mut ctx.payloads);
+            g.stage_payloads((0, 0), &mut staged);
         }
-        let staged = g.take_staged_block_entities();
+        let staged = g.take_staged_payloads();
         assert_eq!(staged.len(), 1, "the generator holds the staged contents once");
-        assert!(g.take_staged_block_entities().is_empty(), "taking them twice yields nothing");
-        crate::materialize_block_entities(staged);
+        assert!(g.take_staged_payloads().is_empty(), "taking them twice yields nothing");
+        crate::materialize_generation_payloads(staged);
         let redstone = crate::name_to_item("minecraft:redstone").unwrap() as i64;
         assert_eq!(
-            crate::chests().lock().unwrap().get(&(2, 70, 2)).cloned(),
+            crate::chests().lock().unwrap().get(&crate::ContainerKey::Block((2, 70, 2))).cloned(),
             Some([(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect()),
             "the live store holds what the template staged"
         );
@@ -974,11 +974,11 @@ mod tests {
         crate::chests().lock().unwrap().clear();
         crate::load_world_from(&buffer).unwrap();
         assert_eq!(
-            crate::chests().lock().unwrap().get(&(2, 70, 2)).cloned(),
+            crate::chests().lock().unwrap().get(&crate::ContainerKey::Block((2, 70, 2))).cloned(),
             Some([(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect()),
             "a saved container comes back with its contents"
         );
-        crate::chests().lock().unwrap().remove(&(2, 70, 2));
+        crate::chests().lock().unwrap().remove(&crate::ContainerKey::Block((2, 70, 2)));
     }
 
     /// The window a player opens reads the same store the handoff writes, so the packet
@@ -989,7 +989,7 @@ mod tests {
         use crate::effect_tests::client_pair;
         let reg = crate::block_registry::breg().unwrap();
         let redstone = crate::name_to_item("minecraft:redstone").unwrap();
-        let pos = (2, 70, 2);
+        let pos = crate::ContainerKey::Block((2, 70, 2));
         crate::chests().lock().unwrap().insert(
             pos,
             [(0i16, (redstone, 3u8, Vec::new()))].into_iter().collect(),
@@ -1074,7 +1074,7 @@ mod tests {
     /// the chunk packet carries the text.
     #[test]
     fn template_sign_text_matches_native_and_reaches_the_sign_store() {
-        use crate::staged_block_entity::StagedBlockEntity;
+        use crate::generation_payload::GenerationPayload;
         let reg = crate::block_registry::breg().unwrap();
         let sign_state = reg.state_of("minecraft:oak_sign", None);
         let stone = reg.state_of("minecraft:stone", None);
@@ -1141,24 +1141,24 @@ mod tests {
                 .place_blocks(&mut ctx, &mut rng, placement, &[], [0, 0, 0, 31, 255, 31])
                 .is_ok());
             let staged = ctx
-                .block_entities
+                .payloads
                 .iter()
                 .find(|(p, _)| *p == cell)
                 .map(|(_, v)| v.clone())
                 .expect("the sign cell stages a payload");
             assert_eq!(
                 staged,
-                StagedBlockEntity::Sign(["Hi".into(), String::new(), String::new(), String::new()]),
+                GenerationPayload::Sign(["Hi".into(), String::new(), String::new(), String::new()]),
                 "the template's front_text decodes to four lines"
             );
             assert_eq!(
                 reg.name_of(ctx.get(cell.0, cell.1, cell.2)),
                 "minecraft:oak_sign"
             );
-            let mut staged_all = std::mem::take(&mut ctx.block_entities);
-            g.stage_block_entities(&mut staged_all);
+            let mut staged_all = std::mem::take(&mut ctx.payloads);
+            g.stage_payloads((0, 0), &mut staged_all);
         }
-        crate::materialize_block_entities(g.take_staged_block_entities());
+        crate::materialize_generation_payloads(g.take_staged_payloads());
         assert_eq!(
             crate::signs().lock().unwrap().get(&(cell.0, cell.1, cell.2, 1)).cloned(),
             Some(["Hi".to_string(), String::new(), String::new(), String::new()]),
@@ -1171,7 +1171,7 @@ mod tests {
     /// that store, so a misplaced staging would look like an empty furnace forever.
     #[test]
     fn template_furnace_contents_reach_the_furnace_store() {
-        use crate::staged_block_entity::{ContainerKind, StagedBlockEntity};
+        use crate::generation_payload::{ContainerKind, GenerationPayload};
         let reg = crate::block_registry::breg().unwrap();
         let furnace = reg.state_of("minecraft:furnace", None);
         let mut items = std::collections::BTreeMap::new();
@@ -1216,8 +1216,8 @@ mod tests {
                 .place_blocks(&mut ctx, &mut rng, placement, &[], [0, 0, 0, 31, 255, 31])
                 .is_ok());
             assert_eq!(
-                ctx.block_entities.first().map(|(_, v)| v.clone()),
-                Some(StagedBlockEntity::Container {
+                ctx.payloads.first().map(|(_, v)| v.clone()),
+                Some(GenerationPayload::Container {
                     kind: ContainerKind::Furnace,
                     slots: vec![
                         (0, crate::name_to_item("minecraft:iron_ore").unwrap(), 2),
@@ -1226,10 +1226,10 @@ mod tests {
                 }),
                 "a furnace is staged with the furnace kind"
             );
-            let mut staged = std::mem::take(&mut ctx.block_entities);
-            g.stage_block_entities(&mut staged);
+            let mut staged = std::mem::take(&mut ctx.payloads);
+            g.stage_payloads((0, 0), &mut staged);
         }
-        crate::materialize_block_entities(g.take_staged_block_entities());
+        crate::materialize_generation_payloads(g.take_staged_payloads());
         let ore = crate::name_to_item("minecraft:iron_ore").unwrap();
         let coal = crate::name_to_item("minecraft:coal").unwrap();
         {
@@ -1241,7 +1241,7 @@ mod tests {
             assert!(f.dirty, "a placed furnace needs a resync");
         }
         assert!(
-            crate::chests().lock().unwrap().get(&cell).is_none(),
+            crate::chests().lock().unwrap().get(&crate::ContainerKey::Block(cell)).is_none(),
             "a furnace must not be staged into the chest store"
         );
         crate::furnaces().lock().unwrap().remove(&cell);

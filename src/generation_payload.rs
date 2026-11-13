@@ -1,9 +1,9 @@
-//! The block-entity payloads a template can carry.
+//! Generation payloads crossing the generator/runtime lock boundary.
 //!
 //! Its own module, below both `worldgen` and `generation_context`: those two are adjacent
 //! layers and the lower one may not reach up, so a shared payload type has to live beneath
-//! both. Decoding lives with the template (which owns the NBT contract); this is only the
-//! data that crosses the generation boundary.
+//! both. Templates decode their own items/signs; procedural writers author entity
+//! and spawner data. This is only the payload crossing the generation boundary.
 type Slot = (i16, i64, u8);
 
 /// Which container store owns a placed container's contents.
@@ -18,7 +18,7 @@ pub(crate) enum ContainerKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum StagedBlockEntity {
+pub(crate) enum GenerationPayload {
     /// `Items`: slot, item id, count, plus the store that owns them.
     Container {
         kind: ContainerKind,
@@ -26,4 +26,8 @@ pub(crate) enum StagedBlockEntity {
     },
     /// A sign side: the four lines of its front text.
     Sign([String; 4]),
+    /// A freshly configured cave-spider spawner (its native setter consumes no RNG).
+    Spawner,
+    /// Entity position is the supplied block anchor plus (0.5, 0.5, 0.5).
+    ChestMinecart { loot_seed: i64 },
 }

@@ -261,6 +261,10 @@ it. Two compiling mutants cover the kind decision and the slot mapping.
 This is the shape the next kinds take: decide the destination at admission from the state,
 write into the store that owns it, and refuse what has no store.
 
+The staging type is now named `GenerationPayload`; its template container/sign
+variants retain these contracts. The [mineshaft extension](../../../evidence/gameplay/feature-parity/mineshaft-entities-20261113.md)
+adds procedural payloads to the same channel, not general template-entity creation.
+
 ### Entity geometry captured; creation still refused (2026-11-11)
 
 `StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)` is the placement-visible

@@ -183,6 +183,14 @@ fn xtrace(kind: &str, arg: i64, val: i64) {
     );
 }
 
+/// fastutil HashCommon.mix(long), shared by native chunk-deadline maps and
+/// structure reference sets. This is NOT its similarly named murmurHash3.
+pub(crate) fn fastutil_mix64(key: u64) -> u64 {
+    let h = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let h = h ^ (h >> 32);
+    h ^ (h >> 16)
+}
+
 pub(crate) struct Xor {
     lo: u64,
     hi: u64,
@@ -264,6 +272,11 @@ impl Xor {
         let mut x = Self::seed(seed);
         x.legacy = true;
         x
+    }
+    /// Non-consuming observation; unlike nextLong this must not move the stream.
+    #[cfg(test)]
+    pub(crate) fn state128(&self) -> (u64, u64) {
+        (self.lo, self.hi)
     }
     pub(crate) const fn raw(lo: u64, hi: u64) -> Self {
         let (lo, hi) = if (lo | hi) == 0 {
@@ -503,6 +516,11 @@ impl Lcg {
     /// Non-consuming position; unlike a nextLong sentinel this is safe mid-stream.
     pub(crate) fn state48(&self) -> u64 {
         self.seed
+    }
+    pub(crate) fn from_raw_state(state48: u64) -> Self {
+        Lcg {
+            seed: state48 & 0xFFFF_FFFF_FFFF,
+        }
     }
 
     fn nx(&mut self, bits: u32) -> u64 {

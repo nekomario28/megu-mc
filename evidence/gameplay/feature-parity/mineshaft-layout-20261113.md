@@ -4,7 +4,10 @@ Starting commit: `a205e2d56405edd99316616285e2bbd7e0b595a7`, with uncommitted
 changes bound by the local receipts' source hashes. This is a verified layout
 component, **not production mineshaft dispatch or zero-diff acceptance**.
 The earlier [piece-writer replay](mineshaft-writer-replay-20261113.md) remains a
-separate, explicitly scripted placement experiment.
+separate, explicitly scripted placement experiment. Subsequent admission, Mesa,
+dispatch and block placement are checked in the
+[Rust connection checkpoint](mineshaft-production-20261113.md); they are not
+retroactively included in this NORMAL-only native layout oracle.
 
 ## The isolated contract
 
@@ -112,8 +115,13 @@ not the shared Cargo target or restored old mtimes. The format-only publication
 refresh and repeated focused controls are recorded separately under
 `~/mc-spine-local/scratch/current/mineshaft-publish-20261113/`.
 
-Next: recover admission/biome selection and decoration step/index/RNG ordering,
-then connect a seed/config-derived layout to the real dispatcher and implement
-piece placement with its native clipping and out-of-BB support writes. Acceptance
-must compare the full volume against A and B separately, without fitting RNG
-seeds or capture injection. M2/M3 and P2-1 remain open.
+The later [admission/decoration checkpoint](mineshaft-admission-20261113.md)
+recovers native start selection and caller-derived RNG/index contracts. Its missing
+OCEAN_FLOOR_WG input is recovered in the subsequent
+[generation-stage writer checkpoint](mineshaft-stage-writer-20261113.md), which
+matches native events/RNG and obtains conditional A/B whole-volume agreement.
+Production admission and dispatch remain unconnected. Next is production piece
+placement with its native clipping and out-of-BB supports, not another saved-map
+substitution or a claim that the layout component already writes blocks.
+Acceptance must compare the full volume against A and B separately, without
+fitting RNG seeds or capture injection. M2/M3 and P2-1 remain open.

@@ -18,6 +18,8 @@
 
 **現在の作業:** [全worldgen](worldgen-parity/README.md)。全64 biome、34構造物と3ディメンションへ広げ、配置候補・NBT/template・processor・jigsaw・構造物固有piece・地形/biome経路を実クラス対照で順に閉じる。部分的なhelper一致を構造物生成の受け入れにしない。
 
+Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../evidence/gameplay/feature-parity/mineshaft-production-20261113.md) まで進んだ。freshな限定fixtureとの一致と元のA/B残差を分離している。[entity/NBT・保存再開・自然Mesa/複数startの追加検証](../evidence/gameplay/feature-parity/mineshaft-entities-20261113.md)も行ったが、車両物理・loot開封・spawner tickや全worldの一致は未完であり、P2-1やM2の完了にはしない。
+
 ## 直近の実行順（2026-11-13）
 
 長期のR0〜R5は維持し、直近は次の小さい出口で進める。

@@ -31,7 +31,8 @@ def run_case(cargo_output, cargo_status, *, missing_anchor=False, leftover=False
         backends = {"client_settings_wire.py": "client settings wire: PASS",
                     "gameplay_wire.py": "gameplay wire: PASS",
                     "container_wire.py": "containers wire: PASS",
-                    "population_plan_test.py": "population plan: PASS"}
+                    "population_plan_test.py": "population plan: PASS",
+                    "mineshaft_dispatch_test.py": "mineshaft dispatch: PASS"}
         # Match identities, not a frozen count: a new CLI gate needs a fake backend too.
         registered = set(re.findall(r"tests/\w+\.py", script.read_text()))
         assert {"tests/" + name for name, _ in cli_calls} == registered
@@ -61,7 +62,7 @@ sys.exit({cargo_status})
         if missing_anchor:
             path = root / "src/main.rs"
             text = path.read_text()
-            anchor = "        if let Some(slots) = chests().lock().unwrap().remove(&(x, y, z)) {"
+            anchor = "        if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Block((x, y, z))) {"
             assert text.count(anchor) == 1
             path.write_text(text.replace(anchor, "        if let Some(slots) = None::<HashMap<i16, Stack>> {", 1))
         if leftover:

@@ -75,8 +75,8 @@ fn container_transfers_match_real_1_21_1_classes() {
             "quick_move" => {
                 let rows = row.get("rows").unwrap().num() as i16 * 9;
                 assert!(matches!(rows, 27 | 54));
-                let cp = (0, 70, 0);
-                let cp2 = (rows == 54).then_some((1, 70, 0));
+                let cp = ContainerKey::Block((0, 70, 0));
+                let cp2 = (rows == 54).then_some(ContainerKey::Block((1, 70, 0)));
                 let mut all = HashMap::new();
                 let mut inv = HashMap::new();
                 for (slot, st) in slot_map(row.get("slots").unwrap()) {

@@ -506,7 +506,7 @@ pub struct Gen {
     /// Generation-owned: they are moved into the runtime container store as soon as
     /// this generator's lock is released (see `block_state`), never kept as a second
     /// live store.
-    staged_block_entities: Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>,
+    staged_payloads: Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
     feat_ord: Vec<(i32, i32)>,
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
@@ -516,6 +516,9 @@ pub struct Gen {
     restored_tick_sources: HashSet<(i32, i32)>,
     suppress_generated_ticks: bool,
     carved: HashSet<(i32, i32)>,
+    /// Generation metadata persists independently of evictable block caches.
+    pub(crate) mineshaft_spawners: HashSet<(i32, i32, usize)>,
+    pub(crate) payload_sources: HashSet<(i32, i32)>,
     /// Decoration region whose lexicographic scan order to follow (`MC_SPINE_POP_REGION`).
     pop_region: Option<(i32, i32, i32, i32)>,
     // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
@@ -817,7 +820,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
-            staged_block_entities: Vec::new(),
+            staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
@@ -834,6 +837,8 @@ impl Gen {
                 }
             }),
             memo: HashMap::new(),
+            mineshaft_spawners: HashSet::new(),
+            payload_sources: HashSet::new(),
             feat_hm: HashMap::new(),
             generated_ticks: GeneratedTickQueues::default(),
         };
@@ -2919,7 +2924,7 @@ impl Gen {
             col_c: HashMap::new(),
             col_ord: Vec::new(),
             feat_c: HashMap::new(),
-            staged_block_entities: Vec::new(),
+            staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
@@ -2935,6 +2940,8 @@ impl Gen {
                     None
                 }
             }),
+            mineshaft_spawners: HashSet::new(),
+            payload_sources: HashSet::new(),
             feat_hm: HashMap::new(),
             generated_ticks: GeneratedTickQueues::default(),
         }
@@ -3616,19 +3623,25 @@ impl Gen {
         }
         self.feat_c.entry(key).or_default().insert(k, st);
     }
-    pub(crate) fn stage_block_entities(
+    pub(crate) fn stage_payloads(
         &mut self,
-        items: &mut Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>,
+        source: (i32, i32),
+        items: &mut Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
     ) {
-        self.staged_block_entities.append(items);
+        if self.payload_sources.insert(source) {
+            self.staged_payloads.append(items);
+        } else {
+            // Recomputing evicted blocks must not reset NBT or recreate entities.
+            items.clear();
+        }
     }
 
     /// Hand the staged contents to the caller. Taken by value so a second call cannot
     /// double-apply them.
-    pub(crate) fn take_staged_block_entities(
+    pub(crate) fn take_staged_payloads(
         &mut self,
-    ) -> Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)> {
-        std::mem::take(&mut self.staged_block_entities)
+    ) -> Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)> {
+        std::mem::take(&mut self.staged_payloads)
     }
 
     pub(crate) fn wseed(&self) -> u64 {
@@ -4197,29 +4210,18 @@ pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
 }
 
 /// The block state at a world position, taking the GEN lock once.
-/// One cell, with the block entities the population staged handed to `sink`.
-///
-/// The sink is the caller's, not this module's: materialising them takes the save lock,
-/// and the block write path already takes save -> generator, so doing it while this lock
-/// is held would be an ABBA deadlock — and calling into the crate root from here would
-/// put generation above the layer that owns the stores.
+/// One cell. Payloads stay generator-owned until a safe runtime boundary or
+/// save drains them under save -> generator -> runtime lock order. A cell read
+/// can hold a mob/player lock, so it must never acquire the save lock or create
+/// a take-before-save gap between a source claim and its payload.
 pub fn block_state(
     x: i32,
     y: i32,
     z: i32,
     populate: impl FnMut(&mut Gen, i32, i32),
-    mut sink: impl FnMut(Vec<((i32, i32, i32), crate::staged_block_entity::StagedBlockEntity)>),
 ) -> Option<u32> {
-    let (state, staged) = {
-        let mut guard = gen_lock();
-        let g = guard.as_mut()?;
-        let state = g.block_state_at(x, y, z, populate);
-        (state, g.take_staged_block_entities())
-    };
-    if !staged.is_empty() {
-        sink(staged);
-    }
-    Some(state)
+    let mut guard = gen_lock();
+    Some(guard.as_mut()?.block_state_at(x, y, z, populate))
 }
 
 /// Base terrain states for one 16x16x16 section, in the send layout

@@ -1921,7 +1921,7 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
     chests()
         .lock()
         .unwrap()
-        .entry((0, hy, 0))
+        .entry(ContainerKey::Block((0, hy, 0)))
         .or_default()
         .insert(0, (item, 3, Vec::new()));
     let mut trace: Vec<(u8, u8)> = Vec::new();
@@ -1930,13 +1930,13 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
         let own = chests()
             .lock()
             .unwrap()
-            .get(&(0, hy, 0))
+            .get(&ContainerKey::Block((0, hy, 0)))
             .map(|m| m.values().map(|v| v.1).sum::<u8>())
             .unwrap_or(0);
         let dst = chests()
             .lock()
             .unwrap()
-            .get(&(0, hy - 1, 0))
+            .get(&ContainerKey::Block((0, hy - 1, 0)))
             .map(|m| m.values().map(|v| v.1).sum::<u8>())
             .unwrap_or(0);
         trace.push((own, dst));
@@ -3501,13 +3501,13 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
         chests()
             .lock()
             .unwrap()
-            .entry(pos)
+            .entry(ContainerKey::Block(pos))
             .or_default()
             .insert(0, stack.clone());
     }
     set_block(broken.0, broken.1, broken.2, 0);
     assert!(
-        !chests().lock().unwrap().contains_key(&broken),
+        !chests().lock().unwrap().contains_key(&ContainerKey::Block(broken)),
         "cleanup on break"
     );
     let mut payload = Vec::new();
@@ -3523,12 +3523,12 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
     let containers = chests().lock().unwrap().clone();
     assert_eq!(containers.len(), 2);
     assert!(
-        !containers.contains_key(&broken),
+        !containers.contains_key(&ContainerKey::Block(broken)),
         "broken contents must not resurrect"
     );
     for pos in [live, barrel] {
         assert_eq!(
-            containers.get(&pos).and_then(|slots| slots.get(&0)),
+            containers.get(&ContainerKey::Block(pos)).and_then(|slots| slots.get(&0)),
             Some(&stack)
         );
         assert!(container_kind(block_at(pos.0, pos.1, pos.2)).is_some());

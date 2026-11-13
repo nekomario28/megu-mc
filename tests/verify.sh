@@ -87,6 +87,7 @@ timeout 180 python3 tests/client_settings_wire.py "$binary"
 timeout 180 python3 tests/gameplay_wire.py "$binary"
 timeout 180 python3 tests/container_wire.py "$binary"
 timeout 180 python3 tests/population_plan_test.py "$binary"
+timeout 180 python3 tests/mineshaft_dispatch_test.py "$binary"
 
 echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe

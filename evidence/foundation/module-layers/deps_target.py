@@ -9,14 +9,14 @@ import depsgx as d
 
 layers = [
     ["main"],
-    ["java_compat", "landing", "effects", "tick_persistence"],
-    ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks", "structure_placement"],
+    ["chest_loot", "java_compat", "landing", "effects", "minecart", "spawner", "tick_persistence"],
+    ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks"],
     ["feature", "structure_template"],
-    ["tree", "mineshaft_layout"],
-    ["generation_providers"],
+    ["tree", "mineshaft"],
+    ["generation_providers", "mineshaft_piece"],
     ["generation_context"],
-    ["worldgen", "block_registry"],
-    ["json", "generation_math", "generation_leaf_queue", "nbt", "staged_block_entity", "structure_transform", "voxel_faces"],
+    ["worldgen", "block_registry", "generated_content"],
+    ["json", "generation_math", "generation_leaf_queue", "nbt", "generation_payload", "structure_transform", "structure_placement", "mineshaft_layout", "voxel_faces"],
     # Leaf utilities and profiling counters. Profilers read trace_env flags but
     # do not depend on generation or runtime owners.
     ["ingress_guard", "tick_stats", "chunk_ack", "connection_limits", "trace_env",
@@ -26,12 +26,23 @@ modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(
     modules=modules,
     depends=[("main", name) for name in modules if name != "main"] + [
+        ("chest_loot", "generation_math"),
+        ("spawner", "generation_math"), ("spawner", "nbt"),
         ("landing", "java_compat"), ("landing", "landing_types"),
         ("landing", "world_rng"),
         ("java_compat", "landing_types"),
         ("tick_persistence", "scheduled_ticks"),
+        ("generated_content", "nbt"),
         ("structure_placement", "generation_math"),
         ("mineshaft_layout", "generation_math"),
+        ("scheduled_ticks", "generation_math"),
+        ("feature", "mineshaft"),
+        *[("mineshaft", module) for module in (
+            "generation_context", "generation_math", "json", "mineshaft_layout",
+            "mineshaft_piece", "structure_placement", "worldgen")],
+        *[("mineshaft_piece", module) for module in (
+            "block_registry", "generation_context", "generation_math",
+            "mineshaft_layout", "structure_transform", "generation_payload")],
         ("structure_template", "nbt"), ("structure_template", "block_registry"),
         ("structure_template", "structure_transform"), ("structure_template", "json"),
         ("structure_template", "generation_context"), ("structure_template", "generation_math"),
