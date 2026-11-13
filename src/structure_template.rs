@@ -1603,38 +1603,64 @@ mod tests {
 
     #[test]
     fn every_pinned_template_matches_native_typed_nbt_and_loaded_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let reg = crate::block_registry::breg().unwrap();
-        let mut count = 0;
-        for row in include_str!("../tests/data/structure_templates_1211.tsv").lines() {
-            let f: Vec<_> = row.split('\t').collect();
-            assert_eq!(f.len(), 5);
-            let path =
-                std::path::Path::new("datapacks/vanilla/data/minecraft/structure").join(f[0]);
-            let bytes = std::fs::read(&path).unwrap();
-            let (name, root) = crate::nbt::read_gzip(&bytes, 16 * 1024 * 1024).unwrap();
-            let canonical = crate::nbt::write_named(&name, &root).unwrap();
-            assert_eq!(hex(&sha256(&canonical)), f[1], "native typed NBT: {}", f[0]);
-            let template = Template::load(&root, reg).unwrap_or_else(|e| panic!("{}: {e}", f[0]));
-            assert_eq!(
-                template.palettes.len(),
-                f[2].parse::<usize>().unwrap(),
-                "{}",
-                f[0]
-            );
-            assert_eq!(
-                template.entities.len(),
-                f[3].parse::<usize>().unwrap(),
-                "{}",
-                f[0]
-            );
-            assert_eq!(
-                hex(&sha256(&template.block_layout(reg).unwrap())),
-                f[4],
-                "native template load: {}",
-                f[0]
-            );
-            count += 1;
-        }
+        let rows: Vec<&str> = include_str!("../tests/data/structure_templates_1211.tsv")
+            .lines()
+            .collect();
+        assert_eq!(rows.len(), 1180);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(1);
+        let next = AtomicUsize::new(0);
+        let count = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut count = 0usize;
+                        loop {
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(row) = rows.get(idx) else {
+                                break;
+                            };
+                            let f: Vec<_> = row.split('\t').collect();
+                            assert_eq!(f.len(), 5);
+                            let path =
+                                std::path::Path::new("datapacks/vanilla/data/minecraft/structure")
+                                    .join(f[0]);
+                            let bytes = std::fs::read(&path).unwrap();
+                            let (name, root) =
+                                crate::nbt::read_gzip(&bytes, 16 * 1024 * 1024).unwrap();
+                            let canonical = crate::nbt::write_named(&name, &root).unwrap();
+                            assert_eq!(hex(&sha256(&canonical)), f[1], "native typed NBT: {}", f[0]);
+                            let template =
+                                Template::load(&root, reg).unwrap_or_else(|e| panic!("{}: {e}", f[0]));
+                            assert_eq!(
+                                template.palettes.len(),
+                                f[2].parse::<usize>().unwrap(),
+                                "{}",
+                                f[0]
+                            );
+                            assert_eq!(
+                                template.entities.len(),
+                                f[3].parse::<usize>().unwrap(),
+                                "{}",
+                                f[0]
+                            );
+                            assert_eq!(
+                                hex(&sha256(&template.block_layout(reg).unwrap())),
+                                f[4],
+                                "native template load: {}",
+                                f[0]
+                            );
+                            count += 1;
+                        }
+                        count
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum::<usize>()
+        });
         assert_eq!(count, 1180);
     }
 

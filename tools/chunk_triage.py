@@ -71,10 +71,18 @@ def canonical_palette_entry(entry):
     return f"{name}[{joined}]"
 
 
+_BLOCK_TABLE_CACHE = None
+
+
 def load_block_state_table():
+    global _BLOCK_TABLE_CACHE
     blocks_path = ROOT / "assets" / "blocks_1211.json"
     if not blocks_path.is_file():
         raise TriageError(f"missing block state table: {blocks_path}")
+    st = blocks_path.stat()
+    sig = (st.st_mtime_ns, st.st_size)
+    if _BLOCK_TABLE_CACHE is not None and _BLOCK_TABLE_CACHE[0] == sig:
+        return _BLOCK_TABLE_CACHE[1]
     by_id = {}
     for block in json.loads(blocks_path.read_text()):
         props = block["states"]
@@ -94,6 +102,7 @@ def load_block_state_table():
                 kv.sort(key=lambda item: item[0])
                 joined = ",".join(f"{k}={v}" for k, v in kv)
                 by_id[state] = f"{name}[{joined}]"
+    _BLOCK_TABLE_CACHE = (sig, by_id)
     return by_id
 
 
@@ -110,6 +119,24 @@ def read_chunk_nbt(world, cx, cz):
     if not isinstance(nbt, dict):
         raise TriageError(f"invalid NBT root in {world} chunk ({cx},{cz})")
     return nbt
+
+
+def cached_read_chunk_nbt(world, cx, cz, nbt_cache=None):
+    if nbt_cache is None:
+        return read_chunk_nbt(world, cx, cz)
+    key = (str(world), cx, cz)
+    if key in nbt_cache:
+        val = nbt_cache[key]
+        if isinstance(val, TriageError):
+            raise val
+        return val
+    try:
+        val = read_chunk_nbt(world, cx, cz)
+    except TriageError as exc:
+        nbt_cache[key] = exc
+        raise
+    nbt_cache[key] = val
+    return val
 
 
 def unpack_heightmap(longs, min_y):
@@ -147,8 +174,8 @@ def unpack_section_biomes(section):
     return out
 
 
-def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=None):
-    nbt = read_chunk_nbt(world, cx, cz)
+def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=None, nbt_cache=None):
+    nbt = cached_read_chunk_nbt(world, cx, cz, nbt_cache)
     status = nbt.get("Status")
     if status not in ("minecraft:full", "full"):
         raise TriageError(
@@ -287,7 +314,7 @@ def bb_distance(bb, x, y, z):
     return max(dx, dy, dz)
 
 
-def collect_structure_pieces(world, native_chunk, halo):
+def collect_structure_pieces(world, native_chunk, halo, *, nbt_cache=None):
     cx, cz = native_chunk["cx"], native_chunk["cz"]
     min_y, height = native_chunk["min_y"], native_chunk["height"]
     chunk_box = (cx * 16, min_y, cz * 16, cx * 16 + 15, min_y + height - 1, cz * 16 + 15)
@@ -339,7 +366,7 @@ def collect_structure_pieces(world, native_chunk, halo):
         if (scx, scz) == (cx, cz):
             continue
         try:
-            start_nbt = read_chunk_nbt(world, scx, scz)
+            start_nbt = cached_read_chunk_nbt(world, scx, scz, nbt_cache)
         except TriageError as exc:
             unavailable_starts.append({"chunk": (scx, scz), "structures": sorted(sids), "reason": str(exc)})
             continue
@@ -414,7 +441,81 @@ def load_port_tsv(path, cx, cz, min_y, height):
     }
 
 
-def load_port_bin(path, cx, cz, min_y, height, *, bin_ox, bin_oz, bin_n):
+def load_port_tsv_grid(path, chunk_coords, min_y, height):
+    want = set(chunk_coords)
+    chunk_cells = (height // 16) * 4096
+    per_chunk = {}
+    seen_per_chunk = {}
+    cur = None
+    y_max = min_y + height - 1
+    file_hash = sha256_file(path)
+
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.rstrip("\r\n")
+            if not line:
+                continue
+            if line.startswith("#"):
+                m = CHUNK_HEADER_RE.match(line)
+                if m:
+                    hcx, hcz = int(m.group(1)), int(m.group(2))
+                    if m.group(3) is not None and int(m.group(3)) != min_y:
+                        raise TriageError(
+                            f"{path}:{lineno}: header min_y {m.group(3)} != native min_y {min_y}"
+                        )
+                    cur = (hcx, hcz)
+                    if cur in want and cur not in per_chunk:
+                        per_chunk[cur] = {
+                            "kind": "tsv",
+                            "path": str(path),
+                            "sha256": file_hash,
+                            "cells": [DEFAULT_AIR] * chunk_cells,
+                            "rows": 0,
+                            "cave_air": 0,
+                            "void_air": 0,
+                            "non_air": 0,
+                        }
+                        seen_per_chunk[cur] = set()
+                continue
+            if cur is None:
+                raise TriageError(f"{path}:{lineno}: block row before '# chunk' header in multi-chunk TSV")
+            parts = line.split("\t")
+            if len(parts) != 4:
+                raise TriageError(f"{path}:{lineno}: expected 4 tab-separated columns, got {len(parts)}")
+            x, y, z = int(parts[0]), int(parts[1]), int(parts[2])
+            state = parts[3]
+            hcx, hcz = cur
+            x0, z0 = hcx * 16, hcz * 16
+            if not (x0 <= x < x0 + 16 and z0 <= z < z0 + 16 and min_y <= y <= y_max):
+                raise TriageError(
+                    f"{path}:{lineno}: coord ({x},{y},{z}) outside chunk ({hcx},{hcz}) y={min_y}..{y_max}"
+                )
+            if cur not in want:
+                continue
+            entry = per_chunk[cur]
+            seen = seen_per_chunk[cur]
+            lx, lz = x - x0, z - z0
+            off = ((y - min_y) >> 4) * 4096 + ((y - min_y) & 15) * 256 + lz * 16 + lx
+            if off in seen:
+                raise TriageError(f"{path}:{lineno}: duplicate coordinate ({x},{y},{z})")
+            seen.add(off)
+            entry["cells"][off] = state
+            entry["rows"] += 1
+            if state == "minecraft:cave_air":
+                entry["cave_air"] += 1
+            elif state == "minecraft:void_air":
+                entry["void_air"] += 1
+            elif state != DEFAULT_AIR:
+                entry["non_air"] += 1
+
+    missing = sorted(want - set(per_chunk))
+    if missing:
+        raise TriageError(f"{path}: missing '# chunk' sections for {missing[:4]}")
+    return per_chunk
+
+
+def load_port_bin(path, cx, cz, min_y, height, *, bin_ox, bin_oz, bin_n,
+                  raw_bytes=None, sha256_hex=None, by_id=None):
     if bin_n <= 0:
         raise TriageError(f"--bin-n must be positive, got {bin_n}")
     dx = cx - bin_ox
@@ -425,12 +526,15 @@ def load_port_bin(path, cx, cz, min_y, height, *, bin_ox, bin_oz, bin_n):
         )
     chunk_cells = (height // 16) * 4096
     want_bytes = bin_n * bin_n * chunk_cells * 4
-    raw = Path(path).read_bytes()
+    raw = Path(path).read_bytes() if raw_bytes is None else raw_bytes
     if len(raw) != want_bytes:
         raise TriageError(
             f"binary dump {path} has {len(raw)} bytes, expected {want_bytes} for {bin_n}x{bin_n} height={height}"
         )
-    by_id = load_block_state_table()
+    if by_id is None:
+        by_id = load_block_state_table()
+    if sha256_hex is None:
+        sha256_hex = hashlib.sha256(raw).hexdigest()
     chunk_idx = dz * bin_n + dx
     start = chunk_idx * chunk_cells * 4
     ids = struct.unpack_from(f"<{chunk_cells}I", raw, start)
@@ -452,7 +556,7 @@ def load_port_bin(path, cx, cz, min_y, height, *, bin_ox, bin_oz, bin_n):
     return {
         "kind": "bin",
         "path": str(path),
-        "sha256": sha256_file(path),
+        "sha256": sha256_hex,
         "cells": cells,
         "rows": chunk_cells,
         "cave_air": cave_air,
@@ -518,8 +622,8 @@ def classify_cell(x, y, z, lx, lz, min_y, native_tops, pieces, halo):
     return f"outside_structures | {band}"
 
 
-def load_port_hm(path, cx, cz, *, bin_ox, bin_oz, bin_n):
-    raw = Path(path).read_bytes()
+def load_port_hm(path, cx, cz, *, bin_ox, bin_oz, bin_n, raw_bytes=None):
+    raw = Path(path).read_bytes() if raw_bytes is None else raw_bytes
     want_bytes = bin_n * bin_n * 256 * 4
     if len(raw) != want_bytes:
         raise TriageError(f"port heightmap {path} has {len(raw)} bytes, expected {want_bytes} for {bin_n}x{bin_n}")
@@ -531,30 +635,22 @@ def load_port_hm(path, cx, cz, *, bin_ox, bin_oz, bin_n):
     return list(struct.unpack_from("<256i", raw, start))
 
 
-def triage(args):
-    native_a = load_native_chunk(args.world, args.cx, args.cz,
-                                 min_y_override=args.min_y, height_override=args.height)
-    min_y = native_a["min_y"]
-    height = native_a["height"]
-
-    native_b = None
-    if args.world_b:
-        native_b = load_native_chunk(args.world_b, args.cx, args.cz,
-                                     min_y_override=min_y, height_override=height)
-
+def _resolve_bin_window(args):
+    n = getattr(args, "n", 1)
+    if n <= 0:
+        raise TriageError(f"--n must be positive, got {n}")
+    bin_n = n if args.bin_n is None else args.bin_n
     bin_ox = args.cx if args.bin_ox is None else args.bin_ox
     bin_oz = args.cz if args.bin_oz is None else args.bin_oz
+    return bin_ox, bin_oz, bin_n
 
-    if args.port_tsv:
-        port = load_port_tsv(args.port_tsv, args.cx, args.cz, min_y, height)
-    else:
-        port = load_port_bin(args.port_bin, args.cx, args.cz, min_y, height,
-                             bin_ox=bin_ox, bin_oz=bin_oz, bin_n=args.bin_n)
 
-    struct_info = collect_structure_pieces(args.world, native_a, args.halo)
+def _compare_chunk(args, native_a, native_b, port, struct_info, port_hm):
+    min_y = native_a["min_y"]
+    height = native_a["height"]
     native_tops = compute_native_tops(native_a["cells"], min_y, height)
 
-    x0, z0 = args.cx * 16, args.cz * 16
+    x0, z0 = native_a["cx"] * 16, native_a["cz"] * 16
     num_sections = native_a["sections"]
 
     all_air_diffs = 0
@@ -645,9 +741,7 @@ def triage(args):
         hm_report["WORLD_SURFACE_vs_non_air_top_mismatches"] = sum(
             1 for i in range(256) if saved_ws[i] != native_tops[i] + 1
         )
-    if args.port_hm:
-        port_hm = load_port_hm(args.port_hm, args.cx, args.cz,
-                               bin_ox=bin_ox, bin_oz=bin_oz, bin_n=args.bin_n)
+    if port_hm is not None:
         saved_hm = native_a["heightmaps"].get(args.hm_name)
         if saved_hm is None:
             raise TriageError(f"native chunk missing Heightmaps[{args.hm_name!r}]")
@@ -674,6 +768,191 @@ def triage(args):
         "overall_pairs": overall_pairs,
         "overall_pair_yrange": overall_pair_yrange,
         "heightmaps": hm_report,
+    }
+
+
+def triage(args):
+    nbt_cache = {}
+    native_a = load_native_chunk(args.world, args.cx, args.cz,
+                                 min_y_override=args.min_y, height_override=args.height,
+                                 nbt_cache=nbt_cache)
+    min_y = native_a["min_y"]
+    height = native_a["height"]
+
+    native_b = None
+    if args.world_b:
+        native_b = load_native_chunk(args.world_b, args.cx, args.cz,
+                                     min_y_override=min_y, height_override=height,
+                                     nbt_cache=nbt_cache)
+
+    bin_ox, bin_oz, bin_n = _resolve_bin_window(args)
+
+    if args.port_tsv:
+        port = load_port_tsv(args.port_tsv, args.cx, args.cz, min_y, height)
+    else:
+        port = load_port_bin(args.port_bin, args.cx, args.cz, min_y, height,
+                             bin_ox=bin_ox, bin_oz=bin_oz, bin_n=bin_n)
+
+    struct_info = collect_structure_pieces(args.world, native_a, args.halo, nbt_cache=nbt_cache)
+    port_hm = None
+    if args.port_hm:
+        port_hm = load_port_hm(args.port_hm, args.cx, args.cz,
+                               bin_ox=bin_ox, bin_oz=bin_oz, bin_n=bin_n)
+
+    return _compare_chunk(args, native_a, native_b, port, struct_info, port_hm)
+
+
+def triage_grid(args):
+    n = getattr(args, "n", 1)
+    if n == 1:
+        return triage(args)
+
+    bin_ox, bin_oz, bin_n = _resolve_bin_window(args)
+    allow_incomplete = getattr(args, "allow_incomplete", False)
+    coords = [(args.cx + dx, args.cz + dz) for dz in range(n) for dx in range(n)]
+    nbt_cache = {}
+
+    native_chunks = []
+    skipped = []
+    ref_min_y = args.min_y
+    ref_height = args.height
+
+    for cx, cz in coords:
+        try:
+            na = load_native_chunk(args.world, cx, cz,
+                                   min_y_override=ref_min_y, height_override=ref_height,
+                                   nbt_cache=nbt_cache)
+        except TriageError as exc:
+            if allow_incomplete:
+                skipped.append({"chunk": [cx, cz], "side": "native_a", "reason": str(exc)})
+                continue
+            raise
+        if ref_min_y is None:
+            ref_min_y = na["min_y"]
+        elif na["min_y"] != ref_min_y:
+            raise TriageError(f"chunk ({cx},{cz}) min_y={na['min_y']} != grid min_y={ref_min_y}")
+        if ref_height is None:
+            ref_height = na["height"]
+        elif na["height"] != ref_height:
+            raise TriageError(f"chunk ({cx},{cz}) height={na['height']} != grid height={ref_height}")
+
+        nb = None
+        if args.world_b:
+            try:
+                nb = load_native_chunk(args.world_b, cx, cz,
+                                       min_y_override=ref_min_y, height_override=ref_height,
+                                       nbt_cache=nbt_cache)
+            except TriageError as exc:
+                if allow_incomplete:
+                    skipped.append({"chunk": [cx, cz], "side": "native_b", "reason": str(exc)})
+                    continue
+                raise
+        native_chunks.append((na, nb))
+
+    if not native_chunks:
+        raise TriageError(f"0 complete native chunks in {n}x{n} grid at ({args.cx},{args.cz})")
+
+    compared_coords = [(na["cx"], na["cz"]) for na, _ in native_chunks]
+    if args.port_tsv:
+        port_map = load_port_tsv_grid(args.port_tsv, compared_coords, ref_min_y, ref_height)
+    else:
+        raw_bin = Path(args.port_bin).read_bytes()
+        sha_bin = hashlib.sha256(raw_bin).hexdigest()
+        by_id = load_block_state_table()
+        port_map = {
+            (na["cx"], na["cz"]): load_port_bin(
+                args.port_bin, na["cx"], na["cz"], ref_min_y, ref_height,
+                bin_ox=bin_ox, bin_oz=bin_oz, bin_n=bin_n,
+                raw_bytes=raw_bin, sha256_hex=sha_bin, by_id=by_id,
+            )
+            for na, _ in native_chunks
+        }
+
+    raw_hm = Path(args.port_hm).read_bytes() if args.port_hm else None
+
+    chunk_results = []
+    agg_totals = {
+        "all_air_diffs": 0,
+        "non_air_projection_diffs": 0,
+        "native_ab_all_diffs": 0,
+        "native_ab_non_air_diffs": 0,
+        "consistent_diffs": 0,
+        "unstable_diffs": 0,
+        "total_cells": 0,
+    }
+    agg_unstable = Counter()
+    agg_pairs = Counter()
+    agg_pair_yrange = {}
+    agg_buckets = defaultdict(lambda: {
+        "count": 0,
+        "min_xyz": [10**9, 10**9, 10**9],
+        "max_xyz": [-10**9, -10**9, -10**9],
+        "biomes": Counter(),
+        "pairs": Counter(),
+        "samples": defaultdict(list),
+    })
+    agg_hm_diff_cols = 0
+
+    for na, nb in native_chunks:
+        cx, cz = na["cx"], na["cz"]
+        struct_info = collect_structure_pieces(args.world, na, args.halo, nbt_cache=nbt_cache)
+        port_hm = (
+            load_port_hm(args.port_hm, cx, cz, bin_ox=bin_ox, bin_oz=bin_oz, bin_n=bin_n, raw_bytes=raw_hm)
+            if raw_hm is not None
+            else None
+        )
+        res = _compare_chunk(args, na, nb, port_map[(cx, cz)], struct_info, port_hm)
+        chunk_results.append(res)
+
+        for k in ("all_air_diffs", "non_air_projection_diffs", "native_ab_all_diffs",
+                  "native_ab_non_air_diffs", "consistent_diffs", "unstable_diffs"):
+            agg_totals[k] += res["totals"][k]
+        agg_totals["total_cells"] += na["meta"]["total"]
+        agg_unstable.update(res["unstable_patterns"])
+        agg_pairs.update(res["overall_pairs"])
+        for pair, (y0, y1) in res["overall_pair_yrange"].items():
+            if pair not in agg_pair_yrange:
+                agg_pair_yrange[pair] = [y0, y1]
+            else:
+                agg_pair_yrange[pair][0] = min(agg_pair_yrange[pair][0], y0)
+                agg_pair_yrange[pair][1] = max(agg_pair_yrange[pair][1], y1)
+        for key, b in res["buckets"].items():
+            ab = agg_buckets[key]
+            ab["count"] += b["count"]
+            for axis in range(3):
+                ab["min_xyz"][axis] = min(ab["min_xyz"][axis], b["min_xyz"][axis])
+                ab["max_xyz"][axis] = max(ab["max_xyz"][axis], b["max_xyz"][axis])
+            ab["biomes"].update(b["biomes"])
+            ab["pairs"].update(b["pairs"])
+            for pair, pts in b["samples"].items():
+                room = args.samples - len(ab["samples"][pair])
+                if room > 0:
+                    ab["samples"][pair].extend(pts[:room])
+        if raw_hm is not None:
+            agg_hm_diff_cols += res["heightmaps"].get("port_vs_native_saved_diff_cols", 0)
+
+    sample_port = chunk_results[0]["port"]
+    return {
+        "is_grid": True,
+        "origin": [args.cx, args.cz],
+        "n": n,
+        "min_y": ref_min_y,
+        "height": ref_height,
+        "world": str(args.world),
+        "world_b": str(args.world_b) if args.world_b else None,
+        "port_meta": {
+            "kind": sample_port["kind"],
+            "path": sample_port["path"],
+            "sha256": sample_port["sha256"],
+        },
+        "skipped": skipped,
+        "chunks": chunk_results,
+        "totals": agg_totals,
+        "unstable_patterns": agg_unstable,
+        "overall_pairs": agg_pairs,
+        "overall_pair_yrange": agg_pair_yrange,
+        "buckets": agg_buckets,
+        "heightmap_diff_cols": agg_hm_diff_cols if raw_hm is not None else None,
     }
 
 
@@ -761,7 +1040,128 @@ def format_report(res, args):
     return "\n".join(lines) + "\n"
 
 
+def format_grid_report(gres, args):
+    if not gres.get("is_grid"):
+        return format_report(gres, args)
+    ox, oz = gres["origin"]
+    n = gres["n"]
+    totals = gres["totals"]
+    pm = gres["port_meta"]
+    lines = []
+    lines.append(
+        f"== chunk_triage grid ({ox},{oz})+{n}x{n} compared={len(gres['chunks'])}/{n*n} "
+        f"min_y={gres['min_y']} height={gres['height']} =="
+    )
+    lines.append(f"native A: {gres['world']}")
+    if gres["world_b"]:
+        lines.append(f"native B: {gres['world_b']}")
+    lines.append(f"port ({pm['kind']}): {pm['path']} sha256={pm['sha256'][:16]}...")
+    if gres["skipped"]:
+        sdesc = ", ".join(f"({s['chunk'][0]},{s['chunk'][1]}:{s['side']})" for s in gres["skipped"])
+        lines.append(f"skipped incomplete chunks ({len(gres['skipped'])}): {sdesc}")
+
+    lines.append("per-chunk scoreboard:")
+    for r in gres["chunks"]:
+        na = r["native_a"]
+        t = r["totals"]
+        top_bucket = "-"
+        if r["buckets"]:
+            bk, bobj = min(r["buckets"].items(), key=lambda kv: (-kv[1]["count"], kv[0]))
+            top_bucket = f"{bk} ({bobj['count']})"
+        nb_part = (
+            f"  consistent={t['consistent_diffs']:5d}  unstable={t['unstable_diffs']:4d}"
+            if gres["world_b"]
+            else ""
+        )
+        hm_part = (
+            f"  hm_diff={r['heightmaps']['port_vs_native_saved_diff_cols']:3d}"
+            if gres["heightmap_diff_cols"] is not None
+            else ""
+        )
+        lines.append(
+            f"  ({na['cx']:4d},{na['cz']:4d})  diffs={t['all_air_diffs']:6d}  "
+            f"non_air={t['non_air_projection_diffs']:6d}{nb_part}{hm_part}  top={top_bucket}"
+        )
+
+    lines.append(
+        f"grid diff summary: all_air_kinds={totals['all_air_diffs']} / {totals['total_cells']}  "
+        f"(lossy non_air_projection={totals['non_air_projection_diffs']})"
+    )
+    if gres["world_b"]:
+        lines.append(
+            f"  consistency vs native B: consistent={totals['consistent_diffs']}  "
+            f"native_unstable={totals['unstable_diffs']}  "
+            f"(A vs B: all_air={totals['native_ab_all_diffs']}, non_air={totals['native_ab_non_air_diffs']})"
+        )
+    if gres["heightmap_diff_cols"] is not None:
+        lines.append(f"heightmap diff columns ({args.hm_name}): {gres['heightmap_diff_cols']}")
+
+    if gres["overall_pairs"]:
+        lines.append("top state pairs across grid (native_A -> port):")
+        for (va, vp), cnt in gres["overall_pairs"].most_common(12):
+            y0, y1 = gres["overall_pair_yrange"][(va, vp)]
+            lines.append(f"  {cnt:6d}  y={y0}..{y1}  {va} -> {vp}")
+
+    if gres["buckets"]:
+        lines.append("aggregated causal attribution:")
+        ordered = sorted(gres["buckets"].items(), key=lambda kv: (-kv[1]["count"], kv[0]))
+        for key, b in ordered:
+            mn, mx = b["min_xyz"], b["max_xyz"]
+            bstr = ",".join(f"{k}:{v}" for k, v in b["biomes"].most_common(3))
+            lines.append(
+                f"  {b['count']:6d}  {key}  bbox=[{mn[0]}..{mx[0]}, {mn[1]}..{mx[1]}, {mn[2]}..{mx[2]}]  biomes=({bstr})"
+            )
+            for (va, vp), cnt in b["pairs"].most_common(8):
+                samples = " ".join(f"({x},{y},{z})" for x, y, z in b["samples"][(va, vp)])
+                sample_txt = f"  samples: {samples}" if samples else ""
+                lines.append(f"    {cnt:5d}  {va} -> {vp}{sample_txt}")
+
+    if getattr(args, "per_chunk", False):
+        for r in gres["chunks"]:
+            if r["totals"]["all_air_diffs"] > 0 or not gres["buckets"]:
+                lines.append("")
+                lines.append(format_report(r, args).rstrip("\n"))
+
+    return "\n".join(lines) + "\n"
+
+
 def json_summary(res):
+    if res.get("is_grid"):
+        return {
+            "grid": {"origin": res["origin"], "n": res["n"]},
+            "min_y": res["min_y"],
+            "height": res["height"],
+            "world": res["world"],
+            "world_b": res["world_b"],
+            "port_meta": res["port_meta"],
+            "compared_chunks": len(res["chunks"]),
+            "skipped": res["skipped"],
+            "totals": res["totals"],
+            "heightmap_diff_cols": res["heightmap_diff_cols"],
+            "top_pairs": [
+                {
+                    "native": va,
+                    "port": vp,
+                    "count": cnt,
+                    "y_range": res["overall_pair_yrange"][(va, vp)],
+                }
+                for (va, vp), cnt in res["overall_pairs"].most_common()
+            ],
+            "attribution": [
+                {
+                    "bucket": key,
+                    "count": b["count"],
+                    "bbox": b["min_xyz"] + b["max_xyz"],
+                    "biomes": dict(b["biomes"]),
+                    "pairs": [
+                        {"native": va, "port": vp, "count": cnt, "samples": b["samples"][(va, vp)]}
+                        for (va, vp), cnt in b["pairs"].most_common()
+                    ],
+                }
+                for key, b in sorted(res["buckets"].items(), key=lambda kv: (-kv[1]["count"], kv[0]))
+            ],
+            "chunks": [json_summary(c) for c in res["chunks"]],
+        }
     na = res["native_a"]
     return {
         "chunk": [na["cx"], na["cz"]],
@@ -812,21 +1212,24 @@ def json_summary(res):
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("world", help="Native Anvil world directory")
-    ap.add_argument("cx", type=int, help="Target chunk X coordinate")
-    ap.add_argument("cz", type=int, help="Target chunk Z coordinate")
+    ap.add_argument("cx", type=int, help="Target chunk X coordinate (or grid origin X with --n)")
+    ap.add_argument("cz", type=int, help="Target chunk Z coordinate (or grid origin Z with --n)")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--port-tsv", help="Port canonical-state TSV (from MC_SPINE_WG_DUMP_CANON or terrain_chunk_dump.py)")
     src.add_argument("--port-bin", help="Port binary dump (from MC_SPINE_WG_DUMP)")
+    ap.add_argument("--n", type=int, default=1, help="Grid width N from (cx,cz) (default: 1)")
     ap.add_argument("--world-b", help="Optional second native world run to isolate native run-to-run noise")
     ap.add_argument("--bin-ox", type=int, help="Binary/HM dump origin chunk X (default: cx)")
     ap.add_argument("--bin-oz", type=int, help="Binary/HM dump origin chunk Z (default: cz)")
-    ap.add_argument("--bin-n", type=int, default=1, help="Binary/HM dump grid width N (default: 1)")
+    ap.add_argument("--bin-n", type=int, default=None, help="Binary/HM dump grid width N (default: --n)")
     ap.add_argument("--min-y", type=int, help="Override min_y (default: from native yPos)")
     ap.add_argument("--height", type=int, help="Override height (default: from native sections)")
     ap.add_argument("--port-hm", help="Optional port OCEAN_FLOOR binary dump (MC_SPINE_WG_DUMP_HM)")
     ap.add_argument("--hm-name", default="OCEAN_FLOOR", help="Native Heightmaps entry name for --port-hm (default: OCEAN_FLOOR)")
     ap.add_argument("--halo", type=int, default=1, help="Halo radius around structure child BBs (default: 1)")
     ap.add_argument("--samples", type=int, default=5, help="Sample coords per pair/bucket (default: 5)")
+    ap.add_argument("--per-chunk", action="store_true", help="In --n > 1 mode, also print per-chunk full reports")
+    ap.add_argument("--allow-incomplete", action="store_true", help="In --n > 1 mode, skip missing/non-full chunks and report them")
     ap.add_argument("--fail-on-diff", action="store_true", help="Exit 1 when all_air_diffs > 0")
     ap.add_argument("--json-out", help="Optional path to write JSON triage report")
     return ap
@@ -836,11 +1239,11 @@ def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
     try:
-        res = triage(args)
+        res = triage_grid(args)
     except TriageError as exc:
         print(f"chunk_triage: ERROR: {exc}", file=sys.stderr)
         return 2
-    sys.stdout.write(format_report(res, args))
+    sys.stdout.write(format_grid_report(res, args))
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(json_summary(res), indent=2) + "\n")
     if args.fail_on_diff and res["totals"]["all_air_diffs"] > 0:

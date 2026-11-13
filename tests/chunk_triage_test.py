@@ -268,6 +268,92 @@ class ChunkTriageContracts(unittest.TestCase):
         self.assertEqual(report["heightmaps"]["port_vs_native_saved_diff_cols"], 1)
         self.assertEqual(report["heightmaps"]["WORLD_SURFACE_vs_non_air_top_mismatches"], 0)
 
+    def test_multi_chunk_grid_bin_and_incomplete_handling(self):
+        blocks_meta = json.loads((ROOT / "assets/blocks_1211.json").read_text())
+        stone = next(b for b in blocks_meta if b["name"] == "stone")["minStateId"]
+        diorite = next(b for b in blocks_meta if b["name"] == "diorite")["minStateId"]
+
+        chunks_a = {
+            (0, 0): make_chunk_nbt(0, 0, blocks={(0, -60, 0): ("minecraft:stone", {})}),
+            (1, 0): make_chunk_nbt(1, 0, blocks={(16, -60, 0): ("minecraft:diorite", {})}),
+            (0, 1): make_chunk_nbt(0, 1, status="minecraft:biomes"),
+            (1, 1): make_chunk_nbt(1, 1, blocks={(16, -60, 16): ("minecraft:stone", {})}),
+        }
+
+        def fake_reader(world, cx, cz):
+            return chunks_a[(cx, cz)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chunk_cells = 2 * 4096
+            grid = [0] * (4 * chunk_cells)
+            # (0,0) idx=0 matches stone; (1,0) idx=1 mismatches (stone vs diorite); (1,1) idx=3 matches stone.
+            grid[0 * chunk_cells + 4 * 256 + 0] = stone
+            grid[1 * chunk_cells + 4 * 256 + 0] = stone
+            grid[3 * chunk_cells + 4 * 256 + 0] = stone
+            bin_path = Path(tmp) / "dump.bin"
+            bin_path.write_bytes(struct.pack(f"<{len(grid)}I", *grid))
+
+            # Without --allow-incomplete, partial chunk (0,1) must fail closed.
+            with patch.object(ct, "read_chunk_nbt", side_effect=fake_reader):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc_fail = ct.main([tmp, "0", "0", "--n", "2", "--port-bin", str(bin_path)])
+            self.assertEqual(rc_fail, 2)
+            self.assertIn("minecraft:biomes", err.getvalue())
+
+            # With --allow-incomplete, (0,1) is loudly skipped and 3 complete chunks are triaged.
+            json_out = Path(tmp) / "grid.json"
+            with patch.object(ct, "read_chunk_nbt", side_effect=fake_reader):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc_ok = ct.main([
+                        tmp, "0", "0", "--n", "2",
+                        "--port-bin", str(bin_path),
+                        "--allow-incomplete", "--per-chunk",
+                        "--json-out", str(json_out),
+                        "--fail-on-diff",
+                    ])
+            self.assertEqual(rc_ok, 1)
+            txt = out.getvalue()
+            report = json.loads(json_out.read_text())
+        self.assertIn("skipped incomplete chunks (1): (0,1:native_a)", txt)
+        self.assertIn("per-chunk scoreboard:", txt)
+        self.assertEqual(report["compared_chunks"], 3)
+        self.assertEqual(report["totals"]["all_air_diffs"], 1)
+        self.assertEqual(len(report["skipped"]), 1)
+
+    def test_multi_chunk_tsv_grid_and_missing_section_fail_closed(self):
+        chunks = {
+            (0, 0): make_chunk_nbt(0, 0, blocks={(0, -60, 0): ("minecraft:stone", {})}),
+            (1, 0): make_chunk_nbt(1, 0, blocks={(16, -60, 0): ("minecraft:stone", {})}),
+            (0, 1): make_chunk_nbt(0, 1, blocks={}),
+            (1, 1): make_chunk_nbt(1, 1, blocks={}),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tsv_ok = Path(tmp) / "ok.tsv"
+            tsv_ok.write_text(
+                "# chunk 0,0 min_y -64 height 32 cells 1\n"
+                "0\t-60\t0\tminecraft:stone\n"
+                "# chunk 1,0 min_y -64 height 32 cells 1\n"
+                "16\t-60\t0\tminecraft:granite\n"
+                "# chunk 0,1 min_y -64 height 32 cells 0\n"
+                "# chunk 1,1 min_y -64 height 32 cells 0\n"
+            )
+            tsv_missing = Path(tmp) / "missing.tsv"
+            tsv_missing.write_text("# chunk 0,0 min_y -64 height 32 cells 0\n")
+
+            with patch.object(ct, "read_chunk_nbt", side_effect=lambda w, cx, cz: chunks[(cx, cz)]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = ct.main([tmp, "0", "0", "--n", "2", "--port-tsv", str(tsv_ok), "--fail-on-diff"])
+                self.assertEqual(rc, 1)
+                self.assertIn("grid diff summary: all_air_kinds=1 / 32768", out.getvalue())
+
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc_bad = ct.main([tmp, "0", "0", "--n", "2", "--port-tsv", str(tsv_missing)])
+                self.assertEqual(rc_bad, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
