@@ -82,15 +82,32 @@ def chunk_bytes(world, cx, cz):
     rx, rz = cx >> 5, cz >> 5
     path = os.path.join(world, "region", f"r.{rx}.{rz}.mca")
     with open(path, "rb") as f:
-        raw = f.read()
-    idx = (cx & 31) + (cz & 31) * 32
-    off = int.from_bytes(raw[idx * 4:idx * 4 + 3], "big")
-    if off == 0:
-        raise SystemExit(f"chunk {cx},{cz} not present in {path}")
-    start = off * 4096
-    length = int.from_bytes(raw[start:start + 4], "big")
-    kind = raw[start + 4]
-    body = raw[start + 5:start + 4 + length]
+        # Unrelated chunks must not grow this read's I/O or resident memory.
+        # Read only this slot and payload, without retaining a stale region cache.
+        size = os.fstat(f.fileno()).st_size
+        idx = (cx & 31) + (cz & 31) * 32
+        f.seek(idx * 4)
+        entry = f.read(4)
+        if len(entry) != 4:
+            raise SystemExit(f"truncated location entry for chunk {cx},{cz} in {path}")
+        off = int.from_bytes(entry[:3], "big")
+        if off == 0:
+            raise SystemExit(f"chunk {cx},{cz} not present in {path}")
+        sectors = entry[3]
+        start = off * 4096
+        if off < 2 or sectors == 0 or start + 5 > size:
+            raise SystemExit(f"invalid sector allocation for chunk {cx},{cz} in {path}")
+        f.seek(start)
+        header = f.read(5)
+        if len(header) != 5:
+            raise SystemExit(f"truncated chunk header for {cx},{cz} in {path}")
+        length = int.from_bytes(header[:4], "big")
+        kind = header[4]
+        if length < 1 or length + 4 > sectors * 4096 or start + 4 + length > size:
+            raise SystemExit(f"invalid chunk length {length} for {cx},{cz} in {path}")
+        body = f.read(length - 1)
+        if len(body) != length - 1:
+            raise SystemExit(f"truncated chunk payload for {cx},{cz} in {path}")
     if kind == 1:
         import gzip
         return gzip.decompress(body)

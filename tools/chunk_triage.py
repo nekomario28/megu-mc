@@ -648,7 +648,6 @@ def _resolve_bin_window(args):
 def _compare_chunk(args, native_a, native_b, port, struct_info, port_hm):
     min_y = native_a["min_y"]
     height = native_a["height"]
-    native_tops = compute_native_tops(native_a["cells"], min_y, height)
 
     x0, z0 = native_a["cx"] * 16, native_a["cz"] * 16
     num_sections = native_a["sections"]
@@ -675,6 +674,11 @@ def _compare_chunk(args, native_a, native_b, port, struct_info, port_hm):
     cells_a = native_a["cells"]
     cells_b = native_b["cells"] if native_b else None
     cells_p = port["cells"]
+    expected_cells = num_sections * 4096
+    for side, cells in (("native_a", cells_a), ("native_b", cells_b), ("port", cells_p)):
+        if cells is not None and len(cells) != expected_cells:
+            raise TriageError(f"{side} has {len(cells)} cells, expected {expected_cells}")
+    native_tops = compute_native_tops(cells_a, min_y, height)
 
     for sidx in range(num_sections):
         sbase = sidx * 4096
@@ -682,6 +686,13 @@ def _compare_chunk(args, native_a, native_b, port, struct_info, port_hm):
         for ly in range(16):
             y = sy_base + ly
             ybase = sbase + ly * 256
+            # Exact state equality includes air kinds and every property. Native B
+            # must also match: a port match alone does not remove A/B variation.
+            row_a = cells_a[ybase:ybase + 256]
+            if row_a == cells_p[ybase:ybase + 256] and (
+                cells_b is None or row_a == cells_b[ybase:ybase + 256]
+            ):
+                continue
             for lz in range(16):
                 z = z0 + lz
                 zbase = ybase + lz * 16

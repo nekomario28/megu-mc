@@ -45,14 +45,14 @@
 | `chunk_world_fixture.sh <tag> <cx> <cz> <n> <terrain\|carvers\|features\|structures>` | 固定jarの同一座標regionをforceloadし、mc-spineの同じstage dumpと`carver_diff`で比較する。参照chunkの完成を先に検査する |
 | `ore_fixture.sh <tag> <keep> [n]` | `ore_*`/`disk_*` のうち `<keep>` 以外の placement を `count: 0` にした world を作る（1 feature 隔離） |
 | `vanilla_nofeat_pack.py <jar> <world> [--keep-carvers]` | biome の features と carvers を空にした pack を書く（地形だけの比較用） |
-| `vanilla_region_blocks.py` | region ファイルから chunk を取り出す共通層 |
+| `vanilla_region_blocks.py` | region の location entry と対象 payload だけを読む共通層。region 全体の保持・永続キャッシュはせず、割当sector／ファイル境界を検査する。[I/O量と互換検証](../evidence/foundation/region-reader/README.md) |
 | `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings] [--accept-eula]` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/**` (worldgen と tags/block)・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv`・`biome_probe_ties_1211.tsv`（range 端の同距離 tie 点。子の走査順を固定）・`random_next_int_1211.tsv`（乱数クラスの `nextInt(bound)` 列のハッシュ、数値のみ）、`--accept-eula` 付きで `config_packets.bin` (`capture_config_packets.py` 経由) を生成する (全て `.gitignore`、新しい clone は `cargo test` の前に1回実行)。jar の sha1 と Fabric mapping の sha256 を固定し、公式 data generator の出力と突き合わせてから書く。Java 21 が必要。出力は決定的 |
 
 ## 比較（両側を同じ土俵で読む）
 
 | 道具 | 何をするか |
 |---|---|
-| `chunk_triage.py <world> <cx> <cz> (--port-tsv \| --port-bin) [--n N] [--world-b] [--port-hm]` | 1 chunk または `N×N` 領域の causal triage を 1 コマンドで実行。保存 world を直接読み `air`/`cave_air`/`void_air` を区別して比較、`--world-b` で native 実行間ゆらぎを分離、`structures.References`→start chunk `Children[].BB`（＋`--halo`）と高度帯で原因帰属を分類。欠損/`Status != full`/座標不一致は exit 2 |
+| `chunk_triage.py <world> <cx> <cz> (--port-tsv \| --port-bin) [--n N] [--world-b] [--port-hm]` | 1 chunk または `N×N` 領域の causal triage を 1 コマンドで実行。保存 world を直接読み `air`/`cave_air`/`void_air` を区別して比較、`--world-b` で native 実行間ゆらぎを分離、`structures.References`→start chunk `Children[].BB`（＋`--halo`）と高度帯で原因帰属を分類。A・port・指定時のBが完全一致する層は単セルループを省く（[測定と境界](../evidence/foundation/triage-layer-skip/README.md)）。欠損/`Status != full`/座標不一致は exit 2 |
 | `port_triage.py <world> <cx> <cz> [--n N] [--mode full\|terrain\|carvers] [--world-b] [--port-hm]` | `cargo build --message-format=json-render-diagnostics` で正確な binary を取得し、`level.dat` の seed・`nofeat` stage 一致・chunk 完成を先に検査してから clean env で `MC_SPINE_WG_DUMP` を生成し、そのまま `chunk_triage`（1 chunk / `N×N`）を実行する |
 | `carver_diff.py <dump> <world> [--n --x0 --z0 --cells --tick]` | port の dump と保存 world を block state 単位で diff。層別（carver/deep/surface）、tick 由来（葉の distance）を分離、`--cells` で座標と名前、**全 chunk skip なら exit 2** |
 | `ore_diff.py <dump> <world> <block> [...]` | **ブロック1種**のセル集合を比較（ours-only/vanilla-only＋クラスタサイズ＝「同数で形違い」と「セルが少ない」を区別）。参照が full でない chunk は両側とも除外し、比較ゼロなら失敗 |

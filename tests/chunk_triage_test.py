@@ -8,6 +8,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -105,6 +106,53 @@ def encode_chunk_pos_long(cx, cz):
 
 
 class ChunkTriageContracts(unittest.TestCase):
+    def test_matching_layers_are_bulk_compared_without_hiding_native_b_changes(self):
+        class BudgetedCells(list):
+            """Count Python per-cell reads, while permitting bulk slice/equality reads."""
+            def __init__(self, values, budget):
+                super().__init__(values)
+                self.budget = budget
+                self.reads = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, int):
+                    self.reads += 1
+                    if self.reads > self.budget:
+                        raise AssertionError('matching layers were scanned cell by cell')
+                return super().__getitem__(key)
+
+        nbt_a = make_chunk_nbt(0, 0)
+        nbt_b = make_chunk_nbt(0, 0, blocks={(0, -60, 0): ('minecraft:cave_air', {})})
+        with patch.object(ct, 'read_chunk_nbt', return_value=nbt_a):
+            a = ct.load_native_chunk('unused', 0, 0)
+        with patch.object(ct, 'read_chunk_nbt', return_value=nbt_b):
+            b = ct.load_native_chunk('unused-b', 0, 0)
+        args = SimpleNamespace(halo=1, samples=5, hm_name='OCEAN_FLOOR')
+        for reference_b, budget, expected_ab in [(None, 0, 0), (b, 256, 1)]:
+            with self.subTest(world_b=reference_b is not None):
+                port = {'cells': BudgetedCells(a['cells'], budget)}
+                res = ct._compare_chunk(args, a, reference_b, port, {'pieces': []}, None)
+                self.assertEqual(res['totals'], {
+                    'all_air_diffs': 0, 'non_air_projection_diffs': 0,
+                    'native_ab_all_diffs': expected_ab, 'native_ab_non_air_diffs': 0,
+                    'consistent_diffs': 0, 'unstable_diffs': 0,
+                })
+                self.assertEqual(res['overall_pairs'], {})
+                self.assertEqual(res['buckets'], {})
+
+    def test_bulk_comparison_rejects_short_cell_arrays(self):
+        with patch.object(ct, 'read_chunk_nbt', return_value=make_chunk_nbt(0, 0)):
+            a = ct.load_native_chunk('unused', 0, 0)
+        args = SimpleNamespace(halo=1, samples=5, hm_name='OCEAN_FLOOR')
+        for side in ('native_a', 'native_b', 'port'):
+            with self.subTest(side=side):
+                inputs = {'native_a': dict(a), 'native_b': dict(a),
+                          'port': {'cells': list(a['cells'])}}
+                inputs[side]['cells'] = []
+                with self.assertRaisesRegex(ct.TriageError, side + ' has 0 cells'):
+                    ct._compare_chunk(args, inputs['native_a'], inputs['native_b'],
+                                      inputs['port'], {'pieces': []}, None)
+
     def test_cave_air_and_void_air_are_never_collapsed(self):
         native = make_chunk_nbt(
             3, -2,
