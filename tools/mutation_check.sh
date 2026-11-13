@@ -44,6 +44,7 @@ skipped=0
 parked=0
 log=$(mktemp)
 artifacts=$(mktemp)
+declare -A baseline_ok=()
 
 # Content hash of the file as it was before the mutation. Restoring the bytes is the point;
 # restoring a timestamp is not, and neither is trusting that the restore worked. A mutation that
@@ -108,9 +109,15 @@ check() {
   backup="$mut_file.mutation-backup"
   local sha_before
   sha_before=$(hash_of "$mut_file")
-  if ! control "$name" "$test_filter" baseline; then
-    failed=$((failed + 1))
-    return
+  # A test filter already proved clean in this run against the verified unmutated source
+  # does not need its baseline re-executed before every subsequent mutant; every mutant still
+  # runs `restored` after `verify_restored` to rebuild and re-prove the unmutated binary.
+  if [ -z "${baseline_ok[$test_filter]+x}" ]; then
+    if ! control "$name" "$test_filter" baseline; then
+      failed=$((failed + 1))
+      return
+    fi
+    baseline_ok["$test_filter"]=1
   fi
   cp "$mut_file" "$backup"
 
@@ -183,6 +190,7 @@ PY
   restore
   verify_restored "$name" "$sha_before"
   if ! control "$name" "$test_filter" restored; then
+    unset "baseline_ok[$test_filter]"
     if [ "$caught" = yes ]; then failed=$((failed + 1)); fi
   elif [ "$caught" = yes ]; then
     echo "ok    $name"

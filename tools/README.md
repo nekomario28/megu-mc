@@ -12,6 +12,7 @@
 | `bytecode_probe.sh <class> [pattern]` | 固定した1.21.1 jar から1クラスの `javap -p -c` を出す。公式mappingsで難読名に引き、入れ子jarから取り出す。証拠ページの javap 引用はこれで再現する |
 | `feature_cases/gen.py <type> [--support <block>] [--force]` | 型の cases skeleton を pack と `tests/data/feature_classes_1211.tsv` から生成する（難読クラス名と config は機械的、scene は定型7種）。**型固有の判別 scene は手で足す**（そこが型の本体）。生成物は `tests/feature_cases/<type>.json` |
 | `feature_type_coverage.py [--unimplemented] [--overworld]` | pack の configured-feature 型 × `p_cf` の腕 × placed feature の入れ子 × それを参照する biome を静的に数える。**到達されていない型を先に実装しない**ための計測 |
+| `p0_2_audit.py [--json]` | P0-2 静的到達性監査。Overworld/Nether/End で実際に到達する `density_function`（ゼロ代替ノードと未対応型を分離）・`noise`・`surface_rule`/`condition`（`biome_is` と `u64` leaf 上限）・`placement_modifier`・`configured_feature`・biome `carvers`/`spawners`/`spawn_costs`・34構造物型を `src/` の parser 腕と突き合わせ、未知到達ノードで exit 1 |
 | `kelp_fixture.sh <cx> <cz> [n] [seed]` | 海洋 biome を spawn から離れた場所で forceload し、**正の kelp セルをゲートで要求**してから port と block 単位で diff（0 なら失敗）。forceload は起動後に送る |
 | `geode_fixture.sh [cx] [cz] [n] [seed]` | geode を含む vanilla 参照を作る（既定 seed 12 / chunk (0,0) は port の配置 trace で geode が発火することを実測済み）。参照に geode が無ければ失敗し、amethyst_block / budding_amethyst / calcite / smooth_basalt をセル単位で比較する |
 | `biome_tree_from_jar.py --jar <server.jar> [--output <tree.json>]` | 固定1.21.1 jar の built-in preset を実クラスに構築させ、気候 RTree を抽出。JDK必須。別jar・不完全な木・jarに無いbiomeを拒否し、成功時だけ出力を置換する。jarとexporterのhashを記録 |
