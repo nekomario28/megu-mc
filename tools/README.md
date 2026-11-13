@@ -51,6 +51,7 @@
 
 | 道具 | 何をするか |
 |---|---|
+| `chunk_triage.py <world> <cx> <cz> (--port-tsv \| --port-bin) [--world-b] [--port-hm]` | 1 chunk の causal triage を 1 コマンドで実行。保存 world を直接読み `air`/`cave_air`/`void_air` を区別して比較、`--world-b` で native 実行間ゆらぎを分離、`structures.References`→start chunk `Children[].BB`（＋`--halo`）と高度帯で原因帰属を分類。欠損/`Status != full`/座標不一致は exit 2 |
 | `carver_diff.py <dump> <world> [--n --x0 --z0 --cells --tick]` | port の dump と保存 world を block state 単位で diff。層別（carver/deep/surface）、tick 由来（葉の distance）を分離、`--cells` で座標と名前、**全 chunk skip なら exit 2** |
 | `ore_diff.py <dump> <world> <block> [...]` | **ブロック1種**のセル集合を比較（ours-only/vanilla-only＋クラスタサイズ＝「同数で形違い」と「セルが少ない」を区別）。参照が full でない chunk は両側とも除外し、比較ゼロなら失敗 |
 | `world_diff.py <worldA> <worldB> [...]` | 保存 world 同士を比較＝**参照自身の実行間ノイズ床**を測る |

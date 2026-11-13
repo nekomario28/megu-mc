@@ -22,7 +22,8 @@
 1. まず既存world/regionとdumpを読む。新規server起動や全chunk再生成は、
    既存artifactだけでは必要なstage/情報を得られないと確認した後に限る。
 2. 名前だけでなく全プロパティを含むcanonical stateを、同じ絶対座標・高さ範囲で比較する。
-   airの省略表現とair種別の扱いも明記し、全volumeと非air行数を混同しない。
+   airの省略表現とair種別の扱いも明記し、全volumeと非air行数を混同しない
+   （[chunk_triage.py](../../tools/chunk_triage.py) で `cave_air` 区別・structure BB 帰属・`--world-b` ゆらぎ分離を1コマンドで確認できる）。
 3. 座標集合と置換方向で差を分ける。最終stateがairというだけでcarver、
    planksというだけで特定構造物、同じ形というだけでRNG原因と断定しない。
 4. 対象セルを作り得るwriterを列挙し、両側で最初に分岐するstageの前後を比較する。
