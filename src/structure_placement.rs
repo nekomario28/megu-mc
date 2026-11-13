@@ -134,12 +134,7 @@ impl FrequencyReduction {
             }
             Self::LegacyType2 => salted(seed, x, z, 10387320).next_f32() < frequency,
             Self::LegacyType3 => {
-                let mut random = Lcg::new(seed);
-                let a = random.next_i64();
-                let b = random.next_i64();
-                let mixed =
-                    i64::from(x).wrapping_mul(a) ^ i64::from(z).wrapping_mul(b) ^ seed as i64;
-                Lcg::new(mixed as u64).next_f64() < f64::from(frequency)
+                Lcg::for_large_feature(seed, x, z).next_f64() < f64::from(frequency)
             }
         }
     }

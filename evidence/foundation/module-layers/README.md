@@ -63,7 +63,7 @@ registry（状態・metadata・タグ）は `block_registry.rs`、値/高さ/状
 `generation_providers.rs`、1本のGen借用と上書き・heightmap・biomeキャッシュは
 `generation_context.rs` が所有する。既存定義の移動であり、式・分岐・反復順・RNG消費・
 保存形式を変えず、旧feature側の再exportや互換wrapperは残さない。
-現行グラフは**16モジュール・39辺・指摘0**で、`policy.json` のaccepted findingsも空である。
+現行のモジュール集合・許可辺は `policy.json` を正本とし、件数はsource-bound gateの実行結果で確認する。accepted findingsは空である。
 移動前後を独立プロセスで2回比較した全上書き値と、provider/predicateの値とRNG消費を固定した
 fixture、実population出力のMD5対照が保存を検査する。これはvanilla準拠や代表負荷の証明ではなく、
 T/F/N/Qと既存ignoredテストは別の未完了契約として残る。

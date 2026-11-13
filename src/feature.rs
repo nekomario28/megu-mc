@@ -7581,10 +7581,7 @@ fn set_large_feature_seed(r: &mut Lcg, seed: u64, cx: i32, cz: i32) {
             }
         }
     }
-    let mut s = Lcg::new(seed);
-    let l = s.next_i64();
-    let m = s.next_i64();
-    *r = Lcg::new(((cx as i64).wrapping_mul(l) ^ (cz as i64).wrapping_mul(m) ^ seed as i64) as u64);
+    *r = Lcg::for_large_feature(seed, cx, cz);
 }
 
 /// `CaveWorldCarver.getYScale`: two floats plus an occasional 1-in-10 room bulge.

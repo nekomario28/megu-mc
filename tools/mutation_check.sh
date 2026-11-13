@@ -1748,6 +1748,32 @@ check "feature context reads carver overrides" \
   '        if let Some(st) = Option::<u32>::None {' \
   feature_context_sees_carver_writes
 
+check "normal mineshaft layout consumes the discarded double before its room" \
+  src/mineshaft_layout.rs '    random.next_f64();' '    // omitted draw' \
+  mineshaft_layout::tests::normal_layout_matches_native_pieces_and_rng_boundaries
+
+check "normal mineshaft layout permits children at parent depth eight" \
+  src/mineshaft_layout.rs 'if parent_depth > 8' 'if parent_depth > 7' \
+  mineshaft_layout::tests::normal_layout_matches_native_pieces_and_rng_boundaries
+
+check "rail corridors skip the spider RNG roll" \
+  src/mineshaft_layout.rs 'let spider = !rails && self.random.next_bound(23) == 0;' \
+  'let spider = self.random.next_bound(23) == 0;' \
+  mineshaft_layout::tests::normal_layout_matches_native_pieces_and_rng_boundaries
+
+check "mineshaft pieces recursively append their children" \
+  src/mineshaft_layout.rs '        self.grow(index);' '        // omitted expansion' \
+  mineshaft_layout::tests::normal_layout_matches_native_pieces_and_rng_boundaries
+
+check "normal mineshaft height adjustment also moves room entrances" \
+  src/mineshaft_layout.rs '*entrance = translated(*entrance, 0, vertical_shift, 0);' \
+  '*entrance = translated(*entrance, 0, 0, 0);' \
+  mineshaft_layout::tests::normal_layout_matches_native_pieces_and_rng_boundaries
+
+check "large feature seeding uses the requested start chunk x" \
+  src/generation_math.rs 'i64::from(x).wrapping_mul(a)' 'i64::from(0).wrapping_mul(a)' \
+  mineshaft_layout::tests::normal_layout_matches_native_pieces_and_rng_boundaries
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

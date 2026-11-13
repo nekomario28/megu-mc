@@ -24,7 +24,8 @@
       "structure_template"
     ],
     [
-      "tree"
+      "tree",
+      "mineshaft_layout"
     ],
     [
       "generation_providers"
@@ -60,6 +61,7 @@
   "explicit_generation_modules": [
     "feature",
     "tree",
+    "mineshaft_layout",
     "generation_providers",
     "generation_context",
     "worldgen",
@@ -254,6 +256,10 @@
     ],
     [
       "main",
+      "mineshaft_layout"
+    ],
+    [
+      "main",
       "nbt"
     ],
     [
@@ -311,6 +317,10 @@
     [
       "main",
       "worldgen"
+    ],
+    [
+      "mineshaft_layout",
+      "generation_math"
     ],
     [
       "structure_placement",

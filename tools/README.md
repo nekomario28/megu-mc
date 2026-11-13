@@ -9,6 +9,7 @@
 |---|---|
 | `vanilla_src.sh <official class...>` | 固定1.21.1 jar を**ソースに逆コンパイル**して読む（`javap` はオフセット引用、こちらはアルゴリズムの移植）。公式mappingsで難読名に引き、入れ子jarから本体と入れ子クラスを出す。jar と mappings の SHA-1 を検査し、**repo 内への出力は拒否**する（Mojang のコードは読解用で、再配布しない）。既定の出力は `~/.cache/mc-spine-work/mc121/src` |
 | `structure-oracle/NativeHarness.java` + `FeatureOracle.java` + `feature_oracles.py [<type> --cases <json> [--write] [--cells <path>]]` | 固定 jar の**実 feature クラス**を scripted level で実行し、`scene/oy/seed/wrote/cells/digest/rngProbe` を記録する。cases はデータ（origin 相対の ply・seeds・box）、`class` は registry と一致を assert。port 側は同じ cases を `generic_feature_cases` が読む。失敗時は `GENERIC_CASE_DUMP=<path>` で port セルを出して cell 単位で diff する。契約と**測った限界**（署名済み jar で `ChunkGenerator` を継承できない／`getLevel()` は供給不能／build height 外の scene は不可）は [native oracle の記録](../evidence/gameplay/feature-parity/native-oracle.md) |
+| `mineshaft_layout_oracle.py [--jar <server.jar>] [--check <fixture> \| --output <fixture>]` | 固定jarの実normal-mineshaft layoutと、同じnative呼出を境界ごとに分けた実行を照合する。既定はpiece列・非消費RNG状態の数値fixtureを検査し、書換えは明示時だけ。start採否・biome・Mesa・block配置は含まない。[検証境界](../evidence/gameplay/feature-parity/mineshaft-layout-20261113.md) |
 | `bytecode_probe.sh <class> [pattern]` | 固定した1.21.1 jar から1クラスの `javap -p -c` を出す。公式mappingsで難読名に引き、入れ子jarから取り出す。証拠ページの javap 引用はこれで再現する |
 | `feature_cases/gen.py <type> [--support <block>] [--force]` | 型の cases skeleton を pack と `tests/data/feature_classes_1211.tsv` から生成する（難読クラス名と config は機械的、scene は定型7種）。**型固有の判別 scene は手で足す**（そこが型の本体）。生成物は `tests/feature_cases/<type>.json` |
 | `feature_type_coverage.py [--unimplemented] [--overworld]` | pack の configured-feature 型 × `p_cf` の腕 × placed feature の入れ子 × それを参照する biome を静的に数える。**到達されていない型を先に実装しない**ための計測 |
@@ -27,7 +28,7 @@
 | `aquifer_oracle.py` | 固定1.21.1 jar の datapack を `RegistryDataLoader` に読ませ、実 `NoiseChunk`／`Aquifer` の preliminary surface と chunk 内の流体状態を照合する。既定は入力・結果・出自の全件一致、意図した記録だけ `--output`。[範囲](../evidence/foundation/aquifer/README.md)を参照 |
 | `biome_spawn_oracle.py` | 固定1.21.1の実 `Biome.getMobSettings()` からspawners全カテゴリ・weight・spawn_costs・creature probabilityを取得し、全biomeを照合する。意図した記録だけ `--output`。[範囲](../evidence/foundation/biome-spawners/README.md)を参照 |
 | `biome_tie_oracle.py` | 固定1.21.1の実 `Climate` 木で、コミット済みのtie-heavy biome点を全件再検索する。thread-localのprevious結果を毎回消してtie順を固定。[範囲](../evidence/foundation/upstream-prs/README.md)を参照 |
-| `nextint_oracle.py` | 固定1.21.1の実 `Xoroshiro128PlusPlusRandom`／`WorldgenRandom`／`LegacyRandomSource` で、コミット済み `nextInt(bound)` 列を全行再計算する。jar認証後に実行し、参照値は変更しない。[範囲](../evidence/foundation/pr-integration/README.md)を参照 |
+| `nextint_oracle.py` | 固定1.21.1の実 `Xoroshiro128PlusPlusRandom`／`WorldgenRandom`／`LegacyRandomSource` で、コミット済み `nextInt(bound)` 列を全行再計算する。jar認証後に実行し、参照値は変更しない。[範囲](../evidence/foundation/upstream-prs/README.md)を参照 |
 | `weird_sampler_oracle.py` | 固定1.21.1の実mapper・NormalNoise・WeirdScaledSamplerを呼び、入力／raw f64結果／出自を全件照合する。world全体の検証とは分ける。[範囲と再現](../evidence/foundation/weird-sampler/README.md)を参照 |
 | `vanilla_pack_from_jar.sh [dir]` | 同じ固定jarの worldgen JSON・block tag・built-in biome tree をまとめて更新する（JDK必須） |
 | `fixture_base.sh [dir]` | 固定具の基点（`CARVER_FIXTURE_BASE`、既定 `/tmp/carverfresh`）を組む。jar を sha1 で固定し、worldgen に効く設定をここで明示する。基点が無いと固定具は空振りする |

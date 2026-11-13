@@ -25048,6 +25048,7 @@ mod persistence_tests;
 mod primitives_tests;
 #[cfg(test)]
 mod registry_tests;
+mod mineshaft_layout;
 mod scheduled_ticks;
 mod structure_placement;
 mod structure_template;

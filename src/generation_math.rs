@@ -489,6 +489,22 @@ impl Lcg {
             seed: (seed ^ 0x5_DEEC_E66D) & 0xFFFF_FFFF_FFFF,
         }
     }
+    /// WorldgenRandom.setLargeFeatureSeed: raw nextLong values, not the odd
+    /// multipliers of setDecorationSeed. Shared by carvers and structure layout.
+    pub(crate) fn for_large_feature(seed: u64, x: i32, z: i32) -> Self {
+        let mut source = Self::new(seed);
+        let a = source.next_i64();
+        let b = source.next_i64();
+        Self::new(
+            (i64::from(x).wrapping_mul(a) ^ i64::from(z).wrapping_mul(b) ^ seed as i64) as u64,
+        )
+    }
+
+    /// Non-consuming position; unlike a nextLong sentinel this is safe mid-stream.
+    pub(crate) fn state48(&self) -> u64 {
+        self.seed
+    }
+
     fn nx(&mut self, bits: u32) -> u64 {
         self.seed = self.seed.wrapping_mul(0x5_DEEC_E66D).wrapping_add(11) & 0xFFFF_FFFF_FFFF;
         let v = self.seed >> (48 - bits);
