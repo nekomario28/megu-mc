@@ -62,14 +62,16 @@ $$S_{\text{final}} = T_n \circ T_{n-1} \circ \dots \circ T_2 \circ T_1(\text{inp
   Comparing $S_{\text{final}}$ of your implementation against $T_2(\text{input})$ of the reference (or comparing a post-runtime-tick state against a pre-tick state) mixes multiple stage deltas and creates thousands of phantom diffs.
 - **Stage Bisection ($O(\log N)$ Localization):**
   Expose stage boundaries in your triage tool (e.g., `--mode stage1 | stage2 | full` or targeted feature toggles). Locate the **earliest stage $k$** where $T_k(\text{input}) \neq T_k^{\text{ref}}(\text{input})$, and ignore all downstream diffs in $T_{>k}$ until $T_k$ is exact.
+- **Teacher Forcing (Reference State Injection):**
+  To test or attribute a downstream stage $T_k$ before upstream stage $T_{k-1}$ is 100% converged, intervene by injecting the captured reference state $S_{k-1}^{\text{ref}}$ directly as the input to $T_k$ ($\text{do}(S_{k-1} = S_{k-1}^{\text{ref}})$). This prevents upstream drift from masquerading as downstream writer bugs during triage. Label this as an intervention: it proves conditional stage behavior, not production parity. Promotion must derive upstream state from the original inputs and reach the real dispatcher without capture injection.
 
 ---
 
 ### 4. Theory of Constraints (Goldratt's TOC) & Feedback Hierarchy
 
-> **Law 4:** *System throughput is strictly bounded by the slowest feedback loop used in daily iteration. Never escalate a question to Loop $L_{k+1}$ if Loop $L_k$ can answer it.*
+> **Law 4:** *System throughput is strictly bounded by the slowest feedback loop used in daily iteration. Never escalate a question to a broader scope tier if a narrower, faster loop can answer it.*
 
-Organize project tooling into strict latency tiers:
+Organize project tooling into strict verification-scope and latency tiers:
 
 | Tier | Loop Type | Target Latency | Allowed Usage |
 | :--- | :--- | :---: | :--- |
@@ -80,8 +82,9 @@ Organize project tooling into strict latency tiers:
 | **$L_4$** | Full Regression & Mutation Gate (`verify.sh`) | **$1 \sim 30\text{ m}$** | Batch promotion at slice/milestone boundaries only |
 | **$L_5$** | External Reference / Live Environment Capture | **$2 \sim 10\text{ m}$** | Capturing new reference fixtures only when existing captures lack the target stage |
 
-- **Resource Exclusivity (WIP Control):**
-  Never run competing compilation jobs against the same build directory (`target/`) while running tests that spawn `current_exe()` subprocesses; unlinking an active test binary mid-run manufactures phantom failures.
+- **Resource Exclusivity & Cache Isolation (WIP Control):**
+  1. Never run competing compilation jobs against the same build directory (`target/`) while running tests that spawn `current_exe()` subprocesses; unlinking an active test binary mid-run manufactures phantom failures.
+  2. Isolate $L_2$ source mutations in a disposable source snapshot **and** a separate build directory, preserving the primary $L_1$ source and cache. A separate `--target-dir` alone does not isolate shared source edits. Restore bytes and rebuild the positive control; never restore an old `mtime` to suppress rebuilding, because Cargo can then reuse the mutated executable (the observed failure guarded by `tools/mutation_check.sh`).
 
 ---
 
@@ -89,8 +92,8 @@ Organize project tooling into strict latency tiers:
 
 > **Law 5:** *Measure remaining work by the number of independent causal owners (writers), never by raw diff count or item count.*
 
-- **Symptom Inflation:** A single off-by-one RNG consumption or a single missing structure piece can flip 50 to 5,000 output cells. Counting cells creates the illusion of massive remaining work; grouping by **causal writer** reveals that 5,000 cell diffs are often just 2 or 3 root bugs.
-- **Algorithmic Archetype Compression:** When implementing $M$ specifications (e.g., 34 world structures or 50 protocol packets), group them by **shared execution engine** (e.g., Single-Template, Piece-Assembly, Jigsaw) rather than implementing 34 isolated vertical silos.
+- **Symptom Inflation & RNG Stream Auditing:** A single off-by-one RNG consumption or a single missing structure piece can flip $50$ to $5{,}000$ output cells. Counting cells creates the illusion of massive remaining work; grouping by **causal writer** reveals that $5{,}000$ cell diffs are often just $2$ or $3$ root bugs. Where outputs depend on stateful streams (PRNGs, buffers), instrument and assert **stream step counts and seed states** at writer boundaries so a $1$-call RNG drift is caught at the exact call site rather than decoded from thousands of mutated cells.
+- **Algorithmic Archetype Compression:** When implementing $M$ specifications (e.g., $34$ world structures or $50$ protocol packets), group them by **shared execution engine** (e.g., Single-Template, Piece-Assembly, Jigsaw) rather than implementing $34$ isolated vertical silos.
 
 ---
 
@@ -121,7 +124,7 @@ flowchart LR
 3. **Single-Owner Fix & Pre-Change Replay ($L_1$):**
    Never add a post-processing workaround ("second owner") to patch a bad upstream state. Fix the single canonical owner, write a micro-oracle test, verify it fails on the pre-change code, and verify it passes in $\approx 1\text{ s}$.
 4. **Focused Mutation Proof ($L_2$):**
-   Run a targeted compiling mutant against the new test (`5-10s`) to prove the test cannot pass when the logic is broken.
+   Run a targeted compiling mutant against the new test ($5 \sim 10\text{ s}$) to prove the test cannot pass when the logic is broken.
 5. **Batch Gate Promotion ($L_4$):**
    Accumulate logically related fixes into a clean slice and run the full verification suite once per slice boundary.
 
@@ -129,8 +132,10 @@ flowchart LR
 
 ## Part III. Checklist for Adopting This Methodology in Any Project
 
-- [ ] **Build a 1-Command Causal Triage Tool ($L_3$):** Given a reference artifact and a candidate binary, output a grouped attribution of diffs by causal subsystem in $< 5\text{ s}$, failing closed (`exit 2`) on mismatched inputs or incomplete reference states.
+- [ ] **Build a 1-Command Causal Triage Tool ($L_3$):** Given a reference artifact and a candidate binary, output a grouped attribution of diffs by causal subsystem in $< 5\text{ s}$ (supporting stage bisection and reference state injection), failing closed (`exit 2`) on mismatched inputs or incomplete reference states.
+- [ ] **Instrument Stateful Streams (PRNG / Cursors):** Expose deterministic step-count or state-hash checkpoints at writer boundaries to catch $1$-off stream shifts before they cascade into spatial/structural diffs.
 - [ ] **Cache Heavy Test Initialization ($L_1$):** Ensure unit tests reuse immutable parsed registries/tables across cases so single-test iteration stays around $1\text{ s}$.
-- [ ] **Enforce Compiling Mutation Gates ($L_2$):** Pair every behavioral test with a targeted mutation check that verifies `normal (pass) -> mutated (fail) -> restored (pass)`.
+- [ ] **Enforce Compiling Mutation Gates with Isolated Cache ($L_2$):** Pair every behavioral test with a targeted mutation check that verifies `normal (pass) -> mutated (fail) -> restored (pass)` without invalidating the primary $L_1$ incremental build cache.
 - [ ] **Audit Complete DAG Reachability ($L_0$):** Maintain a fast static script that verifies every declared config/opcode/node in the specification is wired to a real implementation with zero silent fallbacks.
+- [ ] **Check New Artifacts at Publication:** An unstaged `git diff --check` excludes untracked files. Stage only explicit owned paths, then require `git diff --cached --check` before committing; fix generated-format defects in the producer and recheck its reference, rather than hand-trimming the fixture.
 - [ ] **Separate Foundation Before Expansion:** Finish shared lifecycle hooks (state finalization, serialization, ordering contracts) before scaling horizontally across dozens of content types.

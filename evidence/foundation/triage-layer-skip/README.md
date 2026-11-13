@@ -51,8 +51,9 @@ builds and generation; no full-triage, grid or M3 speedup is claimed.
 layers, with and without a B-only air-kind change. It permits bulk reads rather
 than enforcing a particular timer or caching configuration. The pre-change module
 failed both subtests; the restored module passed. A second test rejects truncated
-A/B/port arrays. The suite was already in `tests/verify.sh`; this change also
-wires triage and port-triage tests into the existing CI workflow before builds.
+A/B/port arrays. The suites remain in `tests/verify.sh`. The proposed triage and
+port-triage workflow step was excluded before publication because the token lacked
+`workflow` scope; that additional hosted-CI wiring did not ship.
 
 Nine triage tests and the port-triage, region-NBT, carver-diff and saved-tick suites
 passed. Manual diff review covered B-only differences, length validation, exact
