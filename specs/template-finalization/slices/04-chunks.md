@@ -220,24 +220,18 @@ The previous claim of “four named causes” is therefore withdrawn, while the 
 earlier commits, original captures and expected states are preserved. No implementation
 is changed merely to fit that diagnosis.
 
-## Next bounded measurement
+## Next bounded measurement — 2026-11-13 実施結果と残件
 
-Use the [investigation workflow](../../worldgen-parity/investigation-workflow.md).
-First make the seed-4242 diagnostic reproducible: record both reference hashes, port
-source/binary, settings, absolute coordinate bounds, FULL status, actual stage/clock,
-population inputs and all unknown/skipped fields. Reuse retained worlds before starting
-another server; do not promote this comparison to acceptance while those inputs are unresolved.
+[調査手順](../../worldgen-parity/investigation-workflow.md) に従い、seed 4242 chunk `(3,-2)` の 82 セル差分（全空気種別では 101 セル）を分解・検証した（詳細: [seed-4242 診断記録](../../../evidence/gameplay/feature-parity/seed-4242-chunk-3-m2-20261113.md)）。
 
-Then inspect the **18 snowy cells**, including each block above/below, raw quart biome,
-block-position blended biome, actual native read positions, temperature query, and the
-before/after state at each relevant writer. Distinguish surface evaluation, snow feature
-placement and runtime updates. Do not assume the grass and snow-space biome are identical.
+1. **18 セルの `snowy` 残差は解消 (`0` 残差):**
+   旧 `Gen::apply_snowy` による surface 事後書き換えは、上に `short_grass`/`poppy`/`dandelion` がある `grass_block` を誤って `snowy=true` にしていた（18/18 例すべて両 native run で同じ植物が直上）。これを撤去し、[FreezeTopLayerOracle.java](../../../tools/structure-oracle/FreezeTopLayerOracle.java)（`edn` 29 場面）に一致する `Cf::FreezeTop` + `snow_can_survive`（`MotionBlocking` heightmap、温度・光・`snow_layer_can_survive_on`）へ一本化した結果、`238/238` の `snowy=true` を保ったまま `snowy` 差分は **0** になった（コンパイルする 4 件の mutant を含む）。
+2. **残り `30 diorite→granite` と native A/B 間 `23 andesite→diorite` は population 順で説明済み:**
+   `FEATURE_CELL_TRACE` と `MC_SPINE_POP_ORDER` により、`(3,-1)`・`(2,-3)` と `(3,-2)` の生成順入れ替えだけで A/B ともに ore 差分は **0** になることを確認。
+3. **残る `34` 非air セル（全空気種別では `53` セル）は未実装 `minecraft:mineshaft`:**
+   `c32['structures']['References']['minecraft:mineshaft']` の開始 chunk `(4,3)` に属する `child 85 mscorridor` / `child 86 msstairs` / `child 185 mscorridor` が交差領域（`51/53` は piece BB 内の `cave_air` 掘削、残り `2` は `child 185` の `y=21` 支持 `oak_planks`）と一致する。
 
-For the other three groups, find the first divergent stage independently, using a narrow
-native trace only if existing captures cannot answer it. A fix needs a native counterexample,
-proof the production path executed, a pre-change failure, a compiling mutant and restored
-normal controls before a settled-batch full gate. Heightmaps, block entities, pending ticks,
-runtime, packet/light and positive Fossil/structure acceptance remain separate open gates.
+Seed 4242 は `minecraft:mineshaft`（P2-1）と生成順固定が未完了のため引き続き探索資料とし、committed acceptance fixture にはしない。Heightmaps, block entities, pending ticks, runtime, packet/light and positive Fossil/structure acceptance remain separate open gates.
 
 ## Local artifact locations
 

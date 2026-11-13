@@ -45,6 +45,7 @@ ORACLES = {
     'bonus_chest': 'tests/data/bonus_chest_1211.tsv',
     'block_column_up': 'tests/data/block_column_up_1211.tsv',
     'block_column_down': 'tests/data/block_column_down_1211.tsv',
+    'freeze_top_layer': 'tests/data/freeze_top_layer_1211.tsv',
 }
 
 

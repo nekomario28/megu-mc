@@ -1259,9 +1259,25 @@ check "the backoff guard holds a visit past the queue cap" \
     let now = TICK_IDX.load(Ordering::Relaxed) + 10_000;' \
   a_backoff_past_the_queue_cap_waits_for_its_real_deadline
 
-check "snowy grass follows the biome temperature" \
-  src/worldgen.rs '            if !(weather.temperature < 0.15) {' '            if true {' \
-  snowy_grass_follows_the_biome_temperature
+check "freeze_top_layer reads MOTION_BLOCKING rather than WORLD_SURFACE" \
+  src/feature.rs '                    let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);' '                    let top = ctx.heightmap(HeightmapKind::WorldSurface, x, z);' \
+  freeze_top_layer_matches_native_oracle
+
+check "freeze_top_layer temperature guard gates snow placement" \
+  src/feature.rs '                        && ctx.cold_enough_to_snow(biome, x, top, z)' '                        && true' \
+  freeze_top_layer_matches_native_oracle
+
+check "freeze_top_layer sets snowy=true on the dirt below placed snow" \
+  src/feature.rs '                                ctx.set(x, below_y, z, reg.with_prop(below, "snowy", "true"));' '                                let _ = below_y;' \
+  freeze_top_layer_matches_native_oracle
+
+check "freeze_top_layer refuses snow on snow_layer_cannot_survive_on blocks" \
+  src/feature.rs '    if reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on") {
+        return false;
+    }' '    if reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on") {
+        return true;
+    }' \
+  freeze_top_layer_matches_native_oracle
 
 check "the canonical state keeps its properties" \
   src/block_registry.rs '            format!("{}[{}]", name, parts.join(","))' '            name' \

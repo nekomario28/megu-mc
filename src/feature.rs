@@ -5975,6 +5975,18 @@ fn grow_chorus(
     }
 }
 
+fn snow_can_survive(reg: &BReg, below: u32) -> bool {
+    if reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on") {
+        return false;
+    }
+    if reg.in_tag(below, "minecraft:snow_layer_can_survive_on") {
+        return true;
+    }
+    reg.supports_multiface(below, 0)
+        || (reg.name_of(below) == "minecraft:snow"
+            && reg.get_prop(below, "layers").as_deref() == Some("8"))
+}
+
 fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     match cf {
         Cf::Unknown(_) => {}
@@ -6968,32 +6980,49 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         }
         Cf::FreezeTop => {
             let Some(reg) = breg() else { return };
-            let bx = pos.0 & !15;
-            let bz = pos.2 & !15;
             let ice = reg.state_of("minecraft:ice", None);
             let snow = reg.state_of("minecraft:snow", None);
+            let min_y = ctx.g.min_y;
+            let max_y = min_y + ctx.g.height;
             for lx in 0..16i32 {
                 for lz in 0..16i32 {
-                    let (x, z) = (bx + lx, bz + lz);
-                    let top = ctx.hm_ws(x, z);
-                    if top <= ctx.g.min_y + 1 {
-                        continue;
-                    }
-                    let Some(b) = ctx.biome(x, top, z) else {
+                    let (x, z) = (pos.0 + lx, pos.2 + lz);
+                    let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);
+                    let Some(biome) = ctx.biome_leaf(x, top, z) else {
                         continue;
                     };
-                    let temp = fr.btemp.get(&b).copied().unwrap_or(0.8);
-                    if temp >= 0.15 {
-                        continue;
-                    }
-                    let cur = ctx.get(x, top - 1, z);
-                    if is_water_st(reg, cur) {
-                        ctx.set(x, top - 1, z, ice);
-                    } else if reg.is_solid(cur)
-                        && ctx.is_air(x, top, z)
-                        && top < ctx.g.min_y + ctx.g.height
+                    let below_y = top - 1;
+                    if below_y >= min_y
+                        && below_y < max_y
+                        && ctx.cold_enough_to_snow(biome, x, below_y, z)
+                        && ctx.block_light(x, below_y, z) < 10
                     {
-                        ctx.set(x, top, z, snow);
+                        let below = ctx.get(x, below_y, z);
+                        if reg.name_of(below) == "minecraft:water"
+                            && reg.fluid_name(below) == "minecraft:water"
+                        {
+                            ctx.set(x, below_y, z, ice);
+                        }
+                    }
+                    if top >= min_y
+                        && top < max_y
+                        && ctx.cold_enough_to_snow(biome, x, top, z)
+                        && ctx.block_light(x, top, z) < 10
+                    {
+                        let at = ctx.get(x, top, z);
+                        let below = if below_y >= min_y && below_y < max_y {
+                            ctx.get(x, below_y, z)
+                        } else {
+                            0
+                        };
+                        if (reg.is_air(at) || reg.name_of(at) == "minecraft:snow")
+                            && snow_can_survive(reg, below)
+                        {
+                            ctx.set(x, top, z, snow);
+                            if reg.has_prop(reg.name_of(below), "snowy") {
+                                ctx.set(x, below_y, z, reg.with_prop(below, "snowy", "true"));
+                            }
+                        }
                     }
                 }
             }

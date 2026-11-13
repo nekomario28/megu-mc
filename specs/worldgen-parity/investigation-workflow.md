@@ -38,10 +38,7 @@ BiomeManager相当の問い合わせ。保存されたquart paletteを、その�
 比較しない。呼び出し位置（下の草か上の空間か）、高さ、lookup方法、温度の参照、
 判定stageとwriterを両側で記録する。
 
-現在のsnowy関連は、surface列を変える `Gen::apply_snowy` と、
-[feature owner](../../src/feature.rs) の `Cf::FreezeTop` が別にある。
-後者は雪/氷を配置する。本当にnativeのどの操作と対応するかは両bodyと実行で確かめる。
-port内の温度テストの緑だけで、nativeのsnowy規則やbiome自体の正しさを認定しない。
+現在のsnowy配置は、[feature owner](../../src/feature.rs) の `Cf::FreezeTop`（`snow_can_survive` と `HeightmapKind::MotionBlocking`）が担当する。surface列を後から書き換える旧 `Gen::apply_snowy` は植物が上にある 18 セルを誤って `snowy=true` にしていたため撤去した。port内の独自温度テストだけで、nativeのsnowy規則やbiome自体の正しさを認定しない。
 
 ## 3. 仮説を実装する前の反証チェック
 

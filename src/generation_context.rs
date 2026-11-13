@@ -69,6 +69,12 @@ pub(crate) struct FC<'a> {
     #[cfg(test)]
     pub(crate) test_no_terrain: bool,
     #[cfg(test)]
+    pub(crate) test_default_air: bool,
+    #[cfg(test)]
+    pub(crate) test_biome_leaf: Option<u16>,
+    #[cfg(test)]
+    pub(crate) test_block_light: u8,
+    #[cfg(test)]
     pub(crate) test_writes: Option<Vec<((i32, i32, i32), u32)>>,
 }
 impl<'a> FC<'a> {
@@ -83,6 +89,12 @@ impl<'a> FC<'a> {
             prof: crate::trace_env::env_flag!("FEAT_PROFILE"),
             #[cfg(test)]
             test_no_terrain: false,
+            #[cfg(test)]
+            test_default_air: false,
+            #[cfg(test)]
+            test_biome_leaf: None,
+            #[cfg(test)]
+            test_block_light: 0,
             #[cfg(test)]
             test_writes: None,
         }
@@ -99,6 +111,10 @@ impl<'a> FC<'a> {
         // place an ore into the reference cave air.
         if let Some(st) = self.g.feature_override(x, y, z) {
             return st;
+        }
+        #[cfg(test)]
+        if self.test_default_air {
+            return 0;
         }
         #[cfg(test)]
         assert!(
@@ -235,15 +251,35 @@ impl<'a> FC<'a> {
         assert!(kind.is_wg());
         self.hmwg.insert((x, z, kind), y);
     }
+    #[cfg(test)]
+    pub(crate) fn test_biome(&mut self, name: &str) {
+        let leaf = self
+            .g
+            .biome_leaf_of_name(name)
+            .unwrap_or_else(|| panic!("unknown biome {name}"));
+        self.test_biome_leaf = Some(leaf);
+    }
     fn heightmap_uncached(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
-        let ws = matches!(
+        #[cfg(test)]
+        if self.test_default_air {
+            let start = self
+                .rc
+                .keys()
+                .chain(self.wr.keys())
+                .filter(|&&(kx, _, kz)| kx == x && kz == z)
+                .map(|&(_, ky, _)| ky)
+                .max()
+                .unwrap_or(self.g.min_y - 1);
+            return self.heightmap_above(x, z, start, kind);
+        }
+        let oc = matches!(
             kind,
-            HeightmapKind::WorldSurface | HeightmapKind::WorldSurfaceWg
+            HeightmapKind::OceanFloor | HeightmapKind::OceanFloorWg
         );
-        let base = if ws {
-            self.g.top_ws(x, z)
-        } else {
+        let base = if oc {
             self.g.top_oc(x, z)
+        } else {
+            self.g.top_ws(x, z)
         };
         let mut start = base.max(self.g.sea + 1);
         if !kind.is_wg() {
@@ -273,10 +309,37 @@ impl<'a> FC<'a> {
     /// chunk's container (`biome_name_at`), and the two disagree at boundaries:
     /// a filter that checks the container rejects or accepts the wrong cells.
     pub(crate) fn biome(&mut self, x: i32, y: i32, z: i32) -> Option<String> {
+        #[cfg(test)]
+        if let Some(leaf) = self.test_biome_leaf {
+            return self.g.biome_name_of_leaf(leaf);
+        }
         match self.g.biome_blended(x, y, z) {
             Some((_, leaf)) => self.g.biome_name_of_leaf(leaf),
             None => self.g.biome_name_at(x, y, z),
         }
+    }
+    pub(crate) fn biome_leaf(&mut self, x: i32, y: i32, z: i32) -> Option<u16> {
+        #[cfg(test)]
+        if let Some(leaf) = self.test_biome_leaf {
+            return Some(leaf);
+        }
+        self.g
+            .biome_blended(x, y, z)
+            .map(|(_, leaf)| leaf)
+            .or_else(|| {
+                self.g
+                    .biome_quart(x >> 2, y >> 2, z >> 2, None)
+                    .map(|(_, leaf)| leaf)
+            })
+    }
+    pub(crate) fn cold_enough_to_snow(&self, leaf: u16, x: i32, y: i32, z: i32) -> bool {
+        self.g.biome_cold_at_leaf(leaf, x, y, z)
+    }
+    pub(crate) fn block_light(&self, _x: i32, _y: i32, _z: i32) -> u8 {
+        #[cfg(test)]
+        return self.test_block_light;
+        #[cfg(not(test))]
+        0
     }
     pub(crate) fn out_of_h(&self, y: i32) -> bool {
         y < self.g.min_y || y >= self.g.min_y + self.g.height

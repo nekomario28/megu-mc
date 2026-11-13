@@ -4796,3 +4796,141 @@ fn large_dripstone_sways_when_both_spikes_clear_the_wind_gate() {
     );
     assert_eq!(with_wind.len(), 126, "golden cell count");
 }
+
+#[test]
+fn freeze_top_layer_matches_native_oracle() {
+    let reg = breg().expect("registry");
+    let grass = reg.state_of("minecraft:grass_block", None);
+    let grass_snowy = reg.with_prop(grass, "snowy", "true");
+    let podzol = reg.state_of("minecraft:podzol", None);
+    let mycelium = reg.state_of("minecraft:mycelium", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let water0 = reg.state_of("minecraft:water", None);
+    let water1 = reg.with_prop(water0, "level", "1");
+    let slab_bottom = reg.state_of("minecraft:oak_slab", None);
+    let slab_top = reg.with_prop(slab_bottom, "type", "top");
+    let slab_waterlogged = reg.with_prop(slab_bottom, "waterlogged", "true");
+    let snow = reg.state_of("minecraft:snow", None);
+    let snow8 = reg.with_prop(snow, "layers", "8");
+
+    let fixture = include_str!("../tests/data/freeze_top_layer_1211.tsv");
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut tested = 0usize;
+    for line in fixture.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 4, "bad row: {line}");
+        let id = cols[0];
+        let origin_parts: Vec<i32> = cols[1].split(',').map(|v| v.parse().unwrap()).collect();
+        let origin = (origin_parts[0], origin_parts[1], origin_parts[2]);
+
+        let mut ctx = context(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        ctx.test_writes = Some(Vec::new());
+        ctx.test_biome("minecraft:snowy_plains");
+
+        match id {
+            "cold_grass_air" => ctx.test_base_cell((0, 64, 0), grass),
+            "cold_podzol_air" => ctx.test_base_cell((0, 64, 0), podzol),
+            "cold_mycelium_air" => ctx.test_base_cell((0, 64, 0), mycelium),
+            "cold_stone_air" => ctx.test_base_cell((0, 64, 0), stone),
+            "cold_grass_short_grass" => {
+                ctx.test_base_cell((0, 64, 0), grass);
+                ctx.test_base_cell((0, 65, 0), reg.state_of("minecraft:short_grass", None));
+            }
+            "cold_grass_poppy" => {
+                ctx.test_base_cell((0, 64, 0), grass);
+                ctx.test_base_cell((0, 65, 0), reg.state_of("minecraft:poppy", None));
+            }
+            "cold_grass_dandelion" => {
+                ctx.test_base_cell((0, 64, 0), grass);
+                ctx.test_base_cell((0, 65, 0), reg.state_of("minecraft:dandelion", None));
+            }
+            "cold_snowy_grass_poppy" => {
+                ctx.test_base_cell((0, 64, 0), grass_snowy);
+                ctx.test_base_cell((0, 65, 0), reg.state_of("minecraft:poppy", None));
+            }
+            "cold_grass_existing_snow" => {
+                ctx.test_base_cell((0, 64, 0), grass);
+                ctx.test_base_cell((0, 65, 0), snow);
+            }
+            "cold_water_source" => ctx.test_base_cell((0, 63, 0), water0),
+            "cold_flowing_water" => ctx.test_base_cell((0, 63, 0), water1),
+            "cold_waterlogged_slab" => ctx.test_base_cell((0, 63, 0), slab_waterlogged),
+            "cold_ice" => ctx.test_base_cell((0, 64, 0), reg.state_of("minecraft:ice", None)),
+            "cold_packed_ice" => {
+                ctx.test_base_cell((0, 64, 0), reg.state_of("minecraft:packed_ice", None));
+            }
+            "cold_soul_sand" => {
+                ctx.test_base_cell((0, 64, 0), reg.state_of("minecraft:soul_sand", None));
+            }
+            "cold_mud" => ctx.test_base_cell((0, 64, 0), reg.state_of("minecraft:mud", None)),
+            "cold_oak_leaves" => {
+                ctx.test_base_cell((0, 64, 0), reg.state_of("minecraft:oak_leaves", None));
+            }
+            "cold_slab_bottom" => ctx.test_base_cell((0, 64, 0), slab_bottom),
+            "cold_slab_top" => ctx.test_base_cell((0, 64, 0), slab_top),
+            "cold_snow8" => ctx.test_base_cell((0, 64, 0), snow8),
+            "cold_leaves_above_grass" => {
+                ctx.test_base_cell((0, 64, 0), grass);
+                ctx.test_base_cell((0, 70, 0), reg.state_of("minecraft:oak_leaves", None));
+            }
+            "cold_light10_grass" => {
+                ctx.test_base_cell((0, 64, 0), grass);
+                ctx.test_block_light = 10;
+            }
+            "cold_light10_water" => {
+                ctx.test_base_cell((0, 63, 0), water0);
+                ctx.test_block_light = 10;
+            }
+            "warm_plains" => {
+                ctx.test_biome("minecraft:plains");
+                ctx.test_base_cell((0, 64, 0), grass);
+                ctx.test_base_cell((1, 63, 0), water0);
+            }
+            "taiga_low_64" => {
+                ctx.test_biome("minecraft:taiga");
+                ctx.test_base_cell((0, 64, 0), grass);
+            }
+            "taiga_high_170" => {
+                ctx.test_biome("minecraft:taiga");
+                ctx.test_base_cell((0, 170, 0), grass);
+            }
+            "frozen_ocean_grid" => {
+                ctx.test_biome("minecraft:frozen_ocean");
+                for x in 0..16 {
+                    for z in 0..16 {
+                        ctx.test_base_cell((x, 63, z), water0);
+                    }
+                }
+            }
+            "build_ceiling_319" => ctx.test_base_cell((0, 319, 0), grass),
+            "chunk_3_m2_offset" => {
+                ctx.test_base_cell((50, 64, -31), grass);
+                ctx.test_base_cell((51, 64, -30), grass);
+                ctx.test_base_cell((51, 65, -30), reg.state_of("minecraft:short_grass", None));
+            }
+            other => panic!("unhandled freeze_top_layer oracle scene: {other}"),
+        }
+
+        let mut rng = Xor::seed_worldgen(0);
+        gen_cf(&Cf::FreezeTop, freg(), &mut ctx, &mut rng, origin);
+        let got: Vec<String> = ctx
+            .test_writes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|&((x, y, z), st)| format!("{x},{y},{z}={}", reg.canonical_state(st)))
+            .collect();
+        assert_eq!(
+            got.join(";"),
+            cols[3],
+            "native freeze_top_layer mismatch for scene {id}"
+        );
+        tested += 1;
+    }
+    assert_eq!(tested, 29);
+}
