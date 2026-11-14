@@ -210,6 +210,15 @@ enum Cf {
     /// at `dy = 0..2` over a 5x5 box (x from the dz offset, z from the dx offset),
     /// skipping cells that already hold the target *block*.
     EndPlatform,
+    /// `minecraft:end_spike` (`edo`, `SpikeFeature`), config `{crystal_invulnerable,
+    /// spikes, crystal_beam_target?}`. When `spikes` is empty, derives the 10-pillar
+    /// dragon ring from the level's world seed via `LegacyRandomSource` (`Lcg`)
+    /// masked with `0xFFFF`. Each spike whose center falls in the origin chunk places
+    /// an obsidian cylinder from `min_y` up to `height` (clearing to air above `height`
+    /// up to `height + 10` where `y > 65`), an optional 5x4x5 `iron_bars` cage with
+    /// explicit edge connections when `guarded`, consumes one crystal-yaw `next_f32()`
+    /// draw, and sets `bedrock` at `height` and default `fire` at `height + 1`.
+    EndSpike(EndSpikeCfg),
     Ore {
         size: i32,
         discard: f32,
@@ -353,6 +362,22 @@ pub(crate) struct MultifaceCfg {
     dirs: Vec<u8>,
     search: i32,
     spread: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndSpike {
+    pub center_x: i32,
+    pub center_z: i32,
+    pub radius: i32,
+    pub height: i32,
+    pub guarded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndSpikeCfg {
+    pub crystal_invulnerable: bool,
+    pub spikes: Vec<EndSpike>,
+    pub crystal_beam_target: Option<(i32, i32, i32)>,
 }
 
 fn name_list(j: &J, k: &str) -> Vec<String> {
@@ -1854,6 +1879,132 @@ fn gen_end_gateway(ctx: &mut FC, pos: (i32, i32, i32)) {
                     ctx.set(x, y, z, state);
                 }
             }
+        }
+    }
+}
+
+/// `SpikeFeature.SpikeCacheLoader.load(Long)` (`edo$b`) paired with `SpikeFeature.getSpikesForLevel`.
+/// Uses `LegacyRandomSource` (`Lcg`) seeded with the world seed, masks `nextLong()` with `0xFFFF`,
+/// and shuffles `[0..10]` using `Util.toShuffledList(..., RandomSource.create(key))`.
+fn end_spikes_for_seed(world_seed: u64) -> Vec<EndSpike> {
+    let mut seed_rng = Lcg::new(world_seed);
+    let key = (seed_rng.next_i64() as u64) & 0xFFFF;
+    let mut order = [0i32, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let mut shuf_rng = Lcg::new(key);
+    let mut i = order.len();
+    while i > 1 {
+        let j = shuf_rng.next_bound(i as i32) as usize;
+        order.swap(i - 1, j);
+        i -= 1;
+    }
+    let mut spikes = Vec::with_capacity(10);
+    for (idx, &l) in order.iter().enumerate() {
+        let angle = 2.0 * (-std::f64::consts::PI + (std::f64::consts::PI / 10.0) * (idx as f64));
+        let center_x = (42.0 * angle.cos()).floor() as i32;
+        let center_z = (42.0 * angle.sin()).floor() as i32;
+        let radius = 2 + l / 3;
+        let height = 76 + l * 3;
+        let guarded = l == 1 || l == 2;
+        spikes.push(EndSpike {
+            center_x,
+            center_z,
+            radius,
+            height,
+            guarded,
+        });
+    }
+    spikes
+}
+
+/// `SpikeFeature.placeSpike` (`edo.a(ddl, ayw, efc, edo$a)`).
+fn place_end_spike(ctx: &mut FC, rng: &mut Xor, spike: &EndSpike) {
+    let Some(reg) = breg() else { return };
+    let obsidian = reg.state_of("minecraft:obsidian", None);
+    let air = reg.state_of("minecraft:air", None);
+    let bedrock = reg.state_of("minecraft:bedrock", None);
+    // `BaseFireBlock.getState(level, crystalPos)`: bedrock below is not in `soul_fire_base_blocks`
+    // and the pillar top has no flammable neighbours, so native resolves default `minecraft:fire`.
+    let fire = reg.state_of("minecraft:fire", None);
+    let iron_bars_base = reg.state_of("minecraft:iron_bars", None);
+
+    let r = spike.radius;
+    let cx = spike.center_x;
+    let cz = spike.center_z;
+    let r2_plus_1 = i64::from(r) * i64::from(r) + 1;
+
+    for x in (cx - r)..=(cx + r) {
+        for y in ctx.g.min_y..=(spike.height + 10) {
+            for z in (cz - r)..=(cz + r) {
+                let dx = i64::from(x - cx);
+                let dz = i64::from(z - cz);
+                if dx * dx + dz * dz <= r2_plus_1 && y < spike.height {
+                    if !ctx.out_of_h(y) {
+                        ctx.set(x, y, z, obsidian);
+                    }
+                } else if y > 65 && !ctx.out_of_h(y) {
+                    ctx.set(x, y, z, air);
+                }
+            }
+        }
+    }
+
+    if spike.guarded {
+        for dx in -2i32..=2 {
+            for dz in -2i32..=2 {
+                for dy in 0i32..=3 {
+                    let is_x_edge = dx.abs() == 2;
+                    let is_z_edge = dz.abs() == 2;
+                    let is_top = dy == 3;
+                    if is_x_edge || is_z_edge || is_top {
+                        let connect_x = dx == -2 || dx == 2 || is_top;
+                        let connect_z = dz == -2 || dz == 2 || is_top;
+                        let mut st = iron_bars_base;
+                        if connect_x && dz != -2 {
+                            st = reg.with_prop(st, "north", "true");
+                        }
+                        if connect_x && dz != 2 {
+                            st = reg.with_prop(st, "south", "true");
+                        }
+                        if connect_z && dx != -2 {
+                            st = reg.with_prop(st, "west", "true");
+                        }
+                        if connect_z && dx != 2 {
+                            st = reg.with_prop(st, "east", "true");
+                        }
+                        let y = spike.height + dy;
+                        if !ctx.out_of_h(y) {
+                            ctx.set(cx + dx, y, cz + dz, st);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // `EndCrystal` entity creation consumes `random.nextFloat() * 360.0F` for `yRot`.
+    let _crystal_yaw = rng.next_f32() * 360.0;
+    if !ctx.out_of_h(spike.height) {
+        ctx.set(cx, spike.height, cz, bedrock);
+    }
+    if !ctx.out_of_h(spike.height + 1) {
+        ctx.set(cx, spike.height + 1, cz, fire);
+    }
+}
+
+/// `SpikeFeature.place` (`edo.a(ecg)`). See [`Cf::EndSpike`].
+fn gen_end_spike(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), cfg: &EndSpikeCfg) {
+    let derived;
+    let spikes = if cfg.spikes.is_empty() {
+        derived = end_spikes_for_seed(ctx.g.wseed());
+        derived.as_slice()
+    } else {
+        cfg.spikes.as_slice()
+    };
+    let origin_cx = pos.0 >> 4;
+    let origin_cz = pos.2 >> 4;
+    for spike in spikes {
+        if origin_cx == (spike.center_x >> 4) && origin_cz == (spike.center_z >> 4) {
+            place_end_spike(ctx, rng, spike);
         }
     }
 }
@@ -4818,6 +4969,35 @@ fn p_cf(j: &J) -> Option<Cf> {
         "void_start_platform" => Cf::VoidStartPlatform,
         "end_platform" => Cf::EndPlatform,
         "end_gateway" => Cf::EndGateway,
+        "end_spike" => {
+            let mut spikes = Vec::new();
+            for s in jarr(j, "spikes")? {
+                if !matches!(s, J::Obj(_)) {
+                    return None;
+                }
+                spikes.push(EndSpike {
+                    center_x: jint(s, "centerX", 0),
+                    center_z: jint(s, "centerZ", 0),
+                    radius: jint(s, "radius", 0),
+                    height: jint(s, "height", 0),
+                    guarded: jbool(s, "guarded", false),
+                });
+            }
+            let crystal_beam_target = match js(j, "crystal_beam_target") {
+                None => None,
+                Some(v) => {
+                    let [J::Num(x), J::Num(y), J::Num(z)] = v.as_arr()?.as_slice() else {
+                        return None;
+                    };
+                    Some((*x as i32, *y as i32, *z as i32))
+                }
+            };
+            Cf::EndSpike(EndSpikeCfg {
+                crystal_invulnerable: jbool(j, "crystal_invulnerable", false),
+                spikes,
+                crystal_beam_target,
+            })
+        }
         "huge_brown_mushroom" => Cf::HugeBrownMushroom {
             cap: p_bsp(js(j, "cap_provider")?)?,
             stem: p_bsp(js(j, "stem_provider")?)?,
@@ -6039,6 +6219,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
         Cf::EndPlatform => gen_end_platform(ctx, pos),
         Cf::EndGateway => gen_end_gateway(ctx, pos),
+        Cf::EndSpike(c) => gen_end_spike(ctx, rng, pos, c),
         Cf::HugeBrownMushroom { cap, stem, radius } => {
             gen_huge_mushroom(ctx, rng, pos, cap, stem, *radius, HugeMushroom::Brown)
         }

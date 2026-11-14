@@ -1287,6 +1287,30 @@ check "freeze_top_layer refuses snow on snow_layer_cannot_survive_on blocks" \
     }' \
   freeze_top_layer_matches_native_oracle
 
+check "end_spike seed cache masks nextLong with 0xFFFF" \
+  src/feature.rs '    let key = (seed_rng.next_i64() as u64) & 0xFFFF;' \
+  '    let key = seed_rng.next_i64() as u64;' \
+  end_spike_matches_native_oracle
+
+check "end_spike clears surrounding air only above y = 65" \
+  src/feature.rs '                } else if y > 65 && !ctx.out_of_h(y) {' \
+  '                } else if y >= 65 && !ctx.out_of_h(y) {' \
+  end_spike_matches_native_oracle
+
+check "end_spike sets iron_bars cage edge connections when guarded" \
+  src/feature.rs '                        if connect_x && dz != -2 {
+                            st = reg.with_prop(st, "north", "true");
+                        }' \
+  '                        if false && connect_x && dz != -2 {
+                            st = reg.with_prop(st, "north", "true");
+                        }' \
+  end_spike_matches_native_oracle
+
+check "end_spike consumes crystal yaw next_f32 draw" \
+  src/feature.rs '    let _crystal_yaw = rng.next_f32() * 360.0;' \
+  '    let _crystal_yaw = 0.0f32;' \
+  end_spike_matches_native_oracle
+
 check "the canonical state keeps its properties" \
   src/block_registry.rs '            format!("{}[{}]", name, parts.join(","))' '            name' \
   overworld_chunk_matches_native_capture_state_for_state

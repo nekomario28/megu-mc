@@ -472,6 +472,11 @@ public final class NativeHarness {
         // This does not reproduce a populated ServerLevel lighting environment.
         public boolean useUninitializedLightEngine;
         private Object nativeLightEngine;
+        /** Opt-in world seed (`WorldGenLevel.getSeed()`, `dds.C()`). */
+        public Long worldSeed;
+        /** Opt-in minimal `ServerLevel` (`aqu`) for `EntityType.create(level.getLevel())` and `addFreshEntity`. */
+        public Object entityServerLevel;
+        public final List<String> entities = new ArrayList<>();
         public final StateScene scene;
         public final int minY, height;
         private final Object heights;
@@ -590,6 +595,18 @@ public final class NativeHarness {
             }
             if (m.getName().equals("y_") && pt.length == 0
                     && m.getReturnType() == C("eot")) return lightEngine();
+            if (worldSeed != null && m.getName().equals("C") && pt.length == 0
+                    && m.getReturnType() == long.class) return worldSeed.longValue();
+            if (entityServerLevel != null) {
+                if (m.getName().equals("E") && pt.length == 0
+                        && m.getReturnType() == C("aqu")) return entityServerLevel;
+                if (m.getName().equals("b") && pt.length == 1
+                        && pt[0] == C("bsr") && m.getReturnType() == boolean.class) {
+                    int[] bp = xyz(C("bsr").getMethod("do").invoke(a[0]));
+                    entities.add(a[0].getClass().getName() + "@" + bp[0] + "," + bp[1] + "," + bp[2]);
+                    return true;
+                }
+            }
             if (m.getName().equals("G_") && pt.length == 0
                     && m.getReturnType() == long.class) return subTickCount++;
             if (m.getName().equals("A_") && pt.length == 0
@@ -722,6 +739,43 @@ public final class NativeHarness {
     /** A level whose scene resolves properties itself (see {@link StateScene}). */
     public static Level levelFromStates(StateScene scene) {
         return new Level(scene, MIN_Y, HEIGHT, null);
+    }
+
+    /** A level with explicit build height bounds (e.g. End `0, 128`). */
+    public static Level levelFromStates(StateScene scene, int minY, int height) {
+        return new Level(scene, minY, height, null);
+    }
+
+    /** Minimal `ServerLevel` (`aqu`) wired only to `MinecraftServer.j` (`WorldData.K()` -> `FeatureFlags.VANILLA_SET`). */
+    public static Object minimalEntityServerLevel() throws Exception {
+        bootstrap();
+        Field unsafeField = Class.forName("sun.misc.Unsafe").getDeclaredField("theUnsafe");
+        unsafeField.setAccessible(true);
+        Object unsafe = unsafeField.get(null);
+        Method alloc = unsafe.getClass().getMethod("allocateInstance", Class.class);
+
+        Object vanillaFlags = C("cpn").getField("f").get(null); // FeatureFlags.VANILLA_SET
+        Object worldData = Proxy.newProxyInstance(
+                NativeHarness.class.getClassLoader(),
+                new Class<?>[]{C("erl")},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("K") && method.getParameterCount() == 0) {
+                        return vanillaFlags;
+                    }
+                    throw new UnsupportedOperationException("minimal worldData: " + method);
+                });
+        Class<?> serverC = Class.forName("net.minecraft.server.MinecraftServer");
+        Object server = alloc.invoke(unsafe, C("apn"));
+        Field worldDataField = serverC.getDeclaredField("j");
+        worldDataField.setAccessible(true);
+        worldDataField.set(server, worldData);
+
+        Class<?> slC = C("aqu");
+        Object sl = alloc.invoke(unsafe, slC);
+        Field serverField = slC.getDeclaredField("J");
+        serverField.setAccessible(true);
+        serverField.set(sl, server);
+        return sl;
     }
 
     /** A level backed by a real chunk: block entities and registry access are real. */

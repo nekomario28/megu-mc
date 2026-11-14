@@ -428,7 +428,7 @@ fn pinned_configured_features_parse_except_explicit_unimplemented_types() {
     unimplemented.sort();
     assert_eq!(
         unimplemented,
-        ["minecraft:bonus_chest", "minecraft:end_spike",],
+        ["minecraft:bonus_chest"],
         "unexpected parser losses (or resolved exceptions; remove them above)"
     );
 }
@@ -4933,4 +4933,108 @@ fn freeze_top_layer_matches_native_oracle() {
         tested += 1;
     }
     assert_eq!(tested, 29);
+}
+
+#[test]
+fn end_spike_config_parses_explicit_fields_and_rejects_malformed() {
+    let valid = jparse(
+        br#"{"type":"minecraft:end_spike","config":{"crystal_invulnerable":true,"crystal_beam_target":[12,95,-34],"spikes":[{"centerX":2,"centerZ":3,"radius":4,"height":88,"guarded":true}]}}"#,
+    )
+    .unwrap();
+    let Some(Cf::EndSpike(cfg)) = super::p_cf(&valid) else {
+        panic!("expected Cf::EndSpike");
+    };
+    assert!(cfg.crystal_invulnerable);
+    assert_eq!(cfg.crystal_beam_target, Some((12, 95, -34)));
+    assert_eq!(
+        cfg.spikes,
+        vec![super::EndSpike {
+            center_x: 2,
+            center_z: 3,
+            radius: 4,
+            height: 88,
+            guarded: true,
+        }]
+    );
+
+    let missing_spikes =
+        jparse(br#"{"type":"minecraft:end_spike","config":{"crystal_invulnerable":false}}"#)
+            .unwrap();
+    assert!(super::p_cf(&missing_spikes).is_none());
+
+    let bad_target = jparse(
+        br#"{"type":"minecraft:end_spike","config":{"crystal_invulnerable":false,"crystal_beam_target":[1,2],"spikes":[]}}"#,
+    )
+    .unwrap();
+    assert!(super::p_cf(&bad_target).is_none());
+}
+
+#[test]
+fn end_spike_matches_native_oracle() {
+    let reg = breg().expect("registry");
+    let fixture = include_str!("../tests/data/end_spike_1211.tsv");
+    let sha = |s: &str| -> String {
+        crate::generation_math::sha256(s.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let mut tested = 0usize;
+    for line in fixture.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 12, "bad row: {line}");
+        let id = cols[0];
+        let min_y = cols[1].parse::<i32>().unwrap();
+        let height = cols[2].parse::<i32>().unwrap();
+        let world_seed = cols[3].parse::<i64>().unwrap() as u64;
+        let origin_parts: Vec<i32> = cols[4].split(',').map(|v| v.parse().unwrap()).collect();
+        let origin = (origin_parts[0], origin_parts[1], origin_parts[2]);
+        let rng_seed = cols[5].parse::<i64>().unwrap() as u64;
+        let cf_json = format!(r#"{{"type":"minecraft:end_spike","config":{}}}"#, cols[6]);
+        let cf = super::p_cf(&jparse(cf_json.as_bytes()).unwrap())
+            .unwrap_or_else(|| panic!("failed to parse end_spike config for {id}"));
+
+        let preset = match (min_y, height) {
+            (0, 128) => crate::worldgen::NoisePreset::End,
+            (-64, 384) => crate::worldgen::NoisePreset::Overworld,
+            _ => panic!("unexpected bounds ({min_y}, {height}) in {id}"),
+        };
+        let mut g = Gen::load_preset(world_seed, crate::name_to_state, preset).expect("datapack");
+        let mut ctx = context(&mut g);
+        assert_eq!(ctx.g.min_y, min_y, "{id}");
+        assert_eq!(ctx.g.height, height, "{id}");
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+
+        let mut rng = Xor::seed_worldgen(rng_seed);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, origin);
+
+        let expect_wrote = cols[7].parse::<bool>().unwrap();
+        let expect_count = cols[8].parse::<usize>().unwrap();
+        assert_eq!(!ctx.wr.is_empty(), expect_wrote, "wrote mismatch for {id}");
+        assert_eq!(ctx.wr.len(), expect_count, "cell count mismatch for {id}");
+
+        let mut cells: Vec<String> = ctx
+            .wr
+            .iter()
+            .map(|(&(x, y, z), &state)| {
+                format!("{x},{y},{z} {}\n", block_state_cells_text(reg, state))
+            })
+            .collect();
+        cells.sort();
+        assert_eq!(sha(&cells.concat()), cols[9], "cells SHA-256 mismatch for {id}");
+
+        let probe = format!(
+            "{},{},{}",
+            rng.next_bound(1000),
+            rng.next_bound(1000),
+            rng.next_bound(1000)
+        );
+        assert_eq!(probe, cols[10], "rng probe mismatch for {id}");
+        tested += 1;
+    }
+    assert_eq!(tested, 37);
 }

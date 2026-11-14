@@ -25,7 +25,7 @@ class P02AuditTests(unittest.TestCase):
         self.assertLess(ow["bleaf_count"], 64)
         self.assertEqual(
             report["features_and_placements"]["end"]["configured_feature_unimplemented_reachable"],
-            ["end_spike"],
+            [],
         )
         self.assertEqual(report["biomes_and_structures"]["structures_total"], 34)
 
