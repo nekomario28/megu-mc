@@ -5711,14 +5711,81 @@ fn materialize_generation_payloads_inner(
 ) {
     for (pos, payload) in staged {
         match payload {
-            crate::generation_payload::GenerationPayload::Container { kind, slots } => {
+            crate::generation_payload::GenerationPayload::Container { .. }
+            | crate::generation_payload::GenerationPayload::LootContainer { .. } => {
                 use crate::generation_payload::ContainerKind;
+                let (kind, container_slots): (ContainerKind, Vec<(i16, Stack)>) = match payload {
+                    crate::generation_payload::GenerationPayload::Container { kind, slots } => (
+                        kind,
+                        slots
+                            .into_iter()
+                            .map(|(slot, item, count)| (slot, (item, count, Vec::new())))
+                            .collect(),
+                    ),
+                    crate::generation_payload::GenerationPayload::LootContainer {
+                        kind,
+                        loot_table,
+                        loot_seed,
+                    } => {
+                        let seed = loot_seed.unwrap_or_else(|| world_rng::next_u64() as i64);
+                        let rolled_slots: HashMap<i16, Stack> =
+                            if loot_table == "minecraft:chests/abandoned_mineshaft" {
+                                roll_cart_loot(seed)
+                            } else {
+                                let pools =
+                                    loot_tables().lock().unwrap().get(&loot_table).map(|p| {
+                                        p.iter()
+                                            .map(|pl| LootPool {
+                                                rolls: pl.rolls,
+                                                chance: pl.chance,
+                                                funcs: pl.funcs.clone(),
+                                                entries: pl
+                                                    .entries
+                                                    .iter()
+                                                    .map(|e| LootEntry {
+                                                        item: e.item,
+                                                        min: e.min,
+                                                        max: e.max,
+                                                        funcs: e.funcs.clone(),
+                                                    })
+                                                    .collect(),
+                                            })
+                                            .collect::<Vec<_>>()
+                                    });
+                                let mut out = HashMap::new();
+                                if let Some(pools) = pools {
+                                    let items = roll_loot(&pools);
+                                    let slot_limit = match kind {
+                                        ContainerKind::Chest => 27i16,
+                                        ContainerKind::Furnace => 3i16,
+                                    };
+                                    let mut slot_order: Vec<i16> = (0..slot_limit).collect();
+                                    if kind == ContainerKind::Chest {
+                                        let mut shuffle_rng =
+                                            crate::generation_math::Lcg::new(seed as u64);
+                                        for i in (2..=slot_order.len()).rev() {
+                                            let j = shuffle_rng.next_bound(i as i32) as usize;
+                                            slot_order.swap(i - 1, j);
+                                        }
+                                    }
+                                    for (idx, stack) in
+                                        items.into_iter().take(slot_limit as usize).enumerate()
+                                    {
+                                        out.insert(slot_order[idx], stack);
+                                    }
+                                }
+                                out
+                            };
+                        (kind, rolled_slots.into_iter().collect())
+                    }
+                    _ => unreachable!(),
+                };
                 match kind {
                     ContainerKind::Chest => {
                         let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
                         let entry = store.entry(ContainerKey::Block(pos)).or_default();
-                        for (slot, item, count) in slots {
-                            entry.insert(slot, (item, count, Vec::new()));
+                        for (slot, stack) in container_slots {
+                            entry.insert(slot, stack);
                         }
                     }
                     ContainerKind::Furnace => {
@@ -5734,8 +5801,7 @@ fn materialize_generation_payloads_inner(
                             recipe_cache: CachedLookup::default(),
                             fuel_cache: CachedLookup::default(),
                         });
-                        for (slot, item, count) in slots {
-                            let stack = (item, count, Vec::new());
+                        for (slot, stack) in container_slots {
                             match slot {
                                 0 => furnace.input = stack,
                                 1 => furnace.fuel = stack,

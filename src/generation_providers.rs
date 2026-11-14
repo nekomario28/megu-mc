@@ -10,7 +10,7 @@ use crate::json::{jarr, jf32, jint, jnum, js, jstr, J};
 
 // ---------- providers ----------
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum IP {
     Const(i32),
     Uniform(i32, i32),

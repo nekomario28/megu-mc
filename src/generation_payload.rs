@@ -24,6 +24,12 @@ pub(crate) enum GenerationPayload {
         kind: ContainerKind,
         slots: Vec<Slot>,
     },
+    /// Container populated from a loot table (`LootTable` + optional `LootTableSeed`).
+    LootContainer {
+        kind: ContainerKind,
+        loot_table: String,
+        loot_seed: Option<i64>,
+    },
     /// A sign side: the four lines of its front text.
     Sign([String; 4]),
     /// A freshly configured cave-spider spawner (its native setter consumes no RNG).

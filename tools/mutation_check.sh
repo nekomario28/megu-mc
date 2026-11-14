@@ -1533,6 +1533,66 @@ check "template integrity codec rejects negative zero" \
   src/structure_template.rs ' || integrity.is_sign_negative()' '' \
   structure_template::tests::processor_lists_reject_unsupported_required_children
 
+check "template gravity keeps original block y offset" \
+  src/structure_template.rs 'current.pos.1 = surface.wrapping_add(*offset).wrapping_add(original.pos.1);' \
+  'current.pos.1 = surface.wrapping_add(*offset);' \
+  structure_template::tests::gravity_processor_shifts_y_by_heightmap_offset_and_original_y
+
+check "template blackstone replace drops unrelated state properties" \
+  src/structure_template.rs 'for prop in ["facing", "half", "type"] {' \
+  'for prop in ["facing", "half", "type", "waterlogged"] {' \
+  structure_template::tests::blackstone_replace_processor_preserves_facing_half_type_and_drops_unrelated_props
+
+check "template lava submerged skips collision-full blocks" \
+  src/structure_template.rs '&& !reg.is_collision_shape_full_block(current.state)' \
+  '&& true' \
+  structure_template::tests::lava_submerged_block_processor_replaces_non_full_blocks_in_lava
+
+check "template capped processor derives factory seed from world seed LCG" \
+  src/structure_template.rs 'let factory_seed = crate::generation_math::Lcg::new(world_seed).next_i64();' \
+  'let factory_seed = world_seed as i64;' \
+  structure_template::tests::capped_processor_uses_world_seed_positional_rng_and_shuffled_limit
+
+check "template capped processor enforces limit count" \
+  src/structure_template.rs 'if replaced >= cap {' \
+  'if replaced > cap {' \
+  structure_template::tests::capped_processor_uses_world_seed_positional_rng_and_shuffled_limit
+
+check "template rottable tag membership evaluates tag" \
+  src/structure_template.rs 'Some(RottableBlocks::Tag(tag)) => reg.in_tag(original.state, tag),' \
+  'Some(RottableBlocks::Tag(_)) => false,' \
+  structure_template::tests::rule_processor_supports_tag_blockstate_random_axis_pos_and_rottable_tag
+
+check "template tag_match rule evaluates tag" \
+  src/structure_template.rs 'Self::Tag(tag) => reg.in_tag(state, tag),' \
+  'Self::Tag(_) => false,' \
+  structure_template::tests::rule_processor_supports_tag_blockstate_random_axis_pos_and_rottable_tag
+
+check "template loot container staging reads LootTable" \
+  src/structure_template.rs 'if let Some(loot_tag) = tag.get("LootTable") {' \
+  'if let Some(loot_tag) = tag.get("MissingLootTable") {' \
+  structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
+
+check "template placement passes decorative block entities through without staging failure" \
+  src/structure_template.rs '.filter(|tag| !Self::is_passthrough_block_entity(state, tag, reg))' \
+  '.filter(|_| true)' \
+  structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
+
+check "template loot container materialization rolls mineshaft cart loot" \
+  src/main.rs 'if loot_table == "minecraft:chests/abandoned_mineshaft" {' \
+  'if false {' \
+  structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
+
+check "template placement updates inside boundary block shapes" \
+  src/structure_template.rs 'if let Some(state) = edge_shape(ctx, p, inside, outside, direction) {' \
+  'if let Some(state) = None::<u32> {' \
+  structure_template::tests::place_blocks_updates_inside_boundary_shapes_and_schedules_inside_fluids
+
+check "template placement schedules generated water on inside boundary" \
+  src/structure_template.rs '"minecraft:water" => ctx.g.schedule_generated_fluid(p, 0),' \
+  '"minecraft:water" => (),' \
+  structure_template::tests::place_blocks_updates_inside_boundary_shapes_and_schedules_inside_fluids
+
 check "sculk vein spreads from a present face toward an absent face" \
   src/feature.rs 'if is_vein && !(spc_has_face(reg, state, from) && !spc_has_face(reg, state, to)) {' \
   'if is_vein && !(spc_has_face(reg, state, to) && !spc_has_face(reg, state, from)) {' \
