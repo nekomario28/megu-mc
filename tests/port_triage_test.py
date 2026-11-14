@@ -173,6 +173,74 @@ if "MC_SPINE_WG_DUMP_CANON" in env:
             self.assertEqual(report["port_provenance"]["mode"], "terrain")
             self.assertEqual(report["totals"]["all_air_diffs"], 1)
 
+    def test_pop_order_accepts_sculk_trace_and_refuses_game_log(self):
+        blocks_meta = json.loads((ROOT / "assets/blocks_1211.json").read_text())
+        stone = next(b for b in blocks_meta if b["name"] == "stone")["minStateId"]
+        chunk = make_chunk_nbt(0, 0, blocks={(0, -60, 0): ("minecraft:stone", {})}, world_surface_val="auto")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            world = tmp_path / "world"
+            world.mkdir()
+            (world / "level.dat").write_bytes(make_level_dat(seed=4242))
+
+            # Ordered SculkLog trace with POP_CHUNK and SPASS (POP_CHUNK preferred, dedup preserving order)
+            trace = tmp_path / "sculk-trace.txt"
+            trace.write_text(
+                "[w=Worker-Main-1] SDRAW_SCOPE pass=all\n"
+                "[w=Worker-Main-1] POP_CHUNK 1 0\n"
+                "[w=Worker-Main-1] SPASS 1 0\n"
+                "[w=Worker-Main-2] POP_CHUNK 0 0\n"
+                "[w=Worker-Main-1] POP_CHUNK 1 0\n"
+            )
+            fake_bin = tmp_path / "fake-mc-spine"
+            captured_order = tmp_path / "captured_order.txt"
+            fake_bin.write_text(f'''#!{sys.executable}
+import os, struct
+from pathlib import Path
+env = dict(os.environ)
+Path({str(captured_order)!r}).write_text(Path(env["MC_SPINE_POP_ORDER"]).read_text())
+grid = [0] * (2 * 4096)
+grid[4 * 256 + 0] = {stone}
+Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid))
+''')
+            fake_bin.chmod(0o755)
+            out_dir = tmp_path / "out"
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=chunk):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = pt.main([
+                        str(world), "0", "0",
+                        "--binary", str(fake_bin),
+                        "--pop-order", str(trace),
+                        "--pop-order-scope", "recorded",
+                        "--out-dir", str(out_dir),
+                    ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured_order.read_text(), "1\t0\n0\t0\n")
+            self.assertEqual((out_dir / "pop_order.tsv").read_text(), "1\t0\n0\t0\n")
+
+            # Unordered log4j game log must fail closed before building.
+            game_log = tmp_path / "run.log"
+            game_log.write_text("[12:00:00] [Worker-Main-1/INFO]: [STDOUT]: DECO 0 0\n")
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=chunk), \
+                 patch.object(pt, "resolve_binary", side_effect=AssertionError("must not build on unordered pop-order")):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = pt.main([str(world), "0", "0", "--pop-order", str(game_log)])
+            self.assertEqual(rc, 2)
+            self.assertIn("not program order", err.getvalue())
+
+            # Empty / markerless trace must fail closed before building.
+            empty_trace = tmp_path / "empty.txt"
+            empty_trace.write_text("[w=Worker-Main-1] SDRAW_SCOPE pass=all\n")
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=chunk), \
+                 patch.object(pt, "resolve_binary", side_effect=AssertionError("must not build on empty pop-order")):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = pt.main([str(world), "0", "0", "--pop-order", str(empty_trace)])
+            self.assertEqual(rc, 2)
+            self.assertIn("POP_CHUNK/SPASS/DECO", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

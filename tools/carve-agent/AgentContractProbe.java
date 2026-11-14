@@ -34,12 +34,69 @@ public final class AgentContractProbe implements Opcodes {
 
     public static void main(String[] args) throws Exception {
         Path trace = Path.of(args[0]);
+        Path popOrder = trace.resolveSibling("pop-order.tsv");
         System.setProperty("sculktrace", trace.toString());
         System.setProperty("sculkdrawpass", "0,0");
+        System.setProperty("dim", "-64");
+        System.setProperty("popchunk", "1");
+        System.setProperty("poporder", popOrder.toString());
         Map<String, byte[]> classes = new HashMap<>();
-        for (String name : new String[]{"dds", "duz", "ayw", "ece"}) {
+        for (String name : new String[]{"ayw", "ece", "ddq"}) {
             classes.put(name, type(name).toByteArray());
         }
+        // dcy (LevelHeightAccessor) interface with I_() -> minBuildHeight, implemented by dds
+        ClassWriter dcy = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+        dcy.visit(V17, ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT, "dcy", null, "java/lang/Object", null);
+        dcy.visitMethod(ACC_PUBLIC | ACC_ABSTRACT, "I_", "()I", null, null).visitEnd();
+        dcy.visitEnd();
+        classes.put("dcy", dcy.toByteArray());
+
+        ClassWriter dds = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+        dds.visit(V17, ACC_PUBLIC, "dds", null, "java/lang/Object", new String[]{"dcy"});
+        MethodVisitor ddsInit = dds.visitMethod(ACC_PUBLIC, "<init>", "()V", null, null);
+        ddsInit.visitCode();
+        ddsInit.visitVarInsn(ALOAD, 0);
+        ddsInit.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        ddsInit.visitInsn(RETURN);
+        ddsInit.visitMaxs(0, 0);
+        ddsInit.visitEnd();
+        dds.visitField(ACC_PUBLIC, "minY", "I", null, null).visitEnd();
+        MethodVisitor getMinY = dds.visitMethod(ACC_PUBLIC, "I_", "()I", null, null);
+        getMinY.visitCode();
+        getMinY.visitVarInsn(ALOAD, 0);
+        getMinY.visitFieldInsn(GETFIELD, "dds", "minY", "I");
+        getMinY.visitInsn(IRETURN);
+        getMinY.visitMaxs(0, 0);
+        getMinY.visitEnd();
+        classes.put("dds", dds.toByteArray());
+
+        ClassWriter dcd = type("dcd");
+        dcd.visitField(ACC_PUBLIC, "e", "I", null, null).visitEnd();
+        dcd.visitField(ACC_PUBLIC, "f", "I", null, null).visitEnd();
+        classes.put("dcd", dcd.toByteArray());
+
+        ClassWriter duy = type("duy");
+        duy.visitField(ACC_PUBLIC, "pos", "Ldcd;", null, null).visitEnd();
+        MethodVisitor getPos = duy.visitMethod(ACC_PUBLIC, "f", "()Ldcd;", null, null);
+        getPos.visitCode();
+        getPos.visitVarInsn(ALOAD, 0);
+        getPos.visitFieldInsn(GETFIELD, "duy", "pos", "Ldcd;");
+        getPos.visitInsn(ARETURN);
+        getPos.visitMaxs(0, 0);
+        getPos.visitEnd();
+        classes.put("duy", duy.toByteArray());
+
+        ClassWriter rawDuz = type("duz");
+        MethodVisitor applyDeco = rawDuz.visitMethod(ACC_PUBLIC, "a", "(Ldds;Lduy;Lddq;)V", null, null);
+        applyDeco.visitCode();
+        applyDeco.visitInsn(RETURN);
+        applyDeco.visitMaxs(0, 0);
+        applyDeco.visitEnd();
+        byte[] duzTransformed = new SculkTransformer().transform(
+                null, "duz", null, null, rawDuz.toByteArray());
+        if (duzTransformed == null) throw new AssertionError("ChunkGenerator duz hook absent");
+        classes.put("duz", duzTransformed);
+
         ClassWriter pos = type("jd");
         zeroMethod(pos, "u", "()I");
         zeroMethod(pos, "w", "()I");
@@ -67,7 +124,10 @@ public final class AgentContractProbe implements Opcodes {
         };
         Class<?> world = loader.loadClass("dds"), generator = loader.loadClass("duz");
         Class<?> random = loader.loadClass("ayw"), position = loader.loadClass("jd");
+        Class<?> chunkAccess = loader.loadClass("duy"), chunkPos = loader.loadClass("dcd");
+        Class<?> structMgr = loader.loadClass("ddq");
         Class<?> configured = loader.loadClass("ebq");
+
         Object instance = configured.getConstructor().newInstance();
         SculkLog.armPlacement();
         SculkLog.windowStart();
@@ -82,11 +142,56 @@ public final class AgentContractProbe implements Opcodes {
         SculkLog.windowEnd();
         SculkLog.disarm();
         SculkLog.drawI(43, "after-placement-return");
+
+        Object genInstance = generator.getConstructor().newInstance();
+        Object netherWorld = world.getConstructor().newInstance();
+        world.getField("minY").setInt(netherWorld, 0);
+        Object netherPos = chunkPos.getConstructor().newInstance();
+        chunkPos.getField("e").setInt(netherPos, 9);
+        chunkPos.getField("f").setInt(netherPos, 9);
+        Object netherChunk = chunkAccess.getConstructor().newInstance();
+        chunkAccess.getField("pos").set(netherChunk, netherPos);
+        generator.getMethod("a", world, chunkAccess, structMgr).invoke(genInstance, netherWorld, netherChunk, null);
+
+        Object owWorld = world.getConstructor().newInstance();
+        world.getField("minY").setInt(owWorld, -64);
+        Object owPos = chunkPos.getConstructor().newInstance();
+        chunkPos.getField("e").setInt(owPos, 3);
+        chunkPos.getField("f").setInt(owPos, -2);
+        Object owChunk = chunkAccess.getConstructor().newInstance();
+        chunkAccess.getField("pos").set(owChunk, owPos);
+        generator.getMethod("a", world, chunkAccess, structMgr).invoke(genInstance, owWorld, owChunk, null);
+
+        System.setProperty("sculkquiet", "true");
+        Object owPos2 = chunkPos.getConstructor().newInstance();
+        chunkPos.getField("e").setInt(owPos2, 3);
+        chunkPos.getField("f").setInt(owPos2, -1);
+        Object owChunk2 = chunkAccess.getConstructor().newInstance();
+        chunkAccess.getField("pos").set(owChunk2, owPos2);
+        generator.getMethod("a", world, chunkAccess, structMgr).invoke(genInstance, owWorld, owChunk2, null);
+        System.clearProperty("sculkquiet");
+
         // Production flushes at shutdown; inspect the actual buffered output now.
         var writer = SculkLog.class.getDeclaredField("writer");
         writer.setAccessible(true);
         ((java.io.PrintWriter) writer.get(null)).flush();
+        var popWriterField = SculkLog.class.getDeclaredField("popWriter");
+        popWriterField.setAccessible(true);
+        ((java.io.PrintWriter) popWriterField.get(null)).flush();
         String output = Files.readString(trace);
+        String popOutput = Files.readString(popOrder);
+        if (output.contains("9 9") || popOutput.contains("9\t9")) {
+            throw new AssertionError("dimension filter failed to suppress minY=0 pass");
+        }
+        if (!output.contains("SPASS 3 -2") || !output.contains("POP_CHUNK 3 -2")) {
+            throw new AssertionError("duz hook missing SPASS/POP_CHUNK for minY=-64");
+        }
+        if (!output.contains("POP_CHUNK 3 -1") || output.contains("SPASS 3 -1")) {
+            throw new AssertionError("POP_CHUNK must still log under sculkquiet=true while SPASS is suppressed");
+        }
+        if (!popOutput.equals("3\t-2\n3\t-1\n")) {
+            throw new AssertionError("unexpected poporder TSV: " + popOutput);
+        }
         if (!output.contains("SDRAW after-configured-return 42")) {
             throw new AssertionError("ConfiguredFeature return disarmed the outer placement");
         }

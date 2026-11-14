@@ -25,6 +25,10 @@ public class SculkLog {
      */
     private static final Object LOCK = new Object();
     private static java.io.PrintWriter writer;
+    private static final Object POP_LOCK = new Object();
+    private static java.io.PrintWriter popWriter;
+    private static boolean popWriterFailed;
+    private static final java.util.Set<Long> POP_SEEN = new java.util.HashSet<>();
 
     private static java.io.PrintWriter writer() {
         if (writer == null) {
@@ -40,13 +44,27 @@ public class SculkLog {
             Runtime.getRuntime().addShutdownHook(new Thread() {
                 @Override public void run() {
                     synchronized (LOCK) {
-                        writer.flush();
-                        writer.close();
+                        if (writer != null) {
+                            writer.flush();
+                            writer.close();
+                        }
+                    }
+                    synchronized (POP_LOCK) {
+                        if (popWriter != null) {
+                            popWriter.flush();
+                            popWriter.close();
+                        }
                     }
                 }
             });
         }
         return writer;
+    }
+
+    private static void writeUnfiltered(String line) {
+        synchronized (LOCK) {
+            writer().println("[w=" + Thread.currentThread().getName() + "] " + line);
+        }
     }
 
     /**
@@ -64,14 +82,7 @@ public class SculkLog {
 
     private static void out(String line) {
         if (Boolean.getBoolean("sculkquiet")) return;
-        synchronized (LOCK) {
-            // The thread is part of the record: the lock keeps lines whole, but placements run on
-            // many worker threads, so the file's global order is not any one thread's program
-            // order. Reading a single window off the file mixed one thread's sculk placement with
-            // another's feature placements (measured: 28 consecutive `SPLACE ecw` lines inside
-            // what looked like one sculk window). With the tag a reader gets per-thread order.
-            writer().println("[w=" + Thread.currentThread().getName() + "] " + line);
-        }
+        writeUnfiltered(line);
     }
 
     /** `SculkSpreader.updateCursors` entry: one round, cursor index starts over. */
@@ -97,6 +108,44 @@ public class SculkLog {
         out("SSPREADALL types=" + types + " r=" + round + " i=" + (idx - 1));
     }
 
+    private static final ThreadLocal<int[]> DIM = ThreadLocal.withInitial(() -> new int[]{Integer.MIN_VALUE});
+
+    /** Record the decorating level's `getMinBuildHeight()` on the current thread (`-64` for Overworld). */
+    public static void dim(int minY) {
+        DIM.get()[0] = minY;
+    }
+
+    private static boolean dimMatch() {
+        String p = System.getProperty("dim");
+        if (p == null) return true;
+        return DIM.get()[0] == Integer.parseInt(p);
+    }
+
+    private static boolean popChunkEnabled() {
+        String p = System.getProperty("popchunk");
+        return p != null && !"false".equalsIgnoreCase(p);
+    }
+
+    private static void recordPopOrder(int cx, int cz) {
+        String path = System.getProperty("poporder");
+        if (path == null || path.isEmpty() || popWriterFailed) return;
+        long key = (((long) cx) << 32) | (cz & 0xffffffffL);
+        synchronized (POP_LOCK) {
+            if (!POP_SEEN.add(key)) return;
+            try {
+                if (popWriter == null) {
+                    popWriter = new java.io.PrintWriter(new java.io.BufferedWriter(
+                            new java.io.FileWriter(path, false), 1 << 12));
+                }
+                popWriter.println(cx + "\t" + cz);
+                popWriter.flush();
+            } catch (java.io.IOException e) {
+                popWriterFailed = true;
+                System.err.println("SCULKAGENT poporder write failed (" + path + "): " + e);
+            }
+        }
+    }
+
     /** `ChunkGenerator.applyBiomeDecoration` entry: the chunk whose decoration pass this is.
      *
      * One pass covers the 3x3 biome sources around its chunk (vanilla's `ChunkPos.rangeClosed`),
@@ -108,6 +157,11 @@ public class SculkLog {
         // and two instruments (`BIOMEF` and `SPWINDOW`) have to be joinable to be reconciled
         PASS.get()[0] = cx;
         PASS.get()[1] = cz;
+        if (!dimMatch()) return;
+        recordPopOrder(cx, cz);
+        if (popChunkEnabled()) {
+            writeUnfiltered("POP_CHUNK " + cx + " " + cz);
+        }
         if (Boolean.getBoolean("sculkquiet")) return;
         out("SPASS " + cx + " " + cz);
     }

@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cargo_executable  # noqa: E402
 import chunk_triage  # noqa: E402
+import sculk_trace  # noqa: E402
 from vanilla_region_blocks import parse_nbt  # noqa: E402
 
 STRIP_ENV_PREFIXES = ("MC_SPINE_", "SPC_", "FSEED_", "BIOMEF_", "FEATURE_")
@@ -100,6 +101,41 @@ def resolve_binary(args):
     return binary, wall
 
 
+def resolve_pop_order_spec(pop_order_path):
+    """Accept either a 2-column TSV (cx, cz) or an ordered SculkLog trace (POP_CHUNK/SPASS)."""
+    path = Path(pop_order_path)
+    if not path.is_file():
+        raise PortTriageError(f"missing --pop-order file: {pop_order_path}")
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    non_empty = [ln.strip() for ln in lines if ln.strip()]
+    if non_empty:
+        all_pairs = True
+        for ln in non_empty:
+            parts = ln.split()
+            if len(parts) != 2:
+                all_pairs = False
+                break
+            try:
+                int(parts[0])
+                int(parts[1])
+            except ValueError:
+                all_pairs = False
+                break
+        if all_pairs:
+            return path.resolve(), None
+    if sculk_trace.reads_unordered(path):
+        raise PortTriageError(
+            f"--pop-order {pop_order_path} is a game log whose line order is not program order; "
+            "pass SculkLog's ordered trace (-Dsculktrace=... / -Dpoporder=...) or sculk_trace.py pop-order TSV"
+        )
+    order = sculk_trace.extract_pop_order(path)
+    if not order:
+        raise PortTriageError(
+            f"--pop-order {pop_order_path} has neither 2-column chunk coordinates nor POP_CHUNK/SPASS/DECO markers"
+        )
+    return None, order
+
+
 def preflight(args):
     if args.n <= 0:
         raise PortTriageError(f"--n must be positive, got {args.n}")
@@ -107,8 +143,8 @@ def preflight(args):
         raise PortTriageError(f"--jobs must be positive, got {args.jobs}")
     if args.preset != "overworld" and args.mode == "full":
         raise PortTriageError(f"--preset {args.preset} requires --mode terrain or --mode carvers (features unsupported)")
-    if args.pop_order and not Path(args.pop_order).is_file():
-        raise PortTriageError(f"missing --pop-order file: {args.pop_order}")
+    if args.pop_order:
+        resolve_pop_order_spec(args.pop_order)
 
     world = Path(args.world)
     if not world.is_dir():
@@ -177,7 +213,7 @@ def preflight(args):
     return seed, meta_a
 
 
-def build_dump_env(args, seed, dump_bin, dump_hm, dump_canon):
+def build_dump_env(args, seed, dump_bin, dump_hm, dump_canon, *, pop_order_file=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith(STRIP_ENV_PREFIXES)}
     env.update({
         "MC_SPINE_SEED": str(seed),
@@ -199,7 +235,11 @@ def build_dump_env(args, seed, dump_bin, dump_hm, dump_canon):
         env["MC_SPINE_WG_DUMP_HM"] = str(dump_hm)
     if dump_canon is not None:
         env["MC_SPINE_WG_DUMP_CANON"] = str(dump_canon)
-    if args.pop_order:
+    if pop_order_file is not None:
+        env["MC_SPINE_POP_ORDER"] = str(pop_order_file)
+        if args.pop_order_scope:
+            env["MC_SPINE_POP_ORDER_SCOPE"] = args.pop_order_scope
+    elif args.pop_order:
         env["MC_SPINE_POP_ORDER"] = str(Path(args.pop_order).resolve())
         if args.pop_order_scope:
             env["MC_SPINE_POP_ORDER_SCOPE"] = args.pop_order_scope
@@ -220,6 +260,7 @@ def run_port_dump(binary, env, dump_log):
 
 def execute(args):
     seed, meta_a = preflight(args)
+    pop_spec = resolve_pop_order_spec(args.pop_order) if args.pop_order else None
     binary, build_wall = resolve_binary(args)
     binary_sha256 = chunk_triage.sha256_file(binary)
 
@@ -238,8 +279,19 @@ def execute(args):
         dump_hm = (out_dir / "hm.bin") if args.port_hm else None
         dump_canon = (out_dir / "canon.tsv") if args.canon else None
         dump_log = out_dir / "dump.log"
+        pop_order_file = None
+        if pop_spec is not None:
+            direct_path, extracted_order = pop_spec
+            if direct_path is not None:
+                pop_order_file = direct_path
+            else:
+                pop_order_file = out_dir / "pop_order.tsv"
+                pop_order_file.write_text(
+                    "".join(f"{cx}\t{cz}\n" for cx, cz in extracted_order),
+                    encoding="utf-8",
+                )
 
-        env = build_dump_env(args, seed, dump_bin, dump_hm, dump_canon)
+        env = build_dump_env(args, seed, dump_bin, dump_hm, dump_canon, pop_order_file=pop_order_file)
         dump_wall = run_port_dump(binary, env, dump_log)
 
         if not dump_bin.is_file():
@@ -317,7 +369,7 @@ def build_parser():
     ap.add_argument("--preset", choices=("overworld", "nether", "end"), default="overworld",
                     help="Offline noise preset (default: overworld)")
     ap.add_argument("--noaq", action="store_true", help="Set MC_SPINE_NOAQ=1 during port dump")
-    ap.add_argument("--pop-order", help="Optional MC_SPINE_POP_ORDER chunk order TSV")
+    ap.add_argument("--pop-order", help="Optional MC_SPINE_POP_ORDER TSV or SculkLog trace (POP_CHUNK/SPASS)")
     ap.add_argument("--pop-order-scope", choices=("exact", "recorded"), default="exact",
                     help="MC_SPINE_POP_ORDER_SCOPE (default: exact)")
     ap.add_argument("--allow-stage-mismatch", action="store_true",

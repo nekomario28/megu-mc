@@ -429,5 +429,33 @@ class CliRefusals(unittest.TestCase):
             self.assertIn("PROBLEM", done.stderr)
 
 
+class PopOrder(unittest.TestCase):
+    def test_extracts_spass_and_pop_chunk_with_bbox_and_refuses_game_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = write(tmp, "trace.txt",
+                          "[w=Worker-1] SPASS 3 -1\n"
+                          "[w=Worker-2] POP_CHUNK 3 -2\n"
+                          "[w=Worker-1] POP_CHUNK 9 9\n"
+                          "[w=Worker-2] POP_CHUNK 3 -1\n"
+                          "[w=Worker-2] POP_CHUNK 3 -2\n")
+            self.assertEqual(st.extract_pop_order(trace), [(3, -2), (9, 9), (3, -1)])
+            self.assertEqual(st.extract_pop_order(trace, bbox=(2, -3, 4, -1)), [(3, -2), (3, -1)])
+
+            spass_only = write(tmp, "spass.txt", HEALTHY)
+            self.assertEqual(st.extract_pop_order(spass_only), [(-16, 112), (-15, 112)])
+
+            log = write(tmp, "run.log", GAME_LOG)
+            refused = subprocess.run([sys.executable, str(ROOT / "tools/sculk_trace.py"),
+                                      "pop-order", str(log)], capture_output=True, text=True)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("not program order", refused.stderr)
+
+            allowed = subprocess.run([sys.executable, str(ROOT / "tools/sculk_trace.py"),
+                                      "pop-order", str(log), "--allow-unordered"],
+                                     capture_output=True, text=True)
+            self.assertEqual(allowed.returncode, 0)
+            self.assertEqual(allowed.stdout, "-16\t112\n")
+
+
 if __name__ == "__main__":
     unittest.main()

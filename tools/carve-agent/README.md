@@ -24,10 +24,13 @@ Sculk hook (the sculk cursor/parity work in `specs/worldgen-parity/sculk-patch.m
   x y z charge decayDelay updateDelay facingMask` and `SSPREAD`/`SSPREADALL`/`SCMARK` around
   the spread calls.
 - `duz` (`ChunkGenerator`) / `applyBiomeDecoration(WorldGenLevel, ChunkAccess,
-  StructureManager)`: at method entry, logs `SPASS cx cz` with the decorated chunk. One pass
-  decorates the 3x3 biome sources around its chunk, so a chunk's placements are logged under
-  nine different base positions and only the pass marker groups them correctly. The port emits
-  the same marker from `populate` (`FEATURE_ATTEMPT_TRACE=1`).
+  StructureManager)`: at method entry, records `LevelHeightAccessor.getMinBuildHeight()` via
+  `SculkLog.dim` (gated when `-Ddim=<minY>` is set) and logs `SPASS cx cz` with the decorated
+  chunk (or `POP_CHUNK cx cz` when `-Dpopchunk=1`, even under `-Dsculkquiet=true`, plus optional
+  direct TSV output via `-Dpoporder=<path>`). One pass decorates the 3x3 biome sources around its
+  chunk, so a chunk's placements are logged under nine different base positions and only the pass
+  marker groups them correctly. The port emits the same marker from `populate`
+  (`FEATURE_ATTEMPT_TRACE=1`).
 - `ebq` (`ConfiguredFeature` - **not** `PlacedFeature`; the mapping is
   `net.minecraft.world.level.levelgen.feature.ConfiguredFeature -> ebq`) /
   `place(WorldGenLevel, ChunkGenerator, RandomSource, BlockPos)`: at method entry, logs

@@ -11,6 +11,7 @@
     tools/sculk_trace.py compare-passes <native> <port-trace>
     tools/sculk_trace.py compare-draws <native> <port-draw-log> [--class CLS] [--offset N]
     tools/sculk_trace.py patches <log> [--origins FILE] [--out FILE]
+    tools/sculk_trace.py pop-order <trace> [--bbox x0,z0,x1,z1] [--out FILE]
 
 Why a tool and not a handful of greps: the same three analyses (per-pass attempt sets, per-patch
 cursor trajectories, per-window RNG draws) were rewritten by hand for every capture in this work,
@@ -30,6 +31,7 @@ each time with a fresh chance of getting the grouping wrong. Two of those mistak
 
 Marker vocabulary (from `tools/carve-agent/SculkLog.java`):
 
+    POP_CHUNK cx cz               lightweight chunk decoration entry (when -Dpopchunk=1)
     SPASS  cx cz                  decoration pass entered (ChunkGenerator.applyBiomeDecoration)
     SPLACE <feature-class> cx cz   a feature placement started (ConfiguredFeature.place)
     SRNG   <rng-class>             the RandomSource that placement was handed
@@ -927,6 +929,53 @@ def cmd_patches(args):
     return 0
 
 
+def extract_pop_order(path, *, bbox=None):
+    """Extract unique (cx, cz) decoration order from POP_CHUNK, SPASS, or DECO lines."""
+    lines = trace_lines(path)
+    for prefix in ('POP_CHUNK', 'SPASS', 'DECO'):
+        matched = []
+        seen = set()
+        for line in lines:
+            parts = line.split()
+            if len(parts) != 3 or parts[0] != prefix:
+                continue
+            try:
+                cx, cz = int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            if bbox is not None:
+                x0, z0, x1, z1 = bbox
+                if not (x0 <= cx <= x1 and z0 <= cz <= z1):
+                    continue
+            if (cx, cz) not in seen:
+                seen.add((cx, cz))
+                matched.append((cx, cz))
+        if matched:
+            return matched
+    return []
+
+
+def cmd_pop_order(args):
+    bbox = None
+    if args.bbox:
+        parts = [int(v.strip()) for v in args.bbox.split(',')]
+        if len(parts) != 4 or parts[0] > parts[2] or parts[1] > parts[3]:
+            print(f"sculk_trace: invalid --bbox {args.bbox!r}; expected x0,z0,x1,z1", file=sys.stderr)
+            return 2
+        bbox = tuple(parts)
+    order = extract_pop_order(args.trace, bbox=bbox)
+    if not order:
+        print(f"sculk_trace: no POP_CHUNK/SPASS/DECO chunk passes found in {args.trace}", file=sys.stderr)
+        return 2
+    text = "".join(f"{cx}\t{cz}\n" for cx, cz in order)
+    if args.out:
+        Path(args.out).write_text(text)
+        print(f"sculk_trace: {len(order)} chunks -> {args.out}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1011,6 +1060,15 @@ def main():
     s.add_argument('--out')
     s.set_defaults(func=cmd_patches)
 
+    s = sub.add_parser('pop-order',
+                       help='extract MC_SPINE_POP_ORDER TSV from POP_CHUNK/SPASS trace')
+    s.add_argument('trace')
+    s.add_argument('--bbox', help='optional inclusive chunk box x0,z0,x1,z1')
+    s.add_argument('--out', help='write TSV to FILE instead of stdout')
+    s.add_argument('--allow-unordered', action='store_true',
+                   help='allow reading DECO/SPASS from an unordered game log')
+    s.set_defaults(func=cmd_pop_order)
+
     args = ap.parse_args()
     positional = ['trace', 'traces', 'native', 'port', 'log']
     for name in positional:
@@ -1020,11 +1078,12 @@ def main():
     for name in ['trace', 'native']:
         path = getattr(args, name, None)
         if isinstance(path, str) and reads_unordered(path) and args.cmd in (
-                'passes', 'windows', 'draws', 'patches', 'compare-passes', 'compare-biomef'):
-            print(f"sculk_trace: refusing {args.cmd} on {path}: it is a game log and its line order "
-                  f"is not program order (pass --allow-unordered only for set questions)",
-                  file=sys.stderr)
+                'passes', 'windows', 'draws', 'patches', 'compare-passes', 'compare-biomef',
+                'pop-order'):
             if not getattr(args, 'allow_unordered', False):
+                print(f"sculk_trace: refusing {args.cmd} on {path}: it is a game log and its line order "
+                      f"is not program order (pass --allow-unordered only for set questions)",
+                      file=sys.stderr)
                 return 2
     return args.func(args)
 

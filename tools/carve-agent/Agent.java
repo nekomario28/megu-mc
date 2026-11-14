@@ -1369,6 +1369,11 @@ class SculkTransformer implements ClassFileTransformer {
                         return new MethodVisitor(Opcodes.ASM9, mv) {
                             @Override public void visitCode() {
                                 super.visitCode();
+                                super.visitVarInsn(Opcodes.ALOAD, 1);
+                                super.visitMethodInsn(Opcodes.INVOKEINTERFACE, "dcy", "I_", "()I",
+                                        true);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "SculkLog", "dim",
+                                        "(I)V", false);
                                 super.visitVarInsn(Opcodes.ALOAD, 2);
                                 super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "duy", "f", "()Ldcd;",
                                         false);
