@@ -2095,6 +2095,26 @@ check "jigsaw replacement final_state parser accepts trailing brackets like vani
   '        let props_str = rest.strip_suffix('\'']'\'')?;' \
   feature::jigsaw_structures::tests::jigsaw_structures_match_1211_native_fixture
 
+check "stronghold large-feature seed mixes the chunk position with xor, not add" \
+  src/stronghold_structures.rs '        (i64::from(chunk_x).wrapping_mul(a) ^ i64::from(chunk_z).wrapping_mul(b)) ^ (seed as i64);' \
+  '        (i64::from(chunk_x).wrapping_mul(a).wrapping_add(i64::from(chunk_z).wrapping_mul(b))) ^ (seed as i64);' \
+  mineshaft_piece::stronghold_tests::stronghold_layouts_and_writes_match_all_1211_native_oracle_vectors
+
+check "stronghold smooth-stone selector keeps the native cracked-stone threshold" \
+  src/stronghold_structures.rs '        if f < 0.2 {' \
+  '        if f < 0.1 {' \
+  mineshaft_piece::stronghold_tests::stronghold_layouts_and_writes_match_all_1211_native_oracle_vectors
+
+check "stronghold library piece refuses to spawn above depth four" \
+  src/stronghold_structures.rs '                        StrongholdKind::Library => depth > 4,' \
+  '                        StrongholdKind::Library => true,' \
+  mineshaft_piece::stronghold_tests::stronghold_layouts_and_writes_match_all_1211_native_oracle_vectors
+
+check "stronghold small-door iron door keeps the block default facing" \
+  src/stronghold_structures.rs '                let lower = state(self.reg, "minecraft:iron_door", &[]);' \
+  '                let lower = state(self.reg, "minecraft:iron_door", &[("facing", "east")]);' \
+  mineshaft_piece::stronghold_tests::stronghold_layouts_and_writes_match_all_1211_native_oracle_vectors
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

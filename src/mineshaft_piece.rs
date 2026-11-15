@@ -524,3 +524,4 @@ pub(crate) fn place(
 }
 
 include!("single_piece_structures.rs");
+include!("stronghold_structures.rs");
