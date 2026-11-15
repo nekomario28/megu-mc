@@ -8993,6 +8993,42 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             }
         }
     }
+    // `ChunkMap.protoChunkToFullChunk` promotes this chunk's `ProtoChunk` to a
+    // `LevelChunk`, and `LevelChunk.postProcessGeneration` then consumes the marks a
+    // `StructurePiece.placeBlock` left on it: every marked cell is re-derived with
+    // `Block.updateFromNeighbourShapes`, in section order then mark order. That is why a
+    // mineshaft fence picks up `east`/`west` from the pillars around it while the single
+    // bit it was written with is dropped.
+    //
+    // The promotion waits for the whole 3x3 to be `FULL` (`protoChunkToFullChunk` asks for
+    // that status over radius one), so the shape pass must not run when this chunk's own
+    // generation ends: a neighbour that decorates later still changes the blocks the pass
+    // reads. Measured on seed 4242 chunk (-96,35): the fence at (-1521,-21,560) reads its
+    // east neighbour as deepslate while only this chunk has generated and as the mineshaft
+    // corridor's `cave_air` once (-95,35) has, and native's stored bits are the latter.
+    for (x, y, z) in std::mem::take(&mut ctx.shape_marks) {
+        ctx.g.store_shape_mark(x, y, z);
+    }
+    let reg = breg();
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            let (cx, cz) = (sx + dx, sz + dz);
+            if !ctx.g.shape_marks_ready(cx, cz) {
+                continue;
+            }
+            let mut marks = ctx.g.take_shape_marks(cx, cz);
+            if marks.is_empty() {
+                continue;
+            }
+            // `ProtoChunk.markPosForPostprocessing` buckets by section and native walks the
+            // buckets in ascending order; `sort_by_key` is stable, so a bucket keeps mark order.
+            let min_y = ctx.g.min_y;
+            marks.sort_by_key(|&(_, y, _)| (y - min_y) >> 4);
+            if let Some(reg) = reg {
+                crate::structure_template::postprocess_shape_marks(&mut ctx, reg, &marks);
+            }
+        }
+    }
     // Taken before the writes because `ctx` borrows the generator; the containers ride
     // the same population and move into the runtime store as soon as the lock is released.
     let mut staged_payloads = std::mem::take(&mut ctx.payloads);

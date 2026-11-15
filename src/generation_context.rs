@@ -54,6 +54,12 @@ pub(crate) fn schedule_leaf_edge_state(
 pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
+    /// `ChunkAccess.postProcessing` as it stands after this chunk's own generation:
+    /// the write positions `StructurePiece.placeBlock` marked, in mark order. They
+    /// are consumed at the end of this chunk's `populate` (see
+    /// `feature::populate`), and the ones that belong to *other* chunks are handed
+    /// to `Gen` for those chunks' own promotion.
+    pub(crate) shape_marks: Vec<(i32, i32, i32)>,
     rc: HashMap<(i32, i32, i32), u32>, // terrain read-through cache
     /// Frozen pre-CARVERS `*_WG` heightmaps, memoized per column. Feature writes
     /// do not invalidate this terrain-only view. Live (non-WG) variants are never
@@ -83,6 +89,7 @@ impl<'a> FC<'a> {
         FC {
             g,
             wr: HashMap::new(),
+            shape_marks: Vec::new(),
             rc: HashMap::new(),
             hmwg: HashMap::new(),
             payloads: Vec::new(),
@@ -136,6 +143,12 @@ impl<'a> FC<'a> {
                 yaw,
             },
         ));
+    }
+    /// `StructurePiece.placeBlock`'s `chunk.markPosForPostprocessing(pos)` for a state
+    /// in `StructurePiece.SHAPE_CHECK_BLOCKS`. The owning chunk is `pos >> 4`; the mark
+    /// is only consumed while that chunk is still generating.
+    pub(crate) fn mark_shape(&mut self, x: i32, y: i32, z: i32) {
+        self.shape_marks.push((x, y, z));
     }
     pub(crate) fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {
         if let Some(&s) = self.wr.get(&(x, y, z)) {

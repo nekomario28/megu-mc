@@ -274,6 +274,9 @@ impl<'a, 'g> PieceWriter<'a, 'g> {
             return;
         }
         let transformed = transform_state(self.orient, st);
+        if self.reg.needs_postprocess_shape(transformed) {
+            self.ctx.mark_shape(wp.0, wp.1, wp.2);
+        }
         self.set_world_block(wp, transformed);
     }
 

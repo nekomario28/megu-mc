@@ -1034,6 +1034,9 @@ impl StrongholdWriter<'_, '_> {
         }
         let st = structure_transform::state(st, self.transform.0, self.transform.1)
             .expect("stronghold state transform");
+        if self.reg.needs_postprocess_shape(st) {
+            self.ctx.mark_shape(at.0, at.1, at.2);
+        }
         self.ctx.set(at.0, at.1, at.2, st);
     }
 

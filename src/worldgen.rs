@@ -741,6 +741,12 @@ pub struct Gen {
     deep_c: HashMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pop_done: HashSet<(i32, i32)>,
+    /// `ChunkAccess.postProcessing` seen across chunks: the positions
+    /// `StructurePiece.placeBlock` marked, keyed by the chunk that owns them and
+    /// kept in mark order. A chunk's bucket is consumed by
+    /// `LevelChunk.postProcessGeneration` once the chunk is promoted, which native
+    /// only allows after the whole 3x3 around it is `FULL`.
+    shape_marks: HashMap<(i32, i32), Vec<(i32, i32, i32)>>,
     // Sources reconstructed after loading must recreate terrain but not enqueue
     // the generation ticks a second time.
     restored_tick_sources: HashSet<(i32, i32)>,
@@ -1074,6 +1080,7 @@ impl Gen {
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            shape_marks: HashMap::new(),
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
             carved: HashSet::new(),
@@ -3215,6 +3222,7 @@ impl Gen {
             deep_c: HashMap::new(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            shape_marks: HashMap::new(),
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
             carved: HashSet::new(),
@@ -3994,6 +4002,28 @@ impl Gen {
             }
         }
         executed
+    }
+
+    /// `ChunkAccess.markPosForPostprocessing`, filed under the chunk that owns the cell
+    /// and kept in mark order.
+    pub(crate) fn store_shape_mark(&mut self, x: i32, y: i32, z: i32) {
+        self.shape_marks
+            .entry((x >> 4, z >> 4))
+            .or_default()
+            .push((x, y, z));
+    }
+
+    /// `ChunkMap.protoChunkToFullChunk` promotes a chunk only once the whole 3x3 is
+    /// `ChunkStatus.FULL` — the promotion future asks for that status over a radius of
+    /// one — so a chunk's `postProcessGeneration` runs after every chunk of its 3x3 has
+    /// finished generating. `pop_done` records exactly one entry per generated chunk.
+    pub(crate) fn shape_marks_ready(&self, cx: i32, cz: i32) -> bool {
+        (-1..=1).all(|dx| (-1..=1).all(|dz| self.pop_done.contains(&(cx + dx, cz + dz))))
+    }
+
+    /// The marks of a promoted chunk, in mark order. Consumed once.
+    pub(crate) fn take_shape_marks(&mut self, cx: i32, cz: i32) -> Vec<(i32, i32, i32)> {
+        self.shape_marks.remove(&(cx, cz)).unwrap_or_default()
     }
 
     /// Populate the 3x3 around a chunk if it has not been populated yet, so a
@@ -5689,6 +5719,94 @@ mod wg_tests {
                         }
                         got.insert(
                             (lx as i32, sy + ly, lz as i32),
+                            reg.canonical_state(st),
+                        );
+                    }
+                }
+            }
+            sy += 16;
+        }
+        let mut diffs: Vec<((i32, i32, i32), Option<&String>, Option<&String>)> = Vec::new();
+        for key in want.keys().chain(got.keys()) {
+            if want.get(key) != got.get(key) && !diffs.iter().any(|d| d.0 == *key) {
+                diffs.push((*key, want.get(key), got.get(key)));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} cells differ from the native capture, first few: {:?}",
+            diffs.len(),
+            &diffs[..diffs.len().min(5)]
+        );
+    }
+
+    /// The state-for-state gate for a chunk whose content is a *structure*, not terrain.
+    ///
+    /// Seed 4242 chunk (-96,35) carries a mineshaft corridor, a stronghold and a trial
+    /// chamber. Four of its cells are the residual this fixes: the `oak_fence` pair at
+    /// x = -1536, z = 565 keeps `east+north+west` (two `oak_log` pillars and a fence on
+    /// its west side) and the pair at z = 562 keeps *no* connection bit, because native's
+    /// `StructurePiece.placeBlock` marks those cells with `markPosForPostprocessing` and
+    /// `LevelChunk.postProcessGeneration` re-derives them from the world as it stands when
+    /// the chunk is promoted — which `ChunkMap.protoChunkToFullChunk` only allows once the
+    /// whole 3x3 around it is `FULL`.
+    ///
+    /// It also pins the other half of that pass: the two `glow_lichen` cells at
+    /// (-1521,-30,573..574) must be absent. The trial chamber template writes them with
+    /// `east=true`, their support cell lies outside the placement box, and
+    /// `MultifaceBlock.updateShape` clears the face and then the cell.
+    #[test]
+    fn structure_chunk_matches_native_capture_state_for_state() {
+        use std::io::Read;
+        let mut expected_text = String::new();
+        flate2::read::GzDecoder::new(
+            &include_bytes!("../tests/data/stronghold_chunk_-96_35_1211.tsv.gz")[..],
+        )
+        .read_to_string(&mut expected_text)
+        .unwrap();
+        let reg = crate::block_registry::breg().unwrap();
+        let mut want: std::collections::HashMap<(i32, i32, i32), String> =
+            std::collections::HashMap::new();
+        for line in expected_text.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 4, "{line}");
+            want.insert(
+                (
+                    f[0].parse().unwrap(),
+                    f[1].parse().unwrap(),
+                    f[2].parse().unwrap(),
+                ),
+                f[3].to_owned(),
+            );
+        }
+        assert_eq!(want.len(), 31_721, "the capture carries its full cell count");
+
+        let _guard = lock_gen();
+        // The generator reaches the structure pipeline's beardifier through a
+        // registered function pointer (`worldgen` sits below `feature`), and the
+        // process entry point registers it before any dump. Without it the terrain is
+        // unbearded, which moves the trial chamber's `encapsulate` shell and every block
+        // the surface then sees.
+        crate::feature::register_beard_resolver();
+        assert!(init(4242, crate::name_to_state), "generator for the captured seed");
+        let (lo, hi) = (min_y(), max_y());
+        let mut got: std::collections::HashMap<(i32, i32, i32), String> =
+            std::collections::HashMap::new();
+        let mut sy = lo;
+        while sy <= hi {
+            let arr = terrain_section(-96, sy, 35, crate::feature::populate).unwrap();
+            for ly in 0..16 {
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let st = arr[((ly << 8) | (lz << 4) | lx) as usize];
+                        if st == 0 {
+                            continue;
+                        }
+                        got.insert(
+                            (-96 * 16 + lx as i32, sy + ly, 35 * 16 + lz as i32),
                             reg.canonical_state(st),
                         );
                     }
@@ -8442,6 +8560,39 @@ mod wg_tests {
             g.populate_in_order([(2, 1), (-3, 4)], |_, _, _| panic!("already populated")),
             0
         );
+    }
+
+    /// `ChunkMap.protoChunkToFullChunk` promotes a chunk only once the whole 3x3 around
+    /// it is `ChunkStatus.FULL`, and `LevelChunk.postProcessGeneration` consumes the
+    /// chunk's shape marks right there. So a mark waits for every neighbour, and the list
+    /// is consumed once — a mark that arrives afterwards is never applied, which is the
+    /// stale connection bit native keeps on a fence written into an already-promoted chunk.
+    #[test]
+    fn shape_marks_wait_for_the_whole_three_by_three_and_are_consumed_once() {
+        let mut g = Gen::load(4242, crate::name_to_state).unwrap();
+        g.store_shape_mark(-1521, -21, 560);
+        assert_eq!(g.take_shape_marks(-97, 35), Vec::new(), "filed under its own chunk");
+        assert!(!g.shape_marks_ready(-96, 35), "nothing has generated yet");
+        let mut order: Vec<(i32, i32)> = Vec::new();
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if (dx, dz) != (0, 0) {
+                    order.push((-96 + dx, 35 + dz));
+                }
+            }
+        }
+        for (i, chunk) in order.iter().copied().enumerate() {
+            assert_eq!(g.populate_in_order([chunk], |_, _, _| {}), 1);
+            assert!(
+                !g.shape_marks_ready(-96, 35),
+                "still waiting for a chunk after {} of 8",
+                i + 1
+            );
+        }
+        assert_eq!(g.populate_in_order([(-96, 35)], |_, _, _| {}), 1);
+        assert!(g.shape_marks_ready(-96, 35), "the whole 3x3 has generated");
+        assert_eq!(g.take_shape_marks(-96, 35), vec![(-1521, -21, 560)]);
+        assert!(g.take_shape_marks(-96, 35).is_empty(), "consumed once");
     }
 
     #[test]

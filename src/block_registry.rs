@@ -1029,6 +1029,29 @@ impl BReg {
             .then(|| self.with_prop(state, "shape", shape))
     }
 
+    /// `StructurePiece.SHAPE_CHECK_BLOCKS`: the blocks whose `placeBlock` marks the
+    /// cell with `ChunkAccess.markPosForPostprocessing`, so the owning chunk's
+    /// `LevelChunk.postProcessGeneration` recomputes the connection shape when it is
+    /// promoted. Exactly eleven `Blocks` identities in the pinned version — the set
+    /// is by block, so the other fence woods, glass panes and the soul/redstone torch
+    /// family are deliberately absent.
+    pub(crate) fn needs_postprocess_shape(&self, st: u32) -> bool {
+        matches!(
+            self.name_of(st),
+            "minecraft:nether_brick_fence"
+                | "minecraft:torch"
+                | "minecraft:wall_torch"
+                | "minecraft:oak_fence"
+                | "minecraft:spruce_fence"
+                | "minecraft:birch_fence"
+                | "minecraft:jungle_fence"
+                | "minecraft:acacia_fence"
+                | "minecraft:dark_oak_fence"
+                | "minecraft:ladder"
+                | "minecraft:iron_bars"
+        )
+    }
+
     /// A known fragile support block is removed if its direct attachment
     /// becomes air or liquid. The direction points FROM the fragile block
     /// TOWARDS its old support, in the six native direction indices.

@@ -1267,6 +1267,33 @@ fn update_shape<W: TemplateWorld>(
     ) {
         return air;
     }
+    // `MultifaceBlock.updateShape` — `glow_lichen` and `sculk_vein` are the only
+    // two subclasses in the pinned version. A face whose support block stops
+    // being attachable is cleared, and the cell becomes air once its last face
+    // is gone; a cell with no faces at all is already air. `canAttachTo` is the
+    // neighbour's *support* shape **or** its *collision* shape covering that
+    // face (`Block.isFaceFull`), which is the pinned `multiface_support` table,
+    // indexed by the direction the face looks at.
+    if matches!(bare, "glow_lichen" | "sculk_vein") {
+        if !multiface_has_face(reg, state) {
+            return air;
+        }
+        let key = match direction {
+            0 => "down",
+            1 => "up",
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            _ => "east",
+        };
+        if reg.get_prop(state, key).as_deref() == Some("true")
+            && !reg.supports_multiface(neighbor, direction)
+        {
+            let next = reg.with_prop(state, key, "false");
+            return if multiface_has_face(reg, next) { next } else { air };
+        }
+        return state;
+    }
     if let Some(next) = reg.connection_after_neighbor(state, neighbor, 0, direction) {
         return next;
     }
@@ -1301,6 +1328,13 @@ fn update_shape<W: TemplateWorld>(
         }
     }
     state
+}
+
+/// `MultifaceBlock.hasAnyFace`: at least one of the six face properties is set.
+fn multiface_has_face(reg: &BReg, state: u32) -> bool {
+    ["down", "up", "north", "south", "west", "east"]
+        .iter()
+        .any(|key| reg.get_prop(state, key).as_deref() == Some("true"))
 }
 
 /// `Block.isExceptionForConnection`.
@@ -1500,6 +1534,39 @@ fn wall_update_shape<W: TemplateWorld>(
     next = reg.with_prop(next, "west", w_val);
     next = reg.with_prop(next, "east", e_val);
     reg.with_prop(next, "up", if up_val { "true" } else { "false" })
+}
+
+/// `LevelChunk.postProcessGeneration`'s per-cell rule, for the positions a
+/// `StructurePiece.placeBlock` marked with `markPosForPostprocessing`.
+///
+/// Native runs this once per chunk, when the `ProtoChunk` is promoted to a
+/// `LevelChunk` (`ChunkMap.protoChunkToFullChunk`): for every marked position, in
+/// section order then mark order, it skips a `LiquidBlock` cell and otherwise
+/// re-derives the state with `Block.updateFromNeighbourShapes`, writing the result
+/// with `UPDATE_INVISIBLE | UPDATE_KNOWN_SHAPE` (`20`). The caller owns which marks
+/// belong to the chunk being promoted and supplies them in that order.
+///
+/// Returns the number of cells the pass rewrote.
+pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
+    world: &mut W,
+    reg: &BReg,
+    marks: &[Pos],
+) -> usize {
+    let mut changed = 0;
+    for &pos in marks {
+        let state = world.get(pos.0, pos.1, pos.2);
+        // `!(state.getBlock() instanceof LiquidBlock)`: fluid blocks carry their own
+        // level, and `updateShape` has nothing to say about them.
+        if matches!(reg.name_of(state), "minecraft:water" | "minecraft:lava") {
+            continue;
+        }
+        let updated = update_from_neighbour_shapes(reg, state, world, pos);
+        if updated != state {
+            world.set(pos.0, pos.1, pos.2, updated);
+            changed += 1;
+        }
+    }
+    changed
 }
 
 /// `Block.updateFromNeighbourShapes` — `UPDATE_SHAPE_ORDER` is
@@ -3761,6 +3828,145 @@ mod template_structures_tests {
             placement,
             "a fence outside the written set keeps its state"
         );
+    }
+
+    /// `StructurePiece.SHAPE_CHECK_BLOCKS` is a `Blocks` *identity* set of eleven
+    /// blocks, not a name pattern. The other fence woods, the panes and the
+    /// soul/redstone torch family are absent, so native's `placeBlock` never marks
+    /// them for a connection recompute. An `ends_with("_fence")` predicate would mark
+    /// six more fence families, and a `_torch` one four more torches.
+    #[test]
+    fn the_postprocess_shape_set_is_exactly_the_native_eleven() {
+        let reg = breg().expect("block registry");
+        let state =
+            |name: &str| reg.checked_state(name, &[]).unwrap_or_else(|| panic!("{name}"));
+        for name in [
+            "minecraft:nether_brick_fence",
+            "minecraft:torch",
+            "minecraft:wall_torch",
+            "minecraft:oak_fence",
+            "minecraft:spruce_fence",
+            "minecraft:birch_fence",
+            "minecraft:jungle_fence",
+            "minecraft:acacia_fence",
+            "minecraft:dark_oak_fence",
+            "minecraft:ladder",
+            "minecraft:iron_bars",
+        ] {
+            assert!(reg.needs_postprocess_shape(state(name)), "{name}");
+        }
+        for name in [
+            "minecraft:crimson_fence",
+            "minecraft:warped_fence",
+            "minecraft:mangrove_fence",
+            "minecraft:cherry_fence",
+            "minecraft:bamboo_fence",
+            "minecraft:glass_pane",
+            "minecraft:white_stained_glass_pane",
+            "minecraft:soul_torch",
+            "minecraft:soul_wall_torch",
+            "minecraft:redstone_torch",
+            "minecraft:redstone_wall_torch",
+            "minecraft:oak_fence_gate",
+            "minecraft:lantern",
+            "minecraft:chain",
+        ] {
+            assert!(!reg.needs_postprocess_shape(state(name)), "{name}");
+        }
+    }
+
+    /// `MultifaceBlock.updateShape`, the rule behind the two `glow_lichen` cells of the
+    /// seed 4242 chunk (-96,35) capture: the trial chamber writes them with `east=true`
+    /// and their support lies outside the placement box, so the face is cleared and the
+    /// cell — with no face left — becomes air.
+    #[test]
+    fn postprocess_clears_a_multiface_face_whose_support_is_gone() {
+        let reg = breg().expect("block registry");
+        let full_cube = reg.state_of("minecraft:deepslate", None);
+        assert!(
+            reg.supports_multiface(full_cube, 2),
+            "a full cube carries the face that looks at it"
+        );
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        // The scene fills every column with stone up to its top, so the air the face
+        // looks into has to be written explicitly.
+        for (dx, dz) in [(1, 0), (0, 0)] {
+            world.set(dx, -30, dz, reg.state_of("minecraft:air", None));
+        }
+        // North is a full cube, east is air.
+        world.set(0, -30, -1, full_cube);
+        let lichen = reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:glow_lichen", None), "north", "true"),
+            "east",
+            "true",
+        );
+        world.set(0, -30, 0, lichen);
+
+        assert_eq!(postprocess_shape_marks(&mut world, reg, &[(0, -30, 0)]), 1);
+        let after = world.get(0, -30, 0);
+        assert_eq!(
+            reg.get_prop(after, "east").as_deref(),
+            Some("false"),
+            "nothing behind the east face"
+        );
+        assert_eq!(
+            reg.get_prop(after, "north").as_deref(),
+            Some("true"),
+            "the north face keeps its support"
+        );
+    }
+
+    /// The other half of the same rule: once the last face is gone the cell is air, not
+    /// a multiface block with every property `false`. `sculk_vein` shares the rule.
+    #[test]
+    fn postprocess_removes_a_multiface_cell_whose_last_face_is_gone() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        let air = reg.state_of("minecraft:air", None);
+        for (pos, name, face, support) in [
+            ((0, -30, 0), "minecraft:glow_lichen", "east", (1, -30, 0)),
+            ((0, -30, 4), "minecraft:sculk_vein", "up", (0, -29, 4)),
+        ] {
+            world.set(support.0, support.1, support.2, air);
+            let block = reg.with_prop(reg.state_of(name, None), face, "true");
+            world.set(pos.0, pos.1, pos.2, block);
+            assert_eq!(postprocess_shape_marks(&mut world, reg, &[pos]), 1);
+            assert_eq!(world.get(pos.0, pos.1, pos.2), air, "{name}");
+        }
+    }
+
+    /// `LevelChunk.postProcessGeneration`'s cell rule over a `StructurePiece` list: the
+    /// fence's stale `north` bit is cleared and the log to its west is picked up, while a
+    /// liquid cell in the same list is skipped (`!(state.getBlock() instanceof
+    /// LiquidBlock)`) instead of being shape-updated into air.
+    #[test]
+    fn postprocess_recomputes_a_marked_fence_and_skips_liquid() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        let log = reg.state_of("minecraft:oak_log", None);
+        let fence = reg.with_prop(
+            reg.state_of("minecraft:oak_fence", None),
+            "north",
+            "true",
+        );
+        let water = reg.with_prop(reg.state_of("minecraft:water", None), "level", "0");
+        world.set(-1, 70, 0, log);
+        world.set(0, 70, 0, fence);
+        world.set(4, 70, 4, water);
+
+        let changed = postprocess_shape_marks(&mut world, reg, &[(0, 70, 0), (4, 70, 4)]);
+        assert_eq!(changed, 1);
+        let after = world.get(0, 70, 0);
+        assert_eq!(reg.get_prop(after, "west").as_deref(), Some("true"));
+        assert_eq!(
+            reg.get_prop(after, "north").as_deref(),
+            Some("false"),
+            "the placement bit pointed at air"
+        );
+        assert_eq!(world.get(4, 70, 4), water, "liquid cells are skipped");
     }
 
     /// The oracle records the obfuscated entity class name.

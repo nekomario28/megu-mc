@@ -79,7 +79,14 @@ impl Writer<'_, '_> {
         if self.protected(old) {
             return;
         }
-        self.ctx.set(p.0, p.1, p.2, self.transformed(s));
+        let st = self.transformed(s);
+        // `StructurePiece.placeBlock`: a shape-check block is marked for the owning
+        // chunk's `postProcessGeneration`, which is what recomputes its connections
+        // from the neighbours that exist at the chunk's promotion.
+        if self.reg.needs_postprocess_shape(st) {
+            self.ctx.mark_shape(p.0, p.1, p.2);
+        }
+        self.ctx.set(p.0, p.1, p.2, st);
     }
     /// Native generateBox's iteration order is Y, then X, then Z. It invokes
     /// placeBlock even for unchanged cells; clipping does not suppress RNG draws.

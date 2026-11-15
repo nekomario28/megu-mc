@@ -218,6 +218,9 @@ impl<'a, 'g> PieceWorld<'a, 'g> {
             return;
         }
         let st = transform_state(self.orient, st);
+        if self.reg.needs_postprocess_shape(st) {
+            self.ctx.mark_shape(p.0, p.1, p.2);
+        }
         self.set_world(p, st);
     }
 

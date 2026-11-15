@@ -2324,6 +2324,37 @@ check "bonus chest refuses a chest outside the build height" \
                 // A column filled to the build limit' \
   feature::generation_contract_tests::bonus_chest_writes_nothing_when_the_heightmap_is_outside_the_world
 
+# StructurePiece.placeBlock's postprocess marks and the two shape rules behind them.
+check "a multiface face is cleared only when its own support is gone" \
+  src/template_structures.rs '            && !reg.supports_multiface(neighbor, direction)' \
+  '            && false' \
+  structure_template::template_structures_tests::postprocess_clears_a_multiface_face_whose_support_is_gone
+
+check "the postprocess mark set keeps iron bars and drops glass panes" \
+  src/block_registry.rs '                | "minecraft:ladder"
+                | "minecraft:iron_bars"' \
+  '                | "minecraft:ladder"
+                | "minecraft:glass_pane"' \
+  structure_template::template_structures_tests::the_postprocess_shape_set_is_exactly_the_native_eleven
+
+check "a mineshaft fence is marked for the owning chunk's promotion" \
+  src/mineshaft_piece.rs '        if self.reg.needs_postprocess_shape(st) {
+            self.ctx.mark_shape(p.0, p.1, p.2);
+        }' \
+  '        if false {
+            self.ctx.mark_shape(p.0, p.1, p.2);
+        }' \
+  worldgen::wg_tests::structure_chunk_matches_native_capture_state_for_state
+
+check "a shape pass waits for the whole 3x3, not just its own chunk" \
+  src/feature.rs '            if !ctx.g.shape_marks_ready(cx, cz) {
+                continue;
+            }' \
+  '            if false {
+                continue;
+            }' \
+  worldgen::wg_tests::structure_chunk_matches_native_capture_state_for_state
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
