@@ -88,6 +88,22 @@ pub(crate) enum GenerationPayload {
         pos: [f64; 3],
         yaw: f32,
     },
+    /// A hanging entity a template or an end-city data marker places
+    /// (`minecraft:item_frame` / `minecraft:glow_item_frame`). It is not a mob: the
+    /// runtime needs its facing and its framed stack, which the generic `Entity`
+    /// payload has no field for.
+    ///
+    /// `facing` is the placed `Direction.get3DDataValue()`. In 1.21.1 that value is
+    /// the direction's declaration ordinal (`north` 2, `south` 3, `west` 4, `east` 5)
+    /// and it is the same number the `Facing` save byte carries and the
+    /// `spawn_entity` object data sends (`ItemFrame.getAddEntityPacket`). `item` is
+    /// the framed stack as the template's `Item` NBT names it; the end-city marker
+    /// is the one place that authors it instead of a template.
+    ItemFrame {
+        glow: bool,
+        facing: u8,
+        item: Option<(String, u8)>,
+    },
     /// Entity position is the supplied block anchor plus (0.5, 0.5, 0.5).
     ChestMinecart { loot_seed: i64 },
 }

@@ -268,6 +268,22 @@ pub(crate) enum BeEvent {
 pub(crate) struct EntitySpawn {
     pub(crate) pos: Pos,
     pub(crate) id: String,
+    /// `Some` for the hanging entities a template or data marker places: they carry
+    /// a facing and a framed stack, which no mob payload can express. `None` for a
+    /// living entity or a hull entity (`minecraft:shulker`, `minecraft:boat`, …).
+    pub(crate) hanging: Option<HangingSpawn>,
+}
+
+/// The two fields a hanging entity adds to a spawn.
+///
+/// `facing` is `Direction.get3DDataValue()`: 1.21.1 sorts `BY_3D_DATA` on the
+/// declaration ordinal, so `north`/`south`/`west`/`east` are 2/3/4/5, and that
+/// number is both the `Facing` save byte (`HangingEntity.addAdditionalSaveData`)
+/// and the `spawn_entity` object data (`ItemFrame.getAddEntityPacket`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HangingSpawn {
+    pub(crate) facing: u8,
+    pub(crate) item: Option<(String, u8)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -287,13 +303,11 @@ pub(crate) fn stage_payloads(
     out: PlacementOut,
 ) {
     for entity in out.entities {
-        if entity.id == "minecraft:item_frame" {
-            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
-                eprintln!(
-                    "SPIPE_PAYLOAD unrouted entity {} at {:?}",
-                    entity.id, entity.pos
-                );
-            }
+        if let Some(hanging) = entity.hanging {
+            // `minecraft:glow_item_frame` is the same entity with a glowing item; the
+            // payload carries the flag so the runtime needs no second name table.
+            let glow = entity.id == "minecraft:glow_item_frame";
+            ctx.push_item_frame(entity.pos, glow, hanging.facing, hanging.item);
             continue;
         }
         ctx.push_entity(
@@ -1114,7 +1128,61 @@ fn place_entities<W: TemplateWorld>(
         if id == "minecraft:villager" {
             continue;
         }
-        out.entities.push(EntitySpawn { pos: block, id });
+        let hanging = hanging_spawn(&info.nbt, settings.mirror, settings.rotation);
+        out.entities.push(EntitySpawn {
+            pos: block,
+            id,
+            hanging,
+        });
+    }
+}
+
+/// The hanging-entity fields a template's entity NBT carries.
+///
+/// `StructureTemplate.placeInWorld` loads the entity from its NBT — so `Facing`
+/// becomes `HangingEntity`'s direction — and then applies `Entity.rotate(rotation)`
+/// to it, which `HangingEntity` overrides by turning the direction with the very
+/// same table `Rotation.rotate(Direction)` uses (1.21.1 `ciz.a(dmm)`:
+/// `CLOCKWISE_90 -> getClockWise`). The facing therefore rotates with the blocks.
+///
+/// `Item` is the framed stack; `ItemRotation` is the item's turn inside the frame.
+pub(crate) fn hanging_spawn(
+    nbt: &Tag,
+    mirror: Mirror,
+    rotation: crate::structure_transform::Rotation,
+) -> Option<HangingSpawn> {
+    let Some(Tag::Byte(byte)) = nbt.get("Facing") else {
+        return None;
+    };
+    let direction = direction_from_3d_data_value(*byte as u8)?;
+    // `HangingEntity.setDirection` validates a horizontal direction, and the only
+    // directions the 3D values can name here are the six face directions.
+    if !matches!(direction, Dir::North | Dir::South | Dir::West | Dir::East) {
+        return None;
+    }
+    let item = nbt.get("Item").and_then(|stack| {
+        let id = nbt_str(stack, "id")?;
+        let count = stack.get("count").and_then(Tag::int).unwrap_or(1);
+        let count = u8::try_from(count.clamp(0, 255)).ok()?;
+        (count > 0).then_some((id, count))
+    });
+    Some(HangingSpawn {
+        facing: rotate_direction(rotation, mirrored_direction(mirror, direction)).data_3d(),
+        item,
+    })
+}
+
+/// `Mirror.getRotation(Direction)` resolved onto the direction it turns: 1.21.1
+/// returns `CLOCKWISE_180` exactly for a direction that lies on the axis the mirror
+/// flips (`dkv.a(ji)`), and `StructureTemplate.placeInWorld` applies it as a second
+/// `Entity.rotate`, i.e. the opposite direction. This port's mirror names follow
+/// `from_index` (native indices), so `LeftRight` flips z like native `LEFT_RIGHT`
+/// and turns north/south, and `FrontBack` flips x and turns west/east.
+fn mirrored_direction(mirror: Mirror, direction: Dir) -> Dir {
+    match (mirror, direction) {
+        (Mirror::LeftRight, Dir::North | Dir::South) => direction.opposite(),
+        (Mirror::FrontBack, Dir::West | Dir::East) => direction.opposite(),
+        _ => direction,
     }
 }
 
@@ -3155,6 +3223,7 @@ impl Piece {
                     out.entities.push(EntitySpawn {
                         pos,
                         id: "minecraft:drowned".to_string(),
+                        hanging: None,
                     });
                     let state = if pos.1 > world.sea_level() {
                         reg.state_of("minecraft:air", None)
@@ -3967,6 +4036,157 @@ mod template_structures_tests {
             "the placement bit pointed at air"
         );
         assert_eq!(world.get(4, 70, 4), water, "liquid cells are skipped");
+    }
+
+    /// A template's hanging entity NBT carries its facing and framed stack, and the
+    /// piece rotation turns the facing with the blocks (native
+    /// `HangingEntity.rotate`, which `StructureTemplate.placeInWorld` applies after
+    /// reading `Facing`). A vertical facing is not a hanging entity: native
+    /// `HangingEntity.setDirection` validates a horizontal direction and throws.
+    #[test]
+    fn a_hanging_entity_reads_its_facing_and_stack_from_template_nbt() {
+        let frame_nbt = Tag::Compound(BTreeMap::from([
+            (
+                NbtString::text("id"),
+                Tag::String(NbtString::text("minecraft:item_frame")),
+            ),
+            // `Direction.get3DDataValue` of SOUTH is 3 in 1.21.1.
+            (NbtString::text("Facing"), Tag::Byte(3)),
+            (
+                NbtString::text("Item"),
+                Tag::Compound(BTreeMap::from([
+                    (
+                        NbtString::text("id"),
+                        Tag::String(NbtString::text("minecraft:elytra")),
+                    ),
+                    (NbtString::text("count"), Tag::Int(1)),
+                ])),
+            ),
+        ]));
+        let hanging = hanging_spawn(&frame_nbt, Mirror::None, Rotation::None).expect("hanging payload");
+        assert_eq!(hanging.facing, 3, "south keeps its own 3D data value");
+        assert_eq!(
+            hanging.item,
+            Some(("minecraft:elytra".to_string(), 1)),
+            "the framed stack survives"
+        );
+        assert_eq!(
+            hanging_spawn(&frame_nbt, Mirror::None, Rotation::Clockwise90)
+                .expect("hanging payload")
+                .facing,
+            4,
+            "a quarter turn clockwise turns a south-facing frame west"
+        );
+        assert_eq!(
+            hanging_spawn(&frame_nbt, Mirror::None, Rotation::Clockwise180)
+                .expect("hanging payload")
+                .facing,
+            2,
+            "half a turn faces north"
+        );
+        // `Mirror.getRotation` is 180 only for a direction on the axis the mirror
+        // flips: a z flip turns north/south, an x flip turns west/east.
+        assert_eq!(
+            hanging_spawn(&frame_nbt, Mirror::LeftRight, Rotation::None)
+                .expect("hanging payload")
+                .facing,
+            2,
+            "mirroring z turns a south-facing frame north"
+        );
+        assert_eq!(
+            hanging_spawn(&frame_nbt, Mirror::FrontBack, Rotation::None)
+                .expect("hanging payload")
+                .facing,
+            3,
+            "mirroring x leaves a south-facing frame alone"
+        );
+
+        let empty = Tag::Compound(BTreeMap::from([
+            (NbtString::text("Facing"), Tag::Byte(5)),
+        ]));
+        assert_eq!(
+            hanging_spawn(&empty, Mirror::None, Rotation::None).map(|h| (h.facing, h.item)),
+            Some((5, None)),
+            "an empty frame is still a frame"
+        );
+
+        let vertical = Tag::Compound(BTreeMap::from([
+            (NbtString::text("Facing"), Tag::Byte(0)),
+        ]));
+        assert!(
+            hanging_spawn(&vertical, Mirror::None, Rotation::None).is_none(),
+            "a hanging entity cannot face down"
+        );
+        assert!(hanging_spawn(&Tag::Compound(BTreeMap::new()), Mirror::None, Rotation::None).is_none());
+    }
+
+    /// Staging routes a hanging spawn to its own payload: the frame is neither a
+    /// mob (the `Entity` payload has no facing) nor dropped (what `stage_payloads`
+    /// did while the payload had nowhere to go).
+    #[test]
+    fn a_hanging_spawn_stages_an_item_frame_payload() {
+        use crate::generation_payload::GenerationPayload;
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+        let mut ctx = crate::generation_context::FC::new(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        let out = PlacementOut {
+            entities: vec![
+                EntitySpawn {
+                    pos: (4, 70, 4),
+                    id: "minecraft:item_frame".to_string(),
+                    hanging: Some(HangingSpawn {
+                        facing: 3,
+                        item: Some(("minecraft:elytra".to_string(), 1)),
+                    }),
+                },
+                EntitySpawn {
+                    pos: (5, 70, 4),
+                    id: "minecraft:glow_item_frame".to_string(),
+                    hanging: Some(HangingSpawn {
+                        facing: 4,
+                        item: None,
+                    }),
+                },
+                EntitySpawn {
+                    pos: (6, 70, 4),
+                    id: "minecraft:shulker".to_string(),
+                    hanging: None,
+                },
+            ],
+            ..Default::default()
+        };
+        stage_payloads(&mut ctx, out);
+        assert_eq!(
+            ctx.payloads,
+            vec![
+                (
+                    (4, 70, 4),
+                    GenerationPayload::ItemFrame {
+                        glow: false,
+                        facing: 3,
+                        item: Some(("minecraft:elytra".to_string(), 1)),
+                    }
+                ),
+                (
+                    (5, 70, 4),
+                    GenerationPayload::ItemFrame {
+                        glow: true,
+                        facing: 4,
+                        item: None,
+                    }
+                ),
+                (
+                    (6, 70, 4),
+                    // The anchor is the block, and the living payload is its centre.
+                    GenerationPayload::Entity {
+                        id: "minecraft:shulker".to_string(),
+                        pos: [6.5, 70.0, 4.5],
+                        yaw: 0.0,
+                    }
+                ),
+            ]
+        );
     }
 
     /// The oracle records the obfuscated entity class name.

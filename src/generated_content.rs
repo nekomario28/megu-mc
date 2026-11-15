@@ -183,10 +183,131 @@ impl Cart {
         Some((table, seed))
     }
 }
+/// A generated hanging entity (`minecraft:item_frame` / `minecraft:glow_item_frame`).
+///
+/// Same shape as `Cart`: the native save compound plus a runtime entity id. The
+/// fields kept are the ones the save and the client need — `Facing`
+/// (`HangingEntity.addAdditionalSaveData`, a `Direction.get3DDataValue()` byte),
+/// the framed `Item` stack and `ItemRotation` (`ItemFrame.addAdditionalSaveData`).
+/// The entity's own position is derived: a hanging entity hangs *in* the block its
+/// `Pos` names, so the block center is stored and the facing decides which face.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Frame {
+    pub eid: i32,
+    pub data: Tag,
+}
+impl Frame {
+    pub fn new(
+        eid: i32,
+        uuid: [u8; 16],
+        p: Pos,
+        glow: bool,
+        facing: u8,
+        item: Option<(&str, u8)>,
+    ) -> Self {
+        let mut values = vec![
+            (
+                "id",
+                string(if glow {
+                    "minecraft:glow_item_frame"
+                } else {
+                    "minecraft:item_frame"
+                }),
+            ),
+            (
+                "UUID",
+                Tag::IntArray(
+                    uuid.chunks_exact(4)
+                        .map(|v| i32::from_be_bytes(v.try_into().unwrap()))
+                        .collect(),
+                ),
+            ),
+            (
+                "Pos",
+                Tag::List(
+                    6,
+                    [p.0, p.1, p.2]
+                        .map(|v| Tag::Double((v as f64 + 0.5).to_bits()))
+                        .to_vec(),
+                ),
+            ),
+            ("Facing", Tag::Byte(facing as i8)),
+            ("ItemRotation", Tag::Byte(0)),
+        ];
+        if let Some((name, count)) = item {
+            values.push((
+                "Item",
+                compound([("id", string(name)), ("count", Tag::Int(i32::from(count)))]),
+            ));
+        }
+        Self {
+            eid,
+            data: compound(values),
+        }
+    }
+    pub fn uuid(&self) -> Result<[u8; 16], &'static str> {
+        let Some(Tag::IntArray(v)) = self.data.get("UUID") else {
+            return Err("frame UUID missing");
+        };
+        if v.len() != 4 {
+            return Err("invalid frame UUID");
+        }
+        let mut bytes = [0u8; 16];
+        for (i, v) in v.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        Ok(bytes)
+    }
+    pub fn pos(&self) -> Result<[f64; 3], &'static str> {
+        let Some(Tag::List(6, values)) = self.data.get("Pos") else {
+            return Err("frame position missing");
+        };
+        if values.len() != 3 {
+            return Err("invalid frame position");
+        }
+        let mut pos = [0.; 3];
+        for (i, v) in values.iter().enumerate() {
+            let Tag::Double(v) = v else {
+                return Err("invalid frame coordinate");
+            };
+            pos[i] = f64::from_bits(*v);
+            if !pos[i].is_finite() {
+                return Err("nonfinite frame coordinate");
+            }
+        }
+        Ok(pos)
+    }
+    /// `HangingEntity`'s direction as `Direction.get3DDataValue` writes it.
+    pub fn facing(&self) -> Result<u8, &'static str> {
+        match self.data.get("Facing") {
+            Some(Tag::Byte(v)) if (0..=5).contains(v) => Ok(*v as u8),
+            _ => Err("invalid frame facing"),
+        }
+    }
+    pub fn glow(&self) -> bool {
+        is_id(&self.data, "minecraft:glow_item_frame")
+    }
+    /// The framed stack's `id` and `count`, as `ItemFrame.addAdditionalSaveData`
+    /// writes them. `None` is an empty frame.
+    pub fn item(&self) -> Option<(String, u8)> {
+        let stack = self.data.get("Item")?;
+        let id = stack.get("id").and_then(Tag::string)?.to_utf8().ok()?;
+        let count = stack.get("count").and_then(Tag::int).unwrap_or(1);
+        let count = u8::try_from(count).ok()?;
+        (count > 0).then_some((id, count))
+    }
+    pub fn rotation(&self) -> i32 {
+        match self.data.get("ItemRotation") {
+            Some(Tag::Byte(v)) => i32::from(*v),
+            _ => 0,
+        }
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Content {
     pub spawners: BTreeMap<Pos, Tag>,
     pub carts: Vec<Cart>,
+    pub frames: Vec<Frame>,
 }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Snapshot {
@@ -224,6 +345,13 @@ impl Snapshot {
                 Tag::List(
                     10,
                     self.content.carts.iter().map(|c| c.data.clone()).collect(),
+                ),
+            ),
+            (
+                "frames",
+                Tag::List(
+                    10,
+                    self.content.frames.iter().map(|f| f.data.clone()).collect(),
                 ),
             ),
             ("sources", Tag::LongArray(sources)),
@@ -298,6 +426,26 @@ impl Snapshot {
                 return Err("duplicate generated cart UUID");
             }
             out.content.carts.push(cart);
+        }
+        // A save written before hanging entities were materialized has no `frames`
+        // list at all; an empty section is not a corrupt one.
+        for tag in match root.get("frames") {
+            Some(Tag::List(_, v)) => v.as_slice(),
+            _ => &[],
+        } {
+            if !is_id(tag, "minecraft:item_frame") && !is_id(tag, "minecraft:glow_item_frame") {
+                return Err("invalid generated frame id");
+            }
+            let frame = Frame {
+                eid: 0,
+                data: tag.clone(),
+            };
+            frame.pos()?;
+            frame.facing()?;
+            if !uuids.insert(frame.uuid()?) {
+                return Err("duplicate generated frame UUID");
+            }
+            out.content.frames.push(frame);
         }
         let Some(Tag::LongArray(sources)) = root.get("sources") else {
             return Err("generated sources missing");

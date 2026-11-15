@@ -116,6 +116,27 @@ impl Dir {
             Self::East => "east",
         }
     }
+    /// `Direction.get3DDataValue`: the number `HangingEntity`'s `Facing` save byte
+    /// and the `spawn_entity` object data carry. 1.21.1 builds `BY_3D_DATA` by
+    /// sorting the enum on this field and the field is the declaration ordinal, so
+    /// it is the ordinal (`DOWN` 0 … `EAST` 5) — *not* the older -1/2/0/1/3 table
+    /// the 2D values imply.
+    pub(crate) fn data_3d(self) -> u8 {
+        self as u8
+    }
+}
+
+/// `Direction.from3DDataValue`: `BY_3D_DATA` is the declaration order.
+pub(crate) fn direction_from_3d_data_value(value: u8) -> Option<Dir> {
+    Some(match value {
+        0 => Dir::Down,
+        1 => Dir::Up,
+        2 => Dir::North,
+        3 => Dir::South,
+        4 => Dir::West,
+        5 => Dir::East,
+        _ => return None,
+    })
 }
 
 /// `Rotation.getRotated(Rotation)`: index addition modulo four
@@ -2793,12 +2814,21 @@ fn handle_data_marker<W: TemplateWorld>(
                 out.entities.push(EntitySpawn {
                     pos,
                     id: "minecraft:shulker".to_string(),
+                    hanging: None,
                 });
             } else if metadata.starts_with("Elytra") {
-                let _ = rotate_direction(rotation, Dir::South);
+                // `EndCityPiece.handleDataMarker`: `new ItemFrame(level, pos,
+                // this.placeSettings.getRotation().rotate(Direction.SOUTH))` carrying
+                // `new ItemStack(Items.ELYTRA)`. The constructor consumes no RNG and the
+                // marker is the ship's single treasure-room frame, so the facing is the
+                // piece rotation applied to SOUTH and the stack is one elytra.
                 out.entities.push(EntitySpawn {
                     pos,
                     id: "minecraft:item_frame".to_string(),
+                    hanging: Some(HangingSpawn {
+                        facing: rotate_direction(rotation, Dir::South).data_3d(),
+                        item: Some(("minecraft:elytra".to_string(), 1)),
+                    }),
                 });
             }
         }
@@ -2824,6 +2854,7 @@ fn handle_data_marker<W: TemplateWorld>(
                     out.entities.push(EntitySpawn {
                         pos,
                         id: "minecraft:evoker".to_string(),
+                        hanging: None,
                     });
                     spawned = 1;
                 }
@@ -2831,6 +2862,7 @@ fn handle_data_marker<W: TemplateWorld>(
                     out.entities.push(EntitySpawn {
                         pos,
                         id: "minecraft:vindicator".to_string(),
+                        hanging: None,
                     });
                     spawned = 1;
                 }
@@ -2840,6 +2872,7 @@ fn handle_data_marker<W: TemplateWorld>(
                         out.entities.push(EntitySpawn {
                             pos,
                             id: "minecraft:allay".to_string(),
+                            hanging: None,
                         });
                     }
                     spawned = count;
@@ -3851,6 +3884,71 @@ mod end_city_mansion_tests {
         end_city_chest_loot(&mut empty, (1, 70, 3), &mut untouched);
         assert!(empty.be_events.is_empty());
         assert_eq!(untouched.state128(), Xor::seed_worldgen(5).state128());
+    }
+
+    /// `EndCityPiece.handleDataMarker`'s `Elytra` branch: an item frame at the marker
+    /// carrying one elytra, faced by the piece rotation applied to SOUTH
+    /// (`new ItemFrame(level, pos, placeSettings.getRotation().rotate(Direction.SOUTH))`
+    /// then `setItem(new ItemStack(Items.ELYTRA))`).
+    ///
+    /// The facing is the rotated one, which is what the old code threw away: the
+    /// ship in the native corpus (`end-city-ship-s0`) is placed a quarter turn, so
+    /// its frame faces west while the template's marker says south.
+    #[test]
+    fn end_ship_elytra_marker_stages_a_rotated_item_frame_with_the_elytra() {
+        let reg = breg().expect("block registry");
+        let chunk_bb: BB = [0, -64, 0, 15, 319, 15];
+        let mut world = TestWorld::new(flat_scene(reg, 70, 63));
+        // (piece rotation, `Direction.get3DDataValue` of rotation.rotate(SOUTH))
+        for (rotation, facing) in [
+            (Rotation::None, 3),               // south
+            (Rotation::Clockwise90, 4),        // west
+            (Rotation::Clockwise180, 2),       // north
+            (Rotation::Counterclockwise90, 5), // east
+        ] {
+            let mut out = PlacementOut::default();
+            let mut rng = Xor::seed_worldgen(11);
+            let before = rng.state128();
+            handle_data_marker(
+                &mut world,
+                reg,
+                &mut out,
+                StructureFlavour::EndCity,
+                "Elytra",
+                (4, 70, 4),
+                rotation,
+                &chunk_bb,
+                &mut rng,
+            );
+            assert_eq!(out.entities.len(), 1, "{rotation:?} stages one frame");
+            let spawn = &out.entities[0];
+            assert_eq!(spawn.id, "minecraft:item_frame");
+            assert_eq!(spawn.pos, (4, 70, 4));
+            let hanging = spawn.hanging.as_ref().expect("hanging payload");
+            assert_eq!(hanging.facing, facing, "{rotation:?} facing");
+            assert_eq!(
+                hanging.item,
+                Some(("minecraft:elytra".to_string(), 1)),
+                "the ship's frame holds one elytra"
+            );
+            assert_eq!(rng.state128(), before, "the frame costs no draw");
+        }
+
+        // The marker is still delivered only inside the chunk being placed.
+        let mut outside = PlacementOut::default();
+        let mut rng = Xor::seed_worldgen(11);
+        handle_data_marker(
+            &mut world,
+            reg,
+            &mut outside,
+            StructureFlavour::EndCity,
+            "Elytra",
+            (20, 70, 4),
+            Rotation::None,
+            &chunk_bb,
+            &mut rng,
+        );
+        assert!(outside.entities.is_empty(), "a frame in another chunk waits");
     }
 
     /// `WoodlandMansionPiece.handleDataMarker` writes a chest whose `facing` is

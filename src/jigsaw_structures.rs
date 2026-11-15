@@ -2873,6 +2873,21 @@ fn place_single_or_legacy<D: JigsawData>(
                 continue;
             };
             let id = ns_name(&id);
+            if id == "minecraft:item_frame" || id == "minecraft:glow_item_frame" {
+                // A hanging entity owns no free position: it hangs in the block the
+                // template names, faced by its own `Facing` rotated with the piece.
+                if let Some(hanging) =
+                    crate::structure_template::hanging_spawn(&info.nbt, Mirror::None, rot)
+                {
+                    ctx.push_item_frame(
+                        block_pos,
+                        id == "minecraft:glow_item_frame",
+                        hanging.facing,
+                        hanging.item,
+                    );
+                    continue;
+                }
+            }
             if matches!(
                 id.as_str(),
                 "minecraft:armor_stand"

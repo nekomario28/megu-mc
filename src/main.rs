@@ -634,6 +634,10 @@ const MOB_CAP: usize = 4096;
 const DROP_CAP: usize = 8192;
 const XP_CAP: usize = 4096;
 const HOPPER_CAP: usize = 65536;
+// A generated hanging entity is static, so nothing turns one back into a spawn:
+// the cap is what bounds a placement bug that stages the same marker in every
+// chunk of a structure.
+const FRAME_CAP: usize = 4096;
 // entity interest management (vanilla EntityTracker analogue):
 // clients only know entities within VIS_R2 — spawn on approach,
 // destroy on leave, prune dead. Server never streams far entities.
@@ -649,6 +653,22 @@ fn interest_tick() {
         let cart = cart.clone();
         let [x,y,z] = cart.pos().expect("validated generated cart");
         ents.push((cart.eid, x, y, z, Box::new(move || vec![(0x01, spawn_generated_cart(&cart))])));
+    }
+    for frame in generated_content().lock().unwrap().frames.iter() {
+        let frame = frame.clone();
+        let [x, y, z] = frame.pos().expect("validated generated frame");
+        ents.push((
+            frame.eid,
+            x,
+            y,
+            z,
+            Box::new(move || {
+                vec![
+                    (0x01, spawn_generated_frame(&frame)),
+                    (0x58, frame_meta_pkt(&frame)),
+                ]
+            }),
+        ));
     }
     for m in mobs().lock().unwrap().iter() {
         let p = *m.pos.lock().unwrap();
@@ -751,7 +771,7 @@ fn interest_tick() {
             x,
             y,
             z,
-            Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0))]),
+            Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0, 0))]),
         ));
     }
     for f in falling().lock().unwrap().iter() {
@@ -2288,7 +2308,16 @@ fn spawn_mob(m: &Mob) -> Vec<u8> {
     p.extend_from_slice(&[0u8; 6]);
     p
 }
-fn spawn_entity_pkt(eid: i32, etype: u32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Vec<u8> {
+fn spawn_entity_pkt(
+    eid: i32,
+    etype: u32,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+    data: i64,
+) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, eid as i64);
     p.extend_from_slice(&[0u8; 16]);
@@ -2297,7 +2326,7 @@ fn spawn_entity_pkt(eid: i32, etype: u32, x: f64, y: f64, z: f64, yaw: f32, pitc
     p.extend_from_slice(&y.to_be_bytes());
     p.extend_from_slice(&z.to_be_bytes());
     spawn_angles(&mut p, yaw, pitch);
-    write_varint(&mut p, 0);
+    write_varint(&mut p, data);
     p.extend_from_slice(&[0u8; 6]);
     p
 }
@@ -5663,6 +5692,65 @@ fn spawn_generated_cart(cart: &generated_content::Cart) -> Vec<u8> {
     }
     out
 }
+/// `HangingEntity.setDirection`'s yaw: `Direction.get2DDataValue() * 90` (`south` 0,
+/// `west` 90, `north` 180, `east` 270). The facing itself travels as the spawn
+/// packet's object data; the angle keeps a client that reads the entity's rotation
+/// from agreeing with it.
+fn frame_yaw(facing: u8) -> f32 {
+    match facing {
+        3 => 0.0,
+        4 => 90.0,
+        2 => 180.0,
+        5 => 270.0,
+        _ => 0.0,
+    }
+}
+/// `spawn_entity` for a generated hanging entity. The object data is the facing's
+/// `Direction.get3DDataValue()` (`ItemFrame.getAddEntityPacket` passes exactly that
+/// to `ClientboundAddEntityPacket`; the client rebuilds the direction from it).
+fn spawn_generated_frame(frame: &generated_content::Frame) -> Vec<u8> {
+    let [x, y, z] = frame.pos().expect("validated generated frame");
+    let facing = frame.facing().expect("validated frame facing");
+    let etype = if frame.glow() {
+        name_to_etype("glow_item_frame")
+    } else {
+        name_to_etype("item_frame")
+    }
+    .expect("item frame entity type");
+    spawn_entity_pkt(
+        frame.eid,
+        u32::try_from(etype).expect("item frame entity type fits"),
+        x,
+        y,
+        z,
+        frame_yaw(facing),
+        0.0,
+        i64::from(facing),
+    )
+}
+/// `set_entity_data` for a frame. Both fields are `SynchedEntityData` entries the
+/// `ItemFrame` class defines after `Entity`'s eight, so `ItemFrame`'s item is index 8
+/// (`ItemStack`, type 7) and its rotation index 9 (`INT`, type 1); `HangingEntity`
+/// defines none (its direction is the spawn packet's object data).
+fn frame_meta_pkt(frame: &generated_content::Frame) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, frame.eid as i64);
+    if let Some((name, count)) = frame.item() {
+        if let Some(item) = name_to_item(&name) {
+            p.push(8);
+            write_varint(&mut p, 7); // ENTITY_DATA_SERIALIZER id: item stack
+            write_varint(&mut p, i64::from(count));
+            write_varint(&mut p, item);
+            write_varint(&mut p, 0); // added components
+            write_varint(&mut p, 0); // removed components
+        }
+    }
+    p.push(9);
+    write_varint(&mut p, 1); // ENTITY_DATA_SERIALIZER id: int
+    write_varint(&mut p, i64::from(frame.rotation()));
+    p.push(0xff);
+    p
+}
 fn generated_spawner_chunk_entities(cx: i32, cz: i32) -> Vec<ChunkBlockEntity> {
     generated_content()
         .lock()
@@ -5904,6 +5992,35 @@ fn materialize_generation_payloads_inner(
                     .unwrap()
                     .carts
                     .push(generated_content::Cart::new(eid, uuid, pos, loot_seed));
+            }
+            crate::generation_payload::GenerationPayload::ItemFrame {
+                glow,
+                facing,
+                item,
+            } => {
+                // A hanging entity is not a mob: `Mob` carries hit points, air and a
+                // fuse, none of which a frame has. It goes into the generated-content
+                // store, so its UUID, facing and framed stack survive a save like a
+                // generated cart's loot does.
+                let mut gen = generated_content().lock().unwrap();
+                if gen.frames.len() >= FRAME_CAP {
+                    continue;
+                }
+                let mut uuid = [0u8; 16];
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| f.read_exact(&mut uuid))
+                    .expect("entity UUID entropy");
+                uuid[6] = (uuid[6] & 15) | 64;
+                uuid[8] = (uuid[8] & 63) | 128;
+                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                gen.frames.push(generated_content::Frame::new(
+                    eid,
+                    uuid,
+                    pos,
+                    glow,
+                    facing,
+                    item.as_ref().map(|(id, count)| (id.as_str(), *count)),
+                ));
             }
             crate::generation_payload::GenerationPayload::Sign(lines) => {
                 // Key `front = 1`: the template's text is the front side.
@@ -10622,6 +10739,9 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                     }
                 }
             }
+        }
+        for frame in &mut generated.content.frames {
+            frame.eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         }
         *generated_content().lock().unwrap() = generated.content;
         if !cart_inventories.is_empty() {
@@ -27700,6 +27820,136 @@ mod mineshaft_runtime_tests {
         let off = generated_content().lock().unwrap().carts[0].clone();
         assert!(off.on_ground(), "cart falling onto stone floor should set OnGround=true");
         assert!(off.motion()[0] <= 0.11, "ground slowdown should damp horizontal motion: {:?}", off.motion());
+    }
+
+    /// An end-ship `Elytra` frame reaches the runtime as a hanging entity: the store
+    /// keeps the native save shape (block centre, `Facing` byte, framed stack), the
+    /// spawn packet's object data is the facing and its yaw is `get2DDataValue * 90`,
+    /// the metadata packet carries the stack at index 8, and a save/load keeps both.
+    #[test]
+    fn item_frame_payloads_materialize_spawn_and_survive_a_save() {
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        forceloaded().lock().unwrap().insert((0, 0));
+        refresh_hot();
+
+        materialize_generation_payloads_inner(vec![
+            (
+                (4, 70, 4),
+                crate::generation_payload::GenerationPayload::ItemFrame {
+                    glow: false,
+                    facing: 4,
+                    item: Some(("minecraft:elytra".to_owned(), 1)),
+                },
+            ),
+            (
+                (5, 70, 4),
+                crate::generation_payload::GenerationPayload::ItemFrame {
+                    glow: true,
+                    facing: 3,
+                    item: None,
+                },
+            ),
+        ]);
+        let frames = generated_content().lock().unwrap().frames.clone();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].pos().unwrap(), [4.5, 70.5, 4.5]);
+        assert_eq!(frames[0].facing().unwrap(), 4);
+        assert!(!frames[0].glow());
+        assert_eq!(
+            frames[0].item(),
+            Some(("minecraft:elytra".to_string(), 1)),
+            "the framed elytra is stored, not just the entity"
+        );
+        assert!(frames[1].glow());
+        assert_eq!(frames[1].item(), None);
+
+        // `spawn_entity`: ... x/y/z doubles, pitch/yaw/head bytes, then the object data.
+        let spawn = spawn_generated_frame(&frames[0]);
+        let (eid, p) = read_varint_at(&spawn, 0);
+        assert_eq!(eid, i64::from(frames[0].eid));
+        let (etype, after) = read_varint_at(&spawn, p + 16);
+        assert_eq!(etype, name_to_etype("item_frame").unwrap());
+        let x = f64::from_be_bytes(spawn[after..after + 8].try_into().unwrap());
+        assert_eq!(x, 4.5);
+        let angles = after + 24;
+        assert_eq!(spawn[angles], 0, "pitch");
+        assert_eq!(spawn[angles + 1], angle(90.0) as u8, "west is 90 degrees");
+        let (data, _) = read_varint_at(&spawn, angles + 3);
+        assert_eq!(data, 4, "the facing travels as the object data");
+
+        // `set_entity_data`: index 8 holds the `ItemStack`, index 9 the rotation.
+        let meta = frame_meta_pkt(&frames[0]);
+        let (meta_eid, p) = read_varint_at(&meta, 0);
+        assert_eq!(meta_eid, i64::from(frames[0].eid));
+        assert_eq!(meta[p], 8);
+        let (kind, p) = read_varint_at(&meta, p + 1);
+        assert_eq!(kind, 7, "ITEM_STACK serializer");
+        let (count, p) = read_varint_at(&meta, p);
+        assert_eq!(count, 1);
+        let (item, p) = read_varint_at(&meta, p);
+        assert_eq!(item, name_to_item("minecraft:elytra").unwrap());
+        let (added, p) = read_varint_at(&meta, p);
+        assert_eq!(added, 0, "no added components");
+        let (removed, p) = read_varint_at(&meta, p);
+        assert_eq!(removed, 0, "no removed components");
+        assert_eq!(meta[p], 9, "index 9 is the item's rotation");
+        let (kind, p) = read_varint_at(&meta, p + 1);
+        assert_eq!(kind, 1, "INT serializer");
+        assert_eq!(read_varint_at(&meta, p).0, 0, "rotation 0");
+        assert_eq!(meta[meta.len() - 1], 0xff);
+
+        // A client in range is spawned the frame and sent its stack.
+        let (client, mut receiver) = effect_tests::client_pair();
+        *client.pos.lock().unwrap() = (4.5, 70.0, 4.5, 0.0, 0.0, true);
+        let client = Arc::new(client);
+        clients().lock().unwrap().push(client.clone());
+        interest_tick();
+        let _ = client.sock.lock().unwrap().shutdown(Shutdown::Write);
+        let (mut saw_spawn, mut saw_data, mut spawn_data) = (false, false, 0i64);
+        while let Some((pid, body)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
+        {
+            if pid == 0x01 {
+                let (spawned, p) = read_varint_at(&body, 0);
+                if spawned == i64::from(frames[0].eid) {
+                    saw_spawn = true;
+                    let (etype, after) = read_varint_at(&body, p + 16);
+                    assert_eq!(etype, name_to_etype("item_frame").unwrap());
+                    spawn_data = read_varint_at(&body, after + 24 + 3).0;
+                }
+            } else if pid == 0x58 {
+                let (target, p) = read_varint_at(&body, 0);
+                if target == i64::from(frames[0].eid) {
+                    assert_eq!(body[p], 8);
+                    saw_data = true;
+                }
+            }
+        }
+        assert!(saw_spawn && saw_data, "tracker sent spawn={saw_spawn} data={saw_data}");
+        assert_eq!(spawn_data, 4, "the object data survives the tracker");
+
+        // The generated-content section carries the frames across a save and load.
+        let mut saved = Vec::new();
+        save_world_into(&mut saved);
+        generated_content().lock().unwrap().frames.clear();
+        load_world_from(&saved).unwrap();
+        let reloaded = generated_content().lock().unwrap().frames.clone();
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(reloaded[0].pos().unwrap(), [4.5, 70.5, 4.5]);
+        assert_eq!(reloaded[0].facing().unwrap(), 4);
+        assert!(!reloaded[0].glow());
+        assert_eq!(
+            reloaded[0].item(),
+            Some(("minecraft:elytra".to_string(), 1))
+        );
+        assert!(reloaded[1].glow());
+        assert_eq!(reloaded[1].item(), None);
+        assert_ne!(reloaded[0].uuid().unwrap(), [0u8; 16]);
+        assert_ne!(
+            reloaded[0].uuid().unwrap(),
+            reloaded[1].uuid().unwrap(),
+            "two frames keep distinct identities"
+        );
     }
 
     #[test]

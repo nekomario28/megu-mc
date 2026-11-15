@@ -150,6 +150,21 @@ impl<'a> FC<'a> {
     pub(crate) fn mark_shape(&mut self, x: i32, y: i32, z: i32) {
         self.shape_marks.push((x, y, z));
     }
+    /// A hanging entity: `pos` is the block it hangs in. `HangingEntity` derives its
+    /// own position from that block and its facing, so the payload keeps the block
+    /// anchor the marker or template named instead of a computed entity position.
+    pub(crate) fn push_item_frame(
+        &mut self,
+        pos: (i32, i32, i32),
+        glow: bool,
+        facing: u8,
+        item: Option<(String, u8)>,
+    ) {
+        self.payloads.push((
+            pos,
+            crate::generation_payload::GenerationPayload::ItemFrame { glow, facing, item },
+        ));
+    }
     pub(crate) fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {
         if let Some(&s) = self.wr.get(&(x, y, z)) {
             return s;

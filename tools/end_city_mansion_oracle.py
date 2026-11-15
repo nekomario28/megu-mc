@@ -121,6 +121,23 @@ def build_cases():
             'chunks': box_chunks(cx, cz, radius),
             'terrain': terrain,
         })
+    # None of the seeds above reaches the end ship in the tower recursion, and the
+    # ship is the only place the `Elytra` data marker is: the single item frame in
+    # its treasure room. The case lists the ship's own 3x2 chunk box instead of a
+    # square around the structure's chunk, because the ship hangs ~90 blocks off its
+    # tower and a per-chunk pass only delivers a marker inside the chunk it is
+    # placing.
+    structures.append({
+        'id': 'end-city-ship-s0',
+        'kind': 'end_city',
+        'structure': END_CITY,
+        'world_seed': 0,
+        'cx': 0,
+        'cz': 0,
+        'post_seed': 4242,
+        'chunks': [[cx, cz] for cx in (3, 4, 5) for cz in (1, 2)],
+        'terrain': flat(70, 0, 0),
+    })
 
     # Mansions: the grid RNG stream is shared with the piece placer, so the
     # seeds matter; the third floor only exists when a 1x2 room with a door is

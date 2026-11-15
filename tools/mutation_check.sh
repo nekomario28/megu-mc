@@ -2355,6 +2355,35 @@ check "a shape pass waits for the whole 3x3, not just its own chunk" \
             }' \
   worldgen::wg_tests::structure_chunk_matches_native_capture_state_for_state
 
+check "an end-ship frame faces where the piece rotation puts it" \
+  src/end_city_mansion.rs '                        facing: rotate_direction(rotation, Dir::South).data_3d(),' \
+  '                        facing: Dir::South.data_3d(),' \
+  structure_template::end_city_mansion_tests::end_ship_elytra_marker_stages_a_rotated_item_frame_with_the_elytra
+
+check "an end-ship frame carries the elytra" \
+  src/end_city_mansion.rs '                        item: Some(("minecraft:elytra".to_string(), 1)),' \
+  '                        item: None,' \
+  structure_template::end_city_mansion_tests::end_ship_elytra_marker_stages_a_rotated_item_frame_with_the_elytra
+
+check "a hanging spawn stages its own payload, not a mob" \
+  src/template_structures.rs '        if let Some(hanging) = entity.hanging {' \
+  '        if let Some(hanging) = entity.hanging.filter(|_| false) {' \
+  structure_template::template_structures_tests::a_hanging_spawn_stages_an_item_frame_payload
+
+check "a template's hanging entity turns its facing with the piece" \
+  src/template_structures.rs '        facing: rotate_direction(rotation, mirrored_direction(mirror, direction)).data_3d(),' \
+  '        facing: rotate_direction(rotation, direction).data_3d(),' \
+  structure_template::template_structures_tests::a_hanging_entity_reads_its_facing_and_stack_from_template_nbt
+
+check "a frame's spawn carries its facing as the object data" \
+  src/main.rs '        0.0,
+        i64::from(facing),
+    )' \
+  '        0.0,
+        0,
+    )' \
+  mineshaft_runtime_tests::item_frame_payloads_materialize_spawn_and_survive_a_save
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

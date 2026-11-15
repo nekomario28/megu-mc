@@ -60,7 +60,7 @@ fn entity_angles_spawn_matches_native_constructors() {
         for packet in [
             spawn_player(&client),
             spawn_mob(&mob),
-            spawn_entity_pkt(42, 124, 1.0, 64.0, -2.0, yaw, pitch),
+            spawn_entity_pkt(42, 124, 1.0, 64.0, -2.0, yaw, pitch, 0),
         ] {
             assert_eq!(
                 spawn_rotation_bytes(&packet),
