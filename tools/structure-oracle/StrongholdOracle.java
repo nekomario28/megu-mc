@@ -19,7 +19,11 @@ import java.util.concurrent.TimeUnit;
  *    *driver* only (clear / setLargeFeatureSeed / StartPiece / pending-children
  *    shuffle / moveBelowSeaLevel, all native calls), because the loop itself is
  *    plain control flow over `StrongholdPieces` statics. Piece construction,
- *    piece weights, child placement and `postProcess` are all native.
+ *    piece weights, child placement and `postProcess` are all native. The
+ *    piece stream is the one `Structure.GenerationContext` builds
+ *    (`WorldgenRandom(new LegacyRandomSource(0L))`, legacy LCG); only the
+ *    `postProcess` arm uses the Xoroshiro decoration stream, as
+ *    `applyBiomeDecoration` does.
  * 2. rings: `ChunkGeneratorStructureState.generateRingPositions` over a real
  *    Overworld `MultiNoiseBiomeSource`, so `BiomeSource.findBiomeHorizontal`
  *    (the quart spiral) runs against the actual noise biome source.
@@ -68,6 +72,16 @@ public final class StrongholdOracle {
 
     static Object legacyRng(long seed) throws Exception {
         return c("dyz").getConstructor(long.class).newInstance(seed);
+    }
+
+    /**
+     * The RNG `Structure.GenerationContext` builds: `new WorldgenRandom(new
+     * LegacyRandomSource(0L))`, i.e. the legacy LCG, **not** the Xoroshiro source
+     * `applyBiomeDecoration` hands to `placeInChunk`. Using `xorRng` here made the
+     * oracle agree with a port that had the same bug.
+     */
+    static Object legacyWorldgenRng(long seed) throws Exception {
+        return c("dzx").getConstructor(c("ayw")).newInstance(legacyRng(seed));
     }
 
     static long nextLong(Object rng) throws Exception {
@@ -156,7 +170,8 @@ public final class StrongholdOracle {
 
     static Start generate(long seed, int cx, int cz) throws Exception {
         Object builder = generationBuilder();
-        Object rng = xorRng(0L);
+        // `Structure.GenerationContext`, not the decoration stream: legacy LCG.
+        Object rng = legacyWorldgenRng(0L);
         Start out = new Start();
         out.builder = builder;
         int attempts = 0;
@@ -308,8 +323,15 @@ public final class StrongholdOracle {
     // ---------- scene ----------
 
     /**
-     * Terrain for a stronghold case: stone below the surface, air above, with one
-     * water pocket so that a piece writing over a liquid has to behave.
+     * Terrain for a stronghold case: stone below an undulating surface with scattered
+     * cave pockets, air above, and one water pocket so that a piece writing over a
+     * liquid has to behave.
+     *
+     * The surface is not flat on purpose. `StructurePiece.generateBox(...)`'s
+     * `skipAir` argument decides per voxel whether the selector draws at all, so a
+     * scene that is stone below `ground` and air above makes every call take the same
+     * side of that branch: a port whose air test disagreed with `BlockState.isAir()`
+     * still reproduced every row. Only a scene with both kinds in one box can see it.
      */
     static final class Scene implements NativeHarness.StateScene {
         final int ground;
@@ -320,13 +342,23 @@ public final class StrongholdOracle {
             this.waterY = waterY;
         }
 
+        /** Surface height: `ground` +/- 3, deterministic in the column. */
+        static int surface(int ground, int x, int z) {
+            return ground + (((x * 31 + z * 17) >> 2 & 7) - 3);
+        }
+
         @Override
         public Object stateAt(int x, int y, int z) {
             try {
                 if (waterY != Integer.MIN_VALUE && y == waterY && ((x * 31 + z * 17) & 63) == 0) {
                     return NativeHarness.state("minecraft:water");
                 }
-                if (y < ground) return NativeHarness.state("minecraft:stone");
+                if (y < surface(ground, x, z)) {
+                    if (((x * 13 + y * 7 + z * 5) & 15) == 0) {
+                        return NativeHarness.state("minecraft:cave_air");
+                    }
+                    return NativeHarness.state("minecraft:stone");
+                }
                 return NativeHarness.state("minecraft:air");
             } catch (Exception e) {
                 throw new AssertionError(e);

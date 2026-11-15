@@ -357,7 +357,7 @@ fn stronghold_box_ok(b: &Bounds) -> bool {
 /// `Direction.Plane.HORIZONTAL` iteration/selection order: NORTH, EAST, SOUTH, WEST.
 const STRONGHOLD_FACINGS: [Facing; 4] = [Facing::North, Facing::East, Facing::South, Facing::West];
 
-fn stronghold_random_small_door(rng: &mut Xor) -> SmallDoor {
+fn stronghold_random_small_door<R: StructureRng + ?Sized>(rng: &mut R) -> SmallDoor {
     match rng.next_bound(5) {
         0 | 1 => SmallDoor::Opening,
         2 => SmallDoor::Wood,
@@ -368,7 +368,7 @@ fn stronghold_random_small_door(rng: &mut Xor) -> SmallDoor {
 
 // ---------- piece factories (`StrongholdPieces.*.createPiece`) ----------
 
-fn make_start_piece(rng: &mut Xor, x: i32, z: i32) -> StrongholdPiece {
+fn make_start_piece<R: StructureRng + ?Sized>(rng: &mut R, x: i32, z: i32) -> StrongholdPiece {
     let orientation = STRONGHOLD_FACINGS[rng.next_bound(4) as usize];
     // The start piece is the one piece whose box is built with
     // `StructurePiece.makeBoundingBox` (forward for every direction), not with
@@ -382,9 +382,9 @@ fn make_start_piece(rng: &mut Xor, x: i32, z: i32) -> StrongholdPiece {
     piece
 }
 
-fn create_stairs_down(
+fn create_stairs_down<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -401,9 +401,9 @@ fn create_stairs_down(
     Some(piece)
 }
 
-fn create_straight(
+fn create_straight<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -423,10 +423,10 @@ fn create_straight(
     Some(piece)
 }
 
-fn create_turn(
+fn create_turn<R: StructureRng + ?Sized>(
     kind: StrongholdKind,
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -443,9 +443,9 @@ fn create_turn(
     Some(piece)
 }
 
-fn create_room_crossing(
+fn create_room_crossing<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -463,9 +463,9 @@ fn create_room_crossing(
     Some(piece)
 }
 
-fn create_straight_stairs_down(
+fn create_straight_stairs_down<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -482,9 +482,9 @@ fn create_straight_stairs_down(
     Some(piece)
 }
 
-fn create_five_crossing(
+fn create_five_crossing<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -507,9 +507,9 @@ fn create_five_crossing(
     Some(piece)
 }
 
-fn create_chest_corridor(
+fn create_chest_corridor<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -526,9 +526,9 @@ fn create_chest_corridor(
     Some(piece)
 }
 
-fn create_library(
+fn create_library<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -567,10 +567,10 @@ fn create_portal_room(
     Some(piece)
 }
 
-fn create_piece(
+fn create_piece<R: StructureRng + ?Sized>(
     kind: StrongholdKind,
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -601,9 +601,9 @@ fn create_piece(
     }
 }
 
-fn create_prison_hall(
+fn create_prison_hall<R: StructureRng + ?Sized>(
     gen: &StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -651,9 +651,9 @@ fn filler_corridor_box(gen: &StrongholdGen, x: i32, y: i32, z: i32, dir: Facing)
 
 /// `StrongholdPieces.generatePieceFromSmallDoor`, including the retry budget, the
 /// weight-table walk and the `imposter` slot the start piece leaves behind.
-fn generate_piece_from_small_door(
+fn generate_piece_from_small_door<R: StructureRng + ?Sized>(
     gen: &mut StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -729,9 +729,9 @@ fn generate_piece_from_small_door(
 }
 
 /// `StrongholdPieces.generateAndAddPiece`: the 112-block leash and the depth-50 cap.
-fn generate_and_add_piece(
+fn generate_and_add_piece<R: StructureRng + ?Sized>(
     gen: &mut StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     x: i32,
     y: i32,
     z: i32,
@@ -751,10 +751,10 @@ fn generate_and_add_piece(
 }
 
 /// `StrongholdPiece`'s three connection helpers, keyed by the piece's own direction.
-fn child_forward(
+fn child_forward<R: StructureRng + ?Sized>(
     gen: &mut StrongholdGen,
     piece: &StrongholdPiece,
-    rng: &mut Xor,
+    rng: &mut R,
     dx: i32,
     dy: i32,
 ) {
@@ -772,7 +772,13 @@ fn child_forward(
     generate_and_add_piece(gen, rng, x, y, z, dir, depth);
 }
 
-fn child_left(gen: &mut StrongholdGen, piece: &StrongholdPiece, rng: &mut Xor, dy: i32, d: i32) {
+fn child_left<R: StructureRng + ?Sized>(
+    gen: &mut StrongholdGen,
+    piece: &StrongholdPiece,
+    rng: &mut R,
+    dy: i32,
+    d: i32,
+) {
     let b = piece.bounds;
     let Some(orient) = piece.orientation else {
         return;
@@ -785,7 +791,13 @@ fn child_left(gen: &mut StrongholdGen, piece: &StrongholdPiece, rng: &mut Xor, d
     generate_and_add_piece(gen, rng, x, y, z, dir, depth);
 }
 
-fn child_right(gen: &mut StrongholdGen, piece: &StrongholdPiece, rng: &mut Xor, dy: i32, d: i32) {
+fn child_right<R: StructureRng + ?Sized>(
+    gen: &mut StrongholdGen,
+    piece: &StrongholdPiece,
+    rng: &mut R,
+    dy: i32,
+    d: i32,
+) {
     let b = piece.bounds;
     let Some(orient) = piece.orientation else {
         return;
@@ -799,7 +811,11 @@ fn child_right(gen: &mut StrongholdGen, piece: &StrongholdPiece, rng: &mut Xor, 
 }
 
 /// `StrongholdPiece.addChildren` for each concrete class.
-fn piece_add_children(gen: &mut StrongholdGen, index: usize, rng: &mut Xor) {
+fn piece_add_children<R: StructureRng + ?Sized>(
+    gen: &mut StrongholdGen,
+    index: usize,
+    rng: &mut R,
+) {
     let piece = gen.pieces[index].clone();
     match piece.kind {
         StrongholdKind::Start | StrongholdKind::StairsDown => {
@@ -869,23 +885,11 @@ fn piece_add_children(gen: &mut StrongholdGen, index: usize, rng: &mut Xor) {
     }
 }
 
-/// `WorldgenRandom.setLargeFeatureSeed`: reseed, take two longs, mix the chunk
-/// position and the seed, reseed.
-fn stronghold_set_large_feature_seed(rng: &mut Xor, seed: u64, chunk_x: i32, chunk_z: i32) {
-    *rng = Xor::seed_worldgen(seed);
-    let a = rng.next_i64();
-    let b = rng.next_i64();
-    // `lxor`, not `ladd`: `(long)chunkX * i ^ (long)chunkZ * j ^ seed`.
-    let mixed =
-        (i64::from(chunk_x).wrapping_mul(a) ^ i64::from(chunk_z).wrapping_mul(b)) ^ (seed as i64);
-    *rng = Xor::seed_worldgen(mixed as u64);
-}
-
 /// `ChunkGeneratorStructureState.moveBelowSeaLevel`: shift the whole start so its top
 /// lands between `min_y + height` and `sea_level - 10`.
-fn stronghold_move_below_sea_level(
+fn stronghold_move_below_sea_level<R: StructureRng + ?Sized>(
     gen: &mut StrongholdGen,
-    rng: &mut Xor,
+    rng: &mut R,
     sea_level: i32,
     min_y: i32,
 ) {
@@ -914,26 +918,27 @@ fn stronghold_move_below_sea_level(
 
 /// `StrongholdStructure.generatePieces` and its retry loop: re-roll with `seed + i`
 /// until the layout produced a portal room.
+///
+/// The piece stream is the **legacy** LCG, not the Xoroshiro decoration stream:
+/// `Structure.GenerationContext` builds `new WorldgenRandom(new LegacyRandomSource(0L))`
+/// and seeds it with `setLargeFeatureSeed(seed + attempt, chunkX, chunkZ)`. Only the
+/// later `StructureStart.placeInChunk` pass (`place_stronghold_chunk`) sees the
+/// Xoroshiro stream `applyBiomeDecoration` hands out.
 pub(crate) fn generate_stronghold_pieces_with_rng(
     seed: u64,
     chunk_x: i32,
     chunk_z: i32,
     min_y: i32,
     sea_level: i32,
-) -> (StrongholdStart, Xor) {
-    let mut rng = Xor::seed_worldgen(0);
+) -> (StrongholdStart, Lcg) {
     let mut attempts = 0;
     loop {
         attempts += 1;
         // A pathological seed could re-roll for a very long time; vanilla has no cap.
         assert!(attempts <= 4096, "stronghold retry loop did not converge");
         let mut gen = StrongholdGen::reset();
-        stronghold_set_large_feature_seed(
-            &mut rng,
-            seed.wrapping_add(attempts as u64 - 1),
-            chunk_x,
-            chunk_z,
-        );
+        let mut rng =
+            Lcg::for_large_feature(seed.wrapping_add(attempts as u64 - 1), chunk_x, chunk_z);
         let start = make_start_piece(&mut rng, (chunk_x << 4) + 2, (chunk_z << 4) + 2);
         let start_index = gen.push(start);
         piece_add_children(&mut gen, start_index, &mut rng);
@@ -1508,8 +1513,11 @@ fn room_crossing_post_process(
                     w.place(piece, (x, y, z), cobble);
                 }
             }
-            let torch = w.torch;
-            w.place(piece, (5, 3, 5), torch);
+            // `Blocks.WALL_TORCH.defaultBlockState()` (`dga.cq`), not the floor torch
+            // `dga.cp`: the piece's own mirror/rotation turns the default north
+            // facing into the native one, so a floor torch here loses the facing.
+            let wall_torch = state(w.reg, "minecraft:wall_torch", &[]);
+            w.place(piece, (5, 3, 5), wall_torch);
             let planks = w.planks;
             for n in 2..=8 {
                 w.place(piece, (2, 3, n), planks);
@@ -2049,13 +2057,25 @@ mod stronghold_tests {
         [nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]]
     }
 
-    /// The scene the oracle paints: stone below `ground`, air above, and (because
-    /// `get_boxed` answers air outside the clip) nothing else.
-    fn paint_scene(ctx: &mut FC, clip: &Bounds, ground: i32, stone: u32) {
+    /// The scene the oracle paints: stone below an undulating surface with scattered
+    /// cave pockets, air above, and (because `get_boxed` answers air outside the clip)
+    /// nothing else. The undulation is what exercises the `skip_air` branch in both
+    /// directions inside one box.
+    fn paint_surface(ground: i32, x: i32, z: i32) -> i32 {
+        ground + (((x * 31 + z * 17) >> 2 & 7) - 3)
+    }
+
+    fn paint_scene(ctx: &mut FC, clip: &Bounds, ground: i32, stone: u32, cave_air: u32) {
         for x in clip[0] - 2..=clip[3] + 2 {
             for z in clip[2] - 2..=clip[5] + 2 {
-                for y in -64..ground {
-                    ctx.test_base_cell((x, y, z), stone);
+                let surface = paint_surface(ground, x, z);
+                for y in -64..surface {
+                    let st = if ((x * 13 + y * 7 + z * 5) & 15) == 0 {
+                        cave_air
+                    } else {
+                        stone
+                    };
+                    ctx.test_base_cell((x, y, z), st);
                 }
             }
         }
@@ -2089,6 +2109,7 @@ mod stronghold_tests {
     fn stronghold_layouts_and_writes_match_all_1211_native_oracle_vectors() {
         let reg = breg().expect("block registry initialized");
         let stone = reg.state_of("minecraft:stone", None);
+        let cave_air = reg.state_of("minecraft:cave_air", None);
         let mut cases = 0usize;
         let mut failures = 0usize;
         for line in FIXTURE.lines() {
@@ -2125,7 +2146,7 @@ mod stronghold_tests {
             let mut ctx = FC::new(&mut gen);
             ctx.test_no_terrain = true;
             ctx.test_default_air = true;
-            paint_scene(&mut ctx, &clip, ground, stone);
+            paint_scene(&mut ctx, &clip, ground, stone, cave_air);
             let mut post_rng = Xor::seed_worldgen(post_seed as u64);
             let placement = place_stronghold_chunk(&mut ctx, &mut start, clip, &mut post_rng);
             let got_post_rng_after = post_rng.next_i64();

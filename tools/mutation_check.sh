@@ -2189,9 +2189,10 @@ check "mansion foundation stops at the first non-air cell above sea level" \
   src/end_city_mansion.rs '                if inside && !is_air_state(reg, world.get(x, y, z)) {' \
   '                if false && inside && !is_air_state(reg, world.get(x, y, z)) {' \
   structure_template::end_city_mansion_tests::mansion_foundation_fills_air_columns_above_sea_level
-check "stronghold large-feature seed mixes the chunk position with xor, not add" \
-  src/stronghold_structures.rs '        (i64::from(chunk_x).wrapping_mul(a) ^ i64::from(chunk_z).wrapping_mul(b)) ^ (seed as i64);' \
-  '        (i64::from(chunk_x).wrapping_mul(a).wrapping_add(i64::from(chunk_z).wrapping_mul(b))) ^ (seed as i64);' \
+# The piece stream is `Lcg`, seeded with `seed + attempt`; the chunk-position mix lives
+# in `Lcg::for_large_feature` and is mutated by the "large feature seeding" entry above.
+check "stronghold retry re-seeds the legacy stream with the attempt index" \
+  src/stronghold_structures.rs 'seed.wrapping_add(attempts as u64 - 1),' 'seed,' \
   mineshaft_piece::stronghold_tests::stronghold_layouts_and_writes_match_all_1211_native_oracle_vectors
 
 check "stronghold smooth-stone selector keeps the native cracked-stone threshold" \
