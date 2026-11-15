@@ -8041,9 +8041,74 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
             run.out.len()
         );
     }
+    let wg = wg_heightmaps_after_carve(g, &cc, tx, tz, &run.out);
+    g.set_wg_after_carve(tx, tz, wg);
     for ((lx, y, lz), st) in std::mem::take(&mut run.out) {
         g.feat_write(tx * 16 + lx as i32, y, tz * 16 + lz as i32, st);
     }
+}
+
+/// `Heightmap.Types.WORLD_SURFACE_WG` and `OCEAN_FLOOR_WG` for one chunk, as
+/// `ProtoChunk.setBlockState` leaves them at the end of the carver pass.
+///
+/// The carver writes go through the chunk, whose status is still SURFACE (vanilla sets
+/// the new status after the stage body), and the SURFACE status tracks exactly these two
+/// maps — so carve writes lower them, and the FEATURES status afterwards does not touch
+/// them at all. Reading them off the pre-carve terrain instead leaves them far too high
+/// wherever a cave cut the surface (the port measured 110 against vanilla's 100 at
+/// (107,122) on seed 4242).
+fn wg_heightmaps_after_carve(
+    g: &mut Gen,
+    cc: &ChunkCols,
+    tx: i32,
+    tz: i32,
+    out: &HashMap<(u8, i32, u8), u32>,
+) -> Box<[i32; 512]> {
+    let reg = breg();
+    let Some(reg) = reg else {
+        return Box::new([g.min_y; 512]);
+    };
+    let (min_y, height) = (g.min_y, g.height);
+    let mut tops = Box::new([min_y; 512]);
+    // A carve write cannot sit above the terrain top (`#overworld_carver_replaceables`
+    // excludes air), but take the written maximum anyway so the scan bound is never the
+    // reason a value is missed.
+    let mut carve_top = [[i32::MIN; 16]; 16];
+    for &(lx, y, lz) in out.keys() {
+        let slot = &mut carve_top[lz as usize][lx as usize];
+        *slot = (*slot).max(y);
+    }
+    for lz in 0..16 {
+        for lx in 0..16 {
+            let (wx, wz) = (tx * 16 + lx as i32, tz * 16 + lz as i32);
+            let mut y = cc
+                .wtop(lx as usize, lz as usize)
+                .max(carve_top[lz][lx])
+                .min(min_y + height - 1);
+            let mut surface = None;
+            let mut floor = None;
+            while y >= min_y {
+                let st = match out.get(&(lx as u8, y, lz as u8)) {
+                    Some(&st) => st,
+                    None => g.terrain_cell(cc, wx, y, wz),
+                };
+                if surface.is_none() && reg.heightmap_counts(st, HeightmapKind::WorldSurfaceWg) {
+                    surface = Some(y + 1);
+                }
+                if floor.is_none() && reg.heightmap_counts(st, HeightmapKind::OceanFloorWg) {
+                    floor = Some(y + 1);
+                }
+                if surface.is_some() && floor.is_some() {
+                    break;
+                }
+                y -= 1;
+            }
+            let index = lz * 16 + lx;
+            tops[index] = surface.unwrap_or(min_y);
+            tops[256 + index] = floor.unwrap_or(min_y);
+        }
+    }
+    tops
 }
 
 impl CarveRun {

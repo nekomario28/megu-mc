@@ -185,6 +185,13 @@ feature の費用を「地形読み」と「feature 自身のロジック」に�
   この無効化は mutation gate で固定する（`huge_fungus_matches_native_cells_and_rng`
   が赤になる）。gate の追加は、同じ `tools/mutation_check.sh` を別レーンが
   編集中のため保留。
+  **2026-11-15 訂正**: 「feature の `setBlock` が WG 面を動かす」は誤り。
+  `ProtoChunk.setBlockState` が追うのは `getStatus().heightmapsAfter()` で、
+  feature 実行中の status は `FEATURES`（= 非 WG の 4 面）なので feature 書き込みは
+  WG 面を触らない。WG 面を動かすのは carver で、そのとき status はまだ `SURFACE`
+  （新 status は stage 本体が返ってから付く）。現在は
+  `Gen::wg_after_carve` に carver 終了時点で凍結している。
+  [詳細](../feature-parity/ruined-portal-wg-heightmap-20261115.md)。
 - これで feature は **20.8 → 7.6 ms/chunk**。残りの上位は `ore_dirt` 0.76、
   `ore_gravel` 0.62、`monster_room(_deep)` 0.68 ms/chunk。
 

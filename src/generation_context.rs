@@ -231,7 +231,9 @@ impl<'a> FC<'a> {
         breg().map(|r| r.is_air(st)).unwrap_or(st == 0)
     }
     /// Read the first available Y using the native type's state predicate.
-    /// WG maps freeze before CARVERS; live maps also see carver/feature writes.
+    /// WG maps freeze when the carver pass ends (see `Gen::wg_after_carve`) and this
+    /// scan is the surface-stage fallback for chunks that have no carver snapshot;
+    /// live maps also see carver/feature writes.
     /// Aquifers can push a solid above the density top (329/9216 columns on the
     /// kelp fixture), so the density top alone is not a heightmap. Conversely,
     /// a removed top must be scanned down, not retained as a max-only result.
@@ -267,6 +269,18 @@ impl<'a> FC<'a> {
     }
     pub(crate) fn heightmap(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
         if kind.is_wg() {
+            // The native WG maps are as of the end of the carver pass, not the surface:
+            // the carver writes land while the chunk still reports the SURFACE status,
+            // whose `heightmapsAfter` is exactly these two maps. Feature and structure
+            // writes (the FEATURES status) never move them, so the answer is neither the
+            // pre-carve terrain nor a live scan.
+            if let Some(v) = self.g.wg_after_carve_height(
+                matches!(kind, HeightmapKind::OceanFloorWg),
+                x,
+                z,
+            ) {
+                return v;
+            }
             if let Some(&v) = self.hmwg.get(&(x, z, kind)) {
                 return v;
             }

@@ -2277,6 +2277,70 @@ fn a_chunk_claims_its_carver_pass_once() {
     assert!(g.begin_carve(1, 3), "a different chunk has its own claim");
 }
 
+/// The WG heightmaps are frozen at the end of the carver pass, and the carver is the
+/// only thing that moves them. Native `ProtoChunk.setBlockState` tracks
+/// `getStatus().heightmapsAfter()`; a chunk still reports SURFACE while its carvers run
+/// (the new status is applied when the stage body returns) and FEATURES while its
+/// features do, and FEATURES' set is the non-WG one - so carve writes lower
+/// WORLD_SURFACE_WG/OCEAN_FLOOR_WG and feature or structure writes never touch them.
+/// Reading the uncarved terrain instead cost the ruined portal at seed 4242 chunk (6,7)
+/// its whole netherrack base: (107,122) read y=110 where vanilla reads 100, which shifted
+/// the weighted placement stream and 124 portal cells.
+#[test]
+fn wg_heightmap_keeps_the_carved_top_and_ignores_the_feature_layer() {
+    use crate::block_registry::HeightmapKind;
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let air = reg.state_of("minecraft:air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let (cx, cz) = (0, 0);
+    let (lx, lz) = (0u8, 0u8);
+    let (x, z) = (lx as i32, lz as i32);
+    let cc = g.cols(cx, cz).expect("chunk columns");
+    let plain = super::wg_heightmaps_after_carve(&mut g, &cc, cx, cz, &Default::default());
+    let index = lz as usize * 16 + lx as usize;
+    let top = plain[index];
+    assert!(top > g.min_y, "the fixture column must have terrain");
+    // A cave mouth that takes the top three cells of the column.
+    let mut out: std::collections::HashMap<(u8, i32, u8), u32> = Default::default();
+    for y in top - 3..top {
+        out.insert((lx, y, lz), air);
+    }
+    let carved = super::wg_heightmaps_after_carve(&mut g, &cc, cx, cz, &out);
+    assert!(
+        carved[index] <= top - 3,
+        "a carve of the top three cells must lower the WG top ({top} -> {})",
+        carved[index]
+    );
+    let carved_surface = carved[index];
+    let carved_floor = carved[256 + index];
+    g.set_wg_after_carve(cx, cz, carved);
+    let mut ctx = context(&mut g);
+    assert_eq!(
+        ctx.heightmap(HeightmapKind::WorldSurfaceWg, x, z),
+        carved_surface
+    );
+    assert_eq!(
+        ctx.heightmap(HeightmapKind::OceanFloorWg, x, z),
+        carved_floor
+    );
+    // A feature layer write above the carved top moves the live reads and the non-WG
+    // heightmap, but not the WG one.
+    let high = top + 20;
+    ctx.set(x, high, z, stone);
+    assert_eq!(ctx.get(x, high, z), stone);
+    assert_eq!(
+        ctx.heightmap(HeightmapKind::WorldSurfaceWg, x, z),
+        carved_surface,
+        "the feature layer must not move a WG heightmap"
+    );
+    assert_eq!(
+        ctx.heightmap(HeightmapKind::OceanFloor, x, z),
+        high + 1,
+        "the non-WG map does track the feature layer"
+    );
+}
+
 /// A feature runs after the carver pass and must read the carver's air/fluid
 /// writes, not the uncarved terrain. This is the lapis-in-a-cave regression.
 #[test]

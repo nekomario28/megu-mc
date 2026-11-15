@@ -740,6 +740,19 @@ pub struct Gen {
     restored_tick_sources: HashSet<(i32, i32)>,
     suppress_generated_ticks: bool,
     carved: HashSet<(i32, i32)>,
+    /// `ChunkAccess`'s WORLD_SURFACE_WG / OCEAN_FLOOR_WG as of the end of that chunk's
+    /// carver pass, first-available form. Vanilla creates a chunk's WG heightmaps while
+    /// it still carries the SURFACE status and updates them per write, so the carver pass
+    /// (whose `ProtoChunk.setBlockState` still reads the SURFACE status, because the new
+    /// status is only set when the stage body returns) lowers them; the FEATURES status
+    /// that follows updates only the POST_FEATURES maps, so a feature never touches
+    /// them. Frozen at the pre-carve terrain they stay too high at every carved column,
+    /// which is what a structure reading `WorldGenRegion.getHeight` sees (measured on
+    /// seed 4242 chunk (6,7): the ruined portal's netherrack base at (107,122) reads
+    /// 100, not the 110 its uncarved terrain top gives). Layout: `[0..256)`
+    /// WORLD_SURFACE_WG, `[256..512)` OCEAN_FLOOR_WG, index `lz * 16 + lx`.
+    wg_after_carve: HashMap<(i32, i32), Box<[i32; 512]>>,
+    wg_after_carve_ord: std::collections::VecDeque<(i32, i32)>,
     /// Generation metadata persists independently of evictable block caches.
     pub(crate) mineshaft_spawners: HashSet<(i32, i32, usize)>,
     pub(crate) payload_sources: HashSet<(i32, i32)>,
@@ -1056,6 +1069,8 @@ impl Gen {
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
             carved: HashSet::new(),
+            wg_after_carve: HashMap::new(),
+            wg_after_carve_ord: std::collections::VecDeque::new(),
             pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                 if p.len() == 4 {
@@ -3193,6 +3208,8 @@ impl Gen {
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
             carved: HashSet::new(),
+            wg_after_carve: HashMap::new(),
+            wg_after_carve_ord: std::collections::VecDeque::new(),
             pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                 if p.len() == 4 {
@@ -3977,6 +3994,32 @@ impl Gen {
     pub(crate) fn begin_carve(&mut self, cx: i32, cz: i32) -> bool {
         self.carved.insert((cx, cz))
     }
+
+    /// Record a chunk's WG heightmaps as the carver pass leaves them (see
+    /// `wg_after_carve` for why the carver, and only the carver, moves them).
+    pub(crate) fn set_wg_after_carve(&mut self, cx: i32, cz: i32, tops: Box<[i32; 512]>) {
+        let key = (cx, cz);
+        if self.wg_after_carve.insert(key, tops).is_none() {
+            self.wg_after_carve_ord.push_back(key);
+        }
+        // Decoration reaches the 17x17 region plus the structure reach; bound the map so
+        // a long generation run cannot grow it without limit. A miss falls back to the
+        // unscanned pre-carve terrain, so eviction degrades, never lies.
+        while self.wg_after_carve_ord.len() > 4096 {
+            if let Some(old) = self.wg_after_carve_ord.pop_front() {
+                self.wg_after_carve.remove(&old);
+            }
+        }
+    }
+
+    /// The stored post-carve WG height for a column, first-available form
+    /// (`topSolid + 1`), or `None` when this generator never carved that chunk.
+    pub(crate) fn wg_after_carve_height(&self, ocean_floor: bool, x: i32, z: i32) -> Option<i32> {
+        let tops = self.wg_after_carve.get(&(x >> 4, z >> 4))?;
+        let base = if ocean_floor { 256 } else { 0 };
+        Some(tops[base + (z & 15) as usize * 16 + (x & 15) as usize])
+    }
+
     /// feature overrides for a whole chunk (populate flushes here)
     #[allow(dead_code)]
     pub(crate) fn feat_map(&self, cx: i32, cz: i32) -> Option<&HashMap<u32, u32>> {
@@ -8522,8 +8565,21 @@ mod wg_tests {
         // behavior. With explicit source order, the production dump matches all
         // 884736 cells of the paused native 3x3, without property exclusions.
         // Saved-world runtime differences remain separate: feature-contracts.md.
+        // 2026-11-15: the WG heightmaps are now frozen at the end of the carver pass
+        // instead of at the surface. `ProtoChunk.setBlockState` updates
+        // `getStatus().heightmapsAfter()`, and the status is still SURFACE while the
+        // carver runs (the new status is set when the stage body returns), so a carve
+        // lowers WORLD_SURFACE_WG/OCEAN_FLOOR_WG and the FEATURES status afterwards
+        // leaves them alone. Features and structures read that map
+        // (`HeightmapFilter`/`world_surface_wg` placements, `WorldGenRegion.getHeight`),
+        // so they now see the carved top. Seed 4242 chunk (6,7) against the native
+        // chunk: `minecraft:ruined_portal`'s netherrack base read 110 at (107,122)
+        // instead of vanilla's 100, which shifted the whole weighted base/column RNG
+        // stream - 124 netherrack/dirt/stone cells of the portal differed (chunk total
+        // 278 -> 154, the remainder the amethyst geode). The capture moves with the
+        // corrected input.
         assert_eq!(
-            digest, "de36bbeffefbcfa49355f3b4c6e95f5d",
+            digest, "b680a4c9782cc8836d617e2febd69841",
             "feature population output changed from the native feature-contract capture"
         );
     }

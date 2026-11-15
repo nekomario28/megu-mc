@@ -97,7 +97,9 @@ pub(crate) trait TemplateWorld {
     fn get(&mut self, x: i32, y: i32, z: i32) -> u32;
     /// `LevelAccessor.setBlock`: `false` when the cell is outside the build height.
     fn set(&mut self, x: i32, y: i32, z: i32, state: u32) -> bool;
-    /// `LevelReader.getHeight` — a scan of the current world, writes included.
+    /// `LevelReader.getHeight` — `WORLD_SURFACE`/`OCEAN_FLOOR` scan the current world
+    /// (writes included); their `*_WG` twins are the map a chunk freezes at the end of
+    /// its carver pass, so a feature or structure write never moves them.
     fn heightmap(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32;
     /// `ChunkGenerator.getBaseHeight` — the generator's own column answer.
     fn base_height(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32;
@@ -3070,8 +3072,10 @@ impl Piece {
                 if rng.next_f64() >= f64::from(WEIGHTS[index as usize]) {
                     continue;
                 }
-                let height =
-                    world.heightmap(placement.heightmap(), dx, dz) - 1;
+                // `getSurfaceY` = `level.getHeight(heightmap, x, z) - 1`, i.e. the top
+                // solid block of the WORLD_SURFACE_WG / OCEAN_FLOOR_WG heightmap. That
+                // map is frozen at the end of the carver pass, not at the surface.
+                let height = world.heightmap(placement.heightmap(), dx, dz) - 1;
                 let y = if flat { height } else { height.min(self.bb[1]) };
                 if (y - self.bb[1]).abs() > 3 {
                     continue;

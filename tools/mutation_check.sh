@@ -794,6 +794,18 @@ check "the heightmap a feature reads is the floor the blocks are at" \
   '        base' \
   heightmap_reads_the_floor_the_blocks_are_at_not_the_noise_surface
 
+check "a WG heightmap read is the carved top, not the uncarved terrain" \
+  src/generation_context.rs '            if let Some(v) = self.g.wg_after_carve_height(
+                matches!(kind, HeightmapKind::OceanFloorWg),
+                x,
+                z,
+            ) {
+                return v;
+            }
+' \
+  '' \
+  feature::generation_contract_tests::wg_heightmap_keeps_the_carved_top_and_ignores_the_feature_layer
+
 check "the projectile sweep retains start-inside contact" \
   src/main.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
   '    bounds.clip(start, end).is_some()' \
