@@ -25537,6 +25537,11 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
 }
 
 fn main() {
+    // Terrain evaluates `add(final_density, beardifier)` (see `worldgen`), and the
+    // structure pipeline owns the starts that feed it. `worldgen` sits below `feature`
+    // in `tools/layers_check.sh`, so the edge is a registered function pointer rather
+    // than an import.
+    feature::register_beard_resolver();
     // A dump request must never fall through to the live server/save path.
     if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
         && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()

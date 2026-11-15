@@ -486,6 +486,7 @@ fn weird_sampler_uses_the_callers_interpolation_context() {
         mats: (0..256).map(|_| None).collect(),
         rd: [0; 256],
         wtop: [0; 256],
+        beard: None,
     };
     cc.grids[interp] = Some(vec![1.0; 5 * 5 * 2].into_boxed_slice());
     let actual = g.eval_c(node, 3, 4, 5, &mut HashMap::new(), Some(&cc));

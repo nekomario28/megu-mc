@@ -307,7 +307,7 @@ fn reference_order(keys: impl IntoIterator<Item = u64>) -> Vec<u64> {
 }
 /// ChunkAccess has a distinct LongSet for each structure, not one set whose
 /// capacity is shared by NORMAL and Mesa references.
-fn reference_order_by_type(keys: impl IntoIterator<Item = (usize, u64)>) -> Vec<(usize, u64)> {
+pub(crate) fn reference_order_by_type(keys: impl IntoIterator<Item = (usize, u64)>) -> Vec<(usize, u64)> {
     let mut groups = std::collections::BTreeMap::<usize, Vec<u64>>::new();
     for (entry, key) in keys {
         groups.entry(entry).or_default().push(key);
@@ -441,4 +441,124 @@ impl References {
             self.rng_after.insert((step, e.slot), random.state128());
         }
     }
+}
+
+// ---------- wrappers for the unified structure pipeline ----------
+//
+// `feature.rs` composes the 1.21.1 structure pipeline but may not import
+// `structure_placement` or `mineshaft_piece` (`tools/layers_check.sh`), so the
+// placement primitives and this module's own start placement are exposed here.
+
+/// `StructurePlacement`'s random-spread candidate generator.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpreadPlacement(RandomSpread);
+
+pub(crate) fn spread_placement(
+    spacing: i32,
+    separation: i32,
+    salt: i32,
+    triangular: bool,
+) -> Option<SpreadPlacement> {
+    let spread = if triangular {
+        Spread::Triangular
+    } else {
+        Spread::Linear
+    };
+    RandomSpread::new(spacing, separation, salt, spread).ok().map(SpreadPlacement)
+}
+
+impl SpreadPlacement {
+    pub(crate) fn candidate(self, seed: u64, x: i32, z: i32) -> (i32, i32) {
+        self.0.candidate(seed, x, z)
+    }
+}
+
+/// `StructurePlacement$FrequencyReductionMethod` by the index the pipeline parses
+/// (`0` default, `1` legacy_type_1, `2` legacy_type_2, `3` legacy_type_3).
+pub(crate) fn frequency_allows(
+    method: u8,
+    seed: u64,
+    salt: i32,
+    x: i32,
+    z: i32,
+    frequency: f32,
+) -> bool {
+    let reducer = match method {
+        0 => FrequencyReduction::Default,
+        1 => FrequencyReduction::LegacyType1,
+        2 => FrequencyReduction::LegacyType2,
+        3 => FrequencyReduction::LegacyType3,
+        other => panic!("structure pipeline: unknown frequency reducer {other}"),
+    };
+    reducer.allows(seed, salt, x, z, frequency)
+}
+
+/// `ExclusionZone.isPlacementForbidden`.
+pub(crate) fn exclusion_forbids(
+    chunk_count: i32,
+    x: i32,
+    z: i32,
+    other_admits: impl FnMut(i32, i32) -> bool,
+) -> bool {
+    crate::structure_placement::ExclusionZone { chunk_count }.forbids(x, z, other_admits)
+}
+
+/// The structure id a start was admitted for.
+pub(crate) fn start_id(start: &Start) -> &str {
+    let c = config().expect("mineshafts: config");
+    &c.entries[start.entry].id
+}
+
+/// The registry step and in-step slot of an admitted start's structure.
+pub(crate) fn start_slot(start: &Start) -> (usize, usize) {
+    let c = config().expect("mineshafts: config");
+    let e = &c.entries[start.entry];
+    (e.step, e.slot)
+}
+
+/// `StructureStart.getBoundingBox`: the union of the piece boxes.
+pub(crate) fn start_bbox(start: &Start) -> [i32; 6] {
+    let mut b = [i32::MAX; 6];
+    b[3..].fill(i32::MIN);
+    for p in &start.pieces {
+        for a in 0..3 {
+            b[a] = b[a].min(p.bounds[a]);
+            b[a + 3] = b[a + 3].max(p.bounds[a + 3]);
+        }
+    }
+    b
+}
+
+/// Clone a start (the pipeline keeps one copy per referencing chunk, as the native
+/// `StructureStart` object is shared by every chunk that references it).
+pub(crate) fn clone_start(start: &Start) -> Start {
+    Start {
+        entry: start.entry,
+        pieces: start.pieces.clone(),
+    }
+}
+
+/// `StructureStart.placeInChunk` for a mineshaft start (the piece walk and its
+/// blocking-biome rule already live in `mineshaft_piece`).
+pub(crate) fn place_start(
+    ctx: &mut FC,
+    random: &mut Xor,
+    cx: i32,
+    cz: i32,
+    key: (i32, i32),
+    start: &mut Start,
+) {
+    let Some(c) = config() else { return };
+    let variant = c.entries[start.entry].variant;
+    crate::mineshaft_piece::place(
+        ctx,
+        random,
+        cx,
+        cz,
+        key.0,
+        key.1,
+        variant,
+        &mut start.pieces,
+        &c.blocking,
+    );
 }

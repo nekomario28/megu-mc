@@ -62,6 +62,36 @@ impl RandomSpread {
     }
 }
 
+/// `StructurePlacement.ExclusionZone`: a structure set may not place a chunk when
+/// another set places one within `chunk_count` chunks of it.
+///
+/// `ChunkGeneratorStructureState.hasStructureChunkInRange` scans the closed square
+/// `[x-n, x+n] x [z-n, z+n]` and asks the *other* set's `isStructureChunk`, so the
+/// other set's own frequency reducer and exclusion zone apply too.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExclusionZone {
+    pub(crate) chunk_count: i32,
+}
+
+impl ExclusionZone {
+    pub(crate) fn forbids(
+        self,
+        x: i32,
+        z: i32,
+        mut other_admits: impl FnMut(i32, i32) -> bool,
+    ) -> bool {
+        let n = self.chunk_count;
+        for ox in x - n..=x + n {
+            for oz in z - n..=z + n {
+                if other_admits(ox, oz) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FrequencyReduction {
     Default,
