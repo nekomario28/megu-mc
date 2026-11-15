@@ -591,6 +591,195 @@ fn glowstone_matches_native_cells_and_rng() {
 }
 
 #[test]
+fn lake_grid_anchor_is_down_only() {
+    // `LakeFeature.place` anchors its 16x8x16 grid with `pos.relative(Direction.DOWN, 4)`
+    // (`jd.c(4)`, verified against the pinned bytecode: `relative(ji.a, 4)` and `LakeFeature`'s
+    // `jd.e()` is `below()`), so grid cell (x, y, z) is the world position
+    // `pos.offset(x, y, z)` of `(pos.x, pos.y - 4, pos.z)`. The x and z of the origin are NOT
+    // shifted. A `pos.offset(-8, -4, -8)` reading moved every lava lake eight blocks
+    // diagonally: on seed 4242 chunk (5,-32) the port put its lake at x 73..88 / z -516..-499
+    // where the native world has it at x 81..96 / z -508..-493.
+    let reg = breg().unwrap();
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:lake","config":{
+                 "fluid":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:lava"}},
+                 "barrier":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:stone"}}
+               }}"#,
+        )
+        .unwrap(),
+    )
+    .expect("lake configured feature");
+    let stone = reg.state_of("minecraft:stone", None);
+    let lava = reg.state_of("minecraft:lava", None);
+    let cave_air = reg.state_of("minecraft:cave_air", None);
+    let oy = 64i32;
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    // Solid slate under the anchor (grid rows 0..3 must read solid-or-fluid) and open air
+    // above it (grid rows 4..7 must not read liquid), over the grid plus its one-cell shell.
+    for x in -2i32..=17 {
+        for z in -2i32..=17 {
+            for y in (oy - 4)..oy {
+                g.feat_write(x, y, z, stone);
+            }
+            for y in oy..(oy + 8) {
+                g.feat_write(x, y, z, 0);
+            }
+        }
+    }
+    let mut ctx = context(&mut g);
+    let mut rng = Xor::seed_worldgen(42);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, oy, 0));
+    assert!(!ctx.wr.is_empty(), "the lake must place on this scene");
+    let mut fluid = 0usize;
+    let mut air = 0usize;
+    for (&(x, y, z), &state) in &ctx.wr {
+        let name = reg.name_of(state);
+        assert!(
+            (0..=15).contains(&x) && (0..=15).contains(&z),
+            "lake cell ({x},{y},{z}) is outside the 16x16 grid anchored at the origin x/z"
+        );
+        assert!(
+            (oy - 4..=oy + 3).contains(&y),
+            "lake cell ({x},{y},{z}) is outside rows oy-4..=oy+3"
+        );
+        match name {
+            "minecraft:lava" => {
+                // `y >= 4` fills CAVE_AIR, `y < 4` fills the fluid; the grid row is y - (oy-4).
+                assert!(y < oy, "fluid placed in a y>=4 grid row at ({x},{y},{z})");
+                fluid += 1;
+            }
+            "minecraft:cave_air" => {
+                assert!(y >= oy, "cave_air placed in a y<4 grid row at ({x},{y},{z})");
+                assert_eq!(state, cave_air);
+                air += 1;
+            }
+            "minecraft:stone" => {}
+            other => panic!("unexpected lake state {other} at ({x},{y},{z})"),
+        }
+        let _ = lava;
+    }
+    assert!(fluid > 0, "a lake on a solid floor must fill fluid");
+    assert!(air > 0, "a lake must carve cave_air above its fluid");
+}
+
+#[test]
+fn java_hashset_order_matches_java_util_hashset_iteration() {
+    // `VegetationPatchFeature` binds its `vegetation_chance` draws to surface points in
+    // `HashSet` order. Both expected sequences below are *measured* on the pinned 1.21.1 jar
+    // (`new HashSet<BlockPos>()`, added in the shown order, iterated), not derived from a
+    // re-derivation of `HashMap`, so a refactor cannot quietly fall back to insertion order.
+    //
+    // 25 points: `Vec3i.hashCode() = (y + z * 31) * 31 + x`, bucket
+    // `spread(h) & (capacity - 1)` with `spread(h) = h ^ (h >>> 16)`, capacity 64 for 25
+    // elements, and a shared bin keeps insertion order (bins 0, 1 and 2 hold repeats here).
+    let pts: Vec<(i32, i32, i32)> = (0..5).flat_map(|x| (0..5).map(move |z| (x, -2, z))).collect();
+    let got = super::java_hashset_order(&pts);
+    let want = vec![
+        (0, -2, 1),
+        (0, -2, 2),
+        (1, -2, 1),
+        (0, -2, 3),
+        (1, -2, 2),
+        (2, -2, 1),
+        (0, -2, 4),
+        (1, -2, 3),
+        (2, -2, 2),
+        (3, -2, 1),
+        (1, -2, 4),
+        (2, -2, 3),
+        (3, -2, 2),
+        (4, -2, 1),
+        (2, -2, 4),
+        (3, -2, 3),
+        (4, -2, 2),
+        (3, -2, 4),
+        (4, -2, 3),
+        (4, -2, 4),
+        (4, -2, 0),
+        (3, -2, 0),
+        (2, -2, 0),
+        (1, -2, 0),
+        (0, -2, 0),
+    ];
+    assert_eq!(got, want);
+    assert_ne!(got, pts, "hash order is not insertion order");
+
+    // 197 points (a full ceiling-patch radius) exercises the capacity growth past 16/64:
+    // Java keeps 197 elements in a 512-slot table, so the measured head and tail below pin
+    // the growth rule as well as the bucket rule.
+    let disc: Vec<(i32, i32, i32)> = (-8..=8)
+        .flat_map(|dx| (-8..=8).map(move |dz| (dx, dz)))
+        .filter(|(dx, dz)| dx * dx + dz * dz <= 64)
+        .map(|(dx, dz)| (dx, -3, dz))
+        .collect();
+    assert_eq!(disc.len(), 197);
+    let ordered = super::java_hashset_order(&disc);
+    assert_eq!(
+        &ordered[..8],
+        &[
+            (7, -3, -1),
+            (6, -3, -1),
+            (5, -3, -1),
+            (4, -3, -1),
+            (3, -3, -1),
+            (2, -3, -1),
+            (1, -3, -1),
+            (0, -3, -1),
+        ]
+    );
+    assert_eq!(
+        &ordered[189..],
+        &[
+            (-7, -3, -2),
+            (-3, -3, 7),
+            (-2, -3, 7),
+            (-1, -3, 7),
+            (0, -3, 7),
+            (1, -3, 7),
+            (2, -3, 7),
+            (3, -3, 7),
+        ]
+    );
+    // An empty/small set stays in insertion order because every point lands in its own bin.
+    assert_eq!(super::java_hashset_order(&[(7, 1, 9)]), vec![(7, 1, 9)]);
+    assert!(super::java_hashset_order(&[]).is_empty());
+}
+
+#[test]
+fn lake_above_the_bottom_guard() {
+    // `LakeFeature.place` returns false when `pos.getY() <= level.getMinBuildHeight() + 4`.
+    let cf = super::p_cf(
+        &jparse(
+            br#"{"type":"minecraft:lake","config":{
+                 "fluid":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:lava"}},
+                 "barrier":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:stone"}}
+               }}"#,
+        )
+        .unwrap(),
+    )
+    .expect("lake configured feature");
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let min_y = g.min_y;
+    for x in -2i32..=17 {
+        for z in -2i32..=17 {
+            for y in min_y..min_y + 16 {
+                g.feat_write(x, y, z, stone);
+            }
+        }
+    }
+    let mut ctx = context(&mut g);
+    let mut rng = Xor::seed_worldgen(7);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, min_y + 4, 0));
+    assert!(
+        ctx.wr.is_empty(),
+        "a lake whose origin is at min_y + 4 must fail before writing"
+    );
+}
+
+#[test]
 fn within_manhattan_keeps_the_native_order() {
     // Measured with a probe on the pinned jar (2,1,3):
     // 0,0,0 -1,0,0 0,-1,0 0,0,1 0,0,-1 0,1,0 1,0,0 -2,0,0 -1,-1,0 -1,0,1 -1,0,-1 ...

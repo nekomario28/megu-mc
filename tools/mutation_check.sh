@@ -636,6 +636,14 @@ check "multiface growth performs native spreading" \
   src/feature.rs '        if rng.next_f32() < cfg.spread {' \
   '        if rng.next_f32() < 0.0 {' \
   feature::generation_contract_tests::multiface_cells_and_following_rng_match_native
+check "the lake grid is anchored down only" \
+  src/feature.rs '            let anchor = (pos.0, pos.1 - 4, pos.2);' \
+  '            let anchor = (pos.0 - 8, pos.1 - 4, pos.2 - 8);' \
+  feature::generation_contract_tests::lake_grid_anchor_is_down_only
+check "the vegetation patch walks its surface set in HashSet order" \
+  src/feature.rs '            let spread = (h ^ ((h as u32) >> 16) as i32) as u32;' \
+  '            let spread = i as u32;' \
+  feature::generation_contract_tests::java_hashset_order_matches_java_util_hashset_iteration
 
 check "the ore vein radius matches vanilla's own output" \
   src/feature.rs '        ds[k as usize * 4 + 3] = (s1 as f64 * hh + 1.0) / 2.0;' \

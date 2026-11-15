@@ -5539,6 +5539,40 @@ fn gen_placed_feature_by_name(
     true
 }
 
+/// `java.util.HashSet<BlockPos>` iteration order.
+///
+/// `VegetationPatchFeature` collects its ground-patch surface points into a `HashSet` and then
+/// walks that set for the vegetation pass, so the per-point `vegetation_chance` draw is bound to
+/// points in *hash-bucket* order, not insertion order. Getting this wrong keeps every moss
+/// block in place but swaps which point receives which vegetation (`short_grass` vs
+/// `moss_carpet` land on each other's cells).
+///
+/// A bucket is `spread(hashCode) & (capacity - 1)`, where `spread(h) = h ^ (h >>> 16)` and
+/// `Vec3i.hashCode() = (y + z * 31) * 31 + x` (pinned from `kh.hashCode` bytecode). The table
+/// starts at 16 and doubles while `size > capacity * 0.75`; `HashMap` appends a new node to the
+/// end of its bin, so a bin keeps insertion order.
+fn java_hashset_order(pts: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
+    let mut cap = 16usize;
+    while pts.len() > cap - cap / 4 {
+        cap *= 2;
+    }
+    let mut keyed: Vec<(usize, usize, (i32, i32, i32))> = pts
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let h = p
+                .1
+                .wrapping_add(p.2.wrapping_mul(31))
+                .wrapping_mul(31)
+                .wrapping_add(p.0);
+            let spread = (h ^ ((h as u32) >> 16) as i32) as u32;
+            ((spread as usize) & (cap - 1), i, p)
+        })
+        .collect();
+    keyed.sort_unstable_by_key(|&(bucket, ins, _)| (bucket, ins));
+    keyed.into_iter().map(|(_, _, p)| p).collect()
+}
+
 fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     // Modifiers are streams of positions, not passes over a list. Vanilla builds
     // `Stream.of(origin).flatMap(modifier::getPositions)` for each modifier in turn, and the
@@ -6882,19 +6916,21 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     }
                     let mut bp = below;
                     let mut placed_any = false;
-                    for i in 0..dep {
+                    for _ in 0..dep {
                         let cur = ctx.get(bp.0, bp.1, bp.2);
                         let mut st = ground.get(ctx, rng, bp.0, bp.1, bp.2);
                         if *waterlog && is_water_st(reg, cur) {
                             st = reg.with_prop(st, "waterlogged", "true");
                         }
+                        // `VegetationPatchFeature.placeGround` skips the write when the
+                        // provider produced the block that is already there -- but it
+                        // *continues* the depth loop (re-drawing at the same position)
+                        // instead of stopping. A `break` here ended the column early, which
+                        // is only invisible while the provider is a constant.
                         if reg.name_of(st) == reg.name_of(cur) {
-                            break;
+                            continue;
                         }
                         if !reg.in_tag(cur, replaceable) {
-                            if i == 0 {
-                                break;
-                            }
                             break;
                         }
                         ctx.set(bp.0, bp.1, bp.2, st);
@@ -6906,20 +6942,53 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     }
                 }
             }
+            if let Some(spec) = env_str!("VEG_TRACE") {
+                if let Some((a, c)) = spec.split_once(',') {
+                    if let (Ok(cx), Ok(cz)) = (a.parse::<i32>(), c.parse::<i32>()) {
+                        if (pos.0 >> 4) == cx && (pos.2 >> 4) == cz {
+                            let cf = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "VEG origin={} {} {} xr={xr} zr={zr} pts={} feature={},{}",
+                                pos.0,
+                                pos.1,
+                                pos.2,
+                                surface_pts.len(),
+                                cf >> 32,
+                                cf & 0xFFFF
+                            );
+                        }
+                    }
+                }
+            }
             let water_st = reg.state_of("minecraft:water", None);
-            for sp in surface_pts {
-                if *waterlog {
-                    // waterlogged patches fill the surface point with water and
-                    // place vegetation at the water cell itself
-                    let below_s = ctx.get(sp.0, sp.1, sp.2);
+            // `WaterloggedVegetationPatchFeature.placeGroundPatch` splits the surface set
+            // into *enclosed* points and drops the rest: a point survives only when none of
+            // its NORTH/EAST/SOUTH/WEST/**DOWN** neighbours is face-sturdy towards it (the
+            // decompiled `isExposed` tests `ji.c`, `ji.f`, `ji.d`, `ji.e`, `ji.a`, and `ji.a`
+            // is DOWN - proven by `LakeFeature`'s `pos.c(4)`, which resolves to `below(4)`).
+            // The surviving points are filled with water first, and only then does the
+            // vegetation pass visit them, so a later pool sees the earlier water.
+            let mut surface_pts = java_hashset_order(&surface_pts);
+            if *waterlog {
+                let mut enclosed = Vec::with_capacity(surface_pts.len());
+                for sp in surface_pts.drain(..) {
+                    // `isExposedDirection`: `!state.isFaceSturdy(level, pos.relative(dir),
+                    // dir.getOpposite())`, so the face index is the neighbour's face
+                    // pointing back at `sp`.
                     let mut exposed = false;
-                    for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, -1, 0)] {
+                    for (dx, dy, dz) in [
+                        (0, 0, -1), // NORTH -> face SOUTH (3)
+                        (1, 0, 0),  // EAST  -> face WEST  (4)
+                        (0, 0, 1),  // SOUTH -> face NORTH (2)
+                        (-1, 0, 0), // WEST  -> face EAST  (5)
+                        (0, -1, 0), // DOWN  -> face UP    (1)
+                    ] {
                         let s = ctx.get(sp.0 + dx, sp.1 + dy, sp.2 + dz);
-                        let face = match (dx, dy, dz) {
-                            (1, 0, 0) => 4usize,
-                            (-1, 0, 0) => 5,
-                            (0, 0, 1) => 2,
-                            (0, 0, -1) => 3,
+                        let face = match (dx, dz) {
+                            (0, -1) => 3usize,
+                            (1, 0) => 4,
+                            (0, 1) => 2,
+                            (-1, 0) => 5,
                             _ => 1,
                         };
                         if !reg.side_solid(s, face) {
@@ -6927,27 +6996,39 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             break;
                         }
                     }
-                    if exposed {
-                        let _ = below_s;
-                        continue;
+                    if !exposed {
+                        enclosed.push(sp);
                     }
+                }
+                // vanilla fills every surviving point before the vegetation pass, and the
+                // fill changes the neighbour test of the next pool, so the two loops stay
+                // separate.
+                for sp in &enclosed {
                     ctx.set(sp.0, sp.1, sp.2, water_st);
                 }
+                surface_pts = java_hashset_order(&enclosed);
+            }
+            for sp in surface_pts {
                 if *chance > 0.0 && rng.next_f32() < *chance {
+                    // `VegetationPatchFeature.placeVegetation` places at
+                    // `pos.relative(surface.getDirection().getOpposite())`, and the
+                    // waterlogged subclass hands it `pos.below()`, so the waterlogged
+                    // position is `pos.below().relative(opposite)` = `pos - inward` for a
+                    // floor patch and two blocks below the ceiling for a ceiling patch.
                     let pp = if *waterlog {
-                        sp
+                        (sp.0, sp.1 - 1 - inward, sp.2)
                     } else {
                         (sp.0, sp.1 - inward, sp.2)
                     };
                     gen_pf(vfeat, fr, ctx, rng, pp);
                     if *waterlog {
-                        let placed = ctx.get(pp.0, pp.1, pp.2);
-                        if !reg.is_air(placed) && !is_water_st(reg, ctx.get(pp.0, pp.1, pp.2)) {
-                            // waterlog the placed vegetation
-                            let wst = reg.with_prop(placed, "waterlogged", "true");
-                            if wst != placed {
-                                ctx.set(pp.0, pp.1, pp.2, wst);
-                            }
+                        // `WaterloggedVegetationPatchFeature.placeVegetation` re-reads the
+                        // *surface* point after the feature and sets `waterlogged=true` when
+                        // the state carries the property and has it false.
+                        let placed = ctx.get(sp.0, sp.1, sp.2);
+                        let wst = reg.with_prop(placed, "waterlogged", "true");
+                        if wst != placed {
+                            ctx.set(sp.0, sp.1, sp.2, wst);
                         }
                     }
                 }
@@ -7064,6 +7145,18 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
         }
         Cf::Lake { fluid, barrier } => {
             let Some(reg) = breg() else { return };
+            // `LakeFeature.place`: the origin must clear the bottom by more than four
+            // blocks (`pos.getY() <= level.getMinBuildHeight() + 4` -> fail), then the
+            // 16x8x16 grid is anchored with `pos.relative(Direction.DOWN, 4)` -- the
+            // x and z of the origin are *not* shifted, so grid cell (x, y, z) is the
+            // world position `pos.offset(x, y, z)` of `(pos.x, pos.y - 4, pos.z)`.
+            // Reading that as a `pos.offset(-8, -4, -8)` anchor moved every lava lake
+            // eight blocks diagonally: seed 4242 chunk (5,-32) put its lake at
+            // (73..88, -516..-499) where the native world has it at (81..96, -508..-493).
+            if pos.1 <= ctx.g.min_y + 4 {
+                return;
+            }
+            let anchor = (pos.0, pos.1 - 4, pos.2);
             // vanilla LakeFeature: 4-7 ellipsoid blobs in a 16x8x16 grid
             let mut grid = [false; 16 * 16 * 8];
             let gidx = |x: usize, z: usize, y: usize| (x * 16 + z) * 8 + y;
@@ -7097,8 +7190,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         || y < 7 && grid[gidx(x, z, y + 1)]
                         || y > 0 && grid[gidx(x, z, y - 1)])
             };
-            let fluid_st = fluid.get(ctx, rng, pos.0, pos.1, pos.2);
-            let barrier_st = barrier.get(ctx, rng, pos.0, pos.1, pos.2);
+            let fluid_st = fluid.get(ctx, rng, anchor.0, anchor.1, anchor.2);
+            let barrier_st = barrier.get(ctx, rng, anchor.0, anchor.1, anchor.2);
             let air_st = reg.state_of("minecraft:cave_air", None);
             for x in 0..16usize {
                 for z in 0..16usize {
@@ -7107,9 +7200,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             continue;
                         }
                         let bp = (
-                            pos.0 + x as i32 - 8,
-                            pos.1 + y as i32 - 4,
-                            pos.2 + z as i32 - 8,
+                            anchor.0 + x as i32,
+                            anchor.1 + y as i32,
+                            anchor.2 + z as i32,
                         );
                         let cur = ctx.get(bp.0, bp.1, bp.2);
                         if y >= 4 && reg.is_liquid(cur) {
@@ -7126,9 +7219,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     for y in 0..8usize {
                         if grid[gidx(x, z, y)] {
                             let bp = (
-                                pos.0 + x as i32 - 8,
-                                pos.1 + y as i32 - 4,
-                                pos.2 + z as i32 - 8,
+                                anchor.0 + x as i32,
+                                anchor.1 + y as i32,
+                                anchor.2 + z as i32,
                             );
                             let cur = ctx.get(bp.0, bp.1, bp.2);
                             if !reg.in_tag(cur, "minecraft:features_cannot_replace") {
@@ -7144,9 +7237,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         for y in 0..8usize {
                             if shell(x, z, y) && (y < 4 || rng.next_bound(2) != 0) {
                                 let bp = (
-                                    pos.0 + x as i32 - 8,
-                                    pos.1 + y as i32 - 4,
-                                    pos.2 + z as i32 - 8,
+                                    anchor.0 + x as i32,
+                                    anchor.1 + y as i32,
+                                    anchor.2 + z as i32,
                                 );
                                 let cur = ctx.get(bp.0, bp.1, bp.2);
                                 if reg.is_solid(cur)
@@ -7164,7 +7257,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 let ice = reg.state_of("minecraft:ice", None);
                 for x in 0..16usize {
                     for z in 0..16usize {
-                        let bp = (pos.0 + x as i32 - 8, pos.1 + 4 - 4, pos.2 + z as i32 - 8);
+                        let bp = (anchor.0 + x as i32, anchor.1 + 4, anchor.2 + z as i32);
                         if let Some(b) = ctx.biome(bp.0, bp.1, bp.2) {
                             let t = fr.btemp.get(&b).copied().unwrap_or(0.8);
                             if t < 0.15 {
