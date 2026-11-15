@@ -5782,3 +5782,298 @@ fn bonus_chest_writes_nothing_when_the_heightmap_is_outside_the_world() {
         "no nextLong was spent, so the next draw is the shuffles' successor"
     );
 }
+
+/// The nether plant classes do **not** share one `mayPlaceOn`; the old arm read
+/// `RootsBlock`'s set off `NetherForestVegetationFeature`, whose origin gate is
+/// `#minecraft:nylium`, so the feature fixture could not see the difference.
+///
+/// * `RootsBlock` (`dmk`) and `NetherSproutsBlock` (`dld`):
+///   `state.is(NYLIUM) || state.is(SOUL_SOIL) || super.mayPlaceOn(...)`
+/// * `BushBlock.mayPlaceOn` (`dgh`): `state.is(DIRT) || state.is(FARMLAND)`
+/// * `FungusBlock` (`dje`) adds `MYCELIUM` and keeps the rest; its `grows_on`
+///   block only gates bonemeal (`isValidBonemealTarget`), not placement.
+#[test]
+fn nether_roots_sprouts_and_fungi_keep_their_own_may_place_on() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let mut ctx = context(&mut g);
+    // (below, roots/sprouts, fungi) - the pinned `#minecraft:dirt` tag covers dirt,
+    // grass_block, podzol, coarse_dirt, mycelium, rooted_dirt, moss_block, mud and
+    // muddy_mangrove_roots; farmland is the extra `Blocks.FARMLAND` term.
+    for (below, plant_ok) in [
+        ("minecraft:crimson_nylium", true),
+        ("minecraft:warped_nylium", true),
+        ("minecraft:soul_soil", true),
+        ("minecraft:dirt", true),
+        ("minecraft:grass_block", true),
+        ("minecraft:podzol", true),
+        ("minecraft:rooted_dirt", true),
+        ("minecraft:mud", true),
+        ("minecraft:mycelium", true),
+        ("minecraft:farmland", true),
+        // not in `#dirt`: the BushBlock helper `is_dirtish` accepts it, the pinned
+        // tag does not, and `RootsBlock` only adds soul soil to the tag set.
+        ("minecraft:dirt_path", false),
+        ("minecraft:netherrack", false),
+        ("minecraft:soul_sand", false),
+        ("minecraft:warped_wart_block", false),
+        ("minecraft:air", false),
+    ] {
+        ctx.set(0, 99, 0, reg.state_of(below, None));
+        for plant in ["minecraft:crimson_roots", "minecraft:warped_roots"] {
+            assert_eq!(
+                super::can_place(reg, &mut ctx, plant, 0, 100, 0),
+                plant_ok,
+                "{plant} on {below}"
+            );
+        }
+        assert_eq!(
+            super::can_place(reg, &mut ctx, "minecraft:nether_sprouts", 0, 100, 0),
+            plant_ok,
+            "nether_sprouts on {below}"
+        );
+        for fungus in ["minecraft:crimson_fungus", "minecraft:warped_fungus"] {
+            assert_eq!(
+                super::can_place(reg, &mut ctx, fungus, 0, 100, 0),
+                plant_ok,
+                "{fungus} on {below}"
+            );
+        }
+    }
+}
+
+/// `BasaltColumnsFeature` (`ebi`) `canPlaceAt`: the cell is air (or ocean lava) and
+/// `!world.getBlockState(pos.below()).isAir()`. `isAir()` is the block predicate, so
+/// `cave_air` and `void_air` are **not** support - comparing the state name against
+/// `minecraft:air` accepted both.
+#[test]
+fn basalt_columns_need_a_non_air_support() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let sea = crate::worldgen::sea_level();
+    let mut ctx = context(&mut g);
+    for (below, start_ok) in [
+        ("minecraft:stone", true),
+        ("minecraft:netherrack", true),
+        ("minecraft:cave_air", false),
+        ("minecraft:void_air", false),
+        ("minecraft:air", false),
+        // in `CANNOT_PLACE_ON` (`ebi.a`) even though it is not air
+        ("minecraft:bedrock", false),
+        ("minecraft:magma_block", false),
+        ("minecraft:lava", false),
+    ] {
+        ctx.set(0, 99, 0, reg.state_of(below, None));
+        ctx.set(0, 100, 0, reg.state_of("minecraft:air", None));
+        assert_eq!(
+            super::bc_can_start(&mut ctx, reg, sea, (0, 100, 0)),
+            start_ok,
+            "support={below}"
+        );
+    }
+}
+
+/// `CountOnEveryLayerPlacement` (`eim`): the pass walks `MOTION_BLOCKING` downward,
+/// counts a layer where the cell is `isEmpty() = isAir() || WATER || LAVA` and the
+/// cell below is not (`Integer.MAX_VALUE` beyond the column), skips a `BEDROCK`
+/// support, and re-samples the count inside **every** layer pass.
+#[test]
+fn count_on_every_layer_walks_motion_blocking_layers() {
+    use crate::generation_providers::{IP, PM};
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let stone = reg.state_of("minecraft:stone", None);
+    let lava = reg.state_of("minecraft:lava", None);
+    let bedrock = reg.state_of("minecraft:bedrock", None);
+    let pf = super::Pf {
+        feat: super::FRef::Name(String::new()),
+        mods: vec![],
+        name: String::new(),
+    };
+    // Every column of the 16x16 square carries the same profile, because the
+    // modifier draws its candidate column from the RNG: stone at 55, 58, 61, 65 and
+    // air elsewhere. Four "empty above non-empty" boundaries, top down.
+    let boundaries = [66, 62, 59, 56];
+    let mut script = |ctx: &mut FC, cells: &[(i32, u32)]| {
+        for lx in 0..16 {
+            for lz in 0..16 {
+                for &(y, st) in cells {
+                    ctx.test_base_cell((lx, y, lz), st);
+                }
+            }
+        }
+    };
+    {
+        let mut ctx = context(&mut g);
+        ctx.test_default_air = true;
+        script(&mut ctx, &[(55, stone), (58, stone), (61, stone), (65, stone)]);
+        assert_eq!(
+            ctx.heightmap(crate::block_registry::HeightmapKind::MotionBlocking, 3, 7),
+            66,
+            "MOTION_BLOCKING is the first free cell above the top solid"
+        );
+        // `uniform(0, 4)` samples the count: `nextInt(5)` per layer pass. The model
+        // below is vanilla's loop read off `eim`: the sample is inside the `do`, so a
+        // pass that draws 0 ends the walk even when the column has more layers.
+        let mut deepest = 0usize;
+        for seed in 0..=7u64 {
+            let mut probe = Xor::seed(seed);
+            let mut expected: Vec<(i32, i32, i32)> = Vec::new();
+            let mut layer = 0usize;
+            loop {
+                let n = probe.next_bound(5);
+                let mut any = false;
+                for _ in 0..n {
+                    let x = probe.next_bound(16);
+                    let z = probe.next_bound(16);
+                    if let Some(&y) = boundaries.get(layer) {
+                        expected.push((x, y, z));
+                        any = true;
+                    }
+                }
+                if any {
+                    deepest = deepest.max(layer + 1);
+                }
+                layer += 1;
+                if !any {
+                    break;
+                }
+            }
+            let mut out = Vec::new();
+            super::mod_positions(
+                &PM::CountEveryLayer(IP::Uniform(0, 4)),
+                freg(),
+                &mut ctx,
+                &mut Xor::seed(seed),
+                (0, 0, 0),
+                &pf,
+                &mut out,
+            );
+            assert_eq!(out, expected, "layer walk / per-layer count at seed {seed}");
+        }
+        assert!(
+            deepest >= 2,
+            "the fixture must reach at least a second layer: {deepest}"
+        );
+        // The same walk with a constant count: two positions on each of the four
+        // layers, nothing on the exhausted fifth.
+        let mut out = Vec::new();
+        super::mod_positions(
+            &PM::CountEveryLayer(IP::Const(2)),
+            freg(),
+            &mut ctx,
+            &mut Xor::seed(0),
+            (0, 0, 0),
+            &pf,
+            &mut out,
+        );
+        assert_eq!(out.len(), 8, "{out:?}");
+        for y in boundaries {
+            assert_eq!(out.iter().filter(|p| p.1 == y).count(), 2, "y={y}: {out:?}");
+        }
+    }
+    // A fluid is `isEmpty()`, so the layer sits in the fluid, not above it: water
+    // 62..=64 over stone 61 gives the layer at 62 even though `MOTION_BLOCKING` is 65.
+    {
+        let mut ctx = context(&mut g);
+        ctx.test_default_air = true;
+        script(
+            &mut ctx,
+            &[
+                (61, stone),
+                (62, reg.state_of("minecraft:water", None)),
+                (63, reg.state_of("minecraft:water", None)),
+                (64, reg.state_of("minecraft:water", None)),
+            ],
+        );
+        let mut out = Vec::new();
+        super::mod_positions(
+            &PM::CountEveryLayer(IP::Const(1)),
+            freg(),
+            &mut ctx,
+            &mut Xor::seed(0),
+            (0, 0, 0),
+            &pf,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].1, 62, "the water cell above the stone: {out:?}");
+    }
+    // Lava is empty too, and a `BEDROCK` support is skipped: stone 50, air, stone 55,
+    // bedrock 56. `MOTION_BLOCKING` is 57, and the cell above the bedrock is a
+    // non-empty/empty pair like any other - only the bedrock exclusion drops it, which
+    // leaves the layer above stone 55's neighbour at 51.
+    {
+        let mut ctx = context(&mut g);
+        ctx.test_default_air = true;
+        script(&mut ctx, &[(50, stone), (55, stone), (56, bedrock)]);
+        assert_eq!(
+            ctx.heightmap(crate::block_registry::HeightmapKind::MotionBlocking, 1, 1),
+            57
+        );
+        let mut out = Vec::new();
+        super::mod_positions(
+            &PM::CountEveryLayer(IP::Const(1)),
+            freg(),
+            &mut ctx,
+            &mut Xor::seed(0),
+            (0, 0, 0),
+            &pf,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "the bedrock support is not a layer: {out:?}");
+        assert_eq!(out[0].1, 51, "{out:?}");
+        // a lava support below the same air is empty, so it is no layer either
+        let mut ctx = context(&mut g);
+        ctx.test_default_air = true;
+        script(&mut ctx, &[(50, stone), (55, lava)]);
+        let mut out = Vec::new();
+        super::mod_positions(
+            &PM::CountEveryLayer(IP::Const(1)),
+            freg(),
+            &mut ctx,
+            &mut Xor::seed(0),
+            (0, 0, 0),
+            &pf,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].1, 51, "{out:?}");
+    }
+}
+
+/// `WorldGenRegion.ensureCanWrite` (`arb.f_`): the FEATURES step's
+/// `blockStateWriteRadius` is 1 chunk, so a write further than one chunk from the
+/// decorated chunk is dropped and the writer's next read still sees the old cell.
+/// Outside a pass there is no region and nothing to drop - every direct
+/// `feature::populate` / `Gen::feat_write` caller (and unit test) relies on that.
+#[test]
+fn feature_writes_outside_the_population_window_are_dropped() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    g.pop_active = Some((0, 0));
+    {
+        let mut ctx = context(&mut g);
+        ctx.set(0, 64, 0, stone); // own chunk
+        ctx.set(16, 64, 0, stone); // (1,0): Chebyshev 1
+        ctx.set(-16, 64, -16, stone); // (-1,-1): Chebyshev 1
+        ctx.set(32, 64, 0, stone); // (2,0): outside
+        ctx.set(0, 64, -32, stone); // (0,-2): outside
+        assert!(ctx.wr.contains_key(&(0, 64, 0)));
+        assert!(ctx.wr.contains_key(&(16, 64, 0)));
+        assert!(ctx.wr.contains_key(&(-16, 64, -16)));
+        assert!(!ctx.wr.contains_key(&(32, 64, 0)));
+        assert!(!ctx.wr.contains_key(&(0, 64, -32)));
+        // a refused write must not raise the feature heightmap tally either
+        assert_eq!(ctx.g.feature_height(32, 0, 0), i32::MIN);
+    }
+    // No active pass: the same far cell is accepted (the diagnostics' direct
+    // population path).
+    g.pop_active = None;
+    {
+        let mut ctx = context(&mut g);
+        ctx.set(32, 64, 0, stone);
+        assert!(ctx.wr.contains_key(&(32, 64, 0)));
+    }
+}

@@ -747,6 +747,9 @@ pub struct Gen {
     /// `LevelChunk.postProcessGeneration` once the chunk is promoted, which native
     /// only allows after the whole 3x3 around it is `FULL`.
     shape_marks: HashMap<(i32, i32), Vec<(i32, i32, i32)>>,
+    /// The chunk whose FEATURES pass is running (`None` outside one): the centre of the
+    /// step's `blockStateWriteRadius` window. See `feature_write_allowed`.
+    pub(crate) pop_active: Option<(i32, i32)>,
     // Sources reconstructed after loading must recreate terrain but not enqueue
     // the generation ticks a second time.
     restored_tick_sources: HashSet<(i32, i32)>,
@@ -1081,6 +1084,7 @@ impl Gen {
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
             shape_marks: HashMap::new(),
+            pop_active: None,
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
             carved: HashSet::new(),
@@ -3223,6 +3227,7 @@ impl Gen {
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
             shape_marks: HashMap::new(),
+            pop_active: None,
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
             carved: HashSet::new(),
@@ -4054,6 +4059,39 @@ impl Gen {
             }
             None => i32::MIN,
         }
+    }
+
+    /// Whether a feature write may land in the chunk that owns `(x, z)`.
+    ///
+    /// This models `WorldGenRegion.ensureCanWrite` (`arb.f_`), which rejects a chunk
+    /// further than the FEATURES step's `blockStateWriteRadius` from the decorated
+    /// chunk: the 1.21.1 `ChunkPyramid` (`dvy`) builds that step as
+    /// `features -> carvers@1 + struct_starts@8 + .a(1)`, and `arb.f_` compares the
+    /// chunk offset with that radius (Chebyshev, in chunks). Writes outside it are
+    /// dropped with only a log line, so the feature sees its own cell unchanged.
+    ///
+    /// The other vanilla refusal is *not* modelled, deliberately. Once a chunk is
+    /// promoted to a `LevelChunk`, `ChunkMap` installs
+    /// `new ImposterProtoChunk(levelChunk, false)` into every proto-status slot and
+    /// `ImposterProtoChunk.setBlockState` (`dvh.a(jd,dtc,Z)`) then returns `null`
+    /// without touching the chunk's blocks or heightmaps - while `arb.a(...)` still
+    /// returns true, which is why a `FCELL ... wrote=true` trace line proves nothing
+    /// about persistence (see `tools/carve-agent/README.md`). That flag flips at
+    /// promotion, not when the chunk's own FEATURES pass returns: measured on the
+    /// pinned Nether fixture (`/tmp/nat-4242-nether-fossil/world`, grid (-25,19)+3x3
+    /// with the recorded pop order), treating "its pass finished" as read-only moved
+    /// 34 diffs to 1183, because native accepted a later pass' writes into an
+    /// already-decorated neighbour that was still a writable proto chunk (blackstone
+    /// at (-385,10,304) from pop (-24,19)). The offline generator has no promotion
+    /// stage, so modeling that half would refuse writes vanilla kept.
+    pub(crate) fn feature_write_allowed(&self, x: i32, z: i32) -> bool {
+        let Some((px, pz)) = self.pop_active else {
+            // Not inside a FEATURES pass (unit tests, template post-processing):
+            // there is no region and therefore no window to enforce.
+            return true;
+        };
+        let (cx, cz) = (x >> 4, z >> 4);
+        (cx - px).abs() <= 1 && (cz - pz).abs() <= 1
     }
 
     pub(crate) fn feat_write(&mut self, x: i32, y: i32, z: i32, st: u32) {

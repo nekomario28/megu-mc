@@ -1175,9 +1175,47 @@ check "end platform covers the obsidian row" \
   feature::generation_contract_tests::end_platform_matches_native_cells
 
 check "nether forest vegetation reads the nylium tag under the plant" \
-  src/generation_providers.rs '| "minecraft:warped_fungus" => reg.in_tag(below, "minecraft:nylium"),' \
-  '| "minecraft:warped_fungus" => reg.in_tag(below, "minecraft:netherrack"),' \
+  src/feature.rs '    if !reg.in_tag(ctx.get(pos.0, pos.1 - 1, pos.2), "minecraft:nylium") {' \
+  '    if !reg.in_tag(ctx.get(pos.0, pos.1 - 1, pos.2), "minecraft:netherrack") {' \
   feature::generation_contract_tests::nether_forest_vegetation_matches_native_cells_and_rng
+
+check "nether roots accept soul soil (the BushBlock dirt/farmland set too)" \
+  src/generation_providers.rs '        "minecraft:crimson_roots" | "minecraft:warped_roots" | "minecraft:nether_sprouts" => {
+            reg.in_tag(below, "minecraft:nylium")
+                || reg.name_of(below) == "minecraft:soul_soil"' \
+  '        "minecraft:crimson_roots" | "minecraft:warped_roots" | "minecraft:nether_sprouts" => {
+            reg.in_tag(below, "minecraft:nylium")
+                || reg.name_of(below) == "minecraft:soul_sand"' \
+  feature::generation_contract_tests::nether_roots_sprouts_and_fungi_keep_their_own_may_place_on
+
+check "basalt columns treat cave_air and void_air as no support" \
+  src/feature.rs '    !reg.is_air(below_st) && !BC_CANNOT_PLACE_ON.contains(&reg.name_of(below_st))' \
+  '    reg.name_of(below_st) != "minecraft:air" && !BC_CANNOT_PLACE_ON.contains(&reg.name_of(below_st))' \
+  feature::generation_contract_tests::basalt_columns_need_a_non_air_support
+
+check "count_on_every_layer re-samples the count inside every layer pass" \
+  src/feature.rs '            let mut layer = 0i32;
+            loop {
+                let n = ip.get(rng).max(0);' \
+  '            let mut layer = 0i32;
+            let n = ip.get(rng).max(0);
+            loop {' \
+  feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
+
+check "count_on_every_layer counts a fluid cell as an empty layer" \
+  src/feature.rs '        reg.is_air(st) || matches!(reg.name_of(st), "minecraft:water" | "minecraft:lava")' \
+  '        reg.is_air(st)' \
+  feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
+
+check "count_on_every_layer will not stack a layer on bedrock" \
+  src/feature.rs '        if !empty(below) && empty(cur) && reg.name_of(below) != "minecraft:bedrock" {' \
+  '        if !empty(below) && empty(cur) {' \
+  feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
+
+check "feature writes stay inside the FEATURES write window" \
+  src/worldgen.rs '        (cx - px).abs() <= 1 && (cz - pz).abs() <= 1' \
+  '        (cx - px).abs() <= 1 && (cz - pz).abs() <= 2' \
+  feature::generation_contract_tests::feature_writes_outside_the_population_window_are_dropped
 
 check "nether forest vegetation keeps the ceiling guard" \
   src/feature.rs '    if y < ctx.g.min_y + 1 || y + 1 >= ctx.g.min_y + ctx.g.height {' \

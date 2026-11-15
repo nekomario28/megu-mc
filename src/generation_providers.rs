@@ -960,14 +960,31 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
     let below = ctx.get(x, y - 1, z);
     let at = ctx.get(x, y, z);
     match name {
-        // Measured against the native `canSurvive` of the nether plants: only the
-        // `minecraft:nylium` tag accepts them (netherrack, soul sand, soul soil and
-        // warped wart block are refused) — see tests/data/nether_forest_vegetation_1211.tsv.
-        "minecraft:crimson_roots"
-        | "minecraft:warped_roots"
-        | "minecraft:nether_sprouts"
-        | "minecraft:crimson_fungus"
-        | "minecraft:warped_fungus" => reg.in_tag(below, "minecraft:nylium"),
+        // `RootsBlock` (`dmk`) and `NetherSproutsBlock` (`dld`) override the same
+        // `mayPlaceOn`: `state.is(BLOCK_TAGS.NYLIUM) || state.is(SOUL_SOIL) ||
+        // super.mayPlaceOn(state, ...)`, and `BushBlock`'s super is
+        // `state.is(BLOCK_TAGS.DIRT) || state.is(FARMLAND)`. The `#nylium`-only test
+        // this arm used to run was read off `NetherForestVegetationFeature`, which
+        // gates the *origin* on `#nylium` before it asks the state to survive, so the
+        // feature fixture cannot see the difference: a `patch_crimson_roots` candidate
+        // on soul soil kept being refused (`would_survive` -> `canSurvive`).
+        "minecraft:crimson_roots" | "minecraft:warped_roots" | "minecraft:nether_sprouts" => {
+            reg.in_tag(below, "minecraft:nylium")
+                || reg.name_of(below) == "minecraft:soul_soil"
+                || reg.in_tag(below, "minecraft:dirt")
+                || reg.name_of(below) == "minecraft:farmland"
+        }
+        // `FungusBlock` (`dje`) adds MYCELIUM to that set (`#nylium || MYCELIUM ||
+        // SOUL_SOIL || #dirt || FARMLAND`). Its `grows_on` block (crimson_nylium /
+        // warped_nylium) is only the bonemeal gate - `isValidBonemealTarget` -
+        // not `canSurvive`, so it does not narrow placement.
+        "minecraft:crimson_fungus" | "minecraft:warped_fungus" => {
+            reg.in_tag(below, "minecraft:nylium")
+                || reg.name_of(below) == "minecraft:mycelium"
+                || reg.name_of(below) == "minecraft:soul_soil"
+                || reg.in_tag(below, "minecraft:dirt")
+                || reg.name_of(below) == "minecraft:farmland"
+        }
         "minecraft:cactus" => {
             let base_ok = matches!(
                 reg.name_of(below),

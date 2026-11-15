@@ -40,6 +40,16 @@ Sculk hook (the sculk cursor/parity work in `specs/worldgen-parity/sculk-patch.m
   `placeWithBiomeCheck`), so the `SPLACE` window cannot contain the placement's position draws -
   the armed window is owned by `eiv.b`, not by each `ebq` call. ConfiguredFeature returns
   must not disarm it, and nested placement returns must leave the outer window armed.
+- `arb` (`WorldGenRegion`) / `setBlock(BlockPos, BlockState, int, int)`: the `FCELL ... wrote=`
+  field is that method's **return value**, and it is not evidence that the block landed. Vanilla
+  returns `true` even when the inner chunk refuses: `WorldGenRegion.setBlock` calls
+  `chunk.setBlockState(pos, state, false)` and ignores a `null` result, while once a chunk has
+  been promoted to a `LevelChunk` the region hands out `ImposterProtoChunk` with
+  `allowWrites == false` and `setBlockState` returns `null` without touching that chunk's blocks
+  or its heightmaps. (`wrote=false` does mean a drop: it is `ensureCanWrite` refusing a far chunk,
+  beyond the step's `blockStateWriteRadius`, or an out-of-build-height cell.) So a cell whose
+  `wrote=true` line exists can still be air in the saved chunk - attribute it by reading the
+  chunk, not by trusting the flag.
 - Draw hooks: the legacy sources' bounded draws come from the mixin interface `dyn`
   (`BitRandomSource`), not from the concrete classes - measured 313289 `nextInt(bound)@dyn`
   lines; `dzx.c(I)I` is `next(bits)`, the raw generator (full-range values). The feature arrives as its *class* - `edi` is unique to `minecraft:sculk_patch`,

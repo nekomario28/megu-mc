@@ -2736,8 +2736,12 @@ fn bc_can_start(ctx: &mut FC, reg: &BReg, sea: i32, p: (i32, i32, i32)) -> bool 
     if !bc_air_or_lava_ocean(ctx, reg, sea, p) {
         return false;
     }
-    let below = reg.name_of(ctx.get(p.0, p.1 - 1, p.2));
-    below != "minecraft:air" && !BC_CANNOT_PLACE_ON.contains(&below)
+    // `ebi.a(dcx,int,jd)`: `!world.getBlockState(pos.below()).isAir() &&
+    // !CANNOT_PLACE_ON.contains(...)`. `isAir()` is the block predicate, so
+    // `cave_air` and `void_air` are not support either - comparing the state name
+    // against `minecraft:air` accepted both of them as a column base.
+    let below_st = ctx.get(p.0, p.1 - 1, p.2);
+    !reg.is_air(below_st) && !BC_CANNOT_PLACE_ON.contains(&reg.name_of(below_st))
 }
 
 /// `BasaltColumnsFeature.placeColumn`: the square of `reach` around a candidate, a surface per
@@ -5651,39 +5655,39 @@ fn mod_positions(
             }
         }
         PM::CountEveryLayer(ip) => {
-            let n = ip.get(rng).max(0);
+            // `CountOnEveryLayerPlacement.getPositions` (`eim.a_(eiw,ayw,jd)`):
+            //
+            // ```java
+            // int layer = 0; boolean found;
+            // do {
+            //    found = false;
+            //    for (int j = 0; j < this.count.sample(random); j++) {   // per layer
+            //       int x = random.nextInt(16) + pos.getX();
+            //       int z = random.nextInt(16) + pos.getZ();
+            //       int top = context.getHeight(MOTION_BLOCKING, x, z);
+            //       int y = getY(context, x, top, z, layer);
+            //       if (y != Integer.MAX_VALUE) { builder.add(...); found = true; }
+            //    }
+            //    layer++;
+            // } while (found);
+            // ```
+            //
+            // Three details each move every later draw (and every later layer):
+            // the count is re-sampled *inside* the layer loop, the column height is
+            // `MOTION_BLOCKING` (not the OCEAN_FLOOR every other modifier here reads),
+            // and the layer scan uses `isEmpty() = isAir() || WATER || LAVA`.
+            let Some(reg) = breg() else { return };
             let mut layer = 0i32;
             loop {
+                let n = ip.get(rng).max(0);
                 let mut any = false;
                 for _ in 0..n {
-                    let x = rng.next_bound(16) + pos.0;
-                    let z = rng.next_bound(16) + pos.2;
-                    let mut y = ctx.hm_oc(x, z).min(ctx.g.min_y + ctx.g.height - 1);
-                    let mut found = 0;
-                    let mut cur = ctx.get(x, y, z);
-                    while y > ctx.g.min_y {
-                        y -= 1;
-                        let nb = ctx.get(x, y, z);
-                        let spawn = |s: u32| {
-                            let r = breg();
-                            r.map(|r| r.is_air(s)).unwrap_or(true)
-                                || matches!(
-                                    r.map(|r| r.name_of(s)),
-                                    Some("minecraft:water") | Some("minecraft:lava")
-                                )
-                        };
-                        if !spawn(nb)
-                            && spawn(cur)
-                            && breg().map(|r| r.name_of(nb)) != Some("minecraft:bedrock")
-                        {
-                            if found == layer {
-                                out.push((x, y + 1, z));
-                                any = true;
-                                break;
-                            }
-                            found += 1;
-                        }
-                        cur = nb;
+                    let x = pos.0 + rng.next_bound(16);
+                    let z = pos.2 + rng.next_bound(16);
+                    let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);
+                    if let Some(y) = cel_find_y(ctx, reg, x, top, z, layer) {
+                        out.push((x, y, z));
+                        any = true;
                     }
                 }
                 layer += 1;
@@ -5829,6 +5833,44 @@ fn mod_positions(
         }
         PM::Carving => {}
     }
+}
+
+/// `CountOnEveryLayerPlacement.getY` (`eim.a(eiw,int,int,int,int)`): the
+/// `layer`-th y from the column's `top` downward whose state is empty
+/// (`isAir() || WATER || LAVA`) while the cell below it is not, skipping a
+/// `BEDROCK` support. Vanilla returns `mutable.getY() + 1` after reading
+/// `j - 1`, i.e. the empty cell itself, and `Integer.MAX_VALUE` (here `None`)
+/// when the column has fewer than `layer + 1` layers.
+fn cel_find_y(
+    ctx: &mut FC<'_>,
+    reg: &BReg,
+    x: i32,
+    top: i32,
+    z: i32,
+    layer: i32,
+) -> Option<i32> {
+    let empty = |st: u32| {
+        reg.is_air(st) || matches!(reg.name_of(st), "minecraft:water" | "minecraft:lava")
+    };
+    let min_y = ctx.g.min_y;
+    let mut found = 0;
+    // `getHeight` can return `minY + height` (a blocking block in the top layer);
+    // `ctx.get` answers air there, exactly like `ChunkAccess.getBlockState` outside
+    // the build height, so the first cell the loop reads is `top - 1`.
+    let mut cur = ctx.get(x, top, z);
+    let mut y = top;
+    while y >= min_y + 1 {
+        let below = ctx.get(x, y - 1, z);
+        if !empty(below) && empty(cur) && reg.name_of(below) != "minecraft:bedrock" {
+            if found == layer {
+                return Some(y);
+            }
+            found += 1;
+        }
+        cur = below;
+        y -= 1;
+    }
+    None
 }
 
 // ---------- configured feature generation ----------
@@ -8895,6 +8937,10 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         ((sx as i64) << 32) | (sz as i64 & 0xFFFF_FFFF),
         std::sync::atomic::Ordering::Relaxed,
     );
+    // The write window this pass owns: `WorldGenRegion`'s `blockStateWriteRadius` is 1
+    // chunk at the FEATURES step. See `Gen::feature_write_allowed` for the refusal and
+    // for the chunk-level half of vanilla's rule that is deliberately not modelled.
+    g.pop_active = Some((sx, sz));
     let mut structures = References::collect(g, sx, sz);
     let mut ctx = FC::new(g);
     let trace = env_flag!("FEAT_TRACE");
@@ -9036,6 +9082,9 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         g.feat_write(x, y, z, st);
     }
     g.stage_payloads((sx, sz), &mut staged_payloads);
+    // The pass is over: a write from here on (there is none) is not part of any
+    // `WorldGenRegion` window.
+    g.pop_active = None;
 }
 
 // The unified StructureSet / StructureStart pipeline. Included rather than declared as a

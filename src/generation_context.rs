@@ -211,6 +211,27 @@ impl<'a> FC<'a> {
         st
     }
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
+        // Refused before anything about this write is recorded (the override map, the
+        // feature heightmap tally and the writer's own later reads), because vanilla's
+        // `WorldGenRegion.ensureCanWrite` drops the write and reports only a log line.
+        // See `Gen::feature_write_allowed` for the window and for the chunk-level
+        // `ImposterProtoChunk.allowWrites` refusal that is deliberately not modelled;
+        // either way `WorldGenRegion.setBlock` still returns true, so a
+        // `FCELL ... wrote=true` trace line proves nothing about persistence
+        // (tools/carve-agent/README.md).
+        if !self.g.feature_write_allowed(x, z) {
+            if crate::trace_env::env_str!("FEATURE_REFUSE_TRACE")
+                .is_some_and(|want| want == "all" || want == format!("{},{}", x >> 4, z >> 4))
+            {
+                let pop = self.g.pop_active;
+                eprintln!(
+                    "FREFUSE {x} {y} {z} state={st} pop={},{}",
+                    pop.map(|p| p.0).unwrap_or(i32::MIN),
+                    pop.map(|p| p.1).unwrap_or(i32::MIN)
+                );
+            }
+            return;
+        }
         #[cfg(test)]
         if let Some(writes) = &mut self.test_writes {
             writes.push(((x, y, z), st));
