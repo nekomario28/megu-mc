@@ -2040,6 +2040,83 @@ mod pipeline_tests {
             .unwrap_or((start.bbox[0] >> 4, start.bbox[2] >> 4))
     }
 
+    /// `NetherFossilStructure.findGenerationPoint` scans `ChunkGenerator.getBaseColumn`:
+    /// noise only, with no surface rule, no carvers, no features and no beardifier. Two
+    /// defects lived in reading the live column instead. The scan was circular - the
+    /// fossil's own `beard_thin` moves the local surface by ~20 blocks in the Nether's
+    /// soft upper density - and it folded the stage order into the placement, because
+    /// `feature::populate` pre-carves the 3x3 before `References::collect`.
+    ///
+    /// Native oracle: seed 4242, `world/DIM-1`, chunk (-22,20) holds
+    /// `minecraft:nether_fossil` with one child at BB [-356, 55, 319, -350, 61, 324];
+    /// chunk (-24,20) holds no fossil at all.
+    #[test]
+    fn nether_fossil_scans_the_noise_column_not_the_live_world() {
+        reset_cache();
+        let mut nether =
+            Gen::load_preset(4242, crate::name_to_state, worldgen::NoisePreset::Nether)
+                .expect("nether gen");
+        let reg = crate::block_registry::breg().expect("block registry");
+        let starts = starts_cached(&mut nether, -22, 20);
+        let fossil = starts
+            .iter()
+            .find(|s| s.structure == "minecraft:nether_fossil")
+            .expect("nether_fossil start in seed 4242 chunk (-22,20)");
+        assert_eq!(fossil.bbox, [-356, 55, 319, -350, 61, 324], "native capture BB");
+
+        // The scan column is the piece origin, not the box corner: `pos` is the box's
+        // maximum x/z. The two cells the scan compares there are the noise surface
+        // (`netherrack` at 55) and the air pocket above it (56).
+        let (x, z) = (-350, 324);
+        let mut base = |y: i32| {
+            nether
+                .base_column_state(x, y, z)
+                .map(|st| reg.name_of(st).to_string())
+        };
+        assert_eq!(base(55).as_deref(), Some("minecraft:netherrack"));
+        assert_eq!(base(56).as_deref(), Some("minecraft:air"));
+        // The base column is the *noise* answer: one block lower the surface rule paints
+        // `soul_soil` in the final chunk while the noise still says `netherrack`.
+        assert_eq!(base(57).as_deref(), Some("minecraft:netherrack"));
+        assert_eq!(
+            reg.name_of(nether.terrain_state(x, 57, z)),
+            "minecraft:soul_soil",
+            "the base column must not carry the surface rule"
+        );
+
+        // Vanilla answers no fossil here; the pre-fix live scan invented one 23 blocks up.
+        assert!(
+            starts_cached(&mut nether, -24, 20)
+                .iter()
+                .all(|s| s.structure != "minecraft:nether_fossil"),
+            "chunk (-24,20) has no nether_fossil in the native capture"
+        );
+
+        // Vanilla settles the start at `structure_starts`, so the carver and feature
+        // stages cannot move it. `feature::populate` pre-carves the 3x3 before it
+        // collects references, so a scan over live blocks answers differently after a
+        // populate (measured pre-fix: (-24,20) had a fossil before any carver ran and
+        // none after), while the noise column answers the same either way.
+        populate(&mut nether, -22, 20);
+        reset_cache();
+        let after = starts_cached(&mut nether, -22, 20);
+        assert_eq!(
+            after
+                .iter()
+                .find(|s| s.structure == "minecraft:nether_fossil")
+                .map(|s| s.bbox),
+            Some([-356, 55, 319, -350, 61, 324]),
+            "the fossil start must not depend on the carver/feature layer"
+        );
+
+        // The beardifier follows the start: the corrected box, at the noise surface.
+        let beard = beard_chunk_data(&mut nether, -23, 20);
+        assert_eq!(beard.rigids.len(), 1, "{:?}", beard.rigids);
+        assert_eq!(beard.rigids[0].min, [-356, 55, 319]);
+        assert_eq!(beard.rigids[0].max, [-350, 61, 324]);
+        assert_eq!(beard.rigids[0].adjustment, BeardAdjustment::BeardThin);
+    }
+
     #[test]
     fn dimension_populate_runs_that_dimensions_decorations_only() {
         reset_cache();
@@ -2084,19 +2161,16 @@ mod pipeline_tests {
         }
 
         // `nether_fossil` is the one Nether structure whose `findGenerationPoint` scans
-        // block states, and `feature::populate` pre-carves the 3x3 before collecting
-        // references, so a start whose scan lands in carved air is dropped: at chunk
-        // (-24,20) `starts_cached` answers a fossil before any carver runs and none
-        // after. That is the pre-existing structure-start/`carvers` ordering question
-        // (vanilla computes starts at `structure_starts`, before noise and carvers),
-        // not something this change can settle without the native oracle, so the fossil
-        // is pinned where it is deterministic: the start and its bone blocks.
-        let fossil_chunk = (-24, 20);
+        // block states. It scans `ChunkGenerator.getBaseColumn`, i.e. noise only, so the
+        // start is settled at `structure_starts` and never sees the carvers, the
+        // features or its own `beard_thin` mound. The native oracle (seed 4242, chunk
+        // (-22,20), `world/DIM-1`) puts the fossil at exactly this box.
+        let fossil_chunk = (-22, 20);
         let fossil_starts = starts_cached(&mut nether, fossil_chunk.0, fossil_chunk.1);
         let fossil = fossil_starts
             .iter()
             .find(|s| s.structure == "minecraft:nether_fossil")
-            .expect("nether_fossil start in seed 4242 chunk (-24,20)");
+            .expect("nether_fossil start in seed 4242 chunk (-22,20)");
         let step = d.structures[&fossil.structure].step;
         let (pop_at, fossil_bbox) = (fossil.key, fossil.bbox);
         let pop = pop_seed(nether.wseed(), pop_at.0 * 16, pop_at.1 * 16);

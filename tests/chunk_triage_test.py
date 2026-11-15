@@ -421,6 +421,141 @@ class ChunkTriageContracts(unittest.TestCase):
                 ct.load_native_chunk("world", 0, 0, min_y_override=0, height_override=128)
         self.assertIn("outside the comparison window", str(raised.exception))
 
+    def test_preset_resolves_the_dimension_directory_of_a_native_world(self):
+        # A native multi-dimension capture keeps `level.dat` at the root and the
+        # Nether/End regions in `DIM-1`/`DIM1`. Reading `<world>/region` for a Nether
+        # chunk would read the Overworld's file (or nothing), so the preset has to
+        # select the directory before any chunk read.
+        with tempfile.TemporaryDirectory() as tmp:
+            world = Path(tmp) / "world"
+            for rel in ("region", "DIM-1/region", "DIM1/region"):
+                (world / rel).mkdir(parents=True)
+            (world / "level.dat").write_bytes(b"")
+            self.assertEqual(str(world / "DIM-1"), ct.resolve_dimension_world(str(world), preset="nether"))
+            self.assertEqual(str(world / "DIM1"), ct.resolve_dimension_world(str(world), preset="end"))
+            self.assertEqual(str(world), ct.resolve_dimension_world(str(world), preset="overworld"))
+            self.assertEqual(str(world), ct.resolve_dimension_world(str(world)))
+            # `--dim` wins over `--preset` and accepts the directory names.
+            self.assertEqual(
+                str(world / "DIM1"), ct.resolve_dimension_world(str(world), preset="nether", dim="DIM1")
+            )
+            self.assertEqual(
+                str(world), ct.resolve_dimension_world(str(world), preset="nether", dim="overworld")
+            )
+            with self.assertRaises(ct.TriageError) as raised:
+                ct.resolve_dimension_world(str(world), dim="mars")
+            self.assertIn("unknown --dim", str(raised.exception))
+
+            # The dimension directory itself keeps working: it has `region/` and no
+            # `level.dat`, so the same preset resolves to it unchanged.
+            for name, preset in (("DIM-1", "nether"), ("DIM1", "end")):
+                self.assertEqual(
+                    str(world / name),
+                    ct.resolve_dimension_world(str(world / name), preset=preset),
+                )
+
+            # A multi-dimension root without the requested dimension must fail closed
+            # instead of comparing the Overworld's chunks against the Nether preset.
+            bare = Path(tmp) / "bare"
+            (bare / "region").mkdir(parents=True)
+            (bare / "level.dat").write_bytes(b"")
+            with self.assertRaises(ct.TriageError) as raised:
+                ct.resolve_dimension_world(str(bare), preset="nether")
+            self.assertIn("DIM-1/region", str(raised.exception))
+            # A directory that holds `region/` itself is taken at its word: the caller
+            # named the dimension directory, which is the pre-existing call shape.
+            self.assertEqual(
+                str(world / "DIM-1"), ct.resolve_dimension_world(str(world / "DIM-1"), preset="overworld")
+            )
+
+    def test_level_dat_is_found_from_a_dimension_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            world = Path(tmp) / "world"
+            (world / "DIM-1" / "region").mkdir(parents=True)
+            (world / "level.dat").write_bytes(b"")
+            self.assertEqual(world / "level.dat", ct.resolve_level_dat(world))
+            self.assertEqual(world / "level.dat", ct.resolve_level_dat(world / "DIM-1"))
+            # A directory that is not a dimension directory and has no `level.dat`
+            # answers None rather than guessing a parent.
+            (world / "DIM1" / "region").mkdir(parents=True)
+            self.assertEqual(world / "level.dat", ct.resolve_level_dat(world / "DIM1"))
+            self.assertIsNone(ct.resolve_level_dat(world / "DIM1" / "region"))
+
+    def test_preset_selects_the_dimension_for_every_native_read(self):
+        # Every native read has to come from the resolved directory: the target chunk,
+        # and the neighbour start chunks `collect_structure_pieces` follows.
+        native = make_chunk_nbt(
+            0, 0, min_y=0, height=32,
+            blocks={(0, 20, 0): ("minecraft:netherrack", {})},
+            references={"minecraft:fortress": [encode_chunk_pos_long(1, 0)]},
+        )
+        neighbour = make_chunk_nbt(
+            1, 0, min_y=0, height=32,
+            starts={"minecraft:fortress": {"Children": [{"BB": [16, 10, 0, 24, 20, 8]}]}},
+        )
+        seen = []
+
+        def fake_reader(world, cx, cz):
+            seen.append((world, cx, cz))
+            return neighbour if (cx, cz) == (1, 0) else native
+
+        with tempfile.TemporaryDirectory() as tmp:
+            world = Path(tmp) / "world"
+            for rel in ("region", "DIM-1/region"):
+                (world / rel).mkdir(parents=True)
+            (world / "level.dat").write_bytes(b"")
+            port = Path(tmp) / "port.bin"
+            port.write_bytes(struct.pack("<8192I", *([0] * 8192)))
+            with patch.object(ct, "read_chunk_nbt", side_effect=fake_reader):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = ct.main([
+                        str(world), "0", "0", "--preset", "nether", "--port-bin", str(port),
+                        "--min-y", "0", "--height", "32",
+                    ])
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertTrue(seen)
+            dim_dir = str(world / "DIM-1")
+            self.assertEqual({w for w, _, _ in seen}, {dim_dir})
+            self.assertIn((dim_dir, 1, 0), seen)
+            self.assertIn("DIM-1", out.getvalue())
+
+            # Without the preset the same root reads the Overworld's `region/`.
+            seen.clear()
+            with patch.object(ct, "read_chunk_nbt", side_effect=fake_reader):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = ct.main([
+                        str(world), "0", "0", "--port-bin", str(port),
+                        "--min-y", "0", "--height", "32",
+                    ])
+            self.assertEqual(rc, 0)
+            self.assertEqual({w for w, _, _ in seen}, {str(world)})
+
+    def test_out_of_window_blocks_are_rejected_by_default_and_reportable(self):
+        # An End City tower reaches y=141 in vanilla while the End's `noise_settings`
+        # window stops at 128. The default must refuse to compare a subset; the opt-in
+        # reports the exclusion as a counted gap so the window itself is still measured.
+        tall = make_chunk_nbt(
+            0, 0, min_y=0, height=208,
+            blocks={(0, 200, 0): ("minecraft:purpur_block", {}),
+                    (1, 200, 0): ("minecraft:purpur_block", {})},
+        )
+        with patch.object(ct, "read_chunk_nbt", return_value=tall):
+            with self.assertRaises(ct.TriageError) as raised:
+                ct.load_native_chunk("world", 0, 0, min_y_override=0, height_override=128)
+            self.assertIn("outside the comparison window", str(raised.exception))
+            self.assertIn("--out-of-window report", str(raised.exception))
+            chunk = ct.load_native_chunk("world", 0, 0, min_y_override=0, height_override=128,
+                                         out_of_window="report")
+        self.assertEqual(chunk["out_of_window"]["cells"], 2)
+        self.assertEqual(chunk["out_of_window"]["states"], {"minecraft:purpur_block": 2})
+        self.assertEqual(chunk["out_of_window"]["sections"], [12])
+        # Air-only sections outside the window are not an exclusion.
+        air = make_chunk_nbt(0, 0, min_y=0, height=208)
+        with patch.object(ct, "read_chunk_nbt", return_value=air):
+            chunk = ct.load_native_chunk("world", 0, 0, min_y_override=0, height_override=128)
+        self.assertEqual(chunk["out_of_window"]["cells"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

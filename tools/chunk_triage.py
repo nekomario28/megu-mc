@@ -35,6 +35,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vanilla_region_blocks import chunk_bytes, parse_nbt  # noqa: E402
 
+# A native multi-dimension world keeps `level.dat` at the root and each dimension's
+# region files under the fixed directory name the dimension type declares. Reading
+# `<world>/region` for a Nether chunk finds the Overworld's file (or nothing), which
+# is why a Nether/End capture has to be resolved before any chunk read.
+DIMENSION_DIRS = {"nether": "DIM-1", "end": "DIM1"}
+# `--dim` / `--preset` spellings that name the same dimension directory. `None` is
+# "the directory holds `region/` itself" (the pre-existing call shape).
+DIMENSION_ALIASES = {
+    "overworld": None,
+    "world": None,
+    "region": None,
+    ".": None,
+    "": None,
+    "nether": "DIM-1",
+    "the_nether": "DIM-1",
+    "minecraft:the_nether": "DIM-1",
+    "dim-1": "DIM-1",
+    "end": "DIM1",
+    "the_end": "DIM1",
+    "minecraft:the_end": "DIM1",
+    "dim1": "DIM1",
+}
+
 AIR_STATES = ("minecraft:air", "minecraft:cave_air", "minecraft:void_air")
 DEFAULT_AIR = "minecraft:air"
 HM_BITS = 9
@@ -104,6 +127,85 @@ def load_block_state_table():
                 by_id[state] = f"{name}[{joined}]"
     _BLOCK_TABLE_CACHE = (sig, by_id)
     return by_id
+
+
+def resolve_dimension_dir(world, *, preset=None, dim=None):
+    """The subdirectory name (`DIM-1`, `DIM1`, or `None`) `world` holds its regions in.
+
+    `dim` wins over `preset`; both accept the aliases in `DIMENSION_ALIASES`. The
+    answer is checked against the filesystem, so an unusable request fails closed
+    here rather than reading another dimension's region file.
+    """
+    name = None
+    if dim is not None:
+        key = str(dim).strip().lower()
+        if key not in DIMENSION_ALIASES:
+            raise TriageError(
+                f"unknown --dim {dim!r}; expected one of {sorted(k for k in DIMENSION_ALIASES if k)}"
+            )
+        name = DIMENSION_ALIASES[key]
+    elif preset in DIMENSION_DIRS:
+        name = DIMENSION_DIRS[preset]
+    return name
+
+
+def resolve_dimension_world(world, *, preset=None, dim=None):
+    """Directory whose `region/` holds the requested dimension's chunks.
+
+    Three shapes are accepted, and each keeps working:
+      * `<world>/region` — the caller already named the dimension directory
+        (`.../world`, `.../world/DIM-1`), the pre-existing call shape;
+      * `<world>/DIM-1` / `<world>/DIM1` — a multi-dimension root with `--preset
+        nether|end` (or `--dim`), the shape a native capture produces;
+      * `--preset overworld` on a multi-dimension root — `<world>/region`.
+
+    A root that has `level.dat` but no requested dimension directory fails closed:
+    falling back to `<world>/region` would silently compare the Overworld's chunks
+    against the Nether preset.
+    """
+    base = Path(world)
+    name = resolve_dimension_dir(base, preset=preset, dim=dim)
+    if name is not None:
+        candidate = base / name
+        if (candidate / "region").is_dir():
+            return str(candidate)
+        # A caller may pass the dimension directory itself (`.../world/DIM-1`);
+        # it has `region/` and no `level.dat` of its own.
+        if (base / "region").is_dir() and not (base / "level.dat").is_file():
+            return str(base)
+        # A multi-dimension root (it has `level.dat` and/or the Overworld's
+        # `region/`) that lacks this dimension's directory must not fall back to
+        # the Overworld's chunks.
+        if (base / "region").is_dir() or (base / "level.dat").is_file():
+            raise TriageError(
+                f"{base} has no {name}/region for preset={preset or dim!r}; "
+                f"pass the dimension directory itself or --dim overworld"
+            )
+        # Nothing to read either way: keep the directory the caller named, so the
+        # chunk read names the missing file.
+        return str(base)
+    if (base / "region").is_dir():
+        return str(base)
+    for other in DIMENSION_DIRS.values():
+        if (base / other / "region").is_dir():
+            raise TriageError(
+                f"{base} has no region/ for the Overworld; it holds {other}/region — "
+                "pass --preset nether|end (or --dim)"
+            )
+    # No `region/` anywhere: keep the directory the caller named. The chunk read is
+    # the place that names the missing file, which is a more precise error than
+    # guessing which dimension was meant.
+    return str(base)
+
+
+def resolve_level_dat(world):
+    """`level.dat` for a world root, or for a dimension directory passed directly."""
+    base = Path(world)
+    if (base / "level.dat").is_file():
+        return base / "level.dat"
+    if base.name in DIMENSION_DIRS.values() and (base.parent / "level.dat").is_file():
+        return base.parent / "level.dat"
+    return None
 
 
 def read_chunk_nbt(world, cx, cz):
@@ -183,16 +285,19 @@ def _section_is_air(sec):
     return len(palette) == 1 and palette[0] in AIR_STATES
 
 
-def reject_out_of_window_sections(nbt, min_y, height, cx, cz):
-    """Fail closed when the native chunk holds blocks the port's window does not cover.
+def out_of_window_sections(nbt, min_y, height):
+    """Non-air cells of the native chunk that the comparison window does not cover.
 
     A section is written only when it is not air-only, so the port's window (`min_y`,
-    `height`) must contain every non-air section of the native chunk. Silently ignoring
-    a section outside the window would compare a subset of the native chunk and report
-    a diff-free chunk that is not actually equal.
+    `height`) must contain every non-air section of the native chunk. Ignoring a section
+    outside the window compares a subset of the native chunk, so the caller either
+    fails closed (`reject`) or reports the exclusion as a counted gap (`report`).
     """
     lo = min_y
     hi = min_y + height
+    cells = 0
+    states = Counter()
+    sections = []
     for sec in nbt.get("sections") or []:
         if "Y" not in sec or "block_states" not in sec:
             continue
@@ -201,13 +306,48 @@ def reject_out_of_window_sections(nbt, min_y, height, cx, cz):
             continue
         if _section_is_air(sec):
             continue
+        bs = sec["block_states"]
+        palette = [canonical_palette_entry(e) for e in (bs.get("palette") or [])]
+        data = bs.get("data") or []
+        if not palette:
+            continue
+        sections.append(sy)
+        if len(palette) == 1:
+            if palette[0] in AIR_STATES:
+                continue
+            cells += 4096
+            states[palette[0]] += 4096
+            continue
+        bits = max(4, (len(palette) - 1).bit_length())
+        per = 64 // bits
+        mask = (1 << bits) - 1
+        for i in range(4096):
+            word_idx = i // per
+            if word_idx >= len(data):
+                raise TriageError(f"truncated block_states data in section {sy}")
+            val = ((data[word_idx] & 0xFFFFFFFFFFFFFFFF) >> ((i % per) * bits)) & mask
+            st = palette[val] if val < len(palette) else "<bad-palette>"
+            if st in AIR_STATES:
+                continue
+            cells += 1
+            states[st] += 1
+    return {"cells": cells, "sections": sections, "states": dict(states.most_common(8))}
+
+
+def reject_out_of_window_sections(nbt, min_y, height, cx, cz):
+    """Fail closed when the native chunk holds blocks the port's window does not cover."""
+    info = out_of_window_sections(nbt, min_y, height)
+    if info["cells"]:
         raise TriageError(
-            f"{cx},{cz}: native section Y={sy} has blocks outside the comparison window "
-            f"y={lo}..{hi - 1}; pass --min-y/--height that cover it"
+            f"{cx},{cz}: native section Y={info['sections'][0]} has blocks outside the "
+            f"comparison window y={min_y}..{min_y + height - 1} "
+            f"({info['cells']} cells: {info['states']}); pass --min-y/--height that cover "
+            "it, or --out-of-window report to compare the window and count the exclusion"
         )
 
 
-def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=None, nbt_cache=None):
+def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=None,
+                      nbt_cache=None, out_of_window="reject"):
     nbt = cached_read_chunk_nbt(world, cx, cz, nbt_cache)
     status = nbt.get("Status")
     if status not in ("minecraft:full", "full"):
@@ -239,8 +379,11 @@ def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=Non
 
     if height <= 0 or height % 16 != 0 or min_y % 16 != 0:
         raise TriageError(f"chunk height/min_y must be section-aligned (got min_y={min_y}, height={height})")
+    oow = {"cells": 0, "sections": [], "states": {}}
     if min_y_override is not None or height_override is not None:
-        reject_out_of_window_sections(nbt, min_y, height, cx, cz)
+        oow = out_of_window_sections(nbt, min_y, height)
+        if oow["cells"] and out_of_window != "report":
+            reject_out_of_window_sections(nbt, min_y, height, cx, cz)
 
     num_sections = height // 16
     min_sy = min_y // 16
@@ -306,6 +449,7 @@ def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=Non
         "quarts": quarts,
         "biome_counts": biome_counts,
         "heightmaps": heightmaps,
+        "out_of_window": oow,
         "meta": {
             "DataVersion": nbt.get("DataVersion"),
             "Status": status,
@@ -814,22 +958,42 @@ def _compare_chunk(args, native_a, native_b, port, struct_info, port_hm):
         "overall_pairs": overall_pairs,
         "overall_pair_yrange": overall_pair_yrange,
         "heightmaps": hm_report,
+        "out_of_window": native_a.get("out_of_window") or {"cells": 0, "sections": [], "states": {}},
     }
+
+
+def resolve_worlds(args):
+    """Resolve `--world`/`--world-b` to the directory that holds the dimension's regions.
+
+    Returns `(world_a, world_b)`. The resolved paths are what every chunk read uses;
+    `args.world` keeps the caller's argument so the report names what was asked for.
+    """
+    world_a = resolve_dimension_world(
+        args.world, preset=getattr(args, "preset", None), dim=getattr(args, "dim", None)
+    )
+    world_b = None
+    if getattr(args, "world_b", None):
+        world_b = resolve_dimension_world(
+            args.world_b, preset=getattr(args, "preset", None), dim=getattr(args, "dim", None)
+        )
+    return world_a, world_b
 
 
 def triage(args):
     nbt_cache = {}
-    native_a = load_native_chunk(args.world, args.cx, args.cz,
+    world_a, world_b = resolve_worlds(args)
+    oow = getattr(args, "out_of_window", "reject")
+    native_a = load_native_chunk(world_a, args.cx, args.cz,
                                  min_y_override=args.min_y, height_override=args.height,
-                                 nbt_cache=nbt_cache)
+                                 nbt_cache=nbt_cache, out_of_window=oow)
     min_y = native_a["min_y"]
     height = native_a["height"]
 
     native_b = None
-    if args.world_b:
-        native_b = load_native_chunk(args.world_b, args.cx, args.cz,
+    if world_b:
+        native_b = load_native_chunk(world_b, args.cx, args.cz,
                                      min_y_override=min_y, height_override=height,
-                                     nbt_cache=nbt_cache)
+                                     nbt_cache=nbt_cache, out_of_window=oow)
 
     bin_ox, bin_oz, bin_n = _resolve_bin_window(args)
 
@@ -839,7 +1003,7 @@ def triage(args):
         port = load_port_bin(args.port_bin, args.cx, args.cz, min_y, height,
                              bin_ox=bin_ox, bin_oz=bin_oz, bin_n=bin_n)
 
-    struct_info = collect_structure_pieces(args.world, native_a, args.halo, nbt_cache=nbt_cache)
+    struct_info = collect_structure_pieces(world_a, native_a, args.halo, nbt_cache=nbt_cache)
     port_hm = None
     if args.port_hm:
         port_hm = load_port_hm(args.port_hm, args.cx, args.cz,
@@ -857,6 +1021,7 @@ def triage_grid(args):
     allow_incomplete = getattr(args, "allow_incomplete", False)
     coords = [(args.cx + dx, args.cz + dz) for dz in range(n) for dx in range(n)]
     nbt_cache = {}
+    world_a, world_b = resolve_worlds(args)
 
     native_chunks = []
     skipped = []
@@ -865,9 +1030,10 @@ def triage_grid(args):
 
     for cx, cz in coords:
         try:
-            na = load_native_chunk(args.world, cx, cz,
+            na = load_native_chunk(world_a, cx, cz,
                                    min_y_override=ref_min_y, height_override=ref_height,
-                                   nbt_cache=nbt_cache)
+                                   nbt_cache=nbt_cache,
+                                   out_of_window=getattr(args, "out_of_window", "reject"))
         except TriageError as exc:
             if allow_incomplete:
                 skipped.append({"chunk": [cx, cz], "side": "native_a", "reason": str(exc)})
@@ -883,11 +1049,12 @@ def triage_grid(args):
             raise TriageError(f"chunk ({cx},{cz}) height={na['height']} != grid height={ref_height}")
 
         nb = None
-        if args.world_b:
+        if world_b:
             try:
-                nb = load_native_chunk(args.world_b, cx, cz,
+                nb = load_native_chunk(world_b, cx, cz,
                                        min_y_override=ref_min_y, height_override=ref_height,
-                                       nbt_cache=nbt_cache)
+                                       nbt_cache=nbt_cache,
+                                       out_of_window=getattr(args, "out_of_window", "reject"))
             except TriageError as exc:
                 if allow_incomplete:
                     skipped.append({"chunk": [cx, cz], "side": "native_b", "reason": str(exc)})
@@ -938,10 +1105,11 @@ def triage_grid(args):
         "samples": defaultdict(list),
     })
     agg_hm_diff_cols = 0
+    agg_oow = {"cells": 0, "sections": [], "states": Counter()}
 
     for na, nb in native_chunks:
         cx, cz = na["cx"], na["cz"]
-        struct_info = collect_structure_pieces(args.world, na, args.halo, nbt_cache=nbt_cache)
+        struct_info = collect_structure_pieces(world_a, na, args.halo, nbt_cache=nbt_cache)
         port_hm = (
             load_port_hm(args.port_hm, cx, cz, bin_ox=bin_ox, bin_oz=bin_oz, bin_n=bin_n, raw_bytes=raw_hm)
             if raw_hm is not None
@@ -976,6 +1144,11 @@ def triage_grid(args):
                     ab["samples"][pair].extend(pts[:room])
         if raw_hm is not None:
             agg_hm_diff_cols += res["heightmaps"].get("port_vs_native_saved_diff_cols", 0)
+        oow = res.get("out_of_window") or {}
+        if oow.get("cells"):
+            agg_oow["cells"] += oow["cells"]
+            agg_oow["sections"].extend(oow["sections"])
+            agg_oow["states"].update(oow["states"])
 
     sample_port = chunk_results[0]["port"]
     return {
@@ -984,8 +1157,9 @@ def triage_grid(args):
         "n": n,
         "min_y": ref_min_y,
         "height": ref_height,
-        "world": str(args.world),
-        "world_b": str(args.world_b) if args.world_b else None,
+        "world": str(world_a),
+        "world_arg": str(args.world),
+        "world_b": str(world_b) if world_b else None,
         "port_meta": {
             "kind": sample_port["kind"],
             "path": sample_port["path"],
@@ -999,6 +1173,11 @@ def triage_grid(args):
         "overall_pair_yrange": agg_pair_yrange,
         "buckets": agg_buckets,
         "heightmap_diff_cols": agg_hm_diff_cols if raw_hm is not None else None,
+        "out_of_window": {
+            "cells": agg_oow["cells"],
+            "sections": agg_oow["sections"],
+            "states": dict(agg_oow["states"].most_common(8)),
+        },
     }
 
 
@@ -1060,6 +1239,13 @@ def format_report(res, args):
         for (va, vb, vp), cnt in res["unstable_patterns"].most_common(6):
             lines.append(f"    unstable {cnt:5d}: A={va} B={vb} port={vp}")
 
+    oow = res.get("out_of_window") or {}
+    if oow.get("cells"):
+        lines.append(
+            f"out-of-window native cells (NOT compared): {oow['cells']} "
+            f"sections={oow['sections']} states={oow['states']}"
+        )
+
     if res["heightmaps"]:
         lines.append(f"heightmaps: {res['heightmaps']}")
 
@@ -1101,6 +1287,12 @@ def format_grid_report(gres, args):
     lines.append(f"native A: {gres['world']}")
     if gres["world_b"]:
         lines.append(f"native B: {gres['world_b']}")
+    oow = gres.get("out_of_window") or {}
+    if oow.get("cells"):
+        lines.append(
+            f"out-of-window native cells (NOT compared): {oow['cells']} "
+            f"sections={oow['sections']} states={oow['states']}"
+        )
     lines.append(f"port ({pm['kind']}): {pm['path']} sha256={pm['sha256'][:16]}...")
     if gres["skipped"]:
         sdesc = ", ".join(f"({s['chunk'][0]},{s['chunk'][1]}:{s['side']})" for s in gres["skipped"])
@@ -1178,12 +1370,14 @@ def json_summary(res):
             "min_y": res["min_y"],
             "height": res["height"],
             "world": res["world"],
+            "world_arg": res.get("world_arg"),
             "world_b": res["world_b"],
             "port_meta": res["port_meta"],
             "compared_chunks": len(res["chunks"]),
             "skipped": res["skipped"],
             "totals": res["totals"],
             "heightmap_diff_cols": res["heightmap_diff_cols"],
+            "out_of_window": res.get("out_of_window"),
             "top_pairs": [
                 {
                     "native": va,
@@ -1213,6 +1407,7 @@ def json_summary(res):
         "chunk": [na["cx"], na["cz"]],
         "min_y": na["min_y"],
         "height": na["height"],
+        "out_of_window": res.get("out_of_window") or {"cells": 0, "sections": [], "states": {}},
         "native_a_meta": na["meta"],
         "port_meta": {
             "kind": res["port"]["kind"],
@@ -1265,6 +1460,12 @@ def build_parser():
     src.add_argument("--port-bin", help="Port binary dump (from MC_SPINE_WG_DUMP)")
     ap.add_argument("--n", type=int, default=1, help="Grid width N from (cx,cz) (default: 1)")
     ap.add_argument("--world-b", help="Optional second native world run to isolate native run-to-run noise")
+    ap.add_argument("--preset", choices=("overworld", "nether", "end"),
+                    help="Dimension the native world's chunks live in (default: from <world>/region)")
+    ap.add_argument("--dim", help="Dimension directory to read: overworld|nether|end|DIM-1|DIM1 (overrides --preset)")
+    ap.add_argument("--out-of-window", choices=("reject", "report"), default="reject",
+                    help="Native blocks outside --min-y/--height: reject (default) or report "
+                         "them as a counted exclusion and compare the window")
     ap.add_argument("--bin-ox", type=int, help="Binary/HM dump origin chunk X (default: cx)")
     ap.add_argument("--bin-oz", type=int, help="Binary/HM dump origin chunk Z (default: cz)")
     ap.add_argument("--bin-n", type=int, default=None, help="Binary/HM dump grid width N (default: --n)")

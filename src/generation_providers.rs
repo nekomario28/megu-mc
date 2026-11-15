@@ -942,6 +942,20 @@ pub(crate) fn is_dirtish(reg: &BReg, st: u32) -> bool {
             | "minecraft:coarse_dirt"
     ) || reg.in_tag(st, "minecraft:dirt")
 }
+/// `LevelReader.getRawBrightness(pos, 0)` for a chunk whose light has not been
+/// initialized yet, which is the state every feature runs in (`INITIALIZE_LIGHT` comes
+/// after `FEATURES`).
+///
+/// The Overworld's uninitialized skylight reads 15; a dimension without skylight (the
+/// Nether, the End) reads its block light, which is 0 before anything lights the chunk.
+fn uninitialized_raw_brightness(ctx: &FC) -> u8 {
+    if ctx.g.has_skylight() {
+        15
+    } else {
+        ctx.block_light(0, 0, 0)
+    }
+}
+
 pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z: i32) -> bool {
     let below = ctx.get(x, y - 1, z);
     let at = ctx.get(x, y, z);
@@ -1046,13 +1060,25 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
                 || reg.name_of(below) == "minecraft:clay"
         }
         "minecraft:brown_mushroom" | "minecraft:red_mushroom" => {
-            // FC runs fresh overworld FEATURES, before INITIALIZE_LIGHT.
-            // SkyLightSectionStorage's missing-column read is 15: all 41
-            // actual MushroomBlock reads on the forest fixture were 15,
-            // including beneath a canopy. Only MUSHROOM_GROW_BLOCK bypasses
-            // the <13 test. Initialized-light feature execution is not modeled.
+            // `MushroomBlock.canSurvive`: `#minecraft:mushroom_grow_block` below skips
+            // the light test entirely, otherwise `getRawBrightness(pos, 0) < 13` *and*
+            // `mayPlaceOn`, which `MushroomBlock` overrides to `isSolidRender` - not the
+            // BushBlock dirt rule. FC runs fresh FEATURES, before INITIALIZE_LIGHT:
+            // SkyLightSectionStorage's missing-column read is 15 in the Overworld (all 41
+            // MushroomBlock reads on the forest fixture were 15, beneath a canopy
+            // included), while the Nether and the End have no skylight at all and read
+            // the block light, which is 0 before the chunk is lit.
             reg.in_tag(below, "minecraft:mushroom_grow_block")
+                || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))
         }
+        // `BaseFireBlock.canSurvive`: the block below has a sturdy up face (or the cell
+        // is a portal, which a patch cannot be). Not the BushBlock rule: `patch_fire`
+        // places on netherrack, which is not in `#minecraft:dirt`.
+        "minecraft:fire" => reg.side_solid(below, 1),
+        // `SoulFireBlock.canSurvive` is narrower: `#minecraft:soul_fire_base_blocks`
+        // (soul sand, soul soil). `patch_soul_fire`'s own predicate already requires
+        // soul soil, so this is the second half of the same rule.
+        "minecraft:soul_fire" => reg.in_tag(below, "minecraft:soul_fire_base_blocks"),
         _ => {
             // BushBlock family (saplings, flowers, grasses, ferns, bushes,
             // petals, dead_bush, torchflower...): dirt-tag or farmland below

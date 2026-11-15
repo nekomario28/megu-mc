@@ -714,6 +714,12 @@ pub struct Gen {
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     col_ord: Vec<(i32, i32)>,
+    /// `ChunkGenerator.getBaseColumn` columns: the noise-only answer a structure's
+    /// `findGenerationPoint` scans. Keyed like `col_c` but *not* interchangeable with
+    /// it: a base column has no beardifier and no surface rule, so it is pure in
+    /// (seed, preset, chunk) and may be cached even while a beard is resolving.
+    base_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
+    base_ord: std::collections::VecDeque<(i32, i32)>,
     /// Per-chunk beardifier input, keyed like `col_c`. Pure in (seed, cx, cz): the
     /// resolver reads structure starts, which are functions of the seed only.
     beard_c: HashMap<(i32, i32), std::sync::Arc<BeardChunkData>>,
@@ -1056,6 +1062,8 @@ impl Gen {
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
             col_ord: Vec::new(),
+            base_c: HashMap::new(),
+            base_ord: std::collections::VecDeque::new(),
             beard_c: HashMap::new(),
             beard_ord: std::collections::VecDeque::new(),
             beard_resolver: None,
@@ -3195,6 +3203,8 @@ impl Gen {
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
             col_ord: Vec::new(),
+            base_c: HashMap::new(),
+            base_ord: std::collections::VecDeque::new(),
             beard_c: HashMap::new(),
             beard_ord: std::collections::VecDeque::new(),
             beard_resolver: None,
@@ -3295,6 +3305,66 @@ impl Gen {
         if let Some(v) = self.col_c.get(&(cx, cz)) {
             return Some(v.clone());
         }
+        let cc = self.build_cols(cx, cz, true)?;
+        let arc = std::sync::Arc::new(cc);
+        // Columns built while a beardifier resolution was in flight are the preliminary
+        // (structure-free) answer on purpose, and must not be cached: the same chunk's
+        // final columns need the structure data this build could not ask for.
+        if self.beard_depth == 0 {
+            self.col_ord.push((cx, cz));
+            if self.col_ord.len() > 128 {
+                let old = self.col_ord.remove(0);
+                self.col_c.remove(&old);
+            }
+            self.col_c.insert((cx, cz), arc.clone());
+        }
+        Some(arc)
+    }
+
+    /// `ChunkGenerator.getBaseColumn(x, z, level, randomState)`: the column a
+    /// structure's `findGenerationPoint` may scan, with no beardifier and no surface
+    /// rule. Vanilla builds a fresh 1x1 `NoiseChunk` here, so the answer must not
+    /// depend on the carvers, the features, or the chunk's own beardifier: a
+    /// `nether_fossil` placed from the live column lands on top of the mound its own
+    /// beard raises instead of inside the terrain the noise says is there.
+    ///
+    /// Cached separately from `col_c` because it is pure in (seed, preset, chunk);
+    /// unlike `cols`, it is safe to cache while `beard_depth > 0`.
+    pub(crate) fn base_cols(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
+        if let Some(v) = self.base_c.get(&(cx, cz)) {
+            return Some(v.clone());
+        }
+        let arc = std::sync::Arc::new(self.build_cols(cx, cz, false)?);
+        self.base_ord.push_back((cx, cz));
+        if self.base_ord.len() > 64 {
+            if let Some(old) = self.base_ord.pop_front() {
+                self.base_c.remove(&old);
+            }
+        }
+        self.base_c.insert((cx, cz), arc.clone());
+        Some(arc)
+    }
+
+    /// One cell of `ChunkGenerator.getBaseColumn`: `NoiseChunk.getBlockState` with the
+    /// beardifier node answering zero, i.e. density -> default block, otherwise the
+    /// aquifer's substance, falling back to the default block where the aquifer
+    /// refuses the cell (vanilla's `$$27 == null ? settings.defaultBlock() : $$27`).
+    ///
+    /// `None` outside the noise window, where vanilla's `NoiseColumn` has no cell.
+    pub(crate) fn base_column_state(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
+        if y < self.min_y || y >= self.min_y + self.height {
+            return None;
+        }
+        let cc = self.base_cols(x >> 4, z >> 4)?;
+        let d = self.block_density(&cc, x, y, z);
+        if d > 0.0 {
+            return Some(self.def_st);
+        }
+        Some(self.aq_state(x, y, z, d).unwrap_or(self.def_st))
+    }
+
+    /// `cols` (`final_columns`) or `base_cols` (`!final_columns`): one chunk's columns.
+    fn build_cols(&mut self, cx: i32, cz: i32, final_columns: bool) -> Option<ChunkCols> {
         let g = self;
         let ny = ((g.height / g.noise_cell_h) + 1) as usize;
         let nx = (16 / g.noise_cell_w + 1) as usize;
@@ -3328,7 +3398,11 @@ impl Gen {
         // unsmoothed estimate and is not affected; a nested heightmap query during
         // resolution runs with `beard_depth > 0`, gets `None` here, and is therefore
         // excluded from `col_c` (see the cache rule at the end of this function).
-        let beard = g.resolve_beard(cx, cz);
+        let beard = if final_columns {
+            g.resolve_beard(cx, cz)
+        } else {
+            None
+        };
         let mut cc = ChunkCols {
             grids,
             surf: [0i16; 256],
@@ -3341,6 +3415,12 @@ impl Gen {
             wtop: [0i16; 256],
             beard,
         };
+        // A base column is the noise answer only: vanilla's `getBaseColumn` runs neither
+        // `SurfaceSystem.buildSurface` nor the heightmap pass, and `block_density` never
+        // reads `surf`/`wtop`/`mats`, so skip all three instead of paying for them.
+        if !final_columns {
+            return Some(cc);
+        }
         let top = g.min_y + g.height - 1;
         for zi in 0..16usize {
             for xi in 0..16usize {
@@ -3426,19 +3506,7 @@ impl Gen {
         }
         cc.mats = mats;
         cc.rd = rd;
-        let arc = std::sync::Arc::new(cc);
-        // Columns built while a beardifier resolution was in flight are the preliminary
-        // (structure-free) answer on purpose, and must not be cached: the same chunk's
-        // final columns need the structure data this build could not ask for.
-        if g.beard_depth == 0 {
-            g.col_ord.push((cx, cz));
-            if g.col_ord.len() > 128 {
-                let old = g.col_ord.remove(0);
-                g.col_c.remove(&old);
-            }
-            g.col_c.insert((cx, cz), arc.clone());
-        }
-        Some(arc)
+        Some(cc)
     }
 }
 
@@ -3755,6 +3823,12 @@ impl Gen {
             Some(st) => st,
             None => self.deep_state_cached(x, y, z, cc),
         }
+    }
+    /// `DimensionType.hasSkyLight()` for this preset. Only the Overworld has a sky
+    /// light layer, which is what decides the brightness a feature sees before
+    /// `INITIALIZE_LIGHT` (see `generation_providers::uninitialized_raw_brightness`).
+    pub(crate) fn has_skylight(&self) -> bool {
+        self.preset == NoisePreset::Overworld
     }
     /// WORLD_SURFACE_WG-style height (first non-air + 1) at a column.
     pub(crate) fn top_ws(&mut self, x: i32, z: i32) -> i32 {

@@ -260,6 +260,9 @@ Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid)
             world = tmp_path / "world"
             world.mkdir()
             (world / "level.dat").write_bytes(make_level_dat(seed=4242))
+            # A native multi-dimension capture keeps the Nether's regions in
+            # `DIM-1/`, not in the root's `region/`.
+            (world / "DIM-1" / "region").mkdir(parents=True)
             env_log = tmp_path / "env.json"
             fake_bin = tmp_path / "fake-mc-spine"
             # 8 sections of all-air for the 0..128 window the port generates.
@@ -323,6 +326,58 @@ Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{n * 8 * 4096}}I", *([
                         rc = pt.main([str(world), "0", "0", *overrides])
                     self.assertEqual(rc, 2)
                     self.assertIn(message, err.getvalue())
+
+    def test_nether_preset_reads_dim_minus_one_and_its_root_level_dat(self):
+        # A native Nether capture has `world/level.dat` plus `world/DIM-1/region`;
+        # the root's `region/` is the Overworld. The preflight has to resolve the
+        # dimension directory *and* still read the seed from the root's level.dat,
+        # otherwise the port dumps the Overworld seed against Nether chunks.
+        native = make_chunk_nbt(
+            0, 0, min_y=0, height=32,
+            blocks={(0, 20, 0): ("minecraft:netherrack", {})},
+            biome="minecraft:nether_wastes",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            world = tmp_path / "world"
+            for rel in ("region", "DIM-1/region"):
+                (world / rel).mkdir(parents=True)
+            (world / "level.dat").write_bytes(make_level_dat(seed=4242))
+            args = pt.build_parser().parse_args(
+                [str(world), "0", "0", "--preset", "nether", "--binary", str(tmp_path / "missing")]
+            )
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=native):
+                seed, meta = pt.preflight(args)
+            self.assertEqual(seed, 4242)
+            self.assertEqual(meta["path"], str(world / "level.dat"))
+            self.assertEqual(args.world, str(world / "DIM-1"))
+
+            # The dimension directory itself stays a valid argument.
+            args = pt.build_parser().parse_args(
+                [str(world / "DIM-1"), "0", "0", "--preset", "nether", "--binary", str(tmp_path / "missing")]
+            )
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=native):
+                seed, meta = pt.preflight(args)
+            self.assertEqual(seed, 4242)
+            self.assertEqual(args.world, str(world / "DIM-1"))
+
+            # A root without the requested dimension fails closed before any build.
+            (world / "DIM-1" / "region").rmdir()
+            args = pt.build_parser().parse_args(
+                [str(world), "0", "0", "--preset", "nether", "--binary", str(tmp_path / "missing")]
+            )
+            with self.assertRaises(pt.PortTriageError) as raised:
+                pt.preflight(args)
+            self.assertIn("DIM-1/region", str(raised.exception))
+
+    def test_out_of_window_flag_defaults_to_reject(self):
+        # The End City capture has 273 native cells above the End noise window; the
+        # default stays fail-closed and the report mode is an explicit opt-in.
+        self.assertEqual(
+            pt.build_parser().parse_args(["w", "0", "0"]).out_of_window, "reject")
+        self.assertEqual(
+            pt.build_parser().parse_args(["w", "0", "0", "--out-of-window", "report"]).out_of_window,
+            "report")
 
 
 if __name__ == "__main__":

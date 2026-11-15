@@ -62,8 +62,10 @@ class PortTriageError(Exception):
 
 
 def read_level_meta(world):
-    level_dat = Path(world) / "level.dat"
-    if not level_dat.is_file():
+    # A dimension directory (`<world>/DIM-1`) passed directly has no `level.dat` of
+    # its own; the seed and options live in the world root above it.
+    level_dat = chunk_triage.resolve_level_dat(world)
+    if level_dat is None:
         return None
     try:
         raw = gzip.decompress(level_dat.read_bytes())
@@ -171,6 +173,15 @@ def preflight(args):
     if not world.is_dir():
         raise PortTriageError(f"native world directory does not exist: {world}")
 
+    # `--preset nether|end` reads `<world>/DIM-1|DIM1` when the world is a
+    # multi-dimension root, and still accepts the dimension directory itself.
+    try:
+        args.world = str(chunk_triage.resolve_dimension_world(
+            world, preset=args.preset, dim=args.dim))
+    except chunk_triage.TriageError as exc:
+        raise PortTriageError(str(exc)) from exc
+    world = Path(args.world)
+
     meta_a = read_level_meta(world)
     if args.seed is not None:
         seed = args.seed
@@ -187,7 +198,12 @@ def preflight(args):
         world_b = Path(args.world_b)
         if not world_b.is_dir():
             raise PortTriageError(f"--world-b directory does not exist: {world_b}")
-        meta_b = read_level_meta(world_b)
+        try:
+            args.world_b = str(chunk_triage.resolve_dimension_world(
+                world_b, preset=args.preset, dim=args.dim))
+        except chunk_triage.TriageError as exc:
+            raise PortTriageError(str(exc)) from exc
+        meta_b = read_level_meta(Path(args.world_b))
         if meta_b and meta_b["seed"] is not None and meta_b["seed"] != seed and not args.allow_seed_mismatch:
             raise PortTriageError(
                 f"world B seed {meta_b['seed']} != target seed {seed}"
@@ -219,13 +235,18 @@ def preflight(args):
                 raise chunk_triage.TriageError(f"{world} chunk ({cx},{cz}) Status={st!r}, expected 'minecraft:full'")
             # The port dumps exactly the preset's generated window, so a native block
             # outside it can never be compared: reject it here, before the build.
-            chunk_triage.reject_out_of_window_sections(nbt, args.min_y, args.height, cx, cz)
+            oow = chunk_triage.out_of_window_sections(nbt, args.min_y, args.height)
+            if oow["cells"] and args.out_of_window != "report":
+                chunk_triage.reject_out_of_window_sections(nbt, args.min_y, args.height, cx, cz)
             if args.world_b:
                 nbt_b = chunk_triage.cached_read_chunk_nbt(str(args.world_b), cx, cz, nbt_cache)
                 st_b = nbt_b.get("Status")
                 if st_b not in ("minecraft:full", "full"):
                     raise chunk_triage.TriageError(f"{args.world_b} chunk ({cx},{cz}) Status={st_b!r}, expected 'minecraft:full'")
-                chunk_triage.reject_out_of_window_sections(nbt_b, args.min_y, args.height, cx, cz)
+                oow_b = chunk_triage.out_of_window_sections(nbt_b, args.min_y, args.height)
+                if oow_b["cells"] and args.out_of_window != "report":
+                    chunk_triage.reject_out_of_window_sections(
+                        nbt_b, args.min_y, args.height, cx, cz)
             ok_chunks += 1
         except chunk_triage.TriageError as exc:
             if not args.allow_incomplete:
@@ -345,6 +366,7 @@ def execute(args):
             allow_incomplete=args.allow_incomplete,
             fail_on_diff=args.fail_on_diff,
             json_out=args.json_out,
+            out_of_window=args.out_of_window,
         )
         try:
             triage_res = chunk_triage.triage_grid(ct_args)
@@ -392,7 +414,9 @@ def build_parser():
     ap.add_argument("--mode", choices=("full", "terrain", "carvers"), default="full",
                     help="Port worldgen stage mode (default: full)")
     ap.add_argument("--preset", choices=("overworld", "nether", "end"), default="overworld",
-                    help="Offline noise preset (default: overworld)")
+                    help="Offline noise preset (default: overworld); also selects the native dimension directory")
+    ap.add_argument("--dim",
+                    help="Native dimension directory to read: overworld|nether|end|DIM-1|DIM1 (overrides --preset)")
     ap.add_argument("--noaq", action="store_true", help="Set MC_SPINE_NOAQ=1 during port dump")
     ap.add_argument("--pop-order", help="Optional MC_SPINE_POP_ORDER TSV or SculkLog trace (POP_CHUNK/SPASS)")
     ap.add_argument("--pop-order-scope", choices=("exact", "recorded"), default="exact",
@@ -417,6 +441,10 @@ def build_parser():
     ap.add_argument("--samples", type=int, default=5, help="Sample coords per pair/bucket (default: 5)")
     ap.add_argument("--per-chunk", action="store_true", help="In --n > 1 mode, print full report per differing chunk")
     ap.add_argument("--allow-incomplete", action="store_true", help="In --n > 1 mode, skip missing/non-full chunks")
+    ap.add_argument("--out-of-window", choices=("reject", "report"), default="reject",
+                    help="Native blocks outside the preset window: reject (default) or report "
+                         "them as a counted exclusion and compare the window (e.g. an End City "
+                         "tower above the End noise window's y=128)")
     ap.add_argument("--json-out", help="Write JSON triage + port provenance report")
     ap.add_argument("--fail-on-diff", action="store_true", help="Exit 1 when all_air_diffs > 0")
     return ap

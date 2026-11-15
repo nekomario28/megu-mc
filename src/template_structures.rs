@@ -103,6 +103,19 @@ pub(crate) trait TemplateWorld {
     fn heightmap(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32;
     /// `ChunkGenerator.getBaseHeight` — the generator's own column answer.
     fn base_height(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32;
+    /// `ChunkGenerator.getBaseColumn(x, z, level, randomState)`: the noise-only column a
+    /// structure's `findGenerationPoint` scans, before the surface rule, the carvers,
+    /// the features and the chunk's own beardifier. `nether_fossil` is the only 1.21.1
+    /// structure that reads it, and reading the live column instead makes its start
+    /// depend on its own beard (measured: seed 4242 chunk (-22,20) places the fossil 23
+    /// blocks too high). `None` when the world has no generator, where the live blocks
+    /// are the only column a synthetic oracle scene can offer.
+    fn base_column(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
+        // A synthetic oracle scene has no generator; its live blocks are the column.
+        let _ = (x, y, z);
+        None
+    }
+
     fn sea_level(&self) -> i32;
     fn min_y(&self) -> i32;
     fn height(&self) -> i32;
@@ -134,6 +147,9 @@ impl TemplateWorld for crate::generation_context::FC<'_> {
         } else {
             self.g.top_ws(x, z)
         }
+    }
+    fn base_column(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.g.base_column_state(x, y, z)
     }
     fn sea_level(&self) -> i32 {
         self.g.sea
@@ -1589,11 +1605,15 @@ pub(crate) enum VerticalAnchor {
 }
 
 impl VerticalAnchor {
+    /// `VerticalAnchor.resolveY(WorldGenerationContext)`. `below_top: n` is the
+    /// n-th block *below* the top, so the offset subtracts: vanilla's
+    /// `minGenY + genDepth - 1 - n`. Adding it instead asks for a y above the
+    /// dimension, which silently widens the `HeightProvider` range.
     fn resolve(self, min_y: i32, depth: i32) -> i32 {
         match self {
             Self::Absolute(y) => y,
             Self::AboveBottom(offset) => min_y + offset,
-            Self::BelowTop(offset) => min_y + depth - 1 + offset,
+            Self::BelowTop(offset) => min_y + depth - 1 - offset,
         }
     }
 
@@ -2053,9 +2073,14 @@ fn nether_fossil_find<W: TemplateWorld>(
     let depth = world.height();
     let mut y = height.sample(ctx.rng, min_y, depth);
     while y > sea {
-        let above = world.get(x, y, z);
+        // `NoiseColumn` cells, not the live chunk. Vanilla's `getBaseColumn` carries no
+        // beardifier, so the scan must not see the mound the fossil's own `beard_thin`
+        // raises around it; and the start is computed at `structure_starts`, before the
+        // noise, surface and carver stages write anything, so the live column would fold
+        // those stages into the placement too.
+        let above = world.base_column(x, y, z).unwrap_or_else(|| world.get(x, y, z));
         y -= 1;
-        let below = world.get(x, y, z);
+        let below = world.base_column(x, y, z).unwrap_or_else(|| world.get(x, y, z));
         let sturdy = reg.is_template_solid(below) == Some(true);
         if reg.is_air(above) && (reg.name_of(below) == "minecraft:soul_sand" || sturdy) {
             break;
@@ -3283,6 +3308,22 @@ mod template_structures_tests {
     use crate::generation_math::sha256;
     use crate::json::{jarr, jint, jnum, jparse, jstr, J};
     use std::collections::HashMap;
+
+    /// `VerticalAnchor.BELOW_TOP` is `minGenY + genDepth - 1 - n`: the n-th block *below*
+    /// the top. Adding the offset instead asks for a y above the dimension, which widens
+    /// the `HeightProvider` range and shifts every `nether_fossil` sample (measured on
+    /// seed 4242 chunk (-22,20): the fossil landed 23 blocks too high).
+    #[test]
+    fn vertical_anchor_resolves_like_the_native_anchors() {
+        assert_eq!(VerticalAnchor::Absolute(7).resolve(-64, 384), 7);
+        assert_eq!(VerticalAnchor::Absolute(7).resolve(0, 128), 7);
+        assert_eq!(VerticalAnchor::AboveBottom(4).resolve(0, 128), 4);
+        assert_eq!(VerticalAnchor::AboveBottom(4).resolve(-64, 384), -60);
+        // `below_top: 0` is the top block, so the dimension's top y is height - 1.
+        assert_eq!(VerticalAnchor::BelowTop(0).resolve(0, 128), 127);
+        assert_eq!(VerticalAnchor::BelowTop(2).resolve(0, 128), 125);
+        assert_eq!(VerticalAnchor::BelowTop(5).resolve(-64, 384), 314);
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
