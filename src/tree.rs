@@ -63,11 +63,23 @@ fn is_air_or_leaves(ctx: &mut FC, p: P3) -> bool {
         None => false,
     }
 }
-fn set_dirt(ctx: &mut FC, rng: &mut Xor, p: P3, provider: &Option<Box<Bsp>>) {
-    if let Some(bsp) = provider {
-        let st = bsp.get(ctx, rng, p.0, p.1, p.2);
-        ctx.set(p.0, p.1, p.2, st);
+pub(crate) fn set_dirt(
+    ctx: &mut FC,
+    rng: &mut Xor,
+    p: P3,
+    provider: &Option<Box<Bsp>>,
+    force: bool,
+    logs: &mut Vec<P3>,
+) {
+    let Some(bsp) = provider else { return };
+    match breg() {
+        Some(reg) if !force && reg.in_tag(ctx.get(p.0, p.1, p.2), "minecraft:logs") => return,
+        Some(_) => {}
+        None => return,
     }
+    let st = bsp.get(ctx, rng, p.0, p.1, p.2);
+    ctx.set(p.0, p.1, p.2, st);
+    logs.push(p);
 }
 fn set_axis(ctx: &mut FC, p: P3, base: u32, axis: &str) -> bool {
     if let Some(reg) = breg() {
@@ -157,7 +169,14 @@ impl TrunkPl {
         let mut logs = vec![];
         match &self.ty {
             TP::Straight => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
+                set_dirt(
+                    ctx,
+                    rng,
+                    (start.0, start.1 - 1, start.2),
+                    dirt_provider,
+                    extra.force_dirt,
+                    &mut logs,
+                );
                 for i in 0..height {
                     let p = (start.0, start.1 + i, start.2);
                     if set_if_can_replace(ctx, p, trunk_st) {
@@ -178,7 +197,7 @@ impl TrunkPl {
                     (below.0, below.1, below.2 + 1),
                     (below.0 + 1, below.1, below.2 + 1),
                 ] {
-                    set_dirt(ctx, rng, dp, dirt_provider);
+                    set_dirt(ctx, rng, dp, dirt_provider, extra.force_dirt, &mut logs);
                 }
                 for y in 0..height {
                     for (dx, dz) in [(0, 0), (1, 0), (1, 1), (0, 1)] {
@@ -226,7 +245,7 @@ impl TrunkPl {
                     (below.0, below.1, below.2 + 1),
                     (below.0 + 1, below.1, below.2 + 1),
                 ] {
-                    set_dirt(ctx, rng, dp, dirt_provider);
+                    set_dirt(ctx, rng, dp, dirt_provider, extra.force_dirt, &mut logs);
                 }
                 let lean_dir = rand_horizontal(rng);
                 let lean_h = height - rng.next_bound(4);
@@ -277,7 +296,14 @@ impl TrunkPl {
                 }
             }
             TP::Forking => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
+                set_dirt(
+                    ctx,
+                    rng,
+                    (start.0, start.1 - 1, start.2),
+                    dirt_provider,
+                    extra.force_dirt,
+                    &mut logs,
+                );
                 let lean_dir = rand_horizontal(rng);
                 let lean_h = height - rng.next_bound(4) - 1;
                 let mut lean_steps = 3 - rng.next_bound(3);
@@ -338,7 +364,14 @@ impl TrunkPl {
             TP::Fancy => {
                 let j = height + 2;
                 let k = ((j as f64) * 0.618).floor() as i32;
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
+                set_dirt(
+                    ctx,
+                    rng,
+                    (start.0, start.1 - 1, start.2),
+                    dirt_provider,
+                    extra.force_dirt,
+                    &mut logs,
+                );
                 let l = ((1.382 + (1.0 * j as f64 / 13.0).powf(2.0)).floor() as i32).min(1);
                 let m = start.1 + k;
                 let mut list: Vec<(P3, i32)> = vec![];
@@ -409,7 +442,14 @@ impl TrunkPl {
                 let dir = rand_horizontal(rng);
                 let log_h = height - 1;
                 let mut pos = start;
-                set_dirt(ctx, rng, (pos.0, pos.1 - 1, pos.2), dirt_provider);
+                set_dirt(
+                    ctx,
+                    rng,
+                    (pos.0, pos.1 - 1, pos.2),
+                    dirt_provider,
+                    extra.force_dirt,
+                    &mut logs,
+                );
                 for i in 0..=log_h {
                     if i + 1 >= log_h + rng.next_bound(2) {
                         let (ox, oz) = hoff(dir);
@@ -530,7 +570,14 @@ impl TrunkPl {
                 start_off,
                 end_off,
             } => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
+                set_dirt(
+                    ctx,
+                    rng,
+                    (start.0, start.1 - 1, start.2),
+                    dirt_provider,
+                    extra.force_dirt,
+                    &mut logs,
+                );
                 let first_off = (height - 1 + start_off.get(rng)).max(0);
                 let mut second_off = (height - 1 + {
                     // second uses min..max-1 of the same uniform range
@@ -604,7 +651,14 @@ impl TrunkPl {
                 above_branches,
                 branch_amount,
             } => {
-                set_dirt(ctx, rng, (start.0, start.1 - 1, start.2), dirt_provider);
+                set_dirt(
+                    ctx,
+                    rng,
+                    (start.0, start.1 - 1, start.2),
+                    dirt_provider,
+                    extra.force_dirt,
+                    &mut logs,
+                );
                 let branch_h = height - above_branches.get(rng);
                 for y in 0..height {
                     let p = (start.0, start.1 + y, start.2);
@@ -637,7 +691,6 @@ impl TrunkPl {
                 });
             }
         }
-        let _ = extra;
         (nodes, logs)
     }
 }
@@ -809,11 +862,31 @@ fn gen_square(
             if leave_pos_invalid(fp, rng, x, y, z, radius, giant) {
                 continue;
             }
-            let p = (center.0 + x, center.1 + y, center.2 + z);
-            if set_if_can_replace(ctx, p, fst) {
-                out.push(p);
-            }
+            put_leaf(ctx, out, (center.0 + x, center.1 + y, center.2 + z), fst);
         }
+    }
+}
+/// `FoliagePlacer.placeLeaf` (`efu.a`), the gate every foliage placer's leaf write goes
+/// through:
+///
+/// ```java
+/// if (!TreeFeature.isFree(level, pos)) return false;   // edq.c
+/// BlockState state = config.foliageProvider().getState(random, pos);
+/// if (state.hasProperty(WATERLOGGED)) state = ...;      // per-position rewrite
+/// setter.set(pos, state);                              // TreeFeature$1: add + setBlock
+/// ```
+///
+/// So a canopy cell the current state refuses is absent from the tree's leaf list, and
+/// from every draw a decorator that walks that list consumes (`leave_vine` draws four
+/// `nextFloat` per entry). `TreeFeature$1` itself adds unconditionally *because* this
+/// gate already ran.
+///
+/// Not modelled here, and not measured in this pass: vanilla resolves the provider state
+/// per leaf cell and rewrites `WATERLOGGED` from the fluid at that cell, while this port
+/// resolves the foliage state once per tree.
+fn put_leaf(ctx: &mut FC, out: &mut Vec<P3>, p: P3, st: u32) {
+    if set_if_can_replace(ctx, p, st) {
+        out.push(p);
     }
 }
 fn is_leaf_set(ctx: &mut FC, p: P3) -> bool {
@@ -1188,9 +1261,7 @@ impl FP {
                         node.center.1 + rng.next_bound(fh) - rng.next_bound(fh),
                         node.center.2 + rng.next_bound(radius) - rng.next_bound(radius),
                     );
-                    if set_if_can_replace(ctx, p, fst) {
-                        out.push(p);
-                    }
+                    put_leaf(ctx, &mut out, p, fst);
                 }
             }
             FP::Cherry { hang, hang_ext, .. } => {
@@ -1322,9 +1393,7 @@ fn poplar_rhombus(
                 continue;
             }
             let p = (center.0 + x, center.1 + y, center.2 + z);
-            if set_if_can_replace(ctx, p, fst) {
-                out.push(p);
-            }
+            put_leaf(ctx, out, p, fst);
         }
     }
 }
@@ -1918,6 +1987,9 @@ pub(crate) struct TreeExtra {
     pub min_clipped: Option<i32>,
     pub dirt_provider: Option<Box<Bsp>>,
     pub ignore_vines: bool,
+    /// `force_dirt`: `TrunkPlacer.setDirtUnderneath` writes the dirt provider below the
+    /// trunk when this is set *or* when the cell is not a log.
+    pub force_dirt: bool,
     pub min_size: FS,
     pub decorators: Vec<Deco>,
     pub root_placer: Option<RootP>,
@@ -1931,6 +2003,60 @@ pub(crate) struct TreeExtra {
 
 fn clip_allows_top(top: i32, height: i32, min_clipped: Option<i32>) -> bool {
     top >= height || min_clipped.is_some_and(|min| top >= min)
+}
+
+/// `Vec3i.hashCode` in the pinned version: `(getY() + getZ() * 31) * 31 + getX()`, with
+/// Java's wrapping `int` arithmetic (`kh.hashCode`, read off the pinned jar).
+fn java_blockpos_hash(p: P3) -> i32 {
+    p.1.wrapping_add(p.2.wrapping_mul(31))
+        .wrapping_mul(31)
+        .wrapping_add(p.0)
+}
+
+/// The decorator's view of one of the tree's position lists, in the order vanilla hands it
+/// over.
+///
+/// `TreeFeature.place` collects the trunk, foliage and root positions in `Set<BlockPos>`s
+/// (`Sets.newHashSet()`), so duplicates collapse; `TreeDecorator.Context`'s constructor
+/// copies each set into an `ObjectArrayList` - which walks the `HashSet` in **bucket
+/// order** - and then sorts that list by `BlockPos::getY` with a stable sort. So the
+/// primary key is y and the tie-break is `HashMap` bucket order, not insertion order.
+///
+/// This matters for every decorator that draws once per entry (`leave_vine`: four
+/// `nextFloat` per leaf, `trunk_vine`: four `nextInt(3)` per log, `cocoa`/`beehive` walk
+/// in list order): the draw values are the same in aggregate, but which position each
+/// draw lands on is decided by this order. Getting it wrong changes which vines and
+/// cocoa exist, and a vine in a later tree's `minimum_size` scan rejects that tree
+/// (`ignore_vines` is false for jungle trees - measured: one wrongly ordered canopy put
+/// a jungle tree's leaves 18 blocks above the reference's terrain and moved the next
+/// `would_survive` filter to y=87).
+pub(crate) fn decorator_list(v: &[P3]) -> Vec<P3> {
+    // java.util.HashSet: table starts at 16, load factor 0.75, `size > cap * 0.75` doubles.
+    let mut distinct = std::collections::HashSet::new();
+    for &p in v {
+        distinct.insert(p);
+    }
+    let n = distinct.len();
+    let mut cap = 16usize;
+    while n > cap * 3 / 4 {
+        cap *= 2;
+    }
+    // Buckets in index order, each bucket in insertion order: Java 8's `HashMap.putVal`
+    // appends to the tail and a resize preserves the relative order of both halves.
+    // Treeification (>8 in one bucket, cap >= 64) cannot be reached by tree coordinates.
+    let mut buckets: Vec<Vec<P3>> = vec![Vec::new(); cap];
+    let mut seen: std::collections::HashSet<P3> = std::collections::HashSet::new();
+    for &p in v {
+        if !seen.insert(p) {
+            continue;
+        }
+        let h = java_blockpos_hash(p);
+        let spread = h ^ ((h as u32 >> 16) as i32);
+        buckets[(spread as usize) & (cap - 1)].push(p);
+    }
+    let mut out: Vec<P3> = buckets.into_iter().flatten().collect();
+    out.sort_by_key(|p| p.1);
+    out
 }
 
 pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> bool {
@@ -2015,8 +2141,17 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
     if logs.is_empty() && foliage.is_empty() {
         return false;
     }
+    // `TreeDecorator.Context`'s constructor orders the three lists: it copies each
+    // `HashSet` into an `ObjectArrayList` (bucket order) and sorts that by `BlockPos::getY`
+    // (stable). See `decorator_list`. The copy is what the decorators see; `update_leaves`
+    // is handed the unsorted positions, as it is in vanilla.
+    let (dec_logs, dec_foliage, dec_roots) = (
+        decorator_list(&logs),
+        decorator_list(&foliage),
+        decorator_list(&root_positions),
+    );
     for d in &t.decorators {
-        d.run(ctx, rng, &root_positions, &logs, &foliage);
+        d.run(ctx, rng, &dec_roots, &dec_logs, &dec_foliage);
     }
     if let Some(shape) = update_leaves(ctx, &logs, &root_positions, &foliage) {
         schedule_leaf_edges(ctx, &shape);
@@ -2386,6 +2521,8 @@ pub(crate) fn p_tree(j: &J) -> Option<TreeExtra> {
             .map(Box::new),
         ignore_vines: jnum(j, "ignore_vines").unwrap_or(0.0) != 0.0
             || matches!(js(j, "ignore_vines"), Some(J::Str(s)) if s == "true"),
+        force_dirt: jnum(j, "force_dirt").unwrap_or(0.0) != 0.0
+            || matches!(js(j, "force_dirt"), Some(J::Str(s)) if s == "true"),
         min_size,
         decorators,
         root_placer: js(j, "root_placer").and_then(p_root),

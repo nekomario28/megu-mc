@@ -447,6 +447,50 @@ impl<'a> FC<'a> {
     }
 }
 
+/// `MC_SPINE_HM_DUMP=cx,cz`: print, for every column of one chunk, the three live
+/// heightmaps a feature can read - `OCEAN_FLOOR`, `WORLD_SURFACE` and `MOTION_BLOCKING` -
+/// followed by the same values for `MOTION_BLOCKING_NO_LEAVES`.
+///
+/// Why it lives here and not in `worldgen`: the answer is what `FC::heightmap` returns,
+/// i.e. the live scan `heightmap_above` makes with the native `Heightmap.Types` predicate
+/// (`BReg::heightmap_counts`) over the *feature-facing* block view (`FC::get`: writes,
+/// then the carver layer, then terrain). `worldgen` may not reach for the generation
+/// context, and computing the answer from the column tops plus `Gen::feature_height`
+/// published the scan bound instead of the answer - a max-only tally that cannot see a
+/// removal, a carver write, or a state its predicate rejects (a leaf above the floor).
+///
+/// The provenance of each number matters for a comparison against a saved chunk:
+/// `--port-hm` in `tools/port_triage.py` dumps `OCEAN_FLOOR` the same way, and a saved
+/// vanilla chunk's `Heightmaps` were maintained by `Heightmap.setBlock` on the very same
+/// predicates (`dyy.a`), so the two are the same quantity.
+pub(crate) fn hm_dump(spec: &str, populate: fn(&mut Gen, i32, i32)) {
+    let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
+    if p.len() != 2 {
+        return;
+    }
+    let (cx, cz) = (p[0], p[1]);
+    crate::worldgen::with_gen(|g| {
+        // The feature layer's height a *running* world holds only exists once the chunks
+        // around the column have been populated; reading before that returns terrain
+        // heights and silently "proves" a difference.
+        g.ensure_populated(cx, cz, populate);
+        if g.cols(cx, cz).is_none() {
+            return;
+        }
+        let mut fc = FC::new(g);
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
+                let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                let oc = fc.hm_oc(x, z);
+                let ws = fc.hm_ws(x, z);
+                let mb = fc.heightmap(HeightmapKind::MotionBlocking, x, z);
+                let mbnl = fc.heightmap(HeightmapKind::MotionBlockingNoLeaves, x, z);
+                eprintln!("HM {lx} {lz} {oc} {ws} {mb} {mbnl}");
+            }
+        }
+    });
+}
+
 /// `MC_SPINE_WG_DUMP_HM=<path>`: write the OCEAN_FLOOR height of every column of
 /// the dumped region, 256 i32 per chunk in the block dump's chunk order.
 ///

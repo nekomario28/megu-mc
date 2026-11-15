@@ -5774,7 +5774,27 @@ fn mod_positions(
         }
         PM::BlockPred(p) => {
             if let Some(reg) = breg() {
-                if test_pred(p, reg, ctx, pos.0, pos.1, pos.2) {
+                let ok = test_pred(p, reg, ctx, pos.0, pos.1, pos.2);
+                // `BLOCKPRED_TRACE=<cx>,<cz>`: the filter decisions of every candidate that
+                // lands in that chunk. A filter that rejects where the reference accepts is
+                // invisible otherwise - it draws nothing, so the draw traces agree and only
+                // the *later* placements differ.
+                if let Some(spec) = env_str!("BLOCKPRED_TRACE") {
+                    if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
+                        eprintln!(
+                            "BLOCKPRED {} {} {} ok={} below={} at={} feature={},{}",
+                            pos.0,
+                            pos.1,
+                            pos.2,
+                            ok,
+                            reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
+                            reg.name_of(ctx.get(pos.0, pos.1, pos.2)),
+                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) >> 32,
+                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) & 0xFFFF
+                        );
+                    }
+                }
+                if ok {
                     out.push(pos);
                 }
             }
@@ -5794,8 +5814,26 @@ fn mod_positions(
             }
         }
         PM::SurfWaterDepth(max) => {
+            // Both reads are live scans through the same block view a feature sees, so the
+            // pair is comparable with a saved chunk's `WORLD_SURFACE`/`OCEAN_FLOOR`
+            // entries directly. `SURF_TRACE=<cx>,<cz>` prints every candidate of that
+            // chunk: a rejection that the reference did not make is otherwise invisible
+            // (this filter draws nothing, so the draw streams stay aligned).
             let wt = ctx.hm_ws(pos.0, pos.2);
             let oc = ctx.hm_oc(pos.0, pos.2);
+            if let Some(spec) = env_str!("SURF_TRACE") {
+                if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
+                    eprintln!(
+                        "SURF {} {} ws={} oc={} depth={} ok={}",
+                        pos.0,
+                        pos.2,
+                        wt,
+                        oc,
+                        wt - oc,
+                        wt - oc <= *max
+                    );
+                }
+            }
             if wt - oc <= *max {
                 out.push(pos);
             }

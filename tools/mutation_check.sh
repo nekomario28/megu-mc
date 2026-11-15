@@ -2429,6 +2429,22 @@ check "a template's hanging entity turns its facing with the piece" \
   '        facing: rotate_direction(rotation, direction).data_3d(),' \
   structure_template::template_structures_tests::a_hanging_entity_reads_its_facing_and_stack_from_template_nbt
 
+check "the tree decorator lists are bucket-ordered, not insertion-ordered" \
+  src/tree.rs '        let spread = h ^ ((h as u32 >> 16) as i32);
+        buckets[(spread as usize) & (cap - 1)].push(p);' \
+  '        buckets[(h as usize) & (cap - 1)].push(p);' \
+  feature::generation_contract_tests::tree_decorator_lists_use_hash_bucket_order_then_y
+
+check "a trunk keeps a log below it instead of burying it in dirt" \
+  src/tree.rs '        Some(reg) if !force && reg.in_tag(ctx.get(p.0, p.1, p.2), "minecraft:logs") => return,' \
+  '        Some(_) if false => return,' \
+  feature::generation_contract_tests::trunk_dirt_joins_the_log_list_and_a_log_below_is_kept
+
+check "the live heightmaps use each type's own predicate" \
+  src/generation_context.rs 'if reg.is_some_and(|r| r.heightmap_counts(st, kind)) {' \
+  'if reg.is_some_and(|r| r.heightmap_counts(st, HeightmapKind::MotionBlocking)) {' \
+  feature::generation_contract_tests::live_heightmap_types_differ_on_leaves
+
 check "a frame's spawn carries its facing as the object data" \
   src/main.rs '        0.0,
         i64::from(facing),

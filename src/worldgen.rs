@@ -3935,6 +3935,17 @@ impl Gen {
     ///
     /// The caller classifies the state: the block knowledge lives below this layer
     /// and a generation module may not reach for it (see module-layers/policy.json).
+    /// The live feature layer's per-column maxima: highest non-air (`solid` 0) and
+    /// highest solid (`solid` 1) block a *feature* has written, +1.
+    ///
+    /// These are scan **bounds**, not heightmap answers. `FC::heightmap_uncached` starts a
+    /// column scan here and walks down with the native predicate
+    /// (`BReg::heightmap_counts`) because a later writer can remove the cell these maxima
+    /// name, and because the marks are max-only: they never record a removal, they miss
+    /// every state the predicate rejects (a leaf above the floor), and they know nothing
+    /// about carver writes (`FC::feature_override` is the carver's channel, not this
+    /// tally). `MC_SPINE_HM_DUMP` used to print `max(top_oc, tally)` and that is exactly
+    /// the bug this comment exists to stop: the printed answer was the bound.
     pub(crate) fn note_feature_write(&mut self, x: i32, y: i32, z: i32, solid: bool, air: bool) {
         let e = self.feat_hm.entry((x, z)).or_insert((i32::MIN, i32::MIN));
         if !air {
@@ -5231,33 +5242,10 @@ pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
 }
 
 /// 4x4x4 biome ids for one chunk section, quart-space index (y<<4|z<<2|x).
-/// `MC_SPINE_HM_DUMP=cx,cz`: print the OCEAN_FLOOR and WORLD_SURFACE height of
-/// every column, to compare against a saved vanilla chunk's Heightmaps.
-pub fn hm_dump(spec: &str, populate: fn(&mut Gen, i32, i32)) {
-    let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
-    if p.len() != 2 {
-        return;
-    }
-    let mut gg = gen_lock();
-    let Some(g) = gg.as_mut() else { return };
-    let (cx, cz) = (p[0], p[1]);
-    // the feature layer's height a *running* world would hold only exists once the
-    // chunks around the column have been populated; reading the tally before that
-    // returns terrain heights and silently "proves" a difference
-    g.ensure_populated(cx, cz, populate);
-    let Some(_c) = g.cols(cx, cz) else { return };
-    for lz in 0..16usize {
-        for lx in 0..16usize {
-            let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-            // include the feature layer: this dump exists to compare against a saved
-            // chunk's heightmaps, which a running server has already had raised by
-            // the canopy its own placements grew
-            let of = g.top_oc(x, z).max(g.feature_height(x, z, 1));
-            let ws = g.top_ws(x, z).max(g.feature_height(x, z, 0));
-            eprintln!("HM {} {} {} {}", lx, lz, of, ws);
-        }
-    }
-}
+/// `MC_SPINE_HM_DUMP=cx,cz` lives in `generation_context::hm_dump`: the live maps are
+/// what a feature reads (`FC::hm_oc`/`hm_ws`), and `worldgen` may not reach for the
+/// generation context (module layers).
+
 
 /// `MC_SPINE_BIOME_AT=x,y,z;x,y,z;...`: print both biome notions at each position.
 /// The container (what a saved chunk holds) and the blended lookup that
@@ -8841,8 +8829,22 @@ mod wg_tests {
         // stream - 124 netherrack/dirt/stone cells of the portal differed (chunk total
         // 278 -> 154, the remainder the amethyst geode). The capture moves with the
         // corrected input.
+        // 2026-11-16: a tree's trunk dirt now joins the tree's *log* list, and the three
+        // decorator lists are handed over in `TreeDecorator.Context`'s order (HashSet
+        // bucket order, then a stable sort by y). `TrunkPlacer.setDirtUnderneath` writes
+        // through the same `BiConsumer` as `placeLog` (`ehm.a`), so vanilla's `logs` set
+        // holds the dirt position too; `trunk_vine` draws four `nextInt(3)` per entry, so
+        // the missing entry shortened the stream and shifted every later decorator. The
+        // list order matters because `leave_vine` draws four `nextFloat` per leaf.
+        // Measured on the pinned jungle fixture (`/tmp/nat-4242-jungle-temple/world`,
+        // chunk (74,-41) against the recorded population order): 732 -> 489 differing
+        // cells with the dirt entry, 489 -> 145 with the list order, and the live
+        // OCEAN_FLOOR / WORLD_SURFACE columns against the saved chunk 77 -> 14 and
+        // 89 -> 18. The visible blocks of this capture's own fixture are unchanged
+        // ((-2,-2)+3x3 564 -> 564, (0,0)+2x2 11 -> 11, (-1,1)+2x2 0 -> 0), so the digest
+        // moves with the captured *write set* in the chunks those windows do not cover.
         assert_eq!(
-            digest, "b680a4c9782cc8836d617e2febd69841",
+            digest, "10832b856152579d9b91c570f436b52f",
             "feature population output changed from the native feature-contract capture"
         );
     }

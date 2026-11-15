@@ -6453,3 +6453,157 @@ fn feature_writes_outside_the_population_window_are_dropped() {
         assert!(ctx.wr.contains_key(&(32, 64, 0)));
     }
 }
+
+// ---------- tree: the decorator lists and the trunk's dirt ----------
+//
+// Both contracts below are draw-stream contracts, not cosmetics: `trunk_vine` consumes
+// four `nextInt(3)` per entry of the tree's log list and `leave_vine` four `nextFloat`
+// per entry of its leaf list, so a short list or a differently ordered one shifts every
+// later decorator draw. Measured on the pinned jungle fixture
+// (`/tmp/nat-4242-jungle-temple/world`, chunk (74,-41)): the missing dirt entry alone
+// moved 732 differing cells to 489, and the list order (below) took that to 145.
+
+/// `TreeDecorator.Context`'s constructor copies each `Set<BlockPos>` into an
+/// `ObjectArrayList` (walking the `HashSet` in bucket order) and sorts it by
+/// `BlockPos::getY` with a stable sort. The expected order here is hand-derived from
+/// `Vec3i.hashCode = (y + z*31)*31 + x`, the `HashMap` spread `h ^ (h >>> 16)` and a
+/// 16-bucket table (`(spread & 15)`), which is what a 5-element set uses.
+#[test]
+fn tree_decorator_lists_use_hash_bucket_order_then_y() {
+    use crate::tree::decorator_list;
+    let zero = vec![(0, 0, 0), (1, 0, 0), (0, 0, 1), (0, 0, 2), (-1, 0, 0)];
+    // h: 0, 1, 961, 1922, -1 -> buckets 0, 1, 1, 2, 0. Bucket order, insertion order
+    // inside a bucket. Not the insertion order.
+    assert_eq!(
+        decorator_list(&zero),
+        vec![(0, 0, 0), (-1, 0, 0), (1, 0, 0), (0, 0, 1), (0, 0, 2)],
+        "bucket order, ties in insertion order"
+    );
+    // A `Set` collapses duplicates before the sort, so the same position cannot feed two
+    // decorator draws.
+    assert_eq!(
+        decorator_list(&[(1, 0, 0), (1, 0, 0), (0, 0, 0)]),
+        vec![(0, 0, 0), (1, 0, 0)],
+        "duplicates must collapse"
+    );
+    // The foliage placer emits rows top-down; the decorators see them bottom-up.
+    let column = vec![(2, 7, 2), (2, 5, 2), (2, 6, 2), (2, 5, 2)];
+    assert_eq!(
+        decorator_list(&column),
+        vec![(2, 5, 2), (2, 6, 2), (2, 7, 2)],
+        "y is the primary key"
+    );
+}
+
+/// `TrunkPlacer.setDirtUnderneath` (`ehm.a`) writes the config's dirt under the trunk
+/// when `force_dirt` is set *or* the cell is not in `BlockTags.LOGS` (`awe.u`), and it
+/// writes through the same `BiConsumer` as `placeLog`, so a written dirt position joins
+/// the tree's log list. `tree_dirt_joins` pins that list; `tree_dirt_keeps_a_log_below`
+/// pins the skip, which is *not* the dirt tag: a trunk grown on another tree's log keeps
+/// the log.
+#[test]
+fn trunk_dirt_joins_the_log_list_and_a_log_below_is_kept() {
+    let reg = breg().unwrap();
+    let grass = reg.state_of("minecraft:grass_block", None);
+    let log = reg.state_of("minecraft:jungle_log", None);
+    let dirt = reg.state_of("minecraft:dirt", None);
+    let provider = crate::generation_providers::p_bsp(
+        &jparse(br#"{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:dirt"}}"#)
+            .expect("inline provider"),
+    )
+    .map(Box::new);
+    assert!(provider.is_some(), "the provider must parse");
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let mut ctx = context(&mut g);
+    ctx.test_no_terrain = true;
+    let mut rng = Xor::seed(11);
+    // ground below the trunk, air at the trunk base, and a log below a second trunk
+    for (x, below) in [(5, grass), (9, log), (13, log)] {
+        ctx.test_base_cell((x, 59, 5), below);
+        ctx.test_base_cell((x, 60, 5), 0);
+    }
+    let mut logs = Vec::new();
+    crate::tree::set_dirt(
+        &mut ctx,
+        &mut rng,
+        (5, 59, 5),
+        &provider,
+        false,
+        &mut logs,
+    );
+    assert_eq!(
+        logs,
+        vec![(5, 59, 5)],
+        "the written dirt position is part of the log list"
+    );
+    assert_eq!(ctx.get(5, 59, 5), dirt, "dirt replaces a non-log cell");
+    // A log below is kept, and then there is no position to add to the list.
+    let mut logs = Vec::new();
+    crate::tree::set_dirt(
+        &mut ctx,
+        &mut rng,
+        (9, 59, 5),
+        &provider,
+        false,
+        &mut logs,
+    );
+    assert!(logs.is_empty(), "a skipped dirt write adds no log entry");
+    assert_eq!(ctx.get(9, 59, 5), log, "the log below must survive");
+    // `force_dirt` overrides the log check.
+    let mut logs = Vec::new();
+    crate::tree::set_dirt(
+        &mut ctx,
+        &mut rng,
+        (13, 59, 5),
+        &provider,
+        true,
+        &mut logs,
+    );
+    assert_eq!(logs, vec![(13, 59, 5)], "force_dirt writes and records");
+    assert_eq!(ctx.get(13, 59, 5), dirt);
+}
+
+/// The four `Heightmap.Types` a feature can read are different quantities, and
+/// `MC_SPINE_HM_DUMP` now prints them live (via the same `FC::heightmap` accessors this
+/// test drives). Read off the pinned jungle chunk (73,-41) at column (1170,-652): the
+/// stored vanilla `Heightmaps` are WORLD_SURFACE 70, OCEAN_FLOOR 70, MOTION_BLOCKING 70
+/// and MOTION_BLOCKING_NO_LEAVES 69, where the column is `jungle_log` at 68 and
+/// `oak_leaves` at 69 - so leaves count for the first three and not for the last.
+#[test]
+fn live_heightmap_types_differ_on_leaves() {
+    use crate::block_registry::HeightmapKind;
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let leaves = reg.state_of("minecraft:oak_leaves", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let (x, z) = (4, 4);
+    let base = g.top_ws(x, z).max(g.top_oc(x, z)) + 2;
+    let mut ctx = context(&mut g);
+    ctx.set(x, base, z, stone);
+    let all: Vec<HeightmapKind> = [
+        HeightmapKind::WorldSurface,
+        HeightmapKind::OceanFloor,
+        HeightmapKind::MotionBlocking,
+        HeightmapKind::MotionBlockingNoLeaves,
+    ]
+    .to_vec();
+    for kind in &all {
+        assert_eq!(ctx.heightmap(*kind, x, z), base + 1, "{kind:?} on stone");
+    }
+    ctx.set(x, base + 1, z, leaves);
+    assert_eq!(ctx.hm_ws(x, z), base + 2, "leaves raise WORLD_SURFACE");
+    assert_eq!(ctx.hm_oc(x, z), base + 2, "leaves raise OCEAN_FLOOR too");
+    assert_eq!(
+        ctx.heightmap(HeightmapKind::MotionBlocking, x, z),
+        base + 2,
+        "leaves block motion"
+    );
+    assert_eq!(
+        ctx.heightmap(HeightmapKind::MotionBlockingNoLeaves, x, z),
+        base + 1,
+        "MOTION_BLOCKING_NO_LEAVES is the one that excludes leaves"
+    );
+    // A removal lowers the live map: native `Heightmap.update` rescans the column.
+    ctx.set(x, base + 1, z, 0);
+    assert_eq!(ctx.hm_ws(x, z), base + 1, "removal lowers WORLD_SURFACE");
+}
