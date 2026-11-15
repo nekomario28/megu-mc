@@ -805,11 +805,13 @@ pub(crate) fn place_in_world<W: TemplateWorld>(
             let next_inside = update_shape(reg, inside, direction, outside, world, p);
             if next_inside != inside {
                 world.set(p.0, p.1, p.2, next_inside);
+                record_shape_write(&mut out, reg, p, next_inside);
                 inside = next_inside;
             }
             let next_outside = update_shape(reg, outside, direction ^ 1, inside, world, q);
             if next_outside != outside {
                 world.set(q.0, q.1, q.2, next_outside);
+                record_shape_write(&mut out, reg, q, next_outside);
             }
         }
         for p in written.clone() {
@@ -817,6 +819,7 @@ pub(crate) fn place_in_world<W: TemplateWorld>(
             let updated = update_from_neighbour_shapes(reg, current, world, p);
             if updated != current {
                 world.set(p.0, p.1, p.2, updated);
+                record_shape_write(&mut out, reg, p, updated);
             }
         }
     }
@@ -825,6 +828,26 @@ pub(crate) fn place_in_world<W: TemplateWorld>(
     }
     out.wrote = true;
     Ok(out)
+}
+
+/// The block-entity side of a `setBlock` the shape passes perform.
+///
+/// Native routes every shape write through `LevelAccessor.setBlock`, which
+/// creates or removes the cell's block entity; a wall banner whose support is
+/// gone is written as air that way, so the banner's block entity has to leave
+/// the map too. The update loops above bypass the main write path, so they
+/// record the same event here.
+fn record_shape_write(out: &mut PlacementOut, reg: &BReg, pos: Pos, state: u32) {
+    match block_entity_id(reg.name_of(state)) {
+        Some(id) => out.be_events.push(BeEvent::Set(BlockEntityRecord {
+            pos,
+            id,
+            loot_table: None,
+            loot_seed: None,
+            items: None,
+        })),
+        None => out.be_events.push(BeEvent::Clear(pos)),
+    }
 }
 
 /// `SimpleWaterloggedBlock.placeLiquid`: set `waterlogged=true` and schedule.
@@ -976,6 +999,31 @@ fn update_shape<W: TemplateWorld>(
 ) -> u32 {
     let name = reg.name_of(state);
     let air = reg.state_of("minecraft:air", None);
+    // `WallBannerBlock.updateShape`: a wall banner hangs on the block behind
+    // it, so a change on that side with nothing solid there drops it to air.
+    // This is the one surviving attachment shape in the pinned corpus - the
+    // end city's tower tops put `magenta_wall_banner`s on their outer edge, and
+    // the tower's own wall is what keeps them.
+    if name
+        .strip_prefix("minecraft:")
+        .unwrap_or(name)
+        .ends_with("_wall_banner")
+    {
+        if let Some(facing) = reg.get_prop(state, "facing") {
+            let facing = match facing.as_str() {
+                "down" => Some(0u8),
+                "up" => Some(1),
+                "north" => Some(2),
+                "south" => Some(3),
+                "west" => Some(4),
+                "east" => Some(5),
+                _ => None,
+            };
+            if facing == Some(direction ^ 1) && !reg.is_solid(neighbor) {
+                return air;
+            }
+        }
+    }
     if name.ends_with("_stairs") && matches!(direction, 2..=5) {
         if let Some(next) = reg.stair_after_neighbors(state, pos, |cell| {
             world.get(cell.0, cell.1, cell.2)
@@ -993,6 +1041,15 @@ fn update_shape<W: TemplateWorld>(
     // "Sturdy" is `BlockStateBase.isFaceSturdy` = the neighbour's *full side*,
     // which is why a fence connects to a stair's back but not its step.
     let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    // `WallBlock.updateShape` for a horizontal change: `low` for a full cube or
+    // another wall, `none` for air, and the post drops when a straight run has
+    // air above. The bounded rule refuses to guess TALL sides, which need the
+    // shape-coverage comparison this registry does not carry.
+    if bare.ends_with("_wall") && matches!(direction, 2..=5) {
+        if let Some(next) = reg.wall_after_full_neighbor(state, neighbor, above, direction) {
+            return next;
+        }
+    }
     if bare.ends_with("_fence") && matches!(direction, 2..=5) {
         let key = match direction {
             2 => "north",

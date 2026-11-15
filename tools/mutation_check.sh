@@ -2095,6 +2095,47 @@ check "jigsaw replacement final_state parser accepts trailing brackets like vani
   '        let props_str = rest.strip_suffix('\'']'\'')?;' \
   feature::jigsaw_structures::tests::jigsaw_structures_match_1211_native_fixture
 
+check "end city admission reads the first occupied height and refuses below sixty" \
+  src/end_city_mansion.rs '    if pos.1 < 60 {
+        return None;
+    }
+    let builder: EndCityMansionPieceBuilder = Box::new(move |world, templates, rng, reg| {
+        let mut pieces = Vec::new();' \
+  '    if pos.1 <= 60 {
+        return None;
+    }
+    let builder: EndCityMansionPieceBuilder = Box::new(move |world, templates, rng, reg| {
+        let mut pieces = Vec::new();' \
+  structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
+
+check "end city house tower anchors its base floor at the caller's offset" \
+  src/end_city_mansion.rs '            let base_offset = pos.unwrap_or((0, 0, 0));' \
+  '            let base_offset = (0, 0, 0);' \
+  structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
+
+check "mansion room origin corner probes the base grid for a corridor" \
+  src/end_city_mansion.rs '        if !base.edges_to(origin_x, origin_y, GRID_CORRIDOR) {
+            origin_x = flip(origin_x, min_x, max_x);' \
+  '        if !rooms.edges_to(origin_x, origin_y, GRID_CORRIDOR) {
+            origin_x = flip(origin_x, min_x, max_x);' \
+  structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
+
+check "mansion 2x2 room mirror is the front-back flip only for the west-south entrance" \
+  src/end_city_mansion.rs '            (Dir::West, Dir::South) => {
+                dx = 15;
+                mirror = Mirror::from_index(2).unwrap();
+            }' \
+  '            (Dir::West, Dir::South) => {
+                dx = 15;
+                mirror = Mirror::from_index(1).unwrap();
+            }' \
+  structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
+
+check "mansion foundation stops at the first non-air cell above sea level" \
+  src/end_city_mansion.rs '                if inside && !is_air_state(reg, world.get(x, y, z)) {' \
+  '                if false && inside && !is_air_state(reg, world.get(x, y, z)) {' \
+  structure_template::end_city_mansion_tests::mansion_foundation_fills_air_columns_above_sea_level
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
