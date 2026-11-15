@@ -5833,6 +5833,59 @@ fn materialize_generation_payloads_inner(
                         .or_insert_with(|| generated_content::spawner_nbt(pos));
                 }
             }
+            crate::generation_payload::GenerationPayload::SpawnerEntity(entity_id) => {
+                let state = name_to_state("spawner").unwrap();
+                let actual = *world()
+                    .lock()
+                    .unwrap()
+                    .entry((pos.0 >> 4, pos.2 >> 4))
+                    .or_default()
+                    .entry(local_idx(pos.0, pos.1, pos.2))
+                    .or_insert(state);
+                if actual == state {
+                    generated_content()
+                        .lock()
+                        .unwrap()
+                        .spawners
+                        .entry(pos)
+                        .or_insert_with(|| generated_content::spawner_nbt_for(pos, &entity_id));
+                }
+            }
+            crate::generation_payload::GenerationPayload::Entity {
+                id,
+                pos: entity_pos,
+                yaw,
+            } => {
+                if let Some(etype) = name_to_etype(&id) {
+                    let mut ms = mobs().lock().unwrap();
+                    if ms.len() < MOB_CAP {
+                        let mut uuid = [0u8; 16];
+                        std::fs::File::open("/dev/urandom")
+                            .and_then(|mut f| f.read_exact(&mut uuid))
+                            .expect("entity UUID entropy");
+                        uuid[6] = (uuid[6] & 15) | 64;
+                        uuid[8] = (uuid[8] & 63) | 128;
+                        ms.push(Arc::new(Mob {
+                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                            uuid,
+                            etype,
+                            pos: Mutex::new((
+                                entity_pos[0],
+                                entity_pos[1],
+                                entity_pos[2],
+                                yaw,
+                                0.0,
+                            )),
+                            hp: Mutex::new(default_mob_hp(&id)),
+                            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                            fuse: Mutex::new(0),
+                            love: Mutex::new(0),
+                            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+                        }));
+                    }
+                }
+            }
             crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed } => {
                 let mut uuid = [0; 16];
                 std::fs::File::open("/dev/urandom")
@@ -5855,6 +5908,24 @@ fn materialize_generation_payloads_inner(
                     .insert((pos.0, pos.1, pos.2, 1), lines);
             }
         }
+    }
+}
+fn default_mob_hp(id: &str) -> f32 {
+    let short = id.strip_prefix("minecraft:").unwrap_or(id);
+    match short {
+        "elder_guardian" => 80.0,
+        "witch" => 26.0,
+        "cat" | "cow" | "pig" => 10.0,
+        "shulker" => 30.0,
+        "evoker" | "vindicator" | "pillager" => 24.0,
+        "piglin" | "spider" | "magma_cube" => 16.0,
+        "piglin_brute" => 50.0,
+        "hoglin" => 40.0,
+        "iron_golem" => 100.0,
+        "cave_spider" => 12.0,
+        "silverfish" | "sheep" => 8.0,
+        "camel" => 32.0,
+        _ => 20.0,
     }
 }
 fn chests() -> &'static LockedMap<ContainerKey, HashMap<i16, Stack>> {
@@ -27628,5 +27699,144 @@ mod mineshaft_runtime_tests {
         let off = generated_content().lock().unwrap().carts[0].clone();
         assert!(off.on_ground(), "cart falling onto stone floor should set OnGround=true");
         assert!(off.motion()[0] <= 0.11, "ground slowdown should damp horizontal motion: {:?}", off.motion());
+    }
+
+    #[test]
+    fn spawner_entity_and_mob_payloads_materialize_and_tick_fails_closed() {
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        forceloaded().lock().unwrap().insert((0, 0));
+        refresh_hot();
+
+        let (client, _receiver) = effect_tests::client_pair();
+        *client.pos.lock().unwrap() = (0.5, 64.0, 0.5, 0.0, 0.0, true);
+        *client.gm.lock().unwrap() = 0;
+        clients().lock().unwrap().push(Arc::new(client));
+
+        // Direct spawner::tick refuses non-cave-spider spawners without panicking.
+        struct DummySpawnerWorld;
+        impl spawner::World for DummySpawnerWorld {
+            fn active(&mut self, _: BlockPos, _: i32) -> bool { true }
+            fn no_collision(&mut self, _: [f64; 3]) -> bool { true }
+            fn rules(&mut self, _: [f64; 3], _: Option<spawner::LightRules>, _: &mut generation_math::Lcg) -> bool { true }
+            fn nearby(&mut self, _: BlockPos, _: i32) -> usize { 0 }
+            fn unobstructed(&mut self, _: [f64; 3]) -> bool { true }
+            fn insert(&mut self, _: [f64; 3], _: f32) -> bool { true }
+            fn effects(&mut self, _: BlockPos, _: [f64; 3]) {}
+        }
+        let mut rng = generation_math::Lcg::new(7);
+        let mut dummy = DummySpawnerWorld;
+        for id in ["minecraft:blaze", "minecraft:silverfish"] {
+            let mut tag = generated_content::spawner_nbt_for((0, 64, 0), id);
+            if let crate::nbt::Tag::Compound(ref mut map) = tag {
+                map.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+            }
+            assert_eq!(
+                spawner::tick(&mut tag, (0, 64, 0), &mut dummy, &mut rng),
+                Err("only cave-spider spawners are implemented")
+            );
+        }
+
+        // Materialize SpawnerEntity + living structure Entity payloads.
+        let mut payloads = vec![
+            (
+                (1, 64, 2),
+                crate::generation_payload::GenerationPayload::SpawnerEntity("minecraft:blaze".to_owned()),
+            ),
+            (
+                (3, 64, 4),
+                crate::generation_payload::GenerationPayload::SpawnerEntity("minecraft:silverfish".to_owned()),
+            ),
+        ];
+        let expected_mobs = [
+            ("minecraft:elder_guardian", 80.0f32),
+            ("minecraft:witch", 26.0),
+            ("minecraft:cat", 10.0),
+            ("minecraft:shulker", 30.0),
+            ("minecraft:evoker", 24.0),
+            ("minecraft:vindicator", 24.0),
+            ("minecraft:allay", 20.0),
+            ("minecraft:drowned", 20.0),
+            ("minecraft:zombie_villager", 20.0),
+            ("minecraft:villager", 20.0),
+            ("minecraft:piglin", 16.0),
+            ("minecraft:piglin_brute", 50.0),
+            ("minecraft:hoglin", 40.0),
+            ("minecraft:pillager", 24.0),
+            ("minecraft:iron_golem", 100.0),
+        ];
+        for (i, (id, _)) in expected_mobs.iter().enumerate() {
+            let fx = i as f64 + 0.5;
+            payloads.push((
+                (i as i32, 65, 5),
+                crate::generation_payload::GenerationPayload::Entity {
+                    id: (*id).to_owned(),
+                    pos: [fx, 65.0, 5.5],
+                    yaw: 90.0,
+                },
+            ));
+        }
+        materialize_generation_payloads_inner(payloads);
+
+        // Verify spawners inserted and runtime spawner_tick() safely ignores them.
+        let spawner_state = name_to_state("spawner").unwrap();
+        assert_eq!(block_at(1, 64, 2), spawner_state);
+        assert_eq!(block_at(3, 64, 4), spawner_state);
+        {
+            let mut gen = generated_content().lock().unwrap();
+            for (pos, expected_id) in [((1, 64, 2), "minecraft:blaze"), ((3, 64, 4), "minecraft:silverfish")] {
+                let tag = gen.spawners.get_mut(&pos).expect("materialized spawner NBT");
+                let spawn_id = tag
+                    .get("SpawnData")
+                    .and_then(|d| d.get("entity"))
+                    .and_then(|e| e.get("id"))
+                    .and_then(crate::nbt::Tag::string);
+                assert_eq!(spawn_id, Some(&crate::nbt::NbtString::text(expected_id)));
+                if let crate::nbt::Tag::Compound(ref mut map) = tag {
+                    map.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+                }
+            }
+        }
+        spawner_tick();
+
+        // Verify all 15 living structure entities materialized with expected etype, pos, and HP.
+        let ms = mobs().lock().unwrap();
+        assert_eq!(ms.len(), expected_mobs.len());
+        for (i, (id, expected_hp)) in expected_mobs.iter().enumerate() {
+            let etype = name_to_etype(id).unwrap();
+            let mob = ms.iter().find(|m| m.etype == etype).expect("materialized mob");
+            assert_eq!(*mob.hp.lock().unwrap(), *expected_hp);
+            let p = *mob.pos.lock().unwrap();
+            assert_eq!(p, (i as f64 + 0.5, 65.0, 5.5, 90.0, 0.0));
+        }
+        drop(ms);
+
+        // Respect MOB_CAP when mobs() is full.
+        {
+            let mut ms = mobs().lock().unwrap();
+            while ms.len() < MOB_CAP {
+                ms.push(Arc::new(Mob {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    uuid: [1u8; 16],
+                    etype: 124,
+                    pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0)),
+                    hp: Mutex::new(20.0),
+                    last_hit: Mutex::new(Instant::now()),
+                    hurt_at: Mutex::new(Instant::now()),
+                    fuse: Mutex::new(0),
+                    love: Mutex::new(0),
+                    air: Mutex::new(60),
+                }));
+            }
+        }
+        materialize_generation_payloads_inner(vec![(
+            (0, 65, 0),
+            crate::generation_payload::GenerationPayload::Entity {
+                id: "minecraft:witch".to_owned(),
+                pos: [0.5, 65.0, 0.5],
+                yaw: 0.0,
+            },
+        )]);
+        assert_eq!(mobs().lock().unwrap().len(), MOB_CAP);
     }
 }

@@ -1474,9 +1474,12 @@ fn fortress_monster_throne(
         if sp_contains(&w.clip, p) {
             piece.spawner_placed = true;
             w.set_world(p, s.spawner);
-            w.ctx
-                .payloads
-                .push((p, crate::generation_payload::GenerationPayload::Spawner));
+            w.ctx.payloads.push((
+                p,
+                crate::generation_payload::GenerationPayload::SpawnerEntity(
+                    "minecraft:blaze".to_owned(),
+                ),
+            ));
         }
     }
     for i in 0..=6 {

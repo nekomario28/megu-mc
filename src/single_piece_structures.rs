@@ -863,12 +863,22 @@ impl SwampHutPiece {
             let wp = w.world_pos((2, 2, 5));
             if sp_contains(&w.clip, wp) {
                 self.spawned_witch = true;
+                w.ctx.push_entity(
+                    "minecraft:witch",
+                    [wp.0 as f64 + 0.5, wp.1 as f64, wp.2 as f64 + 0.5],
+                    0.0,
+                );
             }
         }
         if !self.spawned_cat {
             let wp = w.world_pos((2, 2, 5));
             if sp_contains(&w.clip, wp) {
                 self.spawned_cat = true;
+                w.ctx.push_entity(
+                    "minecraft:cat",
+                    [wp.0 as f64 + 0.5, wp.1 as f64, wp.2 as f64 + 0.5],
+                    0.0,
+                );
             }
         }
 
@@ -2328,5 +2338,47 @@ mod single_piece_tests {
             assert_eq!(res.loots.len(), 4);
             assert_eq!(j.bounds[1], 64);
         }
+    }
+
+    #[test]
+    fn swamp_hut_pushes_witch_and_cat_payloads_once() {
+        let reg = breg().expect("block registry initialized");
+        let dirt = reg.state_of("minecraft:dirt", None);
+        let mut gen = crate::worldgen::Gen::load(202, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut gen);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        for x in 0..=20 {
+            for z in 0..=20 {
+                for y in 60..=63 {
+                    ctx.test_base_cell((x, y, z), dirt);
+                }
+            }
+        }
+        let mut hut = SwampHutPiece::with_orientation(0, 0, Facing::North);
+        hut.post_process(&mut ctx, [0, -64, 0, 15, 319, 15]);
+        assert!(hut.spawned_witch);
+        assert!(hut.spawned_cat);
+
+        let entities: Vec<(&str, [f64; 3], f32)> = ctx
+            .payloads
+            .iter()
+            .filter_map(|(_, p)| match p {
+                GenerationPayload::Entity { id, pos, yaw } => Some((id.as_str(), *pos, *yaw)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(entities.len(), 2);
+        assert!(entities.contains(&("minecraft:witch", [2.5, 66.0, 3.5], 0.0)));
+        assert!(entities.contains(&("minecraft:cat", [2.5, 66.0, 3.5], 0.0)));
+
+        // Re-running over an overlapping clip must not duplicate witch or cat.
+        hut.post_process(&mut ctx, [0, -64, 0, 15, 319, 15]);
+        let entity_count = ctx
+            .payloads
+            .iter()
+            .filter(|(_, p)| matches!(p, GenerationPayload::Entity { .. }))
+            .count();
+        assert_eq!(entity_count, 2);
     }
 }

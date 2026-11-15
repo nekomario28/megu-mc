@@ -2721,12 +2721,12 @@ fn place_single_or_legacy<D: JigsawData>(
         target.set_world(p, placed);
 
         if let Some(nbt) = info.nbt.as_ref() {
-            if is_randomizable_container_be(reg.name_of(placed)) {
+            let bname = reg.name_of(placed);
+            if is_randomizable_container_be(bname) {
                 let loot_seed = rng.next_i64_legacy();
                 if let JigsawTarget::Live(ctx) = &mut *target {
                     if let Some(table) = nbt_str(nbt, "LootTable") {
                         let table = ns_name(&table);
-                        let bname = reg.name_of(placed);
                         let is_furnace = match bname {
                             "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
                                 Some(false)
@@ -2741,6 +2741,17 @@ fn place_single_or_legacy<D: JigsawData>(
                         } else if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
                             eprintln!("SPIPE_PAYLOAD jigsaw {bname} @ {p:?} table={table}");
                         }
+                    }
+                }
+            } else if bname == "minecraft:spawner" {
+                if let JigsawTarget::Live(ctx) = &mut *target {
+                    let entity_id = nbt
+                        .get("SpawnData")
+                        .and_then(|d| d.get("entity"))
+                        .and_then(|e| nbt_str(e, "id"))
+                        .map(|s| ns_name(&s));
+                    if let Some(entity_id) = entity_id {
+                        ctx.push_spawner(p, &entity_id);
                     }
                 }
             }
@@ -2792,6 +2803,43 @@ fn place_single_or_legacy<D: JigsawData>(
                 }
             }
             to_waterlog = next_pending;
+        }
+    }
+
+    if let JigsawTarget::Live(ctx) = &mut *target {
+        for info in &tpl.entities {
+            let btp = transform_block(info.block_pos, Mirror::None, rot, (0, 0, 0));
+            let block_pos = (
+                btp.0.wrapping_add(piece_pos.0),
+                btp.1.wrapping_add(piece_pos.1),
+                btp.2.wrapping_add(piece_pos.2),
+            );
+            if !bb_contains_pos(clip, block_pos) {
+                continue;
+            }
+            let Some(id) = nbt_str(&info.nbt, "id") else {
+                continue;
+            };
+            let id = ns_name(&id);
+            if matches!(
+                id.as_str(),
+                "minecraft:armor_stand"
+                    | "minecraft:item_frame"
+                    | "minecraft:glow_item_frame"
+                    | "minecraft:painting"
+            ) {
+                if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                    eprintln!("SPIPE_PAYLOAD unrouted jigsaw entity {id} at {block_pos:?}");
+                }
+                continue;
+            }
+            let tp = crate::structure_transform::entity(info.pos, Mirror::None, rot, (0, 0, 0));
+            let pos = [
+                tp[0] + f64::from(piece_pos.0),
+                tp[1] + f64::from(piece_pos.1),
+                tp[2] + f64::from(piece_pos.2),
+            ];
+            ctx.push_entity(&id, pos, 0.0);
         }
     }
 

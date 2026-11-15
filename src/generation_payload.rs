@@ -34,6 +34,14 @@ pub(crate) enum GenerationPayload {
     Sign([String; 4]),
     /// A freshly configured cave-spider spawner (its native setter consumes no RNG).
     Spawner,
+    /// A freshly configured spawner for a specific entity id (e.g. `minecraft:blaze`, `minecraft:silverfish`).
+    SpawnerEntity(String),
+    /// A living structure-spawned entity (`id` like `minecraft:elder_guardian`, `minecraft:witch`, etc.).
+    Entity {
+        id: String,
+        pos: [f64; 3],
+        yaw: f32,
+    },
     /// Entity position is the supplied block anchor plus (0.5, 0.5, 0.5).
     ChestMinecart { loot_seed: i64 },
 }

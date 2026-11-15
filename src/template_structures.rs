@@ -234,6 +234,8 @@ pub(crate) struct BlockEntityRecord {
     pub(crate) loot_seed: Option<i64>,
     /// The container `Items` list as `BlockEntity.saveWithoutMetadata` writes it.
     pub(crate) items: Option<Tag>,
+    /// Entity id inside `SpawnData.entity.id` for `minecraft:mob_spawner`.
+    pub(crate) spawner_entity: Option<String>,
 }
 
 /// `blockEntities` is a map keyed by position; a write that creates no block
@@ -258,25 +260,46 @@ pub(crate) struct PlacementOut {
     pub(crate) entities: Vec<EntitySpawn>,
 }
 
-/// Route a placement's block-entity events to the generation payload store.
+/// Route a placement's entity spawns and block-entity events to the generation payload store.
 ///
-/// Only the payload shapes the runtime owns are staged: a container populated from
-/// a loot table. A written container whose contents were already rolled into NBT
-/// `Items`, and every other block entity (signs, spawners), stays a *write* — the
-/// payload channel has no shape for it, and inventing one here would claim a
-/// delivery the runtime cannot perform. `SPIPE_PAYLOAD` names every dropped shape
-/// so a missing payload is observable rather than assumed.
+/// `SPIPE_PAYLOAD` names every dropped shape so a missing payload is observable
+/// rather than assumed.
 pub(crate) fn stage_payloads(
     ctx: &mut crate::generation_context::FC<'_>,
     out: PlacementOut,
 ) {
-    let _ = &out.entities;
+    for entity in out.entities {
+        if entity.id == "minecraft:item_frame" {
+            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                eprintln!(
+                    "SPIPE_PAYLOAD unrouted entity {} at {:?}",
+                    entity.id, entity.pos
+                );
+            }
+            continue;
+        }
+        ctx.push_entity(
+            &entity.id,
+            [
+                entity.pos.0 as f64 + 0.5,
+                entity.pos.1 as f64,
+                entity.pos.2 as f64 + 0.5,
+            ],
+            0.0,
+        );
+    }
     for event in out.be_events {
         let BeEvent::Set(record) = event else {
             // `Clear` removes a block entity a previous write created; the write
             // itself already replaced the state.
             continue;
         };
+        if record.id == "minecraft:mob_spawner" {
+            if let Some(entity_id) = record.spawner_entity {
+                ctx.push_spawner(record.pos, &entity_id);
+                continue;
+            }
+        }
         let Some(table) = record.loot_table else {
             if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
                 eprintln!(
@@ -796,6 +819,7 @@ pub(crate) fn place_in_world<W: TemplateWorld>(
                 loot_table: None,
                 loot_seed: None,
                 items: None,
+                spawner_entity: None,
             }));
         } else {
             // A successful write whose state creates no block entity removes the
@@ -905,6 +929,7 @@ fn record_shape_write(out: &mut PlacementOut, reg: &BReg, pos: Pos, state: u32) 
             loot_table: None,
             loot_seed: None,
             items: None,
+            spawner_entity: None,
         })),
         None => out.be_events.push(BeEvent::Clear(pos)),
     }
@@ -942,12 +967,20 @@ fn block_entity_record(pos: Pos, state_name: &str, tag: &Tag) -> BlockEntityReco
     } else {
         saved_items(tag)
     };
+    let spawner_entity = if id == "minecraft:mob_spawner" {
+        tag.get("SpawnData")
+            .and_then(|d| d.get("entity"))
+            .and_then(|e| nbt_str(e, "id"))
+    } else {
+        None
+    };
     BlockEntityRecord {
         pos,
         id,
         loot_table,
         loot_seed,
         items,
+        spawner_entity,
     }
 }
 
@@ -2922,6 +2955,7 @@ impl Piece {
                     loot_table: None,
                     loot_seed: None,
                     items: None,
+                    spawner_entity: None,
                 })),
                 None => out.be_events.push(BeEvent::Clear(info.pos)),
             }
@@ -2986,6 +3020,7 @@ impl Piece {
                         loot_table: Some(table.to_string()),
                         loot_seed: Some(seed),
                         items: None,
+                        spawner_entity: None,
                     }));
                 } else if metadata == "drowned" {
                     out.entities.push(EntitySpawn {

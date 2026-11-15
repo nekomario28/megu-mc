@@ -119,6 +119,27 @@ impl<'a> FC<'a> {
             },
         ));
     }
+    pub(crate) fn push_spawner(&mut self, pos: (i32, i32, i32), entity_id: &str) {
+        self.payloads.push((
+            pos,
+            crate::generation_payload::GenerationPayload::SpawnerEntity(entity_id.to_owned()),
+        ));
+    }
+    pub(crate) fn push_entity(&mut self, id: &str, pos: [f64; 3], yaw: f32) {
+        let block_pos = (
+            pos[0].floor() as i32,
+            pos[1].floor() as i32,
+            pos[2].floor() as i32,
+        );
+        self.payloads.push((
+            block_pos,
+            crate::generation_payload::GenerationPayload::Entity {
+                id: id.to_owned(),
+                pos,
+                yaw,
+            },
+        ));
+    }
     pub(crate) fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {
         if let Some(&s) = self.wr.get(&(x, y, z)) {
             return s;

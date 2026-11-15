@@ -2754,6 +2754,7 @@ fn mansion_create_chest<W: TemplateWorld>(
         loot_table: Some(WOODLAND_MANSION_LOOT.to_string()),
         loot_seed: Some(seed),
         items: None,
+        spawner_entity: None,
     }));
 }
 
@@ -3827,6 +3828,7 @@ mod end_city_mansion_tests {
             loot_table: None,
             loot_seed: None,
             items: None,
+            spawner_entity: None,
         });
         let mut out = PlacementOut {
             be_events: vec![chest],

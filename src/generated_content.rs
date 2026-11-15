@@ -15,7 +15,12 @@ fn compound(values: impl IntoIterator<Item = (&'static str, Tag)>) -> Tag {
 fn string(s: &str) -> Tag {
     Tag::String(NbtString::text(s))
 }
-pub(crate) fn spawner_nbt(p: Pos) -> Tag {
+pub(crate) fn spawner_nbt_for(p: Pos, entity_id: &str) -> Tag {
+    let entity_id = if entity_id.contains(':') {
+        entity_id.to_owned()
+    } else {
+        format!("minecraft:{entity_id}")
+    };
     compound([
         ("id", string("minecraft:mob_spawner")),
         ("x", Tag::Int(p.0)),
@@ -33,10 +38,13 @@ pub(crate) fn spawner_nbt(p: Pos) -> Tag {
             "SpawnData",
             compound([(
                 "entity",
-                compound([("id", string("minecraft:cave_spider"))]),
+                compound([("id", string(&entity_id))]),
             )]),
         ),
     ])
+}
+pub(crate) fn spawner_nbt(p: Pos) -> Tag {
+    spawner_nbt_for(p, "minecraft:cave_spider")
 }
 pub(crate) fn cart_loot_nbt(seed: i64) -> Tag {
     let mut values = vec![("LootTable", string("minecraft:chests/abandoned_mineshaft"))];
@@ -345,5 +353,26 @@ mod tests {
         let footer = bytes.len() - 12;
         bytes[footer..][..8].copy_from_slice(&u64::MAX.to_be_bytes());
         assert!(Snapshot::read(&bytes).is_err());
+    }
+    #[test]
+    fn spawner_nbt_for_produces_target_entity_id() {
+        for (input, expected_id) in [
+            ("minecraft:blaze", "minecraft:blaze"),
+            ("minecraft:silverfish", "minecraft:silverfish"),
+            ("blaze", "minecraft:blaze"),
+            ("minecraft:cave_spider", "minecraft:cave_spider"),
+        ] {
+            let tag = spawner_nbt_for((1, 64, -2), input);
+            assert_eq!(tag.get("id").and_then(Tag::string), Some(&NbtString::text("minecraft:mob_spawner")));
+            assert_eq!(tag.get("x").and_then(Tag::int), Some(1));
+            assert_eq!(tag.get("y").and_then(Tag::int), Some(64));
+            assert_eq!(tag.get("z").and_then(Tag::int), Some(-2));
+            let spawn_id = tag
+                .get("SpawnData")
+                .and_then(|d| d.get("entity"))
+                .and_then(|e| e.get("id"))
+                .and_then(Tag::string);
+            assert_eq!(spawn_id, Some(&NbtString::text(expected_id)));
+        }
     }
 }

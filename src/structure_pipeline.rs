@@ -1388,15 +1388,19 @@ fn place_start(ctx: &mut FC, start: &mut Start, random: &mut crate::generation_m
                 loots,
                 &mut elders,
             );
+            for ((x, y, z), id) in &elders {
+                ctx.push_entity(id, [*x as f64 + 0.5, *y as f64, *z as f64 + 0.5], 0.0);
+            }
             if crate::trace_env::env_flag!("SPIPE_PAYLOAD") && !elders.is_empty() {
                 eprintln!("SPIPE_PAYLOAD monument elders={elders:?}");
             }
         }
         StartPieces::Stronghold(s) => {
             let out = mineshaft::place_stronghold_chunk(ctx, s, chunk_bb, random);
-            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
-                for payload in &out.payloads {
-                    if let mineshaft::StrongholdPayload::SilverfishSpawner { pos } = payload {
+            for payload in &out.payloads {
+                if let mineshaft::StrongholdPayload::SilverfishSpawner { pos } = payload {
+                    ctx.push_spawner(*pos, "minecraft:silverfish");
+                    if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
                         eprintln!("SPIPE_PAYLOAD stronghold silverfish_spawner @ {pos:?}");
                     }
                 }
@@ -1967,5 +1971,185 @@ mod pipeline_tests {
         let mut e_ctx = FC::new(&mut end);
         e_refs.place_step(&mut e_ctx, e_step, e_pop as u64, ex, ez);
         assert!(!e_ctx.wr.is_empty(), "EndCity placement should write blocks");
+    }
+
+    #[test]
+    fn structure_spawner_and_entity_payloads_reach_fc() {
+        use crate::generation_payload::GenerationPayload;
+        reset_cache();
+        let d = defs().expect("structure definitions load");
+
+        // 1. Fortress -> SpawnerEntity("minecraft:blaze")
+        let mut nether =
+            Gen::load_preset(4242, crate::name_to_state, worldgen::NoisePreset::Nether)
+                .expect("nether gen");
+        let &nether_set = d
+            .by_id
+            .get("minecraft:nether_complexes")
+            .expect("nether complexes");
+        let mut throne_chunks: Option<(usize, Vec<(i32, i32)>)> = None;
+        'fort_scan: for cx in -40..=40 {
+            for cz in -40..=40 {
+                if !set_admits_live(d, &mut nether, nether_set, 4242, cx, cz, 0) {
+                    continue;
+                }
+                for start in starts_cached(&mut nether, cx, cz).iter() {
+                    if let StartPieces::Fortress { pieces, .. } = &start.pieces {
+                        let mut chunks = Vec::new();
+                        for p in pieces {
+                            if p.kind == crate::mineshaft_piece::FortressKind::MonsterThrone {
+                                for tx in (p.bounds[0] >> 4)..=(p.bounds[3] >> 4) {
+                                    for tz in (p.bounds[2] >> 4)..=(p.bounds[5] >> 4) {
+                                        chunks.push((tx, tz));
+                                    }
+                                }
+                            }
+                        }
+                        if !chunks.is_empty() {
+                            throne_chunks = Some((d.structures[&start.structure].step, chunks));
+                            break 'fort_scan;
+                        }
+                    }
+                }
+            }
+        }
+        let (f_step, f_chunks) = throne_chunks.expect("a Fortress with MonsterThrone in seed 4242");
+        let mut blaze_spawners = Vec::new();
+        for (cx, cz) in f_chunks {
+            let mut refs = References::collect(&mut nether, cx, cz);
+            let pop = pop_seed(nether.wseed(), cx * 16, cz * 16);
+            let mut ctx = FC::new(&mut nether);
+            refs.place_step(&mut ctx, f_step, pop as u64, cx, cz);
+            for (pos, payload) in ctx.payloads {
+                if matches!(&payload, GenerationPayload::SpawnerEntity(id) if id == "minecraft:blaze") {
+                    blaze_spawners.push(pos);
+                }
+            }
+        }
+        assert!(
+            !blaze_spawners.is_empty(),
+            "Fortress MonsterThrone must push SpawnerEntity(\"minecraft:blaze\")"
+        );
+
+        // 2. Stronghold -> SpawnerEntity("minecraft:silverfish")
+        let mut ow = Gen::load(4242, crate::name_to_state).expect("overworld gen");
+        let &sh_set = d.by_id.get("minecraft:strongholds").expect("strongholds set");
+        let sh_step = d.structures["minecraft:stronghold"].step;
+        let mut rings: Vec<(i32, i32)> = ring_chunks(d, &mut ow, sh_set).iter().copied().collect();
+        rings.sort();
+        let mut portal_chunks = None;
+        for (cx, cz) in rings {
+            for start in starts_cached(&mut ow, cx, cz).iter() {
+                if let StartPieces::Stronghold(s) = &start.pieces {
+                    if let Some(idx) = s.portal_room {
+                        let bb = s.pieces[idx].bounds;
+                        let mut chunks = Vec::new();
+                        for tx in (bb[0] >> 4)..=(bb[3] >> 4) {
+                            for tz in (bb[2] >> 4)..=(bb[5] >> 4) {
+                                chunks.push((tx, tz));
+                            }
+                        }
+                        portal_chunks = Some(chunks);
+                        break;
+                    }
+                }
+            }
+            if portal_chunks.is_some() {
+                break;
+            }
+        }
+        let sh_chunks = portal_chunks.expect("a Stronghold PortalRoom in seed 4242");
+        let mut silverfish_spawners = Vec::new();
+        for (cx, cz) in sh_chunks {
+            let mut refs = References::collect(&mut ow, cx, cz);
+            let pop = pop_seed(ow.wseed(), cx * 16, cz * 16);
+            let mut ctx = FC::new(&mut ow);
+            refs.place_step(&mut ctx, sh_step, pop as u64, cx, cz);
+            for (pos, payload) in ctx.payloads {
+                if matches!(&payload, GenerationPayload::SpawnerEntity(id) if id == "minecraft:silverfish") {
+                    silverfish_spawners.push(pos);
+                }
+            }
+        }
+        assert!(
+            !silverfish_spawners.is_empty(),
+            "Stronghold PortalRoom must push SpawnerEntity(\"minecraft:silverfish\")"
+        );
+
+        // 3. Monument -> Entity("minecraft:elder_guardian")
+        let &mon_set = d.by_id.get("minecraft:ocean_monuments").expect("monuments set");
+        let mut mon_hit: Option<(usize, [i32; 6])> = None;
+        'mon_scan: for cx in -64..=64 {
+            for cz in -64..=64 {
+                if !set_admits_live(d, &mut ow, mon_set, 4242, cx, cz, 0) {
+                    continue;
+                }
+                for start in starts_cached(&mut ow, cx, cz).iter() {
+                    if matches!(start.pieces, StartPieces::Monument { .. }) {
+                        mon_hit = Some((d.structures[&start.structure].step, start.bbox));
+                        break 'mon_scan;
+                    }
+                }
+            }
+        }
+        let (m_step, m_bb) = mon_hit.expect("an Ocean Monument in seed 4242");
+        let mut elder_pos = Vec::new();
+        for cx in (m_bb[0] >> 4)..=(m_bb[3] >> 4) {
+            for cz in (m_bb[2] >> 4)..=(m_bb[5] >> 4) {
+                let mut refs = References::collect(&mut ow, cx, cz);
+                let pop = pop_seed(ow.wseed(), cx * 16, cz * 16);
+                let mut ctx = FC::new(&mut ow);
+                refs.place_step(&mut ctx, m_step, pop as u64, cx, cz);
+                for (_, payload) in ctx.payloads {
+                    if let GenerationPayload::Entity { id, pos, .. } = payload {
+                        if id == "minecraft:elder_guardian" {
+                            elder_pos.push(pos);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            !elder_pos.is_empty(),
+            "Monument placement must push elder_guardian entities"
+        );
+        for pos in &elder_pos {
+            assert_eq!(pos[0].rem_euclid(1.0), 0.5);
+            assert_eq!(pos[2].rem_euclid(1.0), 0.5);
+        }
+
+        // 4. SwampHut -> Entity("minecraft:witch") & Entity("minecraft:cat")
+        let &hut_set = d.by_id.get("minecraft:swamp_huts").expect("swamp_huts set");
+        let mut hut_hit: Option<(usize, [i32; 6])> = None;
+        'hut_scan: for cx in -512..=512 {
+            for cz in -512..=512 {
+                if !set_admits_live(d, &mut ow, hut_set, 4242, cx, cz, 0) {
+                    continue;
+                }
+                for start in starts_cached(&mut ow, cx, cz).iter() {
+                    if matches!(start.pieces, StartPieces::SwampHut(_)) {
+                        hut_hit = Some((d.structures[&start.structure].step, start.bbox));
+                        break 'hut_scan;
+                    }
+                }
+            }
+        }
+        let (h_step, h_bb) = hut_hit.expect("a SwampHut in seed 4242");
+        let mut hut_entities = Vec::new();
+        for cx in (h_bb[0] >> 4)..=(h_bb[3] >> 4) {
+            for cz in (h_bb[2] >> 4)..=(h_bb[5] >> 4) {
+                let mut refs = References::collect(&mut ow, cx, cz);
+                let pop = pop_seed(ow.wseed(), cx * 16, cz * 16);
+                let mut ctx = FC::new(&mut ow);
+                refs.place_step(&mut ctx, h_step, pop as u64, cx, cz);
+                for (_, payload) in ctx.payloads {
+                    if let GenerationPayload::Entity { id, .. } = payload {
+                        hut_entities.push(id);
+                    }
+                }
+            }
+        }
+        assert!(hut_entities.iter().any(|id| id == "minecraft:witch"));
+        assert!(hut_entities.iter().any(|id| id == "minecraft:cat"));
     }
 }
