@@ -451,7 +451,7 @@ fn end_city_generate(
                 ) else {
                     return false;
                 };
-                current = add_helper(list, next);
+                add_helper(list, next);
             } else if choice == 1 {
                 let Ok(next) = end_city_add_piece(
                     templates,
@@ -621,22 +621,9 @@ fn end_city_generate(
                             );
                         }
                     }
-                    let Ok(top) = end_city_add_piece(
-                        templates,
-                        reg,
-                        &current,
-                        (-1, 4, -1),
-                        "tower_top",
-                        rotation,
-                        true,
-                    ) else {
-                        return false;
-                    };
-                    current = add_helper(list, top);
-                }
-                None => {
-                    if depth == 7 {
-                        let Ok(top) = end_city_add_piece(
+                    let top = add_helper(
+                        list,
+                        match end_city_add_piece(
                             templates,
                             reg,
                             &current,
@@ -644,10 +631,30 @@ fn end_city_generate(
                             "tower_top",
                             rotation,
                             true,
-                        ) else {
-                            return false;
-                        };
-                        current = add_helper(list, top);
+                        ) {
+                            Ok(p) => p,
+                            Err(_) => return false,
+                        },
+                    );
+                    let _ = top;
+                }
+                None => {
+                    if depth == 7 {
+                        add_helper(
+                            list,
+                            match end_city_add_piece(
+                                templates,
+                                reg,
+                                &current,
+                                (-1, 4, -1),
+                                "tower_top",
+                                rotation,
+                                true,
+                            ) {
+                                Ok(p) => p,
+                                Err(_) => return false,
+                            },
+                        );
                     } else {
                         return end_city_recursive_children(
                             templates,
@@ -872,6 +879,9 @@ fn end_city_generate(
 /// `EndCityPieces.startHouseTower`: the four `init()` calls reset the shared
 /// `shipCreated` flag, then the fixed base/second/third stack is laid down and
 /// the tower recursion starts.
+// The worldgen dispatch that consumes these entry points is a separate
+// change; until it lands the whole subsystem is reachable only from tests.
+#[allow(dead_code)]
 pub(crate) fn start_house_tower(
     templates: &mut Templates,
     reg: &BReg,
@@ -938,6 +948,9 @@ pub(crate) fn start_house_tower(
 /// One `Rotation.getRandom` draw, then the four base-height reads. The pieces
 /// are built lazily so the caller's intermediate RNG probe lands between the
 /// two, exactly as native's `GenerationStub` consumer does.
+// The worldgen dispatch that consumes these entry points is a separate
+// change; until it lands the whole subsystem is reachable only from tests.
+#[allow(dead_code)]
 pub(crate) fn find_end_city_pieces(
     world: &mut dyn TemplateWorld,
     cx: i32,
@@ -949,10 +962,9 @@ pub(crate) fn find_end_city_pieces(
     if pos.1 < 60 {
         return None;
     }
-    let builder: EndCityMansionPieceBuilder = Box::new(move |world, templates, rng, reg| {
+    let builder: EndCityMansionPieceBuilder = Box::new(move |_world, templates, rng, reg| {
         let mut pieces = Vec::new();
         let _ = start_house_tower(templates, reg, pos, rotation, &mut pieces, rng);
-        drop(world);
         pieces
     });
     Some((pos, builder))
@@ -1712,7 +1724,8 @@ impl MansionPlacer<'_> {
     /// `traverseInnerTurn`.
     fn traverse_inner_turn(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
+        // `traverseInnerTurn` takes the list and never touches it either.
+        _list: &mut Vec<TemplatePiece>,
         data: &mut MansionPlacement,
     ) -> Result<(), &'static str> {
         data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::South), 6);
@@ -1752,7 +1765,7 @@ impl MansionPlacer<'_> {
                 x + heading.step_x() + heading.counter_clock_wise().step_x(),
                 y + heading.step_z() + heading.counter_clock_wise().step_z(),
             ) {
-                self.traverse_inner_turn(list, data)?;
+                self.traverse_inner_turn(&mut Vec::new(), data)?;
                 x += heading.step_x();
                 y += heading.step_z();
                 heading = heading.counter_clock_wise();
@@ -2220,50 +2233,44 @@ impl MansionPlacer<'_> {
         let (Some(room_direction), Some(door_direction)) = (room_direction, door_direction) else {
             return Ok(());
         };
-        let mut dx = 0;
-        let mut dz = 0;
-        let mut room_rotation = rotation;
-        let mut mirror = Mirror::None;
-        match (door_direction, room_direction) {
-            (Dir::East, Dir::South) => dx = -7,
-            (Dir::East, Dir::North) => {
-                dx = -7;
-                dz = 6;
-                mirror = Mirror::from_index(1).unwrap();
-            }
-            (Dir::North, Dir::East) => {
-                dx = 1;
-                dz = 14;
-                room_rotation = rotate_rotation(rotation, Rotation::Counterclockwise90);
-            }
-            (Dir::North, Dir::West) => {
-                dx = 7;
-                dz = 14;
-                room_rotation = rotate_rotation(rotation, Rotation::Counterclockwise90);
-                mirror = Mirror::from_index(1).unwrap();
-            }
-            (Dir::South, Dir::West) => {
-                dx = 7;
-                dz = -8;
-                room_rotation = rotate_rotation(rotation, Rotation::Clockwise90);
-            }
-            (Dir::South, Dir::East) => {
-                dx = 1;
-                dz = -8;
-                room_rotation = rotate_rotation(rotation, Rotation::Clockwise90);
-                mirror = Mirror::from_index(1).unwrap();
-            }
-            (Dir::West, Dir::North) => {
-                dx = 15;
-                dz = 6;
-                room_rotation = rotate_rotation(rotation, Rotation::Clockwise180);
-            }
-            (Dir::West, Dir::South) => {
-                dx = 15;
-                mirror = Mirror::from_index(2).unwrap();
-            }
+        // `(east offset, south offset, piece rotation, mirror)` per entrance
+        // pair, straight out of the eight arms of `addRoom2x2`.
+        let (dx, dz, room_rotation, mirror) = match (door_direction, room_direction) {
+            (Dir::East, Dir::South) => (-7, 0, rotation, Mirror::None),
+            (Dir::East, Dir::North) => (-7, 6, rotation, Mirror::from_index(1).unwrap()),
+            (Dir::North, Dir::East) => (
+                1,
+                14,
+                rotate_rotation(rotation, Rotation::Counterclockwise90),
+                Mirror::None,
+            ),
+            (Dir::North, Dir::West) => (
+                7,
+                14,
+                rotate_rotation(rotation, Rotation::Counterclockwise90),
+                Mirror::from_index(1).unwrap(),
+            ),
+            (Dir::South, Dir::West) => (
+                7,
+                -8,
+                rotate_rotation(rotation, Rotation::Clockwise90),
+                Mirror::None,
+            ),
+            (Dir::South, Dir::East) => (
+                1,
+                -8,
+                rotate_rotation(rotation, Rotation::Clockwise90),
+                Mirror::from_index(1).unwrap(),
+            ),
+            (Dir::West, Dir::North) => (
+                15,
+                6,
+                rotate_rotation(rotation, Rotation::Clockwise180),
+                Mirror::None,
+            ),
+            (Dir::West, Dir::South) => (15, 0, rotation, Mirror::from_index(2).unwrap()),
             _ => return Ok(()),
-        }
+        };
         let name = floor.two_by_two(self.rng);
         let p = relative(
             relative(pos, rotate_direction(rotation, Dir::East), dx),
@@ -2618,6 +2625,9 @@ fn create_mansion(
 }
 
 /// `WoodlandMansionPieces.generateMansion`.
+// The worldgen dispatch that consumes these entry points is a separate
+// change; until it lands the whole subsystem is reachable only from tests.
+#[allow(dead_code)]
 pub(crate) fn generate_mansion(
     templates: &mut Templates,
     reg: &BReg,
@@ -2630,6 +2640,9 @@ pub(crate) fn generate_mansion(
 }
 
 /// `WoodlandMansionStructure.findGenerationPoint`.
+// The worldgen dispatch that consumes these entry points is a separate
+// change; until it lands the whole subsystem is reachable only from tests.
+#[allow(dead_code)]
 pub(crate) fn find_mansion_pieces(
     world: &mut dyn TemplateWorld,
     cx: i32,
@@ -2808,7 +2821,7 @@ fn handle_data_marker<W: TemplateWorld>(
                 mansion_create_chest(world, reg, out, chunk_bb, rng, pos, facing);
                 return;
             }
-            let mut spawned = 0;
+            let spawned;
             match metadata {
                 "Mage" => {
                     out.entities.push(EntitySpawn {
@@ -2955,6 +2968,9 @@ pub(crate) fn place_chunk<W: TemplateWorld>(
 /// `minecraft:end_city`'s per-chunk placement: `StructureStart.placeInChunk`
 /// over the end city piece list.
 #[allow(clippy::too_many_arguments)]
+// The worldgen dispatch that consumes these entry points is a separate
+// change; until it lands the whole subsystem is reachable only from tests.
+#[allow(dead_code)]
 pub(crate) fn place_end_city_chunk<W: TemplateWorld>(
     world: &mut W,
     templates: &mut Templates,
@@ -2979,6 +2995,9 @@ pub(crate) fn place_end_city_chunk<W: TemplateWorld>(
 /// `minecraft:mansion`'s per-chunk placement: the pieces, then the
 /// `afterPlace` foundation pass.
 #[allow(clippy::too_many_arguments)]
+// The worldgen dispatch that consumes these entry points is a separate
+// change; until it lands the whole subsystem is reachable only from tests.
+#[allow(dead_code)]
 pub(crate) fn place_mansion_chunk<W: TemplateWorld>(
     world: &mut W,
     templates: &mut Templates,
@@ -3003,6 +3022,9 @@ pub(crate) fn place_mansion_chunk<W: TemplateWorld>(
 /// `WoodlandMansionStructure.afterPlace`: fill the foundation under every
 /// structural cell of this chunk with cobblestone down to sea level or the first
 /// non-air block.
+// The worldgen dispatch that consumes these entry points is a separate
+// change; until it lands the whole subsystem is reachable only from tests.
+#[allow(dead_code)]
 pub(crate) fn mansion_after_place<W: TemplateWorld>(
     world: &mut W,
     pieces: &[TemplatePiece],
