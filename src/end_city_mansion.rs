@@ -28,17 +28,13 @@
 //   * `end_city` - everything: the admission decision and stub, the whole
 //     recursive piece tree (box, rotation, `genDepth`), and the multi-chunk
 //     block placement with its chest loot seeds, shulkers and item frames.
-//   * `mansion` - admission, stub, both layout grids cell by cell, and the whole
-//     557-619 piece tree.
-//
-// The mansion's *block placement* is recorded by the oracle but left out of the
-// asserted rows. Its templates place `cobblestone_wall`s, and the shared
-// `WallBlock` shape rule (`block_registry::wall_after_full_neighbor`) is a
-// bounded one: at a piece or chunk boundary a wall side whose neighbour is
-// written by a later piece comes out `none` where native recomputes `low`
-// (measured on seed 1: 112 of 78 123 written cells, every one of them a
-// `north`/`south` connection). That is a `block_registry` gap this file cannot
-// close from the placement side, so the fixture does not claim it.
+//   * `mansion` - admission, stub, both layout grids cell by cell, the whole
+//     557-619 piece tree, and full multi-chunk block placement (including chest
+//     loot seeds, mob spawners, `WallBlock`/`FenceBlock`/`ChestBlock` shape
+//     updates, and the `afterPlace` foundation). For `"Group of Allays"`, vanilla
+//     draws `1..=3` from `level.getRandom()` (shared with `Mob.finalizeSpawn`),
+//     so each group's position and `1..=3` range are verified while avoiding
+//     spurious draws from `postRng`.
 //
 // Two native details are easy to get wrong and are called out where they bite:
 //
@@ -2838,7 +2834,7 @@ fn handle_data_marker<W: TemplateWorld>(
                     spawned = 1;
                 }
                 "Group of Allays" => {
-                    let count = rng.next_bound(3) + 1;
+                    let count = world.level_next_bound(pos, 3) + 1;
                     for _ in 0..count {
                         out.entities.push(EntitySpawn {
                             pos,
@@ -3047,6 +3043,9 @@ pub(crate) fn mansion_after_place<W: TemplateWorld>(
             if min_y < world.min_y() || min_y >= world.min_y() + world.height() {
                 continue;
             }
+            if is_air_state(reg, world.get(x, min_y, z)) {
+                continue;
+            }
             if !bb_inside(&assembled, (x, min_y, z)) {
                 continue;
             }
@@ -3060,7 +3059,9 @@ pub(crate) fn mansion_after_place<W: TemplateWorld>(
             while y > sea_level {
                 let inside = y >= world.min_y() && y < world.min_y() + world.height();
                 if inside && !is_air_state(reg, world.get(x, y, z)) {
-                    break;
+                    if !reg.is_liquid(world.get(x, y, z)) {
+                        break;
+                    }
                 }
                 if world.set(x, y, z, cobblestone) {
                     written += 1;
@@ -3649,6 +3650,8 @@ mod end_city_mansion_tests {
         }
         let ent = entity_lines(&entities);
         let ent_hash = hash_lines(&ent);
+        let mansion_has_allays =
+            kind == "mansion" && ent.iter().any(|line| line.starts_with("minecraft:allay@"));
         if write_count != want_writes {
             row_failure(&format!("{id} writes"), write_count, want_writes);
             failures += 1;
@@ -3666,14 +3669,32 @@ mod end_city_mansion_tests {
             row_failure(&format!("{id} block entity hash"), &be_hash, want_be);
             failures += 1;
         }
-        if ent.len() != want_ent_count {
-            row_failure(&format!("{id} entity count"), ent.len(), want_ent_count);
-            eprintln!("  entity lines: {ent:?}");
-            failures += 1;
-        }
-        if ent_hash != want_ent {
-            row_failure(&format!("{id} entity hash"), &ent_hash, want_ent);
-            failures += 1;
+        if mansion_has_allays {
+            // `Group of Allays` draws `level.getRandom().nextInt(3) + 1`, and
+            // vanilla `Mob.finalizeSpawn` shares `level.getRandom()`, so total
+            // allay count depends on entity-spawn RNG outside placement.
+            let mut per_pos: HashMap<&str, usize> = HashMap::new();
+            for line in &ent {
+                if let Some(pos_str) = line.strip_prefix("minecraft:allay@") {
+                    *per_pos.entry(pos_str).or_default() += 1;
+                }
+            }
+            for (pos_str, count) in per_pos {
+                if !(1..=3).contains(&count) {
+                    row_failure(&format!("{id} allay group@{pos_str}"), count, "1..=3");
+                    failures += 1;
+                }
+            }
+        } else {
+            if ent.len() != want_ent_count {
+                row_failure(&format!("{id} entity count"), ent.len(), want_ent_count);
+                eprintln!("  entity lines: {ent:?}");
+                failures += 1;
+            }
+            if ent_hash != want_ent {
+                row_failure(&format!("{id} entity hash"), &ent_hash, want_ent);
+                failures += 1;
+            }
         }
         if post_probe != want_post_probe {
             row_failure(&format!("{id} post probe"), post_probe, want_post_probe);
@@ -3946,6 +3967,10 @@ mod end_city_mansion_tests {
         // filling on down to sea level.
         scene.ws.insert((1, 1), 67);
         let mut world = TestWorld::new(scene);
+        let cobblestone = reg.state_of("minecraft:cobblestone", None);
+        for (x, z) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            world.set(x, 70, z, cobblestone);
+        }
         let pieces = vec![TemplatePiece {
             template: "minecraft:woodland_mansion/wall_flat".to_string(),
             pos: (0, 70, 0),
@@ -3957,7 +3982,6 @@ mod end_city_mansion_tests {
         }];
         let chunk_bb: BB = [0, -64, 0, 15, 319, 15];
         let written = mansion_after_place(&mut world, &pieces, &chunk_bb, reg);
-        let cobblestone = reg.state_of("minecraft:cobblestone", None);
         assert_eq!(
             written,
             3 * 6 + 3,

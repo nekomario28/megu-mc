@@ -204,7 +204,7 @@ impl StrongholdPiece {
 }
 
 /// `StrongholdPieces.PieceWeight`, with its live `placeCount` and `maxPlaceCount`.
-struct PieceWeight {
+struct StrongholdPieceWeight {
     /// Stable identity: `previousPiece` is compared by weight object, never by slot.
     id: u32,
     kind: StrongholdKind,
@@ -232,7 +232,7 @@ const PIECE_WEIGHTS: [(StrongholdKind, i32, i32); 11] = [
 /// Live stronghold generation state: `StrongholdPieces.pieceList`, `totalWeight`,
 /// `imposter`, and the start piece's `previousPiece`/`pendingChildren`.
 struct StrongholdGen {
-    weights: Vec<PieceWeight>,
+    weights: Vec<StrongholdPieceWeight>,
     total_weight: i32,
     imposter: Option<StrongholdKind>,
     previous: Option<u32>,
@@ -254,7 +254,7 @@ impl StrongholdGen {
             weights: PIECE_WEIGHTS
                 .iter()
                 .enumerate()
-                .map(|(id, &(kind, weight, max_place_count))| PieceWeight {
+                .map(|(id, &(kind, weight, max_place_count))| StrongholdPieceWeight {
                     id: id as u32,
                     kind,
                     weight,

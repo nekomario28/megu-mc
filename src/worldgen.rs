@@ -3758,7 +3758,6 @@ impl Gen {
     pub(crate) fn biome_name_of_leaf(&self, leaf: u16) -> Option<String> {
         self.biome_names.get(leaf as usize).cloned()
     }
-    #[cfg(test)]
     pub(crate) fn biome_leaf_of_name(&self, name: &str) -> Option<u16> {
         self.bleaf.get(name).copied()
     }

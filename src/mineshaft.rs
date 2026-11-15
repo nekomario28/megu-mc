@@ -562,3 +562,13 @@ pub(crate) fn place_start(
         &c.blocking,
     );
 }
+
+pub(crate) use crate::mineshaft_piece::{
+    generate_fortress_pieces, generate_monument_pieces, generate_stronghold_pieces_with_rng,
+    place_fortress_chunk, place_monument_chunk, place_stronghold_chunk, BuriedTreasurePiece,
+    DesertPyramidPiece, DesertPyramidStructure, FortressPiece, JungleTemplePiece, LootKind,
+    LootMap, MonumentLayout, SinglePieceLoot,
+    StrongholdPayload, StrongholdStart, SwampHutPiece,
+};
+pub(crate) use crate::structure_placement::{concentric_rings, concentric_rings_target};
+

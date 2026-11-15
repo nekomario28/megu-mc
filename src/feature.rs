@@ -22,10 +22,6 @@ use std::sync::atomic::Ordering;
 #[path = "generation_contract_tests.rs"]
 mod generation_contract_tests;
 
-#[cfg(test)]
-#[path = "jigsaw_structures.rs"]
-pub(crate) mod jigsaw_structures;
-
 // ---------- configured features ----------
 
 enum FRef {
@@ -2239,7 +2235,7 @@ fn random_tag_block(reg: &BReg, tag: &str, rng: &mut Xor) -> Option<u32> {
 /// `Util.shuffle(list, random)`: Fisher-Yates from the end, `nextInt(i)` for i = size..2, so
 /// the last element is never drawn for. Both the coral plane shuffle and the claw's
 /// `shuffledCopy(Stream)` go through this.
-fn util_shuffle<T>(list: &mut [T], rng: &mut Xor) {
+fn feature_util_shuffle<T>(list: &mut [T], rng: &mut Xor) {
     for i in (2..=list.len()).rev() {
         let j = rng.next_bound(i as i32) as usize;
         list.swap(j, i - 1);
@@ -2339,7 +2335,7 @@ fn coral_tree(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32) {
     let top = m;
     let branches = rng.next_bound(3) + 2;
     let mut dirs = HORIZONTAL;
-    util_shuffle(&mut dirs, rng);
+    feature_util_shuffle(&mut dirs, rng);
     for &(dx, dz, _) in dirs.iter().take(branches as usize) {
         m = top;
         m.0 += dx;
@@ -2375,7 +2371,7 @@ fn coral_claw(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), state: u32) {
         horizontal_clockwise(dir),
         horizontal_counter_clockwise(dir),
     ];
-    util_shuffle(&mut arms, rng);
+    feature_util_shuffle(&mut arms, rng);
     // the tail of every arm runs along the *drawn* direction, not along the arm
     let (ddx, ddz, _) = HORIZONTAL[dir];
     for &arm in arms.iter().take(n as usize) {
@@ -3480,7 +3476,7 @@ fn spc_vein_convert(ctx: &mut FC, reg: &BReg, rng: &mut Xor, pos: (i32, i32, i32
     let state = ctx.get(pos.0, pos.1, pos.2);
     // `Direction.allShuffled(random)` — this one *does* draw (five nextInt for six directions)
     let mut dirs: Vec<u8> = (0..6u8).collect();
-    util_shuffle(&mut dirs, rng);
+    feature_util_shuffle(&mut dirs, rng);
     for d in dirs {
         if !spc_has_face(reg, state, d) {
             continue;
@@ -3603,7 +3599,7 @@ fn spc_find_next_sculk(
     pos: (i32, i32, i32),
 ) -> Option<(i32, i32, i32)> {
     let mut offsets = spc_offsets();
-    util_shuffle(&mut offsets, rng);
+    feature_util_shuffle(&mut offsets, rng);
     let mut target = pos;
     for off in offsets {
         let p = (pos.0 + off.0, pos.1 + off.1, pos.2 + off.2);
@@ -5422,8 +5418,7 @@ fn foliage_noise() -> &'static OSimp {
 
 // ---------- placed feature execution ----------
 
-#[cfg(test)]
-pub(super) fn gen_placed_feature_by_name(
+fn gen_placed_feature_by_name(
     name: &str,
     ctx: &mut FC,
     rng: &mut Xor,
@@ -8750,4 +8745,5 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
 // The unified StructureSet / StructureStart pipeline. Included rather than declared as a
 // submodule: `feature` is the layer that may see `structure_template` and `mineshaft`
 // together, and `tools/layers_check.sh` forbids new `mod` edges in production files.
+include!("jigsaw_structures.rs");
 include!("structure_pipeline.rs");

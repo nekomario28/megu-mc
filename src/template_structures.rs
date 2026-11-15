@@ -32,7 +32,7 @@ pub(crate) fn bb_inside(bb: &BB, p: Pos) -> bool {
 }
 
 pub(crate) fn bb_intersects(a: &BB, b: &BB) -> bool {
-    a[3] >= b[0] && a[0] <= b[3] && a[5] >= b[1] && a[2] <= b[5] && a[4] >= b[2] && a[1] <= b[4]
+    a[3] >= b[0] && a[0] <= b[3] && a[4] >= b[1] && a[1] <= b[4] && a[5] >= b[2] && a[2] <= b[5]
 }
 
 pub(crate) fn bb_encapsulate(a: &mut BB, b: &BB) {
@@ -104,6 +104,12 @@ pub(crate) trait TemplateWorld {
     fn sea_level(&self) -> i32;
     fn min_y(&self) -> i32;
     fn height(&self) -> i32;
+    /// `LevelAccessor.getRandom().nextInt(bound)` for non-placement level RNG
+    /// (e.g. WoodlandMansion `Group of Allays` count), kept separate from the
+    /// chunk decoration `RandomSource`.
+    fn level_next_bound(&mut self, pos: Pos, bound: i32) -> i32 {
+        Lcg::new(hash_block_pos(pos.0, pos.1, pos.2) as u64).next_bound(bound)
+    }
 }
 
 impl TemplateWorld for crate::generation_context::FC<'_> {
@@ -332,6 +338,7 @@ pub(crate) fn block_entity_id(name: &str) -> Option<&'static str> {
         "flower_pot" => "minecraft:flower_pot",
         "enchanting_table" => "minecraft:enchanting_table",
         "shulker_box" => "minecraft:shulker_box",
+        "spawner" => "minecraft:mob_spawner",
         _ if bare.ends_with("_bed") => "minecraft:bed",
         _ if bare.ends_with("_sign") => "minecraft:sign",
         _ if bare.ends_with("_hanging_sign") => "minecraft:hanging_sign",
@@ -1084,24 +1091,12 @@ fn update_shape<W: TemplateWorld>(
             return next;
         }
     }
-    let above = if name.ends_with("_wall") {
-        world.get(pos.0, pos.1.wrapping_add(1), pos.2)
-    } else {
-        0
-    };
-    // `FenceBlock.updateShape`: a horizontal side connects to a sturdy neighbour
-    // that is not an exception for connection, or to the same fence family.
-    // "Sturdy" is `BlockStateBase.isFaceSturdy` = the neighbour's *full side*,
-    // which is why a fence connects to a stair's back but not its step.
     let bare = name.strip_prefix("minecraft:").unwrap_or(name);
-    // `WallBlock.updateShape` for a horizontal change: `low` for a full cube or
-    // another wall, `none` for air, and the post drops when a straight run has
-    // air above. The bounded rule refuses to guess TALL sides, which need the
-    // shape-coverage comparison this registry does not carry.
-    if bare.ends_with("_wall") && matches!(direction, 2..=5) {
-        if let Some(next) = reg.wall_after_full_neighbor(state, neighbor, above, direction) {
-            return next;
-        }
+    // `WallBlock.updateShape`: both `UP` (direction 1) and horizontal sides
+    // recompute `low`/`tall` against `above.getCollisionShape().getFaceShape(DOWN)`
+    // and recompute `up` (`shouldRaisePost`).
+    if bare.ends_with("_wall") || reg.in_tag(state, "minecraft:walls") {
+        return wall_update_shape(reg, state, direction, neighbor, world, pos);
     }
     if bare.ends_with("_fence") && matches!(direction, 2..=5) {
         let key = match direction {
@@ -1156,7 +1151,50 @@ fn update_shape<W: TemplateWorld>(
             return air;
         }
     }
-    if let Some(next) = reg.connection_after_neighbor(state, neighbor, above, direction) {
+    // `ChestBlock.updateShape`: horizontal neighbor updates connect/disconnect
+    // `type` (`single` / `left` / `right`) for double chests.
+    if (bare == "chest" || bare == "trapped_chest") && matches!(direction, 2..=5) {
+        let chest_dir = |facing: &str, ctype: &str| -> Option<u8> {
+            let f = match facing {
+                "north" => 2u8,
+                "south" => 3,
+                "west" => 4,
+                "east" => 5,
+                _ => return None,
+            };
+            Some(match (f, ctype) {
+                (2, "left") | (3, "right") => 5,  // east
+                (2, "right") | (3, "left") => 4,  // west
+                (4, "left") | (5, "right") => 2,  // north
+                (4, "right") | (5, "left") => 3,  // south
+                _ => return None,
+            })
+        };
+        if let (Some(facing), Some(ctype)) = (reg.get_prop(state, "facing"), reg.get_prop(state, "type")) {
+            if reg.name_of(neighbor) == name {
+                if ctype == "single" {
+                    if let (Some(nf), Some(nt)) = (reg.get_prop(neighbor, "facing"), reg.get_prop(neighbor, "type")) {
+                        if nt != "single" && nf == facing && chest_dir(&nf, &nt) == Some(direction ^ 1) {
+                            let opposite_type = if nt == "left" { "right" } else { "left" };
+                            return reg.with_prop(state, "type", opposite_type);
+                        }
+                    }
+                }
+            } else if ctype != "single" && chest_dir(&facing, &ctype) == Some(direction) {
+                return reg.with_prop(state, "type", "single");
+            }
+        }
+    }
+    // `CropBlock.canSurvive` / `BushBlock.updateShape`: during worldgen (unlit
+    // chunk / `useUninitializedLightEngine`), `getRawBrightness < 8`, so crops
+    // fail `canSurvive` and drop to air on shape update.
+    if matches!(
+        bare,
+        "wheat" | "carrots" | "potatoes" | "beetroots" | "torchflower_crop" | "pitcher_crop"
+    ) {
+        return air;
+    }
+    if let Some(next) = reg.connection_after_neighbor(state, neighbor, 0, direction) {
         return next;
     }
     if reg.fragile_loses_support(state, direction, neighbor) {
@@ -1210,13 +1248,185 @@ fn is_face_sturdy(reg: &BReg, state: u32, direction: u8) -> bool {
     reg.side_solid(state, direction as usize)
 }
 
-/// `FenceBlock.connectsTo`: a sturdy neighbour, or the same fence family.
+/// `FenceBlock.connectsTo`: a sturdy neighbour, the same fence family, or a
+/// fence gate aligned across the connection direction.
 fn fence_connects(reg: &BReg, state: u32, neighbor: u32, direction: u8) -> bool {
     let sturdy = is_face_sturdy(reg, neighbor, direction ^ 1);
     let same_fence = reg.in_tag(neighbor, "minecraft:fences")
         && reg.in_tag(state, "minecraft:wooden_fences")
             == reg.in_tag(neighbor, "minecraft:wooden_fences");
-    (!is_exception_for_connection(reg, neighbor) && sturdy) || same_fence
+    let neighbor_name = reg.name_of(neighbor);
+    let neighbor_bare = neighbor_name
+        .strip_prefix("minecraft:")
+        .unwrap_or(neighbor_name);
+    let fence_gate = neighbor_bare.ends_with("_fence_gate")
+        && match reg.get_prop(neighbor, "facing").as_deref() {
+            Some("north" | "south") => matches!(direction, 4 | 5),
+            Some("west" | "east") => matches!(direction, 2 | 3),
+            _ => false,
+        };
+    (!is_exception_for_connection(reg, neighbor) && sturdy) || same_fence || fence_gate
+}
+
+/// `WallBlock.connectsTo`.
+fn wall_connects(reg: &BReg, neighbor: u32, direction_toward_neighbor: u8) -> bool {
+    let opposite = direction_toward_neighbor ^ 1;
+    let sturdy = is_face_sturdy(reg, neighbor, opposite);
+    let name = reg.name_of(neighbor);
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    let fence_gate = bare.ends_with("_fence_gate")
+        && match reg.get_prop(neighbor, "facing").as_deref() {
+            Some("north" | "south") => matches!(opposite, 4 | 5),
+            Some("west" | "east") => matches!(opposite, 2 | 3),
+            _ => false,
+        };
+    reg.in_tag(neighbor, "minecraft:walls")
+        || (!is_exception_for_connection(reg, neighbor) && sturdy)
+        || bare.ends_with("_pane")
+        || bare == "iron_bars"
+        || fence_gate
+}
+
+/// XZ footprint of `above.getCollisionShape().getFaceShape(Direction.DOWN)`:
+/// any collision box whose `minY <= 1e-7 && maxY > 1e-7`.
+fn above_down_face_rects(reg: &BReg, above: u32) -> Vec<[f64; 4]> {
+    reg.collision_boxes(above)
+        .filter(|(min, max)| min[1] <= 1.0e-7 && max[1] > 1.0e-7)
+        .map(|(min, max)| [min[0], min[2], max[0], max[2]])
+        .collect()
+}
+
+/// `!Shapes.joinIsNotEmpty(testBox, aboveDownFace, BooleanOp.ONLY_FIRST)`:
+/// every sub-cell of `test` (`[tx0, tz0, tx1, tz1]`) is inside at least one rect.
+fn rects_cover(rects: &[[f64; 4]], test: [f64; 4]) -> bool {
+    if rects.is_empty() {
+        return false;
+    }
+    let [tx0, tz0, tx1, tz1] = test;
+    let mut xs = Vec::with_capacity(rects.len() * 2 + 2);
+    let mut zs = Vec::with_capacity(rects.len() * 2 + 2);
+    xs.push(tx0);
+    xs.push(tx1);
+    zs.push(tz0);
+    zs.push(tz1);
+    for &[bx0, bz0, bx1, bz1] in rects {
+        if bx1 > tx0 + 1.0e-9 && bx0 < tx1 - 1.0e-9 && bz1 > tz0 + 1.0e-9 && bz0 < tz1 - 1.0e-9 {
+            xs.push(bx0.clamp(tx0, tx1));
+            xs.push(bx1.clamp(tx0, tx1));
+            zs.push(bz0.clamp(tz0, tz1));
+            zs.push(bz1.clamp(tz0, tz1));
+        }
+    }
+    xs.sort_by(|a, b| a.total_cmp(b));
+    zs.sort_by(|a, b| a.total_cmp(b));
+    for xw in xs.windows(2) {
+        if xw[1] - xw[0] <= 1.0e-9 {
+            continue;
+        }
+        let mx = 0.5 * (xw[0] + xw[1]);
+        for zw in zs.windows(2) {
+            if zw[1] - zw[0] <= 1.0e-9 {
+                continue;
+            }
+            let mz = 0.5 * (zw[0] + zw[1]);
+            if !rects
+                .iter()
+                .any(|&[bx0, bz0, bx1, bz1]| bx0 <= mx && mx <= bx1 && bz0 <= mz && mz <= bz1)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Full vanilla `WallBlock.updateShape`.
+fn wall_update_shape<W: TemplateWorld>(
+    reg: &BReg,
+    state: u32,
+    direction: u8,
+    neighbor: u32,
+    world: &mut W,
+    pos: Pos,
+) -> u32 {
+    if direction == 0 {
+        return state;
+    }
+    let connected = |key: &str| reg.get_prop(state, key).as_deref() != Some("none");
+    let (north, south, west, east, above) = if direction == 1 {
+        (
+            connected("north"),
+            connected("south"),
+            connected("west"),
+            connected("east"),
+            neighbor,
+        )
+    } else {
+        let north = if direction == 2 {
+            wall_connects(reg, neighbor, 2)
+        } else {
+            connected("north")
+        };
+        let south = if direction == 3 {
+            wall_connects(reg, neighbor, 3)
+        } else {
+            connected("south")
+        };
+        let west = if direction == 4 {
+            wall_connects(reg, neighbor, 4)
+        } else {
+            connected("west")
+        };
+        let east = if direction == 5 {
+            wall_connects(reg, neighbor, 5)
+        } else {
+            connected("east")
+        };
+        let above = world.get(pos.0, pos.1.wrapping_add(1), pos.2);
+        (north, south, west, east, above)
+    };
+    let rects = above_down_face_rects(reg, above);
+    let side_val = |want: bool, t: [f64; 4]| -> &'static str {
+        if !want {
+            "none"
+        } else if rects_cover(&rects, t) {
+            "tall"
+        } else {
+            "low"
+        }
+    };
+    let n_val = side_val(north, [7.0 / 16.0, 0.0, 9.0 / 16.0, 9.0 / 16.0]);
+    let s_val = side_val(south, [7.0 / 16.0, 7.0 / 16.0, 9.0 / 16.0, 1.0]);
+    let w_val = side_val(west, [0.0, 7.0 / 16.0, 9.0 / 16.0, 9.0 / 16.0]);
+    let e_val = side_val(east, [7.0 / 16.0, 7.0 / 16.0, 1.0, 9.0 / 16.0]);
+
+    let above_wall_up = (reg.name_of(above).ends_with("_wall")
+        || reg.in_tag(above, "minecraft:walls"))
+        && reg.get_prop(above, "up").as_deref() == Some("true");
+    let up_val = if above_wall_up {
+        true
+    } else {
+        let n_none = n_val == "none";
+        let s_none = s_val == "none";
+        let w_none = w_val == "none";
+        let e_none = e_val == "none";
+        let raise = (n_none && s_none && w_none && e_none)
+            || (n_none != s_none)
+            || (w_none != e_none);
+        if raise {
+            true
+        } else if (n_val == "tall" && s_val == "tall") || (w_val == "tall" && e_val == "tall") {
+            false
+        } else {
+            reg.in_tag(above, "minecraft:wall_post_override")
+                || rects_cover(&rects, [7.0 / 16.0, 7.0 / 16.0, 9.0 / 16.0, 9.0 / 16.0])
+        }
+    };
+    let mut next = reg.with_prop(state, "north", n_val);
+    next = reg.with_prop(next, "south", s_val);
+    next = reg.with_prop(next, "west", w_val);
+    next = reg.with_prop(next, "east", e_val);
+    reg.with_prop(next, "up", if up_val { "true" } else { "false" })
 }
 
 /// `Block.updateFromNeighbourShapes` — `UPDATE_SHAPE_ORDER` is

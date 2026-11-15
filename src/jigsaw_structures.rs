@@ -1,15 +1,12 @@
-//! Vanilla 1.21.1 `JigsawStructure` / `JigsawPlacement` pool expansion and
-//! `PoolElementStructurePiece` placement kernel, matched against the native
-//! 1.21.1 server oracle across all 10 `minecraft:jigsaw` structures.
+// Vanilla 1.21.1 `JigsawStructure` / `JigsawPlacement` pool expansion and
+// `PoolElementStructurePiece` placement kernel, matched against the native
+// 1.21.1 server oracle across all 10 `minecraft:jigsaw` structures.
 
-use crate::block_registry::{breg, ns_name, BReg, HeightmapKind};
-use crate::generation_context::FC;
-use crate::generation_math::{hash_block_pos, sha256, Lcg, Xor};
-use crate::json::{jparse, J};
 use crate::nbt::Tag;
 use crate::structure_template::{BlockInfo, Template};
 use crate::structure_transform::{block as transform_block, bounds as transform_bounds, state as transform_state, Mirror, Rotation};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
 use std::path::Path;
 
 type Pos = (i32, i32, i32);
@@ -19,6 +16,7 @@ const MIN_Y: i32 = -64;
 const WORLD_HEIGHT: i32 = 384;
 const MAX_Y_EXCL: i32 = MIN_Y + WORLD_HEIGHT; // 320
 
+#[cfg(test)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1153,13 +1151,94 @@ impl TemplatePool {
     }
 }
 
+trait JigsawData {
+    fn pool(&self, id: &str) -> Option<&TemplatePool>;
+    fn resolve_processors(&self, pref: &ProcessorRef) -> Result<Vec<Processor>, String>;
+    fn template(&mut self, id: &str, reg: &BReg) -> Result<std::sync::Arc<Template>, String>;
+}
+
 struct DatapackRepo {
+    #[cfg(test)]
     structures: HashMap<String, JigsawStructure>,
     pools: HashMap<String, TemplatePool>,
     processor_lists: HashMap<String, Vec<Processor>>,
-    templates: HashMap<String, Template>,
+    templates: HashMap<String, std::sync::Arc<Template>>,
 }
 
+struct LiveJigsawDefs {
+    structures: HashMap<String, JigsawStructure>,
+    pools: HashMap<String, TemplatePool>,
+    processor_lists: HashMap<String, Vec<Processor>>,
+}
+
+fn load_template_arc(id: &str, reg: &BReg) -> Result<std::sync::Arc<Template>, String> {
+    let key = ns_name(id);
+    let tpl = if let Some(bytes) = Gen::dp_resource("structure", &key, "nbt") {
+        let (_, root) = crate::nbt::read_gzip(&bytes, 16 * 1024 * 1024)
+            .map_err(|e| format!("nbt {key}: {e}"))?;
+        Template::load(&root, reg).map_err(|e| format!("template {key}: {e}"))?
+    } else {
+        Template {
+            size: (0, 0, 0),
+            palettes: Vec::new(),
+            entities: Vec::new(),
+        }
+    };
+    Ok(std::sync::Arc::new(tpl))
+}
+
+static LIVE_JIGSAW_DEFS: std::sync::OnceLock<Option<LiveJigsawDefs>> = std::sync::OnceLock::new();
+
+thread_local! {
+    static LIVE_JIGSAW_TEMPLATES: std::cell::RefCell<HashMap<String, std::sync::Arc<Template>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn live_jigsaw_defs(reg: &BReg) -> Option<&'static LiveJigsawDefs> {
+    LIVE_JIGSAW_DEFS
+        .get_or_init(|| match DatapackRepo::load_dp(reg) {
+            Ok(defs) => Some(defs),
+            Err(e) => {
+                eprintln!("SPIPE jigsaw definitions failed to load: {e}");
+                None
+            }
+        })
+        .as_ref()
+}
+
+struct LiveJigsawRepo<'a>(&'a LiveJigsawDefs);
+
+impl JigsawData for LiveJigsawRepo<'_> {
+    fn pool(&self, id: &str) -> Option<&TemplatePool> {
+        self.0.pools.get(id)
+    }
+
+    fn resolve_processors(&self, pref: &ProcessorRef) -> Result<Vec<Processor>, String> {
+        match pref {
+            ProcessorRef::Named(id) => self
+                .0
+                .processor_lists
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("missing processor_list: {id}")),
+            ProcessorRef::Inline(list) => Ok(list.clone()),
+        }
+    }
+
+    fn template(&mut self, id: &str, reg: &BReg) -> Result<std::sync::Arc<Template>, String> {
+        let key = ns_name(id);
+        if let Some(hit) = LIVE_JIGSAW_TEMPLATES.with(|slot| slot.borrow().get(&key).cloned()) {
+            return Ok(hit);
+        }
+        let tpl = load_template_arc(&key, reg)?;
+        LIVE_JIGSAW_TEMPLATES.with(|slot| {
+            slot.borrow_mut().insert(key, tpl.clone());
+        });
+        Ok(tpl)
+    }
+}
+
+#[cfg(test)]
 fn collect_json_files(dir: &Path, prefix: &str, out: &mut Vec<(String, std::path::PathBuf)>) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -1192,6 +1271,47 @@ fn collect_json_files(dir: &Path, prefix: &str, out: &mut Vec<(String, std::path
 }
 
 impl DatapackRepo {
+    fn load_dp(reg: &BReg) -> Result<LiveJigsawDefs, String> {
+        let mut struct_files: Vec<(String, Vec<u8>)> = Gen::dp_files("structure").into_iter().collect();
+        struct_files.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut structures = HashMap::new();
+        for (id, bytes) in struct_files {
+            let json = jparse(&bytes)
+                .ok_or_else(|| format!("invalid JSON in structure {id}"))?;
+            if json.get("type").map(J::str) == Some("minecraft:jigsaw") {
+                structures.insert(id.clone(), JigsawStructure::parse(&id, &json)?);
+            }
+        }
+
+        let mut pool_files: Vec<(String, Vec<u8>)> = Gen::dp_files("template_pool").into_iter().collect();
+        pool_files.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut pools = HashMap::new();
+        for (id, bytes) in pool_files {
+            let json = jparse(&bytes)
+                .ok_or_else(|| format!("invalid JSON in template_pool {id}"))?;
+            pools.insert(id, TemplatePool::parse(&json, reg)?);
+        }
+
+        let mut proc_files: Vec<(String, Vec<u8>)> = Gen::dp_files("processor_list").into_iter().collect();
+        proc_files.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut processor_lists = HashMap::new();
+        processor_lists.insert("minecraft:empty".to_owned(), Vec::new());
+        for (id, bytes) in proc_files {
+            let json = jparse(&bytes)
+                .ok_or_else(|| format!("invalid JSON in processor_list {id}"))?;
+            let list = Processor::parse_list(&json, reg)
+                .map_err(|e| format!("{id}: {e}"))?;
+            processor_lists.insert(id, list);
+        }
+
+        Ok(LiveJigsawDefs {
+            structures,
+            pools,
+            processor_lists,
+        })
+    }
+
+    #[cfg(test)]
     fn load(reg: &BReg) -> Result<Self, String> {
         let base = Path::new("datapacks/vanilla/data/minecraft/worldgen");
 
@@ -1240,30 +1360,11 @@ impl DatapackRepo {
             templates: HashMap::new(),
         })
     }
+}
 
-    fn get_template(&mut self, id: &str, reg: &BReg) -> Result<&Template, String> {
-        let key = ns_name(id);
-        if !self.templates.contains_key(&key) {
-            let rel = key.strip_prefix("minecraft:").unwrap_or(&key);
-            let path = Path::new("datapacks/vanilla/data/minecraft/structure")
-                .join(format!("{rel}.nbt"));
-            let tpl = if path.exists() {
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| format!("read {}: {e}", path.display()))?;
-                let (_, root) = crate::nbt::read_gzip(&bytes, 16 * 1024 * 1024)
-                    .map_err(|e| format!("nbt {}: {e}", path.display()))?;
-                Template::load(&root, reg)
-                    .map_err(|e| format!("template {}: {e}", path.display()))?
-            } else {
-                Template {
-                    size: (0, 0, 0),
-                    palettes: Vec::new(),
-                    entities: Vec::new(),
-                }
-            };
-            self.templates.insert(key.clone(), tpl);
-        }
-        Ok(self.templates.get(&key).unwrap())
+impl JigsawData for DatapackRepo {
+    fn pool(&self, id: &str) -> Option<&TemplatePool> {
+        self.pools.get(id)
     }
 
     fn resolve_processors(&self, pref: &ProcessorRef) -> Result<Vec<Processor>, String> {
@@ -1275,6 +1376,15 @@ impl DatapackRepo {
                 .ok_or_else(|| format!("missing processor_list: {id}")),
             ProcessorRef::Inline(list) => Ok(list.clone()),
         }
+    }
+
+    fn template(&mut self, id: &str, reg: &BReg) -> Result<std::sync::Arc<Template>, String> {
+        let key = ns_name(id);
+        if !self.templates.contains_key(&key) {
+            let tpl = load_template_arc(&key, reg)?;
+            self.templates.insert(key.clone(), tpl);
+        }
+        Ok(self.templates.get(&key).unwrap().clone())
     }
 }
 
@@ -1380,7 +1490,7 @@ fn bb_contains_pos(bb: BBox, p: Pos) -> bool {
     p.0 >= bb[0] && p.0 <= bb[3] && p.1 >= bb[1] && p.1 <= bb[4] && p.2 >= bb[2] && p.2 <= bb[5]
 }
 
-fn bb_intersects(a: BBox, b: BBox) -> bool {
+fn jigsaw_bb_intersects(a: BBox, b: BBox) -> bool {
     a[3] >= b[0] && a[0] <= b[3] && a[5] >= b[2] && a[2] <= b[5] && a[4] >= b[1] && a[1] <= b[4]
 }
 
@@ -1395,7 +1505,7 @@ fn bb_move(bb: BBox, dx: i32, dy: i32, dz: i32) -> BBox {
     ]
 }
 
-fn bb_encapsulate(a: BBox, b: BBox) -> BBox {
+fn jigsaw_bb_encapsulate(a: BBox, b: BBox) -> BBox {
     [
         a[0].min(b[0]),
         a[1].min(b[1]),
@@ -1496,8 +1606,9 @@ impl FreeShape {
     }
 }
 
-fn element_size(
-    repo: &mut DatapackRepo,
+#[allow(dead_code)]
+fn element_size<D: JigsawData>(
+    repo: &mut D,
     el: &PoolElement,
     rot: Rotation,
     reg: &BReg,
@@ -1505,7 +1616,7 @@ fn element_size(
     match el {
         PoolElement::Empty | PoolElement::Feature { .. } => Ok((0, 0, 0)),
         PoolElement::Single { location, .. } | PoolElement::LegacySingle { location, .. } => {
-            let tpl = repo.get_template(location, reg)?;
+            let tpl = repo.template(location, reg)?;
             let s = tpl.size;
             Ok(match rot {
                 Rotation::Clockwise90 | Rotation::Counterclockwise90 => (s.2, s.1, s.0),
@@ -1527,8 +1638,8 @@ fn element_size(
     }
 }
 
-fn element_bounding_box(
-    repo: &mut DatapackRepo,
+fn element_bounding_box<D: JigsawData>(
+    repo: &mut D,
     el: &PoolElement,
     pos: Pos,
     rot: Rotation,
@@ -1538,7 +1649,7 @@ fn element_bounding_box(
         PoolElement::Empty => Err("empty pool element has no bounding box".into()),
         PoolElement::Feature { .. } => Ok([pos.0, pos.1, pos.2, pos.0, pos.1, pos.2]),
         PoolElement::Single { location, .. } | PoolElement::LegacySingle { location, .. } => {
-            let tpl = repo.get_template(location, reg)?;
+            let tpl = repo.template(location, reg)?;
             if tpl.size.0 < 1 || tpl.size.1 < 1 || tpl.size.2 < 1 {
                 Ok([pos.0, pos.1, pos.2, pos.0, pos.1, pos.2])
             } else {
@@ -1554,7 +1665,7 @@ fn element_bounding_box(
                 let sub_bb = element_bounding_box(repo, sub, pos, rot, reg)?;
                 combined = Some(match combined {
                     None => sub_bb,
-                    Some(cur) => bb_encapsulate(cur, sub_bb),
+                    Some(cur) => jigsaw_bb_encapsulate(cur, sub_bb),
                 });
             }
             combined.ok_or_else(|| "list pool element has only empty elements".into())
@@ -1562,8 +1673,8 @@ fn element_bounding_box(
     }
 }
 
-fn element_shuffled_jigsaws(
-    repo: &mut DatapackRepo,
+fn element_shuffled_jigsaws<D: JigsawData>(
+    repo: &mut D,
     el: &PoolElement,
     pos: Pos,
     rot: Rotation,
@@ -1605,7 +1716,7 @@ fn element_shuffled_jigsaws(
             }])
         }
         PoolElement::Single { location, .. } | PoolElement::LegacySingle { location, .. } => {
-            let tpl = repo.get_template(location, reg)?;
+            let tpl = repo.template(location, reg)?;
             let mut list: Vec<BlockInfo> = match tpl.palettes.first() {
                 None => Vec::new(),
                 Some(pal) => pal
@@ -1653,12 +1764,12 @@ fn element_shuffled_jigsaws(
     }
 }
 
-fn pool_max_size(
-    repo: &mut DatapackRepo,
+fn pool_max_size<D: JigsawData>(
+    repo: &mut D,
     pool_id: &str,
     reg: &BReg,
 ) -> Result<i32, String> {
-    let Some(pool) = repo.pools.get(pool_id).cloned() else {
+    let Some(pool) = repo.pool(pool_id).cloned() else {
         return Ok(0);
     };
     let mut best = 0i32;
@@ -1675,19 +1786,28 @@ fn pool_max_size(
 // ---------- JigsawPlacement ----------
 
 #[derive(Clone, Debug)]
-struct Piece {
+pub(crate) struct JigsawPiece {
     element: PoolElement,
     pos: Pos,
     gld: i32,
     rot: Rotation,
-    bb: BBox,
+    pub(crate) bb: BBox,
     liquid_settings: LiquidSettings,
+    pub(crate) junctions: Vec<crate::worldgen::BeardJunction>,
 }
 
-impl Piece {
+impl JigsawPiece {
     fn move_by(&mut self, dx: i32, dy: i32, dz: i32) {
         self.pos = (self.pos.0 + dx, self.pos.1 + dy, self.pos.2 + dz);
         self.bb = bb_move(self.bb, dx, dy, dz);
+    }
+
+    pub(crate) fn is_rigid(&self) -> bool {
+        self.element.projection() == Projection::Rigid
+    }
+
+    pub(crate) fn ground_level_delta(&self) -> i32 {
+        self.gld
     }
 }
 
@@ -1715,15 +1835,61 @@ impl<T> PriorityQueue<T> {
     }
 }
 
-fn generate_pieces(
-    repo: &mut DatapackRepo,
+trait JigsawWorld {
+    fn heightmap(&mut self, x: i32, z: i32, kind: HeightmapKind) -> i32;
+    fn valid_biome(&mut self, x: i32, y: i32, z: i32) -> bool;
+}
+
+#[cfg(test)]
+struct TestJigsawWorld {
+    flat_top: i32,
+}
+
+#[cfg(test)]
+impl JigsawWorld for TestJigsawWorld {
+    fn heightmap(&mut self, _x: i32, _z: i32, _kind: HeightmapKind) -> i32 {
+        self.flat_top
+    }
+
+    fn valid_biome(&mut self, _x: i32, _y: i32, _z: i32) -> bool {
+        true
+    }
+}
+
+struct LiveJigsawWorld<'a> {
+    g: &'a mut Gen,
+    allowed_biomes: &'a HashSet<String>,
+}
+
+impl JigsawWorld for LiveJigsawWorld<'_> {
+    fn heightmap(&mut self, x: i32, z: i32, kind: HeightmapKind) -> i32 {
+        match kind {
+            HeightmapKind::OceanFloor | HeightmapKind::OceanFloorWg => self.g.top_oc(x, z),
+            _ => self.g.top_ws(x, z),
+        }
+    }
+
+    fn valid_biome(&mut self, x: i32, y: i32, z: i32) -> bool {
+        if self.allowed_biomes.is_empty() {
+            return true;
+        }
+        self.g
+            .biome_name_at(x, y, z)
+            .is_some_and(|b| self.allowed_biomes.contains(&b))
+    }
+}
+
+fn generate_pieces_with_hm<D: JigsawData, W: JigsawWorld>(
+    repo: &mut D,
+    world: &mut W,
     structure: &JigsawStructure,
     seed: i64,
     cx: i32,
     cz: i32,
-    flat_top: i32,
+    dim_min_y: i32,
+    dim_max_y_excl: i32,
     reg: &BReg,
-) -> Result<Vec<Piece>, String> {
+) -> Result<Option<(Pos, Vec<JigsawPiece>)>, String> {
     let mut gen_rng = Lcg::for_large_feature(seed as u64, cx, cz);
     let sampled_y = structure.start_height.sample(&mut gen_rng);
     let start_pos = (cx << 4, sampled_y, cz << 4);
@@ -1744,15 +1910,14 @@ fn generate_pieces(
 
     let start_pool_id = lookup_pool(&structure.start_pool);
     let start_pool = repo
-        .pools
-        .get(&start_pool_id)
+        .pool(&start_pool_id)
         .ok_or_else(|| format!("missing start_pool: {start_pool_id}"))?
         .clone();
 
     let start_rot = Rotation::from_index(gen_rng.next_bound(4) as u8).unwrap();
     let start_el = start_pool.get_random_template(&mut gen_rng);
     if matches!(start_el, PoolElement::Empty) {
-        return Err("start pool element was empty".into());
+        return Ok(None);
     }
 
     let delta = if let Some(jigsaw_name) = &structure.start_jigsaw_name {
@@ -1782,43 +1947,49 @@ fn generate_pieces(
         start_pos.2 - delta.2,
     );
     let piece_bb = element_bounding_box(repo, &start_el, piece_pos, start_rot, reg)?;
-    let mut start_piece = Piece {
+    let mut start_piece = JigsawPiece {
         element: start_el.clone(),
         pos: piece_pos,
         gld: start_el.ground_level_delta(),
         rot: start_rot,
         bb: piece_bb,
         liquid_settings: structure.liquid_settings,
+        junctions: Vec::new(),
     };
 
     let center_x = (piece_bb[3] + piece_bb[0]) / 2;
     let center_z = (piece_bb[5] + piece_bb[2]) / 2;
-    let target_y = if structure.project_start_to_heightmap.is_some() {
-        start_pos.1 + flat_top
+    let target_y = if let Some(hm_kind) = structure.project_start_to_heightmap {
+        start_pos.1 + world.heightmap(center_x, center_z, hm_kind)
     } else {
         piece_pos.1
     };
     let anchor_y = piece_bb[1] + start_piece.gld;
     start_piece.move_by(0, target_y - anchor_y, 0);
     let center_y = target_y + delta.1;
+    let stub = (center_x, center_y, center_z);
 
-    let mut pieces = vec![start_piece.clone()];
+    if !world.valid_biome(center_x, center_y, center_z) {
+        return Ok(None);
+    }
+
+    let mut pieces = vec![start_piece];
     if structure.max_depth <= 0 {
-        return Ok(pieces);
+        return Ok(Some((stub, pieces)));
     }
 
     let max_d = structure.max_distance_from_center;
     let (pad_bottom, pad_top) = structure.dimension_padding;
     let outer_aabb = Aabb {
         min_x: (center_x - max_d) as f64,
-        min_y: (center_y - max_d).max(MIN_Y + pad_bottom) as f64,
+        min_y: (center_y - max_d).max(dim_min_y + pad_bottom) as f64,
         min_z: (center_z - max_d) as f64,
         max_x: (center_x + max_d + 1) as f64,
-        max_y: (center_y + max_d + 1).min(MAX_Y_EXCL - pad_top) as f64,
+        max_y: (center_y + max_d + 1).min(dim_max_y_excl - pad_top) as f64,
         max_z: (center_z + max_d + 1) as f64,
     };
     let mut root_shape = FreeShape::from_aabb(outer_aabb);
-    root_shape.cut_out(Aabb::of_bb(start_piece.bb));
+    root_shape.cut_out(Aabb::of_bb(pieces[0].bb));
 
     // Placer::tryPlacingChildren runs on root piece then queued pieces
     #[derive(Clone)]
@@ -1827,21 +1998,26 @@ fn generate_pieces(
         Local(usize), // index into local_shapes
     }
     let mut local_shapes: Vec<Option<FreeShape>> = Vec::new();
-    let mut queue: PriorityQueue<(Piece, ShapeSlot, i32)> = PriorityQueue::new();
+    let mut queue: PriorityQueue<(usize, ShapeSlot, i32)> = PriorityQueue::new();
 
     let mut try_place_children =
-        |parent: &Piece,
+        |parent_idx: usize,
          parent_shape_slot: ShapeSlot,
          depth: i32,
+         pieces: &mut Vec<JigsawPiece>,
          root_shape: &mut FreeShape,
          local_shapes: &mut Vec<Option<FreeShape>>,
-         queue: &mut PriorityQueue<(Piece, ShapeSlot, i32)>|
+         queue: &mut PriorityQueue<(usize, ShapeSlot, i32)>,
+         world: &mut W|
          -> Result<(), String> {
-            let parent_rigid = parent.element.projection() == Projection::Rigid;
-            let parent_min_y = parent.bb[1];
-            let parent_gld = parent.gld;
+            let (parent_element, parent_pos, parent_bb, parent_gld, parent_rot) = {
+                let p = &pieces[parent_idx];
+                (p.element.clone(), p.pos, p.bb, p.gld, p.rot)
+            };
+            let parent_rigid = parent_element.projection() == Projection::Rigid;
+            let parent_min_y = parent_bb[1];
             let parent_jigsaws =
-                element_shuffled_jigsaws(repo, &parent.element, parent.pos, parent.rot, &mut gen_rng, reg)?;
+                element_shuffled_jigsaws(repo, &parent_element, parent_pos, parent_rot, &mut gen_rng, reg)?;
             let parent_children_idx = local_shapes.len();
             local_shapes.push(None);
 
@@ -1859,21 +2035,21 @@ fn generate_pieces(
                     .and_then(|t| nbt_str(t, "pool"))
                     .unwrap_or_else(|| "minecraft:empty".to_owned());
                 let pool_id = lookup_pool(&raw_pool);
-                let Some(pool) = repo.pools.get(&pool_id).cloned() else {
+                let Some(pool) = repo.pool(&pool_id).cloned() else {
                     continue;
                 };
                 if pool.templates.is_empty() && pool_id != "minecraft:empty" {
                     continue;
                 }
                 let fallback_id = pool.fallback.clone();
-                let Some(fallback) = repo.pools.get(&fallback_id).cloned() else {
+                let Some(fallback) = repo.pool(&fallback_id).cloned() else {
                     continue;
                 };
                 if fallback.templates.is_empty() && fallback_id != "minecraft:empty" {
                     continue;
                 }
 
-                let use_local = bb_contains_pos(parent.bb, target_pos);
+                let use_local = bb_contains_pos(parent_bb, target_pos);
                 let mut candidates = Vec::new();
                 if depth != structure.max_depth {
                     candidates.extend(pool.get_shuffled_templates(&mut gen_rng));
@@ -1925,7 +2101,7 @@ fn generate_pieces(
                                             .unwrap_or_else(|| "minecraft:empty".to_owned()),
                                     );
                                     let s1 = pool_max_size(repo, &cj_pool_id, reg)?;
-                                    let s2 = if let Some(p) = repo.pools.get(&cj_pool_id) {
+                                    let s2 = if let Some(p) = repo.pool(&cj_pool_id) {
                                         let fb = p.fallback.clone();
                                         pool_max_size(repo, &fb, reg)?
                                     } else {
@@ -1958,7 +2134,11 @@ fn generate_pieces(
                                 parent_min_y + y_diff
                             } else {
                                 if cached_hm_k == -1 {
-                                    cached_hm_k = flat_top;
+                                    cached_hm_k = world.heightmap(
+                                        p_jig_pos.0,
+                                        p_jig_pos.2,
+                                        HeightmapKind::WorldSurfaceWg,
+                                    );
                                 }
                                 cached_hm_k - cj_y
                             };
@@ -1978,7 +2158,7 @@ fn generate_pieces(
                             let deflated = Aabb::of_bb(final_bb).deflate(0.25);
                             let blocked = if use_local {
                                 let slot = local_shapes[parent_children_idx]
-                                    .get_or_insert_with(|| FreeShape::from_aabb(Aabb::of_bb(parent.bb)));
+                                    .get_or_insert_with(|| FreeShape::from_aabb(Aabb::of_bb(parent_bb)));
                                 slot.blocks_cand(&deflated)
                             } else {
                                 match &parent_shape_slot {
@@ -2014,17 +2194,51 @@ fn generate_pieces(
                             } else {
                                 cand_el.ground_level_delta()
                             };
-                            let child_piece = Piece {
+
+                            let junc_y = if parent_rigid {
+                                parent_min_y + parent_jig_rel_y
+                            } else if cand_rigid {
+                                child_anchor_y + cj_y
+                            } else {
+                                if cached_hm_k == -1 {
+                                    cached_hm_k = world.heightmap(
+                                        p_jig_pos.0,
+                                        p_jig_pos.2,
+                                        HeightmapKind::WorldSurfaceWg,
+                                    );
+                                }
+                                cached_hm_k + y_diff / 2
+                            };
+
+                            pieces[parent_idx]
+                                .junctions
+                                .push(crate::worldgen::BeardJunction {
+                                    source_x: target_pos.0,
+                                    source_ground_y: junc_y - parent_jig_rel_y + parent_gld,
+                                    source_z: target_pos.2,
+                                    delta_y: y_diff,
+                                    rigid: cand_rigid,
+                                });
+
+                            let child_piece = JigsawPiece {
                                 element: cand_el.clone(),
                                 pos: final_pos,
                                 gld: child_gld,
                                 rot: cand_rot,
                                 bb: final_bb,
                                 liquid_settings: structure.liquid_settings,
+                                junctions: vec![crate::worldgen::BeardJunction {
+                                    source_x: p_jig_pos.0,
+                                    source_ground_y: junc_y - cj_y + child_gld,
+                                    source_z: p_jig_pos.2,
+                                    delta_y: -y_diff,
+                                    rigid: parent_rigid,
+                                }],
                             };
-                            pieces.push(child_piece.clone());
+                            let child_idx = pieces.len();
+                            pieces.push(child_piece);
                             if depth + 1 <= structure.max_depth {
-                                queue.push((child_piece, active_slot, depth + 1), placement_priority);
+                                queue.push((child_idx, active_slot, depth + 1), placement_priority);
                             }
                             break 'cand_loop;
                         }
@@ -2035,29 +2249,96 @@ fn generate_pieces(
         };
 
     try_place_children(
-        &start_piece,
+        0,
         ShapeSlot::Root,
         0,
+        &mut pieces,
         &mut root_shape,
         &mut local_shapes,
         &mut queue,
+        world,
     )?;
-    while let Some((piece, slot, depth)) = queue.pop() {
+    while let Some((piece_idx, slot, depth)) = queue.pop() {
         try_place_children(
-            &piece,
+            piece_idx,
             slot,
             depth,
+            &mut pieces,
             &mut root_shape,
             &mut local_shapes,
             &mut queue,
+            world,
         )?;
     }
 
-    Ok(pieces)
+    Ok(Some((stub, pieces)))
+}
+
+#[cfg(test)]
+fn generate_pieces(
+    repo: &mut DatapackRepo,
+    structure: &JigsawStructure,
+    seed: i64,
+    cx: i32,
+    cz: i32,
+    flat_top: i32,
+    reg: &BReg,
+) -> Result<Vec<JigsawPiece>, String> {
+    let mut world = TestJigsawWorld { flat_top };
+    generate_pieces_with_hm(
+        repo,
+        &mut world,
+        structure,
+        seed,
+        cx,
+        cz,
+        MIN_Y,
+        MAX_Y_EXCL,
+        reg,
+    )?
+    .map(|(_, pieces)| pieces)
+    .ok_or_else(|| "start pool element was empty".into())
+}
+
+pub(crate) fn generate_jigsaw_pieces_live(
+    g: &mut Gen,
+    struct_id: &str,
+    allowed_biomes: &HashSet<String>,
+    seed: u64,
+    cx: i32,
+    cz: i32,
+    reg: &BReg,
+) -> Option<(Pos, Vec<JigsawPiece>)> {
+    let defs = live_jigsaw_defs(reg)?;
+    let structure = defs.structures.get(struct_id)?;
+    let mut repo = LiveJigsawRepo(defs);
+    let dim_min_y = g.min_y;
+    let dim_max_y_excl = g.min_y + g.height;
+    let mut world = LiveJigsawWorld { g, allowed_biomes };
+    match generate_pieces_with_hm(
+        &mut repo,
+        &mut world,
+        structure,
+        seed as i64,
+        cx,
+        cz,
+        dim_min_y,
+        dim_max_y_excl,
+        reg,
+    ) {
+        Ok(res) => res,
+        Err(e) => {
+            if crate::trace_env::env_flag!("SPIPE_TRACE") {
+                eprintln!("SPIPE jigsaw {struct_id} ({cx},{cz}) error: {e}");
+            }
+            None
+        }
+    }
 }
 
 // ---------- Chunk placement (`StructureStart::placeInChunk`) ----------
 
+#[cfg(test)]
 fn scene_height(scene: &str, x: i32, z: i32) -> i32 {
     match scene {
         "sloped" => 60 + (x * 3 + z * 7).rem_euclid(9),
@@ -2066,6 +2347,7 @@ fn scene_height(scene: &str, x: i32, z: i32) -> i32 {
     }
 }
 
+#[cfg(test)]
 fn scene_state(scene: &str, x: i32, y: i32, z: i32, reg: &BReg) -> u32 {
     let top = scene_height(scene, x, z);
     let stone = reg.state_of("minecraft:stone", None);
@@ -2097,6 +2379,49 @@ fn scene_state(scene: &str, x: i32, y: i32, z: i32, reg: &BReg) -> u32 {
         "underground" => if y < 64 { deepslate } else { air },
         "nether" => if y < 120 { netherrack } else { air },
         other => panic!("unknown scene {other}"),
+    }
+}
+
+enum JigsawTarget<'a, 'g> {
+    #[cfg(test)]
+    Scene {
+        scene: &'a str,
+        writes: &'a mut HashMap<Pos, u32>,
+        gen: &'a mut crate::worldgen::Gen,
+    },
+    Live(&'a mut FC<'g>),
+}
+
+impl JigsawTarget<'_, '_> {
+    fn get_world(&mut self, p: Pos, reg: &BReg) -> u32 {
+        match self {
+            #[cfg(test)]
+            Self::Scene { scene, writes, .. } => writes
+                .get(&p)
+                .copied()
+                .unwrap_or_else(|| scene_state(scene, p.0, p.1, p.2, reg)),
+            Self::Live(ctx) => ctx.get(p.0, p.1, p.2),
+        }
+    }
+
+    fn set_world(&mut self, p: Pos, st: u32) {
+        match self {
+            #[cfg(test)]
+            Self::Scene { writes, .. } => {
+                writes.insert(p, st);
+            }
+            Self::Live(ctx) => {
+                ctx.set(p.0, p.1, p.2, st);
+            }
+        }
+    }
+
+    fn gravity_surface(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
+        match self {
+            #[cfg(test)]
+            Self::Scene { scene, .. } => scene_height(scene, x, z),
+            Self::Live(ctx) => ctx.heightmap(kind, x, z),
+        }
     }
 }
 
@@ -2153,9 +2478,8 @@ fn apply_processor(
     original: &BlockInfo,
     current: &mut BlockInfo,
     pivot: Pos,
-    scene: &str,
     reg: &BReg,
-    get_world: &mut impl FnMut(Pos) -> u32,
+    target: &mut JigsawTarget<'_, '_>,
 ) -> bool {
     match proc {
         Processor::BlockIgnore(names) => {
@@ -2198,13 +2522,13 @@ fn apply_processor(
             }
         }
         Processor::Protected(tag) => {
-            if reg.in_tag(get_world(current.pos), tag) {
+            if reg.in_tag(target.get_world(current.pos, reg), tag) {
                 return false;
             }
         }
         Processor::Rules(rules) => {
             let mut r = Lcg::new(hash_block_pos(current.pos.0, current.pos.1, current.pos.2) as u64);
-            let existing = get_world(current.pos);
+            let existing = target.get_world(current.pos, reg);
             if let Some(rule) = rules.iter().find(|rule| {
                 rule.input.matches(current.state, reg)
                     && rule.input.roll(&mut r)
@@ -2217,8 +2541,8 @@ fn apply_processor(
                 current.nbt = rule.modifier.apply(&mut r, base_nbt);
             }
         }
-        Processor::Gravity { heightmap: _, offset } => {
-            let surface = scene_height(scene, current.pos.0, current.pos.2);
+        Processor::Gravity { heightmap, offset } => {
+            let surface = target.gravity_surface(*heightmap, current.pos.0, current.pos.2);
             current.pos.1 = surface.wrapping_add(*offset).wrapping_add(original.pos.1);
         }
         Processor::Capped { .. } => {}
@@ -2227,8 +2551,8 @@ fn apply_processor(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn place_single_or_legacy(
-    repo: &mut DatapackRepo,
+fn place_single_or_legacy<D: JigsawData>(
+    repo: &mut D,
     location: &str,
     processors_ref: &ProcessorRef,
     projection: Projection,
@@ -2240,13 +2564,12 @@ fn place_single_or_legacy(
     clip: BBox,
     piece_ls: LiquidSettings,
     world_seed: i64,
-    scene: &str,
-    writes: &mut HashMap<Pos, u32>,
+    target: &mut JigsawTarget<'_, '_>,
     rng: &mut Xor,
     reg: &BReg,
 ) -> Result<(), String> {
     let list_procs = repo.resolve_processors(processors_ref)?;
-    let tpl = repo.get_template(location, reg)?.clone();
+    let tpl = repo.template(location, reg)?;
     if tpl.palettes.is_empty() || tpl.size.0 < 1 || tpl.size.1 < 1 || tpl.size.2 < 1 {
         return Ok(());
     }
@@ -2292,13 +2615,6 @@ fn place_single_or_legacy(
     };
     let raw_blocks = &tpl.palettes[palette_idx];
 
-    let mut get_world = |p: Pos| -> u32 {
-        writes
-            .get(&p)
-            .copied()
-            .unwrap_or_else(|| scene_state(scene, p.0, p.1, p.2, reg))
-    };
-
     let mut kept_originals = Vec::new();
     let mut processed = Vec::new();
     for original in raw_blocks {
@@ -2321,7 +2637,7 @@ fn place_single_or_legacy(
                     );
                 }
             }
-            if !apply_processor(proc, original, &mut current, start_center, scene, reg, &mut get_world) {
+            if !apply_processor(proc, original, &mut current, start_center, reg, target) {
                 keep = false;
                 break;
             }
@@ -2360,9 +2676,8 @@ fn place_single_or_legacy(
                     kept_originals[idx],
                     &mut cand,
                     start_center,
-                    scene,
                     reg,
-                    &mut get_world,
+                    target,
                 ) && (cand.pos != curr.pos || cand.state != curr.state || cand.nbt != curr.nbt)
                 {
                     replaced += 1;
@@ -2382,14 +2697,11 @@ fn place_single_or_legacy(
         if !bb_contains_pos(clip, p) {
             continue;
         }
-        if p.1 < MIN_Y || p.1 >= MAX_Y_EXCL {
+        if p.1 < clip[1] || p.1 > clip[4] {
             continue;
         }
         let existing_fluid_is_water_source = if apply_waterlogging {
-            let ex = writes
-                .get(&p)
-                .copied()
-                .unwrap_or_else(|| scene_state(scene, p.0, p.1, p.2, reg));
+            let ex = target.get_world(p, reg);
             reg.fluid_name(ex) == "minecraft:water"
         } else {
             false
@@ -2406,10 +2718,32 @@ fn place_single_or_legacy(
                 placed
             );
         }
-        writes.insert(p, placed);
+        target.set_world(p, placed);
 
-        if info.nbt.is_some() && is_randomizable_container_be(reg.name_of(placed)) {
-            let _ = rng.next_i64_legacy();
+        if let Some(nbt) = info.nbt.as_ref() {
+            if is_randomizable_container_be(reg.name_of(placed)) {
+                let loot_seed = rng.next_i64_legacy();
+                if let JigsawTarget::Live(ctx) = &mut *target {
+                    if let Some(table) = nbt_str(nbt, "LootTable") {
+                        let table = ns_name(&table);
+                        let bname = reg.name_of(placed);
+                        let is_furnace = match bname {
+                            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
+                                Some(false)
+                            }
+                            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                                Some(true)
+                            }
+                            _ => None,
+                        };
+                        if let Some(is_furnace) = is_furnace {
+                            ctx.push_loot_container(p, is_furnace, table, Some(loot_seed));
+                        } else if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                            eprintln!("SPIPE_PAYLOAD jigsaw {bname} @ {p:?} table={table}");
+                        }
+                    }
+                }
+            }
         }
 
         if apply_waterlogging {
@@ -2418,7 +2752,7 @@ fn place_single_or_legacy(
             } else if can_place_water_liquid(reg, placed) {
                 if existing_fluid_is_water_source {
                     let wl = reg.with_prop(placed, "waterlogged", "true");
-                    writes.insert(p, wl);
+                    target.set_world(p, wl);
                 } else {
                     to_waterlog.push(p);
                 }
@@ -2433,10 +2767,7 @@ fn place_single_or_legacy(
             changed = false;
             let mut next_pending = Vec::with_capacity(to_waterlog.len());
             for p in to_waterlog {
-                let st = writes
-                    .get(&p)
-                    .copied()
-                    .unwrap_or_else(|| scene_state(scene, p.0, p.1, p.2, reg));
+                let st = target.get_world(p, reg);
                 if reg.fluid_name(st) == "minecraft:water" {
                     continue;
                 }
@@ -2446,10 +2777,7 @@ fn place_single_or_legacy(
                     if fluid_sources.contains(&nb) {
                         continue;
                     }
-                    let nb_st = writes
-                        .get(&nb)
-                        .copied()
-                        .unwrap_or_else(|| scene_state(scene, nb.0, nb.1, nb.2, reg));
+                    let nb_st = target.get_world(nb, reg);
                     if reg.fluid_name(nb_st) == "minecraft:water" {
                         found_source = true;
                         break;
@@ -2457,7 +2785,7 @@ fn place_single_or_legacy(
                 }
                 if found_source && can_place_water_liquid(reg, st) {
                     let wl = reg.with_prop(st, "waterlogged", "true");
-                    writes.insert(p, wl);
+                    target.set_world(p, wl);
                     changed = true;
                 } else {
                     next_pending.push(p);
@@ -2471,8 +2799,8 @@ fn place_single_or_legacy(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn place_element(
-    repo: &mut DatapackRepo,
+fn place_element<D: JigsawData>(
+    repo: &mut D,
     element: &PoolElement,
     piece_pos: Pos,
     start_center: Pos,
@@ -2480,10 +2808,8 @@ fn place_element(
     clip: BBox,
     piece_ls: LiquidSettings,
     world_seed: i64,
-    scene: &str,
-    writes: &mut HashMap<Pos, u32>,
+    target: &mut JigsawTarget<'_, '_>,
     rng: &mut Xor,
-    gen: &mut crate::worldgen::Gen,
     reg: &BReg,
 ) -> Result<(), String> {
     match element {
@@ -2506,8 +2832,7 @@ fn place_element(
             clip,
             piece_ls,
             world_seed,
-            scene,
-            writes,
+            target,
             rng,
             reg,
         ),
@@ -2529,45 +2854,54 @@ fn place_element(
             clip,
             piece_ls,
             world_seed,
-            scene,
-            writes,
+            target,
             rng,
             reg,
         ),
-        PoolElement::Feature { feature, .. } => {
-            let mut ctx = FC::new(gen);
-            ctx.test_default_air = true;
-            ctx.test_biome("minecraft:plains");
-            let r = 16;
-            for x in (piece_pos.0 - r)..=(piece_pos.0 + r) {
-                for z in (piece_pos.2 - r)..=(piece_pos.2 + r) {
-                    let top = scene_height(scene, x, z);
-                    ctx.test_frozen_height(HeightmapKind::WorldSurfaceWg, x, z, top);
-                    ctx.test_frozen_height(HeightmapKind::OceanFloorWg, x, z, top);
-                    let y_lo = (top - 8).min(piece_pos.1 - 8).max(MIN_Y);
-                    let y_hi = (top + 2).max(piece_pos.1 + 8).min(MAX_Y_EXCL - 1);
-                    for y in y_lo..=y_hi {
-                        let st = scene_state(scene, x, y, z, reg);
-                        if st != 0 {
-                            ctx.test_base_cell((x, y, z), st);
+        PoolElement::Feature { feature, .. } => match target {
+            #[cfg(test)]
+            JigsawTarget::Scene { scene, writes, gen } => {
+                let mut ctx = FC::new(*gen);
+                ctx.test_default_air = true;
+                ctx.test_biome("minecraft:plains");
+                let r = 16;
+                for x in (piece_pos.0 - r)..=(piece_pos.0 + r) {
+                    for z in (piece_pos.2 - r)..=(piece_pos.2 + r) {
+                        let top = scene_height(scene, x, z);
+                        ctx.test_frozen_height(HeightmapKind::WorldSurfaceWg, x, z, top);
+                        ctx.test_frozen_height(HeightmapKind::OceanFloorWg, x, z, top);
+                        let y_lo = (top - 8).min(piece_pos.1 - 8).max(MIN_Y);
+                        let y_hi = (top + 2).max(piece_pos.1 + 8).min(MAX_Y_EXCL - 1);
+                        for y in y_lo..=y_hi {
+                            let st = scene_state(scene, x, y, z, reg);
+                            if st != 0 {
+                                ctx.test_base_cell((x, y, z), st);
+                            }
                         }
                     }
                 }
-            }
-            for (&p, &st) in writes.iter() {
-                if (p.0 - piece_pos.0).abs() <= r && (p.2 - piece_pos.2).abs() <= r {
-                    ctx.wr.insert(p, st);
+                for (&p, &st) in writes.iter() {
+                    if (p.0 - piece_pos.0).abs() <= r && (p.2 - piece_pos.2).abs() <= r {
+                        ctx.wr.insert(p, st);
+                    }
                 }
+                let ok = gen_placed_feature_by_name(feature, &mut ctx, rng, piece_pos);
+                if !ok {
+                    return Err(format!("unknown placed feature in FeaturePoolElement: {feature}"));
+                }
+                for (p, st) in ctx.wr {
+                    writes.insert(p, st);
+                }
+                Ok(())
             }
-            let ok = super::gen_placed_feature_by_name(feature, &mut ctx, rng, piece_pos);
-            if !ok {
-                return Err(format!("unknown placed feature in FeaturePoolElement: {feature}"));
+            JigsawTarget::Live(ctx) => {
+                let ok = gen_placed_feature_by_name(feature, *ctx, rng, piece_pos);
+                if !ok {
+                    return Err(format!("unknown placed feature in FeaturePoolElement: {feature}"));
+                }
+                Ok(())
             }
-            for (p, st) in ctx.wr {
-                writes.insert(p, st);
-            }
-            Ok(())
-        }
+        },
         PoolElement::List { elements, .. } => {
             for sub in elements {
                 place_element(
@@ -2579,10 +2913,8 @@ fn place_element(
                     clip,
                     piece_ls,
                     world_seed,
-                    scene,
-                    writes,
+                    target,
                     rng,
-                    gen,
                     reg,
                 )?;
             }
@@ -2591,6 +2923,49 @@ fn place_element(
     }
 }
 
+pub(crate) fn place_jigsaw_chunk_live(
+    ctx: &mut FC<'_>,
+    pieces: &[JigsawPiece],
+    world_seed: i64,
+    rng: &mut Xor,
+    clip: BBox,
+    reg: &BReg,
+) -> Result<(), String> {
+    if pieces.is_empty() {
+        return Ok(());
+    }
+    let Some(defs) = live_jigsaw_defs(reg) else {
+        return Err("jigsaw definitions failed to load".into());
+    };
+    let mut repo = LiveJigsawRepo(defs);
+    let first_bb = pieces[0].bb;
+    let start_center = (
+        first_bb[0] + (first_bb[3] - first_bb[0] + 1) / 2,
+        first_bb[1],
+        first_bb[2] + (first_bb[5] - first_bb[2] + 1) / 2,
+    );
+    let mut target = JigsawTarget::Live(ctx);
+    for piece in pieces {
+        if jigsaw_bb_intersects(piece.bb, clip) {
+            place_element(
+                &mut repo,
+                &piece.element,
+                piece.pos,
+                start_center,
+                piece.rot,
+                clip,
+                piece.liquid_settings,
+                world_seed,
+                &mut target,
+                rng,
+                reg,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn decoration_rng(seed: i64, cx: i32, cz: i32) -> Xor {
     let mut r = Xor::seed_worldgen(seed as u64);
     let l = r.next_i64_legacy() | 1;
@@ -2601,9 +2976,10 @@ fn decoration_rng(seed: i64, cx: i32, cz: i32) -> Xor {
     Xor::seed_worldgen(deco as u64)
 }
 
+#[cfg(test)]
 fn place_chunk(
     repo: &mut DatapackRepo,
-    pieces: &[Piece],
+    pieces: &[JigsawPiece],
     world_seed: i64,
     cx: i32,
     cz: i32,
@@ -2620,9 +2996,14 @@ fn place_chunk(
     );
     let mut rng = decoration_rng(world_seed, cx, cz);
     let mut writes: HashMap<Pos, u32> = HashMap::new();
+    let mut target = JigsawTarget::Scene {
+        scene,
+        writes: &mut writes,
+        gen,
+    };
 
     for piece in pieces {
-        if bb_intersects(piece.bb, clip) {
+        if jigsaw_bb_intersects(piece.bb, clip) {
             place_element(
                 repo,
                 &piece.element,
@@ -2632,10 +3013,8 @@ fn place_chunk(
                 clip,
                 piece.liquid_settings,
                 world_seed,
-                scene,
-                &mut writes,
+                &mut target,
                 &mut rng,
-                gen,
                 reg,
             )?;
         }
@@ -2653,8 +3032,9 @@ fn place_chunk(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod jigsaw_structures {
+    pub(crate) mod tests {
+        use super::super::*;
 
     #[test]
     fn jigsaw_datapacks_parse_without_losses() {
@@ -2700,7 +3080,7 @@ mod tests {
         let mut gen = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen load");
 
         let tsv = include_str!("../tests/data/jigsaw_structures_1211.tsv");
-        let mut current_case: Option<(String, i64, String, Vec<Piece>)> = None;
+        let mut current_case: Option<(String, i64, String, Vec<JigsawPiece>)> = None;
         let mut rows = 0usize;
         let mut mismatches = Vec::new();
 
@@ -2806,5 +3186,6 @@ mod tests {
             mismatches.len(),
             mismatches.join("\n")
         );
+    }
     }
 }

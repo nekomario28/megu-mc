@@ -98,6 +98,27 @@ impl<'a> FC<'a> {
             test_writes: None,
         }
     }
+    pub(crate) fn push_loot_container(
+        &mut self,
+        pos: (i32, i32, i32),
+        is_furnace: bool,
+        loot_table: String,
+        loot_seed: Option<i64>,
+    ) {
+        let kind = if is_furnace {
+            crate::generation_payload::ContainerKind::Furnace
+        } else {
+            crate::generation_payload::ContainerKind::Chest
+        };
+        self.payloads.push((
+            pos,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                kind,
+                loot_table,
+                loot_seed,
+            },
+        ));
+    }
     pub(crate) fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {
         if let Some(&s) = self.wr.get(&(x, y, z)) {
             return s;

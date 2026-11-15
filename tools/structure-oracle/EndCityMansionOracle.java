@@ -481,10 +481,7 @@ public final class EndCityMansionOracle {
             @SuppressWarnings("unchecked")
             Optional<Object> stubOpt = (Optional<Object>) structureC.getMethod("b", genCtxC).invoke(structure, gctx);
             long genProbe = NativeHarness.rngState(genCtxC.getMethod("f").invoke(gctx));
-            // `layout` rows carry the same column count but leave the placement
-            // columns at their zero value: the mansion's layout is pinned, its
-            // block placement is not (see the comment by the row writer).
-            String rowKind = kind.equals("mansion") ? "layout" : "end_city";
+            String rowKind = kind;
             if (stubOpt.isEmpty()) {
                 outRows.add(String.join("\t", rowKind, id, "0", "none", "0", "none", "0", "none",
                         "0", "none", "0", "none", String.valueOf(genProbe), "0"));
@@ -553,19 +550,6 @@ public final class EndCityMansionOracle {
                         box, String.valueOf(rotation), String.valueOf(mirror), String.valueOf(genDepth)));
             }
             String geometry = hash(gb.toByteArray());
-            if (kind.equals("mansion")) {
-                // The mansion's block placement is not asserted by the fixture:
-                // its templates place `cobblestone_wall`s whose side properties
-                // the shared bounded `WallBlock` rule cannot reproduce at piece
-                // boundaries (measured: 112 of 78 123 cells for seed 1, all
-                // `north`/`south` = `none` where native has `low`). The row
-                // records the layout contract the port does match: admission, the
-                // stub position, the whole piece tree and the generation stream.
-                outRows.add(String.join("\t", "layout", id, "1",
-                        stubXyz[0] + "," + stubXyz[1] + "," + stubXyz[2],
-                        String.valueOf(pieces.size()), geometry, "0", "none", "0", "none",
-                        "0", "none", String.valueOf(genProbe), "0"));
-            }
 
             World world = new World(terrain, worldSeed, warmBiomeHolder, 999L);
             Object postRng = NativeHarness.rng(c.get("post_seed").getAsLong());
@@ -592,11 +576,9 @@ public final class EndCityMansionOracle {
             for (var entry : sortedBe(world).entrySet()) {
                 outRows.add(String.join("\t", "be", id, entry.getKey(), entry.getValue()));
             }
-            if (!kind.equals("mansion")) {
-                outRows.add(worldRow(rowKind, id, 1,
-                        stubXyz[0] + "," + stubXyz[1] + "," + stubXyz[2],
-                        pieces.size(), geometry, world, genProbe, postProbe));
-            }
+            outRows.add(worldRow(rowKind, id, 1,
+                    stubXyz[0] + "," + stubXyz[1] + "," + stubXyz[2],
+                    pieces.size(), geometry, world, genProbe, postProbe));
         }
         Files.write(outputPath, outRows, StandardCharsets.UTF_8);
         System.out.println("native end city / mansion: " + outRows.size() + " rows");
