@@ -2248,6 +2248,44 @@ check "stronghold small-door iron door keeps the block default facing" \
   '                let lower = state(self.reg, "minecraft:iron_door", &[("facing", "east")]);' \
   mineshaft_piece::stronghold_tests::stronghold_layouts_and_writes_match_all_1211_native_oracle_vectors
 
+# bonus_chest (`ebo`). The feature is a shuffled walk, one heightmap read per cell, a
+# chest plus one `nextLong`, and four torch attempts; each of those is a separate
+# sentence in the native body, so each gets its own mutant.
+
+check "bonus chest shuffles the chunk's X list before the Z list" \
+  src/feature.rs '    feature_util_shuffle(&mut xs, rng);
+    feature_util_shuffle(&mut zs, rng);' \
+  '    feature_util_shuffle(&mut zs, rng);
+    feature_util_shuffle(&mut xs, rng);' \
+  feature::generation_contract_tests::bonus_chest_places_chest_loot_seed_and_supported_torches
+
+check "bonus chest reads the no-leaves heightmap" \
+  src/feature.rs 'let y = ctx.heightmap(HeightmapKind::MotionBlockingNoLeaves, x, z);' \
+  'let y = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);' \
+  feature::generation_contract_tests::bonus_chest_skips_a_collision_shape_and_accepts_a_plant
+
+check "bonus chest's cell test is an empty collision shape, not a missing one" \
+  src/feature.rs 'if !(reg.is_air(cur) || reg.collision_boxes(cur).next().is_none()) {' \
+  'if !(reg.is_air(cur) || reg.collision_boxes(cur).next().is_some()) {' \
+  feature::generation_contract_tests::bonus_chest_skips_a_collision_shape_and_accepts_a_plant
+
+check "bonus chest reads the support cell below each torch, not two below" \
+  src/feature.rs '                let below = ctx.get(x + dx, y - 1, z + dz);' \
+  '                let below = ctx.get(x + dx, y - 2, z + dz);' \
+  feature::generation_contract_tests::bonus_chest_places_chest_loot_seed_and_supported_torches
+
+check "bonus chest spends one nextLong on the spawn-bonus loot seed" \
+  src/feature.rs '            let loot_seed = rng.next_i64();' \
+  '            let loot_seed = 0;' \
+  feature::generation_contract_tests::bonus_chest_places_chest_loot_seed_and_supported_torches
+
+check "bonus chest refuses a chest outside the build height" \
+  src/feature.rs '            if ctx.out_of_h(y) {
+                // A column filled to the build limit' \
+  '            if false {
+                // A column filled to the build limit' \
+  feature::generation_contract_tests::bonus_chest_writes_nothing_when_the_heightmap_is_outside_the_world
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

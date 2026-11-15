@@ -170,10 +170,39 @@ Two nether vine features are ported the same way. `twisting_vines` (`edr`) match
 nylium, warped wart block and the refusal cases), the height draws (`nextInt(6)`
 doubling, `nextInt(5)` collapsing to one) and the age property.
 
-Remaining unsupported configured-feature identities are explicit in the parser
-inventory tests in `src/generation_contract_tests.rs`. Run the actual recursive
-parsers as well as `tools/feature_type_coverage.py`: an outer dispatch arm cannot
-prove that its children, providers or placement modifiers execute.
+`minecraft:bonus_chest` (`ebo`, `BonusChestFeature`) closes the configured-feature
+identity list: the parser inventory test now asserts that no configured feature the
+pack names parses as `Cf::Unknown`. Three scripted worlds pin it. The first is the draw
+order and the four effects — `Util.toShuffledList` over `rangeClosed(minBlockX,
+maxBlockX)` then the same over Z (30 `nextInt` draws before any read), the shuffled
+cross product with X outermost, `MOTION_BLOCKING_NO_LEAVES` for the surface, the
+`isEmptyBlock || collision shape isEmpty` cell test, one `nextLong` for
+`minecraft:chests/spawn_bonus_chest`, and a torch on each horizontal neighbour whose
+support cell passes the face test. The second shows the two halves of the cell test
+disagree with the obvious guesses: a leaf block sits *at* the no-leaves heightmap cell
+(leaves are excluded from that heightmap) and has a collision shape, so the walk skips
+it, while a grass plant also sits at its column's heightmap cell but has no collision
+shape and is replaced by the chest. The third is a column filled to the build limit: the
+first free cell is outside the world, where the native `setBlock` is refused, so the chest
+and its `nextLong` both disappear while the walk still ends. Six mutants are gates:
+swapping the two shuffles, reading `MOTION_BLOCKING` instead of
+`MOTION_BLOCKING_NO_LEAVES`, inverting the empty collision test, reading the support cell
+two below the torch, dropping the `nextLong`, and removing the out-of-world guard. The loot-seed draw is native-verified rather than assumed: `WorldGenRegion
+.setBlock` leaves a `DUMMY` block-entity tag for a new block-entity state
+(`arb.a(jd,dtc,int,int)`), so the `instanceof RandomizableContainer` guard in
+`bqz.a(dcc,ayw,jd,akq)` passes and the seed is spent instead of skipped. Its limits:
+the scenes are scripted, not native-oracle fixtures (`tools/feature_oracles.py` names a
+`bonus_chest` fixture, but `BonusChestOracle` and `tests/data/bonus_chest_1211.tsv` are
+not written yet), the torch support is the pinned full UP face while
+vanilla asks with `SupportType.CENTER` — they differ only for a support whose 2x2
+centre column covers the face, which no generated bonus-chest surface is — and the
+`chests/spawn_bonus_chest` loot table is not in the exported pack, so the payload
+records the table and seed without its contents.
+
+Configured-feature identity is now complete, which is not the same as behavioural
+coverage: run the actual recursive parsers as well as `tools/feature_type_coverage.py`,
+because an outer dispatch arm cannot prove that its children, providers or placement
+modifiers execute.
 
 Next consumers: general template placement and neighbor effects, remaining processors, jigsaw and structure-start pipelines; all reachable
 feature implementations and their full-chunk interactions;

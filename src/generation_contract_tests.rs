@@ -426,10 +426,11 @@ fn pinned_configured_features_parse_except_explicit_unimplemented_types() {
         "unparsed configured features: {unparsed:?}"
     );
     unimplemented.sort();
-    assert_eq!(
-        unimplemented,
-        ["minecraft:bonus_chest"],
-        "unexpected parser losses (or resolved exceptions; remove them above)"
+    // The last gap here was `minecraft:bonus_chest`; every type the pack names now has a
+    // dispatch arm, so this is the inventory of identities rather than of behaviour.
+    assert!(
+        unimplemented.is_empty(),
+        "unimplemented configured features: {unimplemented:?}"
     );
 }
 
@@ -5102,4 +5103,260 @@ fn end_spike_matches_native_oracle() {
         tested += 1;
     }
     assert_eq!(tested, 37);
+}
+
+/// The walk `BonusChestFeature` takes over the origin chunk, recomputed from `nextInt`
+/// draws alone: two `Util.toShuffledList` passes (X first, then Z) before any read, then
+/// the cross product with X outermost. The loot seed is the `nextLong` after that walk.
+fn bonus_chest_walk(seed: u64, cx: i32, cz: i32) -> (Vec<(i32, i32)>, i64) {
+    let mut probe = Xor::seed(seed);
+    let mut xs: Vec<i32> = (cx * 16..cx * 16 + 16).collect();
+    let mut zs: Vec<i32> = (cz * 16..cz * 16 + 16).collect();
+    for list in [&mut xs, &mut zs] {
+        for i in (1..list.len()).rev() {
+            let j = probe.next_bound(i as i32 + 1) as usize;
+            list.swap(i, j);
+        }
+    }
+    let mut walk = Vec::with_capacity(256);
+    for &x in &xs {
+        for &z in &zs {
+            walk.push((x, z));
+        }
+    }
+    (walk, probe.next_i64())
+}
+
+/// A scripted flat chunk: stone at `y = 64` over all 16x16 columns of chunk (0,0), so
+/// every column has a `MOTION_BLOCKING_NO_LEAVES` surface and the walk never leaves it.
+fn bonus_chest_floor(ctx: &mut FC) {
+    let stone = breg().unwrap().state_of("minecraft:stone", None);
+    for x in 0..16 {
+        for z in 0..16 {
+            ctx.set(x, 64, z, stone);
+        }
+    }
+}
+
+/// `minecraft:bonus_chest` (`ebo`, `BonusChestFeature`), config `{}`.
+///
+/// The contract is the draw order plus three effects, so all four are pinned here:
+/// the chest lands on the *shuffled* first cell of the origin chunk (not the origin, not
+/// the lowest x/z), `RandomizableContainer.setBlockEntityLootTable` spends exactly one
+/// `nextLong` on `minecraft:chests/spawn_bonus_chest`, the four horizontal neighbours get
+/// a torch where `torch.canSurvive` holds, and one of them loses it when its support cell
+/// is air — which is the only thing the native body asks (`canSurvive`), not whether the
+/// torch's own cell is empty.
+#[test]
+fn bonus_chest_places_chest_loot_seed_and_supported_torches() {
+    let reg = breg().unwrap();
+    let air = reg.state_of("minecraft:air", None);
+    let chest = reg.state_of("minecraft:chest", None);
+    let torch = reg.state_of("minecraft:torch", None);
+    const SEED: u64 = 11;
+    // origin inside chunk (0,0); the origin itself is not where the chest goes
+    let (walk, loot_seed) = bonus_chest_walk(SEED, 0, 0);
+    let (x, z) = walk[0];
+
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    ctx.test_no_terrain = true;
+    ctx.test_default_air = true;
+    bonus_chest_floor(&mut ctx);
+    // east neighbour of the first cell: no support, so its torch must not appear
+    ctx.set(x + 1, 64, z, air);
+    ctx.test_writes = Some(Vec::new());
+
+    let mut rng = Xor::seed(SEED);
+    gen_cf(&Cf::BonusChest, freg(), &mut ctx, &mut rng, (5, 70, 5));
+
+    let at = |ctx: &mut FC, p: (i32, i32, i32)| ctx.get(p.0, p.1, p.2);
+    assert_eq!(
+        at(&mut ctx, (x, 65, z)),
+        chest,
+        "the chest takes the first walked cell"
+    );
+    assert_eq!(at(&mut ctx, (x, 66, z)), air, "and nothing above it");
+    assert_eq!(
+        at(&mut ctx, (x + 1, 65, z)),
+        air,
+        "no torch without a support below"
+    );
+    for (dx, dz, name) in [(0, -1, "north"), (0, 1, "south"), (-1, 0, "west")] {
+        assert_eq!(
+            at(&mut ctx, (x + dx, 65, z + dz)),
+            torch,
+            "the {name} neighbour stands on the floor, so it gets a torch"
+        );
+    }
+    // `ctx.test_writes` records just the feature's own writes: chest + three torches.
+    let writes = ctx.test_writes.clone().unwrap();
+    assert_eq!(
+        writes.len(),
+        4,
+        "one chest and three supported torches: {writes:?}"
+    );
+
+    // the loot table and the seed it was given: one nextLong after the two shuffles
+    assert_eq!(ctx.payloads.len(), 1, "exactly one payload");
+    match &ctx.payloads[0].1 {
+        crate::generation_payload::GenerationPayload::LootContainer {
+            kind,
+            loot_table,
+            loot_seed: seeded,
+        } => {
+            assert_eq!(*kind, crate::generation_payload::ContainerKind::Chest);
+            assert_eq!(loot_table, "minecraft:chests/spawn_bonus_chest");
+            assert_eq!(
+                *seeded,
+                Some(loot_seed),
+                "the seed is the nextLong after the walk"
+            );
+        }
+        other => panic!("the chest payload is a loot container, not {other:?}"),
+    }
+    assert_eq!(
+        ctx.payloads[0].0,
+        (x, 65, z),
+        "the payload sits on the chest"
+    );
+
+    // the stream then continues one nextLong after the walk, and not a draw further
+    let mut control = Xor::seed(SEED);
+    for _ in 0..2 {
+        for i in (1..16).rev() {
+            let _ = control.next_bound(i as i32 + 1);
+        }
+    }
+    assert_eq!(control.next_i64(), loot_seed, "the 30 draws, then the seed");
+    assert_eq!(
+        rng.next_bound(1 << 30),
+        control.next_bound(1 << 30),
+        "one nextLong, no more"
+    );
+}
+
+/// The cell test is `isEmptyBlock(pos) || getCollisionShape(level, pos).isEmpty()`, and
+/// the heightmap is `MOTION_BLOCKING_NO_LEAVES`: a leaf block above the floor is *at* the
+/// heightmap cell (leaves are excluded from that heightmap) and has a collision shape, so
+/// the walk skips it; a plant is at its column's heightmap cell too (grass does not block
+/// motion) but has no collision shape, so the chest replaces it. A port that read
+/// `MOTION_BLOCKING` would put the chest one cell higher, and a port that tested only
+/// `isEmptyBlock` would place it in the leaves.
+#[test]
+fn bonus_chest_skips_a_collision_shape_and_accepts_a_plant() {
+    let reg = breg().unwrap();
+    let leaves = reg.state_of("minecraft:oak_leaves", None);
+    let grass = reg.state_of("minecraft:short_grass", None);
+    let chest = reg.state_of("minecraft:chest", None);
+    // A seed whose first two walked cells are not adjacent: the torch pass reads the four
+    // neighbours of the chest, so a blocked cell next to it would be overwritten by a torch
+    // and the "skipped" assertion would be testing the torch rule instead of this one.
+    let (seed, blocked, accepted, loot_seed) = (0u64..64)
+        .find_map(|seed| {
+            let (walk, loot_seed) = bonus_chest_walk(seed, 0, 0);
+            let (first, second) = (walk[0], walk[1]);
+            let apart = (first.0 - second.0).abs() + (first.1 - second.1).abs() > 1;
+            apart.then_some((seed, first, second, loot_seed))
+        })
+        .expect("a seed whose first two walked cells are far apart");
+
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    ctx.test_no_terrain = true;
+    ctx.test_default_air = true;
+    bonus_chest_floor(&mut ctx);
+    ctx.set(blocked.0, 65, blocked.1, leaves);
+    ctx.set(accepted.0, 65, accepted.1, grass);
+    ctx.test_writes = Some(Vec::new());
+
+    let mut rng = Xor::seed(seed);
+    gen_cf(&Cf::BonusChest, freg(), &mut ctx, &mut rng, (5, 70, 5));
+
+    assert_eq!(
+        ctx.get(blocked.0, 65, blocked.1),
+        leaves,
+        "a leaf block has a collision shape, so the walk skips its cell"
+    );
+    assert_eq!(
+        ctx.get(accepted.0, 65, accepted.1),
+        chest,
+        "a plant has no collision shape, so the chest takes its cell"
+    );
+    assert_eq!(
+        ctx.test_writes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|(_, st)| *st == chest)
+            .count(),
+        1,
+        "exactly one chest"
+    );
+    let seeded = ctx
+        .payloads
+        .iter()
+        .find_map(|(_, p)| match p {
+            crate::generation_payload::GenerationPayload::LootContainer { loot_seed, .. } => {
+                Some(*loot_seed)
+            }
+            _ => None,
+        })
+        .expect("the placed chest carries a loot payload");
+    assert_eq!(seeded, Some(loot_seed));
+}
+
+/// A column filled to the build limit puts the first free heightmap cell outside the
+/// world, and `WorldGenRegion.setBlock` refuses that y before it writes or leaves a
+/// `DUMMY` block entity — so the chest and its `nextLong` both disappear while the walk
+/// still ends. Without the guard the port writes a chest at `min_y + height` and spends
+/// the seed, which is visible here as writes and as a shifted stream.
+#[test]
+fn bonus_chest_writes_nothing_when_the_heightmap_is_outside_the_world() {
+    const SEED_MAX: u64 = 4096;
+    let full = (0, 0);
+    let seed = (0u64..SEED_MAX)
+        .find(|&seed| bonus_chest_walk(seed, 0, 0).0[0] == full)
+        .expect("a seed whose first walked cell is (0,0)");
+
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    ctx.test_no_terrain = true;
+    ctx.test_default_air = true;
+    let top = ctx.g.min_y + ctx.g.height - 1;
+    ctx.set(full.0, top, full.1, stone);
+    assert_eq!(
+        ctx.heightmap(
+            crate::block_registry::HeightmapKind::MotionBlockingNoLeaves,
+            full.0,
+            full.1
+        ),
+        top + 1,
+        "the first free cell of a full column is outside the build height"
+    );
+    ctx.test_writes = Some(Vec::new());
+
+    let mut rng = Xor::seed(seed);
+    gen_cf(&Cf::BonusChest, freg(), &mut ctx, &mut rng, (5, 70, 5));
+
+    assert!(
+        ctx.test_writes.as_ref().unwrap().is_empty(),
+        "an out-of-world cell takes no write: {:?}",
+        ctx.test_writes
+    );
+    assert!(ctx.payloads.is_empty(), "and no loot-container payload");
+    // the two shuffles ran; the loot seed did not
+    let mut control = Xor::seed(seed);
+    for _ in 0..2 {
+        for i in (1..16).rev() {
+            let _ = control.next_bound(i as i32 + 1);
+        }
+    }
+    assert_eq!(
+        rng.next_bound(1 << 30),
+        control.next_bound(1 << 30),
+        "no nextLong was spent, so the next draw is the shuffles' successor"
+    );
 }

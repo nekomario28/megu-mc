@@ -345,6 +345,13 @@ enum Cf {
         radius: i32,
     },
     FreezeTop,
+    /// `minecraft:bonus_chest` (`ebo`, `BonusChestFeature`), config `{}`.
+    ///
+    /// A one-shot scan of the origin chunk's 16x16 for the first cell that is air or has an
+    /// empty collision shape at `MOTION_BLOCKING_NO_LEAVES`, a chest with the spawn-bonus loot
+    /// table there, and a torch on each horizontal neighbour whose support can hold one.
+    /// Both coordinate lists are shuffled first, so the cell is the fixture, not the origin.
+    BonusChest,
     Multiface(Box<MultifaceCfg>),
     Bamboo(f32),
     Vines,
@@ -2233,8 +2240,10 @@ fn random_tag_block(reg: &BReg, tag: &str, rng: &mut Xor) -> Option<u32> {
 }
 
 /// `Util.shuffle(list, random)`: Fisher-Yates from the end, `nextInt(i)` for i = size..2, so
-/// the last element is never drawn for. Both the coral plane shuffle and the claw's
-/// `shuffledCopy(Stream)` go through this.
+/// the last element is never drawn for. The coral plane shuffle, the claw's
+/// `shuffledCopy(Stream)`, the multiface spread order and the bonus chest's two
+/// `Util.toShuffledList` passes over the origin chunk's coordinate ranges all go through
+/// this, because the number and order of those draws is itself a fixture.
 fn feature_util_shuffle<T>(list: &mut [T], rng: &mut Xor) {
     for i in (2..=list.len()).rev() {
         let j = rng.next_bound(i as i32) as usize;
@@ -3395,7 +3404,7 @@ fn spc_vein_can_spread(
         let (ox, oy, oz) = dir_off(dir ^ 1);
         let side = (pos.0 + ox, pos.1 + oy, pos.2 + oz);
         let side_st = ctx.get(side.0, side.1, side.2);
-        if spc_face_sturdy(reg, side_st, dir) {
+        if face_sturdy(reg, side_st, dir) {
             return false;
         }
     }
@@ -3560,10 +3569,12 @@ fn spc_decay_delay(kind: SpcKind, delay: i32) -> i32 {
     }
 }
 
-/// `BlockState.isFaceSturdy(level, pos, dir)`, from the asset's own side flags. Full cubes are
-/// exact; a partial shape would need the collision shape. The deep-dark scenes only contain
-/// full cubes, air, water and the sculk family.
-fn spc_face_sturdy(reg: &BReg, st: u32, dir: u8) -> bool {
+/// `BlockState.isFaceSturdy(level, pos, dir)` (the default `SupportType.FULL`), from the
+/// asset's own per-state side flags. Full cubes are exact; a partial shape would need the
+/// collision shape, which is the separate `SupportType.CENTER` question the callers that
+/// ask with `canSupportCenter` would need. Shared by the sculk cursor, the block pile's
+/// `tryPlaceBlock` and the bonus chest's torches, so it carries no single feature's name.
+fn face_sturdy(reg: &BReg, st: u32, dir: u8) -> bool {
     reg.is_solid(st) && reg.side_solid(st, dir as usize)
 }
 
@@ -3637,7 +3648,7 @@ fn spc_cursor_can_spread(
         let (ox, oy, oz) = dir_off(dir);
         let p = (from.0 + ox, from.1 + oy, from.2 + oz);
         let st = ctx.get(p.0, p.1, p.2);
-        !spc_face_sturdy(reg, st, dir ^ 1)
+        !face_sturdy(reg, st, dir ^ 1)
     };
     if dx == 0 {
         open(axis_dir(dy, 0, 1)) || open(axis_dir(dz, 2, 3))
@@ -3679,7 +3690,7 @@ fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
     for d in 0..6u8 {
         let (dx, dy, dz) = dir_off(d);
         let nb = ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz);
-        if spc_face_sturdy(reg, nb, d ^ 1) {
+        if face_sturdy(reg, nb, d ^ 1) {
             return true;
         }
     }
@@ -3728,7 +3739,7 @@ fn gen_sculk_patch(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &SculkP
         );
         if reg.is_air(ctx.get(p.0, p.1, p.2)) {
             let below = ctx.get(p.0, p.1 - 1, p.2);
-            if spc_face_sturdy(reg, below, 1) {
+            if face_sturdy(reg, below, 1) {
                 let st = reg.with_prop(
                     reg.state_of("minecraft:sculk_shrieker", None),
                     "can_summon",
@@ -4200,6 +4211,78 @@ fn gen_end_platform(ctx: &mut FC, pos: (i32, i32, i32)) {
                     ctx.set(x, y, z, want);
                 }
             }
+        }
+    }
+}
+
+/// `BonusChestFeature` (`ebo`), config `{}`. See [`Cf::BonusChest`].
+///
+/// Read from `ebo.a(ecg)` in the pinned jar. The scan runs over the **origin's own
+/// chunk** (`new ChunkPos(context.origin())`), and both coordinate lists are shuffled
+/// before the first heightmap read — `Util.toShuffledList(rangeClosed(minBlockX,
+/// maxBlockX))` for X, then the same for Z — so 30 `nextInt` draws precede any read,
+/// and the walk is the shuffled cross product with X outermost.
+///
+/// A cell is usable when `isEmptyBlock(pos) || getCollisionShape(level, pos).isEmpty()`,
+/// which is why a plant (no collision shape) does not stop the chest while a leaf
+/// block, which `MOTION_BLOCKING_NO_LEAVES` does not count as a surface, does.
+/// The chest is written in its default state — there is no orientation pass — and
+/// `RandomizableContainer.setBlockEntityLootTable` then draws one `nextLong`. That
+/// draw happens because `WorldGenRegion.setBlock` leaves a `DUMMY` block-entity tag
+/// for the new state (`arb.a(jd,dtc,int,int)`), and `WorldGenRegion.getBlockEntity`
+/// materialises the chest from it, so the `instanceof RandomizableContainer` guard
+/// in `bqz.a(dcc,ayw,jd,akq)` passes rather than skipping the seed.
+///
+/// The torches are **not** gated on the neighbour being empty: the native body asks
+/// only `torch.canSurvive(level, pos)` — `canSupportCenter(level, pos.below(), UP)` —
+/// and writes over whatever sits there. The support test is the pinned full UP face.
+/// Vanilla asks with `SupportType.CENTER`, which additionally accepts a support whose
+/// 2x2 centre column covers the face (a fence post); no generated bonus-chest surface
+/// is one, so the two predicates agree on every cell this feature reaches.
+fn gen_bonus_chest(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let (cx, cz) = (pos.0 >> 4, pos.2 >> 4);
+    let mut xs: Vec<i32> = (cx * 16..cx * 16 + 16).collect();
+    let mut zs: Vec<i32> = (cz * 16..cz * 16 + 16).collect();
+    feature_util_shuffle(&mut xs, rng);
+    feature_util_shuffle(&mut zs, rng);
+    let chest = reg.state_of("minecraft:chest", None);
+    let torch = reg.state_of("minecraft:torch", None);
+    // `Direction.Plane.HORIZONTAL` iterates north, east, south, west: the plane
+    // enum's `a` constant (`dcd`'s sibling `ji$c.a`) holds `{ji.c, ji.f, ji.d,
+    // ji.e}`, the direction enum's own order with the vertical halves dropped — not
+    // `ji.c..ji.f`. The four cells are independent, but the list is written in the
+    // native order rather than a remembered one.
+    const SIDES: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+    for &x in &xs {
+        for &z in &zs {
+            let y = ctx.heightmap(HeightmapKind::MotionBlockingNoLeaves, x, z);
+            if ctx.out_of_h(y) {
+                // A column filled to the build limit puts the first free cell outside the
+                // world. The native `setBlock` is refused there (`WorldGenRegion` checks
+                // `isOutsideBuildHeight` first), so no chest is written, no block entity
+                // exists to take the loot seed, and no torch survives - the walk still ends.
+                return;
+            }
+            let cur = ctx.get(x, y, z);
+            if !(reg.is_air(cur) || reg.collision_boxes(cur).next().is_none()) {
+                continue;
+            }
+            ctx.set(x, y, z, chest);
+            let loot_seed = rng.next_i64();
+            ctx.push_loot_container(
+                (x, y, z),
+                false,
+                "minecraft:chests/spawn_bonus_chest".to_owned(),
+                Some(loot_seed),
+            );
+            for (dx, dz) in SIDES {
+                let below = ctx.get(x + dx, y - 1, z + dz);
+                if face_sturdy(reg, below, 1) {
+                    ctx.set(x + dx, y, z + dz, torch);
+                }
+            }
+            return;
         }
     }
 }
@@ -5073,6 +5156,7 @@ fn p_cf(j: &J) -> Option<Cf> {
             height: jint(j, "spread_height", 0),
         },
         "monster_room" => Cf::MonsterRoom,
+        "bonus_chest" => Cf::BonusChest,
         "tree" => Cf::Tree(Box::new(crate::tree::p_tree(j)?)),
         "fallen_tree" => Cf::Fallen {
             trunk: p_bsp(js(j, "trunk_provider")?)?,
@@ -5989,12 +6073,6 @@ fn multiface_relative(p: (i32, i32, i32), d: u8) -> (i32, i32, i32) {
     let (x, y, z) = dir_off(d);
     (p.0 + x, p.1 + y, p.2 + z)
 }
-fn multiface_shuffle(dirs: &mut [u8], rng: &mut Xor) {
-    for i in (1..dirs.len()).rev() {
-        let j = rng.next_bound(i as i32 + 1) as usize;
-        dirs.swap(i, j);
-    }
-}
 fn multiface_property(d: u8) -> &'static str {
     ["down", "up", "north", "south", "west", "east"][d as usize]
 }
@@ -6031,7 +6109,7 @@ fn multiface_spread(
     from: u8,
 ) {
     let mut dirs = [0, 1, 2, 3, 4, 5];
-    multiface_shuffle(&mut dirs, rng);
+    feature_util_shuffle(&mut dirs, rng);
     for to in dirs {
         if to / 2 == from / 2
             || reg.get_prop(state, multiface_property(to)).as_deref() == Some("true")
@@ -6230,6 +6308,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
         }
         Cf::BasaltPillar => gen_basalt_pillar(ctx, rng, pos),
+        Cf::BonusChest => gen_bonus_chest(ctx, rng, pos),
         Cf::VoidStartPlatform => gen_void_start_platform(ctx, pos),
         Cf::EndPlatform => gen_end_platform(ctx, pos),
         Cf::EndGateway => gen_end_gateway(ctx, pos),
@@ -6950,7 +7029,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             rng.next_bool()
                         } else {
                             // `BlockStateBase.isFaceSturdy(level, below, Direction.UP)`
-                            spc_face_sturdy(reg, below, 1)
+                            face_sturdy(reg, below, 1)
                         };
                         if may_place_on {
                             let st = bsp.get(ctx, rng, x, y, z);
@@ -7283,14 +7362,14 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 return;
             }
             let mut dirs = cfg.dirs.clone();
-            multiface_shuffle(&mut dirs, rng);
+            feature_util_shuffle(&mut dirs, rng);
             if multiface_try(ctx, reg, rng, pos, cfg, &dirs) {
                 return;
             }
             for &d in &dirs {
                 let mut faces: Vec<_> =
                     cfg.dirs.iter().copied().filter(|v| *v != (d ^ 1)).collect();
-                multiface_shuffle(&mut faces, rng);
+                feature_util_shuffle(&mut faces, rng);
                 // ecw resets to origin + direction on EVERY iteration; it does
                 // not walk search_range blocks down the corridor.
                 let p = multiface_relative(pos, d);
