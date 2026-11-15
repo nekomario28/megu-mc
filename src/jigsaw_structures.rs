@@ -1455,6 +1455,13 @@ fn nbt_int(tag: &Tag, key: &str) -> Option<i32> {
     tag.get(key)?.int()
 }
 
+fn nbt_long(tag: &Tag, key: &str) -> Option<i64> {
+    match tag.get(key)? {
+        Tag::Long(value) => Some(*value),
+        _ => None,
+    }
+}
+
 fn jigsaws_can_attach(parent: &BlockInfo, cand: &BlockInfo, reg: &BReg) -> bool {
     let (p_front, p_top) = jigsaw_front_top(parent.state, reg);
     let (c_front, c_top) = jigsaw_front_top(cand.state, reg);
@@ -2447,6 +2454,12 @@ fn parse_final_state(raw: &str, reg: &BReg) -> Option<u32> {
     }
 }
 
+/// `RandomizableContainer` implementors among the placed states.
+///
+/// This is the *draw* list, not the store list: native `setBlockEntityLootTable` spends a
+/// `nextLong` for exactly these types, and a furnace is not one of them. `ContainerKind::for_block`
+/// therefore stays a separate list — a furnace has a store and draws nothing — because merging
+/// the two would either spend a draw the reference does not take or drop the furnace's contents.
 fn is_randomizable_container_be(name: &str) -> bool {
     matches!(
         name,
@@ -2722,29 +2735,47 @@ fn place_single_or_legacy<D: JigsawData>(
 
         if let Some(nbt) = info.nbt.as_ref() {
             let bname = reg.name_of(placed);
-            if is_randomizable_container_be(bname) {
-                let loot_seed = rng.next_i64_legacy();
-                if let JigsawTarget::Live(ctx) = &mut *target {
-                    if let Some(table) = nbt_str(nbt, "LootTable") {
-                        let table = ns_name(&table);
-                        let is_furnace = match bname {
-                            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
-                                Some(false)
+            let kind = crate::generation_context::ContainerKind::for_block(bname);
+            // `RandomizableContainer.setBlockEntityLootTable` consumes a `nextLong` only for a
+            // block entity that implements the interface, and which ones do is decided by the
+            // placed state, not by the template's tag. A furnace block entity is not a
+            // `RandomizableContainer` in 1.21.1, so it draws nothing; `then` keeps that draw
+            // out of the stream rather than spending it. The draw is taken for the same states
+            // and in the same order as before, which `tests/data/jigsaw_structures_1211.tsv`
+            // pins through its `rng_after` column.
+            let loot_seed = is_randomizable_container_be(bname).then(|| rng.next_i64_legacy());
+            let loot_table = nbt_str(nbt, "LootTable");
+            if let JigsawTarget::Live(ctx) = &mut *target {
+                if let Some(table) = loot_table {
+                    let table = ns_name(&table);
+                    // The store is decided BEFORE anything can refuse the state: a
+                    // furnace/blast_furnace/smoker carries its loot in `furnaces()`, so it must
+                    // not fall through the "no store for this kind" arm below it.
+                    match kind {
+                        Some(kind) => {
+                            let seed = loot_seed.or_else(|| nbt_long(nbt, "LootTableSeed"));
+                            ctx.push_loot_container(p, kind, table, seed);
+                        }
+                        None => {
+                            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                                eprintln!("SPIPE_PAYLOAD jigsaw {bname} @ {p:?} table={table}");
                             }
-                            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
-                                Some(true)
-                            }
-                            _ => None,
-                        };
-                        if let Some(is_furnace) = is_furnace {
-                            ctx.push_loot_container(p, is_furnace, table, Some(loot_seed));
-                        } else if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
-                            eprintln!("SPIPE_PAYLOAD jigsaw {bname} @ {p:?} table={table}");
                         }
                     }
-                }
-            } else if bname == "minecraft:spawner" {
-                if let JigsawTarget::Live(ctx) = &mut *target {
+                } else if kind.is_some() {
+                    // Container `Items` (bastion blast furnaces, village furnaces and chests).
+                    // `LootTable` wins over `Items` above because a container still holding a
+                    // table saves the table INSTEAD of its items; the decoder is the template
+                    // path's, so one owner reads both pipelines' container NBT.
+                    match Template::staged_payload(nbt, placed, reg) {
+                        Ok(payload) => ctx.payloads.push((p, payload)),
+                        Err(reason) => {
+                            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                                eprintln!("SPIPE_PAYLOAD jigsaw {bname} @ {p:?} refused: {reason}");
+                            }
+                        }
+                    }
+                } else if bname == "minecraft:spawner" {
                     let entity_id = nbt
                         .get("SpawnData")
                         .and_then(|d| d.get("entity"))
@@ -3083,6 +3114,189 @@ fn place_chunk(
 pub(crate) mod jigsaw_structures {
     pub(crate) mod tests {
         use super::super::*;
+
+    /// A one-block jigsaw piece of the given state and tag, placed into a live context.
+    ///
+    /// The template is injected into a repository with no datapack behind it, so the case does
+    /// not depend on which vanilla template happens to carry the shape it needs.
+    fn place_single_block_piece(
+        repo: &mut DatapackRepo,
+        id: &str,
+        state: u32,
+        nbt: Option<Tag>,
+        piece_pos: Pos,
+        seed: i64,
+        ctx: &mut FC<'_>,
+        rng: &mut Xor,
+        reg: &BReg,
+    ) -> Result<(), String> {
+        repo.templates.insert(
+            ns_name(id),
+            std::sync::Arc::new(Template {
+                size: (1, 1, 1),
+                palettes: vec![vec![BlockInfo {
+                    pos: (0, 0, 0),
+                    state,
+                    nbt,
+                }]],
+                entities: Vec::new(),
+            }),
+        );
+        let clip: BBox = [
+            piece_pos.0 - 1,
+            piece_pos.1 - 1,
+            piece_pos.2 - 1,
+            piece_pos.0 + 1,
+            piece_pos.1 + 1,
+            piece_pos.2 + 1,
+        ];
+        let mut target = JigsawTarget::Live(ctx);
+        place_single_or_legacy(
+            repo,
+            id,
+            &ProcessorRef::Named("minecraft:empty".to_owned()),
+            Projection::Rigid,
+            None,
+            false,
+            piece_pos,
+            piece_pos,
+            Rotation::None,
+            clip,
+            LiquidSettings::IgnoreWaterlogging,
+            seed,
+            &mut target,
+            rng,
+            reg,
+        )
+    }
+
+    fn empty_repo() -> DatapackRepo {
+        DatapackRepo {
+            structures: HashMap::new(),
+            pools: HashMap::new(),
+            processor_lists: HashMap::from([("minecraft:empty".to_owned(), Vec::new())]),
+            templates: HashMap::new(),
+        }
+    }
+
+    /// The container admission, read from the placed state: a piece's loot table reaches the
+    /// store the runtime reads for that block, and the furnace family (which the `LootTable`
+    /// match used to exclude, leaving its arm unreachable) is admitted before any refusal.
+    #[test]
+    fn jigsaw_container_states_reach_the_store_that_owns_them() {
+        use crate::generation_context::{ContainerKind, GenerationPayload};
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+
+        let loot_tag = |table: &str| {
+            Tag::Compound(BTreeMap::from([(
+                crate::nbt::NbtString::text("LootTable"),
+                Tag::String(crate::nbt::NbtString::text(table)),
+            )]))
+        };
+
+        for (name, expected) in [
+            ("minecraft:chest", ContainerKind::Chest),
+            ("minecraft:barrel", ContainerKind::Chest),
+            ("minecraft:shulker_box", ContainerKind::Chest),
+            ("minecraft:furnace", ContainerKind::Furnace),
+            ("minecraft:blast_furnace", ContainerKind::Furnace),
+            ("minecraft:smoker", ContainerKind::Furnace),
+            ("minecraft:dispenser", ContainerKind::BlockContainer(9)),
+            ("minecraft:dropper", ContainerKind::BlockContainer(9)),
+            ("minecraft:hopper", ContainerKind::BlockContainer(5)),
+            ("minecraft:decorated_pot", ContainerKind::BlockContainer(1)),
+        ] {
+            let mut repo = empty_repo();
+            let mut ctx = FC::new(&mut g);
+            ctx.test_default_air = true;
+            let mut rng = Xor::seed_worldgen(11);
+            place_single_block_piece(
+                &mut repo,
+                "spinetest:loot_piece",
+                reg.state_of(name, None),
+                Some(loot_tag("minecraft:chests/simple_dungeon")),
+                (0, 70, 0),
+                7,
+                &mut ctx,
+                &mut rng,
+                reg,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut fresh = Xor::seed_worldgen(11);
+            let expected_seed = match name {
+                // A furnace is not a `RandomizableContainer`, so it spends no draw.
+                "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => None,
+                _ => Some(fresh.next_i64_legacy()),
+            };
+            assert_eq!(
+                ctx.payloads,
+                vec![(
+                    (0, 70, 0),
+                    GenerationPayload::LootContainer {
+                        kind: expected,
+                        loot_table: "minecraft:chests/simple_dungeon".to_owned(),
+                        loot_seed: expected_seed,
+                    }
+                )],
+                "{name} must stage its loot table into the store that reads it"
+            );
+        }
+    }
+
+    /// Bastion blast furnaces and village furnaces carry container `Items`, not a loot table.
+    /// The jigsaw path used to read only `LootTable`, so those contents were dropped.
+    #[test]
+    fn jigsaw_furnace_contents_reach_the_furnace_store() {
+        use crate::generation_context::{ContainerKind, GenerationPayload};
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+        let mut entry = BTreeMap::new();
+        entry.insert(crate::nbt::NbtString::text("Slot"), Tag::Byte(0));
+        entry.insert(
+            crate::nbt::NbtString::text("id"),
+            Tag::String(crate::nbt::NbtString::text("minecraft:iron_ingot")),
+        );
+        entry.insert(crate::nbt::NbtString::text("count"), Tag::Int(3));
+        let tag = Tag::Compound(BTreeMap::from([
+            (crate::nbt::NbtString::text("id"), Tag::String(crate::nbt::NbtString::text("minecraft:blast_furnace"))),
+            (crate::nbt::NbtString::text("Items"), Tag::List(10, vec![Tag::Compound(entry)])),
+        ]));
+
+        let mut repo = empty_repo();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(5);
+        place_single_block_piece(
+            &mut repo,
+            "spinetest:loot_piece",
+            reg.state_of("minecraft:blast_furnace", None),
+            Some(tag),
+            (4, 70, 4),
+            7,
+            &mut ctx,
+            &mut rng,
+            reg,
+        )
+        .expect("blast furnace piece places");
+        let iron = crate::name_to_item("minecraft:iron_ingot").expect("iron ingot") as i64;
+        assert_eq!(
+            ctx.payloads,
+            vec![(
+                (4, 70, 4),
+                GenerationPayload::Container {
+                    kind: ContainerKind::Furnace,
+                    slots: vec![(0, iron, 3)],
+                }
+            )],
+            "a blast furnace's Items belong in the furnace store"
+        );
+        assert_eq!(
+            rng.next_i64_legacy(),
+            Xor::seed_worldgen(5).next_i64_legacy(),
+            "a furnace is not a RandomizableContainer, so it spends no loot draw"
+        );
+    }
 
     #[test]
     fn jigsaw_datapacks_parse_without_losses() {

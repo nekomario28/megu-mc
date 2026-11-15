@@ -265,6 +265,29 @@ The staging type is now named `GenerationPayload`; its template container/sign
 variants retain these contracts. The [mineshaft extension](../../../evidence/gameplay/feature-parity/mineshaft-entities-20261113.md)
 adds procedural payloads to the same channel, not general template-entity creation.
 
+### The rest of the container family, and the archaeology that has no store (2026-11-15)
+
+The refusal above was decided from the two *menus* the port had. It was too narrow: `chests()`
+is position-keyed and read by more than a window — the hopper tick draws from a hopper,
+`fire_dispenser` draws from a dispenser, and a broken block spills its entry at that position
+(`set_block_if_inner`) — so dispenser, dropper, crafter, hopper and decorated pot have a store
+and their loot was being dropped instead. Measured over the pinned 1.21.1 template corpus, the
+states that actually carry a `LootTable` are chest (139), dispenser (4), decorated pot (4) and
+barrel (3); the states that carry container `Items` are chest (98), barrel (18), furnace (28),
+blast furnace (11), smoker (9), trapped chest (1) and dispenser (1).
+
+`ContainerKind::for_block` is now the one admission all three pipelines read (template NBT,
+template-structure block-entity events, jigsaw pieces), with `BlockContainer(n)` carrying the
+native menu size so the loot roll cannot fill a slot the block does not have. The jigsaw path
+also stages container `Items`, which it previously ignored (`LootTable` still wins, because a
+container that still holds a table saves the table instead of its items).
+
+What still has **no** store is archaeology: a suspicious-sand/gravel block's table is recorded
+as `LootKind::Brushable` and the block is placed, but nothing is staged for it. Staging it in
+the item store would make a broken suspicious-sand block spill loot native never yields — the
+same named gap `feature.rs` carries for `desert_well`. Closing it needs a brushing interaction
+and the store that owns it, not another variant of this payload.
+
 ### Entity geometry captured; creation still refused (2026-11-11)
 
 `StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)` is the placement-visible

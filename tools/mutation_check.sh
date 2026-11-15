@@ -1352,8 +1352,34 @@ check "staged signs reach the sign store" \
   template_sign_text_matches_native_and_reaches_the_sign_store
 
 check "a furnace is staged as a furnace, not a chest" \
-  src/structure_template.rs '"minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {' '"minecraft:dispenser" => {' \
+  src/generation_payload.rs '            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                ContainerKind::Furnace
+            }' '            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                ContainerKind::Chest
+            }' \
   template_furnace_contents_reach_the_furnace_store
+
+check "a furnace's loot table is not dropped for want of a store" \
+  src/generation_payload.rs '            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                ContainerKind::Furnace
+            }' '            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                return None;
+            }' \
+  jigsaw_container_states_reach_the_store_that_owns_them
+
+check "a jigsaw piece stages its container Items" \
+  src/jigsaw_structures.rs 'Ok(payload) => ctx.payloads.push((p, payload)),' 'Ok(_payload) => {}' \
+  jigsaw_furnace_contents_reach_the_furnace_store
+
+check "a jungle temple dispenser is staged as a dispenser, not a chest" \
+  src/single_piece_structures.rs '                kind: ContainerKind::BlockContainer(9),' '                kind: ContainerKind::Chest,' \
+  single_piece_container_loot_is_staged_and_archaeology_is_not
+
+check "a small container rolls only into its own slots" \
+  src/main.rs '                                        ContainerKind::BlockContainer(size) => {
+                                            i16::from(size)
+                                        }' '                                        ContainerKind::BlockContainer(_) => 27i16,' \
+  container_loot_roll_stays_inside_the_block_its_table_came_from
 
 check "a container with no store is refused" \
   src/structure_template.rs '                return Err("template container NBT on a block with no supported store");' '                ContainerKind::Chest' \

@@ -5755,12 +5755,17 @@ fn materialize_generation_payloads_inner(
                                 let mut out = HashMap::new();
                                 if let Some(pools) = pools {
                                     let items = roll_loot(&pools);
+                                    // `LootTable.fill` fills `container.getContainerSize()`
+                                    // slots, so the native menu size bounds the roll.
                                     let slot_limit = match kind {
                                         ContainerKind::Chest => 27i16,
                                         ContainerKind::Furnace => 3i16,
+                                        ContainerKind::BlockContainer(size) => {
+                                            i16::from(size)
+                                        }
                                     };
                                     let mut slot_order: Vec<i16> = (0..slot_limit).collect();
-                                    if kind == ContainerKind::Chest {
+                                    if kind != ContainerKind::Furnace {
                                         let mut shuffle_rng =
                                             crate::generation_math::Lcg::new(seed as u64);
                                         for i in (2..=slot_order.len()).rev() {
@@ -5781,7 +5786,7 @@ fn materialize_generation_payloads_inner(
                     _ => unreachable!(),
                 };
                 match kind {
-                    ContainerKind::Chest => {
+                    ContainerKind::Chest | ContainerKind::BlockContainer(_) => {
                         let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
                         let entry = store.entry(ContainerKey::Block(pos)).or_default();
                         for (slot, stack) in container_slots {

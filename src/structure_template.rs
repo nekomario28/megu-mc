@@ -1152,15 +1152,9 @@ impl Template {
         if tag.get("front_text").is_some() {
             return Ok(GenerationPayload::Sign(Self::sign_lines(tag)?));
         }
-        let kind = match reg.name_of(state) {
-            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
-                ContainerKind::Chest
-            }
-            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
-                ContainerKind::Furnace
-            }
-            other => {
-                let _ = other;
+        let kind = match ContainerKind::for_block(reg.name_of(state)) {
+            Some(kind) => kind,
+            None => {
                 return Err("template container NBT on a block with no supported store");
             }
         };
@@ -2056,19 +2050,64 @@ mod tests {
 
     /// A container the port has no store for is refused rather than staged where nothing
     /// would read it.
+    ///
+    /// An ender chest is the case: its contents belong to the per-player store that
+    /// `ender_key` derives from a UUID, not to the block position, so a template that carried
+    /// `Items` for one cannot be honoured by writing the position-keyed store.
     #[test]
     fn unsupported_container_states_are_refused() {
         let reg = crate::block_registry::breg().unwrap();
-        let dispenser = reg.state_of("minecraft:dispenser", None);
+        let ender_chest = reg.state_of("minecraft:ender_chest", None);
         let mut items = std::collections::BTreeMap::new();
         items.insert(
             NbtString::text("Items"),
             Tag::List(10, vec![container_entry(0, "minecraft:arrow", 1)]),
         );
         assert_eq!(
-            Template::staged_payload(&Tag::Compound(items), dispenser, reg),
+            Template::staged_payload(&Tag::Compound(items), ender_chest, reg),
             Err("template container NBT on a block with no supported store")
         );
+    }
+
+    /// The states the pinned corpus actually carries contents for are admitted with the size
+    /// of their own menu, so the loot roll and the stored slots are bounded by the block.
+    #[test]
+    fn container_states_are_admitted_with_their_own_size() {
+        use crate::generation_payload::{ContainerKind, GenerationPayload};
+        let reg = crate::block_registry::breg().unwrap();
+        let mut items = std::collections::BTreeMap::new();
+        items.insert(
+            NbtString::text("Items"),
+            Tag::List(10, vec![container_entry(0, "minecraft:arrow", 1)]),
+        );
+        let arrow = crate::name_to_item("minecraft:arrow").unwrap() as i64;
+        for (name, expected) in [
+            ("minecraft:chest", ContainerKind::Chest),
+            ("minecraft:barrel", ContainerKind::Chest),
+            ("minecraft:shulker_box", ContainerKind::Chest),
+            ("minecraft:orange_shulker_box", ContainerKind::Chest),
+            ("minecraft:furnace", ContainerKind::Furnace),
+            ("minecraft:blast_furnace", ContainerKind::Furnace),
+            ("minecraft:smoker", ContainerKind::Furnace),
+            ("minecraft:dispenser", ContainerKind::BlockContainer(9)),
+            ("minecraft:dropper", ContainerKind::BlockContainer(9)),
+            ("minecraft:crafter", ContainerKind::BlockContainer(9)),
+            ("minecraft:hopper", ContainerKind::BlockContainer(5)),
+            ("minecraft:decorated_pot", ContainerKind::BlockContainer(1)),
+        ] {
+            assert_eq!(
+                Template::staged_payload(
+                    &Tag::Compound(items.clone()),
+                    reg.state_of(name, None),
+                    reg
+                ),
+                Ok(GenerationPayload::Container {
+                    kind: expected,
+                    slots: vec![(0, arrow, 1)],
+                }),
+                "{name} carries contents this port has a store for"
+            );
+        }
     }
 
     /// A sign tag with a shape the port cannot represent is refused, not blanked.

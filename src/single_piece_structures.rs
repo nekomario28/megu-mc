@@ -505,6 +505,17 @@ impl<'a, 'g> PieceWriter<'a, 'g> {
         );
         self.place_block(disp, lx, ly, lz);
         let seed = rng.next_i64();
+        // `RandomizableContainer.setLootTable`: the dispenser is a 9-slot block container, so its
+        // table belongs in the store the hopper tick, `fire_dispenser` and the break-spill all
+        // read by position, not just in the returned loot record.
+        self.ctx.payloads.push((
+            wp,
+            GenerationPayload::LootContainer {
+                kind: ContainerKind::BlockContainer(9),
+                loot_table: table.to_string(),
+                loot_seed: Some(seed),
+            },
+        ));
         self.loots.insert(
             wp,
             SinglePieceLoot {
@@ -2337,6 +2348,114 @@ mod single_piece_tests {
             let res = j.post_process(&mut ctx, &mut rng, [0, -64, 0, 31, 319, 31]);
             assert_eq!(res.loots.len(), 4);
             assert_eq!(j.bounds[1], 64);
+        }
+    }
+
+    /// The container loot a single-piece piece writes is staged into the generation payload
+    /// store, and the archaeology it also writes is not: this runtime has no brushing store, so
+    /// the `LootKind::Brushable` record has nowhere to go. Putting that table in the item store
+    /// would make a broken suspicious-sand block spill loot native never yields, which is why
+    /// the record stays unstaged (the same named gap `feature.rs` carries for `desert_well`).
+    #[test]
+    fn single_piece_container_loot_is_staged_and_archaeology_is_not() {
+        let reg = breg().expect("block registry initialized");
+        let dirt = reg.state_of("minecraft:dirt", None);
+        let sand = reg.state_of("minecraft:sand", None);
+
+        // Jungle temple: two chests and two dispensers, each in the store that reads the block.
+        {
+            let mut gen = crate::worldgen::Gen::load(404, crate::name_to_state).unwrap();
+            let mut ctx = FC::new(&mut gen);
+            ctx.test_no_terrain = true;
+            ctx.test_default_air = true;
+            for x in 0..=14 {
+                for z in 0..=14 {
+                    for y in 60..=63 {
+                        ctx.test_base_cell((x, y, z), dirt);
+                    }
+                }
+            }
+            let clip = [0, -64, 0, 31, 319, 31];
+            let mut j = JungleTemplePiece::with_orientation(0, 0, Facing::North);
+            let mut rng = Xor::seed_worldgen(404);
+            let res = j.post_process(&mut ctx, &mut rng, clip);
+            assert_eq!(res.loots.len(), 4, "two chests and two dispensers");
+            let staged: Vec<(String, crate::generation_payload::ContainerKind)> = ctx
+                .payloads
+                .iter()
+                .filter_map(|(_, p)| match p {
+                    GenerationPayload::LootContainer { kind, loot_table, .. } => {
+                        Some((loot_table.clone(), *kind))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                staged
+                    .iter()
+                    .filter(|(t, k)| t == "minecraft:chests/jungle_temple"
+                        && *k == ContainerKind::Chest)
+                    .count(),
+                2,
+                "the temple's two chests are staged as chest loot"
+            );
+            assert_eq!(
+                staged
+                    .iter()
+                    .filter(|(t, k)| t == "minecraft:chests/jungle_temple_dispenser"
+                        && *k == ContainerKind::BlockContainer(9))
+                    .count(),
+                2,
+                "the temple's two dispensers are staged as 9-slot block containers"
+            );
+        }
+
+        // Desert pyramid: four chests staged, and no payload for any suspicious-sand cell.
+        {
+            let mut gen = crate::worldgen::Gen::load(303, crate::name_to_state).unwrap();
+            let mut ctx = FC::new(&mut gen);
+            ctx.test_no_terrain = true;
+            ctx.test_default_air = true;
+            for x in 0..=20 {
+                for z in 0..=20 {
+                    for y in 60..=64 {
+                        ctx.test_base_cell((x, y, z), sand);
+                    }
+                }
+            }
+            let clip = [0, -64, 0, 31, 319, 31];
+            let mut d = DesertPyramidPiece::with_orientation(0, 0, Facing::North);
+            let mut post_rng = Xor::seed_worldgen(303);
+            let mut level_rng = Lcg::new(303);
+            let mut res = d.post_process(&mut ctx, &mut post_rng, &mut level_rng, 303, clip);
+            DesertPyramidStructure::after_place(std::slice::from_ref(&d), &mut ctx, 303, clip, &mut res);
+
+            let brushable: Vec<SinglePiecePos> = res
+                .loots
+                .iter()
+                .filter(|l| l.kind == LootKind::Brushable)
+                .map(|l| l.pos)
+                .collect();
+            assert!(
+                !brushable.is_empty(),
+                "the pyramid places suspicious sand with an archaeology table"
+            );
+            let chests = res.loots.iter().filter(|l| l.kind == LootKind::Chest).count();
+            assert_eq!(chests, 4, "four pyramid chests");
+            assert_eq!(ctx.payloads.len(), chests, "every payload is a chest");
+            for (pos, payload) in &ctx.payloads {
+                assert!(
+                    !brushable.contains(pos),
+                    "{pos:?} is suspicious sand: archaeology has no store, so it must not be staged"
+                );
+                assert!(matches!(
+                    payload,
+                    GenerationPayload::LootContainer {
+                        kind: ContainerKind::Chest,
+                        ..
+                    }
+                ));
+            }
         }
     }
 

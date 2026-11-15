@@ -7,6 +7,8 @@ use crate::block_registry::{breg, BReg, HeightmapKind};
 use crate::worldgen::Gen;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[allow(unused_imports)]
+pub(crate) use crate::generation_payload::{ContainerKind, GenerationPayload};
 
 /// FEAT_PROFILE diagnostic: time spent in feature-side terrain reads.
 pub(crate) static READ_NS: AtomicU64 = AtomicU64::new(0);
@@ -101,15 +103,10 @@ impl<'a> FC<'a> {
     pub(crate) fn push_loot_container(
         &mut self,
         pos: (i32, i32, i32),
-        is_furnace: bool,
+        kind: crate::generation_payload::ContainerKind,
         loot_table: String,
         loot_seed: Option<i64>,
     ) {
-        let kind = if is_furnace {
-            crate::generation_payload::ContainerKind::Furnace
-        } else {
-            crate::generation_payload::ContainerKind::Chest
-        };
         self.payloads.push((
             pos,
             crate::generation_payload::GenerationPayload::LootContainer {

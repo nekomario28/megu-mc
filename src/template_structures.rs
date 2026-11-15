@@ -311,16 +311,11 @@ pub(crate) fn stage_payloads(
             }
             continue;
         };
-        let kind = match record.id {
-            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
-                crate::generation_payload::ContainerKind::Chest
-            }
-            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
-                crate::generation_payload::ContainerKind::Furnace
-            }
-            other => {
+        let kind = match crate::generation_payload::ContainerKind::for_block(record.id) {
+            Some(kind) => kind,
+            None => {
                 if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
-                    eprintln!("SPIPE_PAYLOAD no store for {other} at {:?}", record.pos);
+                    eprintln!("SPIPE_PAYLOAD no store for {} at {:?}", record.id, record.pos);
                 }
                 continue;
             }

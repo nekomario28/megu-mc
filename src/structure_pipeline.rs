@@ -2152,4 +2152,130 @@ mod pipeline_tests {
         assert!(hut_entities.iter().any(|id| id == "minecraft:witch"));
         assert!(hut_entities.iter().any(|id| id == "minecraft:cat"));
     }
+
+    /// The container payloads the remaining structure families produce reach `FC` during
+    /// placement, read at the chunks native generates them for seed 4242.
+    #[test]
+    fn structure_container_payloads_reach_fc() {
+        use crate::generation_context::{ContainerKind, GenerationPayload};
+        reset_cache();
+        let d = defs().expect("structure definitions load");
+        let mut ow = Gen::load(4242, crate::name_to_state).expect("overworld gen");
+
+        fn payloads_at(
+            g: &mut Gen,
+            step: usize,
+            cx: i32,
+            cz: i32,
+        ) -> Vec<((i32, i32, i32), crate::generation_context::GenerationPayload)> {
+            let mut refs = References::collect(g, cx, cz);
+            let pop = pop_seed(g.wseed(), cx * 16, cz * 16);
+            let mut ctx = FC::new(g);
+            refs.place_step(&mut ctx, step, pop as u64, cx, cz);
+            ctx.payloads
+        }
+
+        // `minecraft:buried_treasure`: the piece stages its own chest
+        // (`StructurePiece.createChest`).
+        let buried = payloads_at(
+            &mut ow,
+            d.structures["minecraft:buried_treasure"].step,
+            -181,
+            127,
+        );
+        assert_eq!(buried.len(), 1, "one buried treasure chest");
+        assert_eq!(buried[0].0, (-2887, 52, 2041), "at the cell it was written to");
+        match &buried[0].1 {
+            GenerationPayload::LootContainer {
+                kind,
+                loot_table,
+                loot_seed,
+            } => {
+                assert_eq!(*kind, ContainerKind::Chest);
+                assert_eq!(loot_table, "minecraft:chests/buried_treasure");
+                // `createChest` draws the seed it stores for a chest with no `LootTableSeed`.
+                assert!(loot_seed.is_some(), "the piece draws the chest's loot seed");
+            }
+            other => panic!("a buried treasure chest stages a loot container, got {other:?}"),
+        }
+
+        // `minecraft:desert_pyramid`: the four chests are staged, and the archaeology is not:
+        // this runtime has no brushing store, and the item store cannot hold that table without
+        // making a broken suspicious-sand block spill loot native never yields.
+        let pyramid = payloads_at(
+            &mut ow,
+            d.structures["minecraft:desert_pyramid"].step,
+            -573,
+            -555,
+        );
+        assert_eq!(pyramid.len(), 4, "four pyramid chests in this chunk");
+        for (pos, payload) in &pyramid {
+            assert_eq!(
+                payload,
+                &GenerationPayload::LootContainer {
+                    kind: ContainerKind::Chest,
+                    loot_table: "minecraft:chests/desert_pyramid".to_owned(),
+                    loot_seed: match payload {
+                        GenerationPayload::LootContainer { loot_seed, .. } => *loot_seed,
+                        _ => unreachable!(),
+                    },
+                },
+                "{pos:?} carries the pyramid chest table"
+            );
+        }
+
+        // `minecraft:jungle_pyramid`: two chests and two dispensers, each in the store that
+        // reads that block.
+        let jungle = payloads_at(
+            &mut ow,
+            d.structures["minecraft:jungle_pyramid"].step,
+            -394,
+            201,
+        );
+        let kind_of = |payload: &crate::generation_context::GenerationPayload| match payload {
+            GenerationPayload::LootContainer { kind, .. } => Some(*kind),
+            _ => None,
+        };
+        let jungle_chests = jungle
+            .iter()
+            .filter(|(_, p)| {
+                kind_of(p) == Some(ContainerKind::Chest)
+                    && matches!(p, GenerationPayload::LootContainer { loot_table, .. } if loot_table == "minecraft:chests/jungle_temple")
+            })
+            .count();
+        let jungle_dispensers = jungle
+            .iter()
+            .filter(|(_, p)| {
+                kind_of(p) == Some(ContainerKind::BlockContainer(9))
+                    && matches!(p, GenerationPayload::LootContainer { loot_table, .. } if loot_table == "minecraft:chests/jungle_temple_dispenser")
+            })
+            .count();
+        assert_eq!(jungle_chests, 2, "two jungle temple chests");
+        assert_eq!(jungle_dispensers, 2, "two jungle temple dispensers");
+
+        // A `minecraft:village_plains` chunk: a jigsaw piece's container states reach the same
+        // stores — the weapon smith's chest as a loot container and the house furnaces as
+        // container `Items` in the furnace store.
+        let village = payloads_at(
+            &mut ow,
+            d.structures["minecraft:village_plains"].step,
+            -191,
+            -95,
+        );
+        assert!(
+            village.iter().any(|(_, p)| matches!(
+                p,
+                GenerationPayload::Container { kind: ContainerKind::Furnace, .. }
+            )),
+            "a village furnace's `Items` belong in the furnace store"
+        );
+        assert!(
+            village.iter().any(|(_, p)| matches!(
+                p,
+                GenerationPayload::LootContainer { kind: ContainerKind::Chest, loot_table, .. }
+                    if loot_table == "minecraft:chests/village/village_weaponsmith"
+            )),
+            "the weapon smith's chest is staged as a chest loot container"
+        );
+    }
 }

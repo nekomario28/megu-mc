@@ -259,3 +259,82 @@ fn container_pickup_respects_component_limits_on_empty_slots_and_swaps() {
     assert_eq!(slots[&1], (stone, 16, comps.clone()));
     assert_eq!(carried, (stone, 4, comps));
 }
+
+/// `LootTable.fill` fills `container.getContainerSize()` slots, so a rolled table must stay
+/// inside the slots the block actually has: a decorated pot holds one, a hopper five, a
+/// dispenser nine, a chest twenty-seven. Before `ContainerKind::BlockContainer` every
+/// non-furnace kind was a 27-slot chest, so a small container's roll could land on a slot the
+/// block cannot hold and the item would be unreachable.
+#[test]
+fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
+    use crate::generation_payload::{ContainerKind, GenerationPayload};
+    let redstone = name_to_item("minecraft:redstone").unwrap() as i64;
+    let table = "spinetest:one_item";
+    loot_tables().lock().unwrap().insert(
+        table.to_owned(),
+        vec![LootPool {
+            rolls: 1,
+            chance: 1.0,
+            entries: vec![LootEntry {
+                item: redstone,
+                min: 1,
+                max: 1,
+                funcs: Vec::new(),
+            }],
+            funcs: Vec::new(),
+        }],
+    );
+    for (pos, kind, highest) in [
+        ((1, 70, 1), ContainerKind::BlockContainer(1), 0i16),
+        ((2, 70, 2), ContainerKind::BlockContainer(5), 4),
+        ((3, 70, 3), ContainerKind::BlockContainer(9), 8),
+        ((4, 70, 4), ContainerKind::BlockContainer(27), 26),
+        ((5, 70, 5), ContainerKind::Chest, 26),
+    ] {
+        materialize_generation_payloads(vec![(
+            pos,
+            GenerationPayload::LootContainer {
+                kind,
+                loot_table: table.to_owned(),
+                loot_seed: Some(1234),
+            },
+        )]);
+        let slots = chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::Block(pos))
+            .cloned()
+            .expect("a container entry is created");
+        assert!(!slots.is_empty(), "{kind:?} wrote its roll");
+        for slot in slots.keys() {
+            assert!(
+                *slot <= highest,
+                "{kind:?} cannot hold slot {slot} (highest is {highest})"
+            );
+        }
+        chests().lock().unwrap().remove(&ContainerKey::Block(pos));
+    }
+    // A furnace's table names the furnace store, never the chest store.
+    let furnace_pos = (6, 70, 6);
+    materialize_generation_payloads(vec![(
+        furnace_pos,
+        GenerationPayload::LootContainer {
+            kind: ContainerKind::Furnace,
+            loot_table: table.to_owned(),
+            loot_seed: Some(1234),
+        },
+    )]);
+    assert!(
+        !chests()
+            .lock()
+            .unwrap()
+            .contains_key(&ContainerKey::Block(furnace_pos)),
+        "a furnace's loot belongs in furnaces(), not chests()"
+    );
+    assert!(furnaces()
+        .lock()
+        .unwrap()
+        .contains_key(&furnace_pos));
+    furnaces().lock().unwrap().remove(&furnace_pos);
+    loot_tables().lock().unwrap().remove(table);
+}
