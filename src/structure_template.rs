@@ -3174,3 +3174,5 @@ mod tests {
         );
     }
 }
+
+include!("template_structures.rs");

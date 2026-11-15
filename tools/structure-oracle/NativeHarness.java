@@ -657,6 +657,29 @@ public final class NativeHarness {
                 }
                 return ((java.util.function.Predicate<Object>) a[1]).test(at);
             }
+            // `isFluidAtPosition(pos, predicate)` (`ddc.b(jd, Predicate)`): the sibling of the
+            // block test above, but the predicate takes a `FluidState`, so it must be applied to
+            // `BlockStateBase.getFluidState()` of the same cell the level already serves (`u()`,
+            // the call `b_` above already makes). A worldgen level has no flowing fluids, so the
+            // block state's own fluid state is the whole answer.
+            //
+            // Measured: without this the whole jigsaw oracle dies - `FoliagePlacer.placeLeaves`
+            // asks `isFluidAtPosition(pos, fluidState -> fluidState.is(FluidTags.WATER))` to
+            // derive a leaf block's `waterlogged` property, so the first tree in the first
+            // village aborts the run with `UnsupportedOperationException: public abstract boolean
+            // ddc.b(jd,java.util.function.Predicate)`.
+            if (m.getName().equals("b") && pt.length == 2 && pt[0] == posC
+                    && pt[1] == java.util.function.Predicate.class
+                    && m.getReturnType() == boolean.class) {
+                int[] p = xyz(a[0]);
+                Object at = writes.get(p[0] + "," + p[1] + "," + p[2]);
+                if (at == null) {
+                    at = scene.stateAt(p[0], p[1], p[2]);
+                    if (at == null) at = state("minecraft:air");
+                }
+                return ((java.util.function.Predicate<Object>) a[1])
+                        .test(stateC.getMethod("u").invoke(at));
+            }
             // `getChunk(int,int,ChunkStatus,boolean)` (`dcz.a`): a *real* scratch `ProtoChunk`.
             //
             // `SculkVeinBlock`'s shape update asks the level for a chunk, which a scripted level

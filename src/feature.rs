@@ -22,6 +22,10 @@ use std::sync::atomic::Ordering;
 #[path = "generation_contract_tests.rs"]
 mod generation_contract_tests;
 
+#[cfg(test)]
+#[path = "jigsaw_structures.rs"]
+pub(crate) mod jigsaw_structures;
+
 // ---------- configured features ----------
 
 enum FRef {
@@ -5418,6 +5422,21 @@ fn foliage_noise() -> &'static OSimp {
 
 // ---------- placed feature execution ----------
 
+#[cfg(test)]
+pub(super) fn gen_placed_feature_by_name(
+    name: &str,
+    ctx: &mut FC,
+    rng: &mut Xor,
+    pos: (i32, i32, i32),
+) -> bool {
+    let fr = freg();
+    let Some(pf) = fr.placed.get(name) else {
+        return false;
+    };
+    gen_pf(pf, fr, ctx, rng, pos);
+    true
+}
+
 fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     // Modifiers are streams of positions, not passes over a list. Vanilla builds
     // `Stream.of(origin).flatMap(modifier::getPositions)` for each modifier in turn, and the
@@ -6416,6 +6435,15 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             // matching exactly, so the outer placement and the patch spreads were
             // already right and only this check was missing.
             if let Some(reg) = breg() {
+                // `BushBlock.mayPlaceOn` is `state.is(BlockTags.DIRT)` and `minecraft:dirt_path`
+                // is *not* in `#minecraft:dirt` (`data/minecraft/tags/block/dirt.json`).
+                // `is_dirtish` (generation_providers.rs) lists the path by name, so without
+                // this a flower/fern patch plants on the village roads it must refuse.
+                // Measured: village_plains_s1 chunk (-2,-3) placed 18 flowers against native
+                // 11 and every extra one stood on a path; two village_plains_s2 chunks the same.
+                if reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)) == "minecraft:dirt_path" {
+                    return;
+                }
                 let ok = can_place(reg, ctx, reg.name_of(st), pos.0, pos.1, pos.2);
                 if env_flag!("SIMPLE_TRACE") {
                     static N: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -6887,9 +6915,54 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
         }
         Cf::BlockPile(bsp) => {
-            let st = bsp.get(ctx, rng, pos.0, pos.1, pos.2);
-            if ctx.is_air(pos.0, pos.1, pos.2) {
-                ctx.set(pos.0, pos.1, pos.2, st);
+            // `BlockPileFeature` (`ebm.a(ecg)`), read from the pinned 1.21.1 bytecode:
+            //   if (pos.y < minBuildHeight + 5) return false;
+            //   int dx = 2 + random.nextInt(2); int dz = 2 + random.nextInt(2);
+            //   for (BlockPos p : BlockPos.betweenClosed(pos.offset(-dx, 0, -dz),
+            //                                              pos.offset(dx, 1, dz))) {
+            //      int ox = pos.x - p.x; int oz = pos.z - p.z;
+            //      if ((float)(ox*ox + oz*oz) <= random.nextFloat() * 10.0F - random.nextFloat() * 6.0F)
+            //         tryPlaceBlock(p);
+            //      else if ((double)random.nextFloat() < 0.031) tryPlaceBlock(p);
+            //   }
+            // `betweenClosed` varies X fastest, then Y, then Z — the draw order is the fixture.
+            let Some(reg) = breg() else { return };
+            if pos.1 < ctx.g.min_y + 5 {
+                return;
+            }
+            let dx = 2 + rng.next_bound(2);
+            let dz = 2 + rng.next_bound(2);
+            for z in (pos.2 - dz)..=(pos.2 + dz) {
+                for y in pos.1..=(pos.1 + 1) {
+                    for x in (pos.0 - dx)..=(pos.0 + dx) {
+                        let ox = pos.0 - x;
+                        let oz = pos.2 - z;
+                        let d2 = (ox * ox + oz * oz) as f32;
+                        let placed = if d2 <= rng.next_f32() * 10.0 - rng.next_f32() * 6.0 {
+                            true
+                        } else {
+                            (rng.next_f32() as f64) < 0.031
+                        };
+                        if !placed {
+                            continue;
+                        }
+                        // `tryPlaceBlock`: empty cell and a support that can hold the pile.
+                        if !ctx.is_air(x, y, z) {
+                            continue;
+                        }
+                        let below = ctx.get(x, y - 1, z);
+                        let may_place_on = if reg.name_of(below) == "minecraft:dirt_path" {
+                            rng.next_bool()
+                        } else {
+                            // `BlockStateBase.isFaceSturdy(level, below, Direction.UP)`
+                            spc_face_sturdy(reg, below, 1)
+                        };
+                        if may_place_on {
+                            let st = bsp.get(ctx, rng, x, y, z);
+                            ctx.set(x, y, z, st);
+                        }
+                    }
+                }
             }
         }
         Cf::Lake { fluid, barrier } => {

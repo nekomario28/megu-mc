@@ -2017,6 +2017,84 @@ check "chest minecart tick persists updated motion into generated NBT" \
   '                let _ = state.velocity;' \
   mineshaft_runtime_tests::cart_runtime_tick_motion_collision_comparator_tracker_and_persistence
 
+check "buried treasure neighbor casing tests block below neighbor rather than above" \
+  src/single_piece_structures.rs '                        let below_np = ctx.get(np.0, np.1 - 1, np.2);' \
+  '                        let below_np = ctx.get(np.0, np.1 + 1, np.2);' \
+  mineshaft_piece::single_piece_tests::single_piece_structures_match_all_1211_native_oracle_vectors
+
+check "swamp hut stilts fill downward starting below corner log base" \
+  src/single_piece_structures.rs '                w.fill_column_down(oak_log, x, -1, z);' \
+  '                w.fill_column_down(oak_log, x, 0, z);' \
+  mineshaft_piece::single_piece_tests::single_piece_structures_match_all_1211_native_oracle_vectors
+
+check "desert pyramid collapsed roof picker includes the upper inclusive bound" \
+  src/single_piece_structures.rs '        let rx = roof_rng.next_inbetween(roof_x0, roof_x1);' \
+  '        let rx = roof_rng.next_inbetween(roof_x0, roof_x1 - 1);' \
+  mineshaft_piece::single_piece_tests::single_piece_structures_match_all_1211_native_oracle_vectors
+
+check "desert pyramid afterPlace uses exclusive nextInt(5, 8) count" \
+  src/single_piece_structures.rs '        let mut count = unique_positions.len().min((rng.next_bound(8 - 5) + 5) as usize);' \
+  '        let mut count = unique_positions.len().min(rng.next_inbetween(5, 8) as usize);' \
+  mineshaft_piece::single_piece_tests::single_piece_structures_match_all_1211_native_oracle_vectors
+
+check "jungle temple moss selector preserves 0.4f cobblestone threshold" \
+  src/single_piece_structures.rs '            if r.next_f32() < 0.4f32 {' \
+  '            if r.next_f32() < 0.5f32 {' \
+  mineshaft_piece::single_piece_tests::single_piece_structures_match_all_1211_native_oracle_vectors
+
+check "igloo basement probability draws nextDouble rather than nextFloat" \
+  src/template_structures.rs '        if rng.next_f64() < 0.5 {' \
+  '        if (rng.next_f32() as f64) < 0.5 {' \
+  structure_template::template_structures_tests::template_structures_match_1211_native_fixture
+
+check "nether fossil column scan requires air above soul sand or sturdy floor" \
+  src/template_structures.rs '        if reg.is_air(above) && (reg.name_of(below) == "minecraft:soul_sand" || sturdy) {' \
+  '        if reg.is_air(above) && sturdy {' \
+  structure_template::template_structures_tests::template_structures_match_1211_native_fixture
+
+check "beached shipwreck height lowers by half height plus random offset" \
+  src/template_structures.rs '                    min_height - size.1 / 2 - post_rng.next_bound(3)' \
+  '                    min_height - size.1 / 2' \
+  structure_template::template_structures_tests::template_structures_match_1211_native_fixture
+
+check "igloo top snow plug skips ladder shaft when basement is present" \
+  src/template_structures.rs '                    if !reg.is_air(state) && reg.name_of(state) != "minecraft:ladder" {' \
+  '                    if !reg.is_air(state) {' \
+  structure_template::template_structures_tests::template_structures_match_1211_native_fixture
+
+check "ruined portal cold variant replaces lava with netherrack" \
+  src/template_structures.rs '            if props.cold {' \
+  '            if false && props.cold {' \
+  structure_template::template_structures_tests::template_structures_match_1211_native_fixture
+
+check "jigsaw expansion hack applies to candidate boxes up to 16 blocks tall" \
+  src/jigsaw_structures.rs '                            if structure.use_expansion_hack && bb_yspan(cand_zero_bb) <= 16 {' \
+  '                            if false && structure.use_expansion_hack && bb_yspan(cand_zero_bb) <= 16 {' \
+  feature::jigsaw_structures::tests::jigsaw_structures_match_1211_native_fixture
+
+check "jigsaw legacy single pool element appends STRUCTURE_AND_AIR after jigsaw replacement" \
+  src/jigsaw_structures.rs '    if legacy {
+        // `Projection.getProcessors()` is appended before this, and `ekw.a(...)` appends
+        // `STRUCTURE_AND_AIR` last: after `JigsawReplacement` has turned jigsaw blocks into
+        // their `final_state` (often `minecraft:air`), every air cell is dropped.
+        processors.push(Processor::BlockIgnore(vec![
+            "minecraft:air".to_owned(),
+            "minecraft:structure_block".to_owned(),
+        ]));
+    }' \
+  '    if false && legacy {}' \
+  feature::jigsaw_structures::tests::jigsaw_structures_match_1211_native_fixture
+
+check "jigsaw capped processor shuffles candidate indices before applying limit" \
+  src/jigsaw_structures.rs '            util_shuffle(&mut indices, &mut cap_rng);' \
+  '            let _ = &mut cap_rng;' \
+  feature::jigsaw_structures::tests::jigsaw_structures_match_1211_native_fixture
+
+check "jigsaw replacement final_state parser accepts trailing brackets like vanilla BlockStateParser" \
+  src/jigsaw_structures.rs '        let props_str = rest.split_once('\'']'\'').map(|(p, _)| p)?;' \
+  '        let props_str = rest.strip_suffix('\'']'\'')?;' \
+  feature::jigsaw_structures::tests::jigsaw_structures_match_1211_native_fixture
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
