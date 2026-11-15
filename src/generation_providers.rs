@@ -1083,14 +1083,32 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
                 || reg.name_of(below) == "minecraft:clay"
         }
         "minecraft:brown_mushroom" | "minecraft:red_mushroom" => {
-            // `MushroomBlock.canSurvive`: `#minecraft:mushroom_grow_block` below skips
-            // the light test entirely, otherwise `getRawBrightness(pos, 0) < 13` *and*
-            // `mayPlaceOn`, which `MushroomBlock` overrides to `isSolidRender` - not the
-            // BushBlock dirt rule. FC runs fresh FEATURES, before INITIALIZE_LIGHT:
-            // SkyLightSectionStorage's missing-column read is 15 in the Overworld (all 41
-            // MushroomBlock reads on the forest fixture were 15, beneath a canopy
-            // included), while the Nether and the End have no skylight at all and read
-            // the block light, which is 0 before the chunk is lit.
+            // `MushroomBlock.canSurvive` (`dla.a(dtc,dcz,jd)`):
+            //
+            // ```java
+            // BlockPos below = pos.below();
+            // BlockState support = level.getBlockState(below);
+            // return support.is(BlockTags.MUSHROOM_GROW_BLOCK)
+            //       ? true
+            //       : level.getRawBrightness(pos, 0) < 13 && this.b(support, level, below);
+            // ```
+            //
+            // `this.b` is *`dla`'s own override* - `BlockState.isSolidRender(BlockGetter,
+            // BlockPos)` (`dtb$a.i(dcc,jd)`, mappings `1035:1042`) - not `BushBlock.mayPlaceOn`
+            // (`dgh.b(dtc,dcc,jd)`, farmland | `#minecraft:dirt`), even though both have the same
+            // signature. Measured both ways on the pinned Nether fixture (seed 4242,
+            // `(-25,19)+3x3`): the `#minecraft:dirt` reading refuses 24 `brown/red_mushroom_nether`
+            // cells the reference places on netherrack, so the solid-render reading is the one the
+            // reference implements.
+            //
+            // The brightness half is measured too. FC runs fresh FEATURES, before
+            // `INITIALIZE_LIGHT`, so the read is of an uninitialized light engine:
+            // `BlockAndTintGetter.getRawBrightness` (`dbz.b(jd,int)`) is
+            // `getLightEngine().getRawBrightness(pos, amount)`, whose sky half is
+            // `SkyLightSectionStorage.e(pos,false)` - 15 for a column with no lit section data -
+            // and whose block half is `BlockLightSectionStorage`, 0 before anything lights the
+            // chunk. So the Overworld reads 15 and a dimension without a sky layer reads 0, which
+            // is `uninitialized_raw_brightness`.
             reg.in_tag(below, "minecraft:mushroom_grow_block")
                 || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))
         }

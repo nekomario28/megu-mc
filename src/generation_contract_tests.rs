@@ -2782,8 +2782,66 @@ fn mushrooms_in_fresh_generation_need_the_special_substrate() {
         ("grass_block", false),
         ("stone", false),
         ("basalt", false),
+        ("netherrack", false),
         ("podzol", true),
         ("mycelium", true),
+    ] {
+        ctx.set(0, 199, 0, reg.state_of(&format!("minecraft:{soil}"), None));
+        for mushroom in ["minecraft:brown_mushroom", "minecraft:red_mushroom"] {
+            assert_eq!(
+                super::can_place(reg, &mut ctx, mushroom, 0, 200, 0),
+                expected,
+                "{soil} {mushroom}"
+            );
+        }
+    }
+}
+
+/// `MushroomBlock.canSurvive` asks `isSolidRender`, not `BushBlock.mayPlaceOn`.
+///
+/// `dla.a(dtc,dcz,jd)` is
+///
+/// ```java
+/// return support.is(BlockTags.MUSHROOM_GROW_BLOCK)
+///       ? true
+///       : level.getRawBrightness(pos, 0) < 13 && this.b(support, level, below);
+/// ```
+///
+/// and `this.b` resolves to `dla`'s own override - `BlockState.isSolidRender(BlockGetter,
+/// BlockPos)` (`dtb$a.i(dcc,jd)`, official mappings `1035:1042:boolean
+/// isSolidRender(net.minecraft.world.level.BlockGetter,net.minecraft.core.BlockPos) -> i`). The
+/// obvious-looking reading, `BushBlock.mayPlaceOn` (farmland | `#minecraft:dirt`, `dgh.b`), has
+/// the same signature and is wrong: measured on the pinned Nether fixture (seed 4242,
+/// `(-25,19)+3x3`) that reading refuses 24 `brown/red_mushroom_nether` cells the reference places
+/// on netherrack.
+///
+/// The Overworld fixture cannot see this either way, because its uninitialized sky light is 15 and
+/// the brightness half already refuses every non-grow-block support there. A dimension without a
+/// sky light reads its block light (0 before anything lights the chunk), so the support test is
+/// the only gate - which is why this table lives in the Nether preset.
+#[test]
+fn nether_mushrooms_survive_a_solid_render_support() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load_preset(0, crate::name_to_state, crate::worldgen::NoisePreset::Nether)
+        .expect("nether preset");
+    assert!(!g.has_skylight(), "the Nether has no sky light layer");
+    let mut ctx = context(&mut g);
+    // A cell to place into: the mushroom itself must be in open air.
+    ctx.set(0, 200, 0, 0);
+    for (soil, expected) in [
+        // solidRender: a placeable support in the dark, whether or not it is dirt
+        ("netherrack", true),
+        ("basalt", true),
+        ("soul_soil", true),
+        ("blackstone", true),
+        // `#minecraft:mushroom_grow_block` skips the light test
+        ("podzol", true),
+        ("mycelium", true),
+        // neither: not a solid render (this is where `isSolidRender` and the dirt tag differ in
+        // the other direction - nothing here is in `#minecraft:dirt` either, so both readings
+        // agree, and the cell is the discriminator for the solid-render half)
+        ("water", false),
+        ("lava", false),
     ] {
         ctx.set(0, 199, 0, reg.state_of(&format!("minecraft:{soil}"), None));
         for mushroom in ["minecraft:brown_mushroom", "minecraft:red_mushroom"] {
@@ -6416,6 +6474,48 @@ fn count_on_every_layer_walks_motion_blocking_layers() {
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].1, 51, "{out:?}");
     }
+}
+
+/// `CEL_TRACE`'s layer list is the same walk `cel_find_y` makes, layer by layer.
+///
+/// The trace exists so a *layer-count* difference between the port and the reference can name
+/// the boundary that one side has and the other does not, instead of only "one more layer".
+/// A list that disagreed with the placement it annotates would make that reading wrong in the
+/// one place it is used - measured on the Nether `(-25,19)+3x3` fixture, where the port's
+/// `large_basalt_columns` placement sampled a fifth layer that the reference did not.
+#[test]
+fn cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks() {
+    use crate::block_registry::HeightmapKind;
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let mut ctx = context(&mut g);
+    ctx.test_default_air = true;
+    // stone at 8, 11 and 14 over a bedrock floor at 3: three layers, top down, and the
+    // bedrock support is skipped (`below.is(BEDROCK)`), so nothing at 4.
+    ctx.test_base_cell((0, 3, 0), reg.state_of("minecraft:bedrock", None));
+    ctx.test_base_cell((0, 8, 0), reg.state_of("minecraft:stone", None));
+    ctx.test_base_cell((0, 11, 0), reg.state_of("minecraft:stone", None));
+    ctx.test_base_cell((0, 14, 0), reg.state_of("minecraft:stone", None));
+    let top = ctx.heightmap(HeightmapKind::MotionBlocking, 0, 0);
+    assert_eq!(top, 15, "first free cell above the topmost blocking block");
+    let layers = super::cel_layer_ys(&mut ctx, reg, 0, top, 0);
+    assert_eq!(
+        layers,
+        vec![15, 12, 9],
+        "the bedrock support is not a layer"
+    );
+    for (layer, &y) in layers.iter().enumerate() {
+        assert_eq!(
+            super::cel_find_y(&mut ctx, reg, 0, top, 0, layer as i32),
+            Some(y),
+            "layer {layer}"
+        );
+    }
+    assert_eq!(
+        super::cel_find_y(&mut ctx, reg, 0, top, 0, layers.len() as i32),
+        None,
+        "a layer past the column answers Integer.MAX_VALUE"
+    );
 }
 
 /// `WorldGenRegion.ensureCanWrite` (`arb.f_`): the FEATURES step's

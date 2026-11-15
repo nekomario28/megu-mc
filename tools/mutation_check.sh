@@ -628,6 +628,18 @@ check "fresh-generation mushrooms do not infer shade from a canopy" \
   src/generation_providers.rs '            reg.in_tag(below, "minecraft:mushroom_grow_block")' \
   '            is_dirtish(reg, below)' \
   feature::generation_contract_tests::mushrooms_in_fresh_generation_need_the_special_substrate
+check "mushroom canSurvive asks isSolidRender, not the dirt tag" \
+  src/generation_providers.rs '                || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))' \
+  '                || (uninitialized_raw_brightness(ctx) < 13 && true)' \
+  feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support
+check "an uninitialized sky light reads 15, a dimension without one reads block light" \
+  src/generation_providers.rs '    if ctx.g.has_skylight() {
+        15
+    } else {
+        ctx.block_light(0, 0, 0)
+    }' \
+  '    15' \
+  feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support
 check "matching_fluids uses the fluid rather than block type" \
   src/generation_providers.rs '            let f = reg.fluid_name(st);' \
   '            let f = reg.name_of(st);' \
@@ -1203,14 +1215,19 @@ check "count_on_every_layer re-samples the count inside every layer pass" \
   feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
 
 check "count_on_every_layer counts a fluid cell as an empty layer" \
-  src/feature.rs '        reg.is_air(st) || matches!(reg.name_of(st), "minecraft:water" | "minecraft:lava")' \
-  '        reg.is_air(st)' \
+  src/feature.rs '    reg.is_air(st) || matches!(reg.name_of(st), "minecraft:water" | "minecraft:lava")' \
+  '    reg.is_air(st)' \
   feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
 
 check "count_on_every_layer will not stack a layer on bedrock" \
-  src/feature.rs '        if !empty(below) && empty(cur) && reg.name_of(below) != "minecraft:bedrock" {' \
-  '        if !empty(below) && empty(cur) {' \
+  src/feature.rs '        if !cel_empty(reg, below) && cel_empty(reg, cur) && reg.name_of(below) != "minecraft:bedrock" {' \
+  '        if !cel_empty(reg, below) && cel_empty(reg, cur) {' \
   feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
+
+check "the count_on_every_layer column trace lists the layers the walk places on" \
+  src/feature.rs '        if boundary && reg.name_of(below) != "minecraft:bedrock" {' \
+  '        if boundary {' \
+  feature::generation_contract_tests::cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks
 
 check "feature writes stay inside the FEATURES write window" \
   src/worldgen.rs '        (cx - px).abs() <= 1 && (cz - pz).abs() <= 1' \

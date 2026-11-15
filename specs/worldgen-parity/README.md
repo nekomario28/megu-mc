@@ -196,7 +196,9 @@ two below the torch, dropping the `nextLong`, and removing the out-of-world guar
 `bqz.a(dcc,ayw,jd,akq)` passes and the seed is spent instead of skipped. Its limits:
 the scenes are scripted, not native-oracle fixtures (`tools/feature_oracles.py` names a
 `bonus_chest` fixture, but `BonusChestOracle` and `tests/data/bonus_chest_1211.tsv` are
-not written yet), the torch support is the pinned full UP face while
+not written yet: the guard below is the blocker — a scripted level answers
+`getBlockEntity` with `null`, so an oracle would drop the very `nextLong` it is meant to
+pin, and the harness needs pending block entities on `setBlock` first), the torch support is the pinned full UP face while
 vanilla asks with `SupportType.CENTER` — they differ only for a support whose 2x2
 centre column covers the face, which no generated bonus-chest surface is — and the
 `chests/spawn_bonus_chest` loot table is not in the exported pack, so the payload

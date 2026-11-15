@@ -5691,6 +5691,7 @@ fn mod_positions(
             // `MOTION_BLOCKING` (not the OCEAN_FLOOR every other modifier here reads),
             // and the layer scan uses `isEmpty() = isAir() || WATER || LAVA`.
             let Some(reg) = breg() else { return };
+            let trace = cel_trace(pos);
             let mut layer = 0i32;
             loop {
                 let n = ip.get(rng).max(0);
@@ -5699,7 +5700,20 @@ fn mod_positions(
                     let x = pos.0 + rng.next_bound(16);
                     let z = pos.2 + rng.next_bound(16);
                     let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);
-                    if let Some(y) = cel_find_y(ctx, reg, x, top, z, layer) {
+                    let y = cel_find_y(ctx, reg, x, top, z, layer);
+                    if let Some(layers) = trace {
+                        // Every layer the column offers, so a layer-count difference says which
+                        // boundary one side has and the other does not instead of only "one more".
+                        let all = cel_layer_ys(ctx, reg, x, top, z);
+                        eprintln!(
+                            "CEL pass={},{} layer={layer} x={x} z={z} top={top} y={} layers={:?}",
+                            pos.0 >> 4,
+                            pos.2 >> 4,
+                            y.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                            all
+                        );
+                    }
+                    if let Some(y) = y {
                         out.push((x, y, z));
                         any = true;
                     }
@@ -5887,23 +5901,58 @@ fn mod_positions(
     }
 }
 
+/// `CEL_TRACE=cx,cz`: every `count_on_every_layer` sample whose *placement* origin is in that
+/// chunk, with the layer it was asked for, the `MOTION_BLOCKING` top it read, the y it answered
+/// and every layer the column offers. `eim.a(eiw,int,int,int,int)` walks a column from its
+/// `MOTION_BLOCKING` top down, so "one more layer" is a difference in the *column*, not in the
+/// sampling - the layer list says which boundary one side has and the other does not.
+fn cel_trace(pos: (i32, i32, i32)) -> Option<()> {
+    static CACHE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    let want = *CACHE.get_or_init(|| {
+        let raw = std::env::var("CEL_TRACE").ok()?;
+        let (x, z) = raw.split_once(',')?;
+        Some((x.trim().parse().ok()?, z.trim().parse().ok()?))
+    });
+    if want == Some((pos.0 >> 4, pos.2 >> 4)) {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// `CountOnEveryLayerPlacement`'s `isEmpty()`: `isAir() || WATER || LAVA`. A fluid cell is an
+/// *empty* layer, so the layer sits in the fluid rather than above it.
+fn cel_empty(reg: &BReg, st: u32) -> bool {
+    reg.is_air(st) || matches!(reg.name_of(st), "minecraft:water" | "minecraft:lava")
+}
+
+/// Every layer of a column in `CountOnEveryLayerPlacement.getY`'s sense: the empty cells whose
+/// cell below is non-empty and not `BEDROCK`, from the `MOTION_BLOCKING` top down. `cel_find_y`
+/// returns element `layer` of this list.
+fn cel_layer_ys(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32) -> Vec<i32> {
+    let min_y = ctx.g.min_y;
+    let mut out = Vec::new();
+    let mut cur = ctx.get(x, top, z);
+    let mut y = top;
+    while y >= min_y + 1 {
+        let below = ctx.get(x, y - 1, z);
+        let boundary = !cel_empty(reg, below) && cel_empty(reg, cur);
+        if boundary && reg.name_of(below) != "minecraft:bedrock" {
+            out.push(y);
+        }
+        cur = below;
+        y -= 1;
+    }
+    out
+}
+
 /// `CountOnEveryLayerPlacement.getY` (`eim.a(eiw,int,int,int,int)`): the
 /// `layer`-th y from the column's `top` downward whose state is empty
 /// (`isAir() || WATER || LAVA`) while the cell below it is not, skipping a
 /// `BEDROCK` support. Vanilla returns `mutable.getY() + 1` after reading
 /// `j - 1`, i.e. the empty cell itself, and `Integer.MAX_VALUE` (here `None`)
 /// when the column has fewer than `layer + 1` layers.
-fn cel_find_y(
-    ctx: &mut FC<'_>,
-    reg: &BReg,
-    x: i32,
-    top: i32,
-    z: i32,
-    layer: i32,
-) -> Option<i32> {
-    let empty = |st: u32| {
-        reg.is_air(st) || matches!(reg.name_of(st), "minecraft:water" | "minecraft:lava")
-    };
+fn cel_find_y(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32, layer: i32) -> Option<i32> {
     let min_y = ctx.g.min_y;
     let mut found = 0;
     // `getHeight` can return `minY + height` (a blocking block in the top layer);
@@ -5913,7 +5962,7 @@ fn cel_find_y(
     let mut y = top;
     while y >= min_y + 1 {
         let below = ctx.get(x, y - 1, z);
-        if !empty(below) && empty(cur) && reg.name_of(below) != "minecraft:bedrock" {
+        if !cel_empty(reg, below) && cel_empty(reg, cur) && reg.name_of(below) != "minecraft:bedrock" {
             if found == layer {
                 return Some(y);
             }
