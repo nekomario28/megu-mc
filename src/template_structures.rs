@@ -252,6 +252,59 @@ pub(crate) struct PlacementOut {
     pub(crate) entities: Vec<EntitySpawn>,
 }
 
+/// Route a placement's block-entity events to the generation payload store.
+///
+/// Only the payload shapes the runtime owns are staged: a container populated from
+/// a loot table. A written container whose contents were already rolled into NBT
+/// `Items`, and every other block entity (signs, spawners), stays a *write* — the
+/// payload channel has no shape for it, and inventing one here would claim a
+/// delivery the runtime cannot perform. `SPIPE_PAYLOAD` names every dropped shape
+/// so a missing payload is observable rather than assumed.
+pub(crate) fn stage_payloads(
+    ctx: &mut crate::generation_context::FC<'_>,
+    out: PlacementOut,
+) {
+    let _ = &out.entities;
+    for event in out.be_events {
+        let BeEvent::Set(record) = event else {
+            // `Clear` removes a block entity a previous write created; the write
+            // itself already replaced the state.
+            continue;
+        };
+        let Some(table) = record.loot_table else {
+            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                eprintln!(
+                    "SPIPE_PAYLOAD unrouted {} at {:?}",
+                    record.id, record.pos
+                );
+            }
+            continue;
+        };
+        let kind = match record.id {
+            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" => {
+                crate::generation_payload::ContainerKind::Chest
+            }
+            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                crate::generation_payload::ContainerKind::Furnace
+            }
+            other => {
+                if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                    eprintln!("SPIPE_PAYLOAD no store for {other} at {:?}", record.pos);
+                }
+                continue;
+            }
+        };
+        ctx.payloads.push((
+            record.pos,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                kind,
+                loot_table: table,
+                loot_seed: record.loot_seed,
+            },
+        ));
+    }
+}
+
 /// Registry id of the block entity a written state creates, when it creates one.
 pub(crate) fn block_entity_id(name: &str) -> Option<&'static str> {
     let bare = name.strip_prefix("minecraft:").unwrap_or(name);

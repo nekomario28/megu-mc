@@ -2095,6 +2095,45 @@ check "jigsaw replacement final_state parser accepts trailing brackets like vani
   '        let props_str = rest.strip_suffix('\'']'\'')?;' \
   feature::jigsaw_structures::tests::jigsaw_structures_match_1211_native_fixture
 
+# Wave 3B: Beardifier + unified StructureSet admission. The fixture is native
+# (`tools/beardifier_pipeline_oracle.py`): a germ that only moves a value inside the
+# port cannot be seen at all, so every mutation below changes a constant the native
+# run pinned.
+
+check "beardifier kernel keeps vanilla's /16 exponent scale" \
+  src/worldgen.rs '    std::f64::consts::E.powf(-squared / 16.0) as f32' \
+  '    std::f64::consts::E.powf(-squared / 8.0) as f32' \
+  feature::pipeline_tests::beardifier_density_and_structure_admission_match_1211_native
+
+check "beardifier ground-plane term uses Mth.fastInvSqrt, not 1/sqrt" \
+  src/worldgen.rs '    let f = -d * fast_inv_sqrt(squared / 2.0) / 2.0;' \
+  '    let f = -d * (squared / 2.0).sqrt().recip() / 2.0;' \
+  feature::pipeline_tests::beardifier_density_and_structure_admission_match_1211_native
+
+check "beardifier kernel's +0.5 belongs to the y offset" \
+  src/worldgen.rs '                    v[i * 576 + j * 24 + k] = beard_kernel_value(
+                        j as i32 - BEARD_KERNEL_RADIUS,
+                        k as i32 - BEARD_KERNEL_RADIUS,' \
+  '                    v[i * 576 + j * 24 + k] = beard_kernel_value(
+                        k as i32 - BEARD_KERNEL_RADIUS,
+                        j as i32 - BEARD_KERNEL_RADIUS,' \
+  feature::pipeline_tests::beardifier_density_and_structure_admission_match_1211_native
+
+check "structure exclusion zone actually forbids the chunk" \
+  src/structure_pipeline.rs '            !mineshaft::exclusion_forbids(count, x, z, |ox, oz| {
+                set_admits(d, other, seed, ox, oz, depth + 1)
+            })' \
+  '            {
+                let _ = (count, other);
+                true
+            }' \
+  feature::pipeline_tests::beardifier_density_and_structure_admission_match_1211_native
+
+check "preliminary (structure-free) columns stay out of the column cache" \
+  src/worldgen.rs '        if g.beard_depth == 0 {' \
+  '        if true {' \
+  feature::pipeline_tests::preliminary_columns_are_not_cached_as_final
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

@@ -46,6 +46,218 @@ pub(crate) fn parse_world_seed(value: &str) -> Result<u64, std::num::ParseIntErr
         .or_else(|_| value.parse())
 }
 
+// ---------- beardifier (vanilla `Beardifier`) ----------
+//
+// The vanilla `beardifier` density-function node is not in the datapack: `NoiseChunk`
+// wraps the router with `add(final_density, BeardifierMarker)` and substitutes the
+// chunk's `Beardifier` for the marker (`NoiseChunk.wrap`), so this module inserts the
+// same node (`load_preset`) and evaluates it against the chunk's beard data.
+//
+// Bytecode authority (pinned jar, `tools/bytecode_probe.sh`):
+// `Beardifier.compute(dyr$b)`, `Beardifier.a(IIII)` (kernel lookup),
+// `Beardifier.a(IDI)` (kernel value = `pow(E, -(x^2+y^2+z^2)/16)`),
+// `Beardifier.a(DDD)` = `clampedMap(length(x,y,z), 0, 6, 1, 0)` (the burying value),
+// `Mth.fastInvSqrt(double)` (the bit-hack, not `1/sqrt`).
+// `TerrainAdjustment` ordinals: NONE, BURY, BEARD_THIN, BEARD_BOX, ENCAPSULATE.
+
+/// `Beardifier.TerrainAdjustment` — the structure's `terrain_adaptation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeardAdjustment {
+    None,
+    Bury,
+    BeardThin,
+    BeardBox,
+    Encapsulate,
+}
+
+impl BeardAdjustment {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "none" => Some(Self::None),
+            "bury" => Some(Self::Bury),
+            "beard_thin" => Some(Self::BeardThin),
+            "beard_box" => Some(Self::BeardBox),
+            "encapsulate" => Some(Self::Encapsulate),
+            _ => None,
+        }
+    }
+}
+
+/// `Beardifier.Rigid`: one piece's bounding box, the structure's terrain
+/// adjustment and the piece's ground-level delta.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BeardRigid {
+    pub(crate) min: [i32; 3],
+    pub(crate) max: [i32; 3],
+    pub(crate) adjustment: BeardAdjustment,
+    pub(crate) ground_level_delta: i32,
+}
+
+/// `JigsawJunction`: a jigsaw connection point. `rigid` records the source
+/// piece's projection (RIGID vs TERRAIN_MATCHING); `compute` does not read it,
+/// but the collection filter and diagnostics do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BeardJunction {
+    pub(crate) source_x: i32,
+    pub(crate) source_ground_y: i32,
+    pub(crate) source_z: i32,
+    pub(crate) delta_y: i32,
+    pub(crate) rigid: bool,
+}
+
+/// `Beardifier.forStructuresInChunk`: the rigids and junctions of every structure
+/// piece that is close to one chunk.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BeardChunkData {
+    pub(crate) rigids: Vec<BeardRigid>,
+    pub(crate) junctions: Vec<BeardJunction>,
+}
+
+impl BeardChunkData {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rigids.is_empty() && self.junctions.is_empty()
+    }
+}
+
+/// `Beardifier.BEARD_KERNEL_RADIUS`.
+const BEARD_KERNEL_RADIUS: i32 = 12;
+/// `Beardifier.BEARD_KERNEL_SIZE`.
+const BEARD_KERNEL_SIZE: usize = 24;
+
+/// `Beardifier.BEARD_KERNEL`: 24^3 f32 values, `BEARD_KERNEL[z*576 + x*24 + y]`
+/// = `kernel(x, y, z)` for offsets relative to the kernel centre.
+fn beard_kernel() -> &'static [f32] {
+    static KERNEL: std::sync::OnceLock<Box<[f32]>> = std::sync::OnceLock::new();
+    KERNEL.get_or_init(|| {
+        let mut v = vec![0f32; BEARD_KERNEL_SIZE * BEARD_KERNEL_SIZE * BEARD_KERNEL_SIZE];
+        for i in 0..BEARD_KERNEL_SIZE {
+            for j in 0..BEARD_KERNEL_SIZE {
+                for k in 0..BEARD_KERNEL_SIZE {
+                    v[i * 576 + j * 24 + k] = beard_kernel_value(
+                        j as i32 - BEARD_KERNEL_RADIUS,
+                        k as i32 - BEARD_KERNEL_RADIUS,
+                        i as i32 - BEARD_KERNEL_RADIUS,
+                    );
+                }
+            }
+        }
+        v.into_boxed_slice()
+    })
+}
+
+/// `Beardifier.a(int, int, int)` → `Beardifier.a(int, double, int)`: the table
+/// value `pow(E, -(x^2 + (y+0.5)^2 + z^2)/16)`.
+fn beard_kernel_value(x: i32, y: i32, z: i32) -> f32 {
+    let y = f64::from(y) + 0.5;
+    let xs = f64::from(x);
+    let zs = f64::from(z);
+    let squared = xs * xs + y * y + zs * zs;
+    // Java `Math.pow(Math.E, -squared / 16)`: the value is stored as f32 in the table.
+    std::f64::consts::E.powf(-squared / 16.0) as f32
+}
+
+/// `Mth.fastInvSqrt(double)`: the seeded bit-hack, *not* `1.0 / sqrt(d)`.
+fn fast_inv_sqrt(d: f64) -> f64 {
+    let half = 0.5 * d;
+    let bits = 6_910_469_410_427_058_090u64.wrapping_sub((d.to_bits() as i64 >> 1) as u64);
+    let d = f64::from_bits(bits);
+    d * (1.5 - half * d * d)
+}
+
+/// `Beardifier.a(int, int, int, int)`: the exp kernel times the ground-plane term.
+/// `ground_level_delta` is the y distance whose half-plane the kernel is centred on.
+fn beard_contribution(x: i32, y: i32, z: i32, ground_level_delta: i32) -> f64 {
+    let (ix, iy, iz) = (x + 12, y + 12, z + 12);
+    if !(0..BEARD_KERNEL_SIZE as i32).contains(&ix)
+        || !(0..BEARD_KERNEL_SIZE as i32).contains(&iy)
+        || !(0..BEARD_KERNEL_SIZE as i32).contains(&iz)
+    {
+        return 0.0;
+    }
+    let d = f64::from(ground_level_delta) + 0.5;
+    let (xs, zs) = (f64::from(x), f64::from(z));
+    let squared = xs * xs + d * d + zs * zs;
+    let f = -d * fast_inv_sqrt(squared / 2.0) / 2.0;
+    let kernel = beard_kernel()[iz as usize * 576 + ix as usize * 24 + iy as usize];
+    f * f64::from(kernel)
+}
+
+/// `Beardifier.a(double, double, double)` — `clampedMap(length(x, y, z), 0, 6, 1, 0)`.
+fn beard_burying_value(x: f64, y: f64, z: f64) -> f64 {
+    let len = (x * x + y * y + z * z).sqrt();
+    clamped_map(len, 0.0, 6.0, 1.0, 0.0)
+}
+
+/// `Mth.clampedMap(value, min, max, newMin, newMax)`.
+fn clamped_map(value: f64, min: f64, max: f64, new_min: f64, new_max: f64) -> f64 {
+    let delta = (value - min) / (max - min);
+    let t = if delta < 0.0 {
+        0.0
+    } else if delta > 1.0 {
+        1.0
+    } else {
+        delta
+    };
+    new_min + t * (new_max - new_min)
+}
+
+/// `Beardifier.compute(FunctionContext)`: the density this chunk's structures add to
+/// the terrain density at one block position.
+pub(crate) fn compute_beardifier(data: &BeardChunkData, x: i32, y: i32, z: i32) -> f64 {
+    let mut density = 0.0f64;
+    for rigid in &data.rigids {
+        let dx = (rigid.min[0] - x).max(x - rigid.max[0]).max(0);
+        let dz = (rigid.min[2] - z).max(z - rigid.max[2]).max(0);
+        let ground = rigid.min[1] + rigid.ground_level_delta;
+        let dy = y - ground;
+        let boxed = match rigid.adjustment {
+            BeardAdjustment::None => 0,
+            BeardAdjustment::Bury | BeardAdjustment::BeardThin => dy,
+            BeardAdjustment::BeardBox => (ground - y).max(y - rigid.max[1]).max(0),
+            BeardAdjustment::Encapsulate => (rigid.min[1] - y).max(y - rigid.max[1]).max(0),
+        };
+        density += match rigid.adjustment {
+            BeardAdjustment::None => 0.0,
+            BeardAdjustment::Bury => {
+                beard_burying_value(f64::from(dx), f64::from(boxed) / 2.0, f64::from(dz))
+            }
+            BeardAdjustment::BeardThin | BeardAdjustment::BeardBox => {
+                beard_contribution(dx, boxed, dz, dy) * 0.8
+            }
+            BeardAdjustment::Encapsulate => {
+                beard_burying_value(
+                    f64::from(dx) / 2.0,
+                    f64::from(boxed) / 2.0,
+                    f64::from(dz) / 2.0,
+                ) * 0.8
+            }
+        };
+    }
+    for junction in &data.junctions {
+        let q = x - junction.source_x;
+        let r = y - junction.source_ground_y;
+        let s = z - junction.source_z;
+        density += beard_contribution(q, r, s, r) * 0.4;
+    }
+    density
+}
+
+/// Resolves one chunk's beardifier input. `worldgen` may not import the structure
+/// pipeline (`feature` sits above it in `tools/layers_check.sh`), so the pipeline
+/// registers this function instead.
+pub(crate) type BeardResolver = fn(&mut Gen, i32, i32) -> BeardChunkData;
+
+static GLOBAL_BEARD_RESOLVER: Mutex<Option<BeardResolver>> = Mutex::new(None);
+
+/// Register the process-wide beardifier resolver (`main.rs` and the structure tests).
+pub(crate) fn register_beard_resolver(resolver: BeardResolver) {
+    *GLOBAL_BEARD_RESOLVER.lock().unwrap() = Some(resolver);
+}
+
+fn global_beard_resolver() -> Option<BeardResolver> {
+    *GLOBAL_BEARD_RESOLVER.lock().unwrap()
+}
+
 #[derive(Clone)]
 enum SV {
     V(f32),
@@ -173,6 +385,8 @@ enum DF {
     Blended(Box<BlendedNoise>),
     BlendD(usize),
     Zero,
+    /// Vanilla `BeardifierOrMarker`: the chunk's `BeardChunkData` decides the value.
+    Beardifier,
     FindTopSurface {
         density: usize,
         lower: i32,
@@ -500,6 +714,16 @@ pub struct Gen {
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     col_ord: Vec<(i32, i32)>,
+    /// Per-chunk beardifier input, keyed like `col_c`. Pure in (seed, cx, cz): the
+    /// resolver reads structure starts, which are functions of the seed only.
+    beard_c: HashMap<(i32, i32), std::sync::Arc<BeardChunkData>>,
+    beard_ord: std::collections::VecDeque<(i32, i32)>,
+    /// Per-generator resolver override (tests); the world registers a global one.
+    beard_resolver: Option<BeardResolver>,
+    /// Non-zero while a beardifier resolution is in progress: a nested `cols` (a
+    /// structure's heightmap query) must not resolve again, or it would describe
+    /// terrain shaped by the structure it is trying to place.
+    beard_depth: u32,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
     feat_c: HashMap<(i32, i32), HashMap<u32, u32>>,
     /// Container contents staged by template placement during feature population.
@@ -819,6 +1043,10 @@ impl Gen {
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
             col_ord: Vec::new(),
+            beard_c: HashMap::new(),
+            beard_ord: std::collections::VecDeque::new(),
+            beard_resolver: None,
+            beard_depth: 0,
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
@@ -893,7 +1121,16 @@ impl Gen {
             Self::load_trace("noise_router.final_density did not resolve");
             return None;
         };
-        g.final_density = idx;
+        // Vanilla's chunk pipeline never reads `final_density` bare: `NoiseChunk`
+        // builds `cacheAllInCell(add(router.finalDensity, BeardifierMarker))` and
+        // `wrap` substitutes the chunk's `Beardifier` for the marker. The datapack has
+        // no such node, so the same edge is added here once, at load.
+        let base = idx;
+        let beard = g.dfs.len();
+        g.dfs.push(DF::Beardifier);
+        let sum = g.dfs.len();
+        g.dfs.push(DF::Add(base, beard));
+        g.final_density = sum;
         // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
         // from three router functions; 1.21.2+ moved them into a material rule.
         if jbool(&ns, "ore_veins_enabled", false) {
@@ -1689,9 +1926,8 @@ impl Gen {
             "blend_density" => DF::BlendD(either(self, "input", "argument")?),
             "blend_alpha" => DF::C(1.0),
             "end_islands" => DF::EndIslands(Box::new(EndIslands::new(self.world_seed))),
-            "blend_offset" | "beardifier" | "end_outer_islands" | "distance_to_point" | "slice" => {
-                DF::Zero
-            }
+            "beardifier" => DF::Beardifier,
+            "blend_offset" | "end_outer_islands" | "distance_to_point" | "slice" => DF::Zero,
             "find_top_surface" => DF::FindTopSurface {
                 density: sub(self, "density")?,
                 lower: n("lower_bound") as i32,
@@ -1782,6 +2018,7 @@ impl Gen {
             DF::C(_)
             | DF::EndIslands(_)
             | DF::Zero
+            | DF::Beardifier
             | DF::Grad { .. }
             | DF::ShiftA(_)
             | DF::ShiftB(_)
@@ -1916,6 +2153,14 @@ impl Gen {
             DF::C(v) => *v,
             DF::EndIslands(field) => field.density(x, z),
             DF::Zero => 0.0,
+            // Vanilla substitutes the chunk's `Beardifier` for the marker in
+            // `NoiseChunk.wrap`. Without columns (the `interpolated` corner samples,
+            // and `getBaseHeight`/preliminary-surface queries) the marker itself is
+            // what vanilla evaluates, and it is zero.
+            DF::Beardifier => match cc.and_then(|cc| cc.beard.as_deref()) {
+                Some(beard) => compute_beardifier(beard, x, y, z),
+                None => 0.0,
+            },
             DF::Add(a, b) => {
                 self.eval_c(*a, x, y, z, memo, cc) + self.eval_c(*b, x, y, z, memo, cc)
             }
@@ -2451,6 +2696,11 @@ pub(crate) struct ChunkCols {
     mats: Vec<Option<SurfMat>>, // per-column material-rule results (surface window)
     rd: [i16; 256],             // per-column run_depth (surface noise)
     wtop: [i16; 256],           // per-column top of solid-or-fluid (heightmap basis)
+    /// The beardifier input of the chunk that owns these columns, resolved lazily
+    /// by `Gen::resolve_beard`. `None` while the columns are being built (the
+    /// surface scan must see the preliminary, structure-free surface, exactly as
+    /// vanilla's `preliminarySurfaceLevel` does) and for chunks with no structures.
+    beard: Option<std::sync::Arc<BeardChunkData>>,
 }
 
 type GeneratedTick = ((i32, i32, i32), u32);
@@ -2825,6 +3075,12 @@ pub fn prefetch_cols(
 
 /// Is this chunk's `ChunkCols` already in the generator's cache? Diagnostic only: it
 /// tells whether a caller that asks for columns also pays for their generation.
+/// Does this chunk's column set carry beardifier data? Diagnostic for the cache rule
+/// that keeps preliminary (structure-free) columns out of `col_c`.
+pub(crate) fn cols_have_beard(cc: &ChunkCols) -> bool {
+    cc.beard.is_some()
+}
+
 pub fn cols_cached(cx: i32, cz: i32) -> bool {
     gen_lock()
         .as_ref()
@@ -2923,6 +3179,10 @@ impl Gen {
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
             col_ord: Vec::new(),
+            beard_c: HashMap::new(),
+            beard_ord: std::collections::VecDeque::new(),
+            beard_resolver: None,
+            beard_depth: 0,
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
@@ -2961,6 +3221,56 @@ impl Gen {
             }
             self.col_c.insert((cx, cz), arc);
         }
+    }
+
+    /// Set this generator's beardifier resolver.
+    pub(crate) fn set_beard_resolver(&mut self, resolver: BeardResolver) {
+        self.beard_resolver = Some(resolver);
+    }
+
+    /// The chunk's beardifier input, resolving (and caching) it on first use.
+    ///
+    /// `None` while another resolution is in progress: a structure's own heightmap
+    /// query must describe the terrain without that structure, which is exactly why
+    /// vanilla's `getBaseHeight` samples the BeardifierMarker and not the start.
+    pub(crate) fn resolve_beard(
+        &mut self,
+        cx: i32,
+        cz: i32,
+    ) -> Option<std::sync::Arc<BeardChunkData>> {
+        if let Some(v) = self.beard_c.get(&(cx, cz)) {
+            return Some(v.clone());
+        }
+        if self.beard_depth > 0 {
+            return None;
+        }
+        // `MC_SPINE_NOFEAT=1` is the terrain-only comparison switch: it skips the whole
+        // feature layer (`feature::populate`), and a structure-shaped terrain is part of
+        // that layer. Applying structures to a terrain fixture would compare the port's
+        // beardified terrain with a native capture that had none.
+        if env_flag!("MC_SPINE_NOFEAT") {
+            return None;
+        }
+        let Some(resolver) = self.beard_resolver.or_else(global_beard_resolver) else {
+            return None;
+        };
+        self.beard_depth += 1;
+        let data = resolver(self, cx, cz);
+        self.beard_depth -= 1;
+        let arc = std::sync::Arc::new(data);
+        // A structure generation may have populated the cache for this chunk already
+        // (nested resolution is refused, so only the outermost call inserts).
+        if let Some(v) = self.beard_c.get(&(cx, cz)) {
+            return Some(v.clone());
+        }
+        self.beard_ord.push_back((cx, cz));
+        if self.beard_ord.len() > 128 {
+            if let Some(old) = self.beard_ord.pop_front() {
+                self.beard_c.remove(&old);
+            }
+        }
+        self.beard_c.insert((cx, cz), arc.clone());
+        Some(arc)
     }
 
     pub(crate) fn cols(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
@@ -3004,6 +3314,7 @@ impl Gen {
             mats: Vec::new(),
             rd: [0i16; 256],
             wtop: [0i16; 256],
+            beard: None,
         };
         let top = g.min_y + g.height - 1;
         for zi in 0..16usize {
@@ -3090,13 +3401,23 @@ impl Gen {
         }
         cc.mats = mats;
         cc.rd = rd;
+        // Everything above is the preliminary (structure-free) surface, as vanilla's
+        // `preliminarySurfaceLevel`/`getBaseHeight` evaluate the BeardifierMarker.
+        // Attaching the beardifier now makes the *block* decisions below (and in
+        // `terrain_cell`) see the structures this chunk's terrain has to adapt to.
+        cc.beard = g.resolve_beard(cx, cz);
         let arc = std::sync::Arc::new(cc);
-        g.col_ord.push((cx, cz));
-        if g.col_ord.len() > 128 {
-            let old = g.col_ord.remove(0);
-            g.col_c.remove(&old);
+        // Columns built while a beardifier resolution was in flight are the preliminary
+        // (structure-free) answer on purpose, and must not be cached: the same chunk's
+        // final columns need the structure data this build could not ask for.
+        if g.beard_depth == 0 {
+            g.col_ord.push((cx, cz));
+            if g.col_ord.len() > 128 {
+                let old = g.col_ord.remove(0);
+                g.col_c.remove(&old);
+            }
+            g.col_c.insert((cx, cz), arc.clone());
         }
-        g.col_c.insert((cx, cz), arc.clone());
         Some(arc)
     }
 }
@@ -4997,6 +5318,7 @@ mod wg_tests {
                 mats: Vec::new(),
                 rd: [0; 256],
                 wtop: [0; 256],
+                beard: None,
             };
             let (cx, cz) = (-2, 3);
             let field = |x, y, z| f64::from(x) * 3.0 + f64::from(y) * 0.5 + f64::from(z) * 7.0;

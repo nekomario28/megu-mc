@@ -8640,7 +8640,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
         ((sx as i64) << 32) | (sz as i64 & 0xFFFF_FFFF),
         std::sync::atomic::Ordering::Relaxed,
     );
-    let mut structures = crate::mineshaft::References::collect(g, sx, sz);
+    let mut structures = References::collect(g, sx, sz);
     let mut ctx = FC::new(g);
     let trace = env_flag!("FEAT_TRACE");
     let profile = env_flag!("FEAT_PROFILE");
@@ -8746,3 +8746,8 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     }
     g.stage_payloads((sx, sz), &mut staged_payloads);
 }
+
+// The unified StructureSet / StructureStart pipeline. Included rather than declared as a
+// submodule: `feature` is the layer that may see `structure_template` and `mineshaft`
+// together, and `tools/layers_check.sh` forbids new `mod` edges in production files.
+include!("structure_pipeline.rs");
