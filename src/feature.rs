@@ -5577,6 +5577,20 @@ fn java_hashset_order(pts: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
     keyed.into_iter().map(|(_, _, p)| p).collect()
 }
 
+/// `VEG_COL_TRACE=cx,cz`: every candidate column of a vegetation patch whose origin is in that
+/// chunk, with the edge draw it consumed and why it was refused. Column order and the edge draw
+/// are what tie a patch's depth draws to positions; the native side has the same draws in
+/// `sculk-trace.txt` windows (`SDRAW ...@dyn`), so the two sequences align draw by draw.
+fn veg_col_trace(pos: (i32, i32, i32)) -> bool {
+    static CACHE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    let want = *CACHE.get_or_init(|| {
+        let raw = std::env::var("VEG_COL_TRACE").ok()?;
+        let (x, z) = raw.split_once(',')?;
+        Some((x.trim().parse().ok()?, z.trim().parse().ok()?))
+    });
+    want == Some((pos.0 >> 4, pos.2 >> 4))
+}
+
 fn gen_pf(pf: &Pf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     // Modifiers are streams of positions, not passes over a list. Vanilla builds
     // `Stream.of(origin).flatMap(modifier::getPositions)` for each modifier in turn, and the
@@ -6608,15 +6622,6 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             // matching exactly, so the outer placement and the patch spreads were
             // already right and only this check was missing.
             if let Some(reg) = breg() {
-                // `BushBlock.mayPlaceOn` is `state.is(BlockTags.DIRT)` and `minecraft:dirt_path`
-                // is *not* in `#minecraft:dirt` (`data/minecraft/tags/block/dirt.json`).
-                // `is_dirtish` (generation_providers.rs) lists the path by name, so without
-                // this a flower/fern patch plants on the village roads it must refuse.
-                // Measured: village_plains_s1 chunk (-2,-3) placed 18 flowers against native
-                // 11 and every extra one stood on a path; two village_plains_s2 chunks the same.
-                if reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)) == "minecraft:dirt_path" {
-                    return;
-                }
                 let ok = can_place(reg, ctx, reg.name_of(st), pos.0, pos.1, pos.2);
                 if env_flag!("SIMPLE_TRACE") {
                     static N: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -6921,6 +6926,17 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let Some(reg) = breg() else { return };
             let xr = xz.get(rng) + 1;
             let zr = xz.get(rng) + 1;
+            if veg_col_trace(pos) {
+                let gi = CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "VPATCH origin={} {} {} xr={xr} zr={zr} floor={floor} feature={},{}",
+                    pos.0,
+                    pos.1,
+                    pos.2,
+                    gi >> 32,
+                    gi & 0xFFFF
+                );
+            }
             let inward: i32 = if *floor { -1 } else { 1 };
             let mut surface_pts: Vec<(i32, i32, i32)> = vec![];
             for dx in -xr..=xr {
@@ -6930,7 +6946,18 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     if xe && ze {
                         continue;
                     }
-                    if (xe || ze) && (*extra_edge == 0.0 || rng.next_f32() > *extra_edge) {
+                    // `if (!corner && (!sideEdge || (extra_edge != 0 && !(nextFloat() > extra_edge))))`
+                    // enters; the draw exists only for a side edge with a non-zero chance.
+                    let side_edge = xe || ze;
+                    let edge_draw = if side_edge && *extra_edge != 0.0 {
+                        Some(rng.next_f32())
+                    } else {
+                        None
+                    };
+                    if side_edge && edge_draw.map_or(true, |d| d > *extra_edge) {
+                        if veg_col_trace(pos) {
+                            eprintln!("VCOL dx={dx} dz={dz} edge={edge_draw:?} SKIP edge");
+                        }
                         continue;
                     }
                     let mut p = (pos.0 + dx, pos.1, pos.2 + dz);
@@ -6950,36 +6977,64 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                     let bs = ctx.get(below.0, below.1, below.2);
                     let sdir = if *floor { 1usize } else { 0 }; // face opposing inward walk
                     if !(ctx.is_air(p.0, p.1, p.2) && reg.side_solid(bs, sdir)) {
+                        if veg_col_trace(pos) {
+                            eprintln!(
+                                "VCOL dx={dx} dz={dz} edge={edge_draw:?} SKIP surface air={} sturdy={} y={}",
+                                ctx.is_air(p.0, p.1, p.2),
+                                reg.side_solid(bs, sdir),
+                                p.1
+                            );
+                        }
                         continue;
                     }
                     let mut dep = depth.get(rng);
                     if *extra_bottom > 0.0 && rng.next_f32() < *extra_bottom {
                         dep += 1;
                     }
+                    if veg_col_trace(pos) {
+                        eprintln!(
+                            "VCOL dx={dx} dz={dz} edge={edge_draw:?} ACCEPT y={} dep={dep}",
+                            p.1
+                        );
+                    }
                     let mut bp = below;
-                    let mut placed_any = false;
-                    for _ in 0..dep {
+                    // `VegetationPatchFeature.placeGround` (`edt.a(dds,efh,Predicate,ayw,jd.a,int)`):
+                    //
+                    //    for (int i = 0; i < depth; i++) {
+                    //       newState = groundState.getState(random, mut);
+                    //       existing = level.getBlockState(mut);
+                    //       if (newState.is(existing.getBlock())) continue;   // no move either
+                    //       if (!replaceable.test(existing)) return i != 0;
+                    //       level.setBlock(mut, newState, 2);
+                    //       mut.move(inward);
+                    //    }
+                    //    return true;
+                    //
+                    // The returned flag decides whether the caller adds the column to the
+                    // vegetation set, so a column whose ground is *already* the patch's block
+                    // still contributes a surface point and still gets a vegetation roll. The
+                    // port gated on "wrote at least one block" instead, which lost those
+                    // columns: measured on chunk (5,-32), moss_patch stopped one roll short of
+                    // native (draw 124: native `nextFloat`, port the next attempt's `nextInt(16)`) and its
+                    // whole vegetation sequence shifted.
+                    let mut add_point = true;
+                    for i in 0..dep {
                         let cur = ctx.get(bp.0, bp.1, bp.2);
                         let mut st = ground.get(ctx, rng, bp.0, bp.1, bp.2);
                         if *waterlog && is_water_st(reg, cur) {
                             st = reg.with_prop(st, "waterlogged", "true");
                         }
-                        // `VegetationPatchFeature.placeGround` skips the write when the
-                        // provider produced the block that is already there -- but it
-                        // *continues* the depth loop (re-drawing at the same position)
-                        // instead of stopping. A `break` here ended the column early, which
-                        // is only invisible while the provider is a constant.
                         if reg.name_of(st) == reg.name_of(cur) {
                             continue;
                         }
                         if !reg.in_tag(cur, replaceable) {
+                            add_point = i != 0;
                             break;
                         }
                         ctx.set(bp.0, bp.1, bp.2, st);
                         bp.1 += inward;
-                        placed_any = true;
                     }
-                    if placed_any {
+                    if add_point {
                         surface_pts.push(below);
                     }
                 }
@@ -7402,61 +7457,78 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             prob,
             radius,
         } => {
-            // `UnderwaterMagmaFeature` (eds): Column.scan requires the origin to be
-            // water, walks down while it stays water, and only then places magma
-            // around the floor. Every cell in the cube draws `nextFloat()` first
-            // and is kept when the draw is below the probability *and* the cell is
-            // fully enclosed (itself, the cell above, and all six neighbours are
-            // neither water nor air).
+            // `UnderwaterMagmaFeature.place` (`eds.a(ecg)`), read from the pinned 1.21.1
+            // bytecode:
+            //
+            //    OptionalInt floorY = Column.scan(level, pos, config.floor_search_range,
+            //                                     s -> s.is(WATER), s -> !s.is(WATER))
+            //                                 .map(Column::getFloorY);
+            //    if (floorY.isEmpty()) return false;
+            //    BoundingBox bb = fromCorners(floorPos.offset(-r,-r,-r), floorPos.offset(r,r,r));
+            //    return BlockPos.betweenClosedStream(bb)
+            //        .filter(p -> random.nextFloat() < probability)      // one draw per cell
+            //        .filter(p -> isValidPosition(level, p))
+            //        .mapToInt(p -> { setBlock(p, MAGMA, 2); return 1; }).sum() > 0;
+            //
+            // Three things the port had wrong, all of them visible on the taiga 3x3 (11
+            // magma cells at (69..71,19..20,-503..-501), (79..81,45..46,-485..-483) and
+            // (95,-1..-2,-504)):
+            //
+            //  * the draw order. `betweenClosed` walks x fastest, then y, then z; the port
+            //    ran dx/dy/dz with dz fastest, so the probability draws landed on a
+            //    permutation of the cells and magma appeared two blocks diagonally away.
+            //  * `Column.scan` inspects five positions (it moves `i < maxSteps` times and
+            //    then tests the *moved* position), so a floor four blocks under the origin
+            //    is still a floor; the port stopped one short.
+            //  * `isValidPosition` tests the cell, the cell below and the four horizontal
+            //    neighbours - not the cell above.
             let Some(reg) = breg() else { return };
             let magma = reg.state_of("minecraft:magma_block", None);
-            if !is_water_st(reg, ctx.get(pos.0, pos.1, pos.2)) {
+            // `s.is(Blocks.WATER)`: the block, not the fluid, so a waterlogged state is not
+            // water here.
+            let is_water_block =
+                |ctx: &mut FC, p: (i32, i32, i32)| reg.name_of(ctx.get(p.0, p.1, p.2)) == "minecraft:water";
+            if !is_water_block(ctx, pos) {
                 return;
             }
+            // `Column.scan`: `for (i = 1; i < maxSteps && isStateAtPosition(mut, allowed); i++)
+            // mut.move(down);` then `isStateAtPosition(mut, target) ? of(mut.getY()) : empty`.
             let mut y = pos.1;
-            let mut found = false;
-            for _ in 1..*floor {
-                if !is_water_st(reg, ctx.get(pos.0, y, pos.2)) {
-                    found = true;
-                    break;
-                }
+            let mut steps = 1;
+            while steps < *floor && is_water_block(ctx, (pos.0, y, pos.2)) {
                 y -= 1;
+                steps += 1;
             }
-            if !found {
+            if is_water_block(ctx, (pos.0, y, pos.2)) {
                 return;
             }
             let r = *radius;
-            let wet_air = |ctx: &mut FC, reg: &crate::block_registry::BReg, p: (i32, i32, i32)| {
+            let wet_air = |ctx: &mut FC, p: (i32, i32, i32)| {
                 let st = ctx.get(p.0, p.1, p.2);
-                reg.is_air(st) || is_water_st(reg, st)
+                reg.is_air(st) || reg.name_of(st) == "minecraft:water"
             };
-            let enclosed = |ctx: &mut FC, reg: &crate::block_registry::BReg, p: (i32, i32, i32)| {
-                if wet_air(ctx, reg, p) || wet_air(ctx, reg, (p.0, p.1 + 1, p.2)) {
+            // `isValidPosition` (`eds.b`).
+            let valid = |ctx: &mut FC, p: (i32, i32, i32)| {
+                if wet_air(ctx, p) || wet_air(ctx, (p.0, p.1 - 1, p.2)) {
                     return false;
                 }
-                for (dx, dy, dz) in [
-                    (1, 0, 0),
-                    (-1, 0, 0),
-                    (0, 1, 0),
-                    (0, -1, 0),
-                    (0, 0, 1),
-                    (0, 0, -1),
-                ] {
-                    if wet_air(ctx, reg, (p.0 + dx, p.1 + dy, p.2 + dz)) {
+                for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    if wet_air(ctx, (p.0 + dx, p.1, p.2 + dz)) {
                         return false;
                     }
                 }
                 true
             };
-            for dx in -r..=r {
+            // `betweenClosed` order: x fastest, then y, then z.
+            for dz in -r..=r {
                 for dy in -r..=r {
-                    for dz in -r..=r {
+                    for dx in -r..=r {
                         let bp = (pos.0 + dx, y + dy, pos.2 + dz);
                         let draw = rng.next_f32();
                         if draw >= *prob {
                             continue;
                         }
-                        if !enclosed(ctx, reg, bp) {
+                        if !valid(ctx, bp) {
                             continue;
                         }
                         ctx.set(bp.0, bp.1, bp.2, magma);
@@ -7596,38 +7668,50 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
         }
         Cf::Vines => {
+            // `VinesFeature.place` (`edu.a(ecg)`), read from the pinned 1.21.1 bytecode:
+            //
+            //    if (!level.isEmptyBlock(pos)) return false;
+            //    for (Direction dir : Direction.values())
+            //       if (dir != DOWN && VineBlock.canSupportAtFace(level, pos.relative(dir), dir)) {
+            //          level.setBlock(pos, VINE.setValue(VINE_PROPS.get(dir), true), 2);
+            //          return true;
+            //       }
+            //    return false;
+            //
+            // One block, one supporting face, `Direction.values()` order (DOWN, UP, NORTH, SOUTH,
+            // WEST, EAST) with DOWN skipped - so UP is tried first. The port hung a four-block
+            // column and only from horizontal neighbours, which is not this version's feature:
+            // the lush caves' `classic_vines_cave_feature` places ceiling-anchored
+            // `vine[up=true]`, and the port wrote a wall vine or nothing (measured: chunk
+            // (5,-32) native `vine[up=true]` at (78,-2,-497) where the port had air, which let a
+            // later ceiling patch's air test pass and pick up 126 columns vanilla refuses).
+            //
+            // `VineBlock.canSupportAtFace` (`dov.a(dcc,jd,ji)`) is `MultifaceBlock.canAttachTo`
+            // (`dky.a(dcc,ji,jd,dtc)`): the neighbour's block-support shape *or* its collision
+            // shape fully covers the face that points back at the vine.
             let Some(reg) = breg() else { return };
             let base = reg.state_of("minecraft:vine", None);
             if !ctx.is_air(pos.0, pos.1, pos.2) {
                 return;
             }
-            for d in [2u8, 3, 4, 5] {
-                let (dx, _dy, dz) = dir_off(d);
-                let s = ctx.get(pos.0 + dx, pos.1, pos.2 + dz);
-                if !reg.side_solid(
-                    s,
-                    match d {
-                        2 => 3,
-                        3 => 2,
-                        4 => 5,
-                        _ => 4,
-                    },
-                ) {
+            for d in [1u8, 2, 3, 4, 5] {
+                let (dx, dy, dz) = dir_off(d);
+                let nb = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+                let s = ctx.get(nb.0, nb.1, nb.2);
+                let back = (d ^ 1) as usize;
+                if !(reg.side_solid(s, back) || reg.is_collision_shape_full_block(s)) {
                     continue;
                 }
-                let face = match d {
-                    2 => "south",
-                    3 => "north",
-                    4 => "east",
-                    _ => "west",
+                let prop = match d {
+                    1 => "up",
+                    2 => "north",
+                    3 => "south",
+                    4 => "west",
+                    _ => "east",
                 };
-                let mut y = pos.1;
-                while ctx.is_air(pos.0, y, pos.2) && y > pos.1 - 4 {
-                    let st = reg.with_prop(base, face, "true");
-                    ctx.set(pos.0, y, pos.2, st);
-                    y -= 1;
-                }
-                break;
+                let st = reg.with_prop(base, prop, "true");
+                ctx.set(pos.0, pos.1, pos.2, st);
+                return;
             }
         }
         Cf::MonsterRoom => {

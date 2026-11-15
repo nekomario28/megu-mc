@@ -2796,6 +2796,382 @@ fn mushrooms_in_fresh_generation_need_the_special_substrate() {
     }
 }
 
+/// `BushBlock.mayPlaceOn` is `state.is(Blocks.FARMLAND) || state.is(BlockTags.DIRT)`.
+///
+/// The table is the native `BlockState.canSurvive` for `spruce_sapling[stage=0]`,
+/// `oak_sapling[stage=0]` and `short_grass`, run against a scripted 1.21.1 level on the pinned
+/// server jar; all three plants agree cell for cell. `minecraft:dirt_path` is the one support the
+/// port's old `is_dirtish` list accepted that the reference refuses (`dirt.json` holds
+/// dirt/grass_block/podzol/coarse_dirt/mycelium/rooted_dirt/moss_block/mud/muddy_mangrove_roots
+/// and not the path).
+///
+/// This is what grew trees on taiga village roads: `spruce_checked` is a
+/// `block_predicate_filter(would_survive)` in front of `minecraft:spruce`, so a path under the
+/// sapling let the tree through, and `TrunkPlacer.setDirtAt` then wrote `dirt` over the road.
+/// Seed 4242 (4,-32)+3x3 spawned trees at (65,70,-498) and (71,69,-502) that way, and those two
+/// cells did not stay put: two spurious spruces rearranged the canopy, the `would_survive`
+/// outcomes of later candidates and 2,543 `trees_taiga` cells.
+#[test]
+fn bush_block_family_support_is_the_dirt_tag_or_farmland() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    ctx.set(0, 201, 0, 0);
+    for (support, expected) in [
+        ("dirt", true),
+        ("grass_block", true),
+        ("coarse_dirt", true),
+        ("podzol", true),
+        ("moss_block", true),
+        ("mycelium", true),
+        ("rooted_dirt", true),
+        ("farmland", true),
+        ("dirt_path", false),
+        ("stone", false),
+        ("sand", false),
+        ("gravel", false),
+        ("cobblestone", false),
+    ] {
+        ctx.set(0, 199, 0, reg.state_of(&format!("minecraft:{support}"), None));
+        for plant in [
+            "minecraft:spruce_sapling",
+            "minecraft:oak_sapling",
+            "minecraft:short_grass",
+            "minecraft:fern",
+        ] {
+            assert_eq!(
+                super::can_place(reg, &mut ctx, plant, 0, 200, 0),
+                expected,
+                "{plant} on {support}"
+            );
+        }
+    }
+    // The same rule through the predicate the tree placement actually uses.
+    ctx.set(0, 199, 0, reg.state_of("minecraft:dirt_path", None));
+    assert!(!test_pred(
+        &Pr::WouldSurvive("minecraft:spruce_sapling".into()),
+        reg,
+        &mut ctx,
+        0,
+        200,
+        0
+    ));
+    ctx.set(0, 199, 0, reg.state_of("minecraft:grass_block", None));
+    assert!(test_pred(
+        &Pr::WouldSurvive("minecraft:spruce_sapling".into()),
+        reg,
+        &mut ctx,
+        0,
+        200,
+        0
+    ));
+}
+
+/// `SporeBlossomBlock.canSurvive` (`dnp.a(dtc,dcz,jd)`): `Block.canSupportCenter(level,
+/// pos.above(), DOWN) && !level.isWaterAt(pos)`.
+///
+/// The spore blossom hangs from a ceiling, so the support is the block *above* and its DOWN face.
+/// Falling through to the `BushBlock` family rule asked for dirt *below*, which air never
+/// satisfies - the taiga 3x3 had 7 native spore blossoms and the port had none, and each missing
+/// one also changed the ceiling walk of the `moss_patch_ceiling` above it.
+#[test]
+fn spore_blossom_needs_a_sturdy_ceiling_and_a_dry_cell() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    let blossom = "minecraft:spore_blossom";
+    ctx.set(0, 199, 0, 0);
+    ctx.set(0, 200, 0, 0);
+    ctx.set(0, 201, 0, reg.state_of("minecraft:stone", None));
+    assert!(super::can_place(reg, &mut ctx, blossom, 0, 200, 0));
+    // dirt below is irrelevant: the support is the ceiling.
+    ctx.set(0, 199, 0, reg.state_of("minecraft:dirt", None));
+    assert!(super::can_place(reg, &mut ctx, blossom, 0, 200, 0));
+    // used to pass through the family rule and hang in mid-air.
+    ctx.set(0, 201, 0, 0);
+    assert!(!super::can_place(reg, &mut ctx, blossom, 0, 200, 0));
+    // a non-full ceiling offers no DOWN face.
+    ctx.set(0, 201, 0, reg.state_of("minecraft:oak_leaves", None));
+    assert!(!super::can_place(reg, &mut ctx, blossom, 0, 200, 0));
+    // a water cell refuses even under stone.
+    ctx.set(0, 201, 0, reg.state_of("minecraft:stone", None));
+    ctx.set(0, 200, 0, reg.state_of("minecraft:water", None));
+    assert!(!super::can_place(reg, &mut ctx, blossom, 0, 200, 0));
+}
+
+/// `SmallDripleafBlock.canSurvive` (`dne.a(dtc,dcz,jd)`), measured on the pinned jar: the support
+/// is a `#minecraft:small_dripleaf_placeable` block (clay, moss_block) under *any* cell, or
+/// `#minecraft:dirt`/farmland under water. The cell is not part of the first case.
+///
+/// The port required water in the cell *and* a placeable support, so a `clay_with_dripleaves`
+/// dripleaf on dry clay was refused (measured: (69,-7,-493) and (69,-6,-493) in the taiga 3x3).
+#[test]
+fn small_dripleaf_supports_are_the_placeable_tag_or_dirt_under_water() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    let dripleaf = "minecraft:small_dripleaf";
+    let air = reg.state_of("minecraft:air", None);
+    let water = reg.state_of("minecraft:water", None);
+    ctx.set(0, 201, 0, air);
+    for (support, cell, expected) in [
+        ("clay", air, true),
+        ("moss_block", air, true),
+        ("clay", water, true),
+        ("moss_block", water, true),
+        ("dirt", water, true),
+        ("grass_block", water, true),
+        ("dirt", air, false),
+        ("stone", air, false),
+        ("stone", water, false),
+        ("water", water, false),
+    ] {
+        ctx.set(0, 199, 0, reg.state_of(&format!("minecraft:{support}"), None));
+        ctx.set(0, 200, 0, cell);
+        assert_eq!(
+            super::can_place(reg, &mut ctx, dripleaf, 0, 200, 0),
+            expected,
+            "small_dripleaf on {support} under {}",
+            reg.name_of(cell)
+        );
+    }
+}
+
+/// `VinesFeature.place` (`edu.a(ecg)`): with the origin air, the first direction in
+/// `Direction.values()` order - DOWN skipped, so UP first - whose neighbour satisfies
+/// `VineBlock.canSupportAtFace` gets `minecraft:vine` with that direction's property set, and the
+/// feature writes exactly **one** block.
+///
+/// The port hung a four-block column and only from horizontal neighbours, which is not this
+/// version's rule: in the lush caves the ceiling-anchored `vine[up=true]` cells were missing
+/// (measured at (78,-2,-497) in chunk (5,-32)), and each missing vine let a later
+/// `moss_patch_ceiling` column pass its `isAir` test that vanilla refuses.
+#[test]
+fn vines_attach_to_the_first_support_in_direction_values_order() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let vine = reg.state_of("minecraft:vine", None);
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    // ceiling: UP is tested before any horizontal direction.
+    ctx.set(0, 201, 0, stone);
+    gen_cf(&Cf::Vines, freg(), &mut ctx, &mut Xor::seed_worldgen(3), (0, 200, 0));
+    assert_eq!(
+        reg.with_prop(vine, "up", "true"),
+        ctx.get(0, 200, 0),
+        "a ceiling support must write vine[up=true]"
+    );
+    // one block only: the old column model also wrote 199/198/197.
+    for y in [199, 198, 197] {
+        assert_eq!(0, ctx.get(0, y, 0), "the vine must not hang down ({y})");
+    }
+    // no support at all writes nothing.
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    gen_cf(&Cf::Vines, freg(), &mut ctx, &mut Xor::seed_worldgen(3), (0, 200, 0));
+    assert_eq!(0, ctx.get(0, 200, 0));
+    // two horizontal supports on opposite sides: NORTH comes first in Direction.values().
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    ctx.set(0, 200, -1, stone);
+    ctx.set(0, 200, 1, stone);
+    gen_cf(&Cf::Vines, freg(), &mut ctx, &mut Xor::seed_worldgen(3), (0, 200, 0));
+    assert_eq!(reg.with_prop(vine, "north", "true"), ctx.get(0, 200, 0));
+}
+
+/// `VegetationPatchFeature.placeGround` returns "the column joins the vegetation set" unless the
+/// **first** depth iteration meets a non-replaceable block that is not already the patch's own
+/// ground. A column whose ground already equals `ground_state` therefore still contributes a
+/// surface point and still receives a vegetation roll.
+///
+/// The port gated the set on "wrote at least one block", which dropped exactly those columns:
+/// measured on chunk (5,-32), `moss_patch` stopped one roll short of native (its draw 124 is
+/// native's `nextFloat` and the port's next attempt's `nextInt(16)`) and every moss/clay cell of
+/// that pass shifted with it.
+#[test]
+fn vegetation_patch_keeps_a_column_whose_ground_is_already_the_patch_block() {
+    let reg = breg().unwrap();
+    let dirt = reg.state_of("minecraft:dirt", None);
+    let grass = reg.state_of("minecraft:short_grass", None);
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    // The column's ground already IS the patch's ground_state, so the depth loop writes nothing.
+    g.feat_write(0, 199, 0, dirt);
+    let mut ctx = context(&mut g);
+    let cf = Cf::VegPatch {
+        depth: p_ip(&J::Num(1.0)).unwrap(),
+        extra_bottom: 0.0,
+        extra_edge: 0.0,
+        replaceable: "minecraft:moss_replaceable".to_owned(),
+        ground: Bsp::Simple(dirt),
+        floor: true,
+        chance: 1.0,
+        vfeat: Box::new(super::Pf {
+            feat: super::FRef::Inline(Box::new(Cf::SimpleBlock {
+                to: Bsp::Simple(grass),
+                on: vec![],
+                in_: vec![],
+                under: vec![],
+            })),
+            mods: Vec::new(),
+            name: "inline short_grass".to_owned(),
+        }),
+        xz: p_ip(&J::Num(0.0)).unwrap(),
+        vrange: 5,
+        waterlog: false,
+    };
+    gen_cf(&cf, freg(), &mut ctx, &mut Xor::seed_worldgen(11), (0, 200, 0));
+    assert_eq!(
+        grass,
+        ctx.get(0, 200, 0),
+        "a column whose ground is already the patch block still gets a vegetation roll"
+    );
+}
+
+/// `UnderwaterMagmaFeature` internals that the port had wrong, each one measurable on its own.
+///
+/// `Column.scan` moves `i < floor_search_range` times and then tests the **moved** position, so a
+/// floor four blocks below a five-range origin is still a floor; `isValidPosition` tests the cell,
+/// the cell below and the four horizontal neighbours - never the cell above.
+#[test]
+fn underwater_magma_scans_five_positions_and_ignores_the_cell_above() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let water = reg.state_of("minecraft:water", None);
+    let magma = reg.state_of("minecraft:magma_block", None);
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    // water at 200..197, floor at 196: the fifth position, which the port used to give up on.
+    for y in 197..=200 {
+        g.feat_write(0, y, 0, water);
+    }
+    g.feat_write(0, 196, 0, stone);
+    g.feat_write(0, 195, 0, stone);
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        g.feat_write(dx, 196, dz, stone);
+    }
+    // (0,197,0) is water: vanilla does not look at the cell above, so the floor still fills.
+    let mut ctx = context(&mut g);
+    let cf = Cf::UnderMagma {
+        floor: 5,
+        prob: 1.0,
+        radius: 0,
+    };
+    gen_cf(&cf, freg(), &mut ctx, &mut Xor::seed_worldgen(5), (0, 200, 0));
+    assert_eq!(magma, ctx.get(0, 196, 0));
+    // a floor five below a five-range origin is out of reach (four moves).
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    for y in 196..=200 {
+        g.feat_write(0, y, 0, water);
+    }
+    g.feat_write(0, 195, 0, stone);
+    g.feat_write(0, 194, 0, stone);
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        g.feat_write(dx, 195, dz, stone);
+    }
+    let mut ctx = context(&mut g);
+    gen_cf(&cf, freg(), &mut ctx, &mut Xor::seed_worldgen(5), (0, 200, 0));
+    assert_eq!(stone, ctx.get(0, 195, 0));
+}
+
+/// `BlockPos.betweenClosedStream` walks x fastest, then y, then z, and
+/// `UnderwaterMagmaFeature` draws one `nextFloat` per cell in that order before the enclosure
+/// test. Binding the draws to cells in any other order moves magma diagonally (measured: the
+/// taiga 3x3 had magma at (69..70,19,-501) where the reference has it at (71,19,-502..-503)).
+#[test]
+fn underwater_magma_binds_its_probability_draws_in_betweenclosed_order() {
+    use std::collections::HashMap;
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let water = reg.state_of("minecraft:water", None);
+    let magma = reg.state_of("minecraft:magma_block", None);
+    let (fy, r, prob) = (196, 1, 0.5);
+    let seed = 17;
+    let mut world: HashMap<(i32, i32, i32), u32> = HashMap::new();
+    for y in 197..=200 {
+        world.insert((0, y, 0), water);
+    }
+    // Everything the cube and its shell can read is stone, so the only water is that column.
+    for dy in -2..=2 {
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                world.insert((dx, fy + dy, dz), stone);
+            }
+        }
+    }
+    for y in 197..=200 {
+        world.insert((0, y, 0), water);
+    }
+    let wet = |w: &HashMap<(i32, i32, i32), u32>, p: (i32, i32, i32)| {
+        let st = *w.get(&p).unwrap_or(&0);
+        reg.is_air(st) || reg.name_of(st) == "minecraft:water"
+    };
+    let valid = |w: &HashMap<(i32, i32, i32), u32>, p: (i32, i32, i32)| {
+        !wet(w, p)
+            && !wet(w, (p.0, p.1 - 1, p.2))
+            && [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                .iter()
+                .all(|(dx, dz)| !wet(w, (p.0 + dx, p.1, p.2 + dz)))
+    };
+    // `BlockPos.betweenClosed`: x fastest, then y, then z.
+    let between_closed = |()| {
+        let mut cells = Vec::new();
+        for dz in -r..=r {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    cells.push((dx, fy + dy, dz));
+                }
+            }
+        }
+        cells
+    };
+    let pick = |cells: &[(i32, i32, i32)]| {
+        let mut draws = Xor::seed_worldgen(seed);
+        cells
+            .iter()
+            .copied()
+            .filter(|p| draws.next_f32() < prob && valid(&world, *p))
+            .collect::<Vec<_>>()
+    };
+    let expected = pick(&between_closed(()));
+    let mut by_dz = Vec::new();
+    for dx in -r..=r {
+        for dy in -r..=r {
+            for dz in -r..=r {
+                by_dz.push((dx, fy + dy, dz));
+            }
+        }
+    }
+    assert_ne!(
+        expected,
+        pick(&by_dz),
+        "the fixture must distinguish the two draw orders"
+    );
+
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    for (p, st) in &world {
+        g.feat_write(p.0, p.1, p.2, *st);
+    }
+    let mut ctx = context(&mut g);
+    let cf = Cf::UnderMagma {
+        floor: 5,
+        prob,
+        radius: r,
+    };
+    gen_cf(&cf, freg(), &mut ctx, &mut Xor::seed_worldgen(seed), (0, 200, 0));
+    for p in between_closed(()) {
+        // A cell the probability refuses keeps whatever the world holds (the water column).
+        let want = if expected.contains(&p) {
+            magma
+        } else {
+            world.get(&p).copied().unwrap_or(0)
+        };
+        assert_eq!(
+            want,
+            ctx.get(p.0, p.1, p.2),
+            "magma at {p:?} (expected set {expected:?})"
+        );
+    }
+}
+
 #[test]
 fn normal_cache_identity_survives_slot_reuse() {
     use crate::generation_math::normal_new_amps;

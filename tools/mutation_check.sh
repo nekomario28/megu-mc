@@ -2422,6 +2422,60 @@ check "a frame's spawn carries its facing as the object data" \
     )' \
   mineshaft_runtime_tests::item_frame_payloads_materialize_spawn_and_survive_a_save
 
+# Track 4L: the taiga village lane. Each mutant restores one sentence of the reference body that
+# the port had wrong, and each one was measured to move cells of the (4,-32)+3x3 fixture.
+
+check "a sapling's support is the dirt tag or farmland, not dirt_path" \
+  src/generation_providers.rs 'reg.in_tag(below, "minecraft:dirt") || reg.name_of(below) == "minecraft:farmland"' \
+  'is_dirtish(reg, below) || reg.name_of(below) == "minecraft:farmland"' \
+  feature::generation_contract_tests::bush_block_family_support_is_the_dirt_tag_or_farmland
+
+check "spore blossom hangs from the cell above, not two above" \
+  src/generation_providers.rs 'reg.side_solid(ctx.get(x, y + 1, z), 0) && !is_water_st(reg, at)' \
+  'reg.side_solid(ctx.get(x, y + 2, z), 0) && !is_water_st(reg, at)' \
+  feature::generation_contract_tests::spore_blossom_needs_a_sturdy_ceiling_and_a_dry_cell
+
+check "small dripleaf's placeable supports do not need water in the cell" \
+  src/generation_providers.rs 'reg.in_tag(below, "minecraft:small_dripleaf_placeable")
+                || (is_water_st(reg, at)' \
+  'is_water_st(reg, at) && reg.in_tag(below, "minecraft:small_dripleaf_placeable")
+                || (is_water_st(reg, at)' \
+  feature::generation_contract_tests::small_dripleaf_supports_are_the_placeable_tag_or_dirt_under_water
+
+check "vines try the UP support before any horizontal one" \
+  src/feature.rs 'for d in [1u8, 2, 3, 4, 5] {' \
+  'for d in [2u8, 3, 4, 5] {' \
+  feature::generation_contract_tests::vines_attach_to_the_first_support_in_direction_values_order
+
+check "the vine property names the support direction, not a fixed one" \
+  src/feature.rs '                    1 => "up",' \
+  '                    1 => "north",' \
+  feature::generation_contract_tests::vines_attach_to_the_first_support_in_direction_values_order
+
+check "a vegetation patch column whose ground is already the patch block still joins the set" \
+  src/feature.rs 'let mut add_point = true;' \
+  'let mut add_point = false;' \
+  feature::generation_contract_tests::vegetation_patch_keeps_a_column_whose_ground_is_already_the_patch_block
+
+check "underwater magma's column scan tests the fifth position" \
+  src/feature.rs 'while steps < *floor && is_water_block(ctx, (pos.0, y, pos.2)) {' \
+  'while steps + 1 < *floor && is_water_block(ctx, (pos.0, y, pos.2)) {' \
+  feature::generation_contract_tests::underwater_magma_scans_five_positions_and_ignores_the_cell_above
+
+check "underwater magma's validity test does not look at the cell above" \
+  src/feature.rs 'if wet_air(ctx, p) || wet_air(ctx, (p.0, p.1 - 1, p.2)) {' \
+  'if wet_air(ctx, p) || wet_air(ctx, (p.0, p.1 - 1, p.2)) || wet_air(ctx, (p.0, p.1 + 1, p.2)) {' \
+  feature::generation_contract_tests::underwater_magma_scans_five_positions_and_ignores_the_cell_above
+
+check "underwater magma draws in betweenClosed order (x fastest, then y, then z)" \
+  src/feature.rs '            for dz in -r..=r {
+                for dy in -r..=r {
+                    for dx in -r..=r {' \
+  '            for dx in -r..=r {
+                for dy in -r..=r {
+                    for dz in -r..=r {' \
+  feature::generation_contract_tests::underwater_magma_binds_its_probability_draws_in_betweenclosed_order
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

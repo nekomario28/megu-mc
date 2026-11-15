@@ -1044,12 +1044,18 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
                 && (reg.side_solid(below, 1) || reg.name_of(below) == "minecraft:magma_block")
         }
         "minecraft:sea_pickle" => is_water_st(reg, at) && reg.is_solid(below),
+        // `SmallDripleafBlock.canSurvive` (`dne.a(dtc,dcz,jd)`), measured against the pinned
+        // jar by running the native `BlockState.canSurvive` itself: the support is either a
+        // `#minecraft:small_dripleaf_placeable` block (clay, moss_block) under *any* cell, or
+        // `#minecraft:dirt`/farmland under water. The port required water in the cell *and* a
+        // placeable support, which is neither case: it refused an air cell above clay (the
+        // dripleaf of a `clay_with_dripleaves` patch) and accepted nothing the reference does
+        // not. Measured cells: (69,-7,-493)+(69,-6,-493) were the missing pair.
         "minecraft:small_dripleaf" => {
-            is_water_st(reg, at)
-                && matches!(
-                    reg.name_of(below),
-                    "minecraft:clay" | "minecraft:moss_block"
-                )
+            reg.in_tag(below, "minecraft:small_dripleaf_placeable")
+                || (is_water_st(reg, at)
+                    && (reg.in_tag(below, "minecraft:dirt")
+                        || reg.name_of(below) == "minecraft:farmland"))
         }
         "minecraft:big_dripleaf" | "minecraft:big_dripleaf_stem" => {
             let bn = reg.name_of(below);
@@ -1096,10 +1102,25 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
         // (soul sand, soul soil). `patch_soul_fire`'s own predicate already requires
         // soul soil, so this is the second half of the same rule.
         "minecraft:soul_fire" => reg.in_tag(below, "minecraft:soul_fire_base_blocks"),
+        // `SporeBlossomBlock.canSurvive` (`dnp.a(dtc,dcz,jd)`): `Block.canSupportCenter(
+        // level, pos.above(), DOWN) && !level.isWaterAt(pos)` - it hangs from a ceiling, so the
+        // support is the block *above* and its DOWN face. Without an arm the family default
+        // asked for dirt *below*, which air never satisfies: native had 7 spore blossoms in the
+        // taiga 3x3 and the port had none.
+        "minecraft:spore_blossom" => {
+            reg.side_solid(ctx.get(x, y + 1, z), 0) && !is_water_st(reg, at)
+        }
         _ => {
-            // BushBlock family (saplings, flowers, grasses, ferns, bushes,
-            // petals, dead_bush, torchflower...): dirt-tag or farmland below
-            is_dirtish(reg, below) || reg.name_of(below) == "minecraft:farmland"
+            // `BushBlock.mayPlaceOn` (`dgh.b(dtc,dcc,jd)`): `state.is(Blocks.FARMLAND)` or
+            // `state.is(BlockTags.DIRT)` below, and nothing else. The family is saplings,
+            // flowers, grasses, ferns, bushes, petals, torchflower... and its support test is
+            // exactly this pair: `#minecraft:dirt` holds dirt/grass_block/podzol/coarse_dirt/
+            // mycelium/rooted_dirt/moss_block/mud/muddy_mangrove_roots and *not*
+            // `minecraft:dirt_path`, which `is_dirtish` accepts. Measured on the pinned jar
+            // (`BlockState.canSurvive` against a scripted level): a sapling on `dirt_path` is
+            // `false`, on farmland `true`. Accepting the path let `spruce_checked` spawn trees
+            // on taiga village roads (seed 4242 (4,-32)+3x3: (65,70,-498), (71,69,-502)).
+            reg.in_tag(below, "minecraft:dirt") || reg.name_of(below) == "minecraft:farmland"
         }
     }
 }
