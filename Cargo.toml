@@ -8,6 +8,19 @@ opt-level = 3
 lto = true
 strip = true
 
+# Line tables keep file:line in backtraces. Full debug info made the suite binary
+# 136 MiB (measured 2026-11-16), and `src/test_support.rs` re-executes that binary
+# once per isolated test, so its size is paid on every one of those runs.
+[profile.dev]
+debug = "line-tables-only"
+
+# The suite is compute-bound, not compile-bound: a cold `cargo test --no-run`
+# took 12.96 s while the suite itself took 623.72 s (measured 2026-11-16). Level 1
+# keeps `debug-assertions` and `overflow-checks` on, so the assertions the tests
+# rely on still fire; it only stops the inner loops from being unoptimised.
+[profile.test]
+opt-level = 1
+
 [features]
 # Opt-in CI-only Java fixtures; tests hard-fail without native files.
 native-oracle = []

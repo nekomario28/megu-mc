@@ -1,0 +1,92 @@
+{
+ "measured_at": "2026-11-15T23:45:38.646135+00:00",
+ "base_commit": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+ "branch": "t3/401f5f2c (worktree of perf/worldgen-parallel)",
+ "host": {
+  "cpu_logical": 16,
+  "ram_gb": 30,
+  "swap_gb": 30,
+  "toolchain": "rustc 1.98.0 (88d9e12ae 2026-08-18) / cargo 1.98.0, pinned by rust-toolchain.toml",
+  "isolation": "one systemd-run --user --scope -p MemoryMax=14G run at a time, sequential",
+  "tmpdir": "$HOME/.cache/mc-spine-bench/tmp (host /tmp is a 6 GiB tmpfs and was full from another lane)",
+  "pre_gate": "scripts/resource_gate.py --class light --need-mem-gb 8 returned GO before each run"
+ },
+ "donor": {
+  "repository": "https://github.com/horizon-rust/horizon",
+  "commit_surveyed": "4626921 (main, 2026-11-16, --depth 1 --filter=blob:none --sparse into /tmp/horizon-survey, deleted after the survey)",
+  "license_at_surveyed_commit": "LGPL-3.0-or-later",
+  "previous_donor_commit": "0564ab0bcd3235daa6001033261b79aef5f81de1",
+  "license_at_previous_donor": "MIT",
+  "license_transition_commit": "fb1135c6020b (2026-11-15T20:37:34Z, \"docs: change Horizon's licence from MIT to LGPL-3.0-or-later (#17111)\")",
+  "code_imported": false,
+  "files_from_donor_in_tree": 0,
+  "harness_suite_executed": false,
+  "harness_suite_executed_reason": "no Minecraft 26.3 jar on this host; every statement about the donor's tools is from reading the source"
+ },
+ "tool_sizes_lines": {
+  "tools/port_ledger.py": 3133,
+  "tools/parity_reach.py": 865,
+  "tools/parity_shim.py": 229,
+  "tools/rea_vanilla.py": 114,
+  "tools/class_index.py": 327,
+  "tools/ci/test_scope.py": 189,
+  "tools/check_changed.py": 78,
+  "tools/build_times.py": 948
+ },
+ "cargo_profiles": {
+  "changed": [
+   "[profile.dev] debug = \"line-tables-only\"",
+   "[profile.test] opt-level = 1"
+  ],
+  "command_build": "cargo test --offline --locked --bin mc-spine --no-run",
+  "command_suite": "cargo test --offline --locked --bin mc-spine -- --test-threads=1",
+  "before": {
+   "cold_build_ms": 12962,
+   "suite_ms": 623720,
+   "test_binary_bytes": 142764760,
+   "result": "530 passed; 0 failed; 1 ignored",
+   "target_dir": "673 MiB (du -sh)"
+  },
+  "A_line_tables_only": {
+   "cold_build_ms": 11095,
+   "suite_ms": 561034,
+   "test_binary_bytes": 74511248,
+   "result": "530 passed; 0 failed; 1 ignored",
+   "target_dir": "464 MiB (du -sh)"
+  },
+  "B_line_tables_and_test_opt_level_1": {
+   "cold_build_ms": 22991,
+   "suite_ms": 92142,
+   "test_binary_bytes": 74644504,
+   "result": "530 passed; 0 failed; 1 ignored",
+   "target_dir": "571 MiB (du -sh)"
+  },
+  "repeated_pair_same_conditions": {
+   "before_suite_ms": 622575,
+   "before_result": "530 passed; 0 failed; 1 ignored",
+   "after_suite_ms": 92566,
+   "after_result": "530 passed; 0 failed; 1 ignored",
+   "ratio": 6.73
+  },
+  "headline": "623.72 s -> 92.14 s (6.77x, -85.2%); repeated 622.53 s -> 92.53 s (6.73x). Cold build +10.03 s. Test binary -68.1 MB.",
+  "spread": "before 623.72 / 622.53 s (0.19%); after 92.14 / 92.53 s (0.42%)"
+ },
+ "checks": {
+  "suite_one_thread": "530 passed; 0 failed; 1 ignored (every arm of every measurement)",
+  "suite_eight_threads": "530 passed; 0 failed; 1 ignored; finished in 48.34s (wall 48.4 s)",
+  "layers_check": "PASS (current debt is named, not resolved); 4 probe faults reported as expected",
+  "debt_ratchet": "0 over limit; ignored tests: 1 (unchanged)",
+  "gate_scripts": "15 self-tests PASS",
+  "cargo_check_fabric_probe": "Finished",
+  "cargo_check_neoforge_events": "Finished",
+  "verify_sh": "not run (4 suite rounds + mutation check is outside this change's scope)",
+  "native_oracle_suite": "not run (needs the pinned jar)"
+ },
+ "acceptance_limits": [
+  "No Horizon harness was executed; the tool descriptions are a source reading, not a measured result.",
+  "Parallel worldgen (P3-2) was not implemented; section 5.3 is a design mapping only.",
+  "The 6.7x is one suite on this host; tests/verify.sh end-to-end and CI were not measured.",
+  "The P1-3 items in section 6.4 are hypotheses to check against the native fixture, not confirmed defects.",
+  "tests/verify.sh, gate scripts, policy.json, deps_target.py and every test are unchanged."
+ ]
+}
