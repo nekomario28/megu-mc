@@ -165,12 +165,10 @@ keeping the direction alive, and reading below the origin instead of above both
 fail this fixture.
 
 Two nether vine features are ported the same way. `twisting_vines` (`edr`) matches
-42 native cases and `weeping_vines` (`edx`) 42 more: six scenes times seven seeds,
-covering the ground/support rules (netherrack, warped nylium, warped wart block and
-the refusal cases), the height draws (`nextInt(6)` doubling, `nextInt(5)` collapsing
-to one) and the age property. One measured divergence is open and excluded from the
-fixture rather than hidden: `weeping_vines` with seed `Long.MAX_VALUE` in the flat
-ceiling scene is one cell short in the port (115 vs 116 writes), cause unidentified.
+42 native cases and `weeping_vines` (`edx`) 48 more: six scenes times eight seeds
+(including `Long.MAX_VALUE`), covering the ground/support rules (netherrack, warped
+nylium, warped wart block and the refusal cases), the height draws (`nextInt(6)`
+doubling, `nextInt(5)` collapsing to one) and the age property.
 
 Remaining unsupported configured-feature identities are explicit in the parser
 inventory tests in `src/generation_contract_tests.rs`. Run the actual recursive

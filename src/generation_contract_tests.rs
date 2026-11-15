@@ -1719,7 +1719,7 @@ fn weeping_vines_matches_native_cells_and_rng() {
         let mut g = Gen::load(0, crate::name_to_state).unwrap();
         for x in -16i32..=16 {
             for z in -16i32..=16 {
-                for dy in -16i32..=12 {
+                for dy in -24i32..=12 {
                     let state = match scene {
                         0 => {
                             if dy >= 1 {
@@ -1763,6 +1763,7 @@ fn weeping_vines_matches_native_cells_and_rng() {
             }
         }
         let mut ctx = context(&mut g);
+        ctx.test_no_terrain = true;
         let mut rng = Xor::seed_worldgen(seed);
         gen_cf(&cf, freg(), &mut ctx, &mut rng, (0, 64, 0));
         assert_eq!(!ctx.wr.is_empty(), p[2].parse::<bool>().unwrap(), "{row}");

@@ -41,10 +41,7 @@ public final class WeepingVinesOracle {
         if (!cls.getName().equals("edx")) throw new AssertionError("class changed: " + cls);
         List<String> rows = new ArrayList<>();
         for (int scene = 0; scene < 6; scene++) {
-            // `Long.MAX_VALUE` is excluded on purpose: the port is one cell short there
-            // (measured 2026-10-27, scene 0, 116 vs 115 writes) and the cause is not yet
-            // identified. Keeping the row would hide it; see specs/worldgen-parity/README.md.
-            for (long seed : new long[]{0, 1, -1, 42, 60007, Long.MIN_VALUE, 123456789L}) {
+            for (long seed : new long[]{0, 1, -1, 42, 60007, Long.MIN_VALUE, Long.MAX_VALUE, 123456789L}) {
                 rows.add(run(scene, seed));
             }
         }
