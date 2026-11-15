@@ -3176,3 +3176,5 @@ mod tests {
 }
 
 include!("template_structures.rs");
+
+include!("end_city_mansion.rs");

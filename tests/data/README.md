@@ -7,6 +7,7 @@ own classes. They are facts about that build, not code copied from it.
 | File | Content | Consumer |
 | --- | --- | --- |
 | `random_next_int_1211.tsv` | one row per (generator, seed, bound): a hash of 256 `nextInt(bound)` results and the following `nextLong` | `generation_math::next_int_vs_vanilla_tests` |
+| `end_city_mansion_1211.tsv` | `end_city` (admission, piece tree, multi-chunk placement, loot/shulker/item-frame payloads) and `mansion` (admission, layout grids, piece tree) rows; `layout` rows leave the placement columns zero | `structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture`; regenerate with `tools/end_city_mansion_oracle.py --write` |
 | `biome_probe_ties_1211.tsv` | tie-heavy climate points, the game's biome answer and an equal-distance flag | `worldgen::wg_tests::biome_tree_breaks_ties_the_way_vanilla_scans_children`; `tools/biome_tie_oracle.py` replays all rows on the actual tree |
 
 The files came with the upstream `fix/xoroshiro-next-bound-and-bt-search-vanilla`
