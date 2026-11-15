@@ -1347,7 +1347,9 @@ check "the backoff guard holds a visit past the queue cap" \
   a_backoff_past_the_queue_cap_waits_for_its_real_deadline
 
 check "freeze_top_layer reads MOTION_BLOCKING rather than WORLD_SURFACE" \
-  src/feature.rs '                    let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);' '                    let top = ctx.heightmap(HeightmapKind::WorldSurface, x, z);' \
+  src/feature.rs '                    let top = ctx.heightmap(HeightmapKind::MotionBlocking, x, z);
+                    let Some(biome) = ctx.biome_leaf(x, top, z) else {' '                    let top = ctx.heightmap(HeightmapKind::WorldSurface, x, z);
+                    let Some(biome) = ctx.biome_leaf(x, top, z) else {' \
   freeze_top_layer_matches_native_oracle
 
 check "freeze_top_layer temperature guard gates snow placement" \
@@ -2074,7 +2076,21 @@ check "block reads cannot take a save lock while holding entity locks" \
   mineshaft::tests::queued_generation_payloads_never_take_the_save_lock_on_a_cell_read
 
 check "generated spawner handoff preserves a user air edit" \
-  src/main.rs '                    .or_insert(state);' '                    .and_modify(|v| *v=state).or_insert(state);' \
+  src/main.rs '                    .or_insert(state);
+                if actual == state {
+                    generated_content()
+                        .lock()
+                        .unwrap()
+                        .spawners
+                        .entry(pos)
+                        .or_insert_with(|| generated_content::spawner_nbt(pos));' '                    .and_modify(|v| *v=state).or_insert(state);
+                if actual == state {
+                    generated_content()
+                        .lock()
+                        .unwrap()
+                        .spawners
+                        .entry(pos)
+                        .or_insert_with(|| generated_content::spawner_nbt(pos));' \
   mineshaft::tests::queued_generation_payloads_never_take_the_save_lock_on_a_cell_read
 
 check "deferred cart loot unpacks its seeded abandoned_mineshaft table" \
@@ -2244,7 +2260,7 @@ check "structure exclusion zone actually forbids the chunk" \
   feature::pipeline_tests::beardifier_density_and_structure_admission_match_1211_native
 
 check "preliminary (structure-free) columns stay out of the column cache" \
-  src/worldgen.rs '        if g.beard_depth == 0 {' \
+  src/worldgen.rs '        if self.beard_depth == 0 {' \
   '        if true {' \
   feature::pipeline_tests::preliminary_columns_are_not_cached_as_final
 
