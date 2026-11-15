@@ -146,6 +146,96 @@ pub(crate) fn concentric_rings(
     Ok(result)
 }
 
+/// `BiomeSource.findBiomeHorizontal` — the quart-space spiral vanilla runs after a
+/// concentric-ring candidate, and the only place a stronghold's final chunk is decided.
+///
+/// `biome_at` answers `getNoiseBiome(quart_x, quart_y, quart_z)` (a `&str`, or any
+/// `Copy` key such as a biome leaf id); `radius` is in blocks
+/// (112 for strongholds), `increment` in quarts (the seven-argument overload passes 1,
+/// i.e. a 4-block step). With `find_closest` every ring is a full square and the first
+/// match wins; otherwise only the ring outline is sampled and matches are reservoir
+/// sampled with one `nextInt(matches + 1)` draw each, which is why the RNG is threaded in.
+///
+/// Returns the matching block position (`QuartPos.toBlock`), not a chunk.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn find_biome_horizontal<B: Copy>(
+    x: i32,
+    y: i32,
+    z: i32,
+    radius: i32,
+    increment: i32,
+    mut biome_at: impl FnMut(i32, i32, i32) -> B,
+    mut matches: impl FnMut(B) -> bool,
+    random: &mut Lcg,
+    find_closest: bool,
+) -> Option<(i32, i32, i32)> {
+    // `QuartPos.fromBlock`: quart coordinates are a block coordinate shifted by two.
+    let center_x = x >> 2;
+    let center_z = z >> 2;
+    let limit = radius >> 2;
+    let quart_y = y >> 2;
+    let mut found: Option<(i32, i32)> = None;
+    let mut matched = 0;
+    let mut ring = if find_closest { 0 } else { limit };
+    while ring <= limit {
+        let mut dz = -ring;
+        while dz <= ring {
+            let on_edge_z = dz.abs() == ring;
+            let mut dx = -ring;
+            while dx <= ring {
+                if find_closest {
+                    let on_edge_x = dx.abs() == ring;
+                    if !on_edge_x && !on_edge_z {
+                        dx += increment;
+                        continue;
+                    }
+                }
+                let qx = center_x + dx;
+                let qz = center_z + dz;
+                if matches(biome_at(qx, quart_y, qz)) {
+                    if found.is_none() || random.next_bound(matched + 1) == 0 {
+                        found = Some((qx, qz));
+                        if find_closest {
+                            return Some((qx << 2, y, qz << 2));
+                        }
+                    }
+                    matched += 1;
+                }
+                dx += increment;
+            }
+            dz += increment;
+        }
+        ring += increment;
+    }
+    found.map(|(qx, qz)| (qx << 2, y, qz << 2))
+}
+
+/// `ChunkGeneratorStructureState`'s ring-relocation callback: the candidate chunk's
+/// centre (`SectionPos.sectionToBlockCoord(chunk, 8)`) is searched for a preferred
+/// biome and the *chunk* of the hit is returned, or the candidate when none is found.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn concentric_rings_target<B: Copy>(
+    candidate: (i32, i32),
+    random: &mut Lcg,
+    radius: i32,
+    mut biome_at: impl FnMut(i32, i32, i32) -> B,
+    matches: impl FnMut(B) -> bool,
+) -> Option<(i32, i32)> {
+    let (cx, cz) = candidate;
+    let hit = find_biome_horizontal(
+        (cx << 4) + 8,
+        0,
+        (cz << 4) + 8,
+        radius,
+        1,
+        &mut biome_at,
+        matches,
+        random,
+        false,
+    )?;
+    Some((hit.0 >> 4, hit.2 >> 4))
+}
+
 impl FrequencyReduction {
     /// StructurePlacement.applyAdditionalChunkRestrictions. The DEFAULT reducer
     /// passes (seed, salt, chunkX, chunkZ) straight to the salted RNG in 1.21.1;
