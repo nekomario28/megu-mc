@@ -2696,10 +2696,11 @@ pub(crate) struct ChunkCols {
     mats: Vec<Option<SurfMat>>, // per-column material-rule results (surface window)
     rd: [i16; 256],             // per-column run_depth (surface noise)
     wtop: [i16; 256],           // per-column top of solid-or-fluid (heightmap basis)
-    /// The beardifier input of the chunk that owns these columns, resolved lazily
-    /// by `Gen::resolve_beard`. `None` while the columns are being built (the
-    /// surface scan must see the preliminary, structure-free surface, exactly as
-    /// vanilla's `preliminarySurfaceLevel` does) and for chunks with no structures.
+    /// The beardifier input of the chunk that owns these columns, resolved by
+    /// `Gen::resolve_beard` before `surf`, `wtop` and `mats` are built (vanilla's
+    /// `NoiseChunk.fillFromNoise` applies `Beardifier` before
+    /// `SurfaceSystem.buildSurface`). `None` during nested structure-heightmap
+    /// queries (`beard_depth > 0`) and for chunks with no structures.
     beard: Option<std::sync::Arc<BeardChunkData>>,
 }
 
@@ -3304,6 +3305,13 @@ impl Gen {
             }
             grids[iid] = Some(cells.into_boxed_slice());
         }
+        // Resolve the chunk's beardifier before `surf`, `wtop` and `mats`: vanilla's
+        // `fillFromNoise` evaluates `final_density` with `Beardifier` active and only
+        // then calls `SurfaceSystem.buildSurface`. `preliminarySurfaceLevel` is the
+        // unsmoothed estimate and is not affected; a nested heightmap query during
+        // resolution runs with `beard_depth > 0`, gets `None` here, and is therefore
+        // excluded from `col_c` (see the cache rule at the end of this function).
+        let beard = g.resolve_beard(cx, cz);
         let mut cc = ChunkCols {
             grids,
             surf: [0i16; 256],
@@ -3314,7 +3322,7 @@ impl Gen {
             mats: Vec::new(),
             rd: [0i16; 256],
             wtop: [0i16; 256],
-            beard: None,
+            beard,
         };
         let top = g.min_y + g.height - 1;
         for zi in 0..16usize {
@@ -3401,11 +3409,6 @@ impl Gen {
         }
         cc.mats = mats;
         cc.rd = rd;
-        // Everything above is the preliminary (structure-free) surface, as vanilla's
-        // `preliminarySurfaceLevel`/`getBaseHeight` evaluate the BeardifierMarker.
-        // Attaching the beardifier now makes the *block* decisions below (and in
-        // `terrain_cell`) see the structures this chunk's terrain has to adapt to.
-        cc.beard = g.resolve_beard(cx, cz);
         let arc = std::sync::Arc::new(cc);
         // Columns built while a beardifier resolution was in flight are the preliminary
         // (structure-free) answer on purpose, and must not be cached: the same chunk's
@@ -8182,6 +8185,130 @@ mod wg_tests {
         assert!(init(0, crate::name_to_state));
         let cc = chunk_cols(0, 1).unwrap();
         assert_eq!(cc.surface(4, 0), 63, "surface of the check column");
+    }
+
+    #[test]
+    fn beardifier_applies_before_surface_rules() {
+        let _guard = lock_gen();
+        // vanilla 1.21.1 orders `NoiseChunk.fillFromNoise` (density *with* Beardifier)
+        // before `SurfaceSystem.buildSurface`, and `preliminarySurfaceLevel` samples the
+        // BeardifierMarker (density *without* it). So `surf`/`wtop`/`mats` must see the
+        // beardified density, while `prelim_min` must not.
+        fn no_beard(_: &mut Gen, _: i32, _: i32) -> BeardChunkData {
+            BeardChunkData::default()
+        }
+        // A `beard_thin` rigid at ground y=68 on column (4, 32) adds density below its
+        // ground plane (`compute_beardifier`: `dy < 0` is positive) and carves above it,
+        // so the unbeardified surface of 63 is pushed up towards 68 (measured: 67).
+        fn raise_beard(g: &mut Gen, cx: i32, cz: i32) -> BeardChunkData {
+            if (cx, cz) != (0, 2) {
+                return BeardChunkData::default();
+            }
+            // A nested heightmap query runs while the resolution is in flight: it must
+            // describe the un-beardified terrain and must not poison `col_c`.
+            assert_eq!(
+                g.top_oc(4, 32),
+                64,
+                "nested top_oc during resolve_beard must be un-beardified"
+            );
+            BeardChunkData {
+                rigids: vec![BeardRigid {
+                    min: [2, 68, 30],
+                    max: [6, 72, 34],
+                    adjustment: BeardAdjustment::BeardThin,
+                    ground_level_delta: 0,
+                }],
+                junctions: Vec::new(),
+            }
+        }
+        // Ground plane y=59: the 63 surface is carved down to 58, which is below the
+        // aquifer level, so the carved cells 59..=62 flood (measured `wtop` = 62).
+        // `wtop > surf` is what makes the surface rules see a *submerged* floor, giving
+        // `dirt` rather than `grass_block`. The same beard evaluated after the surface
+        // scan leaves `surf` at 63 and the assertion below fails (63 vs 63).
+        fn carve_beard(g: &mut Gen, cx: i32, cz: i32) -> BeardChunkData {
+            if (cx, cz) != (0, 2) {
+                return BeardChunkData::default();
+            }
+            assert_eq!(
+                g.top_oc(4, 32),
+                64,
+                "nested top_oc during resolve_beard must be un-beardified"
+            );
+            BeardChunkData {
+                rigids: vec![BeardRigid {
+                    min: [2, 59, 30],
+                    max: [6, 65, 34],
+                    adjustment: BeardAdjustment::BeardThin,
+                    ground_level_delta: 0,
+                }],
+                junctions: Vec::new(),
+            }
+        }
+
+        let grass = crate::name_to_state("minecraft:grass_block").unwrap();
+        let dirt = crate::name_to_state("minecraft:dirt").unwrap();
+
+        let mut g_plain = Gen::load(0, crate::name_to_state).unwrap();
+        g_plain.set_beard_resolver(no_beard);
+        let plain_cc = g_plain.cols(0, 2).unwrap();
+        let plain_surf = plain_cc.surface(4, 0);
+        assert_eq!(plain_surf, 63, "unbeardified surface of the check column");
+        assert_eq!(plain_cc.wtop(4, 0), 63, "unbeardified column is dry");
+        assert_eq!(plain_cc.mat(4, 0, 63), Some(grass));
+        let plain_prelim = g_plain.prelim_min(4, 32);
+
+        // Positive beard: the surface rises above y=63, and the *material rules* have to
+        // follow it. Resolving the beard last would leave `mats` describing y=63, so the
+        // raised column would read as bare stone.
+        let mut g_raise = Gen::load(0, crate::name_to_state).unwrap();
+        g_raise.set_beard_resolver(raise_beard);
+        let raise_cc = g_raise.cols(0, 2).unwrap();
+        assert!(cols_have_beard(&raise_cc));
+        let raised_surf = raise_cc.surface(4, 0);
+        assert!(
+            raised_surf > plain_surf,
+            "positive beard should raise the surface ({raised_surf} vs {plain_surf})"
+        );
+        assert_eq!(raise_cc.mat(4, 0, raised_surf), Some(grass));
+        assert_eq!(
+            raise_cc.wtop(4, 0),
+            raised_surf,
+            "the raised column stays above the aquifer: no water on top of it"
+        );
+        assert_eq!(g_raise.terrain_state(4, raised_surf, 32), grass);
+        assert_eq!(g_raise.terrain_state(4, raised_surf - 1, 32), dirt);
+        assert_eq!(g_raise.terrain_state(4, raised_surf + 1, 32), 0);
+        // `preliminarySurfaceLevel` samples the BeardifierMarker: unaffected.
+        assert_eq!(g_raise.prelim_min(4, 32), plain_prelim);
+
+        // Negative beard: the surface is carved below the aquifer level, the carved
+        // cells become water/air, and `wtop > surf` makes the exposed floor a submerged
+        // floor, so the rule that applies is `dirt`, not `grass_block`.
+        let mut g_carve = Gen::load(0, crate::name_to_state).unwrap();
+        g_carve.set_beard_resolver(carve_beard);
+        let carve_cc = g_carve.cols(0, 2).unwrap();
+        assert!(cols_have_beard(&carve_cc));
+        let carved_surf = carve_cc.surface(4, 0);
+        assert!(
+            carved_surf < plain_surf,
+            "negative beard should carve the surface ({carved_surf} vs {plain_surf})"
+        );
+        assert!(
+            carve_cc.wtop(4, 0) > carved_surf,
+            "a carved-below-water column floods above its floor (wtop {} vs surf {carved_surf})",
+            carve_cc.wtop(4, 0)
+        );
+        assert_eq!(g_carve.terrain_state(4, carved_surf, 32), dirt);
+        for y in carved_surf + 1..=plain_surf {
+            let st = g_carve.terrain_state(4, y, 32);
+            let solid = st != 0 && st != g_carve.def_fl;
+            assert!(
+                !solid,
+                "carved cell y={y} must not stay solid (state {st})"
+            );
+        }
+        assert_eq!(g_carve.prelim_min(4, 32), plain_prelim);
     }
 
     #[test]
