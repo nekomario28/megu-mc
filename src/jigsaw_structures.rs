@@ -2704,6 +2704,9 @@ fn place_single_or_legacy<D: JigsawData>(
     let apply_waterlogging = effective_ls == LiquidSettings::ApplyWaterlogging;
     let mut fluid_sources: HashSet<Pos> = HashSet::new();
     let mut to_waterlog: Vec<Pos> = Vec::new();
+    // `StructureTemplate.placeInWorld` runs its two shape passes over the cells it
+    // actually wrote, so the jigsaw path has to collect them the same way.
+    let mut written: Vec<Pos> = Vec::new();
 
     for info in processed {
         let p = info.pos;
@@ -2732,6 +2735,7 @@ fn place_single_or_legacy<D: JigsawData>(
             );
         }
         target.set_world(p, placed);
+        written.push(p);
 
         if let Some(nbt) = info.nbt.as_ref() {
             let bname = reg.name_of(placed);
@@ -2838,6 +2842,23 @@ fn place_single_or_legacy<D: JigsawData>(
     }
 
     if let JigsawTarget::Live(ctx) = &mut *target {
+        // `StructureTemplate.placeInWorld`'s shape passes, which the jigsaw path
+        // used to skip (measured: they are what lets a fence/panes/wall written by
+        // an earlier piece pick up a connection to a block a later piece writes).
+        // Applied to the live target only: the `Scene` target exists to pin the
+        // *write sequence* against the recorded native oracle, and it carries no
+        // `TemplateWorld`, so running a pass there would need a second world adapter
+        // and would move every golden that has an outside neighbour.
+        let changed = crate::structure_template::apply_shape_passes(&written, &mut **ctx, reg);
+        // A shape write is a `setBlock`, so a cell that drops to a state with no
+        // block entity loses the one it had. Nothing a shape pass writes owns a
+        // block entity, so only the removal direction is reachable here.
+        for (p, state) in changed {
+            if crate::structure_template::block_entity_id(reg.name_of(state)).is_none() {
+                ctx.payloads.retain(|(q, _)| *q != p);
+            }
+        }
+
         for info in &tpl.entities {
             let btp = transform_block(info.block_pos, Mirror::None, rot, (0, 0, 0));
             let block_pos = (
@@ -3242,6 +3263,51 @@ pub(crate) mod jigsaw_structures {
                 "{name} must stage its loot table into the store that reads it"
             );
         }
+    }
+
+    /// A jigsaw piece's placement is a `StructureTemplate.placeInWorld`, so native runs
+    /// both shape passes over the cells it wrote. Measured on seed 4242 chunk (-96,35):
+    /// the trial-chamber wall the port placed beside a mineshaft fence rail left the
+    /// fence's connection bit unset, because this path wrote blocks and stopped there.
+    #[test]
+    fn jigsaw_piece_shape_pass_connects_an_earlier_fence_to_its_wall() {
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+        let mut repo = empty_repo();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+        // A rail an earlier piece placed, carrying only the bit its placement set.
+        let fence = reg.with_prop(
+            reg.state_of("minecraft:oak_fence", None),
+            "west",
+            "true",
+        );
+        ctx.set(0, 70, 0, fence);
+
+        let mut rng = Xor::seed_worldgen(3);
+        place_single_block_piece(
+            &mut repo,
+            "spinetest:wall",
+            reg.state_of("minecraft:tuff_bricks", None),
+            None,
+            (0, 70, 1),
+            7,
+            &mut ctx,
+            &mut rng,
+            reg,
+        )
+        .expect("wall piece places");
+
+        let after = ctx.get(0, 70, 0);
+        assert_eq!(reg.name_of(after), "minecraft:oak_fence");
+        assert_eq!(
+            reg.get_prop(after, "south").as_deref(),
+            Some("true"),
+            "the wall beside the fence must connect it, as placeInWorld's shape pass does"
+        );
+        assert_eq!(reg.get_prop(after, "west").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(after, "east").as_deref(), Some("false"));
+        assert_eq!(reg.get_prop(after, "north").as_deref(), Some("false"));
     }
 
     /// Bastion blast furnaces and village furnaces carry container `Items`, not a loot table.

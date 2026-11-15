@@ -895,36 +895,63 @@ pub(crate) fn place_in_world<W: TemplateWorld>(
     }
     // `updateShapeAtEdge` over the exposed faces of the written voxels, then the
     // per-cell `updateFromNeighbourShapes` pass (flag 18).
-    if !written.is_empty() {
-        for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {
-            let mut inside = world.get(p.0, p.1, p.2);
-            let outside = world.get(q.0, q.1, q.2);
-            let next_inside = update_shape(reg, inside, direction, outside, world, p);
-            if next_inside != inside {
-                world.set(p.0, p.1, p.2, next_inside);
-                record_shape_write(&mut out, reg, p, next_inside);
-                inside = next_inside;
-            }
-            let next_outside = update_shape(reg, outside, direction ^ 1, inside, world, q);
-            if next_outside != outside {
-                world.set(q.0, q.1, q.2, next_outside);
-                record_shape_write(&mut out, reg, q, next_outside);
-            }
-        }
-        for p in written.clone() {
-            let current = world.get(p.0, p.1, p.2);
-            let updated = update_from_neighbour_shapes(reg, current, world, p);
-            if updated != current {
-                world.set(p.0, p.1, p.2, updated);
-                record_shape_write(&mut out, reg, p, updated);
-            }
-        }
+    for (p, state) in apply_shape_passes(&written, world, reg) {
+        record_shape_write(&mut out, reg, p, state);
     }
     if !settings.ignore_entities {
         place_entities(world, template, origin, settings, &mut out);
     }
     out.wrote = true;
     Ok(out)
+}
+
+/// `StructureTemplate.placeInWorld`'s two shape passes, in native order:
+/// `updateShapeAtEdge(level, flags, writtenShape, min)` over every exposed face
+/// of the written voxels, then `BlockState.updateFromNeighbourShapes` on each
+/// written cell.
+///
+/// Native runs these for *every* caller of `placeInWorld`, not only for the
+/// template-structure pieces: a `TemplateStructurePiece` (jigsaw) placement does
+/// the same two passes, which is how a fence, pane, wall or stair placed by an
+/// earlier piece picks up a connection to a block a later piece writes beside
+/// it. Both callers share this function so the order cannot drift apart.
+///
+/// Returns the cells the passes changed, in write order, so a caller can mirror
+/// the `setBlock` side effect on its own bookkeeping (block entities above,
+/// payload/behaviour maps for the jigsaw path).
+pub(crate) fn apply_shape_passes<W: TemplateWorld>(
+    written: &[Pos],
+    world: &mut W,
+    reg: &BReg,
+) -> Vec<(Pos, u32)> {
+    let mut changed: Vec<(Pos, u32)> = Vec::new();
+    if written.is_empty() {
+        return changed;
+    }
+    for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {
+        let mut inside = world.get(p.0, p.1, p.2);
+        let outside = world.get(q.0, q.1, q.2);
+        let next_inside = update_shape(reg, inside, direction, outside, world, p);
+        if next_inside != inside {
+            world.set(p.0, p.1, p.2, next_inside);
+            changed.push((p, next_inside));
+            inside = next_inside;
+        }
+        let next_outside = update_shape(reg, outside, direction ^ 1, inside, world, q);
+        if next_outside != outside {
+            world.set(q.0, q.1, q.2, next_outside);
+            changed.push((q, next_outside));
+        }
+    }
+    for &p in written {
+        let current = world.get(p.0, p.1, p.2);
+        let updated = update_from_neighbour_shapes(reg, current, world, p);
+        if updated != current {
+            world.set(p.0, p.1, p.2, updated);
+            changed.push((p, updated));
+        }
+    }
+    changed
 }
 
 /// The block-entity side of a `setBlock` the shape passes perform.
@@ -3646,6 +3673,94 @@ mod template_structures_tests {
         } else {
             sha(lines.join("\n").as_bytes())
         }
+    }
+
+    /// Measured on seed 4242 chunk (-96,35): the mineshaft corridor's oak fence
+    /// rails sat beside a `tuff_bricks` wall the trial-chamber template wrote
+    /// *after* them, and native's fence carried the `south` connection bit the
+    /// port did not. `updateShapeAtEdge` over the written voxels is what sets it:
+    /// the face from the new wall towards the existing fence is exposed, and the
+    /// fence's own `updateShape` answers in that direction.
+    #[test]
+    fn shape_passes_connect_an_existing_fence_to_a_newly_written_neighbour() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        let fence_pos = (0, 70, 0);
+        let fence = reg.with_prop(
+            reg.state_of("minecraft:oak_fence", None),
+            "west",
+            "true",
+        );
+        world.set(fence_pos.0, fence_pos.1, fence_pos.2, fence);
+        // The written voxel: the wall the later piece places, south of the fence.
+        let wall_pos = (0, 70, 1);
+        let wall = reg.state_of("minecraft:tuff_bricks", None);
+        world.set(wall_pos.0, wall_pos.1, wall_pos.2, wall);
+
+        let changed = apply_shape_passes(&[wall_pos], &mut world, reg);
+        assert!(
+            changed.contains(&(fence_pos, world.get(0, 70, 0)))
+                || world.get(0, 70, 0) != fence,
+            "the fence must be reported as a shape write"
+        );
+        let after = world.get(0, 70, 0);
+        assert_eq!(
+            reg.get_prop(after, "south").as_deref(),
+            Some("true"),
+            "the fence is adjacent to the new wall on its south face"
+        );
+        assert_eq!(reg.get_prop(after, "west").as_deref(), Some("true"));
+        assert_eq!(reg.get_prop(after, "east").as_deref(), Some("false"));
+        assert_eq!(reg.get_prop(after, "north").as_deref(), Some("false"));
+        assert_eq!(world.get(0, 70, 1), wall, "the written cell keeps its state");
+    }
+
+    /// The other measured half. A fence the placement state left pointing at air
+    /// (`mineshaft` rails are written with one bit only) is the *written* cell in
+    /// a jigsaw piece here, so `updateFromNeighbourShapes` recomputes all four
+    /// bits from the world as it stands — north/the-log-neighbour set, the rest
+    /// cleared. A fence outside both the written set and every written face is
+    /// untouched, which is how native keeps the stale bits it is known to keep.
+    #[test]
+    fn shape_passes_recompute_a_written_fence_from_the_final_world() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        let log = reg.state_of("minecraft:oak_log", None);
+        // West support only; nothing else connects.
+        world.set(-1, 70, 0, log);
+        let fence_pos = (0, 70, 0);
+        let placement = reg.with_prop(
+            reg.state_of("minecraft:oak_fence", None),
+            "north",
+            "true",
+        );
+        world.set(fence_pos.0, fence_pos.1, fence_pos.2, placement);
+        // A fence somewhere else, carrying a stale bit toward air.
+        let stale_pos = (6, 70, 6);
+        world.set(stale_pos.0, stale_pos.1, stale_pos.2, placement);
+
+        apply_shape_passes(&[fence_pos], &mut world, reg);
+
+        let after = world.get(0, 70, 0);
+        assert_eq!(
+            reg.get_prop(after, "west").as_deref(),
+            Some("true"),
+            "the recompute picks up the log the placement bit did not describe"
+        );
+        assert_eq!(
+            reg.get_prop(after, "north").as_deref(),
+            Some("false"),
+            "the placement bit pointed at air and is cleared"
+        );
+        assert_eq!(reg.get_prop(after, "east").as_deref(), Some("false"));
+        assert_eq!(reg.get_prop(after, "south").as_deref(), Some("false"));
+        assert_eq!(
+            world.get(stale_pos.0, stale_pos.1, stale_pos.2),
+            placement,
+            "a fence outside the written set keeps its state"
+        );
     }
 
     /// The oracle records the obfuscated entity class name.

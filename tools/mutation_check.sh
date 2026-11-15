@@ -1392,6 +1392,15 @@ check "a jigsaw piece stages its container Items" \
   src/jigsaw_structures.rs 'Ok(payload) => ctx.payloads.push((p, payload)),' 'Ok(_payload) => {}' \
   jigsaw_furnace_contents_reach_the_furnace_store
 
+# Native runs `StructureTemplate.placeInWorld`'s two shape passes for every caller,
+# including `SinglePoolElement`. Dropping them leaves a fence/pane/wall placed by an
+# earlier piece unconnected to a block a later piece writes beside it (measured on
+# seed 4242 chunk (-96,35): a mineshaft rail beside a trial-chamber wall).
+check "a jigsaw piece runs placeInWorld's shape passes" \
+  src/jigsaw_structures.rs '        let changed = crate::structure_template::apply_shape_passes(&written, &mut **ctx, reg);' \
+  '        let changed: Vec<(Pos, u32)> = Vec::new();' \
+  jigsaw_piece_shape_pass_connects_an_earlier_fence_to_its_wall
+
 check "a jungle temple dispenser is staged as a dispenser, not a chest" \
   src/single_piece_structures.rs '                kind: ContainerKind::BlockContainer(9),' '                kind: ContainerKind::Chest,' \
   single_piece_container_loot_is_staged_and_archaeology_is_not
