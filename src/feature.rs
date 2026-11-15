@@ -457,6 +457,9 @@ fn p_pf(j: &J) -> Option<Pf> {
 /// - every block of the `[min_gen_offset, max_gen_offset]` cube gets
 ///   `d6 = sum over points of 1/sqrt(distSqr + point_offset) + noise` where the
 ///   *noise term is added once per point*, `d7` the same over the crack points;
+/// - the cube is walked in `BlockPos.betweenClosed` order, i.e. x fastest and z
+///   slowest; the layer providers draw from the feature RNG per block, so that
+///   order *is* the draw order;
 /// - `d6 < d4` is outside, then the branches are `d1` (the filling provider: the
 ///   hollow core, and with a crack the six neighbours are replaced by their
 ///   fluid), `d2` (inner, or the alternate inner at `use_alternate_layer0_chance`
@@ -4272,7 +4275,7 @@ fn gen_bonus_chest(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
             let loot_seed = rng.next_i64();
             ctx.push_loot_container(
                 (x, y, z),
-                false,
+                crate::generation_context::ContainerKind::Chest,
                 "minecraft:chests/spawn_bonus_chest".to_owned(),
                 Some(loot_seed),
             );
@@ -4450,7 +4453,7 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
     }
     let points_n = g.distribution_points.get(rng);
     let noise = crate::generation_math::normal_new_l(ctx.g.wseed(), -4, &[1.0]);
-    let d0 = points_n as f64 / g.outer_wall_distance.max_inclusive().max(1) as f64;
+    let d0 = points_n as f64 / g.outer_wall_distance.max_inclusive() as f64;
     let d1 = 1.0 / g.layers[0].sqrt();
     let d2 = 1.0 / (g.layers[1] + d0).sqrt();
     let d3 = 1.0 / (g.layers[2] + d0).sqrt();
@@ -4499,9 +4502,13 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
         dx * dx + dy * dy + dz * dz
     };
     let mut inner_placements: Vec<(i32, i32, i32)> = Vec::new();
-    for x in (origin.0 + g.min_gen_offset)..=(origin.0 + g.max_gen_offset) {
+    // `BlockPos.betweenClosed` decodes its linear index as `x = i % width`,
+    // `y = (i / width) % height`, `z = i / (width * height)`: x is the *fastest*
+    // axis and z the slowest. The layer providers draw from the feature RNG per
+    // block, so the iteration order is the draw order.
+    for z in (origin.2 + g.min_gen_offset)..=(origin.2 + g.max_gen_offset) {
         for y in (origin.1 + g.min_gen_offset)..=(origin.1 + g.max_gen_offset) {
-            for z in (origin.2 + g.min_gen_offset)..=(origin.2 + g.max_gen_offset) {
+            for x in (origin.0 + g.min_gen_offset)..=(origin.0 + g.max_gen_offset) {
                 let at = (x, y, z);
                 let noise_v = noise.get(x as f64, y as f64, z as f64) * g.noise_multiplier;
                 let mut d6 = 0.0;
@@ -4528,12 +4535,24 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
                     ] {
                         let np = (x + dx, y + dy, z + dz);
                         if !ctx.out_of_h(np.1) {
+                            // `FluidState.createLegacyBlock()` on the neighbour, then
+                            // `setBlock(..., 0)`: a dry neighbour is left alone (air
+                            // included), a fluid block keeps its own level, and a
+                            // waterlogged solid holds source water so it becomes a plain
+                            // water block.
                             let ns = ctx.get(np.0, np.1, np.2);
-                            if !reg.is_air(ns) {
-                                // vanilla writes the neighbour's fluid legacy block: a
-                                // fluid keeps its own state, anything else becomes air
-                                let air = reg.state_of("minecraft:air", None);
-                                ctx.set(np.0, np.1, np.2, if reg.is_liquid(ns) { ns } else { air });
+                            let fluid = reg.fluid_name(ns);
+                            if fluid != "minecraft:empty" {
+                                let name = reg.name_of(ns);
+                                let legacy =
+                                    if name == "minecraft:water" || name == "minecraft:lava" {
+                                        ns
+                                    } else if fluid.ends_with("lava") {
+                                        reg.state_of("minecraft:lava", None)
+                                    } else {
+                                        reg.state_of("minecraft:water", None)
+                                    };
+                                ctx.set(np.0, np.1, np.2, legacy);
                             }
                         }
                     }
@@ -4587,14 +4606,18 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
             }
             let ns = ctx.get(np.0, np.1, np.2);
             if reg.has_prop(reg.name_of(st), "waterlogged") {
-                let wl = if reg.is_liquid(ns) { "true" } else { "false" };
-                st = reg.with_prop(st, "waterlogged", wl);
+                // `FluidState.isSource()`, not "is this block a liquid": a
+                // waterlogged solid holds source water and logs as true.
+                let source = matches!(reg.fluid_name(ns), "minecraft:water" | "minecraft:lava");
+                st = reg.with_prop(st, "waterlogged", if source { "true" } else { "false" });
             }
-            // `BuddingAmethystBlock.canClusterGrowAtState`: air, or a water *source*
-            let water_source =
-                reg.is_liquid(ns) && reg.get_prop(ns, "level").map(|l| l == "0").unwrap_or(false);
-            if reg.is_air(ns) || water_source {
-                ctx.set(np.0, np.1, np.2, st);
+            // `BuddingAmethystBlock.canClusterGrowAtState`: air, or a *water* block
+            // holding a full 8 units (a source). Lava is not a growth target.
+            let growable = reg.is_air(ns)
+                || (reg.name_of(ns) == "minecraft:water"
+                    && reg.get_prop(ns, "level").is_some_and(|l| l == "0"));
+            if growable {
+                safe_feature_set(ctx, np, st, &g.cannot_replace);
                 break;
             }
         }

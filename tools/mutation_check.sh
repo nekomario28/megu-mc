@@ -789,6 +789,27 @@ check "an ice spike is built out of packed ice" \
   '                        ctx.set(q.0, q.1, q.2, ice_block);' \
   ice_spike_builds_a_tapering_spike_on_snow
 
+check "a geode walks its generation box x-fastest, as betweenClosed does" \
+  src/feature.rs '    for z in (origin.2 + g.min_gen_offset)..=(origin.2 + g.max_gen_offset) {
+        for y in (origin.1 + g.min_gen_offset)..=(origin.1 + g.max_gen_offset) {
+            for x in (origin.0 + g.min_gen_offset)..=(origin.0 + g.max_gen_offset) {' \
+  '    for x in (origin.0 + g.min_gen_offset)..=(origin.0 + g.max_gen_offset) {
+        for y in (origin.1 + g.min_gen_offset)..=(origin.1 + g.max_gen_offset) {
+            for z in (origin.2 + g.min_gen_offset)..=(origin.2 + g.max_gen_offset) {' \
+  geode_walks_the_generation_box_in_between_closed_order
+
+check "a geode's crack blanks only the neighbours that hold a fluid" \
+  src/feature.rs '                            if fluid != "minecraft:empty" {' \
+  '                            if !reg.is_air(ns) {' \
+  geode_crack_resets_only_neighbours_that_hold_a_fluid
+
+check "a geode hangs a crystal only in air or a water source, not a liquid" \
+  src/feature.rs '                || (reg.name_of(ns) == "minecraft:water"
+                    && reg.get_prop(ns, "level").is_some_and(|l| l == "0"));' \
+  '                || (reg.is_liquid(ns)
+                    && reg.get_prop(ns, "level").is_some_and(|l| l == "0"));' \
+  geode_hangs_crystals_only_in_air_or_a_water_source
+
 check "the heightmap a feature reads is the floor the blocks are at" \
   src/generation_context.rs '        self.heightmap_above(x, z, start, kind)' \
   '        base' \

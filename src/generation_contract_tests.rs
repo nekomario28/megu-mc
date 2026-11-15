@@ -3774,6 +3774,239 @@ fn geode_layers_are_concentric_bands_around_its_points() {
     );
 }
 
+/// `GEODE_TEST_JSON` with the crack and inner-placement knobs overridden, so the
+/// tests below differ from the shape fixture only in the field under test.
+fn geode_test_json(crack: (f64, f64), placements: Option<f64>) -> String {
+    let mut s = GEODE_TEST_JSON.to_string();
+    s = s.replace(
+        "\"generate_crack_chance\": 0.0",
+        &format!("\"generate_crack_chance\": {}", crack.0),
+    );
+    s = s.replace(
+        "\"base_crack_size\": 2.0",
+        &format!("\"base_crack_size\": {}", crack.1),
+    );
+    if let Some(chance) = placements {
+        s = s.replace(
+            "\"use_potential_placements_chance\": 0.0",
+            &format!("\"use_potential_placements_chance\": {chance}"),
+        );
+        // `use_alternate_layer0_chance` is 0, so the alternate flag is never set and
+        // a requiring config would never collect a candidate at all.
+        s = s.replace(
+            "\"placements_require_layer0_alternate\": true",
+            "\"placements_require_layer0_alternate\": false",
+        );
+    }
+    s
+}
+
+/// The generation box is walked in `BlockPos.betweenClosed` order, which decodes
+/// its index as `x = i % width`, `y = (i / width) % height`, `z = i / (width *
+/// height)`: x is the fastest axis and z the slowest. Every layer provider draws
+/// from the feature RNG per written cell, so that order *is* the draw order — the
+/// x-major walk this test was written against handed vanilla's draws to a
+/// different cell in every geode and swapped amethyst/budding states in chunks
+/// (6,7) and (-96,35) of seed 4242.
+#[test]
+fn geode_walks_the_generation_box_in_between_closed_order() {
+    let cf = super::p_cf(&jparse(GEODE_TEST_JSON.as_bytes()).expect("json"))
+        .expect("the geode config must parse");
+    let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+    let mut ctx = context(&mut g);
+    ctx.test_writes = Some(Vec::new());
+    let mut rng = Xor::seed(7);
+    gen_cf(&cf, freg(), &mut ctx, &mut rng, (8, 8, 8));
+    let writes = ctx.test_writes.as_ref().expect("scripted writes");
+    assert!(
+        writes.len() > 20,
+        "the fixture must place a layer to order, got {}",
+        writes.len()
+    );
+    let mut prev: Option<(i32, i32, i32)> = None;
+    for &(p, _) in writes {
+        if let Some(q) = prev {
+            assert!(
+                (p.2, p.1, p.0) > (q.2, q.1, q.0),
+                "betweenClosed visits z slowest and x fastest, so {p:?} cannot be \
+                 written after {q:?}"
+            );
+        }
+        prev = Some(p);
+    }
+}
+
+/// The crack's six-neighbour step is `FluidState.createLegacyBlock()` on the
+/// neighbour, not "blank whatever is not air": a dry neighbour keeps its block —
+/// the over-eager version turned the geode's own amethyst shell, calcite and the
+/// surrounding deepslate into air in chunks (6,7) and (-96,35) of seed 4242 — while
+/// a waterlogged solid holds *source* water and becomes a water block.
+///
+/// The check is a differential over the write log: the reference run over a dry
+/// world must contain no neighbour write at all, and giving one *unwritten*
+/// neighbour of a carved cell a waterlogged slab must add exactly that one water
+/// write and change nothing else.
+#[test]
+fn geode_crack_resets_only_neighbours_that_hold_a_fluid() {
+    let reg = breg().unwrap();
+    let json = geode_test_json((1.0, 2.0), None);
+    let (ox, oy, oz) = (8, 8, 8);
+    let slab = reg.with_prop(
+        reg.state_of("minecraft:oak_slab", None),
+        "waterlogged",
+        "true",
+    );
+    let water = reg.state_of("minecraft:water", None);
+    let run = |extra: Option<(i32, i32, i32)>| -> Vec<((i32, i32, i32), u32)> {
+        let cf = super::p_cf(&jparse(json.as_bytes()).expect("json"))
+            .expect("the geode config must parse");
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut ctx = context(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_writes = Some(Vec::new());
+        let deepslate = reg.state_of("minecraft:deepslate", None);
+        for x in ox - 16..=ox + 16 {
+            for y in oy - 16..=oy + 16 {
+                for z in oz - 16..=oz + 16 {
+                    ctx.test_base_cell((x, y, z), deepslate);
+                }
+            }
+        }
+        if let Some(at) = extra {
+            ctx.test_base_cell(at, slab);
+        }
+        let mut rng = Xor::seed(7);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (ox, oy, oz));
+        let writes = ctx.test_writes.take().expect("scripted writes");
+        if let Some(at) = extra {
+            assert_eq!(
+                ctx.get(at.0, at.1, at.2),
+                water,
+                "a waterlogged neighbour holds source water, so the crack step writes \
+                 the fluid's legacy block there (`WaterFluid.Source.createLegacyBlock`)"
+            );
+        }
+        writes
+    };
+    let dry = run(None);
+    assert!(!dry.is_empty(), "the fixture must carve something");
+    // The crack carves cells; every cell it writes must be one the walk reached, so a
+    // neighbour write at a cell the walk never reached is the old bug's signature.
+    let dry_at: std::collections::HashSet<(i32, i32, i32)> = dry.iter().map(|&(p, _)| p).collect();
+    let mut carved: Vec<(i32, i32, i32)> = dry
+        .iter()
+        .filter(|(_, st)| reg.name_of(*st) == "minecraft:air")
+        .map(|&(p, _)| p)
+        .collect();
+    carved.sort_by_key(|p| (p.2, p.1, p.0));
+    // A neighbour of a carved cell that the walk never wrote: outside the whole
+    // geode, which is exactly where the old version injected air.
+    let mut cand = None;
+    for c in &carved {
+        for (dx, dy, dz) in [
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+            (-1, 0, 0),
+            (1, 0, 0),
+        ] {
+            let at = (c.0 + dx, c.1 + dy, c.2 + dz);
+            // The walk order makes `-x/-y/-z` neighbours final; only those can show
+            // the step's own value.
+            if !dry_at.contains(&at) && (at.2, at.1, at.0) < (c.2, c.1, c.0) {
+                cand = Some(at);
+                break;
+            }
+        }
+        if cand.is_some() {
+            break;
+        }
+    }
+    let cand = cand.expect("the fixture must carve a cell with an unwritten neighbour");
+    let wet = run(Some(cand));
+    let touched: Vec<_> = wet.iter().filter(|&&(p, _)| p == cand).cloned().collect();
+    assert!(
+        !touched.is_empty() && touched.iter().all(|&(_, st)| st == water),
+        "the crack step writes the fluid neighbour at {cand:?}: {touched:?}"
+    );
+    let rest: Vec<_> = wet.iter().filter(|&&(p, _)| p != cand).cloned().collect();
+    assert_eq!(
+        rest, dry,
+        "the crack step may only re-write the fluid neighbour, at {cand:?}"
+    );
+}
+
+/// `BuddingAmethystBlock.canClusterGrowAtState`: air, or a *water* block with a full
+/// 8-unit fluid — not "any liquid", and not a waterlogged solid. `WATERLOGGED` on
+/// the crystal comes from `FluidState.isSource()`.
+///
+/// The assertion replays the write log against the pre-generation world, so it
+/// checks the state the picker actually saw, not the final one. Under lava the only
+/// air is the geode's own core, so the buds that exist there are the ones hung into
+/// it; a lava cell is never a target even though it is a "liquid" with level 0.
+#[test]
+fn geode_hangs_crystals_only_in_air_or_a_water_source() {
+    let reg = breg().unwrap();
+    let json = geode_test_json((0.0, 2.0), Some(1.0));
+    let cf =
+        super::p_cf(&jparse(json.as_bytes()).expect("json")).expect("the geode config must parse");
+
+    let run = |fill: u32| -> Vec<((i32, i32, i32), u32)> {
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut ctx = context(&mut g);
+        ctx.test_no_terrain = true;
+        ctx.test_writes = Some(Vec::new());
+        let (ox, oy, oz) = (8, 8, 8);
+        for x in ox - 16..=ox + 16 {
+            for y in oy - 16..=oy + 16 {
+                for z in oz - 16..=oz + 16 {
+                    ctx.test_base_cell((x, y, z), fill);
+                }
+            }
+        }
+        let mut rng = Xor::seed(7);
+        gen_cf(&cf, freg(), &mut ctx, &mut rng, (ox, oy, oz));
+        ctx.test_writes.take().expect("scripted writes")
+    };
+    let bud = |st: u32| {
+        reg.name_of(st).ends_with("_amethyst_bud")
+            || reg.name_of(st) == "minecraft:amethyst_cluster"
+    };
+    for (name, fill) in [
+        ("lava", reg.state_of("minecraft:lava", None)),
+        ("water", reg.state_of("minecraft:water", None)),
+    ] {
+        let writes = run(fill);
+        let mut world: std::collections::HashMap<(i32, i32, i32), u32> =
+            std::collections::HashMap::new();
+        let mut buds = 0;
+        for &(p, st) in &writes {
+            if bud(st) {
+                buds += 1;
+                let at = world.get(&p).copied().unwrap_or(fill);
+                let water_source = at == reg.state_of("minecraft:water", None);
+                assert!(
+                    reg.is_air(at) || water_source,
+                    "{name}: a {} was hung into {} at {p:?}",
+                    reg.name_of(st),
+                    reg.name_of(at)
+                );
+                assert_eq!(
+                    reg.get_prop(st, "waterlogged").as_deref(),
+                    Some(if water_source { "true" } else { "false" }),
+                    "{name}: WATERLOGGED follows FluidState.isSource"
+                );
+            }
+            world.insert(p, st);
+        }
+        assert!(
+            buds > 0,
+            "{name}: the fixture must hang at least one crystal, else it pins nothing"
+        );
+    }
+}
+
 /// `invalid_blocks_threshold` is a guard, not a filter: the first point that lands
 /// in air past the threshold abandons the whole geode, which is why an aborted one
 /// leaves no trace at all.
