@@ -2099,13 +2099,15 @@ check "end city admission reads the first occupied height and refuses below sixt
   src/end_city_mansion.rs '    if pos.1 < 60 {
         return None;
     }
-    let builder: EndCityMansionPieceBuilder = Box::new(move |world, templates, rng, reg| {
-        let mut pieces = Vec::new();' \
+    let builder: EndCityMansionPieceBuilder = Box::new(move |_world, templates, rng, reg| {
+        let mut pieces = Vec::new();
+        let _ = start_house_tower' \
   '    if pos.1 <= 60 {
         return None;
     }
-    let builder: EndCityMansionPieceBuilder = Box::new(move |world, templates, rng, reg| {
-        let mut pieces = Vec::new();' \
+    let builder: EndCityMansionPieceBuilder = Box::new(move |_world, templates, rng, reg| {
+        let mut pieces = Vec::new();
+        let _ = start_house_tower' \
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
 check "end city house tower anchors its base floor at the caller's offset" \
@@ -2121,14 +2123,8 @@ check "mansion room origin corner probes the base grid for a corridor" \
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
 check "mansion 2x2 room mirror is the front-back flip only for the west-south entrance" \
-  src/end_city_mansion.rs '            (Dir::West, Dir::South) => {
-                dx = 15;
-                mirror = Mirror::from_index(2).unwrap();
-            }' \
-  '            (Dir::West, Dir::South) => {
-                dx = 15;
-                mirror = Mirror::from_index(1).unwrap();
-            }' \
+  src/end_city_mansion.rs '            (Dir::West, Dir::South) => (15, 0, rotation, Mirror::from_index(2).unwrap()),' \
+  '            (Dir::West, Dir::South) => (15, 0, rotation, Mirror::from_index(1).unwrap()),' \
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
 check "mansion foundation stops at the first non-air cell above sea level" \
