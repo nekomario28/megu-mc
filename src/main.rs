@@ -25858,10 +25858,6 @@ fn main() {
         let preset = std::env::var("MC_SPINE_WG_PRESET").unwrap_or_else(|_| "overworld".into());
         let preset =
             worldgen::NoisePreset::parse(&preset).expect("implemented offline noise preset");
-        if preset != worldgen::NoisePreset::Overworld && std::env::var("MC_SPINE_NOFEAT").is_err() {
-            eprintln!("[wg] dimension decoration is not implemented; offline terrain comparison requires MC_SPINE_NOFEAT");
-            std::process::exit(2);
-        }
         if preset != worldgen::NoisePreset::Overworld
             && (std::env::var_os("MC_SPINE_WG_LEAF_RUNTIME_DUMP").is_some()
                 || std::env::var_os("MC_SPINE_WG_DIAG_LOAD_WORLD").is_some())

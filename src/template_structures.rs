@@ -1495,31 +1495,44 @@ fn direction_delta(direction: u8) -> (i32, i32, i32) {
 
 /// Datapack template cache. Native keeps an `Optional<StructureTemplate>`
 /// per resource id; loading on demand keeps the piece list small.
+///
+/// `StructureTemplateManager.getOrCreate` is a plain map on a plain object, so
+/// native can reach it re-entrantly: a structure's `findGenerationPoint` may
+/// query a heightmap, which resolves the beardifier, which generates the starts
+/// of the neighbouring chunks, which reads this cache again. A `&mut self` cache
+/// cannot be handed to that inner call while the outer one holds it (measured:
+/// `--preset nether` panics in `with_templates` with "RefCell already borrowed"
+/// on the first chunk), so the mutable parts live behind their own cells and the
+/// accessor takes `&self` like the native manager.
 pub(crate) struct Templates {
-    cache: std::collections::HashMap<String, Rc<Template>>,
+    cache: std::cell::RefCell<std::collections::HashMap<String, Rc<Template>>>,
     /// `StructureTemplateManager.getOrCreate` behind a seam: this layer may not
     /// reach for the worldgen pack reader (the module graph forbids that edge),
     /// so the caller that owns the datapack supplies the bytes.
-    loader: Box<dyn FnMut(&str) -> Option<Vec<u8>>>,
+    loader: std::cell::RefCell<Box<dyn FnMut(&str) -> Option<Vec<u8>>>>,
 }
 
 impl Templates {
     pub(crate) fn new(loader: impl FnMut(&str) -> Option<Vec<u8>> + 'static) -> Self {
         Templates {
-            cache: std::collections::HashMap::new(),
-            loader: Box::new(loader),
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            loader: std::cell::RefCell::new(Box::new(loader)),
         }
     }
 
-    pub(crate) fn get(&mut self, id: &str, reg: &BReg) -> Result<Rc<Template>, &'static str> {
-        if let Some(template) = self.cache.get(id) {
+    pub(crate) fn get(&self, id: &str, reg: &BReg) -> Result<Rc<Template>, &'static str> {
+        if let Some(template) = self.cache.borrow().get(id) {
             return Ok(template.clone());
         }
-        let bytes = (self.loader)(id).ok_or("missing structure template")?;
+        // Neither borrow is held across the load, so a nested `get` from inside
+        // the loader cannot collide with this one.
+        let bytes = (self.loader.borrow_mut())(id).ok_or("missing structure template")?;
         let (_, root) = crate::nbt::read_gzip(&bytes, 16 * 1024 * 1024)
             .map_err(|_| "structure template NBT")?;
         let template = Rc::new(Template::load(&root, reg)?);
-        self.cache.insert(id.to_string(), template.clone());
+        self.cache
+            .borrow_mut()
+            .insert(id.to_string(), template.clone());
         Ok(template)
     }
 }
@@ -1889,7 +1902,7 @@ fn rule(input: RuleTest, output: u32, modifier: BlockEntityModifier) -> BlockRul
 pub(crate) type PieceBuilder = Box<
     dyn FnOnce(
         &mut dyn TemplateWorld,
-        &mut Templates,
+        &Templates,
         &mut Lcg,
         &BReg,
     ) -> Result<Vec<Piece>, &'static str>,
@@ -1897,7 +1910,7 @@ pub(crate) type PieceBuilder = Box<
 
 pub(crate) fn find_generation_point<W: TemplateWorld>(
     world: &mut W,
-    templates: &mut Templates,
+    templates: &Templates,
     kind: &StructureKind,
     ctx: &mut FindCtx<'_>,
     reg: &BReg,
@@ -2284,7 +2297,7 @@ fn ocean_ruin_find<W: TemplateWorld>(
 /// `OceanRuinPieces.addPieces`.
 #[allow(clippy::too_many_arguments)]
 fn ocean_ruin_add_pieces(
-    templates: &mut Templates,
+    templates: &Templates,
     pos: Pos,
     rotation: Rotation,
     temp: OceanTemp,
@@ -2308,7 +2321,7 @@ fn ocean_ruin_add_pieces(
 /// `OceanRuinPieces.addPiece`.
 #[allow(clippy::too_many_arguments)]
 fn ocean_ruin_add_piece(
-    templates: &mut Templates,
+    templates: &Templates,
     pos: Pos,
     rotation: Rotation,
     temp: OceanTemp,
@@ -2318,9 +2331,9 @@ fn ocean_ruin_add_piece(
     reg: &BReg,
     out: &mut Vec<Piece>,
 ) -> Result<(), &'static str> {
-    let mut add = |template_id: &str,
-                   integrity: f32,
-                   out: &mut Vec<Piece>|
+    let add = |template_id: &str,
+               integrity: f32,
+               out: &mut Vec<Piece>|
      -> Result<(), &'static str> {
         let template = templates.get(template_id, reg)?;
         let processors = ocean_ruin_processors(temp, integrity, reg);
@@ -2401,7 +2414,7 @@ fn ocean_ruin_processors(temp: OceanTemp, integrity: f32, reg: &BReg) -> Vec<Ext
 /// `OceanRuinPieces.addClusterPieces`.
 #[allow(clippy::too_many_arguments)]
 fn ocean_ruin_add_cluster(
-    templates: &mut Templates,
+    templates: &Templates,
     pos: Pos,
     rotation: Rotation,
     temp: OceanTemp,
@@ -2493,7 +2506,7 @@ const RUINED_PORTAL_GIANT: [&str; 3] = [
 
 fn ruined_portal_find<W: TemplateWorld>(
     world: &mut W,
-    templates: &mut Templates,
+    templates: &Templates,
     setups: &[PortalSetup],
     ctx: &mut FindCtx<'_>,
     reg: &BReg,
@@ -2726,7 +2739,7 @@ fn ruined_portal_processors(
 
 pub(crate) fn place_structure<W: TemplateWorld>(
     world: &mut W,
-    templates: &mut Templates,
+    templates: &Templates,
     pieces: &mut [Piece],
     post_rng: &mut Xor,
     world_seed: u64,
@@ -2760,7 +2773,7 @@ impl Piece {
     fn post_process<W: TemplateWorld>(
         &mut self,
         world: &mut W,
-        templates: &mut Templates,
+        templates: &Templates,
         post_rng: &mut Xor,
         world_seed: u64,
         chunk_bb: &mut BB,
@@ -2896,7 +2909,7 @@ impl Piece {
     fn template_pass<W: TemplateWorld>(
         &mut self,
         world: &mut W,
-        templates: &mut Templates,
+        templates: &Templates,
         post_rng: &mut Xor,
         world_seed: u64,
         clip: &BB,
@@ -3852,7 +3865,7 @@ mod template_structures_tests {
     fn run_place_extended(
         case: &J,
         reg: &BReg,
-        templates: &mut Templates,
+        templates: &Templates,
     ) -> (bool, HashMap<Pos, u32>, Vec<BeEvent>, Vec<EntitySpawn>, i32) {
         let template = match jstr(case, "template") {
             Some(path) => {
@@ -4119,7 +4132,7 @@ mod template_structures_tests {
     fn generate(
         case: &J,
         reg: &BReg,
-        templates: &mut Templates,
+        templates: &Templates,
     ) -> (TestWorld, Lcg, i64, Option<(Pos, Vec<Piece>)>) {
         let path = jstr(case, "structure").expect("structure path");
         let struct_id = path
@@ -4161,7 +4174,7 @@ mod template_structures_tests {
         case: &J,
         row: &[&str],
         reg: &BReg,
-        templates: &mut Templates,
+        templates: &Templates,
     ) -> Option<String> {
         let want_pieces: usize = row[2].parse().unwrap();
         let want_state_hash = row[3];

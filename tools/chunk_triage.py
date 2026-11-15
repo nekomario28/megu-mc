@@ -174,6 +174,39 @@ def unpack_section_biomes(section):
     return out
 
 
+def _section_is_air(sec):
+    """Is this chunk section an all-air palette (i.e. nothing to compare)?"""
+    bs = sec.get("block_states") or {}
+    palette = [canonical_palette_entry(e) for e in (bs.get("palette") or [])]
+    if not palette:
+        return True
+    return len(palette) == 1 and palette[0] in AIR_STATES
+
+
+def reject_out_of_window_sections(nbt, min_y, height, cx, cz):
+    """Fail closed when the native chunk holds blocks the port's window does not cover.
+
+    A section is written only when it is not air-only, so the port's window (`min_y`,
+    `height`) must contain every non-air section of the native chunk. Silently ignoring
+    a section outside the window would compare a subset of the native chunk and report
+    a diff-free chunk that is not actually equal.
+    """
+    lo = min_y
+    hi = min_y + height
+    for sec in nbt.get("sections") or []:
+        if "Y" not in sec or "block_states" not in sec:
+            continue
+        sy = int(sec["Y"])
+        if lo <= sy * 16 and (sy + 1) * 16 <= hi:
+            continue
+        if _section_is_air(sec):
+            continue
+        raise TriageError(
+            f"{cx},{cz}: native section Y={sy} has blocks outside the comparison window "
+            f"y={lo}..{hi - 1}; pass --min-y/--height that cover it"
+        )
+
+
 def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=None, nbt_cache=None):
     nbt = cached_read_chunk_nbt(world, cx, cz, nbt_cache)
     status = nbt.get("Status")
@@ -206,6 +239,8 @@ def load_native_chunk(world, cx, cz, *, min_y_override=None, height_override=Non
 
     if height <= 0 or height % 16 != 0 or min_y % 16 != 0:
         raise TriageError(f"chunk height/min_y must be section-aligned (got min_y={min_y}, height={height})")
+    if min_y_override is not None or height_override is not None:
+        reject_out_of_window_sections(nbt, min_y, height, cx, cz)
 
     num_sections = height // 16
     min_sy = min_y // 16

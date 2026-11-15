@@ -241,7 +241,7 @@ pub(crate) fn lowest_y_in_5by5_box_offset_7<W: TemplateWorld + ?Sized>(
 /// the pieces are built only when the builder runs, after the caller's
 /// intermediate `rngState()` draw.
 pub(crate) type EndCityMansionPieceBuilder =
-    Box<dyn FnOnce(&mut dyn TemplateWorld, &mut Templates, &mut Lcg, &BReg) -> Vec<TemplatePiece>>;
+    Box<dyn FnOnce(&mut dyn TemplateWorld, &Templates, &mut Lcg, &BReg) -> Vec<TemplatePiece>>;
 
 // ---------------------------------------------------------------- end city
 
@@ -276,7 +276,7 @@ pub(crate) const END_CITY_FAT_TOWER_BRIDGES: [(Rotation, Pos); 4] = [
 pub(crate) const END_CITY_MAX_GEN_DEPTH: i32 = 8;
 
 fn end_city_piece(
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     name: &str,
     pos: Pos,
@@ -307,7 +307,7 @@ fn end_city_piece(
 /// pivot, so `transform(ZERO, child)` is `(0, 0, 0)` and the delta is the
 /// rotated offset.
 fn end_city_add_piece(
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     parent: &TemplatePiece,
     offset: Pos,
@@ -351,7 +351,7 @@ fn find_collision_piece<'a>(list: &'a [TemplatePiece], bb: &BB) -> Option<&'a Te
 /// candidate collides with an accepted piece of a different depth.
 #[allow(clippy::too_many_arguments)]
 fn end_city_recursive_children(
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     section: EndCitySection,
     depth: i32,
@@ -399,7 +399,7 @@ fn end_city_recursive_children(
 /// `SectionGenerator.generate` for one section shape.
 #[allow(clippy::too_many_arguments)]
 fn end_city_generate(
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     section: EndCitySection,
     depth: i32,
@@ -879,7 +879,7 @@ fn end_city_generate(
 // change; until it lands the whole subsystem is reachable only from tests.
 #[allow(dead_code)]
 pub(crate) fn start_house_tower(
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     pos: Pos,
     rotation: Rotation,
@@ -1629,7 +1629,7 @@ struct MansionPlacement {
 
 /// `WoodlandMansionPieces.MansionPiecePlacer`.
 struct MansionPlacer<'a> {
-    templates: &'a mut Templates,
+    templates: &'a Templates,
     reg: &'a BReg,
     rng: &'a mut Lcg,
     start_x: i32,
@@ -2305,7 +2305,7 @@ pub(crate) fn relative_room_corner(pos: Pos, rotation: Rotation, x: i32, y: i32)
 
 /// `WoodlandMansionPieces.MansionPiecePlacer.createMansion`.
 fn create_mansion(
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     rng: &mut Lcg,
     pos: Pos,
@@ -2625,7 +2625,7 @@ fn create_mansion(
 // change; until it lands the whole subsystem is reachable only from tests.
 #[allow(dead_code)]
 pub(crate) fn generate_mansion(
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     pos: Pos,
     rotation: Rotation,
@@ -2874,7 +2874,7 @@ fn in_spawnable_bounds<W: TemplateWorld + ?Sized>(world: &W, pos: Pos) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn place_template_piece<W: TemplateWorld>(
     world: &mut W,
-    templates: &mut Templates,
+    templates: &Templates,
     reg: &BReg,
     piece: &TemplatePiece,
     flavour: StructureFlavour,
@@ -2930,7 +2930,7 @@ fn place_template_piece<W: TemplateWorld>(
 /// piece's `postProcess`, then the structure's `afterPlace`.
 pub(crate) fn place_chunk<W: TemplateWorld>(
     world: &mut W,
-    templates: &mut Templates,
+    templates: &Templates,
     pieces: &[TemplatePiece],
     flavour: StructureFlavour,
     rng: &mut Xor,
@@ -2970,7 +2970,7 @@ pub(crate) fn place_chunk<W: TemplateWorld>(
 #[allow(dead_code)]
 pub(crate) fn place_end_city_chunk<W: TemplateWorld>(
     world: &mut W,
-    templates: &mut Templates,
+    templates: &Templates,
     pieces: &[TemplatePiece],
     rng: &mut Xor,
     chunk_bb: &BB,
@@ -2997,7 +2997,7 @@ pub(crate) fn place_end_city_chunk<W: TemplateWorld>(
 #[allow(dead_code)]
 pub(crate) fn place_mansion_chunk<W: TemplateWorld>(
     world: &mut W,
-    templates: &mut Templates,
+    templates: &Templates,
     pieces: &[TemplatePiece],
     rng: &mut Xor,
     chunk_bb: &BB,
@@ -3439,7 +3439,7 @@ mod end_city_mansion_tests {
         grid_rows: &std::collections::BTreeMap<String, Vec<&str>>,
         be_rows: &std::collections::BTreeMap<String, Vec<&str>>,
         reg: &BReg,
-        templates: &mut Templates,
+        templates: &Templates,
     ) -> usize {
         let id = jstr(case, "id").expect("id");
         let kind = jstr(case, "kind").expect("kind");

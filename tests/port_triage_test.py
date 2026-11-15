@@ -148,6 +148,9 @@ if "MC_SPINE_WG_DUMP_CANON" in env:
                     rc = pt.main([
                         str(world), "0", "0", "--n", "2",
                         "--binary", str(fake_bin),
+                        # the synthetic chunk is two sections tall; the port-side window
+                        # is pinned to it instead of the preset's 384-block window
+                        "--min-y", "-64", "--height", "32",
                         "--mode", "terrain", "--noaq",
                         "--pop-order", str(pop_order), "--pop-order-scope", "recorded",
                         "--port-hm", "--canon",
@@ -211,6 +214,7 @@ Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid)
                     rc = pt.main([
                         str(world), "0", "0",
                         "--binary", str(fake_bin),
+                        "--min-y", "-64", "--height", "32",
                         "--pop-order", str(trace),
                         "--pop-order-scope", "recorded",
                         "--out-dir", str(out_dir),
@@ -240,6 +244,85 @@ Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid)
                     rc = pt.main([str(world), "0", "0", "--pop-order", str(empty_trace)])
             self.assertEqual(rc, 2)
             self.assertIn("POP_CHUNK/SPASS/DECO", err.getvalue())
+
+    def test_full_mode_nether_uses_the_noise_settings_window(self):
+        # `--preset nether --mode full` used to be refused outright. It now decorates,
+        # and the comparison window is the preset's `noise_settings` window (0..128),
+        # not an inference from which sections this native chunk happens to fill: the
+        # chunk below carries `yPos=0` and only 4 non-empty sections.
+        native = make_chunk_nbt(
+            0, 0, min_y=0, height=64,
+            blocks={(0, 60, 0): ("minecraft:netherrack", {})},
+            biome="minecraft:nether_wastes",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            world = tmp_path / "world"
+            world.mkdir()
+            (world / "level.dat").write_bytes(make_level_dat(seed=4242))
+            env_log = tmp_path / "env.json"
+            fake_bin = tmp_path / "fake-mc-spine"
+            # 8 sections of all-air for the 0..128 window the port generates.
+            fake_bin.write_text(f'''#!{sys.executable}
+import json, os, struct
+from pathlib import Path
+env = dict(os.environ)
+Path({str(env_log)!r}).write_text(json.dumps(env))
+n = int(env["MC_SPINE_WG_DUMP_N"])
+Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{n * 8 * 4096}}I", *([0] * (n * 8 * 4096))))
+''')
+            fake_bin.chmod(0o755)
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=native):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = pt.main([
+                        str(world), "0", "0",
+                        "--preset", "nether", "--mode", "full",
+                        "--binary", str(fake_bin),
+                    ])
+            self.assertEqual(rc, 0, out.getvalue())
+            env = json.loads(env_log.read_text())
+            self.assertEqual(env["MC_SPINE_WG_PRESET"], "nether")
+            # full decoration: neither the feature layer nor the carver pass is skipped
+            self.assertNotIn("MC_SPINE_NOFEAT", env)
+            self.assertNotIn("MC_SPINE_NOCARVE", env)
+
+            # A native block above the generated window must fail closed instead of
+            # being silently left out of the comparison.
+            tall = make_chunk_nbt(
+                0, 0, min_y=0, height=208,
+                blocks={(0, 200, 0): ("minecraft:netherrack", {})},
+                biome="minecraft:nether_wastes",
+            )
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=tall), \
+                 patch.object(pt, "resolve_binary", side_effect=AssertionError("must not build")):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = pt.main([
+                        str(world), "0", "0",
+                        "--preset", "nether", "--mode", "full",
+                    ])
+            self.assertEqual(rc, 2)
+            self.assertIn("outside the comparison window", err.getvalue())
+
+    def test_preset_window_defaults_and_overrides(self):
+        for preset, expected in (("overworld", (-64, 384)), ("nether", (0, 128)), ("end", (0, 128))):
+            self.assertEqual(pt.PRESET_NOISE_WINDOW[preset], expected)
+        chunk = make_chunk_nbt(0, 0, blocks={(0, -60, 0): ("minecraft:stone", {})})
+        with tempfile.TemporaryDirectory() as tmp:
+            world = Path(tmp) / "world"
+            world.mkdir()
+            (world / "level.dat").write_bytes(make_level_dat(seed=4242))
+            with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=chunk):
+                for overrides, message in (
+                    (["--height", "12"], "--height"),
+                    (["--min-y", "5"], "--min-y"),
+                ):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = pt.main([str(world), "0", "0", *overrides])
+                    self.assertEqual(rc, 2)
+                    self.assertIn(message, err.getvalue())
 
 
 if __name__ == "__main__":

@@ -635,18 +635,22 @@ fn union_bb(boxes: impl IntoIterator<Item = BB>) -> Option<BB> {
 thread_local! {
     /// `StructureTemplateManager.getOrCreate`: the native manager caches templates
     /// per world; this is the same cache, kept off the generator (whose layer may
-    /// not name `Templates`).
-    static TEMPLATES: std::cell::RefCell<Option<Templates>> = const { std::cell::RefCell::new(None) };
+    /// not name `Templates`). Held behind `Rc` so a nested generation reads the
+    /// same cache: a structure's world query can resolve the beardifier, which
+    /// generates the neighbouring chunks' starts and reaches this cache again
+    /// (see the `Templates` note on the nether-decoration panic).
+    static TEMPLATES: std::cell::RefCell<Option<std::rc::Rc<Templates>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn with_templates<R>(f: impl FnOnce(&mut Templates) -> R) -> R {
-    TEMPLATES.with(|slot| {
+fn with_templates<R>(f: impl FnOnce(&Templates) -> R) -> R {
+    let templates = TEMPLATES.with(|slot| {
         let mut held = slot.borrow_mut();
-        let templates = held.get_or_insert_with(|| {
-            Templates::new(|id| Gen::dp_resource("structure", id, "nbt"))
-        });
-        f(templates)
-    })
+        std::rc::Rc::clone(held.get_or_insert_with(|| {
+            std::rc::Rc::new(Templates::new(|id| Gen::dp_resource("structure", id, "nbt")))
+        }))
+        // the cell borrow ends here, so a nested `with_templates` can take it
+    });
+    f(&templates)
 }
 
 fn valid_biome(g: &mut Gen, allowed: &HashSet<String>, pos: (i32, i32, i32)) -> bool {
@@ -1971,6 +1975,220 @@ mod pipeline_tests {
         let mut e_ctx = FC::new(&mut end);
         e_refs.place_step(&mut e_ctx, e_step, e_pop as u64, ex, ez);
         assert!(!e_ctx.wr.is_empty(), "EndCity placement should write blocks");
+    }
+
+    /// The block names one chunk's feature layer recorded, with counts.
+    fn feature_blocks(
+        g: &mut Gen,
+        cx: i32,
+        cz: i32,
+    ) -> std::collections::BTreeMap<String, usize> {
+        let reg = crate::block_registry::breg().expect("block registry");
+        let mut out: std::collections::BTreeMap<String, usize> = Default::default();
+        for x in cx * 16..cx * 16 + 16 {
+            for z in cz * 16..cz * 16 + 16 {
+                for y in g.min_y..g.min_y + g.height {
+                    if let Some(st) = g.feature_override(x, y, z) {
+                        *out.entry(reg.name_of(st).to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// One piece box per piece of a start (the beardifier's unit).
+    fn piece_boxes(start: &Start) -> Vec<BB> {
+        match &start.pieces {
+            StartPieces::Mineshaft(_) => vec![start.bbox],
+            StartPieces::Template { pieces } => pieces.iter().map(|p| p.bb).collect(),
+            StartPieces::BuriedTreasure(p) => vec![p.bounds],
+            StartPieces::SwampHut(p) => vec![p.bounds],
+            StartPieces::DesertPyramid(p) => vec![p.bounds],
+            StartPieces::JungleTemple(p) => vec![p.bounds],
+            StartPieces::Fortress { pieces, .. } => pieces.iter().map(|p| p.bounds).collect(),
+            StartPieces::Monument { layout, .. } => {
+                layout.pieces.iter().map(|p| p.bounds).collect()
+            }
+            StartPieces::Stronghold(s) => s.pieces.iter().map(|p| p.bounds).collect(),
+            StartPieces::EndCity { pieces } | StartPieces::Mansion { pieces } => {
+                pieces.iter().map(|p| p.bb).collect()
+            }
+            StartPieces::Jigsaw { pieces } => pieces.iter().map(|p| p.bb).collect(),
+        }
+    }
+
+    /// The chunk holding the most piece volume: the one chunk where `populate` is
+    /// guaranteed to write the start's own blocks (a structure's bbox can span a dozen
+    /// chunks while its pieces sit in two of them).
+    fn densest_chunk(start: &Start) -> (i32, i32) {
+        let mut by_chunk: HashMap<(i32, i32), i64> = HashMap::new();
+        for bb in piece_boxes(start) {
+            let volume = i64::from(bb[3] - bb[0] + 1)
+                * i64::from(bb[4] - bb[1] + 1)
+                * i64::from(bb[5] - bb[2] + 1);
+            for cx in (bb[0] >> 4)..=(bb[3] >> 4) {
+                for cz in (bb[2] >> 4)..=(bb[5] >> 4) {
+                    *by_chunk.entry((cx, cz)).or_default() += volume;
+                }
+            }
+        }
+        by_chunk
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+            .map(|(chunk, _)| chunk)
+            .unwrap_or((start.bbox[0] >> 4, start.bbox[2] >> 4))
+    }
+
+    #[test]
+    fn dimension_populate_runs_that_dimensions_decorations_only() {
+        reset_cache();
+        let d = defs().expect("structure definitions load");
+
+        // Offline full-decoration parity for the two non-Overworld dimensions. Until
+        // now `MC_SPINE_WG_PRESET=nether|end` refused to run the feature layer at all
+        // (`main.rs`) and `tools/port_triage.py` refused `--mode full`, so no test could
+        // reach this path. Seed 4242 was scanned for one start of each structure; the
+        // chunk is the piece-densest chunk of that start.
+        let mut nether =
+            Gen::load_preset(4242, crate::name_to_state, worldgen::NoisePreset::Nether)
+                .expect("nether gen");
+        // Every one of the Nether's own structures: the start exists, and `populate`
+        // writes its blocks into the chunk that holds them.
+        for (id, at, marker) in [
+            ("minecraft:fortress", (-25, 6), "minecraft:nether_bricks"),
+            (
+                "minecraft:bastion_remnant",
+                (-37, -15),
+                "minecraft:polished_blackstone_bricks",
+            ),
+            (
+                "minecraft:ruined_portal_nether",
+                (-39, -26),
+                "minecraft:obsidian",
+            ),
+        ] {
+            let starts = starts_cached(&mut nether, at.0, at.1);
+            let start = starts
+                .iter()
+                .find(|s| s.structure == id)
+                .unwrap_or_else(|| panic!("{id} start in seed 4242 chunk {at:?}"));
+            let (cx, cz) = densest_chunk(start);
+            populate(&mut nether, cx, cz);
+            let blocks = feature_blocks(&mut nether, cx, cz);
+            assert!(
+                blocks.get(marker).copied().unwrap_or(0) > 0,
+                "{id}: populate({cx},{cz}) must write {marker}, got {:?}",
+                blocks.keys().take(12).collect::<Vec<_>>()
+            );
+        }
+
+        // `nether_fossil` is the one Nether structure whose `findGenerationPoint` scans
+        // block states, and `feature::populate` pre-carves the 3x3 before collecting
+        // references, so a start whose scan lands in carved air is dropped: at chunk
+        // (-24,20) `starts_cached` answers a fossil before any carver runs and none
+        // after. That is the pre-existing structure-start/`carvers` ordering question
+        // (vanilla computes starts at `structure_starts`, before noise and carvers),
+        // not something this change can settle without the native oracle, so the fossil
+        // is pinned where it is deterministic: the start and its bone blocks.
+        let fossil_chunk = (-24, 20);
+        let fossil_starts = starts_cached(&mut nether, fossil_chunk.0, fossil_chunk.1);
+        let fossil = fossil_starts
+            .iter()
+            .find(|s| s.structure == "minecraft:nether_fossil")
+            .expect("nether_fossil start in seed 4242 chunk (-24,20)");
+        let step = d.structures[&fossil.structure].step;
+        let (pop_at, fossil_bbox) = (fossil.key, fossil.bbox);
+        let pop = pop_seed(nether.wseed(), pop_at.0 * 16, pop_at.1 * 16);
+        let mut refs = References::collect(&mut nether, pop_at.0, pop_at.1);
+        let mut ctx = FC::new(&mut nether);
+        refs.place_step(&mut ctx, step, pop as u64, pop_at.0, pop_at.1);
+        let reg = crate::block_registry::breg().expect("block registry");
+        let bones = ctx
+            .wr
+            .iter()
+            .filter(|((x, _, z), st)| {
+                reg.name_of(**st) == "minecraft:bone_block"
+                    && *x >= fossil_bbox[0]
+                    && *x <= fossil_bbox[3]
+                    && *z >= fossil_bbox[2]
+                    && *z <= fossil_bbox[5]
+            })
+            .count();
+        assert!(bones > 0, "nether_fossil placement must write bone blocks");
+
+        // The same populate must not reach across dimensions. Each set below is placed
+        // in the Nether chunk space (the placement admits these chunks) and every entry
+        // is an Overworld/End structure: the tag-resolved biome set is the only filter.
+        for (set_id, cx, cz) in [
+            ("minecraft:villages", 22, 18),
+            ("minecraft:ocean_monuments", 16, 6),
+            ("minecraft:end_cities", 1, 25),
+        ] {
+            let &set = d.by_id.get(set_id).expect("structure set");
+            assert!(
+                set_admits_live(d, &mut nether, set, 4242, cx, cz, 0),
+                "{set_id} placement must admit nether chunk ({cx},{cz})"
+            );
+            for start in starts_cached(&mut nether, cx, cz).iter() {
+                let def = d.structures.get(&start.structure).expect("structure def");
+                // A member whose biome holder failed to resolve answers `true` for every
+                // biome (`valid_biome` with an empty set), which is a cross-dimension
+                // placement waiting to happen: require the resolved set to be non-empty.
+                assert!(
+                    !def.biomes.is_empty(),
+                    "{} biome set did not resolve; it can fire in any dimension",
+                    start.structure
+                );
+                assert!(
+                    start.structure != "minecraft:end_city"
+                        && !start.structure.starts_with("minecraft:village")
+                        && start.structure != "minecraft:ocean_monument",
+                    "{set_id} member {} fired in the Nether at ({cx},{cz})",
+                    start.structure
+                );
+            }
+        }
+
+        // The End: an End City start on the outer islands, populated through the feature
+        // layer, plus the End's own small feature (chorus) that the chunk carries.
+        let mut end = Gen::load_preset(4242, crate::name_to_state, worldgen::NoisePreset::End)
+            .expect("end gen");
+        let end_starts = starts_cached(&mut end, 65, 45);
+        let city = end_starts
+            .iter()
+            .find(|s| s.structure == "minecraft:end_city")
+            .expect("end_city start in seed 4242 chunk (65,45)");
+        let (ecx, ecz) = densest_chunk(city);
+        populate(&mut end, ecx, ecz);
+        let blocks = feature_blocks(&mut end, ecx, ecz);
+        assert!(
+            !blocks.is_empty(),
+            "end_city populate({ecx},{ecz}) must write blocks"
+        );
+        assert!(
+            blocks.keys().any(|k| k.starts_with("minecraft:purpur")),
+            "end_city populate must write purpur, got {:?}",
+            blocks.keys().take(12).collect::<Vec<_>>()
+        );
+        // No Nether/Overworld structure may appear in the End either.
+        for (cx, cz) in [(ecx, ecz), (65, 45), (64, 44)] {
+            for start in starts_cached(&mut end, cx, cz).iter() {
+                assert!(
+                    !matches!(
+                        start.structure.as_str(),
+                        "minecraft:fortress"
+                            | "minecraft:bastion_remnant"
+                            | "minecraft:nether_fossil"
+                            | "minecraft:ruined_portal_nether"
+                            | "minecraft:ocean_monument"
+                            | "minecraft:stronghold"
+                    ),
+                    "{} fired in the End at ({cx},{cz})",
+                    start.structure
+                );
+            }
+        }
     }
 
     #[test]

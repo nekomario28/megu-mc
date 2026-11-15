@@ -402,6 +402,25 @@ class ChunkTriageContracts(unittest.TestCase):
                     rc_bad = ct.main([tmp, "0", "0", "--n", "2", "--port-tsv", str(tsv_missing)])
                 self.assertEqual(rc_bad, 2)
 
+    def test_explicit_window_rejects_native_blocks_it_does_not_cover(self):
+        # A nether/end chunk is 256 blocks tall in `dimension_type` while its noise
+        # settings generate 0..128. Asking for the generated window must compare all of
+        # it and must not silently drop a non-air section above it.
+        inside = make_chunk_nbt(
+            0, 0, min_y=0, height=208, blocks={(0, 100, 0): ("minecraft:netherrack", {})}
+        )
+        above = make_chunk_nbt(
+            0, 0, min_y=0, height=208, blocks={(0, 200, 0): ("minecraft:netherrack", {})}
+        )
+        with patch.object(ct, "read_chunk_nbt", return_value=inside):
+            chunk = ct.load_native_chunk("world", 0, 0, min_y_override=0, height_override=128)
+        self.assertEqual((chunk["min_y"], chunk["height"]), (0, 128))
+        self.assertEqual(chunk["cells"][(100 - 0) * 256], "minecraft:netherrack")
+        with patch.object(ct, "read_chunk_nbt", return_value=above):
+            with self.assertRaises(ct.TriageError) as raised:
+                ct.load_native_chunk("world", 0, 0, min_y_override=0, height_override=128)
+        self.assertIn("outside the comparison window", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

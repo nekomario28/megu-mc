@@ -104,9 +104,12 @@ cases. The existing modern constructor over a legacy RNG is distinct from the
 old Nether biome constructor; those paths are not interchangeable.
 
 The offline `MC_SPINE_WG_PRESET=end|nether` terrain path uses the selected noise
-settings, height, interpolation cell dimensions and biome source. It requires
-`MC_SPINE_NOFEAT=1`; ordinary server dimensions, decoration and realm-specific
-save/tick/wire output are not implemented by that switch.
+settings, height, interpolation cell dimensions and biome source. It required
+`MC_SPINE_NOFEAT=1` while the feature layer was gated on the Overworld; the gate
+is gone, so those presets now run the carver and feature passes (their own
+feature order, their own structure sets by biome) and `MC_SPINE_NOFEAT=1` remains
+the layer-attribution switch it is for the Overworld. Ordinary server dimensions
+and realm-specific save/tick/wire output are still outside that switch.
 
 Four frozen, feature-free and carver-free native captures now supply all
 655,360 states from 20 chunks. Central seed-zero End/Nether chunks and negative

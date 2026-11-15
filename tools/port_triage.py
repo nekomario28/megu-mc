@@ -42,6 +42,20 @@ from vanilla_region_blocks import parse_nbt  # noqa: E402
 
 STRIP_ENV_PREFIXES = ("MC_SPINE_", "SPC_", "FSEED_", "BIOMEF_", "FEATURE_")
 
+# The y window `mc-spine` dumps, per preset. It is the preset's `noise_settings`
+# `noise.min_y`/`noise.height` (`datapacks/vanilla/data/minecraft/worldgen/noise_settings/
+# <preset>.json`), because that is the range the port generates: the_nether and the_end
+# declare a 256-block *dimension* (`dimension_type` `min_y` 0 / `height` 256) while their
+# noise settings cover 0..128, and everything above is air on both sides. Passing the
+# window explicitly keeps the dump length and the triage window in agreement instead of
+# letting `chunk_triage` infer a height from whichever sections the native chunk happens
+# to have non-empty (an air-only section is not written, so that inference is not stable).
+PRESET_NOISE_WINDOW = {
+    "overworld": (-64, 384),
+    "nether": (0, 128),
+    "end": (0, 128),
+}
+
 
 class PortTriageError(Exception):
     """Fail-closed error during preflight, build, dump, or triage."""
@@ -141,8 +155,15 @@ def preflight(args):
         raise PortTriageError(f"--n must be positive, got {args.n}")
     if args.jobs <= 0:
         raise PortTriageError(f"--jobs must be positive, got {args.jobs}")
-    if args.preset != "overworld" and args.mode == "full":
-        raise PortTriageError(f"--preset {args.preset} requires --mode terrain or --mode carvers (features unsupported)")
+    default_min_y, default_height = PRESET_NOISE_WINDOW[args.preset]
+    if args.min_y is None:
+        args.min_y = default_min_y
+    if args.height is None:
+        args.height = default_height
+    if args.height <= 0 or args.height % 16 != 0:
+        raise PortTriageError(f"--height must be a positive multiple of 16, got {args.height}")
+    if args.min_y % 16 != 0:
+        raise PortTriageError(f"--min-y must be a multiple of 16, got {args.min_y}")
     if args.pop_order:
         resolve_pop_order_spec(args.pop_order)
 
@@ -196,11 +217,15 @@ def preflight(args):
             st = nbt.get("Status")
             if st not in ("minecraft:full", "full"):
                 raise chunk_triage.TriageError(f"{world} chunk ({cx},{cz}) Status={st!r}, expected 'minecraft:full'")
+            # The port dumps exactly the preset's generated window, so a native block
+            # outside it can never be compared: reject it here, before the build.
+            chunk_triage.reject_out_of_window_sections(nbt, args.min_y, args.height, cx, cz)
             if args.world_b:
                 nbt_b = chunk_triage.cached_read_chunk_nbt(str(args.world_b), cx, cz, nbt_cache)
                 st_b = nbt_b.get("Status")
                 if st_b not in ("minecraft:full", "full"):
                     raise chunk_triage.TriageError(f"{args.world_b} chunk ({cx},{cz}) Status={st_b!r}, expected 'minecraft:full'")
+                chunk_triage.reject_out_of_window_sections(nbt_b, args.min_y, args.height, cx, cz)
             ok_chunks += 1
         except chunk_triage.TriageError as exc:
             if not args.allow_incomplete:
@@ -384,8 +409,10 @@ def build_parser():
     ap.add_argument("--port-hm", action="store_true", help="Also dump MC_SPINE_WG_DUMP_HM and compare heightmaps")
     ap.add_argument("--hm-name", default="OCEAN_FLOOR", help="Native Heightmaps entry for --port-hm (default: OCEAN_FLOOR)")
     ap.add_argument("--canon", action="store_true", help="Also emit MC_SPINE_WG_DUMP_CANON into --out-dir/--keep-dump")
-    ap.add_argument("--min-y", type=int, help="Override min_y passed to chunk_triage")
-    ap.add_argument("--height", type=int, help="Override height passed to chunk_triage")
+    ap.add_argument("--min-y", type=int,
+                    help="Override min_y passed to chunk_triage (default: the preset's noise_settings min_y)")
+    ap.add_argument("--height", type=int,
+                    help="Override height passed to chunk_triage (default: the preset's noise_settings height)")
     ap.add_argument("--halo", type=int, default=1, help="Halo radius around structure child BBs (default: 1)")
     ap.add_argument("--samples", type=int, default=5, help="Sample coords per pair/bucket (default: 5)")
     ap.add_argument("--per-chunk", action="store_true", help="In --n > 1 mode, print full report per differing chunk")
