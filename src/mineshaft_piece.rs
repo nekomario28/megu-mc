@@ -524,3 +524,5 @@ pub(crate) fn place(
 }
 
 include!("single_piece_structures.rs");
+
+include!("fortress_monument.rs");

@@ -2134,6 +2134,26 @@ check "preliminary (structure-free) columns stay out of the column cache" \
   '        if true {' \
   feature::pipeline_tests::preliminary_columns_are_not_cached_as_final
 
+check "fortress fillColumnDown stops above the build floor" \
+  src/fortress_monument.rs '        let floor = self.ctx.g.min_y + 1;' \
+  '        let floor = self.ctx.g.min_y + 2;' \
+  mineshaft_piece::fortress_monument_tests::fortress_and_monument_match_all_1211_native_oracle_vectors
+
+check "monument water box compares against sea level inclusively" \
+  src/fortress_monument.rs '                    if wy >= sea_level && st != s.water {' \
+  '                    if wy > sea_level && st != s.water {' \
+  mineshaft_piece::fortress_monument_tests::fortress_and_monument_match_all_1211_native_oracle_vectors
+
+check "fortress turn pieces draw nextInt(3) for their chest flag" \
+  src/fortress_monument.rs '            chest_pending = rng.next_bound(3) == 0;' \
+  '            chest_pending = rng.next_bound(3) != 0;' \
+  mineshaft_piece::fortress_monument_tests::fortress_and_monument_match_all_1211_native_oracle_vectors
+
+check "monument core claims the east/north/up corner room" \
+  src/fortress_monument.rs '    let core_east_north_up = g.room(core_east_north).connections[DIR_UP].expect("core east/north/up");' \
+  '    let core_east_north_up = core_east_north;' \
+  mineshaft_piece::fortress_monument_tests::fortress_and_monument_match_all_1211_native_oracle_vectors
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
