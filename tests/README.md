@@ -23,7 +23,7 @@
 
 | 段 | 確かめること | 前提 | 入口 |
 |---|---|---|---|
-| fixture 段（Python） | tracked fixture との照合、gate の exit contract、落ちられない gate の負の制御 | Python のみ（`layers_gate_test.py` だけ depsgx） | `grep -E '^python3 tests/' verify.sh` が一覧 |
+| fixture 段（Python） | tracked fixture との照合、gate の exit contract、落ちられない gate の負の制御 | Python のみ（`layers_gate_test.py` だけ depsgx） | `grep -E '^python3 tests/' tests/verify.sh` が一覧 |
 | 層・負債 | `src/` の依存方向、数えた負債が増えていないこと | depsgx（層のみ） | `layers_gate_test.py`、`tools/debt_ratchet.sh` |
 | Rust | 生成・構造物・プロトコルの実装 | 固定 toolchain と crate | `cargo test --offline --locked -j 2 -- --test-threads=1` |
 | wire / 実プロセス | loopback の実通信（spawn chunk 生成→play） | ビルド済み binary | `tools/cargo_executable.py` で binary を取り、`wire_smoke.py` 等へ渡す |
@@ -50,7 +50,7 @@ tracked-only の checkout（`git archive HEAD` を temp に展開）で、`verif
 - `layers_gate_test.py` **以外は全て pass**。`java`・`javac`・`cargo`・`rustc` をすべて 127 で
   落とす `PATH` でも同じ結果だったので、この段は JDK にも Cargo にも依存しない。
 - `layers_gate_test.py` は depsgx が無いため fail（「ツール不在は skip ではない」という契約どおり）。
-  depsgx を入れた環境では同じ段が通る。
+  depsgx を入れた環境での同じ段は、このホストでは**未測定**（CI は固定 revision を入れて回している）。
 - Rust・wire・native の各段は tracked-only で **NOT RUN**。ここに「clean clone で全部 green」とは
   書かない（測っていない）。追跡データで足りるかは `git ls-files` と
   `tools/dev_check.py` の `build_inputs`/`runtime_data` が答える範囲までしか主張しない。
