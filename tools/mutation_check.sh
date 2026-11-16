@@ -37,110 +37,246 @@ case "${MUTATION_STABILITY:-0}" in
     ;;
   esac
 
-# What the campaign reads from the tree it measures: the crate, the harness, and the data the
-# suite loads. The build `include_bytes!`s fixtures under `assets/`, `tests/` and `evidence/`,
-# so a copy without `evidence/` does not compile (measured: 13 missing-fixture errors).
-# Everything else (specs, .git, target, caches) is not an input and is not copied.
+# What the campaign reads from the tree it measures: the crate, the harness, the data the suite
+# loads, and the two files the *server* reads from its working directory. The build
+# `include_bytes!`s fixtures under `assets/`, `tests/` and `evidence/`, so a copy without
+# `evidence/` does not compile (measured: 13 missing-fixture errors). `config_packets.bin` is not a
+# build input, which is why it was missed until 2026-11-16: the wire helper's `local_server`
+# symlinks it into the server's cwd and `src/main.rs::load_config_packets` reads it there, so a copy
+# without it runs a server with empty registries and every wire gate then measures different inputs
+# than this tree does. Everything else (specs, .git, target, caches) is not an input and is not
+# copied.
 INPUTS=(Cargo.toml Cargo.lock rust-toolchain.toml src tests tools assets datapacks evidence)
+RUNTIME_INPUTS=(config_packets.bin resourcepack.zip)
 
-# Deterministic identity of those inputs: path and bytes, sorted. Used to prove the copy is the
-# source and that the source did not move while it was being copied.
-input_manifest() {
+fail() {
+  echo "FAIL  $*" >&2
+  exit 2
+}
+
+# One owner for "which bytes are the inputs". The copy, the manifest and the exclusions all read
+# this one selection, so a file cannot be copied without being hashed. Until 2026-11-16 they were
+# separate policies - `find -type f` for the manifest and `tar` over the whole directory for the
+# copy - so a nested `target/` or `__pycache__` under an input directory was copied and never
+# hashed.
+#
+# Emits `<kind>\t<path>`: `file` for a regular file, `link` for a symlink. A symlink is neither
+# copied nor followed: a mutable `src/foo.rs` link travels back to a file outside the copy, and the
+# mutant is written with `pathlib.write_text`, so the origin of a link is not ours to mutate.
+# Failing closed is the contract; a tree that needs links uses regular files instead.
+selection() {  # $1 root
+  local root="$1" path
   (
-    cd "$1" || exit 1
-    for path in "${INPUTS[@]}"; do
-      [ -e "$path" ] || continue
-      if [ -d "$path" ]; then
-        find "$path" -type f \
-          -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.mutation-backup' \
-          -not -path '*/target/*' -not -path '*/.git/*'
-      else
-        printf '%s\n' "$path"
+    cd "$root" || exit 1
+    for path in "${INPUTS[@]}" "${RUNTIME_INPUTS[@]}"; do
+      if [ -L "$path" ]; then
+        printf 'link\t%s\n' "$path"
+      elif [ -d "$path" ]; then
+        find "$path" -not -path '*/__pycache__/*' -not -name '*.pyc' \
+          -not -name '*.mutation-backup' -not -path '*/target/*' -not -path '*/.git/*' \
+          \( -type f -printf 'file\t%p\n' -o -type l -printf 'link\t%p\n' \) || exit 1
+      elif [ -f "$path" ]; then
+        printf 'file\t%s\n' "$path"
       fi
-    done | LC_ALL=C sort | xargs -r -d '\n' sha256sum
+    done
   )
 }
 
-# The snapshot half. It copies once per campaign, not once per entry, and hands the campaign its
-# own cwd and its own build target.
-if [ -z "${MUTATION_SNAPSHOT_ROOT:-}" ]; then
-  source_root=$PWD
-  if ls src/*.mutation-backup >/dev/null 2>&1; then
-    echo "refusing to run: a previous mutation was left applied in the source tree:" >&2
-    ls src/*.mutation-backup >&2
-    echo 'restore with: for f in src/*.mutation-backup; do cp "$f" "${f%.mutation-backup}" && touch "${f%.mutation-backup}" && rm "$f"; done' >&2
-    exit 2
-  fi
-  snapshot_parent=${MUTATION_SNAPSHOT_PARENT:-${XDG_CACHE_HOME:-$HOME/.cache}/mc-spine/mutation-runs}
-  mkdir -p "$snapshot_parent" || exit 2
-  # A cold private target measured 853 MiB for this crate, and the copy is 82 MiB, so a campaign
-  # needs roughly 1 GiB and must not start with less than 1.5 GiB of headroom. /tmp is a small
-  # tmpfs on some hosts, which is why the default parent is the cache directory and not TMPDIR.
-  avail_kb=$(df -Pk "$snapshot_parent" | awk 'NR == 2 { print $4 }')
-  if [ "${avail_kb:-0}" -lt 1572864 ]; then
-    echo "refusing to run: $snapshot_parent has $(( ${avail_kb:-0} / 1024 )) MiB free and a cold" >&2
-    echo "private target needs about 1 GiB. Free space, or set MUTATION_SNAPSHOT_PARENT." >&2
-    exit 2
-  fi
-  snapshot=$(mktemp -d "$snapshot_parent/run.XXXXXXXX") || exit 2
-  cleanup() {
-    [ -n "${snapshot:-}" ] && rm -rf "$snapshot"
-  }
-  trap cleanup EXIT INT TERM
-  case "$snapshot" in
-    "$source_root"/*)
-      echo "refusing to run: the snapshot must not sit inside the tree it copies" >&2
-      exit 2
-      ;;
-  esac
-  present=()
-  for path in "${INPUTS[@]}"; do
-    [ -e "$source_root/$path" ] && present+=("$path")
+# Deterministic identity of a selection: path and bytes, sorted. A failed read or hash has to be a
+# failure of the manifest, not a partial or empty answer that compares equal to another failed one.
+manifest() {  # $1 root, $2 file list, $3 output
+  local root="$1" list="$2" out="$3"
+  [ -s "$list" ] || return 1
+  ( cd "$root" && xargs -r -d '\n' sha256sum < "$list" | LC_ALL=C sort > "$out" )
+}
+
+# A path that may not exist yet, resolved physically and without creating anything: a symlinked
+# MUTATION_SNAPSHOT_PARENT has to be refused before a directory or a copy is made, and a lexical
+# comparison cannot see the alias.
+physical_path() {  # $1 path
+  local path="$1" parts=() part base
+  while [ ! -e "$path" ] && [ "$path" != "/" ] && [ "$path" != "." ]; do
+    parts=("$(basename "$path")" ${parts[@]+"${parts[@]}"})
+    path=$(dirname "$path") || return 1
   done
-  if [ ${#present[@]} -eq 0 ] || [ ! -d "$source_root/src" ]; then
-    echo "refusing to run: no src/ under $source_root, so there is nothing to measure" >&2
-    exit 2
-  fi
-  manifest_before=$(input_manifest "$source_root")
-  if ! { cd "$source_root" && tar -cf - "${present[@]}"; } | { cd "$snapshot" && tar -xf -; }; then
-    echo "FAIL  the private snapshot did not copy; nothing was measured." >&2
-    exit 2
-  fi
-  manifest_copy=$(input_manifest "$snapshot")
-  manifest_after=$(input_manifest "$source_root")
-  if [ "$manifest_before" != "$manifest_copy" ]; then
-    echo "FAIL  the snapshot is not byte-identical to the source it was copied from:" >&2
-    diff <(printf '%s\n' "$manifest_before") <(printf '%s\n' "$manifest_copy") | head -20 >&2
-    exit 2
-  fi
-  if [ "$manifest_before" != "$manifest_after" ]; then
-    echo "FAIL  the source tree changed while it was being copied, so a campaign here would mix" >&2
-    echo "      two revisions. Nothing was measured; re-run when the tree is quiet." >&2
-    diff <(printf '%s\n' "$manifest_before") <(printf '%s\n' "$manifest_after") | head -20 >&2
-    exit 2
-  fi
-  identity=$(printf '%s' "$manifest_before" | sha256sum | cut -d' ' -f1)
-  echo "mutation check: private snapshot $snapshot"
-  echo "  source   $source_root"
-  echo "  identity $identity (${#present[@]} inputs: ${present[*]})"
-  echo "  target   $snapshot/target (the caller's CARGO_TARGET_DIR is not used)"
-  echo "  the snapshot is removed on exit; a killed run can leave it behind and only there"
-  MUTATION_SNAPSHOT_ROOT=$snapshot CARGO_TARGET_DIR=$snapshot/target \
-    bash "$snapshot/tools/mutation_check.sh" "$@"
-  exit $?
+  base=$(cd "$path" 2>/dev/null && pwd -P) || return 1
+  for part in ${parts[@]+"${parts[@]}"}; do base="$base/$part"; done
+  printf '%s\n' "$base"
+}
+
+# The snapshot. One invocation: copy the inputs, prove the copy, then continue the campaign in this
+# same shell with its cwd and its CARGO_TARGET_DIR inside the snapshot.
+#
+# Until 2026-11-16 this re-entered the copy's own script through MUTATION_SNAPSHOT_ROOT, and that
+# variable was an entry point: `MUTATION_SNAPSHOT_ROOT=$PWD` skipped the snapshot entirely and put
+# the campaign back on the live tree with the caller's CARGO_TARGET_DIR, which is exactly the bug
+# the snapshot exists to prevent. It is refused here, before anything is created, copied or
+# measured.
+if [ -n "${MUTATION_SNAPSHOT_ROOT:-}" ]; then
+  echo "refusing to run: MUTATION_SNAPSHOT_ROOT marked the old internal recursion, not an entry" >&2
+  echo "      point, and a campaign honours no such request. Nothing was copied or measured." >&2
+  exit 2
 fi
 
-# The campaign half. Its cwd is the snapshot it was handed, and it must be: every write below
-# lands in `src/` relative to here.
-if [ "$(pwd -P)" != "$(cd "$MUTATION_SNAPSHOT_ROOT" && pwd -P)" ]; then
-  echo "MUTATION_SNAPSHOT_ROOT is $MUTATION_SNAPSHOT_ROOT but this script is running in $(pwd -P)" >&2
-  exit 2
-fi
+source_root=$(pwd -P) || fail "could not resolve the working tree"
 if ls src/*.mutation-backup >/dev/null 2>&1; then
-  echo "refusing to run: a previous mutation was left applied in this snapshot:" >&2
+  echo "refusing to run: a previous mutation was left applied in the source tree:" >&2
   ls src/*.mutation-backup >&2
+  echo 'restore with: for f in src/*.mutation-backup; do cp "$f" "${f%.mutation-backup}" && touch "${f%.mutation-backup}" && rm "$f"; done' >&2
   exit 2
 fi
+if [ ! -d "$source_root/src" ]; then
+  echo "refusing to run: no src/ under $source_root, so there is nothing to measure" >&2
+  exit 2
+fi
+
+snapshot_parent=${MUTATION_SNAPSHOT_PARENT:-${XDG_CACHE_HOME:-$HOME/.cache}/mc-spine/mutation-runs}
+resolved_parent=$(physical_path "$snapshot_parent") ||
+  fail "could not resolve the snapshot parent $snapshot_parent"
+snapshot_parent=$resolved_parent
+case "$snapshot_parent/" in
+  "$source_root"/*)
+    echo "refusing to run: the snapshot parent $snapshot_parent is inside the tree it copies." >&2
+    echo "      Nothing was created or measured; point MUTATION_SNAPSHOT_PARENT elsewhere." >&2
+    exit 2
+    ;;
+esac
+mkdir -p "$snapshot_parent" || fail "could not create $snapshot_parent"
+# A cold private target measured 853 MiB for this crate, and the copy is 82 MiB, so a campaign
+# needs roughly 1 GiB and must not start with less than 1.5 GiB of headroom. /tmp is a small
+# tmpfs on some hosts, which is why the default parent is the cache directory and not TMPDIR.
+avail_kb=$(df -Pk "$snapshot_parent" | awk 'NR == 2 { print $4 }')
+if [ "${avail_kb:-0}" -lt 1572864 ]; then
+  echo "refusing to run: $snapshot_parent has $(( ${avail_kb:-0} / 1024 )) MiB free and a cold" >&2
+  echo "private target needs about 1 GiB. Free space, or set MUTATION_SNAPSHOT_PARENT." >&2
+  exit 2
+fi
+snapshot=$(mktemp -d "$snapshot_parent/run.XXXXXXXX") || fail "could not create a private snapshot"
+resolved=$(cd "$snapshot" && pwd -P) || fail "could not resolve the private snapshot $snapshot"
+snapshot=$resolved
+case "$snapshot/" in
+  "$source_root"/*)
+    echo "refusing to run: the snapshot $snapshot is inside the tree it copies" >&2
+    rm -rf "$snapshot"
+    exit 2
+    ;;
+esac
+work=$(mktemp -d) || fail "could not create a scratch directory for the manifests"
+cleanup() {
+  [ -n "${snapshot:-}" ] && rm -rf "$snapshot"
+  [ -n "${work:-}" ] && rm -rf "$work"
+}
+trap cleanup EXIT
+# EXIT runs on these, so the snapshot and the scratch directory are removed on a signal too.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if ! selection "$source_root" > "$work/selection"; then
+  echo "FAIL  the input set under $source_root could not be enumerated; a find or a permission" >&2
+  echo "      error is not an empty tree. Nothing was copied or measured." >&2
+  exit 2
+fi
+if [ ! -s "$work/selection" ]; then
+  echo "refusing to run: the input set under $source_root is empty, so there is nothing to measure" >&2
+  exit 2
+fi
+if grep -q $'^link\t' "$work/selection"; then
+  echo "refusing to run: the inputs contain symlinks, which cannot be copied without leaving a" >&2
+  echo "      path back into the tree being mutated. Make these regular files:" >&2
+  grep $'^link\t' "$work/selection" | cut -f2- | sed 's/^/      /' >&2
+  exit 2
+fi
+if ! cut -f2- "$work/selection" > "$work/files"; then
+  fail "the input selection could not be reduced to paths"
+fi
+for path in "${RUNTIME_INPUTS[@]}"; do
+  if [ ! -f "$source_root/$path" ]; then
+    echo "refusing to run: $path is missing from $source_root. src/main.rs reads it from the" >&2
+    echo "      working directory, so the wire gates would measure a server without it. Restore" >&2
+    echo "      the file instead of copying a tree that does not have it." >&2
+    exit 2
+  fi
+done
+
+if ! manifest "$source_root" "$work/files" "$work/before"; then
+  echo "FAIL  the input manifest of $source_root could not be taken (a read or a hash error)." >&2
+  echo "      Nothing was copied or measured." >&2
+  exit 2
+fi
+if [ ! -s "$work/before" ]; then
+  fail "the input manifest of $source_root is empty, so a comparison would prove nothing"
+fi
+selected=$(wc -l < "$work/files") || fail "could not count the input selection"
+hashed=$(wc -l < "$work/before") || fail "could not count the input manifest"
+if [ "$selected" -ne "$hashed" ]; then
+  echo "FAIL  $selected inputs were selected but $hashed were hashed; a failed read must not" >&2
+  echo "      shrink the manifest that is compared against the copy." >&2
+  exit 2
+fi
+if ! tar -cf - -C "$source_root" -T "$work/files" | tar -xf - -C "$snapshot"; then
+  echo "FAIL  the private snapshot did not copy; nothing was measured." >&2
+  exit 2
+fi
+if ! manifest "$snapshot" "$work/files" "$work/copied"; then
+  echo "FAIL  the copy's manifest could not be taken (a read or a hash error). A failing hash is" >&2
+  echo "      not a matching copy. Nothing was measured." >&2
+  exit 2
+fi
+if ! manifest "$source_root" "$work/files" "$work/after"; then
+  echo "FAIL  the source's manifest could not be re-taken after the copy (a read or a hash error)." >&2
+  echo "      Nothing was measured." >&2
+  exit 2
+fi
+if ! cmp -s "$work/before" "$work/copied"; then
+  echo "FAIL  the snapshot is not byte-identical to the source it was copied from:" >&2
+  diff "$work/before" "$work/copied" | head -20 >&2
+  exit 2
+fi
+if ! cmp -s "$work/before" "$work/after"; then
+  echo "FAIL  the source tree changed while it was being copied, so a campaign here would mix" >&2
+  echo "      two revisions. Nothing was measured; re-run when the tree is quiet." >&2
+  diff "$work/before" "$work/after" | head -20 >&2
+  exit 2
+fi
+
+if ! identity=$(sha256sum < "$work/before" | cut -d' ' -f1); then
+  fail "could not reduce the input manifest to an identity"
+fi
+echo "mutation check: private snapshot $snapshot"
+echo "  source   $source_root"
+echo "  identity $identity ($selected files: ${INPUTS[*]} ${RUNTIME_INPUTS[*]})"
+echo "  target   $snapshot/target (the caller's CARGO_TARGET_DIR is not used)"
+echo "  the snapshot is removed on exit; a killed run can leave it behind and only there"
+
+# "The manifests matched" is not the same claim as "the inputs are in the copy": both sides read
+# one selection, so an input the selection forgot is absent from both. These check the input set
+# and the server's cwd inputs against the copy by name and by hash.
+for path in "${INPUTS[@]}" "${RUNTIME_INPUTS[@]}"; do
+  if [ -e "$source_root/$path" ] && [ ! -e "$snapshot/$path" ]; then
+    echo "FAIL  $path is an input of this tree but is not in the snapshot; the copy dropped it." >&2
+    exit 2
+  fi
+done
+for path in "${RUNTIME_INPUTS[@]}"; do
+  if ! source_sha=$(sha256sum "$source_root/$path" | cut -d' ' -f1); then
+    fail "could not hash $source_root/$path"
+  fi
+  if ! copy_sha=$(sha256sum "$snapshot/$path" | cut -d' ' -f1); then
+    fail "could not hash $snapshot/$path"
+  fi
+  case "${source_sha:-}" in
+    '' | *[!0-9a-f]*) fail "$path: the source hash is not a digest" ;;
+  esac
+  if [ "$source_sha" != "$copy_sha" ]; then
+    echo "FAIL  $snapshot/$path is not byte-identical to $source_root/$path" >&2
+    exit 2
+  fi
+  echo "  wire input $path $copy_sha (read from the server's cwd by src/main.rs)"
+  unset source_sha copy_sha
+done
+
+cd "$snapshot" || fail "could not enter the private snapshot"
+export CARGO_TARGET_DIR="$snapshot/target"
 
 CARGO_FLAGS=(--locked -j "${CARGO_BUILD_JOBS:-2}")
 if [ "${MUTATION_RELEASE:-0}" = 1 ]; then
@@ -193,7 +329,9 @@ restore() {
     touch "$mut_file"
   fi
 }
-trap 'restore; rm -f "$log" "$artifacts"' EXIT
+# mid-mutation, in the snapshot, which `cleanup` removes anyway; the snapshot is the only copy the
+# campaign ever writes to.
+trap 'restore; rm -f "$log" "$artifacts"; cleanup' EXIT
 
 # One execution owner for positive controls and mutants. Status is local to check().
 run_filter() {
@@ -400,7 +538,7 @@ verify_restored() {
   if [ "$want" != "$got" ]; then
     echo "BROKEN $name"
     echo "      $mut_file did not come back byte-identical after the mutation."
-    echo "      This campaign runs on the private snapshot $MUTATION_SNAPSHOT_ROOT; the tree you"
+    echo "      This campaign runs on the private snapshot $snapshot; the tree you"
     echo "      edited was not touched. Stopping rather than measuring a mutated copy."
     exit 3
   fi
