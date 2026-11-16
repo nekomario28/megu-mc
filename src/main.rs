@@ -1754,6 +1754,17 @@ struct Drop {
     comps: Comps,
     age: i32,
 }
+impl Drop {
+    /// Vanilla keeps an ItemEntity out of reach for its pickup delay. Both collectors of a
+    /// drop ask this one question: the fake-actor absorb and the real client's take. The
+    /// client path did not ask it, so a player standing on a drop collected it on the tick
+    /// it spawned while the actor path refused the same entity. The age read here is the
+    /// live entity's, counted in server ticks by the pass that also expires it, so the
+    /// delay keeps its existing cadence instead of gaining a second clock.
+    fn pickup_delay_elapsed(&self) -> bool {
+        self.age >= server_ticks(PICKUP_DELAY_GT) as i32
+    }
+}
 static DROPS: OnceLock<Mutex<Vec<Drop>>> = OnceLock::new();
 fn drops() -> &'static Mutex<Vec<Drop>> {
     DROPS.get_or_init(|| Mutex::new(Vec::new()))
@@ -4132,7 +4143,7 @@ fn actor_tick() {
             let mut shrunk: Vec<(i32, Vec<u8>)> = vec![];
             for d in ds.iter_mut() {
                 // vanilla: freshly spawned/thrown drops can't be picked up for ~10 ticks
-                if d.age < server_ticks(PICKUP_DELAY_GT) as i32 {
+                if !d.pickup_delay_elapsed() {
                     continue;
                 }
                 if (d.x - ax).powi(2) + (d.y - ay).powi(2) + (d.z - az).powi(2) < 2.25 {
@@ -4655,6 +4666,13 @@ fn drop_tick() {
             let Some(d) = ds.iter_mut().find(|d| d.eid == deid) else {
                 continue;
             };
+            // The delay belongs to the take, not to the candidate scan: it is judged on
+            // the live entity under the same locks the insertion uses, so a drop spawned
+            // after the snapshot above, or merged into a fresher age, is still too young
+            // to collect on this tick.
+            if !d.pickup_delay_elapsed() {
+                continue;
+            }
             let mut source = (d.item, d.cnt, d.comps.clone());
             let original = source.1;
             let before = inv.clone();

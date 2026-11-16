@@ -806,6 +806,314 @@ fn pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack() {
     }
 }
 
+// The pickup delay is one rule with two consumers. These fixtures drive the real `drop_tick`
+// caller over a TCP `Client`, so a green tick means the client's slots, the live entity and the
+// packets agree - not that the age counter advanced. The insertion rules themselves are pinned
+// by the native 1.21.1 fixture; what is measured here is when they are allowed to run.
+
+/// The negative control for the delay guard. The candidate scan in `drop_tick` copies positions,
+/// not ages, so the decision has to be taken on the live entity under the take's own locks. Before
+/// the guard a client standing on a fresh drop collected it on the tick it spawned: this test then
+/// sees a changed inventory, an emptied entity and packets on a socket that must stay silent.
+#[test]
+fn pickup_tick_refuses_a_drop_inside_its_pickup_delay() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (client, mut receiver) = client_pair();
+    let stone = name_to_item("stone").unwrap();
+    let eid = client.eid;
+    // Register the client as an observer, so "no packet" means the take did not happen rather
+    // than the client being outside the broadcast audience.
+    client.seen.lock().unwrap().insert(9120);
+    let client = Arc::new(client);
+    *clients().lock().unwrap() = vec![client.clone()];
+    let delay = server_ticks(PICKUP_DELAY_GT) as i32;
+    assert!(
+        delay > 1,
+        "the boundary fixture needs at least one tick below the delay"
+    );
+    drops().lock().unwrap().push(Drop {
+        eid: 9120,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 10,
+        comps: vec![],
+        age: 0,
+    });
+    // Fresh. The cell is hot, so the same tick that refuses the take advances the age.
+    drop_tick();
+    let fresh = drops()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|d| d.eid == 9120)
+        .map(|d| (d.age, d.cnt));
+    assert_eq!(
+        fresh,
+        Some((1, 10)),
+        "a refused take must leave the entity's count and its aging stage alone"
+    );
+    let young = client.inv.lock().unwrap().clone();
+    assert!(
+        young.is_empty(),
+        "a fresh drop was collected: {young:?}"
+    );
+    // Boundary: one tick short still refuses, and that tick is also the one that ages the entity
+    // up to the threshold. The age stage stays after the take; the test reads the order, not a
+    // reordering done to make the test pass.
+    for d in drops().lock().unwrap().iter_mut() {
+        if d.eid == 9120 {
+            d.age = delay - 1;
+        }
+    }
+    drop_tick();
+    let at_edge = drops()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|d| d.eid == 9120)
+        .map(|d| (d.age, d.cnt));
+    assert_eq!(
+        at_edge,
+        Some((delay, 10)),
+        "age {} is inside the delay and must refuse the take",
+        delay - 1
+    );
+    let edge = client.inv.lock().unwrap().clone();
+    assert!(
+        edge.is_empty(),
+        "the tick before the threshold collected: {edge:?}"
+    );
+    client
+        .sock
+        .lock()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    let mut packets = Vec::new();
+    while let Some((id, body)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
+        packets.push((id, body));
+    }
+    assert!(
+        packets.is_empty(),
+        "a drop inside its delay was reported to the client: {packets:?}"
+    );
+    // The call after the boundary is the first one allowed to take it, so the refusal above was
+    // the delay and not a candidate the scan never offers again.
+    drop_tick();
+    assert!(
+        drops().lock().unwrap().iter().all(|d| d.eid != 9120),
+        "the drop that reached the delay was never collected"
+    );
+    assert_eq!(
+        client.inv.lock().unwrap().get(&36),
+        Some(&(stone, 10, vec![])),
+        "the aged drop must reach the selected slot, collector {eid}"
+    );
+}
+
+/// The positive half of the same boundary: at exactly the delay the take runs, and it keeps the
+/// whole contract the native fixture pins - both slots the stack spills into, the take event
+/// carrying the entity's original count, and the destroy that removes the entity.
+#[test]
+fn pickup_tick_collects_at_the_delay_and_reports_the_original_count() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (client, mut receiver) = client_pair();
+    let stone = name_to_item("stone").unwrap();
+    let eid = client.eid;
+    client.seen.lock().unwrap().insert(9130);
+    // The offhand holds 60, so the ten items spill from it into the selected slot: two slots
+    // must change, and the entity is still consumed whole.
+    client.inv.lock().unwrap().insert(45, (stone, 60, vec![]));
+    let client = Arc::new(client);
+    *clients().lock().unwrap() = vec![client.clone()];
+    drops().lock().unwrap().push(Drop {
+        eid: 9130,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 10,
+        comps: vec![],
+        age: server_ticks(PICKUP_DELAY_GT) as i32,
+    });
+    drop_tick();
+    assert!(
+        drops().lock().unwrap().is_empty(),
+        "a drop at its delay must be consumed whole"
+    );
+    assert_eq!(
+        client.inv.lock().unwrap().get(&45),
+        Some(&(stone, 64, vec![])),
+        "the offhand must be filled from the aged drop"
+    );
+    assert_eq!(
+        client.inv.lock().unwrap().get(&36),
+        Some(&(stone, 6, vec![])),
+        "the spill must reach the selected slot"
+    );
+    client
+        .sock
+        .lock()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    let mut packets = Vec::new();
+    while let Some(packet) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
+        packets.push(packet);
+    }
+    let ids: Vec<i64> = packets.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        ids,
+        vec![0x15, 0x15, 0x6f, 0x42],
+        "pickup packets were {packets:?}"
+    );
+    let (_, body) = packets
+        .iter()
+        .find(|(id, _)| *id == 0x6f)
+        .expect("the take event");
+    let mut body = body.as_slice();
+    assert_eq!(read_varint(&mut body), Some(9130), "take names the entity");
+    assert_eq!(read_varint(&mut body), Some(eid as i64), "take names the collector");
+    assert_eq!(read_varint(&mut body), Some(10), "take carries the original count");
+}
+
+/// A full inventory only partially absorbs a drop, and that partial result is a `false` return in
+/// 1.21.1 - so no take event, a metadata update with the remainder, and the entity still alive.
+/// The delay must not change any of it: the tick before does nothing at all.
+#[test]
+fn pickup_tick_delay_boundary_keeps_the_partial_insert_and_leftover() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (client, mut receiver) = client_pair();
+    let stone = name_to_item("stone").unwrap();
+    let dirt = name_to_item("dirt").unwrap();
+    client.seen.lock().unwrap().insert(9140);
+    *client.inv.lock().unwrap() = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
+    client.inv.lock().unwrap().insert(45, (stone, 60, vec![]));
+    let client = Arc::new(client);
+    *clients().lock().unwrap() = vec![client.clone()];
+    let delay = server_ticks(PICKUP_DELAY_GT) as i32;
+    drops().lock().unwrap().push(Drop {
+        eid: 9140,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 10,
+        comps: vec![],
+        age: delay - 1,
+    });
+    drop_tick();
+    assert_eq!(
+        client.inv.lock().unwrap().get(&45),
+        Some(&(stone, 60, vec![])),
+        "the tick before the threshold merged into the offhand"
+    );
+    assert_eq!(
+        client.inv.lock().unwrap().get(&9),
+        Some(&(dirt, 64, vec![])),
+        "the tick before the threshold rewrote another slot"
+    );
+    let before = drops()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|d| d.eid == 9140)
+        .map(|d| (d.age, d.cnt));
+    assert_eq!(before, Some((delay, 10)), "the entity moved inside its delay");
+    // One tick later the same fixture runs the pinned insertion rule. Nothing about the partial
+    // result is different for having waited.
+    drop_tick();
+    let remaining: Vec<u8> = drops().lock().unwrap().iter().map(|d| d.cnt).collect();
+    let offhand = client.inv.lock().unwrap().get(&45).cloned();
+    assert_eq!(remaining, [6], "the leftover must stay on the entity");
+    assert_eq!(offhand, Some((stone, 64, vec![])));
+    client
+        .sock
+        .lock()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    let mut packets = Vec::new();
+    while let Some(packet) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
+        packets.push(packet);
+    }
+    let ids: Vec<i64> = packets.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![0x15, 0x58], "partial pickup packets were {packets:?}");
+    let (_, body) = packets
+        .iter()
+        .find(|(id, _)| *id == 0x58)
+        .expect("the entity metadata update");
+    let mut body = body.as_slice();
+    assert_eq!(read_varint(&mut body), Some(9140));
+    assert_eq!(read_varint(&mut body), Some(8), "metadata key 8 is the item");
+    assert_eq!(read_varint(&mut body), Some(7), "type 7 is item_stack");
+    assert_eq!(read_varint(&mut body), Some(6), "the leftover count on the wire");
+}
+
+/// The delay is per entity, not per player: a full player keeps refusing the take, and the next
+/// eligible player must still get the drop once it has aged. Judging the age before the candidate
+/// list is built would have to remember this; judging it on the live entity cannot lose it.
+#[test]
+fn pickup_tick_delay_keeps_the_next_player_eligible() {
+    let _guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+    let (first, _first_rx) = client_pair();
+    let (mut second, _second_rx) = client_pair();
+    second.eid += 1;
+    let first = Arc::new(first);
+    let second = Arc::new(second);
+    *clients().lock().unwrap() = vec![first.clone(), second.clone()];
+    let stone = name_to_item("stone").unwrap();
+    let dirt = name_to_item("dirt").unwrap();
+    *first.inv.lock().unwrap() = (9..=44).map(|key| (key, (dirt, 64, vec![]))).collect();
+    let full = first.inv.lock().unwrap().clone();
+    let delay = server_ticks(PICKUP_DELAY_GT) as i32;
+    drops().lock().unwrap().push(Drop {
+        eid: 9150,
+        x: 0.0,
+        y: 70.0,
+        z: 0.0,
+        item: stone,
+        cnt: 10,
+        comps: vec![],
+        age: delay - 1,
+    });
+    drop_tick();
+    assert!(
+        second.inv.lock().unwrap().is_empty(),
+        "the second player collected a drop inside its delay"
+    );
+    assert_eq!(
+        drops().lock().unwrap().iter().map(|d| (d.eid, d.cnt)).collect::<Vec<_>>(),
+        [(9150, 10)],
+        "a drop inside its delay must stay on the ground"
+    );
+    drop_tick();
+    assert!(
+        drops().lock().unwrap().is_empty(),
+        "the full player monopolized the drop instead of letting the next one take it"
+    );
+    assert_eq!(
+        *second.inv.lock().unwrap(),
+        HashMap::from([(36, (stone, 10, vec![]))]),
+        "the next eligible player must receive the aged drop"
+    );
+    assert_eq!(
+        *first.inv.lock().unwrap(),
+        full,
+        "the full player's inventory must not change"
+    );
+}
+
 /// Sets a test's saver-thread stop flag when dropped, so a panic does not leave the thread taking
 /// `SAVE_LOCK` for the rest of the test binary.
 struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);

@@ -1314,6 +1314,14 @@ check "the pickup tick forwards infinite materials to inventory insertion" \
   '        let creative = false;' \
   pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
+check "a real client observes the pickup delay the actor path already enforced" \
+  src/main.rs '            if !d.pickup_delay_elapsed() {
+                continue;
+            }
+            let mut source = (d.item, d.cnt, d.comps.clone());' \
+  '            let mut source = (d.item, d.cnt, d.comps.clone());' \
+  pickup_tick_refuses_a_drop_inside_its_pickup_delay
+
 # Pinned surface-loader slice: codecs, weather dispatch, and its shared noise owner.
 check "the pinned inline surface rule is actually installed" \
   src/worldgen.rs 'ns.get("surface_rule").or_else(|| ns.get("material_rule"))' \
