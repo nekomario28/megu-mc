@@ -51,6 +51,17 @@ declare -A baseline_ok=()
 # survives in the tree is worse than a failing check, so this is verified rather than assumed.
 hash_of() { sha256sum "$1" | cut -d' ' -f1; }
 
+# A caught mutant whose failing assertion is thrown away is a count, not evidence. With
+# MUTATION_LOG_DIR set, keep the run's own output next to the caller's receipt: the mutant
+# log is what proves the named test actually went red, and the restored log is the control.
+keep_log() {
+  [ -n "${MUTATION_LOG_DIR:-}" ] || return 0
+  mkdir -p "$MUTATION_LOG_DIR"
+  local slug
+  slug=$(printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-//; s/-$//')
+  cp "$log" "$MUTATION_LOG_DIR/$slug.$2.log"
+}
+
 restore() {
   if [ -n "${backup:-}" ] && [ -f "$backup" ]; then
     # Copy, then touch, rather than mv. `mv` gives the file back the backup's timestamp, which is
@@ -92,7 +103,7 @@ control() {
   else
     pattern='^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored'
   fi
-  if [ "$status" = green ] && grep -qE "$pattern" "$log"; then return 0; fi
+  if [ "$status" = green ] && grep -qE "$pattern" "$log"; then keep_log "$name" "$phase"; return 0; fi
   echo "FAIL  $name: $phase control did not pass the required test"
   tail -15 "$log"
   return 1
@@ -141,6 +152,7 @@ PY
   fi
 
   run_filter "$test_filter"
+  keep_log "$name" mutant
 
   # cargo prints "error: test failed" for a failing test, so the exit code and the word error cannot
   # tell a compile failure from an assertion failure. The lines the harness itself prints can.
