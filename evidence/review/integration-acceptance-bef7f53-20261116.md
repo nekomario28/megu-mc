@@ -405,7 +405,10 @@ assertion や golden output の弱体化はしていない。
 2. **F2（未実行 mutation）**: 追加 15 entry のうち未実行だった 6B の 1 件を focused で proved。
    baseline green → mutant `test result: FAILED`（assertion、コンパイルエラー 0）→ restored
    green。既存 14 log は 14 のまま、新しい 3 本を別ディレクトリに保存（§5・§6）。
-   0 件選択は exit 1。
+   0 件選択は exit 1。ただしこれは**1 回の観測**である: `MUTATION_STABILITY` は既定 off で、
+   2 回目も赤いこと（flake でないこと）は確かめていない。stability 経路も再コンパイル済み
+   バイナリと assertion の同一性を再検査しないので、1 回の赤を「stable な catch」とは
+   主張しない（§17）。
 3. **F3（FULL の文脈依存）**: §3 の「FULL は他セルを読まない ⇒ 文脈依存は明るさだけ」を
    撤回し、表の適用範囲を観測したキャッシュ済み/クエリ/生成済み state に限定。
    `moving_piston` 2063..2074 と live block entity が測定外であること、port が moving_piston を
@@ -433,3 +436,44 @@ assertion や golden output の弱体化はしていない。
 - 元の F1 の誤集計は、`exit=` 行だけを出す inline ループに集計 assert が無かったことに
   よる。今回のランナーは `SCANNED == ATTEMPTED == ENTRY` / `PASS+FAIL == ATTEMPTED` /
   `FAIL == 0` を assert し、赤い実行で実際に exit 1 になることを示した（§5.1）。
+- `tools/mutation_check.sh` は src を**その場で書き換える**。SIGKILL されると mutant と
+  `.mutation-backup` が残る（次回起動は backup を見て exit 2 で拒む）。本 pass で過去の
+  SIGKILL 残留が実際に起きたことは確認していない（未証明）。今回の変異実行は隔離 worktree と
+  専用 target で、他のビルド・読み手を同時に走らせずに行った。canonical
+  `/home/yuu/mc-spine` ではハーネスを実行していない。
+- 同ハーネスの restored 制御は「復元後の再ビルド＋再 green」を記録するが、復元の検証は
+  **source の sha256** までで、使われたバイナリの同一性は検査しない。今回の実行では追加で
+  検証した（§18）: `src/*.mutation-backup` 0、`git status` 0 行、receipt のバイナリ sha256
+  `8aba6f80…` は復元ログ（14:23:26）より**後**のビルド（14:29:14）で、変異で赤くなるテストが
+  そのバイナリで green。mtime と挙動の両方で「mutant バイナリではない」ことを示す。
+
+## 18. 最終候補の実測（2026-11-16, HEAD `aeea52a`）
+
+最終候補 `aeea52ad…`（`2799a36` + 独立レビュー報告 + この remediation）上で、source-bound に
+取り直した。すべて `/home/yuu/mc-spine-local/audit/final-landing-20261116-1415/`。
+
+| 検証 | 結果 | ログ |
+|---|---|---|
+| `tools/layers_check.sh`（depsgx 1.0.0） | PASS（42 modules / 108 edges / probe 4 codes） | `gates-layers-debt-receipt.log` |
+| `tools/debt_ratchet.sh` | 0 over limit（parked gates 1） | 同上 |
+| `python3 tests/evidence_receipt_test.py` | 8/8 OK | 同上 |
+| Python unit 37 ファイル | **37/37 exit 0**（unittest 196 ケース） | `python-units-rerun2/` |
+| focused 契約テスト 11 filter（`tools/evidence_receipt.py`） | **11/11**: 各 filter が 1 test を実行して pass | `receipt/receipt.json` |
+| `--list` | 542 tests | 同上 |
+| full Rust suite 1 回 (`--test-threads=1`) | **541 passed / 0 failed / 1 ignored / 91.77 s / exit 0** | `final-suite.log`（start/HEAD/status/EXIT/finish 付き） |
+| mutation（6B の 1 件） | baseline green → mutant FAILED → restored green。**1 回の観測**（stable とは主張しない） | `mutation-logs/` |
+
+束縛:
+
+- receipt の binary は `mc_spine-5263732b84b8ac33`、74,884,240 bytes、sha256
+  `8aba6f80559f2aa393540279eee38e44c98b0f0d6efc3224d6a34319d6a21f47`。
+  `source_at_start` と `source_at_finish` は HEAD `aeea52a` / dirty 0 で一致。
+- 復元とバイナリの検証（`08-restore-and-binary-verification.txt`）: `src/*.mutation-backup` 0、
+  `git status` 0 行、復元ログ 14:23:26 UTC 05:23:26 → receipt のビルド 05:29:14（後）、
+  そのバイナリで変異対象テストが green。
+- suite は同じ `CARGO_TARGET_DIR` と同じ HEAD で、ログに start / HEAD / status / EXIT /
+  finish を残した（`final-suite.log`）。
+- この remediation の後続 commit は docs のみで、`src` / `assets` / `tools` / `Cargo.toml` の
+  tree object は変えない（実行 SHA と最終 docs HEAD で同一性を確認する）。
+- **canonical への着地は親の指示で HELD**（FF の authorization は取り消された）。
+  `/home/yuu/mc-spine` は `e7ead8e667…` / `perf/worldgen-parallel` / clean のまま触っていない。
