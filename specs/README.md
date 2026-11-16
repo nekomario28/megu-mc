@@ -2,6 +2,19 @@
 
 このページは、現在の作業状態と次の判断の入口です。ブランチ名・HEAD・コミット数のように短期間で変わる値は記録しません。測定値と再現条件の詳細は各証拠ページを正本とし、ここでは結論と限界だけを要約します。
 
+## このページの読み方
+
+| 文書の種類 | 置き場所 | 現在の扱い |
+|---|---|---|
+| 現在の作業・できていること・限界 | このページの「状態」 | 正本。数値・条件は各 `evidence/` を参照 |
+| 受け入れ済みの契約 | 各specのREADMEと、そこが指す `evidence/` | 対象fixture・対象stageの範囲だけで有効 |
+| 提案・別ブランチの設計 | 例: [chunk-parallelism](chunk-parallelism/README.md) の設計案 | **現行実装ではない。** root reform の chunk ownership 案もこのツリーには取り込まれていない |
+| 歴史的記録 | [close-defects](close-defects/README.md)、[done/](done/)、旧checkpoint | 現在の合格判定に使わない |
+| 次に進む順序 | [ROADMAP](ROADMAP.md) | 順序と出口条件の正本。このページに複製しない |
+
+文書と実装が食い違う場合は、実装とテストを確認してこのページを直します。追跡データと方針文書の
+食い違い（未解決）は [CONTRIBUTING](../CONTRIBUTING.md) と [開発ガイド](../docs/development.md) に記録しています。
+
 ## 文書の役割
 
 | 質問 | 正本 |

@@ -43,7 +43,7 @@ APIの名前だけで互換とせず、引数、オブジェクト同一性、�
 
 ## 実装済みの核と今後の目標
 
-現在の核は、[固定判定の単一エントリキャッシュ](src/cached_lookup.rs)、かまどへの適用、および[着地操作](src/landing.rs)と[単一JVM所有処理](src/java_compat.rs)である。指定Seed ProtectのFabric／NeoForge版は、通常のプレイヤー・成牛着地経路に接続している。
+現在の核は、[固定判定の単一エントリキャッシュ](src/cached_lookup.rs)、かまどへの適用、および[着地操作](src/landing.rs)と[単一JVM所有処理](src/java_compat.rs)である。指定Seed ProtectのFabric／NeoForge版は、通常のプレイヤー・成牛着地経路に接続している。`src/` の実際のモジュール境界とownerは[開発ガイド](docs/development.md#5-ソースの歩き方)に列挙する。
 
 全操作への共通化、一般的な休止・起床、region actor、任意Modに必要なJava状態モデルは今後の目標。現行の粗いゲーム更新周期と生成の不足を修復しながら、この原則を個別の操作で検証する。[Mod互換の段階設計](specs/mod-compatibility/README.md)が対応範囲を定める。
 
