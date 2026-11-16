@@ -21,6 +21,15 @@ Scope: 独立した integration/readiness review。canonical統合の承認で�
 
 ## 2. 実際に検証したこと（`89ac2124`）
 
+> **2026-11-16 追記（この節の一部は未拘束。遡って合格にしない）。** 当時の `list.txt` は
+> start/finish も source SHA も持たず、同じ runner の `main.out` は `list_exit=127`、
+> `bin=` / `sha256=`（空）、`tests_total=0` を残している。つまり binary 解決と `--list` の
+> bookkeeping は失敗しており、下の「533 tests」「74,670,184 B / sha256 ac4528b1…」は
+> **同じ invocation の成功として拘束できない**。数値自体を消さず、無効試行として残す。
+> source-bound な再測定は
+> [readiness-30460b7-20261116.md](readiness-30460b7-20261116.md) §3（533 tests、binary
+> sha256 `23af568b…`、HEAD `6a2e88f`）であり、この節の数値を置き換えるものではない。
+
 - **profile が何を渡しているか（実測、rustc命令行から）**
   `cargo test --offline --locked -j1 --bin mc-spine --no-run -v` の test unit:
   `opt-level=1` / `debuginfo=line-tables-only` / `debug-assertions=on`。
@@ -49,6 +58,11 @@ Scope: 独立した integration/readiness review。canonical統合の承認で�
   (`src/feature.rs` 側は `cel_empty` 抽出 + `CEL_TRACE` 計装で、`trace` が `Some` のときだけ
   `cel_layer_ys` を呼ぶ。env 未設定時は `OnceLock` 参照のみ。)
 - **負の対照（mutant が実際に落ちること）**: focused mutation 6件すべて `ok`
+  （**2026-11-16 追記: この6件は保存された mutant log を持たないため UNVERIFIED。**
+  当時の log は `build.build_v/list/main.out` のみで、main.out は緑の focused test であって
+  mutant の失敗 assertion ではない。件数だけでは対照にならない。新規の6件は
+  `fresh-30460b7-20261116/mutants.tsv` と各 log に assertion 付きで残っており、
+  この旧6件の追認ではなく別 run である）
   （`MUTATION_FILTER` で対象testに限定、`CARGO_OFFLINE=1`）:
   - `nether_mushrooms_survive_a_solid_render_support`: `isSolidRender` → `true`、
     `uninitialized_raw_brightness` → 常に `15` の2件。
@@ -109,7 +123,11 @@ Scope: 独立した integration/readiness review。canonical統合の承認で�
 
 ## 7. 判定
 
-**READY FOR PARENT REVIEW**（範囲限定）
+**READY FOR PARENT REVIEW**（範囲限定、2026-11-16 時点）
+
+> 追記: 本 receipt の §2/§3 には未拘束・UNVERIFIED の項目がある（上記）。source-bound な再測定は
+> [readiness-30460b7-20261116.md](readiness-30460b7-20261116.md)。その producer 自体は著者の変更なので、
+> 新しい独立レビューが要る。「READY」は本 receipt の記述範囲に対してであり、producer の採否ではない。
 
 - 受け入れる: `89ac2124` の test profile 変更（速度は著者報告）、`fc9dfdf` の
   `CEL_TRACE` 計装・`cel_empty` 抽出・Nether contract test・`canSurvive` 読みの訂正・

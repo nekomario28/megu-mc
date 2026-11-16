@@ -122,8 +122,10 @@ P0-3の資産/出所監査、独立レビュー、hosted CI、M2/M3は別々の�
 
 運用上の帰結:
 
-- 共有logic、永続化、RNG消費、stage境界を変える変更は、canonicalへ入れる前に独立した
-  DeepSeek reviewを通す。実装者自身の承認で閉じない。
+- 共有logic、永続化、RNG消費、stage境界を変える変更は、canonicalへ入れる前に**実装者とは別セッション・
+  別著者の独立レビュー**を通す。独立性は著者とセッションで定義し、特定のmodel名では定義しない
+  （同じmodelでも別セッションなら独立、実行主体が同じなら独立ではない）。実装者自身の承認で閉じない。
+  現在の運用上の選択は user 指示による DeepSeek の別セッションであり、これは brand 要件ではない。
 - focused checkの緑から一般的なparity gate・promotion gateを主張しない。
 - 最終的な集約検証は**1つのintegration candidate SHA**に拘束する。
   実装summaryの寄せ集めは承認にならない。

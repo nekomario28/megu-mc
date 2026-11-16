@@ -1,0 +1,52 @@
+{
+ "tool": "tools/evidence_receipt.py",
+ "start": "2026-11-16T01:16:10Z",
+ "source_at_start": {
+  "head": "6a2e88f8d16262f5b923b480fbcf1b954afaab5b",
+  "dirty": 0,
+  "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "expect_head": "6a2e88f8d16262f5b923b480fbcf1b954afaab5b",
+ "filters": [
+  "feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support",
+  "feature::generation_contract_tests::cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks",
+  "feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers"
+ ],
+ "cargo": "cargo",
+ "problems": [],
+ "binary": {
+  "path": "/home/yuu/.cache/mc-spine-evidence/30460b7/target/debug/deps/mc_spine-5263732b84b8ac33",
+  "bytes": 74669872,
+  "sha256": "23af568b4106e5b03525a2b81a69fb8cdb027f1c51a5c19e65a79e6edf25f4d5",
+  "mtime": "2026-11-16T01:16:11Z"
+ },
+ "list_exit": 0,
+ "tests_total": 533,
+ "tests_sha256": "ed4e3572351dd74aa2c145738df046a92b08f8b23f7159a7d0dc5e468b54a14e",
+ "filters_run": [
+  {
+   "filter": "feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 0.09s"
+  },
+  {
+   "filter": "feature::generation_contract_tests::cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 0.09s"
+  },
+  {
+   "filter": "feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 0.10s"
+  }
+ ],
+ "source_at_finish": {
+  "head": "6a2e88f8d16262f5b923b480fbcf1b954afaab5b",
+  "dirty": 0,
+  "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "finish": "2026-11-16T01:16:12Z",
+ "status": "PASS"
+}

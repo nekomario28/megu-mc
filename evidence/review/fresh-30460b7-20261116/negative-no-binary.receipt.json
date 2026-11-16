@@ -1,0 +1,25 @@
+{
+ "tool": "tools/evidence_receipt.py",
+ "start": "2026-11-16T01:25:38Z",
+ "source_at_start": {
+  "head": "14d1916f52d11db401d12194d5ab1c55102dd4e9",
+  "dirty": 0,
+  "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "expect_head": "14d1916f52d11db401d12194d5ab1c55102dd4e9",
+ "filters": [],
+ "cargo": "/home/yuu/.cache/mc-spine-evidence/30460b7/negative/fake-cargo.sh",
+ "problems": [
+  "no unique Cargo executable: expected one mc-spine test harness executable, received 0"
+ ],
+ "filters_run": [],
+ "source_at_finish": {
+  "head": "14d1916f52d11db401d12194d5ab1c55102dd4e9",
+  "dirty": 0,
+  "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "finish": "2026-11-16T01:25:38Z",
+ "status": "FAIL"
+}

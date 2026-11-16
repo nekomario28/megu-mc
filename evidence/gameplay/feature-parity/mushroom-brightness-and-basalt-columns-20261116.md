@@ -20,6 +20,9 @@ Baseline and final numbers are identical, on purpose - see [Regression](#regress
 > measurement**: the light attribution in §1 and the draw-count decomposition in §2 (see the inline
 > notes). This page carries no `.run.json` receipt, and the streams behind its counts are not bound to
 > a source SHA. Detail: [readiness-89ac2124-fc9dfdf-20261116.md](../../review/readiness-89ac2124-fc9dfdf-20261116.md).
+> Follow-up 2026-11-16: the trace/placement duplication is now stated as a disclosed limit (see §3),
+> and the fresh source-bound run is [readiness-30460b7-20261116.md](../../review/readiness-30460b7-20261116.md).
+> The LIGHT causal chain and the draw counts remain HOLD; nothing here is a promotion.
 
 ## 1. `MushroomBlock.canSurvive`: the support test is `isSolidRender`, and the residual is not the support test
 
@@ -140,7 +143,9 @@ Same for `delta` (`ebv`, pass `(-25,22)` `gi=0,step=4`, placement `count_on_ever
 port's `(0,4)` stream is 780 draws and the reference's 800, **identical for the whole 780**. The
 delta draws 5 per accepted position (one `nextDouble` for the 0.9 blob test, two `size` samples, and
 two `rim_size` samples only when the blob test passed, which 73 of the 78 did), so
-`156 + 2*156 + 2*73 = 780` port positions and `82 + 2*82 + 2*77 = 800` for the reference: the same
+`156 + 2*156 + 2*73 = 780` **(sic: this sum is 614, not 780 — see the note below; the whole
+decomposition is withdrawn, not the observation that the streams agree for 780 draws)** port
+positions and `82 + 2*82 + 2*77 = 800` for the reference: the same
 five layers sampled (400 `nextInt(16)` on both sides), **four of the 200 samples found a layer in the
 reference that the port did not**.
 
@@ -186,9 +191,13 @@ hook on `count_on_every_layer`'s height/column reads.
 placement's chunk, the layer it was asked for, the `MOTION_BLOCKING` top it read, the y it answered
 and **every** layer the column offers. A layer-count difference between the port and the reference
 then names the boundary one side has and the other does not, which is what localised the two cases
-above. `cel_layer_ys` is the annotated walk; `cel_empty` is `isEmpty()` shared with `cel_find_y`, so
-the trace cannot drift from the placement it annotates - pinned by
-`cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks` and one mutation.
+above. `cel_layer_ys` is the annotated walk; `cel_empty` is `isEmpty()` shared with `cel_find_y`.
+**Limit, not a guarantee:** the walk's boundary predicate (`!cel_empty(below) && cel_empty(cur)`
+plus the bedrock exclusion) is *duplicated* in `cel_find_y`; only `cel_empty` is shared, and the
+pin is one-directional (`cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks` plus one
+mutation). A later lane that changes the boundary rule must change both functions; until that is
+unified, the trace **can** drift from the placement it annotates. This is a disclosed limit, not a
+claim of automatic consistency.
 
 ## 4. `sculk_patch` on this HEAD, and the `bonus_chest` oracle
 
