@@ -161,8 +161,8 @@ Java adapterの `cargo check`、mutation（ゲートが赤くなれることの�
 | Java／Mod境界 | `src/java_compat.rs`、`src/landing.rs`、`compat/` | jarは取得のみ。同梱しない |
 
 テストはownerの隣にあります（同じファイルの `#[cfg(test)] mod tests`、または `src/*_tests.rs`）。
-**root reform の chunk ownership 案は提案であり、このツリーの現行実装ではありません。** 現行の境界は上の表と
-`policy.json` を読んでください。
+提案段階の再設計（root reform の chunk ownership 案など）は [specs/README.md](../specs/README.md#このページの読み方)
+を参照してください。現行の境界は上の表と `policy.json` です。
 
 ## 6. 一つの変更を追う（worked example）
 
