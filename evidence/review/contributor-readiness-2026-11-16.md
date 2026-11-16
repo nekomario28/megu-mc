@@ -67,7 +67,7 @@ prune, delete, reset, stash, canonical edit or remote action was performed.
 | export contents | 3553 files = 3553 tracked paths; 0 `*.jar`, `*.mca` or `world_overlay.bin` |
 | negative control, disposable copy of that export | delete one included asset → `build_inputs MISSING`, `route rust build/test: NOT READY (build_inputs MISSING)`, exit 1; restore it → `130 include sites resolve`, route READY, exit 0 |
 | `tests/dev_check_test.py` | 20 tests OK (13 original + 7 new) |
-| same suite against the pre-fix `tools/dev_check.py` (`sha256 c7a8ca38…`), private copy | **8 failure entries / 7 new test methods fail**, the 13 original cases pass — the new cases pin the defects, they are not satisfied by the old code |
+| same suite against the pre-fix `tools/dev_check.py` (`sha256 c7a8ca38…`), private copy | **8 failure entries across 6 of the 7 new test methods**, the 13 original cases pass — each of those six pins a defect the old code had. The seventh new case, `test_the_documented_jdk_major_is_ok`, is a positive control: it passes on both sides, as it must |
 | `verify.sh` python tier in the tracked-only export | 36 commands, 35 exit 0, `tests/layers_gate_test.py` exit 1 (17 tests, 16 failures, `depsgx` absent); 29 s |
 | same tier with `java`/`javac`/`cargo`/`rustc` all exiting 127 | identical per-command return-code pattern, 35 exit 0; 28 s — the tier does not need a JDK or Cargo |
 | newcomer route | `dev_check` → `grep -E '^python3 tests/' tests/verify.sh` (36 commands, 1 is `layers_gate_test.py`) → `python3 tests/nextint_oracle_test.py` (`1116` rows asserted, "nextInt oracle guards passed") → `git status` clean and `git diff --check` clean |
