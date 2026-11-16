@@ -100,3 +100,17 @@ stack animation/pop time、全prototypeのdamage/component意味論、menu開放
 擬似playerのactorはheldと0–35 inventoryが別表現なので、今回のmenu-map規則を流用していない。
 actor側の旧規則は残っている。先に時間・所有者・接触条件を実クラスで固定し、
 その後でactorの表現と責務を統合する。
+
+## 後続: pickup delay
+
+上の本文・`run.json`・`mutations.txt`・未実装／未検証の一覧は、**このsliceを測った時点**の
+記録であり、書き換えない。当時 pickup delay は未検証で、actor 側にだけ規則があった。
+
+その後 [pickup delay slice](../../../specs/horizon-gameplay/pickup-delay.md) が
+`Drop::pickup_delay_elapsed` を1箇所に置き、実プレイヤーの `drop_tick` と擬似 player の
+`actor_tick` の両方から同じ規則を問い合わせるようにした。対象は live entity に対する
+しきい値の境界（spawn tick と しきい値-1 の拒否）、満杯の先行プレイヤーが次の適格者を
+塞がないこと、部分挿入時に `age` の加齢段が保全されることまで。
+所有者制限（thrower の UUID / `canPickup`）、`ItemEntity.playerTouch` 自体の実行、
+接触bounding box、scheduler、統計／advancement は引き続き未実装で、このsliceの
+「部分実装で止める」という結論も変えない。

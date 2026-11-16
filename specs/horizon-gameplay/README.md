@@ -37,9 +37,12 @@ donor は `horizon-world/src/inventory_pickup.rs` / `player_inventory.rs` と
 実プレイヤーの `drop_tick` に接続した。[検証範囲](../../evidence/gameplay/inventory-pickup/README.md)を参照。
 部分挿入と成功通知は別の契約なので、戻り値を「入った個数」に置き換えない。
 
-この段階は部分実装。擬似 player の表現統合、pickup delay と所有者制限、
+pickup delay は[独立した slice](pickup-delay.md)で閉塞した。実プレイヤーの `drop_tick` と
+擬似 player の `actor_tick` が同じ age 述語を問い合わせ、しきい値の境界、満杯の先行プレイヤーが
+次の適格者を塞がないこと、部分挿入時に `age` の加齢段が保全されることを検査している。
+この段階は部分実装。擬似 player の表現統合、所有者制限（thrower の UUID / `canPickup`）、
 `ItemEntity.playerTouch` 自体の実行、接触範囲・scheduler・統計／advancement は未検証。
-次は item entity の時間・所有者・接触条件を独立に固定し、その後で actor の表現を統合する。
+次は item entity の所有者・接触条件を独立に固定し、その後で actor の表現を統合する。
 
 ### 3. チェストのワールド側契約
 
