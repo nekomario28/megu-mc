@@ -122,6 +122,11 @@ suite の 92.52 s は、5A/5C の `[profile.test] opt-level = 1` によるもの
 記録した冷間 623.72 s と比較して **6.7 倍**だが、これは同一 SHA の前後比較ではないので
 「623 s → 92 s になった」とは主張しない（profile 変更込みの 1 点測定）。
 
+最終状態の確認: `git diff --stat bef7f53 HEAD -- src/ assets/ tools/ Cargo.toml` は空
+（この報告 commit は `evidence/` だけを触る）。最終 HEAD `32dad84` 上でも full suite を
+1 回実行し、**541 passed / 0 failed / 1 ignored / 92.22 s / exit 0**（`final-suite.log`）。
+つまり数値はコード SHA `bef7f53` に、再現は最終 HEAD に結ばれている。
+
 `--list` の 542 と suite の 541+1 ignored は一致する。`ignored` の 1 件は
 `debt_ratchet.sh` が「parked gates: 1」として許容しているもの。
 
