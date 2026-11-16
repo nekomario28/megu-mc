@@ -11,7 +11,7 @@
   このソースは新しい標準API（`slice::as_chunks` など）を使うため、古い `stable` や OS の古い `cargo` ではビルドできません。
 - python3 は `tools/` と `tests/` のスクリプトに必要です。
 - Java 21 は**データ生成とnative照合のときだけ**必要です。`cargo build` / `cargo test` 自体は Java を要求しません。
-- 依存crateは `cargo fetch --locked` で取得できます。取得後は `--offline` を付けてネットワークなしでビルドできます（このパスで `cargo fetch --offline --locked` が成功することを確認済み）。
+- 依存crateは `cargo fetch --locked` で取得できます。取得後は `--offline` を付けてネットワークなしでビルドできます（`cargo fetch --offline --locked` が成功することを確認済み）。
 
 ## 2. データと前提
 
@@ -44,7 +44,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 - `config_packets.bin` が無い場合、サーバーは起動してもクライアントへregistryを送れません（`src/main.rs` の起動時メッセージ）。
 
 生成器と抽出器（`tools/vanilla_data/Extract.java`、`build_vanilla_data.py`）はこのツリーにあります。ただし、
-「生成器をこのパスで実行し、全テストが緑になること」は確認していません（NOT RUN。jar・Java 21・EULA同意が必要）。
+「生成器を手元で実行し、全テストが緑になること」は確認していません（NOT RUN。jar・Java 21・EULA同意が必要）。
 
 ### 2.3 テストが必要とする資産
 
@@ -122,7 +122,9 @@ cargo test --locked -- --test-threads=1
 cargo test --locked ingress_guard -- --test-threads=1   # 例: モジュール単位の絞り込み
 ```
 
-このパスでは**コンパイル予算のため実行していません**（NOT RUN）。依存crateの取得（`cargo fetch --locked`）は成功しています。
+全体の `cargo test` は、このガイドの作業では未実行です（NOT RUN。ビルド予算）。
+依存crateの取得（`cargo fetch --locked`）は成功しています。実行した範囲は
+[検証記録](../evidence/review/contributor-readiness-2026-11-16.md) にあります（persistence の絞った filter のみ）。
 実行する場合は、追跡データの有無と、失敗がデータ由来かコード由来かを切り分けてください。
 
 ### T2: ローカル全体ゲート
@@ -134,7 +136,7 @@ bash tests/verify.sh
 pythonの契約テスト、層ゲート、debt ratchet、直列cargo test、8スレッド×3回、loopbackのwire smoke、
 Java adapterの `cargo check`、mutation（ゲートが赤くなれることの確認）を順に実行します。
 時間がかかり、`depsgx`（固定revision。`.github/workflows/ci.yml` の `GXKIT_REV`）が必要です。
-このパスでは実行していません（NOT RUN）。**部分実行の緑を `verify.sh` の代用にしないでください。**
+`bash tests/verify.sh` 全体は、このガイドの作業では未実行です（NOT RUN）。**部分実行の緑を `verify.sh` の代用にしないでください。**
 
 ### T3: hosted CI と native 照合
 
@@ -184,7 +186,7 @@ Java adapterの `cargo check`、mutation（ゲートが赤くなれることの�
    cargo test --locked ingress_guard -- --test-threads=1
    ```
 
-   サーバーも生成データも要らないunitテストです。このパスではコンパイル予算のため実行していません（NOT RUN）。
+   サーバーも生成データも要らないunitテストです。このガイドの作業では未実行です（NOT RUN。ビルド予算）。
 5. **経路を確かめる**: wireの振る舞いが変わるなら、ビルド後に
    `python3 tests/wire_smoke.py target/debug/mc-spine`、または `bash tests/verify.sh`。
    `tests/protocol767_test.py` はCLIデコーダのknown-answer検査で、サーバーの受信経路を実行しないため**証明になりません**。
