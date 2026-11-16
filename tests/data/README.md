@@ -12,7 +12,10 @@ own classes. They are facts about that build, not code copied from it.
 | `biome_probe_ties_1211.tsv` | tie-heavy climate points, the game's biome answer and an equal-distance flag | `worldgen::wg_tests::biome_tree_breaks_ties_the_way_vanilla_scans_children`; `tools/biome_tie_oracle.py` replays all rows on the actual tree |
 
 The files came with the upstream `fix/xoroshiro-next-bound-and-bt-search-vanilla`
-PR. The generator used by that PR (`tools/vanilla_data/Extract.java`) is not
-present on this branch; the vectors are therefore inputs, not a claim that this
-branch can regenerate them. Regenerating would require the pinned jar and the
-mapping set the PR used.
+PR. The generator is on this branch: `tools/vanilla_data/Extract.java`, driven by
+`tools/vanilla_data/gen_vanilla_data.sh` together with
+`tools/vanilla_data/build_vanilla_data.py`, writes `random_next_int_1211.tsv` and
+`biome_probe_ties_1211.tsv`. The other two rows name their own producer above
+(`tools/end_city_mansion_oracle.py --write`, `tools/native_chunk_capture.py`).
+Regenerating any of them needs the pinned jar (and Java 21 and the mapping set for
+the jar-side path); that regeneration was not re-run for this document.

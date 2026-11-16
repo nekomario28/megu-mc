@@ -3,6 +3,38 @@
 診断・固定具の道具。どれも「推測せずに測る」ためのもので、対象を1つに絞るか、
 比較を成立させる条件を明示する役割を持つ。
 
+## 目的別の入口（まずここ）
+
+道具は「何を知りたいか」で選ぶ。網羅的な一覧は下の表が持つ。ここは入口だけを示し、
+同じことを2箇所に書かない。
+
+| 知りたいこと | 走らせるもの |
+|---|---|
+| このチェックアウトで何が動くか（ビルドもDLもせず数秒） | `python3 tools/dev_check.py` — `OK`/`MISSING`/`NOT_CHECKED`/`ERROR` と、次に打つコマンドを出す。何を実行し何をしなかったかも各行に書く |
+| Python だけで走る検査（jar/JDK/Cargo 不要。`layers_gate_test.py` だけ depsgx 必須） | 正規の一覧は `grep -E '^python3 tests/' tests/verify.sh`。段と前提クラスは [tests/README.md](../tests/README.md) |
+| Rust を絞って回す／全体を回す | `cargo test --offline --locked -j 2 -- --test-threads=1`（絞るときは filter、並列は `--test-threads=8`）。ビルド成果物から実行ファイルを取るのは `cargo_executable.py`（CI と同じ経路）。CI 専用の native×Rust の対を**実行されたことまで**確かめるのは `native_cargo_gate.py`（filter が0件でも cargo は exit 0 を返すため）|
+| 層・依存・負債のゲート | `python3 tests/layers_gate_test.py` と `bash tools/layers_check.sh`（**depsgx 必須**、CI が固定 revision を入れる）、`bash tools/debt_ratchet.sh` |
+| ゲートが本当に落ちられるか | `bash tools/mutation_check.sh` — 実装を壊して赤を要求し、ツリーを元に戻したことまで検査する |
+| jar 側の oracle（参照実装を実行して照合） | `vanilla_java.py` を土台にした `*_oracle.py` 群。既定は**保存済み参照との照合**で、`--output` を明示したときだけ記録を書き換える。固定 jar と JDK が要る |
+| 保存 world / chunk を段ごとに比べる | `chunk_triage.py`（保存 world を直接読む）、`port_triage.py`（port をビルドして dump し triage へ）、`carver_diff.py`（ブロック単位）|
+| native capture を取り直す | `sculk_capture.sh`、`*_fixture.sh`、`native_chunk_capture.py`。jar・JDK・（`config_packets.bin` だけは）EULA 同意が要る |
+| 出自と層の監査 | `provenance_scan.py`（コード共有の測定）、`pack_provenance.py`（同梱 pack と固定 jar の data の距離）、`asset_coverage.py` |
+
+## 前提データと生成段階（clone 直後）
+
+このブランチは data を**追跡している**。`assets/`・`tests/data/`・`datapacks/vanilla/`・
+`config_packets.bin` は `.gitignore` の対象ではなく、tracked-only の checkout でもそのまま
+Python の fixture 段が走る（測った範囲は [tests/README.md](../tests/README.md)）。
+`vanilla_data/gen_vanilla_data.sh` は**自分の jar から作り直す**経路で、その出力の一部
+（例: `assets/block_states_1211.json`）は追跡されていない。いま何が追跡されているかは
+`git ls-files assets tests/data datapacks/vanilla config_packets.bin` が唯一の正で、
+この README はその一覧を持たない。
+
+**2つの段を混ぜない。** 比較の相手は「保存済み参照」（tracked な fixture・保存 world）で、
+これはリポジトリが持つ。それを作り直すのが「生成段」で、固定 jar（sha1）・JDK・
+`config_packets.bin` のための EULA 同意が要る。jar は再配布しない。同意は自動で取らず、
+`dev_check.py` も jar を落とさない・展開しない・実行しない。
+
 ## 固定具（参照 world と port の dump を作る）
 
 | 道具 | 何をするか |
@@ -52,7 +84,7 @@
 | `vanilla_nofeat_pack.py <jar> <world> [--keep-carvers]` | biome の features と carvers を空にした pack を書く（地形だけの比較用） |
 | `native_chunk_capture.py <world> <cx> <cz> [--preset ...] --out <tsv[.gz]>` | 参照 world の 1 chunk を **正規化 state（名前＋全property）** の TSV にする。property を落とす name 比較では接続bit・向き・waterlogged が見えないため、`StructurePiece.placeBlock` の postprocess が決める `oak_fence` の接続bit のような差はこの形でしか固定できない。出力形式は port の `MC_SPINE_WG_DUMP_CANON` と同じ（絶対座標、`minecraft:air` は落とす）で、`tests/data/` の chunk 固定具の生産者。`air` 以外の空気（`cave_air`/`void_air`）は両側とも残す |
 | `vanilla_region_blocks.py` | region の location entry と対象 payload だけを読む共通層。region 全体の保持・永続キャッシュはせず、割当sector／ファイル境界を検査する。[I/O量と互換検証](../evidence/foundation/region-reader/README.md) |
-| `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings] [--accept-eula]` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/**` (worldgen と tags/block)・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv`・`biome_probe_ties_1211.tsv`（range 端の同距離 tie 点。子の走査順を固定）・`random_next_int_1211.tsv`（乱数クラスの `nextInt(bound)` 列のハッシュ、数値のみ）、`--accept-eula` 付きで `config_packets.bin` (`capture_config_packets.py` 経由) を生成する (全て `.gitignore`、新しい clone は `cargo test` の前に1回実行)。jar の sha1 と Fabric mapping の sha256 を固定し、公式 data generator の出力と突き合わせてから書く。Java 21 が必要。出力は決定的 |
+| `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings] [--accept-eula]` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/**` (worldgen と tags/block)・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv`・`biome_probe_ties_1211.tsv`（range 端の同距離 tie 点。子の走査順を固定）・`random_next_int_1211.tsv`（乱数クラスの `nextInt(bound)` 列のハッシュ、数値のみ）、`--accept-eula` 付きで `config_packets.bin` (`capture_config_packets.py` 経由) を生成する。どの出力が追跡されているかは `git ls-files` で確認する（このブランチは data の多くを追跡しており、clone 直後の必須手順ではない）。jar の sha1 と Fabric mapping の sha256 を固定し、公式 data generator の出力と突き合わせてから書く。Java 21 が必要。出力は決定的 |
 
 ## 比較（両側を同じ土俵で読む）
 

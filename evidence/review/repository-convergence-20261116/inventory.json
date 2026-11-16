@@ -1,0 +1,3024 @@
+{
+ "schema": "mc-spine/repository-convergence-inventory@1",
+ "purpose": "One machine-readable disposition ledger for local branches, T3 worktrees and the PR surface. It owns ref dispositions only; meaning lives in the linked specs/evidence.",
+ "generated_utc": "2026-11-16T05:01:17+00:00",
+ "snapshot": {
+  "start_utc": "2026-11-16T04:47:23+00:00",
+  "end_utc": "2026-11-16T04:47:26+00:00",
+  "ref_end_snapshot_local": "2026-11-16T14:01:17+09:00",
+  "pr_read_utc": "2026-11-16T13:53:45+09:00",
+  "canonical_ref": "perf/worldgen-parallel",
+  "canonical_sha": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+  "canonical_moving": true,
+  "base_ref": "main",
+  "base_sha": "a205e2d56405edd99316616285e2bbd7e0b595a7",
+  "canonical_ahead_of_base": 38,
+  "origin_url": "https://github.com/nekomario28/mc-spine",
+  "remote_live_heads": 9,
+  "remote_tracking_matches_live": true,
+  "ref_counts": {
+   "local_heads": 50,
+   "remote_tracking": 10,
+   "tags": 1,
+   "t3_orchestration_refs": 183
+  },
+  "read_only": "rev-parse/rev-list/diff/show/patch-id/status/ls-remote/gh pr view/list only"
+ },
+ "counts": {
+  "refs_total": 50,
+  "worktrees_total": 49,
+  "refs": {
+   "ACTIVE": 8,
+   "CANONICAL": 2,
+   "PATCH_EQUIVALENT": 23,
+   "RETIRE_CANDIDATE": 8,
+   "UNKNOWN_HOLD": 9
+  },
+  "worktrees": {
+   "ACTIVE": 8,
+   "CANONICAL": 1,
+   "PATCH_EQUIVALENT": 23,
+   "RETIRE_CANDIDATE": 8,
+   "UNKNOWN_HOLD": 9
+  },
+  "pull_requests": {
+   "MERGED_RETAIN_EVIDENCE": 18,
+   "UNKNOWN_HOLD": 12,
+   "UNMERGED_UNIQUE": 4
+  },
+  "pull_requests_by_state": {
+   "CLOSED": 9,
+   "MERGED": 18,
+   "OPEN": 7
+  }
+ },
+ "drift_during_audit": [
+  {
+   "ref": "t3/26c63f09",
+   "event": "renamed",
+   "from_sha": null,
+   "to_ref": "t3/runtime-source-organization",
+   "detail": "same worktree and HEAD e7ead8e; the old ref no longer exists (git branch --merged still showed it at the first read)"
+  },
+  {
+   "ref": "t3/chunk-state-reform",
+   "event": "moved",
+   "from_sha": "e7ead8e",
+   "to_sha": "5caca0b75",
+   "detail": "owning task committed during the audit; rows for it are ACTIVE, not verdicts"
+  },
+  {
+   "ref": "t3/worldgen-integration-audit",
+   "event": "moved",
+   "from_sha": "bef7f53",
+   "to_sha": "2799a36b4",
+   "detail": "owning task added two acceptance docs; the queue records the observed tip, re-read before acting"
+  },
+  {
+   "ref": "t3/mc-spine-integration-review",
+   "event": "created",
+   "from_sha": null,
+   "to_sha": "e7ead8e",
+   "detail": "new review worktree at canonical HEAD during the audit"
+  },
+  {
+   "ref": "t3/bd0038ec",
+   "event": "created",
+   "from_sha": null,
+   "to_sha": "e7ead8e",
+   "detail": "new branch at canonical HEAD with no worktree and no identified owner; held"
+  },
+  {
+   "ref": "t3/mc-spine-contributor-docs",
+   "event": "worktree dirty moved",
+   "from_sha": "e7ead8e",
+   "to_sha": "e7ead8e",
+   "detail": "1 modified file at first read, 5 modified + docs/ at the end read"
+  }
+ ],
+ "refs": [
+  {
+   "ref": "main",
+   "sha_observed": "a205e2d56405edd99316616285e2bbd7e0b595a7",
+   "disposition": "CANONICAL",
+   "content": "canonical",
+   "moving": true,
+   "sha_changed_during_audit": false,
+   "worktree_id": null,
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 38,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "integration target; only the owning acceptance/integration task advances it",
+   "precondition": "candidate accepted and fast-forwardable"
+  },
+  {
+   "ref": "perf/worldgen-parallel",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "CANONICAL",
+   "content": "canonical",
+   "moving": true,
+   "sha_changed_during_audit": false,
+   "worktree_id": "root",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "integration target; only the owning acceptance/integration task advances it",
+   "precondition": "candidate accepted and fast-forwardable"
+  },
+  {
+   "ref": "subagent-Beardifier-Surface-Order-Fixer-self-c96f1d39-mc-spine",
+   "sha_observed": "97478469728e26a38bf03a774e62cd23d950cf8a",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "subagent-Beardifier-Surface-Order-Fixer-self-c96f1d39-mc-spine",
+   "dirty_count": 1,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 19,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "subagent-Ruined-Portal-Parity-Fixer-self-3d541724-mc-spine",
+   "sha_observed": "97478469728e26a38bf03a774e62cd23d950cf8a",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "subagent-Ruined-Portal-Parity-Fixer-self-3d541724-mc-spine",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 19,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "subagent-Spawner-and-Entity-Payload-Wirer-self-8cb58996-mc-spine",
+   "sha_observed": "ee5802783a5ca7459953fac89e5a00bb2ca0a8fc",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "subagent-Spawner-and-Entity-Payload-Wirer-self-8cb58996-mc-spine",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 20,
+    "diffstat_vs_merge_base": "10 files changed, 610 insertions(+), 18 deletions(-)",
+    "changed_files": 10,
+    "equivalence": "a1530b8",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "spawner/entity payload pipeline; same patch as the canonical commit",
+    "commit_subjects": [
+     "Wire structure spawners and living entities into runtime payload pipeline"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (a1530b8)"
+  },
+  {
+   "ref": "subagent-Stronghold-Parity-Fixer-self-65d240ce-mc-spine",
+   "sha_observed": "97478469728e26a38bf03a774e62cd23d950cf8a",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "subagent-Stronghold-Parity-Fixer-self-65d240ce-mc-spine",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 19,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "subagent-Weeping-Vines-Bug-Fixer-self-b5e10882-mc-spine",
+   "sha_observed": "f86051c9911fb28e48c4fa42bd37b357c60248a5",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "subagent-Weeping-Vines-Bug-Fixer-self-b5e10882-mc-spine",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 20,
+    "diffstat_vs_merge_base": "4 files changed, 13 insertions(+), 11 deletions(-)",
+    "changed_files": 4,
+    "equivalence": "9747846",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "weeping_vines test box / Long.MAX_VALUE; same patch as the canonical commit",
+    "commit_subjects": [
+     "fix(worldgen): extend weeping_vines scripted test box and restore Long.MAX_VALUE vector"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (9747846)"
+  },
+  {
+   "ref": "t3/00396e1e",
+   "sha_observed": "799decd6dcdcdfc82f456a76ec309f79b5737c17",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-00396e1e-ffe8a0584aaa6e8b",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 18,
+    "diffstat_vs_merge_base": "4 files changed, 150 insertions(+), 96 deletions(-)",
+    "changed_files": 4,
+    "equivalence": "55d0285",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "stronghold LCG",
+    "commit_subjects": [
+     "fix(stronghold): draw pieces from the legacy LCG, not the decoration Xoroshiro"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (55d0285)"
+  },
+  {
+   "ref": "t3/05e0b86e",
+   "sha_observed": "2012fb216ad89eff23fed19b282999d3120f9694",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-05e0b86e-56632f925a0b78cd",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 12,
+    "diffstat_vs_merge_base": "3 files changed, 214 insertions(+), 24 deletions(-)",
+    "changed_files": 3,
+    "equivalence": "4611f49",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "jigsaw shape passes",
+    "commit_subjects": [
+     "fix(jigsaw): run StructureTemplate.placeInWorld's shape passes for jigsaw pieces"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (4611f49)"
+  },
+  {
+   "ref": "t3/1a1eaa76",
+   "sha_observed": "a00e703ce8b2e4e6662cc9c20ec4aef5fddd5752",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-1a1eaa76-647f7821536e0b61",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 15,
+    "diffstat_vs_merge_base": "3 files changed, 294 insertions(+), 16 deletions(-)",
+    "changed_files": 3,
+    "equivalence": "b2c2cd5",
+    "equivalence_kind": "same_subject_rebase",
+    "equivalence_note": "same subject/files/stat; 12 content lines differ: canonical commit also carries one adjacent ContainerKind line and drops a trailing blank line; branch adds nothing canonical lacks",
+    "commit_subjects": [
+     "fix(geode): walk betweenClosed order and reset only fluid neighbours"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (b2c2cd5)"
+  },
+  {
+   "ref": "t3/1b855eea",
+   "sha_observed": "a03e42d8865b3fb8d31c06414c3f32f2baa9d528",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-1b855eea-01ced11ca20fd87f",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 7,
+    "diffstat_vs_merge_base": "5 files changed, 848 insertions(+), 81 deletions(-)",
+    "changed_files": 5,
+    "equivalence": "099db4c",
+    "equivalence_kind": "same_subject_rebase",
+    "equivalence_note": "same subject/files/stat; 6 content lines differ and all are mutation_check anchors and a Track 4I/4L comment line; branch adds nothing canonical lacks",
+    "commit_subjects": [
+     "fix(feature): the support rules and placement orders the taiga lane was missing"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (099db4c)"
+  },
+  {
+   "ref": "t3/1f897698",
+   "sha_observed": "443d1eac4d1341e94a13c9b2448cc7a6337d6f7f",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-1f897698-3c092ecb5aff4301",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 18,
+    "diffstat_vs_merge_base": "1 file changed, 137 insertions(+), 10 deletions(-)",
+    "changed_files": 1,
+    "equivalence": "db68ce8",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "beardifier before surface scan",
+    "commit_subjects": [
+     "fix(worldgen): apply the beardifier before the surface scan"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (db68ce8)"
+  },
+  {
+   "ref": "t3/2657631b",
+   "sha_observed": "642dfb7b1a58455c1fda1594143f597321bb126b",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-2657631b-ce5a8580092a9c45",
+   "dirty_count": 7,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 35,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "t3/27d57348",
+   "sha_observed": "fc9dfdf8f2ebf7af25924a6f759d08ed04b966d4",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_candidate",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-27d57348-3f5c9903bcc91a8f",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "6 files changed, 427 insertions(+), 26 deletions(-)",
+    "changed_files": 6,
+    "equivalence": "06adb62",
+    "equivalence_kind": "patch_id_equal_candidate",
+    "equivalence_note": "mushroom/basalt residual test",
+    "commit_subjects": [
+     "test(feature): the mushroom and basalt residuals are not support rules"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (06adb62)"
+  },
+  {
+   "ref": "t3/28f8bfaf",
+   "sha_observed": "0e0ee5a007bf2312f7d3b248623995ffaccb09a3",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-28f8bfaf-9450b571c6aebe09",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 30,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "t3/3536d310",
+   "sha_observed": "2ba443d1e364d6c6159aea900edf5da6dc1a1984",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-3536d310-0eaea3f9d2d392fa",
+   "dirty_count": 5,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 32,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "t3/3554b778",
+   "sha_observed": "a420246fb12dd4d6709111d547f904664562e3af",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-3554b778-9ec1e56fe24e2312",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 15,
+    "diffstat_vs_merge_base": "10 files changed, 452 insertions(+), 58 deletions(-)",
+    "changed_files": 10,
+    "equivalence": "6bc17cd",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "nether/end offline decoration",
+    "commit_subjects": [
+     "fix(worldgen): decorate the nether and the end offline"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (6bc17cd)"
+  },
+  {
+   "ref": "t3/37d03552",
+   "sha_observed": "c79b59679557971725114e361d075d522461bff0",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-37d03552-a46d7a3bf29a6bc1",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 2,
+    "unique_patch_equivalent": 2,
+    "ahead_of_canonical": 2,
+    "behind_canonical": 11,
+    "diffstat_vs_merge_base": "9 files changed, 830 insertions(+), 60 deletions(-)",
+    "changed_files": 9,
+    "equivalence": "4cd16ac+df50c2b",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "nether fossil oracle + placement",
+    "commit_subjects": [
+     "docs(evidence): record the nether fossil base-column oracle",
+     "fix(worldgen): place nether fossils on the noise column"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (4cd16ac+df50c2b)"
+  },
+  {
+   "ref": "t3/38771855",
+   "sha_observed": "2ba443d1e364d6c6159aea900edf5da6dc1a1984",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-38771855-31787de78ee3a88d",
+   "dirty_count": 4,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 32,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "t3/3fa6ff6f",
+   "sha_observed": "642dfb7b1a58455c1fda1594143f597321bb126b",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-3fa6ff6f-065b7e46ecbfc194",
+   "dirty_count": 5,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 35,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "t3/401f5f2c",
+   "sha_observed": "89ac21244b022f3d6d281c83478187a344c911d2",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_candidate",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-401f5f2c-73247e2c0f5715f3",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "3 files changed, 774 insertions(+)",
+    "changed_files": 3,
+    "equivalence": "247602f",
+    "equivalence_kind": "patch_id_equal_candidate",
+    "equivalence_note": "perf(test) test profile",
+    "commit_subjects": [
+     "perf(test): the suite's 624 s is compute, so optimize the test profile"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (247602f)"
+  },
+  {
+   "ref": "t3/42b38472",
+   "sha_observed": "2d9a6b0e778b276a719cc1f958069be86fd0ec97",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-42b38472-ff099c50a976acca",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 16,
+    "diffstat_vs_merge_base": "4 files changed, 431 insertions(+), 28 deletions(-)",
+    "changed_files": 4,
+    "equivalence": "3690410",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "bonus_chest",
+    "commit_subjects": [
+     "feat(worldgen): implement bonus_chest, the last unimplemented configured feature"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (3690410)"
+  },
+  {
+   "ref": "t3/44cdcc09",
+   "sha_observed": "924b6ccbd58aff398db543559fd21d2755a8652d",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-44cdcc09-bc48b5d343d951ca",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 30,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "t3/518d2532",
+   "sha_observed": "4d46394aa49edbb393d2a8ad60d202add4ff453d",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-518d2532-67c4ecb4ae267c70",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 30,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "t3/548b811e",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-548b811e-6e73c70f2d600294",
+   "dirty_count": 4,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": "Track 5B: Fix Jungle (74,-41) 116-cell residual",
+    "link": "t3-thread://v2/0dad0cde-3d82-45b5-8725-7ba7b32672e2/thread:delegated-task:command%3Amcp%3A0e816a01-5e10-4059-8061-d9d6ec8ca26c%3Adelegate-task%3Af7e98a57-f974-403c-a3dd-32be99d666ac",
+    "reason": "Track 5B (Jungle 74,-41 residual); 344 uncommitted lines across feature/tree/carve-agent"
+   }
+  },
+  {
+   "ref": "t3/598a38eb",
+   "sha_observed": "f166588dfc9d5733fe76cbf6949fb872c083ce04",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_candidate",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-598a38eb-11b366258d21a75f",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 2,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 2,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "13 files changed, 1836 insertions(+), 99 deletions(-)",
+    "changed_files": 13,
+    "equivalence": "787f781",
+    "equivalence_kind": "patch_id_equal_candidate",
+    "equivalence_note": "registry pinned table",
+    "commit_subjects": [
+     "feat(registry): the physical predicates are one pinned table, and the compositions on top of it were wrong",
+     "perf(test): the suite's 624 s is compute, so optimize the test profile"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (787f781)"
+  },
+  {
+   "ref": "t3/5a21bfce",
+   "sha_observed": "f446b7fe12dab6e2dd3963b8ab38d7db07b6dc01",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-5a21bfce-3285b48e84a7cc9c",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 28,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "t3/5fc39f59",
+   "sha_observed": "2ba443d1e364d6c6159aea900edf5da6dc1a1984",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-5fc39f59-5eefbf1e8e6861f3",
+   "dirty_count": 6,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 32,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "t3/8979527a",
+   "sha_observed": "864bf73e6262495897b8b68cabe268cd3465f7f0",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_candidate",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-8979527a-6daa326afdcb6f05",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 2,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 2,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "10 files changed, 1998 insertions(+), 46 deletions(-)",
+    "changed_files": 10,
+    "equivalence": "bef7f53",
+    "equivalence_kind": "patch_id_equal_candidate",
+    "equivalence_note": "order fix; 4 content lines differ from 864bf73 and are mutation anchors/context",
+    "commit_subjects": [
+     "fix(feature,tree): the plane array's order, the disk's box walk, and two draw positions",
+     "perf(test): the suite's 624 s is compute, so optimize the test profile"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (bef7f53)"
+  },
+  {
+   "ref": "t3/93e5c0ae",
+   "sha_observed": "2f74c0ef34bfc9003082f61f6fa42b0d6bd09e66",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-93e5c0ae-311a9ed68a611da8",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 16,
+    "diffstat_vs_merge_base": "13 files changed, 720 insertions(+), 48 deletions(-)",
+    "changed_files": 13,
+    "equivalence": "c049a74",
+    "equivalence_kind": "same_subject_rebase",
+    "equivalence_note": "stage container payloads (older base, module path drift)",
+    "commit_subjects": [
+     "fix(structure): stage container payloads where their store reads them"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (c049a74)"
+  },
+  {
+   "ref": "t3/9fb8a1ca",
+   "sha_observed": "51120b7b6c784cb1cabf72055dba9d5f1b723361",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-9fb8a1ca-97e9084acc4b36e2",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 7,
+    "diffstat_vs_merge_base": "12 files changed, 886 insertions(+), 14 deletions(-)",
+    "changed_files": 12,
+    "equivalence": "c142b8b",
+    "equivalence_kind": "same_subject_rebase",
+    "equivalence_note": "hanging item frames (older base)",
+    "commit_subjects": [
+     "feat(structure): materialize hanging item frames with their facing and stack"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (c142b8b)"
+  },
+  {
+   "ref": "t3/aef0d8c5",
+   "sha_observed": "c3d2dc40b29099cdfeae67ecc0b9a68f1d83c90b",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-aef0d8c5-a186eecb476ffbfc",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 8,
+    "diffstat_vs_merge_base": "4 files changed, 459 insertions(+), 39 deletions(-)",
+    "changed_files": 4,
+    "equivalence": "53b75d8",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "lake/vegetation_patch order",
+    "commit_subjects": [
+     "fix(lake,vegetation_patch): anchor the lake grid down and walk the patch set in hash order"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (53b75d8)"
+  },
+  {
+   "ref": "t3/af28fe5e",
+   "sha_observed": "4611f49011c7e0b3e6889850508cbf20a371055f",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-af28fe5e-f935f983e06763fa",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 8,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": "4611f49",
+    "equivalence_kind": "ancestor",
+    "equivalence_note": "jigsaw shape passes (branch tip is canonical history)",
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "t3/c52386e8",
+   "sha_observed": "ae909673c1cb876c3cfc4a0f38ad820f7f2dcc16",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-c52386e8-91324fbac5428fcb",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 2,
+    "unique_patch_equivalent": 2,
+    "ahead_of_canonical": 2,
+    "behind_canonical": 8,
+    "diffstat_vs_merge_base": "15 files changed, 746 insertions(+), 1 deletion(-)",
+    "changed_files": 15,
+    "equivalence": "b489d33+cce0c0f",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "postprocess rule + evidence",
+    "commit_subjects": [
+     "docs(evidence): record the postprocess rule and the residual it closes",
+     "fix(structures): run the chunk postprocess shape pass for procedural pieces"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (b489d33+cce0c0f)"
+  },
+  {
+   "ref": "t3/c5e6c95f",
+   "sha_observed": "085206bb56c3425f902463a952f4f7d04ea1eef6",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_candidate",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-c5e6c95f-48960a200f784ee7",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 3,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 3,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "15 files changed, 1684 insertions(+), 27 deletions(-)",
+    "changed_files": 15,
+    "equivalence": "b7ca4f5",
+    "equivalence_kind": "patch_id_equal_candidate",
+    "equivalence_note": "diagnostics: light half / lost writes / fossil beard",
+    "commit_subjects": [
+     "test(worldgen): the two residuals are an unmeasured light half, lost writes, and a fossil beard",
+     "test(feature): the mushroom and basalt residuals are not support rules",
+     "perf(test): the suite's 624 s is compute, so optimize the test profile"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (b7ca4f5)"
+  },
+  {
+   "ref": "t3/c7fcd100",
+   "sha_observed": "54ee3d68f1b0fcecd6796ec1c9f4a6d11649983a",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-c7fcd100-1e24aed9241aeb48",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 3,
+    "diffstat_vs_merge_base": "8 files changed, 630 insertions(+), 54 deletions(-)",
+    "changed_files": 8,
+    "equivalence": "e7ead8e",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "trunk dirt / decorator order (canonical tip)",
+    "commit_subjects": [
+     "fix(tree,worldgen): the trunk's dirt is a log-list entry, decorator lists use the HashSet order"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (e7ead8e)"
+  },
+  {
+   "ref": "t3/ceb3c758",
+   "sha_observed": "642dfb7b1a58455c1fda1594143f597321bb126b",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-ceb3c758-f26e2ecb70785e0a",
+   "dirty_count": 9,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 35,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "t3/chunk-state-reform",
+   "sha_observed": "5caca0b750e4ff13427f5394c8c8b4d04a204077",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": true,
+   "worktree_id": "t3-39628b20-76d444070145f036",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": "Root reform: authoritative chunk lifecycle and mutation ownership",
+    "link": "t3-thread://v2/0dad0cde-3d82-45b5-8725-7ba7b32672e2/thread:delegated-task:command%3Amcp%3A428c4310-c657-43bc-91ab-2d3e70b7535c%3Adelegate-task%3Ae40bc849-7702-41d6-a608-6b5f3534eb5f",
+    "reason": "root reform (authoritative chunk lifecycle and mutation ownership); uncommitted spec work in its worktree"
+   }
+  },
+  {
+   "ref": "t3/daf7d459",
+   "sha_observed": "aa0cd43a6732db41fd4f3408e760dc144dd1f80b",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-daf7d459-4b29c4eea7a9a863",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 1,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 18,
+    "diffstat_vs_merge_base": "8 files changed, 318 insertions(+), 5 deletions(-)",
+    "changed_files": 8,
+    "equivalence": "7f65ed9",
+    "equivalence_kind": "patch_id_equal",
+    "equivalence_note": "WG heightmaps at carver pass",
+    "commit_subjects": [
+     "fix(worldgen): freeze WG heightmaps at the carver pass, not the surface"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (7f65ed9)"
+  },
+  {
+   "ref": "t3/f1194919",
+   "sha_observed": "77cd4ff1a99e15b4b49792e93af35cc2cad53d85",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_canonical",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-f1194919-7cd784f51d22addf",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 1,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 1,
+    "behind_canonical": 7,
+    "diffstat_vs_merge_base": "8 files changed, 650 insertions(+), 41 deletions(-)",
+    "changed_files": 8,
+    "equivalence": "6cdc2c7",
+    "equivalence_kind": "same_subject_rebase",
+    "equivalence_note": "nether plants mayPlaceOn (older base)",
+    "commit_subjects": [
+     "fix(feature,worldgen): split the nether plants' mayPlaceOn, per-layer count placement, FEATURES write window"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (6cdc2c7)"
+  },
+  {
+   "ref": "t3/independent-acceptance-review",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "RETIRE_CANDIDATE",
+   "content": "ancestor",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-115e673c-4eb42cf3142f47a7",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "local-only `git worktree remove` + `git branch -d` after the manifest is approved",
+   "precondition": "worktree clean, no untracked artifacts, ref tip already in canonical"
+  },
+  {
+   "ref": "t3/mc-spine-contributor-docs",
+   "sha_observed": "866d79ac67811cad70ddfbac0b1bfbcbf4491863",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": true,
+   "worktree_id": "t3-35a73e4b-7d6dc33d136155fc",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": "Contributor readiness A: coherent onboarding and current documentation",
+    "link": "t3-thread://v2/0dad0cde-3d82-45b5-8725-7ba7b32672e2/thread:delegated-task:command%3Amcp%3A2ebeb717-82d9-4f01-b038-e73f5ca57dfe%3Adelegate-task%3Ae18bdcc8-7201-43c7-8bef-3fdfe454bc51",
+    "reason": "contributor docs A (README/CONTRIBUTING/specs README/DESIGN/TODO/docs/development); edits in progress"
+   }
+  },
+  {
+   "ref": "t3/mc-spine-contributor-preflight",
+   "sha_observed": "3aa4772eaf37aa02fb1c22c24dfb5861c63577e9",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": true,
+   "worktree_id": "t3-e76dbf31-f70efc137c4a04be",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": "Contributor readiness B: safe local preflight and navigable verification",
+    "link": "t3-thread://v2/0dad0cde-3d82-45b5-8725-7ba7b32672e2/thread:delegated-task:command%3Amcp%3A2ebeb717-82d9-4f01-b038-e73f5ca57dfe%3Adelegate-task%3Aa4001817-0beb-47f4-ade6-b8539d536298",
+    "reason": "preflight B (tools/dev_check.py, tests/dev_check_test.py, tools/README, tests/README); files in progress"
+   }
+  },
+  {
+   "ref": "t3/mc-spine-evidence-validation",
+   "sha_observed": "9fcb5daa1fb607832f03bf3a6b909b46352fd07a",
+   "disposition": "PATCH_EQUIVALENT",
+   "content": "patch_equivalent_candidate",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-a99f7ba4-18feaf996fd716b1",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 10,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 10,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "21 files changed, 1990 insertions(+), 30 deletions(-)",
+    "changed_files": 21,
+    "equivalence": "9fcb5da(+9)",
+    "equivalence_kind": "patch_id_equal_candidate",
+    "equivalence_note": "foundation receipt/documentation chain; tip is ancestor of the candidate",
+    "commit_subjects": [
+     "docs(worldgen-parity): the trace limit, the unbound old numbers, and the fresh receipt",
+     "test(mutation_check): keep the failing assertion, not just the count",
+     "fix(evidence): a filter that passes zero tests is not a passing filter",
+     "fix(cargo_executable): name the test harness separately from the build binary"
+    ]
+   },
+   "action": "retain until the duplicated commit is accepted into canonical, then retire (bundle first if desired)",
+   "precondition": "duplicate commit present in canonical (9fcb5da(+9))"
+  },
+  {
+   "ref": "t3/mc-spine-readiness-review",
+   "sha_observed": "30460b75a5ac495a88b1f36b4bfe80aab0ddf633",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "patch_equivalent",
+   "moving": false,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-1f0488a5-da686e44cfc6095d",
+   "dirty_count": 1,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 3,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 3,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "11 files changed, 1371 insertions(+), 26 deletions(-)",
+    "changed_files": 11,
+    "equivalence": "0b2d92c+06adb62+247602f",
+    "equivalence_kind": "patch_id_equal_candidate",
+    "equivalence_note": "3 commits duplicate candidate documents/tests",
+    "commit_subjects": [
+     "docs(worldgen-parity): the reporting contract, and the two residuals' evidence read as evidence",
+     "test(feature): the mushroom and basalt residuals are not support rules",
+     "perf(test): the suite's 624 s is compute, so optimize the test profile"
+    ]
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner"
+  },
+  {
+   "ref": "t3/repository-convergence-plan",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-0ada91da-8f2106413bbab7a7",
+   "dirty_count": 1,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": "Repository convergence: PR, branch, worktree and unique-change disposition",
+    "link": "t3-thread://v2/0dad0cde-3d82-45b5-8725-7ba7b32672e2/thread:delegated-task:command%3Amcp%3A2ebeb717-82d9-4f01-b038-e73f5ca57dfe%3Adelegate-task%3A9c9ce04a-be62-4a25-a622-9dd31b8491f4",
+    "reason": "this audit's own worktree; only adds evidence/review/repository-convergence-20261116/"
+   }
+  },
+  {
+   "ref": "t3/runtime-source-organization",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-26c63f09-fdeebdff79cb2aa7",
+   "dirty_count": 2,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": "Code organization: source-grounded cleanup outside active worldgen re",
+    "link": "t3-thread://v2/0dad0cde-3d82-45b5-8725-7ba7b32672e2/thread:delegated-task:command%3Amcp%3A2ebeb717-82d9-4f01-b038-e73f5ca57dfe%3Adelegate-task%3A57a34768-8343-480c-9e5e-f5d2533b38e0",
+    "reason": "source organization cleanup outside the active worldgen lanes; branch created and renamed during this audit"
+   }
+  },
+  {
+   "ref": "t3/worldgen-integration-audit",
+   "sha_observed": "2799a36b416de9e5205067bee313fe6f95fd6664",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": true,
+   "worktree_id": "t3-b2eb8ad1-ebf296b8314a2ff7",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": false,
+    "unique_commits": 13,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 13,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "38 files changed, 4759 insertions(+), 176 deletions(-)",
+    "changed_files": 38,
+    "equivalence": null,
+    "equivalence_kind": null,
+    "equivalence_note": null,
+    "commit_subjects": [
+     "fix(feature,tree): the plane array's order, the disk's box walk, and two draw positions",
+     "test(worldgen): the two residuals are an unmeasured light half, lost writes, and a fossil beard",
+     "feat(registry): the physical predicates are one pinned table, and the compositions on top of it were wrong",
+     "docs(worldgen-parity): the trace limit, the unbound old numbers, and the fresh receipt"
+    ]
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": "Independent acceptance and integration candidate: completed 5A/5C/6A/",
+    "link": "t3-thread://v2/0dad0cde-3d82-45b5-8725-7ba7b32672e2/thread:delegated-task:command%3Amcp%3A428c4310-c657-43bc-91ab-2d3e70b7535c%3Adelegate-task%3A4f1e78bd-d463-4e57-87bf-6e5e091237df",
+    "reason": "integration candidate for the completed 5A/5C/6A/6B/6C batch; a running task owns it"
+   }
+  },
+  {
+   "ref": "t3/bd0038ec",
+   "sha_observed": "4d1d55232a6b09ed1a9ed03f68ddb79ac82a1217",
+   "disposition": "UNKNOWN_HOLD",
+   "content": "none",
+   "moving": true,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-bd0038ec-267d4e33ad713f28",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "protect: uncommitted or untracked work exists only here",
+   "precondition": "the uncommitted work is committed or explicitly discarded by its owner",
+   "note": "created during the audit at canonical HEAD; no worktree, owner/task not identified"
+  },
+  {
+   "ref": "t3/mc-spine-integration-review",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "content": "moves",
+   "moving": true,
+   "sha_changed_during_audit": false,
+   "worktree_id": "t3-bcaff3af-3038d8506b9c7851",
+   "dirty_count": 0,
+   "signals": {
+    "tip_in_canonical_history": true,
+    "unique_commits": 0,
+    "unique_patch_equivalent": 0,
+    "ahead_of_canonical": 0,
+    "behind_canonical": 0,
+    "diffstat_vs_merge_base": "",
+    "changed_files": 0,
+    "equivalence": null,
+    "equivalence_kind": "ancestor",
+    "equivalence_note": null,
+    "commit_subjects": []
+   },
+   "action": "do not touch; re-read the owning task before any change",
+   "precondition": "owning task settles and reports",
+   "owner_thread": {
+    "title": null,
+    "link": null,
+    "reason": "review worktree created during this audit at canonical HEAD; no commits yet"
+   }
+  }
+ ],
+ "worktrees": [
+  {
+   "worktree_id": "root",
+   "branch": "perf/worldgen-parallel",
+   "head_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "CANONICAL",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "subagent-Beardifier-Surface-Order-Fixer-self-c96f1d39-mc-spine",
+   "branch": "subagent-Beardifier-Surface-Order-Fixer-self-c96f1d39-mc-spine",
+   "head_observed": "97478469728e26a38bf03a774e62cd23d950cf8a",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 1,
+   "dirty_kind": {
+    "tracked": 1,
+    "untracked": 0
+   },
+   "dirty_sample": [
+    " M src/worldgen.rs"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "subagent-Ruined-Portal-Parity-Fixer-self-3d541724-mc-spine",
+   "branch": "subagent-Ruined-Portal-Parity-Fixer-self-3d541724-mc-spine",
+   "head_observed": "97478469728e26a38bf03a774e62cd23d950cf8a",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "subagent-Spawner-and-Entity-Payload-Wirer-self-8cb58996-mc-spine",
+   "branch": "subagent-Spawner-and-Entity-Payload-Wirer-self-8cb58996-mc-spine",
+   "head_observed": "ee5802783a5ca7459953fac89e5a00bb2ca0a8fc",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "subagent-Stronghold-Parity-Fixer-self-65d240ce-mc-spine",
+   "branch": "subagent-Stronghold-Parity-Fixer-self-65d240ce-mc-spine",
+   "head_observed": "97478469728e26a38bf03a774e62cd23d950cf8a",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "subagent-Weeping-Vines-Bug-Fixer-self-b5e10882-mc-spine",
+   "branch": "subagent-Weeping-Vines-Bug-Fixer-self-b5e10882-mc-spine",
+   "head_observed": "f86051c9911fb28e48c4fa42bd37b357c60248a5",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-00396e1e-ffe8a0584aaa6e8b",
+   "branch": "t3/00396e1e",
+   "head_observed": "799decd6dcdcdfc82f456a76ec309f79b5737c17",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-05e0b86e-56632f925a0b78cd",
+   "branch": "t3/05e0b86e",
+   "head_observed": "2012fb216ad89eff23fed19b282999d3120f9694",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-0ada91da-8f2106413bbab7a7",
+   "branch": "t3/repository-convergence-plan",
+   "head_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 1
+   },
+   "dirty_sample": [
+    "?? evidence/review/repository-convergence-20261116/"
+   ],
+   "dirty_exempt": [
+    "evidence/review/repository-convergence-20261116/"
+   ],
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-115e673c-4eb42cf3142f47a7",
+   "branch": "t3/independent-acceptance-review",
+   "head_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-1a1eaa76-647f7821536e0b61",
+   "branch": "t3/1a1eaa76",
+   "head_observed": "a00e703ce8b2e4e6662cc9c20ec4aef5fddd5752",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-1b855eea-01ced11ca20fd87f",
+   "branch": "t3/1b855eea",
+   "head_observed": "a03e42d8865b3fb8d31c06414c3f32f2baa9d528",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-1f0488a5-da686e44cfc6095d",
+   "branch": "t3/mc-spine-readiness-review",
+   "head_observed": "30460b75a5ac495a88b1f36b4bfe80aab0ddf633",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 1,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 1
+   },
+   "dirty_sample": [
+    "?? target-readiness/"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": "792M untracked `target-readiness/` build output; regenerable but not confirmed disposable"
+  },
+  {
+   "worktree_id": "t3-1f897698-3c092ecb5aff4301",
+   "branch": "t3/1f897698",
+   "head_observed": "443d1eac4d1341e94a13c9b2448cc7a6337d6f7f",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-2657631b-ce5a8580092a9c45",
+   "branch": "t3/2657631b",
+   "head_observed": "642dfb7b1a58455c1fda1594143f597321bb126b",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 7,
+   "dirty_kind": {
+    "tracked": 5,
+    "untracked": 2
+   },
+   "dirty_sample": [
+    " M src/feature.rs",
+    " M src/generation_contract_tests.rs",
+    " M tests/p0_2_audit_test.py",
+    " M tools/mutation_check.sh",
+    " M tools/structure-oracle/NativeHarness.java",
+    "?? tests/data/end_spike_1211.tsv",
+    "?? tools/structure-oracle/EndSpikeOracle.java"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-26c63f09-fdeebdff79cb2aa7",
+   "branch": "t3/runtime-source-organization",
+   "head_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "clean": false,
+   "dirty_count": 2,
+   "dirty_kind": {
+    "tracked": 1,
+    "untracked": 1
+   },
+   "dirty_sample": [
+    " M src/tick_persistence.rs",
+    "?? evidence/review/code-organization-2026-11-16.md"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-27d57348-3f5c9903bcc91a8f",
+   "branch": "t3/27d57348",
+   "head_observed": "fc9dfdf8f2ebf7af25924a6f759d08ed04b966d4",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-28f8bfaf-9450b571c6aebe09",
+   "branch": "t3/28f8bfaf",
+   "head_observed": "0e0ee5a007bf2312f7d3b248623995ffaccb09a3",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-3536d310-0eaea3f9d2d392fa",
+   "branch": "t3/3536d310",
+   "head_observed": "2ba443d1e364d6c6159aea900edf5da6dc1a1984",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 5,
+   "dirty_kind": {
+    "tracked": 1,
+    "untracked": 4
+   },
+   "dirty_sample": [
+    " M src/feature.rs",
+    "?? src/jigsaw_structures.rs",
+    "?? tests/data/jigsaw_structures_1211.tsv",
+    "?? tools/jigsaw_oracle.py",
+    "?? tools/structure-oracle/JigsawOracle.java"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-3554b778-9ec1e56fe24e2312",
+   "branch": "t3/3554b778",
+   "head_observed": "a420246fb12dd4d6709111d547f904664562e3af",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-35a73e4b-7d6dc33d136155fc",
+   "branch": "t3/mc-spine-contributor-docs",
+   "head_observed": "866d79ac67811cad70ddfbac0b1bfbcbf4491863",
+   "disposition": "ACTIVE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-37d03552-a46d7a3bf29a6bc1",
+   "branch": "t3/37d03552",
+   "head_observed": "c79b59679557971725114e361d075d522461bff0",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-38771855-31787de78ee3a88d",
+   "branch": "t3/38771855",
+   "head_observed": "2ba443d1e364d6c6159aea900edf5da6dc1a1984",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 4,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 4
+   },
+   "dirty_sample": [
+    "?? tests/data/template_structure_cases_1211.json",
+    "?? tests/data/template_structures_1211.tsv",
+    "?? tools/structure-oracle/TemplateStructureOracle.java",
+    "?? tools/template_structure_oracle.py"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-39628b20-76d444070145f036",
+   "branch": "t3/chunk-state-reform",
+   "head_observed": "5caca0b750e4ff13427f5394c8c8b4d04a204077",
+   "disposition": "ACTIVE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": "chunk-state reform spec/evidence/tool files; branch commits move during audit"
+  },
+  {
+   "worktree_id": "t3-3fa6ff6f-065b7e46ecbfc194",
+   "branch": "t3/3fa6ff6f",
+   "head_observed": "642dfb7b1a58455c1fda1594143f597321bb126b",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 5,
+   "dirty_kind": {
+    "tracked": 5,
+    "untracked": 0
+   },
+   "dirty_sample": [
+    " M src/generation_payload.rs",
+    " M src/generation_providers.rs",
+    " M src/main.rs",
+    " M src/structure_template.rs",
+    " M tools/mutation_check.sh"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-401f5f2c-73247e2c0f5715f3",
+   "branch": "t3/401f5f2c",
+   "head_observed": "89ac21244b022f3d6d281c83478187a344c911d2",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-42b38472-ff099c50a976acca",
+   "branch": "t3/42b38472",
+   "head_observed": "2d9a6b0e778b276a719cc1f958069be86fd0ec97",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-44cdcc09-bc48b5d343d951ca",
+   "branch": "t3/44cdcc09",
+   "head_observed": "924b6ccbd58aff398db543559fd21d2755a8652d",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-518d2532-67c4ecb4ae267c70",
+   "branch": "t3/518d2532",
+   "head_observed": "4d46394aa49edbb393d2a8ad60d202add4ff453d",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-548b811e-6e73c70f2d600294",
+   "branch": "t3/548b811e",
+   "head_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "clean": false,
+   "dirty_count": 4,
+   "dirty_kind": {
+    "tracked": 4,
+    "untracked": 0
+   },
+   "dirty_sample": [
+    " M src/feature.rs",
+    " M src/tree.rs",
+    " M tools/carve-agent/Agent.java",
+    " M tools/carve-agent/CarveLog.java"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-598a38eb-11b366258d21a75f",
+   "branch": "t3/598a38eb",
+   "head_observed": "f166588dfc9d5733fe76cbf6949fb872c083ce04",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-5a21bfce-3285b48e84a7cc9c",
+   "branch": "t3/5a21bfce",
+   "head_observed": "f446b7fe12dab6e2dd3963b8ab38d7db07b6dc01",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-5fc39f59-5eefbf1e8e6861f3",
+   "branch": "t3/5fc39f59",
+   "head_observed": "2ba443d1e364d6c6159aea900edf5da6dc1a1984",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 6,
+   "dirty_kind": {
+    "tracked": 2,
+    "untracked": 4
+   },
+   "dirty_sample": [
+    " M src/mineshaft_piece.rs",
+    " M tools/mutation_check.sh",
+    "?? src/single_piece_structures.rs",
+    "?? tests/data/single_piece_structures_1211.tsv",
+    "?? tools/single_piece_oracle.py",
+    "?? tools/structure-oracle/SinglePieceOracle.java"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-8979527a-6daa326afdcb6f05",
+   "branch": "t3/8979527a",
+   "head_observed": "864bf73e6262495897b8b68cabe268cd3465f7f0",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-93e5c0ae-311a9ed68a611da8",
+   "branch": "t3/93e5c0ae",
+   "head_observed": "2f74c0ef34bfc9003082f61f6fa42b0d6bd09e66",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-9fb8a1ca-97e9084acc4b36e2",
+   "branch": "t3/9fb8a1ca",
+   "head_observed": "51120b7b6c784cb1cabf72055dba9d5f1b723361",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-a99f7ba4-18feaf996fd716b1",
+   "branch": "t3/mc-spine-evidence-validation",
+   "head_observed": "9fcb5daa1fb607832f03bf3a6b909b46352fd07a",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-aef0d8c5-a186eecb476ffbfc",
+   "branch": "t3/aef0d8c5",
+   "head_observed": "c3d2dc40b29099cdfeae67ecc0b9a68f1d83c90b",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-af28fe5e-f935f983e06763fa",
+   "branch": "t3/af28fe5e",
+   "head_observed": "4611f49011c7e0b3e6889850508cbf20a371055f",
+   "disposition": "RETIRE_CANDIDATE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-b2eb8ad1-ebf296b8314a2ff7",
+   "branch": "t3/worldgen-integration-audit",
+   "head_observed": "2799a36b416de9e5205067bee313fe6f95fd6664",
+   "disposition": "ACTIVE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": "active integration candidate; dirty state moves between checks"
+  },
+  {
+   "worktree_id": "t3-bcaff3af-3038d8506b9c7851",
+   "branch": "t3/mc-spine-integration-review",
+   "head_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "disposition": "ACTIVE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-bd0038ec-267d4e33ad713f28",
+   "branch": "t3/bd0038ec",
+   "head_observed": "4d1d55232a6b09ed1a9ed03f68ddb79ac82a1217",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-c52386e8-91324fbac5428fcb",
+   "branch": "t3/c52386e8",
+   "head_observed": "ae909673c1cb876c3cfc4a0f38ad820f7f2dcc16",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-c5e6c95f-48960a200f784ee7",
+   "branch": "t3/c5e6c95f",
+   "head_observed": "085206bb56c3425f902463a952f4f7d04ea1eef6",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-c7fcd100-1e24aed9241aeb48",
+   "branch": "t3/c7fcd100",
+   "head_observed": "54ee3d68f1b0fcecd6796ec1c9f4a6d11649983a",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-ceb3c758-f26e2ecb70785e0a",
+   "branch": "t3/ceb3c758",
+   "head_observed": "642dfb7b1a58455c1fda1594143f597321bb126b",
+   "disposition": "UNKNOWN_HOLD",
+   "clean": false,
+   "dirty_count": 9,
+   "dirty_kind": {
+    "tracked": 9,
+    "untracked": 0
+   },
+   "dirty_sample": [
+    " M evidence/gameplay/feature-parity/seed-4242-chunk-3-m2-20261113.md",
+    " M tests/port_triage_test.py",
+    " M tests/sculk_trace_test.py",
+    " M tools/carve-agent/Agent.java",
+    " M tools/carve-agent/AgentContractProbe.java",
+    " M tools/carve-agent/README.md",
+    " M tools/carve-agent/SculkLog.java",
+    " M tools/port_triage.py"
+   ],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-daf7d459-4b29c4eea7a9a863",
+   "branch": "t3/daf7d459",
+   "head_observed": "aa0cd43a6732db41fd4f3408e760dc144dd1f80b",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-e76dbf31-f70efc137c4a04be",
+   "branch": "t3/mc-spine-contributor-preflight",
+   "head_observed": "3aa4772eaf37aa02fb1c22c24dfb5861c63577e9",
+   "disposition": "ACTIVE",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": true,
+   "note": null
+  },
+  {
+   "worktree_id": "t3-f1194919-7cd784f51d22addf",
+   "branch": "t3/f1194919",
+   "head_observed": "77cd4ff1a99e15b4b49792e93af35cc2cad53d85",
+   "disposition": "PATCH_EQUIVALENT",
+   "clean": true,
+   "dirty_count": 0,
+   "dirty_kind": {
+    "tracked": 0,
+    "untracked": 0
+   },
+   "dirty_sample": [],
+   "dirty_exempt": null,
+   "protected": false,
+   "note": null
+  }
+ ],
+ "pull_requests": [
+  {
+   "number": 49,
+   "state": "OPEN",
+   "draft": false,
+   "base": "main",
+   "head_ref": "dependabot/cargo/cargo-minor-patch-abc66d23b0",
+   "head_sha": "f416172cc6f9ddf00ad07a940bc68b76ccc5541a",
+   "merged_at": null,
+   "closed_at": null,
+   "url": "https://github.com/nekomario28/mc-spine/pull/49",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "dependabot cargo minor-patch group; all 4 checks red; base main is 16 commits ahead of the PR head",
+   "action": "user decision: keep/close dependency bump",
+   "local_carrier": null,
+   "remote_only": true
+  },
+  {
+   "number": 48,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "fix/nofeat-datapack-format-1211-20261112",
+   "head_sha": "5f4a34e958a1c6f2517bc56df218b089dcf97829",
+   "merged_at": "2026-11-11T18:05:28Z",
+   "closed_at": "2026-11-11T18:05:28Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/48",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 47,
+   "state": "OPEN",
+   "draft": true,
+   "base": "main",
+   "head_ref": "feat/voxel-collision-1211-20261111",
+   "head_sha": "19f21d915f774d5b9fff9230b42075c454630dd0",
+   "merged_at": null,
+   "closed_at": null,
+   "url": "https://github.com/nekomario28/mc-spine/pull/47",
+   "disposition": "UNMERGED_UNIQUE",
+   "note": "draft; 34 commits ahead of main, 12 files; src/voxel_collision.rs, specs and native collision tests are absent from canonical",
+   "action": "user decision: keep as the voxel slice carrier, or close",
+   "local_carrier": null,
+   "remote_only": true
+  },
+  {
+   "number": 46,
+   "state": "OPEN",
+   "draft": true,
+   "base": "main",
+   "head_ref": "test/fluid-trace-parity-20261111",
+   "head_sha": "ce8c649db21e1c0c429fe0eedb55a51bc266968b",
+   "merged_at": null,
+   "closed_at": null,
+   "url": "https://github.com/nekomario28/mc-spine/pull/46",
+   "disposition": "UNMERGED_UNIQUE",
+   "note": "draft; 6 commits; fluid trace comparator files absent from canonical",
+   "action": "user decision: keep as the fluid trace carrier, or close",
+   "local_carrier": null,
+   "remote_only": true
+  },
+  {
+   "number": 45,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "main",
+   "head_ref": "chore/external-source-guard-20261111",
+   "head_sha": "04c6a0dd9b83035e429d38133c7c0fc0495c2607",
+   "merged_at": null,
+   "closed_at": "2026-11-11T05:41:03Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/45",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted; commit object still present locally",
+   "remote_only": true
+  },
+  {
+   "number": 37,
+   "state": "MERGED",
+   "draft": true,
+   "base": "main",
+   "head_ref": "perf/worldgen-parallel",
+   "head_sha": "7a72f8291994a530fc45c6080ff03216aa9552bb",
+   "merged_at": "2026-11-11T17:28:34Z",
+   "closed_at": "2026-11-11T17:28:34Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/37",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": "t3/worldgen-integration-audit via #37"
+  },
+  {
+   "number": 36,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "test/native-survival-and-tick-order-20261107",
+   "head_ref": "feat/p1-falling-tick-parity-20261108",
+   "head_sha": "f49530df9ba8e285fad8c0dd29a8701c8646d3fd",
+   "merged_at": null,
+   "closed_at": "2026-11-10T14:36:11Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/36",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted; commit object still present locally",
+   "remote_only": true
+  },
+  {
+   "number": 35,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "test/native-survival-and-tick-order-20261107",
+   "head_ref": "feat/p1-falling-scheduled-ticks-20261108",
+   "head_sha": "31c67c0eda2c7a9793dd9f8859b988580394c702",
+   "merged_at": null,
+   "closed_at": "2026-11-10T14:36:08Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/35",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted; commit object still present locally",
+   "remote_only": true
+  },
+  {
+   "number": 34,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "feat/template-neighbor-finalization-20261106",
+   "head_ref": "test/native-survival-and-tick-order-20261107",
+   "head_sha": "a170e5b3802345f1cc5c90450936700ca8c0a1bf",
+   "merged_at": null,
+   "closed_at": "2026-11-10T14:36:00Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/34",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted; commit object still present locally",
+   "remote_only": true
+  },
+  {
+   "number": 33,
+   "state": "MERGED",
+   "draft": true,
+   "base": "perf/worldgen-parallel",
+   "head_ref": "feat/template-neighbor-finalization-20261106",
+   "head_sha": "101b3133cf0dcc2ce9d3183a3759c5b40bc8da83",
+   "merged_at": "2026-11-10T14:35:33Z",
+   "closed_at": "2026-11-10T14:35:33Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/33",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 32,
+   "state": "MERGED",
+   "draft": true,
+   "base": "perf/worldgen-parallel",
+   "head_ref": "fix/worldgen-unknown-density-20261106",
+   "head_sha": "08b7adae65833bbe4753ab50d1027369f875e164",
+   "merged_at": "2026-11-10T14:35:33Z",
+   "closed_at": "2026-11-10T14:35:33Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/32",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 31,
+   "state": "MERGED",
+   "draft": true,
+   "base": "perf/worldgen-parallel",
+   "head_ref": "docs/worldgen-execution-plan-20261106",
+   "head_sha": "a0113ab25bd0b5f54ac2746e42c44fbb4bc25033",
+   "merged_at": "2026-11-10T14:35:33Z",
+   "closed_at": "2026-11-10T14:35:33Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/31",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 30,
+   "state": "OPEN",
+   "draft": false,
+   "base": "main",
+   "head_ref": "docs/vanilla-parity-progress",
+   "head_sha": "2b3a222dc2073b6c6c37597d018c4f1742c45d40",
+   "merged_at": null,
+   "closed_at": null,
+   "url": "https://github.com/nekomario28/mc-spine/pull/30",
+   "disposition": "UNMERGED_UNIQUE",
+   "note": "5 commits; VANILLA_PARITY.md and tools/check_vanilla_parity.py absent from canonical; the parity story has since moved to specs/worldgen-parity/*",
+   "action": "user decision: re-target to canonical or close as superseded in purpose",
+   "local_carrier": null,
+   "remote_only": true
+  },
+  {
+   "number": 29,
+   "state": "OPEN",
+   "draft": false,
+   "base": "main",
+   "head_ref": "docs/blocks-provenance",
+   "head_sha": "c1d4175753485c91ab68ebde4a34f3251fee13ba",
+   "merged_at": null,
+   "closed_at": null,
+   "url": "https://github.com/nekomario28/mc-spine/pull/29",
+   "disposition": "UNMERGED_UNIQUE",
+   "note": "1 commit, 8 lines; provenance re-check text absent from canonical (LICENSING/NOTICE/THIRD_PARTY differ)",
+   "action": "user decision: small docs commit; re-target to canonical or close",
+   "local_carrier": null,
+   "remote_only": true
+  },
+  {
+   "number": 28,
+   "state": "OPEN",
+   "draft": false,
+   "base": "main",
+   "head_ref": "dependabot/cargo/jni-0.22.4",
+   "head_sha": "71818b0395bd388084b1009fbff938c7201b3c9c",
+   "merged_at": null,
+   "closed_at": null,
+   "url": "https://github.com/nekomario28/mc-spine/pull/28",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "dependabot jni 0.21.1 -> 0.22.4; all 4 checks red; base main 16 ahead",
+   "action": "user decision: keep/close dependency bump",
+   "local_carrier": null,
+   "remote_only": true
+  },
+  {
+   "number": 27,
+   "state": "CLOSED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "dependabot/cargo/cargo-minor-patch-f39584c2d8",
+   "head_sha": "38c0b34aaa305a0db9325737b28169255d09917c",
+   "merged_at": null,
+   "closed_at": "2026-11-11T17:30:57Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/27",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted",
+   "remote_only": true
+  },
+  {
+   "number": 26,
+   "state": "OPEN",
+   "draft": false,
+   "base": "main",
+   "head_ref": "dependabot/github_actions/actions/checkout-7.0.1",
+   "head_sha": "99121db7064819cacc2c770984ba72c715f720b1",
+   "merged_at": null,
+   "closed_at": null,
+   "url": "https://github.com/nekomario28/mc-spine/pull/26",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "dependabot actions/checkout 4.4.0 -> 7.0.1; all 4 checks red; base main 16 ahead",
+   "action": "user decision: keep/close dependency bump",
+   "local_carrier": null,
+   "remote_only": true
+  },
+  {
+   "number": 25,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "chore/remove-pumpkin-name-leftovers",
+   "head_sha": "643df4aebe67a20e015f7dd828f2df97481422a8",
+   "merged_at": "2026-10-26T06:05:08Z",
+   "closed_at": "2026-10-26T06:05:08Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/25",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 24,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "perf/guard-dtrace",
+   "head_sha": "f9ee3f4eab46616450143784681f8fec22995a47",
+   "merged_at": "2026-10-26T06:06:13Z",
+   "closed_at": "2026-10-26T06:06:14Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/24",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 23,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "chore/license-apache-gitignore",
+   "head_sha": "f183366e4acdf0057f0f9fdad45147ef385ddc8b",
+   "merged_at": "2026-10-26T06:06:28Z",
+   "closed_at": "2026-10-26T06:06:28Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/23",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 22,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "chore/generate-vanilla-data-locally",
+   "head_sha": "04da22b0ccac020fefd9606eae7ff5bb43828857",
+   "merged_at": "2026-10-26T06:02:53Z",
+   "closed_at": "2026-10-26T06:02:53Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/22",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 21,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "fix/xoroshiro-next-bound-and-bt-search-vanilla",
+   "head_sha": "31cc8b3d81760eb3e1163d1d0bb70d0e9177942a",
+   "merged_at": "2026-10-26T06:05:59Z",
+   "closed_at": "2026-10-26T06:05:59Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/21",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 20,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "chore/cleanup-paths-and-rewrite-matching-code",
+   "head_sha": "692c2d93bf8b38a01a1832901774e1f73a6508d0",
+   "merged_at": "2026-10-26T06:02:34Z",
+   "closed_at": "2026-10-26T06:02:34Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/20",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 19,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "chore/remove-pumpkin-identical-data",
+   "head_sha": "81a9ae7151aa8bfa7204a1ba282abd5f1df38752",
+   "merged_at": "2026-10-26T06:02:15Z",
+   "closed_at": "2026-10-26T06:02:15Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/19",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 18,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "docs/shim-roadmap",
+   "head_sha": "5aa8d99c95af433aff8de5d8acf90716ec28ff8b",
+   "merged_at": "2026-10-26T06:01:56Z",
+   "closed_at": "2026-10-26T06:01:56Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/18",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 17,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "hardening/network-limits",
+   "head_sha": "b4476549ee2e096a865e7072cb37904b6f10c80a",
+   "merged_at": "2026-10-26T06:01:44Z",
+   "closed_at": "2026-10-26T06:01:44Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/17",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 16,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "chore/repo-hygiene",
+   "head_sha": "89b808473fc8512bbba7ffee4acbb134764c87c7",
+   "merged_at": "2026-10-26T06:01:32Z",
+   "closed_at": "2026-10-26T06:01:33Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/16",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 14,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "fix/biome-vectors-flake",
+   "head_sha": "3bd8fb717d46fd48aadb8d3c7a7f5ebc9a4d9911",
+   "merged_at": "2026-10-18T11:40:35Z",
+   "closed_at": "2026-10-18T11:40:35Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/14",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 12,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "fix/clippy-manual",
+   "head_sha": "14b9be59d5d9617aa3aa6f1db52ab23242fa8805",
+   "merged_at": "2026-10-16T16:56:15Z",
+   "closed_at": "2026-10-16T16:56:15Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/12",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 9,
+   "state": "MERGED",
+   "draft": false,
+   "base": "main",
+   "head_ref": "fix/clippy-hygiene",
+   "head_sha": "03c7e31b1d08a1bda7f1882fb43ad9e80412a6fc",
+   "merged_at": "2026-10-16T16:28:23Z",
+   "closed_at": "2026-10-16T16:28:23Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/9",
+   "disposition": "MERGED_RETAIN_EVIDENCE",
+   "note": "in main history; canonical contains main",
+   "local_carrier": null
+  },
+  {
+   "number": 6,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "feat/pumpkin-inspired-runtime-guards",
+   "head_ref": "feat/queued-chunk-streaming",
+   "head_sha": "cf6c0aeeadf6737b620c9372fedd920819813e11",
+   "merged_at": null,
+   "closed_at": "2026-10-23T16:38:10Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/6",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted",
+   "remote_only": true
+  },
+  {
+   "number": 5,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "mod-compat-foundation",
+   "head_ref": "merge-pr2",
+   "head_sha": "86ba6551e90aa31388e64a2291ea50b674b87de6",
+   "merged_at": null,
+   "closed_at": "2026-10-12T15:00:09Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/5",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted",
+   "remote_only": true
+  },
+  {
+   "number": 4,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "fix/audit-1-security-runtime",
+   "head_ref": "feat/pumpkin-inspired-runtime-guards",
+   "head_sha": "32a5e6b853611e3a27e3c2f8d641bd64c14c6a71",
+   "merged_at": null,
+   "closed_at": "2026-10-23T16:38:07Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/4",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted",
+   "remote_only": true
+  },
+  {
+   "number": 2,
+   "state": "CLOSED",
+   "draft": true,
+   "base": "main",
+   "head_ref": "fix/audit-1-security-runtime",
+   "head_sha": "962f25e7341321c38682f69090b5891fadcfe37f",
+   "merged_at": null,
+   "closed_at": "2026-10-23T16:38:04Z",
+   "url": "https://github.com/nekomario28/mc-spine/pull/2",
+   "disposition": "UNKNOWN_HOLD",
+   "note": "closed without merge; remote branch deleted",
+   "remote_only": true
+  }
+ ],
+ "queue": [
+  {
+   "order": 1,
+   "id": "accept-5x-candidate",
+   "carrier": "t3/worldgen-integration-audit",
+   "sha_observed": "2799a36b416de9e5205067bee313fe6f95fd6664",
+   "commits": "commits ahead of canonical at this reading; the row's unique_commits is the snapshot value and the row moved during the audit, so re-read it instead of trusting a count here",
+   "depends_on": [],
+   "gate": "owning acceptance/integration task reports; Jungle 116->121 regression on the order fix resolved or explicitly held",
+   "why": "single carrier for the completed 5A/5C/6A/6B/6C batch; 0 behind canonical at the snapshot, so it fast-forwards"
+  },
+  {
+   "order": 2,
+   "id": "fast-forward-canonical",
+   "carrier": "perf/worldgen-parallel",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "depends_on": [
+    "accept-5x-candidate"
+   ],
+   "gate": "candidate still 0 behind canonical and the acceptance verdict names the candidate SHA",
+   "why": "canonical then holds the batch; no merge commit needed"
+  },
+  {
+   "order": 3,
+   "id": "retire-duplicate-carriers",
+   "carrier": "t3/598a38eb, t3/c5e6c95f, t3/8979527a, t3/mc-spine-evidence-validation, t3/mc-spine-readiness-review, t3/401f5f2c, t3/27d57348",
+   "depends_on": [
+    "fast-forward-canonical"
+   ],
+   "gate": "per carrier, all four re-checked on a fresh read: (i) the content is accepted in canonical at a fresh SHA, not merely present in the candidate; (ii) worktree clean; (iii) artifacts_only_here empty for that row; (iv) the tip SHA read then matches the row",
+   "why": "the carriers are in three different evidence classes (ancestor, patch_id_equal, same_subject_rebase/patch_id_equal_candidate); patch-id equality is the same change, not the same bytes, and a carrier with unique untracked bytes cannot be retired on a commit comparison at all"
+  },
+  {
+   "order": 4,
+   "id": "land-track5b",
+   "carrier": "t3/548b811e",
+   "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
+   "depends_on": [],
+   "gate": "owner commits the 344 uncommitted lines and the Jungle residual measurement is recorded",
+   "why": "uncommitted work is the only copy; unfinished, and it does not gate the docs/preflight slice"
+  },
+  {
+   "order": 5,
+   "id": "land-root-reform",
+   "carrier": "t3/chunk-state-reform",
+   "sha_observed": "5caca0b750e4ff13427f5394c8c8b4d04a204077",
+   "depends_on": [],
+   "gate": "owning task reports a candidate; the recorded tip is a recon/spec commit, not a current generation_context implementation, so its production status is unknown here",
+   "why": "not scheduled and not a dependency of the other items; re-read the row before any containment claim"
+  },
+  {
+   "order": 6,
+   "id": "land-contributor-docs-and-preflight",
+   "carrier": "t3/mc-spine-contributor-docs, t3/mc-spine-contributor-preflight, t3/bd0038ec (unified candidate)",
+   "sha_observed": "866d79ac67811cad70ddfbac0b1bfbcbf4491863",
+   "depends_on": [],
+   "gate": "owners commit; docs only, no source conflict",
+   "why": "documentation, tooling and one persistence refactor; no worldgen or generation_context conflict, so it is independent of the 5x candidate and of Track 5B",
+   "note": "t3/bd0038ec is the unified candidate: docs A + preflight B + 01b7323 persistence cleanup + the repository-convergence inventory directory; the sha_observed here is the snapshot value for the two original carriers, not a fresh read"
+  }
+ ],
+ "local_batch": [
+  {
+   "batch": 1,
+   "kind": "local-only worktree + branch removal",
+   "targets": [
+    "subagent-Ruined-Portal-Parity-Fixer-self-3d541724-mc-spine",
+    "subagent-Stronghold-Parity-Fixer-self-65d240ce-mc-spine",
+    "t3-115e673c-4eb42cf3142f47a7",
+    "t3-28f8bfaf-9450b571c6aebe09",
+    "t3-44cdcc09-bc48b5d343d951ca",
+    "t3-518d2532-67c4ecb4ae267c70",
+    "t3-5a21bfce-3285b48e84a7cc9c",
+    "t3-af28fe5e-f935f983e06763fa"
+   ],
+   "branches": [
+    "subagent-Ruined-Portal-Parity-Fixer-self-3d541724-mc-spine",
+    "subagent-Stronghold-Parity-Fixer-self-65d240ce-mc-spine",
+    "t3/independent-acceptance-review",
+    "t3/28f8bfaf",
+    "t3/44cdcc09",
+    "t3/518d2532",
+    "t3/5a21bfce",
+    "t3/af28fe5e"
+   ],
+   "precondition": "owner approves this exact manifest; `git worktree list` and `git status` are re-read immediately before; each target is still clean and its tip still reachable from canonical",
+   "gate": "`git merge-base --is-ancestor <branch> perf/worldgen-parallel` succeeds for every target",
+   "why": "merged, clean, no untracked artifacts; removing them loses no object content"
+  }
+ ],
+ "deferred_batches": [
+  {
+   "batch": 2,
+   "kind": "after the 5x candidate lands in canonical",
+   "targets": [
+    "subagent-Spawner-and-Entity-Payload-Wirer-self-8cb58996-mc-spine",
+    "subagent-Weeping-Vines-Bug-Fixer-self-b5e10882-mc-spine",
+    "t3-00396e1e-ffe8a0584aaa6e8b",
+    "t3-05e0b86e-56632f925a0b78cd",
+    "t3-1a1eaa76-647f7821536e0b61",
+    "t3-1b855eea-01ced11ca20fd87f",
+    "t3-1f897698-3c092ecb5aff4301",
+    "t3-27d57348-3f5c9903bcc91a8f",
+    "t3-3554b778-9ec1e56fe24e2312",
+    "t3-37d03552-a46d7a3bf29a6bc1",
+    "t3-401f5f2c-73247e2c0f5715f3",
+    "t3-42b38472-ff099c50a976acca",
+    "t3-598a38eb-11b366258d21a75f",
+    "t3-8979527a-6daa326afdcb6f05",
+    "t3-93e5c0ae-311a9ed68a611da8",
+    "t3-9fb8a1ca-97e9084acc4b36e2",
+    "t3-a99f7ba4-18feaf996fd716b1",
+    "t3-aef0d8c5-a186eecb476ffbfc",
+    "t3-c52386e8-91324fbac5428fcb",
+    "t3-c5e6c95f-48960a200f784ee7",
+    "t3-c7fcd100-1e24aed9241aeb48",
+    "t3-daf7d459-4b29c4eea7a9a863",
+    "t3-f1194919-7cd784f51d22addf"
+   ],
+   "branches": [
+    "subagent-Spawner-and-Entity-Payload-Wirer-self-8cb58996-mc-spine",
+    "subagent-Weeping-Vines-Bug-Fixer-self-b5e10882-mc-spine",
+    "t3/00396e1e",
+    "t3/05e0b86e",
+    "t3/1a1eaa76",
+    "t3/1b855eea",
+    "t3/1f897698",
+    "t3/27d57348",
+    "t3/3554b778",
+    "t3/37d03552",
+    "t3/401f5f2c",
+    "t3/42b38472",
+    "t3/598a38eb",
+    "t3/8979527a",
+    "t3/93e5c0ae",
+    "t3/9fb8a1ca",
+    "t3/mc-spine-evidence-validation",
+    "t3/aef0d8c5",
+    "t3/c52386e8",
+    "t3/c5e6c95f",
+    "t3/c7fcd100",
+    "t3/daf7d459",
+    "t3/f1194919"
+   ],
+   "precondition": "the duplicated commit is in canonical, `git branch --merged canonical` contains the ref, and any wanted history has been bundled (`git bundle create ... <ref>`)",
+   "gate": "patch-id / diff-body equivalence re-checked against the new canonical, not against this snapshot",
+   "why": "content is duplicated in canonical or the integration candidate; the refs are redundant carriers"
+  },
+  {
+   "batch": 3,
+   "kind": "protected until the owner commits",
+   "targets": [
+    "subagent-Beardifier-Surface-Order-Fixer-self-c96f1d39-mc-spine",
+    "t3-1f0488a5-da686e44cfc6095d",
+    "t3-2657631b-ce5a8580092a9c45",
+    "t3-3536d310-0eaea3f9d2d392fa",
+    "t3-38771855-31787de78ee3a88d",
+    "t3-3fa6ff6f-065b7e46ecbfc194",
+    "t3-5fc39f59-5eefbf1e8e6861f3",
+    "t3-bd0038ec-267d4e33ad713f28",
+    "t3-ceb3c758-f26e2ecb70785e0a"
+   ],
+   "branches": [
+    "subagent-Beardifier-Surface-Order-Fixer-self-c96f1d39-mc-spine",
+    "t3/mc-spine-readiness-review",
+    "t3/2657631b",
+    "t3/3536d310",
+    "t3/38771855",
+    "t3/3fa6ff6f",
+    "t3/5fc39f59",
+    "t3/bd0038ec",
+    "t3/ceb3c758"
+   ],
+   "precondition": "the owning task commits its uncommitted work or explicitly discards it",
+   "gate": "`git status --porcelain` is empty in the worktree and the new commit exists on a ref",
+   "why": "uncommitted edits and untracked oracle/data files exist only in these worktrees"
+  }
+ ],
+ "remote_decisions": [
+  {
+   "id": "push-canonical",
+   "kind": "remote write",
+   "target": "origin/perf/worldgen-parallel 0d3b4a8 -> canonical",
+   "detail": "canonical is 20 commits ahead of the live remote branch and 38 ahead of main; fast-forward, no rewrite",
+   "needs": "explicit per-request publish instruction (DEVIN_PUBLISH_OK)"
+  },
+  {
+   "id": "push-after-integration",
+   "kind": "remote write",
+   "target": "origin/perf/worldgen-parallel after the 5x candidate lands",
+   "detail": "another fast-forward; do not force-push",
+   "needs": "explicit per-request publish instruction"
+  },
+  {
+   "id": "pr-29-30-docs",
+   "kind": "PR decision",
+   "target": "#29, #30",
+   "detail": "content absent from canonical, but both target main, which is 38 commits behind canonical",
+   "needs": "user decision: re-target, rebase, or close"
+  },
+  {
+   "id": "pr-46-47-drafts",
+   "kind": "PR decision",
+   "target": "#46 (fluid trace), #47 (voxel collision)",
+   "detail": "unique remote-only drafts with red checks; files absent from canonical",
+   "needs": "user decision: keep as carriers, or close"
+  },
+  {
+   "id": "pr-26-28-49-dependabot",
+   "kind": "PR decision",
+   "target": "#26, #28, #49",
+   "detail": "dependency bumps with red checks; base main 16 commits behind the PR heads",
+   "needs": "user decision: rebase/merge or close"
+  },
+  {
+   "id": "remote-branch-deletion",
+   "kind": "remote write",
+   "target": "none proposed yet",
+   "detail": "every live remote head is either an open PR branch or origin/main, origin/perf; no merged branch is left behind",
+   "needs": "nothing now"
+  }
+ ],
+ "limitations": [
+  "No build, test, JVM or GPU run: every verdict is a Git-object/patch comparison, not an executed test result.",
+  "`refs/t3/orchestration-v2/*` (183 refs) are T3 checkpoint refs, not branches; they are out of scope and untouched.",
+  "PR reads are live GitHub reads at the stamp in snapshot.pr_read_utc; all 7 open PR heads match the local remote-tracking objects.",
+  "Remote-tracking refs match the live remote for all 9 heads at snapshot time; no fetch or prune was run.",
+  "Dirty worktree contents were read (status/diffstat), never staged, stashed or modified.",
+  "Porcelain status can be momentarily inconsistent while an owning task writes; ACTIVE rows are observations, not pins.",
+  "Equivalence for the six same-subject/patch-id-different branches is a bounded diff-of-diffs judgement; the drift lines are listed in each row.",
+  "Queue dependencies are a reading of the snapshot, not measured scheduling; re-derive them from the named carriers before acting.",
+  "`refresh.py` validates only the rows it holds, with a sampled `git status`; `0 fail` is not an authorization to delete anything (see the README's Refresh section)."
+ ]
+}

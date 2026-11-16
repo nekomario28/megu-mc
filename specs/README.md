@@ -2,6 +2,22 @@
 
 このページは、現在の作業状態と次の判断の入口です。ブランチ名・HEAD・コミット数のように短期間で変わる値は記録しません。測定値と再現条件の詳細は各証拠ページを正本とし、ここでは結論と限界だけを要約します。
 
+## このページの読み方
+
+| 文書の種類 | 置き場所 | 現在の扱い |
+|---|---|---|
+| 現在の作業・できていること・限界 | このページの「状態」 | 正本。数値・条件は各 `evidence/` を参照 |
+| 受け入れ済みの契約 | 各specのREADMEと、そこが指す `evidence/` | 対象fixture・対象stageの範囲だけで有効 |
+| 提案・別ブランチの設計 | 例: [chunk-parallelism](chunk-parallelism/README.md) の設計案 | **現行実装ではない。** root reform の chunk ownership 案もこのツリーには取り込まれていない |
+| 歴史的記録 | [close-defects](close-defects/README.md)、[done/](done/)、旧checkpoint | 現在の合格判定に使わない |
+| 次に進む順序 | [ROADMAP](ROADMAP.md) | 順序と出口条件の正本。このページに複製しない |
+
+文書と実装が食い違う場合は、実装とテストを確認してこのページを直します。追跡データと方針文書の
+食い違い（未解決）は [CONTRIBUTING](../CONTRIBUTING.md) と [開発ガイド](../docs/development.md) に記録しています。
+
+別ブランチで完了した計測・profileの修正は、このツリーに取り込まれるまで**現行ベースの結果ではありません**。
+取り込み済みかは `git log` と、各 `evidence/` が対象revisionをどう記録しているかで確認してください。
+
 ## 文書の役割
 
 | 質問 | 正本 |
@@ -33,7 +49,7 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 - **M3は未達。** 地形が一致しない条件で得た旧x0.63値は性能根拠に使いません。比較条件・最新の測定と限界は[生成器の費用](../evidence/gameplay/worldgen-cost/README.md)を参照してください。
 - **ローカルsuiteと限定native一致は、全体合格ではありません。** 個別oracle・mutation・全体回帰のreceiptを確認し、hosted CI、whole-world、M2/M3を別々に判定します。以前のleaf-distance属性除外によるno-tick 0は受け入れ根拠から撤回しました。次の境界は[ROADMAP](ROADMAP.md)にあります。
 - **コード検証（旧統合線の履歴）:** `tests/verify.sh` 通過時の記録は159 passed、8スレッド×3回、wire smoke、adapterチェック、mutation 53 proved / 0 skipped、layers 16 modules / 40 edges / 0 named errors、debt ratchet 0 over limit。これは現在のデータ移行ブランチの合格結果ではありません。現在の実行結果は上記の移行証拠を参照。
-- **clippy削減の履歴:** 457 → 83 → **0**（`--all-targets`・release、当時テスト176本green）。現在の移行ブランチでも警告0を確認し、直近のローカルsuiteは248 passed / 0 failed / 1 ignored、層ゲートは20 modules / 47 edges / 0 named errorsです。
+- **clippy削減の履歴:** 457 → 83 → **0**（`--all-targets`・release、当時テスト176本green）。現在の警告数とsuite・層ゲートの件数は実行のたびに変わるので、このページには書きません（数値と条件は各 `evidence/` の receipt が持ちます）。
   前半は機械的に等価な変換（`&*`/`&mut *` の冗長、`x % n == 0` → `is_multiple_of`、不要な `as`、
   `sort_by` → `sort_by_key` など）。残る判断が要るクラスは次のように閉じました:
   - `unnecessary_unwrap` 14: `is_some()` を見て `unwrap()` は `if let`/`match` に。3つのスロット
