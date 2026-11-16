@@ -97,5 +97,42 @@ class RefreshCompareTest(unittest.TestCase):
         self.assertEqual(before, self.inv)
 
 
+class RefreshBoundaryTest(unittest.TestCase):
+    """The documented limits, pinned so nobody reads `0 fail` as "safe to delete".
+
+    These are properties of the validator, not bugs: it compares the rows it holds,
+    with a sampled `git status`. Each case below is clean on purpose.
+    """
+
+    def setUp(self):
+        self.inv = load_inventory()
+        self.facts = facts_for(self.inv)
+
+    def test_a_ref_that_is_not_in_the_inventory_is_invisible(self):
+        self.facts["heads"]["t3/a-ref-created-after-the-snapshot"] = "3" * 40
+        self.assertEqual(compare(self.inv, self.facts), [])
+
+    def test_a_worktree_that_is_not_in_the_inventory_is_invisible(self):
+        self.facts["worktrees"]["t3-a-worktree-created-after-the-snapshot"] = {
+            "id": "t3-later", "path": "/nonexistent", "branch": "t3/later",
+            "head": "4" * 40, "dirty_rows": [" M new"], "dirty_count": 1,
+            "status_readable": True,
+        }
+        self.assertEqual(compare(self.inv, self.facts), [])
+
+    def test_same_dirty_count_with_different_content_is_invisible(self):
+        row = next(w for w in self.inv["worktrees"] if not w["clean"])
+        live = self.facts["worktrees"][row["worktree_id"]]
+        live["dirty_rows"] = [" M completely different"] * len(live["dirty_rows"])
+        self.assertEqual(compare(self.inv, self.facts), [])
+
+    def test_an_unreadable_status_is_a_warning_not_a_failure(self):
+        row = self.inv["worktrees"][0]
+        self.facts["worktrees"][row["worktree_id"]]["status_readable"] = False
+        issues = compare(self.inv, self.facts)
+        self.assertEqual(codes(issues), set())
+        self.assertIn("WORKTREE_STATUS_UNREADABLE", codes(issues, "WARN"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

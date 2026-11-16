@@ -2794,10 +2794,10 @@
    "id": "accept-5x-candidate",
    "carrier": "t3/worldgen-integration-audit",
    "sha_observed": "2799a36b416de9e5205067bee313fe6f95fd6664",
-   "commits": "15 commits: foundation 9fcb5da + 8, registry 787f781, diagnostics b7ca4f5, order fix bef7f53, 2 acceptance docs",
+   "commits": "commits ahead of canonical at this reading; the row's unique_commits is the snapshot value and the row moved during the audit, so re-read it instead of trusting a count here",
    "depends_on": [],
    "gate": "owning acceptance/integration task reports; Jungle 116->121 regression on the order fix resolved or explicitly held",
-   "why": "single carrier for the completed 5A/5C/6A/6B/6C batch; 0 behind canonical, so it fast-forwards"
+   "why": "single carrier for the completed 5A/5C/6A/6B/6C batch; 0 behind canonical at the snapshot, so it fast-forwards"
   },
   {
    "order": 2,
@@ -2817,41 +2817,36 @@
    "depends_on": [
     "fast-forward-canonical"
    ],
-   "gate": "their commits are patch-identical to commits now in canonical",
-   "why": "removes the duplicate carriers without losing work"
+   "gate": "per carrier, all four re-checked on a fresh read: (i) the content is accepted in canonical at a fresh SHA, not merely present in the candidate; (ii) worktree clean; (iii) artifacts_only_here empty for that row; (iv) the tip SHA read then matches the row",
+   "why": "the carriers are in three different evidence classes (ancestor, patch_id_equal, same_subject_rebase/patch_id_equal_candidate); patch-id equality is the same change, not the same bytes, and a carrier with unique untracked bytes cannot be retired on a commit comparison at all"
   },
   {
    "order": 4,
    "id": "land-track5b",
    "carrier": "t3/548b811e",
    "sha_observed": "e7ead8e66466b0b6467450cd3ea31d86a0e39cd3",
-   "depends_on": [
-    "fast-forward-canonical"
-   ],
+   "depends_on": [],
    "gate": "owner commits the 344 uncommitted lines and the Jungle residual measurement is recorded",
-   "why": "uncommitted work is the only copy"
+   "why": "uncommitted work is the only copy; unfinished, and it does not gate the docs/preflight slice"
   },
   {
    "order": 5,
    "id": "land-root-reform",
    "carrier": "t3/chunk-state-reform",
    "sha_observed": "5caca0b750e4ff13427f5394c8c8b4d04a204077",
-   "depends_on": [
-    "fast-forward-canonical"
-   ],
-   "gate": "owner commits spec + code; re-check conflicts against generation_context",
-   "why": "touches the same generation context the 5x batch edits"
+   "depends_on": [],
+   "gate": "owning task reports a candidate; the recorded tip is a recon/spec commit, not a current generation_context implementation, so its production status is unknown here",
+   "why": "not scheduled and not a dependency of the other items; re-read the row before any containment claim"
   },
   {
    "order": 6,
    "id": "land-contributor-docs-and-preflight",
-   "carrier": "t3/mc-spine-contributor-docs, t3/mc-spine-contributor-preflight",
+   "carrier": "t3/mc-spine-contributor-docs, t3/mc-spine-contributor-preflight, t3/bd0038ec (unified candidate)",
    "sha_observed": "866d79ac67811cad70ddfbac0b1bfbcbf4491863",
-   "depends_on": [
-    "fast-forward-canonical"
-   ],
+   "depends_on": [],
    "gate": "owners commit; docs only, no source conflict",
-   "why": "both are documentation/tooling slices on top of the same canonical base"
+   "why": "documentation, tooling and one persistence refactor; no worldgen or generation_context conflict, so it is independent of the 5x candidate and of Track 5B",
+   "note": "t3/bd0038ec is the unified candidate: docs A + preflight B + 01b7323 persistence cleanup + the repository-convergence inventory directory; the sha_observed here is the snapshot value for the two original carriers, not a fresh read"
   }
  ],
  "local_batch": [
@@ -3022,6 +3017,8 @@
   "Remote-tracking refs match the live remote for all 9 heads at snapshot time; no fetch or prune was run.",
   "Dirty worktree contents were read (status/diffstat), never staged, stashed or modified.",
   "Porcelain status can be momentarily inconsistent while an owning task writes; ACTIVE rows are observations, not pins.",
-  "Equivalence for the six same-subject/patch-id-different branches is a bounded diff-of-diffs judgement; the drift lines are listed in each row."
+  "Equivalence for the six same-subject/patch-id-different branches is a bounded diff-of-diffs judgement; the drift lines are listed in each row.",
+  "Queue dependencies are a reading of the snapshot, not measured scheduling; re-derive them from the named carriers before acting.",
+  "`refresh.py` validates only the rows it holds, with a sampled `git status`; `0 fail` is not an authorization to delete anything (see the README's Refresh section)."
  ]
 }
