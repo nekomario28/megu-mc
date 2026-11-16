@@ -17,6 +17,9 @@ Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバーで�
 
 前提は Rust 1.98.0（[rust-toolchain.toml](rust-toolchain.toml) で固定）と python3 です。リポジトリ直下で実行します。
 
+まず `python3 tools/dev_check.py` を実行してください。ビルドもダウンロードもせず、このチェックアウトで
+何が動き何が欠けているか（と次に打つコマンド）を数秒で出します。
+
 ```sh
 cargo build --locked
 cargo test --locked -- --test-threads=1

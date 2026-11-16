@@ -11,7 +11,7 @@
 | 知りたいこと | 走らせるもの |
 |---|---|
 | このチェックアウトで何が動くか（ビルドもDLもせず数秒） | `python3 tools/dev_check.py` — `OK`/`MISSING`/`NOT_CHECKED`/`ERROR` と、次に打つコマンドを出す。何を実行し何をしなかったかも各行に書く |
-| Python だけで走る検査（jar/JDK/Cargo 不要） | 正規の一覧は `grep -E '^python3 tests/' tests/verify.sh`。段と前提クラスは [tests/README.md](../tests/README.md) |
+| Python だけで走る検査（jar/JDK/Cargo 不要。`layers_gate_test.py` だけ depsgx 必須） | 正規の一覧は `grep -E '^python3 tests/' tests/verify.sh`。段と前提クラスは [tests/README.md](../tests/README.md) |
 | Rust を絞って回す／全体を回す | `cargo test --offline --locked -j 2 -- --test-threads=1`（絞るときは filter、並列は `--test-threads=8`）。ビルド成果物から実行ファイルを取るのは `cargo_executable.py`（CI と同じ経路）。CI 専用の native×Rust の対を**実行されたことまで**確かめるのは `native_cargo_gate.py`（filter が0件でも cargo は exit 0 を返すため）|
 | 層・依存・負債のゲート | `python3 tests/layers_gate_test.py` と `bash tools/layers_check.sh`（**depsgx 必須**、CI が固定 revision を入れる）、`bash tools/debt_ratchet.sh` |
 | ゲートが本当に落ちられるか | `bash tools/mutation_check.sh` — 実装を壊して赤を要求し、ツリーを元に戻したことまで検査する |

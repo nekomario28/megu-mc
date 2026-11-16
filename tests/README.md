@@ -12,22 +12,24 @@
 
 | クラス | 何が要る | 無いとどうなるか |
 |---|---|---|
-| Python | `python3` >= 3.9（`str.removeprefix` を使う道具がある） | fixture 段が動かない |
+| Python | `python3` >= 3.9（`str.removeprefix` を使う道具がある） | T0 が動かない |
 | 層ゲート | `depsgx`（CI が `.github/workflows/ci.yml` の `GXKIT_REV` を固定して入れる。`MC_SPINE_DEPSGX` でも可） | `layers_gate_test.py` と `tools/layers_check.sh` は**失敗する**（skip にしない契約）。他は動く |
-| Rust | 固定 toolchain（`rust-toolchain.toml` の 1.98.0）と `Cargo.lock` の crate（初回だけ取得が要る） | Rust 段・wire 段が動かない |
-| JDK | JDK 21（`java`/`javac`） | jar 側の oracle/capture だけが動かない |
+| Rust | 固定 toolchain（`rust-toolchain.toml` の 1.98.0）と `Cargo.lock` の crate（初回だけ取得が要る） | T1・T2 が動かない |
+| JDK | JDK 21（`java`/`javac`） | jar 側（T3）の oracle/capture だけが動かない |
 | 固定 jar | 1.21.1 server jar（sha1 固定、**再配布しない**。各自が用意する） | 参照を**作り直す**段だけが動かない。保存済み参照との照合は動く |
 | EULA 同意 | `config_packets.bin` の再生成だけ `--accept-eula` が要る | その1ファイルの再生成だけが動かない。同意は自動で取らない |
 
-## 段（どこまでを確かめるか）
+## 段（T0–T3）
 
-| 段 | 確かめること | 前提 | 入口 |
-|---|---|---|---|
-| fixture 段（Python） | tracked fixture との照合、gate の exit contract、落ちられない gate の負の制御 | Python のみ（`layers_gate_test.py` だけ depsgx） | `grep -E '^python3 tests/' tests/verify.sh` が一覧 |
-| 層・負債 | `src/` の依存方向、数えた負債が増えていないこと | depsgx（層のみ） | `layers_gate_test.py`、`tools/debt_ratchet.sh` |
-| Rust | 生成・構造物・プロトコルの実装 | 固定 toolchain と crate | `cargo test --offline --locked -j 2 -- --test-threads=1` |
-| wire / 実プロセス | loopback の実通信（spawn chunk 生成→play） | ビルド済み binary | `tools/cargo_executable.py` で binary を取り、`wire_smoke.py` 等へ渡す |
-| native oracle / capture | 固定 jar の実クラスを実行して参照と照合する／参照を作り直す | jar、JDK 21、（`config_packets.bin` は）EULA 同意 | `tools/*_oracle.py`、`tools/sculk_capture.sh` 等 |
+段の意味と何を確かめるかは [開発ガイド §4](../docs/development.md#4-テストの段階) が正本です。
+ここは**各段の前提クラス**だけを持ち、正規のコマンドは [verify.sh](verify.sh) が持ちます。
+
+| 段 | 前提クラス |
+|---|---|
+| T0 Python の契約・fixture | Python（`layers_gate_test.py` だけ depsgx）|
+| T1 Rust unit／回帰 | 固定 toolchain と `Cargo.lock` の crate |
+| T2 `tests/verify.sh` | T0・T1 に加えてビルド済み binary（wire）、depsgx（層）、時間（mutation と 8スレッド×3回）|
+| T3 hosted CI／native oracle | 固定 jar、JDK 21、（`config_packets.bin` は）EULA 同意。ローカルの代用にならない |
 
 `gate_scripts.py` のように**偽のバックエンド**を temp に置くテストがある。あれが固定するのは
 gate の配線と exit contract であって、実ツールの正しさではない。実ツール側は
@@ -42,22 +44,28 @@ gate の配線と exit contract であって、実ツールの正しさではな
   **参照を作り直す**ときだけ。この2つ（保存済み参照の段／生成段）を混ぜると、
   「jar が無いから何も確かめられない」という誤解になる。
 
-## 測った現在地（base `e7ead8e`）
+## 測った現在地（この候補の、追跡ファイルのみの export）
 
-tracked-only の checkout（`git archive HEAD` を temp に展開）で、`verify.sh` の Python 段を
-そのまま走らせた結果:
+`git archive HEAD` を temp に展開した tracked-only の checkout で、`verify.sh` の Python 段
+（`grep -E '^python3 tests/'` の一覧）を上から順に走らせた結果:
 
-- `layers_gate_test.py` **以外は全て pass**。`java`・`javac`・`cargo`・`rustc` をすべて 127 で
+- `layers_gate_test.py` **以外は全て exit 0**。`java`・`javac`・`cargo`・`rustc` をすべて 127 で
   落とす `PATH` でも同じ結果だったので、この段は JDK にも Cargo にも依存しない。
 - `layers_gate_test.py` は depsgx が無いため fail（「ツール不在は skip ではない」という契約どおり）。
   depsgx を入れた環境での同じ段は、このホストでは**未測定**（CI は固定 revision を入れて回している）。
-- Rust・wire・native の各段は tracked-only で **NOT RUN**。ここに「clean clone で全部 green」とは
+- `cargo test` 全体・wire・native の各段は **NOT RUN**。ここに「clean clone で全部 green」とは
   書かない（測っていない）。追跡データで足りるかは `git ls-files` と
   `tools/dev_check.py` の `build_inputs`/`runtime_data` が答える範囲までしか主張しない。
+  persistence の絞った filter（`tick_persistence::tests` と `persistence_tests::`）だけは
+  統合後の checkout で実行済み（[検証記録](../evidence/review/contributor-readiness-2026-11-16.md)）。
+
+件数・所要時間・生ログは
+[contributor-readiness-2026-11-16](../evidence/review/contributor-readiness-2026-11-16.md) にあり、
+このページには写しません。
 
 `assets/block_states_1211.json` のように、生成器の出力でも追跡されていないものがある
 （`git ls-files` が唯一の正）。無いと困るのは `tools/asset_coverage.py` と再生成だけで、
-ビルドと上の fixture 段は tracked のままで動く。
+ビルドと T0 は tracked のままで動く。
 
 ## 走らせるときの前提
 
@@ -71,6 +79,9 @@ tracked-only の checkout（`git archive HEAD` を temp に展開）で、`verif
     python3 tests/dev_check_test.py
 
 hermetic（temp の合成ツリー・偽の `rustup`/`javac`/`cargo`・実 JDK/Cargo/jar 不要）。
-固定しているのは preflight の status/exit 契約、欠けた入力を赤にできること、cwd を変えても
-リポジトリを掴むこと、ツリーを書き換えないこと、`cargo` を起動しないこと。
+固定しているのは preflight の status/exit 契約、route の READY がその route の必須検査から
+導かれること（include の欠落は toolchain があっても Rust を NOT READY にする）、
+`javac -version` の解析（空・雑音・要求不明は NOT_CHECKED）、欠けた入力を赤にできること、
+cwd を変えてもリポジトリを掴むこと、ツリーを書き換えないこと、`cargo` を起動しないこと、
+壊れた `MC_SPINE_DEV_CHECK_TIMEOUT_MS` が exit 2 になること。
 `verify.sh` への組み込みは未実施（親が判断する）。

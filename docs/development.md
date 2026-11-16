@@ -56,8 +56,9 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 | `--features native-oracle` のテスト | 固定jarから作ったnative fixture。無いと**失敗する**（skipしない）。CIの `p1-native-oracle.yml` がjarを取得して実行する |
 | ゲームlistenerの手動確認 | 追跡データとビルド済みバイナリ。外部公開はしない |
 
-`tests/README.md` は別作業で追加予定で、このHEADにはありません。テストの一覧は各ファイルと
-[tools/README.md](../tools/README.md) を参照してください。
+テストの段と前提クラスは [tests/README.md](../tests/README.md)、道具の入口は
+[tools/README.md](../tools/README.md) にあります。どのコマンドを走らせるかは
+[tests/verify.sh](../tests/verify.sh) が正本です。
 
 ### 2.4 追跡データと方針文書の食い違い（未解決）
 
@@ -94,27 +95,25 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 成功の意味を段階ごとに分けます。**T0/T1が緑でも、T2/T3やvanilla一致の代用になりません。**
 
-### T0: 生成データ・サーバーなしで速い確認（このパスで実行済み）
+最初に `python3 tools/dev_check.py` を実行してください。ビルドもダウンロードもせず、このチェックアウトで
+何が動き何が欠けているか、次に打つコマンドを数秒で出します。
 
-追跡済みのfixtureだけを読み、サーバーを起動しない確認です。次はすべて exit 0 を確認しました
-（確認時点のHEADと実行ログは証跡側に記録）。
+### T0: Pythonだけで走る確認（jar・JDK・Cargo不要）
+
+追跡済みのfixtureだけを読み、サーバーもCargoも起動しない確認です。一覧はスクリプトが正本なので
+ここに写しません。
 
 ```sh
-python3 tests/gate_scripts.py             # gateの合否契約（隔離ツリー・偽バックエンド）
-bash tools/debt_ratchet.sh                # 無視テスト・時計読みの上限
-python3 tests/protocol767_test.py         # CLIデコーダのknown-answer（サーバーは起動しない）
-python3 tests/nbt_region_test.py
-python3 tests/nextint_oracle_test.py      # 追跡済み tests/data/random_next_int_1211.tsv
-python3 tests/biome_tree_test.py          # 追跡済み datapacks/vanilla/
-python3 tests/structure_oracle_test.py    # 追跡済み assets/
-python3 tests/feature_coverage_test.py
-python3 tests/carver_diff_test.py
-python3 tests/forest_stage_check_test.py
-python3 tests/carve_agent_build_test.py
+grep -E '^python3 tests/' tests/verify.sh
 ```
 
-`gate_scripts.py` が最も重く、およそ25秒でした。残りは数秒以内です。
-これらは追跡データが前提なので、来歴の整理でデータが外れると生成が必要になります。
+- 前提は python3 >= 3.9 だけです。`tests/layers_gate_test.py` だけは追加で `depsgx` を要求し、
+  無いと skip せず fail します（T2の層ゲートと同じ検査器）。
+- この一覧を tracked-only の export（`git archive HEAD`）で走らせると、`layers_gate_test.py` 以外は
+  exit 0 でした。`java`/`javac`/`cargo`/`rustc` を 127 で落とした PATH でも同じ結果でした。
+  測定した件数・所要時間・生ログは
+  [contributor-readiness-2026-11-16](../evidence/review/contributor-readiness-2026-11-16.md)。
+- この段は追跡データが前提です。来歴の整理でデータが外れると生成が必要になります。
 
 ### T1: Rustのunit／回帰
 
@@ -148,7 +147,7 @@ Java adapterの `cargo check`、mutation（ゲートが赤くなれることの�
 
 `src/` はフラットなファイル構成です。**層の名前を発明せず**、実在する境界とownerを示します。
 依存の許される向きは [evidence/foundation/module-layers/policy.json](../evidence/foundation/module-layers/policy.json) が正本で、
-`tools/check_layers.sh` が検査します。
+`tools/layers_check.sh` が検査します。
 
 | 責務 | 主なowner | 変更時の注意 |
 |---|---|---|
