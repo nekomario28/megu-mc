@@ -1,6 +1,6 @@
 # テスト基盤の修理 — 3つの実測欠陥（2026-11-16）
 
-Date: 2026-11-16. 対象: 候補 `ac0896d` の上に積んだ2コミット（`c3e71c0`, `d4e0e6f`）。
+Date: 2026-11-16. 対象: 候補 `ac0896d` の上に積んだ3コミット（`c3e71c0`, `d4e0e6f`, `cbe2cf2`）。
 作業は tool-created worktree（`t3-87d06ba5-…`）と private audit dir
 `/home/yuu/mc-spine-local/audit/test-harness-repair-20261116T150404/` のみ。
 canonical `/home/yuu/mc-spine` への書き込み・push・network・full campaign・native capture は無し。
@@ -70,8 +70,10 @@ assembly 変異だけを private copy で適用した binary identity（`identit
 ### 4. 全 Rust suite（最終 source で1回）
 
 ```
-test result: ok. 544 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 93.13s
+test result: ok. 544 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 93.51s
 ```
+
+（レビュー用の整理 commit `cbe2cf2` の後に測り直した値。整理は wrapper 1個と未使用引数だけで挙動は変えていない。）
 
 `1 ignored` は既存の parked gate（debt ratchet が `ok ignored tests (parked gates): 1` と数えるもの）で、
 本修理では増減していない。ログには隔離 fixture の**意図した**子プロセスの panic
@@ -80,7 +82,7 @@ test result: ok. 544 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fi
 
 ### 5. gate 自己テスト（`tests/gate_scripts.py`）
 
-25 case 全 PASS（既存15 + 新規10）。新規: 隔離（journal で cwd/target/copy の bytes を検査）、
+25 case 全 PASS（既存15 + 新規10、最終 source で再測）。新規: 隔離（journal で cwd/target/copy の bytes を検査）、
 dirty な source 編集が copy に載ること、copy 中に source が動いたら拒否、SIGKILL 残渣、
 stability の5 case（fails twice / green / compile / crash / zero-selected）と 0/1 検証。
 
@@ -101,7 +103,7 @@ stability の5 case（fails twice / green / compile / crash / zero-selected）�
 | `tests/layers_gate_test.py` | PASS（17 tests、depsgx を PATH に置いた場合） |
 | `bash tools/layers_check.sh` | PASS 42 modules / 108 edges / 0 named errors |
 | `bash tools/debt_ratchet.sh` | 0 over limit / 1 parked（既存） |
-| 全 Rust suite | PASS 544/0/1（93.13s） |
+| 全 Rust suite | PASS 544/0/1（93.51s） |
 | 実変異 4 entry（stability 有効） | 4 proved |
 | **NOT RUN** | `tests/verify.sh` 全体（mutation 全 424 entry を含む。1 entry = baseline+mutant+再実行+restored で数百ビルド）、native capture / wire / adapter（この修理は pure harness + test のみ）、release ビルド |
 
