@@ -75,8 +75,8 @@ def run(command, cwd, log):
 def cargo_executable(artifact_text):
     """Reuse the project resolver, imported from this directory, not a grep."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from cargo_executable import executable
-    return executable(artifact_text.splitlines())
+    from cargo_executable import test_executable
+    return test_executable(artifact_text.splitlines())
 
 
 def main(argv=None):

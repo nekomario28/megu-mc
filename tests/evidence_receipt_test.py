@@ -15,7 +15,28 @@ import tempfile
 import textwrap
 import unittest
 
-TOOL = Path(__file__).resolve().parents[1] / "tools" / "evidence_receipt.py"
+ROOT = Path(__file__).resolve().parents[1]
+TOOL = ROOT / "tools" / "evidence_receipt.py"
+sys.path.insert(0, str(ROOT / "tools"))
+from cargo_executable import executable, test_executable
+
+
+class CargoResolverTests(unittest.TestCase):
+    """`cargo test --no-run` reports the harness with test:true; `cargo build` does not."""
+
+    def lines(self, harness):
+        return [json.dumps({"reason": "compiler-artifact",
+                            "target": {"name": "mc-spine", "kind": ["bin"]},
+                            "profile": {"test": harness},
+                            "executable": str(Path(__file__).resolve())})]
+
+    def test_both_harness_kinds_resolve_and_cross_do_not(self):
+        self.assertEqual(test_executable(self.lines(True)), Path(__file__).resolve())
+        self.assertEqual(executable(self.lines(False)), Path(__file__).resolve())
+        with self.assertRaises(ValueError):
+            executable(self.lines(True))
+        with self.assertRaises(ValueError):
+            test_executable(self.lines(False))
 
 
 class ReceiptProducerTests(unittest.TestCase):
@@ -56,7 +77,7 @@ class ReceiptProducerTests(unittest.TestCase):
               echo '{{"reason":"build-finished","success":true}}'
               exit 0
             fi
-            printf '%s\\n' '{{"reason":"compiler-artifact","target":{{"name":"mc-spine","kind":["bin"]}},"profile":{{"test":false}},"executable":"{self.binary}"}}'
+            printf '%s\\n' '{{"reason":"compiler-artifact","target":{{"name":"mc-spine","kind":["bin"]}},"profile":{{"test":true}},"executable":"{self.binary}"}}'
             """))
         self.cargo.chmod(0o755)
 
