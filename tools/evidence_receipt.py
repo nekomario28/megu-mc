@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -148,10 +149,9 @@ def main(argv=None):
             continue
         if status != 0:
             fail(f"filter {selector!r} exited {status}")
-        if "0 measured" in parsed or " 0 passed" in parsed or not parsed:
-            fail(f"filter {selector!r} ran no test: {parsed or 'no summary'}")
-        if "0 failed" not in parsed:
-            fail(f"filter {selector!r} did not report zero failures: {parsed}")
+        match = re.match(r"test result: ok\. ([1-9][0-9]*) passed; 0 failed; ([0-9]+) ignored;", parsed)
+        if match is None:
+            fail(f"filter {selector!r} did not run and pass a test: {parsed or 'no summary'}")
     receipt["filters_run"] = results
 
     source_end = source_identity(root)

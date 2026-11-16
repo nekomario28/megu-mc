@@ -65,6 +65,7 @@ class ReceiptProducerTests(unittest.TestCase):
                     echo "test feature::tests::a ... ok"
                     echo "test result: ok. 1 passed; 0 failed; 0 ignored; 1 filtered out"
                   fi; exit 0 ;;
+              parked) echo "test result: ok. 0 passed; 0 failed; 1 ignored; 396 filtered out"; exit 0 ;;
               red) echo "test feature::tests::a ... FAILED"
                    echo "test result: FAILED. 0 passed; 1 failed; 0 ignored"; exit 101 ;;
             esac
@@ -126,6 +127,11 @@ class ReceiptProducerTests(unittest.TestCase):
         result, receipt = self.produce(bin_mode="red")
         self.assertEqual(result.returncode, 1)
         self.assertTrue(any("exited 101" in p for p in receipt["problems"]))
+
+    def test_a_parked_filter_is_not_a_pass(self):
+        result, receipt = self.produce(bin_mode="parked")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(any("did not run and pass" in p for p in receipt["problems"]))
 
     def test_stale_source_head_is_rejected_before_it_can_certify(self):
         result, receipt = self.produce(expect_head="0" * 40)
