@@ -38,7 +38,7 @@ def journal_entries(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def assert_private_copy(root, before, journal, snapshot_parent, log, dirty):
+def assert_private_copy(root, before, journal, log, dirty):
     """The campaign's isolation contract, read off what the backend actually saw."""
     for entry in journal:
         assert Path(entry["cwd"]) != root, f"the campaign ran in the source tree: {entry}"
@@ -224,7 +224,6 @@ exit $status
             assert residue.exists(), f"the killed run should leave its residue here: {kept[0]}"
             assert (kept[0] / "src/main.rs").read_bytes() != (root / "src/main.rs").read_bytes(), \
                 "the retained copy should hold the mutant"
-            assert (kept[0] / "src/main.rs").stat().st_mtime > 0
             return proc.returncode, log, journal_entries(journal)
 
         result = subprocess.run(argv, cwd=root, env=env, capture_output=True, text=True,
@@ -238,7 +237,7 @@ exit $status
         left = sorted(p.name for p in snapshot_parent.glob("run.*"))
         assert not left, f"the snapshot was left behind by a completed run: {left}"
         journal = journal_entries(journal)
-        assert_private_copy(root, before, journal, snapshot_parent, log, dirty)
+        assert_private_copy(root, before, journal, log, dirty)
         return result.returncode, log, journal
 
 

@@ -1153,19 +1153,16 @@ fn sky_light_assembly_lights_through_an_opening_and_stops_at_a_barrier() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let mut put = |x: i32, y: i32, z: i32, st: u32| {
-        set_block(x, y, z, st);
-    };
     let (z, y) = (2i32, 7i32);
     let top = height_at(2, z) - 1;
     for sy in (y + 1)..=top {
-        put(2, sy, z, 0);
+        set_block(2, sy, z, 0);
     }
     for x in 2..=12 {
-        put(x, y, z, 0);
+        set_block(x, y, z, 0);
     }
     let stone = name_to_state("stone").expect("stone");
-    put(7, y, z, stone);
+    set_block(7, y, z, stone);
     // The scene means nothing unless the tunnel is enclosed: a solid floor and ceiling are what
     // make the shaft the only way in.
     assert!(
@@ -1277,7 +1274,7 @@ fn a_panicking_scene_fixture_leaves_the_parent_untouched() {
         before.2, stone,
         "the marker cell must start as air or this fingerprint proves nothing"
     );
-    let (status, receipt) = crate::test_support::run_failing_child(
+    let (status, receipt) = crate::test_support::run_isolated_child(
         "registry_tests::a_panicking_scene_fixture_leaves_nothing_to_restore",
     );
     assert!(

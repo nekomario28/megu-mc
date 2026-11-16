@@ -84,8 +84,9 @@ pub(crate) fn child_note(note: &str) {
 }
 
 /// Run exactly `name` in a child and return its status with the receipt it left. Bounded: a
-/// fixture that hangs is a failure of that fixture, not a hung suite.
-fn run_child(name: &str) -> (std::process::ExitStatus, String) {
+/// fixture that hangs is a failure of that fixture, not a hung suite. A caller whose fixture is
+/// *expected* to fail decides what the status means; the receipt and the bound are not weaker for it.
+pub(crate) fn run_isolated_child(name: &str) -> (std::process::ExitStatus, String) {
     let receipt = receipt_path(name);
     let _ = std::fs::remove_file(&receipt);
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -111,18 +112,12 @@ fn run_child(name: &str) -> (std::process::ExitStatus, String) {
     (status, body)
 }
 
-/// The same runner for a fixture whose *panic* is the observation. The caller decides what the
-/// status means; the receipt and the bound are not weakened for it.
-pub(crate) fn run_failing_child(name: &str) -> (std::process::ExitStatus, String) {
-    run_child(name)
-}
-
 pub(crate) fn isolated_world_test() -> bool {
     if is_isolated_child() {
         return false;
     }
     let name = harness_name();
-    let (status, body) = run_child(&name);
+    let (status, body) = run_isolated_child(&name);
     assert_eq!(
         body, name,
         "the isolated fixture process never entered {name}; a child that selects no test exits 0"
