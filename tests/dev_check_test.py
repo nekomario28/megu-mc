@@ -263,6 +263,102 @@ class DevCheckContract(unittest.TestCase):
         self.assertEqual(set(self.fixture.statuses(output).values()),
                          {"OK", "MISSING", "NOT_CHECKED", "ERROR"})
 
+    # ---- readiness is derived from the checks a route needs -----------------------------
+
+    def test_missing_included_file_blocks_the_rust_route_even_with_the_compiler_installed(self):
+        target = self.fixture.root / "tests/data/case.tsv"
+        saved = target.read_bytes()
+        target.unlink()
+        code, output = self.fixture.run()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.fixture.statuses(output)["toolchain_installed"], "OK",
+                         "the compiler is installed; that alone must not make the route ready")
+        # The include target is also a runtime-data root, so both checks name it.
+        self.assertIn("route rust build/test: NOT READY (build_inputs MISSING", output)
+        # No command is offered for a route that cannot run.
+        self.assertNotIn("cargo test --offline", output)
+        self.assertIn("Rust is not READY here: build_inputs", output)
+        # Restoring the one input restores READY, so the red was the input.
+        target.write_bytes(saved)
+        code, output = self.fixture.run()
+        self.assertEqual(code, 0, output)
+        self.assertIn("route rust build/test: READY", output)
+        self.assertIn("crate cache NOT_CHECKED", output)
+
+    def test_absent_toolchain_pin_blocks_the_rust_route(self):
+        (self.fixture.root / "rust-toolchain.toml").unlink()
+        code, output = self.fixture.run()
+        self.assertEqual(code, 1, output)
+        statuses = self.fixture.statuses(output)
+        self.assertEqual(statuses["toolchain_pin"], "MISSING")
+        self.assertIn("route rust build/test: NOT READY (toolchain_pin MISSING", output)
+
+    # ---- the JDK version must be parsed, not guessed ------------------------------------
+
+    def test_the_documented_jdk_major_is_ok(self):
+        code, output = self.fixture.run()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.fixture.statuses(output)["jdk"], "OK")
+        self.assertIn("javac 21.0.1", output)
+
+    def test_jdk_output_without_a_javac_version_stays_not_checked(self):
+        # Exit 0 with nothing parseable, and exit 0 with a number that is not the version
+        # (the old check took the first digits anywhere in the output and called it OK).
+        for label, version in (("empty output", None),
+                               ("digits only in a warning", "warning: 21 deprecated options"),
+                               ("no digits at all", "not a version")):
+            with self.subTest(label):
+                if version is None:
+                    self.fixture.write_shim("javac", "#!/bin/sh\nexit 0\n")
+                    env = self.fixture.env()
+                else:
+                    self.fixture.write_shim("javac", JAVAC_SHIM)
+                    env = self.fixture.env(FAKE_JAVAC_VERSION=version)
+                code, output = self.fixture.run(env=env)
+                self.assertEqual(code, 0, output)  # an optional route, so not a repo fault
+                statuses = self.fixture.statuses(output)
+                self.assertEqual(statuses["jdk"], "NOT_CHECKED", output)
+                self.assertIn("route jar/native oracle: NOT READY", output)
+
+    def test_jdk_mismatched_major_stays_not_checked(self):
+        env = self.fixture.env(FAKE_JAVAC_VERSION="javac 27.0.1")
+        code, output = self.fixture.run(env=env)
+        self.assertEqual(code, 0, output)
+        statuses = self.fixture.statuses(output)
+        self.assertEqual(statuses["jdk"], "NOT_CHECKED")
+        self.assertIn("documents Java 21", output)
+        self.assertIn("javac 27", output)
+        self.assertIn("route jar/native oracle: NOT READY (vanilla_jar MISSING, "
+                      "jdk NOT_CHECKED)", output)
+
+    def test_jdk_requirement_that_cannot_be_read_stays_not_checked(self):
+        generator = self.fixture.root / "tools/vanilla_data/gen_vanilla_data.sh"
+        saved = generator.read_text()
+        generator.write_text("# this text names no Java major\n")
+        code, output = self.fixture.run()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.fixture.statuses(output)["jdk"], "NOT_CHECKED")
+        self.assertIn("requirement unreadable", output)
+        # An absent requirement source is the same unknown, not an OK.
+        generator.unlink()
+        code, output = self.fixture.run()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.fixture.statuses(output)["jdk"], "NOT_CHECKED")
+        self.assertIn("gen_vanilla_data.sh is absent", output)
+        generator.write_text(saved)
+        code, output = self.fixture.run()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.fixture.statuses(output)["jdk"], "OK")
+
+    # ---- the advertised exit status covers a bad environment ---------------------------
+
+    def test_malformed_timeout_env_exits_two_without_a_traceback(self):
+        env = self.fixture.env(MC_SPINE_DEV_CHECK_TIMEOUT_MS="soon")
+        code, output = self.fixture.run(env=env)
+        self.assertEqual(code, 2, output)
+        self.assertIn("MC_SPINE_DEV_CHECK_TIMEOUT_MS", output)
+        self.assertNotIn("Traceback", output)
+
     # ---- safety: anchoring, no mutation, no compile, no execution of repository code ---
 
     def test_wrong_cwd_still_anchors_the_repository(self):
