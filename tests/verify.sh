@@ -12,6 +12,7 @@ export MC_PROBE_DEADLINE="${MC_PROBE_DEADLINE:-30}"
 
 echo "== gate exit contracts"
 python3 tests/gate_scripts.py
+python3 tests/evidence_receipt_test.py
 python3 tests/protocol767_test.py
 python3 tests/nbt_region_test.py
 python3 tests/structure_oracle_test.py
