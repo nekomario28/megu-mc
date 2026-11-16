@@ -276,6 +276,21 @@ def exercise(game):
                 seen = drain(viewer, 0.8)
                 require(sorted((event[0], event[2]) for event in seen["events"])
                         == sorted([(left, 1), (right, 1)]), "close-drops-one-count")
+            # A viewer that disappears without closing anything (disconnect ->
+            # `containerMenu.removed` -> `stopOpen`) stops counting as well.
+            with Client(game, "ContainerLeaver") as leaver:
+                leaver.login()
+                enter(leaver)
+                leaver.move(sx, y + 1.0, sz)
+                open_double_chest(leaver, right)
+                for viewer in (client, leaver):
+                    seen = drain(viewer, 0.8)
+                    require(sorted((event[0], event[2]) for event in seen["events"])
+                            == sorted([(left, 2), (right, 2)]), "third-viewer-count")
+            seen = drain(client, 1.2)
+            require(sorted((event[0], event[2]) for event in seen["events"])
+                    == sorted([(left, 1), (right, 1)]), "disconnect-drops-one-count")
+
             # An item placed through window slot 0 lands in the RIGHT half: slots 0..26
             # come from `CompoundContainer(first = right, second = left)`.
             set_creative(client, 36, stone, 5)

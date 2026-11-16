@@ -22826,7 +22826,8 @@ fn handle(mut s: TcpStream) {
                     let mut halves = chest_window_halves(window);
                     // A second container opening on the same client closes the first,
                     // which drops the first one's opener count too.
-                    if let Some(previous) = *me.open_chest.lock().unwrap() {
+                    let previous = *me.open_chest.lock().unwrap();
+                    if let Some(previous) = previous {
                         for half in chest_window_halves(previous) {
                             if !halves.contains(&half) {
                                 halves.push(half);
@@ -25482,8 +25483,11 @@ fn handle(mut s: TcpStream) {
                 .insert(name.clone(), (p.0, p.1, p.2, p.3, p.4));
         }
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
-        // the leaving viewer stops counting before it leaves the client list.
-        if let Some(open) = *me_cleanup.open_chest.lock().unwrap() {
+        // the leaving viewer stops counting before it leaves the client list. The window
+        // is read into a local first: `if let Some(open) = *mutex.lock().unwrap()` holds
+        // the lock for the whole body, and the body locks it again to clear it.
+        let leaving = *me_cleanup.open_chest.lock().unwrap();
+        if let Some(open) = leaving {
             let audience = client_snapshot();
             let halves = chest_window_halves(open);
             let before = chest_opener_snapshot(&audience, &halves);
