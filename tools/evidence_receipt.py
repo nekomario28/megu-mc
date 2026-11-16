@@ -103,6 +103,12 @@ def main(argv=None):
     if source["head"] != args.expect_head:
         fail(f"stale source: HEAD {source['head']} != expected {args.expect_head}")
 
+    # Cargo prints no compiler-artifact for an up-to-date unit, and a receipt that names no
+    # freshly linked binary is exactly the `bin=` shape this tool rejects. Touch, do not edit:
+    # the bytes stay identical and the patch hash still certifies the source.
+    for anchor in ("src/main.rs", "src/lib.rs"):
+        if (root / anchor).is_file():
+            os.utime(root / anchor)
     artifact_status, artifact_text, artifact_err = run(
         [args.cargo, "test", "--offline", "--locked", "-j1", "--bin", "mc-spine",
          "--no-run", "--message-format=json-render-diagnostics"], root, log)
