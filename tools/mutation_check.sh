@@ -14,9 +14,133 @@
 # Run: bash tools/mutation_check.sh [--offline]
 # Focused runs: MUTATION_FILTER=<test-filter-substring> (zero matches fail).
 # Use MUTATION_RELEASE=1 and CARGO_BUILD_JOBS=1 for bounded release checks.
-# Select here, never copy this script to /tmp: its cwd is owned by this path.
+# MUTATION_STABILITY=1 makes every catch fail twice (0 or 1; anything else is an error).
+#
+# The campaign never mutates this tree. It copies its inputs into a private snapshot, points
+# CARGO_TARGET_DIR inside that snapshot, and runs there; the copy and the target are removed on
+# the way out. Before 2026-11-16 the script rewrote src/*.rs in place for the whole build window
+# and a SIGKILL left the mutant (plus .mutation-backup) behind for the next build to compile.
+# Measured: mutant bytes present for 0.621 s per entry under a fake cargo, and left behind after
+# a kill (audit/test-causality-tc-20261116/probe-window.json). A lock cannot fix that: the write
+# happens before the build, and a cargo or an editor that does not take the lock still reads the
+# live file.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+# Strictness is a contract, not a truthiness test: "0" is not "on" and a typo is not "off".
+case "${MUTATION_STABILITY:-0}" in
+  0 | "") stability=0 ;;
+  1) stability=1 ;;
+  *)
+    echo "MUTATION_STABILITY must be 0 or 1, got '$MUTATION_STABILITY'" >&2
+    exit 2
+    ;;
+  esac
+
+# What the campaign reads from the tree it measures: the crate, the harness, and the data the
+# suite loads. The build `include_bytes!`s fixtures under `assets/`, `tests/` and `evidence/`,
+# so a copy without `evidence/` does not compile (measured: 13 missing-fixture errors).
+# Everything else (specs, .git, target, caches) is not an input and is not copied.
+INPUTS=(Cargo.toml Cargo.lock rust-toolchain.toml src tests tools assets datapacks evidence)
+
+# Deterministic identity of those inputs: path and bytes, sorted. Used to prove the copy is the
+# source and that the source did not move while it was being copied.
+input_manifest() {
+  (
+    cd "$1" || exit 1
+    for path in "${INPUTS[@]}"; do
+      [ -e "$path" ] || continue
+      if [ -d "$path" ]; then
+        find "$path" -type f \
+          -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.mutation-backup' \
+          -not -path '*/target/*' -not -path '*/.git/*'
+      else
+        printf '%s\n' "$path"
+      fi
+    done | LC_ALL=C sort | xargs -r -d '\n' sha256sum
+  )
+}
+
+# The snapshot half. It copies once per campaign, not once per entry, and hands the campaign its
+# own cwd and its own build target.
+if [ -z "${MUTATION_SNAPSHOT_ROOT:-}" ]; then
+  source_root=$PWD
+  if ls src/*.mutation-backup >/dev/null 2>&1; then
+    echo "refusing to run: a previous mutation was left applied in the source tree:" >&2
+    ls src/*.mutation-backup >&2
+    echo 'restore with: for f in src/*.mutation-backup; do cp "$f" "${f%.mutation-backup}" && touch "${f%.mutation-backup}" && rm "$f"; done' >&2
+    exit 2
+  fi
+  snapshot_parent=${MUTATION_SNAPSHOT_PARENT:-${XDG_CACHE_HOME:-$HOME/.cache}/mc-spine/mutation-runs}
+  mkdir -p "$snapshot_parent" || exit 2
+  # A cold private target measured 853 MiB for this crate, and the copy is 82 MiB, so a campaign
+  # needs roughly 1 GiB and must not start with less than 1.5 GiB of headroom. /tmp is a small
+  # tmpfs on some hosts, which is why the default parent is the cache directory and not TMPDIR.
+  avail_kb=$(df -Pk "$snapshot_parent" | awk 'NR == 2 { print $4 }')
+  if [ "${avail_kb:-0}" -lt 1572864 ]; then
+    echo "refusing to run: $snapshot_parent has $(( ${avail_kb:-0} / 1024 )) MiB free and a cold" >&2
+    echo "private target needs about 1 GiB. Free space, or set MUTATION_SNAPSHOT_PARENT." >&2
+    exit 2
+  fi
+  snapshot=$(mktemp -d "$snapshot_parent/run.XXXXXXXX") || exit 2
+  cleanup() {
+    [ -n "${snapshot:-}" ] && rm -rf "$snapshot"
+  }
+  trap cleanup EXIT INT TERM
+  case "$snapshot" in
+    "$source_root"/*)
+      echo "refusing to run: the snapshot must not sit inside the tree it copies" >&2
+      exit 2
+      ;;
+  esac
+  present=()
+  for path in "${INPUTS[@]}"; do
+    [ -e "$source_root/$path" ] && present+=("$path")
+  done
+  if [ ${#present[@]} -eq 0 ] || [ ! -d "$source_root/src" ]; then
+    echo "refusing to run: no src/ under $source_root, so there is nothing to measure" >&2
+    exit 2
+  fi
+  manifest_before=$(input_manifest "$source_root")
+  if ! { cd "$source_root" && tar -cf - "${present[@]}"; } | { cd "$snapshot" && tar -xf -; }; then
+    echo "FAIL  the private snapshot did not copy; nothing was measured." >&2
+    exit 2
+  fi
+  manifest_copy=$(input_manifest "$snapshot")
+  manifest_after=$(input_manifest "$source_root")
+  if [ "$manifest_before" != "$manifest_copy" ]; then
+    echo "FAIL  the snapshot is not byte-identical to the source it was copied from:" >&2
+    diff <(printf '%s\n' "$manifest_before") <(printf '%s\n' "$manifest_copy") | head -20 >&2
+    exit 2
+  fi
+  if [ "$manifest_before" != "$manifest_after" ]; then
+    echo "FAIL  the source tree changed while it was being copied, so a campaign here would mix" >&2
+    echo "      two revisions. Nothing was measured; re-run when the tree is quiet." >&2
+    diff <(printf '%s\n' "$manifest_before") <(printf '%s\n' "$manifest_after") | head -20 >&2
+    exit 2
+  fi
+  identity=$(printf '%s' "$manifest_before" | sha256sum | cut -d' ' -f1)
+  echo "mutation check: private snapshot $snapshot"
+  echo "  source   $source_root"
+  echo "  identity $identity (${#present[@]} inputs: ${present[*]})"
+  echo "  target   $snapshot/target (the caller's CARGO_TARGET_DIR is not used)"
+  echo "  the snapshot is removed on exit; a killed run can leave it behind and only there"
+  MUTATION_SNAPSHOT_ROOT=$snapshot CARGO_TARGET_DIR=$snapshot/target \
+    bash "$snapshot/tools/mutation_check.sh" "$@"
+  exit $?
+fi
+
+# The campaign half. Its cwd is the snapshot it was handed, and it must be: every write below
+# lands in `src/` relative to here.
+if [ "$(pwd -P)" != "$(cd "$MUTATION_SNAPSHOT_ROOT" && pwd -P)" ]; then
+  echo "MUTATION_SNAPSHOT_ROOT is $MUTATION_SNAPSHOT_ROOT but this script is running in $(pwd -P)" >&2
+  exit 2
+fi
+if ls src/*.mutation-backup >/dev/null 2>&1; then
+  echo "refusing to run: a previous mutation was left applied in this snapshot:" >&2
+  ls src/*.mutation-backup >&2
+  exit 2
+fi
 
 CARGO_FLAGS=(--locked -j "${CARGO_BUILD_JOBS:-2}")
 if [ "${MUTATION_RELEASE:-0}" = 1 ]; then
@@ -29,15 +153,9 @@ fi
 # A mutation that is left applied is worse than no check at all: the next build compiles a source
 # nobody chose, and a red suite then points at tests that are fine. This happened while writing this
 # script - two runs reported three falling tests failing, against a tree that still had a mutation
-# in it, and the failure did not reproduce once the source was rebuilt. Refuse to start over a
-# leftover, and restore on every exit path we control.
-if ls src/*.mutation-backup >/dev/null 2>&1; then
-  echo "refusing to run: a previous mutation was left applied:" >&2
-  ls src/*.mutation-backup >&2
-  echo 'restore with: for f in src/*.mutation-backup; do cp "$f" "${f%.mutation-backup}" && touch "${f%.mutation-backup}" && rm "$f"; done' >&2
-  exit 2
-fi
-
+# in it, and the failure did not reproduce once the source was rebuilt. The snapshot above already
+# refuses to start over a leftover; `restore` puts every entry's bytes back on the exit paths this
+# script controls, and `verify_restored` checks that it worked rather than trusting it.
 passed=0
 failed=0
 skipped=0
@@ -109,13 +227,66 @@ control() {
   return 1
 }
 
+# One owner for "what did this run actually do", used for the first run and for the stability
+# re-run alike. Before 2026-11-16 the re-run asked only whether its output was *green*, so a run
+# that never compiled and a run whose harness crashed both counted as the second failure that
+# proves a catch: eleven deterministic scenarios against the unchanged script, two of them
+# (second run compile error, second run SIGSEGV) recorded as proved (measured, see
+# audit/test-causality-followup-20261116/stability-contract.json).
+#
+# verdict:
+#   green    the selected test(s) passed -- not a catch
+#   caught   a selected test reported a failure: `test result: FAILED` with at least one failed
+#            test, or, for a wire gate, the exact line it was registered to print
+#   compile  the mutation did not build, so no assertion ran
+#   zero     the filter matched no test
+#   ignored  the selected test is #[ignore]d
+#   crash    non-zero exit that reported neither a failing test nor the expected wire line
+classify() {
+  local filter="$1" expected_failure="$2"
+  verdict=crash
+  # cargo prints "error: test failed" for a failing test, so the exit code and the word "error"
+  # cannot tell a compile failure from an assertion failure. The lines the harness itself prints
+  # can: a rustc diagnostic, or cargo's own "could not compile" summary.
+  if [ "$compiled" = no ] || grep -qE '^error\[|^error: could not compile' "$log"; then
+    verdict=compile
+    return
+  fi
+  if grep -qE 'running 0 tests' "$log"; then
+    verdict=zero
+    return
+  fi
+  if [ "$status" = green ]; then
+    # The test ran nothing because it is parked with #[ignore]. That is neither a gate nor a silent
+    # pass: it is a named gap, and it has to be loud in the summary or parking becomes a way to make
+    # this job green.
+    if grep -qE 'test result: ok\. 0 passed; 0 failed; [1-9][0-9]* ignored' "$log"; then
+      verdict=ignored
+    else
+      verdict=green
+    fi
+    return
+  fi
+  if [[ "$filter" == tests/*.py ]]; then
+    # A wire gate names the exact line it must print. Any other non-zero exit is a broken run and
+    # not a catch, however red the output happens to look.
+    if [ -n "$expected_failure" ] && grep -Fxq "$expected_failure" "$log"; then
+      verdict=caught
+    fi
+    return
+  fi
+  if grep -qE 'test result: FAILED\. [0-9]+ passed; [1-9][0-9]* failed' "$log"; then
+    verdict=caught
+  fi
+}
+
 # check <name> <file> <from> <to> <test-filter-or-wire-script> [exact-wire-failure]
 check() {
   local name="$1" mut_file_local="$2" from="$3" to="$4" test_filter="$5" expected_failure="${6:-}"
   if [ -n "${MUTATION_FILTER:-}" ] && [[ "$test_filter" != *"$MUTATION_FILTER"* ]]; then
     return
   fi
-  local status compiled caught=no
+  local status compiled caught=no verdict
   mut_file="$mut_file_local"
   backup="$mut_file.mutation-backup"
   local sha_before
@@ -153,50 +324,57 @@ PY
 
   run_filter "$test_filter"
   keep_log "$name" mutant
-
-  # cargo prints "error: test failed" for a failing test, so the exit code and the word error cannot
-  # tell a compile failure from an assertion failure. The lines the harness itself prints can.
-  if [ "$compiled" = no ] || grep -qE '^error\[' "$log"; then
-    echo "FAIL  $name"
-    echo "      the mutation did not compile, so no assertion ran. Narrow it."
-    failed=$((failed + 1))
-  elif grep -qE 'running 0 tests' "$log"; then
-    echo "FAIL  $name"
-    echo "      '$test_filter' matched no test, so nothing was checked."
-    failed=$((failed + 1))
-  elif [ "$status" = green ] && grep -qE 'test result: ok\. 0 passed; 0 failed; [1-9][0-9]* ignored' "$log"; then
-    # The test ran nothing because it is parked with #[ignore]. That is neither a gate nor a silent
-    # pass: it is a named gap, and it has to be loud in the summary or parking becomes a way to make
-    # this job green. Check the count of parked gates, not just the fact that there are some.
-    echo "PARK  $name"
-    echo "      '$test_filter' is #[ignore]d, so the mutation had nothing to hit. See specs/PLAN.md."
-    parked=$((parked + 1))
-  elif [ "$status" = green ]; then
-    echo "FAIL  $name"
-    echo "      '$test_filter' stayed green with the implementation broken. That test is not a gate."
-    failed=$((failed + 1))
-  elif { [[ "$test_filter" == tests/*.py ]] && [ -n "$expected_failure" ] && grep -Fxq "$expected_failure" "$log"; } ||
-       { [[ "$test_filter" != tests/*.py ]] && grep -qE 'test result: FAILED' "$log"; }; then
-    caught=yes
-  else
-    echo "FAIL  $name"
-    echo "      the run neither compiled, matched, nor reported a failing test."
-    tail -15 "$log"
-    failed=$((failed + 1))
-  fi
-  # A failing test is not proof that the mutation caused the failure. Measured
-  # 2026-11-11: three entries were recorded as proved only because a load-sensitive
-  # test happened to fail in that run; re-running the same campaign reported them as
-  # not a gate. With MUTATION_STABILITY=1 the mutant has to fail a second time, so a
-  # flake cannot be counted as a catch. Costs one extra run per caught mutant.
-  if [ "$caught" = yes ] && [ -n "${MUTATION_STABILITY:-}" ]; then
-    run_filter "$test_filter"
-    if [ "$status" = green ]; then
+  classify "$test_filter" "$expected_failure"
+  case "$verdict" in
+    compile)
       echo "FAIL  $name"
-      echo "      the mutant run failed once and passed on a re-run, so the failure was a flake,"
-      echo "      not a catch. The test is not a stable gate."
+      echo "      the mutation did not compile, so no assertion ran. Narrow it."
+      failed=$((failed + 1))
+      ;;
+    zero)
+      echo "FAIL  $name"
+      echo "      '$test_filter' matched no test, so nothing was checked."
+      failed=$((failed + 1))
+      ;;
+    ignored)
+      echo "PARK  $name"
+      echo "      '$test_filter' is #[ignore]d, so the mutation had nothing to hit. See specs/PLAN.md."
+      parked=$((parked + 1))
+      ;;
+    green)
+      echo "FAIL  $name"
+      echo "      '$test_filter' stayed green with the implementation broken. That test is not a gate."
+      failed=$((failed + 1))
+      ;;
+    caught) caught=yes ;;
+    *)
+      echo "FAIL  $name"
+      echo "      the run neither compiled, matched, nor reported a failing test."
+      tail -15 "$log"
+      failed=$((failed + 1))
+      ;;
+  esac
+  # A failing test is not proof that the mutation caused the failure. Measured 2026-11-11: three
+  # entries were recorded as proved only because a load-sensitive test happened to fail in that
+  # run; re-running the same campaign reported them as not a gate. With MUTATION_STABILITY=1 the
+  # mutant has to fail a second time, and the second run is classified by the same owner: a re-run
+  # that did not report a failing test is an unproven result, not a catch and not a flake. Costs
+  # one extra run per caught mutant.
+  if [ "$caught" = yes ] && [ "$stability" = 1 ]; then
+    run_filter "$test_filter"
+    keep_log "$name" mutant-rerun
+    classify "$test_filter" "$expected_failure"
+    if [ "$verdict" != caught ]; then
       caught=no
       failed=$((failed + 1))
+      echo "FAIL  $name"
+      if [ "$verdict" = green ]; then
+        echo "      the mutant run failed once and passed on a re-run, so the failure was a flake,"
+        echo "      not a catch. The test is not a stable gate."
+      else
+        echo "      the mutant run failed once, but the re-run did not report a failing test"
+        echo "      ($verdict), so the first failure is unproven: an infrastructure result, not a catch."
+      fi
     fi
   fi
   restore
@@ -212,15 +390,18 @@ PY
 
 # A restore that did not put the bytes back leaves the tree mutated, and every later measurement is
 # of a source nobody chose. Checking the hash is the only way to know, because the failure mode is
-# silent: the file compiles, the suite runs, and the answer is about the mutation.
+# silent: the file compiles, the suite runs, and the answer is about the mutation. There is no
+# `git checkout --` fallback here on purpose: this file may be a copy inside someone else's
+# worktree, and a checkout would reach the repository behind it. The owned backup is the only
+# recovery, and if that failed the run stops.
 verify_restored() {
   local name="$1" want="$2" got
   got=$(hash_of "$mut_file")
   if [ "$want" != "$got" ]; then
     echo "BROKEN $name"
     echo "      $mut_file did not come back byte-identical after the mutation."
-    echo "      Restoring from git and stopping: a mutated tree must not be measured."
-    git checkout -- "$mut_file" 2>/dev/null || true
+    echo "      This campaign runs on the private snapshot $MUTATION_SNAPSHOT_ROOT; the tree you"
+    echo "      edited was not touched. Stopping rather than measuring a mutated copy."
     exit 3
   fi
 }
@@ -354,6 +535,16 @@ check "sky spill loses one level per step" \
   src/main.rs '            let nl = level.saturating_sub(opacity(qx, qy, qz).max(1));' \
   '            let nl = level;' \
   sky_light_reaches_sideways_through_an_opening
+
+# The BFS above and the nibble packer have their own gates; what nothing called was the assembly
+# that wires them together (3x3 floors, `floor_of`, the spill) -- only the two production call
+# sites did. Dropping the spill at the call site left every older sky-light assertion green
+# (measured 2026-11-16, registry_tests::sky_light_reads_lit_at_the_surface_and_dark_under_it),
+# which is the false green this entry closes.
+check "the light packet assembles spill into its floors" \
+  src/main.rs '    let spill = sky_spill(cx, cz, floor_of, op);' \
+  '    let spill = Default::default();' \
+  registry_tests::sky_light_assembly_lights_through_an_opening_and_stops_at_a_barrier
 
 check "a knocked-out gravity block becomes an entity" \
   src/main.rs '        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);

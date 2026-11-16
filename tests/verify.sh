@@ -96,6 +96,11 @@ cargo check --offline --locked -j 2 --features neoforge-events
 
 # Last, because it is the slowest: prove the gates can still fail. A suite that is green over a gate
 # that cannot fail reports safety it does not have, and this is the only check that would notice.
-bash tools/mutation_check.sh --offline || exit 1
+# MUTATION_STABILITY=1 is the default here because a single red run cannot tell a catch from a
+# load-sensitive flake (measured 2026-11-11: three entries were recorded as proved and re-ran as
+# not a gate). It costs one extra run per caught mutant. The campaign copies the tree into a
+# private snapshot and builds in a private target, so this stage no longer touches the working
+# tree other stages may be reading.
+MUTATION_STABILITY=1 bash tools/mutation_check.sh --offline || exit 1
 
 echo "verify: PASS"

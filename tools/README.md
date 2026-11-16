@@ -116,3 +116,35 @@
 `INVOKEINTERFACE`、`ChunkAccess`(`duy`) は `INVOKEVIRTUAL`）。ローカル slot は
 メソッドごとに確認（`eis.a_` は 4/5）。ログの上限を切ったら**上限を出力**する
 （12 件だけ見て「全試行」と誤読した）。
+
+## gate（テストが落ちられることを確かめる）
+
+| 道具 | 何をするか |
+|---|---|
+| `mutation_check.sh [--offline]` | 実装を1箇所だけ壊し、対になるテストが赤くなることを要求する（424 entry）。1 entry は `check "<名前>" <file> '<from>' '<to>' <test filter または tests/*.py> ['<wire の完全一致行>']`。壊れたまま緑の entry は「テストが gate になっていない」として失敗する |
+| `cargo_executable.py` | cargo の JSON manifest から、いまビルドされた binary を1つに定める |
+
+**隔離の契約.** キャンペーンは測定対象のツリーを書き換えない。`Cargo.toml`/`Cargo.lock`/
+`rust-toolchain.toml`/`src`/`tests`/`tools`/`assets`/`datapacks`/`evidence`（build が
+`include_bytes!` する fixture を含む）を**1キャンペーンに1回だけ**
+`${XDG_CACHE_HOME:-$HOME/.cache}/mc-spine/mutation-runs/run.XXXXXXXX` へコピーし、
+`CARGO_TARGET_DIR` もその中に置いて、そこで実行し、終了時に削除する。置き場所だけ
+`MUTATION_SNAPSHOT_PARENT` で変えられる（`/tmp` が小さい tmpfs のホスト用。冷えた private
+target が 853 MiB なので 1.5 GiB 未満では起動しない）。コピーの前後で入力の sha256 manifest を取り、
+**コピーが source と一致しない**とき／**コピー中に source が動いた**ときは測らずに exit 2
+（2つの revision を混ぜない）。`MUTATION_RELEASE=1`/`CARGO_BUILD_JOBS`/`MUTATION_FILTER`
+（0件一致は失敗）/`MUTATION_LOG_DIR`（mutant と restored の assertion を残す）は従来どおり。
+
+以前は `src/*.rs` をその場で書き換えていた。実測で1 entry あたり 0.621 秒 mutant が作業ツリーに
+存在し、SIGKILL で mutant と `.mutation-backup` が残った（`audit/test-causality-tc-20261116/
+probe-window.json` と `evidence/review/test-causality-20261116.md`）。`flock` では直らない:
+書き込みはビルドの前で、ロックを取らない cargo やエディタは live file をそのまま読む。
+SIGKILL されたときだけ snapshot が残るが、それは**owned path**であって利用者のツリーではない。
+
+**分類の契約.** 1回目の実行と `MUTATION_STABILITY=1` の再実行は同じ `classify()` を通る。
+`proved` と言えるのは、選択されたテストが実際に失敗を報告したとき（`test result: FAILED` かつ
+`failed` が1以上）か、wire gate が登録された**完全一致の1行**を出したときだけ。compile error /
+crash / `running 0 tests` / `#[ignore]` / 無関係な赤は catch ではない。再実行が緑なら flake、
+compile error や crash なら「1回目の赤は unproven」として落とす（`BAC6DC9` の実測では
+再実行の compile error と SIGSEGV が proved として数えられていた）。`MUTATION_STABILITY` は
+`0`/`1` 以外を exit 2 で拒否する。`tests/verify.sh` は `MUTATION_STABILITY=1` を既定にしている。
