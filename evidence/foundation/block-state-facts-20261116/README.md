@@ -149,6 +149,29 @@ outline で、下記の通り 5,124状態を反転させた）。
 到達していないためで、述語そのものは契約テストと変異で押さえている。
 他の fixture（sculk 系・雪層・カーペット上の設置）は未測定で、そこが残件。
 
+## sculk 4箇所の支持平面（独立レビューで確定、2026-11-16）
+
+pinned `server.txt` mappings が無い環境でも決着できるよう、obfuscation 名を behavior から同定した
+（`SupportType` = 定数プールに `FULL`/`CENTER`/`RIGID` を持つ唯一のクラス = `doa`、
+`BlockState` = `dtc extends dtb$a`、`SculkShriekerBlock` = `dts.G`(`can_summon`) を参照する唯一の block）。
+
+- 3引数 `isFaceSturdy` は `dtb$a.d(dcc,jd,ji)` で、本体は `doa.a`(FULL) を積んで4引数へ委譲する。
+  `doa$1`(FULL) の本体は `isFaceFull(getCollisionShape(level,pos), dir)` — state の衝突形状だけで決まり、
+  近傍を読まない。よって pinned 表の列として妥当。
+- `canSupportCenter` は `dfy.a(dcz,jd,ji)` で `doa.b`(CENTER) を使う。CENTER と FULL は別平面。
+
+| port の site | native の本体 | 呼び出し | 判定 |
+|---|---|---|---|
+| `spc_can_spread_from` | `SculkPatchFeature.canSpreadFrom` = `edi` | `dtc.d(dcc,jd,ji)` | FULL 一致 |
+| `gen_sculk_patch`(shrieker) | `SculkPatchFeature.place` = `edi` | `dtc.d` → `dmt.d` | FULL 一致 |
+| `spc_cursor_can_spread` | `ChargeCursor.canSpread` = `dmu$a` | `dtc.d(dcc,jd,ji)` | FULL 一致 |
+| `spc_vein_can_spread` | `SculkVeinSpreaderConfig` `dkz$a` → `MultifaceBlock.canAttachTo` `dky.a` | `isFaceFull(collision) \|\| isFaceFull(support)` | **近似**（下記） |
+
+残る差は1点だけ: `MultifaceBlock.canAttachTo` は衝突形状と support 形状の**両方**を OR するが、
+port は `Support::Full` の片方（衝突形状）だけを問う。したがって vein の site では port が
+**reference より厳しい**（付くはずの vein を拒みうる）。FULL と CENTER の取り違えではなく、
+6A 以前の `is_solid && side_solid` より緩い方向への変更でもない。未修正・記録のみ。
+
 ## 残件（意図的に触っていない）
 
 1. **`liquid()` を使う呼び出し地点は無い。** `is_liquid` は `!getFluidState().isEmpty()`
@@ -157,9 +180,10 @@ outline で、下記の通り 5,124状態を反転させた）。
    `is_liquid_block` は輸出だけしてあり、監査用。
 2. **`can_occlude` の本番消費者も無い。** 光は `lightBlock`（`opacity_of`）で減衰させるのが
    正しい問いなので、列だけ持たせている。
-3. **sculk 系4箇所の FULL は native の3引数呼び出しと一致する、という前提は未検証。**
-   `SculkShriekerBlock.canSurvive` が `canSupportCenter`（CENTER）だった場合は
-   雪層やフェンス上の shrieker で差が出る。jar 側の呼び出しを1本確認すれば決着する。
+3. **sculk 系4箇所の FULL — 2026-11-16 の独立レビューで jar から決着済み（下記）。**
+   未検証だった前提は「`SculkShriekerBlock.canSurvive` が `canSupportCenter`（CENTER）かもしれない」
+   だったが、`SculkShriekerBlock`（`dmt`）は `canSurvive` を宣言せず `SupportType` も参照しない。
+   この前提は成立しない。詳細は §「sculk 4箇所の支持平面（独立レビューで確定）」。
 4. `assets/block_predicates_1211.bin` の bit0、`collision_shape_full_1211.bin`、
    `mineshaft_support_1211.bin` の面ビットは**同じ native 呼び出しの独立な再記録**として
    残した（`pinned_fact_tables_agree...` が読む）。挙動の所有者は新しい表のみ。

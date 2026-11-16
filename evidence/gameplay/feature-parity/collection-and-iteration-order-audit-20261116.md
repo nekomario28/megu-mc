@@ -329,6 +329,32 @@ order that feeds the decision: the order is decided by `ji$c.<clinit>`, which is
 The number is recorded, with the cells, so the lane that fixes the east-edge canopy can re-measure
 it.
 
+### 独立再測定と受入判定（2026-11-16, integration acceptance audit）
+
+統合候補のバイナリで、この節の数値と機構を独立に取り直した。
+
+- native の配列は jar 側で再確認済み: `ji$c.<clinit>` は
+  `anewarray` に `ji.c, ji.f, ji.d, ji.e` を順に積み、`ji.<clinit>` の enum は
+  `a=DOWN b=UP c=NORTH d=SOUTH e=WEST f=EAST`。よって HORIZONTAL = NORTH, EAST, SOUTH, WEST。
+  曖昧さは無い。
+- `port_triage … 74 -41 --n 1 --mode full` で **121 / 98304**。
+  `horizontal_dir` だけを逆向き配列に戻したビルドで **116 / 98304**。差は主張どおり +5。
+- 121 側の差分内訳も一致: `air -> oak_leaves` が 9 セル
+  （`x=1198..1199`, `y=73..75`, `z=-655/-656` 付近）、`short_grass`/`fern -> air` は 11 セル
+  （うち 4 が新規に正しい）。
+- **機構の切り分け**: `horizontal_dir` は正しいまま、cocoa decorator の walk
+  （`for f in plane_horizontal()`）**だけ**を旧配列に戻すと **116** に戻る。
+  つまり +5 の全量は cocoa pass の描画消費に帰属し、trunk の `getRandomDirection` は
+  この fixture に寄与しない。監査の説明と一致した。
+- **cocoa は両側で 0 セル**: port の dump と native の保存チャンクの両方で
+  chunk (74,-41) の cocoa 状態は 0。位置は動いていない。
+
+受入判定: **コンポーネントとしては ACCEPT**（配列順は native と一致し、契約テストと変異で
+押さえられている）。ただし **fixture の指標としては未達**（jungle が 116 -> 121）。
+この 2 つは別物として扱う。+5 は「正しい規則を、既に壊れている世界状態に適用した」結果で
+あり、east-edge の canopy 欠陥が直るまで jungle の数字は改善しない。再測定の条件は
+「east edge の樹が native と一致すること」。座標を動かして数字を合わせることはしない。
+
 The other five fixtures move zero cells, and the reason is measured, not assumed:
 
 ```
