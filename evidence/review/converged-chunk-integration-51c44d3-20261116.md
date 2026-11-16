@@ -124,8 +124,10 @@ stage 後に `set -u` 下で未定義の `$n` を参照して exit 1 になり s
 | 19 | the feature bucket bound does not truncate the WG retention to 384 | `worldgen::wg_tests::post_carve_wg_outlives_the_feature_cache_but_not_its_claim` |
 | 20 | an evicted post-carve WG value takes its claim with it | `worldgen::wg_tests::the_wg_retention_bound_drops_the_value_and_the_claim_together` |
 
-残り **407 entry は実行していない**（skip でも PASS でもない）。それらはこの候補の変更パスを
-踏まない base の不変条件で、base 側の全 suite（549 tests）が担う。
+残り **407 entry は実行していない**（skip でも PASS でもない）。選択した20件は変更経路への
+直接の確認であり、非選択407件が変更の影響を受けないことまで証明したわけではない。
+549件の通常テストの成功も、非選択mutationの検出力の再証明を代替しない。これは承認された
+選択実行方針の限界として残す。
 
 ## 既知の限界
 
@@ -143,7 +145,7 @@ stage 後に `set -u` 下で未定義の `$n` を参照して exit 1 になり s
   `tools/mutation_check.sh` 1 file のみ）。
 * combined の 2 回目で adapter check 2 本が `Finished … in 0.01s` になったのは、1 回目が
   同じ `target/` に同じ 2 feature を build 済みだったため（cargo cache。check 自体は成功）。
-* **e9214ac の文言のずれ 2 件**（意味の閉包には影響しない。main agent が直す）:
+* **測定時点のe9214ac由来の文言のずれ2件**（main agentが後続のコメント・文書修正で訂正。測定時の内容は以下）:
   (a) commit message / `specs/chunk-state-lifecycle/README.md` の「5 new tests red」は実際には
   **4 red + 1 既緑**（`evicting_block_output_keeps_the_staged_payload` は変わらない挙動の guard。
   これは main agent が e921 の raw log から読んだ結果で、本実行は pre-change の赤集合を

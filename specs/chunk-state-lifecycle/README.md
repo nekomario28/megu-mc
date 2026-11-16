@@ -9,7 +9,8 @@ Status: **実装済み**。これは [ロードマップ](../ROADMAP.md) が「�
 `src/worldgen.rs` では 1 chunk の carve stage が 3 つの容器に分かれていた:
 `carved`（latch、上限なし）、`wg_after_carve`（carve 後の WG 高さ、4096 chunk）、
 `feat_c`（block 出力、feature 層と同居する 384 chunk の LRU）。bound が違うので
-「claim だけ残る」経路が 2 つあり、どちらも seed 4242 で再現した:
+「claim だけ残る」経路が 2 つある。前者は seed 4242 の実生成、後者は同じ生成器に
+合成した高さ値を入れて容量境界を超えるテストで再現した:
 
 - `feat_c` の 384 が chunk (6,7) の carver 書き込みを落としても `carved` が残るため、
   `apply_carvers` は `begin_carve` で return する。同じ入力・同じ順序で FEATURES を
@@ -19,7 +20,9 @@ Status: **実装済み**。これは [ロードマップ](../ROADMAP.md) が「�
 
 ## 所有者
 
-`Gen::carve_c: HashMap<(i32, i32), CarveStage>` が唯一の所有者で、**record の存在が latch**。
+`Gen::carve_c: HashMap<(i32, i32), CarveStage>` が唯一の所有者で、**claim は `blocks_live`**。
+record は WG 値を保持したまま `blocks_live=false` で存在できる。record の存在だけでは
+carve 済みとは判定しない。
 
 ```rust
 pub(crate) struct CarveStage {
@@ -48,10 +51,10 @@ queue と map がずれず、slot の重複も起きない。
   384 が WG の保持を切り詰めてはいけない。
 - feature 側は **384 のまま**（容量変更なし）。ただし bucket を落とすときは claim も落とす。
   落とさないと次の FEATURES pass が carve 前の石を読み、出力が変わる。
-- 4096 を超えた chunk は「まだ carve していない chunk」に戻る（値も claim も無い）。
-  値が無い読み手は carve 前の scan を見るが、それは vanilla が CARVERS 未到達の chunk に
-  答える値と同じで、claim が無いので次の生成で必ず pass が走り両方を作り直す。
-  「claim は生きているのに値だけ永久に無い」が直した状態。
+- WG の保持数が4096を超えて追い出された chunk は値・claim・block bucketを失い、
+  次の生成で pass を再実行できる。値が無い間の読み手には既存の carve 前 scan への
+  fallback がある。この修正は「claim が残って値を再導出できない」状態を解消するもので、
+  fallback の全状況での vanilla 同値を証明するものではない。
 
 ## 変えないもの
 
@@ -62,8 +65,9 @@ snapshot/merge・tick・キャッシュ容量には触れない。
 
 ## 検証
 
-`worldgen::wg_tests` の 5 本が旧 tree で red、新 tree で green（
-`carve_output_and_its_latch_share_one_lifetime` は実際の carve→FEATURES 経路）。
+`worldgen::wg_tests` の新規5本のうち、旧 tree で4本がred、新 treeで5本ともgreen。
+`evicting_block_output_keeps_the_staged_payload` は旧 tree でもgreenで、既存の不変条件を保護する。
+`carve_output_and_its_latch_share_one_lifetime` は実際の carve→FEATURES 経路を通る。
 `tools/mutation_check.sh` に 4 つの mutant を置き、それぞれが対応するテストを赤にすることを
 確認した（旧 `begin_carve` の mutant は新しい本体に合わせて置き換え）。native fixture
 （`nether_carvers_1211`, `end_*_features_1211`）は入力を再生成せず、差分が出ないことを確認する。

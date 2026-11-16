@@ -815,9 +815,9 @@ const FEATURE_BUCKET_BOUND: usize = 384;
 /// One chunk's carve stage — the record that replaces the three containers that used to
 /// describe it (`carved`, `wg_after_carve`, `wg_after_carve_ord`).
 ///
-/// **The record's presence is the latch**: there is no separate "this chunk is carved"
-/// set, so no reader can find a claim whose output was discarded. The two outputs have
-/// deliberately different lifetimes, because they are different kinds of thing:
+/// `blocks_live` is the carve claim; there is no separate "this chunk is carved" set.
+/// A record can retain a WG value after its block bucket and claim have been dropped.
+/// The two outputs deliberately have different lifetimes:
 ///
 /// * `wg` — `ChunkAccess`'s WORLD_SURFACE_WG `[0..256)` / OCEAN_FLOOR_WG `[256..512)` as
 ///   of the end of the carver pass, index `lz * 16 + lx`, `topSolid + 1`. Vanilla creates
@@ -3976,11 +3976,9 @@ impl Gen {
             eprintln!("[stage] evict bucket {key:?}");
         }
     }
-    /// The one place a carve record dies. `wg` and the block output are one stage, so
-    /// both go: a record without a claim would answer neither `begin_carve` nor the WG
-    /// read, while a claim without an output is the lie this owner exists to remove.
-    /// The chunk returns to the not-yet-carved stage and the next generation re-derives
-    /// the pass (it is deterministic in the seed, so it reproduces both outputs).
+    /// The one place a carve record dies. Dropping a WG value also invalidates the
+    /// claim and block bucket, so the next generation can re-derive the whole stage.
+    /// Unlike feature-bucket eviction, this removes both retained outputs.
     fn evict_carve_record(&mut self, key: (i32, i32)) {
         self.carve_c.remove(&key);
         self.forget_feature_bucket(key);
@@ -4271,9 +4269,9 @@ impl Gen {
 
     /// The stored post-carve WG height for a column, first-available form
     /// (`topSolid + 1`), or `None` when this generator holds no post-carve value for that
-    /// chunk. `None` means "this chunk has no carver stage record", so its next
-    /// generation runs the pass (and re-derives the value) before a feature reads it —
-    /// it never means "the claim is live and the value is gone".
+    /// chunk. `None` means no WG value is retained; a newly claimed pass also has no
+    /// value until `set_wg_after_carve` hands over its scan. Evicting a completed WG
+    /// value invalidates the claim too, allowing the next generation to re-derive it.
     pub(crate) fn wg_after_carve_height(&self, ocean_floor: bool, x: i32, z: i32) -> Option<i32> {
         let tops = self.carve_c.get(&(x >> 4, z >> 4))?.wg.as_ref()?;
         let base = if ocean_floor { 256 } else { 0 };
