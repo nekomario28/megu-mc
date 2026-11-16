@@ -20,6 +20,14 @@ What a row must prove before its comparison is accepted (no green by silence):
 * the row declares its reference and port generation stages, they are equal, and the
   reference stage matches the fixture's recorded one - a stage is part of the comparison
   identity (`evidence/gameplay/feature-parity/light-and-lost-writes-20261116.md`);
+* the row's `world` is the fixture's own world - `boundary.json` sits in the fixture and
+  records a `world_subdirectory`, so `region_world` must be `fixture/<world_subdirectory>`
+  and `world` must be the fixture's `world` (or that subdirectory); a byte-identical copy of
+  the world elsewhere with every sha256 re-bound is still INVALID, because the provenance
+  would then describe another tree;
+* every typed field (in `boundary.json` and in the row) is checked before it is used as a
+  key or compared, so `dimension: {}` or a boolean `runtime_writes` is INVALID input
+  rather than a `TypeError` out of the suite;
 * `level.dat`'s `WorldGenSettings.seed` equals the declared seed, and the row's grid
   equals the fixture's `min_y`/`height`;
 * every input the comparison actually reads - `level.dat`, each region file of the
@@ -204,13 +212,24 @@ def read_boundary(fixture):
     for key in ("mode", "dimension", "min_y", "height", "seed", "stage", "runtime_writes", "chunks"):
         if key not in boundary:
             raise Invalid(f"{path} is missing {key!r}; the fixture provenance is incomplete")
+    # Types are checked before any dict/set lookup or comparison: `dimension` is used as a
+    # `DIMENSION_PRESETS` key, so an object/list there is an invalid input, not a traceback.
+    for key in ("mode", "dimension", "stage"):
+        if not isinstance(boundary[key], str):
+            raise Invalid(f"{path} field {key!r} must be a string, got {boundary[key]!r}")
     if boundary["mode"] != "frozen":
         raise Invalid(f"fixture mode is {boundary['mode']!r}, not 'frozen'")
-    if boundary["runtime_writes"] != 0:
+    runtime_writes = require_int(boundary["runtime_writes"], f"{path} field 'runtime_writes'")
+    if runtime_writes != 0:
         raise Invalid(
-            f"fixture records {boundary['runtime_writes']} runtime write(s): the saved world is not the "
+            f"fixture records {runtime_writes} runtime write(s): the saved world is not the "
             "declared generation stage (a block name does not attribute the writer)"
         )
+    for key in ("min_y", "height", "chunks", "seed"):
+        require_int(boundary[key], f"{path} field {key!r}")
+    subdir = boundary.get("world_subdirectory")
+    if subdir is not None and (not isinstance(subdir, str) or not subdir.strip()):
+        raise Invalid(f"{path} field 'world_subdirectory' must be a non-empty string, got {subdir!r}")
     if boundary["stage"] not in STAGES:
         raise Invalid(f"fixture stage {boundary['stage']!r} is not one of {list(STAGES)}")
     return boundary, path
@@ -254,6 +273,8 @@ def validate_row(row, ctx):
     if rid in ctx["duplicate_ids"]:
         raise Invalid(f"duplicate row id {rid!r} (ids must be distinct)")
     kind = row.get("kind")
+    if not isinstance(kind, str):
+        raise Invalid(f"kind must be a string ('chunk' or 'sculk'), got {kind!r}")
     if kind not in ("chunk", "sculk"):
         raise Invalid(f"kind must be 'chunk' or 'sculk', got {kind!r}")
 
@@ -275,8 +296,11 @@ def validate_row(row, ctx):
     if not isinstance(stage, dict):
         raise Invalid("stage must be an object {'reference': ..., 'port': ...}")
     for side in ("reference", "port"):
-        if stage.get(side) not in STAGES:
-            raise Invalid(f"stage.{side} {stage.get(side)!r} is not one of {list(STAGES)}")
+        value = stage.get(side)
+        if not isinstance(value, str):
+            raise Invalid(f"stage.{side} must be a string, got {value!r}")
+        if value not in STAGES:
+            raise Invalid(f"stage.{side} {value!r} is not one of {list(STAGES)}")
     if stage["reference"] != stage["port"]:
         raise Invalid(
             f"reference stage {stage['reference']!r} != port stage {stage['port']!r}: "
@@ -306,10 +330,15 @@ def validate_row(row, ctx):
         raise Invalid(f"declared window is {n}x{n} chunks but the fixture recorded {boundary['chunks']}")
 
     declared_preset = row.get("preset")
-    if declared_preset is not None and declared_preset != preset:
-        raise Invalid(f"declared preset {declared_preset!r} != fixture dimension preset {preset!r}")
+    if declared_preset is not None:
+        if not isinstance(declared_preset, str):
+            raise Invalid(f"declared preset must be a string, got {declared_preset!r}")
+        if declared_preset != preset:
+            raise Invalid(f"declared preset {declared_preset!r} != fixture dimension preset {preset!r}")
     declared_dim = row.get("dim")
     if declared_dim is not None:
+        if not isinstance(declared_dim, str):
+            raise Invalid(f"declared dim must be a string, got {declared_dim!r}")
         try:
             dim_dir = chunk_triage.resolve_dimension_dir(fixture, dim=declared_dim)
         except TriageError as exc:
@@ -341,6 +370,39 @@ def validate_row(row, ctx):
         region_world = Path(resolve_dimension_world(str(world), preset=preset)).resolve()
     except TriageError as exc:
         raise Invalid(str(exc)) from exc
+
+    # `boundary.json` describes one fixture, so the world must be that fixture's world: a
+    # byte-identical copy elsewhere (with every sha256 re-bound to the copy) is a different
+    # world, and accepting it would let the recorded stage/window describe another tree.
+    subdir = boundary.get("world_subdirectory")
+    if subdir is not None:
+        expected_region_world = (fixture / subdir).resolve()
+        if not expected_region_world.is_relative_to(fixture):
+            raise Invalid(
+                f"{boundary_path} records world_subdirectory {subdir!r}, which resolves outside "
+                f"the fixture {fixture}"
+            )
+        if region_world != expected_region_world:
+            raise Invalid(
+                f"row world {world} is not the fixture's world: it holds the {preset} regions in "
+                f"{region_world}, but {boundary_path} records {expected_region_world}"
+            )
+        allowed_worlds = {(fixture / "world").resolve(), expected_region_world}
+        if world not in allowed_worlds:
+            allowed = " or ".join(str(path) for path in sorted(allowed_worlds, key=str))
+            raise Invalid(
+                f"row world {world} is not the fixture's world: {boundary_path} belongs to "
+                f"{fixture}, so world must be {allowed}"
+            )
+    else:
+        fixture_world = (fixture / "world").resolve()
+        if world != fixture_world:
+            raise Invalid(
+                f"row world {world} is not the fixture's world {fixture_world}: {boundary_path} "
+                "records no world_subdirectory, so only the fixture's own world can be compared"
+            )
+        if not region_world.is_relative_to(world):
+            raise Invalid(f"region world {region_world} is not inside the fixture's world {world}")
 
     port = resolve_path(base, row.get("port"), "port")
     if not port.is_file():

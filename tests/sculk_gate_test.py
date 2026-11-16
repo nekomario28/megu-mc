@@ -5,6 +5,8 @@ The control that matters is a false green the previous body produced: it compare
 *names* (`gn != wn`), so two `sculk_vein` cells with different `waterlogged`/direction
 properties were reported as agreement, a chunk that was not `full` was silently skipped,
 and a dump of only a few sections was accepted as long as its length divided evenly.
+A missing world (or a world without `region/r.*.mca`) escaped as a `FileNotFoundError`
+traceback instead of invalid input (exit 2).
 `SCULK_GATE_UNDER_TEST=<path>` runs these cases against another copy of the script, so the
 pre-change body can be shown failing them.
 
@@ -301,6 +303,35 @@ class SculkGateContracts(unittest.TestCase):
             code, out, err = run_gate(self.gate, [str(world), str(broken), "1", "0", "0"])
         self.assertEqual(code, 2, out + err)
         self.assertIn("not n*n", err)
+
+    def test_a_missing_world_is_invalid_input_not_a_traceback(self):
+        """`vanilla_chunk` opens `<world>/region/r.*.mca`; a missing world used to escape.
+
+        The failure this pins: `FileNotFoundError` propagated out of `compare` (the
+        `except (SystemExit, ValueError)` did not cover `OSError`), so the gate died with a
+        traceback instead of reporting invalid input.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = make_dump(Path(tmp) / "port.bin", 1, {})
+            code, out, err = run_gate(self.gate, [str(Path(tmp) / "absent-world"), str(dump),
+                                                  "1", "0", "0", "--require-match"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("not a directory", err)
+        self.assertNotIn("Traceback", out + err)
+        self.assertNotIn("PASS", out)
+
+    def test_a_world_without_the_region_file_is_invalid_input_not_a_traceback(self):
+        """A world directory that exists but holds no `region/r.*.mca` is invalid input."""
+        with tempfile.TemporaryDirectory() as tmp:
+            world = Path(tmp) / "world"
+            (world / "region").mkdir(parents=True)
+            dump = make_dump(Path(tmp) / "port.bin", 1, {})
+            code, out, err = run_gate(self.gate, [str(world), str(dump), "1", "0", "0",
+                                                 "--require-match"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("cannot read chunk", err)
+        self.assertNotIn("Traceback", out + err)
+        self.assertNotIn("PASS", out)
 
     def test_a_reference_without_sculk_cannot_pass(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -104,6 +104,10 @@ def parse_args(argv):
 
 def compare(world, raw, n, x0, z0, names, states):
     """Count sculk-family cells; raises Usage for any input this gate cannot read."""
+    # `vanilla_chunk` opens `<world>/region/r.<rx>.<rz>.mca`; a world that is not there is
+    # invalid input (exit 2), not an `OSError` traceback out of the gate.
+    if not Path(world).is_dir():
+        raise Usage(f"world is not a directory: {world}")
     cell_count = len(raw) // (n * n * BYTES_PER_CELL)
     if len(raw) != n * n * cell_count * BYTES_PER_CELL:
         raise Usage(f"dump length {len(raw)} is not n*n*chunks*{BYTES_PER_CELL} bytes")
@@ -129,7 +133,9 @@ def compare(world, raw, n, x0, z0, names, states):
             cx, cz = x0 + dx, z0 + dz
             try:
                 want = vanilla_chunk(world, cx, cz, states, min_y=MIN_Y, height=HEIGHT)
-            except (SystemExit, ValueError) as exc:
+            except (SystemExit, ValueError, OSError) as exc:
+                # OSError covers a missing/unreadable region file (`FileNotFoundError`): a
+                # world without `region/r.*.mca` is invalid input, never a traceback.
                 raise Usage(f"cannot read chunk ({cx},{cz}) from {world}: {exc}") from exc
             if want is None:
                 # `vanilla_chunk` returns None for any status other than full; skipping it

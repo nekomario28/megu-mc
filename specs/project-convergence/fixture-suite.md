@@ -70,12 +70,20 @@ tools/fixture_suite.py <manifest.json> --out <empty-dir> [--timeout SECONDS]
 1. `boundary.json`（`tools/carve-agent/native_fixture.sh` が書く既存のprovenance）が
    `mode: frozen`、`runtime_writes: 0`、`stage`、`seed`、`dimension`、`min_y`/`height`/`chunks`
    を記録している。runtime書き込みがある保存worldは、宣言した生成stageの比較ではない。
+   各フィールドは使う前に型を検査する（`dimension` が object/list、`runtime_writes` が bool
+   のような値は INVALID であり、suite を `TypeError` で落とさない）。
 2. 宣言した `stage.reference` と `stage.port` が一致し、`reference` が fixture の記録と一致する
    （stage は比較の同一性の一部。block名からwriterや最初の分岐stageを推定しない）。
 3. `level.dat` の `Data.WorldGenSettings.seed` が宣言seedと一致し、`grid` が fixture の
    `min_y`/`height`、`n*n` が fixture の `chunks` と一致する。
-4. `inputs.sha256` の全入力が実ファイルと一致する（差し替え・古い入力を緑にしない）。
-5. 子プロセスが `n*n` chunkすべてを比較し、skip 0、比較セル数 > 0。`kind: sculk` は参照側の
+4. `world`（と `region_world`）が **fixture 自身の world** である。`boundary.json` は fixture に
+   あり `world_subdirectory` を記録しているので、`region_world` は
+   `fixture/<world_subdirectory>` と一致し、`world` は fixture の `world` かその subdirectory
+   でなければならない（`world_subdirectory` が無い場合は `fixture/world` のみ）。
+   同じバイト列のworldを別の場所へ複製し、sha256 をその複製へ貼り直しても INVALID である
+   — provenance は別のツリーを説明していることになる。
+5. `inputs.sha256` の全入力が実ファイルと一致する（差し替え・古い入力を緑にしない）。
+6. 子プロセスが `n*n` chunkすべてを比較し、skip 0、比較セル数 > 0。`kind: sculk` は参照側の
    sculk セル数 > 0。exit 0 と子の JSON が矛盾する（差分数>0、比較0件、部分grid、
    切り詰めJSON、exit 2/3）行は INVALID。
 
@@ -116,6 +124,10 @@ bad input の行があっても残りの行は実行・記録する。行を落�
 - 非`full`chunkを `continue` で飛ばしていた（部分gridがPASSし得た）。
 - dump長を「4096の倍数」でしか検査せず、24 section 未満の切り詰めを受け入れていた。
 - `n <= 0` でクラッシュまたは0件比較になり得た。
+- 保存worldが無い、または `region/r.*.mca` が無い場合に `FileNotFoundError` が
+  そのまま外へ出ていた（`vanilla_chunk` の周囲が `SystemExit`/`ValueError` だけを
+  受けていた）。現在は `Path(world).is_dir()` と `OSError` の両方を受け、
+  `Usage`（exit 2）として理由を述べる。
 
 現在は canonical state id（`assets/blocks_1211.json` の並び。参照側と `carver_diff` が同じ
 keyspaceを通る）で比較し、`n*n` chunkすべての存在と `full`、24 section のdump、

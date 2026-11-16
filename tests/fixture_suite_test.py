@@ -9,6 +9,9 @@ What these cases pin, in the order the suite decides it:
 * stale sha256 bindings, an unmatched generation stage, a seed/grid/dimension that the
   fixture does not record, a non-positive `n`, a missing binding and a duplicate id are
   all invalid input (exit 2), and the remaining rows still run and are inventoried;
+* a `world` outside the fixture is invalid even when it is a byte-identical copy with every
+  sha256 re-bound (the provenance describes the fixture's own world), and an unhashable or
+  wrongly typed field in `boundary.json`/the row is INVALID instead of a `TypeError`;
 * an unbound writer trace stays `UNKNOWN` and nothing is inferred from block names;
 * the suite resolves manifest paths from the manifest's own directory, and refuses an
   output directory that overlaps an input or an earlier run;
@@ -327,6 +330,98 @@ class FixtureSuiteContracts(unittest.TestCase):
                 self.assertEqual(result["rows"][0]["status"], "INVALID", label)
                 self.assertIn(expected[label], result["rows"][0]["reason"], label)
                 self.assertEqual(result["rows"][1]["status"], "MATCH", label)
+
+    def test_a_world_outside_the_fixture_is_invalid_even_when_rebound(self):
+        """`boundary.json` describes one fixture; a copied world is not that world.
+
+        The failure this pins: a byte-identical copy of `world/` under another path, with
+        every sha256 re-bound to the copy, was accepted as MATCH because only the file
+        hashes were checked - nothing tied `world`/`region_world` back to the fixture
+        whose boundary.json records the stage and window.
+        """
+        fixture = self.fixture
+        unrelated = self.root / "unrelated" / "world"
+        shutil.rmtree(unrelated.parent, ignore_errors=True)
+        shutil.copytree(fixture / "world", unrelated)
+        row = make_row(self.root, fixture, rid="foreign-world")
+        row["world"] = rel(self.root, unrelated)
+        row["inputs"]["sha256"] = {rel(self.root, path): sha256(path) for path in
+                                   (unrelated / "level.dat", unrelated / "region/r.0.0.mca",
+                                    fixture / "port.bin")}
+        manifest = write_manifest(self.root, [row])
+        out = self.out("foreign-world")
+        code, text = run_suite(self.fake_argv(manifest, out), fake={"*": {"json": chunk_json()}})
+        self.assertEqual(code, 2, text)
+        result = json.loads((out / "result.json").read_text())
+        row_result = result["rows"][0]
+        self.assertEqual(row_result["status"], "INVALID")
+        self.assertIn("not the fixture's world", row_result["reason"])
+        self.assertNotIn("command", row_result, "the comparator must not run on a foreign world")
+
+    def test_unhashable_boundary_fields_are_invalid_not_a_typeerror(self):
+        """A typed field in boundary.json is checked before any dict/set lookup.
+
+        The failure this pins: `dimension: {}` reached `DIMENSION_PRESETS.get(dimension)`
+        and raised `TypeError: unhashable type: 'dict'` out of the suite instead of
+        inventorying the row as INVALID with exit 2. A boolean is not an integer here
+        either: `runtime_writes: true` and `chunks: true` used to satisfy `!= 0`/`== n*n`.
+        """
+        cases = {
+            "dimension-object": ("dimension", {}, "dimension"),
+            "dimension-list": ("dimension", [], "dimension"),
+            "dimension-bool": ("dimension", True, "dimension"),
+            "dimension-number": ("dimension", 7, "dimension"),
+            "mode-object": ("mode", {}, "mode"),
+            "stage-list": ("stage", [], "stage"),
+            "runtime-writes-bool": ("runtime_writes", True, "runtime_writes"),
+            "chunks-bool": ("chunks", True, "chunks"),
+            "seed-bool": ("seed", True, "seed"),
+            "min-y-string": ("min_y", "-64", "min_y"),
+            "height-float": ("height", 32.0, "height"),
+        }
+        for label, (field, value, reason) in cases.items():
+            with self.subTest(case=label):
+                fixture = build_fixture(self.root / f"fixtures/boundary/{label}", n=1, height=32,
+                                        cells_by_chunk={(0, 0): {(0, -60, 0): ("minecraft:stone", {})}})
+                window_dump(fixture / "port.bin", (0, 0), 1, 32,
+                            {(0, -60, 0): block_state("stone")})
+                boundary = json.loads((fixture / "boundary.json").read_text())
+                boundary[field] = value
+                (fixture / "boundary.json").write_text(json.dumps(boundary))
+                manifest = write_manifest(self.root, [make_row(self.root, fixture, rid="bad-boundary")])
+                out = self.out("boundary-" + label)
+                code, text = run_suite(self.fake_argv(manifest, out),
+                                       fake={"*": {"json": chunk_json()}})
+                self.assertEqual(code, 2, text)
+                self.assertNotIn("Traceback", text)
+                row_result = json.loads((out / "result.json").read_text())["rows"][0]
+                self.assertEqual(row_result["status"], "INVALID", label)
+                self.assertIn(reason, row_result["reason"], label)
+
+    def test_unhashable_row_fields_are_invalid_not_a_typeerror(self):
+        """The row's own typed fields are rejected before `in`/`get`/compare."""
+        cases = {
+            "kind-object": ({"kind": {}}, "kind"),
+            "preset-object": ({"preset": {}}, "preset"),
+            "dim-list": ({"dim": []}, "dim"),
+            "stage-reference-object": ({"stage": {"reference": {}, "port": {}}}, "stage.reference"),
+            "stage-port-list": ({"stage": {"reference": "features", "port": []}}, "stage.port"),
+            "grid-height-bool": ({"grid": {"min_y": -64, "height": True}}, "grid.height"),
+            "seed-bool": ({"seed": True}, "seed"),
+        }
+        for label, (mutation, reason) in cases.items():
+            with self.subTest(case=label):
+                row = make_row(self.root, self.fixture, rid="bad-row")
+                row.update(mutation)
+                manifest = write_manifest(self.root, [row])
+                out = self.out("row-" + label)
+                code, text = run_suite(self.fake_argv(manifest, out),
+                                       fake={"*": {"json": chunk_json()}})
+                self.assertEqual(code, 2, text)
+                self.assertNotIn("Traceback", text)
+                row_result = json.loads((out / "result.json").read_text())["rows"][0]
+                self.assertEqual(row_result["status"], "INVALID", label)
+                self.assertIn(reason, row_result["reason"], label)
 
     def test_duplicate_ids_and_truncated_manifests_are_invalid(self):
         row = make_row(self.root, self.fixture, rid="dup")
