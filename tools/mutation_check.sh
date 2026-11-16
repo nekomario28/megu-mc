@@ -1106,6 +1106,16 @@ check "a reload continues the world random stream" \
   '            let _ = &payload[p..p + 8];' \
   persistence_tests::the_world_rng_stream_continues_across_a_save_and_load_round_trip
 
+# The tick save section's footer has one owner. Both consumers (`prefix` and
+# `read`) take the section start from `framed`, so the guard that refuses a
+# footer framing no body is what makes their answers agree. Without it the old
+# `prefix` returned an empty preceding section and let the reader start from
+# nothing. This is the entry that moves with the footer's owner.
+check "a footer that frames no body is refused by both of its consumers" \
+  src/tick_persistence.rs '    if size == 0 {' \
+  '    if false {' \
+  tick_persistence::tests::a_footer_that_frames_no_body_is_refused_by_both_consumers
+
 check "configuration information before known packs reaches chunk streaming" \
   src/main.rs '                client_view = v;
             }

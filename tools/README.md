@@ -153,7 +153,7 @@ Python の fixture 段が走る（測った範囲は [tests/README.md](../tests/
 
 | 道具 | 何をするか |
 |---|---|
-| `mutation_check.sh [--offline]` | 実装を1箇所だけ壊し、対になるテストが赤くなることを要求する（424 entry）。1 entry は `check "<名前>" <file> '<from>' '<to>' <test filter または tests/*.py> ['<wire の完全一致行>']`。壊れたまま緑の entry は「テストが gate になっていない」として失敗する |
+| `mutation_check.sh [--offline]` | 実装を1箇所だけ壊し、対になるテストが赤くなることを要求する（428 entry）。1 entry は `check "<名前>" <file> '<from>' '<to>' <test filter または tests/*.py> ['<wire の完全一致行>']`。壊れたまま緑の entry は「テストが gate になっていない」として失敗する |
 | `cargo_executable.py` | cargo の JSON manifest から、いまビルドされた binary を1つに定める |
 
 **隔離の契約.** キャンペーンは測定対象のツリーを書き換えない。`Cargo.toml`/`Cargo.lock`/
