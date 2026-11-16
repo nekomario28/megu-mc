@@ -576,13 +576,32 @@ check "a non-fluid aquifer state above nonpositive density stays solid" \
   worldgen::wg_tests::a_nonpositive_density_with_an_aquifer_barrier_is_still_solid
 
 check "a chunk claims its carver pass once" \
-  src/worldgen.rs '    pub(crate) fn begin_carve(&mut self, cx: i32, cz: i32) -> bool {
-        self.carved.insert((cx, cz))
-    }' \
-  '    pub(crate) fn begin_carve(&mut self, _cx: i32, _cz: i32) -> bool {
-        true
-    }' \
+  src/worldgen.rs '        if let Some(rec) = self.carve_c.get_mut(&key) {
+            if rec.blocks_live {
+                return false;
+            }' \
+  '        if let Some(rec) = self.carve_c.get_mut(&key) {' \
   feature::generation_contract_tests::a_chunk_claims_its_carver_pass_once
+
+check "a carve claim does not outlive the block output it stands for" \
+  src/worldgen.rs '        if let Some(rec) = self.carve_c.get_mut(&key) {
+            rec.blocks_live = false;
+        }' \
+  '' \
+  worldgen::wg_tests::repeated_stage_updates_keep_one_slot_per_chunk
+
+check "the feature bucket bound does not truncate the WG retention to 384" \
+  src/worldgen.rs '        if let Some(rec) = self.carve_c.get_mut(&key) {
+            rec.blocks_live = false;
+        }' \
+  '        self.carve_c.remove(&key);' \
+  worldgen::wg_tests::post_carve_wg_outlives_the_feature_cache_but_not_its_claim
+
+check "an evicted post-carve WG value takes its claim with it" \
+  src/worldgen.rs '        self.carve_c.remove(&key);
+        self.forget_feature_bucket(key);' \
+  '        self.forget_feature_bucket(key);' \
+  worldgen::wg_tests::the_wg_retention_bound_drops_the_value_and_the_claim_together
 
 check "the fancy centre layer is half the trunk half-height" \
   src/tree.rs '    if g == 0.0 {

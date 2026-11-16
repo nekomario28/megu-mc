@@ -754,20 +754,14 @@ pub struct Gen {
     // the generation ticks a second time.
     restored_tick_sources: HashSet<(i32, i32)>,
     suppress_generated_ticks: bool,
-    carved: HashSet<(i32, i32)>,
-    /// `ChunkAccess`'s WORLD_SURFACE_WG / OCEAN_FLOOR_WG as of the end of that chunk's
-    /// carver pass, first-available form. Vanilla creates a chunk's WG heightmaps while
-    /// it still carries the SURFACE status and updates them per write, so the carver pass
-    /// (whose `ProtoChunk.setBlockState` still reads the SURFACE status, because the new
-    /// status is only set when the stage body returns) lowers them; the FEATURES status
-    /// that follows updates only the POST_FEATURES maps, so a feature never touches
-    /// them. Frozen at the pre-carve terrain they stay too high at every carved column,
-    /// which is what a structure reading `WorldGenRegion.getHeight` sees (measured on
-    /// seed 4242 chunk (6,7): the ruined portal's netherrack base at (107,122) reads
-    /// 100, not the 110 its uncarved terrain top gives). Layout: `[0..256)`
-    /// WORLD_SURFACE_WG, `[256..512)` OCEAN_FLOOR_WG, index `lz * 16 + lx`.
-    wg_after_carve: HashMap<(i32, i32), Box<[i32; 512]>>,
-    wg_after_carve_ord: std::collections::VecDeque<(i32, i32)>,
+    /// `ChunkAccess`'s carve stage: one record per chunk, holding the latch `begin_carve`
+    /// reads and both outputs the stage writes (see `CarveStage`). **Nothing else may
+    /// hold a carve claim or a post-carve WG value** — three containers with three
+    /// lifetimes let a claim outlive the output it stood for.
+    carve_c: HashMap<(i32, i32), CarveStage>,
+    /// The `carve_c` records that carry a WG value, oldest first: the retention bound
+    /// lives in exactly one place (`set_wg_after_carve`).
+    carve_ord: std::collections::VecDeque<(i32, i32)>,
     /// Generation metadata persists independently of evictable block caches.
     pub(crate) mineshaft_spawners: HashSet<(i32, i32, usize)>,
     pub(crate) payload_sources: HashSet<(i32, i32)>,
@@ -805,6 +799,44 @@ struct Aqd {
     split: Split,
     water: u32,
     lava_st: u32,
+}
+
+/// Chunks whose post-carve WG heightmaps stay resident. A value is a deterministic scan
+/// of the carved terrain, so re-running the carver pass reproduces it, but it is *not*
+/// re-readable from a dropped block bucket: that is why this bound belongs to the record
+/// and not to `feat_c`. Approved retention for the first chunk-state repair — do not
+/// shrink it to the feature bucket's bound.
+const CARVE_WG_BOUND: usize = 4096;
+
+/// Chunks whose FEATURES-layer bucket (`feat_c` + `pop_done`) stays resident. Unchanged
+/// by the chunk-state repair: it is a cache of block writes, not of stage identity.
+const FEATURE_BUCKET_BOUND: usize = 384;
+
+/// One chunk's carve stage — the record that replaces the three containers that used to
+/// describe it (`carved`, `wg_after_carve`, `wg_after_carve_ord`).
+///
+/// **The record's presence is the latch**: there is no separate "this chunk is carved"
+/// set, so no reader can find a claim whose output was discarded. The two outputs have
+/// deliberately different lifetimes, because they are different kinds of thing:
+///
+/// * `wg` — `ChunkAccess`'s WORLD_SURFACE_WG `[0..256)` / OCEAN_FLOOR_WG `[256..512)` as
+///   of the end of the carver pass, index `lz * 16 + lx`, `topSolid + 1`. Vanilla creates
+///   a chunk's WG maps while it still carries the SURFACE status and updates them per
+///   write, so the carver pass lowers them and the FEATURES status afterwards updates
+///   only the POST_FEATURES maps. Retained up to `CARVE_WG_BOUND` chunks.
+/// * `blocks_live` — whether the pass' block writes are still materialised in `feat_c`.
+///   That map is a `FEATURE_BUCKET_BOUND`-chunk LRU shared with the feature layer, so it
+///   drops carve writes while `wg` may still be resident; the claim has to fall with the
+///   writes or the next FEATURES pass reads uncarved stone (`apply_carvers` would return
+///   at `begin_carve`) against a post-carve WG value.
+///
+/// `wg` owns its own lifetime precisely so the 384-chunk feature bound cannot silently
+/// truncate the 4096-chunk WG retention, and `blocks_live` owns the claim precisely so
+/// the reverse cannot happen either. Neither field is written by anything but the
+/// lifecycle methods below.
+pub(crate) struct CarveStage {
+    wg: Option<Box<[i32; 512]>>,
+    blocks_live: bool,
 }
 
 /// `AQ_TRACE="<cx>,<cz>"` prints the aquifer's decision terms for that chunk.
@@ -1087,9 +1119,8 @@ impl Gen {
             pop_active: None,
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
-            carved: HashSet::new(),
-            wg_after_carve: HashMap::new(),
-            wg_after_carve_ord: std::collections::VecDeque::new(),
+            carve_c: HashMap::new(),
+            carve_ord: std::collections::VecDeque::new(),
             pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                 if p.len() == 4 {
@@ -3230,9 +3261,8 @@ impl Gen {
             pop_active: None,
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
-            carved: HashSet::new(),
-            wg_after_carve: HashMap::new(),
-            wg_after_carve_ord: std::collections::VecDeque::new(),
+            carve_c: HashMap::new(),
+            carve_ord: std::collections::VecDeque::new(),
             pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                 if p.len() == 4 {
@@ -3917,13 +3947,46 @@ impl Gen {
             }
         }
         // bound the override maps (LRU over chunks)
-        while self.feat_ord.len() > 384 {
+        while self.feat_ord.len() > FEATURE_BUCKET_BOUND {
             let old = self.feat_ord.remove(0);
-            self.feat_c.remove(&old);
-            self.pop_done.remove(&old);
+            self.forget_feature_bucket(old);
         }
         let k = ((y - self.min_y) as u32) << 8 | (((z & 15) as u32) << 4) | (x & 15) as u32;
         self.feat_c.get(&(cx, cz))?.get(&k).copied()
+    }
+    /// Drop a chunk's FEATURES-layer bucket: its override map, its `pop_done` mark and
+    /// the `feat_ord` slot that lists it. Both bounds go through here, so the queue and
+    /// the map cannot disagree (a stale slot would make the next `feat_write` push a
+    /// duplicate and grow the queue without a bound).
+    ///
+    /// A bucket also holds the carver's writes for that chunk, so the carve claim that
+    /// stood for them falls here too — otherwise `apply_carvers` returns at `begin_carve`
+    /// and the next FEATURES pass reads uncarved stone. `CarveStage::wg` is *not* touched:
+    /// it is a scan of the carved terrain with its own 4096-chunk retention.
+    fn forget_feature_bucket(&mut self, key: (i32, i32)) {
+        self.feat_c.remove(&key);
+        self.pop_done.remove(&key);
+        if let Some(i) = self.feat_ord.iter().position(|k| *k == key) {
+            self.feat_ord.remove(i);
+        }
+        if let Some(rec) = self.carve_c.get_mut(&key) {
+            rec.blocks_live = false;
+        }
+        if env_flag!("CHUNK_STAGE_TRACE") {
+            eprintln!("[stage] evict bucket {key:?}");
+        }
+    }
+    /// The one place a carve record dies. `wg` and the block output are one stage, so
+    /// both go: a record without a claim would answer neither `begin_carve` nor the WG
+    /// read, while a claim without an output is the lie this owner exists to remove.
+    /// The chunk returns to the not-yet-carved stage and the next generation re-derives
+    /// the pass (it is deterministic in the seed, so it reproduces both outputs).
+    fn evict_carve_record(&mut self, key: (i32, i32)) {
+        self.carve_c.remove(&key);
+        self.forget_feature_bucket(key);
+        if env_flag!("CHUNK_STAGE_TRACE") {
+            eprintln!("[stage] evict record {key:?}");
+        }
     }
     /// The feature layer's heightmap: for each column, the highest non-air and the
     /// highest solid block a *feature* has written. Vanilla keeps this per chunk and
@@ -4145,30 +4208,74 @@ impl Gen {
     /// FEATURES for every chunk in the decoration area; claiming here lets the
     /// feature context pre-carve its neighbours without carving them twice.
     pub(crate) fn begin_carve(&mut self, cx: i32, cz: i32) -> bool {
-        self.carved.insert((cx, cz))
+        let key = (cx, cz);
+        if let Some(rec) = self.carve_c.get_mut(&key) {
+            if rec.blocks_live {
+                return false;
+            }
+            // The bucket that held this pass' writes is gone (`forget_feature_bucket`),
+            // so re-running is the only way to get them back. `wg` stays: it is a scan of
+            // the carved terrain, not a read of `feat_c`, and the re-run reproduces it.
+            if env_flag!("CHUNK_STAGE_TRACE") {
+                eprintln!("[stage] reclaim carve {cx},{cz} (block output evicted)");
+            }
+            rec.blocks_live = true;
+            return true;
+        }
+        self.carve_c.insert(
+            key,
+            CarveStage {
+                wg: None,
+                blocks_live: true,
+            },
+        );
+        true
     }
 
     /// Record a chunk's WG heightmaps as the carver pass leaves them (see
-    /// `wg_after_carve` for why the carver, and only the carver, moves them).
+    /// `CarveStage::wg` for why the carver, and only the carver, moves them).
     pub(crate) fn set_wg_after_carve(&mut self, cx: i32, cz: i32, tops: Box<[i32; 512]>) {
         let key = (cx, cz);
-        if self.wg_after_carve.insert(key, tops).is_none() {
-            self.wg_after_carve_ord.push_back(key);
+        // A caller that hands over a carved scan without claiming the pass first (the
+        // `wg_heightmap_keeps_the_carved_top` fixture) records the value and no block
+        // output: the same state `forget_feature_bucket` leaves behind, so the next
+        // `begin_carve` claims and re-runs instead of suppressing the pass.
+        let had_wg = {
+            let rec = self.carve_c.entry(key).or_insert(CarveStage {
+                wg: None,
+                blocks_live: false,
+            });
+            rec.wg.replace(tops).is_some()
+        };
+        if !had_wg {
+            self.carve_ord.push_back(key);
         }
-        // Decoration reaches the 17x17 region plus the structure reach; bound the map so
-        // a long generation run cannot grow it without limit. A miss falls back to the
-        // unscanned pre-carve terrain, so eviction degrades, never lies.
-        while self.wg_after_carve_ord.len() > 4096 {
-            if let Some(old) = self.wg_after_carve_ord.pop_front() {
-                self.wg_after_carve.remove(&old);
+        // Decoration reaches the 17x17 region plus the structure reach, so a value must
+        // outlive the pass that wrote it; `CARVE_WG_BOUND` chunks is the approved bound
+        // and it is *this* record's bound — not the 384-chunk `feat_c` one. Dropping the
+        // record drops its block output with it (`evict_carve_record`), so the chunk
+        // returns to the not-yet-carved stage and the next generation re-derives both;
+        // an evicted value never leaves a claim behind that could not recover it.
+        while self.carve_ord.len() > CARVE_WG_BOUND {
+            let Some(old) = self.carve_ord.pop_front() else {
+                break;
+            };
+            if old == key {
+                // The record being written is the oldest one: keep it, evict the next.
+                self.carve_ord.push_back(old);
+                continue;
             }
+            self.evict_carve_record(old);
         }
     }
 
     /// The stored post-carve WG height for a column, first-available form
-    /// (`topSolid + 1`), or `None` when this generator never carved that chunk.
+    /// (`topSolid + 1`), or `None` when this generator holds no post-carve value for that
+    /// chunk. `None` means "this chunk has no carver stage record", so its next
+    /// generation runs the pass (and re-derives the value) before a feature reads it —
+    /// it never means "the claim is live and the value is gone".
     pub(crate) fn wg_after_carve_height(&self, ocean_floor: bool, x: i32, z: i32) -> Option<i32> {
-        let tops = self.wg_after_carve.get(&(x >> 4, z >> 4))?;
+        let tops = self.carve_c.get(&(x >> 4, z >> 4))?.wg.as_ref()?;
         let base = if ocean_floor { 256 } else { 0 };
         Some(tops[base + (z & 15) as usize * 16 + (x & 15) as usize])
     }
@@ -8994,6 +9101,238 @@ mod wg_tests {
             neigh
         );
         assert!(m1.len() + neigh > 0, "no features generated at all");
+    }
+
+    // ---- carve-stage lifecycle -----------------------------------------------------
+
+    /// Everything the block layer holds for one chunk, in a stable order, so two runs of
+    /// the same stage on the same inputs compare as data.
+    fn chunk_override_digest(g: &Gen, cx: i32, cz: i32) -> (usize, u64) {
+        let mut cells: Vec<(i32, i32, i32, u32)> = Vec::new();
+        for lx in 0..16 {
+            for lz in 0..16 {
+                for y in g.min_y..g.min_y + g.height {
+                    let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                    if let Some(st) = g.feature_override(x, y, z) {
+                        cells.push((x, y, z, st));
+                    }
+                }
+            }
+        }
+        cells.sort();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (x, y, z, st) in &cells {
+            for v in [*x as u64, *y as u64, *z as u64, *st as u64] {
+                h ^= v;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        (cells.len(), h)
+    }
+
+    /// Turn `feat_c`'s own bound far enough that an old bucket is dropped: `feat_write`
+    /// is the entry both the carver and the feature layer flush through, and `feat_state`
+    /// is where that bound runs. The driver is a no-op so this stays a cache test.
+    fn evict_feature_buckets(g: &mut Gen, n: i32) {
+        for i in 0..n {
+            g.feat_write(1_000_000 + i * 16, 60, 1_000_000, 1);
+        }
+        let _ = g.feat_state(1_000_000, 60, 1_000_000, |_, _, _| {});
+    }
+
+    /// The carver's writes and the latch that says "this chunk is carved" are one stage.
+    /// When the override cache drops the writes, the latch has to go with them, because
+    /// the only other way to get them back is the pass the latch suppresses.
+    #[test]
+    fn carve_output_and_its_latch_share_one_lifetime() {
+        let mut g = Gen::load(4242, crate::name_to_state).expect("datapack");
+        // The real FEATURES entry point on the real schedule: chunk (6,7) alone. Its 3x3
+        // is carved but not populated, exactly as `feature::populate` does it.
+        assert_eq!(
+            g.populate_in_order([(6, 7)], crate::feature::populate),
+            1,
+            "the first pass must run"
+        );
+        let first = chunk_override_digest(&g, 6, 7);
+        let first_wg = g.wg_after_carve_height(false, 6 * 16, 7 * 16);
+        assert!(first.0 > 0, "the first pass wrote no block output");
+        evict_feature_buckets(&mut g, 400);
+        assert_eq!(
+            chunk_override_digest(&g, 6, 7),
+            (0, 0xcbf2_9ce4_8422_2325),
+            "the 384 bound really dropped this chunk's block output"
+        );
+        // Same entry point, same schedule, same inputs: the stage reproduces itself.
+        let reran = g.populate_in_order([(6, 7)], crate::feature::populate);
+        let second = chunk_override_digest(&g, 6, 7);
+        let second_wg = g.wg_after_carve_height(false, 6 * 16, 7 * 16);
+        eprintln!(
+            "FACTS carve: first=(n={} h={:016x}) reran={reran} second=(n={} h={:016x}) \
+             wg={first_wg:?}->{second_wg:?}",
+            first.0, first.1, second.0, second.1
+        );
+        assert_eq!(reran, 1, "the chunk re-claimed its FEATURES pass");
+        assert_eq!(
+            second, first,
+            "re-running the FEATURES stage under the same inputs and schedule must \
+             reproduce it; the first pass's terrain included the carver's writes, so a \
+             second pass that no longer sees them cannot"
+        );
+        assert_eq!(
+            second_wg, first_wg,
+            "the post-carve WG value is a scan of the same terrain, so the re-run must \
+             derive the same heights"
+        );
+    }
+
+    /// The approved retention is 4096 post-carve WG chunks and a 384-chunk feature
+    /// cache. They are different outputs with different lifetimes: dropping the block
+    /// bucket must not shrink the WG retention to 384 (the value is not re-readable from
+    /// a dropped bucket), but it must drop the claim that stood for those blocks.
+    #[test]
+    fn post_carve_wg_outlives_the_feature_cache_but_not_its_claim() {
+        let mut g = Gen::load(4242, crate::name_to_state).expect("datapack");
+        assert!(g.begin_carve(0, 0), "the real order: claim, then record");
+        let mut tops = Box::new([0i32; 512]);
+        tops[0] = 71;
+        g.set_wg_after_carve(0, 0, tops);
+        // A carved cell in this chunk's own bucket, so the 384 bound has something of
+        // this chunk's to drop.
+        g.feat_write(0, 71, 0, 1);
+        assert!(g.feature_override(0, 71, 0).is_some());
+        evict_feature_buckets(&mut g, 400);
+        assert_eq!(
+            g.feature_override(0, 71, 0),
+            None,
+            "the 384 bound really dropped this chunk's block output"
+        );
+        assert_eq!(
+            g.wg_after_carve_height(false, 0, 0),
+            Some(71),
+            "the 4096 WG retention must not shrink to the 384 feature bound"
+        );
+        assert!(
+            g.begin_carve(0, 0),
+            "a claim whose block output was evicted must not survive it: the next \
+             generation has to re-run the pass"
+        );
+    }
+
+    /// Past 4096 chunks the post-carve value is really evicted. The record holds the
+    /// value and the claim, so the eviction takes both: an absent value never leaves a
+    /// claim behind that could not re-derive it, and the stage can be established again.
+    #[test]
+    fn the_wg_retention_bound_drops_the_value_and_the_claim_together() {
+        let mut g = Gen::load(4242, crate::name_to_state).expect("datapack");
+        assert!(g.begin_carve(0, 0));
+        let mut tops = Box::new([0i32; 512]);
+        tops[0] = 71;
+        g.set_wg_after_carve(0, 0, tops);
+        g.feat_write(0, 71, 0, 1);
+        assert_eq!(g.wg_after_carve_height(false, 0, 0), Some(71));
+        for i in 1..=4100 {
+            assert!(g.begin_carve(i, 0), "chunk {i} has its own pass");
+            g.set_wg_after_carve(i, 0, Box::new([64i32; 512]));
+        }
+        assert_eq!(
+            g.wg_after_carve_height(false, 0, 0),
+            None,
+            "the 4096 bound must actually evict, not grow"
+        );
+        assert!(
+            g.begin_carve(0, 0),
+            "an evicted value must not leave a claim behind: that claim is what made \
+             the value unrecoverable"
+        );
+        assert_eq!(
+            g.feature_override(0, 71, 0),
+            None,
+            "the record's block output goes with the record, not into a second owner"
+        );
+        // The stage can be re-established from the same inputs, which is the only
+        // contract an evicted value leaves behind.
+        let mut again = Box::new([0i32; 512]);
+        again[0] = 71;
+        g.set_wg_after_carve(0, 0, again);
+        assert_eq!(g.wg_after_carve_height(false, 0, 0), Some(71));
+    }
+
+    /// Claiming, recording, evicting and re-inserting the same chunks must not grow a
+    /// queue, duplicate a slot or let the queue and the map disagree.
+    #[test]
+    fn repeated_stage_updates_keep_one_slot_per_chunk() {
+        let mut g = Gen::load(4242, crate::name_to_state).expect("datapack");
+        for round in 0..600i32 {
+            let (cx, cz) = (round % 7, round % 5);
+            g.begin_carve(cx, cz);
+            g.set_wg_after_carve(cx, cz, Box::new([60 + round % 3; 512]));
+            g.feat_write(cx * 16 + 1, 60, cz * 16 + 1, 1);
+            g.feat_write(1_000_000 + round * 16, 60, 1_000_000, 1);
+            let _ = g.feat_state(1_000_000, 60, 1_000_000, |_, _, _| {});
+            let mut ord = g.feat_ord.clone();
+            ord.sort();
+            assert!(
+                ord.windows(2).all(|w| w[0] != w[1]),
+                "round {round}: duplicate feat_ord slot"
+            );
+            assert_eq!(
+                ord.len(),
+                g.feat_c.len(),
+                "round {round}: feat_ord must list exactly the buckets feat_c holds"
+            );
+            assert!(g.feat_ord.len() <= 384, "round {round}: bucket bound");
+        }
+        // Every subject chunk was written in the last rounds, so all of them are still
+        // resident and keep their claim.
+        let subjects: Vec<(i32, i32)> = (0..7).flat_map(|cx| (0..5).map(move |cz| (cx, cz))).collect();
+        for &(cx, cz) in &subjects {
+            assert!(
+                g.feature_override(cx * 16 + 1, 60, cz * 16 + 1).is_some(),
+                "{cx},{cz}: still resident"
+            );
+            assert!(!g.begin_carve(cx, cz), "a live bucket keeps its claim");
+        }
+        // Now turn every one of them over. A claim may not outlive the bucket it speaks
+        // for: the next generation has to re-run the pass instead of reading the
+        // uncarved terrain.
+        evict_feature_buckets(&mut g, 500);
+        for &(cx, cz) in &subjects {
+            assert_eq!(
+                g.feature_override(cx * 16 + 1, 60, cz * 16 + 1),
+                None,
+                "{cx},{cz}: the bucket turned over"
+            );
+            assert!(g.begin_carve(cx, cz), "a dropped bucket loses its claim");
+        }
+    }
+
+    /// Evicting block output is not a reason to lose runtime work: a staged generation
+    /// payload belongs to the runtime store, not to the cache that is being dropped.
+    #[test]
+    fn evicting_block_output_keeps_the_staged_payload() {
+        let mut g = Gen::load(4242, crate::name_to_state).expect("datapack");
+        let mut items = vec![(
+            (0, 60, 0),
+            crate::generation_payload::GenerationPayload::Sign(std::array::from_fn(|_| String::new())),
+        )];
+        g.stage_payloads((0, 0), &mut items);
+        assert!(items.is_empty(), "the staging call takes the payloads");
+        g.feat_write(0, 60, 0, 1);
+        evict_feature_buckets(&mut g, 400);
+        let taken = g.take_staged_payloads();
+        assert_eq!(
+            taken.len(),
+            1,
+            "dropping evicted blocks must not drop the pending runtime payload"
+        );
+        assert_eq!(taken[0].0, (0, 60, 0));
+        // Recomputing the evicted source must not stage it a second time.
+        let mut again = vec![(
+            (0, 60, 0),
+            crate::generation_payload::GenerationPayload::Sign(std::array::from_fn(|_| String::new())),
+        )];
+        g.stage_payloads((0, 0), &mut again);
+        assert!(again.is_empty(), "a regenerated chunk keeps its payload source");
     }
 }
 
