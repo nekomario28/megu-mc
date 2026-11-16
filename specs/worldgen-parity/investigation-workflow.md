@@ -100,3 +100,31 @@ P0-3の資産/出所監査、独立レビュー、hosted CI、M2/M3は別々の�
 
 生存者バイアス・ポパーの反証主義・パールの因果推論（ステージ介入）・制約理論（TOC）・情報利得（Writer単位のパレート圧縮）・スイスチーズモデル（ポカヨケ）を統合した汎用方法論と、5ステップ高速収束サイクルは [high-speed-convergence.md](../methodology/high-speed-convergence.md) を参照する。
 
+## 8. 報告と検証の契約（2026-11-16 承認）
+
+短い報告は**索引**であり、証拠の置き換えではない。報告だけを読んで「測った」「合格した」と
+扱える状態にしてはならない。1件の変更について、報告は最低限これを載せる。
+
+- base/result SHAと `git status` のdirty状態、対象chunk/window・seed・jarとmappingのhash、
+  実行したbinaryのpath/SHAとbuild profile。再実行していない既存logは、source/inputの同一性を
+  確認できるまで再利用せず、確認できないものは「未拘束」と書く。
+- 最初に分岐したstage/writerと、**実際に実行された経路**（counter・trace・到達した関数）。
+  最終残差の件数を最初の差分の代わりにしない。
+- 設計上の選択、既定値、近似、owner、互換性の変更（例: 未初期化lightを15/0と読む）。
+  観測と推論を同じ文に混ぜず、推論は「仮説」と明記し、必要な次の計測を名指しする。
+- PASS/FAIL/SKIP/NOT RUNと、無効だった試行（OOM、input取り違え、0件選択、stale artifact）。
+  無効試行は削除せず残し、同じ条件のまま再試行しない。
+- 対照: compileするmutantを入れて対象testが実際に落ちたこと、復元後の再緑、
+  pre-change moduleへの再生結果（そこで通るtestは修正を証明しない）。
+- 一次証拠の絶対path（log、`*.bin`、`*.tsv`、run.json、world）とartifactごとのstart/finish・
+  SHA-256。短い報告から一次証拠へ辿れること。
+- 未解決項目と、**受け入れる範囲**。何をどこまで主張しないかを書く。
+
+運用上の帰結:
+
+- 共有logic、永続化、RNG消費、stage境界を変える変更は、canonicalへ入れる前に独立した
+  DeepSeek reviewを通す。実装者自身の承認で閉じない。
+- focused checkの緑から一般的なparity gate・promotion gateを主張しない。
+- 最終的な集約検証は**1つのintegration candidate SHA**に拘束する。
+  実装summaryの寄せ集めは承認にならない。
+- 失敗した証拠は保持する。書き換えるのは記述の誤りだけで、観測値を遡って消さない。

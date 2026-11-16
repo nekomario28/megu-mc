@@ -13,6 +13,14 @@ next lane needs, and the reason each residual is out of reach offline.
 
 Baseline and final numbers are identical, on purpose - see [Regression](#regression).
 
+> **Review status (2026-11-16, independent readiness review).** Accepted: the `CEL_TRACE`
+> instrument and its `cel_layer_ys`/`cel_empty` split, the Nether-shaped contract test that pins the
+> `isSolidRender` reading, the corrected reading of `dla.a(dtc,dcz,jd)` itself, and the retraction of
+> the "column-placement difference inside `BasaltColumnsFeature`" attribution. **Not accepted as
+> measurement**: the light attribution in §1 and the draw-count decomposition in §2 (see the inline
+> notes). This page carries no `.run.json` receipt, and the streams behind its counts are not bound to
+> a source SHA. Detail: [readiness-89ac2124-fc9dfdf-20261116.md](../../review/readiness-89ac2124-fc9dfdf-20261116.md).
+
 ## 1. `MushroomBlock.canSurvive`: the support test is `isSolidRender`, and the residual is not the support test
 
 `dla.a(dtc,dcz,jd)` decompiled from the pinned jar:
@@ -85,9 +93,15 @@ refused, which needs `getRawBrightness >= 13`. The reference's world says why - 
 | the 24 matching cells | | **>= 3** | <= 12 | placed | placed |
 
 Every mismatching cell is at Manhattan distance <= 2 from a fire block and every matching cell is at
->= 3 - the exact partition `15 - d >= 13` predicts. The reference's raw brightness on this pass was
-the **lit** block light, not the uninitialized 0, because the light engine it reads is the running
-server's.
+>= 3 - the partition `15 - d >= 13` predicts. **That is a 4-cell post-hoc fit, not a measured light
+value.** It supports the hypothesis that the reference's raw brightness on this pass was the **lit**
+block light rather than the uninitialized 0, because the light engine it reads is the running
+server's. Three links in that chain are still unmeasured: the value the reference actually returned
+(no `getRawBrightness` hook exists yet - see the last paragraph of this section), whether a
+same-pass `patch_fire` write updates the light engine at all (the fixture shows where fire *ended
+up*, not that a light update ran before the mushroom's read), and whether the support state the
+reference read is the one the saved world carries. Until those are measured, treat the light
+attribution as a **hypothesis**; do not rewrite `canSurvive` or its brightness model on it.
 
 That is not modellable from an offline generator: it needs the light data of the chunk that the
 server happened to have already lit, which depends on generation order and on every nearby light
@@ -129,6 +143,14 @@ two `rim_size` samples only when the blob test passed, which 73 of the 78 did), 
 `156 + 2*156 + 2*73 = 780` port positions and `82 + 2*82 + 2*77 = 800` for the reference: the same
 five layers sampled (400 `nextInt(16)` on both sides), **four of the 200 samples found a layer in the
 reference that the port did not**.
+
+> Review 2026-11-16: that decomposition does not evaluate to the totals it states -
+> `156 + 2*156 + 2*73` is **614**, not 780, and `82 + 2*82 + 2*77` is **400**, not 800. The two totals
+> are consistent with 156 vs 160 accepted positions at 5 draws each, which keeps the layer-walk
+> reading but not the stated arithmetic. The `four of 200` figure also does not fall out of the
+> surviving `CEL_TRACE` log (pass `(-25,22)`: 149 columns, 38 of them stopping at layer 3, layers
+> `0..4` requested - the *port* side of the divergence, not the count). Treat the draw counts as
+> author-reported until the streams are re-derived from a receipt that names its source SHA.
 
 `getY` (`eim.a(eiw,int,int,int,int)`) walks the column itself, so a layer-count difference is a
 *column* difference: the reference's column carries one more "empty cell above a non-empty, non-bedrock
