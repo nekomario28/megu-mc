@@ -174,7 +174,10 @@ disposable fixture に置き、`tests/gate_scripts.py --script … --keep-going`
 | 16:04:04–16:05:09 | `tree::tests::a_clipped_tree_needs_a_min_clipped_height_that_the_clip_reaches` | 1 proved（mutant 2回 FAILED → restored `ok`）|
 | 16:05:14–16:05:31 | `tests/container_wire.py`（`the real chest click dispatch preserves the mouse button`）| 1 proved（baseline/restored `containers wire: PASS`、mutant/rerun `containers wire: FAIL chest-half-pickup`）|
 
-copy の identity は両方 `143ae593…`（3423 files、`config_packets.bin`/`resourcepack.zip` を含む）。
+この2実行の `light-run.log` / `wire-run.log` が印字した copy identity は、両方
+`1e19ba8dea1c86f7408253591fc46a91c387b220167ba759d2df0a6f6acea146`
+（3423 files、`config_packets.bin`/`resourcepack.zip` を含む）。これは実行時の入力の identity であり、
+本記録を更新した後の HEAD 全体の identity ではない。
 wire run のログに `config_packets.bin is missing` は **0 回**。`Client` は chunk の palette を
 biome registry の count で復号するので、baseline の PASS は「copy の blob が server に読まれた」
 ことの producer/consumer 契約でもある。これは **test script の gate ではなく実 server の測定**。
