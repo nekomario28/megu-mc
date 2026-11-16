@@ -8,7 +8,7 @@
 |---|---|---|
 | 現在の作業・できていること・限界 | このページの「状態」 | 正本。数値・条件は各 `evidence/` を参照 |
 | 受け入れ済みの契約 | 各specのREADMEと、そこが指す `evidence/` | 対象fixture・対象stageの範囲だけで有効 |
-| 提案・別ブランチの設計 | 例: [chunk-parallelism](chunk-parallelism/README.md) の設計案 | **現行実装ではない。** root reform の chunk ownership 案もこのツリーには取り込まれていない |
+| 提案・別ブランチの設計 | 例: [chunk-parallelism](chunk-parallelism/README.md) の設計案 | 提案全体を実装済みとは扱わない。[carve stageの所有権・破棄の整合性](chunk-state-lifecycle/README.md)は取り込み済みだが、chunk lifecycle全体の改革は未完 |
 | 歴史的記録 | [close-defects](close-defects/README.md)、[done/](done/)、旧checkpoint | 現在の合格判定に使わない |
 | 次に進む順序 | [ROADMAP](ROADMAP.md) | 順序と出口条件の正本。このページに複製しない |
 
