@@ -60,15 +60,16 @@ def source_identity(root):
 
 
 def run(command, cwd, log):
-    started, status, output = utc_now(), None, ""
+    """stdout and stderr stay separate: Cargo's JSON is stdout, progress is stderr."""
+    started, status, out, err = utc_now(), None, "", ""
     try:
         result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
-        output, status = result.stdout + result.stderr, result.returncode
+        out, err, status = result.stdout, result.stderr, result.returncode
     except OSError as error:
-        status, output = 127, f"{command[0]}: {error}\n"
+        status, err = 127, f"{command[0]}: {error}\n"
     log.append({"command": command, "start": started, "finish": utc_now(),
-                "exit": status, "output": output})
-    return status, output
+                "exit": status, "stdout": out, "stderr": err})
+    return status, out, err
 
 
 def cargo_executable(artifact_text):
@@ -102,11 +103,11 @@ def main(argv=None):
     if source["head"] != args.expect_head:
         fail(f"stale source: HEAD {source['head']} != expected {args.expect_head}")
 
-    artifact_status, artifact_text = run(
+    artifact_status, artifact_text, artifact_err = run(
         [args.cargo, "test", "--offline", "--locked", "-j1", "--bin", "mc-spine",
          "--no-run", "--message-format=json-render-diagnostics"], root, log)
     if artifact_status != 0:
-        fail(f"cargo --no-run exited {artifact_status}")
+        fail(f"cargo --no-run exited {artifact_status}: {artifact_err.strip()[-400:]}")
     binary = None
     try:
         binary = cargo_executable(artifact_text)
@@ -119,7 +120,7 @@ def main(argv=None):
                                                     time.gmtime(binary.stat().st_mtime))}
         if size <= 0:
             fail(f"binary is empty: {binary}")
-        list_status, list_output = run([str(binary), "--list"], root, log)
+        list_status, list_output, _ = run([str(binary), "--list"], root, log)
         receipt["list_exit"] = list_status
         tests = sorted(line.rsplit(": test", 1)[0] for line in list_output.splitlines()
                        if line.endswith(": test"))
@@ -132,8 +133,8 @@ def main(argv=None):
 
     results = []
     for selector in args.filter:
-        status, output = run([str(binary), selector, "--test-threads=1"] if binary
-                             else ["true-signal-no-binary"], root, log)
+        status, output, _ = run([str(binary), selector, "--test-threads=1"] if binary
+                                else ["true-signal-no-binary"], root, log)
         summary = [line for line in output.splitlines() if line.startswith("test result:")]
         parsed = summary[-1] if summary else ""
         results.append({"filter": selector, "exit": status, "summary": parsed})
