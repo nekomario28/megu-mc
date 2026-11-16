@@ -1103,3 +1103,198 @@ fn note_block_keeps_solid_and_light_values_for_every_instrument() {
         }
     }
 }
+
+/// A cheap, comparable view of the process globals a light scene writes: the world overlay's
+/// chunk count, the sky-floor cache, two block cells and the light bytes of the centre chunk.
+/// `marker` is a cell that is air in the generated terrain, so a write there cannot be masked
+/// by terrain that already had the value.
+fn light_scene_fingerprint() -> (usize, usize, u32, u32, Vec<u8>) {
+    // The light read comes first because it is what fills the floors cache; reading the cache
+    // length before it would make the first call and the second disagree over this function's
+    // own side effect instead of over the child's.
+    let light: Vec<u8> = sky_light_sections_world(0, 0)
+        .iter()
+        .map(|sec| sec.iter().fold(0u8, |acc, b| acc ^ b))
+        .collect();
+    let chunks = world().lock().unwrap().len();
+    let floors = sky_floors_cache().lock().unwrap().len();
+    let marker = block_at(1, 250, 1);
+    let tunnel = block_at(4, 7, 2);
+    (chunks, floors, marker, tunnel, light)
+}
+
+/// The sky-light packet is built by `sky_light_sections_world`: per-column floors for the 3x3
+/// window, then `sky_spill` for light that arrives sideways. The behavioural case above measures
+/// the `#[cfg(test)]` helper, which has its own floor rule and no spill, so it cannot see that
+/// assembly (nothing else in the suite calls it — only the two production call sites do). This
+/// case sets a world the assembly has to answer for and asserts the shipped function directly.
+///
+/// The scene is the smallest one where sideways arrival is observable: a 1-block shaft from the
+/// sky to a 1-wide tunnel under closed ground, and a single block across the tunnel. Every
+/// neighbour of the tunnel is the base terrain's opaque solid, so the only path is the shaft.
+///
+/// The expected levels are derived from the current algorithm, not recorded from a run: a column
+/// seeds its own floor+1 cell at 15, the BFS loses `opacity.max(1)` per step (so 1 through air),
+/// and an opaque cell (opacity 15) cannot be entered at all. That derivation is the behavioural
+/// authority here; it is not a parity claim against vanilla, which no capture backs.
+///
+/// The body runs in its own process. The scene writes the world overlay, the sky-floor cache and
+/// everything else `set_block` owns (the state band, the scheduled-tick queue, the chunk
+/// versions). Restoring the overlay and the floors at the end — what this case did when it was
+/// first measured — restores neither the rest of them nor anything at all once an assertion
+/// panics, and it left the fixture for every test that ran afterwards. A child process is the
+/// only guard that also covers the panic: its globals die with it.
+#[test]
+fn sky_light_assembly_lights_through_an_opening_and_stops_at_a_barrier() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _g = world_guard();
+    let Some(reg) = breg() else {
+        panic!("the block registry must load from assets/");
+    };
+    let mut put = |x: i32, y: i32, z: i32, st: u32| {
+        set_block(x, y, z, st);
+    };
+    let (z, y) = (2i32, 7i32);
+    let top = height_at(2, z) - 1;
+    for sy in (y + 1)..=top {
+        put(2, sy, z, 0);
+    }
+    for x in 2..=12 {
+        put(x, y, z, 0);
+    }
+    let stone = name_to_state("stone").expect("stone");
+    put(7, y, z, stone);
+    // The scene means nothing unless the tunnel is enclosed: a solid floor and ceiling are what
+    // make the shaft the only way in.
+    assert!(
+        reg.opacity_of(block_at(4, y - 1, z)) > 0 && reg.opacity_of(block_at(4, y + 1, z)) > 0,
+        "the tunnel needs a solid floor and ceiling, found {} and {}",
+        reg.opacity_of(block_at(4, y - 1, z)),
+        reg.opacity_of(block_at(4, y + 1, z))
+    );
+    let nibble = |secs: &[[u8; 2048]], x: i32| -> u8 {
+        let rel = (y - LIGHT_MIN_Y) as usize;
+        let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
+        let b = secs[rel / 16][(rel & 15) * 128 + lz * 8 + lx / 2];
+        if lx % 2 == 0 {
+            b & 0x0f
+        } else {
+            b >> 4
+        }
+    };
+    let floors = sky_floors(0, 0, &|x, y, z| opacity_windowed(x, y, z));
+    let seed_y = floors[(z as usize) << 4 | 2] + 1;
+    assert!(seed_y > y + 1, "the shaft must reach the sky");
+    // 15 at the seed, one level per step down the shaft and then along the tunnel.
+    let expected: Vec<u8> = (2..=6).map(|x| (15 - (seed_y - y) - (x - 2)) as u8).collect();
+
+    // Open tunnel: the light travels sideways and keeps a gradient rather than a constant.
+    set_block(7, y, z, 0);
+    let open = sky_light_sections_world(0, 0);
+    assert_eq!(
+        (2..=6).map(|x| nibble(&open, x)).collect::<Vec<_>>(),
+        expected,
+        "sideways arrival down an open tunnel"
+    );
+    assert!(
+        (8..=11).all(|x| nibble(&open, x) > 0),
+        "with the tunnel open its far end is lit: {:?}",
+        (8..=11).map(|x| nibble(&open, x)).collect::<Vec<_>>()
+    );
+
+    // One block across the tunnel occludes everything past it, and leaves the lit side alone, so
+    // the zeros are the barrier's doing and not the scene's.
+    set_block(7, y, z, stone);
+    let blocked = sky_light_sections_world(0, 0);
+    assert_eq!(nibble(&blocked, 7), 0, "the barrier cell is opaque");
+    assert!(
+        (8..=11).all(|x| nibble(&blocked, x) == 0),
+        "past the barrier must be dark: {:?}",
+        (8..=11).map(|x| nibble(&blocked, x)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (2..=6).map(|x| nibble(&blocked, x)).collect::<Vec<_>>(),
+        expected,
+        "the barrier must not change the lit side"
+    );
+
+    // The packing contract at one exact byte: x and x+1 share a byte, even x in the low nibble.
+    let rel = (y - LIGHT_MIN_Y) as usize;
+    assert_eq!(
+        blocked[rel / 16][(rel & 15) * 128 + (z as usize) * 8 + 1],
+        expected[0] | (expected[1] << 4),
+        "levels {} and {} share one byte",
+        expected[0],
+        expected[1]
+    );
+
+    // The helper the older assertion measures cannot produce any of it: its floors carry no
+    // spill, and its walk (16 steps from `height_at - 1`) does not stop at the terrain once the
+    // shaft made the column air, which is why it reports the shaft lit and the tunnel dark.
+    let helper = sky_light_sections(0, 0);
+    assert_eq!(
+        (3..=11).map(|x| nibble(&helper, x)).collect::<Vec<_>>(),
+        vec![0u8; 9],
+        "the no-spill helper is dark for the whole tunnel"
+    );
+}
+
+/// The fixture the isolation test below starts. It writes to the shared scene and then panics,
+/// which is the case a save/restore pair around a test body cannot cover. It never runs on its
+/// own: `is_isolated_child` is false whenever libtest starts it directly.
+#[test]
+fn a_panicking_scene_fixture_leaves_nothing_to_restore() {
+    if !crate::test_support::is_isolated_child() {
+        return;
+    }
+    let _g = world_guard();
+    let stone = name_to_state("stone").expect("stone");
+    // The real scene's write, plus a marker cell that is air in the generated terrain so the
+    // parent's fingerprint is sensitive to this process leaking.
+    set_block(4, 7, 2, 0);
+    set_block(1, 250, 1, stone);
+    crate::test_support::child_note(&format!(
+        "marker={} tunnel={} chunks={}",
+        block_at(1, 250, 1),
+        block_at(4, 7, 2),
+        world().lock().unwrap().len()
+    ));
+    panic!("the fixture panicked after writing to the shared scene");
+}
+
+/// The isolation the case above relies on, proved instead of assumed. A fixture that writes to
+/// the shared scene and then panics must leave this process exactly as it was and must not stop
+/// the next test: that is the property the measured draft of the scene test lacked.
+#[test]
+fn a_panicking_scene_fixture_leaves_the_parent_untouched() {
+    let _g = world_guard();
+    let stone = name_to_state("stone").expect("stone");
+    assert_ne!(stone, 0, "stone must have a state id");
+    let before = light_scene_fingerprint();
+    assert_ne!(
+        before.2, stone,
+        "the marker cell must start as air or this fingerprint proves nothing"
+    );
+    let (status, receipt) = crate::test_support::run_failing_child(
+        "registry_tests::a_panicking_scene_fixture_leaves_nothing_to_restore",
+    );
+    assert!(
+        !status.success(),
+        "the fixture must panic in its child, not pass: {status}"
+    );
+    assert!(
+        receipt.contains(&format!("marker={stone}")),
+        "the child's marker write did not land, so nothing was proved: {receipt:?}"
+    );
+    assert!(
+        receipt.contains("tunnel=0"),
+        "the child's tunnel write did not land: {receipt:?}"
+    );
+    assert_eq!(
+        light_scene_fingerprint(),
+        before,
+        "the child's writes and its panic must not be visible in this process"
+    );
+}
