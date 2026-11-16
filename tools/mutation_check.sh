@@ -2576,6 +2576,64 @@ check "underwater magma draws in betweenClosed order (x fastest, then y, then z)
                     for dz in -r..=r {' \
   feature::generation_contract_tests::underwater_magma_binds_its_probability_draws_in_betweenclosed_order
 
+check "a disk walks its radius box in betweenClosed order (z slowest)" \
+  src/feature.rs '            for cz in -rr..=rr {
+                for cx in -rr..=rr {' \
+  '            for cx in -rr..=rr {
+                for cz in -rr..=rr {' \
+  feature::generation_contract_tests::disk_walks_the_radius_box_in_between_closed_order
+
+check "attached_to_leaves draws its probability before the required-empty check" \
+  src/tree.rs '                    if rng.next_f32() >= *prob {
+                        continue;
+                    }
+                    let mut ok = true;
+                    for i in 1..=*req_empty {
+                        let cp = (lp.0 + ox * i, lp.1 + oy * i, lp.2 + oz * i);
+                        if !ctx.is_air(cp.0, cp.1, cp.2) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {' \
+  '                    let mut ok = true;
+                    for i in 1..=*req_empty {
+                        let cp = (lp.0 + ox * i, lp.1 + oy * i, lp.2 + oz * i);
+                        if !ctx.is_air(cp.0, cp.1, cp.2) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok && rng.next_f32() < *prob {' \
+  feature::generation_contract_tests::attached_to_leaves_draws_its_probability_before_the_required_empty_check
+
+check "blue ice runs exactly two hundred attempts" \
+  src/feature.rs '            for _ in 0..200 {
+                let j = rng.next_bound(5) - rng.next_bound(6);' \
+  '            for _ in 0..199 {
+                let j = rng.next_bound(5) - rng.next_bound(6);' \
+  feature::generation_contract_tests::blue_ice_spends_the_native_two_ints_per_attempt_stream
+
+check "the horizontal plane is walked north, east, south, west" \
+  src/tree.rs '    match i {
+        0 => 2, // north
+        1 => 5, // east
+        2 => 3, // south
+        _ => 4, // west
+    }' \
+  '    match i {
+        0 => 3, // south
+        1 => 4, // west
+        2 => 5, // east
+        _ => 2, // north
+    }' \
+  feature::generation_contract_tests::horizontal_plane_order_is_north_east_south_west
+
+check "cocoa binds its draws to the plane order, not the reversed array" \
+  src/tree.rs '                    for f in plane_horizontal() {' \
+  '                    for f in [3u8, 4, 5, 2] {' \
+  feature::generation_contract_tests::cocoa_binds_its_four_probability_draws_to_north_east_south_west
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

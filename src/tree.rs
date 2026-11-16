@@ -90,15 +90,47 @@ fn set_axis(ctx: &mut FC, p: P3, base: u32, axis: &str) -> bool {
     }
 }
 fn rand_horizontal(rng: &mut Xor) -> u8 {
-    // horizontal worldgen order: [south, west, east, north]
-    match rng.next_bound(4) {
-        0 => 3, // south
-        1 => 4, // west
-        2 => 5, // east
-        _ => 2, // north
+    horizontal_dir(rng.next_bound(4))
+}
+/// `Direction.Plane.HORIZONTAL.getRandomDirection(random)` (`ji$c.a(ayw)`):
+///
+/// ```
+/// getstatic ji$c.a ; invokevirtual ji$c.a:(Layw;)Lji;     // getRandomDirection
+///   -> getfield ji$c.c:[Lji;                            // the plane's faces array
+///   -> Util.getRandom(T[], RandomSource) = faces[nextInt(faces.length)]
+///
+/// ji$c.<clinit>
+///   HORIZONTAL faces = [ji.c, ji.f, ji.d, ji.e]
+///   and ji's enum order is a=DOWN b=UP c=NORTH d=SOUTH e=WEST f=EAST
+///   => [NORTH, EAST, SOUTH, WEST]
+/// ```
+///
+/// The same array is what `for (Direction d : Direction.Plane.HORIZONTAL)` walks, so
+/// this order is both the draw binding and the iteration order. It is the *forward*
+/// array; indexing it backwards (south, west, east, north) mirrors the lean direction of
+/// `DarkOakTrunkPlacer`, `ForkingTrunkPlacer`, `BendingTrunkPlacer` and
+/// `UpwardsBranchingTrunkPlacer`, and the branch direction of `CherryTrunkPlacer`.
+/// (`FancyTrunkPlacer` does not touch the plane.)
+pub(crate) fn horizontal_dir(i: i32) -> u8 {
+    match i {
+        0 => 2, // north
+        1 => 5, // east
+        2 => 3, // south
+        _ => 4, // west
     }
 }
-fn hoff(d: u8) -> (i32, i32) {
+
+/// `Direction.Plane.HORIZONTAL`'s faces array in iteration order. Every walk over the plane
+/// takes its order from here, so the array order has one owner.
+fn plane_horizontal() -> [u8; 4] {
+    [
+        horizontal_dir(0),
+        horizontal_dir(1),
+        horizontal_dir(2),
+        horizontal_dir(3),
+    ]
+}
+pub(crate) fn hoff(d: u8) -> (i32, i32) {
     match d {
         2 => (0, -1),
         3 => (0, 1),
@@ -613,8 +645,12 @@ impl TrunkPl {
                         giant: false,
                     });
                 }
-                let dirs = [(0i32, -1i32), (0, 1), (-1, 0), (1, 0)];
-                let bd = dirs[rng.next_bound(4) as usize];
+                // `Plane.HORIZONTAL.getRandomDirection(random)`: `CherryTrunkPlacer` draws
+                // the branch direction once and mirrors it for the second branch.
+                let bd = {
+                    let (ox, oz) = hoff(plane_horizontal()[rng.next_bound(4) as usize]);
+                    (ox, oz)
+                };
                 cherry_branch(
                     ctx,
                     rng,
@@ -1495,7 +1531,14 @@ fn litter_positions<'a>(roots: &'a [P3], logs: &'a [P3]) -> Vec<P3> {
 }
 
 impl Deco {
-    fn run(&self, ctx: &mut FC, rng: &mut Xor, roots: &[P3], logs: &[P3], foliage: &[P3]) {
+    pub(crate) fn run(
+        &self,
+        ctx: &mut FC,
+        rng: &mut Xor,
+        roots: &[P3],
+        logs: &[P3],
+        foliage: &[P3],
+    ) {
         let Some(reg) = breg() else { return };
         match self {
             Deco::TrunkVine => {
@@ -1574,8 +1617,11 @@ impl Deco {
                 }
                 let ty = logs[0].1;
                 for lp in logs.iter().filter(|p| p.1 - ty <= 2) {
-                    for f in [3u8, 4, 5, 2] {
-                        // vanilla iterates horizontal dirs in order
+                    // `for (Direction dir : Direction.Plane.HORIZONTAL)`: NORTH, EAST,
+                    // SOUTH, WEST, one `nextFloat()` per direction. `p = pos.relative(
+                    // dir.getOpposite())` and `FACING = dir` (`ji.g()` is read before the
+                    // offset, so the cocoa sits on the near side of the log).
+                    for f in plane_horizontal() {
                         if rng.next_f32() <= 0.25 {
                             let (ox, oz) = hoff(f);
                             let cp = (lp.0 - ox, lp.1, lp.2 - oz);
@@ -1683,6 +1729,16 @@ impl Deco {
                     let d = dirs[rng.next_bound(dirs.len() as i32) as usize];
                     let (ox, oy, oz) = dir_off(d);
                     let pp = (lp.0 + ox, lp.1 + oy, lp.2 + oz);
+                    if blacklist.contains(&pp) {
+                        continue;
+                    }
+                    // The bytecode's order is exclusion-set test, then `nextFloat()`, then
+                    // `isPosEmpty`. Drawing the float after the empty check skips one draw
+                    // for every leaf whose direction is blocked (`required_empty_blocks`
+                    // greater than zero), which shifts every later decorator's stream.
+                    if rng.next_f32() >= *prob {
+                        continue;
+                    }
                     let mut ok = true;
                     for i in 1..=*req_empty {
                         let cp = (lp.0 + ox * i, lp.1 + oy * i, lp.2 + oz * i);
@@ -1691,7 +1747,7 @@ impl Deco {
                             break;
                         }
                     }
-                    if !blacklist.contains(&pp) && ok && rng.next_f32() < *prob {
+                    if ok {
                         for dx in -excl_xz..=*excl_xz {
                             for dy in -excl_y..=*excl_y {
                                 for dz in -excl_xz..=*excl_xz {
@@ -1961,7 +2017,10 @@ impl RootP {
             w.1 += 1;
         }
         roots.push((trunk_pos.0, trunk_pos.1 - 1, trunk_pos.2));
-        for d in [3u8, 4, 5, 2] {
+        // `for (Direction direction : Direction.Plane.HORIZONTAL)`: NORTH, EAST, SOUTH,
+        // WEST (`ji$c.c` = [ji.c, ji.f, ji.d, ji.e]). `canGrow` draws, so this order is the
+        // draw binding for the root branches.
+        for d in plane_horizontal() {
             let (ox, oz) = hoff(d);
             let start = (trunk_pos.0 + ox, trunk_pos.1, trunk_pos.2 + oz);
             let mut off = vec![];

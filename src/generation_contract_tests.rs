@@ -2,7 +2,7 @@ use super::{freg, gen_cf, Cf, LargeDripstoneCfg};
 use crate::block_registry::{breg, bs_parts};
 use crate::generation_context::FC;
 use crate::generation_math::{mth_cos, mth_next_f32, mth_sin, normal_new_l, Xor};
-use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr, FP, RT};
+use crate::generation_providers::{p_fp, p_hp, p_ip, test_pred, test_rt, Bsp, Pr, FP, IP, RT};
 use crate::json::{jarr, jparse, js, jstr, J};
 use crate::worldgen::Gen;
 
@@ -6965,4 +6965,338 @@ fn face_support_answers_the_support_type_the_caller_asks_for() {
     assert!(reg.is_face_sturdy(cauldron, 1, Support::Rigid));
     let stone = reg.state_of("minecraft:stone", None);
     assert!(reg.is_face_sturdy(stone, 1, Support::Rigid));
+}
+
+/// `DiskFeature` walks its radius box with `BlockPos.betweenClosed`, so x is the
+/// fastest axis and z the slowest: the outer loop is **z**. Each column that passes
+/// `config.target().test` then calls the state provider, which draws, so the order of
+/// the columns *is* the order in which draw values are handed out. The x-outer walk
+/// (`for cx { for cz }`) transposes the assignment: every sand/gravel/clay disk got a
+/// different column's draw.
+#[test]
+fn disk_walks_the_radius_box_in_between_closed_order() {
+    use std::collections::HashMap;
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let dirt = reg.state_of("minecraft:dirt", None);
+    let rr = 2;
+    let origin = (0, 64, 0);
+    // `betweenClosed`: z slowest, x fastest. The circle test is order-independent, so
+    // the cell list differs from the transposed one only in order.
+    let between_closed = || {
+        let mut cells = Vec::new();
+        for cz in -rr..=rr {
+            for cx in -rr..=rr {
+                if cx * cx + cz * cz <= rr * rr {
+                    cells.push((origin.0 + cx, origin.1, origin.2 + cz));
+                }
+            }
+        }
+        cells
+    };
+    let by_dx = || {
+        let mut cells = Vec::new();
+        for cx in -rr..=rr {
+            for cz in -rr..=rr {
+                if cx * cx + cz * cz <= rr * rr {
+                    cells.push((origin.0 + cx, origin.1, origin.2 + cz));
+                }
+            }
+        }
+        cells
+    };
+    assert_ne!(
+        between_closed(),
+        by_dx(),
+        "the fixture must distinguish the two walk orders"
+    );
+
+    let seed = 4242u64;
+    // One weighted draw per placed column: `nextInt(2)` picks stone or dirt.
+    let replay = |cells: &[(i32, i32, i32)]| {
+        let mut r = Xor::seed_worldgen(seed);
+        cells
+            .iter()
+            .map(|p| {
+                if r.next_bound(2) == 0 {
+                    (*p, stone)
+                } else {
+                    (*p, dirt)
+                }
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let expect = replay(&between_closed());
+    assert_ne!(
+        expect,
+        replay(&by_dx()),
+        "the fixture's draw stream must bind differently under the transposed walk"
+    );
+
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    let cf = Cf::Disk {
+        half: 0,
+        radius: IP::Const(rr),
+        bsp: Bsp::Weighted(vec![(1, stone), (1, dirt)]),
+        target: Pr::True,
+    };
+    gen_cf(&cf, freg(), &mut ctx, &mut Xor::seed_worldgen(seed), origin);
+    for p in between_closed() {
+        assert_eq!(
+            expect[&p],
+            ctx.get(p.0, p.1, p.2),
+            "the column at {p:?} must take the draw `betweenClosed` binds to it"
+        );
+    }
+}
+
+/// `AttachedToLeavesDecorator` draws its `probability` float **before** it walks the
+/// `required_empty_blocks` column, so a leaf whose direction is blocked still spends the
+/// float:
+///
+/// ```
+/// 72: set.contains(pp)      ; 86: random.nextFloat() >= probability
+/// 100: this.isPosEmpty(ctx, leaf, dir)
+/// ```
+///
+/// Checking the column first saves one draw per refused leaf, which shifts every later
+/// leaf's (and every later decorator's) stream.
+#[test]
+fn attached_to_leaves_draws_its_probability_before_the_required_empty_check() {
+    let reg = breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let leaf = (0, 70, 0);
+    // `dirs: [2]` is NORTH, so the placement cell is the leaf's north neighbour and
+    // `required_empty_blocks: 1` tests that same cell.
+    let cell = (0, 70, -1);
+    let deco = crate::tree::Deco::AttachedLeaves {
+        bsp: Bsp::Weighted(vec![(1, stone), (1, stone)]),
+        dirs: vec![2],
+        excl_xz: 0,
+        excl_y: 0,
+        // `nextFloat() < 1.0` always holds, so the float is never the reason to refuse.
+        prob: 1.0,
+        req_empty: 1,
+    };
+    let seed = 7u64;
+
+    // Blocked cell: the direction draw and the probability float are both spent.
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    g.feat_write(cell.0, cell.1, cell.2, stone);
+    let mut ctx = context(&mut g);
+    let mut rng = Xor::seed_worldgen(seed);
+    deco.run(&mut ctx, &mut rng, &[], &[], &[leaf]);
+    let mut want = Xor::seed_worldgen(seed);
+    want.next_bound(1); // `Util.getRandom(directions)`, one entry
+    want.next_f32(); // probability
+    assert_eq!(
+        want.state128(),
+        rng.state128(),
+        "the refused leaf must still have spent its probability draw"
+    );
+    let mut short = Xor::seed_worldgen(seed);
+    short.next_bound(1);
+    assert_ne!(
+        short.state128(),
+        rng.state128(),
+        "checking the column before drawing is what this test forbids"
+    );
+    assert_eq!(
+        stone,
+        ctx.get(cell.0, cell.1, cell.2),
+        "no write is allowed"
+    );
+
+    // Free cell: the same three draws plus the provider's.
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    let mut rng = Xor::seed_worldgen(seed);
+    deco.run(&mut ctx, &mut rng, &[], &[], &[leaf]);
+    let mut want = Xor::seed_worldgen(seed);
+    want.next_bound(1);
+    want.next_f32();
+    want.next_bound(2);
+    assert_eq!(
+        want.state128(),
+        rng.state128(),
+        "an accepted leaf spends one provider draw after the float"
+    );
+    assert!(
+        !breg().unwrap().is_air(ctx.get(cell.0, cell.1, cell.2)),
+        "the accepted leaf must place its block at {cell:?}"
+    );
+}
+
+/// `BlueIceFeature` (`ebn`) is 200 attempts of `nextInt(5) - nextInt(6)`, each with
+/// `k = 3 (+ j/2 when j < 2)` and two `nextInt(k)` per horizontal axis - not a fixed
+/// ball around the origin. Its draw shape is the whole algorithm, so the stream is the
+/// gate: the port's previous body consumed `nextInt(6)` per cell of a 7x5x7 cube.
+#[test]
+fn blue_ice_spends_the_native_two_ints_per_attempt_stream() {
+    let reg = breg().unwrap();
+    let water = reg.state_of("minecraft:water", None);
+    let packed = reg.state_of("minecraft:packed_ice", None);
+    let blue = reg.state_of("minecraft:blue_ice", None);
+    let sea = crate::worldgen::sea_level();
+    let origin = (0, sea - 1, 0);
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    // The origin must hold water (or sit on water) and a horizontal neighbour must be
+    // `packed_ice`, or the feature returns before drawing.
+    g.feat_write(origin.0, origin.1, origin.2, water);
+    g.feat_write(origin.0, origin.1, origin.2 - 1, packed);
+    let mut ctx = context(&mut g);
+    let seed = 99u64;
+    let mut rng = Xor::seed_worldgen(seed);
+    gen_cf(
+        &Cf::BlueIce,
+        freg(),
+        &mut ctx,
+        &mut rng,
+        (origin.0, origin.1 + 1, origin.2),
+    );
+    // Wrong height: `pos.getY() > seaLevel - 1` must return before any draw.
+    assert_eq!(
+        Xor::seed_worldgen(seed).state128(),
+        rng.state128(),
+        "a candidate above sea level - 1 must not draw"
+    );
+
+    let mut ctx = context(&mut g);
+    let mut rng = Xor::seed_worldgen(seed);
+    gen_cf(&Cf::BlueIce, freg(), &mut ctx, &mut rng, origin);
+
+    let mut want = Xor::seed_worldgen(seed);
+    for _ in 0..200 {
+        let j = want.next_bound(5) - want.next_bound(6);
+        let mut k = 3;
+        if j < 2 {
+            k += j / 2;
+        }
+        if k < 1 {
+            continue;
+        }
+        // two `nextInt(k)` per horizontal axis: x, then z
+        want.next_bound(k);
+        want.next_bound(k);
+        want.next_bound(k);
+        want.next_bound(k);
+    }
+    assert_eq!(
+        want.state128(),
+        rng.state128(),
+        "200 attempts of nextInt(5), nextInt(6) and two nextInt(k) is the stream"
+    );
+    assert_eq!(
+        blue,
+        ctx.get(origin.0, origin.1, origin.2),
+        "the origin becomes blue_ice once a packed_ice neighbour is found"
+    );
+    // The origin plus at least one attempt is the pinned count for this seed; a changed
+    // bound, `k` rule or attempt count moves it.
+    let mut cells = 0;
+    for dy in -6..=6 {
+        for dx in -8..=8 {
+            for dz in -8..=8 {
+                if ctx.get(origin.0 + dx, origin.1 + dy, origin.2 + dz) == blue {
+                    cells += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 68, "the pinned seed places 68 blue_ice cells");
+}
+
+/// `Direction.Plane.HORIZONTAL`'s faces array is `[ji.c, ji.f, ji.d, ji.e]` and `ji`'s enum
+/// order is `a=DOWN b=UP c=NORTH d=SOUTH e=WEST f=EAST`, so the plane is
+/// **NORTH, EAST, SOUTH, WEST**. Both consumers matter:
+///
+/// * `Plane.getRandomDirection(random)` = `faces[nextInt(4)]` — the lean/branch direction of
+///   every fancy, dark-oak, forking, bending and upwards-branching trunk;
+/// * `for (Direction d : Direction.Plane.HORIZONTAL)` — the cocoa and mangrove-root walks.
+///
+/// Indexing the array backwards (south, west, east, north) keeps every draw count identical
+/// and moves the trees, so the offsets are the contract.
+#[test]
+fn horizontal_plane_order_is_north_east_south_west() {
+    use crate::tree::{hoff, horizontal_dir};
+    // `hoff` returns the (dx, dz) of the direction id, and the ids are
+    // `Direction.get3DDataValue`: DOWN 0, UP 1, NORTH 2, SOUTH 3, WEST 4, EAST 5.
+    let want = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+    for (i, w) in want.iter().enumerate() {
+        assert_eq!(
+            *w,
+            hoff(horizontal_dir(i as i32)),
+            "`Plane.HORIZONTAL` index {i} must be north, east, south, west"
+        );
+    }
+    // The reversed array is what the port used to index; it must not agree with `want`.
+    let reversed = [(0, 1), (-1, 0), (1, 0), (0, -1)];
+    assert_ne!(want, reversed, "the two orders must be distinguishable");
+}
+
+/// `CocoaDecorator` walks `Direction.Plane.HORIZONTAL` with one `nextFloat()` per direction,
+/// so the i-th draw belongs to north, east, south, west — not to the reversed array. The
+/// cocoa lands at `log.relative(dir.getOpposite())` with `FACING = dir`.
+#[test]
+fn cocoa_binds_its_four_probability_draws_to_north_east_south_west() {
+    let reg = breg().unwrap();
+    let log = (0, 70, 0);
+    let seed = 20261116u64;
+    let prob = 1.0f32;
+    // Replay: the decorator's own probability float, then one float per plane direction.
+    let mut want = Xor::seed_worldgen(seed);
+    want.next_f32(); // the `probability` gate
+    let dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]; // north, east, south, west
+    let mut expect = Vec::new();
+    for (dx, dz) in dirs {
+        if want.next_f32() <= 0.25 {
+            // `isAir` passes (a fresh world is air), then `nextInt(3)` for the AGE
+            // property is drawn *before* the next direction's gate.
+            want.next_bound(3);
+            expect.push((log.0 - dx, log.1, log.2 - dz));
+        }
+    }
+    // A seed that places nothing would prove nothing.
+    assert!(
+        !expect.is_empty() && expect.len() < 4,
+        "the fixture must accept a proper subset of the four directions, got {expect:?}"
+    );
+    // The reversed binding must differ, or the test cannot catch the regression.
+    let mut rev = Xor::seed_worldgen(seed);
+    rev.next_f32();
+    let mut expect_rev = Vec::new();
+    for (dx, dz) in [(0, 1), (-1, 0), (1, 0), (0, -1)] {
+        if rev.next_f32() <= 0.25 {
+            rev.next_bound(3);
+            expect_rev.push((log.0 - dx, log.1, log.2 - dz));
+        }
+    }
+    assert_ne!(
+        expect, expect_rev,
+        "the fixture's draw stream must distinguish the two plane orders"
+    );
+
+    let mut g = Gen::load(0, crate::name_to_state).unwrap();
+    let mut ctx = context(&mut g);
+    ctx.test_writes = Some(Vec::new());
+    let mut rng = Xor::seed_worldgen(seed);
+    crate::tree::Deco::Cocoa(prob).run(&mut ctx, &mut rng, &[], &[log], &[]);
+    let writes: Vec<_> = ctx
+        .test_writes
+        .as_ref()
+        .expect("scripted writes")
+        .iter()
+        .map(|(p, _)| *p)
+        .collect();
+    assert_eq!(
+        expect, writes,
+        "the i-th probability draw must belong to the i-th plane direction"
+    );
+    for p in &writes {
+        assert!(
+            !reg.is_air(ctx.get(p.0, p.1, p.2)),
+            "the cocoa at {p:?} must be written"
+        );
+    }
 }

@@ -6687,8 +6687,14 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let top = pos.1 + half;
             let bottom = pos.1 - half - 1;
             let rr = radius.get(rng);
-            for cx in -rr..=rr {
-                for cz in -rr..=rr {
+            // `BlockPos.betweenClosed(pos.offset(-r, 0, -r), pos.offset(r, 0, r))`: x is the
+            // fastest axis and z the slowest, so z is the **outer** loop. The column test
+            // (`config.target().test`) runs before the state provider in `placeColumn`, and
+            // the provider draws, so a column's draws belong to it in this order only - the
+            // x-outer walk bound the wrong draw stream to every column of a sand/gravel/clay
+            // disk.
+            for cz in -rr..=rr {
+                for cx in -rr..=rr {
                     if cx * cx + cz * cz > rr * rr {
                         continue;
                     }
@@ -7495,40 +7501,88 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             }
         }
         Cf::BlueIce => {
+            // `BlueIceFeature` (`ebn.a(ecg)`), read from the pinned 1.21.1 bytecode. The
+            // previous body was a hand-written "drop to the floor and scatter a 7x5x7
+            // ball" sketch; it was not this algorithm and its draws were not this
+            // stream.
+            //
+            //   0: if (origin.getY() > level.getSeaLevel() - 1) return false
+            //   33: if (!get(origin).is(WATER) && !get(origin.below()).is(WATER)) return false
+            //   70: for (Direction d : Direction.values())
+            //   100:   if (d == DOWN) continue
+            //   111:   if (get(origin.relative(d)).is(PACKED_ICE)) { flag = true; break }
+            //   144: if (!flag) return false
+            //   151: setBlock(origin, BLUE_ICE, 2)
+            //   166: for (i = 0; i < 200; ++i) {
+            //   177:   int j = nextInt(5) - nextInt(6)
+            //   197:   int k = 3; if (j < 2) k += j / 2
+            //   215:   if (k < 1) continue
+            //   224:   p = origin.offset(nextInt(k) - nextInt(k), j,
+            //                        nextInt(k) - nextInt(k))
+            //   270:   st = get(p)
+            //   280:   if (st.isAir() || st.is(WATER) || st.is(ICE) || st.is(PACKED_ICE))
+            //   324:     for (Direction d : Direction.values())
+            //   366:       if (get(p.relative(d)).is(BLUE_ICE)) {
+            //   377:         setBlock(p, BLUE_ICE, 2); break }
+            //
+            // `Direction.values()` is DOWN, UP, NORTH, SOUTH, WEST, EAST. Both direction
+            // walks only ask "does any neighbour match", so their order is not a draw;
+            // the 200 draws are, and `nextInt(1)`-shaped draws are not elided here.
             let Some(reg) = breg() else { return };
-            // vanilla: drop to the ocean floor, then scatter blue/packed ice
-            let mut p = pos;
-            if ctx.is_air(p.0, p.1, p.2) {
-                while p.1 > ctx.g.min_y + 1 && ctx.is_air(p.0, p.1, p.2) {
-                    p.1 -= 1;
-                }
-            } else {
-                while p.1 < ctx.g.min_y + ctx.g.height - 1 && !ctx.is_air(p.0, p.1, p.2) {
-                    p.1 += 1;
-                }
-            }
-            if ctx.is_air(p.0, p.1, p.2) {
+            const DIRS: [(i32, i32, i32); 6] = [
+                (0, -1, 0),
+                (0, 1, 0),
+                (0, 0, -1),
+                (0, 0, 1),
+                (-1, 0, 0),
+                (1, 0, 0),
+            ];
+            let sea = crate::worldgen::sea_level();
+            if pos.1 > sea - 1 {
                 return;
             }
-            p.1 -= 1;
-            let ice = reg.state_of("minecraft:blue_ice", None);
+            let water = reg.state_of("minecraft:water", None);
+            if ctx.get(pos.0, pos.1, pos.2) != water && ctx.get(pos.0, pos.1 - 1, pos.2) != water {
+                return;
+            }
             let packed = reg.state_of("minecraft:packed_ice", None);
-            for dx in -3i32..=3 {
-                for dz in -3i32..=3 {
-                    for dy in -2i32..=2 {
-                        let d2 = dx * dx + dz * dz + dy * dy;
-                        if d2 > 8 {
-                            continue;
-                        }
-                        let bp = (p.0 + dx, p.1 + dy, p.2 + dz);
-                        let cur = ctx.get(bp.0, bp.1, bp.2);
-                        let n = reg.name_of(cur);
-                        if n == "minecraft:water"
-                            || n == "minecraft:ice"
-                            || n == "minecraft:packed_ice"
-                        {
-                            let st = if rng.next_bound(6) == 0 { ice } else { packed };
-                            ctx.set(bp.0, bp.1, bp.2, st);
+            let blue = reg.state_of("minecraft:blue_ice", None);
+            let ice = reg.state_of("minecraft:ice", None);
+            let mut supported = false;
+            for &(dx, dy, dz) in &DIRS[1..] {
+                if ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz) == packed {
+                    supported = true;
+                    break;
+                }
+            }
+            if !supported {
+                return;
+            }
+            if !ctx.out_of_h(pos.1) {
+                ctx.set(pos.0, pos.1, pos.2, blue);
+            }
+            for _ in 0..200 {
+                let j = rng.next_bound(5) - rng.next_bound(6);
+                let mut k = 3;
+                if j < 2 {
+                    k += j / 2;
+                }
+                if k < 1 {
+                    continue;
+                }
+                let p = (
+                    pos.0 + rng.next_bound(k) - rng.next_bound(k),
+                    pos.1 + j,
+                    pos.2 + rng.next_bound(k) - rng.next_bound(k),
+                );
+                let cur = ctx.get(p.0, p.1, p.2);
+                if reg.is_air(cur) || cur == water || cur == ice || cur == packed {
+                    for &(dx, dy, dz) in &DIRS {
+                        if ctx.get(p.0 + dx, p.1 + dy, p.2 + dz) == blue {
+                            if !ctx.out_of_h(p.1) {
+                                ctx.set(p.0, p.1, p.2, blue);
+                            }
+                            break;
                         }
                     }
                 }
