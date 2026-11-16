@@ -126,14 +126,31 @@
 
 **隔離の契約.** キャンペーンは測定対象のツリーを書き換えない。`Cargo.toml`/`Cargo.lock`/
 `rust-toolchain.toml`/`src`/`tests`/`tools`/`assets`/`datapacks`/`evidence`（build が
-`include_bytes!` する fixture を含む）を**1キャンペーンに1回だけ**
+`include_bytes!` する fixture を含む）と、**server が cwd から読む** `config_packets.bin`/
+`resourcepack.zip` を**1キャンペーンに1回だけ**
 `${XDG_CACHE_HOME:-$HOME/.cache}/mc-spine/mutation-runs/run.XXXXXXXX` へコピーし、
 `CARGO_TARGET_DIR` もその中に置いて、そこで実行し、終了時に削除する。置き場所だけ
 `MUTATION_SNAPSHOT_PARENT` で変えられる（`/tmp` が小さい tmpfs のホスト用。冷えた private
-target が 853 MiB なので 1.5 GiB 未満では起動しない）。コピーの前後で入力の sha256 manifest を取り、
-**コピーが source と一致しない**とき／**コピー中に source が動いた**ときは測らずに exit 2
-（2つの revision を混ぜない）。`MUTATION_RELEASE=1`/`CARGO_BUILD_JOBS`/`MUTATION_FILTER`
-（0件一致は失敗）/`MUTATION_LOG_DIR`（mutant と restored の assertion を残す）は従来どおり。
+target が 853 MiB なので 1.5 GiB 未満では起動しない）。
+
+`config_packets.bin` は build の入力ではないので 2026-11-16 まで入力集合から漏れていた。
+wire helper の `local_server` はこれを server の cwd に symlink し、`src/main.rs::
+load_config_packets` がそこから読む。無い copy では server の registry が空になり、wire gate は
+このツリーとは**別の入力**を測る（実測: 旧 script の copy では `wire config: MISSING`）。
+
+コピーと manifest は**同じ選択 owner**（`selection()`）を読む。`__pycache__`/`*.pyc`/
+`*.mutation-backup`/`*/target/*`/`*/.git/*` の除外はコピーにも manifest にも同じ1回だけ適用され、
+選択に含まれる symlink は**コピーせず exit 2**（link 越しに mutant を書けば、その先の実体は
+こちらのものではない）。`MUTATION_SNAPSHOT_PARENT` と snapshot 自身は物理 path に解決してから
+検査する（symlink alias で source の中に作らせない）。
+
+コピーの前後で入力の sha256 manifest を取り、**列挙・hash・コピーのどれかが失敗したら**、また
+**コピーが source と一致しない**とき／**コピー中に source が動いた**ときは、測らずに exit 2
+（2つの revision を混ぜない。空や部分的な manifest を「一致」と読まない）。`cd` も
+`CARGO_TARGET_DIR` もこの1プロセス内で snapshot に向ける。`MUTATION_SNAPSHOT_ROOT` は旧2プロセス
+モードの内部マーカーであって入口ではない（継承されたら何も作らず exit 2）。
+`MUTATION_RELEASE=1`/`CARGO_BUILD_JOBS`/`MUTATION_FILTER`（0件一致は失敗）/`MUTATION_LOG_DIR`
+（mutant と restored の assertion を残す）は従来どおり。
 
 以前は `src/*.rs` をその場で書き換えていた。実測で1 entry あたり 0.621 秒 mutant が作業ツリーに
 存在し、SIGKILL で mutant と `.mutation-backup` が残った（`audit/test-causality-tc-20261116/

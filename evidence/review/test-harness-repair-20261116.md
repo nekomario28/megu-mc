@@ -120,3 +120,73 @@ stability の5 case（fails twice / green / compile / crash / zero-selected）�
 cargo のピーク RSS は 2.2 GB、cold private target は 853 MiB。`-j 2`、直列、release との二重ビルド無し。
 private evidence は 82 MiB copy + 853 MiB target を1 campaign ごとに作って消す
 （`MUTATION_SNAPSHOT_PARENT` で置き場所だけ変更可）。
+
+## 追補（2026-11-16 15:53–16:00）— 親レビューの4 blocker を閉じる
+
+上の本文は `e928750` 時点の測定記録で、**そのまま残す**。ここから先は親レビューが
+source で指摘した4点（R1–R4）に対する追加の修理と、その測定。対象は `e928750` の上、
+worktree は `t3-042df13c-…`、durable 側は
+`/home/yuu/mc-spine-local/audit/snapshot-boundary-repair-20261116T155346/`。
+
+### 何が欠けていたか（レビューの主張を source で確認した）
+
+| # | 欠けていた契約 | source |
+|---|---|---|
+| R1 | 入力集合に **server が cwd から読むファイル**が無い。`config_packets.bin` が無い copy では wire gate が別の入力（registry 空）を測る | `tests/protocol767.py::local_server` が `ROOT/config_packets.bin` を server の cwd に symlink、`src/main.rs::load_config_packets`（14947）がそれを読む。`resourcepack.zip` は `load_pack_info`（14129）|
+| R2 | `MUTATION_SNAPSHOT_ROOT` が**入口**になっていた。`MUTATION_SNAPSHOT_ROOT=$PWD` で snapshot を作らず live tree を測る | 旧 script 66 行の `if [ -z "${MUTATION_SNAPSHOT_ROOT:-}" ]` と 128 行の自己再入 |
+| R3 | コピーと manifest が**別のポリシー**。除外は manifest だけ、コピーは `tar` でディレクトリ丸ごと。symlink はコピーされ manifest から抜ける | 旧 `input_manifest`（`find -type f` + 除外）と旧 copy（`tar -cf - "${present[@]}"`）。親の source 比較で `MUTATION_SNAPSHOT_PARENT` の symlink alias も未検査 |
+| R4 | manifest の**終了 status を見ていない**。hash が失敗しても空/部分 manifest を「一致」として campaign が走る | 旧 `manifest_before=$(input_manifest …)`（status 未検査）、`set -uo pipefail` に `-e` 無し |
+
+### 修理（1 owner ずつ）
+
+- `selection()` が入力の**唯一の選択 owner**。`<kind>\t<path>` を出し、copy（`tar -T`）と manifest
+  （`sha256sum`）が同じリストを読む。除外は1回だけ適用。`link` は**コピーせず exit 2**。
+- snapshot は**同じ shell 内で1回**。`physical_path()` で `MUTATION_SNAPSHOT_PARENT` と snapshot を
+  物理解決してから source 内かを判定（作る前に拒否）。`cd` と `CARGO_TARGET_DIR` はこのプロセス内。
+- `MUTATION_SNAPSHOT_ROOT` は継承されたら**何もせず exit 2**。
+- `manifest()` は列挙・hash の失敗をそのまま返し、呼び手が全部 status を検査。空 manifest・
+  選択数と hash 数の不一致も exit 2。`RUNTIME_INPUTS`（`config_packets.bin`/`resourcepack.zip`）は
+  存在・byte 一致を名前と sha で別途 assert し、copy の sha を起動時に印字する。
+
+### 旧 → 新（同じ gate を旧 script に当てた negative control）
+
+旧 producer = `e928750:tools/mutation_check.sh`（sha256 `5b54f383…`）を read-only で
+disposable fixture に置き、`tests/gate_scripts.py --script … --keep-going` を実行（exit 1）。
+新 producer（最終 bytes sha256 `da2f3b56…`）は同じ 31 case が全 PASS（exit 0）。
+
+| # | 旧 producer の実測 | 新 producer |
+|---|---|---|
+| R1 | copy に config が無く、wire backend が `wire config: MISSING` を **36 回**、wire baseline control 失敗 | copy に `config_packets.bin`（sha `9fb93288…`）と `resourcepack.zip`（`b4b26472…`）が入り、sha 一致を assert |
+| R2 | `MUTATION_SNAPSHOT_ROOT=<source>` でも campaign が走る（**exit 1**、cargo 到達） | 何も作らず **exit 2**、cargo 未到達 |
+| R3 | `MUTATION_SNAPSHOT_PARENT=alias`（物理的に source 内）で `alias/run.uo9eGMTC` を作って走る。copy に `tools/target/cached.bin` が入る | 物理解決して **exit 2**、source 内にディレクトリを作らない。除外は copy にも適用。symlink 入力は exit 2 |
+| R4 | sha256sum が「完全な manifest を出して exit 1」でも「何も出さず exit 1」でも campaign が走る（後者は `identity  (7 inputs: …)` の**空 identity** 行） | どちらも **exit 2**、cargo 未到達、理由を明示 |
+
+新規 6 case（`copied wire config is the source's bytes` / `an inherited snapshot root is refused` /
+`snapshot parent symlinked into the source is refused` / `a symlink in the inputs is refused` /
+`a failed hash status is not a matching copy` / `an empty failed manifest is not a matching copy`）は
+旧 producer で 6/6 FAIL、新 producer で 6/6 PASS。既存 25 case（sigkill を含む）は新 producer で
+全 PASS のまま（gate case は 25 → 31、`evidence` の既存記録は 25 のまま）。
+
+### 実測（この repair の copy 経由、`MUTATION_STABILITY=1`、`-j 2`、`MemoryMax=4G`）
+
+| run | entry | 結果 |
+|---|---|---|
+| 16:04:04–16:05:09 | `tree::tests::a_clipped_tree_needs_a_min_clipped_height_that_the_clip_reaches` | 1 proved（mutant 2回 FAILED → restored `ok`）|
+| 16:05:14–16:05:31 | `tests/container_wire.py`（`the real chest click dispatch preserves the mouse button`）| 1 proved（baseline/restored `containers wire: PASS`、mutant/rerun `containers wire: FAIL chest-half-pickup`）|
+
+copy の identity は両方 `143ae593…`（3423 files、`config_packets.bin`/`resourcepack.zip` を含む）。
+wire run のログに `config_packets.bin is missing` は **0 回**。`Client` は chunk の palette を
+biome registry の count で復号するので、baseline の PASS は「copy の blob が server に読まれた」
+ことの producer/consumer 契約でもある。これは **test script の gate ではなく実 server の測定**。
+
+### 動かしていない検証
+
+| 検証 | 結果 |
+|---|---|
+| 全 424 entry campaign | **NOT RUN**（変更は harness のみ。entry 領域は旧と byte 同一 sha `a02e99ef…`）|
+| 全 Rust suite 再実行 | **NOT RUN**（`src` tree object `3bc44b62…` が `e928750` と同一。既存 receipt 544/0/1 の scope は不変）|
+| release / native / adapter の broad 反復 | **NOT RUN**（この修理は harness と gate のみ）|
+| `tests/verify.sh` 全体 | **NOT RUN** |
+
+`src` を触っていないこと（`git diff e928750 -- src` 空、tree object 一致）が、既存の suite 結果を
+この変更に流用してよい根拠であって、「新しい suite を測った」ことの代わりにはならない。
