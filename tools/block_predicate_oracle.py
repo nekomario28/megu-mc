@@ -13,21 +13,21 @@ SUPPORT = ROOT / "assets/multiface_support_1211.bin"
 COLLISION_FULL = ROOT / "assets/collision_shape_full_1211.bin"
 
 
-def encode(rows, blocks):
-    native = {}
-    for row in rows.splitlines():
-        text, value, support, collision_full = row.split("\t")
-        match = re.fullmatch(r"Block\{minecraft:(.*?)\}(?:\[(.*)\])?", text)
-        if (match is None or not value.isdigit() or not 0 <= int(value) < 256
-                or not support.isdigit() or not 0 <= int(support) < 64
-                or collision_full not in ("0", "1")):
-            raise ValueError("invalid native state: " + row)
-        name, props = match.groups()
-        key = (name, tuple(sorted(tuple(p.split("=")) for p in props.split(","))) if props else ())
-        if key in native:
-            raise ValueError("duplicate native state: " + text)
-        native[key] = (int(value), int(support), int(collision_full))
-    wire = {}
+def native_key(text):
+    """`Block{minecraft:oak_slab}[type=bottom,waterlogged=false]` -> (name, sorted properties)."""
+    match = re.fullmatch(r"Block\{minecraft:(.*?)\}(?:\[(.*)\])?", text)
+    if match is None:
+        raise ValueError("unparsable native state: " + text)
+    name, props = match.groups()
+    return (name, tuple(sorted(tuple(p.split("=")) for p in props.split(","))) if props else ())
+
+
+def wire_states(blocks):
+    """(state id, native key) for every protocol state id, in id order.
+
+    State ids are a mixed-radix product per block, but each asset may order or extend the
+    property values differently. Translate names and values, never numeric state ids.
+    """
     for block in blocks:
         for state in range(block["minStateId"], block["maxStateId"] + 1):
             offset = state - block["minStateId"]
@@ -36,10 +36,26 @@ def encode(rows, blocks):
                 values = prop.get("values") or ["true", "false"]
                 props.append((prop["name"], str(values[offset % len(values)])))
                 offset //= len(values)
-            key = (block["name"], tuple(sorted(props)))
-            if state in wire:
-                raise ValueError("duplicate wire id")
-            wire[state] = native.pop(key)  # missing names/properties fail, never substitute false
+            yield state, (block["name"], tuple(sorted(props)))
+
+
+def encode(rows, blocks):
+    native = {}
+    for row in rows.splitlines():
+        text, value, support, collision_full = row.split("\t")
+        if (not value.isdigit() or not 0 <= int(value) < 256
+                or not support.isdigit() or not 0 <= int(support) < 64
+                or collision_full not in ("0", "1")):
+            raise ValueError("invalid native state: " + row)
+        key = native_key(text)
+        if key in native:
+            raise ValueError("duplicate native state: " + text)
+        native[key] = (int(value), int(support), int(collision_full))
+    wire = {}
+    for state, key in wire_states(blocks):
+        if state in wire:
+            raise ValueError("duplicate wire id")
+        wire[state] = native.pop(key)  # missing names/properties fail, never substitute false
     if native or not wire or set(wire) != set(range(len(wire))):
         raise ValueError("native/wire state sets differ or contain gaps")
     return tuple(bytes(wire[i][column] for i in range(len(wire))) for column in range(3))

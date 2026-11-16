@@ -17,7 +17,7 @@
 // (`tools/bytecode_probe.sh`) and is pinned by
 // `tests/data/template_structures_1211.tsv` (71 native oracle vectors).
 
-use crate::block_registry::{breg, HeightmapKind};
+use crate::block_registry::{breg, HeightmapKind, Support};
 use crate::generation_math::{hash_block_pos, Lcg, Xor};
 use crate::structure_transform::{Mirror, Rotation};
 use std::rc::Rc;
@@ -1417,10 +1417,11 @@ fn is_exception_for_connection(reg: &BReg, state: u32) -> bool {
         || reg.in_tag(state, "minecraft:shulker_boxes")
 }
 
-/// `BlockStateBase.isFaceSturdy` for the plain FULL support type: the
-/// neighbour must cover that whole side (`side_flags` in the pinned asset).
+/// `BlockStateBase.isFaceSturdy` for the plain FULL support type: the neighbour must cover
+/// that whole side. Reads the pinned 1.21.1 fact table (`Support::Full`); the `side_flags`
+/// this used to read agreed with it on all 26,684 states, and now has one owner.
 fn is_face_sturdy(reg: &BReg, state: u32, direction: u8) -> bool {
-    reg.side_solid(state, direction as usize)
+    reg.is_face_sturdy(state, direction, Support::Full)
 }
 
 /// `FenceBlock.connectsTo`: a sturdy neighbour, the same fence family, or a

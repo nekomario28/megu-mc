@@ -511,10 +511,43 @@ check "broken sign text cannot survive its block" \
             .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
   '        signs().lock().unwrap().retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
+# The note block's per-state solidity and light now come from the pinned fact table, so this
+# mutation moves to the column it reads. The pumpkin `state_flags` load it used to break is
+# covered by the metadata-offset entries above.
 check "solid metadata must reach every note block state" \
-  src/block_registry.rs '                    reg.st_fl[st] = flags;' \
-  '                    reg.st_fl[st] = 0;' \
+  src/block_registry.rs '        state_fact(st)[0] & FACT_BLOCKS_MOTION != 0' \
+  '        state_fact(st)[0] & FACT_IS_AIR != 0' \
   note_block_keeps_solid_and_light_values_for_every_instrument
+
+check "the pinned facts separate the predicates vanilla separates" \
+  src/block_registry.rs '        state_fact(st)[0] & FACT_IS_AIR != 0' \
+  '        st == 0' \
+  state_facts_answer_the_predicates_vanilla_separates
+
+check "an empty collision shape is not a full one" \
+  src/block_registry.rs '        state_fact(st)[0] & FACT_COLLISION_EMPTY != 0' \
+  '        state_fact(st)[0] & FACT_COLLISION_FULL != 0' \
+  state_facts_answer_the_predicates_vanilla_separates
+
+check "a fluid state is not a liquid block" \
+  src/block_registry.rs '        state_fact(st)[0] & FACT_FLUID_EMPTY == 0' \
+  '        state_fact(st)[0] & FACT_LIQUID != 0' \
+  state_facts_answer_the_predicates_vanilla_separates
+
+check "the light columns are emission then block, not one shifted" \
+  src/block_registry.rs '        state_fact(st)[1] >> 4' \
+  '        state_fact(st)[1] & 0xf' \
+  state_facts_answer_the_predicates_vanilla_separates
+
+check "the face planes are indexed by support type, not by direction" \
+  src/block_registry.rs '        (faces >> (support as usize * 6)) & 0x3f & (1 << direction) != 0' \
+  '        (faces >> direction) & 0x3f & (1 << direction) != 0' \
+  face_support_answers_the_support_type_the_caller_asks_for
+
+check "a fact record is five bytes, one per state" \
+  src/block_registry.rs '    let at = st as usize * STATE_FACT_BYTES;' \
+  '    let at = st as usize;' \
+  pinned_fact_tables_agree_with_the_older_oracle_assets
 
 check "property remapping cannot reuse positional state offsets" \
   src/block_registry.rs '                let o = off as i64 + (nd as i64 - digit as i64) * mult as i64;' \
@@ -2386,8 +2419,8 @@ check "bonus chest reads the no-leaves heightmap" \
   feature::generation_contract_tests::bonus_chest_skips_a_collision_shape_and_accepts_a_plant
 
 check "bonus chest's cell test is an empty collision shape, not a missing one" \
-  src/feature.rs 'if !(reg.is_air(cur) || reg.collision_boxes(cur).next().is_none()) {' \
-  'if !(reg.is_air(cur) || reg.collision_boxes(cur).next().is_some()) {' \
+  src/feature.rs 'if !(reg.is_air(cur) || reg.is_collision_empty(cur)) {' \
+  'if !reg.is_air(cur) {' \
   feature::generation_contract_tests::bonus_chest_skips_a_collision_shape_and_accepts_a_plant
 
 check "bonus chest reads the support cell below each torch, not two below" \

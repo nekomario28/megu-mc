@@ -3411,7 +3411,7 @@ fn spc_vein_can_spread(
         let (ox, oy, oz) = dir_off(dir ^ 1);
         let side = (pos.0 + ox, pos.1 + oy, pos.2 + oz);
         let side_st = ctx.get(side.0, side.1, side.2);
-        if face_sturdy(reg, side_st, dir) {
+        if face_sturdy(reg, side_st, dir, Support::Full) {
             return false;
         }
     }
@@ -3576,13 +3576,17 @@ fn spc_decay_delay(kind: SpcKind, delay: i32) -> i32 {
     }
 }
 
-/// `BlockState.isFaceSturdy(level, pos, dir)` (the default `SupportType.FULL`), from the
-/// asset's own per-state side flags. Full cubes are exact; a partial shape would need the
-/// collision shape, which is the separate `SupportType.CENTER` question the callers that
-/// ask with `canSupportCenter` would need. Shared by the sculk cursor, the block pile's
+/// `BlockState.isFaceSturdy(level, pos, dir, supportType)`, from the pinned 1.21.1 table.
+/// `Support::Full` is vanilla's three-argument overload; `Support::Center` is the
+/// `canSupportCenter` question a torch or a plant asks.
+///
+/// The body used to be `is_solid(st) && side_solid(st, dir)`, which added a `blocksMotion`
+/// gate vanilla does not have: measured against the pinned table that denied the support under
+/// a repeater (64 states), scaffolding (32), a comparator (16), a snow layer (13), a ladder (8)
+/// and every carpet (1 each) on the DOWN face alone. Shared by the sculk cursor, the block pile's
 /// `tryPlaceBlock` and the bonus chest's torches, so it carries no single feature's name.
-fn face_sturdy(reg: &BReg, st: u32, dir: u8) -> bool {
-    reg.is_solid(st) && reg.side_solid(st, dir as usize)
+fn face_sturdy(reg: &BReg, st: u32, dir: u8, support: Support) -> bool {
+    reg.is_face_sturdy(st, dir, support)
 }
 
 /// The 18 face/edge neighbours, in `BlockPos.betweenClosed(-1,-1,-1, 1,1,1)` order with the
@@ -3655,7 +3659,7 @@ fn spc_cursor_can_spread(
         let (ox, oy, oz) = dir_off(dir);
         let p = (from.0 + ox, from.1 + oy, from.2 + oz);
         let st = ctx.get(p.0, p.1, p.2);
-        !face_sturdy(reg, st, dir ^ 1)
+        !face_sturdy(reg, st, dir ^ 1, Support::Full)
     };
     if dx == 0 {
         open(axis_dir(dy, 0, 1)) || open(axis_dir(dz, 2, 3))
@@ -3697,7 +3701,7 @@ fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
     for d in 0..6u8 {
         let (dx, dy, dz) = dir_off(d);
         let nb = ctx.get(pos.0 + dx, pos.1 + dy, pos.2 + dz);
-        if face_sturdy(reg, nb, d ^ 1) {
+        if face_sturdy(reg, nb, d ^ 1, Support::Full) {
             return true;
         }
     }
@@ -3746,7 +3750,7 @@ fn gen_sculk_patch(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &SculkP
         );
         if reg.is_air(ctx.get(p.0, p.1, p.2)) {
             let below = ctx.get(p.0, p.1 - 1, p.2);
-            if face_sturdy(reg, below, 1) {
+            if face_sturdy(reg, below, 1, Support::Full) {
                 let st = reg.with_prop(
                     reg.state_of("minecraft:sculk_shrieker", None),
                     "can_summon",
@@ -4272,7 +4276,7 @@ fn gen_bonus_chest(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
                 return;
             }
             let cur = ctx.get(x, y, z);
-            if !(reg.is_air(cur) || reg.collision_boxes(cur).next().is_none()) {
+            if !(reg.is_air(cur) || reg.is_collision_empty(cur)) {
                 continue;
             }
             ctx.set(x, y, z, chest);
@@ -4285,7 +4289,10 @@ fn gen_bonus_chest(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
             );
             for (dx, dz) in SIDES {
                 let below = ctx.get(x + dx, y - 1, z + dz);
-                if face_sturdy(reg, below, 1) {
+                // `canSupportCenter(level, pos.below(), UP)` is `SupportType.CENTER`, not FULL:
+                // a fence post or a wall under the torch supports it while covering no whole
+                // face, and the two planes differ on 9,940 states for UP alone.
+                if face_sturdy(reg, below, 1, Support::Center) {
                     ctx.set(x + dx, y, z + dz, torch);
                 }
             }
@@ -7317,7 +7324,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             rng.next_bool()
                         } else {
                             // `BlockStateBase.isFaceSturdy(level, below, Direction.UP)`
-                            face_sturdy(reg, below, 1)
+                            face_sturdy(reg, below, 1, Support::Full)
                         };
                         if may_place_on {
                             let st = bsp.get(ctx, rng, x, y, z);

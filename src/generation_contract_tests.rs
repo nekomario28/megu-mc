@@ -937,6 +937,12 @@ fn huge_brown_mushroom_matches_native_cells_and_height() {
     let mycelium = reg.state_of("minecraft:mycelium", None);
     let stone = reg.state_of("minecraft:stone", None);
     let leaves = reg.state_of("minecraft:oak_leaves", None);
+    // The extended piston: its shape is the head and the base, so it occludes as a cube without
+    // being a solid render. The default (retracted) piston is a plain full cube.
+    let piston = reg.state_of(
+        "minecraft:piston",
+        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
+    );
     let cf = super::p_cf(
         &jparse(
             br#"{"type":"minecraft:huge_brown_mushroom","config":{"cap_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:brown_mushroom_block","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"true","west":"true"}}},"foliage_radius":3,"stem_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:mushroom_stem","Properties":{"down":"false","east":"true","north":"true","south":"true","up":"true","west":"true"}}}}}"#,
@@ -1012,6 +1018,12 @@ fn huge_red_mushroom_matches_native_cells_and_layers() {
     let mycelium = reg.state_of("minecraft:mycelium", None);
     let stone = reg.state_of("minecraft:stone", None);
     let leaves = reg.state_of("minecraft:oak_leaves", None);
+    // The extended piston: its shape is the head and the base, so it occludes as a cube without
+    // being a solid render. The default (retracted) piston is a plain full cube.
+    let piston = reg.state_of(
+        "minecraft:piston",
+        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
+    );
     // the pinned pack's own red config: foliage_radius 2, and a stem whose `up` is false
     let cf = super::p_cf(
         &jparse(
@@ -3364,6 +3376,12 @@ fn multiface_cells_and_following_rng_match_native() {
     let water = reg.state_of("minecraft:water", None);
     let flowing = reg.with_prop(water, "level", "8");
     let leaves = reg.state_of("minecraft:oak_leaves", None);
+    // The extended piston: its shape is the head and the base, so it occludes as a cube without
+    // being a solid render. The default (retracted) piston is a plain full cube.
+    let piston = reg.state_of(
+        "minecraft:piston",
+        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
+    );
     let slab = reg.state_of("minecraft:oak_slab", None);
     let lichen = reg.state_of("minecraft:glow_lichen", None);
     let mut seen = std::collections::HashSet::new();
@@ -6103,6 +6121,12 @@ fn bonus_chest_places_chest_loot_seed_and_supported_torches() {
 fn bonus_chest_skips_a_collision_shape_and_accepts_a_plant() {
     let reg = breg().unwrap();
     let leaves = reg.state_of("minecraft:oak_leaves", None);
+    // The extended piston: its shape is the head and the base, so it occludes as a cube without
+    // being a solid render. The default (retracted) piston is a plain full cube.
+    let piston = reg.state_of(
+        "minecraft:piston",
+        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
+    );
     let grass = reg.state_of("minecraft:short_grass", None);
     let chest = reg.state_of("minecraft:chest", None);
     // A seed whose first two walked cells are not adjacent: the torch pass reads the four
@@ -6675,6 +6699,12 @@ fn live_heightmap_types_differ_on_leaves() {
     let reg = breg().unwrap();
     let stone = reg.state_of("minecraft:stone", None);
     let leaves = reg.state_of("minecraft:oak_leaves", None);
+    // The extended piston: its shape is the head and the base, so it occludes as a cube without
+    // being a solid render. The default (retracted) piston is a plain full cube.
+    let piston = reg.state_of(
+        "minecraft:piston",
+        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
+    );
     let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
     let (x, z) = (4, 4);
     let base = g.top_ws(x, z).max(g.top_oc(x, z)) + 2;
@@ -6706,4 +6736,205 @@ fn live_heightmap_types_differ_on_leaves() {
     // A removal lowers the live map: native `Heightmap.update` rescans the column.
     ctx.set(x, base + 1, z, 0);
     assert_eq!(ctx.hm_ws(x, z), base + 1, "removal lowers WORLD_SURFACE");
+}
+
+// ---- pinned per-state facts --------------------------------------------------------------
+//
+// `assets/block_state_facts_1211.bin` records ten `BlockBehaviour.BlockStateBase` answers for all
+// 26,684 states, exported by `tools/block_state_facts_from_jar.py` from the pinned server jar.
+// Before it, the physical predicates were composed from two other assets: the same values, as it
+// turns out, but the *questions* were being re-derived at each call site (`is_solid && side_solid`
+// for a face, "has a collision list" for a collision shape), and that is where they drifted.
+//
+// These tests are the audit that keeps the composition honest: the table's own answers against
+// named states vanilla is known by, the table against the older single-column assets, and the
+// exact states each old composition got wrong.
+
+/// The three older assets record the same native calls the fact table now owns. They are read
+/// here and nowhere else, so a shifted state id or a swapped plane in either exporter shows up
+/// as a disagreement instead of as two plausible tables.
+#[test]
+fn pinned_fact_tables_agree_with_the_older_oracle_assets() {
+    let reg = breg().expect("registry");
+    let states = reg.state_count();
+    let facts = include_bytes!("../assets/block_state_facts_1211.bin");
+    assert_eq!(facts.len(), states * 5, "one five-byte record per state");
+    let predicates = include_bytes!("../assets/block_predicates_1211.bin");
+    let collision_full = include_bytes!("../assets/collision_shape_full_1211.bin");
+    let mineshaft = include_bytes!("../assets/mineshaft_support_1211.bin");
+    let mut disagreements = Vec::new();
+    for st in 0..states as u32 {
+        let i = st as usize;
+        if reg.is_solid_render(st) != (predicates[i] & 1 != 0) {
+            disagreements.push(format!("solid render {st}"));
+        }
+        if reg.is_collision_shape_full_block(st) != (collision_full[i] != 0) {
+            disagreements.push(format!("collision full {st}"));
+        }
+        // The mineshaft asset packs FULL faces in the low six bits and CENTER(down) in bit 6.
+        for face in 0..6u8 {
+            if reg.mineshaft_sturdy_face(st, face) != (mineshaft[i] & (1 << face) != 0) {
+                disagreements.push(format!("FULL face {face} {st}"));
+            }
+        }
+        if reg.is_face_sturdy(st, 0, crate::block_registry::Support::Center)
+            != (mineshaft[i] & 64 != 0)
+        {
+            disagreements.push(format!("CENTER down {st}"));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "the pinned tables disagree on {} answers, first: {:?}",
+        disagreements.len(),
+        &disagreements[..disagreements.len().min(8)]
+    );
+}
+
+/// The states that separate the ten predicates from one another. Every assertion here is a
+/// vanilla fact read from the jar, and each one moves if two bit constants are swapped.
+#[test]
+fn state_facts_answer_the_predicates_vanilla_separates() {
+    use crate::block_registry::Support;
+    let reg = breg().expect("registry");
+    let air = reg.state_of("minecraft:air", None);
+    let cave_air = reg.state_of("minecraft:cave_air", None);
+    let stone = reg.state_of("minecraft:stone", None);
+    let water = reg.state_of("minecraft:water", None);
+    let glass = reg.state_of("minecraft:glass", None);
+    let leaves = reg.state_of("minecraft:oak_leaves", None);
+    // The extended piston: its shape is the head and the base, so it occludes as a cube without
+    // being a solid render. The default (retracted) piston is a plain full cube.
+    let piston = reg.state_of(
+        "minecraft:piston",
+        Some(&jparse(br#"{"extended":"true"}"#).expect("props")),
+    );
+    let glowstone = reg.state_of("minecraft:glowstone", None);
+    let dirt_path = reg.state_of("minecraft:dirt_path", None);
+    let grass = reg.state_of("minecraft:short_grass", None);
+    let torch = reg.state_of("minecraft:torch", None);
+    let propagule = reg.state_of(
+        "minecraft:mangrove_propagule",
+        Some(&jparse(br#"{"waterlogged":"true"}"#).expect("props")),
+    );
+    let chest = reg.state_of("minecraft:chest", None);
+    let fence = reg.state_of("minecraft:oak_fence", None);
+
+    // isAir is three states, not "id zero or the pumpkin flag": cave air is a distinct id.
+    assert!(reg.is_air(air) && reg.is_air(cave_air) && !reg.is_air(stone));
+    assert!(reg.is_air(reg.state_of("minecraft:void_air", None)));
+
+    // blocksMotion, liquid() and "carries a fluid state" are three different questions.
+    assert!(!reg.blocks_motion(water) && reg.is_liquid_block(water) && reg.is_liquid(water));
+    assert!(reg.blocks_motion(stone) && !reg.is_liquid_block(stone) && !reg.is_liquid(stone));
+    // A waterlogged plant holds water without being a liquid block. The registry keeps the
+    // fluid-state meaning under `is_liquid`, which is what the generation call sites ask.
+    assert!(!reg.is_liquid_block(propagule) && reg.is_liquid(propagule));
+
+    // canOcclude is not isSolidRender. Every solid render is an occluder, but 14,747 states
+    // occlude as a full cube without being one: a piston and a dirt path have a full occlusion
+    // shape over a collision shape that is not a cube, and glass and leaves are neither.
+    assert!(reg.can_occlude(piston) && !reg.is_solid_render(piston));
+    assert!(reg.can_occlude(dirt_path) && !reg.is_solid_render(dirt_path));
+    assert!(reg.can_occlude(stone) && reg.is_solid_render(stone));
+    assert!(!reg.can_occlude(glass) && !reg.is_solid_render(glass));
+    assert!(!reg.can_occlude(leaves) && !reg.is_solid_render(leaves));
+
+    // The collision shape is not the outline: a plant and a torch are drawn and collide with
+    // nothing, and a dirt path collides without covering a face.
+    assert!(reg.is_collision_empty(grass) && reg.is_collision_empty(torch));
+    assert!(!reg.is_collision_empty(stone) && !reg.is_collision_empty(dirt_path));
+    assert!(reg.is_collision_shape_full_block(stone) && !reg.is_collision_shape_full_block(dirt_path));
+    // The registry's collision list and the native collision shape agree on 26,683 of the 26,684
+    // states. The exception is a pitcher crop's upper half at age 0, where the asset lists no box
+    // and vanilla does collide - so the fact table is the exact owner of the predicate.
+    let pitcher_upper = reg.state_of(
+        "minecraft:pitcher_crop",
+        Some(&jparse(br#"{"half":"upper","age":"0"}"#).expect("props")),
+    );
+    assert!(!reg.is_collision_empty(pitcher_upper));
+    assert!(reg.collision_boxes(pitcher_upper).next().is_none());
+    assert!(reg.is_collision_empty(grass) && reg.collision_boxes(grass).next().is_none());
+
+    // Light: emission 15 on glowstone, 0 on stone; block 15 through stone, 0 through glass.
+    assert_eq!(reg.luminance_of(glowstone), 15);
+    assert_eq!(reg.luminance_of(stone), 0);
+    assert_eq!(reg.opacity_of(stone), 15);
+    assert_eq!(reg.opacity_of(glass), 0);
+    // A dirt path occludes as a cube but damps no light: `canOcclude` and `getLightBlock` are
+    // separate columns for exactly this state.
+    assert!(reg.can_occlude(dirt_path) && reg.opacity_of(dirt_path) == 0);
+
+    // Face support: a stone supports every face at FULL; a fence post supports the centre of
+    // every face but covers no whole face - which is why `canSupportCenter` is a separate
+    // question and why a torch may stand on it.
+    let arms_props = jparse(br#"{"north":"true","south":"true","east":"true","west":"true"}"#)
+        .expect("props");
+    let fence_arms = reg.state_of("minecraft:oak_fence", Some(&arms_props));
+    for dir in 0..6u8 {
+        assert!(reg.is_face_sturdy(stone, dir, Support::Full));
+        assert!(!reg.is_face_sturdy(fence, dir, Support::Full));
+        // The default fence state is the isolated post: its centre answer is vertical only, and
+        // the state with four arms covers the centre of every face. Same block, different id.
+        assert_eq!(
+            reg.is_face_sturdy(fence, dir, Support::Center),
+            dir < 2,
+            "isolated fence post centre, direction {dir}"
+        );
+        assert!(reg.is_face_sturdy(fence_arms, dir, Support::Center));
+    }
+    // The extended piston covers exactly the one face its head points at while its centre answer
+    // covers five, and a chest supports the centre of its down face and nothing else.
+    assert_eq!(reg.face_plane(piston, Support::Full).count_ones(), 1);
+    assert!(reg.face_plane(piston, Support::Center).count_ones() > 1);
+    assert!(reg.is_face_sturdy(chest, 0, Support::Center));
+    assert!(!reg.is_face_sturdy(chest, 1, Support::Center));
+}
+
+/// The states the old `is_solid(st) && side_solid(st, dir)` composition denied, and the states a
+/// FULL-only answer denies to a caller that asked `canSupportCenter`. Both lists are measured.
+#[test]
+fn face_support_answers_the_support_type_the_caller_asks_for() {
+    use crate::block_registry::Support;
+    let reg = breg().expect("registry");
+    // A repeater, a comparator, a snow layer and a carpet cover their whole down face and do not
+    // block motion, so the old `is_solid && side_solid` gate answered "no support" on the very
+    // face their shape covers. The ladder covers one whole side (its facing) instead of the down
+    // face, and the gate denied that one too.
+    for name in [
+        "minecraft:repeater",
+        "minecraft:comparator",
+        "minecraft:snow",
+        "minecraft:white_carpet",
+    ] {
+        let st = reg.state_of(name, None);
+        assert!(!reg.blocks_motion(st), "{name} blocks motion after all");
+        assert_eq!(
+            reg.face_plane(st, Support::Full),
+            1,
+            "{name} covers its down face"
+        );
+    }
+    let ladder = reg.state_of("minecraft:ladder", None);
+    assert!(!reg.blocks_motion(ladder));
+    assert_eq!(
+        reg.face_plane(ladder, Support::Full).count_ones(),
+        1,
+        "a ladder covers exactly the face it hangs on"
+    );
+    // The FULL plane and the CENTER plane disagree in both directions, which is why the support
+    // type is an argument rather than a re-derivation at the call site.
+    let fence = reg.state_of("minecraft:oak_fence", None);
+    assert!(!reg.is_face_sturdy(fence, 1, Support::Full));
+    assert!(reg.is_face_sturdy(fence, 1, Support::Center));
+    let slab = reg.state_of("minecraft:oak_slab", None);
+    assert!(reg.is_face_sturdy(slab, 0, Support::Full));
+    assert!(!reg.is_face_sturdy(slab, 1, Support::Full));
+    // RIGID equals FULL for every state except the six container shapes, whose open top face
+    // answers RIGID without covering a full face.
+    let cauldron = reg.state_of("minecraft:cauldron", None);
+    assert!(!reg.is_face_sturdy(cauldron, 1, Support::Full));
+    assert!(reg.is_face_sturdy(cauldron, 1, Support::Rigid));
+    let stone = reg.state_of("minecraft:stone", None);
+    assert!(reg.is_face_sturdy(stone, 1, Support::Rigid));
 }
