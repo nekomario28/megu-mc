@@ -2,6 +2,7 @@
 // handshake -> status | login -> config (vanilla blob replay) -> play
 // (join_game + 9x9 chunks + teleport + health) -> consume loop with
 // creative block dig/place backed by a shared overlay world.
+use crate::block_registry::breg;
 use crate::json::{jparse, J};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -4058,12 +4059,23 @@ static HOPPERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = On
 fn hoppers() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
     HOPPERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
+/// Where the synthetic per-player ender-chest key starts: far outside the world, so
+/// `ContainerKey::Block` can carry it like any container without colliding with a
+/// real block position.
+const ENDER_KEY_X: i32 = 20_000_000;
+const ENDER_KEY_Y: i32 = 310;
 fn ender_key(uuid: &[u8; 16]) -> (i32, i32, i32) {
     (
-        20000000 + (u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]) & 0xfffff) as i32,
-        310,
+        ENDER_KEY_X + (u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]) & 0xfffff) as i32,
+        ENDER_KEY_Y,
         (u32::from_be_bytes([uuid[4], uuid[5], uuid[6], uuid[7]]) & 0xfffff) as i32,
     )
+}
+/// Is this the synthetic ender-chest key rather than a world block? The key has to be
+/// distinguishable, because "the world still holds this container" is false for it by
+/// construction: there is no block entity behind an ender chest's per-player storage.
+fn is_ender_key(pos: (i32, i32, i32)) -> bool {
+    pos.0 >= ENDER_KEY_X && pos.1 == ENDER_KEY_Y
 }
 // ---------- fake players (carpet-actor equivalent for parity fixtures) ----------
 struct Actor {
@@ -6071,9 +6083,14 @@ fn default_mob_hp(id: &str) -> f32 {
 fn chests() -> &'static LockedMap<ContainerKey, HashMap<i16, Stack>> {
     CHESTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// Is the container a menu was opened on still there? A block container is gone the
+/// moment the world block it was built on is gone: vanilla's chunk stops holding the
+/// block entity, so there is nothing left for a click to reach.
 fn container_exists(key: ContainerKey) -> bool {
     match key {
-        ContainerKey::Block(_) => true,
+        ContainerKey::Block(pos) => {
+            is_ender_key(pos) || container_kind(block_at(pos.0, pos.1, pos.2)).is_some()
+        }
         ContainerKey::Cart(uuid) => generated_content()
             .lock()
             .unwrap()
@@ -6081,6 +6098,135 @@ fn container_exists(key: ContainerKey) -> bool {
             .iter()
             .any(|c| c.uuid().ok() == Some(uuid)),
     }
+}
+
+// ---------- container openers and lid sync (ContainerOpenersCounter, 1.21.1) ----------
+//
+// `dqu` (ContainerOpenersCounter) keeps one `openCount` per block entity and calls
+// `openerCountChanged(level, pos, state, previous, count)` on *every* change; `dqo`
+// (ChestBlockEntity) implements that as `level.blockEvent(pos, block, 1, count)`, i.e.
+// one `ClientboundBlockEventPacket(id=1, param=count)` per half. Each half of a double
+// chest has its own counter (the combined `Container.startOpen` reaches both), so both
+// halves emit. The client lerps the lid from that packet (`getOpenNess`), and a double
+// chest renders `max(left, right)` (`dhb$3`).
+//
+// The port derives the count from the live windows instead of storing it. A stored count
+// would be a second copy of "who has this open" that has to be kept true on open, close,
+// disconnect, break and reload; vanilla's own counter is per block entity and deliberately
+// not serialised, so nothing about it belongs in the save.
+
+/// `ContainerOpenersCounter.getOpenerCount` for one half: how many clients in
+/// `audience` hold a menu built on it. A paired window contains both halves, so both
+/// halves see the same viewers - which is what `CompoundContainer.startOpen` does.
+fn half_openers(audience: &[Arc<Client>], pos: BlockPos) -> u32 {
+    let key = ContainerKey::Block(pos);
+    audience
+        .iter()
+        .filter(|c| {
+            c.open_chest
+                .lock()
+                .map(|open| open.is_some_and(|(a, b)| a == key || b == Some(key)))
+                .unwrap_or(false)
+        })
+        .count() as u32
+}
+
+/// The opener count of every half before a window change, so the change can be
+/// diffed rather than assumed.
+fn chest_opener_snapshot(audience: &[Arc<Client>], halves: &[BlockPos]) -> Vec<(BlockPos, u32)> {
+    halves
+        .iter()
+        .map(|&pos| (pos, half_openers(audience, pos)))
+        .collect()
+}
+
+/// `ContainerOpenersCounter.openerCountChanged`: one block event, carrying the new
+/// count, for each half whose count actually moved.
+fn sync_chest_openers(audience: &[Arc<Client>], before: &[(BlockPos, u32)]) {
+    for &(pos, previous) in before {
+        let now = half_openers(audience, pos);
+        if now != previous {
+            // vanilla writes the count with `writeByte`: the wire field is a byte.
+            broadcast_block_event(audience, pos, 1, now as u8);
+        }
+    }
+}
+
+/// 1.21.1 play clientbound 0x08 `ClientboundBlockEventPacket`: BlockPos, unsigned
+/// byte action id, unsigned byte action param, VarInt **block** id. Verified against
+/// the jar: `agh.a` registers `agg.a` (bundle, 0x00) then `agg.c..agg.j` in order, and
+/// `agg.j` is `acc` = `ClientboundBlockEventPacket`, the ninth entry = 0x08; the
+/// neighbouring entries land where the port's other ids do (0x07 block entity data,
+/// 0x09 block update, 0x12 close container as `agg.t`).
+fn broadcast_block_event(audience: &[Arc<Client>], pos: BlockPos, action: u8, param: u8) {
+    let Some(block) = breg().and_then(|reg| reg.block_id_of(block_at(pos.0, pos.1, pos.2))) else {
+        return;
+    };
+    let mut body = Vec::with_capacity(12);
+    write_pos(&mut body, pos.0, pos.1, pos.2);
+    body.push(action);
+    body.push(param);
+    write_varint(&mut body, i64::from(block));
+    // vanilla `Level.blockEvent` reaches every player within 64 blocks of the cell.
+    fanout_in(
+        audience,
+        |c| {
+            let at = *c.pos.lock().unwrap();
+            let (dx, dy, dz) = (
+                at.0 - f64::from(pos.0),
+                at.1 - f64::from(pos.1),
+                at.2 - f64::from(pos.2),
+            );
+            dx * dx + dy * dy + dz * dz <= 64.0 * 64.0
+        },
+        |_| (0x08, body.clone()),
+    );
+}
+
+/// Is the menu a client opened still backed by the world? A block window needs its
+/// block container (`container_exists`), and a paired one additionally needs both
+/// halves to still name each other: the pair *is* block state, so a broken half, a
+/// `/setblock` or a re-pairing invalidates the window.
+fn window_live(open: (ContainerKey, Option<ContainerKey>)) -> bool {
+    let (first, second) = open;
+    if !container_exists(first) || second.is_some_and(|key| !container_exists(key)) {
+        return false;
+    }
+    let (ContainerKey::Block(right), Some(ContainerKey::Block(left))) = (first, second) else {
+        return true;
+    };
+    chest_pair(right.0, right.1, right.2) == Some((right, left))
+}
+
+/// The world no longer holds the container behind `key`: every menu built on it dies
+/// (`ClientboundContainerClosePacket` on windowId 1, the only id `open_chest_window`
+/// allocates) and the opener counts of `halves` drop. Returns how many windows closed.
+fn invalidate_container_windows(
+    audience: &[Arc<Client>],
+    key: ContainerKey,
+    halves: &[BlockPos],
+) -> usize {
+    let before = chest_opener_snapshot(audience, halves);
+    let mut closed = 0;
+    for c in audience {
+        let had = {
+            let mut open = c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+            if open.is_some_and(|(a, b)| a == key || b == Some(key)) {
+                *open = None;
+                true
+            } else {
+                false
+            }
+        };
+        if had {
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, vec![1u8]);
+            }
+            closed += 1;
+        }
+    }
+    sync_chest_openers(audience, &before);
+    closed
 }
 fn roll_cart_loot(seed: i64) -> HashMap<i16, Stack> {
     let mut out = HashMap::new();
@@ -6894,17 +7040,346 @@ fn container_kind(st: u32) -> Option<&'static str> {
     }
     None
 }
-fn is_chest_pairable(st: u32) -> bool {
-    (2954..=2977).contains(&st) || (9119..=9142).contains(&st)
+// ---------- chest world state (ChestBlock / ChestBlockEntity, 1.21.1) ----------
+//
+// A chest is not "a container at a position": its block state says whether this cell
+// is the `left` or `right` half of a pair and which way it faces, and that state is
+// the only definition of its partner. None of the functions below infer a pair from
+// raw adjacency, because adjacency cannot tell a real pair from two chests that
+// happen to touch.
+//
+// Read from `javap -p -c` on server-1.21.1.jar (mappings from /var/tmp/mcm/server.txt):
+//   dhb.g(dtc)      state TYPE -> DoubleBlockCombiner.BlockType: single->SINGLE,
+//                   right->FIRST, left->SECOND (`dif$a.a/b/c`)
+//   dif.a(..)       own FIRST keeps own BE first, own SECOND puts the neighbour
+//                   first: `CompoundContainer(first, second)`
+//   bqj.a(int)      slot < first.size ? first.a(slot) : second.a(slot - first.size)
+// so the combined container is slots 0..=26 = the RIGHT half and 27..=53 = the LEFT,
+// whichever half the player clicked.
+
+/// The horizontal half of vanilla's `Direction`, in 2D data-value order
+/// (`Direction.from2DDataValue`: south, west, north, east). Chest pairing only asks
+/// horizontal questions, and this order is what `getClockWise()` means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HFace {
+    South,
+    West,
+    North,
+    East,
 }
-fn chest_partner(x: i32, y: i32, z: i32) -> Option<(i32, i32, i32)> {
-    if !is_chest_pairable(block_at(x, y, z)) {
+
+impl HFace {
+    /// `Direction.fromYaw` = `Mth.floor(yaw / 90 + 0.5) & 3`; the port's yaw is in
+    /// degrees with 0 = south, which is the convention `getRotation()` uses.
+    fn from_yaw(yaw: f32) -> HFace {
+        match ((yaw / 90.0 + 0.5).floor() as i64) & 3 {
+            0 => HFace::South,
+            1 => HFace::West,
+            2 => HFace::North,
+            _ => HFace::East,
+        }
+    }
+    /// `Direction.from3DDataValue` for the four horizontal values (DOWN 0, UP 1,
+    /// NORTH 2, SOUTH 3, WEST 4, EAST 5).
+    fn from_face(face: u8) -> Option<HFace> {
+        match face {
+            2 => Some(HFace::North),
+            3 => Some(HFace::South),
+            4 => Some(HFace::West),
+            5 => Some(HFace::East),
+            _ => None,
+        }
+    }
+    fn opposite(self) -> HFace {
+        match self {
+            HFace::South => HFace::North,
+            HFace::West => HFace::East,
+            HFace::North => HFace::South,
+            HFace::East => HFace::West,
+        }
+    }
+    /// `Direction.getClockWise()`: north->east, east->south, south->west, west->north.
+    fn clock_wise(self) -> HFace {
+        match self {
+            HFace::North => HFace::East,
+            HFace::East => HFace::South,
+            HFace::South => HFace::West,
+            HFace::West => HFace::North,
+        }
+    }
+    /// `Direction.getCounterClockWise()`: north->west, west->south, south->east,
+    /// east->north.
+    fn counter_clock_wise(self) -> HFace {
+        match self {
+            HFace::North => HFace::West,
+            HFace::West => HFace::South,
+            HFace::South => HFace::East,
+            HFace::East => HFace::North,
+        }
+    }
+    /// `Direction.getAxis()`: west/east are the x axis, north/south the z axis.
+    fn axis(self) -> u8 {
+        match self {
+            HFace::West | HFace::East => 0,
+            HFace::North | HFace::South => 1,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            HFace::South => "south",
+            HFace::West => "west",
+            HFace::North => "north",
+            HFace::East => "east",
+        }
+    }
+    fn parse(name: &str) -> Option<HFace> {
+        match name {
+            "south" => Some(HFace::South),
+            "west" => Some(HFace::West),
+            "north" => Some(HFace::North),
+            "east" => Some(HFace::East),
+            _ => None,
+        }
+    }
+    /// `BlockPos.relative(self)` in x/z.
+    fn step(self) -> (i32, i32) {
+        match self {
+            HFace::South => (0, 1),
+            HFace::West => (-1, 0),
+            HFace::North => (0, -1),
+            HFace::East => (1, 0),
+        }
+    }
+}
+
+/// The chest block this state belongs to. `chest` and `trapped_chest` are different
+/// `Block` instances in vanilla, and `BlockState.is(this)` in `candidatePartnerFacing`
+/// compares instances, so the two kinds never pair.
+fn chest_kind(st: u32) -> Option<&'static str> {
+    match breg()?.name_of(st) {
+        "minecraft:chest" => Some("minecraft:chest"),
+        "minecraft:trapped_chest" => Some("minecraft:trapped_chest"),
+        _ => None,
+    }
+}
+fn chest_named(st: u32) -> bool {
+    chest_kind(st).is_some()
+}
+fn chest_facing(st: u32) -> Option<HFace> {
+    HFace::parse(&breg()?.get_prop(st, "facing")?)
+}
+/// `ChestType`: `single`, `left`, `right` (dtu field order a/b/c).
+fn chest_type(st: u32) -> Option<&'static str> {
+    match breg()?.get_prop(st, "type")?.as_str() {
+        "single" => Some("single"),
+        "left" => Some("left"),
+        "right" => Some("right"),
+        _ => None,
+    }
+}
+/// `ChestBlock.getConnectedDirection`: the cell this half is connected to. A `single`
+/// chest points at nothing, which is why it cannot be half of a pair.
+fn chest_connected_direction(st: u32) -> Option<HFace> {
+    let facing = chest_facing(st)?;
+    match chest_type(st)? {
+        "left" => Some(facing.clock_wise()),
+        "right" => Some(facing.counter_clock_wise()),
+        _ => None,
+    }
+}
+/// The pair the half at `pos` belongs to, ordered the way `DoubleBlockCombiner`
+/// orders it: `(right, left)`. `None` for a `single` state, for two chests that merely
+/// touch, for the two kinds mixed, and for a half whose partner does not point back.
+fn chest_pair(x: i32, y: i32, z: i32) -> Option<(BlockPos, BlockPos)> {
+    chest_pair_of(block_at(x, y, z), (x, y, z))
+}
+fn chest_pair_of(st: u32, pos: BlockPos) -> Option<(BlockPos, BlockPos)> {
+    let facing = chest_facing(st)?;
+    let own = chest_type(st)?;
+    let dir = chest_connected_direction(st)?;
+    let (dx, dz) = dir.step();
+    let other = (pos.0 + dx, pos.1, pos.2 + dz);
+    let ost = block_at(other.0, other.1, other.2);
+    // `BlockState.is(this)`: a trapped chest beside a chest is a different block.
+    if breg()?.name_of(ost) != breg()?.name_of(st) {
         return None;
     }
-    [(x - 1, y, z), (x + 1, y, z), (x, y, z - 1), (x, y, z + 1)]
+    if chest_facing(ost)? != facing {
+        return None;
+    }
+    // The partner must point back: with equal facings that is exactly "opposite TYPE".
+    if chest_connected_direction(ost)? != dir.opposite() {
+        return None;
+    }
+    match own {
+        "right" => Some((pos, other)),
+        _ => Some((other, pos)),
+    }
+}
+/// The other half, or `None` when this chest is `single`.
+fn chest_partner(x: i32, y: i32, z: i32) -> Option<BlockPos> {
+    chest_pair(x, y, z).map(|(right, left)| if (x, y, z) == right { left } else { right })
+}
+/// The halves the crate at `pos` occupied while it still had state `st`: both halves
+/// of its pair, or just the cell when it was `single`. Read from the *old* state, so a
+/// removal can still tell which counters to drop. Empty for a non-chest.
+fn chest_halves_of(st: u32, pos: BlockPos) -> Vec<BlockPos> {
+    if !chest_named(st) {
+        return Vec::new();
+    }
+    match chest_pair_of(st, pos) {
+        Some((right, left)) => vec![right, left],
+        None => vec![pos],
+    }
+}
+/// The window a container at `pos` opens, in `DoubleBlockCombiner` order: the first key
+/// owns slots 0..=26. A barrel, a shulker box or a `single` chest is its own window.
+fn chest_window(x: i32, y: i32, z: i32) -> (ContainerKey, Option<ContainerKey>) {
+    match chest_pair(x, y, z) {
+        Some((right, left)) => (ContainerKey::Block(right), Some(ContainerKey::Block(left))),
+        None => (ContainerKey::Block((x, y, z)), None),
+    }
+}
+/// Which cells a window's opener counters live on. The synthetic ender-chest key has
+/// no block entity, so it has no lid and no counter (vanilla's is a per-player
+/// inventory, not a `ChestBlockEntity`).
+fn chest_window_halves(open: (ContainerKey, Option<ContainerKey>)) -> Vec<BlockPos> {
+    let mut out: Vec<BlockPos> = Vec::new();
+    for key in [Some(open.0), open.1].into_iter().flatten() {
+        if let ContainerKey::Block(pos) = key {
+            if !is_ender_key(pos) && !out.contains(&pos) {
+                out.push(pos);
+            }
+        }
+    }
+    out
+}
+/// `ChestBlock.candidatePartnerFacing`: the facing of the chest at `pos` if a new one
+/// could pair with it. `is(this)` plus `TYPE == SINGLE` is the whole gate, so an
+/// already-paired half is never a candidate.
+fn chest_candidate_partner_facing(pos: BlockPos, name: &str) -> Option<HFace> {
+    let st = block_at(pos.0, pos.1, pos.2);
+    if breg()?.name_of(st) != name {
+        return None;
+    }
+    if chest_type(st)? != "single" {
+        return None;
+    }
+    chest_facing(st)
+}
+/// `ChestBlock.getStateForPlacement`: facing from the player (opposite of the way they
+/// look), `type` from the neighbour this placement may pair with, `waterlogged` from
+/// the fluid state of the cell being replaced.
+fn chest_placement_state(
+    name: &str,
+    pos: BlockPos,
+    yaw: f32,
+    sneaking: bool,
+    face: u8,
+) -> u32 {
+    let Some(reg) = breg() else { return 0 };
+    let mut facing = HFace::from_yaw(yaw).opposite();
+    let mut kind = "single";
+    // Sneaking against a horizontal face claims that side: only the clicked block may
+    // become the partner, and only when its facing is on the other axis.
+    if sneaking {
+        if let Some(clicked) = HFace::from_face(face) {
+            let back = clicked.opposite();
+            let (bx, bz) = back.step();
+            let behind = (pos.0 + bx, pos.1, pos.2 + bz);
+            if let Some(candidate) = chest_candidate_partner_facing(behind, name) {
+                if candidate.axis() != clicked.axis() {
+                    facing = candidate;
+                    kind = if candidate.counter_clock_wise() == back {
+                        "right"
+                    } else {
+                        "left"
+                    };
+                }
+            }
+        }
+    }
+    // Otherwise the pair axis is perpendicular to facing: clockwise is LEFT, then
+    // counter-clockwise is RIGHT (vanilla checks them in that order, first match wins).
+    if kind == "single" && !sneaking {
+        let (cx, cz) = facing.clock_wise().step();
+        let clockwise = (pos.0 + cx, pos.1, pos.2 + cz);
+        if chest_candidate_partner_facing(clockwise, name) == Some(facing) {
+            kind = "left";
+        } else {
+            let (cx, cz) = facing.counter_clock_wise().step();
+            let counter = (pos.0 + cx, pos.1, pos.2 + cz);
+            if chest_candidate_partner_facing(counter, name) == Some(facing) {
+                kind = "right";
+            }
+        }
+    }
+    let waterlogged = reg.fluid_name(block_at(pos.0, pos.1, pos.2)) == "minecraft:water";
+    let st = reg.state_of(name, None);
+    let st = reg.with_prop(st, "facing", facing.name());
+    let st = reg.with_prop(st, "type", kind);
+    reg.with_prop(st, "waterlogged", if waterlogged { "true" } else { "false" })
+}
+/// `ChestBlock.updateShape`: the state this chest should take now that its neighbour in
+/// direction `dir` changed. The `else` is vanilla's and is load-bearing: when the
+/// neighbour *is* the same chest block only the pairing branch may change us, so a half
+/// left facing a chest that no longer points back keeps its stale `left`/`right` rather
+/// than unpairing.
+fn chest_shape_after(own: u32, own_pos: BlockPos, dir: HFace) -> Option<u32> {
+    let reg = breg()?;
+    let (dx, dz) = dir.step();
+    let nst = block_at(own_pos.0 + dx, own_pos.1, own_pos.2 + dz);
+    if reg.name_of(nst) == reg.name_of(own) {
+        let own_type = chest_type(own)?;
+        let ntype = chest_type(nst)?;
+        if own_type == "single"
+            && ntype != "single"
+            && chest_facing(own)? == chest_facing(nst)?
+            && chest_connected_direction(nst)? == dir.opposite()
+        {
+            let opposite = if ntype == "left" { "right" } else { "left" };
+            return Some(reg.with_prop(own, "type", opposite));
+        }
+        return None;
+    }
+    if chest_connected_direction(own)? == dir {
+        return Some(reg.with_prop(own, "type", "single"));
+    }
+    None
+}
+/// `Block.updateNeighbourShapes` for chests: after a write, each chest beside the cell
+/// re-derives its own state. The written cell is deliberately not repaired - vanilla
+/// only ever calls a block's own `updateShape` from its neighbours, so a `/setblock`ed
+/// ghost half stays a ghost half in both implementations.
+fn repair_chest_neighbours(pos: BlockPos) {
+    for dir in [HFace::South, HFace::West, HFace::North, HFace::East] {
+        let (dx, dz) = dir.step();
+        let np = (pos.0 + dx, pos.1, pos.2 + dz);
+        let own = block_at(np.0, np.1, np.2);
+        if !chest_named(own) {
+            continue;
+        }
+        // `dir` from the neighbour's own point of view is the direction it looks back.
+        if let Some(next) = chest_shape_after(own, np, dir.opposite()) {
+            if next != own {
+                set_block(np.0, np.1, np.2, next);
+                note_block_update(np.0, np.1, np.2, next);
+            }
+        }
+    }
+}
+/// Does a write at `pos` have to repair chest pairing? True when the cell itself is (or
+/// was) a chest, or when a horizontal neighbour is one.
+fn chest_touches(pos: BlockPos, before: u32, after: u32) -> bool {
+    if chest_named(before) || chest_named(after) {
+        return true;
+    }
+    [HFace::South, HFace::West, HFace::North, HFace::East]
         .iter()
-        .copied()
-        .find(|&(nx, ny, nz)| is_chest_pairable(block_at(nx, ny, nz)))
+        .any(|dir| {
+            let (dx, dz) = dir.step();
+            chest_named(block_at(pos.0 + dx, pos.1, pos.2 + dz))
+        })
 }
 fn is_fence_or_wall(st: u32) -> bool {
     matches!(st,
@@ -8367,50 +8842,82 @@ fn set_block_if_inner(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) ->
     let native_fluid_controlled = generated_fluid_changed((x, y, z), old, st);
     if st != old {
         schedule_leaf_neighbors(x, y, z, st);
-        // identity change: per-position metadata cannot survive the
-        // block that owned it (a new chest at a broken chest's spot
-        // must NOT resurrect the old contents — that is an item-dupe).
-        signs()
-            .lock()
-            .unwrap()
-            .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));
-        // broken containers throw their contents (vanilla): one drop
-        // entity per stack, not per item.
-        let mut spill: Vec<Stack> = Vec::new();
-        if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Block((x, y, z))) {
-            spill.extend(
-                slots
-                    .values()
-                    .filter(|&(it, cn, _)| *it > 0 && *cn > 0)
-                    .cloned(),
+        // Identity, not state: `Containers.dropContentsOnDestroy` is guarded by
+        // `!state.is(newState.getBlock())`, so a chest that is waterlogged, re-faced or
+        // re-paired keeps its contents. Guarding this on `st != old` made every state
+        // write on the same block throw the container away.
+        let identity_changed = match breg() {
+            Some(reg) => reg.name_of(old) != reg.name_of(st),
+            None => true,
+        };
+        if identity_changed {
+            // per-position metadata cannot survive the block that owned it (a new
+            // chest at a broken chest's spot must NOT resurrect the old contents —
+            // that is an item-dupe).
+            signs()
+                .lock()
+                .unwrap()
+                .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));
+            // The halves this container was part of, read from the state it still had
+            // as a block: the pair lives in the block state, so the *old* state is the
+            // one that knows it.
+            let halves = chest_halves_of(old, (x, y, z));
+            // broken containers throw their contents (vanilla): one drop
+            // entity per stack, not per item.
+            let mut spill: Vec<Stack> = Vec::new();
+            if let Some(slots) = chests()
+                .lock()
+                .unwrap()
+                .remove(&ContainerKey::Block((x, y, z)))
+            {
+                spill.extend(
+                    slots
+                        .values()
+                        .filter(|&(it, cn, _)| *it > 0 && *cn > 0)
+                        .cloned(),
+                );
+            }
+            if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z)) {
+                spill.extend(
+                    [f.input.clone(), f.fuel.clone(), f.output.clone()]
+                        .into_iter()
+                        .filter(|(it, cn, _)| *it > 0 && *cn > 0),
+                );
+            }
+            if !spill.is_empty() {
+                let mut ds = drops().lock().unwrap();
+                for (item, cnt, comps) in spill {
+                    ds.push(Drop {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        x: x as f64 + 0.5,
+                        y: y as f64 + 0.5,
+                        z: z as f64 + 0.5,
+                        item,
+                        cnt,
+                        comps,
+                        age: 0,
+                    });
+                }
+            }
+            // `ChestBlockEntity.setRemoved` -> `recheckOpeners`: a menu built on a
+            // container the world no longer has is closed, and the opener counters of
+            // the halves it counted drop (one BlockEvent per half that moved).
+            invalidate_container_windows(
+                &client_snapshot(),
+                ContainerKey::Block((x, y, z)),
+                &halves,
             );
-        }
-        if let Some(f) = furnaces().lock().unwrap().remove(&(x, y, z)) {
-            spill.extend(
-                [f.input.clone(), f.fuel.clone(), f.output.clone()]
-                    .into_iter()
-                    .filter(|(it, cn, _)| *it > 0 && *cn > 0),
-            );
-        }
-        if !spill.is_empty() {
-            let mut ds = drops().lock().unwrap();
-            for (item, cnt, comps) in spill {
-                ds.push(Drop {
-                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    x: x as f64 + 0.5,
-                    y: y as f64 + 0.5,
-                    z: z as f64 + 0.5,
-                    item,
-                    cnt,
-                    comps,
-                    age: 0,
-                });
+            disp_power().lock().unwrap().remove(&(x, y, z));
+            obs_unpower().lock().unwrap().remove(&(x, y, z));
+            if !(4278..=4285).contains(&st) {
+                crops().lock().unwrap().remove(&(x, y, z));
             }
         }
-        disp_power().lock().unwrap().remove(&(x, y, z));
-        obs_unpower().lock().unwrap().remove(&(x, y, z));
-        if !(4278..=4285).contains(&st) {
-            crops().lock().unwrap().remove(&(x, y, z));
+        // Chest pairing is block state, so the chests beside this cell re-derive it
+        // (`ChestBlock.updateShape`). A repair writes the same block, which is why it
+        // has to run outside the identity branch above: it must not touch contents.
+        if chest_touches((x, y, z), old, st) {
+            repair_chest_neighbours((x, y, z));
         }
     }
     let mut hh = hoppers().lock().unwrap();
@@ -14956,6 +15463,7 @@ fn item_to_state(item: i64) -> Option<u32> {
         290 => 2354,
         291 => 2355,
         299 => 2955, // chest's 1.21.1 default state (single, north, dry)
+        678 => 9120, // trapped_chest's default state (single, north, dry)
         _ => return None,
     })
 }
@@ -17212,12 +17720,15 @@ fn trade_list_pkt(wid: u8) -> Vec<u8> {
 }
 fn open_chest_window(
     s: &mut TcpStream,
-    pos: ContainerKey,
-    other: Option<ContainerKey>,
+    first: ContainerKey,
+    second: Option<ContainerKey>,
     inv: &HashMap<i16, Stack>,
     title: &str,
 ) {
-    let wide = other.is_some();
+    // `first` owns window slots 0..=26 and `second` 27..=53. For a chest pair that is
+    // `DoubleBlockCombiner`'s order (`CompoundContainer(right, left)`), not a click
+    // order: the caller passes the right half first.
+    let wide = second.is_some();
     let rows = if wide { 54i16 } else { 27i16 };
     let mut p = Vec::new();
     write_varint(&mut p, 1); // windowId
@@ -17228,8 +17739,8 @@ fn open_chest_window(
     write_varint(&mut q, 0);
     write_varint(&mut q, (rows + 36) as i64);
     let all = chests().lock().unwrap();
-    let ch = all.get(&pos).cloned().unwrap_or_default();
-    let ch2 = other.and_then(|k| all.get(&k).cloned()).unwrap_or_default();
+    let ch = all.get(&first).cloned().unwrap_or_default();
+    let ch2 = second.and_then(|k| all.get(&k).cloned()).unwrap_or_default();
     drop(all);
     for i in 0..rows {
         let (it, c, _cc) = if i < 27 {
@@ -17491,9 +18002,12 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
     let chest_pos = *me.open_chest.lock().unwrap();
     let furnace_pos = *me.open_furnace.lock().unwrap();
     if let Some((cp, cp2)) = chest_pos {
-        if !container_exists(cp) || cp2.is_some_and(|p| !container_exists(p)) {
-            *me.open_chest.lock().unwrap() = None;
-            let _ = send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![1u8]);
+        if !window_live((cp, cp2)) {
+            invalidate_container_windows(
+                &client_snapshot(),
+                cp,
+                &chest_window_halves((cp, cp2)),
+            );
             return;
         }
         let rows = if cp2.is_some() { 54i16 } else { 27i16 };
@@ -22305,24 +22819,32 @@ fn handle(mut s: TcpStream) {
                 }
                 // chest: open container instead of placing
                 if let Some(kind) = container_kind(block_at(x, y, z)) {
-                    // adjacent chest -> vanilla double chest (54 slots); deterministic order: north(-z)/west(-x) first
-                    let nb = if is_chest_pairable(block_at(x, y, z)) {
-                        [(x - 1, y, z), (x + 1, y, z), (x, y, z - 1), (x, y, z + 1)]
-                            .iter()
-                            .copied()
-                            .find(|&(nx, ny, nz)| is_chest_pairable(block_at(nx, ny, nz)))
-                    } else {
-                        None
-                    };
-                    let (a, b) = match nb {
-                        Some(n2) if (n2.2, n2.0) < (z, x) => (n2, Some((x, y, z))),
-                        Some(n2) => ((x, y, z), Some(n2)),
-                        None => ((x, y, z), None),
-                    };
-                    let (a, b) = (ContainerKey::Block(a), b.map(ContainerKey::Block));
-                    *me.open_chest.lock().unwrap() = Some((a, b));
+                    // The window is `DoubleBlockCombiner` order, not click order: the
+                    // right half owns slots 0..=26 whichever half was right-clicked.
+                    let window = chest_window(x, y, z);
+                    let audience = client_snapshot();
+                    let mut halves = chest_window_halves(window);
+                    // A second container opening on the same client closes the first,
+                    // which drops the first one's opener count too.
+                    if let Some(previous) = *me.open_chest.lock().unwrap() {
+                        for half in chest_window_halves(previous) {
+                            if !halves.contains(&half) {
+                                halves.push(half);
+                            }
+                        }
+                    }
+                    let before = chest_opener_snapshot(&audience, &halves);
+                    *me.open_chest.lock().unwrap() = Some(window);
                     let inv = me.inv.lock().unwrap().clone();
-                    open_chest_window(&mut me.sock.lock().unwrap(), a, b, &inv, kind);
+                    open_chest_window(
+                        &mut me.sock.lock().unwrap(),
+                        window.0,
+                        window.1,
+                        &inv,
+                        kind,
+                    );
+                    // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
+                    sync_chest_openers(&audience, &before);
                     let _ = send_packet(&mut me.sock.lock().unwrap(), 0x05, ack(seq));
                     continue;
                 }
@@ -22604,6 +23126,24 @@ fn handle(mut s: TcpStream) {
                         continue;
                     }
                     if let Some(st) = item_to_state(item) {
+                        // A chest is placed with the state vanilla computes for it:
+                        // facing from the player (opposite of the look direction),
+                        // `type` from the neighbour it may pair with, and
+                        // `waterlogged` from the fluid it replaces.
+                        let st = match chest_kind(st) {
+                            Some(name) => {
+                                let yaw = me.pos.lock().unwrap().3;
+                                let sneaking = *me.sneaking.lock().unwrap();
+                                chest_placement_state(
+                                    name,
+                                    (tx, ty, tz),
+                                    yaw,
+                                    sneaking,
+                                    face.clamp(0, 5) as u8,
+                                )
+                            }
+                            None => st,
+                        };
                         place_block(tx, ty, tz, st);
                     }
                 }
@@ -23566,7 +24106,17 @@ fn handle(mut s: TcpStream) {
             }
             0x0f => {
                 // close_window
-                let had_container = me.open_chest.lock().unwrap().is_some()
+                // `AbstractContainerMenu.removed` -> `Container.stopOpen`: the opener
+                // counters drop and each half that moved broadcasts its BlockEvent.
+                let chest_window = *me.open_chest.lock().unwrap();
+                if let Some(open) = chest_window {
+                    let audience = client_snapshot();
+                    let halves = chest_window_halves(open);
+                    let before = chest_opener_snapshot(&audience, &halves);
+                    *me.open_chest.lock().unwrap() = None;
+                    sync_chest_openers(&audience, &before);
+                }
+                let had_container = chest_window.is_some()
                     || me.open_furnace.lock().unwrap().is_some()
                     || *me.open_table.lock().unwrap()
                     || *me.open_merchant.lock().unwrap();
@@ -23633,9 +24183,12 @@ fn handle(mut s: TcpStream) {
                         if mode == 0 {
                             let chest_pos = *me.open_chest.lock().unwrap();
                             if let Some((cp, cp2)) = chest_pos {
-                                if !container_exists(cp) || cp2.is_some_and(|p| !container_exists(p)) {
-                                    *me.open_chest.lock().unwrap() = None;
-                                    let _ = send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![1u8]);
+                                if !window_live((cp, cp2)) {
+                                    invalidate_container_windows(
+                                        &client_snapshot(),
+                                        cp,
+                                        &chest_window_halves((cp, cp2)),
+                                    );
                                     continue;
                                 }
                                 // chest window: single 0-26 chest,27-62 inv | double 0-26 A,27-53 B,54-89 inv
@@ -24214,12 +24767,12 @@ fn handle(mut s: TcpStream) {
                             if (0..=8).contains(&btn) {
                                 let chest_pos = *me.open_chest.lock().unwrap();
                                 if let Some((cp, cp2)) = chest_pos {
-                                    if !container_exists(cp)
-                                        || cp2.is_some_and(|p| !container_exists(p))
-                                    {
-                                        *me.open_chest.lock().unwrap() = None;
-                                        let _ =
-                                            send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![1u8]);
+                                    if !window_live((cp, cp2)) {
+                                        invalidate_container_windows(
+                                            &client_snapshot(),
+                                            cp,
+                                            &chest_window_halves((cp, cp2)),
+                                        );
                                         continue;
                                     }
                                 }
@@ -24375,12 +24928,12 @@ fn handle(mut s: TcpStream) {
                             // window onto the cursor (up to stack cap)
                             let chest_pos = *me.open_chest.lock().unwrap();
                             if let Some((cp, cp2)) = chest_pos {
-                                if !container_exists(cp)
-                                    || cp2.is_some_and(|p| !container_exists(p))
-                                {
-                                    *me.open_chest.lock().unwrap() = None;
-                                    let _ =
-                                        send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![1u8]);
+                                if !window_live((cp, cp2)) {
+                                    invalidate_container_windows(
+                                        &client_snapshot(),
+                                        cp,
+                                        &chest_window_halves((cp, cp2)),
+                                    );
                                     continue;
                                 }
                             }
@@ -24479,12 +25032,12 @@ fn handle(mut s: TcpStream) {
                             // 1=whole stack); 1=shift-move between regions
                             let chest_pos = *me.open_chest.lock().unwrap();
                             if let Some((cp, cp2)) = chest_pos {
-                                if !container_exists(cp)
-                                    || cp2.is_some_and(|p| !container_exists(p))
-                                {
-                                    *me.open_chest.lock().unwrap() = None;
-                                    let _ =
-                                        send_packet(&mut me.sock.lock().unwrap(), 0x12, vec![1u8]);
+                                if !window_live((cp, cp2)) {
+                                    invalidate_container_windows(
+                                        &client_snapshot(),
+                                        cp,
+                                        &chest_window_halves((cp, cp2)),
+                                    );
                                     continue;
                                 }
                             }
@@ -24927,6 +25480,15 @@ fn handle(mut s: TcpStream) {
                 .lock()
                 .unwrap()
                 .insert(name.clone(), (p.0, p.1, p.2, p.3, p.4));
+        }
+        // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
+        // the leaving viewer stops counting before it leaves the client list.
+        if let Some(open) = *me_cleanup.open_chest.lock().unwrap() {
+            let audience = client_snapshot();
+            let halves = chest_window_halves(open);
+            let before = chest_opener_snapshot(&audience, &halves);
+            *me_cleanup.open_chest.lock().unwrap() = None;
+            sync_chest_openers(&audience, &before);
         }
         let mut cls = clients().lock().unwrap();
         cls.retain(|c| c.eid != me_cleanup.eid);

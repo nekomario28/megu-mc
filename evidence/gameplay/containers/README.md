@@ -55,5 +55,53 @@ Inventory oracle追加後の再実行は[回収の記録](../inventory-pickup/RE
 チェストの入力・期待結果は変えず、共有Javaソースのprovenanceだけを更新した。
 このsliceの結果は、1.21.1 datapack移行ブランチ全体の受け入れではない。
 
-未検証・未移植: 複数閲覧者への同期、window/state-id整合、閉塞判定・開閉音、正しい向き／left-right／異種チェストの接続判定、shulkerの中身制約、任意component patchの意味的同値、特殊結果スロット、全エンティティ挙動。
+未検証・未移植: 開いている window の毎 tick 同期（`broadcastChanges`、あるいは
+A が動かした item が B の window に出ること）、window/state-id 整合、
+`isChestBlockedAt` による結合拒否、開閉音、shulkerの中身制約、
+任意component patchの意味的同値、特殊結果スロット、全エンティティ挙動。
+向き／left-right／異種チェストの接続判定と複数閲覧者の開閉同期は
+[チェストのワールド側契約](#チェストのワールド側契約)で閉塞した。
+
+## チェストのワールド側契約
+
+M2 slice 3。二重チェストを「隣接」ではなく block state で判定し、開閉・閲覧者数・
+破壊時の window 無効化と drop・永続化を 1.21.1 の機構に合わせた。
+bytecode は `server-1.21.1.jar` を `javap -p -c` で読み、mappings は
+`/var/tmp/mcm/server.txt` で解決した。参照した機構とその根拠:
+
+- `dhb.g(dtc)`（`ChestBlock` の BlockType 写像）は `single→SINGLE`, `right→FIRST`,
+  `left→SECOND`。`dif.a` は own が FIRST なら own を先に、SECOND なら隣を先にして
+  `dif$c$a(first, second)` を作り、`dhb$1` が `CompoundContainer(first, second)` を組む。
+  `bqj.a(int)` は `slot < first.size` なら first。したがって結合 container の
+  **slot 0..=26 が right 半分、27..=53 が left 半分**で、クリックした半分に依存しない。
+- `ChestBlock.getStateForPlacement` は facing = `getHorizontalDirection().getOpposite()`、
+  `type` は `candidatePartnerFacing`（`s.is(this) && TYPE==SINGLE` のときだけ facing を返す）
+  から。sneaking + 水平面クリックは `clickedFace.getOpposite()` の block だけを見て、
+  facing が直交する場合に接続する。非 sneaking は `getClockWise()` → LEFT、
+  `getCounterClockWise()` → RIGHT の順。
+- `ChestBlock.updateShape` は隣接半分の facet と `getConnectedDirection` の逆方向一致で
+  pair を回復し、接続先が chest でなくなったら `single` に戻す。
+- `Containers.dropContentsOnDestroy` は `!state.is(newState.getBlock())` で守られる。
+  block identity の変化だけが中身を落とす。
+- `ContainerOpenersCounter` は BE ごとの `openCount` を増減し、変化のたびに
+  `openerCountChanged(prev, count)` → `dqo.a(dcw,jd,dtc,int,int)` が
+  `level.blockEvent(pos, block, 1, count)` を呼ぶ。double chest は結合 container の
+  `startOpen` が両方の BE に届くので、両半分がそれぞれ event を出す。
+- 1.21.1 play clientbound の `ClientboundBlockEventPacket` は 0x08。
+  `agh.a` の登録順（`agg.a`=bundle 0x00 → `agg.c..agg.j`）で `agg.j` が `acc`
+  （`ClientboundBlockEventPacket`）であり 9 番目。隣の 0x07 が block entity data、
+  0x09 が block update、`agg.t`(0x12) が `ClientboundContainerClosePacket` で、
+  既存の packet id と一致する。
+
+観測点は 2 層に分けた。`src/tick_tests.rs` の 9 本は block state（設置・pairing・
+3連・sneak・updateShape）、slot 順、drop 引き金、window 無効化、閲覧者数と event を
+それぞれ別の assertion で固定し、`tests/container_wire.py` は実 TCP で
+2 client の開閉、半分ごとの slot 所有、破壊時の `0x12` と drop、再起動後の
+left/right と中身を読む。5 step を 1 slice で入れたが、失敗が「state が違う」か
+「event が来ない」かを assertion の名前で区別できるようにしてある。
+
+検証済みの範囲は上の 5 機構だけである。開いている window の毎 tick 同期、
+`isChestBlockedAt`、waterlogged chest の water tick、`LootTableSeed` の初回 open まで
+の保持、視界外閲覧者の `recheckOpeners`、ender/minecart chest の viewer 同期は
+未実装で、この段階の合格には含めていない。
 続きは[移植順序](../../../specs/horizon-gameplay/README.md)を参照。

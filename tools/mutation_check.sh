@@ -1286,6 +1286,74 @@ check "the real chest click dispatch preserves the mouse button" \
   '                                    click_slot(gmap, &mut cur, gslot, 0);' \
   tests/container_wire.py 'containers wire: FAIL chest-half-pickup'
 
+# The chest world-side contract (M2 slice 3). Each mutant restores one sentence of the
+# 1.21.1 mechanism the port had wrong, and each one was measured against the test named
+# beside it: `Containers.dropContentsOnDestroy` is guarded by the *block* changing,
+# `candidatePartnerFacing` requires the same `Block`, `updateShape` unpairs the survivor,
+# `DoubleBlockCombiner` puts the right half first, `ContainerOpenersCounter` broadcasts the
+# new count, the menu dies with the block, and a block container exists only while its
+# block does.
+check "a chest state change does not destroy the container" \
+  src/main.rs '        let identity_changed = match breg() {
+            Some(reg) => reg.name_of(old) != reg.name_of(st),
+            None => true,
+        };' \
+  '        let identity_changed = st != old;' \
+  a_chest_state_change_keeps_its_contents
+
+check "a chest pairs only with a chest of its own kind" \
+  src/main.rs '    let st = block_at(pos.0, pos.1, pos.2);
+    if breg()?.name_of(st) != name {
+        return None;
+    }
+    if chest_type(st)? != "single" {' \
+  '    let st = block_at(pos.0, pos.1, pos.2);
+    if chest_type(st)? != "single" {' \
+  chest_placement_pairs_only_with_a_matching_single_chest
+
+check "breaking one half reverts the survivor to single" \
+  src/main.rs '    if chest_connected_direction(own)? == dir {
+        return Some(reg.with_prop(own, "type", "single"));
+    }' \
+  '    if chest_connected_direction(own)? == dir.opposite() {
+        return Some(reg.with_prop(own, "type", "single"));
+    }' \
+  breaking_a_half_reverts_the_survivor_to_single
+
+check "the combined container puts the right half in slots 0..=26" \
+  src/main.rs '    match own {
+        "right" => Some((pos, other)),
+        _ => Some((other, pos)),
+    }' \
+  '    match own {
+        "right" => Some((other, pos)),
+        _ => Some((pos, other)),
+    }' \
+  a_double_chest_window_opens_right_half_first
+
+check "the lid broadcast carries the new opener count" \
+  src/main.rs '            broadcast_block_event(audience, pos, 1, now as u8);' \
+  '            broadcast_block_event(audience, pos, 1, previous as u8);' \
+  two_viewers_move_the_opener_count_and_broadcast_it
+
+check "a removed container closes its window on windowId 1" \
+  src/main.rs '        if had {
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, vec![1u8]);
+            }
+            closed += 1;' \
+  '        if had {
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, Vec::new());
+            }
+            closed += 1;' \
+  a_removed_container_closes_the_window_built_on_it
+
+check "a block container stops existing when its block does" \
+  src/main.rs '            is_ender_key(pos) || container_kind(block_at(pos.0, pos.1, pos.2)).is_some()' \
+  '            true' \
+  breaking_a_chest_drops_each_stack_once_and_leaves_no_entry
+
 # Inventory pickup: prove the native loop AND its actual tick caller.
 check "pickup drains beyond the first partially filled slot" \
   src/main.rs '        if source.1 == 0 || source.1 == before {' \

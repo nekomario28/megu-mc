@@ -51,6 +51,32 @@ pickup delay は[独立した slice](pickup-delay.md)で閉塞した。実プレ
 同じ block kind、facing、left/right の状態を 1.21.1 と照合する。
 1 の普通のスロットが通っても、この段階の合格にはしない。
 
+実装済み（1.21.1 の bytecode で確認した機構。詳細と未検証項目は
+[検証範囲](../../evidence/gameplay/containers/README.md#チェストのワールド側契約)）:
+
+- 設置は `ChestBlock.getStateForPlacement`。facing は player の yaw の逆、`type` は
+  `candidatePartnerFacing`（同じ `Block` かつ `TYPE=single` だけが候補）、
+  waterlogged は置き換える fluid が水源かどうか。sneaking の水平面クリックは
+  クリックした block だけを候補にし、facing が直交する場合に限り接続する。
+- 隣接 block の書き込みで `ChestBlock.updateShape` を回し、survivor は `single` へ戻る。
+  pairing の修復は state の書き込みであり、中身には触れない。
+- 結合 container の slot 順は `DoubleBlockCombiner` の順（`dhb.g` で right=FIRST、
+  `CompoundContainer(first, second)`）で、**slot 0..=26 が right 半分、27..=53 が left 半分**。
+  どちらをクリックして開いても同じ。
+- 破壊 drop の引き金は block identity の変化（`Containers.dropContentsOnDestroy` の
+  `!state.is(newState.getBlock())`）。同一 block の state 変化では中身を捨てない。
+- `container_exists` は world の block を見る。container が消えた瞬間に開いている window は
+  `0x12` で閉じ、閉じた window への click は container map を作り直さない。
+- 閲覧者数は開いている window から導出し（永続化しない）、半分ごとに
+  `ClientboundBlockEventPacket`（0x08, action 1, param=count）を送る。
+
+未検証・未移植: 開いている複数閲覧者への毎 tick の `broadcastChanges`
+（A が動かした item は B の開いた window に次の tick では出ない）、
+`isChestBlockedAt`（上に載った block / 猫で結合を拒む）、waterlogged chest の
+water tick 再予約、`LootTable`/`LootTableSeed` の初回 open まで保持、
+視界外に出た閲覧者の `recheckOpeners`、ender chest と minecart chest の
+viewer 同期（entity event 経路）、barrel の `open` state。
+
 ### 4. エンティティの属性・移動・接触
 
 候補は `horizon-world/src/attributes/entity.rs`、`entity_move.rs`、

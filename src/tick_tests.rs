@@ -5185,3 +5185,541 @@ fn a_falling_entity_stops_moving_when_its_chunk_goes_cold() {
     let _ = oh;
 }
 
+// ---------- chest world-side contract (M2 slice 3) ----------
+//
+// Every expectation below is the 1.21.1 mechanism itself, named where it is used:
+// `ChestBlock.getStateForPlacement` / `candidatePartnerFacing` / `updateShape`,
+// `DoubleBlockCombiner`'s slot order, `Containers.dropContentsOnDestroy` (guarded by the
+// *block* changing), and `ContainerOpenersCounter` -> `level.blockEvent(1, count)`.
+
+/// Read one varint straight off a socket; `None` on a close or a read timeout.
+fn read_frame_varint(stream: &mut TcpStream) -> Option<i64> {
+    let mut value = 0i64;
+    for shift in 0..5 {
+        let mut byte = [0u8; 1];
+        std::io::Read::read_exact(stream, &mut byte).ok()?;
+        value |= i64::from(byte[0] & 0x7f) << (7 * shift);
+        if byte[0] & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Every frame that arrived on this socket, as `(packet id, payload)`.
+fn frames_on(stream: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
+    let mut out = Vec::new();
+    while let Some(len) = read_frame_varint(stream) {
+        let mut body = vec![0u8; usize::try_from(len).ok().unwrap_or(0)];
+        if std::io::Read::read_exact(stream, &mut body).is_err() {
+            break;
+        }
+        let mut sl = &body[..];
+        let Some(pid) = read_varint(&mut sl) else {
+            break;
+        };
+        out.push((pid, sl.to_vec()));
+    }
+    out
+}
+
+/// `ClientboundBlockEventPacket` (0x08) bodies: pos, action id, action param, block id.
+fn block_events(frames: Vec<(i64, Vec<u8>)>) -> Vec<(BlockPos, u8, u8, i64)> {
+    frames
+        .into_iter()
+        .filter(|(pid, _)| *pid == 0x08)
+        .map(|(_, body)| {
+            let at = read_pos(&body[..8]);
+            let mut rest = &body[10..];
+            (
+                at,
+                body[8],
+                body[9],
+                read_varint(&mut rest).expect("block id varint"),
+            )
+        })
+        .collect()
+}
+
+/// A client whose socket the server writes into, standing at `at` so the gated lid
+/// broadcast reaches it. The audience is passed explicitly, so no other test's
+/// broadcast can land on these sockets.
+fn chest_viewer(eid: i32, at: BlockPos) -> (Arc<Client>, TcpStream) {
+    let (mut client, receiver) = client_pair();
+    client.eid = eid;
+    *client.pos.lock().unwrap() = (
+        f64::from(at.0) + 0.5,
+        f64::from(at.1),
+        f64::from(at.2) + 0.5,
+        0.0,
+        0.0,
+        true,
+    );
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .unwrap();
+    (Arc::new(client), receiver)
+}
+
+fn chest_state(name: &str) -> u32 {
+    name_to_state(name).expect("chest block state")
+}
+
+/// A chest placed by a player looking at yaw 0 (south), so `facing` is north.
+fn placed_chest(name: &str, pos: BlockPos) -> u32 {
+    chest_placement_state(name, pos, 0.0, false, 1)
+}
+
+/// `Containers.dropContentsOnDestroy` is guarded by `!state.is(newState.getBlock())`:
+/// only the block changing may drop a container. Guarding on `st != old` threw the
+/// contents away on every state write on the same chest.
+#[test]
+fn a_chest_state_change_keeps_its_contents() {
+    let _world_guard = world_guard();
+    let reg = breg().expect("block registry");
+    let pos: BlockPos = (40, 160, 40);
+    set_block(pos.0, pos.1, pos.2, chest_state("chest"));
+    let stack: Stack = (name_to_item("iron_ingot").expect("iron"), 7, Vec::new());
+    chests()
+        .lock()
+        .unwrap()
+        .entry(ContainerKey::Block(pos))
+        .or_default()
+        .insert(0, stack.clone());
+    let dropped = drops().lock().unwrap().len();
+    for (prop, value) in [("waterlogged", "true"), ("facing", "east"), ("type", "left")] {
+        let current = block_at(pos.0, pos.1, pos.2);
+        let next = reg.with_prop(current, prop, value);
+        assert_ne!(next, current, "{prop} must move the chest's state");
+        set_block(pos.0, pos.1, pos.2, next);
+        assert_eq!(
+            chests()
+                .lock()
+                .unwrap()
+                .get(&ContainerKey::Block(pos))
+                .and_then(|slots| slots.get(&0)),
+            Some(&stack),
+            "{prop} changed the state, not the block, so the contents must stay"
+        );
+    }
+    assert_eq!(
+        drops().lock().unwrap().len(),
+        dropped,
+        "no state change may drop the contents"
+    );
+    // The break itself does drop, so take the map entry out before clearing the block.
+    chests().lock().unwrap().remove(&ContainerKey::Block(pos));
+    set_block(pos.0, pos.1, pos.2, 0);
+}
+
+/// `ChestBlock.getStateForPlacement`: the placed half takes `left`/`right` from the
+/// neighbour it pairs with, and the neighbour is repaired to the opposite half.
+#[test]
+fn chest_placement_pairs_only_with_a_matching_single_chest() {
+    let _world_guard = world_guard();
+    let y = 162;
+    // Two chests side by side, same facing: the pair axis is perpendicular to facing.
+    let left = (41, y, 60);
+    let right = (42, y, 60);
+    set_block(left.0, left.1, left.2, chest_state("chest"));
+    set_block(
+        right.0,
+        right.1,
+        right.2,
+        placed_chest("minecraft:chest", right),
+    );
+    assert_eq!(chest_type(block_at(left.0, left.1, left.2)), Some("left"));
+    assert_eq!(chest_type(block_at(right.0, right.1, right.2)), Some("right"));
+    assert_eq!(
+        chest_facing(block_at(left.0, left.1, left.2)),
+        chest_facing(block_at(right.0, right.1, right.2)),
+        "both halves carry the placed facing"
+    );
+    assert_eq!(
+        chest_pair(left.0, left.1, left.2),
+        Some((right, left)),
+        "the pair is ordered right-then-left, as DoubleBlockCombiner orders it"
+    );
+
+    // A trap chest beside a chest is a different Block, so `candidatePartnerFacing`
+    // rejects it: both stay single.
+    let plain = (44, y, 60);
+    let trapped = (45, y, 60);
+    set_block(plain.0, plain.1, plain.2, chest_state("chest"));
+    set_block(
+        trapped.0,
+        trapped.1,
+        trapped.2,
+        placed_chest("minecraft:trapped_chest", trapped),
+    );
+    assert_eq!(chest_type(block_at(plain.0, plain.1, plain.2)), Some("single"));
+    assert_eq!(
+        chest_type(block_at(trapped.0, trapped.1, trapped.2)),
+        Some("single"),
+        "a chest and a trapped chest never pair"
+    );
+
+    // Three in a row: the middle half is already paired, so it is not a candidate and
+    // the third chest stays single (a half cannot belong to two pairs).
+    let row = [(47, y, 60), (48, y, 60), (49, y, 60)];
+    set_block(row[0].0, row[0].1, row[0].2, chest_state("chest"));
+    for cell in &row[1..] {
+        set_block(
+            cell.0,
+            cell.1,
+            cell.2,
+            placed_chest("minecraft:chest", *cell),
+        );
+    }
+    assert_eq!(chest_type(block_at(row[0].0, row[0].1, row[0].2)), Some("left"));
+    assert_eq!(chest_type(block_at(row[1].0, row[1].1, row[1].2)), Some("right"));
+    assert_eq!(
+        chest_type(block_at(row[2].0, row[2].1, row[2].2)),
+        Some("single"),
+        "a third chest beside a paired half stays single"
+    );
+    assert_eq!(chest_partner(row[2].0, row[2].1, row[2].2), None);
+    for cell in row.iter().chain([left, right, plain, trapped].iter()) {
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+}
+
+/// The sneaking branch of `getStateForPlacement`: only the clicked block may become the
+/// partner, and only when its facing is on the other axis.
+#[test]
+fn sneak_placement_claims_the_clicked_face_only_across_the_facing_axis() {
+    let _world_guard = world_guard();
+    let y = 163;
+    // Facing north (yaw 0 flip), so its pair axis is x. Sneak-clicking its NORTH face
+    // would connect along z, which the axis test rejects.
+    let host = (52, y, 60);
+    set_block(host.0, host.1, host.2, chest_state("chest"));
+    let along = (52, y, 59);
+    set_block(
+        along.0,
+        along.1,
+        along.2,
+        chest_placement_state("minecraft:chest", along, 0.0, true, 2),
+    );
+    assert_eq!(
+        chest_type(block_at(along.0, along.1, along.2)),
+        Some("single"),
+        "a click along the partner's facing axis cannot pair"
+    );
+    assert_eq!(chest_type(block_at(host.0, host.1, host.2)), Some("single"));
+    // Sneak-clicking its EAST face connects across the facing axis.
+    let across = (53, y, 60);
+    set_block(
+        across.0,
+        across.1,
+        across.2,
+        chest_placement_state("minecraft:chest", across, 0.0, true, 5),
+    );
+    assert_eq!(chest_type(block_at(across.0, across.1, across.2)), Some("right"));
+    assert_eq!(
+        chest_type(block_at(host.0, host.1, host.2)),
+        Some("left"),
+        "the clicked chest is repaired to the opposite half"
+    );
+    for cell in [host, along, across] {
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+}
+
+/// `ChestBlock.updateShape`: breaking one half reverts the survivor to `single`.
+#[test]
+fn breaking_a_half_reverts_the_survivor_to_single() {
+    let _world_guard = world_guard();
+    let y = 164;
+    let left = (55, y, 60);
+    let right = (56, y, 60);
+    set_block(left.0, left.1, left.2, chest_state("chest"));
+    set_block(
+        right.0,
+        right.1,
+        right.2,
+        placed_chest("minecraft:chest", right),
+    );
+    assert_eq!(chest_type(block_at(right.0, right.1, right.2)), Some("right"));
+    set_block(right.0, right.1, right.2, 0);
+    assert_eq!(
+        chest_type(block_at(left.0, left.1, left.2)),
+        Some("single"),
+        "the survivor must not stay a half with no partner"
+    );
+    assert_eq!(chest_partner(left.0, left.1, left.2), None);
+    set_block(left.0, left.1, left.2, 0);
+}
+
+/// `DoubleBlockCombiner` order: the combined container is `(right, left)`, so window
+/// slots 0..=26 are the right half whichever half was clicked.
+#[test]
+fn a_double_chest_window_opens_right_half_first() {
+    let _world_guard = world_guard();
+    let y = 165;
+    let left = (58, y, 60);
+    let right = (59, y, 60);
+    set_block(left.0, left.1, left.2, chest_state("chest"));
+    set_block(
+        right.0,
+        right.1,
+        right.2,
+        placed_chest("minecraft:chest", right),
+    );
+    let expected = (
+        ContainerKey::Block(right),
+        Some(ContainerKey::Block(left)),
+    );
+    assert_eq!(chest_window(left.0, left.1, left.2), expected, "left half");
+    assert_eq!(chest_window(right.0, right.1, right.2), expected, "right half");
+    // A single chest is its own window.
+    let lone = (61, y, 60);
+    set_block(lone.0, lone.1, lone.2, chest_state("chest"));
+    assert_eq!(
+        chest_window(lone.0, lone.1, lone.2),
+        (ContainerKey::Block(lone), None)
+    );
+    for cell in [left, right, lone] {
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+}
+
+/// `ContainerOpenersCounter`: one counter per half, and `openerCountChanged` is what
+/// carries the new count to every viewer.
+#[test]
+fn two_viewers_move_the_opener_count_and_broadcast_it() {
+    let _world_guard = world_guard();
+    let y = 166;
+    let right = (63, y, 60);
+    let left = (64, y, 60);
+    for cell in [right, left] {
+        set_block(cell.0, cell.1, cell.2, chest_state("chest"));
+    }
+    let (first, mut r_first) = chest_viewer(1, left);
+    let (second, mut r_second) = chest_viewer(2, right);
+    let audience = [first.clone(), second.clone()];
+    let halves = [right, left];
+    let window = (
+        ContainerKey::Block(right),
+        Some(ContainerKey::Block(left)),
+    );
+    let chest_id = i64::from(breg().unwrap().block_id_of(block_at(right.0, right.1, right.2)).unwrap());
+    assert_eq!(chest_id, 177, "1.21.1's block id for minecraft:chest");
+
+    let before = chest_opener_snapshot(&audience, &halves);
+    assert_eq!(before, vec![(right, 0), (left, 0)]);
+    *first.open_chest.lock().unwrap() = Some(window);
+    sync_chest_openers(&audience, &before);
+    let expected = vec![
+        (right, 1u8, 1u8, chest_id),
+        (left, 1u8, 1u8, chest_id),
+    ];
+    assert_eq!(block_events(frames_on(&mut r_first)), expected);
+    assert_eq!(
+        block_events(frames_on(&mut r_second)),
+        expected,
+        "a viewer that did not open it still learns the lid moved"
+    );
+
+    let before = chest_opener_snapshot(&audience, &halves);
+    assert_eq!(before, vec![(right, 1), (left, 1)]);
+    *second.open_chest.lock().unwrap() = Some(window);
+    sync_chest_openers(&audience, &before);
+    let expected = vec![
+        (right, 1u8, 2u8, chest_id),
+        (left, 1u8, 2u8, chest_id),
+    ];
+    assert_eq!(block_events(frames_on(&mut r_first)), expected);
+    assert_eq!(block_events(frames_on(&mut r_second)), expected);
+
+    let before = chest_opener_snapshot(&audience, &halves);
+    assert_eq!(before, vec![(right, 2), (left, 2)]);
+    *second.open_chest.lock().unwrap() = None;
+    sync_chest_openers(&audience, &before);
+    let expected = vec![
+        (right, 1u8, 1u8, chest_id),
+        (left, 1u8, 1u8, chest_id),
+    ];
+    assert_eq!(block_events(frames_on(&mut r_first)), expected);
+
+    let before = chest_opener_snapshot(&audience, &halves);
+    *first.open_chest.lock().unwrap() = None;
+    sync_chest_openers(&audience, &before);
+    let expected = vec![
+        (right, 1u8, 0u8, chest_id),
+        (left, 1u8, 0u8, chest_id),
+    ];
+    assert_eq!(block_events(frames_on(&mut r_first)), expected);
+
+    // Nothing changed, so nothing is sent: `openerCountChanged` fires on a change.
+    let before = chest_opener_snapshot(&audience, &halves);
+    sync_chest_openers(&audience, &before);
+    assert!(frames_on(&mut r_first).is_empty());
+    for cell in [right, left] {
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+}
+
+/// A container the world no longer has closes the menu built on it, and its opener
+/// count drops in the same breath (`ChestBlockEntity.setRemoved` -> recheckOpeners).
+#[test]
+fn a_removed_container_closes_the_window_built_on_it() {
+    let _world_guard = world_guard();
+    let y = 167;
+    let pos: BlockPos = (66, y, 60);
+    set_block(pos.0, pos.1, pos.2, chest_state("chest"));
+    let (viewer, mut receiver) = chest_viewer(1, pos);
+    *viewer.open_chest.lock().unwrap() = Some((ContainerKey::Block(pos), None));
+    let closed = invalidate_container_windows(
+        &[viewer.clone()],
+        ContainerKey::Block(pos),
+        &[pos],
+    );
+    assert_eq!(closed, 1, "one window was closed");
+    assert!(
+        viewer.open_chest.lock().unwrap().is_none(),
+        "a stale window must not survive the block"
+    );
+    let frames = frames_on(&mut receiver);
+    assert_eq!(frames[0].0, 0x12, "ClientboundContainerClosePacket");
+    assert_eq!(frames[0].1, vec![1u8], "windowId 1");
+    assert_eq!(
+        block_events(frames),
+        vec![(pos, 1, 0, 177)],
+        "the last viewer left, so the count is 0"
+    );
+    // Second time round there is nothing to close and the count does not move.
+    let again =
+        invalidate_container_windows(&[viewer.clone()], ContainerKey::Block(pos), &[pos]);
+    assert_eq!(again, 0);
+    assert!(frames_on(&mut receiver).is_empty());
+    set_block(pos.0, pos.1, pos.2, 0);
+}
+
+/// Breaking a chest spills one entity per non-empty stack and leaves no container
+/// behind - the guard that makes a later click into the stale window refuse it.
+#[test]
+fn breaking_a_chest_drops_each_stack_once_and_leaves_no_entry() {
+    let _world_guard = world_guard();
+    let pos: BlockPos = (68, 168, 60);
+    let iron = name_to_item("iron_ingot").unwrap();
+    let gold = name_to_item("gold_ingot").unwrap();
+    set_block(pos.0, pos.1, pos.2, chest_state("chest"));
+    let mut slots: HashMap<i16, Stack> = HashMap::new();
+    slots.insert(0, (iron, 5, Vec::new()));
+    slots.insert(7, (gold, 2, Vec::new()));
+    slots.insert(9, (0, 0, Vec::new()));
+    chests()
+        .lock()
+        .unwrap()
+        .insert(ContainerKey::Block(pos), slots);
+    let before = drops().lock().unwrap().len();
+    set_block(pos.0, pos.1, pos.2, 0);
+    assert!(
+        !chests().lock().unwrap().contains_key(&ContainerKey::Block(pos)),
+        "no container entry may outlive the block"
+    );
+    assert!(
+        !window_live((ContainerKey::Block(pos), None)),
+        "the click guard must refuse a window whose block is gone"
+    );
+    assert!(!container_exists(ContainerKey::Block(pos)));
+    let ds = drops().lock().unwrap();
+    assert_eq!(
+        ds.len(),
+        before + 2,
+        "one drop per non-empty stack, not one per item"
+    );
+    // The container is a `HashMap`, so the spill order is not a property of the contract.
+    let mut spilled: Vec<_> = ds[before..].iter().map(|d| (d.item, d.cnt)).collect();
+    spilled.sort_unstable();
+    let mut expected = vec![(iron, 5), (gold, 2)];
+    expected.sort_unstable();
+    assert_eq!(spilled, expected);
+    drop(ds);
+    drops().lock().unwrap().truncate(before);
+}
+
+/// The pair relationship is block state and the viewer count is not persisted (`the
+/// openCount is deliberately not saved`), so a save/reload keeps exactly the chests
+/// that exist and their halves, and invents no container.
+#[test]
+fn chest_pairing_states_and_contents_survive_a_save_and_load() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let y = 169;
+    let left = (70, y, 60);
+    let right = (71, y, 60);
+    let lone = (73, y, 60);
+    set_block(left.0, left.1, left.2, chest_state("chest"));
+    set_block(
+        right.0,
+        right.1,
+        right.2,
+        placed_chest("minecraft:chest", right),
+    );
+    set_block(lone.0, lone.1, lone.2, chest_state("chest"));
+    assert_eq!(chest_type(block_at(left.0, left.1, left.2)), Some("left"));
+    assert_eq!(chest_type(block_at(right.0, right.1, right.2)), Some("right"));
+    let iron = name_to_item("iron_ingot").unwrap();
+    let gold = name_to_item("gold_ingot").unwrap();
+    let diamond = name_to_item("diamond").unwrap();
+    for (pos, stack) in [
+        (left, (iron, 4, Vec::new())),
+        (right, (gold, 1, Vec::new())),
+        (lone, (diamond, 3, Vec::new())),
+    ] {
+        chests()
+            .lock()
+            .unwrap()
+            .entry(ContainerKey::Block(pos))
+            .or_default()
+            .insert(0, stack);
+    }
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    world().lock().unwrap().clear();
+    chests().lock().unwrap().clear();
+    drops().lock().unwrap().clear();
+    load_world_from(&payload).unwrap();
+    assert_eq!(
+        chest_type(block_at(left.0, left.1, left.2)),
+        Some("left"),
+        "the half is saved in the block state"
+    );
+    assert_eq!(chest_type(block_at(right.0, right.1, right.2)), Some("right"));
+    assert_eq!(
+        chest_pair(left.0, left.1, left.2),
+        Some((right, left)),
+        "the pair is re-derived from the reloaded states"
+    );
+    let containers = chests().lock().unwrap().clone();
+    let keys: HashSet<ContainerKey> = containers.keys().copied().collect();
+    assert_eq!(
+        keys,
+        HashSet::from([
+            ContainerKey::Block(left),
+            ContainerKey::Block(right),
+            ContainerKey::Block(lone),
+        ]),
+        "exactly the three chests: no phantom key and no persisted viewer count"
+    );
+    assert_eq!(
+        containers[&ContainerKey::Block(left)].get(&0),
+        Some(&(iron, 4, Vec::new()))
+    );
+    assert_eq!(
+        containers[&ContainerKey::Block(right)].get(&0),
+        Some(&(gold, 1, Vec::new()))
+    );
+    assert_eq!(
+        containers[&ContainerKey::Block(lone)].get(&0),
+        Some(&(diamond, 3, Vec::new()))
+    );
+    for cell in [left, right, lone] {
+        chests().lock().unwrap().remove(&ContainerKey::Block(cell));
+        set_block(cell.0, cell.1, cell.2, 0);
+    }
+    drops().lock().unwrap().clear();
+}

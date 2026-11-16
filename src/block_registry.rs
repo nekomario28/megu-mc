@@ -562,6 +562,12 @@ impl BReg {
         }
         st
     }
+    /// The block registry's raw id (`Registries.BLOCK`), which is what the wire
+    /// carries where a packet names a *block* rather than a state - for example
+    /// `ClientboundBlockEventPacket`'s trailing VarInt. It is not a state id.
+    pub(crate) fn block_id_of(&self, st: u32) -> Option<i32> {
+        self.st_blk.get(st as usize).map(|block| *block as i32)
+    }
     pub(crate) fn name_of(&self, st: u32) -> &str {
         self.st_blk
             .get(st as usize)

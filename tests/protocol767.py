@@ -194,40 +194,49 @@ def unpack_position(data):
 
 
 @contextlib.contextmanager
-def local_server(binary):
-    with tempfile.TemporaryDirectory(prefix="spine-wire-") as tmp:
-        root = Path(tmp)
-        (root / "config_packets.bin").symlink_to(ROOT / "config_packets.bin")
-        (root / "assets").symlink_to(ROOT / "assets", target_is_directory=True)
-        game = port()
-        env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-                   MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="")
-        env.pop("MC_SPINE_RCON_PORT", None)
-        with (root / "server.log").open("w+") as log:
-            proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
-            try:
-                for _ in range(100):
-                    assert proc.poll() is None, "server exited before login"
-                    try:
-                        status(game)
-                        break
-                    except (OSError, AssertionError):
-                        time.sleep(0.05)
-                else:
-                    raise AssertionError("listener did not become ready")
+def local_server(binary, root=None):
+    """Run the server on a loopback port. `root` keeps the world: a caller that hands
+    in the same directory twice is a restart, which is the only way to observe what a
+    save actually persisted."""
+    if root is None:
+        with tempfile.TemporaryDirectory(prefix="spine-wire-") as tmp:
+            with local_server(binary, Path(tmp)) as game:
                 yield game
-            except Exception:
-                log.flush()
-                log.seek(0)
-                print(log.read()[-4000:], file=sys.stderr)
-                raise
-            finally:
-                proc.terminate()
+        return
+    root = Path(root)
+    for link, target in (("config_packets.bin", ROOT / "config_packets.bin"),
+                         ("assets", ROOT / "assets")):
+        if not (root / link).exists():
+            (root / link).symlink_to(target, target_is_directory=target.is_dir())
+    game = port()
+    env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
+               MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="")
+    env.pop("MC_SPINE_RCON_PORT", None)
+    with (root / "server.log").open("w+") as log:
+        proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
+        try:
+            for _ in range(100):
+                assert proc.poll() is None, "server exited before login"
                 try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
+                    status(game)
+                    break
+                except (OSError, AssertionError):
+                    time.sleep(0.05)
+            else:
+                raise AssertionError("listener did not become ready")
+            yield game
+        except Exception:
+            log.flush()
+            log.seek(0)
+            print(log.read()[-4000:], file=sys.stderr)
+            raise
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 class Client:
