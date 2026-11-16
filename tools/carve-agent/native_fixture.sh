@@ -70,6 +70,15 @@ tick_args=()
 if [[ "${MC_TICK_TRACE:-0}" == 1 ]]; then
     tick_args+=("-Dtickbox=$box")
 fi
+# Extra `-D` hooks for one measurement, whitespace separated, e.g.
+#   MC_FIXTURE_JAVA_EXTRA='-Dcelchunk=-25,22 -Dmushroomchunk=-25,19'
+# Kept as one variable instead of a hook per property so a capture's instrumentation is
+# recorded in its own command line (`inputs.sha256` covers this script) rather than defaulted on.
+if [[ -n "${MC_FIXTURE_JAVA_EXTRA:-}" ]]; then
+    read -r -a extra_args <<< "$MC_FIXTURE_JAVA_EXTRA"
+    tick_args+=("${extra_args[@]}")
+fi
+printf '%s\n' "MC_FIXTURE_JAVA_EXTRA=${MC_FIXTURE_JAVA_EXTRA:-}" > "$DIR/java-extra.txt"
 cd "$DIR"
 # Native rewrites this file to add defaults. Preserve its actual input bytes,
 # then check all supplied values against the normalized output after shutdown.

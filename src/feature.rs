@@ -5720,6 +5720,9 @@ fn mod_positions(
                             all
                         );
                     }
+                    if cel_column_wanted(x, z) {
+                        cel_column_dump(ctx, x, z, top);
+                    }
                     if let Some(y) = y {
                         out.push((x, y, z));
                         any = true;
@@ -5924,6 +5927,33 @@ fn cel_trace(pos: (i32, i32, i32)) -> Option<()> {
         Some(())
     } else {
         None
+    }
+}
+
+/// `CEL_COLUMN_TRACE=x,z`: the live feature-facing state of one column, from the
+/// `MOTION_BLOCKING` top down, one `CCELL` line per cell.
+///
+/// Why: `cel_layer_ys` says which boundaries the walk found, which localises a layer-count
+/// difference to a column but not to a cell. The comparison that settles it is against a saved
+/// column (or a `--mode carvers` dump), and a boundary list cannot say whether the walk saw a
+/// different block or the same block one y lower. This prints the states the walk read, through the
+/// same `FC::get`, so the answer is the read itself rather than a rederivation of it.
+fn cel_column_wanted(x: i32, z: i32) -> bool {
+    static CACHE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    let want = *CACHE.get_or_init(|| {
+        let raw = std::env::var("CEL_COLUMN_TRACE").ok()?;
+        let (a, b) = raw.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    });
+    want == Some((x, z))
+}
+
+fn cel_column_dump(ctx: &mut FC<'_>, x: i32, z: i32, top: i32) {
+    let mut y = top;
+    while y >= ctx.g.min_y {
+        let (st, src) = ctx.get_src(x, y, z);
+        eprintln!("CCELL {x} {y} {z} {st} {src}");
+        y -= 1;
     }
 }
 

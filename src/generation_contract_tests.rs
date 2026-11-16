@@ -6542,6 +6542,34 @@ fn cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks() {
     );
 }
 
+/// `FC::get_src` is the provenance-annotated form of `FC::get` that `CEL_COLUMN_TRACE`
+/// prints. A trace that cannot name *which* layer answered turns a read disagreement into
+/// "the column is different", which is what the `(-25,22)` delta investigation needed to
+/// avoid: the same chunk's post-carve dump and a feature-time read disagreed, and only the
+/// tag said the feature-time answer came from the terrain read-through cache.
+///
+/// The invariant is that the state agrees with `FC::get` while the tag names the layer:
+/// a feature write is `wr`, a cached terrain read is `rc`, the carver layer is `ovr`, and a
+/// fresh `terrain_cell` is `terrain`.
+#[test]
+fn cel_column_trace_tags_the_layer_that_answered() {
+    let reg = breg().unwrap();
+    let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
+    let mut ctx = context(&mut g);
+    ctx.test_default_air = true;
+    let stone = reg.state_of("minecraft:stone", None);
+    // `test_base_cell` seeds the terrain read-through cache, so the first read is `rc`.
+    ctx.test_base_cell((0, 10, 0), stone);
+    assert_eq!(ctx.get_src(0, 10, 0), (stone, "rc"));
+    // An uncached cell is a fresh terrain read, and that read is what fills the cache.
+    assert_eq!(ctx.get_src(0, 11, 0), (0, "terrain"));
+    assert_eq!(ctx.get_src(0, 10, 0), (stone, "rc"));
+    // A feature write outranks every layer below it.
+    ctx.set(0, 10, 0, 0);
+    assert_eq!(ctx.get_src(0, 10, 0), (0, "wr"));
+    assert_eq!(ctx.get(0, 10, 0), 0, "the tag must not change the answer");
+}
+
 /// `WorldGenRegion.ensureCanWrite` (`arb.f_`): the FEATURES step's
 /// `blockStateWriteRadius` is 1 chunk, so a write further than one chunk from the
 /// decorated chunk is dropped and the writer's next read still sees the old cell.

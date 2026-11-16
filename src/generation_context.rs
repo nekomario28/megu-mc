@@ -210,6 +210,25 @@ impl<'a> FC<'a> {
         self.rc.insert((x, y, z), st);
         st
     }
+    /// `FC::get` with the provenance of the answer: `wr` (a feature write), `rc` (a cached
+    /// terrain read), `ovr` (the carver layer) or `terrain` (a fresh `terrain_cell`). Used by
+    /// `CEL_COLUMN_TRACE`: a column read that disagrees with the same chunk's dump has to say
+    /// *which* layer answered before it can be attributed.
+    ///
+    /// The tag is decided first and the value is then read through `get`, so this cannot
+    /// drift from the read it annotates.
+    pub(crate) fn get_src(&mut self, x: i32, y: i32, z: i32) -> (u32, &'static str) {
+        let tag = if self.wr.contains_key(&(x, y, z)) {
+            "wr"
+        } else if self.rc.contains_key(&(x, y, z)) {
+            "rc"
+        } else if self.g.feature_override(x, y, z).is_some() {
+            "ovr"
+        } else {
+            "terrain"
+        };
+        (self.get(x, y, z), tag)
+    }
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, st: u32) {
         // Refused before anything about this write is recorded (the override map, the
         // feature heightmap tally and the writer's own later reads), because vanilla's

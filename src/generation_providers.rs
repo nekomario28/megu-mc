@@ -948,6 +948,32 @@ pub(crate) fn is_dirtish(reg: &BReg, st: u32) -> bool {
 ///
 /// The Overworld's uninitialized skylight reads 15; a dimension without skylight (the
 /// Nether, the End) reads its block light, which is 0 before anything lights the chunk.
+///
+/// **This model is contradicted by measurement and is kept only until the other half of
+/// the mechanism is observed (2026-11-16).** `-Dmushroomchunk=<cx>,<cz>` arms a hook on
+/// `MushroomBlock.canSurvive` (`dla.a(dtc,dcz,jd)`) that logs the int the method reads from
+/// `dcz.b(pos, 0)` while preserving it (`tools/carve-agent/Agent.java`,
+/// `CarveLog.mushroomLight`). Measured on captures bound to this tree:
+///
+/// | capture (seed 4242, frozen, structures) | reads | values |
+/// |---|---|---|
+/// | Nether `(-25,19)+3x3` | 464 | 464 x `0` |
+/// | Overworld `(4,-32)+3x3` (village taiga) | 403 | 401 x `0`, 1 x `1`, 1 x `2` |
+///
+/// So the reference's value at `FEATURES` time is 0 in *both* dimensions, including under
+/// an Overworld canopy: this function's 15 is wrong for the Overworld. It is not replaced
+/// here because the observable residual has a second half. The reference also *places* the
+/// mushrooms the residual is about and its saved chunk then does not contain them
+/// (`FCELL ... wrote=true` for all 28 Nether writes, 24 in the saved chunk; 3 taiga writes,
+/// 1 in the saved chunk), and a brightness-only change moves the village-taiga fixture
+/// from 4 diffs to 5: it places the canopy mushroom the reference places (+1 correct) and
+/// two open-sky mushrooms whose saved-chunk fate is the unobserved half. The missing
+/// observation is the block-shape update vanilla runs after `INITIALIZE_LIGHT`
+/// (`ProtoChunk.postProcessGeneration` over `markPosForPostprocessing` cells, whose mark
+/// set gate is `BlockState.hasPostProcess`), where `BushBlock.updateShape` re-asks
+/// `canSurvive` against a *lit* engine and turns a mushroom into air.
+///
+/// See `evidence/gameplay/feature-parity/light-and-lost-writes-20261116.md`.
 fn uninitialized_raw_brightness(ctx: &FC) -> u8 {
     if ctx.g.has_skylight() {
         15
@@ -1101,14 +1127,9 @@ pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z:
             // cells the reference places on netherrack, so the solid-render reading is the one the
             // reference implements.
             //
-            // The brightness half is measured too. FC runs fresh FEATURES, before
-            // `INITIALIZE_LIGHT`, so the read is of an uninitialized light engine:
-            // `BlockAndTintGetter.getRawBrightness` (`dbz.b(jd,int)`) is
-            // `getLightEngine().getRawBrightness(pos, amount)`, whose sky half is
-            // `SkyLightSectionStorage.e(pos,false)` - 15 for a column with no lit section data -
-            // and whose block half is `BlockLightSectionStorage`, 0 before anything lights the
-            // chunk. So the Overworld reads 15 and a dimension without a sky layer reads 0, which
-            // is `uninitialized_raw_brightness`.
+            // The brightness half is measured too, and it contradicts the model above; see
+            // `uninitialized_raw_brightness` and
+            // `evidence/gameplay/feature-parity/light-and-lost-writes-20261116.md`.
             reg.in_tag(below, "minecraft:mushroom_grow_block")
                 || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))
         }

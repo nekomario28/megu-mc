@@ -685,6 +685,12 @@ check "an uninitialized sky light reads 15, a dimension without one reads block 
     }' \
   '    15' \
   feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support
+check "a traced column names the layer that answered it" \
+  src/generation_context.rs '        } else if self.rc.contains_key(&(x, y, z)) {
+            "rc"' \
+  '        } else if self.rc.contains_key(&(x, y, z)) {
+            "terrain"' \
+  feature::generation_contract_tests::cel_column_trace_tags_the_layer_that_answered
 check "matching_fluids uses the fluid rather than block type" \
   src/generation_providers.rs '            let f = reg.fluid_name(st);' \
   '            let f = reg.name_of(st);' \

@@ -1493,6 +1493,7 @@ fn beard_chunk_data(g: &mut Gen, cx: i32, cz: i32) -> BeardChunkData {
     if interesting.is_empty() {
         return data;
     }
+    let interesting_len = interesting.len();
     let (x0, z0) = (cx << 4, cz << 4);
     for (x, z) in interesting {
         for start in starts_cached(g, x, z).iter() {
@@ -1508,6 +1509,16 @@ fn beard_chunk_data(g: &mut Gen, cx: i32, cz: i32) -> BeardChunkData {
             let mut push = |b: &BB| {
                 if !bb_close_to_chunk(b, cx, cz, 12) {
                     return;
+                }
+                // The ids are only needed by `BEARD_TRACE`: a rigid box that the saved
+                // reference chunk does not justify has to name the start that produced it.
+                if crate::trace_env::env_str!("BEARD_TRACE")
+                    .is_some_and(|want| want == "all" || want == format!("{cx},{cz}"))
+                {
+                    eprintln!(
+                        "BEARDPIECE {cx},{cz} {} start={},{} bb={:?}",
+                        start.structure, start.key.0, start.key.1, b
+                    );
                 }
                 data.rigids.push(BeardRigid {
                     min: [b[0], b[1], b[2]],
@@ -1577,6 +1588,22 @@ fn beard_chunk_data(g: &mut Gen, cx: i32, cz: i32) -> BeardChunkData {
                 }
             }
         }
+    }
+    // `BEARD_TRACE=<cx>,<cz>`: the beardifier input for one chunk, after every start in the
+    // +/-8 window has been asked. This is the answer `NoiseChunk.fillFromNoise` shapes the
+    // terrain with, so a feature-time column read that disagrees with the same chunk's
+    // un-beardified dump is attributed here instead of inferred from a four-block height
+    // difference (measured 2026-11-16 on the Nether `(-25,22)` delta: the port's beard was
+    // non-empty while the saved reference chunk carries no structure start at all).
+    if crate::trace_env::env_str!("BEARD_TRACE").is_some_and(|want| {
+        want == "all" || want == format!("{cx},{cz}")
+    }) {
+        eprintln!(
+            "BEARD {cx},{cz} rigids={} junctions={} interesting={}",
+            data.rigids.len(),
+            data.junctions.len(),
+            interesting_len
+        );
     }
     data
 }

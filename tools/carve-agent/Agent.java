@@ -801,13 +801,25 @@ public class Agent {
     }
 
     /** WorldGenRegion writes to one named cell, including the writer chunk. */
+    /**
+     * `WorldGenRegion.setBlock` per-cell trace.
+     *
+     * Both overloads are instrumented: `(jd,dtc,II)Z` is the four-argument form
+     * (`Block.UPDATE_*` flags), and the one feature code actually calls through
+     * `WorldGenLevel` is `(jd,dtc,I)Z`. Instrumenting only the first form logged 12
+     * lines for a whole populated Nether fixture (measured 2026-11-16), which reads
+     * as "the features wrote almost nothing" instead of "the hook missed the call".
+     * The fields logged (`pos`, `state`, the return value) exist in both.
+     */
     static byte[] instrumentWrites(byte[] buf,String callback) {
         ClassReader cr = new ClassReader(buf);
         ClassWriter cw = writer(cr);
         cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
             @Override public MethodVisitor visitMethod(int acc, String mn, String md, String sig, String[] ex) {
                 MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
-                if (!mn.equals("a") || !md.equals("(Ljd;Ldtc;II)Z")) return mv;
+                boolean twoArgFlags = md.equals("(Ljd;Ldtc;II)Z");
+                boolean oneArgFlags = callback.equals("featureCell") && md.equals("(Ljd;Ldtc;I)Z");
+                if (!mn.equals("a") || !(twoArgFlags || oneArgFlags)) return mv;
                 return new MethodVisitor(Opcodes.ASM9, mv) {
                     @Override public void visitInsn(int opcode) {
                         if (opcode == Opcodes.IRETURN) {
@@ -826,6 +838,47 @@ public class Agent {
                             super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog",callback,
                                 callback.equals("runtimeCell") ? "(IIIIIZ)V" : "(IIIIZ)V",false);
                             super.visitVarInsn(Opcodes.ILOAD, 30);
+                        }
+                        super.visitInsn(opcode);
+                    }
+                };
+            }
+        }, ClassReader.EXPAND_FRAMES);
+        return cw.toByteArray();
+    }
+
+    /**
+     * `CountOnEveryLayerPlacement.getY` (`eim.a(eiw,int,int,int,int)`): preserve and log the
+     * answer for every sample.
+     *
+     * The placement template draws `x`, `z` and then asks `context.getHeight(MOTION_BLOCKING,
+     * x, z)` for a top, so the port and the reference can consume the same draws and still
+     * disagree about the *column*. Logging `(x, z, top, layer, y)` per call is the reference's
+     * per-column layer list: successive layers of the same `(x, z)` are its boundaries, and the
+     * `y` of a layer one side does not have names the boundary the two sides disagree about
+     * (`Integer.MAX_VALUE` when the column is out of layers). The port prints the same fields
+     * from `mod_positions`' `CEL_TRACE` (`cel_find_y`), so the two traces diff directly.
+     */
+    static byte[] instrumentCelLayers(byte[] buf) {
+        ClassReader cr = new ClassReader(buf);
+        ClassWriter cw = writer(cr);
+        cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+            @Override public MethodVisitor visitMethod(int acc, String mn, String md, String sig, String[] ex) {
+                MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                if (!mn.equals("a") || !md.equals("(Leiw;IIII)I")) return mv;
+                return new MethodVisitor(Opcodes.ASM9, mv) {
+                    @Override public void visitInsn(int opcode) {
+                        if (opcode == Opcodes.IRETURN) {
+                            // locals: 1 = x, 2 = top, 3 = z, 4 = layer; the answer is on the stack.
+                            super.visitVarInsn(Opcodes.ISTORE, 220);
+                            super.visitVarInsn(Opcodes.ILOAD, 1);
+                            super.visitVarInsn(Opcodes.ILOAD, 3);
+                            super.visitVarInsn(Opcodes.ILOAD, 2);
+                            super.visitVarInsn(Opcodes.ILOAD, 4);
+                            super.visitVarInsn(Opcodes.ILOAD, 220);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "celLayer",
+                                "(IIIII)V", false);
+                            super.visitVarInsn(Opcodes.ILOAD, 220);
                         }
                         super.visitInsn(opcode);
                     }
@@ -922,6 +975,7 @@ public class Agent {
             if ("arb".equals(name) && (System.getProperty("featurecell") != null || System.getProperty("featurebox") != null)) return instrumentWrites(buf,"featureCell");
             if ("dcw".equals(name) && (System.getProperty("runtimecell") != null || System.getProperty("runtimebox") != null)) return instrumentWrites(buf,"runtimeCell");
             if ("dla".equals(name) && System.getProperty("mushroomchunk") != null) return instrumentMushroomLight(buf);
+            if ("eim".equals(name) && System.getProperty("celchunk") != null) return instrumentCelLayers(buf);
             if ("edq".equals(name)) return instrumentFeatureOrigin(buf, "tree");
             if ("edc".equals(name) && System.getProperty("patchchunk") != null) return instrumentFeatureOrigin(buf, "patch");
             if ("eck".equals(name) && System.getProperty("geodechunk") != null) return instrumentFeatureOrigin(buf, "geode");

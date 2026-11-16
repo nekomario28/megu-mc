@@ -342,6 +342,22 @@ public class CarveLog {
         } catch(ReflectiveOperationException e) {throw new IllegalStateException("seagrass read probe",e);}
     }
 
+    /**
+     * `CountOnEveryLayerPlacement.getY` answer for one sample.
+     *
+     * `-Dcelchunk=cx,cz` selects a chunk (plus its one-chunk halo, the write radius of the
+     * FEATURES step), matching the port's `CEL_TRACE`. `y` is
+     * `2147483647` (`Integer.MAX_VALUE`) when the column has no `layer`th boundary, which is the
+     * case that says "one side has a layer here and the other does not".
+     */
+    public static void celLayer(int x, int z, int top, int layer, int y) {
+        String want = System.getProperty("celchunk");
+        if (want == null || !overworld()) return;
+        String[] a = want.split(",");
+        if (Math.abs((x >> 4) - Integer.parseInt(a[0])) > 1 || Math.abs((z >> 4) - Integer.parseInt(a[1])) > 1) return;
+        System.out.println("NCEL " + x + " " + z + " top=" + top + " layer=" + layer + " y=" + y);
+    }
+
     public static void mushroomLight(int x, int y, int z, int light) {
         String want = System.getProperty("mushroomchunk");
         if (want == null || !overworld()) return;
