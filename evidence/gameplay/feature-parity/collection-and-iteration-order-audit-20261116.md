@@ -319,15 +319,16 @@ The jungle-temple number **goes up by five**, and that is reported rather than t
 
 so 116 + 9 − 4 = 121. Both sides place **zero** cocoa cells in the chunk (measured:
 `FEATURE_WRITE_TRACE` on the port, and the native chunk scanned for the cocoa family), so nothing
-about the cocoa positions moved — the whole delta is a *draw-count* cascade: with the correct
+about the cocoa positions moved. The **hypothesis** is a *draw-count* cascade: with the correct
 plane order a cocoa pass takes `isAir` decisions in a different sequence, spends a different
-number of `nextInt(3)` AGE draws, and every later tree in the same pass shifts. Those `isAir`
-answers are the port's, not the reference's — this chunk's canopy is already not the reference's
-(116 pre-existing diffs, whole trees missing at the east edge, `x=1198..1199` exactly where the 9
-new cells are). A fixture whose world state differs at the decision point cannot adjudicate the
-order that feeds the decision: the order is decided by `ji$c.<clinit>`, which is not ambiguous.
-The number is recorded, with the cells, so the lane that fixes the east-edge canopy can re-measure
-it.
+number of `nextInt(3)` AGE draws, and every later tree in the same pass shifts. That attribution is
+**inherited, not re-provable**: the two revert variants' sources were not kept, and the
+before/cocoa-only dumps share one sha256 (`70b3afe0…`), so "cocoa walk only" and "both reverted"
+are the same artifact. The 9 leaves are also *new* differences, not cells that existed and were
+carried — "the correct rule applied to an already-broken world" is a reading, not a measurement.
+The order itself is settled by `ji$c.<clinit>` and is not ambiguous. The number is recorded with
+the cells so the lane that owns the east-edge canopy can re-measure it; that the east-edge fix will
+*lower* the number is a hypothesis, not a proven cause.
 
 ### 独立再測定と受入判定（2026-11-16, integration acceptance audit）
 
@@ -342,18 +343,21 @@ it.
 - 121 側の差分内訳も一致: `air -> oak_leaves` が 9 セル
   （`x=1198..1199`, `y=73..75`, `z=-655/-656` 付近）、`short_grass`/`fern -> air` は 11 セル
   （うち 4 が新規に正しい）。
-- **機構の切り分け**: `horizontal_dir` は正しいまま、cocoa decorator の walk
-  （`for f in plane_horizontal()`）**だけ**を旧配列に戻すと **116** に戻る。
-  つまり +5 の全量は cocoa pass の描画消費に帰属し、trunk の `getRandomDirection` は
-  この fixture に寄与しない。監査の説明と一致した。
+- **機構の切り分け（継承・再証明不能）**: `horizontal_dir` は正しいまま、cocoa decorator の walk
+  （`for f in plane_horizontal()`）**だけ**を旧配列に戻すと **116** に戻る、という記録がある。
+  ただし revert した2変種の source は保存されておらず、before と cocoa-only の dump は
+  **同一 sha256**（`70b3afe0…`）であるため、「cocoa だけ戻した」と「両方戻した」は保存物から
+  区別できない。よって「+5 の全量が cocoa pass に帰属」は**継承主張**で、独立再現はできない。
 - **cocoa は両側で 0 セル**: port の dump と native の保存チャンクの両方で
-  chunk (74,-41) の cocoa 状態は 0。位置は動いていない。
+  chunk (74,-41) の cocoa 状態は 0。位置は動いていない（レビューも独立に確認）。
 
 受入判定: **コンポーネントとしては ACCEPT**（配列順は native と一致し、契約テストと変異で
-押さえられている）。ただし **fixture の指標としては未達**（jungle が 116 -> 121）。
-この 2 つは別物として扱う。+5 は「正しい規則を、既に壊れている世界状態に適用した」結果で
-あり、east-edge の canopy 欠陥が直るまで jungle の数字は改善しない。再測定の条件は
-「east edge の樹が native と一致すること」。座標を動かして数字を合わせることはしない。
+押さえられている）。ただし **fixture の指標としては HOLD**（jungle が 116 -> 121）。
+この 2 つは別物として扱う。121 の内訳は「port が native に無い leaves を 9 セル置き、
+`short_grass`/`fern` の 4 セルが新たに正しくなった」であって、差分セル数が増えたこと自体は
+良し悪しの判定ではない。east-edge の canopy 欠陥が直れば数字が下がる、というのは
+**仮説**で、測定された原因ではない。再測定の条件は「east edge の樹が native と一致すること」。
+座標を動かして数字を合わせることはしない。
 
 The other five fixtures move zero cells, and the reason is measured, not assumed:
 

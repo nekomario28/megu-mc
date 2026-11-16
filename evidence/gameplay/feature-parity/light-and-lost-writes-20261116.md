@@ -271,29 +271,33 @@ Gates: `tools/layers_check.sh` PASS, `tools/debt_ratchet.sh` 0 over limit,
 3. The 49-pop fixtures should be regenerated at the footprint vanilla actually completes, or the
    comparison should state that a residual measured on them is a footprint artifact.
 
-## 独立再測定（2026-11-16, integration acceptance audit）
+## 独立再測定（2026-11-16, integration acceptance audit）— 継承・再検証不能
 
-このページの数値を、統合候補の実バイナリで独立に取り直した。すべて一致した。
+この節は統合時の記録として残すが、**いま独立に再検証することはできない**。当時の capture と
+計器出力は `/tmp/captures` 配下にあり、そのディレクトリは現存しない。native fixture
+`/tmp/nat-4242-nether-fossil` の本体は残るが、`poporder.tsv` は host 上に見つからない。
+したがって下の表は「当時そう測定した」という**継承主張**であり、同条件の再現は保存物からは
+閉じない。数字を作り直すこともしない。
 
-| 主張 | 独立測定 | 一致 |
+| 主張 | 当時の測定 | 記録 |
 |---|---|---|
-| Nether の `getRawBrightness` は 464/464 = 0 | `nat-nf-str/run.log` の `MLIGHT` = 464行、全て `light=0` | ✓ |
-| taiga は 401/403 = 0、1と2が各1 | `nat-taiga-mlight/run.log` の `MLIGHT` = 403行（401×0, 1×1, 1×2） | ✓ |
-| 28 writes / 24 in the save / 4 absent = port の余分4セル | FCELL の mushroom(state 2089/2090) = 28、全て `chunk=-25,19 wrote=true`。save 側は 24（red 12 + brown 12）。余分4セル `(-396,38,304) (-400,39,308) (-395,38,307) (-399,39,308)` は4つとも native で air | ✓ |
-| 81-pop capture で 4 diffs、basalt なし | `--pop-order nat-nf-str/poporder.tsv --pop-order-scope recorded` → `4 / 294912`、内訳は air→red×2, air→brown×2、basalt 0 | ✓ |
-| NCEL 226 samples / 149 columns（両側） | native `NCEL` in chunk (-25,22) = 226 / 149。port `CEL_TRACE=-25,22` = 226 | ✓ |
-| 149列中7列が 1-4 低い、top は 128 で一致 | (x,z,layer) 209 key の突き合わせで差分 7 sample / 7 column、delta -1,-1,-2,-3,-4,-4,-4。両側 `top=128` のみ | ✓ |
-| `BEARDPIECE -25,22 minecraft:nether_fossil start=-24,22 bb=[-384,88,366,-382,91,367]` | port の `BEARD_TRACE=all` で同一行を再現 | ✓ |
-| `BEARD -25,22 rigids=1 junctions=0 interesting=73` | 同一行を再現 | ✓ |
-| reference の fossil start は `(-22,20)` と `(-22,22)` だけ、port は `(-24,22)` も | native の `structures.starts` を 9x9 で走査 → 2件のみ。port の `BEARDPIECE` は (-22,20), (-22,22), (-24,22) | ✓ |
+| Nether の `getRawBrightness` は 464/464 = 0 | `nat-nf-str/run.log` の `MLIGHT` = 464行、全て `light=0` | 継承 |
+| taiga は 401/403 = 0、1と2が各1 | `nat-taiga-mlight/run.log` の `MLIGHT` = 403行（401×0, 1×1, 1×2） | 継承 |
+| 28 writes / 24 in the save / 4 absent = port の余分4セル | FCELL の mushroom(state 2089/2090) = 28、全て `chunk=-25,19 wrote=true`。save 側は 24（red 12 + brown 12）。余分4セル `(-396,38,304) (-400,39,308) (-395,38,307) (-399,39,308)` は4つとも native で air | 継承 |
+| 81-pop capture で 4 diffs、basalt なし | `--pop-order nat-nf-str/poporder.tsv --pop-order-scope recorded` → `4 / 294912`、内訳は air→red×2, air→brown×2、basalt 0 | 継承（poporder 不在） |
+| NCEL 226 samples / 149 columns（両側） | native `NCEL` in chunk (-25,22) = 226 / 149。port `CEL_TRACE=-25,22` = 226 | 継承 |
+| 149列中7列が 1-4 低い、top は 128 で一致 | (x,z,layer) 209 key の突き合わせで差分 7 sample / 7 column、delta -1,-1,-2,-3,-4,-4,-4。両側 `top=128` のみ | 継承 |
+| `BEARDPIECE -25,22 minecraft:nether_fossil start=-24,22 bb=[-384,88,366,-382,91,367]` | port の `BEARD_TRACE=all` で同一行 | 継承 |
+| `BEARD -25,22 rigids=1 junctions=0 interesting=73` | 同一行 | 継承 |
+| reference の fossil start は `(-22,20)` と `(-22,22)` だけ、port は `(-24,22)` も | native の `structures.starts` を 9x9 で走査 → 2件のみ。port の `BEARDPIECE` は (-22,20), (-22,22), (-24,22) | 継承 |
 
 注記（証拠の強さの境界）:
 
-- `BEARD_TRACE` / `CEL_TRACE` は **port 側**の計器なので capture ディレクトリには残らず、
-  上記の通り実行して再現した。native 側の 226/464 などの数値は `captures/t6b/*/run.log` に残っている。
+- `BEARD_TRACE` / `CEL_TRACE` は **port 側**の計器で、当時の出力も `/tmp` 側だったため
+  capture ディレクトリには残っていない。native 側の `MLIGHT`/`NCEL` 行も同じく現存しない。
 - このページの 4 capture は `inputs.sha256` で統合候補の `Agent.java`/`CarveLog.java`/
   `SculkLog.java`/`build_carve_agent.sh` のハッシュと一致し、jar も sha256
-  `e3bc5569…`（= pinned 1.21.1 の `59353fb4…` の bundler）で一致する。つまり capture は
-  この候補の source に結ばれている。
+  `e3bc5569…`（= pinned 1.21.1 の `59353fb4…` の bundler）に結ばれていた。引用された hash 値が
+  候補と一致することは独立レビューが確認しているが、**`inputs.sha256` のファイル自体は現存しない**。
 - 28 writes / 24 saved という**事実**は、最終的にどの writer が消すかまでは特定していない。
   `hasPostProcess`/`postProcessGeneration`/lighting は依然として未測定の仮説である（本文 §3 のまま）。

@@ -3581,10 +3581,12 @@ fn spc_decay_delay(kind: SpcKind, delay: i32) -> i32 {
 /// `canSupportCenter` question a torch or a plant asks.
 ///
 /// The body used to be `is_solid(st) && side_solid(st, dir)`, which added a `blocksMotion`
-/// gate vanilla does not have: measured against the pinned table that denied the support under
-/// a repeater (64 states), scaffolding (32), a comparator (16), a snow layer (13), a ladder (8)
-/// and every carpet (1 each) on the DOWN face alone. Shared by the sculk cursor, the block pile's
-/// `tryPlaceBlock` and the bonus chest's torches, so it carries no single feature's name.
+/// gate vanilla does not have and denied the support on more states than native does. The
+/// per-face counts live with the table that owns them
+/// (`evidence/foundation/block-state-facts-20261116/README.md`) rather than here: an earlier
+/// inline breakdown attributed every face's states to DOWN and did not add up. Shared by the
+/// sculk cursor, the block pile's `tryPlaceBlock` and the bonus chest's torches, so it carries
+/// no single feature's name.
 fn face_sturdy(reg: &BReg, st: u32, dir: u8, support: Support) -> bool {
     reg.is_face_sturdy(st, dir, support)
 }

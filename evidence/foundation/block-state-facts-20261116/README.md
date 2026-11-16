@@ -31,18 +31,29 @@ outline で、下記の通り 5,124状態を反転させた）。
 ## 輸出器を壊しうる取り違え（実測）
 
 `dtb$a` には `(BlockGetter, BlockPos) -> VoxelShape` を返すメソッドが5つある。
-`tools/structure-oracle` の既存オラクルが使っていた `c` は **outline** で、衝突形状ではなかった。
-候補ごとに、`assets/pblocks.json` の衝突形状リストと全状態で突き合わせた結果:
+`tools/structure-oracle` の既存オラクルが使っていた `c` は **outline** で、衝突形状ではなかった
+（5,124状態の逆転として今も成立する）。
 
-| メソッド | 資産との不一致 |
+以下は **2026-11-16 の同定作業が実際に記録した数値**だが、**同定の根拠としては撤回する**
+（履歴として残す。消さない）:
+
+| メソッド | 資産との不一致（当時の記録） |
 |---|---|
 | `k` | **1**（`pitcher_crop[age=0,half=upper]`）|
 | `l` | 986 |
 | `c` / `j` | 5,124 / 4,881 |
 | `m` | 21,613 |
 
-`k` を採用し、`short_grass` / `torch` / `dirt_path` をアンカーに、
-**outline を掴んだら落ちる**ようにした（5,124状態が反転したまま公開されるところだった）。
+撤回の理由（bytecode を読み直した結果）: `dtc.l` は `dtb.b_` 経由で
+`dtb.b(state, level, pos, CollisionContext.empty())` を呼び、`dtc.k` は**同じ4引数**を
+（キャッシュがあればそれを返す点だけ違って）呼ぶ。両者は同じ計算で、差はキャッシュの有無だけ。
+したがって「`l` は 986 不一致だから衝突形状ではない」という推論はこの bytecode では支えられない。
+**この表を `k ≠ l` の証拠として引用しない。**
+
+`k` の採用を支えているのは別の測定である: 26,684状態での旧資産
+`collision_shape_full_1211.bin` との **0 不一致**（下記「監査」節）と、
+`short_grass` / `torch` / `dirt_path` のアンカーで **outline を掴んだら落ちる**こと
+（5,124状態が反転したまま公開されるところだった）。
 
 同じ理由で `isEmpty()` も名前ではなく振る舞いで同定している
 （`VoxelShape` と `FluidState` で別名、型ごとに0引数booleanが複数ある）。
@@ -156,8 +167,16 @@ pinned `server.txt` mappings が無い環境でも決着できるよう、obfusc
 `BlockState` = `dtc extends dtb$a`、`SculkShriekerBlock` = `dts.G`(`can_summon`) を参照する唯一の block）。
 
 - 3引数 `isFaceSturdy` は `dtb$a.d(dcc,jd,ji)` で、本体は `doa.a`(FULL) を積んで4引数へ委譲する。
-  `doa$1`(FULL) の本体は `isFaceFull(getCollisionShape(level,pos), dir)` — state の衝突形状だけで決まり、
-  近傍を読まない。よって pinned 表の列として妥当。
+  `doa$1`(FULL) の本体は `isFaceFull(state.l(level,pos), dir.getOpposite())` で、**自分では
+  近傍セルを読まない**。ただし `l` は level/pos を取る衝突形状 accessor（`dtb.b_` →
+  `dtb.b(..., CollisionContext.empty())`）で、`k` はキャッシュがあればそれを、無ければ同じ4引数を
+  呼ぶ。よって「近傍を読まない」は本体のコードについての事実で、**state 局所性は
+  stone / air / `EmptyBlockGetter` の3世界での実測**（block entity を持たない位置）で示された
+  性質である。表では `moving_piston` 2063..2074 が `colEmpty`・FULL/CENTER/RIGID すべて空
+  （= `EmptyBlockGetter` の答え）で、native の live な moving piston は運搬 block の形状を返すので
+  面があり得る。当 port は moving_piston を生成しないため生成経路では到達しないが、
+  **live 文脈での一致は未証明**。したがって表の適用範囲は「観測したキャッシュ済み/クエリ/
+  生成済みの state」に限る。
 - `canSupportCenter` は `dfy.a(dcz,jd,ji)` で `doa.b`(CENTER) を使う。CENTER と FULL は別平面。
 
 | port の site | native の本体 | 呼び出し | 判定 |
@@ -170,7 +189,9 @@ pinned `server.txt` mappings が無い環境でも決着できるよう、obfusc
 残る差は1点だけ: `MultifaceBlock.canAttachTo` は衝突形状と support 形状の**両方**を OR するが、
 port は `Support::Full` の片方（衝突形状）だけを問う。したがって vein の site では port が
 **reference より厳しい**（付くはずの vein を拒みうる）。FULL と CENTER の取り違えではなく、
-6A 以前の `is_solid && side_solid` より緩い方向への変更でもない。未修正・記録のみ。
+6A 以前の `is_solid && side_solid` より緩い方向への変更でもない。**未修正・記録のみ。**
+この arm 2 の欠落は 6A の導入ではなく **pre-existing**（`787f781` の親でも片側だけ）で、
+独立レビューも「6A が持ち込んだ差ではない」と確認している。
 
 ## 残件（意図的に触っていない）
 

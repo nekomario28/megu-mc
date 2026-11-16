@@ -3,6 +3,12 @@
 状態: **統合候補を構築し、実 SHA 上で検証した。canonical checkout へは未着地。**
 この文書は索引であり、置き換えではない。数値はすべて下記の実行ログに紐づく。
 
+**2026-11-16 追補（最終 remediation）**: 独立レビュー `5dcaf3a` の F1–F6 をこの文書に反映した。
+変更は文書と `src/feature.rs` の docstring だけで、production の意味は変えていない。
+新しい測定は `/home/yuu/mc-spine-local/audit/final-landing-20261116-1415/` にあり、
+以下の各節で「継承（当時の測定、いま再検証不能）」と「今回測った」を分けて書く。
+canonical `perf/worldgen-parallel`（`e7ead8e`）はこの remediation の間も**未変更**。
+
 - 作業 worktree: `/home/yuu/.t3/worktrees/mc-spine/t3-b2eb8ad1-ebf296b8314a2ff7`
 - branch: `t3/worldgen-integration-audit`
 - base: `e7ead8e66466b0b6467450cd3ea31d86a0e39cd3`（`perf/worldgen-parallel`）
@@ -70,16 +76,26 @@ cherry の branch が同じ配列を読む。
 
 文脈の限界（重要）:
 
-- `assets/block_state_facts_1211.bin` は **state の性質**。`initCache()` が構築時に解決するため
-  近傍に依存しない（6A が stone/air/`EmptyBlockGetter` の3世界で全列 0 差分を測定）。
-  独立レビューでも `SupportType.FULL.isSupporting` の本体が
-  `isFaceFull(getCollisionShape(level,pos), dir)` のみで、level の他セルを読まないことを確認した。
-- したがって **文脈依存なのは `getRawBrightness` の側だけ**であり、6B が扱う残差の
+- 表は **state ごとの性質**で、`initCache()` が構築時に解決するキャッシュを読む。state 局所性は
+  6A が stone / air / `EmptyBlockGetter` の3世界で全列 0 差分を測った**実測**であり、
+  「任意の文脈で同じ」ことの証明ではない。
+- `SupportType.FULL.isSupporting`（`doa$1`）の本体は自分では近傍セルを読まず、
+  `isFaceFull(state.l(level,pos), dir)` に委譲する。`dtc.l` は level/pos を取る衝突形状
+  accessor（`dtb.b_` → `dtb.b(..., CollisionContext.empty())`）で、`dtc.k` はキャッシュが
+  あればそれを、無ければ**同じ4引数**を呼ぶ。よって bytecode から言えるのは「本体は近傍を
+  読まない」までで、block entity を持つ位置の live な形状は3世界の測定の外側にある。
+  表では `moving_piston` 2063..2074 が `blocksMotion|colEmpty|fluidEmpty` で FULL/CENTER/RIGID
+  すべて空（= `EmptyBlockGetter` の答え）。native の live な moving piston は運搬 block の
+  形状を返すので面があり得るが、当 port は moving_piston を**生成しない**
+  （`src/main.rs:11019` は名前→id、`src/feature.rs:3399` は判定用の名前一致のみ、
+  piston シミュレーション無し）ため生成経路では到達しない。**live 文脈での一致は未証明**で、
+  新しい runtime consumer も足していない。
+- したがって表の適用範囲は「観測したキャッシュ済み/クエリ/生成済みの state」に限る。
+  この範囲で **文脈依存なのは `getRawBrightness` の側だけ**であり、6B が扱う残差の
   明るさ半分は表では解けない（6B の結論どおり）。
 - 3つの空/石世界での all-state 一致は「任意の文脈で同じ」ことの証明にはならない。
-  今回のレビューはその主張をしていない。表の妥当性は
-  (a) `initCache` 由来の state 局所性、(b) 26,684状態の再輸出一致、(c) 呼び出し地点ごとの
-  native 本体の同定、の3点で支えている。
+  表の妥当性は (a) 3世界での all-state 0 差分（上記の限定つき）、(b) 26,684状態の
+  再輸出一致、(c) 呼び出し地点ごとの native 本体の同定、の3点で支えている。
 
 ## 4. 最初に観測した分岐と、実際に走った経路
 
@@ -101,10 +117,11 @@ cherry の branch が同じ配列を読む。
 | `tools/layers_check.sh` | PASS (42 modules, 108 edges) | `static-gates.log` |
 | `tools/debt_ratchet.sh` | 0 over limit | 同上 |
 | `python3 tests/gate_scripts.py` | PASS（6 self-test すべて） | 同上 |
-| Python unit 37 本（`tests/verify.sh` の一覧） | 37/37 exit 0 | `python-units.log` |
-| `tests/layers_gate_test.py`（17 tests） | OK（**`depsgx` が PATH に必要**） | 同上 |
+| Python unit（`tests/verify.sh` の 37 ファイル） | **当初の記載「37/37 exit 0」は誤り**。`python-units.log` は 36 entry = 35 exit 0 + `layers_gate_test` exit 1（depsgx 不在で 16 failures）。末尾の `layers_gate_exit=0` は変数だけで、合格再実行の出力は保存されていない。再実行は §5.1 | `python-units.log` |
+| `tests/layers_gate_test.py`（17 tests） | depsgx を PATH に置いた再実行で **17/17 OK**（§5.1） | `final-landing-20261116-1415/python-units-rerun2/` |
 | `tools/block_state_facts_from_jar.py`（`--check` 相当） | **26,684 states match**（pinned jar sha1 `59353fb4…`） | `exporter-check.log` |
-| focused mutation 14 entry | **14 proved / 0 skipped / 0 parked / 0 not-a-gate** | `mutations-summary.log`, `mutation-logs/` |
+| focused mutation（追加 15 entry のうち 14） | **14 proved / 0 skipped / 0 parked / 0 not-a-gate**。追加集合は 15（5C 3 / 6A 6 / **6B 1** / 6C 5）なので当時 1 件未実行だった（§6・§16-2） | `mutations-summary.log`, `mutation-logs/` |
+| 6B の未実行 1 件の追加実行（2026-11-16） | `a traced column names the layer that answered it` = **ok / proved**（`src/generation_context.rs`、filter `cel_column_trace_tags_the_layer_that_answered`）: baseline green → mutant `test result: FAILED. 0 passed; 1 failed`（`left: (1, "terrain") right: (1, "rc")`、`error[E` 0 件）→ restored green | `final-landing-20261116-1415/mutation-logs/` |
 
 ログ digest（sha256）:
 
@@ -118,6 +135,32 @@ d557519ea4e467ed637b6362c81bdeab01ce262f50a5049e2f28a926b4756601  exporter-check
 17574a8bd31390618dea4ae9f3183ead319acf019066075e066680828cb37c2e  fixtures.log
 ```
 
+### 5.1 Python unit の再実行（2026-11-16, 最終 remediation）
+
+最初の `python-units.log` は 37 ファイルのうち 36 本しか走っておらず（`gate_scripts.py` は
+`static-gates.log` 側）、その 1 本 `layers_gate_test` は `depsgx` が PATH に無く
+**16 failures / exit 1** だった。末尾の `layers_gate_exit=0` は変数への代入だけで、
+合格した実行の出力は残っていない。よって「37/37 exit 0」は記録として成立しない。
+この履歴は消さない（誤った試行として残す）。
+
+再実行（`final-landing-20261116-1415/python-units-rerun2/`）:
+
+- 一覧は `tests/verify.sh` の `^python3 tests/*.py` 行を機械抽出（**ファイル 37**）。
+- 1 ファイルごとに start / end / exit を `entries.log` に記録し、1 つでも exit != 0 なら
+  その場で停止する。集計は行ではなく**明細の集計**で、`SCANNED == ATTEMPTED == ENTRY 行数`、
+  `PASS+FAIL == ATTEMPTED`、`FAIL == 0` を assert する（`run_python_units.sh`）。
+- 結果: **ファイル 37/37 exit 0**、うち unittest のケース合計 **196**（29 ファイルが
+  `Ran N tests` を出す）。`summary.txt` は `SCANNED=37 ATTEMPTED=37 PASS=37 FAIL=0`。
+- 検査器の同定: `depsgx` **1.0.0**、import 元 `/home/yuu/gxkit/packages/depsgx/src`
+  （editable、gxkit **HEAD `973b293a…`**、`packages/depsgx` は clean）。CI の pin は
+  `d6b9ad8…` だが、この host の venv は pin ではない（`merge-base --is-ancestor` = no、
+  `d6b9ad8..973b293 -- packages/depsgx` は 8 files / +120 / −27）。**したがって
+  「pinned depsgx」とは主張しない**。検査器が落ちうることは、同じ gate が `gate_probe.py` に
+  cycle 2 + layer-violation + forbidden-dependency を要求する形で確認される。
+- 負の対照: `MC_SPINE_DEPSGX` を環境に置いたまま実行すると `layers_gate_test` が 4 件失敗し、
+  ランナーは `ASSERT FAILED` / exit 1 で止まった（`python-units-rerun/`）。集計 assert が
+  **発火しうる**ことの実測で、テスト側の env 依存（§17）でもある。
+
 suite の 92.52 s は、5A/5C の `[profile.test] opt-level = 1` によるもの。同じ chain が
 記録した冷間 623.72 s と比較して **6.7 倍**だが、これは同一 SHA の前後比較ではないので
 「623 s → 92 s になった」とは主張しない（profile 変更込みの 1 点測定）。
@@ -125,7 +168,13 @@ suite の 92.52 s は、5A/5C の `[profile.test] opt-level = 1` によるもの
 最終状態の確認: `git diff --stat bef7f53 HEAD -- src/ assets/ tools/ Cargo.toml` は空
 （この報告 commit は `evidence/` だけを触る）。最終 HEAD `32dad84` 上でも full suite を
 1 回実行し、**541 passed / 0 failed / 1 ignored / 92.22 s / exit 0**（`final-suite.log`）。
-つまり数値はコード SHA `bef7f53` に、再現は最終 HEAD に結ばれている。
+
+ただし `final-suite.log` には `start` / HEAD / `git status` / `EXIT=` の行が無い
+（`full-suite.log` にはある）。したがって **その 1 本の HEAD 束縛は log 単体では確認できない**。
+コード同一性は §0 の tree object 比較（`bef7f53` と `2799a36` の `src`/`assets`/`tools`/
+`Cargo.toml` が同一）で別途成立しているので、数値は「`bef7f53` のコードに対する測定」として
+有効だが、`final-suite.log` 単体を HEAD 束縛の証拠として引用しない。以後の suite は
+stamp（start / HEAD / status / EXIT / finish）を必ず残す（§16-6）。
 
 `--list` の 542 と suite の 541+1 ignored は一致する。`ignored` の 1 件は
 `debt_ratchet.sh` が「parked gates: 1」として許容しているもの。
@@ -137,6 +186,12 @@ suite の 92.52 s は、5A/5C の `[profile.test] opt-level = 1` によるもの
 - mutant log 14 本すべてが **assertion failure**（`test result: FAILED`）で、`error[E…]` の
   コンパイルエラーは 0。つまり「ビルドが壊れて赤」ではない。
 - restored log 14 本が存在し、いずれも green（復元制御）。
+- 追加 entry は **15 件**（5C 3 / 6A 6 / 6B 1 / 6C 5）で、上の 14 本はそのうちの 14 件。
+  **6B の `a traced column names the layer that answered it` は当時未実行**で、赤を誰も
+  観測していなかった。2026-11-16 に focused で 1 回だけ実行し、assertion failure と
+  restored green を保存した（§5 の表）。既存 14 本の log は 14 本のまま（数え直していない）。
+- 0 件選択は合格にしない: `MUTATION_FILTER=no_such_test_filter_xyz_20261116` は
+  `0 proved` / **exit 1**（`final-landing…/05b-mutation-zero-selection.log`）。
 - 0 件選択・未実行・`#[ignore]` を成功として数えない実装（5A/5C の
   「filter が 0 件なら PASS ではない」修正）が入った上での実行。
 
@@ -190,6 +245,8 @@ reference はすべて pinned 1.21.1（bundler jar sha1 `59353fb4…` / 内側
 
 - nether-fossil の 60 は pop order を与えない場合の値。6B が「32」と書いたのは
   49-pop の記録順を与えた場合で、別条件。**同じ条件の数字として並べない。**
+- 81-pop の `4 / 294912` は当時の capture（`/tmp/captures`、`poporder.tsv`）に対する測定で、
+  そのディレクトリは**現存しない**。同条件の再現はできず、**継承**として扱う（§16-6）。
 - end-city (`65 45`) は比較不能（port の End dump は 0..128、city の purpur は y=136）。
   監査の記載どおりで、今回も実行していない。
 
@@ -202,7 +259,9 @@ pinned official mappings (`server.txt` sha1 `03f89854…`) はこの host に無
 - `SupportType` = 定数プールに `FULL`+`CENTER`+`RIGID` を持つ唯一のクラス = `doa`
 - 3引数 `isFaceSturdy` = `dtb$a.d(dcc,jd,ji)`（本体が `doa.a`=FULL を積んで4引数へ委譲）
 - `canSupportCenter` = `dfy.a(dcz,jd,ji)`（`doa.b`=CENTER）
-- `SupportType.FULL.isSupporting` = `isFaceFull(getCollisionShape, dir)` — **state 局所**
+- `SupportType.FULL.isSupporting`（`doa$1`）= `isFaceFull(state.l(level,pos), dir)` — 本体は
+  近傍セルを読まないが、`l` は level/pos を取る衝突形状 accessor。**state 局所性は3世界の実測**
+  で、live な block entity 位置は測定外（§3）
 - `SculkShriekerBlock` = `dts.G`(`can_summon`) を参照する唯一の block = `dmt`。
   **`dmt` は `canSurvive` を宣言せず、`SupportType` も参照しない。**
 
@@ -216,9 +275,11 @@ pinned official mappings (`server.txt` sha1 `03f89854…`) はこの host に無
 近似の中身: native は `isFaceFull(collision) || isFaceFull(support)` の OR、port は
 `Support::Full` の片方（collision）だけ。よって vein の site で port は reference より
 **厳しい**。FULL/CENTER の取り違えではなく、6A 以前（`is_solid && side_solid`）より
-緩い方向の変更でもない。**未修正。** 6A の README 残件3 を、この確定内容で更新した。
+緩い方向の変更でもない。**未修正。** この arm 2 の欠落は **6A が持ち込んだものではない**
+（`787f781` の親でも片側だけ。独立レビューが `9fcb5da..787f781` の diff で確認）。記録のみで、
+この pass では直さない。6A の README 残件3 を、この確定内容で更新した。
 
-## 10. 6B: 主張の全数再測定（すべて一致）
+## 10. 6B: 主張の全数再測定（当時の一致。いまは継承）
 
 | 主張 | 独立測定 | 一致 |
 |---|---|---|
@@ -235,6 +296,10 @@ pinned official mappings (`server.txt` sha1 `03f89854…`) はこの host に無
 6B の capture は統合候補の source に結ばれている（`inputs.sha256` の
 `Agent.java`=`ca4ab2df…`, `CarveLog.java`=`c2b7877a…`, `SculkLog.java`=`d7a36549…`,
 `build_carve_agent.sh`=`2062866f…` が全て候補と一致、jar は sha256 `e3bc5569…`）。
+ただし当時の capture と計器出力は `/tmp/captures` 配下で、**現存しない**（native fixture
+`/tmp/nat-4242-nether-fossil` 本体は残るが `poporder.tsv` は無い）。引用された hash 値が
+候補と一致することは独立レビューが確認したが、`inputs.sha256` のファイル自体は残っていない。
+よって上の表は**継承主張**として読む（今回、再測定はしていない。§16-6）。
 
 **主張しないこと**: 28 writes / 24 saved は「どの writer が最終的に消すか」を特定していない。
 `hasPostProcess` / `postProcessGeneration` / lighting は依然として未測定の仮説である。
@@ -248,23 +313,28 @@ pinned official mappings (`server.txt` sha1 `03f89854…`) はこの host に無
    `ji.c, ji.f, ji.d, ji.e` を積み、`ji.<clinit>` は `a=DOWN b=UP c=NORTH d=SOUTH e=WEST f=EAST`）。
    曖昧さは無い。→ 6C の変更は native と一致する。
 2. 候補バイナリで **121 / 98304**。`horizontal_dir` だけ逆向きに戻すと **116 / 98304**。差 +5。
-3. 121 側の内訳: `air -> oak_leaves` 9 セル（x=1198..1199, y=73..75, z=-655/-656 付近）、
-   `short_grass`/`fern -> air` 11 セル（うち 4 が新規に正しい）。
-4. **切り分け**: `horizontal_dir` は正しいまま cocoa decorator の walk **だけ**を旧配列に戻すと
-   **116** に戻る。+5 の全量が cocoa pass の描画消費に帰属し、trunk の `getRandomDirection` は
-   この fixture に寄与しない。監査の機構説明と一致。
+3. 121 側の内訳: `air -> oak_leaves` **9 セル**（x=1198..1199, y=73..75, z=-655/-656 付近、
+   native は air = **port が新しく置いた差**）、`short_grass`/`fern -> air` 11 セル
+   （うち 4 が新規に正しい）、残りは dripstone/deepslate 等（独立レビューが座標まで確認）。
+4. **切り分け（継承・再証明不能）**: `horizontal_dir` は正しいまま cocoa decorator の walk
+   **だけ**を旧配列に戻すと **116** に戻る、という記録がある。ただし revert した2変種の
+   source は保存されておらず、before と cocoa-only の dump は **同一 sha256**
+   （`70b3afe0…`）であるため、「cocoa だけ戻した」と「両方戻した」は保存物から区別できない。
+   よって「+5 の全量が cocoa pass の描画消費に帰属」は**継承主張**である。
 5. cocoa は **両側 0 セル**（port の dump と native の保存チャンクの双方で chunk (74,-41) の
-   cocoa 状態は 0）。位置は動いていない。
+   cocoa 状態は 0）。位置は動いていない（独立レビューも確認）。
 
-判定: **コンポーネントとして ACCEPT / fixture 指標としては未達**。この2つは別物である。
-+5 は「正しい規則を、既に壊れている世界状態に適用した」結果であり、east-edge の canopy 欠陥
-（116 の既存 diff、x=1198..1199 に樹が丸ごと無い）が直るまで jungle の数字は改善しない。
-座標を動かして数字を合わせることはしない。再測定の条件は「east edge の樹が native と一致」。
+判定: **native の意味修正（N,E,S,W）は ACCEPT / fixture 指標は HOLD**。この2つは別物である。
++5 は「正しい規則を、既に壊れている世界状態に適用した」結果だというのは**読み**であって
+測定ではない（9 セルは新規の差）。east-edge の canopy 欠陥が直れば数字が下がる、も**仮説**で、
+測定された原因ではない。座標を動かして数字を合わせることはしない。再測定の条件は
+「east edge の樹が native と一致」。
 
 ## 12. FAIL / SKIP / NOT RUN（明示）
 
 - **NOT RUN**: `tools/mutation_check.sh` の 423 entry 全通し。1 entry あたり baseline + mutant の
-  2 ビルドが必要で、予算外。代わりに 6A/6B/6C/5C が追加した **14 entry を focused で proved**。
+  2 ビルドが必要で、予算外。代わりに 6A/6B/6C/5C が追加した 15 entry のうち **14 を focused で
+  proved** し、残る 6B の 1 件は 2026-11-16 に focused で proved した（§5・§6）。
   全通しの未実行を「green」とは扱わない。
 - **NOT RUN**: `tests/verify.sh` の wire smoke / adapter check (`--features fabric-probe`,
   `neoforge-events`) / 8 スレッド suite ×3。今回の変更集合（worldgen の述語・順序・診断）に
@@ -272,12 +342,16 @@ pinned official mappings (`server.txt` sha1 `03f89854…`) はこの host に無
 - **NOT RUN**: end-city fixture（比較不能、§8）。
 - **SKIP された変異**: 0（focused 実行内）。
 - **環境依存**: `tests/layers_gate_test.py` は `depsgx` が PATH に必要。PATH 無しでは 16 失敗
-  するが、それは環境の欠落であってコードの欠陥ではない（`/home/yuu/gxkit/.venv/bin` を
-  前置して 17/17 OK）。`tools/layers_check.sh` も同じ前提。
+  するが、それは環境の欠陥であってコードの欠陥ではない。2026-11-16 の再実行では
+  `/home/yuu/gxkit/.venv/bin` を前置して **17/17 OK**（depsgx 1.0.0、§5.1）。ただし
+  `MC_SPINE_DEPSGX` を export したままだと、このテストの「検査器が無い」系 fixture が
+  環境変数を継承して別の理由で落ちる（実測 4 失敗、§5.1 の負の対照）。
+  `tools/layers_check.sh` も depsgx を必要とする。
 
 ## 13. 残っている欠陥と次の作業（順序と完了条件）
 
-1. **`MultifaceBlock.canAttachTo` の support-shape 腕が無い**（6A 由来、port が厳しすぎる）。
+1. **`MultifaceBlock.canAttachTo` の support-shape 腕が無い**（pre-existing、port が厳しすぎる。
+   6A の導入ではない）。
    完了条件: `Support::Full` の vein site を `isFaceFull(collision) || isFaceFull(support)` に
    する契約テストが native の 2 面を区別して落ち、変異で赤、fixture が悪化しないこと。
    注意: 支持形状は asset に無いので、まず資産の追加輸出が要る。
@@ -316,3 +390,46 @@ assertion や golden output の弱体化はしていない。
 - `knowledge`: 6A README の「残件」にあった未検証前提は本 pass で解消したが、
   実装（`Support::Full` を vein site に使うこと）は変えていない。docs と code の
   どちらかに寄せる判断は上記 §13-1 の完了条件に委ねる。
+
+## 16. 最終 remediation（2026-11-16, F1–F6）
+
+独立レビュー `5dcaf3a` の指摘への是正。**production の意味は変えていない**: `src/` の変更は
+`src/feature.rs` の docstring 1 箇所だけで、ほかは `evidence/` の文書。検証と生ログは
+`/home/yuu/mc-spine-local/audit/final-landing-20261116-1415/`。
+
+1. **F1（Python の件数）**: §5 の「37/37 exit 0」を撤回し、当時の log の実数（36 entry /
+   35 exit 0 / `layers_gate_test` exit 1）と、変数だけの `layers_gate_exit=0` を明記した。
+   同一条件の再実行は **37 ファイル / 37 exit 0**（unittest 196 ケース）、depsgx は 1.0.0
+   （gxkit HEAD `973b293a…`、CI pin `d6b9ad8…` ではない）で、「pinned」とは主張しない（§5.1）。
+   集計 assert は赤い実行で exit 1 になることを実測した（負の対照）。
+2. **F2（未実行 mutation）**: 追加 15 entry のうち未実行だった 6B の 1 件を focused で proved。
+   baseline green → mutant `test result: FAILED`（assertion、コンパイルエラー 0）→ restored
+   green。既存 14 log は 14 のまま、新しい 3 本を別ディレクトリに保存（§5・§6）。
+   0 件選択は exit 1。
+3. **F3（FULL の文脈依存）**: §3 の「FULL は他セルを読まない ⇒ 文脈依存は明るさだけ」を
+   撤回し、表の適用範囲を観測したキャッシュ済み/クエリ/生成済み state に限定。
+   `moving_piston` 2063..2074 と live block entity が測定外であること、port が moving_piston を
+   生成しないことを明記（§3・§9）。vein の arm 2 欠落は pre-existing と明記（§9・§13-1）。
+4. **F4（feature.rs の内訳）**: 全面を DOWN に寄せて合計が合わない内訳を削り、面別の実数を
+   持つ README を指すようにした。コメントのみ（`src/feature.rs` の docstring）。
+5. **F5（6A README の accessor 表）**: `k`=1 / `l`=986 の表を**同定の根拠としては撤回**し、
+   履歴として残した。`dtc.k` と `dtc.l` は同じ4引数計算でキャッシュの有無だけ、という
+   bytecode の読みを併記し、`k` の採用は旧資産 0 不一致とアンカーで支えると書き直した。
+6. **F6（receipt / 出所）**: `final-suite.log` に stamp が無いことを明記し、HEAD 束縛の証拠に
+   しない。6C の AB 変種 source 未保存・before/cocoa-only dump 同一 sha、6B の
+   `/tmp/captures` 不在を明記し、該当表を**継承**に落とした。§11 の「正しい規則 /
+   east-edge が直れば改善」は**仮説**に限定した（9 セルは新規の差）。
+
+## 17. テスト側の計測差（観測のみ。テストは変更していない）
+
+- `tests/layers_gate_test.py` の fixture は `PATH` を差し替えるが、`MC_SPINE_DEPSGX` など
+  他の環境変数は継承する。「検査器が無い」ことを確かめるテストが、operator の export で
+  別の理由（`cargo` 不在）に落ちる（2026-11-16 実測: 17 中 4 失敗）。テストの verdict が
+  環境に依存する。
+- 同じ fixture は `CARGO_TARGET_DIR` が環境にあるとそれを使う（既定 `ROOT/target`）。
+  operator の別ツリー向け target を共有しうる（今回の実行は自分の worktree の target）。
+- `tools/mutation_check.sh` は復元ハッシュ不一致時に `git checkout -- "$mut_file"` する。
+  これは**未コミットの編集を破壊しうる**経路である（テストが defect を誘発する形）。
+- 元の F1 の誤集計は、`exit=` 行だけを出す inline ループに集計 assert が無かったことに
+  よる。今回のランナーは `SCANNED == ATTEMPTED == ENTRY` / `PASS+FAIL == ATTEMPTED` /
+  `FAIL == 0` を assert し、赤い実行で実際に exit 1 になることを示した（§5.1）。
