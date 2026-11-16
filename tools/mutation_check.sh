@@ -2698,6 +2698,18 @@ check "preliminary (structure-free) columns stay out of the column cache" \
   '        if true {' \
   feature::pipeline_tests::preliminary_columns_are_not_cached_as_final
 
+# `Structure.findValidGenerationPoint`: the biome gate reads the start's own position. The
+# mutant restores the pre-fix chunk-centre read, which in the Nether answers a different
+# biome (seed 4242 (-24,22): centre soul_sand_valley, scan position basalt_deltas).
+check "a template structure's biome gate reads the start, not the chunk centre" \
+  src/structure_pipeline.rs '            if !def.biomes.is_empty()
+                && !fc
+                    .biome(stub.0, stub.1, stub.2)' \
+  '            if !def.biomes.is_empty()
+                && !fc
+                    .biome(cx * 16 + 8, 64, cz * 16 + 8)' \
+  feature::pipeline_tests::nether_fossil_biome_gate_reads_the_start_not_the_chunk_centre
+
 check "fortress fillColumnDown stops above the build floor" \
   src/fortress_monument.rs '        let floor = self.ctx.g.min_y + 1;' \
   '        let floor = self.ctx.g.min_y + 2;' \

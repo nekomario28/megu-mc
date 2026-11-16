@@ -733,11 +733,6 @@ fn try_generate(
             let kind = def.template.as_ref()?;
             let reg = crate::block_registry::breg()?;
             let mut fc = FC::new(g);
-            if let Some(biome) = fc.biome(cx * 16 + 8, 64, cz * 16 + 8) {
-                if !def.biomes.is_empty() && !def.biomes.contains(&biome) {
-                    return None;
-                }
-            }
             let cold_biome = fc.biome_leaf(cx * 16 + 8, 64, cz * 16 + 8)
                 .is_some_and(|leaf| fc.cold_enough_to_snow(leaf, cx * 16 + 8, 64, cz * 16 + 8));
             let mut gen = crate::generation_math::Lcg::for_large_feature(seed, cx, cz);
@@ -755,6 +750,22 @@ fn try_generate(
             let Some((stub, build)) = found else {
                 return None;
             };
+            // The gate is `Structure.findValidGenerationPoint`, which filters on the
+            // stub the structure's own `findGenerationPoint` returned - not on the
+            // chunk centre. Reading the centre's biome at a fixed y=64 asks a different
+            // question, and in the Nether it answers a *different biome*: seed 4242
+            // chunk (-24,22) scans to (-382,88,367), whose noise biome is
+            // `basalt_deltas` (native quart(-96,22,91) = basalt_deltas), while the
+            // centre (-376,64,360) is `soul_sand_valley`. `#has_structure/nether_fossil`
+            // holds only soul_sand_valley, so vanilla refuses the start and the port
+            // used to place it (spurious beard at bb=[-384,88,366,-382,91,367]).
+            if !def.biomes.is_empty()
+                && !fc
+                    .biome(stub.0, stub.1, stub.2)
+                    .is_some_and(|biome| def.biomes.contains(&biome))
+            {
+                return None;
+            }
             let pieces = with_templates(|templates| build(&mut fc, templates, &mut gen, reg).ok())?;
             let bbox = union_bb(pieces.iter().map(|p| p.bb))?;
             Some(Start {
@@ -2142,6 +2153,63 @@ mod pipeline_tests {
         assert_eq!(beard.rigids[0].min, [-356, 55, 319]);
         assert_eq!(beard.rigids[0].max, [-350, 61, 324]);
         assert_eq!(beard.rigids[0].adjustment, BeardAdjustment::BeardThin);
+    }
+
+    /// `Structure.findValidGenerationPoint` gates on the position the structure's own
+    /// `findGenerationPoint` returned, never on the chunk centre. Seed 4242's chunk
+    /// (-24,22) is the measured case: the fossil scan walks the noise column at
+    /// (-382,88,367) in `basalt_deltas` while the chunk centre (-376,64,360) is
+    /// `soul_sand_valley`. `#has_structure/nether_fossil` holds only soul_sand_valley, so
+    /// vanilla refuses the start (native `world/DIM-1` chunk (-24,22) has an empty
+    /// `structures.starts`) where a centre-gated port placed `bb=[-384,88,366,-382,91,367]`
+    /// and its `beard_thin` reshaped chunk (-25,22)'s +x columns.
+    #[test]
+    fn nether_fossil_biome_gate_reads_the_start_not_the_chunk_centre() {
+        reset_cache();
+        let mut nether =
+            Gen::load_preset(4242, crate::name_to_state, worldgen::NoisePreset::Nether)
+                .expect("nether gen");
+
+        // The two starts the native 9x9 footprint holds, at their saved `Children[].BB`.
+        for (cx, cz, bb) in [
+            (-22, 20, [-356, 55, 319, -350, 61, 324]),
+            (-22, 22, [-337, 76, 355, -333, 80, 357]),
+        ] {
+            let starts = starts_cached(&mut nether, cx, cz);
+            let fossil = starts
+                .iter()
+                .find(|s| s.structure == "minecraft:nether_fossil")
+                .unwrap_or_else(|| panic!("native nether_fossil start in chunk ({cx},{cz})"));
+            assert_eq!(fossil.bbox, bb, "native child box for chunk ({cx},{cz})");
+        }
+
+        // (-24,22): the placement admits the chunk, the scan succeeds, and the biome the
+        // gate has to read is the one at the start it produced.
+        assert!(
+            starts_cached(&mut nether, -24, 22)
+                .iter()
+                .all(|s| s.structure != "minecraft:nether_fossil"),
+            "native chunk (-24,22) holds no nether_fossil start"
+        );
+        assert_eq!(
+            nether.biome_name_at(-382, 88, 367).as_deref(),
+            Some("minecraft:basalt_deltas"),
+            "the scan's own position is outside #has_structure/nether_fossil"
+        );
+        assert_eq!(
+            FC::new(&mut nether).biome(-382, 88, 367).as_deref(),
+            Some("minecraft:basalt_deltas"),
+            "the gate's own read of the start agrees with the quart answer"
+        );
+        assert_eq!(
+            FC::new(&mut nether).biome(-376, 64, 360).as_deref(),
+            Some("minecraft:soul_sand_valley"),
+            "the centre's biome is the wrong question, which is why the start appeared"
+        );
+
+        // Its beard was the visible damage: chunk (-25,22) is the chunk it reshaped.
+        let beard = beard_chunk_data(&mut nether, -25, 22);
+        assert!(beard.rigids.is_empty(), "{:?}", beard.rigids);
     }
 
     #[test]
