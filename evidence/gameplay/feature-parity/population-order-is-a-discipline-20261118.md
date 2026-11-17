@@ -67,6 +67,15 @@ Three things hold in **all seven**:
   blocks with local drops of 1-2 levels, because the demander's own cell is decorated in the middle
   of its scan (level-run sequences `[1,0,1,2,3]` for n=1, 24-29 runs over `{0..3}` for n=3).
 
+The first-block property also holds on the older, `run.log`-derived corpus: of the 25 `order.tsv`
+files under `~/mc-spine-local`, **24 begin with exactly that x-then-z 3x3 at the window's min
+corner** (16 of them are a 1-chunk request, where the whole 9-line file is that block). The one
+exception, `scratch/current/mineshaft-wg-height-20261113/native-fixture` (overworld, seed 4242), runs
+`(2,-2) (2,-1) (2,-3) ...` - a `z` sequence that is not sorted - which is the console-interleaving
+hazard `tools/sculk_trace.py` documents for log-derived traces, so it is not usable as a program-order
+artifact and is not evidence against the rule either. Log output proves less than `poporder.tsv`
+here; the seven artifacts in the table above are the ones with a dedicated flush-ordered writer.
+
 And one thing does **not** hold: no two runs agree.
 
 | pair | identical | common prefix |
