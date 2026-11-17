@@ -1,0 +1,82 @@
+{
+ "tool": "tools/evidence_receipt.py",
+ "start": "2026-11-17T17:43:12Z",
+ "source_at_start": {
+  "head": "6b284f90c0a8209770c9589f59033d89f81f7ce5",
+  "dirty": 0,
+  "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "expect_head": "6b284f90c0a8209770c9589f59033d89f81f7ce5",
+ "filters": [
+  "generation_contract_tests::has_post_process_is_the_native_three_states_and_no_others",
+  "generation_contract_tests::a_written_post_process_state_files_a_mark_on_the_owning_chunk",
+  "generation_contract_tests::promotion_removes_a_mushroom_the_lit_engine_reaches",
+  "generation_contract_tests::promotion_consumes_a_magma_mark_without_moving_it",
+  "generation_contract_tests::the_promotion_light_sample_is_taken_once_and_only_inside_the_pass",
+  "generation_contract_tests::the_promotion_boundary_files_no_mark_and_consumes_its_marks_once",
+  "postprocess_removes_a_mushroom_only_where_the_lit_engine_reaches_it",
+  "postprocess_leaves_a_marked_magma_block_unchanged"
+ ],
+ "cargo": "cargo",
+ "problems": [],
+ "binary": {
+  "path": "/home/yuu/.t3/worktrees/mc-spine/t3-ec6cf822-a285eddd91cde2fb/target/debug/deps/mc_spine-5263732b84b8ac33",
+  "bytes": 78562448,
+  "sha256": "840cd82bf2ba2d4fe1d8bfdd2dc5cd7e8cdc778d82c727f1e41e4d08526e39ea",
+  "mtime": "2026-11-17T17:43:13Z"
+ },
+ "list_exit": 0,
+ "tests_total": 654,
+ "tests_sha256": "55e96a41c362cdbd187f9cd1ae9ca03edccf21d8b248d25762f0aa235a4ab5e1",
+ "filters_run": [
+  {
+   "filter": "generation_contract_tests::has_post_process_is_the_native_three_states_and_no_others",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.07s"
+  },
+  {
+   "filter": "generation_contract_tests::a_written_post_process_state_files_a_mark_on_the_owning_chunk",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.08s"
+  },
+  {
+   "filter": "generation_contract_tests::promotion_removes_a_mushroom_the_lit_engine_reaches",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.09s"
+  },
+  {
+   "filter": "generation_contract_tests::promotion_consumes_a_magma_mark_without_moving_it",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.08s"
+  },
+  {
+   "filter": "generation_contract_tests::the_promotion_light_sample_is_taken_once_and_only_inside_the_pass",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.08s"
+  },
+  {
+   "filter": "generation_contract_tests::the_promotion_boundary_files_no_mark_and_consumes_its_marks_once",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.08s"
+  },
+  {
+   "filter": "postprocess_removes_a_mushroom_only_where_the_lit_engine_reaches_it",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.07s"
+  },
+  {
+   "filter": "postprocess_leaves_a_marked_magma_block_unchanged",
+   "exit": 0,
+   "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 653 filtered out; finished in 0.07s"
+  }
+ ],
+ "source_at_finish": {
+  "head": "6b284f90c0a8209770c9589f59033d89f81f7ce5",
+  "dirty": 0,
+  "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "finish": "2026-11-17T17:43:14Z",
+ "status": "PASS"
+}

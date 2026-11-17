@@ -315,6 +315,10 @@ parked, 4 skipped`; the four skips are entries whose anchors are already absent 
 
 The one ignored test is the pre-existing parked gate `debt_ratchet.sh` reports.
 
+`haspostprocess-contract-20261118.run/receipt.json` is `tools/evidence_receipt.py`'s
+source-bound receipt for the eight contract tests: `status: PASS`, `head 6b284f9`, `dirty 0`,
+`tests_total 654`, eight filters run and green, test binary `840cd82b…`.
+
 ## Reproduce
 
 ```sh
