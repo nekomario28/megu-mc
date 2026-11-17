@@ -3253,6 +3253,20 @@ check "the population queue pops the lowest non-empty level" \
             .find(|(_, bucket)| !bucket.is_empty())' \
   worldgen::wg_tests::default_dispatch_runs_the_named_population_order
 
+check "a compiled cache node still returns its input" \
+  src/worldgen.rs '            DF::Cache(a) | DF::BlendD(a) => self.emit(*a),' \
+  '            DF::Cache(_) => {
+                self.ops.push(Op::Push(0.0));
+                self.stack_push(1);
+            }
+            DF::BlendD(a) => self.emit(*a),' \
+  worldgen::wg_tests::compiled_density_matches_interpreter_without_chunk_grids
+
+check "a compiled interpolated node reads its own grid slot" \
+  src/worldgen.rs '                let slot = id as u32;' \
+  '                let slot = id as u32 + 1;' \
+  worldgen::wg_tests::compiled_density_matches_interpreter_per_block
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
