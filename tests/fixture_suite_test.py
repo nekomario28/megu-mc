@@ -124,7 +124,7 @@ def window_regions(world, origin, n):
 
 def make_row(root, fixture, *, rid="row-1", kind="chunk", n=1, origin=(0, 0), height=32,
              seed=4242, stage=("features", "features"), preset=None, bind=True,
-             writer_trace=None):
+             writer_trace=None, expected_runtime_writes=None):
     fixture = Path(fixture)
     world = fixture / "world"
     row = {
@@ -144,6 +144,8 @@ def make_row(root, fixture, *, rid="row-1", kind="chunk", n=1, origin=(0, 0), he
             if "attribution" in writer_trace:
                 entry["attribution"] = writer_trace["attribution"]
             inputs["writer_trace"] = entry
+        if expected_runtime_writes is not None:
+            inputs["expected_runtime_writes"] = expected_runtime_writes
         row["inputs"] = inputs
     return row
 
@@ -546,6 +548,237 @@ class FixtureSuiteContracts(unittest.TestCase):
         self.assertEqual(row["status"], "DIFF")
         self.assertEqual(row["comparison"]["diffs"], 1)
         self.assertEqual(row["comparison"]["counts"]["wrong_state"], 1)
+
+
+_STATE_TABLE = None
+
+
+def state_id(name):
+    """The block-state id `chunk_triage` names `name`, from the shipped 1.21.1 table."""
+    global _STATE_TABLE
+    if _STATE_TABLE is None:
+        import chunk_triage
+        _STATE_TABLE = chunk_triage.load_block_state_table()
+    for sid, canonical in _STATE_TABLE.items():
+        if canonical == name or canonical.startswith(name + "["):
+            return sid
+    raise AssertionError(name)
+
+
+def canonical(sid):
+    return _STATE_TABLE[sid]
+
+
+def write_run_log(fixture, writes, refused=()):
+    """The capture agent's own record: one RUNTIME line per attempted write.
+
+    `writes`/`refused` are `(x, y, z, state_id)` tuples. The lines are written in a
+    deliberately unsorted order and with a per-line log prefix, so a suite that hashed the
+    raw lines (or trusted their order) would not reproduce the sorted-payload hash.
+    """
+    lines = []
+    for index, (wrote, cells) in enumerate(((True, writes), (False, refused))):
+        for x, y, z, sid in cells:
+            payload = (f"RUNTIME {x} {y} {z} state={sid} wrote={'true' if wrote else 'false'} "
+                       f"stack=dcw.a(SourceFile:267) | dcb.a(SourceFile:217) | aqb.a(SourceFile:691)")
+            lines.append(f"[00:00:{index:02d}] [Server thread/INFO]: [STDOUT]: {payload}")
+    path = Path(fixture) / "run.log"
+    path.write_text("\n".join(lines) + ("\n" if lines else ""))
+    return path
+
+
+def expected_declaration(writes, refused=()):
+    """The declaration computed by hand from the intended record (not by the suite).
+
+    This is the independent half of the test: the algorithm is the *contract* (strip the log
+    prefix, sort, sha256 over every RUNTIME payload; census over `wrote=true` only), so a
+    change to the suite's normalization has to change this too, deliberately.
+    """
+    payloads = []
+    for index, (wrote, cells) in enumerate(((True, writes), (False, refused))):
+        for x, y, z, sid in cells:
+            payloads.append(f"RUNTIME {x} {y} {z} state={sid} wrote={'true' if wrote else 'false'} "
+                            f"stack=dcw.a(SourceFile:267) | dcb.a(SourceFile:217) | aqb.a(SourceFile:691)")
+    census = {}
+    for _x, _y, _z, sid in writes:
+        census[canonical(sid)] = census.get(canonical(sid), 0) + 1
+    digest = hashlib.sha256("".join(line + "\n" for line in sorted(payloads)).encode()).hexdigest()
+    return {"count": len(writes), "blocks": dict(sorted(census.items())), "writes_sha256": digest}
+
+
+class RuntimeWriteDeclarationContracts(unittest.TestCase):
+    """`inputs.expected_runtime_writes` is a fail-closed provenance rule, not an exemption.
+
+    The recorded finding this pins: the nether-fortress capture records
+    `runtime_writes: 16` (deterministic `nether_brick_fence` writes inside the chunk-gen
+    task, identical in matrix-v1 and matrix-v2), so every row was INVALID even after a
+    0-difference comparison. The rule below makes such a row comparable *only* when the
+    row's declaration reproduces the capture's own `run.log` exactly - count, canonical
+    state census, and the sha256 of the sorted RUNTIME lines - and leaves the
+    `runtime_writes == 0` default untouched for undeclared rows.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(tempfile.mkdtemp(prefix="fixture-suite-runtime-"))
+        cls.fake_tool = cls.root / "fake_tool.py"
+        cls.fake_tool.write_text(FAKE_TOOL)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.root, ignore_errors=True)
+
+    def out(self, name):
+        path = self.root / "out" / name
+        shutil.rmtree(path, ignore_errors=True)
+        return path
+
+    def make_fixture(self, label, *, boundary_writes, writes, refused=()):
+        fixture = build_fixture(self.root / f"fixtures/{label}", n=1, height=32,
+                                cells_by_chunk={(0, 0): {(0, -60, 0): ("minecraft:stone", {})}},
+                                boundary_overrides={"runtime_writes": boundary_writes})
+        window_dump(fixture / "port.bin", (0, 0), 1, 32, {(0, -60, 0): block_state("stone")})
+        if writes or refused:
+            write_run_log(fixture, writes, refused)
+        return fixture
+
+    def run_one(self, row):
+        manifest = write_manifest(self.root, [row])
+        out = self.out(row["id"])
+        code, text = run_suite([manifest, "--out", out, "--chunk-tool", self.fake_tool,
+                                "--sculk-tool", self.fake_tool],
+                               fake={"*": {"json": chunk_json()}})
+        result = json.loads((out / "result.json").read_text())
+        return code, text, result["rows"][0]
+
+    def test_a_declared_and_matching_record_is_comparable(self):
+        writes = [(10, 56, 10, state_id("minecraft:stone")),
+                  (11, 56, 10, state_id("minecraft:stone")),
+                  (12, 56, 10, state_id("minecraft:water[level=1]"))]
+        refused = [(13, 56, 10, state_id("minecraft:stone"))]   # attempted, not written
+        fixture = self.make_fixture("matching", boundary_writes=3, writes=writes, refused=refused)
+        declaration = expected_declaration(writes, refused)
+        row = make_row(self.root, fixture, rid="declared-ok", expected_runtime_writes=declaration)
+        code, text, row_result = self.run_one(row)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(row_result["status"], "MATCH", row_result.get("reason"))
+        writes_facts = row_result["provenance"]["runtime_writes"]
+        self.assertEqual(writes_facts["boundary"], 3)
+        self.assertEqual(writes_facts["count"], 3)          # the wrote=false line is not a write
+        self.assertTrue(writes_facts["declared"])
+        self.assertTrue(writes_facts["verified"])
+        self.assertEqual(writes_facts["blocks"], declaration["blocks"])
+        self.assertEqual(writes_facts["writes_sha256"], declaration["writes_sha256"])
+        # Two stone + one water[level=1]: the census keeps the canonical state id (properties
+        # included), so a same-name/different-property write cannot pass as the declared one.
+        self.assertEqual(writes_facts["blocks"],
+                         {"minecraft:stone": 2, "minecraft:water[level=1]": 1})
+        summary = (self.root / "out" / "declared-ok" / "summary.md").read_text()
+        self.assertIn("runtime writes: fixture=3 log_wrote_true=3 declared=True verified=True", summary)
+
+    def test_a_declared_record_that_differs_in_any_way_is_invalid(self):
+        writes = [(10, 56, 10, state_id("minecraft:stone")),
+                  (11, 56, 10, state_id("minecraft:stone"))]
+        fixture = self.make_fixture("mismatch", boundary_writes=2, writes=writes)
+        declaration = expected_declaration(writes)
+        cases = {}
+        count = json.loads(json.dumps(declaration))
+        count["count"] = 3
+        count["blocks"] = {"minecraft:stone": 3}
+        cases["count differs"] = (count, "does not describe this fixture's runtime writes")
+        blocks = json.loads(json.dumps(declaration))
+        blocks["blocks"] = {"minecraft:stone": 1, "minecraft:dirt": 1}
+        cases["census differs"] = (blocks, "census")
+        digest = json.loads(json.dumps(declaration))
+        digest["writes_sha256"] = "0" * 64
+        cases["hash differs"] = (digest, "writes_sha256")
+        extra = json.loads(json.dumps(declaration))
+        extra["writes_sha256"] = expected_declaration(
+            writes + [(12, 56, 10, state_id("minecraft:stone"))])["writes_sha256"]
+        cases["one more cell in the hash"] = (extra, "writes_sha256")
+        unknown = json.loads(json.dumps(declaration))
+        unknown["stack_sha256"] = "0" * 64
+        cases["unknown member"] = (unknown, "cannot verify")
+
+        for label, (mutated, reason) in cases.items():
+            with self.subTest(label=label):
+                row = make_row(self.root, fixture, rid="declared-bad",
+                               expected_runtime_writes=mutated)
+                code, text, row_result = self.run_one(row)
+                self.assertEqual(code, 2, text)
+                self.assertEqual(row_result["status"], "INVALID", label)
+                self.assertIn(reason, row_result["reason"], label)
+                self.assertNotIn("command", row_result,
+                                 "the comparator must not run for an unverifiable declaration")
+
+    def test_a_count_without_the_hash_is_invalid(self):
+        writes = [(10, 56, 10, state_id("minecraft:stone"))]
+        fixture = self.make_fixture("count-only", boundary_writes=1, writes=writes)
+        declaration = expected_declaration(writes)
+        cases = {
+            "count only": {"count": 1},
+            "count and census": {"count": 1, "blocks": declaration["blocks"]},
+        }
+        for label, mutated in cases.items():
+            with self.subTest(label=label):
+                row = make_row(self.root, fixture, rid="count-only",
+                               expected_runtime_writes=mutated)
+                code, text, row_result = self.run_one(row)
+                self.assertEqual(code, 2, text)
+                self.assertEqual(row_result["status"], "INVALID", label)
+                self.assertIn("writes_sha256", row_result["reason"], label)
+                self.assertIn("missing", row_result["reason"], label)
+
+    def test_an_undeclared_fixture_with_writes_stays_invalid(self):
+        """The default is untouched: a write without a declaration is not excused."""
+        writes = [(10, 56, 10, state_id("minecraft:stone"))]
+        fixture = self.make_fixture("undeclared", boundary_writes=1, writes=writes)
+        code, text, row_result = self.run_one(make_row(self.root, fixture, rid="undeclared-writes"))
+        self.assertEqual(code, 2, text)
+        self.assertEqual(row_result["status"], "INVALID")
+        self.assertIn("fixture records 1 runtime write(s)", row_result["reason"])
+        self.assertIn("declares no inputs.expected_runtime_writes", row_result["reason"])
+
+    def test_attempted_but_refused_writes_are_not_writes(self):
+        """`wrote=false` lines are in the hash but not in the count (the sculk capture's shape)."""
+        refused = [(10, 56, 10, state_id("minecraft:stone")),
+                   (11, 56, 10, state_id("minecraft:stone"))]
+        fixture = self.make_fixture("refused", boundary_writes=0, writes=[], refused=refused)
+        code, text, row_result = self.run_one(make_row(self.root, fixture, rid="refused-only"))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(row_result["status"], "MATCH", row_result.get("reason"))
+        writes_facts = row_result["provenance"]["runtime_writes"]
+        self.assertEqual(writes_facts["count"], 0)
+        self.assertFalse(writes_facts["declared"])
+        self.assertEqual(writes_facts["blocks"], {})
+
+    def test_boundary_and_run_log_counts_must_agree(self):
+        """Neither the boundary's count nor the log's can be trusted once they disagree."""
+        writes = [(10, 56, 10, state_id("minecraft:stone"))]
+        fixture = self.make_fixture("disagree", boundary_writes=0, writes=writes)
+        code, text, row_result = self.run_one(make_row(self.root, fixture, rid="disagree"))
+        self.assertEqual(code, 2, text)
+        self.assertEqual(row_result["status"], "INVALID")
+        self.assertIn("disagrees with its own log", row_result["reason"])
+
+        # A declaration cannot paper over a boundary/log disagreement either: the capture's
+        # own numbers are checked before the declaration is compared.
+        declaration = expected_declaration(writes)
+        fixture = self.make_fixture("disagree-declared", boundary_writes=0, writes=writes)
+        code, text, row_result = self.run_one(make_row(self.root, fixture, rid="declared-disagree",
+                                                      expected_runtime_writes=declaration))
+        self.assertEqual(code, 2, text)
+        self.assertEqual(row_result["status"], "INVALID")
+        self.assertIn("disagrees with its own log", row_result["reason"])
+
+    def test_a_declaration_without_a_run_log_is_invalid(self):
+        fixture = self.make_fixture("no-log", boundary_writes=1, writes=[])
+        declaration = {"count": 1, "blocks": {"minecraft:stone": 1}, "writes_sha256": "0" * 64}
+        code, text, row_result = self.run_one(make_row(self.root, fixture, rid="no-log",
+                                                       expected_runtime_writes=declaration))
+        self.assertEqual(code, 2, text)
+        self.assertEqual(row_result["status"], "INVALID")
+        self.assertIn("has no run.log", row_result["reason"])
 
 
 if __name__ == "__main__":

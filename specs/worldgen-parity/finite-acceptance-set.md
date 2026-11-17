@@ -70,13 +70,44 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
 | 行 | 状態 |
 |---|---|
 | matrix-v2 4行(end-city/basalt/fossil/sculk) | **MATCH**(exit 0) |
-| fortress 0/256 | 比較は0差だがprovenance INVALID(runtime_writes 16) — ルール拡張待ち |
-| village-taiga | captureにruntime_writes>0 — 分離・再capture必要 |
+| fortress 0/256 | **MATCH**(0/65536、`expected_runtime_writes` 宣言済み・検証済み) |
+| fortress 0/128(matrix-v1) | **MATCH**(0/32768、同じ宣言。宣言値が両captureでbit一致) |
+| village-taiga | 宣言は検証済みだが比較**DIFF 4/884736** — 受入行にしない(§3) |
 | jungle-temple | 121 HOLD |
 | Overworld (3,−2) | 順序・mineshaft残差あり(population-order lane進行中) |
 | forest 3×3・dimension_terrain 4件・(0,0)・stronghold・(−96,35) | committed gate緑(新SHAでの再検証は行ごとに必要) |
-| ruined-portal | captureのみ — manifest行と比較が未実施 |
+| ruined-portal | **MATCH**(0/98304)— ただし単一native run(§4-5は未充足) |
+| end-outer(全air対照) | **MATCH**(0/32768、両側全air)— 被覆の主張はしない |
 | biome境界行 | v2 |
+
+**2026-11-18 の行ごとの実測(acceptance-rows レーン、source `d12adb5`)**
+
+- **provenance規則の拡張**(`tools/fixture_suite.py`): 行が
+  `inputs.expected_runtime_writes = {count, blocks, writes_sha256}` を宣言でき、MATCHには
+  fixtureの`runtime_writes`・`wrote=true`行のcanonical state census・`run.log`のRUNTIME行
+  (log前置きを除いてsortしたもの)のsha256の**3つすべて**が宣言値と一致することを要求する。
+  1つでも欠けたら/1セルでも違えば INVALID。宣言の無い行の `runtime_writes == 0` default は不変。
+  加えて全行で `boundary.json` の値と `run.log` の `wrote=true` 行数が一致することを要求する。
+- **fortress**: `count 16, nether_brick_fence[east=true,north=true,south=true,waterlogged=false,west=true] × 16,
+  writes_sha256 81cdbd85…`。matrix-v1(0/128)とmatrix-v2(0/256)の2つの独立captureで**同じhash**。
+  16セル全てが保存worldに存在。0/128=0/32768、0/256=0/65536、OCEAN_FLOOR heightmap 0列差。
+- **village-taiga**: 書き込みは fortress と**同じ決定的・生成中のclass**(2つの独立captureで
+  payload hash一致 `62fc3ddc…`、書き込みsiteはchunk-gen task/生成中feature、5セル全てが保存
+  worldに存在、`game_times [3,3]`)。ゆえに宣言は正当だが、比較は4セル差で、うち3セルは
+  まさに宣言した書き込みセル((98,19,−512)/(99,19,−512) の `water[level=1]`→`air`、
+  (82,69,−500) の `air`→`fern`)。**受入行にはしない**(§3のgreenのみ追加の規律)。
+- **ruined-portal**: 3×3ではなく1×1 `(6,7)`、window −64/384(boundary.json)。
+  `chunk_triage` 0/98304、OCEAN_FLOOR heightmap 0列差。window内に `ruined_portal` start (6,7) と
+  mineshaft corridor 2本。
+- **end-outer**: `(10,10)` 0/128、0/32768。native も port も non_air=0(全air対照)。
+  suiteは「比較セル数>0」を要求するので全air参照を拒否しない — MATCHだが被覆の主張はしない。
+- **未充足/未実行**: §4-5(seed 4242のA/B両方に0差)は ruined-portal と end-outer では
+  **満たせない**(host上のcaptureは各1 runのみ。`/tmp`の同名dirは同一runの複製でlevel.dat一致)。
+  §4-4のうち WORLD_SURFACE/MOTION_BLOCKING の port対照は**未実行**(port側のheightmap dumpは
+  OCEAN_FLOORのみ、src変更は本レーンの所有外)。matrix-v1 fossil 0/128 行、matrix-v1 end-city
+  0/128 行は**未実行**(前者は本レーンの対象外、後者は§1のF1によりwindow外273セルで比較不能)。
+  なお matrix-v1 stronghold capture は `runtime_writes 10` を記録しており、fixture_suite 行に
+  する場合は同じ宣言が必要(本レーンでは行を宣言していない)。
 
 ## 改定規則
 

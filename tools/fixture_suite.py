@@ -17,6 +17,15 @@ What a row must prove before its comparison is accepted (no green by silence):
 * the fixture's `boundary.json` (written by `tools/carve-agent/native_fixture.sh`) exists
   and records `mode: frozen`, `runtime_writes: 0`, a declared generation `stage`, and a
   `seed`/`dimension`/`min_y`/`height`/`chunks` window;
+* a fixture that records runtime writes is INVALID unless the row declares
+  `inputs.expected_runtime_writes` = `{count, blocks, writes_sha256}` and the capture's own
+  `run.log` reproduces all three exactly: the number of `RUNTIME ... wrote=true` lines, their
+  canonical block-state census, and the sha256 of the sorted RUNTIME line payloads (the log
+  prefix is stripped, every `wrote=true`/`wrote=false` line is hashed). A count without a
+  hash, an unknown member, a census that differs by one cell, or a hash that differs in any
+  way is INVALID. The declaration does not classify the writes: it pins them, so a captured
+  world is compared at the stage it declares instead of being excused by a block name;
+  `boundary.json`'s count and the `run.log`'s own `wrote=true` count must also agree;
 * the row declares its reference and port generation stages, they are equal, and the
   reference stage matches the fixture's recorded one - a stage is part of the comparison
   identity (`evidence/gameplay/feature-parity/light-and-lost-writes-20261116.md`);
@@ -60,6 +69,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +94,11 @@ SCULK_WINDOW = ({"min_y": -64, "height": 384}, "overworld")
 ROW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 STATUSES = ("MATCH", "DIFF", "INVALID", "NOT_RUN")
+# The capture's agent prints one line per attempted runtime write, through the server's own
+# logger, so the recorded line carries a timestamp and a level prefix before this payload.
+RUNTIME_MARKER = "RUNTIME "
+RUNTIME_STATE_RE = re.compile(r"\bstate=(\d+)\b")
+EXPECTED_WRITES_KEYS = ("count", "blocks", "writes_sha256")
 
 SCOPE = {
     "covers": "every row declared in the manifest passed to this run; no other repository data is discovered or guessed",
@@ -101,10 +116,18 @@ SCOPE = {
         "a MATCH additionally requires frozen fixture provenance, equal declared reference/port stages, "
         "matched seed/dimension/grid, and sha256 bindings that still match the files read"
     ),
+    "runtime_writes": (
+        "a fixture with runtime writes is only accepted through a declared inputs.expected_runtime_writes "
+        "{count, blocks, writes_sha256} that the capture's own run.log reproduces exactly (wrote=true line "
+        "count, canonical block-state census, sha256 of the sorted RUNTIME line payloads); an undeclared "
+        "fixture with any write stays INVALID"
+    ),
     "not_covered": [
         "no capture, dump build or world regeneration in this run",
         "no automatic fixture discovery outside the manifest",
         "no writer or first-divergent-stage attribution beyond an attribution the manifest itself declares",
+        "a declared runtime write is pinned, not classified: this suite does not decide whether the writes "
+        "belong to generation or are post-generation ticks",
     ],
 }
 
@@ -220,11 +243,6 @@ def read_boundary(fixture):
     if boundary["mode"] != "frozen":
         raise Invalid(f"fixture mode is {boundary['mode']!r}, not 'frozen'")
     runtime_writes = require_int(boundary["runtime_writes"], f"{path} field 'runtime_writes'")
-    if runtime_writes != 0:
-        raise Invalid(
-            f"fixture records {runtime_writes} runtime write(s): the saved world is not the "
-            "declared generation stage (a block name does not attribute the writer)"
-        )
     for key in ("min_y", "height", "chunks", "seed"):
         require_int(boundary[key], f"{path} field {key!r}")
     subdir = boundary.get("world_subdirectory")
@@ -233,6 +251,168 @@ def read_boundary(fixture):
     if boundary["stage"] not in STAGES:
         raise Invalid(f"fixture stage {boundary['stage']!r} is not one of {list(STAGES)}")
     return boundary, path
+
+
+def runtime_write_record(fixture):
+    """The capture's own runtime-write record, or None when the fixture has no `run.log`.
+
+    A capture's agent prints one `RUNTIME x y z state=<id> wrote=<true|false> stack=...`
+    line per attempted write through the server's logger. `count`/`blocks` describe the
+    lines with `wrote=true` (an attempted-but-refused write did not change the world), and
+    `writes_sha256` pins *every* RUNTIME line so a recapture cannot keep the count and the
+    census while changing the cells, the order or the caller. The payload is normalized to
+    the text starting at `RUNTIME ` so the log's timestamp does not enter the hash: the two
+    independent fortress captures (matrix-v1 `nat-4242-nether-fortress` and matrix-v2
+    `nat-4242-nether-fortress-256`) hash identically after that strip and differently
+    before it.
+    """
+    path = fixture / "run.log"
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise Invalid(f"cannot read {path}: {exc}") from exc
+    lines = []
+    for line in text.splitlines():
+        index = line.find(RUNTIME_MARKER)
+        if index < 0:
+            continue
+        payload = line[index:].rstrip()
+        if payload:
+            lines.append(payload)
+    written = [line for line in lines if " wrote=true" in line]
+    census = Counter()
+    if written:
+        try:
+            table = chunk_triage.load_block_state_table()
+        except TriageError as exc:
+            raise Invalid(f"cannot name the runtime write states: {exc}") from exc
+    for line in written:
+        match = RUNTIME_STATE_RE.search(line)
+        if match is None:
+            raise Invalid(
+                f"runtime write line in {path} records no state id, so its block cannot be named: "
+                f"{line[:120]!r}"
+            )
+        state = int(match.group(1))
+        name = table.get(state)
+        if name is None:
+            raise Invalid(
+                f"runtime write state id {state} ({path}) is not in assets/blocks_1211.json; "
+                "the census cannot be named, so no declaration can be verified"
+            )
+        census[name] += 1
+    payload = "".join(line + "\n" for line in sorted(lines))
+    return {
+        "log": path,
+        "count": len(written),
+        "blocks": dict(sorted(census.items())),
+        "writes_sha256": hashlib.sha256(payload.encode()).hexdigest(),
+    }
+
+
+def declared_runtime_writes(row):
+    """The row's `inputs.expected_runtime_writes`, or None when it declares nothing."""
+    inputs = row.get("inputs")
+    if isinstance(inputs, dict) and "expected_runtime_writes" in inputs:
+        return inputs["expected_runtime_writes"]
+    return None
+
+
+def check_runtime_writes(row, fixture, boundary, boundary_path, runtime):
+    """Accept the fixture's runtime writes only through an exact, fail-closed declaration.
+
+    Two things are decided here, in this order:
+
+    1. the provenance must agree with itself - `boundary.json`'s `runtime_writes` is what the
+       capture script counted, so it must equal the `run.log`'s own `wrote=true` count. This
+       holds for every row, declared or not; a fixture whose count and log disagree is
+       INVALID, because neither number can be trusted afterwards.
+    2. a fixture with writes needs `inputs.expected_runtime_writes` = `{count, blocks,
+       writes_sha256}` and the record must equal it in all three. No member is optional and no
+       unknown member is ignored: a declaration this suite cannot verify is not a declaration.
+
+    An undeclared fixture with zero writes stays on the default path; an undeclared fixture
+    with a write is INVALID, exactly as before this rule existed.
+    """
+    recorded = boundary["runtime_writes"]
+    declared = declared_runtime_writes(row)
+    facts = {
+        "boundary": recorded,
+        "log": str(runtime["log"]) if runtime is not None else None,
+        "count": runtime["count"] if runtime is not None else None,
+        "blocks": runtime["blocks"] if runtime is not None else None,
+        "writes_sha256": runtime["writes_sha256"] if runtime is not None else None,
+        "declared": declared is not None,
+        "verified": False,
+    }
+    if runtime is not None and runtime["count"] != recorded:
+        raise Invalid(
+            f"{boundary_path} records runtime_writes={recorded} but {runtime['log']} holds "
+            f"{runtime['count']} RUNTIME line(s) with wrote=true; the capture's provenance "
+            "disagrees with its own log, so neither count is usable"
+        )
+    if declared is None:
+        if recorded != 0:
+            raise Invalid(
+                f"fixture records {recorded} runtime write(s): the saved world is not the "
+                "declared generation stage (a block name does not attribute the writer) and this "
+                "row declares no inputs.expected_runtime_writes {count, blocks, writes_sha256}"
+            )
+        return facts
+
+    what = "inputs.expected_runtime_writes"
+    if not isinstance(declared, dict):
+        raise Invalid(f"{what} must be an object {{count, blocks, writes_sha256}}, got {declared!r}")
+    unknown = sorted(key for key in declared if key not in EXPECTED_WRITES_KEYS)
+    if unknown:
+        raise Invalid(
+            f"{what} carries key(s) this suite cannot verify: {unknown}; only "
+            f"{list(EXPECTED_WRITES_KEYS)} are part of the rule"
+        )
+    missing = [key for key in EXPECTED_WRITES_KEYS if key not in declared]
+    if missing:
+        raise Invalid(
+            f"{what} is missing {missing}: a declaration is {list(EXPECTED_WRITES_KEYS)} and "
+            "a count alone cannot pin which writes they were"
+        )
+    count = require_int(declared["count"], f"{what}.count", minimum=0)
+    blocks = declared["blocks"]
+    if not isinstance(blocks, dict) or not blocks:
+        raise Invalid(f"{what}.blocks must be a non-empty object {{canonical state name: count}}, got {blocks!r}")
+    for name, value in blocks.items():
+        if not isinstance(name, str) or not name.strip():
+            raise Invalid(f"{what}.blocks key must be a non-empty string, got {name!r}")
+        require_int(value, f"{what}.blocks[{name!r}]", minimum=1)
+    writes_sha = declared["writes_sha256"]
+    if not isinstance(writes_sha, str) or not SHA_RE.match(writes_sha.lower()):
+        raise Invalid(f"{what}.writes_sha256 must be a hex sha256, got {writes_sha!r}")
+    if runtime is None:
+        raise Invalid(
+            f"{what} is declared but {fixture} has no run.log, so the declared writes cannot be "
+            "verified against the capture's own record"
+        )
+    if count != recorded or count != runtime["count"]:
+        raise Invalid(
+            f"{what}.count={count} != {boundary_path} runtime_writes={recorded} / "
+            f"{runtime['log']} wrote=true line count={runtime['count']}: the declaration does "
+            "not describe this fixture's runtime writes"
+        )
+    if blocks != runtime["blocks"]:
+        raise Invalid(
+            f"{what}.blocks {json.dumps(blocks, sort_keys=True)} != the capture's census "
+            f"{json.dumps(runtime['blocks'], sort_keys=True)} ({runtime['log']}); a declared row "
+            "whose writes differ in any way is not comparable"
+        )
+    if writes_sha.lower() != runtime["writes_sha256"]:
+        raise Invalid(
+            f"{what}.writes_sha256={writes_sha} != the sha256 of the sorted RUNTIME lines in "
+            f"{runtime['log']} ({runtime['writes_sha256']}); the declared writes are not the "
+            "captured ones"
+        )
+    facts["verified"] = True
+    return facts
 
 
 def potential_inputs(row, base):
@@ -312,6 +492,7 @@ def validate_row(row, ctx):
     if not fixture.is_dir():
         raise Invalid(f"fixture is not a directory: {fixture}")
     boundary, boundary_path = read_boundary(fixture)
+    runtime = check_runtime_writes(row, fixture, boundary, boundary_path, runtime_write_record(fixture))
     if stage["reference"] != boundary["stage"]:
         raise Invalid(
             f"declared reference stage {stage['reference']!r} != fixture stage {boundary['stage']!r} "
@@ -486,7 +667,7 @@ def validate_row(row, ctx):
         "seed_declared": seed, "seed_fixture": boundary["seed"], "seed_level_dat": actual_seed,
         "world": world, "region_world": region_world, "level_dat": level_dat, "port": port,
         "region_files": region_files, "input_sha256": {str(p): actual[p] for p in required},
-        "order": optional.get("order"), "writer": writer,
+        "order": optional.get("order"), "writer": writer, "runtime_writes": runtime,
     }
     return facts
 
@@ -704,6 +885,7 @@ def summary_markdown(result):
     lines.append(f"- chunk rows: {SCOPE['chunk']}")
     lines.append(f"- sculk rows: {SCOPE['sculk']}")
     lines.append(f"- acceptance: {SCOPE['stage']}")
+    lines.append(f"- runtime writes: {SCOPE['runtime_writes']}")
     for item in SCOPE["not_covered"]:
         lines.append(f"- not covered: {item}")
     lines += ["", "## Per-row evidence", ""]
@@ -718,6 +900,16 @@ def summary_markdown(result):
         writer = row.get("writer") or {}
         if writer:
             lines.append(f"- writer: {writer.get('status')} ({writer.get('reason')})")
+        writes = (row.get("provenance") or {}).get("runtime_writes") or {}
+        if writes:
+            lines.append(
+                f"- runtime writes: fixture={writes.get('boundary')} log_wrote_true={writes.get('count')} "
+                f"declared={writes.get('declared')} verified={writes.get('verified')}"
+            )
+            if writes.get("blocks"):
+                lines.append(f"- runtime write census: {json.dumps(writes.get('blocks'), sort_keys=True)}")
+            if writes.get("writes_sha256"):
+                lines.append(f"- runtime write lines sha256: `{writes.get('writes_sha256')}`")
         window = row.get("window") or {}
         if window:
             lines.append(f"- window: origin={window.get('origin')} n={window.get('n')} grid={window.get('min_y')}/{window.get('height')}")
@@ -817,7 +1009,8 @@ def main(argv=None):
             "window": {"origin": facts["origin"], "n": facts["n"],
                        "min_y": facts["min_y"], "height": facts["height"]},
             "provenance": {"fixture": str(facts["fixture"]), "boundary": facts["boundary"],
-                           "dimension": facts["dimension"], "preset": facts["preset"]},
+                           "dimension": facts["dimension"], "preset": facts["preset"],
+                           "runtime_writes": facts["runtime_writes"]},
             "inputs": {"world": str(facts["world"]), "region_world": str(facts["region_world"]),
                        "port": str(facts["port"]),
                        "sha256": facts["input_sha256"]},
