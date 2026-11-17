@@ -43,6 +43,10 @@ tools/fixture_suite.py <manifest.json> --out <empty-dir> [--timeout SECONDS]
           "captures/nat-.../world/region/r.0.-1.mca": "<sha256>",
           "captures/nat-.../port-dump.bin": "<sha256>"
         },
+        // 任意。runtime書き込みを持つ capture でのみ使う: 宣言はピンであって分類ではない。
+        "expected_runtime_writes": { "count": 16,
+                                     "blocks": {"nether_brick_fence[east=true,north=true,south=true,waterlogged=false,west=true]": 16},
+                                     "writes_sha256": "<sorted RUNTIME payload lines の sha256>" },
         // 任意。無ければ writer は UNKNOWN のまま（block名から推定しない）。
         "writer_trace": { "path": "captures/nat-.../sculk-trace.txt", "sha256": "<sha256>",
                           "attribution": "manifest が宣言する帰属（任意の文字列）" }
@@ -68,8 +72,15 @@ tools/fixture_suite.py <manifest.json> --out <empty-dir> [--timeout SECONDS]
 行が MATCH になるのは、次のすべてを満たしたときだけである。
 
 1. `boundary.json`（`tools/carve-agent/native_fixture.sh` が書く既存のprovenance）が
-   `mode: frozen`、`runtime_writes: 0`、`stage`、`seed`、`dimension`、`min_y`/`height`/`chunks`
-   を記録している。runtime書き込みがある保存worldは、宣言した生成stageの比較ではない。
+   `mode: frozen`、`runtime_writes`、`stage`、`seed`、`dimension`、`min_y`/`height`/`chunks`
+   を記録している。runtime書き込みがある保存worldは、宣言した生成stageの比較ではない —
+   **ただし行が `inputs.expected_runtime_writes` = `{count, blocks, writes_sha256}` を宣言し、
+   capture自身の `run.log` がそれを再現する場合を除く**: `wrote=true` 行数 == count、
+   canonical state census（`assets/blocks_1211.json` のstate名。比較器と同じowner）== blocks、
+   並べ替えたRUNTIME行payloadのsha256 == writes_sha256。3点すべて完全一致のみ MATCH であり、
+   hash無しのcount単独・未知のmember・1セルでも異なるcensus/hash は INVALID。
+   宣言は分類ではなくピンであり、`boundary.json` の runtime_writes と `run.log` の
+   `wrote=true` 数も一致しなければならない。未宣言で書き込みがある行は従来どおり INVALID。
    各フィールドは使う前に型を検査する（`dimension` が object/list、`runtime_writes` が bool
    のような値は INVALID であり、suite を `TypeError` で落とさない）。
 2. 宣言した `stage.reference` と `stage.port` が一致し、`reference` が fixture の記録と一致する
