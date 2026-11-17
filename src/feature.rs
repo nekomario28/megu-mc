@@ -2469,7 +2469,9 @@ fn gen_huge_fungus(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &HugeFu
     if rng.next_bound(12) == 0 {
         height *= 2;
     }
-    // `chunkGenerator.getGenDepth()` is the level's build height, which is the harness's own
+    // A `LevelHeightAccessor` question (build height), not `ChunkGenerator.getGenDepth()`:
+    // 1.21.1 gives the Nether 0/128 in `noise_settings` and 0/256 in
+    // `dimension_type/the_nether.json`, and this bound is the level's.
     if !c.planted && y + height + 1 >= ctx.g.world_min_y + ctx.g.world_height {
         return;
     }
