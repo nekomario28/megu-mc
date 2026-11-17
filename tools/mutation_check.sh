@@ -831,8 +831,14 @@ check "a block in a cold chunk keeps its position across ticks" \
             }' \
   region_change_mid_fall_keeps_the_entity
 check "breaking a chest drops the slots it owned" \
-  src/main.rs '        if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Block((x, y, z))) {' \
-  '        if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Block((x, y, z + 1000))) {' \
+  src/main.rs '            if let Some(slots) = chests()
+                .lock()
+                .unwrap()
+                .remove(&ContainerKey::Block((x, y, z)))' \
+  '            if let Some(slots) = chests()
+                .lock()
+                .unwrap()
+                .remove(&ContainerKey::Block((x, y + 1000, z)))' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a state whose metadata row cannot be matched is reported as unpaired" \
@@ -856,11 +862,14 @@ check "a broken furnace cannot retain its slots" \
   furnace_and_sign_round_trip_keeps_only_live_owners
 
 check "broken sign text cannot survive its block" \
-  src/main.rs '        signs()
-            .lock()
-            .unwrap()
-            .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
-  '        signs().lock().unwrap().retain(|_, _| true);' \
+  src/main.rs '            signs()
+                .lock()
+                .unwrap()
+                .retain(|&(sx, sy, sz, _), _| !(sx == x && sy == y && sz == z));' \
+  '            signs()
+                .lock()
+                .unwrap()
+                .retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 # The note block's per-state solidity and light now come from the pinned fact table, so this
 # mutation moves to the column it reads. The pumpkin `state_flags` load it used to break is
@@ -1723,8 +1732,8 @@ check "feature writes stay inside the FEATURES write window" \
   feature::generation_contract_tests::feature_writes_outside_the_population_window_are_dropped
 
 check "nether forest vegetation keeps the ceiling guard" \
-  src/feature.rs '    if y < ctx.g.min_y + 1 || y + 1 >= ctx.g.min_y + ctx.g.height {' \
-  '    if y < ctx.g.min_y + 1 {' \
+  src/feature.rs '    if y < ctx.g.world_min_y + 1 || y + 1 >= ctx.g.world_min_y + ctx.g.world_height {' \
+  '    if y < ctx.g.world_min_y + 1 {' \
   feature::generation_contract_tests::nether_forest_vegetation_matches_native_cells_and_rng
 
 check "delta feature draws a double, not a float" \
@@ -1834,7 +1843,7 @@ check "a sign side carries filtered_messages" \
   sign_side_nbt_matches_the_shape_the_game_writes
 
 check "the open window reads the live store, not a copy" \
-  src/main.rs '    let ch = all.get(&pos).cloned().unwrap_or_default();' '    let ch: HashMap<i16, Stack> = HashMap::new();' \
+  src/main.rs '    let ch = all.get(&first).cloned().unwrap_or_default();' '    let ch: HashMap<i16, Stack> = HashMap::new();' \
   a_placed_chest_shows_its_staged_contents_in_the_open_window
 
 check "staged containers reach the live store" \

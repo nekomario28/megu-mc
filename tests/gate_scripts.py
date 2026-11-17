@@ -131,9 +131,16 @@ def build_fixture(root, *, dirty=False, leftover=False, missing_anchor=False, sy
     if missing_anchor:
         path = root / "src/main.rs"
         text = path.read_text()
-        anchor = "        if let Some(slots) = chests().lock().unwrap().remove(&ContainerKey::Block((x, y, z))) {"
+        anchor = (
+            "            if let Some(slots) = chests()\n"
+            "                .lock()\n"
+            "                .unwrap()\n"
+            "                .remove(&ContainerKey::Block((x, y, z)))"
+        )
         assert text.count(anchor) == 1
-        path.write_text(text.replace(anchor, "        if let Some(slots) = None::<HashMap<i16, Stack>> {", 1))
+        path.write_text(
+            text.replace(anchor, anchor.replace("(x, y, z)", "(x, y + 1000, z)"), 1)
+        )
     if leftover:
         (root / "src/main.rs.mutation-backup").write_text("unrestored source")
     if symlink_input:
