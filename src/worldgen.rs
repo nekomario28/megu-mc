@@ -3087,6 +3087,145 @@ pub fn enabled() -> bool {
     GEN_READY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `ChunkLevel.byStatus(FullChunkStatus.ENTITY_TICKING)`: a `forceload` request enters the
+/// scheduler as a ticket at level 31 (`ChunkMap.c`), not as a position in a list.
+pub(crate) const POP_REQUEST_LEVEL: i32 = 31;
+/// The status whose task decorates a chunk (`ChunkStatus.FEATURES`) answers to level 34 in this
+/// build (`ChunkLevel.getStatusForLevel`), so a request set is mirrored by three rings of
+/// *demanders* and the decorated set is the request set plus three rings (`FEATURES_RING`).
+pub(crate) const POP_DECORATION_LEVEL: i32 = 34;
+/// `ChunkStep.blockStateWriteRadius` for the `FEATURES` step: one chunk, so a decoration walks
+/// its own 3x3 and everything it writes outside that square is dropped (`arb.f_`).
+pub(crate) const POP_WRITE_RADIUS: i32 = 1;
+
+/// One pop of the population priority discipline: the demander that reached the head of the
+/// queue, the level it was queued at, and the chunks its `FEATURES` step decorated, in the order
+/// the step walked them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PopBatch {
+    pub level: i32,
+    pub demander: (i32, i32),
+    pub decorated: Vec<(i32, i32)>,
+}
+
+/// The request set in the box shape `MC_SPINE_POP_REGION` already uses, walked x-then-z.
+///
+/// This walk is the *declared* half of the default order and the reason the whole default is
+/// named: vanilla fixes the priority discipline and leaves the within-level sequence to the wall
+/// clock (two identical-setting native runs agree on 9 of 49 chunks), so any single default is one
+/// member of that family. Here the member is: the first demander is the box's min corner, and a
+/// demander's window is walked x-outer / z-inner.
+pub(crate) fn request_box(x0: i32, z0: i32, x1: i32, z1: i32) -> Vec<(i32, i32)> {
+    let (x0, x1) = (x0.min(x1), x0.max(x1));
+    let (z0, z1) = (z0.min(z1), z0.max(z1));
+    (x0..=x1)
+        .flat_map(|x| (z0..=z1).map(move |z| (x, z)))
+        .collect()
+}
+
+/// The default population order: **the serialized demand scan**, a named member of vanilla's
+/// order family.
+///
+/// Vanilla's population order is a priority discipline, not a sequence:
+///
+/// * a request is a ticket at level 31 (`POP_REQUEST_LEVEL`), and `DistanceManager` propagates it
+///   at +1 per Chebyshev step, so ring *d* sits at level 31+d;
+/// * `ChunkTaskPriorityQueue` holds one insertion-ordered FIFO bucket per level and pops the
+///   lowest non-empty level (`aqd`), with the task's priority being the demander's queue level;
+/// * a popped task walks statuses upward and, at `FEATURES`, walks its `2r+1` window x-outer /
+///   z-inner, running each demanded chunk's step inline (`apy`, `dwc`);
+/// * `FEATURES` answers to level 34, so demanders exist at levels 31..=33 and the decorated set
+///   is the request set plus three rings (measured on seven native captures: 1 chunk -> 7x7,
+///   3x3 -> 9x9).
+///
+/// The rule is fixed; the within-level order is wall clock, and identical-setting native runs
+/// differ (9/49 common prefix). This function therefore implements *one named member* and does not
+/// claim bit-parity with any capture — for a comparison against a recorded order the order is an
+/// input (`MC_SPINE_POP_ORDER`), which is what the finite acceptance set compares with.
+///
+/// The member, exactly:
+///
+/// 1. request chunks enter level 31's bucket in `request_box` order;
+/// 2. pop the head of the lowest non-empty level;
+/// 3. walk that demander's 3x3 window x-outer / z-inner, skipping chunks already decorated, and
+///    append every newly decorated chunk that is itself a demander (level < 34) to the tail of
+///    its own level's bucket — that inline demand is what makes the scan serial;
+/// 4. repeat until every bucket is empty.
+///
+/// Steps 2-3 give the two measured shape properties for free: the first batch is the x-then-z 3x3
+/// at the request box's min corner, and batches pop in non-decreasing level (the decorated list is
+/// not level-monotone — a batch's window reaches one ring further — exactly as measured).
+pub(crate) fn population_discipline(requests: &[(i32, i32)]) -> Vec<PopBatch> {
+    if requests.is_empty() {
+        return Vec::new();
+    }
+    let level_of = |c: (i32, i32)| {
+        let ring = requests
+            .iter()
+            .map(|r| (c.0 - r.0).abs().max((c.1 - r.1).abs()))
+            .min()
+            .unwrap_or(0);
+        POP_REQUEST_LEVEL + ring
+    };
+    // One FIFO bucket per level, and the pop order is by level: a `BTreeMap` is the whole queue.
+    let mut buckets: std::collections::BTreeMap<i32, std::collections::VecDeque<(i32, i32)>> =
+        std::collections::BTreeMap::new();
+    let mut queued: HashSet<(i32, i32)> = HashSet::new();
+    let mut decorated: HashSet<(i32, i32)> = HashSet::new();
+    for &request in requests {
+        if queued.insert(request) {
+            buckets
+                .entry(level_of(request))
+                .or_default()
+                .push_back(request);
+        }
+    }
+    let mut batches = Vec::new();
+    loop {
+        let Some(level) = buckets
+            .iter()
+            .find(|(_, bucket)| !bucket.is_empty())
+            .map(|(level, _)| *level)
+        else {
+            break;
+        };
+        let demander = buckets
+            .get_mut(&level)
+            .and_then(|bucket| bucket.pop_front())
+            .expect("the level was found non-empty");
+        let mut window = Vec::with_capacity(9);
+        for dx in -POP_WRITE_RADIUS..=POP_WRITE_RADIUS {
+            for dz in -POP_WRITE_RADIUS..=POP_WRITE_RADIUS {
+                let chunk = (demander.0 + dx, demander.1 + dz);
+                if !decorated.insert(chunk) {
+                    continue;
+                }
+                window.push(chunk);
+                let chunk_level = level_of(chunk);
+                // A chunk whose own target *is* `FEATURES` has a demand radius of 0 for it, so
+                // ring 3 is decorated but never demands: that is where the set stops.
+                if chunk_level < POP_DECORATION_LEVEL && queued.insert(chunk) {
+                    buckets.entry(chunk_level).or_default().push_back(chunk);
+                }
+            }
+        }
+        batches.push(PopBatch {
+            level,
+            demander,
+            decorated: window,
+        });
+    }
+    batches
+}
+
+/// The decorated order of [`population_discipline`], flattened: the execution order.
+pub(crate) fn population_discipline_order(requests: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    population_discipline(requests)
+        .into_iter()
+        .flat_map(|batch| batch.decorated)
+        .collect()
+}
+
 /// Validate an explicit FEATURES plan covering a dump's one-chunk decoration halo.
 /// Recorded plans may include additional observed sources; exact plans may not.
 /// Neither mode silently drops or reorders entries.
@@ -4048,7 +4187,7 @@ impl Gen {
             })
     }
 
-    /// feature-layer lookup: populates the 3x3 neighborhood on demand, then
+    /// feature-layer lookup: runs the default population dispatch on demand, then
     /// returns the override state for (x,y,z) if a feature wrote one.
     pub(crate) fn feat_state(
         &mut self,
@@ -4059,9 +4198,11 @@ impl Gen {
     ) -> Option<u32> {
         let (cx, cz) = (x >> 4, z >> 4);
         // Order is an input: vanilla's ticket scheduler is not a coordinate
-        // sort. POP_REGION is a legacy lexicographic scan; the default is a
-        // lazy local 3x3. Neither claims to emulate tickets. Offline callers
-        // can prepopulate an observed plan through the same execution owner.
+        // sort. POP_REGION is a legacy lexicographic scan; the default is the
+        // named member of vanilla's discipline (`population_discipline`), never
+        // a claim of bit-parity with a capture. Offline callers can prepopulate
+        // an observed plan through the same execution owner, and a chunk the plan
+        // already covers needs no dispatch at all.
         if let Some((px0, pz0, px1, pz1)) = self.pop_region {
             for sx in px0..=px1 {
                 for sz in pz0..=pz1 {
@@ -4076,11 +4217,11 @@ impl Gen {
             let nbr = env_str!("MC_SPINE_FEAT_NBR")
                 .map(|v| v != "0")
                 .unwrap_or(true);
-            let (x0, x1) = if nbr { (cx - 1, cx + 1) } else { (cx, cx) };
-            let (z0, z1) = if nbr { (cz - 1, cz + 1) } else { (cz, cz) };
-            for sx in x0..=x1 {
-                for sz in z0..=z1 {
-                    self.populate_in_order([(sx, sz)], &mut populate);
+            if !self.pop_done.contains(&(cx, cz)) {
+                if nbr {
+                    self.populate_request_box(cx, cz, cx, cz, &mut populate);
+                } else {
+                    self.populate_in_order([(cx, cz)], &mut populate);
                 }
             }
         }
@@ -4241,20 +4382,38 @@ impl Gen {
         self.shape_marks.remove(&(cx, cz)).unwrap_or_default()
     }
 
-    /// Populate the 3x3 around a chunk if it has not been populated yet, so a
-    /// diagnostic reads the same feature-layer state a generation loop would. The
-    /// driver is passed in, as at every other call site here: the choice of
-    /// placement implementation belongs to the caller's boundary, not to worldgen.
+    /// Execute the default population order for a request box: the named member of vanilla's
+    /// order family documented on [`population_discipline`], over the box shape `MC_SPINE_POP_REGION`
+    /// already uses. `.0` is the number of chunks this call decorated.
+    pub(crate) fn populate_request_box(
+        &mut self,
+        x0: i32,
+        z0: i32,
+        x1: i32,
+        z1: i32,
+        populate: impl FnMut(&mut Gen, i32, i32),
+    ) -> usize {
+        let order = population_discipline_order(&request_box(x0, z0, x1, z1));
+        self.populate_in_order(order, populate)
+    }
+
+    /// Populate the request a diagnostic makes, so it reads the feature-layer state a generation
+    /// loop would hold for that chunk. The driver is passed in, as at every other call site here:
+    /// the choice of placement implementation belongs to the caller's boundary, not to worldgen.
+    ///
+    /// A chunk that is already decorated needs nothing: everything that can write into its cells
+    /// either decorated them or was decorated itself when the demand that reached it was served
+    /// (a writer sits within `POP_WRITE_RADIUS` of it, so within the same three rings).
     pub(crate) fn ensure_populated(
         &mut self,
         cx: i32,
         cz: i32,
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) {
-        self.populate_in_order(
-            (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))),
-            &mut populate,
-        );
+        if self.pop_done.contains(&(cx, cz)) {
+            return;
+        }
+        self.populate_request_box(cx, cz, cx, cz, &mut populate);
     }
 
     /// Highest non-air (`0`) / solid (`1`) feature-written block + 1 in a column.
@@ -8722,8 +8881,188 @@ mod wg_tests {
         crate::feature::feat_prof_dump();
     }
 
+    /// The default dispatch is a *named member* of vanilla's order family, not a capture: the
+    /// level-major priority queue with the serialized demand scan tie-break documented on
+    /// [`population_discipline`]. This pinned list is that member for a one-chunk request set, and
+    /// it is the whole contract of the default — vanilla fixes the rule, not the sequence, so no
+    /// captured run is reproduced bit-for-bit here (`MC_SPINE_POP_ORDER` is how a comparison
+    /// against one recorded order is made).
+    ///
+    /// Before this discipline the default was a lazy x-then-z 3x3, so this list is 9 entries long
+    /// and in a different order; the golden is what turns that into a failure instead of a story.
     #[test]
-    fn lazy_population_keeps_neighborhood_order_and_cached_overrides() {
+    fn default_dispatch_runs_the_named_population_order() {
+        let _guard = lock_gen();
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let mut visited = Vec::new();
+        let _ = g.feat_state(8, 64, 8, |_, x, z| visited.push((x, z)));
+        assert_eq!(
+            render_population_order(&visited),
+            squash(&GOLDEN_DEFAULT_ORDER_1X1),
+            "the default dispatch must run the named member, not a coordinate sort"
+        );
+        // A chunk the run already decorated is served from the cache: the discipline is a queue,
+        // not a re-scan.
+        let mut again = Vec::new();
+        let _ = g.feat_state(8 + 16, 64, 8, |_, x, z| again.push((x, z)));
+        assert_eq!(again, Vec::new(), "an already decorated chunk re-populated");
+    }
+
+    /// The same order for a 3x3 request box: 81 decorated chunks (9x9), and the tie-break that
+    /// makes the member reproducible — request chunks are queued at level 31 in box order, so the
+    /// min corner's window is the first batch.
+    #[test]
+    fn named_population_order_scales_to_a_three_by_three_request_box() {
+        let _guard = lock_gen();
+        let order = population_discipline_order(&request_box(0, 0, 2, 2));
+        assert_eq!(
+            render_population_order(&order),
+            squash(&GOLDEN_DEFAULT_ORDER_3X3),
+            "the named member's 3x3 request box order"
+        );
+    }
+
+    /// Invariance 1, measured on all seven native captures: the decorated set is the request set
+    /// plus three rings (1 chunk -> 7x7, 3x3 -> 9x9). The rule comes from the status the decorating
+    /// step answers to: `FEATURES` is level 34, so demanders sit at levels 31..=33.
+    #[test]
+    fn population_discipline_decorates_the_request_set_plus_three_rings() {
+        let _guard = lock_gen();
+        for (x0, z0, x1, z1, want) in [(0, 0, 0, 0, 49), (-3, 5, -3, 5, 49), (0, 0, 2, 2, 81)] {
+            let requests = request_box(x0, z0, x1, z1);
+            let order = population_discipline_order(&requests);
+            assert_eq!(order.len(), want, "decorated count for ({x0},{z0})..({x1},{z1})");
+            let (min_x, max_x) = (order.iter().map(|c| c.0).min(), order.iter().map(|c| c.0).max());
+            let (min_z, max_z) = (order.iter().map(|c| c.1).min(), order.iter().map(|c| c.1).max());
+            assert_eq!(
+                (min_x, max_x, min_z, max_z),
+                (Some(x0 - 3), Some(x1 + 3), Some(z0 - 3), Some(z1 + 3)),
+                "decorated span for ({x0},{z0})..({x1},{z1}) must be the request box + 3 rings"
+            );
+            let unique: HashSet<_> = order.iter().copied().collect();
+            assert_eq!(unique.len(), order.len(), "a chunk was decorated twice");
+        }
+    }
+
+    /// Invariance 2, measured on all seven native captures: the first decoration block is the
+    /// x-then-z 3x3 at the request box's (min x, min z) corner. That block is the first demander's
+    /// write window, which is why it is the only part identical across runs.
+    #[test]
+    fn population_discipline_first_block_is_the_min_corner_window() {
+        let _guard = lock_gen();
+        for (x0, z0, x1, z1) in [(0, 0, 0, 0), (7, -4, 9, -2), (-25, 19, -25, 19)] {
+            let requests = request_box(x0, z0, x1, z1);
+            let batches = population_discipline(&requests);
+            let first = &batches[0];
+            assert_eq!(first.level, POP_REQUEST_LEVEL, "the first batch is a request chunk");
+            assert_eq!(first.demander, (x0, z0), "the first demander is the min corner");
+            let want: Vec<(i32, i32)> = (x0 - 1..=x0 + 1)
+                .flat_map(|x| (z0 - 1..=z0 + 1).map(move |z| (x, z)))
+                .collect();
+            assert_eq!(first.decorated, want, "first block is the x-then-z 3x3 window");
+            assert_eq!(
+                population_discipline_order(&requests)[..9].to_vec(),
+                want,
+                "the first nine decorated chunks are that window"
+            );
+        }
+    }
+
+    /// Invariance 3: the pops are level-major (lowest non-empty level first) and every chunk's
+    /// level is the request set's Chebyshev distance + 31. The *decorated* sequence is not
+    /// level-monotone — a batch's window reaches one ring further — which is exactly the
+    /// staircase native shows (`[1,0,1,2,3]` runs over levels {0..3} for one chunk).
+    #[test]
+    fn population_discipline_pops_in_level_order() {
+        let _guard = lock_gen();
+        for (x0, z0, x1, z1) in [(0, 0, 0, 0), (0, 0, 2, 2), (-2, 6, 1, 9)] {
+            let requests = request_box(x0, z0, x1, z1);
+            let batches = population_discipline(&requests);
+            let levels: Vec<i32> = batches.iter().map(|batch| batch.level).collect();
+            assert!(
+                levels.windows(2).all(|w| w[0] <= w[1]),
+                "pops must be level-major: {levels:?}"
+            );
+            assert_eq!(*levels.last().unwrap(), POP_DECORATION_LEVEL - 1);
+            for batch in &batches {
+                let ring = requests
+                    .iter()
+                    .map(|r| (batch.demander.0 - r.0).abs().max((batch.demander.1 - r.1).abs()))
+                    .min()
+                    .unwrap();
+                assert_eq!(
+                    batch.level,
+                    POP_REQUEST_LEVEL + ring,
+                    "{:?} must sit at 31 + its Chebyshev ring",
+                    batch.demander
+                );
+                assert!(
+                    batch.level < POP_DECORATION_LEVEL,
+                    "a chunk whose own target is FEATURES never demands"
+                );
+                assert!(!batch.decorated.is_empty(), "a demander decorates its window");
+            }
+            // Level-major does not mean the decorated list is level-sorted: the window of a
+            // level-31 pop already reaches ring 1.
+            let decorated_levels: Vec<i32> = population_discipline_order(&requests)
+                .into_iter()
+                .map(|c| {
+                    POP_REQUEST_LEVEL
+                        + requests
+                            .iter()
+                            .map(|r| (c.0 - r.0).abs().max((c.1 - r.1).abs()))
+                            .min()
+                            .unwrap()
+                })
+                .collect();
+            assert!(
+                decorated_levels.windows(2).any(|w| w[0] > w[1]),
+                "the decorated sequence is a staircase, not a sorted list"
+            );
+        }
+    }
+
+    /// The named member for a one-chunk request set, rendered as `x,z` in decoration order.
+    const GOLDEN_DEFAULT_ORDER_1X1: &str = "
+        -1,-1 -1,0 -1,1 0,-1 0,0 0,1 1,-1 1,0
+        1,1 -2,-2 -2,-1 -2,0 -1,-2 0,-2 -2,1 -2,2
+        -1,2 0,2 1,-2 1,2 2,-2 2,-1 2,0 2,1
+        2,2 -3,-3 -3,-2 -3,-1 -2,-3 -1,-3 -3,0 -3,1
+        0,-3 1,-3 -3,2 -3,3 -2,3 -1,3 0,3 1,3
+        2,-3 2,3 3,-3 3,-2 3,-1 3,0 3,1 3,2
+        3,3
+    ";
+
+    /// The same member for the 3x3 request box `(0,0)..(2,2)` (81 decorated chunks).
+    const GOLDEN_DEFAULT_ORDER_3X3: &str = "
+        -1,-1 -1,0 -1,1 0,-1 0,0 0,1 1,-1 1,0
+        1,1 -1,2 0,2 1,2 -1,3 0,3 1,3 2,-1
+        2,0 2,1 2,2 2,3 3,-1 3,0 3,1 3,2
+        3,3 -2,-2 -2,-1 -2,0 -1,-2 0,-2 -2,1 -2,2
+        1,-2 2,-2 -2,3 -2,4 -1,4 0,4 1,4 2,4
+        3,-2 3,4 4,-2 4,-1 4,0 4,1 4,2 4,3
+        4,4 -3,-3 -3,-2 -3,-1 -2,-3 -1,-3 -3,0 -3,1
+        0,-3 1,-3 -3,2 -3,3 2,-3 3,-3 -3,4 -3,5
+        -2,5 -1,5 0,5 1,5 2,5 3,5 4,-3 4,5
+        5,-3 5,-2 5,-1 5,0 5,1 5,2 5,3 5,4
+        5,5
+    ";
+
+    fn render_population_order(order: &[(i32, i32)]) -> String {
+        order
+            .iter()
+            .map(|(x, z)| format!("{x},{z}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Compare a golden against a render without caring where the literal broke its lines.
+    fn squash(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn default_dispatch_keeps_discipline_order_and_cached_overrides() {
         let _guard = lock_gen();
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
         let mut visited = Vec::new();
@@ -8736,18 +9075,23 @@ mod wg_tests {
         assert_eq!(g.feat_state(-16, 64, -16, &mut populate), Some(102));
         assert_eq!(g.feat_state(-16, 64, -16, &mut populate), Some(102));
         assert_eq!(g.feat_state(0, 64, 0, &mut populate), Some(106));
-        let mut expected: Vec<_> = (-2..=0)
-            .flat_map(|sx| (-2..=0).map(move |sz| (sx, sz)))
-            .collect();
-        expected.extend([(-1, 1), (0, 1), (1, -1), (1, 0), (1, 1)]);
-        assert_eq!(visited, expected);
+        // Chunk (-1,-1)'s own 3x3 is the first pop's window, so the values are the ones the lazy
+        // scan produced; the difference is the 40 chunks the discipline also decorates.
+        assert_eq!(visited, population_discipline_order(&request_box(-1, -1, -1, -1)));
+        assert_eq!(visited.len(), 49);
     }
 
     #[test]
     fn lazy_population_preserves_direct_feature_outputs() {
         let _guard = lock_gen();
-        // Preserve population results through the lazy lookup, including writes
+        // Preserve population results through the default dispatch, including writes
         // outside the queried chunk. This is a refactor control, not a vanilla oracle.
+        //
+        // The compared quantity is the *queried* chunk's bucket. A chunk's cells are written
+        // only by its own 3x3 (writes outside `POP_WRITE_RADIUS` are dropped), that 3x3 is the
+        // first pop's window in the discipline, and no later pop decorates those chunks again —
+        // so the equal-value claim is about that chunk, not about the 40 extra ring-2/ring-3
+        // buckets the discipline also fills.
         for (x, z) in [(-1i32, -1i32), (16, 16)] {
             let mut lazy = Gen::load(0, crate::name_to_state).expect("datapack");
             let mut direct = Gen::load(0, crate::name_to_state).expect("datapack");
@@ -8758,16 +9102,20 @@ mod wg_tests {
                     crate::feature::populate(&mut direct, sx, sz);
                 }
             }
-            let expected: usize = direct.feat_c.values().map(HashMap::len).sum();
-            assert!(expected > 0, "fixture must exercise real feature writes");
+            let want = direct.feat_map(cx, cz).cloned();
             assert!(
-                lazy.feat_c == direct.feat_c,
-                "feature values differ at center ({cx},{cz}): actual={} expected={expected}",
-                lazy.feat_c.values().map(HashMap::len).sum::<usize>()
+                want.as_ref().is_some_and(|bucket| !bucket.is_empty()),
+                "fixture must exercise real feature writes"
+            );
+            assert_eq!(
+                lazy.feat_map(cx, cz).cloned(),
+                want,
+                "feature values differ at the queried chunk ({cx},{cz})"
             );
             assert_eq!(lazy.feat_state(x, 64, z, crate::feature::populate), first);
-            assert!(
-                lazy.feat_c == direct.feat_c,
+            assert_eq!(
+                lazy.feat_map(cx, cz).cloned(),
+                want,
                 "cached lookup changed feature values"
             );
         }
@@ -9267,8 +9615,19 @@ mod wg_tests {
         // 89 -> 18. The visible blocks of this capture's own fixture are unchanged
         // ((-2,-2)+3x3 564 -> 564, (0,0)+2x2 11 -> 11, (-1,1)+2x2 0 -> 0), so the digest
         // moves with the captured *write set* in the chunks those windows do not cover.
+        // 2026-11-18: the default population dispatch is now vanilla's order *discipline* — the
+        // level-major priority queue with the serialized demand scan tie-break
+        // (`population_discipline`) — instead of a lazy x-then-z 3x3. This capture digests every
+        // `feat_c` bucket and the whole `pop_done` set, and the discipline decorates the request
+        // set plus three rings (49 chunks for a one-chunk request instead of 9), so the digest
+        // moves with the write set of the two extra rings. The *visible* blocks are unchanged:
+        // a chunk's cells are written only by its own 3x3 (writes beyond `POP_WRITE_RADIUS` are
+        // dropped), that square is the first pop's window in x-then-z — the same nine chunks the
+        // lazy scan ran, in the same order — and no later pop decorates them again
+        // (`lazy_population_preserves_direct_feature_outputs` and
+        // `default_dispatch_keeps_discipline_order_and_cached_overrides` pin both halves).
         assert_eq!(
-            digest, "10832b856152579d9b91c570f436b52f",
+            digest, "dcfa9969316c5721ef37715af66240b4",
             "feature population output changed from the native feature-contract capture"
         );
     }
@@ -9713,3 +10072,4 @@ mod weird_sampler_tests;
 #[cfg(test)]
 #[path = "aquifer_native_tests.rs"]
 mod aquifer_native_tests;
+

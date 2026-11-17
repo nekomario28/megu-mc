@@ -645,15 +645,18 @@ check "the tree path uses the clip decision" \
   'if false && !clip_allows_top(top, height, t.min_clipped) {' \
   feature_population_output_matches_the_pre_refactor_capture
 
+# The default population path is a queue that decorates a request set's three rings; a lookup that
+# "claims" the chunk without running the population input at all leaves an empty feature layer, and
+# the discipline's cross-chunk writes are what make an order observable in returned values.
 check "lazy feature lookup applies its population input and retains cached overrides" \
-  src/worldgen.rs '            for sx in x0..=x1 {
-                for sz in z0..=z1 {
-                    self.populate_in_order([(sx, sz)], &mut populate);' \
-  '            for sx in x0..=x1 {
-                for sz in z0..=z1 {
-                    self.pop_done.insert((sx, sz));
-                    let _ = (&mut populate, sx, sz);'  \
-  worldgen::wg_tests::lazy_population_keeps_neighborhood_order_and_cached_overrides
+  src/worldgen.rs '                if nbr {
+                    self.populate_request_box(cx, cz, cx, cz, &mut populate);
+                } else {' \
+  '                if nbr {
+                    let _ = (&mut populate, cx, cz);
+                    self.pop_done.insert((cx, cz));
+                } else {'  \
+  worldgen::wg_tests::default_dispatch_keeps_discipline_order_and_cached_overrides
 check "a placed gravity block is scheduled by its own cell" \
   src/main.rs '    for (px, py, pz) in [(x, y, z), (x, y.saturating_add(1), z)] {' \
   '    for (px, py, pz) in [(x, y.saturating_add(1), z), (x, y.saturating_add(1), z)] {' \
@@ -3224,6 +3227,31 @@ check "the promotion shape pass keeps a mushroom whose raw brightness is under 1
   src/template_structures.rs '        return if lit < 13 && reg.is_solid_render(below) {' \
   '        return if lit <= 13 && reg.is_solid_render(below) {' \
   generation_contract_tests::promotion_removes_a_mushroom_the_lit_engine_reaches
+
+# Population-order discipline (the default population dispatch). The default is a named member of
+# vanilla's order family, so the two things that make it a discipline are the level propagation and
+# which level is popped: propagating +2 per Chebyshev step instead of +1 stops the demand two rings
+# short, and popping the highest non-empty level inverts the priority. Both leave a plausible
+# sequence behind - the first batch is still the min corner's 3x3 window - which is why the golden
+# ordered list, not a shape check, is the gate.
+check "a request's queue level is its Chebyshev ring + 31, one level per step" \
+  src/worldgen.rs '            .unwrap_or(0);
+        POP_REQUEST_LEVEL + ring
+    };' \
+  '            .unwrap_or(0);
+        POP_REQUEST_LEVEL + ring * 2
+    };' \
+  worldgen::wg_tests::default_dispatch_runs_the_named_population_order
+
+check "the population queue pops the lowest non-empty level" \
+  src/worldgen.rs '        let Some(level) = buckets
+            .iter()
+            .find(|(_, bucket)| !bucket.is_empty())' \
+  '        let Some(level) = buckets
+            .iter()
+            .rev()
+            .find(|(_, bucket)| !bucket.is_empty())' \
+  worldgen::wg_tests::default_dispatch_runs_the_named_population_order
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
