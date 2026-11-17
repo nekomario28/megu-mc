@@ -1326,7 +1326,18 @@ fn log_single_piece_loots(label: &str, loots: &[mineshaft::SinglePieceLoot]) {
 /// structure's `afterPlace`.
 fn place_start(ctx: &mut FC, start: &mut Start, random: &mut crate::generation_math::Xor, cx: i32, cz: i32) {
     let (x0, z0) = (cx << 4, cz << 4);
-    let mut chunk_bb: BB = [x0, ctx.g.min_y, z0, x0 + 15, ctx.g.min_y + ctx.g.height - 1, z0 + 15];
+    // Vanilla's clip is `new BoundingBox(chunkPos.getMinBlockX(), level.getMinBuildHeight(),
+    // ..., level.getMaxBuildHeight(), ...)`, i.e. the **world** window. Keeping the
+    // generator window here would drop every piece cell above y=127 even when the
+    // storage layer accepts it (the End City tower: 273 cells at 128..143).
+    let mut chunk_bb: BB = [
+        x0,
+        ctx.g.world_min_y,
+        z0,
+        x0 + 15,
+        ctx.g.world_min_y + ctx.g.world_height - 1,
+        z0 + 15,
+    ];
     match &mut start.pieces {
         StartPieces::Mineshaft(m) => {
             mineshaft::place_start(ctx, random, cx, cz, start.key, m);
@@ -2025,7 +2036,8 @@ mod pipeline_tests {
         let mut out: std::collections::BTreeMap<String, usize> = Default::default();
         for x in cx * 16..cx * 16 + 16 {
             for z in cz * 16..cz * 16 + 16 {
-                for y in g.min_y..g.min_y + g.height {
+                // the world window: a feature may write above the generator top
+                for y in g.world_min_y..g.world_min_y + g.world_height {
                     if let Some(st) = g.feature_override(x, y, z) {
                         *out.entry(reg.name_of(st).to_string()).or_default() += 1;
                     }
@@ -2360,6 +2372,108 @@ mod pipeline_tests {
         }
     }
 
+    /// The world window, not the generator window, is what a chunk can *store*.
+    ///
+    /// 1.21.1 declares them separately: `data/minecraft/dimension_type/the_end.json` is
+    /// `min_y 0 / height 256`, `worldgen/noise_settings/end.json` is `0/128`. Terrain,
+    /// density, aquifers, carvers and surface rules live in the 128; chunk sections,
+    /// heightmaps, the dump length and structure bounds live in the 256. `end_city`
+    /// builds *up* with no ceiling of its own, so on the pinned capture
+    /// (`captures/matrix-v1/nat-4242-end-city`, chunk (65,45)) vanilla stores 273
+    /// non-air cells at y 128..143: `purpur_block` 168, `end_stone_bricks` 54,
+    /// `purpur_pillar[axis=y]` 12, `magenta_stained_glass` 12, `purpur_stairs` 20,
+    /// `end_rod` 4. Highest block y = 139, stored `WORLD_SURFACE` = 140.
+    ///
+    /// A port that uses the generator height as the storage bound drops all of them and
+    /// still reports `0` differences, because they fall outside the window it compares;
+    /// `chunk_triage` only sees the loss as an out-of-window exclusion count. This test
+    /// pins the cells, not the window arithmetic.
+    #[test]
+    fn end_city_stores_cells_above_the_generator_top() {
+        reset_cache();
+        let mut end = Gen::load_preset(4242, crate::name_to_state, worldgen::NoisePreset::End)
+            .expect("end gen");
+        let starts = starts_cached(&mut end, 65, 45);
+        assert!(
+            starts.iter().any(|s| s.structure == "minecraft:end_city"),
+            "seed 4242 chunk (65,45) must hold an end_city start"
+        );
+        populate(&mut end, 65, 45);
+        let reg = crate::block_registry::breg().expect("block registry");
+        // 128..143 is world section 8 and past the generator top, so nothing the terrain
+        // layer produces can land here: every cell is a structure write the storage bound
+        // has to accept. 144..255 must stay air (vanilla has nothing above 143 here).
+        //
+        // The read is the dump's own reader (`Gen::block_state_at`, which `terrain_section`
+        // wraps), taken from this test's local generator: `worldgen::terrain_section` reads
+        // the global `GEN`, which this test does not install.
+        let mut census: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut above = 0usize;
+        let mut higher = 0usize;
+        for sy in (128..256).step_by(16) {
+            let mut cells = 0usize;
+            for ly in 0..16 {
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let st = end.block_state_at(
+                            65 * 16 + lx,
+                            sy + ly,
+                            45 * 16 + lz,
+                            crate::feature::populate,
+                        );
+                        if st == 0 || reg.is_air(st) {
+                            continue;
+                        }
+                        cells += 1;
+                        *census.entry(reg.canonical_state(st)).or_default() += 1;
+                    }
+                }
+            }
+            if sy == 128 {
+                above = cells;
+            } else {
+                higher += cells;
+            }
+        }
+        assert_eq!(
+            higher, 0,
+            "vanilla stores nothing above y=143 in this chunk; got {higher} cells in 144..255"
+        );
+        assert_eq!(
+            above, 273,
+            "the native capture stores 273 non-air cells at y 128..143 (chunk 65,45); \
+             got {above} (census: {census:?}). Zero means the storage bound is still the \
+             generator window, so every end_city cell above y=127 is dropped"
+        );
+        // The tower's own materials, so a count that happens to match cannot pass with a
+        // different structure in the same section.
+        let count = |name: &str| {
+            census
+                .iter()
+                .filter(|(k, _)| k.starts_with(&format!("minecraft:{name}")))
+                .map(|(_, v)| *v)
+                .sum::<usize>()
+        };
+        assert_eq!(count("purpur_block"), 168, "census: {census:?}");
+        assert_eq!(count("end_stone_bricks"), 54, "census: {census:?}");
+        // The chunk's own heightmap has to follow the same window: the native capture stores
+        // `Heightmaps.WORLD_SURFACE` top = 140 for this chunk (highest block y = 139), i.e.
+        // above the generator top. A heightmap scan that stops at y=127 cannot answer that.
+        let mut fc = FC::new(&mut end);
+        let mut top = i32::MIN;
+        for lz in 0..16 {
+            for lx in 0..16 {
+                top = top.max(fc.hm_ws(65 * 16 + lx, 45 * 16 + lz));
+            }
+        }
+        assert_eq!(
+            top, 140,
+            "the native capture stores Heightmaps.WORLD_SURFACE top = 140 for this chunk; a \
+             0..127 scan tops out at 128, so the two sides would disagree on every column \
+             under the tower"
+        );
+    }
+
     #[test]
     fn structure_spawner_and_entity_payloads_reach_fc() {
         use crate::generation_payload::GenerationPayload;
@@ -2663,6 +2777,93 @@ mod pipeline_tests {
                     if loot_table == "minecraft:chests/village/village_weaponsmith"
             )),
             "the weapon smith's chest is staged as a chest loot container"
+        );
+    }
+}
+
+/// F1 window guards that belong to the *feature* layer's module scope: they call the
+/// placement code directly, which is `pub(crate)`-invisible from another module.
+///
+/// (This file is `include!`d into `feature.rs`, so these tests are children of the
+/// module that owns `mod_positions` / `freg` / `Pf`.)
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// `height_range` samples the **generator** window, not the world window.
+    ///
+    /// It is the placement modifier of 23 Nether placed features (`ore_quartz_nether`,
+    /// `glowstone`, `spring_lava`, the `patch_*` vegetation, ...) and 0 End ones, so a
+    /// 128 -> 256 change here is loud and invisible at the same time: no Nether fixture
+    /// row has a cell above 127, so nothing in the matrix would see the draws move.
+    ///
+    /// Vanilla resolves the anchors against `WorldGenerationContext`, i.e.
+    /// `chunkGenerator.getMinY()/getGenDepth()` — the noise settings window. The
+    /// measurement that fixes it: on the pinned Nether fixture chunk (-25,6)
+    /// `nether_quartz_ore` reaches y=117 on both sides, which is exactly
+    /// `BelowTop(10)` over a 0/128 window; with `hi = 245` roughly half of the ~150
+    /// quartz cells would land in air above the roof.
+    #[test]
+    fn height_range_positions_sample_the_generator_window() {
+        let mut g = crate::worldgen::Gen::load_preset(
+            4242,
+            crate::name_to_state,
+            crate::worldgen::NoisePreset::Nether,
+        )
+        .expect("nether gen");
+        let gen_window = (g.min_y, g.height);
+        let world_window = (g.world_min_y, g.world_height);
+        assert_eq!(gen_window, (0, 128), "the noise settings window");
+        assert_eq!(world_window, (0, 256), "the dimension_type window");
+        let pf = freg()
+            .placed
+            .get("minecraft:ore_quartz_nether")
+            .expect("placed feature ore_quartz_nether");
+        let hr = pf
+            .mods
+            .iter()
+            .find(|m| matches!(m, PM::HeightRange(_)))
+            .expect("ore_quartz_nether is placed by height_range");
+        let PM::HeightRange(hp) = hr else {
+            unreachable!()
+        };
+        let mut ctx = FC::new(&mut g);
+        let mut rng = Xor::seed(4242);
+        let mut out = Vec::new();
+        let mut got = Vec::new();
+        for _ in 0..1024 {
+            out.clear();
+            mod_positions(hr, freg(), &mut ctx, &mut rng, (0, 64, 0), pf, &mut out);
+            assert_eq!(out.len(), 1, "height_range emits exactly one position");
+            got.push(out[0].1);
+        }
+        // The same draws, replayed straight from the generator window: the placement code
+        // must be passing exactly these two numbers.
+        let mut replay = Xor::seed(4242);
+        let expected: Vec<i32> = (0..1024)
+            .map(|_| hp.get(&mut replay, gen_window.0, gen_window.1))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "height_range must sample the generator window ({gen_window:?})"
+        );
+        // The bounds the Nether's ores were measured inside.
+        assert!(got.iter().all(|y| (10..=117).contains(y)), "{:?}", got.iter().min());
+        assert_eq!(got.iter().max(), Some(&117), "BelowTop(10) over 0/128");
+        // Negative control: the assertion above can fail. The world window is the same
+        // range expression resolved against 0/256, and it does not produce these draws.
+        let mut replay = Xor::seed(4242);
+        let widened: Vec<i32> = (0..1024)
+            .map(|_| hp.get(&mut replay, world_window.0, world_window.1))
+            .collect();
+        assert_ne!(
+            got, widened,
+            "widening the anchors must change the draws; otherwise this test pins nothing"
+        );
+        assert!(
+            widened.iter().any(|y| *y > 127),
+            "the world window must be able to draw above the roof, or the two windows are \\
+             indistinguishable here"
         );
     }
 }

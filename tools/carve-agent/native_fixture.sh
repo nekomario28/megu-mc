@@ -2,6 +2,15 @@
 # Bounded signed-seed native fixture (1..3 chunks per side).
 # MC_FIXTURE_DIMENSION selects a vanilla dimension; MC_FIXTURE_STAGE selects
 # terrain/carvers/features/structures. Defaults retain the forest fixture.
+# MC_FIXTURE_HEIGHT_WINDOW=noise|dimension selects which y window a capture covers:
+#   noise     (default) the preset's `noise_settings` window - what the port's *terrain*
+#             can produce, and what every capture in `captures/matrix-v1` used.
+#   dimension the preset's `dimension_type` window - what a chunk can *store*. 1.21.1
+#             gives the Nether and the End 0/256 there, so a 256 capture is the only
+#             way to see (and prove) content above y=127; the End's end_city tower is
+#             measured in it (273 cells at 128..143 in chunk (65,45)).
+# The chosen window drives the forceload/`featurebox` box, the post-processing
+# `vanilla_chunk` read and `boundary.json`'s `min_y`/`height`, so all three agree.
 # Run inside a resource-gated MemoryMax=1800M/CPUQuota=100% scope.
 # Usage: native_fixture.sh <NEW-output-dir> <chunk-x> <chunk-z> <n> [frozen|ticked]
 # Uses an existing authenticated fixture base; never downloads or deletes a capture.
@@ -11,12 +20,19 @@ DIR="${1:?output directory}"; CX="${2:?chunk x}"; CZ="${3:?chunk z}"; N="${4:-3}
 DIMENSION="${MC_FIXTURE_DIMENSION:-minecraft:overworld}"
 STAGE="${MC_FIXTURE_STAGE:-features}"
 SEED="${MC_SPINE_SEED:-0}"
+HEIGHT_WINDOW="${MC_FIXTURE_HEIGHT_WINDOW:-noise}"
 case "$DIMENSION" in
-    minecraft:overworld) MINY=-64; HEIGHT=384; WORLD_REL=world ;;
-    minecraft:the_nether) MINY=0; HEIGHT=128; WORLD_REL=world/DIM-1 ;;
-    minecraft:the_end) MINY=0; HEIGHT=128; WORLD_REL=world/DIM1 ;;
+    minecraft:overworld) N_MINY=-64; N_HEIGHT=384; D_MINY=-64; D_HEIGHT=384; WORLD_REL=world ;;
+    minecraft:the_nether) N_MINY=0; N_HEIGHT=128; D_MINY=0; D_HEIGHT=256; WORLD_REL=world/DIM-1 ;;
+    minecraft:the_end) N_MINY=0; N_HEIGHT=128; D_MINY=0; D_HEIGHT=256; WORLD_REL=world/DIM1 ;;
     *) echo 'unsupported fixture dimension' >&2; exit 2 ;;
 esac
+case "$HEIGHT_WINDOW" in
+    noise) MINY=$N_MINY; HEIGHT=$N_HEIGHT ;;
+    dimension) MINY=$D_MINY; HEIGHT=$D_HEIGHT ;;
+    *) echo 'MC_FIXTURE_HEIGHT_WINDOW must be noise or dimension' >&2; exit 2 ;;
+esac
+echo "native fixture window: $HEIGHT_WINDOW ($MINY/$HEIGHT); noise $N_MINY/$N_HEIGHT, dimension $D_MINY/$D_HEIGHT" >&2
 case "$STAGE" in
     terrain|carvers|features) STRUCTURES=false ;;
     structures) STRUCTURES=true ;;
@@ -127,7 +143,7 @@ commands | timeout 240 java -XX:ActiveProcessorCount=2 -Xmx1G -Xms256M \
     "-Dfeaturebox=$box" "-Druntimebox=$box" "${tick_args[@]}" -jar server.jar nogui > run.log 2>&1
 ! grep -qi 'CARVEAGENT .*failed\|unexpected error occurred\|Incorrect argument for command\|Unknown or incomplete command' run.log
 PYTHONPATH="$ROOT/tools" python3 - "$DIR" "$CX" "$CZ" "$N" "$MODE" "$DIMENSION" "$MINY" "$HEIGHT" "$WORLD_REL" "$SEED" "$STAGE" <<'PY'
-import array,json,re,sys
+import array,json,os,re,sys
 from pathlib import Path
 from carver_diff import vanilla_chunk,load_states
 root=Path(sys.argv[1]);cx,cz,n=map(int,sys.argv[2:5]);mode=sys.argv[5]
@@ -159,7 +175,7 @@ for x,z in re.findall(r'DECO (-?\d+) (-?\d+)',log):
     if cx-1<=x<=cx+n and cz-1<=z<=cz+n:order.append((x,z))
 if len(order)!=(n+2)**2 or len(set(order))!=len(order):raise SystemExit(f'invalid decoration footprint: {order}')
 (root/'order.tsv').write_text(''.join(f'{x}\t{z}\n' for x,z in order))
-(root/'boundary.json').write_text(json.dumps({'mode':mode,'dimension':dimension,'min_y':min_y,'height':height,'seed':seed,'stage':stage,'world_subdirectory':world_rel,'game_times':times,'chunks':n*n,'decorated_chunks':len(order),'runtime_writes':len(re.findall(r'RUNTIME .*wrote=true',log))},indent=2)+'\n')
+(root/'boundary.json').write_text(json.dumps({'mode':mode,'dimension':dimension,'min_y':min_y,'height':height,'height_window':os.environ.get('MC_FIXTURE_HEIGHT_WINDOW','noise'),'seed':seed,'stage':stage,'world_subdirectory':world_rel,'game_times':times,'chunks':n*n,'decorated_chunks':len(order),'runtime_writes':len(re.findall(r'RUNTIME .*wrote=true',log))},indent=2)+'\n')
 print((root/'boundary.json').read_text())
 PY
 sha256sum --check inputs.sha256 > inputs-verified.txt

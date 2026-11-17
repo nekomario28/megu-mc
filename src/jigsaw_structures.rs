@@ -2319,8 +2319,13 @@ pub(crate) fn generate_jigsaw_pieces_live(
     let defs = live_jigsaw_defs(reg)?;
     let structure = defs.structures.get(struct_id)?;
     let mut repo = LiveJigsawRepo(defs);
-    let dim_min_y = g.min_y;
-    let dim_max_y_excl = g.min_y + g.height;
+    // `JigsawPlacement`'s root box is clamped by the level's build height
+    // (`LevelHeightAccessor`), not by the noise settings: `dimension_padding` is padding
+    // from the *world* top/bottom. The Nether's bastions keep their own 0..127 start
+    // range either way, but the bound has to be the one vanilla uses so a padding change
+    // cannot silently move a jigsaw start.
+    let dim_min_y = g.world_min_y;
+    let dim_max_y_excl = g.world_min_y + g.world_height;
     let mut world = LiveJigsawWorld { g, allowed_biomes };
     match generate_pieces_with_hm(
         &mut repo,

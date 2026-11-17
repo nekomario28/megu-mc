@@ -3080,6 +3080,78 @@ check "cocoa binds its draws to the plane order, not the reversed array" \
   '                    for f in [3u8, 4, 5, 2] {' \
   feature::generation_contract_tests::cocoa_binds_its_four_probability_draws_to_north_east_south_west
 
+
+# --- F1: the world window (dimension_type) vs the generator window (noise_settings) ---
+#
+# 1.21.1 declares both: the Nether and the End generate 0..127 and store 0..255. These
+# entries pin the split at every place a "widen everything" edit would silently collapse it.
+check "a dimension window that cuts the generator's terrain is refused" \
+  src/worldgen.rs '    if min_y > gen_min_y || min_y + height < gen_min_y + gen_height {
+        return None;
+    }' \
+  '    if false {
+        return None;
+    }' \
+  worldgen::wg_tests::dimension_window_falls_back_to_the_generator_when_the_object_is_unusable
+
+check "the loaded world height is the dimension_type file's, not the generator's" \
+  src/worldgen.rs '                        g.world_min_y = min_y;
+                        g.world_height = height;' \
+  '                        g.world_min_y = min_y;
+                        g.world_height = g.height;' \
+  worldgen::wg_tests::dimension_type_declares_a_world_window_containing_the_generator
+
+check "the terrain reader answers air above the generator window" \
+  src/worldgen.rs '        if y < self.min_y || y >= self.min_y + self.height {
+            return 0;
+        }
+        let cc = match self.cols(x >> 4, z >> 4) {' \
+  '        if false {
+            return 0;
+        }
+        let cc = match self.cols(x >> 4, z >> 4) {' \
+  worldgen::wg_tests::nether_and_end_dumps_cover_the_world_window_with_air_above_the_generator
+
+check "the FEATURES storage gate is the world window" \
+  src/worldgen.rs '        if y < self.world_min_y || y >= self.world_min_y + self.world_height {
+            return;
+        }' \
+  '        if y < self.min_y || y >= self.min_y + self.height {
+            return;
+        }' \
+  feature::pipeline_tests::end_city_stores_cells_above_the_generator_top
+
+check "isOutsideBuildHeight is the world window" \
+  src/generation_context.rs '        y < self.g.world_min_y || y >= self.g.world_min_y + self.g.world_height' \
+  '        y < self.g.min_y || y >= self.g.min_y + self.g.height' \
+  feature::generation_contract_tests::out_of_h_follows_the_world_window_not_the_generator
+
+check "a heightmap scan reaches the world top" \
+  src/generation_context.rs '        let mut y = from.min(self.g.world_min_y + self.g.world_height - 1);' \
+  '        let mut y = from.min(self.g.min_y + self.g.height - 1);' \
+  feature::pipeline_tests::end_city_stores_cells_above_the_generator_top
+
+check "a template piece writes above the generator top" \
+  src/template_structures.rs '        if y < self.g.world_min_y || y >= self.g.world_min_y + self.g.world_height {
+            return false;
+        }' \
+  '        if y < self.g.min_y || y >= self.g.min_y + self.g.height {
+            return false;
+        }' \
+  feature::pipeline_tests::end_city_stores_cells_above_the_generator_top
+
+check "height_range still samples the generator window" \
+  src/feature.rs '            out.push((pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2));' \
+  '            out.push((pos.0, hp.get(rng, ctx.g.world_min_y, ctx.g.world_height), pos.2));' \
+  feature::window_tests::height_range_positions_sample_the_generator_window
+
+check "nether_fossil anchors on the generator window" \
+  src/template_structures.rs '    let min_y = world.gen_min_y();
+    let depth = world.gen_height();' \
+  '    let min_y = world.min_y();
+    let depth = world.height();' \
+  feature::pipeline_tests::nether_fossil_scans_the_noise_column_not_the_live_world
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

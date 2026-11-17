@@ -117,8 +117,27 @@ pub(crate) trait TemplateWorld {
     }
 
     fn sea_level(&self) -> i32;
+    /// `LevelAccessor.getMinBuildHeight` — the **world** window (`dimension_type`).
     fn min_y(&self) -> i32;
+    /// `LevelHeightAccessor.getHeight` — the **world** window (`dimension_type`).
     fn height(&self) -> i32;
+    /// `WorldGenerationContext.getMinGenY()` = `ChunkGenerator.getMinY()` — the
+    /// **generator** window (`noise_settings`).
+    ///
+    /// Vanilla has both and they are not the same object: `LevelHeightAccessor` answers
+    /// build-height questions (256 in the Nether and the End), while a `HeightProvider`
+    /// samples against the `WorldGenerationContext`, which is built from the chunk
+    /// generator (128 there). `nether_fossil` is the one structure whose placement draws
+    /// from a `HeightProvider`, and the measured answer is the generator's: the pinned
+    /// native start is BB [-356, 55, 319, -350, 61, 324], and sampling the world window
+    /// moves it to y 78 (a `next_bound(222)` draw instead of `next_bound(94)`), which the
+    /// `nat-4242-nether-fossil` row rejects.
+    fn gen_min_y(&self) -> i32 {
+        self.min_y()
+    }
+    fn gen_height(&self) -> i32 {
+        self.height()
+    }
     /// `LevelAccessor.getRandom().nextInt(bound)` for non-placement level RNG
     /// (e.g. WoodlandMansion `Group of Allays` count), kept separate from the
     /// chunk decoration `RandomSource`.
@@ -132,7 +151,9 @@ impl TemplateWorld for crate::generation_context::FC<'_> {
         crate::generation_context::FC::get(self, x, y, z)
     }
     fn set(&mut self, x: i32, y: i32, z: i32, state: u32) -> bool {
-        if y < self.g.min_y || y >= self.g.min_y + self.g.height {
+        // `WorldGenRegion.setBlock` refuses by the level's build height (`dimension_type`),
+        // not by the generator's: a template piece may place above the terrain top.
+        if y < self.g.world_min_y || y >= self.g.world_min_y + self.g.world_height {
             return false;
         }
         crate::generation_context::FC::set(self, x, y, z, state);
@@ -155,9 +176,22 @@ impl TemplateWorld for crate::generation_context::FC<'_> {
         self.g.sea
     }
     fn min_y(&self) -> i32 {
-        self.g.min_y
+        // `LevelAccessor.getMinBuildHeight` - the world window. `base_height`/
+        // `base_column` above stay generator-side on purpose (`ChunkGenerator.getBaseHeight`
+        // is the noise column, not the chunk).
+        self.g.world_min_y
     }
     fn height(&self) -> i32 {
+        // `LevelHeightAccessor.getHeight` - the world window. Every caller here is a
+        // vanilla build-height question: `TemplatePlacement`'s `VerticalAnchor`
+        // resolution, the shipwreck `getMaxBuildHeight` accumulator, the ocean ruin's
+        // floor, `in_spawnable_bounds` and the mansion foundation scan.
+        self.g.world_height
+    }
+    fn gen_min_y(&self) -> i32 {
+        self.g.min_y
+    }
+    fn gen_height(&self) -> i32 {
         self.g.height
     }
 }
@@ -2232,8 +2266,12 @@ fn nether_fossil_find<W: TemplateWorld>(
     let x = min_x + ctx.rng.next_bound(16);
     let z = min_z + ctx.rng.next_bound(16);
     let sea = world.sea_level();
-    let min_y = world.min_y();
-    let depth = world.height();
+    // The `HeightProvider` samples `WorldGenerationContext(minGenY, genDepth)`, i.e. the
+    // generator window - see `TemplateWorld::gen_min_y`. Deliberately not the world
+    // window: measured on `nat-4242-nether-fossil`, that draw lands at y 78 instead of
+    // the native 55.
+    let min_y = world.gen_min_y();
+    let depth = world.gen_height();
     let mut y = height.sample(ctx.rng, min_y, depth);
     while y > sea {
         // `NoiseColumn` cells, not the live chunk. Vanilla's `getBaseColumn` carries no

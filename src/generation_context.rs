@@ -313,8 +313,11 @@ impl<'a> FC<'a> {
         if prof && kind.is_wg() {
             HM_SCAN_N.fetch_add(1, Ordering::Relaxed);
         }
-        let mut y = from.min(self.g.min_y + self.g.height - 1);
-        while y >= self.g.min_y {
+        // A heightmap is a property of the chunk, so its scan bound and its "nothing
+        // found" answer are the **world** window, not the generator's: the End's
+        // `WORLD_SURFACE` for the tower chunk is 140, above the top of its terrain.
+        let mut y = from.min(self.g.world_min_y + self.g.world_height - 1);
+        while y >= self.g.world_min_y {
             let st = if kind.is_wg() {
                 terrain
                     .as_ref()
@@ -330,7 +333,7 @@ impl<'a> FC<'a> {
             }
             y -= 1;
         }
-        self.g.min_y
+        self.g.world_min_y
     }
     pub(crate) fn heightmap(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
         if kind.is_wg() {
@@ -462,7 +465,10 @@ impl<'a> FC<'a> {
         0
     }
     pub(crate) fn out_of_h(&self, y: i32) -> bool {
-        y < self.g.min_y || y >= self.g.min_y + self.g.height
+        // `Level.isOutsideBuildHeight`: the *world* window. A feature may legitimately
+        // write above the generator top (the End's end_city does), and
+        // `BlockPlacement`/`WorldGenRegion` refuse by the level's build height.
+        y < self.g.world_min_y || y >= self.g.world_min_y + self.g.world_height
     }
 }
 

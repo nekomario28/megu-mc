@@ -26662,7 +26662,26 @@ fn main() {
                     if allow_extra { "recorded" } else { "exact" }
                 );
             }
-            let (lo, hi) = (worldgen::min_y(), worldgen::max_y());
+            // Which window a dump covers. Default `world` = the **world** window from
+            // `dimension_type`: the Nether and the End store 16 sections while their
+            // terrain covers 8, and a comparison has to look at the same rectangle on
+            // both sides. `noise` reproduces the pre-split 0/128 dump, which is what the
+            // existing `nat-4242-nether-*` rows were captured in (and therefore what the
+            // reader of those rows expects): `tools/port_triage.py
+            // --height-window noise` sets it together with the triage window, so the dump
+            // length and the compared window cannot disagree.
+            let (lo, hi) = match std::env::var("MC_SPINE_WG_DUMP_WINDOW").as_deref() {
+                Err(std::env::VarError::NotPresent) | Ok("world") => {
+                    (worldgen::world_min_y(), worldgen::world_max_y())
+                }
+                Ok("noise") => (worldgen::min_y(), worldgen::max_y()),
+                other => {
+                    eprintln!(
+                        "[wgdump] invalid MC_SPINE_WG_DUMP_WINDOW {other:?}; expected world or noise"
+                    );
+                    std::process::exit(2);
+                }
+            };
             let mut out: Vec<u8> = Vec::new();
             let t1 = Instant::now();
             for dz in 0..n {

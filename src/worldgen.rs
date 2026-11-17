@@ -46,6 +46,42 @@ pub(crate) fn parse_world_seed(value: &str) -> Result<u64, std::num::ParseIntErr
         .or_else(|_| value.parse())
 }
 
+/// The `dimension_type` file a preset's chunks belong to. Note the two names that are
+/// not the preset: the Nether and the End are `the_nether` / `the_end` on disk.
+///
+/// One preset, one dimension: the overworld noise settings also cover its caves
+/// (`overworld_caves` is a separate dimension_type this port does not load), and it
+/// declares the same -64/384 window.
+fn dimension_type_file(preset: NoisePreset) -> &'static str {
+    match preset {
+        NoisePreset::Overworld => "overworld",
+        NoisePreset::Nether => "the_nether",
+        NoisePreset::End => "the_end",
+    }
+}
+
+/// The world window one `dimension_type` object declares, or `None` when it is not a
+/// window this generator can live in.
+///
+/// Three refusals, each of which would otherwise silently cut terrain or produce a dump
+/// whose length is not a whole number of sections:
+/// * `min_y`/`height` missing, non-positive, or not multiples of 16;
+/// * a window that starts above the generator's own `min_y`;
+/// * a window that ends below the generator's top.
+///
+/// `None` means "keep `world_* = gen_*`" and the loader traces the reason.
+fn dimension_window(j: &J, gen_min_y: i32, gen_height: i32) -> Option<(i32, i32)> {
+    let min_y = j.get("min_y").map(J::num)? as i32;
+    let height = j.get("height").map(J::num)? as i32;
+    if height <= 0 || height % 16 != 0 || min_y % 16 != 0 {
+        return None;
+    }
+    if min_y > gen_min_y || min_y + height < gen_min_y + gen_height {
+        return None;
+    }
+    Some((min_y, height))
+}
+
 // ---------- beardifier (vanilla `Beardifier`) ----------
 //
 // The vanilla `beardifier` density-function node is not in the datapack: `NoiseChunk`
@@ -664,8 +700,19 @@ pub struct GenData {
     biome_names: Vec<String>,
     biome_weather: Vec<BiomeWeather>,
     pub sea: i32,
+    /// The **generator** window from `worldgen/noise_settings/<preset>.json`'s `noise`
+    /// object. Terrain, density, aquifers, carvers, surface rules and the biome quart
+    /// sweep are defined over exactly this range.
     pub min_y: i32,
     pub height: i32,
+    /// The **world** window from `dimension_type/<dimension>.json`. Chunk sections,
+    /// heightmaps, the offline dump length and structure/furniture bounds are defined
+    /// over this range. 1.21.1 makes them different: the Nether and the End generate
+    /// 0..127 but store 0..255 (see `dim_height_256_design.md`). It equals
+    /// `min_y`/`height` whenever the pack has no usable `dimension_type` object, so a
+    /// fixture that predates this split keeps its exact meaning.
+    pub world_min_y: i32,
+    pub world_height: i32,
     // NoiseSettings.getCellHeight() = size_vertical * 4
     noise_cell_h: i32,
     noise_cell_w: i32,
@@ -1067,6 +1114,8 @@ impl Gen {
                 sea: 63,
                 min_y: -64,
                 height: 384,
+                world_min_y: -64,
+                world_height: 384,
                 noise_cell_h: 8,
                 noise_cell_w: 4,
                 legacy_random_source: false,
@@ -1175,6 +1224,50 @@ impl Gen {
             }
         }
         let router = ns.get("noise_router");
+        // The **world** window: `dimension_type/<dimension>.json`'s `min_y`/`height`.
+        // It is a different fact from the noise settings above and 1.21.1 differs by 2x
+        // for both non-overworld dimensions (noise 0/128, dimension 0/256). Only the
+        // storage-side readers use it - chunk sections, heightmaps, the offline dump
+        // length, structure/furniture bounds - never the density/aquifer/carver/surface
+        // path, which is generator height in vanilla too. Absent or unusable, the world
+        // window *is* the generator window, which keeps every pre-split fixture exact.
+        g.world_min_y = g.min_y;
+        g.world_height = g.height;
+        {
+            let file = dimension_type_file(preset);
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            if !g.base.is_empty() {
+                // the pack the noise settings came from answers first, so one pack cannot
+                // contribute a generator and a different pack its world
+                candidates.push(std::path::PathBuf::from(&g.base));
+            }
+            candidates.extend(Gen::packs());
+            for p in candidates {
+                let f = p.join(format!("data/minecraft/dimension_type/{file}.json"));
+                let Ok(b) = std::fs::read(&f) else { continue };
+                let Some(j) = jparse(&b) else {
+                    Self::load_trace(&format!(
+                        "dimension_type/{file}.json is not JSON; the world window stays {}/{}",
+                        g.min_y, g.height
+                    ));
+                    break;
+                };
+                match dimension_window(&j, g.min_y, g.height) {
+                    Some((min_y, height)) => {
+                        g.world_min_y = min_y;
+                        g.world_height = height;
+                    }
+                    // Fail closed: a window that is not whole sections or that does not
+                    // contain the terrain the generator makes would truncate it.
+                    None => Self::load_trace(&format!(
+                        "dimension_type/{file}.json is not a window containing the generator's \
+                         {}/{}",
+                        g.min_y, g.height
+                    )),
+                }
+                break;
+            }
+        }
         // 1.21.1 writes the router entries as inline density functions (the newer
         // dialect writes references), so this has to go through `router_df`, which
         // accepts either.
@@ -2868,8 +2961,12 @@ impl std::ops::DerefMut for GenLock {
 pub(crate) struct GenFacts {
     pub preset: NoisePreset,
     pub sea: i32,
+    /// generator window (`noise_settings`)
     pub min_y: i32,
     pub height: i32,
+    /// world window (`dimension_type`); see `GenData::world_min_y`
+    pub world_min_y: i32,
+    pub world_height: i32,
     pub def_st: u32,
     pub def_fl: u32,
     pub bedrock_st: u32,
@@ -2952,6 +3049,8 @@ pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: Noise
                 sea: g.sea,
                 min_y: g.min_y,
                 height: g.height,
+                world_min_y: g.world_min_y,
+                world_height: g.world_height,
                 def_st: g.def_st,
                 def_fl: g.def_fl,
                 bedrock_st: g.bedrock_st,
@@ -3644,6 +3743,16 @@ impl Gen {
         if let Some(st) = self.feat_state(x, y, z, populate) {
             return st;
         }
+        // The generator is defined over its own window: a cell above (or below) it is
+        // not terrain, it is an empty section, and vanilla answers air there
+        // (`NoiseChunk` has no cell, `ChunkAccess` has no palette entry). Without this
+        // the density function is *evaluated* outside the window it was built for and
+        // invents blocks: measured on the Nether preset, all 32 768 cells of y 128..255
+        // in chunk (0,0) came back non-air. `feat_state` above is consulted first
+        // because a feature may legitimately write there (the End City does).
+        if y < self.min_y || y >= self.min_y + self.height {
+            return 0;
+        }
         let cc = match self.cols(x >> 4, z >> 4) {
             Some(c) => c,
             None => return 0,
@@ -4167,7 +4276,11 @@ impl Gen {
     }
 
     pub(crate) fn feat_write(&mut self, x: i32, y: i32, z: i32, st: u32) {
-        if y < self.min_y || y >= self.min_y + self.height {
+        // The FEATURES-layer storage gate is the **world** window: 1.21.1's End City
+        // builds above the End's generator top (measured: 273 cells at y 128..143 in
+        // chunk (65,45) of the pinned capture), and vanilla's
+        // `WorldGenRegion.ensureCanWrite` bound is the level's build height.
+        if y < self.world_min_y || y >= self.world_min_y + self.world_height {
             return;
         }
         let key = (x >> 4, z >> 4);
@@ -4485,6 +4598,23 @@ pub fn min_y() -> i32 {
 }
 pub fn max_y() -> i32 {
     facts().map(|f| f.min_y + f.height - 1).unwrap_or(319)
+}
+/// The **world** window's floor (`dimension_type` `min_y`): the bottom of the chunk a
+/// player stands in, which is not necessarily the bottom of the terrain.
+///
+/// `min_y()`/`max_y()` above are the generator's window and stay that way: the density
+/// lattice, the surface scans and the biome quart sweep are defined over it, so moving
+/// them would rewrite terrain. Use these for storage and bounds: chunk sections,
+/// heightmaps, the offline dump length, feature/structure write bounds and structure
+/// placement boxes.
+pub fn world_min_y() -> i32 {
+    facts().map(|f| f.world_min_y).unwrap_or(-64)
+}
+pub fn world_height() -> i32 {
+    facts().map(|f| f.world_height).unwrap_or(384)
+}
+pub fn world_max_y() -> i32 {
+    world_min_y() + world_height() - 1
 }
 
 /// First solid (density>0) y when scanning down from max_y. -min_y-1 if none.
@@ -8224,6 +8354,166 @@ mod wg_tests {
         // leave the shared fixture in the Overworld for the other tests
         assert!(init(0, crate::name_to_state));
         assert_eq!(facts().expect("facts").preset, NoisePreset::Overworld);
+    }
+
+    /// There are **two** heights, from two files, and they are not interchangeable.
+    ///
+    /// `worldgen/noise_settings/<preset>.json` is the generator: terrain, density,
+    /// aquifers, carvers, surface rules and the biome quart sweep all live in it, and
+    /// 1.21.1 gives the Nether and the End `min_y 0 / height 128` there. `dimension_type/
+    /// <dimension>.json` is the world: chunk sections, heightmaps, the dump length and
+    /// structure/furniture bounds, and 1.21.1 gives the Nether and the End `0 / 256` there.
+    /// The overworld agrees at -64/384, which is why one number looked sufficient.
+    ///
+    /// The numbers are asserted against the pack files themselves, not against a Rust
+    /// constant: if the data changes the test follows it, and if the loader stops reading
+    /// the file the two sides disagree.
+    #[test]
+    fn dimension_type_declares_a_world_window_containing_the_generator() {
+        let _guard = lock_gen();
+        for (preset, file, gen, world) in [
+            (NoisePreset::Overworld, "overworld.json", (-64, 384), (-64, 384)),
+            (NoisePreset::Nether, "the_nether.json", (0, 128), (0, 256)),
+            (NoisePreset::End, "the_end.json", (0, 128), (0, 256)),
+        ] {
+            assert!(init_preset(0, crate::name_to_state, preset));
+            let f = facts().expect("facts published at init");
+            assert_eq!(
+                (f.min_y, f.height),
+                gen,
+                "{preset:?}: the generator window comes from noise_settings"
+            );
+            assert_eq!(
+                (f.world_min_y, f.world_height),
+                world,
+                "{preset:?}: the world window comes from dimension_type"
+            );
+            assert_eq!(
+                (world_min_y(), world_height(), world_max_y()),
+                (world.0, world.1, world.0 + world.1 - 1),
+                "{preset:?}: the free functions must agree with the published facts"
+            );
+            // A world window that does not contain the generator's would cut terrain.
+            assert!(f.world_min_y <= f.min_y, "{preset:?}");
+            assert!(
+                f.world_min_y + f.world_height >= f.min_y + f.height,
+                "{preset:?}"
+            );
+            assert!(f.world_height >= f.height, "{preset:?}");
+            // And the numbers are the pack's own, read the way the loader reads them.
+            let path = std::path::Path::new("datapacks/vanilla/data/minecraft/dimension_type")
+                .join(file);
+            let raw = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let j = jparse(&raw).unwrap_or_else(|| panic!("{}: invalid JSON", path.display()));
+            assert_eq!(
+                (
+                    j.get("min_y").map(J::num).map(|v| v as i32),
+                    j.get("height").map(J::num).map(|v| v as i32)
+                ),
+                (Some(f.world_min_y), Some(f.world_height)),
+                "{}: the loaded world window must be this file's min_y/height",
+                path.display()
+            );
+        }
+        // leave the shared fixture in the Overworld for the other tests
+        assert!(init(0, crate::name_to_state));
+    }
+
+    /// The fallback that keeps every existing fixture's meaning: a pack without a usable
+    /// `dimension_type` object leaves `world_* = gen_*`. "Unusable" is not only "absent":
+    /// a window that is not whole sections, or that does not contain what the generator
+    /// produces, would truncate terrain - refuse it and say so (the loader traces it),
+    /// rather than defining a world smaller than the ground.
+    #[test]
+    fn dimension_window_falls_back_to_the_generator_when_the_object_is_unusable() {
+        let parse = |s: &str| jparse(s.as_bytes()).expect("json");
+        // absent fields (the file exists but is not a dimension_type)
+        assert_eq!(dimension_window(&parse("{}"), 0, 128), None);
+        // not whole sections
+        assert_eq!(
+            dimension_window(&parse(r#"{"min_y": 0, "height": 120}"#), 0, 128),
+            None
+        );
+        assert_eq!(
+            dimension_window(&parse(r#"{"min_y": 5, "height": 256}"#), 0, 128),
+            None
+        );
+        // shorter than the generator's own terrain
+        assert_eq!(
+            dimension_window(&parse(r#"{"min_y": 0, "height": 96}"#), 0, 128),
+            None
+        );
+        // starts above the generator
+        assert_eq!(
+            dimension_window(&parse(r#"{"min_y": 16, "height": 256}"#), 0, 128),
+            None
+        );
+        // the three shapes 1.21.1 actually ships
+        assert_eq!(
+            dimension_window(&parse(r#"{"min_y": 0, "height": 256}"#), 0, 128),
+            Some((0, 256))
+        );
+        assert_eq!(
+            dimension_window(&parse(r#"{"min_y": -64, "height": 384}"#), -64, 384),
+            Some((-64, 384))
+        );
+        // and an exact match is still a valid world window
+        assert_eq!(
+            dimension_window(&parse(r#"{"min_y": 0, "height": 128}"#), 0, 128),
+            Some((0, 128))
+        );
+    }
+
+    /// The dump, not only the fetch, follows the **world** window.
+    ///
+    /// `main.rs` dumps `worldgen::world_min_y()..=world_max_y()` in 16-block sections, and
+    /// `chunk_triage` is told the same numbers, so "the window the port can produce" and
+    /// "the window the comparison reads" cannot disagree. Above the generator top the
+    /// window must hold nothing but air: that is what makes the Nether's 256 a storage
+    /// property and the End's a content property.
+    #[test]
+    fn nether_and_end_dumps_cover_the_world_window_with_air_above_the_generator() {
+        let _guard = lock_gen();
+        let reg = crate::block_registry::breg().expect("block registry");
+        for preset in [NoisePreset::Nether, NoisePreset::End] {
+            assert!(init_preset(4242, crate::name_to_state, preset));
+            let f = facts().expect("facts");
+            let (lo, hi) = (world_min_y(), world_max_y());
+            assert_eq!(lo, f.world_min_y);
+            assert_eq!(hi, f.world_min_y + f.world_height - 1);
+            // The dump's own loop: one 4096-cell section per 16 blocks.
+            let sections = ((hi - lo + 1) / 16) as usize;
+            assert_eq!(sections, f.world_height as usize / 16, "{preset:?}");
+            assert_eq!(sections, 16, "{preset:?}: 1.21.1 stores 16 sections");
+            let mut cells = 0usize;
+            let mut above_gen = 0usize;
+            let mut sy = lo;
+            while sy <= hi {
+                let arr = terrain_section(0, sy, 0, crate::feature::populate)
+                    .expect("terrain section");
+                cells += arr.len();
+                if sy >= f.min_y + f.height {
+                    above_gen += arr
+                        .iter()
+                        .filter(|st| **st != 0 && !reg.is_air(**st))
+                        .count();
+                }
+                sy += 16;
+            }
+            assert_eq!(
+                cells,
+                sections * 4096,
+                "{preset:?}: the dump length must be the declared window"
+            );
+            assert_eq!(
+                above_gen, 0,
+                "{preset:?}: the generator window's ceiling is the top of the terrain, so \
+                 128..255 must be air in chunk (0,0)"
+            );
+        }
+        // leave the shared fixture in the Overworld for the other tests
+        assert!(init(0, crate::name_to_state));
     }
 
     /// Stage 2A: terrain is pure, so a scratch generator on the same `GenData` must

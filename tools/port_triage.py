@@ -42,18 +42,32 @@ from vanilla_region_blocks import parse_nbt  # noqa: E402
 
 STRIP_ENV_PREFIXES = ("MC_SPINE_", "SPC_", "FSEED_", "BIOMEF_", "FEATURE_")
 
-# The y window `mc-spine` dumps, per preset. It is the preset's `noise_settings`
-# `noise.min_y`/`noise.height` (`datapacks/vanilla/data/minecraft/worldgen/noise_settings/
-# <preset>.json`), because that is the range the port generates: the_nether and the_end
-# declare a 256-block *dimension* (`dimension_type` `min_y` 0 / `height` 256) while their
-# noise settings cover 0..128, and everything above is air on both sides. Passing the
-# window explicitly keeps the dump length and the triage window in agreement instead of
-# letting `chunk_triage` infer a height from whichever sections the native chunk happens
-# to have non-empty (an air-only section is not written, so that inference is not stable).
+# The y window `mc-spine` dumps, per preset, from two different files.
+#
+# `noise` is the preset's `worldgen/noise_settings/<preset>.json` `noise.min_y`/`noise.height`:
+# the range the *terrain* generates. `dimension` is `data/minecraft/dimension_type/
+# <dimension>.json`'s `min_y`/`height`: the range a chunk *stores* (sections, heightmaps,
+# the dump length). 1.21.1 disagrees for the Nether and the End (0/128 vs 0/256) and agrees
+# for the Overworld. `MC_FIXTURE_HEIGHT_WINDOW` / `--height-window` picks which one a run
+# uses, and the same value drives `MC_SPINE_WG_DUMP_WINDOW`, so the dump length and the
+# triage window agree instead of letting `chunk_triage` infer a height from whichever
+# sections the native chunk happens to have non-empty (an air-only section is not written,
+# so that inference is not stable). The default is `noise`: every saved row in
+# `captures/matrix-v1` was captured in that window, and a row's own `boundary.json` says
+# which one it used.
 PRESET_NOISE_WINDOW = {
     "overworld": (-64, 384),
     "nether": (0, 128),
     "end": (0, 128),
+}
+PRESET_DIMENSION_WINDOW = {
+    "overworld": (-64, 384),
+    "nether": (0, 256),
+    "end": (0, 256),
+}
+HEIGHT_WINDOWS = {
+    "noise": (PRESET_NOISE_WINDOW, "noise"),
+    "dimension": (PRESET_DIMENSION_WINDOW, "world"),
 }
 
 
@@ -157,7 +171,15 @@ def preflight(args):
         raise PortTriageError(f"--n must be positive, got {args.n}")
     if args.jobs <= 0:
         raise PortTriageError(f"--jobs must be positive, got {args.jobs}")
-    default_min_y, default_height = PRESET_NOISE_WINDOW[args.preset]
+    if args.height_window is None:
+        args.height_window = os.environ.get("MC_FIXTURE_HEIGHT_WINDOW", "noise")
+    if args.height_window not in HEIGHT_WINDOWS:
+        raise PortTriageError(
+            f"--height-window must be one of {'|'.join(HEIGHT_WINDOWS)}, got {args.height_window!r}"
+        )
+    preset_window, dump_window = HEIGHT_WINDOWS[args.height_window]
+    args.dump_window = dump_window
+    default_min_y, default_height = preset_window[args.preset]
     if args.min_y is None:
         args.min_y = default_min_y
     if args.height is None:
@@ -266,6 +288,7 @@ def build_dump_env(args, seed, dump_bin, dump_hm, dump_canon, *, pop_order_file=
         "MC_SPINE_WG_PROFILE": "0",
         "MC_SPINE_WG_PRESET": args.preset,
         "MC_SPINE_WG_DUMP": str(dump_bin),
+        "MC_SPINE_WG_DUMP_WINDOW": args.dump_window,
         "MC_SPINE_WG_DUMP_X": str(args.cx),
         "MC_SPINE_WG_DUMP_Z": str(args.cz),
         "MC_SPINE_WG_DUMP_N": str(args.n),
@@ -378,6 +401,10 @@ def execute(args):
             "preset": args.preset,
             "mode": args.mode,
             "noaq": args.noaq,
+            "height_window": args.height_window,
+            "dump_window": args.dump_window,
+            "min_y": args.min_y,
+            "height": args.height,
             "binary": str(binary),
             "binary_sha256": binary_sha256,
             "build_wall_s": round(build_wall, 3),
@@ -394,7 +421,8 @@ def execute(args):
 def format_output(provenance, triage_res, ct_args):
     hdr = (
         f"== port_triage seed={provenance['seed']} preset={provenance['preset']} "
-        f"mode={provenance['mode']} noaq={provenance['noaq']} ==\n"
+        f"mode={provenance['mode']} noaq={provenance['noaq']} "
+        f"window={provenance['height_window']}({provenance['min_y']}/{provenance['height']}) ==\n"
         f"port binary: {provenance['binary']} sha256={provenance['binary_sha256'][:16]}... "
         f"build={provenance['build_wall_s']:.2f}s dump={provenance['dump_wall_s']:.2f}s\n"
     )
@@ -434,9 +462,16 @@ def build_parser():
     ap.add_argument("--hm-name", default="OCEAN_FLOOR", help="Native Heightmaps entry for --port-hm (default: OCEAN_FLOOR)")
     ap.add_argument("--canon", action="store_true", help="Also emit MC_SPINE_WG_DUMP_CANON into --out-dir/--keep-dump")
     ap.add_argument("--min-y", type=int,
-                    help="Override min_y passed to chunk_triage (default: the preset's noise_settings min_y)")
+                    help="Override min_y passed to chunk_triage (default: the preset's window for "
+                         "--height-window)")
     ap.add_argument("--height", type=int,
-                    help="Override height passed to chunk_triage (default: the preset's noise_settings height)")
+                    help="Override height passed to chunk_triage (default: the preset's window for "
+                         "--height-window)")
+    ap.add_argument("--height-window", choices=tuple(HEIGHT_WINDOWS),
+                    help="Which y window to dump and compare: noise (the preset's noise_settings, "
+                         "what every saved matrix-v1 row used) or dimension (the preset's "
+                         "dimension_type, e.g. 0/256 for the Nether and the End). Default: "
+                         "$MC_FIXTURE_HEIGHT_WINDOW, else noise.")
     ap.add_argument("--halo", type=int, default=1, help="Halo radius around structure child BBs (default: 1)")
     ap.add_argument("--samples", type=int, default=5, help="Sample coords per pair/bucket (default: 5)")
     ap.add_argument("--per-chunk", action="store_true", help="In --n > 1 mode, print full report per differing chunk")

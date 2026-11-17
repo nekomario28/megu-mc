@@ -2076,7 +2076,7 @@ fn gen_huge_mushroom(
     }
     let (x, y, z) = pos;
     // `isValidPosition`: `y >= minBuildHeight + 1 && y + height + 1 < maxBuildHeight`.
-    if y < ctx.g.min_y + 1 || y + height + 1 >= ctx.g.min_y + ctx.g.height {
+    if y < ctx.g.world_min_y + 1 || y + height + 1 >= ctx.g.world_min_y + ctx.g.world_height {
         return;
     }
     let below = ctx.get(x, y - 1, z);
@@ -2470,7 +2470,7 @@ fn gen_huge_fungus(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), c: &HugeFu
         height *= 2;
     }
     // `chunkGenerator.getGenDepth()` is the level's build height, which is the harness's own
-    if !c.planted && y + height + 1 >= ctx.g.min_y + ctx.g.height {
+    if !c.planted && y + height + 1 >= ctx.g.world_min_y + ctx.g.world_height {
         return;
     }
     let huge = !c.planted && rng.next_f32() < 0.06;
@@ -2819,7 +2819,7 @@ fn bc_find_air(
 ) -> Option<(i32, i32, i32)> {
     let mut m = pos;
     let mut left = dist;
-    let top = ctx.g.min_y + ctx.g.height;
+    let top = ctx.g.world_min_y + ctx.g.world_height;
     while m.1 < top && left > 0 {
         left -= 1;
         let st = ctx.get(m.0, m.1, m.2);
@@ -4058,9 +4058,12 @@ fn gen_netherrack_replace_blobs(
     let Some(reg) = breg() else { return };
     let target = reg.name_of(target);
     // `origin.mutable().clamp(Direction.UP, minY + 1, maxY - 1)`
-    let mut y = pos.1.clamp(ctx.g.min_y + 1, ctx.g.min_y + ctx.g.height - 1);
+    let mut y = pos.1.clamp(
+        ctx.g.world_min_y + 1,
+        ctx.g.world_min_y + ctx.g.world_height - 1,
+    );
     let mut found = None;
-    while y > ctx.g.min_y + 1 {
+    while y > ctx.g.world_min_y + 1 {
         if reg.name_of(ctx.get(pos.0, y, pos.2)) == target {
             found = Some((pos.0, y, pos.2));
             break;
@@ -4165,7 +4168,7 @@ fn gen_nether_forest_vegetation(
         return;
     }
     let y = pos.1;
-    if y < ctx.g.min_y + 1 || y + 1 >= ctx.g.min_y + ctx.g.height {
+    if y < ctx.g.world_min_y + 1 || y + 1 >= ctx.g.world_min_y + ctx.g.world_height {
         return;
     }
     for _ in 0..(width * width) {
@@ -4766,10 +4769,10 @@ impl Fossil {
         }
         let clip = [
             (pos.0 >> 4) * 16 - 16,
-            ctx.g.min_y,
+            ctx.g.world_min_y,
             (pos.2 >> 4) * 16 - 16,
             (pos.0 >> 4) * 16 + 31,
-            ctx.g.min_y + ctx.g.height,
+            ctx.g.world_min_y + ctx.g.world_height,
             (pos.2 >> 4) * 16 + 31,
         ];
         let placement = Placement {
@@ -7607,7 +7610,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 } else {
                     p.1 += 1;
                 }
-                if p.1 < ctx.g.min_y + 3 || p.1 > ctx.g.min_y + ctx.g.height - 4 {
+                if p.1 < ctx.g.world_min_y + 3 || p.1 > ctx.g.world_min_y + ctx.g.world_height - 4 {
                     return;
                 }
             }
@@ -7720,8 +7723,8 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let Some(reg) = breg() else { return };
             let ice = reg.state_of("minecraft:ice", None);
             let snow = reg.state_of("minecraft:snow", None);
-            let min_y = ctx.g.min_y;
-            let max_y = min_y + ctx.g.height;
+            let min_y = ctx.g.world_min_y;
+            let max_y = min_y + ctx.g.world_height;
             for lx in 0..16i32 {
                 for lz in 0..16i32 {
                     let (x, z) = (pos.0 + lx, pos.2 + lz);
@@ -8023,7 +8026,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 } else {
                     p.1 += 1;
                 }
-                if p.1 < ctx.g.min_y + 2 || p.1 > ctx.g.min_y + ctx.g.height - 2 {
+                if p.1 < ctx.g.world_min_y + 2 || p.1 > ctx.g.world_min_y + ctx.g.world_height - 2 {
                     return;
                 }
             }

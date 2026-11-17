@@ -4085,6 +4085,28 @@ fn provider_values_and_following_rng_match_pre_extraction() {
     );
 }
 
+/// `Level.isOutsideBuildHeight` answers with the **world** window (`dimension_type`), not
+/// with the generator's. In 1.21.1 the End generates 0..127 but stores 0..255, and the
+/// End City builds above the terrain top, so a bound that stops at the generator's ceiling
+/// deletes real content: measured, 273 cells at y 128..143 in chunk (65,45).
+#[test]
+fn out_of_h_follows_the_world_window_not_the_generator() {
+    let mut g = Gen::load_preset(0, crate::name_to_state, crate::worldgen::NoisePreset::End)
+        .expect("datapack");
+    assert_eq!((g.min_y, g.height), (0, 128), "the generator window");
+    assert_eq!((g.world_min_y, g.world_height), (0, 256), "the world window");
+    let ctx = context(&mut g);
+    assert!(ctx.out_of_h(-1), "below the End's world floor");
+    assert!(!ctx.out_of_h(0));
+    assert!(!ctx.out_of_h(127));
+    assert!(
+        !ctx.out_of_h(128),
+        "the first section above the terrain is still inside the chunk"
+    );
+    assert!(!ctx.out_of_h(255));
+    assert!(ctx.out_of_h(256), "the first cell above the chunk");
+}
+
 #[test]
 fn context_overrides_heights_bounds_and_biomes_track_live_state() {
     let mut g = Gen::load(0, crate::name_to_state).unwrap();
@@ -5943,9 +5965,20 @@ fn end_spike_matches_native_oracle() {
             _ => panic!("unexpected bounds ({min_y}, {height}) in {id}"),
         };
         let mut g = Gen::load_preset(world_seed, crate::name_to_state, preset).expect("datapack");
+        // The oracle runs each case in a *scripted level* of the row's own height
+        // (`NativeHarness.levelFromStates(states, minY, height)`), and `end_spike` asks the
+        // level for its build height (`isOutsideBuildHeight`), so the recorded cell count
+        // is the count for a level that tall. The port's level window now comes from
+        // `dimension_type` (the End is 0/256 there, not 0/128), so the scene has to declare
+        // the window it was measured in or the two sides answer different questions - a
+        // 125-high spike writes 10 cells of air above itself, and a 128-tall level stops
+        // them at y=127.
+        g.world_min_y = min_y;
+        g.world_height = height;
         let mut ctx = context(&mut g);
         assert_eq!(ctx.g.min_y, min_y, "{id}");
         assert_eq!(ctx.g.height, height, "{id}");
+        assert_eq!((ctx.g.world_min_y, ctx.g.world_height), (min_y, height), "{id}");
         ctx.test_no_terrain = true;
         ctx.test_default_air = true;
 

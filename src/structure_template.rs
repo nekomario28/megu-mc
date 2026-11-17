@@ -1344,7 +1344,9 @@ impl Template {
                 placement.rotation,
             )
             .ok_or("unknown template state transform")?;
-            if p.1 >= ctx.g.min_y && p.1 < ctx.g.min_y + ctx.g.height {
+            // `WorldGenRegion.setBlock`: the write is refused by the level's build height
+            // (`dimension_type`), which is what the clip above uses as well.
+            if p.1 >= ctx.g.world_min_y && p.1 < ctx.g.world_min_y + ctx.g.world_height {
                 ctx.set(p.0, p.1, p.2, state);
                 written.push(p);
                 if let Some(tag) = block
