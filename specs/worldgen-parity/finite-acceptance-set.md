@@ -26,7 +26,7 @@ Status: **APPROVED(凍結) — 2026-11-18、ユーザ承認済み**。
 |---|---|---|---|
 | Overworld | 3×3 at `(−64,32)` | 0 | 構造物off・runtime 700tick再現込み(feature-contracts) |
 | Overworld | 1×1 at `(0,0)` | 0 | canonical state gate(32,518非air) |
-| Overworld | 1×1 at `(3,−2)` | 4242 | native A/B両参照残す。population順序実装後の目標行(現状は残差記録) |
+| Overworld | 1×1 at `(3,−2)` | 4242 | **revision 1を参照** |
 | Overworld | 1×1 at `(−96,35)` | 4242 | stronghold chunk(31,721セル・mineshaft/trial chamber同居) |
 | Nether | 1×1 at `(−25,6)` | 4242 | fortress(0/128と0/256の両行) |
 | Nether | 1×1 at `(−22,20)` | 4242 | nether_fossil(同上) |
@@ -82,3 +82,20 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
 
 - 行の追加/除外/変更は、結果を見てからでなく**理由を先に**書いたrevisionとしてのみ。
 - seedの付け替え・座標移動は受入失敗と同義(黙ってやらない)。
+
+## Revision 1(2026-11-18、測定に基づく変更)
+
+**対象**: §2のOverworld `(3,−2)` 行の受入条件。
+
+**理由(結果後だが証拠に強制された)**:
+[population-order-is-a-discipline-20261118.md](../../evidence/gameplay/feature-parity/population-order-is-a-discipline-20261118.md)
+がjar実読と4probe実測で示したとおり、vanillaのpopulation順序は**level優先の規律**であり、
+level内順序はwall clock由来で**vanilla自身もrun-to-runで再現しない**(同一設定のp1/p2で共通先頭9/49のみ)。
+ゆえに「既定順序で両参照に0差」はいかなる実装でも達成不能(参照AとB自身が23セル異なる)。
+
+**改訂後の受入条件**: この行の一致は **順序を入力として指定した比較**で判定する。
+`MC_SPINE_POP_ORDER=order-A.txt` で native A に、`order-B.txt` で native B に、
+それぞれore差分0(population順序由来の差がないこと)。既定順序自体は
+「規律の名前つきメンバー(level優先+宣言済みtie-break)」として実装し、
+どのcaptureともbit一致しないことを明記する。順序が入力であることは
+corpusの性質であり、既定順序の欠陥ではない。
