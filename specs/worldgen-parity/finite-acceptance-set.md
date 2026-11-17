@@ -96,6 +96,11 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
   worldに存在、`game_times [3,3]`)。ゆえに宣言は正当だが、比較は4セル差で、うち3セルは
   まさに宣言した書き込みセル((98,19,−512)/(99,19,−512) の `water[level=1]`→`air`、
   (82,69,−500) の `air`→`fern`)。**受入行にはしない**(§3のgreenのみ追加の規律)。
+- **capture自身のprovenance**: matrix-v2 fortress-256 / matrix-v1 fortress / end-outer の
+  `inputs.sha256` は instrument を含めて現ツリーと一致する。ruined-portal と village-taiga は
+  2026-11-16 capture で、`tools/carve-agent/{Agent,CarveLog}.java` と `native_fixture.sh` の
+  3件が capture 後に編集済みのため再現できない(既知のF5)。両行の束縛(level.dat / region /
+  dump / run.log)は検証済みだが、`stage: structures` は**記録された主張**であって再導出ではない。
 - **ruined-portal**: 3×3ではなく1×1 `(6,7)`、window −64/384(boundary.json)。
   `chunk_triage` 0/98304、OCEAN_FLOOR heightmap 0列差。window内に `ruined_portal` start (6,7) と
   mineshaft corridor 2本。
