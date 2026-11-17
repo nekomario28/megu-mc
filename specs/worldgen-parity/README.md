@@ -7,6 +7,11 @@ acceptance. Source authority is the authenticated 1.21.1 server bundler, SHA-1
 native classes. Existing forest full-state runtime and restart parity remain a
 regression checkpoint.
 
+The finite acceptance set (seeds, windows, structures in scope, and the
+comparison rules that define "worldgen matches vanilla") is frozen in
+[finite-acceptance-set.md](finite-acceptance-set.md) — approved 2026-11-18,
+declared before results; revisions are explicit, never post-hoc.
+
 ## Measured starting boundary
 
 - The datapack contains 64 biomes, 34 structure definitions (16 algorithm types),
