@@ -13,8 +13,7 @@ given, re-checking each against the artifact rather than the prose:
 | the re-check is `BushBlock.updateShape` → `MushroomBlock.canSurvive` against the **lit** engine | the shape rule asks `raw_brightness`, and the pass answers it from a sample taken at the boundary |
 
 What this lane lands is the contract plus the narrow light read the check needs. It does **not**
-land a light engine, and it does not move the `LIGHT` attribution out of HOLD: see
-[What this does not claim](#what-this-does-not-claim).
+land a light engine, and it does not move the `LIGHT` attribution out of HOLD: see §9, "What this does not claim".
 
 ## Base state
 
