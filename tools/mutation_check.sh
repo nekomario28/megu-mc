@@ -3185,6 +3185,30 @@ check "a suggestion answer keeps start and length in their own fields" \
     write_varint(&mut out, wire_varint(response.start, "suggestion length")?);' \
   brigadier_wire_tests::the_response_serializes_to_id_start_length_count_and_entries
 
+# Tick-cost lane (M3): the two merge scans are bucketed, so the two things that decide
+# *which* entity is absorbed are the neighbourhood and the tie-break. Both are pinned
+# against a verbatim copy of the full pairwise scan, and a bucket that quietly loses a
+# neighbour - or that keeps the wrong one of two equally old orbs - must go red there.
+check "an xp orb merge searches the whole 26-cell neighbourhood, not just upward" \
+  src/main.rs '        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    let key = (
+                        cx.checked_add(dx),' \
+  '        for dx in 0..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    let key = (
+                        cx.checked_add(dx),' \
+  merge_tests::xp_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs
+
+check "two equally old xp orbs keep the lower index" \
+  src/main.rs '                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
+                xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
+  '                let (keep, eat) = if aage < bage { (i, j) } else { (j, i) };
+                xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
+  merge_tests::xp_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

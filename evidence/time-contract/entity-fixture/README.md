@@ -51,3 +51,21 @@ fixtureにdrop・xp・作物・Mobを入れて測った。
 
 fixtureのみ追加。drop_tick は未修正。
 serial/parallelとも32 passed・1 ignored、Fabric/NeoForge check合格。
+
+## 訂正: 単位（1000倍）と現在値
+
+このページの「667ms/tick」「674ms」は **µs の読み違い**である。
+`results.json` の `total_ns` は1000 tick分の合計で、`tick.p50_ns` は1 tickのns。
+`198a80e` の実測を読み直すと
+
+- entity_heavy **667µs/tick**（p50 670,000ns。うち drops 478µs）
+- entity_heavy_furnaces 674µs/tick
+
+であり、50ms予算の 1.3%。**「20TPSを破綻させる」は成立しない**
+（数値そのものは正しく、読み方だけが1000倍ずれていた。
+[random-ticks](../../gameplay/random-ticks/README.md) は同じ formatter を
+「402,932ns = 402µs」と正しく読んでいる）。
+
+現在の値は [entity-merge-index](../entity-merge-index/README.md) にある：
+`5c6ccec` で entity_heavy **345.18µs**、セル索引の変更後 **242.00µs**。
+このページの「修正方針（未実装）」は slice 20 で実装済み、その後も更新されている。

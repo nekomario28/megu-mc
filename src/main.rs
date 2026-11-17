@@ -2537,6 +2537,253 @@ fn plate_unpowered(st: u32) -> bool {
 fn plate_powered(st: u32) -> bool {
     st == 5650 || (5716..=5732).contains(&st) && st.is_multiple_of(2)
 }
+/// The cell -> member index both merge scans use, sized once from the item count.
+///
+/// A `HashMap` is the wrong shape for this: there are no removals, the key is three
+/// integers, every bucket is a short list, and the scan probes the own cell plus its
+/// 26 neighbours for every item (16,200 probes for 600 entities). Measured on the
+/// entity-heavy fixture, the SipHash probe was the whole cost of the merge - 84 us of
+/// walking the neighbourhood plus 25 us of building the map, in a 127 us `drops` stage,
+/// and 105 us of a 135 us `environment` stage - while the distance test it guards is
+/// under a nanosecond. This is a chained table over pre-sized arrays: no
+/// resizing, no per-cell allocation, a probe that is three multiplies and a mask, and
+/// an exact key comparison so a collision changes speed and nothing else.
+struct CellBuckets {
+    cell: Vec<(i32, i32, i32)>,
+    used: Vec<bool>,
+    head: Vec<u32>,
+    next: Vec<u32>,
+    mask: usize,
+}
+
+const NO_MEMBER: u32 = u32::MAX;
+
+impl CellBuckets {
+    fn new(items: usize) -> Self {
+        // At most `items` distinct cells, and a load factor of at most one half.
+        let cap = (items.max(4) * 2).next_power_of_two();
+        CellBuckets {
+            cell: vec![(0, 0, 0); cap],
+            used: vec![false; cap],
+            head: vec![NO_MEMBER; cap],
+            next: vec![NO_MEMBER; items],
+            mask: cap - 1,
+        }
+    }
+
+    #[inline]
+    fn slot(&self, cell: (i32, i32, i32)) -> usize {
+        let h = (cell.0 as u32)
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add((cell.1 as u32).wrapping_mul(0x85EB_CA77))
+            .wrapping_add((cell.2 as u32).wrapping_mul(0xC2B2_AE3D));
+        // xorshift mix: the multiply chain alone leaves low-bit structure that a mask
+        // and a linear probe would turn into long clusters.
+        let h = h ^ (h >> 15) ^ (h >> 7);
+        (h as usize) & self.mask
+    }
+
+    /// Link `idx` into `cell`'s bucket. The chain runs newest first, so a bucket is
+    /// walked in descending index order; both callers sort their candidates before
+    /// comparing, because the merge contract is ascending index order.
+    fn push(&mut self, cell: (i32, i32, i32), idx: u32) {
+        let mut at = self.slot(cell);
+        while self.used[at] && self.cell[at] != cell {
+            at = (at + 1) & self.mask;
+        }
+        if !self.used[at] {
+            self.used[at] = true;
+            self.cell[at] = cell;
+        }
+        self.next[idx as usize] = self.head[at];
+        self.head[at] = idx;
+    }
+
+    /// The members of `cell`, in no particular order; `None` when no item is there.
+    #[inline]
+    fn members(&self, cell: (i32, i32, i32)) -> Option<u32> {
+        let mut at = self.slot(cell);
+        while self.used[at] {
+            if self.cell[at] == cell {
+                return Some(self.head[at]);
+            }
+            at = (at + 1) & self.mask;
+        }
+        None
+    }
+}
+
+/// Walk one cell's members into `out`, keeping only indices past `after`.
+fn collect_members(
+    buckets: &CellBuckets,
+    cell: (i32, i32, i32),
+    after: usize,
+    out: &mut Vec<usize>,
+) {
+    let Some(mut member) = buckets.members(cell) else {
+        return;
+    };
+    while member != NO_MEMBER {
+        let idx = member as usize;
+        if idx > after {
+            out.push(idx);
+        }
+        member = buckets.next[idx];
+    }
+}
+
+/// Vanilla merges same-item drops within ~0.5 blocks into one stack (fits <=64); the
+/// merged entity keeps the fresher age.
+///
+/// Returns the absorbed eids in merge order, which is the order the destroy packet goes
+/// out in.
+///
+/// Bucket drops by integer cell. A pair within 0.5 blocks differs by at most one on each
+/// axis, so only the own cell and its 26 neighbours can satisfy the distance test.
+/// Iterating i in order and candidates in ascending index order keeps the first match
+/// identical to scanning every pair, so which drop is absorbed does not change.
+fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
+    // Nothing to pair, and the index below allocates: an idle world must not pay for a
+    // merge it cannot perform.
+    if dp.len() < 2 {
+        return Vec::new();
+    }
+    let __prof = tickprof::enabled();
+    let mut __t = __prof.then(std::time::Instant::now);
+    let mut buckets = CellBuckets::new(dp.len());
+    for (idx, d) in dp.iter().enumerate() {
+        buckets.push(
+            (d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32),
+            idx as u32,
+        );
+    }
+    if let Some(t) = __t {
+        tickprof::add("drops/merge_cells", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
+    let mut merged: Vec<i32> = Vec::new();
+    let mut candidates: Vec<usize> = Vec::new();
+    for i in 0..dp.len() {
+        let (cx, cy, cz) = (
+            dp[i].x.floor() as i32,
+            dp[i].y.floor() as i32,
+            dp[i].z.floor() as i32,
+        );
+        candidates.clear();
+        // checked arithmetic: a drop whose cell is at the i32 limit has no neighbour
+        // there, and wrapping would invent a cell that aliases.
+        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
+                    if let (Some(kx), Some(ky), Some(kz)) = key {
+                        collect_members(&buckets, (kx, ky, kz), i, &mut candidates);
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        for &j in candidates.iter() {
+            let (ax, ay, az, ait, acnt, aage) = {
+                let a = &dp[i];
+                (a.x, a.y, a.z, a.item, a.cnt, a.age)
+            };
+            let (bx, by, bz, bit, bcnt, bage) = {
+                let b = &dp[j];
+                (b.x, b.y, b.z, b.item, b.cnt, b.age)
+            };
+            // Cheap integer and distance tests first; the component blobs are a Vec
+            // comparison, so they run only for a real candidate.
+            if ait == bit
+                && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
+                && dp[i].comps == dp[j].comps
+                && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
+            {
+                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
+                dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
+                merged.push(dp[eat].eid);
+                break;
+            }
+        }
+    }
+    if let Some(t) = __t {
+        tickprof::add("drops/merge_scan", t.elapsed());
+    }
+    merged
+}
+
+/// Vanilla merges xp orbs closer than one block into a single higher-value orb.
+///
+/// Returns the eaten eids in the order the merge produced them, which is the order
+/// the destroy packet goes out in, so it is part of the contract rather than an
+/// artifact. Duplicates are possible and are kept: an orb eaten by an earlier `i`
+/// is still a candidate for a later one, because the removal happens after the
+/// whole scan (`retain` once, not per pair).
+///
+/// Bucketed by integer cell. Two positions less than 1.0 apart differ by at most
+/// one on each axis after `floor`, so only the own cell and its 26 neighbours can
+/// satisfy `dist^2 < 1.0`; a cell whose coordinates are at the i32 limit has no
+/// neighbour there and `checked_add` says so rather than wrapping into a cell that
+/// aliases. Iterating `i` in order, collecting its candidates in ascending index
+/// order and breaking on the first match is the same sequence of comparisons the
+/// full pairwise scan made, so which orb is eaten does not change. Sorting the orbs
+/// first, or visiting candidates in any other order, *would* change it.
+fn merge_xp_orbs(xl: &mut [Xp]) -> Vec<i32> {
+    // Nothing to pair, and the index below allocates: an idle world must not pay for a
+    // merge it cannot perform.
+    if xl.len() < 2 {
+        return Vec::new();
+    }
+    let mut buckets = CellBuckets::new(xl.len());
+    for (idx, x) in xl.iter().enumerate() {
+        buckets.push(
+            (x.x.floor() as i32, x.y.floor() as i32, x.z.floor() as i32),
+            idx as u32,
+        );
+    }
+    let mut merged: Vec<i32> = Vec::new();
+    let mut candidates: Vec<usize> = Vec::new();
+    for i in 0..xl.len() {
+        let (cx, cy, cz) = (
+            xl[i].x.floor() as i32,
+            xl[i].y.floor() as i32,
+            xl[i].z.floor() as i32,
+        );
+        candidates.clear();
+        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    let key = (
+                        cx.checked_add(dx),
+                        cy.checked_add(dy),
+                        cz.checked_add(dz),
+                    );
+                    if let (Some(kx), Some(ky), Some(kz)) = key {
+                        collect_members(&buckets, (kx, ky, kz), i, &mut candidates);
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        for &j in candidates.iter() {
+            let (ax, ay, az, aage) = {
+                let a = &xl[i];
+                (a.x, a.y, a.z, a.age)
+            };
+            let (bx, by, bz, bage) = {
+                let b = &xl[j];
+                (b.x, b.y, b.z, b.age)
+            };
+            if (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 1.0 {
+                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
+                xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);
+                merged.push(xl[eat].eid);
+                break;
+            }
+        }
+    }
+    merged
+}
 fn keepalive_time_tick() {
     // One region borrow for the stage. A static scan confirmed that nothing this
     // stage calls re-enters the region lock.
@@ -3335,6 +3582,12 @@ fn keepalive_time_tick() {
     {
         // despawn xp orbs after 300s — plus the same hard cap as drops:
         // a farm can out-spawn the despawn window.
+        //
+        // Split under `MC_SPINE_TICK_PROFILE=1`: this block is most of `env/rest`
+        // once a fixture has orbs, and the merge walks 27 cells per orb, so "rest"
+        // alone cannot say whether the despawn pass or the merge is the cost.
+        let __prof = tickprof::enabled();
+        let mut __t = __prof.then(std::time::Instant::now);
         let mut xl = xps().lock().unwrap();
         let life = server_ticks(XP_LIFE_GT) as i32;
         for x in xl.iter_mut() {
@@ -3355,29 +3608,22 @@ fn keepalive_time_tick() {
             let x = xl.remove(0);
             broadcast_seen_destroy(x.eid);
         }
-        // vanilla merges nearby orbs into a single higher-value orb
-        let mut merged: Vec<i32> = Vec::new();
-        for i in 0..xl.len() {
-            for j in (i + 1)..xl.len() {
-                let (ax, ay, az, aage) = {
-                    let a = &xl[i];
-                    (a.x, a.y, a.z, a.age)
-                };
-                let (bx, by, bz, bage) = {
-                    let b = &xl[j];
-                    (b.x, b.y, b.z, b.age)
-                };
-                if (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 1.0 {
-                    let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
-                    xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);
-                    merged.push(xl[eat].eid);
-                    break;
-                }
-            }
+        if let Some(t) = __t {
+            tickprof::add("env/xp_age", t.elapsed());
         }
+        __t = __prof.then(std::time::Instant::now);
+        // vanilla merges nearby orbs into a single higher-value orb
+        let merged = merge_xp_orbs(&mut xl);
+        if let Some(t) = __t {
+            tickprof::add("env/xp_merge", t.elapsed());
+        }
+        __t = __prof.then(std::time::Instant::now);
         for eid in &merged {
             xl.retain(|x| x.eid != *eid);
             broadcast_seen_destroy(*eid);
+        }
+        if let Some(t) = __t {
+            tickprof::add("env/xp_destroy", t.elapsed());
         }
     }
     // #minecraft:tick functions run once per game tick (TICK_MS = 50ms = 20/s, the
@@ -4578,6 +4824,11 @@ fn hopper_tick() {
     }
 }
 fn drop_tick() {
+    // Split under `MC_SPINE_TICK_PROFILE=1`. The bucketed merge landed without a
+    // split, so `drops` could not say whether the residual is the pickup scan, the
+    // cell build, the neighbourhood walk or the despawn pass.
+    let __prof = tickprof::enabled();
+    let mut __t = __prof.then(std::time::Instant::now);
     let region = region_guard();
     // player within 1.3 blocks picks up the drop
     let mut taken: Vec<(i32, Arc<Client>)> = vec![];
@@ -4604,6 +4855,10 @@ fn drop_tick() {
             }
         }
     }
+    if let Some(t) = __t {
+        tickprof::add("drops/pickup", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
     // xp orbs float to nearby players and grant xp
     {
         let mut collected: Vec<(i32, i32, i16)> = vec![];
@@ -4669,6 +4924,10 @@ fn drop_tick() {
             }
         }
     }
+    if let Some(t) = __t {
+        tickprof::add("drops/xp_pickup", t.elapsed());
+    }
+    __t = __prof.then(std::time::Instant::now);
     for (deid, c) in taken {
         let selected = *c.held.lock().unwrap();
         let creative = *c.gm.lock().unwrap() == 1;
@@ -4747,69 +5006,18 @@ fn drop_tick() {
             let d = dp.remove(0);
             broadcast_seen_destroy(d.eid);
         }
-        // vanilla merges same-item drops within ~0.5 blocks into one
-        // stack (fits <=64); the merged entity keeps the fresher age
-        let mut merged: Vec<i32> = Vec::new();
-        // Bucket drops by integer cell. A pair within 0.5 blocks differs by at
-        // most one on each axis, so only the own cell and its 26 neighbours can
-        // satisfy the distance test. Iterating i in order and candidates in
-        // ascending index order keeps the first match identical to scanning
-        // every pair, so which drop is absorbed does not change.
-        let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
-        for (idx, d) in dp.iter().enumerate() {
-            cells
-                .entry((d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32))
-                .or_default()
-                .push(idx);
+        if let Some(t) = __t {
+            tickprof::add("drops/despawn", t.elapsed());
         }
-        for i in 0..dp.len() {
-            let (cx, cy, cz) = (
-                dp[i].x.floor() as i32,
-                dp[i].y.floor() as i32,
-                dp[i].z.floor() as i32,
-            );
-            let mut candidates: Vec<usize> = Vec::new();
-            // checked arithmetic: a drop whose cell is at the i32 limit has no
-            // neighbour there, and wrapping would invent a cell that aliases.
-            for dx in -1..=1i32 {
-                for dy in -1..=1i32 {
-                    for dz in -1..=1i32 {
-                        let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
-                        if let (Some(kx), Some(ky), Some(kz)) = key {
-                            if let Some(bucket) = cells.get(&(kx, ky, kz)) {
-                                candidates.extend(bucket.iter().copied().filter(|j| *j > i));
-                            }
-                        }
-                    }
-                }
-            }
-            candidates.sort_unstable();
-            for j in candidates {
-                let (ax, ay, az, ait, acnt, aage) = {
-                    let a = &dp[i];
-                    (a.x, a.y, a.z, a.item, a.cnt, a.age)
-                };
-                let (bx, by, bz, bit, bcnt, bage) = {
-                    let b = &dp[j];
-                    (b.x, b.y, b.z, b.item, b.cnt, b.age)
-                };
-                // Cheap integer and distance tests first; the component blobs
-                // are a Vec comparison, so they run only for a real candidate.
-                if ait == bit
-                    && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
-                    && dp[i].comps == dp[j].comps
-                    && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
-                {
-                    let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
-                    dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
-                    merged.push(dp[eat].eid);
-                    break;
-                }
-            }
-        }
+        __t = __prof.then(std::time::Instant::now);
+        let merged = merge_drops(&mut dp);
+        __t = __prof.then(std::time::Instant::now);
         for eid in &merged {
             dp.retain(|d| d.eid != *eid);
             broadcast_seen_destroy(*eid);
+        }
+        if let Some(t) = __t {
+            tickprof::add("drops/merge_destroy", t.elapsed());
         }
     }
 }
@@ -26238,7 +26446,7 @@ pub(crate) mod tickprof {
         rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         let total: f64 = rows.iter().map(|(_, ms)| ms).sum();
         eprintln!("TICKPROF ticks={n} body={total:.2}ms/tick");
-        for (name, ms) in rows.iter().take(12) {
+        for (name, ms) in rows.iter().take(20) {
             if *ms > 0.001 {
                 eprintln!("TICKPROF   {ms:7.3}  {name}");
             }

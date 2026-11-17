@@ -44,3 +44,22 @@ entity_heavy の environment が 178.8ms（53%）で最大。
 
 次に調べるなら `keepalive_time_tick` をstage分割して測ること。
 現状は environment が1ステージに固まっていて原因が絞れない。
+
+## 訂正: 単位（1000倍）と、その後の測定
+
+このページの「10,272µs」「337,607µs」は **µs/1000tick を µs/tick として読んだ**もの。
+`results.json` の `total_ns` は1000 tick分の合計なので、1 tick あたりは
+
+- drop_pile **10.27µs/tick**（drops 0.259µs, 3%）
+- entity_heavy（参考）**337.61µs/tick**（drops 148.3µs, 44%）
+
+である（`5bc49c1`）。「environment が 178.8ms（53%）」も同様に **178.8µs/tick**、
+orb 1個あたり 0.298µs。
+
+このページの「次に調べるなら `keepalive_time_tick` をstage分割して測ること」は
+実行済みで、答えは [entity-merge-index](../entity-merge-index/README.md)：
+environment の 81% は `env/xp_merge`（orbの全ペア走査, 105µs/tick）だった。
+同ページで両方のマージをセル索引に置き換え、entity_heavy は
+`5c6ccec` 345.18µs → **242.00µs**。集中した山（このページの主題）は
+その変更後も drops 0.259µs → 0.098µs で、集中が悪いケースにならないという
+このページの結論は変わらない。

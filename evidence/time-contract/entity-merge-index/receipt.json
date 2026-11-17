@@ -1,0 +1,22 @@
+{
+  "claim": "the cost of both entity merge scans was the hash probe, not the distance test: a pre-sized arithmetic-probed cell index takes entity_heavy from 345.18 to 242.00 us/tick (3 interleaved runs, medians) with a byte-identical saved payload",
+  "measurement": "evidence/time-contract/profile_tick.py --runs 3, release, 100 warmup + 1000 measured ticks per scenario, ticks back to back without sleep. results-5c6ccec.json is the re-baseline on 5c6ccec (binary a5513303fd817223); results-cell-index.json is the same runner on the changed source (binary d7b98596a2ce1192). p50 is the median of the three processes' p50.",
+  "attribution": "sub-split under MC_SPINE_TICK_PROFILE=1 attributes the two stages: env/xp_merge 105us of environment 134.9us and drops/merge_scan 84us + drops/merge_cells 25us of drops 127.2us. That mode inflates block-lookup-heavy stages (random_ticks 72 -> 129us) so only ratios inside one stage are read from it.",
+  "reverted": "making the orb merge use the same HashMap cell buckets as the drop merge measured 125.5us against 105us of full pairwise scan and was reverted: at 600 orbs on a 16-block grid every cell holds one orb, which is the bucket's worst case.",
+  "behaviour_identity": [
+    "src/merge_tests.rs compares the bucketed production merge against a verbatim copy of the full pairwise scan for 9 drop and 9 orb scenarios, including boundary straddles on each axis, negative coordinates, equal ages, exact-1.0 non-merges and duplicate eat entries.",
+    "src/tick_tests.rs runs a deterministic world for 200 ticks and pins the FNV-1a 128 of save_world_into's bytes at 54d762909d3321a41cfd670c7ff0baa9 (13 orbs, 2 drops). The same digest was measured with the merge_xp_orbs body swapped back to the full pairwise scan.",
+    "two mutation_check entries go red (MUTATION_FILTER=xp_merge: 2 proved, 0 not a gate)."
+  ],
+  "known_build_variance": "one arm with the phase-0 merges plus the new sub-splits measured 389.17us where the same merges measured 345.18us on 5c6ccec; a no-split rebuild of the same source measured 240.05 and 241.23us. Build-to-build variance up to ~13% on this function exists, so every claim here is a comparison inside the shipped binary or between the two recorded runs.",
+  "suite": "cargo test --offline --locked -- --test-threads=8: 623 passed, 0 failed, 1 ignored",
+  "not_run": [
+    "the full mutation registry (448+2 entries): only MUTATION_FILTER=xp_merge was executed",
+    "independent review: NOT RUN"
+  ],
+  "files_sha256": {
+    "README.md": "7481c745de29682656a8293b53d89c8da6e007c1a47b0a3ca6d5b7635d77b496",
+    "results-5c6ccec.json": "6b68d04df8cf2ef2f0fc08157319ca812d6971c26e9260421fac481dd83aa2d6",
+    "results-cell-index.json": "ae12118f38a0122c93ddf3d7a06d61896d579e8c07b6b21197bccf84d501db8a"
+  }
+}

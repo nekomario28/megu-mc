@@ -1,0 +1,3750 @@
+{
+  "revision": "5c6ccecfb1f70473bfff4b35bcded646187c948d",
+  "working_diff_sha256": "102753b292024224a1eb46b1ca0a7e71a699d50533fd2bf30dda7b12f80e7e8a",
+  "source_sha256": {
+    "src/aquifer_native_tests.rs": "00e436230df0ff8fbdbc78e98190ca4f99f63f146c40cb5353b9b1b94eee6ced",
+    "src/block_registry.rs": "dcce961b5dffe3de19beeacb6e39e2465a5bc424d4029c55db20767f8a942a39",
+    "src/brigadier.rs": "2d5be5eb3f6c2f5efb42463b15f3e8afc9ddba7f29d9e1f67052ce91b7ca22ca",
+    "src/brigadier_tests.rs": "6d6e6c358a10689983ae5fb9badca6ba34a47d9b18d600adee780f69678b5d74",
+    "src/cached_lookup.rs": "84f34b6744ffaa24ea48b7dc967de59dce45cedffe78dd0fc30ed75bbc2430e2",
+    "src/chest_loot.rs": "225f1175f0711f229ce17a0021ea97f49a7139f5a275f2318cf74256635ca367",
+    "src/chest_loot_tests.rs": "a97a7eb00de085413ccbe1c2ffe4756b202f9038b656ac721d9174165f6a0787",
+    "src/chunk_ack.rs": "3457cf65ae2a69d3cbf5d8669cf098e30f71875a8bfd61cce8f29a885f3c4aaf",
+    "src/command_tests.rs": "51bc18221aad76dd33aafeb7dfb2f26d97a5bb2dfd90cfe191b74f1308e6cac9",
+    "src/connection_limits.rs": "8a6c1a6224502de38c4f3dba80653892603556d92bdb1b7bb0c3fddb6e0d522d",
+    "src/container_tests.rs": "562bb7e4045fd32932773670ef214c00d2a639ed126195cde0dc7bffc9f888b6",
+    "src/craft_tests.rs": "4fc80be6a7f3d4884c11f6c7c6edbd31ddd391ac8484b768cdeee9a6f49360e3",
+    "src/effect_tests.rs": "ea8f3fc7291211ba40a4b2a3d9689387742ac10681dd3d07ca750de029bededa",
+    "src/effects.rs": "783684a57f271253a1fab4b25581fbc49307c07003006f98221f015f7f0cc463",
+    "src/end_city_mansion.rs": "2b3cf6f23ee1c4955fdc2c84b8c040d4900e28893e39f140b3c7fea4dbf46e86",
+    "src/entity_encoding_tests.rs": "9912147f38c7f42100e6b87a70d38bcd78a800a4ff97cd5b6fa6a63bc37ea4bf",
+    "src/fanout_tests.rs": "d7ed3e90468289f7023616f511048d3ee3d2fe693d30239b4121c9402fe69eee",
+    "src/feature.rs": "933bb38cbae83d868a652a6d18c9fcc6a66b6a41f08107e34256532839ba4619",
+    "src/flowing_fluid.rs": "4320c3d3c4cf4670d42d544edd6f254560a201fa2cbfad5a741c0bc4e90a9baf",
+    "src/fortress_monument.rs": "4a1280e89125e5f032caaece858e1e8c15940634c4fc30abdc2897437ae4c64e",
+    "src/furnace_cache_tests.rs": "c6e1cab8ec3452e997dab6553efde373b2422d400ddf9af6c624d291b251ff42",
+    "src/generated_content.rs": "748a7ae60098de88060c310ab817f315829e8a313657b1746692be010a0765f6",
+    "src/generation_context.rs": "b2e27897f9f89492d40fa80e6a8b1d9e795b6f3fcb562e7f466c32f4f5b3731c",
+    "src/generation_contract_tests.rs": "36a4e73e879a998523ec49341aecfbd12008e2427829d22d2bf1213935854aac",
+    "src/generation_leaf_queue.rs": "28959bbbd51d494922fbff146d243db2c7d1a33969ca50af2ff59f0bf9af4188",
+    "src/generation_math.rs": "d5da4ad98a98ab65d729671a12faf3220fdd26b8d8c3c59ae2fa8f38a12cbe89",
+    "src/generation_payload.rs": "14c3465420c47fa76d17dcb1c7ec0dcc0539faedce379335f3784950d96400b3",
+    "src/generation_providers.rs": "3036f61cf6a2646042b721c5b2a659d9adb372bc3ba8b8c7708ee6d9ca0c98df",
+    "src/ingress_guard.rs": "0ac1bca729e860b6f092e9b32aa920a008e5e745ac03ae927caef087861fb982",
+    "src/java_compat.rs": "2060cfd3a8a48e7d66415eb9324c41c409a7b47cf22e567cc9ba7a3b5b7aef3b",
+    "src/jigsaw_structures.rs": "b4ca73e0cd850233c54c5f6a193e9762ddf92753aaa5558bcbb08f5706471165",
+    "src/json.rs": "beed3e7ee99f1306efb4a30138e14e5cb899659fc3cb1a12871fbf760e0e5d51",
+    "src/landing.rs": "2356d7d1b72fea34e25da6bfd7d486ca67e7148302737a7885f16183c5fb7032",
+    "src/landing_types.rs": "90b214871b8f0d7315009599af1ca461a1f53024a7d4590185916b9683806d82",
+    "src/light_pack_tests.rs": "1fd0a4292c4466d200f9da5f80ac11cb7d68cdf6b950d2ec8ea34ebf13f87e22",
+    "src/main.rs": "222b3071c868cbc24646f5e501f7ce8e7e00a841a2cc784947c4336918720468",
+    "src/merge_tests.rs": "fd8c42c893814338a78919a901c9bbc517bc34518e7c6854cb17744385844688",
+    "src/minecart.rs": "5f3e5212cd999430d2f111029c24e4f7c87d35c2921f7159f032049b0d0c2111",
+    "src/minecart_tests.rs": "56aa21edd5ecf972b77f4310115a44aa44bb4eee3bb2990c76f6ee61bae5cd21",
+    "src/mineshaft.rs": "023058483d1df93361b5512fd9be4659d8f700a52d2e6fbfa288dab7923e1ed7",
+    "src/mineshaft_layout.rs": "6d56c14d5c4da90fd6fe8f6a64f1b73016667cf6a1d84c22af78aadc924a5f24",
+    "src/mineshaft_piece.rs": "56240c44e55a00be23ac54f70ef0870296c66cc600f823de6f035ff81c592134",
+    "src/mineshaft_tests.rs": "ad2e5950445616114848c78a53bfbdc1244d2ebc97a4536f095454ec07da78f4",
+    "src/nbt.rs": "fa220adc5c9e7ef4a6df9d4b75b634affbd66de1a51d53b634ee4778b7cc9d94",
+    "src/persistence_tests.rs": "5a2ef2595c4a46a2af8ffa415371a4895e1107b0eaeea06a49ffb77cdcee79fa",
+    "src/primitives_tests.rs": "3faca3437cfccf5ed3d505289202c284ca1ab256d9cb9619e425ef36e27a7978",
+    "src/registry_tests.rs": "31c9cb684eefc22782c6604f898a539298f20565ea1f1484dbbb486b66108fb8",
+    "src/scheduled_ticks.rs": "5e5bca44f03cae0e9718011aa59ae57f5c7c857482b1803e7ec8e93e518b8b2f",
+    "src/single_piece_structures.rs": "c4469ae4aaa678c6a0d2269eca8fe1c8bdae71f9f6b565fe7708f10c6b340152",
+    "src/spawner.rs": "0406090de5332d81084a294a4641d4fc9e7d609d6a6900f8b7a54c9e397a6035",
+    "src/spawner_tests.rs": "1039270aa5b224a7b85e395702d3934c35bec57b887156417ced0a5728a727c6",
+    "src/stronghold_structures.rs": "c44b43fe7411a02657bcb3ea9ed6ba0238431571a25957cc273f430b7e385eb1",
+    "src/structure_pipeline.rs": "a24b138d9752f2bdcc6017a2675ed220b36756cb6d814996af21036d9a1c3cb5",
+    "src/structure_placement.rs": "669916c385d7f2c48bfabcf4783d6898184ab97b1e7f316adc93e600fa435c7c",
+    "src/structure_template.rs": "a3517ed49d853d5904dc73a50e6ed56c0ab5c6bd90b0f5dfa7ea9aa4a6d6ac27",
+    "src/structure_transform.rs": "777c9f2c184acf9434aa2cf91dd3e277854ebcb8dece68bda92170d1a6067b31",
+    "src/template_structures.rs": "58b9bc2416de17a4f9d81a32f8a3465fa171a3d2838c73343635b6b172e12547",
+    "src/test_support.rs": "85d25a16f767bc624293f959c99856b0e3ac2fb3630464868474776f0f126e84",
+    "src/tick_persistence.rs": "9bc68c9102782b7b0768c0d102699dcdac4e0076635c8d2af8c5179852d25cae",
+    "src/tick_queue.rs": "584d2b3cff4c35f743df28588da9159e0757ad26f9558eaad452f81d67075f04",
+    "src/tick_stats.rs": "ece168a82d6e8d33f8eff0c253470a047feba35c83eaf7a8c7ead126a6fec342",
+    "src/tick_tests.rs": "4c7a33b73ea26bc6ba2325df57856186dbf7cbd09c40503ff0c171ba86b56071",
+    "src/trace_env.rs": "d68949ec892c40acd1a68fe13fc6443cbfe8ed5ac78c8268c8034c6a2312ff0a",
+    "src/tree.rs": "cc55fc87093f9514bfdeea2294aff3b97065c8ba05d99ac9b9073cc94e4afe92",
+    "src/voxel_faces.rs": "a848eefe6558107b5dfa53bfb3da3943c72244ed3bdf5f29df89de0f426f9c25",
+    "src/weird_sampler_tests.rs": "47dc1ac60792a9c3a7021c8fca095b4f812c5704b384bc96a6673b81650d6965",
+    "src/world_rng.rs": "7708989f742d9323bd5f63c49931638e2cac1f375bedc7b543ecdfdc5f850e44",
+    "src/worldgen.rs": "bb2d2ca3f95c692326ae0c5d94c0a8a887c8ffce3551dbfd9f8c4cfd3b3887e1",
+    "Cargo.toml": "b3efd638fc8664a127cb65ee4ad1b2d8cdb7d91dc3589f4b4282a8ba63e257fd",
+    "Cargo.lock": "b5c247e870110fc2955dc4a36a673a465b08abd1826923550122bc138d16fc13",
+    "evidence/time-contract/profile_tick.py": "8f0fd3c3e6ac45b77c38a89678bc5430811058cdc73c7452528db69fa8cf2116"
+  },
+  "binary_sha256": "d7b98596a2ce1192dab7d694620b704b09e1c07f9c8103a1659b357e63f8708c",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09) (Arch Linux rust 1:1.100.0-1)",
+  "build_command": [
+    "cargo",
+    "test",
+    "--release",
+    "--offline",
+    "--locked",
+    "-j",
+    "2",
+    "--no-run",
+    "--message-format=json"
+  ],
+  "cadence": "50ms tick period semantics; ticks are executed back to back without sleep",
+  "per_tick_unit": "microseconds, total_ns over 1000 ticks divided by 1000 then by 1000",
+  "scope": "flat headless fixture; 100 warmup + 1000 measured ticks per scenario; no clients, mobs, fluids, worldgen, Java mods",
+  "cpu_rss_scope": "whole child: all nine scenarios, fixture setup, warmup and output; Linux RSS in KiB",
+  "results": [
+    {
+      "run": 0,
+      "cpu_user_seconds": 1.507507,
+      "cpu_system_seconds": 0.012546,
+      "peak_rss_kib": 77756,
+      "scenarios": {
+        "empty": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 1851876,
+            "p50_ns": 1803,
+            "p95_ns": 1814,
+            "p99_ns": 1864
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 27404,
+              "max_ns": 40
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 40654,
+              "max_ns": 1863
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28547,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37294,
+              "max_ns": 50
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 80467,
+              "max_ns": 100
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 281091,
+              "max_ns": 42901
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60781,
+              "max_ns": 80
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 25842,
+              "max_ns": 40
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 38521,
+              "max_ns": 60
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36220,
+              "max_ns": 60
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27452,
+              "max_ns": 40
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 57459,
+              "max_ns": 80
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31288,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 883,
+              "max_ns": 41
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32650,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55073,
+              "max_ns": 81
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26715,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 38976,
+              "max_ns": 60
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 84002,
+              "max_ns": 100
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38354,
+              "max_ns": 50
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 36859,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27598,
+              "max_ns": 41
+            }
+          }
+        },
+        "idle_actor": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 60258885,
+            "p50_ns": 60113,
+            "p95_ns": 61757,
+            "p99_ns": 62468
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 80767,
+              "max_ns": 101
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38511,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29900,
+              "max_ns": 1553
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37446,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81660,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 269129,
+              "max_ns": 29225
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60737,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27564,
+              "max_ns": 50
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36608,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 35995,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27717,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8894669,
+              "max_ns": 11312
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 33271,
+              "max_ns": 1212
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 940,
+              "max_ns": 30
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32537,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55431,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26358,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49512203,
+              "max_ns": 51878
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 129563,
+              "max_ns": 161
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38268,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 36887,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27644,
+              "max_ns": 31
+            }
+          }
+        },
+        "idle_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 63984801,
+            "p50_ns": 63820,
+            "p95_ns": 65233,
+            "p99_ns": 65985
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 79052,
+              "max_ns": 101
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38615,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29360,
+              "max_ns": 40
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37955,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 83221,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 299795,
+              "max_ns": 59873
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60735,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 3622972,
+              "max_ns": 7845
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37967,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 38121,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 30788,
+              "max_ns": 41
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8917344,
+              "max_ns": 11932
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 32588,
+              "max_ns": 541
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 892,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31407,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55483,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25763,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49541176,
+              "max_ns": 55175
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 158926,
+              "max_ns": 221
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 39167,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 38201,
+              "max_ns": 1242
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28430,
+              "max_ns": 31
+            }
+          }
+        },
+        "active_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 66029414,
+            "p50_ns": 65484,
+            "p95_ns": 67126,
+            "p99_ns": 68058
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 80030,
+              "max_ns": 90
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39071,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29255,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 38112,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 83207,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 291543,
+              "max_ns": 51417
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61325,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5704728,
+              "max_ns": 98095
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36832,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36906,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 31047,
+              "max_ns": 41
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8965100,
+              "max_ns": 18986
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 32255,
+              "max_ns": 541
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 890,
+              "max_ns": 30
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31589,
+              "max_ns": 80
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55656,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25925,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49464255,
+              "max_ns": 52329
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 155736,
+              "max_ns": 221
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38949,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37071,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28282,
+              "max_ns": 31
+            }
+          }
+        },
+        "crowded_actors": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 66629989,
+            "p50_ns": 66526,
+            "p95_ns": 67988,
+            "p99_ns": 68800
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 4917470,
+              "max_ns": 4940
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39050,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29063,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37366,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 80754,
+              "max_ns": 100
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 258198,
+              "max_ns": 18124
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60640,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 26456,
+              "max_ns": 50
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 38065,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37116,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 28005,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 10538883,
+              "max_ns": 10991
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31850,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 901,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 34580,
+              "max_ns": 60
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55265,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25831,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49405602,
+              "max_ns": 52028
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 131888,
+              "max_ns": 161
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38383,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37589,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27704,
+              "max_ns": 31
+            }
+          }
+        },
+        "dense_actors": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 405941623,
+            "p50_ns": 405837,
+            "p95_ns": 407971,
+            "p99_ns": 408792
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 4923816,
+              "max_ns": 6302
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38697,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29409,
+              "max_ns": 40
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37183,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 82656,
+              "max_ns": 1453
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 256508,
+              "max_ns": 16321
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 62041,
+              "max_ns": 1333
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27491,
+              "max_ns": 31
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37131,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36308,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27985,
+              "max_ns": 40
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 233505730,
+              "max_ns": 245584
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31871,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 930,
+              "max_ns": 30
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 35741,
+              "max_ns": 50
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55339,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26255,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 165691354,
+              "max_ns": 178417
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 160345,
+              "max_ns": 1763
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38452,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 36961,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27614,
+              "max_ns": 31
+            }
+          }
+        },
+        "entity_heavy": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 241841107,
+            "p50_ns": 241216,
+            "p95_ns": 246236,
+            "p99_ns": 250774
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 428647,
+              "max_ns": 461
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 41369,
+              "max_ns": 51
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 34205,
+              "max_ns": 141
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37194,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 69429546,
+              "max_ns": 81394
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 88504295,
+              "max_ns": 267205
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 62008,
+              "max_ns": 1483
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 26591,
+              "max_ns": 50
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37680,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 38251,
+              "max_ns": 50
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 28074,
+              "max_ns": 110
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 9137334,
+              "max_ns": 10971
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31337,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 872,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 36388,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55353,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25887,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 72627003,
+              "max_ns": 86113
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 181329,
+              "max_ns": 280
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38354,
+              "max_ns": 60
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37662,
+              "max_ns": 50
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27903,
+              "max_ns": 40
+            }
+          }
+        },
+        "entity_heavy_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 242782035,
+            "p50_ns": 241677,
+            "p95_ns": 245855,
+            "p99_ns": 249812
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 431246,
+              "max_ns": 471
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 41453,
+              "max_ns": 60
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 34687,
+              "max_ns": 120
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37224,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 67109095,
+              "max_ns": 73539
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 84594473,
+              "max_ns": 304776
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61263,
+              "max_ns": 601
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5723458,
+              "max_ns": 98646
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36750,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37108,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 33653,
+              "max_ns": 541
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 9088678,
+              "max_ns": 11222
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31419,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 1004,
+              "max_ns": 51
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32256,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55139,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26366,
+              "max_ns": 120
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 74166671,
+              "max_ns": 84299
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 148918,
+              "max_ns": 211
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38921,
+              "max_ns": 60
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37690,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27711,
+              "max_ns": 50
+            }
+          }
+        },
+        "active_furnaces_pack": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 88194022,
+            "p50_ns": 87496,
+            "p95_ns": 89209,
+            "p99_ns": 90531
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 79905,
+              "max_ns": 91
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39005,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29368,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37767,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81197,
+              "max_ns": 100
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 301719,
+              "max_ns": 61747
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61170,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5810827,
+              "max_ns": 123203
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 38179,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37165,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 31412,
+              "max_ns": 50
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8966338,
+              "max_ns": 10449
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31931,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 932,
+              "max_ns": 51
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31818,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55236,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26095,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 71552167,
+              "max_ns": 86002
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 128045,
+              "max_ns": 171
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38640,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37185,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28059,
+              "max_ns": 31
+            }
+          }
+        },
+        "drop_pile": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 82298713,
+            "p50_ns": 82155,
+            "p95_ns": 83828,
+            "p99_ns": 84600
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 79686,
+              "max_ns": 90
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39510,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28950,
+              "max_ns": 541
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37930,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 97492,
+              "max_ns": 120
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 262436,
+              "max_ns": 22362
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61313,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27876,
+              "max_ns": 50
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36990,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 35844,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27437,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8943962,
+              "max_ns": 10379
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31998,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 952,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31684,
+              "max_ns": 50
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55086,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25660,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 71494225,
+              "max_ns": 84790
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 129842,
+              "max_ns": 1383
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 39257,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37529,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27674,
+              "max_ns": 31
+            }
+          }
+        }
+      }
+    },
+    {
+      "run": 1,
+      "cpu_user_seconds": 1.5154480000000001,
+      "cpu_system_seconds": 0.013013,
+      "peak_rss_kib": 77764,
+      "scenarios": {
+        "empty": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 1769829,
+            "p50_ns": 1733,
+            "p95_ns": 1743,
+            "p99_ns": 1794
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 26501,
+              "max_ns": 50
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38528,
+              "max_ns": 50
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28173,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37638,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 80594,
+              "max_ns": 100
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 276046,
+              "max_ns": 36169
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61588,
+              "max_ns": 80
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27342,
+              "max_ns": 31
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 38476,
+              "max_ns": 60
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 35163,
+              "max_ns": 50
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27988,
+              "max_ns": 40
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 56982,
+              "max_ns": 80
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31724,
+              "max_ns": 50
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 912,
+              "max_ns": 41
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32423,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55133,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26111,
+              "max_ns": 40
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 38615,
+              "max_ns": 70
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 83771,
+              "max_ns": 101
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38542,
+              "max_ns": 60
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37239,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27609,
+              "max_ns": 50
+            }
+          }
+        },
+        "idle_actor": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 60673780,
+            "p50_ns": 60044,
+            "p95_ns": 61736,
+            "p99_ns": 70002
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 81853,
+              "max_ns": 621
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39186,
+              "max_ns": 391
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28919,
+              "max_ns": 220
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 36434,
+              "max_ns": 220
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 83476,
+              "max_ns": 982
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 288131,
+              "max_ns": 44133
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 63179,
+              "max_ns": 1363
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27412,
+              "max_ns": 160
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 38316,
+              "max_ns": 331
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36201,
+              "max_ns": 281
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 29817,
+              "max_ns": 1723
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8974125,
+              "max_ns": 25979
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 32626,
+              "max_ns": 230
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 952,
+              "max_ns": 70
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 33020,
+              "max_ns": 470
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55945,
+              "max_ns": 411
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26620,
+              "max_ns": 140
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49870645,
+              "max_ns": 106892
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 131367,
+              "max_ns": 1874
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38946,
+              "max_ns": 380
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37209,
+              "max_ns": 201
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28083,
+              "max_ns": 241
+            }
+          }
+        },
+        "idle_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 63724404,
+            "p50_ns": 63570,
+            "p95_ns": 64893,
+            "p99_ns": 65724
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 80451,
+              "max_ns": 101
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38954,
+              "max_ns": 50
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29166,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37450,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 86567,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 298541,
+              "max_ns": 58581
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60764,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 3606342,
+              "max_ns": 4870
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37882,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 35972,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 30778,
+              "max_ns": 50
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8902775,
+              "max_ns": 12704
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31663,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 906,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31899,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55471,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26032,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49380692,
+              "max_ns": 53040
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 153241,
+              "max_ns": 280
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38741,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37385,
+              "max_ns": 50
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27907,
+              "max_ns": 40
+            }
+          }
+        },
+        "active_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 65791534,
+            "p50_ns": 65263,
+            "p95_ns": 66836,
+            "p99_ns": 67638
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 80805,
+              "max_ns": 571
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39299,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29190,
+              "max_ns": 40
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 36504,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 83079,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 296322,
+              "max_ns": 55796
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61021,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5686935,
+              "max_ns": 99598
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37649,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36443,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 30420,
+              "max_ns": 50
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8907770,
+              "max_ns": 10740
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 32518,
+              "max_ns": 1202
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 961,
+              "max_ns": 50
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32049,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55571,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26140,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49369579,
+              "max_ns": 52840
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 146313,
+              "max_ns": 221
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38733,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37677,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27973,
+              "max_ns": 40
+            }
+          }
+        },
+        "crowded_actors": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 66564053,
+            "p50_ns": 66446,
+            "p95_ns": 67928,
+            "p99_ns": 68700
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 4928934,
+              "max_ns": 6172
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38723,
+              "max_ns": 51
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28463,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37307,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81918,
+              "max_ns": 571
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 258251,
+              "max_ns": 18254
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60766,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27071,
+              "max_ns": 31
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37898,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 35731,
+              "max_ns": 50
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27671,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 10558073,
+              "max_ns": 12193
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31835,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 902,
+              "max_ns": 40
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 34193,
+              "max_ns": 51
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55118,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26228,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49374053,
+              "max_ns": 66115
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 128456,
+              "max_ns": 641
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38211,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37325,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28180,
+              "max_ns": 541
+            }
+          }
+        },
+        "dense_actors": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 405500904,
+            "p50_ns": 405125,
+            "p95_ns": 408151,
+            "p99_ns": 414153
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 4929582,
+              "max_ns": 6813
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39151,
+              "max_ns": 211
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29632,
+              "max_ns": 80
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 36283,
+              "max_ns": 101
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 82688,
+              "max_ns": 431
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 272529,
+              "max_ns": 29957
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61199,
+              "max_ns": 330
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27295,
+              "max_ns": 100
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 38385,
+              "max_ns": 221
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36871,
+              "max_ns": 140
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 28003,
+              "max_ns": 161
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 233037981,
+              "max_ns": 343649
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 33515,
+              "max_ns": 1473
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 1021,
+              "max_ns": 91
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 36047,
+              "max_ns": 211
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55488,
+              "max_ns": 170
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26287,
+              "max_ns": 80
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 165761119,
+              "max_ns": 179319
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 157020,
+              "max_ns": 1382
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38697,
+              "max_ns": 180
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37198,
+              "max_ns": 120
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27748,
+              "max_ns": 120
+            }
+          }
+        },
+        "entity_heavy": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 246945727,
+            "p50_ns": 241997,
+            "p95_ns": 264800,
+            "p99_ns": 315566
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 438131,
+              "max_ns": 1423
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 44633,
+              "max_ns": 370
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 36217,
+              "max_ns": 250
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 38149,
+              "max_ns": 240
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 70819642,
+              "max_ns": 216799
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 91390130,
+              "max_ns": 290989
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 67562,
+              "max_ns": 1303
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27889,
+              "max_ns": 140
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 41107,
+              "max_ns": 1553
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 38220,
+              "max_ns": 241
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 29013,
+              "max_ns": 231
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 9357114,
+              "max_ns": 26150
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 32839,
+              "max_ns": 331
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 1644,
+              "max_ns": 100
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 38766,
+              "max_ns": 380
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 56758,
+              "max_ns": 340
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26082,
+              "max_ns": 111
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 73219821,
+              "max_ns": 146366
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 176370,
+              "max_ns": 1904
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 40127,
+              "max_ns": 340
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 38473,
+              "max_ns": 211
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 33433,
+              "max_ns": 4389
+            }
+          }
+        },
+        "entity_heavy_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 247566903,
+            "p50_ns": 245033,
+            "p95_ns": 258638,
+            "p99_ns": 273917
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 431795,
+              "max_ns": 721
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 41646,
+              "max_ns": 211
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 34980,
+              "max_ns": 220
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 36081,
+              "max_ns": 100
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 68669897,
+              "max_ns": 82846
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 87129307,
+              "max_ns": 339741
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61289,
+              "max_ns": 571
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5801456,
+              "max_ns": 107083
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37974,
+              "max_ns": 140
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37454,
+              "max_ns": 110
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 33712,
+              "max_ns": 140
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 9141462,
+              "max_ns": 12283
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31749,
+              "max_ns": 101
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 1271,
+              "max_ns": 200
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 36605,
+              "max_ns": 230
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55977,
+              "max_ns": 371
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26202,
+              "max_ns": 60
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 74710442,
+              "max_ns": 102704
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 151209,
+              "max_ns": 772
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38756,
+              "max_ns": 170
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37560,
+              "max_ns": 121
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28000,
+              "max_ns": 91
+            }
+          }
+        },
+        "active_furnaces_pack": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 88187911,
+            "p50_ns": 87465,
+            "p95_ns": 89209,
+            "p99_ns": 90120
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 80367,
+              "max_ns": 91
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39196,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29614,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37661,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81283,
+              "max_ns": 100
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 316267,
+              "max_ns": 75302
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60862,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5793341,
+              "max_ns": 121199
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37758,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36020,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 31673,
+              "max_ns": 41
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8935526,
+              "max_ns": 10690
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31610,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 1223,
+              "max_ns": 101
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31758,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55471,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26177,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 71629800,
+              "max_ns": 74811
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 131640,
+              "max_ns": 641
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38833,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37508,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28192,
+              "max_ns": 31
+            }
+          }
+        },
+        "drop_pile": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 82327361,
+            "p50_ns": 82126,
+            "p95_ns": 83748,
+            "p99_ns": 84811
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 80115,
+              "max_ns": 100
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39509,
+              "max_ns": 50
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28820,
+              "max_ns": 40
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 36735,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 98206,
+              "max_ns": 140
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 272464,
+              "max_ns": 31349
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61455,
+              "max_ns": 561
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27322,
+              "max_ns": 41
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37856,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36653,
+              "max_ns": 50
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27762,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8921052,
+              "max_ns": 15940
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31807,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 951,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31517,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55248,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25588,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 71581190,
+              "max_ns": 97744
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 142723,
+              "max_ns": 201
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38885,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37659,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27878,
+              "max_ns": 40
+            }
+          }
+        }
+      }
+    },
+    {
+      "run": 2,
+      "cpu_user_seconds": 1.507691,
+      "cpu_system_seconds": 0.016876,
+      "peak_rss_kib": 77612,
+      "scenarios": {
+        "empty": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 1774859,
+            "p50_ns": 1724,
+            "p95_ns": 1743,
+            "p99_ns": 1804
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 26773,
+              "max_ns": 50
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38668,
+              "max_ns": 50
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28022,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37672,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 80575,
+              "max_ns": 110
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 279757,
+              "max_ns": 37942
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61758,
+              "max_ns": 80
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27248,
+              "max_ns": 40
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37400,
+              "max_ns": 60
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 35239,
+              "max_ns": 50
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 28067,
+              "max_ns": 40
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 57326,
+              "max_ns": 80
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 32602,
+              "max_ns": 531
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 871,
+              "max_ns": 40
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32719,
+              "max_ns": 51
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55378,
+              "max_ns": 70
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26035,
+              "max_ns": 40
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 38495,
+              "max_ns": 60
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 83810,
+              "max_ns": 110
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38259,
+              "max_ns": 50
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37275,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27780,
+              "max_ns": 40
+            }
+          }
+        },
+        "idle_actor": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 60110361,
+            "p50_ns": 59974,
+            "p95_ns": 61376,
+            "p99_ns": 62458
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 79562,
+              "max_ns": 130
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38743,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28700,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37245,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81972,
+              "max_ns": 571
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 270156,
+              "max_ns": 29666
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60668,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 25694,
+              "max_ns": 31
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37655,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37441,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27574,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8924553,
+              "max_ns": 14207
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31880,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 883,
+              "max_ns": 40
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32565,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55054,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26441,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49394439,
+              "max_ns": 55224
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 134404,
+              "max_ns": 230
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38459,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37093,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27773,
+              "max_ns": 31
+            }
+          }
+        },
+        "idle_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 64241372,
+            "p50_ns": 63741,
+            "p95_ns": 65614,
+            "p99_ns": 84650
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 81069,
+              "max_ns": 581
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39611,
+              "max_ns": 141
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 30247,
+              "max_ns": 992
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37789,
+              "max_ns": 80
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 87523,
+              "max_ns": 310
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 319446,
+              "max_ns": 76264
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61396,
+              "max_ns": 251
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 3635081,
+              "max_ns": 6612
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36505,
+              "max_ns": 130
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36214,
+              "max_ns": 90
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 31493,
+              "max_ns": 70
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 9029180,
+              "max_ns": 14638
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31557,
+              "max_ns": 80
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 980,
+              "max_ns": 70
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31916,
+              "max_ns": 141
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55964,
+              "max_ns": 151
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26081,
+              "max_ns": 40
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49708902,
+              "max_ns": 72317
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 151485,
+              "max_ns": 822
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 39077,
+              "max_ns": 130
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37681,
+              "max_ns": 80
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28621,
+              "max_ns": 120
+            }
+          }
+        },
+        "active_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 65924704,
+            "p50_ns": 65343,
+            "p95_ns": 67247,
+            "p99_ns": 68520
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 79240,
+              "max_ns": 100
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39396,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29121,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37618,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 82507,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 293808,
+              "max_ns": 53862
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61270,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5707958,
+              "max_ns": 98476
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37940,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37024,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 30959,
+              "max_ns": 41
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8954506,
+              "max_ns": 12493
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31559,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 954,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 33203,
+              "max_ns": 1363
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55534,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26329,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49438906,
+              "max_ns": 62197
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 144871,
+              "max_ns": 701
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38396,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37356,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28451,
+              "max_ns": 40
+            }
+          }
+        },
+        "crowded_actors": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 66595322,
+            "p50_ns": 66465,
+            "p95_ns": 68048,
+            "p99_ns": 68991
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 4923633,
+              "max_ns": 6723
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 39033,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 28850,
+              "max_ns": 31
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37207,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81208,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 263561,
+              "max_ns": 23464
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60767,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27127,
+              "max_ns": 40
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36652,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 36025,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27533,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 10569728,
+              "max_ns": 12394
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31832,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 900,
+              "max_ns": 30
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 34362,
+              "max_ns": 50
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55411,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25970,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 49399515,
+              "max_ns": 62308
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 129727,
+              "max_ns": 170
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38692,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37220,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27675,
+              "max_ns": 31
+            }
+          }
+        },
+        "dense_actors": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 406642642,
+            "p50_ns": 406578,
+            "p95_ns": 408692,
+            "p99_ns": 409624
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 4925021,
+              "max_ns": 6322
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38930,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29472,
+              "max_ns": 40
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 36988,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81321,
+              "max_ns": 101
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 259556,
+              "max_ns": 19537
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60752,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 25947,
+              "max_ns": 31
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 38008,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 39349,
+              "max_ns": 1182
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27887,
+              "max_ns": 50
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 234324528,
+              "max_ns": 237648
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31652,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 870,
+              "max_ns": 30
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 34989,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55128,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26105,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 165643763,
+              "max_ns": 170422
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 159543,
+              "max_ns": 1443
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38620,
+              "max_ns": 50
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37102,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27752,
+              "max_ns": 31
+            }
+          }
+        },
+        "entity_heavy": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 242805599,
+            "p50_ns": 242007,
+            "p95_ns": 246796,
+            "p99_ns": 252507
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 430120,
+              "max_ns": 691
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 41083,
+              "max_ns": 170
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 33918,
+              "max_ns": 231
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37427,
+              "max_ns": 70
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 69732698,
+              "max_ns": 126479
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 88783401,
+              "max_ns": 263929
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 62660,
+              "max_ns": 1753
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 26736,
+              "max_ns": 50
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36715,
+              "max_ns": 170
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37291,
+              "max_ns": 121
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27685,
+              "max_ns": 90
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 9136573,
+              "max_ns": 14287
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31571,
+              "max_ns": 90
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 971,
+              "max_ns": 90
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 36546,
+              "max_ns": 151
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55395,
+              "max_ns": 131
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25777,
+              "max_ns": 50
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 73070174,
+              "max_ns": 100380
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 158998,
+              "max_ns": 1412
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38865,
+              "max_ns": 130
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37814,
+              "max_ns": 80
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27813,
+              "max_ns": 80
+            }
+          }
+        },
+        "entity_heavy_furnaces": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 249165177,
+            "p50_ns": 246646,
+            "p95_ns": 259200,
+            "p99_ns": 290188
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 426254,
+              "max_ns": 1703
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 41931,
+              "max_ns": 391
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 35434,
+              "max_ns": 551
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37546,
+              "max_ns": 190
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 69401042,
+              "max_ns": 217671
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 88269011,
+              "max_ns": 321678
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 61572,
+              "max_ns": 611
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5735903,
+              "max_ns": 101823
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 40132,
+              "max_ns": 2034
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 38252,
+              "max_ns": 231
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 32778,
+              "max_ns": 280
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 9168495,
+              "max_ns": 25608
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31947,
+              "max_ns": 341
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 942,
+              "max_ns": 80
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 36807,
+              "max_ns": 351
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55541,
+              "max_ns": 351
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26755,
+              "max_ns": 130
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 74475958,
+              "max_ns": 163899
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 148372,
+              "max_ns": 1924
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 38944,
+              "max_ns": 310
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 38669,
+              "max_ns": 582
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 28306,
+              "max_ns": 221
+            }
+          }
+        },
+        "active_furnaces_pack": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 88035151,
+            "p50_ns": 87324,
+            "p95_ns": 89059,
+            "p99_ns": 90130
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 80671,
+              "max_ns": 91
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 38965,
+              "max_ns": 41
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29343,
+              "max_ns": 41
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 37186,
+              "max_ns": 51
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 81733,
+              "max_ns": 611
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 304881,
+              "max_ns": 64912
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 60983,
+              "max_ns": 71
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 5794759,
+              "max_ns": 120637
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 36634,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 35349,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 30850,
+              "max_ns": 60
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8977078,
+              "max_ns": 15539
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 31732,
+              "max_ns": 41
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 900,
+              "max_ns": 40
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 32026,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55784,
+              "max_ns": 561
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 26008,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 71450051,
+              "max_ns": 78418
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 124846,
+              "max_ns": 160
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 39289,
+              "max_ns": 541
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37496,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27960,
+              "max_ns": 31
+            }
+          }
+        },
+        "drop_pile": {
+          "tick": {
+            "samples": 1000,
+            "total_ns": 82117164,
+            "p50_ns": 81975,
+            "p95_ns": 83658,
+            "p99_ns": 84580
+          },
+          "stages": {
+            "actors": {
+              "calls": 1000,
+              "total_ns": 79166,
+              "max_ns": 90
+            },
+            "arrows": {
+              "calls": 1000,
+              "total_ns": 40028,
+              "max_ns": 531
+            },
+            "block_updates": {
+              "calls": 1000,
+              "total_ns": 29044,
+              "max_ns": 40
+            },
+            "carts": {
+              "calls": 1000,
+              "total_ns": 38113,
+              "max_ns": 41
+            },
+            "drops": {
+              "calls": 1000,
+              "total_ns": 97917,
+              "max_ns": 120
+            },
+            "environment": {
+              "calls": 1000,
+              "total_ns": 267821,
+              "max_ns": 26200
+            },
+            "falling": {
+              "calls": 1000,
+              "total_ns": 62149,
+              "max_ns": 581
+            },
+            "furnaces": {
+              "calls": 1000,
+              "total_ns": 27096,
+              "max_ns": 1282
+            },
+            "generated_content": {
+              "calls": 1000,
+              "total_ns": 37956,
+              "max_ns": 41
+            },
+            "generated_fluids": {
+              "calls": 1000,
+              "total_ns": 37190,
+              "max_ns": 41
+            },
+            "hoppers": {
+              "calls": 1000,
+              "total_ns": 27568,
+              "max_ns": 31
+            },
+            "hot_regions": {
+              "calls": 1000,
+              "total_ns": 8906276,
+              "max_ns": 10680
+            },
+            "interest": {
+              "calls": 1000,
+              "total_ns": 33604,
+              "max_ns": 1272
+            },
+            "lava": {
+              "calls": 33,
+              "total_ns": 882,
+              "max_ns": 31
+            },
+            "mobs": {
+              "calls": 1000,
+              "total_ns": 31350,
+              "max_ns": 41
+            },
+            "observers": {
+              "calls": 1000,
+              "total_ns": 55217,
+              "max_ns": 61
+            },
+            "plugins": {
+              "calls": 1000,
+              "total_ns": 25628,
+              "max_ns": 31
+            },
+            "random_ticks": {
+              "calls": 1000,
+              "total_ns": 71403781,
+              "max_ns": 81675
+            },
+            "scheduled_blocks": {
+              "calls": 1000,
+              "total_ns": 129322,
+              "max_ns": 160
+            },
+            "spawners": {
+              "calls": 1000,
+              "total_ns": 39088,
+              "max_ns": 41
+            },
+            "tnt": {
+              "calls": 1000,
+              "total_ns": 37540,
+              "max_ns": 41
+            },
+            "water": {
+              "calls": 1000,
+              "total_ns": 27751,
+              "max_ns": 31
+            }
+          }
+        }
+      }
+    }
+  ]
+}

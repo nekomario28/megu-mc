@@ -11,6 +11,19 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# The stage names `game_tick` dispatches, one per `run("<name>", ...)` call. The
+# count used to be a bare `== 17`, which rotted: the tick body grew to 22 stages
+# and the runner then refused every reading (measured 2026-11-18, this lane). The
+# guard it was meant to express is "no stage silently stopped running", so it
+# names them. A stage that is added or removed has to be acknowledged here, which
+# is the point: the fixture must reach the code it claims to measure.
+TICK_STAGES = {
+    "environment", "hot_regions", "scheduled_blocks", "generated_fluids",
+    "generated_content", "interest", "drops", "arrows", "tnt", "furnaces",
+    "hoppers", "water", "lava", "observers", "plugins", "actors", "mobs",
+    "spawners", "carts", "falling", "random_ticks", "block_updates",
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -75,8 +88,11 @@ def main():
         assert set(scenarios) == {"empty", "idle_actor", "idle_furnaces", "active_furnaces", "crowded_actors", "dense_actors", "entity_heavy", "entity_heavy_furnaces", "active_furnaces_pack", "drop_pile"}
         for item in scenarios.values():
             assert item["tick"]["samples"] == 1000
-            assert len(item["stages"]) == 17
             # Every stage must run, so the reading cannot be a stopped pipeline.
+            missing = TICK_STAGES - set(item["stages"])
+            unexpected = set(item["stages"]) - TICK_STAGES
+            assert not missing, f"stage(s) never ran: {sorted(missing)}"
+            assert not unexpected, f"undeclared stage(s) ran: {sorted(unexpected)}"
             # The lava stage is periodic, so its count follows the cadence rather
             # than a fixed number; assert it ran less often and let the report
             # carry the exact count.
