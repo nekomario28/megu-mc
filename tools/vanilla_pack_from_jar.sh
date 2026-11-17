@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Rebuild `datapacks/vanilla/data/minecraft/{worldgen,tags/block}` from the pinned
-# 1.21.1 server jar.
+# Rebuild `datapacks/vanilla/data/minecraft/{worldgen,tags/block,dimension_type}` from the
+# pinned 1.21.1 server jar.
 #
 #   tools/vanilla_pack_from_jar.sh [dir]     # default: datapacks/vanilla
 #
@@ -13,9 +13,17 @@
 # conversion of the *data the reference server actually generates from* is a
 # divergence source that no fixture comparison can see.
 #
-# This script takes the worldgen tree and the block tags straight out of the pinned
-# jar, so the data and the reference worlds come from the same build. It is the same
-# subset the parser reads (`dp_tag_files("block")` and the worldgen loader).
+# This script takes the worldgen tree, the block tags and the dimension types straight out
+# of the pinned jar, so the data and the reference worlds come from the same build. It is
+# the same subset the parser reads (`dp_tag_files("block")`, the worldgen loader and
+# `Gen::load_preset`'s `dimension_type` read).
+#
+# `dimension_type` is the world's own window: `min_y`/`height` are what a chunk can store
+# (sections, heightmaps, structure/furniture bounds). It is NOT the noise settings window:
+# 1.21.1 says 0/256 for the_nether and the_end while their noise_settings say 0/128, and
+# the End's end_city content reaches y=143. Without these files the port has one number
+# for both and silently truncates; see
+# `audit/convergence-prep-20261116/dim_height_256_design.md`.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-$ROOT/datapacks/vanilla}"
@@ -52,10 +60,11 @@ unzip -q "$JAR" 'META-INF/versions/*' -d "$work"
 inner="$(find "$work/META-INF/versions" -name 'server-*.jar' | head -1)"
 [ -n "$inner" ] || { echo "vanilla pack: no nested server jar in $JAR" >&2; exit 1; }
 rm -rf "$work/data"
-unzip -q "$inner" 'data/minecraft/worldgen/*' 'data/minecraft/tags/block/*' -d "$work"
+unzip -q "$inner" 'data/minecraft/worldgen/*' 'data/minecraft/tags/block/*' \
+  'data/minecraft/dimension_type/*' -d "$work"
 
 files="$(find "$work/data" -type f | wc -l)"
-echo "vanilla pack: $files files (worldgen + block tags)"
+echo "vanilla pack: $files files (worldgen + block tags + dimension types)"
 [ "$files" -gt 300 ] || { echo "vanilla pack: only $files files, refusing to install" >&2; exit 1; }
 
 # every known pack needs the same worldgen layout; a missing one means the subset
@@ -78,16 +87,24 @@ if [ -d "$work/data/minecraft/worldgen/feature" ]; then
 fi
 n="$(find "$work/data/minecraft/tags/block" -type f | wc -l)"
 [ "$n" -gt 100 ] || { echo "vanilla pack: only $n block tags" >&2; exit 1; }
+# The world window. All three presets the loader knows must be present, or
+# `world_*` silently falls back to the noise window and the End loses its tower.
+for f in overworld the_nether the_end; do
+  [ -f "$work/data/minecraft/dimension_type/$f.json" ] \
+    || { echo "vanilla pack: dimension_type/$f.json is missing from the jar" >&2; exit 1; }
+done
 
 # The climate preset JSON names a built-in; it does not contain the intervals or
 # search tree. Export those from the same jar before touching the installed pack.
 python3 "$ROOT/tools/biome_tree_from_jar.py" --jar "$JAR" --output "$work/multi_noise_biome_tree.json"
 
-rm -rf "$DEST/data/minecraft/worldgen" "$DEST/data/minecraft/tags"
+rm -rf "$DEST/data/minecraft/worldgen" "$DEST/data/minecraft/tags" \
+  "$DEST/data/minecraft/dimension_type"
 mkdir -p "$DEST/data/minecraft"
 cp -r "$work/data/minecraft/worldgen" "$DEST/data/minecraft/worldgen"
 mkdir -p "$DEST/data/minecraft/tags"
 cp -r "$work/data/minecraft/tags/block" "$DEST/data/minecraft/tags/block"
+cp -r "$work/data/minecraft/dimension_type" "$DEST/data/minecraft/dimension_type"
 cp "$work/multi_noise_biome_tree.json" "$DEST/multi_noise_biome_tree.json"
 python3 "$ROOT/tools/vanilla_structure_assets.py" --jar "$JAR" --output "$DEST" --write
 echo "vanilla pack: installed into $DEST"

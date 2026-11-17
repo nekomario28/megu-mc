@@ -47,7 +47,15 @@ LOADED = [
     "noise_settings",
     "placed_feature",
     "block_state_provider",
+    # The world's own window. It is a sibling of `worldgen/`, not a subdirectory: 1.21.1's
+    # the_nether/the_end say `min_y 0 / height 256` where their noise_settings say 0/128,
+    # and `Gen::load_preset` reads this file for `world_min_y`/`world_height` (chunk
+    # sections, heightmaps, dump length, structure bounds). A pack missing it falls back
+    # to the noise window, which is exactly the truncation this file has to be able to see.
+    "dimension_type",
 ]
+# Loaded directories that live beside `worldgen/`, mapped to their key prefix.
+SIBLINGS = {"dimension_type": "../dimension_type"}
 NOT_LOADED = [
     "flat_level_generator_preset",
     "multi_noise_biome_source_parameter_list",
@@ -94,17 +102,30 @@ def jar_pack(jar):
             for n in inner.namelist():
                 if n.startswith("data/minecraft/tags/block/") and n.endswith(".json"):
                     out["../tags/block/" + n[len("data/minecraft/tags/block/") :]] = inner.read(n)
+        # the world window (`dimension_type`) beside `worldgen/`
+        with zipfile.ZipFile(io.BytesIO(outer.read(inner_name))) as inner:
+            for n in inner.namelist():
+                if n.startswith("data/minecraft/dimension_type/") and n.endswith(".json"):
+                    out[
+                        "../dimension_type/" + n[len("data/minecraft/dimension_type/") :]
+                    ] = inner.read(n)
     return out
 
 
 def pack_files(root):
     out = {}
     for sub in DIRS:
-        d = root / "data/minecraft/worldgen" / sub
+        if sub in SIBLINGS:
+            d = root / "data/minecraft" / sub
+            prefix = SIBLINGS[sub] + "/"
+        else:
+            d = root / "data/minecraft/worldgen" / sub
+            prefix = ""
         if not d.is_dir():
             continue
         for f in d.rglob("*.json"):
-            key = str(pathlib.Path(sub) / f.relative_to(d))
+            rel = str(f.relative_to(d))
+            key = f"{prefix}{rel}" if prefix else str(pathlib.Path(sub) / rel)
             for alias, real in ALIASES.items():
                 if key.startswith(alias + "/"):
                     key = real + key[len(alias) :]
@@ -145,7 +166,15 @@ def main():
     per = {}
     only_jar, only_pack, identical, differ, sem = [], [], 0, [], 0
     for k in sorted(set(ref) | set(cur)):
-        top = k.split("/")[0] if not k.startswith("../") else "../tags/block"
+        # `../tags/block` and `../dimension_type` are siblings of `worldgen/`; a directory
+        # name is not enough to tell them apart (`../tags/...` has three components).
+        if k.startswith("../tags/"):
+            top = "../tags/block"
+        elif k.startswith("../"):
+            top = k.split("/")[1]
+            top = "../" + top
+        else:
+            top = k.split("/")[0]
         if top in NOT_LOADED:
             continue
         ref_k, cur_k = k in ref, k in cur
