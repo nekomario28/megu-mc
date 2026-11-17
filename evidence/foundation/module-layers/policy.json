@@ -53,6 +53,7 @@
       "voxel_faces"
     ],
     [
+      "brigadier",
       "chunk_ack",
       "connection_limits",
       "ingress_guard",
@@ -89,6 +90,10 @@
     ]
   ],
   "allowed_edges": [
+    [
+      "main",
+      "brigadier"
+    ],
     [
       "main",
       "mineshaft"

@@ -3151,6 +3151,23 @@ check "nether_fossil anchors on the generator window" \
   '    let min_y = world.min_y();
     let depth = world.height();' \
   feature::pipeline_tests::nether_fossil_scans_the_noise_column_not_the_live_world
+# Brigadier port (issue #51, slice 1): src/brigadier.rs is a standalone module, so these two
+# mutations need no world state - a reader that keeps `escaped` set after a valid escape, and a
+# redirect hop that resumes from the node it left instead of from the redirect target.
+check "a quoted string clears the escape flag after consuming an escaped character" \
+  src/brigadier.rs '                if c == terminator || c == SYNTAX_ESCAPE {
+                    result.push(c);
+                    escaped = false;
+                } else {' \
+  '                if c == terminator || c == SYNTAX_ESCAPE {
+                    result.push(c);
+                } else {' \
+  brigadier_tests::reader_quoted_strings_unescape_only_the_terminator_and_the_escape
+
+check "a redirect hop parses from the redirect target, not from the node it left" \
+  src/brigadier.rs '                    let parse = self.parse_nodes(&target, &reader, &mut child_context);' \
+  '                    let parse = self.parse_nodes(node, &reader, &mut child_context);' \
+  brigadier_tests::a_redirect_modifier_threads_the_modified_source_through_every_hop
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

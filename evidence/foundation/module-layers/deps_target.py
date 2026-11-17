@@ -18,9 +18,10 @@ layers = [
     ["worldgen", "block_registry", "generated_content"],
     ["json", "generation_math", "generation_leaf_queue", "nbt", "generation_payload", "structure_transform", "structure_placement", "mineshaft_layout", "voxel_faces"],
     # Leaf utilities and profiling counters. Profilers read trace_env flags but
-    # do not depend on generation or runtime owners.
+    # do not depend on generation or runtime owners. brigadier is a leaf library too: the
+    # Brigadier port owns its own reader/tree/dispatcher and references no other crate module.
     ["ingress_guard", "tick_stats", "chunk_ack", "connection_limits", "trace_env",
-     "chunkprof", "lockprof", "loopprof", "tickprof"],
+     "chunkprof", "lockprof", "loopprof", "tickprof", "brigadier"],
 ]
 modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(
