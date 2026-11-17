@@ -3168,6 +3168,22 @@ check "a redirect hop parses from the redirect target, not from the node it left
   src/brigadier.rs '                    let parse = self.parse_nodes(&target, &reader, &mut child_context);' \
   '                    let parse = self.parse_nodes(node, &reader, &mut child_context);' \
   brigadier_tests::a_redirect_modifier_threads_the_modified_source_through_every_hop
+# Brigadier wire format (issue #51, slice 2): src/brigadier_wire.rs writes the tree the dispatcher
+# already holds, so both mutations are byte-level and need no world state - a child index pointing
+# one past the node it names, and the two numbers of a suggestion answer's replaced range
+# transposed. Both produce a packet the client accepts and then resolves into a different tree or
+# a wrong replacement range, which is why the assertions are byte equality and not `is_ok`.
+check "a child index names the node it points at" \
+  src/brigadier_wire.rs '        write_varint(out, wire_varint(child_index, "child index")?);' \
+  '        write_varint(out, wire_varint(child_index + 1, "child index")?);' \
+  brigadier_wire_tests::node_indices_are_assigned_breadth_first
+
+check "a suggestion answer keeps start and length in their own fields" \
+  src/brigadier_wire.rs '    write_varint(&mut out, wire_varint(response.start, "suggestion start")?);
+    write_varint(&mut out, wire_varint(response.length, "suggestion length")?);' \
+  '    write_varint(&mut out, wire_varint(response.length, "suggestion start")?);
+    write_varint(&mut out, wire_varint(response.start, "suggestion length")?);' \
+  brigadier_wire_tests::the_response_serializes_to_id_start_length_count_and_entries
 
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then

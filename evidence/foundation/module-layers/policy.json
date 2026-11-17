@@ -5,6 +5,9 @@
       "main"
     ],
     [
+      "brigadier_wire"
+    ],
+    [
       "chest_loot",
       "java_compat",
       "landing",
@@ -91,8 +94,16 @@
   ],
   "allowed_edges": [
     [
+      "brigadier_wire",
+      "brigadier"
+    ],
+    [
       "main",
       "brigadier"
+    ],
+    [
+      "main",
+      "brigadier_wire"
     ],
     [
       "main",

@@ -17,9 +17,11 @@
 //! # What this slice is
 //!
 //! A standalone library module. Nothing in `main.rs` calls it yet: `run_command_ctx` still
-//! owns the handwritten parser, and no packet is built from this tree. Wiring, the Commands
-//! tree packet, 1.21.1 argument types (selectors, `block_pos`, `vec3`, `resource_location`,
-//! NBT, components), `.mcfunction` execution and the JVM-shim bridge are later slices.
+//! owns the handwritten parser, and no packet is built from this tree. The wire format of the
+//! Commands packet and of the suggestions exchange lives in `src/brigadier_wire.rs`, which reads
+//! this module and is read by nothing; sending either packet is still a later slice. Wiring,
+//! 1.21.1 argument types (selectors, `block_pos`, `vec3`, `resource_location`, NBT, components),
+//! `.mcfunction` execution and the JVM-shim bridge are later slices too.
 //!
 //! # Deliberate deviations from the Java code
 //!
@@ -975,9 +977,37 @@ pub trait ArgumentType<S>: Send + Sync {
         Vec::new()
     }
 
+    /// A description of this type for consumers that must name it rather than call it.
+    ///
+    /// Vanilla keys `ArgumentTypeInfos` by the argument type's *class* and the Commands packet
+    /// writes that registry id, so a serializer has to know which concrete type it holds. Rust
+    /// erases the concrete type behind this trait object, and the Commands packet is the one
+    /// consumer that cannot call its way around the erasure. Each implementation owned here
+    /// states its own shape; the default is `None`, meaning "this module does not own the type",
+    /// which refuses to be described instead of being guessed at.
+    fn type_info(&self) -> Option<ArgumentTypeInfo> {
+        None
+    }
+
     /// A copy of this type as a boxed trait object, so `CommandNode::create_builder` can build a
     /// fresh node of the same type (Java reuses the type instance).
     fn box_clone(&self) -> Box<dyn ArgumentType<S>>;
+}
+
+/// What an [`ArgumentType`] is, without its parser: the measurement that
+/// `net.minecraft.commands.synchronization.ArgumentTypeInfo` carries alongside its serializer.
+///
+/// This is data, not the wire format - the serializer lives in `crate::brigadier_wire`, so this
+/// module stays a leaf with no crate-internal dependency. Fields are `Copy` so a node can answer
+/// by value without lending its boxed type out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ArgumentTypeInfo {
+    Bool,
+    Float { minimum: f32, maximum: f32 },
+    Double { minimum: f64, maximum: f64 },
+    Integer { minimum: i32, maximum: i32 },
+    Long { minimum: i64, maximum: i64 },
+    String { string_type: StringType },
 }
 
 fn boxed<T: Any + Send + Sync>(value: T) -> ArgumentValue {
@@ -1044,6 +1074,12 @@ impl<S> ArgumentType<S> for IntegerArgumentType {
     fn examples(&self) -> Vec<&'static str> {
         vec!["0", "123", "-123"]
     }
+    fn type_info(&self) -> Option<ArgumentTypeInfo> {
+        Some(ArgumentTypeInfo::Integer {
+            minimum: self.minimum,
+            maximum: self.maximum,
+        })
+    }
     fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
         Box::new(*self)
     }
@@ -1108,6 +1144,12 @@ impl<S> ArgumentType<S> for LongArgumentType {
 
     fn examples(&self) -> Vec<&'static str> {
         vec!["0", "123", "-123"]
+    }
+    fn type_info(&self) -> Option<ArgumentTypeInfo> {
+        Some(ArgumentTypeInfo::Long {
+            minimum: self.minimum,
+            maximum: self.maximum,
+        })
     }
     fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
         Box::new(*self)
@@ -1174,6 +1216,12 @@ impl<S> ArgumentType<S> for DoubleArgumentType {
     fn examples(&self) -> Vec<&'static str> {
         vec!["0", "1.2", ".5", "-1", "-.5", "-1234.56"]
     }
+    fn type_info(&self) -> Option<ArgumentTypeInfo> {
+        Some(ArgumentTypeInfo::Double {
+            minimum: self.minimum,
+            maximum: self.maximum,
+        })
+    }
     fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
         Box::new(*self)
     }
@@ -1239,6 +1287,12 @@ impl<S> ArgumentType<S> for FloatArgumentType {
     fn examples(&self) -> Vec<&'static str> {
         vec!["0", "1.2", ".5", "-1", "-.5", "-1234.56"]
     }
+    fn type_info(&self) -> Option<ArgumentTypeInfo> {
+        Some(ArgumentTypeInfo::Float {
+            minimum: self.minimum,
+            maximum: self.maximum,
+        })
+    }
     fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
         Box::new(*self)
     }
@@ -1262,6 +1316,10 @@ impl BoolArgumentType {
 impl<S> ArgumentType<S> for BoolArgumentType {
     fn parse(&self, reader: &mut StringReader) -> Result<ArgumentValue, CommandSyntaxException> {
         Ok(boxed(reader.read_boolean()?))
+    }
+
+    fn type_info(&self) -> Option<ArgumentTypeInfo> {
+        Some(ArgumentTypeInfo::Bool)
     }
 
     fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
@@ -1376,6 +1434,12 @@ impl<S> ArgumentType<S> for StringArgumentType {
 
     fn examples(&self) -> Vec<&'static str> {
         self.kind.examples()
+    }
+
+    fn type_info(&self) -> Option<ArgumentTypeInfo> {
+        Some(ArgumentTypeInfo::String {
+            string_type: self.kind,
+        })
     }
 
     fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
@@ -2354,6 +2418,13 @@ impl<S> CommandNode<S> {
 
     pub fn same_node(&self, other: &CommandNode<S>) -> bool {
         Arc::ptr_eq(&self.data, &other.data)
+    }
+
+    /// The node identity [`Self::same_node`] compares, as a value a map can key on: the address
+    /// of the node the handles share. Stable while any handle to the node is alive, which is the
+    /// whole time a tree that contains it is being walked.
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.data) as usize
     }
 
     pub fn command(&self) -> Option<Command<S>> {

@@ -9,6 +9,9 @@ import depsgx as d
 
 layers = [
     ["main"],
+    # The wire format is the tree's first consumer: it reads brigadier and nothing else, and
+    # nothing below it may read it back.
+    ["brigadier_wire"],
     ["chest_loot", "java_compat", "landing", "effects", "minecart", "spawner", "tick_persistence"],
     ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks"],
     ["feature", "structure_template"],
@@ -27,6 +30,7 @@ modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(
     modules=modules,
     depends=[("main", name) for name in modules if name != "main"] + [
+        ("brigadier_wire", "brigadier"),
         ("chest_loot", "generation_math"),
         ("spawner", "generation_math"), ("spawner", "nbt"),
         ("landing", "java_compat"), ("landing", "landing_types"),

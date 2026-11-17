@@ -27354,8 +27354,11 @@ fn world_guard() -> std::sync::MutexGuard<'static, ()> {
     WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 mod brigadier;
+mod brigadier_wire;
 #[cfg(test)]
 mod brigadier_tests;
+#[cfg(test)]
+mod brigadier_wire_tests;
 #[cfg(test)]
 mod command_tests;
 #[cfg(test)]
