@@ -5723,3 +5723,217 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
     }
     drops().lock().unwrap().clear();
 }
+
+// --- Behaviour identity -----------------------------------------------------------------
+//
+// A tick-cost change is only allowed if the world it produces is the same world. This
+// pins that: build a deterministic scenario, run it, serialize the save payload and hash
+// it. The fixture keeps the block overlay empty on purpose (no crops, no block edits),
+// because `save_world_into` walks that overlay as a `HashMap` and its byte order would
+// then come from the hasher's random seed instead of from the simulation.
+
+fn payload_digest(bytes: &[u8]) -> String {
+    // FNV-1a 128: no dependency, deterministic across processes, and wide enough that a
+    // single changed byte cannot land on the same digest.
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for byte in bytes {
+        hash ^= *byte as u128;
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    format!("{hash:032x}")
+}
+
+struct IdentityFixture {
+    orbs: usize,
+    drops: usize,
+}
+
+fn identity_fixture(orbs: &mut Vec<Xp>, items: &mut Vec<Drop>) -> IdentityFixture {
+    let mut eid = 40_000;
+    let mut orb = |x: f64, y: f64, z: f64, val: i16, age: i32| {
+        orbs.push(Xp {
+            eid,
+            x,
+            y,
+            z,
+            val,
+            age,
+        });
+        eid += 1;
+    };
+    // Coincident, then a chain where one step is in range and the next is not.
+    for i in 0..6 {
+        orb(0.5, 70.0, 0.5, 1, i);
+    }
+    for i in 0..6 {
+        orb(0.2 + i as f64 * 0.8, 70.0, 0.5, (i % 3) as i16 + 1, i);
+    }
+    // Integer-boundary straddles on all three axes at once.
+    for i in 0..4 {
+        orb(16.99 - i as f64 * 0.9, 70.99, 0.99, 2, 5 - i);
+    }
+    // Negative coordinates: floor is not trunc, so these are one cell apart.
+    for i in 0..4 {
+        orb(-0.01 - i as f64 * 0.9, 70.0, -0.5, 1, i * 2);
+    }
+    // Out of range: exactly one block apart must never merge.
+    for i in 0..8 {
+        orb(200.0 + i as f64, 70.0, 200.0, 1, i);
+    }
+    // Same cell, y straddling the boundary.
+    for i in 0..8 {
+        orb(300.5, 70.0 + (i % 2) as f64 * 0.98, 300.5, 3, i);
+    }
+    let mut deid = 50_000;
+    let mut push_drop = |x: f64, z: f64, item: i64, age: i32| {
+        items.push(Drop {
+            eid: deid,
+            x,
+            y: 70.0,
+            z,
+            item,
+            cnt: 1,
+            comps: Vec::new(),
+            age,
+        });
+        deid += 1;
+    };
+    for i in 0..6 {
+        push_drop(8.5, 8.5, 811, i);
+    }
+    for i in 0..6 {
+        push_drop(8.2 + i as f64 * 0.2, 8.5, 812, i);
+    }
+    IdentityFixture {
+        orbs: orbs.len(),
+        drops: items.len(),
+    }
+}
+
+#[test]
+fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
+    // The payload carries process-wide state - the world clock, the weather budget, the
+    // random stream - and the digest is only meaningful if that state started where the
+    // fixture says it did. A test running beside this one can advance any of them between
+    // two ticks, which showed up as a second, perfectly stable digest under
+    // `--test-threads=8` and the pinned one under a single thread. A fresh process is the
+    // fixture's precondition, not a workaround, so it runs in one.
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    let _world_guard = world_guard();
+    // Self-check first: this must be the FNV-1a 128 offset basis, or the digest below is
+    // not the function it claims to be.
+    assert_eq!(
+        payload_digest(b""),
+        "6c62272e07bb014262b821756295c58d",
+        "payload_digest is not FNV-1a 128"
+    );
+    let (old_hot, old_warm) = test_region();
+    let old_drops = std::mem::take(&mut *drops().lock().unwrap());
+    let old_orbs = std::mem::take(&mut *xps().lock().unwrap());
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap());
+    let old_tick = TICK.swap(1, Ordering::Relaxed);
+    let old_index = TICK_IDX.swap(0, Ordering::Relaxed);
+    let old_time = WORLD_TIME.swap(1000, Ordering::Relaxed);
+    let old_weather = (
+        RAINING.swap(0, Ordering::Relaxed),
+        THUNDERING.swap(0, Ordering::Relaxed),
+    );
+    let old_rng = world_rng::saved_state();
+    // Exactly one forceloaded chunk, so the orbs and drops in it age through the tick
+    // while the payload stays deterministic: `save_world_into` writes the forceload set
+    // in `HashSet` iteration order, and one element has only one order.
+    let chunks: HashSet<(i32, i32)> = std::iter::once((0, 0)).collect();
+    *forceloaded().lock().unwrap() = chunks.clone();
+    set_test_region(chunks.clone(), chunks);
+
+    let run_once = || {
+        let mut orbs = Vec::new();
+        let mut items = Vec::new();
+        let counts = identity_fixture(&mut orbs, &mut items);
+        *xps().lock().unwrap() = orbs;
+        *drops().lock().unwrap() = items;
+        TICK.store(1, Ordering::Relaxed);
+        TICK_IDX.store(0, Ordering::Relaxed);
+        WORLD_TIME.store(1000, Ordering::Relaxed);
+        // Weather and the world's random stream are part of the save, so they are part
+        // of what "the same world" means: pin the stream to one seed and start dry. The
+        // digest is then also sensitive to the order and count of RNG draws.
+        RAINING.store(0, Ordering::Relaxed);
+        THUNDERING.store(0, Ordering::Relaxed);
+        world_rng::restore(0x5EED_0000_0000_1234);
+        for _ in 0..200 {
+            game_tick(|_, tick| tick());
+        }
+        let left = (
+            xps().lock().unwrap().len(),
+            drops().lock().unwrap().len(),
+        );
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        let overlay = world().lock().unwrap().len();
+        let mut state: Vec<String> = Vec::new();
+        for x in xps().lock().unwrap().iter() {
+            state.push(format!("orb {} {} {} {} {} {}", x.eid, x.x, x.y, x.z, x.val, x.age));
+        }
+        for d in drops().lock().unwrap().iter() {
+            state.push(format!("drop {} {} {} {} {} {}", d.eid, d.x, d.y, d.z, d.item, d.age));
+        }
+        (payload, left, counts, overlay, state)
+    };
+    let (first_payload, first_left, counts, first_overlay, first_state) = run_once();
+    // The digest is the oracle, so prove it is stable before trusting it.
+    let (second_payload, second_left, _, second_overlay, second_state) = run_once();
+    if first_state != second_state {
+        for (a, b) in first_state.iter().zip(second_state.iter()) {
+            eprintln!("A {a}\nB {b}");
+        }
+        eprintln!("A len {} B len {}", first_state.len(), second_state.len());
+    }
+    if first_payload != second_payload {
+        let at = first_payload
+            .iter()
+            .zip(second_payload.iter())
+            .position(|(a, b)| a != b);
+        panic!(
+            "the fixture itself is not deterministic: first difference at {at:?}, \
+             lens {} / {}, overlay {} / {}, orbs {} / {}, drops {} / {}",
+            first_payload.len(),
+            second_payload.len(),
+            first_overlay,
+            second_overlay,
+            first_left.0,
+            second_left.0,
+            first_left.1,
+            second_left.1
+        );
+    }
+    let first = payload_digest(&first_payload);
+    assert_eq!(first_left, second_left);
+    assert!(
+        first_left.0 < counts.orbs - 10,
+        "the fixture must merge orbs, {} of {} left",
+        first_left.0,
+        counts.orbs
+    );
+    assert!(
+        first_left.1 < counts.drops,
+        "the fixture must merge drops, {} of {} left",
+        first_left.1,
+        counts.drops
+    );
+    eprintln!("IDENTITY {first} orbs={} drops={}", first_left.0, first_left.1);
+
+    *drops().lock().unwrap() = old_drops;
+    *xps().lock().unwrap() = old_orbs;
+    *forceloaded().lock().unwrap() = old_forced;
+    TICK.store(old_tick, Ordering::Relaxed);
+    TICK_IDX.store(old_index, Ordering::Relaxed);
+    WORLD_TIME.store(old_time, Ordering::Relaxed);
+    RAINING.store(old_weather.0, Ordering::Relaxed);
+    THUNDERING.store(old_weather.1, Ordering::Relaxed);
+    world_rng::restore(old_rng);
+    set_test_region(old_hot, old_warm);
+    assert_eq!(first, "54d762909d3321a41cfd670c7ff0baa9");
+}
