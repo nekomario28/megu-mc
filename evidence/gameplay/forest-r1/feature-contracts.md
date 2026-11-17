@@ -63,9 +63,14 @@ missing, malformed and out-of-footprint entries fail; an already-populated
 overlap also fails at the dump boundary. No coordinates from this fixture are
 embedded in production scheduling.
 
-The legacy `MC_SPINE_POP_REGION` scan and default lazy scan remain available,
-but neither is represented as vanilla ticket scheduling. The two explicit
-configuration modes are mutually exclusive.
+The legacy `MC_SPINE_POP_REGION` lexicographic scan and an explicit
+`MC_SPINE_POP_ORDER` replay remain available. The default dispatch is no longer
+a lazy coordinate scan: it is the named member of vanilla's order discipline
+documented on `population_discipline` (level-major priority queue, serialized
+demand scan tie-break, request set + three rings). It equals no capture
+bit-for-bit, and vanilla itself does not fix the within-level order — the
+member is a rule, not a sequence, and is never represented as vanilla's
+scheduler replay. The two explicit configuration modes are mutually exclusive.
 
 ## Reproduction
 

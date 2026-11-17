@@ -136,6 +136,29 @@ explicitly, and each is a decision, not an inference:
    region scan) or a complete explicit list (`MC_SPINE_POP_ORDER`), but not a ticket set, so this
    option also needs a request-set parameter before the rule can be applied to one.
 
+### 5b. Implemented (2026-11-18): option 2 + option 1, as a named member
+
+The decision on the question above was option 2 with option 1's comparison route kept, and the
+port now carries it (`src/worldgen.rs`, `population_discipline`):
+
+* the default dispatch is the **serialized demand scan** — a level-major priority queue over the
+  request set (level 31 at the box, +1 per Chebyshev step), one FIFO bucket per level, pop the
+  lowest non-empty level, each popped demander walking its 3x3 window x-outer / z-inner and queuing
+  the chunks it newly demands inline. Its three measured shape properties hold as gates: decorated
+  set = request box + 3 rings (1 chunk -> 49, 3x3 -> 81), first block = the x-then-z 3x3 at the box's
+  min corner, pops in level order;
+* the member is named and does **not** claim bit-parity with any capture — as §2 measures, none can;
+* `MC_SPINE_POP_ORDER` is unchanged and remains the acceptance input for a named-order comparison
+  (`specs/worldgen-parity/finite-acceptance-set.md` revision 1), and `MC_SPINE_POP_REGION` keeps its
+  legacy lexicographic meaning.
+
+Measured on the merged tree (seed 4242, chunk (3,-2), 98,304 cells): with `order-A.txt` against
+Native A and `order-B.txt` against Native B, **0 diffs both** — the revision-1 acceptance row is
+unchanged. With the **default** order the honest counts are **30 cells vs Native A**
+(`diorite -> granite`, the `(3,-1)`/`(3,-2)` ore overwrite bit) and **53 vs Native B**
+(that 30 plus `andesite -> diorite`, the other bit) — non-zero by construction (§4), not a
+regression.
+
 ## What this page does not claim
 
 - It does not claim the port cannot be made to match a capture: `MC_SPINE_POP_ORDER` already

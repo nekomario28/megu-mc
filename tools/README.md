@@ -107,6 +107,7 @@ Python の fixture 段が走る（測った範囲は [tests/README.md](../tests/
 | `MC_SPINE_NOFEAT` / `_NOCARVE` / `_NOAQ` | 層を止めて帰属を分ける |
 | `MC_SPINE_FEAT_NBR=0` | 隣 chunk を decorate しない（順序の実験用） |
 | `MC_SPINE_POP_REGION=x0,z0,x1,z1` | その領域を辞書順で decorate（順序の実験用） |
+| （既定） | 名前つきの順序 — level優先キュー（level 31 + Chebyshev距離、levelの低いbucketからpop）+ 宣言済みtie-break（箱のmin cornerからx-then-z、demandの窓もx-outer/z-inner、level内FIFO）。装飾集合は要求箱+3 ring。どのcaptureともbit一致しない（vanilla自身がlevel内順序を固定しない）。**capture と比較するときは `MC_SPINE_POP_ORDER` で順序を入力する**（`specs/worldgen-parity/finite-acceptance-set.md` revision 1） |
 | `FEAT_TRACE` / `CARVE_TRACE` / `AQ_TRACE` | 1 feature / 1 chunk / 1 column の生ログ |
 | `FSEED_TRACE` / `INSQ_TRACE` / `BIOMEF_TRACE` | feature の添字集合・in_square の生座標・biome 判定 |
 | `FSEED_ARM=cx,cz,i,step` | その placed feature の**型付きドロー**（`DRAW n f=i,step nextInt(16)=…`） |

@@ -16,7 +16,7 @@ chunk状態の整合性・操作から保存再開までの完成・統合を主
 `5b0e4a2` のcheckpointでは、portの通常game_tickで生成時との差1,803セルも再現し、700 tick後に全セル0差となりました。5 tickで保存し別プロセスで695 tick実行する経路も0差です。正本は[feature contracts](../evidence/gameplay/forest-r1/feature-contracts.md)です。現在の拡張変更は別途回帰を要求します。
 
 制約:
-- source footprintだけでなく**順序も入力**。通常のlazy scanをvanilla ticket schedulerと呼ばない。
+- source footprintだけでなく**順序も入力**。既定順序は「規律の名前つきメンバー」（level優先キュー + 宣言済みtie-break、`population_discipline`）であり、vanilla ticket schedulerの再現でもcaptureの再現でもない。captureと比較する行は順序を明示入力する。
 - 属性による除外をしない。stageは実際の時計・writer・保存状態で確定する。
 - mainの#22 data migrationとの統合は保留。hosted CIはbillingで起動しておらず、ローカル結果と混同しない。
 - 全seed/biome/構造物の合格ではない。JVM identity-hashによるleaf tree-bin tieも明示した未対応境界に残る。
