@@ -33,6 +33,7 @@
 | `evidence/gameplay/**/*.javap.txt` (旧 6 files) | **削除** (§9) | — | 削除済み | Mojang クラスの逆アセンブルは再配布しない。`tools/bytecode_probe.sh <class>` が手元の jar と公式マッピングから同じ出力を作る。 |
 | `evidence/gameplay/**/*.mapping.txt`, `evidence/gameplay/light-update/mappings.txt` (旧 3 files) | **削除** (§9) | — | 削除済み | Mojang 公式マッピングの抜粋は再配布しない。`tools/bytecode_probe.sh` が利用者の手元のマッピングを読む。 |
 | `evidence/foundation/audit-snapshots/main.*.rs` (4 files) | 過去の自作 `src/main.rs` のスナップショット | (第三者物ではない) | `documented` | 同ディレクトリの README が由来と sha256 を記載。第三者由来ではなく、このリポジトリの自作コードの旧版です。`AUDIT_WIRE.md` / `SECURITY_NOTES.md` から参照されています (削除していません)。 |
+| `src/brigadier.rs` (Rust 移植、約 2,400 行) | Mojang の Brigadier 1.3.10 (MIT) のコア (StringReader / コマンド木 / dispatcher / context / suggestion / 基本引数型) を Rust に翻訳したもの。**Java のソースは同梱していない** | 記述なし (issue #51 slice 1 で追加) | `documented` (下記 §11) | 上流 `https://github.com/Mojang/brigadier` の commit `b5419b186e4882290a188d11d6e661d4f56bd8fd` (2024-08-07) を参照。MIT の著作権表示は上流 LICENSE のまま「Copyright (c) Microsoft Corporation」。NOTICE に MIT 全文と帰属を記載。参照クローンは `/home/yuu/mc-spine-local/reference/brigadier-1.3.10/` に置き、リポジトリには含めない。 |
 | `*.storyboard.png` (リポジトリ直下 6 files, `evidence/gameplay/protocol-lifecycle/spine_proto.storyboard.png`) | 図 | 記述なし | `unknown - owner to confirm` | 作成方法の記録は未確認 (自作図と思われる)。 |
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
@@ -141,6 +142,30 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 - 今回の比較が確認したのは上記3ファイルだけです。(その後の §9 の比較も参照。)
 - 再現方法 / Reproduce: `gh api -H 'Accept: application/vnd.github.raw' 'repos/Pumpkin-MC/Pumpkin/contents/assets/blocks.json?ref=b0c48b2d7688bbfa09956adf530b8bc56dcc0c56' | sha256sum` と `sha256sum assets/pblocks.json`。
 - README.md の記述 (「`assets/` は Mojang 由来」「GPL/AGPL の実装コードは取り込んでいない」) と、issue #3 の方針 (GPL のソース/アセットを取り込まない) は **コードについて** の記述です。上記のデータファイルの出所は、現在の文書だけでは確認できません。
+
+## 11. Brigadier 1.3.10 の移植 / Port of Brigadier 1.3.10
+
+issue #51 (Brigadier 互換のコマンドディスパッチャ) の slice 1 で、`src/brigadier.rs` を Mojang の
+Brigadier (MIT) から Rust に翻訳した。**上流の Java ソース・jar はこのリポジトリに含まれない**
+(参照クローンは `/home/yuu/mc-spine-local/reference/brigadier-1.3.10/` のローカルデータ)。
+Pumpkin (GPL-3.0) のコードは読んでいない・参照していない。
+
+固定した参照 / Pinned reference (2026-11-17 に確認):
+
+| 項目 | 値 |
+|---|---|
+| 上流 | `https://github.com/Mojang/brigadier` |
+| 版 | 1.21.1 が同梱する `com.mojang:brigadier:1.3.10` |
+| 上流のタグ | `1.3.10` は**存在しない** (公開タグは `1.0.15` / `1.0.17` / `1.0.18` のみ、`gradle.properties` は `majorMinor: 1.3`) |
+| 固定した commit | `b5419b186e4882290a188d11d6e661d4f56bd8fd` "Add ArgumentType.parse() overload that can accept source context" (2024-08-07) |
+| 版の一致の根拠 | 1.21.1 の server.jar (`META-INF/libraries.list`, sha1 `c8ee4136e474ac7723ca2b432ec8d1a2bc88ef7d1ec57c314ba9e33cdc83dd75`) から取り出した brigadier-1.3.10.jar の `javap com.mojang.brigadier.context.SuggestionContext` は `parent` と `startPos` のみで、2024-12 の suggestion-context 変更 (commit `24b4072`, `9ba4f13`) を含まない。`CommandDispatcher` の公開シグネチャも固定した commit と一致 |
+| LICENSE | `LICENSE` (MIT, 「Copyright (c) Microsoft Corporation. All rights reserved.」) を改変せず保持。sha256 `d25deed12d803f6c973597348627b1939e2d19bbc28fda83c93ea0cde44702da` |
+
+取得と確認の手順 / Reproduce: `git clone https://github.com/Mojang/brigadier` して
+`git checkout b5419b186e4882290a188d11d6e661d4f56bd8fd`。版の一致は 1.21.1 の server.jar から
+`META-INF/libraries/com/mojang/brigadier/1.3.10/brigadier-1.3.10.jar` を取り出し、
+`javap -p -classpath <展開先> com.mojang.brigadier.context.SuggestionContext` で確認した。
+移植部分と意図的な差異は `src/brigadier.rs` のモジュールドキュメントに列挙している。
 
 ## 4. オーナーへの質問 / Questions for the owner
 
