@@ -26808,6 +26808,9 @@ fn main() {
                 );
             }
         }
+        if std::env::var_os("MC_SPINE_DFSTATS").is_some() {
+            eprint!("{}", worldgen::df_stats());
+        }
         if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {
             worldgen::dfdump(&spec);
         }

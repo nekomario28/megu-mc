@@ -3209,6 +3209,20 @@ check "two equally old xp orbs keep the lower index" \
                 xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
   merge_tests::xp_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs
 
+check "a compiled cache node still returns its input" \
+  src/worldgen.rs '            DF::Cache(a) | DF::BlendD(a) => self.emit(*a),' \
+  '            DF::Cache(_) => {
+                self.ops.push(Op::Push(0.0));
+                self.stack_push(1);
+            }
+            DF::BlendD(a) => self.emit(*a),' \
+  worldgen::wg_tests::compiled_density_matches_interpreter_without_chunk_grids
+
+check "a compiled interpolated node reads its own grid slot" \
+  src/worldgen.rs '                let slot = id as u32;' \
+  '                let slot = id as u32 + 1;' \
+  worldgen::wg_tests::compiled_density_matches_interpreter_per_block
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

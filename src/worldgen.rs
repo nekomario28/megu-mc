@@ -737,6 +737,9 @@ pub struct GenData {
     // aquifer (vanilla NoiseBasedAquifer): DF ids + fluid states + caches
     aq: Option<Aqd>,
     world_seed: u64,
+    /// `final_density` compiled once into a flat post-order program (see
+    /// `DfProg`). `None` keeps the interpreted evaluator (`MC_SPINE_DF_INTERP`).
+    dfprog: Option<Box<DfProg>>,
 }
 pub struct Gen {
     /// The immutable inputs. `Deref` keeps every existing field name working;
@@ -899,12 +902,33 @@ fn aq_trace_at(x: i32, z: i32) -> bool {
     matches!(spec, Some((cx, cz)) if *cx == x >> 4 && *cz == z >> 4)
 }
 
-/// Diagnostics: `WG_COUNT=1` prints how many density-function nodes one chunk
-/// walks. Measured 2026-10-22: ~1.6M calls per chunk, which is where the
-/// per-chunk time goes (see evidence/foundation/performance/README.md).
+/// Diagnostics: `WG_COUNT=1` counts **interpreter** node visits
+/// (`Gen::eval_c` calls). It is not a work counter any more: with a compiled
+/// `final_density` program the per-block spine runs as instructions and is not
+/// counted, so the number covers only the corner samples that fill the
+/// `interpolated` grids plus the `Op::Call` subtrees (splines,
+/// `find_top_surface`, `old_blended_noise`, `end_islands`). Measured
+/// 2026-11-18: 1,751,278 per chunk interpreted, 387,576 with the program
+/// (see evidence/foundation/performance/README.md, "Counter semantics").
 pub(crate) static EVAL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Diagnostics: `WG_COUNT=1` also counts visits per density-function node id.
+/// Sized once per generator (see `Gen::df_hits_init`); the counters are what say
+/// *which* nodes the per-chunk time goes to, which is what a compiled evaluator
+/// has to beat.
+pub(crate) static DF_HITS: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU64>> =
+    std::sync::OnceLock::new();
+
 impl Gen {
+    /// Allocate the per-node visit counters for this generator's `dfs` (diagnostic only).
+    fn df_hits_init(&self) {
+        let _ = DF_HITS.set(
+            (0..self.dfs.len())
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        );
+    }
+
     fn df_files() -> HashMap<String, Vec<u8>> {
         Self::dp_files("density_function")
     }
@@ -1137,6 +1161,7 @@ impl Gen {
                 aq: None,
                 vein: None,
                 world_seed: seed,
+                dfprog: None,
             }),
             aq_lv: HashMap::new(),
             aq_lvo: Vec::new(),
@@ -1489,6 +1514,12 @@ impl Gen {
                     lava_st: res("minecraft:lava").unwrap_or(1),
                 });
             }
+        }
+        // Compile `final_density` once, now that the id table is final.
+        g.dfprog = DfProg::compile(&g);
+        // Diagnostic counters sized to this generator's node table (WG_COUNT only).
+        if std::env::var_os("WG_COUNT").is_some() {
+            g.df_hits_init();
         }
         Some(g)
     }
@@ -2133,6 +2164,11 @@ impl Gen {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *ON.get_or_init(|| std::env::var_os("WG_COUNT").is_some()) {
                 EVAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(hits) = DF_HITS.get() {
+                    if let Some(h) = hits.get(id) {
+                        h.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
         }
         if let Some(cc) = cc {
@@ -2158,6 +2194,9 @@ impl Gen {
     /// Terrain density at a block position, with `interpolated` resolved from the
     /// chunk's corner grids.
     pub(crate) fn block_density(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> f64 {
+        if let Some(prog) = self.dfprog.as_ref() {
+            return prog.eval(self, Some(cc), x, y, z);
+        }
         let mut memo = HashMap::new();
         self.eval_c(self.final_density, x, y, z, &mut memo, Some(cc))
     }
@@ -2453,6 +2492,696 @@ impl Gen {
                 *lower as f64
             }
         }
+    }
+}
+
+// ---------- compiled density evaluator ----------
+//
+// `final_density` is a DAG of ~300 nodes and `block_density` walks it once per
+// block: ~1.8M `eval_c` visits per chunk, ~18 per block
+// (evidence/foundation/performance/README.md). Almost all of those visits are
+// cheap arithmetic behind a full dispatch (an `EVAL_COUNT` gate, two enum
+// matches for the `interpolated`/`cache` special cases, then the `eval0_c`
+// match and a recursive call), so the cost is the per-node overhead, not the
+// arithmetic.
+//
+// The compiled form linearises the DAG once, per generator, into a post-order
+// instruction list evaluated by a stack machine: no per-node `match`, no node
+// id to index, no recursion, and constants folded into the instruction stream.
+// That is the shape the Java JIT optimises (vanilla interprets a
+// `DensityFunction` tree) and the shape hyperchunk's `df_compile.c` walks.
+//
+// What it must preserve, and why each is not "close enough":
+//
+// * **Operand order per node.** `Div` evaluates its divisor first and returns
+//   `0.0` *without* evaluating the dividend when it is zero; `Lerp` evaluates
+//   `alpha`, then `f`, then `s`. IEEE arithmetic is order-sensitive for `sub`
+//   and `div`, and the short circuit is what the interpreter does.
+// * **Laziness.** `range_choice` and `interval_select` evaluate one branch.
+//   The program therefore jumps: a flat post-order list that evaluated both
+//   sides would produce the same value here (the branches are pure) but it
+//   would no longer be a compilation of the same function, and any future
+//   impurity under a branch would silently change the world.
+// * **`interpolated`'s two behaviours.** With a chunk's corner grids it is the
+//   trilinear value of `grids[id]`; without them (corner sampling) it is its
+//   input evaluated at the position. `Op::Interp` is "trilinear if the slot is
+//   present, else run the input's program", which is the same two-branch rule.
+// * **`f32` in splines.** Spline locations, derivatives and point values are
+//   `f32` and the coordinate is cast to `f32`, so a spline is *not* a `f64`
+//   subtree. Splines stay on the interpreter (`Op::Call`) rather than being
+//   re-expressed in the compiled arithmetic - the `f32` round-trips are the
+//   whole semantics, and 0.3% of the visits do not need rewriting.
+//
+// `cache` nodes compile to their input (one instruction, no memo). The memo
+// `block_density` passes is created fresh for every block and every node
+// reachable from `final_density` is a deterministic function of
+// `(id, x, y, z, chunk columns)`, so a memo hit inside one block can only
+// return the value a re-evaluation would compute. Dropping the map removes a
+// hash lookup per cached visit and a `HashMap` insert per block; it cannot
+// change a value, and `compiled_density_matches_interpreter` holds that.
+
+/// `MC_SPINE_DF_INTERP=1` keeps `final_density` interpreted: the program is not
+/// even built, so the compiled path then costs one `None` test per block. This
+/// is the A/B arm for the performance page and the reference arm for the
+/// identity tests.
+fn df_compile_disabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MC_SPINE_DF_INTERP").is_some())
+}
+
+/// One instruction of a compiled density program.
+///
+/// Every instruction pops a fixed number of stack slots and leaves exactly one
+/// value, except `Halt` (ends the program, root value on the stack), `Drop`
+/// (used only by `Div`'s zero branch) and the jumps, whose stack effect is
+/// documented at the variant.
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    /// Push a constant. Constant subtrees are folded at compile time, so this is
+    /// also what a folded subtree becomes.
+    Push(f64),
+    Add,
+    Sub,
+    Mul,
+    Min,
+    Max,
+    /// `a / b`, popped in that order. The zero-divisor short circuit is a jump;
+    /// see `DfCompiler::emit_div`.
+    Div,
+    Neg,
+    Abs,
+    Sq,
+    Cube,
+    HNeg,
+    QNeg,
+    Squeeze,
+    Clamp {
+        lo: f64,
+        hi: f64,
+    },
+    /// `f + a * (s - f)`: pops `s`, `f`, `a` in that order.
+    Lerp,
+    /// `a + c` / `a * c` / `a.min(c)` / `a.max(c)` for a compile-time `c`: one
+    /// slot instead of a push plus a two-slot op. `+` and `*` are exact under
+    /// exchange, and `f64::min`/`max` return the non-NaN operand in either
+    /// order, so the constant may sit on either side of the node.
+    ///
+    /// These are codegen forms of *this repository's* `DF::Add`/`DF::Mul`, which
+    /// are plain arithmetic. Vanilla's codec instead builds a separate
+    /// `MulOrAdd` node when one side is a constant, and that node has no
+    /// `arg1 == 0.0` short circuit, so `mul(0.0, negative)` is `-0.0` there and
+    /// `+0.0` through `Ap2.MUL`. That distinction is not modelled here (it is
+    /// the interpreter that the fixtures pin), and an immediate operand cannot
+    /// introduce it: exchange is exact, so `0.0 * -2.0` and `-2.0 * 0.0` are the
+    /// same bits.
+    AddC(f64),
+    MulC(f64),
+    MinC(f64),
+    MaxC(f64),
+    /// `y_clamped_gradient`: `fv + t.clamp(0,1) * (tv - fv)`, `t = (y-fc)/(tc-fc)`.
+    Grad {
+        fc: f64,
+        fv: f64,
+        tc: f64,
+        tv: f64,
+    },
+    /// Pops the three scale arguments (in the interpreter's x, y, z reading
+    /// order) and samples the noise.
+    Noise {
+        ni: u32,
+        xzs: f64,
+        ys: f64,
+    },
+    ShiftA(u32),
+    ShiftB(u32),
+    /// Pops the rarity input.
+    Weird {
+        ni: u32,
+        mapper: RarityValueMapper,
+    },
+    Beardifier,
+    /// `interpolated`: if the chunk column set carries this slot's grid, push its
+    /// trilinear value and jump to `join`; otherwise fall through and run the
+    /// input's program, which ends at `join`.
+    Interp { slot: u32, join: u32 },
+    /// Evaluate a subtree with the interpreter (splines, `find_top_surface`,
+    /// `old_blended_noise`, `end_islands`). The memo handed over is empty: a
+    /// `cache` node outside this subtree needs none, and one inside it only ever
+    /// sees the single position being evaluated (see the section comment).
+    Call(u32),
+    /// Peeks at the top slot and jumps when it is outside `[mi, ma)`; otherwise
+    /// pops it. `range_choice`.
+    BranchOut { mi: f64, ma: f64, target: u32 },
+    /// Pops one value and jumps when it is `< t` (`interval_select`).
+    BranchLt { t: f64, target: u32 },
+    /// Peeks at the top slot and jumps when it is `0.0` (leaving it in place for
+    /// the zero branch to drop), else falls through with it still on top.
+    BranchZero { target: u32 },
+    Jump(u32),
+    /// Discard the top slot.
+    Drop,
+    Halt,
+}
+
+/// A compiled `final_density` program.
+#[derive(Clone)]
+struct DfProg {
+    ops: Vec<Op>,
+    /// Peak stack depth, so one scratch buffer serves the whole program.
+    slots: usize,
+}
+
+thread_local! {
+    /// Per-thread evaluation stack. `block_density` runs once per block, so the
+    /// buffer is reused rather than allocated (a fresh `Vec` per block would be
+    /// 98k allocations a chunk).
+    static DF_STACK: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl DfProg {
+    /// Compile `final_density`. `None` means "keep interpreting": either the
+    /// switch is off, or the DAG collapsed to a handful of instructions (the
+    /// Nether and End roots are a single `old_blended_noise` / `end_islands`
+    /// call), where a program would only add indirection.
+    fn compile(d: &GenData) -> Option<Box<DfProg>> {
+        if df_compile_disabled() {
+            return None;
+        }
+        Self::compile_inner(d)
+    }
+
+    /// The compiler itself, independent of `MC_SPINE_DF_INTERP`: the identity
+    /// tests ask it for a program the switch may have suppressed, so that a tree
+    /// with the A/B switch exported does not silently stop testing anything.
+    fn compile_inner(d: &GenData) -> Option<Box<DfProg>> {
+        let n = d.dfs.len();
+        let mut c = DfCompiler {
+            d,
+            ops: Vec::new(),
+            depth: 0,
+            max_depth: 0,
+            consts: vec![None; n],
+            consts_known: vec![false; n],
+        };
+        c.emit(d.final_density);
+        if c.ops.len() < 8 {
+            return None;
+        }
+        c.ops.push(Op::Halt);
+        Some(Box::new(DfProg {
+            ops: c.ops,
+            slots: c.max_depth.max(1),
+        }))
+    }
+
+    /// `block_density`'s body when a program exists.
+    fn eval(&self, g: &Gen, cc: Option<&ChunkCols>, x: i32, y: i32, z: i32) -> f64 {
+        let reuse = DF_STACK.with(|slot| {
+            let mut buf = slot.try_borrow_mut().ok()?;
+            if buf.len() < self.slots {
+                buf.resize(self.slots, 0.0);
+            }
+            let (head, _) = buf.split_at_mut(self.slots);
+            Some(self.run(g, cc, x, y, z, head))
+        });
+        match reuse {
+            Some(v) => v,
+            // Re-entered from inside a `Call` (which cannot happen today, since
+            // the interpreter never calls back into the program): pay for a local
+            // buffer rather than panicking on the borrow.
+            None => {
+                let mut local = vec![0.0; self.slots];
+                self.run(g, cc, x, y, z, &mut local)
+            }
+        }
+    }
+
+    fn run(
+        &self,
+        g: &Gen,
+        cc: Option<&ChunkCols>,
+        x: i32,
+        y: i32,
+        z: i32,
+        st: &mut [f64],
+    ) -> f64 {
+        let mut sp = 0usize;
+        let mut pc = 0usize;
+        macro_rules! bin {
+            ($e:expr) => {{
+                sp -= 1;
+                st[sp - 1] = $e;
+                pc += 1;
+            }};
+        }
+        macro_rules! un {
+            ($e:expr) => {{
+                st[sp - 1] = $e;
+                pc += 1;
+            }};
+        }
+        loop {
+            match self.ops[pc] {
+                Op::Push(v) => {
+                    st[sp] = v;
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Add => bin!(st[sp - 1] + st[sp]),
+                Op::Sub => bin!(st[sp - 1] - st[sp]),
+                Op::Mul => bin!(st[sp - 1] * st[sp]),
+                Op::Min => bin!(st[sp - 1].min(st[sp])),
+                Op::Max => bin!(st[sp - 1].max(st[sp])),
+                Op::Div => bin!(st[sp - 1] / st[sp]),
+                Op::Neg => un!(-st[sp - 1]),
+                Op::Abs => un!(st[sp - 1].abs()),
+                Op::Sq => un!(st[sp - 1] * st[sp - 1]),
+                Op::Cube => {
+                    let v = st[sp - 1];
+                    un!(v * v * v)
+                }
+                Op::HNeg => {
+                    let v = st[sp - 1];
+                    un!(if v > 0.0 { v } else { v * 0.5 })
+                }
+                Op::QNeg => {
+                    let v = st[sp - 1];
+                    un!(if v > 0.0 { v } else { v * 0.25 })
+                }
+                Op::Squeeze => {
+                    let v = st[sp - 1].clamp(-1.0, 1.0);
+                    un!(v / 2.0 - v * v * v / 24.0)
+                }
+                Op::Clamp { lo, hi } => un!(st[sp - 1].clamp(lo, hi)),
+                Op::Lerp => {
+                    let s = st[sp - 1];
+                    let f = st[sp - 2];
+                    let a = st[sp - 3];
+                    sp -= 2;
+                    st[sp - 1] = f + a * (s - f);
+                    pc += 1;
+                }
+                Op::AddC(c) => un!(st[sp - 1] + c),
+                Op::MulC(c) => un!(st[sp - 1] * c),
+                Op::MinC(c) => un!(st[sp - 1].min(c)),
+                Op::MaxC(c) => un!(st[sp - 1].max(c)),
+                Op::Grad { fc, fv, tc, tv } => {
+                    // A producer, like `Push`: it consumes nothing, so it writes at
+                    // `sp` and grows the stack. Writing it at `sp - 1` leaves every
+                    // later operand pair one slot low, which is silently right for
+                    // some programs and wrong for others.
+                    let t = ((y as f64) - fc) / (tc - fc);
+                    st[sp] = fv + t.clamp(0.0, 1.0) * (tv - fv);
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Noise { ni, xzs, ys } => {
+                    let zs = st[sp - 1];
+                    let ysv = st[sp - 2];
+                    let xs = st[sp - 3];
+                    sp -= 2;
+                    st[sp - 1] = g.noises[ni as usize].get(
+                        x as f64 * xzs + xs,
+                        y as f64 * ys + ysv,
+                        z as f64 * xzs + zs,
+                    );
+                    pc += 1;
+                }
+                Op::ShiftA(ni) => {
+                    st[sp] = g.noises[ni as usize].get(x as f64 * 0.25, 0.0, z as f64 * 0.25) * 4.0;
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::ShiftB(ni) => {
+                    st[sp] = g.noises[ni as usize].get(z as f64 * 0.25, x as f64 * 0.25, 0.0) * 4.0;
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Weird { ni, mapper } => {
+                    let rarity = mapper.rarity(st[sp - 1]);
+                    st[sp - 1] = rarity
+                        * g.noises[ni as usize]
+                            .get(x as f64 / rarity, y as f64 / rarity, z as f64 / rarity)
+                            .abs();
+                    pc += 1;
+                }
+                Op::Beardifier => {
+                    st[sp] = match cc.and_then(|cc| cc.beard.as_deref()) {
+                        Some(beard) => compute_beardifier(beard, x, y, z),
+                        None => 0.0,
+                    };
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Interp { slot, join } => match cc.and_then(|cc| cc.interp_slot(slot as usize, x, y, z)) {
+                    Some(v) => {
+                        st[sp] = v;
+                        sp += 1;
+                        pc = join as usize;
+                    }
+                    None => pc += 1,
+                },
+                Op::Call(id) => {
+                    let mut memo = HashMap::new();
+                    st[sp] = g.eval_c(id as usize, x, y, z, &mut memo, cc);
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::BranchOut { mi, ma, target } => {
+                    if st[sp - 1] >= mi && st[sp - 1] < ma {
+                        sp -= 1;
+                        pc += 1;
+                    } else {
+                        sp -= 1;
+                        pc = target as usize;
+                    }
+                }
+                Op::BranchLt { t, target } => {
+                    sp -= 1;
+                    pc = if st[sp] < t { target as usize } else { pc + 1 };
+                }
+                Op::BranchZero { target } => {
+                    pc = if st[sp - 1] == 0.0 {
+                        target as usize
+                    } else {
+                        pc + 1
+                    };
+                }
+                Op::Jump(target) => pc = target as usize,
+                Op::Drop => {
+                    sp -= 1;
+                    pc += 1;
+                }
+                Op::Halt => {
+                    // The program leaves exactly one value. Compile-time depth and
+                    // runtime depth disagreeing is how a producer written as an
+                    // in-place update hid until a value identity test ran a branch
+                    // it never took.
+                    debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
+                    return st[0];
+                }
+            }
+        }
+    }
+}
+
+struct DfCompiler<'a> {
+    d: &'a GenData,
+    ops: Vec<Op>,
+    /// Compile-time stack depth: every `emit` leaves exactly one value.
+    depth: usize,
+    max_depth: usize,
+    /// Folded constant per node id, filled on demand (`consts_known`).
+    consts: Vec<Option<f64>>,
+    consts_known: Vec<bool>,
+}
+
+impl<'a> DfCompiler<'a> {
+    /// The node's value when it does not depend on the position at all. Anything
+    /// that reads `x`/`y`/`z`, a noise, a spline, a chunk grid or the Beardifier
+    /// is not a constant.
+    fn const_value(&mut self, id: usize) -> Option<f64> {
+        if self.consts_known[id] {
+            return self.consts[id];
+        }
+        let node = &self.d.dfs[id];
+        let v = match node {
+            DF::C(v) => Some(*v),
+            DF::Zero => Some(0.0),
+            DF::Add(a, b) => match (self.const_value(*a), self.const_value(*b)) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            },
+            DF::Sub(a, b) => match (self.const_value(*a), self.const_value(*b)) {
+                (Some(a), Some(b)) => Some(a - b),
+                _ => None,
+            },
+            DF::Mul(a, b) => match (self.const_value(*a), self.const_value(*b)) {
+                (Some(a), Some(b)) => Some(a * b),
+                _ => None,
+            },
+            DF::Min(a, b) => match (self.const_value(*a), self.const_value(*b)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                _ => None,
+            },
+            DF::Max(a, b) => match (self.const_value(*a), self.const_value(*b)) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            },
+            DF::Div(a, b) => match self.const_value(*b) {
+                Some(b) if b == 0.0 => Some(0.0),
+                Some(b) => self.const_value(*a).map(|a| a / b),
+                None => None,
+            },
+            DF::Neg(a) => self.const_value(*a).map(|v| -v),
+            DF::Abs(a) => self.const_value(*a).map(|v| v.abs()),
+            DF::Sq(a) => self.const_value(*a).map(|v| v * v),
+            DF::Cube(a) => self.const_value(*a).map(|v| v * v * v),
+            DF::HNeg(a) => self.const_value(*a).map(|v| if v > 0.0 { v } else { v * 0.5 }),
+            DF::QNeg(a) => self.const_value(*a).map(|v| if v > 0.0 { v } else { v * 0.25 }),
+            DF::Squeeze(a) => self.const_value(*a).map(|v| {
+                let v = v.clamp(-1.0, 1.0);
+                v / 2.0 - v * v * v / 24.0
+            }),
+            DF::Clamp { i, lo, hi } => self.const_value(*i).map(|v| v.clamp(*lo, *hi)),
+            DF::Lerp { a, f, s } => match (
+                self.const_value(*a),
+                self.const_value(*f),
+                self.const_value(*s),
+            ) {
+                (Some(a), Some(f), Some(s)) => Some(f + a * (s - f)),
+                _ => None,
+            },
+            DF::Cache(a) | DF::BlendD(a) => self.const_value(*a),
+            _ => None,
+        };
+        self.consts[id] = v;
+        self.consts_known[id] = true;
+        v
+    }
+
+    /// Emit one node. On entry the stack holds `depth` values; on exit it holds
+    /// `depth + 1` with the node's value on top.
+    fn emit(&mut self, id: usize) {
+        if let Some(v) = self.const_value(id) {
+            self.ops.push(Op::Push(v));
+            self.stack_push(1);
+            return;
+        }
+        let node = &self.d.dfs[id];
+        match node {
+            DF::Add(a, b) => self.bin_op(*a, *b, Op::Add),
+            DF::Sub(a, b) => self.bin_op(*a, *b, Op::Sub),
+            DF::Mul(a, b) => self.bin_op(*a, *b, Op::Mul),
+            DF::Min(a, b) => self.bin_op(*a, *b, Op::Min),
+            DF::Max(a, b) => self.bin_op(*a, *b, Op::Max),
+            DF::Div(a, b) => self.emit_div(*a, *b),
+            DF::Neg(a) => self.un_op(*a, Op::Neg),
+            DF::Abs(a) => self.un_op(*a, Op::Abs),
+            DF::Sq(a) => self.un_op(*a, Op::Sq),
+            DF::Cube(a) => self.un_op(*a, Op::Cube),
+            DF::HNeg(a) => self.un_op(*a, Op::HNeg),
+            DF::QNeg(a) => self.un_op(*a, Op::QNeg),
+            DF::Squeeze(a) => self.un_op(*a, Op::Squeeze),
+            DF::Clamp { i, lo, hi } => self.un_op(*i, Op::Clamp { lo: *lo, hi: *hi }),
+            DF::Lerp { a, f, s } => {
+                self.emit(*a);
+                self.emit(*f);
+                self.emit(*s);
+                self.stack_pop(2);
+                self.ops.push(Op::Lerp);
+            }
+            DF::Grad { fc, fv, tc, tv } => {
+                self.ops.push(Op::Grad {
+                    fc: *fc,
+                    fv: *fv,
+                    tc: *tc,
+                    tv: *tv,
+                });
+                self.stack_push(1);
+            }
+            // A cache node's memo lives exactly one block (see the section
+            // comment), so it compiles to its input.
+            DF::Cache(a) | DF::BlendD(a) => self.emit(*a),
+            DF::Interp(inner) => {
+                let slot = id as u32;
+                let at = self.ops.len();
+                self.ops.push(Op::Interp { slot, join: 0 });
+                self.emit(*inner);
+                let join = self.ops.len() as u32;
+                self.ops[at] = Op::Interp { slot, join };
+            }
+            DF::Noise {
+                ni,
+                sx,
+                sy,
+                sz,
+                xzs,
+                ys,
+            } => {
+                self.emit(*sx);
+                self.emit(*sy);
+                self.emit(*sz);
+                self.stack_pop(2);
+                self.ops.push(Op::Noise {
+                    ni: *ni as u32,
+                    xzs: *xzs,
+                    ys: *ys,
+                });
+            }
+            DF::ShiftA(ni) => {
+                self.ops.push(Op::ShiftA(*ni as u32));
+                self.stack_push(1);
+            }
+            DF::ShiftB(ni) => {
+                self.ops.push(Op::ShiftB(*ni as u32));
+                self.stack_push(1);
+            }
+            DF::WeirdScaledSampler { input, ni, mapper } => {
+                self.emit(*input);
+                self.ops.push(Op::Weird {
+                    ni: *ni as u32,
+                    mapper: *mapper,
+                });
+            }
+            DF::Beardifier => {
+                self.ops.push(Op::Beardifier);
+                self.stack_push(1);
+            }
+            DF::RangeChoice { i, mi, ma, wr, wo } => {
+                self.emit(*i);
+                self.stack_pop(1);
+                let at = self.ops.len();
+                self.ops.push(Op::BranchOut {
+                    mi: *mi,
+                    ma: *ma,
+                    target: 0,
+                });
+                self.emit(*wr);
+                let to_end = self.ops.len();
+                self.ops.push(Op::Jump(0));
+                let out_of_range = self.ops.len() as u32;
+                self.ops[at] = Op::BranchOut {
+                    mi: *mi,
+                    ma: *ma,
+                    target: out_of_range,
+                };
+                self.emit(*wo);
+                let end = self.ops.len() as u32;
+                self.ops[to_end] = Op::Jump(end);
+            }
+            DF::IntervalSelect { i, th, fns } => self.emit_interval_select(*i, th, fns),
+            // Cold or non-f64 subtrees (see the section comment): keep the
+            // interpreter for them.
+            DF::Spline(_) | DF::FindTopSurface { .. } | DF::Blended(_) | DF::EndIslands(_) => {
+                self.ops.push(Op::Call(id as u32));
+                self.stack_push(1);
+            }
+            // Everything else was constant-folded above, `C`/`Zero` included.
+            DF::C(_) | DF::Zero => unreachable!("constant node missed by const_value"),
+        }
+    }
+
+    fn emit_interval_select(&mut self, i: usize, th: &[f64], fns: &[usize]) {
+        // The interpreter's rule: `pick` is the first `k` with `v < th[k]`,
+        // otherwise `fns.len() - 1`, then clamped to `fns.len() - 1`. That needs
+        // at least one bucket and more buckets than thresholds; anything else
+        // falls back to the interpreter rather than inventing a shape.
+        if fns.is_empty() || th.is_empty() || th.len() >= fns.len() {
+            self.ops.push(Op::Call(i as u32));
+            self.stack_push(1);
+            return;
+        }
+        self.emit(i);
+        self.stack_pop(1);
+        let mut tests = Vec::with_capacity(th.len());
+        for _ in 0..th.len() {
+            tests.push(self.ops.len());
+            self.ops.push(Op::BranchLt { t: 0.0, target: 0 });
+        }
+        let miss = self.ops.len();
+        self.ops.push(Op::Jump(0));
+        let mut ends = Vec::with_capacity(th.len());
+        for (k, fn_id) in fns.iter().enumerate().take(th.len()) {
+            let at = self.ops.len() as u32;
+            self.ops[tests[k]] = Op::BranchLt { t: th[k], target: at };
+            self.emit(*fn_id);
+            ends.push(self.ops.len());
+            self.ops.push(Op::Jump(0));
+        }
+        let last = fns.len() - 1;
+        self.ops[miss] = Op::Jump(self.ops.len() as u32);
+        self.emit(fns[last]);
+        let end = self.ops.len() as u32;
+        for e in ends {
+            self.ops[e] = Op::Jump(end);
+        }
+    }
+
+    fn emit_div(&mut self, a: usize, b: usize) {
+        // `Div` evaluates the divisor first and returns 0.0 without evaluating
+        // the dividend when it is zero.
+        self.emit(b);
+        let at = self.ops.len();
+        self.ops.push(Op::BranchZero { target: 0 });
+        self.emit(a);
+        self.stack_pop(1);
+        self.ops.push(Op::Div);
+        let to_end = self.ops.len();
+        self.ops.push(Op::Jump(0));
+        let zero = self.ops.len() as u32;
+        self.ops[at] = Op::BranchZero { target: zero };
+        self.ops.push(Op::Drop);
+        self.ops.push(Op::Push(0.0));
+        let end = self.ops.len() as u32;
+        self.ops[to_end] = Op::Jump(end);
+    }
+
+    fn bin_op(&mut self, a: usize, b: usize, op: Op) {
+        // A constant operand becomes an immediate form for the four ops where
+        // that is exact (see `Op::AddC`); the rest keep a plain `Push`.
+        let imm = matches!(op, Op::Add | Op::Mul | Op::Min | Op::Max);
+        if imm {
+            let (dyn_id, c) = match (self.const_value(a), self.const_value(b)) {
+                (Some(c), None) => (b, c),
+                (None, Some(c)) => (a, c),
+                _ => {
+                    self.emit(a);
+                    self.emit(b);
+                    self.stack_pop(1);
+                    self.ops.push(op);
+                    return;
+                }
+            };
+            self.emit(dyn_id);
+            self.ops.push(match op {
+                Op::Add => Op::AddC(c),
+                Op::Mul => Op::MulC(c),
+                Op::Min => Op::MinC(c),
+                _ => Op::MaxC(c),
+            });
+            return;
+        }
+        self.emit(a);
+        self.emit(b);
+        self.stack_pop(1);
+        self.ops.push(op);
+    }
+
+    fn un_op(&mut self, a: usize, op: Op) {
+        self.emit(a);
+        self.ops.push(op);
+    }
+
+    fn stack_push(&mut self, n: usize) {
+        self.depth += n;
+        if self.depth > self.max_depth {
+            self.max_depth = self.depth;
+        }
+    }
+
+    fn stack_pop(&mut self, n: usize) {
+        self.depth -= n;
     }
 }
 
@@ -4422,7 +5151,14 @@ impl ChunkCols {
     /// `None` when that node has no grid (not reachable from final_density).
     #[inline]
     fn interp(&self, id: usize, x: i32, y: i32, z: i32) -> Option<f64> {
-        let cells = self.grids.get(id)?.as_deref()?;
+        self.interp_slot(id, x, y, z)
+    }
+
+    /// The same lookup addressed by the grid slot the compiled `Op::Interp`
+    /// carries (a slot is a density-function id; see `interp_ids`), so the
+    /// compiled and interpreted paths share one `trilinear` call.
+    fn interp_slot(&self, slot: usize, x: i32, y: i32, z: i32) -> Option<f64> {
+        let cells = self.grids.get(slot)?.as_deref()?;
         Some(trilinear(cells, self, x, y, z))
     }
 }
@@ -4480,6 +5216,109 @@ pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
     let files = Gen::df_files();
     let id = g.resolve_ref(&files, name)?;
     Some(g.eval(id, x, y, z, &mut m))
+}
+
+/// Diagnostics: `WG_COUNT=1 MC_SPINE_DFSTATS=1` prints where the density-node
+/// visits went (per kind and per node), so an evaluator change can be attributed.
+pub fn df_stats() -> String {
+    let hits = match DF_HITS.get() {
+        Some(h) => h,
+        None => return String::new(),
+    };
+    let g = gen_lock();
+    let g = match g.as_ref() {
+        Some(g) => g,
+        None => return String::new(),
+    };
+    let mut per_kind: HashMap<&'static str, u64> = HashMap::new();
+    let mut rows: Vec<(u64, usize, &'static str)> = Vec::new();
+    let mut total = 0u64;
+    for (id, c) in hits.iter().enumerate() {
+        let n = c.load(std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        total += n;
+        let k = df_kind(&g.dfs[id]);
+        *per_kind.entry(k).or_insert(0) += n;
+        rows.push((n, id, k));
+    }
+    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[dfstats] nodes={} reachable_visited={} visits={total}\n",
+        g.dfs.len(),
+        rows.len()
+    ));
+    let mut kinds: Vec<_> = per_kind.into_iter().collect();
+    kinds.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    for (k, n) in kinds {
+        out.push_str(&format!(
+            "[dfstats] kind {k:<20} {n:>12} ({:.1}%)\n",
+            100.0 * n as f64 / total.max(1) as f64
+        ));
+    }
+    for (n, id, k) in rows.iter().take(24) {
+        out.push_str(&format!(
+            "[dfstats]   id={id:<6} {k:<20} {n:>12} ({:.1}%) {}\n",
+            100.0 * *n as f64 / total.max(1) as f64,
+            df_detail(&g.dfs[*id])
+        ));
+    }
+    out
+}
+
+fn df_kind(d: &DF) -> &'static str {
+    match d {
+        DF::C(_) => "constant",
+        DF::EndIslands(_) => "end_islands",
+        DF::Zero => "zero",
+        DF::Beardifier => "beardifier",
+        DF::Add(..) => "add",
+        DF::Sub(..) => "sub",
+        DF::Mul(..) => "mul",
+        DF::Min(..) => "min",
+        DF::Max(..) => "max",
+        DF::Div(..) => "div",
+        DF::Neg(_) => "neg",
+        DF::Abs(_) => "abs",
+        DF::Sq(_) => "square",
+        DF::Cube(_) => "cube",
+        DF::HNeg(_) => "half_negative",
+        DF::QNeg(_) => "quarter_negative",
+        DF::Squeeze(_) => "squeeze",
+        DF::Clamp { .. } => "clamp",
+        DF::Lerp { .. } => "lerp",
+        DF::Grad { .. } => "y_gradient",
+        DF::Cache(_) => "cache",
+        DF::Interp(_) => "interpolated",
+        DF::Noise { .. } => "noise",
+        DF::ShiftA(_) => "shift_a",
+        DF::ShiftB(_) => "shift_b",
+        DF::WeirdScaledSampler { .. } => "weird_sampler",
+        DF::RangeChoice { .. } => "range_choice",
+        DF::IntervalSelect { .. } => "interval_select",
+        DF::Spline(_) => "spline",
+        DF::Blended(_) => "old_blended_noise",
+        DF::BlendD(_) => "blend_density",
+        DF::FindTopSurface { .. } => "find_top_surface",
+    }
+}
+
+fn df_detail(d: &DF) -> String {
+    match d {
+        DF::C(v) => format!("{v}"),
+        DF::Noise { ni, xzs, ys, .. } => format!("ni={ni} xzs={xzs} ys={ys}"),
+        DF::Spline(s) => format!("coord={} pts={}", s.coord, s.pts.len()),
+        DF::Cache(a) | DF::Interp(a) | DF::BlendD(a) => format!("arg={a}"),
+        DF::Add(a, b) | DF::Sub(a, b) | DF::Mul(a, b) | DF::Min(a, b) | DF::Max(a, b) | DF::Div(a, b) => {
+            format!("{a},{b}")
+        }
+        DF::Clamp { i, lo, hi } => format!("{i} [{lo},{hi}]"),
+        DF::Grad { fc, fv, tc, tv } => format!("y {fc}->{tc} {fv}->{tv}"),
+        DF::RangeChoice { i, mi, ma, wr, wo } => format!("{i} [{mi},{ma}) wr={wr} wo={wo}"),
+        _ => String::new(),
+    }
 }
 
 pub fn sea_level() -> i32 {
@@ -6337,6 +7176,113 @@ mod wg_tests {
         assert_eq!(
             classify_surface_cell(0.01, Some(0), true, false),
             SurfaceCell::Solid
+        );
+    }
+
+    // ---- compiled density evaluator ----
+
+    /// Presets to compare on, and the seeds; the overworld is the one that
+    /// compiles to a real program, the other two prove the compiler either
+    /// matches there too or declines.
+    const COMPILE_CASES: [(NoisePreset, u64); 4] = [
+        (NoisePreset::Overworld, 0),
+        (NoisePreset::Overworld, 4242),
+        (NoisePreset::Nether, 4242),
+        (NoisePreset::End, 0),
+    ];
+
+    /// The compiled `final_density` program must reproduce the interpreter's
+    /// value **bit for bit**. Density is compared against `> 0.0` and feeds the
+    /// trilinear cell grid, so a last-bit difference is a different block
+    /// somewhere in the world; "close" is not a property this change may have.
+    ///
+    /// The reference is the interpreter, which is the evaluator the fixtures pin
+    /// against vanilla (`tests/data/dimension_terrain_1211`, the seed-0
+    /// overworld gate). This test holds the two evaluators together; whether it
+    /// can fail at all is `tools/mutation_check.sh`'s business, not this test's.
+    #[test]
+    fn compiled_density_matches_interpreter_per_block() {
+        let _guard = lock_gen();
+        let mut compared = 0usize;
+        for (preset, seed) in COMPILE_CASES {
+            let mut g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            let Some(prog) = DfProg::compile_inner(&g) else {
+                // Declined: the DAG is a single call (`old_blended_noise` /
+                // `end_islands` root), so there is no program to compare. The
+                // interpreter is still the only evaluator there, which is why
+                // this is allowed rather than a failure.
+                continue;
+            };
+            for (cx, cz) in [(0, 0), (3, -2), (-1, -1)] {
+                let cc = g.cols(cx, cz).unwrap();
+                let cc = cc.as_ref();
+                let mut y = g.min_y;
+                while y < g.min_y + g.height {
+                    for lz in 0..16 {
+                        for lx in 0..16 {
+                            let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                            let mut memo = HashMap::new();
+                            let want =
+                                g.eval_c(g.final_density, x, y, z, &mut memo, Some(cc));
+                            let got = prog.eval(&g, Some(cc), x, y, z);
+                            assert_eq!(
+                                want.to_bits(),
+                                got.to_bits(),
+                                "{preset:?} seed {seed} at {x},{y},{z}: interpreter {want:?} program {got:?}"
+                            );
+                            compared += 1;
+                        }
+                    }
+                    y += 7;
+                }
+            }
+        }
+        assert!(
+            compared > 40_000,
+            "only {compared} positions were compared; the comparison loop did not run"
+        );
+    }
+
+    /// The same identity without a chunk's cell grids, which is the corner
+    /// sampling the grid fill does: an `interpolated` node must fall through to
+    /// its input, and the Beardifier marker must be the zero vanilla evaluates
+    /// when there is no chunk to wrap.
+    #[test]
+    fn compiled_density_matches_interpreter_without_chunk_grids() {
+        let _guard = lock_gen();
+        let mut compared = 0usize;
+        let mut compiled = 0usize;
+        for (preset, seed) in COMPILE_CASES {
+            let g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            let Some(prog) = DfProg::compile_inner(&g) else {
+                continue;
+            };
+            compiled += 1;
+            for x in [-17, -1, 0, 7, 15, 16, 31] {
+                for z in [-5, 0, 9] {
+                    let mut y = g.min_y;
+                    while y < g.min_y + g.height {
+                        let mut memo = HashMap::new();
+                        let want = g.eval_c(g.final_density, x, y, z, &mut memo, None);
+                        let got = prog.eval(&g, None, x, y, z);
+                        assert_eq!(
+                            want.to_bits(),
+                            got.to_bits(),
+                            "{preset:?} seed {seed} at {x},{y},{z} without columns"
+                        );
+                        compared += 1;
+                        y += 3;
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 3_000,
+            "only {compared} positions were compared; the comparison loop did not run"
+        );
+        assert_eq!(
+            compiled, 4,
+            "every preset must compile here, or this test stops covering the compiler"
         );
     }
 
