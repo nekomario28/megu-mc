@@ -6801,8 +6801,8 @@ fn live_heightmap_types_differ_on_leaves() {
 
 // ---- pinned per-state facts --------------------------------------------------------------
 //
-// `assets/block_state_facts_1211.bin` records ten `BlockBehaviour.BlockStateBase` answers for all
-// 26,684 states, exported by `tools/block_state_facts_from_jar.py` from the pinned server jar.
+// `assets/block_state_facts_1211.bin` records eleven `BlockBehaviour.BlockStateBase` answers for
+// all 26,684 states, exported by `tools/block_state_facts_from_jar.py` from the pinned server jar.
 // Before it, the physical predicates were composed from two other assets: the same values, as it
 // turns out, but the *questions* were being re-derived at each call site (`is_solid && side_solid`
 // for a face, "has a collision list" for a collision shape), and that is where they drifted.
@@ -6819,7 +6819,7 @@ fn pinned_fact_tables_agree_with_the_older_oracle_assets() {
     let reg = breg().expect("registry");
     let states = reg.state_count();
     let facts = include_bytes!("../assets/block_state_facts_1211.bin");
-    assert_eq!(facts.len(), states * 5, "one five-byte record per state");
+    assert_eq!(facts.len(), states * 6, "one six-byte record per state");
     let predicates = include_bytes!("../assets/block_predicates_1211.bin");
     let collision_full = include_bytes!("../assets/collision_shape_full_1211.bin");
     let mineshaft = include_bytes!("../assets/mineshaft_support_1211.bin");
@@ -7332,4 +7332,301 @@ fn cocoa_binds_its_four_probability_draws_to_north_east_south_west() {
             "the cocoa at {p:?} must be written"
         );
     }
+}
+
+// ---- the `hasPostProcess` contract -------------------------------------------------------
+//
+// 1.21.1's `LevelChunk.postProcessGeneration` is fed by `ProtoChunk.markPosForPostprocessing`,
+// and one of its two `WorldGenRegion` mark sources is `setBlock`'s `hasPostProcess` gate. That
+// gate is constant true for exactly three blocks (`brown_mushroom`, `red_mushroom`,
+// `magma_block`), all of whose shapes depend on something the `FEATURES` stage has not computed
+// yet - the *lit* engine - so the cell is re-derived at promotion instead of at write time.
+//
+// The port's two halves live in `FC::set` (mark at write) and `feature::promote_full_chunks`
+// (consume at promotion, with the light sample). The tests below pin each half, the boundary
+// between them (no mark out, no second pass), and the oracle column behind the three names.
+
+/// A `Gen` whose whole 3x3 has reached `FULL` in the port's status table (`pop_done`), which is
+/// the condition `ChunkMap.protoChunkToFullChunk` asks for before promoting a chunk.
+fn mark_3x3_full(g: &mut Gen, cx: i32, cz: i32) {
+    g.populate_in_order(
+        (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (cx + dx, cz + dz))),
+        |_, _, _| {},
+    );
+}
+
+/// The oracle column and the native set, checked from both ends: a scan of every state must name
+/// exactly the three blocks, and a block nobody would guess from a name pattern (`magma_block` is
+/// not a plant, `oak_leaves` is a full-ish block that is not in the set) must answer false.
+#[test]
+fn has_post_process_is_the_native_three_states_and_no_others() {
+    let reg = breg().expect("block registry");
+    let mut hits: Vec<&str> = Vec::new();
+    for st in 0..reg.state_count() as u32 {
+        if reg.has_post_process(st) {
+            hits.push(reg.name_of(st));
+        }
+    }
+    assert_eq!(
+        hits,
+        vec![
+            "minecraft:brown_mushroom",
+            "minecraft:red_mushroom",
+            "minecraft:magma_block"
+        ],
+        "the exported column must be exactly Blocks.<clinit>'s three setter sites"
+    );
+    for name in [
+        "minecraft:oak_leaves",
+        "minecraft:oak_sapling",
+        "minecraft:crimson_fungus",
+        "minecraft:netherrack",
+        "minecraft:stone",
+        "minecraft:torch",
+        "minecraft:oak_fence",
+        "minecraft:glowstone",
+        "minecraft:air",
+    ] {
+        let st = reg.state_of(name, None);
+        assert!(!reg.has_post_process(st), "{name} must not be in the set");
+    }
+}
+
+/// The mark side: a write whose state answers `hasPostProcess` files the cell on the chunk that
+/// owns it, and nothing else does. On unmodified `39edf3c` this is the failing half - `shape_marks`
+/// only ever carried `StructurePiece.placeBlock` positions, so the assertion sees an empty list.
+#[test]
+fn a_written_post_process_state_files_a_mark_on_the_owning_chunk() {
+    let reg = breg().expect("block registry");
+    let mut g = Gen::load_preset(0, crate::name_to_state, crate::worldgen::NoisePreset::Nether)
+        .expect("nether preset");
+    let mut ctx = context(&mut g);
+    // `WorldGenRegion.setBlock` exists only inside a FEATURES pass; `pop_active` is that window.
+    ctx.g.pop_active = Some((0, 0));
+    let y = 200;
+    let mushroom = reg.state_of("minecraft:brown_mushroom", None);
+    ctx.set(3, y, 3, mushroom);
+    assert_eq!(
+        ctx.shape_marks,
+        vec![(3, y, 3)],
+        "a hasPostProcess state must be marked where it was written"
+    );
+    // The mark belongs to the chunk that owns the cell, not to the one being generated.
+    ctx.shape_marks.clear();
+    ctx.set(17, y, -1, reg.state_of("minecraft:red_mushroom", None));
+    let mark = ctx.shape_marks[0];
+    assert_eq!(
+        (mark.0 >> 4, mark.2 >> 4),
+        (1, -1),
+        "the mark is filed on the owning chunk"
+    );
+    // Control: every state outside the three writes without a mark.
+    for name in [
+        "minecraft:oak_leaves",
+        "minecraft:netherrack",
+        "minecraft:oak_fence",
+        "minecraft:stone",
+        "minecraft:glowstone",
+    ] {
+        ctx.shape_marks.clear();
+        ctx.set(0, y, 0, reg.state_of(name, None));
+        assert!(ctx.shape_marks.is_empty(), "{name} must not be marked");
+    }
+    // And outside the window there is no `WorldGenRegion` to mark from.
+    ctx.shape_marks.clear();
+    ctx.g.pop_active = None;
+    ctx.set(0, y, 0, mushroom);
+    assert!(
+        ctx.shape_marks.is_empty(),
+        "a write outside a FEATURES pass is not a region write"
+    );
+}
+
+/// The consumption side, end to end through the promotion boundary: a mushroom the feature layer
+/// wrote is air after the chunk is promoted when a light source inside the same 3x3 reaches it
+/// with `rawBrightness >= 13`, and it is kept when the same cell is dark. The write itself is the
+/// same write in both arms - only the light differs - which is the point of the contract.
+#[test]
+fn promotion_removes_a_mushroom_the_lit_engine_reaches() {
+    for (fire_distance, expected_air) in [(2i32, true), (3, false)] {
+        let reg = breg().expect("block registry");
+        let mut g = Gen::load_preset(0, crate::name_to_state, crate::worldgen::NoisePreset::Nether)
+            .expect("nether preset");
+        mark_3x3_full(&mut g, 0, 0);
+        let mut ctx = context(&mut g);
+        ctx.test_default_air = true;
+        // The shape rule re-derives the marked cell from its six neighbours and its support, so
+        // the test scene states what the feature layer would have left: netherrack under the
+        // mushroom, a `fire` two (or three) cells east. `patch_fire` runs before the mushroom
+        // patches in this dimension, which is why the write order is fire first.
+        let y = 40;
+        let netherrack = reg.state_of("minecraft:netherrack", None);
+        let fire = reg.state_of("minecraft:fire", None);
+        let mushroom = reg.state_of("minecraft:red_mushroom", None);
+        ctx.g.pop_active = Some((0, 0));
+        ctx.set(fire_distance, y, 0, fire);
+        ctx.set(0, y - 1, 0, netherrack);
+        ctx.set(0, y, 0, mushroom);
+        assert!(
+            ctx.shape_marks.contains(&(0, y, 0)),
+            "the mushroom write is marked"
+        );
+        assert!(
+            !ctx.shape_marks.contains(&(fire_distance, y, 0)),
+            "fire is not in the hasPostProcess set"
+        );
+        // `rawBrightness`: the flood starts at the fire's emission (15) and subtracts
+        // `max(1, lightBlock)` per entered cell, so distance 2 reads 13 and distance 3 reads 12.
+        super::promote_full_chunks(&mut ctx, 0, 0);
+        let after = ctx.get(0, y, 0);
+        assert_eq!(
+            after == reg.state_of("minecraft:air", None),
+            expected_air,
+            "fire at distance {fire_distance}: expected {}",
+            if expected_air { "air" } else { "kept" }
+        );
+        if !expected_air {
+            assert_eq!(after, mushroom, "the mushroom keeps its own state");
+        }
+    }
+}
+
+/// The same boundary over a `magma_block` (the third block of the set): its mark is consumed and
+/// `MagmaBlock.updateShape` returns the state unchanged for a water neighbour - it only schedules
+/// a water tick - so the pass rewrites nothing. This is the arm that would go green if someone
+/// turned the light read into a `canSurvive` for every marked state.
+#[test]
+fn promotion_consumes_a_magma_mark_without_moving_it() {
+    let reg = breg().expect("block registry");
+    let mut g = Gen::load_preset(0, crate::name_to_state, crate::worldgen::NoisePreset::Nether)
+        .expect("nether preset");
+    mark_3x3_full(&mut g, 0, 0);
+    let mut ctx = context(&mut g);
+    ctx.test_default_air = true;
+    let y = 40;
+    let magma = reg.state_of("minecraft:magma_block", None);
+    ctx.g.pop_active = Some((0, 0));
+    ctx.set(0, y, 0, magma);
+    ctx.set(0, y + 1, 0, reg.state_of("minecraft:water", None));
+    assert_eq!(ctx.shape_marks, vec![(0, y, 0)]);
+    super::promote_full_chunks(&mut ctx, 0, 0);
+    assert_eq!(ctx.get(0, y, 0), magma, "MagmaBlock.updateShape moves nothing");
+    assert!(
+        ctx.g.take_shape_marks(0, 0).is_empty(),
+        "the mark was consumed, not left for a later pass"
+    );
+}
+
+/// The light sample is taken once, from the state at promotion, and only inside the pass.
+///
+/// `postProcessGeneration` writes with flags `20` (`UPDATE_INVISIBLE | UPDATE_KNOWN_SHAPE`), which
+/// carries no light update, so a mark the pass rewrites must not change the brightness a later
+/// mark of the same chunk reads. Without that, the answer for a cell would depend on mark order.
+#[test]
+fn the_promotion_light_sample_is_taken_once_and_only_inside_the_pass() {
+    let reg = breg().expect("block registry");
+    let mut g = Gen::load_preset(0, crate::name_to_state, crate::worldgen::NoisePreset::Nether)
+        .expect("nether preset");
+    let mut ctx = context(&mut g);
+    ctx.test_default_air = true;
+    let y = 40;
+    ctx.g.pop_active = Some((0, 0));
+    let fire = reg.state_of("minecraft:fire", None);
+    let mushroom = reg.state_of("minecraft:red_mushroom", None);
+    ctx.set(2, y, 0, fire);
+    ctx.set(0, y, 0, mushroom);
+
+    assert_eq!(
+        ctx.raw_brightness(0, y, 0),
+        None,
+        "outside the boundary there is no lit engine to read"
+    );
+    let marks = [(0, y, 0)];
+    ctx.begin_promotion_pass(0, 0, &marks);
+    assert_eq!(
+        ctx.raw_brightness(0, y, 0),
+        Some(13),
+        "15 - two steps, each subtracting max(1, lightBlock)"
+    );
+    // Removing the source after the sample must not move the answer: the sample is the state at
+    // promotion, and the pass does not relight.
+    ctx.set(2, y, 0, reg.state_of("minecraft:air", None));
+    assert_eq!(ctx.raw_brightness(0, y, 0), Some(13), "sampled once");
+    // A cell outside the flood's reach reads 0, not "unknown".
+    assert_eq!(
+        ctx.raw_brightness(0, y, 20),
+        Some(0),
+        "more than 15 steps from every source"
+    );
+    ctx.end_promotion_pass();
+    assert_eq!(ctx.raw_brightness(0, y, 0), None, "the sample dies with the pass");
+}
+
+/// The boundary is a single pass: it consumes the marks once, it files nothing itself, and a
+/// second call over the same chunk rewrites nothing. This is the "no marks leaking to runtime, no
+/// double-processing" half of the contract, and it is what `pop_active = None` inside
+/// `promote_full_chunks` buys - a write from the pass is a `LevelChunk` write.
+#[test]
+fn the_promotion_boundary_files_no_mark_and_consumes_its_marks_once() {
+    let reg = breg().expect("block registry");
+    let mut g = Gen::load_preset(0, crate::name_to_state, crate::worldgen::NoisePreset::Nether)
+        .expect("nether preset");
+    mark_3x3_full(&mut g, 0, 0);
+    let mut ctx = context(&mut g);
+    ctx.test_default_air = true;
+    let y = 40;
+    let mushroom = reg.state_of("minecraft:red_mushroom", None);
+    let fire = reg.state_of("minecraft:fire", None);
+    let netherrack = reg.state_of("minecraft:netherrack", None);
+    ctx.g.pop_active = Some((0, 0));
+    ctx.set(2, y, 0, fire);
+    ctx.set(0, y - 1, 0, netherrack);
+    ctx.set(0, y, 0, mushroom);
+    ctx.set(0, y - 1, 4, netherrack);
+    ctx.set(0, y, 4, mushroom);
+
+    super::promote_full_chunks(&mut ctx, 0, 0);
+    assert_eq!(
+        ctx.get(0, y, 0),
+        reg.state_of("minecraft:air", None),
+        "the lit mushroom is removed"
+    );
+    assert_eq!(ctx.get(0, y, 4), mushroom, "the dark one stays");
+    assert_eq!(ctx.g.pop_active, None, "the region window closed");
+    assert!(
+        ctx.g.take_shape_marks(0, 0).is_empty(),
+        "the promoted chunk has no mark left"
+    );
+    // A write after the boundary is not a region write, so it cannot file a mark that only a
+    // second pass over an already-promoted chunk could consume.
+    ctx.set(4, y, 4, mushroom);
+    assert!(
+        ctx.shape_marks.is_empty(),
+        "a post-boundary write files no mark"
+    );
+    // And the second pass is a no-op: nothing is rewritten, because the marks are gone.
+    let written = {
+        let mut n = 0;
+        for dx in 0..16 {
+            for dz in 0..16 {
+                if ctx.get(dx, y, dz) == mushroom {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    super::promote_full_chunks(&mut ctx, 0, 0);
+    let after = {
+        let mut n = 0;
+        for dx in 0..16 {
+            for dz in 0..16 {
+                if ctx.get(dx, y, dz) == mushroom {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    assert_eq!(written, after, "a second pass must not touch the chunk again");
 }

@@ -9308,23 +9308,44 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             }
         }
     }
-    // `ChunkMap.protoChunkToFullChunk` promotes this chunk's `ProtoChunk` to a
-    // `LevelChunk`, and `LevelChunk.postProcessGeneration` then consumes the marks a
-    // `StructurePiece.placeBlock` left on it: every marked cell is re-derived with
-    // `Block.updateFromNeighbourShapes`, in section order then mark order. That is why a
-    // mineshaft fence picks up `east`/`west` from the pillars around it while the single
-    // bit it was written with is dropped.
-    //
-    // The promotion waits for the whole 3x3 to be `FULL` (`protoChunkToFullChunk` asks for
-    // that status over radius one), so the shape pass must not run when this chunk's own
-    // generation ends: a neighbour that decorates later still changes the blocks the pass
-    // reads. Measured on seed 4242 chunk (-96,35): the fence at (-1521,-21,560) reads its
-    // east neighbour as deepslate while only this chunk has generated and as the mineshaft
-    // corridor's `cave_air` once (-95,35) has, and native's stored bits are the latter.
+    // `ChunkMap.protoChunkToFullChunk` promotes the chunks of this pass' 3x3 whose status has
+    // reached `FULL` and `LevelChunk.postProcessGeneration` then consumes the marks a
+    // `WorldGenRegion` write left on them: a `StructurePiece.placeBlock` cell in
+    // `SHAPE_CHECK_BLOCKS` and a cell whose written state passed `hasPostProcess` (mushrooms,
+    // magma block). That is why a mineshaft fence picks up `east`/`west` from the pillars
+    // around it while the single bit it was written with is dropped, and why a mushroom a later
+    // fire lit becomes air. See `promote_full_chunks` for the boundary itself and the timing.
+    promote_full_chunks(&mut ctx, sx, sz);
+    // Taken before the writes because `ctx` borrows the generator; the containers ride
+    // the same population and move into the runtime store as soon as the lock is released.
+    let mut staged_payloads = std::mem::take(&mut ctx.payloads);
+    for ((x, y, z), st) in std::mem::take(&mut ctx.wr) {
+        g.feat_write(x, y, z, st);
+    }
+    g.stage_payloads((sx, sz), &mut staged_payloads);
+}
+
+/// The chunk-promotion boundary: `ChunkMap.protoChunkToFullChunk` followed by
+/// `LevelChunk.postProcessGeneration`, for every chunk of this pass' 3x3 whose status has
+/// reached `FULL`.
+///
+/// `pop_done` is the port's status table and `shape_marks_ready` is "the whole 3x3 is FULL",
+/// which is the condition `protoChunkToFullChunk` asks for over radius one, so a chunk's marks
+/// are complete the moment this loop sees it. The marks are flushed to their owning chunks
+/// first (`markPosForPostprocessing` files on `getChunk(pos)`, not on the chunk being
+/// generated), then consumed once, in section order then mark order.
+///
+/// `pop_active` is dropped here, before anything is rewritten, because `postProcessGeneration`
+/// runs on a promoted `LevelChunk`, not inside a `WorldGenRegion`: a write from the pass must
+/// not file a mark (`FC::set`'s `hasPostProcess` gate reads this window) and must not be bounded
+/// by the FEATURES step's write radius. That is the whole reason this is a function of its own
+/// and not a tail inside the feature loop.
+fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
     for (x, y, z) in std::mem::take(&mut ctx.shape_marks) {
         ctx.g.store_shape_mark(x, y, z);
     }
-    let reg = breg();
+    ctx.g.pop_active = None;
+    let Some(reg) = breg() else { return };
     for dx in -1..=1 {
         for dz in -1..=1 {
             let (cx, cz) = (sx + dx, sz + dz);
@@ -9339,21 +9360,13 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
             // buckets in ascending order; `sort_by_key` is stable, so a bucket keeps mark order.
             let min_y = ctx.g.min_y;
             marks.sort_by_key(|&(_, y, _)| (y - min_y) >> 4);
-            if let Some(reg) = reg {
-                crate::structure_template::postprocess_shape_marks(&mut ctx, reg, &marks);
-            }
+            // The chunk is FULL here, i.e. `INITIALIZE_LIGHT`/`LIGHT` have run in vanilla: sample
+            // the light the shape rules read before the pass rewrites anything.
+            ctx.begin_promotion_pass(cx, cz, &marks);
+            crate::structure_template::postprocess_shape_marks(ctx, reg, &marks);
         }
     }
-    // Taken before the writes because `ctx` borrows the generator; the containers ride
-    // the same population and move into the runtime store as soon as the lock is released.
-    let mut staged_payloads = std::mem::take(&mut ctx.payloads);
-    for ((x, y, z), st) in std::mem::take(&mut ctx.wr) {
-        g.feat_write(x, y, z, st);
-    }
-    g.stage_payloads((sx, sz), &mut staged_payloads);
-    // The pass is over: a write from here on (there is none) is not part of any
-    // `WorldGenRegion` window.
-    g.pop_active = None;
+    ctx.end_promotion_pass();
 }
 
 // The unified StructureSet / StructureStart pipeline. Included rather than declared as a

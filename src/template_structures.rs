@@ -117,6 +117,16 @@ pub(crate) trait TemplateWorld {
     }
 
     fn sea_level(&self) -> i32;
+    /// `LevelReader.getRawBrightness(pos, 0)` (`dcz.b(jd,int)`) — the light query
+    /// `MushroomBlock.canSurvive` makes. `None` means "this world has no light engine to ask":
+    /// a synthetic oracle scene, or the port outside the one phase that has a light sample
+    /// (`generation_context::FC::begin_promotion_pass`). A rule that reads it must then leave
+    /// the state alone rather than guess, because the uninitialized engine and the lit engine
+    /// answer differently at exactly the cells the rule exists for.
+    fn raw_brightness(&mut self, pos: Pos) -> Option<u8> {
+        let _ = pos;
+        None
+    }
     /// `LevelAccessor.getMinBuildHeight` — the **world** window (`dimension_type`).
     fn min_y(&self) -> i32;
     /// `LevelHeightAccessor.getHeight` — the **world** window (`dimension_type`).
@@ -193,6 +203,9 @@ impl TemplateWorld for crate::generation_context::FC<'_> {
     }
     fn gen_height(&self) -> i32 {
         self.g.height
+    }
+    fn raw_brightness(&mut self, pos: Pos) -> Option<u8> {
+        crate::generation_context::FC::raw_brightness(self, pos.0, pos.1, pos.2)
     }
 }
 
@@ -1369,6 +1382,36 @@ fn update_shape<W: TemplateWorld>(
     ) {
         return air;
     }
+    // `MushroomBlock` inherits `BushBlock.updateShape` (`dgh.a(dtc,ji,dtc,dcx,jd,jd)`):
+    // `!state.canSurvive(level, pos) ? AIR : super.updateShape(...)`, and its own
+    // `canSurvive` (`dla.a(dtc,dcz,jd)`) is direction-independent:
+    //
+    // ```java
+    // support.is(MUSHROOM_GROW_BLOCK)
+    //    || (level.getRawBrightness(pos, 0) < 13 && isSolidRender(support, below))
+    // ```
+    //
+    // This is the rule the promotion pass exists for. At `FEATURES` time the brightness is
+    // the *uninitialized* value, so a Nether mushroom on netherrack is written; at
+    // `postProcessGeneration` the same check reads the lit engine and removes the ones a
+    // nearby light source lit, which is how a write the feature layer made disappears from
+    // the saved chunk. With no lit engine to ask (`None`) the state is left alone: guessing
+    // here is exactly the mistake `uninitialized_raw_brightness` records.
+    if matches!(bare, "brown_mushroom" | "red_mushroom") {
+        let below = world.get(pos.0, pos.1 - 1, pos.2);
+        if reg.in_tag(below, "minecraft:mushroom_grow_block") {
+            return state;
+        }
+        let lit = match world.raw_brightness(pos) {
+            Some(v) => v,
+            None => return state,
+        };
+        return if lit < 13 && reg.is_solid_render(below) {
+            state
+        } else {
+            air
+        };
+    }
     // `MultifaceBlock.updateShape` — `glow_lichen` and `sculk_vein` are the only
     // two subclasses in the pinned version. A face whose support block stops
     // being attachable is cleared, and the cell becomes air once its last face
@@ -1639,15 +1682,24 @@ fn wall_update_shape<W: TemplateWorld>(
     reg.with_prop(next, "up", if up_val { "true" } else { "false" })
 }
 
-/// `LevelChunk.postProcessGeneration`'s per-cell rule, for the positions a
-/// `StructurePiece.placeBlock` marked with `markPosForPostprocessing`.
+/// `LevelChunk.postProcessGeneration`'s per-cell rule, for the positions a `WorldGenRegion`
+/// write marked with `markPosForPostprocessing`.
 ///
 /// Native runs this once per chunk, when the `ProtoChunk` is promoted to a
-/// `LevelChunk` (`ChunkMap.protoChunkToFullChunk`): for every marked position, in
-/// section order then mark order, it skips a `LiquidBlock` cell and otherwise
-/// re-derives the state with `Block.updateFromNeighbourShapes`, writing the result
-/// with `UPDATE_INVISIBLE | UPDATE_KNOWN_SHAPE` (`20`). The caller owns which marks
-/// belong to the chunk being promoted and supplies them in that order.
+/// `LevelChunk` (`ChunkMap.protoChunkToFullChunk`, after `INITIALIZE_LIGHT`/`LIGHT`): for every
+/// marked position, in section order then mark order, it skips a `LiquidBlock` cell and
+/// otherwise re-derives the state with `Block.updateFromNeighbourShapes`, writing the result
+/// with `UPDATE_INVISIBLE | UPDATE_KNOWN_SHAPE` (`20`). The caller owns which marks belong to
+/// the chunk being promoted and supplies them in that order.
+///
+/// The two mark sources of 1.21.1 are both here: `StructurePiece.placeBlock` for
+/// `SHAPE_CHECK_BLOCKS` (fence/pipe/wall-torch connections, multiface faces, crops) and
+/// `WorldGenRegion.setBlock`'s `hasPostProcess` gate for the three blocks whose shape depends
+/// on the **lit** engine (`brown_mushroom`, `red_mushroom`, `magma_block`). The second is why
+/// this pass reads light through [`TemplateWorld::raw_brightness`]; `magma_block` itself is the
+/// one that does not move - `MagmaBlock.updateShape` only calls
+/// `level.scheduleTick(pos, WATER, 20)` when water sits above it and returns the state
+/// unchanged, and a scheduled tick is not a state change.
 ///
 /// Returns the number of cells the pass rewrote.
 pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
@@ -1656,6 +1708,12 @@ pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
     marks: &[Pos],
 ) -> usize {
     let mut changed = 0;
+    // `POSTPROC_TRACE=<cx>,<cz>` (or `all`): every cell this pass rewrites, with the raw
+    // brightness the shape rules read from it. That number has no other observable: the light
+    // sample lives only for the duration of one promoted chunk (`FC::begin_promotion_pass`), and
+    // a cell that is *not* rewritten by a light-driven rule looks exactly like a cell no rule
+    // looked at.
+    let trace = crate::trace_env::env_str!("POSTPROC_TRACE");
     for &pos in marks {
         let state = world.get(pos.0, pos.1, pos.2);
         // `!(state.getBlock() instanceof LiquidBlock)`: fluid blocks carry their own
@@ -1665,6 +1723,20 @@ pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
         }
         let updated = update_from_neighbour_shapes(reg, state, world, pos);
         if updated != state {
+            if trace
+                .as_deref()
+                .is_some_and(|want| want == "all" || want == format!("{},{}", pos.0 >> 4, pos.2 >> 4))
+            {
+                eprintln!(
+                    "POSTPROC {} {} {} from={} to={} light={:?}",
+                    pos.0,
+                    pos.1,
+                    pos.2,
+                    reg.name_of(state),
+                    reg.name_of(updated),
+                    world.raw_brightness(pos)
+                );
+            }
             world.set(pos.0, pos.1, pos.2, updated);
             changed += 1;
         }
@@ -3611,6 +3683,7 @@ mod template_structures_tests {
     }
 
     /// The oracle's `ScriptedTerrain`, including its `stateAt`/`baseHeight`.
+    #[derive(Clone)]
     struct SceneSpec {
         min_y: i32,
         height: i32,
@@ -3737,6 +3810,10 @@ mod template_structures_tests {
     struct TestWorld {
         scene: SceneSpec,
         writes: HashMap<Pos, u32>,
+        /// `getRawBrightness(pos, 0)` for the scripted scene: `None` models a world with no
+        /// light engine (the default, and what a feature-time caller sees in the port),
+        /// `Some(n)` a lit one at the promotion boundary.
+        light: Option<u8>,
     }
 
     impl TestWorld {
@@ -3744,6 +3821,7 @@ mod template_structures_tests {
             TestWorld {
                 scene,
                 writes: HashMap::new(),
+                light: None,
             }
         }
     }
@@ -3780,6 +3858,9 @@ mod template_structures_tests {
         }
         fn sea_level(&self) -> i32 {
             self.scene.sea
+        }
+        fn raw_brightness(&mut self, _pos: Pos) -> Option<u8> {
+            self.light
         }
         fn min_y(&self) -> i32 {
             self.scene.min_y
@@ -4075,6 +4156,61 @@ mod template_structures_tests {
             "the placement bit pointed at air"
         );
         assert_eq!(world.get(4, 70, 4), water, "liquid cells are skipped");
+    }
+
+    /// The brightness half of `MushroomBlock.canSurvive`, read at the boundary: the same cell a
+    /// feature wrote is removed by the shape pass once the engine is lit, kept while it is dark,
+    /// and left alone when there is no lit engine to ask (`None`). The support test is
+    /// `isSolidRender` (not `#minecraft:dirt`), and `#minecraft:mushroom_grow_block` skips the
+    /// brightness test entirely.
+    #[test]
+    fn postprocess_removes_a_mushroom_only_where_the_lit_engine_reaches_it() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let air = reg.state_of("minecraft:air", None);
+        for (light, support, removed) in [
+            // `15 - 2` from a fire two cells away: `rawBrightness < 13` is false.
+            (Some(13u8), "minecraft:netherrack", true),
+            (Some(12), "minecraft:netherrack", false),
+            (Some(15), "minecraft:netherrack", true),
+            // `#minecraft:mushroom_grow_block` answers canSurvive before the light is read.
+            (Some(15), "minecraft:podzol", false),
+            // `isSolidRender(support)` is the other half: water is not a support.
+            (Some(0), "minecraft:water", true),
+            // No lit engine (a feature-time caller, or a scripted scene): do not guess.
+            (None, "minecraft:netherrack", false),
+        ] {
+            for mushroom in ["minecraft:brown_mushroom", "minecraft:red_mushroom"] {
+                let mut world = TestWorld::new(scene.clone());
+                world.light = light;
+                world.set(0, -31, 0, reg.state_of(support, None));
+                world.set(0, -30, 0, reg.state_of(mushroom, None));
+                let changed = postprocess_shape_marks(&mut world, reg, &[(0, -30, 0)]);
+                assert_eq!(
+                    world.get(0, -30, 0) == air,
+                    removed,
+                    "{mushroom} on {support} with light {light:?}"
+                );
+                assert_eq!(changed, usize::from(removed), "changed count {mushroom}");
+            }
+        }
+    }
+
+    /// The third block of the set: `MagmaBlock.updateShape` only calls
+    /// `level.scheduleTick(pos.above(), Fluids.WATER, 20)` when water sits above and returns the
+    /// state unchanged, so its mark is consumed without a rewrite. A light-driven `canSurvive`
+    /// arm copied from the mushrooms would turn this cell into air.
+    #[test]
+    fn postprocess_leaves_a_marked_magma_block_unchanged() {
+        let reg = breg().expect("block registry");
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        world.light = Some(15);
+        let magma = reg.state_of("minecraft:magma_block", None);
+        world.set(0, -30, 0, magma);
+        world.set(0, -29, 0, reg.state_of("minecraft:water", None));
+        assert_eq!(postprocess_shape_marks(&mut world, reg, &[(0, -30, 0)]), 0);
+        assert_eq!(world.get(0, -30, 0), magma);
     }
 
     /// A template's hanging entity NBT carries its facing and framed stack, and the

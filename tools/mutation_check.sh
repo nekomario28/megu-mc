@@ -3209,6 +3209,22 @@ check "two equally old xp orbs keep the lower index" \
                 xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
   merge_tests::xp_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs
 
+# hasPostProcess lane: `LevelChunk.postProcessGeneration` has two halves in this port and one
+# test for each. The mark half is `WorldGenRegion.setBlock`'s gate - the written state's
+# `hasPostProcess`, and nothing else - and the consumption half is the lit threshold
+# `MushroomBlock.canSurvive` asks at promotion, which is the read the write-time check could not
+# make. Either mutation puts the four Nether residual cells back into the chunk
+# (`evidence/gameplay/feature-parity/haspostprocess-contract-20261118.md`).
+check "only a hasPostProcess state is marked for post-processing" \
+  src/generation_context.rs '        if self.g.pop_active.is_some() && reg.is_some_and(|r| r.has_post_process(st)) {' \
+  '        if self.g.pop_active.is_some() {' \
+  generation_contract_tests::a_written_post_process_state_files_a_mark_on_the_owning_chunk
+
+check "the promotion shape pass keeps a mushroom whose raw brightness is under 13" \
+  src/template_structures.rs '        return if lit < 13 && reg.is_solid_render(below) {' \
+  '        return if lit <= 13 && reg.is_solid_render(below) {' \
+  generation_contract_tests::promotion_removes_a_mushroom_the_lit_engine_reaches
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

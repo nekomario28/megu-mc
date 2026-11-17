@@ -4019,6 +4019,35 @@ impl Gen {
         self.feat_c.get(&(x >> 4, z >> 4))?.get(&k).copied()
     }
 
+    /// Every FEATURES-layer write this generator still holds for one chunk, decoded back to
+    /// positions and states: `(pos, state)` for each entry of the chunk's bucket, in the
+    /// bucket's own order.
+    ///
+    /// The promotion-boundary light sample (`generation_context::FC::begin_promotion_pass`) is
+    /// the one caller. It needs the emitters a chunk can see, and the write layers are the only
+    /// place they can be enumerated without a full terrain scan; the cell *reads* during the
+    /// flood still go through `FC::get`, so the terrain is not skipped, only not scanned.
+    /// A chunk with no bucket yields nothing, which is the right answer for a chunk nothing
+    /// wrote to.
+    pub(crate) fn feature_bucket_writes(
+        &self,
+        cx: i32,
+        cz: i32,
+    ) -> impl Iterator<Item = ((i32, i32, i32), u32)> + '_ {
+        let min_y = self.min_y;
+        self.feat_c
+            .get(&(cx, cz))
+            .into_iter()
+            .flat_map(move |bucket| {
+                bucket.iter().map(move |(&k, &st)| {
+                    let y = min_y + (k >> 8) as i32;
+                    let z = cz * 16 + ((k >> 4) & 15) as i32;
+                    let x = cx * 16 + (k & 15) as i32;
+                    ((x, y, z), st)
+                })
+            })
+    }
+
     /// feature-layer lookup: populates the 3x3 neighborhood on demand, then
     /// returns the override state for (x,y,z) if a feature wrote one.
     pub(crate) fn feat_state(
