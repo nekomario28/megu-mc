@@ -3380,7 +3380,8 @@ fn keepalive_time_tick() {
             broadcast_seen_destroy(*eid);
         }
     }
-    // #minecraft:tick functions (approx rate: our tick = 250ms, vanilla = 50ms)
+    // #minecraft:tick functions run once per game tick (TICK_MS = 50ms = 20/s, the
+    // vanilla rate)
     let ticks: Vec<String> = packs()
         .lock()
         .unwrap()
@@ -4249,8 +4250,9 @@ fn solidify_on_contact(lx: i32, ly: i32, lz: i32, lava_lvl: u32) -> bool {
 
 fn lava_tick() {
     // vanilla: lava flows like water but ~6x slower and only 3 blocks
-    // horizontally in the overworld. Our tick=TICK_MS ~5gt, so gating to
-    // every 6th tick lands near 30gt.
+    // horizontally in the overworld. One server tick is one game tick, so gating
+    // to every 30th tick (server_ticks(FLUID_TICK_GT)) is vanilla's 1.5s lava
+    // re-flow cadence.
     // Only the cells that come due are visited; a backed-off cell costs nothing.
     // Every exit re-queues except removal from the registry.
     let due = {
