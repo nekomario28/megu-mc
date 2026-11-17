@@ -51,6 +51,13 @@ pub(crate) fn schedule_leaf_edge_state(
 
 // ---------- generation context ----------
 
+/// The block-light field of one chunk-promotion pass: cell -> 1..=15, with every other cell 0.
+/// Built once by [`FC::begin_promotion_pass`] from the state as of the boundary and reused for
+/// every mark of that chunk (see there for why the pass must not relight).
+pub(crate) struct PromoLight {
+    block: HashMap<(i32, i32, i32), u8>,
+}
+
 pub(crate) struct FC<'a> {
     pub(crate) g: &'a mut Gen,
     pub(crate) wr: HashMap<(i32, i32, i32), u32>,
@@ -59,6 +66,12 @@ pub(crate) struct FC<'a> {
     /// are consumed at the end of this chunk's `populate` (see
     /// `feature::populate`), and the ones that belong to *other* chunks are handed
     /// to `Gen` for those chunks' own promotion.
+    ///
+    /// Two mark sources file here, and they are the two 1.21.1 has for a
+    /// `WorldGenRegion` write: `StructurePiece.placeBlock` for
+    /// `SHAPE_CHECK_BLOCKS` (`BReg::needs_postprocess_shape`, called by the piece
+    /// writer) and `WorldGenRegion.setBlock`'s own `hasPostProcess` gate
+    /// (`BReg::has_post_process`, filed by [`FC::set`]). The sets are disjoint.
     pub(crate) shape_marks: Vec<(i32, i32, i32)>,
     rc: HashMap<(i32, i32, i32), u32>, // terrain read-through cache
     /// Frozen pre-CARVERS `*_WG` heightmaps, memoized per column. Feature writes
@@ -72,6 +85,11 @@ pub(crate) struct FC<'a> {
     pub(crate) payloads: Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
 
     cc: Option<(i32, i32, std::sync::Arc<crate::worldgen::ChunkCols>)>,
+    /// The block-light field of the chunk-promotion pass that is running, or `None`
+    /// outside one (the sky term is computed per query from the column). Sampled once per promoted chunk, before the pass rewrites
+    /// anything, because `postProcessGeneration` writes with
+    /// `UPDATE_INVISIBLE | UPDATE_KNOWN_SHAPE` (`20`) and does not relight the chunk.
+    promo_light: Option<PromoLight>,
     prof: bool,
     #[cfg(test)]
     pub(crate) test_no_terrain: bool,
@@ -94,6 +112,7 @@ impl<'a> FC<'a> {
             hmwg: HashMap::new(),
             payloads: Vec::new(),
             cc: None,
+            promo_light: None,
             prof: crate::trace_env::env_flag!("FEAT_PROFILE"),
             #[cfg(test)]
             test_no_terrain: false,
@@ -290,6 +309,19 @@ impl<'a> FC<'a> {
         let solid = reg.map(|r| r.is_solid(st)).unwrap_or(false);
         let air = reg.map(|r| r.is_air(st)).unwrap_or(st == 0);
         self.g.note_feature_write(x, y, z, solid, air);
+        // `WorldGenRegion.setBlock`'s last two statements: the state that was actually
+        // written is asked `hasPostProcess`, and if it answers true the *owning* chunk
+        // (`getChunk(pos)`, not the chunk being generated) files the cell with
+        // `markPosForPostprocessing`. The gate is on the state written, and the mark is
+        // filed after the write, so a refused write marks nothing.
+        //
+        // Marked only inside a FEATURES window: a `WorldGenRegion` exists only there, and
+        // the promotion pass itself writes to a `LevelChunk` (outside this function) - a
+        // mark filed by the pass would be a mark nothing consumes or a second pass over an
+        // already-promoted chunk.
+        if self.g.pop_active.is_some() && reg.is_some_and(|r| r.has_post_process(st)) {
+            self.shape_marks.push((x, y, z));
+        }
     }
     pub(crate) fn is_air(&mut self, x: i32, y: i32, z: i32) -> bool {
         let st = self.get(x, y, z);
@@ -463,6 +495,151 @@ impl<'a> FC<'a> {
         return self.test_block_light;
         #[cfg(not(test))]
         0
+    }
+
+    /// The chunk-promotion boundary: sample the light the pass reads, once.    ///
+    /// 1.21.1 consumes `postProcessGeneration`'s marks when the proto chunk is promoted
+    /// (`ChunkMap`'s `prepareTickingChunk` lambda, its first statement), which is after
+    /// `INITIALIZE_LIGHT`/`LIGHT` have run - so `BushBlock.updateShape` there re-asks
+    /// `MushroomBlock.canSurvive` against a **lit** engine while the same check at `FEATURES`
+    /// time read the uninitialized one. The port has no light stage, so this samples the two
+    /// layers the check can see, at the boundary and not before it:
+    ///
+    /// * block light: a multi-source flood from every state in the promoted chunk's 3x3 with
+    ///   `getLightEmission() > 0`, attenuating `max(1, getLightBlock())` per entered cell
+    ///   (`LayerLightEngine`'s rule). Sources are enumerated from the write layers (the
+    ///   in-flight chunk's `wr` and the neighbouring `feat_c` buckets), because those are the
+    ///   only cells a generation-time light source can be in without a full terrain scan; the
+    ///   flood's *reads* still go through [`FC::get`], so terrain occludes and terrain lava is
+    ///   not skipped once the flood reaches it.
+    /// * sky light: [`FC::sky_light`], and only in a dimension with a sky layer.
+    ///
+    /// Sampled **before** the pass rewrites anything and reused for every mark of the promoted
+    /// chunk. `postProcessGeneration` sets with flags `20` (`UPDATE_INVISIBLE |
+    /// UPDATE_KNOWN_SHAPE`), which carries no light update, so a mark must not change the light
+    /// a later mark of the same chunk reads; that is also what keeps the pass independent of
+    /// mark order.
+    ///
+    /// Only sampled when a mark is itself a `hasPostProcess` block: nothing else in the pass
+    /// reads light, and the flood must not be paid by every chunk that only carries a fence.
+    pub(crate) fn begin_promotion_pass(&mut self, cx: i32, cz: i32, marks: &[(i32, i32, i32)]) {
+        self.promo_light = None;
+        let Some(reg) = breg() else { return };
+        let mut needed = false;
+        for &(x, y, z) in marks {
+            if reg.has_post_process(self.get(x, y, z)) {
+                needed = true;
+                break;
+            }
+        }
+        if needed {
+            let field = self.sample_block_light(cx, cz, reg);
+            self.promo_light = Some(field);
+        }
+    }
+
+    /// End the promotion pass: drop the sample, so nothing after the boundary (a later
+    /// chunk's pass, a feature-time read) can answer from a field sampled for a chunk that
+    /// is already promoted.
+    pub(crate) fn end_promotion_pass(&mut self) {
+        self.promo_light = None;
+    }
+
+    fn sample_block_light(&mut self, cx: i32, cz: i32, reg: &BReg) -> PromoLight {
+        let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
+        for (&pos, &st) in self.wr.iter() {
+            let l = reg.luminance_of(st);
+            if l > 0 {
+                sources.push((pos, l));
+            }
+        }
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for (pos, st) in self.g.feature_bucket_writes(cx + dx, cz + dz) {
+                    let l = reg.luminance_of(st);
+                    if l > 0 {
+                        sources.push((pos, l));
+                    }
+                }
+            }
+        }
+        // Max-propagation is a fixed point, so the seed order cannot change the answer; the
+        // sort is for the *trace*: two runs of the same chunk must flood in the same order.
+        sources.sort_unstable();
+        let mut block: HashMap<(i32, i32, i32), u8> = HashMap::new();
+        let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> =
+            std::collections::VecDeque::new();
+        for (pos, l) in sources {
+            if block.get(&pos).copied().unwrap_or(0) < l {
+                block.insert(pos, l);
+                queue.push_back((pos, l));
+            }
+        }
+        while let Some((pos, v)) = queue.pop_front() {
+            if v < 2 {
+                continue;
+            }
+            for (dx, dy, dz) in [
+                (0i32, -1i32, 0i32),
+                (0, 1, 0),
+                (0, 0, -1),
+                (0, 0, 1),
+                (-1, 0, 0),
+                (1, 0, 0),
+            ] {
+                let n = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+                if self.out_of_h(n.1) {
+                    continue;
+                }
+                let cost = reg.opacity_of(self.get(n.0, n.1, n.2)).max(1);
+                let Some(nv) = v.checked_sub(cost) else {
+                    continue;
+                };
+                if nv >= 1 && block.get(&n).copied().unwrap_or(0) < nv {
+                    block.insert(n, nv);
+                    queue.push_back((n, nv));
+                }
+            }
+        }
+        PromoLight { block }
+    }
+
+    /// `LevelReader.getRawBrightness(pos, 0)` (`dcz.b(jd,int)`) as of the promotion boundary,
+    /// i.e. `max(blockLight, skyLight - 0)`.
+    ///
+    /// `None` outside a promotion pass. A feature-time caller has no `INITIALIZE_LIGHT`/`LIGHT`
+    /// result to read - the uninitialized answer is `generation_providers::uninitialized_raw_brightness`
+    /// - and a shape rule must say "no lit engine here" rather than invent one.
+    pub(crate) fn raw_brightness(&mut self, x: i32, y: i32, z: i32) -> Option<u8> {
+        let block = match &self.promo_light {
+            Some(field) => field.block.get(&(x, y, z)).copied().unwrap_or(0),
+            None => return None,
+        };
+        if !self.g.has_skylight() {
+            return Some(block);
+        }
+        let sky = self.sky_light(x, y, z);
+        Some(block.max(sky))
+    }
+
+    /// The sky term of [`FC::raw_brightness`]: 15 minus the light the column above the cell
+    /// stops, capped at 15 (`15 - sum(getLightBlock)`), which is the value `SkyLightSectionStorage`
+    /// answers for a cell that sees the sky straight up. A model, not a light engine: it does not
+    /// spread sideways from a neighbouring lit column, which is the one thing the shape rules in
+    /// this pass do not need (a mushroom under a canopy reads its own column).
+    fn sky_light(&mut self, x: i32, y: i32, z: i32) -> u8 {
+        let Some(reg) = breg() else { return 15 };
+        let top = self.g.world_min_y + self.g.world_height - 1;
+        let mut stopped: u16 = 0;
+        let mut yy = y + 1;
+        while yy <= top {
+            stopped += reg.opacity_of(self.get(x, yy, z)) as u16;
+            if stopped >= 15 {
+                return 0;
+            }
+            yy += 1;
+        }
+        15 - stopped as u8
     }
     pub(crate) fn out_of_h(&self, y: i32) -> bool {
         // `Level.isOutsideBuildHeight`: the *world* window. A feature may legitimately

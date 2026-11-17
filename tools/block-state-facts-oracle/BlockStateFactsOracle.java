@@ -14,10 +14,15 @@ import java.util.*;
  * byte-identical results for all 34 columns, so the table is a property of the state and not of
  * a neighbourhood.
  *
- * <p>Row format: {@code <state text> TAB <flags> TAB <lightEmission> TAB <lightBlock> TAB <faces>}.
- * {@code faces} packs the 18 face/support answers as {@code support * 6 + direction}, and both
- * indexes are resolved from the enum constants' own names, never from array position, because
- * obfuscation is free to reorder the constants.
+ * <p>Row format: {@code <state text> TAB <flags> TAB <lightEmission> TAB <lightBlock> TAB <faces>
+ * TAB <hasPostProcess>}. {@code faces} packs the 18 face/support answers as {@code support * 6 +
+ * direction}, and both indexes are resolved from the enum constants' own names, never from array
+ * position, because obfuscation is free to reorder the constants.
+ *
+ * <p>{@code hasPostProcess} is the predicate {@code WorldGenRegion.setBlock} reads to decide
+ * whether a written cell is filed with {@code ChunkAccess.markPosForPostprocessing}. It is a
+ * cached {@code StatePredicate}, so like every other column it is a property of the state; it is
+ * read here for all states and the anchors pin that exactly three blocks answer true.
  *
  * <p>The anchors at the end are the guard: a wrong obfuscated name, a shifted bit, or a swapped
  * enum order changes one of them, and the run fails instead of writing a plausible table.
@@ -59,6 +64,9 @@ public class BlockStateFactsOracle {
         Method emission = zeroArity(baseType, "h", int.class);
         Method fluidState = zeroArity(baseType, "u", null);
         Method solidRender = twoArity(baseType, "i", getterType, blockPos, boolean.class);
+        // `BlockBehaviour.BlockStateBase.hasPostProcess(BlockGetter, BlockPos)` (`dtb$a.q`,
+        // mappings 1213:1213). One declaration, no per-block override in the pinned version.
+        Method postProcess = twoArity(baseType, "q", getterType, blockPos, boolean.class);
         Method collisionFull = twoArity(baseType, "r", getterType, blockPos, boolean.class);
         Method lightBlock = twoArity(baseType, "b", getterType, blockPos, int.class);
         Method collisionShape = twoArity(baseType, "k", getterType, blockPos, null);
@@ -110,11 +118,13 @@ public class BlockStateFactsOracle {
                 for (int d = 0; d < DIRECTIONS.length; d++)
                     if ((boolean) sturdy.invoke(state, world, zero, directions[d], supports[s]))
                         faces |= 1 << (s * 6 + d);
-            facts.put(text, new int[]{flags, light, block, faces});
+            int post = (boolean) postProcess.invoke(state, world, zero) ? 1 : 0;
+            facts.put(text, new int[]{flags, light, block, faces, post});
             bareName.put(text, bareName(text));
         }
         auditAnchors(facts, bareName, states);
         auditFaces(facts, bareName);
+        auditPostProcess(facts, bareName);
         require(airStates == 3, "isAir states = " + airStates);
         for (String block : LIQUID_BLOCKS)
             require(taggedAny(facts, bareName, block, F_LIQUID), block + " is not liquid()");
@@ -122,7 +132,8 @@ public class BlockStateFactsOracle {
         List<String> rows = new ArrayList<>();
         for (Map.Entry<String, int[]> entry : facts.entrySet()) {
             int[] f = entry.getValue();
-            rows.add(entry.getKey() + "\t" + f[0] + "\t" + f[1] + "\t" + f[2] + "\t" + f[3]);
+            rows.add(entry.getKey() + "\t" + f[0] + "\t" + f[1] + "\t" + f[2] + "\t" + f[3]
+                    + "\t" + f[4]);
         }
         Path output = Path.of(args[0]);
         Files.write(output, rows);
@@ -215,6 +226,33 @@ public class BlockStateFactsOracle {
      * RIGID for its open top face, which is not a full face). Anything else moving here means a
      * plane or a direction bit was reordered.
      */
+    /**
+     * `hasPostProcess` is a `Blocks.<clinit>` fact, so the whole set is re-derived here rather
+     * than typed into Rust: exactly three blocks carry the constant-true predicate, one state
+     * each, and every other state of every other block answers false. `oak_leaves` is the
+     * control for "a full-cube-shaped block that is not in the set".
+     */
+    static void auditPostProcess(Map<String, int[]> facts, Map<String, String> bare) {
+        Set<String> blocks = new TreeSet<>();
+        int states = 0;
+        for (Map.Entry<String, int[]> entry : facts.entrySet()) {
+            if (entry.getValue()[4] == 0) continue;
+            states++;
+            blocks.add(bare.get(entry.getKey()));
+            require(entry.getValue()[4] == 1, "hasPostProcess is not 0/1: " + entry.getKey());
+        }
+        require(blocks.equals(new TreeSet<>(Arrays.asList(
+                "brown_mushroom", "red_mushroom", "magma_block"))),
+                "hasPostProcess blocks " + blocks);
+        require(states == 3, "hasPostProcess states " + states);
+        for (Map.Entry<String, int[]> entry : facts.entrySet()) {
+            String name = bare.get(entry.getKey());
+            if (name.equals("brown_mushroom") || name.equals("red_mushroom")
+                    || name.equals("magma_block")) continue;
+            require(entry.getValue()[4] == 0, "unexpected hasPostProcess: " + entry.getKey());
+        }
+    }
+
     static void auditFaces(Map<String, int[]> facts, Map<String, String> bare) {
         Set<String> rigidExceptions = new TreeSet<>(Arrays.asList(RIGID_NOT_FULL));
         int exceptions = 0;
