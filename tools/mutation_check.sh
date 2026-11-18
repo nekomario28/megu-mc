@@ -3491,6 +3491,56 @@ check "entity_selector_push_other_teams_denies_different_team" \
         && same_team' \
   entity_push_tests::entity_selector_team_rules_match_the_bytecode_deny_shape
 
+# P2-1-T0: StructurePiece.placeBlock SHAPE_CHECK_BLOCKS marks on template & jigsaw placement.
+check "p2_1_t0_jigsaw_place_marks_shape_check_blocks" \
+  src/jigsaw_structures.rs '        if reg.needs_postprocess_shape(placed) {
+            target.mark_shape(p);
+        }' \
+  '        if false {
+            target.mark_shape(p);
+        }' \
+  feature::jigsaw_structures::tests::jigsaw_piece_marks_shape_check_block_and_promotion_disconnects_it
+
+check "p2_1_t0_template_place_marks_shape_check_blocks" \
+  src/template_structures.rs '        if reg.needs_postprocess_shape(state) {
+            world.mark_shape(block.pos);
+        }' \
+  '        if false {
+            world.mark_shape(block.pos);
+        }' \
+  structure_template::template_structures_tests::place_in_world_marks_transformed_shape_check_block_on_fc
+
+# Promotion-only BushBlock / DoublePlantBlock removal (`village-taiga` fern at (82,69,-500)).
+check "bush_block_postprocess_removes_unsupported_plants" \
+  src/template_structures.rs '        let updated = postprocess_bush_shape(reg, state, world, pos)
+            .unwrap_or_else(|| update_from_neighbour_shapes(reg, state, world, pos));' \
+  '        let updated = postprocess_bush_shape(reg, state, world, pos)
+            .filter(|_| false)
+            .unwrap_or_else(|| update_from_neighbour_shapes(reg, state, world, pos));' \
+  structure_template::template_structures_tests::postprocess_shape_marks_removes_unsupported_bush_blocks_only_at_promotion
+
+# Feature.markAboveForPostProcessing (`ece.a`): DiskFeature & LakeFeature's two sites.
+check "disk_feature_marks_above_for_post_processing" \
+  src/feature.rs '                            ctx.set(x, y, z, st);
+                            mark_above_for_post_processing(ctx, reg, x, y, z);' \
+  '                            ctx.set(x, y, z, st);' \
+  feature::mark_above_tests::disk_feature_marks_above_for_post_processing_stopping_on_air
+
+check "lake_feature_cave_air_marks_above_for_post_processing" \
+  src/feature.rs '                                if y >= 4 {
+                                    mark_above_for_post_processing(ctx, reg, bp.0, bp.1, bp.2);
+                                }' \
+  '                                if false && y >= 4 {
+                                    mark_above_for_post_processing(ctx, reg, bp.0, bp.1, bp.2);
+                                }' \
+  feature::mark_above_tests::lake_feature_marks_above_at_cave_air_and_barrier_sites
+
+check "lake_feature_barrier_marks_above_for_post_processing" \
+  src/feature.rs '                                    ctx.set(bp.0, bp.1, bp.2, barrier_st);
+                                    mark_above_for_post_processing(ctx, reg, bp.0, bp.1, bp.2);' \
+  '                                    ctx.set(bp.0, bp.1, bp.2, barrier_st);' \
+  feature::mark_above_tests::lake_feature_marks_above_at_cave_air_and_barrier_sites
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

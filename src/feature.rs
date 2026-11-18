@@ -6738,6 +6738,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         if !ctx.out_of_h(y) && test_pred(target, reg, ctx, x, y, z) {
                             let st = bsp.get(ctx, rng, x, y, z);
                             ctx.set(x, y, z, st);
+                            mark_above_for_post_processing(ctx, reg, x, y, z);
                         }
                         y -= 1;
                     }
@@ -7477,6 +7478,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                             let cur = ctx.get(bp.0, bp.1, bp.2);
                             if !reg.in_tag(cur, "minecraft:features_cannot_replace") {
                                 ctx.set(bp.0, bp.1, bp.2, if y >= 4 { air_st } else { fluid_st });
+                                if y >= 4 {
+                                    mark_above_for_post_processing(ctx, reg, bp.0, bp.1, bp.2);
+                                }
                             }
                         }
                     }
@@ -7497,6 +7501,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                                     && !reg.in_tag(cur, "minecraft:lava_pool_stone_cannot_replace")
                                 {
                                     ctx.set(bp.0, bp.1, bp.2, barrier_st);
+                                    mark_above_for_post_processing(ctx, reg, bp.0, bp.1, bp.2);
                                 }
                             }
                         }
@@ -9392,6 +9397,25 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
 /// not file a mark (`FC::set`'s `hasPostProcess` gate reads this window) and must not be bounded
 /// by the FEATURES step's write radius. That is the whole reason this is a function of its own
 /// and not a tail inside the feature loop.
+/// `Feature.markAboveForPostProcessing` (`ece.a(Ldds;Ljd;)V`): steps `UP` twice
+/// (`y + 1`, `y + 2`), stopping on the first air cell (or outside build height, where
+/// `WorldGenRegion.getBlockState` returns `VOID_AIR`), and marks each visited non-air cell on its
+/// owning chunk with `MarkSrc::FeatureAbove`.
+fn mark_above_for_post_processing(ctx: &mut FC<'_>, reg: &BReg, x: i32, y: i32, z: i32) {
+    for dy in 1..=2 {
+        let cy = y + dy;
+        if ctx.out_of_h(cy) {
+            return;
+        }
+        let st = ctx.get(x, cy, z);
+        if reg.is_air(st) {
+            return;
+        }
+        ctx.g
+            .store_shape_mark_from(x, cy, z, crate::worldgen::MarkSrc::FeatureAbove);
+    }
+}
+
 fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
     for (x, y, z) in std::mem::take(&mut ctx.shape_marks) {
         ctx.g.note_mark_source(x, y, z, crate::worldgen::MarkSrc::Write);
@@ -9439,6 +9463,172 @@ fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
         }
     }
     ctx.end_promotion_pass();
+}
+
+#[cfg(test)]
+mod mark_above_tests {
+    use super::{freg, gen_cf, Cf};
+    use crate::block_registry::breg;
+    use crate::generation_context::FC;
+    use crate::generation_math::Xor;
+    use crate::json::jparse;
+    use crate::worldgen::Gen;
+
+    /// `DiskFeature` calls `Feature.markAboveForPostProcessing` (`ece.a`), which walks `y+1`,
+    /// `y+2`, stops at the first air cell (or outside build height), and files marks on the
+    /// owning chunk.
+    #[test]
+    fn disk_feature_marks_above_for_post_processing_stopping_on_air() {
+        let reg = breg().expect("block registry");
+        let fr = freg();
+        let mut g = Gen::load(0, crate::name_to_state).expect("gen");
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+
+        let sand = reg.state_of("minecraft:sand", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let fern = reg.state_of("minecraft:fern", None);
+
+        // Column (0, _, 0): stone at y=69 (above disk target y=68 -> both 69 and 70 marked),
+        // fern at y=70. Disk will replace y=68 with gravel and mark y=69 and y=70.
+        ctx.set(0, 68, 0, sand);
+        ctx.set(0, 69, 0, stone);
+        ctx.set(0, 70, 0, fern);
+
+        // Column (1, _, 0): disk writes y=68, y=69 is air, y=70 is fern — stopping on air at y=69
+        // must prevent marking y=70.
+        ctx.set(1, 68, 0, sand);
+        ctx.set(1, 70, 0, fern);
+
+        let disk_json = jparse(
+            br#"{
+                "type": "minecraft:disk",
+                "config": {
+                    "half_height": 0,
+                    "radius": 1,
+                    "state_provider": {
+                        "fallback": {
+                            "type": "minecraft:simple_state_provider",
+                            "state": { "Name": "minecraft:gravel" }
+                        },
+                        "rules": []
+                    },
+                    "target": {
+                        "type": "minecraft:matching_blocks",
+                        "blocks": ["minecraft:sand"]
+                    }
+                }
+            }"#,
+        )
+        .expect("parse disk config");
+        let cf: Cf = super::p_cf(&disk_json).expect("disk Cf");
+        let mut rng = Xor::seed_worldgen(1);
+        gen_cf(&cf, fr, &mut ctx, &mut rng, (0, 68, 0));
+
+        let marks = ctx.g.take_shape_marks(0, 0);
+        assert!(
+            marks.contains(&(0, 69, 0)) && marks.contains(&(0, 70, 0)),
+            "disk at (0,68,0) must mark both (0,69,0) and (0,70,0), got {marks:?}"
+        );
+        assert!(
+            !marks.contains(&(1, 70, 0)),
+            "air at (1,69,0) must stop markAboveForPostProcessing before (1,70,0), got {marks:?}"
+        );
+    }
+
+    /// `LakeFeature` (`ect.a`) calls `markAboveForPostProcessing` at two sites: after placing
+    /// `CAVE_AIR` (`y >= 4`, NOT for `y < 4` fluid) and after placing the `barrier` block.
+    #[test]
+    fn lake_feature_marks_above_at_cave_air_and_barrier_sites() {
+        let reg = breg().expect("block registry");
+        let fr = freg();
+        let mut g = Gen::load(0, crate::name_to_state).expect("gen");
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+
+        let stone = reg.state_of("minecraft:stone", None);
+        let dirt_path = reg.state_of("minecraft:dirt_path", None);
+        let fern = reg.state_of("minecraft:fern", None);
+        let lava = reg.state_of("minecraft:lava", None);
+        let cave_air = reg.state_of("minecraft:cave_air", None);
+
+        // Anchor is (pos.0, pos.1 - 4, pos.2) = (0, 60, 0) for pos = (0, 64, 0).
+        // Fill 16x10x16 stone volume around (0..16, 60..69, 0..16) with dirt_path at y=68 and
+        // ferns at y=69 so both cave_air carves (anchor.y+4..7) and barrier writes mark ferns above.
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 60..=67 {
+                    ctx.set(x, y, z, stone);
+                }
+                ctx.set(x, 68, z, dirt_path);
+                ctx.set(x, 69, z, fern);
+            }
+        }
+
+        let lake_json = jparse(
+            br#"{
+                "type": "minecraft:lake",
+                "config": {
+                    "fluid": {
+                        "type": "minecraft:simple_state_provider",
+                        "state": { "Name": "minecraft:lava", "Properties": { "level": "0" } }
+                    },
+                    "barrier": {
+                        "type": "minecraft:simple_state_provider",
+                        "state": { "Name": "minecraft:mossy_cobblestone" }
+                    }
+                }
+            }"#,
+        )
+        .expect("parse lake config");
+        let cf: Cf = super::p_cf(&lake_json).expect("lake Cf");
+        let mut rng = Xor::seed_worldgen(4242);
+        gen_cf(&cf, fr, &mut ctx, &mut rng, (0, 64, 0));
+
+        let mossy = reg.state_of("minecraft:mossy_cobblestone", None);
+        let marks = ctx.g.take_shape_marks(0, 0);
+
+        // Find at least one barrier write (mossy_cobblestone) that has non-air above at y+1/y+2,
+        // and verify those cells were marked by the barrier site.
+        let mut checked_barrier = false;
+        let mut checked_cave_air = false;
+        let mut checked_fluid = false;
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 60..=68 {
+                    let st = ctx.get(x, y, z);
+                    if st == mossy && !reg.is_air(ctx.get(x, y + 1, z)) {
+                        assert!(
+                            marks.contains(&(x, y + 1, z)),
+                            "lake barrier at ({x},{y},{z}) must mark ({x},{},{z})",
+                            y + 1
+                        );
+                        checked_barrier = true;
+                    }
+                    if st == cave_air && y >= 64 && !reg.is_air(ctx.get(x, y + 1, z)) {
+                        assert!(
+                            marks.contains(&(x, y + 1, z)),
+                            "lake cave_air (y>=4) at ({x},{y},{z}) must mark ({x},{},{z})",
+                            y + 1
+                        );
+                        checked_cave_air = true;
+                    }
+                    // Fluid cell at y=63 (grid y=3 < 4) whose cell above (y=64) stayed stone (not
+                    // cave_air and not barrier) must NOT have been marked by the fluid write.
+                    if st == lava && y == 63 && ctx.get(x, 64, z) == stone {
+                        checked_fluid = true;
+                        assert!(
+                            !marks.contains(&(x, 64, z)),
+                            "lake fluid (y<4) at ({x},{y},{z}) must not mark ({x},64,{z})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked_barrier, "expected a lake barrier cell with non-air above");
+        assert!(checked_cave_air, "expected a lake cave_air cell with non-air above");
+        let _ = checked_fluid;
+    }
 }
 
 // The unified StructureSet / StructureStart pipeline. Included rather than declared as a

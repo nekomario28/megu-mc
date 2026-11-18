@@ -154,6 +154,10 @@ pub(crate) trait TemplateWorld {
     fn level_next_bound(&mut self, pos: Pos, bound: i32) -> i32 {
         Lcg::new(hash_block_pos(pos.0, pos.1, pos.2) as u64).next_bound(bound)
     }
+    /// `ChunkAccess.markPosForPostprocessing` (`StructurePiece.placeBlock` for
+    /// `SHAPE_CHECK_BLOCKS`). A synthetic oracle scene has no owning chunk, so the
+    /// default is a no-op and the scripted oracles do not move.
+    fn mark_shape(&mut self, _pos: Pos) {}
 }
 
 impl TemplateWorld for crate::generation_context::FC<'_> {
@@ -206,6 +210,9 @@ impl TemplateWorld for crate::generation_context::FC<'_> {
     }
     fn raw_brightness(&mut self, pos: Pos) -> Option<u8> {
         crate::generation_context::FC::raw_brightness(self, pos.0, pos.1, pos.2)
+    }
+    fn mark_shape(&mut self, pos: Pos) {
+        self.shape_marks.push(pos);
     }
 }
 
@@ -874,6 +881,9 @@ pub(crate) fn place_in_world<W: TemplateWorld>(
         }
         if !world.set(block.pos.0, block.pos.1, block.pos.2, state) {
             continue;
+        }
+        if reg.needs_postprocess_shape(state) {
+            world.mark_shape(block.pos);
         }
         out.writes += 1;
         written.push(block.pos);
@@ -1886,7 +1896,8 @@ pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
         if matches!(reg.name_of(state), "minecraft:water" | "minecraft:lava") {
             continue;
         }
-        let updated = update_from_neighbour_shapes(reg, state, world, pos);
+        let updated = postprocess_bush_shape(reg, state, world, pos)
+            .unwrap_or_else(|| update_from_neighbour_shapes(reg, state, world, pos));
         if updated != state {
             if trace
                 .as_deref()
@@ -1907,6 +1918,86 @@ pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
         }
     }
     changed
+}
+
+/// `BushBlock.updateShape` (`dgh.a`) and `DoublePlantBlock.updateShape` (`dig.a`) for
+/// `LevelChunk.postProcessGeneration` (`dvi.H`) only — NOT shared `update_shape`, because
+/// `apply_shape_passes` runs at structure placement time while a later piece/layer may write the
+/// substrate.
+///
+/// From the pinned 1.21.1 bytecode:
+/// * `BushBlock` (`dgh`) checks `!state.canSurvive(level, pos) -> AIR`, with
+///   `mayPlaceOn = state.is(BlockTags.DIRT) || state.is(Blocks.FARMLAND)`. Exactly the
+///   subclasses inheriting `updateShape`, `canSurvive`, and `mayPlaceOn` unchanged are
+///   `TallGrassBlock` (`short_grass`, `fern`), `FlowerBlock` (the 13 non-wither small flowers),
+///   `SaplingBlock` (the 7 non-mangrove/azalea saplings), `PinkPetalsBlock`, and
+///   `SweetBerryBushBlock`.
+/// * `DoublePlantBlock` (`dig`) / `TallFlowerBlock` (`dod`) pair `lower`/`upper` halves on the
+///   vertical axis and delegate the `lower` half's substrate check to `BushBlock.canSurvive`.
+fn postprocess_bush_shape<W: TemplateWorld>(
+    reg: &BReg,
+    state: u32,
+    world: &mut W,
+    pos: Pos,
+) -> Option<u32> {
+    let name = reg.name_of(state);
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    let air = reg.state_of("minecraft:air", None);
+    let is_plain_bush = matches!(
+        bare,
+        "short_grass"
+            | "fern"
+            | "pink_petals"
+            | "sweet_berry_bush"
+            | "oak_sapling"
+            | "spruce_sapling"
+            | "birch_sapling"
+            | "jungle_sapling"
+            | "acacia_sapling"
+            | "cherry_sapling"
+            | "dark_oak_sapling"
+            | "dandelion"
+            | "torchflower"
+            | "poppy"
+            | "blue_orchid"
+            | "allium"
+            | "azure_bluet"
+            | "red_tulip"
+            | "orange_tulip"
+            | "white_tulip"
+            | "pink_tulip"
+            | "oxeye_daisy"
+            | "cornflower"
+            | "lily_of_the_valley"
+    );
+    if is_plain_bush {
+        let below = world.get(pos.0, pos.1 - 1, pos.2);
+        let ok = reg.in_tag(below, "minecraft:dirt") || reg.name_of(below) == "minecraft:farmland";
+        return Some(if ok { state } else { air });
+    }
+    if matches!(
+        bare,
+        "tall_grass" | "large_fern" | "sunflower" | "lilac" | "rose_bush" | "peony"
+    ) {
+        let half = reg.get_prop(state, "half");
+        let ok = match half.as_deref() {
+            Some("upper") => {
+                let below = world.get(pos.0, pos.1 - 1, pos.2);
+                reg.name_of(below) == name
+                    && reg.get_prop(below, "half").as_deref() == Some("lower")
+            }
+            Some("lower") => {
+                let below = world.get(pos.0, pos.1 - 1, pos.2);
+                let above = world.get(pos.0, pos.1 + 1, pos.2);
+                (reg.in_tag(below, "minecraft:dirt") || reg.name_of(below) == "minecraft:farmland")
+                    && reg.name_of(above) == name
+                    && reg.get_prop(above, "half").as_deref() == Some("upper")
+            }
+            _ => false,
+        };
+        return Some(if ok { state } else { air });
+    }
+    None
 }
 
 /// `Block.updateFromNeighbourShapes` — `UPDATE_SHAPE_ORDER` is
@@ -5274,4 +5365,125 @@ mod template_structures_tests {
         None
     }
 
+    /// P2-1-T0: `place_in_world` marks transformed `SHAPE_CHECK_BLOCKS` cells on `FC` so
+    /// promotion rewrites them when a later carver/lake removes their neighbour.
+    #[test]
+    fn place_in_world_marks_transformed_shape_check_block_on_fc() {
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+        let mut ctx = crate::generation_context::FC::new(&mut g);
+        ctx.test_default_air = true;
+
+        // With `Rotation::Clockwise90` around pivot `(0, 0, 0)`, local `(1, 0, 0)` transforms to
+        // `(0, 0, 1)`, so origin `(4, 70, 4)` places the fence at `(4, 70, 5)`.
+        let transformed_pos = (4, 70, 5);
+        ctx.set(5, 70, 5, reg.state_of("minecraft:stone", None));
+
+        let tpl = crate::structure_template::Template {
+            size: (2, 1, 1),
+            palettes: vec![vec![crate::structure_template::BlockInfo {
+                pos: (1, 0, 0),
+                state: reg.state_of("minecraft:oak_fence", None),
+                nbt: None,
+            }]],
+            entities: Vec::new(),
+        };
+        let settings = Settings::new(Mirror::None, Rotation::Clockwise90, (0, 0, 0));
+        let mut rng = Xor::seed_worldgen(13);
+        place_in_world(&mut ctx, &tpl, (4, 70, 4), (0, 0, 0), &settings, &mut rng, 0, reg)
+            .expect("place_in_world succeeds");
+
+        assert!(
+            ctx.shape_marks.contains(&transformed_pos),
+            "transformed oak_fence must file a shape mark at {transformed_pos:?}, got {:?}",
+            ctx.shape_marks
+        );
+        assert_eq!(
+            reg.get_prop(ctx.get(4, 70, 5), "east").as_deref(),
+            Some("true")
+        );
+
+        ctx.set(5, 70, 5, reg.state_of("minecraft:air", None));
+        let marks = std::mem::take(&mut ctx.shape_marks);
+        postprocess_shape_marks(&mut ctx, reg, &marks);
+        assert_eq!(
+            reg.get_prop(ctx.get(4, 70, 5), "east").as_deref(),
+            Some("false"),
+            "promotion must disconnect the marked fence after its neighbour is removed"
+        );
+    }
+
+    /// `BushBlock.updateShape` (`dgh.a`) and `DoublePlantBlock.updateShape` (`dig.a`) run during
+    /// `LevelChunk.postProcessGeneration` (`postprocess_shape_marks`), NOT shared `update_shape`
+    /// (`apply_shape_passes`), removing plants above non-`#minecraft:dirt`/non-`farmland` blocks
+    /// (e.g. `fern` above `dirt_path` at `(82,69,-500)`).
+    #[test]
+    fn postprocess_shape_marks_removes_unsupported_bush_blocks_only_at_promotion() {
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+        let mut ctx = crate::generation_context::FC::new(&mut g);
+        ctx.test_default_air = true;
+
+        let fern = reg.state_of("minecraft:fern", None);
+        let short_grass = reg.state_of("minecraft:short_grass", None);
+        let dandelion = reg.state_of("minecraft:dandelion", None);
+        let sapling = reg.state_of("minecraft:spruce_sapling", None);
+        let tall_lower = reg.with_prop(reg.state_of("minecraft:tall_grass", None), "half", "lower");
+        let tall_upper = reg.with_prop(reg.state_of("minecraft:tall_grass", None), "half", "upper");
+        let double_ok_lower = reg.with_prop(reg.state_of("minecraft:large_fern", None), "half", "lower");
+        let double_ok_upper = reg.with_prop(reg.state_of("minecraft:large_fern", None), "half", "upper");
+
+        // Unsupported on `dirt_path` and `stone`, supported on `grass_block` and `farmland`.
+        ctx.set(0, 69, 0, reg.state_of("minecraft:dirt_path", None));
+        ctx.set(0, 70, 0, fern);
+
+        ctx.set(1, 69, 0, reg.state_of("minecraft:stone", None));
+        ctx.set(1, 70, 0, short_grass);
+
+        ctx.set(2, 69, 0, reg.state_of("minecraft:grass_block", None));
+        ctx.set(2, 70, 0, fern);
+
+        ctx.set(3, 69, 0, reg.state_of("minecraft:farmland", None));
+        ctx.set(3, 70, 0, dandelion);
+
+        ctx.set(4, 69, 0, reg.state_of("minecraft:stone", None));
+        ctx.set(4, 70, 0, sapling);
+
+        ctx.set(5, 69, 0, reg.state_of("minecraft:stone", None));
+        ctx.set(5, 70, 0, tall_lower);
+        ctx.set(5, 71, 0, tall_upper);
+
+        ctx.set(6, 69, 0, reg.state_of("minecraft:dirt", None));
+        ctx.set(6, 70, 0, double_ok_lower);
+        ctx.set(6, 71, 0, double_ok_upper);
+
+        // Shared `apply_shape_passes` must NOT remove plants during structure placement.
+        apply_shape_passes(&[(0, 70, 0), (1, 70, 0)], &mut ctx, reg);
+        assert_eq!(ctx.get(0, 70, 0), fern);
+        assert_eq!(ctx.get(1, 70, 0), short_grass);
+
+        let marks = vec![
+            (0, 70, 0),
+            (1, 70, 0),
+            (2, 70, 0),
+            (3, 70, 0),
+            (4, 70, 0),
+            (5, 70, 0),
+            (5, 71, 0),
+            (6, 70, 0),
+            (6, 71, 0),
+        ];
+        postprocess_shape_marks(&mut ctx, reg, &marks);
+
+        let air = reg.state_of("minecraft:air", None);
+        assert_eq!(ctx.get(0, 70, 0), air, "fern over dirt_path must be removed");
+        assert_eq!(ctx.get(1, 70, 0), air, "short_grass over stone must be removed");
+        assert_eq!(ctx.get(2, 70, 0), fern, "fern over grass_block must remain");
+        assert_eq!(ctx.get(3, 70, 0), dandelion, "dandelion over farmland must remain");
+        assert_eq!(ctx.get(4, 70, 0), air, "sapling over stone must be removed");
+        assert_eq!(ctx.get(5, 70, 0), air, "tall_grass lower over stone must be removed");
+        assert_eq!(ctx.get(5, 71, 0), air, "tall_grass upper without lower must be removed");
+        assert_eq!(ctx.get(6, 70, 0), double_ok_lower, "large_fern lower over dirt must remain");
+        assert_eq!(ctx.get(6, 71, 0), double_ok_upper, "large_fern upper over lower must remain");
+    }
 }

@@ -43,7 +43,7 @@ Biome境界: 現状**専用行を持たない**。v1では「各windowに跨るb
 
 受入必須(現時点でcapture/gateが存在): `mineshaft`, `stronghold`, `nether_fortress`,
 `nether_fossil`, `end_city`, `ruined_portal`(captureのみでgate未), `village`(taiga,
-captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部分), `jungle_temple`(MATCH —
+**MATCH — 2026-11-18に3→1→0/884,736**。`expected_runtime_writes` count 5 (`writes_sha256 62fc3ddc…`) は独立captureで同一。残差1セル `(82,69,−500)` は P2-1-T0 + `Feature.markAboveForPostProcessing` + promotion限定 `BushBlock` 除去で閉じた), `trial_chamber`(stronghold chunk内で部分), `jungle_temple`(MATCH —
 2026-11-18に121→**0**(47→0)。残差47はdripstone_cavesの地下グループで、原因は
 `ClampedNormalInt`(`bpr`)の`f2i`切り捨てを`round()`で実装していたこと。樹冠/east-edge bandは残差0。
 `evidence/gameplay/feature-parity/jungle-east-edge-vine-edge-shape-20261118.md`,
@@ -76,7 +76,7 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
 | matrix-v2 4行(end-city/basalt/fossil/sculk) | **MATCH**(exit 0) |
 | fortress 0/256 | **MATCH**(0/65536、`expected_runtime_writes` 宣言済み・検証済み) |
 | fortress 0/128(matrix-v1) | **MATCH**(0/32768、同じ宣言。宣言値が両captureでbit一致) |
-| village-taiga | 宣言は検証済みだが比較**DIFF 1/884736** — 受入行にしない(§3)。残る1セル (82,69,−500) は 2026-11-18 の `markPosForPostprocessing` 実測で**機構B**(未実装のmark源 `Feature.markAboveForPostProcessing` 経由。nativeは `LakeFeature` が (82,67,−500) に書いた stone=barrier の上2セルを mark しており、port側も同じ書き込みを `FWRITE … state=1 feature=1,1` として記録済み=**disk配置は一致**)と判定済み — `village-taiga-promotion-footprint-20261118.md` §7 |
+| village-taiga | **MATCH**(0/884736、2026-11-18実測、3→1→**0**)。`expected_runtime_writes` 宣言済み(count 5、`writes_sha256 62fc3ddc…`)。P2-1-T0 + `Feature.markAboveForPostProcessing` + promotion限定 `BushBlock` 除去で閉じた。3 capture (`nat-4242-village-taiga`, `nat-4242-village-marktrace`, `nat-taiga-mlight`) すべて 0/884,736・`OCEAN_FLOOR` 0列差、`manifest-promotable.json` に昇格済み(11→12行、exit 0)。対照: `--mode terrain` 76,736/884,736・seed 4243 185,879/884,736 |
 | jungle-temple | **MATCH**(0/98304、2026-11-18実測)。121 → 47(樹冠、vine lane)→ **0**(`ClampedNormalInt`の`f2i`切り捨て、`jungle-dripstone-random-offset-20261118.md`)。port dumpはnative chunkとbyte一致(`77964c22…a715bf`) |
 | Overworld (3,−2) | **MATCH(Revision 1の順序入力比較)** — order-A vs Native A 0/98,304・order-B vs Native B 0/98,304(2026-11-18 S01実測、負の対照: 既定順序30/98,304)。既定順序は名前つきメンバーでありbit一致しないことが文書化済み |
 | forest 3×3・dimension_terrain 4件・(0,0)・stronghold・(−96,35) | committed gate緑(新SHAでの再検証は行ごとに必要) |
@@ -254,6 +254,20 @@ binaryで再生成して比較した。raw: `audit/p2-1-acceptance-s04-s07-20261
      と `ow-4242-structures-6-7--64-384`(ruined-portal)。§2は(6,7)も(74,−41)も宣言していないので、
      これらの行は §3 の構造物リストの主張(`jungle_temple`/`ruined_portal` の「MATCH」)を支えるが、
      §5のGoal文(§2のwindow集合上の量化)には入らない。§2は凍結なので、追加はrevisionで行う。
+
+**2026-11-18 P2-1-T0 + village-taiga 収束(S08、基点 `354128a`)**
+
+- **P2-1-T0(`StructurePiece.placeBlock` `SHAPE_CHECK_BLOCKS` mark配線)**:
+  `src/template_structures.rs`(`TemplateWorld::mark_shape`、および `FC` 実装 `self.shape_marks.push(pos)` を `place_in_world` の変換済み state 書き込み後で呼び出し)と `src/jigsaw_structures.rs`(`JigsawTarget::mark_shape` を `place_single_or_legacy` の `target.set_world` 後で呼び出し)を接続した。`TestWorld` と `JigsawTarget::Scene` は no-op のため既存 oracle は不変。
+- **`Feature.markAboveForPostProcessing`(`ece.a`) + promotion限定 `BushBlock` 除去**:
+  pinned jar (`59353fb40c36d304f2035d51e7d6e6baa98dc05c`) + official mappings (`03f8985492bda0afc0898465341eb0acef35f570`) を `javap -p -c` で確認し、`MarkSrc::FeatureAbove`(`"above"`, `src/worldgen.rs`)と `mark_above_for_post_processing`(`y+1`/`y+2` を最初の air または build height 外で停止、`src/feature.rs`)を `Cf::Disk` と `Cf::Lake`(`y >= 4` の `cave_air` 書き込み時と `barrier` 書き込み時の2箇所、`<4` の fluid では呼ばない)から呼び出した。`postprocess_bush_shape`(`src/template_structures.rs`)は `BushBlock` 階層(25単体種: `TallGrassBlock`, 非wither 13小花, 非azalea/mangrove 7苗木, `pink_petals`, `sweet_berry_bush`)および `DoublePlantBlock` 6種を `postprocess_shape_marks` のみに限定して適用した(共有 `update_shape` には入れない)。
+- **S08 village-taiga — Overworld `(4,−32)` 3×3 seed 4242 — `1 → 0 / 884,736`(MATCH)**:
+  - `matrix-v1/nat-4242-village-taiga`(recorded order `03d15e34…`): **0 / 884,736**、`OCEAN_FLOOR` 0列差、port dump `0dd5a9d8abb350c3d73adaa573aa083a128b8eaa75ef3a5d696618a1d11654e8`。
+  - `matrix-v2/nat-4242-village-marktrace`(recorded order `5f2eea53…`): **0 / 884,736**、`OCEAN_FLOOR` 0列差、port dump `0dd5a9d8abb350c3…`(両captureで同一)。`MARK_TRACE=all` 上で `(82,69,−500)` が `chunk=5,-32 src=above` としてマークされ、promotion により `air` へ書き換わることを確認。
+  - `t6b/nat-taiga-mlight`(recorded order `d1b02f30…`): **0 / 884,736**、`OCEAN_FLOOR` 0列差。
+  - **対照**: `--mode terrain` = **76,736 / 884,736**、wrong-seed `4243` = **185,879 / 884,736**。
+  - **`manifest-promotable.json` 昇格**: `ow-4242-structures-4--32--64-384-n3` を追加し **11 → 12行、12 MATCH / 0 DIFF / 0 INVALID、exit 0** (`expected_runtime_writes`: count 5 = `air`×3 + `water[level=1]`×2、`writes_sha256 62fc3ddcc136e96cad1e45fc197a744fbe7f807d0a47db5ae2ecdda09b7cdde1`、両独立captureで同一)。なお(6,7)・(74,−41)と同様に `(4,−32)` 3×3 も凍結済み §2 には含まれないため §3 の `village` = MATCH と `manifest-promotable.json` を支える行であり、§2 の追加は別 revision に委ねる。
+  - **seed-0 64-chunk identity dump(`MC_SPINE_WG_DUMP_N=8`)**: `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def`(25,165,824 B) **bit-identical**。詳細は `evidence/gameplay/feature-parity/village-taiga-p2-1-t0-and-mark-above-closure-20261118.md`。
 
 ## 改定規則
 

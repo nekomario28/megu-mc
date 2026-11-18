@@ -2428,6 +2428,16 @@ impl JigsawTarget<'_, '_> {
         }
     }
 
+    fn mark_shape(&mut self, p: Pos) {
+        match self {
+            #[cfg(test)]
+            Self::Scene { .. } => {}
+            Self::Live(ctx) => {
+                ctx.mark_shape(p.0, p.1, p.2);
+            }
+        }
+    }
+
     fn gravity_surface(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
         match self {
             #[cfg(test)]
@@ -2740,6 +2750,9 @@ fn place_single_or_legacy<D: JigsawData>(
             );
         }
         target.set_world(p, placed);
+        if reg.needs_postprocess_shape(placed) {
+            target.mark_shape(p);
+        }
         written.push(p);
 
         if let Some(nbt) = info.nbt.as_ref() {
@@ -3533,6 +3546,54 @@ pub(crate) mod jigsaw_structures {
             "{} mismatches:\n{}",
             mismatches.len(),
             mismatches.join("\n")
+        );
+    }
+
+    /// P2-1-T0: placing a jigsaw piece files a `SHAPE_CHECK_BLOCKS` mark on `FC` for the
+    /// transformed/placed state so later chunk promotion (`postprocess_shape_marks`) updates the
+    /// cell if an adjacent carver/lake removes its neighbour.
+    #[test]
+    fn jigsaw_piece_marks_shape_check_block_and_promotion_disconnects_it() {
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+        let mut repo = empty_repo();
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+        // Neighbour present when the fence piece is placed (connects `east=true` during placement),
+        // then carved away before promotion.
+        ctx.set(1, 70, 0, reg.state_of("minecraft:stone", None));
+        let mut rng = Xor::seed_worldgen(9);
+        place_single_block_piece(
+            &mut repo,
+            "spinetest:fence_piece",
+            reg.state_of("minecraft:oak_fence", None),
+            None,
+            (0, 70, 0),
+            7,
+            &mut ctx,
+            &mut rng,
+            reg,
+        )
+        .expect("fence piece places");
+
+        assert!(
+            ctx.shape_marks.contains(&(0, 70, 0)),
+            "oak_fence must file a shape mark on placement, got {:?}",
+            ctx.shape_marks
+        );
+        assert_eq!(
+            reg.get_prop(ctx.get(0, 70, 0), "east").as_deref(),
+            Some("true"),
+            "fence connects east during jigsaw placement"
+        );
+
+        ctx.set(1, 70, 0, reg.state_of("minecraft:air", None));
+        let marks = std::mem::take(&mut ctx.shape_marks);
+        crate::structure_template::postprocess_shape_marks(&mut ctx, reg, &marks);
+        assert_eq!(
+            reg.get_prop(ctx.get(0, 70, 0), "east").as_deref(),
+            Some("false"),
+            "promotion must disconnect the marked fence after its neighbour is carved"
         );
     }
     }
