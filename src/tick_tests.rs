@@ -313,6 +313,7 @@ struct WorldSnapshot {
     region: crate::RegionSets,
     scheduled_blocks: scheduled_ticks::ScheduledTicks,
     generated_fluids: Option<GeneratedFluidOwner>,
+    pending_block_loot: HashMap<BlockPos, PendingBlockLoot>,
 }
 impl WorldSnapshot {
     fn take() -> WorldSnapshot {
@@ -330,6 +331,7 @@ impl WorldSnapshot {
             generated_fluids: GENERATED_FLUID_OWNER.get().map(|owner| {
                 std::mem::replace(&mut *owner.lock().unwrap(), GeneratedFluidOwner::new())
             }),
+            pending_block_loot: std::mem::take(&mut *pending_block_loot().lock().unwrap()),
         }
     }
 }
@@ -354,6 +356,8 @@ impl std::ops::Drop for WorldSnapshot {
                 .take()
                 .unwrap_or_else(GeneratedFluidOwner::new);
         }
+        *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) =
+            std::mem::take(&mut self.pending_block_loot);
     }
 }
 
@@ -6399,20 +6403,27 @@ fn chest_contract_recheck_openers_reach_and_lid_close() {
 
     // Ender chest anchor reach check (`is_ender_key`).
     let _ = frames_on(&mut r1);
+    let ender_pos: BlockPos = (90, y, 60);
+    set_block(
+        ender_pos.0,
+        ender_pos.1,
+        ender_pos.2,
+        breg().expect("block registry").state_of("minecraft:ender_chest", None),
+    );
     let ek = ContainerKey::Block(ender_key(&v1.uuid));
     *v1.pos.lock().unwrap() = (88.5, f64::from(y), 60.5, 0.0, 0.0, true);
-    open_chest_for_client(&v1, (ek, None), Some(right), &HashMap::new(), "Ender Chest");
+    open_chest_for_client(&v1, (ek, None), Some(ender_pos), &HashMap::new(), "Ender Chest");
     let _ = frames_on(&mut r1);
     chest_viewer_tick_on(&audience);
     assert!(v1.open_chest.lock().unwrap().is_some());
-    *v1.pos.lock().unwrap() = (99.0, f64::from(y), 60.5, 0.0, 0.0, true);
+    *v1.pos.lock().unwrap() = (100.0, f64::from(y), 60.5, 0.0, 0.0, true);
     chest_viewer_tick_on(&audience);
     assert!(v1.open_chest.lock().unwrap().is_none());
     assert!(frames_on(&mut r1)
         .iter()
         .any(|(pid, body)| *pid == 0x12 && *body == vec![1u8]));
 
-    for cell in [left, right] {
+    for cell in [left, right, ender_pos] {
         set_block(cell.0, cell.1, cell.2, 0);
     }
 }
@@ -6632,3 +6643,508 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     set_test_region(old_hot, old_warm);
     assert_eq!(first, "54d762909d3321a41cfd670c7ff0baa9");
 }
+
+// ---------- chest world-side contract remainder (M2 slice 3d) ----------
+
+fn decode_block_updates(frames: Vec<(i64, Vec<u8>)>) -> Vec<(BlockPos, u32)> {
+    frames
+        .into_iter()
+        .filter(|(pid, _)| *pid == 0x09)
+        .filter_map(|(_, body)| {
+            if body.len() < 9 {
+                return None;
+            }
+            let pos = read_pos(&body[..8]);
+            let mut sl = &body[8..];
+            let state = read_varint(&mut sl)? as u32;
+            Some((pos, state))
+        })
+        .collect()
+}
+
+#[test]
+fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+
+    let reg = breg().expect("block registry");
+    let chest_pos: BlockPos = (92, 170, 60);
+    let save_pos: BlockPos = (93, 170, 60);
+    let break_pos: BlockPos = (94, 170, 60);
+    set_block(chest_pos.0, chest_pos.1, chest_pos.2, chest_state("chest"));
+    set_block(save_pos.0, save_pos.1, save_pos.2, reg.state_of("minecraft:barrel", None));
+    set_block(break_pos.0, break_pos.1, break_pos.2, chest_state("chest"));
+
+    let payloads = vec![
+        (
+            chest_pos,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                kind: crate::generation_payload::ContainerKind::Chest,
+                loot_table: "minecraft:chests/abandoned_mineshaft".to_owned(),
+                loot_seed: Some(424242),
+            },
+        ),
+        (
+            save_pos,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                kind: crate::generation_payload::ContainerKind::BlockContainer(27),
+                loot_table: "minecraft:chests/abandoned_mineshaft".to_owned(),
+                loot_seed: Some(13579),
+            },
+        ),
+        (
+            break_pos,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                kind: crate::generation_payload::ContainerKind::Chest,
+                loot_table: "minecraft:chests/abandoned_mineshaft".to_owned(),
+                loot_seed: Some(24680),
+            },
+        ),
+    ];
+    materialize_generation_payloads(payloads);
+
+    assert!(
+        !chests().lock().unwrap().contains_key(&ContainerKey::Block(chest_pos)),
+        "placed chest with LootTable must remain unmaterialized before first open"
+    );
+    assert!(
+        !chests().lock().unwrap().contains_key(&ContainerKey::Block(save_pos)),
+        "placed barrel with LootTable must remain unmaterialized before first open"
+    );
+
+    // Save and reload before opening preserves unexpanded LootTable+LootTableSeed.
+    let mut saved = Vec::new();
+    save_world_into(&mut saved);
+    chests().lock().unwrap().clear();
+    load_world_from(&saved).unwrap();
+    assert!(
+        !chests().lock().unwrap().contains_key(&ContainerKey::Block(save_pos)),
+        "save/reload before opening must not expand LootTable early"
+    );
+
+    // Non-spectator open unpacks deterministically once and clears pending metadata.
+    let (viewer, _rx) = fast_chest_viewer(301, chest_pos);
+    *viewer.gm.lock().unwrap() = 0;
+    open_chest_for_client(
+        &viewer,
+        (ContainerKey::Block(chest_pos), None),
+        None,
+        &HashMap::new(),
+        "Chest",
+    );
+    let expected_chest = roll_cart_loot(424242);
+    assert_eq!(
+        chests().lock().unwrap().get(&ContainerKey::Block(chest_pos)).cloned(),
+        Some(expected_chest.clone())
+    );
+    // Clearing slot 0 and re-opening must NOT re-roll the loot table.
+    chests()
+        .lock()
+        .unwrap()
+        .entry(ContainerKey::Block(chest_pos))
+        .or_default()
+        .clear();
+    open_chest_for_client(
+        &viewer,
+        (ContainerKey::Block(chest_pos), None),
+        None,
+        &HashMap::new(),
+        "Chest",
+    );
+    assert!(
+        chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::Block(chest_pos))
+            .unwrap()
+            .is_empty(),
+        "loot table must clear after first unpack and not refill on second open"
+    );
+
+    // Saved/reloaded barrel unpacks deterministically from its saved LootTableSeed.
+    open_chest_for_client(
+        &viewer,
+        (ContainerKey::Block(save_pos), None),
+        None,
+        &HashMap::new(),
+        "Barrel",
+    );
+    assert_eq!(
+        chests().lock().unwrap().get(&ContainerKey::Block(save_pos)).cloned(),
+        Some(roll_cart_loot(13579))
+    );
+
+    // Breaking an unopened loot chest materializes and spills its drops.
+    let drops_before = drops().lock().unwrap().len();
+    set_block(break_pos.0, break_pos.1, break_pos.2, 0);
+    let expected_drop_count = roll_cart_loot(24680)
+        .values()
+        .filter(|(it, cnt, _)| *it > 0 && *cnt > 0)
+        .count();
+    assert_eq!(
+        drops().lock().unwrap().len(),
+        drops_before + expected_drop_count,
+        "breaking an unopened loot chest must unpack and drop its rolled loot stacks"
+    );
+
+    // Custom datapack loot table rolls deterministically from explicit LootTableSeed.
+    let custom_table = "test:slice3d_seeded_loot";
+    loot_tables().lock().unwrap().insert(
+        custom_table.to_owned(),
+        vec![LootPool {
+            rolls: 3,
+            chance: 1.0,
+            entries: vec![
+                LootEntry { item: 264, min: 1, max: 4, funcs: Vec::new() },
+                LootEntry { item: 265, min: 2, max: 7, funcs: Vec::new() },
+                LootEntry { item: 266, min: 1, max: 3, funcs: Vec::new() },
+            ],
+            funcs: Vec::new(),
+        }],
+    );
+    let seed_a: BlockPos = (95, 170, 60);
+    let seed_b: BlockPos = (95, 170, 62);
+    set_block(seed_a.0, seed_a.1, seed_a.2, chest_state("chest"));
+    set_block(seed_b.0, seed_b.1, seed_b.2, chest_state("chest"));
+    materialize_generation_payloads(vec![
+        (
+            seed_a,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                kind: crate::generation_payload::ContainerKind::Chest,
+                loot_table: custom_table.to_owned(),
+                loot_seed: Some(987654321),
+            },
+        ),
+        (
+            seed_b,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                kind: crate::generation_payload::ContainerKind::Chest,
+                loot_table: custom_table.to_owned(),
+                loot_seed: Some(987654321),
+            },
+        ),
+    ]);
+    open_chest_for_client(
+        &viewer,
+        (ContainerKey::Block(seed_a), None),
+        None,
+        &HashMap::new(),
+        "Chest",
+    );
+    open_chest_for_client(
+        &viewer,
+        (ContainerKey::Block(seed_b), None),
+        None,
+        &HashMap::new(),
+        "Chest",
+    );
+    let rolled_a = chests().lock().unwrap().get(&ContainerKey::Block(seed_a)).cloned();
+    let rolled_b = chests().lock().unwrap().get(&ContainerKey::Block(seed_b)).cloned();
+    assert!(rolled_a.as_ref().is_some_and(|m| !m.is_empty()));
+    assert_eq!(
+        rolled_a, rolled_b,
+        "custom loot_table with explicit LootTableSeed must materialize identically on first open"
+    );
+    loot_tables().lock().unwrap().remove(custom_table);
+
+    for pos in [chest_pos, save_pos, break_pos, seed_a, seed_b] {
+        chests().lock().unwrap().remove(&ContainerKey::Block(pos));
+        set_block(pos.0, pos.1, pos.2, 0);
+    }
+}
+
+#[test]
+fn chest_contract_3d_barrel_toggles_open_property_without_block_event() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+
+    let reg = breg().expect("block registry");
+    let barrel_pos: BlockPos = (96, 170, 60);
+    let closed_north = reg.with_prop(
+        reg.with_prop(reg.state_of("minecraft:barrel", None), "facing", "north"),
+        "open",
+        "false",
+    );
+    let open_north = reg.with_prop(closed_north, "open", "true");
+    set_block(barrel_pos.0, barrel_pos.1, barrel_pos.2, closed_north);
+
+    let (v1, mut r1) = fast_chest_viewer(311, barrel_pos);
+    let (v2, mut r2) = fast_chest_viewer(312, barrel_pos);
+    let (obs, mut r_obs) = fast_chest_viewer(313, barrel_pos);
+    let audience = [v1.clone(), v2.clone(), obs.clone()];
+    let win = (ContainerKey::Block(barrel_pos), None);
+
+    // 0 -> 1: open becomes true preserving facing=north, 0x09 broadcast, NO 0x08.
+    let before = chest_opener_snapshot(&audience, &[barrel_pos]);
+    open_chest_for_client(&v1, win, None, &HashMap::new(), "Barrel");
+    sync_chest_openers(&audience, &before);
+    assert_eq!(block_at(barrel_pos.0, barrel_pos.1, barrel_pos.2), open_north);
+    let obs_frames = frames_on(&mut r_obs);
+    assert!(
+        block_events(obs_frames.clone()).is_empty(),
+        "BarrelBlockEntity must never emit 0x08 block events"
+    );
+    assert_eq!(
+        decode_block_updates(obs_frames),
+        vec![(barrel_pos, open_north)],
+        "0 -> 1 transition must broadcast 0x09 BlockUpdate with open=true"
+    );
+    let _ = frames_on(&mut r1);
+
+    // 1 -> 2: remains open=true, no extra 0x09 or 0x08.
+    let before = chest_opener_snapshot(&audience, &[barrel_pos]);
+    open_chest_for_client(&v2, win, None, &HashMap::new(), "Barrel");
+    sync_chest_openers(&audience, &before);
+    assert_eq!(block_at(barrel_pos.0, barrel_pos.1, barrel_pos.2), open_north);
+    assert!(frames_on(&mut r_obs).is_empty(), "1 -> 2 must emit neither 0x08 nor 0x09");
+    let _ = frames_on(&mut r2);
+
+    // 2 -> 1: remains open=true, no extra 0x09 or 0x08.
+    let before = chest_opener_snapshot(&audience, &[barrel_pos]);
+    *v2.open_chest.lock().unwrap() = None;
+    *v2.chest_sync.lock().unwrap() = None;
+    sync_chest_openers(&audience, &before);
+    assert_eq!(block_at(barrel_pos.0, barrel_pos.1, barrel_pos.2), open_north);
+    assert!(frames_on(&mut r_obs).is_empty(), "2 -> 1 must stay open without packets");
+
+    // 1 -> 0: open returns to false preserving facing=north, 0x09 broadcast, NO 0x08.
+    let before = chest_opener_snapshot(&audience, &[barrel_pos]);
+    *v1.open_chest.lock().unwrap() = None;
+    *v1.chest_sync.lock().unwrap() = None;
+    sync_chest_openers(&audience, &before);
+    assert_eq!(block_at(barrel_pos.0, barrel_pos.1, barrel_pos.2), closed_north);
+    let obs_frames = frames_on(&mut r_obs);
+    assert!(block_events(obs_frames.clone()).is_empty());
+    assert_eq!(
+        decode_block_updates(obs_frames),
+        vec![(barrel_pos, closed_north)],
+        "1 -> 0 transition must broadcast 0x09 BlockUpdate with open=false"
+    );
+
+    set_block(barrel_pos.0, barrel_pos.1, barrel_pos.2, 0);
+}
+
+#[test]
+fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+    set_test_region(HashSet::from([(6, 3)]), HashSet::from([(6, 3)]));
+
+    let reg = breg().expect("block registry");
+    let stone = reg.state_of("minecraft:stone", None);
+    let air = reg.state_of("minecraft:air", None);
+
+    // Build an enclosed chamber inside chunk (6, 3) around (100, 170, 56).
+    {
+        let mut w = world().lock().unwrap();
+        let chunk = w.entry((6, 3)).or_default();
+        for y in 169..=171 {
+            for z in 54..=59 {
+                for x in 98..=104 {
+                    chunk.insert(local_idx(x, y, z), stone);
+                }
+            }
+        }
+    }
+    let left: BlockPos = (100, 170, 56);
+    let right: BlockPos = (101, 170, 56);
+    let open_west: BlockPos = (99, 170, 56);
+    let dry_chest = reg.with_prop(
+        reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:chest", None), "facing", "north"),
+            "type",
+            "single",
+        ),
+        "waterlogged",
+        "false",
+    );
+    let wet_left = reg.with_prop(
+        reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:chest", None), "facing", "north"),
+            "type",
+            "left",
+        ),
+        "waterlogged",
+        "true",
+    );
+    let wet_right = reg.with_prop(
+        reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:chest", None), "facing", "north"),
+            "type",
+            "right",
+        ),
+        "waterlogged",
+        "false",
+    );
+    set_block(open_west.0, open_west.1, open_west.2, air);
+    set_block(left.0, left.1, left.2, wet_left);
+    set_block(right.0, right.1, right.2, dry_chest);
+
+    // FluidReader must report dry chests as Solid instead of failing with unsupported fluid shape.
+    assert_eq!(
+        flowing_fluid::Reader::cell(&mut FluidReader, right),
+        Ok(flowing_fluid::Cell::Solid),
+        "dry chest adjacent to waterlogged chest must be Solid for FlowingFluid"
+    );
+
+    // Re-writing the right half to pair `(right, left)` schedules the waterlogged left half (+5 GT).
+    let base_tick = TICK_IDX.load(Ordering::Relaxed);
+    set_block(right.0, right.1, right.2, wet_right);
+    for step in 1..=4 {
+        TICK_IDX.store(base_tick + step, Ordering::Relaxed);
+        generated_fluid_tick();
+        assert_eq!(
+            block_at(open_west.0, open_west.1, open_west.2),
+            air,
+            "waterlogged chest must not flow before +5 GT"
+        );
+    }
+    TICK_IDX.store(base_tick + 5, Ordering::Relaxed);
+    generated_fluid_tick();
+    assert_eq!(
+        block_at(left.0, left.1, left.2),
+        wet_left,
+        "waterlogged chest half keeps its waterlogged block"
+    );
+    assert_eq!(
+        block_at(right.0, right.1, right.2),
+        wet_right,
+        "dry chest partner must not be auto-waterlogged by flowing water"
+    );
+    assert_eq!(
+        block_at(open_west.0, open_west.1, open_west.2),
+        81,
+        "waterlogged chest half must spread water at +5 GT even beside dry chest half"
+    );
+    WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
+}
+
+#[test]
+fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
+    crate::test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    let _snapshot = WorldSnapshot::take();
+
+    let reg = breg().expect("block registry");
+    let ender_st = reg.state_of("minecraft:ender_chest", None);
+    let ender_id = i64::from(reg.block_id_of(ender_st).expect("ender_chest block id"));
+    let ender_a: BlockPos = (105, 170, 60);
+    let ender_b: BlockPos = (108, 170, 60);
+    set_block(ender_a.0, ender_a.1, ender_a.2, ender_st);
+    set_block(ender_b.0, ender_b.1, ender_b.2, ender_st);
+
+    let (v1, mut r1) = fast_chest_viewer(321, ender_a);
+    let (v2, mut r2) = fast_chest_viewer(322, ender_a);
+    let (spec, mut r_spec) = fast_chest_viewer(323, ender_a);
+    let (other, mut r_other) = fast_chest_viewer(324, ender_b);
+    let (obs, mut r_obs) = fast_chest_viewer(325, ender_a);
+    *spec.gm.lock().unwrap() = 3;
+    let audience = [v1.clone(), v2.clone(), spec.clone(), other.clone(), obs.clone()];
+
+    // v1 & v2 open ender_a; other opens ender_b; spec stays out of opener count.
+    let before = chest_opener_snapshot(&audience, &[ender_a, ender_b]);
+    open_chest_for_client(
+        &v1,
+        (ContainerKey::Block(ender_key(&v1.uuid)), None),
+        Some(ender_a),
+        &HashMap::new(),
+        "Ender Chest",
+    );
+    sync_chest_openers(&audience, &before);
+    assert_eq!(
+        block_events(frames_on(&mut r_obs)),
+        vec![(ender_a, 1, 1, ender_id)],
+        "first ender chest viewer must emit 0x08 action=1 param=1 on anchor"
+    );
+
+    let before = chest_opener_snapshot(&audience, &[ender_a, ender_b]);
+    open_chest_for_client(
+        &v2,
+        (ContainerKey::Block(ender_key(&v2.uuid)), None),
+        Some(ender_a),
+        &HashMap::new(),
+        "Ender Chest",
+    );
+    sync_chest_openers(&audience, &before);
+    assert_eq!(
+        block_events(frames_on(&mut r_obs)),
+        vec![(ender_a, 1, 2, ender_id)],
+        "second ender chest viewer on same anchor must emit count=2"
+    );
+
+    // Opening ender_b increments ender_b without moving ender_a.
+    let before = chest_opener_snapshot(&audience, &[ender_a, ender_b]);
+    open_chest_for_client(
+        &other,
+        (ContainerKey::Block(ender_key(&other.uuid)), None),
+        Some(ender_b),
+        &HashMap::new(),
+        "Ender Chest",
+    );
+    sync_chest_openers(&audience, &before);
+    assert_eq!(
+        block_events(frames_on(&mut r_obs)),
+        vec![(ender_b, 1, 1, ender_id)],
+        "viewer on separate ender chest increments only its own anchor"
+    );
+
+    // Spectator opening ender_a must not increment ender_a's opener count.
+    let before = chest_opener_snapshot(&audience, &[ender_a]);
+    open_chest_for_client(
+        &spec,
+        (ContainerKey::Block(ender_key(&spec.uuid)), None),
+        Some(ender_a),
+        &HashMap::new(),
+        "Ender Chest",
+    );
+    sync_chest_openers(&audience, &before);
+    assert!(
+        block_events(frames_on(&mut r_obs)).is_empty(),
+        "spectator must not increment ender chest opener count"
+    );
+
+    // Personal ender chest contents survive breaking ender_a, while open windows on ender_a close.
+    let diamond = name_to_item("diamond").unwrap();
+    chests()
+        .lock()
+        .unwrap()
+        .entry(ContainerKey::Block(ender_key(&v1.uuid)))
+        .or_default()
+        .insert(0, (diamond, 3, Vec::new()));
+    let _ = frames_on(&mut r1);
+    let _ = frames_on(&mut r2);
+    let _ = frames_on(&mut r_other);
+    let _ = frames_on(&mut r_spec);
+
+    // Put audience in global clients() so set_block invalidates windows on ender_a.
+    *clients().lock().unwrap() = audience.to_vec();
+    set_block(ender_a.0, ender_a.1, ender_a.2, 0);
+    assert!(v1.open_chest.lock().unwrap().is_none(), "breaking ender_a closes v1");
+    assert!(v2.open_chest.lock().unwrap().is_none(), "breaking ender_a closes v2");
+    assert!(
+        other.open_chest.lock().unwrap().is_some(),
+        "breaking ender_a must NOT close viewer anchored on ender_b"
+    );
+    assert!(
+        frames_on(&mut r1).iter().any(|(pid, b)| *pid == 0x12 && *b == vec![1]),
+        "v1 receives ClientboundContainerClosePacket"
+    );
+    assert_eq!(
+        chests()
+            .lock()
+            .unwrap()
+            .get(&ContainerKey::Block(ender_key(&v1.uuid)))
+            .and_then(|m| m.get(&0))
+            .cloned(),
+        Some((diamond, 3, Vec::new())),
+        "breaking an ender chest must preserve player's personal ender inventory"
+    );
+
+    chests().lock().unwrap().remove(&ContainerKey::Block(ender_key(&v1.uuid)));
+    set_block(ender_b.0, ender_b.1, ender_b.2, 0);
+}
+

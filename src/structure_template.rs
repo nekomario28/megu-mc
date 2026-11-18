@@ -3147,6 +3147,11 @@ mod tests {
             g.stage_payloads((0, 0), &mut staged);
         }
         crate::materialize_generation_payloads(g.take_staged_payloads());
+        assert!(
+            !crate::chests().lock().unwrap().contains_key(&crate::ContainerKey::Block((4, 70, 4))),
+            "placed loot chest remains unexpanded until first open/unpack"
+        );
+        assert!(crate::unpack_block_loot_if_needed((4, 70, 4)));
         let expected_loot = crate::roll_cart_loot(424242);
         assert_eq!(
             crate::chests().lock().unwrap().get(&crate::ContainerKey::Block((4, 70, 4))).cloned(),
@@ -3154,6 +3159,7 @@ mod tests {
         );
         assert!(crate::furnaces().lock().unwrap().contains_key(&(5, 70, 4)));
         crate::chests().lock().unwrap().remove(&crate::ContainerKey::Block((4, 70, 4)));
+        crate::pending_block_loot().lock().unwrap().remove(&(4, 70, 4));
         crate::furnaces().lock().unwrap().remove(&(5, 70, 4));
     }
 

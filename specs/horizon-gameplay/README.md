@@ -89,9 +89,32 @@ pickup delay は[独立した slice](pickup-delay.md)で閉塞した。実プレ
   の `< 7.0` / `< 9.0`）を毎 tick 検査し、無効化または射程外となった viewer に `0x12`
   (`ClientboundContainerClosePacket`) を送って `sync_chest_openers` で `0x08` count を減算する。
 
-未検証・未移植: waterlogged chest の water tick 再予約、`LootTable`/`LootTableSeed` の
-初回 open まで保持（block chest 側）、ender chest の block event 経由の蓋アニメーション、
-minecart chest の entity event 経路、barrel の `open` state。
+- 構造物・設置 container の `LootTable` / `LootTableSeed` 遅延展開（Slice 3d）:
+  `RandomizableContainerBlockEntity`（`drn`）および `RandomizableContainer`（`bqz.e_`）に合わせ、
+  `materialize_generation_payloads_inner` が非 Furnace の `LootContainer` を即展開せず
+  `pending_block_loot()` へ保持する（save/reload 時は `BLT1` footer に保存して保持）。
+  初回非 spectator open（`open_chest_for_client` + `0x38` の `me.is_spectator()` 拒否 = `drn.d`）、
+  hopper（`hopper_tick`）、dispenser（`fire_dispenser`）、`/item replace|modify block`、または
+  ブロック破壊時（`set_block_if_inner`）に一度だけ決定的展開し、`pending_block_loot` から消去する。
+- `BarrelBlock`（`dfe`）の `open` property（Slice 3d）:
+  `BarrelBlockEntity`（`dqa$1`）および `updateBlockState`（`dqa.a(dtc, Z)`）に合わせ、
+  opener 数が `0 → >0` で `open=true`、`>0 → 0` で `open=false` を `facing` 保持のまま
+  world blockstate に書き込んで `0x09`（`ClientboundBlockUpdatePacket`）を配信し、
+  `0x08` 蓋イベントは送出しない。
+- Waterlogged chest / double-chest の水 tick（Slice 3d）:
+  `ChestBlock.getStateForPlacement` / `ChestBlock.updateShape`（`dhb.a`）は `WATERLOGGED == true`
+  時に `level.scheduleTick(pos, Fluids.WATER, 5)` 相当（`schedule_waterlogged_source` /
+  `schedule_waterlogged_positions`）を予約し、`GeneratedFluidOwner::write` は fluid 隣接の
+  `waterlogged_source` へも `WATERLOGGED_DEFER` 経由で tick を波及させる。
+  `FlowingFluid.getSpread`（`epc.a`）は `Fluids.FLOWING_WATER` で `canPlaceLiquid`
+  （`epf.c` → dry block で `false`）を呼ぶため、非 waterlogged の `chest` / `trapped_chest` /
+  `ender_chest` は自動浸水せず `FluidReader::cell` が `Cell::Solid` として扱う。
+- `EnderChestBlockEntity`（`drd` / `drd$1`）と `MinecartChest`（`cpa` / `cou`）（Slice 3d）:
+  ender chest は `client_open_window_and_anchor` で記録した `ender_chest` block anchor に基づき
+  `half_openers` / `sync_chest_openers` で `0x08`（action 1, param count）を送出し、
+  `ender_chest` 破壊時に `invalidate_ender_chest_windows` が対象 window を `0x12` で閉じる（個人在庫は保持）。
+  `MinecartChest`（`cpa`）は 1.21.1 jar でも蓋アニメーション用の entity event / `0x08` を持たず、
+  `GameEvent`（`CONTAINER_OPEN`/`CONTAINER_CLOSE`）のみのため蓋パケットを送出しない（音声・GameEvent 本体は未検証）。
 
 ### 4. エンティティの属性・移動・接触
 

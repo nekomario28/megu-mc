@@ -56,18 +56,21 @@ Inventory oracle追加後の再実行は[回収の記録](../inventory-pickup/RE
 このsliceの結果は、1.21.1 datapack移行ブランチ全体の受け入れではない。
 
 未検証・未移植: 開閉音、shulkerの中身制約、任意component patchの意味的同値、特殊結果スロット、
-waterlogged chest の water tick 再予約、barrel の `open` state。
+`GameEvent`（`CONTAINER_OPEN`/`CONTAINER_CLOSE` 等）。
 向き／left-right／異種チェストの接続判定、複数閲覧者の開閉同期、`isChestBlockedAt` 閉塞判定、
-毎 tick `broadcastChanges` 同期、`recheckOpeners` 到達距離検証は
+毎 tick `broadcastChanges` 同期、`recheckOpeners` 到達距離検証、構造物 `LootTable`/`LootTableSeed`
+遅延展開、`BarrelBlock` `open` property、waterlogged chest の water tick、ender chest `0x08` は
 [チェストのワールド側契約](#チェストのワールド側契約)で閉塞した。
 
 ## チェストのワールド側契約
 
-M2 slice 3 + 3c。二重チェストを「隣接」ではなく block state で判定し、開閉・閲覧者数・
+M2 slice 3 + 3c + 3d。二重チェストを「隣接」ではなく block state で判定し、開閉・閲覧者数・
 破壊時の window 無効化と drop・永続化、さらに Slice 3c の閉塞判定・複数閲覧者同期・
-到達距離再検証を 1.21.1 の機構に合わせた。
-bytecode は `server-1.21.1.jar` (`59353fb40c36d304f2035d51e7d6e6baa98dc05c`) を
-`javap -p -c` および jar probe で読み、mappings (`03f8985492bda0afc0898465341eb0acef35f570`) で解決した。
+到達距離再検証、Slice 3d の遅延 loot 展開・Barrel `open` state・waterlogged chest 水 tick・
+EnderChest `0x08` 同期（および MinecartChest 非蓋契約）を 1.21.1 の機構に合わせた。
+bytecode は `server-1.21.1.jar`（bundler SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`、
+unpacked `a8ae1f986e20cc91442b6b2b64d62bcd065618d7`）を `javap -p -c` および jar probe で読み、
+official mappings (`03f8985492bda0afc0898465341eb0acef35f570`) で解決した。
 参照した機構とその根拠:
 
 - `dhb.g(dtc)`（`ChestBlock` の BlockType 写像）は `single→SINGLE`, `right→FIRST`,
@@ -108,25 +111,59 @@ bytecode は `server-1.21.1.jar` (`59353fb40c36d304f2035d51e7d6e6baa98dc05c`) �
   `Player.canInteractWithBlock(pos, 4.0)` (`cmx.a(Ljd;D)Z`): 単位 block AABB から player eye
   (`1.62f` standing / `1.27f` crouching) までの二乗距離 `< (blockInteractionRange + 4.0)^2`
   (survival/adventure `8.5`、creative `9.0`)。double chest は両半分を検査し、ender chest は
-  `chest_sync.anchor` を検査し、minecart chest は `ContainerEntity.isChestVehicleStillValid` (`cox.g`) の
-  `canInteractWithEntity(boundingBox, 4.0)` (`< 7.0` survival / `< 9.0` creative) を検査する。
-  失効時は `ClientboundContainerClosePacket` (`aco` = `0x12`, windowId 1) と `sync_chest_openers` (`0x08`) を送る。
+  `chest_sync.anchor`（`ender_chest` block state の生存と距離）を検査し、minecart chest は
+  `ContainerEntity.isChestVehicleStillValid` (`cox.g`) の `canInteractWithEntity(boundingBox, 4.0)`
+  (`< 7.0` survival / `< 9.0` creative) を検査する。失効時は `ClientboundContainerClosePacket`
+  (`aco` = `0x12`, windowId 1) と `sync_chest_openers` (`0x08` / barrel `0x09`) を送る。
 - 1.21.1 play clientbound の `ClientboundBlockEventPacket` は 0x08。
   `agh.a` の登録順（`agg.a`=bundle 0x00 → `agg.c..agg.j`）で `agg.j` が `acc`
   （`ClientboundBlockEventPacket`）であり 9 番目。隣の 0x07 が block entity data、
   0x09 が block update、`agg.t`(0x12) が `ClientboundContainerClosePacket` で、
   既存の packet id と一致する。
+- `RandomizableContainerBlockEntity` (`drn`) / `RandomizableContainer` (`bqz`):
+  `drn.d` (`canOpen`) は `lootTable != null && player.isSpectator()` を拒否し、`drn.createMenu` は
+  `canOpen` 成功時のみ `bqz.e_(player)` (`unpackLootTable`) を呼ぶ。`drn.c/a/b`（slot 操作・空判定）は
+  `e_(null)` を呼び、`bqz.e_` が `lootTable = null` にして `LootTable.fill` を `lootTableSeed` で実行する。
+  実装では非 Furnace の `LootContainer` を `pending_block_loot()` に保持（save/reload 時は `BLT1` footer に
+  保存、`pending_block_loot` 空なら従来保存 payload バイト列を維持）、非 spectator open・`hopper_tick`・
+  `fire_dispenser`・`/item replace|modify block`・`set_block_if_inner` 破壊時に一度だけ展開する。
+- `BarrelBlockEntity` (`dqa` / `dqa$1`):
+  `dqa$1.a(dcw, jd, dtc)` / `b(...)`（`onOpen` / `onClose`）が `dqa.a(dtc, boolean)`
+  （`updateBlockState` → `dcw.a(pos, state.setValue(OPEN, open), 3)`）を呼び、`dqa$1.a(dcw, jd, dtc, int, int)`
+  （`openerCountChanged`）は空 `return` で `0x08` を送らない。実装では `sync_chest_openers` が
+  `minecraft:barrel` に対し `0 → >0` で `open=true`、`>0 → 0` で `open=false`（`facing` 保持）へ
+  更新し `0x09`（`broadcast_block_update`）を送る。
+- Waterlogged chest / double chest (`ChestBlock.updateShape` = `dhb.a`, `FlowingFluid.getSpread` = `epc.a`,
+  `SimpleWaterloggedBlock.canPlaceLiquid` = `epf.c`):
+  `dhb.a(dtc, ji, dtc, dcx, jd, jd)` は `WATERLOGGED == true` 時に
+  `dcx.a(pos, epf.c /* WATER */, epf.c.a(level) /* getTickDelay = 5 */)` を予約する。
+  また `epc.a` は `Fluids.FLOWING_WATER` で `canPlaceLiquid` を呼ぶため（`epf.c` は `fluid == Fluids.WATER`
+  のみ `true`）、乾いた partner chest に流れ込む水で自動浸水せず、`FluidReader::cell` は非水浸の
+  `minecraft:chest` / `minecraft:trapped_chest` / `minecraft:ender_chest` を `Cell::Solid` として扱う。
+  加えて `GeneratedFluidOwner::write` は fluid 書込み隣接の `waterlogged_source` にも `WATERLOGGED_DEFER`
+  経由で `+5` tick を再予約する。
+- `EnderChestBlockEntity` (`drd` / `drd$1`) と `MinecartChest` (`cpa` / `cou`):
+  `drd$1.a(dcw, jd, dtc, int, int)` は `dcw.a(drd.o, dga.fG /* ENDER_CHEST */, 1, count)` で `0x08` を送り、
+  実装でも `client_open_window_and_anchor` + `half_openers` / `sync_chest_openers` により clicked
+  `ender_chest` anchor への `0x08` 送出と、`set_block_if_inner` 破壊時の window 無効化（個人在庫保持）を行う。
+  `MinecartChest`（`cpa` / `cou`）は `1.21.1` bytecode 上も蓋用の entity event や `0x08` を送らないため、
+  `0x16` open / `0x0f` close 時にも蓋パケットは送出しない。
 
-観測点は 2 層に分けた。`src/tick_tests.rs` の 9 本 + Slice 3c の 4 本 (`chest_contract_*`) と
-`src/main.rs::mineshaft_runtime_tests::chest_contract_live_tcp_blocked_broadcast_and_reach` は
+観測点は 2 層に分けた。`src/tick_tests.rs` の Slice 3/3c 9 本 + Slice 3d 4 本（`chest_contract_3d_*`）と
+`src/main.rs::mineshaft_runtime_tests` の実 TCP 2 本（`chest_contract_live_tcp_blocked_broadcast_and_reach`、
+`chest_contract_3d_live_tcp_lazy_loot_barrel_ender_and_waterlogged`）は
 block state（設置・pairing・3連・sneak・updateShape）、slot 順、drop 引き金、window 無効化、
 閲覧者数と event、`isRedstoneConductor` / 閉塞判定 / 猫、`broadcastChanges` 毎 tick 差分、
-`recheckOpeners` 境界（survival/creative・立位/しゃがみ・double chest 遠側半分・ender chest・cart）を
-実 TCP と unit fixture で固定し、`tests/container_wire.py` は実 TCP で 2 client の開閉、
-半分ごとの slot 所有、破壊時の `0x12` と drop、再起動後の left/right と中身を読む。
-`tools/mutation_check.sh` には `chest_contract_*` 3 本（片側閉塞、27..53 同期、reach 再検証）を接続し、
-`MUTATION_STABILITY=1` で 3/3 検出を確認した。
+`recheckOpeners` 境界（survival/creative・立位/しゃがみ・double chest 遠側半分・ender chest・cart）、
+遅延 `LootTable` + `BLT1` 永続化・spectator 拒否・1回限りの展開・custom table 決定性、
+Barrel `open` property + `0x09`（`0x08` 非送出）、waterlogged double-chest tick 再予約（`+5` GT）と
+乾いた partner `Cell::Solid` 拡散、ender chest `0x08` + 破壊時 `0x12` を固定した。
+`tests/container_wire.py` は実 TCP で 2 client の開閉・半分ごとの slot 所有・破壊時の `0x12` と drop・
+再起動後の left/right と中身を読み、`src/container_tests.rs` / `src/structure_template.rs` は
+遅延展開 contract（`pending_block_loot` → `unpack_block_loot_if_needed`）と整合させた。
+`tools/mutation_check.sh` には `chest_contract_*` 3 本と `chest_contract_3d_*` 5 本（遅延 loot 保持・
+spectator gate・barrel `open`・乾いた chest `Solid`・ender chest `0x08` counting）を接続し、
+`MUTATION_STABILITY=1` で 8/8 検出（および既存 container/furnace/template loot mutations 6/6 検出）を確認した。
 
-未検証・未移植（Slice 3c 後）: waterlogged chest の water tick、`LootTableSeed` の初回 open までの保持
-（block chest 側）、ender chest / minecart chest の蓋・entity event 同期、barrel の `open` state。
+未検証・未移植: 開閉音（vanilla `SoundEvents`）および `GameEvent`（`CONTAINER_OPEN`/`CONTAINER_CLOSE` 等）本体。
 続きは[移植順序](../../../specs/horizon-gameplay/README.md)を参照。

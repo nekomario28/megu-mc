@@ -299,12 +299,21 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
                 loot_seed: Some(1234),
             },
         )]);
+        assert!(
+            !chests().lock().unwrap().contains_key(&ContainerKey::Block(pos)),
+            "{kind:?} LootTable stays unmaterialized before unpack"
+        );
+        assert!(
+            pending_block_loot().lock().unwrap().contains_key(&pos),
+            "{kind:?} LootTable staged in pending_block_loot"
+        );
+        assert!(unpack_block_loot_if_needed(pos));
         let slots = chests()
             .lock()
             .unwrap()
             .get(&ContainerKey::Block(pos))
             .cloned()
-            .expect("a container entry is created");
+            .expect("a container entry is created on unpack");
         assert!(!slots.is_empty(), "{kind:?} wrote its roll");
         for slot in slots.keys() {
             assert!(
@@ -313,6 +322,7 @@ fn container_loot_roll_stays_inside_the_block_its_table_came_from() {
             );
         }
         chests().lock().unwrap().remove(&ContainerKey::Block(pos));
+        pending_block_loot().lock().unwrap().remove(&pos);
     }
     // A furnace's table names the furnace store, never the chest store.
     let furnace_pos = (6, 70, 6);

@@ -3541,6 +3541,54 @@ check "lake_feature_barrier_marks_above_for_post_processing" \
   '                                    ctx.set(bp.0, bp.1, bp.2, barrier_st);' \
   feature::mark_above_tests::lake_feature_marks_above_at_cave_air_and_barrier_sites
 
+# Chest world-side contract remainder (M2 Gameplay Slice 3d):
+# lazy block loot materialization, BarrelBlock open property, waterlogged dry partner Solid,
+# and EnderChestBlockEntity anchored 0x08 opener counting.
+check "chest_contract_3d_block_loot_lazy_defers_materialization" \
+  src/main.rs '                pending_block_loot().lock().unwrap().insert(
+                    pos,
+                    PendingBlockLoot {
+                        kind,
+                        loot_table,
+                        loot_seed,
+                    },
+                );' \
+  '                let rolled = roll_loot_container_slots(kind, &loot_table, loot_seed);
+                chests().lock().unwrap_or_else(|e| e.into_inner()).insert(ContainerKey::Block(pos), rolled);' \
+  tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
+
+check "chest_contract_3d_block_loot_spectator_gate_unpacks_for_viewers" \
+  src/main.rs '    if !me.is_spectator() {
+        unpack_window_loot_if_needed(window);
+    }
+    let initial = chest_window_slots(window);' \
+  '    if me.is_spectator() {
+        unpack_window_loot_if_needed(window);
+    }
+    let initial = chest_window_slots(window);' \
+  tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
+
+check "chest_contract_3d_barrel_toggles_open_without_lid_event" \
+  src/main.rs '            if let Some(reg) = breg().filter(|reg| reg.name_of(st) == "minecraft:barrel") {' \
+  '            if let Some(reg) = breg().filter(|_| false) {' \
+  tick_tests::chest_contract_3d_barrel_toggles_open_property_without_block_event
+
+check "chest_contract_3d_dry_chest_is_solid_for_fluid" \
+  src/main.rs '            || matches!(
+                reg.name_of(st),
+                "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:ender_chest"
+            )' \
+  '            || matches!(
+                reg.name_of(st),
+                "minecraft:ender_chest"
+            )' \
+  tick_tests::chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error
+
+check "chest_contract_3d_ender_chest_counts_anchor_openers" \
+  src/main.rs '            if matches!(a, ContainerKey::Block(ek) if is_ender_key(ek)) && b.is_none() {' \
+  '            if false && matches!(a, ContainerKey::Block(ek) if is_ender_key(ek)) && b.is_none() {' \
+  tick_tests::chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
