@@ -43,7 +43,9 @@ Biome境界: 現状**専用行を持たない**。v1では「各windowに跨るb
 
 受入必須(現時点でcapture/gateが存在): `mineshaft`, `stronghold`, `nether_fortress`,
 `nether_fossil`, `end_city`, `ruined_portal`(captureのみでgate未), `village`(taiga,
-captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部分), `jungle_temple`(HOLD中).
+captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部分), `jungle_temple`(HOLD中 —
+2026-11-18に121→47へ。残差47はdripstone_cavesの地下グループで、樹冠/east-edge bandは残差0。
+`evidence/gameplay/feature-parity/jungle-east-edge-vine-edge-shape-20261118.md`).
 
 各々の受入条件は「window内の全セル一致」で、構造物単独のゲートではない。
 **HOLD中・未解の行は受入から除外し、除外理由をこの表に書く**(紛失させない)。
@@ -73,7 +75,7 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
 | fortress 0/256 | **MATCH**(0/65536、`expected_runtime_writes` 宣言済み・検証済み) |
 | fortress 0/128(matrix-v1) | **MATCH**(0/32768、同じ宣言。宣言値が両captureでbit一致) |
 | village-taiga | 宣言は検証済みだが比較**DIFF 4/884736** — 受入行にしない(§3) |
-| jungle-temple | 121 HOLD |
+| jungle-temple | 121 HOLD → **47 HOLD**(2026-11-18実測。樹冠/east-edge band残差0、残り47はdripstone_cavesの地下グループ) |
 | Overworld (3,−2) | 順序・mineshaft残差あり(population-order lane進行中) |
 | forest 3×3・dimension_terrain 4件・(0,0)・stronghold・(−96,35) | committed gate緑(新SHAでの再検証は行ごとに必要) |
 | ruined-portal | **MATCH**(0/98304)— ただし単一native run(§4-5は未充足) |

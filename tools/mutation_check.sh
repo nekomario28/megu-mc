@@ -3276,6 +3276,20 @@ check "a compiled interpolated node reads its own grid slot" \
   '                let slot = id as u32 + 1;' \
   worldgen::wg_tests::compiled_density_matches_interpreter_per_block
 
+# The tree edge pass's vine half (`StructureTemplate.updateShapeAtEdge` -> `VineBlock.updateShape`).
+# Both entries pin a rule the reference draft got backwards, so each one is also the defect the
+# measurement had to survive: the draft short circuited on UP, and read the cell below instead of
+# the one above.
+check "the vine edge pass short circuits on DOWN, not UP" \
+  src/tree.rs '    if toward_neighbor == 0 {' \
+  '    if toward_neighbor == 1 {' \
+  tree::tests::the_tree_edge_pass_applies_vine_update_shape
+
+check "the vine edge pass reads the cell above, not the one below" \
+  src/tree.rs '    let above = (cell.0, cell.1 + 1, cell.2);' \
+  '    let above = (cell.0, cell.1 - 1, cell.2);' \
+  tree::tests::the_tree_edge_pass_applies_vine_update_shape
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
