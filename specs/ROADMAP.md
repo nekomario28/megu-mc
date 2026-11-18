@@ -119,7 +119,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 
 現行ベースライン（[worldgen-cost](../evidence/gameplay/worldgen-cost/README.md)・[performance](../evidence/foundation/performance/README.md)）では、RSSはvanillaの約1/8（142対1,160 MiB）、定常tick本体は0.05〜0.17 ms/tick（20 TPS、予算超過0/100）である一方、移動時のCPUは1.6〜4.7倍重い。承認済みの5段階超軽量化計画（詳細と阻害要因対策は[チャンク生成の並列化](chunk-parallelism/README.md#m3-超軽量化-5段階計画p1p5承認済み)）でこれを詰める:
 
-1. **P1 (`ChunkCols` / `BeardChunkData` 共有)**: Terrain Slice 1 の worker 側重複計算（full 時 CPU +88%）を解消し、owner 側 `col_c` 等へ安全に還元する。
+1. **P1 (`ChunkCols` / `BeardChunkData` 共有)**: まず **Slice P1a**（ロード非依存カウンタ M1〜M5 ＋ `TERRAIN_STORE_BOUND` A/B）で `full − NOFEAT`（+156%）の主因を確定したうえで、worker 側計算を owner 側 `col_c` 等へ安全に共有・還元する。
 2. **P2 (常駐 `PalettedSection` ストア)**: 2026-10-20 に棄却した非圧縮配列キャッシュではなく、Single-value / Indirect / Direct の省メモリ section ストアを正本化し、light・anti-xray・feature 近傍読み・保存・送信で再計算と二重保持をなくす。
 3. **P3 (`CARVERS` / `FEATURES` 並列化)**: 半径2の先行不変条件と3×3引き渡し（Horizon MIT `0564ab0` の概念参照）により、バイト決定性を保ったまま残る直列生成を並列化する。
 4. **P4 (`DfProg` SIMD/バッチ評価と早期枝刈り)**: MIT `Soju06/hyperchunk`（`df_simd_avx2.c` 等）を先行例に、格子点の SIMD 評価と `material_rule` / `aquifer` の早期枝刈りを行う。
@@ -137,7 +137,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 
 ## R5 — 要求されたMod単位の互換拡張
 
-順序と出口条件は[shim計画](mod-compatibility/shim-plan.md)（S0〜S5）に置く。最初は、mod jarが必要とする面を列挙してshimとの差分を出す `shimcheck`（S0）、次にNeoForgeの単純なMod（S1）、ブロック/アイテムを登録するMod（S2）の順に進める。shimの骨組みはユーザーのjarから手元で生成し、リポジトリには入れない。
+順序と出口条件は[shim計画](mod-compatibility/shim-plan.md)（S0〜S5）に置く。最初は、mod jarが必要とする面を列挙してshimとの差分を出す `shimcheck`（S0）、次にNeoForgeの単純なMod（S1）、ブロック/アイテムを登録するMod（S2）、バッチ／スナップショット JNI 境界を持つ BlockEntity/tick 基盤（S3）の順に進める。shimの骨組みはユーザーのjarから手元で生成し、リポジトリには入れない。S3 基盤確立後は、別プロジェクトへ切り出さず `mc-spine` 本体上の「汎用オフロードカーネル群（接続グラフ・自動スリープ輸送/加工・Contraption 枠組み・リージョン負荷隔離）＋重量 Mod 固有の薄型加速アダプタ」へ段階拡張する。
 
 **出口:** 対象Mod・版・API範囲・実行テストを特定し、その組み合わせに限った互換性を証明する。
 ## 横断規律
