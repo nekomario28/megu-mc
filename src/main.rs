@@ -28320,6 +28320,13 @@ fn main() {
                 out.len(),
                 t1.elapsed()
             );
+            // M3 P1a: the load-independent counters for this run, printed after the binary's
+            // own phase time so a measurement line and its attribution travel together.
+            // Empty unless `MC_SPINE_M3_PROFILE`/`FEAT_PROFILE` is on.
+            let m3 = worldgen::m3_report();
+            if !m3.is_empty() {
+                eprint!("{m3}");
+            }
         }
         if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP_HM") {
             let n: i32 = std::env::var("MC_SPINE_WG_DUMP_N")

@@ -883,6 +883,12 @@ pub struct Gen {
     /// world generator would. Bounded by `TERRAIN_STORE_BOUND`.
     terr_c: HashMap<(i32, i32, i32), Box<[u32; 4096]>>,
     terr_ord: std::collections::VecDeque<(i32, i32, i32)>,
+    /// Sections installed into [`Gen::terr_c`] and not yet consumed by `terrain_section_at`,
+    /// for the M3 P1a M4 counter only. Lives on the generator (not in a process-wide set)
+    /// so "was this row evicted before its consumer read it" is a property of one store:
+    /// the answer is what the `TERRAIN_STORE_BOUND` A/B is asking. Untouched unless
+    /// `MC_SPINE_M3_PROFILE`/`FEAT_PROFILE` is on.
+    terr_pending: std::collections::BTreeSet<(i32, i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
     feat_c: HashMap<(i32, i32), HashMap<u32, u32>>,
     /// Container contents staged by template placement during feature population.
@@ -991,7 +997,420 @@ const FEATURE_BUCKET_BOUND: usize = 384;
 /// 512 x 16 KiB = 8 MiB. One prefetched group is at most `2 * jobs` chunks (24 sections
 /// each), so the store does not have to evict a row its consumer is about to read; the
 /// bound exists so a caller that prefetches without consuming cannot grow it.
+///
+/// The A/B switch is `MC_SPINE_TERRAIN_STORE_BOUND` (see [`terrain_store_bound`]): retention
+/// is the only thing the bound decides, so the two arms must produce the same bytes and the
+/// same `terr_c` hit/miss counts for every section a caller actually asks for.
 const TERRAIN_STORE_BOUND: usize = 512;
+
+/// The retention bound in force, `MC_SPINE_TERRAIN_STORE_BOUND` or [`TERRAIN_STORE_BOUND`].
+pub fn terrain_store_bound() -> usize {
+    static BOUND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| parse_terrain_store_bound(env_str!("MC_SPINE_TERRAIN_STORE_BOUND")))
+}
+
+/// [`terrain_store_bound`] without the environment, so the parse rule is testable in a
+/// process that has already cached the answer.
+pub(crate) fn parse_terrain_store_bound(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(TERRAIN_STORE_BOUND)
+}
+
+// ---------- M3 Slice P1a: load-independent counters (M1-M5) ----------
+//
+// `specs/chunk-parallelism` P1a. Terrain Slice 1 (`3921aa5`/`1667aa3`) bought 3.7-4.7x wall
+// clock on the terrain stage and paid for it in CPU: `full` went 8.32 s -> 15.64 s at five
+// workers while `full - NOFEAT` went the wrong way by 156%. A stopwatch cannot say which
+// part of that is repeated work, because every wall-clock and CPU number moves with the load
+// on the host. These counters count *work* - chunk starts, column builds, store hits,
+// feature-side fallbacks, sections filled - so `jobs=1` against `jobs=5` and `512` against
+// `1536` are comparable, and they change no decision: nothing reads them.
+//
+// The switch is `MC_SPINE_M3_PROFILE=1` (or the older `FEAT_PROFILE=1`). With neither set,
+// every site pays one cached `OnceLock` load and a branch that is predicted not-taken, and
+// nothing else: no environment reads, no allocation, no atomics.
+//
+// The meter is **per thread** and merged into a process aggregate on demand. That is not
+// decoration: a worker builds its own scratch generator, so its counts have to be flushed
+// when its thread ends (`prefetch_terrain`), while a test needs to read the counters of the
+// work *it* just did without every other test thread's contribution. `m3_local` is that
+// per-thread answer; `m3_aggregate` is the run's.
+//
+// Why this lives in `worldgen` instead of a module of its own: `evidence/foundation/
+// module-layers/policy.json` pins the module set and the allowed edges, and the three
+// modules that need these counters (`worldgen`, `feature`, `generation_context`) already
+// depend on this one.
+
+/// Number of M3 counters. Keep `M3_NAMES` in step with the indices below.
+pub(crate) const M3_N: usize = 41;
+
+// M1 - chunk starts, column builds and beardifier resolutions, owner against worker.
+pub(crate) const M3_CHUNK_STARTS_OWNER: usize = 0;
+pub(crate) const M3_CHUNK_STARTS_WORKER: usize = 1;
+pub(crate) const M3_COLS_BUILT_OWNER: usize = 2;
+pub(crate) const M3_COLS_BUILT_WORKER: usize = 3;
+pub(crate) const M3_COLS_HIT_OWNER: usize = 4;
+pub(crate) const M3_COLS_HIT_WORKER: usize = 5;
+pub(crate) const M3_BEARD_RESOLVED_OWNER: usize = 6;
+pub(crate) const M3_BEARD_RESOLVED_WORKER: usize = 7;
+// M2 - the `terr_c` store.
+pub(crate) const M3_TERR_HIT: usize = 8;
+pub(crate) const M3_TERR_MISS: usize = 9;
+pub(crate) const M3_TERR_EVICT: usize = 10;
+pub(crate) const M3_TERR_INSTALL: usize = 11;
+pub(crate) const M3_TERR_INSTALL_DUP: usize = 12;
+// M3 - what answered a feature-side terrain read.
+pub(crate) const M3_RC_HIT: usize = 13;
+pub(crate) const M3_PREFETCH_HIT: usize = 14;
+pub(crate) const M3_PREFETCH_MISS: usize = 15;
+pub(crate) const M3_FALLBACK_DENSITY: usize = 16;
+pub(crate) const M3_FALLBACK_DEEP: usize = 17;
+pub(crate) const M3_FALLBACK_AQUIFER: usize = 18;
+pub(crate) const M3_FALLBACK_SURFACE: usize = 19;
+pub(crate) const M3_DEEP_HIT: usize = 20;
+pub(crate) const M3_DEEP_MISS: usize = 21;
+pub(crate) const M3_AQLV_HIT: usize = 22;
+pub(crate) const M3_AQLV_MISS: usize = 23;
+pub(crate) const M3_PRELIM_HIT: usize = 24;
+pub(crate) const M3_PRELIM_MISS: usize = 25;
+// M4 - section work: off-owner against on-owner.
+pub(crate) const M3_WORKER_SECTIONS: usize = 26;
+pub(crate) const M3_OWNER_SECTIONS: usize = 27;
+pub(crate) const M3_EVICTED_UNCONSUMED: usize = 28;
+// M5 - stage breakdown. `*_NS` pairs with the `*_N` next to it.
+pub(crate) const M3_COLS_NS: usize = 29;
+pub(crate) const M3_COLS_N: usize = 30;
+pub(crate) const M3_BEARD_NS: usize = 31;
+pub(crate) const M3_BEARD_N: usize = 32;
+pub(crate) const M3_FILL_NS: usize = 33;
+pub(crate) const M3_FILL_N: usize = 34;
+pub(crate) const M3_AQUIFER_CELLS: usize = 35;
+pub(crate) const M3_SURFACE_CELLS: usize = 36;
+pub(crate) const M3_CARVER_NS: usize = 37;
+pub(crate) const M3_CARVER_N: usize = 38;
+pub(crate) const M3_FEATURE_NS: usize = 39;
+pub(crate) const M3_FEATURE_N: usize = 40;
+
+/// Counter names, in index order. The determinism test reports them, so this is a test
+/// helper: the run report groups them by metric instead of dumping the flat list.
+#[cfg(test)]
+pub(crate) const M3_NAMES: [&str; M3_N] = [
+    "m1_chunk_starts_owner",
+    "m1_chunk_starts_worker",
+    "m1_cols_built_owner",
+    "m1_cols_built_worker",
+    "m1_cols_hit_owner",
+    "m1_cols_hit_worker",
+    "m1_beard_resolved_owner",
+    "m1_beard_resolved_worker",
+    "m2_terr_hit",
+    "m2_terr_miss",
+    "m2_terr_evict",
+    "m2_terr_install",
+    "m2_terr_install_dup",
+    "m3_rc_hit",
+    "m3_prefetch_hit",
+    "m3_prefetch_miss",
+    "m3_fallback_density",
+    "m3_fallback_deep",
+    "m3_fallback_aquifer",
+    "m3_fallback_surface",
+    "m3_deep_hit",
+    "m3_deep_miss",
+    "m3_aqlv_hit",
+    "m3_aqlv_miss",
+    "m3_prelim_hit",
+    "m3_prelim_miss",
+    "m4_worker_sections",
+    "m4_owner_sections",
+    "m4_evicted_unconsumed",
+    "m5_cols_ns",
+    "m5_cols_n",
+    "m5_beard_ns",
+    "m5_beard_n",
+    "m5_fill_ns",
+    "m5_fill_n",
+    "m5_aquifer_cells",
+    "m5_surface_cells",
+    "m5_carver_ns",
+    "m5_carver_n",
+    "m5_feature_ns",
+    "m5_feature_n",
+];
+
+/// The counters that are durations rather than counts. Everything else counts deterministic
+/// work and is repeatable across runs; these move with the host's load by construction, which
+/// is why the P1a conclusions are drawn from the counts and these only split the remainder.
+#[cfg(test)]
+pub(crate) const M3_DURATION_COUNTERS: [usize; 5] = [
+    M3_COLS_NS,
+    M3_BEARD_NS,
+    M3_FILL_NS,
+    M3_CARVER_NS,
+    M3_FEATURE_NS,
+];
+
+/// One thread's counter block. Plain `u64`s: a counter is read only after the thread that
+/// owns it has finished with it, so nothing here needs to be atomic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct M3Meter(pub [u64; M3_N]);
+
+impl Default for M3Meter {
+    fn default() -> Self {
+        M3Meter([0; M3_N])
+    }
+}
+
+impl M3Meter {
+    pub(crate) fn get(&self, k: usize) -> u64 {
+        self.0[k]
+    }
+
+    /// Add `other` into `self`, counter by counter.
+    pub(crate) fn merge(&mut self, other: &M3Meter) {
+        for (dst, src) in self.0.iter_mut().zip(other.0.iter()) {
+            *dst += *src;
+        }
+    }
+}
+
+static M3_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(test)]
+static M3_TEST_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Is the counter layer on? One cached load on every guarded site.
+#[inline]
+pub(crate) fn m3_on() -> bool {
+    #[cfg(test)]
+    if M3_TEST_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    *M3_ON.get_or_init(|| env_flag!("MC_SPINE_M3_PROFILE") || env_flag!("FEAT_PROFILE"))
+}
+
+#[cfg(test)]
+pub(crate) fn m3_test_force(on: bool) {
+    M3_TEST_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Held by every test that forces the counters on. The force is process-wide, so two such
+/// tests running at once would each switch it off under the other's measurement - measured:
+/// the determinism test went red about once in five runs until this existed.
+#[cfg(test)]
+pub(crate) static M3_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    static M3_LOCAL: std::cell::RefCell<M3Meter> = std::cell::RefCell::new(M3Meter::default());
+    /// Set on a thread that is filling one chunk's terrain for another thread's consumer.
+    static M3_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Depth of `FC::get`'s cold fallback, so the memo counters below can tell a
+    /// feature-side read from the terrain fill that warms the same memos.
+    static M3_FEATURE_READ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+static M3_AGG: [std::sync::atomic::AtomicU64; M3_N] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; M3_N];
+
+/// One counter.
+#[inline]
+pub(crate) fn m3_inc(k: usize) {
+    if !m3_on() {
+        return;
+    }
+    M3_LOCAL.with(|m| m.borrow_mut().0[k] += 1);
+}
+
+/// One counter, decided by a flag the caller already computed (`m3_on() && …`).
+#[inline]
+fn inc_if(flag: bool, k: usize) {
+    if flag {
+        M3_LOCAL.with(|m| m.borrow_mut().0[k] += 1);
+    }
+}
+
+/// One counter, attributed to the owner thread or to a prefetch worker.
+#[inline]
+pub(crate) fn m3_inc_split(owner: usize, worker: usize) {
+    if !m3_on() {
+        return;
+    }
+    let k = if m3_is_worker() { worker } else { owner };
+    M3_LOCAL.with(|m| m.borrow_mut().0[k] += 1);
+}
+
+/// Start a timed stage. `None` when the counters are off, so the stage costs a branch.
+#[inline]
+pub(crate) fn m3_start() -> Option<std::time::Instant> {
+    m3_on().then(std::time::Instant::now)
+}
+
+/// Close a stage opened by [`m3_start`] into its `(ns, n)` counter pair.
+#[inline]
+pub(crate) fn m3_elapsed(k_ns: usize, k_n: usize, t0: Option<std::time::Instant>) {
+    if let Some(t0) = t0 {
+        let ns = t0.elapsed().as_nanos() as u64;
+        M3_LOCAL.with(|m| {
+            let mut m = m.borrow_mut();
+            m.0[k_ns] += ns;
+            m.0[k_n] += 1;
+        });
+    }
+}
+
+#[inline]
+pub(crate) fn m3_is_worker() -> bool {
+    M3_WORKER.with(|c| c.get())
+}
+
+/// Mark this thread as a terrain prefetch worker. Set once per spawned worker.
+pub(crate) fn m3_set_worker(on: bool) {
+    M3_WORKER.with(|c| c.set(on));
+}
+
+#[inline]
+pub(crate) fn m3_in_feature_read() -> bool {
+    M3_FEATURE_READ.with(|c| c.get() > 0)
+}
+
+/// Scope guard: while it lives, the terrain memos (`deep_c`, `aq_lv`, `prelim_c`) are being
+/// read on behalf of the feature layer rather than by the terrain fill.
+pub(crate) struct M3FeatureRead(bool);
+
+impl M3FeatureRead {
+    pub(crate) fn enter() -> Self {
+        if !m3_on() {
+            return M3FeatureRead(false);
+        }
+        M3_FEATURE_READ.with(|c| c.set(c.get() + 1));
+        M3FeatureRead(true)
+    }
+}
+
+impl Drop for M3FeatureRead {
+    fn drop(&mut self) {
+        if self.0 {
+            M3_FEATURE_READ.with(|c| c.set(c.get() - 1));
+        }
+    }
+}
+
+/// Merge this thread's counters into the process aggregate and clear them.
+///
+/// A prefetch worker calls this before its thread ends: its meter would otherwise die with
+/// the thread and the run's own report would under-count exactly the work P1a is about.
+pub(crate) fn m3_flush() {
+    if !m3_on() {
+        return;
+    }
+    let local = M3_LOCAL.with(|m| *m.borrow());
+    for (agg, v) in M3_AGG.iter().zip(local.0.iter()) {
+        if *v != 0 {
+            agg.fetch_add(*v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    M3_LOCAL.with(|m| *m.borrow_mut() = M3Meter::default());
+}
+
+/// This thread's counters (not the process aggregate).
+pub(crate) fn m3_local() -> M3Meter {
+    M3_LOCAL.with(|m| *m.borrow())
+}
+
+/// Drop this thread's counters without touching the aggregate (test helper: a test reads
+/// [`m3_local`] for the work it just did, so it has to start from a known state).
+#[cfg(test)]
+pub(crate) fn m3_reset_local() {
+    M3_LOCAL.with(|m| *m.borrow_mut() = M3Meter::default());
+}
+
+/// The process aggregate: every thread that has flushed, including this one's unflushed
+/// counters so a caller does not have to remember to flush first.
+pub(crate) fn m3_aggregate() -> M3Meter {
+    let mut out = M3Meter::default();
+    for (dst, agg) in out.0.iter_mut().zip(M3_AGG.iter()) {
+        *dst = agg.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out.merge(&m3_local());
+    out
+}
+
+/// The M1-M5 report, one line per metric group. Empty when the counters are off.
+pub(crate) fn m3_report() -> String {
+    if !m3_on() {
+        return String::new();
+    }
+    let m = m3_aggregate();
+    let g = |k: usize| m.get(k);
+    let ms = |ns: usize| g(ns) as f64 / 1e6;
+    let mut s = String::new();
+    s.push_str(&format!(
+        "[m3] terrain_store_bound={} jobs={}\n",
+        terrain_store_bound(),
+        terrain_jobs()
+    ));
+    s.push_str(&format!(
+        "[m3] M1 chunk_starts owner={} worker={} | cols built owner={} worker={} hit owner={} worker={} | beard resolved owner={} worker={}\n",
+        g(M3_CHUNK_STARTS_OWNER),
+        g(M3_CHUNK_STARTS_WORKER),
+        g(M3_COLS_BUILT_OWNER),
+        g(M3_COLS_BUILT_WORKER),
+        g(M3_COLS_HIT_OWNER),
+        g(M3_COLS_HIT_WORKER),
+        g(M3_BEARD_RESOLVED_OWNER),
+        g(M3_BEARD_RESOLVED_WORKER)
+    ));
+    s.push_str(&format!(
+        "[m3] M2 terr_c hit={} miss={} evict={} install={} install_dup={} bound={}\n",
+        g(M3_TERR_HIT),
+        g(M3_TERR_MISS),
+        g(M3_TERR_EVICT),
+        g(M3_TERR_INSTALL),
+        g(M3_TERR_INSTALL_DUP),
+        terrain_store_bound()
+    ));
+    s.push_str(&format!(
+        "[m3] M3 feature reads rc_hit={} prefetch_hit={} prefetch_miss={} | fallback density={} deep={} aquifer={} surface={} | deep_memo hit={} miss={} aqlv hit={} miss={} prelim hit={} miss={}\n",
+        g(M3_RC_HIT),
+        g(M3_PREFETCH_HIT),
+        g(M3_PREFETCH_MISS),
+        g(M3_FALLBACK_DENSITY),
+        g(M3_FALLBACK_DEEP),
+        g(M3_FALLBACK_AQUIFER),
+        g(M3_FALLBACK_SURFACE),
+        g(M3_DEEP_HIT),
+        g(M3_DEEP_MISS),
+        g(M3_AQLV_HIT),
+        g(M3_AQLV_MISS),
+        g(M3_PRELIM_HIT),
+        g(M3_PRELIM_MISS)
+    ));
+    s.push_str(&format!(
+        "[m3] M4 sections worker={} owner={} evicted_unconsumed={}\n",
+        g(M3_WORKER_SECTIONS),
+        g(M3_OWNER_SECTIONS),
+        g(M3_EVICTED_UNCONSUMED)
+    ));
+    s.push_str(&format!(
+        "[m3] M5 cols={:.1}ms/{} beard={:.1}ms/{} fill={:.1}ms/{} aquifer_cells={} surface_cells={} carver={:.1}ms/{} feature={:.1}ms/{}\n",
+        ms(M3_COLS_NS),
+        g(M3_COLS_N),
+        ms(M3_BEARD_NS),
+        g(M3_BEARD_N),
+        ms(M3_FILL_NS),
+        g(M3_FILL_N),
+        g(M3_AQUIFER_CELLS),
+        g(M3_SURFACE_CELLS),
+        ms(M3_CARVER_NS),
+        g(M3_CARVER_N),
+        ms(M3_FEATURE_NS),
+        g(M3_FEATURE_N)
+    ));
+    s
+}
+
+// ---------- end M3 P1a counters ----------
 
 /// One chunk's carve stage — the record that replaces the three containers that used to
 /// describe it (`carved`, `wg_after_carve`, `wg_after_carve_ord`).
@@ -1317,6 +1736,7 @@ impl Gen {
             beard_depth: 0,
             terr_c: HashMap::new(),
             terr_ord: std::collections::VecDeque::new(),
+            terr_pending: std::collections::BTreeSet::new(),
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
@@ -3456,9 +3876,12 @@ impl Gen {
     fn prelim_est_raw(&mut self, x: i32, z: i32) -> i32 {
         // NoiseChunk.preliminarySurfaceLevel keys by QuartPos (x >> 2, z >> 2).
         let k = (x >> 2, z >> 2);
+        let m3_read = m3_on() && m3_in_feature_read();
         if let Some(&v) = self.prelim_c.get(&k) {
+            inc_if(m3_read, M3_PRELIM_HIT);
             return v;
         }
+        inc_if(m3_read, M3_PRELIM_MISS);
         let v = match self.prelim_df {
             Some(id) => {
                 let ax = (x >> 2) << 2;
@@ -4462,6 +4885,9 @@ pub(crate) fn prefetch_cols_with(
     std::thread::scope(|s| {
         for (kslice, slice) in keys.chunks(per).zip(out.chunks_mut(per)) {
             s.spawn(move || {
+                // M3 P1a M1: a column built here is off-owner work, and at `jobs=1` the same
+                // build happens on the caller's thread instead (`workers <= 1` above).
+                m3_set_worker(true);
                 let mut g = Gen::fresh_scratch(data.clone());
                 g.starts_round = starts_round;
                 if let Some(resolver) = resolver {
@@ -4470,6 +4896,7 @@ pub(crate) fn prefetch_cols_with(
                 for (slot, &(cx, cz)) in slice.iter_mut().zip(kslice) {
                     *slot = g.cols(cx, cz);
                 }
+                m3_flush();
             });
         }
     });
@@ -4479,6 +4906,7 @@ pub(crate) fn prefetch_cols_with(
 /// One chunk's base terrain, built by a worker: its columns plus the section rows the
 /// consumer will read. `cols` is what the serial path would have had in `col_c`, so the
 /// feature pass on the owner does not rebuild it per chunk.
+#[derive(Clone)]
 pub(crate) struct PrefetchedTerrain {
     pub key: (i32, i32),
     pub cols: std::sync::Arc<ChunkCols>,
@@ -4493,6 +4921,7 @@ pub(crate) struct PrefetchedTerrain {
 /// worker that reported cells without their marks would make the mark set depend on which
 /// thread built the section, which is exactly what `MC_SPINE_WG_GEN_JOBS=1` vs `8` has to
 /// stay identical on.
+#[derive(Clone)]
 pub(crate) struct BaseRow {
     pub key: (i32, i32, i32),
     pub arr: Box<[u32; 4096]>,
@@ -4592,6 +5021,8 @@ pub(crate) fn prefetch_terrain(
             let kslice = &keys[start..end];
             let cslice = &cols[start..end];
             s.spawn(move || {
+                // M3 P1a M1/M4: everything this thread does is off-owner terrain work.
+                m3_set_worker(true);
                 let mut g = Gen::fresh_scratch(data.clone());
                 g.starts_round = starts_round;
                 if let Some(resolver) = resolver {
@@ -4624,6 +5055,10 @@ pub(crate) fn prefetch_terrain(
                         }
                     }
                 }
+                // The meter is per thread, so the worker's own counts die with this thread
+                // unless they are merged first: `MC_SPINE_M3_PROFILE` would then under-count
+                // exactly the work P1a exists to attribute.
+                m3_flush();
             });
         }
     });
@@ -4790,6 +5225,7 @@ impl Gen {
             beard_depth: 0,
             terr_c: HashMap::new(),
             terr_ord: std::collections::VecDeque::new(),
+            terr_pending: std::collections::BTreeSet::new(),
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
@@ -4852,6 +5288,11 @@ impl Gen {
         sy: i32,
         cz: i32,
     ) -> (Box<[u32; 4096]>, Vec<(u8, i32, i32, i32)>) {
+        // M3 P1a M4/M5: which thread filled this section, and what the fill cost. A worker
+        // and the owner run this same function, so the split is decided by the thread the
+        // caller marked (`m3_set_worker`), not by looking at the generator.
+        m3_inc_split(M3_OWNER_SECTIONS, M3_WORKER_SECTIONS);
+        let t0 = m3_start();
         let mut arr = Box::new([0u32; 4096]);
         let mut marks: Vec<(u8, i32, i32, i32)> = Vec::new();
         for ly in 0..16i32 {
@@ -4890,6 +5331,7 @@ impl Gen {
                 (1, x, z, -y, 0, 0)
             }
         });
+        m3_elapsed(M3_FILL_NS, M3_FILL_N, t0);
         (arr, marks)
     }
 
@@ -4929,6 +5371,16 @@ impl Gen {
     /// eviction the other caches use. A section already in the store is left alone: both
     /// copies are the same pure result.
     fn install_terrain_rows(&mut self, rows: Vec<BaseRow>) {
+        self.install_terrain_rows_bounded(rows, terrain_store_bound());
+    }
+
+    /// [`Gen::install_terrain_rows`] with the retention bound passed in rather than read from
+    /// the environment: the `TERRAIN_STORE_BOUND` A/B has to be reproducible inside one
+    /// process, and an env read is cached per call site.
+    ///
+    /// Retention is the only thing the bound decides. A row it evicts early is rebuilt from
+    /// the (pure) columns when its consumer asks, so both arms have to return the same bytes.
+    fn install_terrain_rows_bounded(&mut self, rows: Vec<BaseRow>, bound: usize) {
         for row in rows {
             let BaseRow { key, arr, marks } = row;
             // The marks are filed even when the rows are already present: a section whose
@@ -4936,14 +5388,28 @@ impl Gen {
             // built it decided its marks, and a second round would file them twice.
             self.file_terrain_marks(&key, &marks);
             if self.terr_c.contains_key(&key) {
+                // M3 P1a M2: a duplicate install is worker terrain work whose consumer
+                // already held the answer.
+                m3_inc(M3_TERR_INSTALL_DUP);
                 continue;
             }
             self.terr_ord.push_back(key);
-            while self.terr_ord.len() > TERRAIN_STORE_BOUND {
+            while self.terr_ord.len() > bound {
                 if let Some(old) = self.terr_ord.pop_front() {
                     self.terr_c.remove(&old);
+                    m3_inc(M3_TERR_EVICT);
+                    // M4: the bound dropped a row before its consumer asked for it. That is
+                    // the one thing raising `TERRAIN_STORE_BOUND` can fix, so it is counted
+                    // separately from evictions a fully-drained store makes anyway.
+                    if m3_on() && self.terr_pending.remove(&old) {
+                        m3_inc(M3_EVICTED_UNCONSUMED);
+                    }
                 }
             }
+            if m3_on() {
+                self.terr_pending.insert(key);
+            }
+            m3_inc(M3_TERR_INSTALL);
             self.terr_c.insert(key, arr);
         }
     }
@@ -4976,18 +5442,39 @@ impl Gen {
     /// workers. The landed row is that same cell's base state, so answering from it keeps
     /// the feature stage's cost where it was.
     pub(crate) fn prefetched_cell(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        let rows = self.terr_c.get(&(x >> 4, y & !15, z >> 4))?;
-        rows.get((((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize)
-            .copied()
+        let rows = match self.terr_c.get(&(x >> 4, y & !15, z >> 4)) {
+            Some(rows) => rows,
+            None => {
+                m3_inc(M3_PREFETCH_MISS);
+                return None;
+            }
+        };
+        let st = rows
+            .get((((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize)
+            .copied();
+        if st.is_some() {
+            m3_inc(M3_PREFETCH_HIT);
+        }
+        st
     }
 
     /// Install a prefetch round: the workers' base rows, and the columns they built, so
     /// the serial feature/carver pass reads `col_c` instead of rebuilding them per chunk.
     pub(crate) fn install_prefetched(&mut self, chunks: Vec<Option<PrefetchedTerrain>>) {
+        self.install_prefetched_bounded(chunks, terrain_store_bound());
+    }
+
+    /// [`Gen::install_prefetched`] with the retention bound passed in (see
+    /// [`Gen::install_terrain_rows_bounded`]).
+    pub(crate) fn install_prefetched_bounded(
+        &mut self,
+        chunks: Vec<Option<PrefetchedTerrain>>,
+        bound: usize,
+    ) {
         let mut cols = Vec::new();
         for chunk in chunks.into_iter().flatten() {
             cols.push((chunk.key, chunk.cols));
-            self.install_terrain_rows(chunk.rows);
+            self.install_terrain_rows_bounded(chunk.rows, bound);
         }
         self.install_cols(cols);
     }
@@ -5024,7 +5511,15 @@ impl Gen {
             return None;
         };
         self.beard_depth += 1;
+        // M3 P1a M1/M5: a beardifier resolution is the 17x17 structure-start scan, the most
+        // expensive per-chunk unit in `cols`. A flat count across worker counts means the
+        // owner and the workers resolve disjoint chunks; a growing one means they repeat each
+        // other (which is what the split is there to answer), so the count and the time are
+        // both kept.
+        let t0 = m3_start();
         let data = resolver(self, cx, cz);
+        m3_elapsed(M3_BEARD_NS, M3_BEARD_N, t0);
+        m3_inc_split(M3_BEARD_RESOLVED_OWNER, M3_BEARD_RESOLVED_WORKER);
         self.beard_depth -= 1;
         let arc = std::sync::Arc::new(data);
         // A structure generation may have populated the cache for this chunk already
@@ -5044,6 +5539,7 @@ impl Gen {
 
     pub(crate) fn cols(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
         if let Some(v) = self.col_c.get(&(cx, cz)) {
+            m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
             return Some(v.clone());
         }
         let cc = self.build_cols(cx, cz, true)?;
@@ -5105,7 +5601,18 @@ impl Gen {
     }
 
     /// `cols` (`final_columns`) or `base_cols` (`!final_columns`): one chunk's columns.
+    ///
+    /// The body is [`Gen::build_cols_body`] so the M3 P1a counters can time every exit
+    /// (the base-column path returns early, before the surface and heightmap passes).
     fn build_cols(&mut self, cx: i32, cz: i32, final_columns: bool) -> Option<ChunkCols> {
+        m3_inc_split(M3_COLS_BUILT_OWNER, M3_COLS_BUILT_WORKER);
+        let t0 = m3_start();
+        let out = self.build_cols_body(cx, cz, final_columns);
+        m3_elapsed(M3_COLS_NS, M3_COLS_N, t0);
+        out
+    }
+
+    fn build_cols_body(&mut self, cx: i32, cz: i32, final_columns: bool) -> Option<ChunkCols> {
         let g = self;
         let ny = ((g.height / g.noise_cell_h) + 1) as usize;
         let nx = (16 / g.noise_cell_w + 1) as usize;
@@ -5573,6 +6080,10 @@ impl Gen {
         if y < self.min_y || y >= self.min_y + self.height {
             return (0, 0);
         }
+        // M3 P1a M3: which layer answered a *feature-side* cold read. The scope is set by
+        // `FC::get`'s fallback, so the terrain fill (which warms the same memos on purpose)
+        // stays out of these counts. `m3_on() &&` keeps the off path at one cached load.
+        let m3_read = m3_on() && m3_in_feature_read();
         let d = self.block_density(cc, x, y, z);
         if d > 0.0 {
             // `NoiseChunk.blockState` asks the aquifer for every cell, and its `density > 0`
@@ -5585,10 +6096,12 @@ impl Gen {
             if let Some(st) = cc.mat((x & 15) as usize, (z & 15) as usize, y) {
                 let st = if st == u32::MAX { self.def_st } else { st };
                 let st = self.vein_override(cc, x, y, z, st);
+                inc_if(m3_read, M3_FALLBACK_DENSITY);
                 return (st, terrain_mark(0, st));
             }
             let st = self.deep_state_cached(x, y, z, cc);
             let st = self.vein_override(cc, x, y, z, st);
+            inc_if(m3_read, M3_FALLBACK_DEEP);
             return (st, 0);
         }
         let aq = self.aq_state(x, y, z, d);
@@ -5602,6 +6115,7 @@ impl Gen {
                 return (0, 0);
             }
             // The fill wrote this cell, so the gate is the one vanilla puts on the fill.
+            inc_if(m3_read, M3_FALLBACK_AQUIFER);
             return (st, terrain_mark(fill_mark, st));
         }
         let lx = (x & 15) as usize;
@@ -5614,14 +6128,20 @@ impl Gen {
                     // The aquifer answered a barrier here, so this state is the surface
                     // stage's write and only its own fluid test applies.
                     let _ = fill_mark;
+                    m3_inc(M3_SURFACE_CELLS);
+                    inc_if(m3_read, M3_FALLBACK_SURFACE);
                     return (st, terrain_mark(MARK_SURFACE, st));
                 }
             }
         }
         match aq {
-            Some(st) => (st, terrain_mark(fill_mark, st)),
+            Some(st) => {
+                inc_if(m3_read, M3_FALLBACK_AQUIFER);
+                (st, terrain_mark(fill_mark, st))
+            }
             None => {
                 let st = self.deep_state_cached(x, y, z, cc);
+                inc_if(m3_read, M3_FALLBACK_DEEP);
                 (st, 0)
             }
         }
@@ -6441,9 +6961,15 @@ impl Gen {
     /// terrain work the feature pass does, and the same cell is read again by the send pass
     /// (`wg2_block`) immediately after, so the result is memoized here rather than recomputed.
     pub(crate) fn deep_state_cached(&mut self, x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
+        // M3 P1a M3: the deep rule is the most expensive terrain work a feature read does,
+        // and its memo lives on whichever generator ran the terrain pass. A cold memo here is
+        // the concrete form of "the feature layer reads terrain the terrain pass used to warm".
+        let m3_read = m3_on() && m3_in_feature_read();
         if let Some(&v) = self.deep_c.get(&(x, y, z)) {
+            inc_if(m3_read, M3_DEEP_HIT);
             return v;
         }
+        inc_if(m3_read, M3_DEEP_MISS);
         let v = self.deep_state_i(x, y, z, cc);
         self.deep_c.insert((x, y, z), v);
         self.deep_ord.push_back((x, y, z));
@@ -6706,9 +7232,12 @@ impl Gen {
         // position with r>=5 in cell c and one with r<5 in cell c+1 land on the
         // same key, so the two cells would share one level.
         let key = (rx.div_euclid(16), ry.div_euclid(12), rz.div_euclid(16));
+        let m3_read = m3_on() && m3_in_feature_read();
         if let Some(&v) = self.aq_lv.get(&key) {
+            inc_if(m3_read, M3_AQLV_HIT);
             return v;
         }
+        inc_if(m3_read, M3_AQLV_MISS);
         let v = self.aq_fluid_level_at(rx, ry, rz);
         self.aq_lv_ins(key, v);
         v
@@ -6959,15 +7488,28 @@ impl Gen {
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) -> Box<[u32; 4096]> {
         let mut arr = match self.terr_c.get(&(cx, sy, cz)) {
-            Some(rows) => rows.clone(),
-            None => match self.cols(cx, cz) {
-                Some(cc) => {
-                    let (arr, marks) = self.base_section_rows(&cc, cx, sy, cz);
-                    self.file_terrain_marks(&(cx, sy, cz), &marks);
-                    arr
+            Some(rows) => {
+                // M3 P1a M2/M4: the store answered, so this section's fill is not repeated and
+                // the row is no longer "waiting for its consumer".
+                m3_inc(M3_TERR_HIT);
+                if m3_on() {
+                    self.terr_pending.remove(&(cx, sy, cz));
                 }
-                None => Box::new([0u32; 4096]),
-            },
+                rows.clone()
+            }
+            None => {
+                // M4: the owner filled a section the store did not have. At `jobs=1` a prefetch
+                // round always installs, so this counts genuinely-missed sections only.
+                m3_inc(M3_TERR_MISS);
+                match self.cols(cx, cz) {
+                    Some(cc) => {
+                        let (arr, marks) = self.base_section_rows(&cc, cx, sy, cz);
+                        self.file_terrain_marks(&(cx, sy, cz), &marks);
+                        arr
+                    }
+                    None => Box::new([0u32; 4096]),
+                }
+            }
         };
         for ly in 0..16i32 {
             let y = sy + ly;
@@ -7028,6 +7570,9 @@ impl Gen {
     }
 
     pub(crate) fn aq_state(&mut self, x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
+        // M3 P1a M5: how many cells ask the aquifer at all. The count is the stage's share of
+        // the 4096 cells a section fills; the aquifer's own cost sits behind it.
+        m3_inc(M3_AQUIFER_CELLS);
         let g = self;
         // Every return below is one of `Aquifer$NoiseBasedAquifer.computeSubstance`'s, and each
         // carries its own `this.w = …` assignment:
@@ -10907,6 +11452,135 @@ mod wg_tests {
                     "chunk ({cx},{cz}) section {sy}: the prefetched arm differs from the serial one"
                 );
                 sy += 16;
+            }
+        }
+    }
+
+    /// M3 Slice P1a (`specs/chunk-parallelism`): `MC_SPINE_TERRAIN_STORE_BOUND` decides
+    /// retention and nothing else. Three arms of the same round — a bound small enough to
+    /// evict rows the consumer has not read yet, and the two A/B values — must return the
+    /// same section bytes, and each arm's own counters must say whether it dropped a row
+    /// early. Without the small arm this would pin an invariant nothing could violate.
+    #[test]
+    fn terrain_store_bound_changes_retention_not_bytes() {
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        let data = std::sync::Arc::clone(&local.data);
+        let keys = [(0, 0), (1, 0)];
+        let lo = min_y();
+        let hi = min_y() + (max_y() + 1 - min_y()) / 16 * 16 - 16;
+        let cols = prefetch_cols_with(&data, None, &keys, 2, None);
+        let prefetched = prefetch_terrain(&data, None, &keys, &cols, lo, hi, 2, None);
+        // The serial reference: no store at all, every section filled inline.
+        let mut reference = Gen::fresh_scratch(data.clone());
+        let mut want: Vec<Box<[u32; 4096]>> = Vec::new();
+        for &(cx, cz) in &keys {
+            let mut sy = lo;
+            while sy <= hi {
+                want.push(reference.terrain_section_at(cx, sy, cz, |_, _, _| {}));
+                sy += 16;
+            }
+        }
+        // `sections_per_chunk` sections are installed per chunk, so a bound of 1 keeps one
+        // row of the chunk being installed and evicts the rest before its consumer asks.
+        for (bound, expect_early_evict) in [(1usize, true), (512, false), (1536, false)] {
+            m3_test_force(true);
+            m3_reset_local();
+            let mut g = Gen::fresh_scratch(data.clone());
+            g.install_prefetched_bounded(prefetched.clone(), bound);
+            let resident = m3_local().get(M3_TERR_INSTALL);
+            let evicted = m3_local().get(M3_TERR_EVICT);
+            let early = m3_local().get(M3_EVICTED_UNCONSUMED);
+            assert_eq!(resident, want.len() as u64, "bound {bound}: installs");
+            assert_eq!(
+                early > 0,
+                expect_early_evict,
+                "bound {bound}: evicted_unconsumed={early} (evicted={evicted}); the counter \
+                 has to be able to see a row dropped before its consumer read it"
+            );
+            let mut i = 0;
+            for &(cx, cz) in &keys {
+                let mut sy = lo;
+                while sy <= hi {
+                    let got = g.terrain_section_at(cx, sy, cz, |_, _, _| {});
+                    assert_eq!(
+                        got.as_slice(),
+                        want[i].as_slice(),
+                        "bound {bound}: chunk ({cx},{cz}) section {sy} differs from the serial \
+                         fill; retention must not change what a section contains"
+                    );
+                    i += 1;
+                    sy += 16;
+                }
+            }
+            m3_test_force(false);
+        }
+    }
+
+    /// M3 Slice P1a: every counter is a count of deterministic work, so two runs of the same
+    /// workload have to agree counter for counter. The workload is run on this thread and the
+    /// meter read with [`m3_local`], so a concurrently running test cannot satisfy or break it;
+    /// the worker arm sets the flag instead of spawning, which keeps the `*_worker` counters
+    /// in this thread's meter.
+    #[test]
+    fn m3_counters_are_deterministic_across_runs() {
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        let data = std::sync::Arc::clone(&local.data);
+        let keys = [(0, 0), (1, 0)];
+        let lo = min_y();
+        let hi = min_y() + (max_y() + 1 - min_y()) / 16 * 16 - 16;
+        let cols = prefetch_cols_with(&data, None, &keys, 2, None);
+        let prefetched = prefetch_terrain(&data, None, &keys, &cols, lo, hi, 2, None);
+        let run = |worker: bool| -> M3Meter {
+            m3_test_force(true);
+            m3_set_worker(worker);
+            m3_reset_local();
+            let mut g = Gen::fresh_scratch(data.clone());
+            g.install_prefetched_bounded(prefetched.clone(), 16);
+            for &(cx, cz) in &keys {
+                let mut sy = lo;
+                while sy <= hi {
+                    let _ = g.prefetched_cell(cx * 16, sy, cz * 16);
+                    let _ = g.terrain_section_at(cx, sy, cz, |_, _, _| {});
+                    sy += 16;
+                }
+            }
+            let meter = m3_local();
+            m3_set_worker(false);
+            m3_test_force(false);
+            meter
+        };
+        for worker in [false, true] {
+            let a = run(worker);
+            let b = run(worker);
+            let drift: Vec<String> = M3_NAMES
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !M3_DURATION_COUNTERS.contains(i))
+                .filter(|(i, _)| a.get(*i) != b.get(*i))
+                .map(|(i, name)| format!("{name}: {} vs {}", a.get(i), b.get(i)))
+                .collect();
+            assert!(
+                drift.is_empty(),
+                "worker={worker}: the counters are not repeatable: {drift:?}"
+            );
+            assert!(
+                a.get(M3_TERR_INSTALL) > 0 && a.get(M3_FILL_N) > 0,
+                "worker={worker}: the measured workload did not run through the store"
+            );
+            if worker {
+                assert_eq!(
+                    a.get(M3_WORKER_SECTIONS),
+                    a.get(M3_FILL_N),
+                    "a marked worker thread's sections must be attributed to the worker arm"
+                );
+                assert_eq!(a.get(M3_OWNER_SECTIONS), 0);
+            } else {
+                assert_eq!(a.get(M3_OWNER_SECTIONS), a.get(M3_FILL_N));
+                assert_eq!(a.get(M3_WORKER_SECTIONS), 0);
             }
         }
     }

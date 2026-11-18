@@ -8470,6 +8470,19 @@ impl CarveRun {
 /// * `CARVE_ONLY=<carver id>` — run a single carver (cave / canyon / …).
 /// * `CARVE_DUMP_WRITES=<tx,tz>` — print the real (terrain-filtered) writes.
 pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
+    // M3 P1a M5: the carver stage is still serial, so its cost is part of the tail the rest of
+    // the batch waits on. The body has several early exits; the wrapper is how every one of
+    // them is timed without moving them.
+    let t0 = crate::worldgen::m3_start();
+    apply_carvers_body(g, tx, tz);
+    crate::worldgen::m3_elapsed(
+        crate::worldgen::M3_CARVER_NS,
+        crate::worldgen::M3_CARVER_N,
+        t0,
+    );
+}
+
+fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32) {
     if env_flag!("MC_SPINE_NOCARVE") {
         return;
     }
@@ -9194,6 +9207,10 @@ pub(crate) fn feat_prof_dump() {
 /// Populate one chunk (and the 3x3 around it, as a feature read would) so that a
 /// diagnostic sees the same feature-layer state a generation loop would.
 pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
+    populate_body(g, sx, sz);
+}
+
+fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
     // Vanilla's chunk status order is CARVERS then FEATURES, and both write into
     // the chunk's block state, so the carver pass runs here — before the feature
     // gate, because "no features" is a comparison fixture, not a carver switch
@@ -9266,6 +9283,10 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     let mut ctx = FC::new(g);
     let trace = env_flag!("FEAT_TRACE");
     let profile = env_flag!("FEAT_PROFILE");
+    // M3 P1a M5: the decoration steps only, without the carver stage above or the promotion
+    // and write-out below. Load-dependent by construction (it is a stopwatch), which is why
+    // the P1a conclusion rests on the M1-M4 counts and this only splits the remainder.
+    let feat_t0 = crate::worldgen::m3_start();
     for step in 0..order.len().max(structures.step_count()) {
         // Structures have steps even when the biome has no placed features.
         // Their registry slots and RNG streams are independent.
@@ -9367,6 +9388,11 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
     // magma block). That is why a mineshaft fence picks up `east`/`west` from the pillars
     // around it while the single bit it was written with is dropped, and why a mushroom a later
     // fire lit becomes air. See `promote_full_chunks` for the boundary itself and the timing.
+    crate::worldgen::m3_elapsed(
+        crate::worldgen::M3_FEATURE_NS,
+        crate::worldgen::M3_FEATURE_N,
+        feat_t0,
+    );
     promote_full_chunks(&mut ctx, sx, sz);
     // Taken before the writes because `ctx` borrows the generator; the containers ride
     // the same population and move into the runtime store as soon as the lock is released.

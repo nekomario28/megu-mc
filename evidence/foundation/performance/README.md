@@ -299,3 +299,169 @@ chunk of a round claimed), `prefetched_terrain_rows_match_the_serial_fill_at_any
 (the composed boundary, features included). Two mutation entries hold the
 dispatch able to fail (`MUTATION_STABILITY=1`, both red/red/green): an off-by-one
 in the worker's first claim, and a section consumed under the next section's key.
+
+## M3 P1a: load-independent counters, and where the `full` CPU penalty is (2026-11-19)
+
+The terrain split above is measured in wall clock and CPU, and both move with the
+host's load. Before extending it (`specs/chunk-parallelism`, P1a) the `full` arm's
+CPU penalty has to be attributed to a *count of work* instead: `jobs=1` against
+`jobs=5`/`8` and `TERRAIN_STORE_BOUND` 512 against 1536 must be comparable when the
+machine is busy. This section is that measurement.
+
+Counters M1–M5 live in `src/worldgen.rs` (`M3_*`), gated by `MC_SPINE_M3_PROFILE=1`
+(or the older `FEAT_PROFILE=1`). Off, each site pays one cached `OnceLock` load and a
+predicted branch; nothing reads a counter to make a decision, so the bytes and the
+mark sets cannot move. On, they count:
+
+| | counter | what it counts |
+|---|---|---|
+| M1 | `chunk_starts`, `cols` built/hit, `beard resolved`, each owner vs worker | the structure admission scan (17x17 window when the beard resolves), and the column builds inside it |
+| M2 | `terr_c` hit / miss / evict / install / install_dup | the prefetched-section store, and `MC_SPINE_TERRAIN_STORE_BOUND` |
+| M3 | `prefetch_hit` / `prefetch_miss`, `deep_c` / `aq_lv` / `prelim_c` hit vs miss, and which layer answered a cold read (density+material, deep, aquifer, surface) | what answers a feature-side terrain read |
+| M4 | sections filled by a worker vs by the owner, `evicted_unconsumed` | duplicated terrain work, and rows the store dropped before a consumer read them |
+| M5 | `cols`, `beard`, `fill`, `carver`, `feature` duration **and** count; aquifer and surface cells | the stage split |
+
+The meter is per thread and merged into a process aggregate: a prefetch worker
+flushes before its thread ends, so the report does not lose exactly the work under
+investigation. `M5`'s `*_ms` are stopwatches and stay load-dependent (two 8-worker
+runs of identical work measured `cols` 33.9 s and 49.9 s); the conclusion below rests
+on the counts, which were identical run to run except where noted.
+
+Identity first, and it holds for every configuration below:
+
+| configuration | sha256 of the 64-chunk block dump |
+|---|---|
+| `full`, `NOFEAT`, `terrain only` (`NOFEAT`+`NOCARVE`) × `jobs` 1/5/8 × bound 512/1536 | `670fdfe3…` / `57101c43…` / `bb499dfb…` — the three recorded above, unchanged |
+
+### Measurement
+
+64-chunk `MC_SPINE_WG_DUMP_N=8` dump at seed 0, in a `CPUQuota=400%`
+`MemoryMax=5G` user scope, three interleaved runs per arm (six for `full` at
+`jobs=1` and `jobs=5`), medians. Counters off, so these are timings and not
+counts; a per-cell counter would be inside the measurement.
+
+| workload | jobs=1 | jobs=5 | jobs=8 |
+|---|---|---|---|
+| terrain only | 3.009 s / 3.00 s cpu | **0.789** / 2.93 | 0.894 / 3.47 |
+| `NOFEAT` (terrain + carvers) | 5.589 / 5.54 | 3.216 / 5.39 | **3.095** / 5.66 |
+| full (features on) | 9.855 / 9.82 | **7.746 / 15.98** | 8.731 / 21.82 |
+
+Read the CPU column: terrain-only and `NOFEAT` are flat in the worker count
+(3.00 -> 2.93 -> 3.47 and 5.54 -> 5.39 -> 5.66), while `full` goes 9.82 -> 15.98 ->
+21.82 (**+63% at 5, +122% at 8**). Restricting to the feature layer,
+`full - NOFEAT` costs 4.29 s of CPU at one worker against 10.59 at five and 16.16 at
+eight: a **2.5x / 3.8x** growth, and the whole penalty is in it. (The absolute
+numbers differ from the 2026-11-18 table above because that one ran in a 550% unit;
+the recorded numbers there stand as their own measurement, and this table is what the
+A/B below is compared within.)
+
+The counters identify what grows. `full`, bound 512, counters on:
+
+| | jobs=1 | jobs=5 | jobs=8 |
+|---|---|---|---|
+| M1 `chunk_starts` owner / worker | 281 / 0 | 170 / 285 | 170 / 206–401 |
+| M1 `cols built` owner / worker | 481 / 0 | 303 / 347 | 289 / 276–471 |
+| M1 `cols hit` owner / worker | 144,448 / **0** | 133,095 / **0** | 118,530 / **0** |
+| M1 `beard resolved` owner / worker | 234 / 0 | 164 / 64 | 148 / 64 |
+| M2 `terr_c` hit / miss / evict / dup | 1536 / 0 / 1024 / 0 | same | same |
+| M3 `prefetch_hit` / `prefetch_miss` | 88,877 / 1,067,302 | 178,699 / 978,534 | 316,801 / 847,630 |
+| M3 `deep_c` hit / miss (feature reads) | 11,748 / 723,917 | 10,985 / 665,889 | 9,307 / 580,476 |
+| M3 `aq_lv` hit / miss | 299,109 / 1,504 | 277,262 / 1,419 | 240,657 / 1,251 |
+| M3 `prelim_c` hit / miss | 3,009 / 9 | 1,903 / 9 | 2,752 / 8 |
+| M4 sections worker / owner | 1,536 / 0 | 1,536 / 0 | 1,536 / 0 |
+| M4 `evicted_unconsumed` | 0 | 0 | 0 |
+| M5 `aquifer_cells` / `surface_cells` | 5,296,614 / 39 | 5,318,341 / 39 | 5,246,448 / 39 |
+
+Three things are flat and one is not.
+
+**Flat: the feature layer's terrain reads.** `rc` hits plus prefetch hits plus the
+fallbacks is ~1.16M reads at every worker count, and the cold-memo misses *fall* as
+workers rise (`deep_c` 723,917 -> 580,476), because a wider round installs more
+neighbour sections. These cannot be the growth. They are a real, constant cost, and
+they are already present at `jobs=1`: the dump prefetches on one worker even then
+(`M4 sections worker=1536`), so the owner's `deep_c` is cold at one worker too — the
+number that would have shown a worker-count effect shows none.
+
+**Flat: the store.** Every section the consumer asked for was installed and hit
+(`hit=1536`, `miss=0`), and the owner recomputed nothing (`M4 sections owner=0`).
+
+**Growing: M1, the structure-start admission and the column builds nested inside
+it.** `chunk_starts` 281 -> 454–462 -> 376–571 and `cols built` 481 -> 650–657 ->
+565–760,
+while the worker's own `col_c` answers **zero** hits at every count. The mechanism is
+visible in `starts_cached` (`src/structure_pipeline.rs`): a round's workers share one
+cache, but each computes a chunk's starts *before* taking the lock and only then
+re-checks for an existing entry, so two workers can compute the same admission scan;
+and a `cols`/`base_cols` taken while `beard_depth > 0` is deliberately not inserted
+into `col_c`, so the nested builds inside a beard resolution repeat per worker. A
+`chunk_starts` here is part of a beard resolution (`beard` is 14.4 ms/chunk at one
+worker, `cols` 17 ms/chunk), so 100–300 duplicated admissions is the order of the
+12 s of extra CPU at eight workers. It is also *variable*: two 8-worker runs of the
+same command measured 206 and 401 worker-side `chunk_starts` — a lost-update race,
+not a difference in what is generated (the sha is identical, which is why a count
+that varies is still a count of wasted work and not a parity break).
+
+### `TERRAIN_STORE_BOUND` A/B (512 against 1536)
+
+`MC_SPINE_TERRAIN_STORE_BOUND` (default 512, = `TERRAIN_STORE_BOUND`) selects the
+`terr_c` retention; it is the only thing it selects. Same 64-chunk dump, `full`:
+
+| | bound 512, j1 / j5 / j8 | bound 1536, j1 / j5 / j8 |
+|---|---|---|
+| dump sha256 | `670fdfe3…` | `670fdfe3…` |
+| wall clock (median, 3 runs) | 9.855 / 7.746 / 8.731 s | 9.778 / 7.651 / — (counters only at j8) |
+| CPU (median) | 9.82 / 15.98 / 21.82 s | 9.75 / 15.79 / — |
+| `terr_c` evict | 1024 / 1024 / 1024 | **0 / 0 / 0** |
+| `terr_c` hit / miss | 1536 / 0 | 1536 / 0 |
+| `evicted_unconsumed` (M4) | **0 / 0 / 0** | **0 / 0 / 0** |
+| `prefetch_hit` (feature reads) | 88,877 / 178,699 / 316,801 | 88,877 / 178,701 / 318,078 |
+| everything else in M1–M5 | — | identical apart from run-to-run noise |
+
+So the bound is **not** what the penalty is made of: at 512 the 1,024 evictions are
+all rows whose own consumer had already read them (`evicted_unconsumed=0`), and
+raising it buys 0.15% more feature-read hits (1,277 cells at eight workers) for
+8 MiB -> 24 MiB of retention. The 1.07M feature-side misses at one worker are not
+evictions at all: the round's group is `2 * jobs` chunks (`terrain_group`), so a
+chunk's decoration window reads neighbours that were never installed. **P1b-e
+(`TerrainShare`) should widen the shared row window, not the bound.**
+
+### What this settles for P1b
+
+* The `full` penalty scales with the worker count and lives in the structure layer
+  (`full - NOFEAT` 2.5x at five workers, 3.8x at eight), carried by M1: duplicated
+  `chunk_starts` and the nested unusable-`col_c` column builds inside them. A
+  `TerrainShare` that (a) publishes a start into the round cache with one
+  compare-and-set instead of compute-then-insert and (b) lets a worker's nested
+  `cols` land in a round-shared column cache is aimed at the measured growth.
+* Do not spend the budget on `terr_c` retention: 512 is already enough for every
+  consumer, and 1536 changes nothing measurable.
+* The feature layer's cold `deep_c` (724k misses, 98% of its deep reads) is real but
+  worker-count-invariant; it is the constant cost of the split, not its growth, and
+  the `prefetched_cell` answer already covers the cells that are resident.
+* `carver` is 1,210 calls and `feature` 121 calls at every worker count (`M5`), so
+  the serial tail is worker-count-invariant too — it caps the win but it is not the
+  penalty.
+
+### Reproduce
+
+```sh
+D=$PWD/target/perf && mkdir -p "$D"
+# counters for one arm (bound defaults to 512; add MC_SPINE_TERRAIN_STORE_BOUND=1536 for the A/B)
+systemd-run --user --scope -p CPUQuota=400% -p MemoryMax=5G --collect \
+  env MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=$D/f.bin MC_SPINE_WG_DUMP_N=8 \
+      MC_SPINE_GEN_JOBS=5 MC_SPINE_M3_PROFILE=1 ./target/release/mc-spine
+sha256sum "$D/f.bin"   # 670fdfe3… full, 57101c43… MC_SPINE_NOFEAT=1, bb499dfb… +MC_SPINE_NOCARVE=1
+```
+
+### Gates
+
+`terrain_store_bound_changes_retention_not_bytes` (three bounds — 1, 512, 1536 — must
+return the same section bytes; `evicted_unconsumed` must be non-zero for the small
+bound and zero for the others, so the counter is proven able to see an early
+eviction) and `m3_counters_are_deterministic_across_runs` (every counter except the
+five durations, twice, on the owner path and with the worker flag set). Both were
+mutation-checked and went red: `install_terrain_rows_bounded` ignoring its bound, a
+zeroed rebuild on a `terr_c` miss, and a counter attributed from process state.
+The full suite: 719 passed, 1 ignored, and the two failures that also fail at
+`0fa6807` on this host (`tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count`,
+`worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock`).

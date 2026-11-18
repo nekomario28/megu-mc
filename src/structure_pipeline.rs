@@ -1058,6 +1058,14 @@ fn set_starts(d: &Defs, g: &mut Gen, set: &SetDef, cx: i32, cz: i32) -> Vec<Star
 
 /// Starts of every set that admit this chunk.
 fn chunk_starts(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
+    // M3 P1a M1: one admission scan per (chunk, cache). The owner/worker split is the point:
+    // the round's cache is shared, so a scan here is duplicated work whenever two threads
+    // find the key missing at once (`starts_cached` computes before it takes the lock), and
+    // the owner repeating a worker's scan is the other half of the same question.
+    crate::worldgen::m3_inc_split(
+        crate::worldgen::M3_CHUNK_STARTS_OWNER,
+        crate::worldgen::M3_CHUNK_STARTS_WORKER,
+    );
     let Some(d) = defs() else {
         return Vec::new();
     };

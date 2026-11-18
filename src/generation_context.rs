@@ -189,6 +189,8 @@ impl<'a> FC<'a> {
             return s;
         }
         if let Some(&s) = self.rc.get(&(x, y, z)) {
+            // M3 P1a M3: answered from this pass' own terrain read-through cache.
+            crate::worldgen::m3_inc(crate::worldgen::M3_RC_HIT);
             return s;
         }
         // Carvers run before features and write into the feature layer. A feature
@@ -214,19 +216,26 @@ impl<'a> FC<'a> {
         // A worker may already have filled this chunk's section: the landed base row is the
         // same answer `terrain_cell` would compute, without the cold memo behind it (see
         // `Gen::prefetched_cell`).
-        let st = match self.g.prefetched_cell(x, y, z) {
-            Some(st) => st,
-            None => {
-                let (cx, cz) = (x >> 4, z >> 4);
-                if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
-                    match self.g.cols(cx, cz) {
-                        Some(c) => self.cc = Some((cx, cz, c)),
-                        None => return 0,
+        //
+        // M3 P1a M3: the scope says the terrain memos read below are being read *for a
+        // feature*, not by the fill that warms them, so `deep_c`/`aq_lv`/`prelim_c` hits and
+        // misses are attributed to the feature layer's cold reads.
+        let st = {
+            let _read = crate::worldgen::M3FeatureRead::enter();
+            match self.g.prefetched_cell(x, y, z) {
+                Some(st) => st,
+                None => {
+                    let (cx, cz) = (x >> 4, z >> 4);
+                    if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
+                        match self.g.cols(cx, cz) {
+                            Some(c) => self.cc = Some((cx, cz, c)),
+                            None => return 0,
+                        }
                     }
-                }
-                match &self.cc {
-                    Some((_, _, c)) => self.g.terrain_cell(c, x, y, z),
-                    None => 0,
+                    match &self.cc {
+                        Some((_, _, c)) => self.g.terrain_cell(c, x, y, z),
+                        None => 0,
+                    }
                 }
             }
         };
