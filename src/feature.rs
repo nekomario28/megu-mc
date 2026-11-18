@@ -6379,6 +6379,16 @@ fn multiface_spread(
                     break;
                 }
                 ctx.set(target.0, target.1, target.2, st);
+                // `MultifaceSpreader$SpreadConfig.spread(..., mark=true)`: the bonus spread the
+                // growth feature runs marks the cell it spreads into (`dkz$b`, site 7). The
+                // sculk vein spreader passes `!spreadOnly` (no mark) and does not come here.
+                ctx.g.note_mark_source(
+                    target.0,
+                    target.1,
+                    target.2,
+                    crate::worldgen::MarkSrc::Multiface,
+                );
+                ctx.mark_shape(target.0, target.1, target.2);
                 return;
             }
         }
@@ -6405,6 +6415,13 @@ fn multiface_try(
         };
         if !ctx.out_of_h(p.1) {
             ctx.set(p.0, p.1, p.2, st);
+            // `MultifaceGrowthFeature.a(...)`: `level.setBlock(pos, state, 3)` then
+            // `level.getChunk(pos).markPosForPostprocessing(pos)` — the mark is filed even when
+            // `setBlock` changed nothing, and `ProtoChunk.e` drops it outside the build height
+            // (the guard above).
+            ctx.g
+                .note_mark_source(p.0, p.1, p.2, crate::worldgen::MarkSrc::Multiface);
+            ctx.mark_shape(p.0, p.1, p.2);
         }
         // The float draw happens even for zero/one spreading probabilities.
         if rng.next_f32() < cfg.spread {
@@ -8394,6 +8411,11 @@ struct CarveRun {
     /// First cell the current source chunk wrote, for the `SRC` trace that is
     /// compared against the real server's carve agent.
     mark: Option<(i32, i32, i32)>,
+    /// `ChunkAccess.markPosForPostprocessing` calls this carve run filed, in the order the
+    /// carver made them. `WorldCarver.apply` has two sites: the carved cell when the aquifer
+    /// says its fluid is settled (`shouldScheduleFluidUpdate`), and the cell below when the
+    /// restored top material carries a fluid.
+    shape_marks: Vec<(i32, i32, i32)>,
 }
 
 impl CarveRun {
@@ -8473,6 +8495,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
         probe_air: breg().map_or(12959, |b| b.state_of("minecraft:cave_air", None)),
         probe_lava: breg().map_or(96, |b| b.state_of("minecraft:lava", None)),
         mark: None,
+        shape_marks: Vec::new(),
     };
     let mut starts = 0u32;
     for ox in tx - 8..=tx + 8 {
@@ -8549,6 +8572,14 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
     }
     let wg = wg_heightmaps_after_carve(g, &cc, tx, tz, &run.out);
     g.set_wg_after_carve(tx, tz, wg);
+    // The marks are the positions the carver *aimed* at, filed by
+    // `ChunkAccess.markPosForPostprocessing` on the chunk being carved. A write more than a
+    // chunk away folds (`x & 15`) into this chunk's array, and the mark folds with it, because
+    // vanilla stores the mark as the same packed local offset — so the folded absolute
+    // position is the faithful one to file.
+    for (x, y, z) in std::mem::take(&mut run.shape_marks) {
+        g.store_shape_mark_from(x, y, z, crate::worldgen::MarkSrc::Carver);
+    }
     for ((lx, y, lz), st) in std::mem::take(&mut run.out) {
         g.feat_write(tx * 16 + lx as i32, y, tz * 16 + lz as i32, st);
     }
@@ -9049,11 +9080,27 @@ impl CarveRun {
             self.mark = Some((x, y, z));
         }
         self.out.insert(((x & 15) as u8, y, (z & 15) as u8), st);
+        // `WorldCarver.apply`'s first mark site: `if (aquifer.shouldScheduleFluidUpdate() &&
+        // !state.getFluidState().isEmpty()) chunk.markPosForPostprocessing(pos)`. The gate is
+        // the aquifer's flag from the `getCarveState` call above and the state *it* returned,
+        // not the state the write folded onto.
+        if !self.probe && g.aq_schedule_fluid_update() && has_fluid_state(br, st) {
+            // Folded onto the chunk being carved: vanilla stores the mark as the packed local
+            // offset on `chunk` (the target), so a far-chunk carve marks the cell it folds to.
+            self.shape_marks
+                .push((self.tx * 16 + (x & 15), y, self.tz * 16 + (z & 15)));
+        }
         if reached_surface && self.read(g, cc, x, y - 1, z) == br.state_of("minecraft:dirt", None) {
             let fluid = g.is_fluid_state(st);
             if let Some(top) = g.top_material_at(x, y - 1, z, fluid) {
                 self.out
                     .insert(((x & 15) as u8, y - 1, (z & 15) as u8), top);
+                // Second site: the restored top material is marked when its own fluid state is
+                // non-empty (no aquifer gate — vanilla asks the restored state only).
+                if !self.probe && has_fluid_state(br, top) {
+                    self.shape_marks
+                        .push((self.tx * 16 + (x & 15), y - 1, self.tz * 16 + (z & 15)));
+                }
             }
         }
         true
@@ -9342,6 +9389,7 @@ pub(crate) fn populate(g: &mut Gen, sx: i32, sz: i32) {
 /// and not a tail inside the feature loop.
 fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
     for (x, y, z) in std::mem::take(&mut ctx.shape_marks) {
+        ctx.g.note_mark_source(x, y, z, crate::worldgen::MarkSrc::Write);
         ctx.g.store_shape_mark(x, y, z);
     }
     ctx.g.pop_active = None;
@@ -9355,6 +9403,22 @@ fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
             let mut marks = ctx.g.take_shape_marks(cx, cz);
             if marks.is_empty() {
                 continue;
+            }
+            // `MARK_TRACE=<cx>,<cz>|all`: the pass' input, one line per marked cell with the
+            // writer that filed it. This is the port-side counterpart of the reference's
+            // RUNTIME lines: the same window files 106 marks there, and the breakdown by
+            // source is what says whether a missing mark is a missing *site* or a cell the
+            // site is not reached for.
+            let mark_trace = crate::trace_env::env_str!("MARK_TRACE")
+                .is_some_and(|want| want == "all" || want == format!("{cx},{cz}"));
+            if mark_trace {
+                eprintln!("MARKPASS {cx} {cz} marks={}", marks.len());
+                for &(x, y, z) in &marks {
+                    eprintln!(
+                        "MARK {x} {y} {z} chunk={cx},{cz} src={}",
+                        ctx.g.mark_source_of(x, y, z)
+                    );
+                }
             }
             // `ProtoChunk.markPosForPostprocessing` buckets by section and native walks the
             // buckets in ascending order; `sort_by_key` is stable, so a bucket keeps mark order.

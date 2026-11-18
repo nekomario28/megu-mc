@@ -8752,6 +8752,103 @@ fn schedule_waterlogged_positions(positions: Vec<BlockPos>) {
     }
 }
 
+/// `FluidState.tick` for the chunk-promotion pass (`LevelChunk.postProcessGeneration`'s
+/// `if (!fs.isEmpty()) fs.tick(this.level, p)`), bridged onto `flowing_fluid`.
+///
+/// `structure_template` is Layer 4 and `flowing_fluid` is Layer 3, so the machine cannot be
+/// reached from the pass: `main` registers this function into it at startup (and in the
+/// tests), the same seam `feature::register_beard_resolver` uses for the terrain layer.
+struct PassFluidReader<'a>(&'a mut dyn structure_template::FluidTickTarget);
+
+impl flowing_fluid::Reader for PassFluidReader<'_> {
+    // The refusal names the cell it could not answer, so a trace can say *which* neighbour
+    // the machine stopped on instead of only that it stopped.
+    type Error = flowing_fluid::Pos;
+    fn cell(&mut self, pos: flowing_fluid::Pos) -> Result<flowing_fluid::Cell, flowing_fluid::Pos> {
+        match self.0.fluid_cell(pos) {
+            Some(structure_template::FluidCell::Air) => Ok(flowing_fluid::Cell::Air),
+            Some(structure_template::FluidCell::Solid) => Ok(flowing_fluid::Cell::Solid),
+            Some(structure_template::FluidCell::Fluid { water, level }) => {
+                Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+                    kind: if water {
+                        flowing_fluid::Kind::Water
+                    } else {
+                        flowing_fluid::Kind::Lava
+                    },
+                    level,
+                }))
+            }
+            // Vanilla's `FlowingFluid` has no such answer: a non-full collision shape or a
+            // cross-fluid contact is a case this machine refuses rather than guesses. The
+            // pass then leaves the cell alone, which is the fail-closed half of the contract
+            // on `flowing_fluid::Reader`.
+            None => Err(pos),
+        }
+    }
+    fn unsupported_contact(&mut self, pos: flowing_fluid::Pos) -> flowing_fluid::Pos {
+        pos
+    }
+}
+
+/// `FluidState.tick(level, pos)` at one marked cell. `expected_source` is the cell's own
+/// source-ness (so a marked flowing cell takes the `getNewLiquid` arm and a source goes
+/// straight to `spread`, which is vanilla's split), and `source_conversion` is water-only,
+/// matching `FlowableFluid`'s `canConvertToSource` as the runtime scheduler already reads it.
+fn promotion_fluid_tick(
+    world: &mut dyn structure_template::FluidTickTarget,
+    pos: flowing_fluid::Pos,
+) {
+    let Some(structure_template::FluidCell::Fluid { water, level }) = world.fluid_cell(pos) else {
+        return;
+    };
+    let kind = if water {
+        flowing_fluid::Kind::Water
+    } else {
+        flowing_fluid::Kind::Lava
+    };
+    let plan = {
+        let mut reader = PassFluidReader(&mut *world);
+        flowing_fluid::tick(&mut reader, pos, kind, level == 0, water)
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(blocked) => {
+            // `flowing_fluid` refuses a cell it has no native contract for (a non-full
+            // collision shape, a cross-fluid contact). Vanilla would have an answer; this
+            // port leaves the cell alone rather than invent one, and says so when asked.
+            if std::env::var_os("FLUID_TICK_TRACE").is_some() {
+                // Position only: this runs inside `worldgen::with_gen`, and `block_at`
+                // re-enters `GEN` (the cell may not be in the runtime store), which is a
+                // self-deadlock on the generator lock. The name is not worth that: the
+                // machine's refusal is about the *cell*, and the cell is what is printed.
+                eprintln!("[fluid-tick] mark={pos:?} stopped on {blocked:?}");
+            }
+            return;
+        }
+    };
+    if std::env::var_os("FLUID_TICK_TRACE").is_some() && !plan.writes.is_empty() {
+        eprintln!(
+            "[fluid-tick] {:?} writes={} self={:?}",
+            pos,
+            plan.writes.len(),
+            plan.updated_self
+        );
+    }
+    for (write_pos, cell) in plan.writes {
+        // `Plan::writes` uses the machine's own cell type; `Solid` is never planned (a fluid
+        // plan writes air or fluid), so an unreachable arm is the honest translation.
+        let cell = match cell {
+            flowing_fluid::Cell::Air => structure_template::FluidCell::Air,
+            flowing_fluid::Cell::Fluid(f) => structure_template::FluidCell::Fluid {
+                water: f.kind == flowing_fluid::Kind::Water,
+                level: f.level,
+            },
+            flowing_fluid::Cell::Solid => continue,
+        };
+        world.set_fluid(write_pos, cell);
+    }
+}
+
 struct FluidReader;
 impl flowing_fluid::Reader for FluidReader {
     type Error = String;
@@ -17993,26 +18090,24 @@ fn prefetch_terrain_group(
     lo: i32,
     hi: i32,
     workers: usize,
-    round: u64,
+    round: Option<u64>,
 ) {
-    if workers <= 1 || news.is_empty() {
+    if news.is_empty() {
         return;
     }
     let Some(data) = worldgen::data_snapshot() else {
         return;
     };
+    // `jobs = 1` builds the same rows on one scratch generator instead of eight. It is not
+    // skipped: the base rows carry the terrain stage's `markPosForPostprocessing` decisions,
+    // so a serial run that let the sections be built lazily would file those marks after the
+    // chunk was already promoted, and `MC_SPINE_WG_GEN_JOBS=1` vs `8` would stop being a
+    // comparison of the same thing.
+    let jobs = workers.max(1);
     let resolver = worldgen::with_gen(|g| g.beard_resolver()).flatten();
-    let cols = worldgen::prefetch_cols_with(&data, resolver, news, workers, Some(round));
-    let chunks = worldgen::prefetch_terrain(
-        &data,
-        resolver,
-        news,
-        &cols,
-        lo,
-        hi,
-        workers,
-        Some(round),
-    );
+    let cols = worldgen::prefetch_cols_with(&data, resolver, news, jobs, round);
+    let chunks =
+        worldgen::prefetch_terrain(&data, resolver, news, &cols, lo, hi, jobs, round);
     let _ = worldgen::with_gen(|g| g.install_prefetched(chunks));
 }
 
@@ -18098,15 +18193,13 @@ fn stream_chunks(
         let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
     }
     for chunk_group in news.chunks(terrain_group(delivery_workers)) {
-        if let Some(round) = delivery_round {
-            prefetch_terrain_group(
-                chunk_group,
-                MIN_Y,
-                MIN_Y + 384 - 16,
-                delivery_workers,
-                round,
-            );
-        }
+        prefetch_terrain_group(
+            chunk_group,
+            MIN_Y,
+            MIN_Y + 384 - 16,
+            delivery_workers,
+            delivery_round,
+        );
         for (cx, cz) in chunk_group {
             if send_packet(s, 0x27, map_chunk(*cx, *cz, gen)).is_err() {
                 return;
@@ -27067,6 +27160,10 @@ fn main() {
     // in `tools/layers_check.sh`, so the edge is a registered function pointer rather
     // than an import.
     feature::register_beard_resolver();
+    // The chunk-promotion pass ticks a marked fluid cell (`LevelChunk.postProcessGeneration`),
+    // and the fluid machine lives below the pass' layer, so it is registered the same way the
+    // beardifier resolver is. Without it the pass would keep skipping marked fluid cells.
+    structure_template::register_fluid_ticker(promotion_fluid_tick);
     // A dump request must never fall through to the live server/save path.
     if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
         && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()
@@ -27077,6 +27174,49 @@ fn main() {
     let probe_args: Vec<String> = std::env::args().skip(1).collect();
     // main's diagnostics pass the same argument list by their own name
     let cli_args = &probe_args;
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg == "--worldgen-cell")
+    {
+        // The terrain stage of one cell, with the aquifer's mark flag: the pair a
+        // `NoiseBasedChunkGenerator`/`WorldCarver` mark is decided from. `fluid` is
+        // `true` when the state carries a fluid and `mark` when
+        // `Aquifer.shouldScheduleFluidUpdate()` held after the call that produced it.
+        assert_eq!(
+            probe_args.len(),
+            6,
+            "usage: --worldgen-cell <overworld|nether|end> <seed> <x> <y> <z>"
+        );
+        let preset = worldgen::NoisePreset::parse(&probe_args[1])
+            .expect("implemented biome source: overworld, nether or end");
+        let seed = probe_args[2].parse::<i64>().expect("signed 64-bit seed") as u64;
+        let coordinate = |i: usize| probe_args[i].parse::<i32>().expect("block coordinate");
+        let (x, y, z) = (coordinate(3), coordinate(4), coordinate(5));
+        let reg = block_registry::breg().expect("block registry");
+        let mut generator =
+            worldgen::Gen::load_preset(seed, name_to_state, preset).expect("load noise preset");
+        let cols = generator.cols(x >> 4, z >> 4).expect("chunk columns");
+        let density = generator.block_density(&cols, x, y, z);
+        let state = generator.terrain_cell(&cols, x, y, z);
+        let mark = generator.aq_schedule_fluid_update();
+        // The two questions vanillas fill asks separately: what the aquifer answered, and
+        // whether that answer carried `shouldScheduleFluidUpdate`. `fill=` is the answer with
+        // the density the fill used (the carver asks with 0.0), so a cell where the surface
+        // material wins can still be told apart from one the aquifer never reached.
+        let fill = generator.aq_state(x, y, z, density);
+        let mark_fill = generator.aq_schedule_fluid_update();
+        println!(
+            "{} density={density} fill={} mark_fill={mark_fill} mark={mark}",
+            reg.name_of(state),
+            fill.map_or("null".to_string(), |st| format!(
+                "{}/{}(sched={})",
+                reg.name_of(st),
+                reg.fluid_name(st),
+                st
+            )),
+        );
+        return;
+    }
     if probe_args
         .first()
         .is_some_and(|arg| arg == "--worldgen-biome")
@@ -27385,6 +27525,35 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            // Which window a dump covers. Default `world` = the **world** window from
+            // `dimension_type`: the Nether and the End store 16 sections while their
+            // terrain covers 8, and a comparison has to look at the same rectangle on
+            // both sides. `noise` reproduces the pre-split 0/128 dump, which is what the
+            // existing `nat-4242-nether-*` rows were captured in (and therefore what the
+            // reader of those rows expects): `tools/port_triage.py
+            // --height-window noise` sets it together with the triage window, so the dump
+            // length and the compared window cannot disagree.
+            let (lo, hi) = match std::env::var("MC_SPINE_WG_DUMP_WINDOW").as_deref() {
+                Err(std::env::VarError::NotPresent) | Ok("world") => {
+                    (worldgen::world_min_y(), worldgen::world_max_y())
+                }
+                Ok("noise") => (worldgen::min_y(), worldgen::max_y()),
+                other => {
+                    eprintln!(
+                        "[wgdump] invalid MC_SPINE_WG_DUMP_WINDOW {other:?}; expected world or noise"
+                    );
+                    std::process::exit(2);
+                }
+            };
+            let dump_workers = gen_workers();
+            let dump_round = (dump_workers > 1).then(crate::feature::starts_round_begin);
+            // The owner shares the round's start cache too: it computes the same starts while
+            // the feature layer runs, and recomputing them per chunk was the rest of the
+            // duplicated cost (measured: 9.72 s with the workers-only sharing against 7.16 s
+            // when the owner shared as well, on the 64-chunk full dump).
+            if let Some(round) = dump_round {
+                let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
+            }
             if let Ok(order_path) = std::env::var("MC_SPINE_POP_ORDER") {
                 let fail = |message: String| -> ! {
                     eprintln!("[wgdump] population plan: {message}");
@@ -27406,6 +27575,15 @@ fn main() {
                 };
                 let order = worldgen::parse_population_order(&text, ox, oz, n, allow_extra)
                     .unwrap_or_else(|error| fail(error));
+                // The terrain stage runs before the plan, not lazily inside it. Vanilla's
+                // `SURFACE` precedes `CARVERS`/`FEATURES` for a chunk, and the marks that
+                // stage files have to be in the chunk's `postProcessing` bucket *before* that
+                // chunk is promoted - and a promotion happens inside the plan, at the end of
+                // the populate that completes its 3x3. Building the rows here (on the same
+                // scratch generators the dump uses) is also what makes the marks independent
+                // of the worker count: they are decided by the terrain pass, not by whichever
+                // section the dump happens to ask for first.
+                prefetch_terrain_group(&order, lo, hi, dump_workers, dump_round);
                 let requested = order.len();
                 let executed =
                     worldgen::with_gen(|g| g.populate_in_order(order, feature::populate))
@@ -27418,26 +27596,6 @@ fn main() {
                     if allow_extra { "recorded" } else { "exact" }
                 );
             }
-            // Which window a dump covers. Default `world` = the **world** window from
-            // `dimension_type`: the Nether and the End store 16 sections while their
-            // terrain covers 8, and a comparison has to look at the same rectangle on
-            // both sides. `noise` reproduces the pre-split 0/128 dump, which is what the
-            // existing `nat-4242-nether-*` rows were captured in (and therefore what the
-            // reader of those rows expects): `tools/port_triage.py
-            // --height-window noise` sets it together with the triage window, so the dump
-            // length and the compared window cannot disagree.
-            let (lo, hi) = match std::env::var("MC_SPINE_WG_DUMP_WINDOW").as_deref() {
-                Err(std::env::VarError::NotPresent) | Ok("world") => {
-                    (worldgen::world_min_y(), worldgen::world_max_y())
-                }
-                Ok("noise") => (worldgen::min_y(), worldgen::max_y()),
-                other => {
-                    eprintln!(
-                        "[wgdump] invalid MC_SPINE_WG_DUMP_WINDOW {other:?}; expected world or noise"
-                    );
-                    std::process::exit(2);
-                }
-            };
             let mut out: Vec<u8> = Vec::new();
             let t1 = Instant::now();
             // The request box, in the dump's own order (dz outer, dx inner). One group of
@@ -27446,19 +27604,8 @@ fn main() {
             let keys: Vec<(i32, i32)> = (0..n)
                 .flat_map(|dz| (0..n).map(move |dx| (ox + dx, oz + dz)))
                 .collect();
-            let dump_workers = gen_workers();
-            let dump_round = (dump_workers > 1).then(crate::feature::starts_round_begin);
-            // The owner shares the round's start cache too: it computes the same starts while
-            // the feature layer runs, and recomputing them per chunk was the rest of the
-            // duplicated cost (measured: 9.72 s with the workers-only sharing against 7.16 s
-            // when the owner shared as well, on the 64-chunk full dump).
-            if let Some(round) = dump_round {
-                let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
-            }
             for chunk_group in keys.chunks(terrain_group(dump_workers)) {
-                if let Some(round) = dump_round {
-                    prefetch_terrain_group(chunk_group, lo, hi, dump_workers, round);
-                }
+                prefetch_terrain_group(chunk_group, lo, hi, dump_workers, dump_round);
                 for &(cx, cz) in chunk_group {
                     let mut sy = lo;
                     while sy <= hi {
