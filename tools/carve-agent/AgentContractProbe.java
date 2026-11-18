@@ -98,8 +98,16 @@ public final class AgentContractProbe implements Opcodes {
         classes.put("duz", duzTransformed);
 
         ClassWriter pos = type("jd");
-        zeroMethod(pos, "u", "()I");
-        zeroMethod(pos, "w", "()I");
+        // Distinct coordinates per axis: the mark hook reads `u()`, `v()` and `w()` reflectively,
+        // and a transposed pair (y from w, z from v) is invisible when every axis is zero.
+        for (String[] g : new String[][]{{"u", "82"}, {"v", "69"}, {"w", "-500"}}) {
+            MethodVisitor axis = pos.visitMethod(ACC_PUBLIC, g[0], "()I", null, null);
+            axis.visitCode();
+            axis.visitLdcInsn(Integer.valueOf(g[1]));
+            axis.visitInsn(IRETURN);
+            axis.visitMaxs(0, 0);
+            axis.visitEnd();
+        }
         classes.put("jd", pos.toByteArray());
         ClassWriter feature = type("ebq");
         MethodVisitor value = feature.visitMethod(ACC_PUBLIC, "b", "()Lece;", null, null);
@@ -115,6 +123,31 @@ public final class AgentContractProbe implements Opcodes {
                 null, "ebq", null, null, feature.toByteArray());
         if (transformed == null) throw new AssertionError("ConfiguredFeature hook absent");
         classes.put("ebq", transformed);
+
+        // `ChunkAccess.markPosForPostprocessing`: execute the transformed ProtoChunk body and
+        // require that the hook not only exists but fires and decodes the cell. A hook whose
+        // marker strings are present but whose transform never matches looks identical to a run
+        // that filed no mark - the failure mode this whole lane exists to rule out.
+        System.setProperty("marktrace", "all");
+        ClassWriter dvs = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
+        dvs.visit(V17, ACC_PUBLIC, "dvs", null, "duy", null);
+        MethodVisitor dvsInit = dvs.visitMethod(ACC_PUBLIC, "<init>", "()V", null, null);
+        dvsInit.visitCode();
+        dvsInit.visitVarInsn(ALOAD, 0);
+        dvsInit.visitMethodInsn(INVOKESPECIAL, "duy", "<init>", "()V", false);
+        dvsInit.visitInsn(RETURN);
+        dvsInit.visitMaxs(0, 0);
+        dvsInit.visitEnd();
+        MethodVisitor markBody = dvs.visitMethod(ACC_PUBLIC, "e", "(Ljd;)V", null, null);
+        markBody.visitCode();
+        markBody.visitInsn(RETURN);
+        markBody.visitMaxs(0, 0);
+        markBody.visitEnd();
+        byte[] dvsTransformed = new Agent.Transformer().transform(
+                null, "dvs", null, null, dvs.toByteArray());
+        if (dvsTransformed == null) throw new AssertionError("ProtoChunk mark hook absent");
+        classes.put("dvs", dvsTransformed);
+        System.clearProperty("marktrace");
         ClassLoader loader = new ClassLoader(AgentContractProbe.class.getClassLoader()) {
             @Override protected Class<?> findClass(String name) throws ClassNotFoundException {
                 byte[] bytes = classes.get(name);
@@ -202,5 +235,26 @@ public final class AgentContractProbe implements Opcodes {
             throw new AssertionError("placement return failed to disarm");
         }
         System.out.println("agent placement lifetime: PASS");
+
+        // --- mark hook: fired, and decoded u/v/w onto the right axes ---
+        System.setProperty("marktrace", "all");
+        Class<?> protoChunk = loader.loadClass("dvs");
+        Object markChunk = protoChunk.getConstructor().newInstance();
+        Object markChunkPos = chunkPos.getConstructor().newInstance();
+        chunkPos.getField("e").setInt(markChunkPos, 5);
+        chunkPos.getField("f").setInt(markChunkPos, -32);
+        chunkAccess.getField("pos").set(markChunk, markChunkPos);
+        protoChunk.getMethod("e", position).invoke(markChunk, position.getConstructor().newInstance());
+        long markCalls = (Long) CarveLog.class.getDeclaredField("MARK_CALLS").get(null);
+        @SuppressWarnings("unchecked")
+        java.util.Set<String> markSeen = ((java.util.Map<String, Integer>)
+                CarveLog.class.getDeclaredField("MARK_SEEN").get(null)).keySet();
+        System.clearProperty("marktrace");
+        if (markCalls < 1) throw new AssertionError("ProtoChunk mark hook never fired");
+        String wantMark = "filed|5,-32|82,69,-500|";
+        boolean decoded = false;
+        for (String key : markSeen) if (key.startsWith(wantMark)) decoded = true;
+        if (!decoded) throw new AssertionError("mark hook decoded the wrong cell: " + markSeen);
+        System.out.println("agent mark insertion: PASS calls=" + markCalls);
     }
 }

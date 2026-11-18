@@ -1136,6 +1136,47 @@ public class Agent {
         return cw.toByteArray();
     }
 
+    /**
+     * `ChunkAccess.markPosForPostprocessing` - the single insertion point every post-processing
+     * mark passes through, whichever of the jar's nine owners filed it.
+     *
+     * Hooked on the three *bodies*, not on the nine call sites: all nine reach it through the
+     * interface method `duy.e(Ljd;)V`, so one hook per body covers every caller that exists today
+     * and every caller a future site would add, without re-deriving a local-variable index per
+     * site (`dvi.H`'s line numbers move between builds; a body's signature does not). `kind`
+     * records which body ran: `dvs` = `ProtoChunk` files the mark into the section bucket the pass
+     * later walks, `dvh` = `ImposterProtoChunk` swallows it, `duy` = the base warns and drops it.
+     *
+     * Only wired when `-Dmarktrace` is set, so an unarmed capture pays nothing.
+     */
+    static byte[] instrumentMark(byte[] buf, String kind) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("e") || !md.equals("(Ljd;)V")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            super.visitLdcInsn(kind);
+                            super.visitVarInsn(Opcodes.ALOAD, 0);   // the ChunkAccess
+                            super.visitVarInsn(Opcodes.ALOAD, 1);   // the BlockPos
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "mark",
+                                "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V", false);
+                        }
+                    };
+                }
+            }, ClassReader.EXPAND_FRAMES);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT mark failed: " + t);
+            return null;
+        }
+    }
+
     static class Transformer implements ClassFileTransformer {
         @Override public byte[] transform(ClassLoader l, String name, Class<?> c,
                                           ProtectionDomain pd, byte[] buf) {
@@ -1165,6 +1206,14 @@ public class Agent {
                 return instrumentEdgeFaces(buf);
             if ("eij".equals(name) && System.getProperty("blockpredchunk") != null)
                 return instrumentBlockPredicate(buf);
+            if (System.getProperty("marktrace") != null) {
+                // `dvs` = ProtoChunk (files), `dvh` = ImposterProtoChunk (swallows),
+                // `duy` = ChunkAccess (warns and drops). All three are hooked so no mark can
+                // enter - or fail to enter - the pass unobserved.
+                if ("dvs".equals(name)) return instrumentMark(buf, "filed");
+                if ("dvh".equals(name)) return instrumentMark(buf, "dropped");
+                if ("duy".equals(name)) return instrumentMark(buf, "unsupported");
+            }
             if ("eir".equals(name) && System.getProperty("hmchunk") != null)
                 return instrumentHeightmapPlacement(buf);
             if ("arb".equals(name)) return instrumentNoiseBiome(buf);

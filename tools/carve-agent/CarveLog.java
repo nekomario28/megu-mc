@@ -451,6 +451,80 @@ public class CarveLog {
             + " wrote=" + wrote + " s=" + SculkLog.windowSerial() + " stack=" + stack);
     }
 
+    /**
+     * One `ChunkAccess.markPosForPostprocessing` call (`-Dmarktrace=all` or a x,y,z box).
+     *
+     * `kind` names the body that ran, because the three bodies differ in what the mark *becomes*:
+     *
+     * * `filed` - `ProtoChunk.e(jd)`: appends to the section's `ShortList`, which is what
+     *   `LevelChunk.postProcessGeneration` later walks. This is the only path that manufactures a
+     *   pass entry, and all nine callers in the jar (the nine owners of the call site) reach it
+     *   through the interface method, so one hook here covers every mark a generation can file.
+     * * `dropped` - `ImposterProtoChunk.e(jd)`: an empty override. A mark filed against a wrapper
+     *   chunk is swallowed, so "the source ran" and "the cell reached the pass" are different
+     *   facts and only this line separates them.
+     * * `unsupported` - `ChunkAccess.e(jd)` itself: warn and drop, for a chunk that does not carry
+     *   post-processing. A mark landing here is a source writing through a chunk it should not.
+     *
+     * Logged at *entry*, not after the body, because `ProtoChunk.e` drops a position outside the
+     * chunk's build height (`!this.s(pos)`) and that drop is invisible afterwards.
+     *
+     * Deduplicated per cell+chunk+stack: the first occurrence of a key prints the full stack, a
+     * repeat prints only its ordinal. The key carries the stack so two different callers marking
+     * the same cell stay two records (vanilla keeps duplicate entries; the pass re-walks the
+     * cell), while one caller re-marking the same cell collapses to a counter.
+     */
+    public static void mark(String kind, Object chunk, Object pos) {
+        MARK_CALLS++;
+        String spec = System.getProperty("marktrace");
+        if (spec == null) return;
+        int x, y, z, cx, cz;
+        try {
+            Class<?> p = pos.getClass();
+            x = (Integer) p.getMethod("u").invoke(pos);
+            y = (Integer) p.getMethod("v").invoke(pos);
+            z = (Integer) p.getMethod("w").invoke(pos);
+            Object cp = chunk.getClass().getMethod("f").invoke(chunk);
+            Class<?> c = cp.getClass();
+            cx = (Integer) c.getField("e").get(cp);
+            cz = (Integer) c.getField("f").get(cp);
+        } catch (Throwable t) {
+            System.out.println("MARKERR " + kind + " " + t);
+            return;
+        }
+        if (!spec.equals("all")) {
+            int[] b;
+            try {
+                b = java.util.Arrays.stream(spec.split(",")).mapToInt(Integer::parseInt).toArray();
+            } catch (RuntimeException e) {
+                return;
+            }
+            if (!inside(b, x, y, z)) return;
+        }
+        String stack = java.util.Arrays.stream(Thread.currentThread().getStackTrace())
+            .skip(2).limit(10).map(StackTraceElement::toString)
+            .collect(java.util.stream.Collectors.joining(" | "));
+        String key = kind + "|" + cx + "," + cz + "|" + x + "," + y + "," + z + "|" + stack;
+        int n;
+        synchronized (MARK_SEEN) {
+            Integer prev = MARK_SEEN.get(key);
+            n = prev == null ? 1 : prev + 1;
+            MARK_SEEN.put(key, n);
+        }
+        MARK_LOGGED++;
+        if (n == 1) {
+            System.out.println("MARK " + kind + " " + x + " " + y + " " + z
+                + " chunk=" + cx + "," + cz + " n=1 s=" + SculkLog.windowSerial()
+                + " stack=" + stack);
+        } else {
+            System.out.println("MARK " + kind + " " + x + " " + y + " " + z
+                + " chunk=" + cx + "," + cz + " n=" + n);
+        }
+    }
+
+    static long MARK_CALLS, MARK_LOGGED;
+    static final java.util.Map<String, Integer> MARK_SEEN = new java.util.HashMap<>();
+
     static long VINE_CALLS, VINE_LOGGED, EDGE_CALLS, EDGE_LOGGED;
 
     static {
@@ -461,6 +535,10 @@ public class CarveLog {
             @Override public void run() {
                 System.out.println("VINESUM calls=" + VINE_CALLS + " logged=" + VINE_LOGGED
                         + " edges=" + EDGE_CALLS + " edges_logged=" + EDGE_LOGGED);
+                // Same reason for the mark hook: an unarmed `dvs` transform and a run that filed
+                // no mark both leave no MARK line, and only this count separates them.
+                System.out.println("MARKSUM calls=" + MARK_CALLS + " logged=" + MARK_LOGGED
+                        + " distinct=" + MARK_SEEN.size());
             }
         });
     }

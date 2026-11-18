@@ -93,7 +93,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         if name.endswith(".class"):
             blob += z.read(name)
 want = [b"SPATCH", b"SPLACE", b"SPASS", b"SDRAW", b"SCURSOR", b"SSPREADALL", b"SRNG",
-        b"VSHAPE", b"EDGE", b"BPRED", b"HMP"]
+        b"VSHAPE", b"EDGE", b"BPRED", b"HMP", b"MARK ", b"MARKSUM ", b"MARKERR"]
 missing = [w.decode() for w in want if w not in blob]
 if missing:
     print("logger is missing markers: " + ", ".join(missing), file=sys.stderr)
@@ -111,7 +111,8 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         if name.endswith(".class") and "/" not in name:
             blob += z.read(name)
 # The hooks the trace tooling depends on, by the game class each one instruments.
-want = [b"SculkLog", b"ebq", b"edi", b"eiv", b"dyn", b"duz", b"dmu", b"dov", b"eij", b"eir"]
+want = [b"SculkLog", b"ebq", b"edi", b"eiv", b"dyn", b"duz", b"dmu", b"dov", b"eij", b"eir",
+        b"dvs", b"dvh", b"duy"]
 missing = [w.decode() for w in want if w not in blob]
 if missing:
     print("agent does not wire hooks for: " + ", ".join(missing), file=sys.stderr)
