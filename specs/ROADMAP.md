@@ -123,7 +123,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 2. **P2 (常駐 `PalettedSection` ストア)**: 2026-10-20 に棄却した非圧縮配列キャッシュではなく、Single-value / Indirect / Direct の省メモリ section ストアを正本化し、light・anti-xray・feature 近傍読み・保存・送信で再計算と二重保持をなくす。
 3. **P3 (`CARVERS` / `FEATURES` 並列化)**: 半径2の先行不変条件と3×3引き渡し（Horizon MIT `0564ab0` の概念参照）により、バイト決定性を保ったまま残る直列生成を並列化する。
 4. **P4 (`DfProg` SIMD/バッチ評価と早期枝刈り)**: MIT `Soju06/hyperchunk`（`df_simd_avx2.c` 等）を先行例に、格子点の SIMD 評価と `material_rule` / `aquifer` の早期枝刈りを行う。
-5. **P5 (ライト・M2物理・圧縮配信)**: Starlight 概念（全空気/不透明 section の O(1) スキップ、nibble 直接フラッド）、Lithium 概念（`VoxelShape`/AABB キャッシュ）、`libdeflate` / zero-repack 送信を統合する。
+5. **P5 (ライト・M2物理/Mob・圧縮配信)**: Starlight 概念（全空気/不透明 section の O(1) スキップ、nibble 直接フラッド）、Lithium 概念（`VoxelShape`/AABB キャッシュ）、大量 Mob の構造的軽量化（連続配列による細粒度ロック撤去・空間グリッド索引による `O(N^2)` 排除・AI/経路探索の読み取り並列化）、`libdeflate` / zero-repack 送信を統合する。
 
 **ライセンス境界:** コード流用は MIT/Apache-2.0 等の許容ライセンス（`Soju06/hyperchunk`, `valence-rs`, `MCHPRS`, `0564ab0` 以前の Horizon）に限る（[OSS survey](../evidence/foundation/oss-survey/README.md)）。C2ME・Starlight/ScalableLux・Lithium・`fb1135c` 以降の Horizon・Paper・Pumpkin・SteelMC 等の GPL/LGPL/AGPL 実装は**アルゴリズム概念の参照のみ**とし、コードを一切コピーしない。
 

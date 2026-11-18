@@ -223,3 +223,13 @@ mutation check が緑であることを要求する。段 3 の perf 主張は `
 - **参照＋設計/コード参考にしてよい許容ライセンス（帰属・ヘッダ遵守）**: `Soju06/hyperchunk`（MIT、`/home/yuu/mc-spine-local/reference/hyperchunk-387c9ad/`）、`valence-rs/valence`（MIT）、`MCHPR/MCHPRS`（MIT）、および `0564ab0bcd3235daa6001033261b79aef5f81de1` 以前の Horizon（MIT）。詳細は [OSS survey](../../evidence/foundation/oss-survey/README.md)。
 - **アルゴリズム概念の参照のみ（コードのコピー・翻訳・派生移植は厳禁）**: C2ME、Starlight / ScalableLux、Lithium、Paper / Moonrise、Pumpkin（GPL-3.0）、SteelMC（AGPL-3.0）、`fb1135c6` 以降の Horizon（LGPL-3.0）。
 
+### 大量エンティティ・Mob・Mod 負荷への構造的防衛（M2 / M3 / R5 接続）
+
+[Entity framework](../foundation/slices/04-entity-framework.md) の方針（汎用 ECS の導入自体は目的にしない・G2 の vanilla 挙動不変を守る）を維持したまま、Mob 密集や大規模工場での構造的ラグを次の設計で防ぐ:
+
+1. **連続配列＋細粒度ロック撤去（M2→M3）**: 現行 `mob_tick` のようなエンティティ毎の複数 `Mutex` 獲得を廃し、tick 所有スレッド上の連続配列／データ配列（位置・速度・状態）＋読み取り/更新フェーズ分離へ移行する（測定で比較）。
+2. **チャンク／サブチャンク空間グリッド索引**: 押し合い・範囲判定・アイテム回収・ターゲット探索を全件総当たり（`O(N^2)`）から 16×16 セル近傍走査（`O(N)`）へ変える。
+3. **P2 + P5 への直結**: Mob の足元・視線・A* 経路探索が `block_at` ロックや地形再計算を踏まず、P2 `PalettedSection` と P5 事前計算済み `VoxelShape`/遮蔽テーブルを O(1) で直接参照する。
+4. **AI / 経路探索の 2 フェーズ読み取り並列化**: センサー走査・A* 計算を「不変ワールドスナップショット上の純粋計算」として並列化し、位置・ダメージの確定だけを規定順で直列コミットする（挙動を変えずに計算をマルチコアへ逃がす）。※ Paper 型の遠距離 AI 休止（Activation Range）は挙動が変わるため、将来入れる場合も既定 OFF の明示オプションに分離する。
+5. **Interest Management と同期バッチ化**: 視界外・微小変動パケットの同報を間引き・バッチ化し、通信エンコードによる tick 遅延を防ぐ。
+6. **R5（NeoForge / Create 規模 Mod）のバッチ JNI 境界**: Create 等の Java バイトコード内計算・GC 自体は JVM shim だけでは消えないため、S3（BlockEntity / tick）以降は 1 セル毎の JNI 往復を避け、チャンク／セクションスナップショットと変更差分のバッチ単位で JNI 境界を跨ぐ契約を採り、同期圧縮・保存・リージョン負荷隔離を Rust 側で吸収する（[shim-plan](../mod-compatibility/shim-plan.md)）。
