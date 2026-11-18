@@ -16,6 +16,15 @@ from wire_smoke import frame, port, recv_exact, recv_vint, status, vint
 
 ROOT = Path(__file__).resolve().parents[1]
 MIN_Y = -64
+DEFAULT_HEIGHT = 384
+DEFAULT_SECTIONS = DEFAULT_HEIGHT // 16
+DEFAULT_LIGHT_SECTIONS = DEFAULT_SECTIONS + 2
+BUILTIN_DIMENSION_TYPES = {
+    "minecraft:overworld": (-64, 384, True),
+    "minecraft:overworld_caves": (-64, 384, True),
+    "minecraft:the_nether": (0, 256, False),
+    "minecraft:the_end": (0, 256, False),
+}
 WIRE_BLOCKS = json.loads((ROOT / "assets/blocks_1211.json").read_text())
 STATE_COUNT = max(b["maxStateId"] for b in WIRE_BLOCKS) + 1
 AIR_STATES = {st for b in WIRE_BLOCKS if b["name"] in ("air", "cave_air", "void_air")
@@ -120,7 +129,10 @@ def palette(reader, count, indirect_max, minimum_bits, registry_count):
 STRICT = True
 
 
-def decode_chunk_light(body, biome_count):
+def decode_chunk_light(body, biome_count, section_count=DEFAULT_SECTIONS, has_skylight=True):
+    assert section_count > 0, "invalid section count"
+    light_section_count = section_count + 2
+    max_mask_longs = (light_section_count + 63) // 64
     reader = Reader(body)
     coord = (reader.number(">i"), reader.number(">i"))
     heightmaps = reader.nbt()
@@ -128,7 +140,7 @@ def decode_chunk_light(body, biome_count):
     data = Reader(reader.take(reader.varint()))
     sections = []
     if STRICT:
-        for _ in range(24):
+        for _ in range(section_count):
             non_air = data.number(">h")
             assert 0 <= non_air <= 4096
             states = palette(data, 4096, 8, 4, STATE_COUNT)
@@ -148,11 +160,15 @@ def decode_chunk_light(body, biome_count):
     masks = []
     for _ in range(4):
         length = reader.varint()
-        assert length <= 1, "light mask outside 26 sections"
-        mask = reader.number(">Q") if length else 0
-        assert mask < 1 << 26
+        assert length <= max_mask_longs, f"light mask outside {light_section_count} sections"
+        mask = 0
+        for word_idx in range(length):
+            mask |= reader.number(">Q") << (64 * word_idx)
+        assert mask < (1 << light_section_count)
         masks.append(mask)
     assert not masks[0] & masks[2] and not masks[1] & masks[3], "overlapping light masks"
+    if not has_skylight:
+        assert masks[0] == 0, "unexpected sky light mask when has_skylight is False"
     arrays = []
     for mask in masks[:2]:
         length = reader.varint()
@@ -166,9 +182,53 @@ def decode_chunk_light(body, biome_count):
     return coord, sections, masks, arrays[0], arrays[1]
 
 
-def decode_chunk(body, biome_count):
-    coord, sections, _, _, _ = decode_chunk_light(body, biome_count)
+def decode_chunk(body, biome_count, section_count=DEFAULT_SECTIONS, has_skylight=True):
+    coord, sections, _, _, _ = decode_chunk_light(
+        body, biome_count, section_count=section_count, has_skylight=has_skylight)
     return coord, sections
+
+
+def parse_spawn_info(reader):
+    dimension_type = reader.varint()
+    dimension_name = reader.string()
+    reader.number(">q")  # hashed_seed
+    reader.number("B")   # game_mode
+    reader.number("b")   # previous_game_mode
+    reader.number("B")   # is_debug
+    reader.number("B")   # is_flat
+    if reader.number("B"):  # has_death_location
+        reader.string()     # death_dimension_name
+        reader.take(8)      # death_location
+    reader.varint()         # portal_cooldown
+    return dimension_type, dimension_name
+
+
+def parse_join_game(body):
+    reader = Reader(body)
+    reader.number(">i")  # entity_id
+    reader.number("B")   # is_hardcore
+    dim_count = reader.varint()
+    assert dim_count <= 65536, "dimension list bound"
+    for _ in range(dim_count):
+        reader.string()
+    reader.varint()      # max_players
+    reader.varint()      # view_distance
+    reader.varint()      # simulation_distance
+    reader.number("B")   # reduced_debug_info
+    reader.number("B")   # enable_respawn_screen
+    reader.number("B")   # do_limited_crafting
+    dim_type, dim_name = parse_spawn_info(reader)
+    reader.number("B")   # enforces_secure_chat
+    assert reader.pos == len(body), "unparsed join game packet"
+    return dim_type, dim_name
+
+
+def parse_respawn(body):
+    reader = Reader(body)
+    dim_type, dim_name = parse_spawn_info(reader)
+    reader.number("B")   # data_kept
+    assert reader.pos == len(body), "unparsed respawn packet"
+    return dim_type, dim_name
 
 
 def settings(view):
@@ -240,6 +300,14 @@ def local_server(binary, root=None):
 
 
 class Client:
+    min_y = MIN_Y
+    height = DEFAULT_HEIGHT
+    max_y = MIN_Y + DEFAULT_HEIGHT
+    section_count = DEFAULT_SECTIONS
+    light_section_count = DEFAULT_LIGHT_SECTIONS
+    has_skylight = True
+    dimension_name = "minecraft:overworld"
+
     def __init__(self, game, name="WireTester"):
         self.socket = socket.create_connection(("127.0.0.1", game), timeout=10)
         self.game, self.name = game, name
@@ -252,6 +320,9 @@ class Client:
         self.raw_chunk = {}
         self.pos, self.contract_started = None, False
         self.phase, self.registry_counts = "login", {}
+        self.dimension_types_by_id = {}
+        self.dimension_types_by_name = {}
+        self._set_dimension(MIN_Y, DEFAULT_HEIGHT, True, "minecraft:overworld")
 
     def __enter__(self):
         return self
@@ -261,6 +332,56 @@ class Client:
 
     def send(self, pid, body=b""):
         self.socket.sendall(frame(pid, body))
+
+    def _set_dimension(self, min_y, height, has_skylight, dimension_name, reset_chunks=False):
+        assert height > 0 and height % 16 == 0, f"invalid dimension height {height}"
+        assert min_y % 16 == 0, f"invalid dimension min_y {min_y}"
+        section_count = height // 16
+        light_section_count = section_count + 2
+        old_dim = (self.min_y, self.height, self.has_skylight, self.dimension_name)
+        self.min_y = min_y
+        self.height = height
+        self.max_y = min_y + height
+        self.section_count = section_count
+        self.light_section_count = light_section_count
+        self.has_skylight = bool(has_skylight)
+        self.dimension_name = dimension_name
+        new_dim = (self.min_y, self.height, self.has_skylight, self.dimension_name)
+        if reset_chunks and old_dim != new_dim:
+            for attr in ("chunks", "raw_chunk", "chunk_light"):
+                if hasattr(self, attr):
+                    getattr(self, attr).clear()
+
+    def _register_dimension_type(self, idx, entry_name, entry_nbt):
+        if not hasattr(self, "dimension_types_by_id"):
+            self.dimension_types_by_id = {}
+        if not hasattr(self, "dimension_types_by_name"):
+            self.dimension_types_by_name = {}
+        meta = None
+        if isinstance(entry_nbt, dict) and {"min_y", "height", "has_skylight"} <= entry_nbt.keys():
+            meta = (int(entry_nbt["min_y"]), int(entry_nbt["height"]), bool(entry_nbt["has_skylight"]))
+        elif entry_name in BUILTIN_DIMENSION_TYPES:
+            meta = BUILTIN_DIMENSION_TYPES[entry_name]
+        if meta is not None:
+            min_y, height, _ = meta
+            assert height > 0 and height % 16 == 0, f"invalid dimension_type height {height}"
+            assert min_y % 16 == 0, f"invalid dimension_type min_y {min_y}"
+            self.dimension_types_by_id[idx] = meta
+            self.dimension_types_by_name[entry_name] = meta
+
+    def _apply_spawn_dimension(self, dim_type_id, dim_name, reset_chunks=False):
+        by_id = getattr(self, "dimension_types_by_id", {})
+        by_name = getattr(self, "dimension_types_by_name", {})
+        if by_id:
+            assert dim_type_id in by_id, f"unknown dimension_type id {dim_type_id}"
+            meta = by_id[dim_type_id]
+        elif dim_name in by_name:
+            meta = by_name[dim_name]
+        elif dim_name in BUILTIN_DIMENSION_TYPES:
+            meta = BUILTIN_DIMENSION_TYPES[dim_name]
+        else:
+            meta = (MIN_Y, DEFAULT_HEIGHT, True)
+        self._set_dimension(*meta, dim_name, reset_chunks=reset_chunks)
 
     def read(self, timeout):
         self.socket.settimeout(timeout)
@@ -272,16 +393,33 @@ class Client:
                 reader = Reader(body)
                 name, length = reader.string(), reader.varint()
                 assert length <= 65536, "registry entry bound"
+                if not hasattr(self, "registry_counts"):
+                    self.registry_counts = {}
                 self.registry_counts[name] = length
-                for _ in range(length):
-                    reader.string()
-                    if reader.number("B"):
-                        reader.nbt()
+                if name == "minecraft:dimension_type":
+                    self.dimension_types_by_id = {}
+                    self.dimension_types_by_name = {}
+                for idx in range(length):
+                    entry_name = reader.string()
+                    entry_nbt = reader.nbt() if reader.number("B") else None
+                    if name == "minecraft:dimension_type":
+                        self._register_dimension_type(idx, entry_name, entry_nbt)
                 assert reader.pos == len(body), "unparsed registry data"
             return pid, body
-        if pid == 0x27:
-            coord, sections, masks, sky, block = decode_chunk_light(
-                body, self.registry_counts["minecraft:worldgen/biome"])
+        if pid == 0x2b:
+            dim_type, dim_name = parse_join_game(body)
+            self._apply_spawn_dimension(dim_type, dim_name, reset_chunks=False)
+        elif pid == 0x47:
+            dim_type, dim_name = parse_respawn(body)
+            self._apply_spawn_dimension(dim_type, dim_name, reset_chunks=True)
+        elif pid == 0x27:
+            biome_count = self.registry_counts["minecraft:worldgen/biome"]
+            if self.section_count == DEFAULT_SECTIONS and self.has_skylight:
+                coord, sections, masks, sky, block = decode_chunk_light(body, biome_count)
+            else:
+                coord, sections, masks, sky, block = decode_chunk_light(
+                    body, biome_count, section_count=self.section_count,
+                    has_skylight=self.has_skylight)
             assert coord not in self.chunks, f"duplicate chunk {coord}"
             self.chunks[coord] = sections
             self.raw_chunk[coord] = body
@@ -310,12 +448,20 @@ class Client:
             reader = Reader(body)
             cx = signed(reader.varint(), 32)
             cz = signed(reader.varint(), 32)
+            light_sections = self.light_section_count
+            max_mask_longs = (light_sections + 63) // 64
             masks = []
             for _ in range(4):
                 length = reader.varint()
-                assert length <= 1, "light-update mask outside 26 sections"
-                masks.append(reader.number(">Q") if length else 0)
+                assert length <= max_mask_longs, f"light-update mask outside {light_sections} sections"
+                mask = 0
+                for word_idx in range(length):
+                    mask |= reader.number(">Q") << (64 * word_idx)
+                assert mask < (1 << light_sections), f"light-update mask outside {light_sections} sections"
+                masks.append(mask)
             assert not masks[0] & masks[2] and not masks[1] & masks[3], "overlapping light-update masks"
+            if not self.has_skylight:
+                assert masks[0] == 0, "unexpected sky light update when has_skylight is False"
             for mask in masks[:2]:
                 length = reader.varint()
                 require(length == mask.bit_count(), "light-update-mask-count")
@@ -343,11 +489,11 @@ class Client:
         return pid, body
 
     def _block_update(self, x, y, z, state):
-        assert MIN_Y <= y < 320
+        assert self.min_y <= y < self.max_y
         self.updates.append(((x, y, z), state))
         chunk = self.chunks.get((x // 16, z // 16))
         if chunk is not None:
-            chunk[(y - MIN_Y) // 16][((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] = state
+            chunk[(y - self.min_y) // 16][((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] = state
 
     def until(self, predicate, contract=None):
         # Probes over slower worldgen can raise the bound; tests keep 10s.
@@ -403,7 +549,8 @@ class Client:
         self.send(0x1a, struct.pack(">ddd?", x, y, z, True))
 
     def block(self, x, y, z):
-        return self.chunks[(x // 16, z // 16)][(y - MIN_Y) // 16][((y & 15) << 8) | ((z & 15) << 4) | (x & 15)]
+        assert self.min_y <= y < self.max_y
+        return self.chunks[(x // 16, z // 16)][(y - self.min_y) // 16][((y & 15) << 8) | ((z & 15) << 4) | (x & 15)]
 
     def chat(self, text):
         self.send(6, string(text) + struct.pack(">qq", int(time.time() * 1000), 0) + bytes(5))

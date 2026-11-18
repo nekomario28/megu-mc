@@ -3,16 +3,126 @@
 import socket
 import struct
 import unittest
-from protocol767 import Client, Reader, decode_chunk, frame, palette, position, unpack_position, vint
+from protocol767 import Client, ROOT, Reader, decode_chunk, frame, palette, position, unpack_position, vint
 
 
-def empty_chunk():
+def nbt_compound(entries):
+    out = bytearray([10])
+    for key, (tag, value) in entries.items():
+        name = key.encode("utf-8")
+        out.append(tag)
+        out.extend(struct.pack(">H", len(name)))
+        out.extend(name)
+        if tag == 1:
+            out.extend(struct.pack("b", value))
+        elif tag == 3:
+            out.extend(struct.pack(">i", value))
+        else:
+            raise ValueError(f"unsupported test NBT tag {tag}")
+    out.append(0)
+    return bytes(out)
+
+
+def encode_string(value):
+    raw = value.encode("utf-8")
+    return vint(len(raw)) + raw
+
+
+def dimension_registry_packet(entries):
+    out = bytearray(encode_string("minecraft:dimension_type"))
+    out.extend(vint(len(entries)))
+    for name, min_y, height, has_skylight in entries:
+        out.extend(encode_string(name))
+        out.append(1)
+        out.extend(nbt_compound({
+            "min_y": (3, min_y),
+            "height": (3, height),
+            "has_skylight": (1, 1 if has_skylight else 0),
+        }))
+    return bytes(out)
+
+
+def spawn_info_bytes(dim_type_id, dim_name, death=None):
+    out = bytearray()
+    out.extend(vint(dim_type_id))
+    out.extend(encode_string(dim_name))
+    out.extend(struct.pack(">q", 0))
+    out.extend(bytes([1, 255 & 0xff, 0, 1]))
+    if death is None:
+        out.append(0)
+    else:
+        death_dim, death_pos = death
+        out.append(1)
+        out.extend(encode_string(death_dim))
+        out.extend(position(*death_pos))
+    out.extend(vint(0))
+    return bytes(out)
+
+
+def join_game_packet(dim_type_id, dim_name, dim_names=None):
+    if dim_names is None:
+        dim_names = [dim_name]
+    out = bytearray()
+    out.extend(struct.pack(">i", 1))
+    out.append(0)
+    out.extend(vint(len(dim_names)))
+    for name in dim_names:
+        out.extend(encode_string(name))
+    out.extend(vint(20))
+    out.extend(vint(8))
+    out.extend(vint(8))
+    out.extend(bytes([0, 1, 0]))
+    out.extend(spawn_info_bytes(dim_type_id, dim_name))
+    out.append(0)
+    return bytes(out)
+
+
+def respawn_packet(dim_type_id, dim_name, death=None):
+    return spawn_info_bytes(dim_type_id, dim_name, death=death) + b"\0"
+
+
+def empty_chunk(section_count=24, coord=(-1, 2), has_skylight=True, blocks=None):
     name = b"MOTION_BLOCKING"
     height = b"\x0a\x0c" + struct.pack(">H", len(name)) + name + struct.pack(">i", 37) + bytes(37 * 8) + b"\0"
-    sections = (bytes(2) + bytes([0, 0, 0]) + bytes([0, 0, 0])) * 24
-    masks = (b"\1" + struct.pack(">Q", (1 << 26) - 1)) * 2 + bytes(2)
-    light = vint(26) + (vint(2048) + bytes(2048)) * 26
-    return struct.pack(">ii", -1, 2) + height + vint(len(sections)) + sections + b"\0" + masks + light * 2
+    blocks = blocks or {}
+    sections = bytearray()
+    for sec_idx in range(section_count):
+        sec_blocks = {k: v for k, v in blocks.items() if k[0] == sec_idx}
+        if not sec_blocks:
+            sections.extend(bytes(2) + bytes([0, 0, 0]) + bytes([0, 0, 0]))
+        else:
+            grid = [0] * 4096
+            for (_s, lx, ly, lz), state in sec_blocks.items():
+                grid[(ly << 8) | (lz << 4) | lx] = state
+            non_air = sum(1 for st in grid if st != 0)
+            sections.extend(struct.pack(">h", non_air))
+            palette_vals = sorted(set(grid))
+            bits = max(4, (len(palette_vals) - 1).bit_length())
+            sections.append(bits)
+            sections.extend(vint(len(palette_vals)))
+            for val in palette_vals:
+                sections.extend(vint(val))
+            val_to_idx = {val: idx for idx, val in enumerate(palette_vals)}
+            per_word = 64 // bits
+            word_count = (4096 + per_word - 1) // per_word
+            sections.extend(vint(word_count))
+            for w in range(word_count):
+                word = 0
+                for j in range(per_word):
+                    cell = w * per_word + j
+                    if cell < 4096:
+                        word |= val_to_idx[grid[cell]] << (j * bits)
+                sections.extend(struct.pack(">Q", word))
+            sections.extend(bytes([0, 0, 0]))  # singleton biome 0
+    light_sections = section_count + 2
+    full_mask = (1 << light_sections) - 1
+    sky_mask = (b"\1" + struct.pack(">Q", full_mask)) if has_skylight else b"\0"
+    block_mask = b"\1" + struct.pack(">Q", full_mask)
+    masks = sky_mask + block_mask + b"\0\0"
+    sky_arrays = (vint(light_sections) + (vint(2048) + bytes(2048)) * light_sections) if has_skylight else b"\0"
+    block_arrays = vint(light_sections) + (vint(2048) + bytes(2048)) * light_sections
+    return (struct.pack(">ii", *coord) + height + vint(len(sections)) + bytes(sections) +
+            b"\0" + masks + sky_arrays + block_arrays)
 
 
 class DecoderTests(unittest.TestCase):
@@ -67,6 +177,7 @@ class DecoderTests(unittest.TestCase):
             self.assertEqual(client.read(1)[0], 0x49)
             self.assertEqual(client.updates, [((-19, -14, 55), 123)])
             self.assertEqual(client.block(-19, -14, 55), 123)
+
     def test_light_update_known_answer_and_bad_mask_count(self):
         a, b = socket.socketpair()
         with a, b:
@@ -86,6 +197,154 @@ class DecoderTests(unittest.TestCase):
             b.sendall(frame(0x2a, bad))
             with self.assertRaises(AssertionError):
                 client.read(1)
+
+    def _make_client(self, sock):
+        client = Client.__new__(Client)
+        client.socket = sock
+        client.phase = "configuration"
+        client.chunks = {}
+        client.raw_chunk = {}
+        client.chunk_light = {}
+        client.updates = []
+        client.light_updates = []
+        client.registry_counts = {"minecraft:worldgen/biome": 1}
+        client.dimension_types_by_id = {}
+        client.dimension_types_by_name = {}
+        return client
+
+    def _feed_dimension_session(self, target_id, target_name, coord, blocks):
+        entries = [
+            ("minecraft:overworld", -64, 384, True),
+            ("minecraft:overworld_caves", -64, 384, True),
+            ("minecraft:the_end", 0, 256, False),
+            ("minecraft:the_nether", 0, 256, False),
+        ]
+        a, b = socket.socketpair()
+        with a, b:
+            client = self._make_client(a)
+            b.sendall(frame(7, dimension_registry_packet(entries)))
+            self.assertEqual(client.read(1)[0], 7)
+            client.phase = "play"
+            b.sendall(frame(0x2b, join_game_packet(
+                target_id, target_name, [e[0] for e in entries])))
+            self.assertEqual(client.read(1)[0], 0x2b)
+            self.assertEqual(client.min_y, 0)
+            self.assertEqual(client.height, 256)
+            self.assertEqual(client.max_y, 256)
+            self.assertEqual(client.section_count, 16)
+            self.assertEqual(client.light_section_count, 18)
+            self.assertIs(client.has_skylight, False)
+
+            chunk_pkt = empty_chunk(section_count=16, coord=coord, has_skylight=False, blocks=blocks)
+            b.sendall(frame(0x27, chunk_pkt))
+            self.assertEqual(client.read(1)[0], 0x27)
+            self.assertEqual(len(client.chunks[coord]), 16)
+
+            mask18 = b"\1" + struct.pack(">Q", (1 << 18) - 1)
+            light18 = vint(18) + (vint(2048) + bytes(2048)) * 18
+            b.sendall(frame(0x2a, vint(coord[0] & 0xffffffff) + vint(coord[1] & 0xffffffff) + b"\0" + mask18 + b"\0\0\0" + light18))
+            self.assertEqual(client.read(1)[0], 0x2a)
+            self.assertEqual(client.light_updates, [coord])
+            return client
+
+    def test_nether_dimension_wire_decoding_and_bounds(self):
+        client = self._feed_dimension_session(
+            3, "minecraft:the_nether", (2, -3),
+            {(0, 4, 0, 5): 79, (15, 7, 15, 9): 123},
+        )
+        self.assertEqual(client.block(2 * 16 + 4, 0, -3 * 16 + 5), 79)
+        self.assertEqual(client.block(2 * 16 + 7, 255, -3 * 16 + 9), 123)
+        self.assertEqual(client.block(2 * 16, 128, -3 * 16), 0)
+        for bad_y in (-1, -64, 256, 319):
+            with self.assertRaises(AssertionError):
+                client.block(2 * 16 + 4, bad_y, -3 * 16 + 5)
+            with self.assertRaises(AssertionError):
+                client._block_update(2 * 16 + 4, bad_y, -3 * 16 + 5, 1)
+
+        # Reject 26-section or sky-lit light updates in a 16-section non-skylight dimension.
+        a, b = socket.socketpair()
+        with a, b:
+            client.socket = a
+            mask26 = b"\1" + struct.pack(">Q", (1 << 26) - 1)
+            light26 = vint(26) + (vint(2048) + bytes(2048)) * 26
+            b.sendall(frame(0x2a, vint(0) + vint(0) + b"\0" + mask26 + b"\0\0\0" + light26))
+            with self.assertRaises(AssertionError):
+                client.read(1)
+
+            mask1 = b"\1" + struct.pack(">Q", 1)
+            light1 = vint(1) + vint(2048) + bytes(2048)
+            b.sendall(frame(0x2a, vint(0) + vint(0) + mask1 + b"\0\0\0" + light1 + b"\0"))
+            with self.assertRaises(AssertionError):
+                client.read(1)
+
+            # Reject a 24-section Overworld chunk or a sky-lit 16-section chunk in Nether.
+            b.sendall(frame(0x27, empty_chunk(section_count=24, coord=(5, 5), has_skylight=False)))
+            with self.assertRaises(AssertionError):
+                client.read(1)
+
+            b.sendall(frame(0x27, empty_chunk(section_count=16, coord=(6, 6), has_skylight=True)))
+            with self.assertRaises(AssertionError):
+                client.read(1)
+
+    def test_end_dimension_wire_decoding(self):
+        client = self._feed_dimension_session(
+            2, "minecraft:the_end", (-1, 1),
+            {(0, 1, 0, 2): 500, (15, 2, 15, 3): 501},
+        )
+        self.assertEqual(client.block(-16 + 1, 0, 16 + 2), 500)
+        self.assertEqual(client.block(-16 + 2, 255, 16 + 3), 501)
+
+    def test_respawn_switches_dimension_and_clears_old_chunks(self):
+        entries = [
+            ("minecraft:overworld", -64, 384, True),
+            ("minecraft:the_nether", 0, 256, False),
+        ]
+        a, b = socket.socketpair()
+        with a, b:
+            client = self._make_client(a)
+            b.sendall(frame(7, dimension_registry_packet(entries)))
+            self.assertEqual(client.read(1)[0], 7)
+            client.phase = "play"
+            b.sendall(frame(0x2b, join_game_packet(0, "minecraft:overworld")))
+            self.assertEqual(client.read(1)[0], 0x2b)
+            self.assertEqual((client.min_y, client.height, client.has_skylight), (-64, 384, True))
+
+            b.sendall(frame(0x27, empty_chunk(section_count=24, coord=(0, 0), has_skylight=True)))
+            self.assertEqual(client.read(1)[0], 0x27)
+            self.assertEqual(len(client.chunks[(0, 0)]), 24)
+            self.assertEqual(client.block(0, -64, 0), 0)
+
+            b.sendall(frame(0x47, respawn_packet(
+                1, "minecraft:the_nether", death=("minecraft:overworld", (1, 64, -2)))))
+            self.assertEqual(client.read(1)[0], 0x47)
+            self.assertEqual((client.min_y, client.height, client.has_skylight), (0, 256, False))
+            self.assertEqual(client.chunks, {})
+
+            b.sendall(frame(0x27, empty_chunk(
+                section_count=16, coord=(0, 0), has_skylight=False, blocks={(10, 3, 2, 4): 88})))
+            self.assertEqual(client.read(1)[0], 0x27)
+            self.assertEqual(len(client.chunks[(0, 0)]), 16)
+            self.assertEqual(client.block(3, 10 * 16 + 2, 4), 88)
+
+    def test_config_packets_bin_dimension_registry(self):
+        blob = (ROOT / "config_packets.bin").read_bytes()
+        reader = Reader(blob)
+        packets = []
+        while reader.pos < len(blob):
+            packets.append(reader.take(reader.varint()))
+        a, b = socket.socketpair()
+        with a, b:
+            client = self._make_client(a)
+            for raw_pkt in packets:
+                b.sendall(vint(len(raw_pkt)) + raw_pkt)
+                client.read(1)
+        self.assertEqual(client.dimension_types_by_name["minecraft:overworld"], (-64, 384, True))
+        self.assertEqual(client.dimension_types_by_name["minecraft:overworld_caves"], (-64, 384, True))
+        self.assertEqual(client.dimension_types_by_name["minecraft:the_end"], (0, 256, False))
+        self.assertEqual(client.dimension_types_by_name["minecraft:the_nether"], (0, 256, False))
+        self.assertEqual(client.dimension_types_by_id[0], (-64, 384, True))
+        self.assertEqual(client.dimension_types_by_id[2], (0, 256, False))
+        self.assertEqual(client.dimension_types_by_id[3], (0, 256, False))
 
 
 if __name__ == "__main__":
