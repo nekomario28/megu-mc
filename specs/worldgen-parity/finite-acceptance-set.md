@@ -124,6 +124,59 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
   なお matrix-v1 stronghold capture は `runtime_writes 10` を記録しており、fixture_suite 行に
   する場合は同じ宣言が必要(本レーンでは行を宣言していない)。
 
+**2026-11-18 P2-1受入lane(blueprint `p2-1-p2-3-blueprint-20261118T050548Z` の S01–S03、three-slice bound)**
+
+source `798f645f4305421615389a11ad3398f152f0be47`(brief記載の40桁SHA `798f6459e2f5…` は本リポジトリに
+存在しない — `798f645` に一致するobjectは1つだけで、それがこのcommit。`perf/worldgen-parallel` tip)。
+binary sha256 `486435229adfb20525e5c7cbe8c8fefd84074ed52170133742990419d5cde23d`。
+これは**新しいnative captureを作らない**受入: 既存captureを現HEADのbinaryで再生成して比較した。
+
+- **S01 mineshaft — Overworld (3,−2) seed 4242(Revision 1の「順序を入力とする比較」)— 0/98,304 両方向**。
+  native A `captures/native/mc-native-ow-seed4242-20261111/world` に対し `order-A.txt`
+  (`scratch/current/snowy-4242-20261113/`)= **0 / 98,304**(port dump `d789a04aad7e04d4…`)、
+  native B `…-seed4242b-20261111/world` に対し `order-B.txt` = **0 / 98,304**
+  (port dump `48db2c95d6f5dcb5…`)。両側 non_air 32,281・cave_air 51 が一致、window内の
+  mineshaft start (4,3) の3 BB(mscorridor#85/#185, msstairs#86)が全部比較対象に入っている。
+  **対照(計測器が差を見えることの証明)**: 同じwindowを既定順序で比較すると **30 / 98,304**
+  (`30 diorite -> granite`, y=19..22, `outside_structures | underground`)で、既存記録の30と一致。
+  つまり0は順序入力が効いている結果であり、比較の空回りではない。
+  ただし `order-A/B` は **構成したwitness**(観測されたscheduleではない、
+  `audit/population-order-20261118-015835/notes/order-artifact-provenance.md` §B)であり、
+  Revision 1が要求する「順序を入力として指定した比較」の入力ではあるが、順序自体のgateではない。
+  この行はfixture_suite manifest行に**しない**(native captureに`boundary.json`がなく、pop-order入力も
+  manifest schemaに無い)。
+- **S02 jungle_pyramid — (74,−41) seed 4242 — 0/98,304(MATCH)**。
+  port dump sha256 `77964c224c9eeddff4bd0cea6ccbfc559647f44003ee001cccd6f36b33a715bf` =
+  §6既存記録の`77964c22…a715bf`と**byte一致**、両側 non_air 34,353。
+  OCEAN_FLOOR heightmap の port対照 **0列差**(§4-4の一部をこの行で充足)。
+  **suites v1の行に昇格**: `matrix-v2/manifest-promotable.json` に
+  `ow-4242-structures-74--41--64-384` を追加(level.dat / `world/region/r.2.-2.mca` / dump.bin を
+  sha256束縛、stage structures、runtime_writes 0)。suiteは **9 MATCH / 0 DIFF / 0 INVALID、exit 0**。
+  **対照**: 同じwindowを seed 4243 で比較すると 16,502 / 98,304 — 比較は全セルを見ている。
+- **S03 fortress — Nether (−25,6) seed 4242 — 0/128 と 0/256 の両行とも0**。
+  0/128 (matrix-v1, `--height-window noise`) = **0 / 32,768**、dump `265d490f19a86f64…`;
+  0/256 (matrix-v2, `--height-window dimension`) = **0 / 65,536**、dump `4df69f134515e18f…`。
+  どちらのdumpもmanifestが束縛している既存artifactと**sha256完全一致** — つまり宣言済み
+  `expected_runtime_writes`(16 cells, `nether_brick_fence[east=true,north=true,south=true,
+  waterlogged=false,west=true]`, `writes_sha256 81cdbd85…`)を現HEADが再現している。
+  **対照**: stageを`--mode terrain`に落とす(構造物を書かない)と **2,124 / 65,536** で、
+  うち nether_bricks 979セル(→netherrack 508 / →air 471)が消える — fortress writerのセルが
+  比較集合に入っていることの証明。
+- **lane gates**: fixture_suite `manifest-promotable.json` **8 → 9 MATCH、exit 0**。
+  seed-0 の64chunk identity dump(`MC_SPINE_WG_DUMP_N=8`, 25,165,824 B)=
+  `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def` **bit-identical**。
+  serial suite **694 passed / 0 failed / 1 ignored**、`--test-threads=8` も
+  **694 passed / 0 failed / 1 ignored、exit 0**(3回)。
+  注: threads8のlog中に `test result: FAILED. … 694 filtered out` が1行あるが、これは
+  `registry_tests::a_panicking_scene_fixture_leaves_nothing_to_restore` の**isolated child**が
+  意図的にpanicした出力(`694 filtered out`がchild実行の証拠)で、親suiteの結果行ではない。
+- **本laneで触っていない/残り**: S04–S07(stronghold / end_city / nether_fossil / ruined_portal)は
+  three-slice boundのため**未実行**。village-taiga は `bbf51d1` 以降 **3 / 884,736** のままで
+  受入行にしない(§3)。`ruined_portal` の§4-5(2つ目の独立native run)は依然**満たせない**。
+  T0(`StructurePiece.placeBlock`のmark)は未landingのまま — `bbf51d1` が
+  「22 SHAPE_CHECK_BLOCKSセルはいずれもreference mark setに無い」と実測して不landingを選んでおり、
+  本laneのS01–S03の0はその状態で成立している。
+
 ## 改定規則
 
 - 行の追加/除外/変更は、結果を見てからでなく**理由を先に**書いたrevisionとしてのみ。
