@@ -580,7 +580,7 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
     crate::world()
         .lock()
         .unwrap()
-        .entry((0, 0))
+        .entry((crate::worldgen::DimId::Overworld, 0, 0))
         .or_default()
         .insert(crate::local_idx(p.0, p.1, p.2), 0);
     crate::materialize_generation_payloads(vec![(

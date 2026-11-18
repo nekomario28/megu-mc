@@ -31,7 +31,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
     world()
         .lock()
         .unwrap()
-        .entry((0, 0))
+        .entry((DimId::Overworld, 0, 0))
         .or_default()
         .insert(0x0000_0004, 4);
     drops().lock().unwrap().push(Drop {
@@ -522,7 +522,7 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
         world()
             .lock()
             .unwrap()
-            .get(&(0, 0))
+            .get(&(DimId::Overworld, 0, 0))
             .and_then(|c| c.get(&local_idx(1, 100, 2)))
             .copied(),
         Some(0),
@@ -765,3 +765,289 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
     assert!(corrupt_err, "corrupt DRO1 footer must return Err");
 }
 
+// ---------- P2-3-S2a: the overlay key carries a dimension ----------
+//
+// `WORLD` is keyed by `(DimId, cx, cz)`. These fixtures install all three generators, so "the
+// Nether's own answer" is a real one and not an uninitialised `None` standing in for it.
+
+/// The three states one cell is given, one per dimension.
+///
+/// Each dimension gets a state its *own* generator does not answer at the probe cell — the
+/// Overworld and the End are air there, the Nether is netherrack — and no two dimensions get the
+/// same one. An edit that lands in the wrong dimension therefore reads as a wrong state, instead
+/// of as the terrain that cell already had (a write equal to the generated state removes the
+/// overlay entry rather than shadowing it).
+fn p2_3_s2a_states() -> [(DimId, u32); 3] {
+    [
+        (DimId::Overworld, name_to_state("stone").expect("stone")),
+        (
+            DimId::Nether,
+            name_to_state("end_stone").expect("end_stone"),
+        ),
+        (
+            DimId::End,
+            name_to_state("netherrack").expect("netherrack"),
+        ),
+    ]
+}
+
+/// Install the three generators this fixture reads, or fail loudly.
+fn p2_3_s2a_init_generators() {
+    assert!(worldgen::init(0, name_to_state), "the Overworld generator");
+    for dim in [DimId::Nether, DimId::End] {
+        assert!(
+            worldgen::init_dim(dim, 0, name_to_state),
+            "{} generator",
+            dim.dimension_id()
+        );
+    }
+}
+
+/// P2-3-S2a: one cell, three dimensions, three independent edits.
+///
+/// With the overlay keyed by `(cx, cz)` alone, the three writes below are one entry: whichever
+/// dimension wrote last owns that coordinate, and a read in either of the other two answers with
+/// it.
+#[test]
+fn p2_3_s2a_one_cell_in_three_dimensions_stays_independent() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    p2_3_s2a_init_generators();
+    let old_world = std::mem::take(&mut *world().lock().unwrap());
+
+    let cell = (5, 100, 7);
+    let states = p2_3_s2a_states();
+    for (dim, st) in states {
+        set_block_dim(dim, cell.0, cell.1, cell.2, st);
+    }
+    for (dim, st) in states {
+        assert_eq!(
+            overlay_block_dim(dim, cell.0, cell.1, cell.2),
+            Some(st),
+            "{dim:?}: the overlay entry at one coordinate is this dimension's edit"
+        );
+        assert_eq!(
+            block_at_dim(dim, cell.0, cell.1, cell.2),
+            st,
+            "{dim:?}: a read in one dimension must not answer with another's edit"
+        );
+    }
+    // The dim-less accessors mean the Overworld, which is every caller's dimension today.
+    assert_eq!(block_at(cell.0, cell.1, cell.2), states[0].1);
+    assert_eq!(overlay_block(cell.0, cell.1, cell.2), Some(states[0].1));
+
+    // Where no dimension has an edit, each answers from its own generator. y = -30 is inside the
+    // Overworld's -64/384 window and below the Nether's and the End's 0/256 ones, so the right
+    // answer is "Overworld terrain, air, air". A fallback to `base_state` — the Overworld's noise
+    // settings, resolved through the *active* generator — answers Overworld terrain in all three
+    // and reads exactly like a working per-dimension overlay until someone loads a Nether chunk.
+    let below = (0, -30, 0);
+    assert_ne!(
+        block_at_dim(DimId::Overworld, below.0, below.1, below.2),
+        0,
+        "the Overworld generator fills y = -30"
+    );
+    for dim in [DimId::Nether, DimId::End] {
+        assert_eq!(
+            block_at_dim(dim, below.0, below.1, below.2),
+            0,
+            "{dim:?}: below its own world window is air, not the Overworld's deepslate"
+        );
+        assert_eq!(
+            overlay_block_dim(dim, below.0, below.1, below.2),
+            None,
+            "{dim:?}: nothing was written there"
+        );
+    }
+
+    *world().lock().unwrap() = old_world;
+    assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
+}
+
+/// P2-3-S2a: `world_overlay.bin` stays the Overworld's file, byte for byte.
+///
+/// A legacy `(cx, cz)` chunk loads as `(DimId::Overworld, cx, cz)`, and another dimension's edits
+/// change none of its bytes: the format, the header count and the keys are what they were before
+/// the key carried a dimension, which is what lets an older build read this file.
+#[test]
+fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    p2_3_s2a_init_generators();
+    let old_world = std::mem::take(&mut *world().lock().unwrap());
+
+    let cell = (5, 100, 7);
+    let states = p2_3_s2a_states();
+    for (dim, st) in states {
+        set_block_dim(dim, cell.0, cell.1, cell.2, st);
+    }
+
+    // The payload the legacy file carries, with all three dimensions edited.
+    //
+    // One throwaway save runs first: `save_world_into` materialises the payloads the generator has
+    // staged, so the first save of a session writes state the second one already finds written.
+    // Both sides of the comparison below are second saves, which leaves the removed dimensions as
+    // the only difference between them.
+    let mut warmup = Vec::new();
+    save_world_into(&mut warmup);
+    let mut with_dims = Vec::new();
+    save_world_into(&mut with_dims);
+    // The same save with the other two dimensions' edits removed. Byte equality is the claim:
+    // a companion dimension must not reach the legacy file at all.
+    world()
+        .lock()
+        .unwrap()
+        .retain(|key, _| key.0 == DimId::Overworld);
+    let mut without_dims = Vec::new();
+    save_world_into(&mut without_dims);
+    assert_eq!(
+        with_dims, without_dims,
+        "another dimension's edits must not change one byte of the Overworld's save"
+    );
+
+    // It loads as the Overworld's chunks and nothing else.
+    world().lock().unwrap().clear();
+    load_world_from(&with_dims).unwrap();
+    assert_eq!(
+        overlay_block_dim(DimId::Overworld, cell.0, cell.1, cell.2),
+        Some(states[0].1),
+        "a legacy (cx, cz) chunk loads into the Overworld"
+    );
+    {
+        let w = world().lock().unwrap();
+        assert!(
+            w.keys().all(|key| key.0 == DimId::Overworld),
+            "the legacy file carries no other dimension: {:?}",
+            w.keys().collect::<Vec<_>>()
+        );
+    }
+    for (dim, _) in &states[1..] {
+        assert_eq!(
+            overlay_block_dim(*dim, cell.0, cell.1, cell.2),
+            None,
+            "{dim:?}: a companion table is not in the legacy file"
+        );
+    }
+
+    // A companion table round-trips on its own, and puts its chunks in its own dimension. The
+    // Overworld's edit is still there — the byte comparison above compared against a save without
+    // the other two, it did not empty the overlay — so it is what shows the load landing in the
+    // dimension it was asked for.
+    for (dim, st) in &states[1..] {
+        set_block_dim(*dim, cell.0, cell.1, cell.2, *st);
+        let mut table = Vec::new();
+        assert_eq!(
+            save_dim_overlay_into(*dim, &mut table),
+            1,
+            "{dim:?}: one edited chunk"
+        );
+        world()
+            .lock()
+            .unwrap()
+            .remove(&(*dim, cell.0 >> 4, cell.2 >> 4));
+        assert_eq!(
+            overlay_block_dim(*dim, cell.0, cell.1, cell.2),
+            None,
+            "{dim:?}: the edit was removed before the reload"
+        );
+        load_dim_overlay_from(*dim, &table).unwrap();
+        assert_eq!(
+            overlay_block_dim(*dim, cell.0, cell.1, cell.2),
+            Some(*st),
+            "{dim:?}: its own table restores its own edit"
+        );
+        assert_eq!(
+            overlay_block_dim(DimId::Overworld, cell.0, cell.1, cell.2),
+            Some(states[0].1),
+            "{dim:?}: a companion load stays out of the Overworld"
+        );
+    }
+
+    // A dimension with no edits writes no chunks, which is what makes its file removable.
+    world().lock().unwrap().clear();
+    let mut empty = Vec::new();
+    assert_eq!(save_dim_overlay_into(DimId::Nether, &mut empty), 0);
+    assert_eq!(empty, vec![0], "an empty table is a zero count and nothing else");
+
+    *world().lock().unwrap() = old_world;
+    assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
+}
+
+/// P2-3-S2a: the companion files follow the legacy one onto disk, and disappear when their
+/// dimension has no edits left.
+///
+/// The save path is the one the server runs, pointed at a scratch directory so the fixture does not
+/// write into the checkout's working directory.
+#[test]
+fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    test_support::require_vanilla_data();
+    let _world_guard = world_guard();
+    p2_3_s2a_init_generators();
+    let old_world = std::mem::take(&mut *world().lock().unwrap());
+    let dir = std::env::temp_dir().join(format!("mc-spine-p2_3_s2a-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch save directory");
+    let file = |dim: DimId| dim_overlay_path(&dir, dim);
+
+    let cell = (5, 100, 7);
+    let states = p2_3_s2a_states();
+    for (dim, st) in states {
+        set_block_dim(dim, cell.0, cell.1, cell.2, st);
+    }
+    save_world_guarded_in(&dir);
+    for (dim, _) in states {
+        assert!(
+            file(dim).is_file(),
+            "{dim:?}: {} was not written",
+            file(dim).display()
+        );
+    }
+
+    // Every dimension comes back from disk, into its own dimension.
+    world().lock().unwrap().clear();
+    load_world_in(&dir).expect("load the scratch save");
+    for (dim, st) in states {
+        assert_eq!(
+            overlay_block_dim(dim, cell.0, cell.1, cell.2),
+            Some(st),
+            "{dim:?}: its edit must come back from its own file"
+        );
+        assert_eq!(block_at_dim(dim, cell.0, cell.1, cell.2), st);
+    }
+
+    // A dimension whose last edit is undone loses its file: an Overworld-only server must not
+    // accumulate companions, and a stale companion would resurrect the edit on the next load.
+    world()
+        .lock()
+        .unwrap()
+        .retain(|key, _| key.0 == DimId::Overworld);
+    save_world_guarded_in(&dir);
+    for dim in [DimId::Nether, DimId::End] {
+        assert!(
+            !file(dim).exists(),
+            "{dim:?}: {} outlived its last edit",
+            file(dim).display()
+        );
+    }
+    assert!(file(DimId::Overworld).is_file(), "the legacy file stays");
+
+    // And the reload no longer invents them.
+    world().lock().unwrap().clear();
+    load_world_in(&dir).expect("reload the scratch save");
+    for dim in [DimId::Nether, DimId::End] {
+        assert_eq!(overlay_block_dim(dim, cell.0, cell.1, cell.2), None);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    *world().lock().unwrap() = old_world;
+    assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
+}

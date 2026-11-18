@@ -874,7 +874,7 @@ mod entity_fluid_tests {
     use super::*;
 
     struct FluidTestWorldSnapshot {
-        world: HashMap<(i32, i32), HashMap<u32, u32>>,
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
         mobs: Vec<Arc<Mob>>,
         region: Region,
     }

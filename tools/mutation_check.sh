@@ -3679,6 +3679,39 @@ check "travel_contract_4d_mob_snap_y_defers_lava_to_travel" \
         || (false && mob_in_lava(m.etype, mp.0, mp.1, mp.2))' \
   tick_tests::travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage
 
+# P2-3-S2a: the block overlay's key carries a dimension. With the key cut back to the chunk, one
+# `(cx, cz)` is one entry for all three dimensions, so a Nether edit and an Overworld edit at the
+# same coordinate are the same cell: the last write wins and both reads answer with it.
+check "p2_3_s2a_block_at_dim_reads_the_dimension_it_names" \
+  src/main.rs '    let hit = w
+        .get(&(dim, x >> 4, z >> 4))' \
+  '    let hit = w
+        .get(&(DimId::Overworld, x >> 4, z >> 4))' \
+  persistence_tests::p2_3_s2a_one_cell_in_three_dimensions_stays_independent
+
+# ...and a write in one dimension must land in that dimension. Storing it under the Overworld's key
+# overwrites the Overworld's edit at the same chunk and leaves the dimension that was written empty.
+check "p2_3_s2a_set_block_dim_stores_the_dimension_it_names" \
+  src/main.rs '    let key: DimChunkKey = (dim, x >> 4, z >> 4);' \
+  '    let key: DimChunkKey = (DimId::Overworld, x >> 4, z >> 4);' \
+  persistence_tests::p2_3_s2a_one_cell_in_three_dimensions_stays_independent
+
+# A read that misses the overlay asks the generator of the dimension it was asked about. The
+# Overworld's `base_state` resolves its own noise settings and its -64/384 window, so a Nether cell
+# below y=0 comes back as Overworld deepslate instead of the air the Nether's window defines — the
+# substitution that looks like a working overlay until a Nether chunk is served.
+check "p2_3_s2a_a_miss_reads_the_dimensions_own_generator" \
+  src/main.rs '    worldgen::with_gen_dim(dim, |g| g.block_state_at(x, y, z, crate::feature::populate))' \
+  '    worldgen::with_gen_dim(DimId::Overworld, |g| g.block_state_at(x, y, z, crate::feature::populate))' \
+  persistence_tests::p2_3_s2a_one_cell_in_three_dimensions_stays_independent
+
+# A companion file's table must load into its own dimension. Read into the Overworld's key, a Nether
+# save restores nothing in the Nether and overwrites the Overworld chunk of the same coordinate.
+check "p2_3_s2a_a_companion_table_loads_into_its_own_dimension" \
+  src/main.rs '        let c = w.entry((dim, cx, cz)).or_default();' \
+  '        let c = w.entry((DimId::Overworld, cx, cz)).or_default();' \
+  persistence_tests::p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

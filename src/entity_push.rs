@@ -365,7 +365,7 @@ mod entity_push_tests {
     use super::*;
 
     struct PushTestWorldSnapshot {
-        world: HashMap<(i32, i32), HashMap<u32, u32>>,
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
         mobs: Vec<Arc<Mob>>,
         drops: Vec<Drop>,
         region: Region,

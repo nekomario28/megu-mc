@@ -239,7 +239,7 @@ fn a_removed_generated_emitter_stops_lighting() {
     world()
         .lock()
         .unwrap()
-        .entry((0, 0))
+        .entry((DimId::Overworld, 0, 0))
         .or_default()
         .insert(local_idx(5, 70, 7), 0);
     let dark = block_light_sections(0, 0, &gen);
@@ -252,7 +252,7 @@ fn a_removed_generated_emitter_stops_lighting() {
     world()
         .lock()
         .unwrap()
-        .entry((0, 0))
+        .entry((DimId::Overworld, 0, 0))
         .or_default()
         .remove(&local_idx(5, 70, 7));
     let back = block_light_sections(0, 0, &gen);

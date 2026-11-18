@@ -305,7 +305,7 @@ fn adv_event_returns_with_a_loaded_advancement_set() {
 /// deterministic for one test, but a panic on the straight-line restore left it polluted for the
 /// next one. Dropping this guard runs the restore on every unwind path.
 struct WorldSnapshot {
-    world: HashMap<(i32, i32), HashMap<u32, u32>>,
+    world: HashMap<DimChunkKey, HashMap<u32, u32>>,
     falling: Vec<Fall>,
     drops: Vec<Drop>,
     clients: Vec<Arc<Client>>,
@@ -529,7 +529,7 @@ fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
         // Explicit closed chamber, so FluidReader never silently consults
         // unspecified generated terrain as a fixture input.
         let mut world = world().lock().unwrap();
-        let chunk = world.entry((0, 0)).or_default();
+        let chunk = world.entry((DimId::Overworld, 0, 0)).or_default();
         for y in 210..=212 {
             for z in 2..=10 {
                 for x in 2..=10 {
@@ -2415,7 +2415,7 @@ fn water_spread_trace_is_stable_across_the_scheduler_migration() {
         let mut cells: Vec<(i32, i32, i32, u32)> = {
             let w = world().lock().unwrap();
             let mut v = Vec::new();
-            for (&(cx, cz), c) in w.iter() {
+            for (&(_dim, cx, cz), c) in w.iter() {
                 for (idx, st) in c.iter() {
                     let (wx, wy, wz) = (
                         cx * 16 + (*idx & 15) as i32,
@@ -5407,7 +5407,7 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
             .lock()
             .unwrap()
             .iter()
-            .flat_map(|(&(cx, cz), cells)| {
+            .flat_map(|(&(_dim, cx, cz), cells)| {
                 cells.iter().map(move |(&idx, &st)| {
                     // local_idx: (y - MIN_Y) << 8 | (z & 15) << 4 | (x & 15)
                     let lx = (idx & 15) as i32;
@@ -7022,7 +7022,7 @@ fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_
     // Build an enclosed chamber inside chunk (6, 3) around (100, 170, 56).
     {
         let mut w = world().lock().unwrap();
-        let chunk = w.entry((6, 3)).or_default();
+        let chunk = w.entry((DimId::Overworld, 6, 3)).or_default();
         for y in 169..=171 {
             for z in 54..=59 {
                 for x in 98..=104 {
@@ -7262,7 +7262,7 @@ fn travel_4d_step(
 /// Restores every shared store a `mob_tick` fixture writes to, so a failing assertion cannot
 /// leave mobs or blocks behind for the next test.
 struct Travel4dWorld {
-    world: HashMap<(i32, i32), HashMap<u32, u32>>,
+    world: HashMap<DimChunkKey, HashMap<u32, u32>>,
     mobs: Vec<Arc<Mob>>,
     region: Region,
     clients: Vec<Arc<Client>>,

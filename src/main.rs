@@ -260,6 +260,13 @@ pub(crate) enum ContainerKey {
 }
 /// A chunk column, for the maps keyed by chunk rather than by block.
 type ChunkKey = (i32, i32);
+/// A chunk column *in a named dimension*: the key of the `WORLD` block overlay.
+///
+/// An overlay entry is an edit that replaced terrain, so it belongs to the dimension whose
+/// generator that cell would otherwise have come from. Keyed by chunk alone, a Nether edit and
+/// an Overworld edit of the same `(cx, cz)` are one entry, and whichever was written last answers
+/// for both — the Nether's netherrack appears in the Overworld, or the edit is simply lost.
+type DimChunkKey = (DimId, i32, i32);
 /// The shape every world registry in this file has: one map behind one mutex,
 /// built the first time something asks for it.
 type Registry<K, V> = OnceLock<Mutex<HashMap<K, V>>>;
@@ -5879,8 +5886,8 @@ fn mob_tick() {
 }
 
 // ---------- world ----------
-// overlay edits: (cx,cz) -> { packed_local_idx -> blockstate }
-static WORLD: Registry<ChunkKey, HashMap<u32, u32>> = OnceLock::new();
+// overlay edits: (dim,cx,cz) -> { packed_local_idx -> blockstate }
+static WORLD: Registry<DimChunkKey, HashMap<u32, u32>> = OnceLock::new();
 /// Wait/hold split for the two locks the tick thread and the connection thread share.
 ///
 /// The tick profile put 10.8 ms of an 11.4 ms tick body in `environment`, a step that
@@ -5950,7 +5957,7 @@ impl<T: 'static> std::ops::DerefMut for TimedGuard<T> {
     }
 }
 
-fn timed_world() -> TimedGuard<HashMap<ChunkKey, HashMap<u32, u32>>> {
+fn timed_world() -> TimedGuard<HashMap<DimChunkKey, HashMap<u32, u32>>> {
     let prof = lockprof::enabled();
     let t = prof.then(std::time::Instant::now);
     let guard = world().lock().unwrap();
@@ -5974,8 +5981,22 @@ fn timed_region() -> TimedGuard<Region> {
     }
 }
 
-fn world() -> &'static LockedMap<ChunkKey, HashMap<u32, u32>> {
+fn world() -> &'static LockedMap<DimChunkKey, HashMap<u32, u32>> {
     WORLD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The Overworld's edits for one chunk, from a held `WORLD` guard.
+///
+/// Several derived caches are still keyed by chunk alone — the state band, the section store, the
+/// light pass, the indexes `rebuild_derived_indexes` restores — and every one of them describes
+/// the Overworld. They ask through this name, so "which dimension does this cache belong to" has
+/// one place to answer in S3 instead of one `(DimId::Overworld, ..)` per reader.
+fn overworld_edits<'a>(
+    w: &'a HashMap<DimChunkKey, HashMap<u32, u32>>,
+    cx: i32,
+    cz: i32,
+) -> Option<&'a HashMap<u32, u32>> {
+    w.get(&(DimId::Overworld, cx, cz))
 }
 struct Furnace {
     input: Stack,
@@ -6434,7 +6455,7 @@ fn materialize_generation_payloads_inner(
                 let actual = *world()
                     .lock()
                     .unwrap()
-                    .entry((pos.0 >> 4, pos.2 >> 4))
+                    .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
                     .or_default()
                     .entry(local_idx(pos.0, pos.1, pos.2))
                     .or_insert(state);
@@ -6452,7 +6473,7 @@ fn materialize_generation_payloads_inner(
                 let actual = *world()
                     .lock()
                     .unwrap()
-                    .entry((pos.0 >> 4, pos.2 >> 4))
+                    .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
                     .or_default()
                     .entry(local_idx(pos.0, pos.1, pos.2))
                     .or_insert(state);
@@ -8619,7 +8640,7 @@ fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
         for &(x, _, z) in positions {
             let key = (x >> 4, z >> 4);
             if let std::collections::hash_map::Entry::Vacant(e) = overlays.entry(key) {
-                if let Some(col) = w.get(&key) {
+                if let Some(col) = overworld_edits(&w, key.0, key.1) {
                     e.insert(col.clone());
                 }
             }
@@ -9251,7 +9272,7 @@ fn ticked_chunks() -> Vec<(i32, i32)> {
 /// band around its surface, which is where placed blocks sit.
 fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::new();
-    if let Some(c) = world().lock().unwrap().get(&(cx, cz)) {
+    if let Some(c) = world().lock().unwrap().get(&(DimId::Overworld, cx, cz)) {
         for idx in c.keys() {
             out.push(((*idx >> 8) as i32 + MIN_Y) >> 4);
         }
@@ -9642,24 +9663,43 @@ fn apply_queued_block_updates() {
 fn local_idx(x: i32, y: i32, z: i32) -> u32 {
     (((y - MIN_Y) as u32) << 8) | (((z & 15) as u32) << 4) | (x & 15) as u32
 }
-/// The overlay's state for a cell, or `None` when the cell still holds generated
-/// terrain. Use this instead of `block_at` where the *only* states that matter are ones
-/// a player or a tick wrote: `block_at` falls back to `base_state` → a full locked
+/// The overlay's state for a cell in one dimension, or `None` when the cell still holds that
+/// dimension's generated terrain. Use this instead of `block_at` where the *only* states that
+/// matter are ones a player or a tick wrote: `block_at` falls back to `base_state` → a full locked
 /// worldgen evaluation (density + material rule + aquifer + feature population) for
 /// every generated cell, measured at 1.6 ms per call in the pressure-plate loop —
 /// 19.5 ms of a tick, for 12 entity positions, none of which was on a plate.
-fn overlay_block(x: i32, y: i32, z: i32) -> Option<u32> {
+fn overlay_block_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     world()
         .lock()
         .unwrap()
-        .get(&(x >> 4, z >> 4))
+        .get(&(dim, x >> 4, z >> 4))
         .and_then(|c| c.get(&local_idx(x, y, z)).copied())
 }
 
-fn block_at(x: i32, y: i32, z: i32) -> u32 {
+fn overlay_block(x: i32, y: i32, z: i32) -> Option<u32> {
+    overlay_block_dim(DimId::Overworld, x, y, z)
+}
+
+/// The generated state for a cell with no edit, from the generator that owns `dim`.
+///
+/// The Overworld arm is `base_state`, which is what every existing reader measured. The other two
+/// ask *their own* generator through the per-dimension registry, and answer air when that
+/// dimension has no generator installed. They must not fall back to `base_state`: that resolves
+/// the Overworld's noise settings and its -64/384 window, so a Nether cell below y=0 would come
+/// back as Overworld deepslate instead of the air the Nether's 0/256 window defines — the exact
+/// substitution the per-dimension registry exists to stop.
+fn dim_base_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
+    if dim == DimId::Overworld {
+        return Some(base_state(x, y, z));
+    }
+    worldgen::with_gen_dim(dim, |g| g.block_state_at(x, y, z, crate::feature::populate))
+}
+
+fn block_at_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
     let w = timed_world();
     let hit = w
-        .get(&(x >> 4, z >> 4))
+        .get(&(dim, x >> 4, z >> 4))
         .and_then(|c| c.get(&local_idx(x, y, z)).copied());
     if chunkprof::enabled() {
         use std::sync::atomic::Ordering;
@@ -9669,10 +9709,17 @@ fn block_at(x: i32, y: i32, z: i32) -> u32 {
         }
     }
     drop(w); // Never acquire SAVE_LOCK through generation while holding WORLD.
-    hit.unwrap_or_else(|| base_state(x, y, z))
+    hit.unwrap_or_else(|| dim_base_state(dim, x, y, z).unwrap_or(0))
+}
+
+fn block_at(x: i32, y: i32, z: i32) -> u32 {
+    block_at_dim(DimId::Overworld, x, y, z)
+}
+fn set_block_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    set_block_if_dim(dim, x, y, z, st, None);
 }
 fn set_block(x: i32, y: i32, z: i32, st: u32) {
-    set_block_if(x, y, z, st, None);
+    set_block_dim(DimId::Overworld, x, y, z, st);
 }
 /// A block write and the scheduled-tick reservations it causes are one
 /// persistence transaction. The signal-thread save holds `SAVE_LOCK` while it
@@ -9680,12 +9727,41 @@ fn set_block(x: i32, y: i32, z: i32, st: u32) {
 /// and `block_updated`'s booking would persist a gravity block with no
 /// callback and leave it hanging after a reload. Re-entrant, so a nested
 /// write (a cascade placing another block) does not take the lock twice.
-fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
-    with_save_guard(|| set_block_if_inner(x, y, z, st, expected))
+fn set_block_if_dim(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+    expected: Option<u32>,
+) -> bool {
+    with_save_guard(|| set_block_if_inner_dim(dim, x, y, z, st, expected))
 }
-fn set_block_if_inner(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
+fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
+    set_block_if_dim(DimId::Overworld, x, y, z, st, expected)
+}
+
+/// [`set_block_if`] for one dimension.
+///
+/// Only the Overworld's write path exists yet. It is a transaction across subsystems that are
+/// keyed by world position alone — the scheduled-tick queue, the state band, the section store,
+/// the water/lava/hopper/crop indexes, spawner flags, chest pairing, `bump_world_epoch` — and
+/// none of them is dimension-aware (S3). A non-Overworld write therefore records its own overlay
+/// edit and nothing else, rather than patching an Overworld band cell or an Overworld chunk's
+/// epoch with a Nether block.
+fn set_block_if_inner_dim(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+    expected: Option<u32>,
+) -> bool {
+    if dim != DimId::Overworld {
+        return set_block_if_dim_edit(dim, x, y, z, st, expected);
+    }
     let mut w = world().lock().unwrap();
-    let c = w.entry((x >> 4, z >> 4)).or_default();
+    let c = w.entry((dim, x >> 4, z >> 4)).or_default();
     let old = c
         .get(&local_idx(x, y, z))
         .copied()
@@ -9846,6 +9922,40 @@ fn set_block_if_inner(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) ->
     }
     refresh_hidden_neighbors(x, y, z);
     block_updated(x, y, z);
+    true
+}
+
+/// A non-Overworld block write: this dimension's overlay edit, and only that.
+///
+/// The predicate is `set_block_if_inner`'s, cell for cell — the overlay wins, a write equal to the
+/// dimension's own generated state removes the entry instead of shadowing it with a copy, and an
+/// `expected` that does not match refuses — but nothing else is touched. See
+/// [`set_block_if_inner_dim`] for why the Overworld's subsystem transaction cannot run for
+/// another dimension yet.
+fn set_block_if_dim_edit(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+    expected: Option<u32>,
+) -> bool {
+    // The generator's answer for this cell does not depend on the overlay, so it is taken before
+    // the world lock: the write is the only thing this path serialises, and it is asked once.
+    let base = dim_base_state(dim, x, y, z).unwrap_or(0);
+    let cell = local_idx(x, y, z);
+    let mut w = world().lock().unwrap();
+    let key: DimChunkKey = (dim, x >> 4, z >> 4);
+    let c = w.entry(key).or_default();
+    let old = c.get(&cell).copied().unwrap_or(base);
+    if expected.is_some_and(|value| old != value) {
+        return false;
+    }
+    if st == base {
+        c.remove(&cell);
+    } else {
+        c.insert(cell, st);
+    }
     true
 }
 
@@ -10460,7 +10570,13 @@ fn rebuild_derived_indexes() {
     let mut cg = crops().lock().unwrap();
     let mut cells = plugin_cells().lock().unwrap();
     let lamp_on = !plugins().lock().unwrap().is_empty();
-    for ((cx, cz), c) in w.iter() {
+    // The indexes below hold positions, not `(dimension, position)`, so they describe the
+    // Overworld: `rebuild_derived_indexes` walks the Overworld's edits and leaves another
+    // dimension's alone until the indexes name a dimension themselves (S3).
+    for (&(dim, cx, cz), c) in w.iter() {
+        if dim != DimId::Overworld {
+            continue;
+        }
         for (idx, st) in c.iter() {
             let x = cx * 16 + (*idx & 15) as i32;
             let z = cz * 16 + ((*idx >> 4) & 15) as i32;
@@ -10485,7 +10601,7 @@ fn rebuild_derived_indexes() {
                 cg.insert((x, y, z), (*st - 4278) as u8);
             }
             if lamp_on && *st == ST_GROWTH_LAMP {
-                cells.entry((*cx, *cz)).or_default().push(PluginCell {
+                cells.entry((cx, cz)).or_default().push(PluginCell {
                     pi: 0,
                     x,
                     y,
@@ -10507,6 +10623,99 @@ fn rebuild_derived_indexes() {
 
 // ---------- persistence (overlay only, no pregen) ----------
 const WORLD_FILE: &str = "world_overlay.bin";
+/// The companion overlay file of a dimension that is not the Overworld, or `WORLD_FILE` itself.
+///
+/// The legacy name and the legacy bytes stay the Overworld's: a server that only ever edits the
+/// Overworld writes exactly the one file it always did, and none of the companions.
+fn dim_overlay_name(dim: DimId) -> &'static str {
+    match dim {
+        DimId::Overworld => WORLD_FILE,
+        DimId::Nether => "world_overlay_nether.bin",
+        DimId::End => "world_overlay_end.bin",
+    }
+}
+
+fn dim_overlay_path(dir: &std::path::Path, dim: DimId) -> std::path::PathBuf {
+    dir.join(dim_overlay_name(dim))
+}
+
+/// The directory the world save lives in: `WORLD_FILE`'s own, so the default bare file name means
+/// the process's working directory — the same place the legacy save has always been read from.
+fn world_save_dir() -> std::path::PathBuf {
+    std::path::Path::new(WORLD_FILE)
+        .parent()
+        .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf)
+}
+
+/// One dimension's overlay, as a save payload: `count`, then per chunk `cx, cz, count` and its
+/// `idx, state` pairs. Returns how many chunks the table holds (0 = this dimension has no edits).
+///
+/// There is deliberately one writer for both the legacy file's leading table and a companion
+/// file, and one reader for both, so "the Overworld's table" and "the same format for another
+/// dimension" cannot drift into two formats.
+fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
+    let w = world().lock().unwrap();
+    let chunks: Vec<(&DimChunkKey, &HashMap<u32, u32>)> =
+        w.iter().filter(|(key, _)| key.0 == dim).collect();
+    let count = chunks.len();
+    write_varint(&mut *f, count as i64);
+    for (key, c) in chunks {
+        let (_, cx, cz) = *key;
+        (*f).extend_from_slice(&cx.to_be_bytes());
+        (*f).extend_from_slice(&cz.to_be_bytes());
+        write_varint(&mut *f, c.len() as i64);
+        for (&idx, &st) in c.iter() {
+            (*f).extend_from_slice(&idx.to_be_bytes());
+            write_varint(&mut *f, st as i64);
+        }
+    }
+    count
+}
+
+/// Read one dimension's chunk table into that dimension's overlay, starting at `p`.
+///
+/// The cursor form exists because the legacy file carries META sections after this table, so
+/// `load_world_from` has to continue parsing where the table ended. A companion file is only the
+/// table, which is what [`load_dim_overlay_from`] reads.
+fn load_dim_overlay_at(dim: DimId, payload: &[u8], p: &mut usize) {
+    let n = rv_varint(payload, p);
+    let mut w = world().lock().unwrap();
+    for _ in 0..n {
+        if *p + 8 > payload.len() {
+            break;
+        }
+        let cx = i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
+        *p += 4;
+        let cz = i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
+        *p += 4;
+        let m = rv_varint(payload, p);
+        let c = w.entry((dim, cx, cz)).or_default();
+        for _ in 0..m {
+            if *p + 4 > payload.len() {
+                break;
+            }
+            let idx = u32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            let st = rv_varint(payload, p) as u32;
+            c.insert(idx, st);
+        }
+        // `bump_world_epoch` moves the Overworld chunk's band/section caches, so only an
+        // Overworld chunk may move it: a Nether cell is not part of what they describe.
+        if dim == DimId::Overworld {
+            bump_world_epoch(cx << 4, cz << 4);
+        }
+    }
+}
+
+/// A companion file's payload: exactly one dimension's chunk table, nothing after it.
+fn load_dim_overlay_from(dim: DimId, payload: &[u8]) -> Result<(), &'static str> {
+    let mut p = 0usize;
+    load_dim_overlay_at(dim, payload, &mut p);
+    if p != payload.len() {
+        return Err("trailing bytes after a dimension's overlay table");
+    }
+    Ok(())
+}
 fn write_comps(f: &mut Vec<u8>, c: &Comps) {
     write_varint(f, c.len() as i64);
     for (ty, d) in c {
@@ -10619,6 +10828,13 @@ fn save_world() {
     with_save_guard(save_world_guarded);
 }
 fn save_world_guarded() {
+    save_world_guarded_in(&world_save_dir());
+}
+/// [`save_world_guarded`] against one directory: the legacy Overworld file, then one companion
+/// per dimension that has edits.
+///
+/// Caller owns `SAVE_LOCK` (or is a single-threaded fixture), exactly as for `save_world_into`.
+fn save_world_guarded_in(dir: &std::path::Path) {
     // save_world_into only builds the payload; the write happens here so the
     // snapshot stays observational and there is exactly one disk path.
     let mut f = Vec::new();
@@ -10628,12 +10844,55 @@ fn save_world_guarded() {
     // the previous save.
     let framed = wrap_world_payload(&f);
     if let Err(error) = write_world_file(
-        std::path::Path::new(WORLD_FILE),
+        &dim_overlay_path(dir, DimId::Overworld),
         &framed,
         connection_limits::backup_interval(),
     ) {
         eprintln!("[spine] WORLD SAVE FAILED: {error}");
     }
+    for dim in [DimId::Nether, DimId::End] {
+        if let Err(error) = save_dim_overlay_file(dir, dim) {
+            eprintln!("[spine] WORLD SAVE FAILED: {error}");
+        }
+    }
+}
+
+/// Write one dimension's companion overlay, or remove the stale file when it has no edits.
+///
+/// A dimension with no overlay chunks must leave nothing behind: an Overworld-only server would
+/// otherwise grow a pair of files on its first save, and a dimension whose last edit was undone
+/// would keep a file that resurrects that edit on the next load.
+fn save_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), String> {
+    if dim == DimId::Overworld {
+        // The Overworld's file is the whole save — chunk table plus META — written by the caller.
+        return Ok(());
+    }
+    let mut f = Vec::new();
+    let chunks = save_dim_overlay_into(dim, &mut f);
+    let path = dim_overlay_path(dir, dim);
+    if chunks == 0 {
+        return remove_world_save(&path);
+    }
+    write_world_file(
+        &path,
+        &wrap_world_payload(&f),
+        connection_limits::backup_interval(),
+    )
+}
+
+/// Remove a save and every sibling `write_world_file` may have left beside it.
+fn remove_world_save(path: &std::path::Path) -> Result<(), String> {
+    for suffix in ["", ".tmp", ".bak", ".bak.1", ".bak.2"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let target = std::path::PathBuf::from(name);
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot remove {}: {error}", target.display())),
+        }
+    }
+    Ok(())
 }
 /// Write `framed` to `path` via `path.tmp` (fsynced), then rename over it.
 ///
@@ -10714,18 +10973,10 @@ fn save_world_into(f: &mut Vec<u8>) {
     let generated = generated_content::Snapshot {
         content, sources, spider_flags,
     };
-    let w = world().lock().unwrap();
-    write_varint(&mut *f, w.len() as i64);
-    for (&(cx, cz), c) in w.iter() {
-        (*f).extend_from_slice(&cx.to_be_bytes());
-        (*f).extend_from_slice(&cz.to_be_bytes());
-        write_varint(&mut *f, c.len() as i64);
-        for (&idx, &st) in c.iter() {
-            (*f).extend_from_slice(&idx.to_be_bytes());
-            write_varint(&mut *f, st as i64);
-        }
-    }
-    drop(w);
+    // The leading chunk table is the Overworld's, which is what the legacy file has always held:
+    // its count, its keys and its bytes are unchanged, and another dimension's edits go to that
+    // dimension's own companion file (`save_world_guarded_in`).
+    save_dim_overlay_into(DimId::Overworld, f);
     // META section: mobs + world time + inventories (offline store + live).
     // MET4 = stacks carry component blobs and entity ages are server ticks.
     // MET2/MET3 stored those ages in milliseconds, which the loader converts.
@@ -11409,12 +11660,38 @@ fn read_drop_owners_footer(
     Ok((&payload[..start], out))
 }
 fn load_world() -> Result<(), &'static str> {
-    let raw = match std::fs::read(WORLD_FILE) {
+    load_world_in(&world_save_dir())
+}
+
+/// [`load_world`] against one directory: the legacy file, then the companion of every dimension
+/// that has one.
+fn load_world_in(dir: &std::path::Path) -> Result<(), &'static str> {
+    let path = dim_overlay_path(dir, DimId::Overworld);
+    let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err("failed to read world save"),
     };
-    load_world_from(&unwrap_world_payload(raw)?)
+    load_world_from(&unwrap_world_payload(raw)?)?;
+    for dim in [DimId::Nether, DimId::End] {
+        load_dim_overlay_file(dir, dim)?;
+    }
+    Ok(())
+}
+
+/// Load `dim`'s companion overlay when the file exists; a dimension with no file has no edits.
+fn load_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), &'static str> {
+    if dim == DimId::Overworld {
+        // The Overworld's edits are the legacy file's leading table, read by `load_world_from`.
+        return Ok(());
+    }
+    let path = dim_overlay_path(dir, dim);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("failed to read world save"),
+    };
+    load_dim_overlay_from(dim, &unwrap_world_payload(raw)?)
 }
 
 fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
@@ -11437,32 +11714,13 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     // bounds-safe varint read: truncated input stops the parse instead of
     // panicking; continuation bytes beyond i64's 70 bits are ignored.
     let rv = rv_varint;
-    let n = rv(payload, &mut p);
-    let mut w = world().lock().unwrap();
-    for _ in 0..n {
-        if p + 8 > payload.len() {
-            break;
-        }
-        let cx = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
-        p += 4;
-        let cz = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
-        p += 4;
-        let m = rv(payload, &mut p);
-        let c = w.entry((cx, cz)).or_default();
-        for _ in 0..m {
-            if p + 4 > payload.len() {
-                break;
-            }
-            let idx = u32::from_be_bytes(b[p..p + 4].try_into().unwrap());
-            p += 4;
-            let st = rv(payload, &mut p) as u32;
-            c.insert(idx, st);
-        }
-        // every chunk this restore touched has new cells
-        bump_world_epoch(cx << 4, cz << 4);
-    }
-    eprintln!("[spine] loaded {} dirty chunks", w.len());
-    drop(w);
+    // The leading table is the Overworld's: the legacy file stores `(cx, cz)` chunks, and they
+    // load into `(DimId::Overworld, cx, cz)`. `p` continues past the table into the META tail.
+    load_dim_overlay_at(DimId::Overworld, payload, &mut p);
+    eprintln!(
+        "[spine] loaded {} dirty chunks",
+        world().lock().unwrap().len()
+    );
     // optional META tail
     if p + 4 <= payload.len() && matches!(&payload[p..p + 4], b"MET2" | b"MET3" | b"MET4") {
         let magic = &payload[p..p + 4];
@@ -12340,7 +12598,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
             world()
                 .lock()
                 .unwrap()
-                .entry((fx >> 4, fz >> 4))
+                .entry((DimId::Overworld, fx >> 4, fz >> 4))
                 .or_default()
                 .insert(local_idx(fx, fy, fz), 0);
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -17090,8 +17348,7 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
                     continue;
                 };
                 for (p, lum) in g {
-                    if guard
-                        .get(&(p.0 >> 4, p.2 >> 4))
+                    if overworld_edits(&guard, p.0 >> 4, p.2 >> 4)
                         .and_then(|c| c.get(&local_idx(p.0, p.1, p.2)))
                         .is_some()
                     {
@@ -17104,7 +17361,7 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
         for dx in -1..=1 {
             for dz in -1..=1 {
                 let (ncx, ncz) = (cx + dx, cz + dz);
-                let Some(col) = guard.get(&(ncx, ncz)) else {
+                let Some(col) = overworld_edits(&guard, ncx, ncz) else {
                     continue;
                 };
                 for (idx, st) in col {
@@ -17138,7 +17395,7 @@ fn block_light_sections(cx: i32, cz: i32, gen: &GenSources) -> Vec<[u8; 2048]> {
         for dx in -1..=1 {
             for dz in -1..=1 {
                 let key = (cx + dx, cz + dz);
-                if let Some(col) = guard.get(&key) {
+                if let Some(col) = overworld_edits(&guard, key.0, key.1) {
                     if !col.is_empty() {
                         w.insert(key, col.clone());
                     }
@@ -17580,7 +17837,7 @@ fn op_band(cx: i32, cz: i32, epoch: u64) -> Option<std::sync::Arc<OpBand>> {
     // `block_at` prefers it.
     {
         let w = world().lock().unwrap();
-        if let Some(col) = w.get(&(cx, cz)) {
+        if let Some(col) = overworld_edits(&w, cx, cz) {
             for (idx, st) in col {
                 let y = (*idx >> 8) as i32 + MIN_Y;
                 if y < y0 || y > y1 {
@@ -17862,7 +18119,7 @@ fn overlay_band(cx: i32, cz: i32) {
     // rows are written, and the tick thread reads `world()` every tick.
     let col: Vec<(u32, u32)> = {
         let w = world().lock().unwrap();
-        match w.get(&(cx, cz)) {
+        match overworld_edits(&w, cx, cz) {
             Some(c) => c.iter().map(|(k, v)| (*k, *v)).collect(),
             None => {
                 return;
@@ -18298,9 +18555,13 @@ fn chunk_data_opt(
     // on 16 `world()` reads, which is the whole tick body. The copy is the chunk's own
     // edit map (a handful of entries, empty on a fresh chunk).
     let __to = chunkprof::enabled().then(std::time::Instant::now);
+    // This chunk belongs to `dim`, so the edits that apply to it are `dim`'s. The band and the
+    // section store this function then fills (`install_band_rows`, `publish_section`) are still
+    // keyed by `(cx, cz)` alone, which is why every caller passes the Overworld today; S3 is what
+    // gives those caches a dimension.
     let overlay: HashMap<u32, u32> = {
         let w = world().lock().unwrap();
-        w.get(&(cx, cz)).cloned().unwrap_or_default()
+        w.get(&(dim, cx, cz)).cloned().unwrap_or_default()
     };
     if let Some(t) = __to {
         chunkprof::add(&chunkprof::OVERLAY_APPLY, t);
@@ -28706,7 +28967,7 @@ fn main() {
                 let edits = world().lock().unwrap();
                 for dz in 0..n {
                     for dx in 0..n {
-                        if let Some(chunk) = edits.get(&(ox + dx, oz + dz)) {
+                        if let Some(chunk) = overworld_edits(&edits, ox + dx, oz + dz) {
                             for (&index, &state) in chunk {
                                 assert!(
                                     (index as usize) < 24 * 4096,
@@ -29537,7 +29798,7 @@ mod mineshaft_runtime_tests {
     use std::net::{Shutdown, TcpListener};
 
     struct RuntimeSnapshot {
-        world: HashMap<(i32, i32), HashMap<u32, u32>>,
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
         chests: HashMap<ContainerKey, HashMap<i16, Stack>>,
         pending_block_loot: HashMap<BlockPos, PendingBlockLoot>,
         drops: Vec<Drop>,

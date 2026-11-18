@@ -368,7 +368,7 @@ mod entity_collision_tests {
     use super::*;
 
     struct TestWorldSnapshot {
-        world: HashMap<(i32, i32), HashMap<u32, u32>>,
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
     }
 
     impl TestWorldSnapshot {
