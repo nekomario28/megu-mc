@@ -37,6 +37,100 @@ impl NoisePreset {
             Self::End => "end",
         }
     }
+    /// The dimension this preset's noise settings belong to. One preset, one dimension
+    /// here: the overworld settings also cover its caves (`overworld_caves` is a separate
+    /// `dimension_type` this port does not load), and the Nether and the End each have
+    /// exactly one.
+    pub(crate) fn dim(self) -> DimId {
+        match self {
+            Self::Overworld => DimId::Overworld,
+            Self::Nether => DimId::Nether,
+            Self::End => DimId::End,
+        }
+    }
+}
+
+/// Which dimension a `Gen` answers for: the key of the per-dimension registry.
+///
+/// A dimension is not a preset spelled differently. The **preset** selects the noise
+/// settings — terrain, density, aquifers, carvers, surface rules, the biome quart sweep — and
+/// the **dimension** selects the `dimension_type` — the world window and whether there is a
+/// sky light layer. They agree one-to-one here only because this port loads one dimension per
+/// preset. The registry exists so a streaming caller can *name* the generator it wants
+/// instead of reading whichever one `init` installed last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum DimId {
+    Overworld,
+    Nether,
+    End,
+}
+
+impl DimId {
+    /// Every dimension the registry holds a slot for, in slot order.
+    pub(crate) const ALL: [DimId; 3] = [DimId::Overworld, DimId::Nether, DimId::End];
+
+    /// The slot this dimension owns in the registry arrays: `ALL[i].index() == i`.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Overworld => 0,
+            Self::Nether => 1,
+            Self::End => 2,
+        }
+    }
+
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    pub(crate) fn preset(self) -> NoisePreset {
+        match self {
+            Self::Overworld => NoisePreset::Overworld,
+            Self::Nether => NoisePreset::Nether,
+            Self::End => NoisePreset::End,
+        }
+    }
+
+    /// The `dimension_type` file name under `data/minecraft/dimension_type/`. Two of the
+    /// three are not the preset name: `the_nether` and `the_end`.
+    pub(crate) fn dimension_file(self) -> &'static str {
+        match self {
+            Self::Overworld => "overworld",
+            Self::Nether => "the_nether",
+            Self::End => "the_end",
+        }
+    }
+
+    /// The dimension id a datapack (or the wire) names this dimension by.
+    pub(crate) fn dimension_id(self) -> &'static str {
+        match self {
+            Self::Overworld => "minecraft:overworld",
+            Self::Nether => "minecraft:the_nether",
+            Self::End => "minecraft:the_end",
+        }
+    }
+
+    pub(crate) fn parse_dimension_id(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|dimension| dimension.dimension_id() == name)
+    }
+
+    /// `DimensionType.hasSkyLight()`: only the Overworld has a sky light layer.
+    pub(crate) fn has_skylight(self) -> bool {
+        matches!(self, DimId::Overworld)
+    }
+}
+
+impl From<NoisePreset> for DimId {
+    fn from(preset: NoisePreset) -> Self {
+        preset.dim()
+    }
+}
+
+impl From<DimId> for NoisePreset {
+    fn from(dimension: DimId) -> Self {
+        dimension.preset()
+    }
 }
 
 pub(crate) fn parse_world_seed(value: &str) -> Result<u64, std::num::ParseIntError> {
@@ -53,11 +147,7 @@ pub(crate) fn parse_world_seed(value: &str) -> Result<u64, std::num::ParseIntErr
 /// (`overworld_caves` is a separate dimension_type this port does not load), and it
 /// declares the same -64/384 window.
 fn dimension_type_file(preset: NoisePreset) -> &'static str {
-    match preset {
-        NoisePreset::Overworld => "overworld",
-        NoisePreset::Nether => "the_nether",
-        NoisePreset::End => "the_end",
-    }
+    preset.dim().dimension_file()
 }
 
 /// The world window one `dimension_type` object declares, or `None` when it is not a
@@ -3642,8 +3732,8 @@ pub(crate) struct ChunkCols {
 type GeneratedTick = ((i32, i32, i32), u32);
 type PendingGeneratedTicks = (Vec<GeneratedTick>, HashSet<GeneratedTick>);
 
-/// Per-world pending ticks. Sharing these handles with runtime avoids taking GEN
-/// to drain, without mixing independent generators or reinitialized worlds.
+/// Per-world pending ticks. Sharing these handles with runtime avoids taking the generator
+/// lock to drain, without mixing independent generators or reinitialized worlds.
 #[derive(Clone, Default)]
 struct GeneratedTickQueues {
     leaves: std::sync::Arc<Mutex<PendingGeneratedTicks>>,
@@ -3669,7 +3759,52 @@ pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))
 }
 
-static GEN: Mutex<Option<Gen>> = Mutex::new(None);
+/// How many dimensions the registry holds a generator slot for.
+pub(crate) const DIM_SLOTS: usize = DimId::ALL.len();
+
+/// The per-dimension generator registry: one `Gen` per dimension, every one built from the
+/// same world seed and its own preset's noise settings.
+///
+/// Before this the process had exactly one generator (`GEN`), and "which dimension" was a
+/// property of `init`'s last call — which is why the Nether and the End could only ever be an
+/// offline diagnostic (`MC_SPINE_WG_PRESET`). The Overworld keeps its old meaning exactly:
+/// the dim-less accessors ([`with_gen`], [`terrain_section`], [`facts`], [`data_snapshot`])
+/// answer for the [`active_dim`] slot, and `init` always makes that the Overworld.
+pub(crate) struct PerDimGen {
+    /// The generators, indexed by [`DimId::index`]. One lock for all three, because a
+    /// `Gen` is not `Send`-shareable work in progress: generation holds its dimension's
+    /// generator exclusively, exactly as it held `GEN`.
+    gens: Mutex<[Option<Gen>; DIM_SLOTS]>,
+    /// The immutable half of each generator, published at init. A worker clones the `Arc`
+    /// once and then reads a dimension's inputs without touching the generator lock.
+    data: Mutex<[Option<std::sync::Arc<GenData>>; DIM_SLOTS]>,
+    /// The dimension facts of each generator, published at init: the lock-free answer a
+    /// reader wants for the build height, the sea level or the world window.
+    facts: Mutex<[Option<GenFacts>; DIM_SLOTS]>,
+}
+
+static PER_DIM: PerDimGen = PerDimGen {
+    gens: Mutex::new([None, None, None]),
+    data: Mutex::new([None, None, None]),
+    facts: Mutex::new([None, None, None]),
+};
+
+/// Which slot the dim-less accessors answer for.
+///
+/// `init_preset` publishes here the generator it installed, so every offline diagnostic that
+/// selects a dimension with `MC_SPINE_WG_PRESET` keeps meaning what it meant (its
+/// `with_gen`, its `world_min_y()`, its dump length). `init` — the runtime's only call —
+/// always installs the Overworld, so a server's dim-less path is the Overworld.
+static ACTIVE_DIM: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(DimId::Overworld as u8);
+
+/// The dimension the dim-less accessors answer for (the Overworld unless an offline
+/// diagnostic selected another one). The streaming path never asks this: it names its
+/// dimension in [`with_gen_dim`] / [`terrain_section_dim`].
+pub(crate) fn active_dim() -> DimId {
+    DimId::from_index(ACTIVE_DIM.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        .unwrap_or(DimId::Overworld)
+}
 
 /// Bumped by every `init`. The caches above the generator (`main.rs`'s state band and
 /// section store) describe *this* generator, so they must not answer for a replacement:
@@ -3748,15 +3883,20 @@ pub(crate) mod parallel_probe {
     }
 }
 
-/// `GEN`'s lock, timing how long a caller waited for it and how long it held it.
+/// The generator lock, timing how long a caller waited for it and how long it held it.
 ///
 /// The parallelization decision needs this split: `FEAT_PROFILE` can say how much
 /// work a populate does, but not how much of a server's wall time is spent queued
 /// behind the one world lock. Off unless `FEAT_PROFILE` is set, in which case the
 /// two `Instant` calls are paid on every acquisition.
+///
+/// The guard is over the registry's whole slot array, and the derefs hand out the one slot
+/// the lock was taken for — so `gen_lock().as_mut()` still means "the Overworld generator",
+/// unchanged, and `gen_lock_dim(dim)` means the same thing for another dimension.
 pub(crate) struct GenLock {
-    guard: std::sync::MutexGuard<'static, Option<Gen>>,
-    /// `Some` when profiling: the time spent inside `GEN.lock()`.
+    guard: std::sync::MutexGuard<'static, [Option<Gen>; DIM_SLOTS]>,
+    dim: DimId,
+    /// `Some` when profiling: the time spent inside `PER_DIM.gens.lock()`.
     waited_ns: Option<u64>,
     held_since: Option<std::time::Instant>,
 }
@@ -3779,19 +3919,19 @@ impl Drop for GenLock {
 impl std::ops::Deref for GenLock {
     type Target = Option<Gen>;
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        &self.guard[self.dim.index()]
     }
 }
 impl std::ops::DerefMut for GenLock {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        &mut self.guard[self.dim.index()]
     }
 }
 
 /// The part of `Gen` that never changes after `init`: the dimension facts every reader
 /// needs (`sea`, build height, the default block states).
 ///
-/// Published separately from `GEN` so a reader does not queue behind a 13 ms generation
+/// Published separately from the generator so a reader does not queue behind a 13 ms generation
 /// hold to learn the build height. It is the first piece of the `GenData`/`Gen` split in
 /// `specs/chunk-parallelism`: immutable inputs readable without the world lock. Anything
 /// added here must be immutable after construction — the snapshot is taken once, and a
@@ -3811,33 +3951,55 @@ pub(crate) struct GenFacts {
     pub bedrock_st: u32,
 }
 
-static GEN_FACTS: Mutex<Option<GenFacts>> = Mutex::new(None);
-
-/// The immutable half as a shareable snapshot, published at `init`. A worker takes a
-/// clone of the `Arc` once and then reads the world's inputs without touching `GEN`:
-/// this lock is held for a clone, not for a generation step.
-static GEN_DATA: Mutex<Option<std::sync::Arc<GenData>>> = Mutex::new(None);
-
-/// `Arc<GenData>` without waiting for a generation step to finish. A job can keep the
-/// snapshot for its lifetime; the caches it must not share live on `Gen`, not here.
+/// `Arc<GenData>` of the active dimension, without waiting for a generation step to finish.
+/// A job can keep the snapshot for its lifetime; the caches it must not share live on `Gen`,
+/// not here. The snapshot itself is [`PerDimGen::data`]: a worker takes a clone of the `Arc`
+/// once and then reads that dimension's inputs without the generator lock, which is held for a
+/// clone and not for a generation step.
 pub fn data_snapshot() -> Option<std::sync::Arc<GenData>> {
-    GEN_DATA.lock().unwrap().clone()
+    data_snapshot_dim(active_dim())
 }
 
-/// The immutable dimension facts, without the `GEN` lock. `None` before `init`.
+/// One dimension's immutable half, published at init.
+pub(crate) fn data_snapshot_dim(dimension: DimId) -> Option<std::sync::Arc<GenData>> {
+    PER_DIM.data.lock().unwrap()[dimension.index()].clone()
+}
+
+/// The active dimension's immutable facts, without the generator lock. `None` before `init`.
 pub(crate) fn facts() -> Option<GenFacts> {
-    *GEN_FACTS.lock().unwrap()
+    facts_dim(active_dim())
+}
+
+/// One dimension's immutable facts, without the generator lock. `None` until that dimension
+/// is installed.
+pub(crate) fn facts_dim(dimension: DimId) -> Option<GenFacts> {
+    PER_DIM.facts.lock().unwrap()[dimension.index()]
+}
+
+/// `DimensionType.hasSkyLight()` for one dimension, answered from the published facts (no
+/// generator lock); the Overworld's answer before any dimension is installed, which is the
+/// frame every pre-registry default came from.
+pub(crate) fn has_skylight(dimension: DimId) -> bool {
+    facts_dim(dimension).map_or(dimension.has_skylight(), |facts| {
+        facts.preset.dim().has_skylight()
+    })
 }
 
 fn gen_lock() -> GenLock {
+    gen_lock_dim(active_dim())
+}
+
+/// One dimension's generator lock.
+fn gen_lock_dim(dimension: DimId) -> GenLock {
     // Either switch turns the timing on: `FEAT_PROFILE` for generation-only runs,
     // `MC_SPINE_TICK_PROFILE` for a live server, where the tick thread is the caller
     // that queues behind a section pass.
     let prof = env_flag!("FEAT_PROFILE") || env_flag!("MC_SPINE_TICK_PROFILE");
     let started = prof.then(std::time::Instant::now);
-    let guard = GEN.lock().unwrap();
+    let guard = PER_DIM.gens.lock().unwrap();
     GenLock {
         guard,
+        dim: dimension,
         waited_ns: started.map(|t| t.elapsed().as_nanos() as u64),
         held_since: started,
     }
@@ -3876,33 +4038,68 @@ pub(crate) const VANILLA_DATA_MISSING: &str =
 pub fn init(seed: u64, res: fn(&str) -> Option<u32>) -> bool {
     init_preset(seed, res, NoisePreset::Overworld)
 }
+
+/// Install one dimension's generator for `seed`, leaving the active dimension alone.
+///
+/// This is what a server calls for the Nether and the End after [`init`]: the same world
+/// seed, the same block-state lookup, and the generator that dimension's terrain, surfaces
+/// and world window are defined against. It publishes that dimension's facts and data and
+/// nothing else — in particular it does not touch `GEN_SEQ` or the generated-tick handles,
+/// which describe the active world.
+pub(crate) fn init_dim(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>) -> bool {
+    install(dimension, seed, res, false)
+}
+
+/// Install `preset`'s generator and make its dimension the active one.
+///
+/// The runtime reaches this through [`init`], i.e. with the Overworld. The offline
+/// diagnostics (`MC_SPINE_WG_PRESET=nether|end`) reach it with another preset, and because
+/// the installed generator also becomes the active one, every dim-less accessor keeps
+/// answering for it exactly as it did before the registry existed.
 pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: NoisePreset) -> bool {
+    let dimension: DimId = preset.into();
+    install(dimension, seed, res, true)
+}
+
+fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: bool) -> bool {
+    let preset = dimension.preset();
     let generator = match preset {
         NoisePreset::Overworld => Gen::load(seed, res),
         NoisePreset::End | NoisePreset::Nether => Gen::load_preset(seed, res, preset),
     };
-    match generator {
-        Some(g) => {
-            *GEN_FACTS.lock().unwrap() = Some(GenFacts {
-                preset: g.preset,
-                sea: g.sea,
-                min_y: g.min_y,
-                height: g.height,
-                world_min_y: g.world_min_y,
-                world_height: g.world_height,
-                def_st: g.def_st,
-                def_fl: g.def_fl,
-                bedrock_st: g.bedrock_st,
-            });
-            *GEN_DATA.lock().unwrap() = Some(g.data.clone());
-            *GEN_TICK_QUEUES.lock().unwrap() = Some(g.generated_ticks.clone());
-            *gen_lock() = Some(g);
-            GEN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
-            GEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            true
-        }
-        None => false,
+    let Some(g) = generator else { return false };
+    // Published before the generator, in the order a reader needs them: once a reader can see
+    // this dimension as active, its facts, its data snapshot and its generator are all there.
+    let slot = dimension.index();
+    {
+        let mut facts = PER_DIM.facts.lock().unwrap();
+        facts[slot] = Some(GenFacts {
+            preset: g.preset,
+            sea: g.sea,
+            min_y: g.min_y,
+            height: g.height,
+            world_min_y: g.world_min_y,
+            world_height: g.world_height,
+            def_st: g.def_st,
+            def_fl: g.def_fl,
+            bedrock_st: g.bedrock_st,
+        });
     }
+    {
+        let mut data = PER_DIM.data.lock().unwrap();
+        data[slot] = Some(g.data.clone());
+    }
+    let ticks = g.generated_ticks.clone();
+    *gen_lock_dim(dimension) = Some(g);
+    if activate {
+        ACTIVE_DIM.store(dimension.index() as u8, std::sync::atomic::Ordering::Relaxed);
+        // The runtime drains the *active* world's generated ticks through these handles, and
+        // the tick thread must not queue behind generation to get them.
+        *GEN_TICK_QUEUES.lock().unwrap() = Some(ticks);
+        GEN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+        GEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
 }
 /// `MC_SPINE_DFDUMP=x,y,z` diagnostic: print the vein-sampler inputs.
 pub fn dfdump(spec: &str) {
@@ -4140,10 +4337,21 @@ pub(crate) fn parse_population_order(
     })
 }
 
-/// Run a diagnostic against the generator under GEN. Feature-facing accessors
-/// stay in the caller's layer to avoid worldgen depending on generation_context.
+/// Run a diagnostic against one dimension's generator.
+///
+/// This is the streaming seam: a caller that serves the Nether asks for the Nether's
+/// generator instead of whatever `init` installed last. A dimension with no generator
+/// installed answers `None`, exactly as an uninitialised world answered before.
+pub fn with_gen_dim<R>(dimension: DimId, f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
+    gen_lock_dim(dimension).as_mut().map(f)
+}
+
+/// Run a diagnostic against the active dimension's generator — the Overworld for every
+/// runtime caller (`init` is the only install the server does); an offline
+/// `MC_SPINE_WG_PRESET` diagnostic is what can make it another dimension. Feature-facing
+/// accessors stay in the caller's layer to avoid worldgen depending on generation_context.
 pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
-    gen_lock().as_mut().map(f)
+    with_gen_dim(active_dim(), f)
 }
 
 /// A stable fingerprint of one chunk's generated columns, for determinism tests.
@@ -4195,7 +4403,7 @@ pub(crate) fn cols_fingerprint(cc: &ChunkCols) -> u64 {
 ///
 /// Stage 2A of `specs/chunk-parallelism`: terrain is a pure function of the immutable
 /// data and the seed — `cols` reads no feature write — so a worker can compute it while
-/// the owner keeps `GEN`. Features stay sequential: they read other chunks' writes, and
+/// the owner keeps the generator. Features stay sequential: they read other chunks' writes, and
 /// their order is pinned to the native capture.
 pub fn chunk_cols_scratch(
     data: &std::sync::Arc<GenData>,
@@ -4345,7 +4553,7 @@ impl MarkSrc {
 ///
 /// Lever 2 of `evidence/foundation/performance/README.md`: terrain is a pure function of
 /// the immutable data and the seed, so chunks are independent and can be filled while the
-/// owner keeps `GEN`. This is exactly the half vanilla runs on its background executor —
+/// owner keeps the generator. This is exactly the half vanilla runs on its background executor —
 /// `NoiseBasedChunkGenerator.fillFromNoise` is `CompletableFuture.supplyAsync(…, background
 /// executor)` per chunk, gated by `ChunkStep`'s neighbour-status requirements
 /// (`apis`, `ChunkGenerationTask`, in `dwc.a`/`apy.a`), while `FEATURES` and `CARVERS`
@@ -4357,7 +4565,7 @@ impl MarkSrc {
 /// rows reuse it instead of computing it a second time.
 ///
 /// A worker that panics leaves its keys as `None` (the consumer builds those chunks
-/// inline) and gets a fresh generator; it never poisons the owner's `GEN`.
+/// inline) and gets a fresh generator; it never poisons the owner's.
 pub(crate) fn prefetch_terrain(
     data: &std::sync::Arc<GenData>,
     resolver: Option<BeardResolver>,
@@ -5122,7 +5330,7 @@ impl Gen {
     }
 
     /// Full block decision (feature layer, material window, aquifer, deep rules)
-    /// without taking the GEN lock. `terrain_section` and the free `block_state`
+    /// without taking the generator lock. `terrain_section` and the free `block_state`
     /// use it so a chunk fill takes one lock instead of five per block.
     pub(crate) fn block_state_at(
         &mut self,
@@ -5422,7 +5630,7 @@ impl Gen {
     /// light layer, which is what decides the brightness a feature sees before
     /// `INITIALIZE_LIGHT` (see `generation_providers::uninitialized_raw_brightness`).
     pub(crate) fn has_skylight(&self) -> bool {
-        self.preset == NoisePreset::Overworld
+        self.preset.dim().has_skylight()
     }
     /// WORLD_SURFACE_WG-style height (first non-air + 1) at a column.
     pub(crate) fn top_ws(&mut self, x: i32, z: i32) -> i32 {
@@ -6228,7 +6436,7 @@ pub fn flat_bedrock() -> bool {
 }
 impl Gen {
     /// in-lock deep rule evaluation (feature layer / tests use this; the free
-    /// `deep_state` wrapper locks GEN).
+    /// `deep_state` wrapper locks the generator).
     /// The material rule below the surface window. Running the rule is the most expensive
     /// terrain work the feature pass does, and the same cell is read again by the send pass
     /// (`wg2_block`) immediately after, so the result is memoized here rather than recomputed.
@@ -6682,7 +6890,7 @@ pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
     gen_lock().as_mut()?.aq_state(x, y, z, density)
 }
 
-/// The block state at a world position, taking the GEN lock once.
+/// The block state at a world position, taking the generator lock once.
 /// One cell. Payloads stay generator-owned until a safe runtime boundary or
 /// save drains them under save -> generator -> runtime lock order. A cell read
 /// can hold a mob/player lock, so it must never acquire the save lock or create
@@ -6698,7 +6906,7 @@ pub fn block_state(
 }
 
 /// Base terrain states for one 16x16x16 section, in the send layout
-/// `(ly << 8) | (lz << 4) | lx`, with one GEN lock for the whole section.
+/// `(ly << 8) | (lz << 4) | lx`, with one generator lock for the whole section.
 ///
 /// The section is built in two halves, and only the first one is ever parallel:
 ///
@@ -6717,14 +6925,32 @@ pub fn terrain_section(
     cz: i32,
     populate: impl FnMut(&mut Gen, i32, i32),
 ) -> Option<Box<[u32; 4096]>> {
-    let mut gg = gen_lock();
-    gg.as_mut()?.terrain_section_at(cx, sy, cz, populate).into()
+    terrain_section_dim(active_dim(), cx, sy, cz, populate)
+}
+
+/// [`terrain_section`] for one dimension: the streaming seam.
+///
+/// The section a caller serves belongs to a dimension, and that dimension's generator is the
+/// one whose surface rules, aquifers, carvers, features and world window produced it. Asking
+/// for it here is the whole difference from the dim-less form; the two bodies are the same so
+/// a test can compare a dimension's arm with the active arm on the same generator.
+pub fn terrain_section_dim(
+    dimension: DimId,
+    cx: i32,
+    sy: i32,
+    cz: i32,
+    populate: impl FnMut(&mut Gen, i32, i32),
+) -> Option<Box<[u32; 4096]>> {
+    let mut gg = gen_lock_dim(dimension);
+    gg.as_mut()?
+        .terrain_section_at(cx, sy, cz, populate)
+        .into()
 }
 
 impl Gen {
-    /// [`terrain_section`] for one generator, without taking `GEN`. The two halves are
-    /// described there; this is the same body so a test can compare a prefetched arm and
-    /// a serial arm on two independent generators.
+    /// [`terrain_section`] for one generator, without taking the registry's lock. The two
+    /// halves are described there; this is the same body so a test can compare a prefetched
+    /// arm and a serial arm on two independent generators.
     pub(crate) fn terrain_section_at(
         &mut self,
         cx: i32,
@@ -7478,7 +7704,7 @@ mod wg_tests {
         let mut local = Gen::load(42, crate::name_to_state).unwrap();
         local.schedule_generated_leaf((9, 80, 9), 264);
         local.schedule_generated_fluid((9, 60, 9), 1);
-        // Hold GEN while another thread drains: reintroducing a GEN acquisition
+        // Hold the generator while another thread drains: reintroducing an acquisition
         // here must fail promptly rather than deadlock the test process.
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = with_gen(|_| {
@@ -7491,7 +7717,7 @@ mod wg_tests {
         })
         .unwrap();
         worker.0.join().unwrap();
-        let (leaves, fluids) = worker.1.expect("runtime drain waited on GEN");
+        let (leaves, fluids) = worker.1.expect("runtime drain waited on the generator");
         assert_eq!(
             leaves,
             vec![leaf],
@@ -8280,7 +8506,7 @@ mod wg_tests {
         );
     }
 
-    // These tests mutate the shared `GEN` static, so they must not run in parallel. The
+    // These tests mutate the shared generator registry, so they must not run in parallel. The
     // lock is the module-level one, also used by tests in other modules (the delivery-path
     // bench) and visible to them: one lock for every test that touches the generator.
     pub(super) fn lock_gen() -> std::sync::MutexGuard<'static, ()> {
@@ -10356,6 +10582,87 @@ mod wg_tests {
                 path.display()
             );
         }
+        // leave the shared fixture in the Overworld for the other tests
+        assert!(init(0, crate::name_to_state));
+    }
+
+    /// P2-3-S1: one registry, three dimensions, one seed, three answers.
+    ///
+    /// Before the registry the process held a single generator and "which dimension" was a
+    /// property of `init`'s last call, so a Nether answer could only be had by *replacing* the
+    /// Overworld's. Here all three are installed from the same seed and each answers from its
+    /// own `dimension_type` — 0/256 and no sky light for the Nether and the End, -64/384 and a
+    /// sky layer for the Overworld — and asking one does not disturb another.
+    #[test]
+    fn p2_3_s1_three_dimensions_answer_independently() {
+        let _guard = lock_gen();
+        assert!(init(0, crate::name_to_state));
+        assert!(init_dim(DimId::Nether, 0, crate::name_to_state));
+        assert!(init_dim(DimId::End, 0, crate::name_to_state));
+
+        // Through the generator each dimension owns: its world window, its sky layer and the
+        // preset its noise settings came from.
+        let answers = |dimension: DimId| {
+            with_gen_dim(dimension, |g| {
+                (g.world_min_y, g.world_height, g.has_skylight(), g.preset)
+            })
+            .expect("generator installed for this dimension")
+        };
+        for (dimension, preset) in [
+            (DimId::Nether, NoisePreset::Nether),
+            (DimId::End, NoisePreset::End),
+        ] {
+            assert_eq!(
+                answers(dimension),
+                (0, 256, false, preset),
+                "{dimension:?}: the world window comes from its own dimension_type"
+            );
+            // The lock-free answers a packet or a save reads, which is what a streaming caller
+            // asks instead of taking the generator lock.
+            let f = facts_dim(dimension).expect("facts published at init");
+            assert_eq!(
+                (f.world_min_y, f.world_height, f.preset),
+                (0, 256, preset),
+                "{dimension:?}: published facts"
+            );
+            assert_eq!(
+                data_snapshot_dim(dimension)
+                    .expect("snapshot published at init")
+                    .world_height,
+                256,
+                "{dimension:?}: data snapshot"
+            );
+            assert!(!has_skylight(dimension), "{dimension:?}: no sky light layer");
+        }
+
+        // The Overworld is untouched by either install: still the active dimension, still its
+        // own window, still the sky layer.
+        assert_eq!(active_dim(), DimId::Overworld);
+        assert_eq!(
+            answers(DimId::Overworld),
+            (-64, 384, true, NoisePreset::Overworld)
+        );
+        assert_eq!((world_min_y(), world_height()), (-64, 384));
+        assert!(has_skylight(DimId::Overworld));
+
+        // A dimension is named the way a datapack names it, and the two conversions agree.
+        assert_eq!(DimId::Nether.dimension_id(), "minecraft:the_nether");
+        assert_eq!(DimId::End.dimension_id(), "minecraft:the_end");
+        for (slot, dimension) in DimId::ALL.into_iter().enumerate() {
+            assert_eq!(dimension.index(), slot);
+            assert_eq!(DimId::from_index(slot), Some(dimension));
+            assert_eq!(
+                DimId::parse_dimension_id(dimension.dimension_id()),
+                Some(dimension)
+            );
+            assert_eq!(dimension.preset().dim(), dimension);
+            assert_eq!(NoisePreset::from(dimension), dimension.preset());
+            assert_eq!(
+                dimension.dimension_file(),
+                dimension_type_file(dimension.preset())
+            );
+        }
+
         // leave the shared fixture in the Overworld for the other tests
         assert!(init(0, crate::name_to_state));
     }

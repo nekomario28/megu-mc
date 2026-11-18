@@ -4,6 +4,7 @@
 // creative block dig/place backed by a shared overlay world.
 use crate::block_registry::breg;
 use crate::json::{jparse, J};
+use crate::worldgen::DimId;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -9083,9 +9084,10 @@ fn promotion_fluid_tick(
             // port leaves the cell alone rather than invent one, and says so when asked.
             if std::env::var_os("FLUID_TICK_TRACE").is_some() {
                 // Position only: this runs inside `worldgen::with_gen`, and `block_at`
-                // re-enters `GEN` (the cell may not be in the runtime store), which is a
-                // self-deadlock on the generator lock. The name is not worth that: the
-                // machine's refusal is about the *cell*, and the cell is what is printed.
+                // re-enters the generator lock (the cell may not be in the runtime store),
+                // which is a self-deadlock on the generator lock. The name is not worth
+                // that: the machine's refusal is about the *cell*, and the cell is what is
+                // printed.
                 eprintln!("[fluid-tick] mark={pos:?} stopped on {blocked:?}");
             }
             return;
@@ -17837,10 +17839,17 @@ fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 20
     out
 }
 
-fn chunk_data(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
+/// One chunk's payload for one dimension.
+///
+/// The dimension is threaded from the caller that decided whose chunk this is, not read from
+/// whatever `init` installed: a Nether section is built by the Nether's generator, and the
+/// Overworld arm passes [`DimId::Overworld`] and is byte-for-byte what it was before the
+/// per-dimension registry existed.
+fn chunk_data(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     chunk_data_opt(
         cx,
         cz,
+        dim,
         gen,
         // On by default. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` turns it off (the digest guard
         // passes the setting explicitly, so it can compare both without the environment).
@@ -17860,7 +17869,13 @@ const NEIGHBOUR_RING: [(i32, i32); 9] = [
     (1, 1),
 ];
 
-fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec<u8> {
+fn chunk_data_opt(
+    cx: i32,
+    cz: i32,
+    dim: DimId,
+    gen: &mut GenSources,
+    prefetch: bool,
+) -> Vec<u8> {
     let mut data = Vec::new();
     let reg = crate::block_registry::breg();
     let mut gen_sources_here: Vec<((i32, i32, i32), u8)> = Vec::new();
@@ -17944,7 +17959,7 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                         if chunkprof::enabled() {
                             chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
                         }
-                        worldgen::terrain_section(cx, sy, cz, feature::populate)
+                        worldgen::terrain_section_dim(dim, cx, sy, cz, feature::populate)
                     }
                 },
             };
@@ -17969,7 +17984,7 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                             chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
                         }
                         if let Some(nbr) =
-                            worldgen::terrain_section(cx + 1, sy, cz, feature::populate)
+                            worldgen::terrain_section_dim(dim, cx + 1, sy, cz, feature::populate)
                         {
                             publish_section(cx + 1, cz, sy, &nbr);
                         }
@@ -17987,7 +18002,7 @@ fn chunk_data_opt(cx: i32, cz: i32, gen: &mut GenSources, prefetch: bool) -> Vec
                         if chunkprof::enabled() {
                             chunkprof::TERRAIN_N.fetch_add(1, Ordering::Relaxed);
                         }
-                        worldgen::terrain_section(cx, sy + 16, cz, feature::populate)
+                        worldgen::terrain_section_dim(dim, cx, sy + 16, cz, feature::populate)
                     }
                 }
             } else {
@@ -18248,7 +18263,7 @@ fn heightmaps_nbt(tops: &[i32; 256]) -> Vec<u8> {
     v
 }
 
-fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
+fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
     let mut p = Vec::new();
     p.extend_from_slice(&cx.to_be_bytes());
@@ -18264,7 +18279,7 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     }
     p.extend_from_slice(&heightmaps_nbt(&tops));
     let __td = chunkprof::enabled().then(std::time::Instant::now);
-    let data = chunk_data(cx, cz, gen);
+    let data = chunk_data(cx, cz, dim, gen);
     if let Some(t) = __td {
         chunkprof::add(&chunkprof::DATA, t);
     }
@@ -18304,7 +18319,7 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
     }
     overlay_band(cx, cz);
     let __tl = chunkprof::enabled().then(std::time::Instant::now);
-    write_light_arrays(&mut p, cx, cz, gen);
+    write_light_arrays(&mut p, cx, cz, dim, gen);
     if let Some(t) = __tl {
         chunkprof::add(&chunkprof::LIGHT, t);
     }
@@ -18323,9 +18338,19 @@ fn map_chunk(cx: i32, cz: i32, gen: &mut GenSources) -> Vec<u8> {
 /// every section rather than masked per section - the mask would save 53 KB on a chunk with no
 /// light source and cost a pass to compute, and the simpler form is the one that can be shown
 /// correct.
-fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, gen: &GenSources) {
+fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, dim: DimId, gen: &GenSources) {
+    // `DimensionType.hasSkyLight()`: a dimension with no sky light layer has no sky arrays to
+    // send, so it sends an empty sky list and an empty mask instead of the Overworld's
+    // all-sections ones. The Overworld — every dimension this build streams today — takes the
+    // unchanged path; the Nether/End shape here is the packet's own contract and is not
+    // exercised by a delivery test until streaming is wired (P2-3-S2).
+    let sky_mask: i64 = if worldgen::has_skylight(dim) {
+        0x3ffffff
+    } else {
+        0
+    };
     write_varint(p, 1);
-    p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // skyLightMask
+    p.extend_from_slice(&sky_mask.to_be_bytes()); // skyLightMask
     write_varint(p, 1);
     p.extend_from_slice(&0x3ffffffi64.to_be_bytes()); // blockLightMask
     write_varint(p, 0); // emptySky
@@ -18334,7 +18359,11 @@ fn write_light_arrays(p: &mut Vec<u8>, cx: i32, cz: i32, gen: &GenSources) {
                         // Sky light per column instead of the placeholder 0xff that read as noon everywhere,
                         // then the block light a torch contributes. Two counted lists, sky first.
     let __tsky = chunkprof::enabled().then(std::time::Instant::now);
-    let sky = sky_light_sections_world(cx, cz);
+    let sky = if sky_mask == 0 {
+        Vec::new()
+    } else {
+        sky_light_sections_world(cx, cz)
+    };
     if let Some(t) = __tsky {
         chunkprof::add(&chunkprof::SKY, t);
     }
@@ -18632,7 +18661,9 @@ fn stream_chunks(
             delivery_round,
         );
         for (cx, cz) in chunk_group {
-            if send_packet(s, 0x27, map_chunk(*cx, *cz, gen)).is_err() {
+            // The player-facing stream is the Overworld: the seam exists so P2-3-S2 can pass
+            // the dimension the client is actually in.
+            if send_packet(s, 0x27, map_chunk(*cx, *cz, DimId::Overworld, gen)).is_err() {
                 return;
             }
             for n in light_dirty_for(gen, *cx, *cz) {
@@ -28542,6 +28573,20 @@ fn main() {
         .unwrap_or(0);
     if std::env::var("MC_SPINE_WG").ok().as_deref() != Some("old") {
         if worldgen::init(wg_seed, name_to_state) {
+            // The Nether and the End are generated by the same seed with their own noise
+            // settings, so they are installed here, once, next to the Overworld: a streamed
+            // Nether section must not depend on a diagnostic having loaded the Nether first.
+            // `init` keeps the Overworld active, so every dim-less accessor below still means
+            // the Overworld.
+            for dim in [DimId::Nether, DimId::End] {
+                if !worldgen::init_dim(dim, wg_seed, name_to_state) {
+                    eprintln!(
+                        "[wg] {} generator missing — that dimension cannot be streamed. {}",
+                        dim.dimension_id(),
+                        worldgen::VANILLA_DATA_MISSING
+                    );
+                }
+            }
             *WORLD_SPAWN.lock().unwrap() = (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5);
             eprintln!("[wg] vanilla datapack worldgen active (seed {})", wg_seed);
             if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {

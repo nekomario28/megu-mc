@@ -4741,7 +4741,7 @@ fn chunk_delivery_path_bench() {
             }
             for (cx, cz) in news {
                 let t = std::time::Instant::now();
-                let _ = chunk_data(cx, cz, &mut gen_sources);
+                let _ = chunk_data(cx, cz, DimId::Overworld, &mut gen_sources);
                 per_chunk.push(t.elapsed().as_secs_f64() * 1e3);
             }
         }
@@ -4841,7 +4841,7 @@ fn chunk_delivery_digest() {
                 } else {
                     (cx + lane, cz)
                 };
-                let _ = chunk_data_opt(cx, cz, gen_sources, prefetch);
+                let _ = chunk_data_opt(cx, cz, DimId::Overworld, gen_sources, prefetch);
                 let mut bytes: Vec<u8> = Vec::new();
                 for sec in 0..24 {
                     let sy = sec * 16 + crate::worldgen::min_y();
@@ -4897,6 +4897,87 @@ fn chunk_delivery_digest() {
     println!("PREFETCH-DIFF\t{}", changed.len());
 }
 
+/// P2-3-S1: the per-dimension registry does not move a single Overworld state.
+///
+/// `9591b6dadd9bc27eb0e198f66f284615` is the Overworld's own answer from *before* the registry
+/// existed: seed 0, chunk (0,0), 24 sections in the send layout, `chunk_data` first and then the
+/// sections (the sequence `chunk_delivery_digest` prints for seed 0 / `(1, 0)` / `0 0`). It is
+/// pinned as a literal because the question is cross-build, and a diff of two `chunk_data`
+/// payloads cannot answer it: the palette encoding is not reproducible between processes
+/// (measured: 18985 vs 18984 bytes for this chunk) while the states are.
+///
+/// It installs the world generator, so it runs in its own process: a generator left installed in
+/// the suite's process makes every later tick test do worldgen work, and measured, that is enough
+/// to push `wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count` over its one-second
+/// budget (filtered `tick_tests::`: 5.5 s green without this test, 28 s and one failure with it).
+#[test]
+fn p2_3_s1_overworld_streaming_path_keeps_its_bytes() {
+    if crate::test_support::isolated_world_test() {
+        return;
+    }
+    const PINNED: &str = "9591b6dadd9bc27eb0e198f66f284615";
+    let _guard = WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _gen_guard = crate::worldgen::lock_gen_for_tests();
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    // What a client would receive for the chunk's blocks: the 24 sections in the send layout,
+    // asked for through the dimension seam (`Some`) or the dim-less active path (`None`).
+    fn sections_digest(cx: i32, cz: i32, dim: Option<DimId>) -> String {
+        let mut bytes: Vec<u8> = Vec::new();
+        for sec in 0..24 {
+            let sy = sec * 16 + crate::worldgen::min_y();
+            let arr = match dim {
+                Some(dimension) => {
+                    worldgen::terrain_section_dim(dimension, cx, sy, cz, crate::feature::populate)
+                }
+                None => worldgen::terrain_section(cx, sy, cz, crate::feature::populate),
+            };
+            let arr = arr.unwrap_or_else(|| panic!("no section {sy} at ({cx},{cz})"));
+            for st in arr.iter() {
+                bytes.extend_from_slice(&st.to_le_bytes());
+            }
+        }
+        hex(&generation_math::md5(&bytes))
+    }
+
+    // Every dimension installed, in the order the server installs them at startup.
+    assert!(worldgen::init(0, crate::name_to_state), "worldgen");
+    assert!(
+        worldgen::init_dim(DimId::Nether, 0, crate::name_to_state),
+        "nether"
+    );
+    assert!(
+        worldgen::init_dim(DimId::End, 0, crate::name_to_state),
+        "end"
+    );
+    let mut gen_sources: GenSources = HashMap::new();
+    let payload = chunk_data_opt(0, 0, DimId::Overworld, &mut gen_sources, false);
+    assert!(!payload.is_empty(), "the Overworld payload is empty");
+    assert_eq!(
+        sections_digest(0, 0, Some(DimId::Overworld)),
+        PINNED,
+        "the dimension-explicit Overworld path moved the states"
+    );
+    // The dim-less (active) path is the same generator, and must answer the same states.
+    assert_eq!(sections_digest(0, 0, None), PINNED);
+
+    // The seam answers for the other two dimensions — each built by its own generator, whose
+    // window is 0/256 rather than the Overworld's -64/384 — and neither disturbs the Overworld.
+    for dimension in [DimId::Nether, DimId::End] {
+        let section = worldgen::terrain_section_dim(dimension, 0, 0, 0, crate::feature::populate)
+            .unwrap_or_else(|| panic!("{dimension:?}: no section at y=0"));
+        assert_eq!(section.len(), 4096, "{dimension:?}: section length");
+        assert_eq!(
+            worldgen::with_gen_dim(dimension, |g| (g.world_min_y, g.world_height)),
+            Some((0, 256)),
+            "{dimension:?}: the registry answers with that dimension's window"
+        );
+    }
+    assert_eq!(worldgen::active_dim(), DimId::Overworld);
+    assert_eq!((worldgen::world_min_y(), worldgen::world_height()), (-64, 384));
+    assert_eq!(sections_digest(0, 0, Some(DimId::Overworld)), PINNED);
+}
 
 /// Paired with the authenticated native 1.21.1 canSurvive matrix, not an
 /// independently guessed all-block survival model. It is compiled only with
@@ -7147,4 +7228,3 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     chests().lock().unwrap().remove(&ContainerKey::Block(ender_key(&v1.uuid)));
     set_block(ender_b.0, ender_b.1, ender_b.2, 0);
 }
-

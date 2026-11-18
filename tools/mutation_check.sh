@@ -3589,6 +3589,23 @@ check "chest_contract_3d_ender_chest_counts_anchor_openers" \
   '            if false && matches!(a, ContainerKey::Block(ek) if is_ender_key(ek)) && b.is_none() {' \
   tick_tests::chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break
 
+# P2-3-S1: the per-dimension registry must select the dimension it is asked for. Routing
+# every `with_gen_dim` back to the Overworld leaves the Overworld green and makes the Nether and
+# the End answer with the Overworld's window (-64/384, sky light) instead of their own
+# (0/256, no sky light), so the dimension test has to notice.
+check "p2_3_s1_with_gen_dim_selects_the_dimension_it_was_asked_for" \
+  src/worldgen.rs '    gen_lock_dim(dimension).as_mut().map(f)' \
+  '    gen_lock_dim(DimId::Overworld).as_mut().map(f)' \
+  worldgen::wg_tests::p2_3_s1_three_dimensions_answer_independently
+
+# ...and `init_dim` must install the dimension it was asked for, not the active one: written into
+# the Overworld's slot, the Nether's generator is unreachable by name while the Overworld holds
+# Nether terrain, which is the same silent substitution one layer down.
+check "p2_3_s1_init_dim_installs_the_dimension_it_names" \
+  src/worldgen.rs '    install(dimension, seed, res, false)' \
+  '    install(DimId::Overworld, seed, res, false)' \
+  worldgen::wg_tests::p2_3_s1_three_dimensions_answer_independently
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."
