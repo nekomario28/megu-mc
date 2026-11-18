@@ -177,3 +177,22 @@ mutation check が緑であることを要求する。段 3 の perf 主張は `
 - 「速く見えた」例が 2 つあり、どちらも**計測の取り違え**だった: (a) 壊れたビルド
   （advancement のデッドロック）が 2.5 倍軽く見えた、(b) bench の 2 パス目だけ warm で
   順序仮説が 40% 良く見えた。どちらも control を足した瞬間に消えた。
+
+## 2026-11-18: 段 3 の最初のスライス（terrain のみ、実装済み）
+
+`evidence/foundation/performance/README.md` の "Parallelising the terrain stage" が測定と
+ゲートの一次記録。要点だけ:
+
+- **対象は地形ステージだけ**（density / material / aquifer / surface・deep rules）。
+  population dispatch・promotion・`hasPostProcess` マーク・feature 順序は不変。
+  carvers は引き続き直列（`±8` seed 走査が chunk 境界を越えて書くため）。
+- **既定で並列**: `MC_SPINE_GEN_JOBS`（0/1 で直列）を読む。既定は
+  `min(available_parallelism, 8)`。dump（このスライスの測定路）は既定で並列、
+  配信路（tick スレッド上で走る）は `MC_SPINE_GEN_JOBS` 指定時のみ並列 —
+  tick の latency を測っていないため。
+- **勝ちは wall clock**: terrain-only の 64 chunk dump が 2.633 → 0.557 s（8 workers、
+  4.73x）。CPU は +13%（terrain-only）。full（feature 込み）は 1.15x / CPU +88% で、
+  残りはこのスライスが直列のまま残したステージと、worker 側の `cols`/beardifier の
+  重複。`MC_SPINE_GEN_JOBS=1` が CPU 重視の比较用の逃げ道。
+- **構造キャッシュは per-thread だった**（`STARTS` / `RING_CACHE`）。per-round 共有に
+  変えた（process 全体の共有は fixture を壊すため不可、証拠は上記 README）。

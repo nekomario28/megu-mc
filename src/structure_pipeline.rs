@@ -394,6 +394,18 @@ thread_local! {
 fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32, i32)>> {
     let seed = g.wseed();
     let tag = preset_tag(g.preset);
+    let key = (seed, tag, set);
+    if let Some(round) = g.starts_round {
+        if let Some(v) = starts_rounds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&round)
+            .and_then(|m| m.rings.get(&key))
+            .cloned()
+        {
+            return v;
+        }
+    }
     if let Some(cached) = RING_CACHE.with(|c| c.borrow().get(&(seed, tag, set)).cloned()) {
         return cached;
     }
@@ -433,6 +445,16 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
         HashSet::new()
     };
     let arc = std::sync::Arc::new(chunks);
+    if let Some(round) = g.starts_round {
+        if let Some(map) = starts_rounds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&round)
+        {
+            map.rings.insert(key, arc.clone());
+        }
+        return arc;
+    }
     RING_CACHE.with(|c| {
         let mut map = c.borrow_mut();
         if map.len() > 64 {
@@ -1073,9 +1095,83 @@ struct StartsCache {
     ord: Vec<(i32, i32)>,
 }
 
+/// One parallel terrain round's structure-start cache, shared by that round's workers
+/// **and nobody else**.
+///
+/// The workers of one round scan overlapping 17x17 windows, so a per-thread cache makes
+/// them recompute the same starts: measured on the 64-chunk full dump, `chunk_starts` ran
+/// 610 times at 8 per-thread caches against 281 serial and the run cost 19.96 s instead of
+/// 7.42 s. A process-wide cache fixes the duplication but also changes what unrelated work
+/// sees (in the parallel suite it moved
+/// `tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count` over its
+/// wall-clock assertion), so the sharing is scoped to the round: created before the workers
+/// spawn, dropped after they join, and every other caller keeps the thread-local cache.
+static STARTS_ROUNDS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, RoundCache>>> =
+    std::sync::OnceLock::new();
+
+/// What one terrain round shares between its workers: the structure starts and the stronghold
+/// ring sets, both pure in their keys. Both matter — with the ring set per thread, a round
+/// that spawns fresh worker threads recomputed the whole concentric-ring scan once per
+/// thread per round, and that alone accounted for most of the 22.8 s the 64-chunk full dump
+/// cost at 5 workers (against 8.19 s serial).
+#[derive(Default)]
+struct RoundCache {
+    starts: HashMap<(u64, u8, i32, i32), std::sync::Arc<Vec<Start>>>,
+    rings: HashMap<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>,
+}
+static STARTS_NEXT_ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+type StartsRoundMap = HashMap<u64, RoundCache>;
+
+fn starts_rounds() -> &'static std::sync::Mutex<StartsRoundMap> {
+    STARTS_ROUNDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Open a round-scoped start cache and return its id (`Gen::starts_round` selects it).
+pub(crate) fn starts_round_begin() -> u64 {
+    let id = STARTS_NEXT_ROUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    starts_rounds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, RoundCache::default());
+    id
+}
+
+/// Drop a round-scoped start cache; called after the round's workers have joined.
+pub(crate) fn starts_round_end(id: u64) {
+    starts_rounds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+}
+
 fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
     let seed = g.wseed();
     let preset = preset_tag(g.preset);
+    if let Some(round) = g.starts_round {
+        let key = (seed, preset, cx, cz);
+        if let Some(v) = starts_rounds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&round)
+            .and_then(|m| m.starts.get(&key))
+            .cloned()
+        {
+            return v;
+        }
+        // Computed outside the lock: start generation reads neighbour columns and can
+        // resolve the nested beardifier rule, so holding the lock across it would serialise
+        // the round's workers.
+        let starts = std::sync::Arc::new(chunk_starts(g, cx, cz));
+        let mut rounds = starts_rounds().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = rounds.get_mut(&round) {
+            if let Some(existing) = map.starts.get(&key) {
+                return existing.clone();
+            }
+            map.starts.insert(key, starts.clone());
+        }
+        return starts;
+    }
     if let Some(v) = STARTS.with(|slot| {
         let mut cache = slot.borrow_mut();
         if cache.seed != seed || cache.preset != preset {
@@ -1122,6 +1218,10 @@ pub(crate) fn reset_cache() {
         cache.ord.clear();
     });
     RING_CACHE.with(|c| c.borrow_mut().clear());
+    starts_rounds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 // ---------------------------------------------------------------- references

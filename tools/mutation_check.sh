@@ -3290,6 +3290,22 @@ check "the vine edge pass reads the cell above, not the one below" \
   '    let above = (cell.0, cell.1 - 1, cell.2);' \
   tree::tests::the_tree_edge_pass_applies_vine_update_shape
 
+# Terrain parallel lane (lever 2: one chunk's terrain per worker). Two things have to hold for
+# the parallel arm to be worth anything, and neither is visible in a byte-identical dump: every
+# chunk of a round must actually be claimed by some worker (an off-by-one in the claim leaves
+# the tail to the serial path, which produces the same bytes, so only a "did every slot get
+# filled" assertion can see it), and a worker must fill the chunk whose columns it was handed
+# (a misaligned column slice still produces a full round of rows, just not that chunk's rows).
+check "a terrain round claims every chunk of the group" \
+  src/worldgen.rs '            let start = i * per;' \
+  '            let start = i * per + 1;' \
+  worldgen::wg_tests::terrain_prefetch_fills_more_than_one_chunk_at_a_time
+
+check "a prefetched section is consumed by its own section key" \
+  src/worldgen.rs '        let mut arr = match self.terr_c.get(&(cx, sy, cz)) {' \
+  '        let mut arr = match self.terr_c.get(&(cx, sy + 16, cz)) {' \
+  worldgen::wg_tests::a_prefetched_section_is_identical_to_the_serial_section_with_features
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

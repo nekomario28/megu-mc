@@ -206,21 +206,29 @@ impl<'a> FC<'a> {
             !self.test_no_terrain,
             "unprovided scripted world input at {x},{y},{z}"
         );
-        let (cx, cz) = (x >> 4, z >> 4);
-        if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
-            match self.g.cols(cx, cz) {
-                Some(c) => self.cc = Some((cx, cz, c)),
-                None => return 0,
-            }
-        }
         let t0 = if self.prof {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        let st = match &self.cc {
-            Some((_, _, c)) => self.g.terrain_cell(c, x, y, z),
-            None => 0,
+        // A worker may already have filled this chunk's section: the landed base row is the
+        // same answer `terrain_cell` would compute, without the cold memo behind it (see
+        // `Gen::prefetched_cell`).
+        let st = match self.g.prefetched_cell(x, y, z) {
+            Some(st) => st,
+            None => {
+                let (cx, cz) = (x >> 4, z >> 4);
+                if !matches!(&self.cc, Some((a, b, _)) if *a == cx && *b == cz) {
+                    match self.g.cols(cx, cz) {
+                        Some(c) => self.cc = Some((cx, cz, c)),
+                        None => return 0,
+                    }
+                }
+                match &self.cc {
+                    Some((_, _, c)) => self.g.terrain_cell(c, x, y, z),
+                    None => 0,
+                }
+            }
         };
         if let Some(t0) = t0 {
             READ_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);

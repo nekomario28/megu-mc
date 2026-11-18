@@ -50,7 +50,7 @@ than the spread is reported.
 | reuse one memo (scratch) + `clear()` per block instead of a fresh map | 12.0 ms vs 10.4 ms (slower: `clear()` + `mem::replace` costs more than the allocation); reverted |
 | SipHash -> multiply-xor hasher for the density memo (1.6M lookups/chunk) | 2.617/2.606/2.610 s vs 2.600/2.599/2.581 s: **-0.4%, inside the noise**; not kept |
 | compile the density-function DAG into a flat post-order instruction list, evaluated by a stack machine | 8.201 -> 7.816 s (64 chunks, interleaved 3+3, same binary, one flag): **-4.7%**, -6.0 ms/chunk; 8.065 -> 7.804 s against the pre-change binary (**-3.2%**). Kept. See the section below |
-| parallel chunk generation | not attempted: the generator holds one global `GEN` mutex, so this needs `Gen` per worker (the structure is there - all caches are per-`Gen` - but it is a larger change) |
+| parallelise terrain across chunks (one `Gen` per worker) | **landed 2026-11-18, see "Parallelising the terrain stage" below**. Terrain-only dump 2.633 -> 0.557 s at 8 workers (**4.73x**), full chunk 8.273 -> 7.164 s at 5 (**1.15x**). The win is wall clock; CPU rises (terrain-only +13%, full +88% at 5 workers, because the worker-side `cols`/beardifier work is per worker) |
 
 Conclusion (2026-11-18): the container choices are exhausted, and the number of
 density-function evaluations is the right thing to attack *within* the
@@ -197,3 +197,105 @@ So it is a count of interpreter node visits, not a work counter, and the two
 arms are not comparable by it. `WG_COUNT=1 MC_SPINE_DFSTATS=1` prints the
 per-node histogram (`DF_HITS`) that attributes the remaining interpreted visits;
 it is empty for the compiled part by construction.
+
+## Parallelising the terrain stage (2026-11-18)
+
+Lever 2, slice 1: the per-chunk **terrain** stage — density, material rules,
+aquifers, surface/deep rules — runs on a pool of scratch `Gen`s, one chunk per
+worker, and the serial stage consumes the completed section rows. Vanilla draws
+the same line: `NoiseBasedChunkGenerator.fillFromNoise` is
+`CompletableFuture.supplyAsync(..., background executor)` per chunk, gated by
+`ChunkStep`'s neighbour-status requirements (`apy.a`, `dwc.a` in the pinned jar),
+while `FEATURES` and `CARVERS` complete synchronously on the thread that popped
+the task (`dwb.h`/`dwb.g` return an already-completed future).
+
+The population dispatch, the promotion boundary, the `hasPostProcess` marks and
+the feature order are untouched: `terrain_section` still asks `feat_state` first,
+cell for cell, in the same order, and the dumps' bytes do not move.
+
+### Identity, before speed
+
+| check | result |
+|---|---|
+| 64-chunk block dump (`MC_SPINE_WG_DUMP_N=8`), full / `NOFEAT` / `NOFEAT`+`NOCARVE`, base commit `d12adb5` vs this tree | byte-identical (25,165,824 B each; sha256 `670fdfe3…` / `57101c43…` / `bb499dfb…`) |
+| the same dump at seed 12345, from a negative-origin window, the Nether (seed 4242) and the End | byte-identical |
+| `dimension_terrain` (End/Nether, seed 0 and -1), the seed-0 canonical gate (`overworld_chunk_0_0_1211`, 98,304 cells) | green |
+| matrix-v1 nether 0/128 rows (`nat-4242-nether-fortress` (-25,6), `nat-4242-nether-fossil` (-22,20)) via `port_triage` | 0 / 32,768 each |
+| mushroom window `(-25,19)+3x3`, recorded 81-pop order (`t6b/nat-nf-str`) | 0 / 294,912 (dump sha256 `97eaee35…`, the same dump the hasPostProcess page recorded) |
+| full suite | 664 passed, 1 ignored (serial and `--test-threads=8`) |
+
+The parallel path is proven to *execute* rather than assumed: `MC_SPINE_GEN_TRACE=1`
+prints one line per round (`round chunks=10 filled=10 jobs=5 sections=240 fill_ms=57`),
+and `terrain_prefetch_fills_more_than_one_chunk_at_a_time` holds a rendezvous that
+releases only once two workers are inside a chunk fill (a serial dispatch makes it
+red after a timeout instead of passing).
+
+### Measurement
+
+`MC_SPINE_GEN_JOBS` (`0`/`1` = inline, the escape hatch) else
+`min(available_parallelism, 8)`; inside a `CPUQuota=550%` unit that reports 5.
+64-chunk `MC_SPINE_WG_DUMP_N=8` dump, three interleaved runs per arm, medians,
+`phase` is the binary's own `[wgdump] ... in <t>` (the generation loop only):
+
+| workload | base | jobs=1 | jobs=5 | jobs=8 |
+|---|---|---|---|---|
+| terrain only (`NOFEAT`+`NOCARVE`) | 2.633 s / 41.1 ms·ch | 2.545 (1.03x) | **0.712 (3.70x)**, 11.1 ms·ch | **0.557 (4.73x)**, 8.7 ms·ch |
+| `NOFEAT` (terrain + carvers) | 4.292 | 4.221 (1.02x) | 3.136 (1.37x) | 2.763 (1.55x) |
+| full (features on) | 8.273 | 8.272 (1.00x) | 7.164 (1.15x) | 7.424 (1.11x) |
+
+CPU (whole process, `getrusage`) and peak RSS, medians:
+
+| workload | base | jobs=5 | jobs=8 |
+|---|---|---|---|
+| terrain only | 2.64 s / 75 MB | 2.98 s / 95 MB | 2.99 s / 105 MB |
+| `NOFEAT` | 4.34 s / 84 MB | 5.45 s / 93 MB | 5.28 s / 105 MB |
+| full | 8.32 s / 119 MB | 15.64 s / 185 MB | 20.85 s / 247 MB |
+
+So: **the terrain stage is 3.7-4.7x faster in wall clock for +13% CPU**, and the
+stages this slice deliberately leaves serial cap the rest — carvers (+18% of the
+terrain arm's CPU) and, with features on, the worker-side `cols`/beardifier work
+that the owner used to share (full: +88% CPU at 5 workers for a 1.15x wall win).
+That CPU number is the honest cost of the split and the reason `MC_SPINE_GEN_JOBS=1`
+exists. `jobs=8` is not better than `jobs=5` on the full arm: past 5 the serial
+tail is what the batch waits on.
+
+### What the split had to get right
+
+* **`cols` is where the money and the traps are.** Terrain is not just the
+  per-block loop: `cols()` (14.5 of the 44.7 ms) includes the beardifier
+  resolution, which scans a 17x17 structure-start window. Doing that per worker
+  looked free and was not — measured, the full dump went 8.36 s serial ->
+  **23.05 s at 5 workers, 39.29 s at 2** because each worker recomputed the
+  window for its own chunks.
+* **The structure caches are per *thread*, not per `Gen`.** `STARTS` and
+  `RING_CACHE` (`src/structure_pipeline.rs`) are `thread_local!`, and a round
+  spawns fresh worker threads, so a naive split recomputes them per thread *per
+  round*. They are now shared **per round** (`feature::starts_round_begin`): the
+  cache is created before the workers spawn, the owner shares it too, and it is
+  dropped when the round ends. Process-wide sharing was tried first and rejected
+  by the suite: `dimension_terrain_matches_all_native_fixture_states` failed on
+  the Nether seed -1 row (`(-994,89,538)`: 19460 vs 5849), because a start's value
+  depends on the context it was first computed in (`FC` reads go through the
+  feature layer, and a beardifier resolution sees preliminary columns). 281
+  `chunk_starts` calls per run (the serial number) at every worker count is the
+  gate that the sharing is neither duplicating nor losing work.
+* **The feature layer reads terrain the terrain pass used to warm.**
+  `deep_c`/`aq_lv`/`prelim_c` are per-`Gen` memos; a feature read against a cold
+  owner memo re-runs the material/aquifer rules. `Gen::prefetched_cell` answers
+  that read from the landed row instead.
+* **The delivery path stays opt-in.** Its prefetch runs on the tick thread, and a
+  round of chunks built while the tick waits is a *latency* change:
+  `tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count`
+  (whose assertion is "40 ticks cost microseconds against a 1 s period") left its
+  boundary once the whole suite ran the delivery path on 8 workers. The offline
+  dump is what this slice measures and it is the default; the server arm needs a
+  tick-latency measurement, not a throughput one, before it flips.
+
+### Gates
+
+`terrain_prefetch_fills_more_than_one_chunk_at_a_time` (concurrency, plus every
+chunk of a round claimed), `prefetched_terrain_rows_match_the_serial_fill_at_any_worker_count`
+(bytes per section for jobs 1/2/8), `a_prefetched_section_is_identical_to_the_serial_section_with_features`
+(the composed boundary, features included). Two mutation entries hold the
+dispatch able to fail (`MUTATION_STABILITY=1`, both red/red/green): an off-by-one
+in the worker's first claim, and a section consumed under the next section's key.

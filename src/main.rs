@@ -17554,40 +17554,81 @@ fn window_batch(view: i32) -> usize {
 // the window parameters are read together every batch; a struct would add a
 // name without removing a parameter
 #[expect(clippy::too_many_arguments)]
-/// Worker count for terrain prefetch: `MC_SPINE_GEN_WORKERS` (0/1 = inline), else the
-/// smaller of 4 and the machine's parallelism. Terrain is pure, so this only trades
-/// threads for wall time and never changes what is generated.
+/// Worker count for terrain prefetch: `MC_SPINE_GEN_JOBS` (0/1 = inline), else
+/// `min(available_parallelism, 8)`. Terrain is pure, so this only trades threads for wall
+/// time and never changes what is generated; the count itself is owned by
+/// `worldgen::terrain_jobs` so the dump path and the delivery path cannot disagree.
+///
+/// The parallel arm is the **default**. It used to be opt-in on the grounds that
+/// `WARM=1 load_compare.sh` measured CPU 21.9 s -> 23.3 s with 4 workers, and CPU seconds
+/// are what that lane measures; that stands as a measurement of *CPU*, and the trade it
+/// describes is the one this change takes deliberately: the same work, spread over
+/// threads, with wall clock down several times and CPU slightly up. `MC_SPINE_GEN_JOBS=1`
+/// restores the serial arm for a CPU-sensitive comparison.
 fn gen_workers() -> usize {
-    if let Some(v) = crate::trace_env::env_str!("MC_SPINE_GEN_WORKERS") {
-        if let Ok(n) = v.trim().parse::<usize>() {
-            return n;
-        }
-    }
-    // Default 1 (inline). Measured with `WARM=1 load_compare.sh`: 4 workers moved CPU
-    // 21.9 s -> 23.3 s (the work is the same; duplicated cold caches and thread setup
-    // cost a little) while the isolated terrain benchmark scales 17.1 -> 4.5 ms/chunk.
-    // CPU seconds are what M3 measures, so parallel terrain stays opt-in until a
-    // latency/TPS metric shows the trade is worth it.
-    1
+    worldgen::terrain_jobs()
 }
 
-/// Generate the batch's terrain on scratch generators before the sequential send loop
-/// touches it, so `chunk_cols`/`terrain_section` hit `col_c` instead of holding `GEN`
-/// for 11 ms per chunk. Features stay inside the sequential loop: their order is pinned.
-fn prefetch_batch_terrain(news: &[(i32, i32)]) {
-    let workers = gen_workers();
-    if workers <= 1 || news.len() <= 1 {
+/// How many chunks one prefetch round covers: two per worker, so a round has a second
+/// chunk ready when a worker finishes its first. At most `2 * 8 = 16` chunks, i.e. 6 MiB
+/// of base rows (`worldgen::TERRAIN_STORE_BOUND` holds 8 MiB).
+fn terrain_group(workers: usize) -> usize {
+    (workers * 2).max(1)
+}
+
+/// Worker count for the **delivery** path's terrain prefetch, which runs on the tick thread.
+///
+/// Opt-in (`MC_SPINE_GEN_JOBS`), unlike the offline dump path. Reason, measured on this
+/// host: the delivery path's prefetch runs between the client's batch and the send loop, so
+/// a round of chunks is built while the tick thread waits. That is a *latency* change to the
+/// tick, and it moved `tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count`
+/// — whose assertion is "40 ticks cost microseconds against a 1 s period" — over its
+/// boundary once the suite ran the whole delivery path on 8 workers. The offline dump is
+/// what this slice measures and it is default; the delivery arm stays a flag until a
+/// tick-latency measurement (not a throughput one) says it is safe.
+fn delivery_prefetch_jobs() -> usize {
+    std::env::var("MC_SPINE_GEN_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+/// Build the group's **base terrain** off the lock, in parallel, and hand it to the
+/// generator: the columns each chunk's feature pass will read, plus the section rows the
+/// send loop is about to ask for.
+///
+/// Features stay inside the sequential loop: their order is pinned, they read other
+/// chunks' writes, and the population discipline is a serial demand scan. Only the
+/// terrain half — density, material rules, aquifers, surface rules — is parallel, and it is
+/// a pure function of the immutable data and the seed (vanilla draws the same line:
+/// `NoiseBasedChunkGenerator.fillFromNoise` runs on the background executor while
+/// `FEATURES`/`CARVERS` complete synchronously on the thread that popped the task).
+fn prefetch_terrain_group(
+    news: &[(i32, i32)],
+    lo: i32,
+    hi: i32,
+    workers: usize,
+    round: u64,
+) {
+    if workers <= 1 || news.is_empty() {
         return;
     }
     let Some(data) = worldgen::data_snapshot() else {
         return;
     };
-    let cols: Vec<((i32, i32), std::sync::Arc<worldgen::ChunkCols>)> =
-        worldgen::prefetch_cols(&data, news, workers)
-            .into_iter()
-            .filter_map(|(k, c)| c.map(|c| (k, c)))
-            .collect();
-    let _ = worldgen::with_gen(|g| g.install_cols(cols));
+    let resolver = worldgen::with_gen(|g| g.beard_resolver()).flatten();
+    let cols = worldgen::prefetch_cols_with(&data, resolver, news, workers, Some(round));
+    let chunks = worldgen::prefetch_terrain(
+        &data,
+        resolver,
+        news,
+        &cols,
+        lo,
+        hi,
+        workers,
+        Some(round),
+    );
+    let _ = worldgen::with_gen(|g| g.install_prefetched(chunks));
 }
 
 fn stream_chunks(
@@ -17660,29 +17701,49 @@ fn stream_chunks(
     for c in &news {
         sent.insert(*c);
     }
-    // Terrain for the whole batch is pure per chunk, so it is computed off the lock
-    // before the send loop; everything after it (features, overlays, encoding) stays
-    // sequential in the order the client is served.
-    prefetch_batch_terrain(&news);
+    // Terrain is pure per chunk, so a group of the batch is built off the lock before the
+    // send loop touches it; everything after it (features, overlays, encoding) stays
+    // sequential in the order the client is served. The group size is bounded so the base
+    // rows in `terr_c` cannot outgrow their store.
     let _ = send_packet(s, 0x0d, vec![]);
     let mut dirty: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-    for (cx, cz) in &news {
-        if send_packet(s, 0x27, map_chunk(*cx, *cz, gen)).is_err() {
-            return;
+    let delivery_workers = delivery_prefetch_jobs();
+    let delivery_round = (delivery_workers > 1).then(crate::feature::starts_round_begin);
+    if let Some(round) = delivery_round {
+        let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
+    }
+    for chunk_group in news.chunks(terrain_group(delivery_workers)) {
+        if let Some(round) = delivery_round {
+            prefetch_terrain_group(
+                chunk_group,
+                MIN_Y,
+                MIN_Y + 384 - 16,
+                delivery_workers,
+                round,
+            );
         }
-        for n in light_dirty_for(gen, *cx, *cz) {
-            dirty.insert(n);
+        for (cx, cz) in chunk_group {
+            if send_packet(s, 0x27, map_chunk(*cx, *cz, gen)).is_err() {
+                return;
+            }
+            for n in light_dirty_for(gen, *cx, *cz) {
+                dirty.insert(n);
+            }
+            let snap: Vec<(SignKey, SignLines)> = signs()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((sx, _, sz, _), _)| sx.div_euclid(16) == *cx && sz.div_euclid(16) == *cz)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            for ((sx, sy, sz, front), lines) in snap {
+                let _ = send_packet(s, 0x07, sign_entity_pkt(sx, sy, sz, front, &lines));
+            }
         }
-        let snap: Vec<(SignKey, SignLines)> = signs()
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((sx, _, sz, _), _)| sx.div_euclid(16) == *cx && sz.div_euclid(16) == *cz)
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
-        for ((sx, sy, sz, front), lines) in snap {
-            let _ = send_packet(s, 0x07, sign_entity_pkt(sx, sy, sz, front, &lines));
-        }
+    }
+    if let Some(round) = delivery_round {
+        let _ = worldgen::with_gen(|g| g.starts_round = None);
+        crate::feature::starts_round_end(round);
     }
     // A neighbour lit before this batch could not see the emitters generated now, so its light is
     // recomputed and re-sent. `light_dirty_for` limits this to held chunks a new emitter can
@@ -26897,9 +26958,26 @@ fn main() {
             };
             let mut out: Vec<u8> = Vec::new();
             let t1 = Instant::now();
-            for dz in 0..n {
-                for dx in 0..n {
-                    let (cx, cz) = (ox + dx, oz + dz);
+            // The request box, in the dump's own order (dz outer, dx inner). One group of
+            // chunks has its base terrain built in parallel before the serial section loop
+            // touches it; the feature pass stays in that loop, in this order.
+            let keys: Vec<(i32, i32)> = (0..n)
+                .flat_map(|dz| (0..n).map(move |dx| (ox + dx, oz + dz)))
+                .collect();
+            let dump_workers = gen_workers();
+            let dump_round = (dump_workers > 1).then(crate::feature::starts_round_begin);
+            // The owner shares the round's start cache too: it computes the same starts while
+            // the feature layer runs, and recomputing them per chunk was the rest of the
+            // duplicated cost (measured: 9.72 s with the workers-only sharing against 7.16 s
+            // when the owner shared as well, on the 64-chunk full dump).
+            if let Some(round) = dump_round {
+                let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
+            }
+            for chunk_group in keys.chunks(terrain_group(dump_workers)) {
+                if let Some(round) = dump_round {
+                    prefetch_terrain_group(chunk_group, lo, hi, dump_workers, round);
+                }
+                for &(cx, cz) in chunk_group {
                     let mut sy = lo;
                     while sy <= hi {
                         let arr = worldgen::terrain_section(cx, sy, cz, crate::feature::populate)
@@ -26910,6 +26988,10 @@ fn main() {
                         sy += 16;
                     }
                 }
+            }
+            if let Some(round) = dump_round {
+                let _ = worldgen::with_gen(|g| g.starts_round = None);
+                crate::feature::starts_round_end(round);
             }
             std::fs::write(&path, &out).unwrap();
             if let Ok(canon_path) = std::env::var("MC_SPINE_WG_DUMP_CANON") {

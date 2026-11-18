@@ -764,6 +764,11 @@ pub struct Gen {
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     col_ord: Vec<(i32, i32)>,
+    /// The parallel terrain round this generator belongs to, if any: selects that round's
+    /// shared structure-start cache instead of the thread-local one. `Gen` cannot name the
+    /// cache's type (it lives above this layer), so the round is a number here; see
+    /// `feature::starts_round_begin`.
+    pub(crate) starts_round: Option<u64>,
     /// `ChunkGenerator.getBaseColumn` columns: the noise-only answer a structure's
     /// `findGenerationPoint` scans. Keyed like `col_c` but *not* interchangeable with
     /// it: a base column has no beardifier and no surface rule, so it is pure in
@@ -780,6 +785,14 @@ pub struct Gen {
     /// structure's heightmap query) must not resolve again, or it would describe
     /// terrain shaped by the structure it is trying to place.
     beard_depth: u32,
+    /// Base (feature-free) section rows a worker already built, keyed like a section
+    /// `(cx, sy, cz)` and consumed by `terrain_section`, which then applies the feature
+    /// layer serially. This is the landing site for cross-chunk parallel terrain
+    /// (`specs/chunk-parallelism`, lever 2): the rows are a pure function of the
+    /// immutable data and the seed, so a scratch generator produces the same array the
+    /// world generator would. Bounded by `TERRAIN_STORE_BOUND`.
+    terr_c: HashMap<(i32, i32, i32), Box<[u32; 4096]>>,
+    terr_ord: std::collections::VecDeque<(i32, i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
     feat_c: HashMap<(i32, i32), HashMap<u32, u32>>,
     /// Container contents staged by template placement during feature population.
@@ -861,6 +874,12 @@ const CARVE_WG_BOUND: usize = 4096;
 /// Chunks whose FEATURES-layer bucket (`feat_c` + `pop_done`) stays resident. Unchanged
 /// by the chunk-state repair: it is a cache of block writes, not of stage identity.
 const FEATURE_BUCKET_BOUND: usize = 384;
+
+/// Base terrain sections (`terr_c`) retained for chunks a worker has already filled:
+/// 512 x 16 KiB = 8 MiB. One prefetched group is at most `2 * jobs` chunks (24 sections
+/// each), so the store does not have to evict a row its consumer is about to read; the
+/// bound exists so a caller that prefetches without consuming cannot grow it.
+const TERRAIN_STORE_BOUND: usize = 512;
 
 /// One chunk's carve stage — the record that replaces the three containers that used to
 /// describe it (`carved`, `wg_after_carve`, `wg_after_carve_ord`).
@@ -1177,12 +1196,15 @@ impl Gen {
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
             col_ord: Vec::new(),
+            starts_round: None,
             base_c: HashMap::new(),
             base_ord: std::collections::VecDeque::new(),
             beard_c: HashMap::new(),
             beard_ord: std::collections::VecDeque::new(),
             beard_resolver: None,
             beard_depth: 0,
+            terr_c: HashMap::new(),
+            terr_ord: std::collections::VecDeque::new(),
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
@@ -3638,6 +3660,68 @@ pub fn generation_seq() -> u64 {
 /// test modules (`worldgen::wg_tests`' own `lock_gen` still uses it too).
 static GEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// A test-only rendezvous the terrain workers pass through, so a test can *prove* two
+/// chunk fills overlapped instead of inferring it from elapsed time.
+///
+/// `prefetch_terrain` calls [`parallel_probe::arrive`] at the start of every chunk claim.
+/// With `expect = 2`, the first worker to arrive blocks until a second one is inside the
+/// same window; if the dispatch were serial the wait times out and the probe records that
+/// failure rather than hanging the suite.
+#[cfg(test)]
+pub(crate) mod parallel_probe {
+    use std::sync::{Condvar, Mutex};
+
+    struct Rendezvous {
+        expect: usize,
+        arrived: usize,
+        timed_out: bool,
+    }
+
+    static RENDEZVOUS: Mutex<Option<Rendezvous>> = Mutex::new(None);
+    static CV: Condvar = Condvar::new();
+    /// How long the first arrival waits for the second before recording a timeout.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub(crate) fn arm(expect: usize) {
+        *RENDEZVOUS.lock().unwrap() = Some(Rendezvous {
+            expect,
+            arrived: 0,
+            timed_out: false,
+        });
+    }
+
+    /// Called by a worker at the start of a chunk fill. Blocks until `expect` workers are
+    /// inside this window; a timeout records the failure instead of hanging.
+    pub(crate) fn arrive() {
+        let mut guard = RENDEZVOUS.lock().unwrap();
+        let Some(r) = guard.as_mut() else { return };
+        r.arrived += 1;
+        CV.notify_all();
+        if r.arrived >= r.expect {
+            return;
+        }
+        let (mut guard, timed_out) = CV.wait_timeout(guard, WAIT).unwrap();
+        if timed_out.timed_out() {
+            if let Some(r) = guard.as_mut() {
+                r.timed_out = true;
+            }
+            CV.notify_all();
+        }
+    }
+
+    /// Disarm and report `(arrived, timed_out)`.
+    pub(crate) fn disarm() -> (usize, bool) {
+        let mut guard = RENDEZVOUS.lock().unwrap();
+        let out = guard
+            .as_ref()
+            .map(|r| (r.arrived, r.timed_out))
+            .unwrap_or((0, false));
+        *guard = None;
+        CV.notify_all();
+        out
+    }
+}
+
 /// `GEN`'s lock, timing how long a caller waited for it and how long it held it.
 ///
 /// The parallelization decision needs this split: `FEAT_PROFILE` can say how much
@@ -4085,26 +4169,196 @@ pub fn prefetch_cols(
     keys: &[(i32, i32)],
     workers: usize,
 ) -> Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)> {
-    if workers <= 1 || keys.len() <= 1 {
-        return keys
-            .iter()
-            .map(|&(cx, cz)| ((cx, cz), chunk_cols_scratch(data, cx, cz)))
-            .collect();
+    keys.iter()
+        .copied()
+        .zip(prefetch_cols_with(data, None, keys, workers, None))
+        .collect()
+}
+
+/// [`prefetch_cols`] with the owner's per-generator beardifier resolver, for a world whose
+/// columns must resolve structures the way the owner generator would.
+pub(crate) fn prefetch_cols_with(
+    data: &std::sync::Arc<GenData>,
+    resolver: Option<BeardResolver>,
+    keys: &[(i32, i32)],
+    workers: usize,
+    starts_round: Option<u64>,
+) -> Vec<Option<std::sync::Arc<ChunkCols>>> {
+    let mut out: Vec<Option<std::sync::Arc<ChunkCols>>> = keys.iter().map(|_| None).collect();
+    if keys.is_empty() {
+        return out;
     }
-    let mut out: Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)> =
-        keys.iter().map(|&k| (k, None)).collect();
+    if workers <= 1 || keys.len() <= 1 {
+        match resolver {
+            Some(resolver) => {
+                let mut g = Gen::fresh_scratch(data.clone());
+                g.starts_round = starts_round;
+                g.set_beard_resolver(resolver);
+                for (slot, &(cx, cz)) in out.iter_mut().zip(keys) {
+                    *slot = g.cols(cx, cz);
+                }
+            }
+            None => {
+                for (slot, &(cx, cz)) in out.iter_mut().zip(keys) {
+                    *slot = chunk_cols_scratch(data, cx, cz);
+                }
+            }
+        }
+        return out;
+    }
     let per = keys.len().div_ceil(workers);
     std::thread::scope(|s| {
-        for slice in out.chunks_mut(per) {
+        for (kslice, slice) in keys.chunks(per).zip(out.chunks_mut(per)) {
             s.spawn(move || {
-                for (key, slot) in slice.iter_mut() {
-                    *slot = chunk_cols_scratch(data, key.0, key.1);
+                let mut g = Gen::fresh_scratch(data.clone());
+                g.starts_round = starts_round;
+                if let Some(resolver) = resolver {
+                    g.set_beard_resolver(resolver);
+                }
+                for (slot, &(cx, cz)) in slice.iter_mut().zip(kslice) {
+                    *slot = g.cols(cx, cz);
                 }
             });
         }
     });
     out
 }
+
+/// One chunk's base terrain, built by a worker: its columns plus the section rows the
+/// consumer will read. `cols` is what the serial path would have had in `col_c`, so the
+/// feature pass on the owner does not rebuild it per chunk.
+pub(crate) struct PrefetchedTerrain {
+    pub key: (i32, i32),
+    pub cols: std::sync::Arc<ChunkCols>,
+    pub rows: Vec<((i32, i32, i32), Box<[u32; 4096]>)>,
+}
+
+/// Build the base terrain rows of `keys` on `jobs` scratch generators, one chunk per job
+/// claim, without the world lock.
+///
+/// Lever 2 of `evidence/foundation/performance/README.md`: terrain is a pure function of
+/// the immutable data and the seed, so chunks are independent and can be filled while the
+/// owner keeps `GEN`. This is exactly the half vanilla runs on its background executor —
+/// `NoiseBasedChunkGenerator.fillFromNoise` is `CompletableFuture.supplyAsync(…, background
+/// executor)` per chunk, gated by `ChunkStep`'s neighbour-status requirements
+/// (`apis`, `ChunkGenerationTask`, in `dwc.a`/`apy.a`), while `FEATURES` and `CARVERS`
+/// complete synchronously on the thread that popped the task (`dwb.h`/`dwb.g` return an
+/// already-completed future). The feature layer therefore stays on the serial path: this
+/// function produces base terrain only.
+///
+/// `cols` is the already-built column set per key (from [`prefetch_cols_with`]), so the
+/// rows reuse it instead of computing it a second time.
+///
+/// A worker that panics leaves its keys as `None` (the consumer builds those chunks
+/// inline) and gets a fresh generator; it never poisons the owner's `GEN`.
+pub(crate) fn prefetch_terrain(
+    data: &std::sync::Arc<GenData>,
+    resolver: Option<BeardResolver>,
+    keys: &[(i32, i32)],
+    cols: &[Option<std::sync::Arc<ChunkCols>>],
+    lo: i32,
+    hi: i32,
+    jobs: usize,
+    starts_round: Option<u64>,
+) -> Vec<Option<PrefetchedTerrain>> {
+    let mut out: Vec<Option<PrefetchedTerrain>> = keys.iter().map(|_| None).collect();
+    if keys.is_empty() {
+        return out;
+    }
+    let started = std::time::Instant::now();
+    let jobs = jobs.max(1).min(keys.len());
+    // Each worker claims one contiguous slice, so a chunk's columns and its result slot are
+    // addressed by the same index and nothing is shared.
+    let per = keys.len().div_ceil(jobs).max(1);
+    std::thread::scope(|s| {
+        for (i, oslice) in out.chunks_mut(per).enumerate() {
+            let start = i * per;
+            let end = (start + per).min(keys.len());
+            let kslice = &keys[start..end];
+            let cslice = &cols[start..end];
+            s.spawn(move || {
+                let mut g = Gen::fresh_scratch(data.clone());
+                g.starts_round = starts_round;
+                if let Some(resolver) = resolver {
+                    g.set_beard_resolver(resolver);
+                }
+                for ((&key, cols), slot) in kslice.iter().zip(cslice).zip(oslice.iter_mut()) {
+                    #[cfg(test)]
+                    parallel_probe::arrive();
+                    let filled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        g.build_terrain_rows(key.0, key.1, lo, hi, cols.clone())
+                    }));
+                    match filled {
+                        Ok(Some((cc, rows))) => {
+                            *slot = Some(PrefetchedTerrain {
+                                key,
+                                cols: cc,
+                                rows,
+                            })
+                        }
+                        // No columns for this chunk: the owner answers 0 for it today, so
+                        // leave the slot empty and let the serial path do the same.
+                        Ok(None) => {}
+                        Err(_) => {
+                            // The generator may hold a half-updated cache after a panic;
+                            // discard it rather than hand it the next chunk.
+                            g = Gen::fresh_scratch(data.clone());
+                            if let Some(resolver) = resolver {
+                                g.set_beard_resolver(resolver);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    // `MC_SPINE_GEN_TRACE=1`: one line per round, so a run can show the parallel path
+    // actually executed instead of assuming it did (a bit-identical dump is produced by
+    // the serial fallback too).
+    if env_flag!("MC_SPINE_GEN_TRACE") {
+        let filled = out.iter().filter(|c| c.is_some()).count();
+        eprintln!(
+            "[terrain] round chunks={} filled={} jobs={} sections={} fill_ms={:.1}",
+            keys.len(),
+            filled,
+            jobs,
+            out.iter()
+                .filter_map(|c| c.as_ref().map(|c| c.rows.len()))
+                .sum::<usize>(),
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    out
+}
+
+/// The parallel terrain worker count.
+///
+/// `MC_SPINE_GEN_JOBS` (0 or 1 = run inline) wins; the older name `MC_SPINE_GEN_WORKERS`
+/// still selects a count. The default is `min(available_parallelism, TERRAIN_MAX_JOBS)`:
+/// terrain is what the whole generation costs (§"Baseline" in the performance README) and
+/// the win is wall clock, not CPU — one chunk per worker is what vanilla does, so the
+/// parallel arm is the default and the environment variable is the escape hatch.
+pub fn terrain_jobs() -> usize {
+    if let Some(v) = env_str!("MC_SPINE_GEN_JOBS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    if let Some(v) = env_str!("MC_SPINE_GEN_WORKERS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .min(TERRAIN_MAX_JOBS)
+}
+
+/// Ceiling on the default worker count. Beyond this the group's serial tail (the feature
+/// layer, overlays and encoding) is what the batch waits on, and each worker costs one
+/// `Gen`'s caches of RSS.
+pub const TERRAIN_MAX_JOBS: usize = 8;
 
 /// Is this chunk's `ChunkCols` already in the generator's cache? Diagnostic only: it
 /// tells whether a caller that asks for columns also pays for their generation.
@@ -4212,12 +4466,15 @@ impl Gen {
             bioq_ord: std::collections::VecDeque::new(),
             col_c: HashMap::new(),
             col_ord: Vec::new(),
+            starts_round: None,
             base_c: HashMap::new(),
             base_ord: std::collections::VecDeque::new(),
             beard_c: HashMap::new(),
             beard_ord: std::collections::VecDeque::new(),
             beard_resolver: None,
             beard_depth: 0,
+            terr_c: HashMap::new(),
+            terr_ord: std::collections::VecDeque::new(),
             feat_c: HashMap::new(),
             staged_payloads: Vec::new(),
             feat_ord: Vec::new(),
@@ -4259,6 +4516,108 @@ impl Gen {
             }
             self.col_c.insert((cx, cz), arc);
         }
+    }
+
+    /// This generator's own beardifier resolver, for a worker that has to build the same
+    /// columns the owner would (a test's per-generator override, not the global one).
+    pub(crate) fn beard_resolver(&self) -> Option<BeardResolver> {
+        self.beard_resolver
+    }
+
+    /// Base (feature-free) rows for one section: the terrain half of `block_state_at`,
+    /// with the columns already fetched.
+    fn base_section_rows(
+        &mut self,
+        cc: &ChunkCols,
+        cx: i32,
+        sy: i32,
+        cz: i32,
+    ) -> Box<[u32; 4096]> {
+        let mut arr = Box::new([0u32; 4096]);
+        for ly in 0..16i32 {
+            let y = sy + ly;
+            for lz in 0..16i32 {
+                for lx in 0..16i32 {
+                    arr[((ly << 8) | (lz << 4) | lx) as usize] =
+                        self.terrain_cell(cc, cx * 16 + lx, y, cz * 16 + lz);
+                }
+            }
+        }
+        arr
+    }
+
+    /// Fill every section of `[lo, hi]` for one chunk on this (scratch) generator.
+    /// `cols` lets a caller that already prefetched the chunk's columns reuse them; a
+    /// missing column set is built here, which is the serial reference path.
+    pub(crate) fn build_terrain_rows(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        lo: i32,
+        hi: i32,
+        cols: Option<std::sync::Arc<ChunkCols>>,
+    ) -> Option<(
+        std::sync::Arc<ChunkCols>,
+        Vec<((i32, i32, i32), Box<[u32; 4096]>)>,
+    )> {
+        let cc = match cols {
+            Some(c) => c,
+            None => self.cols(cx, cz)?,
+        };
+        let mut rows = Vec::new();
+        let mut sy = lo;
+        while sy <= hi {
+            rows.push(((cx, sy, cz), self.base_section_rows(&cc, cx, sy, cz)));
+            sy += 16;
+        }
+        Some((cc, rows))
+    }
+
+    /// Land a worker's base rows in the store `terrain_section` reads, with the same FIFO
+    /// eviction the other caches use. A section already in the store is left alone: both
+    /// copies are the same pure result.
+    fn install_terrain_rows(
+        &mut self,
+        rows: Vec<((i32, i32, i32), Box<[u32; 4096]>)>,
+    ) {
+        for (key, arr) in rows {
+            if self.terr_c.contains_key(&key) {
+                continue;
+            }
+            self.terr_ord.push_back(key);
+            while self.terr_ord.len() > TERRAIN_STORE_BOUND {
+                if let Some(old) = self.terr_ord.pop_front() {
+                    self.terr_c.remove(&old);
+                }
+            }
+            self.terr_c.insert(key, arr);
+        }
+    }
+
+    /// The prefetched base terrain state of one cell, if a worker already built its section.
+    ///
+    /// The feature stage reads terrain cells that the terrain pass used to have warmed
+    /// (`deep_c`, `aq_lv`, `prelim_c`) on the same generator. When the pass runs on a
+    /// worker, those memos live on the worker, so a feature read would re-run the material
+    /// and aquifer rules against a cold cache: measured on the 64-chunk full dump,
+    /// `full - nofeat` (the feature stage) went 3.97 s serial -> 19.7 s at 5 terrain
+    /// workers. The landed row is that same cell's base state, so answering from it keeps
+    /// the feature stage's cost where it was.
+    pub(crate) fn prefetched_cell(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let rows = self.terr_c.get(&(x >> 4, y & !15, z >> 4))?;
+        rows.get((((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize)
+            .copied()
+    }
+
+    /// Install a prefetch round: the workers' base rows, and the columns they built, so
+    /// the serial feature/carver pass reads `col_c` instead of rebuilding them per chunk.
+    pub(crate) fn install_prefetched(&mut self, chunks: Vec<Option<PrefetchedTerrain>>) {
+        let mut cols = Vec::new();
+        for chunk in chunks.into_iter().flatten() {
+            cols.push((chunk.key, chunk.cols));
+            self.install_terrain_rows(chunk.rows);
+        }
+        self.install_cols(cols);
     }
 
     /// Set this generator's beardifier resolver.
@@ -6007,27 +6366,60 @@ pub fn block_state(
 
 /// Base terrain states for one 16x16x16 section, in the send layout
 /// `(ly << 8) | (lz << 4) | lx`, with one GEN lock for the whole section.
+///
+/// The section is built in two halves, and only the first one is ever parallel:
+///
+/// 1. **terrain** — density, material rules, aquifers, surface/deep rules. A pure
+///    function of the immutable data and the seed, so a worker's scratch generator
+///    gives the same array (see [`prefetch_terrain`]); a row a worker already built is
+///    taken from `terr_c` instead of recomputed here.
+/// 2. **the feature layer** — `feat_state` first, exactly as `block_state_at` did, so a
+///    feature write still wins over terrain, the population dispatch still happens at the
+///    first cell of the section in the same order, and the marks it files are unchanged.
+///    A base cell is computed even where a feature later overrides it; that is work the
+///    parallel half absorbs, and it is why the two halves can be separated at all.
 pub fn terrain_section(
     cx: i32,
     sy: i32,
     cz: i32,
-    mut populate: impl FnMut(&mut Gen, i32, i32),
+    populate: impl FnMut(&mut Gen, i32, i32),
 ) -> Option<Box<[u32; 4096]>> {
     let mut gg = gen_lock();
-    let g = gg.as_mut()?;
-    let mut arr = Box::new([0u32; 4096]);
-    for ly in 0..16i32 {
-        let y = sy + ly;
-        for lz in 0..16i32 {
-            for lx in 0..16i32 {
-                let x = cx * 16 + lx;
-                let z = cz * 16 + lz;
-                arr[((ly << 8) | (lz << 4) | lx) as usize] =
-                    g.block_state_at(x, y, z, &mut populate);
+    gg.as_mut()?.terrain_section_at(cx, sy, cz, populate).into()
+}
+
+impl Gen {
+    /// [`terrain_section`] for one generator, without taking `GEN`. The two halves are
+    /// described there; this is the same body so a test can compare a prefetched arm and
+    /// a serial arm on two independent generators.
+    pub(crate) fn terrain_section_at(
+        &mut self,
+        cx: i32,
+        sy: i32,
+        cz: i32,
+        mut populate: impl FnMut(&mut Gen, i32, i32),
+    ) -> Box<[u32; 4096]> {
+        let mut arr = match self.terr_c.get(&(cx, sy, cz)) {
+            Some(rows) => rows.clone(),
+            None => match self.cols(cx, cz) {
+                Some(cc) => self.base_section_rows(&cc, cx, sy, cz),
+                None => Box::new([0u32; 4096]),
+            },
+        };
+        for ly in 0..16i32 {
+            let y = sy + ly;
+            for lz in 0..16i32 {
+                for lx in 0..16i32 {
+                    let x = cx * 16 + lx;
+                    let z = cz * 16 + lz;
+                    if let Some(st) = self.feat_state(x, y, z, &mut populate) {
+                        arr[((ly << 8) | (lz << 4) | lx) as usize] = st;
+                    }
+                }
             }
         }
+        arr
     }
-    Some(arr)
 }
 
 /// feature-layer override lookup (populates 3x3 chunks lazily on first touch)
@@ -9691,6 +10083,137 @@ mod wg_tests {
             let cc = fresh.cols(cx, cz).expect("cached cols");
             assert_eq!(cols_fingerprint(&cc), reference[i]);
         }
+    }
+
+    /// Lever 2 (`evidence/foundation/performance/README.md`): a worker's base rows must
+    /// be the serial generator's bytes, for every worker count. If this fails, the
+    /// "terrain is pure and per-chunk independent" premise is wrong and the parallel arm
+    /// cannot ship. The column slice is checked too: a worker that fills a chunk with a
+    /// *different* chunk's columns would still produce rows, but not these bytes.
+    #[test]
+    fn prefetched_terrain_rows_match_the_serial_fill_at_any_worker_count() {
+        // A local generator, not `init`: these tests only need `GenData`, and re-initialising
+        // the process generator here (or holding its test lock) makes an unrelated
+        // wall-clock tick test flake when the suite runs with `--test-threads=8`.
+        let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        let data = std::sync::Arc::clone(&local.data);
+        let keys: Vec<(i32, i32)> = vec![(-2, -2), (0, 0), (2, 0), (0, 2), (2, 2), (-2, 2)];
+        let lo = min_y();
+        let hi = min_y() + (max_y() + 1 - min_y()) / 16 * 16 - 16;
+        // reference: one scratch generator, built cell by cell, no prefetch anywhere
+        let mut reference = Gen::fresh_scratch(data.clone());
+        let mut want_cols = Vec::new();
+        let mut want_rows = Vec::new();
+        for &(cx, cz) in &keys {
+            let (cc, rows) = reference
+                .build_terrain_rows(cx, cz, lo, hi, None)
+                .expect("reference rows");
+            want_cols.push(cols_fingerprint(&cc));
+            want_rows.push(rows);
+        }
+        for jobs in [1usize, 2, 8] {
+            let cols = prefetch_cols_with(&data, None, &keys, jobs, None);
+            let got = prefetch_terrain(&data, None, &keys, &cols, lo, hi, jobs, None);
+            assert_eq!(got.len(), keys.len());
+            for (i, chunk) in got.iter().enumerate() {
+                let chunk = chunk
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("jobs {jobs}: no rows for {:?}", keys[i]));
+                assert_eq!(chunk.key, keys[i]);
+                assert_eq!(
+                    cols_fingerprint(&chunk.cols),
+                    want_cols[i],
+                    "jobs {jobs}: columns diverged at {:?}",
+                    keys[i]
+                );
+                assert_eq!(chunk.rows.len(), want_rows[i].len());
+                for (row, want) in chunk.rows.iter().zip(&want_rows[i]) {
+                    assert_eq!(row.0, want.0, "jobs {jobs}: section key");
+                    assert_eq!(
+                        row.1.as_slice(),
+                        want.1.as_slice(),
+                        "jobs {jobs}: bytes diverged at {:?} section {}",
+                        keys[i],
+                        row.0 .1
+                    );
+                }
+            }
+        }
+    }
+
+    /// The composed boundary: `terrain_section` returns the same bytes whether a worker
+    /// prefetched the base rows or the section was built inline, **including** the serial
+    /// feature layer on top. Two independent generators, same seed and data.
+    ///
+    /// It deliberately does **not** register the beardifier resolver: the
+    /// `dimension_terrain` fixtures below are unbearded captures and pass only while no
+    /// earlier test in the process has registered one (`overworld_chunk_matches_native_
+    /// capture_state_for_state` registers it, and sorts after them). Registering it here
+    /// made that fixture fail on the Nether seed `-1` row (`(-994, 89, 538)`: 19460 vs
+    /// 5849) — a pre-existing order dependence in the fixture, not this lane's business to
+    /// fix, but this test must not trip it. The bearded path is covered by the identity
+    /// dumps, which run in a process whose entry point registers the resolver.
+    #[test]
+    fn a_prefetched_section_is_identical_to_the_serial_section_with_features() {
+        let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        let data = std::sync::Arc::clone(&local.data);
+        let keys = [(0, 0), (1, 0)];
+        let lo = min_y();
+        let hi = min_y() + (max_y() + 1 - min_y()) / 16 * 16 - 16;
+        let cols = prefetch_cols_with(&data, None, &keys, 2, None);
+        let prefetched = prefetch_terrain(&data, None, &keys, &cols, lo, hi, 2, None);
+        let mut serial = Gen::fresh_scratch(data.clone());
+        let mut parallel = Gen::fresh_scratch(data.clone());
+        parallel.install_prefetched(prefetched);
+        for &(cx, cz) in &keys {
+            let mut sy = lo;
+            while sy <= hi {
+                let a = serial.terrain_section_at(cx, sy, cz, crate::feature::populate);
+                let b = parallel.terrain_section_at(cx, sy, cz, crate::feature::populate);
+                assert_eq!(
+                    a.as_slice(),
+                    b.as_slice(),
+                    "chunk ({cx},{cz}) section {sy}: the prefetched arm differs from the serial one"
+                );
+                sy += 16;
+            }
+        }
+    }
+
+    /// The dispatch is parallel, not merely thread-shaped: two chunk fills are inside the
+    /// worker window at the same time. The probe releases only once two workers have
+    /// arrived, so a serial dispatch makes this test red (after its timeout) instead of
+    /// hanging. `keys.len()` is deliberately not divisible by `jobs`: a work partition
+    /// that rounds down would silently leave the last chunks to the serial path.
+    #[test]
+    fn terrain_prefetch_fills_more_than_one_chunk_at_a_time() {
+        let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        let data = std::sync::Arc::clone(&local.data);
+        let keys = [(0, 0), (2, 0), (4, 0), (6, 0), (8, 0)];
+        let jobs = 3usize;
+        let cols = prefetch_cols_with(&data, None, &keys, jobs, None);
+        parallel_probe::arm(2);
+        let got = prefetch_terrain(&data, None, &keys, &cols, min_y(), min_y() + 15, jobs, None);
+        let (arrived, timed_out) = parallel_probe::disarm();
+        let missing = got.iter().filter(|c| c.is_none()).count();
+        assert!(missing == 0, "{missing} of {} keys were left to the serial path", keys.len());
+        assert!(arrived >= 2, "only {arrived} worker(s) entered the fill window");
+        assert!(
+            !timed_out,
+            "the first worker waited for a second and none came: the dispatch is serial"
+        );
+    }
+
+    /// The default arm is parallel and bounded; the escape hatch is documented on
+    /// `terrain_jobs`. This pins the ceiling, because a default that opened one thread per
+    /// core would put one `Gen`'s caches of RSS per core on a shared host.
+    #[test]
+    fn the_default_terrain_worker_count_is_bounded() {
+        assert!(TERRAIN_MAX_JOBS <= 8);
+        assert!(terrain_jobs() <= TERRAIN_MAX_JOBS.max(1));
     }
 
     /// Terrain throughput by worker count. `FEAT_PROFILE`-gated, and not a server
