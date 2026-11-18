@@ -1029,6 +1029,11 @@ check "simple double plants write both halves" \
   src/feature.rs '                    for (dy, half) in [(0, "lower"), (1, "upper")] {' \
   '                    for (dy, half) in [(0, "lower")] {' \
   feature::generation_contract_tests::simple_block_places_both_halves_or_neither
+check "fresh-generation mushrooms do not infer shade from a canopy" \
+  src/generation_providers.rs '            reg.in_tag(below, "minecraft:mushroom_grow_block")' \
+  '            is_dirtish(reg, below)' \
+  feature::generation_contract_tests::mushrooms_in_fresh_generation_need_the_special_substrate
+
 check "mushroom canSurvive asks isSolidRender, not the dirt tag" \
   src/generation_providers.rs '                || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))' \
   '                || (uninitialized_raw_brightness(ctx) < 13 && true)' \
