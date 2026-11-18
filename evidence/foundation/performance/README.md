@@ -465,3 +465,158 @@ zeroed rebuild on a `terr_c` miss, and a counter attributed from process state.
 The full suite: 719 passed, 1 ignored, and the two failures that also fail at
 `0fa6807` on this host (`tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count`,
 `worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock`).
+
+## M3 P3a: the carver stage — dense write map, prefetched reads, the parallel 3x3 ring (2026-11-19)
+
+`NOFEAT` was 3.216 s at five terrain workers against 0.789 s terrain-only, so
+**~75% of the gap was `apply_carvers`** — and that stage ran entirely on the thread
+that popped the task. Vanilla is the same shape (`CARVERS` completes synchronously,
+`dwb.g`), so this is a port-side split, not a vanilla one, and everything it touches
+has to be proven identical.
+
+`src/feature.rs` only:
+
+1. **Dense `CarveRun::out`.** The write map was `HashMap<(u8, i32, u8), u32>` with one
+   hash per cell read and one allocation per cell written; it is now a `Vec<u32>` of
+   `height * 256` (`u32::MAX` = not written) plus `out_order`, the flat indices in
+   **first-write order**. Reads are one bounds check and one load; the trace count, the
+   `CELL`/`WCELL` probe dumps, the WG-heightmap scan and the `feat_write` commit all
+   read the same two fields.
+2. **`prefetched_cell` fast path** for a read that lands on a cell this run has not
+   written: one map lookup into the owner's landed base rows instead of a cold
+   material/aquifer/deep-rule evaluation. Two gates, both identity, not cost — the
+   position must be *inside* this chunk (the write folds `& 15`, the terrain read does
+   not), and it must be *above the carver's lava level* (`carve_state` returns there
+   without asking the aquifer, so the flag the terrain read writes is the one the mark
+   gate reads).
+3. **Origin-carver cache.** `apply_carvers_body` resolves `biome_name_at` for all 289
+   origins of the `17x17` scan per chunk. That is a pure function of
+   `(generation_seq, world seed, preset, ox, oz)` and `creg()` is `&'static`, so the
+   resolved `(name, carver list)` pair is kept per thread (FIFO cap 4096) as static
+   borrows.
+4. **Parallel 3x3 ring.** `populate_body` carved `(sx,sz)` and then its eight
+   neighbours on one thread. With `terrain_jobs() > 1` and no carver diagnostic env
+   var set, the ring's chunks are now claimed on the owner in the same order
+   (`begin_carve`), carved on `min(jobs, claims)` scoped workers (one scratch `Gen`
+   each, reading the owner's prefetched rows), and committed on the owner in claim
+   order. A panicking worker leaves its chunk to the owner; the claim is already made,
+   so it is re-run rather than dropped.
+
+### Identity, before speed
+
+| check | result |
+|---|---|
+| 64-chunk block dump (`MC_SPINE_WG_DUMP_N=8`), full / `NOFEAT` / `NOFEAT`+`NOCARVE` × `jobs` 1/5/8 | byte-identical to `3135354` (sha256 `670fdfe3…` / `57101c43…` / `bb499dfb…`, 25,165,824 B each) in every run below, both trees |
+| `m3_p3a_carver_serial_vs_parallel_bit_identical` | serial ring (1 worker) vs parallel ring (4): same writes, same 512-cell WG heightmaps, same mark order over all nine chunks |
+| `m3_p3a_dense_out_matches_sparse_writes` | dense `out` + prefetched reads vs the `terrain_cell`-only path (no prefetched rows installed): same writes, WG heightmaps and mark order |
+| `m3_p3a_prefetch_refuses_out_of_chunk_and_lava_level_cells` | the two gates, one assertion each, with the neighbour's base row installed so the out-of-chunk check can fail |
+| `wg_heightmap_keeps_the_carved_top_and_ignores_the_feature_layer` (existing) | still green — and it now runs the dense `out` through the fixture adapter, so it gates the rewritten scan |
+| full suite | 726 passed, 0 failed, 1 ignored |
+
+The parallel arm is proven to *execute*: the two arms produce the same bytes, so
+`CARVE_RING_WORKERS` (a `cfg(test)` counter incremented in the spawned closure) is
+what tells them apart — the test requires `>= 2` there and `0` for the serial arm.
+
+### Measurement
+
+64-chunk `MC_SPINE_WG_DUMP_N=8` dump at seed 0, `CPUQuota=250%`, `MemoryMax=3G`, base
+`3135354` against this tree, **interleaved** runs of the same arm pair (three per
+configuration, six for `NOFEAT` at five workers), medians:
+
+| workload | jobs=1 | jobs=5 | jobs=8 |
+|---|---|---|---|
+| terrain only (`NOFEAT`+`NOCARVE`) | — | 1.277 → 1.271 | — |
+| `NOFEAT` (terrain + carvers) | 5.666 → 5.626 | **3.814 → 3.518** (−7.7%) | 3.732 → 3.343 (−10.4%) |
+| full (features on) | 9.895 → 9.898 | 9.902 → 9.325 (−5.8%) | 12.804 → 12.037 (−6.0%) |
+
+The spread on this host is real and large: the six `NOFEAT`/`jobs=5` samples were
+3.639–4.026 for the base and 3.206–3.893 for this tree (minima 3.639 → 3.206, −12%),
+and an earlier three-run batch of the same pair measured 3.980 → 3.376 (−15%). Read
+the direction and the minimum, not the last digit. Every arm's dump sha256 is the
+recorded one, so no accuracy was traded for the time.
+
+The one- and five-worker arms of the *full* workload move the same way, and the
+`jobs=1` arms are flat by construction: at one worker `carve_ring` is the serial loop
+it replaced, and what remains of the change is the dense map and the prefetch.
+
+### What limits the win
+
+An M5 counter check says where the carver stage's time actually is: it is not the
+carve, it is `cols`. `carve` at `jobs=5`/`NOFEAT` on the base build is 2,386 ms over
+1,210 calls (1,109 of them early exits through `begin_carve`), and the stage's 159
+owner-side `cols` builds at ~14 ms each account for almost all of it. So the split
+that matters is *where the chunk columns are built*, not where the ellipsoid walk
+runs. Building them in the claim loop — the first version of this change — measured
+**3.67 s against 3.59 s**: it parallelised the cheap half and left the expensive one on
+the owner. Claiming first and letting each worker build its own chunk's columns
+(moved: M1 `cols built` owner 159 → 98, worker 64 → 131) is what produced the numbers
+above.
+
+The ring is also a thin source of parallelism: its nine positions are mostly already
+claimed by the previous populate, so 64 populates claim 100 distinct chunks (the
+`10x10` window around the `8x8` request) — ~1.6 uncarved chunks each in raster order.
+A per-ring counter (temporary, not in the tree) recorded 19 rings with 3–9 claims and
+102 with 0–1, i.e. **most of the ring's work has nothing to run in parallel**. That,
+not the worker count, is the ceiling: raising `jobs` past the claim count cannot help,
+and carving a wider ring to expose more chunks would change the carve order (and with
+it the mark order), which this slice refuses to do.
+
+Two smaller measured facts:
+
+* The prefetch fast path answers only ~2–5% of carver reads on this dump
+  (`M3 prefetch_hit` 4,909 / miss 306,593 at one worker; 16,063 / 295,439 at five).
+  The ring carves a chunk as a neighbour of an earlier populate, i.e. *before* its own
+  terrain group is prefetched — the same structural mismatch that keeps the feature
+  layer's hit rate low. It is kept because it is neutral here (measured: disabling it
+  entirely moved nothing outside the noise) and it is the right answer whenever the
+  rows are resident.
+* `carver`'s M5 duration is **not** comparable across this change: the parallel arm
+  times each claim on the worker that ran it and flushes per thread, so the owner's
+  figure now covers only the single-claim rings. Use the wall clock and the `M1`/`M2`
+  counts above.
+
+### What the split had to get right
+
+* **Nothing a carve reads is another chunk's carve output.** `carve_state`,
+  `top_material_at` and `terrain_cell` read `data`, the column build (with
+  `starts_round` and the beard resolver) and the generator's own memos — never
+  `feat_c` (`Gen::feature_override`'s only caller is `FC::get`, which is the feature
+  layer's read). The workers therefore copy `starts_round` and the owner's
+  `beard_resolver`, and read the owner's landed base rows through `prefetched_cell`.
+* **The commit order is the claim order.** Writes, marks and WG heightmaps are handed
+  back per chunk and committed in the order `begin_carve` accepted them, so
+  `feat_c`'s bucket order and the mark buckets see what the serial ring produced.
+* **`shouldScheduleFluidUpdate` is stale on purpose.** `carve_state` returns at or
+  below the lava level without touching the aquifer flag, exactly as
+  `WorldCarver.getCarveState`'s `LAVA` arm does, and `carve_block`'s mark gate reads
+  that flag. A prefetched read skips the `terrain_cell` write that would have set it,
+  which is why the fast path refuses those cells (gate 2 above) — the unit test pins
+  it with the real `lava_level` out of the carver registry.
+* **The worker's columns come back with the output** (`Gen::install_cols`), so the
+  owner's `col_c` is as warm as the serial ring left it for the feature stage and the
+  section fill that follow.
+
+### Reproduce
+
+```sh
+D=$PWD/target/perf && mkdir -p "$D"
+for jobs in 1 5 8; do
+  for arm in "" MC_SPINE_NOFEAT=1; do
+    systemd-run --user --scope -p CPUQuota=250% -p MemoryMax=3G --collect \
+      env MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=$D/d.bin MC_SPINE_WG_DUMP_N=8 \
+          MC_SPINE_GEN_JOBS=$jobs $arm ./target/release/mc-spine
+    sha256sum "$D/d.bin"
+  done
+done
+# 670fdfe3… full, 57101c43… MC_SPINE_NOFEAT=1, bb499dfb… +MC_SPINE_NOCARVE=1
+MC_SPINE_M3_PROFILE=1 MC_SPINE_NOFEAT=1 MC_SPINE_GEN_JOBS=5 ./target/release/mc-spine
+```
+
+### Gates
+
+The three `m3_p3a_*` tests in `src/feature.rs` (no `#[ignore]`). All three were
+mutation-checked and went red: returning a perturbed state from the prefetch fast
+path (both parity tests), dropping the lava-level gate and dropping the
+out-of-chunk gate (the gate test, each with its own message). `bash tools/layers_check.sh`
+and `bash tools/debt_ratchet.sh` pass; the full suite is 726 passed, 0 failed,
+1 ignored (`cargo test --offline --locked -j 2`, 187 s).

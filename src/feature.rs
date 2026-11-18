@@ -8394,9 +8394,107 @@ fn canyon_y(shape: CanyonShape, r: &mut Lcg, y_scale: f64, branch_count: f32, i:
     f as f64 * y_scale * (r.next_f32() * 0.25 + 0.75) as f64
 }
 
+/// The carver list of one origin chunk, resolved from the biome at its minimum corner.
+///
+/// `creg()` is `&'static`, so an entry is two static borrows and copying it is free. The
+/// lookup behind it (`biome_name_at`: a quart sample plus one `String` clone) is a pure
+/// function of the generator's data and seed, and the `17x17` origin scan repeats it across
+/// adjacent chunks, so it is resolved once per origin and kept.
+type OriginCarvers = Option<(&'static str, &'static [String])>;
+
+/// How many origin chunks one thread keeps resolved. The scan is 289 entries per chunk and a
+/// run walks chunks in raster order, so a few rows of the window is all any thread re-reads;
+/// the cap only keeps a long run from growing without bound.
+const ORIGIN_CARVERS_CAP: usize = 4096;
+
+struct OriginCarversCache {
+    /// `(generation_seq, world seed, preset)`. `generation_seq` is bumped by every `init`, so
+    /// a replacement generator, a reseed or another dimension cannot answer from the previous
+    /// one's entries: the biome source is a function of exactly these three.
+    ctx: (u64, u64, NoisePreset),
+    map: HashMap<(i32, i32), OriginCarvers>,
+    order: std::collections::VecDeque<(i32, i32)>,
+}
+
+impl Default for OriginCarversCache {
+    fn default() -> Self {
+        Self {
+            // `GEN_SEQ` starts at 1, so the first lookup always takes the miss path and a
+            // cache can never answer before it knows which generator it belongs to.
+            ctx: (0, 0, NoisePreset::Overworld),
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+thread_local! {
+    /// Per thread, not shared: the answer is pure, so two threads resolving the same origin
+    /// is duplicated work and never a disagreement, while a process-wide map would serialise
+    /// the 289 lookups every chunk makes (including every carver worker's).
+    static ORIGIN_CARVERS: std::cell::RefCell<OriginCarversCache> =
+        std::cell::RefCell::new(OriginCarversCache::default());
+}
+
+/// The carver list of origin chunk `(ox, oz)`, resolved once per (generator, seed, preset,
+/// origin).
+fn origin_carvers(g: &mut Gen, ox: i32, oz: i32) -> OriginCarvers {
+    let ctx = (crate::worldgen::generation_seq(), g.wseed(), g.preset);
+    ORIGIN_CARVERS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.ctx != ctx {
+            cache.ctx = ctx;
+            cache.map.clear();
+            cache.order.clear();
+        }
+        if let Some(hit) = cache.map.get(&(ox, oz)) {
+            return *hit;
+        }
+        // Resolving through a worker's scratch generator is the same answer: the biome source
+        // reads the immutable data and the seed and only fills this generator's own memo.
+        let resolved = g.biome_name_at(ox * 16, 0, oz * 16).and_then(|biome| {
+            creg()
+                .biome
+                .get_key_value(&biome)
+                .map(|(name, list)| (name.as_str(), list.as_slice()))
+        });
+        cache.map.insert((ox, oz), resolved);
+        cache.order.push_back((ox, oz));
+        while cache.order.len() > ORIGIN_CARVERS_CAP {
+            if let Some(old) = cache.order.pop_front() {
+                cache.map.remove(&old);
+            }
+        }
+        resolved
+    })
+}
+
+/// The prefetched base state of one cell: the owner generator a worker carves for, else the
+/// generator being carved (`None`).
+#[inline]
+fn prefetched_cell(g: &Gen, pref: Option<&Gen>, x: i32, y: i32, z: i32) -> Option<u32> {
+    match pref {
+        Some(pref) => pref.prefetched_cell(x, y, z),
+        None => g.prefetched_cell(x, y, z),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-side proof that the prefetch fast path in [`CarveRun::read`] answered at least one
+    /// cell: a bit-identical result is produced by the `terrain_cell` fallback too, so identity
+    /// alone does not show the new path ran (rules CV1).
+    static CARVE_PREFETCH_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-side proof that [`carve_ring_parallel`] really spawned workers: the serial and the
+/// parallel arm produce the same bytes, so the comparison alone cannot say which one ran.
+#[cfg(test)]
+static CARVE_RING_WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// One target chunk's carving state: the shared mask, the cells written so far,
 /// and the `CarvingContext` facts the carve reads (world bounds, floor level).
-struct CarveRun {
+struct CarveRun<'a> {
     tx: i32,
     tz: i32,
     min_y: i32,
@@ -8404,8 +8502,22 @@ struct CarveRun {
     /// `floor_level` of the carver being applied: `skip` rejects cells at or
     /// below it, and vanilla builds that predicate once per carve call.
     floor: f64,
+    /// `lava_level` of the carver being applied, set before its first read: see
+    /// [`CarveRun::read`] for why the prefetch fast path refuses a cell at or below it.
+    lava: i32,
     mask: Vec<u64>,
-    out: HashMap<(u8, i32, u8), u32>,
+    /// The cells written so far, indexed by [`CarveRun::idx`], with `u32::MAX` for "not
+    /// written". This used to be a `HashMap<(lx, y, lz), u32>`: the carver reads one cell per
+    /// block it considers, so every read paid a hash and every write an allocation.
+    out: Vec<u32>,
+    /// The written indices in first-write order. A rewrite of the same cell updates `out`
+    /// without appending, so this is the exact write set the stage reports, scans for the WG
+    /// heightmaps and then commits to `feat_c`, in the order the carvers made the writes.
+    out_order: Vec<u32>,
+    /// The generator whose prefetched base rows answer a cell this run has not written
+    /// (`None`: the generator being carved). A worker's scratch generator has no prefetch of
+    /// its own, so its owner supplies the answers (see [`prefetched_cell`]).
+    pref: Option<&'a Gen>,
     /// Probe mode: pretend every cell is stone and every aquifer sample is cave
     /// air, and print the writes. That is the world `CarverProbe.java` gives
     /// vanilla, so the two cell sets can be compared without a worldgen behind
@@ -8423,10 +8535,46 @@ struct CarveRun {
     shape_marks: Vec<(i32, i32, i32)>,
 }
 
-impl CarveRun {
+impl<'a> CarveRun<'a> {
+    /// An empty run for `(tx, tz)`: no writes, no mask bits, probe off.
+    fn empty(g: &Gen, pref: Option<&'a Gen>, tx: i32, tz: i32) -> Self {
+        let (min_y, height) = (g.min_y, g.height);
+        Self {
+            tx,
+            tz,
+            min_y,
+            height,
+            floor: 0.0,
+            // No carver has run yet, so no cell is at or below a lava level this run knows:
+            // the first `carve_block` sets it before its first read.
+            lava: min_y - 1,
+            mask: vec![0u64; (height as usize * 256).div_ceil(64)],
+            out: vec![u32::MAX; height as usize * 256],
+            out_order: Vec::new(),
+            pref,
+            probe: false,
+            probe_air: breg().map_or(12959, |b| b.state_of("minecraft:cave_air", None)),
+            probe_lava: breg().map_or(96, |b| b.state_of("minecraft:lava", None)),
+            mark: None,
+            shape_marks: Vec::new(),
+        }
+    }
     #[inline]
     fn idx(&self, lx: i32, y: i32, lz: i32) -> usize {
         (((y - self.min_y) << 8) | ((lz & 15) << 4) | (lx & 15)) as usize
+    }
+    /// [`CarveRun::idx`] when `y` is inside the tracked window, which is the mask's window.
+    ///
+    /// Every `carve_block` call site is clamped inside it (`y1` stops at `min_y + height - 8`
+    /// and `y0` at `min_y + 1`, and the second write is one below), so this never rejects a
+    /// cell the run would have written: it turns a position that has no write to see into the
+    /// same answer the old map's missing key gave, instead of an index past the array.
+    #[inline]
+    fn slot(&self, lx: i32, y: i32, lz: i32) -> Option<usize> {
+        if y < self.min_y || y >= self.min_y + self.height {
+            return None;
+        }
+        Some(self.idx(lx, y, lz))
     }
     #[inline]
     fn mask_get(&self, lx: i32, y: i32, lz: i32) -> bool {
@@ -8437,6 +8585,34 @@ impl CarveRun {
     fn mask_set(&mut self, lx: i32, y: i32, lz: i32) {
         let i = self.idx(lx, y, lz);
         self.mask[i >> 6] |= 1 << (i & 63);
+    }
+    /// The cell this run has written, if it has: the fold (`& 15`) is inside [`CarveRun::idx`].
+    #[inline]
+    fn written(&self, lx: i32, y: i32, lz: i32) -> Option<u32> {
+        let i = self.slot(lx, y, lz)?;
+        let st = self.out[i];
+        (st != u32::MAX).then_some(st)
+    }
+    /// Record a carve write: the first write to a cell appends its index, later ones only
+    /// replace the state (the commit order is the order of first writes).
+    #[inline]
+    fn put(&mut self, lx: i32, y: i32, lz: i32, st: u32) {
+        if let Some(i) = self.slot(lx, y, lz) {
+            if self.out[i] == u32::MAX {
+                self.out_order.push(i as u32);
+            }
+            self.out[i] = st;
+        }
+    }
+    /// The local position a flat index stands for, inverting [`CarveRun::idx`].
+    #[inline]
+    fn pos_of(&self, i: u32) -> (i32, i32, i32) {
+        let i = i as usize;
+        (
+            (i & 15) as i32,
+            self.min_y + (i >> 8) as i32,
+            ((i >> 4) & 15) as i32,
+        )
     }
     /// The chunk's block state as the carver sees it: cells carved earlier in
     /// this pass, else the surface-rule terrain.
@@ -8449,10 +8625,31 @@ impl CarveRun {
         // are judged against this chunk's block at the folded position. Reading
         // the neighbour's terrain instead (tried 2026-10-22) changes nothing and
         // is not what the bytecode does.
-        match self.out.get(&((x & 15) as u8, y, (z & 15) as u8)) {
-            Some(&st) => st,
-            None => g.terrain_cell(cc, x, y, z),
+        if let Some(st) = self.written(x, y, z) {
+            return st;
         }
+        // A base row a worker already built is the state `terrain_cell` would compute, for
+        // one map lookup instead of a cold material/aquifer/deep-rule evaluation (see
+        // `Gen::prefetched_cell`). Two gates, both about identity:
+        //
+        // * the cell must be *of this chunk*. The fold above applies to the write and to the
+        //   write's read, but the terrain read below hands `terrain_cell` the unfolded
+        //   position (`aq_state`/`block_density` see it), so answering a folded out-of-chunk
+        //   position from this chunk's rows would substitute another cell's state.
+        // * the cell must be above `lava`. `carve_state` returns without asking the aquifer at
+        //   or below the lava level, so `shouldScheduleFluidUpdate` keeps whatever the last
+        //   writer left there and `carve_block`'s mark gate reads it — at or below the level
+        //   the flag this read writes *is* the one the gate sees. Above it, `carve_state`
+        //   always calls `aq_state`, which writes the flag, so a prefetched read that skips
+        //   the write cannot be observed.
+        if y > self.lava && (x >> 4) == self.tx && (z >> 4) == self.tz {
+            if let Some(st) = prefetched_cell(g, self.pref, x, y, z) {
+                #[cfg(test)]
+                CARVE_PREFETCH_READS.with(|c| c.set(c.get() + 1));
+                return st;
+            }
+        }
+        g.terrain_cell(cc, x, y, z)
     }
 }
 
@@ -8470,9 +8667,8 @@ impl CarveRun {
 /// * `CARVE_ONLY=<carver id>` — run a single carver (cave / canyon / …).
 /// * `CARVE_DUMP_WRITES=<tx,tz>` — print the real (terrain-filtered) writes.
 pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
-    // M3 P1a M5: the carver stage is still serial, so its cost is part of the tail the rest of
-    // the batch waits on. The body has several early exits; the wrapper is how every one of
-    // them is timed without moving them.
+    // M3 P1a M5: the carver stage is the tail the rest of the batch waits on. The body has
+    // several early exits; the wrapper is how every one of them is timed without moving them.
     let t0 = crate::worldgen::m3_start();
     apply_carvers_body(g, tx, tz);
     crate::worldgen::m3_elapsed(
@@ -8494,36 +8690,266 @@ fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32) {
     if !g.begin_carve(tx, tz) {
         return;
     }
+    let out = compute_carve_chunk(g, None, &cc, tx, tz);
+    commit_carve(g, out);
+}
+
+/// The carver stage of one populate: the chunk, then the `3x3` around it.
+///
+/// Vanilla carves the whole decoration area before decorating the centre, so a feature may
+/// read a neighbour's carver air. `begin_carve` makes the later per-chunk populate a no-op for
+/// its own carver stage, so the ring is carved once and the claims are made in the order the
+/// serial loop made them — which is also the order the outputs are committed in.
+fn carve_ring(g: &mut Gen, sx: i32, sz: i32) {
+    carve_ring_with(g, sx, sz, crate::worldgen::terrain_jobs());
+}
+
+/// [`carve_ring`] with the worker count passed in, so the serial and parallel arms are the same
+/// function with one argument different (a test can compare them in one process: the
+/// environment is read once per call site and cannot be changed after that).
+fn carve_ring_with(g: &mut Gen, sx: i32, sz: i32, jobs: usize) {
+    let mut order: Vec<(i32, i32)> = Vec::with_capacity(9);
+    order.push((sx, sz));
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if dx != 0 || dz != 0 {
+                order.push((sx + dx, sz + dz));
+            }
+        }
+    }
+    // A diagnostic that prints per-cell lines is ordered by the carver call it came from, so
+    // it runs on one thread: interleaved lines from eight workers would not be the same trace.
+    if jobs <= 1 || carver_diag_env() {
+        for (tx, tz) in order {
+            apply_carvers(g, tx, tz);
+        }
+        return;
+    }
+    carve_ring_parallel(g, &order, jobs);
+}
+
+/// `true` when a carver diagnostic that prints per-carver or per-cell lines is on.
+fn carver_diag_env() -> bool {
+    env_flag!("MC_SPINE_NOCARVE")
+        || env_flag!("CARVE_TRACE")
+        || env_str!("CARVE_PROBE").is_some()
+        || env_str!("CARVE_DUMP_WRITES").is_some()
+        || env_str!("CARVE_RNG").is_some()
+        || env_str!("CARVE_SRC").is_some()
+        || env_flag!("CV_TRACE")
+        || env_str!("CV_TUN").is_some()
+        || env_flag!("MC_SPINE_NOFOLD")
+}
+
+/// Carve the ring's chunks on `jobs` worker threads, the same work [`carve_ring`] does on one.
+///
+/// The claims are made on the owner first (they are the owner's state, and the order is what
+/// the commit order follows); each worker then carves its share on its own scratch generator,
+/// reading the owner's prefetched base terrain, and the results are committed on the owner in
+/// claim order. Nothing a carve reads is another chunk's carve output — `carve_state`,
+/// `top_material_at` and `terrain_cell` read `data`, `starts_round` and the beard resolver,
+/// never `feat_c` — so the split cannot change the answer, only its schedule.
+fn carve_ring_parallel(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
+    // The same gates `apply_carvers_body` applies, once for the whole ring: a run that skips
+    // carvers or has no carver registry must not claim anything.
+    if env_flag!("MC_SPINE_NOCARVE") {
+        return;
+    }
+    let reg = creg();
+    if reg.cfg.is_empty() || reg.biome.is_empty() || breg().is_none() {
+        return;
+    }
+    // Claim first, and claim *only*: the columns a carve needs are most of the stage's cost,
+    // so building them here would leave the arm serial. Each worker builds its own chunk's
+    // columns and hands them back through the commit (`Gen::install_cols`), which keeps the
+    // owner's `col_c` as warm as the serial ring left it.
+    let mut claims: Vec<(i32, i32)> = Vec::with_capacity(order.len());
+    for &(tx, tz) in order {
+        if g.begin_carve(tx, tz) {
+            claims.push((tx, tz));
+        }
+    }
+    if claims.len() < 2 {
+        // The claim is already made, so the chunks cannot go through `apply_carvers` again
+        // (it would see its own claim and return): carve them here instead.
+        for (tx, tz) in claims {
+            carve_claimed(g, tx, tz);
+        }
+        return;
+    }
+    let jobs = jobs.min(claims.len());
+    let mut results: Vec<Option<CarveSlot>> = claims.iter().map(|_| None).collect();
+    {
+        // `Gen` is `Sync` and a worker only *reads* the owner's prefetched base rows: the
+        // landed row is the state `terrain_cell` would compute, and nothing a worker writes
+        // reaches the owner until the commit below.
+        let owner: &Gen = &*g;
+        let per = claims.len().div_ceil(jobs).max(1);
+        let mut start = 0usize;
+        std::thread::scope(|s| {
+            for slice in results.chunks_mut(per) {
+                let cslice = &claims[start..start + slice.len()];
+                start += slice.len();
+                s.spawn(move || {
+                    #[cfg(test)]
+                    CARVE_RING_WORKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // M3 P1a M1/M4: everything this thread does is off-owner work.
+                    crate::worldgen::m3_set_worker(true);
+                    let mut scratch = Gen::fresh_scratch(owner.data.clone());
+                    scratch.starts_round = owner.starts_round;
+                    if let Some(resolver) = owner.beard_resolver() {
+                        scratch.set_beard_resolver(resolver);
+                    }
+                    for (slot, &(tx, tz)) in slice.iter_mut().zip(cslice) {
+                        let t0 = crate::worldgen::m3_start();
+                        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            match scratch.cols(tx, tz) {
+                                Some(cc) => {
+                                    let out = compute_carve_chunk(
+                                        &mut scratch,
+                                        Some(owner),
+                                        &cc,
+                                        tx,
+                                        tz,
+                                    );
+                                    Some((out, cc))
+                                }
+                                // No columns for this chunk: the serial body returns before
+                                // claiming it, and a carve of it writes nothing either way.
+                                None => None,
+                            }
+                        }));
+                        crate::worldgen::m3_elapsed(
+                            crate::worldgen::M3_CARVER_NS,
+                            crate::worldgen::M3_CARVER_N,
+                            t0,
+                        );
+                        match got {
+                            Ok(Some((out, cc))) => *slot = Some(CarveSlot::Carved(out, cc)),
+                            Ok(None) => *slot = Some(CarveSlot::NoColumns),
+                            // The claim is already made, so a panicking worker leaves its
+                            // chunk to the owner (re-run after the scope). The generator may
+                            // hold a half-updated memo after a panic, so it is replaced
+                            // rather than handed the next chunk.
+                            Err(_) => {
+                                scratch = Gen::fresh_scratch(owner.data.clone());
+                                scratch.starts_round = owner.starts_round;
+                                if let Some(resolver) = owner.beard_resolver() {
+                                    scratch.set_beard_resolver(resolver);
+                                }
+                            }
+                        }
+                    }
+                    // The meter is per thread: without this the workers' counts die with
+                    // them and the report under-counts exactly the stage being measured.
+                    crate::worldgen::m3_flush();
+                });
+            }
+        });
+    }
+    // The commit order is the claim order, so the writes, the marks and the WG heightmaps
+    // land exactly where the serial ring put them.
+    for (i, &(tx, tz)) in claims.iter().enumerate() {
+        match results[i].take() {
+            Some(CarveSlot::Carved(out, cc)) => {
+                // The worker built this chunk's columns; land them so the owner does not
+                // rebuild what the ring already has (a no-op if it holds them).
+                g.install_cols(vec![((tx, tz), cc)]);
+                commit_carve(g, out)
+            }
+            Some(CarveSlot::NoColumns) => {}
+            // A worker panicked: the claim is ours, so the chunk is carved here instead.
+            None => carve_claimed(g, tx, tz),
+        }
+    }
+}
+
+/// What a worker left in its slot: the carve, or the chunk it could not build columns for.
+enum CarveSlot {
+    Carved(CarveOutput, std::sync::Arc<ChunkCols>),
+    NoColumns,
+}
+
+/// Carve one already-claimed chunk on the owner and commit it, timed as one carver call.
+///
+/// This is the arm a single-claim ring takes, and the fallback a panicking worker leaves
+/// behind; the timing covers the column build too, which is what the worker side times.
+fn carve_claimed(g: &mut Gen, tx: i32, tz: i32) {
+    let t0 = crate::worldgen::m3_start();
+    let Some(cc) = g.cols(tx, tz) else {
+        return;
+    };
+    let out = compute_carve_chunk(g, None, &cc, tx, tz);
+    crate::worldgen::m3_elapsed(
+        crate::worldgen::M3_CARVER_NS,
+        crate::worldgen::M3_CARVER_N,
+        t0,
+    );
+    commit_carve(g, out);
+}
+
+/// Everything one chunk's carver pass produces, before it is committed onto an owner.
+struct CarveOutput {
+    tx: i32,
+    tz: i32,
+    wg: Box<[i32; 512]>,
+    shape_marks: Vec<(i32, i32, i32)>,
+    /// The stage's block writes as world positions, in first-write order: `feat_c`'s buckets
+    /// are keyed by local position, so the order they are inserted in is the order the
+    /// carvers made the writes.
+    out_writes: Vec<(i32, i32, i32, u32)>,
+}
+
+/// Hand one chunk's carve output to the owner that owns its `carve_c` and `feat_c`.
+fn commit_carve(g: &mut Gen, out: CarveOutput) {
+    let CarveOutput {
+        tx,
+        tz,
+        wg,
+        shape_marks,
+        out_writes,
+    } = out;
+    g.set_wg_after_carve(tx, tz, wg);
+    // The marks are the positions the carver *aimed* at, filed by
+    // `ChunkAccess.markPosForPostprocessing` on the chunk being carved. A write more than a
+    // chunk away folds (`x & 15`) into this chunk's array, and the mark folds with it, because
+    // vanilla stores the mark as the same packed local offset — so the folded absolute
+    // position is the faithful one to file.
+    for (x, y, z) in shape_marks {
+        g.store_shape_mark_from(x, y, z, crate::worldgen::MarkSrc::Carver);
+    }
+    for (x, y, z, st) in out_writes {
+        g.feat_write(x, y, z, st);
+    }
+}
+
+/// Carve one claimed chunk and return what the owner has to record.
+///
+/// `g` does the carving (a worker's scratch generator when the ring runs in parallel); `pref`
+/// is the generator whose prefetched base rows answer its reads, `None` meaning `g` itself.
+fn compute_carve_chunk(
+    g: &mut Gen,
+    pref: Option<&Gen>,
+    cc: &ChunkCols,
+    tx: i32,
+    tz: i32,
+) -> CarveOutput {
+    let reg = creg();
     let trace = env_flag!("CARVE_TRACE");
     let here = format!("{tx},{tz}");
     let probe_env = env_str!("CARVE_PROBE");
     let probe_here = probe_env == Some("all") || probe_env == Some(&here);
     let dump_here = env_str!("CARVE_DUMP_WRITES") == Some(here.as_str());
     let only = env_str!("CARVE_ONLY");
-    let (min_y, height, wseed) = (g.min_y, g.height, g.wseed());
-    let mut run = CarveRun {
-        tx,
-        tz,
-        min_y,
-        height,
-        floor: 0.0,
-        mask: vec![0u64; (height as usize * 256).div_ceil(64)],
-        out: HashMap::new(),
-        probe: probe_here,
-        probe_air: breg().map_or(12959, |b| b.state_of("minecraft:cave_air", None)),
-        probe_lava: breg().map_or(96, |b| b.state_of("minecraft:lava", None)),
-        mark: None,
-        shape_marks: Vec::new(),
-    };
+    let wseed = g.wseed();
+    let mut run = CarveRun::empty(g, pref, tx, tz);
+    run.probe = probe_here;
     let mut starts = 0u32;
     for ox in tx - 8..=tx + 8 {
         for oz in tz - 8..=tz + 8 {
             // the carver list comes from the biome at the neighbour chunk's
             // minimum corner at y=0, not from its centre
-            let Some(biome) = g.biome_name_at(ox * 16, 0, oz * 16) else {
-                continue;
-            };
-            let Some(list) = reg.biome.get(&biome) else {
+            let Some((biome, list)) = origin_carvers(g, ox, oz) else {
                 continue;
             };
             for (k, name) in list.iter().enumerate() {
@@ -8548,8 +8974,8 @@ fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32) {
                 }
                 run.mark = None;
                 match c.kind {
-                    CKind::Cave | CKind::NetherCave => run.cave(g, &cc, c, &mut r, ox, oz),
-                    CKind::Canyon => run.canyon(g, &cc, c, &mut r, ox, oz),
+                    CKind::Cave | CKind::NetherCave => run.cave(g, cc, c, &mut r, ox, oz),
+                    CKind::Canyon => run.canyon(g, cc, c, &mut r, ox, oz),
                 }
                 if let Some(spec) = env_str!("CARVE_SRC") {
                     if spec == "all" || spec == format!("{tx},{tz}") {
@@ -8566,12 +8992,19 @@ fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32) {
             "[carve] chunk {tx},{tz}: {} starts, {} mask bits, {} cells written",
             starts,
             run.mask.iter().map(|w| w.count_ones() as u64).sum::<u64>(),
-            run.out.len()
+            run.out_order.len()
         );
     }
     if probe_here || dump_here {
         let tag = if probe_here { "CELL" } else { "WCELL" };
-        let mut cells: Vec<((u8, i32, u8), u32)> = run.out.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut cells: Vec<((u8, i32, u8), u32)> = run
+            .out_order
+            .iter()
+            .map(|&i| {
+                let (lx, y, lz) = run.pos_of(i);
+                (((lx & 15) as u8, y, (lz & 15) as u8), run.out[i as usize])
+            })
+            .collect();
         cells.sort();
         for ((lx, y, lz), st) in cells {
             eprintln!(
@@ -8585,22 +9018,40 @@ fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32) {
         eprintln!(
             "PROBE {} cells={}",
             if probe_here { "stone" } else { "world" },
-            run.out.len()
+            run.out_order.len()
         );
     }
-    let wg = wg_heightmaps_after_carve(g, &cc, tx, tz, &run.out);
-    g.set_wg_after_carve(tx, tz, wg);
-    // The marks are the positions the carver *aimed* at, filed by
-    // `ChunkAccess.markPosForPostprocessing` on the chunk being carved. A write more than a
-    // chunk away folds (`x & 15`) into this chunk's array, and the mark folds with it, because
-    // vanilla stores the mark as the same packed local offset — so the folded absolute
-    // position is the faithful one to file.
-    for (x, y, z) in std::mem::take(&mut run.shape_marks) {
-        g.store_shape_mark_from(x, y, z, crate::worldgen::MarkSrc::Carver);
+    let wg = wg_heightmaps_after_carve_run(g, cc, tx, tz, &run);
+    let mut out_writes = Vec::with_capacity(run.out_order.len());
+    for &i in &run.out_order {
+        let (lx, y, lz) = run.pos_of(i);
+        out_writes.push((tx * 16 + lx, y, tz * 16 + lz, run.out[i as usize]));
     }
-    for ((lx, y, lz), st) in std::mem::take(&mut run.out) {
-        g.feat_write(tx * 16 + lx as i32, y, tz * 16 + lz as i32, st);
+    CarveOutput {
+        tx,
+        tz,
+        wg,
+        shape_marks: std::mem::take(&mut run.shape_marks),
+        out_writes,
     }
+}
+
+/// [`wg_heightmaps_after_carve_run`] over an explicit write map, for the fixtures that hand the
+/// function a carved cell set instead of running a carve (a `CarveRun` is the carver's own
+/// storage and carries a mask and an order a fixture has no use for).
+#[cfg(test)]
+fn wg_heightmaps_after_carve(
+    g: &mut Gen,
+    cc: &ChunkCols,
+    tx: i32,
+    tz: i32,
+    writes: &HashMap<(u8, i32, u8), u32>,
+) -> Box<[i32; 512]> {
+    let mut run = CarveRun::empty(g, None, tx, tz);
+    for (&(lx, y, lz), &st) in writes {
+        run.put(lx as i32, y, lz as i32, st);
+    }
+    wg_heightmaps_after_carve_run(g, cc, tx, tz, &run)
 }
 
 /// `Heightmap.Types.WORLD_SURFACE_WG` and `OCEAN_FLOOR_WG` for one chunk, as
@@ -8612,12 +9063,12 @@ fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32) {
 /// them at all. Reading them off the pre-carve terrain instead leaves them far too high
 /// wherever a cave cut the surface (the port measured 110 against vanilla's 100 at
 /// (107,122) on seed 4242).
-fn wg_heightmaps_after_carve(
+fn wg_heightmaps_after_carve_run(
     g: &mut Gen,
     cc: &ChunkCols,
     tx: i32,
     tz: i32,
-    out: &HashMap<(u8, i32, u8), u32>,
+    run: &CarveRun<'_>,
 ) -> Box<[i32; 512]> {
     let reg = breg();
     let Some(reg) = reg else {
@@ -8629,8 +9080,9 @@ fn wg_heightmaps_after_carve(
     // excludes air), but take the written maximum anyway so the scan bound is never the
     // reason a value is missed.
     let mut carve_top = [[i32::MIN; 16]; 16];
-    for &(lx, y, lz) in out.keys() {
-        let slot = &mut carve_top[lz as usize][lx as usize];
+    for &i in &run.out_order {
+        let (lx, y, lz) = run.pos_of(i);
+        let slot = &mut carve_top[(lz & 15) as usize][(lx & 15) as usize];
         *slot = (*slot).max(y);
     }
     for lz in 0..16 {
@@ -8643,9 +9095,15 @@ fn wg_heightmaps_after_carve(
             let mut surface = None;
             let mut floor = None;
             while y >= min_y {
-                let st = match out.get(&(lx as u8, y, lz as u8)) {
-                    Some(&st) => st,
-                    None => g.terrain_cell(cc, wx, y, wz),
+                // Every `(wx, wz)` here is inside `(tx, tz)`, so the prefetched row is this
+                // chunk's own cell (see `CarveRun::read` for the two gates a carver read
+                // needs; the fold one cannot apply here).
+                let st = match run.written(lx as i32, y, lz as i32) {
+                    Some(st) => st,
+                    None => match prefetched_cell(g, run.pref, wx, y, wz) {
+                        Some(st) => st,
+                        None => g.terrain_cell(cc, wx, y, wz),
+                    },
                 };
                 if surface.is_none() && reg.heightmap_counts(st, HeightmapKind::WorldSurfaceWg) {
                     surface = Some(y + 1);
@@ -8666,7 +9124,7 @@ fn wg_heightmaps_after_carve(
     tops
 }
 
-impl CarveRun {
+impl CarveRun<'_> {
     /// `CaveWorldCarver.carve`.
     fn cave(&mut self, g: &mut Gen, cc: &ChunkCols, c: &CarverDef, r: &mut Lcg, ox: i32, oz: i32) {
         // nextInt(nextInt(nextInt(getRange()) + 1) + 1); getRange() is 15 here
@@ -9057,6 +9515,10 @@ impl CarveRun {
         y: i32,
         z: i32,
     ) -> bool {
+        // `carve_state`'s lava branch returns before it asks the aquifer, so the ``read`` below
+        // needs the level up front: at or below it, the flag that read writes is the one the
+        // mark gate further down reads (see `CarveRun::read`).
+        self.lava = c.lava.resolve(self.min_y, self.height);
         let cur = self.read(g, cc, x, y, z);
         let br = match breg() {
             Some(br) => br,
@@ -9067,7 +9529,7 @@ impl CarveRun {
         if !br.in_tag(cur, &c.replaceable) {
             return false;
         }
-        let lava_level = c.lava.resolve(self.min_y, self.height);
+        let lava_level = self.lava;
         let probed = if c.kind == CKind::NetherCave {
             Some(if y <= self.min_y + 31 {
                 self.probe_lava
@@ -9097,7 +9559,7 @@ impl CarveRun {
         if self.mark.is_none() {
             self.mark = Some((x, y, z));
         }
-        self.out.insert(((x & 15) as u8, y, (z & 15) as u8), st);
+        self.put(x, y, z, st);
         // `WorldCarver.apply`'s first mark site: `if (aquifer.shouldScheduleFluidUpdate() &&
         // !state.getFluidState().isEmpty()) chunk.markPosForPostprocessing(pos)`. The gate is
         // the aquifer's flag from the `getCarveState` call above and the state *it* returned,
@@ -9111,8 +9573,7 @@ impl CarveRun {
         if reached_surface && self.read(g, cc, x, y - 1, z) == br.state_of("minecraft:dirt", None) {
             let fluid = g.is_fluid_state(st);
             if let Some(top) = g.top_material_at(x, y - 1, z, fluid) {
-                self.out
-                    .insert(((x & 15) as u8, y - 1, (z & 15) as u8), top);
+                self.put(x, y - 1, z, top);
                 // Second site: the restored top material is marked when its own fluid state is
                 // non-empty (no aquifer gate — vanilla asks the restored state only).
                 if !self.probe && has_fluid_state(br, top) {
@@ -9214,17 +9675,12 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
     // Vanilla's chunk status order is CARVERS then FEATURES, and both write into
     // the chunk's block state, so the carver pass runs here — before the feature
     // gate, because "no features" is a comparison fixture, not a carver switch
-    // (`MC_SPINE_NOCARVE` is).
-    apply_carvers(g, sx, sz);
-    // Vanilla carves the whole decoration area before decorating the centre, so
-    // a feature may read a neighbour's carver air. Pre-carve the same 3x3; the
+    // (`MC_SPINE_NOCARVE` is). Vanilla carves the whole decoration area before
+    // decorating the centre, so a feature may read a neighbour's carver air; the
     // `begin_carve` claim makes the later per-chunk populate a no-op for its
-    // carver stage.
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            apply_carvers(g, sx + dx, sz + dz);
-        }
-    }
+    // carver stage. `carve_ring` carves that 3x3, on one thread or across the
+    // terrain workers.
+    carve_ring(g, sx, sz);
     // Diagnostic: MC_SPINE_NOFEAT=1 skips the whole feature layer so a block diff can
     // attribute the remainder to terrain or to features.
     if env_flag!("MC_SPINE_NOFEAT") {
@@ -9654,6 +10110,244 @@ mod mark_above_tests {
         assert!(checked_barrier, "expected a lake barrier cell with non-air above");
         assert!(checked_cave_air, "expected a lake cave_air cell with non-air above");
         let _ = checked_fluid;
+    }
+}
+
+#[cfg(test)]
+mod carver_parity_tests {
+    use super::{apply_carvers, carve_ring_with};
+    use crate::worldgen::{lock_gen_for_tests, Gen, ChunkCols};
+
+    /// Everything the carver stage hands an owner for one chunk: the block writes, both WG
+    /// heightmaps over all 256 columns, and the marks in the order they were filed.
+    type Snapshot = (Vec<((i32, i32, i32), u32)>, Vec<i32>, Vec<(i32, i32, i32)>);
+
+    fn snapshot(g: &mut Gen, cx: i32, cz: i32) -> Snapshot {
+        let mut writes: Vec<((i32, i32, i32), u32)> = g.feature_bucket_writes(cx, cz).collect();
+        writes.sort();
+        let mut wg = Vec::with_capacity(512);
+        for ocean_floor in [false, true] {
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    let x = cx * 16 + lx;
+                    let z = cz * 16 + lz;
+                    wg.push(
+                        g.wg_after_carve_height(ocean_floor, x, z)
+                            .unwrap_or(i32::MIN),
+                    );
+                }
+            }
+        }
+        let marks = g.take_shape_marks(cx, cz);
+        (writes, wg, marks)
+    }
+
+    fn ring_snapshots(
+        g: &mut Gen,
+        sx: i32,
+        sz: i32,
+    ) -> Vec<(i32, i32, Vec<((i32, i32, i32), u32)>, Vec<i32>, Vec<(i32, i32, i32)>)> {
+        let mut out = Vec::with_capacity(9);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let (cx, cz) = (sx + dx, sz + dz);
+                let (writes, wg, marks) = snapshot(g, cx, cz);
+                out.push((cx, cz, writes, wg, marks));
+            }
+        }
+        out
+    }
+
+    /// The `3x3` ring carved across workers must leave the owner in exactly the state the
+    /// serial ring leaves it in: same writes, same WG heightmaps, same mark order.
+    ///
+    /// The two arms are the same function with the worker count changed, so this is the
+    /// schedule being compared and nothing else (the environment is read once per call site and
+    /// cannot be re-pointed inside a process, which is why the count is a parameter).
+    #[test]
+    fn m3_p3a_carver_serial_vs_parallel_bit_identical() {
+        crate::test_support::require_vanilla_data();
+        let _gen = lock_gen_for_tests();
+        let (sx, sz) = (0, 0);
+
+        let workers_before = super::CARVE_RING_WORKERS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut serial = Gen::load(0, crate::name_to_state).expect("datapack");
+        carve_ring_with(&mut serial, sx, sz, 1);
+        let serial_workers =
+            super::CARVE_RING_WORKERS.load(std::sync::atomic::Ordering::Relaxed) - workers_before;
+
+        let mut parallel = Gen::load(0, crate::name_to_state).expect("datapack");
+        carve_ring_with(&mut parallel, sx, sz, 4);
+        let parallel_workers =
+            super::CARVE_RING_WORKERS.load(std::sync::atomic::Ordering::Relaxed) - workers_before;
+
+        assert_eq!(
+            serial_workers, 0,
+            "one worker is the serial arm: it must not spawn anything"
+        );
+        assert!(
+            parallel_workers >= 2,
+            "the parallel arm must actually spawn workers, or the comparison proves nothing \
+             (it spawned {parallel_workers})"
+        );
+
+        let a = ring_snapshots(&mut serial, sx, sz);
+        let b = ring_snapshots(&mut parallel, sx, sz);
+        let writes: usize = a.iter().map(|s| s.2.len()).sum();
+        assert!(
+            writes > 0,
+            "the fixture must carve something before its identity means anything"
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.0, y.0);
+            assert_eq!(x.1, y.1);
+            assert_eq!(
+                x.2, y.2,
+                "chunk {},{}: the carve writes differ between the serial and the parallel ring",
+                x.0, x.1
+            );
+            assert_eq!(
+                x.3, y.3,
+                "chunk {},{}: the post-carve WG heightmaps differ",
+                x.0, x.1
+            );
+            assert_eq!(
+                x.4, y.4,
+                "chunk {},{}: the mark order differs",
+                x.0, x.1
+            );
+        }
+    }
+
+    /// The two gates on the prefetched-cell fast path, pinned one at a time: a position outside
+    /// this chunk, and a cell at or below the carver's lava level.
+    ///
+    /// Neither is a cost decision. The write folds an out-of-chunk position with `& 15` but the
+    /// terrain read does not (it hands `terrain_cell` the unfolded position), so answering one
+    /// from this chunk's rows would substitute another cell's state; and `carve_state` returns
+    /// at or below the lava level without asking the aquifer, so the flag the read writes there
+    /// is the one the mark gate reads.
+    #[test]
+    fn m3_p3a_prefetch_refuses_out_of_chunk_and_lava_level_cells() {
+        crate::test_support::require_vanilla_data();
+        let _gen = lock_gen_for_tests();
+        let (cx, cz) = (0, 0);
+        let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
+        let data = g.data.clone();
+        let (lo, hi) = (g.min_y, g.min_y + g.height - 16);
+        // Both this chunk and its -x neighbour: the neighbour's row has to be installed for the
+        // out-of-chunk check to mean anything.
+        let keys = [(cx, cz), (cx - 1, cz)];
+        let cols: [Option<std::sync::Arc<ChunkCols>>; 2] = [None, None];
+        let rows =
+            crate::worldgen::prefetch_terrain(&data, None, &keys, &cols, lo, hi, 1, None);
+        assert!(rows.iter().all(|r| r.is_some()), "prefetched rows installed");
+        g.install_prefetched(rows);
+        let cc = g.cols(cx, cz).expect("columns");
+        // The level the data gives the overworld cave carver, not a literal: this test is about
+        // the gate `carve_state` takes, which is that number.
+        let lava = super::creg()
+            .cfg
+            .get("minecraft:cave")
+            .expect("cave carver")
+            .lava
+            .resolve(g.min_y, g.height);
+        let above_lava = lava + 6;
+        let mut run = super::CarveRun::empty(&g, None, cx, cz);
+        run.lava = lava;
+        let (x, z) = (cx * 16 + 1, cz * 16 + 1);
+        let reads = || super::CARVE_PREFETCH_READS.with(|c| c.get());
+
+        super::CARVE_PREFETCH_READS.with(|c| c.set(0));
+        let above = run.read(&mut g, &cc, x, above_lava, z);
+        assert_eq!(
+            reads(),
+            1,
+            "above the lava level the base row answers the read"
+        );
+        assert_eq!(
+            Some(above),
+            g.prefetched_cell(x, above_lava, z),
+            "the answer must be the base row's"
+        );
+
+        let below = run.read(&mut g, &cc, x, lava, z);
+        assert_eq!(
+            reads(),
+            1,
+            "at the lava level the read must keep going through terrain_cell, which writes \
+             the aquifer flag the mark gate reads"
+        );
+        assert_eq!(below, g.terrain_cell(&cc, x, lava, z));
+
+        assert!(
+            g.prefetched_cell(x - 16, above_lava, z).is_some(),
+            "the neighbour's base row must be installed, or the next check cannot fail"
+        );
+        let _ = run.read(&mut g, &cc, x - 16, above_lava, z);
+        assert_eq!(
+            reads(),
+            1,
+            "an out-of-chunk position must not be answered from this chunk's rows"
+        );
+    }
+
+    /// The dense `out` array plus the prefetched-cell fast path must answer exactly what the
+    /// sparse write map over `terrain_cell` answered.
+    ///
+    /// The reference arm has no prefetched rows, so every read the dense path can short-circuit
+    /// falls through to `terrain_cell` — the pre-change behaviour. The fast arm installs the
+    /// base rows a terrain worker would have built for the same chunk.
+    #[test]
+    fn m3_p3a_dense_out_matches_sparse_writes() {
+        crate::test_support::require_vanilla_data();
+        let _gen = lock_gen_for_tests();
+        let (cx, cz) = (0, 0);
+
+        super::CARVE_PREFETCH_READS.with(|c| c.set(0));
+        let mut cold = Gen::load(0, crate::name_to_state).expect("datapack");
+        apply_carvers(&mut cold, cx, cz);
+        let cold_reads = super::CARVE_PREFETCH_READS.with(|c| c.get());
+        let cold = snapshot(&mut cold, cx, cz);
+
+        let mut warm = Gen::load(0, crate::name_to_state).expect("datapack");
+        let data = warm.data.clone();
+        let (lo, hi) = (warm.min_y, warm.min_y + warm.height - 16);
+        let keys = [(cx, cz)];
+        let cols: Vec<Option<std::sync::Arc<ChunkCols>>> = vec![None];
+        let rows = crate::worldgen::prefetch_terrain(&data, None, &keys, &cols, lo, hi, 1, None);
+        assert!(
+            rows.iter().all(|r| r.is_some()),
+            "the fixture needs the prefetched rows installed"
+        );
+        warm.install_prefetched(rows);
+        // Installing a worker's base rows files the *terrain* stage's marks (they are decided by
+        // the fill, not by the carver), so the bucket starts non-empty. This comparison is the
+        // carver's: drop what the install filed.
+        assert!(
+            !warm.take_shape_marks(cx, cz).is_empty(),
+            "the prefetched install must have filed the terrain stage's own marks"
+        );
+        apply_carvers(&mut warm, cx, cz);
+        let warm_reads = super::CARVE_PREFETCH_READS.with(|c| c.get());
+        let warm = snapshot(&mut warm, cx, cz);
+
+        assert!(
+            !cold.0.is_empty(),
+            "the fixture must carve something before its identity means anything"
+        );
+        assert_eq!(
+            cold_reads, 0,
+            "the reference arm has no prefetched rows, so the fast path cannot have answered"
+        );
+        assert!(
+            warm_reads > 0,
+            "the fast arm must answer cells from the prefetched rows, or the comparison is \
+             two copies of the same path"
+        );
+        assert_eq!(cold.0, warm.0, "the carve writes differ");
+        assert_eq!(cold.1, warm.1, "the post-carve WG heightmaps differ");
+        assert_eq!(cold.2, warm.2, "the mark order differs");
     }
 }
 
