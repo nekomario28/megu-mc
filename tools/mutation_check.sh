@@ -3367,6 +3367,26 @@ check "paletted_direct_keeps_all_15_bits" \
   '                word |= ((st as u64) & 0x3fff) << (j * 15);' \
   paletted_tests::paletted_exact_bit_transitions_and_wire_identity
 
+# Entity collision + step-up (M2 Gameplay Slice 4a): 1.21.1 Entity.collide / collideWithShapes / BlockCollisions.
+check "entity_collide_axis_tie_prefers_x" \
+  src/entity_collision.rs '    let z_first = x.abs() < z.abs();' \
+  '    let z_first = x.abs() <= z.abs();' \
+  entity_collision_tests::entity_collide_axis_priority_z_first_when_x_lt_z_and_x_first_on_tie
+
+check "entity_collide_step_up_respects_max_up_step" \
+  src/entity_collision.rs '            if f > max_up_step {
+                break;
+            }' \
+  '            if f > max_up_step + 0.5 {
+                break;
+            }' \
+  entity_collision_tests::entity_collide_step_up_over_slab_and_refuses_full_block_when_max_up_step_0_6
+
+check "entity_collide_block_window_catches_1_5_fence" \
+  src/entity_collision.rs '    let by0 = (min[1] - 1e-7).floor() as i32 - 1;' \
+  '    let by0 = (min[1] - 1e-7).floor() as i32;' \
+  entity_collision_tests::entity_collide_fence_1_5_block_prevents_step_over_and_catches_window
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

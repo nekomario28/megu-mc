@@ -36,6 +36,7 @@ mod tree;
 mod world_rng;
 mod worldgen;
 include!("paletted.rs");
+include!("entity_collision.rs");
 
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
@@ -2049,6 +2050,9 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
     // spawn streams via interest_tick
 }
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
+    if mob_has_support(m.etype, mp.0, mp.1, mp.2) {
+        return;
+    }
     // snap to ground surface; while buried only allow snaps within step height
     // so a fully enclosed mob cannot teleport out through solid blocks
     let (land_x, land_z) = (mp.0.floor() as i32, mp.2.floor() as i32);
@@ -5421,15 +5425,7 @@ fn mob_tick() {
                     let dx = px - mp.0;
                     let dz = pz - mp.2;
                     let len = (dx * dx + dz * dz).sqrt();
-                    let (nx, nz) = (mp.0 + dx / len * 0.25, mp.2 + dz / len * 0.25);
-                    if !mob_move_blocked(nx, mp.1, nz)
-                        || (mob_cell_solid(mp.0, mp.1, mp.2)
-                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
-                    {
-                        mp.0 = nx;
-                        mp.2 = nz;
-                    }
-                    mob_snap_y(m, &mut mp);
+                    mob_collide_move(m, &mut mp, dx / len * 0.25, dz / len * 0.25);
                     mp.3 = (dx.atan2(dz) * 180.0 / std::f64::consts::PI) as f32 - 180.0;
                     drop(mp);
                     let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
@@ -5524,15 +5520,7 @@ fn mob_tick() {
                     let dx = tx - mp.0;
                     let dz = tz - mp.2;
                     let len = (dx * dx + dz * dz).sqrt().max(0.01);
-                    let (nx, nz) = (mp.0 + dx / len * 0.28, mp.2 + dz / len * 0.28);
-                    if !mob_move_blocked(nx, mp.1, nz)
-                        || (mob_cell_solid(mp.0, mp.1, mp.2)
-                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
-                    {
-                        mp.0 = nx;
-                        mp.2 = nz;
-                    }
-                    mob_snap_y(m, &mut mp);
+                    mob_collide_move(m, &mut mp, dx / len * 0.28, dz / len * 0.28);
                 }
                 mp.3 = ((-((tx - mp.0).atan2(tz - mp.2))) as f32).to_degrees();
                 let (x, y, z, yaw, pitch) = *mp;
@@ -5548,16 +5536,7 @@ fn mob_tick() {
                     ^ (TICK.load(Ordering::Relaxed) as u32)) as f64
                     / 4294967295.0
                     * std::f64::consts::TAU;
-                let (nx, nz) = (mp.0 + t.cos() * 2.0, mp.2 + t.sin() * 2.0);
-                let mid = !mob_move_blocked((mp.0 + nx) * 0.5, mp.1, (mp.2 + nz) * 0.5);
-                if (mid && !mob_move_blocked(nx, mp.1, nz))
-                    || (mob_cell_solid(mp.0, mp.1, mp.2)
-                        && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
-                {
-                    mp.0 = nx;
-                    mp.2 = nz;
-                }
-                mob_snap_y(m, &mut mp);
+                mob_collide_move(m, &mut mp, t.cos() * 2.0, t.sin() * 2.0);
                 drop(mp);
                 let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
                 broadcast_seen(m.eid, |_c| {
@@ -5587,15 +5566,7 @@ fn mob_tick() {
                     let dx = px - mp.0;
                     let dz = pz - mp.2;
                     let len = (dx * dx + dz * dz).sqrt().max(0.01);
-                    let (nx, nz) = (mp.0 + dx / len * 0.22 * dir, mp.2 + dz / len * 0.22 * dir);
-                    if !mob_move_blocked(nx, mp.1, nz)
-                        || (mob_cell_solid(mp.0, mp.1, mp.2)
-                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
-                    {
-                        mp.0 = nx;
-                        mp.2 = nz;
-                    }
-                    mob_snap_y(m, &mut mp);
+                    mob_collide_move(m, &mut mp, dx / len * 0.22 * dir, dz / len * 0.22 * dir);
                     let (x, y, z, yaw, pitch) = *mp;
                     broadcast_seen(m.eid, |_c| {
                         (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true))
@@ -5786,15 +5757,7 @@ fn mob_tick() {
                     let dx = px - mp.0;
                     let dz = pz - mp.2;
                     let len = (dx * dx + dz * dz).sqrt();
-                    let (nx, nz) = (mp.0 + dx / len * 0.25, mp.2 + dz / len * 0.25);
-                    if !mob_move_blocked(nx, mp.1, nz)
-                        || (mob_cell_solid(mp.0, mp.1, mp.2)
-                            && surface_y(nx.floor() as i32, nz.floor() as i32) - mp.1 <= 1.2)
-                    {
-                        mp.0 = nx;
-                        mp.2 = nz;
-                    }
-                    mob_snap_y(m, &mut mp);
+                    mob_collide_move(m, &mut mp, dx / len * 0.25, dz / len * 0.25);
                     mp.3 = (dx.atan2(dz) * 180.0 / std::f64::consts::PI) as f32 - 180.0;
                     drop(mp);
                     let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap();
@@ -6735,66 +6698,6 @@ fn aabb_overlaps(a: ([f64; 3], [f64; 3]), b: ([f64; 3], [f64; 3])) -> bool {
         && a.0[2] < b.1[2]
         && a.1[2] > b.0[2]
 }
-fn collect_block_collision_boxes(
-    min: [f64; 3],
-    max: [f64; 3],
-) -> Vec<([f64; 3], [f64; 3])> {
-    let Some(reg) = crate::block_registry::breg() else {
-        return Vec::new();
-    };
-    let bx0 = (min[0] - 1e-7).floor() as i32;
-    let bx1 = (max[0] + 1e-7).floor() as i32;
-    let by0 = (min[1] - 0.51 - 1e-7).floor() as i32;
-    let by1 = (max[1] + 1e-7).floor() as i32;
-    let bz0 = (min[2] - 1e-7).floor() as i32;
-    let bz1 = (max[2] + 1e-7).floor() as i32;
-    let mut boxes = Vec::new();
-    for by in by0..=by1 {
-        for bz in bz0..=bz1 {
-            for bx in bx0..=bx1 {
-                let st = block_at(bx, by, bz);
-                for (bmin, bmax) in reg.collision_boxes(st) {
-                    boxes.push((
-                        [bx as f64 + bmin[0], by as f64 + bmin[1], bz as f64 + bmin[2]],
-                        [bx as f64 + bmax[0], by as f64 + bmax[1], bz as f64 + bmax[2]],
-                    ));
-                }
-            }
-        }
-    }
-    boxes
-}
-fn collide_axis(
-    a_min: [f64; 3],
-    a_max: [f64; 3],
-    axis: usize,
-    mut dist: f64,
-    boxes: &[([f64; 3], [f64; 3])],
-) -> f64 {
-    if dist.abs() < 1e-7 {
-        return 0.0;
-    }
-    let (ax1, ax2) = match axis {
-        0 => (1, 2),
-        1 => (0, 2),
-        _ => (0, 1),
-    };
-    for &(b_min, b_max) in boxes {
-        if b_max[ax1] - a_min[ax1] <= 1e-7
-            || a_max[ax1] - b_min[ax1] <= 1e-7
-            || b_max[ax2] - a_min[ax2] <= 1e-7
-            || a_max[ax2] - b_min[ax2] <= 1e-7
-        {
-            continue;
-        }
-        if dist > 0.0 && b_min[axis] - a_max[axis] >= -1e-7 {
-            dist = dist.min((b_min[axis] - a_max[axis]).max(0.0));
-        } else if dist < 0.0 && a_min[axis] - b_max[axis] >= -1e-7 {
-            dist = dist.max((b_max[axis] - a_min[axis]).min(0.0));
-        }
-    }
-    dist
-}
 fn aabb_collides_blocks(min: [f64; 3], max: [f64; 3]) -> bool {
     collect_block_collision_boxes(min, max)
         .into_iter()
@@ -6873,31 +6776,9 @@ impl crate::minecart::World for CartRuntimeWorld {
         Some(crate::minecart::Rail { shape, powered })
     }
     fn move_cart(&mut self, pos: [f64; 3], delta: [f64; 3]) -> ([f64; 3], bool) {
-        let mut cur_min = [pos[0] - 0.49, pos[1], pos[2] - 0.49];
-        let mut cur_max = [pos[0] + 0.49, pos[1] + 0.7, pos[2] + 0.49];
-        let sweep_min = [
-            cur_min[0].min(cur_min[0] + delta[0]),
-            cur_min[1].min(cur_min[1] + delta[1]),
-            cur_min[2].min(cur_min[2] + delta[2]),
-        ];
-        let sweep_max = [
-            cur_max[0].max(cur_max[0] + delta[0]),
-            cur_max[1].max(cur_max[1] + delta[1]),
-            cur_max[2].max(cur_max[2] + delta[2]),
-        ];
-        let boxes = collect_block_collision_boxes(sweep_min, sweep_max);
-        let mut actual = [0.0; 3];
-        actual[1] = collide_axis(cur_min, cur_max, 1, delta[1], &boxes);
-        cur_min[1] += actual[1];
-        cur_max[1] += actual[1];
-        let x_first = delta[0].abs() >= delta[2].abs();
-        for &axis in if x_first { &[0usize, 2] } else { &[2usize, 0] } {
-            actual[axis] = collide_axis(cur_min, cur_max, axis, delta[axis], &boxes);
-            cur_min[axis] += actual[axis];
-            cur_max[axis] += actual[axis];
-        }
-        let ground = delta[1] < 0.0 && actual[1] != delta[1];
-        (actual, ground)
+        let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], 0.98, 0.7);
+        let res = entity_collide_world(aabb, delta, false, 0.0, &[]);
+        (res.delta, res.vertical_collision_below)
     }
     fn conductor(&mut self, at: BlockPos) -> bool {
         let st = block_at(at.0, at.1, at.2);
@@ -7778,20 +7659,6 @@ fn mob_cell_solid(x: f64, y: f64, z: f64) -> bool {
     // feet cell solid?
     let [cx, cy, cz] = [x, y, z].map(|v| v.floor() as i32);
     !mob_passable(block_at(cx, cy, cz))
-}
-fn mob_move_blocked(nx: f64, fy: f64, nz: f64) -> bool {
-    // destination unreachable?
-    let xi = nx.floor() as i32;
-    let zi = nz.floor() as i32;
-    let ty = surface_y(xi, zi);
-    if ty - fy > 1.2 {
-        return true;
-    } // >1-block wall
-    let fi = ty.floor() as i32;
-    if is_fence_or_wall(block_at(xi, fi - 1, zi)) {
-        return true;
-    } // never step onto a fence/wall top
-    !mob_passable(block_at(xi, fi, zi)) || !mob_passable(block_at(xi, fi + 1, zi))
 }
 fn ore_state(x: i32, y: i32, z: i32) -> u32 {
     let oh = ((x as i64).wrapping_mul(0x9E3779B1)

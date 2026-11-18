@@ -92,3 +92,12 @@ world callback を偽の値で埋めて「移植済み」にしない。
 AI・経路探索・戦利品・乗り物なども再利用対象から除外しないが、
 必要な registry / world callback が見える段階で独立した slice に分ける。
 ここで候補に挙げたことは、Horizon 全 suite の実行成功や対応完了を意味しない。
+
+実装済み（Slice 4a）: [Entity Collision & Step-Up (Slice 4a)](entity-collision.md) および
+[検証記録](../../evidence/gameplay/entity-collision/README.md) で、固定 1.21.1 jar の
+`Entity.collide` / `collideBoundingBox` / `collideWithShapes`（Y 先行、`|x| < |z|` で Z 先行、
+同値で X 先行）/ `collectCandidateStepUpHeights` / `BlockCollisions`（`floor(min - 1e-7) - 1`
+の 1.5 高 fence 窓）/ `Shapes.collide` (`1e-7`) / `Entity.move` 衝突フラグを共通所有者
+[`src/entity_collision.rs`](../../src/entity_collision.rs) に閉塞し、`CartRuntimeWorld::move_cart`
+と `mob_tick` の水平移動（`Attributes.STEP_HEIGHT = 0.6` と `EntityType` 寸法）へ接続した。
+`LivingEntity.travel` の重力・流体・完全な落下統合および entity-entity 押し戻しは後続 slice へ分離。
