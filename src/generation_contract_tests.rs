@@ -2787,16 +2787,29 @@ fn mushrooms_in_fresh_generation_need_the_special_substrate() {
     let reg = breg().unwrap();
     let mut g = Gen::load(0, crate::name_to_state).unwrap();
     let mut ctx = context(&mut g);
-    // The native fixture's uninitialized sky light reads 15 even under trees.
+    // The measurement the write-time gate has to reproduce: at `FEATURES` time the chunk's
+    // light engine is uninitialized and `getRawBrightness(pos, 0)` answers **0 in every
+    // dimension** (`-Dmushroomchunk` on the pinned capture: 403 Overworld reads, 401 x 0 and
+    // two small positives; 464 Nether reads, 464 x 0). So the brightness half of
+    // `MushroomBlock.canSurvive` (`lit < 13`) is *satisfied* at write time and the substrate
+    // half is what decides: a solid-render support is placeable whether or not it is dirt.
+    // Removing the ones a light later reaches is the promotion pass' job
+    // (`postprocess_shape_marks`), not this gate's.
     ctx.set(0, 202, 0, reg.state_of("minecraft:oak_leaves", None));
     for (soil, expected) in [
-        ("dirt", false),
-        ("grass_block", false),
-        ("stone", false),
-        ("basalt", false),
-        ("netherrack", false),
+        // solid render -> the brightness half passes, so the substrate is enough
+        ("dirt", true),
+        ("grass_block", true),
+        ("stone", true),
+        ("basalt", true),
+        ("netherrack", true),
         ("podzol", true),
         ("mycelium", true),
+        // not a solid render -> the only false half, and the reason the gate is not "always
+        // place on any block". (`glass` is not a solid *render* either: its occlusion shape is
+        // a full cube but `isSolidRender` is false, so it belongs on this side.)
+        ("oak_leaves", false),
+        ("glass", false),
     ] {
         ctx.set(0, 199, 0, reg.state_of(&format!("minecraft:{soil}"), None));
         for mushroom in ["minecraft:brown_mushroom", "minecraft:red_mushroom"] {
@@ -2827,10 +2840,11 @@ fn mushrooms_in_fresh_generation_need_the_special_substrate() {
 /// `(-25,19)+3x3`) that reading refuses 24 `brown/red_mushroom_nether` cells the reference places
 /// on netherrack.
 ///
-/// The Overworld fixture cannot see this either way, because its uninitialized sky light is 15 and
-/// the brightness half already refuses every non-grow-block support there. A dimension without a
-/// sky light reads its block light (0 before anything lights the chunk), so the support test is
-/// the only gate - which is why this table lives in the Nether preset.
+/// The Overworld fixture cannot see this either way: `uninitialized_raw_brightness` answers 0 there
+/// too (measured, see `mushrooms_in_fresh_generation_need_the_special_substrate`), so the support
+/// test is the gate in both dimensions. The Nether preset is kept as the table's home because it
+/// has no sky light layer at all, which makes the block-light term exactly 0 by construction
+/// rather than by measurement.
 #[test]
 fn nether_mushrooms_survive_a_solid_render_support() {
     let reg = breg().unwrap();

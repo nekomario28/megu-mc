@@ -945,6 +945,13 @@ pub(crate) fn is_water_st(reg: &BReg, st: u32) -> bool {
     reg.name_of(st) == "minecraft:water"
 }
 
+/// `!state.getFluidState().isEmpty()`, through the exported fluid identity: a waterlogged
+/// stair answers true, `magma_block` and every other solid answers false. Three 1.21.1 mark
+/// gates ask exactly this, not "the block is water or lava".
+pub(crate) fn has_fluid_state(reg: &BReg, st: u32) -> bool {
+    reg.fluid_name(st) != "minecraft:empty"
+}
+
 pub(crate) fn is_dirtish(reg: &BReg, st: u32) -> bool {
     let n = reg.name_of(st);
     matches!(
@@ -966,12 +973,11 @@ pub(crate) fn is_dirtish(reg: &BReg, st: u32) -> bool {
 /// initialized yet, which is the state every feature runs in (`INITIALIZE_LIGHT` comes
 /// after `FEATURES`).
 ///
-/// The Overworld's uninitialized skylight reads 15; a dimension without skylight (the
-/// Nether, the End) reads its block light, which is 0 before anything lights the chunk.
-///
-/// **This model is contradicted by measurement and is kept only until the other half of
-/// the mechanism is observed (2026-11-16).** `-Dmushroomchunk=<cx>,<cz>` arms a hook on
-/// `MushroomBlock.canSurvive` (`dla.a(dtc,dcz,jd)`) that logs the int the method reads from
+/// The pinned 1.21.1 server answers **0**, in every dimension. `WorldGenRegion` does not
+/// carry the level's light engine: it is built with `useUninitializedLightEngine`, so the
+/// `LightLayer.SKY` term of `getRawBrightness` is the uninitialized 0 rather than
+/// "sees the sky straight up". `-Dmushroomchunk=<cx>,<cz>` measures it directly: it hooks
+/// `MushroomBlock.canSurvive` (`dla.a(dtc,dcz,jd)`) and logs the int the method reads from
 /// `dcz.b(pos, 0)` while preserving it (`tools/carve-agent/Agent.java`,
 /// `CarveLog.mushroomLight`). Measured on captures bound to this tree:
 ///
@@ -980,26 +986,29 @@ pub(crate) fn is_dirtish(reg: &BReg, st: u32) -> bool {
 /// | Nether `(-25,19)+3x3` | 464 | 464 x `0` |
 /// | Overworld `(4,-32)+3x3` (village taiga) | 403 | 401 x `0`, 1 x `1`, 1 x `2` |
 ///
-/// So the reference's value at `FEATURES` time is 0 in *both* dimensions, including under
-/// an Overworld canopy: this function's 15 is wrong for the Overworld. It is not replaced
-/// here because the observable residual has a second half. The reference also *places* the
-/// mushrooms the residual is about and its saved chunk then does not contain them
-/// (`FCELL ... wrote=true` for all 28 Nether writes, 24 in the saved chunk; 3 taiga writes,
-/// 1 in the saved chunk), and a brightness-only change moves the village-taiga fixture
-/// from 4 diffs to 5: it places the canopy mushroom the reference places (+1 correct) and
-/// two open-sky mushrooms whose saved-chunk fate is the unobserved half. The missing
-/// observation is the block-shape update vanilla runs after `INITIALIZE_LIGHT`
-/// (`ProtoChunk.postProcessGeneration` over `markPosForPostprocessing` cells, whose mark
-/// set gate is `BlockState.hasPostProcess`), where `BushBlock.updateShape` re-asks
-/// `canSurvive` against a *lit* engine and turns a mushroom into air.
+/// So an Overworld feature sees `0` too, including under open sky and under a canopy: the
+/// 15 this function used to answer was the port's own model. Landing the measured value was
+/// gated on the *other* half of the mechanism it feeds, because the reference also removes
+/// what it places here: the promotion pass (`LevelChunk.postProcessGeneration`) re-asks
+/// `canSurvive` against a lit engine and turns the extra mushroom into air. Both halves are
+/// now in (`src/template_structures.rs::postprocess_shape_marks`), and the two measurements
+/// that adjudicate the value are:
 ///
-/// See `evidence/gameplay/feature-parity/light-and-lost-writes-20261116.md`.
+/// * 34 moved cells on the seed-4242 64-chunk dump, all `snow[layers=1] -> air` plus the
+///   `grass_block[snowy=true] -> [snowy=false]` cell under it, in `(6,0)`. A native capture
+///   of that window agrees with this arm on **34 / 34** and with the 15 arm on 0 / 34
+///   (`mc-spine-local/audit/brightness-verdict-20261118T110138`).
+/// * the seed-**0** identity dump does not move at all: an instrumented build counts **0**
+///   skylight-brightness consultations in that window at seed 0 against 237 at seed 4242.
+///
+/// See `evidence/gameplay/feature-parity/village-taiga-promotion-pass-20261118.md` and
+/// `light-and-lost-writes-20261116.md`.
 fn uninitialized_raw_brightness(ctx: &FC) -> u8 {
-    if ctx.g.has_skylight() {
-        15
-    } else {
-        ctx.block_light(0, 0, 0)
-    }
+    // Dimension-independent, and not "15 under open sky": `FEATURES` runs on a
+    // `WorldGenRegion`, whose light engine is uninitialized in every dimension, so only the
+    // block-light term is left. Keeping it (rather than a constant 0) is what makes the
+    // Nether/End answer the chunk's own lights instead of a guess.
+    ctx.block_light(0, 0, 0)
 }
 
 pub(crate) fn can_place(reg: &BReg, ctx: &mut FC, name: &str, x: i32, y: i32, z: i32) -> bool {

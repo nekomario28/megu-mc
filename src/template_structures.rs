@@ -1682,6 +1682,104 @@ fn wall_update_shape<W: TemplateWorld>(
     reg.with_prop(next, "up", if up_val { "true" } else { "false" })
 }
 
+// ---------------------------------------------------------------- fluid tick seam
+
+/// A cell as `FlowingFluid` sees it. `flowing_fluid` is Layer 3 and this module is Layer 4,
+/// so the vocabulary is restated here and the machine itself is registered into
+/// [`postprocess_shape_marks`] from `main` (the same shape as the beardifier resolver).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FluidCell {
+    Air,
+    Solid,
+    Fluid { water: bool, level: u8 },
+}
+
+/// The two verbs one `FluidState.tick` needs from the world. `None` from [`fluid_cell`] is
+/// "this cell is not one the machine models" (a non-full collision shape, a cross-fluid
+/// contact) — vanilla has no such answer, and the machine refuses instead of guessing
+/// (see `flowing_fluid::Reader`).
+pub(crate) trait FluidTickTarget {
+    fn fluid_cell(&mut self, pos: Pos) -> Option<FluidCell>;
+    fn set_fluid(&mut self, pos: Pos, cell: FluidCell);
+}
+
+/// One fluent tick at `pos`, in place. Registered by `main` for `flowing_fluid::tick`.
+pub(crate) type FluidTicker = fn(&mut dyn FluidTickTarget, Pos);
+
+static GLOBAL_FLUID_TICKER: std::sync::Mutex<Option<FluidTicker>> = std::sync::Mutex::new(None);
+
+/// Register the process-wide fluid ticker (`main.rs`, and the structure tests that run the
+/// pass without one).
+pub(crate) fn register_fluid_ticker(ticker: FluidTicker) {
+    *GLOBAL_FLUID_TICKER.lock().unwrap() = Some(ticker);
+}
+
+fn global_fluid_ticker() -> Option<FluidTicker> {
+    *GLOBAL_FLUID_TICKER.lock().unwrap()
+}
+
+/// `FluidState.getType().tick(level, pos, state)` reads and writes through the same world
+/// the shape rules do, so every `TemplateWorld` is its own tick target.
+impl<W: TemplateWorld> FluidTickTarget for W {
+    fn fluid_cell(&mut self, pos: Pos) -> Option<FluidCell> {
+        let reg = breg()?;
+        let state = TemplateWorld::get(self, pos.0, pos.1, pos.2);
+        match reg.fluid_name(state) {
+            "minecraft:air" | "minecraft:empty" => {
+                if reg.is_air(state) {
+                    Some(FluidCell::Air)
+                } else if reg.is_solid_render(state) {
+                    Some(FluidCell::Solid)
+                } else {
+                    None
+                }
+            }
+            "minecraft:water" | "minecraft:flowing_water" => Some(FluidCell::Fluid {
+                water: true,
+                level: fluid_level(reg, state),
+            }),
+            "minecraft:lava" | "minecraft:flowing_lava" => Some(FluidCell::Fluid {
+                water: false,
+                level: fluid_level(reg, state),
+            }),
+            _ => None,
+        }
+    }
+
+    fn set_fluid(&mut self, pos: Pos, cell: FluidCell) {
+        let Some(reg) = breg() else { return };
+        let state = match cell {
+            FluidCell::Air => reg.state_of("minecraft:air", None),
+            FluidCell::Solid => return,
+            FluidCell::Fluid { water, level } => {
+                let name = if water {
+                    "minecraft:water"
+                } else {
+                    "minecraft:lava"
+                };
+                let base = reg.state_of(name, None);
+                // `FluidState.createLegacyBlock`: a falling fluid (`level >= 8`) is written as
+                // a *falling* fluid, which is the `falling` property on the block state.
+                let base = if reg.get_prop(base, "falling").is_some() {
+                    reg.with_prop(base, "falling", if level >= 8 { "true" } else { "false" })
+                } else {
+                    base
+                };
+                reg.with_prop(base, "level", &(level & 15).to_string())
+            }
+        };
+        TemplateWorld::set(self, pos.0, pos.1, pos.2, state);
+    }
+}
+
+/// The `level` property of a fluid state, 0 when the state does not carry one (a waterlogged
+/// non-fluid keeps a source fluid).
+fn fluid_level(reg: &BReg, state: u32) -> u8 {
+    reg.get_prop(state, "level")
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(0)
+}
+
 /// `LevelChunk.postProcessGeneration`'s per-cell rule, for the positions a `WorldGenRegion`
 /// write marked with `markPosForPostprocessing`.
 ///
@@ -1714,8 +1812,36 @@ pub(crate) fn postprocess_shape_marks<W: TemplateWorld>(
     // a cell that is *not* rewritten by a light-driven rule looks exactly like a cell no rule
     // looked at.
     let trace = crate::trace_env::env_str!("POSTPROC_TRACE");
+    // `POSTPROC_STATES=1`: every mark's state at pass time, not only the ones a rule rewrites.
+    // This is the instrument that says whether a shape family is *reachable* from the mark set
+    // before the rule is written for it: a family with no cell in this list is a rule no
+    // measurement would exercise.
+    let states = crate::trace_env::env_flag!("POSTPROC_STATES");
+    let ticker = global_fluid_ticker();
     for &pos in marks {
         let state = world.get(pos.0, pos.1, pos.2);
+        if states {
+            eprintln!(
+                "POSTPROCSTATE {} {} {} {} fluid={}",
+                pos.0,
+                pos.1,
+                pos.2,
+                reg.name_of(state),
+                reg.fluid_name(state) != "minecraft:empty"
+            );
+        }
+        // `FluidState fs = st.getFluidState(); if (!fs.isEmpty()) fs.tick(this.level, p);`
+        //
+        // This is the reason the pass runs at all on a marked water cell: a carver or the
+        // fill left a source inside a settled aquifer body, and the tick is what gives its
+        // neighbours a flowing level. `st` above is read *before* the tick and both branches
+        // below use that stale state, exactly as the vanilla body does - a tick that rewrites
+        // the cell is still followed by `updateFromNeighbourShapes` on the state that was read.
+        if reg.fluid_name(state) != "minecraft:empty" {
+            if let Some(tick) = ticker {
+                tick(world, pos);
+            }
+        }
         // `!(state.getBlock() instanceof LiquidBlock)`: fluid blocks carry their own
         // level, and `updateShape` has nothing to say about them.
         if matches!(reg.name_of(state), "minecraft:water" | "minecraft:lava") {
@@ -4103,6 +4229,64 @@ mod template_structures_tests {
             reg.get_prop(after, "north").as_deref(),
             Some("true"),
             "the north face keeps its support"
+        );
+    }
+
+    /// `LevelChunk.postProcessGeneration`'s fluid branch, through the registered ticker: a
+    /// marked **source** fluid cell is ticked and its flowing level lands in the neighbour.
+    ///
+    /// This is the branch that produced the reference's two `water[level=1]` cells
+    /// (`dvi.H(534)` -> `FluidState.tick` in the capture's RUNTIME stack). The `flowing_fluid`
+    /// machine lives below this layer, so the test registers the same kind of ticker `main`
+    /// does and drives the real pass over a marked source.
+    #[test]
+    fn postprocess_ticks_a_marked_source_fluid_into_its_neighbour() {
+        let reg = breg().expect("block registry");
+        // The seam is process-global (`register_fluid_ticker`), so the case that installs a
+        // ticker must not overlap another test that runs the pass.
+        static TICKER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = TICKER.lock().unwrap_or_else(|e| e.into_inner());
+        let scene = SceneSpec::parse(None, reg);
+        let mut world = TestWorld::new(scene);
+        let air = reg.state_of("minecraft:air", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let source = reg.state_of("minecraft:water", None);
+        // A one-wide channel: floor, source, and open air to the south (+z).
+        for z in -1..=1 {
+            world.set(0, -31, z, stone);
+            world.set(0, -30, z, air);
+        }
+        world.set(0, -30, -1, source);
+
+        // Stand-in for `flowing_fluid::tick`: spread one flowing level south from a source.
+        fn spread_south(world: &mut dyn FluidTickTarget, pos: Pos) {
+            let Some(FluidCell::Fluid { water, level }) = world.fluid_cell(pos) else {
+                return;
+            };
+            if !water || level != 0 {
+                return;
+            }
+            let south = (pos.0, pos.1, pos.2 + 1);
+            if world.fluid_cell(south) == Some(FluidCell::Air) {
+                world.set_fluid(south, FluidCell::Fluid { water: true, level: 1 });
+            }
+        }
+        register_fluid_ticker(spread_south);
+        let changed = postprocess_shape_marks(&mut world, reg, &[(0, -30, -1)]);
+        // The housekeeping ticker back: a later test must not inherit this stand-in.
+        *GLOBAL_FLUID_TICKER.lock().unwrap() = None;
+
+        assert_eq!(changed, 0, "a liquid block is skipped by the shape branch");
+        let south = world.get(0, -30, 0);
+        assert_eq!(
+            reg.get_prop(south, "level").as_deref(),
+            Some("1"),
+            "the tick wrote a flowing level into the neighbour"
+        );
+        assert_eq!(
+            reg.get_prop(world.get(0, -30, -1), "level").as_deref(),
+            Some("0"),
+            "the marked source cell itself is untouched"
         );
     }
 

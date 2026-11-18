@@ -1029,22 +1029,38 @@ check "simple double plants write both halves" \
   src/feature.rs '                    for (dy, half) in [(0, "lower"), (1, "upper")] {' \
   '                    for (dy, half) in [(0, "lower")] {' \
   feature::generation_contract_tests::simple_block_places_both_halves_or_neither
-check "fresh-generation mushrooms do not infer shade from a canopy" \
-  src/generation_providers.rs '            reg.in_tag(below, "minecraft:mushroom_grow_block")' \
-  '            is_dirtish(reg, below)' \
-  feature::generation_contract_tests::mushrooms_in_fresh_generation_need_the_special_substrate
 check "mushroom canSurvive asks isSolidRender, not the dirt tag" \
   src/generation_providers.rs '                || (uninitialized_raw_brightness(ctx) < 13 && reg.is_solid_render(below))' \
   '                || (uninitialized_raw_brightness(ctx) < 13 && true)' \
   feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support
-check "an uninitialized sky light reads 15, a dimension without one reads block light" \
-  src/generation_providers.rs '    if ctx.g.has_skylight() {
-        15
-    } else {
-        ctx.block_light(0, 0, 0)
-    }' \
-  '    15' \
-  feature::generation_contract_tests::nether_mushrooms_survive_a_solid_render_support
+check "an uninitialized sky light reads 0 in every dimension" \
+  src/generation_providers.rs '    ctx.block_light(0, 0, 0)
+}' \
+  '    15
+}' \
+  feature::generation_contract_tests::mushrooms_in_fresh_generation_need_the_special_substrate
+# The chunk-promotion pass' two new branches. `worldgen`'s own test pins the fill's mark
+# gate on the measured cell; `structure_template`'s pins the fluid tap.
+check "the fill marks a settled aquifer fluid" \
+  src/worldgen.rs '        let fill_mark = if self.aq_sched {
+            MARK_FILL
+        } else {
+            0
+        };' \
+  '        let fill_mark = 0;' \
+  worldgen::wg_tests::the_fill_marks_a_settled_aquifer_fluid_and_nothing_else
+check "the promotion pass ticks a marked fluid cell" \
+  src/template_structures.rs '        if reg.fluid_name(state) != "minecraft:empty" {
+            if let Some(tick) = ticker {
+                tick(world, pos);
+            }
+        }' \
+  '        if false {
+            if let Some(tick) = ticker {
+                tick(world, pos);
+            }
+        }' \
+  structure_template::template_structures_tests::postprocess_ticks_a_marked_source_fluid_into_its_neighbour
 check "a traced column names the layer that answered it" \
   src/generation_context.rs '        } else if self.rc.contains_key(&(x, y, z)) {
             "rc"' \
