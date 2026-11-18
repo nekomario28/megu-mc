@@ -43,7 +43,10 @@
 
 - [ ] **P0-1 HEAD再現と失敗の基線固定** — これから検証する対象SHAのコード・入力資産・固定jarのdigestを紐付け、`tests/verify.sh`（serial / 8-thread×3 / wire / adapter / layers / debt / mutations）で現在の一次失敗を収集。テスト失敗をmutex poisonやCI課金停止と混同しない。各結果に実行環境・終了コード・省略項目を記録する。
 - [ ] **P0-2 1.21.1 density/surface/biomeの到達性監査** — `src/worldgen.rs` の未知density型の拒否、再帰用placeholderと明示ゼロ扱いノード、surface ruleの未対応を区別し、`spawn_costs` とNaturalSpawner等を分類。固定datapackの実際に到達する経路を列挙し、必須の未知ノードは黙ってゼロにせず拒否する。修正は実クラスfixtureと本番チャンク差分で確認。未到達な旧形式の互換性を推測して広げない。
-- [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー）** — この枝は `datapacks/vanilla/`、1,180 NBTテンプレート、`config_packets.bin`、`assets/pblocks.json` 等を追跡しており、README/THIRD_PARTYの「jarからローカル生成・非コミット」という記述と矛盾する。各blobの出所・権利・ハッシュと再生成手順を一覧化し、検証可能なローカル生成物へ切り替える方針を確定する。**無条件の一括削除でテスト入力を消さない**。LICENSE・Pumpkin一致・履歴・第三者資産を含め確認が済むまで `main` へマージ／公開しない。内部実装の他のP1作業は継続可能。
+- [ ] **P0-3 再配布・出所の隔離判断（統合/公開ブロッカー — Stage F1）** — この枝は `datapacks/vanilla/`、1,180 NBTテンプレート、`config_packets.bin`、`assets/pblocks.json` 等を追跡しており、README/THIRD_PARTYの「jarからローカル生成・非コミット」という記述と矛盾する。以下の D1〜D5 で解消するまで `main` へマージ／外部公開しない（内部実装は並行可能）：
+  - [ ] **D1/D2 (`F1-1`)**: `tools/vanilla_data/gen_vanilla_data.sh` で `datapacks/vanilla/`（1,165 JSON + 1,180 `.nbt`）、構造物/バイオームタグ、`config_packets.bin`、`assets/*_1211.bin` を固定 1.21.1 `server.jar` から一括再生成・ハッシュ照合する。
+  - [ ] **D3/D4 (`F1-2`)**: Pumpkin (GPL-3.0) とバイト一致する旧 `assets/pblocks.json`・`assets/properties.json`・`datapacks/vanilla/multi_noise_biome_tree.json`、および出所不明の `resourcepack.zip` を消費者ごと自前生成物に切り替え、`git rm --cached` + 再混入防止 fail-closed ゲートを追加する。
+  - [ ] **D5 (`F1-3`)**: `LICENSE` / `NOTICE` / `THIRD_PARTY.md` / `README.md` を実ツリーと一致させ、旧データの履歴を含まない公開用クリーン基点（orphan/squash）を用意する。
 - [ ] **P0-4 native比較契約の固定** — Fossilが**正に配置される**fixture、complete FULL chunks、必要halo、sourceの生成順、2回のnative採取の再現性を定義。artifactに入力・SHA・対象セル数・除外数・pending tick・writerを記録し、古い測定値の流用を防ぐ。
 
 ### P1 — Template finalization（**最優先の実装列**）
@@ -56,19 +59,34 @@
 
 ### P2 — 全WorldGenへ段階的拡張
 
-- [ ] **P2-1 汎用template / processor / structure starts** — [仕様](worldgen-parity/README.md)。現在のfossil専用full-cube制約を拡張する前に、processorの拒否理由（gravity、位置条件、NBT変更、holder等）をケース別にnative照合。Template Pool / Jigsaw / structure placement / start・reference / exclusionとbiome relocationを実装。**34定義・16アルゴリズム型**を別々に扱い、実配置・NBT・tickを持つ正のfixtureで受け入れを記録。
-- [ ] **P2-2 残るconfigured featuresと実chunk差分** — `src/generation_contract_tests.rs` の明示未実装 `bonus_chest`・`end_spike` を対応。codecは外側のmatchだけでなく必須child/provider/modifierの実パースとRNG消費を検証。`sculk_patch` は旧監査の52/213差分を最新HEAD・同一population順で再計測し `sculk_gate.py --require-match` で判断。特定seedで残る `weeping_vines` 1セル差も独立fixtureで閉じる。差が増えた理由は到達率と実行stageに分解する。
-- [ ] **P2-3 三dimensionの通常サーバー経路** — Overworldの多biome境界、Nether/Endのterrain・features・structures、surface、aquifer、carver、spawnsを実クラス・full chunkで比較。`MC_SPINE_WG_PRESET=end|nether`＋`NOFEAT` はoffline terrain診断に限定されるため、通常のserverのchunk生成→runtime→save/reload→protocolまで別途実装して確認。必要な代表seed・負座標・構造物境界を含める。
+- [ ] **P2-1 汎用template / processor / structure starts** — [仕様](worldgen-parity/README.md)。**34定義・16アルゴリズム型**すべてが `src/structure_pipeline.rs` に dispatch 先と scripted oracle TSV を持つ。残る作業は：
+  - [x] **P2-1-T0**: `StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マーク（template/jigsaw 経路）＋ `Feature.markAboveForPostProcessing` ＋ promotion 限定 `BushBlock` 除去（`2ee2560`, `village-taiga` 0 / 884,736 達成、promotable manifest 12行）。
+  - [ ] **P2-1-T1**: チャンク昇格時（`postProcessGeneration`）の非空流体セルに対する fluid tick 予約・配送接続。
+  - [ ] **P2-1-T2**: `structure_pipeline::load_defs_inner` で1つの不正な構造物 JSON が全パイプラインを `None` に落とす欠陥を要素単位の fail-skip + ログに修正。
+  - [ ] **P2-1-T3 & 残存構造物受入（進行中）**: 汎用構造物 capture レシピ整備、`ruined_portal` B-run、および未実チャンク受入の 24 定義（Batch B1: `igloo`/`shipwreck`/`ocean_ruin`/`ruined_portal_*`、B2: `village_*`/`pillager_outpost`、B3: `ancient_city`/`bastion_remnant`/`trail_ruins`/`trial_chambers`、B4: `mineshaft_mesa`/`buried_treasure`/`desert_pyramid`/`swamp_hut`/`monument`/`mansion`）の段階的受入。
+- [ ] **P2-2 残るconfigured featuresと実chunk差分** — `bonus_chest` は実装済み。End で唯一未実装の `minecraft:end_spike` を実装し native oracle と照合する。codecは外側のmatchだけでなく必須child/provider/modifierの実パースとRNG消費を検証。`sculk_patch` は最新HEAD・同一population順で再計測し `sculk_gate.py --require-match` で判断。
+- [ ] **P2-3 三dimensionの通常サーバー経路（Stage F2 の中核）** — `MC_SPINE_WG_PRESET=end|nether` は offline 診断限定のため、以下の S0〜S4 で通常サーバーの3次元生成・保存・配信・移動を完成させる：
+  - [x] **P2-3-S0**: `tests/protocol767.py` CLI ハーネスの次元対応（`ffb7a22`, `dimension_type` の `min_y`/`height`/`has_skylight` 動的解釈）。
+  - [ ] **P2-3-S1（進行中）**: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ（同一 seed 初期化）、`chunk_data` / `write_light_arrays` への `DimId` 配線。
+  - [ ] **P2-3-S2a〜d（重大欠陥修正）**: 9つのワールドストア（`S2a`: `WORLD` 40箇所 + 次元別セーブファイルと旧 `world_overlay.bin` 互換、`S2b`: `CHESTS`/`FURNACES`/`CROPS`、`S2c`: `SIGNS`/`PENDING_BLOCKS`/`BACKOFF`/`PLUGIN_CELLS`、`S2d`: `POS_STORE`）のキーへ `DimId` を導入し、異次元の同一座標が上書きし合う欠陥を解消する。
+  - [ ] **P2-3-S3**: Nether/End の 16 セクション（`0..256`）チャンク構築と `has_skylight == false` 時の `skyLightMask = 0` 配信。
+  - [ ] **P2-3-S4**: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン次元復元の wire 検証。
 
 ### P3 — M2 gameplay / M3性能（WorldGenと証拠を混ぜない）
 
-- [ ] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)。光・衝突shape・プレイヤー操作・inventory/chest・item pickup・block updates・mob・戦闘・死/respawn・craft/炉・天候/昼夜を、1.21.1 native・実wire・別接続での状態再取得・保存後で確認。旧gameplayの進捗表に古い数値・「未着手」が混在するため、現行コードと証拠で各項目を再棚卸しし、未実装と未検証を分離する。
-- [ ] **P3-2 生成の並列化と性能gate** — [仕様](chunk-parallelism/README.md)。現在はterrain先読みworkerとtickロック分離が中心でfeatureの完全並列生成は未証明。worker 1/4/8で出力digest・RNG・実チャンクの全stateを比較し、ownerによる**vanillaと同じ書込み順**で確定。panic・キャッシュ世代・peak RSSを確認してから `WARM=1` の同一負荷CPU秒・RSS・20TPS・tick P99を測定。CPU優位を測れないならM3未達と記載。
+- [ ] **P3-1 M2観測可能なゲーム操作** — [合格範囲](PLAN.md)・[Horizon計画](horizon-gameplay/README.md)。チェスト/樽/エンダーチェスト・遅延 LootTable・waterlogged chest（Slice 3a〜3d、`0fa6807`）、衝突/段差（Slice 4a）、流体高/水流押し/溶岩接触（Slice 4b）、押し合い/cramming/空間グリッド（Slice 4c）まで完了。残る作業：
+  - [ ] **Slice 4d（進行中）**: `LivingEntity.travel` の水中/溶岩移動・浮力・落下減衰と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）。
+  - [ ] **後続スライス**: 構造物 Entity スポーン初期化と `spawn_overrides`、戦闘・死亡/リスポーン・クラフト/精錬・天候/昼夜の CLI 実 wire 往復検査。
+- [ ] **P3-2 生成の並列化と性能gate（M3 P1〜P5）** — [仕様](chunk-parallelism/README.md)。Terrain Slice 1 で terrain-only は 3.7〜4.7x 高速化済みだが、feature 込み `full` で CPU が +88%（`full - NOFEAT` +156%）増加している欠陥を以下の順で解消する：
+  - [ ] **M3 P1a（進行中）**: 負荷非依存カウンタ（M1〜M5）＋ `TERRAIN_STORE_BOUND` (`512` vs `1536`) A/B 測定による原因特定。
+  - [ ] **M3 P1b〜e**: ラウンド単位 `TerrainShare`（`bases`/`beards`/`cols`）と `terr_c` の `Arc` 化。
+  - [ ] **M3 P2**: 常駐 `PalettedSection` ストアによる `write_light_arrays` / `block_at` 再計算の排除。
+  - [ ] **M3 P3〜P5**: `CARVERS`/`FEATURES` 決定性並列化、`DfProg` SIMD バッチ評価、ライト/配信仕上げと `WARM=1` 代表負荷比較。
 
 ### P4 — 統合前のゲート（自動ではmergeしない）
 
 - [ ] **P4-1 同一SHAの全gateと独立レビュー** — `tests/verify.sh` 完走、native oracle、本番wire、mutation、serial/parallel、adapter、layers/debt、Fossil/structure/feature・dimension回帰の結果を同一revisionで収集。hosted CIを使えない場合は未実行と明記。過去の[Issue #7](https://github.com/nekomario28/mc-spine/issues/7)は古いSHAのレビューなので、現行変更に対して独立レビューを取り直す。
-- [ ] **P4-2 配布物・ライセンス・リリース判定** — P0-3を完了してtracking/生成物、NOTICE、依存ライセンスと履歴を照合。M2/M3/G1〜G4の証拠と既知の未対応範囲を明示して初めて `main` 向け実装PR/リリースを判断する。合格していないテストを緑扱いしない。
+- [ ] **P4-2 配布物・ライセンス・リリース判定（Stage F1 / F2 出口）** — P0-3（D1〜D5）を完了して tracking/生成物、NOTICE、依存ライセンスとクリーン履歴を照合し、Stage F1（Alpha 公開フォーク）または Stage F2（3次元＋M2/M3 実用公開フォーク）として既知の未対応範囲を明記した上で公開・リリースを判断する。合格していないテストを緑扱いしない。
 
 ## 次の着手
 

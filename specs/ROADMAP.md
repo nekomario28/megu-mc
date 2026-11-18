@@ -43,6 +43,37 @@ Mineshaftのadmission・dispatcher・piece配置は [Rust接続checkpoint](../ev
 資産の出所・再生成・配布方針（P0-3）は並行した残件。
 内部調査の続行と、外部配布・リリースの承認は別判断である。
 
+### 公開可能フォーク（Public Fork Release）への2段階収束計画（2026-11-19）
+
+外部へ公開できるフォークを最短で作るため、**法的にクリーンな Alpha 公開（Stage F1）**と、**3次元・軽量性・主要ゲームプレイを揃えた実用公開（Stage F2）**の2段階に分け、現在解消すべき欠陥・不足を明示的なスライスとして実行順へ組み込む。
+
+#### Stage F1: 法的にクリーンな Experimental / Alpha 公開フォーク（P0-3 / D1〜D5 完結）
+- **F1-1 (`P0-3 D1/D2`: 公式 `server.jar` からの全資産ローカル生成化)**:
+  - `tools/vanilla_data/gen_vanilla_data.sh` を拡張し、現在 Git 追跡されている `datapacks/vanilla/`（JSON 1,165件＋構造物 `.nbt` 1,180件）、構造物/バイオームタグ、`assets/*_1211.bin`、`config_packets.bin` をすべて利用者の固定 1.21.1 `server.jar`（SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`）から1コマンドで決定論的に展開・生成できるようにする。
+- **F1-2 (`P0-3 D3/D4`: GPL 同値アセット・Mojang 派生物の追跡解除と fail-closed ゲート)**:
+  - Pumpkin (GPL-3.0) とバイト一致が報告されている旧 `assets/pblocks.json`・`assets/properties.json`・`datapacks/vanilla/multi_noise_biome_tree.json`、および `resourcepack.zip` 等の不要・未承認追跡ファイルを消費者ごと自前生成データへ切り替え、`git rm --cached` と `.gitignore` を一致させる（テスト入力を無条件削除してスイートを壊さない）。
+  - 追跡禁止パスが再度ステージングされたら赤になる検査スクリプトをゲートに追加する。
+- **F1-3 (`P0-3 D5 / P4-2`: クリーン履歴ブランチ・ライセンス表記の確定)**:
+  - `LICENSE`（Apache-2.0）・`NOTICE`・`THIRD_PARTY.md`・`README.md` の記述と実ツリーを完全一致させ、過去コミット履歴の Mojang/第三者データを含まないクリーンな公開用ブランチ（orphan / squash 基点）を切り出せる状態にする。
+
+#### Stage F2: 3次元・構造物・M2/M3 軽量性を備えた実用公開フォーク
+- **F2-1 (`P2-3-S1〜S4`: 3次元サーバーの通常経路とワールドストア次元分離 — 重大欠陥の解消)**:
+  - `S1`（進行中）: `DimId` (`Overworld | Nether | End`) と次元別 `Gen` レジストリ、`chunk_data` / `write_light_arrays` への次元スレッド化。
+  - `S2a〜S2d`（必須欠陥修正）: 現在次元キーを持たない 9 つのワールドストア（`WORLD` 編集オーバーレイ、`CHESTS`、`FURNACES`、`CROPS`、`SIGNS`、`PENDING_BLOCKS`、`BACKOFF`、`PLUGIN_CELLS`、`POS_STORE`、計143箇所）に `DimId` を導入し、Nether/End のブロック編集やコンテナが Overworld `(0,0)` に混ざる欠陥を解消する。次元別保存と旧 `world_overlay.bin` の Overworld 後方互換読込を保証する。
+  - `S3`: Nether/End の 16 セクション（`min_y = 0`, `height = 256`）チャンク配信と `has_skylight = false` での `skyLightMask == 0`（空光配列0件）送信。
+  - `S4`: `0x2b` Join Game / `0x47` Respawn による次元間遷移・ポータル移動・ログイン時次元復元。
+- **F2-2 (`M3 P1〜P2`: Feature 生成時の CPU `+88%`（`full - NOFEAT` `+156%`）欠陥の解消)**:
+  - `P1a`（進行中）: 負荷非依存カウンタ（M1〜M5）と `TERRAIN_STORE_BOUND` (`512` vs `1536`) A/B により、worker/owner 間の `cols`/beardifier 重複と `terr_c` 退避の寄与を確定する。
+  - `P1b〜e`: ラウンド単位の `TerrainShare`（`bases` / `beards` / `cols`）と `terr_c` の `Arc` 化で重複計算を排除する。
+  - `P2`: 常駐 `PalettedSection` ストア（~48 KiB/chunk）を導入し、`write_light_arrays`（27〜33 ms/chunk）や anti-xray の `block_at` 再計算を O(1) パレット参照へ置き換える。
+- **F2-3 (`P2-1 / P2-2`: 構造物実チャンク受入の拡大と残存 Feature / 境界の閉鎖)**:
+  - `P2-1-T3`（進行中）: 汎用構造物 capture レシピの確立、`ruined_portal` の独立 B-run、および Kernel A/B/C 代表構造物（`igloo`, `monument`, `village_plains` 等）から残る 24 定義の段階的受入。
+  - `P2-1-T1` / `P2-1-T2`: チャンク昇格時（`postProcessGeneration`）の非空流体セル tick 起動、および単一構造物 JSON 不良で全パイプラインが `None` になる脆弱性の解消。
+  - `P2-2`: End の `minecraft:end_spike` 実装＋native oracle 照合（Configured Feature 到達率 100% 化）。構造物 `spawn_overrides` は P3/M2 の構造物内スポーン契約として接続する。
+- **F2-4 (`M2 Gameplay`: 流体 `travel` と残る操作契約の閉鎖)**:
+  - `Slice 4d`（進行中）: `LivingEntity.travel` の水中/溶岩浮力・水流減衰・落下速度調整と Nether `ultraWarm` 溶岩押し流し倍率（`0.0023333333333333335`）の接続。
+  - 後続スライス: 構造物 Entity スポーン初期化、プレイヤー操作・戦闘/死亡/リスポーン・精錬・天候等の CLI live wire 往復検査。
+
 **原因記述の訂正:** 端のair差とsnowy差を位置の近さだけで同じ原因にまとめた推測は
 撤回する。訂正根拠・区別すべきlookup・次の反証は
 [chunk差分記録](template-finalization/slices/04-chunks.md)を参照。
