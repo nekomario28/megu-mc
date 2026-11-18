@@ -18,6 +18,7 @@
 | jar 側の oracle（参照実装を実行して照合） | `vanilla_java.py` を土台にした `*_oracle.py` 群。既定は**保存済み参照との照合**で、`--output` を明示したときだけ記録を書き換える。固定 jar と JDK が要る |
 | 保存 world / chunk を段ごとに比べる | `chunk_triage.py`（保存 world を直接読む）、`port_triage.py`（port をビルドして dump し triage へ）、`carver_diff.py`（ブロック単位）|
 | native capture を取り直す | `sculk_capture.sh`、`*_fixture.sh`、`native_chunk_capture.py`。jar・JDK・（`config_packets.bin` だけは）EULA 同意が要る |
+| 構造物1つを capture から manifest 行まで通す | `structure_capture.py`（下の[構造物 capture のレシピ](#構造物-capture-のレシピ)）。候補chunkの確定 → 固定jarで `structures` stage capture → **capture自身の `structures.starts` で start を確認** → `port_triage` → manifest 行 |
 | 出自と層の監査 | `provenance_scan.py`（コード共有の測定）、`pack_provenance.py`（同梱 pack と固定 jar の data の距離）、`asset_coverage.py` |
 
 ## 前提データと生成段階（clone 直後）
@@ -79,12 +80,57 @@ Python の fixture 段が走る（測った範囲は [tests/README.md](../tests/
 | `sculk_trace.py summary\|sanity\|passes\|windows\|draws\|names\|compare-passes\|extract\|patches` | trace の読み取り・検査・比較を**1つの道具**にした。`sanity` は「窓に draw が入っていない」「`SPLACE` が feature 表に無いクラスを指す」「`run.log`（= log4j、行順がプログラム順でない）を位置で切ろうとしている」「port のログに `[wgprof]` と `[wgdump]` の2 phase が混ざっている（= 配置行と arm 済み draw 行が別 run のもの）」を**不合格にする**。実測: 健全な capture = SANE、`ebq`（=`ConfiguredFeature`）で arm した capture = UNUSABLE、draw フック無し = UNUSABLE。`compare-passes` は pass 単位で試行 origin 集合を突き合わせ、差の分布と最初の食い違いを出す |
 | `sculk_trace.py extract <run.log> [--origin x,y,z] [--lines N]` | `SculkSpreader$ChargeCursor.update` の trace を抽出し **(round, index) で整列**して比較する（cell の集合ではなく trajectory を比べる）。共有キーが食い違えば exit 1。native 側の先頭スライスは `tests/data/sculk_cursor_1211.tsv`。capture はパッチの出現順と `r` の通し番号が実行ごとに変わるので、`--origin` でパッチを選び `r` をパッチ内 round に正規化する（実測: 同一パッチは 2 capture で 60/60 一致）|
 | `sculk_gate.py <world> <dump.bin> <n> <x0> <z0> [--require-match]` | sculk ファミリ（`sculk`/`sculk_vein`/`sculk_catalyst`/`sculk_shrieker`）のセルだけを参照 region と port dump で照合する。feature 単体の oracle が使えない `sculk_patch` の合格条件。sculk の無い参照は exit 2（何も証明しない）。[経路と実測値](../specs/worldgen-parity/sculk-patch.md) |
+| `structure_capture.py --structure <id> --seed <n> --dimension <d> --root <captures> [--chunk CX CZ] [--scan-radius N]` | **構造物1つのレシピ**。`(structure_id, seed, cx, cz, dimension)` から native capture・port dump・triage・`fixture_suite` manifest 行までを1コマンドで作り、`--manifest <既存manifest>` で昇格する。chunk を省略すると port の `--worldgen-structure-candidates`（候補/admit probe、spacing セルごとに1回）で候補を列挙し、biome hint で順序を決める。**候補は必要条件でしかない**（probe 自身が `biome_and_pieces_unchecked=true` と書く）ので、採否は capture した chunk の `structures.starts` で決め、start が無い capture は `refuted.txt` を残して次へ進む。既存 capture は上書きしない |
 | `chunk_world_fixture.sh <tag> <cx> <cz> <n> <terrain\|carvers\|features\|structures>` | 固定jarの同一座標regionをforceloadし、mc-spineの同じstage dumpと`carver_diff`で比較する。参照chunkの完成を先に検査する |
 | `ore_fixture.sh <tag> <keep> [n]` | `ore_*`/`disk_*` のうち `<keep>` 以外の placement を `count: 0` にした world を作る（1 feature 隔離） |
 | `vanilla_nofeat_pack.py <jar> <world> [--keep-carvers]` | biome の features と carvers を空にした pack を書く（地形だけの比較用） |
 | `native_chunk_capture.py <world> <cx> <cz> [--preset ...] --out <tsv[.gz]>` | 参照 world の 1 chunk を **正規化 state（名前＋全property）** の TSV にする。property を落とす name 比較では接続bit・向き・waterlogged が見えないため、`StructurePiece.placeBlock` の postprocess が決める `oak_fence` の接続bit のような差はこの形でしか固定できない。出力形式は port の `MC_SPINE_WG_DUMP_CANON` と同じ（絶対座標、`minecraft:air` は落とす）で、`tests/data/` の chunk 固定具の生産者。`air` 以外の空気（`cave_air`/`void_air`）は両側とも残す |
 | `vanilla_region_blocks.py` | region の location entry と対象 payload だけを読む共通層。region 全体の保持・永続キャッシュはせず、割当sector／ファイル境界を検査する。[I/O量と互換検証](../evidence/foundation/region-reader/README.md) |
 | `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings] [--accept-eula]` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/**` (worldgen と tags/block)・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv`・`biome_probe_ties_1211.tsv`（range 端の同距離 tie 点。子の走査順を固定）・`random_next_int_1211.tsv`（乱数クラスの `nextInt(bound)` 列のハッシュ、数値のみ）、`--accept-eula` 付きで `config_packets.bin` (`capture_config_packets.py` 経由) を生成する。どの出力が追跡されているかは `git ls-files` で確認する（このブランチは data の多くを追跡しており、clone 直後の必須手順ではない）。jar の sha1 と Fabric mapping の sha256 を固定し、公式 data generator の出力と突き合わせてから書く。Java 21 が必要。出力は決定的 |
+
+## 構造物 capture のレシピ
+
+`structure_capture.py` は「構造物の capture が 6 段の手作業で作られ、その各段がずれる場所だった」
+ことへの道具で、段はどれも既存の道具が持つ。新しい比較器も新しい採否規則も持たない。
+
+```sh
+# 候補だけ見る（capture しない）
+python3 tools/structure_capture.py --structure minecraft:igloo --seed 4242 \
+    --dimension overworld --root ~/mc-spine-local/captures/matrix-v3 --dry-run
+# capture → triage → 行
+python3 tools/structure_capture.py --structure minecraft:igloo --seed 4242 \
+    --dimension overworld --root ~/mc-spine-local/captures/matrix-v3 --scan-radius 512
+# 既存 capture を採り直して行を既存 manifest に昇格（経路は manifest の dir 相対）
+python3 tools/structure_capture.py --structure minecraft:monument --seed 4242 \
+    --root ~/mc-spine-local/captures/matrix-v3 --chunk 202 -369 \
+    --capture-dir ~/mc-spine-local/captures/matrix-v3/nat-4242-monument \
+    --manifest ~/mc-spine-local/captures/matrix-v2/manifest-promotable.json
+```
+
+1. **admission** — `mc-spine --worldgen-structure-candidates <seed> <cx> <cz>`（port 自身の候補
+   probe）。chunk を spacing で割ったセルの候補を返すので、**セルの角を1回聞けばセルが1つ埋まる**。
+   返るのは「そのセルの候補」であって「聞いた chunk」ではない。frequency reducer と exclusion
+   zone の判定も同じ行に出る。ring 型（strongholds）は点列を返し、セル候補ではない。
+2. **biome hint** — `MC_SPINE_BIOME_AT` の quart biome を構造物の `biomes` タグ（`datapacks/`
+   から解決）と突き合わせて試行順を決める。**hint であって判定ではない**。
+3. **capture** — `tools/carve-agent/native_fixture.sh`（frozen / `MC_FIXTURE_STAGE=structures` /
+   自前の `order.tsv` / `boundary.json`）。jar は sha1 で固定。
+4. **start の確認** — capture した chunk の `structures.starts` に要求した構造物が居なければ
+   その capture は **REFUTED**（`refuted.txt` を残して次候補へ）。候補が通ったことは start が
+   あることの証明ではない。
+5. **比較** — `port_triage.py --height-window`（build/env/dump/triage 一体）。`--use-pop-order`
+   で capture の `order.tsv` を `MC_SPINE_POP_ORDER` として渡せる。既定は渡さない
+   （`matrix-v1|v2` の行は既定順序で 0 になっており、順序は行ごとの主張だから）。
+6. **行** — `level.dat`・窓の region・`dump.bin`・`run.log`・`order.tsv` を sha256 で束縛し、
+   `runtime_writes > 0` なら `inputs.expected_runtime_writes` を **`fixture_suite` と同じ読み取り
+   コード**（`fixture_suite.runtime_write_record`）で書く。宣言と検証が同じ owner を持つ。
+
+退避則: 既存 capture ディレクトリは上書きしない（capture は行が引用する証拠）。失敗した capture も
+消さない。`--capture-dir` は「既にある capture を測り直す」経路で、`--chunk` が要る
+（`boundary.json` は窓の大きさを持つが原点を持たない）。
+
+再現性の確認は「既存行を作り直して native と port の両方が byte 一致すること」で行う
+（実測は [証拠](../evidence/gameplay/feature-parity/structure-capture-recipe-20261119.md)）。
 
 ## 比較（両側を同じ土俵で読む）
 

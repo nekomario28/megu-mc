@@ -293,6 +293,9 @@ public class CarveLog {
     static final java.util.Set<String> RUNTIME_CELLS = new java.util.HashSet<>(
         java.util.Arrays.asList(System.getProperty("runtimecell", "").split(";")));
     static final int[] FEATURE_BOX=box("featurebox"), RUNTIME_BOX=box("runtimebox");
+    /** `-Dfeaturestack=1`: append the caller stack to every `FCELL` line (see {@link #featureCell}). */
+    static final ThreadLocal<Boolean> STACK = ThreadLocal.withInitial(
+        () -> System.getProperty("featurestack") != null);
     /** A second feature-write box: the halo's chunks, not just the target's. */
     static final int[] FEATURE_BOX2=box("featurebox2");
     static int[] box(String property) {
@@ -332,9 +335,25 @@ public class CarveLog {
         // `s=` is the placement-window serial (SculkLog), so a write can be ordered against
         // the `BPRED`/`VSHAPE` records of the window it happened in: a predicate that reads a
         // cell a *later* window writes looks exactly like a predicate that ignores it.
-        System.out.println("FCELL " + x + " " + y + " " + z + " state=" + state
-            + " wrote=" + wrote + " feature=" + f[0] + "," + f[1] + " chunk=" + c[0] + "," + c[1]
-            + " s=" + SculkLog.windowSerial());
+        //
+        // `-Dfeaturestack=1` appends the caller stack. `feature=<i>,<step>` is the *last*
+        // `setFeatureSeed`, which is an attribution-by-context: a structure pass, a
+        // post-processing pass or a second feature pass for the same chunk all inherit it, so
+        // a cell that only the *caller* identifies (the igloo's `grass_block[snowy=true]`
+        // under the floor, 2026-11-19) cannot be attributed from `feature=` alone. Off by
+        // default so an existing capture's line bytes stay comparable.
+        StringBuilder line = new StringBuilder()
+            .append("FCELL ").append(x).append(' ').append(y).append(' ').append(z)
+            .append(" state=").append(state).append(" wrote=").append(wrote)
+            .append(" feature=").append(f[0]).append(',').append(f[1])
+            .append(" chunk=").append(c[0]).append(',').append(c[1])
+            .append(" s=").append(SculkLog.windowSerial());
+        if (STACK.get()) {
+            line.append(" stack=").append(java.util.Arrays.stream(Thread.currentThread().getStackTrace())
+                .skip(2).limit(10).map(StackTraceElement::toString)
+                .collect(java.util.stream.Collectors.joining(" | ")));
+        }
+        System.out.println(line);
     }
 
     /**

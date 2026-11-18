@@ -46,6 +46,7 @@ python3 tests/weird_sampler_oracle_test.py
 python3 tests/suite_compare_test.py
 python3 tests/chunk_triage_test.py
 python3 tests/port_triage_test.py
+python3 tests/structure_capture_test.py
 python3 tests/p0_2_audit_test.py
 
 echo "== module layering"

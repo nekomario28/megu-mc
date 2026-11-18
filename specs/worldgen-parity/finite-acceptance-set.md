@@ -43,7 +43,10 @@ Biome境界: 現状**専用行を持たない**。v1では「各windowに跨るb
 
 受入必須(現時点でcapture/gateが存在): `mineshaft`, `stronghold`, `nether_fortress`,
 `nether_fossil`, `end_city`, `ruined_portal`(captureのみでgate未), `village`(taiga,
-**MATCH — 2026-11-18に3→1→0/884,736**。`expected_runtime_writes` count 5 (`writes_sha256 62fc3ddc…`) は独立captureで同一。残差1セル `(82,69,−500)` は P2-1-T0 + `Feature.markAboveForPostProcessing` + promotion限定 `BushBlock` 除去で閉じた), `trial_chamber`(stronghold chunk内で部分), `jungle_temple`(MATCH —
+**MATCH — 2026-11-18に3→1→0/884,736**。`expected_runtime_writes` count 5 (`writes_sha256 62fc3ddc…`) は独立captureで同一。残差1セル `(82,69,−500)` は P2-1-T0 + `Feature.markAboveForPostProcessing` + promotion限定 `BushBlock` 除去で閉じた), `trial_chamber`(stronghold chunk内で部分), `ocean_monument`(MATCH — 2026-11-19、`(202,−369)` で
+0/98,304)、`igloo`(HOLD — `(37,−512)` で 8/98,304、`grass_block[snowy]` 8セル、原因未解、
+§6 2026-11-19)、`village_plains`(HOLD — `(−338,−384)` で 159/98,304、jigsaw piece 差、
+§6 2026-11-19), `jungle_temple`(MATCH —
 2026-11-18に121→**0**(47→0)。残差47はdripstone_cavesの地下グループで、原因は
 `ClampedNormalInt`(`bpr`)の`f2i`切り捨てを`round()`で実装していたこと。樹冠/east-edge bandは残差0。
 `evidence/gameplay/feature-parity/jungle-east-edge-vine-edge-shape-20261118.md`,
@@ -60,7 +63,10 @@ Biome境界: 現状**専用行を持たない**。v1では「各windowに跨るb
 3. `fixture_suite` v1 manifestの行として緑: frozen・`runtime_writes=0`(または宣言済みexpected集合)・
    stage一致・seed一致・入力sha256束縛・子の比較n*n・skip 0。
 4. heightmapは保存WORLD_SURFACE/MOTION_BLOCKING対照で0不一致(end-city行の実績と同じ形式)。
-5. 2つの独立native runが存在するseed(4242)では、A/B両方に0差であること。
+5. 2つの独立native runが存在するseed(4242)では、A/B両方に0差であること
+   (2026-11-19: `ruined_portal` `(6,7)` は B run `matrix-v3/nat-4242-ruined-portal-b` で充足。
+   ただし A と B の `native.bin`/`order.tsv` は byte 一致した — 窓が決まれば decorate 順序も
+   決まるので、これは run の独立性の確認であって順序の独立性の証明ではない)。
 
 ### 5. 受入の宣言(この文書のGoal文)
 
@@ -268,6 +274,62 @@ binaryで再生成して比較した。raw: `audit/p2-1-acceptance-s04-s07-20261
   - **対照**: `--mode terrain` = **76,736 / 884,736**、wrong-seed `4243` = **185,879 / 884,736**。
   - **`manifest-promotable.json` 昇格**: `ow-4242-structures-4--32--64-384-n3` を追加し **11 → 12行、12 MATCH / 0 DIFF / 0 INVALID、exit 0** (`expected_runtime_writes`: count 5 = `air`×3 + `water[level=1]`×2、`writes_sha256 62fc3ddcc136e96cad1e45fc197a744fbe7f807d0a47db5ae2ecdda09b7cdde1`、両独立captureで同一)。なお(6,7)・(74,−41)と同様に `(4,−32)` 3×3 も凍結済み §2 には含まれないため §3 の `village` = MATCH と `manifest-promotable.json` を支える行であり、§2 の追加は別 revision に委ねる。
   - **seed-0 64-chunk identity dump(`MC_SPINE_WG_DUMP_N=8`)**: `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def`(25,165,824 B) **bit-identical**。詳細は `evidence/gameplay/feature-parity/village-taiga-p2-1-t0-and-mark-above-closure-20261118.md`。
+
+**2026-11-19 構造物batch(T3レシピ + `ruined_portal` B-run + `igloo`/`monument`/`village_plains`、基点 `0fa6807`)**
+
+source `0fa6807`(`perf/worldgen-parallel`、worktree dirty 0)。port binary `target/debug/mc-spine`
+(sha256 `7dc623bf3372e5e8d71ad6cab6b65196f2a3ba7f125862234b4371524c4ef7ca`、`cargo build --offline --locked -j6`)。
+pinned jar sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`(`/home/yuu/tmpx/carverfresh/server.jar`)。
+**`src/` は無変更**。capture はすべて `tools/structure_capture.py`(新しいレシピ)で作った。
+raw: `/home/yuu/mc-spine-local/audit/p21t3-20261119/`、capture/dump: `/home/yuu/mc-spine-local/captures/matrix-v3/`。
+
+- **レシピの再現性(§4-1〜4-4 を満たす道具の検証)**: 既存行を2件作り直し、native・port の両方が
+  **byte一致**した — jungle `(74,−41)`(native.bin `77964c22…a715bf`、dump `77964c22…a715bf`、
+  `order.tsv` `67ef353b…`)、fortress `(−25,6)` 0/256(native.bin `4df69f13…`、dump `4df69f13…`、
+  `order.tsv` `7fb14b7f…`、`expected_runtime_writes` count 16 / `writes_sha256 81cdbd85…` が
+  既存宣言と bit 一致)。row は既存 id(`ow-4242-structures-74--41--64-384`)を再生成し、
+  自前 manifest で `1 MATCH / 0 DIFF / 0 INVALID, exit 0`。
+- **ruined-portal の §4-5(A/B 両方に 0 差)— 充足**: `matrix-v3/nat-4242-ruined-portal-b`
+  (独立 run。自分の `order.tsv` を生成)を capture し、`--world-b` で A と並べた。
+  port vs native B **0 / 98,304**、**native A vs B 0(all_air)/0(non_air)**、dump
+  `2e4e3fed…ac95f9e`(= 既存 `matrix-v2/dumps/ruined-portal/dump.bin` と byte 一致)。
+  A と B の `native.bin`・`order.tsv` は **byte 一致**なので、「独立 run」は A/B の一致を
+  再現したことであって decorate 順序の独立性の証明ではない(窓が決まれば順序も決まる)。
+  行 `ow-4242-structures-6-7--64-384-b` として `manifest-promotable.json` に昇格。
+- **ocean_monument — Overworld `(202,−369)` seed 4242 — 0 / 98,304(MATCH)**。
+  `matrix-v3/nat-4242-monument`、start `(202,−369)` `minecraft:omb#0`
+  BB `[3203,39,−5933,3260,61,−5876]`(chunk 全体が monument BB の内側)、quart biome は
+  `deep_cold_ocean` 1536/1536。dump `e8a24892…`, 両側 non_air 28,976。`WORLD_SURFACE`/
+  `MOTION_BLOCKING` は 63 で一致。行 `ow-4242-structures-202--369--64-384` を昇格。
+- **igloo — Overworld `(37,−512)` seed 4242 — DIFF 8 / 98,304(受入しない)**。
+  残差は全部 `grass_block[snowy=true]`(native)→ `grass_block[snowy=false]`(port)、y=80、
+  x=594..596 / z=−8189..−8182 の8セルで、igloo `iglu#0` BB `[592,81,−8189,598,85,−8182]`
+  の d=1 halo 内。`MOTION_BLOCKING` heightmap は port 対照 **0 列差**、両側 non_air 31,721 で一致。
+  `run.log`(`-Dfeaturebox` 付き再capture)では native がこの8セルを**構造物 pass**
+  (`feature=3,4`、igloo の 152 template セルと同じ pass)で書き、同じ chunk の freeze
+  (`feature=0,10`)は 47 セル書いており、その 72 兄弟セルは port も一致している。
+  詳細は [igloo の残差](../../evidence/gameplay/feature-parity/igloo-snowy-under-floor-20261119.md)。
+  **帰属は記述子単位で確定**: `-Dfeaturestack=1` 付き再capture の stack が
+  `IglooPiece.postProcess` → `TemplateStructurePiece.postProcess` → `StructureTemplate`
+  の shape 更新経路(`ent` 行372 の `flags & ~1` 書き戻し)を指し、そこから
+  `SnowyDirtBlock.updateShape`(`dnj.a`: `direction == UP` なら
+  `snowy = isSnowySetting(neighbor)`、`= state.is(BlockTags.SNOW)`)が
+  `snow_block` 直上の grass を `snowy=true` にする。BB 内で y=80 が grass の列がちょうど 8。
+  port 側の欠落は `src/template_structures.rs::update_shape` に `SnowyDirtBlock` の腕が
+  無いこと(呼び出し側 行1005/1011 は既存)。`src/` は本レーンで無変更。
+- **village_plains — Overworld `(−338,−384)` seed 4242 — DIFF 159 / 98,304(受入しない)**。
+  `matrix-v3/nat-4242-village-plains`、`jigsaw#0` BB `[−5408,64,−6151,−5394,68,−6144]` を含む
+  26 piece が窓内。内訳: `jigsaw#32` の BB 内 84 セル(port だけが `oak_planks` 24 /
+  `oak_stairs` 15 / `oak_log` 9+4+2 / `cobblestone` 7 を書く)、`jigsaw#21` 内 60 セル
+  (native の `oak_leaves[distance=1..4]` 44 + `oak_log` 4 を port は air)、`jigsaw#35` 4、
+  `jigsaw#54` 3(`dirt_path` と `grass_block` の入れ替え、`tall_grass`)。`MOTION_BLOCKING` は
+  port 対照 0 列差。両側 non_air 30,966 / 30,979。**未解**: jigsaw の piece 選択/配置の
+  最初の分岐は未測定。詳細は
+  [village_plains の残差](../../evidence/gameplay/feature-parity/village-plains-jigsaw-pieces-20261119.md)。
+- **suite**: `manifest-promotable.json` は 12 → **14 行**、**14 MATCH / 0 DIFF / 0 INVALID、exit 0**。
+- **§2 への追加はしない**: monument `(202,−369)`・igloo `(37,−512)`・village_plains `(−338,−384)`
+  は凍結済み §2 の window 集合の外にある。§2 の改定は revision 2 に委ねる(§6 は充足状況であって
+  宣言ではない、という §3/改定規則の discipline を維持する)。
 
 ## 改定規則
 

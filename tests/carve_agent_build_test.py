@@ -21,9 +21,16 @@ out.mkdir(parents=True, exist_ok=True)
 for source in [Path(p) for p in args if p.endswith('.java')]:
     if source.stem == os.environ.get('FAKE_OMIT_CLASS'):
         continue
-    blob = b'SPATCH SPLACE SPASS SDRAW SCURSOR SSPREADALL SRNG'
+    # Every marker `tools/build_carve_agent.sh` requires. This blob was written when the
+    # logger printed seven of them; the builder grew VSHAPE/EDGE/BPRED/HMP/MARK/MARKSUM/
+    # MARKERR afterwards, so the control case failed for a stale fixture instead of
+    # exercising the guard (measured 2026-11-19: three cases red on a clean tree).
+    blob = (b'SPATCH SPLACE SPASS SDRAW SCURSOR SSPREADALL SRNG '
+            b'VSHAPE EDGE BPRED HMP MARK  MARKSUM  MARKERR')
     if source.stem == 'Agent':
-        blob += b' SculkLog ebq edi eiv dyn duz dmu'
+        # Same drift as the marker list below: the builder's hook table grew past this
+        # blob, so the control case stopped reaching the probe it is named for.
+        blob += b' SculkLog ebq edi eiv dyn duz dmu dov eij eir dvs dvh duy'
         (out / 'SculkTransformer.class').write_bytes(b'transformer')
     marker = os.environ.get('FAKE_OMIT_MARKER')
     if marker:
