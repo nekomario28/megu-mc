@@ -1475,7 +1475,7 @@ pub(crate) fn terrain_share(round: u64) -> Option<std::sync::Arc<TerrainShare>> 
 // depend on this one.
 
 /// Number of M3 counters. Keep `M3_NAMES` in step with the indices below.
-pub(crate) const M3_N: usize = 41;
+pub(crate) const M3_N: usize = 43;
 
 // M1 - chunk starts, column builds and beardifier resolutions, owner against worker.
 pub(crate) const M3_CHUNK_STARTS_OWNER: usize = 0;
@@ -1523,6 +1523,10 @@ pub(crate) const M3_CARVER_NS: usize = 37;
 pub(crate) const M3_CARVER_N: usize = 38;
 pub(crate) const M3_FEATURE_NS: usize = 39;
 pub(crate) const M3_FEATURE_N: usize = 40;
+// M6 - the four-lane density evaluator: groups it evaluated, and groups a conditional jump
+// found divergent (finished on the one-lane path).
+pub(crate) const M3_DF4_VEC: usize = 41;
+pub(crate) const M3_DF4_BAIL: usize = 42;
 
 /// Counter names, in index order. The determinism test reports them, so this is a test
 /// helper: the run report groups them by metric instead of dumping the flat list.
@@ -1569,6 +1573,8 @@ pub(crate) const M3_NAMES: [&str; M3_N] = [
     "m5_carver_n",
     "m5_feature_ns",
     "m5_feature_n",
+    "m6_df4_vec",
+    "m6_df4_bail",
 ];
 
 /// The counters that are durations rather than counts. Everything else counts deterministic
@@ -1822,6 +1828,11 @@ pub(crate) fn m3_report() -> String {
         g(M3_WORKER_SECTIONS),
         g(M3_OWNER_SECTIONS),
         g(M3_EVICTED_UNCONSUMED)
+    ));
+    s.push_str(&format!(
+        "[m3] M6 df4 vec={} bail={}\n",
+        g(M3_DF4_VEC),
+        g(M3_DF4_BAIL)
     ));
     s.push_str(&format!(
         "[m3] M5 cols={:.1}ms/{} beard={:.1}ms/{} fill={:.1}ms/{} aquifer_cells={} surface_cells={} carver={:.1}ms/{} feature={:.1}ms/{}\n",
@@ -3190,6 +3201,25 @@ impl Gen {
         self.eval_c(self.final_density, x, y, z, &mut memo, Some(cc))
     }
 
+    /// [`Gen::block_density`] at the four consecutive columns `x..x+4`, all at one `(y, z)`.
+    ///
+    /// The four values are the four `block_density` values bit for bit (see `DF4`); the
+    /// vector arm exists because the terrain stage asks for the same row of a section 16
+    /// blocks at a time. A generator that kept the interpreter
+    /// (`MC_SPINE_DF_INTERP=1`) answers the four positions through it, so the A/B switch
+    /// keeps meaning what it meant.
+    pub(crate) fn block_density_x4(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> [f64; DF4] {
+        if let Some(prog) = self.dfprog.as_ref() {
+            return prog.eval_x4(self, Some(cc), x, y, z);
+        }
+        let mut out = [0.0f64; DF4];
+        for (k, o) in out.iter_mut().enumerate() {
+            let mut memo = HashMap::new();
+            *o = self.eval_c(self.final_density, x + k as i32, y, z, &mut memo, Some(cc));
+        }
+        out
+    }
+
     /// Density-function ids a node reads, for the grid reachability walk.
     fn push_kids(&self, id: usize, out: &mut Vec<usize>) {
         fn spl_kids(s: &Spl, out: &mut Vec<usize>) {
@@ -3356,12 +3386,14 @@ impl Gen {
             DF::Mul(a, b) => {
                 self.eval_c(*a, x, y, z, memo, cc) * self.eval_c(*b, x, y, z, memo, cc)
             }
-            DF::Min(a, b) => self
-                .eval_c(*a, x, y, z, memo, cc)
-                .min(self.eval_c(*b, x, y, z, memo, cc)),
-            DF::Max(a, b) => self
-                .eval_c(*a, x, y, z, memo, cc)
-                .max(self.eval_c(*b, x, y, z, memo, cc)),
+            DF::Min(a, b) => df_min(
+                self.eval_c(*a, x, y, z, memo, cc),
+                self.eval_c(*b, x, y, z, memo, cc),
+            ),
+            DF::Max(a, b) => df_max(
+                self.eval_c(*a, x, y, z, memo, cc),
+                self.eval_c(*b, x, y, z, memo, cc),
+            ),
             DF::Div(a, b) => {
                 let d = self.eval_c(*b, x, y, z, memo, cc);
                 if d == 0.0 {
@@ -3570,10 +3602,10 @@ enum Op {
     },
     /// `f + a * (s - f)`: pops `s`, `f`, `a` in that order.
     Lerp,
-    /// `a + c` / `a * c` / `a.min(c)` / `a.max(c)` for a compile-time `c`: one
+    /// `a + c` / `a * c` / `df_min(a, c)` / `df_max(a, c)` for a compile-time `c`: one
     /// slot instead of a push plus a two-slot op. `+` and `*` are exact under
-    /// exchange, and `f64::min`/`max` return the non-NaN operand in either
-    /// order, so the constant may sit on either side of the node.
+    /// exchange, and [`df_min`]/[`df_max`] return the non-NaN operand and the same
+    /// zero in either order, so the constant may sit on either side of the node.
     ///
     /// These are codegen forms of *this repository's* `DF::Add`/`DF::Mul`, which
     /// are plain arithmetic. Vanilla's codec instead builds a separate
@@ -3630,6 +3662,59 @@ enum Op {
     /// Discard the top slot.
     Drop,
     Halt,
+}
+
+/// `f64::min` with the answer pinned instead of left to the lowering.
+///
+/// Rust's `f64::min` is IEEE-754 minNum, except for two cases it documents as unspecified:
+/// two zeros of different signs, and two NaNs. The lowerings disagree about the first - a
+/// branchy comparison sequence returns the first operand where `minsd` returns the second -
+/// which was measured here: the same `f64::min(-0.0, 0.0)` answered `-0.0` from one build of
+/// this tree and `0.0` from another. A vector arm cannot be checked against "whatever the
+/// scalar op did" while that is true, so the density evaluator's three implementations (the
+/// interpreter, the compiled program and its four-lane form) all call this sequence:
+///
+/// * `a < b` -> `a`, `b < a` -> `b`;
+/// * equal -> the bitwise OR of the two, i.e. `-0.0` for the two zeros and the value itself
+///   otherwise (minNum's own rule for the zeros);
+/// * otherwise one is NaN: the other operand (and `b` when both are, which is what both
+///   lowerings do).
+///
+/// It is the sequence `Op::Min`'s vector form runs as `minv!`, so the two agree by
+/// construction. Nothing about the density's *value* changes: the sign of a zero and a NaN's
+/// payload are invisible to every consumer (all of them are comparisons, and the corner grid
+/// the bytes come from is filled on the one-lane path) - the 64-chunk dumps are byte for byte
+/// what they were before this.
+#[inline]
+fn df_min(a: f64, b: f64) -> f64 {
+    if a < b {
+        a
+    } else if b < a {
+        b
+    } else if a == b {
+        f64::from_bits(a.to_bits() | b.to_bits())
+    } else if a.is_nan() {
+        b
+    } else {
+        a
+    }
+}
+
+/// [`df_min`]'s maximum: `+0.0` for the two zeros (the bitwise AND), the other operand when
+/// one is NaN, `b` when both are.
+#[inline]
+fn df_max(a: f64, b: f64) -> f64 {
+    if a > b {
+        a
+    } else if b > a {
+        b
+    } else if a == b {
+        f64::from_bits(a.to_bits() & b.to_bits())
+    } else if a.is_nan() {
+        b
+    } else {
+        a
+    }
 }
 
 /// A compiled `final_density` program.
@@ -3739,8 +3824,8 @@ impl DfProg {
                 Op::Add => bin!(st[sp - 1] + st[sp]),
                 Op::Sub => bin!(st[sp - 1] - st[sp]),
                 Op::Mul => bin!(st[sp - 1] * st[sp]),
-                Op::Min => bin!(st[sp - 1].min(st[sp])),
-                Op::Max => bin!(st[sp - 1].max(st[sp])),
+                Op::Min => bin!(df_min(st[sp - 1], st[sp])),
+                Op::Max => bin!(df_max(st[sp - 1], st[sp])),
                 Op::Div => bin!(st[sp - 1] / st[sp]),
                 Op::Neg => un!(-st[sp - 1]),
                 Op::Abs => un!(st[sp - 1].abs()),
@@ -3772,8 +3857,8 @@ impl DfProg {
                 }
                 Op::AddC(c) => un!(st[sp - 1] + c),
                 Op::MulC(c) => un!(st[sp - 1] * c),
-                Op::MinC(c) => un!(st[sp - 1].min(c)),
-                Op::MaxC(c) => un!(st[sp - 1].max(c)),
+                Op::MinC(c) => un!(df_min(st[sp - 1], c)),
+                Op::MaxC(c) => un!(df_max(st[sp - 1], c)),
                 Op::Grad { fc, fv, tc, tv } => {
                     // A producer, like `Push`: it consumes nothing, so it writes at
                     // `sp` and grows the stack. Writing it at `sp - 1` leaves every
@@ -3874,6 +3959,572 @@ impl DfProg {
     }
 }
 
+// ---------- M3 P4: the four-lane density evaluator ----------
+//
+// `final_density` is evaluated once per block, and that per-block call is where the terrain
+// stage spends its density time: on a 64-chunk dump the `surf` scans make 15.4M calls, the
+// surface window 7.8M and the section fill 6.3M, at 84 ns each (measured 2026-11-19, M5).
+// The spine around the `interpolated` grids is pure `f64` arithmetic on four adjacent
+// columns, so four columns evaluate as four lanes of one `__m256d`.
+//
+// The contract is bit identity with the one-lane evaluator, not "the same value to within an
+// ulp": density feeds `> 0.0` and the trilinear cells, so a last-bit difference is a
+// different block somewhere in the world. That rules out `mul_add`/FMA (a fused multiply-add
+// rounds once where the scalar program rounds twice), so every operation below is the plain
+// IEEE-754 operation the scalar program performs. The ops whose Rust semantics are not the
+// hardware's - `f64::min`/`max` and their immediate forms - are compare/blend sequences
+// written to reproduce the scalar method's four cases, because `_mm256_min_pd` answers
+// differently on the two zeros (`-0.0` against `+0.0`) and on NaN.
+//
+// The `interpolated` grid is what makes this pay. On this preset the per-block spine is 29
+// arithmetic ops and *no* noise samples: the grid lookup jumps over the whole
+// `blend_density` subtree, so the four lanes share eight corner values
+// (`trilinear_x4`) and the rest is arithmetic. When the same bench was run with the
+// scalar `min`/`max` (four libcalls per op) and four separate `trilinear` calls (three
+// `floor` calls each), the group cost four evaluations, i.e. the vector arm bought nothing:
+// the ops *around* the density were the density's cost, not the density itself.
+//
+// A conditional jump is the one thing four lanes cannot share: `range_choice` reads a value
+// the four positions compute separately. The evaluator takes the branch when all four lanes
+// agree and otherwise returns `None`, and the caller finishes those four positions on the
+// one-lane evaluator. `M3_DF4_VEC`/`M3_DF4_BAIL` count both outcomes, so "the vector arm is
+// used" is measured rather than assumed.
+
+/// Lanes in the vector evaluator: one `__m256d`.
+const DF4: usize = 4;
+
+/// Vector stack slots. `DfProg::slots` is the program's peak depth (12 on the Overworld
+/// `final_density`); a deeper program keeps the one-lane path rather than sizing a buffer for
+/// a shape no preset produces.
+const DF4_SLOTS: usize = 16;
+
+/// The A/B switch: `MC_SPINE_DF4=0` disables the vector arm and leaves the same binary's
+/// one-lane path.
+fn df4_disabled() -> bool {
+    #[cfg(test)]
+    if DF4_TEST_SCALAR.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    // `env_str!` caches the read itself.
+    matches!(env_str!("MC_SPINE_DF4").as_deref(), Some("0"))
+}
+
+/// The in-process form of that switch, so one test can build the same chunk with the vector
+/// arm and without it and compare the two (the env read is cached per process, and an
+/// in-process A/B is what proves the batching, not the environment).
+#[cfg(test)]
+static DF4_TEST_SCALAR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn df4_test_force_scalar(on: bool) {
+    DF4_TEST_SCALAR.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Does this CPU have the vector arm? Asked once; a host without AVX2 keeps the scalar path.
+#[cfg(target_arch = "x86_64")]
+fn df4_avx2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn v4_to_arr(v: std::arch::x86_64::__m256d) -> [f64; DF4] {
+    // SAFETY: `__m256d` is four `f64` lanes and nothing else.
+    unsafe { std::mem::transmute(v) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn v4_from_arr(a: [f64; DF4]) -> std::arch::x86_64::__m256d {
+    // SAFETY: as above; `__m256d` has no padding.
+    unsafe { std::mem::transmute(a) }
+}
+
+impl DfProg {
+    /// Density at the four consecutive columns `x..x+4`, all at one `(y, z)`.
+    ///
+    /// Called only when a compiled program exists (the callers keep the interpreter for
+    /// `MC_SPINE_DF_INTERP=1`), so both arms here are programs: the vector one where the CPU
+    /// and the program allow it, and otherwise the same four positions one at a time.
+    fn eval_x4(&self, g: &Gen, cc: Option<&ChunkCols>, x: i32, y: i32, z: i32) -> [f64; DF4] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.slots <= DF4_SLOTS && !df4_disabled() && df4_avx2() {
+                // SAFETY: `df4_avx2` proved the feature is present at runtime.
+                if let Some(v) = unsafe { run4_avx2(self, g, cc, x, y, z) } {
+                    if m3_on() {
+                        m3_inc(M3_DF4_VEC);
+                    }
+                    return v;
+                }
+                if m3_on() {
+                    m3_inc(M3_DF4_BAIL);
+                }
+            }
+        }
+        let mut out = [0.0f64; DF4];
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = self.eval(g, cc, x + k as i32, y, z);
+        }
+        out
+    }
+}
+
+/// [`trilinear`] for four consecutive columns at one `(y, z)`, one lane each.
+///
+/// The four lanes are four consecutive `x`, which puts them inside one horizontal grid cell
+/// (checked below), so all four interpolate between the *same* eight corner values and only
+/// the `x` fraction differs. That is what makes this cheap: eight scalar loads broadcast to
+/// eight vectors, then `lerp3`'s three stages with `fx` per lane and `fy`/`fz` shared.
+///
+/// Every scalar in here is the expression `trilinear` writes - the same divisions, the same
+/// `floor` and `min` clamp, the same `lerp3` order - so the four results are the four
+/// `trilinear` results bit for bit. `None` means the group straddles a cell boundary (a
+/// `cell_w` below 4, or an `x` that is not the start of a cell-aligned run), where the
+/// caller has to interpolate the four positions one at a time.
+///
+/// # Safety
+/// The caller must have checked `is_x86_feature_detected!("avx2")`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn trilinear_x4(
+    cells: &[f64],
+    columns: &ChunkCols,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<[f64; DF4]> {
+    use std::arch::x86_64::*;
+    let (ny, min_y) = (columns.ny, columns.min_y);
+    let (cell_w, cell_h) = (columns.cell_w, columns.cell_h);
+    let lx0 = x & 15;
+    if cell_w < DF4 as i32 || 16 % cell_w != 0 || lx0 % cell_w + DF4 as i32 > cell_w {
+        return None;
+    }
+    let nx = (16 / cell_w + 1) as usize;
+    let (width, height) = (f64::from(cell_w), f64::from(cell_h));
+    let lz = (z & 15) as f64;
+    let ly = (y - min_y) as f64;
+    let xi = (lx0 as f64 / width).floor().min((nx - 2) as f64) as usize;
+    let zi = (lz / width).floor().min((nx - 2) as f64) as usize;
+    let yi = (ly / height).floor().min((ny - 2) as f64) as usize;
+    let fz = lz / width - zi as f64;
+    let fy = ly / height - yi as f64;
+    let g = |xi: usize, yi: usize, zi: usize| cells[(zi * nx + xi) * ny + yi];
+    let c000 = _mm256_set1_pd(g(xi, yi, zi));
+    let c100 = _mm256_set1_pd(g(xi + 1, yi, zi));
+    let c010 = _mm256_set1_pd(g(xi, yi + 1, zi));
+    let c110 = _mm256_set1_pd(g(xi + 1, yi + 1, zi));
+    let c001 = _mm256_set1_pd(g(xi, yi, zi + 1));
+    let c101 = _mm256_set1_pd(g(xi + 1, yi, zi + 1));
+    let c011 = _mm256_set1_pd(g(xi, yi + 1, zi + 1));
+    let c111 = _mm256_set1_pd(g(xi + 1, yi + 1, zi + 1));
+    let mut fx = [0.0f64; DF4];
+    for (k, f) in fx.iter_mut().enumerate() {
+        let lx = (((lx0 + k as i32) & 15) as f64) / width;
+        *f = lx - xi as f64;
+    }
+    let a = _mm256_setr_pd(fx[0], fx[1], fx[2], fx[3]);
+    let b = _mm256_set1_pd(fy);
+    let c = _mm256_set1_pd(fz);
+    let l0 = _mm256_add_pd(c000, _mm256_mul_pd(a, _mm256_sub_pd(c100, c000)));
+    let l1 = _mm256_add_pd(c010, _mm256_mul_pd(a, _mm256_sub_pd(c110, c010)));
+    let l2 = _mm256_add_pd(c001, _mm256_mul_pd(a, _mm256_sub_pd(c101, c001)));
+    let l3 = _mm256_add_pd(c011, _mm256_mul_pd(a, _mm256_sub_pd(c111, c011)));
+    let m0 = _mm256_add_pd(l0, _mm256_mul_pd(b, _mm256_sub_pd(l1, l0)));
+    let m1 = _mm256_add_pd(l2, _mm256_mul_pd(b, _mm256_sub_pd(l3, l2)));
+    Some(v4_to_arr(_mm256_add_pd(
+        m0,
+        _mm256_mul_pd(c, _mm256_sub_pd(m1, m0)),
+    )))
+}
+
+/// The four-lane interpreter: `DfProg::run` with `__m256d` slots. `None` means a conditional
+/// jump found the lanes disagreeing, and the caller has to finish them one at a time.
+///
+/// # Safety
+/// The caller must have checked `is_x86_feature_detected!("avx2")`, and `prog.slots` must be
+/// at most `DF4_SLOTS` (checked by the caller too: a deeper program would overrun `st`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn run4_avx2(
+    prog: &DfProg,
+    g: &Gen,
+    cc: Option<&ChunkCols>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<[f64; DF4]> {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Written before it is read: the program's compile-time depth and its runtime depth
+        // agree (`DfProg::run` relies on the same invariant), so slot `sp` always holds a
+        // value pushed earlier in the same evaluation.
+        let mut st: [std::mem::MaybeUninit<__m256d>; DF4_SLOTS] =
+            [std::mem::MaybeUninit::uninit(); DF4_SLOTS];
+        macro_rules! rd {
+            ($i:expr) => {
+                st[$i].assume_init()
+            };
+        }
+        macro_rules! wr {
+            ($i:expr, $v:expr) => {
+                st[$i] = std::mem::MaybeUninit::new($v)
+            };
+        }
+        let lane_x = [
+            x as f64,
+            (x + 1) as f64,
+            (x + 2) as f64,
+            (x + 3) as f64,
+        ];
+        let yv = _mm256_set1_pd(y as f64);
+        let mut sp = 0usize;
+        let mut pc = 0usize;
+        /// Two lane operands through one floating-point instruction.
+        macro_rules! binop {
+            ($f:ident) => {{
+                let b = rd!(sp - 1);
+                let a = rd!(sp - 2);
+                sp -= 1;
+                wr!(sp - 1, $f(a, b));
+                pc += 1;
+            }};
+        }
+        /// `f64::clamp`'s own two comparisons, so `NaN` and the sign of zero answer what the
+        /// scalar method answers.
+        macro_rules! clampv {
+            ($v:expr, $lo:expr, $hi:expr) => {{
+                let v = $v;
+                let lo = _mm256_set1_pd($lo);
+                let hi = _mm256_set1_pd($hi);
+                let r = _mm256_blendv_pd(v, lo, _mm256_cmp_pd(v, lo, _CMP_LT_OQ));
+                _mm256_blendv_pd(r, hi, _mm256_cmp_pd(r, hi, _CMP_GT_OQ))
+            }};
+        }
+        /// [`df_min`] on four lanes: its four cases (`a < b`, `b < a`, equal, and one NaN),
+        /// which is why this is not `_mm256_min_pd` - that op answers differently on the two
+        /// zeros and on NaN.
+        macro_rules! minv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm256_blendv_pd(b, a, _mm256_cmp_pd(a, b, _CMP_LT_OQ));
+                let r = _mm256_blendv_pd(r, _mm256_or_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
+                let r = _mm256_blendv_pd(r, a, _mm256_cmp_pd(b, b, _CMP_UNORD_Q));
+                _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, a, _CMP_UNORD_Q))
+            }};
+        }
+        /// [`df_max`] on four lanes, the same four cases (`+0.0` for the two zeros).
+        macro_rules! maxv {
+            ($a:expr, $b:expr) => {{
+                let a = $a;
+                let b = $b;
+                let r = _mm256_blendv_pd(b, a, _mm256_cmp_pd(a, b, _CMP_GT_OQ));
+                let r =
+                    _mm256_blendv_pd(r, _mm256_and_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
+                let r = _mm256_blendv_pd(r, a, _mm256_cmp_pd(b, b, _CMP_UNORD_Q));
+                _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, a, _CMP_UNORD_Q))
+            }};
+        }
+        /// Eight `f64`s out of (or into) the stack, for the ops that have to be scalar.
+        macro_rules! lanes3 {
+            () => {{
+                let c = v4_to_arr(rd!(sp - 1));
+                let b = v4_to_arr(rd!(sp - 2));
+                let a = v4_to_arr(rd!(sp - 3));
+                (a, b, c)
+            }};
+        }
+        loop {
+            match prog.ops[pc] {
+                Op::Push(v) => {
+                    wr!(sp, _mm256_set1_pd(v));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Add => binop!(_mm256_add_pd),
+                Op::Sub => binop!(_mm256_sub_pd),
+                Op::Mul => binop!(_mm256_mul_pd),
+                Op::Div => binop!(_mm256_div_pd),
+                Op::Min => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, minv!(a, b));
+                    pc += 1;
+                }
+                Op::Max => {
+                    let b = rd!(sp - 1);
+                    let a = rd!(sp - 2);
+                    sp -= 1;
+                    wr!(sp - 1, maxv!(a, b));
+                    pc += 1;
+                }
+                Op::Neg => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_xor_pd(a, _mm256_set1_pd(-0.0)));
+                    pc += 1;
+                }
+                Op::Abs => {
+                    let a = rd!(sp - 1);
+                    let mask = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64));
+                    wr!(sp - 1, _mm256_and_pd(a, mask));
+                    pc += 1;
+                }
+                Op::Sq => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_mul_pd(a, a));
+                    pc += 1;
+                }
+                Op::Cube => {
+                    let a = rd!(sp - 1);
+                    let sq = _mm256_mul_pd(a, a);
+                    wr!(sp - 1, _mm256_mul_pd(sq, a));
+                    pc += 1;
+                }
+                Op::HNeg => {
+                    let a = rd!(sp - 1);
+                    let half = _mm256_mul_pd(a, _mm256_set1_pd(0.5));
+                    let pos = _mm256_cmp_pd(a, _mm256_setzero_pd(), _CMP_GT_OQ);
+                    wr!(sp - 1, _mm256_blendv_pd(half, a, pos));
+                    pc += 1;
+                }
+                Op::QNeg => {
+                    let a = rd!(sp - 1);
+                    let quarter = _mm256_mul_pd(a, _mm256_set1_pd(0.25));
+                    let pos = _mm256_cmp_pd(a, _mm256_setzero_pd(), _CMP_GT_OQ);
+                    wr!(sp - 1, _mm256_blendv_pd(quarter, a, pos));
+                    pc += 1;
+                }
+                Op::Squeeze => {
+                    let a = rd!(sp - 1);
+                    let v = clampv!(a, -1.0, 1.0);
+                    let cube = _mm256_mul_pd(_mm256_mul_pd(v, v), v);
+                    let half = _mm256_div_pd(v, _mm256_set1_pd(2.0));
+                    let over = _mm256_div_pd(cube, _mm256_set1_pd(24.0));
+                    wr!(sp - 1, _mm256_sub_pd(half, over));
+                    pc += 1;
+                }
+                Op::Clamp { lo, hi } => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, clampv!(a, lo, hi));
+                    pc += 1;
+                }
+                Op::Lerp => {
+                    let s = rd!(sp - 1);
+                    let f = rd!(sp - 2);
+                    let a = rd!(sp - 3);
+                    sp -= 2;
+                    wr!(sp - 1, _mm256_add_pd(f, _mm256_mul_pd(a, _mm256_sub_pd(s, f))));
+                    pc += 1;
+                }
+                Op::AddC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_add_pd(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MulC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, _mm256_mul_pd(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MinC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, minv!(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::MaxC(c) => {
+                    let a = rd!(sp - 1);
+                    wr!(sp - 1, maxv!(a, _mm256_set1_pd(c)));
+                    pc += 1;
+                }
+                Op::Grad { fc, fv, tc, tv } => {
+                    let denom = _mm256_set1_pd(tc - fc);
+                    let t = _mm256_div_pd(
+                        _mm256_sub_pd(yv, _mm256_set1_pd(fc)),
+                        denom,
+                    );
+                    let t = clampv!(t, 0.0, 1.0);
+                    wr!(
+                        sp,
+                        _mm256_add_pd(
+                            _mm256_set1_pd(fv),
+                            _mm256_mul_pd(t, _mm256_set1_pd(tv - fv))
+                        )
+                    );
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Noise { ni, xzs, ys } => {
+                    let (xs, ysv, zs) = lanes3!();
+                    sp -= 2;
+                    let noise = &g.noises[ni as usize];
+                    let mut r = [0.0f64; DF4];
+                    for k in 0..DF4 {
+                        r[k] = noise.get(
+                            lane_x[k] * xzs + xs[k],
+                            y as f64 * ys + ysv[k],
+                            lane_x[k] * xzs + zs[k],
+                        );
+                    }
+                    wr!(sp - 1, v4_from_arr(r));
+                    pc += 1;
+                }
+                Op::ShiftA(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let mut r = [0.0f64; DF4];
+                    for k in 0..DF4 {
+                        r[k] = noise.get(lane_x[k] * 0.25, 0.0, z as f64 * 0.25) * 4.0;
+                    }
+                    wr!(sp, v4_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::ShiftB(ni) => {
+                    let noise = &g.noises[ni as usize];
+                    let mut r = [0.0f64; DF4];
+                    for k in 0..DF4 {
+                        r[k] = noise.get(z as f64 * 0.25, lane_x[k] * 0.25, 0.0) * 4.0;
+                    }
+                    wr!(sp, v4_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::Weird { ni, mapper } => {
+                    let rarity = v4_to_arr(rd!(sp - 1));
+                    let noise = &g.noises[ni as usize];
+                    let mut r = [0.0f64; DF4];
+                    for k in 0..DF4 {
+                        let rarity = mapper.rarity(rarity[k]);
+                        r[k] = rarity
+                            * noise
+                                .get(
+                                    lane_x[k] / rarity,
+                                    y as f64 / rarity,
+                                    z as f64 / rarity,
+                                )
+                                .abs();
+                    }
+                    wr!(sp - 1, v4_from_arr(r));
+                    pc += 1;
+                }
+                Op::Beardifier => {
+                    let beard = cc.and_then(|cc| cc.beard.as_deref());
+                    let mut r = [0.0f64; DF4];
+                    for (k, o) in r.iter_mut().enumerate() {
+                        *o = match beard {
+                            Some(beard) => compute_beardifier(beard, x + k as i32, y, z),
+                            None => 0.0,
+                        };
+                    }
+                    wr!(sp, v4_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                // The grid's presence is a property of the columns, not of the position, so
+                // this jump is lane-uniform: either all four lanes read a trilinear cell or
+                // all four fall through to the node's own program.
+                Op::Interp { slot, join } => {
+                    let cells = cc
+                        .and_then(|c| c.grids.get(slot as usize))
+                        .and_then(|g| g.as_deref());
+                    match (cells, cc) {
+                        (Some(cells), Some(columns)) => {
+                            let r = match trilinear_x4(cells, columns, x, y, z) {
+                                Some(r) => r,
+                                None => {
+                                    let mut r = [0.0f64; DF4];
+                                    for (k, o) in r.iter_mut().enumerate() {
+                                        *o = trilinear(cells, columns, x + k as i32, y, z);
+                                    }
+                                    r
+                                }
+                            };
+                            wr!(sp, v4_from_arr(r));
+                            sp += 1;
+                            pc = join as usize;
+                        }
+                        _ => pc += 1,
+                    }
+                }
+                Op::Call(id) => {
+                    let mut r = [0.0f64; DF4];
+                    for (k, o) in r.iter_mut().enumerate() {
+                        let mut memo = HashMap::new();
+                        *o = g.eval_c(id as usize, x + k as i32, y, z, &mut memo, cc);
+                    }
+                    wr!(sp, v4_from_arr(r));
+                    sp += 1;
+                    pc += 1;
+                }
+                Op::BranchOut { mi, ma, target } => {
+                    let v = v4_to_arr(rd!(sp - 1));
+                    let mut inside = 0usize;
+                    for t in v {
+                        if t >= mi && t < ma {
+                            inside += 1;
+                        }
+                    }
+                    if inside == DF4 {
+                        sp -= 1;
+                        pc += 1;
+                    } else if inside == 0 {
+                        sp -= 1;
+                        pc = target as usize;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::BranchLt { t, target } => {
+                    let v = v4_to_arr(rd!(sp - 1));
+                    let mut below = 0usize;
+                    for lane in v {
+                        if lane < t {
+                            below += 1;
+                        }
+                    }
+                    sp -= 1;
+                    if below == DF4 {
+                        pc = target as usize;
+                    } else if below == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::BranchZero { target } => {
+                    let v = v4_to_arr(rd!(sp - 1));
+                    let mut zero = 0usize;
+                    for lane in v {
+                        if lane == 0.0 {
+                            zero += 1;
+                        }
+                    }
+                    if zero == DF4 {
+                        pc = target as usize;
+                    } else if zero == 0 {
+                        pc += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Op::Jump(target) => pc = target as usize,
+                Op::Drop => {
+                    sp -= 1;
+                    pc += 1;
+                }
+                Op::Halt => {
+                    debug_assert_eq!(sp, 1, "compiled program left {sp} values, not 1");
+                    return Some(v4_to_arr(rd!(0)));
+                }
+            }
+        }
+    }
+}
+
 struct DfCompiler<'a> {
     d: &'a GenData,
     ops: Vec<Op>,
@@ -3910,11 +4561,11 @@ impl<'a> DfCompiler<'a> {
                 _ => None,
             },
             DF::Min(a, b) => match (self.const_value(*a), self.const_value(*b)) {
-                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), Some(b)) => Some(df_min(a, b)),
                 _ => None,
             },
             DF::Max(a, b) => match (self.const_value(*a), self.const_value(*b)) {
-                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), Some(b)) => Some(df_max(a, b)),
                 _ => None,
             },
             DF::Div(a, b) => match self.const_value(*b) {
@@ -5730,21 +6381,44 @@ impl Gen {
         // (`terrain_section_at`'s feature pass) copies it out once.
         let mut arr = Box::new([0u32; 4096]);
         let mut marks: Vec<(u8, i32, i32, i32)> = Vec::new();
+        // M3 P4: the section's densities are asked for four columns at a time
+        // (`Gen::block_density_x4`) and the cell rules then run per cell in the order they
+        // always ran: `ly`, `lz`, `lx`. Only the density call is batched, and the four values
+        // are the four `block_density` values bit for bit, so the order the aquifer, the
+        // material rules and the deep rules see is the order they saw before.
+        let ly_top = self.min_y + self.height;
         for ly in 0..16i32 {
             let y = sy + ly;
             for lz in 0..16i32 {
-                for lx in 0..16i32 {
-                    let (state, marked) =
-                        self.terrain_cell_marked(cc, cx * 16 + lx, y, cz * 16 + lz);
-                    arr[((ly << 8) | (lz << 4) | lx) as usize] = state;
-                    // One entry per writer: vanilla preserves duplicates, and a cell the fill
-                    // marked and the surface then rewrote with another fluid is visited twice
-                    // by `postProcessGeneration`.
-                    for bit in [MARK_FILL, MARK_SURFACE] {
-                        if marked & bit != 0 {
-                            marks.push((bit, cx * 16 + lx, y, cz * 16 + lz));
+                let z = cz * 16 + lz;
+                // A cell outside the generator's window is air and asks no density
+                // (`terrain_cell_marked`'s first rule).
+                let in_window = y >= self.min_y && y < ly_top;
+                let mut lx = 0i32;
+                while lx < 16 {
+                    let x = cx * 16 + lx;
+                    let d = if in_window {
+                        Some(self.block_density_x4(cc, x, y, z))
+                    } else {
+                        None
+                    };
+                    for k in 0..DF4 {
+                        let (state, marked) = match d {
+                            Some(d) => self.terrain_cell_density(cc, x + k as i32, y, z, d[k]),
+                            None => (0, 0),
+                        };
+                        let lx = lx + k as i32;
+                        arr[((ly << 8) | (lz << 4) | lx) as usize] = state;
+                        // One entry per writer: vanilla preserves duplicates, and a cell the
+                        // fill marked and the surface then rewrote with another fluid is
+                        // visited twice by `postProcessGeneration`.
+                        for bit in [MARK_FILL, MARK_SURFACE] {
+                            if marked & bit != 0 {
+                                marks.push((bit, x + k as i32, y, z));
+                            }
                         }
                     }
+                    lx += DF4 as i32;
                 }
             }
         }
@@ -6205,20 +6879,34 @@ impl Gen {
             return Some(cc);
         }
         let top = g.min_y + g.height - 1;
+        // M3 P4: four columns of one `z` row per pass. Each lane keeps its own answer - the
+        // first `y` from the top whose density is positive - so the four searches share the
+        // pass and the step down, and the lanes that have already found their surface are
+        // simply no longer updated. Evaluating a lane past its own surface changes nothing
+        // (density is pure in the position and the columns), which is what makes the lockstep
+        // scan exactly the four independent scans.
         for zi in 0..16usize {
-            for xi in 0..16usize {
-                let wx = cx * 16 + xi as i32;
-                let wz = cz * 16 + zi as i32;
-                let mut sy = g.min_y - 1;
+            let wz = cz * 16 + zi as i32;
+            let mut xb = 0usize;
+            while xb < 16 {
+                let wx = cx * 16 + xb as i32;
+                let mut sy = [g.min_y - 1; DF4];
+                let mut live = DF4;
                 let mut yy = top;
-                while yy >= g.min_y {
-                    if g.block_density(&cc, wx, yy, wz) > 0.0 {
-                        sy = yy;
-                        break;
+                while yy >= g.min_y && live > 0 {
+                    let d = g.block_density_x4(&cc, wx, yy, wz);
+                    for (k, lane) in d.iter().enumerate() {
+                        if sy[k] == g.min_y - 1 && *lane > 0.0 {
+                            sy[k] = yy;
+                            live -= 1;
+                        }
                     }
                     yy -= 1;
                 }
-                cc.surf[zi * 16 + xi] = sy as i16;
+                for (k, lane) in sy.iter().enumerate() {
+                    cc.surf[zi * 16 + xb + k] = *lane as i16;
+                }
+                xb += DF4;
             }
         }
 
@@ -6252,38 +6940,72 @@ impl Gen {
         let mut rd = [0i16; 256];
         if let Some(root) = g.surface_rule {
             let mut c = SC::new();
+            // M3 P4: four columns of one `z` row at a time. The densities for the group's
+            // cells are asked for four at a time and buffered; the columns are then walked one
+            // at a time, in the order they were walked before, so the aquifer, the surface
+            // predicates and the per-column caches see exactly the sequence they saw.
+            let mut dbuf: Vec<f64> = Vec::new();
             for lz in 0..16usize {
-                for lx in 0..16usize {
-                    let x = cx * 16 + lx as i32;
-                    let z = cz * 16 + lz as i32;
-                    let surf_y = cc.surf[lz * 16 + lx] as i32;
-                    let water_surface = if (cc.wtop[lz * 16 + lx] as i32) > surf_y {
-                        cc.wtop[lz * 16 + lx] as i32
-                    } else {
-                        i32::MIN
-                    };
-                    let scan_top = surf_y.max(g.sea);
-                    c.x = x;
-                    c.z = z;
-                    c.run_depth = g.run_depth(x, z);
-                    c.sec_ok = false;
-                    c.steep = None;
-                    c.nt.clear();
-                    rd[lz * 16 + lx] = c.run_depth as i16;
-                    // Nether surface rules decorate every cave floor/ceiling;
-                    // they have no above_preliminary_surface guard.
-                    let est_min = if g.preset == NoisePreset::Nether {
-                        g.min_y
-                    } else {
-                        g.prelim_min(x, z)
-                    };
-                    c.est_min = est_min;
-                    let cells: Vec<SurfaceCell> = (g.min_y..=scan_top)
-                        .map(|y| g.surface_cell(&cc, x, y, z, surf_y, water_surface))
-                        .collect();
-                    let column =
-                        g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
-                    mats[lz * 16 + lx] = column;
+                let z = cz * 16 + lz as i32;
+                let mut xb = 0usize;
+                while xb < 16 {
+                    let mut span = 0i32;
+                    for k in 0..DF4 {
+                        let lx = xb + k;
+                        let scan_top = (cc.surf[lz * 16 + lx] as i32).max(g.sea);
+                        span = span.max(scan_top - g.min_y + 1);
+                    }
+                    let span = span.max(0) as usize;
+                    dbuf.clear();
+                    dbuf.resize(DF4 * span, 0.0);
+                    let gx = cx * 16 + xb as i32;
+                    for yi in 0..span {
+                        let y = g.min_y + yi as i32;
+                        let d = g.block_density_x4(&cc, gx, y, z);
+                        for k in 0..DF4 {
+                            dbuf[k * span + yi] = d[k];
+                        }
+                    }
+                    for k in 0..DF4 {
+                        let lx = xb + k;
+                        let x = cx * 16 + lx as i32;
+                        let surf_y = cc.surf[lz * 16 + lx] as i32;
+                        let water_surface = if (cc.wtop[lz * 16 + lx] as i32) > surf_y {
+                            cc.wtop[lz * 16 + lx] as i32
+                        } else {
+                            i32::MIN
+                        };
+                        let scan_top = surf_y.max(g.sea);
+                        c.x = x;
+                        c.z = z;
+                        c.run_depth = g.run_depth(x, z);
+                        c.sec_ok = false;
+                        c.steep = None;
+                        c.nt.clear();
+                        rd[lz * 16 + lx] = c.run_depth as i16;
+                        // Nether surface rules decorate every cave floor/ceiling;
+                        // they have no above_preliminary_surface guard.
+                        let est_min = if g.preset == NoisePreset::Nether {
+                            g.min_y
+                        } else {
+                            g.prelim_min(x, z)
+                        };
+                        c.est_min = est_min;
+                        let cells: Vec<SurfaceCell> = (g.min_y..=scan_top)
+                            .map(|y| {
+                                g.surface_cell_density(
+                                    dbuf[k * span + (y - g.min_y) as usize],
+                                    x,
+                                    y,
+                                    z,
+                                )
+                            })
+                            .collect();
+                        let column =
+                            g.scan_surface_column(root, &mut c, est_min, &cells, &cc.wtop);
+                        mats[lz * 16 + lx] = column;
+                    }
+                    xb += DF4;
                 }
             }
         }
@@ -6304,6 +7026,13 @@ impl Gen {
         _water_surface: i32,
     ) -> SurfaceCell {
         let d = self.block_density(cc, x, y, z);
+        self.surface_cell_density(d, x, y, z)
+    }
+
+    /// [`Gen::surface_cell`] with the cell's density already in hand, so the surface window
+    /// can ask for four columns' densities at once and still run vanilla's per-cell aquifer
+    /// rules. `d` must be this position's own `block_density`.
+    fn surface_cell_density(&mut self, d: f64, x: i32, y: i32, z: i32) -> SurfaceCell {
         if d > 0.0 {
             return SurfaceCell::Solid;
         }
@@ -6615,11 +7344,29 @@ impl Gen {
         if y < self.min_y || y >= self.min_y + self.height {
             return (0, 0);
         }
+        let d = self.block_density(cc, x, y, z);
+        self.terrain_cell_density(cc, x, y, z, d)
+    }
+
+    /// [`Gen::terrain_cell_marked`]'s body with the density already in hand.
+    ///
+    /// The only thing split off is the `block_density` call: the caller must have checked the
+    /// generator's window (a cell outside it is air, not a density evaluation) and must pass
+    /// that cell's own density. That is what lets the section fill ask for four columns'
+    /// densities at once (`Gen::block_density_x4`) and still run vanilla's per-cell aquifer,
+    /// material and deep rules in the order it ran them.
+    pub(crate) fn terrain_cell_density(
+        &mut self,
+        cc: &ChunkCols,
+        x: i32,
+        y: i32,
+        z: i32,
+        d: f64,
+    ) -> (u32, u8) {
         // M3 P1a M3: which layer answered a *feature-side* cold read. The scope is set by
         // `FC::get`'s fallback, so the terrain fill (which warms the same memos on purpose)
         // stays out of these counts. `m3_on() &&` keeps the off path at one cached load.
         let m3_read = m3_on() && m3_in_feature_read();
-        let d = self.block_density(cc, x, y, z);
         if d > 0.0 {
             // `NoiseChunk.blockState` asks the aquifer for every cell, and its `density > 0`
             // arm clears `shouldScheduleFluidUpdate` before returning null. This path skips the
@@ -9592,6 +10339,362 @@ mod wg_tests {
             compiled, 4,
             "every preset must compile here, or this test stops covering the compiler"
         );
+    }
+
+
+    // ---- M3 P4: the four-lane density evaluator ----
+
+    /// The values the four-lane ops are held to: the ones where an IEEE-754 operation on one
+    /// lane can disagree with the hardware's vector form (the two zeros, the two infinities,
+    /// quiet and signalling NaN, subnormals, `f64::MIN`/`MAX`) plus the constants the
+    /// Overworld spine actually multiplies by.
+    const DF4_EDGES: [f64; 22] = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.5,
+        -0.5,
+        1.5625,
+        -1.5625,
+        24.0,
+        -24.0,
+        0.1171875,
+        -0.078125,
+        f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::MAX,
+        f64::MIN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0xfff8_0000_0000_0001),
+        1.0e300,
+    ];
+
+    /// A hand-built program for the op under test: `slots` is generous, and the vector arm
+    /// refuses a program deeper than `DF4_SLOTS`, so these all take it.
+    fn df4_prog(ops: Vec<Op>) -> DfProg {
+        DfProg { ops, slots: 4 }
+    }
+
+    /// Every op the evaluator implements, over the edge values, one lane group at a time.
+    ///
+    /// The reference is `DfProg::run` - the one-lane interpreter the world's bytes are built
+    /// from - compared with `to_bits`, which is the only comparison this can be: density is
+    /// consumed by `> 0.0` and by the trilinear cells, so a last-bit difference is a
+    /// different block somewhere.
+    #[test]
+    fn df4_ops_match_the_scalar_ops_over_edge_values() {
+        let _guard = lock_gen();
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        df4_test_force_scalar(false);
+        m3_test_force(true);
+        m3_reset_local();
+        let mut compared = 0usize;
+        let mut nan_results = 0usize;
+        let mut check = |ops: Vec<Op>, what: &str, a: f64, b: f64| {
+            let prog = df4_prog(ops);
+            for x in [-8, 0, 5] {
+                let want: [f64; DF4] = std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, 7, 3));
+                let got = prog.eval_x4(&g, None, x, 7, 3);
+                for k in 0..DF4 {
+                    // A NaN *result* is the one place the two lowerings are allowed to
+                    // disagree: with two NaN operands neither the scalar op nor `vaddp*` is
+                    // specified to keep which payload, so both answer "a NaN" with possibly
+                    // different bits. Nothing reads a NaN's payload - every consumer of the
+                    // density is a comparison (`> 0.0`, the aquifer's blends) and the corner
+                    // grid the bytes come from is filled on the one-lane path - so the
+                    // comparison below is "identical, or both NaN".
+                    if want[k].is_nan() && got[k].is_nan() {
+                        nan_results += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        want[k].to_bits(),
+                        got[k].to_bits(),
+                        "{what} at lane {k} of x={x}: {a:?} / {b:?} -> scalar {:?} vector {:?}",
+                        want[k],
+                        got[k]
+                    );
+                    compared += 1;
+                }
+            }
+        };
+        let unary: [(&str, Op); 8] = [
+            ("neg", Op::Neg),
+            ("abs", Op::Abs),
+            ("sq", Op::Sq),
+            ("cube", Op::Cube),
+            ("hneg", Op::HNeg),
+            ("qneg", Op::QNeg),
+            ("squeeze", Op::Squeeze),
+            ("clamp(-1,1)", Op::Clamp { lo: -1.0, hi: 1.0 }),
+        ];
+        for (name, op) in unary {
+            for v in DF4_EDGES {
+                check(vec![Op::Push(v), op, Op::Halt], name, v, v);
+            }
+        }
+        let binary: [(&str, Op); 6] = [
+            ("add", Op::Add),
+            ("sub", Op::Sub),
+            ("mul", Op::Mul),
+            ("div", Op::Div),
+            ("min", Op::Min),
+            ("max", Op::Max),
+        ];
+        for (name, op) in binary {
+            for a in DF4_EDGES {
+                for b in DF4_EDGES {
+                    check(vec![Op::Push(a), Op::Push(b), op, Op::Halt], name, a, b);
+                }
+            }
+        }
+        for c in DF4_EDGES {
+            for v in DF4_EDGES {
+                check(vec![Op::Push(v), Op::AddC(c), Op::Halt], "addC", v, c);
+                check(vec![Op::Push(v), Op::MulC(c), Op::Halt], "mulC", v, c);
+                check(vec![Op::Push(v), Op::MinC(c), Op::Halt], "minC", v, c);
+                check(vec![Op::Push(v), Op::MaxC(c), Op::Halt], "maxC", v, c);
+            }
+        }
+        for a in [0.0f64, -0.0, 1.0, -2.5, f64::NAN, f64::INFINITY] {
+            for f in [0.0f64, 1.0, -1.0, f64::NAN] {
+                for s in [0.5f64, -0.25, f64::NEG_INFINITY] {
+                    check(
+                        vec![Op::Push(a), Op::Push(f), Op::Push(s), Op::Lerp, Op::Halt],
+                        "lerp",
+                        a,
+                        f,
+                    );
+                }
+            }
+        }
+        // `Grad` is the one op that reads a coordinate, and the four lanes share `y` (the
+        // batched columns differ in `x` only), so the groups below walk `y` across the two
+        // clamps' edges and the four lanes must all answer the scalar value for that `y`.
+        for (fc, fv, tc, tv) in [
+            (-64.0, 0.0, -40.0, 1.0),
+            (240.0, 1.0, 256.0, 0.0),
+            (0.0, -0.0, 0.0, 1.0),
+        ] {
+            let prog = df4_prog(vec![Op::Grad { fc, fv, tc, tv }, Op::Halt]);
+            for y in [g.min_y, -56, -40, 0, 240, 255, 256, g.min_y + g.height - 1] {
+                let want = prog.eval(&g, None, 3, y, -2);
+                let got = prog.eval_x4(&g, None, 3, y, -2);
+                for k in 0..DF4 {
+                    assert_eq!(
+                        want.to_bits(),
+                        got[k].to_bits(),
+                        "grad fc={fc} y={y} lane {k}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        let vec = m3_local().get(M3_DF4_VEC);
+        m3_test_force(false);
+        df4_test_force_scalar(false);
+        assert!(
+            compared > 5_000,
+            "only {compared} lane values were compared; the loop did not run"
+        );
+        assert!(
+            nan_results > 0,
+            "no NaN result was reached; the edge values stopped covering the NaN case"
+        );
+        if df4_avx2() {
+            assert!(
+                vec > 0,
+                "no group took the vector arm: this test would pass with the evaluator removed"
+            );
+        }
+    }
+
+    /// The four-lane density against four one-lane densities, on the presets that compile, at
+    /// chunk origins inside and outside the origin cells, and at a seed other than 0.
+    #[test]
+    fn df4_density_matches_block_density_per_column() {
+        let _guard = lock_gen();
+        let _measurement = M3_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        df4_test_force_scalar(false);
+        m3_test_force(true);
+        m3_reset_local();
+        let mut compared = 0usize;
+        let mut programs = 0usize;
+        for (preset, seed) in [
+            (NoisePreset::Overworld, 0u64),
+            (NoisePreset::Overworld, 12345),
+            (NoisePreset::Nether, 0),
+            (NoisePreset::End, 0),
+        ] {
+            let mut g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            if DfProg::compile_inner(&g).is_none() {
+                continue;
+            }
+            programs += 1;
+            for (cx, cz) in [(0, 0), (-3, 2), (5, -7)] {
+                let cc = g.cols(cx, cz).expect("columns");
+                let mut ly = 0;
+                while ly < 16 {
+                    for lz in 0..16 {
+                        for lx in (0..16).step_by(DF4) {
+                            let y = g.min_y + ly;
+                            let x = cx * 16 + lx;
+                            let z = cz * 16 + lz;
+                            let got = g.block_density_x4(&cc, x, y, z);
+                            for k in 0..DF4 {
+                                let want = g.block_density(&cc, x + k as i32, y, z);
+                                assert_eq!(
+                                    want.to_bits(),
+                                    got[k].to_bits(),
+                                    "{preset:?} seed {seed} chunk ({cx},{cz}) at {}, {y}, {z}",
+                                    x + k as i32
+                                );
+                                compared += 1;
+                            }
+                        }
+                    }
+                    ly += 5;
+                }
+            }
+        }
+        let vec = m3_local().get(M3_DF4_VEC);
+        m3_test_force(false);
+        assert_eq!(programs, 4, "every preset must compile here");
+        assert!(
+            compared > 10_000,
+            "only {compared} positions were compared; the loop did not run"
+        );
+        if df4_avx2() {
+            assert!(vec > 0, "the vector arm did not run: {vec} groups");
+        }
+    }
+
+    /// `Gen::cols` on one chunk with the vector arm and without it: the surface levels, the
+    /// water heights, the run depths, the surface materials and the corner grids must be the
+    /// same bytes. This is what pins the batched `surf` scan and the buffered surface window
+    /// (both of which evaluate four columns per pass) to the one-column order.
+    #[test]
+    fn df4_columns_match_the_scalar_density_path() {
+        let _guard = lock_gen();
+        let mut compared = 0usize;
+        for (preset, seed) in [(NoisePreset::Overworld, 0u64), (NoisePreset::Overworld, 4242)] {
+            let mut g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
+            if DfProg::compile_inner(&g).is_none() {
+                continue;
+            }
+            for (cx, cz) in [(0, 0), (-2, 1)] {
+                df4_test_force_scalar(false);
+                g.col_c.clear();
+                let vector = g.cols(cx, cz).expect("columns with the vector arm");
+                df4_test_force_scalar(true);
+                g.col_c.clear();
+                let scalar = g.cols(cx, cz).expect("columns with the scalar arm");
+                df4_test_force_scalar(false);
+                assert_eq!(vector.surf, scalar.surf, "{preset:?} surf at ({cx},{cz})");
+                assert_eq!(vector.wtop, scalar.wtop, "{preset:?} wtop at ({cx},{cz})");
+                assert_eq!(vector.rd, scalar.rd, "{preset:?} rd at ({cx},{cz})");
+                for (i, (a, b)) in vector.mats.iter().zip(scalar.mats.iter()).enumerate() {
+                    match (a, b) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) => {
+                            assert_eq!(a.lo, b.lo, "{preset:?} mat window at column {i}");
+                            assert_eq!(
+                                a.vals, b.vals,
+                                "{preset:?} surface material at column {i} of ({cx},{cz})"
+                            );
+                            compared += a.vals.len();
+                        }
+                        _ => panic!("{preset:?} column {i}: one arm produced a window and the other did not"),
+                    }
+                }
+                for (slot, (a, b)) in vector.grids.iter().zip(scalar.grids.iter()).enumerate() {
+                    match (a, b) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) => {
+                            assert_eq!(a.len(), b.len(), "grid {slot} length");
+                            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                                assert_eq!(
+                                    x.to_bits(),
+                                    y.to_bits(),
+                                    "{preset:?} grid {slot} cell {i} of ({cx},{cz})"
+                                );
+                                compared += 1;
+                            }
+                        }
+                        _ => panic!("{preset:?} grid {slot}: one arm built a grid and the other did not"),
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 50_000,
+            "only {compared} values were compared; the loop did not run"
+        );
+    }
+
+    /// The batched section fill against the one-cell rule: same states, same mark list (order
+    /// included), for sections above, through and below the surface.
+    #[test]
+    fn df4_section_fill_matches_the_scalar_cell_rule() {
+        let _guard = lock_gen();
+        let mut g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        if DfProg::compile_inner(&g).is_none() {
+            return;
+        }
+        let (cx, cz) = (0, 0);
+        let cc = g.cols(cx, cz).expect("columns");
+        let mut marks_seen = 0usize;
+        for sy in [-64, 0, 48, 96, 240, 304] {
+            let (arr, marks) = g.base_section_rows(&cc, cx, sy, cz);
+            let mut got_marks: Vec<(u8, i32, i32, i32)>;
+            let mut want = Box::new([0u32; 4096]);
+            let mut want_marks: Vec<(u8, i32, i32, i32)> = Vec::new();
+            for ly in 0..16i32 {
+                let y = sy + ly;
+                for lz in 0..16i32 {
+                    for lx in 0..16i32 {
+                        let (state, marked) =
+                            g.terrain_cell_marked(&cc, cx * 16 + lx, y, cz * 16 + lz);
+                        want[((ly << 8) | (lz << 4) | lx) as usize] = state;
+                        for bit in [MARK_FILL, MARK_SURFACE] {
+                            if marked & bit != 0 {
+                                want_marks.push((bit, cx * 16 + lx, y, cz * 16 + lz));
+                            }
+                        }
+                    }
+                }
+            }
+            // The fill files its marks in vanilla's stage order and then sorts that bucket into
+            // the order `postProcessGeneration` consumes, so want the returned list already in
+            // that order and the one-cell reference sorted into it: the comparison below is
+            // then the multiset *and* the order it was filed in.
+            let key = |&(kind, x, y, z): &(u8, i32, i32, i32)| {
+                if kind & MARK_FILL != 0 {
+                    (0u8, (x >> 2), (z >> 2), -y, (x & 3), (z & 3))
+                } else {
+                    (1, x, z, -y, 0, 0)
+                }
+            };
+            let mut sorted = marks.clone();
+            sorted.sort_by_key(key);
+            assert_eq!(marks, sorted, "section sy={sy} did not file its marks in order");
+            got_marks = marks.clone();
+            want_marks.sort_by_key(key);
+            assert_eq!(
+                arr.as_ref(),
+                want.as_ref(),
+                "section sy={sy} did not match the one-cell fill"
+            );
+            assert_eq!(got_marks, want_marks, "section sy={sy} marks differ");
+            marks_seen += want_marks.len();
+        }
+        assert!(marks_seen > 0, "no section filed a mark; the fixture moved");
     }
 
     // These tests mutate the shared generator registry, so they must not run in parallel. The

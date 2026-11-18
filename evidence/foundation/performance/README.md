@@ -775,6 +775,190 @@ out-of-chunk gate (the gate test, each with its own message). `bash tools/layers
 and `bash tools/debt_ratchet.sh` pass; the full suite is 726 passed, 0 failed,
 1 ignored (`cargo test --offline --locked -j 2`, 187 s).
 
+## M3 P4: four-lane density evaluation, batched `surf` columns and section fills (2026-11-19)
+
+`cols` was 7.90 s over 481 calls and `fill` 1.86 s over 1,536 sections at `jobs=1` on
+`b588c03`. This slice attacks the per-block density evaluation those two stages are made of,
+four positions at a time, and nothing else: the same values, the same order of the rules that
+follow, the same bytes.
+
+### Where the per-block time actually was
+
+`block_density` is called once per block: 15.4M times by the `surf` top-down scans, 7.8M by
+the surface window and 6.3M by the section fill on this dump — 29.5M calls at **84 ns** each,
+2.5 s of the terrain stage. An env-gated stopwatch inside `build_cols_body` (temporary, not in
+the tree) split `cols` itself:
+
+| inside `cols` | before | after |
+|---|---|---|
+| corner grids (`interp_ids`, interpreter) | 1,131 ms | 1,131 ms |
+| `resolve_beard` (structure layer) | 3,204 ms | 3,204 ms |
+| `surf` scans | 1,302 ms | **268 ms** |
+| `wtop` aquifer scans | 36 ms | 35 ms |
+| surface window (`mats`) | 912 ms | **646 ms** |
+
+**The first measurement that mattered was a negative one.** A density call executes 29
+instructions of the compiled program and **zero noise samples**: the `interpolated` grid
+lookup jumps over the whole `blend_density` subtree, so the per-block spine is arithmetic
+(`min`, `squeeze`, `y_clamped_gradient`, the `range_choice` on `sloped_cheese`) plus the
+trilinear cell. Implemented the obvious way — four scalar `f64::min`/`max` per min op and four
+separate `trilinear` calls (three `floor` calls each) — four lanes measured **exactly
+break-even** (cols 8,030 ms against 7,984 ms): the per-lane work *was* the density's cost, so
+vectorising the arithmetic around it bought nothing. Two rewrites turned it into the table
+above:
+
+* **`min`/`max` as compare/blend sequences.** The pinned `df_min` returns `-0.0` for the two
+  zeros and the non-NaN operand; `_mm256_min_pd` returns its second operand for both — so the
+  four lanes are selected with `_mm256_cmp_pd` + `_mm256_blendv_pd`, the same four cases.
+* **`trilinear_x4`.** Four consecutive `x` of one chunk are inside one horizontal grid cell
+  (checked per group), so all four lanes interpolate between the *same* eight corner values:
+  eight scalar loads broadcast to eight vectors, then `lerp3`'s three stages with `fx` per lane
+  and `fy`/`fz` shared. No gather.
+
+### What changed (all in `src/worldgen.rs`)
+
+1. **`DfProg::eval_x4` + `run4_avx2`.** The compiled program evaluated with `__m256d` slots.
+   `#[cfg(target_arch = "x86_64")]` + `is_x86_feature_detected!("avx2")` at runtime; every
+   other host keeps the one-lane path, and `MC_SPINE_DF4=0` is the A/B switch on any host.
+   Ops keep the scalar program's exact IEEE-754 sequence — **no `mul_add`/FMA** — and the six
+   that cannot be lane-parallel (`Noise`, `ShiftA`, `ShiftB`, `Weird`, `Beardifier`, `Call`)
+   run their scalar body on each lane. A conditional jump (`range_choice`, `interval_select`,
+   `div`'s zero guard) is taken when **all four lanes agree**; if they do not, the group is
+   finished on the one-lane evaluator and `M6 df4 bail` counts it. Measured on the 64-chunk
+   dump: **7,726,111 groups vectorised, 38,227 divergent (0.49%)**.
+2. **`df_min`/`df_max`.** Rust leaves two `f64::min`/`max` cases unspecified — two zeros of
+   different signs, and two NaNs — and the lowerings disagree about the first: the same
+   `f64::min(-0.0, 0.0)` answered `-0.0` from one build of this tree and `0.0` from another
+   (measured while writing the vector arm's test). The interpreter, the constant folder, the
+   one-lane program and the vector arm now all call one pinned sequence, so the arms agree by
+   construction instead of by both happening to lower the same way. The dumps below are
+   unchanged, which is the evidence that no world reads the difference.
+3. **`Gen::block_density_x4`** — four consecutive columns at one `(y, z)`.
+4. **`surf`**: four columns per pass, each lane keeping its own first positive `y` and
+   stepping down in lockstep; a lane that has found its surface is no longer updated. Extra
+   evaluations for lanes past their own surface are pure (density depends only on the position
+   and the columns), which is what makes lockstep exactly four independent scans.
+5. **`fill`**: `base_section_rows` asks for four columns' densities at once and then runs
+   `terrain_cell_density` per cell — vanilla's aquifer, material and deep rules in the order
+   they ran (`ly`, `lz`, `lx`), with `MARK_FILL`/`MARK_SURFACE` filed from the same loop.
+6. **`mats`**: the group's densities are buffered per column (`[min_y ..= scan_top]`, the
+   group's `scan_top` maximum) and each column is then walked in the old order, so the aquifer
+   calls, the surface predicates and the per-column caches see the old sequence
+   (`surface_cell_density`).
+
+### Identity, before speed
+
+| check | result |
+|---|---|
+| 64-chunk dump (`MC_SPINE_WG_DUMP_N=8`) `full` / `MC_SPINE_NOFEAT=1` / `+MC_SPINE_NOCARVE=1` | byte-identical to `b588c03`: `670fdfe3…` / `57101c43…` / `bb499dfb…` (25,165,824 B each) |
+| the same binary with `MC_SPINE_DF4=0` (one-lane arm) | the same three digests |
+| seed `12345`; a negative-origin window `(-7,-5)`; Nether seed `4242`; End seed `0` | byte-identical to a binary built from `b588c03` with this change reverted: `8eeef781…` / `85375f74…` / `e2a3c108…` / `e2eb489f…` |
+| `df4_ops_match_the_scalar_ops_over_edge_values` | every op over 22 edge values (both zeros, both infinities, quiet/signalling NaN, subnormals, `MIN`/`MAX`, the spine's own constants) — `to_bits` identity with the one-lane op, except that a NaN *result* of an arithmetic op on two NaNs may carry the other NaN's payload (neither lowering is specified to keep which). No consumer reads a NaN's payload: every read of the density is a comparison, and the corner grid the bytes come from is filled on the one-lane path |
+| `df4_density_matches_block_density_per_column` | 4 presets (Overworld seeds 0 and 12345, Nether, End) × 3 chunk origins (including negative) × rows, `to_bits` against four `block_density` calls |
+| `df4_columns_match_the_scalar_density_path` | one chunk built with the vector arm and with the in-process one-lane arm (`df4_test_force_scalar`): same `surf`, `wtop`, `rd`, same surface-material windows and same corner grid cells |
+| `df4_section_fill_matches_the_scalar_cell_rule` | six sections (above, through and below the surface) against the one-cell rule: same 4,096 states and the same mark list |
+| full suite | see "Gates" below |
+
+Two of these are held able to fail rather than asserted to pass:
+
+* the op test asserts `M3_DF4_VEC > 0` when the host has AVX2, so deleting the vector arm
+  (or letting it decline every program) turns the test red instead of leaving it green with
+  nothing compared;
+* the columns test builds the same chunk twice with the switch flipped, so the batching — not
+  the environment — is the thing compared.
+
+### Measurement
+
+64-chunk `MC_SPINE_WG_DUMP_N=8` dump at seed 0, `CPUQuota=300%`, `MemoryMax=4G`, two binaries
+(`b588c03` and this tree), three interleaved runs per arm, medians (spread across the three
+runs of one arm: 0.02 s on the `full` serial arm, 0.03 s on the `jobs=5` arm). Wall is the binary's own
+`[wgdump] … in <t>`, CPU is `user+sys` of the run:
+
+| workload | jobs | base `b588c03` | this tree | delta |
+|---|---|---|---|---|
+| full (features on) | 1 | 9.692 s / 9.74 s cpu | **8.137 / 8.17** | **−16.0% wall, −16.1% CPU** |
+| full | 5 | 6.542 / 9.20 | **5.787 / 7.97** | **−11.5% wall, −13.4% CPU** |
+| `MC_SPINE_NOFEAT=1` (terrain + carvers) | 1 | 5.460 / 5.51 | **3.895 / 3.95** | **−28.7% wall, −28.3% CPU** |
+| `MC_SPINE_NOFEAT=1` | 5 | 2.630 / 4.96 | **1.882 / 3.72** | **−28.4% wall, −25.0% CPU** |
+| terrain only (`NOFEAT`+`NOCARVE`) | 5 | 0.992 / 2.98 | **0.768 / 2.27** | **−22.6% wall, −23.8% CPU** |
+
+And the same binary with one flag, which attributes the change to the vector arm rather than to
+the binary difference (three runs each, jobs=1):
+
+| workload | `MC_SPINE_DF4=0` | `MC_SPINE_DF4=1` | delta |
+|---|---|---|---|
+| full | 9.764 s | **8.095** | −17.1% |
+| `NOFEAT` | 5.457 | **3.878** | −28.9% |
+
+Per stage, `full` at `jobs=1` (`MC_SPINE_M3_PROFILE=1`, medians of three):
+
+| M5 | base | this tree |
+|---|---|---|
+| `cols` (481 calls) | 7,901.8 ms | **6,706.0 ms** (−15.1%) |
+| `beard` inside it (234) | 3,267.5 | 3,282.8 (untouched: `structure_pipeline.rs`) |
+| `fill` (1,536 sections) | 1,825.5 | **1,446.5** (−20.8%) |
+| `carver` (1,089) | 2,713.7 | **1,864.4** (−31.3%; the carvers ask for `cols`, so they move with it) |
+| `feature` (121) | 632.1 | 632.6 (not touched by this slice; both arms land in 0.58–0.63 s across runs) |
+
+The `jobs=5` full arm gains less than the serial one because the serial tail (features, and the
+beard resolution inside `cols`) is what the batch waits on; the arms that are terrain only
+gain 25–30%.
+
+### What is left, and why it is not in this slice
+
+* **`beard` 3.2 s and the corner grids 1.1 s are the two biggest remaining items in `cols`,
+  and both are noise-bound.** The grid fill evaluates the `interpolated` node's input with
+  `cc = None`, so the nested `interpolated` nodes fall through and real `NormalNoise` samples
+  run: ~380 ns per corner against the 84 ns a per-block call used to cost. The same is true of
+  `resolve_beard`, which lives in `structure_pipeline.rs`. A four-lane noise sampler is the
+  next lever; it is not attempted here.
+* **`fill`'s remaining 1.2 s is per-cell rules, not density.** 5.3M of its 6.3M cells ask the
+  aquifer (`aq_state`, ~200 ns each, twelve `aq_rpos_c` lookups per cell for the nearest-four
+  selection). The density share of the fill is now ~150 ms of 1,425.
+* `mats`'s remaining 646 ms is the same per-cell work (aquifer plus `scan_surface_column`);
+  its density share was ~650 ms and is now ~120.
+* The `MC_SPINE_DF4` switch is a diagnostic, like `MC_SPINE_DF_INTERP`: the vector arm is the
+  default and there is no host-dependent behaviour, because `df_min`/`df_max` pin the one
+  place where the two lowerings differ.
+
+### Counter semantics (changed by this)
+
+`M6 df4 vec` / `M6 df4 bail` count four-lane groups evaluated by the vector arm and groups a
+conditional jump found divergent (each finished as four one-lane evaluations). Everything else
+in M1–M5 counts what it counted; the counts that depend on *how many* density calls happen
+(`WG_COUNT`, `DFSTATS`) are unchanged, because the batching asks for the same positions.
+
+### Reproduce
+
+```sh
+D=$PWD/target/p4-bench && mkdir -p "$D"
+# the recorded digests (three arms)
+for v in "" MC_SPINE_NOFEAT=1 MC_SPINE_NOFEAT=1\ MC_SPINE_NOCARVE=1; do
+  systemd-run --user --scope -p CPUQuota=300% -p MemoryMax=4G --collect \
+    env $v MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=$D/d.bin MC_SPINE_WG_DUMP_N=8 \
+        MC_SPINE_GEN_JOBS=1 ./target/release/mc-spine
+  sha256sum $D/d.bin     # 670fdfe3… / 57101c43… / bb499dfb…
+done
+# the same binary with the one-lane arm, and the M6 counters
+systemd-run --user --scope -p CPUQuota=300% -p MemoryMax=4G --collect \
+  env MC_SPINE_DF4=0 MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=$D/one.bin \
+      MC_SPINE_WG_DUMP_N=8 MC_SPINE_GEN_JOBS=1 ./target/release/mc-spine
+systemd-run --user --scope -p CPUQuota=300% -p MemoryMax=4G --collect \
+  env MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=$D/vec.bin MC_SPINE_WG_DUMP_N=8 \
+      MC_SPINE_GEN_JOBS=1 MC_SPINE_M3_PROFILE=1 ./target/release/mc-spine   # M6 df4 vec=… bail=…
+cmp $D/one.bin $D/vec.bin
+rm -f $D/*.bin          # one dump is 24 MiB
+```
+
+### Gates
+
+`df4_ops_match_the_scalar_ops_over_edge_values`, `df4_density_matches_block_density_per_column`,
+`df4_columns_match_the_scalar_density_path` and `df4_section_fill_matches_the_scalar_cell_rule`
+(the four identity blocks above). The op test's `M3_DF4_VEC > 0` assertion and the columns
+test's in-process switch are what keep them from passing with the feature removed. Full suite
+(`cargo test --offline --locked -j 2 -- --test-threads=4`): **744 passed, 0 failed, 1 ignored**
+(the one `#[ignore]` is pre-existing). Nothing in this slice is `#[ignore]`d.
+
 ## M3 P5-wire/light: the delivery path's allocations (2026-11-20)
 
 Four shapes in the chunk delivery path allocated per call, on a path that runs for every
