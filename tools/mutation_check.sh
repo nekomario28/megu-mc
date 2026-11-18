@@ -3306,6 +3306,36 @@ check "a prefetched section is consumed by its own section key" \
   '        let mut arr = match self.terr_c.get(&(cx, sy + 16, cz)) {' \
   worldgen::wg_tests::a_prefetched_section_is_identical_to_the_serial_section_with_features
 
+# `ClampedNormalInt` (`bpr`) is `(int) Mth.clamp(Mth.nextGaussian(random, mean, deviation),
+# minInclusive, maxInclusive)`: `ayo.c` narrows the gaussian to f32 before the multiply, the clamp
+# is f32, and the `f2i` cast truncates toward zero. `round()` moved every offset whose fraction
+# reached .5 by one cell, which is what sent `pointed_dripstone`'s `random_offset` candidates
+# through the biome filter at a different cell (47 cells at jungle (74,-41), seed 4242).
+check "clamped_normal as an IntProvider truncates toward zero, it does not round" \
+  src/generation_providers.rs '                };
+                v as i32
+            }' \
+  '                };
+                v.round() as i32
+            }' \
+  feature::generation_contract_tests::clamped_normal_int_provider_truncates_toward_zero_like_f2i
+
+# The clamp is `v < min ? min : Math.min(v, max)`, so the two bounds are not interchangeable: the
+# fixture's `min_inclusive`/`max_inclusive` are ints the JSON declares in that order, and reading
+# them the other way round turns every draw into a constant.
+check "clamped_normal's int clamp keeps min_inclusive and max_inclusive apart" \
+  src/generation_providers.rs '                let v = if v < *lo as f32 {
+                    *lo as f32
+                } else {
+                    v.min(*hi as f32)
+                };' \
+  '                let v = if v < *hi as f32 {
+                    *hi as f32
+                } else {
+                    v.min(*lo as f32)
+                };' \
+  feature::generation_contract_tests::clamped_normal_int_provider_truncates_toward_zero_like_f2i
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

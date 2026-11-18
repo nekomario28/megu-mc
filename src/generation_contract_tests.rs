@@ -3818,6 +3818,92 @@ fn kelp_places_its_head_when_the_column_is_one_water_cell_deep() {
     );
 }
 
+/// `minecraft:clamped_normal` as an **`IntProvider`** (`bpr`, `ClampedNormalInt`) is the only
+/// provider that turns a gaussian draw into a cell offset, and its arithmetic is the whole
+/// behaviour:
+///
+/// ```text
+/// // bpr.a(ayw):  a(random, this.mean, this.deviation, (float)this.minInclusive, (float)this.maxInclusive)
+/// // bpr.a(ayw,FFFF):  Mth.clamp(Mth.nextGaussian(random, mean, deviation), min, max)  then  f2i
+/// // ayo.c(ayw,FF):    mean + (float)random.nextGaussian() * deviation     // d2f, then f32 fmul/fadd
+/// // ayo.a(FFF):       v < min ? min : Math.min(v, max)                    // clamp BEFORE the cast
+/// ```
+///
+/// So the gaussian is narrowed to f32 *before* the multiply, the clamp is f32, and `f2i`
+/// truncates toward zero. This port computed in f64, `round()`ed and clamped afterwards, which
+/// moved every offset whose fraction reached `.5` by one cell. `pointed_dripstone`'s
+/// `random_offset` is the only placed feature that reads this provider (`deviation` 3.0 for the
+/// x/z spread, 0.6 for y), and one flipped offset is enough to send its candidate through the
+/// biome filter at a different cell - the placement stream then parts from the reference and
+/// every later patch lands somewhere else (measured: 47 cells at jungle (74,-41), seed 4242;
+/// `evidence/gameplay/feature-parity/jungle-dripstone-random-offset-20261118.md`).
+///
+/// The expected values are *recorded*, not computed by the code they check: they come from the
+/// bytecode bodies above run over an independent Xoroshiro128++ implementation of the port's
+/// mixin-free seeding (`Xor::seed`: splitmix `stafford13(s ^ phi)`, `stafford13(... + gamma)`,
+/// `nextDouble` = `(nextLong >> 11) * 2^-53`, Marsaglia polar with a spare).
+#[test]
+fn clamped_normal_int_provider_truncates_toward_zero_like_f2i() {
+    for (seed, json, expected) in [
+        (
+            0u64,
+            r#"{"type":"clamped_normal","mean":0.0,"deviation":3.0,"min_inclusive":-10,"max_inclusive":10}"#,
+            [-1, 1, 0, -1, -1, 0, -1, 7],
+        ),
+        (
+            0u64,
+            r#"{"type":"clamped_normal","mean":0.0,"deviation":0.6,"min_inclusive":-2,"max_inclusive":2}"#,
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        ),
+        (
+            7u64,
+            r#"{"type":"clamped_normal","mean":0.0,"deviation":3.0,"min_inclusive":-10,"max_inclusive":10}"#,
+            [0, 0, -4, 1, 1, 1, 0, 7],
+        ),
+        (
+            7u64,
+            r#"{"type":"clamped_normal","mean":0.0,"deviation":0.6,"min_inclusive":-2,"max_inclusive":2}"#,
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        ),
+    ] {
+        let p = p_ip(&jparse(json.as_bytes()).unwrap()).unwrap();
+        let mut r = Xor::seed(seed);
+        let got: Vec<i32> = (0..expected.len()).map(|_| p.get(&mut r)).collect();
+        assert_eq!(
+            got,
+            expected.to_vec(),
+            "seed {seed} {json}: `ClampedNormalInt` is f2i of an f32 clamp, not a rounded f64"
+        );
+    }
+    // The same two shapes the jungle cell set named, held to the spec formula over a sweep so a
+    // future change to the narrowing order, the clamp position or the cast is caught even when
+    // the eight recorded values happen to agree.
+    for (mean, dev, lo, hi) in [(0.0f32, 3.0f32, -10i32, 10i32), (0.0, 0.6, -2, 2)] {
+        let json = format!(
+            r#"{{"type":"clamped_normal","mean":{mean},"deviation":{dev},"min_inclusive":{lo},"max_inclusive":{hi}}}"#
+        );
+        let p = p_ip(&jparse(json.as_bytes()).unwrap()).unwrap();
+        for seed in 0..64u64 {
+            let mut r = Xor::seed(seed);
+            let mut mirror = Xor::seed(seed);
+            for draw in 0..16 {
+                let g = mirror.next_gauss() as f32;
+                let v = mean + g * dev; // f32 arithmetic, gaussian narrowed first
+                let v = if v < lo as f32 {
+                    lo as f32
+                } else {
+                    v.min(hi as f32)
+                };
+                assert_eq!(
+                    p.get(&mut r),
+                    v as i32,
+                    "seed {seed} draw {draw}: {json} must be the f32 clamp of the f32 gaussian, truncated"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn provider_values_and_following_rng_match_pre_extraction() {
     let mut trace = Vec::new();

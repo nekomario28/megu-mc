@@ -52,9 +52,29 @@ impl IP {
                     v
                 }
             }
-            IP::Norm(mean, dev, lo, hi) => (mean + r.next_gauss() * dev)
-                .round()
-                .clamp(*lo as f64, *hi as f64) as i32,
+            // `ClampedNormalInt.sample` (`bpr.a(ayw)`): `(int) Mth.clamp(Mth.nextGaussian(
+            // random, mean, deviation), minInclusive, maxInclusive)`. Three details are the
+            // behaviour, and all three were wrong here before:
+            //
+            // * `Mth.nextGaussian(random, mean, deviation)` (`ayo.c`) narrows the gaussian to
+            //   **f32** *before* the multiply and does `mean + (float)g * deviation` in f32:
+            //   `d2f` then `fmul` then `fadd`, with `mean`/`deviation` being the record's
+            //   `float` fields (double arithmetic lands on a different cell at a boundary).
+            // * the clamp is `Mth.clamp(float,float,float)` (`ayo.a(FFF)`: `v < min ? min :
+            //   Math.min(v, max)`), i.e. **before** the cast, not after a rounding.
+            // * the cast is `f2i` - truncation toward zero. `f64::round` moved every offset
+            //   whose fraction reached .5 by one cell, which flipped `pointed_dripstone`'s
+            //   `random_offset` candidates and, through the biome filter, the whole
+            //   placement stream (47 cells at jungle (74,-41), seed 4242).
+            IP::Norm(mean, dev, lo, hi) => {
+                let v = (*mean as f32) + (r.next_gauss() as f32) * (*dev as f32);
+                let v = if v < *lo as f32 {
+                    *lo as f32
+                } else {
+                    v.min(*hi as f32)
+                };
+                v as i32
+            }
             IP::Weighted(list) => {
                 let total: i32 = list.iter().map(|(w, _)| (*w).max(0)).sum();
                 if total <= 0 {
