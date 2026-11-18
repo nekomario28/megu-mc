@@ -2213,7 +2213,7 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         d.run(ctx, rng, &dec_roots, &dec_logs, &dec_foliage);
     }
     if let Some(shape) = update_leaves(ctx, &logs, &root_positions, &foliage) {
-        schedule_leaf_edges(ctx, &shape);
+        apply_edge_shape_updates(ctx, &shape);
     }
     true
 }
@@ -2333,15 +2333,117 @@ fn update_leaves(ctx: &mut FC, logs: &[P3], roots: &[P3], foliage: &[P3]) -> Opt
     })
 }
 
-/// Each native face updates the inside, then its neighbour.
-fn schedule_leaf_edges(ctx: &mut FC, shape: &LeafShape) {
+/// `StructureTemplate.updateShapeAtEdge(level, 3, shape, x, y, z)`, which `TreeFeature.place`
+/// runs over the shape `updateLeaves` returns, after the decorators.
+///
+/// Two rules live in it. `LeavesBlock.updateShape` only reserves a tick - it never writes the
+/// state it was asked about - and `VineBlock.updateShape` is an immediate recompute that can
+/// turn a vine into air. The leaf half was modelled here long before the vine half, which is
+/// how a vine a trunk/leaf decorator had just placed could survive with nothing sturdy behind
+/// it: `TreeFeature.place`'s obstruction scan counts a vine as an obstruction when the config
+/// does not set `ignore_vines`, so the leftover cell moved the *next* tree's placement. Measured
+/// on seed 4242 chunk (74,-41): with the half present the port's tree origins in that window
+/// equal the native capture's, in order (109); without it, 19 of them move.
+///
+/// Native order, per visited face: read the inside and the outside state, update the inside
+/// with the edge direction, write it, then update the outside with the opposite direction and
+/// the inside cell's *new* state. `VineBlock.updateShape` ignores that argument, but the order
+/// decides what the outside's recompute reads back out of the level - it sees the inside's new
+/// state through `ctx.get`, because the write went into the same map.
+fn apply_edge_shape_updates(ctx: &mut FC, shape: &LeafShape) {
     let Some(reg) = breg() else { return };
-    for (_, p, q) in crate::voxel_faces::exposed_faces(shape.positions()) {
-        let ps = ctx.get(p.0, p.1, p.2);
-        let qs = ctx.get(q.0, q.1, q.2);
-        crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, ps, qs);
-        crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, qs, ps);
+    for (direction, p, q) in crate::voxel_faces::exposed_faces(shape.positions()) {
+        let inside = ctx.get(p.0, p.1, p.2);
+        let outside = ctx.get(q.0, q.1, q.2);
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
+        if let Some(st) = vine_edge_state(ctx, reg, p, inside, direction) {
+            ctx.set(p.0, p.1, p.2, st);
+        }
+        if let Some(st) = vine_edge_state(ctx, reg, q, outside, direction ^ 1) {
+            ctx.set(q.0, q.1, q.2, st);
+        }
     }
+}
+
+/// `VineBlock`'s attachment properties by `Direction` index (declaration order), which is the
+/// order the recompute below walks `Direction.Plane.HORIZONTAL` in.
+const VINE_FACES: [&str; 6] = ["down", "up", "north", "south", "west", "east"];
+
+/// `VineBlock.updateShape` (`dov.a(dtc, ji, dtc, dcx, jd, jd)`), reduced to the two things it
+/// can do: recompute the six attachment flags and become air when none of them survives.
+/// `Some(new_state)` only when the state actually changes - the native comparison is an
+/// identity one on interned states.
+///
+/// From the pinned jar (`dov.class`, server.jar SHA-1 59353fb40c36d304f2035d51e7d6e6baa98dc05c):
+/// the short circuit is `Direction.DOWN` (index 0, the first constant in the clinit), not `UP`;
+/// `getUpdatedState` refreshes the `up` flag from the cell *above* (`jd.d()`) and keeps a
+/// horizontal face when `pos.relative(d)` is face-sturdy toward the vine *or* the cell above is
+/// a vine with that same face (the hanging-chain rule); and the air test counts five flags -
+/// `{north, south, west, east, up}` (`dov.g` minus `DOWN`) - so a vine with only `up` survives.
+/// That last rule is not `dov.p`, the four-face predicate the tick path uses.
+fn vine_edge_state(
+    ctx: &mut FC,
+    reg: &crate::block_registry::BReg,
+    cell: P3,
+    st: u32,
+    toward_neighbor: u8,
+) -> Option<u32> {
+    if reg.name_of(st) != "minecraft:vine" {
+        return None;
+    }
+    // `VINE_EDGE_TRACE=<cx>,<cz>`: one line per decision, the same fields the native
+    // `-Dvinechunk` VSHAPE trace prints, so the two sides diff decision by decision. A vine
+    // the pass kept and a vine the pass never visited leave the same blocks.
+    let traced = crate::trace_env::env_str!("VINE_EDGE_TRACE")
+        .is_some_and(|want| want == "all" || want == format!("{},{}", cell.0 >> 4, cell.2 >> 4));
+    if toward_neighbor == 0 {
+        if traced {
+            eprintln!(
+                "VEDGE 0 {} {} {} before={st} after={st}",
+                cell.0, cell.1, cell.2
+            );
+        }
+        return None;
+    }
+    let above = (cell.0, cell.1 + 1, cell.2);
+    let above_state = ctx.get(above.0, above.1, above.2);
+    let mut cur = st;
+    // `getUpdatedState`'s first step: an already-set `up` flag is re-asked, never added.
+    if reg.get_prop(st, "up").as_deref() == Some("true") {
+        let up = reg.supports_multiface(above_state, 0);
+        cur = reg.with_prop(cur, "up", if up { "true" } else { "false" });
+    }
+    for d in [2u8, 3, 4, 5] {
+        let prop = VINE_FACES[d as usize];
+        if reg.get_prop(cur, prop).as_deref() != Some("true") {
+            continue;
+        }
+        let (dx, dy, dz) = dir_off(d);
+        let neighbour = ctx.get(cell.0 + dx, cell.1 + dy, cell.2 + dz);
+        let mut attached = reg.supports_multiface(neighbour, d);
+        if !attached {
+            attached = reg.name_of(above_state) == "minecraft:vine"
+                && reg.get_prop(above_state, prop).as_deref() == Some("true");
+        }
+        cur = reg.with_prop(cur, prop, if attached { "true" } else { "false" });
+    }
+    let keeps = [2u8, 3, 4, 5]
+        .iter()
+        .any(|&d| reg.get_prop(cur, VINE_FACES[d as usize]).as_deref() == Some("true"))
+        || reg.get_prop(cur, "up").as_deref() == Some("true");
+    let out = if keeps {
+        cur
+    } else {
+        reg.state_of("minecraft:air", None)
+    };
+    if traced {
+        eprintln!(
+            "VEDGE {} {} {} {} before={st} after={out}",
+            toward_neighbor, cell.0, cell.1, cell.2
+        );
+    }
+    (out != st).then_some(out)
 }
 
 // ---------- JSON parsing ----------
@@ -2777,7 +2879,7 @@ mod tests {
             }
             let mut ctx = FC::new(&mut g);
             let shape = update_leaves(&mut ctx, &logs, &blocked, &[min, max]).unwrap();
-            schedule_leaf_edges(&mut ctx, &shape);
+            apply_edge_shape_updates(&mut ctx, &shape);
             let got = ctx.g.generated_leaf_ticks();
             let want: Vec<_> = f[8]
                 .split(';')
@@ -2792,6 +2894,100 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 39);
+    }
+
+    /// The vine half of `StructureTemplate.updateShapeAtEdge`, which `TreeFeature.place` runs
+    /// over the shape `updateLeaves` returns.
+    ///
+    /// Every expectation is a `VineBlock.updateShape` fact read out of the pinned 1.21.1 jar
+    /// (`dov.a(dtc,ji,dtc,dcx,jd,jd)` bytecode, `.cache` outside this repository), not a value
+    /// the port produced: the `Direction.DOWN` short circuit, the `up` flag refreshed from the
+    /// cell *above*, the four horizontal faces recomputed with the vine-above fallback, and air
+    /// only when all five of `north/south/west/east/up` are false. Each case names the rule it
+    /// pins; the first four are the ones the absent half got wrong.
+    #[test]
+    fn the_tree_edge_pass_applies_vine_update_shape() {
+        let reg = breg().expect("the block registry must load from assets/");
+        let log = reg.state_of("minecraft:oak_log", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let air = reg.state_of("minecraft:air", None);
+        // An unwritten cell reads as state 0 in this test (`test_default_air`), so state 0 has
+        // to be air for the expectations below to mean "this cell was left alone".
+        assert_eq!(
+            air, 0,
+            "the default-air read in this test assumes air is state 0"
+        );
+        let vine = |faces: &[&str]| {
+            let mut st = reg.state_of("minecraft:vine", None);
+            for f in faces {
+                st = reg.with_prop(st, f, "true");
+            }
+            st
+        };
+        // One shape cell: the pass visits exactly its six neighbours, and (2,1,0) is the one
+        // the EAST face reaches (with the WEST direction, so the DOWN short circuit is not
+        // what any of these cases is exercising by accident).
+        let shape = LeafShape {
+            min: (1, 1, 0),
+            filled: vec![true],
+            ys: 1,
+            zs: 1,
+        };
+        let run = |world: &[((i32, i32, i32), u32)], read: (i32, i32, i32)| -> u32 {
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            g.feat_write(1, 1, 0, log);
+            for (p, st) in world {
+                g.feat_write(p.0, p.1, p.2, *st);
+            }
+            let mut ctx = FC::new(&mut g);
+            ctx.test_default_air = true;
+            apply_edge_shape_updates(&mut ctx, &shape);
+            ctx.get(read.0, read.1, read.2)
+        };
+        // The vine under test is (2,1,0) unless a case says otherwise.
+        let at = (2, 1, 0);
+        // native: up unset, east has nothing behind it, no vine above -> all five false -> AIR
+        assert_eq!(
+            run(&[(at, vine(&["east"]))], at),
+            air,
+            "a vine with nothing behind it becomes air"
+        );
+        // control: a sturdy block behind the face keeps the vine exactly as it was
+        assert_eq!(
+            run(&[(at, vine(&["east"])), ((3, 1, 0), stone)], at),
+            vine(&["east"]),
+            "a supported face is kept"
+        );
+        // native counts `up` in the air test, so clearing the only horizontal face still keeps
+        // a vine that hangs from the block above
+        assert_eq!(
+            run(&[(at, vine(&["up", "east"])), ((2, 2, 0), stone)], at),
+            vine(&["up"]),
+            "`up` survives the air test even with no horizontal face"
+        );
+        // native reads `up` from the cell ABOVE; a block below is not support
+        assert_eq!(
+            run(&[(at, vine(&["up"])), ((2, 0, 0), stone)], at),
+            air,
+            "`up` is refreshed from above, so a block below cannot hold the vine up"
+        );
+        // the chain rule also reads the cell ABOVE
+        assert_eq!(
+            run(&[(at, vine(&["north"])), ((2, 2, 0), vine(&["north"]))], at),
+            vine(&["north"]),
+            "a vine above carrying the same face keeps the face"
+        );
+        assert_eq!(
+            run(&[(at, vine(&["north"])), ((2, 0, 0), vine(&["north"]))], at),
+            air,
+            "a vine below carrying the same face does not"
+        );
+        // the short circuit is DOWN, so the cell above the shape is never recomputed
+        assert_eq!(
+            run(&[((1, 2, 0), vine(&["east"]))], (1, 2, 0)),
+            vine(&["east"]),
+            "the DOWN edge short circuits and leaves the neighbour alone"
+        );
     }
 
     #[test]

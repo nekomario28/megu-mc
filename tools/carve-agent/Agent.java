@@ -811,6 +811,183 @@ public class Agent {
      * as "the features wrote almost nothing" instead of "the hook missed the call".
      * The fields logged (`pos`, `state`, the return value) exist in both.
      */
+    /**
+     * `VineBlock.updateShape` (`dov.a(dtc, ji, dtc, dcx, jd, jd)`): the state a vine becomes,
+     * logged where it returns (`-Dvinechunk=cx,cz`).
+     *
+     * This method is the whole vine half of `StructureTemplate.updateShapeAtEdge`: it is called
+     * once per visited face for the inside cell (with the edge direction) and once for the
+     * neighbour (with the opposite one), and it is where a vine turns into air when no face of
+     * it survives. It reads only its own arguments and the level, so the hook draws no random
+     * and cannot move a decision.
+     *
+     * Both `areturn` sites are hooked: the `Direction.DOWN` short circuit returns the state
+     * unchanged and logs `before == after`, which is itself the check that the branch read from
+     * the bytecode (DOWN, not UP) is the branch that runs.
+     */
+    static byte[] instrumentVineShape(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a")
+                            || !md.equals("(Ldtc;Lji;Ldtc;Ldcx;Ljd;Ljd;)Ldtc;")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            if (op != Opcodes.ARETURN) { super.visitInsn(op); return; }
+                            super.visitInsn(Opcodes.DUP);
+                            super.visitVarInsn(Opcodes.ASTORE, 40);
+                            super.visitVarInsn(Opcodes.ALOAD, 2);
+                            super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Enum",
+                                    "ordinal", "()I", false);
+                            for (String g : new String[] {"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 5);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                            }
+                            for (int slot : new int[] {1, 40}) {
+                                super.visitVarInsn(Opcodes.ALOAD, slot);
+                                super.visitMethodInsn(Opcodes.INVOKESTATIC, "dfy", "i",
+                                        "(Ldtc;)I", false);
+                            }
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "vine",
+                                    "(IIIIII)V", false);
+                            super.visitVarInsn(Opcodes.ALOAD, 40);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, ClassReader.EXPAND_FRAMES);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT vineshape failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * `StructureTemplate.updateShapeAtEdge`'s per-face lambda (`ent.a(jd$a,int,int,int,jd$a,
+     * dcx,int,ji,int,int,int)`): locals 1..3 are the shape origin, 8..10 the face offset and 7
+     * the direction, so the entry of this method is exactly one (direction, inside cell) visit.
+     * The lambda is a private static synthetic, so it is hooked by its full descriptor.
+     */
+    static byte[] instrumentEdgeFaces(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals(
+                            "(Ljd$a;IIILjd$a;Ldcx;ILji;III)V")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitCode() {
+                            super.visitCode();
+                            // direction, then x + x0, y + y0, z + z0
+                            super.visitVarInsn(Opcodes.ALOAD, 7);
+                            super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Enum",
+                                    "ordinal", "()I", false);
+                            for (String[] pair : new String[][] {{"1", "8"}, {"2", "9"}, {"3", "10"}}) {
+                                super.visitVarInsn(Opcodes.ILOAD,
+                                        Integer.parseInt(pair[0]));
+                                super.visitVarInsn(Opcodes.ILOAD,
+                                        Integer.parseInt(pair[1]));
+                                super.visitInsn(Opcodes.IADD);
+                            }
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "edgeFace",
+                                    "(IIII)V", false);
+                        }
+                    };
+                }
+            }, ClassReader.EXPAND_FRAMES);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT edgefaces failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * BlockPredicateFilter: log every candidate position and the predicate's verdict.
+     *
+     * Local slots of `eij.a(eiw, ayw, jd)`: 0=this, 1=context, 2=random, 3=pos, and the
+     * predicate is a single `ireturn`, so the value is stored in a scratch slot (40, the
+     * same one the biome-filter hook uses; both hooks never coexist on one class), the three
+     * coordinates are pushed and reloaded around the call.
+     */
+    static byte[] instrumentBlockPredicate(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a") || !md.equals("(Leiw;Layw;Ljd;)Z")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            if (op != Opcodes.IRETURN) { super.visitInsn(op); return; }
+                            super.visitVarInsn(Opcodes.ISTORE, 40);
+                            for (String g : new String[] {"u", "v", "w"}) {
+                                super.visitVarInsn(Opcodes.ALOAD, 3);
+                                super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "kh", g, "()I", false);
+                            }
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "blockpred",
+                                                  "(IIIZ)V", false);
+                            super.visitVarInsn(Opcodes.ILOAD, 40);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, ClassReader.EXPAND_FRAMES);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT blockpredicate failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * HeightmapPlacement: the heightmap value the placement puts the candidate at.
+     *
+     * `eir.a_(eiw, ayw, jd)` first stores `pos.getX()` in slot 4, `pos.getZ()` in slot 5 and
+     * `context.getHeight(heightmap, x, z)` in slot 6, then branches on `height > minY` with one
+     * `areturn` per branch - so both returns log the same three locals.
+     */
+    static byte[] instrumentHeightmapPlacement(byte[] buf) {
+        try {
+            ClassReader cr = new ClassReader(buf);
+            ClassWriter cw = writer(cr);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override public MethodVisitor visitMethod(int acc, String mn, String md,
+                                                           String sig, String[] ex) {
+                    MethodVisitor mv = super.visitMethod(acc, mn, md, sig, ex);
+                    if (!mn.equals("a_") || !md.equals(
+                            "(Leiw;Layw;Ljd;)Ljava/util/stream/Stream;")) return mv;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        @Override public void visitInsn(int op) {
+                            if (op != Opcodes.ARETURN) { super.visitInsn(op); return; }
+                            super.visitVarInsn(Opcodes.ILOAD, 4);
+                            super.visitVarInsn(Opcodes.ILOAD, 6);
+                            super.visitVarInsn(Opcodes.ILOAD, 5);
+                            super.visitMethodInsn(Opcodes.INVOKESTATIC, "CarveLog", "heightmap",
+                                                  "(III)V", false);
+                            super.visitInsn(op);
+                        }
+                    };
+                }
+            }, ClassReader.EXPAND_FRAMES);
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            System.err.println("CARVEAGENT heightmapplacement failed: " + t);
+            return null;
+        }
+    }
+
     static byte[] instrumentWrites(byte[] buf,String callback) {
         ClassReader cr = new ClassReader(buf);
         ClassWriter cw = writer(cr);
@@ -982,6 +1159,14 @@ public class Agent {
             if ("duz".equals(name)) return instrumentDimension(buf);
             if ("deg".equals(name)) return instrumentBiomes(buf);
             if ("eii".equals(name)) return instrumentBiomeFilter(buf);
+            if ("dov".equals(name) && System.getProperty("vinechunk") != null)
+                return instrumentVineShape(buf);
+            if ("ent".equals(name) && System.getProperty("edgechunk") != null)
+                return instrumentEdgeFaces(buf);
+            if ("eij".equals(name) && System.getProperty("blockpredchunk") != null)
+                return instrumentBlockPredicate(buf);
+            if ("eir".equals(name) && System.getProperty("hmchunk") != null)
+                return instrumentHeightmapPlacement(buf);
             if ("arb".equals(name)) return instrumentNoiseBiome(buf);
             if ("eis".equals(name)) return instrumentInSquare(buf);
             if ("dyn".equals(name)) return instrumentDynDraws(buf);
