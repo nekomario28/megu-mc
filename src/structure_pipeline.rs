@@ -395,21 +395,31 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
     let seed = g.wseed();
     let tag = preset_tag(g.preset);
     let key = (seed, tag, set);
-    if let Some(round) = g.starts_round {
-        if let Some(v) = starts_rounds()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&round)
-            .and_then(|m| m.rings.get(&key))
-            .cloned()
-        {
-            return v;
-        }
+    if let Some(cache) = g.starts_round.and_then(round_cache) {
+        let token = crate::worldgen::flight_token(RINGS_FLIGHT_DOMAIN, &key);
+        return cache
+            .rings
+            .get_or_build(key, token, || std::sync::Arc::new(ring_chunks_uncached(d, g, set)));
     }
     if let Some(cached) = RING_CACHE.with(|c| c.borrow().get(&(seed, tag, set)).cloned()) {
         return cached;
     }
-    let chunks = if g.preset != worldgen::NoisePreset::Overworld {
+    let arc = std::sync::Arc::new(ring_chunks_uncached(d, g, set));
+    RING_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() > 64 {
+            map.clear();
+        }
+        map.insert((seed, tag, set), arc.clone());
+    });
+    arc
+}
+
+/// [`ring_chunks`]'s computation, without the caches: the concentric-ring scan, which reads the
+/// biome quart sweep for every candidate.
+fn ring_chunks_uncached(d: &Defs, g: &mut Gen, set: usize) -> HashSet<(i32, i32)> {
+    let seed = g.wseed();
+    if g.preset != worldgen::NoisePreset::Overworld {
         HashSet::new()
     } else if let PlacementDef::Rings {
         distance,
@@ -443,26 +453,7 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
         .collect()
     } else {
         HashSet::new()
-    };
-    let arc = std::sync::Arc::new(chunks);
-    if let Some(round) = g.starts_round {
-        if let Some(map) = starts_rounds()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&round)
-        {
-            map.rings.insert(key, arc.clone());
-        }
-        return arc;
     }
-    RING_CACHE.with(|c| {
-        let mut map = c.borrow_mut();
-        if map.len() > 64 {
-            map.clear();
-        }
-        map.insert((seed, tag, set), arc.clone());
-    });
-    arc
 }
 
 /// `RandomSpreadStructurePlacement.isPlacementChunk`: is this chunk the set's own
@@ -1060,8 +1051,9 @@ fn set_starts(d: &Defs, g: &mut Gen, set: &SetDef, cx: i32, cz: i32) -> Vec<Star
 fn chunk_starts(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
     // M3 P1a M1: one admission scan per (chunk, cache). The owner/worker split is the point:
     // the round's cache is shared, so a scan here is duplicated work whenever two threads
-    // find the key missing at once (`starts_cached` computes before it takes the lock), and
-    // the owner repeating a worker's scan is the other half of the same question.
+    // compute the same key. P1b made that impossible for the round's own cache (the slot is a
+    // single-flight claim, so the second asker waits instead of scanning), and this counter is
+    // how that is measured: the count must not grow with the worker count any more.
     crate::worldgen::m3_inc_split(
         crate::worldgen::M3_CHUNK_STARTS_OWNER,
         crate::worldgen::M3_CHUNK_STARTS_WORKER,
@@ -1114,7 +1106,7 @@ struct StartsCache {
 /// `tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count` over its
 /// wall-clock assertion), so the sharing is scoped to the round: created before the workers
 /// spawn, dropped after they join, and every other caller keeps the thread-local cache.
-static STARTS_ROUNDS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, RoundCache>>> =
+static STARTS_ROUNDS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, std::sync::Arc<RoundCache>>>> =
     std::sync::OnceLock::new();
 
 /// What one terrain round shares between its workers: the structure starts and the stronghold
@@ -1122,26 +1114,78 @@ static STARTS_ROUNDS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, RoundCac
 /// that spawns fresh worker threads recomputed the whole concentric-ring scan once per
 /// thread per round, and that alone accounted for most of the 22.8 s the 64-chunk full dump
 /// cost at 5 workers (against 8.19 s serial).
-#[derive(Default)]
+///
+/// Each map is a single-flight cache rather than a plain map because the old shape - look up,
+/// drop the lock, compute, re-lock, insert - is what M3 P1a measured as duplicated work: two
+/// workers that miss the same key at once both compute it, and the later insert loses. Measured
+/// on the 64-chunk `full` dump, `chunk_starts` per round went from 281 serial to 454-462 at five
+/// workers and 376-571 at eight, varying run to run because the count was a race, not a
+/// difference in what was generated.
 struct RoundCache {
-    starts: HashMap<(u64, u8, i32, i32), std::sync::Arc<Vec<Start>>>,
-    rings: HashMap<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>,
+    starts: crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<Start>>>,
+    rings: crate::worldgen::FlightCache<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>,
+    /// Test probe: `chunk_starts` scans this round actually ran. The M1 counters aggregate the
+    /// whole process (a worker flushes into them on its way out), so a test that wants *this
+    /// round's* duplicate count reads it here instead of subtracting two aggregates that other
+    /// tests are also writing to.
+    #[cfg(test)]
+    scans: std::sync::atomic::AtomicU64,
 }
+
+impl Default for RoundCache {
+    fn default() -> Self {
+        RoundCache {
+            // The round's lifetime is the retention: it is created before the workers spawn and
+            // dropped after they join, so a bound would only evict work the round itself is
+            // still asking for.
+            starts: crate::worldgen::FlightCache::new(None),
+            rings: crate::worldgen::FlightCache::new(None),
+            #[cfg(test)]
+            scans: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// Flight domains for this module's two caches (see `worldgen::flight_token`).
+const STARTS_FLIGHT_DOMAIN: u64 = 0x3_0000_0001;
+const RINGS_FLIGHT_DOMAIN: u64 = 0x3_0000_0002;
+
 static STARTS_NEXT_ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-type StartsRoundMap = HashMap<u64, RoundCache>;
+type StartsRoundMap = HashMap<u64, std::sync::Arc<RoundCache>>;
 
 fn starts_rounds() -> &'static std::sync::Mutex<StartsRoundMap> {
     STARTS_ROUNDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Test probe: how many `chunk_starts` scans this round has run (see [`RoundCache::scans`]).
+#[cfg(test)]
+pub(crate) fn round_start_scans(round: u64) -> Option<u64> {
+    round_cache(round).map(|c| c.scans.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The round's cache, cloned out of the map so a caller never holds the map's mutex while it
+/// waits for (or builds) a value.
+fn round_cache(round: u64) -> Option<std::sync::Arc<RoundCache>> {
+    starts_rounds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&round)
+        .cloned()
+}
+
 /// Open a round-scoped start cache and return its id (`Gen::starts_round` selects it).
+///
+/// The same round also opens `worldgen`'s shared terrain caches: a round is the unit of both
+/// the structure-start sharing and the column/beardifier sharing, so the two are opened and
+/// dropped together and neither can outlive the generators that key on them.
 pub(crate) fn starts_round_begin() -> u64 {
     let id = STARTS_NEXT_ROUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     starts_rounds()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id, RoundCache::default());
+        .insert(id, std::sync::Arc::new(RoundCache::default()));
+    crate::worldgen::terrain_share_begin(id);
     id
 }
 
@@ -1151,34 +1195,26 @@ pub(crate) fn starts_round_end(id: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+    crate::worldgen::terrain_share_end(id);
 }
 
 fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
     let seed = g.wseed();
     let preset = preset_tag(g.preset);
-    if let Some(round) = g.starts_round {
+    if let Some(cache) = g.starts_round.and_then(round_cache) {
         let key = (seed, preset, cx, cz);
-        if let Some(v) = starts_rounds()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&round)
-            .and_then(|m| m.starts.get(&key))
-            .cloned()
-        {
-            return v;
-        }
-        // Computed outside the lock: start generation reads neighbour columns and can
-        // resolve the nested beardifier rule, so holding the lock across it would serialise
-        // the round's workers.
-        let starts = std::sync::Arc::new(chunk_starts(g, cx, cz));
-        let mut rounds = starts_rounds().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(map) = rounds.get_mut(&round) {
-            if let Some(existing) = map.starts.get(&key) {
-                return existing.clone();
-            }
-            map.starts.insert(key, starts.clone());
-        }
-        return starts;
+        let token = crate::worldgen::flight_token(STARTS_FLIGHT_DOMAIN, &key);
+        // The leader computes *outside* any cache lock: start generation reads neighbour
+        // columns and can resolve the nested beardifier rule, so holding a lock across it
+        // would serialise the round's workers. Waiters block on the flight's own condvar, so
+        // what they wait for is one publication, not the whole structure layer.
+        return cache.starts.get_or_build(key, token, || {
+            #[cfg(test)]
+            cache
+                .scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::sync::Arc::new(chunk_starts(g, cx, cz))
+        });
     }
     if let Some(v) = STARTS.with(|slot| {
         let mut cache = slot.borrow_mut();

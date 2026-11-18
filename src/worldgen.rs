@@ -881,7 +881,7 @@ pub struct Gen {
     /// (`specs/chunk-parallelism`, lever 2): the rows are a pure function of the
     /// immutable data and the seed, so a scratch generator produces the same array the
     /// world generator would. Bounded by `TERRAIN_STORE_BOUND`.
-    terr_c: HashMap<(i32, i32, i32), Box<[u32; 4096]>>,
+    terr_c: HashMap<(i32, i32, i32), std::sync::Arc<[u32; 4096]>>,
     terr_ord: std::collections::VecDeque<(i32, i32, i32)>,
     /// Sections installed into [`Gen::terr_c`] and not yet consumed by `terrain_section_at`,
     /// for the M3 P1a M4 counter only. Lives on the generator (not in a process-wide set)
@@ -1016,6 +1016,437 @@ pub(crate) fn parse_terrain_store_bound(value: Option<&str>) -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(TERRAIN_STORE_BOUND)
+}
+
+// ---------- M3 Slice P1b: round-scoped single-flight caches ----------
+//
+// `specs/chunk-parallelism` P1b. P1a measured the shape of the `full` CPU penalty: it grows
+// with the worker count (+63% at five, +122% at eight) and all of it is in the structure
+// layer, counted by M1 - `chunk_starts` 281 serial against 454-462 at five workers and
+// 376-571 at eight, `cols built` 481 against 650-657 and 565-760, while a prefetch worker's
+// own `col_c` answered **zero** hits at every count. A round's workers share one structure
+// cache, but each of them computed a chunk's starts *before* taking the lock and only then
+// re-checked for an existing entry, so two workers could compute the same admission scan;
+// and every column a worker built nested inside a beard resolution was private to that
+// worker's `Gen`.
+//
+// The two answers here are the two halves of that measurement:
+//
+// * [`FlightCache`] - one thread computes a key, everybody else waits for the publication.
+//   Nobody computes a value twice while it is resident, and a key that is *being* computed
+//   is not computed a second time either. The single-flight discipline is what a
+//   compute-then-insert cache cannot give: it only deduplicates after the fact.
+// * [`TerrainShare`] - the three bounded caches a round shares between its workers and its
+//   owner (`bases`, `beards`, `cols`), keyed the way `Gen` keys its own.
+//
+// Both are **round-scoped**, never process-wide: a cache of starts, beards or columns is a
+// function of the round's generator, and sharing one across rounds is how the Nether seed
+// `-1` fixture broke (`(-994,89,538)`: 19460 cells against 5849). The round opens them
+// (`terrain_share_begin`, driven by `feature::starts_round_begin`) and drops them when it
+// ends.
+
+/// Where a round's shared value lives: still being computed, or published.
+pub(crate) enum RoundSlot<T> {
+    /// One thread is computing the value; the flight is where it publishes it.
+    InFlight(std::sync::Arc<RoundFlight<T>>),
+    /// Published. Lookups take the value and never touch the flight.
+    Ready(T),
+}
+
+enum FlightOutcome<T> {
+    Pending,
+    Done(T),
+    /// The leader returned without publishing (its build panicked, or produced nothing to
+    /// publish). A waiter computes inline instead of waiting for a value that will not come.
+    Abandoned,
+}
+
+/// One key's publication channel.
+pub(crate) struct RoundFlight<T> {
+    outcome: std::sync::Mutex<FlightOutcome<T>>,
+    cv: std::sync::Condvar,
+}
+
+impl<T: Clone> RoundFlight<T> {
+    fn new() -> Self {
+        RoundFlight {
+            outcome: std::sync::Mutex::new(FlightOutcome::Pending),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// The published value, if it is already there. Never waits.
+    fn value(&self) -> Option<T> {
+        match &*self.outcome.lock().unwrap_or_else(|e| e.into_inner()) {
+            FlightOutcome::Done(v) => Some(v.clone()),
+            FlightOutcome::Pending | FlightOutcome::Abandoned => None,
+        }
+    }
+
+    /// Block until the leader publishes, or until it abandons the flight.
+    fn wait(&self) -> Option<T> {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match &*outcome {
+                FlightOutcome::Pending => {
+                    outcome = self.cv.wait(outcome).unwrap_or_else(|e| e.into_inner());
+                }
+                FlightOutcome::Done(v) => return Some(v.clone()),
+                FlightOutcome::Abandoned => return None,
+            }
+        }
+    }
+
+    fn publish(&self, value: T) {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*outcome, FlightOutcome::Pending) {
+            *outcome = FlightOutcome::Done(value);
+        }
+        drop(outcome);
+        self.cv.notify_all();
+    }
+
+    fn abandon(&self) {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*outcome, FlightOutcome::Pending) {
+            *outcome = FlightOutcome::Abandoned;
+        }
+        drop(outcome);
+        self.cv.notify_all();
+    }
+}
+
+thread_local! {
+    /// Keys whose flight **this thread** is leading, innermost last. A structure resolution
+    /// can ask for a key the same thread is already computing (a heightmap query inside the
+    /// cache's own build); claiming that flight again would deadlock on the publication only
+    /// this thread can make, so the re-entry computes inline instead.
+    static FLIGHT_STACK: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn flight_stack_contains(token: u64) -> bool {
+    FLIGHT_STACK.with(|s| s.borrow().contains(&token))
+}
+
+/// Identity of one flight, for the re-entry check. Two different keys may collide (the hash
+/// is 64 bits and the stack is a handful deep): a collision only makes the re-entrant call
+/// compute inline, which is always safe, and never suppresses a publication.
+pub(crate) fn flight_token<K: std::hash::Hash>(domain: u64, key: &K) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    domain.hash(&mut h);
+    key.hash(&mut h);
+    h.finish()
+}
+
+struct FlightToken(u64);
+
+impl FlightToken {
+    fn push(token: u64) -> Self {
+        FLIGHT_STACK.with(|s| s.borrow_mut().push(token));
+        FlightToken(token)
+    }
+}
+
+impl Drop for FlightToken {
+    fn drop(&mut self) {
+        FLIGHT_STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            if let Some(pos) = stack.iter().rposition(|t| *t == self.0) {
+                stack.remove(pos);
+            }
+        });
+    }
+}
+
+/// A bounded cache with single-flight fills.
+///
+/// Reads are one mutex acquisition. A miss makes this thread the key's leader and runs the
+/// build **without the lock** (a column build resolves structures, which would otherwise
+/// serialise the whole round); every other asker waits on that flight's condvar, also
+/// without the cache's lock held.
+pub(crate) struct FlightCache<K, V> {
+    /// FIFO retention over published keys, or `None` for a cache that lives as long as its
+    /// round. Same eviction discipline as `Gen`'s own caches so the two cannot disagree about
+    /// what "resident" means.
+    bound: Option<usize>,
+    inner: Mutex<FlightCacheInner<K, V>>,
+    /// Test probe: leaders that actually built a value, and askers that took one without
+    /// building. A single-flight claim is exactly the difference between the two, and it is
+    /// read by `m3_p1b_single_flight_deduplicates_chunk_starts_and_cols`.
+    #[cfg(test)]
+    built: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    shared: std::sync::atomic::AtomicU64,
+}
+
+struct FlightCacheInner<K, V> {
+    map: HashMap<K, RoundSlot<V>>,
+    /// Published keys, oldest first. An in-flight key is deliberately absent: a leader is
+    /// never evicted out from under the waiters that already hold its flight.
+    ord: std::collections::VecDeque<K>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightCache<K, V> {
+    pub(crate) fn new(bound: Option<usize>) -> Self {
+        FlightCache {
+            bound,
+            inner: Mutex::new(FlightCacheInner {
+                map: HashMap::new(),
+                ord: std::collections::VecDeque::new(),
+            }),
+            #[cfg(test)]
+            built: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            shared: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Test probe: `(values this cache built, values it served from a flight or a slot)`.
+    #[cfg(test)]
+    pub(crate) fn flight_counts(&self) -> (u64, u64) {
+        (
+            self.built.load(std::sync::atomic::Ordering::Relaxed),
+            self.shared.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The value for `key`, if it is resident or already published. Never builds, never waits.
+    pub(crate) fn peek(&self, key: &K) -> Option<V> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.map.get(key) {
+            Some(RoundSlot::Ready(v)) => Some(v.clone()),
+            Some(RoundSlot::InFlight(f)) => f.value(),
+            None => None,
+        }
+    }
+
+    /// `key`'s value: resident, else published by whoever leads it, else built here.
+    ///
+    /// `token` comes from [`flight_token`] and is the key's re-entry identity (see
+    /// [`FLIGHT_STACK`]).
+    pub(crate) fn get_or_build(&self, key: K, token: u64, build: impl FnOnce() -> V) -> V {
+        // This thread is already computing this key (a nested ask from inside the build):
+        // waiting for this thread's own publication would deadlock, so compute inline.
+        if flight_stack_contains(token) {
+            return build();
+        }
+        match self.claim(&key) {
+            Claim::Ready(v) => {
+                #[cfg(test)]
+                self.shared
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                v
+            }
+            Claim::Wait(flight) => match flight.wait() {
+                Some(v) => {
+                    #[cfg(test)]
+                    self.shared
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    v
+                }
+                // The leader panicked or gave up: this thread computes its own answer, and
+                // pushes the token so a nested ask inside that build behaves the same way.
+                None => {
+                    #[cfg(test)]
+                    self.built.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _token = FlightToken::push(token);
+                    build()
+                }
+            },
+            Claim::Lead(flight) => {
+                #[cfg(test)]
+                self.built.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut leader = FlightLeader {
+                    cache: self,
+                    key,
+                    flight,
+                    token: FlightToken::push(token),
+                    published: false,
+                };
+                let value = build();
+                leader.publish(value.clone());
+                value
+            }
+        }
+    }
+
+    fn claim(&self, key: &K) -> Claim<V> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.map.get(key) {
+            Some(RoundSlot::Ready(v)) => Claim::Ready(v.clone()),
+            Some(RoundSlot::InFlight(f)) => Claim::Wait(f.clone()),
+            None => {
+                let flight = std::sync::Arc::new(RoundFlight::new());
+                inner
+                    .map
+                    .insert(key.clone(), RoundSlot::InFlight(flight.clone()));
+                Claim::Lead(flight)
+            }
+        }
+    }
+}
+
+enum Claim<V> {
+    Ready(V),
+    Wait(std::sync::Arc<RoundFlight<V>>),
+    Lead(std::sync::Arc<RoundFlight<V>>),
+}
+
+/// The leader's obligation: publish, or release the slot so the next asker can lead.
+///
+/// The `Drop` is the panic guard. Without it a build that unwinds would leave the slot in
+/// `InFlight` forever: every other worker asking for that chunk would wait on a publication
+/// that can never happen (a hang, not a wrong byte). Dropping it marks the flight abandoned
+/// and removes the slot, so waiters compute inline and later askers become leaders.
+struct FlightLeader<'a, K: std::hash::Hash + Eq + Clone, V: Clone> {
+    cache: &'a FlightCache<K, V>,
+    key: K,
+    flight: std::sync::Arc<RoundFlight<V>>,
+    token: FlightToken,
+    published: bool,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightLeader<'_, K, V> {
+    fn publish(&mut self, value: V) {
+        // Publish first: a waiter that grabbed the flight before the promotion below must
+        // find the value, not a pending flight nothing will ever fill.
+        self.flight.publish(value.clone());
+        let mut inner = self.cache.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(RoundSlot::InFlight(f)) = inner.map.get(&self.key) {
+            if std::sync::Arc::ptr_eq(f, &self.flight) {
+                inner
+                    .map
+                    .insert(self.key.clone(), RoundSlot::Ready(value));
+                inner.ord.push_back(self.key.clone());
+                if let Some(bound) = self.cache.bound {
+                    while inner.ord.len() > bound {
+                        if let Some(old) = inner.ord.pop_front() {
+                            inner.map.remove(&old);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> Drop for FlightLeader<'_, K, V> {
+    fn drop(&mut self) {
+        // `self.token` is dropped after this body: the re-entry stack must still hold the key
+        // while the cleanup below runs, so a nested ask during cleanup cannot re-claim it.
+        if self.published {
+            return;
+        }
+        self.flight.abandon();
+        let mut inner = self.cache.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let ours = matches!(
+            inner.map.get(&self.key),
+            Some(RoundSlot::InFlight(f)) if std::sync::Arc::ptr_eq(f, &self.flight)
+        );
+        if ours {
+            inner.map.remove(&self.key);
+        }
+    }
+}
+
+/// One terrain round's shared terrain caches: what its workers and its owner would otherwise
+/// each compute privately.
+///
+/// Three caches, all keyed `(world_seed, preset, chunk)` plus the two things that change what
+/// a column contains (`MC_SPINE_NOFEAT`, and which beardifier resolver is in force):
+///
+/// * `bases` (64) - `base_cols`, pure even while a beard resolves;
+/// * `beards` (128) - `resolve_beard`, only filed by an outermost resolution;
+/// * `cols` (128) - the **final** columns, only filed at `beard_depth == 0`.
+///
+/// The last rule is the Nether seed `-1` lesson: a column built while `beard_depth > 0` is the
+/// preliminary, structure-free answer on purpose (`Gen::cols` already refuses to put one in
+/// `col_c`), and putting it in a cache another worker reads would hand that chunk the wrong
+/// terrain - measured on the fixture row `(-994,89,538)`: 19460 cells against 5849.
+pub(crate) struct TerrainShare {
+    /// `Option` because `Gen`'s own builders answer one: a chunk with no columns is an answer
+    /// (and a pure one), so the share publishes it like any other instead of making every
+    /// waiter recompute the same absence.
+    bases: FlightCache<TerrainKey, Option<std::sync::Arc<ChunkCols>>>,
+    beards: FlightCache<TerrainKey, Option<std::sync::Arc<BeardChunkData>>>,
+    cols: FlightCache<TerrainKey, Option<std::sync::Arc<ChunkCols>>>,
+}
+
+/// `(world_seed, preset, cx, cz, flags)` with the flags that change a column's bytes: the
+/// `MC_SPINE_NOFEAT` switch, which the beard/column path reads on every call.
+type TerrainKey = (u64, u8, i32, i32, u8, usize);
+
+/// Which cache a [`flight_token`] belongs to. The token only has to distinguish a key from the
+/// other keys *this thread* is leading at the same moment, so one number per cache plus the
+/// key is enough.
+const SHARE_DOMAIN_BASES: u64 = 0x1_0000_0001;
+const SHARE_DOMAIN_BEARDS: u64 = 0x1_0000_0002;
+const SHARE_DOMAIN_COLS: u64 = 0x1_0000_0003;
+
+/// `MC_SPINE_NOFEAT=1` is the terrain-only switch: it skips the whole feature layer, and a
+/// structure-shaped terrain is part of that layer. Cached once per process (the flag cannot
+/// change under a run) because the share keys on it.
+fn share_nofeat() -> bool {
+    static NOFEAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NOFEAT.get_or_init(|| env_flag!("MC_SPINE_NOFEAT"))
+}
+
+impl TerrainShare {
+    fn new() -> Self {
+        TerrainShare {
+            bases: FlightCache::new(Some(64)),
+            beards: FlightCache::new(Some(128)),
+            cols: FlightCache::new(Some(128)),
+        }
+    }
+
+    /// Test probe: `((built, shared) for bases, beards, cols)`.
+    #[cfg(test)]
+    pub(crate) fn flight_counts(&self) -> [(u64, u64); 3] {
+        [
+            self.bases.flight_counts(),
+            self.beards.flight_counts(),
+            self.cols.flight_counts(),
+        ]
+    }
+}
+
+static TERRAIN_SHARES: std::sync::OnceLock<Mutex<HashMap<u64, std::sync::Arc<TerrainShare>>>> =
+    std::sync::OnceLock::new();
+
+fn terrain_shares() -> &'static Mutex<HashMap<u64, std::sync::Arc<TerrainShare>>> {
+    TERRAIN_SHARES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Open a round's shared terrain caches under the id its generators carry in
+/// `Gen::starts_round`. Called by `feature::starts_round_begin`, so the two caches a round
+/// owns are opened and dropped together.
+pub(crate) fn terrain_share_begin(round: u64) {
+    terrain_shares()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(round, std::sync::Arc::new(TerrainShare::new()));
+}
+
+/// Drop a round's shared terrain caches; called after the round's workers have joined. A
+/// straggler that still asks finds no share and builds its own columns, which is the serial
+/// answer, never a stale one.
+pub(crate) fn terrain_share_end(round: u64) {
+    terrain_shares()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&round);
+}
+
+/// The share a round opened, if it is still open. A caller that asks after the round ended
+/// (or for an id no round opened) gets `None` and builds its own columns.
+pub(crate) fn terrain_share(round: u64) -> Option<std::sync::Arc<TerrainShare>> {
+    terrain_shares()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&round)
+        .cloned()
 }
 
 // ---------- M3 Slice P1a: load-independent counters (M1-M5) ----------
@@ -4924,7 +5355,7 @@ pub(crate) struct PrefetchedTerrain {
 #[derive(Clone)]
 pub(crate) struct BaseRow {
     pub key: (i32, i32, i32),
-    pub arr: Box<[u32; 4096]>,
+    pub arr: std::sync::Arc<[u32; 4096]>,
     pub marks: Vec<(u8, i32, i32, i32)>,
 }
 
@@ -5287,12 +5718,16 @@ impl Gen {
         cx: i32,
         sy: i32,
         cz: i32,
-    ) -> (Box<[u32; 4096]>, Vec<(u8, i32, i32, i32)>) {
+    ) -> (std::sync::Arc<[u32; 4096]>, Vec<(u8, i32, i32, i32)>) {
         // M3 P1a M4/M5: which thread filled this section, and what the fill cost. A worker
         // and the owner run this same function, so the split is decided by the thread the
         // caller marked (`m3_set_worker`), not by looking at the generator.
         m3_inc_split(M3_OWNER_SECTIONS, M3_WORKER_SECTIONS);
         let t0 = m3_start();
+        // P1b: filled in a `Box` (one mutable, uniquely-owned array) and handed over as an
+        // `Arc` - the store, every `BaseRow` clone and every prefetched-section read share the
+        // same 16 KiB instead of copying it. The one place that needs to *write* into a row
+        // (`terrain_section_at`'s feature pass) copies it out once.
         let mut arr = Box::new([0u32; 4096]);
         let mut marks: Vec<(u8, i32, i32, i32)> = Vec::new();
         for ly in 0..16i32 {
@@ -5332,7 +5767,7 @@ impl Gen {
             }
         });
         m3_elapsed(M3_FILL_NS, M3_FILL_N, t0);
-        (arr, marks)
+        (std::sync::Arc::from(arr), marks)
     }
 
     /// Fill every section of `[lo, hi]` for one chunk on this (scratch) generator.
@@ -5504,24 +5939,31 @@ impl Gen {
         // feature layer (`feature::populate`), and a structure-shaped terrain is part of
         // that layer. Applying structures to a terrain fixture would compare the port's
         // beardified terrain with a native capture that had none.
-        if env_flag!("MC_SPINE_NOFEAT") {
+        if share_nofeat() {
             return None;
         }
         let Some(resolver) = self.beard_resolver.or_else(global_beard_resolver) else {
             return None;
         };
-        self.beard_depth += 1;
-        // M3 P1a M1/M5: a beardifier resolution is the 17x17 structure-start scan, the most
-        // expensive per-chunk unit in `cols`. A flat count across worker counts means the
-        // owner and the workers resolve disjoint chunks; a growing one means they repeat each
-        // other (which is what the split is there to answer), so the count and the time are
-        // both kept.
-        let t0 = m3_start();
-        let data = resolver(self, cx, cz);
-        m3_elapsed(M3_BEARD_NS, M3_BEARD_N, t0);
-        m3_inc_split(M3_BEARD_RESOLVED_OWNER, M3_BEARD_RESOLVED_WORKER);
-        self.beard_depth -= 1;
-        let arc = std::sync::Arc::new(data);
+        // M3 P1b: the round's other workers and its owner want the same chunk's beardifier
+        // input (P1a measured 234 resolutions serially against 64 per worker on top of 148-164
+        // on the owner: the same chunk resolved twice). Resolving is only entered at
+        // `beard_depth == 0`, so the share is asked here and nowhere nested.
+        let share = self.round_share();
+        let arc = match share {
+            Some(share) => {
+                let key = self.terrain_share_key(cx, cz);
+                if let Some(v) = share.beards.peek(&key) {
+                    v
+                } else {
+                    let token = flight_token(SHARE_DOMAIN_BEARDS, &key);
+                    share
+                        .beards
+                        .get_or_build(key, token, || self.resolve_beard_uncached(cx, cz, resolver))
+                }
+            }
+            None => self.resolve_beard_uncached(cx, cz, resolver),
+        }?;
         // A structure generation may have populated the cache for this chunk already
         // (nested resolution is refused, so only the outermost call inserts).
         if let Some(v) = self.beard_c.get(&(cx, cz)) {
@@ -5537,13 +5979,85 @@ impl Gen {
         Some(arc)
     }
 
+    /// [`Gen::resolve_beard`]'s body on this generator: the resolver call, its M1/M5 counters
+    /// and the recursion refusal. Split out so the round's share can wrap it without either
+    /// half owning the cache rule.
+    fn resolve_beard_uncached(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        resolver: BeardResolver,
+    ) -> Option<std::sync::Arc<BeardChunkData>> {
+        if self.beard_depth > 0 {
+            return None;
+        }
+        self.beard_depth += 1;
+        // M3 P1a M1/M5: a beardifier resolution is the 17x17 structure-start scan, the most
+        // expensive per-chunk unit in `cols`. A flat count across worker counts means the
+        // owner and the workers resolve disjoint chunks; a growing one means they repeat each
+        // other (which is what the split is there to answer), so the count and the time are
+        // both kept.
+        let t0 = m3_start();
+        let data = resolver(self, cx, cz);
+        m3_elapsed(M3_BEARD_NS, M3_BEARD_N, t0);
+        m3_inc_split(M3_BEARD_RESOLVED_OWNER, M3_BEARD_RESOLVED_WORKER);
+        self.beard_depth -= 1;
+        Some(std::sync::Arc::new(data))
+    }
+
+    /// This generator's round-scoped terrain share, if it belongs to a round that opened one.
+    fn round_share(&self) -> Option<std::sync::Arc<TerrainShare>> {
+        self.starts_round.and_then(terrain_share)
+    }
+
+    /// The share key for one chunk. Two things beyond the chunk's identity change what a
+    /// shared column contains and are therefore part of the key: the `MC_SPINE_NOFEAT` switch
+    /// (a terrain-only run has no beardifier at all) and which beardifier resolver is in force
+    /// (a test's per-generator override is not the world's). Without them a terrain-only arm
+    /// could take a bearded column from a neighbouring run's cache.
+    fn terrain_share_key(&self, cx: i32, cz: i32) -> TerrainKey {
+        let resolver = self.beard_resolver.or_else(global_beard_resolver);
+        (
+            self.world_seed,
+            self.preset.dim().index() as u8,
+            cx,
+            cz,
+            u8::from(share_nofeat()),
+            resolver.map(|r| r as usize).unwrap_or(0),
+        )
+    }
+
     pub(crate) fn cols(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
         if let Some(v) = self.col_c.get(&(cx, cz)) {
             m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
             return Some(v.clone());
         }
-        let cc = self.build_cols(cx, cz, true)?;
-        let arc = std::sync::Arc::new(cc);
+        // M3 P1b: a **final** column (built at `beard_depth == 0`) is what the round's other
+        // threads would build again on their own scratch generator. A nested build
+        // (`beard_depth > 0`) is the preliminary, structure-free answer and must never enter
+        // this cache - see `TerrainShare`.
+        let share = if self.beard_depth == 0 {
+            self.round_share()
+        } else {
+            None
+        };
+        let arc = match share {
+            Some(share) => {
+                let key = self.terrain_share_key(cx, cz);
+                if let Some(v) = share.cols.peek(&key) {
+                    // The column another thread of this round already built: this is the
+                    // `cols hit worker = 0` row of the P1a table, answered.
+                    m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
+                    v
+                } else {
+                    let token = flight_token(SHARE_DOMAIN_COLS, &key);
+                    share.cols.get_or_build(key, token, || {
+                        self.build_cols(cx, cz, true).map(std::sync::Arc::new)
+                    })
+                }
+            }
+            None => self.build_cols(cx, cz, true).map(std::sync::Arc::new),
+        }?;
         // Columns built while a beardifier resolution was in flight are the preliminary
         // (structure-free) answer on purpose, and must not be cached: the same chunk's
         // final columns need the structure data this build could not ask for.
@@ -5567,11 +6081,32 @@ impl Gen {
     ///
     /// Cached separately from `col_c` because it is pure in (seed, preset, chunk);
     /// unlike `cols`, it is safe to cache while `beard_depth > 0`.
+    ///
+    /// M3 P1b: this is the one column the structure layer builds *nested*, so it is the one
+    /// a round's workers repeat for each other. P1a measured the landing of that: the nested
+    /// builds inside a beard resolution were per-worker work, because the only shared cache
+    /// (`col_c`) refuses to file a `beard_depth > 0` column - correctly, since that column is
+    /// the preliminary answer. A base column has no such rule (it is the noise answer alone),
+    /// so it is shared with the round whenever one is open.
     pub(crate) fn base_cols(&mut self, cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
         if let Some(v) = self.base_c.get(&(cx, cz)) {
             return Some(v.clone());
         }
-        let arc = std::sync::Arc::new(self.build_cols(cx, cz, false)?);
+        let share = self.round_share();
+        let arc = match share {
+            Some(share) => {
+                let key = self.terrain_share_key(cx, cz);
+                if let Some(v) = share.bases.peek(&key) {
+                    v
+                } else {
+                    let token = flight_token(SHARE_DOMAIN_BASES, &key);
+                    share.bases.get_or_build(key, token, || {
+                        self.build_cols(cx, cz, false).map(std::sync::Arc::new)
+                    })
+                }
+            }
+            None => self.build_cols(cx, cz, false).map(std::sync::Arc::new),
+        }?;
         self.base_ord.push_back((cx, cz));
         if self.base_ord.len() > 64 {
             if let Some(old) = self.base_ord.pop_front() {
@@ -7487,7 +8022,7 @@ impl Gen {
         cz: i32,
         mut populate: impl FnMut(&mut Gen, i32, i32),
     ) -> Box<[u32; 4096]> {
-        let mut arr = match self.terr_c.get(&(cx, sy, cz)) {
+        let mut arr: Box<[u32; 4096]> = match self.terr_c.get(&(cx, sy, cz)) {
             Some(rows) => {
                 // M3 P1a M2/M4: the store answered, so this section's fill is not repeated and
                 // the row is no longer "waiting for its consumer".
@@ -7495,7 +8030,10 @@ impl Gen {
                 if m3_on() {
                     self.terr_pending.remove(&(cx, sy, cz));
                 }
-                rows.clone()
+                // P1b: the store, the worker that built the row and any other consumer share
+                // the array; the feature pass below writes into it, so this is the one copy
+                // out of the `Arc` (16 KiB per served section, against a fresh fill).
+                Box::new(*rows.as_ref())
             }
             None => {
                 // M4: the owner filled a section the store did not have. At `jobs=1` a prefetch
@@ -7505,7 +8043,12 @@ impl Gen {
                     Some(cc) => {
                         let (arr, marks) = self.base_section_rows(&cc, cx, sy, cz);
                         self.file_terrain_marks(&(cx, sy, cz), &marks);
-                        arr
+                        match std::sync::Arc::try_unwrap(arr) {
+                            Ok(boxed) => Box::new(boxed),
+                            // A shipping store installs the row it just built, so the share is
+                            // normally observable here; copy only if something else holds it.
+                            Err(shared) => Box::new(*shared.as_ref()),
+                        }
                     }
                     None => Box::new([0u32; 4096]),
                 }
@@ -11427,7 +11970,9 @@ mod wg_tests {
     /// made that fixture fail on the Nether seed `-1` row (`(-994, 89, 538)`: 19460 vs
     /// 5849) — a pre-existing order dependence in the fixture, not this lane's business to
     /// fix, but this test must not trip it. The bearded path is covered by the identity
-    /// dumps, which run in a process whose entry point registers the resolver.
+    /// dumps, which run in a process whose entry point registers the resolver. (The P1b
+    /// tests below reach the bearded path the same way without touching the process global:
+    /// they pass `feature::beard_resolver` as a **per-generator** override.)
     #[test]
     fn a_prefetched_section_is_identical_to_the_serial_section_with_features() {
         let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
@@ -11454,6 +11999,189 @@ mod wg_tests {
                 sy += 16;
             }
         }
+    }
+
+    /// M3 Slice P1b (`specs/chunk-parallelism`): opening a round's shared terrain caches changes
+    /// no byte.
+    ///
+    /// The arms are the configurations the dump runs: the serial reference (no round opened at
+    /// all, which is what `MC_SPINE_GEN_JOBS=1` is), then the same block at 1, 5 and 8 workers
+    /// inside one round - so the share is entered on one thread, on five and on eight, and every
+    /// arm must produce the same columns and the same section rows chunk for chunk. The Nether
+    /// fixture is in it on purpose: seed `-1` is where a cache that leaks across contexts shows
+    /// up (`(-994,89,538)`: 19460 cells against 5849), and the one rule this slice must not break
+    /// is that a preliminary (`beard_depth > 0`) column never reaches `cols`.
+    ///
+    /// The reference arm passes the same **per-generator** beardifier resolver as the round arms
+    /// rather than registering the process-wide one: registering it here would change what
+    /// `dimension_terrain_matches_all_native_fixture_states` sees (see the note on
+    /// `a_prefetched_section_is_identical_to_the_serial_section_with_features`).
+    #[test]
+    fn m3_p1b_64chunk_dump_is_bit_identical_across_worker_counts() {
+        let resolver = crate::feature::beard_resolver;
+        let lo = min_y();
+        let hi = min_y() + (max_y() + 1 - min_y()) / 16 * 16 - 16;
+        // The overworld arm is the dump's own block (`MC_SPINE_WG_DUMP_N=8`, seed 0); the Nether
+        // arm is a smaller block of the same fixture seed, because it is here for its structures
+        // and not for its size.
+        for (preset, seed, n) in [
+            (NoisePreset::Overworld, 0u64, 8i32),
+            (NoisePreset::Nether, u64::MAX, 4i32),
+        ] {
+            let local = Gen::load_preset(seed, crate::name_to_state, preset)
+                .expect("generator for the fixture seed");
+            let data = std::sync::Arc::clone(&local.data);
+            let keys: Vec<(i32, i32)> = (0..n)
+                .flat_map(|dz| (0..n).map(move |dx| (dx, dz)))
+                .collect();
+            // Reference: no round, so neither the round's start cache nor its share is entered.
+            let cols = prefetch_cols_with(&data, Some(resolver), &keys, 1, None);
+            let reference = prefetch_terrain(&data, Some(resolver), &keys, &cols, lo, hi, 1, None);
+            let want: Vec<_> = reference
+                .into_iter()
+                .zip(&keys)
+                .map(|(chunk, &key)| {
+                    (key, chunk.unwrap_or_else(|| panic!("{preset:?}: no reference rows for {key:?}")))
+                })
+                .collect();
+            for jobs in [1usize, 5, 8] {
+                let round = crate::feature::starts_round_begin();
+                let cols = prefetch_cols_with(&data, Some(resolver), &keys, jobs, Some(round));
+                let got =
+                    prefetch_terrain(&data, Some(resolver), &keys, &cols, lo, hi, jobs, Some(round));
+                crate::feature::starts_round_end(round);
+                assert_eq!(got.len(), want.len());
+                for (chunk, (key, want_chunk)) in got.into_iter().zip(&want) {
+                    let key = *key;
+                    let chunk = chunk
+                        .unwrap_or_else(|| panic!("{preset:?} jobs={jobs}: no rows for {key:?}"));
+                    assert_eq!(chunk.key, key, "{preset:?} jobs={jobs}: chunk order");
+                    assert_eq!(
+                        cols_fingerprint(&chunk.cols),
+                        cols_fingerprint(&want_chunk.cols),
+                        "{preset:?} jobs={jobs}: columns diverged at {key:?}; the round's share \
+                         must not change what a column contains"
+                    );
+                    assert_eq!(chunk.rows.len(), want_chunk.rows.len());
+                    for (row, want_row) in chunk.rows.iter().zip(&want_chunk.rows) {
+                        assert_eq!(
+                            row.key, want_row.key,
+                            "{preset:?} jobs={jobs}: section key at {key:?}"
+                        );
+                        assert_eq!(
+                            row.arr.as_slice(),
+                            want_row.arr.as_slice(),
+                            "{preset:?} jobs={jobs}: bytes diverged at {key:?} section {}",
+                            row.key.1
+                        );
+                        assert_eq!(
+                            row.marks, want_row.marks,
+                            "{preset:?} jobs={jobs}: terrain marks diverged at {key:?} section {}",
+                            row.key.1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// M3 Slice P1b: a round's workers must not do the same admission scan, or build the same
+    /// chunk's columns, twice.
+    ///
+    /// Two claims, each with its own probe so neither can pass vacuously:
+    ///
+    /// * the structure-start scans a round runs do not grow with the worker count. The 3x3 block
+    ///   is chosen for the overlap - every chunk's 17x17 admission window covers its neighbours,
+    ///   which is where P1a measured 281 scans serial against 454-462 and 376-571 at five and
+    ///   eight workers. The counter is per round (`feature::round_start_scans`), not the process
+    ///   aggregate, so a concurrently running test cannot supply or satisfy it.
+    /// * two threads of one round asking for the same chunk's columns build them once
+    ///   (`FlightCache::flight_counts`). Without single flight both threads build - that is the
+    ///   `M1 cols hit owner / worker = 118,530 / 0` row of the P1a table.
+    #[test]
+    fn m3_p1b_single_flight_deduplicates_chunk_starts_and_cols() {
+        let resolver = crate::feature::beard_resolver;
+        let local = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld)
+            .expect("generator for the fixture seed");
+        let data = std::sync::Arc::clone(&local.data);
+        let keys: Vec<(i32, i32)> = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |z| (x, z)))
+            .collect();
+        let arm = |jobs: usize| -> (u64, Vec<u64>) {
+            let round = crate::feature::starts_round_begin();
+            let _ = prefetch_cols_with(&data, Some(resolver), &keys, jobs, Some(round));
+            let scans = crate::feature::round_start_scans(round).expect("the round's start cache");
+            let counts = terrain_share(round).expect("the round's terrain share");
+            let counts = counts.flight_counts().into_iter().flat_map(|(a, b)| [a, b]).collect();
+            crate::feature::starts_round_end(round);
+            (scans, counts)
+        };
+        let (serial, serial_counts) = arm(1);
+        let (parallel, parallel_counts) = arm(5);
+        // `--nocapture` shows the measurement, not just the verdict: this is the P1a row that
+        // grew (`chunk_starts` 281 -> 454-462) and the share's own work, per worker count.
+        eprintln!(
+            "[m3 p1b] starts_round scans jobs=1 {} jobs=5 {} | share (bases,beards,cols) as \
+             (built,shared) jobs=1 {serial_counts:?} jobs=5 {parallel_counts:?}",
+            serial, parallel
+        );
+        assert!(
+            serial > keys.len() as u64,
+            "a 17x17 window per chunk must scan more chunks than the block holds: {serial} scans \
+             for {} chunks (a zero here would make the equality below vacuous)",
+            keys.len()
+        );
+        assert!(
+            serial_counts[0] > 0,
+            "the round's share was never used; the counters below would say nothing"
+        );
+        assert_eq!(
+            parallel, serial,
+            "five workers ran {parallel} admission scans against {serial} serially: a starts key \
+             was computed twice inside one round"
+        );
+        assert_eq!(
+            parallel_counts, serial_counts,
+            "the round's share did different work at five workers than at one \
+             ((bases, beards, cols) as (built, shared) each): {parallel_counts:?} against \
+             {serial_counts:?}"
+        );
+
+        // The same-key race, forced: two scratch generators of one round ask for one chunk's
+        // final columns at the same moment. One leads the flight, the other takes the
+        // publication, and both must get the same bytes.
+        let round = crate::feature::starts_round_begin();
+        let barrier = std::sync::Barrier::new(2);
+        let fingers = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                let fingers = &fingers;
+                let barrier = &barrier;
+                let data = std::sync::Arc::clone(&data);
+                s.spawn(move || {
+                    let mut g = Gen::fresh_scratch(data);
+                    g.starts_round = Some(round);
+                    g.set_beard_resolver(resolver);
+                    barrier.wait();
+                    let cc = g.cols(7, 7).expect("columns for the raced chunk");
+                    fingers.lock().unwrap().push(cols_fingerprint(&cc));
+                });
+            }
+        });
+        let counts = terrain_share(round).expect("the round's terrain share");
+        let (built, shared) = counts.flight_counts()[2];
+        crate::feature::starts_round_end(round);
+        let fingers = fingers.into_inner().unwrap();
+        assert_eq!(fingers.len(), 2);
+        assert_eq!(fingers[0], fingers[1], "the two racers got different columns");
+        assert_eq!(
+            built, 1,
+            "two threads of one round built the same chunk's columns ({built} builds)"
+        );
+        assert_eq!(
+            shared, 1,
+            "the second asker took the flight's publication ({shared} shared values)"
+        );
     }
 
     /// M3 Slice P1a (`specs/chunk-parallelism`): `MC_SPINE_TERRAIN_STORE_BOUND` decides

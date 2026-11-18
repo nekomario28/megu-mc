@@ -466,6 +466,160 @@ The full suite: 719 passed, 1 ignored, and the two failures that also fail at
 `0fa6807` on this host (`tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count`,
 `worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock`).
 
+
+## M3 P1b: round-scoped `TerrainShare`, single-flight starts/rings, `Arc` `terr_c` (2026-11-19)
+
+P1a above attributed the `full` CPU penalty to a *count* of work and named it: the
+structure layer, carried by M1 — `chunk_starts` 281 serial against 454-462 at five
+workers and 376-571 at eight, duplicated admission scans, with a prefetch worker's own
+`col_c` answering **zero** hits at every worker count. This section is the slice that
+removes it (`specs/chunk-parallelism`, P1b-e), and the re-measurement of the same three
+arms on the same block.
+
+What changed (three things, all inside the round's lifetime):
+
+* **Single-flight `starts_cached` / `ring_chunks`.** The round's cache was a plain map:
+  look up, drop the lock, compute, re-lock, insert. Two workers that missed the same key
+  at once both computed it, which is why P1a's `chunk_starts` count varied run to run
+  (206 against 401 at the same eight workers) — a lost update, not a difference in what
+  was generated. A slot is now `InFlight(flight) | Ready(value)`: one thread claims the
+  key and computes outside every lock, the rest wait on the flight's condvar (also
+  without the round's lock held), and the claim promotes to `Ready` when it publishes. A
+  `Drop` on the leader's handle releases the slot and marks the flight abandoned if its
+  build unwinds, so a panic produces a recompute instead of a hang, and a thread that
+  re-enters a key it is already leading computes inline instead of deadlocking on its own
+  publication.
+* **Round-scoped `TerrainShare` (`src/worldgen.rs`).** A round now also shares three
+  bounded caches, keyed `(world_seed, preset, cx, cz)` plus the two things that change a
+  column's bytes (`MC_SPINE_NOFEAT`, and which beardifier resolver is in force):
+  `bases` (64) for `base_cols` — the one column the structure layer builds *nested* —
+  `beards` (128) for `resolve_beard`, and `cols` (128) for the **final** columns. It is
+  opened by `feature::starts_round_begin` and dropped by `starts_round_end`, never
+  process-wide: sharing a cache of starts/beards/columns across rounds is how the Nether
+  seed `-1` fixture broke (`(-994,89,538)`: 19460 cells against 5849). The same rule is
+  kept inside the share — a `cols` entry is read and written **only** at
+  `beard_depth == 0`, because a column built while a beard resolves is the preliminary,
+  structure-free answer.
+* **`Arc<[u32; 4096]>` for `terr_c` / `BaseRow`.** A section row is built in a `Box` on
+  the worker and handed over as an `Arc`, so installing it, cloning a `PrefetchedTerrain`
+  and reading it from `prefetched_cell` all share the same 16 KiB. The one consumer that
+  writes into a row (`terrain_section_at`'s feature pass) copies it out once.
+
+### Identity
+
+Same 64-chunk block dump (`MC_SPINE_WG_DUMP_N=8`, seed 0), nine runs, three per arm,
+interleaved:
+
+| workload | sha256 | jobs=1 | jobs=5 | jobs=8 |
+|---|---|---|---|---|
+| `full` | `670fdfe3…` | ×3 identical | ×3 identical | ×3 identical |
+| `MC_SPINE_NOFEAT=1` | `57101c43…` | ×3 identical | ×3 identical | ×3 identical |
+
+Both are the digests recorded above, byte for byte, so every configuration below is a
+comparison of the same generated world.
+
+### Measurement
+
+Same command as P1a's *Reproduce* block, in a `CPUQuota=250%` `MemoryMax=3G` user scope
+(this slice's shared-host budget, so the two sections' absolute numbers are not
+comparable; the counters are). Three interleaved runs per arm, medians.
+
+| workload | jobs=1 | jobs=5 | jobs=8 |
+|---|---|---|---|
+| `NOFEAT` (terrain + carvers) | 5.582 s / 5.57 s cpu | **3.221** / 4.57 | 3.143 / 4.63 |
+| full (features on) | 9.792 / 9.78 | **7.260 / 8.78** | 7.104 / 8.85 |
+
+The CPU column is the P1a result with the penalty removed. `full` went 9.82 → **8.78** →
+8.85 here against 9.82 → 15.98 → 21.82 there: the +63%/+122% growth is gone, and the
+absolute cost is 10% *below* the serial arm at five workers. The feature layer alone
+(`full - NOFEAT`) is 4.21 / 4.21 / 4.22 s against P1a's 4.29 / 10.59 / 16.16 — the 2.5x
+and 3.8x growth that P1a identified as the whole penalty is now flat. Wall clock follows
+because the CPU does: 1.35x at five workers and 1.38x at eight (P1a: 1.27x and 1.13x,
+the eight-worker arm having been slower than five).
+
+The counters say where it went. `full`, bound 512, counters on (medians; every run of
+each arm reported these exact numbers, which is itself part of the result):
+
+| | jobs=1 | jobs=5 | jobs=8 |
+|---|---|---|---|
+| M1 `chunk_starts` owner / worker | 281 / 0 | 170 / **111** | 170 / **111** |
+| M1 `cols built` owner / worker | 481 / 0 | 303 / **117** | 289 / **131** |
+| M1 `cols hit` owner / worker | 144,448 / 0 | 133,095 / **54** | 118,530 / **40** |
+| M1 `beard resolved` owner / worker | 234 / 0 | 164 / **10** | 148 / **24** |
+| M2 `terr_c` hit / miss / evict / dup | 1536 / 0 / 1024 / 0 | same | same |
+| M4 sections worker / owner | 1,536 / 0 | 1,536 / 0 | 1,536 / 0 |
+| M4 `evicted_unconsumed` | 0 | 0 | 0 |
+
+Against the P1a table, per total:
+
+| counter | P1a j1 / j5 / j8 | P1b j1 / j5 / j8 |
+|---|---|---|
+| `chunk_starts` | 281 / 455 / 376-571 | **281 / 281 / 281** |
+| `cols built` | 481 / 650 / 565-760 | **481 / 420 / 420** |
+| `beard resolved` | 234 / 228 / 212 | **234 / 174 / 172** |
+| `cols hit` worker | 0 / 0 / 0 | **0 / 54 / 40** |
+
+Three things to read out of it. The admission scan no longer depends on the worker
+count *at all* — 281 at one, five and eight, where P1a measured 1.6x and up to 2x and a
+different number every run — which is exactly what single flight means (one claim per
+key, no lost updates). `cols built` is now *below* the serial count at five and eight
+workers (420 against 481), and nearly all of the drop is on the worker arm (347 -> 117 at
+five): that counter is incremented by `cols` *and* by `base_cols`, and the nested base
+columns a worker builds while a structure resolves are now built once per round instead of
+once per worker. The worker `cols hit` row reads the same change from the other side: it is
+no longer zero (`0 / 54 / 40`), so the `118,530 / 0` row of P1a is answered, and
+`beard resolved` falls from 228 to 174.
+
+Everything the slice did not touch is unchanged: the store still serves every section
+(`hit=1536`, `miss=0`), installs are still `1536` with `install_dup=0`, no worker row is
+evicted before its consumer reads it (`evicted_unconsumed=0`), and `M5`'s `carver` (1,210)
+and `feature` (121) call counts are worker-count-invariant. The `M5` durations are not:
+`cols` reads 12.9 s at five workers and 18.4 s at eight against 7.9 s at one, because the
+stopwatch sums per-thread time across threads sharing a 250% quota. They are the one
+load-dependent row in the report and no conclusion here uses them.
+
+### Reproduce
+
+```sh
+D=$PWD/target/p1b-bench && mkdir -p "$D"
+systemd-run --user --scope -p CPUQuota=250% -p MemoryMax=3G --collect \
+  env MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=$D/f.bin MC_SPINE_WG_DUMP_N=8 \
+      MC_SPINE_GEN_JOBS=5 MC_SPINE_M3_PROFILE=1 ./target/release/mc-spine
+sha256sum "$D/f.bin"   # 670fdfe3… full, 57101c43… MC_SPINE_NOFEAT=1, bb499dfb… +MC_SPINE_NOCARVE=1
+rm -f "$D/f.bin"       # one dump is 24 MiB
+```
+
+### Gates
+
+Two new tests, both prefixed `m3_p1b_` (`src/worldgen.rs`), plus P1a's kept green:
+
+* `m3_p1b_64chunk_dump_is_bit_identical_across_worker_counts` — the block above, as
+  columns fingerprints and section bytes, for the serial reference (no round opened) and
+  for the same block at 1, 5 and 8 workers inside one round, on the Overworld seed 0 and
+  the Nether seed `-1`. **Mutation-checked red**: dropping `cz` from the share's key made
+  it fail at the first chunk (`Overworld jobs=1: columns diverged at (0, 1)`).
+* `m3_p1b_single_flight_deduplicates_chunk_starts_and_cols` — a 3x3 block through a
+  round, twice (1 and 5 workers): the per-round admission-scan count is 82 in both, so
+  the count stopped depending on the worker count (a probe on the round, not the process
+  aggregate, so a concurrent test cannot supply it), and the share's `(built, shared)` is
+  `[72,0, 9,0, 9,0]` at both. Then two scratch generators of one round ask for one
+  chunk's columns at the same moment behind a barrier: one build, one shared value, the
+  same fingerprint. **Mutation-checked red**: letting a nested (`beard_depth > 0`)
+  column into the share made the race report six builds instead of one.
+
+Honest limit of the identity gate: these two blocks contain no `beard_depth > 0` `cols`
+site (the structure layer reaches nested terrain through `base_cols`), so the
+preliminary-column rule is pinned structurally — by the `beard_depth == 0` condition in
+`Gen::cols` and the race above, which fails loudly if the share is asked while nested —
+and not by these bytes.
+
+The P1a gates re-ran green on this tree: `terrain_store_bound_changes_retention_not_bytes`,
+`m3_counters_are_deterministic_across_runs`, `terrain_prefetch_fills_more_than_one_chunk_at_a_time`,
+`p2_3_s1_three_dimensions_answer_independently`,
+`dimension_terrain_matches_all_native_fixture_states`,
+`tick_tests::p2_3_s1_overworld_streaming_path_keeps_its_bytes`. Nothing in this slice is
+`#[ignore]`d.
+
 ## M3 P3a: the carver stage — dense write map, prefetched reads, the parallel 3x3 ring (2026-11-19)
 
 `NOFEAT` was 3.216 s at five terrain workers against 0.789 s terrain-only, so
