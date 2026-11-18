@@ -196,3 +196,30 @@ mutation check が緑であることを要求する。段 3 の perf 主張は `
   重複。`MC_SPINE_GEN_JOBS=1` が CPU 重視の比较用の逃げ道。
 - **構造キャッシュは per-thread だった**（`STARTS` / `RING_CACHE`）。per-round 共有に
   変えた（process 全体の共有は fixture を壊すため不可、証拠は上記 README）。
+
+## M3 超軽量化 5段階計画（P1〜P5、承認済み）
+
+### 現在のボトルネック整理
+
+- **既に勝っている面**: RSS は vanilla の約 1/8（142 対 1,160 MiB）、tick 本体は 0.05〜0.17 ms/tick（20 TPS、予算超過 0/100）。
+- **CPU 1.6〜4.7 倍差の主因**:
+  1. 生成済みチャンクを省メモリなパレット済み section として保持せず、ライト（`write_light_arrays` 27〜33 ms/chunk）・anti-xray 深い近傍読み・保存/再送で `base_state` / `terrain_cell` / `block_at` 再計算へ落ちている。
+  2. `CARVERS` / `FEATURES`（~56 ms/chunk）が直列のまま。
+  3. Terrain Slice 1（`3921aa5` / `1667aa3`）で worker 側の `cols` / beardifier 重複により `full` モード CPU が +88% 増加している。
+  4. 密度・材質・帯水層をセル単位で評価しており、4×8 格子・SIMD バッチ化が未導入。
+
+### 5段階の実行計画（各段でバイト一致・`cargo test`・選択 mutation を必須とする）
+
+| Phase | 対象 | 内容と設計制約 | 出口・効果目標 |
+|---|---|---|---|
+| **P1** | Terrain Slice 2（`ChunkCols` / `BeardChunkData` 共有） | worker が構築した `ChunkCols` と `BeardChunkData` を owner の `col_c` 等へ安全に共有・還元し、per-round / `generation_seq` 境界を守ったまま重複計算を消す（Nether seed -1 fixture の context 依存を壊さない） | Terrain Slice 1 の `full` モード CPU +88% ペナルティを解消 |
+| **P2** | 常駐 `PalettedSection` ストア | **2026-10-20 の教訓**: 非圧縮 `16×16×384` 生配列の先行構築は 20.7 ms/chunk と RSS 147→242 MiB 増を招き棄却済み。Single-value（0 bit）/ Indirect（4–8 bit）/ Direct のパレット section を単一正本とし、生成・配信（zero-repack）・ライト・anti-xray・feature 近傍読み・tick 書込み・保存/アンロード回収を統一 | `write_light_arrays` 27〜33 ms/chunk と `block_at` 再計算を大幅削減、RSS 低位維持 |
+| **P3** | `CARVERS` / `FEATURES` の決定性並列化 | MIT `0564ab0` Horizon の `DecorationOrder` 概念（半径2ランクゲート＋3×3 move-handoff）を参考に、worker が読み取り専用スナップショット＋順序キー付き出力を返し、owner が規定順で確定させる | `CARVERS` / `FEATURES`（~56 ms/chunk）の wall-clock 並列化＋全 fixture バイト一致 |
+| **P4** | `DfProg` SIMD / バッチ評価と早期枝刈り | MIT `Soju06/hyperchunk`（`df_simd_avx2.c` 等）の先行実装を参照し、4×8 格子・垂直列バッチ（`x86_64` AVX2 等、スカラーフォールバック必須）と `material_rule` / `aquifer` の早期枝刈りを導入 | `terrain_section`（~41 ms/chunk）の CPU 単価削減＋`to_bits` 完全一致 |
+| **P5** | ライト・M2 物理・圧縮配信の仕上げ | Starlight 概念（全空気/不透明 section の O(1) スキップ、nibble 直接フラッド、heightmap 空光近道）、Lithium 概念（`VoxelShape` / AABB キャッシュ・ブロック状態インデックス）、`libdeflate`＋パレット直書き送信（配信経路の `MC_SPINE_GEN_JOBS` 有効化前に tick latency を実測） | `WARM=1` CPU で vanilla 同等以下、RSS 軽量性維持、20 TPS 維持 |
+
+### OSS / Mod アルゴリズム参照のライセンス境界
+
+- **参照＋設計/コード参考にしてよい許容ライセンス（帰属・ヘッダ遵守）**: `Soju06/hyperchunk`（MIT、`/home/yuu/mc-spine-local/reference/hyperchunk-387c9ad/`）、`valence-rs/valence`（MIT）、`MCHPR/MCHPRS`（MIT）、および `0564ab0bcd3235daa6001033261b79aef5f81de1` 以前の Horizon（MIT）。詳細は [OSS survey](../../evidence/foundation/oss-survey/README.md)。
+- **アルゴリズム概念の参照のみ（コードのコピー・翻訳・派生移植は厳禁）**: C2ME、Starlight / ScalableLux、Lithium、Paper / Moonrise、Pumpkin（GPL-3.0）、SteelMC（AGPL-3.0）、`fb1135c6` 以降の Horizon（LGPL-3.0）。
+

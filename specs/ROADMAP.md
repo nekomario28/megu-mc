@@ -117,6 +117,16 @@ R0/R1の比較基準を主線とし、独立したgameplay修正は小さいslic
 
 M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測定でCPU、メモリ、tick遅延を比較します。生成burstと定常区間を分け、最適化した経路の実行と出力不変を先に確認します。
 
+現行ベースライン（[worldgen-cost](../evidence/gameplay/worldgen-cost/README.md)・[performance](../evidence/foundation/performance/README.md)）では、RSSはvanillaの約1/8（142対1,160 MiB）、定常tick本体は0.05〜0.17 ms/tick（20 TPS、予算超過0/100）である一方、移動時のCPUは1.6〜4.7倍重い。承認済みの5段階超軽量化計画（詳細と阻害要因対策は[チャンク生成の並列化](chunk-parallelism/README.md#m3-超軽量化-5段階計画p1p5承認済み)）でこれを詰める:
+
+1. **P1 (`ChunkCols` / `BeardChunkData` 共有)**: Terrain Slice 1 の worker 側重複計算（full 時 CPU +88%）を解消し、owner 側 `col_c` 等へ安全に還元する。
+2. **P2 (常駐 `PalettedSection` ストア)**: 2026-10-20 に棄却した非圧縮配列キャッシュではなく、Single-value / Indirect / Direct の省メモリ section ストアを正本化し、light・anti-xray・feature 近傍読み・保存・送信で再計算と二重保持をなくす。
+3. **P3 (`CARVERS` / `FEATURES` 並列化)**: 半径2の先行不変条件と3×3引き渡し（Horizon MIT `0564ab0` の概念参照）により、バイト決定性を保ったまま残る直列生成を並列化する。
+4. **P4 (`DfProg` SIMD/バッチ評価と早期枝刈り)**: MIT `Soju06/hyperchunk`（`df_simd_avx2.c` 等）を先行例に、格子点の SIMD 評価と `material_rule` / `aquifer` の早期枝刈りを行う。
+5. **P5 (ライト・M2物理・圧縮配信)**: Starlight 概念（全空気/不透明 section の O(1) スキップ、nibble 直接フラッド）、Lithium 概念（`VoxelShape`/AABB キャッシュ）、`libdeflate` / zero-repack 送信を統合する。
+
+**ライセンス境界:** コード流用は MIT/Apache-2.0 等の許容ライセンス（`Soju06/hyperchunk`, `valence-rs`, `MCHPRS`, `0564ab0` 以前の Horizon）に限る（[OSS survey](../evidence/foundation/oss-survey/README.md)）。C2ME・Starlight/ScalableLux・Lithium・`fb1135c` 以降の Horizon・Paper・Pumpkin・SteelMC 等の GPL/LGPL/AGPL 実装は**アルゴリズム概念の参照のみ**とし、コードを一切コピーしない。
+
 **出口:** PLANのM3条件を代表負荷で満たし、再現手順・ノイズ・未対応機能を記録する。機能不足で仕事量が減った結果や、地形が異なる条件の旧測定を性能改善へ読み替えない。
 
 ## R4 — 対象revisionの統合・リリース判定
