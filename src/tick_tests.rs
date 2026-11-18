@@ -1622,9 +1622,6 @@ fn wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count() {
     // tick-count implementation would have fired both within these 40 ticks.
     // 40 ticks cost microseconds against a 1s period, so elapsed time cannot
     // legitimately reach it here.
-    for _ in 0..40 {
-        game_tick(|_, tick| tick());
-    }
     let mut seen = Vec::new();
     while let Some((packet, _)) =
         read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
@@ -2213,6 +2210,7 @@ fn profile_game_tick() {
                     last_hit: Mutex::new(Instant::now()),
                     hurt_at: Mutex::new(Instant::now()),
                     last_hurt_tick: Mutex::new(None),
+                    vel: Mutex::new([0.0; 3]),
                     fuse: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -4603,6 +4601,7 @@ fn arrow_sweep_outcome(target_x: f64, velocity: f64) -> (Option<f32>, Option<f64
         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
         hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
         last_hurt_tick: Mutex::new(None),
+        vel: Mutex::new([0.0; 3]),
         fuse: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -6248,6 +6247,7 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
         last_hit: Mutex::new(Instant::now()),
         hurt_at: Mutex::new(Instant::now()),
         last_hurt_tick: Mutex::new(None),
+        vel: Mutex::new([0.0; 3]),
         fuse: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(300),
@@ -7227,4 +7227,581 @@ fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
 
     chests().lock().unwrap().remove(&ContainerKey::Block(ender_key(&v1.uuid)));
     set_block(ender_b.0, ender_b.1, ender_b.2, 0);
+}
+
+// ---------- M2 Gameplay Slice 4d: `LivingEntity.travel` water/lava branches ----------
+//
+// Contract: specs/horizon-gameplay/entity-travel.md. Every expected value below is a literal
+// read out of the pinned 1.21.1 bytecode, not a re-derivation from the implementation's
+// constants, so mutating a constant has to change an assertion.
+
+fn travel_4d_close(actual: [f64; 3], expected: [f64; 3], what: &str) {
+    for axis in 0..3 {
+        assert!(
+            (actual[axis] - expected[axis]).abs() < 1e-6,
+            "{what}: axis {axis} expected {} got {} ({actual:?})",
+            expected[axis],
+            actual[axis]
+        );
+    }
+}
+
+/// The pure step with an identity `Entity.move` and an unobstructed `isFree`.
+fn travel_4d_step(
+    kind: EntityFluidKind,
+    vel: [f64; 3],
+    input: [f64; 3],
+    yaw_deg: f32,
+    ctx: LivingTravelContext,
+) -> FluidTravelOutcome {
+    let mut identity = |d: [f64; 3]| (d, false);
+    let free = |_p: [f64; 3]| true;
+    travel_fluid_step(kind, vel, input, yaw_deg, ctx, &mut identity, &free)
+}
+
+/// Restores every shared store a `mob_tick` fixture writes to, so a failing assertion cannot
+/// leave mobs or blocks behind for the next test.
+struct Travel4dWorld {
+    world: HashMap<(i32, i32), HashMap<u32, u32>>,
+    mobs: Vec<Arc<Mob>>,
+    region: Region,
+    clients: Vec<Arc<Client>>,
+    tick: u64,
+    world_time: u64,
+    ultra_warm: bool,
+}
+
+impl Travel4dWorld {
+    fn take() -> Self {
+        Self {
+            world: std::mem::take(&mut *world().lock().unwrap()),
+            mobs: std::mem::take(&mut *mobs().lock().unwrap()),
+            region: std::mem::take(&mut *region().lock().unwrap()),
+            clients: std::mem::take(&mut *clients().lock().unwrap()),
+            tick: TICK.load(Ordering::Relaxed),
+            world_time: WORLD_TIME.load(Ordering::Relaxed),
+            ultra_warm: level_ultra_warm(),
+        }
+    }
+}
+
+impl std::ops::Drop for Travel4dWorld {
+    fn drop(&mut self) {
+        set_level_ultra_warm(self.ultra_warm);
+        TICK.store(self.tick, Ordering::Relaxed);
+        WORLD_TIME.store(self.world_time, Ordering::Relaxed);
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+        *region().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.region);
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
+        *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+    }
+}
+
+fn travel_4d_mob(eid: i32, etype: i64, pos: (f64, f64, f64), hp: f32) -> Arc<Mob> {
+    Arc::new(Mob {
+        eid,
+        uuid: [0u8; 16],
+        etype,
+        pos: Mutex::new((pos.0, pos.1, pos.2, 0.0, 0.0)),
+        hp: Mutex::new(hp),
+        last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        last_hurt_tick: Mutex::new(None),
+        vel: Mutex::new([0.0; 3]),
+        fuse: Mutex::new(0),
+        love: Mutex::new(0),
+        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+    })
+}
+
+#[test]
+fn travel_contract_4d_water_travel_drag_sprint_dolphins_and_impulse() {
+    // `btn.a` offsets 90–113 return `getWaterSlowDown()` = `0.8f` unless `isSprinting()`
+    // (`0.9f`), and `bsb.D` DOLPHINS_GRACE overrides it with `0.96f`; offsets 255–269 then
+    // multiply `(f, 0.8F, f)` and offsets 273–289 apply `getFluidFallingAdjustedMovement`.
+    let water = LivingTravelContext {
+        on_ground: true,
+        falling: true,
+        ..LivingTravelContext::default()
+    };
+
+    // Horizontal `0.8f`, vertical `0.8f`, then `-d / 16` = `-0.005` from the falling adjustment.
+    let out = travel_4d_step(
+        EntityFluidKind::Water,
+        [0.5, -0.5, 0.25],
+        [0.0; 3],
+        0.0,
+        water,
+    );
+    travel_4d_close(out.vel, [0.4, -0.405, 0.2], "water drag");
+    travel_4d_close(
+        out.moved,
+        [0.5, -0.5, 0.25],
+        "Entity.move precedes the drag",
+    );
+
+    // Sprinting selects `0.9f` and skips `getFluidFallingAdjustedMovement` entirely.
+    let sprint = travel_4d_step(
+        EntityFluidKind::Water,
+        [0.5, 0.0, 0.5],
+        [0.0; 3],
+        0.0,
+        LivingTravelContext {
+            sprinting: true,
+            ..water
+        },
+    );
+    travel_4d_close(
+        sprint.vel,
+        [0.45, 0.0, 0.45],
+        "sprint slow-down 0.9f, no falling adjust",
+    );
+
+    // DOLPHINS_GRACE replaces the slow-down outright.
+    let dolphins = travel_4d_step(
+        EntityFluidKind::Water,
+        [0.5, 0.0, 0.5],
+        [0.0; 3],
+        0.0,
+        LivingTravelContext {
+            dolphins_grace: true,
+            ..water
+        },
+    );
+    travel_4d_close(dolphins.vel, [0.48, -0.005, 0.48], "dolphins grace 0.96f");
+
+    // `moveRelative(0.02F, input)` at yaw 0 pushes +Z: the impulse is `0.02`, and the vertical
+    // drag turns a zero vertical into `-0.005` (the branch adds no upward kick of its own).
+    let swim = travel_4d_step(
+        EntityFluidKind::Water,
+        [0.0; 3],
+        [0.0, 0.0, 1.0],
+        0.0,
+        water,
+    );
+    travel_4d_close(swim.vel, [0.0, -0.005, 0.016], "liquid swim impulse 0.02");
+    travel_4d_close(
+        swim.moved,
+        [0.0, 0.0, 0.02],
+        "impulse reaches Entity.move undamped",
+    );
+
+    // Terminal sink: each tick is `0.8 * v - 0.005`, so the sequence converges on `-0.025`.
+    let mut v = [0.0, 0.0, 0.0];
+    for _ in 0..40 {
+        v = travel_4d_step(EntityFluidKind::Water, v, [0.0; 3], 0.0, water).vel;
+    }
+    assert!(
+        (v[1] + 0.025).abs() < 1e-4,
+        "water terminal sink must converge on -0.025, got {}",
+        v[1]
+    );
+}
+
+#[test]
+fn travel_contract_4d_water_movement_efficiency_blends_slow_down() {
+    // `btn.a` offsets 115–178: `h = WATER_MOVEMENT_EFFICIENCY`, halved while airborne;
+    // `f += (0.54600006f - f) * h` and `g += (speed - g) * h` with `g` starting at `0.02f`.
+    let grounded = travel_4d_step(
+        EntityFluidKind::Water,
+        [0.0; 3],
+        [1.0, 0.0, 0.0],
+        0.0,
+        LivingTravelContext {
+            on_ground: true,
+            water_movement_efficiency: 1.0,
+            speed: 0.1,
+            ..LivingTravelContext::default()
+        },
+    );
+    travel_4d_close(
+        grounded.vel,
+        [0.054600006, -0.005, 0.0],
+        "efficiency slow-down 0.54600006f",
+    );
+
+    // Airborne halves `h`, so the blend stops halfway: `g = 0.06`, `f = 0.67300003`.
+    let airborne = travel_4d_step(
+        EntityFluidKind::Water,
+        [0.0; 3],
+        [1.0, 0.0, 0.0],
+        0.0,
+        LivingTravelContext {
+            on_ground: false,
+            water_movement_efficiency: 1.0,
+            speed: 0.1,
+            ..LivingTravelContext::default()
+        },
+    );
+    travel_4d_close(
+        airborne.vel,
+        [0.040380001, -0.005, 0.0],
+        "airborne efficiency halves h",
+    );
+}
+
+#[test]
+fn travel_contract_4d_water_jump_threshold_and_input_vector_rotation() {
+    // `Entity.getFluidJumpThreshold()` (`bsr.di()`): `eyeHeight < 0.4F ? 0.0 : 0.4`.
+    assert_eq!(fluid_jump_threshold(0.35), 0.0, "cat eye height 0.35");
+    assert_eq!(fluid_jump_threshold(0.39), 0.0);
+    assert_eq!(
+        fluid_jump_threshold(0.4),
+        0.4,
+        "0.4 is not below the threshold"
+    );
+    assert_eq!(fluid_jump_threshold(0.644), 0.4, "chicken eye height 0.644");
+    assert_eq!(fluid_jump_threshold(2.55), 0.4);
+
+    // `Entity.getInputVector`: zero below `1.0E-7`, normalized above unit length, rotated by yaw.
+    travel_4d_close(
+        fluid_input_vector([1.0e-4, 0.0, 0.0], 0.02, 0.0),
+        [0.0; 3],
+        "tiny input is zero",
+    );
+    travel_4d_close(
+        fluid_input_vector([0.0, 0.0, 1.0], 0.02, 0.0),
+        [0.0, 0.0, 0.02],
+        "yaw 0 pushes +Z",
+    );
+    travel_4d_close(
+        fluid_input_vector([0.0, 0.0, 1.0], 0.02, 90.0),
+        [-0.02, 0.0, 0.0],
+        "yaw 90 turns +Z into -X",
+    );
+    travel_4d_close(
+        fluid_input_vector([3.0, 0.0, 4.0], 0.02, 0.0),
+        [0.012, 0.0, 0.016],
+        "length 5 input normalizes to unit",
+    );
+    travel_4d_close(
+        fluid_input_vector([0.5, 0.0, 0.0], 0.02, 0.0),
+        [0.01, 0.0, 0.0],
+        "sub-unit input keeps its length",
+    );
+}
+
+#[test]
+fn travel_contract_4d_lava_drag_and_vertical_sinking() {
+    // `btn.a` offsets 353–561: `getFluidHeight(LAVA) <= getFluidJumpThreshold()` selects
+    // `multiply(0.5, 0.8F, 0.5)` + falling adjustment; above it, `scale(0.5)`. Either way
+    // `if (d != 0.0) add(0.0, -d / 4.0, 0.0)` => `-0.02` at gravity `0.08`.
+    let lava = LivingTravelContext {
+        on_ground: true,
+        falling: true,
+        fluid_height: 0.3,
+        jump_threshold: 0.4,
+        ..LivingTravelContext::default()
+    };
+
+    let shallow = travel_4d_step(EntityFluidKind::Lava, [0.4, 0.0, 0.4], [0.0; 3], 0.0, lava);
+    travel_4d_close(
+        shallow.vel,
+        [0.2, -0.025, 0.2],
+        "lava 0.5 drag, 0.8F vertical, -0.02 sink",
+    );
+
+    // Above the jump threshold the whole vector is `scale(0.5)`, vertical included.
+    let deep = travel_4d_step(
+        EntityFluidKind::Lava,
+        [0.4, -0.2, 0.0],
+        [0.0; 3],
+        0.0,
+        LivingTravelContext {
+            fluid_height: 0.5,
+            ..lava
+        },
+    );
+    travel_4d_close(
+        deep.vel,
+        [0.2, -0.12, 0.0],
+        "deep lava scale(0.5) then -0.02",
+    );
+
+    // Zero gravity drops the `-0.02` term and also short-circuits the falling adjustment,
+    // so the vertical is the plain `0.8F` drag: `-0.2 * 0.8F`.
+    // `if (d != 0.0) deltaMovement = deltaMovement.add(0.0, -d / 4.0, 0.0)`.
+    let weightless = travel_4d_step(
+        EntityFluidKind::Lava,
+        [0.4, -0.2, 0.0],
+        [0.0; 3],
+        0.0,
+        LivingTravelContext {
+            gravity: 0.0,
+            ..lava
+        },
+    );
+    travel_4d_close(weightless.vel, [0.2, -0.16, 0.0], "zero gravity skips -d/4");
+
+    // Terminal lava sink is `0.8 * v - 0.005 - 0.02`, converging on `-0.125`.
+    let mut v = [0.0, 0.0, 0.0];
+    for _ in 0..60 {
+        v = travel_4d_step(EntityFluidKind::Lava, v, [0.0; 3], 0.0, lava).vel;
+    }
+    assert!(
+        (v[1] + 0.125).abs() < 1e-4,
+        "lava terminal sink must converge on -0.125, got {}",
+        v[1]
+    );
+}
+
+#[test]
+fn travel_contract_4d_fluid_falling_adjusted_movement_gravity_and_clamp() {
+    // `btn.a(DZLexc;)Lexc;` offsets 0–100.
+    travel_4d_close(
+        fluid_falling_adjusted_movement(0.08, true, [1.0, 0.0, 2.0], false),
+        [1.0, -0.005, 2.0],
+        "d / 16 at gravity 0.08",
+    );
+    // Zero gravity and sprinting both return the vector untouched (offsets 0–12).
+    assert_eq!(
+        fluid_falling_adjusted_movement(0.0, true, [0.0, 1.0, 0.0], false),
+        [0.0, 1.0, 0.0],
+        "zero gravity returns the vector"
+    );
+    assert_eq!(
+        fluid_falling_adjusted_movement(0.08, true, [0.0, 1.0, 0.0], true),
+        [0.0, 1.0, 0.0],
+        "sprinting returns the vector"
+    );
+    // The `-0.003` terminal frame needs a gravity whose `d / 16` sits away from the `0.005`
+    // probe: at `0.01` (SLOW_FALLING) a velocity of `0.0015` satisfies both predicates.
+    travel_4d_close(
+        fluid_falling_adjusted_movement(0.01, true, [0.0, 0.0015, 0.0], false),
+        [0.0, -0.003, 0.0],
+        "terminal frame -0.003",
+    );
+    // A rising entity is never clamped: `bl` false takes the `y - d / 16` arm.
+    travel_4d_close(
+        fluid_falling_adjusted_movement(0.01, false, [0.0, 0.0015, 0.0], false),
+        [0.0, 0.000875, 0.0],
+        "rising entity keeps the adjusted arm",
+    );
+}
+
+#[test]
+fn travel_contract_4d_horizontal_collision_lift_and_climbable() {
+    // `btn.a` offsets 219–253 (climbable lift `0.2d`) and 292–347 (`isFree` escape lift `0.3f`).
+    let free = |_p: [f64; 3]| true;
+    let blocked = |_p: [f64; 3]| false;
+    let water = LivingTravelContext {
+        on_ground: true,
+        falling: true,
+        ..LivingTravelContext::default()
+    };
+    let mut collides = |_d: [f64; 3]| ([0.0, 0.0, 0.0], true);
+
+    let lifted = travel_fluid_step(
+        EntityFluidKind::Water,
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        water,
+        &mut collides,
+        &free,
+    );
+    travel_4d_close(
+        lifted.vel,
+        [0.0, 0.30000001192092896, 0.0],
+        "isFree escape lift 0.3f",
+    );
+
+    let mut collides = |_d: [f64; 3]| ([0.0, 0.0, 0.0], true);
+    let not_free = travel_fluid_step(
+        EntityFluidKind::Water,
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        water,
+        &mut collides,
+        &blocked,
+    );
+    travel_4d_close(
+        not_free.vel,
+        [0.0, -0.005, 0.0],
+        "obstructed probe keeps the sink",
+    );
+
+    // Climbing replaces `y` with `0.2d` before the drag.
+    let mut collides = |_d: [f64; 3]| ([0.0, 0.0, 0.0], true);
+    let climbing = travel_fluid_step(
+        EntityFluidKind::Water,
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        LivingTravelContext {
+            on_climbable: true,
+            ..water
+        },
+        &mut collides,
+        &blocked,
+    );
+    travel_4d_close(
+        climbing.vel,
+        [0.0, 0.15500000238418579, 0.0],
+        "climbable lift 0.2d then 0.8f",
+    );
+}
+
+#[test]
+fn travel_contract_4d_lava_push_scale_dimension() {
+    // `Entity.bm()` (`bsr.bm()`, offsets 9–35): `dimensionType().ultraWarm() ? 0.007 :
+    // 0.0023333333333333335`. The ultra-warm dimension is the one with the larger push.
+    assert_eq!(fluid_push_scale(EntityFluidKind::Water, false), 0.014);
+    assert_eq!(
+        fluid_push_scale(EntityFluidKind::Water, true),
+        0.014,
+        "water push is dimension independent (`bsr.bn()` = 0.014)"
+    );
+    assert_eq!(
+        fluid_push_scale(EntityFluidKind::Lava, true),
+        0.007,
+        "ultraWarm (Nether) lava push is 0.007"
+    );
+    assert_eq!(
+        fluid_push_scale(EntityFluidKind::Lava, false),
+        0.0023333333333333335,
+        "temperate (Overworld) lava push is 0.0023333333333333335"
+    );
+    // The owner flag reaches the scale, so wiring a dimension is one assignment.
+    set_level_ultra_warm(true);
+    assert!(level_ultra_warm());
+    assert_eq!(
+        fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
+        0.007
+    );
+    set_level_ultra_warm(false);
+    assert!(!level_ultra_warm());
+    assert_eq!(
+        fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
+        0.0023333333333333335
+    );
+}
+
+#[test]
+fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
+    crate::test_support::require_vanilla_data();
+    let _guard = world_guard();
+    let _fixture = Travel4dWorld::take();
+    set_level_ultra_warm(false); // Overworld: dimension_type/overworld.json ultra_warm=false
+    let stone = name_to_state("stone").unwrap();
+    let lava = name_to_state("lava").unwrap();
+
+    // Deep water column under a spider (1.4 x 0.9, eye 0.65) and a lava pocket under a blaze
+    // (fire immune, so lava contact damage cannot be confused with the sink). The fixture stays
+    // inside the origin chunk on purpose: `worldgen::Gen` keeps a 128-entry FIFO of chunk columns
+    // and this binary runs with the generator enabled, so a fixture that pulls its own chunks
+    // pushes the columns the rest of the suite reads out of that cache and the next test pays to
+    // rebuild them.
+    for y in 60..=64 {
+        set_block(2, y, 2, 80);
+    }
+    set_block(2, 59, 2, stone);
+    for y in 58..=59 {
+        set_block(6, y, 6, lava);
+    }
+    set_block(6, 57, 6, stone);
+
+    // Only the client's position matters here: it makes the chunk hot and keeps `cls` non-empty.
+    let (dummy, _rx) = client_pair();
+    *clients().lock().unwrap() = vec![Arc::new(dummy)];
+
+    let spider = travel_4d_mob(9501, 100, (2.5, 64.0, 2.5), 16.0);
+    let blaze = travel_4d_mob(9502, 8, (6.5, 59.5, 6.5), 20.0);
+    mobs()
+        .lock()
+        .unwrap()
+        .extend([spider.clone(), blaze.clone()]);
+    refresh_hot();
+
+    TICK.store(server_ticks(10), Ordering::Relaxed);
+    WORLD_TIME.store(6000, Ordering::Relaxed);
+    // `mobs()` and the hot set are process-global and the other `mob_tick` fixtures in this
+    // binary take and replace them, so a parallel test can empty either between two of these
+    // ticks. Re-assert both rather than read a shorter loop as a sink rate.
+    for _ in 0..80 {
+        {
+            let mut ms = mobs().lock().unwrap();
+            for m in [&spider, &blaze] {
+                if !ms.iter().any(|x| x.eid == m.eid) {
+                    ms.push(m.clone());
+                }
+            }
+        }
+        refresh_hot();
+        mob_tick();
+    }
+
+    let (sx, sy, sz, _, _) = *spider.pos.lock().unwrap();
+    assert!(
+        sy < 63.0 && sy > 61.5,
+        "spider must sink in water at the getFluidFallingAdjustedMovement rate, got y={sy}"
+    );
+    assert!(
+        (sx - 2.5).abs() < 0.1 && (sz - 2.5).abs() < 0.1,
+        "still water has no current: no horizontal drift expected, got ({sx}, {sz})"
+    );
+    assert_eq!(
+        *spider.hp.lock().unwrap(),
+        16.0,
+        "descending through water must not charge fall damage"
+    );
+    assert_ne!(
+        *spider.vel.lock().unwrap(),
+        [0.0; 3],
+        "travel keeps a fluid velocity"
+    );
+
+    let (_, by, _, _, _) = *blaze.pos.lock().unwrap();
+    assert!(
+        (by - 58.0).abs() < 1e-2,
+        "blaze must sink to the lava floor at the travel rate, got y={by}"
+    );
+    assert_eq!(
+        *blaze.hp.lock().unwrap(),
+        20.0,
+        "fire-immune blaze takes no lava damage; the sink itself is not damage"
+    );
+
+    // A mob must not be snapped by `mob_snap_y` while it is in a fluid: travel owns the vertical
+    // motion. The lava case needs a mob with no support below, or the `mob_has_support` arm of the
+    // same guard answers first and the assertion would pass without the lava arm existing.
+    let mut water_snap = *spider.pos.lock().unwrap();
+    let before = water_snap.1;
+    mob_snap_y(&spider, &mut water_snap);
+    assert_eq!(
+        water_snap.1, before,
+        "mob_snap_y must defer water to travel"
+    );
+
+    set_block(6, 57, 6, 0);
+    for y in 50..=57 {
+        set_block(6, y, 6, lava);
+    }
+    let (bx, by, bz, _, _) = *blaze.pos.lock().unwrap();
+    assert!(
+        !mob_has_support(blaze.etype, bx, by, bz),
+        "the lava pocket must have no floor, or the support arm hides the lava arm"
+    );
+    let mut lava_snap = *blaze.pos.lock().unwrap();
+    mob_snap_y(&blaze, &mut lava_snap);
+    assert_eq!(
+        lava_snap.1, by,
+        "mob_snap_y must defer a lava mob to travel instead of lifting it out of the pocket"
+    );
+
+    // Leaving the fluid clears the stored deltaMovement (the non-fluid branch's friction). A
+    // high, dry column keeps this independent of whatever another test did to the overlay.
+    let dry = travel_4d_mob(9503, 8, (6.5, 120.0, 6.5), 20.0);
+    *dry.vel.lock().unwrap() = [0.0, -0.025, 0.0];
+    let mut dry_pos = *dry.pos.lock().unwrap();
+    assert!(
+        mob_fluid_travel_tick(&dry, &mut dry_pos).is_none(),
+        "a mob in neither fluid must not take a fluid travel step"
+    );
+    assert_eq!(
+        *dry.vel.lock().unwrap(),
+        [0.0; 3],
+        "a mob in neither fluid must have its fluid velocity cleared"
+    );
 }

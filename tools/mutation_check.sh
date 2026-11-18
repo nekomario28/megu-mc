@@ -3606,6 +3606,77 @@ check "p2_3_s1_init_dim_installs_the_dimension_it_names" \
   '    install(DimId::Overworld, seed, res, false)' \
   worldgen::wg_tests::p2_3_s1_three_dimensions_answer_independently
 
+# M2 Gameplay Slice 4d: `LivingEntity.travel` fluid branches (`src/entity_fluid.rs`).
+# `btn.a(Lexc;)V` offsets 90–113/255–269 give the water slow-down and the widened `0.8f` vertical
+# drag; `bsr.bm()` offsets 9–35 pick `0.007` for the ultra-warm dimension; `btn.a(DZLexc;)Lexc;`
+# offsets 0–100 hold the `-0.003` terminal frame; `bsr.di()` offsets 0–19 is the
+# `eyeHeight < 0.4F` jump threshold.
+check "travel_contract_4d_water_vertical_drag_is_0_8f" \
+  src/entity_fluid.rs 'const WATER_VERTICAL_DRAG: f64 = 0.800000011920929;' \
+  'const WATER_VERTICAL_DRAG: f64 = 0.9;' \
+  tick_tests::travel_contract_4d_water_travel_drag_sprint_dolphins_and_impulse
+
+check "travel_contract_4d_water_sprint_slow_down_is_0_9f" \
+  src/entity_fluid.rs '            let mut f = if ctx.sprinting {
+                WATER_SPRINT_SLOW_DOWN
+            } else {
+                WATER_SLOW_DOWN
+            };' \
+  '            let mut f = {
+                WATER_SLOW_DOWN
+            };' \
+  tick_tests::travel_contract_4d_water_travel_drag_sprint_dolphins_and_impulse
+
+check "travel_contract_4d_lava_push_scale_ultra_warm_is_0_007" \
+  src/entity_fluid.rs '            if ultra_warm {
+                LAVA_ULTRA_WARM_MOTION_SCALE
+            } else {
+                LAVA_TEMPERATE_MOTION_SCALE
+            }' \
+  '            if ultra_warm {
+                LAVA_TEMPERATE_MOTION_SCALE
+            } else {
+                LAVA_ULTRA_WARM_MOTION_SCALE
+            }' \
+  tick_tests::travel_contract_4d_lava_push_scale_dimension
+
+check "travel_contract_4d_fluid_falling_terminal_frame_is_negative" \
+  src/entity_fluid.rs '        -FLUID_FALLING_TERMINAL
+    } else {' \
+  '        FLUID_FALLING_TERMINAL
+    } else {' \
+  tick_tests::travel_contract_4d_fluid_falling_adjusted_movement_gravity_and_clamp
+
+check "travel_contract_4d_jump_threshold_reads_eye_height" \
+  src/entity_fluid.rs '    if eye_height < 0.4 {
+        0.0
+    } else {
+        0.4
+    }' \
+  '    if eye_height < 0.4 {
+        0.4
+    } else {
+        0.4
+    }' \
+  tick_tests::travel_contract_4d_water_jump_threshold_and_input_vector_rotation
+
+check "travel_contract_4d_mob_tick_applies_the_vertical_travel_delta" \
+  src/entity_fluid.rs '    mp.0 += out.moved[0];
+    mp.1 += out.moved[1];
+    mp.2 += out.moved[2];' \
+  '    mp.0 += out.moved[0];
+    mp.2 += out.moved[2];' \
+  tick_tests::travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage
+
+# `mob_snap_y` must defer a mob in lava to the travel branch: `surface_y` would otherwise lift it
+# to the first non-air column above the lava pocket.
+check "travel_contract_4d_mob_snap_y_defers_lava_to_travel" \
+  src/main.rs '        || mob_in_water(m.etype, mp.0, mp.1, mp.2)
+        || mob_in_lava(m.etype, mp.0, mp.1, mp.2)' \
+  '        || mob_in_water(m.etype, mp.0, mp.1, mp.2)
+        || (false && mob_in_lava(m.etype, mp.0, mp.1, mp.2))' \
+  tick_tests::travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage
+
 echo "mutation check: $passed proved, $failed not a gate, $parked parked, $skipped skipped"
 if [ "$parked" -gt 0 ]; then
   echo "  $parked gate(s) are parked and prove nothing until they run again."

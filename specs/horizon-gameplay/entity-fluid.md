@@ -19,7 +19,7 @@ Pinned server jar (`59353fb40c36d304f2035d51e7d6e6baa98dc05c`) & official mappin
   - Scans `[floor(minX)..ceil(maxX))` × `[floor(minY)..ceil(maxY))` × `[floor(minZ)..ceil(maxZ))`.
   - Computes `double e = (double)((float)pos.y + fluidState.getHeight(level, pos))`; when `e >= aabb.minY`, marks `inFluid = true` and `maxFluidHeight = max(e - aabb.minY, maxFluidHeight)`.
   - If `isPushedByFluid()`, scales `flow` by `maxFluidHeight` when `maxFluidHeight < 0.4`, accumulates into `vec3`, and increments `count`.
-  - When `vec3.length() > 0.0`: divides by `count` if `count > 0`, calls `vec3.normalize()` iff `!(this instanceof Player)` (`cmx`), multiplies by `motionScale` (`0.014` water via `bsr.bn()`, `0.007` Overworld / `0.0023333333333333335` Nether lava via `bsr.bm()`), and clamps to minimum speed `0.0045000000000000005` when `|vx| < 0.003 && |vz| < 0.003 && len < 0.0045000000000000005`.
+  - When `vec3.length() > 0.0`: divides by `count` if `count > 0`, calls `vec3.normalize()` iff `!(this instanceof Player)` (`cmx`), multiplies by `motionScale` (`0.014` water via `bsr.bn()`, lava via `bsr.bm()`: `ultraWarm() ? 0.007 : 0.0023333333333333335`), and clamps to minimum speed `0.0045000000000000005` when `|vx| < 0.003 && |vz| < 0.003 && len < 0.0045000000000000005`.
 - **`Entity.updateFluidOnEyes()` (`bsr.H()`, offsets 0–155) & `LivingEntity.baseTick()` (`btn.aw()`, offsets 229–267)**
   - Verified against `server-1.21.1.jar`: **`bsr.H()` uses `double d = getEyeY()` directly with NO `-0.11111111F` subtraction** (0 occurrences of `0x3de38e39` across the entire jar).
   - Looks up `BlockPos.containing(getX(), d, getZ())` and marks eye immersion iff `(double)((float)by + fluidState.getHeight(level, pos)) > d`.
@@ -61,4 +61,9 @@ Pinned server jar (`59353fb40c36d304f2035d51e7d6e6baa98dc05c`) & official mappin
 ## Out of Scope (Deferred to Slice 4c+)
 
 - Full `LivingEntity.travel` fluid buoyancy / swim speed / vertical water drag integration and `Player` server-authoritative water current pushback.
-- Nether dimension-specific lava `motionScale` (`0.0023333333333333335`) wiring once multi-dimension fluid travel is connected.
+- Lava `motionScale` dimension wiring. **Corrected by Slice 4d:** `bsr.bm()` is
+  `dimensionType().ultraWarm() ? 0.007 : 0.0023333333333333335`, so `0.007` belongs to the
+  ultra-warm (Nether) dimension — the polarity in the line above was inverted. Nothing observable
+  depended on it before Slice 4d (the only call site read `max_height`, not `push`); the constants
+  are renamed to the bytecode in `src/entity_fluid.rs` and pinned by
+  `travel_contract_4d_lava_push_scale_dimension` (see [entity-travel.md](entity-travel.md)).

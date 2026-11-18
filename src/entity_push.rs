@@ -440,6 +440,7 @@ mod entity_push_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),

@@ -17,10 +17,14 @@
 //   net.minecraft.world.phys.AABB                     -> ewx
 //   net.minecraft.world.phys.Vec3                     -> exc
 
+// `Entity.bn()` (`bsr.bn()`, offsets 33–42) pushes every fluid except lava at `0.014`.
 const WATER_MOTION_SCALE: f64 = 0.014;
-const LAVA_OVERWORLD_MOTION_SCALE: f64 = 0.007;
-#[allow(dead_code)]
-const LAVA_NETHER_MOTION_SCALE: f64 = 0.0023333333333333335;
+// `Entity.bm()` (`bsr.bm()`, offsets 9–35): `dimensionType().ultraWarm() ? 0.007 : 0.0023333333333333335`.
+// The pinned bytecode puts the *larger* push in the ultra-warm (Nether) dimension; the
+// previous constants here were named the other way round, which is only observable once the
+// dimension is wired (Slice 4d), so the names follow the bytecode now.
+const LAVA_ULTRA_WARM_MOTION_SCALE: f64 = 0.007;
+const LAVA_TEMPERATE_MOTION_SCALE: f64 = 0.0023333333333333335;
 const FLUID_PUSH_MIN_SPEED: f64 = 0.0045000000000000005;
 const FLUID_VELOCITY_THRESHOLD: f64 = 0.003;
 
@@ -368,7 +372,7 @@ fn aabb_in_lava_with(
     update_fluid_height_and_push_with(
         aabb,
         EntityFluidKind::Lava,
-        LAVA_OVERWORLD_MOTION_SCALE,
+        fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
         false,
         false,
         [0.0; 3],
@@ -488,22 +492,381 @@ fn mob_in_lava(etype: i64, x: f64, y: f64, z: f64) -> bool {
 }
 
 fn mob_water_state(etype: i64, x: f64, y: f64, z: f64) -> FluidPushResult {
-    let (w, h) = mob_dimensions(etype);
-    let aabb = EntityAabb::from_dimensions(x, y, z, w, h);
-    update_fluid_height_and_push_with(
-        aabb,
-        EntityFluidKind::Water,
-        WATER_MOTION_SCALE,
-        true,
-        false,
-        [0.0; 3],
-        &block_at,
-    )
+    mob_water_state_vel(etype, [x, y, z], [0.0; 3])
 }
 
 #[allow(dead_code)]
 fn mob_fluid_push_water(etype: i64, x: f64, y: f64, z: f64) -> [f64; 3] {
     mob_water_state(etype, x, y, z).push
+}
+
+// ---------- Slice 4d: `LivingEntity.travel` fluid branches ----------
+//
+// 1.21.1 `LivingEntity.travel(Vec3)` (`btn.a(Lexc;)V`, `Code:` offsets 0–1251),
+// `LivingEntity.getFluidFallingAdjustedMovement(double, boolean, Vec3)`
+// (`btn.a(DZLexc;)Lexc;`, offsets 0–100) and `Entity.getInputVector(Vec3, float, float)`
+// (`bsr.b(Lexc;FF)Lexc;`, offsets 0–104). Every constant below is read out of the pinned
+// jar's bytecode; no source is copied.
+
+/// `Entity.ba()` gravity and the `MobEffects.SLOW_FALLING` override for a descending entity
+/// (`btn.a` offsets 8–53).
+const LIVING_GRAVITY: f64 = 0.08;
+const SLOW_FALLING_GRAVITY: f64 = 0.01;
+/// `LivingEntity.getWaterSlowDown()` (`btn.fh()`, constant `0.8f`), `isSprinting()` (`0.9f`)
+/// and `MobEffects.DOLPHINS_GRACE` (`0.96f`, `bsb.D`).
+const WATER_SLOW_DOWN: f32 = 0.8;
+const WATER_SPRINT_SLOW_DOWN: f32 = 0.9;
+const DOLPHINS_GRACE_SLOW_DOWN: f32 = 0.96;
+/// `Attributes.WATER_MOVEMENT_EFFICIENCY` (`buw.E`) blends the slow-down toward `0.54600006f`.
+const WATER_MOVEMENT_EFFICIENCY_SLOW_DOWN: f32 = 0.54600006;
+/// `Vec3.multiply(f, 0.8F, f)` (`btn.a` offsets 255–269): the vertical factor is the
+/// `float 0.8f` widened to double, not the `f` slow-down.
+const WATER_VERTICAL_DRAG: f64 = 0.800000011920929;
+/// `Vec3.multiply(0.5, 0.8F, 0.5)` / `Vec3.scale(0.5)` in the lava branch (offsets 416–469).
+const LAVA_DRAG: f64 = 0.5;
+/// `moveRelative(0.02F, movementInput)` in both fluid branches (offsets 195, 382).
+const FLUID_MOVE_RELATIVE: f32 = 0.02;
+/// `btn.a` offsets 219–253: a horizontal collision while climbing replaces `y` with `0.2d`.
+const FLUID_CLIMBABLE_LIFT: f64 = 0.2;
+/// `isFree` probe height `+ 0.6f - getY() + e` and escape lift `0.3f` (offsets 292–347).
+const FLUID_FREE_PROBE: f64 = 0.6000000238418579;
+const FLUID_FREE_LIFT: f64 = 0.30000001192092896;
+/// `getFluidFallingAdjustedMovement`: `d / 16.0`, probe `0.005d`, terminal `0.003d`.
+const FLUID_FALLING_DIVISOR: f64 = 16.0;
+const FLUID_FALLING_PROBE: f64 = 0.005;
+const FLUID_FALLING_TERMINAL: f64 = 0.003;
+/// Lava gravity term `-d / 4.0` (offsets 472–494).
+const LAVA_GRAVITY_DIVISOR: f64 = 4.0;
+/// `Mth.sin`/`Mth.cos` argument scale `0.017453292f` (`getInputVector`).
+const DEG_TO_RAD: f32 = 0.017453292;
+/// `getInputVector` treats an input shorter than `1.0E-7` as zero and normalizes above `1.0`.
+const INPUT_VECTOR_EPSILON: f64 = 1.0e-7;
+
+/// 1.21.1 `DimensionType.ultraWarm()` (`dwy.i()`), read by `Entity.bm()` to pick the lava
+/// push scale. The thread that hosts this server owns the Overworld
+/// (`dimension_type/overworld.json`, `ultra_warm=false`); keeping it as an owner value is what
+/// makes the Nether scale reachable instead of a second copy of the number.
+static LEVEL_ULTRA_WARM: AtomicBool = AtomicBool::new(false);
+
+fn level_ultra_warm() -> bool {
+    LEVEL_ULTRA_WARM.load(Ordering::Relaxed)
+}
+
+fn set_level_ultra_warm(v: bool) {
+    LEVEL_ULTRA_WARM.store(v, Ordering::Relaxed);
+}
+
+/// `Entity.bn()` (water `0.014`) and `Entity.bm()` (lava `ultraWarm() ? 0.007 :
+/// 0.0023333333333333335`) motion scales.
+fn fluid_push_scale(kind: EntityFluidKind, ultra_warm: bool) -> f64 {
+    match kind {
+        EntityFluidKind::Water => WATER_MOTION_SCALE,
+        EntityFluidKind::Lava => {
+            if ultra_warm {
+                LAVA_ULTRA_WARM_MOTION_SCALE
+            } else {
+                LAVA_TEMPERATE_MOTION_SCALE
+            }
+        }
+    }
+}
+
+/// `Entity.getFluidJumpThreshold()` (`bsr.di()`, offsets 0–19): `eyeHeight < 0.4F ? 0.0 : 0.4`.
+fn fluid_jump_threshold(eye_height: f32) -> f64 {
+    if eye_height < 0.4 {
+        0.0
+    } else {
+        0.4
+    }
+}
+
+/// `btn.a` offsets 8–53: `d = getGravity()`, lowered to `0.01` while descending under
+/// `MobEffects.SLOW_FALLING`.
+fn living_gravity(falling: bool, slow_falling: bool) -> f64 {
+    if falling && slow_falling {
+        SLOW_FALLING_GRAVITY
+    } else {
+        LIVING_GRAVITY
+    }
+}
+
+/// 1.21.1 `LivingEntity.getFluidFallingAdjustedMovement(double, boolean, Vec3)`
+/// (`btn.a(DZLexc;)Lexc;`, offsets 0–100): no adjustment for zero gravity or a sprinting
+/// entity; otherwise `y - d / 16`, with the `-0.003` terminal frame that makes a sinking
+/// entity hover instead of accelerating without bound.
+fn fluid_falling_adjusted_movement(
+    gravity: f64,
+    falling: bool,
+    vel: [f64; 3],
+    sprinting: bool,
+) -> [f64; 3] {
+    if gravity == 0.0 || sprinting {
+        return vel;
+    }
+    let adjusted = vel[1] - gravity / FLUID_FALLING_DIVISOR;
+    let y = if falling
+        && (vel[1] - FLUID_FALLING_PROBE).abs() >= FLUID_FALLING_TERMINAL
+        && adjusted.abs() < FLUID_FALLING_TERMINAL
+    {
+        -FLUID_FALLING_TERMINAL
+    } else {
+        adjusted
+    };
+    [vel[0], y, vel[2]]
+}
+
+/// 1.21.1 `Entity.getInputVector(Vec3, float, float)` (`bsr.b(Lexc;FF)Lexc;`, offsets 0–104):
+/// zero below `1.0E-7`, normalized above unit length, scaled by `amount` and rotated by yaw.
+fn fluid_input_vector(input: [f64; 3], amount: f32, yaw_deg: f32) -> [f64; 3] {
+    let len_sq = input[0] * input[0] + input[1] * input[1] + input[2] * input[2];
+    if len_sq < INPUT_VECTOR_EPSILON {
+        return [0.0, 0.0, 0.0];
+    }
+    let base = if len_sq > 1.0 {
+        fluid_vec3_normalize(input)
+    } else {
+        input
+    };
+    let amt = f64::from(amount);
+    let scaled = [base[0] * amt, base[1] * amt, base[2] * amt];
+    let rad = yaw_deg * DEG_TO_RAD;
+    let sin = f64::from(crate::generation_math::mth_sin(rad));
+    let cos = f64::from(crate::generation_math::mth_cos(rad));
+    [
+        scaled[0] * cos - scaled[2] * sin,
+        scaled[1],
+        scaled[2] * cos + scaled[0] * sin,
+    ]
+}
+
+/// 1.21.1 `Entity.isFree(double, double, double)` (`bsr.g(DDD)Z`): `Level.noCollision` for the
+/// entity's AABB at that position. Only the block half is modelled — the entity half needs the
+/// level's entity-AABB query, and this server's mob lacks one (the mob push grid excludes the
+/// querying mob rather than answering obstruction).
+fn entity_is_free_blocks(aabb: EntityAabb) -> bool {
+    collect_block_collision_boxes(aabb.min(), aabb.max()).is_empty()
+}
+
+/// The `LivingEntity.travel` inputs the fluid branches read, separated from the mob so the step
+/// stays pure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LivingTravelContext {
+    /// `d` from `btn.a` offsets 8–53.
+    gravity: f64,
+    /// `bl` — `getDeltaMovement().y <= 0.0` sampled at branch entry.
+    falling: bool,
+    sprinting: bool,
+    on_ground: bool,
+    on_climbable: bool,
+    /// `Attributes.WATER_MOVEMENT_EFFICIENCY` (`buw.E`); `0.0` for every vanilla mob.
+    water_movement_efficiency: f32,
+    dolphins_grace: bool,
+    /// `LivingEntity.speed` (field `cg`, `btn.fj()`), only read by the efficiency term.
+    speed: f32,
+    /// `getFluidHeight(tag)` — the `max_height` of `updateFluidHeightAndDoFluidPushing`.
+    fluid_height: f64,
+    /// `getFluidJumpThreshold()`.
+    jump_threshold: f64,
+}
+
+impl Default for LivingTravelContext {
+    fn default() -> Self {
+        Self {
+            gravity: LIVING_GRAVITY,
+            falling: true,
+            sprinting: false,
+            on_ground: true,
+            on_climbable: false,
+            water_movement_efficiency: 0.0,
+            dolphins_grace: false,
+            speed: 0.0,
+            fluid_height: 0.0,
+            jump_threshold: 0.4,
+        }
+    }
+}
+
+/// The result of one fluid branch: the entity's `deltaMovement` after it and the position delta
+/// its `Entity.move(MoverType.SELF, …)` call applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FluidTravelOutcome {
+    vel: [f64; 3],
+    moved: [f64; 3],
+}
+
+/// One `LivingEntity.travel` fluid step (`btn.a(Lexc;)V` offsets 67–561). `move_fn` is
+/// `Entity.move(MoverType.SELF, delta)` returning the applied delta and `horizontalCollision`;
+/// `is_free` is `Entity.isFree(Vec3)`.
+fn travel_fluid_step(
+    kind: EntityFluidKind,
+    vel: [f64; 3],
+    input: [f64; 3],
+    yaw_deg: f32,
+    ctx: LivingTravelContext,
+    move_fn: &mut dyn FnMut([f64; 3]) -> ([f64; 3], bool),
+    is_free: &dyn Fn([f64; 3]) -> bool,
+) -> FluidTravelOutcome {
+    let (moved, mut v, horizontal_collision) = match kind {
+        EntityFluidKind::Water => {
+            // `f` = getWaterSlowDown()/sprint/dolphins, `g` = moveRelative amount, `h` = efficiency.
+            let mut f = if ctx.sprinting {
+                WATER_SPRINT_SLOW_DOWN
+            } else {
+                WATER_SLOW_DOWN
+            };
+            let mut g = FLUID_MOVE_RELATIVE;
+            let mut h = ctx.water_movement_efficiency;
+            if !ctx.on_ground {
+                h *= 0.5;
+            }
+            if h > 0.0 {
+                f += (WATER_MOVEMENT_EFFICIENCY_SLOW_DOWN - f) * h;
+                g += (ctx.speed - g) * h;
+            }
+            if ctx.dolphins_grace {
+                f = DOLPHINS_GRACE_SLOW_DOWN;
+            }
+            let rel = fluid_input_vector(input, g, yaw_deg);
+            let asked = [vel[0] + rel[0], vel[1] + rel[1], vel[2] + rel[2]];
+            let (moved, horizontal) = move_fn(asked);
+            let mut out = if horizontal && ctx.on_climbable {
+                [asked[0], FLUID_CLIMBABLE_LIFT, asked[2]]
+            } else {
+                asked
+            };
+            out = [
+                out[0] * f64::from(f),
+                out[1] * WATER_VERTICAL_DRAG,
+                out[2] * f64::from(f),
+            ];
+            out = fluid_falling_adjusted_movement(ctx.gravity, ctx.falling, out, ctx.sprinting);
+            (moved, out, horizontal)
+        }
+        EntityFluidKind::Lava => {
+            let rel = fluid_input_vector(input, FLUID_MOVE_RELATIVE, yaw_deg);
+            let asked = [vel[0] + rel[0], vel[1] + rel[1], vel[2] + rel[2]];
+            let (moved, horizontal) = move_fn(asked);
+            let mut out = if ctx.fluid_height <= ctx.jump_threshold {
+                let dragged = [
+                    asked[0] * LAVA_DRAG,
+                    asked[1] * WATER_VERTICAL_DRAG,
+                    asked[2] * LAVA_DRAG,
+                ];
+                fluid_falling_adjusted_movement(ctx.gravity, ctx.falling, dragged, ctx.sprinting)
+            } else {
+                [
+                    asked[0] * LAVA_DRAG,
+                    asked[1] * LAVA_DRAG,
+                    asked[2] * LAVA_DRAG,
+                ]
+            };
+            // `if (d != 0.0) deltaMovement = deltaMovement.add(0.0, -d / 4.0, 0.0)`
+            if ctx.gravity != 0.0 {
+                out[1] -= ctx.gravity / LAVA_GRAVITY_DIVISOR;
+            }
+            (moved, out, horizontal)
+        }
+    };
+
+    // `if (horizontalCollision && isFree(v.x, v.y + 0.6 - getY() + e, v.z)) v = (v.x, 0.3, v.z)`:
+    // `e` is `getY()` sampled before the move, so the probe reduces to `v.y + 0.6 - moved.y`.
+    if horizontal_collision {
+        let probe = [v[0], v[1] + FLUID_FREE_PROBE - moved[1], v[2]];
+        if is_free(probe) {
+            v = [v[0], FLUID_FREE_LIFT, v[2]];
+        }
+    }
+    FluidTravelOutcome { vel: v, moved }
+}
+
+/// `updateFluidHeightAndDoFluidPushing` for a mob at `pos` with its own `deltaMovement` in
+/// flight, which is what vanilla samples for the `0.0045000000000000005` minimum-speed guard.
+fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
+    let (w, h) = mob_dimensions(etype);
+    let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
+    update_fluid_height_and_push_with(
+        aabb,
+        EntityFluidKind::Water,
+        fluid_push_scale(EntityFluidKind::Water, level_ultra_warm()),
+        true,
+        false,
+        vel,
+        &block_at,
+    )
+}
+
+fn mob_lava_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
+    let (w, h) = mob_dimensions(etype);
+    let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
+    update_fluid_height_and_push_with(
+        aabb,
+        EntityFluidKind::Lava,
+        fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
+        true,
+        false,
+        vel,
+        &block_at,
+    )
+}
+
+/// One `LivingEntity.travel` fluid tick for a mob.
+///
+/// Returns the position delta the branch applied, or `None` when the mob is in neither fluid — in
+/// which case the stored `deltaMovement` is cleared, which is the non-fluid branch's friction.
+/// The fluid current push is added to the velocity first, because `Entity.baseTick` runs
+/// `updateInWaterStateAndDoFluidPushing` (and its `addDeltaMovement`) before `travel`.
+fn mob_fluid_travel_tick(
+    m: &Arc<Mob>,
+    mp: &mut (f64, f64, f64, f32, f32),
+) -> Option<FluidTravelOutcome> {
+    let (w, h) = mob_dimensions(m.etype);
+    let pos = [mp.0, mp.1, mp.2];
+    let mut vel = *m.vel.lock().unwrap();
+    let water = mob_water_state_vel(m.etype, pos, vel);
+    let (kind, state) = if water.in_fluid {
+        (EntityFluidKind::Water, water)
+    } else {
+        let lava = mob_lava_state_vel(m.etype, pos, vel);
+        if lava.max_height > 0.0 {
+            (EntityFluidKind::Lava, lava)
+        } else {
+            if vel != [0.0; 3] {
+                *m.vel.lock().unwrap() = [0.0; 3];
+            }
+            return None;
+        }
+    };
+    vel = [
+        vel[0] + state.push[0],
+        vel[1] + state.push[1],
+        vel[2] + state.push[2],
+    ];
+    let on_ground = mob_has_support(m.etype, pos[0], pos[1], pos[2]);
+    let ctx = LivingTravelContext {
+        // `MobEffects.SLOW_FALLING` cannot be raised here: this server keeps effects on `Client`
+        // (`effs`), not on `Mob`, so the second argument is the vanilla default.
+        gravity: living_gravity(vel[1] <= 0.0, false),
+        falling: vel[1] <= 0.0,
+        on_ground,
+        fluid_height: state.max_height,
+        jump_threshold: fluid_jump_threshold(mob_eye_height(m.etype)),
+        ..LivingTravelContext::default()
+    };
+    let mut move_fn = |delta: [f64; 3]| {
+        let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
+        // `Attributes.STEP_HEIGHT` (`buw.B`) default `0.6f`; `Entity.move` runs `collide`.
+        let res = entity_collide_world(aabb, delta, on_ground, 0.6, &[]);
+        (res.delta, res.horizontal_collision)
+    };
+    let is_free = |p: [f64; 3]| {
+        entity_is_free_blocks(EntityAabb::from_dimensions(p[0], p[1], p[2], w, h))
+    };
+    let out = travel_fluid_step(kind, vel, [0.0; 3], mp.3, ctx, &mut move_fn, &is_free);
+    mp.0 += out.moved[0];
+    mp.1 += out.moved[1];
+    mp.2 += out.moved[2];
+    *m.vel.lock().unwrap() = out.vel;
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1037,6 +1400,7 @@ mod entity_fluid_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -1066,6 +1430,7 @@ mod entity_fluid_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -1162,6 +1527,7 @@ mod entity_fluid_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(10),
@@ -1178,6 +1544,7 @@ mod entity_fluid_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -1191,6 +1558,7 @@ mod entity_fluid_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -1207,6 +1575,7 @@ mod entity_fluid_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(5),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -1220,6 +1589,7 @@ mod entity_fluid_tests {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(7),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),

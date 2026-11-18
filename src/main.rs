@@ -242,7 +242,7 @@ fn send_raw(s: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
 }
 
 // ---------- clients (multiplayer visibility) ----------
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct Eff {
@@ -2056,7 +2056,12 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
     // spawn streams via interest_tick
 }
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
-    if mob_has_support(m.etype, mp.0, mp.1, mp.2) || mob_in_water(m.etype, mp.0, mp.1, mp.2) {
+    // A mob in water or lava has its vertical motion owned by `LivingEntity.travel`
+    // (`mob_fluid_travel_tick`), so the surface snap must not teleport it to the bed.
+    if mob_has_support(m.etype, mp.0, mp.1, mp.2)
+        || mob_in_water(m.etype, mp.0, mp.1, mp.2)
+        || mob_in_lava(m.etype, mp.0, mp.1, mp.2)
+    {
         return;
     }
     // snap to ground surface; while buried only allow snaps within step height
@@ -2460,6 +2465,11 @@ struct Mob {
     fuse: Mutex<i32>,
     love: Mutex<i32>,
     air: Mutex<i32>,
+    /// `LivingEntity.deltaMovement` as far as the fluid branches of `LivingEntity.travel`
+    /// maintain it (`src/entity_fluid.rs`). Land movement in this server is displacement based
+    /// and does not read it, so it is cleared whenever the mob is in neither fluid — the
+    /// non-fluid branch's friction does the same thing in vanilla.
+    vel: Mutex<[f64; 3]>,
 }
 static MOBS: OnceLock<Mutex<Vec<Arc<Mob>>>> = OnceLock::new();
 fn mobs() -> &'static Mutex<Vec<Arc<Mob>>> {
@@ -3537,6 +3547,7 @@ fn keepalive_time_tick() {
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     last_hurt_tick: Mutex::new(None),
+                    vel: Mutex::new([0.0; 3]),
                     fuse: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -3710,6 +3721,7 @@ fn keepalive_time_tick() {
                     last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                     last_hurt_tick: Mutex::new(None),
+                    vel: Mutex::new([0.0; 3]),
                     fuse: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -5287,20 +5299,20 @@ fn mob_tick() {
             }
         }
         let water_state = mob_water_state(m.etype, mp.0, mp.1, mp.2);
-        if water_state.in_fluid {
-            if matches!(m.etype, 124 | 91) {
-                *m.fuse.lock().unwrap() = 0;
-            }
-            if water_state.push[0] != 0.0 || water_state.push[2] != 0.0 {
-                let (prev_x, prev_z) = (mp.0, mp.2);
-                mob_collide_move(m, &mut mp, water_state.push[0], water_state.push[2]);
-                if (mp.0 - prev_x).abs() > 1e-9 || (mp.2 - prev_z).abs() > 1e-9 {
-                    let (x, y, z, yaw, pitch) = *mp;
-                    let on_ground = mob_has_support(m.etype, x, y, z);
-                    broadcast_seen(m.eid, |_c| {
-                        (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, on_ground))
-                    });
-                }
+        if water_state.in_fluid && matches!(m.etype, 124 | 91) {
+            *m.fuse.lock().unwrap() = 0;
+        }
+        // `LivingEntity.travel` fluid branches (`btn.a(Lexc;)V`): the fluid current push
+        // (`Entity.baseTick`), buoyancy/sink, the `0.8F` water and `0.5` lava drag and
+        // `getFluidFallingAdjustedMovement` all live in `src/entity_fluid.rs`, and the move
+        // itself goes through the `Entity.move` owner in `src/entity_collision.rs`.
+        if let Some(travel) = mob_fluid_travel_tick(m, &mut mp) {
+            if travel.moved[0] != 0.0 || travel.moved[1] != 0.0 || travel.moved[2] != 0.0 {
+                let (x, y, z, yaw, pitch) = *mp;
+                let on_ground = mob_has_support(m.etype, x, y, z);
+                broadcast_seen(m.eid, |_c| {
+                    (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, on_ground))
+                });
             }
         }
         // lava contact: 1.21.1 Entity.isInLava + EntityType$Builder.fireImmune
@@ -5576,6 +5588,7 @@ fn mob_tick() {
                         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                         hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                         last_hurt_tick: Mutex::new(None),
+                        vel: Mutex::new([0.0; 3]),
                         fuse: Mutex::new(0),
                         love: Mutex::new(0),
                         air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -6481,6 +6494,7 @@ fn materialize_generation_payloads_inner(
                             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                             last_hurt_tick: Mutex::new(None),
+                            vel: Mutex::new([0.0; 3]),
                             fuse: Mutex::new(0),
                             love: Mutex::new(0),
                             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -7339,6 +7353,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
             hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
             last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
             fuse: Mutex::new(0),
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -11481,6 +11496,7 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 last_hurt_tick: Mutex::new(None),
+                vel: Mutex::new([0.0; 3]),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -22351,6 +22367,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&mut TcpStream>) -> S
                         etype: et, pos: Mutex::new((x, y, z, 0.0, 0.0)), hp: Mutex::new(20.0),
                         last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)), hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                         last_hurt_tick: Mutex::new(None),
+                        vel: Mutex::new([0.0; 3]),
                         fuse: Mutex::new(0), love: Mutex::new(0), air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32) });
                     if mobs().lock().unwrap().len() >= MOB_CAP { "mob cap reached".into() } else {
                     mobs().lock().unwrap().push(m);
@@ -29062,6 +29079,7 @@ fn main() {
                 last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                 last_hurt_tick: Mutex::new(None),
+                vel: Mutex::new([0.0; 3]),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
@@ -30485,6 +30503,7 @@ mod mineshaft_runtime_tests {
                 last_hit: Mutex::new(Instant::now()),
                 hurt_at: Mutex::new(Instant::now()),
                 last_hurt_tick: Mutex::new(None),
+                vel: Mutex::new([0.0; 3]),
                 fuse: Mutex::new(0),
                 love: Mutex::new(0),
                 air: Mutex::new(60),
@@ -30919,6 +30938,7 @@ mod mineshaft_runtime_tests {
                     last_hit: Mutex::new(Instant::now()),
                     hurt_at: Mutex::new(Instant::now()),
                     last_hurt_tick: Mutex::new(None),
+                    vel: Mutex::new([0.0; 3]),
                     fuse: Mutex::new(0),
                     love: Mutex::new(0),
                     air: Mutex::new(60),

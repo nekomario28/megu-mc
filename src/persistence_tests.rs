@@ -55,6 +55,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
         last_hit: Mutex::new(Instant::now()),
         hurt_at: Mutex::new(Instant::now()),
         last_hurt_tick: Mutex::new(None),
+        vel: Mutex::new([0.0; 3]),
         fuse: Mutex::new(0),
         love: Mutex::new(0),
         air: Mutex::new(mob_air),

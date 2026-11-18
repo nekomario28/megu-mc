@@ -152,3 +152,17 @@ AI・経路探索・戦利品・乗り物なども再利用対象から除外し
 [`src/entity_push.rs`](../../src/entity_push.rs) に閉塞し、チャンク境界対応・`O(1)` 償却近傍探索の
 [`src/entity_spatial.rs`](../../src/entity_spatial.rs) (`EntitySpatialGrid`) 経由で `mob_tick` の押し合い (`mob_collide_move` + `0x70` + `Client` へ `0x5a`) と繁殖相手探索 (`O(N^2)` 走査置換) へ接続した。
 
+実装済み（Slice 4d）: [`LivingEntity.travel` 流体ブランチ (Slice 4d)](entity-travel.md) および
+[検証記録](../../evidence/gameplay/entity-travel/README.md) で、固定 1.21.1 jar の
+`LivingEntity.travel`（`btn.a(Lexc;)V`）の水／溶岩ブランチ（水 `getWaterSlowDown()` = `0.8F`、
+sprint `0.9F`、`DOLPHINS_GRACE` `0.96F`、`WATER_MOVEMENT_EFFICIENCY` の `0.54600006F` ブレンド、
+`moveRelative(0.02F)`、`multiply(f, 0.8F, f)` の** widen された `0.8F` 垂直**、溶岩 `0.5` ドラッグと
+`getFluidJumpThreshold()` 分岐、`add(0, -d/4, 0)` の `-0.02` 沈降、`horizontalCollision && isFree` の
+`0.3F` 持ち上げ、climbable の `0.2`）、`getFluidFallingAdjustedMovement`（`d/16` の浮力と `-0.003`
+終端、`SLOW_FALLING` `0.01` でのみ到達）、`Entity.bm()` の次元依存溶岩押し流しスケール
+（`ultraWarm` で `0.007`、温帯で `0.0023333333333333335`）を
+[`src/entity_fluid.rs`](../../src/entity_fluid.rs) に閉塞し、`Mob.vel`（`deltaMovement`）と
+`mob_fluid_travel_tick` 経由で `mob_tick`／`mob_snap_y` へ接続した。`Entity.move` は
+[`src/entity_collision.rs`](../../src/entity_collision.rs) の `entity_collide_world` が唯一の所有者のまま。
+`Entity.bm()` の極性（`ultraWarm → 0.007`）は Slice 4b の記述と逆であり、旧定数名は不活性なまま
+逆ラベルだったため、本 slice で bytecode に合わせて改名した。
