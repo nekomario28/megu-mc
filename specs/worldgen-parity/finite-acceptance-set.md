@@ -78,7 +78,7 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
 | fortress 0/128(matrix-v1) | **MATCH**(0/32768、同じ宣言。宣言値が両captureでbit一致) |
 | village-taiga | 宣言は検証済みだが比較**DIFF 1/884736** — 受入行にしない(§3) |
 | jungle-temple | **MATCH**(0/98304、2026-11-18実測)。121 → 47(樹冠、vine lane)→ **0**(`ClampedNormalInt`の`f2i`切り捨て、`jungle-dripstone-random-offset-20261118.md`)。port dumpはnative chunkとbyte一致(`77964c22…a715bf`) |
-| Overworld (3,−2) | 順序・mineshaft残差あり(population-order lane進行中) |
+| Overworld (3,−2) | **MATCH(Revision 1の順序入力比較)** — order-A vs Native A 0/98,304・order-B vs Native B 0/98,304(2026-11-18 S01実測、負の対照: 既定順序30/98,304)。既定順序は名前つきメンバーでありbit一致しないことが文書化済み |
 | forest 3×3・dimension_terrain 4件・(0,0)・stronghold・(−96,35) | committed gate緑(新SHAでの再検証は行ごとに必要) |
 | ruined-portal | **MATCH**(0/98304)— ただし単一native run(§4-5は未充足) |
 | end-outer(全air対照) | **MATCH**(0/32768、両側全air)— 被覆の主張はしない |
@@ -171,8 +171,9 @@ binary sha256 `486435229adfb20525e5c7cbe8c8fefd84074ed52170133742990419d5cde23d`
   `registry_tests::a_panicking_scene_fixture_leaves_nothing_to_restore` の**isolated child**が
   意図的にpanicした出力(`694 filtered out`がchild実行の証拠)で、親suiteの結果行ではない。
 - **本laneで触っていない/残り**: S04–S07(stronghold / end_city / nether_fossil / ruined_portal)は
-  three-slice boundのため**未実行**。village-taiga は `bbf51d1` 以降 **3 / 884,736** のままで
-  受入行にしない(§3)。`ruined_portal` の§4-5(2つ目の独立native run)は依然**満たせない**。
+  three-slice boundのため**未実行**。village-taiga は本laneのbaseでは3 / 884,736だったが、
+  並行のVillage-3 lane(`88d5ed7`)が**1 / 884,736**まで閉じた(fern 1セルは帰因記録済み・受入行には
+  しない、§3)。`ruined_portal` の§4-5(2つ目の独立native run)は依然**満たせない**。
   T0(`StructurePiece.placeBlock`のmark)は未landingのまま — `bbf51d1` が
   「22 SHAPE_CHECK_BLOCKSセルはいずれもreference mark setに無い」と実測して不landingを選んでおり、
   本laneのS01–S03の0はその状態で成立している。
