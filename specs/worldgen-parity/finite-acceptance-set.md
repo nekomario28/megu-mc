@@ -76,7 +76,7 @@ captureのruntime_writes問題未解), `trial_chamber`(stronghold chunk内で部
 | matrix-v2 4行(end-city/basalt/fossil/sculk) | **MATCH**(exit 0) |
 | fortress 0/256 | **MATCH**(0/65536、`expected_runtime_writes` 宣言済み・検証済み) |
 | fortress 0/128(matrix-v1) | **MATCH**(0/32768、同じ宣言。宣言値が両captureでbit一致) |
-| village-taiga | 宣言は検証済みだが比較**DIFF 1/884736** — 受入行にしない(§3) |
+| village-taiga | 宣言は検証済みだが比較**DIFF 1/884736** — 受入行にしない(§3)。残る1セル (82,69,−500) は 2026-11-18 の `markPosForPostprocessing` 実測で**機構B**(未実装のmark源 `Feature.markAboveForPostProcessing` 経由。nativeは `LakeFeature` が (82,67,−500) に書いた stone=barrier の上2セルを mark しており、port側も同じ書き込みを `FWRITE … state=1 feature=1,1` として記録済み=**disk配置は一致**)と判定済み — `village-taiga-promotion-footprint-20261118.md` §7 |
 | jungle-temple | **MATCH**(0/98304、2026-11-18実測)。121 → 47(樹冠、vine lane)→ **0**(`ClampedNormalInt`の`f2i`切り捨て、`jungle-dripstone-random-offset-20261118.md`)。port dumpはnative chunkとbyte一致(`77964c22…a715bf`) |
 | Overworld (3,−2) | **MATCH(Revision 1の順序入力比較)** — order-A vs Native A 0/98,304・order-B vs Native B 0/98,304(2026-11-18 S01実測、負の対照: 既定順序30/98,304)。既定順序は名前つきメンバーでありbit一致しないことが文書化済み |
 | forest 3×3・dimension_terrain 4件・(0,0)・stronghold・(−96,35) | committed gate緑(新SHAでの再検証は行ごとに必要) |

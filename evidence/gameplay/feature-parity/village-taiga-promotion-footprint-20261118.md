@@ -152,3 +152,156 @@ MC_SPINE_POP_ORDER=/home/yuu/mc-spine-local/audit/village-taiga-closure-20261118
 MC_SPINE_POP_ORDER_SCOPE=recorded ./target/debug/mc-spine
 awk -F'\t' '$2==19 && $3==-513' /tmp/c.canon     # 100 = short_grass, 98/99 = water
 ```
+
+## 7. Fern verdict: mechanism B, `Feature.markAboveForPostProcessing`
+
+§4 could not separate "native's disk placement differed" (A) from "a mark source we do not model"
+(B), because a mark leaves no trace in the saved world. This section is the measurement that
+separates them: a `markPosForPostprocessing` hook in the carve-agent (`3fd3be2`) and one native
+capture of the same window. Base `9a6169b` + the instrument. Raw logs, the instrument diff, the
+decoded stacks and `analyse_marks.py`: `mc-spine-local/audit/fern-verdict-20261118T130409/`.
+
+**Verdict: B. The cell is marked, by native's `Feature.markAboveForPostProcessing`
+(`ece.a(dds,jd)`), called from `LakeFeature`'s barrier-shell loop. The port's disk placement at
+that column does *not* differ** — both sides record the same three writes, in the same feature
+identities, so the block the mark was filed from was already placed by the port.
+
+### 7.1 The capture, and what it proves about capture stability
+
+`captures/matrix-v2/nat-4242-village-marktrace`, seed 4242, 3x3 at `(4,-32)`, `frozen`,
+`stage structures`, `-Dmarktrace=all`, `boundary.json`: 9 chunks, 25 decorated, `runtime_writes 5`,
+`height_window noise`. The instrument is the tree's, so `inputs.sha256` verifies (§5's F5 gap does
+not apply to this capture).
+
+| comparison against `matrix-v1/nat-4242-village-taiga` | result |
+|---|---|
+| `native.bin` (884,736 cells) | **bit-identical**, `0dd5a9d8abb350c3…d11654e8` on both |
+| `boundary.json` mode/stage/chunks/decorated/runtime_writes | identical |
+| `game_times` | `[2,2]` here, `[3,3]` there — the pre-freeze tick count, not a cell quantity |
+| `order.tsv` | same **set**; entries 22 and 23 of 25 transposed (`(7,-31)` ↔ `(6,-29)`) |
+
+So the fresh capture does not reproduce the recorded decoration *order* exactly, while it
+reproduces every cell of the world exactly. The order difference is a trace-ordering artifact (two
+of the last decoration slots reported in the other order), and it is worth knowing before anyone
+treats a recorded `order.tsv` as stable input: **the decorated set is stable, the position of the
+tail is not**.
+
+### 7.2 (a) The cell is in native's mark set
+
+```
+MARK filed 82 69 -500 chunk=5,-32 n=1 s=4216
+  stack = dvs.e | ece.a(211) | ect.a(139) | ece.a(168) | ebq.a(28) | eiv.a(54) | ForEachOps...
+```
+
+Decoded against the pinned jar's `LineNumberTable` (`tools/vanilla_src.sh`, jar sha1
+`59353fb4c36d304f2035d51e7d6e6baa98dc05c`):
+
+| frame | body | what it is |
+|---|---|---|
+| `dvs.e(Ljd;)V` | `ProtoChunk.markPosForPostprocessing` | appends to the section bucket `dvi.H` walks — the only body that *manufactures* a pass entry |
+| `ece.a(211)` | `Feature.markAboveForPostProcessing` | offset 36–46 of `a(dds,jd)`: `level.getChunk(p).markPosForPostprocessing(p)` (`invokeinterface duy.e`) |
+| `ect.a(139)` | `LakeFeature.place` | offset 1182: `this.a(level, pos)` immediately after `level.setBlock(pos, state, 2)` (offset 1170, line 138) |
+| `ece.a(168)` | `Feature.place(FC, level, gen, random, origin)` | the 4-arg entry that wraps the context |
+| `ebq.a(28)`, `eiv.a(54)` | `ConfiguredFeature.place`, `PlacedFeature` stream | the placement pass |
+
+`markAboveForPostProcessing` is `p = pos.mutable(); for (i = 0; i < 2; i++) { p.move(UP); if
+(level.getBlockState(p).isAir()) return; level.getChunk(p).markPosForPostprocessing(p); }`, so the
+marked cells are `pos+1` and `pos+2` and both must have been non-air. The capture marks **both**
+`(82,68,-500)` and `(82,69,-500)` from the same site at the same window serial `s=4216`, so
+`pos = (82,67,-500)` — exactly the cell `FCELL 82 67 -500 state=1 wrote=true feature=1,1` records
+the lake writing (state 1 = `stone`: the lake's barrier).
+
+### 7.3 (b) The column's disk state, and (c) the discriminator
+
+| y | native saved world | native `FCELL` write | port `FWRITE` write |
+|---|---|---|---|
+| 70 | air | — | — |
+| 69 | **air** (fern removed by the pass) | `2006` `feature=52,9` (fern) | `2006` `feature=52,9` |
+| 68 | `dirt_path` `12513` | `12513` `feature=25,4` (piece) | `12513` `feature=25,4` |
+| 67 | `stone` `1` | `1` `feature=1,1` (**the lake's barrier**) | `1` `feature=1,1` |
+
+The port's own feature trace holds the same write, at the same cell, with the same state and the
+same feature identity — so the port's LakeFeature already places what native's mark was filed
+from. What it does not do is file the mark: `MarkSrc` has `write`/`piece`/`fill`/`surface`/
+`carver`/`multiface` and no `above` variant. Filing it would reach `(82,69,-500)`: the mark's
+owning chunk is `(5,-32)`, inside the plan `(3..7) x (-33..-29)`, and the pass runs there
+(`RUNTIME 82 69 -500 state=0 wrote=true`, stack `dvi.H(539)`).
+
+One correction to §4 falls out of this table, and it is the reason §4 read the column as
+unreachable: §4 listed `67` as "stone (carver top material)", but the port's own `FWRITE` line for
+that cell is `FWRITE 82 67 -500 state=1 feature=1,1` — the **lake**, not the carver. The lake's
+barrier write is the only *feature* write at `y=67` on either side; it is invisible in the saved
+world only because `stone` is also what the terrain already had there, so "no disk write in the
+column can reach `y=69`" was a misreading of a write that was present and state-identical. A
+feature trace names the last writer of a cell; a saved world cannot, when the state does not
+change.
+
+Rejected alternatives, each by measurement:
+
+| # | hypothesis | measurement | verdict |
+|---|---|---|---|
+| A | native's disk placement at/above the column differed | both sides: `67 = 1 (1,1)`, `68 = 12513 (25,4)`, `69 = 2006 (52,9)` | refuted |
+| B1 | marked but swallowed by `ImposterProtoChunk` | `MARK dropped = 0`, `MARK unsupported = 0` in 71,518 mark calls | refuted |
+| B2 | marked on a chunk the pass never promotes | owning chunk in the plan; `RUNTIME` lines exist there | refuted |
+| B3 | one of the six modelled sources, gated differently | the column's marks are `ece` (68, 69) and `dzb` (y=34, 35) only | refuted |
+| B4 | `Feature.markAboveForPostProcessing`, unmodelled | caller `ece.a(211)` via `ect.a(139)`; no `MarkSrc` for it | **confirmed** |
+
+Scale, for the next lane's budget: `ece` files **9,975 of 71,518** marks in this run — 9,273 from
+`DiskFeature` (`ebx.a(53)`, all outside the plan window), 443 from `LakeFeature` line 139 (138
+inside the plan), 259 from `LakeFeature` line 111 (1 in the plan). Inside the 5x5 plan the port
+therefore holds **139 of 8,019** marks, and the fern cell is one of them. `dzq$1`
+(`SurfaceSystem`) and `eaa` (`Blender`) filed nothing here.
+
+### 7.4 The completeness gate — the hook saw what the pass consumed
+
+A hook that never fires and a hook that fires but filters everything out both leave an empty
+trace, so the trace is checked against the pass itself:
+
+| gate | result |
+|---|---|
+| `MARK` lines / distinct `(cell+chunk+stack)` / repeats | 71,518 / 67,291 / 4,227, all `filed` |
+| caller census (frame above the mark body) | 6 owners present, `dzq$1`/`eaa` absent, `arb` present as `arb.f(308)` |
+| cells the pass called `setBlock` on (`RUNTIME`) | 106 |
+| … that carry a `MARK` line | **104** |
+| … that do not | 2, `(98,19,-512)`/`(99,19,-512)`, both with the **fluid-tick** frame `dvi.H(534)` — written by their marked neighbours `(98/99,19,-513)` (`dzb`), not by marks of their own |
+| `MARKERR` | 0 |
+
+So every cell the pass touched is either marked or explained by a marked cell's fluid tick. One
+instrument caveat is recorded rather than papered over: this capture's `run.log` carries `VINESUM`
+but not `MARKSUM`, the second line of the same shutdown hook. The hook body is proven (the build
+probe prints both lines; a standalone JVM with 70,000 `mark()` calls prints `MARKSUM
+calls=70000`), so the second write is lost in the server's own log shutdown — the 71,518 `MARK`
+lines are the stronger evidence that it ran.
+
+### 7.5 What this hands the next lane
+
+Two independent gaps, in dependency order:
+
+1. **The mark source** — `Feature.markAboveForPostProcessing` for `LakeFeature`'s two marking
+   sites (lines 111 and 139) and `DiskFeature`'s. 139 marks in this window, 9,975 in this run.
+   This is the cell's mechanism: without it the fern is never visited.
+2. **The removal rule** (§4's `dgh` arm, `!canSurvive -> air` under `mayPlaceOn = #minecraft:dirt`,
+   scoped to `postprocess_shape_marks` and not to the shared `update_shape`). With the mark filed
+   and the rule absent, the pass visits the cell and keeps the fern; the cell only closes when
+   both are in.
+
+The `feature=index,step` numbering matches between `FCELL` and `FWRITE` (`52,9`, `25,4`, `1,1`), so
+the two traces are comparable cell by cell — that identity is what makes "the port placed the same
+block" a measurement rather than a plausibility argument.
+
+Reproduce:
+
+```sh
+AUD=mc-spine-local/audit/fern-verdict-20261118T130409
+CAP=mc-spine-local/captures/matrix-v2/nat-4242-village-marktrace
+python3 $AUD/analyse_marks.py "$CAP" \
+  --port-fwrite mc-spine-local/audit/village-taiga-closure-20261118T114736/fwrite-all.txt
+grep -F "MARK filed 82 69 -500 " "$CAP/run.log"        # the fern cell, with its stack
+grep -c  "MARK "               "$CAP/run.log"          # 71,518
+cmp "$CAP/native.bin" mc-spine-local/captures/matrix-v1/nat-4242-village-taiga/native.bin
+```
+
+The capture itself: `CARVER_FIXTURE_BASE=<persistent base> MC_SPINE_SEED=4242
+MC_FIXTURE_STAGE=structures MC_FIXTURE_JAVA_EXTRA='-Dmarktrace=all' bash
+tools/carve-agent/native_fixture.sh <dir> 4 -32 3 frozen`, under a heavy lease → `systemd-run`
+`--slice=devin-compute` (`MemoryMax=3G`, `CPUQuota=250%`, `RuntimeMaxSec=900`) → bind → release.
